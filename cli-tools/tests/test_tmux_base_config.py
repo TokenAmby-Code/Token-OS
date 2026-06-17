@@ -50,3 +50,22 @@ def test_pane_select_bindings_do_not_use_timer_focus_override():
     assert pane_select_lines
     assert all("--seconds" not in line for line in pane_select_lines)
     assert all("allow-mechanicus-focus" not in line for line in pane_select_lines)
+
+
+def test_prefix_q_opens_mark_for_close_popup():
+    conf = CONF.read_text(encoding="utf-8")
+    line = _line_starting("bind Q ")
+    assert "display-popup" in line
+    assert "CLOSE_PANE=#{pane_id}" in line
+    assert "tmux-mark-for-close" in line
+    assert "unbind Q" not in conf
+
+    script = (ROOT / "bin" / "tmux-mark-for-close").read_text(encoding="utf-8")
+    assert "/api/instances/${INSTANCE_ID}/mark-for-close" in script
+    assert "/api/hooks/subscribe" not in script
+    assert "/api/hooks/unsubscribe" in script
+    assert "_unsubscribe_mark" in script
+    assert "send-text --pane" in script
+    assert "kill-pane" not in script
+    assert "/retire" not in script
+    assert "/archive-session-doc" not in script

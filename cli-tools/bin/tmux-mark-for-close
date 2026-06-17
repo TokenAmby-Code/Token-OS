@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# tmux-mark-for-close — close out the current agent pane via Token-API.
+# TAGS: tmux, closeout, stop-hook, retire, session-doc
+# AUDIENCE: human
+set -euo pipefail
+
+PANE=""
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+_LIB_DIR="${SCRIPT_DIR}/../lib"
+# shellcheck source=../lib/nas-path.sh
+source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+TMUXCTL_BIN="${SCRIPT_DIR}/tmuxctl"
+[[ -x "$TMUXCTL_BIN" ]] || TMUXCTL_BIN="tmuxctl"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pane) PANE="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '2,/^$/s/^# //p' "$0"; exit 0 ;;
+        *) echo "tmux-mark-for-close: unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "$PANE" ]]; then
+    PANE="$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)"
+fi
+if [[ -z "$PANE" ]]; then
+    echo "tmux-mark-for-close: no target pane" >&2
+    exit 1
+fi
+
+INSTANCE_ID="$(tmux show-options -pv -t "$PANE" @INSTANCE_ID 2>/dev/null || true)"
+PANE_ROLE="$(tmux show-options -pv -t "$PANE" @PANE_ID 2>/dev/null || true)"
+case "$PANE_ROLE" in
+    legion:custodes|mechanicus:fabricator-general|mechanicus:admin)
+        tmux display-message "mark-for-close refused for static persona pane: $PANE_ROLE" 2>/dev/null || true
+        echo "Static persona panes are not closeout targets: $PANE_ROLE" >&2
+        exit 1
+        ;;
+esac
+if [[ -z "$INSTANCE_ID" ]]; then
+    tmux display-message "mark-for-close: pane has no @INSTANCE_ID" 2>/dev/null || true
+    echo "tmux-mark-for-close: pane has no @INSTANCE_ID" >&2
+    exit 1
+fi
+
+_choose() {
+    local prompt="$1" input="$2" selection
+    if command -v fzf >/dev/null 2>&1; then
+        selection="$(printf '%s\n' "$input" | fzf --height=100% --reverse --cycle --prompt="$prompt" --delimiter=$'\t' --with-nth=2.. 2>/dev/null || true)"
+        printf '%s' "${selection%%$'\t'*}"
+        return 0
+    fi
+    printf '%s\n' "$input" >&2
+    read -r -p "$prompt" selection || true
+    printf '%s' "$selection"
+}
+
+LIFECYCLE="$(_choose 'closeout> ' $'retire\tRetire only\narchive-session-doc\tRetire + archive session doc\ncancel\tCancel')"
+[[ -n "$LIFECYCLE" && "$LIFECYCLE" != "cancel" ]] || exit 0
+
+MODE_CHOICE="$(_choose 'final-message> ' $'message\tSend one last message, close on Stop\nnow\tNo message; close now\ncancel\tCancel')"
+[[ -n "$MODE_CHOICE" && "$MODE_CHOICE" != "cancel" ]] || exit 0
+
+_api_post_json() {
+    local path="$1" body="$2"
+    python3 - "$API_URL" "$path" "$body" <<'PY'
+import sys, urllib.request
+api, path, body = sys.argv[1], sys.argv[2], sys.argv[3]
+url = api.rstrip('/') + path
+req = urllib.request.Request(url, data=body.encode(), method='POST', headers={'Content-Type': 'application/json'})
+try:
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        text = resp.read().decode()
+        if resp.status >= 300:
+            raise SystemExit(text)
+        print(text)
+except Exception as exc:
+    raise SystemExit(str(exc))
+PY
+}
+
+_mark_body() {
+    local mode="$1"
+    python3 - "$PANE" "$LIFECYCLE" "$mode" <<'PY'
+import json, sys
+pane, lifecycle, mode = sys.argv[1:]
+print(json.dumps({"mode": mode, "lifecycle": lifecycle, "pane": pane}, separators=(",", ":")))
+PY
+}
+
+_unsubscribe_mark() {
+    local body
+    body="$(python3 - "$INSTANCE_ID" "$PANE" <<'PY'
+import json, sys
+instance_id, pane = sys.argv[1:]
+print(json.dumps({
+  "target_instance_id": instance_id,
+  "target_pane": pane,
+  "subscriber_instance_id": instance_id,
+  "subscriber_pane": pane,
+  "event": "stop",
+  "purpose": "mark_for_close",
+}, separators=(",", ":")))
+PY
+)"
+    _api_post_json "/api/hooks/unsubscribe" "$body" >/dev/null || true
+}
+
+if [[ "$MODE_CHOICE" == "message" ]]; then
+    echo "Type the final message. It will be submitted, then this pane will close on the next Stop hook."
+    read -e -r -p "final> " FINAL_MESSAGE || true
+    if [[ -z "${FINAL_MESSAGE:-}" ]]; then
+        echo "No final message entered; cancelled." >&2
+        exit 1
+    fi
+    _api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body after-stop)" >/dev/null
+    if ! printf '%s' "$FINAL_MESSAGE" | "$TMUXCTL_BIN" send-text --pane "$PANE" --stdin --clear-prompt; then
+        _unsubscribe_mark
+        tmux display-message "mark-for-close: final send failed; closeout disarmed" 2>/dev/null || true
+        echo "tmux-mark-for-close: final send failed; closeout disarmed" >&2
+        exit 1
+    fi
+    tmux display-message "mark-for-close armed: $LIFECYCLE after next Stop" 2>/dev/null || true
+    exit 0
+fi
+
+_api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body now)" >/dev/null

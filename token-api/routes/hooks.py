@@ -277,6 +277,12 @@ class HookSubscribeRequest(BaseModel):
     oneshot: bool = False
 
 
+class MarkForCloseRequest(BaseModel):
+    mode: str = "after-stop"
+    lifecycle: str = "retire"
+    pane: str | None = None
+
+
 class HookUnsubscribeRequest(BaseModel):
     target_instance_id: str | None = None
     target_pane: str | None = None
@@ -1695,6 +1701,364 @@ async def _enqueue_and_send_stop_delivery(
     }
 
 
+async def _tmux_show_pane_option(pane: str, option: str) -> str:
+    proc = await _run_subprocess_offloop(
+        ("tmux", "show-options", "-pv", "-t", pane, option),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        timeout=2,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.decode(errors="ignore").strip()
+
+
+async def _tmux_pane_exists(pane: str) -> bool:
+    proc = await _run_subprocess_offloop(
+        ("tmux", "display-message", "-p", "-t", pane, "#{pane_id}"),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        timeout=2,
+    )
+    return proc.returncode == 0
+
+
+async def _tmux_pane_stack_window(pane: str | None) -> str | None:
+    pane = _normalize_text(pane)
+    if not pane:
+        return None
+    proc = await _run_subprocess_offloop(
+        (
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{session_name}:#{window_index}\t#{@PANE_ID}\t#{@PANE_TYPE}",
+        ),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        timeout=2,
+    )
+    if proc.returncode != 0:
+        return None
+    parts = proc.stdout.decode(errors="ignore").strip().split("\t")
+    if len(parts) != 3:
+        return None
+    window_target, pane_role, pane_type = parts
+    if pane_role in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL, "legion:custodes"}:
+        return None
+    if pane_type == "stack-worker":
+        return window_target
+    if pane_role in {"legion:worker", "legion:regiment", "mechanicus:worker"}:
+        return window_target
+    if re.fullmatch(r"(legion|mechanicus):[1-9]\d*", pane_role or ""):
+        return window_target
+    return None
+
+
+def _spawn_stack_enforce(window_target: str | None) -> None:
+    window_target = _normalize_text(window_target)
+    if not window_target:
+        return
+    tmuxctl = _tmuxctl_bin()
+    if not tmuxctl.exists():
+        return
+    log_path = Path("/tmp/mark-for-close-stack-enforce.log")
+    log_handle = None
+    try:
+        log_handle = log_path.open("a")
+        env = os.environ.copy()
+        env.setdefault("IMPERIUM_TMUX_AUTOMATION", "1")
+        subprocess.Popen(
+            [
+                str(tmuxctl),
+                "stack",
+                "enforce",
+                "--window",
+                window_target,
+                "--kill-pending-clear",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("mark-for-close stack enforce spawn failed for %s: %s", window_target, exc)
+    finally:
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+
+
+async def _cleanup_tmux_pane_chrome(pane: str) -> None:
+    commands: list[tuple[str, ...]] = [
+        ("tmux", "select-pane", "-t", pane, "-T", ""),
+        ("tmux", "select-pane", "-t", pane, "-P", "bg=default,fg=default"),
+    ]
+    for opt in (
+        "@INSTANCE_ID",
+        "@CC_STATE",
+        "@PANE_LABEL",
+        "@ACTIVE_TITLE",
+        "@PROGRESS_TITLE",
+        "@PANE_PROGRESS",
+        "@PANE_TITLE_SUPPRESS",
+        "@TTS_STATE",
+        "@CONTEXT_INFO",
+        "@STACK_PENDING",
+        "@GT_FIRE",
+        "@PLANNING_STATE",
+        "@PLANNING_AGENT",
+        "@DISCORD_VOICE_LOCK",
+        "@DISCORD_VOICE_PROCESSING",
+        "@TOKEN_API_WRAPPER_LAUNCH_ID",
+        "@TOKEN_API_ENGINE",
+        "@TOKEN_API_LAUNCHER",
+        "@TOKEN_API_CWD",
+        "@TOKEN_API_SESSION_ID",
+        "@TOKEN_API_DISPATCH_TARGET",
+        "@TOKEN_API_DISPATCH_WINDOW",
+        "@TOKEN_API_DISPATCH_MODE",
+        "@TOKEN_API_DISPATCH_SLOT",
+        "@TOKEN_API_LAUNCH_MODE",
+        "@TOKEN_API_TARGET_WORKING_DIR",
+    ):
+        commands.append(("tmux", "set-option", "-pu", "-t", pane, opt))
+    for cmd in commands:
+        try:
+            await _run_subprocess_offloop(
+                cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                timeout=2,
+            )
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            pass
+
+
+async def _close_tmux_pane_for_mark(pane: str | None) -> dict:
+    pane = _normalize_text(pane)
+    if not pane:
+        return {"status": "skipped", "reason": "no_pane"}
+    role = await _tmux_show_pane_option(pane, "@PANE_ID")
+    if role in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL, "legion:custodes"}:
+        return {"status": "refused", "reason": "static_persona_pane", "pane_role": role}
+    if not await _tmux_pane_exists(pane):
+        return {"status": "already_closed"}
+    stack_window = await _tmux_pane_stack_window(pane)
+    await _cleanup_tmux_pane_chrome(pane)
+    for _ in range(3):
+        await _run_subprocess_offloop(
+            ("tmux", "send-keys", "-t", pane, "C-c"),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            timeout=2,
+        )
+        await asyncio.sleep(0.2)
+    for _ in range(6):
+        if not await _tmux_pane_exists(pane):
+            _spawn_stack_enforce(stack_window)
+            return {"status": "closed", "pane": pane, "method": "graceful"}
+        await asyncio.sleep(0.5)
+    proc = await _run_subprocess_offloop(
+        ("tmux", "kill-pane", "-t", pane),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        timeout=3,
+    )
+    if proc.returncode != 0:
+        return {
+            "status": "failed",
+            "error": proc.stderr.decode(errors="ignore").strip() or "tmux kill-pane failed",
+        }
+    _spawn_stack_enforce(stack_window)
+    return {"status": "closed", "pane": pane, "method": "kill-pane"}
+
+
+def _resolve_session_doc_path(raw_path: str | None) -> Path | None:
+    text = _normalize_text(raw_path)
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    return shared._vault_root() / path  # noqa: SLF001 - shared owns lazy vault resolution.
+
+
+async def _apply_mark_for_close_lifecycle(
+    db,
+    *,
+    instance_id: str,
+    lifecycle: str,
+) -> dict:
+    lifecycle = (lifecycle or "retire").strip().lower()
+    if lifecycle in {"archive", "archive-doc", "archive-session-doc", "retire-and-archive"}:
+        lifecycle = "archive-session-doc"
+    elif lifecycle in {"retire", "retire-only"}:
+        lifecycle = "retire"
+    else:
+        return {"status": "failed", "reason": "unsupported_lifecycle", "lifecycle": lifecycle}
+
+    cursor = await db.execute(
+        "SELECT id, session_doc_id FROM instances WHERE id = ?",
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return {"status": "failed", "reason": "instance_not_found"}
+
+    now = datetime.now().isoformat()
+    doc_id = row[1]
+    doc_path_text = None
+    if lifecycle == "archive-session-doc" and doc_id:
+        cursor = await db.execute(
+            "SELECT file_path FROM session_documents WHERE id = ?",
+            (doc_id,),
+        )
+        doc_row = await cursor.fetchone()
+        doc_path_text = doc_row[0] if doc_row else None
+        await db.execute(
+            "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
+            (now, doc_id),
+        )
+        doc_path = _resolve_session_doc_path(doc_path_text)
+        if doc_path and doc_path.exists():
+            try:
+                await asyncio.to_thread(update_frontmatter, doc_path, {"status": "archived"})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("mark-for-close frontmatter update failed for %s: %s", doc_path, exc)
+
+    status = "archived" if lifecycle == "archive-session-doc" else "stopped"
+    await sanctioned_update_instance(
+        db,
+        instance_id=instance_id,
+        updates={
+            "rank": "retired",
+            "status": status,
+            "input_lock": None,
+            "stopped_at": now,
+            "golden_throne": None,
+        },
+        mutation_type="instance_archived" if status == "archived" else "instance_retired",
+        write_source="hooks",
+        actor="mark-for-close",
+    )
+    return {"status": status, "rank": "retired", "session_doc_id": doc_id, "lifecycle": lifecycle}
+
+
+async def _execute_close_pane_stop_subscription(db, *, subscription: dict) -> dict:
+    payload_raw = subscription.get("payload") or "{}"
+    try:
+        payload_obj = json.loads(payload_raw)
+        if not isinstance(payload_obj, dict):
+            payload_obj = {}
+    except json.JSONDecodeError:
+        payload_obj = {}
+    lifecycle = str(payload_obj.get("lifecycle") or payload_obj.get("action") or "retire")
+    target_pane = subscription.get("target_pane") or subscription.get("subscriber_pane")
+    close_result = await _close_tmux_pane_for_mark(target_pane)
+    if close_result.get("status") in {"failed", "refused"}:
+        return {
+            "status": close_result.get("status"),
+            "subscription_id": subscription["id"],
+            "delivery": "close-pane",
+            "close": close_result,
+        }
+    lifecycle_result = await _apply_mark_for_close_lifecycle(
+        db,
+        instance_id=subscription["target_instance_id"],
+        lifecycle=lifecycle,
+    )
+    await db.commit()
+    return {
+        "status": "closed",
+        "subscription_id": subscription["id"],
+        "delivery": "close-pane",
+        "close": close_result,
+        "lifecycle": lifecycle_result,
+    }
+
+
+async def _mark_for_close_subscription(
+    db,
+    *,
+    instance_id: str,
+    pane: str | None,
+    lifecycle: str,
+) -> dict:
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute(
+        "SELECT id, tmux_pane, pane_label FROM instances WHERE id = ? LIMIT 1",
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return {"success": False, "action": "instance_not_found", "instance_id": instance_id}
+
+    target_pane = _normalize_text(pane) or row["tmux_pane"] or row["pane_label"]
+    if not target_pane:
+        return {"success": False, "action": "pane_unresolved", "instance_id": instance_id}
+    known_panes = {
+        _normalize_text(row["tmux_pane"]),
+        _normalize_text(row["pane_label"]),
+    }
+    known_panes.discard("")
+    if pane and known_panes and target_pane not in known_panes:
+        return {
+            "success": False,
+            "action": "pane_instance_mismatch",
+            "instance_id": instance_id,
+            "pane": target_pane,
+        }
+
+    resolved = await _resolve_instance_for_pane(db, target_pane)
+    resolved_id = (resolved or {}).get("id")
+    if resolved_id and resolved_id != instance_id:
+        return {
+            "success": False,
+            "action": "pane_instance_mismatch",
+            "instance_id": instance_id,
+            "pane_instance_id": resolved_id,
+            "pane": target_pane,
+        }
+
+    role = await _tmux_show_pane_option(target_pane, "@PANE_ID")
+    if role in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL, "legion:custodes"}:
+        return {
+            "success": False,
+            "action": "protected_pane",
+            "pane": target_pane,
+            "pane_role": role,
+        }
+
+    sub_id = await _upsert_stop_subscription(
+        db,
+        target_instance_id=instance_id,
+        target_pane=target_pane,
+        subscriber_instance_id=instance_id,
+        subscriber_pane=target_pane,
+        event="stop",
+        delivery="close-pane",
+        purpose="mark_for_close",
+        payload=json.dumps({"lifecycle": lifecycle}, separators=(",", ":")),
+        oneshot=True,
+    )
+    return {
+        "success": True,
+        "action": "armed",
+        "subscription_id": sub_id,
+        "instance_id": instance_id,
+        "pane": target_pane,
+        "lifecycle": lifecycle,
+    }
+
+
 async def _fanout_stop_subscriptions(
     instance: dict, payload: dict, final_response: str | None
 ) -> list[dict]:
@@ -1729,15 +2093,22 @@ async def _fanout_stop_subscriptions(
         rows = [dict(row) for row in await cursor.fetchall()]
         results = []
         for row in rows:
-            delivery_payload = row.get("payload") or default_notice
-            result = await _enqueue_and_send_stop_delivery(
-                db,
-                subscription=row,
-                stop_event_key=stop_event_key,
-                payload=delivery_payload,
-            )
+            if row.get("delivery") == "close-pane":
+                result = await _execute_close_pane_stop_subscription(db, subscription=row)
+            else:
+                delivery_payload = row.get("payload") or default_notice
+                result = await _enqueue_and_send_stop_delivery(
+                    db,
+                    subscription=row,
+                    stop_event_key=stop_event_key,
+                    payload=delivery_payload,
+                )
             results.append(result)
-            if row.get("oneshot") and result.get("status") != "duplicate":
+            if row.get("oneshot") and result.get("status") not in {
+                "duplicate",
+                "failed",
+                "refused",
+            }:
                 now = datetime.now().isoformat()
                 await db.execute(
                     """UPDATE stop_hook_subscriptions
@@ -5339,10 +5710,73 @@ async def handle_stop_validate(payload: dict) -> dict:
     return {}  # default: allow stop
 
 
+@router.post("/api/instances/{instance_id}/mark-for-close")
+async def mark_instance_for_close(instance_id: str, request: MarkForCloseRequest) -> dict:
+    mode = (request.mode or "after-stop").strip().lower()
+    lifecycle = (request.lifecycle or "retire").strip().lower()
+    if mode not in {"after-stop", "now"}:
+        return {"success": False, "action": "unsupported_mode", "mode": mode}
+    if lifecycle in {"archive", "archive-doc", "retire-and-archive"}:
+        lifecycle = "archive-session-doc"
+    if lifecycle not in {"retire", "archive-session-doc"}:
+        return {"success": False, "action": "unsupported_lifecycle", "lifecycle": lifecycle}
+
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        armed = await _mark_for_close_subscription(
+            db,
+            instance_id=instance_id,
+            pane=request.pane,
+            lifecycle=lifecycle,
+        )
+        if not armed.get("success"):
+            return armed
+        await db.commit()
+        if mode == "after-stop":
+            await log_event(
+                "mark_for_close_armed",
+                instance_id=instance_id,
+                details={
+                    "pane": armed.get("pane"),
+                    "lifecycle": lifecycle,
+                    "subscription_id": armed.get("subscription_id"),
+                },
+            )
+            return armed
+
+        cursor = await db.execute(
+            "SELECT * FROM stop_hook_subscriptions WHERE id = ?",
+            (armed["subscription_id"],),
+        )
+        row = await cursor.fetchone()
+        result = await _execute_close_pane_stop_subscription(db, subscription=dict(row))
+        if result.get("status") not in {"failed", "refused"}:
+            now = datetime.now().isoformat()
+            await db.execute(
+                """UPDATE stop_hook_subscriptions
+                   SET status = 'delivered', unsubscribed_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (now, now, armed["subscription_id"]),
+            )
+            await db.commit()
+        await log_event(
+            "mark_for_close_now",
+            instance_id=instance_id,
+            details={"pane": armed.get("pane"), "lifecycle": lifecycle, "result": result},
+        )
+        return {
+            "success": result.get("status") not in {"failed", "refused"},
+            "action": "closed" if result.get("status") not in {"failed", "refused"} else "failed",
+            "subscription_id": armed.get("subscription_id"),
+            "result": result,
+        }
+
+
 @router.post("/api/hooks/subscribe")
 async def subscribe_hook(request: HookSubscribeRequest) -> dict:
     if request.event != "stop":
         return {"success": False, "action": "unsupported_event", "event": request.event}
+    if request.delivery == "close-pane":
+        return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
     if request.delivery not in {"prompt", "ephemeral"}:
         return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:

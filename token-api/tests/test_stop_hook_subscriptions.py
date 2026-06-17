@@ -527,6 +527,191 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
     assert row == ("delivered", "preplan_plan", "/plan create the plan", 1)
 
 
+def test_mark_for_close_stop_subscription_retires_after_closing_pane(app_env, monkeypatch):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "close-me", pane="%91")
+    closed = []
+
+    async def fake_close(pane):
+        closed.append(pane)
+        return {"status": "closed", "pane": pane}
+
+    monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
+
+    async def run():
+        sub = await hooks.mark_instance_for_close(
+            "close-me",
+            hooks.MarkForCloseRequest(mode="after-stop", lifecycle="retire", pane="%91"),
+        )
+        assert sub["success"] is True
+        result = await hooks.handle_stop({"session_id": "close-me", "transcript_tail": ""})
+        assert result["stop_subscriptions"][0]["status"] == "closed"
+
+    asyncio.run(run())
+
+    assert closed == ["%91"]
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT status, rank, golden_throne FROM instances WHERE id='close-me'"
+    ).fetchone()
+    sub_row = conn.execute(
+        "SELECT status, purpose, delivery, oneshot FROM stop_hook_subscriptions WHERE target_instance_id='close-me'"
+    ).fetchone()
+    conn.close()
+    assert row == ("stopped", "retired", None)
+    assert sub_row == ("delivered", "mark_for_close", "close-pane", 1)
+
+
+def test_mark_for_close_stop_subscription_can_archive_session_doc(app_env, monkeypatch, tmp_path):
+    hooks = sys.modules["routes.hooks"]
+    doc = tmp_path / "close-doc.md"
+    doc.write_text("---\nstatus: active\n---\n# Close Doc\n", encoding="utf-8")
+    _insert_instance(app_env.db_path, "archive-me", pane="%92")
+
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        "INSERT INTO session_documents (file_path, title, status) VALUES (?, 'Close Doc', 'active')",
+        (str(doc),),
+    )
+    doc_id = conn.execute("SELECT id FROM session_documents WHERE title='Close Doc'").fetchone()[0]
+    conn.execute("UPDATE instances SET session_doc_id=? WHERE id='archive-me'", (doc_id,))
+    conn.commit()
+    conn.close()
+
+    async def fake_close(pane):
+        return {"status": "closed", "pane": pane}
+
+    monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
+
+    async def run():
+        armed = await hooks.mark_instance_for_close(
+            "archive-me",
+            hooks.MarkForCloseRequest(
+                mode="after-stop", lifecycle="archive-session-doc", pane="%92"
+            ),
+        )
+        assert armed["success"] is True
+        result = await hooks.handle_stop({"session_id": "archive-me", "transcript_tail": ""})
+        assert result["stop_subscriptions"][0]["lifecycle"]["status"] == "archived"
+
+    asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute("SELECT status, rank FROM instances WHERE id='archive-me'").fetchone()
+    doc_status = conn.execute(
+        "SELECT status FROM session_documents WHERE id=?", (doc_id,)
+    ).fetchone()[0]
+    conn.close()
+    assert row == ("archived", "retired")
+    assert doc_status == "archived"
+    assert "status: archived" in doc.read_text(encoding="utf-8")
+
+
+def test_public_hook_subscribe_rejects_close_pane_delivery(app_env):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "public-close", pane="%93")
+
+    async def run():
+        result = await hooks.subscribe_hook(
+            hooks.HookSubscribeRequest(
+                target_pane="%93",
+                subscriber_pane="%93",
+                delivery="close-pane",
+                purpose="mark_for_close",
+            )
+        )
+        assert result == {
+            "success": False,
+            "action": "unsupported_delivery",
+            "delivery": "close-pane",
+        }
+
+    asyncio.run(run())
+
+
+def test_mark_for_close_endpoint_rejects_pane_instance_mismatch(app_env):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "pane-owner", pane="%96")
+
+    async def run():
+        result = await hooks.mark_instance_for_close(
+            "pane-owner",
+            hooks.MarkForCloseRequest(mode="after-stop", lifecycle="retire", pane="%97"),
+        )
+        assert result["success"] is False
+        assert result["action"] == "pane_instance_mismatch"
+
+    asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    sub_count = conn.execute("SELECT COUNT(*) FROM stop_hook_subscriptions").fetchone()[0]
+    conn.close()
+    assert sub_count == 0
+
+
+def test_mark_for_close_endpoint_refuses_protected_persona_pane(app_env, monkeypatch):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "custodes-pane", pane="%95")
+
+    async def fake_role(pane, option):
+        assert pane == "%95"
+        assert option == "@PANE_ID"
+        return "legion:custodes"
+
+    monkeypatch.setattr(hooks, "_tmux_show_pane_option", fake_role)
+
+    async def run():
+        result = await hooks.mark_instance_for_close(
+            "custodes-pane",
+            hooks.MarkForCloseRequest(mode="now", lifecycle="retire", pane="%95"),
+        )
+        assert result["success"] is False
+        assert result["action"] == "protected_pane"
+
+    asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    sub_count = conn.execute("SELECT COUNT(*) FROM stop_hook_subscriptions").fetchone()[0]
+    row = conn.execute("SELECT status, rank FROM instances WHERE id='custodes-pane'").fetchone()
+    conn.close()
+    assert sub_count == 0
+    assert row == ("idle", "astartes")
+
+
+def test_mark_for_close_now_uses_executor(app_env, monkeypatch):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "close-now", pane="%94")
+    closed = []
+
+    async def fake_close(pane):
+        closed.append(pane)
+        return {"status": "closed", "pane": pane}
+
+    monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
+
+    async def run():
+        result = await hooks.mark_instance_for_close(
+            "close-now",
+            hooks.MarkForCloseRequest(mode="now", lifecycle="retire", pane="%94"),
+        )
+        assert result["success"] is True
+        assert result["action"] == "closed"
+
+    asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT status, rank, golden_throne FROM instances WHERE id='close-now'"
+    ).fetchone()
+    sub_row = conn.execute(
+        "SELECT status, delivery FROM stop_hook_subscriptions WHERE target_instance_id='close-now'"
+    ).fetchone()
+    conn.close()
+    assert closed == ["%94"]
+    assert row == ("stopped", "retired", None)
+    assert sub_row == ("delivered", "close-pane")
+
+
 def _insert_subscription(
     db_path,
     *,
