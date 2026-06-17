@@ -10,6 +10,7 @@ import asyncio
 import sqlite3
 import uuid
 from datetime import datetime
+from typing import Any
 
 
 def _conn(db_path):
@@ -103,7 +104,7 @@ def _seed_shadowed_singleton(db_path, slug: str, *, live_id: str, child_id: str,
     conn.close()
 
 
-def test_administratum_bypass_resolver_uses_canonical_singleton_filter(app_env):
+def test_administratum_bypass_resolver_uses_canonical_singleton_filter(app_env: Any) -> None:
     main = app_env.main
     _seed_shadowed_singleton(
         app_env.db_path,
@@ -120,7 +121,9 @@ def test_administratum_bypass_resolver_uses_canonical_singleton_filter(app_env):
     assert resolved["tmux_pane"] == "%10"
 
 
-def test_custodes_morning_brief_injects_into_canonical_singleton(app_env, monkeypatch):
+def test_custodes_morning_brief_injects_into_canonical_singleton(
+    app_env: Any, monkeypatch: Any
+) -> None:
     main = app_env.main
     _seed_shadowed_singleton(
         app_env.db_path,
@@ -156,7 +159,7 @@ def test_custodes_morning_brief_injects_into_canonical_singleton(app_env, monkey
     assert result["delivery"]["instance_id"] == "cust-live"
 
 
-def test_morning_end_clears_canonical_custodes_singleton(app_env, monkeypatch):
+def test_morning_end_clears_canonical_custodes_singleton(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
     _seed_shadowed_singleton(
         app_env.db_path,

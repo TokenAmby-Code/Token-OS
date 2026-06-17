@@ -9034,7 +9034,16 @@ async def _resolve_administratum_instance() -> dict | None:
                  AND i.rank != 'retired'
                  AND i.commander_type != 'chapter'
                  AND i.status NOT IN ('stopped', 'archived')
-               ORDER BY i.last_activity DESC
+               ORDER BY
+                 CASE i.rank
+                   WHEN 'primarch' THEN 3
+                   WHEN 'overseer' THEN 2
+                   WHEN 'astartes' THEN 1
+                   ELSE 0
+                 END DESC,
+                 i.last_activity DESC,
+                 i.created_at DESC,
+                 i.id DESC
                LIMIT 1"""
         )
         row = await cursor.fetchone()
@@ -20739,7 +20748,16 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None):
                  AND i.commander_type != 'chapter'
                  AND i.status NOT IN ('stopped', 'archived')
                  AND i.stopped_at IS NULL
-               ORDER BY i.last_activity DESC
+               ORDER BY
+                 CASE i.rank
+                   WHEN 'primarch' THEN 3
+                   WHEN 'overseer' THEN 2
+                   WHEN 'astartes' THEN 1
+                   ELSE 0
+                 END DESC,
+                 i.last_activity DESC,
+                 i.created_at DESC,
+                 i.id DESC
                LIMIT 1"""
         )
         row = await cursor.fetchone()
@@ -20873,6 +20891,7 @@ async def end_morning_session():
         morning_status = "ended" if ended_state is not None else "no_session"
     except Exception as exc:
         logger.warning("Morning end audit state-file write failed: %s", exc)
+
 
 
     now_ms = int(time.monotonic() * 1000)

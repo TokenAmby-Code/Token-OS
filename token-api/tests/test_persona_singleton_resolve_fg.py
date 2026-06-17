@@ -15,6 +15,7 @@ import asyncio
 import sqlite3
 import uuid
 from datetime import datetime
+from typing import Any
 
 import aiosqlite
 
@@ -62,7 +63,7 @@ async def _resolve(db_path, slug):
         return await personas.resolve_live_persona_instance(db, slug)
 
 
-def test_fg_primary_chapter_children_do_not_shadow_overseer(app_env):
+def test_fg_primary_chapter_children_do_not_shadow_overseer(app_env: Any) -> None:
     conn = _conn(app_env.db_path)
     fg = _persona(conn, "fabricator-general")
     # The real overseer: emperor-commanded, OLDER last_activity.
@@ -103,7 +104,7 @@ def test_fg_primary_chapter_children_do_not_shadow_overseer(app_env):
     assert resolved["id"] == "fg-over", f"chapter child shadowed overseer: {resolved}"
 
 
-def test_fg_secondary_retired_row_not_selected(app_env):
+def test_fg_secondary_retired_row_not_selected(app_env: Any) -> None:
     conn = _conn(app_env.db_path)
     fg = _persona(conn, "fabricator-general")
     _insert_instance(
@@ -130,7 +131,7 @@ def test_fg_secondary_retired_row_not_selected(app_env):
     assert resolved["id"] == "fg-live"
 
 
-def test_chapter_child_cannot_exist_without_live_overseer(app_env):
+def test_chapter_child_cannot_exist_without_live_overseer(app_env: Any) -> None:
     """Why the chapter filter is always safe: the schema's chapter_persona_guard
     forbids a chapter child whose commander is not a live row sharing its
     persona_id. So whenever a chapter child exists, its emperor/persona-commanded
