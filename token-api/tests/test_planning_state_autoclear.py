@@ -269,6 +269,24 @@ def test_dollar_preplan_prompt_sets_preplanning_and_arms_plan_followup(
     )
 
 
+def test_preplan_arms_followup_on_live_payload_pane_over_stored(app_env, monkeypatch) -> None:
+    # The arm must bind the LIVE pane the hook carries, not the stored runtime pane
+    # (which may be stale/null). A payload tmux_pane wins over existing_dict.
+    _insert_instance(app_env.db_path, "live-pane-1", pane="%66", engine="claude")
+
+    _prompt_submit(
+        app_env,
+        monkeypatch,
+        {"session_id": "live-pane-1", "prompt": "/preplan go", "tmux_pane": "%77"},
+    )
+
+    sub = _subscription(app_env.db_path, "live-pane-1")
+    assert sub is not None
+    # target_pane / subscriber_pane are the last two columns; both bind the live pane.
+    assert sub[4] == "%77"
+    assert sub[5] == "%77"
+
+
 def test_preplan_on_already_planning_instance_does_not_arm_followup(app_env, monkeypatch) -> None:
     # The preplanning CAS gate is only_if_in=(none, preplanning). An instance
     # already mid-plan fails the gate (planning_event is None), so the /plan

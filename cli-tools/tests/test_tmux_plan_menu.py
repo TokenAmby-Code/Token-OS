@@ -279,6 +279,63 @@ def test_codex_preplan_tabs_after_dollar_skill_on_successful_subscribe(
     assert lines.index("send-keys -t %1 -l $preplan") < lines.index("send-keys -t %1 Tab")
 
 
+def test_codex_preplan_skips_tab_sink_when_insert_fails(tmp_path: pathlib.Path) -> None:
+    # Fail closed: if the leader insert (`-l $preplan`) fails the cursor is at an
+    # unknown position, so the Codex Tab sink must NOT fire (a stray Tab there does
+    # not materialize the skill). prompt-start (PgUp) and subscribe both succeed so
+    # the only failing step is the insert.
+    recorder = tmp_path / "sends.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {shlex.quote(str(recorder))}\n'
+        'case "$*" in\n'
+        "  *' -l '*) exit 1 ;;\n"  # insert fails
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    fake_tmux.chmod(0o755)
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text("#!/usr/bin/env bash\nprintf '%s\\n' '{\"success\":true}'\nexit 0\n")
+    fake_curl.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HOME": str(home),
+        "IMPERIUM_TMUX_BIN": str(fake_tmux),
+        "TOKEN_API_DB": str(tmp_path / "gate.db"),
+        "TMUX_PLAN_MENU_NO_DETACH": "1",
+        "TMUX_PLAN_MENU_PAGE_UPS": "3",
+        "TMUX_PLAN_MENU_PAGE_DOWNS": "3",
+        "TMUX_SEND_GATE_DELAY_TIMEOUT": "0.1",
+    }
+    subprocess.check_output(
+        [
+            str(SCRIPT),
+            "--pane",
+            "%1",
+            "--selection",
+            "preplan",
+            "--agent",
+            "codex",
+            "--api-url",
+            "http://stub",
+        ],
+        text=True,
+        timeout=20,
+        env=env,
+    )
+    lines = recorder.read_text().splitlines() if recorder.exists() else []
+    assert not any(line.strip().endswith(" Tab") for line in lines)  # Tab sink skipped
+    logfile = home / ".claude" / "logs" / "tmux-plan-menu.log"
+    assert logfile.exists()
+    assert "step=insert" in logfile.read_text()
+
+
 def _run_action_with_stubs(
     tmp_path: pathlib.Path,
     selection: str,

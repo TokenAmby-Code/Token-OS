@@ -351,9 +351,15 @@ run_action() {
                     # _ensure_at_prompt_start): skip the leader insert and the Codex
                     # Tab sink rather than typing into an unknown cursor position.
                     if _ensure_at_prompt_start; then
-                        insert_text "$text" || log_failure preplan "$agent" insert "insert-text rc=$?"
-                        if [[ "$agent" == codex ]]; then
-                            sink_codex_skill || log_failure preplan "$agent" sink-tab "tmux send-keys Tab rc=$?"
+                        # Sink the Codex skill chip only after a confirmed insert —
+                        # a Tab after a failed insert lands at an unknown cursor and
+                        # never materializes the skill.
+                        if insert_text "$text"; then
+                            if [[ "$agent" == codex ]]; then
+                                sink_codex_skill || log_failure preplan "$agent" sink-tab "tmux send-keys Tab rc=$?"
+                            fi
+                        else
+                            log_failure preplan "$agent" insert "insert-text rc=$?"
                         fi
                     fi
                 fi

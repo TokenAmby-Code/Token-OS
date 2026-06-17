@@ -93,7 +93,7 @@ def test_successful_click_leaves_state_for_session_start(tmp_path):
     assert tmux_log.read_text().strip() == "send-keys -t %99 Down Enter"
 
 
-def test_dry_run_reads_state_and_reports_not_planning(tmp_path):
+def test_dry_run_reads_state_and_reports_not_planning(tmp_path: pathlib.Path) -> None:
     # Dry-run gates WRITES only, not the read-only state GET. With a real pane +
     # TOKEN_API_URL the watcher must read planning_state; when it is not planning,
     # the `state-not-planning` no-op branch is reachable (and observable) in dry-run.

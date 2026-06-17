@@ -3884,8 +3884,13 @@ async def handle_prompt_submit(payload: dict) -> dict:
             # planning/approving) — arming there would queue a stray one-shot Stop
             # handoff against a pane that never ran a fresh preplan turn.
             if planning_event is not None:
-                tmux_pane = existing_dict.get("tmux_pane") or (payload.get("env") or {}).get(
-                    "TMUX_PANE"
+                # Prefer the live pane the hook carries (top-level then env) over the
+                # stored runtime pane — a stale/null stored value would otherwise
+                # skip or misroute the one-shot /plan follow-up.
+                tmux_pane = (
+                    _normalize_text(payload.get("tmux_pane"))
+                    or _normalize_text((payload.get("env") or {}).get("TMUX_PANE"))
+                    or existing_dict.get("tmux_pane")
                 )
                 preplan_subscription = await _arm_preplan_plan_subscription(
                     db,
