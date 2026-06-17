@@ -112,6 +112,7 @@ preplan_leader() {
 _AGENT_FILE=""
 _PRESTART_DONE=""
 _PRESTART_OK=1   # 0 once the pre-buffer is confirmed at prompt start (set by _await_prestart)
+_PROMPT_MOVED=0     # 1 once this action has moved the prompt cursor and must restore it
 # Blind page-key counts: 50 each clears a multi-page draft (proven). Env-tunable so
 # tests can shrink the gated-send volume (and a future "saucy" computed PgDn can
 # override the restore count). PgUp-at-top / End are idempotent, so 50 is a safe floor.
@@ -225,15 +226,17 @@ set_planning_state() {
 prebuffer_prompt_start() { "${_script_dir}/tmuxctl" prompt-start --pane "$PANE" --page-ups "$PAGE_UPS"; }
 insert_text()           { "${_script_dir}/tmuxctl" insert-text  --pane "$PANE" --text "$1"; }
 move_prompt_end()       { "${_script_dir}/tmuxctl" prompt-end   --pane "$PANE" --page-downs "$PAGE_DOWNS"; }
+sink_codex_skill()      { tmux send-keys -t "$PANE" Tab; }
 
-# Pre-buffer the expensive, selection-independent 50x PgUp while the picker is
-# open (fzf-viewing time) — it directly helps preplan/plan/compact and is inert
-# for cancel/shift+tab (the on-exit prompt-end restores the cursor). Writes a
-# done-marker the detached action waits on so the insert never lands before the
-# cursor reaches the prompt start. HUP-immune so it completes even when the
-# operator picks fast and the popup tears down mid-move.
+# Optional pre-buffer: disabled by default.  The old default moved the prompt
+# cursor while the picker was still open, which made Shift+Tab feel like a slow
+# visible macro and increased the chance of stray typing into the wrong part of
+# a draft.  The selected action now performs prompt-start only after selection,
+# using tmux's tight repeat-count macro in tmuxctl. Set
+# TMUX_PLAN_MENU_PREBUFFER=1 only for profiling the old overlap behavior.
 _start_prebuffer() {
     $DRY_RUN && return 0
+    [[ "${TMUX_PLAN_MENU_PREBUFFER:-0}" == "1" ]] || return 0
     [[ -z "$PANE" ]] && return 0
     _PRESTART_DONE=$(mktemp -t tmux-plan-menu-prestart.XXXXXX 2>/dev/null) || { _PRESTART_DONE=""; return 0; }
     # Write the done-marker ONLY when prompt-start actually reached the prompt
@@ -259,10 +262,10 @@ _start_prebuffer() {
 # longer races a live PgUp. With no marker to wait on (dry-run / no pane) there
 # is nothing to position, so it reports confirmed.
 _await_prestart() {
-    [[ -z "$_PRESTART_DONE" ]] && { _PRESTART_OK=0; return 0; }
+    [[ -z "$_PRESTART_DONE" ]] && { _PRESTART_OK=1; return 1; }
     local i
     for i in $(seq 1 15); do
-        [[ -s "$_PRESTART_DONE" ]] && { _PRESTART_OK=0; return 0; }
+        [[ -s "$_PRESTART_DONE" ]] && { _PRESTART_OK=0; _PROMPT_MOVED=1; return 0; }
         sleep 0.1
     done
     _PRESTART_OK=1
@@ -274,15 +277,22 @@ _await_prestart() {
 # prompt-start synchronously. prompt-start is idempotent (PgUp-at-top is a
 # no-op), so this is safe even if the detached pre-buffer is still draining.
 # Relies on _await_prestart having already run (the run_action drain point).
+# Returns the prompt-start rc (0 on a confirmed pre-buffer or a clean synchronous
+# move) so the caller can fail closed: a non-zero rc means the cursor is NOT
+# known to be at prompt start, and inserting a leader there would land it mid-draft.
 _ensure_at_prompt_start() {
+    _PROMPT_MOVED=1
     (( _PRESTART_OK == 0 )) && return 0
     # Capture tmuxctl's stderr and log a failed synchronous prompt-start instead of
     # swallowing it — so a cursor op that still fails after batching leaves the real
     # tmux error in the log, not just a silent missed move.
-    local _ps_err
-    if ! _ps_err="$(prebuffer_prompt_start 2>&1)"; then
-        log_failure "${SELECTION:-?}" "${agent:-?}" prompt-start "ensure rc=$? ${_ps_err}"
+    local _ps_err _ps_rc
+    _ps_err="$(prebuffer_prompt_start 2>&1)"; _ps_rc=$?
+    if (( _ps_rc != 0 )); then
+        log_failure "${SELECTION:-?}" "${agent:-?}" prompt-start "ensure rc=${_ps_rc} ${_ps_err}"
+        return "$_ps_rc"
     fi
+    return 0
 }
 
 # Post-mortem-grade failure log (log-only; NO notify/TTS — a missing /plan is the
@@ -303,10 +313,12 @@ log_failure() {
 
 # The full selection-dependent action phase. Detached from the popup (see the
 # dispatch tail) so the popup vanishes the instant Enter is pressed; this runs on
-# after teardown. `set +e` makes failures log-and-continue so the generic cursor
-# restore always runs. move_prompt_end sits in a "finally" position — every path
-# (including cancel and shift+tab) restores the cursor and neutralizes the
-# speculative pre-buffer PgUp.
+# after teardown. `set +e` makes failures log-and-continue so the post-action
+# cursor restore always gets its chance to run. move_prompt_end sits in a
+# "finally" position but fires only when _PROMPT_MOVED==1 — i.e. only on paths
+# that actually moved the cursor to the prompt start. With the speculative
+# pre-buffer off by default, cancel and literal shift+tab move nothing and so
+# skip the restore entirely.
 run_action() {
     set +e
     _await_prestart
@@ -335,19 +347,36 @@ run_action() {
                 else
                     set_planning_state preplanning >/dev/null 2>&1   # advisory hint
                     text="$(preplan_leader "$agent") "
-                    _ensure_at_prompt_start
-                    insert_text "$text" || log_failure preplan "$agent" insert "insert-text rc=$?"
+                    # Fail closed on a missed prompt-start (already logged inside
+                    # _ensure_at_prompt_start): skip the leader insert and the Codex
+                    # Tab sink rather than typing into an unknown cursor position.
+                    if _ensure_at_prompt_start; then
+                        # Sink the Codex skill chip only after a confirmed insert —
+                        # a Tab after a failed insert lands at an unknown cursor and
+                        # never materializes the skill.
+                        if insert_text "$text"; then
+                            if [[ "$agent" == codex ]]; then
+                                sink_codex_skill || log_failure preplan "$agent" sink-tab "tmux send-keys Tab rc=$?"
+                            fi
+                        else
+                            log_failure preplan "$agent" insert "insert-text rc=$?"
+                        fi
+                    fi
                 fi
             fi
             ;;
         plan)
             set_planning_state planning >/dev/null 2>&1   # advisory; /plan is token-api-independent
-            _ensure_at_prompt_start
-            insert_text "/plan " || log_failure plan "$agent" insert "insert-text rc=$?"
+            # Fail closed on a missed prompt-start (already logged): skip the insert
+            # rather than dropping /plan mid-draft at an unknown cursor position.
+            if _ensure_at_prompt_start; then
+                insert_text "/plan " || log_failure plan "$agent" insert "insert-text rc=$?"
+            fi
             ;;
         compact)
-            _ensure_at_prompt_start
-            insert_text "/compact " || log_failure compact "$agent" insert "insert-text rc=$?"
+            if _ensure_at_prompt_start; then
+                insert_text "/compact " || log_failure compact "$agent" insert "insert-text rc=$?"
+            fi
             ;;
         shift+tab|shifttab)
             tmux send-keys -t "$PANE" BTab || log_failure shift+tab "$agent" send-btab "tmux send-keys rc=$?"
@@ -358,18 +387,19 @@ run_action() {
             log_failure "${SELECTION:-?}" "$agent" unknown-selection "no handler for selection" ;;
     esac
 
-    # --- generic cursor restore: runs on EVERY path (incl. cancel/shift+tab) ---
-    # Capture tmuxctl's stderr so a residual cursor-op failure carries the REAL tmux
-    # error into the log (the detached action's own stderr goes to /dev/null), not
-    # just an rc — the diagnostic safety net if batching does not fully fix rc=1.
-    sleep 0.05
-    pe_err="$(move_prompt_end 2>&1)" || log_failure "${SELECTION:-?}" "$agent" prompt-end "rc=$? ${pe_err}"
+    # Restore only when this action actually moved the cursor. With prebuffer off
+    # by default, cancel and literal shift+tab no longer spam PgDn/End into the
+    # live composer. No sleep: macro inputs are sent as a tight tmux burst.
+    if (( _PROMPT_MOVED == 1 )); then
+        pe_err="$(move_prompt_end 2>&1)" || log_failure "${SELECTION:-?}" "$agent" prompt-end "rc=$? ${pe_err}"
+    fi
 
     _action_cleanup
 }
 
-# Kick off harness detection and the speculative cursor pre-buffer before the
-# picker opens so both overlap the operator's choice.
+# Kick off harness detection before the picker opens. Prompt cursor pre-buffer is
+# opt-in only (TMUX_PLAN_MENU_PREBUFFER=1); by default no macro keys hit the pane
+# until after the operator chooses an action.
 _start_agent_detect
 _start_prebuffer
 
@@ -390,8 +420,10 @@ if $DRY_RUN; then
         preplan)
             agent_dry="$(normalize_agent "$AGENT")"
             [[ "$agent_dry" == auto ]] && agent_dry="claude"
-            printf 'pane=%s selection=preplan agent=%s insert:%s subscribe:preplan_plan state:preplanning\n' \
-                "$PANE" "$agent_dry" "$(preplan_leader "$agent_dry")"
+            sink_text=""
+            [[ "$agent_dry" == codex ]] && sink_text=" sink:Tab"
+            printf 'pane=%s selection=preplan agent=%s insert:%s subscribe:preplan_plan state:preplanning%s\n' \
+                "$PANE" "$agent_dry" "$(preplan_leader "$agent_dry")" "$sink_text"
             ;;
         plan)    printf 'pane=%s selection=plan insert:/plan state:planning\n' "$PANE" ;;
         compact) printf 'pane=%s selection=compact insert:/compact\n' "$PANE" ;;

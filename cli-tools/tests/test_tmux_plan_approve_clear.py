@@ -62,7 +62,12 @@ def test_successful_click_leaves_state_for_session_start(tmp_path):
     curl_log = tmp_path / "curl.log"
     tmux_log = tmp_path / "tmux.log"
     (fakebin / "curl").write_text(
-        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {curl_log!s}\nexit 0\n"
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {curl_log!s}\n"
+        'case "$*" in\n'
+        "  *'-G'*) printf '%s\\n' '{\"success\":true,\"planning_state\":\"planning\"}' ;;\n"
+        "esac\n"
+        "exit 0\n"
     )
     (fakebin / "tmux").write_text(
         "#!/usr/bin/env bash\n"
@@ -86,6 +91,32 @@ def test_successful_click_leaves_state_for_session_start(tmp_path):
     assert '"state":"approving"' in body_log
     assert '"state":"none"' not in body_log
     assert tmux_log.read_text().strip() == "send-keys -t %99 Down Enter"
+
+
+def test_dry_run_reads_state_and_reports_not_planning(tmp_path: pathlib.Path) -> None:
+    # Dry-run gates WRITES only, not the read-only state GET. With a real pane +
+    # TOKEN_API_URL the watcher must read planning_state; when it is not planning,
+    # the `state-not-planning` no-op branch is reachable (and observable) in dry-run.
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "curl").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        "  *'-G'*) printf '%s\\n' '{\"success\":true,\"planning_state\":\"none\"}' ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    (fakebin / "curl").chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["TOKEN_API_URL"] = "http://token-api.test"
+    out = subprocess.check_output(
+        [str(SCRIPT), "--pane", "%99", "--agent", "claude", "--dry-run"],
+        text=True,
+        env=env,
+    ).strip()
+    assert out == "action=none state-not-planning"
 
 
 def test_non_clear_context_modal_sends_nothing(tmp_path):
