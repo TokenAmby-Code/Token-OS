@@ -153,17 +153,16 @@ def move_to_prompt_start(adapter: TmuxAdapter, pane: str, *, page_ups: int = 50)
     """Drive the pane cursor to the very start of the prompt.
 
     ``page_ups`` PgUp scrolls a multi-page draft to the top, then Home parks at
-    column 0. PgUp-at-top is idempotent, so an overshoot is harmless — this lets
-    the move be pre-buffered speculatively (while the plan-menu is open) before
-    the operator has committed to an action.
-
-    All keys are dispatched in a SINGLE ``send-keys`` subprocess (``PgUp`` x N then
-    ``Home``) rather than one subprocess per key. tmux applies them in order, so the
-    end state is identical, but the live-pane latency (and the per-key send-gate
-    eval) collapses from N+1 calls to one — and there is no mid-loop window for a
-    single key send to fail against a busy pane and abort the whole move.
+    column 0. PgUp-at-top is idempotent, so an overshoot is harmless.  Use tmux's
+    own repeat-count (`send-keys -N`) instead of expanding 50 separate argv keys:
+    the macro is emitted by tmux as one tight burst, with no sleeps between inputs
+    and no large Python argv construction on the hot path.
     """
-    adapter.send_keys(pane, *(["PgUp"] * page_ups), "Home")
+    count = max(0, int(page_ups))
+    if count:
+        adapter.run("send-keys", "-N", str(count), "-t", pane, "PgUp", "Home")
+    else:
+        adapter.send_keys(pane, "Home")
 
 
 def insert_text(adapter: TmuxAdapter, pane: str, text: str) -> None:
@@ -184,15 +183,15 @@ def insert_text(adapter: TmuxAdapter, pane: str, text: str) -> None:
 def move_to_prompt_end(adapter: TmuxAdapter, pane: str, *, page_downs: int = 50) -> None:
     """Return the pane cursor to the end of the prompt (PgDn x N, then End).
 
-    Used as a generic "restore the cursor" step on every plan-menu exit path —
-    including cancel — so the speculative ``move_to_prompt_start`` is always
-    neutralized and the operator keeps typing where they left off.
-
-    Like :func:`move_to_prompt_start`, the whole sequence ships in ONE ``send-keys``
-    subprocess (``PgDn`` x N then ``End``) — one tmux call, one gate eval, no
-    per-key contention window.
+    Uses tmux's repeat-count for the same reason as
+    :func:`move_to_prompt_start`: emit one tight macro burst, not a slow series of
+    sleeps or independently gated inputs.
     """
-    adapter.send_keys(pane, *(["PgDn"] * page_downs), "End")
+    count = max(0, int(page_downs))
+    if count:
+        adapter.run("send-keys", "-N", str(count), "-t", pane, "PgDn", "End")
+    else:
+        adapter.send_keys(pane, "End")
 
 
 def insert_at_prompt_start(
@@ -200,7 +199,7 @@ def insert_at_prompt_start(
     pane: str,
     text: str,
     *,
-    settle_seconds: float = 0.05,
+    settle_seconds: float = 0.0,
     sink_keys: SkillSinkKeys = (),
 ) -> None:
     move_to_prompt_start(adapter, pane)
@@ -221,7 +220,7 @@ def invoke_skill_in_pane(
     *,
     agent: str = "auto",
     arguments: str | None = None,
-    settle_seconds: float = 0.05,
+    settle_seconds: float = 0.0,
 ) -> str:
     resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
     text = skill_invocation_text(skill, resolved_agent, arguments)

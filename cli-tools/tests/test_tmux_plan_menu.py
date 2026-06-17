@@ -31,11 +31,12 @@ def test_preplan_claude_inserts_slash_leader_and_subscribes() -> None:
     assert "state:preplanning" in out
 
 
-def test_preplan_codex_inserts_dollar_leader() -> None:
+def test_preplan_codex_inserts_dollar_leader_and_tabs_to_sink_skill() -> None:
     out = _dry("preplan", "codex")
     assert "agent=codex" in out
     assert "insert:$preplan" in out
     assert "subscribe:preplan_plan" in out
+    assert "sink:Tab" in out
 
 
 def test_plan_inserts_universal_slash_plan() -> None:
@@ -187,21 +188,18 @@ def _run_action_recording_sends(
     return lines, logfile
 
 
-def test_cancel_runs_prompt_end_cursor_restore(tmp_path: pathlib.Path) -> None:
-    # The generic on-exit cursor restore (prompt-end) runs even on cancel, which
-    # inserts nothing — neutralizing the speculative pre-buffer PgUp.
+def test_cancel_does_not_touch_pane_without_prebuffer(tmp_path: pathlib.Path) -> None:
+    # Prebuffer is off by default, so cancel should not spam PgDn/End into the
+    # live composer.
     lines, logfile = _run_action_recording_sends(tmp_path, "cancel")
-    # PAGE_DOWNS=3 here, all batched into one send-keys subprocess (PgDn x3 + End).
-    assert "send-keys -t %1 PgDn PgDn PgDn End" in lines
-    assert not any(" -l " in line for line in lines)  # no literal insert on cancel
-    assert not logfile.exists()  # nothing failed
+    assert lines == []
+    assert not logfile.exists()
 
 
-def test_shift_tab_runs_prompt_end_and_forwards_btab(tmp_path: pathlib.Path) -> None:
-    # shift+tab forwards one literal BTab AND still restores the cursor on exit.
+def test_shift_tab_forwards_btab_without_prompt_restore_when_no_prebuffer(tmp_path: pathlib.Path) -> None:
     lines, logfile = _run_action_recording_sends(tmp_path, "shift+tab")
     assert "send-keys -t %1 BTab" in lines
-    assert "send-keys -t %1 PgDn PgDn PgDn End" in lines  # batched cursor restore
+    assert not any("PgDn" in line for line in lines)
     assert not any(" -l " in line for line in lines)  # shift+tab inserts no leader
     assert not logfile.exists()
 
@@ -214,11 +212,58 @@ def test_preplan_skips_insert_and_logs_on_subscribe_failure(tmp_path: pathlib.Pa
         tmp_path, "preplan", agent="claude", api_url="http://127.0.0.1:1"
     )
     assert not any(" -l " in line for line in lines)  # no leader inserted
-    assert "send-keys -t %1 PgDn PgDn PgDn End" in lines  # cursor still restored
+    assert not any("PgDn" in line for line in lines)  # no cursor move happened
     assert logfile.exists()  # post-mortem log written
     content = logfile.read_text()
     assert "selection=preplan" in content
     assert "step=subscribe" in content
+
+
+
+
+def test_codex_preplan_tabs_after_dollar_skill_on_successful_subscribe(tmp_path: pathlib.Path) -> None:
+    recorder = tmp_path / "sends.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> {shlex.quote(str(recorder))}\nexit 0\n'
+    )
+    fake_tmux.chmod(0o755)
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *'/api/hooks/subscribe'*) printf '%s\\n' '{\"success\":true}' ;;\n"
+        "  *) printf '%s\\n' '{\"success\":true}' ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    fake_curl.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HOME": str(home),
+        "IMPERIUM_TMUX_BIN": str(fake_tmux),
+        "TOKEN_API_DB": str(tmp_path / "gate.db"),
+        "TMUX_PLAN_MENU_NO_DETACH": "1",
+        "TMUX_PLAN_MENU_PAGE_UPS": "3",
+        "TMUX_PLAN_MENU_PAGE_DOWNS": "3",
+        "TMUX_SEND_GATE_DELAY_TIMEOUT": "0.1",
+    }
+    subprocess.check_output(
+        [str(SCRIPT), "--pane", "%1", "--selection", "preplan", "--agent", "codex", "--api-url", "http://stub"],
+        text=True,
+        timeout=20,
+        env=env,
+    )
+    lines = recorder.read_text().splitlines()
+    assert "send-keys -l $preplan" not in lines  # target must always be present
+    assert "send-keys -t %1 -l $preplan" in lines
+    assert "send-keys -t %1 Tab" in lines
+    assert lines.index("send-keys -t %1 -l $preplan") < lines.index("send-keys -t %1 Tab")
 
 
 def _run_action_with_stubs(
@@ -279,7 +324,7 @@ def test_failed_cursor_op_logs_real_tmux_stderr(tmp_path: pathlib.Path) -> None:
         "  *) exit 0 ;;\n"
         "esac\n"
     )
-    logfile = _run_action_with_stubs(tmp_path, "cancel", tmux_body=tmux_body)
+    logfile = _run_action_with_stubs(tmp_path, "plan", tmux_body=tmux_body)
     assert logfile.exists()
     content = logfile.read_text()
     assert "step=prompt-end" in content
