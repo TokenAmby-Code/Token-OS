@@ -255,9 +255,10 @@ def splice_frontmatter(content: str, fm: dict[str, Any]) -> str:
 
 def update_frontmatter(
     file_path: Path,
-    updates: dict[str, Any],
+    updates: dict[str, Any] | None = None,
     delete_keys: list[str] | None = None,
     *,
+    transform: Callable[[dict[str, Any]], None] | None = None,
     max_attempts: int = 3,
 ) -> dict[str, Any]:
     """Surgically merge updates into a note's frontmatter, atomically.
@@ -266,6 +267,12 @@ def update_frontmatter(
         file_path: Path to the markdown file.
         updates: Key-value pairs to set/overwrite in frontmatter.
         delete_keys: Keys to remove from frontmatter (applied after updates).
+        transform: Optional callback mutating the FRESHLY-read frontmatter dict
+            in place, run *inside* the locked retry loop after updates/delete_keys.
+            Use this for read-modify-write of a nested field (e.g. one rubric
+            subkey) so a concurrent writer touching a *different* subkey of the
+            same dict can't last-write-win — every attempt re-derives from the
+            on-disk state. Must be idempotent across retries.
         max_attempts: mtime-conflict retries before raising.
 
     Race-safety (P0 2026-06-17 — the daily-note timer write-race):
@@ -297,10 +304,13 @@ def update_frontmatter(
             stat = file_path.stat()  # FileNotFoundError bubbles intentionally.
             content = file_path.read_text(encoding="utf-8")
             fm, _body = parse_frontmatter(content)
-            fm.update(updates)
+            if updates:
+                fm.update(updates)
             if delete_keys:
                 for key in delete_keys:
                     fm.pop(key, None)
+            if transform is not None:
+                transform(fm)
             new_content = splice_frontmatter(content, fm)
             try:
                 _atomic_write(file_path, new_content, stat.st_mtime_ns)
@@ -332,48 +342,55 @@ def update_session_doc_worktrees(
     - action="archive": flip the entry matching `path` from active → archived.
       Archived entries are RETAINED, never deleted.
 
-    The caller MUST serialize concurrent calls (the token-api endpoint holds an
-    asyncio.Lock) — read-modify-write on the file is not atomic on its own, and
-    the one-active invariant only holds if claims don't interleave.
+    The token-api endpoint also holds an asyncio.Lock across calls to keep the
+    one-active invariant under interleaving claims. The registry mutation itself
+    is applied inside update_frontmatter's locked retry loop (via ``transform``)
+    over the freshly-read list, so the read-modify-write is atomic against the
+    file even independent of that endpoint lock.
     """
     if action not in ("claim", "archive"):
         raise ValueError(f"unknown action: {action!r}")
     if not path:
         raise ValueError(f"{action} requires path")
 
-    fm, _body = read_frontmatter(file_path)
-    wts = fm.get("worktrees")
-    if not isinstance(wts, list):
-        wts = []
-    # Keep only well-formed dict entries; drop anything malformed.
-    wts = [w for w in wts if isinstance(w, dict)]
+    captured: dict[str, list[dict]] = {}
 
-    if action == "claim":
-        for w in wts:
-            if w.get("status") == "active":
-                w["status"] = "archived"
-        existing = next((w for w in wts if w.get("path") == path), None)
-        if existing is not None:
-            existing.update(
-                {"branch": branch, "port": port, "status": "active", "claimed_at": claimed_at}
-            )
-        else:
-            wts.append(
-                {
-                    "path": path,
-                    "branch": branch,
-                    "port": port,
-                    "status": "active",
-                    "claimed_at": claimed_at,
-                }
-            )
-    else:  # archive
-        for w in wts:
-            if w.get("path") == path and w.get("status") == "active":
-                w["status"] = "archived"
+    def _mutate(fm: dict[str, Any]) -> None:
+        wts = fm.get("worktrees")
+        if not isinstance(wts, list):
+            wts = []
+        # Keep only well-formed dict entries; drop anything malformed.
+        wts = [dict(w) for w in wts if isinstance(w, dict)]
 
-    update_frontmatter(file_path, {"worktrees": wts})
-    return wts
+        if action == "claim":
+            for w in wts:
+                if w.get("status") == "active":
+                    w["status"] = "archived"
+            existing = next((w for w in wts if w.get("path") == path), None)
+            if existing is not None:
+                existing.update(
+                    {"branch": branch, "port": port, "status": "active", "claimed_at": claimed_at}
+                )
+            else:
+                wts.append(
+                    {
+                        "path": path,
+                        "branch": branch,
+                        "port": port,
+                        "status": "active",
+                        "claimed_at": claimed_at,
+                    }
+                )
+        else:  # archive
+            for w in wts:
+                if w.get("path") == path and w.get("status") == "active":
+                    w["status"] = "archived"
+
+        fm["worktrees"] = wts
+        captured["wts"] = wts
+
+    update_frontmatter(file_path, transform=_mutate)
+    return captured.get("wts", [])
 
 
 def update_victory_frontmatter(
@@ -813,15 +830,21 @@ def update_rubric_field(
 
     If the rubric is missing or legacy-scalar, the field is upgraded to a dict
     containing only the supplied key. Returns the updated frontmatter dict.
+
+    The rubric dict is read-modified *inside* update_frontmatter's locked retry
+    loop (via ``transform``) so a concurrent writer flipping a different subkey
+    of the same rubric can't last-write-win — each attempt re-derives from the
+    freshly-read frontmatter.
     """
-    fm, _body = read_frontmatter(file_path)
-    rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
-    existing = fm.get(rk)
-    if not isinstance(existing, dict):
-        existing = {}
-    upgraded = dict(existing)
-    upgraded[key] = value
-    return update_frontmatter(file_path, {rk: upgraded})
+
+    def _set_subkey(fm: dict[str, Any]) -> None:
+        rk = rubric_key or fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+        existing = fm.get(rk)
+        upgraded = dict(existing) if isinstance(existing, dict) else {}
+        upgraded[key] = value
+        fm[rk] = upgraded
+
+    return update_frontmatter(file_path, transform=_set_subkey)
 
 
 # --- CodeRabbit review reconciliation (pure, network-free) -------------------
@@ -1039,10 +1062,19 @@ def bump_session_doc_up_to_date(file_path: Path, value: bool) -> dict | None:
     if not isinstance(existing, dict):
         return None
     if existing.get("session_doc_up_to_date") == value:
+        # Already at target — no write needed (the pre-lock read is sufficient
+        # for this fast path; the flag is single-writer-per-turn in practice).
         return fm
-    upgraded = dict(existing)
-    upgraded["session_doc_up_to_date"] = value
-    return update_frontmatter(file_path, {rk: upgraded})
+
+    # Re-derive the rubric inside the locked retry loop so a concurrent writer
+    # flipping a different subkey can't be clobbered by a whole-dict overwrite.
+    def _set_flag(fm: dict[str, Any]) -> None:
+        cur = fm.get(rk)
+        upgraded = dict(cur) if isinstance(cur, dict) else {}
+        upgraded["session_doc_up_to_date"] = value
+        fm[rk] = upgraded
+
+    return update_frontmatter(file_path, transform=_set_flag)
 
 
 # ============ Obsidian CLI Wrappers ============

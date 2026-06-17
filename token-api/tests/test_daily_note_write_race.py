@@ -151,6 +151,7 @@ def test_callout_writer_and_frontmatter_writer_serialize(tmp_path):
     for t in threads:
         t.join(timeout=30)
 
+    assert all(not t.is_alive() for t in threads), "worker thread did not finish (deadlock?)"
     assert not errors, f"writer raised under contention: {errors}"
     final = note.read_text(encoding="utf-8")
     # Body section never collapsed away.
@@ -233,6 +234,71 @@ def test_update_frontmatter_returns_merged_dict(tmp_path):
     assert out["agents"] == ["custodes-abc", "guilliman-def"]
 
 
+def test_transform_runs_inside_locked_retry_loop(tmp_path, monkeypatch):
+    """A transform that increments a counter must re-run each attempt against the
+    freshly-read frontmatter, so a concurrent change can't be clobbered by a
+    stale whole-dict overwrite."""
+    note = tmp_path / "n.md"
+    note.write_text("---\ncounter: 0\n---\nbody\n", encoding="utf-8")
+
+    real_atomic = dc._atomic_write
+    state = {"calls": 0}
+
+    def conflict_once(path, content, expected_mtime_ns):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            # Simulate another writer bumping the counter to 5 mid-flight.
+            other = path.read_text(encoding="utf-8").replace("counter: 0", "counter: 5")
+            path.write_text(other, encoding="utf-8")
+            raise dc.CalloutConflictError("changed")
+        return real_atomic(path, content, expected_mtime_ns)
+
+    monkeypatch.setattr(dc, "_atomic_write", conflict_once)
+
+    def bump(fm):
+        fm["counter"] = int(fm.get("counter", 0)) + 1
+
+    sdh.update_frontmatter(note, transform=bump)
+
+    fm, _ = sdh.read_frontmatter(note)
+    # Re-read on retry sees 5, +1 = 6 — the concurrent write to 5 was NOT lost.
+    assert fm["counter"] == 6
+
+
+def test_concurrent_rubric_subkey_updates_no_lost_update(tmp_path):
+    """update_rubric_field on two different subkeys of the same rubric, run
+    concurrently, must both land (the CodeRabbit-flagged whole-dict-overwrite
+    lost-update case)."""
+    note = tmp_path / "doc.md"
+    note.write_text(
+        "---\nrubric_key: victory\nvictory:\n  committed: false\n  pushed: false\n---\nbody\n",
+        encoding="utf-8",
+    )
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def flip(subkey):
+        try:
+            barrier.wait(timeout=5)
+            for _ in range(20):
+                sdh.update_rubric_field(note, subkey, True)
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    t1 = threading.Thread(target=flip, args=("committed",))
+    t2 = threading.Thread(target=flip, args=("pushed",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert not t1.is_alive() and not t2.is_alive(), "worker thread did not finish"
+    assert not errors, errors
+    fm, _ = sdh.read_frontmatter(note)
+    assert fm["victory"]["committed"] is True
+    assert fm["victory"]["pushed"] is True
+
+
 def test_delete_keys_still_works(tmp_path):
     note = _daily_note(tmp_path)
     sdh.update_frontmatter(note, {"temp_key": "x"})
@@ -265,6 +331,7 @@ def test_concurrent_frontmatter_updates_no_lost_update(tmp_path):
     t1.join(timeout=10)
     t2.join(timeout=10)
 
+    assert not t1.is_alive() and not t2.is_alive(), "worker thread did not finish (deadlock?)"
     assert not errors, errors
     fm, _ = sdh.read_frontmatter(note)
     assert fm["timer_status"] == "working"
