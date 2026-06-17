@@ -15,6 +15,7 @@ export type TimerMode =
   | 'idle'
   | 'sleeping'
   | 'quiet'
+  | 'morning_session'
   | string;
 
 export type SessionDoc = {

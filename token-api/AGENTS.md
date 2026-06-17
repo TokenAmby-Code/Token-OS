@@ -288,7 +288,7 @@ Three independent layers currently compose into 6 effective modes:
 - **Work activity decay**: productivity drops after 3 minutes with no qualifying work signal (recent processing/pane activity, `/api/work-action`, prompt submit, AskUserQuestion answer, or tmux typing-guard signal).
 - **Parameterized idle timeout**: IDLE auto-breaks after 7 minutes. Total grace from last work action to break is about 10 minutes when activity is otherwise clear.
 - **Gym bounty**: +30 min break on gym exit (`apply_gym_bounty()`).
-- **Daily reset**: 7 AM (CronTrigger hour=7).
+- **Daily reset / morning lifecycle**: 6 AM America/Phoenix enters first-class `morning_session` mode and resets daily metrics to zero. `/api/timer/daily-reset` remains manual/debug compatibility.
 - **Serialization**: `format_version: 2` in DB. Legacy v1 flat modes auto-migrated on load.
 
 ### Timer API Endpoints

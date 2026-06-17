@@ -39,28 +39,31 @@ Notes:
     - Sleeping and idle modes omit balance (not meaningful to display).
 """
 
-import sys
 import json
+import sys
 import urllib.request
 
 API_URL = "http://localhost:7777"
 
 MODE_ICONS = {
-    "working":      "\U0001f4bc",   # 💼
-    "multitasking": "\u26a1",       # ⚡
-    "idle":         "\u23f8",       # ⏸
-    "distracted":   "\u26a0\ufe0f", # ⚠️
-    "break":        "\u2615",       # ☕
-    "sleeping":     "\U0001f319",   # 🌙
+    "working": "\U0001f4bc",  # 💼
+    "multitasking": "\u26a1",  # ⚡
+    "idle": "\u23f8",  # ⏸
+    "distracted": "\u26a0\ufe0f",  # ⚠️
+    "break": "\u2615",  # ☕
+    "declared_break": "\u2615",  # ☕
+    "idle_break": "\u2615",  # ☕
+    "morning_session": "\U0001f305",  # 🌅
+    "sleeping": "\U0001f319",  # 🌙
 }
 
 WORK_MODE_LABELS = {
-    "clocked_out": "\U0001f3e0OFF",   # 🏠OFF
-    "gym":         "\U0001f3cbGYM",   # 🏋GYM
+    "clocked_out": "\U0001f3e0OFF",  # 🏠OFF
+    "gym": "\U0001f3cbGYM",  # 🏋GYM
 }
 
 # Modes where showing balance is meaningful
-BALANCE_MODES = {"working", "multitasking", "break", "distracted"}
+BALANCE_MODES = {"working", "multitasking", "break", "declared_break", "idle_break", "distracted"}
 
 
 def get_timer():

@@ -27,6 +27,7 @@ const MODE_RATE_PER_MS: Record<string, number> = {
   break: -1,
   sleeping: 0,
   quiet: 0,
+  morning_session: 0,
 };
 
 // A plausible day arc that deliberately dips into debt (negative balance)
@@ -35,6 +36,7 @@ const MODE_RATE_PER_MS: Record<string, number> = {
 // credit, a second smaller dip, then a strong working recovery.
 const ARC: Array<{ mode: TimerMode; minutes: number; activity: string; source?: string }> = [
   { mode: 'idle', minutes: 20, activity: 'working', source: 'startup' },
+  { mode: 'morning_session', minutes: 20, activity: 'working', source: 'scheduler_0600' },
   { mode: 'distracted', minutes: 28, activity: 'distraction', source: 'reddit' },
   { mode: 'break', minutes: 32, activity: 'distraction', source: 'manual' },
   { mode: 'working', minutes: 75, activity: 'working', source: 'claude:processing' },

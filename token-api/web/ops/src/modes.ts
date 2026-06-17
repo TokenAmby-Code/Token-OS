@@ -19,6 +19,7 @@ const MODE_TABLE: Record<string, ModeVisual> = {
   idle: { label: 'IDLE', color: 'var(--m-idle)', glyph: '·' },
   sleeping: { label: 'SLEEPING', color: 'var(--m-sleep)', glyph: '☾' },
   quiet: { label: 'QUIET', color: 'var(--m-sleep)', glyph: '○' },
+  morning_session: { label: 'MORNING', color: 'var(--m-working)', glyph: '🌅' },
 };
 
 const FALLBACK: ModeVisual = { label: 'UNKNOWN', color: 'var(--muted)', glyph: '?' };

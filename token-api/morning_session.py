@@ -19,7 +19,7 @@ import os
 import subprocess
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger("token_api")
@@ -51,6 +51,20 @@ MORNING_ACTIVE_STATUSES = ("launched", "active")
 # redundant net for anything that slips past this window.
 CUSTODES_CONFIRM_TIMEOUT_S = int(os.environ.get("CUSTODES_CONFIRM_TIMEOUT_S", "90"))
 CUSTODES_CONFIRM_INTERVAL_S = float(os.environ.get("CUSTODES_CONFIRM_INTERVAL_S", "3"))
+
+
+MORNING_LIFECYCLE_PROMPT = """Morning lifecycle has begun. Execute these instructions sequentially; do not skip ahead.
+
+1. First finalize yesterday's daily note and assess:
+   - daily completion;
+   - open tmux worker panes;
+   - open PRs on Token-OS or askCivic;
+   - daily-note threads needing rollover.
+
+2. Then run `/plan create` for the morning session. The final sentence of that plan prompt must be exactly:
+
+get settled into the custodes persona and read yesterdays daily note, then end this inference, you will be woken by the morning session, do not take actions until that point
+"""
 
 
 def morning_state_dir() -> Path:
@@ -246,44 +260,23 @@ def confirm_custodes_registered(
 
 
 def morning_session_active(today: str | None = None) -> tuple[bool, str]:
-    """Decide whether today's morning session is active and in-bound.
+    """Return whether the timer is in first-class morning-session mode.
 
-    Returns (active, reason). Active requires ALL of:
-      - a morning record exists for today,
-      - its status is in MORNING_ACTIVE_STATUSES ("launched"/"active", not
-        "ended"/"failed"),
-      - it is within MORNING_MAX_DURATION_HOURS of started_at.
-
-    Past the bound the session is auto-ended (status="ended",
-    ended_by="auto-2h-bound") and (False, "expired") is returned — the caller
-    emits one final notice and does NOT re-prompt. Reasons for an inactive
-    session: "no_session", "ended", "expired".
+    The state file is retained only as audit/debug data. It is deliberately not
+    a liveness source: a morning is active iff ``shared.timer_engine.current_mode``
+    is ``morning_session``. ``today`` is retained for compatibility with legacy
+    callers that passed a date for the old state-file liveness check.
     """
-    state = read_morning_state(today)
-    if state is None:
-        return False, "no_session"
-    if state.get("status") not in MORNING_ACTIVE_STATUSES:
-        return False, "ended"
-
-    started_raw = state.get("started_at")
-    if not started_raw:
-        # Launched but undated — a corrupt/incomplete record must NOT stay active
-        # forever; that reintroduces the indefinite keepalive loop this gate exists
-        # to kill. Auto-end it and report inactive.
-        write_morning_status("ended", ended_by="auto-invalid-started_at", today=today)
-        return False, "ended"
     try:
-        started = datetime.fromisoformat(started_raw)
-    except Exception:
-        write_morning_status("ended", ended_by="auto-invalid-started_at", today=today)
-        return False, "ended"
-    if started.tzinfo is not None:
-        started = started.replace(tzinfo=None)
+        import shared
 
-    if datetime.now() - started > timedelta(hours=MORNING_MAX_DURATION_HOURS):
-        write_morning_status("ended", ended_by="auto-2h-bound", today=today)
-        return False, "expired"
-    return True, "active"
+        engine = getattr(shared, "timer_engine", None)
+        mode = getattr(getattr(engine, "current_mode", None), "value", None)
+        if mode == "morning_session":
+            return True, "timer_mode"
+        return False, f"timer_mode:{mode or 'unavailable'}"
+    except Exception:
+        return False, "timer_mode:unavailable"
 
 
 def _get(path: str) -> dict | list | str:
@@ -940,6 +933,59 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> dict:
         return {"launched": False, "pane_id": pane_id}
     logger.info("Morning session: sent via assert-instance %s", assertion)
     return {"launched": True, "pane_id": pane_id}
+
+
+def inject_morning_lifecycle_prompt(prompt_text: str | None = None) -> dict:
+    """Inject the official 06:00 lifecycle prompt into ``legion:custodes``.
+
+    This is the scheduler path for first-class ``morning_session`` mode. It uses
+    tmuxctl's pane marker and assert/send flow; no physical pane id is hardcoded.
+    """
+    prompt = prompt_text or MORNING_LIFECYCLE_PROMPT
+    tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
+    try:
+        assertion = subprocess.run(
+            [str(tmuxctl), "assert-instance", "--pane", "legion:custodes"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        if assertion.returncode != 0:
+            logger.error(
+                "morning lifecycle assert-instance rc=%s: stdout=%s stderr=%s",
+                assertion.returncode,
+                assertion.stdout.strip()[:200],
+                assertion.stderr.strip()[:200],
+            )
+            return {
+                "injected": False,
+                "reason": "assert_failed",
+                "returncode": assertion.returncode,
+            }
+        sent = subprocess.run(
+            [str(tmuxctl), "send-text", "--pane", "legion:custodes", "--stdin"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("morning lifecycle prompt injection timed out")
+        return {"injected": False, "reason": "timeout"}
+    except Exception as exc:
+        logger.error("morning lifecycle prompt injection failed: %s", exc)
+        return {"injected": False, "reason": "exception", "error": str(exc)}
+
+    if sent.returncode != 0:
+        logger.error(
+            "morning lifecycle send-text rc=%s: stdout=%s stderr=%s",
+            sent.returncode,
+            sent.stdout.strip()[:200],
+            sent.stderr.strip()[:200],
+        )
+        return {"injected": False, "reason": "send_failed", "returncode": sent.returncode}
+
+    return {"injected": True, "pane": "legion:custodes"}
 
 
 def run_morning_session() -> dict:

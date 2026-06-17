@@ -165,7 +165,9 @@ def test_run_morning_session_survives_stack_enforce_timeout(isolated_morning_dir
         "waited_s": 0.0,
     }
 
+    day_state = {"day_started_at": "2026-06-15T06:00:00", "source": "morning"}
     with (
+        patch("shared.get_day_state_sync", lambda today=None, db_path=None: day_state),
         patch("morning_session.subprocess.run", side_effect=fake_run),
         patch("morning_session.ensure_daily_notes", lambda: None),
         patch("morning_session.get_daily_thread_id", lambda today: "thread123"),
@@ -180,17 +182,15 @@ def test_run_morning_session_survives_stack_enforce_timeout(isolated_morning_dir
         assert result["pane_id"] == "%42"
         assert result["instance_id"] == "cafe1234"
 
-        # The state file is durably written as active (validation confirmed a live
-        # sync Custodes), so the keepalive gate (morning_session_active) reports the
-        # session in-bound — the Emperor is genuinely placed into morning mode, not
-        # just "launch returned ok".
+        # The state file is durably written for audit/debug, but first-class
+        # timer mode is now the only morning liveness source.
         state = morning_session.read_morning_state()
         assert state is not None
         assert state["status"] == "active"
         assert state["confirmed_instance_id"] == "cafe1234"
         active, reason = morning_session.morning_session_active()
-        assert active is True
-        assert reason == "active"
+        assert active is False
+        assert reason.startswith("timer_mode:")
 
 
 def test_run_morning_session_marks_failed_when_custodes_never_registers(isolated_morning_dir):
@@ -222,7 +222,9 @@ def test_run_morning_session_marks_failed_when_custodes_never_registers(isolated
     }
     tts_messages: list[str] = []
 
+    day_state = {"day_started_at": "2026-06-15T06:00:00", "source": "morning"}
     with (
+        patch("shared.get_day_state_sync", lambda today=None, db_path=None: day_state),
         patch("morning_session.subprocess.run", side_effect=fake_run),
         patch("morning_session.ensure_daily_notes", lambda: None),
         patch("morning_session.get_daily_thread_id", lambda today: "thread123"),
@@ -326,7 +328,9 @@ def test_run_morning_session_no_pane_fails_gracefully(isolated_morning_dir):
             raise subprocess.TimeoutExpired(cmd, 5)
         raise AssertionError(f"unexpected cmd: {cmd}")
 
+    day_state = {"day_started_at": "2026-06-15T06:00:00", "source": "morning"}
     with (
+        patch("shared.get_day_state_sync", lambda today=None, db_path=None: day_state),
         patch("morning_session.subprocess.run", side_effect=fake_run),
         patch("morning_session.ensure_daily_notes", lambda: None),
         patch("morning_session.get_daily_thread_id", lambda today: "thread123"),
