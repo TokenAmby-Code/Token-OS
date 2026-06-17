@@ -9031,8 +9031,19 @@ async def _resolve_administratum_instance() -> dict | None:
                FROM instances i
                JOIN personas p ON p.id = i.persona_id
                WHERE p.slug = 'administratum'
+                 AND i.rank != 'retired'
+                 AND i.commander_type != 'chapter'
                  AND i.status NOT IN ('stopped', 'archived')
-               ORDER BY i.last_activity DESC
+               ORDER BY
+                 CASE i.rank
+                   WHEN 'primarch' THEN 3
+                   WHEN 'overseer' THEN 2
+                   WHEN 'astartes' THEN 1
+                   ELSE 0
+                 END DESC,
+                 i.last_activity DESC,
+                 i.created_at DESC,
+                 i.id DESC
                LIMIT 1"""
         )
         row = await cursor.fetchone()
@@ -20733,9 +20744,20 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None):
                FROM instances i
                JOIN personas p ON p.id = i.persona_id
                WHERE p.slug = 'custodes'
+                 AND i.rank != 'retired'
+                 AND i.commander_type != 'chapter'
                  AND i.status NOT IN ('stopped', 'archived')
                  AND i.stopped_at IS NULL
-               ORDER BY i.last_activity DESC
+               ORDER BY
+                 CASE i.rank
+                   WHEN 'primarch' THEN 3
+                   WHEN 'overseer' THEN 2
+                   WHEN 'astartes' THEN 1
+                   ELSE 0
+                 END DESC,
+                 i.last_activity DESC,
+                 i.created_at DESC,
+                 i.id DESC
                LIMIT 1"""
         )
         row = await cursor.fetchone()
