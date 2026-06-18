@@ -140,7 +140,7 @@ def test_explicit_dir_wins_over_repo(env: Env) -> None:
 def test_no_worktree_refuses_protected_root(env: Env) -> None:
     res = _run(env, "--no-worktree", "--dir", str(env.prod), "do the thing")
     assert res.returncode == 64
-    assert "refusing to dispatch into protected/runtime root" in res.stderr
+    assert "refusing to dispatch into protected/runtime/secrets/bare root" in res.stderr
 
 
 def test_runtime_root_also_forces_worktree(env: Env) -> None:
@@ -149,3 +149,67 @@ def test_runtime_root_also_forces_worktree(env: Env) -> None:
     res = _run(env, "--dir", str(runtime), "--worktree", "runtime-fix", "do it")
     assert res.returncode == 0, res.stderr
     assert "wt-runtime-fix" in _worktree_line(res.stdout)
+
+
+# --- 2a / P3: Token-OS `--repo` must anchor on BARE_REPO, never the legacy ---------
+# PROTECTED_ROOT. The Token-OS conf points PROTECTED_ROOT at the archived legacy NAS
+# tree (Token-OS.legacy-20260610) which is a write-guard, not a base to branch from.
+# When BARE_REPO is present on disk, `--repo` must resolve `dir:` to it and redirect
+# into a fresh worktree (worktree-setup always cuts the worktree from BARE_REPO).
+
+
+@dataclass
+class BareEnv:
+    home: Path
+    bare: Path
+    legacy: Path
+    parent: Path
+    base: dict[str, str]
+
+
+@pytest.fixture
+def bare_env(tmp_path: Path) -> BareEnv:
+    """Token-OS-shaped conf: a real on-disk BARE_REPO plus a distinct legacy
+    PROTECTED_ROOT (the archive guard) and a separate RUNTIME_CHECKOUT."""
+    home = tmp_path / "home"
+    (home / ".config" / "worktrees").mkdir(parents=True)
+    bare = tmp_path / "token-os.git"
+    bare.mkdir()  # present on disk → preferred anchor
+    legacy = tmp_path / "Token-OS.legacy-20260610"
+    legacy.mkdir()
+    runtime = tmp_path / "live"
+    runtime.mkdir()
+    parent = home / "worktrees" / "Token-OS"
+    parent.mkdir(parents=True)
+    (home / ".config" / "worktrees" / "Token-OS.conf").write_text(
+        f"BARE_REPO={bare}\nWORKTREE_PARENT={parent}\nSECRETS_DIR={tmp_path / 'config'}\n"
+        f"PROTECTED_ROOT={legacy}\nRUNTIME_CHECKOUT={runtime}\nLOCAL_BARE_MAIN_SYNC=true\n",
+        encoding="utf-8",
+    )
+    base = dict(os.environ)
+    base["HOME"] = str(home)
+    return BareEnv(home=home, bare=bare, legacy=legacy, parent=parent, base=base)
+
+
+def _run_bare(env: BareEnv, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", *args],
+        env=env.base,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_repo_anchors_on_bare_not_legacy_protected_root(bare_env: BareEnv) -> None:
+    res = _run_bare(bare_env, "--repo", "Token-OS", "--worktree", "X", "do it")
+    assert res.returncode == 0, res.stderr
+    assert f"dir:             {bare_env.bare}" in res.stdout, res.stdout
+    # And it must NOT anchor on the legacy archive.
+    assert str(bare_env.legacy) not in res.stdout, res.stdout
+
+
+def test_repo_bare_anchor_redirects_into_worktree(bare_env: BareEnv) -> None:
+    res = _run_bare(bare_env, "--repo", "Token-OS", "--worktree", "X", "do it")
+    assert res.returncode == 0, res.stderr
+    assert "wt-X" in _worktree_line(res.stdout), res.stdout

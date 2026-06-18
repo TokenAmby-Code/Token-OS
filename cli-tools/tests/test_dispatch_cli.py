@@ -1239,6 +1239,40 @@ def test_dispatch_omits_legion_for_non_custodes_target():
     assert "TOKEN_API_LEGION=custodes" not in result.stdout
 
 
+def test_dispatch_does_not_inherit_dispatcher_legion_into_worker() -> None:
+    # P1 (2026-06-18) persona theft via the emperor-commander path: a custodes pane
+    # carries an exported TOKEN_API_LEGION=custodes (and TOKEN_API_PERSONA=custodes)
+    # from its own launch. Dispatching a worker into a NON-custodes seat with no
+    # --persona must NOT forward the dispatcher's legion/persona into the child env —
+    # else the server infers persona=custodes and the singleton guard retires the live
+    # incumbent. The child legion must resolve fresh (empty here → server assigns a
+    # fresh worker identity).
+    env = os.environ.copy()
+    env["TOKEN_API_LEGION"] = "custodes"
+    env["TOKEN_API_PERSONA"] = "custodes"
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--target",
+            "palace:new",
+            "--dir",
+            str(ROOT),
+            "worker task",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TOKEN_API_LEGION=custodes" not in result.stdout, result.stdout
+    # No --persona was given, so no persona must be forwarded to the child either.
+    assert "TOKEN_API_PERSONA=custodes" not in result.stdout, result.stdout
+
+
 def test_dispatch_target_dry_run_resolves_public_without_physical(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
