@@ -188,6 +188,15 @@ if $PUSH_MACROS; then
     fi
 fi
 
+# One final settings reload after all file copies. Reloading immediately after
+# termux.properties is not enough when a deploy also updates tmux/toolbar files:
+# Termux can keep rendering the old extra-keys row until settings are reloaded
+# after the complete push. Best-effort: deploy should not fail if Termux refuses
+# to reload from a headless SSH session.
+if [[ "$DRY_RUN" != true && $pushed -gt 0 && ( "$PUSH_PROPERTIES" == true || "$PUSH_TMUX" == true ) ]]; then
+    ssh $SSH_OPTS phone "termux-reload-settings" 2>/dev/null && log_ok "settings reloaded" || true
+fi
+
 echo ""
 if [[ "$DRY_RUN" == true ]]; then
     echo -e "${YELLOW}Dry run complete.${NC}"
