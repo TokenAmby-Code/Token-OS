@@ -84,8 +84,8 @@ Add one row ABOVE the QWERTY row:
 | 3 | `-` | `_` | Flags, filenames. Underscore for snake_case. |
 | 4 | `{` | `[` | JSON, code blocks. |
 | 5 | `}` | `]` | Closing pair. |
-| 6 | `\|` | `~` | Pipe for commands. Tilde for home dir. |
-| 7 | `:` | `;` | Ports, time, YAML, Python. |
+| 6 | `\|` | `:` | Pipe for commands. Colon for ports/time/YAML/Python. |
+| 7 | `~` | `;` | Home dir. Semicolon separator. |
 | 8 | `#` | `$` | Markdown headers, comments. Dollar for vars. |
 
 ### Sizing
@@ -196,7 +196,7 @@ All characters should be reachable from the dev bar without hitting ?123.
 Samsung Toolbar: [Clipboard] [Extract Text] [Search] [Writing Assist] [1-Hand] [Size] [Settings]
 Suggestion Strip: [word1] [word2] [word3]
 +-------+-------+-------+-------+-------+-------+-------+-------+
-| TAB   |  /\   |  -_   |  {[   |  }]   |  |~   |  :;   |  #$   |  <- Dev Bar
+| TAB   |  /\   |  -_   |  {[   |  }]   |  |:   |  ~;   |  #$   |  <- Dev Bar
 +-------+-------+-------+-------+-------+-------+-------+-------+
 |  Q 1  |  W 2  |  E 3  |  R 4  |  T 5  |  Y 6  |  U 7  |  I 8  |  O 9  |  P 0  |
 +-------+-------+-------+-------+-------+-------+-------+-------+-------+-------+
