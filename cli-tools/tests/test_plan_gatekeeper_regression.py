@@ -63,7 +63,9 @@ def _run_gatekeeper(tmp_path: pathlib.Path, *, resolve_pane: str) -> pathlib.Pat
     return marker
 
 
-def test_plan_gatekeeper_recovers_pane_when_tmux_pane_stripped(tmp_path):
+def test_plan_gatekeeper_recovers_pane_when_tmux_pane_stripped(
+    tmp_path: pathlib.Path,
+) -> None:
     # Claude Code strips $TMUX_PANE; the hook must recover the pane via the
     # PID walk and STILL launch the clear-context approver against it.
     marker = _run_gatekeeper(tmp_path, resolve_pane="%777")
@@ -71,7 +73,9 @@ def test_plan_gatekeeper_recovers_pane_when_tmux_pane_stripped(tmp_path):
     assert "--pane %777" in marker.read_text()
 
 
-def test_plan_gatekeeper_yields_when_recovery_also_fails(tmp_path):
+def test_plan_gatekeeper_yields_when_recovery_also_fails(
+    tmp_path: pathlib.Path,
+) -> None:
     # When neither $TMUX_PANE nor the PID walk yields a pane, the hook yields
     # without launching the approver (no bogus write to a stale/empty pane).
     marker = _run_gatekeeper(tmp_path, resolve_pane="")

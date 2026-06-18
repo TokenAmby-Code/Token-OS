@@ -18,6 +18,14 @@ log() {
 
 # Resolve a token-os bin tolerantly: PATH first, then the live runtime under
 # IMPERIUM/CIVIC. Mirrors generic-hook.sh so we don't trust a minimal hook PATH.
+# The _mount_live guard skips stale/unmounted NAS roots deterministically before
+# probing them, so a dead mount can't yield a phantom -x hit.
+_mount_live() {
+  local root="$1"
+  [[ -n "$root" && -d "$root" ]] || return 1
+  ls "$root" >/dev/null 2>&1
+}
+
 _resolve_token_os_bin() {
   local tool="$1" found root cand
   found=$(command -v "$tool" 2>/dev/null) || true
@@ -28,7 +36,7 @@ _resolve_token_os_bin() {
   for root in "${IMPERIUM:-}" "${CIVIC:-}"; do
     [[ -n "$root" ]] || continue
     cand="${root%/}/runtimes/token-os/live/cli-tools/bin/${tool}"
-    if [[ -x "$cand" ]]; then
+    if _mount_live "$root" && [[ -x "$cand" ]]; then
       printf '%s\n' "$cand"
       return 0
     fi
