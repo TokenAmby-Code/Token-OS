@@ -31,6 +31,8 @@ def _connect(db_path: Path | None = None) -> sqlite3.Connection | None:
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if table not in {"personas", "primarchs"}:
+        return set()
     try:
         return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
     except sqlite3.Error:

@@ -18,6 +18,8 @@ def columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def migrate(db: Path, *, dry_run: bool = True) -> None:
+    if not db.exists():
+        raise FileNotFoundError(f"database does not exist: {db}")
     conn = sqlite3.connect(db)
     try:
         conn.execute("PRAGMA foreign_keys = ON")

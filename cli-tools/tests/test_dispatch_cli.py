@@ -1494,6 +1494,9 @@ def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Pa
     assert "TOKEN_API_PERSONA=fabricator-general" not in result.stdout
     assert "TOKEN_API_LEGION=mechanicus" not in result.stdout
     assert "-u TOKEN_API_INSTANCE_ID" in result.stdout
+    assert "-u TOKEN_API_PARENT_INSTANCE_ID" in result.stdout
+    assert "-u TOKEN_API_PERSONA" in result.stdout
+    assert "-u TOKEN_API_LEGION" in result.stdout
 
 
 def test_dispatch_prompt_file_single_quote_is_shell_safe(tmp_path: Path) -> None:
