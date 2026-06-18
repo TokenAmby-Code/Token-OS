@@ -139,7 +139,7 @@ def test_default_roots_exclude_unprotectable_network_mounts(tmp_path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "/Volumes/Imperium/runtimes/token-os/live" not in proc.stdout
-    assert "/mnt/imperium/runtimes/token-os/live" not in proc.stdout
+    assert "/mnt/imperium" not in proc.stdout
     # the local default root is still present (here: the overridden checkout)
     assert str(tmp_path / "live") in proc.stdout
 

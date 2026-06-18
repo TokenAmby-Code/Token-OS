@@ -6,13 +6,13 @@ Integration tests hit the live Token API at localhost:7777.
 
 Run:
     # Unit tests only (fast, no server needed):
-    cd /mnt/imperium/runtimes/token-os/live/token-api && .venv/bin/python -m pytest test_cron_engine.py -v -k "not integration"
+    cd /home/token/runtimes/token-os/live/token-api && UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv run pytest test_cron_engine.py -v -k "not integration"
 
     # Integration tests (requires running Token API):
-    cd /mnt/imperium/runtimes/token-os/live/token-api && .venv/bin/python -m pytest test_cron_engine.py -v -k "integration"
+    cd /home/token/runtimes/token-os/live/token-api && UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv run pytest test_cron_engine.py -v -k "integration"
 
     # All tests:
-    cd /mnt/imperium/runtimes/token-os/live/token-api && .venv/bin/python -m pytest test_cron_engine.py -v
+    cd /home/token/runtimes/token-os/live/token-api && UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv run pytest test_cron_engine.py -v
 """
 
 import asyncio

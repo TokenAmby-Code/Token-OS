@@ -1,11 +1,11 @@
 @echo off
 :: ring-remap-launcher.bat
-:: Local launcher for ring-remap.ahk - waits for NAS path before launching.
+:: Local launcher for ring-remap.ahk - waits for the Windows-local cache before launching.
 :: Point Task Scheduler at a LOCAL COPY of this file (e.g. C:\Scripts\ring-remap-launcher.bat),
-:: not the NAS copy, so it can always be found on startup.
+:: not a network copy, so it can always be found on startup.
 
 set "AHK_EXE=C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe"
-set "SCRIPT_PATH=\\Token-NAS\Imperium\runtimes\token-os\live\ahk\ring-remap.ahk"
+set "SCRIPT_PATH=C:\TokenOS\ahk\ring-remap.ahk"
 set "RETRY_SECONDS=5"
 set "MAX_RETRIES=60"
 
