@@ -4,4 +4,4 @@
 
 set -euo pipefail
 
-exec "/mnt/imperium/runtimes/token-os/live/cli-tools/bin/cli-wrapper" subagent "$@"
+exec "/home/token/runtimes/token-os/live/cli-tools/bin/cli-wrapper" subagent "$@"

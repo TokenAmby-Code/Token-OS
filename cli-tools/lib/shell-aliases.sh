@@ -167,9 +167,7 @@ _resolve_dispatch_bin() {
         "${CLI_TOOLS:-}/bin/dispatch" \
         "${TOKEN_OS:-}/cli-tools/bin/dispatch" \
         "$HOME/runtimes/Token-OS/live/cli-tools/bin/dispatch" \
-        "${IMPERIUM:-}/runtimes/token-os/live/cli-tools/bin/dispatch" \
-        "/Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/dispatch" \
-        "/mnt/imperium/runtimes/token-os/live/cli-tools/bin/dispatch"
+        "/home/token/runtimes/token-os/live/cli-tools/bin/dispatch"
     do
         [[ -n "$candidate" && -x "$candidate" ]] || continue
         echo "$candidate"
@@ -192,9 +190,7 @@ _resolve_claude_wrapper_bin() {
         "${CLI_TOOLS:-}/scripts/claude-wrapper.sh" \
         "${TOKEN_OS:-}/cli-tools/scripts/claude-wrapper.sh" \
         "$HOME/runtimes/Token-OS/live/cli-tools/scripts/claude-wrapper.sh" \
-        "${IMPERIUM:-}/runtimes/token-os/live/cli-tools/scripts/claude-wrapper.sh" \
-        "/Volumes/Imperium/runtimes/token-os/live/cli-tools/scripts/claude-wrapper.sh" \
-        "/mnt/imperium/runtimes/token-os/live/cli-tools/scripts/claude-wrapper.sh"
+        "/home/token/runtimes/token-os/live/cli-tools/scripts/claude-wrapper.sh"
     do
         [[ -n "$candidate" && -x "$candidate" ]] || continue
         echo "$candidate"

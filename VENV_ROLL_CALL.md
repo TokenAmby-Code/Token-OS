@@ -20,7 +20,7 @@ Venvs must live on **local filesystems**, one per project per machine.
 
 ### 1. token-api (Imperium)
 - **NAS path (Mac):** `/Volumes/Imperium/runtimes/token-os/live/token-api/`
-- **NAS path (WSL):** `/mnt/imperium/runtimes/token-os/live/token-api/`
+- **WSL local runtime path:** `/home/token/runtimes/token-os/live/token-api/`
 - **Python:** >=3.11, managed by `uv`
 - **Key deps:** fastapi, uvicorn, langgraph, apscheduler, rich
 - **WSL local venv:** `~/.local/venvs/token-api`
@@ -57,8 +57,8 @@ Other useful vars:
 - [x] `monitor` alias updated to set `UV_PROJECT_ENVIRONMENT`
 - [x] `.env` updated with `TOKEN_API_URL=http://100.95.109.23:7777` (Mac via Tailscale)
 - [x] `token-restart` — updated for NAS era. Git sync / `scripts-sync` / `--no-push` removed (all devices read from NAS). `--from <dir>` still works for plist updates. Core flow: Mac launchctl restart → WSL satellite restart → open `/ui/ops` browser tabs reload; remote browsers auto-reload on frontend build-id changes.
-- [ ] systemd service (`token-api.service`) — currently disabled, uses `/usr/bin/python3` directly (not uv), WorkingDirectory points to `/mnt/imperium/runtimes/token-os/live/token-api` (old symlink path). **Mac perspective:** Same pattern as Mac's LaunchAgent fix — needs ExecStart pointed to `~/.local/venvs/token-api/bin/python` and WorkingDirectory to `/mnt/imperium/runtimes/token-os/live/token-api`.
-- [ ] **`token-satellite.service` — crash-looping (exit 203/EXEC)**. Service is `enabled` but ExecStart points to `/mnt/imperium/runtimes/token-os/live/token-api/.venv/bin/python` which doesn't exist. The NAS `.venv` at `/mnt/imperium/runtimes/token-os/live/token-api/.venv/` is empty (just CACHEDIR.TAG, empty `bin/`). Needs the same fix as token-api.service: point at local venv `~/.local/venvs/token-api` and update WorkingDirectory to NAS path. Satellite runs on port 7777 and is the Windows execution arm (AHK scripts, TTS, app enforcement). **Currently blocking: pedal-enter feature, all satellite-dependent functionality.**
+- [ ] systemd service (`token-api.service`) — currently disabled, uses `/usr/bin/python3` directly (not uv), WorkingDirectory points to `/home/token/runtimes/token-os/live/token-api` (old symlink path). **Mac perspective:** Same pattern as Mac's LaunchAgent fix — needs ExecStart pointed to `~/.local/venvs/token-api/bin/python` and WorkingDirectory to `/home/token/runtimes/token-os/live/token-api`.
+- [ ] **`token-satellite.service` — crash-looping (exit 203/EXEC)**. Service is `enabled` but ExecStart points to `/home/token/runtimes/token-os/live/token-api/.venv/bin/python` which doesn't exist. The runtime `.venv` at `/home/token/runtimes/token-os/live/token-api/.venv/` is empty (just CACHEDIR.TAG, empty `bin/`). Needs the same fix as token-api.service: point at local venv `~/.local/venvs/token-api` and keep WorkingDirectory on the local runtime path. Satellite runs on port 7777 and is the Windows execution arm (AHK scripts, TTS, app enforcement). **Currently blocking: pedal-enter feature, all satellite-dependent functionality.**
 - [x] askcivic worktrees — `worktree-setup` creates worktrees on local disk (`~/worktrees/askCivic/wt-<branch>`), `uv sync` runs there and creates `.venv` on local FS. No NAS venv issues.
 
 ### Mac
@@ -95,7 +95,7 @@ For monorepos like Scripts/token-api, `SYNC_SUBDIR=token-api` in the `.conf` fil
 - `env -C` not available on macOS — cannot use it as an alternative
 
 ## Stale Artifacts to Clean Up
-- `/mnt/imperium/runtimes/token-os/live/token-api/.venv.old` — renamed macOS venv with darwin `.so` files that can't be deleted due to NAS stale file handles. Try again later or delete from Mac side.
+- `/home/token/runtimes/token-os/live/token-api/.venv.old` — old renamed macOS venv path from the pre-local-runtime era. If present, inspect before deleting.
 - `/Users/tokenclaw/ProcAgentDir/ProcurementAgentAI` — old Mac checkout (pre-worktree). Can be removed once Mac is fully on worktree model.
 
 ### 3. cli-tools (Imperium)
@@ -113,10 +113,10 @@ For monorepos like Scripts/token-api, `SYNC_SUBDIR=token-api` in the `.conf` fil
 monitor
 
 # WSL: Manually sync token-api venv
-cd /mnt/imperium/runtimes/token-os/live/token-api && UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv sync
+cd /home/token/runtimes/token-os/live/token-api && UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv sync
 
 # WSL: Run arbitrary token-api script
-cd /mnt/imperium/runtimes/token-os/live/token-api && UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv run python <script.py>
+cd /home/token/runtimes/token-os/live/token-api && UV_PROJECT_ENVIRONMENT=~/.local/venvs/token-api uv run python <script.py>
 
 # AskCivic: Sync from within a worktree (copy mode, works on NAS)
 cd /mnt/civic/askcivic.worktrees/<branch> && UV_PROJECT_ENVIRONMENT=.venv UV_LINK_MODE=copy uv sync --frozen

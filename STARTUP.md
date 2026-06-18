@@ -201,7 +201,7 @@ Follow-ups:
 - WSL runtime: `/home/token/runtimes/token-os/live`.
 - Windows AHK startup cache: `C:\TokenOS\ahk`.
 - WSL view of that cache: `/mnt/c/TokenOS/ahk`.
-- NAS runtime path `/mnt/imperium/runtimes/token-os/live` is not a startup dependency and must not be used by Windows logon tasks or AHK hotkeys that recover local WSL services.
+- The retired NAS runtime mount is not a startup dependency and must not be used by Windows logon tasks or AHK hotkeys that recover local WSL services.
 
 ## Restart Test Preflight
 

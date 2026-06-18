@@ -8,10 +8,10 @@ Create a fully functional CLI tool based on the user's requirements. The tool sh
 
 ## cli-tools Architecture
 
-All tools live in `/Volumes/Imperium/runtimes/token-os/live/cli-tools/` with this structure:
+All tools live in the local Token-OS runtime checkout under `cli-tools/` with this structure:
 
 ```
-/Volumes/Imperium/runtimes/token-os/live/cli-tools/
+cli-tools/
 ├── bin/                          # Bash wrapper scripts
 │   └── {tool-name}               # Delegates to cli-wrapper
 ├── src/cli_tools/                # Python package
@@ -76,7 +76,10 @@ if __name__ == "__main__":
 Create `bin/{tool-name}`:
 ```bash
 #!/usr/bin/env bash
-exec "/mnt/imperium/runtimes/token-os/live/cli-tools/bin/cli-wrapper" {tool-name} "$@"
+set -euo pipefail
+
+token_os="${TOKEN_OS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+exec "$token_os/cli-tools/bin/cli-wrapper" {tool-name} "$@"
 ```
 
 Make it executable: `chmod +x bin/{tool-name}`
@@ -101,7 +104,7 @@ If your tool needs external packages not already in pyproject.toml, add them to 
 
 ### 7. Sync the Environment
 
-Run: `cd /Volumes/Imperium/runtimes/token-os/live/cli-tools && uv sync`
+Run from the local runtime checkout: `cd "${TOKEN_OS:-$HOME/runtimes/token-os/live}/cli-tools" && uv sync`
 
 This registers the new entry point.
 
