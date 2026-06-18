@@ -1336,6 +1336,7 @@ maybe_enter_worktree() {
     fi
     if (( ${#resume_worktree_matches[@]} > 1 )); then
       WORKTREE_DECISION="resume requested ambiguous worktree branch $WORKTREE_BRANCH"
+      $DRY_RUN && return 0
       err "--worktree $WORKTREE_BRANCH matches multiple existing worktrees; pass --dir for the intended project or use a unique branch"
       local match
       for match in "${resume_worktree_matches[@]}"; do err "  match: $match"; done
@@ -1555,11 +1556,11 @@ if [[ ${#MCP_REQUESTS[@]} -gt 0 ]]; then
   MCP_DECISION="requested: $(IFS=,; echo "${MCP_REQUESTS[*]}")"
 fi
 
-AUTO_PARENT_INSTANCE_ID="${TOKEN_API_PARENT_INSTANCE_ID:-}"
+AUTO_PARENT_INSTANCE_ID=""
 # Caller-pane identity is intentionally NOT auto-resolved here. A singleton pane
 # launching a worker must not leak its instance/persona through TMUX_PANE,
-# TOKEN_API_INSTANCE_ID, or TOKEN_API_PERSONA. Parentage may still be supplied
-# explicitly via TOKEN_API_PARENT_INSTANCE_ID by trusted orchestrators.
+# TOKEN_API_INSTANCE_ID, TOKEN_API_PARENT_INSTANCE_ID, or TOKEN_API_PERSONA.
+# Add a dispatch CLI flag later if trusted orchestrators need explicit parentage.
 
 WRAPPER_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
 COMMON_ENV=(
@@ -1855,7 +1856,7 @@ build_agent_command() {
     fi
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
-  printf 'cd %q && env -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
+  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
   local e
   for e in "${envs[@]}"; do printf ' %q' "$e"; done
   local a

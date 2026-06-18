@@ -47,6 +47,33 @@ def title_slug(slug: str) -> str:
     return "-".join(part[:1].upper() + part[1:] for part in slug.split("-") if part)
 
 
+def _safe_path_component(value: str) -> str:
+    value = value.strip()
+    if not value or value in {".", ".."}:
+        return ""
+    if "/" in value or "\\" in value or Path(value).is_absolute():
+        return ""
+    if any(part in {".", ".."} for part in Path(value).parts):
+        return ""
+    return value
+
+
+def _candidate(root: Path, component: str) -> Path | None:
+    safe = _safe_path_component(component)
+    if not safe:
+        return None
+    return root / "Personas" / f"{safe}.md"
+
+
+def _existing_candidates(root: Path, components: Iterable[str]) -> list[Path]:
+    candidates: list[Path] = []
+    for component in components:
+        candidate = _candidate(root, component)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
 def _imperium_root() -> Path:
     base = os.environ.get("IMPERIUM")
     if base and (Path(base) / "Imperium-ENV").is_dir():
@@ -69,39 +96,27 @@ def _first_existing(candidates: Iterable[Path]) -> Path | None:
 
 
 def behavior_file_for(row: PersonaRow) -> tuple[Path | None, list[Path]]:
-    slug = row.slug.strip().lower()
+    slug = _safe_path_component(row.slug.strip().lower())
     rank = (row.default_rank or "astartes").strip().lower()
-    display = row.display_name.strip()
-    titled = title_slug(slug)
+    display = _safe_path_component(row.display_name.strip())
+    titled = title_slug(slug) if slug else ""
 
     if slug in {"pax", "orchestrator"}:
         root = _pax_root()
-        candidates = [
-            root / "Personas" / f"{slug}.md",
-            root / "Personas" / f"{titled}.md",
-            root / "Personas" / f"{display}.md",
-        ]
+        candidates = _existing_candidates(root, [slug, titled, display])
         return _first_existing(candidates), candidates
 
     root = _imperium_root()
     if rank == "astartes":
-        candidates = [
-            root / "Personas" / f"{titled}.md",
-            root / "Personas" / f"{display}.md",
-            root / "Personas" / f"{slug}.md",
-            root / "Personas" / "Astartes.md",
-        ]
+        candidates = _existing_candidates(root, [titled, display, slug])
+        candidates.append(root / "Personas" / "Astartes.md")
         return _first_existing(candidates), candidates
 
     if rank in {"overseer", "primarch"}:
-        candidates = [
-            root / "Personas" / f"{titled}.md",
-            root / "Personas" / f"{display}.md",
-            root / "Personas" / f"{slug}.md",
-        ]
+        candidates = _existing_candidates(root, [titled, display, slug])
         return _first_existing(candidates), candidates
 
-    candidates = [root / "Personas" / f"{titled}.md"]
+    candidates = _existing_candidates(root, [titled])
     return _first_existing(candidates), candidates
 
 
@@ -167,15 +182,16 @@ def resolve_persona(input_name: str, db_path: Path | None = None) -> PersonaRow 
                 )
         # Compatibility with legacy primarchs lookup while callers migrate.
         if {"name"}.issubset(_table_columns(conn, "primarchs")):
+            raw_like = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             row = conn.execute(
                 """
                 SELECT name
                 FROM primarchs
-                WHERE LOWER(name) = ? OR LOWER(COALESCE(aliases, '')) LIKE ?
+                WHERE LOWER(name) = ? OR LOWER(COALESCE(aliases, '')) LIKE ? ESCAPE '\\'
                 ORDER BY CASE WHEN LOWER(name) = ? THEN 0 ELSE 1 END
                 LIMIT 1
                 """,
-                (raw, f'%"{raw}"%', raw),
+                (raw, f'%"{raw_like}"%', raw),
             ).fetchone()
             if row:
                 name = str(row["name"])
