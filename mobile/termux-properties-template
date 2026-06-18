@@ -21,7 +21,7 @@
 #   - Hold DOWN → types 'exit' + Enter
 #   - Hold ^Space(prefix) → sends tmux prefix then T (toolbar swap)
 extra-keys = [ \
-  [{key: 'DRAWER', popup: {macro: "mac\n", display: 'mac'}}, {macro: "\u001b[Z", display: '⇧Tab', popup: {macro: "\u00002", display: '2'}}, {macro: "\u0012", display: '^R', popup: {macro: "\u00003", display: '3'}}, {macro: "\u0003", display: '^C', popup: {macro: "\u00004", display: '4'}}, {key: 'TAB', popup: {macro: "\u0000e", display: 'e'}}, {macro: "\u0000", display: '^␣', popup: {macro: "\u0000T", display: '⇄'}}, {key: 'KEYBOARD', display: '⌨', popup: 'ENTER'}], \
+  [{key: 'DRAWER', popup: {macro: "\u00001", display: '1'}}, {macro: "\u001b[Z", display: '⇧Tab', popup: {macro: "\u00002", display: '2'}}, {macro: "\u0012", display: '^R', popup: {macro: "\u00003", display: '3'}}, {macro: "\u0003", display: '^C', popup: {macro: "\u00004", display: '4'}}, {key: 'TAB', popup: {macro: "\u0000e", display: 'e'}}, {macro: "\u0000", display: '^␣', popup: {macro: "\u0000T", display: '⇄'}}, {key: 'KEYBOARD', display: '⌨', popup: 'ENTER'}], \
   ['ESC', 'SHIFT', 'ALT', {key: 'CTRL', popup: 'PASTE'}, {key: 'HOME', popup: {macro: "\u0000y", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
   [{key: '|', popup: ':'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
 ]
