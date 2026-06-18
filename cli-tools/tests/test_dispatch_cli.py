@@ -1381,17 +1381,15 @@ def _persona_db(tmp_path: Path, rows: list[tuple[str, str, str]]) -> Path:
     import sqlite3
 
     db = tmp_path / "agents.db"
-    conn = sqlite3.connect(db)
-    conn.execute(
-        "CREATE TABLE personas (id TEXT PRIMARY KEY, slug TEXT UNIQUE, display_name TEXT, default_rank TEXT)"
-    )
-    for idx, (slug, display, rank) in enumerate(rows):
+    with sqlite3.connect(db) as conn:
         conn.execute(
-            "INSERT INTO personas (id, slug, display_name, default_rank) VALUES (?, ?, ?, ?)",
-            (f"p{idx}", slug, display, rank),
+            "CREATE TABLE personas (id TEXT PRIMARY KEY, slug TEXT UNIQUE, display_name TEXT, default_rank TEXT)"
         )
-    conn.commit()
-    conn.close()
+        for idx, (slug, display, rank) in enumerate(rows):
+            conn.execute(
+                "INSERT INTO personas (id, slug, display_name, default_rank) VALUES (?, ?, ?, ?)",
+                (f"p{idx}", slug, display, rank),
+            )
     return db
 
 
@@ -1514,6 +1512,8 @@ def test_dispatch_prompt_file_single_quote_is_shell_safe(tmp_path: Path) -> None
     )
 
     assert result.returncode == 0, result.stderr
-    final = result.stdout.split("  final_command:\n    ", 1)[1].splitlines()[0]
+    final_parts = result.stdout.split("  final_command:\n    ", 1)
+    assert len(final_parts) == 2, result.stdout
+    final = final_parts[1].splitlines()[0]
     syntax = subprocess.run(["bash", "-n", "-c", final], capture_output=True, text=True)
     assert syntax.returncode == 0, syntax.stderr

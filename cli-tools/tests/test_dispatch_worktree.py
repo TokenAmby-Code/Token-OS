@@ -221,26 +221,24 @@ def test_resume_with_worktree_enters_existing_branch_worktree(env: Env, tmp_path
     wt = env.parent / "wt-resume-branch"
     wt.mkdir()
     db = tmp_path / "agents.db"
-    conn = sqlite3.connect(db)
-    conn.executescript(
-        f"""
-        CREATE TABLE session_documents (id INTEGER, file_path TEXT);
-        CREATE TABLE personas (id TEXT PRIMARY KEY, slug TEXT);
-        CREATE TABLE instances (
-          id TEXT PRIMARY KEY, name TEXT, engine TEXT, launcher TEXT, target_working_dir TEXT,
-          working_dir TEXT, dispatch_session_doc_path TEXT, session_doc_id INTEGER,
-          golden_throne TEXT, zealotry TEXT, dispatch_target TEXT, dispatch_window TEXT,
-          dispatch_mode TEXT, dispatch_slot TEXT, launch_mode TEXT, tmux_pane TEXT,
-          persona_id TEXT, commander_type TEXT, commander_id TEXT, discord_hosted TEXT,
-          discord_channel TEXT, discord_bot TEXT, pane_label TEXT,
-          last_activity TEXT
-        );
-        INSERT INTO instances (id, name, engine, working_dir, golden_throne, zealotry, last_activity, commander_type)
-        VALUES ('resume-id', 'Resume', 'claude', '{env.prod}', NULL, '3', '2026-06-18', 'emperor');
-        """
-    )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            f"""
+            CREATE TABLE session_documents (id INTEGER, file_path TEXT);
+            CREATE TABLE personas (id TEXT PRIMARY KEY, slug TEXT);
+            CREATE TABLE instances (
+              id TEXT PRIMARY KEY, name TEXT, engine TEXT, launcher TEXT, target_working_dir TEXT,
+              working_dir TEXT, dispatch_session_doc_path TEXT, session_doc_id INTEGER,
+              golden_throne TEXT, zealotry TEXT, dispatch_target TEXT, dispatch_window TEXT,
+              dispatch_mode TEXT, dispatch_slot TEXT, launch_mode TEXT, tmux_pane TEXT,
+              persona_id TEXT, commander_type TEXT, commander_id TEXT, discord_hosted TEXT,
+              discord_channel TEXT, discord_bot TEXT, pane_label TEXT,
+              last_activity TEXT
+            );
+            INSERT INTO instances (id, name, engine, working_dir, golden_throne, zealotry, last_activity, commander_type)
+            VALUES ('resume-id', 'Resume', 'claude', '{env.prod}', NULL, '3', '2026-06-18', 'emperor');
+            """
+        )
     env.base["TOKEN_API_DB"] = str(db)
 
     res = _run(env, "--id", "resume-id", "--worktree", "resume-branch", "continue")

@@ -100,7 +100,7 @@ def behavior_file_for(row: PersonaRow) -> tuple[Path | None, list[Path]]:
         return _first_existing(candidates), candidates
 
     candidates = [root / "Personas" / f"{titled}.md"]
-    return None, candidates
+    return _first_existing(candidates), candidates
 
 
 def iter_persona_rows(conn: sqlite3.Connection) -> list[PersonaRow]:
