@@ -223,7 +223,7 @@ def test_evaluate_defaults_typing_guard_to_delay(monkeypatch):
     assert result["suppressed"] is True
 
 
-def test_typing_guard_is_scoped_to_target_pane(monkeypatch):
+def test_typing_guard_is_scoped_to_target_pane(monkeypatch: pytest.MonkeyPatch) -> None:
     now = 1_700_000_000
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
 
@@ -253,7 +253,7 @@ def test_typing_guard_is_scoped_to_target_pane(monkeypatch):
     assert send_gate.typing_guard_active(target="%other") is False
 
 
-def test_evaluate_only_blocks_target_under_typing_guard(monkeypatch):
+def test_evaluate_only_blocks_target_under_typing_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
     monkeypatch.setattr(
