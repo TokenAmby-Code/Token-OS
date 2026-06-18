@@ -528,6 +528,68 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
     assert row == ("delivered", "preplan_plan", "/plan create the plan", 1)
 
 
+def test_orphan_session_stop_still_delivers_preplan_oneshot(app_env, monkeypatch):
+    """A Stop whose session has no `instances` row must still deliver an armed
+    preplan_plan one-shot.
+
+    Live failure (session bb6a48cd, pane %191): /preplan armed the one-shot but
+    the Stop session resolved to no registered instance, so handle_stop returned
+    `instance_not_found` BEFORE _fanout_stop_subscriptions ran. The subscription
+    row itself carries the target instance id (== the Stop session_id) and its
+    own pane, so fanout can deliver without a live instance row — it just never
+    got the chance. Identity Discipline forbids self-patching the registry here,
+    but the delivery path must not silently no-op.
+    """
+    hooks = sys.modules["routes.hooks"]
+    # NOTE: deliberately NO _insert_instance for "orphan-session".
+    sent = []
+
+    async def fake_write(pane, payload):
+        sent.append((pane, payload))
+        return {"status": "sent", "operation": "fake"}
+
+    monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
+
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO stop_hook_subscriptions
+           (target_instance_id, target_pane, subscriber_instance_id, subscriber_pane,
+            event, delivery, status, purpose, payload, oneshot)
+           VALUES ('orphan-session', '%191', 'orphan-session', '%191',
+                   'stop', 'prompt', 'active', 'preplan_plan', '/plan create the plan', 1)"""
+    )
+    conn.commit()
+    conn.close()
+
+    async def run() -> None:
+        result = await hooks.handle_stop({"session_id": "orphan-session", "transcript_tail": ""})
+        assert result["stop_subscriptions"][0]["status"] == "sent"
+
+    asyncio.run(run())
+
+    assert sent == [("%191", "/plan create the plan")]
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT status, oneshot FROM stop_hook_subscriptions WHERE target_instance_id='orphan-session'"
+    ).fetchone()
+    conn.close()
+    # One-shot consumed so it does not re-arm on the next Stop.
+    assert row == ("delivered", 1)
+
+
+def test_orphan_session_stop_without_subscription_reports_not_found(app_env):
+    """An orphan Stop with NO deliverable subscription still reports the missing
+    instance — the orphan-fanout path must not mask a genuinely unknown session."""
+    hooks = sys.modules["routes.hooks"]
+
+    async def run() -> None:
+        result = await hooks.handle_stop({"session_id": "ghost-session", "transcript_tail": ""})
+        assert result["success"] is False
+        assert result["action"] == "instance_not_found"
+
+    asyncio.run(run())
+
+
 def test_gated_preplan_oneshot_consumes_sub_but_requeues_plan_for_redrain(
     app_env: Any, monkeypatch: Any
 ) -> None:

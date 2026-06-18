@@ -2148,6 +2148,46 @@ async def _mark_for_close_subscription(
     }
 
 
+async def _fanout_stop_for_orphan_session(session_id: str, payload: dict) -> dict:
+    """Deliver active stop subscriptions for a Stop whose session has no row.
+
+    handle_stop resolves the live ``instances`` row to drive notifications; a
+    miss used to short-circuit to ``instance_not_found`` BEFORE the subscription
+    fanout, silently dropping an armed one-shot (the live /preplan → /plan break).
+    The subscription rows carry their own ``subscriber_pane``, so fanout delivers
+    without a live row. We synthesize a minimal instance whose pane (if the Stop
+    carries one) lets the fanout's pane fallback also match id-drifted rows.
+    """
+    pane = _normalize_text(payload.get("tmux_pane")) or _normalize_text(
+        (payload.get("env") or {}).get("TMUX_PANE")
+    )
+    synthetic = {"id": session_id, "tmux_pane": pane}
+    deliveries = await _fanout_stop_subscriptions(synthetic, payload, None)
+    handled = any(d.get("status") in ("sent", "unverified", "duplicate") for d in deliveries)
+    if handled:
+        return {
+            "success": True,
+            "action": "stop_orphan_fanout",
+            "instance_id": session_id,
+            "stop_subscriptions": deliveries,
+        }
+    if deliveries:
+        # Active subscriptions existed but none delivered — loud, never silent.
+        logger.error(
+            "Stop orphan fanout: session %s had %d active subscription(s) but delivered none: %s",
+            session_id[:12],
+            len(deliveries),
+            deliveries,
+        )
+        return {
+            "success": False,
+            "action": "stop_orphan_fanout_failed",
+            "instance_id": session_id,
+            "stop_subscriptions": deliveries,
+        }
+    return {"success": False, "action": "instance_not_found"}
+
+
 async def _fanout_stop_subscriptions(
     instance: dict, payload: dict, final_response: str | None
 ) -> list[dict]:
@@ -2169,16 +2209,33 @@ async def _fanout_stop_subscriptions(
         f"{response or '[no final assistant text captured]'}\n"
         "</system-reminder>"
     )
+    # Match the armed subscription by the Stop session id, OR — when a pane is
+    # known — by the target pane. The pane fallback covers id drift: a pane that
+    # re-registered under a new instance id (or whose row was reaped mid-turn)
+    # would otherwise strand an active one-shot keyed on the stale id. The
+    # subscription row carries its own subscriber_pane for delivery, so a pane
+    # match is sufficient to deliver without a live instances row.
+    pane = _normalize_text(instance.get("tmux_pane"))
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT * FROM stop_hook_subscriptions
-               WHERE target_instance_id = ?
-                 AND event = 'stop'
-                 AND status = 'active'
-               ORDER BY created_at ASC, id ASC""",
-            (session_id,),
-        )
+        if pane:
+            cursor = await db.execute(
+                """SELECT * FROM stop_hook_subscriptions
+                   WHERE (target_instance_id = ? OR target_pane = ?)
+                     AND event = 'stop'
+                     AND status = 'active'
+                   ORDER BY created_at ASC, id ASC""",
+                (session_id, pane),
+            )
+        else:
+            cursor = await db.execute(
+                """SELECT * FROM stop_hook_subscriptions
+                   WHERE target_instance_id = ?
+                     AND event = 'stop'
+                     AND status = 'active'
+                   ORDER BY created_at ASC, id ASC""",
+                (session_id,),
+            )
         rows = [dict(row) for row in await cursor.fetchall()]
         results = []
         for row in rows:
@@ -2191,6 +2248,25 @@ async def _fanout_stop_subscriptions(
                     subscription=row,
                     stop_event_key=stop_event_key,
                     payload=delivery_payload,
+                )
+            # Loud failure (per no-silent-no-op): a preplan_plan one-shot that
+            # neither sent bytes nor deduped means the /preplan → /plan handoff
+            # did not land. Surface it instead of dropping silently. 'gated' is
+            # exempt — the byte-issue is deferred to the pane_write_queue redrain.
+            if row.get("purpose") == "preplan_plan" and result.get("status") not in (
+                "sent",
+                "unverified",
+                "duplicate",
+                "gated",
+            ):
+                logger.error(
+                    "preplan_plan delivery did not land: sub=%s target_id=%s "
+                    "target_pane=%s subscriber_pane=%s result=%s",
+                    row.get("id"),
+                    row.get("target_instance_id"),
+                    row.get("target_pane"),
+                    row.get("subscriber_pane"),
+                    result,
                 )
             results.append(result)
             if row.get("oneshot") and result.get("status") != "duplicate":
@@ -4644,7 +4720,13 @@ async def handle_stop(payload: dict) -> dict:
         is_custodes_persona = await cursor.fetchone() is not None
 
     if not instance:
-        return {"success": False, "action": "instance_not_found"}
+        # Identity Discipline: a missing instances row for this Stop session is a
+        # registry/harness bug (the pane re-registered under a new id, or the row
+        # was reaped mid-turn). We do NOT self-patch the registry here — but the
+        # delivery path must not silently no-op. An armed one-shot (e.g. the
+        # /preplan → /plan handoff) is keyed on this session_id and carries its
+        # own target pane, so fanout can still deliver without a live row.
+        return await _fanout_stop_for_orphan_session(session_id, payload)
 
     instance = dict(instance)
     device_id = instance.get("device_id", "Mac-Mini")
