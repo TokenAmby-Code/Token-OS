@@ -527,6 +527,100 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
     assert row == ("delivered", "preplan_plan", "/plan create the plan", 1)
 
 
+def test_gated_preplan_oneshot_consumes_sub_but_requeues_plan_for_redrain(app_env, monkeypatch):
+    """A typing-gated Stop must not drop the /preplan -> /plan handoff.
+
+    When the universal send gate suppresses the byte-issue at Stop time, the
+    preplan_plan one-shot is still consumed (status='delivered', so it does not
+    re-arm on the next Stop), but the '/plan create the plan' payload survives
+    as a *pending* pane_write_queue row. The periodic drainer then flushes that
+    exact payload to the pane once the gate clears — the typing guard queues the
+    handoff, it never bounces it.
+    """
+    hooks = sys.modules["routes.hooks"]
+    main = sys.modules["main"]
+    _insert_instance(app_env.db_path, "self-plan", pane="%90")
+
+    async def gated_write(pane, payload):
+        return {"status": "gated", "gate_reason": "typing_guard"}
+
+    monkeypatch.setattr(hooks, "_direct_pane_write", gated_write)
+
+    async def arm_and_stop() -> dict:
+        sub = await hooks.subscribe_hook(
+            hooks.HookSubscribeRequest(
+                target_pane="%90",
+                subscriber_pane="%90",
+                purpose="preplan_plan",
+                payload="/plan create the plan",
+                oneshot=True,
+            )
+        )
+        assert sub["success"] is True
+        return await hooks.handle_stop({"session_id": "self-plan", "transcript_tail": ""})
+
+    result = asyncio.run(arm_and_stop())
+    # Gate suppressed the live send (no bytes issued).
+    assert result["stop_subscriptions"][0]["status"] == "gated"
+
+    conn = sqlite3.connect(app_env.db_path)
+    sub_row = conn.execute(
+        "SELECT status, oneshot FROM stop_hook_subscriptions WHERE target_instance_id='self-plan'"
+    ).fetchone()
+    queue_row = conn.execute(
+        "SELECT id, status, source, purpose, payload, instance_id "
+        "FROM pane_write_queue WHERE purpose='stop_subscription'"
+    ).fetchone()
+    conn.close()
+
+    # One-shot is consumed so the next Stop does not re-arm it...
+    assert sub_row == ("delivered", 1)
+    # ...but the handoff payload is parked pending for the periodic re-drain.
+    assert queue_row is not None
+    queue_id, q_status, q_source, q_purpose, q_payload, q_instance = queue_row
+    assert (q_status, q_source, q_purpose, q_payload) == (
+        "pending",
+        "hook",
+        "stop_subscription",
+        "/plan create the plan",
+    )
+
+    # Gate clears: the drainer flushes the SAME pending row to the pane.
+    sent: list = []
+
+    async def resolve(instance_id):
+        return ("%90", None) if instance_id == q_instance else (None, None)
+
+    async def no_pending_input(_pane):
+        return False
+
+    async def ok_send(pane, payload, *, clear_prompt=False):
+        sent.append((pane, payload))
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "verification_status": "unverified",
+            "verified_by": None,
+        }
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", resolve)
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", no_pending_input)
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", ok_send)
+
+    drained = asyncio.run(main.process_pane_write_queue_once(queue_id))
+
+    assert sent == [("%90", "/plan create the plan")]
+    assert drained[0]["status"] == main.PANE_WRITE_SENT
+    conn = sqlite3.connect(app_env.db_path)
+    final_status = conn.execute(
+        "SELECT status FROM pane_write_queue WHERE id = ?", (queue_id,)
+    ).fetchone()[0]
+    conn.close()
+    assert final_status == "sent"
+
+
 def test_mark_for_close_stop_subscription_retires_after_closing_pane(
     app_env: object, monkeypatch: object
 ) -> None:
