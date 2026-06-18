@@ -392,8 +392,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if metal_result.ok else 1
 
         if args.command == "doctor":
-            print(control.doctor(args.session))
-            return 0
+            output = control.doctor(args.session)
+            try:
+                from persona_behavior import invariant_issues
+
+                persona_issues = invariant_issues()
+            except Exception as exc:  # pragma: no cover - defensive doctor surface
+                persona_issues = [f"persona behavior invariant check errored: {exc}"]
+            if persona_issues:
+                output = output + "\n" + "\n".join(f"  ! {issue}" for issue in persona_issues)
+            print(output)
+            return 1 if persona_issues else 0
 
         if args.command == "resolve-pane":
             resolved = control.resolve_pane(args.target)

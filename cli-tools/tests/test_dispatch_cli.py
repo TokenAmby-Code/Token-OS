@@ -1372,3 +1372,148 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     assert "TOKEN_API_DISPATCH_RESOLVED_PANE=mechanicus:new" not in content, content
     # The allocation token remains the semantic request target.
     assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in content, content
+
+
+# --- Step 3: rank-based persona behavior resolver / row-file invariant ---------
+
+
+def _persona_db(tmp_path: Path, rows: list[tuple[str, str, str]]) -> Path:
+    import sqlite3
+
+    db = tmp_path / "agents.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE personas (id TEXT PRIMARY KEY, slug TEXT UNIQUE, display_name TEXT, default_rank TEXT)"
+    )
+    for idx, (slug, display, rank) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO personas (id, slug, display_name, default_rank) VALUES (?, ?, ?, ?)",
+            (f"p{idx}", slug, display, rank),
+        )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _persona_env(tmp_path: Path, db: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["TOKEN_API_DB"] = str(db)
+    imperium = tmp_path / "vaults" / "Imperium"
+    civic = tmp_path / "vaults" / "Civic"
+    (imperium / "Imperium-ENV" / "Personas").mkdir(parents=True)
+    (civic / "Pax-ENV" / "Personas").mkdir(parents=True)
+    env["IMPERIUM"] = str(imperium)
+    env["CIVIC"] = str(civic)
+    return env
+
+
+def test_dispatch_persona_invariant_fails_loud_when_astartes_file_missing(tmp_path: Path) -> None:
+    db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
+    env = _persona_env(tmp_path, db)
+
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "work"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 66
+    assert "persona behavior file missing: slug=blood-angels" in result.stderr
+    assert "persona behavior-file invariant failed" in result.stderr
+
+
+def test_dispatch_astartes_row_uses_generic_rank_file_when_slug_file_absent(tmp_path: Path) -> None:
+    db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
+    env = _persona_env(tmp_path, db)
+    (Path(env["IMPERIUM"]) / "Imperium-ENV" / "Personas" / "Astartes.md").write_text(
+        "## System Prompt\nGeneric rank behavior\n", encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "--persona",
+            "blood-angels",
+            "work",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "persona:         blood-angels" in result.stdout
+    assert "Generic rank behavior" in result.stdout
+
+
+def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Path) -> None:
+    db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
+    env = _persona_env(tmp_path, db)
+    (Path(env["IMPERIUM"]) / "Imperium-ENV" / "Personas" / "Astartes.md").write_text(
+        "## System Prompt\nGeneric\n", encoding="utf-8"
+    )
+    env.update(
+        {
+            "TMUX_PANE": "%55",
+            "TOKEN_API_INSTANCE_ID": "fabricator-general-live-id",
+            "TOKEN_API_PERSONA": "fabricator-general",
+            "TOKEN_API_LEGION": "mechanicus",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "--target",
+            "mechanicus:new",
+            "worker task",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TOKEN_API_PARENT_INSTANCE_ID=fabricator-general-live-id" not in result.stdout
+    assert "TOKEN_API_PERSONA=fabricator-general" not in result.stdout
+    assert "TOKEN_API_LEGION=mechanicus" not in result.stdout
+    assert "-u TOKEN_API_INSTANCE_ID" in result.stdout
+
+
+def test_dispatch_prompt_file_single_quote_is_shell_safe(tmp_path: Path) -> None:
+    db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
+    env = _persona_env(tmp_path, db)
+    (Path(env["IMPERIUM"]) / "Imperium-ENV" / "Personas" / "Astartes.md").write_text(
+        "## System Prompt\nGeneric\n", encoding="utf-8"
+    )
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("it's time — don't break ✓\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "--prompt-file", str(prompt)],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    final = result.stdout.split("  final_command:\n    ", 1)[1].splitlines()[0]
+    syntax = subprocess.run(["bash", "-n", "-c", final], capture_output=True, text=True)
+    assert syntax.returncode == 0, syntax.stderr
