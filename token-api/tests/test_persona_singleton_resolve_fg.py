@@ -1,12 +1,12 @@
 """Empirical reproduction of the Custodes-specified shadow scenario for
 resolve_live_persona_instance, FG (fabricator-general):
 
-  PRIMARY  : overseer singleton + live chapter children sharing persona_id
+  PRIMARY  : overseer singleton + live chapter children
              -> must resolve to the OVERSEER, ignoring chapter children.
   SECONDARY: active overseer + a retired row sharing persona_id
              -> must resolve to the active overseer, never the retired row.
-  EDGE     : orphan chapter-child insert (no live overseer commander)
-             -> must fail with sqlite3.IntegrityError via chapter_persona_guard.
+  EDGE     : orphan chapter-child insert (no live commander)
+             -> must fail with sqlite3.IntegrityError via chapter commander guard.
 """
 
 from __future__ import annotations
@@ -103,7 +103,8 @@ def test_fg_primary_chapter_children_do_not_shadow_overseer(app_env: Any) -> Non
         status="working",
         last_activity="2025-01-01T00:00:00",
     )
-    # Two dispatched workers parented to FG, sharing persona_id, MORE recent.
+    # Two dispatched workers parented to FG, MORE recent.  Same-persona chapter
+    # children remain legal but must not shadow the singleton resolver.
     _insert_instance(
         conn,
         id="fg-child-1",
@@ -160,11 +161,11 @@ def test_fg_secondary_retired_row_not_selected(app_env: Any) -> None:
 
 
 def test_chapter_child_cannot_exist_without_live_overseer(app_env: Any) -> None:
-    """Why the chapter filter is always safe: the schema's chapter_persona_guard
-    forbids a chapter child whose commander is not a live row sharing its
-    persona_id. So whenever a chapter child exists, its emperor/persona-commanded
-    overseer also exists — resolve_live_persona_instance is never left with only
-    chapter rows to choose from."""
+    """Why the chapter filter is always safe: the schema's commander guard
+    forbids a chapter child whose commander is not a live row.  So whenever a
+    chapter child exists, its emperor/persona-commanded commander also exists —
+    resolve_live_persona_instance is never left with only chapter rows to choose
+    from."""
     conn = _conn(app_env.db_path)
     fg = _persona(conn, "fabricator-general")
     raised = False
@@ -194,7 +195,7 @@ def test_chapter_child_cannot_exist_without_live_overseer(app_env: Any) -> None:
         )
     except sqlite3.IntegrityError as exc:
         raised = True
-        assert "chapter commander must be active and share persona_id" in str(exc)
+        assert "chapter commander must be active" in str(exc)
     finally:
         conn.close()
     assert raised, "schema must forbid an orphan chapter child (no live commander)"

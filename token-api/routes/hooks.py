@@ -569,14 +569,24 @@ async def _apply_commander_binding(
         )
         parent = await cursor.fetchone()
         if parent:
+            cursor = await db.execute(
+                "SELECT persona_id FROM instances WHERE id = ?",
+                (instance_id,),
+            )
+            child = await cursor.fetchone()
+            updates = {
+                "commander_type": "chapter",
+                "commander_id": parent[0],
+            }
+            # Parent binding is control, not identity.  Do not overwrite a persona
+            # already resolved from the launch env / dispatch context; inherit the
+            # parent's persona only for truly persona-less rows.
+            if child is not None and child[0] is None:
+                updates["persona_id"] = parent[1]
             await sanctioned_update_instance_record(
                 db,
                 instance_id=instance_id,
-                updates={
-                    "persona_id": parent[1],
-                    "commander_type": "chapter",
-                    "commander_id": parent[0],
-                },
+                updates=updates,
                 mutation_type="commander_binding_changed",
                 write_source="hooks",
                 actor="SessionStart",
@@ -3532,7 +3542,10 @@ async def handle_session_start(payload: dict) -> dict:
                 "working_dir": working_dir,
                 "origin_type": origin_type,
                 "device_id": device_id,
-                "profile_name": profile["name"],
+                # TOKEN_API_PERSONA is an explicit identity assignment from the
+                # dispatch/env path.  Let it win over the randomly assigned voice
+                # profile so chapter-parent binding cannot steal singleton identity.
+                "profile_name": primarch_name or profile["name"],
                 "tts_voice": profile["wsl_voice"],
                 "notification_sound": profile["notification_sound"],
                 "status": "idle",

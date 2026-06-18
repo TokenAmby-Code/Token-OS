@@ -138,7 +138,12 @@ async def _prepare_chapter_commander(db, values: dict) -> dict:
     cursor = await db.execute("SELECT persona_id FROM instances WHERE id = ?", (commander_id,))
     commander = await cursor.fetchone()
     if commander:
-        values["persona_id"] = commander[0]
+        # A chapter edge conveys control, not identity.  Preserve an already
+        # resolved worker persona (from TOKEN_API_PERSONA / TOKEN_API_LEGION /
+        # dispatch context); inherit the commander's persona only as the legacy
+        # fallback for rows that arrived with no persona at all.
+        if values.get("persona_id") is None:
+            values["persona_id"] = commander[0]
     else:
         # A chapter edge must point at a live commander row in `instances`
         # (the legacy legacy instance table fallback died with the extraction).
@@ -155,7 +160,11 @@ def _prepare_chapter_commander_sync(db, values: dict) -> dict:
         "SELECT persona_id FROM instances WHERE id = ?", (commander_id,)
     ).fetchone()
     if commander:
-        values["persona_id"] = commander[0]
+        # A chapter edge conveys control, not identity.  Preserve an already
+        # resolved worker persona; inherit the commander's persona only as the
+        # fallback for rows that arrived with no persona at all.
+        if values.get("persona_id") is None:
+            values["persona_id"] = commander[0]
     else:
         values["commander_type"] = "emperor"
         values["commander_id"] = None
