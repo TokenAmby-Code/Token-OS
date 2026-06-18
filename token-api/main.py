@@ -13104,6 +13104,13 @@ def _sync_update_daily_note():
     except Exception:
         pass  # Silently skip if DB query fails
 
+    # Snap last_timer_update to the 30-min grid so this purely-time-derived field is
+    # stable for 30 min at a time. Combined with update_frontmatter's write-skip guard,
+    # the 30s poll becomes a near-total no-op except at the grid boundary or on a real
+    # timer-state change.
+    _now = datetime.now()
+    last_timer_update = _now.replace(minute=(_now.minute // 30) * 30).strftime("%H:%M")
+
     update_frontmatter(
         note_path,
         {
@@ -13117,7 +13124,7 @@ def _sync_update_daily_note():
             "timer_backlog": format_timer_time(abs(min(0, timer_engine.break_balance_ms))),
             "timer_sessions": session_count,
             "timer_mode_changes": mode_change_count,
-            "last_timer_update": datetime.now().strftime("%H:%M:%S"),
+            "last_timer_update": last_timer_update,
         },
     )
 

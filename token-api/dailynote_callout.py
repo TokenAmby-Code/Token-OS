@@ -169,14 +169,23 @@ def apply_callout(
     path = Path(file_path)
     block = render_callout_block(callout_id, content, title, callout_type)
 
-    # Serialize against the frontmatter writer (and any other in-process writer
-    # to this note) so their read→write windows cannot interleave-destroy.
-    with file_write_lock(path):
+    # Lazy import keeps import-time light (mirrors update_frontmatter's pattern).
+    from vault_lock import file_flock
+
+    # Lock ordering: cross-process flock → in-process threading lock → RMW. The
+    # flock serializes against other processes (the `obsidian` CLI); the threading
+    # lock serializes against other in-process writers to this note.
+    with file_flock(path), file_write_lock(path):
         last_conflict: CalloutConflictError | None = None
         for _attempt in range(max_attempts):
             stat = path.stat()  # FileNotFoundError intentionally bubbles to the API as 404.
             existing = path.read_text(encoding="utf-8")
             updated, action = _replace_or_append(existing, callout_id, block)
+            # Write-skip: if the rendered output is byte-identical to what's on
+            # disk, return without touching the file so mtime never moves (no
+            # spurious Obsidian-sync re-trigger / collision window).
+            if updated == existing:
+                return CalloutWriteResult(action="unchanged", bytes_written=0, path=path)
             try:
                 bytes_written = _atomic_write(path, updated, stat.st_mtime_ns)
                 return CalloutWriteResult(action=action, bytes_written=bytes_written, path=path)

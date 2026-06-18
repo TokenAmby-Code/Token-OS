@@ -18,13 +18,32 @@ def test_compose_now_markdown_structure_and_mst_timestamp():
 
     body = compose_now_markdown(telemetry, now=now)
 
-    assert "**Block:** 16:23 MST live snapshot" in body
+    # Clock lines are floored to the 30-min grid (16:23 → 16:00); state fields
+    # still reflect live telemetry.
+    assert "**Block:** 16:00 MST live snapshot" in body
     assert "**Posture:** custodes daily-note surface" in body
     assert "**Balance:** +12min · timer mode: WORKING" in body
     assert "**Active:** custodes-main, mechanicus-pr-37" in body
     assert "**Geofence:** home · desktop_mode: code" in body
     assert "**Cascade:** none in last hour" in body
-    assert "*Last updated 16:23 MST*" in body
+    assert "*Last updated 16:00 MST*" in body
+
+
+def test_compose_now_markdown_floors_clock_to_30_min_grid():
+    """The two clock lines snap to HH:00 / HH:30; :00–:29 → HH:00, :30–:59 → HH:30."""
+    telemetry = NowWidgetTelemetry(
+        timer={"current_mode": "working", "break_balance_ms": 0},
+        active_instances=[],
+        location_zone="home",
+        desktop_mode="code",
+        recent_cascade=None,
+    )
+    cases = {5: "09:00", 29: "09:00", 31: "09:30", 59: "09:30"}
+    for minute, expected in cases.items():
+        now = datetime(2026, 5, 9, 9, minute, 17, tzinfo=ZoneInfo("America/Phoenix"))
+        body = compose_now_markdown(telemetry, now=now)
+        assert f"**Block:** {expected} MST live snapshot" in body, (minute, body)
+        assert f"*Last updated {expected} MST*" in body, (minute, body)
 
 
 def test_compose_derives_v2_timer_mode_when_flat_mode_absent():
