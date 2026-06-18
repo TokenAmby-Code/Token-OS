@@ -40,10 +40,12 @@ esac
 HOME_DIR="${HOME%/}"
 
 default_roots() {
+    # Local-filesystem runtimes only. chmod is a silent no-op on network mounts
+    # (SMB/CIFS — e.g. /Volumes/Imperium, /mnt/imperium), so the boundary cannot
+    # enforce there; never list a path we can't actually lock. NAS runtimes are
+    # retired by the local-runtime cutover, not protected here.
     local roots=()
     roots+=("${TOKEN_OS_RUNTIME_CHECKOUT:-${HOME_DIR}/runtimes/Token-OS/live}")
-    roots+=("/Volumes/Imperium/runtimes/token-os/live")
-    roots+=("/mnt/imperium/runtimes/token-os/live")
     roots+=("/home/token/runtimes/token-os/live")
 
     local seen=""
@@ -59,7 +61,12 @@ default_roots() {
 if [[ $# -gt 0 ]]; then
     ROOTS=("$@")
 else
-    mapfile -t ROOTS < <(default_roots)
+    # Portable read loop instead of `mapfile` (bash 4+) so the no-arg default
+    # path works on macOS's stock bash 3.2 too.
+    ROOTS=()
+    while IFS= read -r _root; do
+        ROOTS+=("$_root")
+    done < <(default_roots)
 fi
 
 is_git_checkout() {

@@ -129,6 +129,21 @@ def test_lock_warns_and_fails_when_chmod_is_a_noop(tmp_path) -> None:
     assert has_any_write(root), "no-op chmod must leave write bits"
 
 
+def test_default_roots_exclude_unprotectable_network_mounts(tmp_path) -> None:
+    # default_roots() must list only local-filesystem runtimes. NAS/CIFS paths
+    # (SMB) silently no-op chmod, so the boundary can't enforce there; the tool
+    # must not claim to protect a path it can't lock. `status` with no path args
+    # iterates default_roots(), so its output is how we observe the root list.
+    env = {**os.environ, "TOKEN_OS_RUNTIME_CHECKOUT": str(tmp_path / "live")}
+    proc = run("status", env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "/Volumes/Imperium/runtimes/token-os/live" not in proc.stdout
+    assert "/mnt/imperium/runtimes/token-os/live" not in proc.stdout
+    # the local default root is still present (here: the overridden checkout)
+    assert str(tmp_path / "live") in proc.stdout
+
+
 def test_lock_sets_git_filemode_false_so_status_stays_clean(tmp_path) -> None:
     root = tmp_path / "runtime"
     root.mkdir()
