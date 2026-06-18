@@ -24,12 +24,24 @@ $CopyMap = @(
         Target = Join-Path $UserProfile "ahk-nas-wait.bat"
     },
     @{
+        Source = Join-Path $AhkDir "ring-remap.ahk"
+        Target = Join-Path $StartupRoot "ring-remap.ahk"
+    },
+    @{
         Source = Join-Path $PSScriptRoot "Invoke-DeskflowBoot.ps1"
         Target = Join-Path $StartupRoot "Invoke-DeskflowBoot.ps1"
     },
     @{
         Source = Join-Path $PSScriptRoot "Start-BluetoothAudioReceiver.ps1"
         Target = Join-Path $StartupRoot "Start-BluetoothAudioReceiver.ps1"
+    },
+    @{
+        Source = Join-Path $PSScriptRoot "Open-BluetoothAudioReceiverConnection.ps1"
+        Target = Join-Path $StartupRoot "Open-BluetoothAudioReceiverConnection.ps1"
+    },
+    @{
+        Source = Join-Path $PSScriptRoot "Repair-BonjourLsaBlock.ps1"
+        Target = Join-Path $StartupRoot "Repair-BonjourLsaBlock.ps1"
     }
 )
 
@@ -52,6 +64,33 @@ foreach ($item in $CopyMap) {
         New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
     }
     Copy-Item -Force $item.Source $item.Target
+}
+
+$DisabledStartupRoot = Join-Path $StartupRoot "DisabledStartupShortcuts"
+New-Item -ItemType Directory -Force -Path $DisabledStartupRoot | Out-Null
+
+# These are now owned by startup.ahk so it can place/minimize them consistently.
+$WisprStartupShortcuts = @(
+    (Join-Path ([Environment]::GetFolderPath("Startup")) "Wispr Flow.lnk"),
+    (Join-Path ([Environment]::GetFolderPath("CommonStartup")) "Wispr Flow.lnk"),
+    (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\Wispr Flow.lnk"),
+    (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Startup\Wispr Flow.lnk")
+) | Select-Object -Unique
+foreach ($WisprStartupShortcut in $WisprStartupShortcuts) {
+    if (Test-Path $WisprStartupShortcut) {
+        Move-Item -Force $WisprStartupShortcut (Join-Path $DisabledStartupRoot "Wispr Flow.lnk")
+        Write-Host "Disabled Startup folder shortcut: Wispr Flow ($WisprStartupShortcut)"
+    }
+}
+
+# Phone Link is a packaged app startup task, not a classic Run/Startup entry.
+# Disable its login startup task. Phone Link remains manual until we have a
+# no-main-monitor-flash launch wrapper.
+$PhoneLinkStartupTaskKey = "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\Microsoft.YourPhone_8wekyb3d8bbwe\YourPhone.Start"
+if (Test-Path $PhoneLinkStartupTaskKey) {
+    Set-ItemProperty -Path $PhoneLinkStartupTaskKey -Name "State" -Type DWord -Value 1
+    Set-ItemProperty -Path $PhoneLinkStartupTaskKey -Name "UserEnabledStartupOnce" -Type DWord -Value 0
+    Write-Host "Disabled packaged startup task: Phone Link / YourPhone.Start"
 }
 
 $TaskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -93,26 +132,24 @@ function Register-ImperiumLogonTask {
 $StartupAhk = Join-Path $UserProfile "startup.ahk"
 $AhkNasWait = Join-Path $UserProfile "ahk-nas-wait.bat"
 
-# Belt-and-suspenders fallback for the non-elevated bootstrap. If the scheduled
-# task is stale, disabled, or blocked by permissions, HKCU Run still starts the
-# local startup.ahk copy at interactive logon. #SingleInstance in startup.ahk
-# makes this safe even when ahk_boot also succeeds.
+# The Task Scheduler entry is the single owner for startup. HKCU Run caused a
+# duplicate startup.ahk execution and duplicate ops cockpit windows.
 $RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-$RunValue = "`"$AhkExe`" `"$StartupAhk`""
-New-Item -Path $RunKey -Force | Out-Null
-Set-ItemProperty -Path $RunKey -Name "ImperiumStartupAhk" -Value $RunValue
-Write-Host "Registered HKCU Run fallback: ImperiumStartupAhk"
+if (Test-Path $RunKey) {
+    Remove-ItemProperty -Path $RunKey -Name "ImperiumStartupAhk" -ErrorAction SilentlyContinue
+    Write-Host "Removed HKCU Run fallback: ImperiumStartupAhk"
+}
 
 Register-ImperiumLogonTask `
     -TaskName "ahk_boot" `
-    -Description "Windows logon bootstrap: monitor TUI, Deskflow phased restart, Bluetooth Audio Receiver, startup hotkeys" `
+    -Description "Windows logon bootstrap: WSL boot, Deskflow phased restart, Bluetooth Audio Receiver, startup hotkeys, app placement" `
     -Execute $AhkExe `
     -Arguments "`"$StartupAhk`"" `
     -Principal $LimitedPrincipal
 
 Register-ImperiumLogonTask `
     -TaskName "ahk_init" `
-    -Description "Start the main NAS-backed AutoHotkey suite" `
+    -Description "Start the main local-cache AutoHotkey suite" `
     -Execute $AhkNasWait `
     -Arguments "script-compiler" `
     -Principal $LimitedPrincipal
@@ -141,5 +178,5 @@ Write-Host "  $StartupRoot"
 Write-Host ""
 Write-Host "Tasks now managed by this script:"
 Write-Host "  ahk_boot   - local startup bootstrap"
-Write-Host "  ahk_init   - NAS-backed main AutoHotkey suite"
+Write-Host "  ahk_init   - local-cache main AutoHotkey suite"
 Write-Host "  ahk_admin  - elevated ring remap"

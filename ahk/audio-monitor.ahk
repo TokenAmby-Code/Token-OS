@@ -122,6 +122,32 @@ DetectSteamGame() {
     return false
 }
 
+IsWindowOnLeftVerticalMonitor(hwnd) {
+    try {
+        WinGetPos(&x, &y, &width, &height, "ahk_id " . hwnd)
+    } catch {
+        return false
+    }
+
+    centerX := x + Floor(width / 2)
+    centerY := y + Floor(height / 2)
+    monitorCount := MonitorGetCount()
+
+    Loop monitorCount {
+        MonitorGet(A_Index, &left, &top, &right, &bottom)
+        monitorWidth := right - left
+        monitorHeight := bottom - top
+
+        if (monitorHeight > monitorWidth && right <= 0) {
+            if (centerX >= left && centerX < right && centerY >= top && centerY < bottom) {
+                return true
+            }
+        }
+    }
+
+    return false
+}
+
 DetectAudioState() {
     ; Check if we're in manual lock mode
     if (AM_STATE.isLocked) {
@@ -234,6 +260,18 @@ DetectAudioState() {
             for hwnd in windows {
                 try {
                     title := WinGetTitle("ahk_id " . hwnd)
+
+                    ; Brave also hosts infrastructure surfaces such as the
+                    ; startup ops cockpit. Only media titles count as video.
+                    if (InStr(title, "Ops Cockpit")) {
+                        continue
+                    }
+
+                    ; The left vertical monitor is the official ops surface.
+                    ; Brave windows there are operational displays, not video.
+                    if (IsWindowOnLeftVerticalMonitor(hwnd)) {
+                        continue
+                    }
 
                     ; Check if "YouTube" is in the title
                     if (InStr(title, "YouTube")) {

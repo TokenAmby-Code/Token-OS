@@ -73,7 +73,7 @@ IsVoiceChatActive() {
 
 ; ============== CONFIGURATION ==============
 RING_DEVICE_ID := 0  ; Auto-detected below (set manually to override)
-MINIMUM_RING_ID := 14  ; IDs below this are assumed to be built-in devices (trackpad, etc.)
+MINIMUM_RING_ID := 20  ; IDs below this are regular/built-in mice on the current rig
 TAP_THRESHOLD_MS := 200  ; Mod-tap threshold for right button
 LEFT_TAP_THRESHOLD_MS := 200  ; Mod-tap threshold for left button
 DOUBLE_TAP_MS := 500  ; Double-tap window for Enter
@@ -86,7 +86,9 @@ TRAYTIP_DURATION_MS := 2000  ; Auto-dismiss tray notifications after 2 seconds
 
 ; ============== AUTO-DETECT RING DEVICE ==============
 ; The Bluetooth ring gets a floating device ID that changes on reconnect.
-; Known stable devices are typically IDs 11-13 (built-in trackpad, etc.)
+; Known stable devices used to be IDs 11-13, but regular mice have appeared
+; above ID 14 on this rig. Keep the floor high enough to avoid binding normal
+; mouse input as the ring.
 ; The ring is always the highest mouse device ID.
 ; Set RING_DEVICE_ID above to a specific value to override auto-detection.
 
@@ -225,7 +227,7 @@ IsDevicePresent(deviceId) {
 }
 
 ; Ring Remapper - D06 Pro ring with gestures and Wispr Flow
-; Ring device ID: 14
+; Ring device ID: auto-detected above MINIMUM_RING_ID
 ; Press Ctrl+Shift+Escape to exit
 
 
