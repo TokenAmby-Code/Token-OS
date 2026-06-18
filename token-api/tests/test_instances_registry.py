@@ -249,7 +249,7 @@ def test_active_persona_lock_is_rank_based(app_env):
     assert retired == "retired"
 
 
-def test_singleton_reregister_retires_previous_stale(app_env):
+def test_singleton_reregister_retires_previous_stale(app_env: object) -> None:
     conn = _conn(app_env.db_path)
     pid = _persona(conn, "custodes")
     _insert_instance(conn, id="old-custodes", persona_id=pid, rank="overseer", status="stopped")
@@ -264,7 +264,9 @@ def test_singleton_reregister_retires_previous_stale(app_env):
     ]
 
 
-def test_emperor_singleton_insert_cannot_steal_working_incumbent_regardless_commander_type(app_env):
+def test_emperor_singleton_insert_cannot_steal_working_incumbent_regardless_commander_type(
+    app_env: object,
+) -> None:
     """RED: an emperor-path singleton insert must not retire/replace a working
     incumbent row for the same singleton persona, even if that incumbent carries
     a non-emperor commander_type. The live apply/migration gate owns deploying
