@@ -309,6 +309,70 @@ def test_preplan_on_already_planning_instance_does_not_arm_followup(app_env, mon
     assert _subscription(app_env.db_path, "already-planning-1") is None  # no stray arm
 
 
+# ── Tag-wrapped /preplan & /plan skill invocations (the real Claude Code path) ──
+
+# Claude Code delivers a slash-command/skill invocation to UserPromptSubmit with the
+# command buried in <command-name> tags + the skill body appended — NOT as a leading
+# token. After lstrip() the prompt starts with "<command-message>…", so the old
+# leading-token matcher never fired. These pin the wrapper-aware detection.
+_WRAPPED_PREPLAN_PROMPT = (
+    "<command-message>preplan</command-message>\n"
+    "<command-name>/preplan</command-name>\n"
+    "<command-args>lets test live, this is a real preplan request</command-args>\n"
+    "Base directory for this skill: /Users/x/.claude/skills/preplan\n"
+    "# Preplan\n"
+    "...skill body...\n"
+)
+_WRAPPED_PLAN_PROMPT = (
+    "<command-message>plan</command-message>\n"
+    "<command-name>/plan</command-name>\n"
+    "<command-args>create the plan</command-args>\n"
+    "Base directory for this skill: /Users/x/.claude/skills/plan\n"
+    "# Plan\n"
+    "...skill body...\n"
+)
+
+
+def test_wrapped_preplan_skill_sets_preplanning_and_arms_plan_followup(
+    app_env, monkeypatch
+) -> None:
+    _insert_instance(app_env.db_path, "wrapped-preplan-1", pane="%80", engine="claude")
+
+    _prompt_submit(
+        app_env,
+        monkeypatch,
+        {"session_id": "wrapped-preplan-1", "prompt": _WRAPPED_PREPLAN_PROMPT},
+    )
+
+    state, source = _planning(app_env.db_path, "wrapped-preplan-1")
+    assert state == "preplanning"
+    assert source == "preplan:prompt-submit"
+    assert _subscription(app_env.db_path, "wrapped-preplan-1") == (
+        "active",
+        "preplan_plan",
+        "/plan create the plan",
+        1,
+        "%80",
+        "%80",
+    )
+
+
+def test_wrapped_plan_skill_sets_planning(app_env, monkeypatch) -> None:
+    _insert_instance(app_env.db_path, "wrapped-plan-1", pane="%81", engine="claude")
+
+    _prompt_submit(
+        app_env,
+        monkeypatch,
+        {"session_id": "wrapped-plan-1", "prompt": _WRAPPED_PLAN_PROMPT},
+    )
+
+    state, source = _planning(app_env.db_path, "wrapped-plan-1")
+    assert state == "planning"
+    assert source == "auto-clear:prompt-submit"
+    # A /plan invocation must NOT arm the preplan follow-up.
+    assert _subscription(app_env.db_path, "wrapped-plan-1") is None
+
+
 def test_codex_prompt_submit_transcript_plan_context_sets_planning(
     app_env,
     monkeypatch,
