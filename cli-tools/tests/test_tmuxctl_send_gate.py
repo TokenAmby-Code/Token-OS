@@ -223,6 +223,52 @@ def test_evaluate_defaults_typing_guard_to_delay(monkeypatch):
     assert result["suppressed"] is True
 
 
+def test_typing_guard_is_scoped_to_target_pane(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "display-message" in cmd and "#{client_activity}" in cmd and "-t" not in cmd:
+            proc.stdout = f"{now}\n"
+            return proc
+        if "display-message" in cmd and "-t" in cmd and "%active" in cmd:
+            proc.stdout = "11\n"
+            return proc
+        if "display-message" in cmd and "-t" in cmd and "%other" in cmd:
+            proc.stdout = "00\n"
+            return proc
+        if "list-clients" in cmd and "%active" in cmd:
+            proc.stdout = "x\n"
+            return proc
+        if "capture-pane" in cmd and "-t" in cmd:
+            proc.stdout = "> \n"
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    assert send_gate.typing_guard_active(target="%active") is True
+    assert send_gate.typing_guard_active(target="%other") is False
+
+
+def test_evaluate_only_blocks_target_under_typing_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    monkeypatch.setattr(
+        send_gate,
+        "typing_guard_active",
+        lambda **kw: kw.get("target") == "%guarded",
+    )
+
+    blocked = send_gate.evaluate(("send-keys", "-t", "%guarded", "hi"))
+    allowed = send_gate.evaluate(("send-keys", "-t", "%clear", "hi"))
+
+    assert blocked is not None and blocked["reason"] == "typing_guard"
+    assert allowed is None
+
+
 @pytest.fixture
 def fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict:
     """Deterministic time for the delay path: sleep() advances the clock."""
@@ -245,9 +291,14 @@ def counted_typing_delay(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
     """Force evaluate() to diagnose a typing-guard delay, counting every call."""
     calls: list[tuple] = []
 
-    def _evaluate(args, **kwargs) -> dict:
+    def _evaluate(args, **kwargs) -> dict | None:
         calls.append(tuple(args))
-        return {"suppressed": True, "policy": "delay", "reason": "typing_guard"}
+        activity = send_gate._client_activity_epoch()
+        if activity is None:
+            return None
+        if 0 <= send_gate.time.time() - activity <= send_gate._typing_guard_window_seconds():
+            return {"suppressed": True, "policy": "delay", "reason": "typing_guard"}
+        return None
 
     monkeypatch.setattr(send_gate, "evaluate", _evaluate)
     return calls
