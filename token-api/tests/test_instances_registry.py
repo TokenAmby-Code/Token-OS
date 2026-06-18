@@ -249,10 +249,10 @@ def test_active_persona_lock_is_rank_based(app_env):
     assert retired == "retired"
 
 
-def test_singleton_reregister_retires_previous_active(app_env):
+def test_singleton_reregister_retires_previous_stale(app_env):
     conn = _conn(app_env.db_path)
     pid = _persona(conn, "custodes")
-    _insert_instance(conn, id="old-custodes", persona_id=pid, rank="overseer")
+    _insert_instance(conn, id="old-custodes", persona_id=pid, rank="overseer", status="stopped")
     _insert_instance(conn, id="new-custodes", persona_id=pid, rank="overseer")
     rows = conn.execute(
         "SELECT id, rank, status FROM instances WHERE persona_id = ? ORDER BY id", (pid,)
@@ -262,6 +262,54 @@ def test_singleton_reregister_retires_previous_active(app_env):
         ("new-custodes", "overseer", "idle"),
         ("old-custodes", "retired", "stopped"),
     ]
+
+
+def test_emperor_singleton_insert_cannot_steal_working_incumbent_regardless_commander_type(app_env):
+    """RED: an emperor-path singleton insert must not retire/replace a working
+    incumbent row for the same singleton persona, even if that incumbent carries
+    a non-emperor commander_type. The live apply/migration gate owns deploying
+    this trigger to agents.db; this pins only the in-memory/test schema.
+    """
+    conn = _conn(app_env.db_path)
+    pid = _persona(conn, "custodes")
+    commander_pid = _persona(conn, "ultramarines")
+    _insert_instance(conn, id="chapter-parent", persona_id=None, status="working")
+
+    cases = [
+        ("incumbent-emperor", "emperor", None),
+        ("incumbent-persona", "persona", str(commander_pid)),
+        ("incumbent-chapter", "chapter", "chapter-parent"),
+    ]
+    for incumbent_id, commander_type, commander_id in cases:
+        conn.execute("DELETE FROM instances WHERE id != 'chapter-parent'")
+        _insert_instance(
+            conn,
+            id=incumbent_id,
+            persona_id=pid,
+            rank="overseer",
+            status="working",
+            commander_type=commander_type,
+            commander_id=commander_id,
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="live singleton incumbent exists"):
+            _insert_instance(
+                conn,
+                id=f"thief-{commander_type}",
+                persona_id=pid,
+                rank="overseer",
+                status="idle",
+                commander_type="emperor",
+            )
+
+        rows = conn.execute(
+            "SELECT id, rank, status, commander_type FROM instances WHERE persona_id = ? ORDER BY id",
+            (pid,),
+        ).fetchall()
+        assert [(r["id"], r["rank"], r["status"], r["commander_type"]) for r in rows] == [
+            (incumbent_id, "overseer", "working", commander_type)
+        ]
+    conn.close()
 
 
 def test_chapter_commander_requires_active_parent_not_shared_persona(app_env):
