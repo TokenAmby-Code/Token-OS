@@ -388,19 +388,46 @@ apply_codex_profile_default() {
 }
 
 resolve_persona_name() {
-  local input="$1" input_sql row
+  local input="$1" row
   [[ -n "$input" ]] || return 0
-  input_sql="$(sql_literal "$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]')")"
-  row="$(sqlite_query "
-    SELECT name
-    FROM primarchs
-    WHERE LOWER(name) = '${input_sql}'
-       OR LOWER(COALESCE(aliases, '')) LIKE '%\"${input_sql}\"%'
-    ORDER BY CASE WHEN LOWER(name) = '${input_sql}' THEN 0 ELSE 1 END
-    LIMIT 1;
-  ")"
+  row="$(PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 - "$input" <<'PY_RESOLVE_PERSONA' 2>/dev/null || true
+import sys
+from persona_behavior import resolve_persona
+row = resolve_persona(sys.argv[1])
+if row:
+    print(row.slug)
+PY_RESOLVE_PERSONA
+)"
   [[ -n "$row" ]] && printf '%s' "$row"
   return 0
+}
+
+persona_behavior_file_for() {
+  local input="$1" file
+  [[ -n "$input" ]] || return 0
+  file="$(PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 - "$input" <<'PY_PERSONA_FILE' 2>/dev/null || true
+import sys
+from persona_behavior import resolve_behavior_file
+path = resolve_behavior_file(sys.argv[1])
+if path:
+    print(path)
+PY_PERSONA_FILE
+)"
+  [[ -n "$file" ]] && printf '%s' "$file"
+  return 0
+}
+
+check_persona_behavior_invariant() {
+  local output rc
+  output="$(PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m persona_behavior check 2>&1)" || rc=$?
+  rc="${rc:-0}"
+  if [[ "$rc" != "0" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && err "$line"
+    done <<< "$output"
+    err "persona behavior-file invariant failed; refusing dispatch to prevent persona inheritance/theft"
+    exit 66
+  fi
 }
 
 canonicalize_persona() {
@@ -465,6 +492,7 @@ PY_EXTRACT_PERSONA
 build_claude_persona_system_prompt() {
   local persona="$1" persona_sql row title vault_name prefix note_path vault_root persona_file doc_id prompt
   [[ -n "$persona" ]] || return 1
+  persona_file="$(persona_behavior_file_for "$persona")"
   persona_sql="$(sql_literal "$persona")"
   row="$(sqlite_query_usv "
     SELECT COALESCE(title, ''), COALESCE(vault, ''), COALESCE(instance_name_prefix, name), COALESCE(vault_note_path, '')
@@ -475,7 +503,7 @@ build_claude_persona_system_prompt() {
   if [[ -n "$row" ]]; then
     IFS=$'\x1f' read -r title vault_name prefix note_path <<< "$row"
     vault_root="$(persona_vault_root "$vault_name")"
-    [[ -n "$vault_root" && -n "$note_path" ]] && persona_file="$vault_root/$note_path"
+    [[ -z "${persona_file:-}" && -n "$vault_root" && -n "$note_path" ]] && persona_file="$vault_root/$note_path"
   fi
   if [[ -z "${persona_file:-}" || ! -f "$persona_file" ]]; then
     persona_file="$(find_local_persona_file "$persona")"
@@ -1289,9 +1317,37 @@ enter_worktree_for_project() {
 
 maybe_enter_worktree() {
   $ASPIRANT && { WORKTREE_DECISION="n/a (aspirant)"; return 0; }
-  [[ -n "$RESUME_ID" ]] && { WORKTREE_DECISION="n/a (resume reuses existing dir)"; return 0; }
 
   local conf proj parent secrets protected runtime bare root
+  if [[ -n "$RESUME_ID" && -n "$WORKTREE_BRANCH" ]]; then
+    local -a resume_worktree_matches=()
+    for conf in "$HOME"/.config/worktrees/*.conf; do
+      [[ -f "$conf" ]] || continue
+      parent="$(dispatch_conf_var "$conf" WORKTREE_PARENT)"
+      [[ -n "$parent" ]] || continue
+      if [[ -d "$parent/wt-$WORKTREE_BRANCH" ]]; then
+        resume_worktree_matches+=("$parent/wt-$WORKTREE_BRANCH")
+      fi
+    done
+    if (( ${#resume_worktree_matches[@]} == 1 )); then
+      WORK_DIR="$(cd "${resume_worktree_matches[0]}" && pwd)"
+      WORKTREE_DECISION="resume entered existing $WORK_DIR (branch $WORKTREE_BRANCH)"
+      return 0
+    fi
+    if (( ${#resume_worktree_matches[@]} > 1 )); then
+      WORKTREE_DECISION="resume requested ambiguous worktree branch $WORKTREE_BRANCH"
+      $DRY_RUN && return 0
+      err "--worktree $WORKTREE_BRANCH matches multiple existing worktrees; pass --dir for the intended project or use a unique branch"
+      local match
+      for match in "${resume_worktree_matches[@]}"; do err "  match: $match"; done
+      exit 66
+    fi
+    WORKTREE_DECISION="resume requested missing worktree branch $WORKTREE_BRANCH"
+    $DRY_RUN && return 0
+    err "--worktree $WORKTREE_BRANCH was requested for resume but no existing wt-$WORKTREE_BRANCH was found"
+    exit 66
+  fi
+  [[ -n "$RESUME_ID" ]] && { WORKTREE_DECISION="n/a (resume reuses existing dir)"; return 0; }
   for conf in "$HOME"/.config/worktrees/*.conf; do
     [[ -f "$conf" ]] || continue
     proj="$(basename "$conf" .conf)"
@@ -1323,6 +1379,8 @@ maybe_enter_worktree() {
 }
 
 maybe_enter_worktree
+
+check_persona_behavior_invariant
 
 DISPATCH_WINDOW=""
 DISPATCH_MODE=""
@@ -1498,16 +1556,11 @@ if [[ ${#MCP_REQUESTS[@]} -gt 0 ]]; then
   MCP_DECISION="requested: $(IFS=,; echo "${MCP_REQUESTS[*]}")"
 fi
 
-AUTO_PARENT_INSTANCE_ID="${TOKEN_API_PARENT_INSTANCE_ID:-}"
-# Resolve the dispatching caller as the child's parent when no explicit parent
-# was passed. This must run on the resume path too: resurrecting a worker into a
-# fresh pane (e.g. FG re-parenting a wiped agent via `--resume … --target …:new`)
-# should make the resurrector the parent so the FG↔child stop-hook auto-subscribe
-# fires. Skip only for an in-place resume (LAUNCH_MODE=direct), where the caller
-# *is* the resumed instance and self-parenting is meaningless.
-if [[ -z "$AUTO_PARENT_INSTANCE_ID" && "$LAUNCH_MODE" != "direct" ]]; then
-  AUTO_PARENT_INSTANCE_ID="$(resolve_caller_instance_id)"
-fi
+AUTO_PARENT_INSTANCE_ID=""
+# Caller-pane identity is intentionally NOT auto-resolved here. A singleton pane
+# launching a worker must not leak its instance/persona through TMUX_PANE,
+# TOKEN_API_INSTANCE_ID, TOKEN_API_PARENT_INSTANCE_ID, or TOKEN_API_PERSONA.
+# Add a dispatch CLI flag later if trusted orchestrators need explicit parentage.
 
 WRAPPER_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
 COMMON_ENV=(
@@ -1803,7 +1856,7 @@ build_agent_command() {
     fi
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
-  printf 'cd %q && env TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
+  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
   local e
   for e in "${envs[@]}"; do printf ' %q' "$e"; done
   local a
@@ -1927,7 +1980,7 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   # Automated dispatch should not steal the operator's camera/focus. The new pane
   # is still addressable by @PANE_ID/Token-API metadata and can be focused explicitly.
   pane_id="$(IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --no-focus --command "clear")"
-  pane_id="$(printf '%s' "$pane_id" | tr -d '[:space:]')"
+  pane_id="$(printf '%s\n' "$pane_id" | grep -Eo '%[0-9]+' | tail -n1 || true)"
   # FINAL_COMMAND was built (above) before this pane existed, so it baked the
   # allocation token (e.g. mechanicus:new) into TMUX_PANE and
   # TOKEN_API_DISPATCH_RESOLVED_PANE. Now that the concrete pane is known, rebuild
