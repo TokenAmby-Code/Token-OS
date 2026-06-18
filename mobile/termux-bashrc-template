@@ -136,9 +136,9 @@ _write_termux_props() {
             cat > "$f" << 'PROPS'
 # ~/.termux/termux.properties — mobile-nav toolbar (true mobile, 3 rows, key-height:40)
 extra-keys = [ \
-  [{key: 'DRAWER', popup: {macro: "\u00001", display: '1'}}, {macro: "\u001b[Z", display: '⇧Tab', popup: {macro: "\u00002", display: '2'}}, {macro: "\u0012", display: '^R', popup: {macro: "\u00003", display: '3'}}, {macro: "\u0003", display: '^C', popup: {macro: "\u00004", display: '4'}}, 'TAB', {macro: "\u0000", display: '^␣', popup: {macro: "\u0000T", display: '⇄'}}, {key: 'KEYBOARD', display: '⌨', popup: 'ENTER'}], \
-  ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "\u0000y", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
-  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
+  [{key: 'DRAWER', popup: {macro: "mac\n", display: 'mac'}}, {macro: "\u001b[Z", display: '⇧Tab', popup: {macro: "\u00002", display: '2'}}, {macro: "\u0012", display: '^R', popup: {macro: "\u00003", display: '3'}}, {macro: "\u0003", display: '^C', popup: {macro: "\u00004", display: '4'}}, {key: 'TAB', popup: {macro: "\u0000e", display: 'e'}}, {macro: "\u0000", display: '^␣', popup: {macro: "\u0000T", display: '⇄'}}, {key: 'KEYBOARD', display: '⌨', popup: 'ENTER'}], \
+  ['ESC', 'SHIFT', 'ALT', {key: 'CTRL', popup: 'PASTE'}, {key: 'HOME', popup: {macro: "\u0000y", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
+  [{key: '|', popup: ':'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT'] \
 ]
 extra-keys-style = key-height:40,key-gap:0,key-border:0
 terminal-transcript-rows = 10000
@@ -153,7 +153,7 @@ PROPS
 # 2 rows (vs 3 on mobile) with tall keys + visible borders = unmistakable difference
 extra-keys = [ \
   [{macro: "\u0000T", display: '⇄'}, {key: 'ESC', popup: {macro: "\u00001", display: '1'}}, {key: 'CTRL', popup: {macro: "\u00002", display: '2'}}, {key: 'ALT', popup: {macro: "\u00003", display: '3'}}, {macro: "\u0012", display: '^R', popup: {macro: "\u00004", display: '4'}}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣', popup: {macro: "\u0000T", display: '⇄'}}, {key: 'KEYBOARD', display: '⌨', popup: 'ENTER'}], \
-  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT', {key: 'END', popup: 'PASTE'}] \
+  [{key: '|', popup: ':'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'DOWN', popup: {macro: "exit\n", display: 'exit↩'}}, 'RIGHT', {key: 'END', popup: 'PASTE'}] \
 ]
 extra-keys-style = key-height:90,key-gap:4,key-border:1
 terminal-transcript-rows = 10000
@@ -262,17 +262,59 @@ tx() {
 }
 alias t=tx
 
-# mac: SSH to Mac. From tx panes → plain SSH. Standalone → SSH then attach tmux.
+# Mac attach state. Default is assertive: `mac` means "get me to the Mac tmux
+# workspace", including from local tx panes and after dropped/reloaded sessions.
+# `not-mac` disables the remembered preference for the next `mac` call. That
+# call re-enables the default for future reconnects, but honors the one-shot
+# opt-out by opening a plain Mac shell instead of attaching tmux.
+MAC_INSIST_TMUX_FILE="$HOME/.mac-insist-tmux"
+MAC_NOT_MAC_FILE="$HOME/.not-mac"
+if [[ -f "$MAC_NOT_MAC_FILE" ]]; then
+    export MAC_INSIST_TMUX=false
+else
+    export MAC_INSIST_TMUX="${MAC_INSIST_TMUX:-true}"
+fi
+
+_mac_insist_tmux_enabled() {
+    [[ "${MAC_INSIST_TMUX:-true}" == "true" ]] && [[ ! -f "$MAC_NOT_MAC_FILE" ]]
+}
+
+_mac_set_insist_tmux() {
+    export MAC_INSIST_TMUX=true
+    rm -f "$MAC_NOT_MAC_FILE"
+    : > "$MAC_INSIST_TMUX_FILE"
+}
+
+not-mac() {
+    export MAC_INSIST_TMUX=false
+    rm -f "$MAC_INSIST_TMUX_FILE"
+    : > "$MAC_NOT_MAC_FILE"
+    echo "Mac tmux auto-attach disabled for the next 'mac'. Run 'mac' to re-enable."
+}
+
+# mac: SSH to Mac. Assertively attach tmux by default, even from tx panes.
 # Portable monitor → main session (full workspace).
 # Phone → grouped session 'phone' on main:warp with keyboard auto-zoom hook.
 # SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
 mac() {
+    local insist_tmux=true
+    _mac_insist_tmux_enabled || insist_tmux=false
+
+    # Running `mac` always restores the assertive default for future prompts.
+    # If `not-mac` set a one-shot opt-out, honor it for this invocation only.
+    _mac_set_insist_tmux
+
+    if [[ "$insist_tmux" != "true" ]]; then
+        ssh -t mac "exec zsh -il"
+        return
+    fi
+
     if [[ -n "$TMUX" ]]; then
         # Session selection even from tx pane — respects portable monitor flag.
         if is_portable_monitor; then
             ssh -t mac "zsh -il -c 'tmux attach -t main 2>/dev/null || tx start --mac'"
         else
-            ssh mac
+            ssh -t mac "tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t warp 2>/dev/null || exec zsh -il"
         fi
         return
     fi
