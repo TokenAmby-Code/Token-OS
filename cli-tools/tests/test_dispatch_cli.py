@@ -1416,6 +1416,7 @@ def test_dispatch_persona_invariant_fails_loud_when_astartes_file_missing(tmp_pa
         check=False,
         cwd=str(ROOT),
         env=env,
+        timeout=60,
     )
 
     assert result.returncode == 66
@@ -1446,6 +1447,7 @@ def test_dispatch_astartes_row_uses_generic_rank_file_when_slug_file_absent(tmp_
         check=False,
         cwd=str(ROOT),
         env=env,
+        timeout=60,
     )
 
     assert result.returncode == 0, result.stderr
@@ -1484,6 +1486,7 @@ def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Pa
         check=False,
         cwd=str(ROOT),
         env=env,
+        timeout=60,
     )
 
     assert result.returncode == 0, result.stderr
@@ -1509,11 +1512,12 @@ def test_dispatch_prompt_file_single_quote_is_shell_safe(tmp_path: Path) -> None
         check=False,
         cwd=str(ROOT),
         env=env,
+        timeout=60,
     )
 
     assert result.returncode == 0, result.stderr
     final_parts = result.stdout.split("  final_command:\n    ", 1)
     assert len(final_parts) == 2, result.stdout
     final = final_parts[1].splitlines()[0]
-    syntax = subprocess.run(["bash", "-n", "-c", final], capture_output=True, text=True)
+    syntax = subprocess.run(["bash", "-n", "-c", final], capture_output=True, text=True, timeout=60)
     assert syntax.returncode == 0, syntax.stderr

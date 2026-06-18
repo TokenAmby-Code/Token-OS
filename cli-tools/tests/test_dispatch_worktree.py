@@ -7,6 +7,7 @@ real worktree is created and no agent is launched.
 """
 
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -261,7 +262,7 @@ def test_stack_dispatch_accepts_noisy_tmuxctl_pane_output(tmp_path: Path) -> Non
     fake_tmuxctl.chmod(0o755)
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
-        f'#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\0" "$a" >> {rec}; done\nexit 0\n',
+        f'#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\0" "$a" >> {shlex.quote(str(rec))}; done\nexit 0\n',
         encoding="utf-8",
     )
     fake_tmux.chmod(0o755)

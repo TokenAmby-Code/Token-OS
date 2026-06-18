@@ -20,6 +20,7 @@ def columns(conn: sqlite3.Connection, table: str) -> set[str]:
 def migrate(db: Path, *, dry_run: bool = True) -> None:
     conn = sqlite3.connect(db)
     try:
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("BEGIN")
         conn.execute("UPDATE personas SET default_rank = 'astartes' WHERE slug = 'inquisitor'")
         if "persona_lock" in columns(conn, "instances"):
