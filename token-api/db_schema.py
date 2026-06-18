@@ -476,6 +476,13 @@ async def _ensure_instances(db) -> None:
         WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
              AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
         BEGIN
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM instances incumbent
+                 WHERE incumbent.persona_id = NEW.persona_id
+                   AND incumbent.rank != 'retired'
+                   AND incumbent.status = 'working'
+            ) THEN RAISE(ABORT, 'live singleton incumbent exists') END;
+
             UPDATE instances
                SET rank = 'retired', status = CASE WHEN status = 'archived' THEN 'archived' ELSE 'stopped' END, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP)
              WHERE persona_id = NEW.persona_id AND rank != 'retired' AND commander_type != 'chapter';
@@ -488,6 +495,15 @@ async def _ensure_instances(db) -> None:
         WHEN NEW.persona_id IS NOT NULL AND NEW.rank != 'retired' AND NEW.commander_type != 'chapter'
              AND COALESCE((SELECT default_rank FROM personas WHERE id = NEW.persona_id), 'astartes') != 'astartes'
         BEGIN
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM instances incumbent
+                 WHERE incumbent.id != NEW.id
+                   AND incumbent.id != OLD.id
+                   AND incumbent.persona_id = NEW.persona_id
+                   AND incumbent.rank != 'retired'
+                   AND incumbent.status = 'working'
+            ) THEN RAISE(ABORT, 'live singleton incumbent exists') END;
+
             -- id != OLD.id too: a BEFORE trigger sees the table pre-update, so a
             -- supplant that rewrites the row id in the same UPDATE would otherwise
             -- match its own pre-image and retire the row being supplanted.

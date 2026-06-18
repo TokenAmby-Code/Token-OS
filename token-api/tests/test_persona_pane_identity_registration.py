@@ -275,16 +275,13 @@ def test_custodes_relaunch_over_zombie_predecessor_absorbs_it(
     assert live == 1
 
 
-def test_persona_supplant_does_not_restore_poisoned_prior_parent(
+def test_persona_supplant_does_not_steal_live_prior_parent(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The supplant path restores blank launch fields from the prior persona row
-    # (old_parent_id is its commander edge). When the prior row was already
-    # poisoned into a chapter child, supplanting it must shed the poison —
-    # _effective_parent suppresses the restore and the supplant updates assert
-    # emperor sovereignty. Mirrors the live incident shape: the chapter commander
-    # is the persona's own (still-active) zombie predecessor, which the commander
-    # integrity guard requires to be active and same-persona.
+    # The poisoned stale child shape is also the emperor-path theft vector: a
+    # stopped chapter child can be selected for supplant, rewritten to emperor
+    # sovereignty, and thereby retire/replace the still-working incumbent. The
+    # singleton guard must fail closed and leave the live incumbent untouched.
     hooks = sys.modules["routes.hooks"]
     _insert_instance(
         app_env.db_path,
@@ -304,12 +301,19 @@ def test_persona_supplant_does_not_restore_poisoned_prior_parent(
     monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:custodes"))
     _no_pane_occupant(monkeypatch, hooks)
 
-    result = _start_session(hooks, "fresh-cust-2")
-    assert result["success"] is True
+    with pytest.raises(sqlite3.IntegrityError, match="live singleton incumbent exists"):
+        _start_session(hooks, "fresh-cust-2")
 
-    # Persona-singleton supplant migrates the stale row to the new session id.
-    row = _row(app_env.db_path, "fresh-cust-2")
-    assert row is not None
-    assert row["commander_type"] == "emperor"
-    assert row["commander_id"] is None
-    assert row["rank"] == "overseer"
+    incumbent = _row(app_env.db_path, "dead-dispatcher")
+    assert incumbent is not None
+    assert incumbent["commander_type"] == "emperor"
+    assert incumbent["commander_id"] is None
+    assert incumbent["rank"] == "overseer"
+    assert incumbent["status"] == "working"
+
+    assert _row(app_env.db_path, "fresh-cust-2") is None
+    stale = _row(app_env.db_path, "stale-cust")
+    assert stale is not None
+    assert stale["commander_type"] == "chapter"
+    assert stale["commander_id"] == "dead-dispatcher"
+    assert stale["status"] == "stopped"
