@@ -1022,10 +1022,19 @@ if [[ -n "$REPO" ]]; then
     done
   fi
   [[ -n "$REPO_CONF" ]] || { err "--repo '$REPO': no config at ~/.config/worktrees/${REPO}.conf"; exit 66; }
+  # Anchor the dispatch on BARE_REPO: worktree-setup always cuts the new worktree
+  # from it, so it is the single source of truth for the base. Token-OS PROTECTED_ROOT
+  # is the legacy NAS archive guard, not a checkout to branch from; anchoring there
+  # made --repo land in / cut from the stale archived tree (P3, 2026-06-18). Prefer
+  # BARE_REPO when present on disk; fall back to PROTECTED_ROOT/SECRETS_DIR only when
+  # the bare is unreachable so configs whose bare lives on an unmounted NAS still
+  # resolve to their local guard. maybe_enter_worktree redirects a BARE_REPO anchor
+  # into a fresh per-branch worktree, never running an agent in the bare repo.
   REPO_ROOT="$( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; PROTECTED_ROOT=""; RUNTIME_CHECKOUT=""; SYNC_SUBDIR=""
     # shellcheck disable=SC1090
     source "$REPO_CONF" 2>/dev/null || true
-    if [[ -n "$PROTECTED_ROOT" ]]; then printf '%s' "$PROTECTED_ROOT";
+    if [[ -n "$BARE_REPO" && -d "$BARE_REPO" ]]; then printf '%s' "$BARE_REPO";
+    elif [[ -n "$PROTECTED_ROOT" ]]; then printf '%s' "$PROTECTED_ROOT";
     elif [[ -n "$SECRETS_DIR" ]]; then printf '%s' "$SECRETS_DIR";
     else printf '%s' "$BARE_REPO"; fi )"
   [[ -n "$REPO_ROOT" ]] || { err "--repo '$REPO': config has no PROTECTED_ROOT, SECRETS_DIR, or BARE_REPO ($REPO_CONF)"; exit 66; }
@@ -1172,7 +1181,7 @@ launch_dispatch_aspirant_session() {
   printf '\n'
   TOKEN_API_DISPATCH_MENU_CONSUMED=1 \
   TOKEN_API_INTERNAL_DISPATCH=1 \
-  TOKEN_API_PERSONA="${PERSONA:-${TOKEN_API_PERSONA:-}}" \
+  TOKEN_API_PERSONA="${PERSONA:-}" \
   TOKEN_API_CODEX_PROFILE="$CODEX_PROFILE" \
   "${SCRIPT_DIR}/dispatch" "${launch_args[@]}"
 }
@@ -1282,7 +1291,7 @@ maybe_enter_worktree() {
   $ASPIRANT && { WORKTREE_DECISION="n/a (aspirant)"; return 0; }
   [[ -n "$RESUME_ID" ]] && { WORKTREE_DECISION="n/a (resume reuses existing dir)"; return 0; }
 
-  local conf proj parent secrets protected runtime root
+  local conf proj parent secrets protected runtime bare root
   for conf in "$HOME"/.config/worktrees/*.conf; do
     [[ -f "$conf" ]] || continue
     proj="$(basename "$conf" .conf)"
@@ -1290,15 +1299,18 @@ maybe_enter_worktree() {
     secrets="$(dispatch_conf_var "$conf" SECRETS_DIR)"
     protected="$(dispatch_conf_var "$conf" PROTECTED_ROOT)"
     runtime="$(dispatch_conf_var "$conf" RUNTIME_CHECKOUT)"
+    bare="$(dispatch_conf_var "$conf" BARE_REPO)"
     if [[ -n "$parent" && ( "$WORK_DIR" == "$parent" || "$WORK_DIR" == "$parent"/* ) ]]; then
       WORKTREE_DECISION="n/a (already isolated worktree)"
       return 0
     fi
-    for root in "$protected" "$runtime" "$secrets"; do
+    # BARE_REPO is a redirect trigger too: `--repo` now anchors on it (see above), and
+    # an agent must never run in a bare repo — always redirect into a fresh worktree.
+    for root in "$protected" "$runtime" "$secrets" "$bare"; do
       [[ -n "$root" ]] || continue
       [[ "$WORK_DIR" == "$root" || "$WORK_DIR" == "$root"/* ]] || continue
       if $NO_WORKTREE; then
-        err "refusing to dispatch into protected/runtime root with --no-worktree: $WORK_DIR"
+        err "refusing to dispatch into protected/runtime/secrets/bare root with --no-worktree: $WORK_DIR"
         err "use --worktree <branch> (preferred) or choose an existing branch worktree under $parent"
         exit 64
       fi
@@ -1453,9 +1465,17 @@ if [[ -n "$DISCORD_CHANNEL" ]]; then
   esac
 fi
 
-# Derive the instance legion so automated launches (GT/state-hook dispatch,
-# cron) that bypass --persona still bind Custodes to its shared daily note.
-LEGION="${TOKEN_API_LEGION:-}"
+# Derive the CHILD's legion fresh from explicit args only — NEVER from the inherited
+# TOKEN_API_LEGION. A dispatching pane carries its own exported TOKEN_API_LEGION (set
+# when that pane was itself launched); seeding the child from it stamped the worker
+# with the dispatcher's legion, and the server then inferred the dispatcher's persona
+# from that legion — the custodes persona-theft via the emperor-commander path (P1,
+# 2026-06-18). Legion/persona are NOT env-injectable: sources of truth are the tmux
+# pane stamp + the DB. Leave NULL when no --persona / non-custodes target so the server
+# assigns a fresh worker (astartes) identity. Automated custodes launches still bind
+# correctly: they target the `legion:custodes` slot, handled by the DISPATCH_SLOT case
+# below.
+LEGION=""
 if [[ -z "$LEGION" && -n "$PERSONA" ]]; then
   case "$(printf '%s' "$PERSONA" | tr '[:upper:]' '[:lower:]')" in
     custodes) LEGION="custodes" ;;

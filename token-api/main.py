@@ -5299,6 +5299,17 @@ async def process_pane_write_queue_once(
         # resolves — never deliver an automated write to a stale or reused pane.
         live_pane, _live_role = await shared.resolve_instance_pane(instance_id)
         pane = live_pane
+        if not pane and str(instance_id or "").startswith("%"):
+            # Live @PANE_ID fallback for direct-pane writes (brief/talk): these target a
+            # pane, not a registry instance, so the queue row carries a raw %NNN as the
+            # instance_id. A retired/absent instance row makes resolve_instance_pane()
+            # return nothing even though the pane is alive (R4/P5, 2026-06-18). tmux
+            # never recycles a %NNN within a server lifetime, so a %NNN that still
+            # resolves live is unambiguously the same pane — deliver to it. Re-verified
+            # against tmux (never the stale stored column) and scoped to %NNN
+            # instance_ids, so registry-instance writes still fail closed (their stored
+            # pane may have been reused by a different agent).
+            pane = await shared.resolve_tmux_pane_id(instance_id)
         base = {
             "queue_id": item["id"],
             "instance_id": instance_id,

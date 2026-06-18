@@ -490,6 +490,59 @@ async def test_dequeue_fails_closed_when_pane_unresolved(app_env: Any, monkeypat
     assert _fetch_status(app_env.db_path, queued["id"]) == "cancelled"
 
 
+async def test_brief_raw_pane_falls_back_to_live_at_pane_id(app_env: Any, monkeypatch: Any) -> None:
+    """2b / P5: a brief targets a pane directly, so the queue row carries a raw %NNN
+    as ``instance_id``. When that pane's registry/instance row is retired,
+    ``resolve_instance_pane`` returns nothing — but the pane is still alive. Delivery
+    must fall back to the live ``@PANE_ID`` (re-verified against tmux) instead of
+    cancelling with ``pane_unresolved``, so designation is never blocked."""
+    main = app_env.main
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
+
+    # Retired registry row: the instance resolver finds nothing.
+    async def _gone(_instance_id):
+        return (None, None)
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _gone)
+
+    # But the raw pane is still live in tmux.
+    async def _live(tmux_pane):
+        return tmux_pane if str(tmux_pane or "").startswith("%") else None
+
+    monkeypatch.setattr(main.shared, "resolve_tmux_pane_id", _live)
+
+    sent: list[Any] = []
+
+    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False):
+        sent.append(pane)
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "verification_status": "unverified",
+            "verified_by": None,
+        }
+
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
+
+    # brief enqueues with instance_id == tmux_pane == the resolved raw %NNN.
+    queued = await main.enqueue_pane_write(
+        instance_id="%199",
+        tmux_pane="%199",
+        source="brief",
+        purpose="brief_send",
+        payload="FYI from the palace",
+    )
+    results = await main.process_pane_write_queue_once(queued["id"])
+
+    assert len(results) == 1
+    assert results[0].get("reason") != "pane_unresolved", results[0]
+    assert results[0].get("status") != main.PANE_WRITE_CANCELLED, results[0]
+    assert sent == ["%199"], "must deliver to the live @PANE_ID"
+    assert results[0]["tmux_pane"] == "%199"
+
+
 async def test_naming_nudge_clears_stale_composer_instead_of_deferring(
     app_env: Any, monkeypatch: Any
 ) -> None:
