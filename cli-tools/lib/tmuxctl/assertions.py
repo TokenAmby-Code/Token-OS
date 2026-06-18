@@ -160,6 +160,12 @@ def _registry_entries(
     include_stopped: bool = False,
     instance_stamp: str = "",
 ):
+    """Registry rows bound to this pane, newest-active first.
+
+    ``instance_stamp`` is the pane's live ``@INSTANCE_ID`` (when known). It is the
+    single source of truth for pane->instance, so it is matched ahead of the
+    legacy stored-pane / pane_label identifiers.
+    """
     # The pane's live ``@INSTANCE_ID`` stamp is the single source of truth for
     # pane->instance — the same bridge ``resolver.resolve_instance`` /
     # ``shared.instance_id_for_pane`` read. Match the row by it FIRST so a pane the
