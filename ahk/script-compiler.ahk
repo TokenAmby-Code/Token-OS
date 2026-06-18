@@ -158,7 +158,7 @@ Media_Prev:: {  ; Restart current TTS message from beginning
 ^!k:: {  ; Ctrl+Alt+K = ask the WSL watchdog to run Deskflow recovery
     ToolTip("deskflow watchdog…")
     try {
-        cmd := "wsl.exe -d Ubuntu -e bash -lc `"/mnt/imperium/runtimes/token-os/live/Shell/deskflow-recover reload`""
+        cmd := "wsl.exe -d Ubuntu -e bash -lc `"/home/token/runtimes/token-os/live/Shell/deskflow-recover reload`""
         exitCode := RunWait(cmd,, "Hide")
         if (exitCode = 0)
             ToolTip("deskflow recovery requested")
