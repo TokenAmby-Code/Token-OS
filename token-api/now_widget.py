@@ -134,6 +134,10 @@ def compose_now_markdown(
     now: datetime | None = None,
 ) -> str:
     now = now.astimezone(MST) if now else datetime.now(MST)
+    # Floor to the 30-min grid so the clock lines are stable for 30 min at a time.
+    # The daily note is a passive coarse clock; snapping the display kills per-tick
+    # churn (the write-skip guard turns identical output into a no-op).
+    floored = now.replace(minute=(now.minute // 30) * 30, second=0, microsecond=0)
     timer = telemetry.timer
     mode = (
         timer.get("effective_mode")
@@ -149,14 +153,14 @@ def compose_now_markdown(
 
     return "\n".join(
         [
-            f"**Block:** {now.strftime('%H:%M')} MST live snapshot",
+            f"**Block:** {floored.strftime('%H:%M')} MST live snapshot",
             "**Posture:** custodes daily-note surface",
             f"**Balance:** {balance} · timer mode: {str(mode).upper()}",
             f"**Active:** {active}",
             f"**Geofence:** {location} · desktop_mode: {desktop}",
             f"**Cascade:** {cascade}",
             "",
-            f"*Last updated {now.strftime('%H:%M')} MST*",
+            f"*Last updated {floored.strftime('%H:%M')} MST*",
         ]
     )
 

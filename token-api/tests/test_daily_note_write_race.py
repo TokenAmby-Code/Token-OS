@@ -17,13 +17,24 @@ the live DB, or the live vault.
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 import dailynote_callout as dc
 import session_doc_helpers as sdh
+import vault_lock
+
+# Repo layout: this file is token-api/tests/…; the repo root is two parents up.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_OBSIDIAN_CLI = _REPO_ROOT / "cli-tools" / "bin" / "obsidian"
+_VAULT_LOCK_PY = Path(__file__).resolve().parents[1] / "vault_lock.py"
 
 
 def _daily_note(tmp_path):
@@ -297,6 +308,173 @@ def test_concurrent_rubric_subkey_updates_no_lost_update(tmp_path):
     fm, _ = sdh.read_frontmatter(note)
     assert fm["victory"]["committed"] is True
     assert fm["victory"]["pushed"] is True
+
+
+# ── Write-skip guard (churn kill) ─────────────────────────────────────────────
+
+
+def test_apply_callout_skips_write_when_unchanged(tmp_path):
+    """A second identical callout write must not move mtime (byte-identical → no-op)."""
+    note = _daily_note(tmp_path)
+    # Seed a distinct callout body so the first write actually changes the file.
+    first = dc.apply_callout(note, "now", "fresh-tick", title="NOW")
+    assert first.action in ("replaced", "appended")
+    mtime_after_first = note.stat().st_mtime_ns
+
+    time.sleep(0.01)  # ensure the clock could advance if a write happened
+    second = dc.apply_callout(note, "now", "fresh-tick", title="NOW")
+
+    assert second.action == "unchanged"
+    assert second.bytes_written == 0
+    assert note.stat().st_mtime_ns == mtime_after_first, "unchanged callout still rewrote the note"
+
+
+def test_update_frontmatter_skips_write_when_unchanged(tmp_path):
+    """A second identical frontmatter update must not move mtime."""
+    note = _daily_note(tmp_path)
+    sdh.update_frontmatter(note, {"timer_status": "working"})
+    mtime_after_first = note.stat().st_mtime_ns
+
+    time.sleep(0.01)
+    out = sdh.update_frontmatter(note, {"timer_status": "working"})
+
+    assert out["timer_status"] == "working"
+    assert note.stat().st_mtime_ns == mtime_after_first, (
+        "unchanged frontmatter still rewrote the note"
+    )
+
+
+# ── Cross-process lock derivation (bash ↔ python agreement) ───────────────────
+
+
+def test_lock_path_for_is_stable_and_resolved(tmp_path):
+    note = tmp_path / "n.md"
+    note.write_text("x", encoding="utf-8")
+    a = vault_lock.lock_path_for(note)
+    b = vault_lock.lock_path_for(str(note))
+    assert a == b
+    # Lives under the local tempdir, never beside the note.
+    assert "imperium-vault-locks" in a
+    assert not a.startswith(str(tmp_path))
+
+
+def test_lock_path_for_matches_cli_derivation(tmp_path):
+    """The lockfile the bash CLI grabs (via vault_lock.py) must equal the one
+    token-api derives in-process for the same path — else they don't serialize."""
+    note = tmp_path / "Terra" / "Journal" / "Daily" / "2026-06-17.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("x", encoding="utf-8")
+
+    py_lock = vault_lock.lock_path_for(note)
+    # Run the SAME code the bash CLI shells into: vault_lock.py acquires the lock
+    # then runs a child that prints the lockfile it would derive for the path.
+    printer = "import sys, vault_lock; print(vault_lock.lock_path_for(sys.argv[1]))"
+    env = {**os.environ, "PYTHONPATH": str(_VAULT_LOCK_PY.parent)}
+    out = subprocess.check_output(
+        [
+            sys.executable,
+            str(_VAULT_LOCK_PY),
+            str(note),
+            "--",
+            sys.executable,
+            "-c",
+            printer,
+            str(note),
+        ],
+        text=True,
+        env=env,
+    ).strip()
+    assert out == py_lock
+
+
+# ── Concurrent-writer stress: in-proc vs auto-flocked obsidian CLI ────────────
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or not _OBSIDIAN_CLI.exists(),
+    reason="needs bash + the obsidian CLI",
+)
+def test_concurrent_inproc_and_cli_writers_no_lost_update(tmp_path):
+    """Race in-proc update_frontmatter against subprocess `obsidian append` AND
+    `property:set`, all auto-flocked on the same daily note. Every appended line
+    must survive and the frontmatter must parse with the expected keys."""
+    home = tmp_path / "home"
+    vault_root = home / "TestVault"
+    daily_dir = vault_root / "Terra" / "Journal" / "Daily"
+    daily_dir.mkdir(parents=True)
+    rel_path = "Terra/Journal/Daily/2026-06-17.md"
+    note = daily_dir / "2026-06-17.md"
+
+    # Env for the CLI: resolve the vault under HOME, and point LOCK_HELPER at our
+    # real vault_lock.py via TOKEN_OS so needs_lock auto-flocks the daily note.
+    cli_env = {
+        **os.environ,
+        "HOME": str(home),
+        "TOKEN_OS": str(_REPO_ROOT),
+    }
+
+    def cli(*args):
+        subprocess.run(
+            [str(_OBSIDIAN_CLI), "vault=TestVault", *args],
+            check=True,
+            env=cli_env,
+            capture_output=True,
+            text=True,
+        )
+
+    def run_one_round(round_idx):
+        """One race round, factored out so the worker closures bind function-local
+        names (not loop variables — avoids the B023 late-binding trap)."""
+        note.write_text(
+            "---\ndate: 2026-06-17\ntype: daily-note\ntimer_status: idle\n---\n\n# 2026-06-17\n",
+            encoding="utf-8",
+        )
+        appended = [f"APPEND-{round_idx}-{i}-must-survive" for i in range(8)]
+        errors: list[BaseException] = []
+
+        def run_frontmatter():
+            try:
+                for i in range(30):
+                    sdh.update_frontmatter(note, {"timer_status": f"s{i}"})
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        def run_appends():
+            try:
+                for line in appended:
+                    cli("append", f"path={rel_path}", f"content={line}")
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        def run_property():
+            try:
+                for i in range(8):
+                    cli("property:set", f"path={rel_path}", "property=lap", f"value={i}")
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=run_frontmatter),
+            threading.Thread(target=run_appends),
+            threading.Thread(target=run_property),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert all(not t.is_alive() for t in threads), "writer thread hung (deadlock?)"
+        assert not errors, f"writer raised under contention: {errors}"
+
+        final = note.read_text(encoding="utf-8")
+        for line in appended:
+            assert line in final, f"lost append: {line!r}"
+        fm, _ = sdh.read_frontmatter(note)
+        assert "timer_status" in fm and str(fm["timer_status"]).startswith("s")
+        assert "lap" in fm  # property:set landed and survived the frontmatter rewrites
+
+    for round_idx in range(3):
+        run_one_round(round_idx)
 
 
 def test_delete_keys_still_works(tmp_path):

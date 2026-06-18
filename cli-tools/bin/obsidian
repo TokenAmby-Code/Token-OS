@@ -133,6 +133,18 @@ resolve_path() {
   echo "$VAULT_ROOT/$p"
 }
 
+# --- Same-machine flock for daily-note writes ---
+# Mutating commands that touch the daily note must serialize against token-api's
+# in-process writers (timer frontmatter + NOW callout). vault_lock.py derives the
+# sidecar lockfile from the same code token-api uses, so the two never disagree.
+LOCK_HELPER="${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/token-api/vault_lock.py"
+
+needs_lock() {
+  # True when the resolved path is the daily note (Emperor's stated scope;
+  # trivially broadened later by adding more path prefixes here).
+  [[ "$1" == */Terra/Journal/Daily/* ]]
+}
+
 # --- Commands ---
 
 cmd_read() {
@@ -349,6 +361,22 @@ print(f'obsidian://open?vault={vault}&file={path}')
     *)     echo "Error: obsidian open not implemented for $PLATFORM" >&2; return 1 ;;
   esac
 }
+
+# --- Auto-flock daily-note mutations ---
+# Re-exec the whole invocation under vault_lock.py so the flock is held for the
+# real write, then set OBSIDIAN_LOCK_HELD=1 to prevent infinite re-exec. Graceful
+# degrade: if the helper is absent (WSL/VPS with no token-api), skip locking and
+# write directly — cross-machine is out of scope and Obsidian Sync merges there.
+case "$COMMAND" in
+  append|create|property:set|move)
+    if [[ -z "${OBSIDIAN_LOCK_HELD:-}" && -n "$PARAM_path" ]]; then
+      resolved=$(resolve_path "$PARAM_path")
+      if needs_lock "$resolved" && [[ -f "$LOCK_HELPER" ]]; then
+        exec python3 "$LOCK_HELPER" "$resolved" -- env OBSIDIAN_LOCK_HELD=1 "$0" "$@"
+      fi
+    fi
+    ;;
+esac
 
 # --- Dispatch ---
 case "$COMMAND" in

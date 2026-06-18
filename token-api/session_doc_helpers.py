@@ -297,8 +297,11 @@ def update_frontmatter(
         _atomic_write,
         file_write_lock,
     )
+    from vault_lock import file_flock
 
-    with file_write_lock(file_path):
+    # Lock ordering: cross-process flock → in-process threading lock → RMW, so
+    # the timer frontmatter writer and the `obsidian` CLI can never interleave.
+    with file_flock(file_path), file_write_lock(file_path):
         last_conflict: CalloutConflictError | None = None
         for _attempt in range(max_attempts):
             stat = file_path.stat()  # FileNotFoundError bubbles intentionally.
@@ -312,6 +315,10 @@ def update_frontmatter(
             if transform is not None:
                 transform(fm)
             new_content = splice_frontmatter(content, fm)
+            # Write-skip: byte-identical frontmatter splice ⇒ no write, so mtime
+            # holds steady and the 30s timer poll is a no-op off the grid boundary.
+            if new_content == content:
+                return fm
             try:
                 _atomic_write(file_path, new_content, stat.st_mtime_ns)
                 return fm
