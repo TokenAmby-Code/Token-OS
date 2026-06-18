@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def _insert_instance(
@@ -527,7 +528,9 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
     assert row == ("delivered", "preplan_plan", "/plan create the plan", 1)
 
 
-def test_gated_preplan_oneshot_consumes_sub_but_requeues_plan_for_redrain(app_env, monkeypatch):
+def test_gated_preplan_oneshot_consumes_sub_but_requeues_plan_for_redrain(
+    app_env: Any, monkeypatch: Any
+) -> None:
     """A typing-gated Stop must not drop the /preplan -> /plan handoff.
 
     When the universal send gate suppresses the byte-issue at Stop time, the
