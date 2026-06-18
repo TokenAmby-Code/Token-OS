@@ -153,13 +153,36 @@ def _pane_type(adapter: TmuxAdapter, pane_id: str) -> str:
     return adapter.show_pane_option(pane_id, "@PANE_TYPE")
 
 
-def _registry_entries(pane_id: str, pane_label: str, *, include_stopped: bool = False):
+def _registry_entries(
+    pane_id: str,
+    pane_label: str,
+    *,
+    include_stopped: bool = False,
+    instance_stamp: str = "",
+):
+    """Registry rows bound to this pane, newest-active first.
+
+    ``instance_stamp`` is the pane's live ``@INSTANCE_ID`` (when known). It is the
+    single source of truth for pane->instance, so it is matched ahead of the
+    legacy stored-pane / pane_label identifiers.
+    """
+    # The pane's live ``@INSTANCE_ID`` stamp is the single source of truth for
+    # pane->instance — the same bridge ``resolver.resolve_instance`` /
+    # ``shared.instance_id_for_pane`` read. Match the row by it FIRST so a pane the
+    # stamp endpoint armed (but whose stored ``tmux_pane`` column drifted/emptied
+    # post-extraction) still resolves to its row, instead of being refused. The
+    # stored-pane / pane_label matches remain as legacy fallbacks.
+    stamp = (instance_stamp or "").strip()
     registry = fetch_instance_registry()
     rows = [
         row
         for row in registry.instances
         if (include_stopped or row.status is not InstanceStatus.STOPPED)
-        and (row.tmux_pane == pane_id or (pane_label and row.pane_label == pane_label))
+        and (
+            (stamp and row.instance_id == stamp)
+            or row.tmux_pane == pane_id
+            or (pane_label and row.pane_label == pane_label)
+        )
     ]
     rows.sort(key=lambda r: r.last_activity, reverse=True)
     return rows
@@ -736,7 +759,10 @@ def _assert_instance_impl(
     pane_label = _pane_label(adapter, pane_id, resolved.pane_role)
     pane_type = _pane_type(adapter, pane_id)
     runtime_ok = _runtime_has_instance(adapter, pane_id)
-    rows = _registry_entries(pane_id, pane_label)
+    # Resolve the registry row through the pane's live @INSTANCE_ID stamp (the
+    # source of truth resolve-instance uses), not just the stored tmux_pane column.
+    instance_stamp = adapter.show_pane_option(pane_id, "@INSTANCE_ID")
+    rows = _registry_entries(pane_id, pane_label, instance_stamp=instance_stamp)
     row = rows[0] if rows else None
     result = _base_result(pane_id, pane_label, pane_type, row)
 

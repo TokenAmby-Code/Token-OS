@@ -2909,7 +2909,13 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(tmux_pane, session_id, display_name=existing_row["name"])
-                if old_tmux_pane and old_tmux_pane != tmux_pane:
+                # Only vacate the old pane when a NEW addressable pane was actually
+                # stamped. A blank `tmux_pane` (in-wrapper re-fire arriving with no
+                # live TMUX_PANE) means nothing moved — the instance is still on
+                # `old_tmux_pane`, so unstamping it would zero a valid live stamp
+                # (the churn that drops resolve-instance to 0). Mirrors the guarded
+                # sibling branch below.
+                if tmux_pane and old_tmux_pane and old_tmux_pane != tmux_pane:
                     await _unstamp_instance_id(old_tmux_pane, session_id)
                 await _apply_instance_workflow_state(
                     db,
