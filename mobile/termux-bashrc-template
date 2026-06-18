@@ -264,8 +264,9 @@ alias t=tx
 
 # Mac attach state. Default is assertive: `mac` means "get me to the Mac tmux
 # workspace", including from local tx panes and after dropped/reloaded sessions.
-# `not-mac` disables the remembered preference until the next `mac`, which flips
-# it back on before opening SSH.
+# `not-mac` disables the remembered preference for the next `mac` call. That
+# call re-enables the default for future reconnects, but honors the one-shot
+# opt-out by opening a plain Mac shell instead of attaching tmux.
 MAC_INSIST_TMUX_FILE="$HOME/.mac-insist-tmux"
 MAC_NOT_MAC_FILE="$HOME/.not-mac"
 if [[ -f "$MAC_NOT_MAC_FILE" ]]; then
@@ -288,7 +289,7 @@ not-mac() {
     export MAC_INSIST_TMUX=false
     rm -f "$MAC_INSIST_TMUX_FILE"
     : > "$MAC_NOT_MAC_FILE"
-    echo "Mac tmux auto-attach disabled for this phone shell. Run 'mac' to re-enable."
+    echo "Mac tmux auto-attach disabled for the next 'mac'. Run 'mac' to re-enable."
 }
 
 # mac: SSH to Mac. Assertively attach tmux by default, even from tx panes.
@@ -296,7 +297,17 @@ not-mac() {
 # Phone → grouped session 'phone' on main:warp with keyboard auto-zoom hook.
 # SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
 mac() {
+    local insist_tmux=true
+    _mac_insist_tmux_enabled || insist_tmux=false
+
+    # Running `mac` always restores the assertive default for future prompts.
+    # If `not-mac` set a one-shot opt-out, honor it for this invocation only.
     _mac_set_insist_tmux
+
+    if [[ "$insist_tmux" != "true" ]]; then
+        ssh -t mac "exec zsh -il"
+        return
+    fi
 
     if [[ -n "$TMUX" ]]; then
         # Session selection even from tx pane — respects portable monitor flag.
