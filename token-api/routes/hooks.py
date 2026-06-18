@@ -4097,12 +4097,32 @@ PROMPT_TEXT_KEYS = (
 )
 PROMPT_PARENT_KEYS = ("payload", "event", "data", "turn", "turn_context", "context")
 
+_COMMAND_NAME_RE = re.compile(
+    r"<command-name>\s*(?P<name>\S+)\s*</command-name>", re.IGNORECASE | re.DOTALL
+)
+_COMMAND_ARGS_RE = re.compile(
+    r"<command-args>(?P<args>.*?)</command-args>", re.IGNORECASE | re.DOTALL
+)
+
+
+def _iter_command_wrappers(text: str) -> Iterable[str]:
+    """Surface the inner slash/skill command from Claude Code's <command-name> wrapper
+    so detection still matches when the raw prompt no longer *starts* with /preplan."""
+    for match in _COMMAND_NAME_RE.finditer(text):
+        name = match.group("name").strip()
+        if not name:
+            continue
+        args_match = _COMMAND_ARGS_RE.search(text)
+        args = args_match.group("args").strip() if args_match else ""
+        yield f"{name} {args}".strip()
+
 
 def _iter_prompt_texts(payload: dict) -> Iterable[str]:
     for key in PROMPT_TEXT_KEYS:
         value = payload.get(key)
         if isinstance(value, str):
             yield value
+            yield from _iter_command_wrappers(value)
 
     for parent_key in PROMPT_PARENT_KEYS:
         parent = payload.get(parent_key)
