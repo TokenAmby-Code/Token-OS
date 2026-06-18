@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pathlib
+import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONF = ROOT / "tmux" / "tmux-base.conf"
@@ -59,6 +60,9 @@ def test_prefix_q_opens_mark_for_close_popup():
     assert "CLOSE_PANE=#{pane_id}" in line
     assert "tmux-mark-for-close" in line
     assert "unbind Q" not in conf
+    # The command must be single-quoted so tmux does not expand $CLOSE_PANE at
+    # config-parse time (which leaves --pane empty); the popup shell expands it.
+    assert "'tmux-mark-for-close --pane \"$CLOSE_PANE\"'" in line
 
     script = (ROOT / "bin" / "tmux-mark-for-close").read_text(encoding="utf-8")
     assert "/api/instances/${INSTANCE_ID}/mark-for-close" in script
@@ -69,3 +73,19 @@ def test_prefix_q_opens_mark_for_close_popup():
     assert "kill-pane" not in script
     assert "/retire" not in script
     assert "/archive-session-doc" not in script
+
+
+def test_mark_for_close_script_is_committed_executable():
+    # core.fileMode is false in this repo, so a missing exec bit is not caught by
+    # the working tree; assert the committed git mode is 100755 directly. The
+    # tmux popup runs `tmux-mark-for-close` off PATH and a non-exec file fails.
+    out = subprocess.run(
+        ["git", "ls-files", "-s", "bin/tmux-mark-for-close"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout, "tmux-mark-for-close is not tracked by git"
+    mode = out.stdout.split()[0]
+    assert mode == "100755", f"tmux-mark-for-close must be committed executable, got {mode}"
