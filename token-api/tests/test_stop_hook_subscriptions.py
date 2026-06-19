@@ -577,6 +577,52 @@ def test_orphan_session_stop_still_delivers_preplan_oneshot(app_env, monkeypatch
     assert row == ("delivered", 1)
 
 
+def test_stop_pane_fallback_delivers_id_drifted_subscription(app_env, monkeypatch):
+    """Id drift: a LIVE Stop delivers a one-shot armed under a STALE instance id.
+
+    The pane re-registered under a new id (`new-session`) mid-turn, but the
+    armed subscription still carries the old id (`old-session`) and the shared
+    pane (`%191`). handle_stop resolves the live row, so the normal fanout runs —
+    and its pane fallback (target_instance_id = ? OR target_pane = ?) must match
+    the stale-id subscription by pane and deliver. Without the fallback the
+    one-shot would silently strand on the dead id.
+    """
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "new-session", pane="%191")
+    sent = []
+
+    async def fake_write(pane, payload):
+        sent.append((pane, payload))
+        return {"status": "sent", "operation": "fake"}
+
+    monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
+
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO stop_hook_subscriptions
+           (target_instance_id, target_pane, subscriber_instance_id, subscriber_pane,
+            event, delivery, status, purpose, payload, oneshot)
+           VALUES ('old-session', '%191', 'old-session', '%191',
+                   'stop', 'prompt', 'active', 'preplan_plan', '/plan create the plan', 1)"""
+    )
+    conn.commit()
+    conn.close()
+
+    async def run() -> None:
+        result = await hooks.handle_stop({"session_id": "new-session", "transcript_tail": ""})
+        assert result["stop_subscriptions"][0]["status"] == "sent"
+
+    asyncio.run(run())
+
+    assert sent == [("%191", "/plan create the plan")]
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT status, oneshot FROM stop_hook_subscriptions WHERE target_instance_id='old-session'"
+    ).fetchone()
+    conn.close()
+    assert row == ("delivered", 1)
+
+
 def test_orphan_session_stop_without_subscription_reports_not_found(app_env):
     """An orphan Stop with NO deliverable subscription still reports the missing
     instance — the orphan-fanout path must not mask a genuinely unknown session."""
