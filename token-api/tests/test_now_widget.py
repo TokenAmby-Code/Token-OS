@@ -110,6 +110,42 @@ def test_write_today_now_callout_smoke_with_fixture_db(tmp_path):
     assert "> **Active:** custodes-main" in text
 
 
+def test_now_widget_prefers_today_timer_state_daily(tmp_path):
+    import json
+    import sqlite3
+
+    from now_widget import load_telemetry
+
+    db = tmp_path / "agents.db"
+    today = datetime.now(ZoneInfo("America/Phoenix")).strftime("%Y-%m-%d")
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE timer_state (id INTEGER PRIMARY KEY, state_json TEXT)")
+        conn.execute(
+            "INSERT INTO timer_state (id, state_json) VALUES (1, ?)",
+            (json.dumps({"current_mode": "stale-singleton"}),),
+        )
+        conn.execute("CREATE TABLE timer_state_daily (date TEXT PRIMARY KEY, state_json TEXT)")
+        conn.execute(
+            "INSERT INTO timer_state_daily (date, state_json) VALUES (?, ?)",
+            (today, json.dumps({"current_mode": "working", "break_balance_ms": 60000})),
+        )
+        conn.execute(
+            """CREATE TABLE instances (
+                id TEXT,
+                name TEXT,
+                working_dir TEXT,
+                status TEXT,
+                last_activity TEXT
+            )"""
+        )
+        conn.execute("CREATE TABLE events (event_type TEXT, details TEXT, created_at TEXT)")
+
+    telemetry = load_telemetry(db)
+
+    assert telemetry.timer["current_mode"] == "working"
+    assert telemetry.timer["break_balance_ms"] == 60000
+
+
 def test_now_widget_active_instances_reject_claude_placeholder(tmp_path):
     import json
     import sqlite3

@@ -40,6 +40,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 def load_telemetry(db_path: str | Path) -> NowWidgetTelemetry:
     db_path = Path(db_path)
+    today = datetime.now(MST).strftime("%Y-%m-%d")
     timer: dict = {}
     active_instances: list[str] = []
     location_zone = None
@@ -47,7 +48,15 @@ def load_telemetry(db_path: str | Path) -> NowWidgetTelemetry:
     recent_cascade = None
 
     with _connect(db_path) as conn:
-        row = conn.execute("SELECT state_json FROM timer_state WHERE id = 1").fetchone()
+        try:
+            row = conn.execute(
+                "SELECT state_json FROM timer_state_daily WHERE date = ?",
+                (today,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row is None:
+            row = conn.execute("SELECT state_json FROM timer_state WHERE id = 1").fetchone()
         if row and row["state_json"]:
             try:
                 timer = json.loads(row["state_json"])

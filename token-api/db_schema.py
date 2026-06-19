@@ -1316,6 +1316,14 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS timer_state_daily (
+                date TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS day_state (
                 date TEXT PRIMARY KEY,
                 day_started_at TEXT,
