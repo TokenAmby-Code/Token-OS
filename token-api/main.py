@@ -18471,21 +18471,30 @@ async def process_pane_state_queue_once() -> list[dict]:
                 )
                 continue
             status = "applied"
+            # @CC_IDENTITY is a marker row carrying profile_name (the trigger
+            # can't reach the Python PROFILES table from SQL). Expand it here into
+            # the concrete identity pane vars; every other row pushes verbatim.
+            if row["variable"] == "@CC_IDENTITY":
+                profile = shared.profile_by_name(row["value"]) or {}
+                # @CC_BOUND is a "pushed at least once" sentinel so tmux-context
+                # can tell a cold pane (never projected) from a legitimately
+                # unprofiled one (chapter genuinely empty) in a single read, and
+                # only run its API fallback for the truly-cold case.
+                push_pairs = [
+                    ("@CC_CHAPTER", profile.get("chapter") or ""),
+                    ("@CC_COLOR", profile.get("cc_color") or "default"),
+                    ("@CC_BOUND", "1"),
+                ]
+            else:
+                push_pairs = [(row["variable"], row["value"])]
             try:
-                await _run_subprocess_offloop(
-                    (
-                        "tmux",
-                        "set-option",
-                        "-p",
-                        "-t",
-                        pane,
-                        row["variable"],
-                        row["value"],
-                    ),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    timeout=5,
-                )
+                for var, val in push_pairs:
+                    await _run_subprocess_offloop(
+                        ("tmux", "set-option", "-p", "-t", pane, var, val),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        timeout=5,
+                    )
                 logger.info(
                     f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
                 )

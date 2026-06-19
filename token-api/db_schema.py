@@ -965,6 +965,47 @@ async def init_database_async(db_path: Path | None = None) -> None:
             END
         """)
 
+        # Linking/unlinking a session doc projects its title to @CC_SESSION_DOC
+        # (Phase 2-A2). tmux-context reads this pane option in-format instead of
+        # polling GET /api/session-docs every Claude render. The title lives in
+        # SQL (session_documents.title), so the trigger resolves it via subquery —
+        # COALESCE('') because: (a) the queue's value column is NOT NULL, and
+        # (b) on unlink NEW.session_doc_id is NULL so the subquery yields NULL,
+        # which COALESCE turns into the empty string that CLEARS the pane var.
+        # `IS NOT` (null-safe) so a NULL<->value transition still fires.
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_session_doc_pane_state
+            AFTER UPDATE OF session_doc_id ON claude_instances
+            WHEN OLD.session_doc_id IS NOT NEW.session_doc_id
+            BEGIN
+                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
+                VALUES (NEW.id, '@CC_SESSION_DOC',
+                        COALESCE((SELECT title FROM session_documents WHERE id = NEW.session_doc_id), ''),
+                        NEW.tmux_pane);
+            END
+        """)
+
+        # Binding an instance to a pane projects its identity (chapter + tint
+        # colour) to that pane (Phase 2-A2). tmux-context reads @CC_CHAPTER /
+        # @CC_COLOR in-format instead of polling GET /api/instances every render.
+        # Those two derive purely from the (immutable) profile_name, but chapter
+        # and cc_color live in the Python PROFILES table, not in SQL — so this
+        # trigger can only enqueue a MARKER carrying profile_name (@CC_IDENTITY);
+        # the pane_state drainer resolves the profile and pushes the concrete
+        # @CC_CHAPTER/@CC_COLOR. Keyed on tmux_pane (not profile_name): tmux_pane
+        # is absent at register INSERT and only ever set by a later UPDATE, so the
+        # first bind — and every rebind/pane-reuse — fires this and re-stamps the
+        # new pane. COALESCE('') guards the NOT NULL value column when unprofiled.
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_pane_identity_pane_state
+            AFTER UPDATE OF tmux_pane ON claude_instances
+            WHEN NEW.tmux_pane IS NOT NULL AND OLD.tmux_pane IS NOT NEW.tmux_pane
+            BEGIN
+                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
+                VALUES (NEW.id, '@CC_IDENTITY', COALESCE(NEW.profile_name, ''), NEW.tmux_pane);
+            END
+        """)
+
         # ── Session Doc Sync Queue ──
         # Trigger-driven session doc frontmatter updates. Fires on status change,
         # tab rename, doc link, and doc unlink — keeps agents: list coherent.
