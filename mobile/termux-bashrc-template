@@ -138,7 +138,7 @@ _write_termux_props() {
 extra-keys = [ \
   [{key: 'DRAWER', popup: {macro: "\u00001", display: '1'}}, {macro: "\u001b[Z", display: '⇧Tab', popup: {macro: "\u00002", display: '2'}}, {macro: "\u0012", display: '^R', popup: {macro: "\u00003", display: '3'}}, {macro: "\u0003", display: '^C', popup: {macro: "\u00004", display: '4'}}, 'TAB', {macro: "\u0000", display: '^␣', popup: {macro: "\u0000T", display: '⇄'}}, {key: 'KEYBOARD', display: '⌨', popup: 'ENTER'}], \
   ['ESC', 'SHIFT', 'ALT', 'CTRL', {key: 'HOME', popup: {macro: "\u0000y", display: '📋'}}, {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'END', popup: 'PASTE'}], \
-  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "\n~.", display: 'disc'}}, 'RIGHT'] \
+  [{key: '|', popup: ':'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'DOWN', popup: {macro: "\n~.", display: 'disc'}}, 'RIGHT'] \
 ]
 extra-keys-style = key-height:40,key-gap:0,key-border:0
 terminal-transcript-rows = 10000
@@ -153,7 +153,7 @@ PROPS
 # 2 rows (vs 3 on mobile) with tall keys + visible borders = unmistakable difference
 extra-keys = [ \
   [{macro: "\u0000T", display: '⇄'}, {key: 'ESC', popup: {macro: "\u00001", display: '1'}}, {key: 'CTRL', popup: {macro: "\u00002", display: '2'}}, {key: 'ALT', popup: {macro: "\u00003", display: '3'}}, {macro: "\u0012", display: '^R', popup: {macro: "\u00004", display: '4'}}, {macro: "\u0003", display: '^C'}, 'TAB', {macro: "\u0000", display: '^␣', popup: {macro: "\u0000T", display: '⇄'}}, {key: 'KEYBOARD', display: '⌨', popup: 'ENTER'}], \
-  [{key: '|', popup: '@'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'DOWN', popup: {macro: "\n~.", display: 'disc'}}, 'RIGHT', {key: 'END', popup: 'PASTE'}] \
+  [{key: '|', popup: ':'}, {key: '~', popup: '&&'}, {key: '/', popup: '\\\\'}, {key: '-', popup: '_'}, 'LEFT', {key: 'UP', popup: {macro: "claude\n", display: 'claude↩'}}, {key: 'DOWN', popup: {macro: "\n~.", display: 'disc'}}, 'RIGHT', {key: 'END', popup: 'PASTE'}] \
 ]
 extra-keys-style = key-height:90,key-gap:4,key-border:1
 terminal-transcript-rows = 10000
@@ -278,6 +278,10 @@ tx-kill() {
 # Phone → grouped session 'phone' on main:warp with keyboard auto-zoom hook.
 # SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
 mac() {
+    # Explicit mac request restores Mac insistence after `not-mac`.
+    rm -f "$HOME/.not-mac" "$HOME/.mac-auto-cooldown"
+    unset TERMUX_AUTO_MAC
+
     if [[ -n "$TMUX" ]]; then
         # Session selection even from tx pane — respects portable monitor flag.
         if is_portable_monitor; then
@@ -300,10 +304,16 @@ mac() {
         ssh -t mac "$_mac_attach"
         local exit_code=$?
 
-        # Exit code 0 = clean remote exit/detach.
+        # Exit code 0 = clean remote exit/detach. Arm a one-prompt cooldown so
+        # the prompt hook does not immediately reattach to the Mac.
+        if [[ $exit_code -eq 0 ]]; then
+            : > "$HOME/.mac-auto-cooldown"
+            break
+        fi
+
         # Exit code 255 is also how OpenSSH reports the intentional ~. escape;
         # treat it as a requested disconnect instead of fake-restarting/retrying.
-        [[ $exit_code -eq 0 || $exit_code -eq 255 ]] && break
+        [[ $exit_code -eq 255 ]] && break
 
         # Non-SSH failures may be transient. Retry up to 3 times
         # with a brief delay to allow transient issues to resolve.
@@ -661,35 +671,41 @@ shutdown-mini() {
 }
 
 # ====================================================
-# STARTUP
+# STARTUP / MAC INSISTENCE
 # ====================================================
-# Termux app page [1] is the raw Mac connection. Do not launch local tmux here.
-# If page [1] is dead/restarted, the new raw shell claims page [1] and runs mac.
-# Page [2] remains a normal raw shell; run `tx` there for the local phone tmux.
-# Disable with: TERMUX_AUTO_MAC=0 bash, or `termux-auto-mac off`.
+# Bare Termux prompts automatically attach the Mac tmux session.
+# Conservative scope: interactive top-level Termux shells only; never inside tmux,
+# SSH, noninteractive commands, or after `not-mac`.
+# `not-mac` persists opt-out until the next explicit `mac`. Clean Mac detach/exit
+# arms ~/.mac-auto-cooldown for exactly one prompt to prevent reattach loops.
+not-mac() {
+    touch "$HOME/.not-mac"
+    rm -f "$HOME/.mac-auto-cooldown"
+    export TERMUX_AUTO_MAC=0
+    echo "Mac auto-attach: OFF (run 'mac' to re-enable)"
+}
+
 termux-auto-mac() {
     case "${1:-status}" in
         on)
             unset TERMUX_AUTO_MAC
-            rm -f "$HOME/.termux-auto-mac-off"
+            rm -f "$HOME/.not-mac" "$HOME/.termux-auto-mac-off"
             echo "Termux auto-mac: ON"
             ;;
         off)
-            export TERMUX_AUTO_MAC=0
-            touch "$HOME/.termux-auto-mac-off"
-            echo "Termux auto-mac: OFF"
+            not-mac
             ;;
         reset)
-            rm -f "$HOME/.termux-page1-tty"
-            echo "Termux page [1] claim reset"
+            rm -f "$HOME/.mac-auto-cooldown"
+            echo "Termux auto-mac prompt cooldown reset"
             ;;
         status)
-            if [[ -f "$HOME/.termux-auto-mac-off" ]]; then
+            if [[ -f "$HOME/.not-mac" || -f "$HOME/.termux-auto-mac-off" || "${TERMUX_AUTO_MAC:-1}" == "0" ]]; then
                 echo "Termux auto-mac: OFF"
             else
                 echo "Termux auto-mac: ON"
             fi
-            [[ -f "$HOME/.termux-page1-tty" ]] && echo "page [1] tty: $(cat "$HOME/.termux-page1-tty")"
+            [[ -f "$HOME/.mac-auto-cooldown" ]] && echo "cooldown: armed for next prompt"
             ;;
         *)
             echo "Usage: termux-auto-mac on|off|reset|status" >&2
@@ -698,37 +714,42 @@ termux-auto-mac() {
     esac
 }
 
-_termux_tty_is_live() {
-    local tty_name="$1"
-    [[ -n "$tty_name" ]] || return 1
-    ps -eo tty= 2>/dev/null | awk '{print $1}' | grep -qx "$tty_name"
+_termux_auto_mac_eligible() {
+    [[ $- == *i* ]] || return 1
+    [[ -z "${TMUX:-}" && -z "${SSH_CONNECTION:-}" ]] || return 1
+    [[ "${TERMUX_AUTO_MAC:-1}" != "0" ]] || return 1
+    [[ ! -f "$HOME/.not-mac" && ! -f "$HOME/.termux-auto-mac-off" ]] || return 1
+    [[ -n "${TERMUX_VERSION:-}" || -d /data/data/com.termux ]] || return 1
+    type mac >/dev/null 2>&1 || return 1
 }
 
-_termux_startup_auto_mac() {
-    # Interactive top-level Termux shell only. Do not trigger in tmux panes,
-    # SSH sessions, scp/noninteractive commands, or explicit opt-out shells.
-    [[ $- == *i* ]] || return 0
-    [[ -z "${TMUX:-}" && -z "${SSH_CONNECTION:-}" ]] || return 0
-    [[ "${TERMUX_AUTO_MAC:-1}" != "0" ]] || return 0
-    [[ ! -f "$HOME/.termux-auto-mac-off" ]] || return 0
-    [[ -n "${TERMUX_VERSION:-}" || -d /data/data/com.termux ]] || return 0
+_termux_prompt_auto_mac() {
+    [[ -z "${__TERMUX_AUTO_MAC_RUNNING:-}" ]] || return 0
+    _termux_auto_mac_eligible || return 0
 
-    local current_tty claimed_tty state_file
-    current_tty=$(tty 2>/dev/null | sed 's#^/dev/##') || return 0
-    [[ -n "$current_tty" && "$current_tty" != "not a tty" ]] || return 0
-
-    state_file="$HOME/.termux-page1-tty"
-    claimed_tty=$(cat "$state_file" 2>/dev/null || true)
-
-    # If another live Termux TTY already owns page [1], this is page [2]+.
-    # Leave it as a raw shell so `tx` can be run manually there.
-    if [[ -n "$claimed_tty" && "$claimed_tty" != "$current_tty" ]] && _termux_tty_is_live "$claimed_tty"; then
+    # One-prompt/session-return guard. Consume it immediately; it is not a
+    # long-term disable.
+    if [[ -f "$HOME/.mac-auto-cooldown" ]]; then
+        rm -f "$HOME/.mac-auto-cooldown"
         return 0
     fi
 
-    echo "$current_tty" > "$state_file"
-    export TERMUX_AUTO_MAC=0
+    __TERMUX_AUTO_MAC_RUNNING=1
     mac
+    unset __TERMUX_AUTO_MAC_RUNNING
+    return 0
 }
 
-_termux_startup_auto_mac
+_termux_install_prompt_auto_mac() {
+    case ";${PROMPT_COMMAND:-};" in
+        *";_termux_prompt_auto_mac;"*) return 0 ;;
+    esac
+
+    if [[ -n "${PROMPT_COMMAND:-}" ]]; then
+        PROMPT_COMMAND="_termux_prompt_auto_mac; ${PROMPT_COMMAND}"
+    else
+        PROMPT_COMMAND="_termux_prompt_auto_mac"
+    fi
+}
+
+_termux_install_prompt_auto_mac
