@@ -33,6 +33,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from instance_mutation import sanctioned_update_instance
+from personas import assign_astartes_persona, persona_to_profile
 from shared import (
     DB_PATH,
     DESKTOP_CONFIG,
@@ -44,7 +45,6 @@ from shared import (
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
     ULTIMATE_FALLBACK,
-    get_next_available_profile,
     get_quiet_hours_status,
     is_phone_reachable,
     is_satellite_tts_available,
@@ -618,7 +618,9 @@ async def dispatch_notify(
                     "SELECT tts_voice FROM claude_instances WHERE id = ?", (instance_id,)
                 )
                 row = await cursor.fetchone()
-            if row and row["tts_voice"]:
+            if row and row["tts_voice"] is None:
+                tts = False
+            elif row and row["tts_voice"]:
                 wsl_voice = row["tts_voice"]
                 for p in PROFILES + FALLBACK_VOICES + PERSONA_PROFILES:
                     if p["wsl_voice"] == wsl_voice:
@@ -1050,8 +1052,11 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     if not row:
         return {"success": False, "error": f"Instance {instance_id} not found"}
 
-    voice = row["tts_voice"] or "Microsoft David"
-    sound = row["notification_sound"] or "chimes.wav"
+    if row["tts_voice"] is None:
+        return {"success": True, "queued": False, "reason": "persona_silent"}
+
+    voice = row["tts_voice"]
+    sound = row["notification_sound"]
     tab_name = row["tab_name"] or instance_id
     tmux_pane = row["tmux_pane"] if "tmux_pane" in row.keys() else None
 
@@ -1464,16 +1469,25 @@ async def set_global_tts_mode(request: Request):
         elif mode == "verbose" and old_mode == "silent":
             # Re-assign voices to all active instances that lost theirs
             cursor = await db.execute(
-                "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND tts_voice IS NULL AND is_subagent = 0"
+                """
+                SELECT ci.id
+                FROM claude_instances ci
+                LEFT JOIN personas p ON p.slug = ci.profile_name
+                WHERE ci.status IN ('processing', 'idle')
+                  AND ci.tts_voice IS NULL
+                  AND ci.is_subagent = 0
+                  AND (p.default_rank = 'astartes' OR ci.profile_name IS NULL)
+                """
             )
             rows = await cursor.fetchall()
-            used_voices = set()
             for row in rows:
-                profile, _ = get_next_available_profile(used_voices)
+                persona, _ = await assign_astartes_persona(db)
+                profile = persona_to_profile(persona)
                 await sanctioned_update_instance(
                     db,
                     instance_id=row[0],
                     updates={
+                        "profile_name": profile["name"],
                         "tts_mode": mode,
                         "tts_voice": profile["wsl_voice"],
                         "notification_sound": profile["notification_sound"],
@@ -1482,7 +1496,6 @@ async def set_global_tts_mode(request: Request):
                     write_source="api",
                     actor="tts-global-mode",
                 )
-                used_voices.add(profile["wsl_voice"])
         else:
             cursor = await db.execute(
                 "SELECT id FROM claude_instances WHERE status IN ('processing', 'idle') AND is_subagent = 0"

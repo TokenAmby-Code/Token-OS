@@ -828,14 +828,12 @@ fi
 # Get instance metadata from Token-API
 old_tab_name=""
 old_session_doc_id=""
-old_cc_color=""
 old_primarch=""
 if command -v curl &>/dev/null && command -v jq &>/dev/null; then
     instance_json=$(get_instance_metadata "$session_id")
     if [[ -n "$instance_json" && "$instance_json" != "{}" ]]; then
         old_tab_name=$(echo "$instance_json" | jq -r '.tab_name // empty' 2>/dev/null || true)
         old_session_doc_id=$(echo "$instance_json" | jq -r '.session_doc_id // empty' 2>/dev/null || true)
-        old_cc_color=$(echo "$instance_json" | jq -r '.cc_color // empty' 2>/dev/null || true)
         old_primarch=$(echo "$instance_json" | jq -r '.primarch // empty' 2>/dev/null || true)
         [[ -n "$old_tab_name" ]] && log_success "Instance name: $old_tab_name"
         [[ -n "$old_session_doc_id" ]] && log_success "Session doc: $old_session_doc_id"

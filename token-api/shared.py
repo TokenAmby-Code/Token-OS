@@ -11,7 +11,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import sqlite3
 import subprocess
 import threading
@@ -281,222 +280,64 @@ def get_quiet_hours_status(now: datetime | None = None) -> dict:
     }
 
 
-# ============ Voice Profiles ============
+# ============ Voice Profiles / Persona Registry ============
 
-# Voice profiles are named for Warhammer 40k Space Marine chapters. The chapter's
-# canonical colour drives the slot: `cc_color` is the Claude Code `/color` argument
-# (must be one of red|blue|green|yellow|purple|orange|pink|cyan|default), and the hex
-# `color` is a canonical chapter shade for UI widgets only. Each chapter is bound 1:1
-# to a fixed voice (wsl_voice/wsl_rate/mac_voice never change once assigned).
+# Runtime persona data lives in the SQLite ``personas`` table. These lists are
+# compatibility projections for older endpoints that still speak in terms of
+# profile_name/wsl_voice while the main instances table refactor lands.
+from personas import (  # noqa: E402
+    BACKUP_PROFILES,
+    PERSONA_COMPAT_PROFILES,
+    PRIMARY_PROFILES,
+    PROFILE_BY_SLUG,
+    ULTIMATE_FALLBACK_PROFILE,
+)
 
-# PRIMARY pool — distinctive foreign-accent voices, assigned first.
-PROFILES = [
-    {
-        "name": "blood-angels",
-        "chapter": "Blood Angels",
-        "wsl_voice": "Microsoft Ravi",
-        "wsl_rate": 1,
-        "mac_voice": "Rishi",
-        "notification_sound": "notify.wav",
-        "color": "#b1191e",
-        "cc_color": "red",
-    },  # IN M
-    {
-        "name": "ultramarines",
-        "chapter": "Ultramarines",
-        "wsl_voice": "Microsoft Susan",
-        "wsl_rate": 1,
-        "mac_voice": "Karen",
-        "notification_sound": "notify.wav",
-        "color": "#1f4e9b",
-        "cc_color": "blue",
-    },  # UK F
-    {
-        "name": "salamanders",
-        "chapter": "Salamanders",
-        "wsl_voice": "Microsoft Sean",
-        "wsl_rate": 0,
-        "mac_voice": "Moira",
-        "notification_sound": "chord.wav",
-        "color": "#1b7a3d",
-        "cc_color": "green",
-    },  # IE M
-    {
-        "name": "imperial-fists",
-        "chapter": "Imperial Fists",
-        "wsl_voice": "Microsoft Catherine",
-        "wsl_rate": 1,
-        "mac_voice": "Karen",
-        "notification_sound": "ding.wav",
-        "color": "#e6b800",
-        "cc_color": "yellow",
-    },  # AU F
-    {
-        "name": "emperors-children",
-        "chapter": "Emperor's Children",
-        "wsl_voice": "Microsoft Heera",
-        "wsl_rate": 1,
-        "mac_voice": "Rishi",
-        "notification_sound": "chimes.wav",
-        "color": "#d44d9c",
-        "cc_color": "pink",
-    },  # IN F
-]
-
-# FALLBACK pool — generic US voices, overflow only (still flags pool_exhausted).
-FALLBACK_VOICES = [
-    {
-        "name": "soul-drinkers",
-        "chapter": "Soul Drinkers",
-        "wsl_voice": "Microsoft David",
-        "wsl_rate": 1,
-        "mac_voice": "Daniel",
-        "notification_sound": "tada.wav",
-        "color": "#6a2fa0",
-        "cc_color": "purple",
-    },  # US M
-    {
-        "name": "legion-of-the-damned",
-        "chapter": "Legion of the Damned",
-        "wsl_voice": "Microsoft Zira",
-        "wsl_rate": 1,
-        "mac_voice": "Karen",
-        "notification_sound": "chord.wav",
-        "color": "#d35400",
-        "cc_color": "orange",
-    },  # US F
-    {
-        "name": "alpha-legion",
-        "chapter": "Alpha Legion",
-        "wsl_voice": "Microsoft Mark",
-        "wsl_rate": 1,
-        "mac_voice": "Daniel",
-        "notification_sound": "recycle.wav",
-        "color": "#2f9e9e",
-        "cc_color": "cyan",
-    },  # US M
-]
-
-# ULTIMATE FALLBACK — shared overflow slot when every chapter is taken. A cross-chapter
-# kill-team that appears only when there is nothing left to assign.
-ULTIMATE_FALLBACK = {
-    "name": "deathwatch",
-    "chapter": "Deathwatch",
-    "wsl_voice": "Microsoft David",
-    "wsl_rate": 1,
-    "mac_voice": "Daniel",
-    "notification_sound": "chimes.wav",
-    "color": "#1c1c1c",
-    "cc_color": "default",
-}
-
-# ============ Persona profiles ============
-# Persona panes (Custodes, Fabricator-General, Administratum, and any future
-# persona) have their ENTIRE background repainted by tmux (LEGION_PANE_COLORS),
-# so they NEVER take a foreground /color — cc_color is always "default" and the
-# themed background carries their identity. `default` is therefore reserved for
-# personas + the deathwatch overflow; no assignable chapter uses it (that frees
-# yellow to belong to Imperial Fists alone).
-#
-# Custodes is the one persona that SPEAKS: enforcement TTS via George, pulled out
-# of the general rotation. CUSTODES_PROFILE is deliberately NOT in
-# PROFILES/FALLBACK_VOICES, so get_next_available_profile() can never hand George
-# to a worker; that exclusion IS the reservation. Every other persona is voiceless
-# (wsl_voice=None) so it never TTSes and never consumes a chapter voice slot.
-CUSTODES_PROFILE = {
-    "name": "custodes",
-    "chapter": "Custodes",
-    "wsl_voice": "Microsoft George",
-    "wsl_rate": 2,
-    "mac_voice": "Daniel",
-    "notification_sound": "chimes.wav",
-    "color": "#d4af37",
-    "cc_color": "default",
-}
-
-
-def persona_profile_for(name: str, *, color: str = "#302800") -> dict:
-    """Build a voiceless persona profile.
-
-    Voiceless personas (FG, Administratum, any future non-speaking persona) hold
-    NO voice (wsl_voice=None) and take cc_color="default" — their tmux-painted
-    background is their signature, so no foreground /color is queued. `color` is a
-    UI-widget hue only (defaults to the dark-gold persona shade). The display
-    ``chapter`` is derived from the slug (``fabricator-general`` -> ``Fabricator
-    General``) so any future persona resolves a sensible operator-facing name.
-    """
-    return {
-        "name": name,
-        "chapter": name.replace("-", " ").title(),
-        "wsl_voice": None,
-        "wsl_rate": None,
-        "mac_voice": None,
-        "notification_sound": None,
-        "color": color,
-        "cc_color": "default",
-    }
-
-
-# The current persona panes. Adding a persona = add its pane label to
-# PERSONA_PANE_IDENTITY (routes/hooks.py); a VOICED persona also needs a profile
-# here, a VOICELESS one resolves automatically via resolve_persona_profile().
-FABRICATOR_PROFILE = persona_profile_for("fabricator-general", color="#300808")
-ADMINISTRATUM_PROFILE = persona_profile_for("administratum", color="#300808")
-PERSONA_PROFILES = [CUSTODES_PROFILE, FABRICATOR_PROFILE, ADMINISTRATUM_PROFILE]
+PROFILES = PRIMARY_PROFILES
+FALLBACK_VOICES = BACKUP_PROFILES
+ULTIMATE_FALLBACK = ULTIMATE_FALLBACK_PROFILE
+CUSTODES_PROFILE = PROFILE_BY_SLUG["custodes"]
+PERSONA_PROFILES = [p for p in PERSONA_COMPAT_PROFILES if p["default_rank"] != "astartes"]
 
 
 def resolve_persona_profile(primarch: str | None, legion: str | None = None) -> dict:
-    """Resolve the profile for a persona pane from its primarch (or legion).
+    """Compatibility resolver for persona panes.
 
-    Returns the registered profile for a known persona (Custodes/FG/Administratum)
-    or a generic voiceless persona profile for any future persona. Applied at
-    SessionStart the moment a pane is recognised as a persona, overriding whatever
-    random chapter profile it drew at registration.
+    The canonical DB resolver is ``personas.resolve_persona``. This seed-backed
+    projection is used during hook registration before the broader instances
+    refactor wires ``persona_id`` directly into every call site.
     """
-    name = (primarch or legion or "persona").strip().lower()
-    for p in PERSONA_PROFILES:
-        if p["name"] == name:
-            return p
-    return persona_profile_for(name)
+    slug = (primarch or legion or "persona").strip().lower()
+    return PROFILE_BY_SLUG.get(
+        slug,
+        {
+            "id": None,
+            "name": slug,
+            "slug": slug,
+            "chapter": slug.replace("-", " ").title(),
+            "display_name": slug.replace("-", " ").title(),
+            "default_rank": "overseer",
+            "assignment_pool": None,
+            "assignment_order": None,
+            "wsl_voice": None,
+            "wsl_rate": None,
+            "mac_voice": None,
+            "notification_sound": None,
+            "color": "#302800",
+            "chip_color": "#302800",
+            "pane_tint": "#302800",
+            "tts_voice": None,
+            "tts_rate": None,
+            "silent": True,
+        },
+    )
 
 
 def profile_by_name(profile_name: str | None) -> dict | None:
-    """Resolve a stored ``profile_name`` (chapter slug or persona slug) to its
-    profile dict, or ``None`` if it matches nothing (e.g. a legacy pre-rename
-    name). Centralises the chapter/persona lookup the instance APIs do ad hoc."""
+    """Resolve a stored ``profile_name``/persona slug to its compatibility dict."""
     if not profile_name:
         return None
-    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
-        if p["name"] == profile_name:
-            return p
-    return None
-
-
-def get_next_available_profile(used_wsl_voices: set) -> tuple[dict, bool]:
-    """Assign a profile using random-start linear probe (open addressing).
-
-    Args:
-        used_wsl_voices: Set of WSL voice names currently held by active instances.
-
-    Returns:
-        (profile_dict, pool_exhausted) — pool_exhausted is True if we had to
-        dip into fallback voices (David/Zira/Mark) or the ultimate fallback.
-    """
-    # 1. Try foreign-accent pool with linear probe
-    n = len(PROFILES)
-    start = random.randint(0, n - 1)
-    for i in range(n):
-        idx = (start + i) % n
-        if PROFILES[idx]["wsl_voice"] not in used_wsl_voices:
-            return PROFILES[idx], False
-
-    # 2. Foreign pool exhausted — try fallback voices (David, Zira, Mark)
-    for fb in FALLBACK_VOICES:
-        if fb["wsl_voice"] not in used_wsl_voices:
-            return fb, True
-
-    # 3. All exhausted — ultimate fallback (David again, shared slot)
-    return ULTIMATE_FALLBACK, True
+    return PROFILE_BY_SLUG.get(profile_name)
 
 
 # ============ TTS State ============
@@ -630,18 +471,15 @@ async def tmux_pane_exists(tmux_pane: str | None) -> bool:
     return await resolve_tmux_pane_id(tmux_pane) is not None
 
 
-# ── Legion pane tint (event-driven) ─────────────────────────────────────────
-# Pane background colour by legion. MUST stay in sync with tmuxctl's
-# _assert_persona_color (cli-tools/lib/tmuxctl/assertions.py): custodes→gold,
-# mechanicus/fabricator→red, civic→green, else→default. The two painters share
-# this map and each fires ONLY on a lifecycle event (persona register/change,
-# pane vacate, close) — never on a timer — so they paint the same colour and
-# never fight. There is no polling worker; this and _assert_persona_color are
-# the only things that paint a pane.
+# ── Persona pane tint (event-driven) ────────────────────────────────────────
+# Pane background colour is resolved from persona pane_tint where available and
+# applied only with `tmux select-pane -P bg=...`. Claude slash-color is not used.
 LEGION_PANE_COLORS = {
-    "custodes": "#302800",  # dark gold
-    "mechanicus": "#300808",  # dark red
-    "fabricator": "#300808",  # FG shares the mechanicus page tint
+    "custodes": PROFILE_BY_SLUG["custodes"]["pane_tint"],
+    "mechanicus": PROFILE_BY_SLUG["mechanicus"]["pane_tint"],
+    "fabricator": PROFILE_BY_SLUG["fabricator-general"]["pane_tint"],
+    "fabricator-general": PROFILE_BY_SLUG["fabricator-general"]["pane_tint"],
+    "administratum": PROFILE_BY_SLUG["administratum"]["pane_tint"],
     "civic": "#083010",  # dark green
     "astartes": "default",  # no tint (default legion)
 }
@@ -673,6 +511,16 @@ def apply_pane_tint(
         return
     try:
         adapter = TmuxAdapter()
+        voice_locked = adapter.run(
+            "show-options",
+            "-pqv",
+            "-t",
+            tmux_pane,
+            "@DISCORD_VOICE_LOCK",
+            allow_failure=True,
+        ).strip()
+        if voice_locked == "1":
+            return
         with preserve_focus(adapter, source=source, attempted_target=tmux_pane):
             adapter.run("select-pane", "-t", tmux_pane, "-P", f"bg={bg}", allow_failure=True)
     except Exception as exc:

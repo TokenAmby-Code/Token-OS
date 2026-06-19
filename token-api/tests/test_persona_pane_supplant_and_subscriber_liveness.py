@@ -240,21 +240,23 @@ def test_custodes_pane_assigns_reserved_george_profile(app_env, monkeypatch):
     assert tts_voice == CUSTODES_PROFILE["wsl_voice"] == "Microsoft George"
     assert notification_sound == CUSTODES_PROFILE["notification_sound"]
 
-    # The SessionStart response drives the queued /color command (generic-hook.sh
-    # reads .cc_color). Custodes is a persona pane — its whole background is gold-
-    # tinted by tmux — so it takes cc_color=default (no foreground /color), not the
-    # random chapter colour it was assigned a moment before it was recognised.
+    # The SessionStart response carries display/chip/tint data only. Pane colour
+    # is applied by tmux style; no Claude slash-color command is emitted.
     assert result["profile"] == "custodes"
-    assert result["cc_color"] == CUSTODES_PROFILE["cc_color"] == "default"
+    assert "cc_color" not in result
     assert result["color"] == CUSTODES_PROFILE["color"]
+    assert result["chip_color"] == CUSTODES_PROFILE["chip_color"]
+    assert result["pane_tint"] == CUSTODES_PROFILE["pane_tint"]
 
 
 def test_voiceless_persona_pane_holds_no_voice(app_env, monkeypatch):
     # FG (and every persona except Custodes) must register with NO voice — it never
-    # TTSes and never consumes a chapter voice slot — and take cc_color=default so
-    # its tmux-painted background carries its identity instead of a /color.
+    # TTSes and never consumes a chapter voice slot. Its tmux-painted background
+    # carries its identity; no Claude slash-color command is emitted.
     hooks = sys.modules["routes.hooks"]
-    from shared import FABRICATOR_PROFILE
+    from shared import profile_by_name
+
+    FABRICATOR_PROFILE = profile_by_name("fabricator-general")
 
     async def fg_label(_pane):
         return hooks.MECHANICUS_FG_LABEL  # "mechanicus:fabricator-general"
@@ -285,6 +287,7 @@ def test_voiceless_persona_pane_holds_no_voice(app_env, monkeypatch):
     assert profile_name == FABRICATOR_PROFILE["name"] == "fabricator-general"
     assert tts_voice is None, "FG must hold no voice (frees a chapter voice slot)"
 
-    # Persona pane → no foreground /color; the response carries cc_color=default.
+    # Persona pane → no foreground slash-color; response carries tint data.
     assert result["profile"] == "fabricator-general"
-    assert result["cc_color"] == "default"
+    assert "cc_color" not in result
+    assert result["pane_tint"] == FABRICATOR_PROFILE["pane_tint"]

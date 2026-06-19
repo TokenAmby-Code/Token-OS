@@ -9,7 +9,7 @@ This exists because raw `tmux send-keys ... Enter` can leave text queued in live
 ```bash
 agent-cmd --pane %123 "run the tests"
 agent-cmd --instance <instance-id> "////resume"
-agent-cmd --self "/color #ff9900"
+tmux select-pane -P bg=#ff9900
 ```
 
 `claude-cmd` is retained as a compatibility wrapper and delegates directly to `agent-cmd`.

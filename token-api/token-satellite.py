@@ -1559,7 +1559,7 @@ class AhkRequest(BaseModel):
 
 class TmuxSendKeysRequest(BaseModel):
     pane: str  # tmux pane ID (e.g., "%5")
-    command: str  # slash command or text to send (e.g., "/color cyan")
+    command: str  # slash command or text to send
     no_escape: bool = False  # Skip C-u clear before sending (prompt known-empty)
 
 
@@ -1568,6 +1568,7 @@ class GoldenThroneFollowupRequest(BaseModel):
     tmux_pane: str | None = None
     working_dir: str = "~"
     prompt: str
+    prompt_summary: str | None = None
     engine: str = "claude"
 
 
@@ -2170,6 +2171,36 @@ def _resolve_instance_pane(session_id: str) -> tuple[str | None, str | None]:
     return (pane_id, role)
 
 
+def _clip_one_line(text: str, max_len: int) -> str:
+    compact = " ".join(str(text).split())
+    if max_len <= 0:
+        return ""
+    if len(compact) <= max_len:
+        return compact
+    if max_len == 1:
+        return "…"
+    return compact[: max_len - 1].rstrip() + "…"
+
+
+def _golden_throne_file_bridge_prompt(
+    sop_file: str,
+    *,
+    prompt_summary: str | None = None,
+    max_len: int = 200,
+) -> str:
+    """Short live-agent prompt for long/multi-line Golden Throne payloads.
+
+    Mac token-api already generated the full prompt. For rubric-driven fires it
+    also sends a one-line summary naming the missing criterion so the remote
+    pane does not receive a generic "execute this SOP" injection.
+    """
+    if prompt_summary:
+        tail = f". Run: cat {sop_file}, then address those criteria."
+        return f"{_clip_one_line(prompt_summary, max_len - len(tail))}{tail}"
+    text = f"Golden Throne follow-up. Run: cat {sop_file}, then resume this thread."
+    return _clip_one_line(text, max_len)
+
+
 @app.get("/tmux/resolve-instance")
 async def tmux_resolve_instance(session_id: str):
     """Resolve a Claude instance UUID to its live pane on this satellite's host.
@@ -2241,8 +2272,9 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
                 else:
                     sop_file = f"/tmp/golden-throne-sop-{req.session_id[:8]}.md"
                     Path(sop_file).write_text(req.prompt)
-                    inject_prompt = (
-                        f"Golden Throne follow-up. Run: cat {sop_file} — then execute that SOP."
+                    inject_prompt = _golden_throne_file_bridge_prompt(
+                        sop_file,
+                        prompt_summary=req.prompt_summary,
                     )
                 _tmux_send_payload_then_submit(pane, inject_prompt, clear_prompt=True)
                 transport = "send-keys"

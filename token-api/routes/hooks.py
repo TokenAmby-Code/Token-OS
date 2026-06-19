@@ -38,6 +38,7 @@ from instance_mutation import (
     sanctioned_update_instance,
 )
 from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface
+from personas import assign_astartes_persona, persona_to_profile
 from phone_service import _send_to_phone
 from questions_gate import trials_clear
 from routes.tts import dispatch_notify, play_sound, queue_tts
@@ -53,17 +54,13 @@ from shared import (
     DB_PATH,
     DESKTOP_STATE,
     DISCORD_DAEMON_URL,
-    FALLBACK_VOICES,
     MORNING_EXPIRY_NOTICE,
     MORNING_KEEPALIVE_PROMPT,
-    PERSONA_PROFILES,
-    PROFILES,
-    ULTIMATE_FALLBACK,
     VOICE_CHAT_SESSIONS,
     append_workflow_event,
-    get_next_available_profile,
     is_subagent_pid,
     log_event,
+    profile_by_name,
     resolve_device_from_ip,
     resolve_persona_profile,
 )
@@ -479,6 +476,7 @@ async def _stop_if_dead_pane(db, session_id: str, existing: dict, actor: str) ->
         updates={
             "status": "stopped",
             "synced": 0,
+            "input_lock": None,
             "stopped_at": datetime.now().isoformat(),
         },
         mutation_type="instance_stopped",
@@ -2081,19 +2079,13 @@ async def handle_session_start(payload: dict) -> dict:
                     )
                 await db.commit()
 
-                # Resolve preserved profile for color
                 cursor = await db.execute(
                     "SELECT * FROM claude_instances WHERE id = ?", (session_id,)
                 )
                 updated_inst = await cursor.fetchone()
-                cc_color = "default"
-                hex_color = "#666666"
-                if updated_inst and updated_inst["profile_name"]:
-                    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
-                        if p["name"] == updated_inst["profile_name"]:
-                            cc_color = p.get("cc_color", "default")
-                            hex_color = p.get("color", "#666666")
-                            break
+                prof = profile_by_name(updated_inst["profile_name"] if updated_inst else None)
+                hex_color = (prof.get("chip_color") or prof.get("color")) if prof else "#666666"
+                pane_tint = prof.get("pane_tint") if prof else None
 
                 logger.info(
                     f"Hook: SessionStart transplant-refresh {session_id[:12]}... ({working_dir}) [device:{device_id}]"
@@ -2104,7 +2096,8 @@ async def handle_session_start(payload: dict) -> dict:
                     "instance_id": session_id,
                     "profile": updated_inst["profile_name"] if updated_inst else None,
                     "color": hex_color,
-                    "cc_color": cc_color,
+                    "chip_color": hex_color,
+                    "pane_tint": pane_tint,
                     "session_doc_id": updated_inst["session_doc_id"] if updated_inst else None,
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
@@ -2394,16 +2387,10 @@ async def handle_session_start(payload: dict) -> dict:
                     )
                 await db.commit()
 
-                # Resolve cc_color from preserved profile
                 preserved_profile = old_inst["profile_name"]
-                cc_color = "default"
-                hex_color = "#666666"
-                if preserved_profile:
-                    for p in PROFILES + FALLBACK_VOICES + [ULTIMATE_FALLBACK] + PERSONA_PROFILES:
-                        if p["name"] == preserved_profile:
-                            cc_color = p.get("cc_color", "default")
-                            hex_color = p.get("color", "#666666")
-                            break
+                prof = profile_by_name(preserved_profile)
+                hex_color = (prof.get("chip_color") or prof.get("color")) if prof else "#666666"
+                pane_tint = prof.get("pane_tint") if prof else None
 
                 supplant_source = (
                     f"transplant:{transplant_from}"
@@ -2432,7 +2419,8 @@ async def handle_session_start(payload: dict) -> dict:
                     "supplanted_from": supplant_id,
                     "profile": preserved_profile,
                     "color": hex_color,
-                    "cc_color": cc_color,
+                    "chip_color": hex_color,
+                    "pane_tint": pane_tint,
                     "session_doc_id": session_doc_id,
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
@@ -2445,15 +2433,8 @@ async def handle_session_start(payload: dict) -> dict:
             profile = {"name": None, "wsl_voice": None, "notification_sound": None}
             pool_exhausted = False
         else:
-            # Get WSL voices held by active instances
-            cursor = await db.execute(
-                "SELECT tts_voice FROM claude_instances WHERE status IN ('processing', 'idle')"
-            )
-            rows = await cursor.fetchall()
-            used_wsl_voices = {row[0] for row in rows if row[0]}
-
-            # Assign profile via linear probe
-            profile, pool_exhausted = get_next_available_profile(used_wsl_voices)
+            persona, pool_exhausted = await assign_astartes_persona(db)
+            profile = persona_to_profile(persona)
 
         # Preserve discord settings from prior registration (--resume re-registers with same id)
         _prior_discord_hosted = 0
@@ -2678,7 +2659,8 @@ async def handle_session_start(payload: dict) -> dict:
             # reserved George voice (the only path to it — George lives outside the
             # rotation pools); every other persona is voiceless (tts_voice=None) so
             # it never TTSes and frees the chapter voice it briefly held. All persona
-            # panes take cc_color="default" — their whole background is tmux-painted.
+            # voiceless personas keep tts_voice=NULL (silent). Pane colour is applied
+            # only through tmux select-pane -P bg=<personas.pane_tint>.
             if persona_identity:
                 persona_profile = resolve_persona_profile(
                     persona_identity.get("primarch"), auto_legion
@@ -2690,11 +2672,8 @@ async def handle_session_start(payload: dict) -> dict:
                         "notification_sound": persona_profile["notification_sound"],
                     }
                 )
-                # Rebind the local profile so the SessionStart response carries the
-                # persona name/colour. generic-hook.sh queues `/color` from the
-                # response's cc_color (="default" for personas), so the pane keeps
-                # its themed background instead of the random chapter foreground it
-                # was assigned a moment ago.
+                # Rebind the local profile so the SessionStart response carries
+                # persona display/chip/tint data. No Claude slash-color command is emitted.
                 profile = persona_profile
             await sanctioned_update_instance(
                 db,
@@ -2796,7 +2775,8 @@ async def handle_session_start(payload: dict) -> dict:
         "instance_id": session_id,
         "profile": profile["name"] if not is_subagent else None,
         "color": profile.get("color") if not is_subagent else None,
-        "cc_color": profile.get("cc_color") if not is_subagent else None,
+        "chip_color": profile.get("chip_color") if not is_subagent else None,
+        "pane_tint": profile.get("pane_tint") if not is_subagent else None,
         "session_doc_id": session_doc_id,
         "stop_subscription": auto_subscription,
         "mechanicus_stop_subscription": mechanicus_subscription,
@@ -2890,6 +2870,7 @@ async def handle_session_end(payload: dict) -> dict:
             updates={
                 "status": "stopped",
                 "synced": 0,
+                "input_lock": None,
                 "stopped_at": now,
                 "hook_driven": 0,
                 "workflow_state": "closed",
