@@ -4020,7 +4020,8 @@ async def handle_session_end(payload: dict) -> dict:
             """SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id,
                       tmux_pane,
                       (SELECT slug FROM personas WHERE id = instances.persona_id) AS legion,
-                      workflow_state, pane_label, golden_throne, status, rank
+                      workflow_state, pane_label, golden_throne, status, rank,
+                      engine, COALESCE(hook_driven, 0)
                FROM instances WHERE id = ?""",
             (session_id,),
         )
@@ -4043,6 +4044,18 @@ async def handle_session_end(payload: dict) -> dict:
         _gt_marker = row[8]
         _existing_status = row[9]
         _existing_rank = row[10]
+        _engine = row[11] if len(row) > 11 else _normalize_text(payload.get("engine") or "")
+        _hook_driven = row[12] if len(row) > 12 else 0
+        _payload_instance_type = _normalize_text(
+            payload.get("instance_type")
+            or payload.get("env", {}).get("TOKEN_API_INSTANCE_TYPE", "")
+        )
+        _is_codex_completed_one_off = (
+            _normalize_text(_engine or payload.get("engine") or "") == "codex"
+        ) and (
+            _payload_instance_type == "one_off"
+            or (_gt_marker is None and int(_hook_driven or 0) == 0)
+        )
 
         # Layer 1 — non-terminal SessionEnd short-circuit (in-wrapper re-fire).
         # plan-accept / `/clear` / compaction fire SessionEnd→SessionStart inside
@@ -4171,7 +4184,14 @@ async def handle_session_end(payload: dict) -> dict:
         # persona panes self-heal/recolor, dead stack workers prune, and failed
         # assertions clear stale overlays. Spawn bounded work out-of-band so the
         # hook response is not held hostage by a relaunch.
-        _spawn_session_end_assertion(_stop_pane_label or _stop_pane, session_id)
+        if _is_codex_completed_one_off:
+            logger.info(
+                "Hook: SessionEnd preserving Codex one-off pane stamp for %s (%s)",
+                _stop_pane_label or _stop_pane,
+                session_id[:12],
+            )
+        else:
+            _spawn_session_end_assertion(_stop_pane_label or _stop_pane, session_id)
 
         # Check remaining active instances
         cursor = await db.execute(

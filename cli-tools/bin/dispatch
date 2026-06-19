@@ -1848,6 +1848,7 @@ dispatch_codex_launch_inline() {
       --arg launcher "$launcher" \
       --arg engine "codex" \
       --arg tmux_pane "$resolved_tmux_pane" \
+      --arg instance_type "$instance_type" \
       --argjson code "$exit_code" \
       '{
         session_id: $sid,
@@ -1856,7 +1857,9 @@ dispatch_codex_launch_inline() {
         launcher: $launcher,
         engine: $engine,
         tmux_pane: $tmux_pane,
-        exit_code: $code
+        instance_type: $instance_type,
+        exit_code: $code,
+        env: {TOKEN_API_INSTANCE_TYPE: $instance_type}
       }')"
     dispatch_codex_post_hook "SessionEnd" "$end_payload"
     dispatch_codex_stack_enforce_if_needed
