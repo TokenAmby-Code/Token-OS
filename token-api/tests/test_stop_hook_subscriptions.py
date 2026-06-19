@@ -528,7 +528,7 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
     assert row == ("delivered", "preplan_plan", "/plan create the plan", 1)
 
 
-def test_orphan_session_stop_still_delivers_preplan_oneshot(app_env, monkeypatch):
+def test_orphan_session_stop_still_delivers_preplan_oneshot(app_env: Any, monkeypatch: Any) -> None:
     """A Stop whose session has no `instances` row must still deliver an armed
     preplan_plan one-shot.
 
@@ -577,7 +577,9 @@ def test_orphan_session_stop_still_delivers_preplan_oneshot(app_env, monkeypatch
     assert row == ("delivered", 1)
 
 
-def test_stop_pane_fallback_delivers_id_drifted_subscription(app_env, monkeypatch):
+def test_stop_pane_fallback_delivers_id_drifted_subscription(
+    app_env: Any, monkeypatch: Any
+) -> None:
     """Id drift: a LIVE Stop delivers a one-shot armed under a STALE instance id.
 
     The pane re-registered under a new id (`new-session`) mid-turn, but the
@@ -623,7 +625,7 @@ def test_stop_pane_fallback_delivers_id_drifted_subscription(app_env, monkeypatc
     assert row == ("delivered", 1)
 
 
-def test_orphan_session_stop_without_subscription_reports_not_found(app_env):
+def test_orphan_session_stop_without_subscription_reports_not_found(app_env: Any) -> None:
     """An orphan Stop with NO deliverable subscription still reports the missing
     instance — the orphan-fanout path must not mask a genuinely unknown session."""
     hooks = sys.modules["routes.hooks"]
