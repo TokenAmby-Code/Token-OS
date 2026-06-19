@@ -72,6 +72,7 @@ SESSION_NAME="main"
 # modes that caused the wipes. Best-effort: it must NEVER block or fail `tx`.
 TX_INVOCATION_LOG="${TX_INVOCATION_LOG:-${HOME}/.claude/tx-invocations.log}"
 TX_RESTART_WATCHDOG_LOG="${TX_RESTART_WATCHDOG_LOG:-${HOME}/.claude/tx-restart-watchdog.log}"
+TX_RESTART_EXECUTOR_LOG_DIR="${TX_RESTART_EXECUTOR_LOG_DIR:-${HOME}/.claude}"
 TX_RESTART_WATCHDOG_DELAY="${TX_RESTART_WATCHDOG_DELAY:-8}"
 
 _tx_restart_watchdog_log() {
@@ -104,6 +105,12 @@ _tx_validate_restart_nonce() {
         log_error "internal tx restart entrypoint refused: invalid restart nonce"
         return 1
     fi
+}
+
+_tx_restart_client_attached_to_session() {
+    local session="${1:-}" client_tty="${2:-}"
+    [[ -n "$session" && -n "$client_tty" ]] || return 1
+    tmux list-clients -t "$session" -F '#{client_tty}' 2>/dev/null | grep -Fxq "$client_tty"
 }
 
 _tx_log_invocation() {
@@ -412,7 +419,8 @@ cmd_restart() {
     # agent / hook / cron, which have repeatedly wiped live work unbidden.
     # Require an explicit interactive confirmation; FAIL CLOSED when there is no
     # controlling TTY (a tool-invoked Bash, a hook, a background job all lack
-    # one). `--force`/`-y` is the deliberate escape hatch for scripted callers.
+    # one). `--force`/`-y` only skips the typed word for an already-interactive
+    # operator; it is not a non-TTY agent/hook/cron escape hatch.
     local force=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -421,13 +429,21 @@ cmd_restart() {
         esac
     done
 
-    if [[ -z "$force" ]]; then
-        if [[ ! -t 0 || ! -t 1 ]]; then
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        if [[ -n "$force" ]]; then
+            _tx_log_invocation "restart --force" "refused-force-no-tty" || true
+            log_error "tx restart wipes & rebuilds the whole '${session}' workspace (all panes/instances)."
+            log_error "Refusing: --force requires an interactive terminal; non-TTY agents/hooks/cron may not restart the fleet."
+            return 1
+        else
             _tx_log_invocation "restart" "refused-no-tty" || true
             log_error "tx restart wipes & rebuilds the whole '${session}' workspace (all panes/instances)."
-            log_error "Refusing: no interactive terminal to confirm. Re-run with --force if you really mean it."
+            log_error "Refusing: no interactive terminal to confirm."
             return 1
         fi
+    fi
+
+    if [[ -z "$force" ]]; then
         log_warn "tx restart will KILL and rebuild the entire '${session}' session — every pane and agent instance."
         printf "Type 'restart' to confirm: " >&2
         local reply=""
@@ -465,9 +481,12 @@ cmd_restart() {
         # executor dies after teardown. That watchdog is a belt-and-suspenders
         # recovery path; if it fires, it means the restart path still has a real
         # bug that needs inspection in $TX_RESTART_WATCHDOG_LOG.
-        local cli_dir client_tty restart_pid nonce_file nonce nonce_row
+        local cli_dir client_tty restart_pid nonce_file nonce nonce_row executor_log executor_ts
         cli_dir="$(dirname "$(readlink -f "$0")")"
         client_tty=$(tmux display-message -p '#{client_tty}' 2>/dev/null || echo "")
+        mkdir -p "$TX_RESTART_EXECUTOR_LOG_DIR" 2>/dev/null || true
+        executor_ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date +%s)
+        executor_log="${TX_RESTART_EXECUTOR_LOG_DIR%/}/tx-restart-executor-${executor_ts}.log"
         nonce_row=$(_tx_make_restart_nonce) || {
             log_error "failed to create tx restart nonce"
             return 1
@@ -479,7 +498,7 @@ cmd_restart() {
             nonce_file="$3"
             nonce="$4"
             exec "$tx_bin" __tmuxctl_restart "$session_name" "$nonce_file" "$nonce"
-        ' _ "${cli_dir}/tx" "$session" "$nonce_file" "$nonce" >/dev/null 2>&1 &
+        ' _ "${cli_dir}/tx" "$session" "$nonce_file" "$nonce" >>"$executor_log" 2>&1 &
         restart_pid=$!
         if [[ "${TX_RESTART_WATCHDOG_DISABLE:-}" != "1" ]]; then
             nohup bash -c '
@@ -493,7 +512,7 @@ cmd_restart() {
                 exec "$tx_bin" __restart_watchdog "$session_name" "$client_tty" "$restart_pid" "$delay" "$nonce_file" "$nonce"
             ' _ "${cli_dir}/tx" "$session" "$client_tty" "$restart_pid" "$TX_RESTART_WATCHDOG_DELAY" "$nonce_file" "$nonce" >/dev/null 2>&1 &
         fi
-        _tx_restart_watchdog_log "launched session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
+        _tx_restart_watchdog_log "launched session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid} executor_log=${executor_log}"
         return 0
     fi
 
@@ -517,7 +536,9 @@ cmd_internal_restart_watchdog() {
     local delay="${4:-$TX_RESTART_WATCHDOG_DELAY}"
     local nonce_file="${5:-}" nonce="${6:-}"
     _tx_validate_restart_nonce "$nonce_file" "$nonce" || return 1
-    trap 'rm -f "$nonce_file" 2>/dev/null || true' EXIT
+    local nonce_file_q
+    nonce_file_q=$(printf '%q' "$nonce_file")
+    trap "rm -f $nonce_file_q 2>/dev/null || true" EXIT
 
     sleep "$delay" 2>/dev/null || sleep 8
 
@@ -537,13 +558,24 @@ cmd_internal_restart_watchdog() {
         return 0
     fi
 
-    if [[ -n "$client_tty" ]] && tmux list-clients -F '#{client_tty}' 2>/dev/null | grep -Fxq "$client_tty"; then
+    if _tx_restart_client_attached_to_session "$session" "$client_tty"; then
         _tx_restart_watchdog_log "noop client-restored session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
         return 0
     fi
 
     if tmux has-session -t "$session" 2>/dev/null; then
         local attached_clients
+        if [[ -n "$client_tty" ]] && tmux list-clients -F '#{client_tty}' 2>/dev/null | grep -Fxq "$client_tty"; then
+            if tmux switch-client -c "$client_tty" -t "$session" 2>>"$TX_RESTART_WATCHDOG_LOG"; then
+                if _tx_restart_client_attached_to_session "$session" "$client_tty"; then
+                    _tx_restart_watchdog_log "switched-client-to-session session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
+                    return 0
+                fi
+                _tx_restart_watchdog_log "switch-client-unverified session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
+            else
+                _tx_restart_watchdog_log "switch-client-failed session=${session} client_tty=${client_tty} restart_pid=${restart_pid}"
+            fi
+        fi
         attached_clients=$(tmux list-clients -t "$session" -F '#{client_tty}' 2>/dev/null || true)
         if [[ -n "$attached_clients" ]]; then
             _tx_restart_watchdog_log "noop session-has-other-client session=${session} client_tty=${client_tty:-none} restart_pid=${restart_pid}"
