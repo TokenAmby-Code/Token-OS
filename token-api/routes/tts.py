@@ -56,6 +56,15 @@ from shared import (
 
 logger = logging.getLogger("token_api")
 
+# Safety valve only. Normal focus follows event-hot pane speech, not timer/UI polls
+# or promoted pause-queue summaries.
+TTS_AUTO_FOCUS_ENABLED = os.environ.get("TOKEN_API_TTS_AUTO_FOCUS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 RAW_TMUX_PANE_RX = re.compile(r"%\d+")
 
 
@@ -718,6 +727,7 @@ class TTSQueueItem:
     queued_at: datetime = field(default_factory=datetime.now)
     status: str = "queued"  # queued, playing, completed
     tmux_pane: str | None = None  # pane ID for @TTS_STATE tracking
+    focus_on_playback: bool = False  # true only for event/urgent hot speech
 
 
 # Global TTS queue state — two-queue model
@@ -1021,9 +1031,14 @@ async def tts_queue_worker():
                     tts_current = None
 
             if tts_current:
-                # Playback start (None -> item): snap operator focus + zoom to
-                # the speaking pane. Best-effort; never fails the playback path.
-                await _snap_focus_to_speaker(tts_current)
+                # Playback start is the ONLY focus event. Do not tie focus to
+                # status/timer/UI polling. Only original hot/event speech may
+                # focus its source pane; paused summaries promoted later do not
+                # yank the operator back to stale/custodes context.
+                if tts_current.message and (
+                    tts_current.focus_on_playback or TTS_AUTO_FOCUS_ENABLED
+                ):
+                    await _snap_focus_to_speaker(tts_current)
 
                 # Log TTS starting
                 await log_event(
@@ -1208,6 +1223,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             tab_name=tab_name,
             queue_target=queue_target,
             tmux_pane=tmux_pane,
+            focus_on_playback=(queue_target == "hot"),
         )
     else:
         item = TTSQueueItem(
@@ -1218,6 +1234,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             tab_name=tab_name,
             queue_target=queue_target,
             tmux_pane=tmux_pane,
+            focus_on_playback=(queue_target == "hot"),
         )
 
     async with tts_queue_lock:
@@ -1237,6 +1254,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             "voice": voice,
             "position": position,
             "queue": queue_target,
+            "focus_on_playback": item.focus_on_playback,
         },
     )
 
