@@ -44,7 +44,7 @@ def get_active_instances():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
-        "SELECT id, name AS tab_name, working_dir, created_at AS registered_at FROM instances WHERE status IN ('working', 'idle') ORDER BY created_at DESC"
+        "SELECT id, name AS tab_name, working_dir, created_at AS registered_at FROM instances WHERE status IN ('working', 'implementing', 'idle') ORDER BY created_at DESC"
     )
     instances = [dict(row) for row in cursor.fetchall()]
     conn.close()

@@ -19,6 +19,7 @@ from .models import InstanceRegistryEntry, InstanceRegistrySnapshot
 _ACTIVE_STATUSES = {
     "processing",
     "working",
+    "implementing",
     "questioning",
     "preplanning",
     "planning",

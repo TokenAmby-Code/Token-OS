@@ -27,7 +27,7 @@ def test_preplan_claude_inserts_slash_leader_and_subscribes() -> None:
     assert "selection=preplan" in out
     assert "agent=claude" in out
     assert "insert:/preplan" in out
-    assert "subscribe:preplan_plan" in out
+    assert "handoff:preplan_plan" in out
     assert "state:preplanning" in out
 
 
@@ -35,7 +35,7 @@ def test_preplan_codex_inserts_dollar_leader() -> None:
     out = _dry("preplan", "codex")
     assert "agent=codex" in out
     assert "insert:$preplan" in out
-    assert "subscribe:preplan_plan" in out
+    assert "handoff:preplan_plan" in out
 
 
 def test_plan_inserts_universal_slash_plan() -> None:
@@ -207,8 +207,8 @@ def test_shift_tab_runs_prompt_end_and_forwards_btab(tmp_path: pathlib.Path) -> 
 
 
 def test_preplan_skips_insert_and_logs_on_subscribe_failure(tmp_path: pathlib.Path) -> None:
-    # The one-shot Stop subscription must arm BEFORE the leader is inserted. With
-    # an unreachable API the subscribe fails, so the leader insert is skipped (no
+    # The DB-backed preplan handoff must arm BEFORE the leader is inserted. With
+    # an unreachable API the handoff fails, so the leader insert is skipped (no
     # /plan would ever come) and the failure is logged. The cursor still restores.
     lines, logfile = _run_action_recording_sends(
         tmp_path, "preplan", agent="claude", api_url="http://127.0.0.1:1"
@@ -305,7 +305,7 @@ def test_failed_prompt_start_logs_real_tmux_stderr(tmp_path: pathlib.Path) -> No
 
 
 def test_subscribe_preplan_retries_once_then_fails_closed(tmp_path: pathlib.Path) -> None:
-    # A timed-out subscribe (curl exit 28) is retried exactly once before failing
+    # A timed-out preplan handoff (curl exit 28) is retried exactly once before failing
     # closed. The retry must run (two curl attempts) and, with both timing out, the
     # leader insert is still skipped and the failure logged — never an unarmed leader.
     attempts = tmp_path / "curl_attempts.txt"
@@ -322,3 +322,21 @@ def test_subscribe_preplan_retries_once_then_fails_closed(tmp_path: pathlib.Path
     assert logfile.exists()
     content = logfile.read_text()
     assert "step=subscribe" in content
+
+
+def test_preplan_uses_db_handoff_not_stop_hook_subscribe(tmp_path: pathlib.Path) -> None:
+    calls = tmp_path / "curl_calls.txt"
+    curl_body = (
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {shlex.quote(str(calls))}\n'
+        'printf "%s\\n" \'{"success":true,"intent_id":1}\'\n'
+        "exit 0\n"
+    )
+    logfile = _run_action_with_stubs(
+        tmp_path, "preplan", agent="claude", api_url="http://stub.invalid", curl_body=curl_body
+    )
+    assert calls.exists()
+    content = calls.read_text()
+    assert "/api/preplan/handoff" in content
+    assert "/api/hooks/subscribe" not in content
+    assert not logfile.exists()

@@ -93,7 +93,10 @@ async def _create_instances_table(db) -> None:
                 CHECK(commander_type IN ('emperor','persona','chapter')),
             commander_id TEXT,
             status TEXT NOT NULL DEFAULT 'idle'
-                CHECK(status IN ('idle','working','questioning','preplanning','planning','compacting','reviewing','victorious','stopped','archived')),
+                CHECK(status IN ('idle','working','implementing','questioning','preplanning','planning','compacting','reviewing','victorious','stopped','archived')),
+            is_questioning INTEGER NOT NULL DEFAULT 0 CHECK(is_questioning IN (0,1)),
+            questioning_since TIMESTAMP,
+            questioning_source TEXT,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_activity TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             stopped_at TIMESTAMP,
@@ -956,6 +959,29 @@ async def init_database_async(db_path: Path | None = None) -> None:
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_stop_hook_deliveries_target
             ON stop_hook_deliveries(target_instance_id, created_at DESC)
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS preplan_handoff_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_instance_id TEXT,
+                target_pane TEXT,
+                payload TEXT NOT NULL DEFAULT '/plan create the plan',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','delivered','cancelled','expired','failed')),
+                source TEXT NOT NULL DEFAULT 'api',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                delivered_at TIMESTAMP,
+                delivery_status TEXT,
+                delivery_result_json TEXT,
+                error TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_preplan_handoff_pending
+            ON preplan_handoff_intents(target_instance_id, target_pane, status, created_at)
         """)
 
         await db.execute("""

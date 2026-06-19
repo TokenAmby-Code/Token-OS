@@ -1075,7 +1075,7 @@ def _sync_insert_timer_sample(
     processing_recent = _coerce_work_state_value(work_state, "processing_recent_count")
     if processing_recent is None:
         cursor = conn.execute(
-            "SELECT COUNT(*) FROM instances WHERE status = 'working' AND COALESCE(is_subagent, 0) = 0"
+            "SELECT COUNT(*) FROM instances WHERE status IN ('working','implementing') AND COALESCE(is_subagent, 0) = 0"
         )
         processing_recent = int(cursor.fetchone()[0] or 0)
 

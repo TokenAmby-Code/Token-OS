@@ -10856,7 +10856,7 @@ async def resolve_instance(pid: int | None = None, cwd: str | None = None):
                                ELSE 'one_off'
                           END AS instance_type
                    FROM instances i
-                   WHERE i.working_dir = ? AND i.status = 'working'
+                   WHERE i.working_dir = ? AND i.status IN ('working', 'implementing')
                    ORDER BY i.last_activity DESC LIMIT 1""",
                 (cwd,),
             )
@@ -17796,7 +17796,7 @@ async def _ops_read_instances(now: datetime) -> dict:
             LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
             WHERE ci.status NOT IN ('stopped', 'archived')
             ORDER BY
-                CASE ci.status WHEN 'working' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END,
+                CASE ci.status WHEN 'working' THEN 0 WHEN 'implementing' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END,
                 ci.last_activity DESC
             LIMIT 160
             """
@@ -17840,6 +17840,9 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "chapter_color": (_prof.get("chip_color") or _prof.get("color")) if _prof else None,
                 "pane_tint": _prof.get("pane_tint") if _prof else None,
                 "status": status,
+                "is_questioning": bool(inst.get("is_questioning") or 0),
+                "questioning_since": inst.get("questioning_since"),
+                "questioning_source": inst.get("questioning_source"),
                 "engine": engine,
                 "device_id": inst.get("device_id"),
                 "working_dir": inst.get("working_dir"),
@@ -25808,7 +25811,9 @@ async def get_state():
         row = await cursor.fetchone()
         active_count = row[0] if row else 0
 
-        cursor = await db.execute("SELECT COUNT(*) FROM instances WHERE status = 'working'")
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM instances WHERE status IN ('working', 'implementing')"
+        )
         row = await cursor.fetchone()
         processing_count = row[0] if row else 0
 

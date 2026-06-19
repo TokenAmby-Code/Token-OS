@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timedelta
 
@@ -18,6 +19,9 @@ EXPECTED_INSTANCE_COLUMNS = [
     "commander_type",
     "commander_id",
     "status",
+    "is_questioning",
+    "questioning_since",
+    "questioning_source",
     "created_at",
     "last_activity",
     "stopped_at",
@@ -97,6 +101,9 @@ def _insert_instance(conn, **overrides):
         "commander_type": "emperor",
         "commander_id": None,
         "status": "idle",
+        "is_questioning": 0,
+        "questioning_since": None,
+        "questioning_source": None,
         "created_at": now,
         "last_activity": now,
         "stopped_at": None,
@@ -148,7 +155,7 @@ def test_supporting_tables_exist_and_seed_personas(app_env):
     tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     slugs = {r["slug"] for r in conn.execute("SELECT slug FROM personas")}
     conn.close()
-    assert {"personas", "golden_throne", "aspirants"} <= tables
+    assert {"personas", "golden_throne", "aspirants", "preplan_handoff_intents"} <= tables
     assert {
         "custodes",
         "fabricator-general",
@@ -159,6 +166,66 @@ def test_supporting_tables_exist_and_seed_personas(app_env):
     } <= slugs
     assert "emperor" not in slugs
     assert "chapter-master" not in slugs
+
+
+def test_instances_schema_accepts_implementing_and_questioning_columns(app_env):
+    conn = _conn(app_env.db_path)
+    iid = _insert_instance(
+        conn,
+        status="implementing",
+        is_questioning=1,
+        questioning_since="2026-06-14T00:00:00",
+        questioning_source="test",
+    )
+    row = conn.execute(
+        "SELECT status, is_questioning, questioning_since, questioning_source FROM instances WHERE id = ?",
+        (iid,),
+    ).fetchone()
+    conn.close()
+    assert tuple(row) == ("implementing", 1, "2026-06-14T00:00:00", "test")
+
+
+def test_migrated_instances_schema_gains_implementing_and_questioning_columns(app_env, tmp_path):
+    import asyncio
+
+    db_schema = sys.modules["db_schema"]
+    db_path = tmp_path / "old-agents.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE instances (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            engine TEXT,
+            working_dir TEXT,
+            device_id TEXT NOT NULL,
+            origin_type TEXT,
+            commander_type TEXT,
+            commander_id TEXT,
+            status TEXT NOT NULL DEFAULT 'idle',
+            created_at TIMESTAMP,
+            last_activity TIMESTAMP
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO instances
+           (id, name, working_dir, device_id, origin_type, commander_type, status,
+            created_at, last_activity)
+           VALUES ('old-1', 'old', '/tmp', 'Mac-Mini', 'local', 'emperor',
+                   'working', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"""
+    )
+    conn.commit()
+    conn.close()
+
+    asyncio.run(db_schema.init_database_async(db_path))
+
+    conn = sqlite3.connect(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(instances)")}
+    status = conn.execute(
+        "SELECT status, is_questioning FROM instances WHERE id='old-1'"
+    ).fetchone()
+    conn.close()
+    assert {"is_questioning", "questioning_since", "questioning_source"} <= cols
+    assert status == ("working", 0)
 
 
 def test_instance_normalizer_maps_legacy_row_to_expected_fields(app_env):
@@ -188,7 +255,7 @@ def test_instance_normalizer_maps_legacy_row_to_expected_fields(app_env):
 
     assert normalized["id"] == iid
     assert normalized["name"] == "clear-slate"
-    assert normalized["status"] == "working"
+    assert normalized["status"] == "implementing"
     assert normalized["persona_id"] == 42
     assert normalized["interaction_mode"] == "voice_chat"
     assert not (
@@ -314,6 +381,7 @@ def test_derived_cockpit_labels_not_stored(app_env):
     stale = (datetime.now() - timedelta(minutes=31)).isoformat()
     assert derived_cockpit_label({"status": "working", "automated": 1}) == "interred"
     assert derived_cockpit_label({"status": "working", "automated": 0}) == "commanded"
+    assert derived_cockpit_label({"status": "implementing", "automated": 0}) == "commanded"
     assert derived_cockpit_label({"status": "idle", "last_activity": stale}) == "languishing"
     conn = _conn(app_env.db_path)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(instances)")}

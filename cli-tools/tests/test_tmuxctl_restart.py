@@ -507,7 +507,15 @@ def test_normalize_instance_status_accepts_live_api_vocabulary():
     # vanish from the plan just because it was busy at capture time.
     from tmuxctl.registry import normalize_instance_status
 
-    for active in ("working", "questioning", "preplanning", "planning", "compacting", "reviewing"):
+    for active in (
+        "working",
+        "implementing",
+        "questioning",
+        "preplanning",
+        "planning",
+        "compacting",
+        "reviewing",
+    ):
         assert normalize_instance_status(active) is InstanceStatus.PROCESSING, active
     assert normalize_instance_status("processing") is InstanceStatus.PROCESSING
     assert normalize_instance_status("idle") is InstanceStatus.IDLE

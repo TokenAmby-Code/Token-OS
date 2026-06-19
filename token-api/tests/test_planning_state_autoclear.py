@@ -70,6 +70,13 @@ def _planning(db_path, instance_id):
     return (row[0], row[1]) if row else (None, None)
 
 
+def _phase(db_path, instance_id):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status FROM instances WHERE id = ?", (instance_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
 def _planning_mutations(db_path, instance_id) -> int:
     conn = sqlite3.connect(db_path)
     n = conn.execute(
@@ -95,6 +102,17 @@ def _post_tool(app_env, monkeypatch, session_id, tool_name):
     return asyncio.run(run())
 
 
+def _pre_tool(app_env, session_id, tool_name, tool_input=None):
+    hooks = sys.modules["routes.hooks"]
+
+    async def run():
+        return await hooks.handle_pre_tool_use(
+            {"session_id": session_id, "tool_name": tool_name, "tool_input": tool_input or {}}
+        )
+
+    return asyncio.run(run())
+
+
 def _prompt_submit(app_env, monkeypatch, payload):
     hooks = sys.modules["routes.hooks"]
     monkeypatch.setattr(hooks, "_stop_if_dead_pane", _never_dead)
@@ -114,6 +132,7 @@ def test_write_clears_planning(app_env, monkeypatch):
     state, source = _planning(app_env.db_path, "plan-1")
     assert state == "none"
     assert source == "auto-clear:tool-exec"
+    assert _phase(app_env.db_path, "plan-1") == "implementing"
     assert _planning_mutations(app_env.db_path, "plan-1") == 1
 
 
@@ -165,6 +184,33 @@ def test_write_on_none_noops(app_env, monkeypatch):
     assert _planning_mutations(app_env.db_path, "idle-1") == 0
 
 
+def test_ask_user_question_sets_stackable_questioning_without_phase_change(app_env, monkeypatch):
+    _insert_instance(
+        app_env.db_path, "askq-1", pane="%54", planning_state="planning", status="planning"
+    )
+
+    _pre_tool(
+        app_env,
+        "askq-1",
+        "AskUserQuestion",
+        {"questions": [{"question": "Approve?", "options": ["Yes", "No"]}]},
+    )
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT status, is_questioning, questioning_source FROM instances WHERE id='askq-1'"
+    ).fetchone()
+    conn.close()
+    assert row == ("planning", 1, "PreToolUse")
+
+    _post_tool(app_env, monkeypatch, "askq-1", "AskUserQuestion")
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT status, is_questioning, questioning_since, questioning_source FROM instances WHERE id='askq-1'"
+    ).fetchone()
+    conn.close()
+    assert row == ("planning", 0, None, None)
+
+
 # ── The clear runs before the debounce ─────────────────────────────────────────
 
 
@@ -205,6 +251,7 @@ def test_codex_prompt_submit_plan_context_sets_planning(app_env, monkeypatch):
     state, source = _planning(app_env.db_path, "codex-plan-1")
     assert state == "planning"
     assert source == "auto-clear:prompt-submit"
+    assert _phase(app_env.db_path, "codex-plan-1") == "planning"
 
 
 def test_slash_plan_prompt_sets_planning_for_any_harness(app_env, monkeypatch):
@@ -215,6 +262,7 @@ def test_slash_plan_prompt_sets_planning_for_any_harness(app_env, monkeypatch):
     state, source = _planning(app_env.db_path, "slash-plan-1")
     assert state == "planning"
     assert source == "auto-clear:prompt-submit"
+    assert _phase(app_env.db_path, "slash-plan-1") == "planning"
 
 
 def test_codex_prompt_submit_transcript_plan_context_sets_planning(
@@ -326,7 +374,9 @@ def test_codex_prompt_submit_ignores_prior_turnless_plan_item(
 
 def test_session_start_reregistration_reconciles_planning(app_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "stuck-1", pane="%47", planning_state="planning")
+    _insert_instance(
+        app_env.db_path, "stuck-1", pane="%47", planning_state="planning", status="planning"
+    )
 
     async def no_label(_pane):
         return None
@@ -347,6 +397,7 @@ def test_session_start_reregistration_reconciles_planning(app_env, monkeypatch):
     state, source = _planning(app_env.db_path, "stuck-1")
     assert state == "none"
     assert source == "auto-clear:session-start"
+    assert _phase(app_env.db_path, "stuck-1") == "implementing"
 
 
 def test_session_start_supplant_reconciles_planning_with_supplant_source(app_env, monkeypatch):
@@ -356,6 +407,7 @@ def test_session_start_supplant_reconciles_planning_with_supplant_source(app_env
         "old-plan-1",
         pane="%50",
         planning_state="approving",
+        status="planning",
         engine="codex",
         wrapper_launch_id="bridge-plan-1",
     )
@@ -384,3 +436,4 @@ def test_session_start_supplant_reconciles_planning_with_supplant_source(app_env
     state, source = _planning(app_env.db_path, "new-plan-1")
     assert state == "none"
     assert source == "auto-clear:instance-supplanted"
+    assert _phase(app_env.db_path, "new-plan-1") == "implementing"

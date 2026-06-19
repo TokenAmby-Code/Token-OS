@@ -5,7 +5,7 @@
 #
 # Bare Shift+Tab opens this picker: preplan / plan / compact / shift+tab / cancel.
 #   preplan   -> insert the preplan leader (/preplan for Claude, $preplan for
-#                Codex) at the prompt START and arm a one-shot Stop subscription
+#                Codex) at the prompt START and arm a DB-backed preplan handoff
 #                that delivers the plan turn after this pane next stops
 #   plan      -> insert /plan    at the prompt start (universal slash, both harnesses)
 #   compact   -> insert /compact at the prompt start (universal slash, both harnesses)
@@ -156,14 +156,13 @@ _detect_agent() {
     echo "$a"
 }
 
-# One-shot Stop subscription: when this pane next stops after the operator
-# submits the preplan turn, deliver the plan turn. PR#2b routes this to /compact
-# when the preplan response recommends it; the payload here remains the default
-# plan submission.
+# DB-backed preplan handoff: when this pane next stops after the operator
+# submits the preplan turn, Token-API consumes the pending intent and delivers
+# the plan turn. The payload here remains the default plan submission.
 subscribe_preplan() {
     [[ -z "$API_URL" ]] && return 0
     local body resp rc=0 attempt
-    body="{\"target_pane\":$(json_escape "$PANE"),\"subscriber_pane\":$(json_escape "$PANE"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"preplan_plan\",\"payload\":\"/plan create the plan\",\"oneshot\":true}"
+    body="{\"target_pane\":$(json_escape "$PANE"),\"payload\":\"/plan create the plan\",\"source\":\"tmux-plan-menu\"}"
     # preplan is fail-closed: a timed-out subscribe skips the leader insert, so the
     # whole pick no-ops (the codex live-test symptom). Give the (sometimes slow)
     # endpoint real headroom (--max-time 8, was 2) and one retry on a transient
@@ -172,7 +171,7 @@ subscribe_preplan() {
     # not retried; it will not improve on a second attempt.
     for attempt in 1 2; do
         rc=0
-        resp=$(curl -sf --max-time 8 -X POST "${API_URL}/api/hooks/subscribe" \
+        resp=$(curl -sf --max-time 8 -X POST "${API_URL}/api/preplan/handoff" \
             -H 'Content-Type: application/json' -d "$body") || rc=$?
         (( rc == 0 )) && break
         case "$rc" in
@@ -181,10 +180,10 @@ subscribe_preplan() {
         esac
     done
     if (( rc != 0 )); then
-        echo "tmux-plan-menu: subscribe_preplan POST ${API_URL}/api/hooks/subscribe failed (curl exit $rc)" >&2
+        echo "tmux-plan-menu: subscribe_preplan POST ${API_URL}/api/preplan/handoff failed (curl exit $rc)" >&2
         return "$rc"
     fi
-    # /api/hooks/subscribe returns HTTP 200 with {"success": false} when the pane
+    # /api/preplan/handoff returns HTTP 200 with {"success": false} when the pane
     # can't be resolved (target_unresolved/subscriber_unresolved), so a 2xx is not
     # enough — confirm the one-shot actually armed before the caller inserts a leader.
     if ! RESP="$resp" python3 -c '
@@ -390,7 +389,7 @@ if $DRY_RUN; then
         preplan)
             agent_dry="$(normalize_agent "$AGENT")"
             [[ "$agent_dry" == auto ]] && agent_dry="claude"
-            printf 'pane=%s selection=preplan agent=%s insert:%s subscribe:preplan_plan state:preplanning\n' \
+            printf 'pane=%s selection=preplan agent=%s insert:%s handoff:preplan_plan state:preplanning\n' \
                 "$PANE" "$agent_dry" "$(preplan_leader "$agent_dry")"
             ;;
         plan)    printf 'pane=%s selection=plan insert:/plan state:planning\n' "$PANE" ;;

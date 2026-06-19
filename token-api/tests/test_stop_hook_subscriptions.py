@@ -152,8 +152,8 @@ def test_explicit_subscribe_unsubscribe(app_env):
 
 
 def test_same_pane_subscribe_resolves_pane_once(app_env, monkeypatch) -> None:
-    # The live preplan subscribe sends target_pane == subscriber_pane == the same
-    # %id. _resolve_instance_for_pane is the expensive leg (tmux show-options + a
+    # Same-pane subscribers send target_pane == subscriber_pane == the same %id.
+    # _resolve_instance_for_pane is the expensive leg (tmux show-options + a
     # SQLite lookup); it must run ONCE for the shared pane, not twice. Force the
     # pane-stamp probe to miss so resolution is deterministic (falls to the
     # tmux_pane fallback that finds the inserted row).
@@ -527,6 +527,77 @@ def test_custom_oneshot_stop_subscription_delivers_payload_and_deactivates(app_e
     assert row == ("delivered", "preplan_plan", "/plan create the plan", 1)
 
 
+def test_preplan_handoff_endpoint_sets_phase_and_creates_db_intent(app_env, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("TOKEN_API_TEST_ALLOW_STAMPED_PANE_FALLBACK", "1")
+    _insert_instance(app_env.db_path, "preplan-1", pane="%92", status="idle")
+    client = TestClient(app_env.main.app)
+
+    resp = client.post(
+        "/api/preplan/handoff",
+        json={"target_pane": "%92", "source": "tmux-plan-menu"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["action"] == "preplan_handoff_armed"
+    assert data["phase"] == "preplanning"
+
+    conn = sqlite3.connect(app_env.db_path)
+    inst = conn.execute(
+        "SELECT status, planning_state, planning_source FROM instances WHERE id='preplan-1'"
+    ).fetchone()
+    intent = conn.execute(
+        "SELECT target_instance_id, target_pane, payload, status, source FROM preplan_handoff_intents"
+    ).fetchone()
+    sub_count = conn.execute("SELECT COUNT(*) FROM stop_hook_subscriptions").fetchone()[0]
+    conn.close()
+
+    assert inst == ("preplanning", "preplanning", "tmux-plan-menu")
+    assert intent == ("preplan-1", "%92", "/plan create the plan", "pending", "tmux-plan-menu")
+    assert sub_count == 0
+
+
+def test_stop_hook_fulfills_preplan_handoff_once(app_env, monkeypatch):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "preplan-2", pane="%93", status="preplanning")
+    sent = []
+
+    async def fake_write(pane, payload):
+        sent.append((pane, payload))
+        return {"status": "sent", "operation": "fake"}
+
+    monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
+
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO preplan_handoff_intents
+           (target_instance_id, target_pane, payload, status, source)
+           VALUES ('preplan-2', '%93', '/plan create the plan', 'pending', 'test')"""
+    )
+    conn.commit()
+    conn.close()
+
+    async def run():
+        first = await hooks.handle_stop({"session_id": "preplan-2", "transcript_tail": ""})
+        second = await hooks.handle_stop({"session_id": "preplan-2", "transcript_tail": ""})
+        assert first["preplan_handoffs"][0]["status"] == "delivered"
+        assert "preplan_handoffs" not in second
+
+    asyncio.run(run())
+
+    assert sent == [("%93", "/plan create the plan")]
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT status, delivery_status, error FROM preplan_handoff_intents"
+    ).fetchone()
+    phase = conn.execute("SELECT status FROM instances WHERE id='preplan-2'").fetchone()[0]
+    conn.close()
+    assert row == ("delivered", "sent", None)
+    assert phase == "preplanning"
+
+
 def _insert_subscription(
     db_path,
     *,
@@ -789,7 +860,7 @@ def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env, monkeypat
         "SELECT planning_state, planning_source FROM legacy_instances WHERE id='planner-1'"
     ).fetchone()
     queued = conn.execute(
-        "SELECT variable, value, tmux_pane FROM pane_state_queue WHERE instance_id='planner-1' ORDER BY id DESC LIMIT 1"
+        "SELECT variable, value, tmux_pane FROM pane_state_queue WHERE instance_id='planner-1' AND variable='@PLANNING_STATE' ORDER BY id DESC LIMIT 1"
     ).fetchone()
     event_count = conn.execute(
         "SELECT COUNT(*) FROM events WHERE instance_id='planner-1' AND event_type='planning_state_changed'"

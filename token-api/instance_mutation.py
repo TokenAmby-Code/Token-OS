@@ -35,6 +35,9 @@ INSTANCE_MUTATION_FIELDS = {
     "name",
     "engine",
     "status",
+    "is_questioning",
+    "questioning_since",
+    "questioning_source",
     "last_activity",
     "stopped_at",
     "archived_at",
@@ -95,6 +98,84 @@ INSTANCE_MUTATION_FIELDS = {
     "hook_driven",
     "is_subagent",
 }
+
+IMPLEMENTATION_PHASE_STATUS = "implementing"
+PLANNING_PHASE_STATUSES = {"preplanning", "planning"}
+
+
+async def transition_instance_phase(
+    db,
+    *,
+    instance_id: str,
+    phase: str,
+    source: str,
+    actor: str,
+    last_activity: str | None = None,
+    stopped_at: str | None = None,
+    write_source: str = "hooks",
+    mutation_type: str = "status_changed",
+    only_if_in: tuple[str, ...] | set[str] | None = None,
+    extra_updates: dict | None = None,
+) -> dict | None:
+    """Sanctioned phase transition for instances.status.
+
+    ``instances.status`` is the durable lifecycle phase. This helper keeps phase
+    writes centralized while letting callers CAS-gate idempotent transitions.
+    """
+    before = await _fetch_instance_record(db, instance_id)
+    if before is None:
+        raise LookupError(f"Instance not found: {instance_id}")
+    previous = before.get("status") or "idle"
+    if only_if_in is not None and previous not in set(only_if_in):
+        return None
+    updates = {"status": phase}
+    if last_activity is not None:
+        updates["last_activity"] = last_activity
+    if stopped_at is not None:
+        updates["stopped_at"] = stopped_at
+    if extra_updates:
+        updates.update(extra_updates)
+    return await sanctioned_update_instance(
+        db,
+        instance_id=instance_id,
+        updates=updates,
+        mutation_type=mutation_type,
+        write_source=write_source,
+        actor=actor,
+    )
+
+
+async def set_instance_questioning(
+    db,
+    *,
+    instance_id: str,
+    active: bool,
+    source: str,
+    actor: str,
+    write_source: str = "hooks",
+    last_activity: str | None = None,
+) -> dict | None:
+    """Set/clear stackable AskUserQuestion state without replacing phase."""
+    before = await _fetch_instance_record(db, instance_id)
+    if before is None:
+        raise LookupError(f"Instance not found: {instance_id}")
+    now = datetime.now().isoformat()
+    updates = {
+        "is_questioning": 1 if active else 0,
+        "questioning_since": (before.get("questioning_since") or now) if active else None,
+        "questioning_source": source if active else None,
+    }
+    if last_activity is not None:
+        updates["last_activity"] = last_activity
+    return await sanctioned_update_instance(
+        db,
+        instance_id=instance_id,
+        updates=updates,
+        mutation_type="questioning_state_changed",
+        write_source=write_source,
+        actor=actor,
+    )
+
 
 # Canonical registry columns. These deliberately exclude every raw tmux pane
 # id and tmuxctl positional/cardinal field. Token-API may return live runtime

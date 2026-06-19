@@ -38,6 +38,9 @@ IDENTITY_COLUMNS = [
     "commander_type",
     "commander_id",
     "status",
+    "is_questioning",
+    "questioning_since",
+    "questioning_source",
     "created_at",
     "last_activity",
     "stopped_at",
@@ -129,6 +132,7 @@ VALID_COMMANDER_TYPES = {"emperor", "persona", "chapter"}
 VALID_STATUSES = {
     "idle",
     "working",
+    "implementing",
     "questioning",
     "preplanning",
     "planning",
@@ -164,7 +168,7 @@ def assert_no_runtime_tmux_fields(values: dict, *, context: str) -> None:
 def normalize_status(status: str | None) -> str:
     value = (status or "idle").strip().lower()
     if value == "processing":
-        return "working"
+        return "implementing"
     if value in VALID_STATUSES:
         return value
     return "idle"
@@ -277,9 +281,9 @@ def derived_cockpit_label(
     row: dict, *, stale_minutes: int = 30, now: datetime | None = None
 ) -> str | None:
     status = row.get("status")
-    if status == "working" and int(row.get("automated") or 0):
+    if status in {"working", "implementing"} and int(row.get("automated") or 0):
         return "interred"
-    if status == "working":
+    if status in {"working", "implementing"}:
         return "commanded"
     if status == "idle" and row.get("last_activity"):
         try:

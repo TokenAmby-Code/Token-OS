@@ -103,7 +103,7 @@ def load_instances() -> dict[str, Instance]:
                COALESCE(i.tmux_pane, '') AS tmux_pane, COALESCE(p.slug, '') AS legion
         FROM instances i
         LEFT JOIN personas p ON p.id = i.persona_id
-        WHERE i.status IN ('idle', 'working')
+        WHERE i.status IN ('idle', 'working', 'implementing')
           AND COALESCE(i.tmux_pane, '') != ''
           AND COALESCE(i.is_subagent, 0) = 0
         ORDER BY last_activity DESC

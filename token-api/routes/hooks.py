@@ -32,6 +32,7 @@ import shared
 import talk as talk_service
 from enforcement_service import close_distraction_windows
 from instance_mutation import (
+    PLANNING_PHASE_STATUSES,
     _fetch_instance_row,
     create_golden_throne_binding,
     sanctioned_delete_instance,
@@ -39,6 +40,7 @@ from instance_mutation import (
     sanctioned_update_instance,
     sanctioned_update_instance_record,
     sanctioned_update_runtime_fields,
+    set_instance_questioning,
 )
 from instance_registry import LEGACY_PERSONA_ALIASES
 from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface
@@ -293,6 +295,15 @@ class PlanningStateRequest(BaseModel):
     state: str | None = None
     cycle: bool = False
     source: str = "api"
+
+
+class PreplanHandoffRequest(BaseModel):
+    instance_id: str | None = None
+    tmux_pane: str | None = None
+    target_pane: str | None = None
+    payload: str = "/plan create the plan"
+    source: str = "api"
+    ttl_seconds: int | None = 86400
 
 
 class HookSubscriptionsQuery(BaseModel):
@@ -1710,6 +1721,93 @@ async def _fanout_stop_subscriptions(
         return results
 
 
+async def _fulfill_preplan_handoff_intents(instance: dict) -> list[dict]:
+    """Consume pending preplan→plan DB intents for this stopped instance once."""
+    instance_id = _normalize_text(instance.get("id"))
+    target_pane = _normalize_text(instance.get("tmux_pane"))
+    if not instance_id and not target_pane:
+        return []
+
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute(
+            """UPDATE preplan_handoff_intents
+               SET status = 'expired', updated_at = ?, error = 'expired'
+               WHERE status = 'pending'
+                 AND expires_at IS NOT NULL
+                 AND expires_at <= ?""",
+            (now, now),
+        )
+        cursor = await db.execute(
+            """SELECT * FROM preplan_handoff_intents
+               WHERE status = 'pending'
+                 AND (
+                   (target_instance_id IS NOT NULL AND target_instance_id = ?)
+                   OR (target_pane IS NOT NULL AND target_pane = ?)
+                 )
+               ORDER BY created_at ASC, id ASC""",
+            (instance_id, target_pane),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        claimed: list[dict] = []
+        for row in rows:
+            cursor = await db.execute(
+                """UPDATE preplan_handoff_intents
+                   SET status = 'delivered', delivered_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'pending'""",
+                (now, now, row["id"]),
+            )
+            if cursor.rowcount:
+                claimed.append(row)
+        await db.commit()
+
+    results: list[dict] = []
+    for row in claimed:
+        pane = _normalize_text(row.get("target_pane")) or target_pane
+        payload = row.get("payload") or "/plan create the plan"
+        send_result = (
+            await _direct_pane_write(pane, payload)
+            if pane
+            else {
+                "status": "failed",
+                "error": "target_pane_unresolved",
+            }
+        )
+        delivery_status = send_result.get("status") or "failed"
+        bytes_issued = delivery_status in {"sent", "unverified"}
+        final_status = "delivered" if bytes_issued else "failed"
+        error = (
+            None if bytes_issued else (send_result.get("error") or send_result.get("gate_reason"))
+        )
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            await db.execute(
+                """UPDATE preplan_handoff_intents
+                   SET status = ?, delivery_status = ?, delivery_result_json = ?,
+                       error = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    final_status,
+                    delivery_status,
+                    json.dumps(send_result, sort_keys=True),
+                    error,
+                    datetime.now().isoformat(),
+                    row["id"],
+                ),
+            )
+            await db.commit()
+        results.append(
+            {
+                "intent_id": row["id"],
+                "status": final_status,
+                "delivery_status": delivery_status,
+                "target_pane": pane,
+                "send": send_result,
+            }
+        )
+    return results
+
+
 def _derive_continuity_binding_source(session_doc_policy: str | None) -> str | None:
     """Collapse session-doc policy variants into the higher-level ownership classes."""
     if not session_doc_policy:
@@ -2275,7 +2373,7 @@ async def handle_session_start(payload: dict) -> dict:
                 transplant_updates = {
                     "working_dir": working_dir,
                     "device_id": device_id,
-                    "status": "idle",
+                    "status": "implementing" if existing_row["status"] == "planning" else "idle",
                     "last_activity": now,
                     "stopped_at": None,
                     "victory_at": None,
@@ -2448,7 +2546,7 @@ async def handle_session_start(payload: dict) -> dict:
                 updates = {
                     "working_dir": working_dir,
                     "device_id": device_id,
-                    "status": "idle",
+                    "status": "implementing" if existing_row["status"] == "planning" else "idle",
                     "last_activity": now,
                     "stopped_at": None,
                     "victory_at": None,
@@ -2648,7 +2746,7 @@ async def handle_session_start(payload: dict) -> dict:
                 supplant_updates = {
                     "id": session_id,
                     "working_dir": working_dir,
-                    "status": "idle",
+                    "status": "implementing" if old_inst["status"] == "planning" else "idle",
                     "device_id": device_id,
                     "created_at": now,
                     "last_activity": now,
@@ -3405,6 +3503,9 @@ async def handle_session_end(payload: dict) -> dict:
             )
         session_end_updates = {
             "status": "stopped",
+            "is_questioning": 0,
+            "questioning_since": None,
+            "questioning_source": None,
             "input_lock": None,
             "stopped_at": now,
             "hook_driven": 0,
@@ -3694,20 +3795,23 @@ async def handle_prompt_submit(payload: dict) -> dict:
                 actor="PromptSubmit",
             )
 
-        # Also resurrect stopped instances - activity means they're active.
-        # (pid died with legacy instance table; nothing to backfill.)
-        await sanctioned_update_instance(
-            db,
-            instance_id=session_id,
-            updates={
-                "status": "working",
-                "last_activity": now,
-                "stopped_at": None,
-            },
-            mutation_type="status_changed",
-            write_source="hooks",
-            actor="PromptSubmit",
-        )
+        # Prompt submit is an activity heartbeat. It must not collapse a
+        # preplanning handoff into implementation; only an explicit/native plan
+        # submit (handled above) enters planning. Ordinary active prompts are
+        # implementation phase.
+        if not planning_event:
+            current_phase = existing_dict.get("status") or "idle"
+            updates = {"last_activity": now, "stopped_at": None}
+            if current_phase not in PLANNING_PHASE_STATUSES:
+                updates["status"] = "implementing"
+            await sanctioned_update_instance(
+                db,
+                instance_id=session_id,
+                updates=updates,
+                mutation_type="status_changed",
+                write_source="hooks",
+                actor="PromptSubmit",
+            )
         await db.commit()
 
     if planning_event:
@@ -3831,14 +3935,21 @@ async def handle_post_tool_use(payload: dict) -> dict:
                 "action": "ignored_dead_pane",
                 "instance_id": session_id,
             }
+        updates = {"last_activity": now, "stopped_at": None}
+        if tool_name == "AskUserQuestion":
+            updates.update(
+                {
+                    "is_questioning": 0,
+                    "questioning_since": None,
+                    "questioning_source": None,
+                }
+            )
+        if (existing.get("status") or "idle") not in PLANNING_PHASE_STATUSES:
+            updates["status"] = "implementing"
         await sanctioned_update_instance(
             db,
             instance_id=session_id,
-            updates={
-                "status": "working",
-                "last_activity": now,
-                "stopped_at": None,
-            },
+            updates=updates,
             mutation_type="status_changed",
             write_source="hooks",
             actor="PostToolUse",
@@ -3987,10 +4098,17 @@ async def handle_stop(payload: dict) -> dict:
                 actor="Stop",
             )
         else:
+            stop_updates = {"last_activity": now, "hook_driven": 0}
+            if (instance.get("status") or "idle") not in {
+                "preplanning",
+                "planning",
+                "implementing",
+            }:
+                stop_updates["status"] = "idle"
             await sanctioned_update_instance(
                 db,
                 instance_id=session_id,
-                updates={"status": "idle", "last_activity": now, "hook_driven": 0},
+                updates=stop_updates,
                 mutation_type="status_changed",
                 write_source="hooks",
                 actor="Stop",
@@ -4138,6 +4256,13 @@ async def handle_stop(payload: dict) -> dict:
             logger.warning(
                 "Hook: Stop final-response fallback failed for %s: %s", session_id[:12], exc
             )
+
+    # DB-backed preplan handoff: Stop is only the trigger. The intent row is the
+    # source of truth and is consumed exactly once here; preplan no longer rides
+    # stop_hook_subscriptions.
+    preplan_handoffs = await _fulfill_preplan_handoff_intents(instance)
+    if preplan_handoffs:
+        result["preplan_handoffs"] = preplan_handoffs
 
     # Trinity Chunk 2: live Stop-hook subscriptions. Deliver before legacy
     # state_injections so a subscribed parent gets an immediate prompt instead
@@ -4795,19 +4920,34 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {})
 
-    # Mark instance as processing (catches cases where prompt_submit was missed)
-    # Also resurrect stopped instances - activity means they're active
+    # Mark activity (catches cases where prompt_submit was missed). AskUserQuestion
+    # is stackable state and must not replace the phase.
     if session_id:
         now = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            await sanctioned_update_instance(
-                db,
-                instance_id=session_id,
-                updates={"status": "working", "last_activity": now, "stopped_at": None},
-                mutation_type="status_changed",
-                write_source="hooks",
-                actor="PreToolUse",
-            )
+            existing = await _fetch_instance_row(db, session_id)
+            if existing:
+                if tool_name == "AskUserQuestion":
+                    await set_instance_questioning(
+                        db,
+                        instance_id=session_id,
+                        active=True,
+                        source="PreToolUse",
+                        actor="PreToolUse",
+                        last_activity=now,
+                    )
+                else:
+                    updates = {"last_activity": now, "stopped_at": None}
+                    if (existing.get("status") or "idle") not in PLANNING_PHASE_STATUSES:
+                        updates["status"] = "implementing"
+                    await sanctioned_update_instance(
+                        db,
+                        instance_id=session_id,
+                        updates=updates,
+                        mutation_type="status_changed",
+                        write_source="hooks",
+                        actor="PreToolUse",
+                    )
             await db.commit()
 
     # Track background Task subagents so Stop hooks can detect intermediate vs final stops.
@@ -5316,6 +5456,72 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
     }
 
 
+@router.post("/api/preplan/handoff")
+async def create_preplan_handoff(request: PreplanHandoffRequest) -> dict:
+    source = _normalize_text(request.source) or "api"
+    payload = request.payload or "/plan create the plan"
+    pane_hint = _normalize_text(request.target_pane or request.tmux_pane)
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        instance = await _resolve_instance_by_id(db, request.instance_id)
+        if not instance or not instance.get("id"):
+            instance = await _resolve_instance_for_pane(db, pane_hint)
+        instance_id = (instance or {}).get("id")
+        target_pane = (instance or {}).get("tmux_pane") or pane_hint
+        if not instance_id and not target_pane:
+            return {"success": False, "action": "target_unresolved", "tmux_pane": pane_hint}
+
+        now = datetime.now().isoformat()
+        expires_at = None
+        if request.ttl_seconds and request.ttl_seconds > 0:
+            expires_at = datetime.fromtimestamp(
+                time.time() + min(int(request.ttl_seconds), 7 * 24 * 3600)
+            ).isoformat()
+
+        if instance_id:
+            await _set_planning_state(
+                db,
+                instance_id,
+                "preplanning",
+                source=source,
+                write_source="api",
+                actor="preplan-handoff",
+            )
+
+        cursor = await db.execute(
+            """INSERT INTO preplan_handoff_intents
+               (target_instance_id, target_pane, payload, status, source,
+                created_at, updated_at, expires_at)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
+            (instance_id, target_pane, payload, source, now, now, expires_at),
+        )
+        intent_id = int(cursor.lastrowid)
+        await db.commit()
+
+    await log_event(
+        "preplan_handoff_armed",
+        instance_id=instance_id,
+        details={
+            "intent_id": intent_id,
+            "target_pane": target_pane,
+            "source": source,
+            "payload": payload,
+        },
+    )
+    return {
+        "success": True,
+        "action": "preplan_handoff_armed",
+        "intent_id": intent_id,
+        "instance_id": instance_id,
+        "target_pane": target_pane,
+        "payload": payload,
+        "planning_state": "preplanning",
+        "phase": "preplanning",
+        "status": "preplanning",
+        "source": source,
+    }
+
+
 PLANNING_STATES = {"none", "preplanning", "planning", "approving"}
 PLANNING_CYCLE = {
     "none": "preplanning",
@@ -5354,27 +5560,35 @@ async def _set_planning_state(
     row, a failed gate, or an invalid ``new_state``.
     """
     cursor = await db.execute(
-        "SELECT planning_state, tmux_pane FROM instances WHERE id = ?",
+        "SELECT planning_state, status, tmux_pane FROM instances WHERE id = ?",
         (instance_id,),
     )
     row = await cursor.fetchone()
     if not row:
         return None
     previous = row["planning_state"] or "none"
+    previous_phase = row["status"] or "idle"
     if only_if_in is not None and previous not in only_if_in:
         return None
     if new_state not in PLANNING_STATES:
         return None
     tmux_pane = row["tmux_pane"]
     now = datetime.now().isoformat()
+    updates = {
+        "planning_state": new_state,
+        "planning_updated_at": now,
+        "planning_source": source,
+    }
+    if new_state in {"preplanning", "planning"}:
+        updates["status"] = new_state
+    elif new_state == "approving":
+        updates["status"] = "planning"
+    elif new_state == "none" and previous_phase == "planning":
+        updates["status"] = "implementing"
     await sanctioned_update_instance(
         db,
         instance_id=instance_id,
-        updates={
-            "planning_state": new_state,
-            "planning_updated_at": now,
-            "planning_source": source,
-        },
+        updates=updates,
         mutation_type="planning_state_changed",
         write_source=write_source,
         actor=actor,
@@ -5390,6 +5604,8 @@ async def _set_planning_state(
     return {
         "old_state": previous,
         "new_state": new_state,
+        "old_phase": previous_phase,
+        "new_phase": updates.get("status", previous_phase),
         "source": source,
         "tmux_pane": tmux_pane,
     }
@@ -5411,7 +5627,7 @@ async def get_planning_state(instance_id: str | None = None, tmux_pane: str | No
             }
 
         cursor = await db.execute(
-            "SELECT planning_state, planning_source, tmux_pane, engine FROM instances WHERE id = ?",
+            "SELECT planning_state, planning_source, status, is_questioning, questioning_since, questioning_source, tmux_pane, engine FROM instances WHERE id = ?",
             (resolved_id,),
         )
         row = await cursor.fetchone()
@@ -5425,6 +5641,11 @@ async def get_planning_state(instance_id: str | None = None, tmux_pane: str | No
         "tmux_pane": row["tmux_pane"],
         "planning_state": row["planning_state"] or "none",
         "planning_source": row["planning_source"],
+        "phase": row["status"],
+        "status": row["status"],
+        "is_questioning": bool(row["is_questioning"]),
+        "questioning_since": row["questioning_since"],
+        "questioning_source": row["questioning_source"],
         "engine": row["engine"],
     }
 
@@ -5443,7 +5664,7 @@ async def set_planning_state(request: PlanningStateRequest) -> dict:
             return {"success": False, "action": "instance_unresolved", "tmux_pane": tmux_pane}
 
         cursor = await db.execute(
-            "SELECT planning_state, tmux_pane, engine FROM instances WHERE id = ?",
+            "SELECT planning_state, status, is_questioning, questioning_since, questioning_source, tmux_pane, engine FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -5478,6 +5699,11 @@ async def set_planning_state(request: PlanningStateRequest) -> dict:
         "tmux_pane": tmux_pane,
         "previous_state": previous,
         "planning_state": new_state,
+        "phase": event_details.get("new_phase") if event_details else row["status"],
+        "status": event_details.get("new_phase") if event_details else row["status"],
+        "is_questioning": bool(row["is_questioning"]),
+        "questioning_since": row["questioning_since"],
+        "questioning_source": row["questioning_source"],
         "source": source,
         "engine": (instance or {}).get("engine") or row["engine"],
     }
