@@ -155,12 +155,16 @@ def _alive_panes() -> set[str] | None:
     return {ln.strip() for ln in out.splitlines() if ln.strip()}
 
 
-def _typing_active(window_seconds: int) -> bool:
-    """True iff a human typed within the window. Mirrors send_gate.typing_guard_active.
+def _typing_active(pane: str, window_seconds: int) -> bool:
+    """True iff ``pane`` is under the recent-keystroke typing guard.
 
-    Reads tmux ``#{client_activity}`` (bumped on client input). Fail-open: an
-    unreadable tmux returns False (allow), never a spurious hold.
+    The client activity signal is tmux-global, so scope it to the target pane by
+    requiring the pane to be attended. This keeps pending-ui flushing per-pane:
+    typing in one pane must not hold branding/commands for every other pane.
+    Fail-open on unreadable tmux.
     """
+    if not _pane_attended(pane):
+        return False
     rc, out = _tmux("display-message", "-p", "#{client_activity} #{client_last_key}")
     if rc != 0:
         return False
@@ -202,7 +206,7 @@ def _pane_attended(pane: str) -> bool:
 
 def _unsafe(pane: str, window_seconds: int) -> bool:
     """The pane must not be written to right now (human typing OR viewing it)."""
-    return _typing_active(window_seconds) or _pane_attended(pane)
+    return _typing_active(pane, window_seconds) or _pane_attended(pane)
 
 
 # ---- send path (reuses the gated agent-cmd / send-gate pipeline) --------- #

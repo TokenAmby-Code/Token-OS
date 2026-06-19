@@ -171,7 +171,12 @@ def test_flush_holds_and_keeps_entry_while_human_typing(tmp_path: Path) -> None:
         qdir=qdir,
         fakes=fakes,
         # Human typed "just now" -> typing guard active. Pane alive.
-        extra_env={"FAKE_ALIVE": "%41", "FAKE_ACTIVITY": str(int(time.time()) - 2)},
+        extra_env={
+            "FAKE_ALIVE": "%41",
+            "FAKE_ACTIVITY": str(int(time.time()) - 2),
+            "FAKE_ATTEND": "11",
+            "FAKE_CLIENTS": "1",
+        },
     )
     assert proc.returncode == 0, proc.stderr
     # Zero keystrokes injected, and the command is NOT dropped — it stays queued.
@@ -180,6 +185,27 @@ def test_flush_holds_and_keeps_entry_while_human_typing(tmp_path: Path) -> None:
     assert "/rename held" in _qfile(qdir, "%41").read_text()
     assert _summary(proc).get("sent", 0) == 0
     assert _summary(proc).get("held", 0) >= 1
+
+
+def test_flush_does_not_hold_unattended_pane_for_global_typing(tmp_path: Path) -> None:
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    fakes = _mkfakes(tmp_path)
+    _qfile(qdir, "%41").write_text(f"{int(time.time())} {SID} %41 /rename clear\n")
+    proc = _run(
+        ["flush", "--pane", "%41", "--session", SID],
+        qdir=qdir,
+        fakes=fakes,
+        extra_env={
+            "FAKE_ALIVE": "%41",
+            "FAKE_ACTIVITY": str(int(time.time()) - 2),
+            "FAKE_ATTEND": "00",
+            "FAKE_CLIENTS": "0",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "/rename clear" in _sends(fakes)
+    assert _summary(proc).get("sent", 0) == 1
 
 
 def test_flush_sends_and_drains_when_idle(tmp_path: Path) -> None:

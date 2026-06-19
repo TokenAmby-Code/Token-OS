@@ -221,3 +221,49 @@ def test_evaluate_defaults_typing_guard_to_delay(monkeypatch):
     assert result["reason"] == "typing_guard"
     assert result["policy"] == "delay"
     assert result["suppressed"] is True
+
+
+def test_typing_guard_is_scoped_to_target_pane(monkeypatch):
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if cmd[:3] == ["tmux", "display-message", "-p"] and "-t" not in cmd:
+            proc.stdout = f"{now}\n"
+            return proc
+        if cmd[:5] == ["tmux", "display-message", "-p", "-t", "%active"]:
+            proc.stdout = "11\n"
+            return proc
+        if cmd[:5] == ["tmux", "display-message", "-p", "-t", "%other"]:
+            proc.stdout = "00\n"
+            return proc
+        if cmd[:4] == ["tmux", "list-clients", "-t", "%active"]:
+            proc.stdout = "x\n"
+            return proc
+        if cmd[:4] == ["tmux", "capture-pane", "-t"]:
+            proc.stdout = "> \n"
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    assert send_gate.typing_guard_active(target="%active") is True
+    assert send_gate.typing_guard_active(target="%other") is False
+
+
+def test_evaluate_only_blocks_target_under_typing_guard(monkeypatch):
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    monkeypatch.setattr(
+        send_gate,
+        "typing_guard_active",
+        lambda **kw: kw.get("target") == "%guarded",
+    )
+
+    blocked = send_gate.evaluate(("send-keys", "-t", "%guarded", "hi"))
+    allowed = send_gate.evaluate(("send-keys", "-t", "%clear", "hi"))
+
+    assert blocked is not None and blocked["reason"] == "typing_guard"
+    assert allowed is None
