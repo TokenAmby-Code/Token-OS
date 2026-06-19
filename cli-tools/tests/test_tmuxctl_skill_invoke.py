@@ -95,19 +95,20 @@ def test_invoke_skill_in_pane_inserts_at_prompt_start_with_harness_prefix(monkey
     text = invoke_skill_in_pane(adapter, "%42", "/preplan", agent="codex")
 
     assert text == "$preplan "
-    # PgUp x50 + Home batched into ONE send-keys, then the right-side buffer
-    # (space, Left) and the rstripped leader, then the codex Tab sink — never a
-    # concatenated "$preplanexisting" — then PgDn x50 + End batched into one send.
-    pgup_home = ("send-keys", "-t", "%42") + ("PgUp",) * 50 + ("Home",)
-    pgdn_end = ("send-keys", "-t", "%42") + ("PgDn",) * 50 + ("End",)
-    assert adapter.calls == [
-        pgup_home,
+    # PgUp x50 + Home, then the right-side buffer (space, Left) and the rstripped
+    # leader, then the codex Tab sink — never a concatenated "$preplanexisting".
+    expected_insert = [
+        ("send-keys", "-t", "%42", "PgUp"),
+    ] * 50 + [
+        ("send-keys", "-t", "%42", "Home"),
         ("send-keys", "-t", "%42", "-l", " "),
         ("send-keys", "-t", "%42", "Left"),
         ("send-keys", "-t", "%42", "-l", "$preplan"),
         ("send-keys", "-t", "%42", "Tab"),
-        pgdn_end,
     ]
+    assert adapter.calls[:55] == expected_insert
+    assert adapter.calls[55:105] == [("send-keys", "-t", "%42", "PgDn")] * 50
+    assert adapter.calls[-1] == ("send-keys", "-t", "%42", "End")
 
 
 def test_invoke_skill_in_pane_does_not_tab_sink_claude(monkeypatch):
@@ -117,16 +118,17 @@ def test_invoke_skill_in_pane_does_not_tab_sink_claude(monkeypatch):
     text = invoke_skill_in_pane(adapter, "%42", "preplan", agent="claude")
 
     assert text == "/preplan "
-    pgup_home = ("send-keys", "-t", "%42") + ("PgUp",) * 50 + ("Home",)
-    pgdn_end = ("send-keys", "-t", "%42") + ("PgDn",) * 50 + ("End",)
-    assert adapter.calls == [
-        pgup_home,
+    assert adapter.calls[:54] == [
+        ("send-keys", "-t", "%42", "PgUp"),
+    ] * 50 + [
+        ("send-keys", "-t", "%42", "Home"),
         ("send-keys", "-t", "%42", "-l", " "),
         ("send-keys", "-t", "%42", "Left"),
         ("send-keys", "-t", "%42", "-l", "/preplan"),
-        pgdn_end,
     ]
     assert ("send-keys", "-t", "%42", "Tab") not in adapter.calls
+    assert adapter.calls[54:104] == [("send-keys", "-t", "%42", "PgDn")] * 50
+    assert adapter.calls[-1] == ("send-keys", "-t", "%42", "End")
 
 
 def test_invoke_skill_in_pane_prompt_start_buffer_separates_arguments(monkeypatch):
@@ -156,22 +158,24 @@ def test_invoke_skill_in_pane_prompt_start_buffer_separates_arguments(monkeypatc
         ),
     ]
     tab_index = adapter.calls.index(("send-keys", "-t", "%42", "Tab"))
-    # PgDn is now batched into the single prompt-end send-keys, not its own call.
-    prompt_end_index = next(i for i, call in enumerate(adapter.calls) if "PgDn" in call)
-    assert tab_index < prompt_end_index
+    first_pgdn_index = adapter.calls.index(("send-keys", "-t", "%42", "PgDn"))
+    assert tab_index < first_pgdn_index
 
 
-def test_move_to_prompt_start_emits_single_batched_pgup_then_home() -> None:
-    # One send-keys subprocess carries all 50 PgUp plus the Home terminator.
+def test_move_to_prompt_start_emits_pgup_then_home():
     adapter = RecordingAdapter()
     move_to_prompt_start(adapter, "%42")
-    assert adapter.calls == [("send-keys", "-t", "%42") + ("PgUp",) * 50 + ("Home",)]
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgUp")] * 50 + [
+        ("send-keys", "-t", "%42", "Home")
+    ]
 
 
 def test_move_to_prompt_start_honors_page_ups():
     adapter = RecordingAdapter()
     move_to_prompt_start(adapter, "%42", page_ups=3)
-    assert adapter.calls == [("send-keys", "-t", "%42", "PgUp", "PgUp", "PgUp", "Home")]
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgUp")] * 3 + [
+        ("send-keys", "-t", "%42", "Home")
+    ]
 
 
 def test_insert_text_emits_buffer_separated_send():
@@ -187,17 +191,20 @@ def test_insert_text_emits_buffer_separated_send():
     ]
 
 
-def test_move_to_prompt_end_emits_single_batched_pgdn_then_end() -> None:
-    # One send-keys subprocess carries all 50 PgDn plus the End terminator.
+def test_move_to_prompt_end_emits_pgdn_then_end():
     adapter = RecordingAdapter()
     move_to_prompt_end(adapter, "%42")
-    assert adapter.calls == [("send-keys", "-t", "%42") + ("PgDn",) * 50 + ("End",)]
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgDn")] * 50 + [
+        ("send-keys", "-t", "%42", "End")
+    ]
 
 
 def test_move_to_prompt_end_honors_page_downs():
     adapter = RecordingAdapter()
     move_to_prompt_end(adapter, "%42", page_downs=3)
-    assert adapter.calls == [("send-keys", "-t", "%42", "PgDn", "PgDn", "PgDn", "End")]
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgDn")] * 3 + [
+        ("send-keys", "-t", "%42", "End")
+    ]
 
 
 def _cli_with_adapter(adapter, monkeypatch):
@@ -209,7 +216,9 @@ def test_cli_prompt_start_routes_to_adapter(monkeypatch):
     adapter = RecordingAdapter()
     _cli_with_adapter(adapter, monkeypatch)
     assert tmuxctl_cli.main(["prompt-start", "--pane", "%42", "--page-ups", "2"]) == 0
-    assert adapter.calls == [("send-keys", "-t", "%42", "PgUp", "PgUp", "Home")]
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgUp")] * 2 + [
+        ("send-keys", "-t", "%42", "Home")
+    ]
 
 
 def test_cli_insert_text_routes_to_adapter(monkeypatch):
@@ -227,7 +236,9 @@ def test_cli_prompt_end_routes_to_adapter(monkeypatch):
     adapter = RecordingAdapter()
     _cli_with_adapter(adapter, monkeypatch)
     assert tmuxctl_cli.main(["prompt-end", "--pane", "%42", "--page-downs", "2"]) == 0
-    assert adapter.calls == [("send-keys", "-t", "%42", "PgDn", "PgDn", "End")]
+    assert adapter.calls == [("send-keys", "-t", "%42", "PgDn")] * 2 + [
+        ("send-keys", "-t", "%42", "End")
+    ]
 
 
 def test_send_skill_invocation_to_pane_submits_through_gated_adapter(monkeypatch):

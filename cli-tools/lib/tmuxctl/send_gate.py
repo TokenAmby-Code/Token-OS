@@ -261,25 +261,10 @@ def quiet_hours_active(
     return active, context
 
 
-def _real_tmux_binary() -> str:
-    """Resolve the real tmux binary, never the bin/tmux shim.
-
-    Lazy import to avoid a module cycle (tmux_adapter imports send_gate). The
-    shim consults this module via ``python -m tmuxctl.send_gate``; shelling
-    back into the shim from here would recurse through the gate.
-    """
-    try:
-        from .tmux_adapter import _tmux_binary
-
-        return _tmux_binary()
-    except Exception:
-        return "tmux"
-
-
 def _client_activity_epoch() -> int | None:
     try:
         proc = subprocess.run(
-            [_real_tmux_binary(), "display-message", "-p", "#{client_activity}"],
+            ["tmux", "display-message", "-p", "#{client_activity}"],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -299,13 +284,6 @@ def _client_activity_epoch() -> int | None:
         return None
 
 
-def _typing_guard_window_seconds() -> int:
-    try:
-        return int(os.environ.get("TMUX_TYPING_GUARD_WINDOW", str(_DEFAULT_TYPING_GUARD_WINDOW)))
-    except (TypeError, ValueError):
-        return _DEFAULT_TYPING_GUARD_WINDOW
-
-
 def typing_guard_active(*, window_seconds: int | None = None) -> bool:
     """Canonical typing-guard predicate: recent human keystroke on a client.
 
@@ -316,7 +294,12 @@ def typing_guard_active(*, window_seconds: int | None = None) -> bool:
     Fail-open: if tmux is unreachable or reports nothing, returns False.
     """
     if window_seconds is None:
-        window_seconds = _typing_guard_window_seconds()
+        try:
+            window_seconds = int(
+                os.environ.get("TMUX_TYPING_GUARD_WINDOW", str(_DEFAULT_TYPING_GUARD_WINDOW))
+            )
+        except (TypeError, ValueError):
+            window_seconds = _DEFAULT_TYPING_GUARD_WINDOW
     window_seconds = max(1, window_seconds)
 
     activity = _client_activity_epoch()
@@ -374,76 +357,33 @@ def _delay_timeout_seconds() -> float | None:
     return value if value > 0 else None
 
 
-# Margin added past the computed typing-window expiry so the post-sleep
-# re-check lands strictly outside the window (epoch math is whole-second).
-_DELAY_WAKE_MARGIN_SECONDS = 0.1
-# An explicitly configured quiet-hours delay (TMUX_SEND_GATE_POLICY=delay) has
-# no keystroke-derived deadline; re-evaluate at a coarse cadence instead.
-_QUIET_DELAY_RECHECK_SECONDS = 60.0
-
-
-def _wait_for_typing_window_expiry(deadline: float | None) -> bool:
-    """Deadline-sleep until the typing-guard window expires; never polls.
-
-    The guard is a fixed window after the last keystroke, so the exact expiry
-    is ``client_activity + window``. Sleep once until it; if the human typed
-    again during the sleep the re-read activity yields a new expiry and we
-    sleep again — one wake per typing burst instead of four per second.
-    """
-    window = max(1, _typing_guard_window_seconds())
-    while True:
-        activity = _client_activity_epoch()
-        if activity is None:
-            return True  # tmux unreachable — same fail-open as typing_guard_active
-        age = time.time() - activity
-        if age < 0:
-            return True  # clock skew: typing_guard_active would report inactive
-        sleep_for = (window + _DELAY_WAKE_MARGIN_SECONDS) - age
-        if sleep_for <= 0:
-            return True
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            sleep_for = min(sleep_for, remaining)
-        time.sleep(sleep_for)
-
-
 def wait_for_gate_clear(
     args: tuple[str, ...] | list[str],
     *,
     db_path: Path | None = None,
     now: datetime | None = None,
     timeout_seconds: float | None = None,
+    interval_seconds: float = 0.25,
 ) -> bool:
     """Wait while policy remains ``delay``; return True once sending is allowed.
 
-    Returns False if the policy changes to cancel or an explicit timeout
-    expires. Event-aligned, not polling: a typing-guard delay computes the
-    exact window expiry from ``#{client_activity}`` and sleeps until it (the
-    quiet predicate was already false when the typing delay was diagnosed, so
-    the full ``evaluate()`` — two sqlite opens — is not re-run per wake).
+    Returns False if the policy changes to cancel or an explicit timeout expires.
+    With the default no-timeout setting, typing-guard delays clear shortly after
+    the operator stops typing because the guard itself is a recent-activity
+    window, not a permanent latch.
     """
     if timeout_seconds is None:
         timeout_seconds = _delay_timeout_seconds()
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
-    result = evaluate(tuple(args), db_path=db_path, now=now)
     while True:
+        result = evaluate(tuple(args), db_path=db_path, now=now)
         if result is None or not result.get("suppressed"):
             return True
         if result.get("policy") != "delay":
             return False
         if deadline is not None and time.monotonic() >= deadline:
             return False
-        if result.get("reason") == "typing_guard":
-            return _wait_for_typing_window_expiry(deadline)
-        # Quiet-hours only delays under an explicit TMUX_SEND_GATE_POLICY=delay;
-        # there is no keystroke deadline to sleep to, so re-check coarsely.
-        sleep_for = _QUIET_DELAY_RECHECK_SECONDS
-        if deadline is not None:
-            sleep_for = min(sleep_for, max(0.05, deadline - time.monotonic()))
-        time.sleep(sleep_for)
-        result = evaluate(tuple(args), db_path=db_path, now=now)
+        time.sleep(max(0.05, interval_seconds))
 
 
 def evaluate(

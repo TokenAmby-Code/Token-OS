@@ -320,7 +320,7 @@ async function main() {
         botLabel,
       });
       logger.info(`Transcription [${botLabel}]: tmux route ${JSON.stringify(routed)}`);
-      if (routed && routed.routed === false && routed.reason && !routed.ignored && !routed.warning_sent && !routed.tmux_lag) {
+      if (routed && routed.routed === false && routed.reason && !routed.ignored && !routed.tmux_lag) {
         try {
           await voiceManager.playTTS(`Voice route failed: ${routed.reason}`, botLabel);
         } catch {}
@@ -328,11 +328,9 @@ async function main() {
     } catch (err) {
       const message = err?.message || String(err);
       logger.warn(`Transcription [${botLabel}]: tmux route failed: ${message}`);
-      if (!err?.warning_sent && !err?.tmux_lag) {
-        try {
-          await voiceManager.playTTS('Voice route failed. Check Discord daemon logs.', botLabel);
-        } catch {}
-      }
+      try {
+        await voiceManager.playTTS('Voice route failed. Check Discord daemon logs.', botLabel);
+      } catch {}
     }
   });
 

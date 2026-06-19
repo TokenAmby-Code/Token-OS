@@ -46,7 +46,7 @@ _PROMPTS_DIR = str(Path.home() / ".claude" / "prompts")
 # claude, openclaw, and homebrew tools are reachable.
 _HOME = str(Path.home())
 _EXTRA_PATHS = [
-    "/Users/tokenclaw/runtimes/Token-OS/live/cli-tools/bin",
+    "/Volumes/Imperium/runtimes/token-os/live/cli-tools/bin",
     f"{_HOME}/.local/bin",
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
@@ -241,7 +241,7 @@ class CronEngine:
             "description": "Deep reserve watchdog. Monitors fleet health, alerts on catastrophic failure. I am Alpharius.",
             "enabled": True,
             "schedule": {"type": "cron", "value": "*/30 * * * *", "tz": "America/Phoenix"},
-            "command": f"cd {os.environ.get('TOKEN_OS', str(Path.home() / 'runtimes' / 'Token-OS' / 'live'))}/token-api && python3 alpharius_heartbeat.py",
+            "command": f"cd {os.environ.get('TOKEN_OS', '/mnt/imperium/runtimes/token-os/live')}/token-api && python3 alpharius_heartbeat.py",
             "timeout_seconds": 60,
         },
     ]

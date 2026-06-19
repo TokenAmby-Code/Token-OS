@@ -6,7 +6,7 @@
 macrodroid-gen - official-schema-only MacroDroid .macro generator
 
 No YAML DSL. No legacy compiler. The source of truth is:
-  ~/runtimes/Token-OS/live/mobile/macrodroid-llm-schema.yaml
+  /Volumes/Imperium/runtimes/token-os/live/mobile/macrodroid-llm-schema.yaml
 
 Usage:
   macrodroid-gen official.macro --pretty --validate

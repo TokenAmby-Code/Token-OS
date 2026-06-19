@@ -13,13 +13,14 @@ test('retry predicate recognizes tmux route failures', () => {
   assert.equal(isRetryableVoiceRouteFailure({ routed: false, reason: 'no_draft' }), false);
 });
 
-test('route wrapper warns once and does not retry tmux lag failures', async () => {
+test('route wrapper warns loudly once and does not retry tmux lag failures', async () => {
   const calls = [];
   const tts = [];
   const router = {
     async route() {
       calls.push(Date.now());
-      return { routed: false, reason: 'no_target' };
+      if (calls.length === 1) return { routed: false, reason: 'no_target' };
+      return { routed: true, target: '3:0', pane: '%9' };
     },
   };
   const result = await routeVoiceTranscriptWithRetry({
@@ -32,42 +33,35 @@ test('route wrapper warns once and does not retry tmux lag failures', async () =
   });
 
   assert.equal(calls.length, 1);
-  assert.deepEqual(tts, ['tmux lagging']);
+  assert.equal(tts.length, 1);
+  assert.equal(tts[0], 'tmux lagging');
   assert.equal(result.routed, false);
-  assert.equal(result.reason, 'no_target');
-  assert.equal(result.attempts, 1);
-  assert.equal(result.warning_sent, true);
   assert.equal(result.retry_disabled, true);
   assert.equal(result.tmux_lag, true);
+  assert.equal(result.warning_sent, true);
 });
 
-test('route wrapper warns once and does not retry thrown tmux errors', async () => {
-  let calls = 0;
+test('route wrapper converts retryable tmux errors to a non-retried lag result', async () => {
   const tts = [];
-  await assert.rejects(
-    () => routeVoiceTranscriptWithRetry({
-      router: {
-        async route() {
-          calls += 1;
-          throw new Error('tmux timed out');
-        },
+  const result = await routeVoiceTranscriptWithRetry({
+    router: {
+      async route() {
+        throw new Error('Command failed: tmux-dictate timed out');
       },
-      voiceManager: { playTTS: async msg => tts.push(msg) },
-      logger: { warn() {} },
-      result: { botName: 'custodes', userId: 'u', text: 'hello' },
-      maxAttempts: 3,
-      retryDelayMs: 1,
-    }),
-    err => {
-      assert.equal(err.attempts, 1);
-      assert.equal(err.warning_sent, true);
-      assert.equal(err.retry_disabled, true);
-      assert.equal(err.tmux_lag, true);
-      return true;
-    }
-  );
-  assert.equal(calls, 1);
-  assert.deepEqual(tts, ['tmux lagging']);
+    },
+    voiceManager: { playTTS: async msg => tts.push(msg) },
+    logger: { warn() {} },
+    result: { botName: 'custodes', userId: 'u', text: 'hello' },
+    maxAttempts: 3,
+    retryDelayMs: 1,
+  });
+
+  assert.equal(tts.length, 1);
+  assert.equal(tts[0], 'tmux lagging');
+  assert.equal(result.routed, false);
+  assert.equal(result.retry_disabled, true);
+  assert.equal(result.tmux_lag, true);
+  assert.equal(result.attempts, 1);
 });
 
 test('route wrapper does not retry non-retryable command states', async () => {

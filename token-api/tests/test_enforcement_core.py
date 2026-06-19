@@ -483,10 +483,6 @@ async def test_golden_throne_detects_codex_below_bash_and_does_not_resume(app_en
         assert engine == "codex"
         return True
 
-    async def no_pending_input(pane):
-        assert pane == "%134"
-        return False
-
     async def fake_subprocess_exec(*args, **kwargs):
         calls.append(args)
         if args[:2] == ("tmux", "display-message"):
@@ -508,7 +504,6 @@ async def test_golden_throne_detects_codex_below_bash_and_does_not_resume(app_en
     monkeypatch.setattr(app_env.main, "_tmux_pane_label", pane_label)
     monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
     monkeypatch.setattr(app_env.main, "_tmux_pane_has_agent_process", has_agent_process)
-    monkeypatch.setattr(app_env.main, "_tmux_pane_has_pending_input", no_pending_input)
     monkeypatch.setattr(app_env.main, "_send_to_phone", lambda *args, **kwargs: {"success": True})
     monkeypatch.setattr(
         app_env.main, "_tmux_send_payload_then_submit", fake_tmux_send_payload_then_submit

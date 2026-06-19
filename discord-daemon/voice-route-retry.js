@@ -1,4 +1,7 @@
-// voice-route-retry.js — loud tmux-lag warning wrapper for Discord voice routing.
+// voice-route-retry.js — loud tmux-lag guard for Discord voice -> tmux routing.
+
+const DEFAULT_MAX_ATTEMPTS = 1;
+const DEFAULT_RETRY_DELAY_MS = 0;
 
 export function isRetryableVoiceRouteFailure(resultOrError) {
   if (!resultOrError) return false;
@@ -21,9 +24,20 @@ export async function routeVoiceTranscriptWithRetry({
   logger,
   result,
   botLabel = result?.botName || 'voice',
+  maxAttempts = DEFAULT_MAX_ATTEMPTS,
+  retryDelayMs = DEFAULT_RETRY_DELAY_MS,
 }) {
-  async function warnTmuxLagging() {
-    logger?.warn?.(`Voice route [${botLabel}]: tmux lag/route failure; not retrying`);
+  let warned = false;
+  // Keep the legacy knobs in the public wrapper signature, but do not honor
+  // them for tmux-lag failures: retrying a timed-out tmux write can duplicate
+  // text that already landed.
+  void maxAttempts;
+  void retryDelayMs;
+
+  async function warnTmuxLagOnce() {
+    if (warned) return;
+    warned = true;
+    logger?.warn?.(`Voice route [${botLabel}]: tmux lag/route failure; retry disabled`);
     try {
       await voiceManager?.playTTS?.('tmux lagging', botLabel);
     } catch {}
@@ -32,20 +46,30 @@ export async function routeVoiceTranscriptWithRetry({
   try {
     const routed = await router.route(result);
     if (routed?.routed === false && isRetryableVoiceRouteFailure(routed)) {
-      await warnTmuxLagging();
-      return { ...routed, attempts: 1, warning_sent: true, retry_disabled: true, tmux_lag: true };
+      await warnTmuxLagOnce();
+      return {
+        ...routed,
+        attempts: 1,
+        warning_sent: warned,
+        retry_disabled: true,
+        tmux_lag: true,
+      };
     }
-    return { ...routed, attempts: 1, warning_sent: false };
+    return { ...routed, attempts: 1, warning_sent: warned };
   } catch (err) {
-    if (isRetryableVoiceRouteFailure(err)) {
-      await warnTmuxLagging();
-      err.warning_sent = true;
-      err.retry_disabled = true;
-      err.tmux_lag = true;
-    } else {
-      err.warning_sent = false;
+    if (!isRetryableVoiceRouteFailure(err)) {
+      err.attempts = 1;
+      err.warning_sent = warned;
+      throw err;
     }
-    err.attempts = 1;
-    throw err;
+    await warnTmuxLagOnce();
+    return {
+      routed: false,
+      reason: err?.message || String(err) || 'route_failed',
+      attempts: 1,
+      warning_sent: warned,
+      retry_disabled: true,
+      tmux_lag: true,
+    };
   }
 }

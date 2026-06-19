@@ -55,7 +55,6 @@ class CurrentPaneContext:
     window_target: str
     pane_role: str
     pane_type: str
-    window_zoomed: bool = False
 
 
 @dataclass(frozen=True)
@@ -105,40 +104,30 @@ def _display_args(client: str, fmt: str) -> tuple[str, ...]:
 
 
 def _current_context(adapter: TmuxAdapter, client: str = "") -> CurrentPaneContext:
-    # window_zoomed_flag rides along in the same display-message so the
-    # per-keypress hot path does not spend a second tmux subprocess on it.
     raw = adapter.run(
-        *_display_args(
-            client,
-            "#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_zoomed_flag}",
-        ),
+        *_display_args(client, "#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}"),
         allow_failure=True,
     ).strip()
-    zoomed_flag = ""
-    if raw.count("\t") != 4:
+    if raw.count("\t") != 3:
         # Compatibility for small unit-test fakes and degraded tmux contexts.
         pane_id = adapter.run(*_display_args(client, "#{pane_id}"), allow_failure=True).strip()
         session = adapter.run(*_display_args(client, "#{session_name}"), allow_failure=True).strip()
         index = adapter.run(*_display_args(client, "#{window_index}"), allow_failure=True).strip()
         name = adapter.run(*_display_args(client, "#{window_name}"), allow_failure=True).strip()
     else:
-        pane_id, session, index, name, zoomed_flag = raw.split("\t", 4)
+        pane_id, session, index, name = raw.split("\t", 3)
     if not pane_id:
         raise ValueError("current pane not found")
     base = stack_base_of(_window_base(name)) or _window_base(name)
-    window_target = f"{session}:{index}" if session and index else name
-    if not zoomed_flag:
-        zoomed_flag = "1" if _window_zoomed(adapter, window_target) else "0"
     return CurrentPaneContext(
         pane_id=pane_id,
         session_name=session,
         window_index=index,
         window_name=name,
         window_base=base,
-        window_target=window_target,
+        window_target=f"{session}:{index}" if session and index else name,
         pane_role=canonical_pane_role(adapter.show_pane_option(pane_id, "@PANE_ID")),
         pane_type=adapter.show_pane_option(pane_id, "@PANE_TYPE"),
-        window_zoomed=zoomed_flag == "1",
     )
 
 
@@ -307,7 +296,7 @@ def _relative_special_target(
 
 
 def _select_target(adapter: TmuxAdapter, ctx: CurrentPaneContext, target: str) -> str:
-    was_zoomed = ctx.window_zoomed
+    was_zoomed = _window_zoomed(adapter, ctx.window_target)
     pane_id = adapter.run(
         "display-message", "-t", target, "-p", "#{pane_id}", allow_failure=True
     ).strip()
@@ -338,7 +327,7 @@ def _select_target(adapter: TmuxAdapter, ctx: CurrentPaneContext, target: str) -
 
 
 def _select_relative(adapter: TmuxAdapter, ctx: CurrentPaneContext, direction: Direction) -> str:
-    was_zoomed = ctx.window_zoomed
+    was_zoomed = _window_zoomed(adapter, ctx.window_target)
     if was_zoomed:
         _set_zoom_restore_pending(adapter, ctx.window_target, True)
     try:

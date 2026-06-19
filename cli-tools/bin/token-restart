@@ -20,9 +20,9 @@
 #
 # GIT-AWARE SMART DEPLOY (the mantra: a merge to main → one restart endpoint hit →
 # this script syncs + intelligently restarts):
-#   By DEFAULT token-restart fast-forwards the CD bare cache
-#   (CD_BARE_REPO, distinct from the worktree BARE_REPO) from GitHub main, then updates
-#   the deploy-owned runtime checkout detached to the
+#   By DEFAULT token-restart fast-forwards the local bare skeleton
+#   (/Volumes/Imperium/token-os.git) from GitHub main, then updates the deploy-owned
+#   runtime checkout (/Volumes/Imperium/runtimes/token-os/live) detached to the
 #   requested SHA (or the new bare main). It DIFFS old runtime HEAD → target SHA and
 #   restarts ONLY the affected services (token-api / ops-ui / discord / WSL
 #   satellite / mobile) — see map_changed_to_services(). Runtime checkouts are
@@ -64,22 +64,18 @@ DISCORD_URL="http://127.0.0.1:7779"
 # runtime checkout is deploy-owned and must stay clean.
 conf_value() {
     local conf="$1" name="$2"
-    ( BARE_REPO=""; CD_BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; PROTECTED_ROOT=""; RUNTIME_CHECKOUT=""; CD_RUNTIME_CHECKOUT=""; LOCAL_BARE_MAIN_SYNC=""
+    ( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; PROTECTED_ROOT=""; RUNTIME_CHECKOUT=""; LOCAL_BARE_MAIN_SYNC=""
       # shellcheck disable=SC1090
       [[ -f "$conf" ]] && source "$conf" 2>/dev/null || true
       eval "printf '%s' \"\${$name:-}\"" )
 }
 
 TOKEN_OS_WORKTREE_CONF="${TOKEN_OS_WORKTREE_CONF:-$HOME/.config/worktrees/Token-OS.conf}"
-TOKEN_OS_BARE_REPO="${TOKEN_OS_BARE_REPO:-${CD_BARE_REPO:-$(conf_value "$TOKEN_OS_WORKTREE_CONF" CD_BARE_REPO)}}"
-TOKEN_OS_BARE_REPO="${TOKEN_OS_BARE_REPO:-$(conf_value "$TOKEN_OS_WORKTREE_CONF" BARE_REPO)}"
-TOKEN_OS_BARE_REPO="${TOKEN_OS_BARE_REPO:-$HOME/runtimes/Token-OS/token-os.git}"
-TOKEN_OS_RUNTIME_CHECKOUT="${TOKEN_OS_RUNTIME_CHECKOUT:-${CD_RUNTIME_CHECKOUT:-$(conf_value "$TOKEN_OS_WORKTREE_CONF" CD_RUNTIME_CHECKOUT)}}"
-TOKEN_OS_RUNTIME_CHECKOUT="${TOKEN_OS_RUNTIME_CHECKOUT:-$(conf_value "$TOKEN_OS_WORKTREE_CONF" RUNTIME_CHECKOUT)}"
-TOKEN_OS_RUNTIME_CHECKOUT="${TOKEN_OS_RUNTIME_CHECKOUT:-$HOME/runtimes/Token-OS/live}"
-TOKEN_OS_SECRETS_DIR="${TOKEN_OS_SECRETS_DIR:-$(conf_value "$TOKEN_OS_WORKTREE_CONF" SECRETS_DIR)}"
+TOKEN_OS_BARE_REPO="${TOKEN_OS_BARE_REPO:-${CD_BARE_REPO:-$(conf_value "$TOKEN_OS_WORKTREE_CONF" BARE_REPO)}}"
+TOKEN_OS_BARE_REPO="${TOKEN_OS_BARE_REPO:-/Volumes/Imperium/token-os.git}"
+TOKEN_OS_RUNTIME_CHECKOUT="${TOKEN_OS_RUNTIME_CHECKOUT:-${CD_RUNTIME_CHECKOUT:-$(conf_value "$TOKEN_OS_WORKTREE_CONF" RUNTIME_CHECKOUT)}}"
+TOKEN_OS_RUNTIME_CHECKOUT="${TOKEN_OS_RUNTIME_CHECKOUT:-/Volumes/Imperium/runtimes/token-os/live}"
 TOKEN_RESTART_TARGET_SHA="${TOKEN_RESTART_TARGET_SHA:-}"
-TOKEN_SATELLITE_REFRESH_SECRET="${TOKEN_SATELLITE_REFRESH_SECRET:-}"
 
 is_mac() {
     [[ "$IMPERIUM_MACHINE" == "mac" ]]
@@ -112,8 +108,8 @@ Smart-deploy flow (default):
          token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
          token-api/{ui,web}/ops/**                  → token-api + reload ops tabs
          discord-daemon/**                          → Discord daemon (launchd)
-         WSL runtime paths (satellite/AHK/cli-tools) → WSL /runtime/refresh
-         mobile/**                                    → push-mobile -a (phone)
+         token-api/token-satellite.py               → WSL satellite
+         mobile/**                                  → push-mobile -a (phone)
     2. If the pull was a no-op (already current) or --no-sync: full restart of
        the standard set (Mac token-api → Discord → WSL), preserving the human
        "restart my stuff now" workflow.
@@ -298,25 +294,6 @@ ensure_bare_repo() {
     fi
 }
 
-ensure_runtime_aux_files() {
-    local dir="$1"
-    local exclude="$dir/.git/info/exclude"
-    if [[ -f "$exclude" ]]; then
-        grep -qxF 'discord-daemon/node_modules' "$exclude" 2>/dev/null || cat >> "$exclude" <<'EOF'
-discord-daemon/node_modules
-.smbdelete*
-config.json
-token-api/.env
-EOF
-    fi
-    if [[ -n "$TOKEN_OS_SECRETS_DIR" && -d "$TOKEN_OS_SECRETS_DIR" ]]; then
-        [[ -e "$dir/config.json" || ! -e "$TOKEN_OS_SECRETS_DIR/config.json" ]] || \
-            ln -s "$TOKEN_OS_SECRETS_DIR/config.json" "$dir/config.json"
-        [[ -e "$dir/token-api/.env" || ! -e "$TOKEN_OS_SECRETS_DIR/token-api/.env" ]] || \
-            ln -s "$TOKEN_OS_SECRETS_DIR/token-api/.env" "$dir/token-api/.env"
-    fi
-}
-
 runtime_is_dirty() {
     local dir="$1"
     [[ -d "$dir/.git" || -f "$dir/.git" ]] || return 1
@@ -373,7 +350,6 @@ ensure_runtime_checkout() {
             return 1
         }
     fi
-    ensure_runtime_aux_files "$dir"
     if runtime_is_dirty "$dir"; then
         echo -e "  ${RED}✗${NC} CD-sync: runtime checkout is dirty; aborting deploy (no stash in runtime): $dir"
         git -C "$dir" status --short >&2 || true
@@ -388,7 +364,6 @@ sync_live_checkout() {
     local dir target old_head changed_paths
     dir="$(resolve_live_checkout)" || return 1
     target="$(resolve_deploy_target)" || return 1
-    SYNC_TARGET_SHA="$target"
     ensure_runtime_checkout "$dir" || return 1
 
     old_head="$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null || true)"
@@ -530,11 +505,6 @@ get_wsl_status() {
 }
 
 restart_wsl() {
-    if [[ "${REFRESH_WSL:-false}" == true ]]; then
-        refresh_wsl_runtime
-        return $?
-    fi
-
     echo -e "${BLUE}→${NC} Restarting WSL satellite..."
 
     # Try HTTP restart first
@@ -581,53 +551,6 @@ restart_wsl() {
 
     echo -e "  ${YELLOW}⚠${NC} WSL satellite not yet healthy (may still be starting)"
     return 0
-}
-
-refresh_wsl_runtime() {
-    local sha="${SYNC_TARGET_SHA:-${TOKEN_RESTART_TARGET_SHA:-}}"
-    [[ -n "$sha" ]] || sha="$(git -C "$(runtime_root)" rev-parse -q --verify HEAD 2>/dev/null || true)"
-    if [[ -z "$sha" ]]; then
-        echo -e "  ${YELLOW}⚠${NC} WSL refresh target SHA unknown; falling back to /restart"
-        local old_refresh="$REFRESH_WSL"
-        REFRESH_WSL=false
-        restart_wsl
-        REFRESH_WSL="$old_refresh"
-        return 0
-    fi
-    if [[ -z "$TOKEN_SATELLITE_REFRESH_SECRET" ]]; then
-        echo -e "  ${YELLOW}⚠${NC} TOKEN_SATELLITE_REFRESH_SECRET unset; falling back to /restart"
-        local old_refresh="$REFRESH_WSL"
-        REFRESH_WSL=false
-        restart_wsl
-        REFRESH_WSL="$old_refresh"
-        return 0
-    fi
-
-    echo -e "${BLUE}→${NC} Refreshing WSL local runtime → ${sha:0:9}..."
-    local payload
-    payload=$(python3 - "$sha" <<'PY'
-import json, os, sys
-sha = sys.argv[1]
-paths = [p for p in os.environ.get("SYNC_CHANGED_PATHS", "").splitlines() if p]
-print(json.dumps({"sha": sha, "changed_paths": paths}, separators=(",", ":")))
-PY
-)
-    local http_code
-    http_code=$(curl -sS --connect-timeout 3 -o /tmp/token-wsl-refresh.out -w '%{http_code}' \
-        -X POST "http://${WSL_HOST}:${WSL_PORT}/runtime/refresh" \
-        -H "Authorization: Bearer ${TOKEN_SATELLITE_REFRESH_SECRET}" \
-        -H "Content-Type: application/json" \
-        --data "$payload" 2>/tmp/token-wsl-refresh.err || echo "000")
-    if [[ "$http_code" =~ ^2 ]]; then
-        echo -e "  ${GREEN}✓${NC} WSL runtime refresh scheduled"
-    else
-        echo -e "  ${YELLOW}⚠${NC} WSL refresh failed (HTTP ${http_code}); falling back to /restart"
-        [[ -s /tmp/token-wsl-refresh.err ]] && sed 's/^/    /' /tmp/token-wsl-refresh.err >&2 || true
-        local old_refresh="$REFRESH_WSL"
-        REFRESH_WSL=false
-        restart_wsl
-        REFRESH_WSL="$old_refresh"
-    fi
 }
 
 
@@ -806,11 +729,11 @@ map_changed_to_services() {
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
         case "$path" in
-            token-api/token-satellite.py | ahk/* | cli-tools/bin/dispatch | cli-tools/lib/* | config/deskflow/*)
-                # WSL-hosted runtime dependencies. Push the target SHA into the
-                # WSL-local runtime/AHK cache instead of merely restarting NAS code.
+            token-api/token-satellite.py)
+                # Satellite code lives under token-api/ but runs on WSL. (Also a
+                # *.py, so token-api restarts too — matches old paths-filter.)
                 RESTART_WSL=true
-                REFRESH_WSL=true
+                RESTART_TOKENAPI=true
                 ;;
             token-api/ui/ops/* | token-api/web/ops/*)
                 # Ops cockpit is served by token-api; a restart bumps the build-id
@@ -818,12 +741,7 @@ map_changed_to_services() {
                 RESTART_OPS=true
                 RESTART_TOKENAPI=true
                 ;;
-            token-api/uv.lock | token-api/pyproject.toml)
-                RESTART_TOKENAPI=true
-                RESTART_WSL=true
-                REFRESH_WSL=true
-                ;;
-            token-api/*.py)
+            token-api/*.py | token-api/uv.lock | token-api/pyproject.toml)
                 RESTART_TOKENAPI=true
                 ;;
             discord-daemon/*)
@@ -833,7 +751,7 @@ map_changed_to_services() {
                 RESTART_MOBILE=true
                 ;;
             *)
-                : # unmapped (docs, workflows, tmux, hammerspoon, non-runtime files):
+                : # unmapped (docs, cli-tools, workflows, tmux/ahk/hammerspoon):
                   # no long-lived service to bounce — nothing to do.
                 ;;
         esac
@@ -954,7 +872,6 @@ SYNC_BEFORE_RESTART=true
 # Set by sync_live_checkout() when the pull advances HEAD, plus the changed paths.
 SYNC_DID_ADVANCE=false
 SYNC_CHANGED_PATHS=""
-SYNC_TARGET_SHA=""
 # Stderr from the last failed ff-merge attempt — surfaced on a genuine non-ff so the
 # failure is never silent (see _cd_sync_ff_with_retry / sync_live_checkout).
 CD_SYNC_MERGE_ERR=""
@@ -964,7 +881,6 @@ RESTART_TOKENAPI=false
 RESTART_OPS=false
 RESTART_DISCORD=false
 RESTART_WSL=false
-REFRESH_WSL=false
 RESTART_MOBILE=false
 
 while [[ $# -gt 0 ]]; do

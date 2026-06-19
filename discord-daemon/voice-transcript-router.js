@@ -46,7 +46,6 @@ const VOICE_PROCESSING_OPTION = '@DISCORD_VOICE_PROCESSING';
 const TMUX_RESOLVE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_RESOLVE_TIMEOUT_MS || 1500);
 const TMUX_WRITE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_WRITE_TIMEOUT_MS || 8000);
 const TMUX_COMMAND_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_COMMAND_TIMEOUT_MS || 3000);
-const TMUX_LIST_DELIMITER = '|';
 
 function execFileAsync(file, args, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -66,23 +65,6 @@ function tmuxEnv(extra = {}) {
   return {
     ...process.env,
     PATH: [CLI_DIR, '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH || ''].join(':'),
-    ...extra,
-  };
-}
-
-// Read-only tmux state lookups (pane existence, the static-target list-panes,
-// title reads) must resolve to the LOCAL tmux binary, never the NAS-hosted
-// cli-tools/bin/tmux guard wrapper. That wrapper lives on the SMB mount; when
-// the mount stalls, spawning it times out (spawnSync tmux ETIMEDOUT) and a live
-// voice transcript is silently dropped as "no target pane" — observed dropping
-// both a Custodes static-target route and a Cadia locked-pane route. The guard
-// wrapper exists for interactive typing/focus safety, which read lookups never
-// need, so prefer the local binary here. Writes keep tmuxEnv()'s wrapper path
-// (they rely on its TMUX_SEND_GATE_ALLOW handling).
-function tmuxReadEnv(extra = {}) {
-  return {
-    ...process.env,
-    PATH: ['/opt/homebrew/bin', '/usr/local/bin', CLI_DIR, process.env.PATH || ''].join(':'),
     ...extra,
   };
 }
@@ -134,7 +116,7 @@ function paneExists(pane, execSync = execFileSync) {
     const out = execSync('tmux', ['display-message', '-p', '-t', pane, '#{pane_id}'], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxReadEnv(),
+      env: tmuxEnv(),
     }).trim();
     return out === pane || out.startsWith('%');
   } catch {
@@ -170,18 +152,17 @@ export function resolveStaticVoiceTargetToPane(target, {
       'list-panes',
       '-a',
       '-F',
-      `#{session_name}${TMUX_LIST_DELIMITER}#{window_index}${TMUX_LIST_DELIMITER}` +
-      `#{pane_index}${TMUX_LIST_DELIMITER}#{pane_id}${TMUX_LIST_DELIMITER}#{@PANE_ID}`,
+      '#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{@PANE_ID}',
     ], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxReadEnv(),
+      env: tmuxEnv(),
     });
     const marked = [];
     const fallback = [];
     for (const line of out.split(/\r?\n/)) {
       if (!line) continue;
-      const [sessionName, win, paneIndex, pane, paneMarker] = line.split(TMUX_LIST_DELIMITER, 5);
+      const [sessionName, win, paneIndex, pane, paneMarker] = line.split('\t', 5);
       if (sessionName !== 'main' || win !== spec.windowIndex || !pane?.startsWith('%')) continue;
       if (!paneExistsFn(pane)) continue;
       const index = Number.parseInt(paneIndex || '9999', 10);
@@ -253,7 +234,7 @@ function displayValue(target, format) {
     return execFileSync('tmux', ['display-message', '-p', '-t', pane, format], {
       encoding: 'utf8',
       timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxReadEnv(),
+      env: tmuxEnv(),
     }).replace(/\n$/, '');
   } catch {
     return '';

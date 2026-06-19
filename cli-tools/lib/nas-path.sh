@@ -5,7 +5,7 @@
 #   IMPERIUM_MACHINE — Machine identifier: mac, wsl, phone
 #   IMPERIUM         — Root of the Imperium NAS share
 #   CIVIC            — Root of the Civic NAS share
-#   TOKEN_OS         — Token-OS runtime checkout (machine-local when available)
+#   TOKEN_OS         — Token-OS runtime checkout ($IMPERIUM/runtimes/token-os/live)
 #   CLI_TOOLS        — CLI tools directory ($TOKEN_OS/cli-tools)
 #   TOKEN_API_URL    — Token-API base URL (localhost on mac, tailscale elsewhere)
 #
@@ -59,7 +59,6 @@ fi
 #   ssh_alias     — SSH config host alias for this machine
 #   device_name   — Canonical device name (matches Token-API DEVICE_IPS)
 #   shell         — Default interactive shell (zsh/bash)
-#   token_os_runtime — Preferred machine-local Token-OS runtime checkout
 
 # --- Mac Mini ---
 _IMPERIUM_CFG_mac_nas_imperium="/Volumes/Imperium"
@@ -69,7 +68,6 @@ _IMPERIUM_CFG_mac_token_api_url="http://localhost:7777"
 _IMPERIUM_CFG_mac_ssh_alias="mini"
 _IMPERIUM_CFG_mac_device_name="Mac-Mini"
 _IMPERIUM_CFG_mac_shell="zsh"
-_IMPERIUM_CFG_mac_token_os_runtime="$HOME/runtimes/Token-OS/live"
 
 # --- WSL (Ubuntu on Windows PC) ---
 _IMPERIUM_CFG_wsl_nas_imperium="/mnt/imperium"
@@ -79,7 +77,6 @@ _IMPERIUM_CFG_wsl_token_api_url="http://100.95.109.23:7777"
 _IMPERIUM_CFG_wsl_ssh_alias="wsl"
 _IMPERIUM_CFG_wsl_device_name="TokenPC"
 _IMPERIUM_CFG_wsl_shell="bash"
-_IMPERIUM_CFG_wsl_token_os_runtime="/home/token/runtimes/token-os/live"
 
 # --- Phone (Termux) ---
 _IMPERIUM_CFG_phone_nas_imperium=""
@@ -89,7 +86,6 @@ _IMPERIUM_CFG_phone_token_api_url="http://100.95.109.23:7777"
 _IMPERIUM_CFG_phone_ssh_alias="phone"
 _IMPERIUM_CFG_phone_device_name="Token-S24"
 _IMPERIUM_CFG_phone_shell="bash"
-_IMPERIUM_CFG_phone_token_os_runtime=""
 
 # --- Linux fallback ---
 _IMPERIUM_CFG_linux_nas_imperium="/mnt/imperium"
@@ -99,7 +95,6 @@ _IMPERIUM_CFG_linux_token_api_url="http://100.95.109.23:7777"
 _IMPERIUM_CFG_linux_ssh_alias=""
 _IMPERIUM_CFG_linux_device_name=""
 _IMPERIUM_CFG_linux_shell="bash"
-_IMPERIUM_CFG_linux_token_os_runtime="/home/token/runtimes/token-os/live"
 
 # ============================================================
 # CONFIG LOOKUP FUNCTION
@@ -121,18 +116,11 @@ imperium_cfg() {
 # ============================================================
 export IMPERIUM="$(imperium_cfg nas_imperium)"
 export CIVIC="$(imperium_cfg nas_civic)"
-# Token-OS now runs from a deploy-owned runtime checkout (protected-main/local-CD).
-# Hot runtime execution is machine-local when that checkout exists; $IMPERIUM remains
-# the NAS root for vault/archive/exchange and worktree skeletons. Agents edit branch
-# worktrees under ~/worktrees/Token-OS/wt-<branch>, never runtime checkouts.
+# Token-OS now runs from the deploy-owned runtime checkout (protected-main/local-CD,
+# 2026-06-10). The old working checkout $IMPERIUM/Token-OS is archived. Agents edit
+# branch worktrees under ~/worktrees/Token-OS/wt-<branch>, never these paths.
 # Unconditional (not ${TOKEN_OS:-...}): long-lived tmux/launchd parents may export a
 # stale legacy TOKEN_OS, and this is the one canonical derivation — it must override.
-_token_os_runtime="$(imperium_cfg token_os_runtime)"
-if [[ -n "$_token_os_runtime" && -d "$_token_os_runtime" ]]; then
-    export TOKEN_OS="$_token_os_runtime"
-else
-    export TOKEN_OS="$IMPERIUM/runtimes/token-os/live"
-fi
-unset _token_os_runtime
+export TOKEN_OS="$IMPERIUM/runtimes/token-os/live"
 export CLI_TOOLS="$TOKEN_OS/cli-tools"
 export TOKEN_API_URL="${TOKEN_API_URL:-$(imperium_cfg token_api_url)}"

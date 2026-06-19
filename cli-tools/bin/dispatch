@@ -525,7 +525,7 @@ directory_candidates() {
   for path in \
     "/Volumes/Imperium/Imperium-ENV" \
     "/Volumes/Civic/Pax-ENV" \
-    "${TOKEN_OS_RUNTIME_CHECKOUT:-$HOME/runtimes/Token-OS/live}" \
+    "${TOKEN_OS_RUNTIME_CHECKOUT:-/Volumes/Imperium/runtimes/token-os/live}" \
     "$HOME/worktrees/Token-OS" \
     "$HOME/worktrees/askCivic" \
     "${TERMINUS_RUNTIME_CHECKOUT:-$HOME/runtimes/askCivic/terminus-preview}" \

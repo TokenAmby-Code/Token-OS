@@ -68,15 +68,6 @@ class FakePaneSelectAdapter:
                 return (
                     f"{pane['pane_id']}\t{self.session}\t{self.window_index}\t{self.window_name}\n"
                 )
-            if fmt == (
-                "#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}"
-                "\t#{window_zoomed_flag}"
-            ):
-                zoomed = "1" if self.zoomed else "0"
-                return (
-                    f"{pane['pane_id']}\t{self.session}\t{self.window_index}"
-                    f"\t{self.window_name}\t{zoomed}\n"
-                )
             if fmt == "#{pane_id}":
                 return f"{pane['pane_id']}\n"
             if fmt == "#{session_name}":
