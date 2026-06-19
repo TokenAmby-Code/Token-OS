@@ -594,7 +594,8 @@ def test_dispatch_human_origin_uses_codex_harness_state_for_astartes(
     assert "persona:         Astartes — Codex" in result.stdout
     assert "instance_type:   one_off" in result.stdout
     assert "dispatch_codex_launch_inline" in result.stdout
-    assert "codex-dispatch" not in result.stdout
+    assert 'dispatch_codex_post_hook "SessionStart"' in result.stdout
+    assert "TOKEN_API_PERSONA=codex-dispatch" not in result.stdout
     assert "sisters-of-battle" not in result.stdout
     assert "Sisters" not in result.stdout
 
