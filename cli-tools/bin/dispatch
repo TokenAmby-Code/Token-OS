@@ -1652,6 +1652,7 @@ dispatch_codex_launch_inline() {
     local env_obj="{}"
     [[ -n "${SSH_CLIENT:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$SSH_CLIENT" '. + {SSH_CLIENT: $v}')
     [[ -n "${TMUX:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX" '. + {TMUX: $v}')
+    [[ -n "${session_id:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$session_id" '. + {TOKEN_API_SESSION_ID: $v}')
     [[ -n "${resolved_tmux_pane:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$resolved_tmux_pane" '. + {TMUX_PANE: $v}')
     local persona_env="${TOKEN_API_PERSONA:-}"
     [[ -n "$persona_env" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$persona_env" '. + {TOKEN_API_PERSONA: $v}')
@@ -1691,6 +1692,46 @@ dispatch_codex_launch_inline() {
       env: $env
     }')"
   dispatch_codex_post_hook "WrapperStart" "$wrapper_start_payload"
+
+  local session_start_payload
+  session_start_payload="$(jq -nc \
+    --arg sid "$session_id" \
+    --arg wrapper_launch_id "$bridge_id" \
+    --arg launcher "$launcher" \
+    --arg engine "codex" \
+    --arg wd "$working_dir" \
+    --arg tmux_pane "$resolved_tmux_pane" \
+    --arg dispatch_target "$dispatch_target" \
+    --arg dispatch_window "$dispatch_window" \
+    --arg dispatch_mode "$dispatch_mode" \
+    --arg dispatch_slot "$dispatch_slot" \
+    --arg session_doc "$session_doc" \
+    --arg target_working_dir "$target_working_dir" \
+    --arg launch_mode "$launch_mode" \
+    --arg instance_type "$instance_type" \
+    --argjson zealotry "$zealotry" \
+    --argjson pid "$$" \
+    --argjson env "$env_obj" \
+    '{
+      session_id: $sid,
+      wrapper_launch_id: $wrapper_launch_id,
+      launcher: $launcher,
+      engine: $engine,
+      cwd: $wd,
+      tmux_pane: $tmux_pane,
+      dispatch_target: $dispatch_target,
+      dispatch_window: $dispatch_window,
+      dispatch_mode: $dispatch_mode,
+      dispatch_slot: $dispatch_slot,
+      dispatch_session_doc_path: $session_doc,
+      target_working_dir: $target_working_dir,
+      launch_mode: $launch_mode,
+      instance_type: $instance_type,
+      zealotry: $zealotry,
+      pid: $pid,
+      env: $env
+    }')"
+  dispatch_codex_post_hook "SessionStart" "$session_start_payload"
 
   dispatch_codex_cleanup() {
     local exit_code="${1:-$?}"
