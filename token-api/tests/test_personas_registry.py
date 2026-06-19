@@ -30,26 +30,33 @@ async def test_personas_seed_and_schema_constraints(app_env):
 
 
 @pytest.mark.asyncio
-async def test_pax_overseer_seed_resolves_silent_civic_seat(app_env):
-    # Pax is the third legion seat: a non-40k civic day-job overseer singleton.
-    # resolve_persona must surface it as an overseer (so the rank-stamp trigger
+async def test_civic_overseer_seeds_resolve_silent_civic_seats(app_env):
+    # The civic trinity seats are non-40k civic day-job overseer singletons.
+    # resolve_persona must surface each as an overseer (so the rank-stamp trigger
     # promotes its instance row off the astartes default) with the civic slate/
-    # blue identity and no voice/sound (a silent seat).
+    # blue identity and no voice/sound (silent seats).
     import personas
 
     async with aiosqlite.connect(app_env.db_path) as db:
-        pax = await personas.resolve_persona(db, "pax")
+        custodes = await personas.resolve_persona(db, "civic-custodes")
+        administratum = await personas.resolve_persona(db, "civic-administratum")
+        fg = await personas.resolve_persona(db, "civic-fg")
 
-    assert pax is not None
-    assert pax["id"] == personas.persona_id_for_slug("pax")
-    assert pax["default_rank"] == "overseer"
-    assert pax["pane_tint"] == "#1c2b3a"
-    assert pax["chip_color"] == "#3a6ea5"
-    assert pax["assignment_pool"] is None
-    assert pax["assignment_order"] is None
-    assert pax["tts_voice"] is None
-    assert pax["notification_sound"] is None
-    assert pax["silent"] is True
+    for slug, seat in (
+        ("civic-custodes", custodes),
+        ("civic-administratum", administratum),
+        ("civic-fg", fg),
+    ):
+        assert seat is not None, slug
+        assert seat["id"] == personas.persona_id_for_slug(slug), slug
+        assert seat["default_rank"] == "overseer", slug
+        assert seat["pane_tint"] == "#1c2b3a", slug
+        assert seat["chip_color"] == "#3a6ea5", slug
+        assert seat["assignment_pool"] is None, slug
+        assert seat["assignment_order"] is None, slug
+        assert seat["tts_voice"] is None, slug
+        assert seat["notification_sound"] is None, slug
+        assert seat["silent"] is True, slug
 
 
 @pytest.mark.asyncio

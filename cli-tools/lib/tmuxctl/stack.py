@@ -32,7 +32,7 @@ from .tmux_adapter import TmuxAdapter, TmuxError
 # Instance statuses that denote a live, drive-able runtime worth rebinding.
 _LIVE_STATUSES = frozenset({"processing", "idle"})
 
-STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "mars", "kreig", "reservists")
+STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "civic", "mars", "kreig", "reservists")
 SPILL_RE = re.compile(r"^(?P<base>[a-z]+)(?:-(?P<n>\d+))?$")
 
 
@@ -398,11 +398,13 @@ def sweep_stack_assertions(
 # Generic persona-pane stack page implementation. Imported at module end so the
 # implementation can reuse stack_base_of()/spill helpers above without a cycle.
 from ._stack_core import (  # noqa: E402,F401
+    CIVIC_ADMINISTRATUM_ROLE,
+    CIVIC_CUSTODES_ROLE,
+    CIVIC_FG_ROLE,
     CUSTODES_ROLE,
     FABRICATOR_ROLE,
     LEGACY_WORKER_ROLES,
     MALCADOR_ROLE,
-    PAX_ROLE,
     REGIMENT_ROLE,
     STACK_COLLAPSED_HEIGHT,
     STACK_ORCHESTRATOR_RATIO,

@@ -12,6 +12,7 @@ PALACE_WINDOW = "palace"
 SOMNIUM_WINDOW = "somnium"
 LEGION_WINDOW = "legion"
 MECHANICUS_WINDOW = "mechanicus"
+CIVIC_WINDOW = "civic"
 RESERVISTS_WINDOW = "reservists"
 
 DETACHED_W = 240
@@ -176,15 +177,10 @@ def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNI
 def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
     """Build the legion stack window.
 
-    The left column holds three overseer seats stacked in even thirds:
-    Custodes on top, Malcador (the advisor seat) in the middle, and Pax (the
-    civic day-job seat) on the bottom. Pane 1 is the Custodes orchestrator slot.
-    If that orchestrator is promoted to an audience surface, this pane becomes
-    its tombstone.
-
-    The split sequence re-balances the column for three panes: Custodes keeps
-    the top third, the lower two-thirds becomes Malcador, then Malcador's region
-    is halved to seat Pax in the bottom third.
+    The left column mirrors mechanicus: Custodes on top, Malcador (the
+    advisor seat) below. Pane 1 is the Custodes orchestrator slot. If that
+    orchestrator is promoted to an audience surface, this pane becomes its
+    tombstone.
     """
     target = f"{session}:{LEGION_WINDOW}"
     adapter.run(
@@ -198,14 +194,11 @@ def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
         _window_dir(LEGION_WINDOW),
     )
     custodes = f"{target}.1"
-    malcador = _split_pane(adapter, custodes, "-v", "-l", "66%", cwd=_window_dir(LEGION_WINDOW))
-    pax = _split_pane(adapter, malcador, "-v", "-l", "50%", cwd=_window_dir(LEGION_WINDOW))
+    malcador = _split_pane(adapter, custodes, "-v", "-l", "50%", cwd=_window_dir(LEGION_WINDOW))
     _pane_tag(adapter, custodes, "legion:custodes")
     _set_pane_option(adapter, custodes, "@PANE_TYPE", "legion")
     _pane_tag(adapter, malcador, "legion:malcador")
     _set_pane_option(adapter, malcador, "@PANE_TYPE", "legion")
-    _pane_tag(adapter, pax, "legion:pax")
-    _set_pane_option(adapter, pax, "@PANE_TYPE", "legion")
 
 
 def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
@@ -233,6 +226,42 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
     _set_pane_option(adapter, fabricator, "@PANE_TYPE", "mechanicus")
     _pane_tag(adapter, admin, "mechanicus:admin")
     _set_pane_option(adapter, admin, "@PANE_TYPE", "mechanicus")
+
+
+def build_civic_window(adapter: TmuxAdapter, session: str) -> None:
+    """Build the civic stack window — the day-job trinity page.
+
+    Mirrors the mechanicus trinity but for civic (askCivic / Public Knowledge)
+    work, which lives in its own vault (Pax-ENV). The left column holds three
+    overseer seats stacked in even thirds: civic-custodes (high-abstraction
+    interaction + brainstorm) on top, civic-administratum (state) in the middle,
+    and civic-fg (orchestration) on the bottom. Worker panes are added by
+    stack.add_stack_pane on the right stack via `dispatch civic`.
+
+    The split sequence re-balances the column for three panes: civic-custodes
+    keeps the top third, the lower two-thirds becomes civic-administratum, then
+    that region is halved to seat civic-fg in the bottom third.
+    """
+    target = f"{session}:{CIVIC_WINDOW}"
+    adapter.run(
+        "new-window",
+        "-t",
+        session,
+        "-n",
+        CIVIC_WINDOW,
+        "-d",
+        "-c",
+        _window_dir(CIVIC_WINDOW),
+    )
+    custodes = f"{target}.1"
+    administratum = _split_pane(adapter, custodes, "-v", "-l", "66%", cwd=_window_dir(CIVIC_WINDOW))
+    fg = _split_pane(adapter, administratum, "-v", "-l", "50%", cwd=_window_dir(CIVIC_WINDOW))
+    _pane_tag(adapter, custodes, "civic:custodes")
+    _set_pane_option(adapter, custodes, "@PANE_TYPE", "civic")
+    _pane_tag(adapter, administratum, "civic:administratum")
+    _set_pane_option(adapter, administratum, "@PANE_TYPE", "civic")
+    _pane_tag(adapter, fg, "civic:fg")
+    _set_pane_option(adapter, fg, "@PANE_TYPE", "civic")
 
 
 def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
@@ -297,6 +326,7 @@ def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
     build_somnium_window(adapter, session, SOMNIUM_WINDOW)
     build_legion_window(adapter, session)
     build_mechanicus_window(adapter, session)
+    build_civic_window(adapter, session)
     build_reservists_window(adapter, session)
     adapter.run("select-window", "-t", f"{session}:{PALACE_WINDOW}")
 

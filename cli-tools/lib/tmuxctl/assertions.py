@@ -30,6 +30,9 @@ PERSONA_LABELS = {
     "legion:malcador",
     "mechanicus:fabricator-general",
     "mechanicus:admin",
+    "civic:custodes",
+    "civic:administratum",
+    "civic:fg",
 }
 
 
@@ -49,6 +52,11 @@ def _vault_root() -> Path:
     if root:
         return Path(root) / "Imperium-ENV"
     return Path("/Volumes/Imperium/Imperium-ENV")
+
+
+def _civic_vault_root() -> Path:
+    """Civic fleet vault root (Pax-ENV, on the Civic NAS share)."""
+    return Path(os.environ.get("CIVIC") or "/Volumes/Civic") / "Pax-ENV"
 
 
 def _today_daily_note() -> str:
@@ -81,6 +89,36 @@ def persona_spec(label: str) -> PersonaSpec:
         )
     if label == "mechanicus:admin":
         return PersonaSpec(label, "administratum", "hook_driven", _admin_log(), model="sonnet")
+    if label == "civic:custodes":
+        # The civic high-abstraction interaction + brainstorm seat. Opus, like its
+        # Imperium counterpart. Session docs live in the Civic vault (Pax-ENV).
+        return PersonaSpec(
+            label,
+            "civic-custodes",
+            "hook_driven",
+            str(_civic_vault_root() / "Sessions" / "civic-custodes.md"),
+            sync=True,
+            model="opus",
+        )
+    if label == "civic:administratum":
+        return PersonaSpec(
+            label,
+            "civic-administratum",
+            "hook_driven",
+            str(_civic_vault_root() / "Sessions" / "civic-administratum.md"),
+            model="sonnet",
+        )
+    if label == "civic:fg":
+        # Orchestration seat. Sonnet is pending the Phase 3 spike (harness
+        # cleanliness + GT-ping accuracy); it stays a higher model until that
+        # passes.
+        return PersonaSpec(
+            label,
+            "civic-fg",
+            "hook_driven",
+            str(_civic_vault_root() / "Sessions" / "civic-fg.md"),
+            model="sonnet",
+        )
     raise ValueError(f"unknown persona pane: {label}")
 
 

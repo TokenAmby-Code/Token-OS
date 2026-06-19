@@ -10,8 +10,10 @@ from .tmux_adapter import TmuxAdapter
 
 CUSTODES_ROLE = "legion:custodes"
 MALCADOR_ROLE = "legion:malcador"
-PAX_ROLE = "legion:pax"
 FABRICATOR_ROLE = "mechanicus:fabricator-general"
+CIVIC_CUSTODES_ROLE = "civic:custodes"
+CIVIC_ADMINISTRATUM_ROLE = "civic:administratum"
+CIVIC_FG_ROLE = "civic:fg"
 REGIMENT_ROLE = "legion:worker"
 STACK_COLLAPSED_HEIGHT = 3
 STACK_ORCHESTRATOR_RATIO = 40
@@ -47,14 +49,11 @@ STACK_PAGE_SPECS: dict[str, StackPageSpec] = {
         orchestrator_role=CUSTODES_ROLE,
         orchestrator_type="legion",
         worker_role=REGIMENT_ROLE,
-        # Malcador (advisor) and Pax (civic day-job) are durable overseer seats
-        # docked under Custodes in the left column, not regiment workers. Without
-        # registering them here, enforce_stack_layout classifies them as untyped
-        # workers and retags them legion:N, clobbering the seat identity.
-        secondary_personas=(
-            PersonaPaneSpec(MALCADOR_ROLE, "legion"),
-            PersonaPaneSpec(PAX_ROLE, "legion"),
-        ),
+        # Malcador (advisor) is a durable overseer seat docked under Custodes in
+        # the left column, not a regiment worker. Without registering it here,
+        # enforce_stack_layout classifies it as an untyped worker and retags it
+        # legion:N, clobbering the seat identity.
+        secondary_personas=(PersonaPaneSpec(MALCADOR_ROLE, "legion"),),
     ),
     "mechanicus": StackPageSpec(
         base="mechanicus",
@@ -62,6 +61,21 @@ STACK_PAGE_SPECS: dict[str, StackPageSpec] = {
         orchestrator_type="mechanicus",
         worker_role="mechanicus:worker",
         secondary_personas=(PersonaPaneSpec("mechanicus:admin", "mechanicus"),),
+    ),
+    "civic": StackPageSpec(
+        base="civic",
+        orchestrator_role=CIVIC_CUSTODES_ROLE,
+        orchestrator_type="civic",
+        worker_role="civic:worker",
+        # The civic trinity mirrors mechanicus: civic-custodes orchestrates the
+        # left column, with civic-administratum (state) and civic-fg
+        # (orchestration) docked beneath it as durable overseer seats. Registering
+        # them here keeps enforce_stack_layout from retagging them as civic:N
+        # workers.
+        secondary_personas=(
+            PersonaPaneSpec(CIVIC_ADMINISTRATUM_ROLE, "civic"),
+            PersonaPaneSpec(CIVIC_FG_ROLE, "civic"),
+        ),
     ),
 }
 

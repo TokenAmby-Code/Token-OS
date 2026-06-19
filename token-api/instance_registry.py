@@ -149,7 +149,6 @@ LEGACY_PERSONA_ALIASES = {
     "mechanicus:admin": "administratum",
     "legion:custodes": "custodes",
     "legion:malcador": "malcador",
-    "legion:pax": "pax",
     "mechanicus": "administratum",
 }
 

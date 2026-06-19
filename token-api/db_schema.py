@@ -1492,20 +1492,40 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "perturabo",
                 "Personas/Perturabo.md",
             ),
+            # ── Civic trinity (the day-job page) ────────────────────────────────
+            # The civic seats live in the Civic vault (Pax-ENV), not Imperium-ENV,
+            # so the dispatch local-file fallback (which searches Imperium-ENV)
+            # cannot find them — the vault/vault_note_path mapping below is what
+            # lets `dispatch --persona civic-*` resolve each seat's system prompt
+            # from $CIVIC/Pax-ENV/Personas/<slug>.md. "Pax" survives as an alias on
+            # the orchestrator seat (civic-fg inherits Pax's intent) so
+            # `dispatch --persona pax` still resolves.
             (
-                # Civic day-job overseer seat (the third legion pane). Unlike the
-                # Imperium personas, Pax lives in the Civic vault (Pax-ENV), so the
-                # dispatch local-file fallback (which only searches Imperium-ENV)
-                # cannot find it — the vault/vault_note_path mapping below is what
-                # lets `dispatch --persona pax` resolve its system prompt from
-                # $CIVIC/Pax-ENV/Personas/pax.md.
-                "pax",
-                "Pax, The Civic Overseer",
-                '["civic", "askcivic", "public-knowledge"]',
+                "civic-custodes",
+                "Civic Custodes, The Civic Overseer",
+                '["civic", "civic-custodes"]',
                 "Pax-ENV",
-                "Civic day-job overseer. Stewards askCivic / Public Knowledge / Civic work as a standing seat beside the Imperium overseers. Deliberately non-40k.",
-                "pax",
-                "Personas/pax.md",
+                "Civic high-abstraction interaction + brainstorm seat. Stewards askCivic / Public Knowledge / Civic work. Deliberately non-40k.",
+                "civic-custodes",
+                "Personas/civic-custodes.md",
+            ),
+            (
+                "civic-administratum",
+                "Civic Administratum",
+                '["civic-admin", "civic-administratum"]',
+                "Pax-ENV",
+                "Civic state recorder. Maintains civic-fleet state and continuity. Deliberately non-40k.",
+                "civic-administratum",
+                "Personas/civic-administratum.md",
+            ),
+            (
+                "civic-fg",
+                "Civic Fabricator-General",
+                '["civic-fg", "pax", "askcivic", "public-knowledge"]',
+                "Pax-ENV",
+                "Civic orchestration seat (inherits Pax's orchestrator intent). Drives civic worker dispatch and follow-through. Deliberately non-40k.",
+                "civic-fg",
+                "Personas/civic-fg.md",
             ),
         ]
         for primarch in primarch_seed:

@@ -8,7 +8,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl.api import build_client_attachments
-from tmuxctl.builder import build_legion_window, build_workspace
+from tmuxctl.builder import build_civic_window, build_legion_window, build_workspace
 from tmuxctl.enums import (
     AttachmentClass,
     CoherenceSeverity,
@@ -467,6 +467,7 @@ def test_builder_creates_canonical_workspace_roles():
         "somnium",
         "legion",
         "mechanicus",
+        "civic",
         "reservists",
     ]
     roles = {
@@ -488,15 +489,20 @@ def test_builder_creates_canonical_workspace_roles():
         "somnium:SE",
     } <= set(roles.values())
     assert roles["main:legion.1"] == "legion:custodes"
-    # The legion window seats three overseers in even thirds: Custodes (.1),
-    # Malcador (.2), and the civic Pax seat (.3).
+    # The legion window seats two overseers: Custodes (.1) and Malcador (.2).
     assert roles["main:legion.2"] == "legion:malcador"
-    assert roles["main:legion.3"] == "legion:pax"
+    # The civic trinity page seats three overseers in thirds: Custodes (.1),
+    # Administratum (.2), and the Fabricator-General (.3).
+    assert roles["main:civic.1"] == "civic:custodes"
+    assert roles["main:civic.2"] == "civic:administratum"
+    assert roles["main:civic.3"] == "civic:fg"
     assert roles["main:mechanicus.1"] == "mechanicus:fabricator-general"
     assert roles["main:reservists.1"] == "reservists:civic"
     assert adapter.pane_options["main:legion.1"]["@PANE_TYPE"] == "legion"
     assert adapter.pane_options["main:legion.2"]["@PANE_TYPE"] == "legion"
-    assert adapter.pane_options["main:legion.3"]["@PANE_TYPE"] == "legion"
+    assert adapter.pane_options["main:civic.1"]["@PANE_TYPE"] == "civic"
+    assert adapter.pane_options["main:civic.2"]["@PANE_TYPE"] == "civic"
+    assert adapter.pane_options["main:civic.3"]["@PANE_TYPE"] == "civic"
     assert adapter.pane_options["main:mechanicus.1"]["@PANE_TYPE"] == "mechanicus"
     assert adapter.pane_options["main:reservists.1"]["@PANE_TYPE"] == "reservists"
     # The civic reservist pane carries the hook the civic-thread fallthrough resolves.
@@ -505,11 +511,11 @@ def test_builder_creates_canonical_workspace_roles():
     assert "tui" not in pane_types
 
 
-def test_build_legion_window_seats_three_overseers_in_order() -> None:
-    # The legion column is built top-to-bottom: Custodes (.1), then the lower
-    # two-thirds split into Malcador (.2) and Pax (.3). Each seat is tagged with
-    # its @PANE_ID and the shared legion @PANE_TYPE so resolve_pane can address
-    # `legion:pax` off the live tag.
+def test_build_legion_window_seats_two_overseers_in_order() -> None:
+    # The legion column is built top-to-bottom: Custodes (.1), then a single
+    # split into Malcador (.2). Each seat is tagged with its @PANE_ID and the
+    # shared legion @PANE_TYPE so resolve_pane can address `legion:malcador`
+    # off the live tag.
     adapter = FakeBuilderAdapter()
     adapter.sessions.add("main")
     adapter.windows["main"] = []
@@ -525,10 +531,35 @@ def test_build_legion_window_seats_three_overseers_in_order() -> None:
     assert seats == {
         "main:legion.1": "legion:custodes",
         "main:legion.2": "legion:malcador",
-        "main:legion.3": "legion:pax",
     }
-    for pane in ("main:legion.1", "main:legion.2", "main:legion.3"):
+    for pane in ("main:legion.1", "main:legion.2"):
         assert adapter.pane_options[pane]["@PANE_TYPE"] == "legion"
+
+
+def test_build_civic_window_seats_three_overseers_in_order() -> None:
+    # The civic trinity page is built top-to-bottom in thirds: Custodes (.1),
+    # Administratum (.2), and the Fabricator-General (.3). Each seat is tagged
+    # with its @PANE_ID and the shared civic @PANE_TYPE so resolve_pane can
+    # address `civic:fg` off the live tag.
+    adapter = FakeBuilderAdapter()
+    adapter.sessions.add("main")
+    adapter.windows["main"] = []
+    adapter.panes["main:civic"] = ["main:civic.1"]
+
+    build_civic_window(adapter, "main")  # type: ignore[arg-type]
+
+    seats = {
+        target: options["@PANE_ID"]
+        for target, options in adapter.pane_options.items()
+        if options.get("@PANE_ID", "").startswith("civic:")
+    }
+    assert seats == {
+        "main:civic.1": "civic:custodes",
+        "main:civic.2": "civic:administratum",
+        "main:civic.3": "civic:fg",
+    }
+    for pane in ("main:civic.1", "main:civic.2", "main:civic.3"):
+        assert adapter.pane_options[pane]["@PANE_TYPE"] == "civic"
 
 
 def test_normalize_instance_status_accepts_live_api_vocabulary():

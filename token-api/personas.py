@@ -192,17 +192,45 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
     PersonaSeed(
         "inquisitor", "Inquisitor", "overseer", None, None, "#180830", "#7a4cc2", None, None, None
     ),
+    # ── Civic trinity (the day-job page, mirroring the mechanicus trinity) ──────
+    # All three share the civic slate (#1c2b3a) / civic blue (#3a6ea5) identity,
+    # deliberately non-40k. "Pax" survives as the Pax-ENV vault / civic-fleet
+    # identity; civic-fg inherits its orchestrator intent. Silent seats.
     PersonaSeed(
-        "pax",
-        "Pax",
+        "civic-custodes",
+        "Civic Custodes",
         "overseer",
         None,
-        None,  # assignment_pool, assignment_order (overseer → None)
-        "#1c2b3a",  # pane_tint  — civic slate, deliberately non-40k
-        "#3a6ea5",  # chip_color — civic blue
+        None,
+        "#1c2b3a",
+        "#3a6ea5",
         None,
         None,
-        None,  # tts_voice, tts_rate, notification_sound (silent seat)
+        None,
+    ),
+    PersonaSeed(
+        "civic-administratum",
+        "Civic Administratum",
+        "overseer",
+        None,
+        None,
+        "#1c2b3a",
+        "#3a6ea5",
+        None,
+        None,
+        None,
+    ),
+    PersonaSeed(
+        "civic-fg",
+        "Civic Fabricator-General",
+        "overseer",
+        None,
+        None,
+        "#1c2b3a",
+        "#3a6ea5",
+        None,
+        None,
+        None,
     ),
 )
 

@@ -131,47 +131,49 @@ def test_malcador_pane_registers_with_primarch_identity(
     assert row["commander_type"] == "emperor"
 
 
-# ── Pax: the civic day-job overseer seat (third legion pane) ───────────────────
+# ── Civic trinity: the civic day-job overseer seats (civic page) ───────────────
 
 
-def test_pax_pane_registers_with_overseer_identity(
+def test_civic_custodes_pane_registers_with_overseer_identity(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A fresh SessionStart in the legion:pax pane IS Pax: its identity is derived
-    # from PERSONA_PANE_IDENTITY (primarch='pax' → the `pax` personas row), and
-    # the rank-stamp trigger must promote the freshly inserted row off the
-    # 'astartes' column default to 'overseer'. Emperor-commanded, like every
-    # persona singleton.
+    # A fresh SessionStart in the civic:custodes pane IS the Civic Custodes: its
+    # identity is derived from PERSONA_PANE_IDENTITY (primarch='civic-custodes' →
+    # the `civic-custodes` personas row), and the rank-stamp trigger must promote
+    # the freshly inserted row off the 'astartes' column default to 'overseer'.
+    # Emperor-commanded, like every persona singleton.
     hooks = sys.modules["routes.hooks"]
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:pax"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("civic:custodes"))
     _no_pane_occupant(monkeypatch, hooks)
 
-    result = _start_session(hooks, "pax-1")
+    result = _start_session(hooks, "civic-custodes-1")
     assert result["success"] is True
 
-    row = _row(app_env.db_path, "pax-1")
-    assert row["persona_slug"] == "pax"
+    row = _row(app_env.db_path, "civic-custodes-1")
+    assert row["persona_slug"] == "civic-custodes"
     assert row["rank"] == "overseer"
     assert row["commander_type"] == "emperor"
 
 
-def test_pax_pane_parent_env_does_not_register_chapter_child(
+def test_civic_pane_parent_env_does_not_register_chapter_child(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A persona relaunch chain leaks the predecessor into
-    # TOKEN_API_PARENT_INSTANCE_ID; honoring it would register Pax as a chapter
-    # child (exempt from the singleton guard and rank-stamp triggers). The pax
-    # singleton must register Emperor-commanded, always.
+    # TOKEN_API_PARENT_INSTANCE_ID; honoring it would register the Civic Custodes
+    # as a chapter child (exempt from the singleton guard and rank-stamp
+    # triggers). The civic singleton must register Emperor-commanded, always.
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "dispatcher-pax")
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:pax"))
+    _insert_instance(app_env.db_path, "dispatcher-civic")
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("civic:custodes"))
     _no_pane_occupant(monkeypatch, hooks)
 
-    result = _start_session(hooks, "pax-2", env={"TOKEN_API_PARENT_INSTANCE_ID": "dispatcher-pax"})
+    result = _start_session(
+        hooks, "civic-custodes-2", env={"TOKEN_API_PARENT_INSTANCE_ID": "dispatcher-civic"}
+    )
     assert result["success"] is True
 
-    row = _row(app_env.db_path, "pax-2")
-    assert row["persona_slug"] == "pax"
+    row = _row(app_env.db_path, "civic-custodes-2")
+    assert row["persona_slug"] == "civic-custodes"
     assert row["rank"] == "overseer"
     assert row["commander_type"] == "emperor"
     assert row["commander_id"] is None

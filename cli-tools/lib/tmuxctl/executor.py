@@ -325,10 +325,12 @@ done
         registry row after teardown. Assert them after restore so `tx restart`
         leaves the workspace operational instead of with blank FG/Admin shells.
 
-        The civic reservist pane is a special case: `civic-thread fallthrough`
-        injects through tmux-resume, which requires an already-running agent TUI.
-        If the reservist pane is only a shell, seed a low-cost idle Claude in the
-        Civic working dir; the invariant can then deliver its activation prompt.
+        The civic standby is a special case: `civic-thread fallthrough` injects
+        through tmux-resume, which requires an already-running agent TUI. The
+        dedicated civic-custodes seat is the primary civic runtime now, so resolve
+        it first; if it is absent (or only a shell), fall back to the
+        reservists:civic pane. Either way, seed a low-cost idle Claude in the
+        Civic working dir so the invariant can deliver its activation prompt.
         """
         violations: list[str] = []
 
@@ -339,6 +341,9 @@ done
                 "legion:custodes",
                 "mechanicus:fabricator-general",
                 "mechanicus:admin",
+                "civic:custodes",
+                "civic:administratum",
+                "civic:fg",
             ):
                 try:
                     result = assert_instance(self.adapter, pane_label)
@@ -359,10 +364,10 @@ done
 
         for label, target, cwd, prompt in (
             (
-                "civic reservist",
-                "reservists:civic",
+                "civic standby",
+                ("civic:custodes", "reservists:civic"),
                 Path(os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic")),
-                "Stand by as the civic reservist runtime. Do not start new work. "
+                "Stand by as the civic standby runtime. Do not start new work. "
                 "Wait for civic-thread fallthrough or operator instructions.",
             ),
             (
@@ -383,13 +388,21 @@ done
         return violations
 
     def _ensure_reservist_runtime(
-        self, label: str, target: str, working_dir: Path, prompt: str
+        self, label: str, target: str | tuple[str, ...], working_dir: Path, prompt: str
     ) -> str:
-        pane_id = self._resolve_optional_pane(target)
+        # `target` may be an ordered tuple of candidate seats: resolve the first
+        # that exists (e.g. civic:custodes, then reservists:civic). A candidate
+        # whose seat already hosts a live agent satisfies the standby — no-op.
+        candidates = (target,) if isinstance(target, str) else target
+        pane_id = ""
+        for candidate in candidates:
+            pane_id = self._resolve_optional_pane(candidate)
+            if pane_id:
+                if self._pane_has_agent_runtime(pane_id):
+                    return ""
+                break
         if not pane_id:
             return f"{label} pane missing after rebuild"
-        if self._pane_has_agent_runtime(pane_id):
-            return ""
 
         if not working_dir.is_dir():
             working_dir = Path.home()
