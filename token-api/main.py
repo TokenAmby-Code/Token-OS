@@ -12186,7 +12186,7 @@ def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
     Adds fields like energy_0900, focus_0900, etc. and updates top-level
     energy/focus/mood so meta-bind widgets reflect the latest values.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE)).date().isoformat()
     note_path = DAILY_NOTE_DIR / f"{today}.md"
 
     if not note_path.exists():
@@ -12259,9 +12259,9 @@ def _append_work_action_to_daily_note(at: str, source: str) -> None:
 
 
 @app.get("/api/daily-note")
-async def get_daily_note():
+async def get_daily_note() -> dict[str, object]:
     """Return today's daily note content as plain text."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE)).date().isoformat()
     note_path = DAILY_NOTE_DIR / f"{today}.md"
     if not note_path.exists():
         return {"date": today, "content": None, "exists": False}
@@ -13141,6 +13141,7 @@ def _sync_save_to_db(state_json: str):
     """Save timer state to SQLite synchronously (called via asyncio.to_thread)."""
     import sqlite3
 
+    today = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE)).date().isoformat()
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
@@ -13148,6 +13149,21 @@ def _sync_save_to_db(state_json: str):
            VALUES (1, ?, CURRENT_TIMESTAMP)
            ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json, updated_at = CURRENT_TIMESTAMP""",
         (state_json,),
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS timer_state_daily (
+            date TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO timer_state_daily (date, state_json, updated_at)
+           VALUES (?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(date) DO UPDATE SET
+             state_json = excluded.state_json,
+             updated_at = CURRENT_TIMESTAMP""",
+        (today, state_json),
     )
     conn.commit()
     conn.close()
@@ -13303,29 +13319,40 @@ async def timer_save_daily_score(
         print(f"TIMER: Failed to save daily score: {e}")
 
 
-def timer_load_from_db():
+def timer_load_from_db() -> None:
     """Load timer state from DB on startup."""
     import sqlite3
 
     now_ms = int(time.monotonic() * 1000)
+    today = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE)).date().isoformat()
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("PRAGMA busy_timeout=5000")
-        row = conn.execute("SELECT state_json FROM timer_state WHERE id = 1").fetchone()
+        try:
+            row = conn.execute(
+                "SELECT state_json FROM timer_state_daily WHERE date = ?",
+                (today,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row is None:
+            row = conn.execute("SELECT state_json FROM timer_state WHERE id = 1").fetchone()
         conn.close()
 
         if row:
             saved = json.loads(row[0])
             timer_engine.from_dict(saved, now_mono_ms=now_ms)
-            print(
-                f"TIMER: Restored state from DB (mode={timer_engine.current_mode.value}, break={timer_engine.break_balance_ms / 1000:.0f}s)"
+            logger.info(
+                "TIMER: Restored state from DB (mode=%s, break=%.0fs)",
+                timer_engine.current_mode.value,
+                timer_engine.break_balance_ms / 1000,
             )
             return
     except Exception as e:
-        print(f"TIMER: DB load failed: {e}")
+        logger.warning("TIMER: DB load failed: %s", e)
 
     # Fresh start
-    print("TIMER: Fresh start (no DB state found)")
+    logger.info("TIMER: Fresh start (no DB state found)")
 
 
 async def _wipe_prior_day_timer_events(cutoff_date: str) -> None:
