@@ -156,6 +156,30 @@ def test_recoloring_has_no_slash_color_path():
     assert "LEGION_PANE_COLORS" not in shared
 
 
+def test_pane_tint_decoupled_from_voice_lock():
+    """The Discord voice lock is a non-tint signifier: persona tint no longer
+    reads or honors @DISCORD_VOICE_LOCK, so a (possibly stale) lock never
+    suppresses or alters pane background. Persona tint always paints."""
+    root = Path(__file__).resolve().parents[2]
+    shared = (root / "token-api" / "shared.py").read_text(encoding="utf-8")
+    assert "@DISCORD_VOICE_LOCK" not in shared
+    assertions = (root / "cli-tools" / "lib" / "tmuxctl" / "assertions.py").read_text(
+        encoding="utf-8"
+    )
+    # The only surviving reference is the close-time teardown list (a dead pane is
+    # torn down through its own lifecycle), never a tint-suppression guard.
+    assert assertions.count("@DISCORD_VOICE_LOCK") == 1
+
+
+def test_token_api_voice_draft_signifier_is_voice_lock_not_title():
+    """The token-api voice-draft lock uses the @DISCORD_VOICE_LOCK pane option as
+    its sole signifier — the volatile title-prefix method is retired."""
+    root = Path(__file__).resolve().parents[2]
+    main_src = (root / "token-api" / "main.py").read_text(encoding="utf-8")
+    assert "_VOICE_DRAFT_TITLE_PREFIX" not in main_src
+    assert "@DISCORD_VOICE_LOCK" in main_src
+
+
 @pytest.mark.asyncio
 async def test_null_tts_voice_queues_as_silent_not_fallback(app_env):
     from routes.tts import queue_tts

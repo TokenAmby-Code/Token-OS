@@ -2883,19 +2883,10 @@ async def handle_session_start(payload: dict) -> dict:
                 actor="SessionStart",
                 wrapper_launch_id=wrapper_launch_id,
             )
-            if auto_legion == "civic":
-                # Civic/Pax launches have no persona tint authority. Keep legacy
-                # legion for routing, but clear canonical persona assignment so
-                # tint resolution falls through to tmux default instead of an old
-                # civic-green or arbitrary chapter colour.
-                await sanctioned_update_canonical_instance(
-                    db,
-                    instance_id=session_id,
-                    updates={"persona_id": None},
-                    mutation_type="persona_unassigned",
-                    write_source="hooks",
-                    actor="SessionStart",
-                )
+            # Civic/Pax is classified as the civic legion for routing only — it has
+            # no special tint system. Tint follows the canonical persona like any
+            # pane, so the civic pane keeps its normal chapter/persona colour (or
+            # tmux default if its persona is genuinely null).
         elif _prior_legion and _prior_legion != "astartes":
             await sanctioned_update_instance(
                 db,

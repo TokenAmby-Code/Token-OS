@@ -195,7 +195,10 @@ class TestSetLegion:
         conn.close()
         assert persona_id == personas.persona_id_for_slug("custodes")
 
-    def test_set_legion_civic_clears_canonical_persona_tint(self, client, app_env, monkeypatch):
+    def test_set_legion_civic_keeps_canonical_persona_tint(self, client, app_env, monkeypatch):
+        """Civic has no special tint system: setting legion=civic no longer
+        force-clears the canonical persona. The pane keeps normal chapter/persona
+        tint (only a genuinely null persona resolves to default)."""
         tint_calls = []
 
         async def _pane(_instance_id):
@@ -208,17 +211,44 @@ class TestSetLegion:
             lambda pane, pane_tint, **kw: tint_calls.append((pane, pane_tint)),
         )
 
-        iid = _insert_instance()
-        resp = client.patch(f"/api/instances/{iid}/legion", json={"legion": "civic"})
-        assert resp.status_code == 200
-        assert ("%pax", "default") in tint_calls
+        # Register a pane the normal way so it draws a canonical chapter persona.
+        sid = str(uuid.uuid4())
+        resp = client.post(
+            "/api/hooks/SessionStart",
+            json={
+                "session_id": sid,
+                "cwd": "/Volumes/Imperium/Imperium-ENV",
+                "env": {},
+                "pid": 99999,
+                "tmux_pane": "%pax",
+            },
+        )
+        assert resp.status_code == 200, resp.text
 
         conn = sqlite3.connect(app_env.db_path)
-        persona_id = conn.execute(
-            "SELECT persona_id FROM instances WHERE id = ?", (iid,)
+        pre_pid = conn.execute("SELECT persona_id FROM instances WHERE id = ?", (sid,)).fetchone()[
+            0
+        ]
+        assert pre_pid is not None, "registration should assign a canonical chapter persona"
+        pre_tint = conn.execute(
+            "SELECT pane_tint FROM personas WHERE id = ?", (pre_pid,)
         ).fetchone()[0]
         conn.close()
-        assert persona_id is None
+        assert pre_tint and pre_tint != "default"
+
+        tint_calls.clear()
+        resp = client.patch(f"/api/instances/{sid}/legion", json={"legion": "civic"})
+        assert resp.status_code == 200
+        # Civic keeps the canonical chapter tint — never force-cleared to default.
+        assert ("%pax", pre_tint) in tint_calls
+        assert ("%pax", "default") not in tint_calls
+
+        conn = sqlite3.connect(app_env.db_path)
+        post_pid = conn.execute("SELECT persona_id FROM instances WHERE id = ?", (sid,)).fetchone()[
+            0
+        ]
+        conn.close()
+        assert post_pid == pre_pid
 
     def test_set_legion_invalid(self, client):
         iid = _insert_instance()
@@ -390,7 +420,10 @@ class TestCivicAutoDetect:
         assert row is not None
         assert row["legion"] == "civic"
 
-    def test_civic_pax_tint_resolves_default_not_green(self, client, monkeypatch):
+    def test_civic_pax_uses_normal_chapter_persona_tint(self, client, monkeypatch):
+        """Civic/Pax panes use normal chapter/persona tint — no special civic tint
+        system, no force-cleared default, and never the retired civic-green
+        (#083010). Legion is still classified as civic for routing."""
         import shared
 
         tint_calls = []
@@ -412,7 +445,10 @@ class TestCivicAutoDetect:
             },
         )
         assert resp.status_code == 200, resp.text
-        assert ("%pax", "default") in tint_calls
+        # Normal chapter persona tint, like any other pane.
+        assert ("%pax", "#300808") in tint_calls
+        # No longer force-cleared to default, and never the old civic-green.
+        assert ("%pax", "default") not in tint_calls
         assert ("%pax", "#083010") not in tint_calls
 
     def test_civic_autodetect_pax_path(self, client):

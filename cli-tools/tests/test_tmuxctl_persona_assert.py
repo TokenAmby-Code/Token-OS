@@ -311,3 +311,40 @@ def test_clear_pane_overlay_preserves_static_persona_guard():
 
     assert adapter.options[PERSONA_GUARD_OPTION] == "{}"
     assert "@PANE_LABEL" not in adapter.options
+
+
+def test_assert_persona_color_paints_through_voice_lock_and_keeps_signifier():
+    """A voice lock is a non-tint signifier. Persona tint still paints while
+    @DISCORD_VOICE_LOCK=1 (the lock never changes/suppresses pane bg), and the
+    assertion never clears the lock option — stale locks stay stale until the
+    voice path itself releases them."""
+
+    class _Adapter:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+            self.options: dict[str, str] = {"@DISCORD_VOICE_LOCK": "1"}
+
+        def run(self, *args, allow_failure: bool = False) -> str:
+            self.calls.append(args)
+            if args and args[0] == "display-message":
+                return "%27"
+            if args and args[0] == "show-options" and "@DISCORD_VOICE_LOCK" in args:
+                return self.options.get("@DISCORD_VOICE_LOCK", "")
+            if args and args[0] == "set-option":
+                if "-pu" in args:
+                    self.options.pop(args[-1], None)
+                else:
+                    self.options[args[-2]] = args[-1]
+            return ""
+
+        def show_pane_option(self, pane_id: str, option: str) -> str:
+            return self.options.get(option, "")
+
+    adapter = _Adapter()
+    assertions._assert_persona_color(adapter, "%27", _custodes_spec())
+
+    # Persona tint paints despite the active voice lock.
+    assert ("select-pane", "-t", "%27", "-P", "bg=#302800") in adapter.calls
+    # The lock signifier is left untouched by the tint assertion.
+    assert adapter.options["@DISCORD_VOICE_LOCK"] == "1"
+    assert not any(a and a[0] == "set-option" and "@DISCORD_VOICE_LOCK" in a for a in adapter.calls)

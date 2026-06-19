@@ -89,7 +89,7 @@ test('unavailable persona static target fails instead of falling back to locked 
   assert.deepEqual(result, { routed: false, reason: 'no_target' });
 });
 
-test('Imperial Guard clear restores Cadia overlay ownership for its own draft', async () => {
+test('Imperial Guard lock sets @DISCORD_VOICE_LOCK signifier and never touches pane bg or title', async () => {
   const ops = [];
   const router = createVoiceTranscriptRouter({
     logger: { warn() {}, info() {} },
@@ -113,42 +113,56 @@ test('Imperial Guard clear restores Cadia overlay ownership for its own draft', 
   const cleared = await router.clear({ bot: 'imperial_guard' });
   assert.equal(cleared.length, 1);
 
+  // The sole signifier is the @DISCORD_VOICE_LOCK pane option: set on lock-birth,
+  // cleared only on release. No pane-background tint, no title rewrite.
   assert.deepEqual(ops, [
-    ['title', '%42', 'IG🔒 old-title'],
     ['option', '%42', '@DISCORD_VOICE_LOCK', '1'],
-    ['style', '%42', 'bg=#2b1645'],
     ['type', '%42', 'hold this draft'],
-    ['title', '%42', 'old-title'],
-    ['style', '%42', 'bg=default'],
     ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
   ]);
+  assert.ok(!ops.some(op => op[0] === 'style'), 'voice lock must not mutate pane bg');
+  assert.ok(!ops.some(op => op[0] === 'title'), 'voice lock must not rewrite pane title');
 });
 
 
-test('Imperial Guard cleanup clears voice lock even if style restore fails', async () => {
+test('a held Cadia lock is never auto-cleaned or tinted — only explicit release clears it', async () => {
   const ops = [];
   const router = createVoiceTranscriptRouter({
     logger: { warn() {}, info() {} },
     resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue(_target, format) { return format === '#{pane_style}' ? 'bg=bad-old' : 'old-title'; },
-    async setPaneTitle() {},
-    async setPaneStyle(target, style) {
-      ops.push(['style', target, style]);
-      if (style === 'bg=bad-old') throw new Error('style restore failed');
-    },
+    displayValue(_target, format) { return format === '#{pane_style}' ? 'bg=default' : 'old-title'; },
+    async setPaneTitle(target, title) { ops.push(['title', target, title]); },
+    async setPaneStyle(target, style) { ops.push(['style', target, style]); },
     async setPaneOption(target, option, value) { ops.push(['option', target, option, value]); },
     async typeIntoTarget() {},
     lockedPaneTarget(result) { return result.lockedTmuxPane; },
   });
 
-  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft', lockedTmuxPane: '%42' });
-  const cleared = await router.clear({ bot: 'imperial_guard' });
+  // Lock is born, then more transcripts arrive — the signifier must not be
+  // re-toggled or independently reconciled while the draft is held.
+  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'first', lockedTmuxPane: '%42' });
+  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'second', lockedTmuxPane: '%42' });
+  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'third', lockedTmuxPane: '%42' });
+  assert.equal(router.listDrafts().length, 1);
 
-  assert.equal(cleared.length, 1);
-  assert.deepEqual(ops.slice(-2), [
-    ['style', '%42', 'bg=bad-old'],
-    ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
-  ]);
+  // Never any bg/title mutation — the lock is a pure non-tint signifier.
+  assert.ok(!ops.some(op => op[0] === 'style'), 'held lock must never mutate pane bg');
+  assert.ok(!ops.some(op => op[0] === 'title'), 'held lock must never rewrite pane title');
+  // Signifier set exactly once at lock-birth; never independently cleared.
+  assert.deepEqual(
+    ops.filter(op => op[0] === 'option' && op[2] === '@DISCORD_VOICE_LOCK'),
+    [['option', '%42', '@DISCORD_VOICE_LOCK', '1']],
+  );
+
+  // Cleanup happens ONLY through the release path.
+  await router.clear({ bot: 'imperial_guard' });
+  assert.deepEqual(
+    ops.filter(op => op[0] === 'option' && op[2] === '@DISCORD_VOICE_LOCK'),
+    [
+      ['option', '%42', '@DISCORD_VOICE_LOCK', '1'],
+      ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
+    ],
+  );
 });
 
 test('clearing a persona bot leaves Cadia drafts intact', async () => {
@@ -241,11 +255,10 @@ test('late transcript with stale epoch/channel is ignored and clears Cadia tint 
   assert.deepEqual(result, { routed: false, ignored: true, reason: 'stale_transcript', cleared: 1 });
   assert.equal(router.listDrafts().length, 0);
   assert.ok(warnings.some(msg => String(msg).includes('ignored stale transcript')));
-  assert.deepEqual(ops.slice(-3), [
-    ['title', '%42', 'old-title'],
-    ['style', '%42', 'bg=default'],
-    ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
-  ]);
+  // Releasing a stale draft clears the @DISCORD_VOICE_LOCK signifier and nothing else.
+  assert.deepEqual(ops.slice(-1), [['option', '%42', '@DISCORD_VOICE_LOCK', '0']]);
+  assert.ok(!ops.some(op => op[0] === 'style'), 'stale-epoch release must not mutate pane bg');
+  assert.ok(!ops.some(op => op[0] === 'title'), 'stale-epoch release must not rewrite pane title');
 });
 
 test('normalizes voice command text', () => {

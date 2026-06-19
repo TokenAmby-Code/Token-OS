@@ -50,3 +50,10 @@ def test_pane_select_bindings_do_not_use_timer_focus_override():
     assert pane_select_lines
     assert all("--seconds" not in line for line in pane_select_lines)
     assert all("allow-mechanicus-focus" not in line for line in pane_select_lines)
+
+
+def test_voice_lock_renders_in_pane_border():
+    """The Discord voice lock is surfaced as a visible, non-tint signifier in the
+    pane border, driven solely by @DISCORD_VOICE_LOCK (never pane background)."""
+    border = _line_starting("set -g pane-border-format")
+    assert "@DISCORD_VOICE_LOCK" in border

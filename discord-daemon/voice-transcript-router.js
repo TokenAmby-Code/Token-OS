@@ -30,17 +30,11 @@ export function defaultVoiceTargetForBot(botName) {
   return BOT_TARGETS[normalizeBot(botName)] || null;
 }
 
-const TITLE_PREFIX = {
-  imperial_guard: 'IG🔒',
-  mechanicus: 'MECH🔒',
-  custodes: 'CUST🔒',
-};
-
 // Cadia voice locks are active-pane locks, so the operator needs an unmistakable
-// visual target. This tint is owned only by the voice draft lock lifecycle: set
-// when the lock is born, cleared only after the lock is deleted. If a lock goes
-// stale, the tint intentionally stays stale with it.
-const CADIA_LOCK_STYLE = 'bg=#2b1645';
+// target. The lock's sole signifier is the @DISCORD_VOICE_LOCK pane option, rendered
+// in the tmux pane border — never pane background. It is owned only by the voice
+// draft lock lifecycle: set when the lock is born, cleared only after the lock is
+// deleted. If a lock goes stale, the signifier intentionally stays stale with it.
 const VOICE_LOCK_OPTION = '@DISCORD_VOICE_LOCK';
 const TMUX_RESOLVE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_RESOLVE_TIMEOUT_MS || 1500);
 const TMUX_WRITE_TIMEOUT_MS = Number(process.env.DISCORD_VOICE_TMUX_WRITE_TIMEOUT_MS || 8000);
@@ -226,42 +220,6 @@ function publicTargetForPane(pane) {
   }
 }
 
-function displayValue(target, format) {
-  const pane = resolveTargetToPane(target);
-  if (!pane) return '';
-  try {
-    return execFileSync('tmux', ['display-message', '-p', '-t', pane, format], {
-      encoding: 'utf8',
-      timeout: TMUX_RESOLVE_TIMEOUT_MS,
-      env: tmuxEnv(),
-    }).replace(/\n$/, '');
-  } catch {
-    return '';
-  }
-}
-
-async function setPaneTitle(target, title) {
-  const pane = resolveTargetToPane(target);
-  if (!pane) return;
-  try {
-    await execFileAsync('tmux', ['select-pane', '-t', pane, '-T', title || ''], {
-      timeout: TMUX_COMMAND_TIMEOUT_MS,
-      env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-title' }),
-    });
-  } catch {
-    // title restore is cosmetic
-  }
-}
-
-async function setPaneStyle(target, style) {
-  const pane = resolveTargetToPane(target);
-  if (!pane) throw new Error(`target not live: ${target}`);
-  await execFileAsync('tmux', ['select-pane', '-t', pane, '-P', style || 'bg=default'], {
-    timeout: TMUX_COMMAND_TIMEOUT_MS,
-    env: tmuxEnv({ IMPERIUM_TMUX_AUTOMATION: '1', TMUX_SEND_GATE_ALLOW: 'discord-voice-lock-style' }),
-  });
-}
-
 async function setPaneOption(target, option, value) {
   const pane = resolveTargetToPane(target);
   if (!pane) throw new Error(`target not live: ${target}`);
@@ -313,9 +271,6 @@ export function createVoiceTranscriptRouter({
   logger,
   voiceManager = null,
   resolveTargetToPane: resolvePane = resolveTargetToPane,
-  displayValue: readDisplayValue = displayValue,
-  setPaneTitle: writePaneTitle = setPaneTitle,
-  setPaneStyle: writePaneStyle = setPaneStyle,
   setPaneOption: writePaneOption = setPaneOption,
   typeIntoTarget: writeText = typeIntoTarget,
   sendKey: writeKey = sendKey,
@@ -334,35 +289,17 @@ export function createVoiceTranscriptRouter({
     };
   }
 
-  async function restoreTitle(state) {
-    if (state?.target && resolvePaneWithDiagnostics(state.target)) await writePaneTitle(state.target, state.title || '');
-  }
-
   async function applyStateLockOverlay(state) {
-    if (!state?.lockOverlay) return;
+    // The @DISCORD_VOICE_LOCK pane option is the sole lock signifier (rendered in
+    // the pane border). No pane-background tint is applied.
     await writePaneOption(state.target, VOICE_LOCK_OPTION, '1');
-    try {
-      await writePaneStyle(state.target, CADIA_LOCK_STYLE);
-    } catch (err) {
-      try {
-        await writePaneOption(state.target, VOICE_LOCK_OPTION, '0');
-      } catch {}
-      throw err;
-    }
   }
 
   async function restoreStateLockOverlay(state) {
-    if (!state?.lockOverlay) return;
-    try {
-      await writePaneStyle(state.target, state.paneStyle || 'bg=default');
-    } catch {
-      // Cosmetic restore is best-effort. Ownership must still be cleared so a
-      // failed style restore cannot leave stale Cadia draft ownership behind.
-    }
     try {
       await writePaneOption(state.target, VOICE_LOCK_OPTION, '0');
     } catch {
-      // Best effort.
+      // Best effort — releasing draft ownership must not depend on tmux liveness.
     }
   }
 
@@ -389,7 +326,6 @@ export function createVoiceTranscriptRouter({
     const state = drafts.get(key.value);
     if (!state) return null;
     drafts.delete(key.value);
-    await restoreTitle(state);
     await restoreStateLockOverlay(state);
     return summarizeDraft(key, state);
   }
@@ -503,15 +439,8 @@ export function createVoiceTranscriptRouter({
         logger?.warn?.(`Voice route [${key.bot}/${key.userId}]: no target pane for ${target || 'none'}`);
         return { routed: false, reason: 'no_target' };
       }
-      const oldTitle = readDisplayValue(target, '#{pane_title}');
-      const oldStyle = readDisplayValue(target, '#{pane_style}');
-      const prefix = TITLE_PREFIX[key.bot] || `${key.bot.toUpperCase().slice(0, 4)}🔒`;
-      if (!oldTitle.startsWith(prefix)) await writePaneTitle(target, `${prefix} ${oldTitle}`.trim());
       state = {
         target,
-        title: oldTitle,
-        paneStyle: oldStyle,
-        lockOverlay: key.bot === 'imperial_guard',
         createdAt: new Date().toISOString(),
         utterances: 0,
       };
@@ -520,7 +449,6 @@ export function createVoiceTranscriptRouter({
         await applyStateLockOverlay(state);
       } catch (err) {
         drafts.delete(key.value);
-        await restoreTitle(state);
         await restoreStateLockOverlay(state);
         throw err;
       }
@@ -536,7 +464,6 @@ export function createVoiceTranscriptRouter({
     } catch (err) {
       if ((state.utterances || 0) === 0) {
         drafts.delete(key.value);
-        await restoreTitle(state);
         await restoreStateLockOverlay(state);
       }
       throw err;

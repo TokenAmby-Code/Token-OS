@@ -401,16 +401,9 @@ def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec)
     current = adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
     if current != pane_id:
         return
-    voice_locked = adapter.run(
-        "show-options",
-        "-pqv",
-        "-t",
-        pane_id,
-        "@DISCORD_VOICE_LOCK",
-        allow_failure=True,
-    ).strip()
-    if voice_locked == "1":
-        return
+    # Persona tint is decoupled from the Discord voice lock: that lock is a non-tint
+    # signifier (a pane option), so persona colour is asserted regardless of lock
+    # state and the lock signifier is never cleared here.
     if spec.persona == "custodes":
         adapter.run("select-pane", "-t", pane_id, "-P", "bg=#302800", allow_failure=True)
     elif spec.persona == "fabricator-general":

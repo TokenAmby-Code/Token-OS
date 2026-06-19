@@ -77,7 +77,6 @@ from instance_mutation import (
     get_instance_mutations,
     reconcile_instance,
     sanctioned_insert_instance,
-    sanctioned_update_canonical_instance,
     sanctioned_update_instance,
 )
 from instance_registry import derived_cockpit_label
@@ -256,10 +255,8 @@ import traceback
 # Machine identity from centralized config
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
 from imperium_config import cfg
-from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
 from tmuxctl.skill_invoke import looks_like_codex_skill_invocation as _looks_like_codex_skill
 from tmuxctl.skill_invoke import skill_invocation_text as _tmuxctl_skill_invocation_text
-from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
 ASSERT_PERSONA_PANE_LABELS = {
@@ -271,27 +268,6 @@ ASSERT_PERSONA_PANE_LABELS = {
 
 def _is_assert_persona_label(value: str | None) -> bool:
     return (value or "") in ASSERT_PERSONA_PANE_LABELS
-
-
-def _run_tmux_focus_preserved(
-    args: tuple[str, ...] | list[str],
-    *,
-    source: str,
-    attempted_target: str = "",
-    allow_failure: bool = True,
-) -> str:
-    """Run a tmux operation from Token-API without leaving the client focused elsewhere."""
-    argv = tuple(args)
-    if not argv:
-        return ""
-    tmux_args = argv[1:] if Path(argv[0]).name == "tmux" else argv
-    adapter = _TmuxCtlAdapter()
-    with _tmuxctl_preserve_focus(
-        adapter,
-        source=source,
-        attempted_target=attempted_target,
-    ):
-        return adapter.run(*tmux_args, allow_failure=allow_failure)
 
 
 def spawn_tmux_assert_instance(
@@ -9417,15 +9393,6 @@ async def set_instance_legion(instance_id: str, request: Request):
             write_source="api",
             actor="set-legion",
         )
-        if legion == "civic":
-            await sanctioned_update_canonical_instance(
-                db,
-                instance_id=instance_id,
-                updates={"persona_id": None},
-                mutation_type="persona_unassigned",
-                write_source="api",
-                actor="set-legion",
-            )
         await db.commit()
 
     # Event-driven tint: resolve live pane through tmuxctl and paint from
@@ -20511,11 +20478,6 @@ _aspirant_thread_gates: dict[str, int] = {}
 _aspirant_gated_queue: dict[str, list[tuple[str, str]]] = {}  # thread_id -> [(message, bot)]
 
 
-_VOICE_DRAFT_TITLE_PREFIX = {
-    "imperial_guard": "IG🔒",
-    "mechanicus": "MECH🔒",
-    "custodes": "CUST🔒",
-}
 _discord_voice_drafts: dict[tuple[str, str], dict] = {}
 
 
@@ -20535,7 +20497,7 @@ async def _clear_discord_voice_draft(key: tuple[str, str]) -> dict | None:
     state = _discord_voice_drafts.pop(key, None)
     if not state:
         return None
-    await _discord_voice_restore_title(state)
+    await _discord_voice_clear_lock(state)
     return _discord_voice_draft_summary(key, state)
 
 
@@ -20607,47 +20569,34 @@ async def _discord_voice_mute_member(bot: str, author_id: str) -> bool:
         return False
 
 
-async def _tmux_display_value(pane: str, fmt: str) -> str | None:
-    proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        "display-message",
-        "-p",
-        "-t",
-        pane,
-        fmt,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-    if proc.returncode != 0:
-        return None
-    return stdout.decode(errors="replace").rstrip("\n")
+async def _discord_voice_set_lock(pane: str, value: str) -> None:
+    """Set the @DISCORD_VOICE_LOCK pane option — the sole, non-tint voice-lock
+    signifier (rendered in the tmux pane border). Best-effort: authoritative lock
+    state lives in _discord_voice_drafts, so a failed option write must not break
+    drafting or leave the draft half-created."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            "@DISCORD_VOICE_LOCK",
+            value,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=5)
+    except Exception as e:
+        logger.warning(f"Voice draft: failed setting @DISCORD_VOICE_LOCK={value} for {pane}: {e}")
 
 
-async def _tmux_set_pane_title(pane: str, title: str) -> None:
-    await asyncio.to_thread(
-        _run_tmux_focus_preserved,
-        ("tmux", "select-pane", "-t", pane, "-T", title),
-        source="token-api pane-title",
-        attempted_target=pane,
-    )
-
-
-async def _discord_voice_restore_title(state: dict) -> None:
+async def _discord_voice_clear_lock(state: dict) -> None:
+    """Clear the voice-lock signifier. Only ever called from the draft release
+    path, so a stale (unreleased) lock keeps its signifier."""
     pane = state.get("pane")
     if pane and await _tmux_pane_exists(pane):
-        try:
-            await _tmux_set_pane_title(pane, state.get("title") or "")
-        except Exception as e:
-            logger.warning(f"Voice draft: failed restoring pane title for {pane}: {e}")
-
-
-async def _discord_voice_mark_title(bot: str, pane: str) -> str:
-    old_title = await _tmux_display_value(pane, "#{pane_title}") or ""
-    prefix = _VOICE_DRAFT_TITLE_PREFIX.get(bot, f"{bot.upper()[:4]}🔒")
-    if not old_title.startswith(prefix):
-        await _tmux_set_pane_title(pane, f"{prefix} {old_title}".strip())
-    return old_title
+        await _discord_voice_set_lock(pane, "0")
 
 
 async def _discord_voice_type(pane: str, text: str) -> bool:
@@ -20803,7 +20752,7 @@ async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
             if await _discord_voice_type(state["pane"], segment):
                 state["utterances"] = int(state.get("utterances") or 0) + 1
         ok = await _discord_voice_send_key(state["pane"], "Enter")
-        await _discord_voice_restore_title(state)
+        await _discord_voice_clear_lock(state)
         _discord_voice_drafts.pop(key, None)
         return {
             "received": True,
@@ -20827,7 +20776,7 @@ async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
                 "reason": "no_draft",
             }
         ok = await _discord_voice_send_key(state["pane"], "C-c")
-        await _discord_voice_restore_title(state)
+        await _discord_voice_clear_lock(state)
         _discord_voice_drafts.pop(key, None)
         return {
             "received": True,
@@ -20840,7 +20789,7 @@ async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
 
     if command == "clear":
         if state:
-            await _discord_voice_restore_title(state)
+            await _discord_voice_clear_lock(state)
             _discord_voice_drafts.pop(key, None)
             logger.info(f"Voice draft [{bot}/{author_id}]: lock cleared by command")
             return {
@@ -20931,8 +20880,8 @@ async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
                 "reason": "typing_guard",
                 "pane": pane,
             }
-        title = await _discord_voice_mark_title(bot, pane)
-        state = {"pane": pane, "title": title, "created_at": datetime.now().isoformat()}
+        await _discord_voice_set_lock(pane, "1")
+        state = {"pane": pane, "created_at": datetime.now().isoformat()}
         _discord_voice_drafts[key] = state
         logger.info(f"Voice draft [{bot}/{author_id}]: locked {pane}")
 
@@ -20948,7 +20897,7 @@ async def _handle_discord_voice_draft(request: DiscordMessageRequest) -> dict:
         )
         logger.warning(f"{failure_msg} pane={state['pane']}")
         if not state.get("utterances"):
-            await _discord_voice_restore_title(state)
+            await _discord_voice_clear_lock(state)
             _discord_voice_drafts.pop(key, None)
         await _discord_voice_error_message(bot, failure_msg)
         return {
