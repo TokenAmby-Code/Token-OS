@@ -311,6 +311,47 @@ def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
     assert dispatched is None, "a send to an unrelated pane must not be gated by typing in %active"
 
 
+def test_pending_input_skips_tui_chrome_below_the_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#284 regression pin: a paused Claude/Codex draft sits ABOVE the TUI chrome.
+
+    The post-#284 detector took the literal last non-empty line — the
+    ``⏵⏵ bypass permissions`` hint / context footer — so a held draft read as
+    *clear* once the client-activity window expired and enforcement leaked into
+    the Emperor's half-typed prompt. The detector must skip the chrome and
+    evaluate the real prompt line above it.
+    """
+    drafting = (
+        "> tell me about the thing I am drafting\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
+    cleared = (
+        "❯ /clear\n"
+        "❯ \n"
+        "─" * 60 + "\n"
+        "  ... 0/200k $0.00\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+
+    def _capture(text: str):
+        def _fake_run(cmd, *args, **kwargs):
+            proc = _FakeCompleted()
+            if "capture-pane" in cmd:
+                proc.stdout = text
+                return proc
+            proc.returncode = 1
+            return proc
+
+        return _fake_run
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _capture(drafting))
+    assert send_gate._pane_has_pending_input("%active") is True
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _capture(cleared))
+    assert send_gate._pane_has_pending_input("%active") is False
+
+
 def test_unattended_worker_pane_with_prompt_text_is_deliverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
