@@ -10074,6 +10074,158 @@ async def get_synced_session(legion: str):
         }
 
 
+def _same_worktree_path(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        return Path(left).expanduser().resolve(strict=False) == Path(right).expanduser().resolve(
+            strict=False
+        )
+    except Exception:
+        return str(left).rstrip("/") == str(right).rstrip("/")
+
+
+def _is_live_instance_status(status: str | None) -> bool:
+    return (status or "").lower() not in {"", "stopped", "archived"}
+
+
+async def _build_victory_cascade_plan(
+    *,
+    doc_id: int,
+    doc_path: Path | None,
+    linked_rows: list[aiosqlite.Row],
+    server_cwd: str | None = None,
+) -> dict:
+    """Build the victorious→archived cleanup plan without mutating anything."""
+    server_cwd = server_cwd or os.getcwd()
+    fm_worktrees: list[dict] = []
+    if doc_path and doc_path.exists():
+        async with _worktree_registry_lock:
+            fm, _body = await asyncio.to_thread(read_frontmatter, doc_path)
+            raw_worktrees = fm.get("worktrees") or []
+            if isinstance(raw_worktrees, list):
+                fm_worktrees = [wt for wt in raw_worktrees if isinstance(wt, dict)]
+
+    linked_instances: list[dict] = []
+    for row in linked_rows:
+        linked_instances.append(
+            {
+                "id": row["id"],
+                "tab_name": row["tab_name"],
+                "status": row["status"],
+                "working_dir": row["working_dir"],
+                "pr_state": row["pr_state"],
+            }
+        )
+
+    live_instances = [
+        inst for inst in linked_instances if _is_live_instance_status(inst.get("status"))
+    ]
+    actions: list[dict] = []
+    skipped: list[dict] = []
+    warnings: list[str] = []
+
+    for wt in fm_worktrees:
+        path = wt.get("path")
+        branch = wt.get("branch")
+        port = wt.get("port")
+        if not branch:
+            skipped.append({"reason": "missing_branch", "worktree": wt})
+            continue
+
+        matching_instances = [
+            inst for inst in linked_instances if _same_worktree_path(inst.get("working_dir"), path)
+        ]
+        open_pr_instances = [inst for inst in matching_instances if inst.get("pr_state") == "open"]
+        if open_pr_instances:
+            msg = f"linked instance has open PR; skipping branch {branch}: " + ", ".join(
+                inst["id"] for inst in open_pr_instances
+            )
+            warnings.append(msg)
+            skipped.append(
+                {
+                    "reason": "open_pr",
+                    "worktree": wt,
+                    "instances": open_pr_instances,
+                    "warning": msg,
+                }
+            )
+            continue
+
+        if _same_worktree_path(path, server_cwd):
+            skipped.append({"reason": "self_guard", "worktree": wt, "server_cwd": server_cwd})
+            continue
+
+        action = {
+            "path": path,
+            "branch": branch,
+            "port": port,
+            "status": wt.get("status"),
+            "instances": matching_instances,
+            "commands": [],
+        }
+        if path:
+            action["commands"].append(
+                [str(SCRIPTS_DIR / "cli-tools" / "bin" / "dev-server-stop"), str(path)]
+            )
+        action["commands"].append(
+            [
+                str(SCRIPTS_DIR / "cli-tools" / "bin" / "worktree-delete"),
+                str(branch),
+                "-b",
+                "-f",
+                "--delete-remote",
+            ]
+        )
+        actions.append(action)
+
+    return {
+        "doc_id": doc_id,
+        "doc_path": str(doc_path) if doc_path else None,
+        "worktrees": fm_worktrees,
+        "linked_instances": linked_instances,
+        "live_instances": live_instances,
+        "actions": actions,
+        "skipped": skipped,
+        "warnings": warnings,
+        "server_cwd": server_cwd,
+    }
+
+
+async def _execute_victory_cascade_plan(plan: dict) -> list[dict]:
+    """Run the cleanup commands in the exact plan order."""
+    executed: list[dict] = []
+    for action in plan.get("actions", []):
+        for command in action.get("commands", []):
+            proc = await _run_subprocess_offloop(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+            record = {
+                "command": command,
+                "returncode": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "branch": action.get("branch"),
+                "path": action.get("path"),
+                "port": action.get("port"),
+            }
+            executed.append(record)
+            if proc.returncode != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "cascade_cleanup_failed",
+                        "failed": record,
+                        "executed": executed,
+                    },
+                )
+    return executed
+
+
 @app.get("/api/instances/{instance_id}/zealotry")
 async def get_zealotry(instance_id: str):
     """Get zealotry level and timer status for an instance."""
@@ -10106,6 +10258,8 @@ async def _victory_ack_core(
     *,
     force: bool = False,
     source: str = "victory-ack",
+    cascade: bool = False,
+    dry_run: bool | None = None,
 ) -> dict:
     """Shared core for the victory-ack flow.
 
@@ -10113,7 +10267,13 @@ async def _victory_ack_core(
     Action: stamp acknowledged_at + reason; archive the doc; cancel GT timers
     on all linked instances; downgrade those instances to one_off. Returns a
     summary dict; raises HTTPException(409) when precondition fails.
+
+    When cascade=True, dry_run defaults to True: the API returns the full
+    cleanup action plan and performs no mutation unless dry_run is explicitly
+    false.
     """
+    if dry_run is None:
+        dry_run = bool(cascade)
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -10190,6 +10350,38 @@ async def _victory_ack_core(
                     },
                 )
 
+        cursor = await db.execute(
+            """SELECT id, name AS tab_name, status, working_dir, pr_state
+               FROM instances WHERE session_doc_id = ?""",
+            (doc_id,),
+        )
+        linked_rows = await cursor.fetchall()
+
+        cascade_plan: dict | None = None
+        cascade_executed: list[dict] = []
+        if cascade:
+            cascade_plan = await _build_victory_cascade_plan(
+                doc_id=doc_id,
+                doc_path=doc_path,
+                linked_rows=linked_rows,
+            )
+            if already_archived:
+                cascade_plan["skipped"].extend(
+                    {"reason": "already_archived", "worktree": action}
+                    for action in cascade_plan.get("actions", [])
+                )
+                cascade_plan["actions"] = []
+            if dry_run:
+                return {
+                    "doc_id": doc_id,
+                    "victory": True,
+                    "archived": False,
+                    "dry_run": True,
+                    "cascade": cascade_plan,
+                    "force": force,
+                }
+            cascade_executed = await _execute_victory_cascade_plan(cascade_plan)
+
         # Stamp rubric ack on the session-doc frontmatter (modern path) and
         # mirror the archive status onto the file. Without the status write the
         # file frontmatter keeps `status: active` while the DB row below flips to
@@ -10212,11 +10404,6 @@ async def _victory_ack_core(
             )
 
         # Resolve all instances linked to this doc; downgrade and cancel timers.
-        cursor = await db.execute(
-            "SELECT id, name AS tab_name FROM instances WHERE session_doc_id = ?",
-            (doc_id,),
-        )
-        linked_rows = await cursor.fetchall()
         linked_instance_ids: list[str] = []
         instance_surfaces: list[str] = []
         for linked in linked_rows:
@@ -10282,6 +10469,10 @@ async def _victory_ack_core(
             "force": force,
             "source": source,
             "rubric_complete": (rubric_status.complete if rubric_status else None),
+            "cascade": bool(cascade),
+            "cascade_dry_run": bool(dry_run) if cascade else None,
+            "cascade_plan": cascade_plan,
+            "cascade_executed": cascade_executed,
         },
     )
     logger.info(
@@ -10296,6 +10487,9 @@ async def _victory_ack_core(
         "linked_instance_ids": linked_instance_ids,
         "timers_cancelled": timers_cancelled,
         "force": force,
+        "dry_run": False,
+        "cascade": cascade_plan,
+        "cascade_executed": cascade_executed,
     }
 
 
@@ -10433,7 +10627,19 @@ async def victory_ack_session_doc(doc_id: int, request: Request):
     reason = body.get("reason") or "victory"
     deliverables = body.get("deliverables", []) or []
     force = bool(body.get("force"))
-    return await _victory_ack_core(doc_id, reason, deliverables, force=force, source="victory-ack")
+    cascade = bool(body.get("cascade"))
+    dry_run = body.get("dry_run")
+    if dry_run is not None:
+        dry_run = bool(dry_run)
+    return await _victory_ack_core(
+        doc_id,
+        reason,
+        deliverables,
+        force=force,
+        source="victory-ack",
+        cascade=cascade,
+        dry_run=dry_run,
+    )
 
 
 @app.post("/api/instances/{instance_id}/victory")
