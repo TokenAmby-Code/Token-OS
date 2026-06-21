@@ -124,6 +124,7 @@ WORK_DIR="$(pwd)"
 WORK_DIR_EXPLICIT=false
 TITLE=""
 OBJECTIVE=""
+OBJECTIVE_EXPLICIT=false
 VICTORY_CONDITIONS=()
 ASPIRANT_SOURCE="dispatch"
 SESSION_DOC=""
@@ -189,7 +190,7 @@ while [[ $# -gt 0 ]]; do
     --primarch) err "--primarch is deprecated; use --persona"; exit 64 ;;
     --dir|-C) WORK_DIR="${2:-}"; WORK_DIR_EXPLICIT=true; shift 2 ;;
     --title) TITLE="${2:-}"; shift 2 ;;
-    --objective) OBJECTIVE="${2:-}"; shift 2 ;;
+    --objective) OBJECTIVE="${2:-}"; OBJECTIVE_EXPLICIT=true; shift 2 ;;
     --victory-condition|--victory-conditions) VICTORY_CONDITIONS+=("${2:-}"); shift 2 ;;
     --source) ASPIRANT_SOURCE="${2:-}"; shift 2 ;;
     --session-doc) SESSION_DOC="${2:-}"; shift 2 ;;
@@ -1021,6 +1022,18 @@ if [[ -z "$TITLE" && -n "$OBJECTIVE" ]]; then
   TITLE="$(printf '%s' "$OBJECTIVE" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-80)"
 fi
 [[ -z "$TITLE" ]] && TITLE="Dispatch aspirant"
+
+# --objective is aspirant-only metadata: for the aspirant pipeline it becomes the
+# note's goal and (via prompt-fallback) the brief. A DIRECT launch, by contrast,
+# delivers its task through --prompt/--prompt-file or --session-doc; --objective
+# carries nowhere. So a direct launch given --objective but neither a prompt nor a
+# session doc boots the agent idle with no instructions — the exact trap that left
+# the 2026-06-20 canary briefless. Warn (don't hard-fail, to avoid breaking any
+# existing caller) so the operator knows to attach a real brief.
+if ! $ASPIRANT && $OBJECTIVE_EXPLICIT && [[ -z "$RESUME_ID" && -z "$PROMPT" && -z "$SESSION_DOC" ]]; then
+  err "warning: --objective is aspirant-only metadata and does not brief a direct launch;"
+  err "         the agent will boot idle. Pass --prompt/--prompt-file or --session-doc to deliver the task."
+fi
 
 if [[ -n "$SYSTEM_PROMPT" && "$ENGINE" == "codex" ]]; then
   err "--system-prompt/--system-prompt-file are not supported for --engine codex"
@@ -2021,7 +2034,18 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   # Automated dispatch should not steal the operator's camera/focus. The new pane
   # is still addressable by @PANE_ID/Token-API metadata and can be focused explicitly.
   pane_id="$(IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --no-focus --command "clear")"
-  pane_id="$(printf '%s\n' "$pane_id" | grep -Eo '%[0-9]+' | tail -n1 || true)"
+  # The tmuxctl canonical-id campaign made `stack dispatch` print the public
+  # page:index id (e.g. mechanicus:2) instead of the legacy raw %NNN. Resolve
+  # whatever it emits down to a physical %NNN through the same helper the
+  # --target flow uses: it maps a canonical id via `resolve-pane --format
+  # physical` and falls back to its input for a raw %NNN (older tmuxctl) — so it
+  # is correct whichever form tmuxctl emits.
+  pane_id="$(printf '%s\n' "$pane_id" | tail -n1)"
+  # `|| true`: resolve_dispatch_physical_target returns non-zero on empty input
+  # (tmuxctl emitted nothing / failed). Swallow it so `set -e` does not abort the
+  # assignment here — the explicit non-pane-id validation just below produces the
+  # clear operator-facing error instead.
+  pane_id="$(resolve_dispatch_physical_target "$pane_id" || true)"
   # FINAL_COMMAND was built (above) before this pane existed, so it baked the
   # allocation token (e.g. mechanicus:new) into TMUX_PANE and
   # TOKEN_API_DISPATCH_RESOLVED_PANE. Now that the concrete pane is known, rebuild
