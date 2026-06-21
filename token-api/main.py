@@ -13418,7 +13418,10 @@ async def enter_morning_session_internal(
     await _write_morning_audit_state(source, today, local_now)
     await timer_save_to_db()
     if TimerEvent.DAILY_RESET in result.events and result.reset_date and result.reset_date != today:
-        await generate_daily_timer_analytics(result.reset_date)
+        try:
+            await generate_daily_timer_analytics(result.reset_date)
+        except Exception as exc:
+            logger.exception("Morning prior-day timer analytics flush failed: %s", exc)
     try:
         await _wipe_prior_day_timer_events(today)
     except Exception as e:

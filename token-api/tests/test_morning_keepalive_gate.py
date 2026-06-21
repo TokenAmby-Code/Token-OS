@@ -24,6 +24,8 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 # ── Helpers ──────────────────────────────────────────────────
 
 
@@ -364,7 +366,9 @@ def test_morning_entry_resets_metrics_logs_and_injects(app_env, monkeypatch):
     assert injected == ["pytest"]
 
 
-def test_morning_entry_flushes_prior_reset_date_before_current_day_shift(app_env, monkeypatch):
+def test_morning_entry_flushes_prior_reset_date_before_current_day_shift(
+    app_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     main = app_env.main
     today = datetime.now(main.ZoneInfo(main.MORNING_SESSION_TIMEZONE)).date().isoformat()
     prior_date = "2000-01-01" if today != "2000-01-01" else "1999-12-31"
@@ -390,7 +394,9 @@ def test_morning_entry_flushes_prior_reset_date_before_current_day_shift(app_env
     assert shift_triggers[-1] == "morning_session_start"
 
 
-def test_morning_entry_does_not_flush_when_reset_date_is_today(app_env, monkeypatch):
+def test_morning_entry_does_not_flush_when_reset_date_is_today(
+    app_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     main = app_env.main
     calls = []
 
