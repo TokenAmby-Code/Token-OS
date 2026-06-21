@@ -58,8 +58,22 @@ def _stub_env(
     bare = tmp_path / "token-os.git"
     bare.mkdir(exist_ok=True)
 
-    # Simple logging stubs (log "<name> <args>", exit 0).
-    for name in ["launchctl", "sleep", "ssh", "osascript", "uv", "pgrep", "push-mobile"]:
+    # Simple logging stubs (log "<name> <args>", exit 0). tmux/tmuxctl/tx are
+    # stubbed too so that if token-restart ever shelled out to the session-
+    # destructive `tx restart`/`tmuxctl restart`, it would show in the call log —
+    # see test_deploy_never_wipes_the_tmux_fleet.
+    for name in [
+        "launchctl",
+        "sleep",
+        "ssh",
+        "osascript",
+        "uv",
+        "pgrep",
+        "push-mobile",
+        "tmux",
+        "tmuxctl",
+        "tx",
+    ]:
         p = stub_bin / name
         p.write_text(f'#!/usr/bin/env bash\necho "{name} $*" >> "{logfile}"\nexit 0\n')
         p.chmod(0o755)
@@ -334,3 +348,55 @@ def test_cd_bare_repo_config_is_distinct_from_worktree_bare_repo(tmp_path: Path)
     assert proc.returncode == 0, proc.stderr
     assert f"bare skeleton {cd_bare}" in proc.stdout
     assert f"bare skeleton {worktree_bare}" not in proc.stdout
+
+
+# ── CD invariant: deploy reloads services, NEVER wipes the tmux fleet ────────
+
+# The session-destructive tmux rebuild (`tx restart` → `tmuxctl restart
+# --execute` → kill-session). token-restart is the CD reload path and must NEVER
+# emit any of these — a deploy reloads launchd services and exits; wiping the
+# live fleet is an operator-only `tx restart`, never an automatic consequence of
+# a merge. tmux/tmuxctl/tx are logging stubs (see _stub_env), so any such call
+# would land in the call log.
+_DESTRUCTIVE_TMUX = (
+    "tmuxctl restart",
+    "restart --execute",
+    "kill-session",
+    "tx restart",
+    "tx -r",
+    "__tmuxctl_restart",
+)
+
+
+def _assert_no_fleet_wipe(calls: str) -> None:
+    for bad in _DESTRUCTIVE_TMUX:
+        assert bad not in calls, (
+            f"deploy must never emit destructive tmux command {bad!r}:\n{calls}"
+        )
+    # token-restart should not shell to tmux/tmuxctl/tx at all.
+    for tool in ("tmux ", "tmuxctl ", "tx "):
+        assert tool not in calls, f"deploy unexpectedly invoked {tool!r}:\n{calls}"
+
+
+def test_mac_affecting_deploy_reloads_without_wiping_fleet(tmp_path: Path) -> None:
+    # A token-api change restarts the Mac service (kickstart -k) but must not
+    # touch the tmux fleet.
+    env, logfile = _stub_env(tmp_path, "token-api/main.py")
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr
+    calls = logfile.read_text()
+    assert KICK_TOKENAPI in calls  # it DID reload the service…
+    _assert_no_fleet_wipe(calls)  # …without wiping the fleet.
+
+
+def test_no_advance_full_restart_still_never_wipes_fleet(tmp_path: Path) -> None:
+    # The heaviest path: a no-advance sync falls back to a FULL restart of the
+    # standard set (token-api + discord). Even then — deploy everything, but
+    # never `tx restart`.
+    env, logfile = _stub_env(tmp_path, "discord-daemon/daemon.js", no_advance=True)
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr
+    calls = logfile.read_text()
+    assert KICK_TOKENAPI in calls
+    assert KICK_DISCORD in calls
+    _assert_no_fleet_wipe(calls)

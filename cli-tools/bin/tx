@@ -143,6 +143,32 @@ _tx_log_invocation() {
     } 2>/dev/null || true
 }
 
+# --- Agent / automation context detection -----------------------------------
+# True when `tx` is running inside an agent/automation harness (Claude Code,
+# Codex, the subagent CLI). The session-destructive `tx restart` is HUMAN-ONLY:
+# the TTY guard in cmd_restart stops non-TTY callers (cron/hooks/detached
+# children), but an agent's shell running inside a tmux pane HOLDS a TTY, so a
+# TTY check alone cannot tell a human from an agent — and agent-invoked
+# `tx restart` is exactly what wiped the live fleet. This is the HARD
+# enforcement behind the advisory action_validator "human-only" policy.
+#
+# Scope (Custodes scope-guard): ONLY the destructive `tx restart` consults this.
+# The graceful CD reload path (`token-restart --sync` — a separate binary that
+# kickstarts the launchd service and reloads the restart-state blob) is NEVER
+# gated here, so automated Mac deploys keep reloading. Likewise the non-
+# destructive `tx restart-pane`/`restart-page` and `tx start` (attach/create)
+# are not gated — only the full kill-and-rebuild.
+_tx_is_agent_context() {
+    [[ -n "${CLAUDECODE:-}" \
+        || -n "${CLAUDE_CODE_ENTRYPOINT:-}" \
+        || -n "${TOKEN_API_SUBAGENT:-}" \
+        || -n "${CODEX_PROFILE:-}" \
+        || -n "${CODEX_HEADLESS:-}" \
+        || -n "${CODEX_BRIDGE_ID:-}" \
+        || -n "${TOKEN_API_CODEX_BRIDGE_ID:-}" \
+        || -n "${TOKEN_API_CODEX_PROFILE:-}" ]]
+}
+
 # --- Workspace flag detection ---
 # Legacy workspace flags (now mapped to tx subcommands or removed).
 # If someone does `tx --focus`, route to the right subcommand.
@@ -412,6 +438,22 @@ cmd_restart_page() {
 
 cmd_restart() {
     local session="$SESSION_NAME"
+
+    # --- Agent/automation hard-block (human-only command) -------------------
+    # Refuse outright when an agent/automation harness is detected, BEFORE the
+    # TTY guard — an agent pane's shell has a TTY, so the TTY check below cannot
+    # catch it. This is the actual fix for the fleet wipes traced to agent-
+    # invoked `tx restart`. It is absolute: `--force`/`-y` does not bypass it,
+    # and it never touches the graceful `token-restart --sync` CD reload (a
+    # different binary that is intentionally always available to automation).
+    if _tx_is_agent_context; then
+        _tx_log_invocation "restart" "refused-agent-context" || true
+        log_error "tx restart wipes & rebuilds the whole '${session}' workspace (all panes/instances)."
+        log_error "Refusing: agent/automation context detected (CLAUDECODE/CODEX/TOKEN_API_SUBAGENT)."
+        log_error "tx restart is human-only — a human must run it from a clean shell; agents must never self-run it."
+        log_error "For a code deploy use 'token-restart --sync' (graceful reload, no fleet wipe)."
+        return 1
+    fi
 
     # --- Destructive-action guard -------------------------------------------
     # `tx restart` tears down and rebuilds the ENTIRE workspace — every pane and
