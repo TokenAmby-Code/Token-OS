@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -403,21 +404,63 @@ def _pane_attended(target: str) -> bool:
     return any(line.strip() for line in clients.stdout.splitlines())
 
 
-def _pane_input_line_has_text(line: str) -> bool:
-    stripped = line.rstrip()
+# Claude Code / Codex render UI chrome BELOW the prompt input line — a context
+# footer ("... 0/200k $0.00", "4% 38k/1.0M $0.19"), a "⏵⏵ bypass permissions…"
+# hint, an "esc again to edit previous" hint, or a horizontal divider. The unsent
+# draft lives on the prompt line ABOVE that chrome, so the detector must skip the
+# chrome and evaluate the real prompt line. Mirrors the proven heuristic in
+# cli-tools/lib/tmux-guard.sh (tmux_pane_has_input).
+_CHROME_FOOTER_RE = re.compile(r"^\s*(?:\.\.\.|[0-9]+%)\s+.*\$[0-9]")
+
+
+def _normalize_prompt_line(line: str) -> str:
+    # Claude Code renders a non-breaking space after the prompt marker.
+    return line.replace(" ", " ")
+
+
+def _is_chrome_line(line: str) -> bool:
+    """True if ``line`` is TUI chrome below the prompt, not the input line."""
+    normalized = _normalize_prompt_line(line)
+    stripped = normalized.strip()
     if not stripped:
+        return True
+    if stripped.startswith("⏵"):
+        return True
+    if stripped.startswith("esc again"):
+        return True
+    if all(ch in "─━-" for ch in stripped):
+        return True
+    return bool(_CHROME_FOOTER_RE.match(normalized))
+
+
+def _pane_input_line_has_text(line: str) -> bool:
+    """True iff the prompt/input line carries an unsent draft.
+
+    A bare prompt marker (``$``/``%``/``#``/``>``/``❯``) is clear; the same marker
+    followed by user text is pending input.
+    """
+    current = _normalize_prompt_line(line)
+    lead = current.lstrip(" \t\r\n│░▒▓▐▌")
+    if lead.startswith((">", "❯")):
+        # Claude/Codex prompt: marker with text after it is an unsent draft.
+        return bool(lead[1:].strip())
+    # Shell-ish fallback: trailing text after the last prompt marker blocks; a
+    # bare marker (or no marker at all) is clear.
+    marker_pos = max(current.rfind(marker) for marker in ("$", "%", "#", ">", "❯"))
+    if marker_pos < 0:
         return False
-    if stripped.lstrip(" │░▒▓") in {">", "❯"}:
-        return False
-    if stripped[-1:] in {"$", "%", "#", ">", "❯"}:
-        return False
-    if not any(marker in stripped for marker in ("$", "%", "#", ">", "❯")):
-        return False
-    return True
+    return bool(current[marker_pos + 1 :].strip())
 
 
 def _pane_has_pending_input(target: str) -> bool:
-    """Per-pane prompt-line guard. Fail-open on tmux errors."""
+    """Per-pane prompt-line guard. Fail-open on tmux errors.
+
+    Skips Claude/Codex TUI chrome below the prompt so the detector evaluates the
+    real input line rather than the footer. (#284 regressed this by taking the
+    literal last non-empty line: a paused TUI draft sat ABOVE the chrome, so the
+    guard read the footer, missed the draft, and let enforcement leak in once the
+    client-activity window expired.)
+    """
     try:
         proc = subprocess.run(
             [_real_tmux_binary(), "capture-pane", "-t", target, "-p"],
@@ -431,10 +474,11 @@ def _pane_has_pending_input(target: str) -> bool:
         return False
     if proc.returncode != 0:
         return False
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    if not lines:
-        return False
-    return _pane_input_line_has_text(lines[-1])
+    for line in reversed(proc.stdout.splitlines()):
+        if _is_chrome_line(line):
+            continue
+        return _pane_input_line_has_text(line)
+    return False
 
 
 def _target_pane_has_input(target: str) -> bool:
