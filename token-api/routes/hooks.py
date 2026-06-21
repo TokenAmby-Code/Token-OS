@@ -49,6 +49,7 @@ from questions_gate import trials_clear
 from routes.tts import dispatch_notify, play_sound, queue_tts
 from session_doc_helpers import (
     _update_doc_agents_list,
+    create_deferred_interactive_session_doc,
     read_frontmatter,
     resolve_session_doc_for_start,
     update_frontmatter,
@@ -3756,6 +3757,16 @@ async def handle_session_start(payload: dict) -> dict:
                     "dispatch_session_doc_path": dispatch_session_doc_path,
                 },
             )
+        elif session_doc_id is None and resolved_session_doc_policy == "interactive_deferred":
+            # Genuine interactive pane: no doc minted at SessionStart. Surface the
+            # deferral so a fleet of opened-but-un-named panes stays observable; the
+            # placeholder is minted lazily on the first prompt (handle_prompt_submit).
+            await log_event(
+                "session_doc_deferred",
+                instance_id=session_id,
+                device_id=device_id,
+                details={"launcher": launcher, "origin_type": origin_type},
+            )
         workflow_state = _derive_launch_workflow_state(
             dispatch_target=dispatch_target,
             engine=engine,
@@ -4021,7 +4032,9 @@ async def handle_session_end(payload: dict) -> dict:
                       tmux_pane,
                       (SELECT slug FROM personas WHERE id = instances.persona_id) AS legion,
                       workflow_state, pane_label, golden_throne, status, rank,
-                      engine, COALESCE(hook_driven, 0)
+                      engine, COALESCE(hook_driven, 0),
+                      origin_type, commander_type, dispatch_session_doc_path,
+                      COALESCE(automated, 0), persona_id
                FROM instances WHERE id = ?""",
             (session_id,),
         )
@@ -4060,6 +4073,11 @@ async def handle_session_end(payload: dict) -> dict:
                 and int(_hook_driven or 0) == 0
             )
         )
+        _origin_type = row[13]
+        _commander_type = row[14]
+        _dispatch_session_doc_path = row[15]
+        _automated = row[16]
+        _persona_id = row[17]
 
         # Layer 1 — non-terminal SessionEnd short-circuit (in-wrapper re-fire).
         # plan-accept / `/clear` / compaction fire SessionEnd→SessionStart inside
@@ -4150,8 +4168,36 @@ async def handle_session_end(payload: dict) -> dict:
             "next_required_action": None,
             "next_action_owner": None,
         }
+        # Never-acted interactive pane: a genuine top-level human pane that closed
+        # without ever sending a prompt. The first prompt is what BOTH flips the
+        # row to `working` AND lazily mints its doc, so "never acted" is precisely
+        # `status == 'idle'` (still in its registration status) AND
+        # `session_doc_id IS NULL`. A pane that ever worked is `working`/has a doc
+        # and is excluded. Leaving such a ghost `stopped` accumulates an empty
+        # orphan row; soft-archive instead (status='archived', rank='retired' —
+        # required by the db_schema CHECK) so it drops out of active counts / the
+        # ops cockpit with no doc and no pollution, while the append-only
+        # instance_mutations provenance log is preserved (vs a hard DELETE).
+        never_acted_interactive = (
+            session_doc_id is None
+            and _existing_status == "idle"
+            and _row_is_genuine_interactive(
+                origin_type=_origin_type,
+                commander_type=_commander_type,
+                persona_id=_persona_id,
+                is_subagent=is_subagent,
+                dispatch_session_doc_path=_dispatch_session_doc_path,
+                automated=_automated,
+                golden_throne=_gt_marker,
+            )
+        )
         if _existing_status != "archived":
-            session_end_updates["status"] = "stopped"
+            if never_acted_interactive:
+                session_end_updates["status"] = "archived"
+                session_end_updates["archived_at"] = now
+                session_end_updates["rank"] = "retired"
+            else:
+                session_end_updates["status"] = "stopped"
         # Legacy `synced=0` cleared the morning-session sync flag. Its durable home is the
         # golden_throne marker: clear it ONLY when it is the 'sync' sentinel — a real
         # golden_throne.id binding survives the session ending.
@@ -4169,6 +4215,18 @@ async def handle_session_end(payload: dict) -> dict:
         )
 
         await db.commit()
+
+        if never_acted_interactive:
+            await log_event(
+                "instance_never_acted_reaped",
+                instance_id=session_id,
+                device_id=row[1],
+                details={
+                    "reason": end_reason,
+                    "soft_archived": True,
+                    "source": "session_end",
+                },
+            )
 
         # Terminal SessionEnd is a harness-neutral chance to catch unnamed panes
         # before close-time assertions/cleanup can clear runtime pane stamps.
@@ -4472,6 +4530,36 @@ async def _transcript_indicates_plan_mode(payload: dict) -> bool:
     return await asyncio.to_thread(_transcript_indicates_plan_mode_sync, payload)
 
 
+def _row_is_genuine_interactive(
+    *,
+    origin_type,
+    commander_type,
+    persona_id,
+    is_subagent,
+    dispatch_session_doc_path,
+    automated,
+    golden_throne,
+) -> bool:
+    """True when an instance row is a genuine top-level interactive human session.
+
+    Mirrors the SessionStart precedence in ``resolve_session_doc_for_start``: not
+    a subagent, not cron/dispatch, no explicit dispatch doc, no persona/legion,
+    emperor-commanded, not automated, no golden-throne binding. Gates both the
+    deferred-doc lazy mint (first prompt) and the never-acted reap (SessionEnd),
+    so a dispatched worker whose doc legitimately resolved to NULL
+    (``unresolved_dispatch``) is never mistaken for an un-named human pane.
+    """
+    return (
+        (origin_type or "local") not in ("cron", "dispatch")
+        and (commander_type or "emperor") == "emperor"
+        and not persona_id
+        and not is_subagent
+        and not dispatch_session_doc_path
+        and not automated
+        and not golden_throne
+    )
+
+
 async def handle_prompt_submit(payload: dict) -> dict:
     """Handle UserPromptSubmit hook - mark instance as processing."""
     session_id = payload.get("session_id")
@@ -4558,21 +4646,51 @@ async def handle_prompt_submit(payload: dict) -> dict:
                 actor="PromptSubmit",
             )
 
+        # Deferred interactive session doc: the first real prompt is what proves
+        # the pane is a genuine working session, so mint the placeholder doc now
+        # (SessionStart left it deferred — resolve_session_doc_for_start returned
+        # "interactive_deferred"). Pragma-once via the `session_doc_id IS NULL`
+        # gate; a dispatched worker with a legitimately-NULL doc (unresolved_dispatch)
+        # is excluded by _row_is_genuine_interactive, so it never gets an
+        # interactive placeholder.
+        status_updates = {
+            "status": "working",
+            "last_activity": now,
+            "stopped_at": None,
+        }
+        minted_session_doc_id = None
+        if existing_dict.get("session_doc_id") is None and _row_is_genuine_interactive(
+            origin_type=existing_dict.get("origin_type"),
+            commander_type=existing_dict.get("commander_type"),
+            persona_id=existing_dict.get("persona_id"),
+            is_subagent=existing_dict.get("is_subagent"),
+            dispatch_session_doc_path=existing_dict.get("dispatch_session_doc_path"),
+            automated=existing_dict.get("automated"),
+            golden_throne=existing_dict.get("golden_throne"),
+        ):
+            minted_session_doc_id = await create_deferred_interactive_session_doc(db)
+            status_updates["session_doc_id"] = minted_session_doc_id
+
         # Also resurrect stopped instances - activity means they're active.
         # (pid died with legacy instance table; nothing to backfill.)
         await sanctioned_update_instance(
             db,
             instance_id=session_id,
-            updates={
-                "status": "working",
-                "last_activity": now,
-                "stopped_at": None,
-            },
+            updates=status_updates,
             mutation_type="status_changed",
             write_source="hooks",
             actor="PromptSubmit",
         )
         await db.commit()
+        if minted_session_doc_id is not None:
+            await log_event(
+                "session_doc_deferred_minted",
+                instance_id=session_id,
+                details={
+                    "session_doc_id": minted_session_doc_id,
+                    "trigger": "first_prompt",
+                },
+            )
 
     if planning_event:
         await log_event("planning_state_changed", instance_id=session_id, details=planning_event)
