@@ -255,7 +255,10 @@ def test_stack_dispatch_accepts_noisy_tmuxctl_pane_output(tmp_path: Path) -> Non
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
         "#!/usr/bin/env bash\n"
-        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "note: created pane"; echo "%88"; exit 0; fi\n'
+        # Noisy multi-line emit: `tail -n1` must pick the real canonical id off the
+        # last line, then dispatch materializes physical at the raw-tmux send.
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "note: created pane"; echo "mechanicus:5"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%88"; exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -288,5 +291,5 @@ def test_stack_dispatch_accepts_noisy_tmuxctl_pane_output(tmp_path: Path) -> Non
         cwd=str(ROOT),
     )
     assert res.returncode == 0, res.stderr
-    assert "non-pane id" not in res.stderr
+    assert "non-canonical id" not in res.stderr
     assert "%88" in rec.read_bytes().decode("utf-8", "replace")

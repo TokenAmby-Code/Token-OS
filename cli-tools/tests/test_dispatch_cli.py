@@ -1052,7 +1052,13 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     tmuxctl_log = tmp_path / "tmuxctl.log"
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
-        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$TMUXCTL_LOG"\nprintf "%%84\\n"\n',
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$*" > "$TMUXCTL_LOG"\n'
+        # Campaign contract: stack dispatch emits canonical page:index; dispatch
+        # materializes physical only at the raw-tmux send via resolve-pane.
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then printf "legion:3\\n"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then printf "%%84\\n"; exit 0; fi\n'
+        'printf "%%84\\n"\n',
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
@@ -1288,13 +1294,19 @@ def test_dispatch_does_not_inherit_dispatcher_legion_into_worker() -> None:
     assert "TOKEN_API_PERSONA=custodes" not in result.stdout, result.stdout
 
 
-def test_dispatch_target_dry_run_resolves_public_without_physical(tmp_path):
+def test_dispatch_target_dry_run_carries_canonical_without_physical(tmp_path):
+    """The dry-run carries the canonical working id verbatim and never leaks physical.
+
+    With the per-consumer public/physical resolve wrappers retired, dispatch no
+    longer eagerly remaps the target for display — `resolved_target` shows the
+    canonical working id as given. The load-bearing invariant is unchanged: a
+    physical %NNN must never surface on the dry-run diagnostic.
+    """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
         "#!/usr/bin/env bash\n"
-        'if [[ "$*" == "resolve-pane --format id 2:NE" ]]; then echo somnium:NE; exit 0; fi\n'
         'if [[ "$*" == "resolve-pane --format physical 2:NE" ]]; then echo %22; exit 0; fi\n'
         "exit 1\n",
         encoding="utf-8",
@@ -1313,7 +1325,7 @@ def test_dispatch_target_dry_run_resolves_public_without_physical(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "target:          2:NE" in result.stdout
-    assert "resolved_target: somnium:NE" in result.stdout
+    assert "resolved_target: 2:NE" in result.stdout
     assert "%22" not in result.stdout
 
 
@@ -1334,7 +1346,11 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
         "#!/usr/bin/env bash\n"
-        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "%77"; exit 0; fi\n'
+        # The canonical-id campaign's contract: `stack dispatch` prints page:index.
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        # dispatch materializes physical only at the raw-tmux send site, via the
+        # oracle: `resolve-pane --format physical <canonical>` -> %NNN.
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -1375,16 +1391,22 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     assert result.returncode == 0, result.stderr
 
     calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
-    # The staged launcher is sent via `tmux send-keys -t %77 'bash /tmp/...' Enter`.
+    # The staged launcher is sent via `tmux send-keys -t %77 'bash /tmp/...' Enter`
+    # — physical materialized from the canonical id immediately before the syscall.
     staged_arg = next((c for c in calls if c.startswith("bash /")), None)
     assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
+    assert "%77" in calls, f"launch not targeted at the materialized physical pane; calls={calls}"
     staged_path = Path(staged_arg.split(" ", 1)[1])
     content = staged_path.read_text(encoding="utf-8")
 
+    # PR-A keeps the child env (and DB tmux_pane column) PHYSICAL: the concrete
+    # pane is materialized into the launch env so SessionStart registers it. The
+    # canonical id is dispatch's internal working identity, never the launch env.
     assert "TMUX_PANE=%77" in content, content
     assert "TOKEN_API_DISPATCH_RESOLVED_PANE=%77" in content, content
     assert "TMUX_PANE=mechanicus:new" not in content, content
     assert "TOKEN_API_DISPATCH_RESOLVED_PANE=mechanicus:new" not in content, content
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=mechanicus:2" not in content, content
     # The allocation token remains the semantic request target.
     assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in content, content
 
@@ -1623,6 +1645,102 @@ def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path: Pat
     assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in content, content
 
 
+def test_dispatch_stack_new_rejects_non_canonical_id(tmp_path: Path) -> None:
+    """The inverted guard validates the canonical page:index contract.
+
+    Dog-food saturation: dispatch no longer accepts a legacy raw %NNN (or any
+    non-canonical token) from `stack dispatch`. A non-canonical emit is a loud
+    error, not a silent fallthrough — the inverse of the old `=~ ^%[0-9]+$` guard.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        # A pre-campaign tmuxctl that still emits a raw %NNN must now be rejected.
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "non-canonical id" in result.stderr, result.stderr
+
+
+def test_normalize_pane_to_canonical_ingest_helper(tmp_path: Path) -> None:
+    """The ingest helper canonicalizes inbound pane ids; fails open to physical.
+
+    page:index passthrough; raw %NNN / self -> `resolve-pane --format id`; a pane
+    with no canonical cardinal (resolver emits nothing) keeps its physical id.
+    """
+    common = ROOT / "cli-tools" / "lib" / "agent-wrapper-common.sh"
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        # Only %77 has a canonical cardinal; everything else resolves to nothing.
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "id" ]]; then\n'
+        '  [[ "$4" == "%77" ]] && { echo "mechanicus:2"; exit 0; }\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    def normalize(value: str) -> str:
+        script = f'source "{common}"; normalize_pane_to_canonical "{value}"'
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+        out = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        return out.stdout
+
+    # Already-canonical: passthrough, no resolver hop.
+    assert normalize("mechanicus:2") == "mechanicus:2"
+    # Raw physical with a cardinal: canonicalized.
+    assert normalize("%77") == "mechanicus:2"
+    # Raw physical with NO cardinal: fail open to the physical id (no regression).
+    assert normalize("%99") == "%99"
+
+
 def test_dispatch_direct_objective_without_brief_warns(tmp_path: Path) -> None:
     """A direct launch with --objective but no brief boots idle — warn the operator.
 
@@ -1654,11 +1772,11 @@ def test_dispatch_direct_objective_without_brief_warns(tmp_path: Path) -> None:
 
 
 def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path: Path) -> None:
-    """When tmuxctl emits nothing, the operator gets the clear non-pane-id error.
+    """When tmuxctl emits nothing, the operator gets the clear non-canonical error.
 
-    The resolve step runs under `set -euo pipefail`; an empty tmuxctl result must
+    The tail step runs under `set -euo pipefail`; an empty tmuxctl result must
     not abort the assignment silently — it must fall through to the explicit
-    'stack dispatch returned a non-pane id' guard so the failure is legible.
+    'stack dispatch returned a non-canonical id' guard so the failure is legible.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1695,7 +1813,7 @@ def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path
     )
 
     assert result.returncode != 0
-    assert "stack dispatch returned a non-pane id" in result.stderr
+    assert "stack dispatch returned a non-canonical id" in result.stderr
 
 
 def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) -> None:

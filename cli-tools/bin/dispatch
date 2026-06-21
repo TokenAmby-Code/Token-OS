@@ -1409,10 +1409,8 @@ if [[ -n "$TARGET" ]]; then
     fi
     LAUNCH_MODE="direct"
     RESOLVED_TARGET="$DISPATCH_SELF_PANE"
-    RESOLVED_PHYSICAL_TARGET="$DISPATCH_SELF_PANE"
   elif [[ -n "${TMUX_PANE:-}" && "$TARGET" == "$TMUX_PANE" ]]; then
     LAUNCH_MODE="direct"
-    RESOLVED_PHYSICAL_TARGET="$TMUX_PANE"
   elif [[ "$TARGET" == *:* ]]; then
     DISPATCH_WINDOW="${TARGET%%:*}"
     DISPATCH_SLOT="${TARGET#*:}"
@@ -1445,7 +1443,6 @@ if [[ -n "$RESUME_ID" ]]; then
       fi
       LAUNCH_MODE="direct"
       RESOLVED_TARGET="$DISPATCH_SELF_PANE"
-      RESOLVED_PHYSICAL_TARGET="$DISPATCH_SELF_PANE"
     elif [[ -n "${TMUX_PANE:-}" && "$TARGET" == "$TMUX_PANE" ]]; then
       LAUNCH_MODE="direct"
     elif [[ "$TARGET" == *:new ]]; then
@@ -1464,30 +1461,15 @@ if [[ -n "$RESUME_ID" ]]; then
   fi
 fi
 
-resolve_dispatch_public_target() {
+# Materialize a physical %NNN from a canonical page:index id immediately before a
+# raw `tmux ... -t` syscall — the only place a physical id is allowed to exist.
+# Everything above this line speaks canonical; this is the irreducible floor where
+# the working id touches tmux. Fail open to the input so an already-physical %NNN,
+# a `self`/`current` token already resolved upstream, or a pane the oracle cannot
+# map keeps today's behavior (no regression).
+materialize_physical_pane() {
   local target="$1" resolved
   [[ -n "$target" ]] || return 0
-  [[ "$target" == *:new ]] && return 0
-  if [[ ( "$target" == "self" || "$target" == "current" ) && -n "${TMUX_PANE:-}" ]]; then
-    target="$TMUX_PANE"
-  fi
-  if command -v tmuxctl >/dev/null 2>&1; then
-    resolved="$(tmuxctl resolve-pane --format id "$target" 2>/dev/null || true)"
-    [[ -n "$resolved" ]] && printf '%s' "$resolved"
-  fi
-  # Raw %pane ids (and anything tmuxctl can't map) have no public cardinal — that
-  # is fine; callers fall back to the physical target. Return success explicitly so
-  # the empty-resolution case does not trip `set -e` in the caller's assignment.
-  return 0
-}
-
-resolve_dispatch_physical_target() {
-  local target="$1" resolved
-  [[ -n "$target" ]] || return 1
-  if [[ ( "$target" == "self" || "$target" == "current" ) && -n "${TMUX_PANE:-}" ]]; then
-    printf '%s' "$TMUX_PANE"
-    return 0
-  fi
   if command -v tmuxctl >/dev/null 2>&1; then
     resolved="$(tmuxctl resolve-pane --format physical "$target" 2>/dev/null || true)"
     [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
@@ -1496,8 +1478,11 @@ resolve_dispatch_physical_target() {
 }
 
 assert_dispatch_target_unoccupied() {
-  local pane="$1" meta cmd title
+  # Caller passes the canonical working id; resolve to physical once, here, at the
+  # raw-tmux boundary.
+  local pane meta cmd title
   [[ "${TOKEN_API_DISPATCH_FORCE_OCCUPIED:-}" == "1" ]] && return 0
+  pane="$(materialize_physical_pane "$1")"
   meta="$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{pane_title}' 2>/dev/null || true)"
   [[ -n "$meta" ]] || return 0
   cmd="${meta%%|*}"
@@ -1518,13 +1503,9 @@ assert_dispatch_target_unoccupied() {
   esac
 }
 
-if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
-  public_resolved="$(resolve_dispatch_public_target "$TARGET")"
-  [[ -n "$public_resolved" ]] && RESOLVED_TARGET="$public_resolved"
-  physical_resolved="$(resolve_dispatch_physical_target "$TARGET")"
-  [[ -n "$physical_resolved" ]] && RESOLVED_PHYSICAL_TARGET="$physical_resolved"
-fi
-
+# RESOLVED_TARGET already carries the canonical working id (the user's --target, a
+# stack pane's page:index, or an already-physical %NNN for direct/self launches).
+# No boundary resolve here — physical materializes only at the raw-tmux send sites.
 
 DISCORD_BOT=""
 if [[ -n "$DISCORD_CHANNEL" ]]; then
@@ -1862,9 +1843,16 @@ dispatch_codex_launch_inline() {
 build_agent_command() {
   local -a cmd envs
   envs=("${COMMON_ENV[@]}")
-  if [[ -n "${RESOLVED_PHYSICAL_TARGET:-${RESOLVED_TARGET:-}}" ]]; then
-    envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${RESOLVED_PHYSICAL_TARGET:-$RESOLVED_TARGET}")
-    envs+=("TMUX_PANE=${RESOLVED_PHYSICAL_TARGET:-$RESOLVED_TARGET}")
+  # The child env still carries a PHYSICAL pane id this PR: the wrapper, runtime
+  # cleanup/stamp/enforce, and the DB tmux_pane column all consume it via raw
+  # `tmux ... -t` and are not canonical-aware until PR-B. Materialize physical from
+  # the canonical working id at this hand-off boundary so storage + consumers stay
+  # unchanged (column stays physical, fleet launchable at every commit).
+  if [[ -n "${RESOLVED_TARGET:-}" ]]; then
+    local resolved_physical_pane
+    resolved_physical_pane="$(materialize_physical_pane "$RESOLVED_TARGET")"
+    envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${resolved_physical_pane}")
+    envs+=("TMUX_PANE=${resolved_physical_pane}")
   fi
   if [[ -n "$RESUME_ID" ]]; then
     if [[ "$ENGINE" == "codex" ]]; then
@@ -1931,13 +1919,16 @@ stamp_resume_instance_id() {
   # tmuxctl resolve-instance finds it before the agent re-registers — closing
   # the pane-alloc -> SessionStart gap. No-op for fresh launches (the
   # registration hook stamps those). Cleared on agent death by the wrapper.
-  local pane="$1"
+  # Caller passes the canonical working id; resolve to physical here, at the
+  # raw-tmux boundary.
+  local pane="$1" phys
   # Stamp the canonical ci.id resolved from the DB (RESUME_ID may be a session_id);
   # fall back to the raw RESUME_ID when the row was not found (--engine/--dir resume).
   local instance_id="${RESUME_INSTANCE_ID:-$RESUME_ID}"
   [[ -n "$instance_id" && -n "$pane" ]] || return 0
   command -v tmux >/dev/null 2>&1 || return 0
-  tmux set-option -p -t "$pane" @INSTANCE_ID "$instance_id" >/dev/null 2>&1 || true
+  phys="$(materialize_physical_pane "$pane")"
+  tmux set-option -p -t "$phys" @INSTANCE_ID "$instance_id" >/dev/null 2>&1 || true
 }
 
 stage_agent_command() {
@@ -2034,36 +2025,32 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   # Automated dispatch should not steal the operator's camera/focus. The new pane
   # is still addressable by @PANE_ID/Token-API metadata and can be focused explicitly.
   pane_id="$(IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --no-focus --command "clear")"
-  # The tmuxctl canonical-id campaign made `stack dispatch` print the public
-  # page:index id (e.g. mechanicus:2) instead of the legacy raw %NNN. Resolve
-  # whatever it emits down to a physical %NNN through the same helper the
-  # --target flow uses: it maps a canonical id via `resolve-pane --format
-  # physical` and falls back to its input for a raw %NNN (older tmuxctl) — so it
-  # is correct whichever form tmuxctl emits.
+  # The tmuxctl canonical-id campaign made `stack dispatch` print the canonical
+  # page:index id (e.g. mechanicus:2). That id is the working identity from here
+  # on — carried through env injection, stamping, and the launch send — and only
+  # materialized to a physical %NNN at the raw `tmux send-keys` site below.
   pane_id="$(printf '%s\n' "$pane_id" | tail -n1)"
-  # `|| true`: resolve_dispatch_physical_target returns non-zero on empty input
-  # (tmuxctl emitted nothing / failed). Swallow it so `set -e` does not abort the
-  # assignment here — the explicit non-pane-id validation just below produces the
-  # clear operator-facing error instead.
-  pane_id="$(resolve_dispatch_physical_target "$pane_id" || true)"
-  # FINAL_COMMAND was built (above) before this pane existed, so it baked the
-  # allocation token (e.g. mechanicus:new) into TMUX_PANE and
-  # TOKEN_API_DISPATCH_RESOLVED_PANE. Now that the concrete pane is known, rebuild
-  # the launch env with it so the agent's first SessionStart registers the real
-  # pane id — otherwise pane_truth / assert-instance / agent-cmd cannot resolve
-  # pane→instance and the orchestrator cannot drive its own child. The request
-  # token stays in TOKEN_API_DISPATCH_TARGET (the row's dispatch_target field);
-  # only the pane fields become concrete.
-  if [[ ! "$pane_id" =~ ^%[0-9]+$ ]]; then
-    err "stack dispatch returned a non-pane id for $stack: '${pane_id}'"
+  # Validate the canonical contract directly (page:index). A non-canonical emit
+  # (older tmuxctl, or a stack failure) is now a loud error rather than a silent
+  # fallthrough — the dog-food-saturation contract.
+  if [[ ! "$pane_id" =~ ^[a-z][a-z0-9-]*:[A-Za-z0-9-]+$ ]]; then
+    err "stack dispatch returned a non-canonical id for $stack: '${pane_id}'"
     exit 1
   fi
-  RESOLVED_PHYSICAL_TARGET="$pane_id"
+  # FINAL_COMMAND was built (above) before this pane existed, so it baked the
+  # allocation token (e.g. mechanicus:new) into the launch env. Now that the
+  # concrete pane is known, carry it as the canonical RESOLVED_TARGET and rebuild
+  # the launch env so the agent's first SessionStart registers the real pane —
+  # otherwise pane_truth / assert-instance / agent-cmd cannot resolve pane→instance
+  # and the orchestrator cannot drive its own child. The request token stays in
+  # TOKEN_API_DISPATCH_TARGET (the row's dispatch_target field).
+  RESOLVED_TARGET="$pane_id"
   stamp_resume_instance_id "$pane_id"
   FINAL_COMMAND="$(LC_ALL=C; build_agent_command)"
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
-  tmux send-keys -t "$pane_id" "$STAGED_COMMAND" Enter
+  phys_pane="$(materialize_physical_pane "$pane_id")"
+  tmux send-keys -t "$phys_pane" "$STAGED_COMMAND" Enter
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
   printf '%s\n' "dispatched $ENGINE to $stack_display" | redact_tmux_panes_for_display
@@ -2075,9 +2062,12 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
     err "tmux is required for target $TARGET"
     exit 69
   fi
-  PHYSICAL_TARGET="${RESOLVED_PHYSICAL_TARGET:-$(resolve_dispatch_physical_target "$TARGET")}"
-  assert_dispatch_target_unoccupied "$PHYSICAL_TARGET"
-  stamp_resume_instance_id "$PHYSICAL_TARGET"
+  # Canonical working id in, physical materialized once at the raw-tmux boundary.
+  # assert/stamp take the canonical id and resolve internally; the two send-keys
+  # syscalls share a single materialized physical id.
+  assert_dispatch_target_unoccupied "$RESOLVED_TARGET"
+  stamp_resume_instance_id "$RESOLVED_TARGET"
+  PHYSICAL_TARGET="$(materialize_physical_pane "$RESOLVED_TARGET")"
   tmux send-keys -t "$PHYSICAL_TARGET" "clear" Enter
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
@@ -2094,5 +2084,5 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   exit 0
 fi
 
-stamp_resume_instance_id "${RESOLVED_PHYSICAL_TARGET:-${TMUX_PANE:-}}"
+stamp_resume_instance_id "${RESOLVED_TARGET:-${TMUX_PANE:-}}"
 exec bash -lc "$FINAL_COMMAND"
