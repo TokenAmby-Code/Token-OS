@@ -158,15 +158,27 @@ _tx_log_invocation() {
 # gated here, so automated Mac deploys keep reloading. Likewise the non-
 # destructive `tx restart-pane`/`restart-page` and `tx start` (attach/create)
 # are not gated — only the full kill-and-rebuild.
+#
+# Fail SAFE, two ways (CodeRabbit #277 hardening):
+#   1. Detect a marker that is SET AT ALL — `${VAR+x}`, not `${VAR:-}` — so an
+#      empty-but-present marker (e.g. `CLAUDECODE=`) still trips the block. For a
+#      human-only destructive command, "present but empty" must refuse, not pass.
+#   2. Match the Codex markers by PREFIX (`CODEX_*` / `TOKEN_API_CODEX_*`) via an
+#      env scan, so a NEW Codex variant can't slip past a hand-maintained list.
+# Over-refusal is the safe direction here: the worst case is a human clearing a
+# stray env var, versus the catastrophic case this guards — a wiped live fleet.
 _tx_is_agent_context() {
-    [[ -n "${CLAUDECODE:-}" \
-        || -n "${CLAUDE_CODE_ENTRYPOINT:-}" \
-        || -n "${TOKEN_API_SUBAGENT:-}" \
-        || -n "${CODEX_PROFILE:-}" \
-        || -n "${CODEX_HEADLESS:-}" \
-        || -n "${CODEX_BRIDGE_ID:-}" \
-        || -n "${TOKEN_API_CODEX_BRIDGE_ID:-}" \
-        || -n "${TOKEN_API_CODEX_PROFILE:-}" ]]
+    [[ -n "${CLAUDECODE+x}" \
+        || -n "${CLAUDE_CODE_ENTRYPOINT+x}" \
+        || -n "${TOKEN_API_SUBAGENT+x}" ]] && return 0
+
+    local key
+    while IFS='=' read -r key _; do
+        case "$key" in
+            CODEX_* | TOKEN_API_CODEX_*) return 0 ;;
+        esac
+    done < <(env)
+    return 1
 }
 
 # --- Workspace flag detection ---

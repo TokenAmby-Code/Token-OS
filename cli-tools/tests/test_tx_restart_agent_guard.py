@@ -20,7 +20,10 @@ import subprocess
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TX = ROOT / "bin" / "tx"
 
-# Every env marker the guard treats as an agent/automation context.
+# Every env marker the guard treats as an agent/automation context. The three
+# CLAUDE/SUBAGENT keys are matched by exact name; the Codex keys are matched by
+# PREFIX (CODEX_* / TOKEN_API_CODEX_*) so a new variant can't slip past. The
+# named CODEX_* entries below are representative samples of that prefix family.
 AGENT_MARKERS = [
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
@@ -32,12 +35,20 @@ AGENT_MARKERS = [
     "TOKEN_API_CODEX_PROFILE",
 ]
 
+# The guard scans for these prefixes, so the clean-env separation proof must
+# strip the WHOLE family, not just the named samples above.
+AGENT_MARKER_PREFIXES = ("CODEX_", "TOKEN_API_CODEX_")
+
+
+def _is_agent_marker(key: str) -> bool:
+    return key in AGENT_MARKERS or key.startswith(AGENT_MARKER_PREFIXES)
+
 
 def _base_env(tmp_path: pathlib.Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     """A controlled env with ALL agent markers stripped (the test runner itself
     may run under Claude Code, which sets CLAUDECODE). A fake tmux on PATH keeps
     any incidental tmux call inert. Callers re-add exactly the marker they test."""
-    env = {k: v for k, v in os.environ.items() if k not in AGENT_MARKERS}
+    env = {k: v for k, v in os.environ.items() if not _is_agent_marker(k)}
     stub = tmp_path / "bin"
     stub.mkdir(exist_ok=True)
     fake_tmux = stub / "tmux"
@@ -87,6 +98,24 @@ def test_codex_context_refuses_restart(tmp_path: pathlib.Path) -> None:
 
 def test_subagent_context_refuses_restart(tmp_path: pathlib.Path) -> None:
     env = _base_env(tmp_path, {"TOKEN_API_SUBAGENT": "subagent:claude"})
+    _assert_refused_as_agent(_run_restart(env))
+
+
+def test_empty_agent_marker_refuses_restart(tmp_path: pathlib.Path) -> None:
+    """Fail-safe contract: a marker that is PRESENT BUT EMPTY (`CLAUDECODE=`) must
+    still refuse. The guard tests whether the marker is set at all (`${VAR+x}`),
+    not whether it is non-empty — a present-but-empty marker is still an agent
+    context, and over-refusing a destructive human-only command is the safe
+    direction. Guards against silent regression to a `${VAR:-}` non-empty test."""
+    env = _base_env(tmp_path, {"CLAUDECODE": ""})
+    _assert_refused_as_agent(_run_restart(env))
+
+
+def test_novel_codex_prefix_marker_refuses_restart(tmp_path: pathlib.Path) -> None:
+    """A Codex variant NOT in the named list must still refuse — the guard matches
+    the CODEX_* / TOKEN_API_CODEX_* prefix family, so a future marker cannot slip
+    past a hand-maintained allowlist."""
+    env = _base_env(tmp_path, {"CODEX_SOME_NEW_FLAG": "1"})
     _assert_refused_as_agent(_run_restart(env))
 
 
