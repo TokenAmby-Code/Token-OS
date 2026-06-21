@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 
 @pytest.mark.asyncio
-async def test_brief_rowless_live_codex_singleton_uses_tmuxctl_fallback(app_env, monkeypatch):
+async def test_brief_rowless_live_codex_singleton_uses_tmuxctl_fallback(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No registry row + live Codex pane must still deliver via tmuxctl."""
     main = app_env.main
     target = {
@@ -65,7 +69,9 @@ async def test_brief_rowless_live_codex_singleton_uses_tmuxctl_fallback(app_env,
 
 
 @pytest.mark.asyncio
-async def test_brief_rowless_dead_pane_reports_no_delivery(app_env, monkeypatch):
+async def test_brief_rowless_dead_pane_reports_no_delivery(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No registry row + no live pane/process is a real miss, not a success."""
     main = app_env.main
     target = {
@@ -107,7 +113,9 @@ async def test_brief_rowless_dead_pane_reports_no_delivery(app_env, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_brief_registry_row_path_still_uses_queue(app_env, monkeypatch):
+async def test_brief_registry_row_path_still_uses_queue(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A target with a registry row keeps the existing queued registry path."""
     main = app_env.main
     target = {
@@ -161,7 +169,9 @@ async def test_brief_registry_row_path_still_uses_queue(app_env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_talk_rowless_live_codex_singleton_uses_tmuxctl_fallback(app_env, monkeypatch):
+async def test_talk_rowless_live_codex_singleton_uses_tmuxctl_fallback(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """talk uses the same no-row live-agent fallback rather than requiring a DB row."""
     main = app_env.main
 
