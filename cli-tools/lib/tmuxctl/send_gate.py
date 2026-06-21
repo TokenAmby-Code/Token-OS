@@ -279,6 +279,20 @@ def _real_tmux_binary() -> str:
         return "tmux"
 
 
+def _parse_activity_epochs(output: str) -> list[int]:
+    epochs: list[int] = []
+    for raw in output.splitlines():
+        value = raw.strip()
+        if not value:
+            continue
+        try:
+            epochs.append(int(value))
+        except ValueError:
+            # Unparsable tmux format output is not a positive guard signal.
+            continue
+    return epochs
+
+
 def _client_activity_epoch() -> int | None:
     try:
         proc = subprocess.run(
@@ -293,13 +307,33 @@ def _client_activity_epoch() -> int | None:
         return None
     if proc.returncode != 0:
         return None
-    value = proc.stdout.strip()
-    if not value:
-        return None
+    epochs = _parse_activity_epochs(proc.stdout)
+    return max(epochs) if epochs else None
+
+
+def _target_client_activity_epochs(target: str) -> list[int]:
+    """Return activity epochs for clients currently attending ``target``.
+
+    Uses ``list-clients -t <target>`` instead of global ``#{client_activity}``:
+    fresh input in an unrelated tmux client must not block delivery to this
+    target. Empty/error/unparsable output is fail-open and yields no signal.
+    """
+    if not target:
+        return []
     try:
-        return int(value)
-    except ValueError:
-        return None
+        proc = subprocess.run(
+            [_real_tmux_binary(), "list-clients", "-t", target, "-F", "#{client_activity}"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.3,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    return _parse_activity_epochs(proc.stdout)
 
 
 def _typing_guard_window_seconds(window_seconds: int | None = None) -> int:
@@ -313,12 +347,21 @@ def _typing_guard_window_seconds(window_seconds: int | None = None) -> int:
         return _DEFAULT_TYPING_GUARD_WINDOW
 
 
-def _recent_client_activity(window_seconds: int) -> bool:
-    activity = _client_activity_epoch()
-    if activity is None:
-        return False
+def _activity_recent(activity: int, window_seconds: int) -> bool:
     age = int(time.time()) - activity
     return 0 <= age <= window_seconds
+
+
+def _recent_client_activity(window_seconds: int) -> bool:
+    activity = _client_activity_epoch()
+    return activity is not None and _activity_recent(activity, window_seconds)
+
+
+def _target_recent_client_activity(target: str, window_seconds: int) -> bool:
+    return any(
+        _activity_recent(activity, window_seconds)
+        for activity in _target_client_activity_epochs(target)
+    )
 
 
 def _pane_attended(target: str) -> bool:
@@ -394,6 +437,10 @@ def _pane_has_pending_input(target: str) -> bool:
     return _pane_input_line_has_text(lines[-1])
 
 
+def _target_pane_has_input(target: str) -> bool:
+    return _pane_has_pending_input(target)
+
+
 def _live_pane_ids() -> list[str] | None:
     try:
         proc = subprocess.run(
@@ -414,9 +461,8 @@ def _live_pane_ids() -> list[str] | None:
 def any_typing_guard_active(*, window_seconds: int | None = None) -> bool:
     """Aggregate query: true if any pane is under a typing guard.
 
-    This is a derived query over pane-local guard state, not a first-class global
-    block. Use it only for policy that really hangs off ANY typing guard
-    (for example enforcement deferral). Normal pane writes must pass a target.
+    Preserve legacy aggregate behavior for global policies: recent activity on
+    any/current client OR pending input in any live pane.
     """
     window_seconds = _typing_guard_window_seconds(window_seconds)
     if _recent_client_activity(window_seconds):
@@ -430,18 +476,12 @@ def any_typing_guard_active(*, window_seconds: int | None = None) -> bool:
 def typing_guard_active(*, target: str | None = None, window_seconds: int | None = None) -> bool:
     """Canonical typing-guard predicate.
 
-    With ``target`` set, the guard holds ONLY for a pane a human is actually
-    attending — ``_pane_attended(target)`` AND (an unsent draft on its prompt
-    line OR a keystroke within the recent-activity window). Attendance gates BOTH
-    branches by design: the guard is "scoped to the pane the human is actually
-    typing in" (the mandate). An unattended worker pane is never guarded merely
-    for holding leftover prompt text — that was the asymmetry that over-blocked
-    agents (dispatch / brief-delivery DELAY-ed to idle panes) while under-
-    protecting the Emperor. The attended pane stays held both mid-draft and
-    mid-keystroke, so automation cannot race his direct input there.
+    With ``target`` set, the guard holds only for a pane a human is actually
+    attending: attended target AND (pending input OR recent activity from a
+    client attending that target). Unrelated/global client activity is ignored.
 
-    With no target, returns ``any_typing_guard_active`` for the few global
-    policies that intentionally hang on ANY typing guard.
+    With no target, keep aggregate behavior for policies that intentionally
+    hang on ANY typing guard.
 
     Fail-open: if tmux is unreachable or reports nothing, returns False.
     """
@@ -449,7 +489,9 @@ def typing_guard_active(*, target: str | None = None, window_seconds: int | None
     if target:
         if not _pane_attended(target):
             return False
-        return _pane_has_pending_input(target) or _recent_client_activity(window_seconds)
+        return _pane_has_pending_input(target) or _target_recent_client_activity(
+            target, window_seconds
+        )
     return any_typing_guard_active(window_seconds=window_seconds)
 
 
@@ -512,7 +554,7 @@ _QUIET_DELAY_RECHECK_SECONDS = 60.0
 _PENDING_INPUT_RECHECK_SECONDS = 0.25
 
 
-def _wait_for_typing_window_expiry(deadline: float | None) -> bool:
+def _wait_for_typing_window_expiry(deadline: float | None, *, target: str | None = None) -> bool:
     """Deadline-sleep until the typing-guard window expires; never polls.
 
     The guard is a fixed window after the last keystroke, so the exact expiry
@@ -522,9 +564,25 @@ def _wait_for_typing_window_expiry(deadline: float | None) -> bool:
     """
     window = max(1, _typing_guard_window_seconds())
     while True:
-        activity = _client_activity_epoch()
-        if activity is None:
-            return True  # tmux unreachable — same fail-open as typing_guard_active
+        if target and _pane_has_pending_input(target):
+            sleep_for = 0.5
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                sleep_for = min(sleep_for, remaining)
+            time.sleep(sleep_for)
+            continue
+
+        if target:
+            activities = _target_client_activity_epochs(target)
+            if not activities:
+                return True  # no attending client / tmux error — fail open
+            activity = max(activities)
+        else:
+            activity = _client_activity_epoch()
+            if activity is None:
+                return True  # tmux unreachable — same fail-open as typing_guard_active
         age = time.time() - activity
         if age < 0:
             return True  # clock skew: typing_guard_active would report inactive
@@ -539,6 +597,13 @@ def _wait_for_typing_window_expiry(deadline: float | None) -> bool:
         time.sleep(sleep_for)
 
 
+def _typing_delay_activity(target: str | None, window_seconds: int) -> int | None:
+    if target:
+        activities = _target_client_activity_epochs(target)
+        return max(activities) if activities else None
+    return _client_activity_epoch()
+
+
 def wait_for_gate_clear(
     args: tuple[str, ...] | list[str],
     *,
@@ -549,15 +614,15 @@ def wait_for_gate_clear(
     """Wait while policy remains ``delay``; return True once sending is allowed.
 
     Returns False if the policy changes to cancel or an explicit timeout
-    expires. Event-aligned, not polling: a typing-guard delay computes the
-    exact window expiry from ``#{client_activity}`` and sleeps until it (the
-    quiet predicate was already false when the typing delay was diagnosed, so
-    the full ``evaluate()`` — two sqlite opens — is not re-run per wake).
+    expires. Typing-guard waits are target-aware: pending input is re-checked
+    lightly, while recent client activity sleeps to the target client's expiry.
     """
     if timeout_seconds is None:
         timeout_seconds = _delay_timeout_seconds()
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
-    result = evaluate(tuple(args), db_path=db_path, now=now)
+    args_tuple = tuple(args)
+    target = _extract_target(args_tuple)
+    result = evaluate(args_tuple, db_path=db_path, now=now)
     while True:
         if result is None or not result.get("suppressed"):
             return True
@@ -566,22 +631,17 @@ def wait_for_gate_clear(
         if deadline is not None and time.monotonic() >= deadline:
             return False
         if result.get("reason") == "typing_guard":
-            # Recent client activity has a computed expiry; pane-local pending
-            # input does not. Sleep to the activity edge when present, otherwise
-            # fall back to a light re-check. Always re-evaluate before allowing
-            # the send: the pane may still have prompt-line text after the
-            # client-activity window expires.
-            activity = _client_activity_epoch()
             window = _typing_guard_window_seconds()
+            activity = _typing_delay_activity(target, window)
             if activity is not None and 0 <= time.time() - activity <= window:
-                if not _wait_for_typing_window_expiry(deadline):
+                if not _wait_for_typing_window_expiry(deadline, target=target):
                     return False
             else:
                 sleep_for = _PENDING_INPUT_RECHECK_SECONDS
                 if deadline is not None:
                     sleep_for = min(sleep_for, max(0.05, deadline - time.monotonic()))
                 time.sleep(sleep_for)
-            result = evaluate(tuple(args), db_path=db_path, now=now)
+            result = evaluate(args_tuple, db_path=db_path, now=now)
             continue
         # Quiet-hours only delays under an explicit TMUX_SEND_GATE_POLICY=delay;
         # there is no keystroke deadline to sleep to, so re-check coarsely.
@@ -589,7 +649,7 @@ def wait_for_gate_clear(
         if deadline is not None:
             sleep_for = min(sleep_for, max(0.05, deadline - time.monotonic()))
         time.sleep(sleep_for)
-        result = evaluate(tuple(args), db_path=db_path, now=now)
+        result = evaluate(args_tuple, db_path=db_path, now=now)
 
 
 def evaluate(
@@ -611,8 +671,8 @@ def evaluate(
 
     override = sanctioned_override()
 
-    quiet, quiet_ctx = quiet_hours_active(db_path=db_path, now=now)
     target = _extract_target(args)
+    quiet, quiet_ctx = quiet_hours_active(db_path=db_path, now=now)
     typing = typing_guard_active(target=target)
     if not (quiet or typing):
         return None

@@ -15,6 +15,7 @@ GUARD = REPO / "cli-tools" / "lib" / "tmux-guard.sh"
 AGENT_CMD = REPO / "cli-tools" / "bin" / "agent-cmd"
 BRIEF = REPO / "cli-tools" / "bin" / "brief"
 TMUX_SHIM = REPO / "cli-tools" / "bin" / "tmux"
+STATUS = REPO / "cli-tools" / "bin" / "tmux-typing-guard-status"
 
 
 def _fake_tmux(tmp_path: Path) -> Path:
@@ -31,10 +32,20 @@ def _fake_tmux(tmp_path: Path) -> Path:
                 ;;
               display-message)
                 if [[ "$*" == *"#{client_activity}"* ]]; then echo "${FAKE_TMUX_CLIENT_ACTIVITY:-}";
+                elif [[ "$*" == *"#{?pane_active,1,0}#{?window_active,1,0}"* ]]; then echo "${FAKE_TMUX_ATTENDED:-11}";
+                elif [[ "$*" == *"#{pane_id}	#{session_name}"* ]]; then printf '%%1\ts\t0\tw\t0\t80\t24\tbash\t/dev/ttys001\t1\n';
+                elif [[ "$*" == *"#{session_name}:#{window_index}"* ]]; then echo "s:0";
+                elif [[ "$*" == *"#{pane_pid}"* ]]; then echo "1";
                 elif [[ "$*" == *"#{pane_id}"* ]]; then echo "%1"; else echo ""; fi
+                ;;
+              list-clients)
+                echo "${FAKE_TMUX_TARGET_CLIENT_ACTIVITY:-${FAKE_TMUX_CLIENT_ACTIVITY:-}}"
                 ;;
               list-panes)
                 echo "%1"
+                ;;
+              list-windows)
+                echo -e "s\t0\tw"
                 ;;
               show-options)
                 exit 1
@@ -43,7 +54,7 @@ def _fake_tmux(tmp_path: Path) -> Path:
                 exit 0
                 ;;
               send-keys|send-key|send)
-                echo "SEND $*" >> "${FAKE_TMUX_SENT}"
+                echo "ALLOW=${TMUX_SEND_GATE_ALLOW:-} SEND $*" >> "${FAKE_TMUX_SENT}"
                 ;;
               *)
                 ;;
@@ -175,11 +186,42 @@ EOF
     assert "stamp:gone" in proc.stdout
 
 
-# NOTE: the status segment used to mirror this 300s stamp model. It now reflects
-# the canonical send_gate predicate instead (the gate that actually fires on the
-# clobber path), so its behaviour is pinned in test_tmux_typing_guard_statusline.py.
-# The stamp model below is still the SHELL inbound guard (tmux_wait_for_clear) and
-# is exercised by the remaining tests in this file.
+def test_status_segment_uses_global_recent_client_activity(tmp_path: Path) -> None:
+    env = _env(tmp_path, "> draft\n")
+    now = int(time.time())
+    env["FAKE_TMUX_CLIENT_ACTIVITY"] = str(now)
+    first = subprocess.run(
+        [sys.executable, str(STATUS), "--plain"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=2,
+        check=False,
+    )
+    env["FAKE_TMUX_CLIENT_ACTIVITY"] = str(now - 2)
+    second = subprocess.run(
+        [sys.executable, str(STATUS), "--plain"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=2,
+        check=False,
+    )
+    Path(env["FAKE_TMUX_CAPTURE"]).write_text("> \n")
+    env["FAKE_TMUX_CLIENT_ACTIVITY"] = str(now - 60)
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(now - 60)
+    expired = subprocess.run(
+        [sys.executable, str(STATUS), "--plain"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=2,
+        check=False,
+    )
+
+    assert first.stdout == "TYPE"
+    assert second.stdout == "TYPE"
+    assert expired.stdout == ""
 
 
 def test_tmux_send_guarded_does_not_silently_swallow_block(tmp_path: Path) -> None:
@@ -202,11 +244,36 @@ def test_tmux_guard_skip_escape_hatch_bypasses_block(tmp_path: Path) -> None:
     assert "SEND send-keys -t %1 -l peer-bytes" in Path(env["FAKE_TMUX_SENT"]).read_text()
 
 
-def test_tmux_shim_applies_inbound_guard_before_send_gate_and_fails_loud(tmp_path: Path) -> None:
+def test_tmux_shim_delays_under_typing_guard_then_delivers(tmp_path: Path) -> None:
     env = _env(tmp_path, "> draft\n")
-    env["TMUX_GUARD_NOW"] = "1000"
+    env.pop("TMUX_SEND_GATE_POLICY", None)
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    env["IMPERIUM_TMUX_RAW"] = "1"
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
+    capture = Path(env["FAKE_TMUX_CAPTURE"])
+    proc = subprocess.run(
+        [
+            "bash",
+            "-lc",
+            f"(sleep 0.2; printf '> \\n' > '{capture}') & exec '{TMUX_SHIM}' send-keys -t %1 peer-bytes",
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=3,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    sent = Path(env["FAKE_TMUX_SENT"]).read_text()
+    assert "SEND send-keys -t %1 peer-bytes" in sent
+    assert "ALLOW= SEND" in sent
+
+
+def test_tmux_shim_cancel_policy_suppresses_without_writing(tmp_path: Path) -> None:
+    env = _env(tmp_path, "> draft\n")
+    env["TMUX_SEND_GATE_POLICY"] = "cancel"
+    env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
     proc = subprocess.run(
         ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
         text=True,
@@ -216,18 +283,35 @@ def test_tmux_shim_applies_inbound_guard_before_send_gate_and_fails_loud(tmp_pat
         check=False,
     )
 
-    assert proc.returncode == 1
-    assert "tmux-guard: BLOCKED send-keys to %1" in proc.stderr
+    assert proc.returncode == 0
     assert Path(env["FAKE_TMUX_SENT"]).read_text() == ""
 
 
-def test_tmux_shim_empty_pane_pierces_global_typing_gate_after_per_pane_guard(
-    tmp_path: Path,
-) -> None:
+def test_tmux_shim_raw_read_is_unaffected(tmp_path: Path) -> None:
+    env = _env(tmp_path, "visible\n")
+    env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
+    env["IMPERIUM_TMUX_RAW"] = "1"
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
+    proc = subprocess.run(
+        ["bash", str(TMUX_SHIM), "capture-pane", "-t", "%1", "-p"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=2,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout == "visible\n"
+    assert Path(env["FAKE_TMUX_SENT"]).read_text() == ""
+
+
+def test_tmux_shim_empty_pane_ignores_unrelated_global_typing_gate(tmp_path: Path) -> None:
     env = _env(tmp_path, "> \n")
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
     env.pop("TMUX_SEND_GATE_POLICY", None)
     env["FAKE_TMUX_CLIENT_ACTIVITY"] = str(int(time.time()))
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()) - 60)
     proc = subprocess.run(
         ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
         text=True,
@@ -239,27 +323,54 @@ def test_tmux_shim_empty_pane_pierces_global_typing_gate_after_per_pane_guard(
 
     assert proc.returncode == 0
     assert "tmux-guard: BLOCKED" not in proc.stderr
-    assert "SEND send-keys -t %1 peer-bytes" in Path(env["FAKE_TMUX_SENT"]).read_text()
+    sent = Path(env["FAKE_TMUX_SENT"]).read_text()
+    assert "SEND send-keys -t %1 peer-bytes" in sent
+    assert "ALLOW= SEND" in sent
 
 
-def test_agent_cmd_reports_blocked_not_empty_detached_silence(tmp_path: Path) -> None:
+def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path) -> None:
     env = _env(tmp_path, "> draft\n")
-    env["TMUX_GUARD_NOW"] = "1000"
+    env.pop("TMUX_SEND_GATE_POLICY", None)
+    env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
+    stub = tmp_path / "tmuxctl-stub"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'pane=""\n'
+        'text=""\n'
+        "while [[ $# -gt 0 ]]; do\n"
+        '  case "$1" in\n'
+        '    --pane) pane="$2"; shift 2 ;;\n'
+        '    --text) text="$2"; shift 2 ;;\n'
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        f'exec "{TMUX_SHIM}" send-keys -t "$pane" -l "$text"\n'
+    )
+    stub.chmod(0o755)
+    env["TMUXCTL_BIN"] = str(stub)
+    capture = Path(env["FAKE_TMUX_CAPTURE"])
     proc = subprocess.run(
-        [str(AGENT_CMD), "--pane", "%1", "hello from peer"],
+        [
+            "bash",
+            "-lc",
+            f"(sleep 0.2; printf '> \\n' > '{capture}') & exec '{AGENT_CMD}' --pane %1 'hello from peer'",
+        ],
         text=True,
         capture_output=True,
         env=env,
-        timeout=2,
+        timeout=4,
         check=False,
     )
 
-    assert proc.returncode == 1
-    assert "tmux-guard: BLOCKED send-keys to %1" in proc.stderr
+    assert proc.returncode == 0
     payload = json.loads(proc.stdout)
-    assert payload["verification_status"] == "blocked"
-    assert payload["blocked"] is True
+    assert payload["verification_status"] == "sent"
     assert payload["pane"] == "%1"
+    sent = Path(env["FAKE_TMUX_SENT"]).read_text()
+    assert "hello from peer" in sent
+    assert "ALLOW= SEND" in sent
 
 
 class _BriefHandler(BaseHTTPRequestHandler):
@@ -310,6 +421,4 @@ def test_brief_surfaces_blocked_as_not_delivered(tmp_path: Path) -> None:
 
     assert proc.returncode == 1
     assert "delivered=0/1" in proc.stdout
-    assert "1 blocked" in proc.stdout
     assert "blocked" in proc.stderr
-    assert "not delivered" in proc.stderr

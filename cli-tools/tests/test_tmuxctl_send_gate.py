@@ -238,6 +238,12 @@ def test_typing_guard_is_scoped_to_target_pane(monkeypatch: pytest.MonkeyPatch) 
         if "display-message" in cmd and "-t" in cmd and "%other" in cmd:
             proc.stdout = "00\n"
             return proc
+        if "list-clients" in cmd and "%active" in cmd and "#{client_activity}" in cmd:
+            proc.stdout = f"{now}\n"
+            return proc
+        if "list-clients" in cmd and "%active" in cmd and "#{client_activity}" in cmd:
+            proc.stdout = f"{now}\n"
+            return proc
         if "list-clients" in cmd and "%active" in cmd:
             proc.stdout = "x\n"
             return proc
@@ -280,6 +286,9 @@ def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
             return proc
         if "display-message" in cmd and "-t" in cmd and "%other" in cmd:
             proc.stdout = "00\n"
+            return proc
+        if "list-clients" in cmd and "%active" in cmd and "#{client_activity}" in cmd:
+            proc.stdout = f"{now}\n"
             return proc
         if "list-clients" in cmd and "%active" in cmd:
             proc.stdout = "x\n"
@@ -360,6 +369,9 @@ def test_attended_pane_is_held_on_pending_text_and_on_recent_keystroke(
         if "display-message" in cmd and "-t" in cmd and "%active" in cmd:
             proc.stdout = "11\n"
             return proc
+        if "list-clients" in cmd and "%active" in cmd and "#{client_activity}" in cmd:
+            proc.stdout = f"{state['activity']}\n"
+            return proc
         if "list-clients" in cmd and "%active" in cmd:
             proc.stdout = "x\n"
             return proc
@@ -437,6 +449,8 @@ def counted_typing_delay(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
 def test_wait_for_gate_clear_sleeps_to_deadline_not_polls(
     monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
 ) -> None:
+    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
+    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [998])
     monkeypatch.setattr(send_gate, "_client_activity_epoch", lambda: 998)
 
     assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is True
@@ -451,6 +465,12 @@ def test_wait_for_gate_clear_extends_when_typing_resumes(
     monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
 ) -> None:
     # Keystroke at 998; human types again at 1005 (visible after the first wake).
+    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
+    monkeypatch.setattr(
+        send_gate,
+        "_target_client_activity_epochs",
+        lambda target: [998 if fake_clock["now"] < 1_005 else 1_005],
+    )
     monkeypatch.setattr(
         send_gate,
         "_client_activity_epoch",
@@ -468,9 +488,66 @@ def test_wait_for_gate_clear_extends_when_typing_resumes(
 def test_wait_for_gate_clear_honors_delay_timeout(
     monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
 ) -> None:
+    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
+    monkeypatch.setattr(
+        send_gate, "_target_client_activity_epochs", lambda target: [fake_clock["now"] - 1]
+    )
     monkeypatch.setattr(send_gate, "_client_activity_epoch", lambda: fake_clock["now"] - 1)
     monkeypatch.setenv("TMUX_SEND_GATE_DELAY_TIMEOUT", "5")
 
     assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is False
 
     assert abs(sum(fake_clock["sleeps"]) - 5.0) < 0.01, "timeout caps the deadline sleep"
+
+
+def test_target_typing_guard_ignores_unrelated_global_activity(monkeypatch):
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    now = 10_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    monkeypatch.setattr(send_gate, "_client_activity_epoch", lambda: now)
+    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [now - 60])
+    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
+    monkeypatch.setattr(send_gate, "_pane_attended", lambda target: True)
+
+    assert send_gate.evaluate(("send-keys", "-t", "%9", "hi")) is None
+
+
+def test_target_typing_guard_uses_attending_client_activity(monkeypatch):
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    now = 10_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [now - 2])
+    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
+    monkeypatch.setattr(send_gate, "_pane_attended", lambda target: True)
+
+    result = send_gate.evaluate(("send-keys", "-t", "%9", "hi"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "delay"
+
+
+def test_target_typing_guard_pending_prompt_on_attended_target(monkeypatch):
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    monkeypatch.setattr(send_gate.time, "time", lambda: 10_000)
+    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [9_000])
+    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: True)
+    monkeypatch.setattr(send_gate, "_pane_attended", lambda target: True)
+
+    result = send_gate.evaluate(("send-keys", "-t", "%9", "hi"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+
+
+def test_target_typing_guard_unattended_pending_prompt_is_deliverable(monkeypatch):
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [])
+    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: True)
+    monkeypatch.setattr(send_gate, "_pane_attended", lambda target: False)
+
+    assert send_gate.evaluate(("send-keys", "-t", "%9", "hi")) is None
