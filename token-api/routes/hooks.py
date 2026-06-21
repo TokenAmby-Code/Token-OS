@@ -2532,6 +2532,32 @@ def _parse_launch_zealotry(value: Any) -> int | None:
 # Replaces shell scripts with Python for better reliability and debugging
 
 
+def _supplant_would_leak_singleton(
+    candidate_persona_id: str | None,
+    candidate_default_rank: str | None,
+    registrant_persona_id: str | None,
+) -> bool:
+    """True when supplanting ``candidate`` would transplant a *singleton* persona
+    onto a registrant that does not present that same persona.
+
+    Supplant/adoption (wrapper_launch_id, @INSTANCE_ID stamp, or primarch match)
+    re-keys an agent's OWN row across in-wrapper re-fires. A singleton (Custodes,
+    Fabricator-General, Administratum, ...) is a persona whose ``default_rank`` is
+    not the generic ``astartes`` worker rank. A clean dispatched worker presents
+    no persona (``registrant_persona_id is None``) or a different one. If such a
+    registrant supplants a singleton row it keeps the singleton's ``persona_id``,
+    then trips ``trg_instances_singleton_guard``, which retires the real
+    singleton — the fleet-wide decapitation channel. Refuse that adoption. A
+    singleton's own re-fire presents its persona (``registrant_persona_id`` equals
+    the singleton), so it is never blocked.
+    """
+    if not candidate_persona_id:
+        return False
+    if (candidate_default_rank or "astartes") == "astartes":
+        return False
+    return registrant_persona_id != candidate_persona_id
+
+
 async def handle_session_start(payload: dict) -> dict:
     """Handle SessionStart hook - register new Claude instance."""
     session_id = payload.get("session_id") or payload.get("conversation_id")
@@ -2854,7 +2880,12 @@ async def handle_session_start(payload: dict) -> dict:
         # --continue re-register stays on its own id.
         if not supplant_id and not existing_row and wrapper_launch_id:
             cursor = await db.execute(
-                """SELECT id FROM instances
+                """SELECT id, persona_id,
+                          COALESCE(
+                              (SELECT default_rank FROM personas WHERE id = instances.persona_id),
+                              'astartes'
+                          ) AS persona_default_rank
+                   FROM instances
                    WHERE wrapper_launch_id = ?
                      AND status != 'archived'
                      AND COALESCE(is_subagent, 0) = 0
@@ -2863,7 +2894,29 @@ async def handle_session_start(payload: dict) -> dict:
             )
             row = await cursor.fetchone()
             if row and row["id"] != session_id:
-                supplant_id = row["id"]
+                # wrapper_launch_id is a WEAK identity match (unlike the @INSTANCE_ID
+                # stamp / pane-occupancy supplants above, where the registrant IS in
+                # the persona's pane). A worker that inherited the dispatcher's
+                # wrapper_launch_id would otherwise supplant — and the singleton
+                # guard trigger then retire — the dispatcher's live singleton row.
+                # Refuse the adoption when the candidate is a singleton the
+                # registrant does not present; it registers fresh instead. A
+                # singleton's own re-fire presents its persona, so it is allowed.
+                if _supplant_would_leak_singleton(
+                    row["persona_id"], row["persona_default_rank"], launch_persona_id
+                ):
+                    logger.warning(
+                        "SessionStart: refusing wrapper_launch_id adoption of singleton "
+                        "row %s (persona_default_rank=%s) by registrant %s lacking a "
+                        "matching persona identity (launch_persona_id=%s); registering "
+                        "fresh to protect the singleton",
+                        str(row["id"])[:12],
+                        row["persona_default_rank"],
+                        str(session_id)[:12],
+                        launch_persona_id,
+                    )
+                else:
+                    supplant_id = row["id"]
 
         # --- Handle --continue (same session ID) with transplant ---
         # With --continue, the session ID doesn't change. If the row already exists
