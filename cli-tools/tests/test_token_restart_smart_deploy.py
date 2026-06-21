@@ -12,6 +12,7 @@ which must fall back to a full restart of the standard set.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -105,10 +106,21 @@ exit 0
     git = stub_bin / "git"
     git.write_text(
         r"""#!/usr/bin/env bash
-if [[ "$1" == "-C" ]]; then shift 2; fi
+git_cwd=""
+if [[ "$1" == "-C" ]]; then git_cwd="$2"; shift 2; fi
 if [[ "$1" == --git-dir=* ]]; then shift; fi
 if [[ "$1" == "--git-dir" ]]; then shift 2; fi
 sub="$1"; shift || true
+if [[ "$sub" == "status" && "${STUB_DIRTY_RUNTIME:-}" == "1" ]]; then
+  echo " M token-api/main.py"
+  exit 0
+fi
+if [[ "${STUB_REQUIRE_RUNTIME_WRITABLE:-}" == "1" && ( "$sub" == "fetch" || "$sub" == "checkout" ) && -n "$git_cwd" ]]; then
+  if [[ ! -w "$git_cwd/.git" ]]; then
+    echo "runtime git dir is locked during $sub" >&2
+    exit 77
+  fi
+fi
 case "$sub" in
   fetch|stash|update-ref|checkout|cat-file) exit 0 ;;
   status) exit 0 ;;
@@ -327,6 +339,40 @@ def test_dirty_runtime_checkout_aborts_without_restart(tmp_path: Path) -> None:
     calls = logfile.read_text()
     assert KICK_TOKENAPI not in calls
     assert KICK_DISCORD not in calls
+
+
+def _has_any_write_bit(path: Path) -> bool:
+    return bool(path.lstat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+
+def test_locked_runtime_is_unlocked_for_git_sync_then_relocked(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "token-api/main.py")
+    runtime = Path(env["CD_LIVE_CHECKOUT"])
+    git_dir = runtime / ".git"
+
+    # Match production: deploy-owned runtime starts FS-locked, including .git.
+    subprocess.run(
+        [
+            str(Path(__file__).resolve().parents[1] / "scripts" / "runtime-write-protect.sh"),
+            "lock",
+            str(runtime),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert not _has_any_write_bit(git_dir)
+
+    # The git stub fails fetch/checkout unless token-restart lifted the lock first.
+    env["STUB_REQUIRE_RUNTIME_WRITABLE"] = "1"
+    proc = _run(env)
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "runtime advanced" in proc.stdout
+    assert "runtime write-protected" in proc.stdout
+    assert not _has_any_write_bit(runtime)
+    assert not _has_any_write_bit(git_dir)
+    assert KICK_TOKENAPI in logfile.read_text()
 
 
 def test_cd_bare_repo_config_is_distinct_from_worktree_bare_repo(tmp_path: Path) -> None:
