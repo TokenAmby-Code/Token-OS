@@ -95,20 +95,48 @@ capture() {
 }
 
 classify() {
+    # Detection is wrap- AND resize-invariant: lowercase the capture, strip ALL
+    # whitespace, then test short atomic tokens. The pane hard-wraps (~36 col) and
+    # the Emperor resizes/shunts panes constantly, so any long prose phrase shatters
+    # across lines and a substring test silently misses (the modal then "sticks").
+    # CC 2.1.185 also dropped the old "implement this plan?" header, which is why
+    # the prose match regressed — atomic tokens cover the current + legacy copy.
+    #
+    # Claude action safety: only fire when the selection cursor (U+276F) is on the
+    # clear-context option; otherwise return "none" and let the human approve. We
+    # never guess a Down-count that could land on "No, refine" or bypass-without-clear.
     python3 -c 'import re,sys
 agent=sys.argv[1]
 text=sys.stdin.read()
-low=text.lower()
-clear = "clear context" in low or "clear the context" in low or "clear current context" in low
-approval = any(s in low for s in ["auto-accept edits", "approve edits", "manually approve", "manual approval", "start fresh", "fresh context", "fresh thread", "implement this plan?"])
-if not (clear and approval):
+flat=re.sub(r"\s+","",text.lower())
+# Anchor on the rare clear-context option, then require ONE short corroborating
+# atom — a plan-execute header OR an approval-option phrase. All tokens survive
+# whitespace-strip, so wrap/resize cannot blank the match, and a plan body that
+# merely mentions "clear context" in prose lacks the corroborating atom.
+clear = "clearcontext" in flat
+corrob = any(t in flat for t in (
+    "readytoexecute","writtenupaplan","implementthisplan","liketoproceed","wishtoproceed",
+    "acceptedits","approveedits","manuallyapprove","manualapproval","bypasspermissions"))
+if not (clear and corrob):
     print("none")
     raise SystemExit
 if agent == "auto":
-    if "codex" in low:
-        agent = "codex"
-    else:
-        agent = "claude"
+    agent = "codex" if "codex" in flat else "claude"
+if agent == "claude":
+    cur=None
+    lines=text.splitlines()
+    for i,ln in enumerate(lines):
+        if "❯" in ln or re.match(r"\s*>\s*\d", ln):
+            chunk=[ln]
+            for nxt in lines[i+1:]:
+                if re.match(r"\s*[❯>]?\s*\d+[.)]", nxt) or not nxt.strip():
+                    break
+                chunk.append(nxt)
+            cur=re.sub(r"\s+",""," ".join(chunk).lower())
+            break
+    if cur is None or "clearcontext" not in cur:
+        print("none")
+        raise SystemExit
 print(agent)' "$AGENT"
 }
 
