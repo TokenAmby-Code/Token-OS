@@ -33,6 +33,14 @@ _resolve_token_os_bin() {
     printf '%s\n' "$found"
     return 0
   fi
+  for root in "${TOKEN_OS:-}" "${HOME%/}/runtimes/Token-OS/live"; do
+    [[ -n "$root" ]] || continue
+    cand="${root%/}/cli-tools/bin/${tool}"
+    if [[ -x "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
   for root in "${IMPERIUM:-}" "${CIVIC:-}"; do
     [[ -n "$root" ]] || continue
     cand="${root%/}/runtimes/token-os/live/cli-tools/bin/${tool}"
@@ -44,7 +52,24 @@ _resolve_token_os_bin() {
   return 1
 }
 
+normalize_agent() {
+  case "${1:-auto}" in
+    codex|openai) echo codex ;;
+    claude|claude-code|anthropic) echo claude ;;
+    *) echo auto ;;
+  esac
+}
+
+resolve_pane_agent() {
+  local pane="$1" tmuxctl_bin agent
+  tmuxctl_bin=$(_resolve_token_os_bin tmuxctl) || true
+  [[ -n "${tmuxctl_bin:-}" ]] || { echo auto; return 0; }
+  agent=$("$tmuxctl_bin" resolve-agent --pane "$pane" --agent auto --default auto 2>/dev/null || true)
+  normalize_agent "$agent"
+}
+
 PANE="${TMUX_PANE:-}"
+APPROVER=$(_resolve_token_os_bin tmux-plan-approve-clear) || true
 # Claude Code strips $TMUX_PANE from the hook env (see generic-hook.sh's PID-walk
 # recovery). Without recovery, ExitPlanMode here would silently yield with no
 # approver — the preplan → /plan → approve chain loses its approve+context-clear
@@ -58,11 +83,18 @@ if [[ -z "$PANE" ]]; then
 fi
 
 if [[ -n "$PANE" ]]; then
-  (
-    tmux-plan-approve-clear --pane "$PANE" --agent auto --timeout 10 >> "$LOG" 2>&1 || true
-  ) </dev/null >/dev/null 2>&1 &
-  disown 2>/dev/null || true
-  log "ExitPlanMode ${SESSION_ID:-unknown}: launched clear-context approver for $PANE"
+  AGENT=$(resolve_pane_agent "$PANE")
+  if [[ "$AGENT" == auto ]]; then
+    log "ExitPlanMode ${SESSION_ID:-unknown}: could not resolve harness for $PANE; yielding without approver"
+  elif [[ -z "${APPROVER:-}" ]]; then
+    log "ExitPlanMode ${SESSION_ID:-unknown}: tmux-plan-approve-clear not found; yielding without approver"
+  else
+    (
+      "$APPROVER" --pane "$PANE" --agent "$AGENT" --timeout 10 --no-state >> "$LOG" 2>&1 || true
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    log "ExitPlanMode ${SESSION_ID:-unknown}: launched clear-context approver for $PANE as $AGENT"
+  fi
 else
   log "ExitPlanMode ${SESSION_ID:-unknown}: no TMUX_PANE and pane recovery failed; yielding without approver"
 fi
