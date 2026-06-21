@@ -1880,7 +1880,7 @@ def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path
     assert "stack dispatch returned a non-canonical id" in result.stderr
 
 
-def test_dispatch_stack_new_fails_fast_when_wrapper_never_starts(tmp_path: Path) -> None:
+def test_dispatch_stack_new_launch_failure_does_not_inject_target_pane(tmp_path: Path) -> None:
     """A sent launch whose wrapper never stamps the pane must not look successful.
 
     This is the observable-launch guard for the real failure mode where the
@@ -1941,8 +1941,14 @@ def test_dispatch_stack_new_fails_fast_when_wrapper_never_starts(tmp_path: Path)
 
     assert result.returncode != 0
     assert "launch failed: wrapper did not start" in result.stderr
+    assert "staged command may not have reached the pane" in result.stderr
     assert "%77" not in result.stderr
-    assert "DISPATCH LAUNCH FAILED" in tmux_log.read_text(encoding="utf-8")
+    tmux_calls = tmux_log.read_text(encoding="utf-8")
+    assert "DISPATCH LAUNCH FAILED" not in tmux_calls
+    assert not any(
+        line.startswith("send-keys -t %77") and "launch failed" in line.lower()
+        for line in tmux_calls.splitlines()
+    )
 
 
 def test_dispatch_stack_new_observer_accepts_matching_wrapper_stamp(tmp_path: Path) -> None:
@@ -2259,7 +2265,13 @@ def test_dispatch_fails_fast_when_registry_row_is_stopped_after_stamp(tmp_path: 
 
     assert result.returncode == 70
     assert "instance row did not bind live" in result.stderr
-    assert "DISPATCH LAUNCH FAILED" in tmux_log.read_text(encoding="utf-8")
+    assert "registry row is missing, stopped, wrong-dir, or missing pane_label" in result.stderr
+    tmux_calls = tmux_log.read_text(encoding="utf-8")
+    assert "DISPATCH LAUNCH FAILED" not in tmux_calls
+    assert not any(
+        line.startswith("send-keys -t %44") and "launch failed" in line.lower()
+        for line in tmux_calls.splitlines()
+    )
 
 
 def test_dispatch_stack_new_fails_fast_when_instance_never_registers(tmp_path: Path) -> None:
@@ -2326,7 +2338,13 @@ def test_dispatch_stack_new_fails_fast_when_instance_never_registers(tmp_path: P
 
     assert result.returncode != 0
     assert "launch failed: instance did not register" in result.stderr
-    assert "DISPATCH LAUNCH FAILED" in tmux_log.read_text(encoding="utf-8")
+    assert "SessionStart did not stamp the pane" in result.stderr
+    tmux_calls = tmux_log.read_text(encoding="utf-8")
+    assert "DISPATCH LAUNCH FAILED" not in tmux_calls
+    assert not any(
+        line.startswith("send-keys -t %77") and "launch failed" in line.lower()
+        for line in tmux_calls.splitlines()
+    )
 
 
 def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) -> None:
