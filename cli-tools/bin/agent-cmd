@@ -8,6 +8,7 @@ source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${_LIB_DIR}/tmux-guard.sh"
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+TMUXCTL_BIN="${TMUXCTL_BIN:-${_BIN_DIR}/tmuxctl}"
 TARGET_MODE="self"
 TARGET_VALUE=""
 DETACH=false
@@ -140,31 +141,23 @@ send_command() {
     dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
     hash=$(printf '%s' "$cmd" | payload_hash)
 
-    if ! tmux_wait_for_clear "$pane" "${TMUX_GUARD_TIMEOUT:-0}"; then
-        echo "agent-cmd: blocked — user input not cleared in $pane; no bytes delivered" >&2
-        blocked=true
-        reason="typing_guard"
-        verification_status="blocked"
-        rc=1
-    else
-        if [[ -n "${INSTANCE_ID:-}" ]]; then
-            for _ in {1..20}; do
-                lock_resp=$(curl -s --connect-timeout 1 --max-time 2 \
-                    -X POST "$API_URL/api/instances/$INSTANCE_ID/input-lock?locker=$locker" 2>/dev/null || true)
-                if echo "$lock_resp" | grep -q '"acquired": *true'; then
-                    locked=true
-                    break
-                fi
-                sleep 0.5
-            done
-        fi
-
-        out=$(TMUX_SEND_GATE_ALLOW="${TMUX_SEND_GATE_ALLOW:-agent-cmd}" "${_BIN_DIR}/tmuxctl" send-text --pane "$pane" --text "$cmd" 2>&1) || {
-            echo "$out" >&2
-            rc=1
-        }
-        [[ "$rc" == 0 ]] || verification_status="failed"
+    if [[ -n "${INSTANCE_ID:-}" ]]; then
+        for _ in {1..20}; do
+            lock_resp=$(curl -s --connect-timeout 1 --max-time 2 \
+                -X POST "$API_URL/api/instances/$INSTANCE_ID/input-lock?locker=$locker" 2>/dev/null || true)
+            if echo "$lock_resp" | grep -q '"acquired": *true'; then
+                locked=true
+                break
+            fi
+            sleep 0.5
+        done
     fi
+
+    out=$("$TMUXCTL_BIN" send-text --pane "$pane" --text "$cmd" 2>&1) || {
+        echo "$out" >&2
+        rc=1
+    }
+    [[ "$rc" == 0 ]] || verification_status="failed"
 
     if [[ "$locked" == true ]]; then
         curl -s --connect-timeout 1 --max-time 2 \
@@ -178,16 +171,6 @@ send_command() {
 }
 
 if [[ "$DETACH" == true ]]; then
-    # Fail-loud preflight: do not background a send that is already blocked,
-    # because that recreates the silent swallow path (empty output, no delivery).
-    if ! tmux_wait_for_clear "$PANE" "${TMUX_GUARD_TIMEOUT:-0}"; then
-        dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
-        hash=$(printf '%s' "$COMMAND" | payload_hash)
-        echo "agent-cmd: blocked — user input not cleared in $PANE; detached injection not started" >&2
-        printf '{"dispatch_id":"%s","payload_hash":"%s","pane":"%s","instance_id":"%s","verification_status":"blocked","verified_by":"tmux-guard","blocked":true,"reason":"typing_guard"}\n' \
-            "$dispatch_id" "$hash" "$PANE" "${INSTANCE_ID:-}"
-        exit 1
-    fi
     (send_command "$PANE" "$COMMAND" >/dev/null 2>>"${TMUX_GUARD_LOG_STDERR:-/tmp/agent-cmd-detached.err}") &
     disown 2>/dev/null || true
 else
