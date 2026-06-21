@@ -1411,6 +1411,70 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in content, content
 
 
+def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path: Path) -> None:
+    """Stack dispatch may return the canonical public pane id (mechanicus:N).
+
+    Dispatch must accept that human-facing surface and translate it to the
+    physical tmux pane before staging the launch command.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    rec = tmp_path / "tmux_calls.txt"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:6"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" && "$4" == "mechanicus:6" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        f'#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\0" "$a" >> {rec}; done\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "non-pane id" not in result.stderr
+
+    calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
+    assert "-t" in calls and "%77" in calls, calls
+    staged_arg = next((c for c in calls if c.startswith("bash /")), None)
+    assert staged_arg is not None, calls
+    content = Path(staged_arg.split(" ", 1)[1]).read_text(encoding="utf-8")
+    assert "TMUX_PANE=%77" in content, content
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=%77" in content, content
+    assert "TMUX_PANE=mechanicus:6" not in content, content
+
+
 # --- Step 3: rank-based persona behavior resolver / row-file invariant ---------
 
 
