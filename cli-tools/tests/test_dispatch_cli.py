@@ -1943,6 +1943,261 @@ def test_dispatch_stack_new_observer_accepts_matching_wrapper_stamp(tmp_path: Pa
     assert "DISPATCH LAUNCH FAILED" not in tmux_log.read_text(encoding="utf-8")
 
 
+def test_dispatch_tmux_target_rejects_protected_singleton_seat(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%27"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {tmux_log}\n'
+        'if [[ "$1" == "display-message" ]]; then printf "bash||legion:custodes|999|\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "legion:custodes",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 73
+    assert "protected singleton seat" in result.stderr
+    assert "send-keys" not in tmux_log.read_text(encoding="utf-8")
+
+
+def test_dispatch_tmux_target_rejects_live_agent_descendant_without_instance_stamp(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%44"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {tmux_log}\n'
+        'if [[ "$1" == "display-message" ]]; then printf "bash||palace:E|999|\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<'EOF'\n"
+        "  999     1 bash\n"
+        " 1000   999 /opt/homebrew/bin/node /Users/tokenclaw/.local/bin/claude\n"
+        "EOF\n",
+        encoding="utf-8",
+    )
+    fake_ps.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "palace:E",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 73
+    assert "live Claude/Codex descendant" in result.stderr
+    assert "send-keys" not in tmux_log.read_text(encoding="utf-8")
+
+
+def test_dispatch_tmux_target_bakes_pane_label_into_launch_env(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%44"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "show-options" ]]; then echo "palace:E"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--target",
+            "palace:E",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=<tmux-pane>" in result.stdout
+    assert "TOKEN_API_PANE_LABEL=palace:E" in result.stdout
+
+
+def test_dispatch_fails_fast_when_registry_row_is_stopped_after_stamp(tmp_path: Path) -> None:
+    import sqlite3
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+    db = tmp_path / "agents.db"
+    instance_id = "live-stamped-but-stopped"
+    wrapper_id = "11111111-2222-3333-4444-555555555555"
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, status TEXT, working_dir TEXT, tmux_pane TEXT, pane_label TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO instances VALUES (?, 'stopped', ?, '%44', 'palace:E')",
+            (instance_id, str(ROOT)),
+        )
+
+    fake_uuidgen = fake_bin / "uuidgen"
+    fake_uuidgen.write_text(
+        f"#!/usr/bin/env bash\nprintf '%s\\n' '{wrapper_id}'\n", encoding="utf-8"
+    )
+    fake_uuidgen.chmod(0o755)
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%44"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {tmux_log}\n'
+        'if [[ "$1" == "display-message" && "$*" == *"@TOKEN_API_WRAPPER_LAUNCH_ID"* ]]; then\n'
+        f'  printf "%s\\n" "{wrapper_id}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "display-message" && "${@: -1}" == "#{@INSTANCE_ID}" ]]; then\n'
+        f'  printf "%s\\n" "{instance_id}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "show-options" ]]; then echo "palace:E"; exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "bash||palace:E|999|\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_DB"] = str(db)
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "palace:E",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 70
+    assert "instance row did not bind live" in result.stderr
+    assert "DISPATCH LAUNCH FAILED" in tmux_log.read_text(encoding="utf-8")
+
+
 def test_dispatch_stack_new_fails_fast_when_instance_never_registers(tmp_path: Path) -> None:
     """Wrapper start alone is not enough; the agent must reach SessionStart."""
     fake_bin = tmp_path / "bin"

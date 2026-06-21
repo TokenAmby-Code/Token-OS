@@ -1477,16 +1477,76 @@ materialize_physical_pane() {
   printf '%s' "$target"
 }
 
+resolve_pane_label_for_env() {
+  local pane="$1" label=""
+  [[ -n "$pane" ]] || return 0
+  if command -v tmux >/dev/null 2>&1; then
+    label="$(tmux show-options -pv -t "$pane" @PANE_ID 2>/dev/null || true)"
+  fi
+  if [[ -z "$label" && "$pane" =~ ^[a-z][a-z0-9-]*:[A-Za-z0-9-]+$ ]]; then
+    label="$pane"
+  fi
+  printf '%s' "$label"
+}
+
+pane_has_active_agent_process() {
+  local root_pid="$1" needles="claude|codex"
+  [[ -n "$root_pid" && "$root_pid" =~ ^[0-9]+$ && "$root_pid" != "0" ]] || return 1
+  ps -A -o pid=,ppid=,command= 2>/dev/null | awk -v root="$root_pid" -v needles="$needles" '
+    {
+      pid=$1; ppid=$2; $1=""; $2=""; sub(/^  */, "", $0)
+      parent[pid]=ppid
+      cmd[pid]=tolower($0)
+    }
+    END {
+      for (pid in parent) {
+        cur=pid
+        while (cur in parent) {
+          if (parent[cur] == root) {
+            if (cmd[pid] ~ needles) exit 0
+            break
+          }
+          cur=parent[cur]
+        }
+      }
+      exit 1
+    }
+  '
+}
+
 assert_dispatch_target_unoccupied() {
   # Caller passes the canonical working id; resolve to physical once, here, at the
   # raw-tmux boundary.
-  local pane meta cmd title
+  local pane meta cmd title pane_label pane_pid instance_id
   [[ "${TOKEN_API_DISPATCH_FORCE_OCCUPIED:-}" == "1" ]] && return 0
   pane="$(materialize_physical_pane "$1")"
-  meta="$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{pane_title}' 2>/dev/null || true)"
+  meta="$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{pane_title}|#{@PANE_ID}|#{pane_pid}|#{@INSTANCE_ID}' 2>/dev/null || true)"
   [[ -n "$meta" ]] || return 0
   cmd="${meta%%|*}"
-  title="${meta#*|}"
+  meta="${meta#*|}"
+  title="${meta%%|*}"
+  meta="${meta#*|}"
+  pane_label="${meta%%|*}"
+  meta="${meta#*|}"
+  pane_pid="${meta%%|*}"
+  instance_id="${meta#*|}"
+  case "$pane_label" in
+    legion:custodes|legion:malcador|mechanicus:fabricator-general|mechanicus:admin|koronus:pax|koronus:orchestrator)
+      err "target pane $TARGET is a protected singleton seat ($pane_label); refusing dispatch injection"
+      err "use a worker pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
+      exit 73
+      ;;
+  esac
+  if [[ -n "$instance_id" ]]; then
+    err "target pane $TARGET appears occupied (@INSTANCE_ID=$instance_id); refusing to inject dispatch command"
+    err "use an empty shell pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
+    exit 73
+  fi
+  if pane_has_active_agent_process "$pane_pid"; then
+    err "target pane $TARGET has a live Claude/Codex descendant (pane_pid=$pane_pid); refusing dispatch injection"
+    err "use an empty shell pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
+    exit 73
+  fi
   case "$cmd" in
     node|claude|codex)
       err "target pane $TARGET appears occupied (command=$cmd, title=$title); refusing to inject dispatch command"
@@ -1621,6 +1681,7 @@ dispatch_codex_launch_inline() {
   local dispatch_slot="${TOKEN_API_DISPATCH_SLOT:-}"
   local launch_mode="${TOKEN_API_LAUNCH_MODE:-}"
   local resolved_tmux_pane="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
+  local pane_label="${TOKEN_API_PANE_LABEL:-}"
   local instance_type="${TOKEN_API_INSTANCE_TYPE:-golden_throne}"
   local zealotry="${TOKEN_API_ZEALOTRY:-5}"
   local parent_instance_id="${TOKEN_API_PARENT_INSTANCE_ID:-}"
@@ -1664,6 +1725,7 @@ dispatch_codex_launch_inline() {
     [[ -n "${TMUX:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX" '. + {TMUX: $v}')
     [[ -n "${session_id:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$session_id" '. + {TOKEN_API_SESSION_ID: $v}')
     [[ -n "${resolved_tmux_pane:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$resolved_tmux_pane" '. + {TMUX_PANE: $v}')
+    [[ -n "${pane_label:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$pane_label" '. + {TOKEN_API_PANE_LABEL: $v}')
     local persona_env="${TOKEN_API_PERSONA:-}"
     [[ -n "$persona_env" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$persona_env" '. + {TOKEN_API_PERSONA: $v}')
     [[ -n "${codex_profile:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$codex_profile" '. + {TOKEN_API_CODEX_PROFILE: $v}')
@@ -1716,6 +1778,7 @@ dispatch_codex_launch_inline() {
     --arg dispatch_window "$dispatch_window" \
     --arg dispatch_mode "$dispatch_mode" \
     --arg dispatch_slot "$dispatch_slot" \
+    --arg pane_label "$pane_label" \
     --arg session_doc "$session_doc" \
     --arg target_working_dir "$target_working_dir" \
     --arg launch_mode "$launch_mode" \
@@ -1734,6 +1797,7 @@ dispatch_codex_launch_inline() {
       dispatch_window: $dispatch_window,
       dispatch_mode: $dispatch_mode,
       dispatch_slot: $dispatch_slot,
+      pane_label: $pane_label,
       dispatch_session_doc_path: $session_doc,
       target_working_dir: $target_working_dir,
       launch_mode: $launch_mode,
@@ -1822,6 +1886,7 @@ dispatch_codex_launch_inline() {
     "TOKEN_API_DISPATCH_WINDOW=${dispatch_window}"
     "TOKEN_API_DISPATCH_MODE=${dispatch_mode}"
     "TOKEN_API_DISPATCH_SLOT=${dispatch_slot}"
+    "TOKEN_API_PANE_LABEL=${pane_label}"
     "TOKEN_API_PARENT_INSTANCE_ID=${parent_instance_id}"
     "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${session_doc}"
     "TOKEN_API_TARGET_WORKING_DIR=${working_dir}"
@@ -1866,10 +1931,12 @@ build_agent_command() {
   # the canonical working id at this hand-off boundary so storage + consumers stay
   # unchanged (column stays physical, fleet launchable at every commit).
   if [[ -n "${RESOLVED_TARGET:-}" ]]; then
-    local resolved_physical_pane
+    local resolved_physical_pane resolved_pane_label
     resolved_physical_pane="$(materialize_physical_pane "$RESOLVED_TARGET")"
     envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${resolved_physical_pane}")
     envs+=("TMUX_PANE=${resolved_physical_pane}")
+    resolved_pane_label="$(resolve_pane_label_for_env "$resolved_physical_pane")"
+    [[ -n "$resolved_pane_label" ]] && envs+=("TOKEN_API_PANE_LABEL=${resolved_pane_label}")
   fi
   if [[ -n "$RESUME_ID" ]]; then
     if [[ "$ENGINE" == "codex" ]]; then
@@ -2035,6 +2102,45 @@ wait_for_dispatch_instance_register() {
   return 1
 }
 
+wait_for_dispatch_registry_bind() {
+  local pane="$1" target_display="$2" timeout deadline instance_id row status row_workdir row_pane row_label expected_label message
+  timeout="$(dispatch_launch_observe_timeout)"
+  [[ "$timeout" -gt 0 ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  [[ -f "$DB_PATH" ]] || return 0
+  expected_label="$(resolve_pane_label_for_env "$pane")"
+  deadline=$((SECONDS + timeout))
+  while (( SECONDS <= deadline )); do
+    instance_id="$(pane_instance_id "$pane")"
+    if [[ -z "$instance_id" ]]; then
+      sleep 0.2
+      continue
+    fi
+    row="$(sqlite3 -separator $'\t' "$DB_PATH" \
+      "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(tmux_pane,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
+      2>/dev/null || true)"
+    if [[ -n "$row" ]]; then
+      IFS=$'\t' read -r status row_workdir row_pane row_label <<< "$row"
+      if [[ "$status" != "stopped" && "$status" != "archived" ]]; then
+        if [[ -z "$RESUME_ID" && "$row_workdir" != "$WORK_DIR" ]]; then
+          sleep 0.2
+          continue
+        fi
+        if [[ -n "$expected_label" && -z "$row_label" ]]; then
+          sleep 0.2
+          continue
+        fi
+        return 0
+      fi
+    fi
+    sleep 0.2
+  done
+  message="DISPATCH LAUNCH FAILED: instance row did not bind live within ${timeout}s for ${ENGINE} launch to ${target_display}. The pane stamped an instance, but the registry row is missing, stopped, wrong-dir, or missing pane_label; inspect Token-API registration before reusing it."
+  write_launch_failure_to_pane "$pane" "$message"
+  err "launch failed: instance row did not bind live within ${timeout}s for ${ENGINE} launch to ${target_display}"
+  return 1
+}
+
 build_dispatch_command() {
   local -a args
   if [[ -n "$RESUME_ID" ]]; then
@@ -2049,6 +2155,7 @@ build_dispatch_command() {
   fi
   [[ -n "$PERSONA" ]] && args+=(--persona "$PERSONA")
   [[ -n "$CLAUDE_MODEL" ]] && args+=(--model "$CLAUDE_MODEL")
+  [[ -n "$WORKTREE_BRANCH" ]] && args+=(--worktree "$WORKTREE_BRANCH")
   if [[ -z "$RESUME_ID" ]]; then
     [[ -n "$SESSION_DOC" ]] && args+=(--session-doc "$SESSION_DOC")
     [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
@@ -2153,6 +2260,9 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   if ! wait_for_dispatch_instance_register "$phys_pane" "$stack_display"; then
     exit 70
   fi
+  if ! wait_for_dispatch_registry_bind "$phys_pane" "$stack_display"; then
+    exit 70
+  fi
   printf '%s\n' "dispatched $ENGINE to $stack_display" | redact_tmux_panes_for_display
   exit 0
 fi
@@ -2187,6 +2297,9 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
     exit 70
   fi
   if ! wait_for_dispatch_instance_register "$PHYSICAL_TARGET" "$target_display"; then
+    exit 70
+  fi
+  if ! wait_for_dispatch_registry_bind "$PHYSICAL_TARGET" "$target_display"; then
     exit 70
   fi
   echo "dispatched $ENGINE to $target_display"

@@ -80,6 +80,13 @@ def test_explicit_worktree_branch(env: Env) -> None:
     assert "wt-my-branch" in _worktree_line(res.stdout)
 
 
+def test_explicit_worktree_branch_survives_dispatch_reinvocation(env: Env) -> None:
+    res = _run(env, "--dir", str(env.prod), "--worktree", "my-branch", "do it")
+    assert res.returncode == 0, res.stderr
+    assert "dispatch_command:" in res.stdout
+    assert "--worktree my-branch" in res.stdout
+
+
 def test_worktree_requires_branch_value(env: Env) -> None:
     # --worktree must not swallow the following flag as its value.
     res = _run(env, "--dir", str(env.prod), "--worktree", "--no-gt", "do it")
