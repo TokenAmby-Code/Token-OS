@@ -11645,6 +11645,73 @@ async def _pane_sender_is_custodes(caller_pane: str | None) -> bool:
     return bool(row) and (row["legion"] or "").lower() == "custodes"
 
 
+async def _pane_live_agent_engine(tmux_pane: str | None) -> str | None:
+    """Return claude/codex when a resolved pane is backed by a live agent process.
+
+    This is deliberately tmux/process based, not registry based: Codex singleton
+    panes can be live and usable without an ``instances`` row.
+    """
+    pane = await shared.resolve_tmux_pane_id(tmux_pane)
+    if not pane:
+        return None
+    for row_pane, command, cwd, window, tty in await _tmux_pane_rows():
+        if row_pane != pane:
+            continue
+        is_agent, engine = await _pane_is_agent(command, cwd, window, tty)
+        return engine if is_agent else None
+    return None
+
+
+async def _direct_tmux_pane_delivery(
+    tmux_pane: str,
+    payload: str,
+    *,
+    source: str,
+    purpose: str,
+    clear_prompt: bool = False,
+) -> dict:
+    """Deliver directly to a live pane when no registry row exists.
+
+    The normal pane-write queue resolves ``instance_id -> pane`` through the
+    registry/tmux stamp path.  Rowless Codex singleton panes have no durable row
+    to resolve, so route them through the lower-level tmuxctl primitive after a
+    live agent-process check.
+    """
+    pane = await shared.resolve_tmux_pane_id(tmux_pane)
+    engine = await _pane_live_agent_engine(pane)
+    base = {
+        "instance_id": pane or tmux_pane,
+        "tmux_pane": pane,
+        "stored_pane": tmux_pane,
+        "source": source,
+        "purpose": purpose,
+        "fallback": "tmuxctl_send_text_no_registry_row",
+        "engine": engine,
+    }
+    if not pane:
+        return {**base, "status": PANE_WRITE_CANCELLED, "reason": "pane_unresolved"}
+    if not engine:
+        return {**base, "status": PANE_WRITE_CANCELLED, "reason": "no_live_agent_process"}
+    send_result = await _tmux_send_payload_then_submit(
+        pane,
+        payload,
+        clear_prompt=clear_prompt,
+    )
+    if send_result.get("gated"):
+        gate_reason = send_result.get("gate_reason") or "gated"
+        return {
+            **base,
+            "status": PANE_WRITE_PENDING,
+            "reason": f"send_gated:{gate_reason}",
+            **send_result,
+        }
+    return {
+        **base,
+        "status": PANE_WRITE_SENT if send_result.get("returncode") == 0 else PANE_WRITE_FAILED,
+        **send_result,
+    }
+
+
 async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: bool = False) -> dict:
     """Inject `payload` into ``target_pane`` via the existing pane-write queue.
 
@@ -11711,7 +11778,16 @@ async def talk_send(request: TalkSendRequest):
         }
 
     target_instance = await talk_service.lookup_instance_for_pane(target_pane)
-    target_engine = (target_instance or {}).get("engine") or "claude"
+    target_engine = (target_instance or {}).get("engine")
+    rowless_live_engine = None
+    if target_instance is None:
+        rowless_live_engine = await _pane_live_agent_engine(target_pane)
+        if not rowless_live_engine:
+            raise HTTPException(
+                status_code=400,
+                detail=f"target_pane has no live agent process: {target_raw}",
+            )
+    target_engine = target_engine or rowless_live_engine or "claude"
     record = await talk_service.register_talk(
         caller_pane=caller_pane,
         target_pane=target_pane,
@@ -11720,9 +11796,22 @@ async def talk_send(request: TalkSendRequest):
         engine=target_engine,
     )
     try:
-        send_result = await _talk_send_payload(
-            target_pane, request.payload, hook_driven=talk_hook_driven
-        )
+        if target_instance is None:
+            send_result = await _direct_tmux_pane_delivery(
+                target_pane,
+                request.payload,
+                source="talk",
+                purpose="talk_send",
+                clear_prompt=False,
+            )
+            if send_result.get("status") in {PANE_WRITE_CANCELLED, PANE_WRITE_FAILED}:
+                raise RuntimeError(
+                    send_result.get("reason") or send_result.get("error") or "delivery_failed"
+                )
+        else:
+            send_result = await _talk_send_payload(
+                target_pane, request.payload, hook_driven=talk_hook_driven
+            )
     except Exception as exc:  # noqa: BLE001
         await talk_service.cancel_talk(record["talk_id"], reason="delivery_failed")
         detail = await talk_service.publicize_payload(f"talk delivery failed: {exc}")
@@ -11807,16 +11896,26 @@ async def brief_send(request: BriefSendRequest):
                 )
                 receipt = {**receipt, **target}
             else:
-                queued = await enqueue_pane_write(
-                    instance_id=pane_id,
-                    tmux_pane=pane_id,
-                    source="brief",
-                    purpose="brief_send",
-                    payload=request.payload,
-                    hook_driven=brief_hook_driven,
-                )
-                drained = await process_pane_write_queue_once(queued["id"])
-                receipt = drained[0] if drained else queued
+                instance = await talk_service.lookup_instance_for_pane(pane_id)
+                if instance is None:
+                    receipt = await _direct_tmux_pane_delivery(
+                        pane_id,
+                        request.payload,
+                        source="brief",
+                        purpose="brief_send",
+                        clear_prompt=True,
+                    )
+                else:
+                    queued = await enqueue_pane_write(
+                        instance_id=pane_id,
+                        tmux_pane=pane_id,
+                        source="brief",
+                        purpose="brief_send",
+                        payload=request.payload,
+                        hook_driven=brief_hook_driven,
+                    )
+                    drained = await process_pane_write_queue_once(queued["id"])
+                    receipt = drained[0] if drained else queued
                 receipt = {**receipt, **target}
             delivered.append(receipt)
         except Exception as exc:  # noqa: BLE001
