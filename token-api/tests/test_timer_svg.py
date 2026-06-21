@@ -7,12 +7,13 @@ well-formed, embeddable element for a real timeline.
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 
 from timer_svg import render_timer_svg
 
 
-def _seeded_summary():
+def _seeded_summary() -> dict:
     # A day that earns, peaks, then dips into backlog.
     timeline = [
         {"time": "2026-06-20T06:00:00-07:00", "balance_ms": 0},
@@ -29,7 +30,7 @@ def _seeded_summary():
     }
 
 
-def test_renders_well_formed_svg():
+def test_renders_well_formed_svg() -> None:
     svg = render_timer_svg(_seeded_summary())
     assert svg.startswith("<svg")
     assert svg.rstrip().endswith("</svg>")
@@ -39,7 +40,7 @@ def test_renders_well_formed_svg():
     assert root.get("viewBox") == "0 0 800 400"
 
 
-def test_contains_balance_polyline_and_axis_labels():
+def test_contains_balance_polyline_and_axis_labels() -> None:
     summary = _seeded_summary()
     svg = render_timer_svg(summary)
     # The core series is a polyline.
@@ -57,7 +58,7 @@ def test_contains_balance_polyline_and_axis_labels():
     assert "18:00" in svg
 
 
-def test_empty_timeline_renders_placeholder_not_crash():
+def test_empty_timeline_renders_placeholder_not_crash() -> None:
     svg = render_timer_svg({"date": "2026-06-20", "balance_timeline": []})
     root = ET.fromstring(svg)  # still valid XML
     assert root.tag.endswith("svg")
@@ -65,13 +66,13 @@ def test_empty_timeline_renders_placeholder_not_crash():
     assert "<polyline" not in svg
 
 
-def test_missing_timeline_key_renders_placeholder():
+def test_missing_timeline_key_renders_placeholder() -> None:
     svg = render_timer_svg({"date": "2026-06-20"})
     assert "No timer data" in svg
     ET.fromstring(svg)
 
 
-def test_single_point_timeline_is_placeholder():
+def test_single_point_timeline_is_placeholder() -> None:
     summary = {
         "date": "2026-06-20",
         "balance_timeline": [{"time": "2026-06-20T06:00:00-07:00", "balance_ms": 0}],
@@ -81,7 +82,7 @@ def test_single_point_timeline_is_placeholder():
     ET.fromstring(svg)
 
 
-def test_unparseable_timestamps_fall_back_to_index_spacing():
+def test_unparseable_timestamps_fall_back_to_index_spacing() -> None:
     summary = {
         "date": "2026-06-20",
         "balance_timeline": [
@@ -96,11 +97,12 @@ def test_unparseable_timestamps_fall_back_to_index_spacing():
     svg = render_timer_svg(summary)
     assert "<polyline" in svg
     ET.fromstring(svg)
-    # No X-axis HH:MM labels when timestamps don't parse.
-    assert "<text" in svg
+    # No X-axis HH:MM labels when timestamps don't parse (the balance labels are
+    # "Xh Ym", never "HH:MM", and the date carries no time-of-day).
+    assert re.search(r"\d{1,2}:\d{2}", svg) is None
 
 
-def test_all_zero_balance_does_not_divide_by_zero():
+def test_all_zero_balance_does_not_divide_by_zero() -> None:
     summary = {
         "date": "2026-06-20",
         "balance_timeline": [

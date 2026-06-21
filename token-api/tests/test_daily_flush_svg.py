@@ -10,6 +10,10 @@ temp Daily dir — never the live vault/DB/tmux.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pytest
 
 _DATE = "2026-06-20"
 
@@ -23,7 +27,7 @@ _SHIFTS = [
 ]
 
 
-def _seed_timer_shifts(db_path):
+def _seed_timer_shifts(db_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS timer_shifts (
@@ -51,7 +55,7 @@ def _seed_timer_shifts(db_path):
     conn.close()
 
 
-def _daily_dir(main, tmp_path, monkeypatch):
+def _daily_dir(main: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     daily = tmp_path / "Daily"
     (daily).mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(main, "OBSIDIAN_DAILY_PATH", daily)
@@ -78,7 +82,9 @@ _NOTE_WITH_CALLOUT = (
 )
 
 
-def test_flush_writes_svg_and_embeds_in_now_callout(app_env, tmp_path, monkeypatch):
+def test_flush_writes_svg_and_embeds_in_now_callout(
+    app_env: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     main = app_env.main
     daily = _daily_dir(main, tmp_path, monkeypatch)
     _seed_timer_shifts(app_env.db_path)
@@ -128,7 +134,9 @@ def test_flush_writes_svg_and_embeds_in_now_callout(app_env, tmp_path, monkeypat
     assert remaining == 0
 
 
-def test_flush_appends_embed_when_note_has_no_now_callout(app_env, tmp_path, monkeypatch):
+def test_flush_appends_embed_when_note_has_no_now_callout(
+    app_env: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Prior-day notes from create_daily_note_file have no NOW callout — the embed
     must be appended, not lost."""
     main = app_env.main
@@ -149,7 +157,9 @@ def test_flush_appends_embed_when_note_has_no_now_callout(app_env, tmp_path, mon
     assert "body." in final  # original body preserved
 
 
-def test_flush_with_no_shifts_writes_nothing(app_env, tmp_path, monkeypatch):
+def test_flush_with_no_shifts_writes_nothing(
+    app_env: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No shift data → the flush returns None and writes no SVG (no note touch)."""
     main = app_env.main
     daily = _daily_dir(main, tmp_path, monkeypatch)
@@ -160,7 +170,9 @@ def test_flush_with_no_shifts_writes_nothing(app_env, tmp_path, monkeypatch):
     assert not (daily / "analytics" / f"timer-{_DATE}.svg").exists()
 
 
-def test_flush_without_note_still_writes_svg(app_env, tmp_path, monkeypatch):
+def test_flush_without_note_still_writes_svg(
+    app_env: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """If the daily note doesn't exist, the SVG + JSON are still written (the note
     embed is simply skipped) — no crash."""
     main = app_env.main

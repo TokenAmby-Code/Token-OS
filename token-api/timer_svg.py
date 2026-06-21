@@ -35,7 +35,6 @@ _PLOT_H = _PLOT_Y1 - _PLOT_Y0
 _BG = "#1e1e2e"
 _FG = "#cdd6f4"
 _MUTED = "#6c7086"
-_GRID = "#313244"
 _POS = "#a6e3a1"  # earned break (positive balance)
 _NEG = "#f38ba8"  # backlog (negative balance)
 _LINE = "#89b4fa"
