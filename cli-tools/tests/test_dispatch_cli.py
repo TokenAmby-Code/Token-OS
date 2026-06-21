@@ -1411,7 +1411,7 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in content, content
 
 
-def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path):
+def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path: Path) -> None:
     """Stack dispatch may return the canonical public pane id (mechanicus:N).
 
     Dispatch must accept that human-facing surface and translate it to the

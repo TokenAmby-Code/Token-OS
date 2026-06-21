@@ -4050,11 +4050,15 @@ async def handle_session_end(payload: dict) -> dict:
             payload.get("instance_type")
             or payload.get("env", {}).get("TOKEN_API_INSTANCE_TYPE", "")
         )
-        _is_codex_completed_one_off = (
-            _normalize_text(_engine or payload.get("engine") or "") == "codex"
-        ) and (
+        _normalized_engine = _normalize_text(_engine or payload.get("engine") or "")
+        _has_payload_instance_type = bool(_payload_instance_type)
+        _is_codex_completed_one_off = (_normalized_engine == "codex") and (
             _payload_instance_type == "one_off"
-            or (_gt_marker is None and int(_hook_driven or 0) == 0)
+            or (
+                not _has_payload_instance_type
+                and _gt_marker is None
+                and int(_hook_driven or 0) == 0
+            )
         )
 
         # Layer 1 — non-terminal SessionEnd short-circuit (in-wrapper re-fire).
