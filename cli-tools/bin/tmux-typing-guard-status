@@ -49,9 +49,9 @@ def _imports() -> tuple:
     """Import the canonical predicate + real-tmux resolver, or (None, None)."""
     try:
         from tmuxctl.send_gate import typing_guard_active
-        from tmuxctl.tmux_adapter import _tmux_binary
+        from tmuxctl.tmux_adapter import tmux_binary
 
-        return typing_guard_active, _tmux_binary
+        return typing_guard_active, tmux_binary
     except Exception:
         return None, None
 
@@ -97,12 +97,12 @@ def main() -> int:
     plain = "--plain" in argv
     scan = "--scan" in argv
 
-    typing_guard_active, _tmux_binary = _imports()
-    if typing_guard_active is None or _tmux_binary is None:
+    typing_guard_active, tmux_binary = _imports()
+    if typing_guard_active is None or tmux_binary is None:
         return 0  # fail-open: no predicate available → render dark
 
     try:
-        binary = _tmux_binary()
+        binary = tmux_binary()
     except Exception:
         return 0
 
