@@ -96,6 +96,16 @@ def _tmux_binary() -> str:
     return "tmux"
 
 
+def tmux_binary() -> str:
+    """Public accessor for the resolved real tmux binary (never the shim).
+
+    A thin, stable wrapper over ``_tmux_binary`` so out-of-package readers (e.g.
+    the ``tmux-typing-guard-status`` diagnostic) can depend on a public name
+    rather than the private resolver.
+    """
+    return _tmux_binary()
+
+
 def _looks_like_custom_pane_target(target: str) -> bool:
     if not target or target.startswith("%"):
         return False

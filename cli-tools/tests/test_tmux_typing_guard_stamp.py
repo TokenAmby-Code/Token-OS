@@ -15,7 +15,6 @@ GUARD = REPO / "cli-tools" / "lib" / "tmux-guard.sh"
 AGENT_CMD = REPO / "cli-tools" / "bin" / "agent-cmd"
 BRIEF = REPO / "cli-tools" / "bin" / "brief"
 TMUX_SHIM = REPO / "cli-tools" / "bin" / "tmux"
-STATUS = REPO / "cli-tools" / "bin" / "tmux-typing-guard-status"
 
 
 def _fake_tmux(tmp_path: Path) -> Path:
@@ -176,51 +175,11 @@ EOF
     assert "stamp:gone" in proc.stdout
 
 
-def test_status_segment_uses_same_stamp_once_hard_ttl(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> draft\n")
-    env["TMUX_GUARD_NOW"] = "1000"
-    first = subprocess.run(
-        [sys.executable, str(STATUS), "--plain"],
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=2,
-        check=False,
-    )
-    env["TMUX_GUARD_NOW"] = "1100"
-    second = subprocess.run(
-        [sys.executable, str(STATUS), "--plain"],
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=2,
-        check=False,
-    )
-    styled = subprocess.run(
-        [sys.executable, str(STATUS)],
-        text=True,
-        capture_output=True,
-        env={**env, "TMUX_GUARD_NOW": "1100"},
-        timeout=2,
-        check=False,
-    )
-    env["TMUX_GUARD_NOW"] = "1301"
-    expired = subprocess.run(
-        [sys.executable, str(STATUS), "--plain"],
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=2,
-        check=False,
-    )
-
-    assert first.stdout == "TYPE"
-    assert second.stdout == "TYPE"
-    assert styled.stdout == "#[fg=colour214,bold]⌨ GUARD#[default] "
-    assert expired.stdout == ""
-    stamp = (tmp_path / "guard-state" / "%1.stamp").read_text()
-    assert "started_at=1000" in stamp
-    assert "state=expired" in stamp
+# NOTE: the status segment used to mirror this 300s stamp model. It now reflects
+# the canonical send_gate predicate instead (the gate that actually fires on the
+# clobber path), so its behaviour is pinned in test_tmux_typing_guard_statusline.py.
+# The stamp model below is still the SHELL inbound guard (tmux_wait_for_clear) and
+# is exercised by the remaining tests in this file.
 
 
 def test_tmux_send_guarded_does_not_silently_swallow_block(tmp_path: Path) -> None:

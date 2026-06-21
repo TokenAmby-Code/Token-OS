@@ -1,38 +1,70 @@
 #!/usr/bin/env python3
-# tmux-typing-guard-status - per-pane typing-guard stamp indicator
+# tmux-typing-guard-status - per-pane typing-guard diagnostic
 # TAGS: tmux, guard, status
 # AUDIENCE: human, agent
-"""Show a compact tmux status segment while the inbound send-keys guard is active.
+"""Render the typing_guard state for a pane — the visible diagnostic.
 
-This is intentionally separate from the outbound/OOB send gate. It mirrors the
-shell guard's per-pane stamp-once model without importing tmuxctl on tmux's hot
-path:
+This is the statusline/pane-border diagnostic for the inbound typing guard. Its
+ONE job is to answer honestly: *would the universal send gate hold an automated
+write to this pane right now?* So it consults the single canonical predicate,
+``tmuxctl.send_gate.typing_guard_active(target=pane)`` — the same predicate that
+gates the Python clobber path (state-hooks, enforcement, dispatch via
+``TmuxAdapter.run``). It deliberately does NOT read the legacy 300s shell
+``*.stamp`` files: those over-report (they light long after a keystroke and
+across unattended agent panes), so a stamp-driven light could not tell "the
+guard never engaged" from "the guard was pierced." This reads the real gate.
 
-* stamp the current pane once when pending prompt input is observed;
-* do not refresh the stamp on subsequent keystrokes;
-* clear when the prompt is empty/submitted;
-* hard-expire after TMUX_GUARD_TTL seconds (default 300).
+Modes:
+  * default      — print the status-right segment for the *current* (active)
+                   pane and publish its ``@GUARD`` pane option so the pane
+                   border renders the same state with zero fork per redraw.
+  * ``--plain``  — same decision, plain ``TYPE`` text (for tests / dumb bars).
+  * ``--scan``   — refresh every live pane's ``@GUARD`` option in a single fork.
+                   This is the per-pane border updater; it is intentionally kept
+                   OUT of the per-render path so it never reintroduces the
+                   N-shell-out status-bar lag (see cli-tools/tmux/tmux-base.conf).
+
+Fail-open everywhere: any tmux/predicate error renders dark and never raises, so
+a transient fault can neither brick the status bar nor fake a guard light.
 """
 
 from __future__ import annotations
 
-import os
-import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 
+_LIB = Path(__file__).resolve().parents[1] / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
 
-def _run_tmux(*args: str) -> str | None:
+# Styled status-right segment (matches the bar's colour theme) and the compact
+# marker pushed into the per-pane @GUARD border var.
+SEGMENT_STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
+SEGMENT_PLAIN = "TYPE"
+BORDER_MARKER = "#[fg=colour214,bold]⌨#[default]"
+
+
+def _imports() -> tuple:
+    """Import the canonical predicate + real-tmux resolver, or (None, None)."""
+    try:
+        from tmuxctl.send_gate import typing_guard_active
+        from tmuxctl.tmux_adapter import tmux_binary
+
+        return typing_guard_active, tmux_binary
+    except Exception:
+        return None, None
+
+
+def _tmux(binary: str, *args: str) -> str | None:
     try:
         proc = subprocess.run(
-            ["tmux", *args],
+            [binary, *args],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=0.3,
+            timeout=0.5,
         )
     except Exception:
         return None
@@ -41,138 +73,61 @@ def _run_tmux(*args: str) -> str | None:
     return proc.stdout
 
 
-def _ttl() -> int:
-    try:
-        value = int(os.environ.get("TMUX_GUARD_TTL", "300"))
-    except (TypeError, ValueError):
-        value = 300
-    return value if value > 0 else 300
+def _current_pane(binary: str) -> str:
+    out = _tmux(binary, "display-message", "-p", "#{pane_id}")
+    return (out or "").strip()
 
 
-def _now() -> int:
-    raw = os.environ.get("TMUX_GUARD_NOW")
-    if raw:
-        try:
-            return int(float(raw))
-        except ValueError:
-            pass
-    return int(time.time())
-
-
-def _state_dir() -> Path:
-    default = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"tmux-typing-guard-{os.getuid()}"
-    path = Path(os.environ.get("TMUX_GUARD_STATE_DIR", str(default)))
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _pane_key(pane: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.:%-]", "_", pane)
-
-
-def _stamp_file(pane: str) -> Path:
-    return _state_dir() / f"{_pane_key(pane)}.stamp"
-
-
-def _read_stamp(path: Path) -> tuple[int | None, str]:
-    started: int | None = None
-    state = ""
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            key, _, value = line.partition("=")
-            if key == "started_at":
-                try:
-                    started = int(float(value))
-                except ValueError:
-                    started = None
-            elif key == "state":
-                state = value.strip()
-    except OSError:
-        pass
-    return started, state
-
-
-def _write_stamp(path: Path, started_at: int, state: str) -> None:
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}")
-    try:
-        tmp.write_text(f"started_at={started_at}\nstate={state}\n", encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-
-
-def _clear_stamp(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
-
-
-def _pane_has_input(pane: str) -> bool:
-    out = _run_tmux("capture-pane", "-t", pane, "-p")
+def _live_panes(binary: str) -> list[str]:
+    out = _tmux(binary, "list-panes", "-a", "-F", "#{pane_id}")
     if out is None:
-        return False
-    lines = []
-    for line in out.splitlines():
-        if not line.strip():
-            continue
-        if re.match(r"^\s*[0-9]+%\s+[0-9]", line):
-            continue
-        if re.match(r"^\s*⏵", line):
-            continue
-        if re.match(r"^\s*esc again", line):
-            continue
-        lines.append(line)
-    if not lines:
-        return False
-    last = lines[-1]
-    if re.match(r"^[\s│░▒▓]*>\s*$", last):
-        return False
-    if re.search(r"[$%#>❯]\s*$", last):
-        return False
-    if not re.search(r"[$%#>❯]", last):
-        return False
-    return True
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def guard_active_for_current_pane() -> bool:
-    pane_out = _run_tmux("display-message", "-p", "#{pane_id}")
-    pane = (pane_out or "").strip()
-    if not pane:
-        return False
-    path = _stamp_file(pane)
-    now = _now()
-    ttl = _ttl()
-
-    if not _pane_has_input(pane):
-        _clear_stamp(path)
-        return False
-
-    started, state = _read_stamp(path)
-    if state == "expired":
-        return False
-    if started is None:
-        started = now
-        _write_stamp(path, started, "active")
-    if now - started >= ttl:
-        _write_stamp(path, started, "expired")
-        return False
-    return True
+def _publish(binary: str, pane: str, active: bool) -> None:
+    """Push the pane-scoped @GUARD border var (zero-fork to render later)."""
+    value = BORDER_MARKER if active else ""
+    # Best-effort: a failed option write must never break the segment render.
+    _tmux(binary, "set-option", "-p", "-t", pane, "@GUARD", value)
 
 
 def main() -> int:
-    plain = "--plain" in sys.argv[1:]
-    if not guard_active_for_current_pane():
+    argv = sys.argv[1:]
+    plain = "--plain" in argv
+    scan = "--scan" in argv
+
+    typing_guard_active, tmux_binary = _imports()
+    if typing_guard_active is None or tmux_binary is None:
+        return 0  # fail-open: no predicate available → render dark
+
+    try:
+        binary = tmux_binary()
+    except Exception:
         return 0
-    if plain:
-        print("TYPE", end="")
-    else:
-        print("#[fg=colour214,bold]⌨ GUARD#[default] ", end="")
+
+    if scan:
+        for pane in _live_panes(binary):
+            try:
+                active = bool(typing_guard_active(target=pane))
+            except Exception:
+                active = False
+            _publish(binary, pane, active)
+        return 0
+
+    pane = _current_pane(binary)
+    if not pane:
+        return 0
+
+    try:
+        active = bool(typing_guard_active(target=pane))
+    except Exception:
+        active = False
+
+    _publish(binary, pane, active)
+
+    if active:
+        sys.stdout.write(SEGMENT_PLAIN if plain else SEGMENT_STYLED)
     return 0
 
 
