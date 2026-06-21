@@ -122,7 +122,23 @@ def test_restart_watchdog_restored_check_is_scoped_to_target_session(tmp_path: p
 
 def test_restart_force_refuses_non_interactive_invocation(tmp_path: pathlib.Path):
     invocation_log = tmp_path / "invocations.log"
-    env = os.environ.copy()
+    # Strip agent/automation markers so this exercises the TTY guard specifically
+    # (the test runner itself may run under Claude Code, which sets CLAUDECODE —
+    # that would trip the earlier agent-context block instead). The agent guard is
+    # covered in test_tx_restart_agent_guard.py; here we assert the non-agent,
+    # non-TTY caller is refused by the --force/TTY guard.
+    #
+    # Match the guard's contract exactly: 3 markers by exact name plus the whole
+    # CODEX_* / TOKEN_API_CODEX_* prefix family. Stripping by prefix (not a fixed
+    # list) keeps this isolation deterministic as new Codex variants appear — the
+    # same prefix scan _tx_is_agent_context now performs.
+    agent_marker_names = {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "TOKEN_API_SUBAGENT"}
+    agent_marker_prefixes = ("CODEX_", "TOKEN_API_CODEX_")
+
+    def _is_agent_marker(key: str) -> bool:
+        return key in agent_marker_names or key.startswith(agent_marker_prefixes)
+
+    env = {k: v for k, v in os.environ.items() if not _is_agent_marker(k)}
     env.update(
         {
             "TX_INVOCATION_LOG": str(invocation_log),
