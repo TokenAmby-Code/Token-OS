@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import yaml
 
 from pane_surface import is_placeholder_tab_name
@@ -1500,9 +1501,25 @@ async def resolve_session_doc_for_start(
     if dispatch_session_doc_path or legion or primarch_name or origin_type == "cron":
         return None, "unresolved_dispatch"
 
+    # Genuine interactive pane: defer the placeholder. Minting at SessionStart
+    # pollutes the vault with "Needs Session Name" docs for every pane that is
+    # opened and closed without a prompt (stray tests, failed dispatches, idle
+    # panes). The doc is minted lazily on the first real prompt instead — see
+    # create_deferred_interactive_session_doc(), called from handle_prompt_submit.
+    return None, "interactive_deferred"
+
+
+async def create_deferred_interactive_session_doc(db: aiosqlite.Connection) -> int:
+    """Mint the placeholder session doc for a genuine interactive pane.
+
+    Deferred from SessionStart (``resolve_session_doc_for_start`` returns
+    ``(None, "interactive_deferred")``) to the first prompt so opened-but-unused
+    panes leave no doc behind. Mirrors the old eager interactive fall-through:
+    a "Needs Session Name" doc the session is expected to rename via
+    ``session-doc-name``. Caller is responsible for binding the returned id onto
+    the instance row (pragma-once). Does not commit.
+    """
     now_ts = datetime.now().isoformat()
-    # No cwd/date fallback names. A new interactive session gets a placeholder
-    # and is expected to name its own session doc via `session-doc-name`.
     doc_title = "Needs Session Name"
     fp = unique_human_path(terra_sessions_dir(), doc_title, fallback="needs-session-name")
     cursor = await db.execute(
@@ -1510,6 +1527,6 @@ async def resolve_session_doc_for_start(
            VALUES (?, ?, ?, 'active', ?, ?)""",
         (doc_title, str(fp), None, now_ts, now_ts),
     )
-    doc_id = cursor.lastrowid
+    doc_id = int(cursor.lastrowid)
     create_session_doc_file(fp, doc_title, doc_id)
-    return doc_id, "interactive_auto"
+    return doc_id
