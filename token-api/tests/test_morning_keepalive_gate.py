@@ -364,6 +364,48 @@ def test_morning_entry_resets_metrics_logs_and_injects(app_env, monkeypatch):
     assert injected == ["pytest"]
 
 
+def test_morning_entry_flushes_prior_reset_date_before_current_day_shift(app_env, monkeypatch):
+    main = app_env.main
+    today = datetime.now(main.ZoneInfo(main.MORNING_SESSION_TIMEZONE)).date().isoformat()
+    prior_date = "2000-01-01" if today != "2000-01-01" else "1999-12-31"
+    main.timer_engine._daily_start_date = prior_date
+    calls = []
+
+    async def fake_generate(date_str):
+        calls.append(date_str)
+
+    monkeypatch.setattr(main, "generate_daily_timer_analytics", fake_generate)
+    monkeypatch.setattr(main, "_inject_custodes_morning_prompt", lambda source: None)
+
+    result = asyncio.run(main.enter_morning_session_internal(source="pytest", inject_prompt=False))
+
+    assert result["current_mode"] == "morning_session"
+    assert calls == [prior_date]
+
+    conn = sqlite3.connect(app_env.db_path)
+    shift_triggers = [
+        row[0] for row in conn.execute("SELECT trigger FROM timer_shifts ORDER BY id").fetchall()
+    ]
+    conn.close()
+    assert shift_triggers[-1] == "morning_session_start"
+
+
+def test_morning_entry_does_not_flush_when_reset_date_is_today(app_env, monkeypatch):
+    main = app_env.main
+    calls = []
+
+    async def fake_generate(date_str):
+        calls.append(date_str)
+
+    monkeypatch.setattr(main, "generate_daily_timer_analytics", fake_generate)
+    monkeypatch.setattr(main, "_inject_custodes_morning_prompt", lambda source: None)
+
+    result = asyncio.run(main.enter_morning_session_internal(source="pytest", inject_prompt=False))
+
+    assert result["current_mode"] == "morning_session"
+    assert calls == []
+
+
 def test_morning_enter_endpoint_uses_timer_path_without_prompt(app_env, monkeypatch):
     from fastapi.testclient import TestClient
 

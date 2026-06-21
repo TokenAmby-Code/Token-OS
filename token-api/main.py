@@ -12967,7 +12967,7 @@ def _sync_generate_daily_analytics(date_str: str):
     Writes:
     1. Summary fields to the daily note's YAML front matter
     2. Full JSON to Imperium-ENV/Journal/Daily/analytics/ for programmatic access
-    Then wipes timer_shifts table.
+    Then deletes only the timer_shifts rows that were flushed.
     """
     import json
     import sqlite3
@@ -12977,11 +12977,24 @@ def _sync_generate_daily_analytics(date_str: str):
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
 
-    rows = conn.execute("SELECT * FROM timer_shifts ORDER BY id").fetchall()
+    day = datetime.fromisoformat(date_str).date()
+    start_ts = f"{day.isoformat()}T06:00:00"
+    end_ts = f"{(day + timedelta(days=1)).isoformat()}T06:00:00"
+
+    rows = conn.execute(
+        """
+        SELECT * FROM timer_shifts
+        WHERE timestamp >= ? AND timestamp < ?
+        ORDER BY id
+        """,
+        (start_ts, end_ts),
+    ).fetchall()
 
     if not rows:
         conn.close()
         return None
+
+    flushed_ids = [int(r["id"]) for r in rows]
 
     # Compute analytics
     shift_count_by_trigger = defaultdict(int)
@@ -13073,8 +13086,11 @@ def _sync_generate_daily_analytics(date_str: str):
             callout_type="info",
         )
 
-    # Wipe timer_shifts table
-    conn.execute("DELETE FROM timer_shifts")
+    # Delete only the rows included in this flush, after all writes succeed.
+    for i in range(0, len(flushed_ids), 500):
+        chunk = flushed_ids[i : i + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        conn.execute(f"DELETE FROM timer_shifts WHERE id IN ({placeholders})", chunk)
     conn.commit()
     conn.close()
 
@@ -13401,6 +13417,8 @@ async def enter_morning_session_internal(
     )
     await _write_morning_audit_state(source, today, local_now)
     await timer_save_to_db()
+    if TimerEvent.DAILY_RESET in result.events and result.reset_date and result.reset_date != today:
+        await generate_daily_timer_analytics(result.reset_date)
     try:
         await _wipe_prior_day_timer_events(today)
     except Exception as e:

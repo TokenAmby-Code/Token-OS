@@ -9,6 +9,7 @@ temp Daily dir — never the live vault/DB/tmux.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ import pytest
 
 _DATE = "2026-06-20"
 
-_SHIFTS = [
+_TARGET_SHIFTS = [
     # (timestamp, old_mode, new_mode, trigger, source, break_balance_ms, active_instances)
     (f"{_DATE}T06:00:00-07:00", None, "working", "manual", "user", 0, 1),
     (f"{_DATE}T09:00:00-07:00", "working", "working", "tick", "engine", 45 * 60 * 1000, 2),
@@ -26,8 +27,14 @@ _SHIFTS = [
     (f"{_DATE}T18:00:00-07:00", "working", "break", "tick", "engine", -30 * 60 * 1000, 0),
 ]
 
+_NON_TARGET_SHIFTS = [
+    ("2026-06-20T05:59:59-07:00", "break", "working", "previous_day", "engine", 999, 9),
+    ("2026-06-21T06:00:00-07:00", "working", "break", "next_day_boundary", "engine", 888, 8),
+    ("2026-06-22T09:00:00-07:00", "working", "break", "future_day", "engine", 777, 7),
+]
 
-def _seed_timer_shifts(db_path: Path) -> None:
+
+def _seed_timer_shifts(db_path: Path, shifts: list[tuple] | None = None) -> list[int]:
     conn = sqlite3.connect(db_path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS timer_shifts (
@@ -45,14 +52,18 @@ def _seed_timer_shifts(db_path: Path) -> None:
             details TEXT
         )
     """)
-    conn.executemany(
-        "INSERT INTO timer_shifts "
-        "(timestamp, old_mode, new_mode, trigger, source, break_balance_ms, active_instances) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        _SHIFTS,
-    )
+    ids: list[int] = []
+    for shift in shifts or _TARGET_SHIFTS:
+        cur = conn.execute(
+            "INSERT INTO timer_shifts "
+            "(timestamp, old_mode, new_mode, trigger, source, break_balance_ms, active_instances) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            shift,
+        )
+        ids.append(int(cur.lastrowid))
     conn.commit()
     conn.close()
+    return ids
 
 
 def _daily_dir(main: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -87,7 +98,10 @@ def test_flush_writes_svg_and_embeds_in_now_callout(
 ) -> None:
     main = app_env.main
     daily = _daily_dir(main, tmp_path, monkeypatch)
-    _seed_timer_shifts(app_env.db_path)
+    target_ids = _seed_timer_shifts(
+        app_env.db_path, _NON_TARGET_SHIFTS[:1] + _TARGET_SHIFTS + _NON_TARGET_SHIFTS[1:]
+    )
+    expected_deleted_ids = target_ids[1 : 1 + len(_TARGET_SHIFTS)]
 
     note = daily / f"{_DATE}.md"
     note.write_text(_NOTE_WITH_CALLOUT, encoding="utf-8")
@@ -121,17 +135,28 @@ def test_flush_writes_svg_and_embeds_in_now_callout(
     import session_doc_helpers as sdh
 
     fm, _ = sdh.read_frontmatter(note)
-    assert fm["timer_total_shifts"] == len(_SHIFTS)
+    assert fm["timer_total_shifts"] == len(_TARGET_SHIFTS)
     assert fm["timer_enforcements"] == 1
     assert fm["timer_peak_break"] == "1h 30m"
     assert fm["timer_min_break"] == "-0h 30m"
     assert fm["timer_max_instances"] == 3
 
-    # timer_shifts wiped.
+    # Only flushed target-window rows were deleted; previous/current/future rows remain.
+    summary = json.loads(Path(out).read_text(encoding="utf-8"))
+    assert summary["total_shifts"] == len(_TARGET_SHIFTS)
+    assert {p["time"] for p in summary["balance_timeline"]} == {row[0] for row in _TARGET_SHIFTS}
+
     conn = sqlite3.connect(app_env.db_path)
-    remaining = conn.execute("SELECT COUNT(*) FROM timer_shifts").fetchone()[0]
+    remaining_rows = conn.execute(
+        "SELECT id, timestamp, trigger FROM timer_shifts ORDER BY id"
+    ).fetchall()
     conn.close()
-    assert remaining == 0
+    assert {row[0] for row in remaining_rows}.isdisjoint(expected_deleted_ids)
+    assert [row[2] for row in remaining_rows] == [
+        "previous_day",
+        "next_day_boundary",
+        "future_day",
+    ]
 
 
 def test_flush_appends_embed_when_note_has_no_now_callout(
@@ -157,17 +182,25 @@ def test_flush_appends_embed_when_note_has_no_now_callout(
     assert "body." in final  # original body preserved
 
 
-def test_flush_with_no_shifts_writes_nothing(
+def test_flush_with_no_target_shifts_writes_nothing_and_preserves_rows(
     app_env: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No shift data → the flush returns None and writes no SVG (no note touch)."""
+    """No target-day shift data → no files, no note touch, no deletes."""
     main = app_env.main
     daily = _daily_dir(main, tmp_path, monkeypatch)
-    # No seed.
+    inserted_ids = _seed_timer_shifts(app_env.db_path, _NON_TARGET_SHIFTS)
 
     out = main._sync_generate_daily_analytics(_DATE)
     assert out is None
+    assert not (daily / "analytics" / f"timer-{_DATE}.json").exists()
     assert not (daily / "analytics" / f"timer-{_DATE}.svg").exists()
+
+    conn = sqlite3.connect(app_env.db_path)
+    remaining_ids = [
+        row[0] for row in conn.execute("SELECT id FROM timer_shifts ORDER BY id").fetchall()
+    ]
+    conn.close()
+    assert remaining_ids == inserted_ids
 
 
 def test_flush_without_note_still_writes_svg(
