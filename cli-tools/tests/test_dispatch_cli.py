@@ -1543,7 +1543,7 @@ def test_dispatch_prompt_file_single_quote_is_shell_safe(tmp_path: Path) -> None
     assert syntax.returncode == 0, syntax.stderr
 
 
-def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path):
+def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path: Path) -> None:
     """A :new stack launch must survive tmuxctl emitting a canonical page:index id.
 
     Regression for the tmuxctl canonical-id campaign: `tmuxctl stack dispatch`
@@ -1623,7 +1623,7 @@ def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path):
     assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in content, content
 
 
-def test_dispatch_direct_objective_without_brief_warns(tmp_path):
+def test_dispatch_direct_objective_without_brief_warns(tmp_path: Path) -> None:
     """A direct launch with --objective but no brief boots idle — warn the operator.
 
     --objective is aspirant-only metadata; on a --direct/--target launch it is
@@ -1653,7 +1653,7 @@ def test_dispatch_direct_objective_without_brief_warns(tmp_path):
     assert "boot idle" in result.stderr or "boots idle" in result.stderr
 
 
-def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path):
+def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path: Path) -> None:
     """When tmuxctl emits nothing, the operator gets the clear non-pane-id error.
 
     The resolve step runs under `set -euo pipefail`; an empty tmuxctl result must
@@ -1698,7 +1698,7 @@ def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path
     assert "stack dispatch returned a non-pane id" in result.stderr
 
 
-def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path):
+def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) -> None:
     """The objective guard must not fire when a real brief is present."""
     result = subprocess.run(
         [
