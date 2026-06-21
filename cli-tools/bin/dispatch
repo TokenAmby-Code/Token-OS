@@ -2059,15 +2059,9 @@ clear_pane_wrapper_launch_id() {
   tmux set-option -pu -t "$pane" @INSTANCE_ID >/dev/null 2>&1 || true
 }
 
-write_launch_failure_to_pane() {
-  local pane="$1" message="$2" command
-  command -v tmux >/dev/null 2>&1 || return 0
-  printf -v command 'printf "\\n%s\\n" %q' "$message"
-  tmux send-keys -t "$pane" "$command" Enter >/dev/null 2>&1 || true
-}
 
 wait_for_dispatch_wrapper_start() {
-  local pane="$1" target_display="$2" expected_wrapper_id="${3:-$WRAPPER_ID}" timeout deadline observed message
+  local pane="$1" target_display="$2" expected_wrapper_id="${3:-$WRAPPER_ID}" timeout deadline observed
   timeout="$(dispatch_launch_observe_timeout)"
   [[ "$timeout" -gt 0 ]] || return 0
   deadline=$((SECONDS + timeout))
@@ -2081,14 +2075,12 @@ wait_for_dispatch_wrapper_start() {
     fi
     sleep 0.2
   done
-  message="DISPATCH LAUNCH FAILED: wrapper did not start within ${timeout}s for ${ENGINE} launch to ${target_display}. The staged command may not have reached the pane; inspect the pane before reusing it."
-  write_launch_failure_to_pane "$pane" "$message"
-  err "launch failed: wrapper did not start within ${timeout}s for ${ENGINE} launch to ${target_display}"
+  err "launch failed: wrapper did not start within ${timeout}s for ${ENGINE} launch to ${target_display}; the staged command may not have reached the pane"
   return 1
 }
 
 wait_for_dispatch_instance_register() {
-  local pane="$1" target_display="$2" timeout deadline observed message
+  local pane="$1" target_display="$2" timeout deadline observed
   timeout="$(dispatch_launch_observe_timeout)"
   [[ "$timeout" -gt 0 ]] || return 0
   deadline=$((SECONDS + timeout))
@@ -2099,14 +2091,12 @@ wait_for_dispatch_instance_register() {
     fi
     sleep 0.2
   done
-  message="DISPATCH LAUNCH FAILED: instance did not register within ${timeout}s for ${ENGINE} launch to ${target_display}. The wrapper started but SessionStart did not stamp the pane; inspect Token-API hooks and the pane before reusing it."
-  write_launch_failure_to_pane "$pane" "$message"
-  err "launch failed: instance did not register within ${timeout}s for ${ENGINE} launch to ${target_display}"
+  err "launch failed: instance did not register within ${timeout}s for ${ENGINE} launch to ${target_display}; wrapper started but SessionStart did not stamp the pane"
   return 1
 }
 
 wait_for_dispatch_registry_bind() {
-  local pane="$1" target_display="$2" timeout deadline instance_id row status row_workdir row_pane row_label expected_label message
+  local pane="$1" target_display="$2" timeout deadline instance_id row status row_workdir row_pane row_label expected_label
   timeout="$(dispatch_launch_observe_timeout)"
   [[ "$timeout" -gt 0 ]] || return 0
   command -v sqlite3 >/dev/null 2>&1 || return 0
@@ -2138,9 +2128,7 @@ wait_for_dispatch_registry_bind() {
     fi
     sleep 0.2
   done
-  message="DISPATCH LAUNCH FAILED: instance row did not bind live within ${timeout}s for ${ENGINE} launch to ${target_display}. The pane stamped an instance, but the registry row is missing, stopped, wrong-dir, or missing pane_label; inspect Token-API registration before reusing it."
-  write_launch_failure_to_pane "$pane" "$message"
-  err "launch failed: instance row did not bind live within ${timeout}s for ${ENGINE} launch to ${target_display}"
+  err "launch failed: instance row did not bind live within ${timeout}s for ${ENGINE} launch to ${target_display}; registry row is missing, stopped, wrong-dir, or missing pane_label"
   return 1
 }
 
