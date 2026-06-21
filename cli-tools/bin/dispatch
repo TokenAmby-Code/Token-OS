@@ -1556,7 +1556,14 @@ AUTO_PARENT_INSTANCE_ID=""
 # TOKEN_API_INSTANCE_ID, TOKEN_API_PARENT_INSTANCE_ID, or TOKEN_API_PERSONA.
 # Add a dispatch CLI flag later if trusted orchestrators need explicit parentage.
 
-WRAPPER_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+# A dispatched worker is always a NEW wrapper launch, so it must mint its OWN
+# wrapper_launch_id — never inherit the dispatching agent's. token-api SessionStart
+# treats wrapper_launch_id as unique per wrapper launch and re-keys the most-recent
+# row carrying it (routes/hooks.py branch 5); inheriting the dispatcher's id makes
+# the worker supplant the dispatcher's registry row and clobber its (singleton)
+# persona — the systemic singleton-decapitation channel. The caller-pane-identity
+# guard above (TMUX_PANE/INSTANCE_ID/PARENT/PERSONA) missed this one leak channel.
+WRAPPER_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 COMMON_ENV=(
   "TOKEN_API_LAUNCHER=dispatch"
   "TOKEN_API_ENGINE=${ENGINE}"
@@ -1898,7 +1905,7 @@ build_agent_command() {
     fi
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
-  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
+  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME -u TOKEN_API_WRAPPER_LAUNCH_ID TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
   local e
   for e in "${envs[@]}"; do printf ' %q' "$e"; done
   local a
