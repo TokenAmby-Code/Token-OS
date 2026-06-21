@@ -253,6 +253,55 @@ def test_typing_guard_is_scoped_to_target_pane(monkeypatch: pytest.MonkeyPatch) 
     assert send_gate.typing_guard_active(target="%other") is False
 
 
+def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end per-pane proof (the mandate scenario, real predicate).
+
+    The Emperor is typing in the active+attended pane ``%active`` (fresh
+    keystroke, an unsent draft on its prompt line); ``%other`` is an unattended
+    worker pane at an empty prompt. A dispatch send to ``%other`` MUST sail
+    through while a send to ``%active`` is held — typing in one pane never
+    blocks an unrelated pane. No monkeypatch of the predicate: evaluate() runs
+    the real ``typing_guard_active`` over a faked tmux.
+    """
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "display-message" in cmd and "#{client_activity}" in cmd and "-t" not in cmd:
+            proc.stdout = f"{now}\n"
+            return proc
+        if "display-message" in cmd and "-t" in cmd and "%active" in cmd:
+            proc.stdout = "11\n"
+            return proc
+        if "display-message" in cmd and "-t" in cmd and "%other" in cmd:
+            proc.stdout = "00\n"
+            return proc
+        if "list-clients" in cmd and "%active" in cmd:
+            proc.stdout = "x\n"
+            return proc
+        if "capture-pane" in cmd and "%active" in cmd:
+            proc.stdout = "> draft\n"  # Emperor's unsent draft
+            return proc
+        if "capture-pane" in cmd and "%other" in cmd:
+            proc.stdout = "> \n"  # worker pane, empty prompt
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    held = send_gate.evaluate(("send-keys", "-t", "%active", "x"))
+    dispatched = send_gate.evaluate(("send-keys", "-t", "%other", "launch"))
+
+    assert held is not None and held["reason"] == "typing_guard" and held["suppressed"] is True
+    assert dispatched is None, "a send to an unrelated pane must not be gated by typing in %active"
+
+
 def test_evaluate_only_blocks_target_under_typing_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
