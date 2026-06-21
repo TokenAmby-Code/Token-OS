@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Stop the dev token-api listener assigned to a worktree without freeing its port.
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: dev-server-stop <worktree-dir>" >&2
+    exit 2
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/worktree-ports.sh
+source "$SCRIPT_DIR/../lib/worktree-ports.sh"
+
+stop_port_process "$1"
