@@ -52,6 +52,54 @@ def test_codex_current_plan_modal_sends_option_two_sequence(tmp_path: pathlib.Pa
     assert out == "action=codex option-2 Down Enter"
 
 
+def test_codex_current_plan_modal_aborts_when_cursor_already_on_clear_context(
+    tmp_path: pathlib.Path,
+):
+    fixture = tmp_path / "codex-current-on-option2.txt"
+    fixture.write_text(
+        "Implement this plan?\n\n"
+        "  1. Yes, implement this plan          Switch to Default\n"
+        "› 2. Yes, clear context and implement  Fresh thread.\n"
+        "  3. No, stay in Plan mode             Continue planning\n"
+    )
+    out = subprocess.check_output(
+        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
+        text=True,
+    ).strip()
+    assert out == "action=none timeout"
+
+
+def test_codex_current_plan_modal_aborts_when_option_down_is_not_clear_context(
+    tmp_path: pathlib.Path,
+):
+    fixture = tmp_path / "codex-current-option2-not-clear.txt"
+    fixture.write_text(
+        "Implement this plan?\n\n"
+        "› 1. Yes, implement this plan          Switch to Default\n"
+        "  2. Yes, implement without clearing   Keep context.\n"
+        "  3. Yes, clear context and implement  Fresh thread.\n"
+    )
+    out = subprocess.check_output(
+        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
+        text=True,
+    ).strip()
+    assert out == "action=none timeout"
+
+
+def test_single_flight_lock_aborts_overlapping_watcher(tmp_path: pathlib.Path):
+    safe = "%99".replace("%", "_")
+    root = tmp_path / "tmux-plan-approve-clear"
+    (root / f"{safe}.lockd").mkdir(parents=True)
+    env = os.environ.copy()
+    env["TMPDIR"] = str(tmp_path)
+    out = subprocess.check_output(
+        [str(SCRIPT), "--pane", "%99", "--agent", "codex", "--dry-run"],
+        text=True,
+        env=env,
+    ).strip()
+    assert out == "action=none locked"
+
+
 def test_successful_click_leaves_state_for_session_start(tmp_path):
     fixture = tmp_path / "pane.txt"
     fixture.write_text(
