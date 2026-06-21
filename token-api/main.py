@@ -13032,7 +13032,21 @@ def _sync_generate_daily_analytics(date_str: str):
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    # 2. Write summary fields to daily note frontmatter
+    # 2. Render the day's timer graph as a self-contained SVG and write it
+    #    atomically beside the JSON. This is the note's single, durable end-of-day
+    #    timer footprint (intra-day churn writers are gone — daily note = cold
+    #    storage). Pure-Python; no browser, no matplotlib.
+    from timer_svg import render_timer_svg
+
+    svg = render_timer_svg(summary)
+    svg_path = analytics_dir / f"timer-{date_str}.svg"
+    svg_tmp = analytics_dir / f".timer-{date_str}.svg.tmp"
+    with open(svg_tmp, "w", encoding="utf-8") as f:
+        f.write(svg)
+    os.replace(svg_tmp, svg_path)
+
+    # 3. Write summary fields to daily note frontmatter + embed the SVG in place
+    #    of the (now runtime-dead) NOW callout.
     note_path = OBSIDIAN_DAILY_PATH / f"{date_str}.md"
     if note_path.exists():
         update_frontmatter(
@@ -13047,6 +13061,16 @@ def _sync_generate_daily_analytics(date_str: str):
                 "timer_avg_instances": summary["avg_active_instances"],
                 "timer_max_instances": summary["max_active_instances"],
             },
+        )
+        # Replace the NOW callout region with the SVG embed (or append it if the
+        # note — e.g. a prior-day note from create_daily_note_file — has none).
+        # The embed string is ~35 bytes; the SVG itself is a separate file.
+        apply_callout(
+            note_path,
+            "now",
+            f"![[timer-{date_str}.svg]]",
+            title=f"Timer · {date_str}",
+            callout_type="info",
         )
 
     # Wipe timer_shifts table
