@@ -34,7 +34,7 @@ def _insert_instance(
     session_doc_id=None,
     status="idle",
     pane=None,
-):
+) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO instances
@@ -61,7 +61,7 @@ def _insert_instance(
     conn.close()
 
 
-def _row(db_path, instance_id):
+def _row(db_path, instance_id) -> sqlite3.Row | None:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     r = conn.execute("SELECT * FROM instances WHERE id = ?", (instance_id,)).fetchone()
@@ -76,14 +76,14 @@ def _doc_count(db_path) -> int:
     return n
 
 
-async def _never_dead(db, session_id, existing, actor):
+async def _never_dead(db, session_id, existing, actor) -> bool:
     return False
 
 
 # ── SessionStart defers (no eager placeholder) ─────────────────────────────────
 
 
-def test_resolve_interactive_defers_without_minting(app_env):
+def test_resolve_interactive_defers_without_minting(app_env) -> None:
     """A plain interactive launch returns the deferred sentinel and mints no doc."""
     helpers = sys.modules.get("session_doc_helpers") or __import__("session_doc_helpers")
 
@@ -107,7 +107,7 @@ def test_resolve_interactive_defers_without_minting(app_env):
     assert _doc_count(app_env.db_path) == 0
 
 
-def test_resolve_dispatch_still_unresolved(app_env):
+def test_resolve_dispatch_still_unresolved(app_env) -> None:
     """An automated launch that can't resolve its doc still surfaces the miss
     (not the new interactive sentinel)."""
     helpers = sys.modules.get("session_doc_helpers") or __import__("session_doc_helpers")
@@ -135,7 +135,7 @@ def test_resolve_dispatch_still_unresolved(app_env):
 # ── First prompt mints the doc once (pragma-once) ──────────────────────────────
 
 
-def test_first_prompt_mints_doc_once(app_env, monkeypatch):
+def test_first_prompt_mints_doc_once(app_env, monkeypatch) -> None:
     hooks = sys.modules["routes.hooks"]
     monkeypatch.setattr(hooks, "_stop_if_dead_pane", _never_dead)
     _insert_instance(app_env.db_path, "inter-1", session_doc_id=None)
@@ -158,7 +158,7 @@ def test_first_prompt_mints_doc_once(app_env, monkeypatch):
     assert _doc_count(app_env.db_path) == 1
 
 
-def test_dispatched_null_doc_not_minted_on_prompt(app_env, monkeypatch):
+def test_dispatched_null_doc_not_minted_on_prompt(app_env, monkeypatch) -> None:
     """A dispatched worker with a legitimately-NULL doc must never get an
     interactive placeholder on its first prompt."""
     hooks = sys.modules["routes.hooks"]
@@ -178,7 +178,7 @@ def test_dispatched_null_doc_not_minted_on_prompt(app_env, monkeypatch):
 # ── SessionEnd reaps the never-acted interactive pane ──────────────────────────
 
 
-def _run_session_end(hooks, monkeypatch, session_id):
+def _run_session_end(hooks, monkeypatch, session_id) -> dict:
     monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
     monkeypatch.setattr(hooks, "_schedule_naming_nudge", lambda *a, **k: None)
     monkeypatch.setattr(hooks.subprocess, "Popen", lambda *a, **k: None)
@@ -189,7 +189,7 @@ def _run_session_end(hooks, monkeypatch, session_id):
     return asyncio.run(run())
 
 
-def test_session_end_soft_archives_never_acted_interactive(app_env, monkeypatch):
+def test_session_end_soft_archives_never_acted_interactive(app_env, monkeypatch) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "ghost-1", session_doc_id=None)
 
@@ -201,7 +201,7 @@ def test_session_end_soft_archives_never_acted_interactive(app_env, monkeypatch)
     assert row["archived_at"] is not None
 
 
-def test_session_end_keeps_acted_interactive_stopped(app_env, monkeypatch):
+def test_session_end_keeps_acted_interactive_stopped(app_env, monkeypatch) -> None:
     """An interactive pane that DID act (has a doc) closes normally as stopped."""
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "worked-1", session_doc_id=4242)
@@ -212,7 +212,7 @@ def test_session_end_keeps_acted_interactive_stopped(app_env, monkeypatch):
     assert row["status"] == "stopped"
 
 
-def test_session_end_working_null_doc_not_reaped(app_env, monkeypatch):
+def test_session_end_working_null_doc_not_reaped(app_env, monkeypatch) -> None:
     """A pane that ever worked (status='working') has acted even if its doc is
     NULL — it must close as stopped, never soft-archived. 'never acted' is
     status=='idle' AND doc IS NULL, not doc IS NULL alone."""
@@ -225,7 +225,7 @@ def test_session_end_working_null_doc_not_reaped(app_env, monkeypatch):
     assert row["status"] == "stopped"
 
 
-def test_session_end_dispatch_null_doc_not_reaped(app_env, monkeypatch):
+def test_session_end_dispatch_null_doc_not_reaped(app_env, monkeypatch) -> None:
     """A dispatched worker with a NULL doc is not interactive — close as stopped,
     never soft-archived."""
     hooks = sys.modules["routes.hooks"]

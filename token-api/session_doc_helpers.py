@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import yaml
 
 from pane_surface import is_placeholder_tab_name
@@ -1508,7 +1509,7 @@ async def resolve_session_doc_for_start(
     return None, "interactive_deferred"
 
 
-async def create_deferred_interactive_session_doc(db) -> int:
+async def create_deferred_interactive_session_doc(db: aiosqlite.Connection) -> int:
     """Mint the placeholder session doc for a genuine interactive pane.
 
     Deferred from SessionStart (``resolve_session_doc_for_start`` returns
