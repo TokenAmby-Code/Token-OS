@@ -894,7 +894,21 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     tmuxctl_log = tmp_path / "tmuxctl.log"
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
-        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$TMUXCTL_LOG"\nprintf "%%83\\n"\n',
+        "#!/usr/bin/env bash\n"
+        # Log only the stack-dispatch invocation; the canonical-id resolve probe
+        # (resolve-pane --format physical) must answer with the physical pane but
+        # not clobber the logged command. Emit the canonical page:index id from
+        # stack dispatch so the resolve step is genuinely exercised.
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then\n'
+        '  printf "%s\\n" "$*" > "$TMUXCTL_LOG"\n'
+        '  printf "legion:1\\n"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then\n'
+        '  printf "%%83\\n"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
@@ -1527,3 +1541,182 @@ def test_dispatch_prompt_file_single_quote_is_shell_safe(tmp_path: Path) -> None
     final = final_parts[1].splitlines()[0]
     syntax = subprocess.run(["bash", "-n", "-c", final], capture_output=True, text=True, timeout=60)
     assert syntax.returncode == 0, syntax.stderr
+
+
+def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path: Path) -> None:
+    """A :new stack launch must survive tmuxctl emitting a canonical page:index id.
+
+    Regression for the tmuxctl canonical-id campaign: `tmuxctl stack dispatch`
+    now prints the public `page:index` id (e.g. mechanicus:2), not a legacy raw
+    %NNN. dispatch used to `grep -Eo '%[0-9]+'` that output, get '', and fatal
+    with "stack dispatch returned a non-pane id" — every fresh-stack launch dead.
+    dispatch must now resolve whatever tmuxctl emits to a physical %NNN via
+    `resolve-pane --format physical` and bake THAT into the launch env so the
+    agent's first SessionStart registers the real pane (correct persona, not a
+    default-astartes ghost).
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    rec = tmp_path / "tmux_calls.txt"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        # The campaign's canonical output: page:index, NOT %NNN.
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        # resolve_dispatch_physical_target maps the canonical id back to physical.
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        f'#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\0" "$a" >> {rec}; done\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    # Skip the caller-instance resolution network hop so the test is hermetic.
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    # Must NOT fatal with the non-pane-id error the grep produced.
+    assert result.returncode == 0, result.stderr
+    assert "non-pane id" not in result.stderr
+
+    calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
+    staged_arg = next((c for c in calls if c.startswith("bash /")), None)
+    assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
+    # The agent must launch in the resolved physical pane, not the canonical id.
+    assert "-t" in calls and "%77" in calls, f"launch not targeted at %77; calls={calls}"
+    staged_path = Path(staged_arg.split(" ", 1)[1])
+    content = staged_path.read_text(encoding="utf-8")
+
+    assert "TMUX_PANE=%77" in content, content
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=%77" in content, content
+    assert "TMUX_PANE=mechanicus:2" not in content, content
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=mechanicus:2" not in content, content
+    # The allocation token remains the semantic request target.
+    assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in content, content
+
+
+def test_dispatch_direct_objective_without_brief_warns(tmp_path: Path) -> None:
+    """A direct launch with --objective but no brief boots idle — warn the operator.
+
+    --objective is aspirant-only metadata; on a --direct/--target launch it is
+    delivered nowhere. Without --prompt/--prompt-file/--session-doc the agent
+    boots with no instructions (the 2026-06-20 briefless-canary trap). dispatch
+    must emit a clear warning (non-fatal) pointing the operator at the real
+    brief flags.
+    """
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "--objective",
+            "do the important thing",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--objective is aspirant-only metadata" in result.stderr
+    assert "boot idle" in result.stderr or "boots idle" in result.stderr
+
+
+def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path: Path) -> None:
+    """When tmuxctl emits nothing, the operator gets the clear non-pane-id error.
+
+    The resolve step runs under `set -euo pipefail`; an empty tmuxctl result must
+    not abort the assignment silently — it must fall through to the explicit
+    'stack dispatch returned a non-pane id' guard so the failure is legible.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    # stack dispatch succeeds but prints nothing; resolve-pane also empty.
+    fake_tmuxctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_tmuxctl.chmod(0o755)
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "stack dispatch returned a non-pane id" in result.stderr
+
+
+def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) -> None:
+    """The objective guard must not fire when a real brief is present."""
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "--objective",
+            "do the important thing",
+            "--prompt",
+            "here is the actual brief",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "aspirant-only metadata" not in result.stderr
