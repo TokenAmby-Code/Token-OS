@@ -6,6 +6,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
+from tmuxctl import custodes
 from tmuxctl.resolver import list_free_panes
 from tmuxctl.service import TmuxControlPlane
 
@@ -14,10 +15,10 @@ class FakeAdapter:
     """Minimal adapter stub: serves a canned `list-panes -a` scan.
 
     `rows` is a list of (pane_id, @PANE_CLEAN, @INSTANCE_ID, @PANE_ID,
-    window_name) tuples mirroring the freelist format string.
+    window_name, pane_pid) tuples mirroring the freelist format string.
     """
 
-    def __init__(self, rows: list[tuple[str, str, str, str, str]]):
+    def __init__(self, rows: list[tuple[str, str, str, str, str, str]]):
         self._rows = rows
         self.calls: list[tuple[str, ...]] = []
 
@@ -30,15 +31,15 @@ class FakeAdapter:
 
 LIVE = [
     # clean + no agent → FREE
-    ("%24", "1", "", "palace:N", "palace"),
+    ("%24", "1", "", "palace:N", "palace", "100"),
     # clean but a live agent owns it → NOT free
-    ("%25", "1", "uuid-agent", "palace:E", "palace"),
+    ("%25", "1", "uuid-agent", "palace:E", "palace", "101"),
     # dirty shell (no stamp) → NOT free
-    ("%29", "", "", "somnium:NE", "somnium"),
+    ("%29", "", "", "somnium:NE", "somnium", "102"),
     # clean + no agent + no cardinal role → FREE, role None
-    ("%43", "1", "", "", "scratch"),
+    ("%43", "1", "", "", "scratch", "103"),
     # explicit non-1 stamp value → NOT free
-    ("%50", "0", "", "legion:S", "legion"),
+    ("%50", "0", "", "legion:S", "legion", "104"),
 ]
 
 
@@ -53,6 +54,23 @@ def test_list_free_panes_excludes_agent_owned_clean_pane():
     assert all(p.pane_id != "%25" for p in free)
 
 
+def test_list_free_panes_excludes_live_agent_even_when_instance_stamp_missing(monkeypatch):
+    """Stale/missing @INSTANCE_ID must not expose a live singleton pane as free."""
+
+    def fake_active(pid: int | None) -> bool:
+        return pid == 999
+
+    monkeypatch.setattr(custodes, "pane_has_active_agent", fake_active)
+    rows = [
+        ("%custodes", "1", "", "legion:custodes", "legion", "999"),
+        ("%worker", "1", "", "legion:1", "legion", "1000"),
+    ]
+
+    free = list_free_panes(FakeAdapter(rows))
+
+    assert [p.pane_id for p in free] == ["%worker"]
+
+
 def test_list_free_panes_role_canonicalized_and_optional():
     free = {p.pane_id: p for p in list_free_panes(FakeAdapter(LIVE))}
     assert free["%24"].pane_role == "palace:N"
@@ -61,7 +79,7 @@ def test_list_free_panes_role_canonicalized_and_optional():
 
 
 def test_list_free_panes_empty_when_none_clean():
-    free = list_free_panes(FakeAdapter([("%1", "", "", "x:N", "w")]))
+    free = list_free_panes(FakeAdapter([("%1", "", "", "x:N", "w", "100")]))
     assert free == []
 
 

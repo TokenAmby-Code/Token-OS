@@ -1816,6 +1816,200 @@ def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path
     assert "stack dispatch returned a non-canonical id" in result.stderr
 
 
+def test_dispatch_stack_new_fails_fast_when_wrapper_never_starts(tmp_path: Path) -> None:
+    """A sent launch whose wrapper never stamps the pane must not look successful.
+
+    This is the observable-launch guard for the real failure mode where the
+    newborn pane receives a corrupted/no-op staged command: tmux accepts the
+    send, but no wrapper starts, no instance row appears, and the operator used
+    to get a false "dispatched ..." success.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {tmux_log}\n'
+        # The launch command is accepted, but display-message never reports the
+        # wrapper stamp, simulating a pane where the staged shell never ran.
+        'if [[ "$1" == "display-message" ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "launch failed: wrapper did not start" in result.stderr
+    assert "%77" not in result.stderr
+    assert "DISPATCH LAUNCH FAILED" in tmux_log.read_text(encoding="utf-8")
+
+
+def test_dispatch_stack_new_observer_accepts_matching_wrapper_stamp(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+    wrapper_id = "11111111-2222-3333-4444-555555555555"
+
+    fake_uuidgen = fake_bin / "uuidgen"
+    fake_uuidgen.write_text(
+        f"#!/usr/bin/env bash\nprintf '%s\\n' '{wrapper_id}'\n", encoding="utf-8"
+    )
+    fake_uuidgen.chmod(0o755)
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {tmux_log}\n'
+        f'if [[ "$1" == "display-message" ]]; then printf "%s\\n" "{wrapper_id}"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dispatched claude to mechanicus:new" in result.stdout
+    assert "DISPATCH LAUNCH FAILED" not in tmux_log.read_text(encoding="utf-8")
+
+
+def test_dispatch_stack_new_fails_fast_when_instance_never_registers(tmp_path: Path) -> None:
+    """Wrapper start alone is not enough; the agent must reach SessionStart."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+    wrapper_id = "11111111-2222-3333-4444-555555555555"
+
+    fake_uuidgen = fake_bin / "uuidgen"
+    fake_uuidgen.write_text(
+        f"#!/usr/bin/env bash\nprintf '%s\\n' '{wrapper_id}'\n", encoding="utf-8"
+    )
+    fake_uuidgen.chmod(0o755)
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {tmux_log}\n'
+        'if [[ "$1" == "display-message" && "$*" == *"@TOKEN_API_WRAPPER_LAUNCH_ID"* ]]; then\n'
+        f'  printf "%s\\n" "{wrapper_id}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "display-message" && "$*" == *"@INSTANCE_ID"* ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "launch failed: instance did not register" in result.stderr
+    assert "DISPATCH LAUNCH FAILED" in tmux_log.read_text(encoding="utf-8")
+
+
 def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) -> None:
     """The objective guard must not fire when a real brief is present."""
     result = subprocess.run(
