@@ -430,8 +430,16 @@ def any_typing_guard_active(*, window_seconds: int | None = None) -> bool:
 def typing_guard_active(*, target: str | None = None, window_seconds: int | None = None) -> bool:
     """Canonical typing-guard predicate.
 
-    With ``target`` set, evaluates only that pane: pending prompt input in that
-    pane, or recent client input while that pane is the active attached pane.
+    With ``target`` set, the guard holds ONLY for a pane a human is actually
+    attending — ``_pane_attended(target)`` AND (an unsent draft on its prompt
+    line OR a keystroke within the recent-activity window). Attendance gates BOTH
+    branches by design: the guard is "scoped to the pane the human is actually
+    typing in" (the mandate). An unattended worker pane is never guarded merely
+    for holding leftover prompt text — that was the asymmetry that over-blocked
+    agents (dispatch / brief-delivery DELAY-ed to idle panes) while under-
+    protecting the Emperor. The attended pane stays held both mid-draft and
+    mid-keystroke, so automation cannot race his direct input there.
+
     With no target, returns ``any_typing_guard_active`` for the few global
     policies that intentionally hang on ANY typing guard.
 
@@ -439,9 +447,9 @@ def typing_guard_active(*, target: str | None = None, window_seconds: int | None
     """
     window_seconds = _typing_guard_window_seconds(window_seconds)
     if target:
-        return _pane_has_pending_input(target) or (
-            _pane_attended(target) and _recent_client_activity(window_seconds)
-        )
+        if not _pane_attended(target):
+            return False
+        return _pane_has_pending_input(target) or _recent_client_activity(window_seconds)
     return any_typing_guard_active(window_seconds=window_seconds)
 
 

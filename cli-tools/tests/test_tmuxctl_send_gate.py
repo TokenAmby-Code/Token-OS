@@ -302,6 +302,84 @@ def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
     assert dispatched is None, "a send to an unrelated pane must not be gated by typing in %active"
 
 
+def test_unattended_worker_pane_with_prompt_text_is_deliverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asymmetry fix (mandate 3) + Custodes brief-delivery guardrail.
+
+    A worker pane that no human is attending must NOT be typing-guarded merely
+    because it has leftover prompt text — the guard is scoped to the pane the
+    human is actually typing in. So a brief/dispatch send to that unattended
+    worker still SAILS THROUGH (evaluate → None). This is the over-block the old
+    predicate caused: ``_pane_has_pending_input`` fired regardless of attendance,
+    holding W's brief-delivery to idle worker panes.
+    """
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "display-message" in cmd and "#{client_activity}" in cmd and "-t" not in cmd:
+            proc.stdout = f"{now - 3600}\n"  # last keystroke an hour ago, nowhere near
+            return proc
+        if "display-message" in cmd and "-t" in cmd and "%worker" in cmd:
+            proc.stdout = "00\n"  # not the active pane, not the active window
+            return proc
+        if "list-clients" in cmd and "%worker" in cmd:
+            return proc  # no client attached to the worker pane
+        if "capture-pane" in cmd and "%worker" in cmd:
+            proc.stdout = "❯ leftover prompt text\n"  # has prompt text, but no human here
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    assert send_gate.typing_guard_active(target="%worker") is False
+    assert send_gate.evaluate(("send-keys", "-t", "%worker", "brief body")) is None
+
+
+def test_attended_pane_is_held_on_pending_text_and_on_recent_keystroke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Human-protection pin: the attended pane the Emperor is in stays guarded
+    both when its prompt shows an unsent draft AND when he just struck a key with
+    no visible draft yet (mid-keystroke injection must be held)."""
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+
+    state = {"capture": "❯ draft\n", "activity": now - 3600}  # draft, stale keystroke
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "display-message" in cmd and "#{client_activity}" in cmd and "-t" not in cmd:
+            proc.stdout = f"{state['activity']}\n"
+            return proc
+        if "display-message" in cmd and "-t" in cmd and "%active" in cmd:
+            proc.stdout = "11\n"
+            return proc
+        if "list-clients" in cmd and "%active" in cmd:
+            proc.stdout = "x\n"
+            return proc
+        if "capture-pane" in cmd and "%active" in cmd:
+            proc.stdout = state["capture"]
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    # Draft on the prompt, no recent keystroke → held.
+    assert send_gate.typing_guard_active(target="%active") is True
+
+    # No visible draft, but a keystroke just landed → still held (mid-keystroke).
+    state["capture"] = "❯ \n"
+    state["activity"] = now
+    assert send_gate.typing_guard_active(target="%active") is True
+
+
 def test_evaluate_only_blocks_target_under_typing_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
