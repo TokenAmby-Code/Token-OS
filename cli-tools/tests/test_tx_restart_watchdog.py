@@ -127,17 +127,18 @@ def test_restart_force_refuses_non_interactive_invocation(tmp_path: pathlib.Path
     # that would trip the earlier agent-context block instead). The agent guard is
     # covered in test_tx_restart_agent_guard.py; here we assert the non-agent,
     # non-TTY caller is refused by the --force/TTY guard.
-    agent_markers = {
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "TOKEN_API_SUBAGENT",
-        "CODEX_PROFILE",
-        "CODEX_HEADLESS",
-        "CODEX_BRIDGE_ID",
-        "TOKEN_API_CODEX_BRIDGE_ID",
-        "TOKEN_API_CODEX_PROFILE",
-    }
-    env = {k: v for k, v in os.environ.items() if k not in agent_markers}
+    #
+    # Match the guard's contract exactly: 3 markers by exact name plus the whole
+    # CODEX_* / TOKEN_API_CODEX_* prefix family. Stripping by prefix (not a fixed
+    # list) keeps this isolation deterministic as new Codex variants appear — the
+    # same prefix scan _tx_is_agent_context now performs.
+    agent_marker_names = {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "TOKEN_API_SUBAGENT"}
+    agent_marker_prefixes = ("CODEX_", "TOKEN_API_CODEX_")
+
+    def _is_agent_marker(key: str) -> bool:
+        return key in agent_marker_names or key.startswith(agent_marker_prefixes)
+
+    env = {k: v for k, v in os.environ.items() if not _is_agent_marker(k)}
     env.update(
         {
             "TX_INVOCATION_LOG": str(invocation_log),
