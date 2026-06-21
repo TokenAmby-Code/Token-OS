@@ -1780,7 +1780,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cron_engine = CronEngine(scheduler, DB_PATH)
     await cron_engine.recover_orphaned_runs()
     await cron_engine.ensure_permanent_jobs()
-    cron_engine.register_now_widget_job(DB_PATH, DAILY_NOTE_DIR)
     cron_engine.register_persona_sweep_job()
     print("Cron engine loaded")
     # Start TTS queue worker
@@ -13073,68 +13072,14 @@ async def generate_daily_timer_analytics(date_str: str):
         print(f"TIMER: Failed to generate daily analytics: {e}")
 
 
-def _sync_update_daily_note():
-    """Update daily note synchronically (called via asyncio.to_thread)."""
-    import sqlite3
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    note_path = OBSIDIAN_DAILY_PATH / f"{today}.md"
-    if not note_path.exists():
-        return
-
-    # Get session count and mode change count for today
-    session_count = 0
-    mode_change_count = 0
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("PRAGMA busy_timeout=5000")
-        session_count = (
-            conn.execute("SELECT COUNT(*) FROM timer_sessions WHERE date = ?", (today,)).fetchone()[
-                0
-            ]
-            or 0
-        )
-        mode_change_count = (
-            conn.execute(
-                "SELECT COUNT(*) FROM timer_mode_changes WHERE timestamp LIKE ?", (f"{today}%",)
-            ).fetchone()[0]
-            or 0
-        )
-        conn.close()
-    except Exception:
-        pass  # Silently skip if DB query fails
-
-    # Snap last_timer_update to the 30-min grid so this purely-time-derived field is
-    # stable for 30 min at a time. Combined with update_frontmatter's write-skip guard,
-    # the 30s poll becomes a near-total no-op except at the grid boundary or on a real
-    # timer-state change.
-    _now = datetime.now()
-    last_timer_update = _now.replace(minute=(_now.minute // 30) * 30).strftime("%H:%M")
-
-    update_frontmatter(
-        note_path,
-        {
-            "timer_status": timer_engine.current_mode.value,
-            "timer_work_time": format_timer_time(timer_engine.total_work_time_ms),
-            "timer_break_earned": format_timer_time(
-                max(0, timer_engine.break_balance_ms) + timer_engine.total_break_time_ms
-            ),
-            "timer_break_used": format_timer_time(timer_engine.total_break_time_ms),
-            "timer_break_available": format_timer_time(max(0, timer_engine.break_balance_ms)),
-            "timer_backlog": format_timer_time(abs(min(0, timer_engine.break_balance_ms))),
-            "timer_sessions": session_count,
-            "timer_mode_changes": mode_change_count,
-            "last_timer_update": last_timer_update,
-        },
-    )
-
-
-async def timer_update_daily_note():
-    """Update today's daily note front matter asynchronously."""
-    try:
-        await asyncio.to_thread(_sync_update_daily_note)
-    except Exception as e:
-        print(f"TIMER: Failed to update daily note: {e}")
+# `_sync_update_daily_note` / `timer_update_daily_note` were removed (2026-06-21,
+# daily-note write-race P0). They rewrote today's daily-note frontmatter every 30s
+# from the live timer engine (timer_status, break balances, last_timer_update),
+# churning the file's mtime and racing concurrent harness `Edit`s / external
+# appends. Intra-day timer state is the DB source of truth (timer_state /
+# timer_state_daily, PR #269) surfaced live by the /ui/ops cockpit; the daily note
+# receives the day's timer footprint exactly once via the end-of-day flush
+# (`_sync_generate_daily_analytics`). Do not reintroduce a per-tick note writer.
 
 
 def _sync_save_to_db(state_json: str):
@@ -19334,7 +19279,6 @@ async def _work_session_enforce_tick(now_ms: int, result) -> dict | None:
 async def timer_worker():
     """Background worker: ticks timer every 1s, persists state periodically."""
     global _current_session_id, _session_start_ms, _mode_change_count
-    last_daily_update = 0.0
     last_db_save = 0.0
     last_sample_save = 0.0
     last_mode = timer_engine.current_mode.value
@@ -19608,10 +19552,11 @@ async def timer_worker():
                         productivity_active=productivity_active,
                     )
 
-            # Update daily note every 30s
-            if now - last_daily_update >= 30:
-                await timer_update_daily_note()
-                last_daily_update = now
+            # (Removed 2026-06-21, daily-note write-race P0) The timer worker no
+            # longer writes the daily note every 30s. That per-tick frontmatter
+            # rewrite moved the live note's mtime and broke concurrent harness
+            # `Edit`s. Live timer state is the DB (timer_state/_daily) + cockpit;
+            # the daily note gets the day's timer footprint once at end-of-day flush.
 
             # Persist faithful graph samples independently from sparse shift events.
             if now - last_sample_save >= 30:
@@ -22792,7 +22737,6 @@ async def _create_aspirant_session_doc(
 session_doc_id: {doc_id}
 created: {today}
 agents: []
-instance_ids: []
 status: active
 type: session
 project: aspirants

@@ -1226,8 +1226,7 @@ def create_session_doc_file(
     }
     if project:
         fm["project"] = project
-    fm["agents"] = []
-    fm["instance_ids"] = []
+    fm["agents"] = []  # append-only launch roster (see _update_doc_agents_list)
     if primarch_name:
         fm["primarch"] = primarch_name
     fm["status"] = "active"
@@ -1278,14 +1277,26 @@ def create_session_doc_file(
 
 
 async def _update_doc_agents_list(db, doc_id: int) -> None:
-    """Update the agents list, instance_ids, and primarch in a session doc's YAML frontmatter."""
+    """Append newly-bound agents to a session doc's append-only ``agents:`` log.
+
+    ``agents:`` is a monotonic, append-only roster of every agent ever bound to
+    the doc — a pulse for fleet reconstruction, NOT live lifecycle state. We
+    deliberately do **not** filter by status and never remove an entry: a
+    stopped/archived agent stays in the log. New names are unioned with whatever
+    is already in the note, so the roster survives even if the DB rows are later
+    cleared (the note is the durable record). Combined with ``update_frontmatter``'s
+    write-skip guard, a sync that adds no new agent is a byte-identical no-op, so
+    the daily note's mtime never moves on routine status churn — only a genuine new
+    launch writes (low-frequency, append-only). ``instance_ids`` is retired: it was
+    never read for logic and implied a live "active instances" write-contract the
+    daily-note cold-storage model deliberately does not hold.
+    """
     cursor = await db.execute(
-        "SELECT id, name AS tab_name FROM instances WHERE session_doc_id = ? AND status NOT IN ('stopped', 'archived')",
+        "SELECT name FROM instances WHERE session_doc_id = ?",
         (doc_id,),
     )
     rows = await cursor.fetchall()
-    agents = [r[1] for r in rows if r[1]]
-    instance_ids = [r[0] for r in rows if r[0]]
+    bound_names = [r[0] for r in rows if r[0]]
 
     cursor = await db.execute(
         "SELECT file_path, primarch_name FROM session_documents WHERE id = ?", (doc_id,)
@@ -1300,15 +1311,23 @@ async def _update_doc_agents_list(db, doc_id: int) -> None:
 
     primarch_name = doc_row[1]
 
-    updates = {
-        "agents": agents,
-        "instance_ids": instance_ids,
-    }
-    if primarch_name:
-        updates["primarch"] = primarch_name
-    delete_keys = ["primarch"] if not primarch_name else None
+    def _merge(fm: dict[str, Any]) -> None:
+        existing = fm.get("agents")
+        roster = list(existing) if isinstance(existing, list) else []
+        seen = set(roster)
+        for name in bound_names:
+            if name not in seen:
+                roster.append(name)
+                seen.add(name)
+        fm["agents"] = roster
+        # Retire the live-lifecycle field wherever it still lingers.
+        fm.pop("instance_ids", None)
+        if primarch_name:
+            fm["primarch"] = primarch_name
+        else:
+            fm.pop("primarch", None)
 
-    await asyncio.to_thread(update_frontmatter, fp, updates, delete_keys)
+    await asyncio.to_thread(update_frontmatter, fp, transform=_merge)
 
 
 async def resolve_or_create_session_doc_for_path(db, file_path: Path) -> int | None:
@@ -1378,8 +1397,7 @@ def create_daily_note_file(file_path: Path, date_str: str, doc_id: int) -> None:
         "type": "daily-note",
         "status": "active",
         "legion": "custodes",
-        "agents": [],
-        "instance_ids": [],
+        "agents": [],  # append-only launch roster (see _update_doc_agents_list)
     }
     body = f"# {date_str}\n\n## Custodes\n\n## Log\n"
     file_path.write_text(serialize_frontmatter(fm, body), encoding="utf-8")
