@@ -1496,7 +1496,12 @@ async def load_tasks_from_db():
             print(f"Failed to register task {task_id}: {e}")
 
 
-RESTART_STATE_PATH = Path(__file__).parent / "restart_state.json"
+# Runtime state, NOT source: lives in ~/.claude (alongside agents.db and
+# corax-state.json), never inside the deploy-owned runtime checkout. The tree is
+# frozen read-only after deploy (runtime-write-protect.sh), so a path under
+# token-api/ here would EACCES on both the shutdown write and the pragma-once
+# unlink. ~/.claude is always writable.
+RESTART_STATE_PATH = Path.home() / ".claude" / "restart_state.json"
 
 # Keys that must NOT survive a restart — derived from live signals or boot-time config.
 _RESTART_STATE_DENYLIST = {
@@ -1533,6 +1538,7 @@ def save_restart_state() -> None:
             "saved_at": datetime.now().isoformat(),
             "desktop_state": persistable,
         }
+        RESTART_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         RESTART_STATE_PATH.write_text(json.dumps(payload, indent=2))
         print(f"Restart state saved: {sorted(persistable.keys())}")
     except Exception as e:

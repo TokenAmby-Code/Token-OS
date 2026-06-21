@@ -39,6 +39,30 @@ esac
 
 HOME_DIR="${HOME%/}"
 
+# Runtime-writable directories: subpaths the RUNNING app must open for write at
+# runtime even though the rest of the deploy-owned tree is frozen read-only.
+# These are exempted from the lock (re-granted owner-write, created if missing)
+# and ignored by the write-bit verification, so locking the tree no longer
+# clobbers the live queue. Paths are relative to each runtime root; override the
+# default with TOKEN_OS_RUNTIME_WRITABLE_DIRS (':' or space separated).
+#
+# Audited write sites under the runtime tree (paths relative to the root):
+#   pending/  -> discord-daemon job queue (discord-daemon/message-store.js;
+#                token-api /send enqueues here). THE incident path — a missing
+#                owner-write bit on this dir fired EACCES fleet-wide.
+# token-api/restart_state.json was the only other runtime write into the tree;
+# it was relocated to ~/.claude/ (out of the deploy tree) rather than exempted,
+# because a lone mutable file inside a read-only source dir can't satisfy the
+# pragma-once unlink (delete needs a writable parent dir, which stays frozen).
+writable_rel_dirs() {
+    local raw="${TOKEN_OS_RUNTIME_WRITABLE_DIRS-pending}"
+    local d
+    local IFS=': '
+    for d in $raw; do
+        [[ -n "$d" ]] && printf '%s\n' "$d"
+    done
+}
+
 default_roots() {
     # Local-filesystem runtimes only. chmod is a silent no-op on network mounts
     # (SMB/CIFS — e.g. /Volumes/Imperium, /mnt/imperium), so the boundary cannot
@@ -89,9 +113,71 @@ chmod_tree_no_symlinks() {
     find -P "$root" ! -type l -exec chmod "$mode" {} +
 }
 
+# Create any missing runtime-writable exemption BEFORE the freeze, while the
+# tree is still writable (deploy unlocks before it locks). Creation matters for
+# a fresh deploy: once the root is read-only the app can't mkdir the queue
+# itself, so the lock must leave the exemption present. On a re-lock of an
+# already-frozen tree, briefly restore owner write on the root so mkdir lands;
+# the freeze that follows resets it.
+ensure_writable_exemptions_exist() {
+    local root="$1" rel target
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        target="$root/$rel"
+        [[ -L "$target" ]] && continue   # symlinks reported in the re-grant pass
+        if [[ ! -e "$target" ]]; then
+            chmod u+w "$root" 2>/dev/null || true
+            mkdir -p "$target"
+        fi
+    done < <(writable_rel_dirs)
+}
+
+# Re-grant owner write to each exemption AFTER the freeze clobbered it. group/
+# other stay write-less and symlink targets are never chmod'd. A symlink where a
+# writable dir is expected is refused (rc=1) — never silently widen a link.
+regrant_writable_exemptions() {
+    local root="$1" rel target
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        target="$root/$rel"
+        if [[ -L "$target" ]]; then
+            echo "runtime-write-protect: writable exemption is a symlink, refusing: $target" >&2
+            rc=1
+            continue
+        fi
+        [[ -e "$target" ]] || continue
+        chmod_tree_no_symlinks "$target" u+w
+    done < <(writable_rel_dirs)
+}
+
+# Build a find prune expression that skips the writable exemptions under $root,
+# so the write-bit verification ignores the dirs we deliberately keep writable.
+exemption_prune_expr() {
+    local root="$1" rel
+    EXEMPTION_PRUNE=()
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        EXEMPTION_PRUNE+=( -path "$root/$rel" -o -path "$root/$rel/*" -o )
+    done < <(writable_rel_dirs)
+    # Drop the trailing -o so the group is a well-formed expression.
+    if [[ ${#EXEMPTION_PRUNE[@]} -gt 0 ]]; then
+        unset 'EXEMPTION_PRUNE[$((${#EXEMPTION_PRUNE[@]}-1))]'
+    fi
+}
+
+# True if any non-exempt path under $root still carries a write bit. The
+# exemptions are pruned so a correctly-locked tree (frozen source + writable
+# queue) reads as locked, not as a false "still writable".
 root_has_write_bits() {
     local root="$1"
-    find -P "$root" ! -type l \( -perm -u+w -o -perm -g+w -o -perm -o+w \) -print -quit | grep -q .
+    exemption_prune_expr "$root"
+    if [[ ${#EXEMPTION_PRUNE[@]} -gt 0 ]]; then
+        find -P "$root" \( "${EXEMPTION_PRUNE[@]}" \) -prune -o \
+            ! -type l \( -perm -u+w -o -perm -g+w -o -perm -o+w \) -print -quit | grep -q .
+    else
+        find -P "$root" \
+            ! -type l \( -perm -u+w -o -perm -g+w -o -perm -o+w \) -print -quit | grep -q .
+    fi
 }
 
 rc=0
@@ -119,7 +205,13 @@ for root in "${ROOTS[@]}"; do
             ;;
         lock)
             disable_git_filemode_tracking "$root"
+            # Create exemptions while writable, freeze the whole tree, then
+            # re-grant write to the exemptions. Net result: frozen source, 0755
+            # runtime queue. Idempotent — a re-deploy onto a correct tree leaves
+            # the exemptions 0755.
+            ensure_writable_exemptions_exist "$root"
             chmod_tree_no_symlinks "$root" u-w,go-w
+            regrant_writable_exemptions "$root"
             # Verify the lock actually took. Network mounts (SMB/CIFS) silently
             # ignore POSIX mode changes, so chmod "succeeds" while the tree stays
             # writable. Never report a lock we didn't achieve — that is false
