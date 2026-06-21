@@ -22,6 +22,33 @@ token_wrapper_uuid() {
   fi
 }
 
+# Normalize any pane id reaching our ingest boundary to its canonical page:index
+# form. tmux hands the child process a physical %NNN via its own $TMUX_PANE
+# contract; rather than carry that physical id as the working identity, we
+# canonicalize it the moment it enters our space (the inverse of the legacy
+# "translate physical->public on the way out" layer).
+#
+#   already-canonical (page:index)  -> kept verbatim
+#   raw %NNN / self / current       -> `tmuxctl resolve-pane --format id`
+#   empty / no @PANE_ID role / error -> FAIL OPEN to the input (today's behavior)
+#
+# Fail-open is deliberate: a pane with no canonical cardinal (e.g. no @PANE_ID
+# role stamped) keeps emitting its physical id exactly as before, so this is a
+# no-op for unmanaged panes — no regression. Wired into call sites in PR-B.
+normalize_pane_to_canonical() {
+  local pane="$1" resolved
+  [[ -n "$pane" ]] || return 0
+  if [[ "$pane" == [a-z]*:* && "$pane" != %* ]]; then
+    printf '%s' "$pane"
+    return 0
+  fi
+  if command -v tmuxctl >/dev/null 2>&1; then
+    resolved="$(tmuxctl resolve-pane --format id "$pane" 2>/dev/null || true)"
+    [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
+  fi
+  printf '%s' "$pane"
+}
+
 token_wrapper_post_hook() {
   local action_type="$1"
   local payload="$2"
