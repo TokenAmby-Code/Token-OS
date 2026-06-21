@@ -439,18 +439,32 @@ _sync_live_checkout_unlocked() {
     ensure_runtime_checkout "$dir" || return 1
 
     old_head="$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null || true)"
+
+    git -C "$dir" fetch "$TOKEN_OS_BARE_REPO" '+refs/heads/*:refs/remotes/local-bare/*' >/dev/null 2>&1 || {
+        echo -e "  ${RED}✗${NC} CD-sync: failed to fetch bare refs into runtime"
+        return 1
+    }
+    if ! git -C "$dir" fetch origin --prune >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠${NC} CD-sync: failed to refresh runtime origin refs (continuing)"
+    fi
+
     if [[ "$old_head" == "$target" ]]; then
         echo -e "  ${GREEN}✓${NC} CD-sync: runtime already at ${target:0:9} — no sync needed"
         return 0
     fi
 
     echo -e "${BLUE}→${NC} CD-sync: updating runtime $dir detached → ${target:0:9}..."
-    git -C "$dir" fetch "$TOKEN_OS_BARE_REPO" '+refs/heads/*:refs/remotes/local-bare/*' >/dev/null 2>&1 || {
-        echo -e "  ${RED}✗${NC} CD-sync: failed to fetch bare refs into runtime"
+    if runtime_is_dirty "$dir"; then
+        echo -e "  ${RED}✗${NC} CD-sync: aborting deploy — runtime has unexpected local changes (refusing to clobber): $dir"
+        git -C "$dir" status --short >&2 || true
         return 1
-    }
+    fi
     git -C "$dir" checkout --detach "$target" >/dev/null 2>&1 || {
         echo -e "  ${RED}✗${NC} CD-sync: failed to checkout runtime target ${target:0:9}"
+        return 1
+    }
+    git -C "$dir" reset --hard "$target" >/dev/null 2>&1 || {
+        echo -e "  ${RED}✗${NC} CD-sync: failed to hard-reset runtime target ${target:0:9}"
         return 1
     }
 
