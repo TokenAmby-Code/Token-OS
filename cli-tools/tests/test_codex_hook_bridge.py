@@ -46,7 +46,7 @@ def _bridge_env(tmp_path: pathlib.Path, state: str) -> tuple[dict[str, str], pat
 
 def _wait_for_approver(approve_log: pathlib.Path) -> None:
     for _ in range(20):
-        if approve_log.exists():
+        if approve_log.exists() and approve_log.read_text().strip():
             break
         time.sleep(0.05)
 
@@ -60,7 +60,7 @@ def _run_bridge(
     env, approve_log = _bridge_env(tmp_path, state)
     subprocess.run(
         ["bash", str(SCRIPT), action],
-        input=json.dumps(payload or {"session_id": "codex-1"}).encode(),
+        input=json.dumps(payload if payload is not None else {"session_id": "codex-1"}).encode(),
         env=env,
         check=True,
     )
@@ -84,19 +84,21 @@ def _write_transcript(path: pathlib.Path, turns: list[list[dict[str, object]]]) 
     path.write_text("\n".join(lines) + "\n")
 
 
-def test_stop_launches_clear_context_approver_when_planning(tmp_path):
+def test_stop_launches_clear_context_approver_when_planning(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(tmp_path, "planning")
 
     assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
 
 
-def test_stop_launches_clear_context_approver_when_approving(tmp_path):
+def test_stop_launches_clear_context_approver_when_approving(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(tmp_path, "approving")
 
     assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
 
 
-def test_stop_launches_approver_when_latest_transcript_turn_has_plan_item(tmp_path):
+def test_stop_launches_approver_when_latest_transcript_turn_has_plan_item(
+    tmp_path: pathlib.Path,
+) -> None:
     transcript = tmp_path / ".codex" / "sessions" / "rollout-codex-1.jsonl"
     _write_transcript(
         transcript,
@@ -115,7 +117,9 @@ def test_stop_launches_approver_when_latest_transcript_turn_has_plan_item(tmp_pa
     assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
 
 
-def test_stop_launches_approver_when_latest_transcript_turn_has_proposed_plan(tmp_path):
+def test_stop_launches_approver_when_latest_transcript_turn_has_proposed_plan(
+    tmp_path: pathlib.Path,
+) -> None:
     transcript = tmp_path / "transcript.jsonl"
     _write_transcript(
         transcript,
@@ -147,7 +151,9 @@ def test_stop_launches_approver_when_latest_transcript_turn_has_proposed_plan(tm
     assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
 
 
-def test_stop_does_not_launch_when_only_older_transcript_turn_has_plan(tmp_path):
+def test_stop_does_not_launch_when_only_older_transcript_turn_has_plan(
+    tmp_path: pathlib.Path,
+) -> None:
     transcript = tmp_path / ".codex" / "sessions" / "rollout-codex-1.jsonl"
     _write_transcript(
         transcript,
@@ -176,13 +182,13 @@ def test_stop_does_not_launch_when_only_older_transcript_turn_has_plan(tmp_path)
     assert not approve_log.exists()
 
 
-def test_stop_does_not_launch_approver_when_not_planning(tmp_path):
+def test_stop_does_not_launch_approver_when_not_planning(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(tmp_path, "none")
 
     assert not approve_log.exists()
 
 
-def test_stop_launches_approver_when_payload_has_proposed_plan(tmp_path):
+def test_stop_launches_approver_when_payload_has_proposed_plan(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(
         tmp_path,
         "none",
@@ -195,7 +201,7 @@ def test_stop_launches_approver_when_payload_has_proposed_plan(tmp_path):
     assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
 
 
-def test_post_tool_use_in_open_plan_turn_launches_longer_watcher(tmp_path):
+def test_post_tool_use_in_open_plan_turn_launches_longer_watcher(tmp_path: pathlib.Path) -> None:
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
         json.dumps(
@@ -219,7 +225,7 @@ def test_post_tool_use_in_open_plan_turn_launches_longer_watcher(tmp_path):
     assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 30 --no-state"
 
 
-def test_user_prompt_submit_plan_command_launches_longer_watcher(tmp_path):
+def test_user_prompt_submit_plan_command_launches_longer_watcher(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(
         tmp_path,
         "none",

@@ -211,6 +211,8 @@ def test_dry_run_reads_state_and_reports_not_planning(tmp_path: pathlib.Path) ->
         "exit 0\n"
     )
     (fakebin / "curl").chmod(0o755)
+    (fakebin / "tmux").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (fakebin / "tmux").chmod(0o755)
 
     env = os.environ.copy()
     env["PATH"] = f"{fakebin}:{env['PATH']}"
@@ -236,7 +238,7 @@ def test_non_clear_context_modal_sends_nothing(tmp_path):
 
 def test_codex_truncated_current_plan_modal_accepts_fresh_thread_option(
     tmp_path: pathlib.Path,
-):
+) -> None:
     fixture = tmp_path / "codex-truncated-current.txt"
     fixture.write_text(
         "Implement this plan?\n\n"

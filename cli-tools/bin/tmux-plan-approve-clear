@@ -20,7 +20,11 @@ DRY_RUN=false
 UPDATE_STATE=true
 REAL_TMUX="${TOKEN_API_TMUX_BIN:-/opt/homebrew/bin/tmux}"
 [[ -x "$REAL_TMUX" ]] || REAL_TMUX="/usr/bin/tmux"
-[[ -x "$REAL_TMUX" ]] || REAL_TMUX="$(command -v tmux)"
+[[ -x "$REAL_TMUX" ]] || REAL_TMUX="$(command -v tmux || true)"
+if [[ -z "$REAL_TMUX" || ! -x "$REAL_TMUX" ]]; then
+    echo "tmux-plan-approve-clear: real tmux binary not found" >&2
+    exit 2
+fi
 
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null

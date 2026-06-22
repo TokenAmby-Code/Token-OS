@@ -331,14 +331,18 @@ maybe_launch_plan_approver() {
                 # modal can block that completion. Start a safe watcher for every
                 # prompt; tmux-plan-approve-clear is classifier-gated and only sends
                 # keys when the live pane shows the clear-context plan approval modal.
-                reason="user-prompt-watch"
+                if payload_prompt_starts_plan; then
+                    reason="payload-plan-command"
+                else
+                    reason="user-prompt-watch"
+                fi
                 ;;
         esac
     fi
     [[ -n "$reason" ]] || return 0
     case "$ACTION_TYPE:$reason" in
         UserPromptSubmit:user-prompt-watch) launch_plan_approver "$pane" "$reason" 90 ;;
-        UserPromptSubmit:payload-plan-command) launch_plan_approver "$pane" "$reason" 60 ;;
+        UserPromptSubmit:payload-plan-command) launch_plan_approver "$pane" "$reason" 90 ;;
         PostToolUse:plan-mode-post-tool) launch_plan_approver "$pane" "$reason" 30 ;;
         *) launch_plan_approver "$pane" "$reason" 10 ;;
     esac
