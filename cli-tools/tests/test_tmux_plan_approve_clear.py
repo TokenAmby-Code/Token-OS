@@ -142,7 +142,7 @@ def test_codex_ignores_stale_scrollback_modal_above_live_modal(
     assert out == "action=codex option-2 Down Enter"
 
 
-def test_single_flight_lock_aborts_overlapping_watcher(tmp_path: pathlib.Path):
+def test_single_flight_lock_aborts_overlapping_watcher(tmp_path: pathlib.Path) -> None:
     # The script's single-flight guard prefers flock (a `.lock` FILE) when the
     # `flock` binary is available (Linux/CI) and only falls back to an atomic
     # mkdir (`.lockd` DIR) when it is not (stock macOS). To assert "locked"
