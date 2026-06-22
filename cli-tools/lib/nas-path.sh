@@ -116,6 +116,19 @@ imperium_cfg() {
     eval "echo \"\${${var}}\""
 }
 
+# imperium_path_is_quarantined <path> — returns 0 (true) for paths that must
+# NEVER win runtime/bare resolution: a Synology recycle bin (#recycle), a macOS
+# Trash, or a dated legacy archive (…legacy-YYYYMMDD). These are purge targets;
+# binding the runtime or a worktree's bare there silently destroys work when the
+# bin is emptied (incident 2026-06-22). Mirrors _is_quarantined in imperium_config.py.
+imperium_path_is_quarantined() {
+    case "/${1#/}/" in
+        *"/#recycle/"*|*"/.Trash/"*|*"/.Trashes/"*) return 0 ;;
+        *.legacy-[0-9]*) return 0 ;;
+    esac
+    return 1
+}
+
 # ============================================================
 # LEGACY-COMPATIBLE EXPORTS
 # ============================================================
@@ -128,7 +141,8 @@ export CIVIC="$(imperium_cfg nas_civic)"
 # Unconditional (not ${TOKEN_OS:-...}): long-lived tmux/launchd parents may export a
 # stale legacy TOKEN_OS, and this is the one canonical derivation — it must override.
 _token_os_runtime="$(imperium_cfg token_os_runtime)"
-if [[ -n "$_token_os_runtime" && -d "$_token_os_runtime" ]]; then
+if [[ -n "$_token_os_runtime" && -d "$_token_os_runtime" ]] \
+        && ! imperium_path_is_quarantined "$_token_os_runtime"; then
     export TOKEN_OS="$_token_os_runtime"
 else
     export TOKEN_OS="$IMPERIUM/runtimes/token-os/live"

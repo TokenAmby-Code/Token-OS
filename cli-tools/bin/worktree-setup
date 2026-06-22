@@ -199,6 +199,15 @@ load_config() {
         log_error "$BARE_REPO is not a bare git repository"
         exit 1
     fi
+    # Quarantine guard (incident 2026-06-22): never cut a worktree from a bare in
+    # a recycle bin or a dated legacy archive — its commondir would bind into a
+    # purge target and the work is silently destroyed when the bin empties.
+    if declare -f imperium_path_is_quarantined >/dev/null 2>&1 \
+            && imperium_path_is_quarantined "$BARE_REPO"; then
+        log_error "Refusing to use a quarantined bare repo (recycle bin / legacy archive): $BARE_REPO"
+        log_error "Point BARE_REPO in $config at the canonical bare (e.g. \$HOME/runtimes/Token-OS/token-os.git)."
+        exit 64
+    fi
     if [[ ! -d "$SECRETS_DIR" ]]; then
         log_error "Secrets dir not found: $SECRETS_DIR (is NAS mounted?)"
         exit 1
