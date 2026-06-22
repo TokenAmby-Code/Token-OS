@@ -116,6 +116,9 @@ def test_prefix_q_opens_mark_for_close_popup() -> None:
     assert "/api/hooks/subscribe" not in script
     assert "/api/hooks/unsubscribe" in script
     assert "_unsubscribe_mark" in script
+    assert "_begin_atomic_close_contract" in script
+    assert "trap '' INT QUIT TSTP" in script
+    assert "MARK_FOR_CLOSE_OK" in script
     assert "send-text --pane" in script
     assert "kill-pane" not in script
     assert "/retire" not in script
@@ -123,6 +126,8 @@ def test_prefix_q_opens_mark_for_close_popup() -> None:
 
     exit_script = (ROOT / "bin" / "tmux-instance-exit").read_text(encoding="utf-8")
     assert '"$TMUXCTL_BIN" close --instance-id' in exit_script
+    assert "trap '' INT QUIT TSTP" in exit_script
+    assert "CLOSE_CONTRACT_OK" in exit_script
     assert "send-keys C-c" not in exit_script
 
 
