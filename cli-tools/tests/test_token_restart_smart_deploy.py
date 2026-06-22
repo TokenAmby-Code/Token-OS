@@ -123,7 +123,14 @@ if [[ "${STUB_REQUIRE_RUNTIME_WRITABLE:-}" == "1" && ( "$sub" == "fetch" || "$su
 fi
 case "$sub" in
   fetch|stash|update-ref|checkout|cat-file) exit 0 ;;
-  show-ref) exit 1 ;;  # no wip/live-dirty-* ref preexists in the fake bare
+  show-ref)
+    # Only the shunt's wip/live-dirty-* refs are reported absent (so the
+    # uniqueness loop terminates); any other ref-existence check is unaffected.
+    case "$*" in
+      *wip/live-dirty-*) exit 1 ;;
+      *) exit 0 ;;
+    esac
+    ;;
   status) exit 0 ;;
   merge-base)
     if [[ "${MERGE_FAIL_TIMES:-0}" != "0" ]]; then
