@@ -114,6 +114,61 @@ def _tmuxctl_bin() -> Path:
     return Path(__file__).resolve().parents[2] / "cli-tools" / "bin" / "tmuxctl"
 
 
+def _dev_server_stop_bin() -> Path:
+    return Path(__file__).resolve().parents[2] / "cli-tools" / "bin" / "dev-server-stop"
+
+
+def _is_dev_worktree_dir(working_dir: str | None) -> bool:
+    if not working_dir:
+        return False
+    try:
+        path = Path(working_dir).expanduser().resolve(strict=False)
+        worktrees_root = (Path.home() / "worktrees").resolve(strict=False)
+        rel = path.relative_to(worktrees_root)
+    except Exception:
+        return False
+    return len(rel.parts) == 2 and rel.parts[-1].startswith("wt-")
+
+
+def _spawn_dev_server_stop(working_dir: str | None, session_id: str) -> None:
+    """Stop this closing dev worktree's own token-api listener out-of-band."""
+    if not _is_dev_worktree_dir(working_dir):
+        return
+    dev_server_stop = _dev_server_stop_bin()
+    if not dev_server_stop.exists():
+        logger.warning("Hook: dev-server-stop skipped for %s — helper not found", working_dir)
+        return
+    log_path = Path("/tmp/dev-server-stop.log")
+    log_handle = None
+    try:
+        log_handle = log_path.open("a")
+        subprocess.Popen(
+            [str(dev_server_stop), str(working_dir)],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+        logger.info(
+            "Hook: SessionEnd spawned dev-server-stop for %s (%s)",
+            working_dir,
+            session_id[:12],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Hook: SessionEnd failed to spawn dev-server-stop for %s: %s",
+            working_dir,
+            exc,
+        )
+    finally:
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+
+
 def _spawn_session_end_assertion(tmux_pane: str, session_id: str) -> None:
     """Assert/prune a just-closed pane without blocking hook completion."""
     if not tmux_pane:
@@ -4034,7 +4089,7 @@ async def handle_session_end(payload: dict) -> dict:
                       workflow_state, pane_label, golden_throne, status, rank,
                       engine, COALESCE(hook_driven, 0),
                       origin_type, commander_type, dispatch_session_doc_path,
-                      COALESCE(automated, 0), persona_id
+                      COALESCE(automated, 0), persona_id, working_dir
                FROM instances WHERE id = ?""",
             (session_id,),
         )
@@ -4078,6 +4133,7 @@ async def handle_session_end(payload: dict) -> dict:
         _dispatch_session_doc_path = row[15]
         _automated = row[16]
         _persona_id = row[17]
+        _working_dir = row[18] if len(row) > 18 else None
 
         # Layer 1 — non-terminal SessionEnd short-circuit (in-wrapper re-fire).
         # plan-accept / `/clear` / compaction fire SessionEnd→SessionStart inside
@@ -4254,6 +4310,9 @@ async def handle_session_end(payload: dict) -> dict:
             )
         else:
             _spawn_session_end_assertion(_stop_pane_label or _stop_pane, session_id)
+
+        if not is_subagent:
+            _spawn_dev_server_stop(_working_dir, session_id)
 
         # Check remaining active instances
         cursor = await db.execute(
