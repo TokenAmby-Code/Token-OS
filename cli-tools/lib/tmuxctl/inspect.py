@@ -24,25 +24,29 @@ def _canonical_base(window_name: str) -> str:
     return base
 
 
-def render_workspace(snapshot: WorkspaceSnapshot) -> str:
+def render_workspace(snapshot: WorkspaceSnapshot, *, physical: bool = False) -> str:
     lines = [f"session {snapshot.session_name}"]
     for window in snapshot.windows:
-        lines.extend(render_window_lines(window))
+        lines.extend(render_window_lines(window, physical=physical))
     return "\n".join(lines)
 
 
-def render_window(snapshot: WindowSnapshot) -> str:
-    return "\n".join(render_window_lines(snapshot))
+def render_window(snapshot: WindowSnapshot, *, physical: bool = False) -> str:
+    return "\n".join(render_window_lines(snapshot, physical=physical))
 
 
-def render_pane(snapshot: PaneSnapshot) -> str:
+def render_pane(snapshot: PaneSnapshot, *, physical: bool = False) -> str:
+    # Canonical id (the @PANE_ID role) is the sole external identity; the raw
+    # physical %NN is volatile and gated behind --physical.
     role = snapshot.pane_role or "(unset)"
     active = " active" if snapshot.active else ""
     reserved = " reserved" if snapshot.reserved else ""
-    return "\n".join(
+    header = f"pane {role}"
+    lines = [header, f"  role: {role}"]
+    if physical:
+        lines.append(f"  physical: {snapshot.pane_id}")
+    lines.extend(
         [
-            f"pane {snapshot.pane_id}",
-            f"  role: {role}",
             f"  window: {snapshot.session_name}:{snapshot.window_index} {snapshot.window_name}",
             f"  size: {snapshot.width}x{snapshot.height}",
             f"  state: grid={snapshot.grid_state.value} kind={snapshot.pane_kind.value}{active}{reserved}",
@@ -51,6 +55,7 @@ def render_pane(snapshot: PaneSnapshot) -> str:
             f"  tty: {snapshot.tty}",
         ]
     )
+    return "\n".join(lines)
 
 
 def render_restart_plan(plan: RestartPlan) -> str:
@@ -194,7 +199,7 @@ def render_doctor(snapshot: WorkspaceSnapshot) -> str:
     return "\n".join(lines)
 
 
-def render_window_lines(snapshot: WindowSnapshot) -> list[str]:
+def render_window_lines(snapshot: WindowSnapshot, *, physical: bool = False) -> list[str]:
     lines = [
         (
             f"- {snapshot.target} {snapshot.window_name} "
@@ -220,9 +225,12 @@ def render_window_lines(snapshot: WindowSnapshot) -> list[str]:
         tombstone = ""
         if pane.pane_kind.value == "tombstone":
             tombstone = f" -> {pane.tombstone_target or '?'}"
+        # Canonical role is the default identity; the raw physical %NN is gated
+        # behind --physical so the normal path never leaks volatile tmux ids.
+        physical_prefix = f"{pane.pane_id} " if physical else ""
         lines.append(
             "    "
-            f"{pane.pane_id} {role} "
+            f"{physical_prefix}{role} "
             f"{pane.width}x{pane.height} "
             f"grid={pane.grid_state.value} kind={pane.pane_kind.value} "
             f"cmd={pane.current_command}{tombstone}{suffix}"

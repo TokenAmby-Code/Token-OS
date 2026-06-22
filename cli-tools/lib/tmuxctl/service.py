@@ -55,13 +55,19 @@ class TmuxControlPlane:
     def __init__(self, adapter: TmuxAdapter | None = None) -> None:
         self.adapter = adapter or TmuxAdapter()
 
-    def inspect_workspace(self, session_name: str) -> str:
-        return render_workspace(build_workspace_snapshot(self.adapter, session_name))
+    def inspect_workspace(self, session_name: str, *, physical: bool = False) -> str:
+        return render_workspace(
+            build_workspace_snapshot(self.adapter, session_name), physical=physical
+        )
 
-    def inspect_window(self, session_name: str, window_index: int) -> str:
-        return render_window(build_window_snapshot(self.adapter, session_name, window_index))
+    def inspect_window(
+        self, session_name: str, window_index: int, *, physical: bool = False
+    ) -> str:
+        return render_window(
+            build_window_snapshot(self.adapter, session_name, window_index), physical=physical
+        )
 
-    def inspect_pane(self, pane_id: str) -> str:
+    def inspect_pane(self, pane_id: str, *, physical: bool = False) -> str:
         pane_target = self.adapter.run(
             "display-message",
             "-t",
@@ -73,7 +79,7 @@ class TmuxControlPlane:
         window = build_window_snapshot(self.adapter, session_name, int(window_index))
         for pane in window.panes:
             if pane.pane_id == resolved_pane_id:
-                return render_pane(pane)
+                return render_pane(pane, physical=physical)
         raise ValueError(f"pane not found in snapshot: {pane_id}")
 
     def inspect_restart_plan(self, session_name: str) -> str:
