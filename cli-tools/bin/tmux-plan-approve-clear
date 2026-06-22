@@ -18,6 +18,13 @@ INTERVAL="0.25"
 CAPTURE_FILE=""
 DRY_RUN=false
 UPDATE_STATE=true
+REAL_TMUX="${TOKEN_API_TMUX_BIN:-/opt/homebrew/bin/tmux}"
+[[ -x "$REAL_TMUX" ]] || REAL_TMUX="/usr/bin/tmux"
+[[ -x "$REAL_TMUX" ]] || REAL_TMUX="$(command -v tmux || true)"
+if [[ -z "$REAL_TMUX" || ! -x "$REAL_TMUX" ]]; then
+    echo "tmux-plan-approve-clear: real tmux binary not found" >&2
+    exit 2
+fi
 
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
@@ -90,7 +97,7 @@ capture() {
     if [[ -n "$CAPTURE_FILE" ]]; then
         cat "$CAPTURE_FILE" 2>/dev/null || true
     else
-        tmux capture-pane -p -t "$PANE" -S -80 2>/dev/null || true
+        "$REAL_TMUX" capture-pane -p -t "$PANE" -S -80 2>/dev/null || true
     fi
 }
 
@@ -155,10 +162,10 @@ flat=re.sub(r"\s+","",text.lower())
 # atom — a plan-execute header OR an approval-option phrase. All tokens survive
 # whitespace-strip, so wrap/resize cannot blank the match, and a plan body that
 # merely mentions "clear context" in prose lacks the corroborating atom.
-clear = "clearcontext" in flat
+clear = any(t in flat for t in ("clearcontext", "clearconte", "freshthread"))
 corrob = any(t in flat for t in (
     "readytoexecute","writtenupaplan","implementthisplan","liketoproceed","wishtoproceed",
-    "acceptedits","approveedits","manuallyapprove","manualapproval","bypasspermissions"))
+    "acceptedits","approveedits","manuallyapprove","manualapproval","bypasspermissions", "freshthread"))
 if not (clear and corrob):
     print("none")
     raise SystemExit
@@ -201,7 +208,7 @@ while i < len(lines):
     i=j
 
 if agent == "claude":
-    if current is None or "clearcontext" not in current["flat"]:
+    if current is None or not any(t in current["flat"] for t in ("clearcontext", "clearconte", "freshthread")):
         print("none")
         raise SystemExit
 elif agent == "codex":
@@ -212,7 +219,7 @@ elif agent == "codex":
     for opt in options[current["index"]+1:]:
         target=opt
         break
-    if target is None or target["num"] != current["num"] + 1 or "clearcontext" not in target["flat"]:
+    if target is None or target["num"] != current["num"] + 1 or not any(t in target["flat"] for t in ("clearcontext", "clearconte", "freshthread")):
         print("none")
         raise SystemExit
 print(agent)' "$AGENT"
@@ -228,9 +235,9 @@ send_action() {
         return 0
     fi
     if [[ "$detected" == "codex" ]]; then
-        tmux send-keys -t "$PANE" Down Enter
+        "$REAL_TMUX" send-keys -t "$PANE" Down Enter
     else
-        tmux send-keys -t "$PANE" Enter
+        "$REAL_TMUX" send-keys -t "$PANE" Enter
     fi
 }
 
