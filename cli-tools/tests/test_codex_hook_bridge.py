@@ -127,7 +127,10 @@ def test_stop_launches_approver_when_latest_transcript_turn_has_proposed_plan(tm
                         "type": "message",
                         "role": "assistant",
                         "content": [
-                            {"type": "output_text", "text": "<proposed_plan>\nPlan\n</proposed_plan>"}
+                            {
+                                "type": "output_text",
+                                "text": "<proposed_plan>\nPlan\n</proposed_plan>",
+                            }
                         ],
                     },
                 }
