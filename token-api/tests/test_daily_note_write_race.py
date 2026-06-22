@@ -17,7 +17,6 @@ the live DB, or the live vault.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import shutil
 import subprocess
@@ -26,7 +25,6 @@ import threading
 import time
 from pathlib import Path
 
-import aiosqlite
 import pytest
 
 import dailynote_callout as dc
@@ -489,41 +487,6 @@ def test_delete_keys_still_works(tmp_path):
     assert fm["agents"] == ["custodes-abc", "guilliman-def"]
 
 
-# ── No intra-day daily-note churn writers (root-cause removal, P1 2026-06-21) ──
-#
-# The atomic/surgical/locked update_frontmatter above stopped the *data-loss* race
-# (clobbered body / reset lists). It did NOT stop the *liveness* race: a writer that
-# fires every tick with live-changing content still moves the note's mtime every
-# minute, so concurrent harness `Edit`s bounce with "File has been modified since
-# read". The durable fix removes the per-tick writers entirely (daily note = cold
-# storage; live timer state lives in the DB + cockpit; the note's timer footprint is
-# written once at the end-of-day flush). These guards keep them from coming back.
-
-_MAIN_PY = Path(__file__).resolve().parents[1] / "main.py"
-_CRON_PY = Path(__file__).resolve().parents[1] / "cron_engine.py"
-
-
-def test_now_callout_interval_writer_is_gone():
-    """The 60s in-process NOW-callout writer (per-minute mtime churn) must not exist."""
-    cron_src = _CRON_PY.read_text(encoding="utf-8")
-    assert "register_now_widget_job" not in cron_src
-    assert "_run_now_widget_job" not in cron_src
-    # cron_engine must not import the live-telemetry callout composer anymore.
-    assert "from now_widget import" not in cron_src
-    main_src = _MAIN_PY.read_text(encoding="utf-8")
-    assert "register_now_widget_job(" not in main_src
-
-
-def test_timer_worker_has_no_intraday_daily_note_writer():
-    """The timer worker must not write today's daily note on an interval."""
-    main_src = _MAIN_PY.read_text(encoding="utf-8")
-    # The 30s frontmatter writer and its helpers are removed (only the tombstone
-    # comment may mention the names).
-    assert "await timer_update_daily_note()" not in main_src
-    assert "def timer_update_daily_note(" not in main_src
-    assert "def _sync_update_daily_note(" not in main_src
-
-
 def test_concurrent_frontmatter_updates_no_lost_update(tmp_path):
     """Two threads each set a distinct key; both must land (no last-writer-wins
     over the whole frontmatter)."""
@@ -551,75 +514,3 @@ def test_concurrent_frontmatter_updates_no_lost_update(tmp_path):
     fm, _ = sdh.read_frontmatter(note)
     assert fm["timer_status"] == "working"
     assert fm["timer_work_time"] == "01:00:00"
-
-
-# ── agents: append-only launch log (P2 2026-06-21) ────────────────────────────
-#
-# The old _update_doc_agents_list rebuilt agents+instance_ids from LIVE-status
-# instances on every status/rename trigger, so a daily note bound to agents that
-# all stopped reset to `agents: []` (lost the day's fleet roster) and churned the
-# note. The roster is now an append-only, status-agnostic launch log unioned with
-# the note's existing entries; instance_ids is retired.
-
-
-def _seed_agents_db(db_path, note_path, doc_id, instances, primarch=None):
-    async def _run():
-        async with aiosqlite.connect(db_path) as db:
-            await db.execute(
-                "CREATE TABLE instances (id TEXT, name TEXT, session_doc_id INTEGER, status TEXT)"
-            )
-            await db.execute(
-                "CREATE TABLE session_documents (id INTEGER, file_path TEXT, primarch_name TEXT)"
-            )
-            await db.execute(
-                "INSERT INTO session_documents VALUES (?, ?, ?)",
-                (doc_id, str(note_path), primarch),
-            )
-            for iid, name, status in instances:
-                await db.execute(
-                    "INSERT INTO instances VALUES (?, ?, ?, ?)", (iid, name, doc_id, status)
-                )
-            await db.commit()
-            await sdh._update_doc_agents_list(db, doc_id)
-
-    asyncio.run(_run())
-
-
-def test_agents_log_is_append_only_and_status_agnostic(tmp_path):
-    """Stopped agents stay; existing roster entries are preserved; instance_ids retired."""
-    note = tmp_path / "2026-06-21.md"
-    note.write_text(
-        "---\nsession_doc_id: 7\ntype: daily-note\nagents:\n- already-here\n"
-        "instance_ids:\n- 999\n---\n\n# 2026-06-21\n\n## Log\nbody.\n",
-        encoding="utf-8",
-    )
-    _seed_agents_db(
-        tmp_path / "a.db",
-        note,
-        7,
-        [("a", "custodes-new", "processing"), ("b", "guilliman-stopped", "stopped")],
-    )
-
-    fm, _ = sdh.read_frontmatter(note)
-    # Existing entry kept, both DB-bound agents appended (stopped one INCLUDED).
-    assert fm["agents"] == ["already-here", "custodes-new", "guilliman-stopped"]
-    # instance_ids is retired even though it was present in the note.
-    assert "instance_ids" not in fm
-    assert "body." in note.read_text(encoding="utf-8")
-
-
-def test_agents_log_dedups_and_no_op_write_when_nothing_new(tmp_path):
-    """A re-sync that adds no new agent is a byte-identical no-op (mtime frozen)."""
-    note = tmp_path / "2026-06-21.md"
-    note.write_text(
-        "---\nsession_doc_id: 7\ntype: daily-note\nagents:\n- custodes-new\n---\n\n# body\n",
-        encoding="utf-8",
-    )
-    mtime_before = note.stat().st_mtime_ns
-    time.sleep(0.01)
-    # Same agent already in the roster → union is identical → write-skip → no mtime move.
-    _seed_agents_db(tmp_path / "a.db", note, 7, [("a", "custodes-new", "stopped")])
-
-    fm, _ = sdh.read_frontmatter(note)
-    assert fm["agents"] == ["custodes-new"]  # no duplicate
-    assert note.stat().st_mtime_ns == mtime_before, "no-op agents sync still rewrote the note"

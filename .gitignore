@@ -85,16 +85,6 @@ yarn-error.log*
 # the pid file was untracked and tripped pr-create's clean-tree guard)
 .worktree-dev.pid
 
-# Runtime-writable queue: the discord-daemon / token-api /send path enqueues
-# JSON jobs here at runtime, and runtime-write-protect.sh (re)creates it 0755
-# inside the otherwise read-only deploy tree. Keep it untracked so the runtime
-# checkout stays clean (a dirty runtime aborts deploys).
-/pending/
-
-# Relocated out of the deploy tree to ~/.claude/restart_state.json; ignore any
-# stragglers so a stale copy never re-enters the frozen tree.
-/token-api/restart_state.json
-
 # ====================================================
 # COMPILED / BINARY
 # ====================================================

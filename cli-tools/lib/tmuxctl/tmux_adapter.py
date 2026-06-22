@@ -56,34 +56,6 @@ _AUTOMATION_FOCUS_ENVS = {
     "IMPERIUM_TMUX_AUTOMATION",
     "TOKEN_API_INTERNAL_DISPATCH",
 }
-RUNTIME_PANE_OPTIONS = (
-    "@INSTANCE_ID",
-    "@CC_STATE",
-    "@PANE_LABEL",
-    "@ACTIVE_TITLE",
-    "@PROGRESS_TITLE",
-    "@PANE_PROGRESS",
-    "@PANE_TITLE_SUPPRESS",
-    "@TTS_STATE",
-    "@CONTEXT_INFO",
-    "@STACK_PENDING",
-    "@GT_FIRE",
-    "@PLANNING_STATE",
-    "@PLANNING_AGENT",
-    "@DISCORD_VOICE_LOCK",
-    "@DISCORD_VOICE_PROCESSING",
-    "@TOKEN_API_WRAPPER_LAUNCH_ID",
-    "@TOKEN_API_ENGINE",
-    "@TOKEN_API_LAUNCHER",
-    "@TOKEN_API_CWD",
-    "@TOKEN_API_SESSION_ID",
-    "@TOKEN_API_DISPATCH_TARGET",
-    "@TOKEN_API_DISPATCH_WINDOW",
-    "@TOKEN_API_DISPATCH_MODE",
-    "@TOKEN_API_DISPATCH_SLOT",
-    "@TOKEN_API_LAUNCH_MODE",
-    "@TOKEN_API_TARGET_WORKING_DIR",
-)
 
 
 def normalize_prompt_payload(text: str) -> str:
@@ -122,16 +94,6 @@ def _tmux_binary() -> str:
             pass
         return candidate
     return "tmux"
-
-
-def tmux_binary() -> str:
-    """Public accessor for the resolved real tmux binary (never the shim).
-
-    A thin, stable wrapper over ``_tmux_binary`` so out-of-package readers (e.g.
-    the ``tmux-typing-guard-status`` diagnostic) can depend on a public name
-    rather than the private resolver.
-    """
-    return _tmux_binary()
 
 
 def _looks_like_custom_pane_target(target: str) -> bool:
@@ -331,65 +293,6 @@ class TmuxAdapter:
         except Exception:
             return "tmuxctl"
 
-    def _run_raw_tmux(self, args: list[str], *, allow_failure: bool = True) -> str:
-        """Run tmux without target resolution, send gate, or focus guard."""
-        proc = subprocess.run(
-            [self.tmux_binary, *args],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=_tmux_stderr_target(allow_failure=allow_failure),
-            check=False,
-        )
-        if proc.returncode != 0 and not allow_failure:
-            stderr = proc.stderr.strip()
-            raise TmuxError(stderr or f"tmux {' '.join(args)} failed")
-        return proc.stdout
-
-    def clear_pane_style(self, target: str) -> None:
-        """Clear pane tint/title overlays. Best-effort and camera-neutral."""
-        if not target:
-            return
-        self._run_raw_tmux(["select-pane", "-t", target, "-P", "bg=default"])
-        self._run_raw_tmux(["select-pane", "-t", target, "-T", ""])
-
-    def clear_runtime_state(self, target: str) -> None:
-        """Clear runtime stamps and pane close/assertion chrome together."""
-        if not target:
-            return
-        self.clear_pane_style(target)
-        for option in RUNTIME_PANE_OPTIONS:
-            self._run_raw_tmux(["set-option", "-pu", "-t", target, option])
-
-    def _target_for_invariant(self, resolved_args: list[str]) -> str:
-        target = _target_arg(resolved_args)
-        if target:
-            return target
-        try:
-            return self._run_raw_tmux(["display-message", "-p", "#{pane_id}"]).strip()
-        except Exception:
-            return ""
-
-    def _preflight_runtime_invariants(self, resolved_args: list[str]) -> None:
-        if not resolved_args:
-            return
-        command = resolved_args[0]
-        if command == "respawn-pane":
-            target = self._target_for_invariant(resolved_args)
-            if target:
-                self.clear_runtime_state(target)
-            return
-        if command not in {"set-option", "set"}:
-            return
-        if not any(arg.startswith("-") and "p" in arg for arg in resolved_args[1:]):
-            return
-        if not any(arg.startswith("-") and "u" in arg for arg in resolved_args[1:]):
-            return
-        option = resolved_args[-1] if resolved_args else ""
-        if option == "@INSTANCE_ID":
-            target = self._target_for_invariant(resolved_args)
-            if target:
-                self.clear_pane_style(target)
-
     def run(self, *args: str, allow_failure: bool = False) -> str:
         # Universal send gate — the inescapable pane-write sentinel. Every send
         # to a pane that originates in Python (token-api interventions, the
@@ -402,23 +305,10 @@ class TmuxAdapter:
         # Clear any prior suppression payload so an allowed send (which also
         # returns empty stdout) is never misread as suppressed by callers/tests.
         self.last_send_gate_result = None
-        # Resolve Imperium canonical pane targets (mechanicus:N, legion:custodes,
-        # 1:N, …) to physical %pane ids BEFORE the gate evaluates. The gate's
-        # attendance/typing checks shell out to `tmux display-message -t <target>`
-        # and `tmux list-clients -t <target>`; tmux only understands physical ids
-        # and native session:window addresses, so a canonical id silently
-        # mis-resolves and _pane_attended returns False — the gate then MISSES an
-        # actively-typed attended pane and clobbers the human's live draft
-        # (send-gate-attended-scoping-clobber). The shell shim already
-        # resolves-then-gates (bin/tmux: resolve_target before send_gate_suppresses);
-        # this aligns the Python clobber path so both languages gate on the same
-        # physical id. Resolution is read-only (live tmux snapshot), so doing it
-        # ahead of a possible suppression return is safe.
-        resolved_args = self._resolve_tmux_args(args_tuple)
-        gate = send_gate.evaluate(resolved_args)
+        gate = send_gate.evaluate(args_tuple)
         if gate is not None and gate.get("policy") == "delay":
             send_gate.record_suppression(gate)
-            if send_gate.wait_for_gate_clear(resolved_args):
+            if send_gate.wait_for_gate_clear(args_tuple):
                 gate = None
             else:
                 gate = {**gate, "policy": "cancel", "suppressed": True, "delay_failed": True}
@@ -427,9 +317,9 @@ class TmuxAdapter:
             if gate.get("suppressed"):
                 self.last_send_gate_result = gate
                 return ""
+        resolved_args = self._resolve_tmux_args(args_tuple)
         if self._mechanicus_focus_guard_blocks(resolved_args):
             return ""
-        self._preflight_runtime_invariants(resolved_args)
         if _camera_mutating(resolved_args):
             self.focus_mutation_count += 1
         # Every send through run() is automated by construction (see this method's

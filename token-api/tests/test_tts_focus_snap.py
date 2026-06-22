@@ -2,18 +2,16 @@
 
 Ticket: Mars/Tasks/TTS Playback Focus Snap.md
 
-Rule: when an event-hot TTS item begins *playback* (the moment the playback
-dispatcher transitions `tts_current` from None -> item), snap the operator's tmux
-focus to the originating pane and zoom it. Pause-queue summaries promoted later
-do not snap focus; they are notification backlog, not a live pane speaking event.
+Rule: when a TTS item begins *playback* (the moment the playback dispatcher
+transitions `tts_current` from None -> item), snap the operator's tmux focus to
+the originating pane and zoom it. No gate, no flag, no preference toggle.
 
 These tests pin the hook (`_snap_focus_to_speaker`), the zoom-dedup primitive
 (`_focus_and_zoom_pane`), and the wiring into `tts_queue_worker`. They cover
 every edge case the ticket enumerates:
 
 - pane no longer exists -> skip snap, playback continues
-- rapid successive event-hot items from different panes -> snap on each transition
-- promoted pause-queue items -> no snap
+- rapid successive items from different panes -> snap on each transition
 - custodes/cron-originated TTS with no real pane -> skip
 - voice chat / Discord backend -> no snap
 - cross-machine -> local-only snap (remote panes skipped)
@@ -67,7 +65,7 @@ class _FakeProc:
         self.returncode = returncode
 
 
-def _make_item(tts, instance_id, tmux_pane="palace:1", *, focus_on_playback=False):
+def _make_item(tts, instance_id, tmux_pane="palace:1"):
     return tts.TTSQueueItem(
         instance_id=instance_id,
         message="speak to me",
@@ -75,7 +73,6 @@ def _make_item(tts, instance_id, tmux_pane="palace:1", *, focus_on_playback=Fals
         sound="",
         tab_name="t",
         tmux_pane=tmux_pane,
-        focus_on_playback=focus_on_playback,
     )
 
 
@@ -310,9 +307,9 @@ def test_snap_never_raises_on_error(app_env, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_worker_snaps_on_each_event_hot_playback_start(app_env, monkeypatch) -> None:
-    """The playback dispatcher snaps focus for event-hot pane speech, including
-    rapid successive items from different panes."""
+def test_worker_snaps_on_each_playback_start(app_env, monkeypatch):
+    """The playback dispatcher snaps focus on every None -> item transition,
+    including rapid successive items from different panes."""
     tts = _load_tts(app_env)
 
     snapped = []
@@ -327,10 +324,8 @@ def test_worker_snaps_on_each_event_hot_playback_start(app_env, monkeypatch) -> 
     monkeypatch.setattr(tts, "speak_tts", lambda *a, **k: {"success": True, "method": "test"})
 
     tts.hot_queue.clear()
-    tts.hot_queue.append(_make_item(tts, "alpha", tmux_pane="palace:1", focus_on_playback=True))
-    tts.hot_queue.append(
-        _make_item(tts, "bravo", tmux_pane="legion:custodes", focus_on_playback=True)
-    )
+    tts.hot_queue.append(_make_item(tts, "alpha", tmux_pane="palace:1"))
+    tts.hot_queue.append(_make_item(tts, "bravo", tmux_pane="legion:custodes"))
 
     async def drive():
         task = asyncio.create_task(tts.tts_queue_worker())
@@ -346,44 +341,6 @@ def test_worker_snaps_on_each_event_hot_playback_start(app_env, monkeypatch) -> 
 
     asyncio.run(drive())
     assert snapped[:2] == ["alpha", "bravo"]
-
-
-def test_worker_does_not_snap_promoted_pause_queue_items(app_env, monkeypatch) -> None:
-    """Promoting backlog to hot should play it, but not reinterpret it as a live
-    pane-started-talking event that steals focus back to a stale/custodes pane."""
-    tts = _load_tts(app_env)
-
-    snapped = []
-
-    async def fake_snap(item):
-        snapped.append(item.instance_id)
-        return {"snapped": True}
-
-    monkeypatch.setattr(tts, "_snap_focus_to_speaker", fake_snap)
-    monkeypatch.setattr(tts, "_set_tts_state", lambda *a, **k: None)
-    monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
-    monkeypatch.setattr(tts, "speak_tts", lambda *a, **k: {"success": True, "method": "test"})
-
-    tts.hot_queue.clear()
-    # This simulates an item that was originally pause-queued, then later moved
-    # into hot_queue by promote/play-pane. Its queue_target may now be hot, but
-    # focus_on_playback remains false.
-    tts.hot_queue.append(_make_item(tts, "custodes-backlog", tmux_pane="legion:custodes"))
-
-    async def drive():
-        task = asyncio.create_task(tts.tts_queue_worker())
-        for _ in range(20):
-            await asyncio.sleep(0.05)
-            if tts.tts_current is None and not tts.hot_queue:
-                break
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    asyncio.run(drive())
-    assert snapped == []
 
 
 # --------------------------------------------------------------------------

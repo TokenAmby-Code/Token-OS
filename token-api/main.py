@@ -73,7 +73,6 @@ from dailynote_callout import (
     apply_callout,
 )
 from db_schema import init_database_async
-from instance_lifecycle import apply_instance_lifecycle
 from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
     create_golden_throne_binding,  # noqa: F401 — used in PATCH /type GT promotion
@@ -98,10 +97,12 @@ from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
 from personas import (
+    BLACK_SHIELDS,
     assign_astartes_persona,
     persona_to_profile,
     resolve_live_persona_instance,
     resolve_persona,
+    seed_params,
 )
 from phone_service import (
     _send_to_phone,
@@ -1495,12 +1496,7 @@ async def load_tasks_from_db():
             print(f"Failed to register task {task_id}: {e}")
 
 
-# Runtime state, NOT source: lives in ~/.claude (alongside agents.db and
-# corax-state.json), never inside the deploy-owned runtime checkout. The tree is
-# frozen read-only after deploy (runtime-write-protect.sh), so a path under
-# token-api/ here would EACCES on both the shutdown write and the pragma-once
-# unlink. ~/.claude is always writable.
-RESTART_STATE_PATH = Path.home() / ".claude" / "restart_state.json"
+RESTART_STATE_PATH = Path(__file__).parent / "restart_state.json"
 
 # Keys that must NOT survive a restart — derived from live signals or boot-time config.
 _RESTART_STATE_DENYLIST = {
@@ -1537,7 +1533,6 @@ def save_restart_state() -> None:
             "saved_at": datetime.now().isoformat(),
             "desktop_state": persistable,
         }
-        RESTART_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         RESTART_STATE_PATH.write_text(json.dumps(payload, indent=2))
         print(f"Restart state saved: {sorted(persistable.keys())}")
     except Exception as e:
@@ -1785,6 +1780,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cron_engine = CronEngine(scheduler, DB_PATH)
     await cron_engine.recover_orphaned_runs()
     await cron_engine.ensure_permanent_jobs()
+    cron_engine.register_now_widget_job(DB_PATH, DAILY_NOTE_DIR)
     cron_engine.register_persona_sweep_job()
     print("Cron engine loaded")
     # Start TTS queue worker
@@ -2255,17 +2251,19 @@ async def delete_all_instances():
 async def stop_instance(instance_id: str):
     """Mark an instance as stopped."""
     logger.info(f"Stopping instance: {instance_id[:12]}...")
+    now = datetime.now().isoformat()
 
     async with aiosqlite.connect(DB_PATH) as db:
-        lifecycle_result = await apply_instance_lifecycle(
-            db,
-            instance_id,
-            lifecycle="stop",
-            write_source="api",
-            actor="stop-instance",
+        cursor = await db.execute(
+            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM instances WHERE id = ?",
+            (instance_id,),
         )
-        if lifecycle_result.get("status") == "failed":
+        row = await cursor.fetchone()
+
+        if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
+
+        is_subagent = row[2]
 
         # Resolve the stopping instance's LIVE pane (tmuxctl owns instance->pane) for
         # the tint-clear below — never the stored tmux_pane column. resolve-instance
@@ -2273,6 +2271,20 @@ async def stop_instance(instance_id: str):
         # so a truthy result is unambiguously ours to vacate; a dead, reused, or
         # taken-over pane resolves to None and we leave the tint to its current owner.
         stopped_pane, _stopped_role = await shared.resolve_instance_pane(instance_id)
+
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "status": "stopped",
+                "input_lock": None,
+                "stopped_at": now,
+                "golden_throne": None,
+            },
+            mutation_type="instance_stopped",
+            write_source="api",
+            actor="stop-instance",
+        )
         await db.commit()
 
         # Check remaining active instances (all)
@@ -2295,14 +2307,10 @@ async def stop_instance(instance_id: str):
         await asyncio.to_thread(shared.clear_pane_tint, stopped_pane, source="stop-instance")
 
     # Log event
-    await log_event(
-        "instance_stopped",
-        instance_id=instance_id,
-        device_id=lifecycle_result.get("device_id"),
-    )
+    await log_event("instance_stopped", instance_id=instance_id, device_id=row[1])
 
     # Push updated instance count to phone widget
-    if not lifecycle_result.get("is_subagent"):
+    if not is_subagent:
         asyncio.create_task(
             push_phone_widget_async(timer_engine.current_mode.value, remaining_non_sub)
         )
@@ -9819,7 +9827,10 @@ async def set_instance_legion(instance_id: str, request: Request):
         # and bind persona_id (plus annex voice/sound from the profile).
         updates: dict = {}
         persona_slug = LEGION_PERSONA_SLUGS.get(legion)
-        if persona_slug:
+        if legion == "civic":
+            # Civic/Pax has no persona tint authority: clear the assignment.
+            updates["persona_id"] = None
+        elif persona_slug:
             persona = await resolve_persona(db, persona_slug)
             if persona:
                 profile = persona_to_profile(persona)
@@ -10058,181 +10069,6 @@ async def get_synced_session(legion: str):
         }
 
 
-def _same_worktree_path(left: str | None, right: str | None) -> bool:
-    if not left or not right:
-        return False
-    try:
-        return Path(left).expanduser().resolve(strict=False) == Path(right).expanduser().resolve(
-            strict=False
-        )
-    except Exception:
-        return str(left).rstrip("/") == str(right).rstrip("/")
-
-
-def _is_live_instance_status(status: str | None) -> bool:
-    return (status or "").lower() not in {"", "stopped", "archived"}
-
-
-async def _build_victory_cascade_plan(
-    *,
-    doc_id: int,
-    doc_path: Path | None,
-    linked_rows: list[aiosqlite.Row],
-    server_cwd: str | None = None,
-) -> dict:
-    """Build the victorious→archived cleanup plan without mutating anything."""
-    server_cwd = server_cwd or os.getcwd()
-    fm_worktrees: list[dict] = []
-    if doc_path and doc_path.exists():
-        async with _worktree_registry_lock:
-            fm, _body = await asyncio.to_thread(read_frontmatter, doc_path)
-            raw_worktrees = fm.get("worktrees") or []
-            if isinstance(raw_worktrees, list):
-                fm_worktrees = [wt for wt in raw_worktrees if isinstance(wt, dict)]
-
-    linked_instances: list[dict] = []
-    for row in linked_rows:
-        linked_instances.append(
-            {
-                "id": row["id"],
-                "tab_name": row["tab_name"],
-                "status": row["status"],
-                "working_dir": row["working_dir"],
-                "pr_state": row["pr_state"],
-            }
-        )
-
-    live_instances = [
-        inst for inst in linked_instances if _is_live_instance_status(inst.get("status"))
-    ]
-    actions: list[dict] = []
-    skipped: list[dict] = []
-    warnings: list[str] = []
-
-    for wt in fm_worktrees:
-        path = wt.get("path")
-        branch = wt.get("branch")
-        port = wt.get("port")
-        if not branch:
-            skipped.append({"reason": "missing_branch", "worktree": wt})
-            continue
-
-        matching_instances = [
-            inst for inst in linked_instances if _same_worktree_path(inst.get("working_dir"), path)
-        ]
-        open_pr_instances = [inst for inst in matching_instances if inst.get("pr_state") == "open"]
-        if open_pr_instances:
-            msg = f"linked instance has open PR; skipping branch {branch}: " + ", ".join(
-                inst["id"] for inst in open_pr_instances
-            )
-            warnings.append(msg)
-            skipped.append(
-                {
-                    "reason": "open_pr",
-                    "worktree": wt,
-                    "instances": open_pr_instances,
-                    "warning": msg,
-                }
-            )
-            continue
-
-        # worktree-delete targets ghost Claude processes by CWD; never let cascade
-        # delete the worktree currently hosting this API/operator session.
-        if _same_worktree_path(path, server_cwd):
-            skipped.append({"reason": "self_guard", "worktree": wt, "server_cwd": server_cwd})
-            continue
-
-        action = {
-            "path": path,
-            "branch": branch,
-            "port": port,
-            "status": wt.get("status"),
-            "instances": matching_instances,
-            "commands": [],
-        }
-        if path:
-            action["commands"].append(
-                [str(SCRIPTS_DIR / "cli-tools" / "bin" / "dev-server-stop"), str(path)]
-            )
-        action["commands"].append(
-            [
-                str(SCRIPTS_DIR / "cli-tools" / "bin" / "worktree-delete"),
-                str(branch),
-                "-b",
-                "-f",
-                "--delete-remote",
-            ]
-        )
-        actions.append(action)
-
-    return {
-        "doc_id": doc_id,
-        "doc_path": str(doc_path) if doc_path else None,
-        "worktrees": fm_worktrees,
-        "linked_instances": linked_instances,
-        "live_instances": live_instances,
-        "actions": actions,
-        "skipped": skipped,
-        "warnings": warnings,
-        "server_cwd": server_cwd,
-    }
-
-
-async def _execute_victory_cascade_plan(plan: dict) -> list[dict]:
-    """Run the cleanup commands in the exact plan order."""
-    executed: list[dict] = []
-    for action in plan.get("actions", []):
-        for command in action.get("commands", []):
-            try:
-                proc = await _run_subprocess_offloop(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=120,
-                )
-            except subprocess.TimeoutExpired as exc:
-                record = {
-                    "command": command,
-                    "returncode": None,
-                    "stdout": exc.stdout,
-                    "stderr": exc.stderr,
-                    "branch": action.get("branch"),
-                    "path": action.get("path"),
-                    "port": action.get("port"),
-                    "timeout": exc.timeout,
-                }
-                executed.append(record)
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "error": "cascade_cleanup_failed",
-                        "failed": record,
-                        "executed": executed,
-                    },
-                ) from exc
-            record = {
-                "command": command,
-                "returncode": proc.returncode,
-                "stdout": proc.stdout,
-                "stderr": proc.stderr,
-                "branch": action.get("branch"),
-                "path": action.get("path"),
-                "port": action.get("port"),
-            }
-            executed.append(record)
-            if proc.returncode != 0:
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "error": "cascade_cleanup_failed",
-                        "failed": record,
-                        "executed": executed,
-                    },
-                )
-    return executed
-
-
 @app.get("/api/instances/{instance_id}/zealotry")
 async def get_zealotry(instance_id: str):
     """Get zealotry level and timer status for an instance."""
@@ -10265,8 +10101,6 @@ async def _victory_ack_core(
     *,
     force: bool = False,
     source: str = "victory-ack",
-    cascade: bool = False,
-    dry_run: bool | None = None,
 ) -> dict:
     """Shared core for the victory-ack flow.
 
@@ -10274,13 +10108,7 @@ async def _victory_ack_core(
     Action: stamp acknowledged_at + reason; archive the doc; cancel GT timers
     on all linked instances; downgrade those instances to one_off. Returns a
     summary dict; raises HTTPException(409) when precondition fails.
-
-    When cascade=True, dry_run defaults to True: the API returns the full
-    cleanup action plan and performs no mutation unless dry_run is explicitly
-    false.
     """
-    if dry_run is None:
-        dry_run = bool(cascade)
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -10357,38 +10185,6 @@ async def _victory_ack_core(
                     },
                 )
 
-        cursor = await db.execute(
-            """SELECT id, name AS tab_name, status, working_dir, pr_state
-               FROM instances WHERE session_doc_id = ?""",
-            (doc_id,),
-        )
-        linked_rows = await cursor.fetchall()
-
-        cascade_plan: dict | None = None
-        cascade_executed: list[dict] = []
-        if cascade:
-            cascade_plan = await _build_victory_cascade_plan(
-                doc_id=doc_id,
-                doc_path=doc_path,
-                linked_rows=linked_rows,
-            )
-            if already_archived:
-                cascade_plan["skipped"].extend(
-                    {"reason": "already_archived", "worktree": action}
-                    for action in cascade_plan.get("actions", [])
-                )
-                cascade_plan["actions"] = []
-            if dry_run:
-                return {
-                    "doc_id": doc_id,
-                    "victory": True,
-                    "archived": False,
-                    "dry_run": True,
-                    "cascade": cascade_plan,
-                    "force": force,
-                }
-            cascade_executed = await _execute_victory_cascade_plan(cascade_plan)
-
         # Stamp rubric ack on the session-doc frontmatter (modern path) and
         # mirror the archive status onto the file. Without the status write the
         # file frontmatter keeps `status: active` while the DB row below flips to
@@ -10411,6 +10207,11 @@ async def _victory_ack_core(
             )
 
         # Resolve all instances linked to this doc; downgrade and cancel timers.
+        cursor = await db.execute(
+            "SELECT id, name AS tab_name FROM instances WHERE session_doc_id = ?",
+            (doc_id,),
+        )
+        linked_rows = await cursor.fetchall()
         linked_instance_ids: list[str] = []
         instance_surfaces: list[str] = []
         for linked in linked_rows:
@@ -10476,10 +10277,6 @@ async def _victory_ack_core(
             "force": force,
             "source": source,
             "rubric_complete": (rubric_status.complete if rubric_status else None),
-            "cascade": bool(cascade),
-            "cascade_dry_run": bool(dry_run) if cascade else None,
-            "cascade_plan": cascade_plan,
-            "cascade_executed": cascade_executed,
         },
     )
     logger.info(
@@ -10494,9 +10291,6 @@ async def _victory_ack_core(
         "linked_instance_ids": linked_instance_ids,
         "timers_cancelled": timers_cancelled,
         "force": force,
-        "dry_run": False,
-        "cascade": cascade_plan,
-        "cascade_executed": cascade_executed,
     }
 
 
@@ -10634,19 +10428,7 @@ async def victory_ack_session_doc(doc_id: int, request: Request):
     reason = body.get("reason") or "victory"
     deliverables = body.get("deliverables", []) or []
     force = bool(body.get("force"))
-    cascade = bool(body.get("cascade"))
-    dry_run = body.get("dry_run")
-    if dry_run is not None:
-        dry_run = bool(dry_run)
-    return await _victory_ack_core(
-        doc_id,
-        reason,
-        deliverables,
-        force=force,
-        source="victory-ack",
-        cascade=cascade,
-        dry_run=dry_run,
-    )
+    return await _victory_ack_core(doc_id, reason, deliverables, force=force, source="victory-ack")
 
 
 @app.post("/api/instances/{instance_id}/victory")
@@ -10905,18 +10687,61 @@ async def set_instance_type(instance_id: str, request: Request):
     return {"instance_id": instance_id, "instance_type": new_type, "old_type": old_type}
 
 
+async def _ensure_persona_seed(db, seed) -> str | None:
+    await db.execute(
+        """INSERT INTO personas
+           (id, slug, display_name, default_rank, assignment_pool, assignment_order,
+            pane_tint, chip_color, tts_voice, tts_rate, notification_sound)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             slug = excluded.slug,
+             display_name = excluded.display_name,
+             default_rank = excluded.default_rank,
+             assignment_pool = excluded.assignment_pool,
+             assignment_order = excluded.assignment_order,
+             pane_tint = excluded.pane_tint,
+             chip_color = excluded.chip_color,
+             tts_voice = excluded.tts_voice,
+             tts_rate = excluded.tts_rate,
+             notification_sound = excluded.notification_sound""",
+        seed_params(seed),
+    )
+    return seed.id
+
+
+async def _retire_instance_row(
+    db,
+    instance_id: str,
+    *,
+    status: str = "stopped",
+    actor: str = "retire-instance",
+    mutation_type: str = "instance_retired",
+) -> None:
+    updates = {
+        "rank": "retired",
+        "status": status,
+        "input_lock": None,
+        "stopped_at": datetime.now().isoformat(),
+        "golden_throne": None,
+    }
+    await sanctioned_update_instance(
+        db,
+        instance_id=instance_id,
+        updates=updates,
+        mutation_type=mutation_type,
+        write_source="api",
+        actor=actor,
+    )
+
+
 @app.patch("/api/instances/{instance_id}/retire")
 async def retire_instance(instance_id: str):
     """Retire an instance row without archiving its session document."""
     async with aiosqlite.connect(DB_PATH) as db:
-        result = await apply_instance_lifecycle(
-            db,
-            instance_id,
-            lifecycle="retire",
-            write_source="api",
-        )
-        if result.get("status") == "failed":
+        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
+        if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
+        await _retire_instance_row(db, instance_id)
         await db.commit()
     await log_event("instance_retired", instance_id=instance_id)
     return {"instance_id": instance_id, "rank": "retired", "status": "stopped"}
@@ -10926,53 +10751,90 @@ async def retire_instance(instance_id: str):
 async def archive_instance_session_doc(instance_id: str):
     """Archive the session document attached to an instance, and retire the instance."""
     async with aiosqlite.connect(DB_PATH) as db:
-        result = await apply_instance_lifecycle(
+        cursor = await db.execute(
+            "SELECT id, session_doc_id FROM instances WHERE id = ?", (instance_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        doc_id = row[1]
+        doc_path = None
+        if doc_id:
+            cursor = await db.execute(
+                "SELECT status, file_path FROM session_documents WHERE id = ?", (doc_id,)
+            )
+            doc_row = await cursor.fetchone()
+            if not doc_row:
+                raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
+            if doc_row[1]:
+                raw_path = Path(doc_row[1])
+                doc_path = raw_path if raw_path.is_absolute() else OBSIDIAN_VAULT_PATH / raw_path
+            await db.execute(
+                "UPDATE session_documents SET status = ?, updated_at = ? WHERE id = ?",
+                ("archived", datetime.now().isoformat(), doc_id),
+            )
+            if doc_path and doc_path.exists():
+                try:
+                    await asyncio.to_thread(update_frontmatter, doc_path, {"status": "archived"})
+                except Exception as exc:
+                    logger.warning(
+                        f"archive-session-doc: frontmatter update failed for {doc_path}: {exc}"
+                    )
+        await _retire_instance_row(
             db,
             instance_id,
-            lifecycle="archive-session-doc",
-            write_source="api",
+            status="archived",
             actor="archive-session-doc",
+            mutation_type="instance_archived",
         )
-        if result.get("status") == "failed":
-            if result.get("reason") == "session_doc_not_found":
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Session doc {result.get('session_doc_id')} not found",
-                )
-            raise HTTPException(status_code=404, detail="Instance not found")
         await db.commit()
     await log_event(
         "instance_session_doc_archived",
         instance_id=instance_id,
-        details={"session_doc_id": result.get("session_doc_id")},
+        details={"session_doc_id": doc_id},
     )
-    return {
-        "instance_id": instance_id,
-        "session_doc_id": result.get("session_doc_id"),
-        "status": "archived",
-    }
+    return {"instance_id": instance_id, "session_doc_id": doc_id, "status": "archived"}
 
 
 @app.patch("/api/instances/{instance_id}/banish")
 async def banish_instance(instance_id: str):
     """Close an instance without retiring/archiving; chapter children move to Black Shields."""
+    now = datetime.now().isoformat()
+    banished_to = None
     async with aiosqlite.connect(DB_PATH) as db:
-        result = await apply_instance_lifecycle(
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT i.id, i.commander_type, p.default_rank
+               FROM instances i
+               LEFT JOIN personas p ON p.id = i.persona_id
+               WHERE i.id = ?""",
+            (instance_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        updates = {
+            "status": "stopped",
+            "input_lock": None,
+            "stopped_at": now,
+            "golden_throne": None,
+        }
+        if row["commander_type"] == "chapter" and (row["default_rank"] or "astartes") == "astartes":
+            updates["persona_id"] = await _ensure_persona_seed(db, BLACK_SHIELDS)
+            updates["commander_type"] = "emperor"
+            updates["commander_id"] = None
+            banished_to = BLACK_SHIELDS.slug
+        await sanctioned_update_instance(
             db,
-            instance_id,
-            lifecycle="banish",
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type="instance_banished",
             write_source="api",
             actor="banish-instance",
         )
-        if result.get("status") == "failed":
-            raise HTTPException(status_code=404, detail="Instance not found")
         await db.commit()
-    await log_event(
-        "instance_banished",
-        instance_id=instance_id,
-        details={"persona": result.get("persona")},
-    )
-    return {"instance_id": instance_id, "status": "stopped", "persona": result.get("persona")}
+    await log_event("instance_banished", instance_id=instance_id, details={"persona": banished_to})
+    return {"instance_id": instance_id, "status": "stopped", "persona": banished_to}
 
 
 @app.patch("/api/instances/{instance_id}/archive")
@@ -11778,117 +11640,6 @@ async def _pane_sender_is_custodes(caller_pane: str | None) -> bool:
     return bool(row) and (row["legion"] or "").lower() == "custodes"
 
 
-async def _pane_live_agent_engine(tmux_pane: str | None) -> str | None:
-    """Return claude/codex when a resolved pane is backed by a live agent process.
-
-    This is deliberately tmux/process based, not registry based: Codex singleton
-    panes can be live and usable without an ``instances`` row.
-    """
-    pane = await shared.resolve_tmux_pane_id(tmux_pane)
-    if not pane:
-        return None
-    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
-    try:
-        proc = await _run_subprocess_offloop(
-            (
-                sys.executable,
-                "-m",
-                "tmuxctl.cli",
-                "resolve-agent",
-                "--pane",
-                pane,
-                "--agent",
-                "auto",
-                "--default",
-                "auto",
-            ),
-            env={
-                **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            },
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=3,
-        )
-        if proc.returncode == 0:
-            engine = proc.stdout.decode(errors="ignore").strip().lower()
-            if engine in {"claude", "codex"}:
-                return engine
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("tmuxctl resolve-agent probe failed for pane %s: %s", pane, exc)
-    for row_pane, command, cwd, window, tty in await _tmux_pane_rows():
-        if row_pane != pane:
-            continue
-        is_agent, engine = await _pane_is_agent(command, cwd, window, tty)
-        return engine if is_agent else None
-    return None
-
-
-async def _direct_tmux_pane_delivery(
-    tmux_pane: str,
-    payload: str,
-    *,
-    source: str,
-    purpose: str,
-    clear_prompt: bool = False,
-) -> dict:
-    """Deliver directly to a live pane when no registry row exists.
-
-    The normal pane-write queue resolves ``instance_id -> pane`` through the
-    registry/tmux stamp path.  Rowless Codex singleton panes have no durable row
-    to resolve, so route them through the lower-level tmuxctl primitive after a
-    live agent-process check.
-    """
-    pane = await shared.resolve_tmux_pane_id(tmux_pane)
-    engine = await _pane_live_agent_engine(pane)
-    base = {
-        "instance_id": pane or tmux_pane,
-        "tmux_pane": pane,
-        "stored_pane": tmux_pane,
-        "source": source,
-        "purpose": purpose,
-        "fallback": "tmuxctl_send_text_no_registry_row",
-        "engine": engine,
-    }
-    if not pane:
-        return {**base, "status": PANE_WRITE_CANCELLED, "reason": "pane_unresolved"}
-    if not engine:
-        return {**base, "status": PANE_WRITE_CANCELLED, "reason": "no_live_agent_process"}
-    send_result = await _tmux_send_payload_then_submit(
-        pane,
-        payload,
-        clear_prompt=clear_prompt,
-    )
-    if send_result.get("gated"):
-        # Direct rowless sends have no registry row, but they still must not
-        # drop a payload when the universal gate suppresses bytes. Queue the
-        # raw pane id as the queue instance_id; process_pane_write_queue_once()
-        # has a live %pane fallback for this exact rowless path and will retry
-        # until the attended draft / typing guard clears.
-        gate_reason = send_result.get("gate_reason") or "gated"
-        queued = await enqueue_pane_write(
-            instance_id=pane,
-            tmux_pane=pane,
-            source=source,
-            purpose=purpose,
-            payload=payload,
-        )
-        drained = await process_pane_write_queue_once(queued["id"])
-        result = drained[0] if drained else queued
-        return {
-            **base,
-            "status": PANE_WRITE_PENDING,
-            "reason": f"send_gated:{gate_reason}",
-            **send_result,
-            **result,
-        }
-    return {
-        **base,
-        "status": PANE_WRITE_SENT if send_result.get("returncode") == 0 else PANE_WRITE_FAILED,
-        **send_result,
-    }
-
-
 async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: bool = False) -> dict:
     """Inject `payload` into ``target_pane`` via the existing pane-write queue.
 
@@ -11955,17 +11706,7 @@ async def talk_send(request: TalkSendRequest):
         }
 
     target_instance = await talk_service.lookup_instance_for_pane(target_pane)
-    target_engine = (target_instance or {}).get("engine")
-    rowless_target = target_instance is None or bool((target_instance or {}).get("rowless_live"))
-    rowless_live_engine = None
-    if rowless_target:
-        rowless_live_engine = await _pane_live_agent_engine(target_pane)
-        if not rowless_live_engine:
-            raise HTTPException(
-                status_code=400,
-                detail=f"target_pane has no live agent process: {target_raw}",
-            )
-    target_engine = target_engine or rowless_live_engine or "claude"
+    target_engine = (target_instance or {}).get("engine") or "claude"
     record = await talk_service.register_talk(
         caller_pane=caller_pane,
         target_pane=target_pane,
@@ -11974,24 +11715,9 @@ async def talk_send(request: TalkSendRequest):
         engine=target_engine,
     )
     try:
-        if rowless_target:
-            if talk_hook_driven:
-                await _flag_hook_driven(target_pane, tmux_pane=target_pane, actor="talk:rowless")
-            send_result = await _direct_tmux_pane_delivery(
-                target_pane,
-                request.payload,
-                source="talk",
-                purpose="talk_send",
-                clear_prompt=False,
-            )
-            if send_result.get("status") in {PANE_WRITE_CANCELLED, PANE_WRITE_FAILED}:
-                raise RuntimeError(
-                    send_result.get("reason") or send_result.get("error") or "delivery_failed"
-                )
-        else:
-            send_result = await _talk_send_payload(
-                target_pane, request.payload, hook_driven=talk_hook_driven
-            )
+        send_result = await _talk_send_payload(
+            target_pane, request.payload, hook_driven=talk_hook_driven
+        )
     except Exception as exc:  # noqa: BLE001
         await talk_service.cancel_talk(record["talk_id"], reason="delivery_failed")
         detail = await talk_service.publicize_payload(f"talk delivery failed: {exc}")
@@ -12076,28 +11802,16 @@ async def brief_send(request: BriefSendRequest):
                 )
                 receipt = {**receipt, **target}
             else:
-                instance = await talk_service.lookup_instance_for_pane(pane_id)
-                if instance is None or instance.get("rowless_live"):
-                    if brief_hook_driven:
-                        await _flag_hook_driven(pane_id, tmux_pane=pane_id, actor="brief:rowless")
-                    receipt = await _direct_tmux_pane_delivery(
-                        pane_id,
-                        request.payload,
-                        source="brief",
-                        purpose="brief_send",
-                        clear_prompt=True,
-                    )
-                else:
-                    queued = await enqueue_pane_write(
-                        instance_id=pane_id,
-                        tmux_pane=pane_id,
-                        source="brief",
-                        purpose="brief_send",
-                        payload=request.payload,
-                        hook_driven=brief_hook_driven,
-                    )
-                    drained = await process_pane_write_queue_once(queued["id"])
-                    receipt = drained[0] if drained else queued
+                queued = await enqueue_pane_write(
+                    instance_id=pane_id,
+                    tmux_pane=pane_id,
+                    source="brief",
+                    purpose="brief_send",
+                    payload=request.payload,
+                    hook_driven=brief_hook_driven,
+                )
+                drained = await process_pane_write_queue_once(queued["id"])
+                receipt = drained[0] if drained else queued
                 receipt = {**receipt, **target}
             delivered.append(receipt)
         except Exception as exc:  # noqa: BLE001
@@ -13254,7 +12968,7 @@ def _sync_generate_daily_analytics(date_str: str):
     Writes:
     1. Summary fields to the daily note's YAML front matter
     2. Full JSON to Imperium-ENV/Journal/Daily/analytics/ for programmatic access
-    Then deletes only the timer_shifts rows that were flushed.
+    Then wipes timer_shifts table.
     """
     import json
     import sqlite3
@@ -13264,24 +12978,11 @@ def _sync_generate_daily_analytics(date_str: str):
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
 
-    day = datetime.fromisoformat(date_str).date()
-    start_ts = f"{day.isoformat()}T06:00:00"
-    end_ts = f"{(day + timedelta(days=1)).isoformat()}T06:00:00"
-
-    rows = conn.execute(
-        """
-        SELECT * FROM timer_shifts
-        WHERE timestamp >= ? AND timestamp < ?
-        ORDER BY id
-        """,
-        (start_ts, end_ts),
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM timer_shifts ORDER BY id").fetchall()
 
     if not rows:
         conn.close()
         return None
-
-    flushed_ids = [int(r["id"]) for r in rows]
 
     # Compute analytics
     shift_count_by_trigger = defaultdict(int)
@@ -13332,21 +13033,7 @@ def _sync_generate_daily_analytics(date_str: str):
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    # 2. Render the day's timer graph as a self-contained SVG and write it
-    #    atomically beside the JSON. This is the note's single, durable end-of-day
-    #    timer footprint (intra-day churn writers are gone — daily note = cold
-    #    storage). Pure-Python; no browser, no matplotlib.
-    from timer_svg import render_timer_svg
-
-    svg = render_timer_svg(summary)
-    svg_path = analytics_dir / f"timer-{date_str}.svg"
-    svg_tmp = analytics_dir / f".timer-{date_str}.svg.tmp"
-    with open(svg_tmp, "w", encoding="utf-8") as f:
-        f.write(svg)
-    os.replace(svg_tmp, svg_path)
-
-    # 3. Write summary fields to daily note frontmatter + embed the SVG in place
-    #    of the (now runtime-dead) NOW callout.
+    # 2. Write summary fields to daily note frontmatter
     note_path = OBSIDIAN_DAILY_PATH / f"{date_str}.md"
     if note_path.exists():
         update_frontmatter(
@@ -13362,22 +13049,9 @@ def _sync_generate_daily_analytics(date_str: str):
                 "timer_max_instances": summary["max_active_instances"],
             },
         )
-        # Replace the NOW callout region with the SVG embed (or append it if the
-        # note — e.g. a prior-day note from create_daily_note_file — has none).
-        # The embed string is ~35 bytes; the SVG itself is a separate file.
-        apply_callout(
-            note_path,
-            "now",
-            f"![[timer-{date_str}.svg]]",
-            title=f"Timer · {date_str}",
-            callout_type="info",
-        )
 
-    # Delete only the rows included in this flush, after all writes succeed.
-    for i in range(0, len(flushed_ids), 500):
-        chunk = flushed_ids[i : i + 500]
-        placeholders = ",".join("?" for _ in chunk)
-        conn.execute(f"DELETE FROM timer_shifts WHERE id IN ({placeholders})", chunk)
+    # Wipe timer_shifts table
+    conn.execute("DELETE FROM timer_shifts")
     conn.commit()
     conn.close()
 
@@ -13399,14 +13073,68 @@ async def generate_daily_timer_analytics(date_str: str):
         print(f"TIMER: Failed to generate daily analytics: {e}")
 
 
-# `_sync_update_daily_note` / `timer_update_daily_note` were removed (2026-06-21,
-# daily-note write-race P0). They rewrote today's daily-note frontmatter every 30s
-# from the live timer engine (timer_status, break balances, last_timer_update),
-# churning the file's mtime and racing concurrent harness `Edit`s / external
-# appends. Intra-day timer state is the DB source of truth (timer_state /
-# timer_state_daily, PR #269) surfaced live by the /ui/ops cockpit; the daily note
-# receives the day's timer footprint exactly once via the end-of-day flush
-# (`_sync_generate_daily_analytics`). Do not reintroduce a per-tick note writer.
+def _sync_update_daily_note():
+    """Update daily note synchronically (called via asyncio.to_thread)."""
+    import sqlite3
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    note_path = OBSIDIAN_DAILY_PATH / f"{today}.md"
+    if not note_path.exists():
+        return
+
+    # Get session count and mode change count for today
+    session_count = 0
+    mode_change_count = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA busy_timeout=5000")
+        session_count = (
+            conn.execute("SELECT COUNT(*) FROM timer_sessions WHERE date = ?", (today,)).fetchone()[
+                0
+            ]
+            or 0
+        )
+        mode_change_count = (
+            conn.execute(
+                "SELECT COUNT(*) FROM timer_mode_changes WHERE timestamp LIKE ?", (f"{today}%",)
+            ).fetchone()[0]
+            or 0
+        )
+        conn.close()
+    except Exception:
+        pass  # Silently skip if DB query fails
+
+    # Snap last_timer_update to the 30-min grid so this purely-time-derived field is
+    # stable for 30 min at a time. Combined with update_frontmatter's write-skip guard,
+    # the 30s poll becomes a near-total no-op except at the grid boundary or on a real
+    # timer-state change.
+    _now = datetime.now()
+    last_timer_update = _now.replace(minute=(_now.minute // 30) * 30).strftime("%H:%M")
+
+    update_frontmatter(
+        note_path,
+        {
+            "timer_status": timer_engine.current_mode.value,
+            "timer_work_time": format_timer_time(timer_engine.total_work_time_ms),
+            "timer_break_earned": format_timer_time(
+                max(0, timer_engine.break_balance_ms) + timer_engine.total_break_time_ms
+            ),
+            "timer_break_used": format_timer_time(timer_engine.total_break_time_ms),
+            "timer_break_available": format_timer_time(max(0, timer_engine.break_balance_ms)),
+            "timer_backlog": format_timer_time(abs(min(0, timer_engine.break_balance_ms))),
+            "timer_sessions": session_count,
+            "timer_mode_changes": mode_change_count,
+            "last_timer_update": last_timer_update,
+        },
+    )
+
+
+async def timer_update_daily_note():
+    """Update today's daily note front matter asynchronously."""
+    try:
+        await asyncio.to_thread(_sync_update_daily_note)
+    except Exception as e:
+        print(f"TIMER: Failed to update daily note: {e}")
 
 
 def _sync_save_to_db(state_json: str):
@@ -13704,11 +13432,6 @@ async def enter_morning_session_internal(
     )
     await _write_morning_audit_state(source, today, local_now)
     await timer_save_to_db()
-    if TimerEvent.DAILY_RESET in result.events and result.reset_date and result.reset_date != today:
-        try:
-            await generate_daily_timer_analytics(result.reset_date)
-        except Exception as exc:
-            logger.exception("Morning prior-day timer analytics flush failed: %s", exc)
     try:
         await _wipe_prior_day_timer_events(today)
     except Exception as e:
@@ -19611,6 +19334,7 @@ async def _work_session_enforce_tick(now_ms: int, result) -> dict | None:
 async def timer_worker():
     """Background worker: ticks timer every 1s, persists state periodically."""
     global _current_session_id, _session_start_ms, _mode_change_count
+    last_daily_update = 0.0
     last_db_save = 0.0
     last_sample_save = 0.0
     last_mode = timer_engine.current_mode.value
@@ -19884,11 +19608,10 @@ async def timer_worker():
                         productivity_active=productivity_active,
                     )
 
-            # (Removed 2026-06-21, daily-note write-race P0) The timer worker no
-            # longer writes the daily note every 30s. That per-tick frontmatter
-            # rewrite moved the live note's mtime and broke concurrent harness
-            # `Edit`s. Live timer state is the DB (timer_state/_daily) + cockpit;
-            # the daily note gets the day's timer footprint once at end-of-day flush.
+            # Update daily note every 30s
+            if now - last_daily_update >= 30:
+                await timer_update_daily_note()
+                last_daily_update = now
 
             # Persist faithful graph samples independently from sparse shift events.
             if now - last_sample_save >= 30:
@@ -23069,6 +22792,7 @@ async def _create_aspirant_session_doc(
 session_doc_id: {doc_id}
 created: {today}
 agents: []
+instance_ids: []
 status: active
 type: session
 project: aspirants

@@ -338,8 +338,6 @@ def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
     pane qualifies when ``@PANE_CLEAN == 1`` AND no live ``@INSTANCE_ID``. Order
     follows tmux enumeration so the result is deterministic across calls.
     """
-    from .custodes import pane_has_active_agent
-
     raw = adapter.run(
         "list-panes",
         "-a",
@@ -351,7 +349,6 @@ def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
                 "#{@INSTANCE_ID}",
                 "#{@PANE_ID}",
                 "#{window_name}",
-                "#{pane_pid}",
             ]
         ),
         allow_failure=True,
@@ -359,21 +356,13 @@ def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
     free: list[FreePane] = []
     for line in raw.splitlines():
         parts = line.split("\t")
-        if len(parts) != 6:
+        if len(parts) != 5:
             continue
-        pane_id, clean, instance_id, pane_role, window_name, pane_pid_raw = parts
+        pane_id, clean, instance_id, pane_role, window_name = parts
         if clean.strip() != "1":
             continue
         if instance_id.strip():
             # A live agent owns this pane — never free, regardless of the stamp.
-            continue
-        try:
-            pane_pid = int(pane_pid_raw.strip()) if pane_pid_raw.strip() else None
-        except ValueError:
-            pane_pid = None
-        if pane_has_active_agent(pane_pid):
-            # Defense-in-depth: stale/missing @INSTANCE_ID must not make a live
-            # singleton/agent pane available for dispatch target selection.
             continue
         role = canonical_pane_role(pane_role.strip()) if pane_role.strip() else ""
         free.append(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from datetime import datetime
 
 import pytest
 
@@ -70,62 +69,3 @@ async def test_session_end_schedules_harness_agnostic_naming_nudge(app_env, monk
 
     assert result["action"] == "stopped"
     assert scheduled == [("sess-unnamed", "SessionEnd")]
-
-
-@pytest.mark.asyncio
-async def test_codex_one_off_session_end_preserves_instance_stamp_resolution(
-    app_env, monkeypatch
-) -> None:
-    """Completed Codex one-shots must keep the pane @INSTANCE_ID resolvable.
-
-    Regression: terminal SessionEnd spawned assert-instance; because the Codex
-    process had exited, stack-worker assertion pruned/cleared the pane stamp, so
-    tmuxctl resolve-instance failed immediately after completion.
-    """
-    from instance_mutation import sanctioned_insert_instance_sync
-
-    hooks = sys.modules["routes.hooks"]
-    now = datetime.now().isoformat()
-    with sqlite3.connect(app_env.db_path) as conn:
-        # tmux_pane/pane_label are runtime ids the sanctioned writer rejects; the
-        # one-off classification this test exercises reads engine/golden_throne/
-        # hook_driven only, so seed via the sanctioned helper without them.
-        sanctioned_insert_instance_sync(
-            conn,
-            values={
-                "id": "codex-done",
-                "name": "done",
-                "engine": "codex",
-                "working_dir": "/tmp",
-                "device_id": "Mac-Mini",
-                "status": "working",
-                "rank": "astartes",
-                "wrapper_launch_id": "wrap-done",
-                "golden_throne": None,
-                "hook_driven": 0,
-                "created_at": now,
-                "last_activity": now,
-            },
-            mutation_type="instance_registered",
-            write_source="test",
-            actor="test",
-        )
-        conn.commit()
-
-    spawned: list[tuple[str, str]] = []
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a: spawned.append(a))
-    monkeypatch.setattr(hooks, "_schedule_naming_nudge", lambda *a, **k: None)
-    monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
-
-    result = await hooks.handle_session_end(
-        {
-            "session_id": "codex-done",
-            "wrapper_launch_id": "wrap-done",
-            "engine": "codex",
-            "tmux_pane": "%9",
-            "env": {"TOKEN_API_INSTANCE_TYPE": "one_off"},
-        }
-    )
-
-    assert result["action"] == "stopped"
-    assert spawned == []

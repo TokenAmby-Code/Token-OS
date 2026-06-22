@@ -22,6 +22,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from nas_mount import ensure_command_mounts
+from now_widget import write_today_now_callout
 
 # Timezone handling
 try:
@@ -245,14 +246,38 @@ class CronEngine:
         },
     ]
 
-    # The 60s in-process NOW daily-note widget writer was removed (2026-06-21,
-    # daily-note write-race P0): it rewrote the live daily note every minute with
-    # live-changing telemetry (break balance, active-instance list), moving the
-    # file's mtime ~every tick and breaking concurrent harness `Edit`s with
-    # "File has been modified since read". The daily note is now cold storage —
-    # live timer state lives in the DB + /ui/ops cockpit, and the day's timer
-    # footprint is written once at the end-of-day flush
-    # (`_sync_generate_daily_analytics`). Do not reintroduce a per-tick note writer.
+    def register_now_widget_job(self, db_path: Path, daily_note_dir: Path) -> None:
+        """Register the in-process NOW daily-note widget refresh.
+
+        This intentionally calls the pure writer directly instead of making an
+        HTTP request back into Token-API. The direct path avoids local
+        server self-calls while still sharing the same atomic callout primitive
+        as PUT /api/daily-note/callout.
+        """
+        self.scheduler.add_job(
+            self._run_now_widget_job,
+            trigger=IntervalTrigger(seconds=60, timezone=ZoneInfo("America/Phoenix")),
+            args=[Path(db_path), Path(daily_note_dir)],
+            id="daily_note_now_widget",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+            name="daily-note-now-widget",
+        )
+        print("CronEngine: Registered daily-note-now-widget (interval: 60s)")
+
+    async def _run_now_widget_job(self, db_path: Path, daily_note_dir: Path) -> None:
+        try:
+            result = await asyncio.to_thread(write_today_now_callout, db_path, daily_note_dir)
+            print(
+                f"CronEngine: daily-note-now-widget {result.action} "
+                f"{result.path.name} ({result.bytes_written} bytes)"
+            )
+        except FileNotFoundError as exc:
+            print(f"CronEngine: daily-note-now-widget skipped — daily note missing: {exc}")
+        except Exception as exc:
+            print(f"CronEngine: daily-note-now-widget failed: {exc}")
 
     def register_persona_sweep_job(self, interval_minutes: int = 2) -> None:
         """Register the periodic singleton-persona registration sweep.

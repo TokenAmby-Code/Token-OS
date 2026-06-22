@@ -4,7 +4,6 @@ import subprocess
 import time
 
 from .api import fetch_instance_registry
-from .custodes import _process_tree
 from .tmux_adapter import TmuxAdapter
 
 SkillSinkKeys = tuple[str, ...]
@@ -68,30 +67,6 @@ def looks_like_codex_skill_invocation(text: str) -> bool:
 
 
 def detect_agent_from_pane_process(adapter: TmuxAdapter, pane: str) -> str:
-    try:
-        pane_pid_raw = adapter.run(
-            "display-message", "-t", pane, "-p", "#{pane_pid}", allow_failure=True
-        ).strip()
-        pane_pid = int(pane_pid_raw) if pane_pid_raw else None
-    except Exception:
-        pane_pid = None
-    if pane_pid:
-        children, commands = _process_tree()
-        stack = [pane_pid, *children.get(pane_pid, [])]
-        seen: set[int] = set()
-        while stack:
-            pid = stack.pop()
-            if pid in seen:
-                continue
-            seen.add(pid)
-            command = commands.get(pid, "")
-            if "@openai/codex" in command or "codex" in command:
-                return "codex"
-            if "claude" in command:
-                return "claude"
-            stack.extend(children.get(pid, []))
-
-    # Compatibility fallback for platforms/tests where pane_pid is unavailable.
     try:
         tty = adapter.run(
             "display-message", "-t", pane, "-p", "#{pane_tty}", allow_failure=True

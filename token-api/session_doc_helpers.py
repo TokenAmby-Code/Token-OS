@@ -18,7 +18,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
 import yaml
 
 from pane_surface import is_placeholder_tab_name
@@ -1227,7 +1226,8 @@ def create_session_doc_file(
     }
     if project:
         fm["project"] = project
-    fm["agents"] = []  # append-only launch roster (see _update_doc_agents_list)
+    fm["agents"] = []
+    fm["instance_ids"] = []
     if primarch_name:
         fm["primarch"] = primarch_name
     fm["status"] = "active"
@@ -1278,26 +1278,14 @@ def create_session_doc_file(
 
 
 async def _update_doc_agents_list(db, doc_id: int) -> None:
-    """Append newly-bound agents to a session doc's append-only ``agents:`` log.
-
-    ``agents:`` is a monotonic, append-only roster of every agent ever bound to
-    the doc — a pulse for fleet reconstruction, NOT live lifecycle state. We
-    deliberately do **not** filter by status and never remove an entry: a
-    stopped/archived agent stays in the log. New names are unioned with whatever
-    is already in the note, so the roster survives even if the DB rows are later
-    cleared (the note is the durable record). Combined with ``update_frontmatter``'s
-    write-skip guard, a sync that adds no new agent is a byte-identical no-op, so
-    the daily note's mtime never moves on routine status churn — only a genuine new
-    launch writes (low-frequency, append-only). ``instance_ids`` is retired: it was
-    never read for logic and implied a live "active instances" write-contract the
-    daily-note cold-storage model deliberately does not hold.
-    """
+    """Update the agents list, instance_ids, and primarch in a session doc's YAML frontmatter."""
     cursor = await db.execute(
-        "SELECT name FROM instances WHERE session_doc_id = ?",
+        "SELECT id, name AS tab_name FROM instances WHERE session_doc_id = ? AND status NOT IN ('stopped', 'archived')",
         (doc_id,),
     )
     rows = await cursor.fetchall()
-    bound_names = [r[0] for r in rows if r[0]]
+    agents = [r[1] for r in rows if r[1]]
+    instance_ids = [r[0] for r in rows if r[0]]
 
     cursor = await db.execute(
         "SELECT file_path, primarch_name FROM session_documents WHERE id = ?", (doc_id,)
@@ -1312,23 +1300,15 @@ async def _update_doc_agents_list(db, doc_id: int) -> None:
 
     primarch_name = doc_row[1]
 
-    def _merge(fm: dict[str, Any]) -> None:
-        existing = fm.get("agents")
-        roster = list(existing) if isinstance(existing, list) else []
-        seen = set(roster)
-        for name in bound_names:
-            if name not in seen:
-                roster.append(name)
-                seen.add(name)
-        fm["agents"] = roster
-        # Retire the live-lifecycle field wherever it still lingers.
-        fm.pop("instance_ids", None)
-        if primarch_name:
-            fm["primarch"] = primarch_name
-        else:
-            fm.pop("primarch", None)
+    updates = {
+        "agents": agents,
+        "instance_ids": instance_ids,
+    }
+    if primarch_name:
+        updates["primarch"] = primarch_name
+    delete_keys = ["primarch"] if not primarch_name else None
 
-    await asyncio.to_thread(update_frontmatter, fp, transform=_merge)
+    await asyncio.to_thread(update_frontmatter, fp, updates, delete_keys)
 
 
 async def resolve_or_create_session_doc_for_path(db, file_path: Path) -> int | None:
@@ -1398,7 +1378,8 @@ def create_daily_note_file(file_path: Path, date_str: str, doc_id: int) -> None:
         "type": "daily-note",
         "status": "active",
         "legion": "custodes",
-        "agents": [],  # append-only launch roster (see _update_doc_agents_list)
+        "agents": [],
+        "instance_ids": [],
     }
     body = f"# {date_str}\n\n## Custodes\n\n## Log\n"
     file_path.write_text(serialize_frontmatter(fm, body), encoding="utf-8")
@@ -1501,25 +1482,9 @@ async def resolve_session_doc_for_start(
     if dispatch_session_doc_path or legion or primarch_name or origin_type == "cron":
         return None, "unresolved_dispatch"
 
-    # Genuine interactive pane: defer the placeholder. Minting at SessionStart
-    # pollutes the vault with "Needs Session Name" docs for every pane that is
-    # opened and closed without a prompt (stray tests, failed dispatches, idle
-    # panes). The doc is minted lazily on the first real prompt instead — see
-    # create_deferred_interactive_session_doc(), called from handle_prompt_submit.
-    return None, "interactive_deferred"
-
-
-async def create_deferred_interactive_session_doc(db: aiosqlite.Connection) -> int:
-    """Mint the placeholder session doc for a genuine interactive pane.
-
-    Deferred from SessionStart (``resolve_session_doc_for_start`` returns
-    ``(None, "interactive_deferred")``) to the first prompt so opened-but-unused
-    panes leave no doc behind. Mirrors the old eager interactive fall-through:
-    a "Needs Session Name" doc the session is expected to rename via
-    ``session-doc-name``. Caller is responsible for binding the returned id onto
-    the instance row (pragma-once). Does not commit.
-    """
     now_ts = datetime.now().isoformat()
+    # No cwd/date fallback names. A new interactive session gets a placeholder
+    # and is expected to name its own session doc via `session-doc-name`.
     doc_title = "Needs Session Name"
     fp = unique_human_path(terra_sessions_dir(), doc_title, fallback="needs-session-name")
     cursor = await db.execute(
@@ -1527,6 +1492,6 @@ async def create_deferred_interactive_session_doc(db: aiosqlite.Connection) -> i
            VALUES (?, ?, ?, 'active', ?, ?)""",
         (doc_title, str(fp), None, now_ts, now_ts),
     )
-    doc_id = int(cursor.lastrowid)
+    doc_id = cursor.lastrowid
     create_session_doc_file(fp, doc_title, doc_id)
-    return doc_id
+    return doc_id, "interactive_auto"

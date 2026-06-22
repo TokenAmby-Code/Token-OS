@@ -56,7 +56,7 @@ _choose() {
     printf '%s' "$selection"
 }
 
-LIFECYCLE="$(_choose 'closeout> ' $'retire\tRetire only\narchive-session-doc\tRetire + archive session doc\nbanish\tBanish\ncancel\tCancel')"
+LIFECYCLE="$(_choose 'closeout> ' $'retire\tRetire only\narchive-session-doc\tRetire + archive session doc\ncancel\tCancel')"
 [[ -n "$LIFECYCLE" && "$LIFECYCLE" != "cancel" ]] || exit 0
 
 MODE_CHOICE="$(_choose 'final-message> ' $'message\tSend one last message, close on Stop\nnow\tNo message; close now\ncancel\tCancel')"

@@ -1477,76 +1477,16 @@ materialize_physical_pane() {
   printf '%s' "$target"
 }
 
-resolve_pane_label_for_env() {
-  local pane="$1" label=""
-  [[ -n "$pane" ]] || return 0
-  if command -v tmux >/dev/null 2>&1; then
-    label="$(tmux show-options -pv -t "$pane" @PANE_ID 2>/dev/null || true)"
-  fi
-  if [[ -z "$label" && "$pane" =~ ^[a-z][a-z0-9-]*:[A-Za-z0-9-]+$ ]]; then
-    label="$pane"
-  fi
-  printf '%s' "$label"
-}
-
-pane_has_active_agent_process() {
-  local root_pid="$1" needles="claude|codex"
-  [[ -n "$root_pid" && "$root_pid" =~ ^[0-9]+$ && "$root_pid" != "0" ]] || return 1
-  ps -A -o pid=,ppid=,command= 2>/dev/null | awk -v root="$root_pid" -v needles="$needles" '
-    {
-      pid=$1; ppid=$2; $1=""; $2=""; sub(/^  */, "", $0)
-      parent[pid]=ppid
-      cmd[pid]=tolower($0)
-    }
-    END {
-      for (pid in parent) {
-        cur=pid
-        while (cur in parent) {
-          if (parent[cur] == root) {
-            if (cmd[pid] ~ needles) exit 0
-            break
-          }
-          cur=parent[cur]
-        }
-      }
-      exit 1
-    }
-  '
-}
-
 assert_dispatch_target_unoccupied() {
   # Caller passes the canonical working id; resolve to physical once, here, at the
   # raw-tmux boundary.
-  local pane meta cmd title pane_label pane_pid instance_id
+  local pane meta cmd title
   [[ "${TOKEN_API_DISPATCH_FORCE_OCCUPIED:-}" == "1" ]] && return 0
   pane="$(materialize_physical_pane "$1")"
-  meta="$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{pane_title}|#{@PANE_ID}|#{pane_pid}|#{@INSTANCE_ID}' 2>/dev/null || true)"
+  meta="$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{pane_title}' 2>/dev/null || true)"
   [[ -n "$meta" ]] || return 0
   cmd="${meta%%|*}"
-  meta="${meta#*|}"
-  title="${meta%%|*}"
-  meta="${meta#*|}"
-  pane_label="${meta%%|*}"
-  meta="${meta#*|}"
-  pane_pid="${meta%%|*}"
-  instance_id="${meta#*|}"
-  case "$pane_label" in
-    legion:custodes|legion:malcador|mechanicus:fabricator-general|mechanicus:admin|koronus:pax|koronus:orchestrator)
-      err "target pane $TARGET is a protected singleton seat ($pane_label); refusing dispatch injection"
-      err "use a worker pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
-      exit 73
-      ;;
-  esac
-  if [[ -n "$instance_id" ]]; then
-    err "target pane $TARGET appears occupied (@INSTANCE_ID=$instance_id); refusing to inject dispatch command"
-    err "use an empty shell pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
-    exit 73
-  fi
-  if pane_has_active_agent_process "$pane_pid"; then
-    err "target pane $TARGET has a live Claude/Codex descendant (pane_pid=$pane_pid); refusing dispatch injection"
-    err "use an empty shell pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
-    exit 73
-  fi
+  title="${meta#*|}"
   case "$cmd" in
     node|claude|codex)
       err "target pane $TARGET appears occupied (command=$cmd, title=$title); refusing to inject dispatch command"
@@ -1668,6 +1608,245 @@ if [[ -n "$RESUME_DISCORD_CHANNEL" && -z "$DISCORD_CHANNEL" ]]; then
   )
 fi
 
+dispatch_codex_launch_inline() {
+  local resume_session_id="${1:-}"
+  local prompt="${2:-}"
+  local working_dir="${TOKEN_API_TARGET_WORKING_DIR:-$PWD}"
+  local api_url="${TOKEN_API_URL:-http://localhost:7777}"
+  local launcher="${TOKEN_API_LAUNCHER:-dispatch}"
+  local session_doc="${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}"
+  local dispatch_target="${TOKEN_API_DISPATCH_TARGET:-}"
+  local dispatch_window="${TOKEN_API_DISPATCH_WINDOW:-}"
+  local dispatch_mode="${TOKEN_API_DISPATCH_MODE:-}"
+  local dispatch_slot="${TOKEN_API_DISPATCH_SLOT:-}"
+  local launch_mode="${TOKEN_API_LAUNCH_MODE:-}"
+  local resolved_tmux_pane="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
+  local instance_type="${TOKEN_API_INSTANCE_TYPE:-golden_throne}"
+  local zealotry="${TOKEN_API_ZEALOTRY:-5}"
+  local parent_instance_id="${TOKEN_API_PARENT_INSTANCE_ID:-}"
+  local codex_profile="${TOKEN_API_CODEX_PROFILE:-}"
+
+  [[ -d "$working_dir" ]] || { echo "dispatch: working directory does not exist: $working_dir" >&2; return 65; }
+
+  local codex_bin
+  codex_bin="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
+  [[ -n "$codex_bin" ]] || { echo "dispatch: codex not found in PATH" >&2; return 66; }
+  command -v jq >/dev/null 2>&1 || { echo "dispatch: jq not found in PATH" >&2; return 67; }
+
+  local session_id bridge_id bridge_dir
+  session_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  bridge_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  bridge_dir="${HOME}/.codex/session-bridges"
+  mkdir -p "$bridge_dir"
+  rm -f "${bridge_dir}/${bridge_id}.session_id"
+
+  dispatch_codex_post_hook() {
+    local action_type="$1"
+    local payload="$2"
+    curl -s --connect-timeout 2 --max-time 5 \
+      -X POST "${api_url}/api/hooks/${action_type}" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null 2>&1 || true
+  }
+
+  dispatch_codex_build_env_object() {
+    local env_obj="{}"
+    [[ -n "${SSH_CLIENT:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$SSH_CLIENT" '. + {SSH_CLIENT: $v}')
+    [[ -n "${TMUX:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TMUX" '. + {TMUX: $v}')
+    [[ -n "${session_id:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$session_id" '. + {TOKEN_API_SESSION_ID: $v}')
+    [[ -n "${resolved_tmux_pane:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$resolved_tmux_pane" '. + {TMUX_PANE: $v}')
+    local persona_env="${TOKEN_API_PERSONA:-}"
+    [[ -n "$persona_env" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$persona_env" '. + {TOKEN_API_PERSONA: $v}')
+    [[ -n "${codex_profile:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$codex_profile" '. + {TOKEN_API_CODEX_PROFILE: $v}')
+    [[ -n "${parent_instance_id:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$parent_instance_id" '. + {TOKEN_API_PARENT_INSTANCE_ID: $v}')
+    [[ -n "${TOKEN_API_DISPATCH_MCP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP" '. + {TOKEN_API_DISPATCH_MCP: $v}')
+    [[ -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_WITH_BROWSER" '. + {TOKEN_API_DISPATCH_WITH_BROWSER: $v}')
+    [[ -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_WITH_DESKTOP" '. + {TOKEN_API_DISPATCH_WITH_DESKTOP: $v}')
+    [[ -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISPATCH_MCP_LIST" '. + {TOKEN_API_DISPATCH_MCP_LIST: $v}')
+    [[ -n "${TOKEN_API_DISCORD_HOSTED:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_HOSTED" '. + {TOKEN_API_DISCORD_HOSTED: $v}')
+    [[ -n "${TOKEN_API_DISCORD_CHANNEL:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_CHANNEL" '. + {TOKEN_API_DISCORD_CHANNEL: $v}')
+    [[ -n "${TOKEN_API_DISCORD_BOT:-}" ]] && env_obj=$(echo "$env_obj" | jq -c --arg v "$TOKEN_API_DISCORD_BOT" '. + {TOKEN_API_DISCORD_BOT: $v}')
+    echo "$env_obj"
+  }
+
+  local env_obj wrapper_start_payload
+  env_obj="$(dispatch_codex_build_env_object)"
+  wrapper_start_payload="$(jq -nc \
+    --arg wrapper_launch_id "$bridge_id" \
+    --arg launcher "$launcher" \
+    --arg engine "codex" \
+    --arg wd "$working_dir" \
+    --arg tmux_pane "$resolved_tmux_pane" \
+    --arg instance_type "$instance_type" \
+    --argjson zealotry "$zealotry" \
+    --argjson pid "$$" \
+    --argjson env "$env_obj" \
+    '{
+      wrapper_launch_id: $wrapper_launch_id,
+      launcher: $launcher,
+      engine: $engine,
+      cwd: $wd,
+      tmux_pane: $tmux_pane,
+      instance_type: $instance_type,
+      zealotry: $zealotry,
+      pid: $pid,
+      env: $env
+    }')"
+  dispatch_codex_post_hook "WrapperStart" "$wrapper_start_payload"
+
+  local session_start_payload
+  session_start_payload="$(jq -nc \
+    --arg sid "$session_id" \
+    --arg wrapper_launch_id "$bridge_id" \
+    --arg launcher "$launcher" \
+    --arg engine "codex" \
+    --arg wd "$working_dir" \
+    --arg tmux_pane "$resolved_tmux_pane" \
+    --arg dispatch_target "$dispatch_target" \
+    --arg dispatch_window "$dispatch_window" \
+    --arg dispatch_mode "$dispatch_mode" \
+    --arg dispatch_slot "$dispatch_slot" \
+    --arg session_doc "$session_doc" \
+    --arg target_working_dir "$target_working_dir" \
+    --arg launch_mode "$launch_mode" \
+    --arg instance_type "$instance_type" \
+    --argjson zealotry "$zealotry" \
+    --argjson pid "$$" \
+    --argjson env "$env_obj" \
+    '{
+      session_id: $sid,
+      wrapper_launch_id: $wrapper_launch_id,
+      launcher: $launcher,
+      engine: $engine,
+      cwd: $wd,
+      tmux_pane: $tmux_pane,
+      dispatch_target: $dispatch_target,
+      dispatch_window: $dispatch_window,
+      dispatch_mode: $dispatch_mode,
+      dispatch_slot: $dispatch_slot,
+      dispatch_session_doc_path: $session_doc,
+      target_working_dir: $target_working_dir,
+      launch_mode: $launch_mode,
+      instance_type: $instance_type,
+      zealotry: $zealotry,
+      pid: $pid,
+      env: $env
+    }')"
+  dispatch_codex_post_hook "SessionStart" "$session_start_payload"
+
+  dispatch_codex_cleanup() {
+    local exit_code="${1:-$?}"
+    local codex_session_id="$session_id"
+    local wrapper_end_payload end_payload
+    dispatch_codex_stack_enforce_if_needed() {
+      if declare -F token_wrapper_enforce_stack_if_needed >/dev/null 2>&1; then
+        token_wrapper_enforce_stack_if_needed "${resolved_tmux_pane:-}"
+      fi
+    }
+    if [[ -s "${bridge_dir}/${bridge_id}.session_id" ]]; then
+      codex_session_id="$(cat "${bridge_dir}/${bridge_id}.session_id" 2>/dev/null || printf '%s' "$session_id")"
+    fi
+    rm -f "${bridge_dir}/${bridge_id}.session_id"
+    wrapper_end_payload="$(jq -nc \
+      --arg wrapper_launch_id "$bridge_id" \
+      --arg launcher "$launcher" \
+      --arg engine "codex" \
+      --arg wd "$working_dir" \
+      --arg tmux_pane "$resolved_tmux_pane" \
+      --argjson pid "$$" \
+      --argjson code "$exit_code" \
+      --argjson env "$env_obj" \
+      '{
+        wrapper_launch_id: $wrapper_launch_id,
+        launcher: $launcher,
+        engine: $engine,
+        cwd: $wd,
+        tmux_pane: $tmux_pane,
+        pid: $pid,
+        exit_code: $code,
+        env: $env
+      }')"
+    dispatch_codex_post_hook "WrapperEnd" "$wrapper_end_payload"
+    end_payload="$(jq -nc \
+      --arg sid "$codex_session_id" \
+      --arg wrapper_launch_id "$bridge_id" \
+      --arg wd "$working_dir" \
+      --arg launcher "$launcher" \
+      --arg engine "codex" \
+      --arg tmux_pane "$resolved_tmux_pane" \
+      --argjson code "$exit_code" \
+      '{
+        session_id: $sid,
+        wrapper_launch_id: $wrapper_launch_id,
+        cwd: $wd,
+        launcher: $launcher,
+        engine: $engine,
+        tmux_pane: $tmux_pane,
+        exit_code: $code
+      }')"
+    dispatch_codex_post_hook "SessionEnd" "$end_payload"
+    dispatch_codex_stack_enforce_if_needed
+  }
+  dispatch_codex_signal_cleanup() {
+    local exit_code=$?
+    dispatch_codex_cleanup "$exit_code"
+    exit "$exit_code"
+  }
+  trap dispatch_codex_signal_cleanup INT TERM HUP
+
+  local bypass_flag=""
+  if [[ "${CODEX_DANGEROUS_BYPASS:-1}" == "1" ]]; then
+    bypass_flag="--dangerously-bypass-approvals-and-sandbox"
+  else
+    bypass_flag="--full-auto"
+  fi
+
+  local -a codex_env codex_profile_args
+  codex_env=(
+    "TOKEN_API_SESSION_ID=${session_id}"
+    "TOKEN_API_CODEX_BRIDGE_ID=${bridge_id}"
+    "TOKEN_API_WRAPPER_LAUNCH_ID=${bridge_id}"
+    "TOKEN_API_LAUNCHER=${launcher}"
+    "TOKEN_API_ENGINE=codex"
+    "TOKEN_API_DISPATCH_TARGET=${dispatch_target}"
+    "TOKEN_API_DISPATCH_WINDOW=${dispatch_window}"
+    "TOKEN_API_DISPATCH_MODE=${dispatch_mode}"
+    "TOKEN_API_DISPATCH_SLOT=${dispatch_slot}"
+    "TOKEN_API_PARENT_INSTANCE_ID=${parent_instance_id}"
+    "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${session_doc}"
+    "TOKEN_API_TARGET_WORKING_DIR=${working_dir}"
+    "TOKEN_API_LAUNCH_MODE=${launch_mode}"
+    "TOKEN_API_TRANSPLANT_EXPECTED=${TOKEN_API_TRANSPLANT_EXPECTED:-false}"
+    "TOKEN_API_DISPATCH_RESOLVED_PANE=${resolved_tmux_pane}"
+    "TMUX_PANE=${resolved_tmux_pane}"
+    "TOKEN_API_INSTANCE_TYPE=${instance_type}"
+    "TOKEN_API_ZEALOTRY=${zealotry}"
+    "TOKEN_API_DISPATCH_MCP=${TOKEN_API_DISPATCH_MCP:-}"
+    "TOKEN_API_DISPATCH_WITH_BROWSER=${TOKEN_API_DISPATCH_WITH_BROWSER:-}"
+    "TOKEN_API_DISPATCH_WITH_DESKTOP=${TOKEN_API_DISPATCH_WITH_DESKTOP:-}"
+    "TOKEN_API_DISPATCH_MCP_LIST=${TOKEN_API_DISPATCH_MCP_LIST:-}"
+    "TOKEN_API_DISCORD_HOSTED=${TOKEN_API_DISCORD_HOSTED:-}"
+    "TOKEN_API_DISCORD_CHANNEL=${TOKEN_API_DISCORD_CHANNEL:-}"
+    "TOKEN_API_DISCORD_BOT=${TOKEN_API_DISCORD_BOT:-}"
+  )
+  [[ -n "$codex_profile" ]] && codex_env+=("TOKEN_API_CODEX_PROFILE=${codex_profile}")
+  codex_profile_args=()
+  [[ -n "$codex_profile" ]] && codex_profile_args=(--profile "$codex_profile")
+
+  local codex_exit_code=0
+  if [[ "${CODEX_HEADLESS:-0}" == "1" ]]; then
+    local output_file="/tmp/codex-${session_id}.md"
+    env "${codex_env[@]}" "$codex_bin" exec ${codex_profile_args[@]+"${codex_profile_args[@]}"} "$prompt" -C "$working_dir" "$bypass_flag" --json -o "$output_file" || codex_exit_code=$?
+  elif [[ -n "$resume_session_id" ]]; then
+    env "${codex_env[@]}" "$codex_bin" resume -C "$working_dir" "$bypass_flag" ${codex_profile_args[@]+"${codex_profile_args[@]}"} "$resume_session_id" "$prompt" || codex_exit_code=$?
+  else
+    env "${codex_env[@]}" "$codex_bin" ${codex_profile_args[@]+"${codex_profile_args[@]}"} "$prompt" -C "$working_dir" "$bypass_flag" || codex_exit_code=$?
+  fi
+  dispatch_codex_cleanup "$codex_exit_code"
+  trap - INT TERM HUP
+  return "$codex_exit_code"
+}
+
 build_agent_command() {
   local -a cmd envs
   envs=("${COMMON_ENV[@]}")
@@ -1677,18 +1856,14 @@ build_agent_command() {
   # the canonical working id at this hand-off boundary so storage + consumers stay
   # unchanged (column stays physical, fleet launchable at every commit).
   if [[ -n "${RESOLVED_TARGET:-}" ]]; then
-    local resolved_physical_pane resolved_pane_label
+    local resolved_physical_pane
     resolved_physical_pane="$(materialize_physical_pane "$RESOLVED_TARGET")"
     envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${resolved_physical_pane}")
     envs+=("TMUX_PANE=${resolved_physical_pane}")
-    resolved_pane_label="$(resolve_pane_label_for_env "$resolved_physical_pane")"
-    [[ -n "$resolved_pane_label" ]] && envs+=("TOKEN_API_PANE_LABEL=${resolved_pane_label}")
   fi
   if [[ -n "$RESUME_ID" ]]; then
     if [[ "$ENGINE" == "codex" ]]; then
-      cmd=("${SCRIPT_DIR}/../scripts/codex-wrapper.sh")
-      envs+=("TOKEN_API_CODEX_RESUME_ID=${RESUME_ID}")
-      [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
+      cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline \"\$@\"" dispatch-codex "$RESUME_ID" "${PROMPT:-}")
     else
       cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
       [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
@@ -1700,8 +1875,7 @@ build_agent_command() {
       [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
     fi
   elif [[ "$ENGINE" == "codex" ]]; then
-    cmd=("${SCRIPT_DIR}/../scripts/codex-wrapper.sh")
-    [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
+    cmd=(bash -lc "$(declare -f dispatch_codex_launch_inline); dispatch_codex_launch_inline \"\$@\"" dispatch-codex "" "${PROMPT:-}")
   else
     cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
     [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
@@ -1777,107 +1951,6 @@ stage_agent_command() {
   printf 'bash %q' "$stage"
 }
 
-dispatch_launch_observe_timeout() {
-  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-20}"
-  if [[ "$value" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$value"
-  else
-    printf '%s' "20"
-  fi
-}
-
-pane_wrapper_launch_id() {
-  local pane="$1"
-  command -v tmux >/dev/null 2>&1 || return 0
-  tmux display-message -p -t "$pane" '#{@TOKEN_API_WRAPPER_LAUNCH_ID}' 2>/dev/null || true
-}
-
-pane_instance_id() {
-  local pane="$1"
-  command -v tmux >/dev/null 2>&1 || return 0
-  tmux display-message -p -t "$pane" '#{@INSTANCE_ID}' 2>/dev/null || true
-}
-
-clear_pane_wrapper_launch_id() {
-  local pane="$1"
-  command -v tmux >/dev/null 2>&1 || return 0
-  tmux set-option -pu -t "$pane" @TOKEN_API_WRAPPER_LAUNCH_ID >/dev/null 2>&1 || true
-  tmux set-option -pu -t "$pane" @INSTANCE_ID >/dev/null 2>&1 || true
-}
-
-
-wait_for_dispatch_wrapper_start() {
-  local pane="$1" target_display="$2" expected_wrapper_id="${3:-$WRAPPER_ID}" timeout deadline observed
-  timeout="$(dispatch_launch_observe_timeout)"
-  [[ "$timeout" -gt 0 ]] || return 0
-  deadline=$((SECONDS + timeout))
-  while (( SECONDS <= deadline )); do
-    observed="$(pane_wrapper_launch_id "$pane")"
-    if [[ -n "$expected_wrapper_id" && "$observed" == "$expected_wrapper_id" ]]; then
-      return 0
-    fi
-    if [[ -z "$expected_wrapper_id" && -n "$observed" ]]; then
-      return 0
-    fi
-    sleep 0.2
-  done
-  err "launch failed: wrapper did not start within ${timeout}s for ${ENGINE} launch to ${target_display}; the staged command may not have reached the pane"
-  return 1
-}
-
-wait_for_dispatch_instance_register() {
-  local pane="$1" target_display="$2" timeout deadline observed
-  timeout="$(dispatch_launch_observe_timeout)"
-  [[ "$timeout" -gt 0 ]] || return 0
-  deadline=$((SECONDS + timeout))
-  while (( SECONDS <= deadline )); do
-    observed="$(pane_instance_id "$pane")"
-    if [[ -n "$observed" ]]; then
-      return 0
-    fi
-    sleep 0.2
-  done
-  err "launch failed: instance did not register within ${timeout}s for ${ENGINE} launch to ${target_display}; wrapper started but SessionStart did not stamp the pane"
-  return 1
-}
-
-wait_for_dispatch_registry_bind() {
-  local pane="$1" target_display="$2" timeout deadline instance_id row status row_workdir row_pane row_label expected_label
-  timeout="$(dispatch_launch_observe_timeout)"
-  [[ "$timeout" -gt 0 ]] || return 0
-  command -v sqlite3 >/dev/null 2>&1 || return 0
-  [[ -f "$DB_PATH" ]] || return 0
-  expected_label="$(resolve_pane_label_for_env "$pane")"
-  deadline=$((SECONDS + timeout))
-  while (( SECONDS <= deadline )); do
-    instance_id="$(pane_instance_id "$pane")"
-    if [[ -z "$instance_id" ]]; then
-      sleep 0.2
-      continue
-    fi
-    row="$(sqlite3 -separator $'\t' "$DB_PATH" \
-      "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(tmux_pane,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
-      2>/dev/null || true)"
-    if [[ -n "$row" ]]; then
-      IFS=$'\t' read -r status row_workdir row_pane row_label <<< "$row"
-      if [[ "$status" != "stopped" && "$status" != "archived" ]]; then
-        if [[ -z "$RESUME_ID" && "$row_workdir" != "$WORK_DIR" ]]; then
-          sleep 0.2
-          continue
-        fi
-        if [[ -n "$expected_label" && -z "$row_label" ]]; then
-          sleep 0.2
-          continue
-        fi
-        return 0
-      fi
-    fi
-    sleep 0.2
-  done
-  err "launch failed: instance row did not bind live within ${timeout}s for ${ENGINE} launch to ${target_display}; registry row is missing, stopped, wrong-dir, or missing pane_label"
-  return 1
-}
-
 build_dispatch_command() {
   local -a args
   if [[ -n "$RESUME_ID" ]]; then
@@ -1892,7 +1965,6 @@ build_dispatch_command() {
   fi
   [[ -n "$PERSONA" ]] && args+=(--persona "$PERSONA")
   [[ -n "$CLAUDE_MODEL" ]] && args+=(--model "$CLAUDE_MODEL")
-  [[ -n "$WORKTREE_BRANCH" ]] && args+=(--worktree "$WORKTREE_BRANCH")
   if [[ -z "$RESUME_ID" ]]; then
     [[ -n "$SESSION_DOC" ]] && args+=(--session-doc "$SESSION_DOC")
     [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
@@ -1985,21 +2057,9 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   phys_pane="$(materialize_physical_pane "$pane_id")"
-  clear_pane_wrapper_launch_id "$phys_pane"
   tmux send-keys -t "$phys_pane" "$STAGED_COMMAND" Enter
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
-  expected_wrapper_id="$WRAPPER_ID"
-  [[ "$ENGINE" == "codex" ]] && expected_wrapper_id=""
-  if ! wait_for_dispatch_wrapper_start "$phys_pane" "$stack_display" "$expected_wrapper_id"; then
-    exit 70
-  fi
-  if ! wait_for_dispatch_instance_register "$phys_pane" "$stack_display"; then
-    exit 70
-  fi
-  if ! wait_for_dispatch_registry_bind "$phys_pane" "$stack_display"; then
-    exit 70
-  fi
   printf '%s\n' "dispatched $ENGINE to $stack_display" | redact_tmux_panes_for_display
   exit 0
 fi
@@ -2018,7 +2078,6 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   tmux send-keys -t "$PHYSICAL_TARGET" "clear" Enter
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
-  clear_pane_wrapper_launch_id "$PHYSICAL_TARGET"
   tmux send-keys -t "$PHYSICAL_TARGET" "$STAGED_COMMAND" Enter
   target_display="${RESOLVED_TARGET:-$TARGET}"
   if [[ "$TARGET" == %* ]]; then
@@ -2027,17 +2086,6 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
       [[ -n "$human_target" ]] && target_display="$human_target"
     fi
     [[ "$target_display" == %* ]] && target_display="tmux target"
-  fi
-  expected_wrapper_id="$WRAPPER_ID"
-  [[ "$ENGINE" == "codex" ]] && expected_wrapper_id=""
-  if ! wait_for_dispatch_wrapper_start "$PHYSICAL_TARGET" "$target_display" "$expected_wrapper_id"; then
-    exit 70
-  fi
-  if ! wait_for_dispatch_instance_register "$PHYSICAL_TARGET" "$target_display"; then
-    exit 70
-  fi
-  if ! wait_for_dispatch_registry_bind "$PHYSICAL_TARGET" "$target_display"; then
-    exit 70
   fi
   echo "dispatched $ENGINE to $target_display"
   exit 0

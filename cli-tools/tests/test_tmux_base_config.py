@@ -14,66 +14,21 @@ def _line_starting(prefix: str) -> str:
     raise AssertionError(f"missing tmux binding: {prefix}")
 
 
-def test_pane_select_prefix_arrows_use_stack_aware_absolute_selection() -> None:
-    for key, (pane_index, direction) in {
-        "Left": ("1", "left"),
-        "Up": ("2", "up"),
-        "Down": ("3", "down"),
-        "Right": ("4", "right"),
-    }.items():
-        line = _line_starting(f"bind {key} ")
-        assert f"#{'{session_name}'}:#{'{window_index}'}.{pane_index}" in line
-        assert "tmuxctl pane-select --mode absolute" in line
-        assert f"--direction {direction}" in line
-        assert "m:legion*,#{window_name}" in line
-        assert "m:mechanicus*,#{window_name}" in line
-        assert "m:koronus*,#{window_name}" in line
-        assert "select-pane -L" not in line
-        assert "select-pane -R" not in line
-        assert "select-pane -U" not in line
-        assert "select-pane -D" not in line
-        assert "resize-pane -Z" in line
-        assert "window_zoomed_flag" in line
-        assert "switch-client -T pane-select" in line
-
-
-def test_pane_select_prefix_arrows_keep_native_non_stack_targets() -> None:
-    for key, pane_index in {
-        "Left": "1",
-        "Up": "2",
-        "Down": "3",
-        "Right": "4",
-    }.items():
-        line = _line_starting(f"bind {key} ")
-        native = f"'select-pane -t \"#{{session_name}}:#{{window_index}}.{pane_index}\"'"
-        assert native in line
-
-
-def test_pane_select_prefix_hjkl_deexpand_before_routing() -> None:
+def test_pane_select_prefix_arrows_are_bound_to_absolute_routing():
     for key, direction in {
-        "h": "left",
-        "j": "down",
-        "k": "up",
-        "l": "right",
+        "Left": "left",
+        "Down": "down",
+        "Up": "up",
+        "Right": "right",
     }.items():
         line = _line_starting(f"bind {key} ")
-        assert "resize-pane -Z" in line
-        assert "window_zoomed_flag" in line
         assert "tmuxctl pane-select" in line
-        assert "--mode relative" in line
+        assert "--mode absolute" in line
         assert f"--direction {direction}" in line
         assert "switch-client -T pane-select" in line
 
 
-def test_pane_select_enter_expands_without_status_flash() -> None:
-    line = _line_starting("bind -T pane-select Enter ")
-    assert "tmux-grid-expand" in line
-    assert "--expand" in line
-    assert "#{client_tty}" in line
-    assert "display-message" not in line
-
-
-def test_pane_select_table_arrows_are_bound_to_relative_routing() -> None:
+def test_pane_select_table_arrows_are_bound_to_relative_routing():
     for key, direction in {
         "Left": "left",
         "Down": "down",
@@ -87,7 +42,7 @@ def test_pane_select_table_arrows_are_bound_to_relative_routing() -> None:
         assert "switch-client -T pane-select" in line
 
 
-def test_pane_select_bindings_do_not_use_timer_focus_override() -> None:
+def test_pane_select_bindings_do_not_use_timer_focus_override():
     pane_select_lines = [
         line
         for line in CONF.read_text(encoding="utf-8").splitlines()
@@ -96,11 +51,9 @@ def test_pane_select_bindings_do_not_use_timer_focus_override() -> None:
     assert pane_select_lines
     assert all("--seconds" not in line for line in pane_select_lines)
     assert all("allow-mechanicus-focus" not in line for line in pane_select_lines)
-    assert all("stack enforce" not in line for line in pane_select_lines)
-    assert all("@STACK_FOCUSED_PANE" not in line for line in pane_select_lines)
 
 
-def test_prefix_q_opens_mark_for_close_popup() -> None:
+def test_prefix_q_opens_mark_for_close_popup():
     conf = CONF.read_text(encoding="utf-8")
     line = _line_starting("bind Q ")
     assert "display-popup" in line
@@ -121,12 +74,8 @@ def test_prefix_q_opens_mark_for_close_popup() -> None:
     assert "/retire" not in script
     assert "/archive-session-doc" not in script
 
-    exit_script = (ROOT / "bin" / "tmux-instance-exit").read_text(encoding="utf-8")
-    assert '"$TMUXCTL_BIN" close --instance-id' in exit_script
-    assert "send-keys C-c" not in exit_script
 
-
-def test_mark_for_close_script_is_committed_executable() -> None:
+def test_mark_for_close_script_is_committed_executable():
     # core.fileMode is false in this repo, so a missing exec bit is not caught by
     # the working tree; assert the committed git mode is 100755 directly. The
     # tmux popup runs `tmux-mark-for-close` off PATH and a non-exec file fails.
@@ -140,32 +89,3 @@ def test_mark_for_close_script_is_committed_executable() -> None:
     assert out.stdout, "tmux-mark-for-close is not tracked by git"
     mode = out.stdout.split()[0]
     assert mode == "100755", f"tmux-mark-for-close must be committed executable, got {mode}"
-
-
-def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
-    """The typing-guard indicator lives in each pane's border, not the global bar.
-
-    Emperor UX directive: drop the global "⌨ GUARD" status-right segment and show
-    guard state per-pane via @GUARD. status-right keeps tmux-typing-guard-status
-    only as a SILENT --scan reconciler (one fork/interval, no visible segment) so
-    every pane's @GUARD is refreshed honestly and stale markers clear.
-    """
-    status_right = _line_starting("set -g status-right ")
-    # The reconciler must run in --scan mode (all panes), never the current-pane
-    # visible-segment mode.
-    assert "tmux-typing-guard-status --scan" in status_right
-    assert "#(tmux-typing-guard-status 2>/dev/null)" not in status_right, (
-        "the visible current-pane guard segment must be removed from the global bar"
-    )
-    # The per-pane border is the sole guard surface now.
-    border = _line_starting("set -g pane-border-format ")
-    assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
-
-
-def test_portable_status_guard_indicator_is_also_per_pane() -> None:
-    portable = (ROOT / "tmux" / "tmux-portable-status.conf").read_text(encoding="utf-8")
-    status_right = next(
-        line for line in portable.splitlines() if line.startswith("set status-right ")
-    )
-    assert "tmux-typing-guard-status --scan" in status_right
-    assert "#(tmux-typing-guard-status 2>/dev/null)" not in status_right

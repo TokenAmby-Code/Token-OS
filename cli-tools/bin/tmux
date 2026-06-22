@@ -326,34 +326,6 @@ maybe_open_mechanicus_override() {
     esac
 }
 
-runtime_invariant_preflight() {
-    [[ $# -gt 0 ]] || return 0
-    local command="$1" target="" opt="" arg
-    case "$command" in
-        respawn-pane)
-            target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
-            [[ -n "$target" ]] || target="$TMUX_PANE"
-            [[ -n "$target" ]] || return 0
-            IMPERIUM_TMUX_AUTOMATION=1 "${_BIN_DIR}/tmuxctl" clear-runtime --pane "$target" >/dev/null 2>&1 || true
-            ;;
-        set-option|set)
-            local pane_scope=0 unset_scope=0
-            for arg in "$@"; do
-                [[ "$arg" == -* && "$arg" == *p* ]] && pane_scope=1
-                [[ "$arg" == -* && "$arg" == *u* ]] && unset_scope=1
-            done
-            [[ "$pane_scope" == 1 && "$unset_scope" == 1 ]] || return 0
-            opt="${@: -1}"
-            [[ "$opt" == "@INSTANCE_ID" ]] || return 0
-            target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
-            [[ -n "$target" ]] || target="$TMUX_PANE"
-            [[ -n "$target" ]] || return 0
-            # clear-runtime clears pane tint/title before unsetting @INSTANCE_ID.
-            IMPERIUM_TMUX_AUTOMATION=1 "${_BIN_DIR}/tmuxctl" clear-runtime --pane "$target" >/dev/null 2>&1 || true
-            ;;
-    esac
-}
-
 if [[ "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_launch_command "$@"; then
     exec "$_TX_BIN" start
 fi
@@ -391,6 +363,17 @@ if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; th
             i=$((i+1))
         fi
     done
+    if ! inbound_typing_guard_allows "${args[@]}"; then
+        exit 1
+    fi
+    case "${args[0]:-}" in
+        send-keys|send-key|send)
+            # The per-pane inbound guard just made the authoritative decision.
+            # Do not let the older global client_activity send gate suppress an
+            # empty/different pane and recreate the silent-swallow path.
+            export TMUX_SEND_GATE_ALLOW="${TMUX_SEND_GATE_ALLOW:-tmux-inbound-guard}"
+            ;;
+    esac
     if send_gate_suppresses "${args[@]}"; then
         exit 0  # cancel policy (e.g. quiet hours): no PTY write
     fi
@@ -398,7 +381,6 @@ if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; th
         "$_REAL_TMUX" "${args[@]}" | sanitize_pane_ids
         exit "${PIPESTATUS[0]}"
     fi
-    runtime_invariant_preflight "${args[@]}"
     exec "$_REAL_TMUX" "${args[@]}"
 fi
 

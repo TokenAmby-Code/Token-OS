@@ -13,8 +13,6 @@ Usage:
     victory-ack --doc-id 12 "reason"           # explicit doc id
     victory-ack --instance-id <id> "reason"    # resolve via specific instance
     victory-ack --force "reason"               # bypass rubric precondition
-    victory-ack --cascade "reason"             # print cleanup plan only (default dry-run)
-    victory-ack --cascade --execute "reason"   # run cascade cleanup, then archive
     victory-ack --deliverable X --deliverable Y "reason"
 
 Flags:
@@ -22,9 +20,6 @@ Flags:
     --instance-id ID      Instance id to resolve doc from (else $TOKEN_API_INSTANCE_ID)
     --deliverable TEXT    Repeatable; recorded in `deliverables:` frontmatter
     --force               Skip rubric-complete precondition (escape hatch)
-    --cascade             Plan victorious→archived cleanup for worktrees/dev servers
-    --dry-run             With --cascade, execute nothing (default)
-    --execute             With --cascade, run dev-server-stop and worktree-delete
     --json                Output raw API response as JSON
     -h, --help            Show this help
 """
@@ -51,9 +46,9 @@ def http_get(path: str) -> dict:
             return parsed
     except urllib.error.HTTPError as e:
         body = e.read().decode() if e.fp else ""
-        raise SystemExit(f"Error: GET {path} returned {e.code}: {body}") from None
+        raise SystemExit(f"Error: GET {path} returned {e.code}: {body}")
     except urllib.error.URLError as e:
-        raise SystemExit(f"Error: Cannot reach Token-API at {api_url()} — {e.reason}") from None
+        raise SystemExit(f"Error: Cannot reach Token-API at {api_url()} — {e.reason}")
 
 
 def http_post(path: str, data: dict) -> tuple[int, dict]:
@@ -78,7 +73,7 @@ def http_post(path: str, data: dict) -> tuple[int, dict]:
             parsed = {"detail": parsed}
         return e.code, parsed
     except urllib.error.URLError as e:
-        raise SystemExit(f"Error: Cannot reach Token-API at {api_url()} — {e.reason}") from None
+        raise SystemExit(f"Error: Cannot reach Token-API at {api_url()} — {e.reason}")
 
 
 def resolve_doc_id_from_instance(instance_id: str) -> int:
@@ -86,7 +81,8 @@ def resolve_doc_id_from_instance(instance_id: str) -> int:
     doc_id = data.get("session_doc_id")
     if not doc_id:
         raise SystemExit(
-            f"Error: Instance {instance_id} has no linked session doc.\nPass --doc-id explicitly."
+            f"Error: Instance {instance_id} has no linked session doc.\n"
+            "Pass --doc-id explicitly."
         )
     return int(doc_id)
 
@@ -98,8 +94,6 @@ def parse_args(argv: list[str]) -> dict:
         "reason": None,
         "deliverables": [],
         "force": False,
-        "cascade": False,
-        "dry_run": None,
         "json_output": False,
     }
     positionals: list[str] = []
@@ -116,7 +110,9 @@ def parse_args(argv: list[str]) -> dict:
             try:
                 args["doc_id"] = int(argv[i])
             except ValueError:
-                raise SystemExit(f"Error: --doc-id must be an integer, got {argv[i]!r}.") from None
+                raise SystemExit(
+                    f"Error: --doc-id must be an integer, got {argv[i]!r}."
+                )
         elif a == "--instance-id":
             i += 1
             if i >= len(argv):
@@ -129,12 +125,6 @@ def parse_args(argv: list[str]) -> dict:
             args["deliverables"].append(argv[i])
         elif a == "--force":
             args["force"] = True
-        elif a == "--cascade":
-            args["cascade"] = True
-        elif a == "--dry-run":
-            args["dry_run"] = True
-        elif a == "--execute":
-            args["dry_run"] = False
         elif a == "--json":
             args["json_output"] = True
         elif a.startswith("-"):
@@ -147,8 +137,6 @@ def parse_args(argv: list[str]) -> dict:
     args["reason"] = " ".join(positionals).strip()
     if not args["reason"]:
         raise SystemExit("Error: reason is empty.")
-    if args["dry_run"] is not None and not args["cascade"]:
-        raise SystemExit("Error: --dry-run/--execute require --cascade.")
     return args
 
 
@@ -169,11 +157,9 @@ def main() -> int:
         "deliverables": args["deliverables"],
         "force": args["force"],
     }
-    if args["cascade"]:
-        payload["cascade"] = True
-        if args["dry_run"] is not None:
-            payload["dry_run"] = args["dry_run"]
-    status_code, body = http_post(f"/api/session-docs/{doc_id}/victory-ack", payload)
+    status_code, body = http_post(
+        f"/api/session-docs/{doc_id}/victory-ack", payload
+    )
     if args["json_output"]:
         print(json.dumps({"status_code": status_code, "body": body}, indent=2))
         return 0 if status_code < 400 else 1
@@ -199,25 +185,6 @@ def main() -> int:
         print(f"victory-ack [FORCED]: {surface} — {args['reason']}")
     else:
         print(f"victory-ack: {surface} — {args['reason']}")
-    if body.get("dry_run"):
-        plan = body.get("cascade") or {}
-        print("  DRY-RUN: no changes made.")
-        print(f"  worktrees: {len(plan.get('worktrees') or [])}")
-        print(f"  linked instances: {len(plan.get('linked_instances') or [])}")
-        print(f"  live instances: {len(plan.get('live_instances') or [])}")
-        for warning in plan.get("warnings") or []:
-            print(f"  WARNING: {warning}")
-        for action in plan.get("actions") or []:
-            print(f"  branch {action.get('branch')} @ {action.get('path')}")
-            if action.get("port") not in (None, ""):
-                print(f"    dev port: {action.get('port')}")
-            print("    deletes: local branch + remote branch via worktree-delete --delete-remote")
-            for command in action.get("commands") or []:
-                print("    would run: " + " ".join(command))
-        for skipped in plan.get("skipped") or []:
-            wt = skipped.get("worktree") or {}
-            print(f"  skipped {wt.get('branch') or wt.get('path')}: {skipped.get('reason')}")
-        return 0
     if archived:
         print("  session doc archived.")
     if linked:

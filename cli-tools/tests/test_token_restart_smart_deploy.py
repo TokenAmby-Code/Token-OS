@@ -12,7 +12,6 @@ which must fall back to a full restart of the standard set.
 from __future__ import annotations
 
 import os
-import stat
 import subprocess
 from pathlib import Path
 
@@ -106,31 +105,12 @@ exit 0
     git = stub_bin / "git"
     git.write_text(
         r"""#!/usr/bin/env bash
-git_cwd=""
-if [[ "$1" == "-C" ]]; then git_cwd="$2"; shift 2; fi
+if [[ "$1" == "-C" ]]; then shift 2; fi
 if [[ "$1" == --git-dir=* ]]; then shift; fi
 if [[ "$1" == "--git-dir" ]]; then shift 2; fi
 sub="$1"; shift || true
-if [[ "$sub" == "status" && "${STUB_DIRTY_RUNTIME:-}" == "1" ]]; then
-  echo " M token-api/main.py"
-  exit 0
-fi
-if [[ "${STUB_REQUIRE_RUNTIME_WRITABLE:-}" == "1" && ( "$sub" == "fetch" || "$sub" == "checkout" ) && -n "$git_cwd" ]]; then
-  if [[ ! -w "$git_cwd/.git" ]]; then
-    echo "runtime git dir is locked during $sub" >&2
-    exit 77
-  fi
-fi
 case "$sub" in
   fetch|stash|update-ref|checkout|cat-file) exit 0 ;;
-  show-ref)
-    # Only the shunt's wip/live-dirty-* refs are reported absent (so the
-    # uniqueness loop terminates); any other ref-existence check is unaffected.
-    case "$*" in
-      *wip/live-dirty-*) exit 1 ;;
-      *) exit 0 ;;
-    esac
-    ;;
   status) exit 0 ;;
   merge-base)
     if [[ "${MERGE_FAIL_TIMES:-0}" != "0" ]]; then
@@ -324,55 +304,29 @@ def test_bare_main_non_ff_aborts_without_restart(tmp_path: Path) -> None:
     assert KICK_DISCORD not in calls
 
 
-def test_dirty_runtime_shunts_then_restarts_changed_service(tmp_path: Path) -> None:
-    """New invariant: a dirty runtime NEVER blocks the deploy. The stub reports a
-    dirty `git status` (STUB_DIRTY_RUNTIME=1); token-restart must auto-preserve the
-    WIP to a wip/live-dirty-<ts> branch and STILL advance + restart the changed
-    service rather than aborting. (Replaces the old #280 dirty-tree-abort.) The
-    real branch-create/commit/push mechanics are covered against real git in
-    test_token_restart_runtime_reconcile.py."""
+def test_dirty_runtime_checkout_aborts_without_restart(tmp_path: Path) -> None:
     env, logfile = _stub_env(tmp_path, "token-api/main.py")
     env["STUB_DIRTY_RUNTIME"] = "1"
-    proc = _run(env)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "auto-preserving WIP to wip/live-dirty-" in proc.stdout
-    calls = logfile.read_text()
-    assert KICK_TOKENAPI in calls
-    assert KICK_DISCORD not in calls
-
-
-def _has_any_write_bit(path: Path) -> bool:
-    return bool(path.lstat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-
-
-def test_locked_runtime_is_unlocked_for_git_sync_then_relocked(tmp_path: Path) -> None:
-    env, logfile = _stub_env(tmp_path, "token-api/main.py")
-    runtime = Path(env["CD_LIVE_CHECKOUT"])
-    git_dir = runtime / ".git"
-
-    # Match production: deploy-owned runtime starts FS-locked, including .git.
-    subprocess.run(
-        [
-            str(Path(__file__).resolve().parents[1] / "scripts" / "runtime-write-protect.sh"),
-            "lock",
-            str(runtime),
-        ],
-        check=True,
-        text=True,
-        capture_output=True,
+    # Replace git stub with a small wrapper that reports dirty status, delegating
+    # all other commands to the generated stub body is overkill; status alone is
+    # enough to force the hard-fail path before checkout/restarts.
+    git_path = Path(env["PATH"].split(":", 1)[0]) / "git"
+    old = git_path.read_text()
+    git_path.write_text(
+        old.replace(
+            'sub="$1"; shift || true\ncase "$sub" in',
+            'sub="$1"; shift || true\n'
+            'if [[ "$sub" == "status" && "${STUB_DIRTY_RUNTIME:-}" == "1" ]]; then '
+            'echo " M token-api/main.py"; exit 0; fi\n'
+            'case "$sub" in',
+        )
     )
-    assert not _has_any_write_bit(git_dir)
-
-    # The git stub fails fetch/checkout unless token-restart lifted the lock first.
-    env["STUB_REQUIRE_RUNTIME_WRITABLE"] = "1"
     proc = _run(env)
-
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "runtime advanced" in proc.stdout
-    assert "runtime write-protected" in proc.stdout
-    assert not _has_any_write_bit(runtime)
-    assert not _has_any_write_bit(git_dir)
-    assert KICK_TOKENAPI in logfile.read_text()
+    assert proc.returncode != 0
+    assert "runtime checkout is dirty" in proc.stdout
+    calls = logfile.read_text()
+    assert KICK_TOKENAPI not in calls
+    assert KICK_DISCORD not in calls
 
 
 def test_cd_bare_repo_config_is_distinct_from_worktree_bare_repo(tmp_path: Path) -> None:

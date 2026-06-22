@@ -89,12 +89,11 @@ PENDING_UI_FLUSH=$(_resolve_token_os_bin pending-ui-flush) || true
 
 # Inject shell environment variables for device detection, primarch identity,
 # and structured dispatch metadata from launcher wrappers.
-if [[ -n "${SSH_CLIENT:-}" || -n "${TMUX:-}" || -n "${TMUX_PANE:-}" || -n "${TOKEN_API_PANE_LABEL:-}" || -n "${TOKEN_API_PERSONA:-}" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_PARENT_INSTANCE_ID:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" || -n "${TOKEN_API_INSTANCE_TYPE:-}" || -n "${TOKEN_API_ZEALOTRY:-}" || -n "${TOKEN_API_DISCORD_HOSTED:-}" || -n "${TOKEN_API_DISCORD_CHANNEL:-}" || -n "${TOKEN_API_DISCORD_BOT:-}" || -n "${TOKEN_API_DISPATCH_MCP:-}" || -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" || -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" || -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]]; then
+if [[ -n "${SSH_CLIENT:-}" || -n "${TMUX:-}" || -n "${TMUX_PANE:-}" || -n "${TOKEN_API_PERSONA:-}" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_PARENT_INSTANCE_ID:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" || -n "${TOKEN_API_INSTANCE_TYPE:-}" || -n "${TOKEN_API_ZEALOTRY:-}" || -n "${TOKEN_API_DISCORD_HOSTED:-}" || -n "${TOKEN_API_DISCORD_CHANNEL:-}" || -n "${TOKEN_API_DISCORD_BOT:-}" || -n "${TOKEN_API_DISPATCH_MCP:-}" || -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" || -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" || -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]]; then
   JQ_FILTER=".env //= {} | .env"
   [[ -n "${SSH_CLIENT:-}" ]] && JQ_FILTER="$JQ_FILTER + {SSH_CLIENT: \$ssh}"
   [[ -n "${TMUX:-}" ]] && JQ_FILTER="$JQ_FILTER + {TMUX: \$tmux}"
   [[ -n "${TMUX_PANE:-}" ]] && JQ_FILTER="$JQ_FILTER + {TMUX_PANE: \$tmux_pane}"
-  [[ -n "${TOKEN_API_PANE_LABEL:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_PANE_LABEL: \$pane_label}"
   [[ -n "${TOKEN_API_PERSONA:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_PERSONA: \$persona}"
   [[ -n "${TOKEN_API_LAUNCHER:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_LAUNCHER: \$launcher}"
   [[ -n "${TOKEN_API_ENGINE:-}" ]] && JQ_FILTER="$JQ_FILTER + {TOKEN_API_ENGINE: \$engine}"
@@ -123,7 +122,6 @@ if [[ -n "${SSH_CLIENT:-}" || -n "${TMUX:-}" || -n "${TMUX_PANE:-}" || -n "${TOK
     --arg ssh "${SSH_CLIENT:-}" \
     --arg tmux "${TMUX:-}" \
     --arg tmux_pane "${TMUX_PANE:-}" \
-    --arg pane_label "${TOKEN_API_PANE_LABEL:-}" \
     --arg persona "${TOKEN_API_PERSONA:-}" \
     --arg launcher "${TOKEN_API_LAUNCHER:-}" \
     --arg engine "${TOKEN_API_ENGINE:-}" \

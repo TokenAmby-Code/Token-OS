@@ -146,49 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
     )
 
-    clear_runtime_parser = subparsers.add_parser(
-        "clear-runtime",
-        help="Clear pane runtime stamps plus tint/style/close overlays atomically.",
-    )
-    clear_runtime_parser.add_argument("--pane", required=True)
-
-    close_pane_parser = subparsers.add_parser(
-        "close-pane",
-        help="Close a live agent pane through the tmux-owned close primitive.",
-    )
-    close_pane_parser.add_argument("--pane", required=True)
-    close_pane_parser.add_argument("--timeout", type=float, default=3.0)
-
-    close_parser = subparsers.add_parser(
-        "close",
-        help="Close an instance: Token-API lifecycle + tmuxctl pane close.",
-    )
-    close_parser.add_argument("--instance-id", required=True)
-    close_parser.add_argument(
-        "--lifecycle",
-        default="retire",
-        choices=["retire", "archive-session-doc", "banish"],
-    )
-    close_parser.add_argument("--mode", default="now", choices=["now", "after-stop"])
-    close_parser.add_argument("--pane", default="")
-    close_parser.add_argument("--timeout", type=float, default=3.0)
-
     send_text_parser = subparsers.add_parser("send-text")
     send_text_parser.add_argument("--pane", required=True)
     text_source = send_text_parser.add_mutually_exclusive_group(required=True)
     text_source.add_argument("--text")
     text_source.add_argument("--stdin", action="store_true")
     send_text_parser.add_argument("--clear-prompt", action="store_true")
-    send_text_parser.add_argument(
-        "--no-submit",
-        action="store_true",
-        help=(
-            "Insert the text as a DRAFT at the prompt — no C-m, no submit. Routes "
-            "through the insert-only primitive (insert_text) instead of "
-            "send_text_then_submit, so it can never auto-submit over a human's "
-            "draft. Mutually exclusive with --clear-prompt."
-        ),
-    )
 
     invoke_skill_parser = subparsers.add_parser(
         "invoke-skill",
@@ -537,48 +500,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(doc.get("pane_label") or control.cardinal_pane_label(args.pane))
             return 0
 
-        if args.command == "clear-runtime":
-            import json
-
-            from .close import clear_runtime
-
-            print(json.dumps(clear_runtime(control.adapter, args.pane), sort_keys=True))
-            return 0
-
-        if args.command == "close-pane":
-            import json
-
-            from .close import close_pane
-
-            result = close_pane(control.adapter, args.pane, timeout=args.timeout)
-            print(json.dumps(result, sort_keys=True))
-            return 0 if result.get("status") in {"closed", "already_closed"} else 1
-
-        if args.command == "close":
-            import json
-
-            from .close import close_instance
-
-            result = close_instance(
-                control.adapter,
-                args.instance_id,
-                lifecycle=args.lifecycle,
-                mode=args.mode,
-                pane=args.pane or None,
-                timeout=args.timeout,
-            )
-            print(json.dumps(result, sort_keys=True))
-            return 0 if result.get("status") not in {"failed", "refused"} else 1
-
         if args.command == "send-text":
             import json as _json
 
             from .assertions import assert_instance
-
-            if args.no_submit and args.clear_prompt:
-                raise ValueError(
-                    "--no-submit is insert-only and cannot be combined with --clear-prompt"
-                )
 
             assertion = assert_instance(control.adapter, args.pane)
             if not assertion.get("ok"):
@@ -599,19 +524,11 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
             text = sys.stdin.read() if args.stdin else args.text
-            if args.no_submit:
-                # Draft mode: insert the literal text at the prompt and STOP. No
-                # C-m is ever issued, so this can never auto-submit over a human's
-                # in-progress draft — the insert path is the only attended-safe way
-                # to land text in a pane. (send_text_then_submit keeps its
-                # double-C-m submit semantics for the normal path.)
-                control.insert_text(args.pane, text)
-            else:
-                control.adapter.send_text_then_submit(
-                    args.pane,
-                    text,
-                    clear_prompt=args.clear_prompt,
-                )
+            control.adapter.send_text_then_submit(
+                args.pane,
+                text,
+                clear_prompt=args.clear_prompt,
+            )
             return 0
 
         if args.command == "invoke-skill":

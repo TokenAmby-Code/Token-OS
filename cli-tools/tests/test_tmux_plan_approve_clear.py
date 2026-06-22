@@ -52,109 +52,6 @@ def test_codex_current_plan_modal_sends_option_two_sequence(tmp_path: pathlib.Pa
     assert out == "action=codex option-2 Down Enter"
 
 
-def test_codex_current_plan_modal_aborts_when_cursor_already_on_clear_context(
-    tmp_path: pathlib.Path,
-):
-    fixture = tmp_path / "codex-current-on-option2.txt"
-    fixture.write_text(
-        "Implement this plan?\n\n"
-        "  1. Yes, implement this plan          Switch to Default\n"
-        "› 2. Yes, clear context and implement  Fresh thread.\n"
-        "  3. No, stay in Plan mode             Continue planning\n"
-    )
-    out = subprocess.check_output(
-        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
-        text=True,
-    ).strip()
-    assert out == "action=none timeout"
-
-
-def test_codex_current_plan_modal_aborts_when_option_down_is_not_clear_context(
-    tmp_path: pathlib.Path,
-):
-    fixture = tmp_path / "codex-current-option2-not-clear.txt"
-    fixture.write_text(
-        "Implement this plan?\n\n"
-        "› 1. Yes, implement this plan          Switch to Default\n"
-        "  2. Yes, implement without clearing   Keep context.\n"
-        "  3. Yes, clear context and implement  Fresh thread.\n"
-    )
-    out = subprocess.check_output(
-        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
-        text=True,
-    ).strip()
-    assert out == "action=none timeout"
-
-
-def test_claude_ignores_stale_scrollback_modal_above_live_clear_context(
-    tmp_path: pathlib.Path,
-) -> None:
-    # capture() reads -S -80, so a stale cursor-marked modal from a prior session
-    # (here an "Exit anyway / Stay" prompt) can sit in scrollback ABOVE the live
-    # clear-context modal. Anchoring on the FIRST cursor option used to pick the
-    # stale "Exit anyway" line (no "clear context") -> classify "none" -> the modal
-    # stuck and forced manual approval. The live modal is always at the bottom, so
-    # we anchor on the LAST cursor option and must still send Enter.
-    fixture = tmp_path / "claude-scrollback.txt"
-    fixture.write_text(
-        "  ❯ 1. Exit anyway\n"
-        "    2. Stay\n"
-        "\n"
-        "tokenclaw@host ~ % claude\n"
-        "\n"
-        " Claude has written up a plan and is ready to execute. Would you\n"
-        " like to proceed?\n"
-        "\n"
-        " ❯1.Yes, clear context (3% used) and\n"
-        "    bypass permissions\n"
-        "   2. Yes, and bypass permissions\n"
-        "   3. Yes, manually approve edits\n"
-    )
-    out = subprocess.check_output(
-        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "claude", "--dry-run"],
-        text=True,
-    ).strip()
-    assert out == "action=claude option-1 Enter"
-
-
-def test_codex_ignores_stale_scrollback_modal_above_live_modal(
-    tmp_path: pathlib.Path,
-) -> None:
-    # Same scrollback-shadow hazard for the Codex two-step: a stale top modal must
-    # not capture the cursor anchor. The live modal's cursor sits on option 1 and
-    # clear-context is one Down -> Down,Enter.
-    fixture = tmp_path / "codex-scrollback.txt"
-    fixture.write_text(
-        "  ❯ 1. Exit anyway\n"
-        "    2. Stay\n"
-        "\n"
-        "Implement this plan?\n"
-        "\n"
-        "› 1. Yes, implement this plan          Switch to Default\n"
-        "  2. Yes, clear context and implement  Fresh thread.\n"
-        "  3. No, stay in Plan mode             Continue planning\n"
-    )
-    out = subprocess.check_output(
-        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
-        text=True,
-    ).strip()
-    assert out == "action=codex option-2 Down Enter"
-
-
-def test_single_flight_lock_aborts_overlapping_watcher(tmp_path: pathlib.Path):
-    safe = "%99".replace("%", "_")
-    root = tmp_path / "tmux-plan-approve-clear"
-    (root / f"{safe}.lockd").mkdir(parents=True)
-    env = os.environ.copy()
-    env["TMPDIR"] = str(tmp_path)
-    out = subprocess.check_output(
-        [str(SCRIPT), "--pane", "%99", "--agent", "codex", "--dry-run"],
-        text=True,
-        env=env,
-    ).strip()
-    assert out == "action=none locked"
-
-
 def test_successful_click_leaves_state_for_session_start(tmp_path):
     fixture = tmp_path / "pane.txt"
     fixture.write_text(
@@ -184,7 +81,6 @@ def test_successful_click_leaves_state_for_session_start(tmp_path):
 
     env = os.environ.copy()
     env["PATH"] = f"{fakebin}:{env['PATH']}"
-    env["TOKEN_API_TMUX_BIN"] = str(fakebin / "tmux")
     env["TOKEN_API_URL"] = "http://token-api.test"
     subprocess.check_call(
         [str(SCRIPT), "--pane", "%99", "--agent", "codex", "--timeout", "1"],
@@ -211,12 +107,9 @@ def test_dry_run_reads_state_and_reports_not_planning(tmp_path: pathlib.Path) ->
         "exit 0\n"
     )
     (fakebin / "curl").chmod(0o755)
-    (fakebin / "tmux").write_text("#!/usr/bin/env bash\nexit 0\n")
-    (fakebin / "tmux").chmod(0o755)
 
     env = os.environ.copy()
     env["PATH"] = f"{fakebin}:{env['PATH']}"
-    env["TOKEN_API_TMUX_BIN"] = str(fakebin / "tmux")
     env["TOKEN_API_URL"] = "http://token-api.test"
     out = subprocess.check_output(
         [str(SCRIPT), "--pane", "%99", "--agent", "claude", "--dry-run"],
@@ -234,29 +127,3 @@ def test_non_clear_context_modal_sends_nothing(tmp_path):
         text=True,
     ).strip()
     assert out == "action=none timeout"
-
-
-def test_codex_truncated_current_plan_modal_accepts_fresh_thread_option(
-    tmp_path: pathlib.Path,
-) -> None:
-    fixture = tmp_path / "codex-truncated-current.txt"
-    fixture.write_text(
-        "Implement this plan?\n\n"
-        "› 1. Yes, implement t… Switch to\n"
-        "                       Default and\n"
-        "                       start\n"
-        "                       coding.\n"
-        "  2. Yes, clear conte… Fresh\n"
-        "                       thread.\n"
-        "                       Context: 6%\n"
-        "                       used.\n"
-        "  3. No, stay in Plan… Continue\n"
-        "                       planning\n"
-        "                       with the\n"
-        "                       model.\n"
-    )
-    out = subprocess.check_output(
-        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
-        text=True,
-    ).strip()
-    assert out == "action=codex option-2 Down Enter"

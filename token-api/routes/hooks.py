@@ -32,7 +32,6 @@ from pydantic import BaseModel
 import shared
 import talk as talk_service
 from enforcement_service import close_distraction_windows
-from instance_lifecycle import apply_instance_lifecycle, normalize_instance_lifecycle
 from instance_mutation import (
     _fetch_instance_row,
     create_golden_throne_binding,
@@ -50,7 +49,6 @@ from questions_gate import trials_clear
 from routes.tts import dispatch_notify, play_sound, queue_tts
 from session_doc_helpers import (
     _update_doc_agents_list,
-    create_deferred_interactive_session_doc,
     read_frontmatter,
     resolve_session_doc_for_start,
     update_frontmatter,
@@ -113,61 +111,6 @@ async def _launch_golden_throne_marker(
 
 def _tmuxctl_bin() -> Path:
     return Path(__file__).resolve().parents[2] / "cli-tools" / "bin" / "tmuxctl"
-
-
-def _dev_server_stop_bin() -> Path:
-    return Path(__file__).resolve().parents[2] / "cli-tools" / "bin" / "dev-server-stop"
-
-
-def _is_dev_worktree_dir(working_dir: str | None) -> bool:
-    if not working_dir:
-        return False
-    try:
-        path = Path(working_dir).expanduser().resolve(strict=False)
-        worktrees_root = (Path.home() / "worktrees").resolve(strict=False)
-        rel = path.relative_to(worktrees_root)
-    except Exception:
-        return False
-    return len(rel.parts) == 2 and rel.parts[-1].startswith("wt-")
-
-
-def _spawn_dev_server_stop(working_dir: str | None, session_id: str) -> None:
-    """Stop this closing dev worktree's own token-api listener out-of-band."""
-    if not _is_dev_worktree_dir(working_dir):
-        return
-    dev_server_stop = _dev_server_stop_bin()
-    if not dev_server_stop.exists():
-        logger.warning("Hook: dev-server-stop skipped for %s — helper not found", working_dir)
-        return
-    log_path = Path("/tmp/dev-server-stop.log")
-    log_handle = None
-    try:
-        log_handle = log_path.open("a")
-        subprocess.Popen(
-            [str(dev_server_stop), str(working_dir)],
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=log_handle,
-            start_new_session=True,
-            close_fds=True,
-        )
-        logger.info(
-            "Hook: SessionEnd spawned dev-server-stop for %s (%s)",
-            working_dir,
-            session_id[:12],
-        )
-    except Exception as exc:
-        logger.warning(
-            "Hook: SessionEnd failed to spawn dev-server-stop for %s: %s",
-            working_dir,
-            exc,
-        )
-    finally:
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except Exception:
-                pass
 
 
 def _spawn_session_end_assertion(tmux_pane: str, session_id: str) -> None:
@@ -1952,27 +1895,43 @@ async def _close_tmux_pane_for_mark(pane: str | None) -> dict:
     pane = _normalize_text(pane)
     if not pane:
         return {"status": "skipped", "reason": "no_pane"}
+    stack_window = None
     try:
+        role = await _tmux_show_pane_option(pane, "@PANE_ID")
+        if role in PROTECTED_MARK_FOR_CLOSE_PANE_IDS:
+            return {"status": "refused", "reason": "static_persona_pane", "pane_role": role}
+        if not await _tmux_pane_exists(pane):
+            return {"status": "already_closed"}
+        stack_window = await _tmux_pane_stack_window(pane)
+        await _cleanup_tmux_pane_cosmetic(pane)
+        for _ in range(3):
+            await _run_subprocess_offloop(
+                ("tmux", "send-keys", "-t", pane, "C-c"),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                timeout=2,
+            )
+            await asyncio.sleep(0.2)
+        for _ in range(6):
+            if not await _tmux_pane_exists(pane):
+                await _cleanup_tmux_pane_runtime_stamps(pane)
+                _spawn_stack_enforce(stack_window)
+                return {"status": "closed", "pane": pane, "method": "graceful"}
+            await asyncio.sleep(0.5)
         proc = await _run_subprocess_offloop(
-            (str(_tmuxctl_bin()), "close-pane", "--pane", pane),
+            ("tmux", "kill-pane", "-t", pane),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            timeout=15,
+            timeout=3,
         )
-        stdout = proc.stdout.decode(errors="ignore").strip()
-        if stdout:
-            try:
-                payload = json.loads(stdout)
-                if isinstance(payload, dict):
-                    return payload
-            except json.JSONDecodeError:
-                pass
         if proc.returncode != 0:
             return {
                 "status": "failed",
-                "error": proc.stderr.decode(errors="ignore").strip() or "tmuxctl close-pane failed",
+                "error": proc.stderr.decode(errors="ignore").strip() or "tmux kill-pane failed",
             }
-        return {"status": "closed", "pane": pane, "method": "tmuxctl"}
+        await _cleanup_tmux_pane_runtime_stamps(pane)
+        _spawn_stack_enforce(stack_window)
+        return {"status": "closed", "pane": pane, "method": "kill-pane"}
     except Exception as exc:  # noqa: BLE001
         return {"status": "failed", "error": str(exc)}
 
@@ -1993,30 +1952,65 @@ async def _apply_mark_for_close_lifecycle(
     instance_id: str,
     lifecycle: str,
 ) -> dict:
-    raw_lifecycle = (lifecycle or "retire").strip().lower()
-    lifecycle = normalize_instance_lifecycle(raw_lifecycle)
-    if lifecycle not in {"retire", "archive-session-doc", "banish"}:
-        return {"status": "failed", "reason": "unsupported_lifecycle", "lifecycle": raw_lifecycle}
+    lifecycle = (lifecycle or "retire").strip().lower()
+    if lifecycle in {"archive", "archive-doc", "archive-session-doc", "retire-and-archive"}:
+        lifecycle = "archive-session-doc"
+    elif lifecycle in {"retire", "retire-only"}:
+        lifecycle = "retire"
+    else:
+        return {"status": "failed", "reason": "unsupported_lifecycle", "lifecycle": lifecycle}
 
-    result = await apply_instance_lifecycle(
+    cursor = await db.execute(
+        "SELECT id, session_doc_id FROM instances WHERE id = ?",
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return {"status": "failed", "reason": "instance_not_found"}
+
+    now = datetime.now().isoformat()
+    doc_id = row[1]
+    doc_path_text = None
+    if lifecycle == "archive-session-doc" and doc_id:
+        cursor = await db.execute(
+            "SELECT file_path FROM session_documents WHERE id = ?",
+            (doc_id,),
+        )
+        doc_row = await cursor.fetchone()
+        if not doc_row:
+            return {
+                "status": "failed",
+                "reason": "session_doc_not_found",
+                "session_doc_id": doc_id,
+            }
+        doc_path_text = doc_row[0]
+        await db.execute(
+            "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
+            (now, doc_id),
+        )
+        doc_path = _resolve_session_doc_path(doc_path_text)
+        if doc_path and doc_path.exists():
+            try:
+                await asyncio.to_thread(update_frontmatter, doc_path, {"status": "archived"})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("mark-for-close frontmatter update failed for %s: %s", doc_path, exc)
+
+    status = "archived" if lifecycle == "archive-session-doc" else "stopped"
+    await sanctioned_update_instance(
         db,
-        write_source="hooks",
         instance_id=instance_id,
-        lifecycle=lifecycle,
+        updates={
+            "rank": "retired",
+            "status": status,
+            "input_lock": None,
+            "stopped_at": now,
+            "golden_throne": None,
+        },
+        mutation_type="instance_archived" if status == "archived" else "instance_retired",
+        write_source="hooks",
         actor="mark-for-close",
     )
-    if result.get("status") == "failed":
-        return result
-    payload = {
-        "status": result.get("status"),
-        "session_doc_id": result.get("session_doc_id"),
-        "lifecycle": lifecycle,
-    }
-    if lifecycle in {"retire", "archive-session-doc"}:
-        payload["rank"] = "retired"
-    if lifecycle == "banish":
-        payload["persona"] = result.get("persona")
-    return payload
+    return {"status": status, "rank": "retired", "session_doc_id": doc_id, "lifecycle": lifecycle}
 
 
 async def _execute_close_pane_stop_subscription(db, *, subscription: dict) -> dict:
@@ -3762,16 +3756,6 @@ async def handle_session_start(payload: dict) -> dict:
                     "dispatch_session_doc_path": dispatch_session_doc_path,
                 },
             )
-        elif session_doc_id is None and resolved_session_doc_policy == "interactive_deferred":
-            # Genuine interactive pane: no doc minted at SessionStart. Surface the
-            # deferral so a fleet of opened-but-un-named panes stays observable; the
-            # placeholder is minted lazily on the first prompt (handle_prompt_submit).
-            await log_event(
-                "session_doc_deferred",
-                instance_id=session_id,
-                device_id=device_id,
-                details={"launcher": launcher, "origin_type": origin_type},
-            )
         workflow_state = _derive_launch_workflow_state(
             dispatch_target=dispatch_target,
             engine=engine,
@@ -3821,15 +3805,15 @@ async def handle_session_start(payload: dict) -> dict:
 
         # Restore prior legion if no auto-detect, or apply auto-detect. The legacy
         # legion column died into persona_id: resolve the legion name to a persona
-        # slug (LEGACY_PERSONA_ALIASES) and bind it where the legion has an
-        # identity persona. ``civic`` is only a context/legion label for generic
-        # Pax-ENV workers: it must NOT clear the astartes persona assigned during
-        # registration, because that row owns the worker's chip/TTS voice lock.
-        # Civic singleton panes still override below through PERSONA_PANE_IDENTITY
-        # (primarch=pax/orchestrator).
+        # slug (LEGACY_PERSONA_ALIASES) and bind/clear persona_id accordingly.
         if auto_legion:
             legion_updates = {}
-            if auto_legion != "civic":
+            if auto_legion == "civic":
+                # Civic/Pax launches have no persona tint authority: clear the
+                # persona assignment so tint resolution falls through to tmux
+                # default instead of an old civic-green or arbitrary chapter colour.
+                legion_updates["persona_id"] = None
+            else:
                 # Persona panes bind persona_id by primarch, not legion: a seat in
                 # a shared legion (Malcador in astartes, Administratum in
                 # mechanicus) is invisible to a legion-keyed lookup, leaving the
@@ -4036,10 +4020,7 @@ async def handle_session_end(payload: dict) -> dict:
             """SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id,
                       tmux_pane,
                       (SELECT slug FROM personas WHERE id = instances.persona_id) AS legion,
-                      workflow_state, pane_label, golden_throne, status, rank,
-                      engine, COALESCE(hook_driven, 0),
-                      origin_type, commander_type, dispatch_session_doc_path,
-                      COALESCE(automated, 0), persona_id, working_dir
+                      workflow_state, pane_label, golden_throne, status, rank
                FROM instances WHERE id = ?""",
             (session_id,),
         )
@@ -4062,28 +4043,6 @@ async def handle_session_end(payload: dict) -> dict:
         _gt_marker = row[8]
         _existing_status = row[9]
         _existing_rank = row[10]
-        _engine = row[11] if len(row) > 11 else _normalize_text(payload.get("engine") or "")
-        _hook_driven = row[12] if len(row) > 12 else 0
-        _payload_instance_type = _normalize_text(
-            payload.get("instance_type")
-            or payload.get("env", {}).get("TOKEN_API_INSTANCE_TYPE", "")
-        )
-        _normalized_engine = _normalize_text(_engine or payload.get("engine") or "")
-        _has_payload_instance_type = bool(_payload_instance_type)
-        _is_codex_completed_one_off = (_normalized_engine == "codex") and (
-            _payload_instance_type == "one_off"
-            or (
-                not _has_payload_instance_type
-                and _gt_marker is None
-                and int(_hook_driven or 0) == 0
-            )
-        )
-        _origin_type = row[13]
-        _commander_type = row[14]
-        _dispatch_session_doc_path = row[15]
-        _automated = row[16]
-        _persona_id = row[17]
-        _working_dir = row[18] if len(row) > 18 else None
 
         # Layer 1 — non-terminal SessionEnd short-circuit (in-wrapper re-fire).
         # plan-accept / `/clear` / compaction fire SessionEnd→SessionStart inside
@@ -4174,36 +4133,8 @@ async def handle_session_end(payload: dict) -> dict:
             "next_required_action": None,
             "next_action_owner": None,
         }
-        # Never-acted interactive pane: a genuine top-level human pane that closed
-        # without ever sending a prompt. The first prompt is what BOTH flips the
-        # row to `working` AND lazily mints its doc, so "never acted" is precisely
-        # `status == 'idle'` (still in its registration status) AND
-        # `session_doc_id IS NULL`. A pane that ever worked is `working`/has a doc
-        # and is excluded. Leaving such a ghost `stopped` accumulates an empty
-        # orphan row; soft-archive instead (status='archived', rank='retired' —
-        # required by the db_schema CHECK) so it drops out of active counts / the
-        # ops cockpit with no doc and no pollution, while the append-only
-        # instance_mutations provenance log is preserved (vs a hard DELETE).
-        never_acted_interactive = (
-            session_doc_id is None
-            and _existing_status == "idle"
-            and _row_is_genuine_interactive(
-                origin_type=_origin_type,
-                commander_type=_commander_type,
-                persona_id=_persona_id,
-                is_subagent=is_subagent,
-                dispatch_session_doc_path=_dispatch_session_doc_path,
-                automated=_automated,
-                golden_throne=_gt_marker,
-            )
-        )
         if _existing_status != "archived":
-            if never_acted_interactive:
-                session_end_updates["status"] = "archived"
-                session_end_updates["archived_at"] = now
-                session_end_updates["rank"] = "retired"
-            else:
-                session_end_updates["status"] = "stopped"
+            session_end_updates["status"] = "stopped"
         # Legacy `synced=0` cleared the morning-session sync flag. Its durable home is the
         # golden_throne marker: clear it ONLY when it is the 'sync' sentinel — a real
         # golden_throne.id binding survives the session ending.
@@ -4222,18 +4153,6 @@ async def handle_session_end(payload: dict) -> dict:
 
         await db.commit()
 
-        if never_acted_interactive:
-            await log_event(
-                "instance_never_acted_reaped",
-                instance_id=session_id,
-                device_id=row[1],
-                details={
-                    "reason": end_reason,
-                    "soft_archived": True,
-                    "source": "session_end",
-                },
-            )
-
         # Terminal SessionEnd is a harness-neutral chance to catch unnamed panes
         # before close-time assertions/cleanup can clear runtime pane stamps.
         _schedule_naming_nudge(session_id, "SessionEnd")
@@ -4249,21 +4168,10 @@ async def handle_session_end(payload: dict) -> dict:
             )
 
         # Close-time pane cleanup is centralized through tmuxctl assertion:
-        # persona panes launch/reactivate/recolor (identity mismatches are
-        # diagnosed, not in-band patched), dead stack workers prune, and failed
+        # persona panes self-heal/recolor, dead stack workers prune, and failed
         # assertions clear stale overlays. Spawn bounded work out-of-band so the
         # hook response is not held hostage by a relaunch.
-        if _is_codex_completed_one_off:
-            logger.info(
-                "Hook: SessionEnd preserving Codex one-off pane stamp for %s (%s)",
-                _stop_pane_label or _stop_pane,
-                session_id[:12],
-            )
-        else:
-            _spawn_session_end_assertion(_stop_pane_label or _stop_pane, session_id)
-
-        if not is_subagent:
-            _spawn_dev_server_stop(_working_dir, session_id)
+        _spawn_session_end_assertion(_stop_pane_label or _stop_pane, session_id)
 
         # Check remaining active instances
         cursor = await db.execute(
@@ -4540,36 +4448,6 @@ async def _transcript_indicates_plan_mode(payload: dict) -> bool:
     return await asyncio.to_thread(_transcript_indicates_plan_mode_sync, payload)
 
 
-def _row_is_genuine_interactive(
-    *,
-    origin_type,
-    commander_type,
-    persona_id,
-    is_subagent,
-    dispatch_session_doc_path,
-    automated,
-    golden_throne,
-) -> bool:
-    """True when an instance row is a genuine top-level interactive human session.
-
-    Mirrors the SessionStart precedence in ``resolve_session_doc_for_start``: not
-    a subagent, not cron/dispatch, no explicit dispatch doc, no persona/legion,
-    emperor-commanded, not automated, no golden-throne binding. Gates both the
-    deferred-doc lazy mint (first prompt) and the never-acted reap (SessionEnd),
-    so a dispatched worker whose doc legitimately resolved to NULL
-    (``unresolved_dispatch``) is never mistaken for an un-named human pane.
-    """
-    return (
-        (origin_type or "local") not in ("cron", "dispatch")
-        and (commander_type or "emperor") == "emperor"
-        and not persona_id
-        and not is_subagent
-        and not dispatch_session_doc_path
-        and not automated
-        and not golden_throne
-    )
-
-
 async def handle_prompt_submit(payload: dict) -> dict:
     """Handle UserPromptSubmit hook - mark instance as processing."""
     session_id = payload.get("session_id")
@@ -4656,51 +4534,21 @@ async def handle_prompt_submit(payload: dict) -> dict:
                 actor="PromptSubmit",
             )
 
-        # Deferred interactive session doc: the first real prompt is what proves
-        # the pane is a genuine working session, so mint the placeholder doc now
-        # (SessionStart left it deferred — resolve_session_doc_for_start returned
-        # "interactive_deferred"). Pragma-once via the `session_doc_id IS NULL`
-        # gate; a dispatched worker with a legitimately-NULL doc (unresolved_dispatch)
-        # is excluded by _row_is_genuine_interactive, so it never gets an
-        # interactive placeholder.
-        status_updates = {
-            "status": "working",
-            "last_activity": now,
-            "stopped_at": None,
-        }
-        minted_session_doc_id = None
-        if existing_dict.get("session_doc_id") is None and _row_is_genuine_interactive(
-            origin_type=existing_dict.get("origin_type"),
-            commander_type=existing_dict.get("commander_type"),
-            persona_id=existing_dict.get("persona_id"),
-            is_subagent=existing_dict.get("is_subagent"),
-            dispatch_session_doc_path=existing_dict.get("dispatch_session_doc_path"),
-            automated=existing_dict.get("automated"),
-            golden_throne=existing_dict.get("golden_throne"),
-        ):
-            minted_session_doc_id = await create_deferred_interactive_session_doc(db)
-            status_updates["session_doc_id"] = minted_session_doc_id
-
         # Also resurrect stopped instances - activity means they're active.
         # (pid died with legacy instance table; nothing to backfill.)
         await sanctioned_update_instance(
             db,
             instance_id=session_id,
-            updates=status_updates,
+            updates={
+                "status": "working",
+                "last_activity": now,
+                "stopped_at": None,
+            },
             mutation_type="status_changed",
             write_source="hooks",
             actor="PromptSubmit",
         )
         await db.commit()
-        if minted_session_doc_id is not None:
-            await log_event(
-                "session_doc_deferred_minted",
-                instance_id=session_id,
-                details={
-                    "session_doc_id": minted_session_doc_id,
-                    "trigger": "first_prompt",
-                },
-            )
 
     if planning_event:
         await log_event("planning_state_changed", instance_id=session_id, details=planning_event)
@@ -6219,10 +6067,10 @@ async def mark_instance_for_close(instance_id: str, request: MarkForCloseRequest
     lifecycle = (request.lifecycle or "retire").strip().lower()
     if mode not in {"after-stop", "now"}:
         return {"success": False, "action": "unsupported_mode", "mode": mode}
-    raw_lifecycle = lifecycle
-    lifecycle = normalize_instance_lifecycle(lifecycle) or raw_lifecycle
-    if lifecycle not in {"retire", "archive-session-doc", "banish"}:
-        return {"success": False, "action": "unsupported_lifecycle", "lifecycle": raw_lifecycle}
+    if lifecycle in {"archive", "archive-doc", "retire-and-archive"}:
+        lifecycle = "archive-session-doc"
+    if lifecycle not in {"retire", "archive-session-doc"}:
+        return {"success": False, "action": "unsupported_lifecycle", "lifecycle": lifecycle}
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
         armed = await _mark_for_close_subscription(

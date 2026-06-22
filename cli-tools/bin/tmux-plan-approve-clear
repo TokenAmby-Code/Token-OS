@@ -18,13 +18,6 @@ INTERVAL="0.25"
 CAPTURE_FILE=""
 DRY_RUN=false
 UPDATE_STATE=true
-REAL_TMUX="${TOKEN_API_TMUX_BIN:-/opt/homebrew/bin/tmux}"
-[[ -x "$REAL_TMUX" ]] || REAL_TMUX="/usr/bin/tmux"
-[[ -x "$REAL_TMUX" ]] || REAL_TMUX="$(command -v tmux || true)"
-if [[ -z "$REAL_TMUX" || ! -x "$REAL_TMUX" ]]; then
-    echo "tmux-plan-approve-clear: real tmux binary not found" >&2
-    exit 2
-fi
 
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
@@ -97,133 +90,28 @@ capture() {
     if [[ -n "$CAPTURE_FILE" ]]; then
         cat "$CAPTURE_FILE" 2>/dev/null || true
     else
-        "$REAL_TMUX" capture-pane -p -t "$PANE" -S -80 2>/dev/null || true
+        tmux capture-pane -p -t "$PANE" -S -80 2>/dev/null || true
     fi
-}
-
-LOCK_FD_OPEN=false
-LOCK_DIR=""
-
-_release_single_flight() {
-    if [[ -n "${LOCK_DIR:-}" ]]; then
-        rm -rf "$LOCK_DIR" 2>/dev/null || true
-    fi
-}
-
-acquire_single_flight() {
-    [[ -n "$PANE" && -z "$CAPTURE_FILE" ]] || return 0
-    local safe root lockfile
-    safe="$(printf '%s' "$PANE" | tr -c 'A-Za-z0-9_.-' '_')"
-    root="${TMPDIR:-/tmp}/tmux-plan-approve-clear"
-    mkdir -p "$root" 2>/dev/null || true
-    lockfile="$root/${safe}.lock"
-    if command -v flock >/dev/null 2>&1; then
-        exec 9>"$lockfile" || return 1
-        flock -n 9 || return 1
-        LOCK_FD_OPEN=true
-        return 0
-    fi
-    LOCK_DIR="$root/${safe}.lockd"
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        return 1
-    fi
-    printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
-    trap _release_single_flight EXIT INT TERM
-    return 0
 }
 
 classify() {
-    # Detection is wrap- AND resize-invariant: lowercase the capture, strip ALL
-    # whitespace, then test short atomic tokens. The pane hard-wraps (~36 col) and
-    # the Emperor resizes/shunts panes constantly, so any long prose phrase shatters
-    # across lines and a substring test silently misses (the modal then "sticks").
-    # CC 2.1.185 also dropped the old "implement this plan?" header, which is why
-    # the prose match regressed — atomic tokens cover the current + legacy copy.
-    #
-    # Cursor safety: Claude only presses Enter when the current cursor option is
-    # clear-context. Codex only presses Down,Enter when the option one Down from
-    # the current cursor is the clear-context option. Otherwise return "none" and
-    # leave the modal for the human; never guess a Down-count.
-    #
-    # Scrollback shadowing: capture() reads -S -80, so the capture can contain a
-    # STALE cursor-marked modal frozen in scrollback above the live one (e.g. an
-    # "❯ 1. Exit anyway / 2. Stay" prompt left by a prior session in the pane
-    # before it was relaunched). The active TUI modal is always rendered at the
-    # BOTTOM of the pane; any cursor markers above it are dead scrollback. So we
-    # anchor `current` on the LAST cursor option (bottom-most = live), not the
-    # first — anchoring on the first lets a stale top modal shadow the real one,
-    # classify returns "none", the approver times out, and the modal sticks
-    # (forcing manual approval — the exact regression this guards against).
     python3 -c 'import re,sys
 agent=sys.argv[1]
 text=sys.stdin.read()
-flat=re.sub(r"\s+","",text.lower())
-# Anchor on the rare clear-context option, then require ONE short corroborating
-# atom — a plan-execute header OR an approval-option phrase. All tokens survive
-# whitespace-strip, so wrap/resize cannot blank the match, and a plan body that
-# merely mentions "clear context" in prose lacks the corroborating atom.
-clear = any(t in flat for t in ("clearcontext", "clearconte", "freshthread"))
-corrob = any(t in flat for t in (
-    "readytoexecute","writtenupaplan","implementthisplan","liketoproceed","wishtoproceed",
-    "acceptedits","approveedits","manuallyapprove","manualapproval","bypasspermissions", "freshthread"))
-if not (clear and corrob):
+low=text.lower()
+clear = "clear context" in low or "clear the context" in low or "clear current context" in low
+approval = any(s in low for s in ["auto-accept edits", "approve edits", "manually approve", "manual approval", "start fresh", "fresh context", "fresh thread", "implement this plan?"])
+if not (clear and approval):
     print("none")
     raise SystemExit
 if agent == "auto":
-    # NEVER text-sniff scrollback for the harness: a Claude pane that merely
-    # mentions "codex" (every fleet session does) used to flip to the Codex key
-    # sequence (Down,Enter), moving the cursor off the clear-context option ->
-    # plan mode never cleanly exits and the agent retries (spurious re-entry).
-    # The gatekeeper resolves the real harness (tmuxctl resolve-agent) and passes
-    # --agent claude|codex explicitly, yielding entirely if it cannot; auto is a
-    # defensive fallback to claude, still gated by the cursor-safety below.
-    agent = "claude"
-
-opt_re=re.compile(r"^\s*([❯›>])?\s*(\d+)[.)]\s*(.*)$")
-options=[]
-current=None
-lines=text.splitlines()
-i=0
-while i < len(lines):
-    m=opt_re.match(lines[i])
-    if not m:
-        i += 1
-        continue
-    cursor=bool(m.group(1))
-    num=int(m.group(2))
-    chunk=[m.group(3)]
-    j=i+1
-    while j < len(lines):
-        if opt_re.match(lines[j]) or not lines[j].strip():
-            break
-        chunk.append(lines[j])
-        j += 1
-    opt_flat=re.sub(r"\s+",""," ".join(chunk).lower())
-    item={"num":num,"cursor":cursor,"flat":opt_flat,"index":len(options)}
-    options.append(item)
-    if cursor:
-        # Last cursor wins: the live modal is the bottom-most one; earlier cursor
-        # markers are stale scrollback (see "Scrollback shadowing" above).
-        current=item
-    i=j
-
-if agent == "claude":
-    if current is None or not any(t in current["flat"] for t in ("clearcontext", "clearconte", "freshthread")):
-        print("none")
-        raise SystemExit
-elif agent == "codex":
-    if current is None:
-        print("none")
-        raise SystemExit
-    target=None
-    for opt in options[current["index"]+1:]:
-        target=opt
-        break
-    if target is None or target["num"] != current["num"] + 1 or not any(t in target["flat"] for t in ("clearcontext", "clearconte", "freshthread")):
-        print("none")
-        raise SystemExit
+    if "codex" in low:
+        agent = "codex"
+    else:
+        agent = "claude"
 print(agent)' "$AGENT"
 }
+
 send_action() {
     local detected="$1"
     if $DRY_RUN || [[ -n "$CAPTURE_FILE" ]]; then
@@ -235,16 +123,11 @@ send_action() {
         return 0
     fi
     if [[ "$detected" == "codex" ]]; then
-        "$REAL_TMUX" send-keys -t "$PANE" Down Enter
+        tmux send-keys -t "$PANE" Down Enter
     else
-        "$REAL_TMUX" send-keys -t "$PANE" Enter
+        tmux send-keys -t "$PANE" Enter
     fi
 }
-
-if ! acquire_single_flight; then
-    $DRY_RUN && echo "action=none locked"
-    exit 0
-fi
 
 if ! planning_state_allows_poll; then
     $DRY_RUN && echo "action=none state-not-planning"

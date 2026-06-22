@@ -12,7 +12,6 @@
 # Public functions:
 #   assign_port <worktree-dir>    → echoes assigned port (idempotent)
 #   free_port   <worktree-dir>    → frees the port and kills its process
-#   stop_port_process <worktree-dir> → kills assigned port listener, keeps registry
 #   lookup_port <worktree-dir>    → echoes assigned port or empty
 #   list_ports                     → dumps the registry as text
 #   prune_ports                    → frees entries whose worktree dir is gone
@@ -102,14 +101,15 @@ _wp_assign_inner() {
     return 1
 }
 
-_wp_kill_port_process() {
-    local port="$1"
+_wp_free_inner() {
+    local worktree_dir="$1"
+    _wp_ensure_registry
 
-    # Hard safety rails: never touch live Token-API, and only reap the worktree
-    # dev pool. Registry corruption must fail safe, not kill arbitrary listeners.
-    [[ "$port" == "7777" ]] && return 0
-    [[ "$port" =~ ^[0-9]+$ ]] || return 0
-    (( port >= WORKTREE_PORT_POOL_START && port <= WORKTREE_PORT_POOL_END )) || return 0
+    local port
+    port=$(jq -r --arg k "$worktree_dir" '.[$k] // empty' "$WORKTREE_PORT_REGISTRY")
+    if [[ -z "$port" ]]; then
+        return 0  # nothing to free
+    fi
 
     # Kill whatever's bound to it (best-effort).
     if command -v lsof &>/dev/null; then
@@ -121,32 +121,6 @@ _wp_kill_port_process() {
             kill -KILL $pids 2>/dev/null || true
         fi
     fi
-}
-
-_wp_stop_port_process_inner() {
-    local worktree_dir="$1"
-    _wp_ensure_registry
-
-    local port
-    port=$(jq -r --arg k "$worktree_dir" '.[$k] // empty' "$WORKTREE_PORT_REGISTRY")
-    if [[ -z "$port" ]]; then
-        return 0  # nothing to stop
-    fi
-
-    _wp_kill_port_process "$port"
-}
-
-_wp_free_inner() {
-    local worktree_dir="$1"
-    _wp_ensure_registry
-
-    local port
-    port=$(jq -r --arg k "$worktree_dir" '.[$k] // empty' "$WORKTREE_PORT_REGISTRY")
-    if [[ -z "$port" ]]; then
-        return 0  # nothing to free
-    fi
-
-    _wp_kill_port_process "$port"
 
     local tmp
     tmp=$(mktemp)
@@ -183,11 +157,6 @@ prune_ports() {
 free_port() {
     [[ $# -eq 1 ]] || { echo "free_port <worktree-dir>" >&2; return 1; }
     _wp_with_lock _wp_free_inner "$1"
-}
-
-stop_port_process() {
-    [[ $# -eq 1 ]] || { echo "stop_port_process <worktree-dir>" >&2; return 1; }
-    _wp_with_lock _wp_stop_port_process_inner "$1"
 }
 
 lookup_port() {

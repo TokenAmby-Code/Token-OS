@@ -14,10 +14,6 @@ if [[ -f "$LIB_DIR/nas-path.sh" ]]; then
     # shellcheck source=../lib/nas-path.sh
     source "$LIB_DIR/nas-path.sh" 2>/dev/null || true
 fi
-if [[ -f "$LIB_DIR/plan-approver-launch.sh" ]]; then
-    # shellcheck source=../lib/plan-approver-launch.sh
-    source "$LIB_DIR/plan-approver-launch.sh" 2>/dev/null || true
-fi
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 LOG_DIR="${HOME}/.codex/log"
 LOG_FILE="${LOG_DIR}/hook-bridge.log"
@@ -25,6 +21,9 @@ TOKEN_API_CODEX_LAUNCHER="${TOKEN_API_LAUNCHER:-codex-hooks}"
 TOKEN_API_CODEX_ENGINE="${TOKEN_API_ENGINE:-codex}"
 RESUME_SCRIPT="${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/agent-session-end-resume.sh"
 [[ -f "$RESUME_SCRIPT" ]] || RESUME_SCRIPT="${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/scripts/agent-session-end-resume.sh"
+PLAN_APPROVER="${TOKEN_API_PLAN_APPROVER:-${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/bin/tmux-plan-approve-clear}"
+[[ -x "$PLAN_APPROVER" ]] || PLAN_APPROVER="${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/bin/tmux-plan-approve-clear"
+[[ -x "$PLAN_APPROVER" ]] || PLAN_APPROVER="${SCRIPT_DIR}/../bin/tmux-plan-approve-clear"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 HOOK_INPUT="$(cat 2>/dev/null || true)"
@@ -107,65 +106,41 @@ if command -v jq >/dev/null 2>&1 && [[ -n "${TOKEN_API_CODEX_BRIDGE_ID:-}" ]]; t
     fi
 fi
 
-maybe_launch_plan_approver() {
-    case "$ACTION_TYPE" in
-        Stop|PostToolUse|UserPromptSubmit) ;;
-        *) return 0 ;;
-    esac
-    command -v jq >/dev/null 2>&1 || return 0
-    type plan_approver_launch >/dev/null 2>&1 || return 0
+json_value() {
+    local expr="$1"
+    if ! command -v jq >/dev/null 2>&1; then
+        return 1
+    fi
+    printf '%s' "$HOOK_INPUT" | jq -r "$expr" 2>/dev/null || true
+}
 
-    local pane state state_hint reason trigger_class
-    pane="$(plan_approver_resolve_pane "" "$HOOK_INPUT" "" 2>/dev/null || true)"
+maybe_launch_plan_approver() {
+    [[ "$ACTION_TYPE" == "Stop" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    [[ -x "$PLAN_APPROVER" ]] || return 0
+
+    local pane state
+    pane="${TMUX_PANE:-}"
+    [[ -n "$pane" ]] || pane="$(json_value '.env.TMUX_PANE // empty')"
     [[ -n "$pane" ]] || return 0
 
-    state="$(plan_approver_get_planning_state "$pane" "$API_URL" 2>/dev/null || true)"
-    state_hint=""
+    state="$(
+        curl -fsS -G --connect-timeout 1 --max-time 2 \
+            --data-urlencode "tmux_pane=${pane}" \
+            "${API_URL}/api/planning/state" 2>/dev/null \
+            | jq -r '.planning_state // empty' 2>/dev/null || true
+    )"
     case "$state" in
-        planning|approving) state_hint="state-${state}" ;;
-    esac
-
-    reason=""
-    trigger_class=""
-    case "$ACTION_TYPE" in
-        UserPromptSubmit)
-            trigger_class="early_prompt"
-            # Stop fires after the plan turn is complete, but the Codex approval
-            # modal can block that completion. Start a safe watcher for every
-            # prompt; tmux-plan-approve-clear is classifier-gated and only sends
-            # keys when the live pane shows the clear-context plan approval modal.
-            if plan_approver_payload_prompt_starts_plan; then
-                reason="payload-plan-command"
-            else
-                reason="user-prompt-watch"
-            fi
-            ;;
-        PostToolUse)
-            trigger_class="post_tool"
-            if plan_approver_current_transcript_turn_is_plan_mode; then
-                reason="plan-mode-post-tool"
-            fi
-            ;;
-        Stop)
-            trigger_class="late_stop"
-            if plan_approver_payload_has_plan; then
-                reason="payload-plan"
-            elif plan_approver_latest_transcript_turn_has_plan; then
-                reason="transcript-plan"
-            fi
+        planning|approving)
+            (
+                exec 0</dev/null
+                "$PLAN_APPROVER" --pane "$pane" --agent codex --timeout 10 >>"$LOG_FILE" 2>&1
+            ) &
+            disown 2>/dev/null || true
+            [[ "${HOOK_DEBUG:-0}" == "1" ]] && printf '[%s] Stop launched clear-context approver pane=%s state=%s\n' \
+                "$(date '+%Y-%m-%d %H:%M:%S')" "$pane" "$state" >> "$LOG_FILE" 2>/dev/null || true
             ;;
     esac
-
-    [[ -n "$reason" ]] || return 0
-    [[ -z "$state_hint" ]] || reason="${reason}+${state_hint}"
-
-    plan_approver_launch \
-        --agent codex \
-        --trigger-class "$trigger_class" \
-        --pane "$pane" \
-        --hook-input "$HOOK_INPUT" \
-        --reason "$reason" \
-        --log-file "$LOG_FILE"
 }
 
 maybe_launch_plan_approver

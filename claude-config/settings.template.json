@@ -102,10 +102,6 @@
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/uv-python-policy.sh"
-          },
-          {
-            "type": "command",
-            "command": "bash ~/.claude/hooks/runtime-unlock-guard.sh"
           }
         ]
       },

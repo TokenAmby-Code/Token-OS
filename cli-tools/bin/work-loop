@@ -238,9 +238,9 @@ do_dispatch() {
     local dispatch_prompt
     dispatch_prompt=$(build_dispatch_prompt "$session_doc" "$branch_name" "$project" "$primarch_name" "$extra_context" "$zealotry")
 
-    # --- Resolve Claude wrapper shim ---
+    # --- Resolve claude binary ---
     local claude_bin
-    claude_bin="${_LIB_DIR}/../bin/claude"
+    claude_bin=$(command -v claude 2>/dev/null || echo "\$HOME/.local/bin/claude")
 
     # --- Store metadata on the pane for status/tracking ---
     tmux set-option -p -t "$target_pane" @WORKLOOP_SESSION_DOC "$session_doc" 2>/dev/null || true

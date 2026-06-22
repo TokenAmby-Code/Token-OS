@@ -10,7 +10,7 @@ user_invocable: true
 
 When an instance loads a persona via `@Personas/<name>.md` **in an arbitrary pane**, the DB doesn't know about it — the instance shows as `legion: astartes, instance_type: one_off`. This skill bridges the gap: read the persona file, extract identity fields, and PATCH the instance's DB row via Token-API.
 
-**Singleton persona panes auto-register — do not PATCH them.** The Custodes, Malcador, Fabricator-General, Administratum, Pax, and Orchestrator panes carry a stable `@PANE_ID` (`legion:custodes`, `legion:malcador`, `mechanicus:fabricator-general`, `mechanicus:admin`, `koronus:pax`, `koronus:orchestrator`) stamped by tmuxctl. `SessionStart` derives the row identity (persona + rank, plus legion/primarch) from that pane label — it is an infrastructure invariant, not the agent's job. **Identity is persona + rank** (for example `persona.slug=custodes`, `rank=overseer`; `persona.slug=pax`, `rank=overseer`; `persona.slug=orchestrator`, `rank=overseer`), resolved on the canonical `instances` table — **never** by sync. `synced`/`instance_type=sync` are a runtime MODE the morning session sets while live (default `synced=0`); do not treat `synced=0` at registration time as a defect. If you are one of these personas, your row is **already correct on startup**. Run the verify step below and **report** if it is wrong (that means the harness is broken) — never self-PATCH. Patching is only for ad-hoc personas loaded into a non-persona pane.
+**Singleton persona panes auto-register — do not PATCH them.** The custodes, Fabricator-General, and Administratum panes carry a stable `@PANE_ID` (`legion:custodes`, `mechanicus:fabricator-general`, `mechanicus:admin`) stamped by tmuxctl. `SessionStart` derives the row identity (persona + rank, plus legion/primarch) from that pane label — it is an infrastructure invariant, not the agent's job. **Custodes identity is persona + rank** (`persona.slug=custodes`, `rank=overseer`), resolved on the canonical `instances` table — **never** by sync. `synced`/`instance_type=sync` are a runtime MODE the morning session sets while live (default `synced=0`); do not treat `synced=0` at registration time as a defect. If you are one of these personas, your row is **already correct on startup**. Run the verify step below and **report** if it is wrong (that means the harness is broken) — never self-PATCH. Patching is only for ad-hoc personas loaded into a non-persona pane.
 
 ## Usage
 
@@ -59,7 +59,7 @@ class: custodes        # <-- this maps to legion
 ```
 
 **Mapping rules:**
-- If `class` is one of the allowed legions (`custodes`, `mechanicus`, `civic`): set `legion` to that value. For `civic`, this is only a context label for ad-hoc/non-singleton panes; it must not erase an existing astartes persona/voice lock.
+- If `class` is one of the allowed legions (`custodes`, `mechanicus`, `civic`): set `legion` to that value
 - If `class` is a primarch name (e.g., `vulkan`, `guilliman`, `slaanesh`): set `legion` to `astartes`
 - The `title` field becomes the display identity
 
@@ -86,14 +86,14 @@ curl -s "$TOKEN_API_URL/api/instances" \
   | jq --arg id "$INSTANCE_ID" '.[] | select(.id==$id) | {persona: .persona.slug, rank, status, primarch, pane_label}'
 ```
 
-- If `pane_label` is one of `legion:custodes` / `legion:malcador` / `mechanicus:fabricator-general` / `mechanicus:admin` / `koronus:pax` / `koronus:orchestrator`, this is a **singleton persona pane**. `SessionStart` already set its identity (persona + rank). **Verify it matches the expected identity and stop — do not PATCH.** In particular, never `PATCH /legion {"legion":"civic"}` from `koronus:pax` or `koronus:orchestrator`; civic is shared with generic workers and is not the singleton identity. For custodes specifically, the canonical check is exactly one non-retired row with `persona.slug == "custodes"` at `rank == "overseer"`:
+- If `pane_label` is one of `legion:custodes` / `mechanicus:fabricator-general` / `mechanicus:admin`, this is a **singleton persona pane**. `SessionStart` already set its identity (persona + rank). **Verify it matches the expected identity and stop — do not PATCH.** For custodes specifically, the canonical check is exactly one non-retired row with `persona.slug == "custodes"` at `rank == "overseer"`:
 
   ```bash
   curl -s "$TOKEN_API_URL/api/instances" \
     | jq '[.[] | select(.persona.slug=="custodes" and .rank!="retired")] | {count: length, row: .[0] | {id, rank, status}}'
   ```
 
-  For Pax and Orchestrator, the expected checks are `persona.slug == "pax"` / `rank == "overseer"` and `persona.slug == "orchestrator"` / `rank == "overseer"`. If any singleton check is wrong (no row, wrong slug, wrong rank, or more than one live singleton), report it: the harness invariant is broken (e.g. tmuxctl didn't stamp `@PANE_ID`, or the SessionStart hook didn't fire). Surface that instead of papering over it with a manual PATCH. Sync mode (`synced`/`instance_type=sync`) is NOT part of this check — it is a runtime mode, not identity.
+  If that is wrong (no row, wrong rank, or more than one), report it: the harness invariant is broken (e.g. tmuxctl didn't stamp `@PANE_ID`, or the SessionStart hook didn't fire). Surface that instead of papering over it with a manual PATCH. Sync mode (`synced`/`instance_type=sync`) is NOT part of this check — it is a morning-session mode, not identity.
 - Otherwise (ad-hoc persona in a non-persona pane), continue to Step 4 and PATCH.
 
 ### Step 4: PATCH the instance (ad-hoc panes only)
@@ -132,7 +132,7 @@ After registration, the persona file content is already in context (you read it 
 
 - **No TOKEN_API_URL:** Report that Token-API is unreachable. The persona file can still be read for context, but DB registration fails.
 - **Instance not found:** The instance may not have registered yet (race condition on startup). Suggest retrying after a few seconds.
-- **Singleton pane mismatch:** If a protected singleton pane reports the wrong `persona.slug` or `rank`, report a harness/SessionStart failure. Do not repair it by PATCHing `legion` (especially not `legion=civic`).
+- **Singleton demotion:** Setting `legion: custodes` will demote any other active Custodes instance to `astartes`. This is expected — report the demotion.
 
 ---
 
