@@ -115,6 +115,15 @@ def _patch_panes(app_env, monkeypatch, panes):
     monkeypatch.setattr(app_env.main, "_live_agent_panes", fake_panes)
 
 
+def _patch_read_panes(app_env, monkeypatch, panes):
+    """Drive _read_tmux_panes() (the reconciler's physical-id keyed pane dict)."""
+
+    async def fake_read():
+        return dict(panes)
+
+    monkeypatch.setattr(app_env.main, "_read_tmux_panes", fake_read)
+
+
 OLD = None  # filled per-test from datetime.now()
 
 
@@ -337,3 +346,63 @@ def test_cleanup_keeps_fully_live_hook(app_env, monkeypatch):
 
     assert _active_sub_count(app_env) == 1
     assert result["pruned_hooks"] == 0
+
+
+# ── (f) reconcile cycle: physical-id mismatch must not false-stop live panes ──
+
+
+def test_reconcile_cycle_spares_live_pane_with_stale_physical_id(app_env, monkeypatch):
+    """A working row whose @INSTANCE_ID is live but whose stored %NN is absent from
+    _read_tmux_panes() (canonical/stale drift) must NOT be stopped as pane_missing."""
+    # Eligible for the working branch (≥10s stale) but demonstrably alive.
+    stale = (datetime.now() - timedelta(seconds=30)).isoformat()
+    iid = _insert(app_env, status="working", last_activity=stale, tmux_pane="%26")
+    # Reconciler's pane dict has NO physical key matching %26 (the bug's signature).
+    _patch_read_panes(app_env, monkeypatch, {})
+    # ...but the instance is stamped on a genuinely live pane.
+    _patch_panes(app_env, monkeypatch, [_pane("%88", iid, pane_role="legion:malcador")])
+    monkeypatch.setattr(app_env.main, "spawn_tmux_assert_instance", lambda *a, **k: None)
+
+    counts = _run(app_env.main._run_tmux_db_reconcile_cycle())
+
+    assert _row(app_env, iid)["status"] == "working", "live pane was false-stopped"
+    assert counts["pane_vanished"] == 0
+
+
+def test_reconcile_cycle_still_stops_genuinely_vanished_pane(app_env, monkeypatch):
+    """Regression guard: a row whose pane is gone AND whose instance is not live is
+    still stopped — the reconciler keeps doing its real job."""
+    stale = (datetime.now() - timedelta(seconds=30)).isoformat()
+    iid = _insert(app_env, status="working", last_activity=stale, tmux_pane="%26")
+    _patch_read_panes(app_env, monkeypatch, {})  # pane gone
+    _patch_panes(app_env, monkeypatch, [])  # instance not live
+    monkeypatch.setattr(app_env.main, "spawn_tmux_assert_instance", lambda *a, **k: None)
+
+    counts = _run(app_env.main._run_tmux_db_reconcile_cycle())
+
+    assert _row(app_env, iid)["status"] == "stopped", "dead pane should be reaped"
+    assert counts["pane_vanished"] >= 1
+
+
+def test_pane_enumerators_force_raw_physical_ids(app_env, monkeypatch):
+    """Both enumeration helpers must pass IMPERIUM_TMUX_RAW=1 so the cli-tools/bin
+    shim emits physical %NN ids instead of canonical labels."""
+    captured = []
+
+    async def fake_run(args, **kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(returncode=0, stdout=b"")
+
+    async def fake_tree():
+        return {}, {}
+
+    monkeypatch.setattr(app_env.main, "_run_subprocess_offloop", fake_run)
+    monkeypatch.setattr(app_env.main, "_ps_process_tree", fake_tree)
+
+    _run(app_env.main._read_tmux_panes())
+    _run(app_env.main._live_agent_panes())
+
+    assert len(captured) == 2, "expected one subprocess call per enumerator"
+    for kwargs in captured:
+        env = kwargs.get("env") or {}
+        assert env.get("IMPERIUM_TMUX_RAW") == "1", "raw-id flag missing from enumerator"

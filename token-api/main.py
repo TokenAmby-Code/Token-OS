@@ -1194,6 +1194,11 @@ async def _live_agent_panes() -> list[dict]:
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            # Force physical %NN ids. Without this the cli-tools/bin shim (first on the
+            # launchd PATH) rewrites #{pane_id} to canonical ids, the
+            # `if not pane_id.startswith("%")` filter below drops every line, and
+            # _live_agent_instance_ids() collapses to an empty set.
+            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
             timeout=5,
         )
         if proc.returncode != 0 or not proc.stdout:
@@ -20142,6 +20147,12 @@ async def _read_tmux_panes() -> dict[str, dict] | None:
             ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Force physical %NN ids. The launchd PATH puts cli-tools/bin first, so a
+            # bare `tmux` resolves to the canonical-id shim, which rewrites #{pane_id}
+            # → legion:malcador etc. Callers compare these keys against the physical
+            # id stored in instances.tmux_pane, so canonical keys read as "every pane
+            # vanished" and false-stop the live fleet.
+            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
             timeout=5,
         )
     except Exception:
@@ -20279,6 +20290,13 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
         # tmux unreachable — skip the cycle rather than stop a fleet of rows.
         return counts
 
+    # Liveness oracle, computed once per cycle: instance_ids stamped on a genuinely
+    # live agent pane (@INSTANCE_ID survives a stale/rotated %NN). A row in this set
+    # is never stopped as "pane vanished" even when its stored physical id no longer
+    # matches a pane key — e.g. after a tmux restart reassigns %NN. Mirrors the
+    # idle-sweep guard in cleanup_stale_instances().
+    live_ids = await _live_agent_instance_ids()
+
     now = datetime.now()
     deferred_events: list[tuple[str, str, dict]] = []  # (event_type, instance_id, details)
 
@@ -20349,6 +20367,11 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
 
             # Pane vanished.
             if tmux_pane and tmux_pane not in panes:
+                # ...unless the row's instance is demonstrably alive on a pane (its
+                # @INSTANCE_ID stamp), in which case the missing key is a stale
+                # physical-id mismatch, not a dead pane. Don't false-stop it.
+                if row["id"] in live_ids:
+                    continue
                 try:
                     await sanctioned_update_instance(
                         db,
