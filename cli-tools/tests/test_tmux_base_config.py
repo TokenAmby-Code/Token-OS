@@ -167,6 +167,46 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
 
 
+def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> None:
+    """The root-table any-key binding is the sole arming surface for the
+    keystroke-anchored typing lock. It must:
+
+      * stamp the per-pane @TYPING_LOCK_UNTIL on a real keystroke,
+      * KEEP an existing future value (no refresh — "5 min since FIRST
+        keystroke", not since LAST), re-arming only when absent/expired,
+      * source "now" from #{client_activity} (zero-fork; set -F can't expand %s),
+      * pass mouse events through (`send-keys -M`) WITHOUT arming (focus/click
+        must never lock a pane), discriminated by a fresh non-empty #{mouse_x},
+      * faithfully REPLAY the real keystroke with a bare `send-keys`.
+    """
+    line = _line_starting("    set -Fp @TYPING_LOCK_UNTIL ")
+    # No-refresh keep-or-rearm: keep @TYPING_LOCK_UNTIL while it is >= now, else
+    # rearm to client_activity + 300s.
+    assert "#{?#{e|>=:#{@TYPING_LOCK_UNTIL},#{client_activity}}" in line
+    assert "#{e|+:#{client_activity},300}" in line
+    # The kept branch re-writes the SAME value (the proof of no-refresh).
+    assert "},#{@TYPING_LOCK_UNTIL}," in line
+
+    conf = CONF.read_text(encoding="utf-8")
+    assert "bind -n Any {" in conf
+    # Mouse keys are excluded from arming and passed straight through.
+    assert "if -F '#{!=:#{mouse_x},}' {" in conf
+    assert "send-keys -M" in conf
+    # Faithful replay of the matched key: a bare `send-keys` with no args
+    # (tmux re-sends the bound key). Distinct from the `send-keys -M` mouse line.
+    stripped = [ln.strip() for ln in conf.splitlines()]
+    assert "send-keys" in stripped, "the keep branch must replay the key with a bare send-keys"
+
+
+def test_keystroke_lock_enter_clears_lock_and_submits() -> None:
+    """Enter (and tmux's C-m resolution of Return) clears the pane lock and
+    passes the key through to submit. No focus-based clearing exists."""
+    for key in ("Enter", "C-m"):
+        line = _line_starting(f"bind -n {key} ")
+        assert "set -pu @TYPING_LOCK_UNTIL" in line, f"{key} must UNSET the pane lock"
+        assert "send-keys" in line, f"{key} must still pass through (submit)"
+
+
 def test_portable_status_guard_indicator_is_also_per_pane() -> None:
     portable = (ROOT / "tmux" / "tmux-portable-status.conf").read_text(encoding="utf-8")
     status_right = next(
