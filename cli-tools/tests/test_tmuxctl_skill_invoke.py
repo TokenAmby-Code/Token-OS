@@ -161,7 +161,9 @@ def test_invoke_skill_in_pane_prompt_start_buffer_separates_arguments(monkeypatc
     assert tab_index < prompt_end_index
 
 
-def test_resolve_agent_detects_codex_in_pane_process_subtree(monkeypatch):
+def test_resolve_agent_detects_codex_in_pane_process_subtree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Rowless Codex workers surface as shell/node descendants, not registry rows."""
     adapter = RecordingAdapter()
 

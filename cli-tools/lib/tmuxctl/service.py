@@ -161,9 +161,10 @@ class TmuxControlPlane:
     def resolve_instance(self, instance_id: str) -> dict:
         """Resolve an instance UUID to its live pane (pure tmux, fail-closed).
 
-        Returns ``{instance_id, pane_id, pane_role, found}``. When no live pane
-        carries the stamp, ``found`` is False and ``pane_id``/``pane_role`` are
-        empty strings.
+        Returns ``{instance_id, pane_id, pane_role, found, agent, live_agent}``.
+        When no live pane carries the stamp, ``found`` is False,
+        ``pane_id``/``pane_role`` are empty strings, ``agent`` is ``auto``, and
+        ``live_agent`` is False.
         """
         resolved = resolve_instance(self.adapter, instance_id)
         agent = "auto"

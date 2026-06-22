@@ -139,7 +139,7 @@ def test_both_layers_refuse_an_unstamped_pane_with_no_row():
     assert result["reason"] == "no_registry_instance", result
 
 
-def test_rowless_live_stack_worker_is_deliverable_by_process_tree():
+def test_rowless_live_stack_worker_is_deliverable_by_process_tree() -> None:
     """A live Codex stack-worker without a registry row is still a send target."""
     adapter = StampAdapter(panes={})
     resolved = SimpleNamespace(pane_id=_LIVE_PANE, pane_role="stack:worker-1")
