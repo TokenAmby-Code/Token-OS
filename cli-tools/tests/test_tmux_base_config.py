@@ -15,20 +15,19 @@ def _line_starting(prefix: str) -> str:
 
 
 def test_pane_select_prefix_arrows_use_absolute_low_latency_selection() -> None:
-    for key, (pane_index, direction) in {
-        "Left": ("1", "left"),
-        "Up": ("2", "up"),
-        "Down": ("3", "down"),
-        "Right": ("4", "right"),
+    for key, pane_index in {
+        "Left": "1",
+        "Up": "2",
+        "Down": "3",
+        "Right": "4",
     }.items():
         line = _line_starting(f"bind {key} ")
-        assert f"#{'{session_name}'}:#{'{window_index}'}.{pane_index}" in line
+        assert f"select-pane -t .{pane_index}" in line
+        assert "tmuxctl pane-select" not in line
         assert "select-pane -L" not in line
         assert "select-pane -R" not in line
         assert "select-pane -U" not in line
         assert "select-pane -D" not in line
-        assert "tmuxctl pane-select --mode absolute" in line
-        assert f"--direction {direction}" in line
         assert "resize-pane -Z" in line
         assert "window_zoomed_flag" in line
         assert "switch-client -T pane-select" in line
