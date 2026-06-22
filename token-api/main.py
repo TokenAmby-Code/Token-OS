@@ -10152,6 +10152,8 @@ async def _build_victory_cascade_plan(
             )
             continue
 
+        # worktree-delete targets ghost Claude processes by CWD; never let cascade
+        # delete the worktree currently hosting this API/operator session.
         if _same_worktree_path(path, server_cwd):
             skipped.append({"reason": "self_guard", "worktree": wt, "server_cwd": server_cwd})
             continue
