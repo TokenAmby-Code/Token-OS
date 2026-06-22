@@ -12,7 +12,13 @@ done
 BIN_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 install_one() {
-  local engine="$1" front="$2" tracked="$BIN_DIR/$engine" real="${front}.token-os-real"
+  # Note: each `local` is on its own line. A single multi-assignment such as
+  # `local engine="$1" tracked="$BIN_DIR/$engine"` expands every RHS before the
+  # builtin runs, so `$engine` is still unset there and `set -u` aborts.
+  local engine="$1"
+  local front="$2"
+  local tracked="$BIN_DIR/$engine"
+  local real="${front}.token-os-real"
   [[ -e "$front" || -L "$front" || -e "$real" || -L "$real" ]] || {
     echo "skip $engine: $front does not exist" >&2
     return 0
@@ -45,5 +51,8 @@ SHIM
   echo "installed $engine shim: $front -> $tracked (real: $real)"
 }
 
-install_one claude "$HOME/.local/bin/claude"
-install_one codex "/opt/homebrew/bin/codex"
+# Front-door paths are overridable (CLAUDE_FRONT_DOOR / CODEX_FRONT_DOOR) so the
+# installer can be exercised end-to-end against a sandbox in tests without
+# touching the real vendor binaries.
+install_one claude "${CLAUDE_FRONT_DOOR:-$HOME/.local/bin/claude}"
+install_one codex "${CODEX_FRONT_DOOR:-/opt/homebrew/bin/codex}"
