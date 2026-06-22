@@ -226,7 +226,7 @@ def test_custodes_fails_when_not_custodes():
     assert _row_matches_persona(impostor, spec) is False
 
 
-def test_custodes_fails_on_wrong_rank_when_rank_surfaced():
+def test_custodes_fails_on_wrong_rank_when_rank_surfaced() -> None:
     spec = _custodes_spec()
     row = SimpleNamespace(
         instance_id="i-c",
@@ -281,7 +281,7 @@ def test_admin_fails_on_pane_label_mismatch_even_with_right_primarch():
     assert _row_matches_persona(row, spec) is False
 
 
-def test_koronus_pax_matches_on_canonical_persona_slug_and_rank():
+def test_koronus_pax_matches_on_canonical_persona_slug_and_rank() -> None:
     spec = persona_spec("koronus:pax")
     row = SimpleNamespace(
         instance_id="i-pax",
@@ -296,7 +296,7 @@ def test_koronus_pax_matches_on_canonical_persona_slug_and_rank():
     assert _row_matches_persona(row, spec) is True
 
 
-def test_koronus_orchestrator_matches_on_primarch_fallback():
+def test_koronus_orchestrator_matches_on_primarch_fallback() -> None:
     spec = persona_spec("koronus:orchestrator")
     row = SimpleNamespace(
         instance_id="i-orch",
@@ -311,7 +311,7 @@ def test_koronus_orchestrator_matches_on_primarch_fallback():
     assert _row_matches_persona(row, spec) is True
 
 
-def test_koronus_pax_fails_on_wrong_rank():
+def test_koronus_pax_fails_on_wrong_rank() -> None:
     spec = persona_spec("koronus:pax")
     row = SimpleNamespace(
         instance_id="i-pax",
@@ -332,6 +332,15 @@ def test_admin_hash_busts_on_primarch_change():
     h_missing = _observed_row_hash(_admin_row(primarch=""), spec)
     h_set = _observed_row_hash(_admin_row(primarch="administratum"), spec)
     assert h_missing != h_set
+
+
+def test_guard_hash_busts_on_rank_change() -> None:
+    # Rank is part of singleton identity; the mismatch guard must re-evaluate
+    # when SessionStart repairs a wrong-rank row.
+    spec = persona_spec("koronus:pax")
+    h_astartes = _observed_row_hash(_row(pane_label="koronus:pax", rank="astartes"), spec)
+    h_overseer = _observed_row_hash(_row(pane_label="koronus:pax", rank="overseer"), spec)
+    assert h_astartes != h_overseer
 
 
 # ── guardrail ────────────────────────────────────────────────────────────────
@@ -404,7 +413,7 @@ def test_guard_stays_failopen_once_threshold_crossed():
     assert action == "persona_correction_failopen"
 
 
-def test_assert_instance_notes_singleton_mismatch_without_persona_injection():
+def test_assert_instance_notes_singleton_mismatch_without_persona_injection() -> None:
     # End-to-end through the REAL assert_instance: a live singleton persona pane
     # whose registry row has the wrong identity must NOT receive `/persona`. The
     # binding is a harness/SessionStart invariant; the assertion emits a
@@ -505,7 +514,7 @@ def test_unregistered_note_suppresses_within_backoff():
     assert emitted.count("persona_unregistered_live_runtime") == 1
 
 
-def test_mismatch_note_does_not_inject_persona_and_backs_off():
+def test_mismatch_note_does_not_inject_persona_and_backs_off() -> None:
     adapter = FakeAdapter()
     spec = persona_spec("koronus:pax")
     row = _row(

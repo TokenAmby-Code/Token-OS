@@ -347,6 +347,7 @@ def _observed_row_hash(row, spec: PersonaSpec) -> str:
             (getattr(row, "persona_slug", "") or "").strip().lower() if row is not None else ""
         ),
         "legion": getattr(row, "legion", "") if row is not None else "",
+        "rank": (getattr(row, "rank", "") or "").strip().lower() if row is not None else "",
         "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
         "instance_type": getattr(row, "instance_type", "") if row is not None else "",
         "primarch": (getattr(row, "primarch", "") or "") if row is not None else "",
