@@ -137,6 +137,16 @@ classify() {
     # clear-context. Codex only presses Down,Enter when the option one Down from
     # the current cursor is the clear-context option. Otherwise return "none" and
     # leave the modal for the human; never guess a Down-count.
+    #
+    # Scrollback shadowing: capture() reads -S -80, so the capture can contain a
+    # STALE cursor-marked modal frozen in scrollback above the live one (e.g. an
+    # "❯ 1. Exit anyway / 2. Stay" prompt left by a prior session in the pane
+    # before it was relaunched). The active TUI modal is always rendered at the
+    # BOTTOM of the pane; any cursor markers above it are dead scrollback. So we
+    # anchor `current` on the LAST cursor option (bottom-most = live), not the
+    # first — anchoring on the first lets a stale top modal shadow the real one,
+    # classify returns "none", the approver times out, and the modal sticks
+    # (forcing manual approval — the exact regression this guards against).
     python3 -c 'import re,sys
 agent=sys.argv[1]
 text=sys.stdin.read()
@@ -184,7 +194,9 @@ while i < len(lines):
     opt_flat=re.sub(r"\s+",""," ".join(chunk).lower())
     item={"num":num,"cursor":cursor,"flat":opt_flat,"index":len(options)}
     options.append(item)
-    if cursor and current is None:
+    if cursor:
+        # Last cursor wins: the live modal is the bottom-most one; earlier cursor
+        # markers are stale scrollback (see "Scrollback shadowing" above).
         current=item
     i=j
 
