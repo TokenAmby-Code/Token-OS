@@ -121,7 +121,7 @@ def test_mark_for_close_script_is_committed_executable() -> None:
     assert mode == "100755", f"tmux-mark-for-close must be committed executable, got {mode}"
 
 
-def test_typing_guard_indicator_is_per_pane_not_global_taskbar():
+def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     """The typing-guard indicator lives in each pane's border, not the global bar.
 
     Emperor UX directive: drop the global "⌨ GUARD" status-right segment and show
@@ -141,7 +141,7 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar():
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
 
 
-def test_portable_status_guard_indicator_is_also_per_pane():
+def test_portable_status_guard_indicator_is_also_per_pane() -> None:
     portable = (ROOT / "tmux" / "tmux-portable-status.conf").read_text(encoding="utf-8")
     status_right = next(
         line for line in portable.splitlines() if line.startswith("set status-right ")

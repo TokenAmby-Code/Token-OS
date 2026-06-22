@@ -661,7 +661,7 @@ def _attended_physical_only_tmux(physical: str):
     return _fake_run
 
 
-def test_typing_guard_detects_physical_but_misses_canonical_target(monkeypatch):
+def test_typing_guard_detects_physical_but_misses_canonical_target(monkeypatch) -> None:
     """Debug-step pin: physical id is detected, canonical id is MISSED.
 
     This is the exact divergence behind the clobber. The fix lives upstream
@@ -678,7 +678,7 @@ def test_typing_guard_detects_physical_but_misses_canonical_target(monkeypatch):
 
 def test_run_resolves_canonical_target_to_physical_before_gating(
     monkeypatch, captured_subprocess, recorded_suppressions
-):
+) -> None:
     """The fix: an attended-pane send addressed canonically is HELD, not clobbered.
 
     `tmuxctl send-text --pane mechanicus:fabricator-general` (and every
