@@ -78,6 +78,8 @@ def test_service_resolve_instance_shape_found():
         "pane_id": "%29",
         "pane_role": "somnium:NE",
         "found": True,
+        "agent": "auto",
+        "live_agent": False,
     }
 
 
@@ -89,6 +91,8 @@ def test_service_resolve_instance_shape_not_found():
         "pane_id": "",
         "pane_role": "",
         "found": False,
+        "agent": "auto",
+        "live_agent": False,
     }
 
 

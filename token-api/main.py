@@ -11883,6 +11883,35 @@ async def _pane_live_agent_engine(tmux_pane: str | None) -> str | None:
     pane = await shared.resolve_tmux_pane_id(tmux_pane)
     if not pane:
         return None
+    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+    try:
+        proc = await _run_subprocess_offloop(
+            (
+                sys.executable,
+                "-m",
+                "tmuxctl.cli",
+                "resolve-agent",
+                "--pane",
+                pane,
+                "--agent",
+                "auto",
+                "--default",
+                "auto",
+            ),
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            },
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            timeout=3,
+        )
+        if proc.returncode == 0:
+            engine = proc.stdout.decode(errors="ignore").strip().lower()
+            if engine in {"claude", "codex"}:
+                return engine
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("tmuxctl resolve-agent probe failed for pane %s: %s", pane, exc)
     for row_pane, command, cwd, window, tty in await _tmux_pane_rows():
         if row_pane != pane:
             continue
@@ -12023,8 +12052,9 @@ async def talk_send(request: TalkSendRequest):
 
     target_instance = await talk_service.lookup_instance_for_pane(target_pane)
     target_engine = (target_instance or {}).get("engine")
+    rowless_target = target_instance is None or bool((target_instance or {}).get("rowless_live"))
     rowless_live_engine = None
-    if target_instance is None:
+    if rowless_target:
         rowless_live_engine = await _pane_live_agent_engine(target_pane)
         if not rowless_live_engine:
             raise HTTPException(
@@ -12040,7 +12070,9 @@ async def talk_send(request: TalkSendRequest):
         engine=target_engine,
     )
     try:
-        if target_instance is None:
+        if rowless_target:
+            if talk_hook_driven:
+                await _flag_hook_driven(target_pane, tmux_pane=target_pane, actor="talk:rowless")
             send_result = await _direct_tmux_pane_delivery(
                 target_pane,
                 request.payload,
@@ -12141,7 +12173,9 @@ async def brief_send(request: BriefSendRequest):
                 receipt = {**receipt, **target}
             else:
                 instance = await talk_service.lookup_instance_for_pane(pane_id)
-                if instance is None:
+                if instance is None or instance.get("rowless_live"):
+                    if brief_hook_driven:
+                        await _flag_hook_driven(pane_id, tmux_pane=pane_id, actor="brief:rowless")
                     receipt = await _direct_tmux_pane_delivery(
                         pane_id,
                         request.payload,
