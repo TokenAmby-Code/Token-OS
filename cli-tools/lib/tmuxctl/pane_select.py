@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from ._stack_core import STACK_PAGE_SPECS
 from .focus_guard import allow_human_focus
 from .labels import canonical_pane_role
 from .stack import stack_base_of
@@ -33,11 +34,6 @@ _ABSOLUTE_GRID_TARGETS: dict[str, dict[Direction, str]] = {
         "up": "somnium:N",
         "down": "somnium:S",
     },
-}
-
-_PRIMARY_PERSONA_ROLES: dict[str, str] = {
-    "legion": "legion:custodes",
-    "mechanicus": "mechanicus:fabricator-general",
 }
 
 _LEGACY_STACK_FOCUSED_PANE_OPTION = "@LEGION_FOCUSED_PANE"
@@ -264,6 +260,13 @@ def _uppermost_worker(panes: list[StackPaneInfo], base: str) -> StackPaneInfo | 
     return min(workers, key=lambda pane: (pane.top, pane.left, pane.pane_id))
 
 
+def _lowermost_worker(panes: list[StackPaneInfo], base: str) -> StackPaneInfo | None:
+    workers = [pane for pane in panes if _is_stack_worker(pane, base)]
+    if not workers:
+        return None
+    return max(workers, key=lambda pane: (pane.top, pane.left, pane.pane_id))
+
+
 def _focused_or_uppermost_worker_target(adapter: TmuxAdapter, ctx: CurrentPaneContext) -> str:
     panes = _list_stack_panes(adapter, ctx.window_target)
     worker = _stored_focused_worker(adapter, ctx.window_target, panes, ctx.window_base)
@@ -272,26 +275,57 @@ def _focused_or_uppermost_worker_target(adapter: TmuxAdapter, ctx: CurrentPaneCo
     return _stable_target_for(worker, panes) if worker else ""
 
 
+def _persona_roles_for_base(base: str) -> tuple[str, ...]:
+    spec = STACK_PAGE_SPECS.get(base)
+    if spec is None:
+        return ()
+    return (spec.orchestrator_role, *(persona.role for persona in spec.secondary_personas))
+
+
+def _persona_panes(panes: list[StackPaneInfo], base: str) -> list[StackPaneInfo]:
+    roles = set(_persona_roles_for_base(base))
+    return [pane for pane in panes if pane.role in roles]
+
+
+def _topmost_persona(panes: list[StackPaneInfo], base: str) -> StackPaneInfo | None:
+    personas = _persona_panes(panes, base)
+    if not personas:
+        return None
+    return min(personas, key=lambda pane: (pane.top, pane.left, pane.pane_id))
+
+
+def _bottommost_persona(panes: list[StackPaneInfo], base: str) -> StackPaneInfo | None:
+    personas = _persona_panes(panes, base)
+    if not personas:
+        return None
+    return max(personas, key=lambda pane: (pane.top, pane.left, pane.pane_id))
+
+
 def _is_persona_pane(ctx: CurrentPaneContext) -> bool:
-    if ctx.pane_type in {"legion", "mechanicus"}:
+    if ctx.pane_type in STACK_PAGE_SPECS:
         return True
-    primary = _PRIMARY_PERSONA_ROLES.get(ctx.window_base)
-    return bool(primary and ctx.pane_role == primary)
+    return ctx.pane_role in _persona_roles_for_base(ctx.window_base)
 
 
-def _absolute_target(adapter: TmuxAdapter, ctx: CurrentPaneContext, direction: Direction) -> str:
+def _absolute_target(
+    adapter: TmuxAdapter, ctx: CurrentPaneContext, direction: Direction
+) -> str | None:
     page_targets = _ABSOLUTE_GRID_TARGETS.get(ctx.window_base)
     if page_targets:
         return page_targets[direction]
 
-    if ctx.window_base not in _PRIMARY_PERSONA_ROLES:
+    if ctx.window_base not in STACK_PAGE_SPECS:
         return ""
+    panes = _list_stack_panes(adapter, ctx.window_target)
     if direction == "left":
-        return _PRIMARY_PERSONA_ROLES[ctx.window_base]
-    if direction == "right":
-        return _focused_or_uppermost_worker_target(adapter, ctx)
-    # Stack pages do not have a single clear absolute north/south target.
-    return ""
+        persona = _topmost_persona(panes, ctx.window_base)
+    elif direction == "right":
+        persona = _bottommost_persona(panes, ctx.window_base)
+    elif direction == "up":
+        persona = _uppermost_worker(panes, ctx.window_base)
+    else:
+        persona = _lowermost_worker(panes, ctx.window_base)
+    return _stable_target_for(persona, panes) if persona else None
 
 
 def _relative_special_target(
@@ -299,7 +333,7 @@ def _relative_special_target(
 ) -> str:
     if direction != "right":
         return ""
-    if ctx.window_base not in _PRIMARY_PERSONA_ROLES:
+    if ctx.window_base not in STACK_PAGE_SPECS:
         return ""
     if not _is_persona_pane(ctx):
         return ""
@@ -383,7 +417,7 @@ def select_pane(
     )
     ctx = _current_context(adapter, client=client)
 
-    target = ""
+    target: str | None = ""
     if mode == "absolute":
         target = _absolute_target(adapter, ctx, direction)
     else:
@@ -392,6 +426,8 @@ def select_pane(
     if target:
         _select_target(adapter, ctx, target)
         return f"pane-select {mode} {direction}: {target}"
+    if target is None:
+        return f"pane-select {mode} {direction}: noop"
 
     _select_relative(adapter, ctx, direction)
     return f"pane-select {mode} {direction}: relative"
