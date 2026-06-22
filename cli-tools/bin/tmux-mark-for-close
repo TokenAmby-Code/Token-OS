@@ -104,6 +104,14 @@ print(json.dumps({"mode": mode, "lifecycle": lifecycle, "pane": pane}, separator
 PY
 }
 
+_begin_atomic_close_contract() {
+    # Once mark-for-close commits an API lifecycle/closeout request, the wrapper
+    # owns completion. Extra Ctrl-C keystrokes from close muscle memory must not
+    # kill this popup between arming, final-message delivery, and the victory
+    # signal.
+    trap '' INT QUIT TSTP
+}
+
 _unsubscribe_mark() {
     local body response
     body="$(python3 - "$INSTANCE_ID" "$PANE" <<'PY'
@@ -137,6 +145,7 @@ if [[ "$MODE_CHOICE" == "message" ]]; then
         echo "No final message entered; cancelled." >&2
         exit 1
     fi
+    _begin_atomic_close_contract
     _api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body after-stop)" >/dev/null
     if ! printf '%s' "$FINAL_MESSAGE" | "$TMUXCTL_BIN" send-text --pane "$PANE" --stdin --clear-prompt; then
         if _unsubscribe_mark; then
@@ -149,10 +158,13 @@ if [[ "$MODE_CHOICE" == "message" ]]; then
         exit 1
     fi
     tmux display-message "mark-for-close armed: $LIFECYCLE after next Stop" 2>/dev/null || true
+    echo "MARK_FOR_CLOSE_OK mode=after-stop lifecycle=$LIFECYCLE instance=$INSTANCE_ID pane=$PANE"
     exit 0
 fi
 
 if [[ "$MODE_CHOICE" == "now" ]]; then
+    _begin_atomic_close_contract
     _api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body now)" >/dev/null
     tmux display-message "mark-for-close: $LIFECYCLE executed" 2>/dev/null || true
+    echo "MARK_FOR_CLOSE_OK mode=now lifecycle=$LIFECYCLE instance=$INSTANCE_ID pane=$PANE"
 fi

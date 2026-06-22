@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import pathlib
+import signal
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl.close import close_instance, close_pane
+from tmuxctl.close import close_contract_signal_shield, close_instance, close_pane
 from tmuxctl.tmux_adapter import TmuxAdapter
 
 
@@ -165,3 +166,29 @@ def test_respawn_preflight_clears_runtime_and_style_first():
         ("select-pane", "-t", "%9", "-T", ""),
     ]
     assert ("set-option", "-pu", "-t", "%9", "@INSTANCE_ID") in adapter.raw
+
+
+def test_close_contract_signal_shield_ignores_ctrl_c_signals(monkeypatch):
+    calls = []
+
+    def fake_signal(sig, handler):
+        calls.append((sig, handler))
+        return f"old-{sig}"
+
+    monkeypatch.setattr(signal, "signal", fake_signal)
+
+    with close_contract_signal_shield():
+        pass
+
+    ignored = calls[:3]
+    restored = calls[3:]
+    assert ignored == [
+        (signal.SIGINT, signal.SIG_IGN),
+        (signal.SIGQUIT, signal.SIG_IGN),
+        (signal.SIGTSTP, signal.SIG_IGN),
+    ]
+    assert restored == [
+        (signal.SIGINT, f"old-{signal.SIGINT}"),
+        (signal.SIGQUIT, f"old-{signal.SIGQUIT}"),
+        (signal.SIGTSTP, f"old-{signal.SIGTSTP}"),
+    ]

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from typing import Any
 
 from .focus_guard import preserve_focus
@@ -31,6 +33,43 @@ LIFECYCLE_ALIASES = {
     "retire-and-archive": "archive-session-doc",
     "banish": "banish",
 }
+
+
+@contextmanager
+def close_contract_signal_shield():
+    """Ignore terminal interrupt keys while a close contract is in flight.
+
+    Operators often mash Ctrl-C to close Claude/Codex panes. When close is
+    running inside a tmux popup or direct shell, those extra Ctrl-C keystrokes
+    can reach this wrapper process as SIGINT. Once close starts, Token-API
+    lifecycle, pane runtime cleanup, interrupts, kill fallback, and stack
+    enforcement are one atomic contract; a human interrupt should hit only the
+    target pane, never strand the wrapper halfway through its cleanup.
+    """
+    saved = {}
+    signals = (
+        getattr(signal, "SIGINT", None),
+        getattr(signal, "SIGQUIT", None),
+        getattr(signal, "SIGTSTP", None),
+    )
+    try:
+        for sig in signals:
+            if sig is None:
+                continue
+            try:
+                saved[sig] = signal.signal(sig, signal.SIG_IGN)
+            except (OSError, RuntimeError, ValueError):
+                # Non-main threads cannot mutate signal handlers. The close
+                # path still runs; callers that execute it in a main process get
+                # the shield.
+                pass
+        yield
+    finally:
+        for sig, handler in saved.items():
+            try:
+                signal.signal(sig, handler)
+            except (OSError, RuntimeError, ValueError):
+                pass
 
 
 def normalize_lifecycle(value: str | None) -> str:
@@ -123,7 +162,9 @@ def clear_runtime(adapter: TmuxAdapter, pane: str) -> dict[str, Any]:
     return {"status": "cleared", "pane": pane}
 
 
-def close_pane(adapter: TmuxAdapter, pane: str, *, timeout: float = 3.0) -> dict[str, Any]:
+def _close_pane_unshielded(
+    adapter: TmuxAdapter, pane: str, *, timeout: float = 3.0
+) -> dict[str, Any]:
     pane = _resolve_current(adapter, pane)
     role = _pane_role(adapter, pane)
     if role in PROTECTED_STATIC_PERSONA_PANES:
@@ -176,6 +217,11 @@ def close_pane(adapter: TmuxAdapter, pane: str, *, timeout: float = 3.0) -> dict
     }
 
 
+def close_pane(adapter: TmuxAdapter, pane: str, *, timeout: float = 3.0) -> dict[str, Any]:
+    with close_contract_signal_shield():
+        return _close_pane_unshielded(adapter, pane, timeout=timeout)
+
+
 def close_instance(
     adapter: TmuxAdapter,
     instance_id: str,
@@ -185,48 +231,49 @@ def close_instance(
     pane: str | None = None,
     timeout: float = 3.0,
 ) -> dict[str, Any]:
-    lifecycle = normalize_lifecycle(lifecycle)
-    mode = (mode or "now").strip().lower()
-    if mode not in {"now", "after-stop"}:
-        raise ValueError(f"unsupported close mode: {mode}")
+    with close_contract_signal_shield():
+        lifecycle = normalize_lifecycle(lifecycle)
+        mode = (mode or "now").strip().lower()
+        if mode not in {"now", "after-stop"}:
+            raise ValueError(f"unsupported close mode: {mode}")
 
-    resolved_pane = pane or ""
-    if not resolved_pane:
-        from .resolver import resolve_instance
+        resolved_pane = pane or ""
+        if not resolved_pane:
+            from .resolver import resolve_instance
 
-        resolved = resolve_instance(adapter, instance_id)
-        resolved_pane = resolved.pane_id or ""
+            resolved = resolve_instance(adapter, instance_id)
+            resolved_pane = resolved.pane_id or ""
 
-    if mode == "after-stop":
-        body = {"mode": "after-stop", "lifecycle": lifecycle}
-        if resolved_pane:
-            body["pane"] = resolved_pane
-        result = _http_json("POST", f"/api/instances/{instance_id}/mark-for-close", body)
-        if result.get("success") is False:
-            raise ValueError(f"mark-for-close failed: {json.dumps(result, sort_keys=True)}")
+        if mode == "after-stop":
+            body = {"mode": "after-stop", "lifecycle": lifecycle}
+            if resolved_pane:
+                body["pane"] = resolved_pane
+            result = _http_json("POST", f"/api/instances/{instance_id}/mark-for-close", body)
+            if result.get("success") is False:
+                raise ValueError(f"mark-for-close failed: {json.dumps(result, sort_keys=True)}")
+            return {
+                "status": "armed",
+                "instance_id": instance_id,
+                "lifecycle": lifecycle,
+                "result": result,
+            }
+
+        lifecycle_result = _http_json("PATCH", f"/api/instances/{instance_id}/{lifecycle}")
+        if not resolved_pane:
+            return {
+                "status": "lifecycle_applied",
+                "instance_id": instance_id,
+                "lifecycle": lifecycle,
+                "lifecycle_result": lifecycle_result,
+                "close": {"status": "skipped", "reason": "pane_unresolved"},
+            }
+        close_result = _close_pane_unshielded(adapter, resolved_pane, timeout=timeout)
         return {
-            "status": "armed",
-            "instance_id": instance_id,
-            "lifecycle": lifecycle,
-            "result": result,
-        }
-
-    lifecycle_result = _http_json("PATCH", f"/api/instances/{instance_id}/{lifecycle}")
-    if not resolved_pane:
-        return {
-            "status": "lifecycle_applied",
+            "status": "closed"
+            if close_result.get("status") == "closed"
+            else close_result.get("status"),
             "instance_id": instance_id,
             "lifecycle": lifecycle,
             "lifecycle_result": lifecycle_result,
-            "close": {"status": "skipped", "reason": "pane_unresolved"},
+            "close": close_result,
         }
-    close_result = close_pane(adapter, resolved_pane, timeout=timeout)
-    return {
-        "status": "closed"
-        if close_result.get("status") == "closed"
-        else close_result.get("status"),
-        "instance_id": instance_id,
-        "lifecycle": lifecycle,
-        "lifecycle_result": lifecycle_result,
-        "close": close_result,
-    }

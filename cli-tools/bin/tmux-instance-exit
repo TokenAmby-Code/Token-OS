@@ -58,6 +58,14 @@ _normalize_lifecycle() {
     esac
 }
 
+_begin_atomic_close_contract() {
+    # After the operator chooses a lifecycle, close is an atomic wrapper-owned
+    # contract. Extra Ctrl-C keystrokes are expected muscle memory for Claude
+    # panes; they may hit the target pane, but must not abort this cleanup
+    # wrapper between lifecycle mutation, pane close, and stack enforcement.
+    trap '' INT QUIT TSTP
+}
+
 INSTANCE_ID="$(tmux show-options -pv -t "$PANE" @INSTANCE_ID 2>/dev/null || true)"
 if [[ -z "$LIFECYCLE_ACTION" && -n "$INSTANCE_ID" ]]; then
     _show_close_menu
@@ -72,8 +80,10 @@ if [[ -z "$INSTANCE_ID" ]]; then
     exit 1
 fi
 
+_begin_atomic_close_contract
 if IMPERIUM_TMUX_AUTOMATION=1 "$TMUXCTL_BIN" close --instance-id "$INSTANCE_ID" --pane "$PANE" --lifecycle "$LIFECYCLE" --mode now; then
     tmux display-message "tmux-instance-exit: $LIFECYCLE executed" 2>/dev/null || true
+    echo "CLOSE_CONTRACT_OK lifecycle=$LIFECYCLE instance=$INSTANCE_ID pane=$PANE"
 else
     tmux display-message "tmux-instance-exit: $LIFECYCLE failed" 2>/dev/null || true
     exit 1
