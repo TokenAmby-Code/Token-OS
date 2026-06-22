@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime
@@ -190,7 +191,7 @@ async def resolve_pane(identifier: str) -> str | None:
 async def lookup_instance_for_pane(pane_id: str) -> dict[str, Any] | None:
     instance_id = await instance_id_for_pane(pane_id)
     if not instance_id:
-        return None
+        return await _rowless_live_instance_for_pane(pane_id)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -209,6 +210,63 @@ async def lookup_instance_for_pane(pane_id: str) -> dict[str, Any] | None:
         return None
     result = dict(row)
     result["tmux_pane"] = pane_id
+    for pane in await _tmux_list_panes():
+        if pane.get("pane_id") == pane_id and pane.get("position_id"):
+            result["pane_label"] = pane["position_id"]
+            break
+    return result
+
+
+async def _resolve_agent_for_pane(pane_id: str) -> str | None:
+    """Return claude/codex for a live rowless pane via tmuxctl's ps detector."""
+    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [
+                sys.executable,
+                "-m",
+                "tmuxctl.cli",
+                "resolve-agent",
+                "--pane",
+                pane_id,
+                "--agent",
+                "auto",
+                "--default",
+                "auto",
+            ],
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    engine = (proc.stdout or "").strip().lower()
+    return engine if engine in {"claude", "codex"} else None
+
+
+async def _rowless_live_instance_for_pane(pane_id: str) -> dict[str, Any] | None:
+    engine = await _resolve_agent_for_pane(pane_id)
+    if not engine:
+        return None
+    result: dict[str, Any] = {
+        "id": None,
+        "working_dir": None,
+        "engine": engine,
+        "tab_name": None,
+        "status": "live_rowless",
+        "last_activity": None,
+        "tmux_pane": pane_id,
+        "rowless_live": True,
+    }
     for pane in await _tmux_list_panes():
         if pane.get("pane_id") == pane_id and pane.get("position_id"):
             result["pane_label"] = pane["position_id"]

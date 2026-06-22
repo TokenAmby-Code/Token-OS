@@ -138,13 +138,21 @@ class TmuxControlPlane:
 
     def resolve_pane(self, target: str) -> str:
         resolved = resolve_pane(self.adapter, target)
+        from .skill_invoke import resolve_agent_for_pane
+
         public_id = canonical_pane_role(resolved.pane_role) if resolved.pane_role else ""
         chain = " -> ".join(resolved.chain)
+        try:
+            agent = resolve_agent_for_pane(self.adapter, resolved.pane_id, default="auto")
+        except Exception:
+            agent = "auto"
         lines = [
             f"requested: {resolved.requested}",
             f"pane_id: {public_id or '(unset)'}",
             f"role: {resolved.pane_role or '(unset)'}",
             f"kind: {resolved.pane_kind.value}",
+            f"agent: {agent}",
+            f"live_agent: {str(agent != 'auto').lower()}",
         ]
         if chain:
             lines.append(f"chain: {chain}")
@@ -158,11 +166,21 @@ class TmuxControlPlane:
         empty strings.
         """
         resolved = resolve_instance(self.adapter, instance_id)
+        agent = "auto"
+        if resolved.pane_id:
+            from .skill_invoke import resolve_agent_for_pane
+
+            try:
+                agent = resolve_agent_for_pane(self.adapter, resolved.pane_id, default="auto")
+            except Exception:
+                agent = "auto"
         return {
             "instance_id": resolved.instance_id,
             "pane_id": resolved.pane_id or "",
             "pane_role": resolved.pane_role or "",
             "found": resolved.found,
+            "agent": agent,
+            "live_agent": agent != "auto",
         }
 
     def freelist(self) -> list[dict]:

@@ -903,8 +903,12 @@ def _assert_instance_impl(
             adapter.run("kill-pane", "-t", pane_id, allow_failure=True)
             result.update({"ok": False, "action": "pruned", "reason": "stack_worker_runtime_dead"})
             return finish(result)
-        ok = row is not None
-        result.update({"ok": ok, "reason": "live" if ok else "no_registry_instance"})
+        # Stack workers may be live before/without a registry row (notably Codex
+        # workers whose authoritative signal is the pane process tree).  Once
+        # runtime_ok is true, allow byte delivery to the pane; preserve the exact
+        # row-backed behavior when a row exists.
+        ok = True
+        result.update({"ok": ok, "reason": "live"})
         return finish(result)
 
     if not runtime_ok and rows:

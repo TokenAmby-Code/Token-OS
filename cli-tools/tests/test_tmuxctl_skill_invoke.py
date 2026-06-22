@@ -161,6 +161,33 @@ def test_invoke_skill_in_pane_prompt_start_buffer_separates_arguments(monkeypatc
     assert tab_index < prompt_end_index
 
 
+def test_resolve_agent_detects_codex_in_pane_process_subtree(monkeypatch):
+    """Rowless Codex workers surface as shell/node descendants, not registry rows."""
+    adapter = RecordingAdapter()
+
+    def fake_run(*args: str, allow_failure: bool = False) -> str:
+        adapter.calls.append(args)
+        if args == ("display-message", "-t", "%42", "-p", "#{pane_id}"):
+            return "%42\n"
+        if args == ("display-message", "-t", "%42", "-p", "#{pane_pid}"):
+            return "100\n"
+        return ""
+
+    adapter.run = fake_run
+    monkeypatch.setattr(
+        skill_invoke,
+        "fetch_instance_registry",
+        lambda: InstanceRegistrySnapshot(device_id="Mac-Mini", instances=()),
+    )
+    monkeypatch.setattr(
+        skill_invoke,
+        "_process_tree",
+        lambda: ({100: [101], 101: [102]}, {101: "node worker", 102: "node /x/@openai/codex"}),
+    )
+
+    assert skill_invoke.resolve_agent_for_pane(adapter, "%42", default="auto") == "codex"
+
+
 def test_move_to_prompt_start_emits_single_batched_pgup_then_home() -> None:
     # One send-keys subprocess carries tmux repeat-count PgUp plus the Home terminator.
     adapter = RecordingAdapter()

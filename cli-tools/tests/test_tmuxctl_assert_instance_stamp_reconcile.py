@@ -139,6 +139,24 @@ def test_both_layers_refuse_an_unstamped_pane_with_no_row():
     assert result["reason"] == "no_registry_instance", result
 
 
+def test_rowless_live_stack_worker_is_deliverable_by_process_tree():
+    """A live Codex stack-worker without a registry row is still a send target."""
+    adapter = StampAdapter(panes={})
+    resolved = SimpleNamespace(pane_id=_LIVE_PANE, pane_role="stack:worker-1")
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="stack-worker"),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "fetch_instance_registry", return_value=_registry()),
+        patch.object(assertions, "log_event"),
+    ):
+        result = assert_instance(adapter, _LIVE_PANE)
+
+    assert result["ok"] is True, result
+    assert result["reason"] == "live", result
+    assert result["instance_id"] == "", result
+
+
 def test_dead_runtime_refused_even_with_matching_stamp():
     """Liveness still gates: a lingering stamp must not resurrect a dead pane.
     assert_instance fails closed on runtime_ok=False regardless of the stamp.
