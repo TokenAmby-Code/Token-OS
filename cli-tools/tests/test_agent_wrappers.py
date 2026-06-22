@@ -276,6 +276,56 @@ TOKEN_API_AGENT_WRAPPER_BYPASS=1 command codex raw-beta
     ]
 
 
+def test_install_shims_preserves_vendor_and_installs_bypass_shim(tmp_path: Path) -> None:
+    # End-to-end exercise of the installer. A `bash -n` syntax check cannot catch
+    # runtime faults like the `local a=$1 b=$a` / set -u unbound-variable trap, so
+    # this runs the installer for real against a sandbox via the front-door overrides.
+    claude_front = tmp_path / "local-bin" / "claude"
+    codex_front = tmp_path / "opt-bin" / "codex"
+    claude_front.parent.mkdir(parents=True)
+    codex_front.parent.mkdir(parents=True)
+    _write_executable(claude_front, '#!/usr/bin/env bash\necho real-claude "$@"\n')
+    _write_executable(codex_front, '#!/usr/bin/env bash\necho real-codex "$@"\n')
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "CLAUDE_FRONT_DOOR": str(claude_front),
+            "CODEX_FRONT_DOOR": str(codex_front),
+        }
+    )
+    installer = CLI_TOOLS / "bin" / "agent-wrapper-install-shims"
+    result = subprocess.run([str(installer)], env=env, text=True, capture_output=True, check=True)
+    assert "installed claude shim" in result.stdout
+    assert "installed codex shim" in result.stdout
+
+    for front, engine in ((claude_front, "claude"), (codex_front, "codex")):
+        real = front.with_name(front.name + ".token-os-real")
+        # Vendor binary preserved verbatim, front door replaced with a shim.
+        assert real.exists()
+        assert real.read_text(encoding="utf-8") == f'#!/usr/bin/env bash\necho real-{engine} "$@"\n'
+        shim = front.read_text(encoding="utf-8")
+        assert "TOKEN_API_AGENT_WRAPPER_BYPASS" in shim
+        assert str(CLI_TOOLS / "bin" / engine) in shim
+        assert str(real) in shim
+
+        # The bypass env var routes the shim straight to the preserved vendor binary.
+        bypass = os.environ.copy()
+        bypass["TOKEN_API_AGENT_WRAPPER_BYPASS"] = "1"
+        out = subprocess.run(
+            [str(front), "ping"], env=bypass, text=True, capture_output=True, check=True
+        )
+        assert out.stdout.strip() == f"real-{engine} ping"
+
+    # Re-running is idempotent: it must not clobber the preserved real with a shim.
+    again = subprocess.run([str(installer)], env=env, text=True, capture_output=True)
+    assert again.returncode == 0
+    assert (
+        claude_front.with_name("claude.token-os-real").read_text(encoding="utf-8")
+        == '#!/usr/bin/env bash\necho real-claude "$@"\n'
+    )
+
+
 def test_static_launch_code_avoids_raw_agent_front_doors() -> None:
     allowed = {
         CLI_TOOLS / "scripts" / "agent-wrapper.sh",
