@@ -8,12 +8,15 @@ name: PR Gate (blocking)
 # pytest is intentionally NOT on this hot main-path gate — the full suite is
 # preserved in prod-gate.yml (future prod-branch CI). See that file.
 #
-# NOTE: re-adding pytest here as a BLOCKING gate is the intended next step (now
-# that pytest-xdist makes it fast), but it is blocked on test-suite hermeticity:
-# the suite still flakes under parallel execution (cross-file global-state
-# pollution) even with --dist loadfile, and main currently carries pre-existing
-# failures. Until the suite is reliably green under `-n auto --dist loadfile`,
-# pytest runs only on the advisory push gate (push.yml) and prod-gate.yml.
+# pytest is being re-introduced here as a blocking gate via a shadow-then-flip
+# rollout. The "Test (pytest)" step below currently carries `continue-on-error:
+# true` (SHADOW phase) — it runs on every real PR and surfaces its result, but
+# cannot block merge. The clean-runner CI arbiter showed token-api is already
+# green parallel (`-n auto --dist loadfile`); cli-tools' parallel flakes were
+# pure CPU contention, so cli-tools runs SERIAL here while token-api (the long
+# pole) stays parallel. The FLIP step (PR-C) simply deletes the one
+# `continue-on-error: true` line below; the job name stays `quality`, which
+# branch protection already requires — no branch-protection edit is needed.
 
 on:
   pull_request:
@@ -44,7 +47,7 @@ jobs:
       checks: write
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,10 +101,18 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports .)
           fi
 
-      # NOTE: pytest is NOT yet on the blocking gate — see header comment. The
-      # full suite is preserved in prod-gate.yml and runs (advisory) in push.yml.
-      # Hot-path gates retained: ruff format/lint, mypy, CodeRabbit, secrets-scan
-      # (secrets-scan.yml), push-advisory (push.yml), deployed smoke (deploy-prod.yml).
+      # SHADOW phase: pytest runs here but `continue-on-error: true` keeps it
+      # non-blocking. token-api runs first (long pole) parallel; cli-tools runs
+      # serial. The FLIP (PR-C) removes the one `continue-on-error` line below.
+      - name: Test (pytest)
+        continue-on-error: true
+        run: |
+          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
+            (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --timeout=120 --tb=short)
+          fi
+          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
+            (cd cli-tools && uv run --python 3.11 --group dev pytest --timeout=120 --tb=short)
+          fi
 
       - name: CodeRabbit PR gate
         env:

@@ -94,11 +94,13 @@ jobs:
         id: test
         continue-on-error: true
         run: |
-          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
-            (cd cli-tools && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --tb=short) || echo "::warning::pytest failed (cli-tools)"
-          fi
+          # token-api runs parallel (already green on clean CI); cli-tools runs
+          # serial — its parallel flakes were CPU contention, not the bottleneck.
           if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
-            (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --tb=short) || echo "::warning::pytest failed (token-api)"
+            (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --timeout=120 --tb=short) || echo "::warning::pytest failed (token-api)"
+          fi
+          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
+            (cd cli-tools && uv run --python 3.11 --group dev pytest --timeout=120 --tb=short) || echo "::warning::pytest failed (cli-tools)"
           fi
 
       - name: CodeRabbit chill review
