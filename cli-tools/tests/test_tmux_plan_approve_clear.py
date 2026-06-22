@@ -86,6 +86,61 @@ def test_codex_current_plan_modal_aborts_when_option_down_is_not_clear_context(
     assert out == "action=none timeout"
 
 
+def test_claude_ignores_stale_scrollback_modal_above_live_clear_context(
+    tmp_path: pathlib.Path,
+) -> None:
+    # capture() reads -S -80, so a stale cursor-marked modal from a prior session
+    # (here an "Exit anyway / Stay" prompt) can sit in scrollback ABOVE the live
+    # clear-context modal. Anchoring on the FIRST cursor option used to pick the
+    # stale "Exit anyway" line (no "clear context") -> classify "none" -> the modal
+    # stuck and forced manual approval. The live modal is always at the bottom, so
+    # we anchor on the LAST cursor option and must still send Enter.
+    fixture = tmp_path / "claude-scrollback.txt"
+    fixture.write_text(
+        "  ❯ 1. Exit anyway\n"
+        "    2. Stay\n"
+        "\n"
+        "tokenclaw@host ~ % claude\n"
+        "\n"
+        " Claude has written up a plan and is ready to execute. Would you\n"
+        " like to proceed?\n"
+        "\n"
+        " ❯1.Yes, clear context (3% used) and\n"
+        "    bypass permissions\n"
+        "   2. Yes, and bypass permissions\n"
+        "   3. Yes, manually approve edits\n"
+    )
+    out = subprocess.check_output(
+        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "claude", "--dry-run"],
+        text=True,
+    ).strip()
+    assert out == "action=claude option-1 Enter"
+
+
+def test_codex_ignores_stale_scrollback_modal_above_live_modal(
+    tmp_path: pathlib.Path,
+) -> None:
+    # Same scrollback-shadow hazard for the Codex two-step: a stale top modal must
+    # not capture the cursor anchor. The live modal's cursor sits on option 1 and
+    # clear-context is one Down -> Down,Enter.
+    fixture = tmp_path / "codex-scrollback.txt"
+    fixture.write_text(
+        "  ❯ 1. Exit anyway\n"
+        "    2. Stay\n"
+        "\n"
+        "Implement this plan?\n"
+        "\n"
+        "› 1. Yes, implement this plan          Switch to Default\n"
+        "  2. Yes, clear context and implement  Fresh thread.\n"
+        "  3. No, stay in Plan mode             Continue planning\n"
+    )
+    out = subprocess.check_output(
+        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
+        text=True,
+    ).strip()
+    assert out == "action=codex option-2 Down Enter"
+
+
 def test_single_flight_lock_aborts_overlapping_watcher(tmp_path: pathlib.Path):
     safe = "%99".replace("%", "_")
     root = tmp_path / "tmux-plan-approve-clear"
