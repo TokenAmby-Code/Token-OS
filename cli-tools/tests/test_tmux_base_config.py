@@ -14,7 +14,7 @@ def _line_starting(prefix: str) -> str:
     raise AssertionError(f"missing tmux binding: {prefix}")
 
 
-def test_pane_select_prefix_arrows_use_native_low_latency_selection():
+def test_pane_select_prefix_arrows_use_native_low_latency_selection() -> None:
     for key, flag in {
         "Left": "-L",
         "Down": "-D",
@@ -29,7 +29,7 @@ def test_pane_select_prefix_arrows_use_native_low_latency_selection():
         assert "switch-client -T pane-select" in line
 
 
-def test_pane_select_prefix_hjkl_deexpand_before_routing():
+def test_pane_select_prefix_hjkl_deexpand_before_routing() -> None:
     for key, direction in {
         "h": "left",
         "j": "down",
@@ -45,7 +45,7 @@ def test_pane_select_prefix_hjkl_deexpand_before_routing():
         assert "switch-client -T pane-select" in line
 
 
-def test_pane_select_enter_expands_without_status_flash():
+def test_pane_select_enter_expands_without_status_flash() -> None:
     line = _line_starting("bind -T pane-select Enter ")
     assert "tmux-grid-expand" in line
     assert "--expand" in line
@@ -53,7 +53,7 @@ def test_pane_select_enter_expands_without_status_flash():
     assert "display-message" not in line
 
 
-def test_pane_select_table_arrows_are_bound_to_relative_routing():
+def test_pane_select_table_arrows_are_bound_to_relative_routing() -> None:
     for key, direction in {
         "Left": "left",
         "Down": "down",
@@ -67,7 +67,7 @@ def test_pane_select_table_arrows_are_bound_to_relative_routing():
         assert "switch-client -T pane-select" in line
 
 
-def test_pane_select_bindings_do_not_use_timer_focus_override():
+def test_pane_select_bindings_do_not_use_timer_focus_override() -> None:
     pane_select_lines = [
         line
         for line in CONF.read_text(encoding="utf-8").splitlines()
@@ -78,7 +78,7 @@ def test_pane_select_bindings_do_not_use_timer_focus_override():
     assert all("allow-mechanicus-focus" not in line for line in pane_select_lines)
 
 
-def test_prefix_q_opens_mark_for_close_popup():
+def test_prefix_q_opens_mark_for_close_popup() -> None:
     conf = CONF.read_text(encoding="utf-8")
     line = _line_starting("bind Q ")
     assert "display-popup" in line
@@ -100,7 +100,7 @@ def test_prefix_q_opens_mark_for_close_popup():
     assert "/archive-session-doc" not in script
 
 
-def test_mark_for_close_script_is_committed_executable():
+def test_mark_for_close_script_is_committed_executable() -> None:
     # core.fileMode is false in this repo, so a missing exec bit is not caught by
     # the working tree; assert the committed git mode is 100755 directly. The
     # tmux popup runs `tmux-mark-for-close` off PATH and a non-exec file fails.
