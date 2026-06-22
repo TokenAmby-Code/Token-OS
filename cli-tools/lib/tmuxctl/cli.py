@@ -52,17 +52,25 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser = subparsers.add_parser("inspect")
     inspect_subparsers = inspect_parser.add_subparsers(dest="inspect_command", required=True)
 
+    # `--physical` is the debug-only opt-in that re-surfaces raw tmux %NN ids.
+    # Default render is canonical-only (the @PANE_ID role) per the canonical-id
+    # campaign, so the normal path never leaks volatile physical ids.
+    _physical_help = "also show raw tmux physical pane ids (%%NN); debug only"
+
     inspect_workspace = inspect_subparsers.add_parser("workspace")
     inspect_workspace.add_argument("--session", default="main")
+    inspect_workspace.add_argument("--physical", action="store_true", help=_physical_help)
 
     inspect_restart = inspect_subparsers.add_parser("restart-plan")
     inspect_restart.add_argument("--session", default="main")
 
     inspect_window = inspect_subparsers.add_parser("window")
     inspect_window.add_argument("--window", default="current")
+    inspect_window.add_argument("--physical", action="store_true", help=_physical_help)
 
     inspect_pane = inspect_subparsers.add_parser("pane")
     inspect_pane.add_argument("--pane", required=True)
+    inspect_pane.add_argument("--physical", action="store_true", help=_physical_help)
 
     normalize_parser = subparsers.add_parser("normalize")
     normalize_parser.add_argument("--window", default="current")
@@ -371,17 +379,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "inspect":
             if args.inspect_command == "workspace":
-                print(control.inspect_workspace(args.session))
+                print(control.inspect_workspace(args.session, physical=args.physical))
                 return 0
             if args.inspect_command == "restart-plan":
                 print(control.inspect_restart_plan(args.session))
                 return 0
             if args.inspect_command == "window":
                 session_name, window_index = _parse_window_ref(args.window, control)
-                print(control.inspect_window(session_name, window_index))
+                print(control.inspect_window(session_name, window_index, physical=args.physical))
                 return 0
             if args.inspect_command == "pane":
-                print(control.inspect_pane(args.pane))
+                print(control.inspect_pane(args.pane, physical=args.physical))
                 return 0
 
         if args.command == "normalize":
