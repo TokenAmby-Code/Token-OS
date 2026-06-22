@@ -86,7 +86,9 @@ def test_codex_current_plan_modal_aborts_when_option_down_is_not_clear_context(
     assert out == "action=none timeout"
 
 
-def test_claude_ignores_stale_scrollback_modal_above_live_clear_context(tmp_path):
+def test_claude_ignores_stale_scrollback_modal_above_live_clear_context(
+    tmp_path: pathlib.Path,
+) -> None:
     # capture() reads -S -80, so a stale cursor-marked modal from a prior session
     # (here an "Exit anyway / Stay" prompt) can sit in scrollback ABOVE the live
     # clear-context modal. Anchoring on the FIRST cursor option used to pick the
@@ -115,7 +117,9 @@ def test_claude_ignores_stale_scrollback_modal_above_live_clear_context(tmp_path
     assert out == "action=claude option-1 Enter"
 
 
-def test_codex_ignores_stale_scrollback_modal_above_live_modal(tmp_path):
+def test_codex_ignores_stale_scrollback_modal_above_live_modal(
+    tmp_path: pathlib.Path,
+) -> None:
     # Same scrollback-shadow hazard for the Codex two-step: a stale top modal must
     # not capture the cursor anchor. The live modal's cursor sits on option 1 and
     # clear-context is one Down -> Down,Enter.
