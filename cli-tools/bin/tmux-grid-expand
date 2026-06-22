@@ -50,7 +50,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$TARGET_PANE" ]]; then
-    TARGET_PANE=$(tmux display-message -p '#{pane_id}')
+    if [[ -n "$CLIENT" ]]; then
+        TARGET_PANE=$(tmux display-message -c "$CLIENT" -p '#{pane_id}')
+    else
+        TARGET_PANE=$(tmux display-message -p '#{pane_id}')
+    fi
 fi
 
 if ! tmux display-message -t "$TARGET_PANE" -p '' >/dev/null 2>&1; then

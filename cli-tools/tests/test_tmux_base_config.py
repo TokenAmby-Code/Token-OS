@@ -14,18 +14,43 @@ def _line_starting(prefix: str) -> str:
     raise AssertionError(f"missing tmux binding: {prefix}")
 
 
-def test_pane_select_prefix_arrows_are_bound_to_absolute_routing():
-    for key, direction in {
-        "Left": "left",
-        "Down": "down",
-        "Up": "up",
-        "Right": "right",
+def test_pane_select_prefix_arrows_use_native_low_latency_selection():
+    for key, flag in {
+        "Left": "-L",
+        "Down": "-D",
+        "Up": "-U",
+        "Right": "-R",
     }.items():
         line = _line_starting(f"bind {key} ")
+        assert "tmuxctl pane-select" not in line
+        assert f"select-pane {flag}" in line
+        assert "resize-pane -Z" in line
+        assert "window_zoomed_flag" in line
+        assert "switch-client -T pane-select" in line
+
+
+def test_pane_select_prefix_hjkl_deexpand_before_routing():
+    for key, direction in {
+        "h": "left",
+        "j": "down",
+        "k": "up",
+        "l": "right",
+    }.items():
+        line = _line_starting(f"bind {key} ")
+        assert "resize-pane -Z" in line
+        assert "window_zoomed_flag" in line
         assert "tmuxctl pane-select" in line
-        assert "--mode absolute" in line
+        assert "--mode relative" in line
         assert f"--direction {direction}" in line
         assert "switch-client -T pane-select" in line
+
+
+def test_pane_select_enter_expands_without_status_flash():
+    line = _line_starting("bind -T pane-select Enter ")
+    assert "tmux-grid-expand" in line
+    assert "--expand" in line
+    assert "#{client_tty}" in line
+    assert "display-message" not in line
 
 
 def test_pane_select_table_arrows_are_bound_to_relative_routing():
