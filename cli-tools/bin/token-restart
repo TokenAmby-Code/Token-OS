@@ -446,12 +446,21 @@ ensure_runtime_checkout() {
 # leaving the working tree clean for the caller to reset onto the deploy target.
 # Ignored files (config.json, token-api/.env, node_modules, …) are never touched.
 # The timestamp comes from runtime `date`, never hardcoded. Returns non-zero only
-# if the WIP could not be safely committed AND pushed (so we never silently lose
-# uncommitted work).
+# if the WIP could not be safely staged, committed, AND pushed — in which case we
+# abort rather than reset over dirt we failed to preserve (never silent data loss).
 shunt_dirty_runtime() {
-    local dir="$1" ts branch wip_sha
+    local dir="$1" ts base branch wip_sha suffix=0
     ts="$(date +%Y%m%d-%H%M%S)"
-    branch="wip/live-dirty-${ts}"
+    # Seed with the PID so two concurrent deploys never collide, then make the name
+    # unique against the actual push target (the bare cache) so a same-second retry
+    # can't reuse an existing ref — a collision would fail checkout-b/push and bring
+    # back a deploy-blocking path, defeating the whole invariant.
+    base="wip/live-dirty-${ts}-$$"
+    branch="$base"
+    while git --git-dir="$TOKEN_OS_BARE_REPO" show-ref --verify --quiet "refs/heads/${branch}"; do
+        suffix=$((suffix + 1))
+        branch="${base}-${suffix}"
+    done
 
     echo -e "${YELLOW}⚠${NC} CD-sync: runtime is dirty; auto-preserving WIP to ${branch} before deploy"
     git -C "$dir" status --short >&2 || true
@@ -462,7 +471,13 @@ shunt_dirty_runtime() {
         echo -e "  ${RED}✗${NC} CD-sync: failed to create WIP branch ${branch}"
         return 1
     fi
-    git -C "$dir" add -A >/dev/null 2>&1 || true
+    # A partial `git add` would let the commit/push succeed while the later hard
+    # reset silently drops the unstaged dirt — so a staging failure must abort,
+    # never be swallowed.
+    if ! git -C "$dir" add -A; then
+        echo -e "  ${RED}✗${NC} CD-sync: failed to stage dirty runtime changes for ${branch}"
+        return 1
+    fi
     if ! git -C "$dir" \
             -c user.name="token-cd" -c user.email="cd@token-os.local" \
             commit -q -m "wip(live): auto-preserved dirty runtime at deploy ${ts}" >/dev/null 2>&1; then

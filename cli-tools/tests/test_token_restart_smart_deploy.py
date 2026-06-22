@@ -123,6 +123,7 @@ if [[ "${STUB_REQUIRE_RUNTIME_WRITABLE:-}" == "1" && ( "$sub" == "fetch" || "$su
 fi
 case "$sub" in
   fetch|stash|update-ref|checkout|cat-file) exit 0 ;;
+  show-ref) exit 1 ;;  # no wip/live-dirty-* ref preexists in the fake bare
   status) exit 0 ;;
   merge-base)
     if [[ "${MERGE_FAIL_TIMES:-0}" != "0" ]]; then
