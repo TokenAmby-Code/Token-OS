@@ -11927,12 +11927,27 @@ async def _direct_tmux_pane_delivery(
         clear_prompt=clear_prompt,
     )
     if send_result.get("gated"):
+        # Direct rowless sends have no registry row, but they still must not
+        # drop a payload when the universal gate suppresses bytes. Queue the
+        # raw pane id as the queue instance_id; process_pane_write_queue_once()
+        # has a live %pane fallback for this exact rowless path and will retry
+        # until the attended draft / typing guard clears.
         gate_reason = send_result.get("gate_reason") or "gated"
+        queued = await enqueue_pane_write(
+            instance_id=pane,
+            tmux_pane=pane,
+            source=source,
+            purpose=purpose,
+            payload=payload,
+        )
+        drained = await process_pane_write_queue_once(queued["id"])
+        result = drained[0] if drained else queued
         return {
             **base,
             "status": PANE_WRITE_PENDING,
             "reason": f"send_gated:{gate_reason}",
             **send_result,
+            **result,
         }
     return {
         **base,

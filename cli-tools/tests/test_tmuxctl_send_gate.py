@@ -592,3 +592,29 @@ def test_target_typing_guard_unattended_pending_prompt_is_deliverable(monkeypatc
     monkeypatch.setattr(send_gate, "_pane_attended", lambda target: False)
 
     assert send_gate.evaluate(("send-keys", "-t", "%9", "hi")) is None
+
+
+def test_send_text_then_submit_gated_attended_pane_writes_no_bytes(
+    monkeypatch, captured_subprocess, recorded_suppressions
+):
+    """Typing guard suppression is atomic for direct pane writes.
+
+    This pins the lower-boundary half of attended-pane queue safety: when a
+    target pane has pending human input and the delay cannot clear, tmuxctl
+    raises a structured gate result and issues no tmux write. The API layer is
+    responsible for queueing that payload for a later drain.
+    """
+    _force_quiet(monkeypatch, False)
+    _force_typing(monkeypatch, True)
+    _no_override(monkeypatch)
+    monkeypatch.setattr(send_gate, "wait_for_gate_clear", lambda *_args, **_kwargs: False)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+
+    with pytest.raises(tmux_adapter.TmuxSendGated) as excinfo:
+        adapter.send_text_then_submit("%attended", "do not clobber", clear_prompt=True)
+
+    assert excinfo.value.gate["reason"] == "typing_guard"
+    assert excinfo.value.gate["suppressed"] is True
+    assert captured_subprocess == [], "gated send_text_then_submit must not touch tmux"
+    assert recorded_suppressions and recorded_suppressions[-1]["reason"] == "typing_guard"
