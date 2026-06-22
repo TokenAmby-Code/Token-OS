@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 from collections import Counter
+import os
 import pathlib
 import stat
 import subprocess
@@ -42,7 +42,13 @@ def test_trigger_classes_map_to_timeout_and_always_no_state(tmp_path: pathlib.Pa
             [
                 "bash",
                 "-c",
-                f'source "{LIB}"; plan_approver_launch --agent codex --trigger-class {trigger} --pane %42 --approver "{approver}" --log-file "{launch_log}" --reason {trigger}',
+                (
+                    f'source "{LIB}"; '
+                    "plan_approver_launch --agent codex "
+                    f'--trigger-class {trigger} --pane %42 '
+                    f'--approver "{approver}" --log-file "{launch_log}" '
+                    f'--reason {trigger}'
+                ),
             ],
             env=env,
             check=True,
@@ -77,7 +83,11 @@ def test_resolve_pane_prefers_env_then_hook_json_then_dispatch_then_pid_walk(
         run_env.pop("TOKEN_API_DISPATCH_RESOLVED_PANE", None)
         run_env.update(extra_env)
         out = subprocess.check_output(
-            ["bash", "-c", f'source "{LIB}"; plan_approver_resolve_pane "" \'{hook}\' ""'],
+            [
+                "bash",
+                "-c",
+                f'source "{LIB}"; plan_approver_resolve_pane "" \'{hook}\' ""',
+            ],
             env=run_env,
             text=True,
             timeout=10,
