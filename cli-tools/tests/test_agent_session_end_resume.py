@@ -19,7 +19,10 @@ def _write_executable(path: Path, body: str) -> None:
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="agent resume hook uses jq")
-def test_agent_session_end_resume_stages_generic_dispatch_command(tmp_path: Path) -> None:
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_agent_session_end_resume_stages_generic_dispatch_command(
+    tmp_path: Path, engine: str
+) -> None:
     db = tmp_path / "agents.db"
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -66,7 +69,7 @@ fi
     )
     payload = {"session_id": "claude-or-codex-native-session"}
     subprocess.run(
-        [str(CLI_TOOLS / "scripts" / "agent-session-end-resume.sh"), "codex"],
+        ["bash", str(CLI_TOOLS / "scripts" / "agent-session-end-resume.sh"), engine],
         input=json.dumps(payload),
         text=True,
         env=env,
@@ -76,7 +79,7 @@ fi
     try:
         assert (
             sentinel.read_text(encoding="utf-8")
-            == "codex\n\ndispatch --id iid-generic --pane self\n"
+            == f"{engine}\n\ndispatch --id iid-generic --pane self\n"
         )
         assert legacy.read_text(encoding="utf-8") == "dispatch --id iid-generic --pane self"
     finally:
