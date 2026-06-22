@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import pathlib
 import subprocess
@@ -142,16 +143,29 @@ def test_codex_ignores_stale_scrollback_modal_above_live_modal(
 
 
 def test_single_flight_lock_aborts_overlapping_watcher(tmp_path: pathlib.Path):
-    safe = "%99".replace("%", "_")
+    # The script's single-flight guard prefers flock (a `.lock` FILE) when the
+    # `flock` binary is available (Linux/CI) and only falls back to an atomic
+    # mkdir (`.lockd` DIR) when it is not (stock macOS). To assert "locked"
+    # deterministically on BOTH backends, hold whichever lock the script will
+    # actually contend on: an exclusive flock on the `.lock` file *and* a
+    # pre-created `.lockd` directory. (Previously this test created only the
+    # `.lockd` dir, so on CI the script took the flock path, acquired the lock
+    # uncontended, and fell through to `state-not-planning` — a platform-dependent
+    # failure, not a flake.) fcntl.flock contends with shell `flock(1)` because
+    # both use the flock(2) syscall.
+    safe = "%99".replace("%", "_")  # mirrors the script's `tr -c 'A-Za-z0-9_.-' '_'`
     root = tmp_path / "tmux-plan-approve-clear"
-    (root / f"{safe}.lockd").mkdir(parents=True)
+    root.mkdir(parents=True)
+    (root / f"{safe}.lockd").mkdir()  # mkdir-fallback backend (macOS)
     env = os.environ.copy()
     env["TMPDIR"] = str(tmp_path)
-    out = subprocess.check_output(
-        [str(SCRIPT), "--pane", "%99", "--agent", "codex", "--dry-run"],
-        text=True,
-        env=env,
-    ).strip()
+    with open(root / f"{safe}.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)  # flock backend (Linux/CI)
+        out = subprocess.check_output(
+            [str(SCRIPT), "--pane", "%99", "--agent", "codex", "--dry-run"],
+            text=True,
+            env=env,
+        ).strip()
     assert out == "action=none locked"
 
 

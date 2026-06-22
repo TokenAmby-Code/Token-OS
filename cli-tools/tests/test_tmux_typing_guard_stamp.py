@@ -248,14 +248,17 @@ def test_tmux_shim_delays_under_typing_guard_then_delivers(tmp_path: Path) -> No
     env.pop("TMUX_SEND_GATE_POLICY", None)
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
     # A keystroke lock ~1s out: the shim's send-gate delays, then the lock
-    # expires by wall-clock and the byte is delivered (no drop).
+    # expires by wall-clock and the byte is delivered (no drop). The gate polls
+    # every 0.5s spawning a python3 subprocess per iteration, so on a contended
+    # CI runner the ~1s wait + process overhead can overrun a tight timeout;
+    # 30s gives ample headroom (pytest-timeout=120 is the true-hang backstop).
     env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 1)
     proc = subprocess.run(
         ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
         text=True,
         capture_output=True,
         env=env,
-        timeout=4,
+        timeout=30,
         check=False,
     )
 
@@ -331,7 +334,9 @@ def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path)
     env.pop("TMUX_SEND_GATE_POLICY", None)
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
     # Keystroke lock ~1s out: agent-cmd queues behind the gate, then delivers
-    # once the lock expires by wall-clock.
+    # once the lock expires by wall-clock. 30s subprocess timeout (vs the gate's
+    # ~1s wait) absorbs CI poll/process overhead; pytest-timeout=120 backstops a
+    # true hang.
     env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 1)
     stub = tmp_path / "tmuxctl-stub"
     stub.write_text(
@@ -355,7 +360,7 @@ def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path)
         text=True,
         capture_output=True,
         env=env,
-        timeout=4,
+        timeout=30,
         check=False,
     )
 
