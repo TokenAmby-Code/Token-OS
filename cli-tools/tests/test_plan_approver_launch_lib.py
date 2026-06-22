@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections import Counter
 import pathlib
+import shlex
 import stat
 import subprocess
 import time
@@ -16,9 +17,9 @@ def _write_exe(path: pathlib.Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _wait(path: pathlib.Path) -> None:
+def _wait_for_lines(path: pathlib.Path, expected: int) -> None:
     for _ in range(50):
-        if path.exists() and path.read_text().strip():
+        if path.exists() and len(path.read_text().strip().splitlines()) >= expected:
             return
         time.sleep(0.05)
 
@@ -37,18 +38,33 @@ def test_trigger_classes_map_to_timeout_and_always_no_state(tmp_path: pathlib.Pa
         "post_tool": "30",
         "late_stop": "10",
     }
-    for trigger, timeout in cases.items():
-        subprocess.run(
+    for trigger in cases:
+        command = " ".join(
             [
-                "bash",
-                "-c",
-                f'source "{LIB}"; plan_approver_launch --agent codex --trigger-class {trigger} --pane %42 --approver "{approver}" --log-file "{launch_log}" --reason {trigger}',
-            ],
+                "source",
+                shlex.quote(str(LIB)) + ";",
+                "plan_approver_launch",
+                "--agent",
+                "codex",
+                "--trigger-class",
+                shlex.quote(trigger),
+                "--pane",
+                shlex.quote("%42"),
+                "--approver",
+                shlex.quote(str(approver)),
+                "--log-file",
+                shlex.quote(str(launch_log)),
+                "--reason",
+                shlex.quote(trigger),
+            ]
+        )
+        subprocess.run(
+            ["bash", "-c", command],
             env=env,
             check=True,
             timeout=10,
         )
-    _wait(argv_log)
+    _wait_for_lines(argv_log, expected=len(cases))
     lines = argv_log.read_text().strip().splitlines()
     assert Counter(lines) == Counter(
         f"--pane %42 --agent codex --timeout {timeout} --no-state" for timeout in cases.values()
@@ -75,8 +91,18 @@ def test_resolve_pane_prefers_env_then_hook_json_then_dispatch_then_pid_walk(
         run_env.pop("TMUX_PANE", None)
         run_env.pop("TOKEN_API_DISPATCH_RESOLVED_PANE", None)
         run_env.update(extra_env)
+        command = " ".join(
+            [
+                "source",
+                shlex.quote(str(LIB)) + ";",
+                "plan_approver_resolve_pane",
+                shlex.quote(""),
+                shlex.quote(hook),
+                shlex.quote(""),
+            ]
+        )
         out = subprocess.check_output(
-            ["bash", "-c", f'source "{LIB}"; plan_approver_resolve_pane "" \'{hook}\' ""'],
+            ["bash", "-c", command],
             env=run_env,
             text=True,
             timeout=10,

@@ -91,7 +91,7 @@ plan_approver_trigger_timeout() {
 
 plan_approver_resolve_pane() {
     local explicit="${1:-}" hook_input="${2:-${HOOK_INPUT:-}}" pane_resolver="${3:-}"
-    local pane cmd
+    local pane cmd_name resolved_cmd
 
     if [[ -n "$explicit" ]]; then
         printf '%s\n' "$explicit"
@@ -119,10 +119,10 @@ plan_approver_resolve_pane() {
         fi
     fi
 
-    for cmd in agent-cmd claude-cmd; do
-        cmd="$(plan_approver_resolve_token_os_bin "$cmd" 2>/dev/null || true)"
-        [[ -n "$cmd" ]] || continue
-        pane="$($cmd --self --resolve-only 2>/dev/null || true)"
+    for cmd_name in agent-cmd claude-cmd; do
+        resolved_cmd="$(plan_approver_resolve_token_os_bin "$cmd_name" 2>/dev/null || true)"
+        [[ -n "$resolved_cmd" ]] || continue
+        pane="$($resolved_cmd --self --resolve-only 2>/dev/null || true)"
         if [[ -n "$pane" ]]; then
             printf '%s\n' "$pane"
             return 0

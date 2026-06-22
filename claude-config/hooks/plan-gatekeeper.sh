@@ -16,7 +16,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB="${SCRIPT_DIR}/../../cli-tools/lib/plan-approver-launch.sh"
 if [[ -f "$LIB" ]]; then
   # shellcheck source=../../cli-tools/lib/plan-approver-launch.sh
-  source "$LIB"
+  source "$LIB" || true
+  if ! type plan_approver_launch >/dev/null 2>&1; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] plan-approver-skip engine=claude trigger=precise_permission reason=ExitPlanMode:${SESSION_ID:-unknown} error=invalid-lib" >> "$LOG" 2>/dev/null || true
+    exit 0
+  fi
 else
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] plan-approver-skip engine=claude trigger=precise_permission reason=ExitPlanMode:${SESSION_ID:-unknown} error=missing-lib" >> "$LOG" 2>/dev/null || true
   exit 0
