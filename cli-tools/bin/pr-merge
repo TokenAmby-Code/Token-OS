@@ -21,6 +21,7 @@ set -euo pipefail
 # Source shared libs
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 source "$SCRIPT_DIR/../lib/git-remote.sh"
+source "$SCRIPT_DIR/../lib/worktree-park.sh" 2>/dev/null || true
 
 # Colors
 RED='\033[0;31m'
@@ -369,6 +370,14 @@ MAIN_BRANCH=$(git symbolic-ref "refs/remotes/${GIT_GITHUB_REMOTE}/HEAD" 2>/dev/n
 log "${PULL} Updating ${MAIN_BRANCH}..."
 
 if [[ "$(git rev-parse --is-bare-repository 2>/dev/null)" == "true" ]]; then
+    # Reconciler park-sweep (incident 2026-06-22): a worktree left checked out on
+    # main pins the ref and makes the fast-forward below refuse ("refusing to fetch
+    # into branch 'refs/heads/main' checked out at <wt>"). Park any such worktree
+    # off main first (detach in place, edits preserved) so the FF can land.
+    if declare -f park_worktrees_off_main >/dev/null 2>&1; then
+        _parked="$(park_worktrees_off_main "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null || true)"
+        [[ -n "$_parked" ]] && printf '%s\n' "$_parked" | sed 's/^/   /'
+    fi
     # No working tree: fast-forward the local ref directly (no checkout). The
     # refspec without a leading '+' only allows fast-forwards, so it is safe
     # even though `main` is the bare repo's HEAD branch.
