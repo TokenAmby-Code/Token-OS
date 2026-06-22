@@ -107,7 +107,8 @@ Usage:
 
 Smart-deploy flow (default):
     0. ff-only sync local bare main from GitHub; update runtime checkout detached
-       to --sha/TOKEN_RESTART_TARGET_SHA or bare main. Dirty runtime aborts.
+       to --sha/TOKEN_RESTART_TARGET_SHA or bare main. A dirty runtime is
+       auto-preserved to a wip/live-dirty-<ts> branch (never blocks the deploy).
     1. If runtime HEAD advanced: diff old→new and restart ONLY the services
        whose files changed:
          token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
