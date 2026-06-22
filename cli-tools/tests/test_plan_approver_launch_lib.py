@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import os
-from collections import Counter
 import pathlib
 import shlex
 import stat
 import subprocess
 import time
+from collections import Counter
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LIB = ROOT / "lib" / "plan-approver-launch.sh"
