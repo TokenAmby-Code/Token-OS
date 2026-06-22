@@ -114,14 +114,190 @@ json_value() {
     printf '%s' "$HOOK_INPUT" | jq -r "$expr" 2>/dev/null || true
 }
 
+payload_has_plan() {
+    [[ "$HOOK_INPUT" == *"<proposed_plan>"* ]]
+}
+
+find_codex_transcript() {
+    local transcript session_id found
+    transcript="$(json_value '.transcript_path // .transcriptPath // empty')"
+    if [[ -n "$transcript" && -f "$transcript" ]]; then
+        printf '%s\n' "$transcript"
+        return 0
+    fi
+
+    session_id="$(json_value '.session_id // .conversation_id // empty')"
+    [[ -n "$session_id" ]] || return 1
+
+    found="$(find "${HOME}/.codex/sessions" -type f -name "*${session_id}*.jsonl" -print 2>/dev/null | head -n 1 || true)"
+    [[ -n "$found" ]] || return 1
+    printf '%s\n' "$found"
+}
+
+latest_transcript_turn_has_plan() {
+    local transcript
+    transcript="$(find_codex_transcript)" || return 1
+    python3 - "$transcript" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+current = []
+latest_completed = []
+
+try:
+    lines = path.read_text(errors="replace").splitlines()
+except OSError:
+    sys.exit(1)
+
+for line in lines:
+    if not line.strip():
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    current.append(obj)
+    payload = obj.get("payload") if isinstance(obj, dict) else None
+    if (
+        isinstance(obj, dict)
+        and obj.get("type") == "event_msg"
+        and isinstance(payload, dict)
+        and payload.get("type") == "task_complete"
+    ):
+        latest_completed = current
+        current = []
+
+if not latest_completed:
+    sys.exit(1)
+
+def walk(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk(child)
+    elif isinstance(value, str):
+        yield value
+
+for item in latest_completed:
+    for value in walk(item):
+        if isinstance(value, dict) and value.get("type") == "Plan":
+            sys.exit(0)
+        if isinstance(value, str) and "<proposed_plan>" in value:
+            sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+
+current_transcript_turn_is_plan_mode() {
+    local transcript
+    transcript="$(find_codex_transcript)" || return 1
+    python3 - "$transcript" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+current = []
+try:
+    lines = path.read_text(errors="replace").splitlines()
+except OSError:
+    sys.exit(1)
+
+for line in lines:
+    if not line.strip():
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    current.append(obj)
+    payload = obj.get("payload") if isinstance(obj, dict) else None
+    if (
+        isinstance(obj, dict)
+        and obj.get("type") == "event_msg"
+        and isinstance(payload, dict)
+        and payload.get("type") == "task_complete"
+    ):
+        current = []
+
+if not current:
+    sys.exit(1)
+
+def walk(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk(child)
+
+for value in walk(current):
+    if not isinstance(value, dict):
+        continue
+    if value.get("collaboration_mode_kind") == "plan":
+        sys.exit(0)
+    mode = value.get("collaboration_mode")
+    if isinstance(mode, dict) and mode.get("mode") == "plan":
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+payload_prompt_starts_plan() {
+    HOOK_PAYLOAD="$HOOK_INPUT" python3 - <<'PY'
+import json, os, sys
+try:
+    data=json.loads(os.environ.get("HOOK_PAYLOAD", ""))
+except Exception:
+    sys.exit(1)
+texts=[]
+def walk(v):
+    if isinstance(v, dict):
+        for k, child in v.items():
+            if k in {"prompt", "message", "text", "user_prompt"} and isinstance(child, str):
+                texts.append(child)
+            walk(child)
+    elif isinstance(v, list):
+        for child in v:
+            walk(child)
+walk(data)
+for text in texts:
+    if text.lstrip().startswith("/plan"):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+launch_plan_approver() {
+    local pane="$1" reason="$2" timeout="${3:-10}"
+    nohup "$PLAN_APPROVER" --pane "$pane" --agent codex --timeout "$timeout" --no-state >>"$LOG_FILE" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+    printf '[%s] %s launched clear-context approver pane=%s reason=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$ACTION_TYPE" "$pane" "$reason" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+
 maybe_launch_plan_approver() {
-    [[ "$ACTION_TYPE" == "Stop" ]] || return 0
+    case "$ACTION_TYPE" in
+        Stop|PostToolUse|UserPromptSubmit) ;;
+        *) return 0 ;;
+    esac
     command -v jq >/dev/null 2>&1 || return 0
     [[ -x "$PLAN_APPROVER" ]] || return 0
 
-    local pane state
+    local pane state reason
     pane="${TMUX_PANE:-}"
     [[ -n "$pane" ]] || pane="$(json_value '.env.TMUX_PANE // empty')"
+    [[ -n "$pane" ]] || pane="${TOKEN_API_DISPATCH_RESOLVED_PANE:-}"
     [[ -n "$pane" ]] || return 0
 
     state="$(
@@ -130,16 +306,41 @@ maybe_launch_plan_approver() {
             "${API_URL}/api/planning/state" 2>/dev/null \
             | jq -r '.planning_state // empty' 2>/dev/null || true
     )"
+
+    reason=""
     case "$state" in
-        planning|approving)
-            (
-                exec 0</dev/null
-                "$PLAN_APPROVER" --pane "$pane" --agent codex --timeout 10 >>"$LOG_FILE" 2>&1
-            ) &
-            disown 2>/dev/null || true
-            [[ "${HOOK_DEBUG:-0}" == "1" ]] && printf '[%s] Stop launched clear-context approver pane=%s state=%s\n' \
-                "$(date '+%Y-%m-%d %H:%M:%S')" "$pane" "$state" >> "$LOG_FILE" 2>/dev/null || true
-            ;;
+        planning) reason="planning-state" ;;
+        approving) reason="approving-state" ;;
+    esac
+    if [[ -z "$reason" ]]; then
+        case "$ACTION_TYPE" in
+            Stop)
+                if payload_has_plan; then
+                    reason="payload-plan"
+                elif latest_transcript_turn_has_plan; then
+                    reason="transcript-plan"
+                fi
+                ;;
+            PostToolUse)
+                if current_transcript_turn_is_plan_mode; then
+                    reason="plan-mode-post-tool"
+                fi
+                ;;
+            UserPromptSubmit)
+                # Stop fires after the plan turn is complete, but the Codex approval
+                # modal can block that completion. Start a safe watcher for every
+                # prompt; tmux-plan-approve-clear is classifier-gated and only sends
+                # keys when the live pane shows the clear-context plan approval modal.
+                reason="user-prompt-watch"
+                ;;
+        esac
+    fi
+    [[ -n "$reason" ]] || return 0
+    case "$ACTION_TYPE:$reason" in
+        UserPromptSubmit:user-prompt-watch) launch_plan_approver "$pane" "$reason" 90 ;;
+        UserPromptSubmit:payload-plan-command) launch_plan_approver "$pane" "$reason" 60 ;;
+        PostToolUse:plan-mode-post-tool) launch_plan_approver "$pane" "$reason" 30 ;;
+        *) launch_plan_approver "$pane" "$reason" 10 ;;
     esac
 }
 

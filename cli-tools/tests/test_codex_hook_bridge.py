@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import subprocess
@@ -20,7 +21,8 @@ def _bridge_env(tmp_path: pathlib.Path, state: str) -> tuple[dict[str, str], pat
         "#!/usr/bin/env bash\n"
         f"printf '%s\\n' \"$*\" >> {curl_log!s}\n"
         'case "$*" in\n'
-        f"  *'/api/planning/state'*) printf '%s\\n' '{{\"success\":true,\"planning_state\":\"{state}\"}}' ;;\n"
+        f"  *'/api/planning/state'*|*'/api/planning/state'*) printf '%s\\n' '{{\"success\":true,\"planning_state\":\"{state}\"}}' ;;\n"
+        f"  *'/api/hooks/'*|*'/api/hooks/'*) cat >/dev/null ; printf '%s\\n' '{{\"success\":true}}' ;;\n"
         "esac\n"
     )
     approver.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {approve_log!s}\n")
@@ -42,34 +44,184 @@ def _bridge_env(tmp_path: pathlib.Path, state: str) -> tuple[dict[str, str], pat
     return env, approve_log
 
 
-def _run_bridge(tmp_path: pathlib.Path, state: str) -> pathlib.Path:
-    env, approve_log = _bridge_env(tmp_path, state)
-    subprocess.run(
-        ["bash", str(SCRIPT), "Stop"],
-        input=b'{"session_id":"codex-1"}',
-        env=env,
-        check=True,
-    )
+def _wait_for_approver(approve_log: pathlib.Path) -> None:
     for _ in range(20):
         if approve_log.exists():
             break
         time.sleep(0.05)
+
+
+def _run_bridge(
+    tmp_path: pathlib.Path,
+    state: str,
+    payload: dict[str, object] | None = None,
+    action: str = "Stop",
+) -> pathlib.Path:
+    env, approve_log = _bridge_env(tmp_path, state)
+    subprocess.run(
+        ["bash", str(SCRIPT), action],
+        input=json.dumps(payload or {"session_id": "codex-1"}).encode(),
+        env=env,
+        check=True,
+    )
+    _wait_for_approver(approve_log)
     return approve_log
+
+
+def _write_transcript(path: pathlib.Path, turns: list[list[dict[str, object]]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for i, items in enumerate(turns, start=1):
+        lines.extend(json.dumps(item) for item in items)
+        lines.append(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "turn_id": f"turn-{i}"},
+                }
+            )
+        )
+    path.write_text("\n".join(lines) + "\n")
 
 
 def test_stop_launches_clear_context_approver_when_planning(tmp_path):
     approve_log = _run_bridge(tmp_path, "planning")
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10"
+    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
 
 
 def test_stop_launches_clear_context_approver_when_approving(tmp_path):
     approve_log = _run_bridge(tmp_path, "approving")
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10"
+    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+
+
+def test_stop_launches_approver_when_latest_transcript_turn_has_plan_item(tmp_path):
+    transcript = tmp_path / ".codex" / "sessions" / "rollout-codex-1.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            [
+                {
+                    "type": "response_item",
+                    "payload": {"item": {"type": "Plan", "text": "do it"}},
+                }
+            ]
+        ],
+    )
+
+    approve_log = _run_bridge(tmp_path, "none", {"session_id": "codex-1"})
+
+    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+
+
+def test_stop_launches_approver_when_latest_transcript_turn_has_proposed_plan(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "<proposed_plan>\nPlan\n</proposed_plan>"}
+                        ],
+                    },
+                }
+            ]
+        ],
+    )
+
+    approve_log = _run_bridge(
+        tmp_path,
+        "none",
+        {"session_id": "codex-1", "transcript_path": str(transcript)},
+    )
+
+    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+
+
+def test_stop_does_not_launch_when_only_older_transcript_turn_has_plan(tmp_path):
+    transcript = tmp_path / ".codex" / "sessions" / "rollout-codex-1.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            [
+                {
+                    "type": "response_item",
+                    "payload": {"item": {"type": "Plan", "text": "old"}},
+                }
+            ],
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    },
+                }
+            ],
+        ],
+    )
+
+    approve_log = _run_bridge(tmp_path, "none", {"session_id": "codex-1"})
+
+    assert not approve_log.exists()
 
 
 def test_stop_does_not_launch_approver_when_not_planning(tmp_path):
     approve_log = _run_bridge(tmp_path, "none")
 
     assert not approve_log.exists()
+
+
+def test_stop_launches_approver_when_payload_has_proposed_plan(tmp_path):
+    approve_log = _run_bridge(
+        tmp_path,
+        "none",
+        {
+            "session_id": "codex-1",
+            "message": "<proposed_plan>\nPlan\n</proposed_plan>",
+        },
+    )
+
+    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+
+
+def test_post_tool_use_in_open_plan_turn_launches_longer_watcher(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "collaboration_mode_kind": "plan"},
+            }
+        )
+        + "\n"
+        + json.dumps({"type": "response_item", "payload": {"type": "function_call"}})
+        + "\n"
+    )
+
+    approve_log = _run_bridge(
+        tmp_path,
+        "none",
+        {"session_id": "codex-1", "transcript_path": str(transcript)},
+        action="PostToolUse",
+    )
+
+    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 30 --no-state"
+
+
+def test_user_prompt_submit_plan_command_launches_longer_watcher(tmp_path):
+    approve_log = _run_bridge(
+        tmp_path,
+        "none",
+        {"session_id": "codex-1", "prompt": "/plan make a tiny plan"},
+        action="UserPromptSubmit",
+    )
+
+    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 90 --no-state"

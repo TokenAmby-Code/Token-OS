@@ -184,6 +184,7 @@ def test_successful_click_leaves_state_for_session_start(tmp_path):
 
     env = os.environ.copy()
     env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["TOKEN_API_TMUX_BIN"] = str(fakebin / "tmux")
     env["TOKEN_API_URL"] = "http://token-api.test"
     subprocess.check_call(
         [str(SCRIPT), "--pane", "%99", "--agent", "codex", "--timeout", "1"],
@@ -213,6 +214,7 @@ def test_dry_run_reads_state_and_reports_not_planning(tmp_path: pathlib.Path) ->
 
     env = os.environ.copy()
     env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["TOKEN_API_TMUX_BIN"] = str(fakebin / "tmux")
     env["TOKEN_API_URL"] = "http://token-api.test"
     out = subprocess.check_output(
         [str(SCRIPT), "--pane", "%99", "--agent", "claude", "--dry-run"],
@@ -230,3 +232,29 @@ def test_non_clear_context_modal_sends_nothing(tmp_path):
         text=True,
     ).strip()
     assert out == "action=none timeout"
+
+
+def test_codex_truncated_current_plan_modal_accepts_fresh_thread_option(
+    tmp_path: pathlib.Path,
+):
+    fixture = tmp_path / "codex-truncated-current.txt"
+    fixture.write_text(
+        "Implement this plan?\n\n"
+        "› 1. Yes, implement t… Switch to\n"
+        "                       Default and\n"
+        "                       start\n"
+        "                       coding.\n"
+        "  2. Yes, clear conte… Fresh\n"
+        "                       thread.\n"
+        "                       Context: 6%\n"
+        "                       used.\n"
+        "  3. No, stay in Plan… Continue\n"
+        "                       planning\n"
+        "                       with the\n"
+        "                       model.\n"
+    )
+    out = subprocess.check_output(
+        [str(SCRIPT), "--capture-file", str(fixture), "--agent", "codex", "--dry-run"],
+        text=True,
+    ).strip()
+    assert out == "action=codex option-2 Down Enter"
