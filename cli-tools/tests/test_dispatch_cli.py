@@ -593,8 +593,8 @@ def test_dispatch_human_origin_uses_codex_harness_state_for_astartes(
     assert "engine:          codex" in result.stdout
     assert "persona:         Astartes — Codex" in result.stdout
     assert "instance_type:   one_off" in result.stdout
-    assert "dispatch_codex_launch_inline" in result.stdout
-    assert 'dispatch_codex_post_hook "SessionStart"' in result.stdout
+    assert "codex-wrapper.sh" in result.stdout
+    assert "dispatch_codex_launch_inline" not in result.stdout
     assert "TOKEN_API_PERSONA=codex-dispatch" not in result.stdout
     assert "sisters-of-battle" not in result.stdout
     assert "Sisters" not in result.stdout
@@ -785,7 +785,8 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     assert "TOKEN_API_CODEX_PROFILE=inquisitor" not in inquisitor.stdout
     assert "TOKEN_API_CODEX_PROFILE=sisters-of-battle" not in inquisitor.stdout
     assert "TOKEN_API_PERSONA=inquisitor" in inquisitor.stdout
-    assert "dispatch_codex_launch_inline" in inquisitor.stdout
+    assert "codex-wrapper.sh" in inquisitor.stdout
+    assert "dispatch_codex_launch_inline" not in inquisitor.stdout
 
     vulkan = subprocess.run(
         [
@@ -1112,7 +1113,8 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     send_line = next(line for line in tmux_text.splitlines() if "send-keys -t %84 bash " in line)
     staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
     staged = staged_path.read_text(encoding="utf-8", errors="replace")
-    assert "dispatch_codex_launch_inline" in staged
+    assert "codex-wrapper.sh" in staged
+    assert "dispatch_codex_launch_inline" not in staged
     assert "--append-system-prompt" not in staged
     assert "Aspirant Session Startup" in staged
 

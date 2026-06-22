@@ -13,8 +13,12 @@ def test_wrapper_scripts_are_bash_syntax_valid() -> None:
             "bash",
             "-n",
             str(CLI_TOOLS / "lib" / "agent-wrapper-common.sh"),
+            str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"),
             str(CLI_TOOLS / "scripts" / "claude-wrapper.sh"),
             str(CLI_TOOLS / "scripts" / "codex-wrapper.sh"),
+            str(CLI_TOOLS / "bin" / "claude"),
+            str(CLI_TOOLS / "bin" / "codex"),
+            str(CLI_TOOLS / "bin" / "agent-wrapper-install-shims"),
         ],
         check=True,
     )
@@ -202,32 +206,102 @@ wait
     )
 
 
-def test_dispatch_stack_enforcement_uses_shared_wrapper_helper() -> None:
+def test_dispatch_uses_codex_wrapper_not_inline_launcher() -> None:
     dispatch = (CLI_TOOLS / "bin" / "dispatch").read_text(encoding="utf-8")
     assert 'source "${LIB_DIR}/agent-wrapper-common.sh"' in dispatch
-    assert 'token_wrapper_enforce_stack_if_needed "${resolved_tmux_pane:-}"' in dispatch
-    marker = "dispatch_codex_stack_enforce_if_needed() {"
-    start = dispatch.index(marker) + len(marker)
-    depth = 1
-    pos = start
-    in_parameter_expansion = 0
-    while pos < len(dispatch) and depth:
-        two = dispatch[pos : pos + 2]
-        char = dispatch[pos]
-        if two == "${":
-            in_parameter_expansion += 1
-            pos += 2
+    assert "dispatch_codex_launch_inline" not in dispatch
+    assert "codex-wrapper.sh" in dispatch
+    assert "claude-wrapper.sh" in dispatch
+
+
+def test_agent_wrapper_owns_stack_enforcement() -> None:
+    wrapper = (CLI_TOOLS / "scripts" / "agent-wrapper.sh").read_text(encoding="utf-8")
+    assert 'token_wrapper_enforce_stack_if_needed "$TMUX_PANE_VALUE"' not in wrapper
+    common = (CLI_TOOLS / "lib" / "agent-wrapper-common.sh").read_text(encoding="utf-8")
+    assert 'token_wrapper_enforce_stack_if_needed "$TMUX_PANE_VALUE"' in common
+    assert "tmuxctl stack enforce" in common
+
+
+def test_command_shims_route_through_wrappers_and_bypass_to_real(tmp_path: Path) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    hooks = tmp_path / "hooks.log"
+    claude_called = tmp_path / "claude-called.txt"
+    codex_called = tmp_path / "codex-called.txt"
+    _write_executable(fakebin / "curl", f'#!/usr/bin/env bash\necho "$*" >> {str(hooks)!r}\n')
+    _write_executable(
+        fakebin / "claude-real",
+        f'#!/usr/bin/env bash\nprintf \'claude bypass=%s args=%s\\n\' "${{TOKEN_API_AGENT_WRAPPER_BYPASS:-}}" "$*" >> {str(claude_called)!r}\n',
+    )
+    _write_executable(
+        fakebin / "codex-real",
+        f'#!/usr/bin/env bash\nprintf \'codex bypass=%s args=%s\\n\' "${{TOKEN_API_AGENT_WRAPPER_BYPASS:-}}" "$*" >> {str(codex_called)!r}\n',
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{CLI_TOOLS / 'bin'}:{fakebin}:{env.get('PATH', '')}",
+            "CLAUDE_WRAPPER_TARGET": str(fakebin / "claude-real"),
+            "CODEX_WRAPPER_TARGET": str(fakebin / "codex-real"),
+            "TOKEN_API_URL": "http://token-api.invalid",
+            "TOKEN_API_WRAPPER_LAUNCH_ID": "shim-wrapper-id",
+        }
+    )
+    env.pop("TMUX_PANE", None)
+    env.pop("TOKEN_API_DISPATCH_RESOLVED_PANE", None)
+
+    script = """
+set -euo pipefail
+command -v claude
+command -v codex
+command claude alpha
+command codex beta
+TOKEN_API_AGENT_WRAPPER_BYPASS=1 command claude raw-alpha
+TOKEN_API_AGENT_WRAPPER_BYPASS=1 command codex raw-beta
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, cwd=tmp_path, text=True, capture_output=True, check=True
+    )
+    lines = result.stdout.splitlines()
+    assert lines[0] == str(CLI_TOOLS / "bin" / "claude")
+    assert lines[1] == str(CLI_TOOLS / "bin" / "codex")
+    assert claude_called.read_text(encoding="utf-8").splitlines() == [
+        "claude bypass=1 args=alpha",
+        "claude bypass= args=raw-alpha",
+    ]
+    assert codex_called.read_text(encoding="utf-8").splitlines() == [
+        "codex bypass=1 args=beta",
+        "codex bypass= args=raw-beta",
+    ]
+
+
+def test_static_launch_code_avoids_raw_agent_front_doors() -> None:
+    allowed = {
+        CLI_TOOLS / "scripts" / "agent-wrapper.sh",
+        CLI_TOOLS / "bin" / "claude",
+        CLI_TOOLS / "bin" / "codex",
+        CLI_TOOLS / "bin" / "agent-wrapper-install-shims",
+    }
+    launch_files = [
+        CLI_TOOLS / "bin" / "dispatch",
+        CLI_TOOLS / "bin" / "work-loop",
+        CLI_TOOLS / "lib" / "shell-aliases.sh",
+        *sorted((CLI_TOOLS / "scripts").glob("*.sh")),
+    ]
+    forbidden = [
+        "$HOME/.local/bin/claude",
+        "~/.local/bin/claude",
+        "/Users/tokenclaw/.local/bin/claude",
+        "/opt/homebrew/bin/codex",
+        "command -v codex",
+    ]
+    offenders: list[str] = []
+    for path in launch_files:
+        if path in allowed or not path.exists():
             continue
-        if char == "}" and in_parameter_expansion:
-            in_parameter_expansion -= 1
-            pos += 1
-            continue
-        if not in_parameter_expansion:
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-        pos += 1
-    body = dispatch[start : pos - 1]
-    assert "tmuxctl stack enforce" not in body
-    assert "#{@PANE_TYPE}" not in body
+        body = path.read_text(encoding="utf-8", errors="replace")
+        for needle in forbidden:
+            if needle in body:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}: {needle}")
+    assert offenders == []
