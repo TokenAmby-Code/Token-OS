@@ -2,22 +2,36 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 
-def _insert_instance(db_path: Path, instance_id: str, working_dir: str) -> None:
+def _insert_instance(
+    db_path: Path, instance_id: str, working_dir: str, *, is_subagent: int = 0
+) -> None:
+    from instance_mutation import sanctioned_insert_instance_sync
+
+    now = datetime.now().isoformat()
     with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO instances (
-                id, name, engine, working_dir, device_id, status, rank,
-                is_subagent, created_at, last_activity
-            ) VALUES (?, ?, 'codex', ?, 'Mac-Mini', 'working', 'astartes', 1,
-                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """,
-            (instance_id, instance_id, working_dir),
+        sanctioned_insert_instance_sync(
+            conn,
+            values={
+                "id": instance_id,
+                "name": instance_id,
+                "engine": "codex",
+                "working_dir": working_dir,
+                "device_id": "Mac-Mini",
+                "status": "working",
+                "rank": "astartes",
+                "is_subagent": is_subagent,
+                "created_at": now,
+                "last_activity": now,
+            },
+            mutation_type="instance_registered",
+            write_source="test",
+            actor="test",
         )
         conn.commit()
 
@@ -47,9 +61,39 @@ async def test_session_end_spawns_dev_server_stop_for_dev_worktree(app_env, monk
     assert result["action"] == "stopped"
     assert len(popen_calls) == 1
     args, kwargs = popen_calls[0]
-    assert args == [str(Path.cwd() / "cli-tools" / "bin" / "dev-server-stop"), str(worktree)]
+    repo_root = Path(hooks.__file__).resolve().parents[2]
+    expected_stop = repo_root / "cli-tools" / "bin" / "dev-server-stop"
+    assert args == [str(expected_stop), str(worktree)]
     assert kwargs["start_new_session"] is True
     assert kwargs["close_fds"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_end_does_not_spawn_dev_server_stop_for_subagent(
+    app_env, monkeypatch, tmp_path
+):
+    hooks = sys.modules["routes.hooks"]
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    worktree = home / "worktrees" / "Token-OS" / "wt-feat-x"
+    worktree.mkdir(parents=True)
+    _insert_instance(app_env.db_path, "subagent-close", str(worktree), is_subagent=1)
+
+    popen_calls: list = []
+
+    class DummyPopen:
+        def __init__(self, args, **kwargs):
+            popen_calls.append((args, kwargs))
+
+    monkeypatch.setattr(hooks.subprocess, "Popen", DummyPopen)
+    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
+    monkeypatch.setattr(hooks, "_schedule_naming_nudge", lambda *a, **k: None)
+    monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
+
+    result = await hooks.handle_session_end({"session_id": "subagent-close", "reason": "logout"})
+
+    assert result["action"] == "stopped"
+    assert popen_calls == []
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -27,18 +28,21 @@ def test_stop_port_process_kills_assigned_71xx_listener_and_keeps_registry(tmp_p
     reg = reg_dir / "worktree-ports.json"
     reg.write_text(json.dumps({str(wt): 7108}), encoding="utf-8")
     calls = tmp_path / "calls.log"
+    worktree_ports_q = shlex.quote(str(WORKTREE_PORTS))
+    calls_q = shlex.quote(str(calls))
+    wt_q = shlex.quote(str(wt))
 
     result = _run_bash(
         f"""
         set -euo pipefail
-        source {WORKTREE_PORTS}
+        source {worktree_ports_q}
         lsof() {{
-            printf 'lsof %s\n' "$*" >> {calls}
+            printf 'lsof %s\n' "$*" >> {calls_q}
             [[ "$*" == *'-tiTCP:7108'* ]] && printf '123\n456\n'
         }}
-        kill() {{ printf 'kill %s\n' "$*" >> {calls}; }}
-        sleep() {{ printf 'sleep %s\n' "$*" >> {calls}; }}
-        stop_port_process {wt}
+        kill() {{ printf 'kill %s\n' "$*" >> {calls_q}; }}
+        sleep() {{ printf 'sleep %s\n' "$*" >> {calls_q}; }}
+        stop_port_process {wt_q}
         """,
         tmp_path,
     )
@@ -63,15 +67,19 @@ def test_stop_port_process_refuses_7777_and_out_of_pool_ports(tmp_path: Path) ->
     reg = reg_dir / "worktree-ports.json"
     reg.write_text(json.dumps({str(live): 7777, str(other): 7200}), encoding="utf-8")
     calls = tmp_path / "calls.log"
+    worktree_ports_q = shlex.quote(str(WORKTREE_PORTS))
+    calls_q = shlex.quote(str(calls))
+    live_q = shlex.quote(str(live))
+    other_q = shlex.quote(str(other))
 
     result = _run_bash(
         f"""
         set -euo pipefail
-        source {WORKTREE_PORTS}
-        lsof() {{ printf 'lsof %s\n' "$*" >> {calls}; printf '999\n'; }}
-        kill() {{ printf 'kill %s\n' "$*" >> {calls}; }}
-        stop_port_process {live}
-        stop_port_process {other}
+        source {worktree_ports_q}
+        lsof() {{ printf 'lsof %s\n' "$*" >> {calls_q}; printf '999\n'; }}
+        kill() {{ printf 'kill %s\n' "$*" >> {calls_q}; }}
+        stop_port_process {live_q}
+        stop_port_process {other_q}
         """,
         tmp_path,
     )

@@ -4311,7 +4311,8 @@ async def handle_session_end(payload: dict) -> dict:
         else:
             _spawn_session_end_assertion(_stop_pane_label or _stop_pane, session_id)
 
-        _spawn_dev_server_stop(_working_dir, session_id)
+        if not is_subagent:
+            _spawn_dev_server_stop(_working_dir, session_id)
 
         # Check remaining active instances
         cursor = await db.execute(
