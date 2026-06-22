@@ -1,6 +1,6 @@
 name: Prod Gate (tests)
 
-# Preserved full pytest suite — RESERVED for the future prod-branch CI.
+# Full pytest suite — RESERVED for the future prod-branch CI.
 #
 # Background: pytest was stripped from the hot main-path gate (pr.yml's `quality`
 # job) so PRs reach `main` fast (Emperor-decreed CI-policy change). The tests were
@@ -12,8 +12,8 @@ name: Prod Gate (tests)
 # into `main` and cannot block them. It can be exercised on demand any time via
 # the Actions tab (workflow_dispatch) to confirm the suite still passes.
 #
-# The pytest invocation is byte-identical to the one previously in pr.yml's
-# `quality` job — same uv/lockfile-pinned runner, same projects, same flags.
+# Runs under pytest-xdist (-n auto --dist loadfile) — parallelized across runner
+# cores so the full suite finishes in a few minutes instead of ~20 min serial.
 
 on:
   pull_request:
@@ -70,8 +70,8 @@ jobs:
       - name: Test (pytest)
         run: |
           if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
-            (cd cli-tools && uv run --python 3.11 --group dev pytest --tb=short)
+            (cd cli-tools && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --tb=short)
           fi
           if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
-            (cd token-api && uv run --python 3.11 --group dev pytest --tb=short)
+            (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --tb=short)
           fi

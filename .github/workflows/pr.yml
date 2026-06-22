@@ -7,6 +7,13 @@ name: PR Gate (blocking)
 # workflow runs the deterministic gates: format, lint, typecheck.
 # pytest is intentionally NOT on this hot main-path gate — the full suite is
 # preserved in prod-gate.yml (future prod-branch CI). See that file.
+#
+# NOTE: re-adding pytest here as a BLOCKING gate is the intended next step (now
+# that pytest-xdist makes it fast), but it is blocked on test-suite hermeticity:
+# the suite still flakes under parallel execution (cross-file global-state
+# pollution) even with --dist loadfile, and main currently carries pre-existing
+# failures. Until the suite is reliably green under `-n auto --dist loadfile`,
+# pytest runs only on the advisory push gate (push.yml) and prod-gate.yml.
 
 on:
   pull_request:
@@ -91,11 +98,9 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports .)
           fi
 
-      # NOTE: pytest was REMOVED from the hot main-path gate (Emperor-decreed
-      # CI-policy change). The full suite is PRESERVED — not weakened — in
-      # prod-gate.yml, reserved for the future prod-branch CI. Tests still exist
-      # and still run there; they just no longer block PRs into main. Hot-path
-      # gates retained: ruff format/lint, mypy, CodeRabbit, secrets-scan
+      # NOTE: pytest is NOT yet on the blocking gate — see header comment. The
+      # full suite is preserved in prod-gate.yml and runs (advisory) in push.yml.
+      # Hot-path gates retained: ruff format/lint, mypy, CodeRabbit, secrets-scan
       # (secrets-scan.yml), push-advisory (push.yml), deployed smoke (deploy-prod.yml).
 
       - name: CodeRabbit PR gate

@@ -8,9 +8,9 @@ merge-triggered webhook that reaches the Mac over Tailscale.
 
 | Workflow | Trigger | Role |
 |---|---|---|
-| `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, pytest, chill CodeRabbit — all **non-blocking** annotations. |
-| `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. **pytest is NOT on this hot path** — stripped so PRs reach `main` fast (Emperor-decreed CI policy). The full suite is preserved in `prod-gate.yml`, not deleted. |
-| `prod-gate.yml` — *Prod Gate (tests)* | PR/push → `prod`, `workflow_dispatch` | Preserved full pytest suite, RESERVED for the future prod-branch CI. Inert until a `prod` branch exists — never runs on PRs into `main`, so it can't block the hot path. Run on demand via the Actions tab. |
+| `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, pytest, chill CodeRabbit — all **non-blocking** annotations. pytest runs under `pytest-xdist -n auto --dist loadfile` (~7 min on a 10-core box vs ~20 min single-threaded). |
+| `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. **pytest is NOT yet on this hot path** — re-adding it as a blocking gate is the intended next step now that xdist makes it fast, but it is blocked on test-suite hermeticity (the suite still flakes under parallel execution). The full suite is preserved in `prod-gate.yml` and runs advisory in `push.yml`. |
+| `prod-gate.yml` — *Prod Gate (tests)* | PR/push → `prod`, `workflow_dispatch` | Full pytest suite under `pytest-xdist -n auto --dist loadfile`, RESERVED for the future prod-branch CI. Inert until a `prod` branch exists — never runs on PRs into `main`, so it can't block the hot path. Run on demand via the Actions tab. |
 | `secrets-scan.yml` | push/PR → `main` | Blocks on leaked IPs/secrets (patterns kept in repo secrets). |
 | `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD. Path-filter → changed-service list → Tailscale ephemeral node → POST `/api/cd/restart` on the Mac (ack-first). Post-merge restart + deployed smoke. |
 
