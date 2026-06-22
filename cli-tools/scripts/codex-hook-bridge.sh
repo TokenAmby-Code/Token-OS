@@ -341,8 +341,7 @@ maybe_launch_plan_approver() {
     fi
     [[ -n "$reason" ]] || return 0
     case "$ACTION_TYPE:$reason" in
-        UserPromptSubmit:user-prompt-watch) launch_plan_approver "$pane" "$reason" 90 ;;
-        UserPromptSubmit:payload-plan-command) launch_plan_approver "$pane" "$reason" 90 ;;
+        UserPromptSubmit:user-prompt-watch|UserPromptSubmit:payload-plan-command) launch_plan_approver "$pane" "$reason" 90 ;;
         PostToolUse:plan-mode-post-tool) launch_plan_approver "$pane" "$reason" 30 ;;
         *) launch_plan_approver "$pane" "$reason" 10 ;;
     esac
