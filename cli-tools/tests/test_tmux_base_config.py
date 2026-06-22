@@ -14,16 +14,20 @@ def _line_starting(prefix: str) -> str:
     raise AssertionError(f"missing tmux binding: {prefix}")
 
 
-def test_pane_select_prefix_arrows_use_absolute_low_latency_selection() -> None:
-    for key, pane_index in {
-        "Left": "1",
-        "Up": "2",
-        "Down": "3",
-        "Right": "4",
+def test_pane_select_prefix_arrows_use_stack_aware_absolute_selection() -> None:
+    for key, (pane_index, direction) in {
+        "Left": ("1", "left"),
+        "Up": ("2", "up"),
+        "Down": ("3", "down"),
+        "Right": ("4", "right"),
     }.items():
         line = _line_starting(f"bind {key} ")
-        assert f"select-pane -t .{pane_index}" in line
-        assert "tmuxctl pane-select" not in line
+        assert f"#{'{session_name}'}:#{'{window_index}'}.{pane_index}" in line
+        assert "tmuxctl pane-select --mode absolute" in line
+        assert f"--direction {direction}" in line
+        assert "m:legion*,#{window_name}" in line
+        assert "m:mechanicus*,#{window_name}" in line
+        assert "m:koronus*,#{window_name}" in line
         assert "select-pane -L" not in line
         assert "select-pane -R" not in line
         assert "select-pane -U" not in line
@@ -31,6 +35,18 @@ def test_pane_select_prefix_arrows_use_absolute_low_latency_selection() -> None:
         assert "resize-pane -Z" in line
         assert "window_zoomed_flag" in line
         assert "switch-client -T pane-select" in line
+
+
+def test_pane_select_prefix_arrows_keep_native_non_stack_targets() -> None:
+    for key, pane_index in {
+        "Left": "1",
+        "Up": "2",
+        "Down": "3",
+        "Right": "4",
+    }.items():
+        line = _line_starting(f"bind {key} ")
+        native = f"'select-pane -t \"#{{session_name}}:#{{window_index}}.{pane_index}\"'"
+        assert native in line
 
 
 def test_pane_select_prefix_hjkl_deexpand_before_routing() -> None:
@@ -80,6 +96,8 @@ def test_pane_select_bindings_do_not_use_timer_focus_override() -> None:
     assert pane_select_lines
     assert all("--seconds" not in line for line in pane_select_lines)
     assert all("allow-mechanicus-focus" not in line for line in pane_select_lines)
+    assert all("stack enforce" not in line for line in pane_select_lines)
+    assert all("@STACK_FOCUSED_PANE" not in line for line in pane_select_lines)
 
 
 def test_prefix_q_opens_mark_for_close_popup() -> None:
