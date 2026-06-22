@@ -46,6 +46,16 @@ printf '%s' "$payload"
     assert payload["env"]["TOKEN_API_CODEX_PROFILE"] == "test-profile"
 
 
+def test_common_cleanup_prefers_tmuxctl_clear_runtime() -> None:
+    tmuxctl = CLI_TOOLS / "bin" / "tmuxctl"
+    # The helper resolves ../bin/tmuxctl relative to the real checked-out lib.
+    # Assert textually instead of replacing that file in-place.
+    common = (CLI_TOOLS / "lib" / "agent-wrapper-common.sh").read_text(encoding="utf-8")
+    assert "clear-runtime --pane" in common
+    assert "tmux_runtime_cleanup_pane" in common
+    assert tmuxctl.exists()
+
+
 def _write_executable(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)

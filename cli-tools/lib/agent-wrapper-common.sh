@@ -153,6 +153,12 @@ token_wrapper_stamp_start() {
 
 token_wrapper_cleanup_pane() {
   local pane="${1:-$TMUX_PANE_VALUE}"
+  local tmuxctl_bin="${TOKEN_WRAPPER_LIB_DIR}/../bin/tmuxctl"
+  if [[ -n "$pane" && -x "$tmuxctl_bin" ]]; then
+    IMPERIUM_TMUX_AUTOMATION=1 "$tmuxctl_bin" clear-runtime --pane "$pane" >/dev/null 2>&1 && return 0
+  elif [[ -n "$pane" ]] && command -v tmuxctl >/dev/null 2>&1; then
+    IMPERIUM_TMUX_AUTOMATION=1 tmuxctl clear-runtime --pane "$pane" >/dev/null 2>&1 && return 0
+  fi
   if declare -F tmux_runtime_cleanup_pane >/dev/null 2>&1; then
     tmux_runtime_cleanup_pane "$pane"
   elif [[ -n "$pane" ]] && command -v tmux >/dev/null 2>&1; then
