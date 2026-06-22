@@ -1079,6 +1079,15 @@ if [[ -n "$REPO" ]]; then
     elif [[ -n "$SECRETS_DIR" ]]; then printf '%s' "$SECRETS_DIR";
     else printf '%s' "$BARE_REPO"; fi )"
   [[ -n "$REPO_ROOT" ]] || { err "--repo '$REPO': config has no PROTECTED_ROOT, SECRETS_DIR, or BARE_REPO ($REPO_CONF)"; exit 66; }
+  # Quarantine guard (incident 2026-06-22): never anchor on a bare/checkout in a
+  # recycle bin or dated legacy archive — worktrees cut from it bind their
+  # commondir into a purge target (silent data loss when the bin empties).
+  if declare -f imperium_path_is_quarantined >/dev/null 2>&1 \
+        && imperium_path_is_quarantined "$REPO_ROOT"; then
+    err "--repo '$REPO': resolved root is quarantined (recycle bin / legacy archive): $REPO_ROOT"
+    err "Fix BARE_REPO in $REPO_CONF to point at the canonical bare."
+    exit 64
+  fi
   if ! $WORK_DIR_EXPLICIT; then
     WORK_DIR="$REPO_ROOT"
     WORK_DIR_EXPLICIT=true
