@@ -209,9 +209,7 @@ class TestSetLegion:
         conn.close()
         assert persona_id == personas.persona_id_for_slug("custodes")
 
-    def test_set_legion_civic_preserves_canonical_persona_tint(
-        self, client, app_env, monkeypatch
-    ):
+    def test_set_legion_civic_preserves_canonical_persona_tint(self, client, app_env, monkeypatch):
         import personas
 
         tint_calls = []
