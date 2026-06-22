@@ -147,6 +147,8 @@ def parse_args(argv: list[str]) -> dict:
     args["reason"] = " ".join(positionals).strip()
     if not args["reason"]:
         raise SystemExit("Error: reason is empty.")
+    if args["dry_run"] is not None and not args["cascade"]:
+        raise SystemExit("Error: --dry-run/--execute require --cascade.")
     return args
 
 

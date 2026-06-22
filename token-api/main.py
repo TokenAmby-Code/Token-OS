@@ -10199,13 +10199,34 @@ async def _execute_victory_cascade_plan(plan: dict) -> list[dict]:
     executed: list[dict] = []
     for action in plan.get("actions", []):
         for command in action.get("commands", []):
-            proc = await _run_subprocess_offloop(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=120,
-            )
+            try:
+                proc = await _run_subprocess_offloop(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=120,
+                )
+            except subprocess.TimeoutExpired as exc:
+                record = {
+                    "command": command,
+                    "returncode": None,
+                    "stdout": exc.stdout,
+                    "stderr": exc.stderr,
+                    "branch": action.get("branch"),
+                    "path": action.get("path"),
+                    "port": action.get("port"),
+                    "timeout": exc.timeout,
+                }
+                executed.append(record)
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "cascade_cleanup_failed",
+                        "failed": record,
+                        "executed": executed,
+                    },
+                ) from exc
             record = {
                 "command": command,
                 "returncode": proc.returncode,

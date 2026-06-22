@@ -1,8 +1,12 @@
 """Cascade cleanup for session-doc victorious→archived."""
 
+import importlib.machinery
+import importlib.util
 import sqlite3
+import subprocess
 import types
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,12 +52,29 @@ def _insert_instance(
     status: str = "working",
     pr_state: str | None = "merged",
 ) -> None:
+    from instance_mutation import sanctioned_insert_instance_sync
+
+    now = datetime.now().isoformat()
     conn = sqlite3.connect(app_env.db_path)
-    conn.execute(
-        """INSERT INTO instances
-           (id, name, working_dir, origin_type, device_id, status, session_doc_id, pr_state)
-           VALUES (?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?)""",
-        (iid, iid, working_dir, status, doc_id, pr_state),
+    sanctioned_insert_instance_sync(
+        conn,
+        values={
+            "id": iid,
+            "name": iid,
+            "engine": "codex",
+            "working_dir": working_dir,
+            "origin_type": "local",
+            "device_id": "Mac-Mini",
+            "status": status,
+            "session_doc_id": doc_id,
+            "pr_state": pr_state,
+            "rank": "astartes",
+            "created_at": now,
+            "last_activity": now,
+        },
+        mutation_type="instance_registered",
+        write_source="test",
+        actor="test",
     )
     conn.commit()
     conn.close()
@@ -240,3 +261,58 @@ def test_self_guard_skips_operator_cwd_worktree(
     plan = resp.json()["cascade"]
     assert plan["actions"] == []
     assert plan["skipped"][0]["reason"] == "self_guard"
+
+
+def _load_victory_ack_cli():
+    cli_path = Path(__file__).resolve().parents[2] / "cli-tools" / "bin" / "victory-ack"
+    loader = importlib.machinery.SourceFileLoader("victory_ack_cli", str(cli_path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("flag", ["--dry-run", "--execute"])
+def test_victory_ack_cli_requires_cascade_for_cascade_mode_flags(flag: str) -> None:
+    cli = _load_victory_ack_cli()
+
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args([flag, "done"])
+
+    assert exc.value.code == "Error: --dry-run/--execute require --cascade."
+
+
+@pytest.mark.asyncio
+async def test_real_cascade_timeout_returns_structured_cleanup_failure(
+    app_env, monkeypatch
+) -> None:
+    command = ["worktree-delete", "feat/timeout"]
+
+    async def fake_run(args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=args, timeout=kwargs.get("timeout"), output="out", stderr="err"
+        )
+
+    monkeypatch.setattr(app_env.main, "_run_subprocess_offloop", fake_run)
+    plan = {
+        "actions": [
+            {
+                "branch": "feat/timeout",
+                "path": "/tmp/wt-timeout",
+                "port": None,
+                "commands": [command],
+            }
+        ]
+    }
+
+    with pytest.raises(app_env.main.HTTPException) as exc:
+        await app_env.main._execute_victory_cascade_plan(plan)
+
+    assert exc.value.status_code == 500
+    detail = exc.value.detail
+    assert detail["error"] == "cascade_cleanup_failed"
+    assert detail["failed"]["command"] == command
+    assert detail["failed"]["returncode"] is None
+    assert detail["failed"]["timeout"] == 120
+    assert detail["executed"] == [detail["failed"]]
