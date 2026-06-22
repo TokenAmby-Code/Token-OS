@@ -3,6 +3,14 @@
 Invariant under test: quiet hours cancel automated pane writes by default;
 the typing guard delays automated writes by default; sanctioned direct-input
 sends pierce but are audited. Reads are never gated.
+
+The typing guard is the keystroke-anchored per-pane lock: the tmux any-key
+binding stamps ``@TYPING_LOCK_UNTIL`` (an absolute expiry epoch) the moment the
+Emperor first types into a pane, and an Enter clears it. The gate reads that one
+option — focus-decoupled, no screen-scraping — so these tests fake
+``show-options -pqv -t <pane> @TYPING_LOCK_UNTIL`` (a future epoch = locked, an
+empty/past value = clear) rather than the retired ``client_activity`` /
+attendance / pending-prompt model.
 """
 
 from __future__ import annotations
@@ -95,6 +103,39 @@ def _force_typing(monkeypatch, active: bool):
 
 def _no_override(monkeypatch):
     monkeypatch.setattr(send_gate, "sanctioned_override", lambda: None)
+
+
+def _lock_tmux(monkeypatch, locks: dict[str, int | None], *, panes: list[str] | None = None):
+    """Fake real tmux so the keystroke-lock reader sees ``locks`` (pane -> epoch).
+
+    Answers exactly the two commands the predicate issues:
+      * ``show-options -pqv -t <pane> @TYPING_LOCK_UNTIL`` → the pane's lock epoch
+        (empty line + exit 0 when unset, matching real ``-pqv``).
+      * ``list-panes -a -F #{pane_id}``                    → the live pane ids.
+    Any other command errors (rc=1), matching the gate's fail-open contract.
+    A pane mapped to ``None`` (or absent) reads as unlocked.
+    """
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "show-options" in cmd and send_gate._TYPING_LOCK_OPTION in cmd:
+            target = None
+            for idx, tok in enumerate(cmd):
+                if tok == "-t" and idx + 1 < len(cmd):
+                    target = cmd[idx + 1]
+                    break
+            value = locks.get(target)
+            proc.stdout = "" if value is None else f"{int(value)}\n"
+            return proc
+        if "list-panes" in cmd:
+            ids = panes if panes is not None else list(locks.keys())
+            proc.stdout = "".join(f"{p}\n" for p in ids)
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
 
 
 # (a) send-keys / paste-buffer during quiet hours -> suppressed + logged, no PTY write.
@@ -224,39 +265,28 @@ def test_evaluate_defaults_typing_guard_to_delay(monkeypatch):
 
 
 def test_typing_guard_is_scoped_to_target_pane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lock is per-pane: a live ``@TYPING_LOCK_UNTIL`` on one pane never
+    leaks onto another. ``%active`` was typed into (lock 200s out); ``%other``
+    carries an expired lock and reads clear."""
     now = 1_700_000_000
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
-
-    def _fake_run(cmd, *args, **kwargs):
-        proc = _FakeCompleted()
-        if "display-message" in cmd and "#{client_activity}" in cmd and "-t" not in cmd:
-            proc.stdout = f"{now}\n"
-            return proc
-        if "display-message" in cmd and "-t" in cmd and "%active" in cmd:
-            proc.stdout = "11\n"
-            return proc
-        if "display-message" in cmd and "-t" in cmd and "%other" in cmd:
-            proc.stdout = "00\n"
-            return proc
-        if "list-clients" in cmd and "%active" in cmd and "#{client_activity}" in cmd:
-            proc.stdout = f"{now}\n"
-            return proc
-        if "list-clients" in cmd and "%active" in cmd and "#{client_activity}" in cmd:
-            proc.stdout = f"{now}\n"
-            return proc
-        if "list-clients" in cmd and "%active" in cmd:
-            proc.stdout = "x\n"
-            return proc
-        if "capture-pane" in cmd and "-t" in cmd:
-            proc.stdout = "> \n"
-            return proc
-        proc.returncode = 1
-        return proc
-
-    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+    _lock_tmux(monkeypatch, {"%active": now + 200, "%other": now - 5})
 
     assert send_gate.typing_guard_active(target="%active") is True
     assert send_gate.typing_guard_active(target="%other") is False
+
+
+def test_any_typing_guard_active_scans_live_panes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The targetless aggregate query (global policies that hang on ANY guard)
+    is true iff some live pane carries an unexpired lock."""
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+
+    _lock_tmux(monkeypatch, {"%a": now - 5, "%b": now + 120})
+    assert send_gate.any_typing_guard_active() is True
+
+    _lock_tmux(monkeypatch, {"%a": now - 5, "%b": now - 1})
+    assert send_gate.any_typing_guard_active() is False
 
 
 def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
@@ -264,45 +294,18 @@ def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
 ) -> None:
     """End-to-end per-pane proof (the mandate scenario, real predicate).
 
-    The Emperor is typing in the active+attended pane ``%active`` (fresh
-    keystroke, an unsent draft on its prompt line); ``%other`` is an unattended
-    worker pane at an empty prompt. A dispatch send to ``%other`` MUST sail
-    through while a send to ``%active`` is held — typing in one pane never
-    blocks an unrelated pane. No monkeypatch of the predicate: evaluate() runs
-    the real ``typing_guard_active`` over a faked tmux.
+    The Emperor typed into ``%active`` ~1 min ago, so its lock is still ~4 min
+    out; ``%other`` is an unrelated worker pane he never typed into (no lock). A
+    dispatch send to ``%other`` MUST sail through while a send to ``%active`` is
+    held — typing in one pane never blocks an unrelated pane. No monkeypatch of
+    the predicate: evaluate() runs the real ``typing_guard_active`` over a faked
+    tmux reading only ``@TYPING_LOCK_UNTIL``.
     """
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
     now = 1_700_000_000
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
-
-    def _fake_run(cmd, *args, **kwargs):
-        proc = _FakeCompleted()
-        if "display-message" in cmd and "#{client_activity}" in cmd and "-t" not in cmd:
-            proc.stdout = f"{now}\n"
-            return proc
-        if "display-message" in cmd and "-t" in cmd and "%active" in cmd:
-            proc.stdout = "11\n"
-            return proc
-        if "display-message" in cmd and "-t" in cmd and "%other" in cmd:
-            proc.stdout = "00\n"
-            return proc
-        if "list-clients" in cmd and "%active" in cmd and "#{client_activity}" in cmd:
-            proc.stdout = f"{now}\n"
-            return proc
-        if "list-clients" in cmd and "%active" in cmd:
-            proc.stdout = "x\n"
-            return proc
-        if "capture-pane" in cmd and "%active" in cmd:
-            proc.stdout = "> draft\n"  # Emperor's unsent draft
-            return proc
-        if "capture-pane" in cmd and "%other" in cmd:
-            proc.stdout = "> \n"  # worker pane, empty prompt
-            return proc
-        proc.returncode = 1
-        return proc
-
-    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+    _lock_tmux(monkeypatch, {"%active": now + 240, "%other": None})
 
     held = send_gate.evaluate(("send-keys", "-t", "%active", "x"))
     dispatched = send_gate.evaluate(("send-keys", "-t", "%other", "launch"))
@@ -311,126 +314,45 @@ def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
     assert dispatched is None, "a send to an unrelated pane must not be gated by typing in %active"
 
 
-def test_pending_input_skips_tui_chrome_below_the_prompt(
+def test_unattended_pane_without_lock_is_deliverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#284 regression pin: a paused Claude/Codex draft sits ABOVE the TUI chrome.
+    """No screen-scraping: the keystroke lock is the SOLE signal.
 
-    The post-#284 detector took the literal last non-empty line — the
-    ``⏵⏵ bypass permissions`` hint / context footer — so a held draft read as
-    *clear* once the client-activity window expired and enforcement leaked into
-    the Emperor's half-typed prompt. The detector must skip the chrome and
-    evaluate the real prompt line above it.
-    """
-    drafting = (
-        "> tell me about the thing I am drafting\n"
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
-    )
-    cleared = (
-        "❯ /clear\n"
-        "❯ \n"
-        "─" * 60 + "\n"
-        "  ... 0/200k $0.00\n"
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
-    )
-
-    def _capture(text: str):
-        def _fake_run(cmd, *args, **kwargs):
-            proc = _FakeCompleted()
-            if "capture-pane" in cmd:
-                proc.stdout = text
-                return proc
-            proc.returncode = 1
-            return proc
-
-        return _fake_run
-
-    monkeypatch.setattr(send_gate.subprocess, "run", _capture(drafting))
-    assert send_gate._pane_has_pending_input("%active") is True
-
-    monkeypatch.setattr(send_gate.subprocess, "run", _capture(cleared))
-    assert send_gate._pane_has_pending_input("%active") is False
-
-
-def test_unattended_worker_pane_with_prompt_text_is_deliverable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Asymmetry fix (mandate 3) + Custodes brief-delivery guardrail.
-
-    A worker pane that no human is attending must NOT be typing-guarded merely
-    because it has leftover prompt text — the guard is scoped to the pane the
-    human is actually typing in. So a brief/dispatch send to that unattended
-    worker still SAILS THROUGH (evaluate → None). This is the over-block the old
-    predicate caused: ``_pane_has_pending_input`` fired regardless of attendance,
-    holding W's brief-delivery to idle worker panes.
+    A worker pane the Emperor never typed into carries no lock, so a
+    brief/dispatch send sails through (evaluate → None) even if its screen still
+    shows leftover prompt text. This is the over-block the retired
+    ``_pane_has_pending_input`` detector caused — holding W's brief-delivery to
+    idle worker panes merely because they had prompt text on screen. Stale draft
+    text with no live lock is, by the Emperor's accepted tradeoff, deliverable.
     """
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
     now = 1_700_000_000
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
-
-    def _fake_run(cmd, *args, **kwargs):
-        proc = _FakeCompleted()
-        if "display-message" in cmd and "#{client_activity}" in cmd and "-t" not in cmd:
-            proc.stdout = f"{now - 3600}\n"  # last keystroke an hour ago, nowhere near
-            return proc
-        if "display-message" in cmd and "-t" in cmd and "%worker" in cmd:
-            proc.stdout = "00\n"  # not the active pane, not the active window
-            return proc
-        if "list-clients" in cmd and "%worker" in cmd:
-            return proc  # no client attached to the worker pane
-        if "capture-pane" in cmd and "%worker" in cmd:
-            proc.stdout = "❯ leftover prompt text\n"  # has prompt text, but no human here
-            return proc
-        proc.returncode = 1
-        return proc
-
-    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+    _lock_tmux(monkeypatch, {"%worker": None})
 
     assert send_gate.typing_guard_active(target="%worker") is False
     assert send_gate.evaluate(("send-keys", "-t", "%worker", "brief body")) is None
 
 
-def test_attended_pane_is_held_on_pending_text_and_on_recent_keystroke(
+def test_locked_pane_is_held_until_expiry_regardless_of_focus(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Human-protection pin: the attended pane the Emperor is in stays guarded
-    both when its prompt shows an unsent draft AND when he just struck a key with
-    no visible draft yet (mid-keystroke injection must be held)."""
+    """Focus-decoupled persistence: a locked pane stays guarded purely on the
+    absolute expiry, with no focus/attendance/keystroke re-check. The same pane
+    releases the instant its expiry falls into the past."""
     now = 1_700_000_000
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    locks: dict[str, int | None] = {"%active": now + 1}
+    _lock_tmux(monkeypatch, locks)
 
-    state = {"capture": "❯ draft\n", "activity": now - 3600}  # draft, stale keystroke
-
-    def _fake_run(cmd, *args, **kwargs):
-        proc = _FakeCompleted()
-        if "display-message" in cmd and "#{client_activity}" in cmd and "-t" not in cmd:
-            proc.stdout = f"{state['activity']}\n"
-            return proc
-        if "display-message" in cmd and "-t" in cmd and "%active" in cmd:
-            proc.stdout = "11\n"
-            return proc
-        if "list-clients" in cmd and "%active" in cmd and "#{client_activity}" in cmd:
-            proc.stdout = f"{state['activity']}\n"
-            return proc
-        if "list-clients" in cmd and "%active" in cmd:
-            proc.stdout = "x\n"
-            return proc
-        if "capture-pane" in cmd and "%active" in cmd:
-            proc.stdout = state["capture"]
-            return proc
-        proc.returncode = 1
-        return proc
-
-    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
-
-    # Draft on the prompt, no recent keystroke → held.
+    # Lock still future → held (no focus signal is consulted at all).
     assert send_gate.typing_guard_active(target="%active") is True
 
-    # No visible draft, but a keystroke just landed → still held (mid-keystroke).
-    state["capture"] = "❯ \n"
-    state["activity"] = now
-    assert send_gate.typing_guard_active(target="%active") is True
+    # Same pane, expiry now in the past → released. Nothing else changed.
+    locks["%active"] = now - 1
+    assert send_gate.typing_guard_active(target="%active") is False
 
 
 def test_evaluate_only_blocks_target_under_typing_guard(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -461,137 +383,121 @@ def fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setattr(send_gate.time, "time", lambda: clock["now"])
     monkeypatch.setattr(send_gate.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(send_gate.time, "sleep", _sleep)
-    monkeypatch.delenv("TMUX_TYPING_GUARD_WINDOW", raising=False)
     monkeypatch.delenv("TMUX_SEND_GATE_DELAY_TIMEOUT", raising=False)
     return clock
 
 
-@pytest.fixture
-def counted_typing_delay(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
-    """Force evaluate() to diagnose a typing-guard delay, counting every call."""
-    calls: list[tuple] = []
-
-    def _evaluate(args, **kwargs) -> dict | None:
-        calls.append(tuple(args))
-        activity = send_gate._client_activity_epoch()
-        if activity is None:
-            return None
-        if 0 <= send_gate.time.time() - activity <= send_gate._typing_guard_window_seconds():
-            return {"suppressed": True, "policy": "delay", "reason": "typing_guard"}
-        return None
-
-    monkeypatch.setattr(send_gate, "evaluate", _evaluate)
-    return calls
-
-
-# The de-poll regression: a clean clear used to take ~40 evaluate() round-trips
-# (0.25s poll, 2 sqlite opens each); now it is one evaluation plus one
-# deadline-sleep to the typing window's expiry.
-def test_wait_for_gate_clear_sleeps_to_deadline_not_polls(
-    monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
+# The de-poll property: a delayed send sleeps TOWARD the lock's absolute expiry
+# (no 4/second busy-spin), but at a recheck cap so an early Enter-clear releases
+# promptly rather than after the whole window.
+def test_wait_for_gate_clear_sleeps_toward_lock_expiry(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict
 ) -> None:
-    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
-    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [998])
-    monkeypatch.setattr(send_gate, "_client_activity_epoch", lambda: 998)
-
-    assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is True
-
-    assert len(counted_typing_delay) <= 2
-    assert len(fake_clock["sleeps"]) <= 2, "one wake per typing burst, not 4/second"
-    # last keystroke at 998, window 10s, margin 0.1 → one sleep of ~8.1s
-    assert abs(sum(fake_clock["sleeps"]) - 8.1) < 0.01
-
-
-def test_wait_for_gate_clear_extends_when_typing_resumes(
-    monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
-) -> None:
-    # Keystroke at 998; human types again at 1005 (visible after the first wake).
-    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
-    monkeypatch.setattr(
-        send_gate,
-        "_target_client_activity_epochs",
-        lambda target: [998 if fake_clock["now"] < 1_005 else 1_005],
-    )
-    monkeypatch.setattr(
-        send_gate,
-        "_client_activity_epoch",
-        lambda: 998 if fake_clock["now"] < 1_005 else 1_005,
-    )
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    until = fake_clock["now"] + 3
+    _lock_tmux(monkeypatch, {"%9": until})
 
     assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is True
 
     sleeps = fake_clock["sleeps"]
-    assert 2 <= len(sleeps) <= 3, "a resumed burst earns exactly one more wake"
-    assert abs(sleeps[0] - 8.1) < 0.01
-    assert abs(sum(sleeps) - 15.1) < 0.01  # ends at 1015.1 = 1005 + 10 + 0.1
+    assert sleeps, "a held send must sleep at least once"
+    assert all(s <= send_gate._TYPING_LOCK_RECHECK_SECONDS + 1e-9 for s in sleeps), (
+        "each wake is capped at the recheck interval"
+    )
+    assert fake_clock["now"] >= until, "wakes carry the clock past the lock expiry"
+    # ~3s of lock at a 1s recheck cap → a small handful of wakes, not a busy-spin.
+    assert len(sleeps) <= 5
+
+
+def test_wait_for_gate_clear_releases_promptly_when_lock_cleared_early(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict
+) -> None:
+    """An Enter into the pane clears ``@TYPING_LOCK_UNTIL`` mid-wait. Even though
+    the original lock ran 5 min out, the recheck cap releases the held send
+    within ~1 wake of the clear — the gate must not wait out the full window."""
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    cleared_at = fake_clock["now"] + 2  # Emperor presses Enter 2s in
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "show-options" in cmd and send_gate._TYPING_LOCK_OPTION in cmd:
+            # 5-min lock until an Enter clears it at cleared_at.
+            proc.stdout = (
+                "" if fake_clock["now"] >= cleared_at else f"{int(fake_clock['now'] + 300)}\n"
+            )
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is True
+
+    total = sum(fake_clock["sleeps"])
+    assert total <= cleared_at - 1_000 + send_gate._TYPING_LOCK_RECHECK_SECONDS + 1e-9, (
+        "released within one recheck of the Enter-clear, not after the 5-min window"
+    )
 
 
 def test_wait_for_gate_clear_honors_delay_timeout(
-    monkeypatch: pytest.MonkeyPatch, fake_clock: dict, counted_typing_delay: list[tuple]
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict
 ) -> None:
-    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
-    monkeypatch.setattr(
-        send_gate, "_target_client_activity_epochs", lambda target: [fake_clock["now"] - 1]
-    )
-    monkeypatch.setattr(send_gate, "_client_activity_epoch", lambda: fake_clock["now"] - 1)
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    # A full 5-min lock, but an explicit 5s delay timeout caps the wait.
+    _lock_tmux(monkeypatch, {"%9": fake_clock["now"] + 300})
     monkeypatch.setenv("TMUX_SEND_GATE_DELAY_TIMEOUT", "5")
 
     assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is False
 
-    assert abs(sum(fake_clock["sleeps"]) - 5.0) < 0.01, "timeout caps the deadline sleep"
+    assert abs(sum(fake_clock["sleeps"]) - 5.0) < 0.5, "timeout caps the total delayed wait"
 
 
-def test_target_typing_guard_ignores_unrelated_global_activity(monkeypatch):
-    _force_quiet(monkeypatch, False)
-    _no_override(monkeypatch)
-    now = 10_000
+# ── send-gate-attended-scoping-clobber: canonical-id resolution miss ──────────
+# The clobber's root cause: the gate's typing-lock read shells out to
+# `tmux show-options -pqv -t <target> @TYPING_LOCK_UNTIL`. tmux only understands
+# physical %pane ids (and native session:window addresses). An Imperium
+# canonical id (mechanicus:fabricator-general, legion:custodes, 1:N…) cannot be
+# resolved at the tmux boundary, so the read errors and the guard MISSES an
+# actively-typed pane — then a send would clobber the human's live draft. The
+# fix is to resolve canonical→physical BEFORE the gate (see the adapter test).
+
+
+def test_typing_guard_detects_physical_but_misses_canonical_target(monkeypatch) -> None:
+    """Debug-step pin: a physical id is detected, a canonical id is MISSED.
+
+    This is the exact divergence behind the clobber. The fix lives upstream
+    (resolve canonical -> physical before the gate); this pins the boundary so a
+    future refactor can't silently re-introduce a canonical id reaching the raw
+    tmux lock probe (which would always read clear and never guard).
+    """
+    now = 1_700_000_000
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
-    monkeypatch.setattr(send_gate, "_client_activity_epoch", lambda: now)
-    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [now - 60])
-    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
-    monkeypatch.setattr(send_gate, "_pane_attended", lambda target: True)
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
 
-    assert send_gate.evaluate(("send-keys", "-t", "%9", "hi")) is None
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "show-options" in cmd and send_gate._TYPING_LOCK_OPTION in cmd:
+            target = None
+            for idx, tok in enumerate(cmd):
+                if tok == "-t" and idx + 1 < len(cmd):
+                    target = cmd[idx + 1]
+                    break
+            if target == "%44":
+                proc.stdout = f"{now + 200}\n"  # physical pane carries a live lock
+                return proc
+            proc.returncode = 1  # tmux can't resolve a canonical id → fail-open clear
+            return proc
+        proc.returncode = 1
+        return proc
 
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
 
-def test_target_typing_guard_uses_attending_client_activity(monkeypatch):
-    _force_quiet(monkeypatch, False)
-    _no_override(monkeypatch)
-    now = 10_000
-    monkeypatch.setattr(send_gate.time, "time", lambda: now)
-    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [now - 2])
-    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: False)
-    monkeypatch.setattr(send_gate, "_pane_attended", lambda target: True)
-
-    result = send_gate.evaluate(("send-keys", "-t", "%9", "hi"))
-
-    assert result is not None
-    assert result["reason"] == "typing_guard"
-    assert result["policy"] == "delay"
-
-
-def test_target_typing_guard_pending_prompt_on_attended_target(monkeypatch):
-    _force_quiet(monkeypatch, False)
-    _no_override(monkeypatch)
-    monkeypatch.setattr(send_gate.time, "time", lambda: 10_000)
-    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [9_000])
-    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: True)
-    monkeypatch.setattr(send_gate, "_pane_attended", lambda target: True)
-
-    result = send_gate.evaluate(("send-keys", "-t", "%9", "hi"))
-
-    assert result is not None
-    assert result["reason"] == "typing_guard"
-
-
-def test_target_typing_guard_unattended_pending_prompt_is_deliverable(monkeypatch):
-    _force_quiet(monkeypatch, False)
-    _no_override(monkeypatch)
-    monkeypatch.setattr(send_gate, "_target_client_activity_epochs", lambda target: [])
-    monkeypatch.setattr(send_gate, "_pane_has_pending_input", lambda target: True)
-    monkeypatch.setattr(send_gate, "_pane_attended", lambda target: False)
-
-    assert send_gate.evaluate(("send-keys", "-t", "%9", "hi")) is None
+    assert send_gate.typing_guard_active(target="%44") is True
+    assert send_gate.typing_guard_active(target="mechanicus:fabricator-general") is False
 
 
 def test_send_text_then_submit_gated_attended_pane_writes_no_bytes(
@@ -599,9 +505,9 @@ def test_send_text_then_submit_gated_attended_pane_writes_no_bytes(
 ):
     """Typing guard suppression is atomic for direct pane writes.
 
-    This pins the lower-boundary half of attended-pane queue safety: when a
-    target pane has pending human input and the delay cannot clear, tmuxctl
-    raises a structured gate result and issues no tmux write. The API layer is
+    This pins the lower-boundary half of locked-pane queue safety: when a target
+    pane carries a live keystroke lock and the delay cannot clear, tmuxctl raises
+    a structured gate result and issues no tmux write. The API layer is
     responsible for queueing that payload for a later drain.
     """
     _force_quiet(monkeypatch, False)
@@ -620,70 +526,14 @@ def test_send_text_then_submit_gated_attended_pane_writes_no_bytes(
     assert recorded_suppressions and recorded_suppressions[-1]["reason"] == "typing_guard"
 
 
-# ── send-gate-attended-scoping-clobber: canonical-id resolution miss ──────────
-# The clobber's root cause: the gate's attendance/typing checks shell out to
-# `tmux display-message -t <target>` / `tmux list-clients -t <target>`. tmux only
-# understands physical %pane ids (and native session:window addresses). An
-# Imperium canonical id (mechanicus:fabricator-general, legion:custodes, 1:N…)
-# silently mis-resolves, so _pane_attended returns False and the guard MISSES an
-# actively-typed attended pane — then the send clobbers the human's live draft.
-
-
-def _attended_physical_only_tmux(physical: str):
-    """Fake real-tmux where ONLY ``physical`` is an attended pane with a draft.
-
-    Mirrors live tmux: a canonical id (anything != ``physical``) cannot be
-    resolved at the tmux boundary, so every query for it errors (rc=1) exactly
-    as `tmux display-message -t mechanicus:fabricator-general` would.
-    """
-
-    def _fake_run(cmd, *args, **kwargs):
-        proc = _FakeCompleted()
-        target = None
-        for idx, tok in enumerate(cmd):
-            if tok == "-t" and idx + 1 < len(cmd):
-                target = cmd[idx + 1]
-                break
-        verb = cmd[1] if len(cmd) > 1 else ""
-        if target is not None and target != physical:
-            proc.returncode = 1  # tmux cannot resolve a canonical id
-            return proc
-        if verb == "display-message":
-            proc.stdout = "11\n"  # pane_active & window_active
-        elif verb == "list-clients":
-            proc.stdout = (
-                f"{int(send_gate.time.time())}\n" if "#{client_activity}" in cmd else "x\n"
-            )
-        elif verb == "capture-pane":
-            proc.stdout = "> half-typed draft\n"  # pending human input
-        return proc
-
-    return _fake_run
-
-
-def test_typing_guard_detects_physical_but_misses_canonical_target(monkeypatch) -> None:
-    """Debug-step pin: physical id is detected, canonical id is MISSED.
-
-    This is the exact divergence behind the clobber. The fix lives upstream
-    (resolve canonical -> physical before the gate, see the adapter test below);
-    this test pins the boundary behaviour so a future refactor can't silently
-    re-introduce a canonical id reaching the raw tmux attendance probes.
-    """
-    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
-    monkeypatch.setattr(send_gate.subprocess, "run", _attended_physical_only_tmux("%44"))
-
-    assert send_gate.typing_guard_active(target="%44") is True
-    assert send_gate.typing_guard_active(target="mechanicus:fabricator-general") is False
-
-
 def test_run_resolves_canonical_target_to_physical_before_gating(
     monkeypatch, captured_subprocess, recorded_suppressions
 ) -> None:
-    """The fix: an attended-pane send addressed canonically is HELD, not clobbered.
+    """The fix: a locked-pane send addressed canonically is HELD, not clobbered.
 
     `tmuxctl send-text --pane mechanicus:fabricator-general` (and every
     TmuxAdapter.run caller) must evaluate the gate against the RESOLVED physical
-    id. With the human typing in %44, the gate must see target=%44, engage the
+    id. With the human's lock on %44, the gate must see target=%44, engage the
     typing guard, and issue zero bytes — the draft survives.
     """
     _force_quiet(monkeypatch, False)
@@ -694,7 +544,7 @@ def test_run_resolves_canonical_target_to_physical_before_gating(
 
     def _typing(*, target=None, **_kw):
         seen_targets.append(target)
-        return target == "%44"  # the human is typing in the physical pane
+        return target == "%44"  # the human's lock is on the physical pane
 
     monkeypatch.setattr(send_gate, "typing_guard_active", _typing)
 
@@ -712,6 +562,6 @@ def test_run_resolves_canonical_target_to_physical_before_gating(
     assert "mechanicus:fabricator-general" not in seen_targets, (
         "the unresolved canonical id must never reach the typing-guard predicate"
     )
-    assert captured_subprocess == [], "attended-pane send must write zero bytes, never clobber"
+    assert captured_subprocess == [], "locked-pane send must write zero bytes, never clobber"
     assert recorded_suppressions and recorded_suppressions[-1]["reason"] == "typing_guard"
     assert result == ""

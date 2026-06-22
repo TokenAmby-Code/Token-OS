@@ -295,10 +295,12 @@ tmux_wait_for_clear() {
 }
 
 # Canonical typing-guard predicate — thin reader of the ONE implementation in
-# tmuxctl.send_gate.typing_guard_active (which reads tmux #{client_activity}).
-# No second source of truth: the status segment, this guard, and the universal
-# send gate all consult the same predicate. Returns 0 if the human typed within
-# the client_activity window, non-zero otherwise (or on error → fail-open).
+# tmuxctl.send_gate.typing_guard_active (which reads the per-pane keystroke lock
+# @TYPING_LOCK_UNTIL stamped by the tmux any-key binding). No second source of
+# truth: the status segment, this guard, and the universal send gate all consult
+# the same predicate. Returns 0 if the target pane is keystroke-locked (the
+# Emperor typed into it within the last 5 min and has not pressed Enter),
+# non-zero otherwise (or on error → fail-open).
 tmux_typing_guard_active() {
     local lib_dir
     lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
