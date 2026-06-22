@@ -95,10 +95,10 @@ jobs:
         continue-on-error: true
         run: |
           if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
-            (cd cli-tools && uv run --python 3.11 --group dev pytest -x --tb=short) || echo "::warning::pytest failed (cli-tools)"
+            (cd cli-tools && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --tb=short) || echo "::warning::pytest failed (cli-tools)"
           fi
           if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
-            (cd token-api && uv run --python 3.11 --group dev pytest -x --tb=short) || echo "::warning::pytest failed (token-api)"
+            (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --tb=short) || echo "::warning::pytest failed (token-api)"
           fi
 
       - name: CodeRabbit chill review
