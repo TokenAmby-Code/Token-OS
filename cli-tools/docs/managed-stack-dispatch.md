@@ -57,11 +57,11 @@ Exit code is boolean: `0` only when `ok=true`.
 
 Behavior is type-bound:
 
-- Persona panes (`legion:custodes`, `mechanicus:fabricator-general`, `mechanicus:admin`):
+- Persona panes (`legion:custodes`, `legion:malcador`, `mechanicus:fabricator-general`, `mechanicus:admin`, `koronus:pax`, `koronus:orchestrator`):
   - blank/no live runtime: launch the configured persona in the same pane;
   - live runtime with a stopped coherent registry row: reactivate the row and return `ok=true`, `action=registry_reactivated`;
   - live runtime but no registry row at all: do not inject `/persona`; log the anomaly and return `ok=false`, `action=persona_unregistered_noted` (or `persona_unregistered_suppressed` during backoff);
-  - live runtime with a registry row for the wrong identity: send `/persona <expected>` in-band and return `ok=false`, `action=persona_correction_sent`;
+  - live runtime with a registry row for the wrong identity: do not inject `/persona`; log the harness/SessionStart mismatch and return `ok=false`, `action=persona_mismatch_noted` (or `persona_mismatch_suppressed` during backoff);
   - stopped-row reactivation failure: return `ok=false`, `action=registry_reactivation_failed`;
   - live and coherent: return `ok=true`.
 - Stack workers (`@PANE_TYPE=stack-worker`):

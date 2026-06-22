@@ -9832,10 +9832,7 @@ async def set_instance_legion(instance_id: str, request: Request):
         # and bind persona_id (plus annex voice/sound from the profile).
         updates: dict = {}
         persona_slug = LEGION_PERSONA_SLUGS.get(legion)
-        if legion == "civic":
-            # Civic/Pax has no persona tint authority: clear the assignment.
-            updates["persona_id"] = None
-        elif persona_slug:
+        if persona_slug:
             persona = await resolve_persona(db, persona_slug)
             if persona:
                 profile = persona_to_profile(persona)
