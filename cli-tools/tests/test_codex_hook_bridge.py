@@ -84,16 +84,16 @@ def _write_transcript(path: pathlib.Path, turns: list[list[dict[str, object]]]) 
     path.write_text("\n".join(lines) + "\n")
 
 
-def test_stop_launches_clear_context_approver_when_planning(tmp_path: pathlib.Path) -> None:
+def test_stop_does_not_launch_on_planning_state_alone(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(tmp_path, "planning")
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+    assert not approve_log.exists()
 
 
-def test_stop_launches_clear_context_approver_when_approving(tmp_path: pathlib.Path) -> None:
+def test_stop_does_not_launch_on_approving_state_alone(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(tmp_path, "approving")
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+    assert not approve_log.exists()
 
 
 def test_stop_launches_approver_when_latest_transcript_turn_has_plan_item(

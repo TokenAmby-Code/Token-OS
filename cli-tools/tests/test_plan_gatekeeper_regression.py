@@ -10,11 +10,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "claude-config" / "hooks" / "plan-gatekeeper.sh"
 
 
-def test_plan_gatekeeper_no_reject_once_bounce_state_machine():
+def test_plan_gatekeeper_no_reject_once_bounce_state_machine() -> None:
     text = SCRIPT.read_text()
     assert "claude-plan-bounced" not in text
     assert 'behavior":"deny' not in text
-    assert "tmux-plan-approve-clear" in text
+    assert "plan_approver_launch" in text
 
 
 def _write_stub(path: pathlib.Path, body: str) -> None:
@@ -37,6 +37,7 @@ def _run_gatekeeper(
     # claude-cmd --self --resolve-only is the PID-walk pane recovery; emit the
     # configured pane (empty string => recovery fails).
     _write_stub(bindir / "claude-cmd", f'printf "%s" "{resolve_pane}"\n')
+    _write_stub(bindir / "agent-cmd", f'printf "%s" "{resolve_pane}"\n')
     _write_stub(bindir / "tmuxctl", f'printf "%s" "{agent}"\n')
     # The approver records the argv it was invoked with so the test can assert
     # it ran against the recovered pane and explicit harness.
@@ -80,18 +81,13 @@ def test_plan_gatekeeper_recovers_pane_when_tmux_pane_stripped(
     assert "--no-state" in argv
 
 
-def test_plan_gatekeeper_passes_codex_agent_explicitly(tmp_path: pathlib.Path) -> None:
+def test_plan_gatekeeper_uses_claude_agent_for_precise_permission(tmp_path: pathlib.Path) -> None:
     marker = _run_gatekeeper(tmp_path, resolve_pane="%778", agent="codex")
-    assert marker.exists(), "approver was not launched for resolved Codex pane"
+    assert marker.exists(), "approver was not launched for resolved pane"
     argv = marker.read_text()
     assert "--pane %778" in argv
-    assert "--agent codex" in argv
-    assert "--agent auto" not in argv
-
-
-def test_plan_gatekeeper_yields_when_agent_resolution_is_auto(tmp_path: pathlib.Path) -> None:
-    marker = _run_gatekeeper(tmp_path, resolve_pane="%779", agent="auto")
-    assert not marker.exists(), "approver must not run when harness is unresolved"
+    assert "--agent claude" in argv
+    assert "--agent codex" not in argv
 
 
 def test_plan_gatekeeper_yields_when_recovery_also_fails(
