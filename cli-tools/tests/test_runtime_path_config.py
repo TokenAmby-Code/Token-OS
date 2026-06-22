@@ -97,9 +97,21 @@ def test_quarantine_predicate_shell_and_python_agree(tmp_path):
     for p in clean:
         assert module._is_quarantined(p) is False, p
 
-    # Shell helper in nas-path.sh must agree exactly.
+    # Shell helper in nas-path.sh must agree exactly. Pass the lib path and the
+    # candidate as positional args ($1, $2) rather than interpolating them into
+    # the command body, to avoid shell-injection / quoting surprises.
     for expect_q, paths in ((0, quarantined), (1, clean)):
         for p in paths:
-            script = f'source {NAS_PATH!s} 2>/dev/null; imperium_path_is_quarantined "{p}"; echo $?'
-            proc = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
+            proc = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1" 2>/dev/null; imperium_path_is_quarantined "$2"; echo $?',
+                    "_",
+                    str(NAS_PATH),
+                    p,
+                ],
+                text=True,
+                capture_output=True,
+            )
             assert proc.stdout.strip() == str(expect_q), (p, proc.stdout, proc.stderr)

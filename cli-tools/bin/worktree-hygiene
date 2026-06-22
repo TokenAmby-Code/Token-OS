@@ -165,7 +165,6 @@ cmd_park() {
     done
     log_warn "park: $wt is dirty — preserving WIP to ${wip} before detaching"
     git -C "$wt" status --short >&2 || true
-    if ! git -C "$wt" stash create >/dev/null 2>&1; then :; fi
     # Commit the dirt onto a new branch, push to canonical bare + origin, then
     # detach so the working tree keeps the same files but is no longer on the branch.
     local cur_branch_existed=true
@@ -192,6 +191,7 @@ cmd_reanchor() {
     [[ -n "$wt" && -e "$wt/.git" ]] || { log_err "reanchor: not a worktree: $wt"; exit 1; }
     load_project_conf
     local common; common="$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null || true)"
+    [[ -n "$common" ]] || { log_err "reanchor: cannot resolve git-common-dir for $wt"; exit 1; }
     case "$common" in /*) : ;; *) common="$(cd "$wt" && cd "$common" && pwd)" ;; esac
     if [[ "$common" == "$CANON_BARE" ]]; then
         log_ok "reanchor: $wt already bound to canonical bare — nothing to do"; return 0

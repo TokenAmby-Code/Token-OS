@@ -35,7 +35,7 @@ def _git(*args: str, cwd: Path | None = None, env: dict | None = None) -> str:
 
 
 @pytest.fixture
-def project(tmp_path: Path):
+def project(tmp_path: Path) -> dict[str, object]:
     home = tmp_path / "home"
     home.mkdir()
     src = tmp_path / "src"
@@ -140,7 +140,9 @@ def test_refuses_recycle_bin_bare(project) -> None:
     project["write_conf"](recycle_bare)
 
     res = project["setup"]("feature-y")
-    assert res.returncode != 0, res.stdout
+    # Assert the quarantine guard's own exit code (64), not just generic failure,
+    # so the test pins down *which* guard fired.
+    assert res.returncode == 64, res.stdout
     assert "recycle" in res.stderr.lower() or "quarantin" in res.stderr.lower()
     assert not (project["parent"] / "wt-feature-y").exists()
 
@@ -152,5 +154,5 @@ def test_refuses_dated_legacy_archive_bare(project) -> None:
     project["write_conf"](legacy_bare)
 
     res = project["setup"]("feature-z")
-    assert res.returncode != 0
+    assert res.returncode == 64
     assert not (project["parent"] / "wt-feature-z").exists()

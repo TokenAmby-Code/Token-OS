@@ -132,7 +132,11 @@ def _runtime_checkout() -> str:
 
     # Explicit non-NAS overrides still work for tests/dev, but a stale exported
     # NAS runtime must not beat the machine-local hot runtime during cutover.
-    if env_value and os.path.isdir(env_expanded) and env_value != known_nas_runtime:
+    # Compare normalized expanded paths so a trailing slash or `~` form of the NAS
+    # runtime can't slip past this check and wrongly beat the local hot runtime.
+    env_norm = os.path.normpath(env_expanded) if env_expanded else ""
+    nas_norm = os.path.normpath(known_nas_runtime)
+    if env_value and os.path.isdir(env_expanded) and env_norm != nas_norm:
         return env_expanded
     if local and os.path.isdir(local) and not _is_quarantined(local):
         return local

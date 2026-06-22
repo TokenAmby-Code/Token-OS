@@ -27,6 +27,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 PARK_LIB = ROOT / "cli-tools" / "lib" / "worktree-park.sh"
 
+# (tmp_path, bare, seed, origin) — see the `repo` fixture.
+RepoFixture = tuple[Path, Path, Path, Path]
+
 
 def _git(*args: str, cwd: Path) -> str:
     return subprocess.run(
@@ -36,8 +39,22 @@ def _git(*args: str, cwd: Path) -> str:
 
 def _park(bare: Path) -> subprocess.CompletedProcess[str]:
     """Source the lib and invoke park_worktrees_off_main against `bare`."""
-    script = f'source "{PARK_LIB}"; park_worktrees_off_main "{bare}"'
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    # Pass the lib path and bare as positional args ($1, $2) rather than
+    # interpolating them into the command body — avoids shell-injection / quoting
+    # surprises if a path ever contains special characters.
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; park_worktrees_off_main "$2"',
+            "_",
+            str(PARK_LIB),
+            str(bare),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
 
 
 def _branch_of(wt: Path) -> str:
@@ -51,7 +68,7 @@ def _branch_of(wt: Path) -> str:
 
 
 @pytest.fixture
-def repo(tmp_path: Path):
+def repo(tmp_path: Path) -> RepoFixture:
     """A throwaway origin + local bare cache with linked worktrees."""
     env_args = [
         "-c",
@@ -84,7 +101,7 @@ def _add_worktree(bare: Path, path: Path, ref: str, detach: bool = False) -> Non
     subprocess.run(args, check=True, capture_output=True, text=True)
 
 
-def test_parks_dirty_worktree_on_main_preserving_edits(repo) -> None:
+def test_parks_dirty_worktree_on_main_preserving_edits(repo: RepoFixture) -> None:
     tmp, bare, _seed, _origin = repo
     wt = tmp / "wt-jam"
     _add_worktree(bare, wt, "main")
@@ -100,7 +117,7 @@ def test_parks_dirty_worktree_on_main_preserving_edits(repo) -> None:
     assert "f" in porcelain, "uncommitted edits must be preserved"
 
 
-def test_freed_ref_allows_bare_main_fast_forward(repo) -> None:
+def test_freed_ref_allows_bare_main_fast_forward(repo: RepoFixture) -> None:
     tmp, bare, seed, origin = repo
     wt = tmp / "wt-jam"
     _add_worktree(bare, wt, "main")
@@ -144,7 +161,7 @@ def test_freed_ref_allows_bare_main_fast_forward(repo) -> None:
     assert ok.returncode == 0, ok.stderr
 
 
-def test_master_is_also_parked(repo) -> None:
+def test_master_is_also_parked(repo: RepoFixture) -> None:
     tmp, bare, seed, _origin = repo
     # Create a master branch in the bare and check it out in a worktree.
     subprocess.run(["git", "--git-dir", str(bare), "branch", "master", "main"], check=True)
@@ -156,7 +173,7 @@ def test_master_is_also_parked(repo) -> None:
     assert _branch_of(wt) == "", "master worktree must be parked too"
 
 
-def test_detached_worktree_untouched(repo) -> None:
+def test_detached_worktree_untouched(repo: RepoFixture) -> None:
     """The deploy-owned live runtime is detached HEAD — never matched/moved."""
     tmp, bare, _seed, _origin = repo
     wt = tmp / "wt-runtime"
@@ -170,7 +187,7 @@ def test_detached_worktree_untouched(repo) -> None:
     assert after == before, "detached runtime SHA must be untouched"
 
 
-def test_feature_branch_worktree_untouched(repo) -> None:
+def test_feature_branch_worktree_untouched(repo: RepoFixture) -> None:
     tmp, bare, _seed, _origin = repo
     subprocess.run(["git", "--git-dir", str(bare), "branch", "feature-x", "main"], check=True)
     wt = tmp / "wt-feature"
@@ -180,7 +197,7 @@ def test_feature_branch_worktree_untouched(repo) -> None:
     assert _branch_of(wt) == "feature-x", "feature worktree must stay on its branch"
 
 
-def test_idempotent_no_worktrees_on_main(repo) -> None:
+def test_idempotent_no_worktrees_on_main(repo: RepoFixture) -> None:
     """A clean fleet (nothing on main) parks nothing and exits 0."""
     tmp, bare, _seed, _origin = repo
     subprocess.run(["git", "--git-dir", str(bare), "branch", "feature-y", "main"], check=True)
