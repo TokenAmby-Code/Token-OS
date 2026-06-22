@@ -118,3 +118,32 @@ def test_mark_for_close_script_is_committed_executable() -> None:
     assert out.stdout, "tmux-mark-for-close is not tracked by git"
     mode = out.stdout.split()[0]
     assert mode == "100755", f"tmux-mark-for-close must be committed executable, got {mode}"
+
+
+def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
+    """The typing-guard indicator lives in each pane's border, not the global bar.
+
+    Emperor UX directive: drop the global "⌨ GUARD" status-right segment and show
+    guard state per-pane via @GUARD. status-right keeps tmux-typing-guard-status
+    only as a SILENT --scan reconciler (one fork/interval, no visible segment) so
+    every pane's @GUARD is refreshed honestly and stale markers clear.
+    """
+    status_right = _line_starting("set -g status-right ")
+    # The reconciler must run in --scan mode (all panes), never the current-pane
+    # visible-segment mode.
+    assert "tmux-typing-guard-status --scan" in status_right
+    assert "#(tmux-typing-guard-status 2>/dev/null)" not in status_right, (
+        "the visible current-pane guard segment must be removed from the global bar"
+    )
+    # The per-pane border is the sole guard surface now.
+    border = _line_starting("set -g pane-border-format ")
+    assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
+
+
+def test_portable_status_guard_indicator_is_also_per_pane() -> None:
+    portable = (ROOT / "tmux" / "tmux-portable-status.conf").read_text(encoding="utf-8")
+    status_right = next(
+        line for line in portable.splitlines() if line.startswith("set status-right ")
+    )
+    assert "tmux-typing-guard-status --scan" in status_right
+    assert "#(tmux-typing-guard-status 2>/dev/null)" not in status_right
