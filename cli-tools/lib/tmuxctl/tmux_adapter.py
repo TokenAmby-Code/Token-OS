@@ -315,10 +315,23 @@ class TmuxAdapter:
         # Clear any prior suppression payload so an allowed send (which also
         # returns empty stdout) is never misread as suppressed by callers/tests.
         self.last_send_gate_result = None
-        gate = send_gate.evaluate(args_tuple)
+        # Resolve Imperium canonical pane targets (mechanicus:N, legion:custodes,
+        # 1:N, …) to physical %pane ids BEFORE the gate evaluates. The gate's
+        # attendance/typing checks shell out to `tmux display-message -t <target>`
+        # and `tmux list-clients -t <target>`; tmux only understands physical ids
+        # and native session:window addresses, so a canonical id silently
+        # mis-resolves and _pane_attended returns False — the gate then MISSES an
+        # actively-typed attended pane and clobbers the human's live draft
+        # (send-gate-attended-scoping-clobber). The shell shim already
+        # resolves-then-gates (bin/tmux: resolve_target before send_gate_suppresses);
+        # this aligns the Python clobber path so both languages gate on the same
+        # physical id. Resolution is read-only (live tmux snapshot), so doing it
+        # ahead of a possible suppression return is safe.
+        resolved_args = self._resolve_tmux_args(args_tuple)
+        gate = send_gate.evaluate(resolved_args)
         if gate is not None and gate.get("policy") == "delay":
             send_gate.record_suppression(gate)
-            if send_gate.wait_for_gate_clear(args_tuple):
+            if send_gate.wait_for_gate_clear(resolved_args):
                 gate = None
             else:
                 gate = {**gate, "policy": "cancel", "suppressed": True, "delay_failed": True}
@@ -327,7 +340,6 @@ class TmuxAdapter:
             if gate.get("suppressed"):
                 self.last_send_gate_result = gate
                 return ""
-        resolved_args = self._resolve_tmux_args(args_tuple)
         if self._mechanicus_focus_guard_blocks(resolved_args):
             return ""
         if _camera_mutating(resolved_args):

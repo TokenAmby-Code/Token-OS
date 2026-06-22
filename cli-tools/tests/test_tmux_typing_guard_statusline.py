@@ -62,7 +62,18 @@ def _fake_tmux(tmp_path: Path) -> Path:
                 fi
                 ;;
               list-clients)
-                if [[ "$target" == "${FAKE_ACTIVE_PANE:-%1}" ]]; then echo "x"; fi
+                # Real tmux honors -F: the per-pane activity probe asks for
+                # #{client_activity} (an epoch), the attendance probe asks for a
+                # bare marker. The canonical predicate's target-scoped activity
+                # branch uses `list-clients -t <target> -F #{client_activity}`,
+                # so the fake must answer that format — not echo a bare marker.
+                if [[ "$target" == "${FAKE_ACTIVE_PANE:-%1}" ]]; then
+                  if [[ "$*" == *"#{client_activity}"* ]]; then
+                    echo "${FAKE_CLIENT_ACTIVITY:-}"
+                  else
+                    echo "x"
+                  fi
+                fi
                 ;;
               capture-pane)
                 f="${FAKE_CAP_DIR}/$(key "$target")"

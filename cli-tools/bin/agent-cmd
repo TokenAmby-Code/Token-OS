@@ -14,13 +14,18 @@ TARGET_VALUE=""
 DETACH=false
 RESOLVE_ONLY=false
 NO_ESCAPE=false
+NO_SUBMIT=false
 COMMAND=""
 
 usage() {
     cat <<'USAGE'
 agent-cmd - Send a prompt/command to a live Claude or Codex pane
 
-Usage: agent-cmd [--self|--pane PANE|--instance ID] [--detach] [--resolve-only] [--no-escape] <prompt>
+Usage: agent-cmd [--self|--pane PANE|--instance ID] [--detach] [--resolve-only] [--no-escape] [--no-submit] <prompt>
+
+  --no-submit   Insert the prompt as a DRAFT (no Enter/submit). Attended-safe:
+                routes through tmuxctl send-text --no-submit (insert-only), so it
+                can never auto-submit over a human's in-progress draft.
 USAGE
 }
 
@@ -95,6 +100,7 @@ while [[ $# -gt 0 ]]; do
         --detach) DETACH=true; shift ;;
         --resolve-only) RESOLVE_ONLY=true; shift ;;
         --no-escape) NO_ESCAPE=true; shift ;;  # accepted for claude-cmd compatibility
+        --no-submit) NO_SUBMIT=true; shift ;;  # insert as draft, never submit
         -h|--help) usage; exit 0 ;;
         *) COMMAND="$1"; shift ;;
     esac
@@ -153,7 +159,9 @@ send_command() {
         done
     fi
 
-    out=$("$TMUXCTL_BIN" send-text --pane "$pane" --text "$cmd" 2>&1) || {
+    local -a send_args=(send-text --pane "$pane" --text "$cmd")
+    [[ "$NO_SUBMIT" == true ]] && send_args+=(--no-submit)
+    out=$("$TMUXCTL_BIN" "${send_args[@]}" 2>&1) || {
         echo "$out" >&2
         rc=1
     }

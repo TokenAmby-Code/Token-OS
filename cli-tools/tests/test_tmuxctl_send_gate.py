@@ -618,3 +618,100 @@ def test_send_text_then_submit_gated_attended_pane_writes_no_bytes(
     assert excinfo.value.gate["suppressed"] is True
     assert captured_subprocess == [], "gated send_text_then_submit must not touch tmux"
     assert recorded_suppressions and recorded_suppressions[-1]["reason"] == "typing_guard"
+
+
+# ── send-gate-attended-scoping-clobber: canonical-id resolution miss ──────────
+# The clobber's root cause: the gate's attendance/typing checks shell out to
+# `tmux display-message -t <target>` / `tmux list-clients -t <target>`. tmux only
+# understands physical %pane ids (and native session:window addresses). An
+# Imperium canonical id (mechanicus:fabricator-general, legion:custodes, 1:N…)
+# silently mis-resolves, so _pane_attended returns False and the guard MISSES an
+# actively-typed attended pane — then the send clobbers the human's live draft.
+
+
+def _attended_physical_only_tmux(physical: str):
+    """Fake real-tmux where ONLY ``physical`` is an attended pane with a draft.
+
+    Mirrors live tmux: a canonical id (anything != ``physical``) cannot be
+    resolved at the tmux boundary, so every query for it errors (rc=1) exactly
+    as `tmux display-message -t mechanicus:fabricator-general` would.
+    """
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        target = None
+        for idx, tok in enumerate(cmd):
+            if tok == "-t" and idx + 1 < len(cmd):
+                target = cmd[idx + 1]
+                break
+        verb = cmd[1] if len(cmd) > 1 else ""
+        if target is not None and target != physical:
+            proc.returncode = 1  # tmux cannot resolve a canonical id
+            return proc
+        if verb == "display-message":
+            proc.stdout = "11\n"  # pane_active & window_active
+        elif verb == "list-clients":
+            proc.stdout = (
+                f"{int(send_gate.time.time())}\n" if "#{client_activity}" in cmd else "x\n"
+            )
+        elif verb == "capture-pane":
+            proc.stdout = "> half-typed draft\n"  # pending human input
+        return proc
+
+    return _fake_run
+
+
+def test_typing_guard_detects_physical_but_misses_canonical_target(monkeypatch):
+    """Debug-step pin: physical id is detected, canonical id is MISSED.
+
+    This is the exact divergence behind the clobber. The fix lives upstream
+    (resolve canonical -> physical before the gate, see the adapter test below);
+    this test pins the boundary behaviour so a future refactor can't silently
+    re-introduce a canonical id reaching the raw tmux attendance probes.
+    """
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+    monkeypatch.setattr(send_gate.subprocess, "run", _attended_physical_only_tmux("%44"))
+
+    assert send_gate.typing_guard_active(target="%44") is True
+    assert send_gate.typing_guard_active(target="mechanicus:fabricator-general") is False
+
+
+def test_run_resolves_canonical_target_to_physical_before_gating(
+    monkeypatch, captured_subprocess, recorded_suppressions
+):
+    """The fix: an attended-pane send addressed canonically is HELD, not clobbered.
+
+    `tmuxctl send-text --pane mechanicus:fabricator-general` (and every
+    TmuxAdapter.run caller) must evaluate the gate against the RESOLVED physical
+    id. With the human typing in %44, the gate must see target=%44, engage the
+    typing guard, and issue zero bytes — the draft survives.
+    """
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")  # avoid the delay/retry loop
+
+    seen_targets: list[str | None] = []
+
+    def _typing(*, target=None, **_kw):
+        seen_targets.append(target)
+        return target == "%44"  # the human is typing in the physical pane
+
+    monkeypatch.setattr(send_gate, "typing_guard_active", _typing)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    # Stand in for live canonical->physical resolution (no live tmux in tests).
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_pane_target_arg",
+        lambda t: "%44" if t == "mechanicus:fabricator-general" else t,
+    )
+
+    result = adapter.run("send-keys", "-t", "mechanicus:fabricator-general", "-l", "brief body")
+
+    assert "%44" in seen_targets, "gate must evaluate the RESOLVED physical id"
+    assert "mechanicus:fabricator-general" not in seen_targets, (
+        "the unresolved canonical id must never reach the typing-guard predicate"
+    )
+    assert captured_subprocess == [], "attended-pane send must write zero bytes, never clobber"
+    assert recorded_suppressions and recorded_suppressions[-1]["reason"] == "typing_guard"
+    assert result == ""

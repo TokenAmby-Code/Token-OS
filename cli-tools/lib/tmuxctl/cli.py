@@ -152,6 +152,16 @@ def build_parser() -> argparse.ArgumentParser:
     text_source.add_argument("--text")
     text_source.add_argument("--stdin", action="store_true")
     send_text_parser.add_argument("--clear-prompt", action="store_true")
+    send_text_parser.add_argument(
+        "--no-submit",
+        action="store_true",
+        help=(
+            "Insert the text as a DRAFT at the prompt — no C-m, no submit. Routes "
+            "through the insert-only primitive (insert_text) instead of "
+            "send_text_then_submit, so it can never auto-submit over a human's "
+            "draft. Mutually exclusive with --clear-prompt."
+        ),
+    )
 
     invoke_skill_parser = subparsers.add_parser(
         "invoke-skill",
@@ -505,6 +515,11 @@ def main(argv: list[str] | None = None) -> int:
 
             from .assertions import assert_instance
 
+            if args.no_submit and args.clear_prompt:
+                raise ValueError(
+                    "--no-submit is insert-only and cannot be combined with --clear-prompt"
+                )
+
             assertion = assert_instance(control.adapter, args.pane)
             if not assertion.get("ok"):
                 if assertion.get("action") == "persona_correction_sent":
@@ -524,11 +539,19 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
             text = sys.stdin.read() if args.stdin else args.text
-            control.adapter.send_text_then_submit(
-                args.pane,
-                text,
-                clear_prompt=args.clear_prompt,
-            )
+            if args.no_submit:
+                # Draft mode: insert the literal text at the prompt and STOP. No
+                # C-m is ever issued, so this can never auto-submit over a human's
+                # in-progress draft — the insert path is the only attended-safe way
+                # to land text in a pane. (send_text_then_submit keeps its
+                # double-C-m submit semantics for the normal path.)
+                control.insert_text(args.pane, text)
+            else:
+                control.adapter.send_text_then_submit(
+                    args.pane,
+                    text,
+                    clear_prompt=args.clear_prompt,
+                )
             return 0
 
         if args.command == "invoke-skill":
