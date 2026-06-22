@@ -212,7 +212,6 @@ def test_agent_wrapper_owns_stack_enforcement() -> None:
     assert "tmuxctl stack enforce" in common
 
 
-
 def test_command_shims_route_through_wrappers_and_bypass_to_real(tmp_path: Path) -> None:
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
@@ -251,7 +250,9 @@ command codex beta
 TOKEN_API_AGENT_WRAPPER_BYPASS=1 command claude raw-alpha
 TOKEN_API_AGENT_WRAPPER_BYPASS=1 command codex raw-beta
 """
-    result = subprocess.run(["bash", "-c", script], env=env, cwd=tmp_path, text=True, capture_output=True, check=True)
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, cwd=tmp_path, text=True, capture_output=True, check=True
+    )
     lines = result.stdout.splitlines()
     assert lines[0] == str(CLI_TOOLS / "bin" / "claude")
     assert lines[1] == str(CLI_TOOLS / "bin" / "codex")
