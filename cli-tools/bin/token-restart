@@ -26,7 +26,8 @@
 #   requested SHA (or the new bare main). It DIFFS old runtime HEAD → target SHA and
 #   restarts ONLY the affected services (token-api / ops-ui / discord / WSL
 #   satellite / mobile) — see map_changed_to_services(). Runtime checkouts are
-#   deploy artifacts: dirty state is a hard error, never stashed.
+#   deploy artifacts: a dirty tree is auto-preserved to a wip/live-dirty-<ts>
+#   branch (pushed to the bare cache) and never blocks the deploy.
 
 set -euo pipefail
 
@@ -106,7 +107,8 @@ Usage:
 
 Smart-deploy flow (default):
     0. ff-only sync local bare main from GitHub; update runtime checkout detached
-       to --sha/TOKEN_RESTART_TARGET_SHA or bare main. Dirty runtime aborts.
+       to --sha/TOKEN_RESTART_TARGET_SHA or bare main. A dirty runtime is
+       auto-preserved to a wip/live-dirty-<ts> branch (never blocks the deploy).
     1. If runtime HEAD advanced: diff old→new and restart ONLY the services
        whose files changed:
          token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
@@ -121,7 +123,9 @@ Smart-deploy flow (default):
 
 Notes:
     - Sync is ff-only at the bare skeleton and detached at the runtime checkout.
-      Runtime WIP is never stashed or preserved; dirty runtime state aborts deploy.
+      A dirty runtime NEVER blocks deploy: stray WIP is auto-committed to a
+      timestamped wip/live-dirty-<ts> branch and pushed to the bare cache, then
+      the tree is reset onto the target SHA. The WIP is recoverable from there.
     - WSL restart is fire-and-forget if unreachable
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
@@ -315,8 +319,12 @@ sync_venv_if_needed() {
 #
 # SAFETY (load-bearing):
 #   - Bare main fast-forwards only. We never force local main to a non-ancestor.
-#   - Runtime checkout must be clean. Runtime WIP is an operational error; CD
-#     never stashes it and never deploys over it.
+#   - A dirty runtime checkout NEVER blocks the deploy. Stray WIP is an
+#     operational error, but instead of aborting, CD auto-commits it to a
+#     timestamped wip/live-dirty-<ts> branch and pushes that to the durable bare
+#     cache, THEN resets the tree onto the deploy target. The WIP is recoverable
+#     from the bare cache; deploys can never jam on dirt (the new invariant that
+#     replaces the #280 dirty-tree-abort / hard-reconcile).
 #   - On sync failure, abort the restart loudly instead of running ambiguous code.
 
 resolve_live_checkout() {
@@ -425,12 +433,72 @@ ensure_runtime_checkout() {
             return 1
         }
     fi
+    # Aux symlinks are best-effort — never let a missing secrets file fail the
+    # deploy (this runs under `set +e`, so swallow its exit explicitly).
     ensure_runtime_aux_files "$dir"
-    if runtime_is_dirty "$dir"; then
-        echo -e "  ${RED}✗${NC} CD-sync: runtime checkout is dirty; aborting deploy (no stash in runtime): $dir"
-        git -C "$dir" status --short >&2 || true
+    # NOTE: a dirty tree is NOT an error here — _sync_live_checkout_unlocked()
+    # shunts any uncommitted WIP to a wip/live-dirty-<ts> branch before deploy.
+    return 0
+}
+
+# Dirty-shunt: auto-preserve any uncommitted runtime work so it can NEVER block a
+# deploy. Commits the dirt (tracked edits + non-ignored untracked) onto a
+# timestamped wip/live-dirty-<ts> branch and pushes it to the durable bare cache,
+# leaving the working tree clean for the caller to reset onto the deploy target.
+# Ignored files (config.json, token-api/.env, node_modules, …) are never touched.
+# The timestamp comes from runtime `date`, never hardcoded. Returns non-zero only
+# if the WIP could not be safely staged, committed, AND pushed — in which case we
+# abort rather than reset over dirt we failed to preserve (never silent data loss).
+shunt_dirty_runtime() {
+    local dir="$1" ts base branch wip_sha suffix=0
+    ts="$(date +%Y%m%d-%H%M%S)"
+    # Seed with the PID so two concurrent deploys never collide, then make the name
+    # unique against the actual push target (the bare cache) so a same-second retry
+    # can't reuse an existing ref — a collision would fail checkout-b/push and bring
+    # back a deploy-blocking path, defeating the whole invariant.
+    base="wip/live-dirty-${ts}-$$"
+    branch="$base"
+    while git --git-dir="$TOKEN_OS_BARE_REPO" show-ref --verify --quiet "refs/heads/${branch}"; do
+        suffix=$((suffix + 1))
+        branch="${base}-${suffix}"
+    done
+
+    echo -e "${YELLOW}⚠${NC} CD-sync: runtime is dirty; auto-preserving WIP to ${branch} before deploy"
+    git -C "$dir" status --short >&2 || true
+
+    # Branch off the current (detached) HEAD, keeping the working-tree changes, so
+    # the commit captures exactly the dirt that made the tree dirty.
+    if ! git -C "$dir" checkout -b "$branch" >/dev/null 2>&1; then
+        echo -e "  ${RED}✗${NC} CD-sync: failed to create WIP branch ${branch}"
         return 1
     fi
+    # A partial `git add` would let the commit/push succeed while the later hard
+    # reset silently drops the unstaged dirt — so a staging failure must abort,
+    # never be swallowed.
+    if ! git -C "$dir" add -A; then
+        echo -e "  ${RED}✗${NC} CD-sync: failed to stage dirty runtime changes for ${branch}"
+        return 1
+    fi
+    if ! git -C "$dir" \
+            -c user.name="token-cd" -c user.email="cd@token-os.local" \
+            commit -q -m "wip(live): auto-preserved dirty runtime at deploy ${ts}" >/dev/null 2>&1; then
+        echo -e "  ${RED}✗${NC} CD-sync: failed to commit dirty runtime to ${branch}"
+        return 1
+    fi
+    wip_sha="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+
+    # Push to the durable bare cache so the WIP survives the upcoming reset and is
+    # recoverable later. If we can't preserve it durably, abort rather than risk
+    # discarding uncommitted work in the reset.
+    if ! git -C "$dir" push "$TOKEN_OS_BARE_REPO" "refs/heads/${branch}:refs/heads/${branch}" >/dev/null 2>&1; then
+        echo -e "  ${RED}✗${NC} CD-sync: failed to push ${branch} to bare cache; aborting to avoid losing WIP"
+        return 1
+    fi
+    echo -e "  ${GREEN}✓${NC} CD-sync: preserved dirty runtime → ${branch} (${wip_sha:0:9}); pushed to bare cache"
+
+    # Detach off the WIP branch so the caller's reset doesn't move the branch ref.
+    git -C "$dir" checkout --detach "$wip_sha" >/dev/null 2>&1 || true
+    return 0
 }
 
 _sync_live_checkout_unlocked() {
@@ -448,17 +516,23 @@ _sync_live_checkout_unlocked() {
         echo -e "  ${YELLOW}⚠${NC} CD-sync: failed to refresh runtime origin refs (continuing)"
     fi
 
-    if [[ "$old_head" == "$target" ]]; then
+    # Dirty-shunt (the new invariant): if the runtime has uncommitted WIP, preserve
+    # it to a wip/live-dirty-<ts> branch + push, then deploy over the now-clean tree.
+    # A dirty runtime NEVER blocks the deploy. This replaces the #280 abort path.
+    local did_shunt=false
+    if runtime_is_dirty "$dir"; then
+        shunt_dirty_runtime "$dir" || return 1
+        did_shunt=true
+    fi
+
+    # Only short-circuit when the tree is already exactly the target AND we did not
+    # have to shunt — after a shunt the HEAD has moved, so we must reset onto target.
+    if [[ "$old_head" == "$target" && "$did_shunt" == false ]]; then
         echo -e "  ${GREEN}✓${NC} CD-sync: runtime already at ${target:0:9} — no sync needed"
         return 0
     fi
 
     echo -e "${BLUE}→${NC} CD-sync: updating runtime $dir detached → ${target:0:9}..."
-    if runtime_is_dirty "$dir"; then
-        echo -e "  ${RED}✗${NC} CD-sync: aborting deploy — runtime has unexpected local changes (refusing to clobber): $dir"
-        git -C "$dir" status --short >&2 || true
-        return 1
-    fi
     git -C "$dir" checkout --detach "$target" >/dev/null 2>&1 || {
         echo -e "  ${RED}✗${NC} CD-sync: failed to checkout runtime target ${target:0:9}"
         return 1
@@ -468,7 +542,11 @@ _sync_live_checkout_unlocked() {
         return 1
     }
 
-    if [[ -n "$old_head" ]]; then
+    if [[ "$old_head" == "$target" ]]; then
+        # Shunt-only deploy: code is unchanged, we just reclaimed a clean tree.
+        changed_paths=""
+        echo -e "  ${GREEN}✓${NC} CD-sync: runtime cleaned to ${target:0:9} (WIP shunted; code unchanged)"
+    elif [[ -n "$old_head" ]]; then
         changed_paths="$(git --git-dir="$TOKEN_OS_BARE_REPO" diff --name-only "$old_head" "$target" 2>/dev/null || true)"
         echo -e "  ${GREEN}✓${NC} CD-sync: runtime advanced ${old_head:0:9} → ${target:0:9}"
     else
