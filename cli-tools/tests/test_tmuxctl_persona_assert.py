@@ -17,6 +17,7 @@ from tmuxctl.assertions import (
     PersonaSpec,
     _clear_pane_overlay,
     _dispatch_args,
+    _guarded_note_mismatched,
     _guarded_note_unregistered,
     _guarded_send_persona_command,
     _observed_row_hash,
@@ -94,6 +95,8 @@ def test_persona_specs_pin_model_defaults():
     assert persona_spec("legion:malcador").model == "fable"
     assert persona_spec("mechanicus:fabricator-general").model == ""
     assert persona_spec("mechanicus:admin").model == "sonnet"
+    assert persona_spec("koronus:pax").model == "opus"
+    assert persona_spec("koronus:orchestrator").model == "sonnet"
 
 
 def test_malcador_spec_is_not_sync() -> None:
@@ -223,6 +226,20 @@ def test_custodes_fails_when_not_custodes():
     assert _row_matches_persona(impostor, spec) is False
 
 
+def test_custodes_fails_on_wrong_rank_when_rank_surfaced() -> None:
+    spec = _custodes_spec()
+    row = SimpleNamespace(
+        instance_id="i-c",
+        pane_label="legion:custodes",
+        persona_slug="custodes",
+        rank="astartes",
+        legion="",
+        instance_type="",
+        tab_name="custodes-morning",
+    )
+    assert _row_matches_persona(row, spec) is False
+
+
 def test_fg_matches_on_canonical_persona_slug():
     # The whole family reads canonical identity: persona_slug identifies FG even when
     # the legacy legion/tab columns the API dropped are absent.
@@ -264,12 +281,66 @@ def test_admin_fails_on_pane_label_mismatch_even_with_right_primarch():
     assert _row_matches_persona(row, spec) is False
 
 
+def test_koronus_pax_matches_on_canonical_persona_slug_and_rank() -> None:
+    spec = persona_spec("koronus:pax")
+    row = SimpleNamespace(
+        instance_id="i-pax",
+        pane_label="koronus:pax",
+        persona_slug="pax",
+        rank="overseer",
+        legion="civic",
+        primarch="",
+        instance_type="",
+        tab_name="needs-name",
+    )
+    assert _row_matches_persona(row, spec) is True
+
+
+def test_koronus_orchestrator_matches_on_primarch_fallback() -> None:
+    spec = persona_spec("koronus:orchestrator")
+    row = SimpleNamespace(
+        instance_id="i-orch",
+        pane_label="koronus:orchestrator",
+        persona_slug="",
+        rank="overseer",
+        legion="civic",
+        primarch="orchestrator",
+        instance_type="hook_driven",
+        tab_name="needs-name",
+    )
+    assert _row_matches_persona(row, spec) is True
+
+
+def test_koronus_pax_fails_on_wrong_rank() -> None:
+    spec = persona_spec("koronus:pax")
+    row = SimpleNamespace(
+        instance_id="i-pax",
+        pane_label="koronus:pax",
+        persona_slug="pax",
+        rank="astartes",
+        legion="civic",
+        primarch="pax",
+        instance_type="hook_driven",
+        tab_name="needs-name",
+    )
+    assert _row_matches_persona(row, spec) is False
+
+
 def test_admin_hash_busts_on_primarch_change():
     # The guard must notice a primarch flip so a stuck backoff can re-evaluate.
     spec = _admin_spec()
     h_missing = _observed_row_hash(_admin_row(primarch=""), spec)
     h_set = _observed_row_hash(_admin_row(primarch="administratum"), spec)
     assert h_missing != h_set
+
+
+def test_guard_hash_busts_on_rank_change() -> None:
+    # Rank is part of singleton identity; the mismatch guard must re-evaluate
+    # when SessionStart repairs a wrong-rank row.
+    spec = persona_spec("koronus:pax")
+    h_astartes = _observed_row_hash(_row(pane_label="koronus:pax", rank="astartes"), spec)
+    h_overseer = _observed_row_hash(_row(pane_label="koronus:pax", rank="overseer"), spec)
+    assert h_astartes != h_overseer
 
 
 # ── guardrail ────────────────────────────────────────────────────────────────
@@ -342,40 +413,42 @@ def test_guard_stays_failopen_once_threshold_crossed():
     assert action == "persona_correction_failopen"
 
 
-def test_assert_instance_marks_pane_deliverable_on_failopen():
-    # End-to-end through the REAL assert_instance: a live persona pane whose registry
-    # row never matches the predicate drives the bounded correction loop to fail-open,
-    # at which point assert_instance must mark the result `deliverable=True` so the
-    # send path delivers the payload (the live-enforcement-to-custodes fix).
+def test_assert_instance_notes_singleton_mismatch_without_persona_injection() -> None:
+    # End-to-end through the REAL assert_instance: a live singleton persona pane
+    # whose registry row has the wrong identity must NOT receive `/persona`. The
+    # binding is a harness/SessionStart invariant; the assertion emits a
+    # diagnostic and backs off instead of trying an in-band self-PATCH.
     from tmuxctl.assertions import assert_instance
 
     adapter = FakeAdapter()
-    # Persistently-mismatched live custodes row (legion never 'custodes').
+    # Persistently-mismatched live Pax row: it is in the protected koronus:pax
+    # pane but the DB binding is still a generic astartes worker.
     row = _row(
         instance_id="7cd51be3",
-        pane_label="legion:custodes",
+        pane_label="koronus:pax",
+        persona_slug="blood-angels",
+        rank="astartes",
         legion="astartes",
         tab_name="needs-name",
         instance_type="hook_driven",
         primarch="",
     )
 
-    resolved = SimpleNamespace(pane_id="%25", pane_role="legion:custodes")
-    last = {}
+    resolved = SimpleNamespace(pane_id="%25", pane_role="koronus:pax")
     with (
         patch.object(assertions, "resolve_pane", return_value=resolved),
-        patch.object(assertions, "_pane_type", return_value="legion"),
+        patch.object(assertions, "_pane_type", return_value="koronus"),
         patch.object(assertions, "_runtime_has_instance", return_value=True),
         patch.object(assertions, "_registry_entries", return_value=[row]),
-        patch.object(assertions, "_send_persona_command", return_value=(True, "sent")),
+        patch.object(assertions, "_send_persona_command", return_value=(True, "sent")) as send,
         patch.object(assertions, "log_event"),
     ):
-        for _ in range(PERSONA_FAILOPEN_ATTEMPTS + 1):
-            last = assert_instance(adapter, "legion:custodes")
+        result = assert_instance(adapter, "koronus:pax")
 
-    assert last["ok"] is False
-    assert last["action"] == "persona_correction_failopen"
-    assert last["deliverable"] is True
+    assert result["ok"] is False
+    assert result["action"] == "persona_mismatch_noted"
+    assert "deliverable" not in result
+    send.assert_not_called()
 
 
 def test_guard_allows_resend_after_row_changes():
@@ -439,6 +512,31 @@ def test_unregistered_note_suppresses_within_backoff():
     # The loud diagnostic fires once, then backs off — no per-tick event spam.
     emitted = [c.args[0] for c in log.call_args_list if c.args]
     assert emitted.count("persona_unregistered_live_runtime") == 1
+
+
+def test_mismatch_note_does_not_inject_persona_and_backs_off() -> None:
+    adapter = FakeAdapter()
+    spec = persona_spec("koronus:pax")
+    row = _row(
+        instance_id="i-pax",
+        pane_label="koronus:pax",
+        persona_slug="blood-angels",
+        rank="astartes",
+        legion="astartes",
+        tab_name="needs-name",
+    )
+    with (
+        patch.object(assertions, "_send_persona_command", return_value=(True, "sent")) as send,
+        patch.object(assertions, "log_event") as log,
+    ):
+        _, _, action1 = _guarded_note_mismatched(adapter, "%11", spec, row)
+        _, _, action2 = _guarded_note_mismatched(adapter, "%11", spec, row)
+
+    assert action1 == "persona_mismatch_noted"
+    assert action2 == "persona_mismatch_suppressed"
+    send.assert_not_called()
+    emitted = [c.args[0] for c in log.call_args_list if c.args]
+    assert emitted.count("persona_mismatch_live_runtime") == 1
 
 
 def test_guard_state_persists_in_pane_option():

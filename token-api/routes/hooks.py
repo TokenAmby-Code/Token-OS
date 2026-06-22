@@ -3821,15 +3821,15 @@ async def handle_session_start(payload: dict) -> dict:
 
         # Restore prior legion if no auto-detect, or apply auto-detect. The legacy
         # legion column died into persona_id: resolve the legion name to a persona
-        # slug (LEGACY_PERSONA_ALIASES) and bind/clear persona_id accordingly.
+        # slug (LEGACY_PERSONA_ALIASES) and bind it where the legion has an
+        # identity persona. ``civic`` is only a context/legion label for generic
+        # Pax-ENV workers: it must NOT clear the astartes persona assigned during
+        # registration, because that row owns the worker's chip/TTS voice lock.
+        # Civic singleton panes still override below through PERSONA_PANE_IDENTITY
+        # (primarch=pax/orchestrator).
         if auto_legion:
             legion_updates = {}
-            if auto_legion == "civic":
-                # Civic/Pax launches have no persona tint authority: clear the
-                # persona assignment so tint resolution falls through to tmux
-                # default instead of an old civic-green or arbitrary chapter colour.
-                legion_updates["persona_id"] = None
-            else:
+            if auto_legion != "civic":
                 # Persona panes bind persona_id by primarch, not legion: a seat in
                 # a shared legion (Malcador in astartes, Administratum in
                 # mechanicus) is invisible to a legion-keyed lookup, leaving the
@@ -4249,7 +4249,8 @@ async def handle_session_end(payload: dict) -> dict:
             )
 
         # Close-time pane cleanup is centralized through tmuxctl assertion:
-        # persona panes self-heal/recolor, dead stack workers prune, and failed
+        # persona panes launch/reactivate/recolor (identity mismatches are
+        # diagnosed, not in-band patched), dead stack workers prune, and failed
         # assertions clear stale overlays. Spawn bounded work out-of-band so the
         # hook response is not held hostage by a relaunch.
         if _is_codex_completed_one_off:

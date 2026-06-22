@@ -33,6 +33,14 @@ PERSONA_LABELS = {
     "koronus:pax",
     "koronus:orchestrator",
 }
+EXPECTED_PERSONA_RANKS = {
+    "custodes": "overseer",
+    "fabricator-general": "overseer",
+    "administratum": "overseer",
+    "malcador": "primarch",
+    "pax": "overseer",
+    "orchestrator": "overseer",
+}
 
 
 @dataclass(frozen=True)
@@ -339,6 +347,7 @@ def _observed_row_hash(row, spec: PersonaSpec) -> str:
             (getattr(row, "persona_slug", "") or "").strip().lower() if row is not None else ""
         ),
         "legion": getattr(row, "legion", "") if row is not None else "",
+        "rank": (getattr(row, "rank", "") or "").strip().lower() if row is not None else "",
         "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
         "instance_type": getattr(row, "instance_type", "") if row is not None else "",
         "primarch": (getattr(row, "primarch", "") or "") if row is not None else "",
@@ -533,6 +542,74 @@ def _guarded_note_unregistered(
     return False, "persona_unregistered_live_runtime", "persona_unregistered_noted"
 
 
+def _guarded_note_mismatched(
+    adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec, row
+) -> tuple[bool, str, str]:
+    """Surface a live persona pane whose registry row has the wrong identity.
+
+    Singleton panes are pane-stamped infrastructure identities. If SessionStart
+    bound the live row to the wrong persona, in-band ``/persona`` is not a safe
+    repair path: the persona skill intentionally verifies-and-reports for these
+    panes and must not PATCH a civic/shared-legion row. Emit a bounded diagnostic
+    and let restart/SessionStart re-registration repair the binding.
+
+    Returns ``(False, reason, action)`` — never "sent"; the action is
+    ``persona_mismatch_noted`` (fresh) or ``persona_mismatch_suppressed`` (within
+    backoff).
+    """
+    row_hash = _observed_row_hash(row, spec)
+    guard = _read_persona_guard(adapter, pane_id)
+    now = time.time()
+    same_input = guard.get("persona") == spec.persona and guard.get("row_hash") == row_hash
+
+    if same_input and (now - float(guard.get("ts", 0) or 0)) < PERSONA_GUARD_BACKOFF_SECONDS:
+        attempts = int(guard.get("attempts", 1) or 1) + 1
+        guard["attempts"] = attempts
+        _write_persona_guard(adapter, pane_id, guard)
+        return (
+            False,
+            f"persona_mismatch_suppressed attempts={attempts}",
+            "persona_mismatch_suppressed",
+        )
+
+    observed_row = {
+        "instance_id": getattr(row, "instance_id", "") if row is not None else "",
+        "persona_slug": getattr(row, "persona_slug", "") if row is not None else "",
+        "rank": getattr(row, "rank", "") if row is not None else "",
+        "legion": getattr(row, "legion", "") if row is not None else "",
+        "primarch": getattr(row, "primarch", "") if row is not None else "",
+        "tab_name": (getattr(row, "tab_name", "") or "") if row is not None else "",
+        "instance_type": getattr(row, "instance_type", "") if row is not None else "",
+    }
+    log_event(
+        "persona_mismatch_live_runtime",
+        instance_id=observed_row["instance_id"],
+        details={
+            "pane": pane_id,
+            "pane_label": spec.pane_label,
+            "expected_persona": spec.persona,
+            "predicate": "_row_matches_persona",
+            "observed_row": observed_row,
+            "remedy": (
+                "restart this singleton pane so SessionStart re-registers the "
+                "pane-stamped persona binding; /persona is intentionally not "
+                "injected for protected persona panes"
+            ),
+        },
+    )
+    _write_persona_guard(
+        adapter,
+        pane_id,
+        {
+            "persona": spec.persona,
+            "row_hash": row_hash,
+            "ts": now,
+            "attempts": (int(guard.get("attempts", 0) or 0) + 1) if same_input else 1,
+        },
+    )
+    return False, "persona_mismatch_live_runtime", "persona_mismatch_noted"
+
+
 def _stop_rows(rows, *, pane_id: str, pane_label: str, reason: str) -> None:
     for row in rows:
         try:
@@ -613,6 +690,10 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
     # predicate and re-armed the `/persona custodes` injection loop every tick.
     slug = (getattr(row, "persona_slug", "") or "").strip().lower()
     if slug:
+        expected_rank = EXPECTED_PERSONA_RANKS.get(spec.persona)
+        rank = (getattr(row, "rank", "") or "").strip().lower()
+        if expected_rank and rank and rank != expected_rank:
+            return False
         return slug == spec.persona
     # LEGACY fallbacks for rows/sources predating the persona_slug surface.
     if spec.persona == "custodes":
@@ -652,6 +733,16 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
         # primarch column.
         return row.pane_label == spec.pane_label and (
             getattr(row, "primarch", "") == "administratum" or spec.persona in tab
+        )
+    if spec.persona in {"pax", "orchestrator"}:
+        # Civic singleton panes share the `civic` legion with generic Pax-ENV
+        # workers, so legion is not identity. The stable identity is the koronus
+        # pane label plus persona/primarch, with overseer rank when surfaced.
+        rank = (getattr(row, "rank", "") or "").strip().lower()
+        return (
+            row.pane_label == spec.pane_label
+            and (getattr(row, "primarch", "") == spec.persona or spec.persona in tab)
+            and (not rank or rank == "overseer")
         )
     # Fallback for any other persona pane: stable pane_label plus persona-derived
     # tab name.
@@ -797,7 +888,7 @@ def _assert_instance_impl(
             )
             return finish(result, clear_failed=False)
         if row is not None and not _row_matches_persona(row, spec):
-            sent, reason, action = _guarded_send_persona_command(adapter, pane_id, spec, row)
+            _noted, reason, action = _guarded_note_mismatched(adapter, pane_id, spec, row)
             log_event(
                 "assert_instance_mismatch",
                 instance_id=row.instance_id,
@@ -811,13 +902,6 @@ def _assert_instance_impl(
                 },
             )
             result.update({"ok": False, "action": action, "reason": reason})
-            # The persona correction is stuck past its bounded attempts but the live
-            # runtime IS present (we only reach this branch with runtime_ok=True and a
-            # real row). Mark the pane deliverable so the send path fails open and
-            # delivers the payload instead of treating the stuck correction as a dead
-            # pane — payload delivery is primary, the correction is secondary.
-            if action == "persona_correction_failopen":
-                result["deliverable"] = True
             return finish(result, clear_failed=False)
         if row is None:
             stopped_rows = _registry_entries(pane_id, pane_label, include_stopped=True)

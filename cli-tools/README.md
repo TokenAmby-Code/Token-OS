@@ -68,7 +68,7 @@ Automation must never steal the operator's tmux focus. Use `preserve_focus(...)`
 
 ### Pane-bound assertion (`tmuxctl assert-instance`)
 
-`tmuxctl assert-instance --pane <target>` is the public assertion/check-and-repair primitive for pane-backed agents. It is pane-type-bound: persona panes self-heal or receive `/persona <expected>`, stack workers are retired/pruned when dead, and palace/somnium panes only report truth while cleaning stale registry rows. Use it before automated injection; if it returns `action=persona_correction_sent`, settle and retry before sending the real payload. See `cli-tools/docs/managed-stack-dispatch.md`.
+`tmuxctl assert-instance --pane <target>` is the public assertion/check-and-repair primitive for pane-backed agents. It is pane-type-bound: persona panes launch/reactivate when safe and report live identity mismatches without injecting `/persona`, stack workers are retired/pruned when dead, and palace/somnium panes only report truth while cleaning stale registry rows. Use it before automated injection; if it reports a persona mismatch/unregistered action, restart or let SessionStart re-register the protected pane before sending sensitive payloads. See `cli-tools/docs/managed-stack-dispatch.md`.
 
 ### Subagents (`subagent`)
 

@@ -209,7 +209,11 @@ class TestSetLegion:
         conn.close()
         assert persona_id == personas.persona_id_for_slug("custodes")
 
-    def test_set_legion_civic_clears_canonical_persona_tint(self, client, app_env, monkeypatch):
+    def test_set_legion_civic_preserves_canonical_persona_tint(
+        self, client, app_env, monkeypatch
+    ) -> None:
+        import personas
+
         tint_calls = []
 
         async def _pane(_instance_id):
@@ -223,16 +227,35 @@ class TestSetLegion:
         )
 
         iid = _insert_instance()
+        from instance_mutation import sanctioned_update_instance_sync
+
+        persona_id = personas.persona_id_for_slug("ultramarines")
+        conn = sqlite3.connect(app_env.db_path)
+        expected_tint = conn.execute(
+            "SELECT pane_tint FROM personas WHERE id = ?", (persona_id,)
+        ).fetchone()[0]
+        sanctioned_update_instance_sync(
+            conn,
+            instance_id=iid,
+            updates={"persona_id": persona_id},
+            mutation_type="test_persona_assignment",
+            write_source="test",
+            actor="test_set_legion_civic_preserves_canonical_persona_tint",
+        )
+        conn.commit()
+        conn.close()
+
         resp = client.patch(f"/api/instances/{iid}/legion", json={"legion": "civic"})
         assert resp.status_code == 200
-        assert ("%pax", "default") in tint_calls
+        assert ("%pax", expected_tint) in tint_calls
+        assert ("%pax", "default") not in tint_calls
 
         conn = sqlite3.connect(app_env.db_path)
-        persona_id = conn.execute(
+        actual_persona_id = conn.execute(
             "SELECT persona_id FROM instances WHERE id = ?", (iid,)
         ).fetchone()[0]
         conn.close()
-        assert persona_id is None
+        assert actual_persona_id == persona_id
 
     def test_set_legion_invalid(self, client):
         iid = _insert_instance()
@@ -437,7 +460,7 @@ class TestCivicAutoDetect:
         assert resp.status_code == 200, f"Hook failed: {resp.text}"
         return resp.json()
 
-    def test_civic_autodetect_pax_env(self, client):
+    def test_civic_autodetect_pax_env_preserves_assigned_astartes_persona(self, client) -> None:
         sid = str(uuid.uuid4())
         self._register_via_hook(client, working_dir="/Volumes/Imperium/Pax-ENV", session_id=sid)
         row = _get_instance(sid)
@@ -447,9 +470,9 @@ class TestCivicAutoDetect:
             persona_id = conn.execute(
                 "SELECT persona_id FROM instances WHERE id = ?", (sid,)
             ).fetchone()[0]
-        assert persona_id is None
+        assert persona_id is not None
 
-    def test_civic_pax_tint_resolves_default_not_green(self, client, monkeypatch):
+    def test_civic_pax_tint_keeps_assigned_chapter_not_default(self, client, monkeypatch) -> None:
         import shared
 
         tint_calls = []
@@ -471,10 +494,11 @@ class TestCivicAutoDetect:
             },
         )
         assert resp.status_code == 200, resp.text
-        assert ("%pax", "default") in tint_calls
+        assert tint_calls
+        assert ("%pax", "default") not in tint_calls
         assert ("%pax", "#083010") not in tint_calls
 
-    def test_civic_autodetect_pax_path(self, client):
+    def test_civic_autodetect_pax_path_preserves_assigned_astartes_persona(self, client) -> None:
         sid = str(uuid.uuid4())
         self._register_via_hook(client, working_dir="/mnt/imperium/pax/project", session_id=sid)
         row = _get_instance(sid)
@@ -484,7 +508,7 @@ class TestCivicAutoDetect:
             persona_id = conn.execute(
                 "SELECT persona_id FROM instances WHERE id = ?", (sid,)
             ).fetchone()[0]
-        assert persona_id is None
+        assert persona_id is not None
 
     def test_no_autodetect_normal_dir(self, client):
         sid = str(uuid.uuid4())
