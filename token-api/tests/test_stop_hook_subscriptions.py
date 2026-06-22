@@ -938,6 +938,59 @@ def test_mark_for_close_now_uses_executor(app_env: object, monkeypatch: object) 
     assert sub_row == ("delivered", "close-pane")
 
 
+def test_mark_for_close_supports_banish(app_env: object, monkeypatch: object) -> None:
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(app_env.db_path, "banish-now", pane="%104")
+    closed = []
+
+    async def fake_close(pane: str) -> dict:
+        closed.append(pane)
+        return {"status": "closed", "pane": pane}
+
+    monkeypatch.setattr(hooks, "_close_tmux_pane_for_mark", fake_close)
+
+    async def run() -> None:
+        result = await hooks.mark_instance_for_close(
+            "banish-now",
+            hooks.MarkForCloseRequest(mode="now", lifecycle="banish", pane="%104"),
+        )
+        assert result["success"] is True
+        assert result["action"] == "closed"
+
+    asyncio.run(run())
+
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT status, rank, golden_throne FROM instances WHERE id='banish-now'"
+    ).fetchone()
+    conn.close()
+    assert closed == ["%104"]
+    assert row == ("stopped", "astartes", None)
+
+
+def test_mark_for_close_executor_invokes_tmuxctl_close_pane(
+    app_env: object, monkeypatch: object
+) -> None:
+    hooks = sys.modules["routes.hooks"]
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stdout = b'{"status":"closed","pane":"%105","method":"kill-pane"}'
+        stderr = b""
+
+    async def fake_run(args, **kwargs):
+        calls.append(tuple(args))
+        return Proc()
+
+    monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_run)
+
+    result = asyncio.run(hooks._close_tmux_pane_for_mark("%105"))
+
+    assert result["status"] == "closed"
+    assert calls == [(str(hooks._tmuxctl_bin()), "close-pane", "--pane", "%105")]
+
+
 def test_mark_for_close_archive_fails_when_session_doc_row_missing(
     app_env: object, monkeypatch: object
 ) -> None:

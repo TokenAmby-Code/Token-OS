@@ -56,6 +56,34 @@ _AUTOMATION_FOCUS_ENVS = {
     "IMPERIUM_TMUX_AUTOMATION",
     "TOKEN_API_INTERNAL_DISPATCH",
 }
+RUNTIME_PANE_OPTIONS = (
+    "@INSTANCE_ID",
+    "@CC_STATE",
+    "@PANE_LABEL",
+    "@ACTIVE_TITLE",
+    "@PROGRESS_TITLE",
+    "@PANE_PROGRESS",
+    "@PANE_TITLE_SUPPRESS",
+    "@TTS_STATE",
+    "@CONTEXT_INFO",
+    "@STACK_PENDING",
+    "@GT_FIRE",
+    "@PLANNING_STATE",
+    "@PLANNING_AGENT",
+    "@DISCORD_VOICE_LOCK",
+    "@DISCORD_VOICE_PROCESSING",
+    "@TOKEN_API_WRAPPER_LAUNCH_ID",
+    "@TOKEN_API_ENGINE",
+    "@TOKEN_API_LAUNCHER",
+    "@TOKEN_API_CWD",
+    "@TOKEN_API_SESSION_ID",
+    "@TOKEN_API_DISPATCH_TARGET",
+    "@TOKEN_API_DISPATCH_WINDOW",
+    "@TOKEN_API_DISPATCH_MODE",
+    "@TOKEN_API_DISPATCH_SLOT",
+    "@TOKEN_API_LAUNCH_MODE",
+    "@TOKEN_API_TARGET_WORKING_DIR",
+)
 
 
 def normalize_prompt_payload(text: str) -> str:
@@ -303,6 +331,65 @@ class TmuxAdapter:
         except Exception:
             return "tmuxctl"
 
+    def _run_raw_tmux(self, args: list[str], *, allow_failure: bool = True) -> str:
+        """Run tmux without target resolution, send gate, or focus guard."""
+        proc = subprocess.run(
+            [self.tmux_binary, *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=_tmux_stderr_target(allow_failure=allow_failure),
+            check=False,
+        )
+        if proc.returncode != 0 and not allow_failure:
+            stderr = proc.stderr.strip()
+            raise TmuxError(stderr or f"tmux {' '.join(args)} failed")
+        return proc.stdout
+
+    def clear_pane_style(self, target: str) -> None:
+        """Clear pane tint/title overlays. Best-effort and camera-neutral."""
+        if not target:
+            return
+        self._run_raw_tmux(["select-pane", "-t", target, "-P", "bg=default"])
+        self._run_raw_tmux(["select-pane", "-t", target, "-T", ""])
+
+    def clear_runtime_state(self, target: str) -> None:
+        """Clear runtime stamps and pane close/assertion chrome together."""
+        if not target:
+            return
+        self.clear_pane_style(target)
+        for option in RUNTIME_PANE_OPTIONS:
+            self._run_raw_tmux(["set-option", "-pu", "-t", target, option])
+
+    def _target_for_invariant(self, resolved_args: list[str]) -> str:
+        target = _target_arg(resolved_args)
+        if target:
+            return target
+        try:
+            return self._run_raw_tmux(["display-message", "-p", "#{pane_id}"]).strip()
+        except Exception:
+            return ""
+
+    def _preflight_runtime_invariants(self, resolved_args: list[str]) -> None:
+        if not resolved_args:
+            return
+        command = resolved_args[0]
+        if command == "respawn-pane":
+            target = self._target_for_invariant(resolved_args)
+            if target:
+                self.clear_runtime_state(target)
+            return
+        if command not in {"set-option", "set"}:
+            return
+        if not any(arg.startswith("-") and "p" in arg for arg in resolved_args[1:]):
+            return
+        if not any(arg.startswith("-") and "u" in arg for arg in resolved_args[1:]):
+            return
+        option = resolved_args[-1] if resolved_args else ""
+        if option == "@INSTANCE_ID":
+            target = self._target_for_invariant(resolved_args)
+            if target:
+                self.clear_pane_style(target)
+
     def run(self, *args: str, allow_failure: bool = False) -> str:
         # Universal send gate — the inescapable pane-write sentinel. Every send
         # to a pane that originates in Python (token-api interventions, the
@@ -342,6 +429,7 @@ class TmuxAdapter:
                 return ""
         if self._mechanicus_focus_guard_blocks(resolved_args):
             return ""
+        self._preflight_runtime_invariants(resolved_args)
         if _camera_mutating(resolved_args):
             self.focus_mutation_count += 1
         # Every send through run() is automated by construction (see this method's

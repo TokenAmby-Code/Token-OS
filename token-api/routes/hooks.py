@@ -32,6 +32,7 @@ from pydantic import BaseModel
 import shared
 import talk as talk_service
 from enforcement_service import close_distraction_windows
+from instance_lifecycle import apply_instance_lifecycle, normalize_instance_lifecycle
 from instance_mutation import (
     _fetch_instance_row,
     create_golden_throne_binding,
@@ -1951,43 +1952,27 @@ async def _close_tmux_pane_for_mark(pane: str | None) -> dict:
     pane = _normalize_text(pane)
     if not pane:
         return {"status": "skipped", "reason": "no_pane"}
-    stack_window = None
     try:
-        role = await _tmux_show_pane_option(pane, "@PANE_ID")
-        if role in PROTECTED_MARK_FOR_CLOSE_PANE_IDS:
-            return {"status": "refused", "reason": "static_persona_pane", "pane_role": role}
-        if not await _tmux_pane_exists(pane):
-            return {"status": "already_closed"}
-        stack_window = await _tmux_pane_stack_window(pane)
-        await _cleanup_tmux_pane_cosmetic(pane)
-        for _ in range(3):
-            await _run_subprocess_offloop(
-                ("tmux", "send-keys", "-t", pane, "C-c"),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                timeout=2,
-            )
-            await asyncio.sleep(0.2)
-        for _ in range(6):
-            if not await _tmux_pane_exists(pane):
-                await _cleanup_tmux_pane_runtime_stamps(pane)
-                _spawn_stack_enforce(stack_window)
-                return {"status": "closed", "pane": pane, "method": "graceful"}
-            await asyncio.sleep(0.5)
         proc = await _run_subprocess_offloop(
-            ("tmux", "kill-pane", "-t", pane),
+            (str(_tmuxctl_bin()), "close-pane", "--pane", pane),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            timeout=3,
+            timeout=15,
         )
+        stdout = proc.stdout.decode(errors="ignore").strip()
+        if stdout:
+            try:
+                payload = json.loads(stdout)
+                if isinstance(payload, dict):
+                    return payload
+            except json.JSONDecodeError:
+                pass
         if proc.returncode != 0:
             return {
                 "status": "failed",
-                "error": proc.stderr.decode(errors="ignore").strip() or "tmux kill-pane failed",
+                "error": proc.stderr.decode(errors="ignore").strip() or "tmuxctl close-pane failed",
             }
-        await _cleanup_tmux_pane_runtime_stamps(pane)
-        _spawn_stack_enforce(stack_window)
-        return {"status": "closed", "pane": pane, "method": "kill-pane"}
+        return {"status": "closed", "pane": pane, "method": "tmuxctl"}
     except Exception as exc:  # noqa: BLE001
         return {"status": "failed", "error": str(exc)}
 
@@ -2008,65 +1993,30 @@ async def _apply_mark_for_close_lifecycle(
     instance_id: str,
     lifecycle: str,
 ) -> dict:
-    lifecycle = (lifecycle or "retire").strip().lower()
-    if lifecycle in {"archive", "archive-doc", "archive-session-doc", "retire-and-archive"}:
-        lifecycle = "archive-session-doc"
-    elif lifecycle in {"retire", "retire-only"}:
-        lifecycle = "retire"
-    else:
-        return {"status": "failed", "reason": "unsupported_lifecycle", "lifecycle": lifecycle}
+    raw_lifecycle = (lifecycle or "retire").strip().lower()
+    lifecycle = normalize_instance_lifecycle(raw_lifecycle)
+    if lifecycle not in {"retire", "archive-session-doc", "banish"}:
+        return {"status": "failed", "reason": "unsupported_lifecycle", "lifecycle": raw_lifecycle}
 
-    cursor = await db.execute(
-        "SELECT id, session_doc_id FROM instances WHERE id = ?",
-        (instance_id,),
-    )
-    row = await cursor.fetchone()
-    if not row:
-        return {"status": "failed", "reason": "instance_not_found"}
-
-    now = datetime.now().isoformat()
-    doc_id = row[1]
-    doc_path_text = None
-    if lifecycle == "archive-session-doc" and doc_id:
-        cursor = await db.execute(
-            "SELECT file_path FROM session_documents WHERE id = ?",
-            (doc_id,),
-        )
-        doc_row = await cursor.fetchone()
-        if not doc_row:
-            return {
-                "status": "failed",
-                "reason": "session_doc_not_found",
-                "session_doc_id": doc_id,
-            }
-        doc_path_text = doc_row[0]
-        await db.execute(
-            "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
-            (now, doc_id),
-        )
-        doc_path = _resolve_session_doc_path(doc_path_text)
-        if doc_path and doc_path.exists():
-            try:
-                await asyncio.to_thread(update_frontmatter, doc_path, {"status": "archived"})
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("mark-for-close frontmatter update failed for %s: %s", doc_path, exc)
-
-    status = "archived" if lifecycle == "archive-session-doc" else "stopped"
-    await sanctioned_update_instance(
+    result = await apply_instance_lifecycle(
         db,
-        instance_id=instance_id,
-        updates={
-            "rank": "retired",
-            "status": status,
-            "input_lock": None,
-            "stopped_at": now,
-            "golden_throne": None,
-        },
-        mutation_type="instance_archived" if status == "archived" else "instance_retired",
         write_source="hooks",
+        instance_id=instance_id,
+        lifecycle=lifecycle,
         actor="mark-for-close",
     )
-    return {"status": status, "rank": "retired", "session_doc_id": doc_id, "lifecycle": lifecycle}
+    if result.get("status") == "failed":
+        return result
+    payload = {
+        "status": result.get("status"),
+        "session_doc_id": result.get("session_doc_id"),
+        "lifecycle": lifecycle,
+    }
+    if lifecycle in {"retire", "archive-session-doc"}:
+        payload["rank"] = "retired"
+    if lifecycle == "banish":
+        payload["persona"] = result.get("persona")
+    return payload
 
 
 async def _execute_close_pane_stop_subscription(db, *, subscription: dict) -> dict:
@@ -6268,10 +6218,10 @@ async def mark_instance_for_close(instance_id: str, request: MarkForCloseRequest
     lifecycle = (request.lifecycle or "retire").strip().lower()
     if mode not in {"after-stop", "now"}:
         return {"success": False, "action": "unsupported_mode", "mode": mode}
-    if lifecycle in {"archive", "archive-doc", "retire-and-archive"}:
-        lifecycle = "archive-session-doc"
-    if lifecycle not in {"retire", "archive-session-doc"}:
-        return {"success": False, "action": "unsupported_lifecycle", "lifecycle": lifecycle}
+    raw_lifecycle = lifecycle
+    lifecycle = normalize_instance_lifecycle(lifecycle) or raw_lifecycle
+    if lifecycle not in {"retire", "archive-session-doc", "banish"}:
+        return {"success": False, "action": "unsupported_lifecycle", "lifecycle": raw_lifecycle}
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
         armed = await _mark_for_close_subscription(

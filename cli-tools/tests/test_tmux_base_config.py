@@ -103,6 +103,10 @@ def test_prefix_q_opens_mark_for_close_popup() -> None:
     assert "/retire" not in script
     assert "/archive-session-doc" not in script
 
+    exit_script = (ROOT / "bin" / "tmux-instance-exit").read_text(encoding="utf-8")
+    assert '"$TMUXCTL_BIN" close --instance-id' in exit_script
+    assert "send-keys C-c" not in exit_script
+
 
 def test_mark_for_close_script_is_committed_executable() -> None:
     # core.fileMode is false in this repo, so a missing exec bit is not caught by

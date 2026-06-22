@@ -73,6 +73,7 @@ from dailynote_callout import (
     apply_callout,
 )
 from db_schema import init_database_async
+from instance_lifecycle import apply_instance_lifecycle
 from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
     create_golden_throne_binding,  # noqa: F401 — used in PATCH /type GT promotion
@@ -97,12 +98,10 @@ from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
 from personas import (
-    BLACK_SHIELDS,
     assign_astartes_persona,
     persona_to_profile,
     resolve_live_persona_instance,
     resolve_persona,
-    seed_params,
 )
 from phone_service import (
     _send_to_phone,
@@ -2256,19 +2255,17 @@ async def delete_all_instances():
 async def stop_instance(instance_id: str):
     """Mark an instance as stopped."""
     logger.info(f"Stopping instance: {instance_id[:12]}...")
-    now = datetime.now().isoformat()
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id, device_id, COALESCE(is_subagent, 0) FROM instances WHERE id = ?",
-            (instance_id,),
+        lifecycle_result = await apply_instance_lifecycle(
+            db,
+            instance_id,
+            lifecycle="stop",
+            write_source="api",
+            actor="stop-instance",
         )
-        row = await cursor.fetchone()
-
-        if not row:
+        if lifecycle_result.get("status") == "failed":
             raise HTTPException(status_code=404, detail="Instance not found")
-
-        is_subagent = row[2]
 
         # Resolve the stopping instance's LIVE pane (tmuxctl owns instance->pane) for
         # the tint-clear below — never the stored tmux_pane column. resolve-instance
@@ -2276,20 +2273,6 @@ async def stop_instance(instance_id: str):
         # so a truthy result is unambiguously ours to vacate; a dead, reused, or
         # taken-over pane resolves to None and we leave the tint to its current owner.
         stopped_pane, _stopped_role = await shared.resolve_instance_pane(instance_id)
-
-        await sanctioned_update_instance(
-            db,
-            instance_id=instance_id,
-            updates={
-                "status": "stopped",
-                "input_lock": None,
-                "stopped_at": now,
-                "golden_throne": None,
-            },
-            mutation_type="instance_stopped",
-            write_source="api",
-            actor="stop-instance",
-        )
         await db.commit()
 
         # Check remaining active instances (all)
@@ -2312,10 +2295,14 @@ async def stop_instance(instance_id: str):
         await asyncio.to_thread(shared.clear_pane_tint, stopped_pane, source="stop-instance")
 
     # Log event
-    await log_event("instance_stopped", instance_id=instance_id, device_id=row[1])
+    await log_event(
+        "instance_stopped",
+        instance_id=instance_id,
+        device_id=lifecycle_result.get("device_id"),
+    )
 
     # Push updated instance count to phone widget
-    if not is_subagent:
+    if not lifecycle_result.get("is_subagent"):
         asyncio.create_task(
             push_phone_widget_async(timer_engine.current_mode.value, remaining_non_sub)
         )
@@ -10921,61 +10908,18 @@ async def set_instance_type(instance_id: str, request: Request):
     return {"instance_id": instance_id, "instance_type": new_type, "old_type": old_type}
 
 
-async def _ensure_persona_seed(db, seed) -> str | None:
-    await db.execute(
-        """INSERT INTO personas
-           (id, slug, display_name, default_rank, assignment_pool, assignment_order,
-            pane_tint, chip_color, tts_voice, tts_rate, notification_sound)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-             slug = excluded.slug,
-             display_name = excluded.display_name,
-             default_rank = excluded.default_rank,
-             assignment_pool = excluded.assignment_pool,
-             assignment_order = excluded.assignment_order,
-             pane_tint = excluded.pane_tint,
-             chip_color = excluded.chip_color,
-             tts_voice = excluded.tts_voice,
-             tts_rate = excluded.tts_rate,
-             notification_sound = excluded.notification_sound""",
-        seed_params(seed),
-    )
-    return seed.id
-
-
-async def _retire_instance_row(
-    db,
-    instance_id: str,
-    *,
-    status: str = "stopped",
-    actor: str = "retire-instance",
-    mutation_type: str = "instance_retired",
-) -> None:
-    updates = {
-        "rank": "retired",
-        "status": status,
-        "input_lock": None,
-        "stopped_at": datetime.now().isoformat(),
-        "golden_throne": None,
-    }
-    await sanctioned_update_instance(
-        db,
-        instance_id=instance_id,
-        updates=updates,
-        mutation_type=mutation_type,
-        write_source="api",
-        actor=actor,
-    )
-
-
 @app.patch("/api/instances/{instance_id}/retire")
 async def retire_instance(instance_id: str):
     """Retire an instance row without archiving its session document."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
-        if not await cursor.fetchone():
+        result = await apply_instance_lifecycle(
+            db,
+            instance_id,
+            lifecycle="retire",
+            write_source="api",
+        )
+        if result.get("status") == "failed":
             raise HTTPException(status_code=404, detail="Instance not found")
-        await _retire_instance_row(db, instance_id)
         await db.commit()
     await log_event("instance_retired", instance_id=instance_id)
     return {"instance_id": instance_id, "rank": "retired", "status": "stopped"}
@@ -10985,90 +10929,53 @@ async def retire_instance(instance_id: str):
 async def archive_instance_session_doc(instance_id: str):
     """Archive the session document attached to an instance, and retire the instance."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id, session_doc_id FROM instances WHERE id = ?", (instance_id,)
-        )
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Instance not found")
-        doc_id = row[1]
-        doc_path = None
-        if doc_id:
-            cursor = await db.execute(
-                "SELECT status, file_path FROM session_documents WHERE id = ?", (doc_id,)
-            )
-            doc_row = await cursor.fetchone()
-            if not doc_row:
-                raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
-            if doc_row[1]:
-                raw_path = Path(doc_row[1])
-                doc_path = raw_path if raw_path.is_absolute() else OBSIDIAN_VAULT_PATH / raw_path
-            await db.execute(
-                "UPDATE session_documents SET status = ?, updated_at = ? WHERE id = ?",
-                ("archived", datetime.now().isoformat(), doc_id),
-            )
-            if doc_path and doc_path.exists():
-                try:
-                    await asyncio.to_thread(update_frontmatter, doc_path, {"status": "archived"})
-                except Exception as exc:
-                    logger.warning(
-                        f"archive-session-doc: frontmatter update failed for {doc_path}: {exc}"
-                    )
-        await _retire_instance_row(
+        result = await apply_instance_lifecycle(
             db,
             instance_id,
-            status="archived",
+            lifecycle="archive-session-doc",
+            write_source="api",
             actor="archive-session-doc",
-            mutation_type="instance_archived",
         )
+        if result.get("status") == "failed":
+            if result.get("reason") == "session_doc_not_found":
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Session doc {result.get('session_doc_id')} not found",
+                )
+            raise HTTPException(status_code=404, detail="Instance not found")
         await db.commit()
     await log_event(
         "instance_session_doc_archived",
         instance_id=instance_id,
-        details={"session_doc_id": doc_id},
+        details={"session_doc_id": result.get("session_doc_id")},
     )
-    return {"instance_id": instance_id, "session_doc_id": doc_id, "status": "archived"}
+    return {
+        "instance_id": instance_id,
+        "session_doc_id": result.get("session_doc_id"),
+        "status": "archived",
+    }
 
 
 @app.patch("/api/instances/{instance_id}/banish")
 async def banish_instance(instance_id: str):
     """Close an instance without retiring/archiving; chapter children move to Black Shields."""
-    now = datetime.now().isoformat()
-    banished_to = None
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT i.id, i.commander_type, p.default_rank
-               FROM instances i
-               LEFT JOIN personas p ON p.id = i.persona_id
-               WHERE i.id = ?""",
-            (instance_id,),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Instance not found")
-        updates = {
-            "status": "stopped",
-            "input_lock": None,
-            "stopped_at": now,
-            "golden_throne": None,
-        }
-        if row["commander_type"] == "chapter" and (row["default_rank"] or "astartes") == "astartes":
-            updates["persona_id"] = await _ensure_persona_seed(db, BLACK_SHIELDS)
-            updates["commander_type"] = "emperor"
-            updates["commander_id"] = None
-            banished_to = BLACK_SHIELDS.slug
-        await sanctioned_update_instance(
+        result = await apply_instance_lifecycle(
             db,
-            instance_id=instance_id,
-            updates=updates,
-            mutation_type="instance_banished",
+            instance_id,
+            lifecycle="banish",
             write_source="api",
             actor="banish-instance",
         )
+        if result.get("status") == "failed":
+            raise HTTPException(status_code=404, detail="Instance not found")
         await db.commit()
-    await log_event("instance_banished", instance_id=instance_id, details={"persona": banished_to})
-    return {"instance_id": instance_id, "status": "stopped", "persona": banished_to}
+    await log_event(
+        "instance_banished",
+        instance_id=instance_id,
+        details={"persona": result.get("persona")},
+    )
+    return {"instance_id": instance_id, "status": "stopped", "persona": result.get("persona")}
 
 
 @app.patch("/api/instances/{instance_id}/archive")
