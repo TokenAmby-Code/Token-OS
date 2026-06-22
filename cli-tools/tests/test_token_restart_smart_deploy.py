@@ -316,28 +316,20 @@ def test_bare_main_non_ff_aborts_without_restart(tmp_path: Path) -> None:
     assert KICK_DISCORD not in calls
 
 
-def test_dirty_runtime_checkout_aborts_without_restart(tmp_path: Path) -> None:
+def test_dirty_runtime_shunts_then_restarts_changed_service(tmp_path: Path) -> None:
+    """New invariant: a dirty runtime NEVER blocks the deploy. The stub reports a
+    dirty `git status` (STUB_DIRTY_RUNTIME=1); token-restart must auto-preserve the
+    WIP to a wip/live-dirty-<ts> branch and STILL advance + restart the changed
+    service rather than aborting. (Replaces the old #280 dirty-tree-abort.) The
+    real branch-create/commit/push mechanics are covered against real git in
+    test_token_restart_runtime_reconcile.py."""
     env, logfile = _stub_env(tmp_path, "token-api/main.py")
     env["STUB_DIRTY_RUNTIME"] = "1"
-    # Replace git stub with a small wrapper that reports dirty status, delegating
-    # all other commands to the generated stub body is overkill; status alone is
-    # enough to force the hard-fail path before checkout/restarts.
-    git_path = Path(env["PATH"].split(":", 1)[0]) / "git"
-    old = git_path.read_text()
-    git_path.write_text(
-        old.replace(
-            'sub="$1"; shift || true\ncase "$sub" in',
-            'sub="$1"; shift || true\n'
-            'if [[ "$sub" == "status" && "${STUB_DIRTY_RUNTIME:-}" == "1" ]]; then '
-            'echo " M token-api/main.py"; exit 0; fi\n'
-            'case "$sub" in',
-        )
-    )
     proc = _run(env)
-    assert proc.returncode != 0
-    assert "runtime checkout is dirty" in proc.stdout
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "auto-preserving WIP to wip/live-dirty-" in proc.stdout
     calls = logfile.read_text()
-    assert KICK_TOKENAPI not in calls
+    assert KICK_TOKENAPI in calls
     assert KICK_DISCORD not in calls
 
 
