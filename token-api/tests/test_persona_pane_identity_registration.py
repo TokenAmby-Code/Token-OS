@@ -275,6 +275,51 @@ def test_custodes_relaunch_over_zombie_predecessor_absorbs_it(
     assert live == 1
 
 
+def test_custodes_paneless_start_resolves_label_for_stamp_and_gold_tint(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Custodes SessionStart can arrive with no TMUX_PANE while still carrying
+    # pane_label=legion:custodes. The hook must resolve that stable label through
+    # the live pane oracle and use the effective pane for both @INSTANCE_ID stamp
+    # and personas.pane_tint application.
+    hooks = sys.modules["routes.hooks"]
+    stamps: list[tuple[str | None, str | None]] = []
+    tint_calls: list[tuple[str | None, str | None]] = []
+
+    async def resolve_label(target):
+        return "%custodes" if target == "legion:custodes" else None
+
+    async def stamp(pane, session_id, **_kwargs):
+        stamps.append((pane, session_id))
+
+    def apply_pane_tint(pane, tint, **_kwargs):
+        tint_calls.append((pane, tint))
+
+    _no_pane_occupant(monkeypatch, hooks)
+    monkeypatch.setattr(hooks.shared, "resolve_tmux_pane_id", resolve_label)
+    monkeypatch.setattr(hooks, "_stamp_instance_id", stamp)
+    monkeypatch.setattr(hooks.shared, "apply_pane_tint", apply_pane_tint)
+
+    result = asyncio.run(
+        hooks.handle_session_start(
+            {
+                "session_id": "cust-paneless",
+                "cwd": "/tmp",
+                "pane_label": "legion:custodes",
+                "env": {"TOKEN_API_ENGINE": "claude"},
+            }
+        )
+    )
+
+    row = _row(app_env.db_path, "cust-paneless")
+    assert row["persona_slug"] == "custodes"
+    assert row["rank"] == "overseer"
+    assert result["pane_tint"] == "#302800"
+    assert ("%custodes", "cust-paneless") in stamps
+    assert ("%custodes", "#302800") in tint_calls
+    assert all(tint != "default" for _pane, tint in tint_calls)
+
+
 def test_persona_supplant_does_not_steal_live_prior_parent(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

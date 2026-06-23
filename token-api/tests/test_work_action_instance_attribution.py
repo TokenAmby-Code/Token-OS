@@ -105,10 +105,11 @@ def no_typing(app_env, monkeypatch):
     hook_driven / marker discount is not masked by a stray live tmux client.
     """
 
-    async def _resolve_instance_pane(instance_id):
-        return (PANE, None) if instance_id == SESSION_ID else (None, None)
-
     monkeypatch.setattr(app_env.main, "_typing_guard_active", lambda: False)
+
+    async def _resolve_instance_pane(instance_id: str | None):
+        return (PANE, "mechanicus:admin") if instance_id == SESSION_ID else (None, None)
+
     monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve_instance_pane)
     return app_env
 
