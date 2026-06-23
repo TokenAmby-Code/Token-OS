@@ -44,25 +44,25 @@ def _tree(parent_pid: int, descendants: dict[int, tuple[int, str]]):
     return children, commands
 
 
-def test_pane_is_live_true_for_live_agent():
+def test_pane_is_live_true_for_live_agent() -> None:
     adapter = FakePaneAdapter(pane_pids={"%9": 14030})
     children, commands = _tree(14030, {15230: (14030, "codex")})
     with patch.object(custodes, "_process_tree", return_value=(children, commands)):
         assert pane_is_live(adapter, "%9") is True
 
 
-def test_pane_is_live_false_for_bare_shell():
+def test_pane_is_live_false_for_bare_shell() -> None:
     adapter = FakePaneAdapter(pane_pids={"%9": 500})
     children, commands = _tree(500, {501: (500, "-zsh")})
     with patch.object(custodes, "_process_tree", return_value=(children, commands)):
         assert pane_is_live(adapter, "%9") is False
 
 
-def test_pane_is_live_false_for_empty_pane():
+def test_pane_is_live_false_for_empty_pane() -> None:
     assert pane_is_live(FakePaneAdapter(), "") is False
 
 
-def test_live_agents_in_dir_matches_cwd_and_liveness(tmp_path):
+def test_live_agents_in_dir_matches_cwd_and_liveness(tmp_path: pathlib.Path) -> None:
     work = tmp_path / "wt-target"
     work.mkdir()
     other = tmp_path / "wt-other"
@@ -86,7 +86,7 @@ def test_live_agents_in_dir_matches_cwd_and_liveness(tmp_path):
     assert matches[0].agent_command == "claude"
 
 
-def test_live_agents_in_dir_excludes_self_pane(tmp_path):
+def test_live_agents_in_dir_excludes_self_pane(tmp_path: pathlib.Path) -> None:
     work = tmp_path / "wt-target"
     work.mkdir()
     adapter = FakePaneAdapter(
@@ -100,6 +100,6 @@ def test_live_agents_in_dir_excludes_self_pane(tmp_path):
         assert live_agents_in_dir(adapter, str(work), exclude_pane="%self") == []
 
 
-def test_live_agents_in_dir_empty_when_no_server():
+def test_live_agents_in_dir_empty_when_no_server() -> None:
     # A dead/absent tmux server yields no panes → no matches, no crash.
     assert live_agents_in_dir(FakePaneAdapter(panes=[]), "/some/dir") == []

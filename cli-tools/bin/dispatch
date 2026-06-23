@@ -1920,7 +1920,13 @@ refuse_if_worktree_has_live_agent() {
   # enumerates the operator's LIVE tmux server. Default (unset) = enabled.
   [[ "${DISPATCH_WORKTREE_DUP_CHECK:-1}" == "0" ]] && return 0
   [[ "${TOKEN_API_DISPATCH_FORCE_OCCUPIED:-}" == "1" ]] && return 0
-  command -v tmuxctl >/dev/null 2>&1 || return 0
+  if ! command -v tmuxctl >/dev/null 2>&1; then
+    # Fail open, but VISIBLY: without tmuxctl we cannot verify the worktree is
+    # free, so the duplicate-corruption protection is off — say so rather than
+    # silently allowing a possible second agent into one worktree.
+    warn "dup-guard skipped: tmuxctl unavailable, cannot verify $dir is free of a live agent"
+    return 0
+  fi
   matches="$(tmuxctl live-agents --dir "$dir" ${self_pane:+--exclude-pane "$self_pane"} 2>/dev/null || true)"
   [[ -n "$matches" ]] || return 0
   err "refusing to dispatch: a live agent is already running in the target worktree $dir:"

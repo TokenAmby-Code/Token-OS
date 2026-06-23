@@ -23,8 +23,8 @@ Read-only: a tmux snapshot + ``ps``. No DB, no pane mutation.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from .liveness import detect_pane_tui
 from .tmux_adapter import TmuxAdapter
@@ -53,7 +53,7 @@ def _normalize(path: str) -> str:
     if not path:
         return ""
     try:
-        return os.path.realpath(path)
+        return str(Path(path).resolve())
     except OSError:
         return path
 
