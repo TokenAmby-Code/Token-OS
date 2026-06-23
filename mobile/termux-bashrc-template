@@ -326,23 +326,30 @@ mac() {
         _mac_attach="tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t warp 2>/dev/null || exec zsh -il"
     fi
 
-    local retries=0
+    # Bare Termux: stay glued to the Mac tmux workspace. A dropped SSH (screen
+    # lock, network blip, Wi-Fi↔LTE roam) lands back here and reconnects forever
+    # instead of dumping to the local Termux shell. Two deliberate ways out:
+    #   * Clean tmux detach (prefix + d → exit 0) — you meant to leave.
+    #   * Ctrl-C while it's waiting to reconnect — aborts the loop to the shell.
+    # Backoff grows 1→2→4→8s and caps at 8s so a long outage doesn't hammer SSH.
+    # Each attempt is bounded so a half-open / blackholed TCP can't wedge the
+    # loop: ConnectTimeout caps the handshake, and ServerAlive* tears a silently
+    # dead session down within ~15s and returns non-zero → falls through to the
+    # backoff instead of hanging the shell.
+    local _mac_ssh_opts=(-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+    local delay=1 attempt=0
     while true; do
-        ssh -t mac "$_mac_attach"
+        ssh "${_mac_ssh_opts[@]}" -t mac "$_mac_attach"
         local exit_code=$?
 
-        # Exit code 0 = clean disconnect (user detached). Don't retry.
+        # Exit code 0 = clean detach / clean remote logout. You asked to leave.
         [[ $exit_code -eq 0 ]] && break
 
-        # SSH failed — likely a dropped connection. Retry up to 3 times
-        # with a brief delay to allow transient network issues to resolve.
-        ((retries++))
-        if [[ $retries -ge 3 ]]; then
-            echo "Connection lost after $retries attempts."
-            break
-        fi
-        echo "Connection dropped, reconnecting (attempt $retries/3)..."
-        sleep 2
+        # Non-zero = dropped/failed connection. Reconnect indefinitely.
+        ((attempt++))
+        echo "Connection dropped (exit $exit_code) — reconnecting in ${delay}s (attempt ${attempt}, Ctrl-C to stop)..."
+        sleep "$delay"
+        (( delay = delay < 8 ? delay * 2 : 8 ))
     done
 }
 
@@ -692,4 +699,20 @@ shutdown-mini() {
 # ====================================================
 # STARTUP
 # ====================================================
-# No auto-launch. Use `tx` for local terminals, `mac`/`wsl` to connect remote.
+# Sticky auto-attach: a fresh Termux open jumps straight to the Mac tmux
+# workspace via mac(), which then reconnects forever on drops. Guards:
+#   * interactive shells only ($- has 'i') — never hijacks scp/`ssh phone cmd`,
+#   * skip if already inside tmux or an inbound SSH session (no recursion),
+#   * skip if `not-mac` set the one-shot opt-out — run `not-mac` then reopen
+#     Termux (or Ctrl-C during reconnect) to reach a plain local shell.
+case $- in
+    *i*)
+        if [[ -f "$MAC_NOT_MAC_FILE" ]]; then
+            # One-shot opt-out from `not-mac`: skip auto-attach exactly once,
+            # then consume the flag so the next Termux open is sticky again.
+            rm -f "$MAC_NOT_MAC_FILE"
+        elif [[ -z "$TMUX" && -z "$SSH_CONNECTION" ]]; then
+            mac
+        fi
+        ;;
+esac
