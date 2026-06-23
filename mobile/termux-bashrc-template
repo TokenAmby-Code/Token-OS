@@ -332,9 +332,14 @@ mac() {
     #   * Clean tmux detach (prefix + d → exit 0) — you meant to leave.
     #   * Ctrl-C while it's waiting to reconnect — aborts the loop to the shell.
     # Backoff grows 1→2→4→8s and caps at 8s so a long outage doesn't hammer SSH.
+    # Each attempt is bounded so a half-open / blackholed TCP can't wedge the
+    # loop: ConnectTimeout caps the handshake, and ServerAlive* tears a silently
+    # dead session down within ~15s and returns non-zero → falls through to the
+    # backoff instead of hanging the shell.
+    local _mac_ssh_opts=(-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
     local delay=1 attempt=0
     while true; do
-        ssh -t mac "$_mac_attach"
+        ssh "${_mac_ssh_opts[@]}" -t mac "$_mac_attach"
         local exit_code=$?
 
         # Exit code 0 = clean detach / clean remote logout. You asked to leave.
@@ -702,7 +707,11 @@ shutdown-mini() {
 #     Termux (or Ctrl-C during reconnect) to reach a plain local shell.
 case $- in
     *i*)
-        if [[ -z "$TMUX" && -z "$SSH_CONNECTION" && ! -f "$MAC_NOT_MAC_FILE" ]]; then
+        if [[ -f "$MAC_NOT_MAC_FILE" ]]; then
+            # One-shot opt-out from `not-mac`: skip auto-attach exactly once,
+            # then consume the flag so the next Termux open is sticky again.
+            rm -f "$MAC_NOT_MAC_FILE"
+        elif [[ -z "$TMUX" && -z "$SSH_CONNECTION" ]]; then
             mac
         fi
         ;;
