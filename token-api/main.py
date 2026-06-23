@@ -16222,8 +16222,7 @@ async def _resolve_work_action_attribution(
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT tmux_pane, COALESCE(hook_driven, 0) AS hook_driven "
-                "FROM instances WHERE id = ?",
+                "SELECT COALESCE(hook_driven, 0) AS hook_driven FROM instances WHERE id = ?",
                 (session_id,),
             )
             row = await cursor.fetchone()
@@ -16237,7 +16236,7 @@ async def _resolve_work_action_attribution(
                 return (session_id, True)
             if bool(row["hook_driven"]):
                 return (session_id, False)
-            tmux_pane = row["tmux_pane"]
+            tmux_pane, _role = await shared.resolve_instance_pane(session_id)
             if tmux_pane:
                 # injected_at/expires_at are naive-LOCAL (matches instances.last_activity),
                 # so compare against a Python local now — NOT SQLite datetime('now')

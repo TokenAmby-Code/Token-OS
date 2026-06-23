@@ -21,8 +21,8 @@ def _insert_tts_instance(db_path: Path) -> str:
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, tmux_pane, tts_mode, registered_at, last_activity)
-           VALUES (?, ?, ?, '/tmp/test', 'local', 'Mac-Mini', 'idle', 'palace:1',
+            status, tts_mode, registered_at, last_activity)
+           VALUES (?, ?, ?, '/tmp/test', 'local', 'Mac-Mini', 'idle',
                    'verbose', datetime('now'), datetime('now'))""",
         (iid, str(uuid.uuid4()), f"tts-{iid[:8]}"),
     )
