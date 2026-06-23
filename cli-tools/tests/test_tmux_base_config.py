@@ -132,9 +132,12 @@ def test_prefix_q_opens_mark_for_close_popup() -> None:
 
 
 def test_mark_for_close_script_is_committed_executable() -> None:
-    # core.fileMode is false in this repo, so a missing exec bit is not caught by
-    # the working tree; assert the committed git mode is 100755 directly. The
-    # tmux popup runs `tmux-mark-for-close` off PATH and a non-exec file fails.
+    # The canonical bare is core.fileMode=true (this repo ships executables), but
+    # a checkout's working-tree exec bit can still be unreliable on filesystems
+    # that don't honor it (e.g. SMB/NAS shares). So we assert the *committed* git
+    # index mode is 100755 directly — robust regardless of the checkout
+    # filesystem's exec-bit fidelity. The tmux popup runs `tmux-mark-for-close`
+    # off PATH and a non-exec file fails.
     out = subprocess.run(
         ["git", "ls-files", "-s", "bin/tmux-mark-for-close"],
         cwd=ROOT,
