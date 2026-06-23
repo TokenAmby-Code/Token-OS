@@ -26,7 +26,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import aiosqlite
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 import shared
@@ -73,6 +73,13 @@ from shared import (
 logger = logging.getLogger("token_api")
 
 router = APIRouter()
+
+# Bounded in-band retry for transient WAL "database is locked" (SQLITE_BUSY) on
+# hook DB writes. Total added latency on full exhaustion is
+# 0.15*(1+2+3+4) = 1.5s — well under the client hook's --max-time/--retry-max-time
+# budget — so a genuinely-down DB still can't block Claude startup for long.
+_HOOK_DB_LOCKED_RETRIES = 4
+_HOOK_DB_LOCKED_BACKOFF = 0.15
 
 _QUESTION_LOG_TITLE = "AskUserQuestion Log"
 _UNANSWERED_TITLE = "Unanswered Questions"
@@ -3674,48 +3681,88 @@ async def handle_session_start(payload: dict) -> dict:
         )
         if persona_synced:
             launch_marker = launch_marker or "sync"
-        await sanctioned_insert_instance(
-            db,
-            values={
-                "id": session_id,
-                "tab_name": tab_name,
-                "working_dir": working_dir,
-                "origin_type": origin_type,
-                "device_id": device_id,
-                # TOKEN_API_PERSONA is an explicit identity assignment from the
-                # dispatch/env path.  Let it win over the randomly assigned voice
-                # profile so chapter-parent binding cannot steal singleton identity.
-                "profile_name": primarch_name or profile["name"],
-                "tts_voice": profile["wsl_voice"],
-                "notification_sound": profile["notification_sound"],
-                "status": "idle",
-                "legion": _prior_legion or "astartes",
-                "golden_throne": launch_marker,
-                "input_lock": None,
-                "is_subagent": is_subagent,
-                "primarch": primarch_name or None,
-                "wrapper_launch_id": wrapper_launch_id,
-                "launcher": launcher,
-                "engine": engine,
-                "dispatch_mode": dispatch_mode,
-                "dispatch_session_doc_path": dispatch_session_doc_path,
-                "target_working_dir": target_working_dir,
-                "launch_mode": launch_mode,
-                "parent_instance_id": parent_instance_id,
-                "transplant_expected": 1 if transplant_expected else 0,
-                "hook_driven": launch_hook_driven,
-                "zealotry": launch_zealotry if launch_zealotry is not None else 4,
-                "session_doc_policy": session_doc_policy,
-                "discord_hosted": _prior_discord_hosted,
-                "discord_channel": _prior_discord_channel,
-                "registered_at": now,
-                "last_activity": now,
-            },
-            mutation_type="instance_registered",
-            write_source="hooks",
-            actor="SessionStart",
-            wrapper_launch_id=wrapper_launch_id,
-        )
+        try:
+            await sanctioned_insert_instance(
+                db,
+                values={
+                    "id": session_id,
+                    "tab_name": tab_name,
+                    "working_dir": working_dir,
+                    "origin_type": origin_type,
+                    "device_id": device_id,
+                    # TOKEN_API_PERSONA is an explicit identity assignment from the
+                    # dispatch/env path.  Let it win over the randomly assigned voice
+                    # profile so chapter-parent binding cannot steal singleton identity.
+                    "profile_name": primarch_name or profile["name"],
+                    "tts_voice": profile["wsl_voice"],
+                    "notification_sound": profile["notification_sound"],
+                    "status": "idle",
+                    "legion": _prior_legion or "astartes",
+                    "golden_throne": launch_marker,
+                    "input_lock": None,
+                    "is_subagent": is_subagent,
+                    "primarch": primarch_name or None,
+                    "wrapper_launch_id": wrapper_launch_id,
+                    "launcher": launcher,
+                    "engine": engine,
+                    "dispatch_mode": dispatch_mode,
+                    "dispatch_session_doc_path": dispatch_session_doc_path,
+                    "target_working_dir": target_working_dir,
+                    "launch_mode": launch_mode,
+                    "parent_instance_id": parent_instance_id,
+                    "transplant_expected": 1 if transplant_expected else 0,
+                    "hook_driven": launch_hook_driven,
+                    "zealotry": launch_zealotry if launch_zealotry is not None else 4,
+                    "session_doc_policy": session_doc_policy,
+                    "discord_hosted": _prior_discord_hosted,
+                    "discord_channel": _prior_discord_channel,
+                    "registered_at": now,
+                    "last_activity": now,
+                },
+                mutation_type="instance_registered",
+                write_source="hooks",
+                actor="SessionStart",
+                wrapper_launch_id=wrapper_launch_id,
+            )
+        except aiosqlite.IntegrityError as exc:
+            # INSERT race: a concurrent SessionStart for this same id won between
+            # our existing-row SELECT and this INSERT (client curl --retry re-fire,
+            # or parallel hook delivery). The `existing_row` branch above could not
+            # see the winner's uncommitted row, so we land here. Converge
+            # idempotently — refresh liveness on the now-existing row and return —
+            # rather than letting UNIQUE bubble up as a swallowed handler_error that
+            # strands this pane row-less. Mirrors the idempotent
+            # POST /api/instances/register path (#198), which only covered the bare
+            # endpoint, never this hook insert.
+            if "unique" not in str(exc).lower():
+                raise
+            logger.info(
+                "Hook: SessionStart INSERT race for %s... — adopting concurrently "
+                "registered row (idempotent)",
+                session_id[:12],
+            )
+            try:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=session_id,
+                    updates={"last_activity": now},
+                    mutation_type="instance_updated",
+                    write_source="hooks",
+                    actor="SessionStart",
+                    wrapper_launch_id=wrapper_launch_id,
+                )
+                await db.commit()
+            except LookupError:
+                # The UNIQUE error already proves the row exists; a 0-row update
+                # only means our connection's snapshot lags the winner's commit.
+                # Converge to success regardless — the winner owns the row's
+                # identity and side effects.
+                await db.rollback()
+            return {
+                "success": True,
+                "action": "already_registered",
+                "instance_id": session_id,
+            }
         await _persist_runtime_fields(
             db,
             instance_id=session_id,
@@ -6687,17 +6734,48 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
     payload["_hook_action_type"] = normalized_action_type
     payload["_hook_action_type_raw"] = action_type
 
+    # The agents.db is a single WAL SQLite file shared by every pane's hooks plus
+    # the background workers. Under fleet load a writer can lose the lock race and
+    # raise "database is locked" (SQLITE_BUSY) — a transient that resolves on a
+    # retry. Without this, a dropped SessionStart INSERT left the pane row-less
+    # until the next full `tx restart` (the persona sweep only heals singleton
+    # persona panes, not generic workers). Retry the whole handler: each handler
+    # commits only at the end, so a failed attempt rolls back atomically and a
+    # retry is a clean re-run.
+    last_exc: Exception | None = None
+    for attempt in range(_HOOK_DB_LOCKED_RETRIES + 1):
+        try:
+            return await handler(payload)
+        except aiosqlite.OperationalError as e:
+            last_exc = e
+            if "locked" in str(e).lower() and attempt < _HOOK_DB_LOCKED_RETRIES:
+                await asyncio.sleep(_HOOK_DB_LOCKED_BACKOFF * (attempt + 1))
+                continue
+            break
+        except Exception as e:
+            last_exc = e
+            break
+
+    logger.error(f"Hook handler error ({normalized_action_type}): {last_exc}")
     try:
-        result = await handler(payload)
-        return result
-    except Exception as e:
-        logger.error(f"Hook handler error ({normalized_action_type}): {e}")
         await log_event(
             "hook_error",
             details={
                 "action_type": normalized_action_type,
                 "raw_action_type": action_type,
-                "error": str(e),
+                "error": str(last_exc),
             },
         )
-        return {"success": False, "action": "handler_error", "error": str(e)}
+    except Exception:  # noqa: BLE001 — the event log shares the locked DB; never mask the real failure
+        pass
+
+    # Fail loud for SessionStart. A 200 {success: False} reads as success to the
+    # client's `curl --retry` (PR #225), which only re-fires on connection/5xx
+    # errors — so the swallowed write silently stranded the pane. A 503 lets that
+    # bounded client retry actually re-attempt the registration in-band.
+    if normalized_action_type == "SessionStart":
+        raise HTTPException(
+            status_code=503,
+            detail=f"SessionStart registration write failed: {last_exc}",
+        )
+    return {"success": False, "action": "handler_error", "error": str(last_exc)}
