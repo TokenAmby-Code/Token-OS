@@ -794,6 +794,11 @@ class EnforcementStandDownRequest(BaseModel):
 class WorkActionRequest(BaseModel):
     source: str = "api"
     note: str | None = None
+    # First-class originating session/instance id. The Claude Code session UUID is
+    # the instances primary key, so this resolves a hook-driven work_action (prompt
+    # submit / ask_user_question / typing-guard) back to the pane that emitted it.
+    # Carried explicitly rather than smuggled inside ``note`` (legacy "session_id=…").
+    session_id: str | None = None
 
 
 class StateValidateRequest(BaseModel):
@@ -16170,6 +16175,67 @@ async def work_action(request: WorkActionRequest | None = None) -> dict:
     return await _work_action(request or WorkActionRequest(), explicit=True)
 
 
+async def _resolve_work_action_attribution(
+    session_id: str | None, source: str | None
+) -> tuple[str | None, bool]:
+    """Resolve a work_action's originating ``session_id`` to a registered instance
+    id, and decide whether it should refresh that instance's ``last_activity``.
+
+    The session UUID *is* the ``instances`` primary key (the prompt-submit hook
+    resolves 273/273 the same way), so resolution is a registry lookup: a row miss
+    returns ``(None, False)`` — never invent attribution for an unregistered
+    session.
+
+    The bump is the human-freshness heartbeat ``compute_work_state`` gates
+    ``active_instances`` on. To avoid reopening the agent-to-agent idle-reset vector
+    the ``set_productivity=explicit`` design closed, this MUST mirror that read-time
+    discount exactly (``main.py`` work_action loop / instance loop): a ``hook_driven``
+    instance, or a pane under a live ``automated_pane_activity`` marker, is discounted
+    (no bump) UNLESS a human is at the keyboard — a ``tmux-typing-guard`` source or a
+    hot global typing guard always anchors. Returns ``(instance_id, should_bump)``;
+    ``instance_id`` is set whenever the session resolves, independent of the bump
+    decision, so the event/ack path can attribute it either way.
+    """
+    if not session_id:
+        return (None, False)
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT tmux_pane, COALESCE(hook_driven, 0) AS hook_driven "
+                "FROM instances WHERE id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return (None, False)
+            # A human keystroke overrides every discount (mirrors compute_work_state:
+            # tmux-typing-guard source + a hot global typing guard are never
+            # discounted). _typing_guard_active() is the same predicate the read path
+            # consults, kept in sync deliberately.
+            if source == "tmux-typing-guard" or _typing_guard_active():
+                return (session_id, True)
+            if bool(row["hook_driven"]):
+                return (session_id, False)
+            tmux_pane = row["tmux_pane"]
+            if tmux_pane:
+                # injected_at/expires_at are naive-LOCAL (matches instances.last_activity),
+                # so compare against a Python local now — NOT SQLite datetime('now')
+                # (UTC) — exactly as compute_work_state does (main.py:5817).
+                marker = await db.execute(
+                    "SELECT 1 FROM automated_pane_activity "
+                    "WHERE tmux_pane = ? AND datetime(expires_at) >= datetime(?) "
+                    "LIMIT 1",
+                    (tmux_pane, datetime.now().isoformat()),
+                )
+                if await marker.fetchone() is not None:
+                    return (session_id, False)
+            return (session_id, True)
+    except Exception as exc:  # defensive: attribution must never break the hot path
+        logger.warning("work_action attribution resolve failed for %s: %s", session_id, exc)
+        return (None, False)
+
+
 async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
     """Core work-action handler, shared by the explicit HTTP endpoint and the
     hook callback.
@@ -16180,10 +16246,27 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
     signals (prompt_submit / ask_user_question / typing-guard) still route here
     for enforcement, but must NOT pollute the explicit-press visualization or the
     durable daily-note log."""
+    # First-class session id, with back-compat for the legacy ``note="session_id=…"``
+    # smuggle so direct callers (and old hooks) still attribute correctly.
+    session_id = request.session_id
+    if not session_id and request.note and request.note.startswith("session_id="):
+        session_id = request.note[len("session_id=") :].strip() or None
+    # Resolve the originating instance + heartbeat decision BEFORE side effects, so
+    # the event row, ack path, and last_activity bump all agree on attribution.
+    instance_id, should_bump_activity = await _resolve_work_action_attribution(
+        session_id, request.source
+    )
+    # compute_work_state's discount still parses the session id out of the event
+    # ``note`` (it reads events, not request fields), so synthesize the note when a
+    # caller passes session_id first-class without one — keep that read path intact.
+    note = request.note
+    if not note and session_id:
+        note = f"session_id={session_id}"
+
     await bust_quiet_state(
         "api",
         "work_action",
-        {"source": request.source, "note": request.note},
+        {"source": request.source, "note": note},
     )
 
     # Only an EXPLICIT user press (Stream Deck / work-action bind) flips global
@@ -16194,7 +16277,8 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
     signal = await observe_work_signal(
         source=request.source,
         kind="work_action",
-        details={"note": request.note} if request.note else None,
+        instance_id=instance_id,
+        details={"note": note} if note else None,
         set_productivity=explicit,
     )
     acknowledged_acks = signal["resolved_acks"]
@@ -16205,9 +16289,10 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
     action_at = datetime.now().isoformat()
     await log_event(
         "work_action",
+        instance_id=instance_id,
         details={
             "source": request.source,
-            "note": request.note,
+            "note": note,
             "at": action_at,
             "explicit": explicit,
             "old_mode": timer.get("old_mode"),
@@ -16215,6 +16300,31 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
             "acknowledged_expected_acks": acknowledged_acks,
         },
     )
+
+    # Heartbeat: a non-discounted (human) work_action keeps the originating instance
+    # "fresh" so compute_work_state counts it among active_instances for the freshness
+    # window. Discounted agent-to-agent reflexes (hook_driven / automated marker) are
+    # deliberately NOT bumped — that is the idle-reset vector the explicit-productivity
+    # redesign closed, preserved here. Best-effort: a heartbeat write must never break
+    # the work-action path.
+    if instance_id and should_bump_activity:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=instance_id,
+                    updates={"last_activity": datetime.now().isoformat()},
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor=f"work_action-{request.source}",
+                )
+                await db.commit()
+        except LookupError:
+            pass  # instance vanished between resolve and bump — nothing to refresh
+        except Exception as exc:
+            logger.warning(
+                "work_action: last_activity heartbeat failed for %s: %s", instance_id, exc
+            )
 
     # Canonical, durable record: append to today's daily-note frontmatter — only
     # for explicit presses, never hook-driven satisfy signals (prompt_submit etc.
@@ -16234,10 +16344,17 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
     }
 
 
-async def hook_work_action_callback(source: str, note: str | None = None):
+async def hook_work_action_callback(
+    source: str, note: str | None = None, session_id: str | None = None
+):
     # Hook-driven satisfy signal (prompt_submit / ask_user_question / typing-
     # guard): not an explicit press — keep it out of the daily note + cockpit.
-    return await _work_action(WorkActionRequest(source=source, note=note), explicit=False)
+    # ``session_id`` is the originating instance id (carried first-class so the
+    # event row + last_activity heartbeat are attributable); ``note`` stays as a
+    # legacy fallback for callers that still smuggle it as "session_id=…".
+    return await _work_action(
+        WorkActionRequest(source=source, note=note, session_id=session_id), explicit=False
+    )
 
 
 # ============ Pavlok Endpoints ============

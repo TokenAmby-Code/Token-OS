@@ -4719,7 +4719,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
     # non-explicit source, no longer sets global productivity (see _work_action).
     exited_idle = False
     if _work_action_callback:
-        await _work_action_callback(source="prompt_submit", note=f"session_id={session_id}")
+        await _work_action_callback(source="prompt_submit", session_id=session_id)
 
     # Golden Throne: cancel any pending follow-up (user is active). A real GT
     # binding is a golden_throne.id marker — i.e. non-null and not the 'sync'
@@ -4849,9 +4849,7 @@ async def handle_post_tool_use(payload: dict) -> dict:
     # missed PromptSubmit is still caught. Liveness is preserved; only the
     # productivity flip is removed.
     if tool_name == "AskUserQuestion" and _work_action_callback:
-        await _work_action_callback(
-            source="ask_user_question_answered", note=f"session_id={session_id}"
-        )
+        await _work_action_callback(source="ask_user_question_answered", session_id=session_id)
 
     return {"success": True, "action": "heartbeat", "instance_id": session_id}
 
