@@ -71,3 +71,4 @@ ignore_errors = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["lib"]
+addopts = "-n auto --dist loadfile"  # local default parallel; CI pins serial with -n0 (see workflows); `-n0` to debug

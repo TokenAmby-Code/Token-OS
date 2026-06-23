@@ -205,7 +205,7 @@ def test_status_segment_follows_keystroke_lock(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         env=env,
-        timeout=2,
+        timeout=15,  # widened for CPU contention under parallel runs
         check=False,
     )
 
@@ -215,7 +215,7 @@ def test_status_segment_follows_keystroke_lock(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         env=env,
-        timeout=2,
+        timeout=15,  # widened for CPU contention under parallel runs
         check=False,
     )
 
@@ -278,7 +278,7 @@ def test_tmux_shim_cancel_policy_suppresses_without_writing(tmp_path: Path) -> N
         text=True,
         capture_output=True,
         env=env,
-        timeout=2,
+        timeout=15,  # widened for CPU contention under parallel runs
         check=False,
     )
 
@@ -296,7 +296,7 @@ def test_tmux_shim_raw_read_is_unaffected(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         env=env,
-        timeout=2,
+        timeout=15,  # widened for CPU contention under parallel runs
         check=False,
     )
 
@@ -318,7 +318,7 @@ def test_tmux_shim_unlocked_pane_is_deliverable(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         env=env,
-        timeout=2,
+        timeout=15,  # widened for CPU contention under parallel runs
         check=False,
     )
 
@@ -412,12 +412,12 @@ def test_brief_surfaces_blocked_as_not_delivered(tmp_path: Path) -> None:
             text=True,
             capture_output=True,
             env=env,
-            timeout=2,
+            timeout=15,  # widened for CPU contention under parallel runs
             check=False,
         )
     finally:
         server.shutdown()
-        thread.join(timeout=2)
+        thread.join(timeout=15)
 
     assert proc.returncode == 1
     assert "delivered=0/1" in proc.stdout

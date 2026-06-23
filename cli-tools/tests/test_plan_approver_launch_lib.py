@@ -18,7 +18,8 @@ def _write_exe(path: pathlib.Path, body: str) -> None:
 
 
 def _wait_for_lines(path: pathlib.Path, expected: int) -> None:
-    for _ in range(50):
+    # ~15s retry budget (was ~2.5s); widened for CPU contention under parallel runs.
+    for _ in range(300):
         if path.exists() and len(path.read_text().strip().splitlines()) >= expected:
             return
         time.sleep(0.05)

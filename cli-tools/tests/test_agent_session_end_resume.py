@@ -23,6 +23,11 @@ def _write_executable(path: Path, body: str) -> None:
 def test_agent_session_end_resume_stages_generic_dispatch_command(
     tmp_path: Path, engine: str
 ) -> None:
+    # Unique per-test pane token so the hardcoded /tmp sentinels the script writes
+    # (/tmp/agent-resume-<pane>, /tmp/claude-resume-<pane>) never collide across
+    # xdist workers or parametrizations. The script does not honor $TMPDIR.
+    pane = f"%resumehook-{engine}"
+
     db = tmp_path / "agents.db"
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -36,7 +41,8 @@ def test_agent_session_end_resume_stages_generic_dispatch_command(
         )
         conn.execute(
             """INSERT INTO instances (id, tmux_pane, pane_label, status, last_activity)
-               VALUES ('iid-generic', '%resumehook', 'legion:worker', 'idle', '2026-06-22T12:00:00')"""
+               VALUES ('iid-generic', ?, 'legion:worker', 'idle', '2026-06-22T12:00:00')""",
+            (pane,),
         )
 
     fakebin = tmp_path / "bin"
@@ -52,7 +58,6 @@ fi
 """,
     )
 
-    pane = "%resumehook"
     sentinel = Path(f"/tmp/agent-resume-{pane}")
     legacy = Path(f"/tmp/claude-resume-{pane}")
     sentinel.unlink(missing_ok=True)
