@@ -103,7 +103,7 @@ def test_ladder_cancelled_on_post_tool_use(ladder_env):
     asyncio.run(run())
 
 
-def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch):
+def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch) -> None:
     """No answer → L1 nudge fires, L2 enforcement fires, L3 pavlok + bust prompt fires."""
     hooks = sys.modules["routes.hooks"]
     shared = ladder_env.shared
@@ -155,7 +155,7 @@ def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch):
     asyncio.run(run())
 
 
-def test_ladder_cancel_after_l1_skips_l2_l3(ladder_env, monkeypatch):
+def test_ladder_cancel_after_l1_skips_l2_l3(ladder_env, monkeypatch) -> None:
     """Answer arrives between L1 and L2 → L2/L3 callbacks suppressed."""
     hooks = sys.modules["routes.hooks"]
     shared = ladder_env.shared
@@ -323,7 +323,7 @@ def test_question_persistence_records_answer(ladder_env):
     assert "- **Alpha** — First route" in text
 
 
-def test_question_persistence_records_bust_queue(ladder_env, monkeypatch):
+def test_question_persistence_records_bust_queue(ladder_env, monkeypatch) -> None:
     hooks = sys.modules["routes.hooks"]
 
     async def noop_l1(instance_id, question_text, state):
