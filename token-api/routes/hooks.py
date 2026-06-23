@@ -3681,49 +3681,65 @@ async def handle_session_start(payload: dict) -> dict:
         )
         if persona_synced:
             launch_marker = launch_marker or "sync"
+        insert_values = {
+            "id": session_id,
+            "tab_name": tab_name,
+            "working_dir": working_dir,
+            "origin_type": origin_type,
+            "device_id": device_id,
+            # TOKEN_API_PERSONA is an explicit identity assignment from the
+            # dispatch/env path.  Let it win over the randomly assigned voice
+            # profile so chapter-parent binding cannot steal singleton identity.
+            "profile_name": primarch_name or profile["name"],
+            "tts_voice": profile["wsl_voice"],
+            "notification_sound": profile["notification_sound"],
+            "status": "idle",
+            "legion": _prior_legion or "astartes",
+            "golden_throne": launch_marker,
+            "input_lock": None,
+            "is_subagent": is_subagent,
+            "primarch": primarch_name or None,
+            "wrapper_launch_id": wrapper_launch_id,
+            "launcher": launcher,
+            "engine": engine,
+            "dispatch_mode": dispatch_mode,
+            "dispatch_session_doc_path": dispatch_session_doc_path,
+            "target_working_dir": target_working_dir,
+            "launch_mode": launch_mode,
+            "parent_instance_id": parent_instance_id,
+            "transplant_expected": 1 if transplant_expected else 0,
+            "hook_driven": launch_hook_driven,
+            "zealotry": launch_zealotry if launch_zealotry is not None else 4,
+            "session_doc_policy": session_doc_policy,
+            "discord_hosted": _prior_discord_hosted,
+            "discord_channel": _prior_discord_channel,
+            "registered_at": now,
+            "last_activity": now,
+        }
         try:
-            await sanctioned_insert_instance(
-                db,
-                values={
-                    "id": session_id,
-                    "tab_name": tab_name,
-                    "working_dir": working_dir,
-                    "origin_type": origin_type,
-                    "device_id": device_id,
-                    # TOKEN_API_PERSONA is an explicit identity assignment from the
-                    # dispatch/env path.  Let it win over the randomly assigned voice
-                    # profile so chapter-parent binding cannot steal singleton identity.
-                    "profile_name": primarch_name or profile["name"],
-                    "tts_voice": profile["wsl_voice"],
-                    "notification_sound": profile["notification_sound"],
-                    "status": "idle",
-                    "legion": _prior_legion or "astartes",
-                    "golden_throne": launch_marker,
-                    "input_lock": None,
-                    "is_subagent": is_subagent,
-                    "primarch": primarch_name or None,
-                    "wrapper_launch_id": wrapper_launch_id,
-                    "launcher": launcher,
-                    "engine": engine,
-                    "dispatch_mode": dispatch_mode,
-                    "dispatch_session_doc_path": dispatch_session_doc_path,
-                    "target_working_dir": target_working_dir,
-                    "launch_mode": launch_mode,
-                    "parent_instance_id": parent_instance_id,
-                    "transplant_expected": 1 if transplant_expected else 0,
-                    "hook_driven": launch_hook_driven,
-                    "zealotry": launch_zealotry if launch_zealotry is not None else 4,
-                    "session_doc_policy": session_doc_policy,
-                    "discord_hosted": _prior_discord_hosted,
-                    "discord_channel": _prior_discord_channel,
-                    "registered_at": now,
-                    "last_activity": now,
-                },
-                mutation_type="instance_registered",
-                write_source="hooks",
-                actor="SessionStart",
-                wrapper_launch_id=wrapper_launch_id,
-            )
+            # The registration INSERT is the first durable write and the dominant
+            # "database is locked" (SQLITE_BUSY) victim under fleet WAL contention.
+            # Retry it here — at the narrow, side-effect-free boundary, before any
+            # commit/stamp/tint — so a transient writer-lock loss self-heals
+            # in-band without replaying durable work (the prior whole-handler retry
+            # was unsafe for exactly that reason). On exhaustion the error
+            # propagates to dispatch_hook, which fails the SessionStart loud (503).
+            for attempt in range(_HOOK_DB_LOCKED_RETRIES + 1):
+                try:
+                    await sanctioned_insert_instance(
+                        db,
+                        values=insert_values,
+                        mutation_type="instance_registered",
+                        write_source="hooks",
+                        actor="SessionStart",
+                        wrapper_launch_id=wrapper_launch_id,
+                    )
+                    break
+                except aiosqlite.OperationalError as exc:
+                    if "locked" in str(exc).lower() and attempt < _HOOK_DB_LOCKED_RETRIES:
+                        await asyncio.sleep(_HOOK_DB_LOCKED_BACKOFF * (attempt + 1))
+                        continue
+                    raise
         except aiosqlite.IntegrityError as exc:
             # INSERT race: a concurrent SessionStart for this same id won between
             # our existing-row SELECT and this INSERT (client curl --retry re-fire,
@@ -3734,7 +3750,12 @@ async def handle_session_start(payload: dict) -> dict:
             # strands this pane row-less. Mirrors the idempotent
             # POST /api/instances/register path (#198), which only covered the bare
             # endpoint, never this hook insert.
-            if "unique" not in str(exc).lower():
+            #
+            # Scope the recovery to the instance primary key only: a UNIQUE failure
+            # on any other constraint (e.g. the instance_mutations audit row) is a
+            # genuine integrity violation that must surface, not be masked as
+            # already_registered.
+            if "unique constraint failed: instances.id" not in str(exc).lower():
                 raise
             logger.info(
                 "Hook: SessionStart INSERT race for %s... — adopting concurrently "
@@ -6734,48 +6755,35 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
     payload["_hook_action_type"] = normalized_action_type
     payload["_hook_action_type_raw"] = action_type
 
-    # The agents.db is a single WAL SQLite file shared by every pane's hooks plus
-    # the background workers. Under fleet load a writer can lose the lock race and
-    # raise "database is locked" (SQLITE_BUSY) — a transient that resolves on a
-    # retry. Without this, a dropped SessionStart INSERT left the pane row-less
-    # until the next full `tx restart` (the persona sweep only heals singleton
-    # persona panes, not generic workers). Retry the whole handler: each handler
-    # commits only at the end, so a failed attempt rolls back atomically and a
-    # retry is a clean re-run.
-    last_exc: Exception | None = None
-    for attempt in range(_HOOK_DB_LOCKED_RETRIES + 1):
-        try:
-            return await handler(payload)
-        except aiosqlite.OperationalError as e:
-            last_exc = e
-            if "locked" in str(e).lower() and attempt < _HOOK_DB_LOCKED_RETRIES:
-                await asyncio.sleep(_HOOK_DB_LOCKED_BACKOFF * (attempt + 1))
-                continue
-            break
-        except Exception as e:
-            last_exc = e
-            break
-
-    logger.error(f"Hook handler error ({normalized_action_type}): {last_exc}")
+    # NB: do NOT blanket-retry the handler here. Handlers commit mid-flight and
+    # perform durable side effects (tmux stamping/tint, frontmatter writes), so a
+    # replay on a late lock error would double-apply already-committed work. The
+    # transient "database is locked" retry lives at the narrow, side-effect-free
+    # write boundary inside each handler that needs it (see handle_session_start's
+    # registration INSERT); this dispatcher only swallows-or-surfaces the outcome.
     try:
-        await log_event(
-            "hook_error",
-            details={
-                "action_type": normalized_action_type,
-                "raw_action_type": action_type,
-                "error": str(last_exc),
-            },
-        )
-    except Exception:  # noqa: BLE001 — the event log shares the locked DB; never mask the real failure
-        pass
+        return await handler(payload)
+    except Exception as e:
+        logger.error(f"Hook handler error ({normalized_action_type}): {e}")
+        try:
+            await log_event(
+                "hook_error",
+                details={
+                    "action_type": normalized_action_type,
+                    "raw_action_type": action_type,
+                    "error": str(e),
+                },
+            )
+        except Exception:  # noqa: BLE001 — event log shares the DB; never mask the real failure
+            pass
 
-    # Fail loud for SessionStart. A 200 {success: False} reads as success to the
-    # client's `curl --retry` (PR #225), which only re-fires on connection/5xx
-    # errors — so the swallowed write silently stranded the pane. A 503 lets that
-    # bounded client retry actually re-attempt the registration in-band.
-    if normalized_action_type == "SessionStart":
-        raise HTTPException(
-            status_code=503,
-            detail=f"SessionStart registration write failed: {last_exc}",
-        )
-    return {"success": False, "action": "handler_error", "error": str(last_exc)}
+        # Fail loud for SessionStart. A 200 {success: False} reads as success to
+        # the client's `curl --retry` (PR #225), which only re-fires on
+        # connection/5xx errors — so the swallowed write silently stranded the
+        # pane. A 503 lets that bounded client retry re-attempt the registration.
+        if normalized_action_type == "SessionStart":
+            raise HTTPException(
+                status_code=503,
+                detail=f"SessionStart registration write failed: {e}",
+            ) from e
+        return {"success": False, "action": "handler_error", "error": str(e)}
