@@ -14098,7 +14098,10 @@ async def _enforce_shizuku_retry(app_name: str, action: str):
 # Wire TTS route dependencies
 from routes.tts import init_deps as tts_init_deps
 
-tts_init_deps(send_to_phone=_send_to_phone)
+tts_init_deps(
+    send_to_phone=_send_to_phone,
+    custodes_state_event_handler=handle_custodes_state_event,
+)
 
 # Wire enforce dependencies (atomic emitter). The notify path is the unified
 # router core (dispatch_notify); notify.py is a thin typed shim over it and

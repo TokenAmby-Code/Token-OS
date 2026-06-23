@@ -24,6 +24,7 @@ V1_TRIGGERS = {
     "enforcement_cascade_started",
     "enforcement_cascade_escalate",
     "expected_ack_escalated",
+    "tts_queue_languishing",
 }
 
 # Hooks that carry a physical enforcement action (Pavlok / window-close / ack
@@ -38,6 +39,7 @@ ENFORCEMENT_TRIGGERS = {
     "phone_distraction_blocked",
     "phone_distraction_enforce",
     "desktop_mode_blocked",
+    "tts_queue_languishing",
 }
 
 
@@ -241,6 +243,7 @@ def evaluate_state_event(
         "enforcement_cascade_started": "Intervene because enforcement has escalated; get explicit closure from the Emperor.",
         "enforcement_cascade_escalate": "Intervene about active escalation; the loop is escalating — get explicit closure now.",
         "expected_ack_escalated": "Intervene about the missed acknowledgement ladder; mirror the Discord-channel cascade and pull the Emperor back to the work surface.",
+        "tts_queue_languishing": "Intervene because the TTS pause queue is languishing; get the Emperor to play or clear the queued speech before more messages pile up.",
     }[event.event_type]
 
     prompt = (
