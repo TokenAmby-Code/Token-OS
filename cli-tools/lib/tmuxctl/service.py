@@ -312,6 +312,321 @@ class TmuxControlPlane:
         builder(self.adapter, session_name, window_name_raw)
         return f"rebuilt {target}"
 
+    # ------------------------------------------------------------------
+    # Façade completion — thin delegators over the free functions cli.py
+    # already dispatches. One logic implementation, no fork: each method
+    # wraps the *same* free function the CLI calls. These exist so the
+    # daemon (and the deferred cli.py migration) can consume a complete
+    # ``TmuxControlPlane`` surface in-process.
+    # ------------------------------------------------------------------
+
+    def metal_observe(self, session_name: str) -> list[dict]:
+        from .metal_resolver import observation_to_dict, observe_and_resolve
+
+        return [observation_to_dict(obs) for obs in observe_and_resolve(self.adapter, session_name)]
+
+    def metal_restart(self, session_name: str, *, dry_run: bool = False) -> dict:
+        from .metal_restart import metal_restart, render_metal_restart_result
+
+        result = metal_restart(self.adapter, session_name, dry_run=dry_run)
+        return {"ok": result.ok, "output": render_metal_restart_result(result)}
+
+    def translate_ids(self, text: str, *, unresolved: str = "unresolved") -> str:
+        from .public_ids import physical_to_public_id_map, translate_physical_ids
+
+        mapping = physical_to_public_id_map(self.adapter)
+        return translate_physical_ids(text, mapping, unresolved=unresolved)
+
+    def clear_runtime(self, pane: str) -> dict:
+        from .close import clear_runtime
+
+        return clear_runtime(self.adapter, pane)
+
+    def close_pane(self, pane: str, *, timeout: float = 3.0) -> dict:
+        from .close import close_pane
+
+        return close_pane(self.adapter, pane, timeout=timeout)
+
+    def close_instance(
+        self,
+        instance_id: str,
+        *,
+        lifecycle: str = "retire",
+        mode: str = "now",
+        pane: str = "",
+        timeout: float = 3.0,
+    ) -> dict:
+        from .close import close_instance
+
+        return close_instance(
+            self.adapter,
+            instance_id,
+            lifecycle=lifecycle,
+            mode=mode,
+            pane=pane or None,
+            timeout=timeout,
+        )
+
+    def assert_instance(self, pane: str) -> dict:
+        from .assertions import assert_instance
+
+        return assert_instance(self.adapter, pane)
+
+    def assert_personas(self) -> list[dict]:
+        from .assertions import sweep_persona_panes
+
+        return sweep_persona_panes(self.adapter)
+
+    def resolve_agent(
+        self, pane: str = "current", agent: str = "auto", *, default: str = "claude"
+    ) -> str:
+        from .skill_invoke import resolve_agent_for_pane
+
+        return resolve_agent_for_pane(self.adapter, pane, agent, default=default)
+
+    def send_text(
+        self,
+        pane: str,
+        text: str,
+        *,
+        clear_prompt: bool = False,
+        submit: bool = True,
+    ) -> dict:
+        """Deliver literal text to a pane through the gated send primitive.
+
+        ``submit=False`` routes through the insert-only primitive (draft mode —
+        never issues C-m), mirroring ``tmuxctl send-text --no-submit``.
+        """
+        if not submit:
+            self.insert_text(pane, text)
+            return {"status": "inserted", "pane": pane}
+        self.adapter.send_text_then_submit(pane, text, clear_prompt=clear_prompt)
+        return {"status": "submitted", "pane": pane}
+
+    def stack_add(
+        self, base: str, *, cwd: str | None = None, session: str = "main", focus: bool = True
+    ) -> str:
+        from .stack import add_stack_pane
+
+        pane_id = add_stack_pane(self.adapter, session, base, cwd=cwd, focus=focus)
+        return self._public_or_unresolved(pane_id)
+
+    def stack_dispatch(
+        self,
+        base: str,
+        command: str,
+        *,
+        cwd: str | None = None,
+        session: str = "main",
+        focus: bool = True,
+        settle_seconds: float = 0.5,
+    ) -> str:
+        from .stack import dispatch_stack_command
+
+        pane_id = dispatch_stack_command(
+            self.adapter,
+            session,
+            base,
+            command,
+            cwd=cwd,
+            focus=focus,
+            settle_seconds=settle_seconds,
+        )
+        return self._public_or_unresolved(pane_id)
+
+    def stack_adopt(
+        self,
+        base: str,
+        pane: str,
+        *,
+        cwd: str | None = None,
+        session: str = "main",
+        focus: bool = True,
+    ) -> str:
+        from .focus_guard import preserve_focus
+        from .stack import add_stack_pane
+
+        with preserve_focus(
+            self.adapter,
+            source="tmuxctld stack adopt",
+            attempted_target=f"{session}:{base}",
+        ):
+            pane_id = add_stack_pane(
+                self.adapter, session, base, cwd=cwd, focus=focus, adopt_pane=pane
+            )
+        return self._public_or_unresolved(pane_id)
+
+    def stack_enforce(
+        self,
+        *,
+        pane: str = "current",
+        window: str = "",
+        focus: bool = False,
+        admit: bool = False,
+        kill_pending_clear: bool = False,
+    ) -> str:
+        from .stack import enforce_stack_layout
+
+        if window:
+            target = window
+            focused_pane = ""
+        else:
+            focused_pane = self._resolve_current(pane)
+            target = self.adapter.run(
+                "display-message", "-t", focused_pane, "-p", "#{session_name}:#{window_index}"
+            ).strip()
+        return enforce_stack_layout(
+            self.adapter,
+            target,
+            focused_pane=focused_pane,
+            focus=focus,
+            admit=admit,
+            kill_pending_clear=kill_pending_clear,
+        )
+
+    def stack_sweep(self, *, session: str = "main", kill_pending_clear: bool = True) -> str:
+        from .stack import sweep_stack_assertions
+
+        return sweep_stack_assertions(self.adapter, session, kill_pending_clear=kill_pending_clear)
+
+    def legion_focus_selected(self, pane: str = "current") -> str:
+        from .stack import focus_selected
+
+        return focus_selected(self.adapter, self._resolve_current(pane))
+
+    def legion_enforce(self, pane: str = "current") -> str:
+        from .stack import enforce_stack_layout
+
+        resolved = self._resolve_current(pane)
+        target = self.adapter.run(
+            "display-message", "-t", resolved, "-p", "#{session_name}:#{window_index}"
+        ).strip()
+        return enforce_stack_layout(self.adapter, target, focused_pane=resolved, focus=True)
+
+    def mechanicus_focus_guard(
+        self, *, pane: str = "", client: str = "", surface: str = "after-select"
+    ) -> dict:
+        from .focus_guard import remember_or_bounce
+
+        return remember_or_bounce(self.adapter, pane=pane, client=client, surface=surface)
+
+    def allow_mechanicus_focus(self, *, seconds: float = 4.0, reason: str = "explicit") -> float:
+        from .focus_guard import allow_temporarily
+
+        return allow_temporarily(self.adapter, seconds=seconds, reason=reason, actor="tmuxctld")
+
+    def allow_human_mechanicus_focus(
+        self, *, client: str = "", reason: str = "explicit-human-navigation"
+    ) -> str:
+        from .focus_guard import allow_human_focus
+
+        allow_human_focus(self.adapter, client=client, reason=reason, actor="tmuxctld")
+        return "ok"
+
+    def pane_select(self, *, mode: str, direction: str, client: str = "") -> str:
+        from .pane_select import select_pane
+
+        return select_pane(self.adapter, mode=mode, direction=direction, client=client)
+
+    # ------------------------------------------------------------------
+    # Instance-id-aware ops. Each resolves ``instance_id -> live pane`` via
+    # ``resolve_instance()`` and FAILS CLOSED — no live pane carrying the
+    # stamp means ``{found: False}`` and a structured no-op, never a tmux
+    # action against the wrong (or a dead) pane. Pre-stages the deferred
+    # token-api integration pass.
+    # ------------------------------------------------------------------
+
+    def instance_show_option(self, instance_id: str, option: str) -> dict:
+        resolved = self.resolve_instance(instance_id)
+        if not resolved["found"]:
+            return {"instance_id": instance_id, "found": False, "option": option, "value": ""}
+        return {
+            "instance_id": instance_id,
+            "found": True,
+            "option": option,
+            "value": self.adapter.show_pane_option(resolved["pane_id"], option),
+            "pane_role": resolved["pane_role"],
+        }
+
+    def instance_set_option(self, instance_id: str, option: str, value: str) -> dict:
+        resolved = self.resolve_instance(instance_id)
+        if not resolved["found"]:
+            return {"instance_id": instance_id, "found": False, "option": option}
+        self.adapter.run("set-option", "-p", "-t", resolved["pane_id"], option, value)
+        return {
+            "instance_id": instance_id,
+            "found": True,
+            "option": option,
+            "value": value,
+            "pane_role": resolved["pane_role"],
+        }
+
+    def instance_unset_option(self, instance_id: str, option: str) -> dict:
+        resolved = self.resolve_instance(instance_id)
+        if not resolved["found"]:
+            return {"instance_id": instance_id, "found": False, "option": option}
+        self.adapter.run("set-option", "-pu", "-t", resolved["pane_id"], option)
+        return {"instance_id": instance_id, "found": True, "option": option}
+
+    def instance_send_text(
+        self, instance_id: str, text: str, *, clear_prompt: bool = False, submit: bool = True
+    ) -> dict:
+        resolved = self.resolve_instance(instance_id)
+        if not resolved["found"]:
+            return {"instance_id": instance_id, "found": False}
+        if not submit:
+            self.insert_text(resolved["pane_id"], text)
+            return {"instance_id": instance_id, "found": True, "status": "inserted"}
+        self.adapter.send_text_then_submit(resolved["pane_id"], text, clear_prompt=clear_prompt)
+        return {"instance_id": instance_id, "found": True, "status": "submitted"}
+
+    def instance_tint(self, instance_id: str, color: str) -> dict:
+        resolved = self.resolve_instance(instance_id)
+        if not resolved["found"]:
+            return {"instance_id": instance_id, "found": False}
+        bg = color or "default"
+        # select-pane -P is camera-neutral (style only) — no focus snapshot or
+        # restore needed (mirrors token-api shared.apply_pane_tint, relocated here).
+        self.adapter.run(
+            "select-pane", "-t", resolved["pane_id"], "-P", f"bg={bg}", allow_failure=True
+        )
+        return {"instance_id": instance_id, "found": True, "tint": bg}
+
+    def instance_clear_tint(self, instance_id: str) -> dict:
+        resolved = self.resolve_instance(instance_id)
+        if not resolved["found"]:
+            return {"instance_id": instance_id, "found": False}
+        self.adapter.clear_pane_style(resolved["pane_id"])
+        return {"instance_id": instance_id, "found": True, "tint": "default"}
+
+    def instance_focus(self, instance_id: str, *, allow: bool = False, client: str = "") -> dict:
+        resolved = self.resolve_instance(instance_id)
+        if not resolved["found"]:
+            return {"instance_id": instance_id, "found": False}
+        # Allow-flag threaded as an EXPLICIT param (not os.environ mutation) so
+        # concurrent daemon requests never race a shared process-global.
+        if allow:
+            from .focus_guard import allow_temporarily
+
+            allow_temporarily(self.adapter, reason="instance-focus", actor="tmuxctld")
+        self.adapter.run("select-pane", "-t", resolved["pane_id"])
+        return {"instance_id": instance_id, "found": True, "focused": resolved["pane_role"]}
+
+    # -- small shared helpers --------------------------------------------------
+
+    def _resolve_current(self, pane: str) -> str:
+        if pane == "current":
+            return self.adapter.run("display-message", "-p", "#{pane_id}").strip()
+        return pane
+
+    def _public_or_unresolved(self, target: str | None) -> str:
+        if not target:
+            return "unresolved"
+        try:
+            return self.public_pane_id(target)
+        except Exception:
+            return "unresolved"
+
     def _grouped_sessions(self, leader_session_name: str) -> tuple[GroupedSessionSnapshot, ...]:
         sessions = []
         for row in self.adapter.list_sessions():
