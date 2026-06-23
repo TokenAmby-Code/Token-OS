@@ -310,9 +310,8 @@ def test_snap_never_raises_on_error(app_env, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_worker_snaps_on_each_event_hot_playback_start(app_env, monkeypatch) -> None:
-    """The playback dispatcher snaps focus for event-hot pane speech, including
-    rapid successive items from different panes."""
+def test_worker_snaps_explicit_queue_playback(app_env, monkeypatch) -> None:
+    """Items explicitly played from the queue snap focus on playback start."""
     tts = _load_tts(app_env)
 
     snapped = []
@@ -321,6 +320,7 @@ def test_worker_snaps_on_each_event_hot_playback_start(app_env, monkeypatch) -> 
         snapped.append(item.instance_id)
         return {"snapped": True}
 
+    monkeypatch.setattr(tts, "TTS_AUTO_FOCUS_ENABLED", False)
     monkeypatch.setattr(tts, "_snap_focus_to_speaker", fake_snap)
     monkeypatch.setattr(tts, "_set_tts_state", lambda *a, **k: None)
     monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
@@ -348,9 +348,8 @@ def test_worker_snaps_on_each_event_hot_playback_start(app_env, monkeypatch) -> 
     assert snapped[:2] == ["alpha", "bravo"]
 
 
-def test_worker_does_not_snap_promoted_pause_queue_items(app_env, monkeypatch) -> None:
-    """Promoting backlog to hot should play it, but not reinterpret it as a live
-    pane-started-talking event that steals focus back to a stale/custodes pane."""
+def test_worker_does_not_snap_direct_hot_tts_by_default(app_env, monkeypatch) -> None:
+    """Direct-to-surface hot TTS does not yank tmux focus."""
     tts = _load_tts(app_env)
 
     snapped = []
@@ -359,16 +358,14 @@ def test_worker_does_not_snap_promoted_pause_queue_items(app_env, monkeypatch) -
         snapped.append(item.instance_id)
         return {"snapped": True}
 
+    monkeypatch.setattr(tts, "TTS_AUTO_FOCUS_ENABLED", False)
     monkeypatch.setattr(tts, "_snap_focus_to_speaker", fake_snap)
     monkeypatch.setattr(tts, "_set_tts_state", lambda *a, **k: None)
     monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
     monkeypatch.setattr(tts, "speak_tts", lambda *a, **k: {"success": True, "method": "test"})
 
     tts.hot_queue.clear()
-    # This simulates an item that was originally pause-queued, then later moved
-    # into hot_queue by promote/play-pane. Its queue_target may now be hot, but
-    # focus_on_playback remains false.
-    tts.hot_queue.append(_make_item(tts, "custodes-backlog", tmux_pane="legion:custodes"))
+    tts.hot_queue.append(_make_item(tts, "alpha", tmux_pane="palace:1", focus_on_playback=False))
 
     async def drive():
         task = asyncio.create_task(tts.tts_queue_worker())
@@ -384,6 +381,45 @@ def test_worker_does_not_snap_promoted_pause_queue_items(app_env, monkeypatch) -
 
     asyncio.run(drive())
     assert snapped == []
+
+
+def test_worker_snaps_promoted_pause_queue_items(app_env, monkeypatch) -> None:
+    """Promoting backlog to hot is an explicit play action and should snap focus."""
+    tts = _load_tts(app_env)
+
+    snapped = []
+
+    async def fake_snap(item):
+        snapped.append(item.instance_id)
+        return {"snapped": True}
+
+    monkeypatch.setattr(tts, "_snap_focus_to_speaker", fake_snap)
+    monkeypatch.setattr(tts, "_set_tts_state", lambda *a, **k: None)
+    monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
+    monkeypatch.setattr(tts, "speak_tts", lambda *a, **k: {"success": True, "method": "test"})
+
+    tts.hot_queue.clear()
+    # This simulates an item that was originally pause-queued, then later moved
+    # into hot_queue by promote/play-pane. The promote endpoint sets
+    # focus_on_playback=True because the operator pressed play.
+    tts.hot_queue.append(
+        _make_item(tts, "custodes-backlog", tmux_pane="legion:custodes", focus_on_playback=True)
+    )
+
+    async def drive():
+        task = asyncio.create_task(tts.tts_queue_worker())
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if tts.tts_current is None and not tts.hot_queue:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(drive())
+    assert snapped == ["custodes-backlog"]
 
 
 # --------------------------------------------------------------------------

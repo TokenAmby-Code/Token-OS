@@ -56,8 +56,10 @@ from shared import (
 
 logger = logging.getLogger("token_api")
 
-# Safety valve only. Normal focus follows event-hot pane speech, not timer/UI polls
-# or promoted pause-queue summaries.
+# TTS playback focus snap is explicit-action only. Direct-to-surface hot TTS
+# must not steal tmux focus; queued items promoted/played by the operator may
+# snap because pressing play is the focus intent. TOKEN_API_TTS_AUTO_FOCUS is an
+# emergency switch for restoring broad snap behavior.
 TTS_AUTO_FOCUS_ENABLED = os.environ.get("TOKEN_API_TTS_AUTO_FOCUS", "").lower() in {
     "1",
     "true",
@@ -1031,10 +1033,10 @@ async def tts_queue_worker():
                     tts_current = None
 
             if tts_current:
-                # Playback start is the ONLY focus event. Do not tie focus to
-                # status/timer/UI polling. Only original hot/event speech may
-                # focus its source pane; paused summaries promoted later do not
-                # yank the operator back to stale/custodes context.
+                # Playback focus snap is explicit-action only. Direct hot TTS
+                # may fire from background hooks at arbitrary times; do not
+                # steal focus for that. Promoting/playing from the pause queue
+                # sets focus_on_playback=True because the operator pressed play.
                 if tts_current.message and (
                     tts_current.focus_on_playback or TTS_AUTO_FOCUS_ENABLED
                 ):
@@ -1223,7 +1225,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             tab_name=tab_name,
             queue_target=queue_target,
             tmux_pane=tmux_pane,
-            focus_on_playback=(queue_target == "hot"),
+            focus_on_playback=False,
         )
     else:
         item = TTSQueueItem(
@@ -1234,7 +1236,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             tab_name=tab_name,
             queue_target=queue_target,
             tmux_pane=tmux_pane,
-            focus_on_playback=(queue_target == "hot"),
+            focus_on_playback=False,
         )
 
     async with tts_queue_lock:
@@ -1532,12 +1534,14 @@ async def promote_from_pause(request: PromoteRequest):
             for item in to_promote:
                 pause_queue.remove(item)
                 item.queue_target = "hot"
+                item.focus_on_playback = True
                 hot_queue.appendleft(item)
                 promoted += 1
         else:
             # Promote the next (oldest) item
             item = pause_queue.popleft()
             item.queue_target = "hot"
+            item.focus_on_playback = True
             hot_queue.appendleft(item)
             promoted = 1
 
@@ -1557,6 +1561,7 @@ async def play_pane(request: PlayPaneRequest):
         for item in to_promote:
             pause_queue.remove(item)
             item.queue_target = "hot"
+            item.focus_on_playback = True
             hot_queue.appendleft(item)
             promoted += 1
 
