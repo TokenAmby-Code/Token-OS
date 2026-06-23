@@ -39,6 +39,7 @@ def _bridge_env(tmp_path: pathlib.Path, state: str) -> tuple[dict[str, str], pat
             "TMUX_PANE": "%12",
             "TOKEN_API_PLAN_APPROVER": str(approver),
             "TOKEN_API_DISABLE_SESSION_RESUME": "1",
+            "TOKEN_API_SESSION_ID": "api-instance-1",
         }
     )
     return env, approve_log
@@ -84,16 +85,22 @@ def _write_transcript(path: pathlib.Path, turns: list[list[dict[str, object]]]) 
     path.write_text("\n".join(lines) + "\n")
 
 
-def test_stop_does_not_launch_on_planning_state_alone(tmp_path: pathlib.Path) -> None:
+def test_stop_launches_on_planning_state_alone(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(tmp_path, "planning")
 
-    assert not approve_log.exists()
+    assert (
+        approve_log.read_text().strip()
+        == "--agent codex --timeout 30 --no-state --pane %12 --instance-id api-instance-1"
+    )
 
 
-def test_stop_does_not_launch_on_approving_state_alone(tmp_path: pathlib.Path) -> None:
+def test_stop_launches_on_approving_state_alone(tmp_path: pathlib.Path) -> None:
     approve_log = _run_bridge(tmp_path, "approving")
 
-    assert not approve_log.exists()
+    assert (
+        approve_log.read_text().strip()
+        == "--agent codex --timeout 30 --no-state --pane %12 --instance-id api-instance-1"
+    )
 
 
 def test_stop_launches_approver_when_latest_transcript_turn_has_plan_item(
@@ -114,7 +121,10 @@ def test_stop_launches_approver_when_latest_transcript_turn_has_plan_item(
 
     approve_log = _run_bridge(tmp_path, "none", {"session_id": "codex-1"})
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+    assert (
+        approve_log.read_text().strip()
+        == "--agent codex --timeout 30 --no-state --pane %12 --instance-id api-instance-1"
+    )
 
 
 def test_stop_launches_approver_when_latest_transcript_turn_has_proposed_plan(
@@ -148,7 +158,10 @@ def test_stop_launches_approver_when_latest_transcript_turn_has_proposed_plan(
         {"session_id": "codex-1", "transcript_path": str(transcript)},
     )
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+    assert (
+        approve_log.read_text().strip()
+        == "--agent codex --timeout 30 --no-state --pane %12 --instance-id api-instance-1"
+    )
 
 
 def test_stop_does_not_launch_when_only_older_transcript_turn_has_plan(
@@ -198,7 +211,10 @@ def test_stop_launches_approver_when_payload_has_proposed_plan(tmp_path: pathlib
         },
     )
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 10 --no-state"
+    assert (
+        approve_log.read_text().strip()
+        == "--agent codex --timeout 30 --no-state --pane %12 --instance-id api-instance-1"
+    )
 
 
 def test_post_tool_use_in_open_plan_turn_launches_longer_watcher(tmp_path: pathlib.Path) -> None:
@@ -222,7 +238,10 @@ def test_post_tool_use_in_open_plan_turn_launches_longer_watcher(tmp_path: pathl
         action="PostToolUse",
     )
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 30 --no-state"
+    assert (
+        approve_log.read_text().strip()
+        == "--agent codex --timeout 120 --no-state --pane %12 --instance-id api-instance-1"
+    )
 
 
 def test_user_prompt_submit_plan_command_launches_longer_watcher(tmp_path: pathlib.Path) -> None:
@@ -233,4 +252,7 @@ def test_user_prompt_submit_plan_command_launches_longer_watcher(tmp_path: pathl
         action="UserPromptSubmit",
     )
 
-    assert approve_log.read_text().strip() == "--pane %12 --agent codex --timeout 90 --no-state"
+    assert (
+        approve_log.read_text().strip()
+        == "--agent codex --timeout 300 --no-state --pane %12 --instance-id api-instance-1"
+    )
