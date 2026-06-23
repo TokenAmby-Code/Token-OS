@@ -27,6 +27,9 @@ class StubAdapter:
     def run(self, *args, allow_failure=False):
         return ""
 
+    def show_pane_option(self, pane_id, option):
+        return self.run("show-options", "-pv", "-t", pane_id, option, allow_failure=True).strip()
+
 
 def _serve(adapter_factory):
     server = daemon.TmuxctldServer(
@@ -37,6 +40,9 @@ def _serve(adapter_factory):
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    # Gate on the real ready event (set once the accept loop owns the socket) —
+    # no sleep-based race. The timeout is only a deadlock backstop, not the gate.
+    assert server.ready.wait(timeout=5), "server thread never signalled ready"
     return server, thread
 
 
@@ -53,6 +59,16 @@ def _post(server, path, body):
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+def test_server_signals_ready_event():
+    # Finding #3: the server thread sets a threading.Event once it is actually
+    # listening; _serve gates on it, so by the time it returns the event is set.
+    server, _ = _serve(StubAdapter)
+    try:
+        assert server.ready.is_set()
+    finally:
+        server.shutdown()
 
 
 def test_health_shape():
@@ -108,6 +124,49 @@ def test_resolve_instance_returns_canonical_role_never_physical():
         assert result["pane_id"] == "mechanicus:1"
         assert result["pane_role"] == "mechanicus:1"
         assert "%42" not in json.dumps(payload)
+    finally:
+        server.shutdown()
+
+
+class StampedPaneAdapter:
+    """current pane resolves to %7 and carries @INSTANCE_ID=stamped-uuid."""
+
+    def list_sessions(self):
+        return []
+
+    def run(self, *args, allow_failure=False):
+        if args[:2] == ("display-message", "-p"):
+            return "%7"
+        if args[0] == "show-options" and args[-1] == "@INSTANCE_ID":
+            return "stamped-uuid"
+        return ""
+
+    def show_pane_option(self, pane_id, option):
+        return self.run("show-options", "-pv", "-t", pane_id, option, allow_failure=True).strip()
+
+
+def test_instance_id_for_pane_reads_stamp():
+    server, _ = _serve(StampedPaneAdapter)
+    try:
+        status, payload = _get(server, "/tmux/instance-id-for-pane?pane=current")
+        assert status == 200
+        result = payload["result"]
+        assert result["found"] is True
+        assert result["instance_id"] == "stamped-uuid"
+        assert result["pane"] == "%7"
+    finally:
+        server.shutdown()
+
+
+def test_instance_id_for_pane_fail_closed_when_unstamped():
+    server, _ = _serve(StubAdapter)
+    try:
+        status, payload = _get(server, "/tmux/instance-id-for-pane?pane=current")
+        assert status == 200
+        result = payload["result"]
+        # No @INSTANCE_ID stamp -> fail-closed: found:false, empty instance_id.
+        assert result["found"] is False
+        assert result["instance_id"] == ""
     finally:
         server.shutdown()
 

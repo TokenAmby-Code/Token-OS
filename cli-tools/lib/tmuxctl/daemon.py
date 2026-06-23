@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import signal
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -44,6 +46,10 @@ from .tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7778
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+# Server-side log. Full exception detail is logged HERE (launchd captures stderr)
+# and never leaked into the HTTP JSON response (clients get a generic message).
+log = logging.getLogger("tmuxctld")
 
 _RAW_TMUX_ID_RX = re.compile(r"%\d+")
 _PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
@@ -98,11 +104,13 @@ def read_sha() -> str:
 
 
 def heartbeat_path(home: str | None = None) -> Path:
+    """Path of the liveness heartbeat file (``~/.claude/tmuxctld-heartbeat.json``)."""
     base = home or os.path.expanduser("~")
     return Path(base) / ".claude" / "tmuxctld-heartbeat.json"
 
 
 def heartbeat_payload(port: int, *, reachable: bool) -> dict:
+    """Build the heartbeat record (pid, port, tmux reachability, wall-clock ts)."""
     return {
         "pid": os.getpid(),
         "port": port,
@@ -139,6 +147,7 @@ def tmux_reachable(adapter: TmuxAdapter) -> bool:
 
 
 def _heartbeat_loop(server: TmuxctldServer, stop: threading.Event) -> None:
+    """Background loop: write the liveness heartbeat every interval until stopped."""
     while not stop.is_set():
         try:
             write_heartbeat(
@@ -217,6 +226,12 @@ def _h_resolve_instance(control, params):
         "pane_id": pane_id,
         "pane_role": pane_id,
     }
+
+
+def _h_instance_id_for_pane(control, params):
+    # Reverse of resolve-instance: read a pane's live @INSTANCE_ID stamp. Fails
+    # closed — an unstamped or dead pane yields instance_id:"" / found:false.
+    return control.instance_id_for_pane(_s(params, "pane", "current"))
 
 
 def _h_resolve_pane(control, params):
@@ -559,9 +574,12 @@ def _h_instance_focus(control, params):
     )
 
 
-ROUTES: dict[tuple[str, str], object] = {
+RouteHandler = Callable[["TmuxControlPlane", dict], object]
+
+ROUTES: dict[tuple[str, str], RouteHandler] = {
     # Resolution (GET)
     ("GET", "/tmux/resolve-instance"): _h_resolve_instance,
+    ("GET", "/tmux/instance-id-for-pane"): _h_instance_id_for_pane,
     ("GET", "/resolve-pane"): _h_resolve_pane,
     ("GET", "/resolve-agent"): _h_resolve_agent,
     ("GET", "/freelist"): _h_freelist,
@@ -628,6 +646,15 @@ ROUTES: dict[tuple[str, str], object] = {
 
 
 class TmuxctldServer(ThreadingHTTPServer):
+    """Threading HTTP server for the tmuxctld loopback control plane.
+
+    Carries the per-process metadata (version/sha/advertised port) and the
+    adapter factory the request handler uses to build a fresh control plane per
+    request. :attr:`ready` is set the instant the accept loop owns the (already
+    bound + listening) socket, so startup and tests gate on the real ready event
+    instead of a sleep-based race.
+    """
+
     daemon_threads = True
     allow_reuse_address = True
 
@@ -635,25 +662,42 @@ class TmuxctldServer(ThreadingHTTPServer):
         self,
         server_address,
         *,
-        adapter_factory=None,
+        adapter_factory: Callable[[], TmuxAdapter] | None = None,
         version: str = "",
         sha: str = "",
         advertised_port: int | None = None,
     ) -> None:
         super().__init__(server_address, TmuxctldHandler)
-        self.adapter_factory = adapter_factory or (lambda: TmuxAdapter())
+        self.adapter_factory: Callable[[], TmuxAdapter] = adapter_factory or (lambda: TmuxAdapter())
         self.version = version
         self.sha = sha
         self.advertised_port = advertised_port or server_address[1]
+        self.ready = threading.Event()
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        """Run the accept loop, signalling :attr:`ready` once we own the socket.
+
+        ``server_bind()`` + ``server_activate()`` already ran in ``__init__``, so
+        the socket is bound and listening by the time this is called; we set the
+        ready event before entering the (blocking) accept loop so a waiter can
+        connect the moment it returns.
+        """
+        self.ready.set()
+        super().serve_forever(poll_interval)
 
 
 class TmuxctldHandler(BaseHTTPRequestHandler):
+    """HTTP request handler — a faithful transport over the control plane.
+
+    It parses the request, builds a fresh ``TmuxControlPlane`` per request,
+    dispatches to the matching route handler, and wraps the return in the
+    ``{ok, result}`` / ``{ok:false, error}`` envelope. ALL command logic lives on
+    ``TmuxControlPlane`` / the free route functions — never here.
+    """
+
+    server: TmuxctldServer  # narrow BaseServer for the typed attribute access below
     server_version = "tmuxctld/1.0"
     protocol_version = "HTTP/1.1"
-
-    # The handler is a faithful transport: it parses the request, builds a fresh
-    # control plane, dispatches to the route handler, and wraps the return in the
-    # envelope. ALL command logic lives on TmuxControlPlane / the free functions.
 
     def do_GET(self):  # noqa: N802
         self._dispatch("GET")
@@ -697,9 +741,15 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             # so the caller can re-queue cleanly.
             self._write(200, self._error("gated", str(exc), detail=exc.gate))
         except (TmuxError, RegistryError, ValueError, KeyError) as exc:
+            # Expected, structured domain errors: the message is a deliberate,
+            # author-controlled part of the API contract — safe to surface.
             self._write(200, self._error(type(exc).__name__, str(exc)))
-        except Exception as exc:  # never a 500 for a logic failure
-            self._write(200, self._error("internal", str(exc), detail=type(exc).__name__))
+        except Exception:  # never a 500 for a logic failure
+            # Unexpected internal error: log the full exception (with traceback)
+            # SERVER-SIDE and return a generic client message — raw exception
+            # detail must never leak into the HTTP JSON response.
+            log.exception("unhandled error dispatching %s %s", method, path)
+            self._write(200, self._error("internal", "internal error"))
 
     def _health_payload(self) -> dict:
         return {
@@ -725,7 +775,8 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
-    def log_message(self, *_args):  # quiet by default; launchd captures stderr
+    def log_message(self, *_args):
+        """Silence stdlib access logging — launchd captures stderr already."""
         return
 
 
@@ -735,6 +786,7 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the ``tmuxctld`` CLI parser (``--host`` / ``--port``)."""
     parser = argparse.ArgumentParser(
         prog="tmuxctld",
         description="Standalone HTTP-loopback daemon face of tmuxctl (stdlib only).",
@@ -747,6 +799,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def serve(host: str, port: int) -> int:
+    """Run the daemon on ``host:port`` until SIGTERM/Ctrl-C; returns the exit code.
+
+    Starts the background heartbeat thread, installs a SIGTERM handler that
+    raises ``SystemExit`` for a clean ``server_close()``, and blocks in
+    ``serve_forever()`` (which sets the server ready event once listening).
+    """
     server = TmuxctldServer(
         (host, port),
         version=read_version(),
@@ -775,8 +833,9 @@ def serve(host: str, port: int) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse argv and run :func:`serve`; the module's process entry point."""
     args = build_parser().parse_args(argv)
-    return serve(args.host, args.port)
+    return serve(str(args.host), int(args.port))
 
 
 if __name__ == "__main__":

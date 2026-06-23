@@ -56,6 +56,7 @@ class TmuxControlPlane:
         self.adapter = adapter or TmuxAdapter()
 
     def inspect_workspace(self, session_name: str, *, physical: bool = False) -> str:
+        """Render the full workspace snapshot for a session as text."""
         return render_workspace(
             build_workspace_snapshot(self.adapter, session_name), physical=physical
         )
@@ -63,11 +64,13 @@ class TmuxControlPlane:
     def inspect_window(
         self, session_name: str, window_index: int, *, physical: bool = False
     ) -> str:
+        """Render a single window's snapshot for a session as text."""
         return render_window(
             build_window_snapshot(self.adapter, session_name, window_index), physical=physical
         )
 
     def inspect_pane(self, pane_id: str, *, physical: bool = False) -> str:
+        """Render a single pane's snapshot, located via its live window snapshot."""
         pane_target = self.adapter.run(
             "display-message",
             "-t",
@@ -83,13 +86,20 @@ class TmuxControlPlane:
         raise ValueError(f"pane not found in snapshot: {pane_id}")
 
     def inspect_restart_plan(self, session_name: str) -> str:
+        """Build and render the restart plan for a session as text."""
         plan = self.build_restart_plan(session_name)
         return render_restart_plan(plan)
 
     def doctor(self, session_name: str) -> str:
+        """Render the workspace coherence/health report for a session."""
         return render_doctor(build_workspace_snapshot(self.adapter, session_name))
 
     def build_restart_plan(self, session_name: str):
+        """Build the restart plan from the live snapshot, registry, and clients.
+
+        Falls back to a tmux-only plan with a warning issue if the registry is
+        unavailable.
+        """
         workspace = build_workspace_snapshot(self.adapter, session_name)
         registry_error = ""
         try:
@@ -128,21 +138,26 @@ class TmuxControlPlane:
         return plan
 
     def dry_run_restart(self, session_name: str) -> str:
+        """Render the dry-run result of executing the session's restart plan."""
         plan = self.build_restart_plan(session_name)
         return render_restart_result(RestartExecutor(self.adapter).dry_run(plan))
 
     def execute_restart(self, session_name: str) -> tuple[str, bool]:
+        """Execute the session's restart plan; return (rendered result, success)."""
         plan = self.build_restart_plan(session_name)
         result = RestartExecutor(self.adapter).execute(plan)
         return render_restart_result(result), result.is_success
 
     def normalize(self, session_name: str, window_index: int) -> str:
+        """Normalize the layout/options of a window to its canonical archetype."""
         return normalize_window(self.adapter, session_name, window_index)
 
     def focus(self, session_name: str, window_index: int, mode: str) -> str:
+        """Apply a focus mode to a window (e.g. zoom/spread the panes)."""
         return focus_window(self.adapter, session_name, window_index, mode)
 
     def resolve_pane(self, target: str) -> str:
+        """Resolve a pane target and render its identity, role, kind, and agent."""
         resolved = resolve_pane(self.adapter, target)
         from .skill_invoke import resolve_agent_for_pane
 
@@ -190,6 +205,18 @@ class TmuxControlPlane:
             "live_agent": agent != "auto",
         }
 
+    def instance_id_for_pane(self, pane: str) -> dict:
+        """Reverse of :meth:`resolve_instance`: read a pane's live ``@INSTANCE_ID``.
+
+        The pane's stamp is the authoritative ``pane -> instance_id`` bridge.
+        Fails closed: an unstamped or dead pane yields ``instance_id:""`` and
+        ``found:False`` — never a guess. Returns
+        ``{pane, instance_id, found}``.
+        """
+        resolved_pane = self._resolve_current(pane)
+        value = self.adapter.show_pane_option(resolved_pane, "@INSTANCE_ID")
+        return {"pane": resolved_pane, "instance_id": value or "", "found": bool(value)}
+
     def freelist(self) -> list[dict]:
         """List the clean, agent-free panes (the freelist).
 
@@ -220,12 +247,15 @@ class TmuxControlPlane:
         return resolve_to_public(self.adapter, target)
 
     def physical_pane_id(self, target: str) -> str:
+        """Resolve a target to its raw tmux %physical pane id."""
         return resolve_to_physical(self.adapter, target)
 
     def public_pane_id(self, target: str) -> str:
+        """Resolve a target to its stable public (cardinal) pane id."""
         return resolve_to_public(self.adapter, target)
 
     def session_doc_for_pane(self, target: str) -> dict:
+        """Fetch the session doc associated with a target pane's cardinal label."""
         pane_label = self.cardinal_pane_label(target)
         return fetch_session_doc_for_pane_label(pane_label)
 
@@ -237,6 +267,7 @@ class TmuxControlPlane:
         agent: str = "auto",
         arguments: str | None = None,
     ) -> str:
+        """Invoke a skill in a target pane via the agent's invocation primitive."""
         return invoke_skill_in_pane(self.adapter, target, skill, agent=agent, arguments=arguments)
 
     def send_skill(
@@ -248,6 +279,7 @@ class TmuxControlPlane:
         arguments: str | None = None,
         clear_prompt: bool = False,
     ) -> str:
+        """Send a skill invocation as literal text into a target pane's prompt."""
         return send_skill_invocation_to_pane(
             self.adapter,
             target,
@@ -258,33 +290,42 @@ class TmuxControlPlane:
         )
 
     def move_to_prompt_start(self, target: str, *, page_ups: int = 50) -> None:
+        """Move the cursor to the start of a pane's prompt via page-up keys."""
         move_to_prompt_start(self.adapter, target, page_ups=page_ups)
 
     def insert_text(self, target: str, text: str) -> None:
+        """Insert literal text into a pane's prompt without submitting (draft mode)."""
         insert_text(self.adapter, target, text)
 
     def move_to_prompt_end(self, target: str, *, page_downs: int = 50) -> None:
+        """Move the cursor to the end of a pane's prompt via page-down keys."""
         move_to_prompt_end(self.adapter, target, page_downs=page_downs)
 
     def audience_toggle(self, target: str, *, client: str = "") -> str:
+        """Toggle the audience (spotlight) view on a target pane for a client."""
         return audience_toggle(self.adapter, target, client=client)
 
     def audience_return(self, target: str, *, client: str = "") -> str:
+        """Return a client from the audience (spotlight) view to its prior layout."""
         return audience_return(self.adapter, target, client=client)
 
     def tombstone_jump(self, target: str, *, client: str = "") -> str:
+        """Jump a client to the tombstone recorded for a target pane."""
         return jump_tombstone(self.adapter, target, client=client)
 
     def tombstone_install(self, slot_pane: str, source_role: str, target_pane: str) -> str:
+        """Install a tombstone in a slot pane pointing from a source role to a target."""
         return install_tombstone(self.adapter, slot_pane, source_role, target_pane)
 
     def create_workspace(self, session_name: str = SESSION_NAME) -> str:
+        """Build the managed workspace session if it does not already exist."""
         if self.adapter.has_session(session_name):
             return f"session '{session_name}' already exists"
         build_workspace(self.adapter, session_name)
         return f"created workspace '{session_name}'"
 
     def rebuild_window(self, session_name: str, window_index: int) -> str:
+        """Rebuild a palace or somnium window from a single survivor pane."""
         target = f"{session_name}:{window_index}"
         panes = self.adapter.list_panes(target)
         if not panes:
@@ -321,28 +362,33 @@ class TmuxControlPlane:
     # ------------------------------------------------------------------
 
     def metal_observe(self, session_name: str) -> list[dict]:
+        """Observe and resolve the session at the metal layer; return dict records."""
         from .metal_resolver import observation_to_dict, observe_and_resolve
 
         return [observation_to_dict(obs) for obs in observe_and_resolve(self.adapter, session_name)]
 
     def metal_restart(self, session_name: str, *, dry_run: bool = False) -> dict:
+        """Run the metal-layer restart for a session; return ``{ok, output}``."""
         from .metal_restart import metal_restart, render_metal_restart_result
 
         result = metal_restart(self.adapter, session_name, dry_run=dry_run)
         return {"ok": result.ok, "output": render_metal_restart_result(result)}
 
     def translate_ids(self, text: str, *, unresolved: str = "unresolved") -> str:
+        """Translate raw physical pane ids in text to their public ids."""
         from .public_ids import physical_to_public_id_map, translate_physical_ids
 
         mapping = physical_to_public_id_map(self.adapter)
         return translate_physical_ids(text, mapping, unresolved=unresolved)
 
     def clear_runtime(self, pane: str) -> dict:
+        """Clear the agent runtime in a pane, leaving the pane itself alive."""
         from .close import clear_runtime
 
         return clear_runtime(self.adapter, pane)
 
     def close_pane(self, pane: str, *, timeout: float = 3.0) -> dict:
+        """Close a single pane, gracefully clearing its runtime first."""
         from .close import close_pane
 
         return close_pane(self.adapter, pane, timeout=timeout)
@@ -356,6 +402,7 @@ class TmuxControlPlane:
         pane: str = "",
         timeout: float = 3.0,
     ) -> dict:
+        """Close an instance by id with the given lifecycle/mode (retire, etc.)."""
         from .close import close_instance
 
         return close_instance(
@@ -368,11 +415,13 @@ class TmuxControlPlane:
         )
 
     def assert_instance(self, pane: str) -> dict:
+        """Assert/repair the instance stamp invariants for a single pane."""
         from .assertions import assert_instance
 
         return assert_instance(self.adapter, pane)
 
     def assert_personas(self) -> list[dict]:
+        """Sweep all persona panes, asserting their stamp invariants."""
         from .assertions import sweep_persona_panes
 
         return sweep_persona_panes(self.adapter)
@@ -380,6 +429,7 @@ class TmuxControlPlane:
     def resolve_agent(
         self, pane: str = "current", agent: str = "auto", *, default: str = "claude"
     ) -> str:
+        """Resolve the effective agent (cli) for a pane, applying overrides/default."""
         from .skill_invoke import resolve_agent_for_pane
 
         return resolve_agent_for_pane(self.adapter, pane, agent, default=default)
@@ -406,6 +456,7 @@ class TmuxControlPlane:
     def stack_add(
         self, base: str, *, cwd: str | None = None, session: str = "main", focus: bool = True
     ) -> str:
+        """Add a new pane to a stack base; return its public id or 'unresolved'."""
         from .stack import add_stack_pane
 
         pane_id = add_stack_pane(self.adapter, session, base, cwd=cwd, focus=focus)
@@ -421,6 +472,7 @@ class TmuxControlPlane:
         focus: bool = True,
         settle_seconds: float = 0.5,
     ) -> str:
+        """Add a stack pane and dispatch a command into it; return its public id."""
         from .stack import dispatch_stack_command
 
         pane_id = dispatch_stack_command(
@@ -443,6 +495,7 @@ class TmuxControlPlane:
         session: str = "main",
         focus: bool = True,
     ) -> str:
+        """Adopt an existing pane into a stack base under focus preservation."""
         from .focus_guard import preserve_focus
         from .stack import add_stack_pane
 
@@ -465,6 +518,7 @@ class TmuxControlPlane:
         admit: bool = False,
         kill_pending_clear: bool = False,
     ) -> str:
+        """Enforce the canonical stack layout for a pane's or window's session."""
         from .stack import enforce_stack_layout
 
         if window:
@@ -485,16 +539,19 @@ class TmuxControlPlane:
         )
 
     def stack_sweep(self, *, session: str = "main", kill_pending_clear: bool = True) -> str:
+        """Sweep all stacks in a session, asserting their layout invariants."""
         from .stack import sweep_stack_assertions
 
         return sweep_stack_assertions(self.adapter, session, kill_pending_clear=kill_pending_clear)
 
     def legion_focus_selected(self, pane: str = "current") -> str:
+        """Focus the currently selected pane within its legion stack."""
         from .stack import focus_selected
 
         return focus_selected(self.adapter, self._resolve_current(pane))
 
     def legion_enforce(self, pane: str = "current") -> str:
+        """Enforce the stack layout for a pane's window and focus that pane."""
         from .stack import enforce_stack_layout
 
         resolved = self._resolve_current(pane)
@@ -506,11 +563,13 @@ class TmuxControlPlane:
     def mechanicus_focus_guard(
         self, *, pane: str = "", client: str = "", surface: str = "after-select"
     ) -> dict:
+        """Remember the prior focus or bounce a stray focus back (focus guard)."""
         from .focus_guard import remember_or_bounce
 
         return remember_or_bounce(self.adapter, pane=pane, client=client, surface=surface)
 
     def allow_mechanicus_focus(self, *, seconds: float = 4.0, reason: str = "explicit") -> float:
+        """Temporarily allow mechanicus-initiated focus changes; return the deadline."""
         from .focus_guard import allow_temporarily
 
         return allow_temporarily(self.adapter, seconds=seconds, reason=reason, actor="tmuxctld")
@@ -518,12 +577,14 @@ class TmuxControlPlane:
     def allow_human_mechanicus_focus(
         self, *, client: str = "", reason: str = "explicit-human-navigation"
     ) -> str:
+        """Allow human-initiated focus changes for a client through the focus guard."""
         from .focus_guard import allow_human_focus
 
         allow_human_focus(self.adapter, client=client, reason=reason, actor="tmuxctld")
         return "ok"
 
     def pane_select(self, *, mode: str, direction: str, client: str = "") -> str:
+        """Select a pane by mode and direction (stack-aware navigation)."""
         from .pane_select import select_pane
 
         return select_pane(self.adapter, mode=mode, direction=direction, client=client)
@@ -537,6 +598,7 @@ class TmuxControlPlane:
     # ------------------------------------------------------------------
 
     def instance_show_option(self, instance_id: str, option: str) -> dict:
+        """Read a pane option on an instance's live pane; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False, "option": option, "value": ""}
@@ -549,6 +611,7 @@ class TmuxControlPlane:
         }
 
     def instance_set_option(self, instance_id: str, option: str, value: str) -> dict:
+        """Set a pane option on an instance's live pane; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False, "option": option}
@@ -562,6 +625,7 @@ class TmuxControlPlane:
         }
 
     def instance_unset_option(self, instance_id: str, option: str) -> dict:
+        """Unset a pane option on an instance's live pane; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False, "option": option}
@@ -571,6 +635,7 @@ class TmuxControlPlane:
     def instance_send_text(
         self, instance_id: str, text: str, *, clear_prompt: bool = False, submit: bool = True
     ) -> dict:
+        """Deliver text to an instance's live pane; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False}
@@ -581,6 +646,7 @@ class TmuxControlPlane:
         return {"instance_id": instance_id, "found": True, "status": "submitted"}
 
     def instance_tint(self, instance_id: str, color: str) -> dict:
+        """Tint an instance's live pane background; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False}
@@ -593,6 +659,7 @@ class TmuxControlPlane:
         return {"instance_id": instance_id, "found": True, "tint": bg}
 
     def instance_clear_tint(self, instance_id: str) -> dict:
+        """Clear the tint on an instance's live pane; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False}
@@ -600,6 +667,7 @@ class TmuxControlPlane:
         return {"instance_id": instance_id, "found": True, "tint": "default"}
 
     def instance_focus(self, instance_id: str, *, allow: bool = False, client: str = "") -> dict:
+        """Focus an instance's live pane; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False}

@@ -74,6 +74,8 @@ def _serve(adapter_factory):
         ("127.0.0.1", 0), adapter_factory=adapter_factory, version="t", sha="t"
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    # Gate on the real ready event — no sleep-based race before hitting endpoints.
+    assert server.ready.wait(timeout=5), "server thread never signalled ready"
     return server
 
 
