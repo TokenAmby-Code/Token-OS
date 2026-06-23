@@ -48,6 +48,8 @@ INSTANCE_MUTATION_FIELDS = {
     "notification_mode",
     "interaction_mode",
     "golden_throne",
+    "human_anchored_at",
+    "human_anchor_source",
     "session_doc_id",
     "continuity_binding_source",
     "wrapper_launch_id",
@@ -393,6 +395,12 @@ async def sanctioned_update_instance(
 ) -> dict:
     if not updates:
         raise ValueError("no fields to update")
+    if updates.get("status") in {"stopped", "archived"}:
+        updates = {
+            **updates,
+            "human_anchored_at": None,
+            "human_anchor_source": None,
+        }
     before_row = await _fetch_instance_row(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
@@ -466,6 +474,12 @@ def sanctioned_update_instance_sync(
 ) -> dict:
     if not updates:
         raise ValueError("no fields to update")
+    if updates.get("status") in {"stopped", "archived"}:
+        updates = {
+            **updates,
+            "human_anchored_at": None,
+            "human_anchor_source": None,
+        }
     before_row = _fetch_instance_row_sync(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")

@@ -78,6 +78,30 @@ def mark_cron_instance_stopped(instance_id: str):
         print(f"[warn] Could not mark cron instance stopped: {e}", file=sys.stderr)
 
 
+def clear_human_anchor_on_stop(instance_id: str) -> None:
+    """Defensively clear AUQ human-time anchors when a Stop hook fires."""
+    try:
+        con = sqlite3.connect(str(DB_PATH))
+        try:
+            sanctioned_update_instance_sync(
+                con,
+                instance_id=instance_id,
+                updates={
+                    "human_anchored_at": None,
+                    "human_anchor_source": None,
+                },
+                mutation_type="instance_updated",
+                write_source="stop_hook",
+                actor="stop-hook:clear-human-anchor",
+            )
+        except LookupError:
+            pass
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"[warn] Could not clear human anchor on stop: {e}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Tool summarization
 # ---------------------------------------------------------------------------
@@ -789,6 +813,8 @@ def main():
     # Mutex: cron instances must be explicitly marked stopped
     if instance and instance.get("origin_type") == "cron":
         mark_cron_instance_stopped(session_id)
+    else:
+        clear_human_anchor_on_stop(session_id)
 
     tab_name = instance.get("tab_name", session_id[:8]) if instance else session_id[:8]
 

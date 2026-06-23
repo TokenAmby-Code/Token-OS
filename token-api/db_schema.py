@@ -111,6 +111,8 @@ async def _create_instances_table(db) -> None:
             interaction_mode TEXT NOT NULL DEFAULT 'text'
                 CHECK(interaction_mode IN ('text','voice_chat')),
             golden_throne TEXT,
+            human_anchored_at TIMESTAMP,
+            human_anchor_source TEXT,
             -- ── RUNTIME ANNEX (transitional) ─────────────────────────────
             -- Inherited verbatim from the extracted claude_instances table so
             -- exterminatus could land without redesigning every subsystem.
