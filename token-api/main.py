@@ -5866,8 +5866,8 @@ async def compute_work_state() -> WorkStateResponse:
             except Exception:
                 continue
 
-        # Widen to LIMIT 5 (was 1) so an interleaved human work_action still
-        # anchors even when the most-recent row is a discounted automated wake.
+        # Scan the bounded supervisory window so newer discounted automated
+        # wakes cannot hide an earlier non-discounted human work_action.
         recent_work_action_cursor = await db.execute(
             """
             SELECT
@@ -5878,7 +5878,6 @@ async def compute_work_state() -> WorkStateResponse:
             WHERE event_type = 'work_action'
               AND datetime(created_at) >= datetime('now', ?)
             ORDER BY created_at DESC
-            LIMIT 5
             """,
             (f"-{SUPERVISORY_HUMAN_WORK_ACTION_WINDOW_SECONDS} seconds",),
         )
@@ -16293,11 +16292,14 @@ async def _resolve_work_action_attribution(
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT COALESCE(hook_driven, 0) AS hook_driven FROM instances WHERE id = ?",
+                "SELECT status, COALESCE(hook_driven, 0) AS hook_driven "
+                "FROM instances WHERE id = ?",
                 (session_id,),
             )
             row = await cursor.fetchone()
             if row is None:
+                return (None, False)
+            if row["status"] in {"stopped", "archived"}:
                 return (None, False)
             # A human keystroke overrides every discount (mirrors compute_work_state:
             # tmux-typing-guard source + a hot global typing guard are never
@@ -19886,9 +19888,24 @@ async def timer_worker():
         try:
             await asyncio.sleep(1)
             now_ms = int(time.monotonic() * 1000)
-            now = datetime.now()
-            today = now.strftime("%Y-%m-%d")
-            current_hour = now.hour
+            now_dt = datetime.now()
+            today = now_dt.strftime("%Y-%m-%d")
+            current_hour = now_dt.hour
+            now_epoch = time.time()
+
+            # Refresh the shared idle-timeout exemption before tick() can cross
+            # the IDLE→IDLE_BREAK boundary. Reuse this work_state below for the
+            # 10s productivity update so compute_work_state remains single-shot
+            # per poll interval.
+            location_zone = DESKTOP_STATE.get("location_zone")
+            work_state_for_productivity: WorkStateResponse | None = None
+            if now_epoch - last_db_save >= 10:  # piggyback on DB save interval
+                work_state_for_productivity = await compute_work_state()
+                work_idle_timeout_exempt = work_state_for_productivity.idle_timeout_exempt
+            timer_engine.idle_timeout_exempt = (
+                location_zone == "campus"
+            ) or work_idle_timeout_exempt
+
             result = timer_engine.tick(now_ms, today, current_hour)
 
             # Handle events (some events come paired with MODE_CHANGED — handle specially)
@@ -20072,25 +20089,12 @@ async def timer_worker():
             # as lower assertion confidence; the source is cleared only by explicit
             # close/new-app telemetry or an intentional correction endpoint.
 
-            now = time.time()
-
-            # Update idle_timeout_exempt from location OR the shared human
-            # supervision predicate computed by compute_work_state.
-            # NOTE: work_mode is manual-only now (user clocks in/out explicitly).
-            # Location-based exemptions still apply (e.g., campus = studying).
-            location_zone = DESKTOP_STATE.get("location_zone")
-            timer_engine.idle_timeout_exempt = (
-                location_zone == "campus"
-            ) or work_idle_timeout_exempt
+            now = now_epoch
 
             # Productivity layer update (every 10s) — poll DB for active instances
-            if now - last_db_save >= 10:  # piggyback on DB save interval
-                work_state = await compute_work_state()
+            if work_state_for_productivity is not None:
+                work_state = work_state_for_productivity
                 productivity_active = work_state.productivity_active
-                work_idle_timeout_exempt = work_state.idle_timeout_exempt
-                timer_engine.idle_timeout_exempt = (
-                    location_zone == "campus"
-                ) or work_idle_timeout_exempt
 
                 # Feed per-class active counts for shadow accrual (billable vs
                 # personal). Pure accounting input — does not affect enforcement.

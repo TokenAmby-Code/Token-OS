@@ -395,7 +395,8 @@ async def sanctioned_update_instance(
 ) -> dict:
     if not updates:
         raise ValueError("no fields to update")
-    if updates.get("status") in {"stopped", "archived"}:
+    force_clear_human_anchor = updates.get("status") in {"stopped", "archived"}
+    if force_clear_human_anchor:
         updates = {
             **updates,
             "human_anchored_at": None,
@@ -405,7 +406,9 @@ async def sanctioned_update_instance(
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
 
-    tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
+    tracked = set(tracked_fields) if tracked_fields is not None else set(INSTANCE_MUTATION_FIELDS)
+    if force_clear_human_anchor:
+        tracked.update({"human_anchored_at", "human_anchor_source"})
     changed_fields = []
     for field, value in updates.items():
         if field in tracked and before_row.get(field) != value:
@@ -474,7 +477,8 @@ def sanctioned_update_instance_sync(
 ) -> dict:
     if not updates:
         raise ValueError("no fields to update")
-    if updates.get("status") in {"stopped", "archived"}:
+    force_clear_human_anchor = updates.get("status") in {"stopped", "archived"}
+    if force_clear_human_anchor:
         updates = {
             **updates,
             "human_anchored_at": None,
@@ -484,7 +488,9 @@ def sanctioned_update_instance_sync(
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
 
-    tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
+    tracked = set(tracked_fields) if tracked_fields is not None else set(INSTANCE_MUTATION_FIELDS)
+    if force_clear_human_anchor:
+        tracked.update({"human_anchored_at", "human_anchor_source"})
     changed_fields = []
     for field, value in updates.items():
         if field in tracked and before_row.get(field) != value:
