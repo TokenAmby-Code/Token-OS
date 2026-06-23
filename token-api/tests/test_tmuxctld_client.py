@@ -12,6 +12,7 @@ Coverage maps to the carried-forward CodeRabbit findings:
 """
 
 import asyncio
+import json
 import pathlib
 import subprocess
 import sys
@@ -81,8 +82,9 @@ def _warm(server, path: str) -> None:
     """
     url = f"{_url_for(server)}{path}"
     with urllib.request.urlopen(url, timeout=30) as resp:
-        body = resp.read()
-    assert resp.status == 200 and b'"ok": true' in body, f"warm-up failed: {body!r}"
+        status = resp.status
+        payload = json.loads(resp.read().decode("utf-8"))
+    assert status == 200 and payload.get("ok") is True, f"warm-up failed: {payload}"
 
 
 def test_resolve_instance_pane_prefers_tmuxctld_live(app_env, monkeypatch) -> None:
