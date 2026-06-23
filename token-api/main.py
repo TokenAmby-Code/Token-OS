@@ -10028,6 +10028,10 @@ async def get_synced_session(legion: str) -> dict:
             row = await resolve_live_persona_instance(db, "custodes")
         if not row:
             return {"legion": legion, "synced_session": None}
+        # Pane is live-resolved from the oracle (transient response field) so the
+        # Custodes branch returns the same shape as the sync-mode branch below;
+        # clients can't tell "no live pane" from "field absent".
+        pane, _role = await shared.resolve_instance_pane(row.get("id"))
         return {
             "legion": legion,
             "synced_session": {
@@ -10036,6 +10040,7 @@ async def get_synced_session(legion: str) -> dict:
                 "status": row.get("status"),
                 "rank": row.get("rank"),
                 "legion": legion,
+                "tmux_pane": pane,
             },
         }
 
@@ -20561,20 +20566,24 @@ async def clear_stale_processing_flags() -> None:
                                 "Golden Throne: failed to schedule dead-pane follow-up "
                                 f"for {stopped.get('id', '')[:12]}: {exc}"
                             )
-                    for stale_idle in stale_idle_instances:
-                        marker = stale_idle.get("golden_throne")
-                        if not marker or marker == "sync":
-                            continue
-                        stale_idle["status"] = "idle"
-                        try:
-                            await schedule_golden_throne_followup(
-                                stale_idle, reason="clear-stale-processing"
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Golden Throne: failed to schedule stale-processing follow-up "
-                                f"for {stale_idle.get('id', '')[:12]}: {exc}"
-                            )
+                # Stale-idle Golden Throne follow-ups are independent of dead-pane
+                # stops — a working->idle GT row must get its follow-up even when no
+                # dead pane was swept in this pass, so this loop is NOT nested under
+                # `if stopped_dead_panes`.
+                for stale_idle in stale_idle_instances:
+                    marker = stale_idle.get("golden_throne")
+                    if not marker or marker == "sync":
+                        continue
+                    stale_idle["status"] = "idle"
+                    try:
+                        await schedule_golden_throne_followup(
+                            stale_idle, reason="clear-stale-processing"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Golden Throne: failed to schedule stale-processing follow-up "
+                            f"for {stale_idle.get('id', '')[:12]}: {exc}"
+                        )
 
             await asyncio.sleep(60)  # Run every minute
 
@@ -21008,6 +21017,7 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None) -> 
                  AND i.commander_type != 'chapter'
                  AND i.status NOT IN ('stopped', 'archived')
                  AND i.stopped_at IS NULL
+                 AND i.device_id = ?
                ORDER BY
                  CASE i.rank
                    WHEN 'primarch' THEN 3
@@ -21018,7 +21028,8 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None) -> 
                  i.last_activity DESC,
                  i.created_at DESC,
                  i.id DESC
-               LIMIT 1"""
+               LIMIT 1""",
+            (LOCAL_DEVICE_NAME,),
         )
         row = await cursor.fetchone()
 

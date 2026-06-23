@@ -2928,6 +2928,11 @@ async def handle_session_start(payload: dict) -> dict:
                 # this instance's @INSTANCE_ID currently lives BEFORE re-stamping,
                 # so the vacate/unstamp targets the real old pane.
                 old_tmux_pane, _ = await shared.resolve_instance_pane(session_id)
+                # Effective pane: a paneless re-fire (no live TMUX_PANE in the
+                # payload) means nothing moved — the instance is still on
+                # `old_tmux_pane`, so stamp/tint operate on it rather than zeroing a
+                # valid live stamp/tint. Mirrors the supplant branch's target pane.
+                target_pane = tmux_pane or old_tmux_pane
 
                 # Same-ID transplant (--continue): update the existing row in-place.
                 # pid died with legacy instance table; the commander edge (legacy
@@ -3007,7 +3012,7 @@ async def handle_session_start(payload: dict) -> dict:
                     parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
-                await _stamp_instance_id(tmux_pane, session_id, display_name=existing_row["name"])
+                await _stamp_instance_id(target_pane, session_id, display_name=existing_row["name"])
                 # Only vacate the old pane when a NEW addressable pane was actually
                 # stamped. A blank `tmux_pane` (in-wrapper re-fire arriving with no
                 # live TMUX_PANE) means nothing moved — the instance is still on
@@ -3035,7 +3040,7 @@ async def handle_session_start(payload: dict) -> dict:
                 auto_subscription = await _auto_subscribe_parent_on_start(
                     db,
                     child_instance_id=session_id,
-                    child_pane=tmux_pane,
+                    child_pane=target_pane,
                     parent_instance_id=_effective_parent(existing_parent_id),
                 )
                 if auto_subscription:
@@ -3054,13 +3059,13 @@ async def handle_session_start(payload: dict) -> dict:
                 # → personas.pane_tint (no recolor queue).
                 # Tint is cosmetic — best-effort, never fail registration on it.
                 try:
-                    if old_tmux_pane and old_tmux_pane != tmux_pane:
+                    if old_tmux_pane and old_tmux_pane != target_pane:
                         await asyncio.to_thread(
                             shared.clear_pane_tint, old_tmux_pane, source="transplant-vacate"
                         )
-                    if tmux_pane:
+                    if target_pane:
                         await shared.apply_instance_pane_tint(
-                            db, session_id, tmux_pane, source="transplant"
+                            db, session_id, target_pane, source="transplant"
                         )
                 except Exception as exc:
                     logger.warning(
@@ -3470,13 +3475,13 @@ async def handle_session_start(payload: dict) -> dict:
                 # → personas.pane_tint (no recolor queue).
                 # Tint is cosmetic — best-effort, never fail registration on it.
                 try:
-                    if old_tmux_pane and old_tmux_pane != tmux_pane:
+                    if old_tmux_pane and old_tmux_pane != target_tmux_pane:
                         await asyncio.to_thread(
                             shared.clear_pane_tint, old_tmux_pane, source="supplant-vacate"
                         )
-                    if tmux_pane:
+                    if target_tmux_pane:
                         await shared.apply_instance_pane_tint(
-                            db, session_id, tmux_pane, source="supplant"
+                            db, session_id, target_tmux_pane, source="supplant"
                         )
                 except Exception as exc:
                     logger.warning(
