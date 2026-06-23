@@ -46,21 +46,48 @@ def _persona_id(db_path, slug):
     return row[0] if row else None
 
 
-def _insert_singleton(db_path, instance_id, persona_slug, *, rank="overseer", status="working"):
+def _seed_instance(db_path, instance_id, *, persona_id=None, rank="astartes", status="working"):
+    """Seed an instances row through the sanctioned write layer (not raw SQL).
+
+    Per the sanctioned-write policy, new instance-row writes go through
+    sanctioned_insert_instance_sync(); it filters the values dict through
+    INSTANCE_COLUMNS, so only the columns supplied here are persisted (no tmux
+    runtime fields). The raw `persona_id = NULL` UPDATEs in the tests below stay
+    raw on purpose — they bypass the service layer to exercise the DB trigger.
+    """
+    from instance_mutation import sanctioned_insert_instance_sync
+
     conn = sqlite3.connect(db_path)
-    persona_id = conn.execute("SELECT id FROM personas WHERE slug = ?", (persona_slug,)).fetchone()[
-        0
-    ]
-    conn.execute(
-        """INSERT INTO instances
-           (id, name, engine, working_dir, device_id, origin_type, commander_type,
-            commander_id, status, created_at, last_activity, persona_id, rank)
-           VALUES (?, ?, 'claude', '/tmp', 'Mac-Mini', 'local', 'emperor',
-                   NULL, ?, '2026-06-23T09:00:00', '2026-06-23T09:00:00', ?, ?)""",
-        (instance_id, instance_id, status, persona_id, rank),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        sanctioned_insert_instance_sync(
+            conn,
+            values={
+                "id": instance_id,
+                "name": instance_id,
+                "engine": "claude",
+                "working_dir": "/tmp",
+                "device_id": "Mac-Mini",
+                "origin_type": "local",
+                "commander_type": "emperor",
+                "commander_id": None,
+                "status": status,
+                "created_at": "2026-06-23T09:00:00",
+                "last_activity": "2026-06-23T09:00:00",
+                "persona_id": persona_id,
+                "rank": rank,
+            },
+            mutation_type="instance_registered",
+            write_source="api",
+            actor="test-seed",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_singleton(db_path, instance_id, persona_slug, *, rank="overseer", status="working"):
+    persona_id = _persona_id(db_path, persona_slug)
+    _seed_instance(db_path, instance_id, persona_id=persona_id, rank=rank, status=status)
     return persona_id
 
 
@@ -136,15 +163,8 @@ def test_failsafe_allows_rebind_to_a_real_persona(app_env: SimpleNamespace) -> N
 
 def test_failsafe_inert_when_no_prior_binding(app_env: SimpleNamespace) -> None:
     """A row that never had a persona is unaffected (NULL → NULL is not a clobber)."""
+    _seed_instance(app_env.db_path, "no-persona", persona_id=None, rank="astartes")
     conn = sqlite3.connect(app_env.db_path)
-    conn.execute(
-        """INSERT INTO instances
-           (id, name, engine, working_dir, device_id, origin_type, commander_type,
-            commander_id, status, created_at, last_activity, persona_id, rank)
-           VALUES ('no-persona', 'no-persona', 'claude', '/tmp', 'Mac-Mini', 'local',
-                   'emperor', NULL, 'working', '2026-06-23T09:00:00',
-                   '2026-06-23T09:00:00', NULL, 'astartes')""",
-    )
     conn.execute("UPDATE instances SET persona_id = NULL WHERE id = 'no-persona'")
     conn.commit()
     conn.close()
@@ -197,25 +217,18 @@ def test_pax_sessionstart_civic_legion_binds_persona_not_null(
     assert _persona_slug(app_env.db_path, "pax-reg") == "pax"
 
 
-def test_legion_endpoint_civic_preserves_bound_singleton_persona(
+def test_orchestrator_sessionstart_civic_legion_binds_persona_not_null(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PATCH /legion {"legion":"civic"} on a bound pax row must not null the slug.
+    """koronus:orchestrator registers under legion=civic but binds via primarch.
 
-    civic is an ALLOWED_LEGION with no persona mapping; the endpoint must leave the
-    existing persona binding intact rather than clobbering it.
+    Same invariant as pax: the shared civic legion label must never drive a
+    persona-nulling write — the row binds to the `orchestrator` persona.
     """
-    import httpx
-    from httpx import ASGITransport
+    hooks = sys.modules["routes.hooks"]
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:orchestrator"))
+    _no_pane_occupant(monkeypatch, hooks)
 
-    main = app_env.main
-    _insert_singleton(app_env.db_path, "pax-patch", "pax")
-
-    async def run():
-        transport = ASGITransport(app=main.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            return await client.patch("/api/instances/pax-patch/legion", json={"legion": "civic"})
-
-    resp = asyncio.run(run())
-    assert resp.status_code == 200
-    assert _persona_slug(app_env.db_path, "pax-patch") == "pax"
+    result = _start_session(hooks, "orch-reg")
+    assert result["success"] is True
+    assert _persona_slug(app_env.db_path, "orch-reg") == "orchestrator"
