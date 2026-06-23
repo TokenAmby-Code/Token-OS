@@ -124,7 +124,7 @@ def _run(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
         env=env,
-        timeout=5,
+        timeout=15,  # widened for CPU contention under parallel runs
         check=False,
     )
 

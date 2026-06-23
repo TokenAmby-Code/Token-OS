@@ -107,7 +107,8 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --timeout=120 --tb=short)
           fi
           if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
-            (cd cli-tools && uv run --python 3.11 --group dev pytest --timeout=120 --tb=short)
+            # -n0 overrides the addopts parallel default; cli-tools stays serial on CI (contended runner unverified for parallel).
+            (cd cli-tools && uv run --python 3.11 --group dev pytest -n0 --timeout=120 --tb=short)
           fi
 
       - name: CodeRabbit PR gate

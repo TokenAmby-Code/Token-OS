@@ -22,6 +22,21 @@ lockfile-pinned ruff CI uses (no floating `uvx`). So local edits are byte-identi
 to the gate and format drift never reaches CI. `worktree-setup` installs the
 pre-commit hook and syncs both projects' dev venvs.
 
+### Running tests locally
+
+Both suites default to **parallel** locally via `addopts = "-n auto --dist loadfile"`
+in each `pyproject.toml` `[tool.pytest.ini_options]` — a bare `pytest` (or an agent
+session that shells out to it) gets the xdist speedup for free, no `-n` flag to remember.
+
+- **token-api** runs parallel everywhere — local *and* CI (the CI commands already pass
+  `-n auto --dist loadfile` explicitly; the addopts is a harmless duplicate).
+- **cli-tools** runs parallel **locally** but is pinned **serial on CI** via an explicit
+  `pytest -n0 …` in all three workflows (the contended GH runner is unverified for
+  cli-tools parallel, so CI keeps the proven serial behavior).
+- To **debug**, disable parallelism with `pytest -n0` (required for `pdb`, `-s`, and
+  reliable single-test runs). Removing the `addopts` line reverts that suite to
+  serial-default — a local-only knob, independent of branch protection.
+
 ## Branch protection (main)
 
 Required status checks: **`quality`** (pr.yml) + **`secrets-scan`**. The advisory

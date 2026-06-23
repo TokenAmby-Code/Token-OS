@@ -72,3 +72,4 @@ exclude = ["tests/"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "-n auto --dist loadfile"  # local runs default to parallel; use `-n0` to disable (pdb/-s)

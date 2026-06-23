@@ -45,7 +45,9 @@ def _bridge_env(tmp_path: pathlib.Path, state: str) -> tuple[dict[str, str], pat
 
 
 def _wait_for_approver(approve_log: pathlib.Path) -> None:
-    for _ in range(20):
+    # ~10s retry budget (was ~1s); widened so CPU contention under parallel runs
+    # cannot exhaust the poll before the approver writes.
+    for _ in range(200):
         if approve_log.exists() and approve_log.read_text().strip():
             break
         time.sleep(0.05)
