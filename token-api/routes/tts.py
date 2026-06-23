@@ -83,16 +83,20 @@ router = APIRouter()
 # Set by init_deps() called from main.py after import.
 
 _send_to_phone = None
+_custodes_state_event_handler = None
+TTS_LANGUISHING_THRESHOLD = 5
 
 
-def init_deps(*, send_to_phone=None):
+def init_deps(*, send_to_phone=None, custodes_state_event_handler=None):
     """Receive dependencies from main.py to avoid circular imports.
 
     Called once during app startup, before any requests are served.
     """
-    global _send_to_phone
+    global _send_to_phone, _custodes_state_event_handler
     if send_to_phone is not None:
         _send_to_phone = send_to_phone
+    if custodes_state_event_handler is not None:
+        _custodes_state_event_handler = custodes_state_event_handler
 
 
 # ============ Pydantic Models ============
@@ -1245,6 +1249,9 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             pause_queue.append(item)
             position = len(pause_queue)
 
+    if queue_target == "pause":
+        await _maybe_emit_tts_languishing_enforcement(position=position, item=item)
+
     # Log queued event
     await log_event(
         "tts_queued",
@@ -1274,6 +1281,48 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         "voice": voice,
         "sound": sound,
     }
+
+
+async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQueueItem) -> None:
+    """Escalate when the manually-played TTS pause queue starts languishing.
+
+    Pause-queue length above the threshold means speech is accumulating but not
+    being heard. That is an attention failure, so emit a recognized enforcement
+    state event to the Custodes/Administratum hook path. The state-event router
+    owns dedupe; this helper stays best-effort and never blocks queueing.
+    """
+    if position <= TTS_LANGUISHING_THRESHOLD or _custodes_state_event_handler is None:
+        return
+
+    payload = {
+        "app": "tts_queue",
+        "queue": "pause",
+        "pause_queue_length": position,
+        "threshold": TTS_LANGUISHING_THRESHOLD,
+        "latest_instance_id": item.instance_id,
+        "latest_tab_name": item.tab_name,
+        "oldest_queued_at": pause_queue[0].queued_at.isoformat() if pause_queue else None,
+    }
+    try:
+        await _custodes_state_event_handler(
+            "tts_queue_languishing",
+            "tts_queue",
+            instance_id=item.instance_id,
+            severity=4 if position >= 10 else 3,
+            payload=payload,
+            event_class="enforcement",
+        )
+    except Exception as exc:
+        logger.warning("TTS languishing enforcement emit failed: %s", exc)
+        try:
+            await log_event(
+                "tts_languishing_enforcement_failed",
+                instance_id=item.instance_id,
+                device_id="tts_queue",
+                details={"error": str(exc), **payload},
+            )
+        except Exception:
+            pass
 
 
 def _queue_item_to_dict(item: TTSQueueItem) -> dict:
