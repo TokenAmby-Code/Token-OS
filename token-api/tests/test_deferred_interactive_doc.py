@@ -33,15 +33,14 @@ def _insert_instance(
     dispatch_session_doc_path=None,
     session_doc_id=None,
     status="idle",
-    pane=None,
 ) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO instances
            (id, name, device_id, origin_type, commander_type, persona_id,
             is_subagent, automated, golden_throne, dispatch_session_doc_path,
-            session_doc_id, status, rank, tmux_pane)
-           VALUES (?, ?, 'Mac-Mini', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'astartes', ?)""",
+            session_doc_id, status, rank)
+           VALUES (?, ?, 'Mac-Mini', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'astartes')""",
         (
             instance_id,
             instance_id,
@@ -54,7 +53,6 @@ def _insert_instance(
             dispatch_session_doc_path,
             session_doc_id,
             status,
-            pane,
         ),
     )
     conn.commit()

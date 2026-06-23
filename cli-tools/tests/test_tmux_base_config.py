@@ -116,6 +116,9 @@ def test_prefix_q_opens_mark_for_close_popup() -> None:
     assert "/api/hooks/subscribe" not in script
     assert "/api/hooks/unsubscribe" in script
     assert "_unsubscribe_mark" in script
+    assert "_begin_atomic_close_contract" in script
+    assert "trap '' INT QUIT TSTP" in script
+    assert "MARK_FOR_CLOSE_OK" in script
     assert "send-text --pane" in script
     assert "kill-pane" not in script
     assert "/retire" not in script
@@ -123,13 +126,18 @@ def test_prefix_q_opens_mark_for_close_popup() -> None:
 
     exit_script = (ROOT / "bin" / "tmux-instance-exit").read_text(encoding="utf-8")
     assert '"$TMUXCTL_BIN" close --instance-id' in exit_script
+    assert "trap '' INT QUIT TSTP" in exit_script
+    assert "CLOSE_CONTRACT_OK" in exit_script
     assert "send-keys C-c" not in exit_script
 
 
 def test_mark_for_close_script_is_committed_executable() -> None:
-    # core.fileMode is false in this repo, so a missing exec bit is not caught by
-    # the working tree; assert the committed git mode is 100755 directly. The
-    # tmux popup runs `tmux-mark-for-close` off PATH and a non-exec file fails.
+    # The canonical bare is core.fileMode=true (this repo ships executables), but
+    # a checkout's working-tree exec bit can still be unreliable on filesystems
+    # that don't honor it (e.g. SMB/NAS shares). So we assert the *committed* git
+    # index mode is 100755 directly — robust regardless of the checkout
+    # filesystem's exec-bit fidelity. The tmux popup runs `tmux-mark-for-close`
+    # off PATH and a non-exec file fails.
     out = subprocess.run(
         ["git", "ls-files", "-s", "bin/tmux-mark-for-close"],
         cwd=ROOT,
@@ -160,6 +168,46 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     # The per-pane border is the sole guard surface now.
     border = _line_starting("set -g pane-border-format ")
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
+
+
+def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> None:
+    """The root-table any-key binding is the sole arming surface for the
+    keystroke-anchored typing lock. It must:
+
+      * stamp the per-pane @TYPING_LOCK_UNTIL on a real keystroke,
+      * KEEP an existing future value (no refresh — "5 min since FIRST
+        keystroke", not since LAST), re-arming only when absent/expired,
+      * source "now" from #{client_activity} (zero-fork; set -F can't expand %s),
+      * pass mouse events through (`send-keys -M`) WITHOUT arming (focus/click
+        must never lock a pane), discriminated by a fresh non-empty #{mouse_x},
+      * faithfully REPLAY the real keystroke with a bare `send-keys`.
+    """
+    line = _line_starting("    set -Fp @TYPING_LOCK_UNTIL ")
+    # No-refresh keep-or-rearm: keep @TYPING_LOCK_UNTIL while it is >= now, else
+    # rearm to client_activity + 300s.
+    assert "#{?#{e|>=:#{@TYPING_LOCK_UNTIL},#{client_activity}}" in line
+    assert "#{e|+:#{client_activity},300}" in line
+    # The kept branch re-writes the SAME value (the proof of no-refresh).
+    assert "},#{@TYPING_LOCK_UNTIL}," in line
+
+    conf = CONF.read_text(encoding="utf-8")
+    assert "bind -n Any {" in conf
+    # Mouse keys are excluded from arming and passed straight through.
+    assert "if -F '#{!=:#{mouse_x},}' {" in conf
+    assert "send-keys -M" in conf
+    # Faithful replay of the matched key: a bare `send-keys` with no args
+    # (tmux re-sends the bound key). Distinct from the `send-keys -M` mouse line.
+    stripped = [ln.strip() for ln in conf.splitlines()]
+    assert "send-keys" in stripped, "the keep branch must replay the key with a bare send-keys"
+
+
+def test_keystroke_lock_enter_clears_lock_and_submits() -> None:
+    """Enter (and tmux's C-m resolution of Return) clears the pane lock and
+    passes the key through to submit. No focus-based clearing exists."""
+    for key in ("Enter", "C-m"):
+        line = _line_starting(f"bind -n {key} ")
+        assert "set -pu @TYPING_LOCK_UNTIL" in line, f"{key} must UNSET the pane lock"
+        assert "send-keys" in line, f"{key} must still pass through (submit)"
 
 
 def test_portable_status_guard_indicator_is_also_per_pane() -> None:

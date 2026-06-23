@@ -25,7 +25,6 @@ def _insert_instance(
     db_path: Any,
     instance_id: str,
     *,
-    tmux_pane: str = "%STORED",
     status: str = "idle",
     legion: str = "astartes",
     tab_name: str = "Worker",
@@ -36,9 +35,9 @@ def _insert_instance(
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, tmux_pane, legion, session_doc_id, hook_driven,
+            instance_type, engine, legion, session_doc_id, hook_driven,
             zealotry)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance_id,
             instance_id,
@@ -49,7 +48,6 @@ def _insert_instance(
             status,
             "sync",
             "claude",
-            tmux_pane,
             legion,
             session_doc_id,
             hook_driven,
@@ -135,7 +133,7 @@ async def test_instance_id_for_pane_blank_pane_is_none(app_env: Any) -> None:
 async def test_rename_by_pane_resolves_via_stamp(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
     # Stored pane intentionally != the live pane the agent reports.
-    _insert_instance(app_env.db_path, "inst-A", tmux_pane="%STALE", tab_name="Old")
+    _insert_instance(app_env.db_path, "inst-A", tab_name="Old")
 
     async def _stamp(pane):
         return "inst-A" if pane == "%LIVE" else None
@@ -153,7 +151,7 @@ async def test_rename_by_pane_resolves_via_stamp(app_env: Any, monkeypatch: Any)
 
 async def test_rename_by_pane_404_when_pane_unstamped(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-A", tmux_pane="%LIVE", tab_name="Old")
+    _insert_instance(app_env.db_path, "inst-A", tab_name="Old")
 
     async def _no_stamp(_pane):
         return None
@@ -176,7 +174,7 @@ async def test_rename_by_pane_404_when_pane_unstamped(app_env: Any, monkeypatch:
 
 async def test_flag_hook_driven_pane_fallback_uses_stamp(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-B", tmux_pane="%STALE", hook_driven=0)
+    _insert_instance(app_env.db_path, "inst-B", hook_driven=0)
 
     async def _stamp(pane):
         return "inst-B" if pane == "%LIVE" else None
@@ -191,7 +189,7 @@ async def test_flag_hook_driven_pane_fallback_uses_stamp(app_env: Any, monkeypat
 async def test_flag_hook_driven_prefers_explicit_id(app_env: Any, monkeypatch: Any) -> None:
     """The id path is unchanged: an explicit instance_id still wins, no stamp read."""
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-B", tmux_pane="%STALE", hook_driven=0)
+    _insert_instance(app_env.db_path, "inst-B", hook_driven=0)
 
     called: list[Any] = []
 
@@ -214,7 +212,7 @@ async def test_flag_hook_driven_prefers_explicit_id(app_env: Any, monkeypatch: A
 
 async def test_pane_instance_route_resolves_via_stamp(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-C", tmux_pane="%STALE", status="idle")
+    _insert_instance(app_env.db_path, "inst-C", status="idle")
 
     async def _stamp(pane):
         return "inst-C" if pane == "%LIVE" else None
@@ -227,7 +225,7 @@ async def test_pane_instance_route_resolves_via_stamp(app_env: Any, monkeypatch:
 
 async def test_pane_instance_route_404_when_unstamped(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-C", tmux_pane="%LIVE", status="idle")
+    _insert_instance(app_env.db_path, "inst-C", status="idle")
 
     async def _no_stamp(_pane):
         return None
@@ -247,7 +245,7 @@ async def test_pane_session_doc_route_resolves_via_stamp(app_env: Any, monkeypat
             (501, "Doc", "/Volumes/Imperium/Imperium-ENV/Mars/Sessions/x.md", "mars"),
         )
         conn.commit()
-    _insert_instance(app_env.db_path, "inst-G", tmux_pane="%STALE", session_doc_id=501)
+    _insert_instance(app_env.db_path, "inst-G", session_doc_id=501)
 
     async def _stamp(pane):
         return "inst-G" if pane == "%LIVE" else None
@@ -269,9 +267,7 @@ async def test_pane_session_doc_404_for_stopped_instance(app_env: Any, monkeypat
             (502, "Doc", "/Volumes/Imperium/Imperium-ENV/Mars/Sessions/y.md", "mars"),
         )
         conn.commit()
-    _insert_instance(
-        app_env.db_path, "inst-Gs", tmux_pane="%STALE", session_doc_id=502, status="stopped"
-    )
+    _insert_instance(app_env.db_path, "inst-Gs", session_doc_id=502, status="stopped")
 
     async def _stamp(pane):
         return "inst-Gs" if pane == "%LIVE" else None
@@ -290,7 +286,7 @@ async def test_pane_session_doc_404_for_stopped_instance(app_env: Any, monkeypat
 
 async def test_pane_sender_is_custodes_via_stamp(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-D", tmux_pane="%STALE", legion="custodes")
+    _insert_instance(app_env.db_path, "inst-D", legion="custodes")
 
     async def _stamp(pane):
         return "inst-D" if pane == "%LIVE" else None
@@ -302,7 +298,7 @@ async def test_pane_sender_is_custodes_via_stamp(app_env: Any, monkeypatch: Any)
 
 async def test_pane_sender_non_custodes_via_stamp(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-D2", tmux_pane="%STALE", legion="mechanicus")
+    _insert_instance(app_env.db_path, "inst-D2", legion="mechanicus")
 
     async def _stamp(pane):
         return "inst-D2" if pane == "%LIVE" else None
@@ -321,7 +317,7 @@ async def test_inject_custodes_singleton_resolves_id_via_stamp(
     app_env: Any, monkeypatch: Any
 ) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-E", tmux_pane="%STALE", legion="custodes")
+    _insert_instance(app_env.db_path, "inst-E", legion="custodes")
 
     async def _find_pane():
         return "%LIVE"
@@ -357,7 +353,7 @@ async def test_stop_instance_clears_tint_on_live_resolved_pane(
     app_env: Any, monkeypatch: Any
 ) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-F", tmux_pane="%STALE", legion="custodes")
+    _insert_instance(app_env.db_path, "inst-F", legion="custodes")
 
     async def _resolve(instance_id):
         return ("%LIVE", "legion:custodes") if instance_id == "inst-F" else (None, None)
@@ -380,7 +376,7 @@ async def test_stop_instance_clears_tint_on_live_resolved_pane(
 
 async def test_stop_instance_no_tint_clear_when_pane_gone(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    _insert_instance(app_env.db_path, "inst-H", tmux_pane="%STALE", legion="custodes")
+    _insert_instance(app_env.db_path, "inst-H", legion="custodes")
 
     async def _gone(_instance_id):
         return (None, None)

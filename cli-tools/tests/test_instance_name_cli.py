@@ -60,7 +60,7 @@ def test_instance_name_cli_posts_tmux_pane_and_name():
         )
     finally:
         server.shutdown()
-        thread.join(timeout=2)
+        thread.join(timeout=15)  # widened for CPU contention under parallel runs
 
     assert proc.returncode == 0, proc.stderr
     assert "Renamed to: anti-archaeology-cli" in proc.stdout

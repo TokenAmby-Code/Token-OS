@@ -9,9 +9,9 @@ civic-keeper instance found broken against the stale live runtime:
   (a) rename  — POST /api/instance/rename (the instance-name CLI's pane-scoped
       route) and PATCH /api/instances/{id}/rename update the `instances` row
       `name`, and the API reflects it.
-  (b) pane-bind — a SessionStart registration that carries a tmux pane persists
-      `instances.tmux_pane` + `pane_label`, and GET /api/instances surfaces them
-      non-null (civic-keeper saw pane=null though @PANE_LABEL was stamped).
+  (b) pane-bind — EXTERMINATED. Pane ids are no longer persisted; the tmuxctl
+      @INSTANCE_ID oracle resolves pane geometry live. The "instances never stores
+      tmux_pane/pane_label" invariant is pinned in test_claude_instances_exterminatus.
   (c) resolve — GET /api/instances/resolve and GET /api/panes/{pane}/instance
       return the live instance out of `instances`.
 
@@ -124,35 +124,14 @@ class TestRenameHitsInstances:
         assert "claude_instances" not in names
 
 
-# ── (b) pane-bind ────────────────────────────────────────────────────────────
-
-
-class TestPaneBindHitsInstances:
-    def test_session_start_pane_bind_persists_to_instances(self, client, app_env):
-        """A SessionStart carrying a pane persists tmux_pane + pane_label onto instances."""
-        instance_id = _session_start(client, tmux_pane="%25", pane_label="palace:NW")
-
-        conn = _db(app_env)
-        row = conn.execute(
-            "SELECT tmux_pane, pane_label FROM instances WHERE id = ?",
-            (instance_id,),
-        ).fetchone()
-        names = _table_names(conn)
-        conn.close()
-        assert row is not None, "pane-bind did not register the instance"
-        assert row["tmux_pane"] == "%25", "tmux_pane did not land on instances"
-        assert row["pane_label"] == "palace:NW", "pane_label did not land on instances"
-        assert "claude_instances" not in names
-
-    def test_list_instances_surfaces_stored_pane_non_null(self, client, app_env):
-        """GET /api/instances surfaces the stored pane non-null after a pane-bind."""
-        instance_id = _session_start(client, tmux_pane="%25", pane_label="palace:NW")
-        resp = client.get("/api/instances")
-        assert resp.status_code == 200, resp.text
-        row = next((r for r in resp.json() if r["id"] == instance_id), None)
-        assert row is not None, "registered instance missing from /api/instances"
-        assert row.get("tmux_pane") == "%25", "/api/instances surfaced a null tmux_pane"
-        assert row.get("pane_label") == "palace:NW"
+# ── (b) pane-bind — EXTERMINATED ─────────────────────────────────────────────
+#
+# The original part (b) pinned the OPPOSITE of the current invariant: that a
+# SessionStart pane-bind PERSISTS instances.tmux_pane/pane_label and GET
+# /api/instances surfaces them. Pane ids are no longer stored — the tmuxctl
+# @INSTANCE_ID oracle resolves pane geometry live — so those tests were deleted.
+# The "instances never carries tmux_pane/pane_label" invariant is pinned by
+# tests/test_claude_instances_exterminatus.py::test_instances_has_runtime_annex_columns.
 
 
 # ── (c) resolve ──────────────────────────────────────────────────────────────

@@ -622,7 +622,6 @@ async def queue_pane_var(
     instance_id: str,
     variable: str,
     value: str | None,
-    tmux_pane: str | None,
 ) -> None:
     """Enqueue one pushed pane @-var via ``pane_state_queue``.
 
@@ -630,12 +629,13 @@ async def queue_pane_var(
     ``pane_state_worker`` stays the only writer of pane options. ``value`` is coerced
     to "" when None so the NOT NULL ``value`` column never aborts the insert; the
     border treats "" as unset (the ``#{?@VAR,…,}`` conditional renders the empty
-    branch). The caller's transaction owns the commit.
+    branch). The caller's transaction owns the commit. No pane id is stored — the
+    worker re-resolves the live pane from ``instance_id`` per drain.
     """
     await db.execute(
-        """INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-           VALUES (?, ?, ?, ?)""",
-        (instance_id, variable, value or "", tmux_pane),
+        """INSERT INTO pane_state_queue (instance_id, variable, value)
+           VALUES (?, ?, ?)""",
+        (instance_id, variable, value or ""),
     )
 
 
@@ -644,37 +644,32 @@ async def push_agnostic_pane_vars(
 ) -> dict[str, str]:
     """Resolve + enqueue the engine-agnostic nametag vars from the canonical row.
 
-    Reads ``persona_id``/``session_doc_id``/``working_dir``/``tmux_pane`` from the
-    freshly-written ``instances`` row (uncommitted writes on the same connection are
-    visible) and enqueues ``@PERSONA``/``@SESSION_DOC``/``@CWD``. Identical for
-    ``engine='codex'`` and ``engine='claude'`` — agnosticism by construction. The
-    stored ``tmux_pane`` is only the queue's bookkeeping column; the worker
-    re-resolves the live pane per row. Best-effort: never raises into a caller in a
-    registration/legion critical section. Returns the resolved values (for tests).
+    Reads ``persona_id``/``session_doc_id``/``working_dir`` from the freshly-written
+    ``instances`` row (uncommitted writes on the same connection are visible) and
+    enqueues ``@PERSONA``/``@SESSION_DOC``/``@CWD``. Identical for ``engine='codex'``
+    and ``engine='claude'`` — agnosticism by construction. No pane id is read or
+    stored; the worker re-resolves the live pane from ``instance_id`` per drain.
+    Best-effort: never raises into a caller in a registration/legion critical
+    section. Returns the resolved values (for tests).
     """
     if not instance_id:
         return {}
     try:
         cursor = await db.execute(
-            "SELECT persona_id, session_doc_id, working_dir, tmux_pane FROM instances WHERE id = ?",
+            "SELECT persona_id, session_doc_id, working_dir FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
         if not row:
             return {}
-        persona_id, session_doc_id, working_dir, tmux_pane = (
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-        )
+        persona_id, session_doc_id, working_dir = (row[0], row[1], row[2])
         values = {
             "@PERSONA": await _persona_display_name(db, persona_id),
             "@SESSION_DOC": await _session_doc_title(db, session_doc_id),
             "@CWD": cwd_basename(working_dir),
         }
         for variable, value in values.items():
-            await queue_pane_var(db, instance_id, variable, value, tmux_pane)
+            await queue_pane_var(db, instance_id, variable, value)
         return values
     except Exception as exc:  # pragma: no cover - defensive, never fail the caller
         logger.warning("push_agnostic_pane_vars failed for %s: %s", instance_id, exc)

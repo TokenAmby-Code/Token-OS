@@ -75,7 +75,7 @@ finally:
     try:
         _tmux("new-session", "-d", "-s", session, sys.executable, "-c", script)
         pane = _tmux("display-message", "-p", "-t", session, "#{pane_id}").stdout.strip()
-        deadline = time.time() + 5
+        deadline = time.time() + 15  # widened for CPU contention under parallel runs
         while time.time() < deadline:
             if "READY" in _tmux("capture-pane", "-t", pane, "-p", check=False).stdout:
                 break
@@ -93,7 +93,7 @@ finally:
 
         # Fixed helper: text, immediate C-m, settle, delayed C-m. This must submit.
         TmuxAdapter().send_text_then_submit(pane, "fixed")
-        deadline = time.time() + 5
+        deadline = time.time() + 15  # widened for CPU contention under parallel runs
         while time.time() < deadline:
             capture = _tmux("capture-pane", "-t", pane, "-p", "-S", "-100", check=False).stdout
             if "SUBMITTED" in capture:

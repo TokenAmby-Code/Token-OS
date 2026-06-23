@@ -6,35 +6,36 @@ from types import SimpleNamespace
 
 import pytest
 
+# instance_id -> live pane, seeded by the test insert helpers. There is no stored
+# tmux_pane column anymore; tmuxctl resolves the pane live by UUID, which the
+# autouse fixture below mimics by reading this in-test map.
+_INSTANCE_PANES: dict[str, str] = {}
+
 
 @pytest.fixture(autouse=True)
 def _stub_instance_pane_resolution(app_env, monkeypatch):
     """tmuxctl owns instance_id -> pane resolution.
 
-    These Golden-Throne tests insert a local instance with a stored ``tmux_pane``
-    and assert the fire dispatches to it. After the Phase-3 reader cutover the
-    fire path resolves the pane live by UUID, so mimic a correctly-stamped live
-    pane here: resolve to the instance's stored ``tmux_pane`` and derive its role
-    via ``_tmux_pane_label`` (which individual tests monkeypatch) — the dual-write
-    reality where the stored pane still matches the live one. Scoped to this file
-    so tests of the real ``resolve_instance_pane`` elsewhere are untouched.
+    These Golden-Throne tests register a local instance's LIVE pane (via the
+    insert helpers, which seed ``_INSTANCE_PANES``) and assert the fire dispatches
+    to it. The fire path resolves the pane live by UUID, so mimic a
+    correctly-stamped live pane here: resolve to the registered pane and derive
+    its role via ``_tmux_pane_label`` (which individual tests monkeypatch).
+    Scoped to this file so tests of the real ``resolve_instance_pane`` elsewhere
+    are untouched.
     """
     main = app_env.main
+    _INSTANCE_PANES.clear()
 
     async def _resolve_instance_pane(instance_id):
-        conn = sqlite3.connect(app_env.db_path)
-        try:
-            row = conn.execute(
-                "SELECT tmux_pane FROM legacy_instances WHERE id = ?", (instance_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-        pane = row[0] if row else None
+        pane = _INSTANCE_PANES.get(instance_id)
         if not pane:
             return (None, None)
         return (pane, await main._tmux_pane_label(pane))
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_instance_pane)
+    yield
+    _INSTANCE_PANES.clear()
 
 
 def _rows(db_path, query, params=()):
@@ -60,8 +61,8 @@ def _insert_gt_instance(db_path, instance_id="gt-dispatch", *, tmux_pane="%10"):
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, tmux_pane, zealotry)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, engine, zealotry)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance_id,
             instance_id,
@@ -72,12 +73,13 @@ def _insert_gt_instance(db_path, instance_id="gt-dispatch", *, tmux_pane="%10"):
             "idle",
             "golden_throne",
             "codex",
-            tmux_pane,
             10,
         ),
     )
     conn.commit()
     conn.close()
+    # Register the instance's live pane for the autouse resolver stub.
+    _INSTANCE_PANES[instance_id] = tmux_pane
 
 
 def test_expected_ack_deadlines_use_compressed_ladder_defaults(app_env):
@@ -991,8 +993,8 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, zealotry, tmux_pane, stopped_at, last_activity)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, engine, zealotry, stopped_at, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             "gt-stopped-shell",
             "gt-stopped-shell",
@@ -1004,13 +1006,13 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
             "golden_throne",
             "codex",
             10,
-            "%132",
             (now - timedelta(minutes=5)).isoformat(),
             (now - timedelta(minutes=5)).isoformat(),
         ),
     )
     conn.commit()
     conn.close()
+    _INSTANCE_PANES["gt-stopped-shell"] = "%132"
 
     recovered = await app_env.main.recover_recent_stopped_golden_throne_timers(
         lookback_minutes=30,
@@ -1040,8 +1042,8 @@ async def test_golden_throne_instance_gone_marks_quiet_edge_handled(app_env, mon
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, zealotry, tmux_pane, stopped_at, last_activity)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, engine, zealotry, stopped_at, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             "gt-instance-gone",
             "gt-instance-gone",
@@ -1053,13 +1055,13 @@ async def test_golden_throne_instance_gone_marks_quiet_edge_handled(app_env, mon
             "golden_throne",
             "codex",
             10,
-            "%404",
             now.isoformat(),
             now.isoformat(),
         ),
     )
     conn.commit()
     conn.close()
+    _INSTANCE_PANES["gt-instance-gone"] = "%404"
 
     await app_env.main._golden_throne_handle_instance_gone("gt-instance-gone", "codex")
 
@@ -1089,8 +1091,8 @@ async def test_golden_throne_followup_skips_disabled_row_before_rubric(app_env, 
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, zealotry, tmux_pane, last_activity)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, engine, zealotry, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             "gt-disabled-before-fire",
             "gt-disabled-before-fire",
@@ -1102,12 +1104,12 @@ async def test_golden_throne_followup_skips_disabled_row_before_rubric(app_env, 
             "one_off",
             "codex",
             0,
-            "%405",
             datetime.now().isoformat(),
         ),
     )
     conn.commit()
     conn.close()
+    _INSTANCE_PANES["gt-disabled-before-fire"] = "%405"
 
     await app_env.main.golden_throne_followup("gt-disabled-before-fire")
 
@@ -1627,6 +1629,17 @@ async def test_quiet_buster_activity_reschedules_only_existing_resume(app_env):
     assert result["resume_rescheduled"] is True
 
 
+def _live_pane(pane_id, instance_id, *, cmd="codex"):
+    return {
+        "pane_id": pane_id,
+        "pane_pid": 1234,
+        "instance_id": instance_id,
+        "pane_label": None,
+        "pane_role": None,
+        "current_command": cmd,
+    }
+
+
 def test_work_state_counts_idle_tracked_instance_as_productive(app_env, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -1634,19 +1647,21 @@ def test_work_state_counts_idle_tracked_instance_as_productive(app_env, monkeypa
         return []
 
     async def tmux_pane_rows():
-        return [("%42", "codex", "/Volumes/Imperium/Pax-ENV", "Codex Pax", "")]
+        return []
 
-    async def pane_exists(pane_id):
-        return pane_id == "%42"
+    # The read model resolves each row's pane live from the oracle; surface the
+    # instance's live agent pane there instead of a stored tmux_pane column.
+    async def live_panes():
+        return [_live_pane("%42", "inst-work-state")]
 
     monkeypatch.setattr(app_env.main, "_detect_tmux_agent_panes", no_observed_agents)
     monkeypatch.setattr(app_env.main, "_tmux_pane_rows", tmux_pane_rows)
-    monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
+    monkeypatch.setattr(app_env.main, "_live_agent_panes", live_panes)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
         """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity, tmux_pane)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             "inst-work-state",
             "session-work-state",
@@ -1656,7 +1671,6 @@ def test_work_state_counts_idle_tracked_instance_as_productive(app_env, monkeypa
             app_env.main.LOCAL_DEVICE_NAME,
             "idle",
             datetime.now().isoformat(),
-            "%42",
         ),
     )
     conn.commit()
@@ -1672,30 +1686,28 @@ def test_work_state_counts_idle_tracked_instance_as_productive(app_env, monkeypa
     assert body["active_instances"][0]["working_dir"] == "/Volumes/Imperium/Pax-ENV"
 
 
-def test_work_state_resolves_noncanonical_tmux_target(app_env, monkeypatch):
+def test_work_state_surfaces_live_resolved_pane_id(app_env, monkeypatch):
     from fastapi.testclient import TestClient
 
     async def no_observed_agents():
         return []
 
     async def tmux_pane_rows():
-        return [("%42", "codex", "/Volumes/Imperium/Pax-ENV", "Codex Pax", "")]
+        return []
 
-    async def pane_exists(pane_id):
-        return pane_id == "main:codex.1"
-
-    async def resolve_pane_id(pane_id):
-        return "%42" if pane_id == "main:codex.1" else None
+    # The oracle owns pane geometry; the read model surfaces whatever pane id it
+    # resolves live (here a non-%N canonical id), never a stored column.
+    async def live_panes():
+        return [_live_pane("main:codex.1", "inst-work-state-noncanonical")]
 
     monkeypatch.setattr(app_env.main, "_detect_tmux_agent_panes", no_observed_agents)
     monkeypatch.setattr(app_env.main, "_tmux_pane_rows", tmux_pane_rows)
-    monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
-    monkeypatch.setattr(app_env.main, "_resolve_tmux_pane_id_for_read_model", resolve_pane_id)
+    monkeypatch.setattr(app_env.main, "_live_agent_panes", live_panes)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
         """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity, tmux_pane)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             "inst-work-state-noncanonical",
             "session-work-state-noncanonical",
@@ -1705,7 +1717,6 @@ def test_work_state_resolves_noncanonical_tmux_target(app_env, monkeypatch):
             app_env.main.LOCAL_DEVICE_NAME,
             "idle",
             datetime.now().isoformat(),
-            "main:codex.1",
         ),
     )
     conn.commit()
@@ -1730,17 +1741,19 @@ def test_work_state_ignores_idle_tracked_instance_without_agent_process(app_env,
     async def tmux_pane_rows():
         return [("%42", "bash", "/Volumes/Imperium/Pax-ENV", "Codex Pax", "")]
 
-    async def pane_exists(pane_id):
-        return pane_id == "%42"
+    # The pane hosts bash, not an agent, so the agent-liveness-gated oracle does
+    # not surface it: the instance resolves to no live pane and is ignored.
+    async def live_panes():
+        return []
 
     monkeypatch.setattr(app_env.main, "_detect_tmux_agent_panes", no_observed_agents)
     monkeypatch.setattr(app_env.main, "_tmux_pane_rows", tmux_pane_rows)
-    monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
+    monkeypatch.setattr(app_env.main, "_live_agent_panes", live_panes)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
         """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity, tmux_pane)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (id, session_id, tab_name, working_dir, origin_type, device_id, status, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             "inst-stale-work-state",
             "session-stale-work-state",
@@ -1750,7 +1763,6 @@ def test_work_state_ignores_idle_tracked_instance_without_agent_process(app_env,
             app_env.main.LOCAL_DEVICE_NAME,
             "idle",
             datetime.now().isoformat(),
-            "%42",
         ),
     )
     conn.commit()

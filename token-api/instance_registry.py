@@ -20,14 +20,6 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-RUNTIME_TMUX_FIELDS = {
-    "tmux_pane",
-    "pane_label",
-    "dispatch_target",
-    "dispatch_window",
-    "dispatch_slot",
-}
-
 IDENTITY_COLUMNS = [
     "id",
     "name",
@@ -56,9 +48,9 @@ IDENTITY_COLUMNS = [
 # Transitional runtime annex (see module docstring). Order matters: it is the
 # physical column order in the CREATE TABLE.
 RUNTIME_ANNEX_COLUMNS = [
-    # tmux/dispatch geometry — dies when @INSTANCE_ID-stamp resolution lands
-    "tmux_pane",
-    "pane_label",
+    # tmux/dispatch geometry — dies when @INSTANCE_ID-stamp resolution lands.
+    # tmux_pane/pane_label are GONE: pane ids are never persisted (too volatile),
+    # the tmuxctl runtime oracle resolves geometry live from @INSTANCE_ID stamps.
     "dispatch_target",
     "dispatch_window",
     "dispatch_mode",
@@ -154,14 +146,6 @@ LEGACY_PERSONA_ALIASES = {
     "koronus:worker": "agentic-worker",
     "mechanicus": "administratum",
 }
-
-
-def assert_no_runtime_tmux_fields(values: dict, *, context: str) -> None:
-    forbidden = RUNTIME_TMUX_FIELDS & set(values.keys())
-    if forbidden:
-        raise ValueError(
-            f"{context} must not persist tmux/runtime ids: " + ", ".join(sorted(forbidden))
-        )
 
 
 def normalize_status(status: str | None) -> str:

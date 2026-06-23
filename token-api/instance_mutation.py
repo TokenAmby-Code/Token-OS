@@ -11,8 +11,6 @@ import aiosqlite
 
 from instance_registry import (
     INSTANCE_COLUMNS,
-    RUNTIME_TMUX_FIELDS,
-    assert_no_runtime_tmux_fields,
     legacy_row_to_instance_values,
     slug_from_legacy,
 )
@@ -69,8 +67,6 @@ INSTANCE_MUTATION_FIELDS = {
     "target_working_dir",
     "launch_mode",
     "launcher",
-    "tmux_pane",
-    "pane_label",
     "follow_up_sop",
     "zealotry",
     "gt_resume_count",
@@ -171,11 +167,6 @@ def _prepare_chapter_commander_sync(db, values: dict) -> dict:
     return values
 
 
-def _assert_no_runtime_tmux_fields(values: dict, *, context: str) -> None:
-    """Fail loudly if a writer tries to persist tmux runtime identity."""
-    assert_no_runtime_tmux_fields(values, context=context)
-
-
 # The dual-write mirror layer (mirror_instance_to_legacy*) died with the
 # legacy instance table extraction: every sanctioned write now lands directly on
 # `instances`, the one physical table.
@@ -225,7 +216,6 @@ async def sanctioned_update_instance_record(
     actor: str,
     wrapper_launch_id: str | None = None,
 ) -> dict:
-    assert_no_runtime_tmux_fields(updates, context="sanctioned_update_instance_record")
     before_row = await _fetch_instance_record(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
@@ -244,122 +234,6 @@ async def sanctioned_update_instance_record(
     write_txn_id = str(uuid.uuid4())
     if changed_fields:
         await _append_instance_mutation(
-            db,
-            instance_id=instance_id,
-            mutation_type=mutation_type,
-            write_source=write_source,
-            actor=actor,
-            wrapper_launch_id=wrapper_launch_id or after_row.get("wrapper_launch_id"),
-            write_txn_id=write_txn_id,
-            field_names=changed_fields,
-            before=_subset_from_row(before_row, changed_fields),
-            after=_subset_from_row(after_row, changed_fields),
-        )
-    return {
-        "write_txn_id": write_txn_id,
-        "changed_fields": changed_fields,
-        "before": before_row,
-        "after": after_row,
-    }
-
-
-async def sanctioned_update_runtime_fields(
-    db,
-    *,
-    instance_id: str,
-    updates: dict,
-    mutation_type: str,
-    write_source: str,
-    actor: str,
-    wrapper_launch_id: str | None = None,
-) -> dict:
-    """Dedicated gate for tmux runtime geometry writes (annex columns).
-
-    General sanctioned updates still refuse tmux fields; pane/dispatch
-    geometry may only flow through here, so every rebind has provenance.
-    """
-    if not updates:
-        raise ValueError("no fields to update")
-    forbidden = set(updates) - RUNTIME_TMUX_FIELDS
-    if forbidden:
-        raise ValueError(
-            "sanctioned_update_runtime_fields only accepts runtime fields: "
-            + ", ".join(sorted(forbidden))
-        )
-    before_row = await _fetch_instance_row(db, instance_id)
-    if before_row is None:
-        raise LookupError(f"Instance not found: {instance_id}")
-
-    changed_fields = [field for field, value in updates.items() if before_row.get(field) != value]
-    assignments = ", ".join(f"{field} = ?" for field in updates)
-    cursor = await db.execute(
-        f"UPDATE instances SET {assignments} WHERE id = ?",
-        [*updates.values(), instance_id],
-    )
-    if cursor.rowcount == 0:
-        raise LookupError(f"Sanctioned runtime update matched no rows for {instance_id}")
-
-    after_row = dict(before_row)
-    after_row.update(updates)
-    write_txn_id = str(uuid.uuid4())
-    if changed_fields:
-        await _append_instance_mutation(
-            db,
-            instance_id=instance_id,
-            mutation_type=mutation_type,
-            write_source=write_source,
-            actor=actor,
-            wrapper_launch_id=wrapper_launch_id or after_row.get("wrapper_launch_id"),
-            write_txn_id=write_txn_id,
-            field_names=changed_fields,
-            before=_subset_from_row(before_row, changed_fields),
-            after=_subset_from_row(after_row, changed_fields),
-        )
-    return {
-        "write_txn_id": write_txn_id,
-        "changed_fields": changed_fields,
-        "before": before_row,
-        "after": after_row,
-    }
-
-
-def sanctioned_update_runtime_fields_sync(
-    db,
-    *,
-    instance_id: str,
-    updates: dict,
-    mutation_type: str,
-    write_source: str,
-    actor: str,
-    wrapper_launch_id: str | None = None,
-) -> dict:
-    """Sync twin of sanctioned_update_runtime_fields."""
-    if not updates:
-        raise ValueError("no fields to update")
-    forbidden = set(updates) - RUNTIME_TMUX_FIELDS
-    if forbidden:
-        raise ValueError(
-            "sanctioned_update_runtime_fields_sync only accepts runtime fields: "
-            + ", ".join(sorted(forbidden))
-        )
-    before_row = _fetch_instance_row_sync(db, instance_id)
-    if before_row is None:
-        raise LookupError(f"Instance not found: {instance_id}")
-
-    changed_fields = [field for field, value in updates.items() if before_row.get(field) != value]
-    assignments = ", ".join(f"{field} = ?" for field in updates)
-    cursor = db.execute(
-        f"UPDATE instances SET {assignments} WHERE id = ?",
-        [*updates.values(), instance_id],
-    )
-    if cursor.rowcount == 0:
-        raise LookupError(f"Sanctioned runtime update matched no rows for {instance_id}")
-
-    after_row = dict(before_row)
-    after_row.update(updates)
-    write_txn_id = str(uuid.uuid4())
-    if changed_fields:
-        _append_instance_mutation_sync(
             db,
             instance_id=instance_id,
             mutation_type=mutation_type,
@@ -523,8 +397,6 @@ async def sanctioned_update_instance(
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
 
-    _assert_no_runtime_tmux_fields(updates, context="sanctioned_update_instance")
-
     tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
     changed_fields = []
     for field, value in updates.items():
@@ -598,8 +470,6 @@ def sanctioned_update_instance_sync(
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
 
-    _assert_no_runtime_tmux_fields(updates, context="sanctioned_update_instance_sync")
-
     tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
     changed_fields = []
     for field, value in updates.items():
@@ -658,7 +528,6 @@ async def sanctioned_insert_instance(
     (legion/profile_name resolve to persona_id, parent_instance_id to a
     chapter commander edge, tts_mode to notification/interaction modes).
     """
-    _assert_no_runtime_tmux_fields(values, context="sanctioned_insert_instance")
     instance_values = _instance_values_from_legacy_row(
         values, await _persona_id_for_row(db, values)
     )
@@ -706,7 +575,6 @@ def sanctioned_insert_instance_sync(
     tracked_fields: set[str] | None = None,
 ) -> dict:
     """Sync twin of sanctioned_insert_instance."""
-    _assert_no_runtime_tmux_fields(values, context="sanctioned_insert_instance_sync")
     instance_values = _instance_values_from_legacy_row(values, _persona_id_for_row_sync(db, values))
     instance_values = _prepare_chapter_commander_sync(db, instance_values)
     if not instance_values.get("id"):
@@ -814,7 +682,7 @@ async def _get_pending_projection(db, instance_id: str) -> dict:
     db.row_factory = aiosqlite.Row
     try:
         cur = await db.execute(
-            "SELECT id, variable, value, tmux_pane FROM pane_state_queue WHERE instance_id = ? ORDER BY id DESC LIMIT 10",
+            "SELECT id, variable, value FROM pane_state_queue WHERE instance_id = ? ORDER BY id DESC LIMIT 10",
             (instance_id,),
         )
         for row in await cur.fetchall():
@@ -940,19 +808,25 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
 
     findings.extend(_collect_state_findings(row))
 
+    # Pane geometry is never stored: resolve it live from the @INSTANCE_ID stamp
+    # via the tmuxctl oracle. A miss/dead/unstamped pane returns None and we skip
+    # projection checks entirely (no pane → nothing to project against).
+    from shared import resolve_instance_pane
+
+    live_pane, _live_role = await resolve_instance_pane(instance_id)
     pending_projection = await _get_pending_projection(db, instance_id)
-    observed_projection = _read_tmux_projection(row.get("tmux_pane"))
+    observed_projection = _read_tmux_projection(live_pane)
     expected_cc_state = row.get("status")
     expected_pane_bg = await persona_tint_for_instance(db, instance_id)
     projection_findings = []
 
-    if row.get("tmux_pane"):
+    if live_pane:
         if not observed_projection["pane_exists"]:
             projection_findings.append(
                 {
                     "category": "projection_drift",
                     "message": "instance tmux pane is missing",
-                    "fields": ["tmux_pane"],
+                    "fields": ["status"],
                 }
             )
         else:

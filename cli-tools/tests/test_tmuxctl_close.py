@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import pathlib
+import signal
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl.close import close_instance, close_pane
+from tmuxctl import close as close_mod
+from tmuxctl.close import close_contract_signal_shield, close_instance, close_pane
+from tmuxctl.liveness import LiveTui
 from tmuxctl.tmux_adapter import TmuxAdapter
 
 
@@ -104,6 +107,98 @@ def test_close_instance_now_delegates_lifecycle_then_pane_close(monkeypatch):
     assert result["close"]["status"] == "already_closed"
 
 
+def _live_tui(pane_id: str = "%9") -> LiveTui:
+    return LiveTui(pane_id=pane_id, pane_pid=14030, agent_pid=15230, agent_command="claude")
+
+
+def _dead_tui(pane_id: str = "%9") -> LiveTui:
+    return LiveTui(pane_id=pane_id, pane_pid=None, agent_pid=None, agent_command=None)
+
+
+def test_close_instance_refuses_retire_while_tui_live(monkeypatch):
+    """Guard: a live TUI on the target pane must fail closed — no retire, no kill."""
+    adapter = FakeCloseAdapter(exists_count=99)
+    calls = []
+
+    monkeypatch.setattr(
+        "tmuxctl.close._http_json",
+        lambda method, path, body=None: calls.append((method, path, body)) or {"ok": True},
+    )
+    monkeypatch.setattr(close_mod, "instance_live_tui", lambda *a, **k: _live_tui())
+
+    result = close_instance(adapter, "iid-1", mode="now", pane="%9", timeout=0)
+
+    assert result["status"] == "refused"
+    assert result["reason"] == "live_tui"
+    assert result["agent_pid"] == 15230
+    # Fail closed: the DB row was never retired and the pane was never killed.
+    assert calls == []
+    assert not any(c[0] == "kill-pane" for c in adapter.commands)
+    assert not any(c[:1] == ("send-keys",) for c in adapter.commands)
+
+
+def test_close_instance_force_kills_then_retires_live_tui(monkeypatch):
+    """--force: kill the live TUI atomically BEFORE retiring the DB row."""
+    adapter = FakeCloseAdapter(exists_count=1)  # present on entry, gone after kill
+    events = []
+
+    def fake_http(method, path, body=None):
+        events.append(("http", method, path))
+        return {"ok": True}
+
+    monkeypatch.setattr("tmuxctl.close._http_json", fake_http)
+    monkeypatch.setattr(close_mod, "instance_live_tui", lambda *a, **k: _live_tui())
+    monkeypatch.setattr(close_mod, "detect_pane_tui", lambda *a, **k: _dead_tui())
+
+    result = close_instance(adapter, "iid-1", mode="now", pane="%9", timeout=0, force=True)
+
+    assert result["status"] == "closed"
+    assert ("kill-pane", "-t", "%9") in adapter.commands
+    assert ("http", "PATCH", "/api/instances/iid-1/retire") in events
+    # Atomic: the proc kill must precede the DB retire.
+    kill_idx = adapter.commands.index(("kill-pane", "-t", "%9"))
+    assert kill_idx >= 0
+    assert events == [("http", "PATCH", "/api/instances/iid-1/retire")]
+
+
+def test_close_instance_force_refuses_when_tui_survives_close(monkeypatch):
+    """If a forced kill fails to clear the TUI, refuse — never retire a live row."""
+    adapter = FakeCloseAdapter(exists_count=99)  # pane never dies
+    calls = []
+
+    monkeypatch.setattr(
+        "tmuxctl.close._http_json",
+        lambda method, path, body=None: calls.append((method, path, body)) or {"ok": True},
+    )
+    monkeypatch.setattr(close_mod, "instance_live_tui", lambda *a, **k: _live_tui())
+    monkeypatch.setattr(close_mod, "detect_pane_tui", lambda *a, **k: _live_tui())
+
+    result = close_instance(adapter, "iid-1", mode="now", pane="%9", timeout=0, force=True)
+
+    assert result["status"] == "refused"
+    assert result["reason"] == "live_tui_survived_close"
+    assert calls == []  # retire never fired
+
+
+def test_close_instance_idle_husk_reaps_clean(monkeypatch):
+    """No live TUI (idle/exited husk): kill the pane, THEN retire — clean reap."""
+    adapter = FakeCloseAdapter(exists_count=1)  # present then gone
+    calls = []
+
+    monkeypatch.setattr(
+        "tmuxctl.close._http_json",
+        lambda method, path, body=None: calls.append((method, path, body)) or {"ok": True},
+    )
+    monkeypatch.setattr(close_mod, "instance_live_tui", lambda *a, **k: None)
+    monkeypatch.setattr(close_mod, "detect_pane_tui", lambda *a, **k: _dead_tui())
+
+    result = close_instance(adapter, "iid-1", mode="now", pane="%9", timeout=0)
+
+    assert result["status"] == "closed"
+    assert calls == [("PATCH", "/api/instances/iid-1/retire", None)]
+    assert ("kill-pane", "-t", "%9") in adapter.commands
+
+
 def test_close_instance_after_stop_posts_mark_for_close(monkeypatch):
     adapter = FakeCloseAdapter()
     calls = []
@@ -165,3 +260,29 @@ def test_respawn_preflight_clears_runtime_and_style_first():
         ("select-pane", "-t", "%9", "-T", ""),
     ]
     assert ("set-option", "-pu", "-t", "%9", "@INSTANCE_ID") in adapter.raw
+
+
+def test_close_contract_signal_shield_ignores_ctrl_c_signals(monkeypatch):
+    calls = []
+
+    def fake_signal(sig, handler):
+        calls.append((sig, handler))
+        return f"old-{sig}"
+
+    monkeypatch.setattr(signal, "signal", fake_signal)
+
+    with close_contract_signal_shield():
+        pass
+
+    ignored = calls[:3]
+    restored = calls[3:]
+    assert ignored == [
+        (signal.SIGINT, signal.SIG_IGN),
+        (signal.SIGQUIT, signal.SIG_IGN),
+        (signal.SIGTSTP, signal.SIG_IGN),
+    ]
+    assert restored == [
+        (signal.SIGINT, f"old-{signal.SIGINT}"),
+        (signal.SIGQUIT, f"old-{signal.SIGQUIT}"),
+        (signal.SIGTSTP, f"old-{signal.SIGTSTP}"),
+    ]

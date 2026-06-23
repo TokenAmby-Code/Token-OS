@@ -1,5 +1,6 @@
 import importlib
 import sqlite3
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -47,8 +48,6 @@ def _install_legacy_instances_test_view(conn):
               i.created_at AS registered_at,
               i.last_activity,
               i.stopped_at,
-              i.tmux_pane,
-              i.pane_label,
               CASE
                 WHEN p.slug = 'custodes' THEN 'custodes'
                 WHEN p.slug = 'fabricator-general' THEN 'fabricator'
@@ -127,7 +126,7 @@ def _install_legacy_instances_test_view(conn):
                 commander_type, commander_id, status, created_at, last_activity,
                 stopped_at, persona_id, rank, session_doc_id, automated,
                 notification_mode, interaction_mode, golden_throne,
-                tmux_pane, pane_label, launcher, is_subagent, hook_driven,
+                launcher, is_subagent, hook_driven,
                 zealotry, gt_resume_count, gt_resume_window_started_at,
                 gt_last_resume_at, follow_up_sop, stop_allowed, input_lock,
                 tts_voice, notification_sound, discord_hosted, discord_channel,
@@ -185,7 +184,7 @@ def _install_legacy_instances_test_view(conn):
                 CASE COALESCE(NEW.tts_mode, 'verbose') WHEN 'muted' THEN 'muted' WHEN 'silent' THEN 'silent' ELSE 'verbose' END,
                 CASE COALESCE(NEW.tts_mode, '') WHEN 'voice-chat' THEN 'voice_chat' WHEN 'voice_chat' THEN 'voice_chat' ELSE 'text' END,
                 CASE WHEN COALESCE(NEW.synced, 0) = 1 THEN 'sync' WHEN NEW.instance_type = 'sync' THEN 'sync' WHEN NEW.instance_type = 'golden_throne' THEN '1' ELSE NULL END,
-                NEW.tmux_pane, NEW.pane_label, COALESCE(NEW.launcher, NEW.spawner), COALESCE(NEW.is_subagent, 0), COALESCE(NEW.hook_driven, CASE WHEN NEW.instance_type = 'hook_driven' THEN 1 ELSE 0 END),
+                COALESCE(NEW.launcher, NEW.spawner), COALESCE(NEW.is_subagent, 0), COALESCE(NEW.hook_driven, CASE WHEN NEW.instance_type = 'hook_driven' THEN 1 ELSE 0 END),
                 COALESCE(NEW.zealotry, 4), COALESCE(NEW.gt_resume_count, 0), NEW.gt_resume_window_started_at,
                 NEW.gt_last_resume_at, NEW.follow_up_sop, COALESCE(NEW.stop_allowed, 1), NEW.input_lock,
                 NEW.tts_voice, NEW.notification_sound, COALESCE(NEW.discord_hosted, 0), NEW.discord_channel,
@@ -215,8 +214,6 @@ def _install_legacy_instances_test_view(conn):
                 status = CASE COALESCE(NEW.status, status) WHEN 'processing' THEN 'working' ELSE COALESCE(NEW.status, status) END,
                 last_activity = COALESCE(NEW.last_activity, last_activity),
                 stopped_at = NEW.stopped_at,
-                tmux_pane = NEW.tmux_pane,
-                pane_label = NEW.pane_label,
                 persona_id = (SELECT id FROM personas WHERE slug = CASE
                     CASE
                       WHEN NEW.legion IS NOT OLD.legion THEN NEW.legion
@@ -371,10 +368,33 @@ def app_env(tmp_path, monkeypatch):
     async def _no_observed_agents():
         return []
 
+    # The tmuxctl pane oracle (shared.resolve_instance_pane / instance_id_for_pane)
+    # and the tmux-target resolvers all funnel through shared._run_subprocess_offloop,
+    # which spawns a real subprocess against the live tmux server. Under test there
+    # is no live server, so each call would pay the full 3s spawn before failing
+    # closed — which dragged SessionStart-heavy files past their timeout. Stub the
+    # chokepoint (not the high-level functions) so the real oracle logic still runs
+    # but resolves to "no live pane" instantly. Tests that need a specific resolution
+    # override resolve_instance_pane / _run_subprocess_offloop themselves after
+    # app_env builds; the oracle's own unit tests (test_instance_id_stamp.py) rely on
+    # this exact seam.
+    async def _no_tmux_offloop(args, *, timeout=None, stdout=None, stderr=None, env=None):
+        arglist = list(args)
+        # tmuxctl resolve-instance --format json: payload printed on both exit codes,
+        # caller trusts the `found` flag → emit a miss.
+        if "resolve-instance" in arglist:
+            return subprocess.CompletedProcess(
+                args=arglist, returncode=1, stdout=b'{"found": false}', stderr=b""
+            )
+        # tmux show-options / display-message / tmuxctl resolve-pane: empty stdout +
+        # nonzero rc → callers fail closed to None.
+        return subprocess.CompletedProcess(args=arglist, returncode=1, stdout=b"", stderr=b"")
+
     # Golden Throne fixtures insert Mac-Mini-local instances; pin the
     # reloaded module so Linux CI does not route them through satellite dispatch.
     monkeypatch.setattr(main, "LOCAL_DEVICE_NAME", "Mac-Mini")
     monkeypatch.setattr(main, "_tmux_pane_rows", _no_pane_rows)
     monkeypatch.setattr(main, "_detect_tmux_agent_panes", _no_observed_agents)
+    monkeypatch.setattr(shared, "_run_subprocess_offloop", _no_tmux_offloop)
 
     return SimpleNamespace(db_path=db_path, shared=shared, init_db=init_db, main=main)

@@ -20,6 +20,9 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-xdist>=3.5.0",
+    "pytest-randomly>=3.15.0",
+    "pytest-timeout>=2.3.0",
     "httpx>=0.28.0",
     "ruff>=0.6.0",
     "mypy>=1.10.0",
@@ -69,3 +72,4 @@ exclude = ["tests/"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "-n auto --dist loadfile"  # local runs default to parallel; use `-n0` to disable (pdb/-s)

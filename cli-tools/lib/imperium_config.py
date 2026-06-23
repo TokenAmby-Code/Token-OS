@@ -13,6 +13,7 @@ Usage:
 
 import os
 import platform
+import re
 import sys
 
 # ============================================================
@@ -98,23 +99,49 @@ IMPERIUM = os.environ.get("IMPERIUM") or cfg("nas_imperium")
 CIVIC = os.environ.get("CIVIC") or cfg("nas_civic")
 
 
+_QUARANTINE_RE = re.compile(r"\.legacy-\d")
+
+
+def _is_quarantined(path: str) -> bool:
+    """True for paths that must NEVER win runtime/bare resolution.
+
+    A Synology recycle bin (``#recycle``), a macOS Trash, or a dated legacy
+    archive (``…legacy-YYYYMMDD``) is a purge target. Binding the runtime — or a
+    worktree's bare — there silently destroys work when the bin is emptied
+    (incident 2026-06-22). Mirrors imperium_path_is_quarantined in nas-path.sh.
+    """
+    if not path:
+        return False
+    norm = "/" + path.strip("/") + "/"
+    if "/#recycle/" in norm or "/.Trash/" in norm or "/.Trashes/" in norm:
+        return True
+    return bool(_QUARANTINE_RE.search(norm))
+
+
 def _runtime_checkout() -> str:
     local = os.path.expanduser(cfg("token_os_runtime").strip())
     env_value = (os.environ.get("TOKEN_OS") or "").strip()
+    env_expanded = os.path.expanduser(env_value) if env_value else ""
     known_nas_runtime = f"{IMPERIUM}/runtimes/token-os/live"
+
+    # A quarantined override (recycle bin / dated legacy archive) is never honored,
+    # even when the dir still exists: a stale exported TOKEN_OS pointing into
+    # #recycle previously won here, binding tooling + worktrees to a purge target.
+    if env_value and _is_quarantined(env_expanded):
+        env_value = env_expanded = ""
 
     # Explicit non-NAS overrides still work for tests/dev, but a stale exported
     # NAS runtime must not beat the machine-local hot runtime during cutover.
-    if (
-        env_value
-        and os.path.isdir(os.path.expanduser(env_value))
-        and env_value != known_nas_runtime
-    ):
-        return os.path.expanduser(env_value)
-    if local and os.path.isdir(local):
+    # Compare normalized expanded paths so a trailing slash or `~` form of the NAS
+    # runtime can't slip past this check and wrongly beat the local hot runtime.
+    env_norm = os.path.normpath(env_expanded) if env_expanded else ""
+    nas_norm = os.path.normpath(known_nas_runtime)
+    if env_value and os.path.isdir(env_expanded) and env_norm != nas_norm:
+        return env_expanded
+    if local and os.path.isdir(local) and not _is_quarantined(local):
         return local
-    if env_value and os.path.isdir(os.path.expanduser(env_value)):
-        return os.path.expanduser(env_value)
+    if env_value and os.path.isdir(env_expanded):
+        return env_expanded
     return known_nas_runtime
 
 

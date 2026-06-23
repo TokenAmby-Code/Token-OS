@@ -8,9 +8,9 @@ merge-triggered webhook that reaches the Mac over Tailscale.
 
 | Workflow | Trigger | Role |
 |---|---|---|
-| `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, pytest, chill CodeRabbit — all **non-blocking** annotations. |
-| `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. **pytest is NOT on this hot path** — stripped so PRs reach `main` fast (Emperor-decreed CI policy). The full suite is preserved in `prod-gate.yml`, not deleted. |
-| `prod-gate.yml` — *Prod Gate (tests)* | PR/push → `prod`, `workflow_dispatch` | Preserved full pytest suite, RESERVED for the future prod-branch CI. Inert until a `prod` branch exists — never runs on PRs into `main`, so it can't block the hot path. Run on demand via the Actions tab. |
+| `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, pytest, chill CodeRabbit — all **non-blocking** annotations. pytest runs under `pytest-xdist -n auto --dist loadfile` (~7 min on a 10-core box vs ~20 min single-threaded). |
+| `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. **pytest is NOT yet on this hot path** — re-adding it as a blocking gate is the intended next step now that xdist makes it fast, but it is blocked on test-suite hermeticity (the suite still flakes under parallel execution). The full suite is preserved in `prod-gate.yml` and runs advisory in `push.yml`. |
+| `prod-gate.yml` — *Prod Gate (tests)* | PR/push → `prod`, `workflow_dispatch` | Full pytest suite under `pytest-xdist -n auto --dist loadfile`, RESERVED for the future prod-branch CI. Inert until a `prod` branch exists — never runs on PRs into `main`, so it can't block the hot path. Run on demand via the Actions tab. |
 | `secrets-scan.yml` | push/PR → `main` | Blocks on leaked IPs/secrets (patterns kept in repo secrets). |
 | `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD. Path-filter → changed-service list → Tailscale ephemeral node → POST `/api/cd/restart` on the Mac (ack-first). Post-merge restart + deployed smoke. |
 
@@ -21,6 +21,21 @@ The format-on-save hook (`cli-tools/scripts/post-tool-format.sh`) and the git
 lockfile-pinned ruff CI uses (no floating `uvx`). So local edits are byte-identical
 to the gate and format drift never reaches CI. `worktree-setup` installs the
 pre-commit hook and syncs both projects' dev venvs.
+
+### Running tests locally
+
+Both suites default to **parallel** locally via `addopts = "-n auto --dist loadfile"`
+in each `pyproject.toml` `[tool.pytest.ini_options]` — a bare `pytest` (or an agent
+session that shells out to it) gets the xdist speedup for free, no `-n` flag to remember.
+
+- **token-api** runs parallel everywhere — local *and* CI (the CI commands already pass
+  `-n auto --dist loadfile` explicitly; the addopts is a harmless duplicate).
+- **cli-tools** runs parallel **locally** but is pinned **serial on CI** via an explicit
+  `pytest -n0 …` in all three workflows (the contended GH runner is unverified for
+  cli-tools parallel, so CI keeps the proven serial behavior).
+- To **debug**, disable parallelism with `pytest -n0` (required for `pdb`, `-s`, and
+  reliable single-test runs). Removing the `addopts` line reverts that suite to
+  serial-default — a local-only knob, independent of branch protection.
 
 ## Branch protection (main)
 

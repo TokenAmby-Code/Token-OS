@@ -13,14 +13,17 @@ def _insert_instance(
     tab_name,
     status="idle",
 ):
+    # ``pane`` is accepted for caller readability but no longer stored: pane
+    # geometry is resolved live from the tmuxctl oracle. Selection is driven by
+    # the faked ``_read_tmux_panes`` dict keyed by pane -> instance_id.
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
         INSERT INTO legacy_instances (
-            id, session_id, tab_name, origin_type, device_id, tmux_pane, engine, status
-        ) VALUES (?, ?, ?, 'local', 'mac', ?, ?, ?)
+            id, session_id, tab_name, origin_type, device_id, engine, status
+        ) VALUES (?, ?, ?, 'local', 'mac', ?, ?)
         """,
-        (instance_id, session_id, tab_name, pane, engine, status),
+        (instance_id, session_id, tab_name, engine, status),
     )
     conn.commit()
     conn.close()

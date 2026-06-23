@@ -40,7 +40,6 @@ def _insert_instance(db_path) -> None:
             status="processing",
             engine="claude",
             working_dir="/work",
-            tmux_pane=PANE,
             device_id="Mac-Mini",
             last_activity=datetime.now().isoformat(),
             legion="mechanicus",
@@ -108,8 +107,23 @@ def work_state_env(app_env, monkeypatch):
     async def _engine_by_tty():
         return {}
 
+    async def _live_panes():
+        # Pane geometry is resolved live from the tmuxctl oracle, not a stored
+        # column: bind PANE to the test instance via the @INSTANCE_ID stamp.
+        return [
+            {
+                "pane_id": PANE,
+                "pane_pid": 1234,
+                "instance_id": SESSION_ID,
+                "pane_label": None,
+                "pane_role": "mechanicus:admin",
+                "current_command": "node",
+            }
+        ]
+
     monkeypatch.setattr(main, "_tmux_pane_rows", _pane_rows)
     monkeypatch.setattr(main, "_agent_engine_by_tty", _engine_by_tty)
+    monkeypatch.setattr(main, "_live_agent_panes", _live_panes)
     monkeypatch.setattr(main, "_pane_is_agent_from_snapshot", lambda c, t, m: (True, "claude"))
     monkeypatch.setattr(main, "_typing_guard_active", lambda: False)
     _insert_instance(app_env.db_path)

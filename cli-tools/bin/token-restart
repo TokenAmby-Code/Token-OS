@@ -34,6 +34,7 @@ set -euo pipefail
 _BIN_DIR="$(dirname "$(readlink -f "$0")")"
 _LIB_DIR="${_BIN_DIR}/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+source "${_LIB_DIR}/worktree-park.sh" 2>/dev/null || true
 
 # Colors
 RED='\033[0;31m'
@@ -375,6 +376,19 @@ runtime_is_dirty() {
 }
 
 sync_bare_main() {
+    # Reconciler park-sweep (incident 2026-06-22): any agent worktree left checked
+    # out *on* main/master pins the branch ref and jams the bare-main fast-forward
+    # (`git fetch … main:main` / `pull --ff-only` refuse a worktree-held branch).
+    # Park them off main first — detach in place at the current SHA, preserving any
+    # uncommitted edits. The detached deploy runtime is never matched. Best-effort.
+    if declare -f park_worktrees_off_main >/dev/null 2>&1; then
+        local _parked
+        _parked="$(park_worktrees_off_main "$TOKEN_OS_BARE_REPO" 2>/dev/null || true)"
+        if [[ -n "$_parked" ]]; then
+            echo -e "${YELLOW}⚠${NC} CD-sync: parked worktree(s) off main before fast-forward:"
+            printf '  %s\n' "$_parked" >&2
+        fi
+    fi
     echo -e "${BLUE}→${NC} CD-sync: fetching GitHub main into bare skeleton $TOKEN_OS_BARE_REPO..."
     if ! git --git-dir="$TOKEN_OS_BARE_REPO" fetch origin main >/dev/null 2>&1; then
         echo -e "  ${RED}✗${NC} CD-sync: 'git fetch origin main' failed for bare skeleton"

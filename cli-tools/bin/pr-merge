@@ -21,6 +21,8 @@ set -euo pipefail
 # Source shared libs
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 source "$SCRIPT_DIR/../lib/git-remote.sh"
+source "$SCRIPT_DIR/../lib/worktree-park.sh" 2>/dev/null || true
+source "$SCRIPT_DIR/../lib/worktree-resolve.sh"
 
 # Colors
 RED='\033[0;31m'
@@ -187,18 +189,36 @@ if [[ "$PR_MERGEABLE" == "CONFLICTING" ]]; then
     exit 1
 fi
 
-# Detect if we're in a worktree
+# Resolve the worktree to remove from the PR's *head branch*, never from the
+# current working directory. Deriving it from cwd (the original
+# `WORKTREE_PATH="$REPO_ROOT"`) meant running `pr-merge <N>` from an unrelated
+# worktree merged the right branch but removed the WRONG worktree — the caller's
+# — orphaning the PR's real worktree.
 IN_WORKTREE=false
 WORKTREE_PATH=""
-MAIN_WORKTREE_PATH=""
+PR_WORKTREE_PATH="$(resolve_worktree_for_branch "$BRANCH_NAME")"
+MAIN_WORKTREE_PATH=$(git worktree list --porcelain | grep -m1 "^worktree " | cut -d' ' -f2)
 
-if [[ -f "$REPO_ROOT/.git" ]]; then
-    # .git is a file, not a directory - we're in a worktree
+if [[ -n "$PR_WORKTREE_PATH" && -f "$PR_WORKTREE_PATH/.git" ]]; then
+    # The PR's head branch is checked out in a *linked* worktree (its .git is a
+    # file) → that, and only that, is what we remove during cleanup. A regular
+    # checkout or the bare repo's own entry (.git is a directory / bare) is not a
+    # removable worktree and falls through to the checkout-main cleanup path.
     IN_WORKTREE=true
-    WORKTREE_PATH="$REPO_ROOT"
+    WORKTREE_PATH="$PR_WORKTREE_PATH"
+fi
 
-    # Get main worktree path
-    MAIN_WORKTREE_PATH=$(git worktree list --porcelain | grep -m1 "^worktree " | cut -d' ' -f2)
+# Footgun guard: if the caller is sitting in a *different* linked worktree than
+# the PR's, refuse rather than silently operating across worktrees. The old code
+# would have removed this cwd worktree by mistake; stop and point the user at the
+# PR's own worktree instead.
+if [[ -f "$REPO_ROOT/.git" && -n "$WORKTREE_PATH" && "$REPO_ROOT" != "$WORKTREE_PATH" ]]; then
+    error "Refusing to merge PR #${PR_NUMBER} from a different worktree."
+    error "  Current worktree:            ${REPO_ROOT}"
+    error "  PR branch '${BRANCH_NAME}' worktree: ${WORKTREE_PATH}"
+    error "Run pr-merge from the PR's own worktree so cleanup removes the right one:"
+    error "  cd \"${WORKTREE_PATH}\" && pr-merge ${PR_NUMBER}"
+    exit 1
 fi
 
 # Show plan
@@ -369,6 +389,14 @@ MAIN_BRANCH=$(git symbolic-ref "refs/remotes/${GIT_GITHUB_REMOTE}/HEAD" 2>/dev/n
 log "${PULL} Updating ${MAIN_BRANCH}..."
 
 if [[ "$(git rev-parse --is-bare-repository 2>/dev/null)" == "true" ]]; then
+    # Reconciler park-sweep (incident 2026-06-22): a worktree left checked out on
+    # main pins the ref and makes the fast-forward below refuse ("refusing to fetch
+    # into branch 'refs/heads/main' checked out at <wt>"). Park any such worktree
+    # off main first (detach in place, edits preserved) so the FF can land.
+    if declare -f park_worktrees_off_main >/dev/null 2>&1; then
+        _parked="$(park_worktrees_off_main "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null || true)"
+        [[ -n "$_parked" ]] && printf '%s\n' "$_parked" | sed 's/^/   /'
+    fi
     # No working tree: fast-forward the local ref directly (no checkout). The
     # refspec without a leading '+' only allows fast-forwards, so it is safe
     # even though `main` is the bare repo's HEAD branch.

@@ -4,9 +4,16 @@ name: PR Gate (blocking)
 # Triggered on PR open / synchronize / reopen against main. Failures here
 # block merge via branch protection. CodeRabbit GitHub App handles the
 # assertive review (governed by .coderabbit.yaml in repo root) — this
-# workflow runs the deterministic gates: format, lint, typecheck.
-# pytest is intentionally NOT on this hot main-path gate — the full suite is
-# preserved in prod-gate.yml (future prod-branch CI). See that file.
+# workflow runs the deterministic gates: format, lint, typecheck, pytest.
+#
+# pytest is now a BLOCKING gate (the shadow-then-flip rollout completed). It runs
+# under pytest-xdist: token-api parallel (`-n auto --dist loadfile`, the long
+# pole) and cli-tools serial (its parallel "flakes" were CPU contention; its 3
+# CI-only failures were fixed in #320). Reliability was confirmed before the flip
+# via prod-gate.yml workflow_dispatch 10×10 green (randomized order each run).
+# The job name stays `quality` (already branch-protection-required), so the flip
+# needed no branch-protection edit. ROLLBACK: re-add `continue-on-error: true` to
+# the "Test (pytest)" step (one line) — never touch branch protection.
 
 on:
   pull_request:
@@ -37,7 +44,7 @@ jobs:
       checks: write
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,12 +98,18 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports .)
           fi
 
-      # NOTE: pytest was REMOVED from the hot main-path gate (Emperor-decreed
-      # CI-policy change). The full suite is PRESERVED — not weakened — in
-      # prod-gate.yml, reserved for the future prod-branch CI. Tests still exist
-      # and still run there; they just no longer block PRs into main. Hot-path
-      # gates retained: ruff format/lint, mypy, CodeRabbit, secrets-scan
-      # (secrets-scan.yml), push-advisory (push.yml), deployed smoke (deploy-prod.yml).
+      # BLOCKING: token-api runs first (long pole) parallel, cli-tools serial.
+      # ROLLBACK if a flake slips = re-add `continue-on-error: true` here (one
+      # line); never touch branch protection.
+      - name: Test (pytest)
+        run: |
+          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
+            (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --timeout=120 --tb=short)
+          fi
+          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
+            # -n0 overrides the addopts parallel default; cli-tools stays serial on CI (contended runner unverified for parallel).
+            (cd cli-tools && uv run --python 3.11 --group dev pytest -n0 --timeout=120 --tb=short)
+          fi
 
       - name: CodeRabbit PR gate
         env:

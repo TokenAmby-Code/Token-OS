@@ -404,12 +404,12 @@ class TmuxAdapter:
         self.last_send_gate_result = None
         # Resolve Imperium canonical pane targets (mechanicus:N, legion:custodes,
         # 1:N, …) to physical %pane ids BEFORE the gate evaluates. The gate's
-        # attendance/typing checks shell out to `tmux display-message -t <target>`
-        # and `tmux list-clients -t <target>`; tmux only understands physical ids
-        # and native session:window addresses, so a canonical id silently
-        # mis-resolves and _pane_attended returns False — the gate then MISSES an
-        # actively-typed attended pane and clobbers the human's live draft
-        # (send-gate-attended-scoping-clobber). The shell shim already
+        # keystroke-lock read shells out to
+        # `tmux show-options -pqv -t <target> @TYPING_LOCK_UNTIL`; tmux only
+        # understands physical ids and native session:window addresses, so a
+        # canonical id silently mis-resolves, the lock reads as unset, and the
+        # gate then MISSES a keystroke-locked pane and clobbers the human's live
+        # draft (send-gate-attended-scoping-clobber). The shell shim already
         # resolves-then-gates (bin/tmux: resolve_target before send_gate_suppresses);
         # this aligns the Python clobber path so both languages gate on the same
         # physical id. Resolution is read-only (live tmux snapshot), so doing it
