@@ -9034,6 +9034,7 @@ async def _resolve_administratum_instance() -> dict | None:
                FROM instances i
                JOIN personas p ON p.id = i.persona_id
                WHERE p.slug = 'administratum'
+                 AND i.device_id = ?
                  AND i.rank != 'retired'
                  AND i.commander_type != 'chapter'
                  AND i.status NOT IN ('stopped', 'archived')
@@ -9047,7 +9048,8 @@ async def _resolve_administratum_instance() -> dict | None:
                  i.last_activity DESC,
                  i.created_at DESC,
                  i.id DESC
-               LIMIT 1"""
+               LIMIT 1""",
+            (LOCAL_DEVICE_NAME,),
         )
         row = await cursor.fetchone()
 
@@ -9055,11 +9057,11 @@ async def _resolve_administratum_instance() -> dict | None:
         return None
     instance = dict(row)
 
-    # Resolve the pane live from the oracle (instances.tmux_pane is gone). When
-    # the row is on another device or the oracle has no live pane for it, fall
-    # back to scanning tmux for the Administratum-marked pane.
+    # The row is guaranteed local (scoped above). Resolve its pane live from the
+    # oracle (instances.tmux_pane is gone); fall back to scanning tmux for the
+    # Administratum-marked pane only when the oracle has no live pane for it.
     pane, _role = await shared.resolve_instance_pane(instance["id"])
-    if instance.get("device_id", LOCAL_DEVICE_NAME) != LOCAL_DEVICE_NAME or not pane:
+    if not pane:
         pane = await _find_administratum_tmux_pane()
         if not pane:
             return None
@@ -10006,7 +10008,7 @@ async def set_instance_discord(instance_id: str, request: Request):
 
 
 @app.get("/api/legion/{legion}/synced-session")
-async def get_synced_session(legion: str):
+async def get_synced_session(legion: str) -> dict:
     """Lookup the active session for a legion.
 
     Custodes is resolved by **persona identity + rank** on the canonical
@@ -11522,7 +11524,7 @@ async def pane_instance(tmux_pane: str):
 
 
 @app.get("/api/orchestrator/pane_truth")
-async def orchestrator_pane_truth():
+async def orchestrator_pane_truth() -> list[dict]:
     """Merged tmux↔DB pane truth for the orchestrator.
 
     Joins live ``tmux list-panes -a`` against ``instances`` (active or
@@ -11539,10 +11541,20 @@ async def orchestrator_pane_truth():
     # (instances.tmux_pane is gone); a row is pane-resident iff it has a live pane.
     live = {p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]}
 
+    # Surface swept-but-still-live rows too: a stopped/archived row that the oracle
+    # still resolves to a live pane must be fetched so the Python filter below can
+    # keep it. Without this OR clause the SQL excludes it and the filter is dead code.
+    live_instance_ids = list(live)
+    live_filter = ""
+    params: list[str] = []
+    if live_instance_ids:
+        live_filter = f" OR ci.id IN ({','.join('?' for _ in live_instance_ids)})"
+        params.extend(live_instance_ids)
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT ci.id AS instance_id, ci.name AS tab_name,
+            f"""SELECT ci.id AS instance_id, ci.name AS tab_name,
                       ci.status, ci.last_activity, ci.engine,
                       COALESCE(p.slug, 'astartes') AS legion,
                       ci.session_doc_id, ci.workflow_state, ci.workflow_blocked_reason,
@@ -11551,8 +11563,9 @@ async def orchestrator_pane_truth():
                FROM instances ci
                LEFT JOIN personas p ON p.id = ci.persona_id
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-               WHERE ci.status NOT IN ('stopped', 'archived')
-               ORDER BY ci.last_activity DESC"""
+               WHERE ci.status NOT IN ('stopped', 'archived'){live_filter}
+               ORDER BY ci.last_activity DESC""",
+            params,
         )
         rows = [dict(r) for r in await cursor.fetchall()]
 
@@ -20279,7 +20292,9 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
                       sd.file_path AS session_doc_path
                FROM instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-               WHERE ci.status NOT IN ('stopped', 'archived')"""
+               WHERE ci.status NOT IN ('stopped', 'archived')
+                 AND ci.device_id = ?""",
+            (LOCAL_DEVICE_NAME,),
         )
         rows = [dict(r) for r in await cursor.fetchall()]
 
@@ -20457,7 +20472,7 @@ async def session_doc_sync_worker():
         await asyncio.sleep(2)
 
 
-async def clear_stale_processing_flags():
+async def clear_stale_processing_flags() -> None:
     """Background worker that clears stale processing and stops dead local pane rows.
 
     Dead-pane detection is sourced live from the tmuxctl oracle: a local
@@ -20466,37 +20481,43 @@ async def clear_stale_processing_flags():
     """
     while True:
         try:
-            live_ids = await _live_agent_instance_ids()
+            # tmux-reachability gate: None means tmux is unreachable, so the oracle
+            # would fail closed and empty live_ids — never mass-stop a live fleet on a
+            # transient miss (mirrors _run_tmux_db_reconcile_cycle). Stale-processing
+            # cleanup below is time-based and runs regardless.
+            panes = await _read_tmux_panes()
+            live_ids = None if panes is None else await _live_agent_instance_ids()
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
-                cursor = await db.execute(
-                    """SELECT *
-                       FROM instances
-                       WHERE status NOT IN ('stopped', 'archived')
-                         AND device_id = ?""",
-                    (LOCAL_DEVICE_NAME,),
-                )
-                pane_rows = await cursor.fetchall()
                 stopped_dead_panes = []
-                for row in pane_rows:
-                    if row["id"] in live_ids:
-                        continue
-                    try:
-                        await sanctioned_update_instance(
-                            db,
-                            instance_id=row["id"],
-                            updates={
-                                "status": "stopped",
-                                "input_lock": None,
-                                "stopped_at": datetime.now().isoformat(),
-                            },
-                            mutation_type="instance_stopped",
-                            write_source="system",
-                            actor="clear-dead-tmux-pane",
-                        )
-                        stopped_dead_panes.append(dict(row))
-                    except LookupError:
-                        continue
+                if live_ids is not None:
+                    cursor = await db.execute(
+                        """SELECT *
+                           FROM instances
+                           WHERE status NOT IN ('stopped', 'archived')
+                             AND device_id = ?""",
+                        (LOCAL_DEVICE_NAME,),
+                    )
+                    pane_rows = await cursor.fetchall()
+                    for row in pane_rows:
+                        if row["id"] in live_ids:
+                            continue
+                        try:
+                            await sanctioned_update_instance(
+                                db,
+                                instance_id=row["id"],
+                                updates={
+                                    "status": "stopped",
+                                    "input_lock": None,
+                                    "stopped_at": datetime.now().isoformat(),
+                                },
+                                mutation_type="instance_stopped",
+                                write_source="system",
+                                actor="clear-dead-tmux-pane",
+                            )
+                            stopped_dead_panes.append(dict(row))
+                        except LookupError:
+                            continue
 
                 cursor = await db.execute(
                     """SELECT *
@@ -20544,16 +20565,16 @@ async def clear_stale_processing_flags():
                         marker = stale_idle.get("golden_throne")
                         if not marker or marker == "sync":
                             continue
-                    stale_idle["status"] = "idle"
-                    try:
-                        await schedule_golden_throne_followup(
-                            stale_idle, reason="clear-stale-processing"
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Golden Throne: failed to schedule stale-processing follow-up "
-                            f"for {stale_idle.get('id', '')[:12]}: {exc}"
-                        )
+                        stale_idle["status"] = "idle"
+                        try:
+                            await schedule_golden_throne_followup(
+                                stale_idle, reason="clear-stale-processing"
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Golden Throne: failed to schedule stale-processing follow-up "
+                                f"for {stale_idle.get('id', '')[:12]}: {exc}"
+                            )
 
             await asyncio.sleep(60)  # Run every minute
 
@@ -20959,7 +20980,7 @@ class MorningBriefRequest(BaseModel):
 
 
 @app.post("/api/custodes/morning-brief")
-async def custodes_morning_brief(request: MorningBriefRequest | None = None):
+async def custodes_morning_brief(request: MorningBriefRequest | None = None) -> dict:
     """Morning-session-as-compaction proxy.
 
     If a Custodes singleton is alive, inject a 3-step prompt (handoff blurb →

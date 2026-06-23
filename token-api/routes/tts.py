@@ -1006,7 +1006,7 @@ async def focus_instance_pane(instance_id: str) -> dict:
     return await select_instance_pane(instance_id)
 
 
-async def tts_queue_worker():
+async def tts_queue_worker() -> None:
     """Background worker that processes TTS hot queue sequentially.
 
     Only drains from hot_queue. Pause queue items must be promoted to hot
@@ -1140,6 +1140,14 @@ async def tts_queue_worker():
 
         except Exception as e:
             logger.error(f"TTS worker error: {e}")
+            # Never leave the source pane stuck "speaking" when playback raises
+            # after @TTS_STATE was set: clear it before looping (best-effort).
+            try:
+                if tts_current is not None and getattr(tts_current, "tmux_pane", None):
+                    _set_tts_state(tts_current.tmux_pane, "")
+            except Exception:
+                pass
+            tts_current = None
             await asyncio.sleep(1)
 
 

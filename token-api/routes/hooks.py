@@ -3308,8 +3308,11 @@ async def handle_session_start(payload: dict) -> dict:
                 )
 
                 # The oracle is the sole source of the supplanted pane: resolve
-                # where the old instance's @INSTANCE_ID currently lives.
+                # where the old instance's @INSTANCE_ID currently lives. When the
+                # SessionStart payload omits a pane, the live supplanted pane is the
+                # target to restamp so it never keeps the old id (a stale oracle bridge).
                 old_tmux_pane, _ = await shared.resolve_instance_pane(supplant_id)
+                target_tmux_pane = tmux_pane or old_tmux_pane
 
                 # Update the old row with new session identity, preserve config.
                 # pid/session_id died with legacy instance table; the commander edge
@@ -3388,7 +3391,13 @@ async def handle_session_start(payload: dict) -> dict:
                     parent_instance_id=_effective_parent(old_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
-                await _stamp_instance_id(tmux_pane, session_id, display_name=old_inst["name"])
+                await _stamp_instance_id(
+                    target_tmux_pane, session_id, display_name=old_inst["name"]
+                )
+                # If the agent moved panes, vacate the old pane's @INSTANCE_ID so the
+                # oracle never reports the supplanted (now-defunct) id there.
+                if tmux_pane and old_tmux_pane and old_tmux_pane != tmux_pane:
+                    await _unstamp_instance_id(old_tmux_pane, supplant_id)
 
                 await _apply_commander_binding(
                     db,
@@ -3442,7 +3451,7 @@ async def handle_session_start(payload: dict) -> dict:
                 auto_subscription = await _auto_subscribe_parent_on_start(
                     db,
                     child_instance_id=session_id,
-                    child_pane=tmux_pane,
+                    child_pane=target_tmux_pane,
                     parent_instance_id=_effective_parent(old_parent_id),
                 )
                 if auto_subscription:
@@ -6372,9 +6381,9 @@ async def _set_planning_state(
     # state is reasserted, queue an explicit projection so tmux hints recover.
     if previous == new_state:
         await db.execute(
-            """INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-               VALUES (?, '@PLANNING_STATE', ?, ?)""",
-            (instance_id, new_state, tmux_pane),
+            """INSERT INTO pane_state_queue (instance_id, variable, value)
+               VALUES (?, '@PLANNING_STATE', ?)""",
+            (instance_id, new_state),
         )
     return {
         "old_state": previous,

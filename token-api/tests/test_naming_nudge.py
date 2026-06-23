@@ -45,11 +45,14 @@ def _insert_instance(
     conn.close()
 
 
-def _patch_pane(app_env, monkeypatch, pane="%10"):
+def _patch_pane(app_env, monkeypatch, pane="%10", instance_id="inst-naming"):
     """The nudge pane is resolved live from the oracle now (no stored tmux_pane);
-    pin it so the placeholder pane is addressable for the nudge enqueue."""
+    pin it so the placeholder pane is addressable for the nudge enqueue. Asserts the
+    code resolves the EXPECTED instance — a wrong-row resolve fails the test instead
+    of silently passing."""
 
     async def _resolve(_instance_id):
+        assert _instance_id == instance_id, f"unexpected instance resolved: {_instance_id!r}"
         return (pane, "main")
 
     monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve)

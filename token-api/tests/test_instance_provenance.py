@@ -17,7 +17,7 @@ def client(app_env):
 
 
 @pytest.fixture
-def pane_oracle(app_env, monkeypatch):
+def pane_oracle(app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Register a live pane<->instance map over the conftest no-op oracle default.
 
     Pane ids are no longer stored on the row: supplant + reconcile resolve a pane's
@@ -38,7 +38,15 @@ def pane_oracle(app_env, monkeypatch):
     monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve)
     monkeypatch.setattr(app_env.main.shared, "instance_id_for_pane", _id_for)
 
-    def _bind(instance_id, pane):
+    def _bind(instance_id: str, pane: str) -> None:
+        # One pane has exactly one live occupant and one instance one live pane:
+        # evict any stale mapping before rebinding so forward/reverse stay consistent.
+        old_pane = forward.get(instance_id)
+        if old_pane is not None and old_pane != pane:
+            reverse.pop(old_pane, None)
+        old_instance = reverse.get(pane)
+        if old_instance is not None and old_instance != instance_id:
+            forward.pop(old_instance, None)
         forward[instance_id] = pane
         reverse[pane] = instance_id
 

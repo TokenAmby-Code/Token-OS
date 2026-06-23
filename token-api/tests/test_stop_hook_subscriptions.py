@@ -24,6 +24,11 @@ def _seed_pane(instance_id, pane, role=None):
     wrapper stamps @INSTANCE_ID + @PANE_ID before SessionStart, so the oracle
     resolves the freshly-registered pane to (pane, role)."""
     if pane:
+        # One pane has exactly one live owner: evict any other instance that
+        # previously claimed this pane so instance_id_for_pane (which scans by
+        # insertion order) reports the current owner, not a stale one.
+        for stale_id in [i for i, (p, _r) in _PANE_MAP.items() if p == pane and i != instance_id]:
+            del _PANE_MAP[stale_id]
         _PANE_MAP[instance_id] = (pane, role)
 
 
