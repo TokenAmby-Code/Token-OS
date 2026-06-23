@@ -180,6 +180,14 @@ def build_parser() -> argparse.ArgumentParser:
     close_parser.add_argument("--mode", default="now", choices=["now", "after-stop"])
     close_parser.add_argument("--pane", default="")
     close_parser.add_argument("--timeout", type=float, default=3.0)
+    close_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Override the refuse-retire-while-TUI-live guard: kill a live agent "
+            "process and retire atomically. Without it, a live TUI fails closed."
+        ),
+    )
 
     send_text_parser = subparsers.add_parser("send-text")
     send_text_parser.add_argument("--pane", required=True)
@@ -574,6 +582,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=args.mode,
                 pane=args.pane or None,
                 timeout=args.timeout,
+                force=args.force,
             )
             print(json.dumps(result, sort_keys=True))
             return 0 if result.get("status") not in {"failed", "refused"} else 1
