@@ -4,19 +4,16 @@ name: PR Gate (blocking)
 # Triggered on PR open / synchronize / reopen against main. Failures here
 # block merge via branch protection. CodeRabbit GitHub App handles the
 # assertive review (governed by .coderabbit.yaml in repo root) — this
-# workflow runs the deterministic gates: format, lint, typecheck.
-# pytest is intentionally NOT on this hot main-path gate — the full suite is
-# preserved in prod-gate.yml (future prod-branch CI). See that file.
+# workflow runs the deterministic gates: format, lint, typecheck, pytest.
 #
-# pytest is being re-introduced here as a blocking gate via a shadow-then-flip
-# rollout. The "Test (pytest)" step below currently carries `continue-on-error:
-# true` (SHADOW phase) — it runs on every real PR and surfaces its result, but
-# cannot block merge. The clean-runner CI arbiter showed token-api is already
-# green parallel (`-n auto --dist loadfile`); cli-tools' parallel flakes were
-# pure CPU contention, so cli-tools runs SERIAL here while token-api (the long
-# pole) stays parallel. The FLIP step (PR-C) simply deletes the one
-# `continue-on-error: true` line below; the job name stays `quality`, which
-# branch protection already requires — no branch-protection edit is needed.
+# pytest is now a BLOCKING gate (the shadow-then-flip rollout completed). It runs
+# under pytest-xdist: token-api parallel (`-n auto --dist loadfile`, the long
+# pole) and cli-tools serial (its parallel "flakes" were CPU contention; its 3
+# CI-only failures were fixed in #320). Reliability was confirmed before the flip
+# via prod-gate.yml workflow_dispatch 10×10 green (randomized order each run).
+# The job name stays `quality` (already branch-protection-required), so the flip
+# needed no branch-protection edit. ROLLBACK: re-add `continue-on-error: true` to
+# the "Test (pytest)" step (one line) — never touch branch protection.
 
 on:
   pull_request:
@@ -101,11 +98,10 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports .)
           fi
 
-      # SHADOW phase: pytest runs here but `continue-on-error: true` keeps it
-      # non-blocking. token-api runs first (long pole) parallel; cli-tools runs
-      # serial. The FLIP (PR-C) removes the one `continue-on-error` line below.
+      # BLOCKING: token-api runs first (long pole) parallel, cli-tools serial.
+      # ROLLBACK if a flake slips = re-add `continue-on-error: true` here (one
+      # line); never touch branch protection.
       - name: Test (pytest)
-        continue-on-error: true
         run: |
           if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
             (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --timeout=120 --tb=short)
