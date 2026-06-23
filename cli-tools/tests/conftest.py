@@ -32,6 +32,11 @@ def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
     # inside tests; tests that exercise the observer override this to a small
     # timeout explicitly.
     monkeypatch.setenv("DISPATCH_LAUNCH_OBSERVE_TIMEOUT", "0")
+    # The duplicate-refusal guard enumerates the LIVE tmux server (list-panes -a +
+    # ps) via `tmuxctl live-agents`. Disable it by default so the suite never reads
+    # the operator's real fleet; the dedicated dup-refusal test re-enables it with a
+    # fake tmuxctl that returns a canned match.
+    monkeypatch.setenv("DISPATCH_WORKTREE_DUP_CHECK", "0")
     # Isolate the Obsidian vault too: cli-tools tests that import token-api
     # session-doc helpers must not write placeholder docs into the live vault at
     # /Volumes/Imperium/Imperium-ENV. Vault-root resolution is lazy and checks
