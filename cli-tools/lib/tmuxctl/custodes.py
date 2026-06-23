@@ -91,13 +91,18 @@ def _process_tree() -> tuple[dict[int, list[int]], dict[int, str]]:
     return children, commands
 
 
-def _pane_has_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> bool:
-    """True if any descendant of pane_pid command contains one of needles."""
+def _find_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> tuple[int, str] | None:
+    """First descendant of pane_pid whose command contains a needle: (pid, command).
+
+    Returns the live match (not just a bool) so callers that need to *report*
+    the offending process — the close-lifecycle liveness guard names the agent
+    pid/command in its refusal — share one canonical tree walk.
+    """
     if not pane_pid:
-        return False
+        return None
     children, commands = _process_tree()
     if not commands:
-        return False
+        return None
     stack = list(children.get(pane_pid, []))
     seen: set[int] = set()
     while stack:
@@ -107,9 +112,23 @@ def _pane_has_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> 
         seen.add(pid)
         command = commands.get(pid, "")
         if any(needle in command for needle in needles):
-            return True
+            return pid, command
         stack.extend(children.get(pid, []))
-    return False
+    return None
+
+
+def _pane_has_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> bool:
+    """True if any descendant of pane_pid command contains one of needles."""
+    return _find_active_process(pane_pid, needles) is not None
+
+
+def active_agent_in_pane(pane_pid: int | None) -> tuple[int, str] | None:
+    """The first live Claude/Codex descendant of pane_pid as (pid, command).
+
+    Engine-neutral sibling of ``pane_has_active_agent`` that surfaces *which*
+    process is alive, for the refuse-retire-while-TUI-live guard's payload.
+    """
+    return _find_active_process(pane_pid, AGENT_PROCESS_NEEDLES)
 
 
 def pane_has_active_claude(pane_pid: int | None) -> bool:
