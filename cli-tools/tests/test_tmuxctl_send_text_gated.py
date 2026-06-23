@@ -54,7 +54,10 @@ def _force_quiet(monkeypatch, active: bool):
 
 
 def _force_typing(monkeypatch, active: bool):
+    # The border and send-path predicates are split; evaluate() reads the send-path
+    # one, so force both for these gate tests.
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda **kw: active)
+    monkeypatch.setattr(send_gate, "send_hold_active", lambda **kw: active)
 
 
 def _no_override(monkeypatch):

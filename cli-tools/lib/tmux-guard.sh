@@ -295,16 +295,54 @@ tmux_wait_for_clear() {
 }
 
 # Canonical typing-guard predicate — thin reader of the ONE implementation in
-# tmuxctl.send_gate.typing_guard_active (which reads the per-pane keystroke lock
-# @TYPING_LOCK_UNTIL stamped by the tmux any-key binding). No second source of
-# truth: the status segment, this guard, and the universal send gate all consult
-# the same predicate. Returns 0 if the target pane is keystroke-locked (the
-# Emperor typed into it within the last 5 min and has not pressed Enter),
-# non-zero otherwise (or on error → fail-open).
+# tmuxctl.send_gate.typing_guard_active (the BORDER surface: a live keystroke lock
+# @TYPING_LOCK_UNTIL, minus an abandoned draft). No second source of truth: the
+# status segment, this guard, and the universal send gate all consult the same
+# module. Returns 0 if the target pane's border signal is lit (the Emperor typed
+# into it within the last 5 min, has not pressed Enter, and has not deleted-and-
+# abandoned), non-zero otherwise (or on error → fail-open).
 tmux_typing_guard_active() {
     local lib_dir
     lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
     PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.send_gate typing >/dev/null 2>&1
+}
+
+# Send-hold predicate — the SEND surface of the same module
+# (tmuxctl.send_gate.send_hold_active): held for the grace AFTER the border drops
+# (post-Enter / post-expiry / post-abandon), so an automated raw send does not fire
+# into the gap while the Emperor queues a follow-up message. Exit 0 = held.
+tmux_send_hold_active() {
+    local pane="$1" lib_dir
+    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m tmuxctl.send_gate send-hold "$pane" >/dev/null 2>&1
+}
+
+# Wait while the per-pane send-hold (lock term + grace) is active, then return 0.
+# Complements tmux_wait_for_clear's screen-scrape: the scrape clears the instant
+# the prompt is submitted/empty, but a clobber-prone 2nd-message grace window
+# remains — this closes it on the raw inbound path. Args: PANE [TIMEOUT_SECONDS].
+# TIMEOUT 0 means do not wait past a still-active hold (fail-loud), matching the
+# scrape path. Returns 0 once clear, 1 if the hold outlasts a positive timeout.
+tmux_wait_send_hold_clear() {
+    local pane="$1" timeout="${2:-0}"
+    local interval="${TMUX_GUARD_POLL_INTERVAL:-0.5}"
+    local start now elapsed=0
+    [[ -n "$pane" ]] || return 0
+    if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
+        timeout="${timeout%%.*}"
+        [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=0
+    fi
+    start="$(tmux_guard_now)"
+    while tmux_send_hold_active "$pane"; do
+        now="$(tmux_guard_now)"
+        elapsed=$(( now - start ))
+        if [[ "$timeout" == "0" ]] || (( elapsed >= timeout )); then
+            return 1
+        fi
+        sleep "$interval"
+    done
+    return 0
 }
 
 # Guarded send-keys: waits for the pane to be clear, then sends.

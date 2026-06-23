@@ -125,13 +125,17 @@ def test_run_records_marker_before_send_and_skips_suppressed(monkeypatch, db_pat
 
     # Gate open → send lands → marker written.
     monkeypatch.setattr(send_gate, "quiet_hours_active", lambda **kw: (False, {}))
+    # evaluate() consults the send-path predicate (send_hold_active); keep the
+    # border predicate in lockstep so both surfaces agree in this gate test.
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda **kw: False)
+    monkeypatch.setattr(send_gate, "send_hold_active", lambda **kw: False)
     adapter.run("send-keys", "-t", "%7", "hello")
     assert len(calls) == 1
     assert any(r[0] == "%7" for r in _markers(db_path))
 
     # Gate closed (typing) → send suppressed → no new marker for a fresh pane.
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda **kw: True)
+    monkeypatch.setattr(send_gate, "send_hold_active", lambda **kw: True)
     monkeypatch.setattr(send_gate, "sanctioned_override", lambda: None)
     monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")
     adapter.run("send-keys", "-t", "%8", "blocked")

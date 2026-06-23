@@ -93,6 +93,10 @@ def _env(tmp_path: Path, capture_text: str) -> dict[str, str]:
             "TMUX_GUARD_LOG": str(tmp_path / "guard.jsonl"),
             "TMUX_GUARD_TTL": "300",
             "TMUX_SEND_GATE_POLICY": "pierce",
+            # These integration tests pin the pure keystroke-lock path; the post-drop
+            # send grace (lock_term + grace) is exercised in the send_gate unit tests,
+            # so disable it here to keep the lock-expiry timing assertions exact/fast.
+            "TMUX_SEND_GRACE_SECONDS": "0",
         }
     )
     return env

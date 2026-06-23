@@ -170,24 +170,27 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
 
 
-def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> None:
+def test_keystroke_lock_any_key_binding_arms_first_keystroke_extends_last_minute() -> None:
     """The root-table any-key binding is the sole arming surface for the
     keystroke-anchored typing lock. It must:
 
       * stamp the per-pane @TYPING_LOCK_UNTIL on a real keystroke,
-      * KEEP an existing future value (no refresh — "5 min since FIRST
-        keystroke", not since LAST), re-arming only when absent/expired,
+      * KEEP an existing value with MORE than 60s left (no refresh — "5 min since
+        FIRST keystroke", not since LAST), re-arming to +300s only when
+        absent/expired OR inside the final 60s (the last-minute extension that
+        closes the still-typing-at-expiry micro-drop),
       * source "now" from #{client_activity} (zero-fork; set -F can't expand %s),
       * pass mouse events through (`send-keys -M`) WITHOUT arming (focus/click
         must never lock a pane), discriminated by a fresh non-empty #{mouse_x},
+      * reset the backspace-abandon run (@BS_RUN 0) on any normal key,
       * faithfully REPLAY the real keystroke with a bare `send-keys`.
     """
     line = _line_starting("    set -Fp @TYPING_LOCK_UNTIL ")
-    # No-refresh keep-or-rearm: keep @TYPING_LOCK_UNTIL while it is >= now, else
-    # rearm to client_activity + 300s.
-    assert "#{?#{e|>=:#{@TYPING_LOCK_UNTIL},#{client_activity}}" in line
+    # Keep-or-rearm with a 60s last-minute window: keep @TYPING_LOCK_UNTIL only
+    # while it is >= now + 60, else rearm to client_activity + 300s.
+    assert "#{?#{e|>=:#{@TYPING_LOCK_UNTIL},#{e|+:#{client_activity},60}}" in line
     assert "#{e|+:#{client_activity},300}" in line
-    # The kept branch re-writes the SAME value (the proof of no-refresh).
+    # The kept branch re-writes the SAME value (the proof of no-refresh outside 60s).
     assert "},#{@TYPING_LOCK_UNTIL}," in line
 
     conf = CONF.read_text(encoding="utf-8")
@@ -195,19 +198,46 @@ def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> Non
     # Mouse keys are excluded from arming and passed straight through.
     assert "if -F '#{!=:#{mouse_x},}' {" in conf
     assert "send-keys -M" in conf
+    # The backspace-run reset lives in the Any else (non-mouse) branch so a normal
+    # key breaks the run, while a mouse pass-through must NOT clear it.
+    assert "    set -p @BS_RUN 0" in conf
     # Faithful replay of the matched key: a bare `send-keys` with no args
     # (tmux re-sends the bound key). Distinct from the `send-keys -M` mouse line.
     stripped = [ln.strip() for ln in conf.splitlines()]
     assert "send-keys" in stripped, "the keep branch must replay the key with a bare send-keys"
 
 
-def test_keystroke_lock_enter_clears_lock_and_submits() -> None:
-    """Enter (and tmux's C-m resolution of Return) clears the pane lock and
-    passes the key through to submit. No focus-based clearing exists."""
+def test_keystroke_lock_enter_clears_lock_stamps_grace_resets_run_and_submits() -> None:
+    """Enter (and tmux's C-m resolution of Return) clears the pane lock, stamps the
+    5s send-grace floor (@TYPING_GRACE_UNTIL), resets the backspace run, and passes
+    the key through to submit. No focus-based clearing exists."""
     for key in ("Enter", "C-m"):
         line = _line_starting(f"bind -n {key} ")
         assert "set -pu @TYPING_LOCK_UNTIL" in line, f"{key} must UNSET the pane lock"
+        assert "@TYPING_GRACE_UNTIL '#{e|+:#{client_activity},5}'" in line, (
+            f"{key} must stamp the 5s send-grace floor"
+        )
+        assert "set -p @BS_RUN 0" in line, f"{key} must reset the backspace-abandon run"
         assert "send-keys" in line, f"{key} must still pass through (submit)"
+
+
+def test_backspace_binding_counts_run_and_stamps_for_abandon_detection() -> None:
+    """A dedicated BSpace binding (most-specific key wins over Any) mirrors Any's
+    arm/extend + replay, increments @BS_RUN (guarding the unset case as 0), and
+    stamps @BS_LAST — the deletion-then-idle signal the send gate reads to drop the
+    guard early on an abandoned draft. No mouse branch (backspace is never a mouse
+    key)."""
+    conf = CONF.read_text(encoding="utf-8")
+    assert "bind -n BSpace {" in conf
+    line = _line_starting("  set -Fp @BS_RUN ")
+    # Increment with an unset-as-0 guard (don't rely on empty-as-0 arithmetic).
+    assert "#{e|+:#{?#{@BS_RUN},#{@BS_RUN},0},1}" in line
+    last = _line_starting("  set -Fp @BS_LAST ")
+    assert "#{client_activity}" in last
+    # The BSpace arm/extend uses the same last-minute keep-condition as Any.
+    bs_lock = [ln for ln in conf.splitlines() if ln.startswith("  set -Fp @TYPING_LOCK_UNTIL ")]
+    assert bs_lock, "BSpace must arm/extend @TYPING_LOCK_UNTIL like Any"
+    assert "#{e|+:#{client_activity},60}" in bs_lock[0]
 
 
 def test_portable_status_guard_indicator_is_also_per_pane() -> None:

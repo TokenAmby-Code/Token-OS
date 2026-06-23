@@ -98,7 +98,10 @@ def _force_quiet(monkeypatch, active: bool):
 
 
 def _force_typing(monkeypatch, active: bool):
+    # The border predicate and the send-path predicate are split; evaluate() reads
+    # the send-path one, so force both to the same value for these gate tests.
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda **kw: active)
+    monkeypatch.setattr(send_gate, "send_hold_active", lambda **kw: active)
 
 
 def _no_override(monkeypatch):
@@ -170,7 +173,8 @@ def test_run_delays_send_keys_during_typing_guard_then_sends(
         calls["typing"] += 1
         return calls["typing"] == 1
 
-    monkeypatch.setattr(send_gate, "typing_guard_active", _typing_once)
+    # evaluate() consults the send-path predicate; first call holds, then clears.
+    monkeypatch.setattr(send_gate, "send_hold_active", _typing_once)
     monkeypatch.setattr(send_gate.time, "sleep", lambda _seconds: None)
     _no_override(monkeypatch)
 
@@ -360,7 +364,7 @@ def test_evaluate_only_blocks_target_under_typing_guard(monkeypatch: pytest.Monk
     _no_override(monkeypatch)
     monkeypatch.setattr(
         send_gate,
-        "typing_guard_active",
+        "send_hold_active",
         lambda **kw: kw.get("target") == "%guarded",
     )
 
@@ -384,6 +388,9 @@ def fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setattr(send_gate.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(send_gate.time, "sleep", _sleep)
     monkeypatch.delenv("TMUX_SEND_GATE_DELAY_TIMEOUT", raising=False)
+    # These pin the pure lock-expiry sleep cadence; the post-drop send grace is
+    # exercised separately, so disable it here to keep the deadline at the lock.
+    monkeypatch.setenv("TMUX_SEND_GRACE_SECONDS", "0")
     return clock
 
 
@@ -546,7 +553,7 @@ def test_run_resolves_canonical_target_to_physical_before_gating(
         seen_targets.append(target)
         return target == "%44"  # the human's lock is on the physical pane
 
-    monkeypatch.setattr(send_gate, "typing_guard_active", _typing)
+    monkeypatch.setattr(send_gate, "send_hold_active", _typing)
 
     adapter = TmuxAdapter(tmux_binary="tmux")
     # Stand in for live canonical->physical resolution (no live tmux in tests).
@@ -565,3 +572,227 @@ def test_run_resolves_canonical_target_to_physical_before_gating(
     assert captured_subprocess == [], "locked-pane send must write zero bytes, never clobber"
     assert recorded_suppressions and recorded_suppressions[-1]["reason"] == "typing_guard"
     assert result == ""
+
+
+# ── Edge-fuzz refinements: the lock-lifecycle boundaries (R1/R2/R3) ───────────
+# The BORDER predicate (typing_guard_active) and the SEND predicate
+# (send_hold_active) deliberately diverge: the border darkens the instant the lock
+# drops / the draft is abandoned, while a send is held for the grace so it never
+# clobbers a 2nd queued message. These fake the four per-pane options the
+# combined state reads (lock / grace / bs_run / bs_last).
+
+
+def _guard_tmux(monkeypatch, opts: dict[str, int | None]) -> None:
+    """Fake real tmux so ``_pane_guard_state`` reads ``opts`` (option name -> int).
+
+    Answers each ``show-options -pqv -t <pane> <OPTION>`` with ``opts[OPTION]``
+    (empty line + rc0 when None/absent, matching real ``-pqv`` for an unset
+    option). Single-pane; any other tmux command errors (fail-open).
+    """
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+    known = (
+        send_gate._TYPING_LOCK_OPTION,
+        send_gate._TYPING_GRACE_OPTION,
+        send_gate._BS_RUN_OPTION,
+        send_gate._BS_LAST_OPTION,
+    )
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "show-options" in cmd:
+            for name in known:
+                if name in cmd:
+                    val = opts.get(name)
+                    proc.stdout = "" if val is None else f"{int(val)}\n"
+                    return proc
+            proc.stdout = ""
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+
+def _clear_edge_env(monkeypatch) -> None:
+    for env in (
+        "TMUX_SEND_GRACE_SECONDS",
+        "TMUX_BS_ABANDON_RUN",
+        "TMUX_BS_STOP_IDLE_SECONDS",
+    ):
+        monkeypatch.delenv(env, raising=False)
+
+
+def test_enter_grace_darkens_border_but_holds_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2: after Enter the lock is unset (border dark) but @TYPING_GRACE_UNTIL holds
+    the send for the grace, so an automated write can't fire into the gap while the
+    Emperor queues a follow-up message."""
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _clear_edge_env(monkeypatch)
+    _guard_tmux(monkeypatch, {send_gate._TYPING_GRACE_OPTION: now + 5})
+
+    assert send_gate.typing_guard_active(target="%9") is False, "border dark once lock is unset"
+    assert send_gate.send_hold_active(target="%9") is True, "send still held for the grace"
+    assert send_gate._pane_guard_state("%9").hold_kind == "grace"
+
+
+def test_rearm_during_grace_reextends_the_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2: a keystroke during the grace re-arms @TYPING_LOCK_UNTIL to now+300, so the
+    border re-lights and the send-hold deadline jumps to lock+grace — the lingering
+    grace floor is dominated (re-queue), never an early release."""
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _clear_edge_env(monkeypatch)
+    # Lingering Enter grace (now+5) PLUS a fresh re-arm to now+300, run reset to 0.
+    _guard_tmux(
+        monkeypatch,
+        {
+            send_gate._TYPING_LOCK_OPTION: now + 300,
+            send_gate._TYPING_GRACE_OPTION: now + 5,
+            send_gate._BS_RUN_OPTION: 0,
+        },
+    )
+
+    assert send_gate.typing_guard_active(target="%9") is True, "border re-lit by the re-arm"
+    state = send_gate._pane_guard_state("%9")
+    assert state.hold_kind == "lock"
+    # lock(now+300) + grace(5) dominates the now+5 floor.
+    assert state.send_hold_until == pytest.approx(now + 305)
+
+
+def test_backspace_abandon_darkens_border_and_holds_only_for_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3: >= 4 backspaces then >= 1.5s idle reads as abandon — the border darkens
+    DESPITE a live future lock, and the send is held only to the deletion-idle point
+    plus the grace (NOT the stale remaining lock), so a real abandon injects cleanly
+    once the grace lapses."""
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _clear_edge_env(monkeypatch)
+    _guard_tmux(
+        monkeypatch,
+        {
+            send_gate._TYPING_LOCK_OPTION: now + 200,  # lock still live/future…
+            send_gate._BS_RUN_OPTION: 4,
+            send_gate._BS_LAST_OPTION: now - 2,  # …but deleted-and-idle 2s ago
+        },
+    )
+
+    assert send_gate.typing_guard_active(target="%9") is False, "border dark on abandon"
+    assert send_gate.send_hold_active(target="%9") is True
+    state = send_gate._pane_guard_state("%9")
+    assert state.hold_kind == "abandon_grace"
+    # held to bs_last + STOP_IDLE(1.5) + grace(5) = now+4.5, NOT the now+200 lock.
+    assert state.send_hold_until == pytest.approx(now - 2 + 1.5 + 5)
+
+
+def test_backspace_run_without_idle_stays_lit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R3 boundary: a backspace run that has NOT yet gone idle (still mid-deletion)
+    is not an abandon — the border stays lit and the hold is the normal live lock."""
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _clear_edge_env(monkeypatch)
+    _guard_tmux(
+        monkeypatch,
+        {
+            send_gate._TYPING_LOCK_OPTION: now + 200,
+            send_gate._BS_RUN_OPTION: 4,
+            send_gate._BS_LAST_OPTION: now,  # just backspaced — 0s < 1.5s idle
+        },
+    )
+
+    assert send_gate.typing_guard_active(target="%9") is True, "still lit mid-deletion"
+    assert send_gate.send_hold_active(target="%9") is True
+    assert send_gate._pane_guard_state("%9").hold_kind == "lock"
+
+
+def test_untouched_pane_all_options_unset_adds_zero_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2/R3 must not tax untouched panes: all four options unset → no border, no
+    hold, no send_hold deadline, and evaluate() allows the send immediately."""
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _clear_edge_env(monkeypatch)
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    _guard_tmux(monkeypatch, {})
+
+    assert send_gate.typing_guard_active(target="%9") is False
+    assert send_gate.send_hold_active(target="%9") is False
+    assert send_gate._pane_guard_state("%9").send_hold_until is None
+    assert send_gate.evaluate(("send-keys", "-t", "%9", "hi")) is None
+
+
+def test_wait_for_gate_clear_requeues_when_lock_rearms_during_grace(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict
+) -> None:
+    """R2 end-to-end: a keystroke re-arms the lock mid-grace, so the held send keeps
+    waiting past the original grace floor (it re-queues) rather than releasing."""
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    monkeypatch.setenv("TMUX_SEND_GRACE_SECONDS", "5")
+    start = fake_clock["now"]
+    rearm_at = start + 2  # a keystroke 2s into the grace re-arms the lock
+    monkeypatch.setenv("TMUX_SEND_GATE_DELAY_TIMEOUT", "30")  # terminate if logic regresses
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "show-options" in cmd:
+            t = fake_clock["now"]
+            if send_gate._TYPING_LOCK_OPTION in cmd:
+                proc.stdout = f"{int(rearm_at + 300)}\n" if t >= rearm_at else ""
+            elif send_gate._TYPING_GRACE_OPTION in cmd:
+                proc.stdout = f"{int(start + 5)}\n"  # the Enter grace floor
+            else:
+                proc.stdout = ""
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    # The re-armed lock (rearm_at+300)+grace outlasts the 30s timeout → held, not
+    # released at the original now+5 floor: the send re-queued behind the new draft.
+    assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is False
+    assert fake_clock["now"] >= start + 5, "kept holding past the original grace floor"
+
+
+def test_typing_delay_sleep_grace_only_hold_does_not_busyspin(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict
+) -> None:
+    """R2 regression guard: a grace-only hold (the lock already PAST, only the grace
+    floor future) must sleep toward send_hold_until — not hit the 0.05s expiry floor
+    and busy-spin for the whole grace. fake_clock sets grace env 0, so the future
+    @TYPING_GRACE_UNTIL is the sole hold term."""
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    start = fake_clock["now"]
+
+    def _fake_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "show-options" in cmd:
+            if send_gate._TYPING_LOCK_OPTION in cmd:
+                proc.stdout = f"{int(start - 10)}\n"  # lock long expired (stale stamp)
+            elif send_gate._TYPING_GRACE_OPTION in cmd:
+                proc.stdout = f"{int(start + 3)}\n"  # 3s of grace remaining
+            else:
+                proc.stdout = ""
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    assert send_gate.wait_for_gate_clear(("send-keys", "-t", "%9", "hi")) is True
+
+    sleeps = fake_clock["sleeps"]
+    assert sleeps, "a grace-only hold must sleep at least once"
+    assert all(s <= send_gate._TYPING_LOCK_RECHECK_SECONDS + 1e-9 for s in sleeps), (
+        "each wake is capped at the recheck interval"
+    )
+    assert fake_clock["now"] >= start + 3, "wakes carry the clock past the grace end"
+    assert len(sleeps) <= 5, "~3s grace at a 1s recheck → a handful of wakes, not a busy-spin"

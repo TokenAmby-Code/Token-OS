@@ -49,6 +49,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -88,6 +89,76 @@ _TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
 # interval so an Enter-clear (or a vanished draft) releases a held send within
 # ~1s instead of after the whole 5-min window.
 _TYPING_LOCK_RECHECK_SECONDS = 1.0
+
+# --- Edge-fuzz refinements at the lock-lifecycle boundaries (see tmux-base.conf) ---
+# These three pane options diverge the BORDER surface from the SEND-HOLD surface:
+# the ⌨ pane border darkens the instant the lock drops / the draft is abandoned,
+# while an automated send is still held for a short grace so it never clobbers a
+# message the Emperor is mid-queue. All three fail-open (unset → no effect).
+#
+#   @TYPING_GRACE_UNTIL — absolute epoch floor stamped by Enter/C-m: hold automated
+#                         sends ~5s past the guard drop (covers a queued 2nd message).
+#   @BS_RUN             — count of consecutive backspaces (BSpace binding bumps it;
+#                         any other key / Enter resets it to 0).
+#   @BS_LAST            — epoch of the last backspace in the run (deletion-idle anchor).
+_TYPING_GRACE_OPTION = "@TYPING_GRACE_UNTIL"
+_BS_RUN_OPTION = "@BS_RUN"
+_BS_LAST_OPTION = "@BS_LAST"
+
+# Send grace (seconds): how long an automated send is held PAST the lock term
+# (lock expiry, or an abandoned draft's deletion-idle point) so a second queued
+# message is never clobbered. The Enter-stamped @TYPING_GRACE_UNTIL is a .conf
+# floor; this env knob owns the dominant term (lock_term + grace) and can only
+# extend the hold, never shorten it below the floor. 0 disables the added grace.
+_SEND_GRACE_ENV = "TMUX_SEND_GRACE_SECONDS"
+_DEFAULT_SEND_GRACE_SECONDS = 5.0
+
+# Backspace-abandon detection. A run of >= _BS_ABANDON_RUN backspaces followed by
+# >= _BS_STOP_IDLE seconds of stillness reads as "the Emperor deleted his input
+# and walked away": the border darkens early and (after the send grace) automation
+# may inject cleanly. A typo path retypes — the Any binding resets @BS_RUN, the
+# lock re-arms, and the 5s grace covers the gap so the retype is never clobbered.
+_BS_ABANDON_RUN_ENV = "TMUX_BS_ABANDON_RUN"
+_DEFAULT_BS_ABANDON_RUN = 4
+_BS_STOP_IDLE_ENV = "TMUX_BS_STOP_IDLE_SECONDS"
+_DEFAULT_BS_STOP_IDLE_SECONDS = 1.5
+
+
+def _send_grace_seconds() -> float:
+    """Added send-hold grace past the lock term (seconds). Env-overridable, floored at 0."""
+    raw = os.environ.get(_SEND_GRACE_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_SEND_GRACE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_SEND_GRACE_SECONDS
+    return max(0.0, value)
+
+
+def _bs_abandon_run() -> int:
+    """Backspace-run length that arms abandon detection. Env-overridable, floored at 1."""
+    raw = os.environ.get(_BS_ABANDON_RUN_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_BS_ABANDON_RUN
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_BS_ABANDON_RUN
+    return max(1, value)
+
+
+def _bs_stop_idle_seconds() -> float:
+    """Deletion-stillness before an abandon is recognised (seconds). Env-overridable, floored at 0."""
+    raw = os.environ.get(_BS_STOP_IDLE_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_BS_STOP_IDLE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_BS_STOP_IDLE_SECONDS
+    return max(0.0, value)
+
 
 # Automated-activation marker TTL (seconds). Every send through
 # TmuxAdapter.run() is automated by construction (see module docstring), so the
@@ -292,19 +363,20 @@ def _real_tmux_binary() -> str:
         return "tmux"
 
 
-def _pane_lock_until(target: str) -> int | None:
-    """Absolute expiry epoch of ``target``'s keystroke lock, or None.
+def _pane_option_int(target: str, option: str) -> int | None:
+    """Integer value of per-pane ``option`` on ``target``, or None.
 
-    Reads the per-pane ``@TYPING_LOCK_UNTIL`` option the tmux any-key binding
-    stamps. ``show-options -pqv`` prints the value for a set option and an empty
-    line (exit 0) for an unset one. Fail-open: any tmux error / unset / unparsable
-    value yields None (no lock), so a transient fault never wedges pane writes.
+    ``show-options -pqv`` prints the value for a set option and an empty line
+    (exit 0) for an unset one. Fail-open: any tmux error / unset / unparsable
+    value yields None, so a transient fault never wedges pane writes. (A canonical
+    Imperium id tmux cannot resolve errors here → None → fail-open clear; callers
+    must resolve canonical → physical before the gate.)
     """
     if not target:
         return None
     try:
         proc = subprocess.run(
-            [_real_tmux_binary(), "show-options", "-pqv", "-t", target, _TYPING_LOCK_OPTION],
+            [_real_tmux_binary(), "show-options", "-pqv", "-t", target, option],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -324,15 +396,118 @@ def _pane_lock_until(target: str) -> int | None:
         return None
 
 
-def _pane_keystroke_locked(target: str) -> bool:
-    """True iff ``target`` carries a live keystroke lock (expiry still future).
+def _pane_lock_until(target: str) -> int | None:
+    """Absolute expiry epoch of ``target``'s keystroke lock, or None."""
+    return _pane_option_int(target, _TYPING_LOCK_OPTION)
 
-    The lock is purely keystroke-anchored and focus-decoupled: it engages when
-    the Emperor types into the pane and holds until the 5-min timer or an Enter
-    clears it, regardless of which pane currently has focus.
+
+@dataclass(frozen=True)
+class _GuardState:
+    """The full per-pane guard reading the lock boundaries diverge two surfaces from.
+
+    Derived from one read of the four pane options (``fail-open`` → all None/0 when
+    tmux is unreachable). Two surfaces fall out:
+
+      * ``border_active`` — the ⌨ pane-border / aggregate "typing" signal. Lit while
+        the lock is live AND the draft is not abandoned; darkens the instant the
+        lock drops or a deletion-then-idle abandon is detected.
+      * ``send_hold_active`` — the universal send path. Held until ``send_hold_until``:
+        the lock term (lock expiry, or an abandoned draft's deletion-idle point) plus
+        the send grace, floored by the Enter-stamped grace epoch. So an automated
+        send is still held briefly after the border darkens, covering a 2nd queued
+        message; a keystroke during the grace re-arms the lock and re-extends the hold.
     """
-    until = _pane_lock_until(target)
-    return until is not None and time.time() < until
+
+    lock_until: int | None
+    grace_until: int | None
+    bs_run: int
+    bs_last: int | None
+    now: float
+
+    @property
+    def abandoned(self) -> bool:
+        """The Emperor deleted a run of input (>= run length) and went still (>= idle)."""
+        if self.bs_run < _bs_abandon_run() or self.bs_last is None:
+            return False
+        return self.now >= self.bs_last + _bs_stop_idle_seconds()
+
+    @property
+    def lock_live(self) -> bool:
+        return self.lock_until is not None and self.now < self.lock_until
+
+    @property
+    def border_active(self) -> bool:
+        """Border/aggregate signal: a live lock, minus an abandoned draft."""
+        return self.lock_live and not self.abandoned
+
+    @property
+    def send_hold_until(self) -> float | None:
+        """Absolute epoch the send path is held until, or None (no hold).
+
+        ``max(lock_term + grace, grace_until)`` where ``lock_term`` is the lock
+        expiry normally, but the deletion-idle point (``bs_last + stop_idle``) when
+        abandoned — so an abandoned pane is held only for the grace past its
+        deletion-idle, never the stale remaining lock.
+        """
+        grace = _send_grace_seconds()
+        parts: list[float] = []
+        if self.lock_until is not None:
+            if self.abandoned and self.bs_last is not None:
+                lock_term: float = self.bs_last + _bs_stop_idle_seconds()
+            else:
+                lock_term = float(self.lock_until)
+            parts.append(lock_term + grace)
+        if self.grace_until is not None:
+            parts.append(float(self.grace_until))
+        if not parts:
+            return None
+        return max(parts)
+
+    @property
+    def send_hold_active(self) -> bool:
+        until = self.send_hold_until
+        return until is not None and self.now < until
+
+    @property
+    def hold_kind(self) -> str | None:
+        """Why the send is held: a live lock vs a post-drop / abandon debounce."""
+        if not self.send_hold_active:
+            return None
+        if self.abandoned:
+            return "abandon_grace"
+        if self.lock_live:
+            return "lock"
+        return "grace"
+
+
+def _pane_guard_state(target: str | None) -> _GuardState:
+    """One read of the four pane options into a ``_GuardState``; fail-open.
+
+    A handful of short ``show-options -pqv`` reads — this runs on the send path and
+    the background border reconciler, never the per-keystroke hot path, so the read
+    cost is immaterial (the lag-monster concern is the keystroke binding, which
+    stays pure-tmux zero-fork).
+    """
+    now = time.time()
+    if not target:
+        return _GuardState(None, None, 0, None, now)
+    return _GuardState(
+        lock_until=_pane_option_int(target, _TYPING_LOCK_OPTION),
+        grace_until=_pane_option_int(target, _TYPING_GRACE_OPTION),
+        bs_run=_pane_option_int(target, _BS_RUN_OPTION) or 0,
+        bs_last=_pane_option_int(target, _BS_LAST_OPTION),
+        now=now,
+    )
+
+
+def _pane_keystroke_locked(target: str) -> bool:
+    """True iff ``target``'s BORDER signal is lit: a live lock, minus abandonment.
+
+    The lock is keystroke-anchored and focus-decoupled: it engages when the Emperor
+    types into the pane and holds until the 5-min timer or an Enter clears it,
+    regardless of focus. A deletion-then-idle abandon darkens it early.
+    """
+    return _pane_guard_state(target).border_active
 
 
 def _live_pane_ids() -> list[str] | None:
@@ -356,7 +531,8 @@ def any_typing_guard_active() -> bool:
     """Aggregate query: true if any pane is under a typing guard.
 
     Aggregate behavior for global policies that intentionally hang on ANY typing
-    guard: true iff any live pane carries a keystroke lock.
+    guard: true iff any live pane's border signal is lit (a live keystroke lock,
+    minus an abandoned draft).
     """
     panes = _live_pane_ids()
     if panes is None:
@@ -365,24 +541,47 @@ def any_typing_guard_active() -> bool:
 
 
 def typing_guard_active(*, target: str | None = None) -> bool:
-    """Canonical typing-guard predicate — the keystroke-anchored per-pane lock.
+    """The BORDER / aggregate typing signal — a live keystroke lock, minus abandon.
 
-    With ``target`` set, the guard holds iff that pane carries a live keystroke
-    lock (``@TYPING_LOCK_UNTIL`` still in the future): the Emperor typed into the
-    pane within the last 5 min and has not pressed Enter. This is the single,
-    honest, focus-DECOUPLED signal both surfaces consume — the ⌨ pane-border
-    diagnostic (``tmux-typing-guard-status --scan``) and the universal send-hold.
-    Focus/click never set, move, or clear it; the fleet's own ``send-keys`` never
-    arms it (those bypass the key table). A genuine unsent draft is covered by
-    the lock the keystroke that typed it armed — no prompt-line screen-scraping,
-    so an idle worker pane with leftover prompt text is never falsely held.
+    With ``target`` set, true iff that pane's lock (``@TYPING_LOCK_UNTIL``) is still
+    in the future AND the draft is not abandoned (a deletion-then-idle run): the
+    Emperor typed into the pane within the last 5 min, has not pressed Enter, and
+    has not backspaced his input away and gone still. This is the signal the ⌨
+    pane-border diagnostic (``tmux-typing-guard-status --scan``) renders.
+
+    NOTE this is the BORDER predicate, deliberately split from the SEND path
+    (:func:`send_hold_active`): the border darkens the instant the lock drops or the
+    draft is abandoned, while a send is still held for the grace so it never
+    clobbers a 2nd queued message. Focus/click never set, move, or clear the lock;
+    the fleet's own ``send-keys`` never arms it (those bypass the key table). A
+    genuine unsent draft is covered by the lock its keystroke armed — no prompt-line
+    screen-scraping, so an idle worker pane with leftover prompt text is never held.
 
     With no target, keep aggregate behavior for policies that hang on ANY guard.
 
     Fail-open: if tmux is unreachable or reports nothing, returns False.
     """
     if target:
-        return _pane_keystroke_locked(target)
+        return _pane_guard_state(target).border_active
+    return any_typing_guard_active()
+
+
+def send_hold_active(*, target: str | None = None) -> bool:
+    """The SEND-path predicate — hold an automated write until the grace clears.
+
+    With ``target`` set, true while ``now`` is before the pane's ``send_hold_until``
+    (the lock term + send grace, floored by the Enter-stamped grace epoch). This is
+    the surface the universal send gate consults: it stays held for the grace AFTER
+    the border (:func:`typing_guard_active`) has gone dark, so an automated send
+    cannot fire into the gap while the Emperor queues a follow-up message — and a
+    keystroke during the grace re-arms the lock and re-extends the hold (re-queue).
+
+    With no target, fall back to the aggregate border query (no pane to hold on).
+
+    Fail-open: if tmux is unreachable or reports nothing, returns False.
+    """
+    if target:
+        return _pane_guard_state(target).send_hold_active
     return any_typing_guard_active()
 
 
@@ -445,13 +644,17 @@ _QUIET_DELAY_RECHECK_SECONDS = 60.0
 def _typing_delay_sleep(target: str | None) -> float:
     """Seconds to sleep before re-checking a typing-guard delay.
 
-    The keystroke lock carries an absolute expiry, so sleep toward it — a quiet
+    The hold carries an absolute deadline (``send_hold_until`` — the lock term plus
+    the send grace, or the Enter-stamped grace floor), so sleep toward it — a quiet
     5-min lock costs ~one wake per second rather than a busy-spin — but cap the
     interval at ``_TYPING_LOCK_RECHECK_SECONDS`` so an Enter-clear (which retires
-    the lock early) or a vanished draft releases the held send within ~1s. With
-    no live lock (draft-only hold, or tmux unreadable) fall back to the cap.
+    the lock early) or a vanished draft releases the held send within ~1s. Sleeping
+    toward ``send_hold_until`` (not the raw lock expiry) is load-bearing: a
+    grace-only hold whose lock has already passed would otherwise hit the 0.05s
+    floor and busy-spin for the whole grace. With no hold deadline (tmux unreadable)
+    fall back to the cap.
     """
-    until = _pane_lock_until(target) if target else None
+    until = _pane_guard_state(target).send_hold_until if target else None
     if until is None:
         return _TYPING_LOCK_RECHECK_SECONDS
     remaining = (until + _DELAY_WAKE_MARGIN_SECONDS) - time.time()
@@ -520,7 +723,10 @@ def evaluate(
 
     target = _extract_target(args)
     quiet, quiet_ctx = quiet_hours_active(db_path=db_path, now=now)
-    typing = typing_guard_active(target=target)
+    # The SEND path consults send_hold_active, NOT the border predicate: a send is
+    # held for the grace after the border has darkened (post-Enter / post-expiry /
+    # post-abandon) so it never clobbers a 2nd queued message.
+    typing = send_hold_active(target=target)
     if not (quiet or typing):
         return None
 
@@ -549,6 +755,14 @@ def record_suppression(result: dict, *, db_path: Path | None = None) -> None:
     reason = result.get("reason")
     target = result.get("target")
     policy = result.get("policy") or ("pierce" if override else "cancel")
+    # Diagnostic only (event_type/policy unchanged): distinguish a live-lock hold
+    # from a post-drop grace / abandon debounce in the events table. Computed here
+    # (not in evaluate) so the hot path issues no extra tmux read; best-effort.
+    if reason == "typing_guard" and target and "hold_kind" not in result:
+        try:
+            result = {**result, "hold_kind": _pane_guard_state(target).hold_kind}
+        except Exception:
+            pass
     if override is not None or policy == "pierce":
         event_type = "send_gate_override"
         logger.warning(
@@ -646,11 +860,12 @@ def _cli(argv: list[str]) -> int:
 
     Subcommands:
       * ``check <verb> [args...]`` — gate a tmux command. Exit 0 allow after any delay / 100 cancel.
-      * ``typing`` — typing-guard predicate. Exit 0 active / 1 inactive.
+      * ``typing [pane]`` — BORDER predicate (live lock, minus abandon). Exit 0 active / 1 inactive.
+      * ``send-hold [pane]`` — SEND predicate (lock term + grace). Exit 0 held / 1 clear.
       * ``quiet``  — quiet-hours predicate.  Exit 0 active / 1 inactive.
     """
     if not argv:
-        sys.stderr.write("usage: send_gate check|typing|quiet [args...]\n")
+        sys.stderr.write("usage: send_gate check|typing|send-hold|quiet [args...]\n")
         return 2
     cmd = argv[0]
     if cmd == "check":
@@ -670,10 +885,13 @@ def _cli(argv: list[str]) -> int:
     if cmd == "typing":
         target = argv[1] if len(argv) > 1 else None
         return 0 if typing_guard_active(target=target) else 1
+    if cmd == "send-hold":
+        target = argv[1] if len(argv) > 1 else None
+        return 0 if send_hold_active(target=target) else 1
     if cmd == "quiet":
         active, _ = quiet_hours_active()
         return 0 if active else 1
-    sys.stderr.write("usage: send_gate check|typing|quiet [args...]\n")
+    sys.stderr.write("usage: send_gate check|typing|send-hold|quiet [args...]\n")
     return 2
 
 
