@@ -13,9 +13,9 @@ def _insert_wrapper_instance(db_path, *, instance_id="wrap-unnamed", wrapper_id=
             """
             INSERT INTO instances (
                 id, name, engine, working_dir, device_id, status, rank,
-                wrapper_launch_id, tmux_pane, session_doc_id
+                wrapper_launch_id, session_doc_id
             ) VALUES (?, 'needs-name', 'codex', '/tmp', 'Mac-Mini', 'working',
-                      'astartes', ?, '%9', NULL)
+                      'astartes', ?, NULL)
             """,
             (instance_id, wrapper_id),
         )

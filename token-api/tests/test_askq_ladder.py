@@ -385,8 +385,8 @@ def test_hook_handlers_persist_question_and_answer(ladder_env, monkeypatch):
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, legion, tmux_pane)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, legion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             sid,
             sid,
@@ -397,7 +397,6 @@ def test_hook_handlers_persist_question_and_answer(ladder_env, monkeypatch):
             "idle",
             "one_off",
             "custodes",
-            "%2",
         ),
     )
     conn.commit()

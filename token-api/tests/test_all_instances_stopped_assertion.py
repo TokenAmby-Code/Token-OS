@@ -38,8 +38,8 @@ def _insert_instance(db_path, instance_id, *, status="processing", is_subagent=0
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, tmux_pane, is_subagent, last_activity)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, engine, is_subagent, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance_id,
             instance_id,
@@ -50,7 +50,6 @@ def _insert_instance(db_path, instance_id, *, status="processing", is_subagent=0
             status,
             "interactive",
             "claude",
-            None,
             is_subagent,
             datetime.now().isoformat(),
         ),

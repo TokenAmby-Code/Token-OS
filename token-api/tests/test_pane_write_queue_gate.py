@@ -178,8 +178,8 @@ async def test_queue_enables_skill_sink_only_for_codex_gt(app_env: Any, monkeypa
         conn.execute(
             """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, instance_type, engine, tmux_pane)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, instance_type, engine)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 "gt-codex-skill",
                 "gt-codex-skill",
@@ -190,7 +190,6 @@ async def test_queue_enables_skill_sink_only_for_codex_gt(app_env: Any, monkeypa
                 "idle",
                 "golden_throne",
                 "codex",
-                "%9",
             ),
         )
 

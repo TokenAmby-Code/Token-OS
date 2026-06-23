@@ -22,9 +22,9 @@ def _insert_ops_fixture(app_env):
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, tmux_pane, engine, registered_at, last_activity, zealotry)
+            status, engine, registered_at, last_activity, zealotry)
            VALUES (?, ?, 'ops-test', '/tmp/ops', 'local', 'Mac-Mini',
-                   'processing', '%44', 'codex',
+                   'processing', 'codex',
                    '2026-05-25T10:00:00', '2026-05-25T10:01:00', 5)""",
         (instance_id, str(uuid.uuid4())),
     )
@@ -321,9 +321,9 @@ def test_work_state_ignores_stale_idle_instances(client, app_env):
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, tmux_pane, engine, registered_at, last_activity)
+            status, engine, registered_at, last_activity)
            VALUES (?, ?, 'stale-idle', '/tmp/ops', 'local', 'Mac-Mini',
-                   'idle', '%44', 'codex',
+                   'idle', 'codex',
                    datetime('now', '-20 minutes'), datetime('now', '-10 minutes'))""",
         (str(uuid.uuid4()), str(uuid.uuid4())),
     )

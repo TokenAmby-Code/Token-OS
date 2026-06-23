@@ -19,22 +19,21 @@ import sys
 
 
 def _insert_instance(
-    db_path, instance_id, *, pane=None, parent=None, legion="astartes", status="idle", hook_driven=0
+    db_path, instance_id, *, parent=None, legion="astartes", status="idle", hook_driven=0
 ):
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status, tmux_pane,
+            profile_name, tts_voice, notification_sound, status,
             parent_instance_id, legion, hook_driven)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?)""",
         (
             instance_id,
             f"{instance_id}-session",
             instance_id,
             "/tmp",
             status,
-            pane,
             parent,
             legion,
             hook_driven,
@@ -67,7 +66,7 @@ def _input_lock(db_path, instance_id):
 
 def test_stop_clears_hook_driven(app_env):
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "flagged-1", pane="%40", hook_driven=1)
+    _insert_instance(app_env.db_path, "flagged-1", hook_driven=1)
 
     async def run():
         res = await hooks.handle_stop({"session_id": "flagged-1"})
@@ -79,7 +78,7 @@ def test_stop_clears_hook_driven(app_env):
 
 def test_session_end_clears_hook_driven(app_env):
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "flagged-2", pane="%41", hook_driven=1)
+    _insert_instance(app_env.db_path, "flagged-2", hook_driven=1)
 
     async def run():
         await hooks.handle_session_end({"session_id": "flagged-2"})
@@ -90,7 +89,7 @@ def test_session_end_clears_hook_driven(app_env):
 
 def test_session_end_clears_input_lock(app_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "locked-1", pane="%44")
+    _insert_instance(app_env.db_path, "locked-1")
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
             "UPDATE legacy_instances SET input_lock = ? WHERE id = ?",
@@ -117,7 +116,7 @@ async def _never_dead(db, session_id, existing, actor):
 def test_prompt_submit_does_not_flip_global_productivity(app_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
     shared = app_env.shared
-    _insert_instance(app_env.db_path, "live-1", pane="%42")
+    _insert_instance(app_env.db_path, "live-1")
     monkeypatch.setattr(hooks, "_stop_if_dead_pane", _never_dead)
 
     calls: list = []
@@ -138,7 +137,7 @@ def test_prompt_submit_does_not_flip_global_productivity(app_env, monkeypatch):
 def test_post_tool_use_does_not_flip_global_productivity(app_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
     shared = app_env.shared
-    _insert_instance(app_env.db_path, "live-2", pane="%43")
+    _insert_instance(app_env.db_path, "live-2")
     monkeypatch.setattr(hooks, "_stop_if_dead_pane", _never_dead)
 
     calls: list = []
@@ -183,13 +182,13 @@ def _register_child(app_env, monkeypatch, child_id, child_pane, parent_id):
 
 
 def test_fg_dispatched_worker_is_hook_driven(app_env, monkeypatch):
-    _insert_instance(app_env.db_path, "fg-1", pane="%50", legion="fabricator")
+    _insert_instance(app_env.db_path, "fg-1", legion="fabricator")
     _register_child(app_env, monkeypatch, "worker-1", "%51", "fg-1")
     assert _hook_driven(app_env.db_path, "worker-1") == 1
 
 
 def test_custodes_dispatched_worker_is_not_hook_driven(app_env, monkeypatch):
-    _insert_instance(app_env.db_path, "cust-1", pane="%52", legion="custodes")
+    _insert_instance(app_env.db_path, "cust-1", legion="custodes")
     _register_child(app_env, monkeypatch, "worker-2", "%53", "cust-1")
     assert _hook_driven(app_env.db_path, "worker-2") == 0
 
@@ -217,8 +216,8 @@ def test_direct_emperor_launch_is_not_hook_driven(app_env, monkeypatch):
 
 def test_stop_subscription_delivery_flags_subscriber(app_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "watched-1", pane="%60")
-    _insert_instance(app_env.db_path, "subscriber-1", pane="%61")
+    _insert_instance(app_env.db_path, "watched-1")
+    _insert_instance(app_env.db_path, "subscriber-1")
 
     async def fake_write(pane, payload):
         return {"status": "sent", "operation": "fake"}

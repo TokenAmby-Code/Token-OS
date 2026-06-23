@@ -52,9 +52,9 @@ def _insert_gt(db_path: Path, *, doc_path: Path, status: str = "idle", zealotry:
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            tmux_pane, status, instance_type, zealotry, session_doc_id,
+            status, instance_type, zealotry, session_doc_id,
             registered_at, last_activity)
-           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', '%10', ?, 'golden_throne', ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', ?, 'golden_throne', ?, ?, ?, ?)""",
         (iid, str(uuid.uuid4()), f"gt-{iid[:8]}", status, zealotry, doc_id, now, now),
     )
     conn.commit()

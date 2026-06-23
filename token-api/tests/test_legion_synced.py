@@ -48,7 +48,6 @@ def _insert_instance(
     legion="astartes",
     synced=0,
     status="idle",
-    tmux_pane=None,
     working_dir="/tmp",
     last_activity=None,
     db_path=None,
@@ -60,8 +59,8 @@ def _insert_instance(
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, legion, synced, tmux_pane, registered_at, last_activity)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",
+            status, legion, synced, registered_at, last_activity)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?)""",
         (
             iid,
             str(uuid.uuid4()),
@@ -70,7 +69,6 @@ def _insert_instance(
             status,
             legion,
             synced,
-            tmux_pane,
             now,
             now,
         ),
@@ -376,7 +374,7 @@ class TestSyncedSessionLookup:
 
     def test_mechanicus_session_uses_legacy_synced(self, client):
         """Non-custodes legions keep the legacy claude_instances.synced lookup."""
-        iid = _insert_instance(legion="mechanicus", synced=1, tmux_pane="%5")
+        iid = _insert_instance(legion="mechanicus", synced=1)
         resp = client.get("/api/legion/mechanicus/synced-session")
         assert resp.status_code == 200
         data = resp.json()
@@ -937,10 +935,9 @@ class TestSetTmuxPane:
     """Pane rebinding is retired. Tmux runtime identity belongs to tmuxctl."""
 
     def test_rebind_tmux_pane_route_removed(self, client: TestClient) -> None:
-        iid = _insert_instance(tmux_pane="mechanicus:new", status="processing")
+        iid = _insert_instance(status="processing")
         resp = client.patch(f"/api/instances/{iid}/tmux-pane", json={"tmux_pane": "%16"})
         assert resp.status_code == 404
-        assert _get_instance(iid)["tmux_pane"] == "mechanicus:new"
 
     def test_rebind_tmux_pane_nonexistent_route_removed(self, client: TestClient) -> None:
         resp = client.patch("/api/instances/nonexistent-id/tmux-pane", json={"tmux_pane": "%16"})

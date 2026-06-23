@@ -35,21 +35,22 @@ def _insert(
     status="idle",
     hook_driven=0,
 ):
+    # Pane geometry (tmux_pane/pane_label) is no longer stored — pane occupancy is
+    # resolved live via ``instance_id_for_pane`` (monkeypatched per test). The ``pane``
+    # / ``pane_label`` kwargs are accepted for call-site readability but not persisted.
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status, tmux_pane,
-            pane_label, primarch, legion, hook_driven)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?, ?)""",
+            profile_name, tts_voice, notification_sound, status,
+            primarch, legion, hook_driven)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?)""",
         (
             instance_id,
             f"{instance_id}-session",
             instance_id,
             "/tmp",
             status,
-            pane,
-            pane_label,
             primarch,
             legion,
             hook_driven,
@@ -68,10 +69,14 @@ def _hook_driven(db_path, instance_id):
     return row[0] if row else None
 
 
-def _rows_at_pane(db_path, pane):
+def _rows_with_primarch(db_path, primarch):
+    # Pane ids are no longer stored, so pane occupancy can't be queried from the DB.
+    # The supplant outcome surfaces instead through the persona/primarch carried by
+    # the surviving row (supplant renames the prior row's id onto the new session,
+    # preserving its persona_id → primarch projection).
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
-        "SELECT id, primarch FROM legacy_instances WHERE tmux_pane = ?", (pane,)
+        "SELECT id, primarch FROM legacy_instances WHERE primarch = ?", (primarch,)
     ).fetchall()
     conn.close()
     return rows
@@ -127,7 +132,7 @@ def test_persona_pane_supplant_when_label_unresolved(app_env, monkeypatch):
 
     asyncio.run(run())
 
-    rows = _rows_at_pane(app_env.db_path, "%fg")
+    rows = _rows_with_primarch(app_env.db_path, "fabricator-general")
     assert len(rows) == 1, f"expected supplant (1 row), got {len(rows)}: {rows}"
     surviving_id, surviving_primarch = rows[0]
     assert surviving_id == "new-fg", "the new session must take over the persona row"
@@ -165,11 +170,12 @@ def test_non_persona_pane_is_not_supplanted(app_env, monkeypatch):
 
     asyncio.run(run())
 
-    ids = {r[0] for r in _rows_at_pane(app_env.db_path, "%wk")}
     # No supplant: the stale non-persona row survives untouched and the new session
     # registers as its own distinct row. New registrations no longer persist tmux_pane,
-    # so verify the new row by id rather than by pane.
-    assert "stale-worker" in ids, "non-persona row must not be supplanted/migrated"
+    # so verify both rows by id rather than by pane.
+    assert _row_by_id(app_env.db_path, "stale-worker") is not None, (
+        "non-persona row must not be supplanted/migrated"
+    )
     assert _row_by_id(app_env.db_path, "new-worker") is not None, "new session must register"
 
 

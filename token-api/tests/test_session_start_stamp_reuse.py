@@ -26,13 +26,15 @@ from fastapi.testclient import TestClient
 
 
 def _insert(db_path, instance_id, *, pane=None, status="idle"):
+    # ``pane`` is accepted for call-site compatibility but no longer stored: pane
+    # geometry is resolved live from the @INSTANCE_ID stamp, not a DB column.
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status, tmux_pane)
-           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?)""",
-        (instance_id, f"{instance_id}-session", instance_id, status, pane),
+            profile_name, tts_voice, notification_sound, status)
+           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'p', 'v', 's', ?)""",
+        (instance_id, f"{instance_id}-session", instance_id, status),
     )
     conn.commit()
     conn.close()

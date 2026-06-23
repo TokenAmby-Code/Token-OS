@@ -114,13 +114,17 @@ async def test_direct_pane_write_uninitialized_primitive_is_failed_not_sent(
 
 
 def _insert_instance(db_path, instance_id, pane=None, parent=None, status="idle"):
+    # Pane geometry is no longer stored on the instance row; it is resolved live
+    # from the @INSTANCE_ID stamp. The ``pane`` kwarg is retained for caller
+    # readability but no longer persisted. Stop-hook delivery resolves the pane
+    # from the subscription's ``subscriber_pane`` column, not from here.
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO instances
-           (id, name, working_dir, origin_type, device_id, status, tmux_pane,
+           (id, name, working_dir, origin_type, device_id, status,
             commander_type, commander_id)
-           VALUES (?, ?, ?, 'local', 'Mac-Mini', ?, ?, 'emperor', NULL)""",
-        (instance_id, instance_id, "/tmp", status, pane),
+           VALUES (?, ?, ?, 'local', 'Mac-Mini', ?, 'emperor', NULL)""",
+        (instance_id, instance_id, "/tmp", status),
     )
     conn.commit()
     conn.close()
