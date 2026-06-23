@@ -3,6 +3,7 @@ import importlib
 import sqlite3
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from custodes_state_policy import StateEvent, evaluate_state_event
@@ -16,15 +17,28 @@ def _load_tts():
 
 
 def _insert_tts_instance(db_path: Path) -> str:
+    from instance_mutation import sanctioned_insert_instance_sync
+
     iid = str(uuid.uuid4())
+    now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, tts_mode, registered_at, last_activity)
-           VALUES (?, ?, ?, '/tmp/test', 'local', 'Mac-Mini', 'idle',
-                   'verbose', datetime('now'), datetime('now'))""",
-        (iid, str(uuid.uuid4()), f"tts-{iid[:8]}"),
+    sanctioned_insert_instance_sync(
+        conn,
+        values={
+            "id": iid,
+            "session_id": str(uuid.uuid4()),
+            "tab_name": f"tts-{iid[:8]}",
+            "working_dir": "/tmp/test",
+            "origin_type": "local",
+            "device_id": "Mac-Mini",
+            "status": "idle",
+            "tts_mode": "verbose",
+            "registered_at": now,
+            "last_activity": now,
+        },
+        mutation_type="instance_registered",
+        write_source="test",
+        actor="test",
     )
     conn.execute("UPDATE instances SET tts_voice = 'Microsoft George' WHERE id = ?", (iid,))
     conn.commit()

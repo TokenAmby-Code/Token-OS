@@ -716,6 +716,29 @@ async def _persist_runtime_fields(
     )
 
 
+async def _session_start_effective_pane(
+    tmux_pane: str | None,
+    pane_label: str | None,
+) -> str | None:
+    """Return an addressable pane for SessionStart side effects.
+
+    Hook payloads sometimes arrive without ``TMUX_PANE`` even though the pane's
+    stable label (for example ``legion:custodes``) is present. Pane geometry is
+    still not persisted: this resolves the transient label through tmuxctl's live
+    pane oracle so SessionStart can stamp and tint the actual pane on this event.
+    """
+    if tmux_pane:
+        return tmux_pane
+    label = _normalize_text(pane_label)
+    if not label:
+        return None
+    try:
+        return await shared.resolve_tmux_pane_id(label)
+    except Exception as exc:
+        logger.warning("Hook: SessionStart pane label resolve failed for %s: %s", label, exc)
+        return None
+
+
 async def _unstamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
     """Clear ``@INSTANCE_ID`` on a pane an instance is moving *off* of.
 
@@ -2572,6 +2595,11 @@ async def handle_session_start(payload: dict) -> dict:
     pane_label = payload.get("pane_label") or env.get("TOKEN_API_PANE_LABEL")
     if not pane_label:
         pane_label = await _tmux_pane_label(tmux_pane)
+    # Effective pane for this SessionStart event. If Claude/hook env stripped
+    # TMUX_PANE but the stable role label survived (notably legion:custodes),
+    # live-resolve that label so the row is stamped and tinted immediately.
+    # This is transient pane addressing only; nothing is written to instances.
+    tmux_pane = await _session_start_effective_pane(tmux_pane, pane_label)
 
     # The pane's @INSTANCE_ID stamp as read by the hook itself, atomically with
     # the event. The live tmuxctl lookup stays preferred (fresher), but when it

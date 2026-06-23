@@ -16236,6 +16236,9 @@ async def _resolve_work_action_attribution(
                 return (session_id, True)
             if bool(row["hook_driven"]):
                 return (session_id, False)
+            # Pane geometry was exterminated from instances. Resolve the live pane
+            # from the @INSTANCE_ID oracle only long enough to check whether an
+            # automated activity marker should discount this hook-driven signal.
             tmux_pane, _role = await shared.resolve_instance_pane(session_id)
             if tmux_pane:
                 # injected_at/expires_at are naive-LOCAL (matches instances.last_activity),
