@@ -369,6 +369,30 @@ async def _ensure_instances(db) -> None:
             ) THEN RAISE(ABORT, 'persona_id must reference personas.id') END;
         END
     """)
+    # Persona-binding null-clobber fail-safe (the P1 koronus:pax/orchestrator
+    # slug-null corruption). A `legion=civic` PATCH — civic is an ALLOWED_LEGION
+    # but has no persona, and the legion column itself died into persona_id — must
+    # NEVER drop a row's existing persona binding to NULL. When it did, the live
+    # singleton pane resolved as "no live instance" (persona_unregistered_suppressed)
+    # and every registry-mediated send was suppressed while the pane was demonstrably
+    # alive. Nulling persona_id is never a sanctioned operation anywhere in the
+    # service (release-on-stop is keyed on status/rank, not by nulling the binding —
+    # see personas.active_non_retired_persona_ids), so this guard is writer-agnostic:
+    # whatever path fires the bad write, the DB refuses to null the slug and the prior
+    # valid binding is preserved. AFTER-UPDATE restore (SQLite BEFORE triggers cannot
+    # mutate NEW.*) mirrors trg_instances_stamp_persona_rank; it converges as a fixed
+    # point (the restore writes persona_id non-NULL → WHEN false on any re-fire) under
+    # recursive_triggers ON or OFF, and lets the rest of the offending UPDATE's columns
+    # land untouched.
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_no_null_clobber")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_persona_no_null_clobber
+        AFTER UPDATE OF persona_id ON instances
+        WHEN OLD.persona_id IS NOT NULL AND NEW.persona_id IS NULL
+        BEGIN
+            UPDATE instances SET persona_id = OLD.persona_id WHERE id = NEW.id;
+        END
+    """)
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_commander_guard")
     await db.execute("""
         CREATE TRIGGER trg_instances_persona_commander_guard
