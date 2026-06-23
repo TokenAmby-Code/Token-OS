@@ -1890,7 +1890,8 @@ def _spawn_stack_enforce(window_target: str | None) -> None:
 async def _cleanup_tmux_pane_cosmetic(pane: str) -> None:
     commands: list[tuple[str, ...]] = [
         ("tmux", "select-pane", "-t", pane, "-T", ""),
-        ("tmux", "select-pane", "-t", pane, "-P", "bg=default,fg=default"),
+        ("tmux", "set-option", "-pu", "-t", pane, "window-style"),
+        ("tmux", "set-option", "-pu", "-t", pane, "window-active-style"),
     ]
     for cmd in commands:
         try:
@@ -1910,6 +1911,10 @@ async def _cleanup_tmux_pane_runtime_stamps(pane: str) -> None:
         "@INSTANCE_ID",
         "@CC_STATE",
         "@PANE_LABEL",
+        "@PERSONA",
+        "@SESSION_DOC",
+        "@CWD",
+        "@OPS_SELECTED",
         "@ACTIVE_TITLE",
         "@PROGRESS_TITLE",
         "@PANE_PROGRESS",

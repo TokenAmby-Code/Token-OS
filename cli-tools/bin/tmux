@@ -42,6 +42,40 @@ find_real_tmux() {
 _REAL_TMUX="$(find_real_tmux)"
 export IMPERIUM_TMUX_BIN="$_REAL_TMUX"
 
+RUNTIME_PANE_OPTIONS=(
+    @INSTANCE_ID
+    @CC_STATE
+    @PANE_LABEL
+    @PERSONA
+    @SESSION_DOC
+    @CWD
+    @OPS_SELECTED
+    @ACTIVE_TITLE
+    @PROGRESS_TITLE
+    @PANE_PROGRESS
+    @PANE_TITLE_SUPPRESS
+    @TTS_STATE
+    @CONTEXT_INFO
+    @STACK_PENDING
+    @GT_FIRE
+    @PLANNING_STATE
+    @PLANNING_AGENT
+    @DISCORD_VOICE_LOCK
+    @DISCORD_VOICE_PROCESSING
+    @TOKEN_API_WRAPPER_LAUNCH_ID
+    @TOKEN_API_ENGINE
+    @TOKEN_API_LAUNCHER
+    @TOKEN_API_CWD
+    @TOKEN_API_SESSION_ID
+    @TOKEN_API_DISPATCH_TARGET
+    @TOKEN_API_DISPATCH_WINDOW
+    @TOKEN_API_DISPATCH_MODE
+    @TOKEN_API_DISPATCH_SLOT
+    @TOKEN_API_LAUNCH_MODE
+    @TOKEN_API_TARGET_WORKING_DIR
+)
+PANE_STYLE_OPTIONS=(window-style window-active-style)
+
 is_launch_command() {
     if [[ $# -eq 0 ]]; then
         return 0
@@ -251,6 +285,45 @@ extract_target_flag() {
     return 1
 }
 
+is_instance_id_unset() {
+    [[ $# -gt 0 ]] || return 1
+    case "$1" in set-option|set) ;; *) return 1 ;; esac
+    local has_pane=0 has_unset=0 arg
+    for arg in "${@:2}"; do
+        [[ "$arg" == -* && "$arg" == *p* ]] && has_pane=1
+        [[ "$arg" == -* && "$arg" == *u* ]] && has_unset=1
+    done
+    [[ "$has_pane" == 1 && "$has_unset" == 1 ]] || return 1
+    [[ " ${*} " == *" @INSTANCE_ID "* ]]
+}
+
+clear_tint_before_instance_unset() {
+    is_instance_id_unset "$@" || return 0
+    local target base
+    target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
+    base=(set-option -pu)
+    if [[ -n "$target" ]]; then
+        base+=(-t "$target")
+    fi
+    local opt
+    for opt in "${PANE_STYLE_OPTIONS[@]}"; do
+        "$_REAL_TMUX" "${base[@]}" "$opt" >/dev/null 2>&1 || return 1
+    done
+}
+
+clear_runtime_before_respawn() {
+    [[ "${1:-}" == "respawn-pane" ]] || return 0
+    local target base opt
+    target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
+    base=(set-option -pu)
+    if [[ -n "$target" ]]; then
+        base+=(-t "$target")
+    fi
+    for opt in "${PANE_STYLE_OPTIONS[@]}" "${RUNTIME_PANE_OPTIONS[@]}"; do
+        "$_REAL_TMUX" "${base[@]}" "$opt" >/dev/null 2>&1 || return 1
+    done
+}
+
 target_window_is_mechanicus() {
     local target="$1" name
     [[ -n "$target" ]] || return 1
@@ -370,8 +443,13 @@ if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_pane_command "$@"; th
         "$_REAL_TMUX" "${args[@]}" | sanitize_pane_ids
         exit "${PIPESTATUS[0]}"
     fi
+    clear_tint_before_instance_unset "${args[@]}" || exit 1
+    clear_runtime_before_respawn "${args[@]}" || exit 1
     exec "$_REAL_TMUX" "${args[@]}"
 fi
+
+clear_tint_before_instance_unset "$@" || exit 1
+clear_runtime_before_respawn "$@" || exit 1
 
 if [[ "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_read_command_with_pane_ids "$@"; then
     "$_REAL_TMUX" "$@" | sanitize_pane_ids

@@ -21,7 +21,7 @@ from .api import (
 from .custodes import _pane_pid, pane_has_active_agent
 from .enums import InstanceStatus
 from .resolver import resolve_pane
-from .tmux_adapter import TmuxAdapter
+from .tmux_adapter import RUNTIME_PANE_OPTIONS, TmuxAdapter
 
 DISPATCH_BIN = "dispatch"
 CLAUDE_CMD_BIN = "claude-cmd"
@@ -300,25 +300,8 @@ STACK_WORKER_BOOT_GRACE_SECONDS = 30.0
 # sweep host. A future timestamp within this window is treated as just-born
 # (age 0.0); beyond it the stamp is anomalous and does not extend the grace.
 _CLOCK_SKEW_TOLERANCE_SECONDS = 5.0
-PANE_CLOSE_TRANSIENT_OPTIONS = (
-    "@INSTANCE_ID",
-    "@PANE_LABEL",
-    "@PERSONA",
-    "@SESSION_DOC",
-    "@CWD",
-    "@CC_STATE",
-    "@TTS_STATE",
-    "@OPS_SELECTED",
-    "@CONTEXT_INFO",
-    "@STACK_PENDING",
-    "@ACTIVE_TITLE",
-    "@PROGRESS_TITLE",
-    "@PANE_PROGRESS",
-    "@GT_FIRE",
-    "@PLANNING_STATE",
-    "@PLANNING_AGENT",
-    "@DISCORD_VOICE_LOCK",
-    "@DISCORD_VOICE_PROCESSING",
+PANE_CLOSE_TRANSIENT_OPTIONS = tuple(
+    option for option in RUNTIME_PANE_OPTIONS if option != "@PANE_TITLE_SUPPRESS"
 )
 
 
@@ -582,10 +565,14 @@ def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec)
 
 def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:
     """Clear close-time pane chrome/state without touching durable pane identity."""
-    current = adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
     pane_label = adapter.show_pane_option(pane_id, "@PANE_ID")
-    if current == pane_id:
-        adapter.run("select-pane", "-t", pane_id, "-P", "bg=default", allow_failure=True)
+    # Persona tint is stored as per-pane window-style/window-active-style.
+    # Unset it by target, independent of active focus; the old active-pane check
+    # left inactive panes visibly red after their @INSTANCE_ID/lock stamps died.
+    adapter.run("set-option", "-pu", "-t", pane_id, "window-style", allow_failure=True)
+    adapter.run(
+        "set-option", "-pu", "-t", pane_id, "window-active-style", allow_failure=True
+    )
     adapter.run("select-pane", "-t", pane_id, "-T", "", allow_failure=True)
     adapter.run(
         "set-option", "-p", "-t", pane_id, "@PANE_TITLE_SUPPRESS", "true", allow_failure=True

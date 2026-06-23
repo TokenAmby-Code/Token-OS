@@ -58,6 +58,41 @@ _AUTOMATION_FOCUS_ENVS = {
 }
 
 
+RUNTIME_PANE_OPTIONS = (
+    "@INSTANCE_ID",
+    "@CC_STATE",
+    "@PANE_LABEL",
+    "@PERSONA",
+    "@SESSION_DOC",
+    "@CWD",
+    "@OPS_SELECTED",
+    "@ACTIVE_TITLE",
+    "@PROGRESS_TITLE",
+    "@PANE_PROGRESS",
+    "@PANE_TITLE_SUPPRESS",
+    "@TTS_STATE",
+    "@CONTEXT_INFO",
+    "@STACK_PENDING",
+    "@GT_FIRE",
+    "@PLANNING_STATE",
+    "@PLANNING_AGENT",
+    "@DISCORD_VOICE_LOCK",
+    "@DISCORD_VOICE_PROCESSING",
+    "@TOKEN_API_WRAPPER_LAUNCH_ID",
+    "@TOKEN_API_ENGINE",
+    "@TOKEN_API_LAUNCHER",
+    "@TOKEN_API_CWD",
+    "@TOKEN_API_SESSION_ID",
+    "@TOKEN_API_DISPATCH_TARGET",
+    "@TOKEN_API_DISPATCH_WINDOW",
+    "@TOKEN_API_DISPATCH_MODE",
+    "@TOKEN_API_DISPATCH_SLOT",
+    "@TOKEN_API_LAUNCH_MODE",
+    "@TOKEN_API_TARGET_WORKING_DIR",
+)
+PANE_STYLE_OPTIONS = ("window-style", "window-active-style")
+
+
 def normalize_prompt_payload(text: str) -> str:
     """Normalize a live-agent prompt payload before pane injection."""
     normalized = re.sub(r"[\r\n]+", " ", text).rstrip()
@@ -156,6 +191,21 @@ def _target_arg(args: list[str], flag: str = "-t") -> str:
 
 def _has_flag(args: list[str] | tuple[str, ...], flag: str) -> bool:
     return any(arg == flag or (arg.startswith(flag) and arg != flag) for arg in args[1:])
+
+
+def _is_pane_option_unset(args: list[str] | tuple[str, ...], option: str) -> bool:
+    if not args or args[0] not in {"set-option", "set"}:
+        return False
+    if option not in args:
+        return False
+    # Pane-scoped unset forms include clustered -pu or split -p -u.
+    has_pane_scope = any(arg.startswith("-") and "p" in arg for arg in args[1:])
+    has_unset = any(arg.startswith("-") and "u" in arg for arg in args[1:])
+    return has_pane_scope and has_unset
+
+
+def _pane_option_unset_target(args: list[str] | tuple[str, ...]) -> str:
+    return _target_arg(list(args), "-t")
 
 
 def _camera_mutating(args: list[str] | tuple[str, ...]) -> bool:
@@ -303,6 +353,63 @@ class TmuxAdapter:
         except Exception:
             return "tmuxctl"
 
+    def _clear_tint_before_instance_unset(
+        self, resolved_args: list[str], *, allow_failure: bool
+    ) -> bool:
+        """Enforce the pane identity invariant: unstamp implies untint.
+
+        Persona tint lives in per-pane ``window-style`` options.  Any tmuxctl
+        interaction that clears ``@INSTANCE_ID`` must clear those style options
+        first; otherwise a writer can make a pane agent-free while leaving stale
+        visual identity behind.  Returning False means the identity unset should
+        not be attempted.
+        """
+        if not _is_pane_option_unset(resolved_args, "@INSTANCE_ID"):
+            return True
+        target = _pane_option_unset_target(resolved_args)
+        base: list[str] = ["set-option", "-pu"]
+        if target:
+            base.extend(["-t", target])
+        for option in PANE_STYLE_OPTIONS:
+            proc = subprocess.run(
+                [self.tmux_binary, *base, option],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=_tmux_stderr_target(allow_failure=allow_failure),
+                check=False,
+            )
+            if proc.returncode != 0:
+                if not allow_failure:
+                    stderr = proc.stderr.strip() if proc.stderr else ""
+                    raise TmuxError(stderr or f"tmux {' '.join(base + [option])} failed")
+                return False
+        return True
+
+    def _clear_runtime_before_respawn(
+        self, resolved_args: list[str], *, allow_failure: bool
+    ) -> bool:
+        """Respawn starts fresh process state, so pane runtime state must die first."""
+        if not resolved_args or resolved_args[0] != "respawn-pane":
+            return True
+        target = _target_arg(resolved_args)
+        base: list[str] = ["set-option", "-pu"]
+        if target:
+            base.extend(["-t", target])
+        for option in (*PANE_STYLE_OPTIONS, *RUNTIME_PANE_OPTIONS):
+            proc = subprocess.run(
+                [self.tmux_binary, *base, option],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=_tmux_stderr_target(allow_failure=allow_failure),
+                check=False,
+            )
+            if proc.returncode != 0:
+                if not allow_failure:
+                    stderr = proc.stderr.strip() if proc.stderr else ""
+                    raise TmuxError(stderr or f"tmux {' '.join(base + [option])} failed")
+                return False
+        return True
+
     def run(self, *args: str, allow_failure: bool = False) -> str:
         # Universal send gate — the inescapable pane-write sentinel. Every send
         # to a pane that originates in Python (token-api interventions, the
@@ -332,6 +439,10 @@ class TmuxAdapter:
             return ""
         if _camera_mutating(resolved_args):
             self.focus_mutation_count += 1
+        if not self._clear_tint_before_instance_unset(resolved_args, allow_failure=allow_failure):
+            return ""
+        if not self._clear_runtime_before_respawn(resolved_args, allow_failure=allow_failure):
+            return ""
         # Every send through run() is automated by construction (see this method's
         # docstring): stamp the target pane so compute_work_state discounts the
         # woken agent's reflex activity from productivity. Resolved args carry the

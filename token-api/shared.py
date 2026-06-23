@@ -503,8 +503,9 @@ async def tmux_pane_exists(tmux_pane: str | None) -> bool:
 
 # ── Persona pane tint (event-driven) ────────────────────────────────────────
 # Pane background colour is resolved from canonical instances.persona_id →
-# personas.pane_tint and applied only with `tmux select-pane -P bg=...`.
-# Claude slash-color is not used.
+# personas.pane_tint. Applying uses `tmux select-pane -P bg=...`; clearing
+# unsets the per-pane `window-style`/`window-active-style` options entirely so
+# a vacated pane carries no invisible tint state. Claude slash-color is not used.
 
 
 def apply_pane_tint(
@@ -540,6 +541,27 @@ def apply_pane_tint(
             "@DISCORD_VOICE_LOCK",
             allow_failure=True,
         ).strip()
+        # Clearing is teardown, not a competing status tint.  Do it even if a stale
+        # voice-lock option is present, and remove the per-pane style options
+        # entirely so empty panes do not retain invisible window-style state.
+        if bg == "default":
+            adapter.run(
+                "set-option",
+                "-pu",
+                "-t",
+                tmux_pane,
+                "window-style",
+                allow_failure=True,
+            )
+            adapter.run(
+                "set-option",
+                "-pu",
+                "-t",
+                tmux_pane,
+                "window-active-style",
+                allow_failure=True,
+            )
+            return
         if voice_locked == "1":
             return
         # select-pane -P is camera-neutral (style only) — no focus snapshot or

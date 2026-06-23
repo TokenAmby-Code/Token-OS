@@ -95,3 +95,81 @@ def test_tmux_shim_sanitizes_windows_sessions_display_and_capture(tmp_path) -> N
         proc = _run_shim(tmp_path, *command)
         assert proc.returncode == 0, (command, proc.stderr)
         assert "%" not in proc.stdout, (command, proc.stdout)
+
+
+def test_tmux_shim_instance_unset_clears_tint_first(tmp_path) -> None:
+    log = tmp_path / "tmux.log"
+    fake = tmp_path / "real-tmux-unset"
+    fake.write_text(
+        textwrap.dedent(
+            r'''
+            #!/usr/bin/env bash
+            set -euo pipefail
+            printf '%s\n' "$*" >> "$TMUX_FAKE_LOG"
+            exit 0
+            '''
+        ).strip()
+        + "\n"
+    )
+    fake.chmod(0o755)
+    env = {
+        **os.environ,
+        "IMPERIUM_TMUX_BIN": str(fake),
+        "TMUX_FAKE_LOG": str(log),
+        "IMPERIUM_ALLOW_TMUX_FOCUS": "1",
+        "IMPERIUM_ALLOW_MECHANICUS_FOCUS": "1",
+    }
+
+    proc = subprocess.run(
+        [str(TMUX_SHIM), "set-option", "-pu", "-t", "%11", "@INSTANCE_ID"],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert log.read_text().splitlines() == [
+        "set-option -pu -t %11 window-style",
+        "set-option -pu -t %11 window-active-style",
+        "set-option -pu -t %11 @INSTANCE_ID",
+    ]
+
+
+def test_tmux_shim_respawn_clears_runtime_state_first(tmp_path) -> None:
+    log = tmp_path / "tmux.log"
+    fake = tmp_path / "real-tmux-respawn"
+    fake.write_text(
+        textwrap.dedent(
+            r'''
+            #!/usr/bin/env bash
+            set -euo pipefail
+            printf '%s\n' "$*" >> "$TMUX_FAKE_LOG"
+            exit 0
+            '''
+        ).strip()
+        + "\n"
+    )
+    fake.chmod(0o755)
+    env = {
+        **os.environ,
+        "IMPERIUM_TMUX_BIN": str(fake),
+        "TMUX_FAKE_LOG": str(log),
+        "IMPERIUM_ALLOW_TMUX_FOCUS": "1",
+        "IMPERIUM_ALLOW_MECHANICUS_FOCUS": "1",
+    }
+
+    proc = subprocess.run(
+        [str(TMUX_SHIM), "respawn-pane", "-k", "-t", "%11"],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    lines = log.read_text().splitlines()
+    assert proc.returncode == 0, proc.stderr
+    assert lines[:3] == [
+        "set-option -pu -t %11 window-style",
+        "set-option -pu -t %11 window-active-style",
+        "set-option -pu -t %11 @INSTANCE_ID",
+    ]
+    assert lines[-1] == "respawn-pane -k -t %11"

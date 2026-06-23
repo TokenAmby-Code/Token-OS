@@ -463,12 +463,16 @@ def test_clear_pane_overlay_removes_close_time_state_but_keeps_identity():
             "@INSTANCE_ID": "inst-1",
             "@DISCORD_VOICE_LOCK": "1",
             "@DISCORD_VOICE_PROCESSING": "1",
+            "window-style": "bg=#300808",
+            "window-active-style": "bg=#300808",
             PERSONA_GUARD_OPTION: "{}",
         }
     )
 
     _clear_pane_overlay(adapter, "%27")
 
+    for style_option in ("window-style", "window-active-style"):
+        assert style_option not in adapter.options
     for option in PANE_CLOSE_TRANSIENT_OPTIONS:
         assert option not in adapter.options
     assert PERSONA_GUARD_OPTION not in adapter.options

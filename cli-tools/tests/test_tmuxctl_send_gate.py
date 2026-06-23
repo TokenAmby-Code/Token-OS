@@ -618,3 +618,69 @@ def test_send_text_then_submit_gated_attended_pane_writes_no_bytes(
     assert excinfo.value.gate["suppressed"] is True
     assert captured_subprocess == [], "gated send_text_then_submit must not touch tmux"
     assert recorded_suppressions and recorded_suppressions[-1]["reason"] == "typing_guard"
+
+
+def test_instance_id_unset_clears_pane_tint_first(monkeypatch):
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return _FakeCompleted()
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", _fake_run)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    adapter.run("set-option", "-pu", "-t", "%22", "@INSTANCE_ID")
+
+    assert calls == [
+        ["tmux", "set-option", "-pu", "-t", "%22", "window-style"],
+        ["tmux", "set-option", "-pu", "-t", "%22", "window-active-style"],
+        ["tmux", "set-option", "-pu", "-t", "%22", "@INSTANCE_ID"],
+    ]
+
+
+def test_instance_id_unset_aborts_if_tint_clear_fails(monkeypatch):
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        proc = _FakeCompleted()
+        if cmd[-1] == "window-style":
+            proc.returncode = 1
+            proc.stderr = "style clear failed"
+        return proc
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", _fake_run)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    with pytest.raises(tmux_adapter.TmuxError, match="style clear failed"):
+        adapter.run("set-option", "-pu", "-t", "%22", "@INSTANCE_ID")
+
+    assert calls == [["tmux", "set-option", "-pu", "-t", "%22", "window-style"]]
+
+
+def test_respawn_pane_clears_runtime_state_first(monkeypatch):
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return _FakeCompleted()
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", _fake_run)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    adapter.run("respawn-pane", "-k", "-t", "%22")
+
+    expected_prefix = [
+        ["tmux", "set-option", "-pu", "-t", "%22", "window-style"],
+        ["tmux", "set-option", "-pu", "-t", "%22", "window-active-style"],
+    ]
+    expected_runtime = [
+        ["tmux", "set-option", "-pu", "-t", "%22", option]
+        for option in tmux_adapter.RUNTIME_PANE_OPTIONS
+    ]
+    assert calls == [
+        *expected_prefix,
+        *expected_runtime,
+        ["tmux", "respawn-pane", "-k", "-t", "%22"],
+    ]
