@@ -92,14 +92,13 @@ def _insert(
     *,
     device_id: str,
     doc_path: Path | None,
-    tmux_pane: str = "%10",
     engine: str = "claude",
 ) -> str:
     """Insert a golden_throne instance, optionally linked to a session doc.
 
-    ``tmux_pane`` is the *stored* column value; for local instances the fire path
-    no longer trusts it (tmuxctl resolves the pane live by UUID), so tests can set
-    a deliberately stale value here to prove the stored column is not consulted.
+    There is no stored pane column anymore — the fire path resolves the pane live
+    by UUID (tmuxctl owns resolution), which the tests drive by monkeypatching
+    ``resolve_instance_pane`` / ``_resolve_remote_instance_pane``.
     """
     iid = str(uuid.uuid4())
     now = datetime.now().isoformat()
@@ -114,15 +113,14 @@ def _insert(
         doc_id = cur.lastrowid
     conn.execute(
         """INSERT INTO instances
-           (id, name, working_dir, origin_type, device_id, tmux_pane, status,
+           (id, name, working_dir, origin_type, device_id, status,
             golden_throne, zealotry, session_doc_id, created_at, last_activity, engine)
-           VALUES (?, ?, ?, 'local', ?, ?, 'idle', '1', 4, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, 'local', ?, 'idle', '1', 4, ?, ?, ?, ?)""",
         (
             iid,
             f"gt-{iid[:8]}",
             "/tmp",
             device_id,
-            tmux_pane,
             doc_id,
             now,
             now,
@@ -361,7 +359,7 @@ async def test_local_fire_fails_closed_when_pane_unresolved(gt_env, monkeypatch)
     rec = _Recorder(main, monkeypatch)
     # gt_env default: resolve_instance_pane -> (None, None) [pane gone]. Stored
     # column carries a stale %N that must NOT be used as a fallback.
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None, tmux_pane="%999")
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None)
 
     await main.golden_throne_followup(iid)
 
@@ -412,7 +410,7 @@ async def test_local_fire_targets_live_resolved_pane_not_stored_column(gt_env, m
     monkeypatch.setattr(main, "_tmux_pane_exists", _pane_exists)
 
     # Stored column is deliberately stale; live resolution must win.
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None, tmux_pane="%999")
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None)
 
     await main.golden_throne_followup(iid)
 
@@ -497,7 +495,6 @@ async def test_remote_fire_fails_closed_when_satellite_cannot_resolve(gt_env, mo
         gt_env.db_path,
         device_id=main.LOCAL_DEVICE_NAME + "-remote",
         doc_path=None,
-        tmux_pane="%999",
     )
 
     await main.golden_throne_followup(iid)
@@ -536,7 +533,6 @@ async def test_remote_fire_resolves_via_satellite_not_stored_column(gt_env, monk
         gt_env.db_path,
         device_id=main.LOCAL_DEVICE_NAME + "-remote",
         doc_path=None,
-        tmux_pane="%999",
     )
 
     await main.golden_throne_followup(iid)

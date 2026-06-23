@@ -207,8 +207,6 @@ class TestFreshDatabase:
         cols = _columns(conn, "instances")
         conn.close()
         for annex in (
-            "tmux_pane",
-            "pane_label",
             "workflow_state",
             "planning_state",
             "tts_voice",
@@ -223,8 +221,19 @@ class TestFreshDatabase:
             "dispatch_target",
         ):
             assert annex in cols, f"missing runtime annex column: {annex}"
-        # the dead identity duplicates must NOT be reincarnated
-        for dead in ("legion", "primarch", "profile_name", "instance_type", "synced", "tab_name"):
+        # the dead identity duplicates must NOT be reincarnated — and pane ids
+        # (tmux_pane/pane_label) are EXTERMINATED: pane geometry lives only in the
+        # tmuxctl @INSTANCE_ID oracle, never persisted.
+        for dead in (
+            "legion",
+            "primarch",
+            "profile_name",
+            "instance_type",
+            "synced",
+            "tab_name",
+            "tmux_pane",
+            "pane_label",
+        ):
             assert dead not in cols, f"dead legacy column reincarnated on instances: {dead}"
 
     def test_mutation_tables_have_no_legacy_fk(self, app_env):
@@ -289,7 +298,7 @@ class TestArchiveExtraction:
     def test_instance_identity_wins_and_annex_backfills(self, legacy_seed, app_env):
         conn = _db(app_env)
         row = conn.execute(
-            """SELECT rank, origin_type, status, tmux_pane, workflow_state, golden_throne
+            """SELECT rank, origin_type, status, workflow_state, golden_throne
                FROM instances WHERE id = ?""",
             (LEGACY_ACTIVE_ID,),
         ).fetchone()
@@ -299,8 +308,7 @@ class TestArchiveExtraction:
         assert row["rank"] == "overseer"
         assert row["origin_type"] == "perpetual"
         assert row["status"] == "working"
-        # annex backfilled from the legacy row
-        assert row["tmux_pane"] == "%42"
+        # annex backfilled from the legacy row (pane ids are NOT persisted — exterminated)
         assert row["workflow_state"] == "open"
         # synced=1/instance_type=sync legacy markers land as the instance marker
         assert row["golden_throne"] == "sync"
@@ -381,40 +389,6 @@ class TestSanctionedWritesV2Only:
         row = conn.execute("SELECT name FROM instances WHERE id = ?", (instance_id,)).fetchone()
         conn.close()
         assert row is not None and row["name"] == "exterminatus-test"
-
-    def test_runtime_field_updates_land_on_instances(self, app_env):
-        import instance_mutation
-
-        conn = _db(app_env)
-        instance_id = str(uuid.uuid4())
-        instance_mutation.sanctioned_insert_instance_sync(
-            conn,
-            values={
-                "id": instance_id,
-                "name": "runtime-test",
-                "device_id": "test-device",
-                "status": "idle",
-            },
-            mutation_type="instance_registered",
-            write_source="test",
-            actor="test",
-        )
-        instance_mutation.sanctioned_update_runtime_fields_sync(
-            conn,
-            instance_id=instance_id,
-            updates={"tmux_pane": "%7", "pane_label": "test-label"},
-            mutation_type="runtime_rebind",
-            write_source="test",
-            actor="test",
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT tmux_pane, pane_label FROM instances WHERE id = ?",
-            (instance_id,),
-        ).fetchone()
-        conn.close()
-        assert row["tmux_pane"] == "%7"
-        assert row["pane_label"] == "test-label"
 
 
 # ── legacy PATCH endpoints write instance-table ─────────────────────────────────────────

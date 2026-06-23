@@ -11,7 +11,7 @@ scope here — is what shells out to ``tmux set-option``):
   * ``@CWD``         — basename of ``working_dir`` (trailing-slash / root edges);
   * ``@PERSONA``     — ``personas.display_name`` from ``persona_id`` ("" when none);
   * ``@SESSION_DOC`` — ``session_documents.title`` from ``session_doc_id`` (rebind);
-  * each push enqueues a ``(instance_id, '@VAR', value, tmux_pane)`` queue row.
+  * each push enqueues a ``(instance_id, '@VAR', value)`` queue row.
 """
 
 from __future__ import annotations
@@ -53,15 +53,14 @@ def _insert_instance(
     persona_id: str | None = None,
     session_doc_id: int | None = None,
     working_dir: str | None = "/tmp/work",
-    tmux_pane: str | None = "%5",
     name: str = "inst",
 ) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "INSERT INTO instances "
-            "(id, name, device_id, engine, working_dir, persona_id, session_doc_id, tmux_pane) "
-            "VALUES (?, ?, 'Mac-Mini', ?, ?, ?, ?, ?)",
-            (instance_id, name, engine, working_dir, persona_id, session_doc_id, tmux_pane),
+            "(id, name, device_id, engine, working_dir, persona_id, session_doc_id) "
+            "VALUES (?, ?, 'Mac-Mini', ?, ?, ?, ?)",
+            (instance_id, name, engine, working_dir, persona_id, session_doc_id),
         )
         conn.commit()
 
@@ -80,7 +79,7 @@ def _queue_rows(db_path) -> list[tuple]:
         return [
             tuple(r)
             for r in conn.execute(
-                "SELECT instance_id, variable, value, tmux_pane FROM pane_state_queue ORDER BY id"
+                "SELECT instance_id, variable, value FROM pane_state_queue ORDER BY id"
             ).fetchall()
         ]
 
@@ -116,11 +115,11 @@ def test_cwd_basename_edge_cases(app_env, working_dir, expected):
 
 def test_cwd_var_is_basename_of_working_dir(app_env):
     shared, db_path = app_env.shared, app_env.db_path
-    _insert_instance(db_path, "i-cwd", working_dir="/Users/x/worktrees/wt-foo/", tmux_pane="%9")
+    _insert_instance(db_path, "i-cwd", working_dir="/Users/x/worktrees/wt-foo/")
     values = _push(shared, db_path, "i-cwd")
     assert values["@CWD"] == "wt-foo"
     cwd_rows = [r for r in _queue_rows(db_path) if r[1] == "@CWD"]
-    assert cwd_rows == [("i-cwd", "@CWD", "wt-foo", "%9")]
+    assert cwd_rows == [("i-cwd", "@CWD", "wt-foo")]
 
 
 # ── @PERSONA (resolution + empty + engine-agnostic) ────────────────────────────
@@ -140,7 +139,7 @@ def test_persona_empty_when_no_persona(app_env):
     values = _push(shared, db_path, "i-bare")
     assert values["@PERSONA"] == ""
     persona_rows = [r for r in _queue_rows(db_path) if r[1] == "@PERSONA"]
-    assert persona_rows == [("i-bare", "@PERSONA", "", "%5")]
+    assert persona_rows == [("i-bare", "@PERSONA", "")]
 
 
 def test_persona_resolution_is_engine_agnostic(app_env):
@@ -197,13 +196,12 @@ def test_push_enqueues_all_three_vars_with_pane(app_env):
         persona_id="p-sang",
         session_doc_id=doc,
         working_dir="/tmp/wt-blood/",
-        tmux_pane="%42",
     )
     _push(shared, db_path, "i-all")
     rows = _queue_rows(db_path)
-    assert ("i-all", "@PERSONA", "Sanguinius", "%42") in rows
-    assert ("i-all", "@SESSION_DOC", "Blood Angels Doc", "%42") in rows
-    assert ("i-all", "@CWD", "wt-blood", "%42") in rows
+    assert ("i-all", "@PERSONA", "Sanguinius") in rows
+    assert ("i-all", "@SESSION_DOC", "Blood Angels Doc") in rows
+    assert ("i-all", "@CWD", "wt-blood") in rows
     assert len(rows) == 3
 
 
@@ -212,11 +210,11 @@ def test_queue_pane_var_coerces_none_value_to_empty(app_env):
 
     async def _run():
         async with aiosqlite.connect(db_path) as db:
-            await shared.queue_pane_var(db, "i-x", "@PERSONA", None, "%1")
+            await shared.queue_pane_var(db, "i-x", "@PERSONA", None)
             await db.commit()
 
     asyncio.run(_run())
-    assert _queue_rows(db_path) == [("i-x", "@PERSONA", "", "%1")]
+    assert _queue_rows(db_path) == [("i-x", "@PERSONA", "")]
 
 
 def test_push_no_rows_for_unknown_instance(app_env):

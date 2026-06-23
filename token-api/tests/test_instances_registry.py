@@ -203,37 +203,11 @@ def test_instance_normalizer_maps_legacy_row_to_expected_fields(app_env):
             "profile_name",
             "tts_mode",
             "parent_instance_id",
+            # pane ids are exterminated — the normalizer never projects them
+            "tmux_pane",
+            "pane_label",
         }
     )
-
-
-async def test_sanctioned_insert_fails_loud_on_tmux_fields(app_env):
-    import aiosqlite
-
-    from instance_mutation import sanctioned_insert_instance
-
-    now = datetime.now().isoformat()
-    iid = str(uuid.uuid4())
-    async with aiosqlite.connect(app_env.db_path) as db:
-        with pytest.raises(ValueError, match="must not persist tmux/runtime ids"):
-            await sanctioned_insert_instance(
-                db,
-                values={
-                    "id": iid,
-                    "session_id": iid,
-                    "tab_name": "no-runtime-storage",
-                    "working_dir": "/tmp",
-                    "origin_type": "local",
-                    "device_id": "Mac-Mini",
-                    "status": "idle",
-                    "registered_at": now,
-                    "last_activity": now,
-                    "tmux_pane": "%42",
-                },
-                mutation_type="instance_registered",
-                write_source="test",
-                actor="test",
-            )
 
 
 def test_active_persona_lock_is_rank_based(app_env):

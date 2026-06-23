@@ -81,7 +81,6 @@ from instance_mutation import (
     reconcile_instance,
     sanctioned_insert_instance,
     sanctioned_update_instance,
-    sanctioned_update_runtime_fields,
 )
 from instance_registry import derived_cockpit_label
 from morning_supervisor import arm_morning_supervisor
@@ -1207,7 +1206,11 @@ async def _live_agent_panes() -> list[dict]:
         if len(parts) < 6:
             parts += [""] * (6 - len(parts))
         pane_id, pane_pid, instance_id, pane_label, pane_role, current_cmd = parts[:6]
-        if not pane_id.startswith("%"):
+        # Shim-agnostic: the cli-tools/bin tmux shim rewrites #{pane_id} to canonical
+        # positional ids (legion:malcador), so a `%`-prefix gate would drop every pane
+        # and empty the liveness oracle. Liveness is decided by the @INSTANCE_ID stamp
+        # + agent command below, NOT by the pane id's spelling; skip only blank lines.
+        if not pane_id:
             continue
         try:
             pid: int | None = int(pane_pid)
@@ -1323,10 +1326,11 @@ async def reconcile_live_panes() -> dict:
     A DB sweep flips a row to ``stopped`` but never touches the pane, so a live
     agent pane keeps its ``@INSTANCE_ID`` stamp. Any such stamp pointing at a
     stopped/archived row is a false-dead: reactivate the row (``status``→idle,
-    clear ``stopped_at``, refresh ``last_activity``) and rebind its tmux geometry
-    (``tmux_pane``, ``pane_label``) from the live pane. This HEALS an already-
-    collapsed active set rather than only preventing future collapses; it is the
-    proactive companion to the cleanup liveness guard.
+    clear ``stopped_at``, refresh ``last_activity``). No tmux geometry is persisted
+    — the pane keeps its ``@INSTANCE_ID`` stamp, so geometry is always resolvable
+    live via ``resolve_instance_pane``. This HEALS an already-collapsed active set
+    rather than only preventing future collapses; it is the proactive companion to
+    the cleanup liveness guard.
 
     Scope: only reactivates rows that already exist and are stopped/archived.
     Unstamped live panes (and stamps with no DB row) are left to the SessionStart
@@ -1361,20 +1365,9 @@ async def reconcile_live_panes() -> dict:
                 write_source="task",
                 actor="reconcile-live-panes",
             )
-            runtime: dict = {}
-            if pane.get("pane_id"):
-                runtime["tmux_pane"] = pane["pane_id"]
-            if pane.get("pane_role"):
-                runtime["pane_label"] = pane["pane_role"]
-            if runtime:
-                await sanctioned_update_runtime_fields(
-                    db,
-                    instance_id=instance_id,
-                    updates=runtime,
-                    mutation_type="instance_reregistered",
-                    write_source="task",
-                    actor="reconcile-live-panes",
-                )
+            # No pane geometry is persisted: the live pane (already in `pane`) keeps
+            # its @INSTANCE_ID stamp, so resolve_instance_pane(instance_id) recovers
+            # pane/role on demand. Reactivating the row is the whole job.
             reactivated += 1
         await db.commit()
 
@@ -1964,7 +1957,7 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT ci.id, ci.name AS tab_name, ci.tmux_pane, ci.workflow_blocked_reason,
+            SELECT ci.id, ci.name AS tab_name, ci.workflow_blocked_reason,
                    ci.session_doc_id, ci.dispatch_session_doc_path,
                    sd.file_path AS session_doc_path
             FROM instances ci
@@ -1994,7 +1987,7 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
                 "nudges": NAMING_NUDGE_MAX_PER_INSTANCE,
             }
 
-        tmux_pane = (instance.get("tmux_pane") or "").strip()
+        tmux_pane, _role = await shared.resolve_instance_pane(instance_id)
         if not tmux_pane:
             return {"success": False, "action": "missing_tmux_pane", "instance_id": instance_id}
 
@@ -3550,17 +3543,19 @@ async def _tmux_pane_current_command(tmux_pane: str | None) -> str:
 
 
 async def _golden_throne_recovery_blocked_by_stale_pane(instance: dict) -> str | None:
-    """Fail closed on startup recovery when the recorded pane is now just a shell.
+    """Fail closed on startup recovery when the live pane is now just a shell.
 
     Normal stop-hook scheduling still owns fresh GT timers. Startup recovery is
-    only a repair path; if the original local pane exists but no longer contains
-    the target agent, resuming from that stale row risks driving the wrong pane.
+    only a repair path; if the instance's pane resolves live but no longer
+    contains the target agent, resuming risks driving the wrong pane. The pane is
+    resolved live from the tmuxctl oracle (there is no stored pane to go stale);
+    when no live pane resolves, there is simply nothing to mis-drive.
     """
     if instance.get("status") != "stopped":
         return None
     if instance.get("device_id") != LOCAL_DEVICE_NAME:
         return None
-    tmux_pane = instance.get("tmux_pane")
+    tmux_pane, _role = await shared.resolve_instance_pane(instance["id"])
     if not tmux_pane:
         return None
     if not await _tmux_pane_exists(tmux_pane):
@@ -4506,12 +4501,13 @@ async def recover_recent_stopped_golden_throne_timers(
                 continue
         stale_pane_reason = await _golden_throne_recovery_blocked_by_stale_pane(instance)
         if stale_pane_reason:
+            live_pane, _live_role = await shared.resolve_instance_pane(instance_id)
             await log_event(
                 "golden_throne_recovery_skipped_stale_pane",
                 instance_id=instance_id,
                 details={
                     "reason": stale_pane_reason,
-                    "tmux_pane": instance.get("tmux_pane"),
+                    "tmux_pane": live_pane,
                     "status": instance.get("status"),
                     "quiet_at": quiet_at.isoformat(),
                 },
@@ -5765,13 +5761,18 @@ async def compute_work_state() -> WorkStateResponse:
     local_pane_row_list = await _tmux_pane_rows()
     local_pane_rows = {row[0]: row for row in local_pane_row_list}
     agent_engines_by_tty = await _agent_engine_by_tty()
+    # Live oracle: instance_id -> live pane dict. The sole source of pane geometry
+    # now that instances.tmux_pane is gone; resolve every row's pane through this.
+    live_panes_by_instance = {
+        p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]
+    }
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
             SELECT i.id, i.name AS tab_name, i.status, i.engine, i.working_dir,
-                   i.tmux_pane, i.device_id, i.last_activity,
+                   i.device_id, i.last_activity,
                    COALESCE(p.slug, 'astartes') AS legion,
                    COALESCE(i.hook_driven, 0) AS hook_driven
             FROM instances i
@@ -5781,28 +5782,36 @@ async def compute_work_state() -> WorkStateResponse:
             """
         )
         rows = await cursor.fetchall()
-        pane_activity_cursor = await db.execute(
-            """
-            SELECT tmux_pane,
-                   MAX(last_activity) AS last_activity,
-                   MAX(COALESCE(hook_driven, 0)) AS hook_driven
-            FROM instances
-            WHERE tmux_pane IS NOT NULL
-              AND device_id = ?
-            GROUP BY tmux_pane
-            """,
-            (LOCAL_DEVICE_NAME,),
-        )
-        pane_activity_rows = await pane_activity_cursor.fetchall()
-        pane_last_activity: dict[str, str] = {
-            r["tmux_pane"]: r["last_activity"] for r in pane_activity_rows if r["last_activity"]
-        }
-        # Panes whose (non-stopped — Stop clears the flag) instance is hook_driven=1,
-        # i.e. being driven autonomously / agent-to-agent. Discounted at read-time
-        # alongside the low-level automated_pane_activity marker (belt-and-suspenders).
-        pane_hook_driven: set[str] = {
-            r["tmux_pane"] for r in pane_activity_rows if r["hook_driven"]
-        }
+        # Per-pane last_activity / hook_driven, keyed by the LIVE pane id resolved
+        # from the oracle (instances.tmux_pane is gone). Each live pane maps to
+        # exactly one live instance_id, so there is no cross-instance aggregation;
+        # we look up each live instance's last_activity / hook_driven directly.
+        pane_last_activity: dict[str, str] = {}
+        # Panes whose instance is hook_driven=1, i.e. being driven autonomously /
+        # agent-to-agent. Discounted at read-time alongside the low-level
+        # automated_pane_activity marker (belt-and-suspenders).
+        pane_hook_driven: set[str] = set()
+        live_instance_ids = list(live_panes_by_instance.keys())
+        if live_instance_ids:
+            placeholders = ",".join("?" * len(live_instance_ids))
+            pane_activity_cursor = await db.execute(
+                f"""
+                SELECT id, last_activity, COALESCE(hook_driven, 0) AS hook_driven
+                FROM instances
+                WHERE id IN ({placeholders})
+                  AND device_id = ?
+                """,
+                (*live_instance_ids, LOCAL_DEVICE_NAME),
+            )
+            for r in await pane_activity_cursor.fetchall():
+                lp = live_panes_by_instance.get(r["id"])
+                if not lp:
+                    continue
+                pane_id = lp["pane_id"]
+                if r["last_activity"]:
+                    pane_last_activity[pane_id] = r["last_activity"]
+                if r["hook_driven"]:
+                    pane_hook_driven.add(pane_id)
         # Automated-activation markers: panes woken by an automated tmuxctl
         # injection (state-hook fanout / dispatch / enforcement) still inside the
         # TTL window. Their reflex activity (instance last_activity bump +
@@ -5866,12 +5875,13 @@ async def compute_work_state() -> WorkStateResponse:
                 wa_sid = wa_note[len("session_id=") :].strip()
                 if wa_sid:
                     wa_pane_cursor = await db.execute(
-                        "SELECT tmux_pane, COALESCE(hook_driven, 0) AS hook_driven "
+                        "SELECT COALESCE(hook_driven, 0) AS hook_driven "
                         "FROM instances WHERE id = ?",
                         (wa_sid,),
                     )
                     wa_pane_row = await wa_pane_cursor.fetchone()
-                    wa_pane = wa_pane_row["tmux_pane"] if wa_pane_row else None
+                    wa_lp = live_panes_by_instance.get(wa_sid)
+                    wa_pane = wa_lp["pane_id"] if wa_lp else None
                     wa_hook_driven = bool(wa_pane_row["hook_driven"]) if wa_pane_row else False
                     marker_injected = automated_panes.get(wa_pane) if wa_pane else None
                     if wa_hook_driven:
@@ -5905,26 +5915,16 @@ async def compute_work_state() -> WorkStateResponse:
             pass
         live_pane = None
         pane_is_agent = None
-        canonical_tmux_pane = row["tmux_pane"]
-        if row["tmux_pane"] and row["device_id"] == LOCAL_DEVICE_NAME:
-            if row["tmux_pane"] in local_pane_rows:
-                canonical_tmux_pane = row["tmux_pane"]
-            elif str(row["tmux_pane"]).startswith("%"):
-                canonical_tmux_pane = None
-            else:
-                # Rare non-% tmux targets can still be resolved, but do it in a
-                # worker thread. The prior path used async subprocess creation in
-                # the event loop for every row, which reintroduced the P0
-                # fork/exec blocker on cold `/api/timer` polls.
-                canonical_tmux_pane = await _resolve_tmux_pane_id_for_read_model(row["tmux_pane"])
-            live_pane = canonical_tmux_pane in local_pane_rows
-            pane_row = local_pane_rows.get(canonical_tmux_pane)
-            if pane_row:
-                pane_is_agent, _ = _pane_is_agent_from_snapshot(
-                    pane_row[1], pane_row[4], agent_engines_by_tty
-                )
-            else:
-                pane_is_agent = False
+        # Resolve this instance's pane live from the oracle. A live pane in the
+        # map is, by construction, an agent-hosting pane (the oracle gates on
+        # agent liveness), so its presence settles both live_pane and
+        # pane_is_agent. Non-local rows are not in the local tmux oracle, so they
+        # keep the legacy None/None (no live-pane gating).
+        live_pane_entry = live_panes_by_instance.get(row["id"])
+        canonical_tmux_pane = live_pane_entry["pane_id"] if live_pane_entry else None
+        if row["device_id"] == LOCAL_DEVICE_NAME:
+            live_pane = live_pane_entry is not None
+            pane_is_agent = live_pane
         if row["status"] == "working" and is_recent:
             processing_recent_count += 1
         if not is_recent:
@@ -5962,7 +5962,7 @@ async def compute_work_state() -> WorkStateResponse:
                 status=row["status"],
                 engine=row["engine"],
                 working_dir=row["working_dir"],
-                tmux_pane=row["tmux_pane"],
+                tmux_pane=canonical_tmux_pane,
                 device_id=row["device_id"],
                 last_activity=last_activity,
                 registered=True,
@@ -8126,7 +8126,8 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
         pass
     await _gt_clear_fire(instance_id)
 
-    tmux_pane = instance.get("tmux_pane")
+    # Pane is resolved live from the tmuxctl oracle (instances.tmux_pane is gone).
+    tmux_pane, _role = await shared.resolve_instance_pane(instance_id)
     working_dir = instance.get("working_dir") or "~"
     tab_name = instance.get("tab_name", instance_id[:8])
 
@@ -9029,7 +9030,7 @@ async def _resolve_administratum_instance() -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT i.id, i.tmux_pane, i.device_id, i.dispatch_session_doc_path
+            """SELECT i.id, i.device_id, i.dispatch_session_doc_path
                FROM instances i
                JOIN personas p ON p.id = i.persona_id
                WHERE p.slug = 'administratum'
@@ -9054,14 +9055,15 @@ async def _resolve_administratum_instance() -> dict | None:
         return None
     instance = dict(row)
 
-    # Recover the pane when the row is on another device or has no pane recorded.
-    if instance.get("device_id", LOCAL_DEVICE_NAME) != LOCAL_DEVICE_NAME or not instance.get(
-        "tmux_pane"
-    ):
-        recovered = await _find_administratum_tmux_pane()
-        if not recovered:
+    # Resolve the pane live from the oracle (instances.tmux_pane is gone). When
+    # the row is on another device or the oracle has no live pane for it, fall
+    # back to scanning tmux for the Administratum-marked pane.
+    pane, _role = await shared.resolve_instance_pane(instance["id"])
+    if instance.get("device_id", LOCAL_DEVICE_NAME) != LOCAL_DEVICE_NAME or not pane:
+        pane = await _find_administratum_tmux_pane()
+        if not pane:
             return None
-        instance["tmux_pane"] = recovered
+    instance["tmux_pane"] = pane
 
     return instance
 
@@ -10038,7 +10040,7 @@ async def get_synced_session(legion: str):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT i.id, i.name AS tab_name, i.tmux_pane, i.device_id,
+            """SELECT i.id, i.name AS tab_name, i.device_id,
                       COALESCE(p.slug, 'astartes') AS legion, i.status
                FROM instances i
                LEFT JOIN personas p ON p.id = i.persona_id
@@ -10052,9 +10054,13 @@ async def get_synced_session(legion: str):
         row = await cursor.fetchone()
         if not row:
             return {"legion": legion, "synced_session": None}
+        synced_session = dict(row)
+        # Pane is live-resolved from the oracle (transient response field).
+        pane, _role = await shared.resolve_instance_pane(synced_session["id"])
+        synced_session["tmux_pane"] = pane
         return {
             "legion": legion,
-            "synced_session": dict(row),
+            "synced_session": synced_session,
         }
 
 
@@ -11528,12 +11534,15 @@ async def orchestrator_pane_truth():
     panes = await _read_tmux_panes()
     if panes is None:
         panes = {}
-    pane_ids_in_tmux = set(panes.keys())
+
+    # Live oracle: instance_id -> live pane dict. Pane geometry is sourced live
+    # (instances.tmux_pane is gone); a row is pane-resident iff it has a live pane.
+    live = {p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]}
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT ci.id AS instance_id, ci.tmux_pane, ci.pane_label, ci.name AS tab_name,
+            """SELECT ci.id AS instance_id, ci.name AS tab_name,
                       ci.status, ci.last_activity, ci.engine,
                       COALESCE(p.slug, 'astartes') AS legion,
                       ci.session_doc_id, ci.workflow_state, ci.workflow_blocked_reason,
@@ -11543,33 +11552,32 @@ async def orchestrator_pane_truth():
                LEFT JOIN personas p ON p.id = ci.persona_id
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
                WHERE ci.status NOT IN ('stopped', 'archived')
-                  OR (ci.tmux_pane IS NOT NULL AND ci.tmux_pane != '')
                ORDER BY ci.last_activity DESC"""
         )
         rows = [dict(r) for r in await cursor.fetchall()]
 
-    # Filter rows: keep active rows OR rows whose tmux_pane is currently live.
-    # (A stopped row whose pane never existed in tmux is noise.)
+    # Filter rows: keep active rows OR rows that currently have a live pane.
+    # (A stopped row with no live pane simply isn't pane-resident — noise.)
     filtered: list[dict] = []
     for row in rows:
         if row.get("status") not in ("stopped", "archived"):
             filtered.append(row)
             continue
-        if row.get("tmux_pane") and row["tmux_pane"] in pane_ids_in_tmux:
+        if live.get(row["instance_id"]):
             filtered.append(row)
 
-    # Identify duplicate-pane owners for the superseded_duplicate flag.
+    # Identify duplicate-pane owners for the superseded_duplicate flag, keyed on
+    # the LIVE pane id resolved from the oracle.
     by_pane: dict[str, list[dict]] = {}
     for row in filtered:
-        tp = row.get("tmux_pane")
+        lp = live.get(row["instance_id"])
+        tp = lp["pane_id"] if lp else None
         if tp:
             by_pane.setdefault(tp, []).append(row)
-    duplicate_pane_ids: set[str] = set()
     superseded_row_ids: set[str] = set()
     for tp, group in by_pane.items():
         if len(group) <= 1:
             continue
-        duplicate_pane_ids.add(tp)
         ordered = sorted(
             group,
             key=lambda r: (r.get("last_activity") or "", r.get("instance_id") or ""),
@@ -11580,16 +11588,14 @@ async def orchestrator_pane_truth():
 
     out: list[dict] = []
     for row in filtered:
-        tmux_pane = row.get("tmux_pane")
+        lp = live.get(row["instance_id"])
+        tmux_pane = lp["pane_id"] if lp else None
+        pane_label = lp["pane_label"] if lp else None
         pane_meta = panes.get(tmux_pane) if tmux_pane else None
         # Compute drift flags. superseded_duplicate is per-row, not per-pane.
         flags: list[str] = []
         if row["instance_id"] in superseded_row_ids:
             flags.append("superseded_duplicate")
-        if tmux_pane and tmux_pane not in pane_ids_in_tmux:
-            flags.append("pane_missing")
-        if pane_meta and row.get("pane_label") != pane_meta["pane_label"]:
-            flags.append("pane_label_drift")
         if _is_placeholder_tab_name(row.get("tab_name")) and row.get("session_doc_id"):
             flags.append("tab_name_placeholder")
         if _tab_name_session_doc_mismatch(row.get("tab_name"), row.get("session_doc_path")):
@@ -11604,7 +11610,7 @@ async def orchestrator_pane_truth():
                 "tmux_pane": tmux_pane,
                 "tmux_session_window": pane_meta["session_window"] if pane_meta else None,
                 "tmux_current_command": pane_meta["current_command"] if pane_meta else None,
-                "pane_label": row.get("pane_label"),
+                "pane_label": pane_label,
                 "descriptive_name": None if is_placeholder else descriptive_name,
                 "is_placeholder_name": is_placeholder,
                 "session_doc_id": row.get("session_doc_id"),
@@ -11635,21 +11641,14 @@ PANE_TAP_DIR = Path.home() / ".claude" / "tmp" / "panes"
 
 
 async def _resolve_instance_pane(instance_id: str) -> str | None:
-    """Resolve a durable ``instance_id`` to its tmux pane (``%N``), or None.
+    """Resolve a durable ``instance_id`` to its tmux pane, or None.
 
-    Same source of truth ``pane_truth`` joins against — ``instances``.
+    Delegates to the tmuxctl oracle (``shared.resolve_instance_pane``), the sole
+    live source of pane geometry — computed from each pane's ``@INSTANCE_ID``
+    stamp, not any stored column.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT tmux_pane FROM instances WHERE id = ?",
-            (instance_id,),
-        )
-        row = await cursor.fetchone()
-    if not row:
-        return None
-    pane = (row["tmux_pane"] or "").strip()
-    return pane or None
+    pane, _role = await shared.resolve_instance_pane(instance_id)
+    return pane
 
 
 async def _tmux_pane_pipe_active(tmux_pane: str) -> bool:
@@ -18527,6 +18526,11 @@ async def _ops_read_instances(now: datetime) -> dict:
         )
         rows = await cursor.fetchall()
 
+    # Live oracle: instance_id -> live pane dict. Pane id + label are sourced live
+    # (instances.tmux_pane / pane_label are gone). Local-only; non-local rows
+    # simply have no live pane to surface.
+    live_panes = {p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]}
+
     active = []
     status_counts: dict[str, int] = {}
     engine_counts: dict[str, int] = {}
@@ -18535,6 +18539,9 @@ async def _ops_read_instances(now: datetime) -> dict:
     stale_count = 0
     for row in rows:
         inst = dict(row)
+        _lp = live_panes.get(inst.get("id"))
+        inst["tmux_pane"] = _lp["pane_id"] if _lp else None
+        inst["pane_label"] = _lp["pane_label"] if _lp else None
         status = inst.get("status") or "unknown"
         engine = inst.get("engine") or "claude"
         legion = inst.get("legion") or inst.get("instance_type") or "unassigned"
@@ -20237,34 +20244,6 @@ def _tab_name_session_doc_mismatch(tab_name: str | None, file_path: str | None) 
     return a not in b and b not in a
 
 
-def _compute_drift_flags(
-    row: dict,
-    panes: dict[str, dict],
-    duplicate_pane_ids: set[str],
-) -> list[str]:
-    """Return live drift flags for a single instance row.
-
-    Vocabulary matches the reconciler event log:
-    pane_label_drift, tab_name_placeholder, tab_name_session_doc_mismatch,
-    superseded_duplicate, pane_missing.
-    """
-    flags: list[str] = []
-    tmux_pane = row.get("tmux_pane")
-    if tmux_pane and tmux_pane in duplicate_pane_ids:
-        flags.append("superseded_duplicate")
-    if tmux_pane and tmux_pane not in panes:
-        flags.append("pane_missing")
-    if tmux_pane and tmux_pane in panes:
-        tmux_label = panes[tmux_pane]["pane_label"]
-        if row.get("pane_label") != tmux_label:
-            flags.append("pane_label_drift")
-    if _is_placeholder_tab_name(row.get("tab_name")) and row.get("session_doc_id"):
-        flags.append("tab_name_placeholder")
-    if _tab_name_session_doc_mismatch(row.get("tab_name"), row.get("session_doc_path")):
-        flags.append("tab_name_session_doc_mismatch")
-    return flags
-
-
 async def _run_tmux_db_reconcile_cycle() -> dict:
     """Single reconciliation pass. Returns counts dict for telemetry."""
     counts = {
@@ -20274,10 +20253,17 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
         "placeholder_tab_name_drift": 0,
         "tab_name_session_doc_mismatch": 0,
     }
+    # _read_tmux_panes is used ONLY as a tmux-reachability gate: None means tmux is
+    # unreachable, so skip the cycle rather than mass-stop a live fleet. Its pane
+    # keys are no longer compared against any stored id (there is none).
     panes = await _read_tmux_panes()
     if panes is None:
-        # tmux unreachable — skip the cycle rather than stop a fleet of rows.
         return counts
+
+    # The liveness oracle: instance_ids stamped on a genuinely live agent pane
+    # (@INSTANCE_ID). This is the ONLY pane↔row bridge now — a row absent from this
+    # set has no live pane and is reconciled to stopped.
+    live_ids = await _live_agent_instance_ids()
 
     now = datetime.now()
     deferred_events: list[tuple[str, str, dict]] = []  # (event_type, instance_id, details)
@@ -20287,8 +20273,9 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
         await db.execute("PRAGMA busy_timeout = 5000")
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT ci.id, ci.tmux_pane, ci.pane_label, ci.name AS tab_name, ci.session_doc_id,
+            """SELECT ci.id, ci.name AS tab_name, ci.session_doc_id,
                       ci.status, ci.last_activity, ci.workflow_blocked_reason,
+                      ci.golden_throne, ci.rank, ci.zealotry,
                       sd.file_path AS session_doc_path
                FROM instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
@@ -20296,124 +20283,55 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
         )
         rows = [dict(r) for r in await cursor.fetchall()]
 
-        # Group rows by tmux_pane for duplicate detection.
-        by_pane: dict[str, list[dict]] = {}
         for row in rows:
-            tp = row.get("tmux_pane")
-            if tp:
-                by_pane.setdefault(tp, []).append(row)
-
-        # Resolve which row "owns" each pane; the rest are superseded duplicates.
-        owners: set[str] = set()
-        superseded: list[dict] = []
-        for tp, group in by_pane.items():
-            if len(group) <= 1:
-                owners.add(group[0]["id"])
-                continue
-            # Newest by last_activity wins. Fall back to id for stable order.
-            ordered = sorted(
-                group,
-                key=lambda r: (r.get("last_activity") or "", r.get("id") or ""),
-                reverse=True,
-            )
-            owners.add(ordered[0]["id"])
-            superseded.extend(ordered[1:])
-
-        # Stop superseded duplicates first.
-        for row in superseded:
-            if not _reconcile_eligible(row, now):
-                continue
-            try:
-                await sanctioned_update_instance(
-                    db,
-                    instance_id=row["id"],
-                    updates={
-                        "status": "stopped",
-                        "stopped_at": now.isoformat(),
-                    },
-                    mutation_type="reconcile_superseded",
-                    write_source="tmux_db_reconciler",
-                    actor="reconciler",
-                )
-                counts["superseded_duplicate"] += 1
-            except Exception as e:
-                logger.warning(f"Reconciler superseded mutation failed for {row.get('id')}: {e}")
-
-        # Process owners + tmux_pane-less rows.
-        for row in rows:
-            tmux_pane = row.get("tmux_pane")
-            if tmux_pane and row["id"] not in owners:
-                continue  # already handled above
             if not _reconcile_eligible(row, now):
                 continue
 
-            # Pane vanished.
-            if tmux_pane and tmux_pane not in panes:
+            # Pane vanished. A row is live iff a tmux pane currently carries its
+            # @INSTANCE_ID stamp — the durable, ONLY pane↔row bridge now that pane
+            # ids are never stored. `id not in live_ids` subsumes the old
+            # stored-%NN "pane_missing" AND "superseded_duplicate" branches: a stale
+            # duplicate row is never the stamp owner, so it too falls out of
+            # live_ids and is stopped here. No stored pane means no pane_label_drift
+            # to reconcile — the pane border reads @PANE_LABEL pushed from
+            # instances.name by trigger.
+            if row["id"] not in live_ids:
+                marker = row.get("golden_throne")
+                pane_vanished_updates = {
+                    "status": "stopped",
+                    "stopped_at": now.isoformat(),
+                }
+                # Mirror the relocated hook behaviour: clear the morning-session sync
+                # sentinel on reap; a real golden_throne.id binding must survive so the
+                # dead-pane follow-up below can re-arm it.
+                if marker == "sync":
+                    pane_vanished_updates["golden_throne"] = None
                 try:
                     await sanctioned_update_instance(
                         db,
                         instance_id=row["id"],
-                        updates={
-                            "status": "stopped",
-                            "stopped_at": now.isoformat(),
-                        },
+                        updates=pane_vanished_updates,
                         mutation_type="reconcile_pane_missing",
                         write_source="tmux_db_reconciler",
                         actor="reconciler",
                     )
                     counts["pane_vanished"] += 1
-                    if not _is_assert_persona_label(row.get("pane_label")):
-                        spawn_tmux_assert_instance(
-                            row.get("pane_label") or tmux_pane,
-                            row.get("id", ""),
-                            "reconciler-pane-missing",
-                        )
                 except Exception as e:
                     logger.warning(
                         f"Reconciler pane_missing mutation failed for {row.get('id')}: {e}"
                     )
-                continue
-
-            # Pane label drift.
-            if tmux_pane and tmux_pane in panes:
-                tmux_label = panes[tmux_pane]["pane_label"]
-                if row.get("pane_label") != tmux_label:
+                # GT dead-pane follow-up relocated here from hooks._stop_if_dead_pane: a
+                # genuine golden_throne marker (not the 'sync' sentinel) re-arms the resume
+                # timer so a reaped Golden Throne seat is followed up on.
+                if marker and marker != "sync":
                     try:
-                        workflow_events = [
-                            {
-                                "workflow_state": row.get("status"),
-                                "event_type": "pane_label_reconciled",
-                                "event_owner": "tmux_db_reconciler",
-                                "details": {
-                                    "previous_pane_label": row.get("pane_label"),
-                                    "tmux_pane_label": tmux_label,
-                                    "tmux_session_window": panes[tmux_pane].get("session_window"),
-                                    "tmux_pane": tmux_pane,
-                                },
-                            }
-                        ]
-                        await sanctioned_update_instance(
-                            db,
-                            instance_id=row["id"],
-                            updates={"pane_label": tmux_label},
-                            mutation_type="reconcile_pane_label",
-                            write_source="tmux_db_reconciler",
-                            actor="reconciler",
-                            workflow_events=workflow_events,
-                        )
-                        logger.info(
-                            "Reconciler pane_label mutation instance=%s tmux_pane=%s old=%s new=%s session_window=%s",
-                            row.get("id"),
-                            tmux_pane,
-                            row.get("pane_label"),
-                            tmux_label,
-                            panes[tmux_pane].get("session_window"),
-                        )
-                        counts["pane_label_drift"] += 1
+                        await schedule_golden_throne_followup(row, reason="reconciler-dead-pane")
                     except Exception as e:
                         logger.warning(
-                            f"Reconciler pane_label mutation failed for {row.get('id')}: {e}"
+                            f"Golden Throne: failed to schedule dead-pane follow-up for "
+                            f"{str(row.get('id'))[:12]}: {e}"
                         )
+                continue
 
             # Placeholder tab_name with attached session doc — flag, don't rename.
             if _is_placeholder_tab_name(row.get("tab_name")) and row.get("session_doc_id"):
@@ -20540,23 +20458,28 @@ async def session_doc_sync_worker():
 
 
 async def clear_stale_processing_flags():
-    """Background worker that clears stale processing and stops dead local pane rows."""
+    """Background worker that clears stale processing and stops dead local pane rows.
+
+    Dead-pane detection is sourced live from the tmuxctl oracle: a local
+    non-stopped row whose ``@INSTANCE_ID`` is not stamped on any live agent pane
+    has no live pane and is stopped. There is no stored pane column to consult.
+    """
     while True:
         try:
+            live_ids = await _live_agent_instance_ids()
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute(
                     """SELECT *
                        FROM instances
                        WHERE status NOT IN ('stopped', 'archived')
-                         AND tmux_pane IS NOT NULL
                          AND device_id = ?""",
                     (LOCAL_DEVICE_NAME,),
                 )
                 pane_rows = await cursor.fetchall()
                 stopped_dead_panes = []
                 for row in pane_rows:
-                    if await _tmux_pane_exists(row["tmux_pane"]):
+                    if row["id"] in live_ids:
                         continue
                     try:
                         await sanctioned_update_instance(
@@ -20604,14 +20527,6 @@ async def clear_stale_processing_flags():
                     logger.warning(
                         f"Auto-stopped {len(stopped_dead_panes)} dead tmux-pane instance rows"
                     )
-                    for stopped in stopped_dead_panes:
-                        if _is_assert_persona_label(stopped.get("pane_label")):
-                            continue
-                        spawn_tmux_assert_instance(
-                            stopped.get("pane_label") or stopped.get("tmux_pane"),
-                            stopped.get("id", ""),
-                            "clear-dead-tmux-pane",
-                        )
                     for stopped in stopped_dead_panes:
                         marker = stopped.get("golden_throne")
                         if not marker or marker == "sync":
@@ -21064,7 +20979,7 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT i.id, i.tmux_pane, i.device_id
+            """SELECT i.id, i.device_id
                FROM instances i
                JOIN personas p ON p.id = i.persona_id
                WHERE p.slug = 'custodes'
@@ -21088,12 +21003,13 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None):
 
     target_pane: str | None = None
     target_instance: str | None = None
-    if row and (row["tmux_pane"] or "").strip():
-        if await _tmux_pane_exists(row["tmux_pane"]):
-            target_pane = row["tmux_pane"]
+    if row:
+        pane, _role = await shared.resolve_instance_pane(row["id"])
+        if pane:
+            target_pane = pane
             target_instance = row["id"]
     if not target_pane:
-        # DB stale — try recovering from tmux directly
+        # Oracle has no live pane for the singleton — try recovering from tmux directly
         recovered = await _find_custodes_tmux_pane()
         if recovered:
             target_pane = recovered
@@ -21627,16 +21543,28 @@ async def _resolve_discord_fixer_target(redirect: str | None = None) -> dict:
     paste blindly.
     """
     redirect = (redirect or "").strip()
+    # Live oracle: instance_id -> live pane dict. Pane id + label are sourced live
+    # (instances.tmux_pane / pane_label are gone); only pane-resident instances
+    # are routing targets, so we keep DB rows that have a live pane.
+    live_panes = {p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]}
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT id, tmux_pane, pane_label, name AS tab_name,
+            """SELECT id, name AS tab_name,
                       CASE WHEN commander_type = 'chapter' THEN commander_id END AS parent_instance_id,
                       status
                FROM instances
-               WHERE status NOT IN ('stopped', 'archived') AND tmux_pane IS NOT NULL"""
+               WHERE status NOT IN ('stopped', 'archived')"""
         )
-        live = [dict(row) for row in await cursor.fetchall()]
+        live = []
+        for row in await cursor.fetchall():
+            lp = live_panes.get(row["id"])
+            if not lp:
+                continue
+            entry = dict(row)
+            entry["tmux_pane"] = lp["pane_id"]
+            entry["pane_label"] = lp["pane_label"]
+            live.append(entry)
 
     fg = next((r for r in live if (r.get("pane_label") or "") == _DISCORD_FIXER_FG_LABEL), None)
     if not fg:
@@ -21790,7 +21718,7 @@ async def _discord_voice_error(legion: str, transcript: str):
     # Determine why injection failed
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """SELECT i.id, i.status, i.tmux_pane
+            """SELECT i.id, i.status
                FROM instances i
                LEFT JOIN personas p ON p.id = i.persona_id
                WHERE COALESCE(p.slug, 'astartes') = ?
@@ -21804,7 +21732,7 @@ async def _discord_voice_error(legion: str, transcript: str):
         reason = f"No {legion} instance is running."
     elif row[1] in ("stopped", "archived"):
         reason = f"{legion.capitalize()} instance is {row[1]}, not active."
-    elif not row[2]:
+    elif not (await shared.resolve_instance_pane(row[0]))[0]:
         reason = f"{legion.capitalize()} instance has no terminal attached."
     else:
         reason = f"{legion.capitalize()} injection failed."
@@ -21925,7 +21853,7 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
     async with aiosqlite.connect(DB_PATH) as db:
         if require_synced:
             cursor = await db.execute(
-                """SELECT i.id, i.tmux_pane, i.device_id
+                """SELECT i.id, i.device_id
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
                    WHERE COALESCE(p.slug, 'astartes') = ?
@@ -21936,7 +21864,7 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
             )
         else:
             cursor = await db.execute(
-                """SELECT i.id, i.tmux_pane, i.device_id
+                """SELECT i.id, i.device_id
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
                    WHERE COALESCE(p.slug, 'astartes') = ?
@@ -21947,7 +21875,8 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
         row = await cursor.fetchone()
 
     instance_id = row[0] if row else None
-    tmux_pane = row[1] if row else None
+    # Pane is resolved live from the oracle (instances.tmux_pane is gone).
+    tmux_pane = (await shared.resolve_instance_pane(instance_id))[0] if instance_id else None
 
     if not tmux_pane:
         if instance_id:
@@ -22184,7 +22113,7 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
     async with aiosqlite.connect(DB_PATH) as db:
         if require_synced:
             cursor = await db.execute(
-                """SELECT i.tmux_pane
+                """SELECT i.id
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
                    WHERE COALESCE(p.slug, 'astartes') = ?
@@ -22195,7 +22124,7 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
             )
         else:
             cursor = await db.execute(
-                """SELECT i.tmux_pane
+                """SELECT i.id
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
                    WHERE COALESCE(p.slug, 'astartes') = ?
@@ -22204,7 +22133,8 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
                 (bot,),
             )
         row = await cursor.fetchone()
-    pane = row[0] if row else None
+    # Pane is resolved live from the oracle (instances.tmux_pane is gone).
+    pane = (await shared.resolve_instance_pane(row[0]))[0] if row else None
     if pane and await _tmux_pane_exists(pane):
         return pane
     logger.warning(f"Voice draft [{bot}]: no live target pane")

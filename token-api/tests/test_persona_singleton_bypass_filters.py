@@ -27,7 +27,6 @@ _INSTANCE_INSERT_COLUMNS = frozenset(
         "created_at",
         "last_activity",
         "stopped_at",
-        "tmux_pane",
         "persona_id",
         "rank",
         "golden_throne",
@@ -64,7 +63,6 @@ def _insert_instance(conn: sqlite3.Connection, **overrides: Any) -> str:
         "created_at": now,
         "last_activity": now,
         "stopped_at": None,
-        "tmux_pane": "%1",
         "persona_id": None,
         "rank": "overseer",
         "golden_throne": None,
@@ -73,7 +71,6 @@ def _insert_instance(conn: sqlite3.Connection, **overrides: Any) -> str:
     cols = list(values)
     invalid_cols = [col for col in cols if col not in _INSTANCE_INSERT_COLUMNS]
     assert not invalid_cols, f"unexpected instances columns: {invalid_cols}"
-    tmux_pane = values.pop("tmux_pane", None)
     sanctioned_insert_instance_sync(
         conn,
         values=values,
@@ -81,8 +78,6 @@ def _insert_instance(conn: sqlite3.Connection, **overrides: Any) -> str:
         write_source="test",
         actor="test",
     )
-    if tmux_pane is not None:
-        conn.execute("UPDATE instances SET tmux_pane = ? WHERE id = ?", (tmux_pane, values["id"]))
     return values["id"]
 
 
@@ -105,7 +100,6 @@ def _seed_shadowed_singleton(
         commander_id=None,
         rank="overseer",
         status="working",
-        tmux_pane="%10",
         last_activity="2025-01-01T00:00:00",
     )
     _insert_instance(
@@ -119,7 +113,6 @@ def _seed_shadowed_singleton(
         # Malformed historical rows can carry retired rank without stopped status;
         # rank, not status, is the identity death marker this regression pins.
         status="working",
-        tmux_pane="%20",
         last_activity="2025-12-30T00:00:00",
     )
     _insert_instance(
@@ -131,14 +124,15 @@ def _seed_shadowed_singleton(
         commander_id=live_id,
         rank="overseer",
         status="working",
-        tmux_pane="%30",
         last_activity="2025-12-31T00:00:00",
     )
     conn.commit()
     conn.close()
 
 
-def test_administratum_bypass_resolver_uses_canonical_singleton_filter(app_env: Any) -> None:
+def test_administratum_bypass_resolver_uses_canonical_singleton_filter(
+    app_env: Any, monkeypatch: Any
+) -> None:
     main = app_env.main
     _seed_shadowed_singleton(
         app_env.db_path,
@@ -147,6 +141,12 @@ def test_administratum_bypass_resolver_uses_canonical_singleton_filter(app_env: 
         child_id="admin-child",
         retired_id="admin-retired",
     )
+
+    # Pane geometry is resolved live from the oracle (instances.tmux_pane is gone).
+    async def fake_resolve_pane(instance_id):
+        return ("%10", "mechanicus:administratum") if instance_id == "admin-live" else (None, None)
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", fake_resolve_pane)
 
     resolved = asyncio.run(main._resolve_administratum_instance())
 
@@ -173,11 +173,17 @@ def test_custodes_morning_brief_injects_into_canonical_singleton(
     async def fake_find_custodes_tmux_pane():
         raise AssertionError("DB row should resolve without pane-marker fallback")
 
+    # Pane geometry is resolved live from the oracle (instances.tmux_pane is gone);
+    # the canonical singleton must resolve to its live pane without the tmux fallback.
+    async def fake_resolve_pane(instance_id):
+        return ("%10", "legion:custodes") if instance_id == "cust-live" else (None, None)
+
     async def fake_inject(_prompt, pane, *, instance_id=None):
         return {"dispatched": True, "pane": pane, "instance_id": instance_id}
 
     import morning_session
 
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", fake_resolve_pane)
     monkeypatch.setattr(main, "_tmux_pane_exists", fake_tmux_pane_exists)
     monkeypatch.setattr(main, "_find_custodes_tmux_pane", fake_find_custodes_tmux_pane)
     monkeypatch.setattr(main, "_inject_custodes_prompt_to_pane", fake_inject)

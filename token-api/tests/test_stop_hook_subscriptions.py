@@ -7,6 +7,50 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+# token-api no longer stores tmux pane-ids; pane geometry is resolved LIVE from
+# the tmuxctl oracle in `shared.py`. Tests record the (pane, role) they want each
+# inserted instance to resolve to in this registry, and the autouse `_pane_oracle`
+# fixture monkeypatches shared.resolve_instance_pane / shared.instance_id_for_pane
+# to read from it. _insert_instance no longer writes pane/pane_label columns
+# (they are gone from the schema); it populates this map instead.
+_PANE_MAP: dict[str, tuple[str | None, str | None]] = {}
+
+
+def _seed_pane(instance_id, pane, role=None):
+    """Seed the live-oracle map for an instance the test does NOT create via
+    _insert_instance (e.g. a child registered inside handle_session_start). The
+    wrapper stamps @INSTANCE_ID + @PANE_ID before SessionStart, so the oracle
+    resolves the freshly-registered pane to (pane, role)."""
+    if pane:
+        _PANE_MAP[instance_id] = (pane, role)
+
+
+@pytest.fixture(autouse=True)
+def _pane_oracle(request, monkeypatch):
+    _PANE_MAP.clear()
+    # app_env reloads `shared` per test; depend on it (when the test uses it) so we
+    # patch the freshly reloaded module, not a stale one that the reload replaces.
+    if "app_env" in request.fixturenames:
+        request.getfixturevalue("app_env")
+    shared = sys.modules.get("shared")
+    if shared is not None:
+
+        async def resolve_instance_pane(instance_id):
+            return _PANE_MAP.get(instance_id, (None, None))
+
+        async def instance_id_for_pane(pane):
+            for inst_id, (mapped_pane, _role) in _PANE_MAP.items():
+                if mapped_pane is not None and mapped_pane == pane:
+                    return inst_id
+            return None
+
+        monkeypatch.setattr(shared, "resolve_instance_pane", resolve_instance_pane)
+        monkeypatch.setattr(shared, "instance_id_for_pane", instance_id_for_pane)
+    yield
+    _PANE_MAP.clear()
+
 
 def _insert_instance(
     db_path,
@@ -23,18 +67,16 @@ def _insert_instance(
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status, tmux_pane,
-            parent_instance_id, pane_label, dispatch_target, dispatch_window, engine)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?, ?, ?)""",
+            profile_name, tts_voice, notification_sound, status,
+            parent_instance_id, dispatch_target, dispatch_window, engine)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?)""",
         (
             instance_id,
             f"{instance_id}-session",
             instance_id,
             "/tmp",
             status,
-            pane,
             parent,
-            pane_label,
             dispatch_target,
             dispatch_window,
             engine,
@@ -42,6 +84,13 @@ def _insert_instance(
     )
     conn.commit()
     conn.close()
+    # Pane geometry is no longer stored; record it into the live-oracle map so
+    # shared.resolve_instance_pane / shared.instance_id_for_pane can resolve it.
+    # A None pane means "no live pane" -> absent from the map -> oracle returns
+    # (None, None), which is what swept/stopped-row cases expect. role == the old
+    # pane_label column value (e.g. "mechanicus:fabricator-general").
+    if pane:
+        _PANE_MAP[instance_id] = (pane, pane_label)
 
 
 def test_session_start_auto_subscribes_parent(app_env, monkeypatch):
@@ -154,18 +203,11 @@ def test_explicit_subscribe_unsubscribe(app_env):
 
 def test_same_pane_subscribe_resolves_pane_once(app_env, monkeypatch) -> None:
     # The live preplan subscribe sends target_pane == subscriber_pane == the same
-    # %id. _resolve_instance_for_pane is the expensive leg (tmux show-options + a
-    # SQLite lookup); it must run ONCE for the shared pane, not twice. Force the
-    # pane-stamp probe to miss so resolution is deterministic (falls to the
-    # tmux_pane fallback that finds the inserted row).
+    # %id. _resolve_instance_for_pane is the expensive leg (oracle lookup + a
+    # SQLite lookup); it must run ONCE for the shared pane, not twice. The autouse
+    # oracle resolves %55 -> selfpane-1 from the inserted row.
     hooks = sys.modules["routes.hooks"]
-    shared = sys.modules["shared"]
     _insert_instance(app_env.db_path, "selfpane-1", pane="%55")
-
-    async def no_stamp(_pane):
-        return None
-
-    monkeypatch.setattr(shared, "instance_id_for_pane", no_stamp)
 
     original = hooks._resolve_instance_for_pane
     calls = {"n": 0}
@@ -193,16 +235,11 @@ def test_same_pane_subscribe_resolves_pane_once(app_env, monkeypatch) -> None:
 
 def test_distinct_pane_subscribe_resolves_each_pane(app_env, monkeypatch) -> None:
     # When the two roles are different panes, each is still resolved (the cache
-    # must not collapse distinct panes to one resolution).
+    # must not collapse distinct panes to one resolution). The autouse oracle
+    # resolves each pane to its inserted row.
     hooks = sys.modules["routes.hooks"]
-    shared = sys.modules["shared"]
     _insert_instance(app_env.db_path, "tgt-x", pane="%60")
     _insert_instance(app_env.db_path, "sub-x", pane="%61")
-
-    async def no_stamp(_pane):
-        return None
-
-    monkeypatch.setattr(shared, "instance_id_for_pane", no_stamp)
 
     original = hooks._resolve_instance_for_pane
     seen = []
@@ -234,6 +271,9 @@ def test_mechanicus_worker_session_start_auto_subscribes_to_live_fg(app_env):
         pane="%40",
         pane_label="mechanicus:fabricator-general",
     )
+    # Child registers inside handle_session_start; its pane is stamped by the
+    # wrapper before SessionStart, so seed the oracle to resolve it live.
+    _seed_pane("worker-1", "%41", "mechanicus:1")
 
     async def run() -> None:
         result = await hooks.handle_session_start(
@@ -277,6 +317,8 @@ def test_fg_session_start_reconciles_existing_mechanicus_workers(app_env):
         pane_label="mechanicus:worker-7",
         parent="fg-2",
     )
+    # FG registers inside handle_session_start; seed its stamped pane/role.
+    _seed_pane("fg-2", "%44", "mechanicus:fabricator-general")
 
     async def run() -> None:
         result = await hooks.handle_session_start(
@@ -391,6 +433,9 @@ def test_mechanicus_reconcile_is_idempotent(app_env):
 
 def test_mechanicus_worker_start_without_fg_does_not_create_subscription(app_env):
     hooks = sys.modules["routes.hooks"]
+    # Worker registers inside handle_session_start; seed its stamped pane/role so
+    # the oracle classifies it as a mechanicus worker (no FG is live).
+    _seed_pane("worker-no-fg", "%71", "mechanicus:1")
 
     async def run() -> None:
         result = await hooks.handle_session_start(
@@ -1430,7 +1475,7 @@ def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env, monkeypat
         "SELECT planning_state, planning_source FROM legacy_instances WHERE id='planner-1'"
     ).fetchone()
     queued = conn.execute(
-        "SELECT variable, value, tmux_pane FROM pane_state_queue WHERE instance_id='planner-1' ORDER BY id DESC LIMIT 1"
+        "SELECT variable, value FROM pane_state_queue WHERE instance_id='planner-1' ORDER BY id DESC LIMIT 1"
     ).fetchone()
     event_count = conn.execute(
         "SELECT COUNT(*) FROM events WHERE instance_id='planner-1' AND event_type='planning_state_changed'"
@@ -1438,7 +1483,7 @@ def test_planning_state_endpoint_cycles_and_projects_pane_var(app_env, monkeypat
     conn.close()
 
     assert inst == ("preplanning", "test")
-    assert queued == ("@PLANNING_STATE", "preplanning", "%91")
+    assert queued == ("@PLANNING_STATE", "preplanning")
     assert event_count == 1
 
     get_resp = client.get("/api/planning/state", params={"tmux_pane": "%91"})
