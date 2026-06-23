@@ -445,25 +445,40 @@ def test_dispatch_interactive_session_doc_resume_option(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
 
+    server = _run_instance_api_server(
+        {
+            "resume-session-id": {
+                "id": "resume-session-id",
+                "engine": "claude",
+                "working_dir": str(ROOT),
+                "golden_throne": "1",
+                "zealotry": 5,
+            }
+        }
+    )
     monkeypatch.setenv("TOKEN_API_DB", str(db))
+    monkeypatch.setenv("TOKEN_API_URL", f"http://127.0.0.1:{server.server_port}")
     monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__resume__")
     monkeypatch.setenv("DISPATCH_INTERACTIVE_RESUME", "resume-session-id")
-    result = subprocess.run(
-        [
-            str(DISPATCH),
-            "--dry-run",
-            "--interactive",
-            "--direct",
-            "--engine",
-            "claude",
-            "--dir",
-            str(ROOT),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=str(ROOT),
-    )
+    try:
+        result = subprocess.run(
+            [
+                str(DISPATCH),
+                "--dry-run",
+                "--interactive",
+                "--direct",
+                "--engine",
+                "claude",
+                "--dir",
+                str(ROOT),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+        )
+    finally:
+        server.shutdown()
 
     assert result.returncode == 0, result.stderr
     assert "resume_id:       resume-session-id" in result.stdout
@@ -2421,3 +2436,104 @@ def test_dispatch_mints_fresh_wrapper_launch_id_not_inheriting_dispatcher():
     assert "-u TOKEN_API_WRAPPER_LAUNCH_ID" in result.stdout, (
         "dispatch must scrub an inherited TOKEN_API_WRAPPER_LAUNCH_ID from the child env"
     )
+
+
+def _run_instance_api_server(payloads):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import unquote
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            prefix = "/api/instances/"
+            if not self.path.startswith(prefix):
+                self.send_response(404)
+                self.end_headers()
+                return
+            iid = unquote(self.path[len(prefix) :])
+            if iid not in payloads:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b'{"detail":"Instance not found"}')
+                return
+            body = json.dumps(payloads[iid]).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def test_dispatch_resume_by_id_uses_token_api_without_engine_or_dir(tmp_path: Path) -> None:
+    iid = "resume-api-row"
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    server = _run_instance_api_server(
+        {
+            iid: {
+                "id": iid,
+                "engine": "codex",
+                "launcher": "codex",
+                "target_working_dir": str(work_dir),
+                "working_dir": "/stale/working-dir",
+                "dispatch_session_doc_path": "Sessions/resume-api-row.md",
+                "instance_type": "one_off",
+                "zealotry": 5,
+                "persona": {"slug": "mechanicus"},
+            }
+        }
+    )
+    try:
+        env = os.environ.copy()
+        env["TOKEN_API_URL"] = f"http://127.0.0.1:{server.server_port}"
+        env["TOKEN_API_DB"] = str(tmp_path / "missing-agents.db")
+        result = subprocess.run(
+            [str(DISPATCH), "--dry-run", "--id", iid, "--pane", "mechanicus:new"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+            env=env,
+            timeout=60,
+        )
+    finally:
+        server.shutdown()
+
+    assert result.returncode == 0, result.stderr
+    assert "engine:          codex" in result.stdout
+    assert f"dir:             {work_dir}" in result.stdout
+    assert "resume_db:       true" in result.stdout
+    assert f"dispatch --id {iid} --pane mechanicus:new" in result.stdout
+    assert "--engine" not in result.stdout
+    assert "--dir" not in result.stdout
+
+
+def test_dispatch_resume_missing_id_requires_explicit_engine_and_dir(tmp_path: Path) -> None:
+    server = _run_instance_api_server({})
+    try:
+        env = os.environ.copy()
+        env["TOKEN_API_URL"] = f"http://127.0.0.1:{server.server_port}"
+        env["TOKEN_API_DB"] = str(tmp_path / "missing-agents.db")
+        result = subprocess.run(
+            [str(DISPATCH), "--dry-run", "--id", "not-found", "--pane", "mechanicus:new"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+            env=env,
+            timeout=60,
+        )
+    finally:
+        server.shutdown()
+
+    assert result.returncode == 66
+    assert "pass explicit --engine and --dir" in result.stderr

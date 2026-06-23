@@ -906,42 +906,80 @@ RESUME_DISCORD_HOSTED=""
 RESUME_DISCORD_CHANNEL=""
 RESUME_DISCORD_BOT=""
 
+api_instance_resume_row() {
+  local instance_id="$1"
+  local api_url="${TOKEN_API_URL:-http://localhost:7777}"
+  API_URL="$api_url" INSTANCE_ID="$instance_id" python3 - <<'PYAPI' 2>/dev/null || true
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+api = os.environ.get("API_URL", "http://localhost:7777").rstrip("/")
+iid = os.environ.get("INSTANCE_ID", "")
+if not iid:
+    sys.exit(0)
+url = f"{api}/api/instances/{urllib.parse.quote(iid, safe='')}"
+try:
+    with urllib.request.urlopen(url, timeout=2) as resp:
+        if resp.status == 404:
+            sys.exit(0)
+        data = json.loads(resp.read().decode("utf-8"))
+except urllib.error.HTTPError as exc:
+    if exc.code == 404:
+        sys.exit(0)
+    sys.exit(0)
+except Exception:
+    sys.exit(0)
+
+if not isinstance(data, dict) or not data.get("id"):
+    sys.exit(0)
+
+session_doc = data.get("session_doc") if isinstance(data.get("session_doc"), dict) else {}
+persona = data.get("persona") if isinstance(data.get("persona"), dict) else {}
+instance_type = data.get("instance_type")
+if not instance_type:
+    gt = data.get("golden_throne")
+    if gt == "sync":
+        instance_type = "sync"
+    elif gt is not None and gt != "":
+        instance_type = "golden_throne"
+    else:
+        instance_type = "one_off"
+parent = data.get("parent_instance_id")
+if not parent and data.get("commander_type") == "chapter":
+    parent = data.get("commander_id")
+values = [
+    data.get("id"),
+    data.get("engine"),
+    data.get("launcher"),
+    data.get("target_working_dir"),
+    data.get("working_dir"),
+    data.get("dispatch_session_doc_path"),
+    session_doc.get("file_path"),
+    instance_type,
+    data.get("zealotry"),
+    data.get("dispatch_target"),
+    data.get("dispatch_window"),
+    data.get("dispatch_mode"),
+    data.get("dispatch_slot"),
+    data.get("launch_mode"),
+    data.get("tmux_pane") or data.get("runtime_pane") or data.get("pane_id"),
+    persona.get("slug") or data.get("persona_slug") or data.get("profile_name") or data.get("legion"),
+    parent,
+    data.get("discord_hosted"),
+    data.get("discord_channel"),
+    data.get("discord_bot"),
+]
+print("\x1f".join("" if v is None else str(v) for v in values))
+PYAPI
+}
+
 resolve_resume_id() {
-  local sid_sql row
-  sid_sql="$(sql_literal "$RESUME_ID")"
-  row="$(sqlite_query_usv "
-    SELECT
-      COALESCE(ci.id, ''),
-      COALESCE(ci.engine, ''),
-      COALESCE(ci.launcher, ''),
-      COALESCE(ci.target_working_dir, ''),
-      COALESCE(ci.working_dir, ''),
-      COALESCE(ci.dispatch_session_doc_path, ''),
-      COALESCE(sd.file_path, ''),
-      COALESCE(CASE
-        WHEN ci.golden_throne = 'sync' THEN 'sync'
-        WHEN ci.golden_throne IS NOT NULL THEN 'golden_throne'
-        ELSE 'one_off'
-      END, ''),
-      COALESCE(ci.zealotry, ''),
-      COALESCE(ci.dispatch_target, ''),
-      COALESCE(ci.dispatch_window, ''),
-      COALESCE(ci.dispatch_mode, ''),
-      COALESCE(ci.dispatch_slot, ''),
-      COALESCE(ci.launch_mode, ''),
-      COALESCE(ci.tmux_pane, ''),
-      COALESCE(p.slug, ''),
-      COALESCE(CASE WHEN ci.commander_type = 'chapter' THEN ci.commander_id ELSE '' END, ''),
-      COALESCE(ci.discord_hosted, ''),
-      COALESCE(ci.discord_channel, ''),
-      COALESCE(ci.discord_bot, '')
-    FROM instances ci
-    LEFT JOIN personas p ON p.id = ci.persona_id
-    LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
-    WHERE ci.id = '${sid_sql}'
-    ORDER BY ci.last_activity DESC
-    LIMIT 1;
-  ")"
+  local row
+  row="$(api_instance_resume_row "$RESUME_ID")"
 
   if [[ -z "$row" ]]; then
     if ! $ENGINE_EXPLICIT || ! $WORK_DIR_EXPLICIT; then
