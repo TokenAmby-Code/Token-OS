@@ -1882,13 +1882,15 @@ def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path
     assert "stack dispatch returned a non-canonical id" in result.stderr
 
 
-def test_dispatch_stack_new_launch_failure_does_not_inject_target_pane(tmp_path: Path) -> None:
-    """A sent launch whose wrapper never stamps the pane must not look successful.
+def test_dispatch_stack_new_launch_failure_when_no_live_agent(tmp_path: Path) -> None:
+    """A sent launch where NO live agent ever comes up is the only exit-70 case.
 
-    This is the observable-launch guard for the real failure mode where the
-    newborn pane receives a corrupted/no-op staged command: tmux accepts the
-    send, but no wrapper starts, no instance row appears, and the operator used
-    to get a false "dispatched ..." success.
+    The success criterion is liveness (a live Claude/Codex process in the pane),
+    not a DB-row bind. This is the genuine failure mode the guard still catches:
+    the newborn pane receives a corrupted/no-op staged command, the pane stays up
+    as a bare shell, but no agent process appears — ``tmuxctl pane-live`` reports
+    not-live for the whole (advisory) window and dispatch fails exit 70 rather
+    than printing a false "dispatched ..." success.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1899,6 +1901,8 @@ def test_dispatch_stack_new_launch_failure_does_not_inject_target_pane(tmp_path:
         "#!/usr/bin/env bash\n"
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
         'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        # No live agent ever appears in the pane → not-live for the whole window.
+        'if [[ "$1" == "pane-live" ]]; then exit 1; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -1908,9 +1912,9 @@ def test_dispatch_stack_new_launch_failure_does_not_inject_target_pane(tmp_path:
     fake_tmux.write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> {tmux_log}\n'
-        # The launch command is accepted, but display-message never reports the
-        # wrapper stamp, simulating a pane where the staged shell never ran.
-        'if [[ "$1" == "display-message" ]]; then exit 0; fi\n'
+        # The pane survives (display-message succeeds) but hosts no agent — the
+        # "staged command died to a bare shell" case, not a vanished pane.
+        'if [[ "$1" == "display-message" ]]; then printf "%%77\\n"; exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -1941,9 +1945,9 @@ def test_dispatch_stack_new_launch_failure_does_not_inject_target_pane(tmp_path:
         env=env,
     )
 
-    assert result.returncode != 0
-    assert "launch failed: wrapper did not start" in result.stderr
-    assert "staged command may not have reached the pane" in result.stderr
+    assert result.returncode == 70
+    assert "launch failed: no live claude agent appeared" in result.stderr
+    assert "dispatched claude" not in result.stdout
     assert "%77" not in result.stderr
     tmux_calls = tmux_log.read_text(encoding="utf-8")
     assert "DISPATCH LAUNCH FAILED" not in tmux_calls
@@ -1953,23 +1957,19 @@ def test_dispatch_stack_new_launch_failure_does_not_inject_target_pane(tmp_path:
     )
 
 
-def test_dispatch_stack_new_observer_accepts_matching_wrapper_stamp(tmp_path: Path) -> None:
+def test_dispatch_stack_new_observer_accepts_live_agent(tmp_path: Path) -> None:
+    """A live agent process in the pane is success — regardless of the row bind."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     tmux_log = tmp_path / "tmux.log"
-    wrapper_id = "11111111-2222-3333-4444-555555555555"
-
-    fake_uuidgen = fake_bin / "uuidgen"
-    fake_uuidgen.write_text(
-        f"#!/usr/bin/env bash\nprintf '%s\\n' '{wrapper_id}'\n", encoding="utf-8"
-    )
-    fake_uuidgen.chmod(0o755)
 
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
         'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        # The pane is running a live agent → success criterion met immediately.
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -1979,7 +1979,7 @@ def test_dispatch_stack_new_observer_accepts_matching_wrapper_stamp(tmp_path: Pa
     fake_tmux.write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> {tmux_log}\n'
-        f'if [[ "$1" == "display-message" ]]; then printf "%s\\n" "{wrapper_id}"; exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "%%77\\n"; exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -2186,7 +2186,16 @@ def test_dispatch_tmux_target_bakes_pane_label_into_launch_env(tmp_path: Path) -
     assert "TOKEN_API_PANE_LABEL=palace:E" in result.stdout
 
 
-def test_dispatch_fails_fast_when_registry_row_is_stopped_after_stamp(tmp_path: Path) -> None:
+def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Path) -> None:
+    """A live pane whose instances row lags (or is stale) is SUCCESS, not failure.
+
+    Regression for the fleet-wide exit-70 false-failure: the agent process is up
+    and engaged in the pane, but the DB row has not bound live (here it is still
+    ``stopped`` — the cold-start / codex-undercount reconciliation lag). The old
+    code gated success on the row binding and fatal-ed exit 70 even though the
+    launch plainly succeeded. The liveness-driven gate returns exit 0 and surfaces
+    the lag as an ADVISORY ``registration slow`` warning — never a hard failure.
+    """
     import sqlite3
 
     fake_bin = tmp_path / "bin"
@@ -2194,7 +2203,6 @@ def test_dispatch_fails_fast_when_registry_row_is_stopped_after_stamp(tmp_path: 
     tmux_log = tmp_path / "tmux.log"
     db = tmp_path / "agents.db"
     instance_id = "live-stamped-but-stopped"
-    wrapper_id = "11111111-2222-3333-4444-555555555555"
 
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -2205,16 +2213,12 @@ def test_dispatch_fails_fast_when_registry_row_is_stopped_after_stamp(tmp_path: 
             (instance_id, str(ROOT)),
         )
 
-    fake_uuidgen = fake_bin / "uuidgen"
-    fake_uuidgen.write_text(
-        f"#!/usr/bin/env bash\nprintf '%s\\n' '{wrapper_id}'\n", encoding="utf-8"
-    )
-    fake_uuidgen.chmod(0o755)
-
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%44"; exit 0; fi\n'
+        # The pane is running a live agent (liveness wins over the stale row).
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -2224,10 +2228,6 @@ def test_dispatch_fails_fast_when_registry_row_is_stopped_after_stamp(tmp_path: 
     fake_tmux.write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> {tmux_log}\n'
-        'if [[ "$1" == "display-message" && "$*" == *"@TOKEN_API_WRAPPER_LAUNCH_ID"* ]]; then\n'
-        f'  printf "%s\\n" "{wrapper_id}"\n'
-        "  exit 0\n"
-        "fi\n"
         'if [[ "$1" == "display-message" && "${@: -1}" == "#{@INSTANCE_ID}" ]]; then\n'
         f'  printf "%s\\n" "{instance_id}"\n'
         "  exit 0\n"
@@ -2265,35 +2265,34 @@ def test_dispatch_fails_fast_when_registry_row_is_stopped_after_stamp(tmp_path: 
         env=env,
     )
 
-    assert result.returncode == 70
-    assert "instance row did not bind live" in result.stderr
-    assert "registry row is missing, stopped, wrong-dir, or missing pane_label" in result.stderr
-    tmux_calls = tmux_log.read_text(encoding="utf-8")
-    assert "DISPATCH LAUNCH FAILED" not in tmux_calls
-    assert not any(
-        line.startswith("send-keys -t %44") and "launch failed" in line.lower()
-        for line in tmux_calls.splitlines()
-    )
+    assert result.returncode == 0, result.stderr
+    assert "dispatched claude to palace:E" in result.stdout
+    # The row lag is advisory only — surfaced as a warning, never a failure.
+    assert "registration slow" in result.stderr
+    assert "instance row did not bind live" not in result.stderr
+    assert "launch failed" not in result.stderr
 
 
-def test_dispatch_stack_new_fails_fast_when_instance_never_registers(tmp_path: Path) -> None:
-    """Wrapper start alone is not enough; the agent must reach SessionStart."""
+def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: Path) -> None:
+    """The codex singleton-undercount path: a live agent that never stamps a row.
+
+    For codex the SessionStart pane stamp / DB row may never land at all. The old
+    gate required the @INSTANCE_ID stamp and fatal-ed exit 70, breaking the
+    stop-hook/completion contract for a launch that genuinely succeeded. With the
+    liveness-driven gate, a live agent process in the pane is success (exit 0) even
+    when nothing ever registers — the row is reconciled advisorily.
+    """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     tmux_log = tmp_path / "tmux.log"
-    wrapper_id = "11111111-2222-3333-4444-555555555555"
-
-    fake_uuidgen = fake_bin / "uuidgen"
-    fake_uuidgen.write_text(
-        f"#!/usr/bin/env bash\nprintf '%s\\n' '{wrapper_id}'\n", encoding="utf-8"
-    )
-    fake_uuidgen.chmod(0o755)
 
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
         'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        # A live agent is running even though nothing ever stamps the pane/row.
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -2303,11 +2302,9 @@ def test_dispatch_stack_new_fails_fast_when_instance_never_registers(tmp_path: P
     fake_tmux.write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> {tmux_log}\n'
-        'if [[ "$1" == "display-message" && "$*" == *"@TOKEN_API_WRAPPER_LAUNCH_ID"* ]]; then\n'
-        f'  printf "%s\\n" "{wrapper_id}"\n'
-        "  exit 0\n"
-        "fi\n"
+        # @INSTANCE_ID is never stamped (undercount), but the pane survives.
         'if [[ "$1" == "display-message" && "$*" == *"@INSTANCE_ID"* ]]; then exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "%%77\\n"; exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -2322,6 +2319,8 @@ def test_dispatch_stack_new_fails_fast_when_instance_never_registers(tmp_path: P
     result = subprocess.run(
         [
             str(DISPATCH),
+            "--engine",
+            "codex",
             "--target",
             "mechanicus:new",
             "--dir",
@@ -2338,15 +2337,11 @@ def test_dispatch_stack_new_fails_fast_when_instance_never_registers(tmp_path: P
         env=env,
     )
 
-    assert result.returncode != 0
-    assert "launch failed: instance did not register" in result.stderr
-    assert "SessionStart did not stamp the pane" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "dispatched codex to mechanicus:new" in result.stdout
+    assert "launch failed" not in result.stderr
     tmux_calls = tmux_log.read_text(encoding="utf-8")
     assert "DISPATCH LAUNCH FAILED" not in tmux_calls
-    assert not any(
-        line.startswith("send-keys -t %77") and "launch failed" in line.lower()
-        for line in tmux_calls.splitlines()
-    )
 
 
 def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) -> None:
@@ -2421,3 +2416,223 @@ def test_dispatch_mints_fresh_wrapper_launch_id_not_inheriting_dispatcher():
     assert "-u TOKEN_API_WRAPPER_LAUNCH_ID" in result.stdout, (
         "dispatch must scrub an inherited TOKEN_API_WRAPPER_LAUNCH_ID from the child env"
     )
+
+
+def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path) -> None:
+    """The core repro: row lags but the pane is live → exit 0 AND naming runs.
+
+    A false exit-70 before the naming step is exactly why agents land needs-name
+    and untracked. With the liveness-driven gate the launch reaches exit 0, so the
+    launched agent is neither reaped nor retried and proceeds through its
+    SessionStart naming — the staged launch command carries the
+    ``instance-name "<prefix>-..."`` directive that performs it.
+    """
+    db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
+    env = _persona_env(tmp_path, db)
+    (Path(env["IMPERIUM"]) / "Imperium-ENV" / "Personas" / "Astartes.md").write_text(
+        "## System Prompt\nGeneric rank behavior\n", encoding="utf-8"
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    rec = tmp_path / "tmux_calls.txt"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        # Live agent in the pane; the DB row never binds (cold-start lag).
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        f'#!/usr/bin/env bash\nfor a in "$@"; do printf "%s\\0" "$a" >> {rec}; done\n'
+        # @INSTANCE_ID never stamped → row never binds; pane stays present.
+        'if [[ "$1" == "display-message" ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--persona",
+            "blood-angels",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dispatched claude to mechanicus:new" in result.stdout
+    assert "registration slow" in result.stderr
+    assert "launch failed" not in result.stderr
+
+    # Proof the naming step reaches the pane on the success path: the staged
+    # launch command carries the self-naming directive.
+    calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
+    staged_arg = next((c for c in calls if c.startswith("bash /")), None)
+    assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
+    staged = Path(staged_arg.split(" ", 1)[1]).read_text(encoding="utf-8", errors="replace")
+    assert 'instance-name "blood-angels-' in staged, staged
+
+
+def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Path) -> None:
+    """Resume/--no-worktree into a worktree with a LIVE agent must REFUSE.
+
+    The corruption FG hit: a false exit-70 was retried via ``--no-worktree --dir``
+    into the orphaned worktree and launched a SECOND live agent racing one git
+    worktree. The duplicate-refusal guard detects an already-live agent rooted in
+    the target dir by LIVENESS (``tmuxctl live-agents``, process tree + pane cwd —
+    so a row-less / undercounted duplicate is still caught) and refuses, sending
+    no launch.
+    """
+    work_dir = tmp_path / "wt-live"
+    work_dir.mkdir()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        # A live agent is already rooted in the target worktree.
+        'if [[ "$1" == "live-agents" ]]; then\n'
+        f'  printf "%s\\n" "mechanicus:3\\t%%91\\tcodex\\t{work_dir}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> {tmux_log}\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    # Re-enable the guard the conftest disables for hermeticity.
+    env["DISPATCH_WORKTREE_DUP_CHECK"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(work_dir),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+        timeout=60,
+    )
+
+    assert result.returncode == 73, result.stderr
+    assert "a live agent is already running in the target worktree" in result.stderr
+    assert "do NOT stack a second" in result.stderr
+    assert "dispatched" not in result.stdout
+    # No launch was staged: the guard refused before the send.
+    tmux_calls = tmux_log.read_text(encoding="utf-8")
+    assert "send-keys" not in tmux_calls
+
+
+def test_dispatch_dup_guard_force_occupied_override_allows_launch(tmp_path: Path) -> None:
+    """TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 overrides the duplicate-refusal guard."""
+    work_dir = tmp_path / "wt-live"
+    work_dir.mkdir()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "live-agents" ]]; then\n'
+        f'  printf "%s\\n" "mechanicus:3\\t%%91\\tcodex\\t{work_dir}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        '#!/usr/bin/env bash\nif [[ "$1" == "display-message" ]]; then printf "%%77\\n"; fi\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_WORKTREE_DUP_CHECK"] = "1"
+    env["TOKEN_API_DISPATCH_FORCE_OCCUPIED"] = "1"
+    # Liveness gate disabled so the test asserts only the guard override, fast.
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "0"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(work_dir),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "a live agent is already running" not in result.stderr
+    assert "dispatched claude to mechanicus:new" in result.stdout

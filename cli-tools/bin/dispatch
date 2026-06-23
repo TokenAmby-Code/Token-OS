@@ -104,6 +104,7 @@ USAGE
 }
 
 err() { echo "dispatch: $*" >&2; }
+warn() { echo "dispatch: warning: $*" >&2; }
 quote() { printf '%q' "$1"; }
 
 ENGINE="claude"
@@ -1285,6 +1286,10 @@ fi
 # `worktree-setup --require-free`, so a 2nd dispatch on a live branch is refused
 # (the agent passes --worktree <new> or --no-worktree).
 WORKTREE_DECISION="n/a (not a code checkout)"
+# True only when THIS invocation cut a fresh worktree via worktree-setup
+# --require-free (so the dir is provably exclusive). Every other launch enters a
+# pre-existing dir and must pass the duplicate-refusal guard before launching.
+WORKTREE_FRESHLY_CREATED=false
 
 dispatch_conf_var() {
   ( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; SYNC_SUBDIR=""
@@ -1330,6 +1335,7 @@ enter_worktree_for_project() {
       WORK_DIR="$(cd "$wt_path" && pwd)"
     fi
     WORKTREE_DECISION="created+entered $WORK_DIR (branch $branch)"
+    WORKTREE_FRESHLY_CREATED=true
   else
     err "worktree-setup refused/failed for branch '$branch' (already claimed?); refusing to dispatch into shared checkout $WORK_DIR"
     err "pass --worktree <new-branch> or --no-worktree"
@@ -1787,18 +1793,19 @@ stage_agent_command() {
 }
 
 dispatch_launch_observe_timeout() {
-  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-20}"
+  # Generous, configurable ceiling for how long to wait for the agent process to
+  # come up before declaring a GENUINE failure (pane created but no agent ever
+  # appeared). This is the real-event bound, not a row-bind clock: it only gates
+  # exit 70 when liveness never confirms. Raised from the old 20s — under fleet
+  # load (2-4 panes, MCP init, worktree first-shell hooks) cold start routinely
+  # exceeded 20s. Override with DISPATCH_LAUNCH_OBSERVE_TIMEOUT; 0 disables the
+  # observer entirely (the dispatcher trusts the send and returns immediately).
+  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-45}"
   if [[ "$value" =~ ^[0-9]+$ ]]; then
     printf '%s' "$value"
   else
-    printf '%s' "20"
+    printf '%s' "45"
   fi
-}
-
-pane_wrapper_launch_id() {
-  local pane="$1"
-  command -v tmux >/dev/null 2>&1 || return 0
-  tmux display-message -p -t "$pane" '#{@TOKEN_API_WRAPPER_LAUNCH_ID}' 2>/dev/null || true
 }
 
 pane_instance_id() {
@@ -1815,76 +1822,119 @@ clear_pane_wrapper_launch_id() {
 }
 
 
-wait_for_dispatch_wrapper_start() {
-  local pane="$1" target_display="$2" expected_wrapper_id="${3:-$WRAPPER_ID}" timeout deadline observed
-  timeout="$(dispatch_launch_observe_timeout)"
-  [[ "$timeout" -gt 0 ]] || return 0
-  deadline=$((SECONDS + timeout))
-  while (( SECONDS <= deadline )); do
-    observed="$(pane_wrapper_launch_id "$pane")"
-    if [[ -n "$expected_wrapper_id" && "$observed" == "$expected_wrapper_id" ]]; then
-      return 0
-    fi
-    if [[ -z "$expected_wrapper_id" && -n "$observed" ]]; then
-      return 0
-    fi
-    sleep 0.2
-  done
-  err "launch failed: wrapper did not start within ${timeout}s for ${ENGINE} launch to ${target_display}; the staged command may not have reached the pane"
-  return 1
+dispatch_pane_exists() {
+  # True while the pane is still present. A pane that VANISHES after the send is
+  # the one unambiguous negative event (the launch died) — distinct from a pane
+  # that is up but whose agent has not finished cold-starting yet.
+  local pane="$1"
+  [[ -n "$pane" ]] || return 1
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1
 }
 
-wait_for_dispatch_instance_register() {
-  local pane="$1" target_display="$2" timeout deadline observed
-  timeout="$(dispatch_launch_observe_timeout)"
-  [[ "$timeout" -gt 0 ]] || return 0
-  deadline=$((SECONDS + timeout))
-  while (( SECONDS <= deadline )); do
-    observed="$(pane_instance_id "$pane")"
-    if [[ -n "$observed" ]]; then
-      return 0
-    fi
-    sleep 0.2
-  done
-  err "launch failed: instance did not register within ${timeout}s for ${ENGINE} launch to ${target_display}; wrapper started but SessionStart did not stamp the pane"
-  return 1
+dispatch_pane_agent_live() {
+  # THE success criterion: is a live Claude/Codex agent process running in the
+  # pane right now? Engine-agnostic and faction-agnostic — read from the process
+  # tree, NOT a DB stamp (which lags, and for codex may never land). Routed
+  # through `tmuxctl pane-live` so it reuses the same battle-tested walk that
+  # gates close-lifecycle reaps, and so it is cleanly mockable in tests. Falls
+  # back to an in-process ps walk only when tmuxctl is unavailable.
+  local pane="$1"
+  [[ -n "$pane" ]] || return 1
+  if command -v tmuxctl >/dev/null 2>&1; then
+    # tmuxctl's exit code IS the verdict (0 live / non-0 not-live). Trust it
+    # outright: do NOT fall back to ps on a not-live answer, or a coincidental
+    # match would mask a genuinely dead pane.
+    tmuxctl pane-live "$pane" >/dev/null 2>&1
+    return $?
+  fi
+  local pane_pid
+  pane_pid="$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)"
+  pane_has_active_agent_process "$pane_pid"
 }
 
-wait_for_dispatch_registry_bind() {
-  local pane="$1" target_display="$2" timeout deadline instance_id row status row_workdir row_pane row_label expected_label
-  timeout="$(dispatch_launch_observe_timeout)"
-  [[ "$timeout" -gt 0 ]] || return 0
+reconcile_dispatch_registry_bind() {
+  # RECONCILIATION, not a pass/fail gate. Liveness has already proven the launch
+  # succeeded; the instances row is allowed to lag (cold start) or, for the codex
+  # singleton-undercount path, never bind at all. A single best-effort check: if
+  # the row is already live, stay silent; otherwise emit an ADVISORY "registration
+  # slow" warning and return success regardless. Never fails the launch.
+  local pane="$1" target_display="$2" instance_id row status row_workdir row_label expected_label
   command -v sqlite3 >/dev/null 2>&1 || return 0
   [[ -f "$DB_PATH" ]] || return 0
-  expected_label="$(resolve_pane_label_for_env "$pane")"
-  deadline=$((SECONDS + timeout))
-  while (( SECONDS <= deadline )); do
-    instance_id="$(pane_instance_id "$pane")"
-    if [[ -z "$instance_id" ]]; then
-      sleep 0.2
-      continue
-    fi
+  instance_id="$(pane_instance_id "$pane")"
+  if [[ -n "$instance_id" ]]; then
     row="$(sqlite3 -separator $'\t' "$DB_PATH" \
-      "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(tmux_pane,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
+      "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
       2>/dev/null || true)"
     if [[ -n "$row" ]]; then
-      IFS=$'\t' read -r status row_workdir row_pane row_label <<< "$row"
-      if [[ "$status" != "stopped" && "$status" != "archived" ]]; then
-        if [[ -z "$RESUME_ID" && "$row_workdir" != "$WORK_DIR" ]]; then
-          sleep 0.2
-          continue
-        fi
-        if [[ -n "$expected_label" && -z "$row_label" ]]; then
-          sleep 0.2
-          continue
-        fi
+      IFS=$'\t' read -r status row_workdir row_label <<< "$row"
+      expected_label="$(resolve_pane_label_for_env "$pane")"
+      if [[ "$status" != "stopped" && "$status" != "archived" ]] \
+        && { [[ -n "$RESUME_ID" ]] || [[ "$row_workdir" == "$WORK_DIR" ]]; } \
+        && { [[ -z "$expected_label" ]] || [[ -n "$row_label" ]]; }; then
         return 0
       fi
     fi
-    sleep 0.2
+  fi
+  warn "registration slow: ${ENGINE} launch to ${target_display} is LIVE but its instances row has not bound yet (cold-start / codex-undercount reconciliation lag); the launch SUCCEEDED — reconciliation will catch up"
+  return 0
+}
+
+confirm_dispatch_launch_live() {
+  # Liveness-driven launch confirmation. Success = the pane is up AND a live agent
+  # process is running in it. The DB-row bind is decoupled into an advisory
+  # reconciliation (see reconcile_dispatch_registry_bind). Exit 70 fires ONLY when
+  # the agent genuinely never came up — a row lag with a live pane is exit 0.
+  local pane="$1" target_display="$2" timeout deadline
+  timeout="$(dispatch_launch_observe_timeout)"
+  # Observer disabled (0): trust the send and return immediately. Used by the
+  # bulk of the hermetic CLI tests and available as a production opt-out.
+  [[ "$timeout" -gt 0 ]] || return 0
+  deadline=$((SECONDS + timeout))
+  while (( SECONDS <= deadline )); do
+    if dispatch_pane_agent_live "$pane"; then
+      reconcile_dispatch_registry_bind "$pane" "$target_display"
+      return 0
+    fi
+    if ! dispatch_pane_exists "$pane"; then
+      err "launch failed: the pane for ${ENGINE} launch to ${target_display} vanished before an agent came up; the staged command died on start"
+      return 1
+    fi
+    sleep 0.3
   done
-  err "launch failed: instance row did not bind live within ${timeout}s for ${ENGINE} launch to ${target_display}; registry row is missing, stopped, wrong-dir, or missing pane_label"
+  err "launch failed: no live ${ENGINE} agent appeared in the pane within ${timeout}s for ${target_display}; the pane is up but the staged command never started the agent (raise DISPATCH_LAUNCH_OBSERVE_TIMEOUT if cold start is slow)"
   return 1
+}
+
+refuse_if_worktree_has_live_agent() {
+  # FAIL SAFE against the two-agents-one-worktree corruption (the duplicate FG hit
+  # after a false exit-70 retry). Before launching into an EXISTING worktree
+  # (resume / --no-worktree / --worktree resume), refuse if a live Claude/Codex
+  # agent is ALREADY rooted there. Detection is by LIVENESS (process tree + pane
+  # cwd via `tmuxctl live-agents`), never the DB stamp — the duplicate may itself
+  # be a row-less / undercounted live agent, which is exactly the case that bit FG.
+  local dir="$1" self_pane="${2:-}" matches
+  [[ -n "$dir" ]] || return 0
+  # Hermetic opt-out: tests set DISPATCH_WORKTREE_DUP_CHECK=0 so the suite never
+  # enumerates the operator's LIVE tmux server. Default (unset) = enabled.
+  [[ "${DISPATCH_WORKTREE_DUP_CHECK:-1}" == "0" ]] && return 0
+  [[ "${TOKEN_API_DISPATCH_FORCE_OCCUPIED:-}" == "1" ]] && return 0
+  if ! command -v tmuxctl >/dev/null 2>&1; then
+    # Fail open, but VISIBLY: without tmuxctl we cannot verify the worktree is
+    # free, so the duplicate-corruption protection is off — say so rather than
+    # silently allowing a possible second agent into one worktree.
+    warn "dup-guard skipped: tmuxctl unavailable, cannot verify $dir is free of a live agent"
+    return 0
+  fi
+  matches="$(tmuxctl live-agents --dir "$dir" ${self_pane:+--exclude-pane "$self_pane"} 2>/dev/null || true)"
+  [[ -n "$matches" ]] || return 0
+  err "refusing to dispatch: a live agent is already running in the target worktree $dir:"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && err "  $line"
+  done <<< "$matches"
+  err "resume that agent (do NOT stack a second into one worktree), or launch a fresh --worktree; set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 to override"
+  exit 73
 }
 
 build_dispatch_command() {
@@ -1952,6 +2002,15 @@ EOF_DRY
   exit 0
 fi
 
+# Duplicate-refusal guard: a launch into a pre-existing worktree (resume,
+# --no-worktree, or --worktree resume) must never STACK a second agent onto a
+# worktree that already hosts a live one. A freshly-cut worktree is provably
+# exclusive, so skip it there. The dispatcher's own pane is excluded so an agent
+# launching a worker into its own dir (to a NEW pane) is not refused by itself.
+if [[ "$WORKTREE_FRESHLY_CREATED" != true ]]; then
+  refuse_if_worktree_has_live_agent "$WORK_DIR" "${TMUX_PANE:-}"
+fi
+
 if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   if ! command -v tmuxctl >/dev/null 2>&1; then
     err "tmuxctl is required for target $TARGET"
@@ -1998,17 +2057,13 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   tmux send-keys -t "$phys_pane" "$STAGED_COMMAND" Enter
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
-  expected_wrapper_id="$WRAPPER_ID"
-  [[ "$ENGINE" == "codex" ]] && expected_wrapper_id=""
-  if ! wait_for_dispatch_wrapper_start "$phys_pane" "$stack_display" "$expected_wrapper_id"; then
+  # Success = pane up + live agent process (liveness), NOT a DB-row bind clock.
+  # The row reconciles as an advisory detail inside confirm_dispatch_launch_live.
+  if ! confirm_dispatch_launch_live "$phys_pane" "$stack_display"; then
     exit 70
   fi
-  if ! wait_for_dispatch_instance_register "$phys_pane" "$stack_display"; then
-    exit 70
-  fi
-  if ! wait_for_dispatch_registry_bind "$phys_pane" "$stack_display"; then
-    exit 70
-  fi
+  # Liveness confirmed: reach exit 0 so the launched agent is NOT reaped/retried
+  # and proceeds through its SessionStart naming step.
   printf '%s\n' "dispatched $ENGINE to $stack_display" | redact_tmux_panes_for_display
   exit 0
 fi
@@ -2037,15 +2092,8 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
     fi
     [[ "$target_display" == %* ]] && target_display="tmux target"
   fi
-  expected_wrapper_id="$WRAPPER_ID"
-  [[ "$ENGINE" == "codex" ]] && expected_wrapper_id=""
-  if ! wait_for_dispatch_wrapper_start "$PHYSICAL_TARGET" "$target_display" "$expected_wrapper_id"; then
-    exit 70
-  fi
-  if ! wait_for_dispatch_instance_register "$PHYSICAL_TARGET" "$target_display"; then
-    exit 70
-  fi
-  if ! wait_for_dispatch_registry_bind "$PHYSICAL_TARGET" "$target_display"; then
+  # Success = pane up + live agent process (liveness), NOT a DB-row bind clock.
+  if ! confirm_dispatch_launch_live "$PHYSICAL_TARGET" "$target_display"; then
     exit 70
   fi
   echo "dispatched $ENGINE to $target_display"

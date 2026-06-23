@@ -376,6 +376,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pane_select_parser.add_argument("--client", default="")
 
+    pane_live_parser = subparsers.add_parser(
+        "pane-live",
+        help="Exit 0 iff a live Claude/Codex agent process is running in the pane "
+        "(the dispatch launch success criterion; read from the process tree).",
+    )
+    pane_live_parser.add_argument("pane")
+    pane_live_parser.add_argument("--format", choices=["text", "json"], default="text")
+
+    live_agents_parser = subparsers.add_parser(
+        "live-agents",
+        help="List panes running a live agent rooted in a working dir "
+        "(the dispatch duplicate-refusal guard).",
+    )
+    live_agents_parser.add_argument("--dir", required=True)
+    live_agents_parser.add_argument(
+        "--exclude-pane",
+        default="",
+        help="Drop this pane from the result (the dispatcher's own pane).",
+    )
+    live_agents_parser.add_argument("--format", choices=["text", "json"], default="text")
+
     return parser
 
 
@@ -947,6 +968,66 @@ def main(argv: list[str] | None = None) -> int:
                     client=args.client,
                 )
             )
+            return 0
+
+        if args.command == "pane-live":
+            from .liveness import detect_pane_tui
+
+            pane = args.pane
+            if pane == "current":
+                pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
+            tui = detect_pane_tui(control.adapter, pane)
+            if args.format == "json":
+                import json as _json
+
+                print(
+                    _json.dumps(
+                        {
+                            "pane_id": tui.pane_id,
+                            "pane_pid": tui.pane_pid,
+                            "agent_pid": tui.agent_pid,
+                            "agent_command": tui.agent_command,
+                            "live": tui.live,
+                        }
+                    )
+                )
+            elif tui.live:
+                print(f"{tui.agent_pid}\t{tui.agent_command}")
+            # Exit code IS the contract: 0 = live agent present, 1 = not live.
+            return 0 if tui.live else 1
+
+        if args.command == "live-agents":
+            from .dispatch_liveness import live_agents_in_dir
+
+            matches = live_agents_in_dir(
+                control.adapter,
+                args.dir,
+                exclude_pane=args.exclude_pane or None,
+            )
+            if args.format == "json":
+                import json as _json
+
+                print(
+                    _json.dumps(
+                        [
+                            {
+                                "pane_id": m.pane_id,
+                                "pane_pid": m.pane_pid,
+                                "agent_pid": m.agent_pid,
+                                "agent_command": m.agent_command,
+                                "cwd": m.cwd,
+                            }
+                            for m in matches
+                        ]
+                    )
+                )
+            else:
+                for m in matches:
+                    print(
+                        f"{control.public_pane_id(m.pane_id)}\t{m.pane_id}\t"
+                        f"{m.agent_command or '?'}\t{m.cwd}"
+                    )
+            # Enumeration always succeeds; the caller decides refusal from the lines.
             return 0
 
         parser.error(f"unhandled command: {args.command}")
