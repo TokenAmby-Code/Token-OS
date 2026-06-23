@@ -47,6 +47,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7778
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
+# The daemon is unauthenticated and does powerful tmux ops — it binds loopback
+# ONLY. serve() refuses any other --host (fail-closed).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 # Server-side log. Full exception detail is logged HERE (launchd captures stderr)
 # and never leaked into the HTTP JSON response (clients get a generic message).
 log = logging.getLogger("tmuxctld")
@@ -105,8 +109,8 @@ def read_sha() -> str:
 
 def heartbeat_path(home: str | None = None) -> Path:
     """Path of the liveness heartbeat file (``~/.claude/tmuxctld-heartbeat.json``)."""
-    base = home or os.path.expanduser("~")
-    return Path(base) / ".claude" / "tmuxctld-heartbeat.json"
+    base = Path(home) if home else Path.home()
+    return base / ".claude" / "tmuxctld-heartbeat.json"
 
 
 def heartbeat_payload(port: int, *, reachable: bool) -> dict:
@@ -315,6 +319,13 @@ def _h_send_keys(control, params):
         control.adapter.run("send-keys", "-t", pane, "-l", command)
     else:
         control.adapter.send_keys(pane, command)
+    # adapter.run() suppresses a gated send SILENTLY (sets last_send_gate_result,
+    # returns ""), so — like send_text_then_submit — surface the structured gate
+    # instead of falsely reporting sent:True. Dispatch turns this into the
+    # {ok:false, error:{code:"gated"}} envelope (zero bytes written, re-queueable).
+    gate = getattr(control.adapter, "last_send_gate_result", None)
+    if gate:
+        raise TmuxSendGated(gate)
     return {"pane": pane, "sent": True}
 
 
@@ -660,7 +671,7 @@ class TmuxctldServer(ThreadingHTTPServer):
 
     def __init__(
         self,
-        server_address,
+        server_address: tuple[str, int],
         *,
         adapter_factory: Callable[[], TmuxAdapter] | None = None,
         version: str = "",
@@ -711,7 +722,14 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
         params: dict = {k: v[0] for k, v in parse_qs(parsed.query).items()}
 
         if method == "POST":
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._write(400, self._error("bad_request", "invalid Content-Length"))
+                return
+            if length < 0:
+                self._write(400, self._error("bad_request", "invalid Content-Length"))
+                return
             raw = self.rfile.read(length) if length else b""
             if raw:
                 try:
@@ -804,7 +822,19 @@ def serve(host: str, port: int) -> int:
     Starts the background heartbeat thread, installs a SIGTERM handler that
     raises ``SystemExit`` for a clean ``server_close()``, and blocks in
     ``serve_forever()`` (which sets the server ready event once listening).
+
+    The daemon performs powerful, UNAUTHENTICATED tmux operations, so it must
+    only ever bind loopback. A non-loopback ``--host`` is refused (fail-closed)
+    rather than silently exposing the control plane on a routable interface.
     """
+    if host not in _LOOPBACK_HOSTS:
+        print(
+            f"tmuxctld refuses to bind non-loopback host {host!r} "
+            f"(allowed: {', '.join(sorted(_LOOPBACK_HOSTS))})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
     server = TmuxctldServer(
         (host, port),
         version=read_version(),

@@ -29,10 +29,10 @@ if str(CLI_LIB) not in sys.path:
 class FoundInstanceAdapter:
     """tmux reachable; one live pane carries @INSTANCE_ID=live-uuid @PANE_ID=palace:1."""
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         return []
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[:2] == ("list-panes", "-a"):
             return "%24\tlive-uuid\tpalace:1"
         return ""
@@ -41,19 +41,19 @@ class FoundInstanceAdapter:
 class StampedPaneAdapter:
     """Pane palace:1 carries @INSTANCE_ID=stamped-uuid (reverse lookup)."""
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         return []
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[0] == "show-options" and args[-1] == "@INSTANCE_ID":
             return "stamped-uuid"
         return ""
 
-    def show_pane_option(self, pane_id, option):
+    def show_pane_option(self, pane_id: str, option: str) -> str:
         return self.run("show-options", "-pv", "-t", pane_id, option, allow_failure=True).strip()
 
 
-def _serve_daemon(adapter_factory):
+def _serve_daemon(adapter_factory: type):
     from tmuxctl import daemon
 
     server = daemon.TmuxctldServer(
@@ -83,7 +83,7 @@ def _warm(server, path: str) -> None:
         resp.read()
 
 
-def test_resolve_instance_pane_prefers_tmuxctld_live(app_env, monkeypatch):
+def test_resolve_instance_pane_prefers_tmuxctld_live(app_env, monkeypatch) -> None:
     shared = sys.modules["shared"]
     server = _serve_daemon(FoundInstanceAdapter)
     try:
@@ -100,7 +100,7 @@ def test_resolve_instance_pane_prefers_tmuxctld_live(app_env, monkeypatch):
         server.shutdown()
 
 
-def test_resolve_instance_pane_falls_back_when_daemon_down(app_env, monkeypatch):
+def test_resolve_instance_pane_falls_back_when_daemon_down(app_env, monkeypatch) -> None:
     shared = sys.modules["shared"]
     # Nothing is listening on port 1 -> client returns None -> subprocess fallback.
     monkeypatch.setenv("TMUXCTLD_URL", "http://127.0.0.1:1")
@@ -117,7 +117,7 @@ def test_resolve_instance_pane_falls_back_when_daemon_down(app_env, monkeypatch)
     assert asyncio.run(shared.resolve_instance_pane("u")) == ("%25", "mars:E")
 
 
-def test_instance_id_for_pane_prefers_tmuxctld_live(app_env, monkeypatch):
+def test_instance_id_for_pane_prefers_tmuxctld_live(app_env, monkeypatch) -> None:
     shared = sys.modules["shared"]
     server = _serve_daemon(StampedPaneAdapter)
     try:
@@ -132,7 +132,20 @@ def test_instance_id_for_pane_prefers_tmuxctld_live(app_env, monkeypatch):
         server.shutdown()
 
 
-def test_loopback_client_bypasses_env_proxy(app_env, monkeypatch):
+def test_tmuxctld_url_rejects_non_loopback(app_env, monkeypatch) -> None:
+    shared = sys.modules["shared"]
+    # Off-box host -> rejected (no SSRF / exfiltration via a stray TMUXCTLD_URL).
+    monkeypatch.setenv("TMUXCTLD_URL", "http://10.0.0.5:7778")
+    assert shared._tmuxctld_url() is None
+    # Non-http scheme -> rejected.
+    monkeypatch.setenv("TMUXCTLD_URL", "https://127.0.0.1:7778")
+    assert shared._tmuxctld_url() is None
+    # Loopback http -> honoured.
+    monkeypatch.setenv("TMUXCTLD_URL", "http://127.0.0.1:7778")
+    assert shared._tmuxctld_url() == "http://127.0.0.1:7778"
+
+
+def test_loopback_client_bypasses_env_proxy(app_env, monkeypatch) -> None:
     shared = sys.modules["shared"]
     server = _serve_daemon(FoundInstanceAdapter)
     try:

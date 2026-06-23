@@ -27,7 +27,12 @@ from .inspect import (
     render_workspace,
 )
 from .labels import canonical_pane_role
-from .models import CoherenceIssue, GroupedSessionSnapshot, InstanceRegistrySnapshot
+from .models import (
+    CoherenceIssue,
+    GroupedSessionSnapshot,
+    InstanceRegistrySnapshot,
+    RestartPlan,
+)
 from .normalize import normalize_window
 from .planner import build_restart_plan
 from .resolver import (
@@ -94,7 +99,8 @@ class TmuxControlPlane:
         """Render the workspace coherence/health report for a session."""
         return render_doctor(build_workspace_snapshot(self.adapter, session_name))
 
-    def build_restart_plan(self, session_name: str):
+    def build_restart_plan(self, session_name: str) -> RestartPlan:
+        """Build the restart plan for a session (registry-degraded if unavailable)."""
         """Build the restart plan from the live snapshot, registry, and clients.
 
         Falls back to a tmux-only plan with a warning issue if the registry is
@@ -677,6 +683,18 @@ class TmuxControlPlane:
             from .focus_guard import allow_temporarily
 
             allow_temporarily(self.adapter, reason="instance-focus", actor="tmuxctld")
+        # Honour an explicit client: point THAT client at the pane's window first
+        # (the switch-client -c idiom used by audience/tombstone), so a multi-client
+        # attach focuses the right viewer rather than only the latest-active one.
+        if client:
+            window = self.adapter.run(
+                "display-message",
+                "-t",
+                resolved["pane_id"],
+                "-p",
+                "#{session_name}:#{window_index}",
+            ).strip()
+            self.adapter.run("switch-client", "-c", client, "-t", window, allow_failure=True)
         self.adapter.run("select-pane", "-t", resolved["pane_id"])
         return {"instance_id": instance_id, "found": True, "focused": resolved["pane_role"]}
 

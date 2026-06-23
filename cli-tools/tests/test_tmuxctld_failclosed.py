@@ -43,6 +43,28 @@ class GatedAdapter:
         raise TmuxSendGated(self.GATE)
 
 
+class SendKeysGatedAdapter:
+    """run() suppresses a send the way the real gate does — sets
+    last_send_gate_result and returns '' WITHOUT raising (the caller must notice)."""
+
+    GATE = {"suppressed": True, "reason": "keystroke-lock"}
+
+    def __init__(self):
+        self.last_send_gate_result = None
+
+    def list_sessions(self):
+        return []
+
+    def run(self, *args, allow_failure=False):
+        if args[:1] == ("send-keys",):
+            self.last_send_gate_result = self.GATE
+            return ""
+        return ""
+
+    def send_keys(self, target, *keys, allow_failure=False):
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+
 def _serve(adapter_factory):
     server = daemon.TmuxctldServer(
         ("127.0.0.1", 0), adapter_factory=adapter_factory, version="t", sha="t"
@@ -112,5 +134,20 @@ def test_send_gated_envelope():
         assert payload["error"]["code"] == "gated"
         # The structured gate result rides in detail so callers can re-queue.
         assert payload["error"]["detail"] == GatedAdapter.GATE
+    finally:
+        server.shutdown()
+
+
+def test_send_keys_gated_envelope():
+    # send-keys goes through adapter.run(), which SUPPRESSES SILENTLY (no raise);
+    # the handler must notice last_send_gate_result and surface the gated envelope
+    # instead of falsely reporting sent:True.
+    server = _serve(SendKeysGatedAdapter)
+    try:
+        status, payload = _post(server, "/tmux/send-keys", {"pane": "%1", "command": "hi"})
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "gated"
+        assert payload["error"]["detail"] == SendKeysGatedAdapter.GATE
     finally:
         server.shutdown()

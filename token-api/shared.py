@@ -689,11 +689,26 @@ _TMUXCTLD_OPENER: urllib.request.OpenerDirector = urllib.request.build_opener(
     urllib.request.ProxyHandler({})
 )
 
+# The daemon is loopback-only and unauthenticated; the client refuses to speak to
+# anything but a loopback host, so a stray/hostile TMUXCTLD_URL cannot turn this
+# into an SSRF or exfiltration vector.
+_TMUXCTLD_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 def _tmuxctld_url() -> str | None:
-    """Return the configured tmuxctld base URL (str, trailing slash trimmed) or None."""
+    """Return the configured tmuxctld base URL, or None.
+
+    Trailing slash trimmed; only ``http`` loopback URLs are honoured — a
+    non-loopback (or non-http) host is rejected (returns None) so the client
+    never reaches off-box.
+    """
     url = str(os.environ.get("TMUXCTLD_URL") or "").strip().rstrip("/")
-    return url or None
+    if not url:
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "http" or (parsed.hostname or "") not in _TMUXCTLD_LOOPBACK_HOSTS:
+        return None
+    return url
 
 
 def _tmuxctld_get_json(path: str, params: dict[str, str], *, timeout: float = 0.5) -> dict | None:

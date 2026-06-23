@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import socket
 import sys
 import threading
 import urllib.error
@@ -171,6 +172,42 @@ def test_instance_id_for_pane_fail_closed_when_unstamped():
         server.shutdown()
 
 
+class RecordingFocusAdapter:
+    """Resolves focus-uuid -> palace:1 and records every run() call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def list_sessions(self):
+        return []
+
+    def run(self, *args, allow_failure=False):
+        self.calls.append(args)
+        if args[:2] == ("list-panes", "-a"):
+            return "%24\tfocus-uuid\tpalace:1"
+        if args and args[0] == "display-message" and "#{session_name}:#{window_index}" in args:
+            return "main:3"
+        return ""
+
+    def show_pane_option(self, pane_id, option):
+        return self.run("show-options", "-pv", "-t", pane_id, option, allow_failure=True).strip()
+
+
+def test_instance_focus_honors_explicit_client():
+    rec = RecordingFocusAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        status, payload = _post(
+            server, "/instance/focus", {"instance_id": "focus-uuid", "client": "viewer-1"}
+        )
+        assert status == 200
+        assert payload["result"]["found"] is True
+        # The explicit client is pointed at the pane's window before select-pane.
+        assert ("switch-client", "-c", "viewer-1", "-t", "main:3") in rec.calls
+    finally:
+        server.shutdown()
+
+
 def test_translate_ids_unresolved_passthrough():
     server, _ = _serve(StubAdapter)
     try:
@@ -213,6 +250,43 @@ def test_bad_json_body_is_400():
             assert exc.code == 400
             body = json.loads(exc.read().decode("utf-8"))
             assert body["error"]["code"] == "bad_request"
+    finally:
+        server.shutdown()
+
+
+def test_serve_refuses_non_loopback_bind():
+    # The daemon is unauthenticated and does powerful tmux ops — serve() must
+    # fail closed (no bind) on any non-loopback host.
+    assert daemon.serve("0.0.0.0", 0) == 2
+    assert daemon.serve("10.0.0.5", 0) == 2
+
+
+def test_malformed_content_length_is_bad_request():
+    # A non-integer Content-Length must normalize to a 400 bad_request envelope,
+    # never an unhandled 500. Crafted over a raw socket (urllib would rewrite the
+    # header), with Connection: close so the server replies once and hangs up.
+    server, _ = _serve(StubAdapter)
+    try:
+        host, port = server.server_address
+        with socket.create_connection((host, port), timeout=5) as sock:
+            sock.sendall(
+                b"POST /send-text HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: not-a-number\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            )
+            chunks = []
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        raw = b"".join(chunks).decode("utf-8", "ignore")
+        status_line, _, body = raw.partition("\r\n\r\n")
+        assert "400" in status_line.splitlines()[0]
+        assert json.loads(body)["error"]["code"] == "bad_request"
     finally:
         server.shutdown()
 

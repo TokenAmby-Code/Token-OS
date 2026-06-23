@@ -16,7 +16,9 @@
 set -euo pipefail
 
 LABEL="ai.tokenclaw.tmuxctld"
-DAEMON_URL="http://127.0.0.1:7778"
+# Loopback endpoint; overridable via TMUXCTLD_URL (same env the token-api client
+# reads) so the URL is not duplicated/drifting against the plist's bind port.
+DAEMON_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
 PLIST_NAME="${LABEL}.plist"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SRC_PLIST="${SCRIPT_DIR}/../launchd/${PLIST_NAME}"
