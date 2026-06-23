@@ -12,7 +12,6 @@ Coverage maps to the carried-forward CodeRabbit findings:
 """
 
 import asyncio
-import contextlib
 import pathlib
 import subprocess
 import sys
@@ -71,26 +70,34 @@ def _url_for(server) -> str:
 
 
 def _warm(server, path: str) -> None:
-    """Pre-touch an endpoint so its first-call lazy imports are warm.
+    """Drive the cold first request to completion before the timed assertion.
 
-    The real daemon is a long-running process with warm imports; in-process the
-    first hit on a route that lazy-imports (e.g. resolve-instance pulls in
-    skill_invoke) can exceed the client's tight 0.5s loopback timeout. Warming
-    keeps the assertion measuring behaviour, not cold-import latency.
+    The real daemon is a long-running, warm process; in-process the FIRST request
+    pays a one-time per-process cost (lazy import + bytecode compile in the handler
+    thread — seconds on a cold CI runner with no cached .pyc) that exceeds the
+    client's tight 0.5s loopback timeout. We pay that cost here with a generous
+    timeout and ASSERT success, so a genuine failure surfaces loudly instead of
+    silently degrading the timed assertion to the subprocess fallback.
     """
     url = f"{_url_for(server)}{path}"
-    with contextlib.suppress(Exception), urllib.request.urlopen(url, timeout=5) as resp:
-        resp.read()
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        body = resp.read()
+    assert resp.status == 200 and b'"ok": true' in body, f"warm-up failed: {body!r}"
 
 
 def test_resolve_instance_pane_prefers_tmuxctld_live(app_env, monkeypatch) -> None:
     shared = sys.modules["shared"]
     server = _serve_daemon(FoundInstanceAdapter)
     try:
+        # The daemon's resolve-instance resolves the agent via a registry fetch to
+        # TOKEN_API_URL (default localhost:7777). Point it at a dead port so that
+        # fetch fails INSTANTLY (ECONNREFUSED) rather than stalling on its 5s
+        # timeout — otherwise the daemon reply outruns the client's 0.5s budget.
+        monkeypatch.setenv("TOKEN_API_URL", "http://127.0.0.1:1")
         _warm(server, "/tmux/resolve-instance?instance_id=live-uuid")
         monkeypatch.setenv("TMUXCTLD_URL", _url_for(server))
 
-        async def boom(*args, **kwargs):
+        async def boom(*args, **kwargs) -> None:
             raise AssertionError("subprocess fallback must not run when the daemon answers")
 
         monkeypatch.setattr(shared, "_run_subprocess_offloop", boom)
@@ -105,7 +112,7 @@ def test_resolve_instance_pane_falls_back_when_daemon_down(app_env, monkeypatch)
     # Nothing is listening on port 1 -> client returns None -> subprocess fallback.
     monkeypatch.setenv("TMUXCTLD_URL", "http://127.0.0.1:1")
 
-    async def fake_offloop(args, **kwargs):
+    async def fake_offloop(args: list, **kwargs):
         return subprocess.CompletedProcess(
             args=list(args),
             returncode=0,
@@ -123,7 +130,7 @@ def test_instance_id_for_pane_prefers_tmuxctld_live(app_env, monkeypatch) -> Non
     try:
         monkeypatch.setenv("TMUXCTLD_URL", _url_for(server))
 
-        async def boom(*args, **kwargs):
+        async def boom(*args, **kwargs) -> None:
             raise AssertionError("subprocess fallback must not run when the daemon answers")
 
         monkeypatch.setattr(shared, "_run_subprocess_offloop", boom)
@@ -149,8 +156,10 @@ def test_loopback_client_bypasses_env_proxy(app_env, monkeypatch) -> None:
     shared = sys.modules["shared"]
     server = _serve_daemon(FoundInstanceAdapter)
     try:
-        # Warm lazy imports BEFORE installing the bogus proxy (warm-up uses a bare
-        # opener that would otherwise honour it).
+        # Fast-fail the daemon's registry fetch (see sibling test) so the reply
+        # beats the client's 0.5s budget; warm BEFORE installing the bogus proxy
+        # (warm-up uses a bare opener that would otherwise honour it).
+        monkeypatch.setenv("TOKEN_API_URL", "http://127.0.0.1:1")
         _warm(server, "/tmux/resolve-instance?instance_id=live-uuid")
         # A bogus proxy on a dead port would break the call IF the loopback request
         # were routed through it. The empty ProxyHandler opener must bypass it.
@@ -158,7 +167,7 @@ def test_loopback_client_bypasses_env_proxy(app_env, monkeypatch) -> None:
             monkeypatch.setenv(var, "http://127.0.0.1:9")
         monkeypatch.setenv("TMUXCTLD_URL", _url_for(server))
 
-        async def boom(*args, **kwargs):
+        async def boom(*args, **kwargs) -> None:
             raise AssertionError("subprocess fallback must not run when the daemon answers")
 
         monkeypatch.setattr(shared, "_run_subprocess_offloop", boom)

@@ -21,10 +21,10 @@ from tmuxctl.tmux_adapter import TmuxError, TmuxSendGated
 class DeadTmuxAdapter:
     """tmux is unreachable: list/probe raise; any other call raises TmuxError."""
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         raise TmuxError("no server running")
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         raise TmuxError("no server running")
 
 
@@ -33,13 +33,15 @@ class GatedAdapter:
 
     GATE = {"suppressed": True, "reason": "quiet-hours"}
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         return []
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         return ""
 
-    def send_text_then_submit(self, target, text, *, clear_prompt=False, **_kw):
+    def send_text_then_submit(
+        self, target: str, text: str, *, clear_prompt: bool = False, **_kw
+    ) -> None:
         raise TmuxSendGated(self.GATE)
 
 
@@ -49,19 +51,19 @@ class SendKeysGatedAdapter:
 
     GATE = {"suppressed": True, "reason": "keystroke-lock"}
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.last_send_gate_result = None
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         return []
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[:1] == ("send-keys",):
             self.last_send_gate_result = self.GATE
             return ""
         return ""
 
-    def send_keys(self, target, *keys, allow_failure=False):
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
         self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
 
 
@@ -75,13 +77,13 @@ def _serve(adapter_factory):
     return server
 
 
-def _get(server, path):
+def _get(server, path: str):
     url = f"http://127.0.0.1:{server.server_address[1]}{path}"
     with urllib.request.urlopen(url, timeout=5) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
-def _post(server, path, body):
+def _post(server, path: str, body):
     url = f"http://127.0.0.1:{server.server_address[1]}{path}"
     req = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}
@@ -90,7 +92,7 @@ def _post(server, path, body):
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
-def test_health_degraded_when_tmux_dead():
+def test_health_degraded_when_tmux_dead() -> None:
     server = _serve(DeadTmuxAdapter)
     try:
         status, payload = _get(server, "/health")
@@ -101,7 +103,7 @@ def test_health_degraded_when_tmux_dead():
         server.shutdown()
 
 
-def test_data_endpoint_never_500_when_tmux_dead():
+def test_data_endpoint_never_500_when_tmux_dead() -> None:
     server = _serve(DeadTmuxAdapter)
     try:
         # freelist hits tmux; with tmux dead it must surface a 200 error envelope,
@@ -114,7 +116,7 @@ def test_data_endpoint_never_500_when_tmux_dead():
         server.shutdown()
 
 
-def test_resolve_instance_fail_closed_when_tmux_dead():
+def test_resolve_instance_fail_closed_when_tmux_dead() -> None:
     server = _serve(DeadTmuxAdapter)
     try:
         status, payload = _get(server, "/tmux/resolve-instance?instance_id=x")
@@ -125,7 +127,7 @@ def test_resolve_instance_fail_closed_when_tmux_dead():
         server.shutdown()
 
 
-def test_send_gated_envelope():
+def test_send_gated_envelope() -> None:
     server = _serve(GatedAdapter)
     try:
         status, payload = _post(server, "/send-text", {"pane": "%1", "text": "hi", "submit": True})
@@ -138,7 +140,7 @@ def test_send_gated_envelope():
         server.shutdown()
 
 
-def test_send_keys_gated_envelope():
+def test_send_keys_gated_envelope() -> None:
     # send-keys goes through adapter.run(), which SUPPRESSES SILENTLY (no raise);
     # the handler must notice last_send_gate_result and surface the gated envelope
     # instead of falsely reporting sent:True.

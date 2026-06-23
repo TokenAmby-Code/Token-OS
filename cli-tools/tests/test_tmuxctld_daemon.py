@@ -22,13 +22,13 @@ from tmuxctl import daemon
 class StubAdapter:
     """Minimal adapter: tmux reachable, every scan returns empty (fail-closed)."""
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         return []
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         return ""
 
-    def show_pane_option(self, pane_id, option):
+    def show_pane_option(self, pane_id: str, option: str) -> str:
         return self.run("show-options", "-pv", "-t", pane_id, option, allow_failure=True).strip()
 
 
@@ -47,13 +47,13 @@ def _serve(adapter_factory):
     return server, thread
 
 
-def _get(server, path):
+def _get(server, path: str):
     url = f"http://127.0.0.1:{server.server_address[1]}{path}"
     with urllib.request.urlopen(url, timeout=5) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
-def _post(server, path, body):
+def _post(server, path: str, body):
     url = f"http://127.0.0.1:{server.server_address[1]}{path}"
     req = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}
@@ -62,7 +62,7 @@ def _post(server, path, body):
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
-def test_server_signals_ready_event():
+def test_server_signals_ready_event() -> None:
     # Finding #3: the server thread sets a threading.Event once it is actually
     # listening; _serve gates on it, so by the time it returns the event is set.
     server, _ = _serve(StubAdapter)
@@ -72,7 +72,7 @@ def test_server_signals_ready_event():
         server.shutdown()
 
 
-def test_health_shape():
+def test_health_shape() -> None:
     server, _ = _serve(StubAdapter)
     try:
         status, payload = _get(server, "/health")
@@ -87,7 +87,7 @@ def test_health_shape():
         server.shutdown()
 
 
-def test_resolve_instance_fail_closed_envelope():
+def test_resolve_instance_fail_closed_envelope() -> None:
     server, _ = _serve(StubAdapter)
     try:
         status, payload = _get(server, "/tmux/resolve-instance?instance_id=does-not-exist")
@@ -106,16 +106,16 @@ def test_resolve_instance_fail_closed_envelope():
 class FoundInstanceAdapter:
     """tmux reachable; one live pane carries @INSTANCE_ID=my-uuid @PANE_ID=mechanicus:1."""
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         return []
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[:2] == ("list-panes", "-a"):
             return "%42\tmy-uuid\tmechanicus:1"
         return ""
 
 
-def test_resolve_instance_returns_canonical_role_never_physical():
+def test_resolve_instance_returns_canonical_role_never_physical() -> None:
     server, _ = _serve(FoundInstanceAdapter)
     try:
         _, payload = _get(server, "/tmux/resolve-instance?instance_id=my-uuid")
@@ -132,21 +132,21 @@ def test_resolve_instance_returns_canonical_role_never_physical():
 class StampedPaneAdapter:
     """current pane resolves to %7 and carries @INSTANCE_ID=stamped-uuid."""
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         return []
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[:2] == ("display-message", "-p"):
             return "%7"
         if args[0] == "show-options" and args[-1] == "@INSTANCE_ID":
             return "stamped-uuid"
         return ""
 
-    def show_pane_option(self, pane_id, option):
+    def show_pane_option(self, pane_id: str, option: str) -> str:
         return self.run("show-options", "-pv", "-t", pane_id, option, allow_failure=True).strip()
 
 
-def test_instance_id_for_pane_reads_stamp():
+def test_instance_id_for_pane_reads_stamp() -> None:
     server, _ = _serve(StampedPaneAdapter)
     try:
         status, payload = _get(server, "/tmux/instance-id-for-pane?pane=current")
@@ -159,7 +159,7 @@ def test_instance_id_for_pane_reads_stamp():
         server.shutdown()
 
 
-def test_instance_id_for_pane_fail_closed_when_unstamped():
+def test_instance_id_for_pane_fail_closed_when_unstamped() -> None:
     server, _ = _serve(StubAdapter)
     try:
         status, payload = _get(server, "/tmux/instance-id-for-pane?pane=current")
@@ -175,13 +175,13 @@ def test_instance_id_for_pane_fail_closed_when_unstamped():
 class RecordingFocusAdapter:
     """Resolves focus-uuid -> palace:1 and records every run() call."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.calls = []
 
-    def list_sessions(self):
+    def list_sessions(self) -> list:
         return []
 
-    def run(self, *args, allow_failure=False):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
         self.calls.append(args)
         if args[:2] == ("list-panes", "-a"):
             return "%24\tfocus-uuid\tpalace:1"
@@ -189,11 +189,11 @@ class RecordingFocusAdapter:
             return "main:3"
         return ""
 
-    def show_pane_option(self, pane_id, option):
+    def show_pane_option(self, pane_id: str, option: str) -> str:
         return self.run("show-options", "-pv", "-t", pane_id, option, allow_failure=True).strip()
 
 
-def test_instance_focus_honors_explicit_client():
+def test_instance_focus_honors_explicit_client() -> None:
     rec = RecordingFocusAdapter()
     server, _ = _serve(lambda: rec)
     try:
@@ -208,7 +208,7 @@ def test_instance_focus_honors_explicit_client():
         server.shutdown()
 
 
-def test_translate_ids_unresolved_passthrough():
+def test_translate_ids_unresolved_passthrough() -> None:
     server, _ = _serve(StubAdapter)
     try:
         status, payload = _post(server, "/translate-ids", {"text": "pane %9 here"})
@@ -220,7 +220,7 @@ def test_translate_ids_unresolved_passthrough():
         server.shutdown()
 
 
-def test_unknown_route_is_404_envelope():
+def test_unknown_route_is_404_envelope() -> None:
     server, _ = _serve(StubAdapter)
     try:
         url = f"http://127.0.0.1:{server.server_address[1]}/nope"
@@ -236,7 +236,7 @@ def test_unknown_route_is_404_envelope():
         server.shutdown()
 
 
-def test_bad_json_body_is_400():
+def test_bad_json_body_is_400() -> None:
     server, _ = _serve(StubAdapter)
     try:
         url = f"http://127.0.0.1:{server.server_address[1]}/send-text"
@@ -254,14 +254,14 @@ def test_bad_json_body_is_400():
         server.shutdown()
 
 
-def test_serve_refuses_non_loopback_bind():
+def test_serve_refuses_non_loopback_bind() -> None:
     # The daemon is unauthenticated and does powerful tmux ops — serve() must
     # fail closed (no bind) on any non-loopback host.
     assert daemon.serve("0.0.0.0", 0) == 2
     assert daemon.serve("10.0.0.5", 0) == 2
 
 
-def test_malformed_content_length_is_bad_request():
+def test_malformed_content_length_is_bad_request() -> None:
     # A non-integer Content-Length must normalize to a 400 bad_request envelope,
     # never an unhandled 500. Crafted over a raw socket (urllib would rewrite the
     # header), with Connection: close so the server replies once and hangs up.
@@ -291,7 +291,7 @@ def test_malformed_content_length_is_bad_request():
         server.shutdown()
 
 
-def test_heartbeat_written_only_when_reachable(tmp_path, monkeypatch):
+def test_heartbeat_written_only_when_reachable(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     # Reachable -> file written atomically.
     assert daemon.write_heartbeat(7778, reachable=True, home=str(tmp_path)) is True

@@ -694,7 +694,10 @@ class TmuxControlPlane:
                 "-p",
                 "#{session_name}:#{window_index}",
             ).strip()
-            self.adapter.run("switch-client", "-c", client, "-t", window, allow_failure=True)
+            # An explicit client was requested: if the retarget fails (stale/invalid
+            # client), let it raise rather than silently focusing the pane for the
+            # WRONG client and reporting success — fail loud, fail closed.
+            self.adapter.run("switch-client", "-c", client, "-t", window)
         self.adapter.run("select-pane", "-t", resolved["pane_id"])
         return {"instance_id": instance_id, "found": True, "focused": resolved["pane_role"]}
 
