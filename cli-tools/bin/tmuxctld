@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+_LIB_DIR="$(cd "$(dirname "$(readlink -f "$0")")/../lib" && pwd)"
+PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m tmuxctl.daemon "$@"

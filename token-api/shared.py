@@ -16,6 +16,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -674,6 +676,26 @@ async def push_agnostic_pane_vars(
         return {}
 
 
+def _tmuxctld_url() -> str | None:
+    url = (os.environ.get("TMUXCTLD_URL") or "").strip().rstrip("/")
+    return url or None
+
+
+def _tmuxctld_get_json(path: str, params: dict[str, str], *, timeout: float = 0.5) -> dict | None:
+    base = _tmuxctld_url()
+    if not base:
+        return None
+    query = urllib.parse.urlencode(params)
+    url = f"{base}{path}?{query}" if query else f"{base}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            return json.loads(resp.read().decode(errors="ignore") or "{}")
+    except Exception:
+        return None
+
+
 async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, str | None]:
     """Resolve an instance UUID to its live ``(pane_id, role)`` via tmuxctl.
 
@@ -685,6 +707,15 @@ async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, st
     """
     if not instance_id:
         return (None, None)
+    payload = await asyncio.to_thread(
+        _tmuxctld_get_json, "/resolve-instance", {"instance_id": instance_id}, timeout=0.5
+    )
+    if payload is not None:
+        if not payload.get("found"):
+            return (None, None)
+        pane_id = (payload.get("pane_id") or "").strip() or None
+        role = (payload.get("pane_role") or "").strip() or None
+        return (pane_id, role)
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         # sys.executable, never bare "python3": on the live host "python3" resolves
@@ -737,6 +768,11 @@ async def instance_id_for_pane(pane: str | None) -> str | None:
     """
     if not (pane or "").strip():
         return None
+    payload = await asyncio.to_thread(
+        _tmuxctld_get_json, "/instance-id-for-pane", {"pane": pane or ""}, timeout=0.5
+    )
+    if payload is not None:
+        return (payload.get("instance_id") or "").strip() or None
     try:
         proc = await _run_subprocess_offloop(
             ("tmux", "show-options", "-pv", "-t", pane, "@INSTANCE_ID"),

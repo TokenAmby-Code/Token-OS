@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  tmuxctld loopback daemon. Stage-B only: staged for owner-gated deployment;
+  do not load from a branch worktree. Install after merge/deploy by copying the
+  repo-backed tmuxctld entrypoint to a local path if TCC requires it, then
+  bootstrap this LaunchAgent. Token-API can opt in via TMUXCTLD_URL=http://127.0.0.1:7778.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.openclaw.tmuxctld</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/tokenclaw/runtimes/Token-OS/live/cli-tools/bin/tmuxctld</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>7778</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/tokenclaw/runtimes/Token-OS/live/cli-tools/bin:/Users/tokenclaw/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>HOME</key>
+		<string>/Users/tokenclaw</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/tokenclaw/.claude/tmuxctld-stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/tokenclaw/.claude/tmuxctld-stderr.log</string>
+</dict>
+</plist>
