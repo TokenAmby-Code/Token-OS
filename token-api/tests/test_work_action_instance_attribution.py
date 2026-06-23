@@ -51,7 +51,6 @@ def _insert_instance(db_path, *, last_activity: datetime, hook_driven: int = 0) 
             status="working",
             engine="claude",
             working_dir="/work",
-            tmux_pane=PANE,
             device_id="Mac-Mini",
             last_activity=last_activity.isoformat(),
             legion="mechanicus",
@@ -105,7 +104,12 @@ def no_typing(app_env, monkeypatch):
     _typing_guard_active shells out to tmux; pin it deterministically off so the
     hook_driven / marker discount is not masked by a stray live tmux client.
     """
+
+    async def _resolve_instance_pane(instance_id):
+        return (PANE, None) if instance_id == SESSION_ID else (None, None)
+
     monkeypatch.setattr(app_env.main, "_typing_guard_active", lambda: False)
+    monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve_instance_pane)
     return app_env
 
 
