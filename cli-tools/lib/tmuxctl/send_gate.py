@@ -72,22 +72,11 @@ _SEND_GATE_POLICY_ENV = "TMUX_SEND_GATE_POLICY"
 _SEND_GATE_POLICIES = frozenset({"delay", "cancel", "pierce"})
 _SEND_GATE_DELAY_TIMEOUT_ENV = "TMUX_SEND_GATE_DELAY_TIMEOUT"  # unset/0 = no timeout
 
-# Per-pane keystroke-anchored typing lock. The tmux root-table any-key binding
-# (cli-tools/tmux/tmux-base.conf) stamps this pane option with an ABSOLUTE expiry
-# epoch the moment the Emperor first types into a pane (first keystroke + the
-# 5-min window, in the same unix-epoch timebase as ``time.time()``), and an Enter
-# keystroke into that pane clears it. The gate reads this option as the SOLE
-# typing signal: a pane the Emperor typed into is locked until the timer expires
-# or an Enter clears it — held even after focus leaves the pane, and never armed
-# by focus/click or by the fleet's own ``send-keys`` (those bypass the key
-# table). This replaces the old focus-coupled ``#{client_activity}`` shadow.
+# Per-pane keystroke lock written by tmux-base.conf root key bindings.
+# Value is an absolute Unix epoch; active iff now < value.
 _TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
-
-# Poll cap (seconds) while a send is delayed behind a typing lock. The lock has a
-# concrete absolute expiry, so the delay sleeps toward it; the cap bounds the
-# interval so an Enter-clear (or a vanished draft) releases a held send within
-# ~1s instead of after the whole 5-min window.
-_TYPING_LOCK_RECHECK_SECONDS = 1.0
+_GUARD_MARKER_OPTION = "@GUARD"
+_GUARD_BORDER_MARKER = "#[fg=colour214]#[bold]⌨#[default]"
 
 # Automated-activation marker TTL (seconds). Every send through
 # TmuxAdapter.run() is automated by construction (see module docstring), so the
@@ -292,47 +281,76 @@ def _real_tmux_binary() -> str:
         return "tmux"
 
 
-def _pane_lock_until(target: str) -> int | None:
-    """Absolute expiry epoch of ``target``'s keystroke lock, or None.
-
-    Reads the per-pane ``@TYPING_LOCK_UNTIL`` option the tmux any-key binding
-    stamps. ``show-options -pqv`` prints the value for a set option and an empty
-    line (exit 0) for an unset one. Fail-open: any tmux error / unset / unparsable
-    value yields None (no lock), so a transient fault never wedges pane writes.
-    """
-    if not target:
-        return None
+def _tmux_text(*args: str, timeout: float = 0.5) -> str | None:
     try:
         proc = subprocess.run(
-            [_real_tmux_binary(), "show-options", "-pqv", "-t", target, _TYPING_LOCK_OPTION],
+            [_real_tmux_binary(), *args],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=0.3,
+            timeout=timeout,
         )
     except Exception:
         return None
     if proc.returncode != 0:
         return None
-    raw = proc.stdout.strip()
+    return proc.stdout
+
+
+def _tmux_set_pane_option(target: str, option: str, value: str) -> None:
+    if not target:
+        return
+    try:
+        subprocess.run(
+            [_real_tmux_binary(), "set-option", "-p", "-t", target, option, value],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.5,
+        )
+    except Exception:
+        return
+
+
+def publish_typing_guard_marker(target: str, active: bool) -> None:
+    """Project canonical typing-lock state into pane-local ``@GUARD``.
+
+    Best-effort and target-only: this never scans all panes and never raises into
+    the send path. The hot human key path sets the same pane option directly in
+    tmux; this helper exists for Python-side transitions/tests and the expiry
+    clear helper.
+    """
+    _tmux_set_pane_option(target, _GUARD_MARKER_OPTION, _GUARD_BORDER_MARKER if active else "")
+
+
+def _pane_lock_until(target: str) -> float | None:
+    if not target:
+        return None
+    out = _tmux_text("show-options", "-pqv", "-t", target, _TYPING_LOCK_OPTION, timeout=0.3)
+    if out is None:
+        return None
+    raw = out.strip()
     if not raw:
         return None
     try:
-        return int(raw)
+        return float(raw)
     except ValueError:
         return None
 
 
-def _pane_keystroke_locked(target: str) -> bool:
-    """True iff ``target`` carries a live keystroke lock (expiry still future).
-
-    The lock is purely keystroke-anchored and focus-decoupled: it engages when
-    the Emperor types into the pane and holds until the 5-min timer or an Enter
-    clears it, regardless of which pane currently has focus.
-    """
+def typing_guard_deadline(*, target: str | None = None) -> float | None:
+    """Return the active lock expiry for ``target``, or None if clear/expired."""
+    if not target:
+        return None
     until = _pane_lock_until(target)
-    return until is not None and time.time() < until
+    if until is None or time.time() >= until:
+        return None
+    return until
+
+
+def _pane_keystroke_locked(target: str) -> bool:
+    return typing_guard_deadline(target=target) is not None
 
 
 def _live_pane_ids() -> list[str] | None:
@@ -352,35 +370,31 @@ def _live_pane_ids() -> list[str] | None:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
-def any_typing_guard_active() -> bool:
-    """Aggregate query: true if any pane is under a typing guard.
+def any_typing_guard_active(*, window_seconds: int | None = None) -> bool:
+    """Aggregate query: true if any live pane has an active keystroke lock.
 
-    Aggregate behavior for global policies that intentionally hang on ANY typing
-    guard: true iff any live pane carries a keystroke lock.
+    ``window_seconds`` is accepted for compatibility with older callers but is no
+    longer used; the lock expiry is the source of truth.
     """
+    _ = window_seconds
     panes = _live_pane_ids()
     if panes is None:
         return False
     return any(_pane_keystroke_locked(pane) for pane in panes)
 
 
-def typing_guard_active(*, target: str | None = None) -> bool:
-    """Canonical typing-guard predicate — the keystroke-anchored per-pane lock.
+def typing_guard_active(*, target: str | None = None, window_seconds: int | None = None) -> bool:
+    """Canonical typing-guard predicate.
 
-    With ``target`` set, the guard holds iff that pane carries a live keystroke
-    lock (``@TYPING_LOCK_UNTIL`` still in the future): the Emperor typed into the
-    pane within the last 5 min and has not pressed Enter. This is the single,
-    honest, focus-DECOUPLED signal both surfaces consume — the ⌨ pane-border
-    diagnostic (``tmux-typing-guard-status --scan``) and the universal send-hold.
-    Focus/click never set, move, or clear it; the fleet's own ``send-keys`` never
-    arms it (those bypass the key table). A genuine unsent draft is covered by
-    the lock the keystroke that typed it armed — no prompt-line screen-scraping,
-    so an idle worker pane with leftover prompt text is never falsely held.
+    With ``target`` set, the guard is the pane-local keystroke lock written by
+    tmux's root key binding (``@TYPING_LOCK_UNTIL``). Focus/client activity does
+    not move or clear it, and automated ``send-keys`` does not arm it.
 
-    With no target, keep aggregate behavior for policies that hang on ANY guard.
+    With no target, return whether any live pane has an active lock.
 
     Fail-open: if tmux is unreachable or reports nothing, returns False.
     """
+    _ = window_seconds
     if target:
         return _pane_keystroke_locked(target)
     return any_typing_guard_active()
@@ -434,30 +448,30 @@ def _delay_timeout_seconds() -> float | None:
     return value if value > 0 else None
 
 
-# Margin added past the computed lock expiry so the post-sleep re-check lands
-# strictly outside the lock window (epoch math is whole-second).
+# Margin past the lock expiry so the post-sleep re-check lands outside it.
 _DELAY_WAKE_MARGIN_SECONDS = 0.1
 # An explicitly configured quiet-hours delay (TMUX_SEND_GATE_POLICY=delay) has
 # no keystroke-derived deadline; re-evaluate at a coarse cadence instead.
 _QUIET_DELAY_RECHECK_SECONDS = 60.0
+# Lock expiry is absolute, but cap sleeps so an Enter-clear releases promptly.
+_TYPING_LOCK_RECHECK_SECONDS = 1.0
 
 
-def _typing_delay_sleep(target: str | None) -> float:
-    """Seconds to sleep before re-checking a typing-guard delay.
-
-    The keystroke lock carries an absolute expiry, so sleep toward it — a quiet
-    5-min lock costs ~one wake per second rather than a busy-spin — but cap the
-    interval at ``_TYPING_LOCK_RECHECK_SECONDS`` so an Enter-clear (which retires
-    the lock early) or a vanished draft releases the held send within ~1s. With
-    no live lock (draft-only hold, or tmux unreadable) fall back to the cap.
-    """
-    until = _pane_lock_until(target) if target else None
+def _typing_delay_sleep(target: str | None, deadline: float | None) -> bool:
+    if not target:
+        return True
+    until = typing_guard_deadline(target=target)
     if until is None:
-        return _TYPING_LOCK_RECHECK_SECONDS
-    remaining = (until + _DELAY_WAKE_MARGIN_SECONDS) - time.time()
-    if remaining <= 0:
-        return 0.05
-    return min(_TYPING_LOCK_RECHECK_SECONDS, remaining)
+        return True
+    sleep_for = max(0.0, (until + _DELAY_WAKE_MARGIN_SECONDS) - time.time())
+    sleep_for = min(sleep_for, _TYPING_LOCK_RECHECK_SECONDS)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        sleep_for = min(sleep_for, remaining)
+    time.sleep(max(0.05, sleep_for))
+    return True
 
 
 def wait_for_gate_clear(
@@ -470,9 +484,8 @@ def wait_for_gate_clear(
     """Wait while policy remains ``delay``; return True once sending is allowed.
 
     Returns False if the policy changes to cancel or an explicit timeout
-    expires. A typing-guard wait sleeps toward the target pane's keystroke-lock
-    expiry (capped so an Enter-clear or vanished draft releases promptly); a
-    quiet-hours delay re-checks coarsely.
+    expires. Typing-guard waits are target-aware: pending input is re-checked
+    lightly, while recent client activity sleeps to the target client's expiry.
     """
     if timeout_seconds is None:
         timeout_seconds = _delay_timeout_seconds()
@@ -488,11 +501,13 @@ def wait_for_gate_clear(
         if deadline is not None and time.monotonic() >= deadline:
             return False
         if result.get("reason") == "typing_guard":
-            sleep_for = _typing_delay_sleep(target)
-        else:
-            # Quiet-hours only delays under an explicit TMUX_SEND_GATE_POLICY=delay;
-            # there is no keystroke deadline to sleep to, so re-check coarsely.
-            sleep_for = _QUIET_DELAY_RECHECK_SECONDS
+            if not _typing_delay_sleep(target, deadline):
+                return False
+            result = evaluate(args_tuple, db_path=db_path, now=now)
+            continue
+        # Quiet-hours only delays under an explicit TMUX_SEND_GATE_POLICY=delay;
+        # there is no keystroke deadline to sleep to, so re-check coarsely.
+        sleep_for = _QUIET_DELAY_RECHECK_SECONDS
         if deadline is not None:
             sleep_for = min(sleep_for, max(0.05, deadline - time.monotonic()))
         time.sleep(sleep_for)

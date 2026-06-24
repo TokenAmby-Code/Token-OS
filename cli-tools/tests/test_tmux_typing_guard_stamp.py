@@ -47,16 +47,10 @@ def _fake_tmux(tmp_path: Path) -> Path:
               list-windows)
                 echo -e "s\t0\tw"
                 ;;
-              show-options)
-                # The canonical send-gate predicate reads the per-pane keystroke
-                # lock here; the shell-stamp path (tmux_wait_for_clear) queries no
-                # option, so a bare show-options still falls through to exit 1.
-                if [[ "$*" == *"@TYPING_LOCK_UNTIL"* ]]; then
-                  echo "${FAKE_TYPING_LOCK_UNTIL:-}"; exit 0;
-                fi
-                exit 1
+              show-options|show)
+                if [[ "$*" == *"@TYPING_LOCK_UNTIL"* ]]; then echo "${FAKE_TMUX_LOCK_UNTIL:-}"; else exit 1; fi
                 ;;
-              set-option)
+              set-option|set)
                 exit 0
                 ;;
               send-keys|send-key|send)
@@ -192,34 +186,39 @@ EOF
     assert "stamp:gone" in proc.stdout
 
 
-def test_status_segment_follows_keystroke_lock(tmp_path: Path) -> None:
-    """The status segment lights iff the pane carries a live keystroke lock —
-    the same canonical predicate that gates the send path. A future
-    ``@TYPING_LOCK_UNTIL`` lights it; an expired one goes dark."""
-    env = _env(tmp_path, "> \n")
+def test_status_segment_uses_pane_keystroke_lock(tmp_path: Path) -> None:
+    env = _env(tmp_path, "> draft\n")
     now = int(time.time())
-
-    env["FAKE_TYPING_LOCK_UNTIL"] = str(now + 200)
-    lit = subprocess.run(
+    env["FAKE_TMUX_LOCK_UNTIL"] = str(now + 300)
+    first = subprocess.run(
         [sys.executable, str(STATUS), "--plain"],
         text=True,
         capture_output=True,
         env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
+        timeout=2,
         check=False,
     )
-
-    env["FAKE_TYPING_LOCK_UNTIL"] = str(now - 60)  # 5-min window elapsed / Enter cleared
+    Path(env["FAKE_TMUX_CAPTURE"]).write_text("> \n")
+    still_locked = subprocess.run(
+        [sys.executable, str(STATUS), "--plain"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=2,
+        check=False,
+    )
+    env["FAKE_TMUX_LOCK_UNTIL"] = str(now - 1)
     expired = subprocess.run(
         [sys.executable, str(STATUS), "--plain"],
         text=True,
         capture_output=True,
         env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
+        timeout=2,
         check=False,
     )
 
-    assert lit.stdout == "TYPE"
+    assert first.stdout == "TYPE"
+    assert still_locked.stdout == "TYPE"
     assert expired.stdout == ""
 
 
@@ -244,21 +243,21 @@ def test_tmux_guard_skip_escape_hatch_bypasses_block(tmp_path: Path) -> None:
 
 
 def test_tmux_shim_delays_under_typing_guard_then_delivers(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> \n")
+    env = _env(tmp_path, "> draft\n")
     env.pop("TMUX_SEND_GATE_POLICY", None)
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    # A keystroke lock ~1s out: the shim's send-gate delays, then the lock
-    # expires by wall-clock and the byte is delivered (no drop). The gate polls
-    # every 0.5s spawning a python3 subprocess per iteration, so on a contended
-    # CI runner the ~1s wait + process overhead can overrun a tight timeout;
-    # 30s gives ample headroom (pytest-timeout=120 is the true-hang backstop).
-    env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 1)
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
+    capture = Path(env["FAKE_TMUX_CAPTURE"])
     proc = subprocess.run(
-        ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
+        [
+            "bash",
+            "-lc",
+            f"(sleep 0.2; printf '> \\n' > '{capture}') & exec '{TMUX_SHIM}' send-keys -t %1 peer-bytes",
+        ],
         text=True,
         capture_output=True,
         env=env,
-        timeout=30,
+        timeout=3,
         check=False,
     )
 
@@ -269,16 +268,16 @@ def test_tmux_shim_delays_under_typing_guard_then_delivers(tmp_path: Path) -> No
 
 
 def test_tmux_shim_cancel_policy_suppresses_without_writing(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> \n")
+    env = _env(tmp_path, "> draft\n")
     env["TMUX_SEND_GATE_POLICY"] = "cancel"
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 200)  # %1 keystroke-locked
+    env["FAKE_TMUX_LOCK_UNTIL"] = str(int(time.time()) + 300)
     proc = subprocess.run(
         ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
         text=True,
         capture_output=True,
         env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
+        timeout=2,
         check=False,
     )
 
@@ -296,7 +295,7 @@ def test_tmux_shim_raw_read_is_unaffected(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
+        timeout=2,
         check=False,
     )
 
@@ -305,20 +304,18 @@ def test_tmux_shim_raw_read_is_unaffected(tmp_path: Path) -> None:
     assert Path(env["FAKE_TMUX_SENT"]).read_text() == ""
 
 
-def test_tmux_shim_unlocked_pane_is_deliverable(tmp_path: Path) -> None:
-    # The target pane carries no keystroke lock (the Emperor never typed into
-    # it), so the per-pane gate never engages — the send sails through. A lock on
-    # some OTHER pane is irrelevant: the guard is strictly per-pane.
+def test_tmux_shim_empty_pane_ignores_unrelated_global_typing_gate(tmp_path: Path) -> None:
     env = _env(tmp_path, "> \n")
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
     env.pop("TMUX_SEND_GATE_POLICY", None)
-    env["FAKE_TYPING_LOCK_UNTIL"] = ""  # %1 unlocked
+    env["FAKE_TMUX_CLIENT_ACTIVITY"] = str(int(time.time()))
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()) - 60)
     proc = subprocess.run(
         ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
         text=True,
         capture_output=True,
         env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
+        timeout=2,
         check=False,
     )
 
@@ -330,14 +327,10 @@ def test_tmux_shim_unlocked_pane_is_deliverable(tmp_path: Path) -> None:
 
 
 def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> \n")
+    env = _env(tmp_path, "> draft\n")
     env.pop("TMUX_SEND_GATE_POLICY", None)
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    # Keystroke lock ~1s out: agent-cmd queues behind the gate, then delivers
-    # once the lock expires by wall-clock. 30s subprocess timeout (vs the gate's
-    # ~1s wait) absorbs CI poll/process overhead; pytest-timeout=120 backstops a
-    # true hang.
-    env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 1)
+    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
     stub = tmp_path / "tmuxctl-stub"
     stub.write_text(
         "#!/usr/bin/env bash\n"
@@ -355,12 +348,17 @@ def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path)
     )
     stub.chmod(0o755)
     env["TMUXCTL_BIN"] = str(stub)
+    capture = Path(env["FAKE_TMUX_CAPTURE"])
     proc = subprocess.run(
-        [str(AGENT_CMD), "--pane", "%1", "hello from peer"],
+        [
+            "bash",
+            "-lc",
+            f"(sleep 0.2; printf '> \\n' > '{capture}') & exec '{AGENT_CMD}' --pane %1 'hello from peer'",
+        ],
         text=True,
         capture_output=True,
         env=env,
-        timeout=30,
+        timeout=4,
         check=False,
     )
 
@@ -412,12 +410,12 @@ def test_brief_surfaces_blocked_as_not_delivered(tmp_path: Path) -> None:
             text=True,
             capture_output=True,
             env=env,
-            timeout=15,  # widened for CPU contention under parallel runs
+            timeout=2,
             check=False,
         )
     finally:
         server.shutdown()
-        thread.join(timeout=15)
+        thread.join(timeout=2)
 
     assert proc.returncode == 1
     assert "delivered=0/1" in proc.stdout

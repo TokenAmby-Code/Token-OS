@@ -1,14 +1,8 @@
-"""Statusline diagnostic tests — the segment must reflect the CANONICAL gate.
+"""Typing-guard diagnostic/projection tests.
 
-`bin/tmux-typing-guard-status` is the per-pane diagnostic. Its whole job is to
-answer, honestly, "would the universal send gate hold an automated write to this
-pane right now?" — so it must consult ``send_gate.typing_guard_active(target=…)``
-(the predicate that actually gates the Python clobber path: state-hooks,
-enforcement, dispatch). That predicate is now the keystroke-anchored per-pane
-lock: it reads ``@TYPING_LOCK_UNTIL`` (an absolute expiry epoch the tmux any-key
-binding stamps on first keystroke). It must NOT answer from the legacy 300s shell
-stamp files, which over-report. The divergence test below pins exactly that: a
-live stamp present, but no keystroke lock ⇒ the segment is dark.
+Live tmux status/borders do not invoke this command. It remains a manual
+single-pane diagnostic and a one-shot expiry clearer for the event-updated
+@GUARD projection.
 """
 
 from __future__ import annotations
@@ -23,18 +17,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 STATUS = REPO / "cli-tools" / "bin" / "tmux-typing-guard-status"
 
-STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
+STYLED = "#[fg=colour214]#[bold]⌨ GUARD#[default] "
+MARKER = "#[fg=colour214]#[bold]⌨#[default]"
 
 
 def _fake_tmux(tmp_path: Path) -> Path:
-    """A tmux stand-in driven by FAKE_* env, recording set-option writes.
-
-    Emulates exactly the calls the canonical predicate makes: the per-pane
-    keystroke-lock read (``show-options -pqv -t <pane> @TYPING_LOCK_UNTIL``),
-    the active-pane / live-pane queries, and ``set-option`` (recorded as a clean
-    ``<option>\\t<pane>\\t<value>`` line in FAKE_SETOPT, value empty when cleared).
-    A pane's lock epoch is read from ``FAKE_LOCK_DIR/<panekey>`` (absent = unset).
-    """
     fake = tmp_path / "tmux"
     fake.write_text(
         textwrap.dedent(
@@ -42,40 +29,33 @@ def _fake_tmux(tmp_path: Path) -> Path:
             #!/usr/bin/env bash
             set -uo pipefail
             echo "$*" >> "${FAKE_TMUX_CALLS}"
-            key() { printf '%s' "$1" | sed 's/[^A-Za-z0-9_.:%-]/_/g'; }
             verb="${1:-}"; shift || true
-            target=""; opt=""; val=""; prev=""; seen_opt=0
+            target=""; opt=""; val=""; prev=""
             for a in "$@"; do
               if [[ "$prev" == "-t" ]]; then target="$a"; fi
-              if [[ "$a" == @* ]]; then opt="$a"; seen_opt=1; prev="$a"; continue; fi
-              if [[ "$seen_opt" == "1" ]]; then val="$a"; fi
+              if [[ "$a" == @* ]]; then opt="$a"; fi
               prev="$a"
             done
             case "$verb" in
               display-message)
                 if [[ "$*" == *"#{pane_id}"* && "$*" != *"-t"* ]]; then
                   echo "${FAKE_ACTIVE_PANE:-%1}"
+                fi
+                ;;
+              show-options|show)
+                if [[ "$opt" == "@TYPING_LOCK_UNTIL" ]]; then
+                  key="LOCK_${target//%/}"
+                  printf '%s\n' "${!key:-}"
                 else
-                  echo ""
+                  exit 1
                 fi
                 ;;
               list-panes)
                 for p in ${FAKE_PANES:-}; do echo "$p"; done
                 ;;
-              show-options|show)
-                # The canonical predicate's only read: the per-pane keystroke lock.
-                if [[ "$*" == *"@TYPING_LOCK_UNTIL"* ]]; then
-                  f="${FAKE_LOCK_DIR}/$(key "$target")"
-                  if [[ -f "$f" ]]; then cat "$f"; fi
-                  exit 0
-                fi
-                exit 1
-                ;;
               set-option|set)
+                val="${@: -1}"
                 printf '%s\t%s\t%s\n' "$opt" "$target" "$val" >> "${FAKE_SETOPT}"
-                exit 0
-                ;;
-              *)
                 ;;
             esac
             """
@@ -86,16 +66,7 @@ def _fake_tmux(tmp_path: Path) -> Path:
     return fake
 
 
-def _key(pane: str) -> str:
-    return "".join(c if (c.isalnum() or c in "_.:%-") else "_" for c in pane)
-
-
-def _env(tmp_path: Path, *, locks: dict[str, int], active: str = "%1") -> dict[str, str]:
-    """Build the env, stamping each pane's keystroke-lock epoch into FAKE_LOCK_DIR."""
-    lock_dir = tmp_path / "locks"
-    lock_dir.mkdir()
-    for pane, epoch in locks.items():
-        (lock_dir / _key(pane)).write_text(f"{int(epoch)}\n")
+def _env(tmp_path: Path, *, active: str = "%1", locks: dict[str, float] | None = None) -> dict[str, str]:
     calls = tmp_path / "calls.log"
     setopt = tmp_path / "setopt.log"
     calls.write_text("")
@@ -108,13 +79,12 @@ def _env(tmp_path: Path, *, locks: dict[str, int], active: str = "%1") -> dict[s
             "IMPERIUM_TMUX_BIN": str(fake),
             "FAKE_TMUX_CALLS": str(calls),
             "FAKE_SETOPT": str(setopt),
-            "FAKE_LOCK_DIR": str(lock_dir),
             "FAKE_ACTIVE_PANE": active,
-            "FAKE_PANES": "%1",
-            # Isolate the legacy stamp dir so a stray host stamp can't leak in.
-            "TMUX_GUARD_STATE_DIR": str(tmp_path / "guard-state"),
+            "FAKE_PANES": "%1 %2",
         }
     )
+    for pane, until in (locks or {}).items():
+        env[f"LOCK_{pane.replace('%', '')}"] = str(until)
     return env
 
 
@@ -124,7 +94,7 @@ def _run(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
         env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
+        timeout=5,
         check=False,
     )
 
@@ -139,66 +109,38 @@ def _setopts(env: dict[str, str]) -> list[tuple[str, str, str]]:
     return rows
 
 
-def _guard_value_for(env: dict[str, str], pane: str) -> str | None:
-    """Last @GUARD value written for ``pane`` (None if never written)."""
-    value: str | None = None
-    for opt, target, val in _setopts(env):
-        if opt == "@GUARD" and target == pane:
-            value = val
-    return value
+def _calls(env: dict[str, str]) -> str:
+    return Path(env["FAKE_TMUX_CALLS"]).read_text()
 
 
-def test_segment_active_when_canonical_predicate_holds(tmp_path: Path) -> None:
-    # Active pane carries a live keystroke lock → canonical predicate active.
-    env = _env(tmp_path, locks={"%1": int(time.time()) + 200})
+def test_segment_active_when_pane_lock_is_future(tmp_path: Path) -> None:
+    env = _env(tmp_path, locks={"%1": time.time() + 60})
     assert _run(env).stdout == STYLED
     assert _run(env, "--plain").stdout == "TYPE"
 
 
-def test_segment_dark_when_predicate_clear(tmp_path: Path) -> None:
-    # No lock (never typed into) → predicate inactive.
-    env = _env(tmp_path, locks={})
+def test_segment_dark_when_pane_lock_is_absent_or_expired(tmp_path: Path) -> None:
+    env = _env(tmp_path, locks={"%1": time.time() - 1})
     assert _run(env).stdout == ""
     assert _run(env, "--plain").stdout == ""
 
 
-def test_segment_dark_when_lock_expired(tmp_path: Path) -> None:
-    # An expired lock (5-min window elapsed, or an Enter cleared it) reads clear.
-    env = _env(tmp_path, locks={"%1": int(time.time()) - 5})
-    assert _run(env).stdout == ""
+def test_publish_sets_one_pane_guard_without_scanning(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _run(env, "--publish", "-t", "%1", "--active")
+    assert ("@GUARD", "%1", MARKER) in _setopts(env)
+    assert "list-panes" not in _calls(env)
 
 
-def test_segment_follows_lock_not_legacy_stamp(tmp_path: Path) -> None:
-    """Divergence pin: the segment tracks the CANONICAL keystroke lock, not the
-    legacy shell stamp. A stale ``%1.stamp`` is present and the pane has NO live
-    lock — the honest diagnostic must stay dark, proving it ignores the stamp."""
-    env = _env(tmp_path, locks={})  # no keystroke lock
-    state_dir = Path(env["TMUX_GUARD_STATE_DIR"])
-    state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "%1.stamp").write_text("started_at=1\nstate=active\n")  # stale/irrelevant
-
-    assert _run(env).stdout == "", "must follow the canonical lock, not the legacy stamp"
+def test_publish_clears_one_pane_guard_without_scanning(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _run(env, "--publish", "-t", "%1", "--inactive")
+    assert ("@GUARD", "%1", "") in _setopts(env)
+    assert "list-panes" not in _calls(env)
 
 
-def test_segment_publishes_pane_scoped_guard_option(tmp_path: Path) -> None:
-    """The active pane's border var is pushed so it renders with zero fork."""
-    env = _env(tmp_path, locks={"%1": int(time.time()) + 200})
-    _run(env)
-    assert _guard_value_for(env, "%1") not in (None, ""), "locked pane must get a non-empty @GUARD"
-
-
-def test_segment_clears_pane_guard_option_when_dark(tmp_path: Path) -> None:
-    env = _env(tmp_path, locks={})
-    _run(env)
-    assert _guard_value_for(env, "%1") == "", "unlocked pane must have @GUARD cleared"
-
-
-def test_scan_marks_guarded_panes_and_clears_clean_ones(tmp_path: Path) -> None:
-    """--scan refreshes every pane's @GUARD in a single fork (not per render)."""
-    now = int(time.time())
-    env = _env(tmp_path, locks={"%1": now + 200, "%2": now - 5})
-    env["FAKE_PANES"] = "%1 %2"
-    _run(env, "--scan")
-
-    assert _guard_value_for(env, "%1") not in (None, ""), "%1 locked"
-    assert _guard_value_for(env, "%2") == "", "%2 clear (expired lock)"
+def test_clear_expired_clears_only_target_when_lock_expired(tmp_path: Path) -> None:
+    env = _env(tmp_path, locks={"%1": time.time() - 1, "%2": time.time() + 60})
+    _run(env, "--clear-expired", "-t", "%1")
+    assert ("@GUARD", "%1", "") in _setopts(env)
+    assert "list-panes" not in _calls(env)

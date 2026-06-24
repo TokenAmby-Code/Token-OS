@@ -5805,10 +5805,10 @@ async def compute_work_state() -> WorkStateResponse:
     # separate supervisory window below, after the automated/hook-driven discount.
     work_activity_cutoff = now - timedelta(seconds=AGENT_ACTIVITY_FRESH_SECONDS)
     # Human override for the automated-activation discount: a recent human
-    # keystroke (the same #{client_activity} predicate the send gate uses)
-    # disables the discount this tick, so genuine typing always anchors WORKING.
-    # Client-wide (not per-pane) by design — fail-toward-anchoring; carving it to
-    # per-pane is deferred. Sampled once: the discount is applied uniformly below.
+    # keystroke on any tmux client disables the discount this tick, so genuine
+    # typing always anchors WORKING. This is intentionally broader than the
+    # per-pane send gate lock — fail-toward-anchoring for work-state accounting.
+    # Sampled once: the discount is applied uniformly below.
     human_typing = _typing_guard_active()
     active_instances: list[AgentRuntime] = []
     processing_recent_count = 0
@@ -8314,19 +8314,19 @@ _custodes_enforcement_defer_queue: list[dict] = []
 # gate-overridden if still typing — the Custodes pane nag is benign even mid-flow;
 # the physical Pavlok is a separate, still-blocked path).
 _CUSTODES_DEFER_MAX_SECONDS = int(os.environ.get("TOKEN_API_CUSTODES_DEFER_MAX_SECONDS", "300"))
-# Mirrors `tmuxctl.send_gate._DEFAULT_TYPING_GUARD_WINDOW` — kept in sync via the
-# same env contract so the flusher's "typing stopped" matches what the gate sees.
+# Custodes enforcement uses a global "any live human typing" defer heuristic.
+# This is intentionally NOT the per-pane send_gate.typing_guard_active() predicate,
+# which now reads @TYPING_LOCK_UNTIL for the target pane. This broader signal only
+# decides whether to stall non-pane-specific enforcement nagging.
 _TYPING_GUARD_WINDOW_SECONDS = int(os.environ.get("TMUX_TYPING_GUARD_WINDOW", "10"))
 
 
 def _typing_guard_active() -> bool:
-    """Canonical typing-guard predicate (sync): recent human keystroke on a client.
+    """Global enforcement-defer heuristic: recent human keystroke on any client.
 
-    Mirrors ``tmuxctl.send_gate.typing_guard_active`` — reads tmux
-    ``#{client_activity}`` and reports active for ``_TYPING_GUARD_WINDOW_SECONDS``
-    after the last keystroke. This is the same signal the universal send gate
-    consults, so the flusher's notion of "typing stopped" matches the gate's.
-    Fail-open: if tmux is unreachable or reports nothing, returns False.
+    Reads tmux ``#{client_activity}`` and reports active for
+    ``_TYPING_GUARD_WINDOW_SECONDS`` after the last key. Fail-open: if tmux is
+    unreachable or reports nothing, returns False.
     """
     try:
         proc = subprocess.run(

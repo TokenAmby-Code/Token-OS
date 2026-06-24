@@ -1,59 +1,54 @@
 #!/usr/bin/env python3
-# tmux-typing-guard-status - per-pane typing-guard diagnostic
+# tmux-typing-guard-status - typing-guard diagnostic / expiry projection helper
 # TAGS: tmux, guard, status
 # AUDIENCE: human, agent
-"""Render the typing_guard state for a pane — the visible diagnostic.
+"""Render or project the canonical per-pane typing guard.
 
-This is the statusline/pane-border diagnostic for the inbound typing guard. Its
-ONE job is to answer honestly: *would the universal send gate hold an automated
-write to this pane right now?* So it consults the single canonical predicate,
-``tmuxctl.send_gate.typing_guard_active(target=pane)`` — the same predicate that
-gates the Python clobber path (state-hooks, enforcement, dispatch via
-``TmuxAdapter.run``). It deliberately does NOT read the legacy 300s shell
-``*.stamp`` files: those over-report (they light long after a keystroke and
-across unattended agent panes), so a stamp-driven light could not tell "the
-guard never engaged" from "the guard was pierced." This reads the real gate.
+Live tmux config must not invoke this from status-right or pane-border-format.
+Those surfaces are pure reads of pushed tmux options. This command remains as a
+manual diagnostic and as a one-shot expiry clearer scheduled when tmux's root key
+binding arms a pane-local ``@TYPING_LOCK_UNTIL`` lock.
 
 Modes:
-  * default      — print the status-right segment for the *current* (active)
-                   pane and publish its ``@GUARD`` pane option so the pane
-                   border renders the same state with zero fork per redraw.
-  * ``--plain``  — same decision, plain ``TYPE`` text (for tests / dumb bars).
-  * ``--scan``   — refresh every live pane's ``@GUARD`` option in a single fork.
-                   This is the per-pane border updater; it is intentionally kept
-                   OUT of the per-render path so it never reintroduces the
-                   N-shell-out status-bar lag (see cli-tools/tmux/tmux-base.conf).
+  * default      — print a status segment for the current pane only.
+  * ``--plain``  — print ``TYPE`` instead of a styled tmux segment.
+  * ``--publish -t PANE --active|--inactive`` — set/clear ``@GUARD`` for one pane.
+  * ``--clear-expired -t PANE`` — sleep until that pane's lock expiry, then clear
+                   ``@GUARD`` iff the canonical predicate is no longer active.
 
-Fail-open everywhere: any tmux/predicate error renders dark and never raises, so
-a transient fault can neither brick the status bar nor fake a guard light.
+There is intentionally no all-pane scan mode. Marker updates are event-driven by
+the key binding, Enter clear, and this one-shot expiry clearer.
 """
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _LIB = Path(__file__).resolve().parents[1] / "lib"
 if str(_LIB) not in sys.path:
     sys.path.insert(0, str(_LIB))
 
-# Styled status-right segment (matches the bar's colour theme) and the compact
-# marker pushed into the per-pane @GUARD border var.
-SEGMENT_STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
+SEGMENT_STYLED = "#[fg=colour214]#[bold]⌨ GUARD#[default] "
 SEGMENT_PLAIN = "TYPE"
-BORDER_MARKER = "#[fg=colour214,bold]⌨#[default]"
+BORDER_MARKER = "#[fg=colour214]#[bold]⌨#[default]"
 
 
 def _imports() -> tuple:
-    """Import the canonical predicate + real-tmux resolver, or (None, None)."""
     try:
-        from tmuxctl.send_gate import typing_guard_active
+        from tmuxctl.send_gate import (
+            publish_typing_guard_marker,
+            typing_guard_active,
+            typing_guard_deadline,
+        )
         from tmuxctl.tmux_adapter import tmux_binary
 
-        return typing_guard_active, tmux_binary
+        return typing_guard_active, typing_guard_deadline, publish_typing_guard_marker, tmux_binary
     except Exception:
-        return None, None
+        return None, None, None, None
 
 
 def _tmux(binary: str, *args: str) -> str | None:
@@ -78,44 +73,50 @@ def _current_pane(binary: str) -> str:
     return (out or "").strip()
 
 
-def _live_panes(binary: str) -> list[str]:
-    out = _tmux(binary, "list-panes", "-a", "-F", "#{pane_id}")
-    if out is None:
-        return []
-    return [line.strip() for line in out.splitlines() if line.strip()]
-
-
-def _publish(binary: str, pane: str, active: bool) -> None:
-    """Push the pane-scoped @GUARD border var (zero-fork to render later)."""
-    value = BORDER_MARKER if active else ""
-    # Best-effort: a failed option write must never break the segment render.
-    _tmux(binary, "set-option", "-p", "-t", pane, "@GUARD", value)
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--plain", action="store_true")
+    parser.add_argument("--publish", action="store_true")
+    state = parser.add_mutually_exclusive_group()
+    state.add_argument("--active", action="store_true")
+    state.add_argument("--inactive", action="store_true")
+    parser.add_argument("--clear-expired", action="store_true")
+    parser.add_argument("-t", "--target")
+    return parser.parse_args(argv)
 
 
 def main() -> int:
-    argv = sys.argv[1:]
-    plain = "--plain" in argv
-    scan = "--scan" in argv
+    args = _parse_args(sys.argv[1:])
+    typing_guard_active, typing_guard_deadline, publish_marker, tmux_binary = _imports()
+    if typing_guard_active is None or tmux_binary is None or publish_marker is None:
+        return 0
 
-    typing_guard_active, tmux_binary = _imports()
-    if typing_guard_active is None or tmux_binary is None:
-        return 0  # fail-open: no predicate available → render dark
+    if args.publish:
+        if not args.target:
+            return 2
+        publish_marker(args.target, bool(args.active) and not args.inactive)
+        return 0
+
+    if args.clear_expired:
+        if not args.target or typing_guard_deadline is None:
+            return 2
+        deadline = typing_guard_deadline(target=args.target)
+        if deadline is not None:
+            sleep_for = max(0.0, deadline - time.time() + 0.1)
+            # Bound pathological clock/config values; the shipped lock is 300s.
+            time.sleep(min(sleep_for, 3600.0))
+        try:
+            active = bool(typing_guard_active(target=args.target))
+        except Exception:
+            active = False
+        publish_marker(args.target, active)
+        return 0
 
     try:
         binary = tmux_binary()
     except Exception:
         return 0
-
-    if scan:
-        for pane in _live_panes(binary):
-            try:
-                active = bool(typing_guard_active(target=pane))
-            except Exception:
-                active = False
-            _publish(binary, pane, active)
-        return 0
-
-    pane = _current_pane(binary)
+    pane = args.target or _current_pane(binary)
     if not pane:
         return 0
 
@@ -124,10 +125,8 @@ def main() -> int:
     except Exception:
         active = False
 
-    _publish(binary, pane, active)
-
     if active:
-        sys.stdout.write(SEGMENT_PLAIN if plain else SEGMENT_STYLED)
+        sys.stdout.write(SEGMENT_PLAIN if args.plain else SEGMENT_STYLED)
     return 0
 
 

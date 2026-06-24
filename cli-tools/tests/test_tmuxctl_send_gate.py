@@ -410,6 +410,23 @@ def test_wait_for_gate_clear_sleeps_toward_lock_expiry(
     assert len(sleeps) <= 5
 
 
+def test_wait_for_gate_clear_without_target_yields_between_rechecks(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict
+) -> None:
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    until = fake_clock["now"] + 3
+    _lock_tmux(monkeypatch, {"%9": until})
+
+    assert send_gate.wait_for_gate_clear(("send-keys", "hi")) is True
+
+    sleeps = fake_clock["sleeps"]
+    assert sleeps, "an aggregate typing-guard wait must yield instead of spin"
+    assert all(s <= send_gate._TYPING_LOCK_RECHECK_SECONDS + 1e-9 for s in sleeps)
+    assert fake_clock["now"] >= until
+    assert len(sleeps) <= 5
+
+
 def test_wait_for_gate_clear_releases_promptly_when_lock_cleared_early(
     monkeypatch: pytest.MonkeyPatch, fake_clock: dict
 ) -> None:
