@@ -222,7 +222,7 @@ workspace_needs_repair() {
     tmux has-session -t "$session" 2>/dev/null || return 1
 
     local window count roles expected role
-    for window in palace somnium legion mechanicus; do
+    for window in palace somnium council mechanicus reservists; do
         if ! tmux list-windows -t "$session" -F '#W' 2>/dev/null | grep -Fxq "$window"; then
             return 0
         fi
@@ -232,9 +232,12 @@ workspace_needs_repair() {
     [[ "$count" == "4" ]] || return 0
     count=$(tmux list-panes -t "${session}:somnium" 2>/dev/null | wc -l | tr -d ' ')
     [[ "$count" == "5" ]] || return 0
-    count=$(tmux list-panes -t "${session}:legion" 2>/dev/null | wc -l | tr -d ' ')
-    [[ "$count" -ge 1 ]] || return 0
+    # Council reuses the somnium 5-pane geometry, seating five fixed personas.
+    count=$(tmux list-panes -t "${session}:council" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" == "5" ]] || return 0
     count=$(tmux list-panes -t "${session}:mechanicus" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" -ge 1 ]] || return 0
+    count=$(tmux list-panes -t "${session}:reservists" 2>/dev/null | wc -l | tr -d ' ')
     [[ "$count" -ge 1 ]] || return 0
 
     roles=$(tmux list-panes -t "${session}:palace" -F '#{@PANE_ID}' 2>/dev/null || true)
@@ -247,7 +250,8 @@ workspace_needs_repair() {
         grep -Fxq "$expected" <<<"$roles" || return 0
     done
 
-    role=$(tmux list-panes -t "${session}:legion" -F '#{@PANE_ID}' 2>/dev/null | head -1)
+    # Custodes is a fixed council seat (pane .1); the legion orchestrator page is retired.
+    role=$(tmux list-panes -t "${session}:council" -F '#{@PANE_ID}' 2>/dev/null | head -1)
     [[ "$role" == "council:custodes" ]] || return 0
     role=$(tmux list-panes -t "${session}:mechanicus" -F '#{@PANE_ID}' 2>/dev/null | head -1)
     [[ "$role" == "mechanicus:fabricator-general" ]] || return 0

@@ -975,7 +975,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "--system-prompt-file" in result.stdout
     assert "--prompt-file" in result.stdout
     launched = tmuxctl_log.read_text(encoding="utf-8", errors="replace")
-    assert "stack dispatch legion --session main" in launched
+    assert "stack dispatch mechanicus --session main" in launched
     # tmuxctl now spawns the pane with a throwaway `clear` warmup that absorbs
     # any leading-char loss from the upstream type-check guard; the real
     # `bash <staged>` is sent via a follow-up tmux send-keys after a settle.

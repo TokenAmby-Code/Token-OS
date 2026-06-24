@@ -1,12 +1,16 @@
 """Unit tests for the morning-session launcher's tmux-injection resilience.
 
-Regression under test (P0, 2026-06-05): ``run_morning_session()`` crashed when
-the tmuxctl ``stack enforce`` pre-assertion hit its 5s timeout. The uncaught
-``subprocess.TimeoutExpired`` propagated out of ``create_legion_pane()`` ->
+Historical regression (P0, 2026-06-05): ``run_morning_session()`` crashed when
+the tmuxctl ``stack enforce`` pre-assertion hit its 5s timeout — the uncaught
+``subprocess.TimeoutExpired`` propagated out of the seat resolver into
 ``run_morning_session()``, so the Emperor was never placed into morning-session
-mode and the break was never paused. The morning launch MUST survive a slow or
-hung stack-enforce: the legion stack is persistent and ``resolve-pane`` is the
-operation that actually gates the launch.
+mode and the break was never paused.
+
+That pre-assertion targeted the per-fleet ``legion`` stack, which was retired
+into the council page. ``resolve_custodes_pane()`` now resolves the durable fixed
+``council:custodes`` seat with NO stack-enforce step, so the regression is
+structurally impossible — ``resolve-pane`` is the only operation, and it already
+fails closed (returns None) when the seat is absent.
 
 Run:
     cd token-api && .venv/bin/python -m pytest test_morning_session.py -v
@@ -33,96 +37,79 @@ def _cmd_is(cmd, *needles):
     return all(n in cmd for n in needles)
 
 
-# ── create_legion_pane: the stack-enforce timeout path ────────
+# ── resolve_custodes_pane: the durable council seat, no stack-enforce ─
 
 
-def test_create_legion_pane_survives_stack_enforce_timeout():
-    """stack-enforce timing out (5s) must NOT crash; resolve-pane still gates."""
+def test_resolve_custodes_pane_never_invokes_stack_enforce():
+    """The retired ``legion`` stack pre-assertion is gone: resolving the fixed
+    council seat must call ``resolve-pane`` ONLY — any ``stack enforce`` call is a
+    regression (and a hard error against a non-stack base)."""
+    seen: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 5))
+        seen.append(list(cmd))
         if _cmd_is(cmd, "resolve-pane"):
             return _completed(cmd, 0, stdout="%42\n")
         raise AssertionError(f"unexpected cmd: {cmd}")
 
     with patch("morning_session.subprocess.run", side_effect=fake_run):
-        pane = morning_session.create_legion_pane()
+        pane = morning_session.resolve_custodes_pane()
     assert pane == "%42"
+    # Resolves the durable council seat, never the retired legion window.
+    flat = [tok for cmd in seen for tok in cmd]
+    assert any("council:custodes" in tok for tok in flat), seen
+    assert not any(tok.endswith(":legion") for tok in flat), seen
 
 
-def test_create_legion_pane_survives_stack_enforce_error():
-    """Any stack-enforce failure (not just timeout) is best-effort, non-fatal."""
-
-    def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            raise OSError("tmuxctl exploded")
-        if _cmd_is(cmd, "resolve-pane"):
-            return _completed(cmd, 0, stdout="%7\n")
-        raise AssertionError(f"unexpected cmd: {cmd}")
-
-    with patch("morning_session.subprocess.run", side_effect=fake_run):
-        pane = morning_session.create_legion_pane()
-    assert pane == "%7"
-
-
-def test_create_legion_pane_normal_path():
-    """Control: both enforce and resolve-pane succeed → resolved pane."""
+def test_resolve_custodes_pane_normal_path():
+    """Control: resolve-pane succeeds → resolved pane."""
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            return _completed(cmd, 0)
         if _cmd_is(cmd, "resolve-pane"):
             return _completed(cmd, 0, stdout="%99\n")
         raise AssertionError(f"unexpected cmd: {cmd}")
 
     with patch("morning_session.subprocess.run", side_effect=fake_run):
-        pane = morning_session.create_legion_pane()
+        pane = morning_session.resolve_custodes_pane()
     assert pane == "%99"
 
 
-def test_create_legion_pane_resolve_timeout_returns_none():
-    """If resolve-pane itself times out, fail gracefully (None), never raise."""
+def test_resolve_custodes_pane_resolve_timeout_returns_none():
+    """If resolve-pane times out, fail gracefully (None), never raise."""
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            return _completed(cmd, 0)
         if _cmd_is(cmd, "resolve-pane"):
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 5))
         raise AssertionError(f"unexpected cmd: {cmd}")
 
     with patch("morning_session.subprocess.run", side_effect=fake_run):
-        pane = morning_session.create_legion_pane()
+        pane = morning_session.resolve_custodes_pane()
     assert pane is None
 
 
-def test_create_legion_pane_resolve_nonzero_returns_none():
-    """Control: resolve-pane rc!=0 → None (already-correct behavior)."""
+def test_resolve_custodes_pane_resolve_nonzero_returns_none():
+    """Control: resolve-pane rc!=0 → None (seat absent fails closed)."""
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            return _completed(cmd, 0)
         if _cmd_is(cmd, "resolve-pane"):
-            return _completed(cmd, 1, stderr="no such window")
+            return _completed(cmd, 1, stderr="no such pane")
         raise AssertionError(f"unexpected cmd: {cmd}")
 
     with patch("morning_session.subprocess.run", side_effect=fake_run):
-        pane = morning_session.create_legion_pane()
+        pane = morning_session.resolve_custodes_pane()
     assert pane is None
 
 
-def test_create_legion_pane_resolve_empty_returns_none():
+def test_resolve_custodes_pane_resolve_empty_returns_none():
     """Control: resolve-pane rc=0 but empty stdout → None."""
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            return _completed(cmd, 0)
         if _cmd_is(cmd, "resolve-pane"):
             return _completed(cmd, 0, stdout="   \n")
         raise AssertionError(f"unexpected cmd: {cmd}")
 
     with patch("morning_session.subprocess.run", side_effect=fake_run):
-        pane = morning_session.create_legion_pane()
+        pane = morning_session.resolve_custodes_pane()
     assert pane is None
 
 
@@ -136,18 +123,14 @@ def isolated_morning_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_run_morning_session_survives_stack_enforce_timeout(isolated_morning_dir):
-    """End-to-end: a stack-enforce timeout must NOT abort the morning launch.
-
-    With the enforce timing out but resolve-pane + assert-instance + send-text
+def test_run_morning_session_reaches_active_via_council_seat(isolated_morning_dir):
+    """End-to-end: resolving the council:custodes seat + assert-instance + send-text
     all succeeding AND a live Custodes confirming registration, run_morning_session()
     must reach status="active" — i.e. the Emperor is placed into morning-session
-    mode despite the timeout.
+    mode. No stack-enforce pre-assertion is involved (the legion stack is retired).
     """
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            raise subprocess.TimeoutExpired(cmd, 5)
         if _cmd_is(cmd, "resolve-pane"):
             return _completed(cmd, 0, stdout="%42\n")
         if _cmd_is(cmd, "assert-instance"):
@@ -202,8 +185,6 @@ def test_run_morning_session_marks_failed_when_custodes_never_registers(isolated
     """
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            return _completed(cmd, 0)
         if _cmd_is(cmd, "resolve-pane"):
             return _completed(cmd, 0, stdout="%42\n")
         if _cmd_is(cmd, "assert-instance"):
@@ -256,15 +237,14 @@ def test_run_morning_session_falls_back_when_custodes_pane_unregistered(
 
     This is the 2026-06-15 failure mode: SessionStart registration was lost, so
     tmuxctl assert-instance returned persona_unregistered_live_runtime. The
-    morning launcher must open a fresh legion pane instead of failing closed.
+    morning launcher must dispatch a fresh Custodes (mechanicus:new) instead of
+    failing closed.
     """
 
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        if _cmd_is(cmd, "stack", "enforce"):
-            return _completed(cmd, 0)
         if _cmd_is(cmd, "resolve-pane"):
             return _completed(cmd, 0, stdout="%86\n")
         if _cmd_is(cmd, "assert-instance"):
@@ -321,8 +301,6 @@ def test_run_morning_session_no_pane_fails_gracefully(isolated_morning_dir):
     """If the pane cannot be resolved at all, fail cleanly (no_pane), never raise."""
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            raise subprocess.TimeoutExpired(cmd, 5)
         if _cmd_is(cmd, "resolve-pane"):
             # Even resolve-pane is wedged — graceful degradation, not a crash.
             raise subprocess.TimeoutExpired(cmd, 5)
@@ -356,7 +334,7 @@ def test_run_morning_session_refuses_without_day_start_latch(isolated_morning_di
 
     The legacy phone macro POSTs /api/morning/start directly, bypassing the
     day-start latch. run_morning_session must refuse (status="no_day_start_latch")
-    and never reach create_legion_pane / confirm — no ghost Custodes spawned.
+    and never reach resolve_custodes_pane / confirm — no ghost Custodes spawned.
     """
     create_pane = MagicMock()
     confirm = MagicMock()
@@ -367,7 +345,7 @@ def test_run_morning_session_refuses_without_day_start_latch(isolated_morning_di
         patch("morning_session.get_daily_thread_id", lambda today: "t"),
         patch("morning_session.create_daily_thread", lambda today: "t"),
         patch("morning_session.send_tts", lambda msg: None),
-        patch("morning_session.create_legion_pane", create_pane),
+        patch("morning_session.resolve_custodes_pane", create_pane),
         patch("morning_session.confirm_custodes_registered", confirm),
         patch("nas_mount.ensure_mounted", lambda share, **kw: (True, "ok")),
     ):
@@ -396,7 +374,7 @@ def test_run_morning_session_refuses_non_official_day_start_source(isolated_morn
         patch("morning_session.get_daily_thread_id", lambda today: "t"),
         patch("morning_session.create_daily_thread", lambda today: "t"),
         patch("morning_session.send_tts", lambda msg: None),
-        patch("morning_session.create_legion_pane", create_pane),
+        patch("morning_session.resolve_custodes_pane", create_pane),
         patch("nas_mount.ensure_mounted", lambda share, **kw: (True, "ok")),
     ):
         result = morning_session.run_morning_session()
@@ -412,8 +390,6 @@ def test_run_morning_session_proceeds_with_real_alarm_ack(isolated_morning_dir):
     path that this morning's 11:16 wake exercised."""
 
     def fake_run(cmd, **kwargs):
-        if _cmd_is(cmd, "stack", "enforce"):
-            return _completed(cmd, 0)
         if _cmd_is(cmd, "resolve-pane"):
             return _completed(cmd, 0, stdout="%42\n")
         if _cmd_is(cmd, "assert-instance"):

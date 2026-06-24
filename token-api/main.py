@@ -7297,19 +7297,20 @@ def _golden_throne_accountability_prompt(
     )
 
 
-async def _get_or_create_legion_pane() -> str:
-    """Allocate a managed legion worker pane for an autonomous resume.
+async def _get_or_create_mechanicus_pane() -> str:
+    """Allocate a managed mechanicus worker pane for an autonomous resume.
 
-    Pane allocation is delegated to the typed tmuxctl stack primitive so
-    Custodes remains the left orchestrator and autonomous resume panes file
-    into the right-side legion worker stack.
+    Pane allocation is delegated to the typed tmuxctl stack primitive. The
+    per-fleet legion worker stack was retired into the single shared
+    ``mechanicus`` worker stack, so autonomous resume panes file in behind the
+    Fabricator-General/orchestrator anchors as flat workers.
     """
     tmuxctl = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
     proc = await asyncio.create_subprocess_exec(
         str(tmuxctl),
         "stack",
         "add",
-        "legion",
+        "mechanicus",
         "--session",
         "main",
         "--cwd",
@@ -7320,13 +7321,13 @@ async def _get_or_create_legion_pane() -> str:
     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
     if proc.returncode != 0:
         raise RuntimeError(
-            f"failed to allocate managed legion worker pane: "
+            f"failed to allocate managed mechanicus worker pane: "
             f"{stderr.decode(errors='replace').strip()}"
         )
     pane_id = stdout.decode().strip().splitlines()[0] if stdout.decode().strip() else ""
     if not pane_id:
-        raise RuntimeError("managed legion worker allocation returned empty pane id")
-    logger.info(f"Golden Throne: allocated managed legion worker pane {pane_id}")
+        raise RuntimeError("managed mechanicus worker allocation returned empty pane id")
+    logger.info(f"Golden Throne: allocated managed mechanicus worker pane {pane_id}")
     return pane_id
 
 
@@ -7946,18 +7947,18 @@ async def golden_throne_followup(session_id: str):
                 )
                 logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
         else:
-            # Agent not running — resume into a single managed legion worker pane
-            # via the canonical `dispatch` launcher. dispatch resumes the agent
+            # Agent not running — resume into a single managed mechanicus worker
+            # pane via the canonical `dispatch` launcher. dispatch resumes the agent
             # INTERACTIVELY (no `claude -p`), so tmux automation stays intact and no
             # print-mode redirect host-pane is spawned.
             try:
-                resume_pane = await _get_or_create_legion_pane()
+                resume_pane = await _get_or_create_mechanicus_pane()
                 # Fail closed if allocation returned no pane — dispatching with an
                 # empty --pane target would resume into nowhere (or the wrong pane).
                 if not (resume_pane or "").strip():
                     raise RuntimeError(
                         "Golden Throne resume requires a concrete tmux pane target; "
-                        "legion worker allocation returned empty"
+                        "mechanicus worker allocation returned empty"
                     )
                 # Write SOP to a unique, short-lived temp file (avoids shell escaping
                 # and predictable-path symlink/collision risk); dispatch reads it via
@@ -7987,7 +7988,7 @@ async def golden_throne_followup(session_id: str):
                     {
                         "transport": "dispatch-resume",
                         "target_pane": resume_pane,
-                        "legion_worker_pane": resume_pane,
+                        "mechanicus_worker_pane": resume_pane,
                         "resume_command": resume_result["command"],
                         "returncode": resume_result["returncode"],
                         "stdout": _snippet(resume_result["stdout"]),
@@ -7998,7 +7999,7 @@ async def golden_throne_followup(session_id: str):
                 if resume_result["returncode"] == 0:
                     logger.info(
                         f"Golden Throne: resumed {session_id[:12]} via dispatch in managed "
-                        f"legion worker pane={resume_pane} ({engine}, interactive)"
+                        f"mechanicus worker pane={resume_pane} ({engine}, interactive)"
                     )
                 else:
                     logger.error(
@@ -8634,7 +8635,8 @@ async def _find_custodes_tmux_pane() -> str | None:
     """Recover a live Custodes pane from tmux when DB singleton tracking is stale.
 
     Uses the `@PANE_ID = council:custodes` tmux pane option as the identity signal
-    — set by `_create_custodes_legion_pane` at pane creation. Pane background
+    — set when the fixed council seat is built (`builder.ensure_council_window`).
+    Pane background
     color is an OUTPUT of canonical persona assignment, never an input — keying
     recovery on color creates a circular SoT dependency
     where a missed recolor makes Custodes "disappear" to the dispatcher.
@@ -8679,128 +8681,6 @@ async def _find_custodes_tmux_pane() -> str | None:
     # gate makes the static Custodes pane disappear. Prefer obvious Claude-like
     # runtimes when present, but fall back to the marked live pane.
     return candidates[0] if candidates else (marker_fallbacks[0] if marker_fallbacks else None)
-
-
-async def _create_custodes_legion_pane() -> str | None:
-    """Create or return the fixed Custodes pane in the local legion window."""
-    try:
-        exists = await asyncio.create_subprocess_exec(
-            "tmux",
-            "list-windows",
-            "-t",
-            "main",
-            "-F",
-            "#{window_name}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(exists.communicate(), timeout=5)
-        windows = stdout.decode().splitlines() if exists.returncode == 0 else []
-
-        if "legion" in windows:
-            list_proc = await asyncio.create_subprocess_exec(
-                "tmux",
-                "list-panes",
-                "-t",
-                "main:legion",
-                "-F",
-                "#{pane_id}\t#{@PANE_ID}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            pane_stdout, pane_stderr = await asyncio.wait_for(list_proc.communicate(), timeout=5)
-            if list_proc.returncode != 0:
-                logger.warning(
-                    f"Custodes state hook: could not inspect legion panes: {pane_stderr.decode()[:200]}"
-                )
-                return None
-            first_pane = ""
-            for line in pane_stdout.decode().splitlines():
-                try:
-                    pane_id, pane_role = line.split("\t", 1)
-                except ValueError:
-                    continue
-                first_pane = first_pane or pane_id
-                if pane_role == "council:custodes":
-                    return pane_id
-            if first_pane:
-                tag_proc = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "set-option",
-                    "-p",
-                    "-t",
-                    first_pane,
-                    "@PANE_ID",
-                    "council:custodes",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(tag_proc.communicate(), timeout=5)
-                type_proc = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "set-option",
-                    "-p",
-                    "-t",
-                    first_pane,
-                    "@PANE_TYPE",
-                    "legion",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(type_proc.communicate(), timeout=5)
-                return first_pane
-            return None
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                "tmux",
-                "new-window",
-                "-t",
-                "main",
-                "-n",
-                "legion",
-                "-d",
-                "-P",
-                "-F",
-                "#{pane_id}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        pane_stdout, pane_stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode != 0:
-            logger.warning(
-                f"Custodes state hook: could not create legion pane: {pane_stderr.decode()[:200]}"
-            )
-            return None
-        pane_id = pane_stdout.decode().strip().splitlines()[0]
-
-        tag_proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "set-option",
-            "-p",
-            "-t",
-            pane_id,
-            "@PANE_ID",
-            "council:custodes",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(tag_proc.communicate(), timeout=5)
-        type_proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "set-option",
-            "-p",
-            "-t",
-            pane_id,
-            "@PANE_TYPE",
-            "legion",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(type_proc.communicate(), timeout=5)
-        return pane_id
-    except Exception as exc:
-        logger.warning(f"Custodes state hook: legion pane creation failed: {exc}")
-        return None
 
 
 async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:

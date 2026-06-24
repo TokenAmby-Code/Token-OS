@@ -15,8 +15,8 @@ Usage:
 Pane addressing accepts public ids (``somnium:SE``) or full triples
 (``main:2:SE``). Raw tmux ``%NNN`` ids are internal-only and are never printed
 back. Page names map to tmux window names:
-``palace``, ``somnium``, ``legion``, ``mechanicus``, ``all``, or a window
-index like ``2``.
+``palace``, ``somnium``, ``council``, ``mechanicus``, ``reservists``, ``all``,
+or a window index like ``2``.
 
 Duplicate prevention: a pane targeted by both ``--pane`` and a ``--page``
 that contains it receives the brief once.
@@ -69,7 +69,7 @@ def main(argv: list[str]) -> int:
         "--page",
         action="append",
         default=[],
-        help="Target page/window (repeatable; palace|somnium|legion|mechanicus|all|<index>)",
+        help="Target page/window (repeatable; palace|somnium|council|mechanicus|reservists|all|<index>)",
     )
     parser.add_argument(
         "--ephemeral",

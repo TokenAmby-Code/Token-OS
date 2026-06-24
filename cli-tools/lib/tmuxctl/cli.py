@@ -299,12 +299,14 @@ def build_parser() -> argparse.ArgumentParser:
     stack_subparsers = stack_parser.add_subparsers(dest="stack_command", required=True)
 
     stack_add = stack_subparsers.add_parser("add")
-    stack_add.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
+    stack_add.add_argument("base", help="stack window base: mechanicus, mars, kreig, reservists")
     stack_add.add_argument("--cwd", default=None)
     stack_add.add_argument("--session", default="main")
     stack_add.add_argument("--no-focus", action="store_true")
     stack_dispatch = stack_subparsers.add_parser("dispatch")
-    stack_dispatch.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
+    stack_dispatch.add_argument(
+        "base", help="stack window base: mechanicus, mars, kreig, reservists"
+    )
     stack_dispatch.add_argument("--cwd", default=None)
     stack_dispatch.add_argument("--session", default="main")
     stack_dispatch.add_argument("--command", dest="launch_command", required=True)

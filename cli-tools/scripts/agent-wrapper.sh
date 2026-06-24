@@ -36,7 +36,7 @@ LAUNCHER="${TOKEN_API_LAUNCHER:-${ENGINE_ARG}-wrapper}"
 ENGINE="${TOKEN_API_ENGINE:-$ENGINE_ARG}"
 WORKING_DIR="$(pwd)"
 TMUX_PANE_VALUE="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
-DISPATCH_TARGET_WINDOW="${TOKEN_API_PRINT_REDIRECT_WINDOW:-main:legion}"
+DISPATCH_TARGET_WINDOW="${TOKEN_API_PRINT_REDIRECT_WINDOW:-main:mechanicus}"
 WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(token_wrapper_uuid)}"
 
 is_token_wrapper_file() {
@@ -154,7 +154,7 @@ run_claude() {
     fi
     dispatch_base="${dispatch_base%%(*}"
     case "$dispatch_base" in
-      legion|mechanicus|mars|kreig) ;;
+      mechanicus|mars|kreig|reservists) ;;
       *)
         echo "claude -p redirect target must be a managed stack window, got: $DISPATCH_TARGET_WINDOW" >&2
         exit 1

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # quiet-buster-resume-watch — resume a Codex thread if quiet mode is busted overnight
-# TAGS: token-api, cron, tmux, legion
+# TAGS: token-api, cron, tmux, mechanicus
 # AUDIENCE: agent
 
 set -euo pipefail
@@ -12,7 +12,7 @@ CHECK_AFTER="${QUIET_BUSTER_RESUME_CHECK_AFTER:-}"
 CHECK_UNTIL="${QUIET_BUSTER_RESUME_CHECK_UNTIL:-}"
 FLAG_PATH="${QUIET_BUSTER_RESUME_FLAG:-$HOME/.claude/quiet-buster-resume-fired.flag}"
 TMUX_SESSION="${QUIET_BUSTER_RESUME_TMUX_SESSION:-main}"
-TMUX_WINDOW="${QUIET_BUSTER_RESUME_TMUX_WINDOW:-legion}"
+TMUX_WINDOW="${QUIET_BUSTER_RESUME_TMUX_WINDOW:-mechanicus}"
 
 if [[ -z "$THREAD_ID" ]]; then
   echo "quiet-buster-resume-watch: QUIET_BUSTER_RESUME_THREAD_ID is required" >&2
