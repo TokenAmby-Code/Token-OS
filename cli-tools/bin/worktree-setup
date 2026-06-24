@@ -122,6 +122,53 @@ log_error() {
     echo -e "${RED}✗${NC} $1" >&2
 }
 
+is_token_os_github_remote() {
+    local url="${1%.git}"
+    case "$url" in
+        git@github.com:TokenAmby-Code/Token-OS|\
+        ssh://git@github.com/TokenAmby-Code/Token-OS|\
+        https://github.com/TokenAmby-Code/Token-OS|\
+        http://github.com/TokenAmby-Code/Token-OS)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+remote_url_is_forbidden_worktree_source() {
+    local url="${1%/}"
+    case "$url" in
+        /Volumes/Imperium/token-os.git|file:///Volumes/Imperium/token-os.git|*'#recycle'*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+validate_canonical_remote() {
+    local project="$1" config="$2"
+    CANONICAL_REMOTE="$(git --git-dir="$BARE_REPO" remote get-url origin 2>/dev/null || true)"
+    if [[ -z "$CANONICAL_REMOTE" ]]; then
+        log_error "Bare repo origin remote is empty: $BARE_REPO"
+        log_error "Set origin in $config to the canonical GitHub remote before creating PR-capable worktrees."
+        exit 64
+    fi
+    if remote_url_is_forbidden_worktree_source "$CANONICAL_REMOTE"; then
+        log_error "Refusing canonical remote with dead/quarantined provenance: $CANONICAL_REMOTE"
+        log_error "Expected a live GitHub remote, not the old NAS/recycle Token-OS source."
+        exit 64
+    fi
+    if [[ "$project" == "Token-OS" ]] && ! is_token_os_github_remote "$CANONICAL_REMOTE"; then
+        log_error "Token-OS worktrees must use GitHub origin git@github.com:TokenAmby-Code/Token-OS.git"
+        log_error "Configured bare origin is: $CANONICAL_REMOTE"
+        exit 64
+    fi
+}
+
 # ── Per-branch worktree claim lock (super-workflow Gap 1, D2 — LIVE guard) ──
 # Serializes the (project, branch) create race so two concurrent worktree-setup
 # runs cannot both create/claim the same branch. Prefers flock(1) where present
@@ -199,6 +246,7 @@ load_config() {
         log_error "$BARE_REPO is not a bare git repository"
         exit 1
     fi
+    validate_canonical_remote "$project" "$config"
     # Quarantine guard (incident 2026-06-22): never cut a worktree from a bare in
     # a recycle bin or a dated legacy archive — its commondir would bind into a
     # purge target and the work is silently destroyed when the bin empties.
@@ -433,6 +481,7 @@ echo "════════════════════════�
 echo ""
 echo "  Project:       $PROJECT"
 echo "  Bare repo:     $BARE_REPO"
+echo "  Origin:        $CANONICAL_REMOTE"
 echo "  Branch:        $BRANCH_NAME $(if [[ "$USE_EXISTING_BRANCH" == "true" ]]; then echo "(existing)"; else echo "(new)"; fi)"
 echo "  Worktree:      $WORKTREE_DIR"
 echo "  Secrets from:  $SECRETS_DIR"
@@ -531,6 +580,20 @@ else
     fi
     log_success "Worktree created at $WORKTREE_DIR"
 fi
+
+# Remote provenance guard: worktrees inherit remote config from the common
+# gitdir, so a worktree cut from a recycled/runtime checkout can silently keep a
+# dead NAS origin. Force the checked-out worktree back to the bare repo's
+# canonical origin before any PR-capable agent starts work.
+git -C "$WORKTREE_DIR" remote set-url origin "$CANONICAL_REMOTE"
+git -C "$WORKTREE_DIR" remote add github "$CANONICAL_REMOTE" 2>/dev/null || \
+    git -C "$WORKTREE_DIR" remote set-url github "$CANONICAL_REMOTE"
+if [[ "$PROJECT" == "Token-OS" ]] \
+        && ! git -C "$WORKTREE_DIR" remote get-url origin | grep -Eq 'github\.com[:/]TokenAmby-Code/Token-OS(\.git)?$'; then
+    log_error "Worktree is not PR-capable; expected TokenAmby-Code/Token-OS GitHub remote"
+    exit 64
+fi
+log_success "Verified PR-capable remotes from canonical origin"
 
 # Copy files from secrets dir
 if [[ ${#FILES_TO_COPY[@]} -gt 0 ]]; then

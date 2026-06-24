@@ -38,6 +38,51 @@ warn() { echo -e "${YELLOW}[pr-create]${NC} $1" >&2; }
 error() { echo -e "${RED}[pr-create]${NC} $1" >&2; }
 success() { echo -e "${GREEN}[pr-create]${NC} $1" >&2; }
 
+token_os_github_remote() {
+    local url="${1%.git}"
+    case "$url" in
+        git@github.com:TokenAmby-Code/Token-OS|\
+        ssh://git@github.com/TokenAmby-Code/Token-OS|\
+        https://github.com/TokenAmby-Code/Token-OS|\
+        http://github.com/TokenAmby-Code/Token-OS)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+dead_or_quarantined_remote() {
+    local url="${1%/}"
+    case "$url" in
+        ""|/Volumes/Imperium/token-os.git|file:///Volumes/Imperium/token-os.git|*'#recycle'*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+assert_pr_capable_remote() {
+    local top origin
+    top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    origin="$(git remote get-url origin 2>/dev/null || true)"
+    if [[ "$top" == *"/Token-OS/"* || "$top" == *"/Token-OS" ]]; then
+        if ! token_os_github_remote "$origin"; then
+            error "worktree is not PR-capable; expected TokenAmby-Code/Token-OS GitHub remote"
+            error "origin remote: ${origin:-<missing>}"
+            exit 64
+        fi
+        return 0
+    fi
+    if dead_or_quarantined_remote "$origin"; then
+        error "worktree is not PR-capable; origin remote is missing, dead, or quarantined: ${origin:-<missing>}"
+        exit 64
+    fi
+}
+
 merge_comments_json() {
     local inline_json="$1"
     local issue_json="$2"
@@ -253,6 +298,7 @@ if ! git rev-parse --show-toplevel &>/dev/null; then
     error "Must be run from within a git repository"
     exit 1
 fi
+assert_pr_capable_remote
 
 # Handle --merge mode
 if [[ "$MERGE_MODE" == "true" ]]; then

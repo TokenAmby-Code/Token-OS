@@ -72,13 +72,24 @@ def project(tmp_path: Path) -> dict[str, object]:
 
     write_conf(bare)
 
-    def setup(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    def write_named_conf(
+        project_name: str, bare_path: Path, parent_path: Path | None = None
+    ) -> None:
+        (conf_dir / f"{project_name}.conf").write_text(
+            f"BARE_REPO={bare_path}\n"
+            f"WORKTREE_PARENT={parent_path or parent}\n"
+            f"SECRETS_DIR={secrets}\n"
+        )
+
+    def setup(
+        *args: str, project_name: str = "guardtest", timeout: int = 60
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 str(WORKTREE_SETUP),
                 *args,
                 "--project",
-                "guardtest",
+                project_name,
                 "--no-transplant",
                 "--skip-sync",
             ],
@@ -95,6 +106,7 @@ def project(tmp_path: Path) -> dict[str, object]:
         "env": env,
         "setup": setup,
         "write_conf": write_conf,
+        "write_named_conf": write_named_conf,
         "tmp": tmp_path,
     }
 
@@ -156,3 +168,128 @@ def test_refuses_dated_legacy_archive_bare(project) -> None:
     res = project["setup"]("feature-z")
     assert res.returncode == 64
     assert not (project["parent"] / "wt-feature-z").exists()
+
+
+# ── canonical remote provenance guard ───────────────────────────────────────
+
+
+def test_token_os_github_origin_forces_worktree_origin_and_github(project) -> None:
+    parent = project["home"] / "worktrees" / "Token-OS"
+    project["write_named_conf"]("Token-OS", project["bare"], parent)
+    _git(
+        "--git-dir",
+        str(project["bare"]),
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:TokenAmby-Code/Token-OS.git",
+        env=project["env"],
+    )
+    _git(
+        "--git-dir",
+        str(project["bare"]),
+        "branch",
+        "feature-remote-guard",
+        "main",
+        env=project["env"],
+    )
+
+    res = project["setup"]("feature-remote-guard", "--existing", project_name="Token-OS")
+    assert res.returncode == 0, res.stderr
+    wt = parent / "wt-feature-remote-guard"
+    assert (
+        _git("-C", str(wt), "remote", "get-url", "origin", env=project["env"])
+        == "git@github.com:TokenAmby-Code/Token-OS.git"
+    )
+    assert (
+        _git("-C", str(wt), "remote", "get-url", "github", env=project["env"])
+        == "git@github.com:TokenAmby-Code/Token-OS.git"
+    )
+
+
+def test_token_os_refuses_dead_nas_origin_before_worktree_create(project) -> None:
+    parent = project["home"] / "worktrees" / "Token-OS"
+    project["write_named_conf"]("Token-OS", project["bare"], parent)
+    _git(
+        "--git-dir",
+        str(project["bare"]),
+        "remote",
+        "set-url",
+        "origin",
+        "/Volumes/Imperium/token-os.git",
+        env=project["env"],
+    )
+
+    res = project["setup"]("dead-remote", project_name="Token-OS")
+    assert res.returncode == 64
+    assert "dead" in res.stderr.lower() or "quarantined" in res.stderr.lower()
+    assert not (parent / "wt-dead-remote").exists()
+
+
+def test_token_os_refuses_recycle_origin_before_worktree_create(project) -> None:
+    parent = project["home"] / "worktrees" / "Token-OS"
+    project["write_named_conf"]("Token-OS", project["bare"], parent)
+    _git(
+        "--git-dir",
+        str(project["bare"]),
+        "remote",
+        "set-url",
+        "origin",
+        str(project["tmp"] / "#recycle" / "token-os.git"),
+        env=project["env"],
+    )
+
+    res = project["setup"]("recycle-remote", project_name="Token-OS")
+    assert res.returncode == 64
+    assert "recycle" in res.stderr.lower() or "quarantined" in res.stderr.lower()
+    assert not (parent / "wt-recycle-remote").exists()
+
+
+def test_token_os_refuses_non_token_os_github_origin(project) -> None:
+    parent = project["home"] / "worktrees" / "Token-OS"
+    project["write_named_conf"]("Token-OS", project["bare"], parent)
+    _git(
+        "--git-dir",
+        str(project["bare"]),
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:Someone/Other.git",
+        env=project["env"],
+    )
+
+    res = project["setup"]("wrong-github", project_name="Token-OS")
+    assert res.returncode == 64
+    assert "Token-OS worktrees must use GitHub origin" in res.stderr
+    assert not (parent / "wt-wrong-github").exists()
+
+
+def test_non_token_project_is_not_hardcoded_to_token_os_remote(project) -> None:
+    parent = project["home"] / "worktrees" / "OtherProject"
+    project["write_named_conf"]("OtherProject", project["bare"], parent)
+    _git(
+        "--git-dir",
+        str(project["bare"]),
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:Someone/Other.git",
+        env=project["env"],
+    )
+    _git("--git-dir", str(project["bare"]), "branch", "other-feature", "main", env=project["env"])
+
+    res = project["setup"]("other-feature", "--existing", project_name="OtherProject")
+    assert res.returncode == 0, res.stderr
+    wt = parent / "wt-other-feature"
+    assert (
+        _git("-C", str(wt), "remote", "get-url", "origin", env=project["env"])
+        == "git@github.com:Someone/Other.git"
+    )
+
+
+def test_refuses_missing_bare_origin(project) -> None:
+    _git("--git-dir", str(project["bare"]), "remote", "remove", "origin", env=project["env"])
+
+    res = project["setup"]("missing-remote")
+    assert res.returncode == 64
+    assert "origin remote is empty" in res.stderr

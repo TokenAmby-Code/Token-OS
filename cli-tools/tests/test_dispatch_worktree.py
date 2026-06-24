@@ -300,3 +300,96 @@ def test_stack_dispatch_accepts_noisy_tmuxctl_pane_output(tmp_path: Path) -> Non
     assert res.returncode == 0, res.stderr
     assert "non-canonical id" not in res.stderr
     assert "%88" in rec.read_bytes().decode("utf-8", "replace")
+
+
+def _git(*args: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@dataclass
+class TokenOsWorktreeEnv:
+    home: Path
+    parent: Path
+    worktree: Path
+    base: dict[str, str]
+
+
+@pytest.fixture
+def token_os_worktree_env(tmp_path: Path) -> TokenOsWorktreeEnv:
+    home = tmp_path / "home"
+    parent = home / "worktrees" / "Token-OS"
+    worktree = parent / "wt-remote-guard"
+    conf_dir = home / ".config" / "worktrees"
+    conf_dir.mkdir(parents=True)
+    parent.mkdir(parents=True)
+    worktree.mkdir()
+    bare = tmp_path / "token-os.git"
+    bare.mkdir()
+    secrets = tmp_path / "config"
+    secrets.mkdir()
+    (conf_dir / "Token-OS.conf").write_text(
+        f"BARE_REPO={bare}\nWORKTREE_PARENT={parent}\nSECRETS_DIR={secrets}\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["GIT_AUTHOR_NAME"] = "t"
+    env["GIT_AUTHOR_EMAIL"] = "t@t"
+    env["GIT_COMMITTER_NAME"] = "t"
+    env["GIT_COMMITTER_EMAIL"] = "t@t"
+    _git("init", "-b", "remote-guard", str(worktree), env=env)
+    return TokenOsWorktreeEnv(home=home, parent=parent, worktree=worktree, base=env)
+
+
+def _run_token_os_worktree(env: TokenOsWorktreeEnv, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--dir", str(env.worktree), *args],
+        env=env.base,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_dispatch_worktree_refuses_dead_token_os_origin(
+    token_os_worktree_env: TokenOsWorktreeEnv,
+) -> None:
+    _git(
+        "-C",
+        str(token_os_worktree_env.worktree),
+        "remote",
+        "add",
+        "origin",
+        "/Volumes/Imperium/token-os.git",
+        env=token_os_worktree_env.base,
+    )
+
+    res = _run_token_os_worktree(token_os_worktree_env, "--worktree", "remote-guard", "do it")
+    assert res.returncode == 64
+    assert "worktree is not PR-capable" in res.stderr
+    assert "TokenAmby-Code/Token-OS" in res.stderr
+
+
+def test_dispatch_worktree_accepts_token_os_github_origin(
+    token_os_worktree_env: TokenOsWorktreeEnv,
+) -> None:
+    _git(
+        "-C",
+        str(token_os_worktree_env.worktree),
+        "remote",
+        "add",
+        "origin",
+        "git@github.com:TokenAmby-Code/Token-OS.git",
+        env=token_os_worktree_env.base,
+    )
+
+    res = _run_token_os_worktree(token_os_worktree_env, "--worktree", "remote-guard", "do it")
+    assert res.returncode == 0, res.stderr
+    assert "already isolated worktree" in _worktree_line(res.stdout)
