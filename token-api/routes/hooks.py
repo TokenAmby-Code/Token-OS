@@ -10,6 +10,7 @@ Uses dependency injection from main.py for runtime-owned callbacks.
 """
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -6718,6 +6719,39 @@ async def prune_hook_subscriptions(request: HookPruneRequest) -> dict:
 
 
 # Hook dispatcher endpoint
+# Running tally of critical-hook (SessionStart) registration failures by cause,
+# so we can confirm how material each drop source is. Pairs with the client-side
+# tally in cli-tools/lib/agent-wrapper-common.sh: conn-refused/timeout are tagged
+# THERE (the request never reached the server — restart window / hung accept);
+# what reaches this handler and still fails is the fd-burst path (EMFILE) or a
+# lock/other server-side failure. This distinguishes the restart-window drops
+# (which socket activation + graceful drain target) from the EMFILE path (which
+# the fd-limit bump band-aids) — see the OPEN_PROBLEMS note on fd bursts.
+_SESSION_START_FAILURE_CAUSES: dict[str, int] = {}
+
+
+def _classify_session_start_failure(exc: BaseException) -> str:
+    """Coarse cause tag for a failed SessionStart registration write.
+
+    EMFILE is the signal we most want to isolate (fd exhaustion under burst);
+    everything else collapses to db-locked vs other. conn-refused / timeout do
+    not appear here — those mean the POST never landed and are tagged client-side.
+    """
+    err: BaseException | None = exc
+    while err is not None:
+        if isinstance(err, OSError) and err.errno == errno.EMFILE:
+            return "emfile"
+        err = err.__cause__ or err.__context__
+    msg = str(exc).lower()
+    if "too many open files" in msg:
+        return "emfile"
+    if "database is locked" in msg:
+        return "db-locked"
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    return "other"
+
+
 @router.post("/api/hooks/{action_type}")
 async def dispatch_hook(action_type: str, payload: dict, request: Request) -> dict:
     """
@@ -6768,15 +6802,28 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
         return await handler(payload)
     except Exception as e:
         logger.error(f"Hook handler error ({normalized_action_type}): {e}")
-        try:
-            await log_event(
-                "hook_error",
-                details={
-                    "action_type": normalized_action_type,
-                    "raw_action_type": action_type,
-                    "error": str(e),
-                },
+
+        # Tag + count the failure cause on the critical SessionStart path so we
+        # can quantify which drop source is material (EMFILE fd-burst vs other).
+        cause = None
+        if normalized_action_type == "SessionStart":
+            cause = _classify_session_start_failure(e)
+            _SESSION_START_FAILURE_CAUSES[cause] = _SESSION_START_FAILURE_CAUSES.get(cause, 0) + 1
+            logger.warning(
+                "Hook: SessionStart registration failed cause=%s tally=%s",
+                cause,
+                dict(_SESSION_START_FAILURE_CAUSES),
             )
+
+        try:
+            details: dict[str, Any] = {
+                "action_type": normalized_action_type,
+                "raw_action_type": action_type,
+                "error": str(e),
+            }
+            if cause is not None:
+                details["cause"] = cause
+            await log_event("hook_error", details=details)
         except Exception:  # noqa: BLE001 — event log shares the DB; never mask the real failure
             pass
 
@@ -6787,6 +6834,6 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
         if normalized_action_type == "SessionStart":
             raise HTTPException(
                 status_code=503,
-                detail=f"SessionStart registration write failed: {e}",
+                detail=f"SessionStart registration write failed [{cause}]: {e}",
             ) from e
         return {"success": False, "action": "handler_error", "error": str(e)}

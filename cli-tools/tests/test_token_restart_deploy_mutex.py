@@ -14,7 +14,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from test_token_restart_smart_deploy import KICK_TOKENAPI, _run, _stub_env
+from test_token_restart_smart_deploy import RESTART_TOKENAPI, _run, _stub_env
 
 
 def _lockdir(tmp_path: Path) -> Path:
@@ -38,7 +38,7 @@ def test_contender_queues_and_bows_out_when_holder_is_live(tmp_path: Path) -> No
         assert proc.returncode == 0, proc.stderr
         assert "deploy already in progress" in proc.stdout
         assert (lockdir / "redeploy-pending").exists(), "must queue a trailing re-sync"
-        assert KICK_TOKENAPI not in logfile.read_text(), "contender must not deploy"
+        assert RESTART_TOKENAPI not in logfile.read_text(), "contender must not deploy"
         assert (lockdir / "owner").exists(), "contender must not steal the live lock"
     finally:
         holder.terminate()
@@ -60,14 +60,15 @@ def test_stale_lock_from_dead_pid_is_reclaimed(tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "reclaiming stale lock" in proc.stderr
-    assert KICK_TOKENAPI in logfile.read_text(), "reclaiming deploy must proceed"
+    assert RESTART_TOKENAPI in logfile.read_text(), "reclaiming deploy must proceed"
     assert not lockdir.exists(), "mutex released after the deploy"
 
 
 def _launchctl_touches_pending_once(tmp_path: Path, logfile: Path, lockdir: Path) -> None:
-    """Rewrite the launchctl stub so the FIRST kickstart (during the PRIMARY
-    deploy's restart_mac) drops a redeploy-pending sentinel — simulating a
-    contender that queued a trailing re-sync mid-deploy — and never again."""
+    """Rewrite the launchctl stub so the FIRST launchctl call (the pid query at
+    the start of the PRIMARY deploy's restart_mac) drops a redeploy-pending
+    sentinel — simulating a contender that queued a trailing re-sync mid-deploy —
+    and never again."""
     launchctl = tmp_path / "stubbin" / "launchctl"
     launchctl.write_text(
         f"""#!/usr/bin/env bash
@@ -129,6 +130,6 @@ def test_single_deploy_acquires_and_releases_cleanly(tmp_path: Path) -> None:
     proc = _run(env)
 
     assert proc.returncode == 0, proc.stderr
-    assert KICK_TOKENAPI in logfile.read_text()
+    assert RESTART_TOKENAPI in logfile.read_text()
     assert "deploy already in progress" not in proc.stdout
     assert not lockdir.exists(), "mutex must be released on a clean exit"

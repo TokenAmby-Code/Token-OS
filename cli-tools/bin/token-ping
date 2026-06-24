@@ -72,7 +72,13 @@ def ensure_server(skip=False):
         sys.exit(1)
 
     print(color("Server not responding, restarting...", YELLOW), file=sys.stderr)
-    subprocess.run(["pkill", "-f", "uvicorn.*7777"], capture_output=True)
+    # token-api runs under launchd as `python main.py` (socket-activated), so the
+    # old `pkill -f uvicorn.*7777` pattern no longer matches the process. Restart
+    # via launchd, which relaunches onto the retained, launchd-owned socket.
+    subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/ai.openclaw.tokenapi"],
+        capture_output=True,
+    )
     time.sleep(2)
 
     for i in range(10):
