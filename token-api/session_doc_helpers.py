@@ -21,14 +21,17 @@ from typing import Any
 import aiosqlite
 import yaml
 
+from billable import WorkClass, classify_work_class
 from pane_surface import is_placeholder_tab_name
 from personas import resolve_persona
 
 logger = logging.getLogger(__name__)
 
-# The live Obsidian vault. Tests MUST NOT write here; the chokepoint guard below
-# hard-fails any session-doc creation that targets this tree while under pytest.
+# The live Obsidian vaults. Tests MUST NOT write here; the chokepoint guard below
+# hard-fails any session-doc creation that targets either tree while under pytest.
+# Imperium = personal-infra vault; Pax-ENV = civic (day-job / askCivic) vault.
 LIVE_VAULT_ROOT = Path("/Volumes/Imperium/Imperium-ENV")
+LIVE_CIVIC_VAULT_ROOT = Path("/Volumes/Civic/Pax-ENV")
 
 OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
 
@@ -50,6 +53,39 @@ def vault_root() -> Path:
     return imperium / "Imperium-ENV"
 
 
+def civic_vault_root() -> Path:
+    """Resolve the civic (Pax-ENV) vault root at CALL time — mirrors vault_root().
+
+    Civic / askCivic day-job work binds its session docs under the Pax-ENV vault
+    (``/Volumes/Civic/Pax-ENV``), NOT the personal Imperium vault. Read the
+    environment on each call (never frozen at import) so the isolation fixture can
+    redirect civic writes to a temp dir via ``CIVIC_ENV``.
+    """
+    env = os.environ.get("CIVIC_ENV")
+    if env:
+        return Path(env)
+    civic = Path(os.environ.get("CIVIC", "/Volumes/Civic"))
+    if not civic.exists():
+        civic = Path.home()
+    return civic / "Pax-ENV"
+
+
+def vault_root_for(working_dir: str | None = None, legion: str | None = None) -> Path:
+    """Route to the vault that owns this work-class.
+
+    Civic (BILLABLE) work — askCivic worktrees, ``/Volumes/Civic``, legion
+    ``civic``/``pax`` — binds under Pax-ENV; everything else (PERSONAL **and**
+    UNKNOWN) binds under Imperium. Keying on UNKNOWN→Imperium preserves the
+    pre-existing mono-vault behavior for any launch we cannot confidently place.
+
+    Routing keys on work-class (``working_dir`` + ``legion``), never on
+    ``koronus:*`` pane labels, so it survives the council pane migration.
+    """
+    if classify_work_class(working_dir, legion) == WorkClass.BILLABLE:
+        return civic_vault_root()
+    return vault_root()
+
+
 def terra_sessions_dir() -> Path:
     return vault_root() / "Terra" / "Sessions"
 
@@ -58,8 +94,23 @@ def mars_sessions_dir() -> Path:
     return vault_root() / "Mars" / "Sessions"
 
 
-def daily_notes_dir() -> Path:
+def daily_notes_dir_for(working_dir: str | None = None, legion: str | None = None) -> Path:
+    """Daily-notes dir for this work-class.
+
+    Civic daily notes live at ``Pax-ENV/Journal/Daily`` (no ``Terra/`` segment,
+    created by ``morning_session.py``); Imperium daily notes live at
+    ``Terra/Journal/Daily``. Structural divergence is intentional — see
+    ``create_daily_note_file``.
+    """
+    if classify_work_class(working_dir, legion) == WorkClass.BILLABLE:
+        return civic_vault_root() / "Journal" / "Daily"
     return vault_root() / "Terra" / "Journal" / "Daily"
+
+
+def daily_notes_dir() -> Path:
+    # One source of truth — the no-arg (Imperium) case of daily_notes_dir_for.
+    # Still referenced by tests/test_vault_isolation.py.
+    return daily_notes_dir_for()
 
 
 def _assert_not_live_vault(path: Path) -> None:
@@ -74,12 +125,13 @@ def _assert_not_live_vault(path: Path) -> None:
         resolved = path.resolve()
     except OSError:
         resolved = path
-    if resolved == LIVE_VAULT_ROOT or LIVE_VAULT_ROOT in resolved.parents:
-        raise RuntimeError(
-            f"Test attempted to write a session doc into the LIVE vault: {resolved}. "
-            "Tests must target an isolated vault (the autouse isolate_vault fixture "
-            "sets IMPERIUM_ENV to a temp dir)."
-        )
+    for live_root in (LIVE_VAULT_ROOT, LIVE_CIVIC_VAULT_ROOT):
+        if resolved == live_root or live_root in resolved.parents:
+            raise RuntimeError(
+                f"Test attempted to write a session doc into the LIVE vault: {resolved}. "
+                "Tests must target an isolated vault (the autouse isolate_vault fixture "
+                "sets IMPERIUM_ENV and CIVIC_ENV to temp dirs)."
+            )
 
 
 class _ObsidianDumper(yaml.SafeDumper):
@@ -1383,44 +1435,83 @@ async def resolve_today_daily_note_session_doc(db, date_str: str | None = None) 
     return await resolve_or_create_session_doc_for_path(db, daily_notes_dir() / f"{date_str}.md")
 
 
-def create_daily_note_file(file_path: Path, date_str: str, doc_id: int) -> None:
-    """Create the Custodes daily-note home on demand.
+def create_daily_note_file(
+    file_path: Path, date_str: str, doc_id: int, *, civic: bool = False
+) -> None:
+    """Create a daily-note home on demand (Custodes/Imperium or civic/Pax-ENV).
 
-    Custodes continuity is daily-note backed, not an interactive session-doc
+    Daily-note continuity is note-backed, not an interactive session-doc
     placeholder.  Keep the shape intentionally plain so existing journal notes
     remain valid Obsidian daily notes while still carrying session_doc_id for
     Token-API binding.
+
+    Two shapes — a single chokepoint with a ``civic`` flag rather than a forked
+    function, so the live-vault tripwire below guards both vaults at one place:
+
+    - Imperium (``civic=False``): ``type: daily-note`` + ``legion: custodes`` +
+      ``agents`` roster (the Custodes shape).
+    - Civic (``civic=True``): the minimal Pax-ENV shape ``type: daily`` +
+      ``tags: ["daily","civic"]``, NO ``legion``/``agents`` — matches what
+      ``morning_session.py`` writes. This is the rare fallback; normally the
+      morning note already exists and is merely backfilled with session_doc_id.
     """
+    _assert_not_live_vault(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    fm: dict[str, Any] = {
-        "session_doc_id": doc_id,
-        "created": date_str,
-        "date": date_str,
-        "type": "daily-note",
-        "status": "active",
-        "legion": "custodes",
-        "agents": [],  # append-only launch roster (see _update_doc_agents_list)
-    }
-    body = f"# {date_str}\n\n## Custodes\n\n## Log\n"
+    if civic:
+        fm: dict[str, Any] = {
+            "session_doc_id": doc_id,
+            "title": date_str,
+            "created": date_str,
+            "date": date_str,
+            "type": "daily",
+            "status": "active",
+            "tags": ["daily", "civic"],
+        }
+        body = f"# {date_str}\n\n## Log\n"
+    else:
+        fm = {
+            "session_doc_id": doc_id,
+            "created": date_str,
+            "date": date_str,
+            "type": "daily-note",
+            "status": "active",
+            "legion": "custodes",
+            "agents": [],  # append-only launch roster (see _update_doc_agents_list)
+        }
+        body = f"# {date_str}\n\n## Custodes\n\n## Log\n"
     file_path.write_text(serialize_frontmatter(fm, body), encoding="utf-8")
 
 
-async def resolve_or_create_today_daily_note_session_doc(db, date_str: str | None = None) -> int:
-    """Return today's Custodes daily note, creating note and DB row if absent."""
+async def resolve_or_create_today_daily_note_session_doc(
+    db,
+    date_str: str | None = None,
+    *,
+    working_dir: str | None = None,
+    legion: str | None = None,
+) -> int:
+    """Return today's daily note, creating note and DB row if absent.
+
+    Routes by work-class: civic (askCivic worktree / legion civic|pax) binds the
+    Pax-ENV daily note; everything else binds the Imperium Custodes daily note.
+    New params are optional + default Imperium so the no-arg caller (the Custodes
+    midnight rebind in ``routes/day_start.py``) is unchanged.
+    """
     date_str = date_str or datetime.now().strftime("%Y-%m-%d")
-    fp = (daily_notes_dir() / f"{date_str}.md").resolve()
+    is_civic = classify_work_class(working_dir, legion) == WorkClass.BILLABLE
+    fp = (daily_notes_dir_for(working_dir, legion) / f"{date_str}.md").resolve()
     existing = await resolve_or_create_session_doc_for_path(db, fp)
     if existing:
         return existing
 
     now_ts = datetime.now().isoformat()
+    project = "Pax Daily Note" if is_civic else "Custodes Daily Note"
     cursor = await db.execute(
         """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
            VALUES (?, ?, ?, 'active', ?, ?)""",
-        (date_str, str(fp), "Custodes Daily Note", now_ts, now_ts),
+        (date_str, str(fp), project, now_ts, now_ts),
     )
     doc_id = int(cursor.lastrowid)
-    await asyncio.to_thread(create_daily_note_file, fp, date_str, doc_id)
+    await asyncio.to_thread(create_daily_note_file, fp, date_str, doc_id, civic=is_civic)
     return doc_id
 
 
@@ -1465,13 +1556,23 @@ async def resolve_session_doc_for_start(
             continue
         persona = await resolve_persona(db, candidate)
         if persona and persona.get("default_session_doc") == "daily_note":
-            doc_id = await resolve_or_create_today_daily_note_session_doc(db)
+            # Civic seats (pax/orchestrator, legion=civic) bind the Pax-ENV daily
+            # note; Custodes/FG/Admin with a personal cwd stay Imperium. Routing is
+            # by work-class, so it survives the koronus→council pane migration.
+            doc_id = await resolve_or_create_today_daily_note_session_doc(
+                db, working_dir=working_dir, legion=legion
+            )
             return doc_id, "daily_note"
 
     if dispatch_session_doc_path:
         fp = Path(dispatch_session_doc_path)
         if not fp.is_absolute():
-            fp = vault_root() / dispatch_session_doc_path
+            # Route a vault-relative dispatch path to the vault that owns this
+            # work-class: a civic worker (askCivic worktree / legion civic|pax)
+            # records "Sessions/<file>.md" but the file lives under Pax-ENV, not
+            # Imperium. Absolute dispatch paths short-circuit above and skip
+            # routing entirely.
+            fp = vault_root_for(working_dir, legion) / dispatch_session_doc_path
         doc_id = await resolve_or_create_session_doc_for_path(db, fp)
         if doc_id:
             return doc_id, "dispatch_explicit"

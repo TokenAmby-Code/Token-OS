@@ -249,6 +249,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         None,
         None,
         None,  # tts_voice, tts_rate, notification_sound (silent seat)
+        default_session_doc="daily_note",  # bind today's Pax-ENV daily note
     ),
     PersonaSeed(
         "orchestrator",
@@ -261,6 +262,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         None,
         None,
         None,  # tts_voice, tts_rate, notification_sound (silent seat)
+        default_session_doc="daily_note",  # bind today's Pax-ENV daily note
     ),
 )
 
