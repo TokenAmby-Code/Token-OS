@@ -337,6 +337,9 @@ def isolate_vault(tmp_path, monkeypatch):
     # this fully isolates the vault. Do NOT override IMPERIUM here — it also drives
     # runtime-path resolution (cli-tools imperium config) unrelated to the vault.
     monkeypatch.setenv("IMPERIUM_ENV", str(vault))
+    # Isolate the civic (Pax-ENV) vault too: civic_vault_root() checks CIVIC_ENV
+    # first, so civic session-doc writes land in the temp dir, never /Volumes/Civic.
+    monkeypatch.setenv("CIVIC_ENV", str(tmp_path / "Pax-ENV"))
     return vault
 
 
@@ -345,6 +348,7 @@ def app_env(tmp_path, monkeypatch):
     db_path = tmp_path / "agents.db"
     monkeypatch.setenv("TOKEN_API_DB", str(db_path))
     monkeypatch.setenv("IMPERIUM_ENV", str(tmp_path / "Imperium-ENV"))
+    monkeypatch.setenv("CIVIC_ENV", str(tmp_path / "Pax-ENV"))
     # Isolate morning-session state from the real /tmp so the keepalive gate and
     # morning/end endpoint operate on a per-test directory.
     monkeypatch.setenv("CUSTODES_MORNING_DIR", str(tmp_path / "custodes_morning"))
