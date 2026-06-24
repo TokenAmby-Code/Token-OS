@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# tmuxctld-ctl - Manage the tmuxctld HTTP-loopback daemon (launchd-supervised)
+# TAGS: tmux, daemon
+# AUDIENCE: human, agent
+#
+# Usage: tmuxctld-ctl <status|health|logs>          # read-only inspection
+#        tmuxctld-ctl <start|restart|stop>          # delegate to launchd
+#        tmuxctld-ctl install                       # sync plist + (re)bootstrap
+#
+# The daemon exposes a local HTTP API on 127.0.0.1:7778 and is launchd-supervised
+# (ai.tokenclaw.tmuxctld, KeepAlive). It NEVER spawns the daemon directly — the
+# only safe lifecycle is `launchctl kickstart -k` / `bootout` (the split-brain
+# lesson discord-daemon encodes: a second nohup'd daemon races launchd for the
+# port). start/restart == `launchctl kickstart -k`; stop == `bootout`.
+
+set -euo pipefail
+
+LABEL="ai.tokenclaw.tmuxctld"
+# Loopback endpoint; overridable via TMUXCTLD_URL (same env the token-api client
+# reads) so the URL is not duplicated/drifting against the plist's bind port.
+DAEMON_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+PLIST_NAME="${LABEL}.plist"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SRC_PLIST="${SCRIPT_DIR}/../launchd/${PLIST_NAME}"
+DST_PLIST="${HOME}/Library/LaunchAgents/${PLIST_NAME}"
+STDOUT_LOG="${HOME}/.claude/tmuxctld-stdout.log"
+STDERR_LOG="${HOME}/.claude/tmuxctld-stderr.log"
+DOMAIN="gui/$(id -u)"
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+cmd_start() {
+  echo "Kickstarting ${LABEL} (launchd; starts if down, restarts if up)..."
+  launchctl kickstart -k "${DOMAIN}/${LABEL}" \
+    && echo "Kickstarted." \
+    || die "kickstart failed (is the plist bootstrapped? run: tmuxctld-ctl install)"
+}
+
+cmd_restart() { cmd_start; }
+
+cmd_stop() {
+  echo "Stopping launchd-supervised tmuxctld (${LABEL})..."
+  echo "(bootout disables KeepAlive — stays down until 'tmuxctld-ctl start')"
+  if launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null; then
+    echo "Daemon stopped."
+  else
+    echo "Daemon already stopped or not loaded."
+  fi
+}
+
+cmd_install() {
+  [[ -f "$SRC_PLIST" ]] || die "source plist not found: $SRC_PLIST"
+  mkdir -p "$(dirname "$DST_PLIST")"
+  cp "$SRC_PLIST" "$DST_PLIST"
+  echo "Installed plist -> $DST_PLIST"
+  # Re-bootstrap: bootout (ignore if absent) then bootstrap the fresh copy.
+  launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+  if launchctl bootstrap "$DOMAIN" "$DST_PLIST"; then
+    echo "Bootstrapped ${LABEL}."
+  else
+    die "bootstrap failed for $DST_PLIST"
+  fi
+}
+
+cmd_health() {
+  if command -v jq >/dev/null 2>&1; then
+    curl -sf "${DAEMON_URL}/health" 2>/dev/null | jq . \
+      || die "health endpoint not responding on ${DAEMON_URL}"
+  else
+    curl -sf "${DAEMON_URL}/health" 2>/dev/null \
+      || die "health endpoint not responding on ${DAEMON_URL}"
+    echo
+  fi
+}
+
+cmd_status() {
+  if launchctl print "${DOMAIN}/${LABEL}" >/dev/null 2>&1; then
+    echo "launchd: loaded (${LABEL})"
+  else
+    echo "launchd: not loaded (run: tmuxctld-ctl install)"
+  fi
+  if curl -sf "${DAEMON_URL}/health" >/dev/null 2>&1; then
+    echo "HTTP: responding on ${DAEMON_URL}"
+    cmd_health
+  else
+    echo "HTTP: not responding on ${DAEMON_URL}"
+    exit 1
+  fi
+}
+
+cmd_logs() {
+  local which="${1:-out}"
+  local log_file="$STDOUT_LOG"
+  [[ "$which" == "err" || "$which" == "stderr" ]] && log_file="$STDERR_LOG"
+  [[ -f "$log_file" ]] || die "no log file: $log_file"
+  if [[ "${2:-}" == "-f" || "${2:-}" == "--follow" ]]; then
+    tail -f "$log_file"
+  else
+    tail -"${2:-50}" "$log_file"
+  fi
+}
+
+[[ $# -eq 0 ]] && {
+  echo "Usage: tmuxctld-ctl <status|health|logs|start|restart|stop|install>"
+  exit 1
+}
+
+case "$1" in
+  start)   cmd_start ;;
+  restart) cmd_restart ;;
+  stop)    cmd_stop ;;
+  install) cmd_install ;;
+  health)  cmd_health ;;
+  status)  cmd_status ;;
+  logs)    shift; cmd_logs "$@" ;;
+  -h|--help)
+    echo "Usage: tmuxctld-ctl <status|health|logs|start|restart|stop|install>"
+    echo "  status, health, logs   read-only inspection"
+    echo "  start, restart         -> launchctl kickstart -k (launchd, authoritative)"
+    echo "  stop                   -> launchctl bootout (disables KeepAlive)"
+    echo "  install                -> cp plist + bootout/bootstrap"
+    exit 0 ;;
+  *) die "Unknown command: $1" ;;
+esac

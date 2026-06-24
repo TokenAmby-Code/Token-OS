@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# tmuxctld — entrypoint for the standalone HTTP-loopback tmux control-plane daemon.
+#
+# Near-clone of `tmuxctl`: same interpreter probe + PYTHONPATH=.../lib, but execs
+# the daemon module instead of the CLI. This script is the SINGLE SOURCE OF TRUTH
+# for the interpreter the launchd plist invokes (the plist ProgramArguments point
+# at this file in the runtime checkout). Stdlib only — no venv.
+set -euo pipefail
+_LIB_DIR="$(cd "$(dirname "$(readlink -f "$0")")/../lib" && pwd)"
+
+tmuxctl_python() {
+    local candidate
+    for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'from datetime import UTC' >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    echo "tmuxctld requires Python 3.11+" >&2
+    return 1
+}
+
+PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec "$(tmuxctl_python)" -m tmuxctl.daemon "$@"
