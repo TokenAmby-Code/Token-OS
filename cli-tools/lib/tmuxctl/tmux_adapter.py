@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import os
@@ -234,6 +235,11 @@ class TmuxAdapter:
     def __init__(self, tmux_binary: str | None = None) -> None:
         self.tmux_binary = tmux_binary or _tmux_binary()
         self._resolving_targets = False
+        # When set, custom pane-target resolution snapshots THIS session instead
+        # of the ambient current_session_name(). The restart executor pins it to
+        # the freshly rebuilt session for the resume loop, whose generic run()
+        # interception path cannot otherwise carry an explicit session argument.
+        self.pinned_resolution_session: str | None = None
         # Last structured suppression result from the universal send gate, for
         # callers/tests that want to inspect why a send was a silent no-op.
         self.last_send_gate_result: dict | None = None
@@ -470,6 +476,25 @@ class TmuxAdapter:
 
     def current_session_name(self) -> str:
         return self.run("display-message", "-p", "#{session_name}").strip()
+
+    @contextlib.contextmanager
+    def pin_resolution_session(self, session_name: str):
+        """Pin custom-target resolution to an explicit session for the duration.
+
+        During ``tx restart`` the executor runs detached after parking clients
+        into ``_stash`` and killing the old leader, so the target-less
+        ``current_session_name()`` no longer returns the rebuilt session. Pinning
+        routes every public-label resolution — including the generic ``run()``
+        interception path (``display-message``/``capture-pane``/``send-keys`` on
+        a label) that cannot take a session argument — at the freshly built
+        session instead of the wrong ambient one. Restores the prior pin on exit.
+        """
+        previous = self.pinned_resolution_session
+        self.pinned_resolution_session = session_name
+        try:
+            yield
+        finally:
+            self.pinned_resolution_session = previous
 
     def list_windows(self, session_name: str) -> list[dict[str, str]]:
         fmt = "#{session_name}\t#{window_index}\t#{window_name}"
