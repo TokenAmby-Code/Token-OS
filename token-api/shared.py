@@ -573,8 +573,8 @@ async def apply_instance_pane_tint(
 
 
 # ── Engine-agnostic pushed statusline @-vars ──
-# The pane-border nametag reads pushed @-vars only (zero #() shell-outs, zero
-# per-pane polling — the 2026-06-05 freeze lesson). Every field sources from the
+# Pushed tmux @-vars use zero #() shell-outs and zero per-pane polling — the
+# 2026-06-05 freeze lesson. Values source from the
 # engine-agnostic ``instances`` table via the existing pane_state_queue → 1s
 # pane_state_worker → ``tmux set-option -p`` path, so Claude and Codex panes light
 # up identically (only ``instances.engine`` distinguishes them, and nothing here
@@ -583,7 +583,7 @@ async def apply_instance_pane_tint(
 
 
 def cwd_basename(working_dir: str | None) -> str:
-    """Basename of an instance working_dir for the @CWD nametag field.
+    """Basename of an instance working_dir for the @CWD status field.
 
     Trailing slashes are stripped first so ``/a/b/`` → ``b`` (not ``""``). Root
     ``/`` and empty/None collapse to ``""`` — the border treats "" as unset and
@@ -627,9 +627,9 @@ async def queue_pane_var(
 
     Mirrors the trigger INSERTs (``trg_tab_name_pane_state`` etc.) so the single 1s
     ``pane_state_worker`` stays the only writer of pane options. ``value`` is coerced
-    to "" when None so the NOT NULL ``value`` column never aborts the insert; the
-    border treats "" as unset (the ``#{?@VAR,…,}`` conditional renders the empty
-    branch). The caller's transaction owns the commit. No pane id is stored — the
+    to "" when None so the NOT NULL ``value`` column never aborts the insert;
+    consumers treat "" as unset (``#{?@VAR,…,}`` conditionals render empty
+    branches). The caller's transaction owns the commit. No pane id is stored — the
     worker re-resolves the live pane from ``instance_id`` per drain.
     """
     await db.execute(
@@ -642,7 +642,7 @@ async def queue_pane_var(
 async def push_agnostic_pane_vars(
     db: "aiosqlite.Connection", instance_id: str | None
 ) -> dict[str, str]:
-    """Resolve + enqueue the engine-agnostic nametag vars from the canonical row.
+    """Resolve + enqueue engine-agnostic statusline identity vars from the canonical row.
 
     Reads ``persona_id``/``session_doc_id``/``working_dir`` from the freshly-written
     ``instances`` row (uncommitted writes on the same connection are visible) and

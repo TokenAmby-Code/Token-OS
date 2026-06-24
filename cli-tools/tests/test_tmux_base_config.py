@@ -170,6 +170,32 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
 
 
+def test_pane_border_never_renders_identity_nametag() -> None:
+    """Pane border nametag must not show persona, instance name, or pane_title.
+
+    Persona display remains available through @PERSONA for statusline consumers,
+    and @PANE_LABEL is still pushed for compatibility/debugging, but the border
+    does not read either. No fallback hostname/title is allowed either.
+    """
+    border = _line_starting("set -g pane-border-format ")
+    assert "@PERSONA" not in border
+    assert "@PANE_LABEL" not in border
+    assert "pane_title" not in border
+    assert "@PANE_TITLE_SUPPRESS" not in border
+    for expected in (
+        "@GUARD",
+        "@OPS_SELECTED",
+        "@GT_FIRE",
+        "@DISCORD_VOICE_PROCESSING",
+        "@DISCORD_VOICE_LOCK",
+        "@TTS_STATE",
+        "@CC_STATE",
+        "@SESSION_DOC",
+        "@CWD",
+    ):
+        assert expected in border
+
+
 def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> None:
     """The root-table any-key binding is the sole arming surface for the
     keystroke-anchored typing lock. It must:
