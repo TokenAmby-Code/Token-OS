@@ -179,7 +179,42 @@ run_claude() {
   trap cleanup_common EXIT INT TERM HUP
   token_wrapper_start
   export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
-  run_engine_binary claude "$@" 2> >(grep -v 'Overriding existing handler for signal' >&2)
+
+  # Bake the rank+persona system-doc staple into claude's system prompt. This is
+  # the single injection point for every Claude launch surface (workers +
+  # singletons). We MERGE with any --append-system-prompt the caller already
+  # passed (collect their values, re-emit one combined flag) and leave
+  # --system-prompt untouched, so the staple layers under both rather than
+  # dropping a caller-supplied prompt.
+  local wrapper_system_text caller_append="" expect_append=0 carg
+  local -a claude_argv=()
+  wrapper_system_text="$(token_wrapper_compose_system_text || true)"
+  for carg in "$@"; do
+    if [[ "$expect_append" -eq 1 ]]; then
+      expect_append=0
+      caller_append+="${caller_append:+$'\n\n'}$carg"
+      continue
+    fi
+    case "$carg" in
+      --append-system-prompt)
+        expect_append=1
+        ;;
+      --append-system-prompt=*)
+        caller_append+="${caller_append:+$'\n\n'}${carg#--append-system-prompt=}"
+        ;;
+      *)
+        claude_argv+=("$carg")
+        ;;
+    esac
+  done
+  local final_append=""
+  [[ -n "$wrapper_system_text" ]] && final_append="$wrapper_system_text"
+  if [[ -n "$caller_append" ]]; then
+    final_append="${final_append:+$final_append$'\n\n'}$caller_append"
+  fi
+  [[ -n "$final_append" ]] && claude_argv+=(--append-system-prompt "$final_append")
+
+  run_engine_binary claude ${claude_argv[@]+"${claude_argv[@]}"} 2> >(grep -v 'Overriding existing handler for signal' >&2)
 }
 
 strip_ansi() {
@@ -303,6 +338,20 @@ run_codex() {
   trap codex_cleanup EXIT INT TERM HUP
   token_wrapper_start
 
+  # Fold the rank+persona staple into codex's initial prompt as a delimited
+  # <SYSTEM IDENTITY> preamble (codex has no system-prompt flag; its config
+  # `instructions` key is ignored by current codex). Resume is intentionally
+  # skipped — first launch already seeded the identity turn into the thread.
+  local codex_preamble augmented_prompt
+  codex_preamble="$(token_wrapper_codex_system_preamble || true)"
+  augmented_prompt="$prompt"
+  if [[ -n "$codex_preamble" ]]; then
+    if [[ -n "$prompt" ]]; then
+      augmented_prompt="${codex_preamble}"$'\n\n'"${prompt}"
+    else
+      augmented_prompt="${codex_preamble}"
+    fi
+  fi
 
   if [[ "${CODEX_DANGEROUS_BYPASS:-1}" == "1" ]]; then
     bypass_flag="--dangerously-bypass-approvals-and-sandbox"
@@ -315,7 +364,7 @@ run_codex() {
     output_file="/tmp/codex-${session_id}.md"
     codex_args=(exec)
     [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_args+=(--profile "$TOKEN_API_CODEX_PROFILE")
-    codex_args+=("$prompt" -C "$working_dir" "$bypass_flag" --json -o "$output_file")
+    codex_args+=("$augmented_prompt" -C "$working_dir" "$bypass_flag" --json -o "$output_file")
     run_engine_binary codex "${codex_args[@]}"
     status=$?
   elif [[ -n "$resume_id" ]]; then
@@ -328,12 +377,18 @@ run_codex() {
   elif [[ "${TOKEN_API_INTERNAL_DISPATCH:-0}" == "1" || "$LAUNCHER" == "dispatch" ]]; then
     codex_args=()
     [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_args+=(--profile "$TOKEN_API_CODEX_PROFILE")
-    [[ -n "$prompt" ]] && codex_args+=("$prompt")
+    [[ -n "$augmented_prompt" ]] && codex_args+=("$augmented_prompt")
     codex_args+=(-C "$working_dir" "$bypass_flag")
     run_engine_binary codex "${codex_args[@]}"
     status=$?
   else
-    run_engine_binary codex "$@"
+    # Bare interactive codex: pass the staple preamble as the initial prompt so a
+    # managed persona pane still receives its identity (empty for unmanaged).
+    if [[ -n "$codex_preamble" ]]; then
+      run_engine_binary codex "$@" "$codex_preamble"
+    else
+      run_engine_binary codex "$@"
+    fi
     status=$?
   fi
   set -e
