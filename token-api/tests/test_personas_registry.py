@@ -118,7 +118,7 @@ async def test_resolver_silent_and_voiced_personas(app_env):
     assert chapter["notification_sound"] == "notify.wav"
 
 
-def test_overseer_tints_do_not_collide_with_worker_or_primarch_tints(app_env):
+def test_overseer_tints_do_not_collide_with_worker_or_primarch_tints(app_env) -> None:
     """Pane backgrounds are an operator-recognition channel.
 
     Worker tints include chapter personas plus shared worker coats such as
