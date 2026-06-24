@@ -107,6 +107,12 @@ def test_trailing_resync_noops_when_nothing_new(tmp_path: Path) -> None:
     # newest main (no advance), it must NO-OP — not fall back to a full restart of
     # every service. The primary here is a no-advance full restart; the queued
     # trailing run then converges to a clean no-op.
+    #
+    # Invariant: this no-op is now contingent on running==checkout. _stub_env
+    # defaults STUB_RUNNING_SHA to the git stub's HEAD (NEW111 under no_advance),
+    # so the live process is NOT stale and the trailing run legitimately no-ops.
+    # The stale-process counterpart (running != checkout) is exercised by
+    # test_trailing_resync_restarts_when_process_stale below.
     env, logfile = _stub_env(tmp_path, "token-api/main.py", no_advance=True)
     lockdir = _lockdir(tmp_path)
     env["TOKEN_OS_DEPLOY_LOCKDIR"] = str(lockdir)
@@ -133,3 +139,58 @@ def test_single_deploy_acquires_and_releases_cleanly(tmp_path: Path) -> None:
     assert RESTART_TOKENAPI in logfile.read_text()
     assert "deploy already in progress" not in proc.stdout
     assert not lockdir.exists(), "mutex must be released on a clean exit"
+
+
+def test_trailing_resync_restarts_when_process_stale(tmp_path: Path) -> None:
+    # Regression for the stranded socket-activation cutover (#345): a trailing
+    # coalescing re-sync that finds NO new commits must STILL bounce token-api
+    # when the live process is serving stale code (its /health git_sha != the
+    # checkout HEAD). The checkout advanced without a paired restart, so the
+    # deploy is NOT actually finished — "nothing further to redeploy" would
+    # strand the old process forever.
+    env, logfile = _stub_env(tmp_path, "token-api/main.py", no_advance=True)
+    env["STUB_RUNNING_SHA"] = "STALE999"  # live process != checkout HEAD (NEW111)
+    lockdir = _lockdir(tmp_path)
+    env["TOKEN_OS_DEPLOY_LOCKDIR"] = str(lockdir)
+    _launchctl_touches_pending_once(tmp_path, logfile, lockdir)
+
+    proc = _run(env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "trailing re-sync 1/3" in proc.stdout
+    assert RESTART_TOKENAPI in logfile.read_text(), "stale live process must bounce"
+    assert "live token-api serving" in proc.stdout, "must report the stale state"
+    assert "nothing further to redeploy" not in proc.stdout, (
+        "must NOT claim convergence while the process is stale"
+    )
+    assert not lockdir.exists()
+
+
+def test_already_at_sha_deploy_restarts_when_process_stale(tmp_path: Path) -> None:
+    # Uncontended counterpart: a plain `token-restart --sync` that finds the
+    # checkout already at the newest SHA (no advance, no contender) lands in the
+    # full-restart `else` branch — but the staleness check guarantees token-api
+    # bounces even though THIS invocation advanced nothing. Closes skip path #4
+    # (already-at-SHA short-circuit leaving the process stale).
+    env, logfile = _stub_env(tmp_path, "token-api/main.py", no_advance=True)
+    env["STUB_RUNNING_SHA"] = "STALE999"
+
+    proc = _run(env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert RESTART_TOKENAPI in logfile.read_text(), "stale live process must bounce"
+
+
+def test_docs_only_deploy_restarts_stale_process(tmp_path: Path) -> None:
+    # Skip path #2: a smart deploy that advanced but changed ONLY non-service
+    # files (docs) would print "No deployable services changed" and skip every
+    # restart — stranding a process that was already stale from an earlier
+    # skipped bounce. The staleness check forces a token-api restart instead.
+    env, logfile = _stub_env(tmp_path, "README.md")  # advance=True, docs-only
+    env["STUB_RUNNING_SHA"] = "STALE999"  # process stale vs checkout HEAD (OLD000)
+
+    proc = _run(env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert RESTART_TOKENAPI in logfile.read_text(), "stale process must bounce"
+    assert "No deployable services changed" not in proc.stdout
