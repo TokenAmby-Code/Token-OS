@@ -280,8 +280,177 @@ runtime_write_lock_after_deploy() {
 runtime_write_lock_after_signal() {
     local sig="$1" dir="$2"
     runtime_write_lock_after_deploy "$dir" >/dev/null 2>&1 || true
+    # A killed deploy must free BOTH the runtime write-lock and the deploy mutex,
+    # so a stale lockdir never blocks the next deploy. No-op if we don't hold it.
+    deploy_lock_release
     trap - "$sig"
     kill -s "$sig" "$$"
+}
+
+# ============ Deploy mutex (single-runner + trailing coalescing) ============
+#
+# Two concurrent token-restart deploys — the token-api CD webhook spawn plus a
+# manual run, or two rapid back-to-back merges — race on the same uchg-locked
+# runtime .git: ref-`.lock` contention during the bare-mirror fetch, and transient
+# git `.lock` files vanishing mid-`chflags`-freeze → a false "failed to fetch bare
+# refs" / "failed to write-protect" (chflags ENOENT) even though one actor
+# deployed cleanly. macOS ships no flock(1), so we serialize with an atomic
+# `mkdir` lockdir (portable Mac + Linux satellites, zero deps).
+#
+# The holder runs full_restart. A contender that finds a LIVE holder drops a
+# redeploy-pending sentinel and exits 0 (never races, never stacks). After the
+# holder finishes it re-runs the sync+restart once more per queued contender
+# (capped) — and because sync_live_checkout re-fetches GitHub main and re-resolves
+# the target every call, the trailing run always lands the NEWEST merged SHA. If
+# the runtime is already at that SHA the trailing run no-ops. Convergent, bounded,
+# and coalescing rather than preemptive: we never interrupt an in-flight
+# git/chflags freeze (which could leave a half-locked or partial tree).
+DEPLOY_LOCKDIR="${TOKEN_OS_DEPLOY_LOCKDIR:-${TMPDIR:-/tmp}/token-os-cd-deploy.lock}"
+DEPLOY_LOCKDIR="${DEPLOY_LOCKDIR%/}"
+DEPLOY_LOCK_HELD=false
+# Cap on trailing coalescing re-runs so a pathological touch-storm can't loop
+# forever; each re-run re-resolves the newest main, so a small cap still converges.
+DEPLOY_REDEPLOY_MAX=3
+# Set true around a trailing coalescing re-run so full_restart skips the
+# no-advance → full-restart fallback (a trailing run that finds nothing new must
+# no-op, not bounce every service).
+DEPLOY_COALESCE_TRAILING=false
+
+# PID recorded in the lockdir owner file ("<pid> <sha>"), or empty/unreadable.
+deploy_lock_owner_pid() {
+    local owner="$DEPLOY_LOCKDIR/owner" pid
+    [[ -f "$owner" ]] || return 1
+    pid="$(cut -d' ' -f1 "$owner" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+deploy_lock_release() {
+    [[ "$DEPLOY_LOCK_HELD" == true ]] || return 0
+    rm -rf "$DEPLOY_LOCKDIR" 2>/dev/null || true
+    DEPLOY_LOCK_HELD=false
+}
+
+# Acquire the deploy mutex. Returns 0 if we now hold it (caller runs full_restart);
+# returns 1 if a LIVE deploy holds it — in which case we've queued a trailing
+# re-sync and the caller must exit 0 without deploying.
+deploy_lock_acquire() {
+    local target="${1:-}"
+    local tries=0 missing_owner=0
+    local max_tries=100
+    while (( tries < max_tries )); do
+        tries=$((tries + 1))
+        if mkdir "$DEPLOY_LOCKDIR" 2>/dev/null; then
+            DEPLOY_LOCK_HELD=true
+            printf '%s %s\n' "$$" "$target" > "$DEPLOY_LOCKDIR/owner" 2>/dev/null || true
+            return 0
+        fi
+
+        local pid
+        pid="$(deploy_lock_owner_pid 2>/dev/null || true)"
+
+        if [[ -z "$pid" ]]; then
+            # Lockdir exists but no owner yet: either a holder still initialising
+            # (owner is written immediately after mkdir) or a crashed deploy that
+            # never wrote one. Grace a few polls before reclaiming so we never blow
+            # away a live holder mid-init.
+            missing_owner=$((missing_owner + 1))
+            if (( missing_owner < 5 )); then
+                sleep 0.1
+                continue
+            fi
+            rm -rf "$DEPLOY_LOCKDIR" 2>/dev/null || true
+            missing_owner=0
+            continue
+        fi
+        missing_owner=0
+
+        if kill -0 "$pid" 2>/dev/null; then
+            # A live deploy holds the lock: queue a trailing re-sync and bow out so
+            # the holder converges on the newest main after it finishes.
+            touch "$DEPLOY_LOCKDIR/redeploy-pending" 2>/dev/null || true
+            # Close the holder-release race: if the holder vanished right after we
+            # queued (our sentinel possibly rm-rf'd with the dir), loop and try to
+            # become the holder ourselves rather than dropping the deploy.
+            if [[ -d "$DEPLOY_LOCKDIR" ]] && kill -0 "$pid" 2>/dev/null; then
+                local osha=""
+                [[ -f "$DEPLOY_LOCKDIR/owner" ]] && \
+                    osha="$(cut -d' ' -f2 "$DEPLOY_LOCKDIR/owner" 2>/dev/null || true)"
+                echo -e "${YELLOW}⚠${NC} deploy already in progress (pid=${pid}, sha=${osha:0:9}) — queued a trailing re-sync; exiting"
+                return 1
+            fi
+            continue
+        fi
+
+        # Owner PID is dead → stale lock from a crashed deploy. Reclaim and retry.
+        echo -e "${YELLOW}⚠${NC} deploy mutex: reclaiming stale lock from dead pid ${pid}" >&2
+        rm -rf "$DEPLOY_LOCKDIR" 2>/dev/null || true
+    done
+
+    echo -e "  ${RED}✗${NC} deploy mutex: gave up acquiring ${DEPLOY_LOCKDIR}" >&2
+    return 1
+}
+
+# Reset the per-run sync/restart globals so a trailing coalescing re-run starts
+# clean and re-resolves the newest target instead of inheriting the prior run.
+_reset_deploy_run_state() {
+    SYNC_DID_ADVANCE=false
+    SYNC_CHANGED_PATHS=""
+    SYNC_TARGET_SHA=""
+    RESTART_TOKENAPI=false
+    RESTART_OPS=false
+    RESTART_DISCORD=false
+    RESTART_WSL=false
+    REFRESH_WSL=false
+    RESTART_MOBILE=false
+}
+
+# Serialize full_restart under the deploy mutex with trailing coalescing. If a
+# live deploy already holds the mutex, we queued a trailing re-sync inside
+# deploy_lock_acquire and return 0 without deploying. Otherwise we hold the mutex,
+# run full_restart, then re-run it once per queued contender (bounded) so rapid
+# merges converge on the newest bare-main SHA. The mutex (and runtime write-lock)
+# are freed on every exit path — normal, error, or signal.
+run_coalesced_deploy() {
+    # Best-effort target SHA for the owner file (diagnostics only; the authoritative
+    # target is re-resolved inside sync_live_checkout on every run).
+    local target="${TOKEN_RESTART_TARGET_SHA:-}"
+    [[ -n "$target" ]] || \
+        target="$(git --git-dir="$TOKEN_OS_BARE_REPO" rev-parse -q --verify refs/heads/main 2>/dev/null || true)"
+
+    if ! deploy_lock_acquire "$target"; then
+        return 0
+    fi
+
+    local quoted_root
+    printf -v quoted_root '%q' "$(runtime_root)"
+    trap 'deploy_lock_release' EXIT
+    trap "runtime_write_lock_after_signal INT $quoted_root" INT
+    trap "runtime_write_lock_after_signal TERM $quoted_root" TERM
+
+    # Primary deploy. Run inside an if so `set -e` does not abort before we capture
+    # the status; the primary run's status is what the whole command returns.
+    local rc=0
+    if full_restart; then rc=0; else rc=$?; fi
+
+    # Trailing coalescing: converge on any merge a contender flagged mid-deploy.
+    # Clear the sentinel BEFORE each re-run so a merge landing DURING the re-run
+    # re-arms it (no lost wakeup).
+    local iter=0
+    while [[ -f "$DEPLOY_LOCKDIR/redeploy-pending" && "$iter" -lt "$DEPLOY_REDEPLOY_MAX" ]]; do
+        rm -f "$DEPLOY_LOCKDIR/redeploy-pending" 2>/dev/null || true
+        iter=$((iter + 1))
+        echo ""
+        echo -e "${BLUE}→${NC} deploy: trailing re-sync ${iter}/${DEPLOY_REDEPLOY_MAX} (a concurrent invocation queued one) — converging on newest main"
+        _reset_deploy_run_state
+        DEPLOY_COALESCE_TRAILING=true
+        full_restart || echo -e "  ${YELLOW}⚠${NC} deploy: trailing re-sync ${iter} did not complete cleanly (primary deploy already applied)"
+        DEPLOY_COALESCE_TRAILING=false
+    done
+
+    deploy_lock_release
+    trap - EXIT INT TERM
+    return "$rc"
 }
 
 sync_venv_if_needed() {
@@ -522,10 +691,15 @@ _sync_live_checkout_unlocked() {
 
     old_head="$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null || true)"
 
-    git -C "$dir" fetch "$TOKEN_OS_BARE_REPO" '+refs/heads/*:refs/remotes/local-bare/*' >/dev/null 2>&1 || {
-        echo -e "  ${RED}✗${NC} CD-sync: failed to fetch bare refs into runtime"
-        return 1
-    }
+    # Mirror the bare refs into the runtime's refs/remotes/local-bare/* for
+    # convenience/inspection only — the deploy checkout reads objects directly from
+    # $TOKEN_OS_BARE_REPO (the `git checkout --detach "$target"` below), not from
+    # these refs. A partial mirror-fetch (e.g. transient ref-`.lock` contention)
+    # must therefore NOT abort an otherwise-valid deploy; warn like the origin
+    # refresh below and continue.
+    if ! git -C "$dir" fetch "$TOKEN_OS_BARE_REPO" '+refs/heads/*:refs/remotes/local-bare/*' >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠${NC} CD-sync: failed to mirror bare refs into runtime (continuing; deploy reads objects directly from the bare repo)"
+    fi
     if ! git -C "$dir" fetch origin --prune >/dev/null 2>&1; then
         echo -e "  ${YELLOW}⚠${NC} CD-sync: failed to refresh runtime origin refs (continuing)"
     fi
@@ -585,8 +759,14 @@ sync_live_checkout() {
     validate_runtime_checkout_path "$dir" || return 1
     runtime_write_unlock_for_deploy "$dir" || return 1
 
-    local quoted_dir
+    # Re-lock the runtime on signal during the unlocked deploy window. Capture any
+    # outer INT/TERM traps (the deploy-mutex handlers from run_coalesced_deploy)
+    # and RESTORE them afterwards rather than resetting to default, so a signal
+    # arriving later in full_restart still frees the mutex.
+    local quoted_dir prev_int prev_term
     printf -v quoted_dir '%q' "$dir"
+    prev_int="$(trap -p INT)"
+    prev_term="$(trap -p TERM)"
     trap "runtime_write_lock_after_signal INT $quoted_dir" INT
     trap "runtime_write_lock_after_signal TERM $quoted_dir" TERM
 
@@ -595,7 +775,8 @@ sync_live_checkout() {
     rc=$?
     runtime_write_lock_after_deploy "$dir"
     lock_rc=$?
-    trap - INT TERM
+    eval "${prev_int:-trap - INT}"
+    eval "${prev_term:-trap - TERM}"
     set -e
     [[ "$rc" -eq 0 ]] || return "$rc"
     return "$lock_rc"
@@ -1100,6 +1281,12 @@ full_restart() {
         [[ "$RESTART_MOBILE" == true ]] && changed_list+=" mobile"
         echo -e "${BLUE}→${NC} Changed services:${changed_list}"
         echo ""
+    elif [[ "$DEPLOY_COALESCE_TRAILING" == true ]]; then
+        # Trailing coalescing re-run that found nothing new: the primary deploy
+        # already landed the newest SHA. Do NOT fall back to a full restart —
+        # that would needlessly bounce every service. Converged; nothing to do.
+        echo -e "${GREEN}✓${NC} Trailing re-sync: runtime already at newest main — nothing further to redeploy."
+        return 0
     else
         # No new commits (already current / --no-sync / sync degraded): full
         # restart of the standard set — the human "restart my stuff now" path.
@@ -1279,7 +1466,7 @@ case "$ACTION" in
         kill_server
         ;;
     watch)
-        full_restart
+        run_coalesced_deploy
         watch_logs
         ;;
     wsl-only)
@@ -1292,6 +1479,6 @@ case "$ACTION" in
         if [[ -n "$DEPLOY_FROM" ]]; then
             update_plist "$DEPLOY_FROM" || exit 1
         fi
-        full_restart
+        run_coalesced_deploy
         ;;
 esac

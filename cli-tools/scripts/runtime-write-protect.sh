@@ -119,11 +119,22 @@ disable_git_filemode_tracking() {
     fi
 }
 
+# Transient git lock files (HEAD.lock, index.lock, refs/**/*.lock, gc.log.lock)
+# are created and deleted by git mid-operation. Freezing one (uchg) would break
+# git; worse, a lock that vanishes between `find` listing it and the batched
+# `-exec` running yields `chmod/chflags: …/X.lock: No such file or directory` — a
+# nonzero exit that falsely fails the whole lock (the concurrent-deploy race).
+# Prune anything under a `.git/` dir ending in `.lock` from every tree pass.
+# `-path '*/.git/*.lock'` matches at any depth (find's -path `*` spans '/'), and
+# is scoped to `.git` so a tracked lockfile like uv.lock (token-api/uv.lock) stays
+# frozen. Used as the leading clause of an `-prune -o <rest>` expression.
+GIT_LOCK_PRUNE=( -path '*/.git/*.lock' -prune -o )
+
 chmod_tree_no_symlinks() {
     local root="$1" mode="$2"
     # find -P is the default, but spell it out: do not chmod symlink targets
     # such as secrets mounted into the runtime checkout.
-    find -P "$root" ! -type l -exec chmod "$mode" {} +
+    find -P "$root" "${GIT_LOCK_PRUNE[@]}" ! -type l -exec chmod "$mode" {} +
 }
 
 # The user-immutable layer (chflags uchg) is BSD/macOS only. Linux satellites
@@ -137,7 +148,7 @@ immutable_supported() {
 # secret symlinked into the tree keeps its own flags) and batch with -exec +.
 chflags_tree_no_symlinks() {
     local root="$1" flags="$2"
-    find -P "$root" ! -type l -exec chflags "$flags" {} +
+    find -P "$root" "${GIT_LOCK_PRUNE[@]}" ! -type l -exec chflags "$flags" {} +
 }
 
 # Clear the immutable flag across the WHOLE tree, exemptions included. chmod and
@@ -207,10 +218,10 @@ root_has_write_bits() {
     local root="$1"
     exemption_prune_expr "$root"
     if [[ ${#EXEMPTION_PRUNE[@]} -gt 0 ]]; then
-        find -P "$root" \( "${EXEMPTION_PRUNE[@]}" \) -prune -o \
+        find -P "$root" "${GIT_LOCK_PRUNE[@]}" \( "${EXEMPTION_PRUNE[@]}" \) -prune -o \
             ! -type l \( -perm -u+w -o -perm -g+w -o -perm -o+w \) -print -quit | grep -q .
     else
-        find -P "$root" \
+        find -P "$root" "${GIT_LOCK_PRUNE[@]}" \
             ! -type l \( -perm -u+w -o -perm -g+w -o -perm -o+w \) -print -quit | grep -q .
     fi
 }
@@ -224,10 +235,10 @@ set_immutable_frozen() {
     immutable_supported || return 0
     exemption_prune_expr "$root"
     if [[ ${#EXEMPTION_PRUNE[@]} -gt 0 ]]; then
-        find -P "$root" \( "${EXEMPTION_PRUNE[@]}" \) -prune -o \
+        find -P "$root" "${GIT_LOCK_PRUNE[@]}" \( "${EXEMPTION_PRUNE[@]}" \) -prune -o \
             ! -type l -exec chflags uchg {} +
     else
-        find -P "$root" ! -type l -exec chflags uchg {} +
+        find -P "$root" "${GIT_LOCK_PRUNE[@]}" ! -type l -exec chflags uchg {} +
     fi
 }
 
@@ -241,10 +252,10 @@ root_missing_immutable() {
     immutable_supported || return 1
     exemption_prune_expr "$root"
     if [[ ${#EXEMPTION_PRUNE[@]} -gt 0 ]]; then
-        find -P "$root" \( "${EXEMPTION_PRUNE[@]}" \) -prune -o \
+        find -P "$root" "${GIT_LOCK_PRUNE[@]}" \( "${EXEMPTION_PRUNE[@]}" \) -prune -o \
             ! -type l ! -flags +uchg -print -quit | grep -q .
     else
-        find -P "$root" ! -type l ! -flags +uchg -print -quit | grep -q .
+        find -P "$root" "${GIT_LOCK_PRUNE[@]}" ! -type l ! -flags +uchg -print -quit | grep -q .
     fi
 }
 

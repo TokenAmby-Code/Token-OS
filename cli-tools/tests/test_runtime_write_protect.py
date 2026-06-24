@@ -420,3 +420,67 @@ def test_assert_locked_fails_when_immutable_flag_missing(tmp_path) -> None:
     proc = run("assert-locked", str(root))
     assert proc.returncode == 1
     assert "unlocked" in run("status", str(root)).stdout
+
+
+# --- transient git lock files (.git/**/*.lock) are never frozen ---------------
+
+
+def _seed_git_lock_files(root: Path) -> tuple[Path, Path]:
+    """Create stray transient git lock files at the top of .git/ and nested under
+    refs/, returning (HEAD.lock, refs/heads/main.lock)."""
+    gitdir = root / ".git"
+    (gitdir / "refs" / "heads").mkdir(parents=True)
+    head_lock = gitdir / "HEAD.lock"
+    head_lock.write_text("ref: refs/heads/main\n")
+    ref_lock = gitdir / "refs" / "heads" / "main.lock"
+    ref_lock.write_text("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n")
+    return head_lock, ref_lock
+
+
+def test_lock_ignores_transient_git_lock_files(tmp_path) -> None:
+    # A git lock file (HEAD.lock, refs/**/*.lock) is transient by design: a
+    # concurrent deploy creates and deletes it mid-operation. Freezing one would
+    # break git, and a lock that vanishes between `find` and the batched `-exec`
+    # is the exact ENOENT ("No such file or directory") that falsely failed the
+    # whole lock in the concurrent-deploy race. lock must skip them and still
+    # succeed — while keeping a tracked `uv.lock` frozen (the prune is .git-scoped).
+    root = tmp_path / "runtime"
+    root.mkdir()
+    (root / "app.py").write_text("print('x')\n")
+    (root / "token-api").mkdir()
+    uvlock = root / "token-api" / "uv.lock"
+    uvlock.write_text("# tracked lockfile — must stay frozen\n")
+    head_lock, ref_lock = _seed_git_lock_files(root)
+
+    proc = run("lock", str(root))
+
+    assert proc.returncode == 0, proc.stderr
+    assert "locked" in proc.stdout
+    assert "No such file" not in proc.stderr
+    # Tracked uv.lock is frozen (proves the prune is scoped to `.git`, not all *.lock).
+    assert not has_any_write(uvlock)
+    if HAVE_CHFLAGS:
+        assert is_immutable(uvlock), "tracked uv.lock must still be frozen"
+        # The transient git locks must NOT carry uchg — proof they were pruned
+        # from the freeze (uchg on them would break the next git operation).
+        assert not is_immutable(head_lock)
+        assert not is_immutable(ref_lock)
+
+
+def test_assert_locked_ignores_transient_git_lock_files(tmp_path) -> None:
+    # A correctly-locked tree may carry a stray .git/**/*.lock (writable + not
+    # immutable, because the freeze pruned it). The verify passes must prune them
+    # too, so assert-locked/status report the tree as locked rather than falsely
+    # "unlocked". (Seeded before lock — once the root is frozen+immutable, mkdir
+    # under .git is impossible anyway, which is precisely why the locks must be
+    # left mutable and ignored.)
+    root = tmp_path / "runtime"
+    root.mkdir()
+    (root / "app.py").write_text("print('x')\n")
+    head_lock, _ = _seed_git_lock_files(root)
+    assert run("lock", str(root)).returncode == 0
+    # The lock file stayed writable (not pulled into the freeze)...
+    assert has_owner_write(head_lock)
+    # ...yet the tree still verifies as locked.
+    assert run("assert-locked", str(root)).returncode == 0
+    assert "locked" in run("status", str(root)).stdout
