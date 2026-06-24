@@ -75,10 +75,14 @@ _DAILY_NOTE_BASENAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\.md$")
 
 
 async def _consumer_custodes_doc_rebind() -> dict:
-    """Rebind a live custodes bound to a prior-day daily note onto today's note.
+    """Rebind live daily-note singletons off a prior-day note onto today's note.
 
-    A custodes alive across midnight stays bound to yesterday's daily note. Only
-    date-named daily-note bindings are rebound; bespoke dockets are left untouched.
+    Generalized from custodes-only to every persona whose
+    ``personas.default_session_doc == 'daily_note'`` (Custodes, Fabricator-General,
+    Administratum). Any such singleton alive across midnight stays bound to
+    yesterday's daily note until rebound here. Only date-named daily-note bindings
+    are rebound; bespoke dockets are left untouched. The ``custodes_*`` telemetry
+    names are retained for dashboard/event stability.
     """
     from instance_mutation import sanctioned_update_instance
     from session_doc_helpers import resolve_or_create_today_daily_note_session_doc
@@ -108,7 +112,7 @@ async def _consumer_custodes_doc_rebind() -> dict:
             FROM instances ci
             JOIN personas p ON p.id = ci.persona_id
             LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
-            WHERE p.slug = 'custodes'
+            WHERE p.default_session_doc = 'daily_note'
               AND ci.golden_throne = 'sync'
               AND ci.status NOT IN ('stopped', 'archived')
               AND ci.stopped_at IS NULL
