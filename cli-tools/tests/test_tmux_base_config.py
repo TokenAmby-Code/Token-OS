@@ -170,16 +170,19 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
 
 
-def test_pane_border_never_renders_identity_nametag() -> None:
-    """Pane border nametag must not show persona, instance name, or pane_title.
+def test_persona_is_statusline_not_pane_border_nametag() -> None:
+    """Persona displays in generic status-left; pane border nametag shows instance name.
 
-    Persona display remains available through @PERSONA for statusline consumers,
-    and @PANE_LABEL is still pushed for compatibility/debugging, but the border
-    does not read either. No fallback hostname/title is allowed either.
+    The blue pane-border box must read @PANE_LABEL (for values like needs-name),
+    never @PERSONA. It also must not fall back to pane_title/hostname.
     """
+    status_left = _line_starting("set -g status-left ")
+    assert "#S" in status_left
+    assert "@PERSONA" in status_left
+
     border = _line_starting("set -g pane-border-format ")
+    assert "@PANE_LABEL" in border
     assert "@PERSONA" not in border
-    assert "@PANE_LABEL" not in border
     assert "pane_title" not in border
     assert "@PANE_TITLE_SUPPRESS" not in border
     for expected in (
