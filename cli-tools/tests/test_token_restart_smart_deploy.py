@@ -28,7 +28,7 @@ UID = str(os.getuid())
 # rather than `kickstart -k`; restart_mac's signature in the log is the
 # `launchctl print <mac label>` pid query, emitted only when restart_mac runs.
 # Discord still bounces via `kickstart -k`.
-RESTART_TOKENAPI = f"print gui/501/{TOKENAPI_LABEL}"
+RESTART_TOKENAPI = f"print gui/{UID}/{TOKENAPI_LABEL}"
 KICK_DISCORD = f"kickstart -k gui/{UID}/{DISCORD_LABEL}"
 
 

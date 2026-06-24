@@ -138,8 +138,10 @@ def test_no_stale_uvicorn_process_pattern() -> None:
 def test_restart_mac_uses_graceful_sigterm() -> None:
     src = TOKEN_RESTART.read_text(encoding="utf-8")
     # Graceful drain via SIGTERM to the launchd pid, not `kickstart -k` (SIGKILL).
+    # The token-api ${LABEL} kickstart line must be gone (Discord's
+    # ${DISCORD_LABEL} kickstart is a separate service and stays).
     assert "kill -TERM" in src
-    assert "kickstart -k gui/501/${LABEL}" not in src
+    assert 'kickstart -k "gui/$(id -u)/${LABEL}"' not in src
 
 
 def test_canonical_template_is_socket_activated() -> None:
