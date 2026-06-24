@@ -13,9 +13,10 @@
 # Exports:
 #   GIT_GITHUB_REMOTE — Name of the remote that points to GitHub (e.g. "origin" or "github")
 
-# Skip if already resolved (idempotent sourcing)
-if [[ -n "${GIT_GITHUB_REMOTE:-}" ]]; then
-    return 0 2>/dev/null || true
+_GIT_REMOTE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "${IMPERIUM:-}" && -f "$_GIT_REMOTE_LIB_DIR/nas-path.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$_GIT_REMOTE_LIB_DIR/nas-path.sh" 2>/dev/null || true
 fi
 
 # Detect GitHub remote by scanning `git remote -v` for github.com URLs.
@@ -34,4 +35,39 @@ _detect_github_remote() {
     echo "${remote_name:-origin}"
 }
 
-export GIT_GITHUB_REMOTE="$(_detect_github_remote)"
+if [[ -z "${GIT_GITHUB_REMOTE:-}" ]]; then
+    export GIT_GITHUB_REMOTE="$(_detect_github_remote)"
+fi
+
+token_os_github_remote() {
+    local url="${1%.git}"
+    case "$url" in
+        git@github.com:TokenAmby-Code/Token-OS|\
+        ssh://git@github.com/TokenAmby-Code/Token-OS|\
+        https://github.com/TokenAmby-Code/Token-OS)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+dead_or_quarantined_remote() {
+    local url="${1%/}" imperium_root="${IMPERIUM:-}" token_os_bare=""
+    if [[ -z "$imperium_root" ]] && type imperium_cfg >/dev/null 2>&1; then
+        imperium_root="$(imperium_cfg nas_imperium 2>/dev/null || true)"
+    fi
+    if [[ -n "$imperium_root" ]]; then
+        token_os_bare="${imperium_root%/}/token-os.git"
+    fi
+    case "$url" in
+        ""|*'#recycle'*)
+            return 0
+            ;;
+    esac
+    if [[ -n "$token_os_bare" ]]; then
+        [[ "$url" == "$token_os_bare" || "$url" == "file://$token_os_bare" ]] && return 0
+    fi
+    return 1
+}

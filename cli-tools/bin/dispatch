@@ -13,6 +13,7 @@ source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
 source "${LIB_DIR}/agent-wrapper-common.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
 [[ -n "$CALLER_IMPERIUM" ]] && export IMPERIUM="$CALLER_IMPERIUM"
+source "${LIB_DIR}/git-remote.sh"
 
 # Harden the ctype locale internally. dispatch pipes arbitrary prompt/title text
 # (which routinely contains non-ASCII: →, ✓, emoji) through sed/tr/cut. Under a
@@ -1298,6 +1299,34 @@ dispatch_conf_var() {
     eval "printf '%s' \"\${$2:-}\"" )
 }
 
+assert_worktree_pr_capable() {
+  local dir="$1" proj="$2" origin=""
+  if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    err "worktree is not PR-capable; not a git worktree: $dir"
+    exit 64
+  fi
+  origin="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+  if [[ "$proj" == "Token-OS" ]]; then
+    if ! token_os_github_remote "$origin"; then
+      err "worktree is not PR-capable; expected TokenAmby-Code/Token-OS GitHub remote"
+      err "origin remote: ${origin:-<missing>}"
+      exit 64
+    fi
+    return 0
+  fi
+  if dead_or_quarantined_remote "$origin"; then
+    err "worktree is not PR-capable; origin remote is missing, dead, or quarantined: ${origin:-<missing>}"
+    exit 64
+  fi
+  case "${origin%.git}" in
+    git@github.com:*/*|ssh://git@github.com/*/*|https://github.com/*/*)
+      return 0
+      ;;
+  esac
+  err "worktree is not PR-capable; origin remote does not map to GitHub: $origin"
+  exit 64
+}
+
 slugify_branch() {
   printf '%s' "$1" \
     | tr '[:upper:]' '[:lower:]' \
@@ -1334,6 +1363,7 @@ enter_worktree_for_project() {
     else
       WORK_DIR="$(cd "$wt_path" && pwd)"
     fi
+    assert_worktree_pr_capable "$wt_path" "$proj"
     WORKTREE_DECISION="created+entered $WORK_DIR (branch $branch)"
     WORKTREE_FRESHLY_CREATED=true
   else
@@ -1385,6 +1415,7 @@ maybe_enter_worktree() {
     runtime="$(dispatch_conf_var "$conf" RUNTIME_CHECKOUT)"
     bare="$(dispatch_conf_var "$conf" BARE_REPO)"
     if [[ -n "$parent" && ( "$WORK_DIR" == "$parent" || "$WORK_DIR" == "$parent"/* ) ]]; then
+      assert_worktree_pr_capable "$WORK_DIR" "$proj"
       WORKTREE_DECISION="n/a (already isolated worktree)"
       return 0
     fi
