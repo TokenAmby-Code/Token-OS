@@ -989,7 +989,7 @@ for p in data['panes']:
                 fi
                 target_pane=$(tmux display-message -p '#{pane_id}')
             fi
-            run_tmuxctl legion focus-selected --pane "$target_pane"
+            run_tmuxctl mechanicus focus-selected --pane "$target_pane"
             ;;
 
         *)

@@ -237,15 +237,15 @@ def legion_adapter(*, current: str = "%C", workers: bool = True) -> FakePaneSele
     panes: list[dict[str, object]] = [
         {
             "pane_id": "%C",
-            "role": "council:custodes",
-            "type": "legion",
+            "role": "mechanicus:fabricator-general",
+            "type": "mechanicus",
             "left": 0,
             "top": 0,
         },
         {
             "pane_id": "%M",
-            "role": "council:malcador",
-            "type": "legion",
+            "role": "mechanicus:orchestrator",
+            "type": "mechanicus",
             "left": 0,
             "top": 25,
         },
@@ -255,14 +255,14 @@ def legion_adapter(*, current: str = "%C", workers: bool = True) -> FakePaneSele
             [
                 {
                     "pane_id": "%1",
-                    "role": "legion:1",
+                    "role": "mechanicus:1",
                     "type": "stack-worker",
                     "left": 81,
                     "top": 8,
                 },
                 {
                     "pane_id": "%2",
-                    "role": "legion:2",
+                    "role": "mechanicus:2",
                     "type": "stack-worker",
                     "left": 81,
                     "top": 20,
@@ -271,25 +271,25 @@ def legion_adapter(*, current: str = "%C", workers: bool = True) -> FakePaneSele
         )
     return FakePaneSelectAdapter(
         window_index="3",
-        window_name="legion",
+        window_name="mechanicus",
         panes=panes,
         current=current,
     )
 
 
-def koronus_adapter(*, current: str = "%P", workers: bool = True) -> FakePaneSelectAdapter:
+def merged_stack_adapter(*, current: str = "%P", workers: bool = True) -> FakePaneSelectAdapter:
     panes: list[dict[str, object]] = [
         {
             "pane_id": "%P",
-            "role": "council:pax",
-            "type": "koronus",
+            "role": "mechanicus:fabricator-general",
+            "type": "mechanicus",
             "left": 0,
             "top": 0,
         },
         {
             "pane_id": "%O",
             "role": "mechanicus:orchestrator",
-            "type": "koronus",
+            "type": "mechanicus",
             "left": 0,
             "top": 25,
         },
@@ -299,14 +299,14 @@ def koronus_adapter(*, current: str = "%P", workers: bool = True) -> FakePaneSel
             [
                 {
                     "pane_id": "%1",
-                    "role": "koronus:1",
+                    "role": "mechanicus:1",
                     "type": "stack-worker",
                     "left": 81,
                     "top": 8,
                 },
                 {
                     "pane_id": "%2",
-                    "role": "koronus:2",
+                    "role": "mechanicus:2",
                     "type": "stack-worker",
                     "left": 81,
                     "top": 20,
@@ -315,7 +315,7 @@ def koronus_adapter(*, current: str = "%P", workers: bool = True) -> FakePaneSel
         )
     return FakePaneSelectAdapter(
         window_index="7",
-        window_name="koronus",
+        window_name="mechanicus",
         panes=panes,
         current=current,
     )
@@ -323,10 +323,10 @@ def koronus_adapter(*, current: str = "%P", workers: bool = True) -> FakePaneSel
 
 def test_legion_absolute_arrows_select_persona_and_worker_extremes():
     expected = {
-        "left": "council:custodes",
-        "right": "council:malcador",
-        "up": "legion:1",
-        "down": "legion:2",
+        "left": "mechanicus:fabricator-general",
+        "right": "mechanicus:orchestrator",
+        "up": "mechanicus:1",
+        "down": "mechanicus:2",
     }
     for direction, target in expected.items():
         adapter = legion_adapter(current="%2")
@@ -355,15 +355,15 @@ def test_mechanicus_absolute_arrows_select_persona_and_worker_extremes():
         assert ("select-pane", "-t", target) in adapter.commands
 
 
-def test_koronus_absolute_arrows_select_persona_and_worker_extremes():
+def test_merged_stack_absolute_arrows_select_persona_and_worker_extremes():
     expected = {
-        "left": "council:pax",
+        "left": "mechanicus:fabricator-general",
         "right": "mechanicus:orchestrator",
-        "up": "koronus:1",
-        "down": "koronus:2",
+        "up": "mechanicus:1",
+        "down": "mechanicus:2",
     }
     for direction, target in expected.items():
-        adapter = koronus_adapter(current="%2")
+        adapter = merged_stack_adapter(current="%2")
 
         result = select_pane(adapter, mode="absolute", direction=direction, client="/dev/ttys001")
 

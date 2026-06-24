@@ -11,17 +11,16 @@ from .tmux_adapter import TmuxAdapter
 PAGE_AUDIENCE = {
     "palace": "_palace_audience",
     "somnium": "_somnium_audience",
-    "legion": "_legion_audience",
+    "council": "_council_audience",
     "mechanicus": "_mechanicus_audience",
-    "koronus": "_koronus_audience",
 }
 
 AUDIENCE_ROLES = {
     "council:custodes",
     "mechanicus:fabricator-general",
     # The civic pax seat is the human-facing interaction surface, so it can be
-    # expanded into a koronus audience chamber (orchestrator is dispatch-only,
-    # like the mechanicus admin seat, and stays unexpanded).
+    # expanded into a council audience chamber (orchestrator is dispatch-only,
+    # like the administratum seat, and stays unexpanded).
     "council:pax",
 }
 

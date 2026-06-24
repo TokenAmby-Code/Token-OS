@@ -28,8 +28,8 @@ def test_demote_keeps_reaper_and_legacy_focus_out_of_path() -> None:
     # The allocator owns stack geometry; the shuttle only swaps with the
     # allocator-created pane and restores metadata. It must not move panes by
     # raw join/move or fire audit reaping from the demote hot path.
-    assert "stack adopt legion" not in demote_body
+    assert "stack adopt mechanicus" not in demote_body
     assert "join-pane" not in demote_body
     assert "move-pane" not in demote_body
     assert "tmux-audit" not in demote_body
-    assert "legion focus-selected" not in demote_body
+    assert "mechanicus focus-selected" not in demote_body

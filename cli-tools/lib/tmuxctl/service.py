@@ -550,13 +550,13 @@ class TmuxControlPlane:
 
         return sweep_stack_assertions(self.adapter, session, kill_pending_clear=kill_pending_clear)
 
-    def legion_focus_selected(self, pane: str = "current") -> str:
-        """Focus the currently selected pane within its legion stack."""
+    def mechanicus_focus_selected(self, pane: str = "current") -> str:
+        """Focus the currently selected pane within its mechanicus stack."""
         from .stack import focus_selected
 
         return focus_selected(self.adapter, self._resolve_current(pane))
 
-    def legion_enforce(self, pane: str = "current") -> str:
+    def mechanicus_enforce(self, pane: str = "current") -> str:
         """Enforce the stack layout for a pane's window and focus that pane."""
         from .stack import enforce_stack_layout
 

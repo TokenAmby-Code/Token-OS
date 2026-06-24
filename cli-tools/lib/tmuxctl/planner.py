@@ -366,7 +366,7 @@ def _legal_restart_labels(workspace: WorkspaceSnapshot) -> set[str]:
             legal.update(PALACE_ROLES)
         elif window.archetype.value == "somnium":
             legal.update(SOMNIUM_ROLES)
-        elif window.archetype.value in {"legion_stack", "mechanicus_stack"}:
+        elif window.archetype.value in {"mechanicus_stack", "council"}:
             legal.update({pane.pane_role for pane in window.panes if pane.pane_role})
     return legal
 

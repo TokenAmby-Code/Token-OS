@@ -330,15 +330,23 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
 
 
 def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
-    """Build the reservists stack window (index 6), split down the middle.
+    """Build the reservists stack window, split down the middle into two
+    perpetual reservist persona seats.
+
+    Both panes are always-on, singleton-style perpetual seats — the reservists
+    page mirror of how mechanicus anchors the Fabricator-General + orchestrator.
+    The ephemeral test/subagent pool (token-api-owned lifecycle) is layered on
+    later; this builder only seats the two standing reservists.
 
     Left pane is the **civic reservist** — the standing civic day-job thread that
     the civic-thread fallthrough activates when no civic instance is alive. It is
     marked ``@CIVIC_RESERVIST 1`` so the orchestration harness can resolve it by
-    pane option (see civic-thread). The right pane is a second reservist slot.
+    pane option (see civic-thread). Right pane is the **token-os reservist** — the
+    token-os mirror of the civic reservist, marked ``@TOKEN_OS_RESERVIST 1`` so a
+    future token-os-thread resolver can find it the same way.
 
     Like mars/kreig, ``reservists`` is a recognized stack base with no
-    StackPageSpec, so stack reconcile leaves these two startup panes alone while
+    StackPageSpec, so stack reconcile leaves these two perpetual panes alone while
     still allowing dispatch to add reservist workers later.
     """
     target = f"{session}:{RESERVISTS_WINDOW}"
@@ -353,12 +361,13 @@ def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
         _window_dir(RESERVISTS_WINDOW),
     )
     civic = f"{target}.1"
-    slot = _split_pane(adapter, civic, "-h", "-l", "50%", cwd=_window_dir(RESERVISTS_WINDOW))
+    token_os = _split_pane(adapter, civic, "-h", "-l", "50%", cwd=_window_dir(RESERVISTS_WINDOW))
     _pane_tag(adapter, civic, "reservists:civic")
     _set_pane_option(adapter, civic, "@PANE_TYPE", "reservists")
     _set_pane_option(adapter, civic, "@CIVIC_RESERVIST", "1")
-    _pane_tag(adapter, slot, "reservists:slot")
-    _set_pane_option(adapter, slot, "@PANE_TYPE", "reservists")
+    _pane_tag(adapter, token_os, "reservists:token-os")
+    _set_pane_option(adapter, token_os, "@PANE_TYPE", "reservists")
+    _set_pane_option(adapter, token_os, "@TOKEN_OS_RESERVIST", "1")
 
 
 def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
