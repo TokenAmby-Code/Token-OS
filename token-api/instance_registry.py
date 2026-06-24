@@ -140,12 +140,12 @@ LEGACY_PERSONA_ALIASES = {
     "fabricator": "fabricator-general",
     "mechanicus:fabricator-general": "fabricator-general",
     "mechanicus:administratum": "administratum",
-    "mechanicus:admin": "administratum",
-    "legion:custodes": "custodes",
-    "legion:malcador": "malcador",
-    "koronus:pax": "pax",
-    "koronus:orchestrator": "orchestrator",
-    "koronus:worker": "agentic-worker",
+    "council:administratum": "administratum",
+    "council:custodes": "custodes",
+    "council:malcador": "malcador",
+    "council:pax": "pax",
+    "mechanicus:orchestrator": "orchestrator",
+    "mechanicus:worker": "agentic-worker",
     "mechanicus": "administratum",
 }
 

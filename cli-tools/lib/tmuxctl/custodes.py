@@ -205,7 +205,7 @@ def assert_custodes(
     *,
     session: str = "main",
 ) -> dict[str, Any]:
-    """Deliver `prompt` to the legion:custodes pane, upserting or launching."""
+    """Deliver `prompt` to the council:custodes pane, upserting or launching."""
     pane_id = _ensure_custodes_pane(adapter, session)
     pane_pid = _pane_pid(adapter, pane_id)
 

@@ -79,7 +79,7 @@ if [[ "${1:-}" == "--do-swap" ]]; then
     src_window="${src_window:-legion}"
     tombstone_source=""
     case "$src_tag" in
-        legion:custodes|mechanicus:fabricator-general|mechanicus:anchor)
+        council:custodes|mechanicus:fabricator-general|mechanicus:anchor)
             tombstone_source="$src_tag"
             ;;
     esac
@@ -152,7 +152,7 @@ demote() {
             --no-focus)
     [[ -n "$stack_pane" ]] || { tmux display-message "Shuttle: failed to allocate legion stack pane"; return 1; }
     stack_tag=$(pane_id_of "$stack_pane")
-    [[ -n "$stack_tag" ]] || stack_tag="legion:worker"
+    [[ -n "$stack_tag" ]] || stack_tag="mechanicus:worker"
 
     tmux swap-pane -d -s "$current_pane" -t "$stack_pane" || {
         tmux kill-pane -t "$stack_pane" 2>/dev/null || true

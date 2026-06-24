@@ -41,10 +41,10 @@ def _run(argv, sweep_results, capsys):
 
 def test_assert_personas_json_exits_zero(capsys):
     results = [
-        {"ok": True, "pane_label": "legion:custodes", "action": "none", "reason": "live"},
+        {"ok": True, "pane_label": "council:custodes", "action": "none", "reason": "live"},
         {
             "ok": False,
-            "pane_label": "mechanicus:admin",
+            "pane_label": "council:administratum",
             "action": "persona_unregistered_noted",
             "reason": "persona_unregistered_live_runtime",
         },
@@ -58,10 +58,10 @@ def test_assert_personas_json_exits_zero(capsys):
 
 def test_assert_personas_text_format(capsys):
     results = [
-        {"ok": True, "pane_label": "legion:custodes", "action": "none", "reason": "live"},
+        {"ok": True, "pane_label": "council:custodes", "action": "none", "reason": "live"},
         {
             "ok": False,
-            "pane_label": "mechanicus:admin",
+            "pane_label": "council:administratum",
             "action": "persona_unregistered_noted",
             "reason": "live_runtime_no_row",
         },
@@ -70,5 +70,5 @@ def test_assert_personas_text_format(capsys):
 
     assert rc == 0
     lines = out.strip().splitlines()
-    assert lines[0] == "legion:custodes\tok\tnone\tlive"
-    assert lines[1] == "mechanicus:admin\tFAIL\tpersona_unregistered_noted\tlive_runtime_no_row"
+    assert lines[0] == "council:custodes\tok\tnone\tlive"
+    assert lines[1] == "council:administratum\tFAIL\tpersona_unregistered_noted\tlive_runtime_no_row"

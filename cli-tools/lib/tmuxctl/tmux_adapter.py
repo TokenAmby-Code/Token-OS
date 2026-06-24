@@ -215,7 +215,7 @@ def _camera_mutating(args: list[str] | tuple[str, ...]) -> bool:
 
 def _tmux_stderr_target(*, allow_failure: bool):
     # allow_failure callers intentionally tolerate tmux errors and almost never
-    # consume stderr. Do not spend a second pipe for stderr; the live legion:new
+    # consume stderr. Do not spend a second pipe for stderr; the live mechanicus:new
     # failure hit EMFILE while creating an unnecessary err pipe. Discard tolerated
     # stderr instead of merging it into stdout, because structured tmux stdout is
     # parsed by list_clients/list_sessions/list_panes callers.
@@ -227,7 +227,7 @@ class TmuxAdapter:
 
     The adapter is the lowest Python tmux boundary. Pane-scoped target flags are
     resolved through tmuxctl before subprocess execution, so callers can pass
-    stable custom ids (``1:N``, ``palace:N``, ``somnium:SE``, ``legion:custodes``) in
+    stable custom ids (``1:N``, ``palace:N``, ``somnium:SE``, ``council:custodes``) in
     place of volatile ``%N`` pane ids.
     """
 
@@ -402,7 +402,7 @@ class TmuxAdapter:
         # Clear any prior suppression payload so an allowed send (which also
         # returns empty stdout) is never misread as suppressed by callers/tests.
         self.last_send_gate_result = None
-        # Resolve Imperium canonical pane targets (mechanicus:N, legion:custodes,
+        # Resolve Imperium canonical pane targets (mechanicus:N, council:custodes,
         # 1:N, …) to physical %pane ids BEFORE the gate evaluates. The gate's
         # keystroke-lock read shells out to
         # `tmux show-options -pqv -t <target> @TYPING_LOCK_UNTIL`; tmux only

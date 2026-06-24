@@ -153,7 +153,7 @@ async def test_redirect_to_non_child_falls_back_to_fg(app_env: Any, monkeypatch)
         monkeypatch,
         [
             _pane("%33", "fg-live", pane_label=FG_LABEL),
-            _pane("%50", "other-owner", pane_label="legion:custodes"),
+            _pane("%50", "other-owner", pane_label="council:custodes"),
             _pane("%46", "stray-7", pane_label="mechanicus:7"),
         ],
     )

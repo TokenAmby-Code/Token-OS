@@ -389,7 +389,7 @@ def test_mechanicus_fg_and_admin_are_never_subscription_targets(app_env):
         pane="%50",
         pane_label="mechanicus:fabricator-general",
     )
-    _insert_instance(app_env.db_path, "admin-1", pane="%51", pane_label="mechanicus:admin")
+    _insert_instance(app_env.db_path, "admin-1", pane="%51", pane_label="council:administratum")
 
     async def run() -> None:
         result = await hooks.reconcile_hook_subscriptions(
@@ -932,7 +932,7 @@ def test_mark_for_close_endpoint_refuses_protected_persona_pane(
     async def fake_role(pane: str, option: str) -> str:
         assert pane == "%95"
         assert option == "@PANE_ID"
-        return "legion:custodes"
+        return "council:custodes"
 
     monkeypatch.setattr(hooks, "_tmux_show_pane_option", fake_role)
 
@@ -1091,16 +1091,16 @@ def test_mark_for_close_checks_resolved_protected_pane(
     app_env: object, monkeypatch: object
 ) -> None:
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "malcador-pane", pane="%100", pane_label="legion:malcador")
+    _insert_instance(app_env.db_path, "malcador-pane", pane="%100", pane_label="council:malcador")
 
     async def fake_resolve(db: object, pane: str | None) -> dict:
-        assert pane == "legion:malcador"
+        assert pane == "council:malcador"
         return {"id": "malcador-pane", "tmux_pane": "%100"}
 
     async def fake_role(pane: str, option: str) -> str:
         assert pane == "%100"
         assert option == "@PANE_ID"
-        return "legion:malcador"
+        return "council:malcador"
 
     monkeypatch.setattr(hooks, "_resolve_instance_for_pane", fake_resolve)
     monkeypatch.setattr(hooks, "_tmux_show_pane_option", fake_role)
@@ -1109,13 +1109,13 @@ def test_mark_for_close_checks_resolved_protected_pane(
         result = await hooks.mark_instance_for_close(
             "malcador-pane",
             hooks.MarkForCloseRequest(
-                mode="after-stop", lifecycle="retire", pane="legion:malcador"
+                mode="after-stop", lifecycle="retire", pane="council:malcador"
             ),
         )
         assert result["success"] is False
         assert result["action"] == "protected_pane"
         assert result["pane"] == "%100"
-        assert result["pane_role"] == "legion:malcador"
+        assert result["pane_role"] == "council:malcador"
 
     asyncio.run(run())
 
@@ -1124,7 +1124,7 @@ def test_mark_for_close_refuses_stored_protected_pane_label_when_pane_omitted(
     app_env: object, monkeypatch: object
 ) -> None:
     hooks = sys.modules["routes.hooks"]
-    _insert_instance(app_env.db_path, "pax-pane", pane="%101", pane_label="koronus:pax")
+    _insert_instance(app_env.db_path, "pax-pane", pane="%101", pane_label="council:pax")
 
     async def fake_role(pane: str, option: str) -> str:
         assert pane == "%101"
@@ -1140,7 +1140,7 @@ def test_mark_for_close_refuses_stored_protected_pane_label_when_pane_omitted(
         )
         assert result["success"] is False
         assert result["action"] == "protected_pane"
-        assert result["pane_role"] == "koronus:pax"
+        assert result["pane_role"] == "council:pax"
 
     asyncio.run(run())
 
@@ -1260,7 +1260,7 @@ def test_reconcile_skips_worker_parented_to_other_live_instance(app_env):
         app_env.db_path, "fg-other", pane="%72", pane_label="mechanicus:fabricator-general"
     )
     # A different LIVE commander owns this worker — it is NOT an FG child.
-    _insert_instance(app_env.db_path, "custodes-live", pane="%73", pane_label="legion:custodes")
+    _insert_instance(app_env.db_path, "custodes-live", pane="%73", pane_label="council:custodes")
     _insert_instance(
         app_env.db_path,
         "worker-elsewhere",

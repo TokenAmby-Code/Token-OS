@@ -28,7 +28,7 @@ from tmuxctl.assertions import (
 )
 
 FG_LABEL = "mechanicus:fabricator-general"
-ADMIN_LABEL = "mechanicus:admin"
+ADMIN_LABEL = "council:administratum"
 
 
 def _fg_spec() -> PersonaSpec:
@@ -36,7 +36,7 @@ def _fg_spec() -> PersonaSpec:
 
 
 def _custodes_spec() -> PersonaSpec:
-    return PersonaSpec("legion:custodes", "custodes", "hook_driven", "/tmp/c.md", sync=True)
+    return PersonaSpec("council:custodes", "custodes", "hook_driven", "/tmp/c.md", sync=True)
 
 
 def _admin_spec() -> PersonaSpec:
@@ -91,16 +91,16 @@ class FakeAdapter:
 
 
 def test_persona_specs_pin_model_defaults():
-    assert persona_spec("legion:custodes").model == "opus"
-    assert persona_spec("legion:malcador").model == "fable"
+    assert persona_spec("council:custodes").model == "opus"
+    assert persona_spec("council:malcador").model == "fable"
     assert persona_spec("mechanicus:fabricator-general").model == ""
-    assert persona_spec("mechanicus:admin").model == "sonnet"
-    assert persona_spec("koronus:pax").model == "opus"
-    assert persona_spec("koronus:orchestrator").model == "sonnet"
+    assert persona_spec("council:administratum").model == "sonnet"
+    assert persona_spec("council:pax").model == "opus"
+    assert persona_spec("mechanicus:orchestrator").model == "sonnet"
 
 
 def test_malcador_spec_is_not_sync() -> None:
-    spec = persona_spec("legion:malcador")
+    spec = persona_spec("council:malcador")
     assert spec.sync is False
     assert spec.persona == "malcador"
     assert spec.session_doc.endswith("Terra/Sessions/malcador.md")
@@ -195,7 +195,7 @@ def test_custodes_matches_canonical_persona_slug():
     spec = _custodes_spec()
     row = SimpleNamespace(
         instance_id="i-c",
-        pane_label="legion:custodes",
+        pane_label="council:custodes",
         persona_slug="custodes",
         legion="",
         instance_type="",
@@ -217,7 +217,7 @@ def test_custodes_fails_when_not_custodes():
     assert _row_matches_persona(_row(legion="astartes", instance_type="sync"), spec) is False
     impostor = SimpleNamespace(
         instance_id="i-x",
-        pane_label="legion:custodes",
+        pane_label="council:custodes",
         persona_slug="malcador",
         legion="",
         instance_type="",
@@ -230,7 +230,7 @@ def test_custodes_fails_on_wrong_rank_when_rank_surfaced() -> None:
     spec = _custodes_spec()
     row = SimpleNamespace(
         instance_id="i-c",
-        pane_label="legion:custodes",
+        pane_label="council:custodes",
         persona_slug="custodes",
         rank="astartes",
         legion="",
@@ -282,10 +282,10 @@ def test_admin_fails_on_pane_label_mismatch_even_with_right_primarch():
 
 
 def test_koronus_pax_matches_on_canonical_persona_slug_and_rank() -> None:
-    spec = persona_spec("koronus:pax")
+    spec = persona_spec("council:pax")
     row = SimpleNamespace(
         instance_id="i-pax",
-        pane_label="koronus:pax",
+        pane_label="council:pax",
         persona_slug="pax",
         rank="overseer",
         legion="civic",
@@ -297,10 +297,10 @@ def test_koronus_pax_matches_on_canonical_persona_slug_and_rank() -> None:
 
 
 def test_koronus_orchestrator_matches_on_primarch_fallback() -> None:
-    spec = persona_spec("koronus:orchestrator")
+    spec = persona_spec("mechanicus:orchestrator")
     row = SimpleNamespace(
         instance_id="i-orch",
-        pane_label="koronus:orchestrator",
+        pane_label="mechanicus:orchestrator",
         persona_slug="",
         rank="overseer",
         legion="civic",
@@ -312,10 +312,10 @@ def test_koronus_orchestrator_matches_on_primarch_fallback() -> None:
 
 
 def test_koronus_pax_fails_on_wrong_rank() -> None:
-    spec = persona_spec("koronus:pax")
+    spec = persona_spec("council:pax")
     row = SimpleNamespace(
         instance_id="i-pax",
-        pane_label="koronus:pax",
+        pane_label="council:pax",
         persona_slug="pax",
         rank="astartes",
         legion="civic",
@@ -337,9 +337,9 @@ def test_admin_hash_busts_on_primarch_change():
 def test_guard_hash_busts_on_rank_change() -> None:
     # Rank is part of singleton identity; the mismatch guard must re-evaluate
     # when SessionStart repairs a wrong-rank row.
-    spec = persona_spec("koronus:pax")
-    h_astartes = _observed_row_hash(_row(pane_label="koronus:pax", rank="astartes"), spec)
-    h_overseer = _observed_row_hash(_row(pane_label="koronus:pax", rank="overseer"), spec)
+    spec = persona_spec("council:pax")
+    h_astartes = _observed_row_hash(_row(pane_label="council:pax", rank="astartes"), spec)
+    h_overseer = _observed_row_hash(_row(pane_label="council:pax", rank="overseer"), spec)
     assert h_astartes != h_overseer
 
 
@@ -421,11 +421,11 @@ def test_assert_instance_notes_singleton_mismatch_without_persona_injection() ->
     from tmuxctl.assertions import assert_instance
 
     adapter = FakeAdapter()
-    # Persistently-mismatched live Pax row: it is in the protected koronus:pax
+    # Persistently-mismatched live Pax row: it is in the protected council:pax
     # pane but the DB binding is still a generic astartes worker.
     row = _row(
         instance_id="7cd51be3",
-        pane_label="koronus:pax",
+        pane_label="council:pax",
         persona_slug="blood-angels",
         rank="astartes",
         legion="astartes",
@@ -434,7 +434,7 @@ def test_assert_instance_notes_singleton_mismatch_without_persona_injection() ->
         primarch="",
     )
 
-    resolved = SimpleNamespace(pane_id="%25", pane_role="koronus:pax")
+    resolved = SimpleNamespace(pane_id="%25", pane_role="council:pax")
     with (
         patch.object(assertions, "resolve_pane", return_value=resolved),
         patch.object(assertions, "_pane_type", return_value="koronus"),
@@ -443,7 +443,7 @@ def test_assert_instance_notes_singleton_mismatch_without_persona_injection() ->
         patch.object(assertions, "_send_persona_command", return_value=(True, "sent")) as send,
         patch.object(assertions, "log_event"),
     ):
-        result = assert_instance(adapter, "koronus:pax")
+        result = assert_instance(adapter, "council:pax")
 
     assert result["ok"] is False
     assert result["action"] == "persona_mismatch_noted"
@@ -516,10 +516,10 @@ def test_unregistered_note_suppresses_within_backoff():
 
 def test_mismatch_note_does_not_inject_persona_and_backs_off() -> None:
     adapter = FakeAdapter()
-    spec = persona_spec("koronus:pax")
+    spec = persona_spec("council:pax")
     row = _row(
         instance_id="i-pax",
-        pane_label="koronus:pax",
+        pane_label="council:pax",
         persona_slug="blood-angels",
         rank="astartes",
         legion="astartes",
@@ -579,7 +579,7 @@ def test_clear_pane_overlay_preserves_static_persona_guard():
     adapter = FakeAdapter()
     adapter.options.update(
         {
-            "@PANE_ID": "legion:custodes",
+            "@PANE_ID": "council:custodes",
             "@PANE_TYPE": "legion",
             "@PANE_LABEL": "custodes",
             PERSONA_GUARD_OPTION: "{}",
@@ -637,8 +637,8 @@ def test_sweep_captures_per_pane_errors_without_aborting():
     adapter = FakeAdapter()
 
     def fake_assert(_adapter, label):
-        if label == "legion:malcador":
-            raise ValueError("no live pane: legion:malcador")
+        if label == "council:malcador":
+            raise ValueError("no live pane: council:malcador")
         return {"ok": True, "pane_label": label, "action": "none"}
 
     with patch.object(assertions, "assert_instance", side_effect=fake_assert):
@@ -646,7 +646,7 @@ def test_sweep_captures_per_pane_errors_without_aborting():
 
     assert len(results) == len(PERSONA_LABELS)
     errored = [r for r in results if r["action"] == "error"]
-    assert [r["pane_label"] for r in errored] == ["legion:malcador"]
+    assert [r["pane_label"] for r in errored] == ["council:malcador"]
     assert errored[0]["ok"] is False
     # Every other persona pane still got asserted.
     assert sum(1 for r in results if r.get("action") == "none") == len(PERSONA_LABELS) - 1
@@ -665,7 +665,7 @@ def test_build_snapshot_extracts_persona_slug_and_rank():
             {
                 "id": "i-c",
                 "device_id": "Mac-Mini",
-                "pane_label": "legion:custodes",
+                "pane_label": "council:custodes",
                 "status": "working",
                 "persona": {"slug": "custodes"},
                 "rank": "overseer",

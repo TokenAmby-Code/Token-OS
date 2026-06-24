@@ -55,7 +55,7 @@ def install_tombstone(
     """Turn an existing stable slot pane into a tombstone for a promoted pane.
 
     This is intentionally independent from expand/zoom. A tombstone preserves a
-    canonical logical slot such as ``legion:custodes`` while the real process is
+    canonical logical slot such as ``council:custodes`` while the real process is
     promoted elsewhere. The slot remains resolvable by @PANE_ID and points at
     the live target via @TOMBSTONE_TARGET.
     """

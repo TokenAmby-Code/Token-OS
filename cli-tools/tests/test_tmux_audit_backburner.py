@@ -11,7 +11,7 @@ AUDIT = ROOT / "bin" / "tmux-audit"
 LEGION_ROWS = "\n".join(
     [
         # Custodes idle at a shell prompt — protected by @PANE_TYPE=legion.
-        "%C\tzsh\tlegion\tlegion:custodes",
+        "%C\tzsh\tlegion\tcouncil:custodes",
         # A demoted live agent — a stack-worker, but running claude, never idle.
         "%live\tclaude\tstack-worker\tlegion:1",
         # An untyped grid pane that wandered in — not an explicit stack-worker.

@@ -2,7 +2,7 @@
 
 Source bug: a `legion=civic` write (civic is an ALLOWED_LEGION but maps to no
 persona; the legacy `legion` column died into `persona_id`) nulled the persona
-slug on the koronus:pax / koronus:orchestrator singleton rows. The resolver then
+slug on the council:pax / mechanicus:orchestrator singleton rows. The resolver then
 reported "no live instance" and suppressed every send
 (`persona_unregistered_suppressed attempts=45`) while the pane was demonstrably
 alive.
@@ -14,7 +14,7 @@ Two halves, mirroring the fix split:
      slug is preserved (prior valid state intact). Tested directly against the
      schema with a raw `persona_id = NULL` UPDATE.
 
-  #1 verify-only registration — the koronus:pax / orchestrator SessionStart
+  #1 verify-only registration — the council:pax / orchestrator SessionStart
      registration binds persona via `primarch` and never issues a persona-nulling
      `legion=civic` write, and the `/api/instances/{id}/legion` endpoint with civic
      on an already-bound singleton preserves the binding.
@@ -203,13 +203,13 @@ def _start_session(hooks, session_id, env=None):
 def test_pax_sessionstart_civic_legion_binds_persona_not_null(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """koronus:pax registers under legion=civic but binds persona via primarch=pax.
+    """council:pax registers under legion=civic but binds persona via primarch=pax.
 
     The civic legion label must NOT drive a persona-nulling write: the row ends up
     bound to the `pax` persona, never NULL.
     """
     hooks = sys.modules["routes.hooks"]
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:pax"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:pax"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "pax-reg")
@@ -220,13 +220,13 @@ def test_pax_sessionstart_civic_legion_binds_persona_not_null(
 def test_orchestrator_sessionstart_civic_legion_binds_persona_not_null(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """koronus:orchestrator registers under legion=civic but binds via primarch.
+    """mechanicus:orchestrator registers under legion=civic but binds via primarch.
 
     Same invariant as pax: the shared civic legion label must never drive a
     persona-nulling write — the row binds to the `orchestrator` persona.
     """
     hooks = sys.modules["routes.hooks"]
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:orchestrator"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("mechanicus:orchestrator"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "orch-reg")

@@ -62,7 +62,7 @@ def test_list_free_panes_excludes_live_agent_even_when_instance_stamp_missing(mo
 
     monkeypatch.setattr(custodes, "pane_has_active_agent", fake_active)
     rows = [
-        ("%custodes", "1", "", "legion:custodes", "legion", "999"),
+        ("%custodes", "1", "", "council:custodes", "legion", "999"),
         ("%worker", "1", "", "legion:1", "legion", "1000"),
     ]
 

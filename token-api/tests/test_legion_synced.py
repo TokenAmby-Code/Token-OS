@@ -584,7 +584,7 @@ class TestPersonaPaneAutoSetup:
         return row
 
     def test_custodes_pane(self, client):
-        row = self._register(client, "legion:custodes", "%32")
+        row = self._register(client, "council:custodes", "%32")
         assert row["legion"] == "custodes"
         assert row["primarch"] == "custodes"
         # Custodes resting identity is persona + rank, NOT sync. The legacy
@@ -623,7 +623,7 @@ class TestPersonaPaneAutoSetup:
     def test_administratum_pane(self, client):
         # Administratum resolves on primarch='administratum' — the field that
         # MUST be backfilled or the recorder becomes unfindable.
-        row = self._register(client, "mechanicus:admin", "%41")
+        row = self._register(client, "council:administratum", "%41")
         assert row["legion"] == "mechanicus"
         assert row["primarch"] == "administratum"
         assert row["instance_type"] == "one_off"
@@ -790,7 +790,7 @@ class TestWorkflowState:
                 "env": {
                     "TOKEN_API_ENGINE": "claude",
                     "TOKEN_API_LAUNCHER": "dispatch",
-                    "TOKEN_API_DISPATCH_TARGET": "legion:new",
+                    "TOKEN_API_DISPATCH_TARGET": "mechanicus:new",
                     "TOKEN_API_DISPATCH_WINDOW": "legion",
                     "TOKEN_API_DISPATCH_MODE": "stack_new",
                     "TOKEN_API_DISPATCH_SESSION_DOC_PATH": str(session_doc),

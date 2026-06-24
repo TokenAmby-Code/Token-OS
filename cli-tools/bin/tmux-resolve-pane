@@ -3,7 +3,7 @@
 # TAGS: tmux, resolver
 # AUDIENCE: agent, user, system
 #
-# Accepts raw tmux pane ids (%5), @PANE_ID roles (palace:N, legion:custodes),
+# Accepts raw tmux pane ids (%5), @PANE_ID roles (palace:N, council:custodes),
 # and positional ids (1:N, palace:N). Resolution is live and uncached.
 
 set -euo pipefail
@@ -18,7 +18,7 @@ Usage: tmux-resolve-pane [--format id|physical|full|json] <target>
 Examples:
   tmux-resolve-pane 1:N
   tmux-resolve-pane palace:N
-  tmux-resolve-pane --format json legion:custodes
+  tmux-resolve-pane --format json council:custodes
 EOF
 }
 

@@ -334,7 +334,7 @@ def test_worker_snaps_on_each_event_hot_playback_start(app_env, monkeypatch) -> 
     tts.hot_queue.clear()
     tts.hot_queue.append(_make_item(tts, "alpha", tmux_pane="palace:1", focus_on_playback=True))
     tts.hot_queue.append(
-        _make_item(tts, "bravo", tmux_pane="legion:custodes", focus_on_playback=True)
+        _make_item(tts, "bravo", tmux_pane="council:custodes", focus_on_playback=True)
     )
 
     async def drive():
@@ -373,7 +373,7 @@ def test_worker_does_not_snap_promoted_pause_queue_items(app_env, monkeypatch) -
     # This simulates an item that was originally pause-queued, then later moved
     # into hot_queue by promote/play-pane. Its queue_target may now be hot, but
     # focus_on_playback remains false.
-    tts.hot_queue.append(_make_item(tts, "custodes-backlog", tmux_pane="legion:custodes"))
+    tts.hot_queue.append(_make_item(tts, "custodes-backlog", tmux_pane="council:custodes"))
 
     async def drive():
         task = asyncio.create_task(tts.tts_queue_worker())

@@ -26,12 +26,12 @@ from .tmux_adapter import TmuxAdapter
 DISPATCH_BIN = "dispatch"
 CLAUDE_CMD_BIN = "claude-cmd"
 PERSONA_LABELS = {
-    "legion:custodes",
-    "legion:malcador",
+    "council:custodes",
+    "council:malcador",
     "mechanicus:fabricator-general",
-    "mechanicus:admin",
-    "koronus:pax",
-    "koronus:orchestrator",
+    "council:administratum",
+    "council:pax",
+    "mechanicus:orchestrator",
 }
 EXPECTED_PERSONA_RANKS = {
     "custodes": "overseer",
@@ -91,7 +91,7 @@ def _admin_log() -> str:
 
 
 def persona_spec(label: str) -> PersonaSpec:
-    if label == "legion:custodes":
+    if label == "council:custodes":
         return PersonaSpec(
             label,
             "custodes",
@@ -101,7 +101,7 @@ def persona_spec(label: str) -> PersonaSpec:
             model="opus",
             working_dir=_persona_working_dir(),
         )
-    if label == "legion:malcador":
+    if label == "council:malcador":
         return PersonaSpec(
             label,
             "malcador",
@@ -118,7 +118,7 @@ def persona_spec(label: str) -> PersonaSpec:
             str(_vault_root() / "Mars" / "Sessions" / "fabricator-general.md"),
             working_dir=_persona_working_dir(),
         )
-    if label == "mechanicus:admin":
+    if label == "council:administratum":
         return PersonaSpec(
             label,
             "administratum",
@@ -127,7 +127,7 @@ def persona_spec(label: str) -> PersonaSpec:
             model="sonnet",
             working_dir=_persona_working_dir(),
         )
-    if label == "koronus:pax":
+    if label == "council:pax":
         # Pax: the combined Custodes+Administratum civic seat (human-facing
         # interaction + record-keeper). Opus, launched from the Civic vault.
         return PersonaSpec(
@@ -138,7 +138,7 @@ def persona_spec(label: str) -> PersonaSpec:
             model="opus",
             working_dir=str(CIVIC_VAULT),
         )
-    if label == "koronus:orchestrator":
+    if label == "mechanicus:orchestrator":
         # Orchestrator: the civic dispatch seat (the role the Fabricator-General
         # plays for mechanicus). Sonnet pending a model spike (see the spec doc),
         # launched from the Civic vault.

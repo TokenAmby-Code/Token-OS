@@ -252,7 +252,7 @@ def test_run_morning_session_marks_failed_when_custodes_never_registers(isolated
 def test_run_morning_session_falls_back_when_custodes_pane_unregistered(
     isolated_morning_dir: Path,
 ) -> None:
-    """A live but unregistered legion:custodes pane must not brick the morning.
+    """A live but unregistered council:custodes pane must not brick the morning.
 
     This is the 2026-06-15 failure mode: SessionStart registration was lost, so
     tmuxctl assert-instance returned persona_unregistered_live_runtime. The
@@ -281,7 +281,7 @@ def test_run_morning_session_falls_back_when_custodes_pane_unregistered(
                 ),
             )
         if "dispatch" in str(cmd[0]):
-            assert "legion:new" in cmd
+            assert "mechanicus:new" in cmd
             return _completed(cmd, 0, stdout="dispatched\n")
         raise AssertionError(f"unexpected cmd: {cmd}")
 
@@ -310,7 +310,7 @@ def test_run_morning_session_falls_back_when_custodes_pane_unregistered(
     assert result["status"] == "active"
     assert result["instance_id"] == "fresh-custodes"
     assert result["pane_id"] == "%101"
-    assert any("dispatch" in str(cmd[0]) and "legion:new" in cmd for cmd in calls)
+    assert any("dispatch" in str(cmd[0]) and "mechanicus:new" in cmd for cmd in calls)
     assert not any(_cmd_is(cmd, "send-text") for cmd in calls)
     confirm.assert_called_once()
     assert confirm.call_args.kwargs["pane_id"] is None

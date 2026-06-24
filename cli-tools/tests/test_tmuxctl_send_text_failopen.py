@@ -37,7 +37,7 @@ def _run_send_text(assertion: dict, *, text: str = "enforcement payload"):
         patch.object(cli, "TmuxControlPlane", return_value=control),
         patch("tmuxctl.assertions.assert_instance", return_value=assertion) as assert_inst,
     ):
-        rc = cli.main(["send-text", "--pane", "legion:custodes", "--text", text])
+        rc = cli.main(["send-text", "--pane", "council:custodes", "--text", text])
     return rc, control, assert_inst
 
 
@@ -56,7 +56,7 @@ def test_send_text_fails_open_and_delivers_when_assertion_deliverable():
     # The byte-bearing payload reached the pane despite the stuck correction.
     control.adapter.send_text_then_submit.assert_called_once()
     sent_args = control.adapter.send_text_then_submit.call_args
-    assert sent_args.args[0] == "legion:custodes"
+    assert sent_args.args[0] == "council:custodes"
     assert sent_args.args[1] == "enforcement payload"
 
 

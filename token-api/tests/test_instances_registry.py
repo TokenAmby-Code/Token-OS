@@ -577,7 +577,7 @@ def test_session_start_dispatch_targets_bind_persona_commanders(app_env):
                 "env": {
                     "TOKEN_API_ENGINE": "codex",
                     "TOKEN_API_LAUNCHER": "dispatch",
-                    "TOKEN_API_DISPATCH_TARGET": "legion:new",
+                    "TOKEN_API_DISPATCH_TARGET": "mechanicus:new",
                 },
             }
         )

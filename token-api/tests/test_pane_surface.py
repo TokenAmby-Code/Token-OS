@@ -91,9 +91,9 @@ def test_golden_throne_human_surface_dynamic_workspace_uses_name(app_env):
         app_env.main._golden_throne_human_surface(
             "custodes-cascade-intervention",
             "%102",
-            "legion:custodes",
+            "council:custodes",
         )
-        == "legion:custodes custodes-cascade-intervention"
+        == "council:custodes custodes-cascade-intervention"
     )
 
 

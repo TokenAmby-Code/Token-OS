@@ -70,7 +70,7 @@ case "$1" in
     exit 0 ;;
   show-options)
     if [[ "$*" == *"@INSTANCE_ID"* ]]; then printf '{instance}\n'; fi
-    if [[ "$*" == *"@PANE_ID"* ]]; then printf 'legion:worker\n'; fi
+    if [[ "$*" == *"@PANE_ID"* ]]; then printf 'mechanicus:worker\n'; fi
     exit 0 ;;
   *) exit 0 ;;
 esac

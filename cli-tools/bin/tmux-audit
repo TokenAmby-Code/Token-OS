@@ -90,7 +90,7 @@ assert_backburner() {
             legion|mechanicus|tombstone) return 0 ;;
         esac
         case "$label" in
-            legion:custodes|mechanicus:fabricator-general|mechanicus:admin) return 0 ;;
+            council:custodes|mechanicus:fabricator-general|council:administratum) return 0 ;;
         esac
         return 1
     }

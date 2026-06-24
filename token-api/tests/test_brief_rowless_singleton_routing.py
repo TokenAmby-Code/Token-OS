@@ -52,7 +52,7 @@ async def test_brief_rowless_live_codex_singleton_uses_tmuxctl_fallback(
 
     result = await main.brief_send(
         main.BriefSendRequest(
-            caller_pane="legion:custodes",
+            caller_pane="council:custodes",
             panes=["mechanicus:fabricator-general"],
             payload="PR-B probe",
         )
@@ -120,9 +120,9 @@ async def test_brief_registry_row_path_still_uses_queue(
     main = app_env.main
     target = {
         "pane_id": "%46",
-        "position_id": "legion:custodes",
+        "position_id": "council:custodes",
         "source": "pane",
-        "spec": "legion:custodes",
+        "spec": "council:custodes",
     }
 
     async def _targets(**_kwargs):
@@ -151,7 +151,7 @@ async def test_brief_registry_row_path_still_uses_queue(
     monkeypatch.setattr(main, "_direct_tmux_pane_delivery", _direct)
 
     result = await main.brief_send(
-        main.BriefSendRequest(panes=["legion:custodes"], payload="row path")
+        main.BriefSendRequest(panes=["council:custodes"], payload="row path")
     )
 
     assert result["delivered"] == 1
@@ -176,7 +176,7 @@ async def test_talk_rowless_live_codex_singleton_uses_tmuxctl_fallback(
     main = app_env.main
 
     async def _resolve(spec):
-        return {"legion:custodes": "%10", "mechanicus:fabricator-general": "%44"}.get(spec)
+        return {"council:custodes": "%10", "mechanicus:fabricator-general": "%44"}.get(spec)
 
     async def _no_return(**_kwargs):
         return None
@@ -217,7 +217,7 @@ async def test_talk_rowless_live_codex_singleton_uses_tmuxctl_fallback(
 
     result = await main.talk_send(
         main.TalkSendRequest(
-            caller_pane="legion:custodes",
+            caller_pane="council:custodes",
             target_pane="mechanicus:fabricator-general",
             payload="talk probe",
         )

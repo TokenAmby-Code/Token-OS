@@ -36,9 +36,9 @@ API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 # So: never auto-clear a persona row — preserve it for reactivation.
 PERSONA_SLUGS = {"custodes", "fabricator-general", "administratum"}
 PERSONA_PANE_LABELS = {
-    "legion:custodes",
+    "council:custodes",
     "mechanicus:fabricator-general",
-    "mechanicus:admin",
+    "council:administratum",
 }
 
 def _is_persona_row(inst: dict) -> bool:

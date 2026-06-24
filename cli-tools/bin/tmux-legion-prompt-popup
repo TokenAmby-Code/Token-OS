@@ -40,5 +40,5 @@ fi
 # If the user Ctrl-C's out of any selector, dispatch exits 130 and this popup
 # closes without opening a worker pane or continuing down a launch path.
 log_debug "starting dispatch selector chars=${#PROMPT_TEXT}"
-TOKEN_API_DISPATCH_ORIGIN=d "$DISPATCH_BIN" --direct --target legion:new --prompt "$PROMPT_TEXT"
+TOKEN_API_DISPATCH_ORIGIN=d "$DISPATCH_BIN" --direct --target mechanicus:new --prompt "$PROMPT_TEXT"
 log_debug "dispatch selector exited rc=0"

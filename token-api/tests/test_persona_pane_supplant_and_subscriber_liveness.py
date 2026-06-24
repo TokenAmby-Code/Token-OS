@@ -226,7 +226,7 @@ def test_subscriber_flag_resolves_live_pane_over_dead_id(app_env, monkeypatch):
 
 
 def test_custodes_pane_assigns_reserved_george_profile(app_env, monkeypatch):
-    # A fresh session in the legion:custodes pane resolves to the custodes persona,
+    # A fresh session in the council:custodes pane resolves to the custodes persona,
     # which must override whatever random chapter it drew at registration with the
     # reserved Custodes profile (George). George lives outside the rotation pools,
     # so this hook is the only path that ever assigns it.
@@ -234,7 +234,7 @@ def test_custodes_pane_assigns_reserved_george_profile(app_env, monkeypatch):
     from shared import CUSTODES_PROFILE
 
     async def custodes_label(_pane):
-        return hooks.CUSTODES_PANE_LABEL  # "legion:custodes"
+        return hooks.CUSTODES_PANE_LABEL  # "council:custodes"
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", custodes_label)
 

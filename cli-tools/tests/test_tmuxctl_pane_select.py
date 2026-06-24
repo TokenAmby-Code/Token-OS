@@ -199,7 +199,7 @@ def mechanicus_adapter(
         },
         {
             "pane_id": "%A",
-            "role": "mechanicus:admin",
+            "role": "council:administratum",
             "type": "mechanicus",
             "left": 0,
             "top": 25,
@@ -237,14 +237,14 @@ def legion_adapter(*, current: str = "%C", workers: bool = True) -> FakePaneSele
     panes: list[dict[str, object]] = [
         {
             "pane_id": "%C",
-            "role": "legion:custodes",
+            "role": "council:custodes",
             "type": "legion",
             "left": 0,
             "top": 0,
         },
         {
             "pane_id": "%M",
-            "role": "legion:malcador",
+            "role": "council:malcador",
             "type": "legion",
             "left": 0,
             "top": 25,
@@ -281,14 +281,14 @@ def koronus_adapter(*, current: str = "%P", workers: bool = True) -> FakePaneSel
     panes: list[dict[str, object]] = [
         {
             "pane_id": "%P",
-            "role": "koronus:pax",
+            "role": "council:pax",
             "type": "koronus",
             "left": 0,
             "top": 0,
         },
         {
             "pane_id": "%O",
-            "role": "koronus:orchestrator",
+            "role": "mechanicus:orchestrator",
             "type": "koronus",
             "left": 0,
             "top": 25,
@@ -323,8 +323,8 @@ def koronus_adapter(*, current: str = "%P", workers: bool = True) -> FakePaneSel
 
 def test_legion_absolute_arrows_select_persona_and_worker_extremes():
     expected = {
-        "left": "legion:custodes",
-        "right": "legion:malcador",
+        "left": "council:custodes",
+        "right": "council:malcador",
         "up": "legion:1",
         "down": "legion:2",
     }
@@ -341,7 +341,7 @@ def test_legion_absolute_arrows_select_persona_and_worker_extremes():
 def test_mechanicus_absolute_arrows_select_persona_and_worker_extremes():
     expected = {
         "left": "mechanicus:fabricator-general",
-        "right": "mechanicus:admin",
+        "right": "council:administratum",
         "up": "mechanicus:1",
         "down": "mechanicus:2",
     }
@@ -357,8 +357,8 @@ def test_mechanicus_absolute_arrows_select_persona_and_worker_extremes():
 
 def test_koronus_absolute_arrows_select_persona_and_worker_extremes():
     expected = {
-        "left": "koronus:pax",
-        "right": "koronus:orchestrator",
+        "left": "council:pax",
+        "right": "mechanicus:orchestrator",
         "up": "koronus:1",
         "down": "koronus:2",
     }
@@ -406,8 +406,8 @@ def test_mechanicus_absolute_right_selects_admin():
 
     select_pane(adapter, mode="absolute", direction="right", client="/dev/ttys001")
 
-    assert adapter._pane()["role"] == "mechanicus:admin"
-    assert ("select-pane", "-t", "mechanicus:admin") in adapter.commands
+    assert adapter._pane()["role"] == "council:administratum"
+    assert ("select-pane", "-t", "council:administratum") in adapter.commands
 
 
 def test_mechanicus_absolute_up_down_select_worker_top_bottom():

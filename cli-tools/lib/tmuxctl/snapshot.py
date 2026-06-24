@@ -18,9 +18,8 @@ from .tmux_adapter import TmuxAdapter, TmuxError
 AUDIENCE_WINDOW_PAGES = {
     "_palace_audience": "palace",
     "_somnium_audience": "somnium",
-    "_legion_audience": "legion",
+    "_council_audience": "council",
     "_mechanicus_audience": "mechanicus",
-    "_koronus_audience": "koronus",
 }
 
 
@@ -55,9 +54,9 @@ def _infer_archetype(window_name: str) -> WindowArchetype:
         return WindowArchetype.PALACE
     if base == "somnium":
         return WindowArchetype.SOMNIUM
-    if base == "legion":
-        return WindowArchetype.LEGION_STACK
-    if base in {"mechanicus", "koronus", "mars", "kreig", "reservists"}:
+    if base == "council":
+        return WindowArchetype.COUNCIL
+    if base in {"mechanicus", "mars", "kreig", "reservists"}:
         return WindowArchetype.MECHANICUS_STACK
     return WindowArchetype.UNKNOWN
 

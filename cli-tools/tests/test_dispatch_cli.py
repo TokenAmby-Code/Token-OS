@@ -20,7 +20,7 @@ def test_dispatch_claude_system_prompt_file_dry_run(tmp_path):
             str(DISPATCH),
             "--dry-run",
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--dir",
             str(ROOT),
             "--system-prompt-file",
@@ -132,7 +132,7 @@ def test_dispatch_legion_shorthand_only_consumes_leading_token():
     )
     assert result.returncode == 0, result.stderr
     assert "target:          current" in result.stdout
-    assert "legion:new" not in result.stdout
+    assert "mechanicus:new" not in result.stdout
 
 
 def test_dispatch_explicit_target_overrides_shorthand():
@@ -506,7 +506,7 @@ def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_pa
       d --direct "direct work"
       cdc {ROOT} --direct "direct cdc"
       d --resume resume-session-id
-      d --target legion:new "new pane"
+      d --target mechanicus:new "new pane"
     """
     env = os.environ.copy()
     env.update(
@@ -536,7 +536,7 @@ def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_pa
     assert lines[2] == "d|--interactive --pane self --direct direct work"
     assert lines[3] == f"cdc|--interactive --pane self --dir {ROOT} --direct direct cdc"
     assert lines[4] == "d|--interactive --pane self --resume resume-session-id"
-    assert lines[5] == "d|--interactive --target legion:new new pane"
+    assert lines[5] == "d|--interactive --target mechanicus:new new pane"
 
 
 def test_dispatch_human_origin_defaults_to_self_pane_in_tmux(
@@ -938,7 +938,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
             "--dir",
             str(ROOT),
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--victory-condition",
             "Tests pass",
             "Implement safely",
@@ -956,7 +956,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert data["dispatch_schema_complete"] is True
     assert data["dispatch_ready"] is False
     assert data["operator_approved_dispatch"] is False
-    assert "dispatched claude to legion:new" in result.stdout
+    assert "dispatched claude to mechanicus:new" in result.stdout
     assert "%83" not in result.stdout
 
     note = next((vault / "Aspirants").glob("implement-safely*.md"))
@@ -970,7 +970,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "which other questions are needed for this aspirant?" in note_text
     assert "importance: 10" in note_text
     assert "launch_action: dispatch --direct --engine claude" in result.stdout
-    assert "--target legion:new" in result.stdout
+    assert "--target mechanicus:new" in result.stdout
     assert "--session-doc" in result.stdout
     assert "--system-prompt-file" in result.stdout
     assert "--prompt-file" in result.stdout
@@ -1039,7 +1039,7 @@ def test_dispatch_human_aspirant_launch_defaults_to_self_pane(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     assert "launch_action: dispatch --direct --engine codex" in result.stdout
     assert "--target self" in result.stdout
-    assert "--target legion:new" not in result.stdout
+    assert "--target mechanicus:new" not in result.stdout
     assert codex_log.exists()
 
 
@@ -1089,7 +1089,7 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
             "--dir",
             str(ROOT),
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--victory-condition",
             "Tests pass",
             "Implement with codex",
@@ -1107,7 +1107,7 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     assert "launch_action: dispatch --direct --engine codex" in result.stdout
     assert "--no-gt" in result.stdout
     assert "--system-prompt-file" not in result.stdout
-    assert "dispatched codex to legion:new" in result.stdout
+    assert "dispatched codex to mechanicus:new" in result.stdout
 
     tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
     send_line = next(line for line in tmux_text.splitlines() if "send-keys -t %84 bash " in line)
@@ -1138,7 +1138,7 @@ def test_dispatch_aspirant_dispatch_intake_only_preserves_note_only_behavior(tmp
             "--dir",
             str(ROOT),
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--victory-condition",
             "Tests pass",
             "Implement safely",
@@ -1167,7 +1167,7 @@ def test_tmux_prefix_space_launcher_uses_large_popup_without_enter_newline_hang(
     assert "IFS= read -e -r -p" in popup
     assert "TOKEN_API_DISPATCH_ORIGIN=d" in popup
     assert "--direct" in popup
-    assert "--target legion:new" in popup
+    assert "--target mechanicus:new" in popup
     assert "trap soft_cancel INT TERM" in popup
     assert "tmux-legion-prompt-popup.log" in popup
     assert "tmux run-shell" not in popup
@@ -1201,7 +1201,7 @@ def test_dispatch_emits_token_api_legion_for_custodes_persona():
             "--persona",
             "custodes",
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--dir",
             str(ROOT),
             "custodes work",
@@ -1217,14 +1217,14 @@ def test_dispatch_emits_token_api_legion_for_custodes_persona():
 
 
 def test_dispatch_emits_token_api_legion_for_custodes_slot_target():
-    # State-hook dispatcher targets the legion:custodes slot without a persona.
+    # State-hook dispatcher targets the council:custodes slot without a persona.
     result = subprocess.run(
         [
             str(DISPATCH),
             "--dry-run",
             "--direct",
             "--target",
-            "legion:custodes",
+            "council:custodes",
             "--dir",
             str(ROOT),
             "custodes work",
@@ -2033,7 +2033,7 @@ def test_dispatch_tmux_target_rejects_protected_singleton_seat(tmp_path: Path) -
     fake_tmux.write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> {tmux_log}\n'
-        'if [[ "$1" == "display-message" ]]; then printf "bash||legion:custodes|999|\\n"; exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "bash||council:custodes|999|\\n"; exit 0; fi\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -2048,7 +2048,7 @@ def test_dispatch_tmux_target_rejects_protected_singleton_seat(tmp_path: Path) -
         [
             str(DISPATCH),
             "--target",
-            "legion:custodes",
+            "council:custodes",
             "--dir",
             str(ROOT),
             "--no-worktree",

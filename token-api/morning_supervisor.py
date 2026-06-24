@@ -435,7 +435,7 @@ async def _backup_message_to_custodes(message: str) -> dict:
     try:
         resolved = await asyncio.to_thread(
             subprocess.run,
-            [str(tmuxctl), "resolve-pane", "--format", "physical", "legion:custodes"],
+            [str(tmuxctl), "resolve-pane", "--format", "physical", "council:custodes"],
             capture_output=True,
             text=True,
             timeout=5,

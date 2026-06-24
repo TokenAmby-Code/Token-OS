@@ -16,12 +16,12 @@ from .tmux_adapter import TmuxAdapter
 
 PROTECTED_STATIC_PERSONA_PANES = frozenset(
     {
-        "legion:custodes",
+        "council:custodes",
         "mechanicus:fabricator-general",
-        "mechanicus:admin",
-        "legion:malcador",
-        "koronus:pax",
-        "koronus:orchestrator",
+        "council:administratum",
+        "council:malcador",
+        "council:pax",
+        "mechanicus:orchestrator",
     }
 )
 

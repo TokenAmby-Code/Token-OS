@@ -421,11 +421,11 @@ _self_eval_pending: dict[str, float] = {}  # session_id -> timestamp of block
 SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
 
 MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
-MECHANICUS_ADMIN_LABEL = "mechanicus:admin"
-CUSTODES_PANE_LABEL = "legion:custodes"
-LEGION_MALCADOR_LABEL = "legion:malcador"
-KORONUS_PAX_LABEL = "koronus:pax"
-KORONUS_ORCHESTRATOR_LABEL = "koronus:orchestrator"
+MECHANICUS_ADMIN_LABEL = "council:administratum"
+CUSTODES_PANE_LABEL = "council:custodes"
+LEGION_MALCADOR_LABEL = "council:malcador"
+KORONUS_PAX_LABEL = "council:pax"
+KORONUS_ORCHESTRATOR_LABEL = "mechanicus:orchestrator"
 
 # Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
 # stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
@@ -433,7 +433,7 @@ KORONUS_ORCHESTRATOR_LABEL = "koronus:orchestrator"
 # the pane. This makes "SessionStart from
 # a persona pane registers correctly" an infrastructure invariant — no persona
 # ever has to self-PATCH legion/type/synced. The fields chosen match each
-# persona's own resolution key: custodes resolves on the legion:custodes pane marker,
+# persona's own resolution key: custodes resolves on the council:custodes pane marker,
 # FG on its pane label, Administratum on primarch='administratum'.
 #
 # Worker panes (mechanicus:N, mechanicus:worker-N) are intentionally absent — they
@@ -447,7 +447,7 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         # sync. The resting registration default matches FG/Admin (hook_driven);
         # the morning session sets sync MODE (instance_type='sync', synced=1) only
         # while a session is live, and clears it on /api/morning/end. Do NOT touch
-        # the legion:custodes pane marker — that is the pane source of truth.
+        # the council:custodes pane marker — that is the pane source of truth.
         "instance_type": "hook_driven",
         "synced": False,
     },
@@ -668,7 +668,7 @@ async def _apply_commander_binding(
         return
     target = (_normalize_text(dispatch_target) or "").lower()
     commander_slug = None
-    if target == "legion:new":
+    if target == "mechanicus:new":
         commander_slug = "custodes"
     elif target == "mechanicus:new":
         commander_slug = "fabricator-general"
@@ -730,7 +730,7 @@ async def _session_start_effective_pane(
     """Return an addressable pane for SessionStart side effects.
 
     Hook payloads sometimes arrive without ``TMUX_PANE`` even though the pane's
-    stable label (for example ``legion:custodes``) is present. Pane geometry is
+    stable label (for example ``council:custodes``) is present. Pane geometry is
     still not persisted: this resolves the transient label through tmuxctl's live
     pane oracle so SessionStart can stamp and tint the actual pane on this event.
     """
@@ -1827,7 +1827,7 @@ async def _tmux_pane_stack_window(pane: str | None) -> str | None:
         return None
     if pane_type == "stack-worker":
         return window_target
-    if pane_role in {"legion:worker", "legion:regiment", "mechanicus:worker"}:
+    if pane_role in {"mechanicus:worker", "mechanicus:regiment", "mechanicus:worker"}:
         return window_target
     if re.fullmatch(r"(legion|mechanicus):[1-9]\d*", pane_role or ""):
         return window_target
@@ -2606,7 +2606,7 @@ async def handle_session_start(payload: dict) -> dict:
     if not pane_label:
         pane_label = await _tmux_pane_label(tmux_pane)
     # Effective pane for this SessionStart event. If Claude/hook env stripped
-    # TMUX_PANE but the stable role label survived (notably legion:custodes),
+    # TMUX_PANE but the stable role label survived (notably council:custodes),
     # live-resolve that label so the row is stamped and tinted immediately.
     # This is transient pane addressing only; nothing is written to instances.
     tmux_pane = await _session_start_effective_pane(tmux_pane, pane_label)
@@ -2678,7 +2678,7 @@ async def handle_session_start(payload: dict) -> dict:
     if launch_instance_type not in VALID_LAUNCH_INSTANCE_TYPES:
         launch_instance_type = None
     # Persona/orchestrator pane (tmuxctl stamps a stable @PANE_ID like
-    # "legion:custodes" / "mechanicus:fabricator-general" / "mechanicus:admin").
+    # "council:custodes" / "mechanicus:fabricator-general" / "council:administratum").
     # A fresh spawn in one of these panes IS that persona — derive its row identity
     # from the pane so the agent never self-PATCHes legion/primarch/type/synced.
     # The pane is authoritative for the persona's legion (written below in the

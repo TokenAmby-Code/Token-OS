@@ -170,9 +170,9 @@ def _install_legacy_instances_test_view(conn):
                     ELSE COALESCE(NEW.profile_name, NEW.primarch, NEW.legion)
                   END
                     WHEN 'fabricator' THEN 'fabricator-general'
-                    WHEN 'mechanicus:admin' THEN 'administratum'
+                    WHEN 'council:administratum' THEN 'administratum'
                     WHEN 'mechanicus:administratum' THEN 'administratum'
-                    WHEN 'legion:custodes' THEN 'custodes'
+                    WHEN 'council:custodes' THEN 'custodes'
                     ELSE CASE
                       WHEN NEW.legion IS NOT NULL AND NEW.legion != 'astartes' THEN NEW.legion
                       ELSE COALESCE(NEW.profile_name, NEW.primarch, NEW.legion)
@@ -220,9 +220,9 @@ def _install_legacy_instances_test_view(conn):
                       ELSE COALESCE(NEW.profile_name, NEW.primarch, NEW.legion)
                     END
                     WHEN 'fabricator' THEN 'fabricator-general'
-                    WHEN 'mechanicus:admin' THEN 'administratum'
+                    WHEN 'council:administratum' THEN 'administratum'
                     WHEN 'mechanicus:administratum' THEN 'administratum'
-                    WHEN 'legion:custodes' THEN 'custodes'
+                    WHEN 'council:custodes' THEN 'custodes'
                     ELSE CASE
                       WHEN NEW.legion IS NOT OLD.legion THEN NEW.legion
                       ELSE COALESCE(NEW.profile_name, NEW.primarch, NEW.legion)

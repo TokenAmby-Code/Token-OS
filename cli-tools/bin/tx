@@ -248,7 +248,7 @@ workspace_needs_repair() {
     done
 
     role=$(tmux list-panes -t "${session}:legion" -F '#{@PANE_ID}' 2>/dev/null | head -1)
-    [[ "$role" == "legion:custodes" ]] || return 0
+    [[ "$role" == "council:custodes" ]] || return 0
     role=$(tmux list-panes -t "${session}:mechanicus" -F '#{@PANE_ID}' 2>/dev/null | head -1)
     [[ "$role" == "mechanicus:fabricator-general" ]] || return 0
 

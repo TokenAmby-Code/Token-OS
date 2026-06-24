@@ -116,7 +116,7 @@ def work_state_env(app_env, monkeypatch):
                 "pane_pid": 1234,
                 "instance_id": SESSION_ID,
                 "pane_label": None,
-                "pane_role": "mechanicus:admin",
+                "pane_role": "council:administratum",
                 "current_command": "node",
             }
         ]

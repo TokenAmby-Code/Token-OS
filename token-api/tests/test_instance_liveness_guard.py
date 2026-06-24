@@ -202,7 +202,7 @@ def test_reconcile_ignores_unmatched_and_unstamped(app_env, monkeypatch):
 def test_reconcile_leaves_active_rows_active(app_env, monkeypatch):
     """An already-active row stamped on a live pane stays active (no spurious churn)."""
     active = _insert(app_env, status="idle")
-    _patch_panes(app_env, monkeypatch, [_pane("%25", active, pane_role="legion:custodes")])
+    _patch_panes(app_env, monkeypatch, [_pane("%25", active, pane_role="council:custodes")])
 
     result = _run(app_env.main.reconcile_live_panes())
 

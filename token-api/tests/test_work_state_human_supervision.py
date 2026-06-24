@@ -73,7 +73,7 @@ def supervised_env(app_env: Any, monkeypatch: Any) -> Any:
                 "pane_pid": 1234,
                 "instance_id": SESSION_ID,
                 "pane_label": None,
-                "pane_role": "mechanicus:admin",
+                "pane_role": "council:administratum",
                 "current_command": "node",
             }
         ]

@@ -74,7 +74,7 @@ list_workloop_panes() {
 
     while IFS=$'	' read -r pane_id work_loop cmd window_name pane_role; do
         [[ "${window_name%%(*}" == "legion" ]] || continue
-        [[ "$pane_role" == "legion:worker" ]] || continue
+        [[ "$pane_role" == "mechanicus:worker" ]] || continue
         [[ "$work_loop" == "true" ]] || continue
         panes+=("$pane_id")
     done < <(tmux list-panes -a -F "#{pane_id}	#{@WORK_LOOP}	#{pane_current_command}	#{window_name}	#{@PANE_ID}" 2>/dev/null)
@@ -452,7 +452,7 @@ do_status() {
     # Check managed legion workers for work-loop metadata.
     while IFS=$'\t' read -r pane_id work_loop cmd window_name pane_role; do
         [[ "${window_name%%(*}" == "legion" ]] || continue
-        [[ "$pane_role" == "legion:worker" ]] || continue
+        [[ "$pane_role" == "mechanicus:worker" ]] || continue
 
         local session_doc branch project dispatched
         session_doc=$(tmux show-options -p -t "$pane_id" -v @WORKLOOP_SESSION_DOC 2>/dev/null || true)

@@ -172,11 +172,11 @@ def test_wrapper_stack_enforcement_runs_only_for_stack_panes(tmp_path: Path) -> 
         tmux,
         """#!/usr/bin/env bash
 if [[ "$*" == *"%stack"* ]]; then
-  printf 'main:7\\tlegion:worker\\tstack-worker\\n'
+  printf 'main:7\\tmechanicus:worker\\tstack-worker\\n'
 elif [[ "$*" == *"%plain"* ]]; then
   printf 'main:1\\t\\t\\n'
 elif [[ "$*" == *"%custodes"* ]]; then
-  printf 'main:1\\tlegion:custodes\\t\\n'
+  printf 'main:1\\tcouncil:custodes\\t\\n'
 fi
 """,
     )
