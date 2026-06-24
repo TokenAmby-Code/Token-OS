@@ -110,6 +110,14 @@ alias fetch-bashrc="fetch-mobile"
 
 
 # ====================================================
+# On Termux shell exit/app close, ask the Mac tmux server to drop the grouped
+# phone client. Reopen uses the normal sticky mac() auto-reconnect path below.
+_termux_detach_mac_tmux_client() {
+    [[ -n "${TERMUX_SKIP_TMUX_DETACH:-}" ]] && return 0
+    ssh -o BatchMode=yes -o ConnectTimeout=2 mac "tmux detach-client -s phone 2>/dev/null || true" >/dev/null 2>&1 &
+}
+trap _termux_detach_mac_tmux_client EXIT
+
 # TMUX — local session + remote attach
 # ====================================================
 # is_portable_monitor: true when terminal is wide enough to be an external display.

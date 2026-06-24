@@ -16642,6 +16642,26 @@ LOCATION_MODE_MAP = {
 }
 
 
+async def _tmux_client_lease_away(reason: str) -> None:
+    """Best-effort geofence hook: away from home soft-detaches desktop tmux clients."""
+
+    tool = SCRIPTS_DIR / "cli-tools" / "bin" / "tmux-client-lease"
+    if not tool.exists():
+        return
+    try:
+        proc = await _run_subprocess_offloop(
+            [str(tool), "away", "--reason", reason],
+            timeout=3.0,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if proc.returncode != 0:
+            logger.debug("tmux-client-lease away exited %s", proc.returncode)
+    except Exception as exc:
+        logger.debug("tmux-client-lease away failed: %s", exc)
+
+
 class LocationEventRequest(BaseModel):
     location: str = Field(..., description="Location name: home, gym, work")
     action: str = Field(..., description="enter or exit")
@@ -16705,6 +16725,9 @@ async def handle_location_event(request: LocationEventRequest):
             notes.append(f"stale_exit:was_{current_zone}")
             print(f">>> Stale exit for {location} (tracked zone={current_zone}), processing anyway")
         DESKTOP_STATE["location_zone"] = None
+
+    if (location == "home" and action == "exit") or (location != "home" and action == "enter"):
+        asyncio.create_task(_tmux_client_lease_away(f"geofence:{location}:{action}"))
 
     # --- Mode change ---
     # DEPRECATED: work_mode is now MANUAL only (user explicitly clocks in/out via /api/clock-in /api/clock-out)

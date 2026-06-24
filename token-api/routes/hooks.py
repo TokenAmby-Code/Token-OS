@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -5891,6 +5892,133 @@ async def _askq_ladder_cancel(
     )
 
 
+_BROAD_NAS_ROOTS = {
+    "/Volumes",
+    "/Volumes/Imperium",
+    "/Volumes/Civic",
+    "/mnt/imperium",
+    "$IMPERIUM",
+    "${IMPERIUM}",
+}
+_SEARCH_COMMANDS = {"find", "bfs", "rg", "ugrep", "grep"}
+_SHELL_SEPARATORS = {";", "&&", "||", "|"}
+
+
+def _normalize_search_path_token(token: str) -> str:
+    token = (token or "").strip().rstrip("/")
+    if token.startswith("$IMPERIUM/"):
+        token = "/Volumes/Imperium/" + token[len("$IMPERIUM/") :]
+    elif token.startswith("${IMPERIUM}/"):
+        token = "/Volumes/Imperium/" + token[len("${IMPERIUM}/") :]
+    return token.rstrip("/") or token
+
+
+def _is_broad_nas_search_root(token: str) -> bool:
+    normalized = _normalize_search_path_token(token)
+    return normalized in _BROAD_NAS_ROOTS
+
+
+def _shell_words(command: str) -> list[str]:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return []
+
+
+def _split_shell_commands(command: str) -> list[list[str]]:
+    words = _shell_words(command)
+    commands: list[list[str]] = []
+    current: list[str] = []
+    for word in words:
+        if word in _SHELL_SEPARATORS or set(word) <= {";", "&", "|"}:
+            if current:
+                commands.append(current)
+                current = []
+            continue
+        if word in {"(", ")"}:
+            continue
+        current.append(word)
+    if current:
+        commands.append(current)
+    return commands
+
+
+def _strip_command_prefix(tokens: list[str]) -> list[str]:
+    out = list(tokens)
+    while out and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", out[0]):
+        out.pop(0)
+    while out and out[0] in {"command", "env", "noglob"}:
+        out.pop(0)
+        while out and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", out[0]):
+            out.pop(0)
+    if out and out[0] in {"sudo", "doas"}:
+        out.pop(0)
+        while out and out[0].startswith("-"):
+            out.pop(0)
+    return out
+
+
+def _grep_is_recursive(args: list[str]) -> bool:
+    for arg in args:
+        if arg == "--":
+            break
+        if arg in {"-R", "-r", "--recursive", "--dereference-recursive"}:
+            return True
+        if arg.startswith("-") and not arg.startswith("--") and ("R" in arg or "r" in arg):
+            return True
+    return False
+
+
+def classify_broad_nas_search(command: str) -> str | None:
+    """Return a hard-denial reason for recursive NAS-root searches, else None."""
+
+    for raw in _split_shell_commands(command):
+        tokens = _strip_command_prefix(raw)
+        if not tokens:
+            continue
+        exe = Path(tokens[0]).name
+        if exe not in _SEARCH_COMMANDS:
+            continue
+        args = tokens[1:]
+        if exe == "grep" and not _grep_is_recursive(args):
+            continue
+        if exe in {"find", "bfs"}:
+            # find/bfs default to '.' when no root is given. Only explicit broad
+            # NAS roots are denied; bounded roots under the vault/worktree remain allowed.
+            idx = 0
+            while idx < len(args) and args[idx] in {"-H", "-L", "-P", "-X", "-s"}:
+                idx += 1
+            if idx < len(args) and args[idx] == "--":
+                idx += 1
+            for arg in args[idx:]:
+                # The first predicate/operator starts the expression; later
+                # predicate values are not search roots.
+                if arg.startswith("-") or arg in {"!", "(", ")", ","}:
+                    break
+                if _is_broad_nas_search_root(arg):
+                    return _nas_search_denial_reason(exe, arg)
+            continue
+        for arg in args:
+            if arg == "--":
+                continue
+            if _is_broad_nas_search_root(arg):
+                return _nas_search_denial_reason(exe, arg)
+    return None
+
+
+def _nas_search_denial_reason(command_name: str, root: str) -> str:
+    return (
+        f"Blocked broad NAS-root recursive search: `{command_name}` against `{root}`. "
+        "Root-wide scans of /Volumes, /Volumes/Imperium, /Volumes/Civic, or /mnt/imperium "
+        "can lock up the Mac/NAS. Use `git grep`/`rg` from the repo root, search "
+        "`$IMPERIUM/Imperium-ENV` or a narrower subdirectory, or add an explicit "
+        "bounded root with `-maxdepth`."
+    )
+
+
 async def handle_pre_tool_use(payload: dict) -> dict:
     """Handle PreToolUse hook - marks processing, can block operations like 'make deploy'."""
     session_id = payload.get("session_id")
@@ -6046,6 +6174,13 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         return {"success": True, "action": "allowed"}
 
     command = tool_input.get("command", "")
+
+    nas_search_denial = classify_broad_nas_search(command)
+    if nas_search_denial:
+        return {
+            "permissionDecision": "deny",
+            "permissionDecisionReason": nas_search_denial,
+        }
 
     # Block 'make deploy' commands
     if "make deploy" in command or command.strip() == "make deploy":
