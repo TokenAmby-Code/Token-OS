@@ -331,6 +331,43 @@ deploy_lock_release() {
     DEPLOY_LOCK_HELD=false
 }
 
+# Graceful release for the normal end of a deploy. Closes the lost-wakeup race in
+# the window between the trailing loop's final sentinel check and the release: a
+# contender that touches redeploy-pending there would otherwise see us alive,
+# bow out trusting us to re-sync, and have its sentinel rm-rf'd unseen.
+#
+# We unlink the well-known lock path ATOMICALLY by renaming it aside, which splits
+# every interleaving cleanly:
+#   - contender touched BEFORE the rename → its sentinel rode into $sealed; we see
+#     it, restore the lock (mv back), and report pending so the caller drains it;
+#   - contender touches AFTER the rename → its `touch` hits a vanished path and
+#     its own `[[ -d $DEPLOY_LOCKDIR ]]` recheck fails, so it stops trusting us and
+#     loops to mkdir a fresh lock — becoming the new holder and converging itself.
+# Returns 0 if released, 1 if a re-sync is still queued (lock retained; drain it).
+deploy_lock_release_graceful() {
+    [[ "$DEPLOY_LOCK_HELD" == true ]] || return 0
+    local sealed="${DEPLOY_LOCKDIR}.releasing.$$"
+    if ! mv "$DEPLOY_LOCKDIR" "$sealed" 2>/dev/null; then
+        # Lock path already gone (shouldn't happen while we hold it) — force-release.
+        deploy_lock_release
+        return 0
+    fi
+    if [[ -f "$sealed/redeploy-pending" ]]; then
+        # A contender queued a re-sync just before we sealed. Keep holding and drain
+        # it. If restore fails, a contender already mkdir'd a fresh lock and is the
+        # new holder — let it converge and release ours.
+        if mv "$sealed" "$DEPLOY_LOCKDIR" 2>/dev/null; then
+            return 1
+        fi
+        rm -rf "$sealed" 2>/dev/null || true
+        DEPLOY_LOCK_HELD=false
+        return 0
+    fi
+    rm -rf "$sealed" 2>/dev/null || true
+    DEPLOY_LOCK_HELD=false
+    return 0
+}
+
 # Acquire the deploy mutex. Returns 0 if we now hold it (caller runs full_restart);
 # returns 1 if a LIVE deploy holds it — in which case we've queued a trailing
 # re-sync and the caller must exit 0 without deploying.
@@ -342,7 +379,15 @@ deploy_lock_acquire() {
         tries=$((tries + 1))
         if mkdir "$DEPLOY_LOCKDIR" 2>/dev/null; then
             DEPLOY_LOCK_HELD=true
-            printf '%s %s\n' "$$" "$target" > "$DEPLOY_LOCKDIR/owner" 2>/dev/null || true
+            # The owner file IS the lock's identity: a contender reads it to decide
+            # live-vs-stale. If we can't write it, the lockdir would be an
+            # unidentifiable held lock that a contender reclaims out from under us
+            # (→ two concurrent holders). Release and fail acquisition instead.
+            if ! printf '%s %s\n' "$$" "$target" > "$DEPLOY_LOCKDIR/owner" 2>/dev/null; then
+                echo -e "  ${RED}✗${NC} deploy mutex: failed to write owner file; releasing lock" >&2
+                deploy_lock_release
+                return 1
+            fi
             return 0
         fi
 
@@ -434,21 +479,41 @@ run_coalesced_deploy() {
     if full_restart; then rc=0; else rc=$?; fi
 
     # Trailing coalescing: converge on any merge a contender flagged mid-deploy.
-    # Clear the sentinel BEFORE each re-run so a merge landing DURING the re-run
-    # re-arms it (no lost wakeup).
+    # The inner loop drains queued re-syncs (clearing the sentinel BEFORE each
+    # re-run so a merge landing DURING it re-arms it). The outer loop closes the
+    # release-window race: deploy_lock_release_graceful retains the lock and
+    # reports pending=1 if a contender queued one between the inner loop's exit
+    # test and the release — so we drain that too instead of dropping it.
     local iter=0
-    while [[ -f "$DEPLOY_LOCKDIR/redeploy-pending" && "$iter" -lt "$DEPLOY_REDEPLOY_MAX" ]]; do
-        rm -f "$DEPLOY_LOCKDIR/redeploy-pending" 2>/dev/null || true
-        iter=$((iter + 1))
-        echo ""
-        echo -e "${BLUE}→${NC} deploy: trailing re-sync ${iter}/${DEPLOY_REDEPLOY_MAX} (a concurrent invocation queued one) — converging on newest main"
-        _reset_deploy_run_state
-        DEPLOY_COALESCE_TRAILING=true
-        full_restart || echo -e "  ${YELLOW}⚠${NC} deploy: trailing re-sync ${iter} did not complete cleanly (primary deploy already applied)"
-        DEPLOY_COALESCE_TRAILING=false
+    while true; do
+        while [[ -f "$DEPLOY_LOCKDIR/redeploy-pending" && "$iter" -lt "$DEPLOY_REDEPLOY_MAX" ]]; do
+            rm -f "$DEPLOY_LOCKDIR/redeploy-pending" 2>/dev/null || true
+            iter=$((iter + 1))
+            echo ""
+            echo -e "${BLUE}→${NC} deploy: trailing re-sync ${iter}/${DEPLOY_REDEPLOY_MAX} (a concurrent invocation queued one) — converging on newest main"
+            _reset_deploy_run_state
+            DEPLOY_COALESCE_TRAILING=true
+            full_restart || echo -e "  ${YELLOW}⚠${NC} deploy: trailing re-sync ${iter} did not complete cleanly (primary deploy already applied)"
+            DEPLOY_COALESCE_TRAILING=false
+        done
+
+        if (( iter >= DEPLOY_REDEPLOY_MAX )); then
+            # Bounded: a pathological touch-storm hit the cap. Force-release and let
+            # the queuing merge's own deploy trigger reconverge.
+            if [[ -f "$DEPLOY_LOCKDIR/redeploy-pending" ]]; then
+                echo -e "  ${YELLOW}⚠${NC} deploy: trailing re-sync cap (${DEPLOY_REDEPLOY_MAX}) reached; the next deploy trigger will reconverge"
+            fi
+            deploy_lock_release
+            break
+        fi
+
+        if deploy_lock_release_graceful; then
+            break
+        fi
+        # graceful retained the lock: a re-sync was queued in the release window —
+        # loop back to drain it.
     done
 
-    deploy_lock_release
     trap - EXIT INT TERM
     return "$rc"
 }

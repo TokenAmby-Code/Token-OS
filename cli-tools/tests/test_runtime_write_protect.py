@@ -437,7 +437,7 @@ def _seed_git_lock_files(root: Path) -> tuple[Path, Path]:
     return head_lock, ref_lock
 
 
-def test_lock_ignores_transient_git_lock_files(tmp_path) -> None:
+def test_lock_ignores_transient_git_lock_files(tmp_path: Path) -> None:
     # A git lock file (HEAD.lock, refs/**/*.lock) is transient by design: a
     # concurrent deploy creates and deletes it mid-operation. Freezing one would
     # break git, and a lock that vanishes between `find` and the batched `-exec`
@@ -467,7 +467,7 @@ def test_lock_ignores_transient_git_lock_files(tmp_path) -> None:
         assert not is_immutable(ref_lock)
 
 
-def test_assert_locked_ignores_transient_git_lock_files(tmp_path) -> None:
+def test_assert_locked_ignores_transient_git_lock_files(tmp_path: Path) -> None:
     # A correctly-locked tree may carry a stray .git/**/*.lock (writable + not
     # immutable, because the freeze pruned it). The verify passes must prune them
     # too, so assert-locked/status report the tree as locked rather than falsely
