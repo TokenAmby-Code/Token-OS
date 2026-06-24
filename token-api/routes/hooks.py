@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -5913,13 +5914,26 @@ def _normalize_search_path_token(token: str) -> str:
     return token.rstrip("/") or token
 
 
-def _is_broad_nas_search_root(token: str) -> bool:
+def _resolve_search_path_token(token: str, cwd: str | None) -> str:
     normalized = _normalize_search_path_token(token)
+    if normalized in {"", "."}:
+        return cwd or normalized
+    if normalized == "-":
+        return normalized
+    if normalized.startswith("./") and cwd:
+        normalized = posixpath.join(cwd, normalized[2:])
+    elif not normalized.startswith("/") and cwd:
+        normalized = posixpath.join(cwd, normalized)
+    return posixpath.normpath(normalized).rstrip("/") or normalized
+
+
+def _is_broad_nas_search_root(token: str, cwd: str | None = None) -> bool:
+    normalized = _resolve_search_path_token(token, cwd)
     return normalized in _BROAD_NAS_ROOTS
 
 
 def _shell_words(command: str) -> list[str]:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+    lexer = shlex.shlex(command.replace("\n", ";"), posix=True, punctuation_chars=";&|()")
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
@@ -5951,14 +5965,75 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     while out and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", out[0]):
         out.pop(0)
     while out and out[0] in {"command", "env", "noglob"}:
-        out.pop(0)
+        prefix = out.pop(0)
+        if prefix == "env":
+            while out:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", out[0]):
+                    out.pop(0)
+                elif out[0] in {"-i", "--ignore-environment", "-0", "--null"}:
+                    out.pop(0)
+                elif (
+                    out[0] in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+                    and len(out) > 1
+                ):
+                    del out[:2]
+                elif out[0].startswith("-"):
+                    out.pop(0)
+                else:
+                    break
         while out and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", out[0]):
             out.pop(0)
     if out and out[0] in {"sudo", "doas"}:
         out.pop(0)
         while out and out[0].startswith("-"):
-            out.pop(0)
+            flag = out.pop(0)
+            if flag in {"-u", "-g", "-h", "-p", "-C", "-T", "-r", "-t"} and out:
+                out.pop(0)
     return out
+
+
+_SEARCH_OPTIONS_WITH_VALUE = {
+    "-A",
+    "-B",
+    "-C",
+    "-D",
+    "-M",
+    "-e",
+    "-f",
+    "-g",
+    "-m",
+    "-t",
+    "--after-context",
+    "--before-context",
+    "--color",
+    "--colors",
+    "--context",
+    "--context-separator",
+    "--encoding",
+    "--engine",
+    "--field-context-separator",
+    "--field-match-separator",
+    "--glob",
+    "--iglob",
+    "--ignore-file",
+    "--json-path",
+    "--max-columns",
+    "--max-count",
+    "--max-depth",
+    "--max-filesize",
+    "--path-separator",
+    "--pre",
+    "--pre-glob",
+    "--regexp",
+    "--replace",
+    "--sort",
+    "--sortr",
+    "--threads",
+    "--type",
+    "--type-add",
+    "--type-clear",
+    "--type-not",
+}
 
 
 def _grep_is_recursive(args: list[str]) -> bool:
@@ -5972,39 +6047,87 @@ def _grep_is_recursive(args: list[str]) -> bool:
     return False
 
 
+def _search_path_operands(args: list[str]) -> list[str]:
+    paths: list[str] = []
+    saw_pattern = False
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg == "--":
+            idx += 1
+            if idx < len(args) and not saw_pattern:
+                saw_pattern = True
+                idx += 1
+            paths.extend(args[idx:])
+            break
+        if arg.startswith("--") and "=" in arg:
+            idx += 1
+            continue
+        if arg in _SEARCH_OPTIONS_WITH_VALUE:
+            # -e/--regexp supplies the pattern itself; other value-taking
+            # options consume the next token without making it a path operand.
+            if arg in {"-e", "--regexp"}:
+                saw_pattern = True
+            idx += 2
+            continue
+        if arg.startswith("-"):
+            idx += 1
+            continue
+        if not saw_pattern:
+            saw_pattern = True
+        else:
+            paths.append(arg)
+        idx += 1
+    return paths
+
+
+def _find_path_operands(args: list[str]) -> list[str]:
+    idx = 0
+    while idx < len(args) and args[idx] in {"-H", "-L", "-P", "-X", "-s"}:
+        idx += 1
+    if idx < len(args) and args[idx] == "--":
+        idx += 1
+    paths: list[str] = []
+    for arg in args[idx:]:
+        # The first predicate/operator starts the expression; later predicate
+        # values are not search roots.
+        if arg.startswith("-") or arg in {"!", "(", ")", ","}:
+            break
+        paths.append(arg)
+    return paths
+
+
 def classify_broad_nas_search(command: str) -> str | None:
     """Return a hard-denial reason for recursive NAS-root searches, else None."""
 
+    cwd: str | None = None
     for raw in _split_shell_commands(command):
         tokens = _strip_command_prefix(raw)
         if not tokens:
             continue
         exe = Path(tokens[0]).name
+        if exe == "cd":
+            target = tokens[1] if len(tokens) > 1 else ""
+            cwd = _resolve_search_path_token(target, cwd) if target and target != "-" else None
+            continue
         if exe not in _SEARCH_COMMANDS:
             continue
         args = tokens[1:]
         if exe == "grep" and not _grep_is_recursive(args):
             continue
         if exe in {"find", "bfs"}:
-            # find/bfs default to '.' when no root is given. Only explicit broad
-            # NAS roots are denied; bounded roots under the vault/worktree remain allowed.
-            idx = 0
-            while idx < len(args) and args[idx] in {"-H", "-L", "-P", "-X", "-s"}:
-                idx += 1
-            if idx < len(args) and args[idx] == "--":
-                idx += 1
-            for arg in args[idx:]:
-                # The first predicate/operator starts the expression; later
-                # predicate values are not search roots.
-                if arg.startswith("-") or arg in {"!", "(", ")", ","}:
-                    break
-                if _is_broad_nas_search_root(arg):
+            # find/bfs default to '.' when no root is given. Bounded roots under
+            # the vault/worktree remain allowed.
+            paths = _find_path_operands(args) or ["."]
+            for arg in paths:
+                if _is_broad_nas_search_root(arg, cwd):
                     return _nas_search_denial_reason(exe, arg)
             continue
-        for arg in args:
-            if arg == "--":
-                continue
-            if _is_broad_nas_search_root(arg):
+        paths = _search_path_operands(args)
+        if not paths and cwd and _is_broad_nas_search_root(cwd):
+            return _nas_search_denial_reason(exe, cwd)
+        for arg in paths:
+            if _is_broad_nas_search_root(arg, cwd):
                 return _nas_search_denial_reason(exe, arg)
     return None
 

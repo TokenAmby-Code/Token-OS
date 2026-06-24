@@ -63,8 +63,28 @@ def test_denies_env_imperium_root_scan() -> None:
     assert_denied("rg foo $IMPERIUM")
 
 
+def test_denies_sudo_wrapped_rg_root_scan() -> None:
+    assert_denied("sudo -u root rg foo /Volumes")
+
+
+def test_denies_env_wrapped_rg_root_scan() -> None:
+    assert_denied("env -i rg foo /Volumes")
+
+
+def test_denies_cd_into_imperium_then_relative_rg() -> None:
+    assert_denied("cd /Volumes/Imperium && rg foo .")
+
+
 def test_allows_env_imperium_vault_scan() -> None:
     assert_allowed("rg foo $IMPERIUM/Imperium-ENV")
+
+
+def test_allows_broad_nas_path_as_rg_pattern() -> None:
+    assert_allowed('rg "/Volumes/Imperium" .')
+
+
+def test_allows_broad_nas_path_as_grep_pattern() -> None:
+    assert_allowed("grep -R -- /Volumes/Imperium .")
 
 
 @pytest.mark.asyncio
