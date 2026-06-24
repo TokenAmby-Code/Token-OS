@@ -398,6 +398,7 @@ def test_worker_snaps_promoted_pause_queue_items(app_env, monkeypatch) -> None:
         snapped.append(item.instance_id)
         return {"snapped": True}
 
+    monkeypatch.setattr(tts, "TTS_AUTO_FOCUS_ENABLED", False)
     monkeypatch.setattr(tts, "_snap_focus_to_speaker", fake_snap)
     monkeypatch.setattr(tts, "_set_tts_state", lambda *a, **k: None)
     monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
