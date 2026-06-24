@@ -21,6 +21,11 @@ def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
         "IMPERIUM_MECHANICUS_FOCUS_LOG", str(tmp_path / "mechanicus-focus-guard.log")
     )
     monkeypatch.setenv("TOKEN_API_DB", str(tmp_path / "agents.db"))
+    # token-restart's plist reconcilers (ensure_plist_resource_limits /
+    # ensure_plist_socket_activation) edit the LaunchAgent IN PLACE. Point them at
+    # a throwaway path so a subprocess token-restart can never mutate the live
+    # ~/Library/LaunchAgents plist while pytest runs (absent file → reconcile no-op).
+    monkeypatch.setenv("TOKEN_RESTART_PLIST", str(tmp_path / "ai.openclaw.tokenapi.plist"))
     # Subprocess tests can execute dispatch paths that emit WrapperStart /
     # SessionStart / WrapperEnd hook telemetry. Those hooks must never post to
     # the developer's live Token-API while pytest is running; a failed local

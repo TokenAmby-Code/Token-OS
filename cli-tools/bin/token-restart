@@ -31,7 +31,9 @@
 
 set -euo pipefail
 
-_BIN_DIR="$(dirname "$(readlink -f "$0")")"
+# Resolve from BASH_SOURCE (not $0) so the lib paths resolve correctly whether the
+# script is executed directly or sourced (e.g. by unit tests exercising functions).
+_BIN_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 _LIB_DIR="${_BIN_DIR}/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${_LIB_DIR}/worktree-park.sh" 2>/dev/null || true
@@ -52,7 +54,10 @@ WSL_PORT=7777
 
 # Mac-only config (only used when running on Mac)
 LABEL="ai.openclaw.tokenapi"
-PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+# TOKEN_RESTART_PLIST overrides the target plist — used by tests so the in-place
+# plist reconcilers (ensure_plist_resource_limits / ensure_plist_socket_activation)
+# operate on a throwaway file and can never mutate the live LaunchAgent.
+PLIST="${TOKEN_RESTART_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
 
 # Discord daemon — launchd-supervised, Mac-only. token-restart is the
 # AUTHORITATIVE restart path: launchctl kickstart against KeepAlive. Never use
@@ -191,6 +196,14 @@ check_mac_health() {
     curl -sf "${TOKEN_API_URL:-http://localhost:7777}/health" > /dev/null 2>&1
 }
 
+# PID of the launchd-managed token-api process, asked of launchd directly
+# (authoritative). The process now runs as `python main.py` (not `-m uvicorn …`),
+# so the old uvicorn-by-port pgrep pattern no longer matches the command line.
+mac_server_pid() {
+    launchctl print "gui/$(id -u)/${LABEL}" 2>/dev/null \
+        | awk '$1 == "pid" && $2 == "=" { print $3; exit }'
+}
+
 get_mac_status() {
     echo -e "${BOLD}Mac token-api${NC}"
 
@@ -201,7 +214,7 @@ get_mac_status() {
     fi
 
     local pid
-    pid=$(pgrep -f 'uvicorn.*7777' 2>/dev/null || true)
+    pid=$(mac_server_pid)
     if [[ -n "$pid" ]]; then
         echo -e "  Process: ${GREEN}running${NC} (PID: $pid)"
     else
@@ -218,17 +231,19 @@ get_mac_status() {
 kill_server() {
     echo "Stopping Token-API..."
 
-    if pkill -f 'uvicorn.*7777' 2>/dev/null; then
-        echo "Killed uvicorn process"
-    else
+    local pid
+    pid=$(mac_server_pid)
+    if [[ -z "$pid" ]]; then
         echo "No process found"
-    fi
-
-    sleep 1
-
-    if pgrep -f 'uvicorn.*7777' > /dev/null 2>&1; then
-        echo -e "${YELLOW}Warning: Process still running, force killing...${NC}"
-        pkill -9 -f 'uvicorn.*7777' 2>/dev/null || true
+    else
+        kill -TERM "$pid" 2>/dev/null && echo "Sent SIGTERM to token-api (PID: $pid)"
+        sleep 1
+        # Only escalate if the SAME pid is still alive — launchd's KeepAlive may
+        # have already respawned a fresh process, which we must not force-kill.
+        if kill -0 "$pid" 2>/dev/null; then
+            echo -e "${YELLOW}Warning: Process still running, force killing...${NC}"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
     fi
 
     echo -e "${GREEN}Server stopped${NC}"
@@ -852,25 +867,65 @@ restart_mac() {
 
     sync_venv_if_needed
 
-    # Keep the fd ceiling current. If the plist actually changed, kickstart -k
-    # would NOT re-read the new resource limits (it reuses the bootstrapped
-    # service definition), so bootout+bootstrap to load them before restarting.
+    # Reconcile the plist (fd limits + socket activation). A plist change is NOT
+    # honored by kickstart/SIGTERM — launchd reuses the already-bootstrapped
+    # service definition — so a change forces a bootout+bootstrap, which also
+    # starts a fresh process on the (now launchd-owned) socket.
+    local plist_changed=false
     if ! ensure_plist_resource_limits; then
-        echo -e "  ${BLUE}→${NC} fd limits updated (soft=${FD_SOFT_LIMIT}/hard=${FD_HARD_LIMIT}); reloading service"
-        launchctl bootout gui/501/${LABEL} 2>/dev/null || true
-        launchctl bootstrap gui/501 "$PLIST" 2>/dev/null || true
+        echo -e "  ${BLUE}→${NC} fd limits updated (soft=${FD_SOFT_LIMIT}/hard=${FD_HARD_LIMIT})"
+        plist_changed=true
+    fi
+    if ! ensure_plist_socket_activation; then
+        echo -e "  ${BLUE}→${NC} socket activation reconciled (launchd owns port ${MAC_PORT})"
+        plist_changed=true
     fi
 
-    launchctl kickstart -k gui/501/${LABEL} 2>/dev/null || {
-        echo "  Service not loaded, bootstrapping..."
+    # old_pid lets the health poll below confirm the NEW process is serving
+    # rather than the old one still draining (which keeps answering /health 200).
+    # Empty => no incumbent to outlive (bootout/bootstrap or cold start), so the
+    # poll falls back to plain health.
+    local old_pid=""
+    if [[ "$plist_changed" == true ]]; then
+        echo -e "  ${BLUE}→${NC} reloading service (plist changed)"
+        launchctl bootout gui/501/${LABEL} 2>/dev/null || true
         launchctl bootstrap gui/501 "$PLIST" 2>/dev/null || true
-    }
+    else
+        # Graceful drain: SIGTERM lets uvicorn finish in-flight requests (bounded
+        # by main.py's timeout_graceful_shutdown) before exiting; launchd's
+        # KeepAlive then respawns it onto the retained, launchd-owned socket.
+        # New connections queue in the kernel accept backlog meanwhile — they
+        # stall briefly, never connection-refused. (kickstart -k would SIGKILL
+        # and reset every in-flight request.)
+        old_pid=$(mac_server_pid)
+        if [[ -n "$old_pid" ]]; then
+            echo -e "  ${BLUE}→${NC} draining in-flight requests (SIGTERM pid=$old_pid), launchd will respawn…"
+            kill -TERM "$old_pid" 2>/dev/null || true
+        else
+            echo "  Service not loaded, bootstrapping..."
+            launchctl bootstrap gui/501 "$PLIST" 2>/dev/null || true
+        fi
+    fi
 
     local attempts=0
-    local max_attempts=10
+    # Allow for the worst-case graceful drain (timeout_graceful_shutdown=10s) plus
+    # fresh-process startup before declaring failure.
+    local max_attempts=20
 
     while [[ $attempts -lt $max_attempts ]]; do
         sleep 1
+        # In the graceful path, wait for a respawned pid (different from the one we
+        # signalled) before trusting /health — the old process keeps answering 200
+        # while it drains, so health alone would report the stale process as "up".
+        if [[ -n "$old_pid" ]]; then
+            local cur_pid
+            cur_pid=$(mac_server_pid)
+            if [[ -z "$cur_pid" || "$cur_pid" == "$old_pid" ]]; then
+                attempts=$((attempts + 1))
+                echo "  Waiting for respawn... ($attempts/$max_attempts)"
+                continue
+            fi
+        fi
         if check_mac_health; then
             echo -e "  ${GREEN}✓${NC} Mac server is up and healthy"
             return 0
@@ -1214,6 +1269,54 @@ sys.exit(1 if changed else 0)
 PYEOF
 }
 
+# Idempotently reconcile the LaunchAgent plist to the socket-activation shape:
+#   * ProgramArguments = [<python>, "main.py"]  (NOT `-m uvicorn …`), so main.py's
+#     launchd-fd shim runs (token-api/launchd_socket.py) and serves on the
+#     launchd-owned socket.
+#   * a `Sockets` dict so launchd — not uvicorn — owns the listening socket; its
+#     kernel accept backlog then survives every uvicorn restart, so a deploy
+#     stalls incoming hooks briefly instead of connection-refusing (and dropping)
+#     them. The canonical reference is cli-tools/launchd/ai.openclaw.tokenapi.plist.
+# Preserves EnvironmentVariables (secrets), resource limits, and the configured
+# interpreter (ProgramArguments[0]). Returns 0 if already canonical (no-op), 1 if
+# modified — the caller must then bootout+bootstrap, because a Sockets /
+# ProgramArguments change is NOT picked up by `kickstart -k` (it reuses the
+# already-bootstrapped service definition).
+ensure_plist_socket_activation() {
+    [[ -f "$PLIST" ]] || return 0
+    /usr/bin/python3 - "$PLIST" "$MAC_PORT" << 'PYEOF'
+import sys, plistlib
+plist_path, port = sys.argv[1], sys.argv[2]
+with open(plist_path, 'rb') as f:
+    data = plistlib.load(f)
+changed = False
+
+args = data.get('ProgramArguments') or []
+# Preserve the configured interpreter (index 0); collapse the rest to main.py.
+python = args[0] if args else '/Users/tokenclaw/.local/venvs/token-api/bin/python'
+desired_args = [python, 'main.py']
+if args != desired_args:
+    data['ProgramArguments'] = desired_args
+    changed = True
+
+desired_sockets = {
+    'Listeners': {
+        'SockServiceName': port,
+        'SockType': 'stream',
+        'SockFamily': 'IPv4',
+    }
+}
+if data.get('Sockets') != desired_sockets:
+    data['Sockets'] = desired_sockets
+    changed = True
+
+if changed:
+    with open(plist_path, 'wb') as f:
+        plistlib.dump(data, f, fmt=plistlib.FMT_XML, sort_keys=False)
+sys.exit(1 if changed else 0)
+PYEOF
+}
+
 update_plist() {
     local service_dir="$1"
     local python_path="$service_dir/.venv/bin/python"
@@ -1236,6 +1339,7 @@ with open(plist_path, 'wb') as f:
     plistlib.dump(data, f, fmt=plistlib.FMT_XML, sort_keys=False)
 PYEOF
     ensure_plist_resource_limits || true
+    ensure_plist_socket_activation || true
     echo -e "  ${GREEN}✓${NC} Plist updated"
 }
 
@@ -1509,41 +1613,46 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Remote proxy: if not on Mac, forward to Mac via SSH
-if ! is_mac; then
+# Only dispatch when executed directly — when sourced (e.g. by unit tests that
+# exercise individual functions like ensure_plist_socket_activation), define the
+# functions but do not run the restart.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Remote proxy: if not on Mac, forward to Mac via SSH
+    if ! is_mac; then
+        case "$ACTION" in
+            status)
+                remote_status
+                ;;
+            *)
+                remote_restart
+                ;;
+        esac
+        exit $?
+    fi
+
+    # Execute action (Mac only from here)
     case "$ACTION" in
         status)
-            remote_status
+            get_status_all
             ;;
-        *)
-            remote_restart
+        kill)
+            kill_server
+            ;;
+        watch)
+            run_coalesced_deploy
+            watch_logs
+            ;;
+        wsl-only)
+            restart_wsl
+            ;;
+        discord)
+            restart_discord
+            ;;
+        restart)
+            if [[ -n "$DEPLOY_FROM" ]]; then
+                update_plist "$DEPLOY_FROM" || exit 1
+            fi
+            run_coalesced_deploy
             ;;
     esac
-    exit $?
 fi
-
-# Execute action (Mac only from here)
-case "$ACTION" in
-    status)
-        get_status_all
-        ;;
-    kill)
-        kill_server
-        ;;
-    watch)
-        run_coalesced_deploy
-        watch_logs
-        ;;
-    wsl-only)
-        restart_wsl
-        ;;
-    discord)
-        restart_discord
-        ;;
-    restart)
-        if [[ -n "$DEPLOY_FROM" ]]; then
-            update_plist "$DEPLOY_FROM" || exit 1
-        fi
-        run_coalesced_deploy
-        ;;
-esac
