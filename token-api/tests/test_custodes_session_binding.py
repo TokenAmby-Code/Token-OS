@@ -22,7 +22,7 @@ async def test_custodes_creates_and_binds_today_daily_note(app_env, monkeypatch,
         await db.commit()
 
         note_path = vault / "Terra" / "Journal" / "Daily" / f"{helpers.datetime.now():%Y-%m-%d}.md"
-        assert reason == "daily_note_custodes"
+        assert reason == "daily_note"
         assert note_path.exists()
         row = await (
             await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
@@ -132,7 +132,7 @@ async def test_custodes_ignores_explicit_dispatch_doc_and_uses_daily_note(
             await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
         ).fetchone()
 
-    assert reason == "daily_note_custodes"
+    assert reason == "daily_note"
     assert row[0].endswith(f"/Terra/Journal/Daily/{helpers.datetime.now():%Y-%m-%d}.md")
     assert "not-custodes-home" not in row[0]
 
@@ -162,7 +162,7 @@ async def test_custodes_legion_without_primarch_binds_daily_note(app_env, monkey
             await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
         ).fetchone()
 
-    assert reason == "daily_note_custodes"
+    assert reason == "daily_note"
     assert row[0].endswith(f"/Terra/Journal/Daily/{helpers.datetime.now():%Y-%m-%d}.md")
     assert "needs-session-name" not in row[0]
 
@@ -196,3 +196,73 @@ async def test_automated_unresolved_launch_creates_no_placeholder(app_env, monke
     assert not (vault / "Terra" / "Sessions").exists() or not list(
         (vault / "Terra" / "Sessions").glob("needs-session-name*")
     )
+
+
+# ── Generalized persona-default daily-note binding ───────────────────────────
+# The daily-note-as-session-doc policy is no longer custodes-only: it is driven
+# by personas.default_session_doc == 'daily_note'. Fabricator-General and
+# Administratum carry the same default and co-bind the SAME shared daily note.
+
+
+@pytest.mark.parametrize("legion", ["fabricator-general", "administratum"])
+@pytest.mark.asyncio
+async def test_trinity_singletons_bind_today_daily_note(app_env, monkeypatch, tmp_path, legion):
+    """FG and Administratum resolve today's daily note via their persona default,
+    exactly like Custodes — arriving (as headless launches do) with
+    primarch_name=None and only a legion."""
+    helpers = __import__("session_doc_helpers")
+    vault = tmp_path / "Imperium-ENV"
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
+
+    async with aiosqlite.connect(app_env.db_path) as db:
+        doc_id, reason = await helpers.resolve_session_doc_for_start(
+            db,
+            dispatch_session_doc_path=None,
+            primarch_name=None,
+            origin_type="interactive",
+            cron_job_id=None,
+            cron_job_name=None,
+            working_dir=None,
+            is_subagent=False,
+            legion=legion,
+        )
+        await db.commit()
+        row = await (
+            await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
+        ).fetchone()
+
+    assert reason == "daily_note"
+    assert row[0].endswith(f"/Terra/Journal/Daily/{helpers.datetime.now():%Y-%m-%d}.md")
+    assert "needs-session-name" not in row[0]
+
+
+@pytest.mark.asyncio
+async def test_trinity_shares_one_daily_note_doc(app_env, monkeypatch, tmp_path):
+    """Custodes, FG, and Administratum all co-bind the SAME daily-note doc — the
+    shared-note invariant (mirror of the custodes infra), not three separate docs."""
+    helpers = __import__("session_doc_helpers")
+    vault = tmp_path / "Imperium-ENV"
+    monkeypatch.setenv("IMPERIUM_ENV", str(vault))
+
+    ids = []
+    async with aiosqlite.connect(app_env.db_path) as db:
+        for legion in ("custodes", "fabricator-general", "administratum"):
+            doc_id, reason = await helpers.resolve_session_doc_for_start(
+                db,
+                dispatch_session_doc_path=None,
+                primarch_name=None,
+                origin_type="interactive",
+                cron_job_id=None,
+                cron_job_name=None,
+                working_dir=None,
+                is_subagent=False,
+                legion=legion,
+            )
+            await db.commit()
+            assert reason == "daily_note"
+            ids.append(doc_id)
+
+        count = await (await db.execute("SELECT COUNT(*) FROM session_documents")).fetchone()
+
+    assert ids[0] == ids[1] == ids[2]
+    assert count[0] == 1

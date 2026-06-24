@@ -2289,7 +2289,10 @@ def _derive_continuity_binding_source(session_doc_policy: str | None) -> str | N
         return None
     if session_doc_policy == "dispatch_explicit":
         return "dispatch"
-    if session_doc_policy == "daily_note_custodes":
+    # "daily_note" is the generalized persona-default policy (Custodes, FG,
+    # Administratum); "daily_note_custodes" is the legacy emitter value retained
+    # so any in-flight instance row stamped before the rename still maps.
+    if session_doc_policy in {"daily_note", "daily_note_custodes"}:
         return "daily_note"
     if session_doc_policy in {"manual_assigned", "manual_created"}:
         return "manual"

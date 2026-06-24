@@ -31,6 +31,12 @@ class PersonaSeed:
     tts_voice: str | None
     tts_rate: str | None
     notification_sound: str | None
+    # Symbolic session-doc binding policy resolved at stamp time (NOT a stored
+    # path). ``'daily_note'`` → the persona co-binds today's shared
+    # ``Terra/Journal/Daily/YYYY-MM-DD.md``; ``None`` → no persona default (the
+    # dispatch/interactive resolver decides). Trailing + defaulted so the many
+    # positional Astartes/Primarch seeds below need no change.
+    default_session_doc: str | None = None
 
     @property
     def id(self) -> str:
@@ -201,6 +207,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         "Microsoft George",
         "2",
         "chimes.wav",
+        default_session_doc="daily_note",
     ),
     PersonaSeed(
         "fabricator-general",
@@ -213,6 +220,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         None,
         None,
         None,
+        default_session_doc="daily_note",
     ),
     PersonaSeed(
         "administratum",
@@ -225,6 +233,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         None,
         None,
         None,
+        default_session_doc="daily_note",
     ),
     PersonaSeed(
         "inquisitor", "Inquisitor", "overseer", None, None, "#180830", "#7a4cc2", None, None, None
@@ -349,6 +358,7 @@ def persona_schema_sql() -> str:
             tts_voice TEXT,
             tts_rate TEXT,
             notification_sound TEXT,
+            default_session_doc TEXT,
             CHECK (default_rank = 'astartes' OR assignment_pool IS NULL)
         )
     """
@@ -367,14 +377,16 @@ def seed_params(seed: PersonaSeed) -> tuple:
         seed.tts_voice,
         seed.tts_rate,
         seed.notification_sound,
+        seed.default_session_doc,
     )
 
 
 UPSERT_SQL = """
     INSERT INTO personas (
         id, slug, display_name, default_rank, assignment_pool, assignment_order,
-        pane_tint, chip_color, tts_voice, tts_rate, notification_sound
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        pane_tint, chip_color, tts_voice, tts_rate, notification_sound,
+        default_session_doc
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
         slug=excluded.slug,
         display_name=excluded.display_name,
@@ -385,14 +397,42 @@ UPSERT_SQL = """
         chip_color=excluded.chip_color,
         tts_voice=excluded.tts_voice,
         tts_rate=excluded.tts_rate,
-        notification_sound=excluded.notification_sound
+        notification_sound=excluded.notification_sound,
+        default_session_doc=excluded.default_session_doc
 """
+
+
+# Additive column migrations for the personas table. ``persona_schema_sql`` uses
+# ``CREATE TABLE IF NOT EXISTS``, so a column added after a DB's first boot would
+# never land without an explicit ALTER. Each entry is ``(column_name, alter_sql)``
+# and is applied iff the column is absent — idempotent, additive house style
+# (mirrors the session_documents migration in db_schema). The UPSERT seed that
+# follows then backfills values onto existing rows.
+_PERSONA_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("default_session_doc", "ALTER TABLE personas ADD COLUMN default_session_doc TEXT"),
+)
+
+
+def _migrate_persona_columns_sync(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(personas)").fetchall()}
+    for column_name, sql in _PERSONA_COLUMN_MIGRATIONS:
+        if column_name not in existing:
+            conn.execute(sql)
+
+
+async def _migrate_persona_columns(db: aiosqlite.Connection) -> None:
+    cursor = await db.execute("PRAGMA table_info(personas)")
+    existing = {row[1] for row in await cursor.fetchall()}
+    for column_name, sql in _PERSONA_COLUMN_MIGRATIONS:
+        if column_name not in existing:
+            await db.execute(sql)
 
 
 def ensure_personas_table_sync(db_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute(persona_schema_sql())
+        _migrate_persona_columns_sync(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_personas_assignment
@@ -405,6 +445,7 @@ def ensure_personas_table_sync(db_path: Path) -> None:
 
 async def ensure_personas_table(db: aiosqlite.Connection) -> None:
     await db.execute(persona_schema_sql())
+    await _migrate_persona_columns(db)
     await db.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_personas_assignment
@@ -442,6 +483,7 @@ def _row_to_dict(row) -> dict | None:
             "tts_voice",
             "tts_rate",
             "notification_sound",
+            "default_session_doc",
         )
         data = dict(zip(keys, row, strict=False))
     data["silent"] = data.get("tts_voice") is None

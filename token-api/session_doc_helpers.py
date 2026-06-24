@@ -22,6 +22,7 @@ import aiosqlite
 import yaml
 
 from pane_surface import is_placeholder_tab_name
+from personas import resolve_persona
 
 logger = logging.getLogger(__name__)
 
@@ -1438,7 +1439,7 @@ async def resolve_session_doc_for_start(
     """Resolve launch-time session doc ownership with explicit precedence.
 
     Precedence:
-    1. Custodes daily note
+    1. persona-default daily note (``personas.default_session_doc == 'daily_note'``)
     2. explicit dispatch doc
     3. active primarch doc
     4. active cron doc (or create one)
@@ -1449,11 +1450,23 @@ async def resolve_session_doc_for_start(
     ``(None, "unresolved_dispatch")`` so the orchestrator surfaces the miss
     instead of accumulating blank ``needs-session-name-N.md`` docs.
     """
-    # Legion-aware so automated custodes launches (cron, GT/state-hook dispatch,
-    # resume) that never set TOKEN_API_PERSONA still bind to the shared daily note.
-    if primarch_name == "custodes" or legion == "custodes":
-        doc_id = await resolve_or_create_today_daily_note_session_doc(db)
-        return doc_id, "daily_note_custodes"
+    # Persona-default daily-note binding — the generalization of the old
+    # custodes-only special case. ANY persona whose ``personas.default_session_doc``
+    # is ``'daily_note'`` (Custodes, Fabricator-General, Administratum) co-binds
+    # today's single shared ``Terra/Journal/Daily/YYYY-MM-DD.md``: Custodes owns
+    # its semantics, FG/Admin ride the same infra. Resolved by persona at stamp
+    # time (never a stored path) so it re-points cleanly across midnight.
+    #
+    # Legion- AND primarch_name-aware so automated launches (cron, GT/state-hook
+    # dispatch, resume) that never set TOKEN_API_PERSONA still resolve identity.
+    # primarch_name is checked first so a primarch-shaped launch wins, then legion.
+    for candidate in (primarch_name, legion):
+        if not candidate:
+            continue
+        persona = await resolve_persona(db, candidate)
+        if persona and persona.get("default_session_doc") == "daily_note":
+            doc_id = await resolve_or_create_today_daily_note_session_doc(db)
+            return doc_id, "daily_note"
 
     if dispatch_session_doc_path:
         fp = Path(dispatch_session_doc_path)
