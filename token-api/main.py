@@ -571,6 +571,9 @@ class WorkStateResponse(BaseModel):
     desktop_mode: str
     phone_app: str | None = None
     productivity_hold: str = "none"  # active_process | typing_guard | work_action_buffer | none
+    idle_timeout_exempt: bool = False
+    human_anchored_instance_count: int = 0
+    within_human_work_action_window: bool = False
     work_action_source: str | None = None
     work_action_note: str | None = None
     work_action_age_seconds: int | None = None
@@ -1701,6 +1704,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         print(f"TIMER: Synced activity=WORKING (desktop={desktop_mode})")
     try:
         startup_work_state = await compute_work_state()
+        timer_engine.idle_timeout_exempt = (
+            DESKTOP_STATE.get("location_zone") == "campus" or startup_work_state.idle_timeout_exempt
+        )
         timer_engine.set_productivity(startup_work_state.productivity_active, now_ms)
         await shared.timer_write_sample(
             source="startup",
@@ -5681,7 +5687,14 @@ def _activity_icons() -> list[ActivityIconState]:
     ]
 
 
-WORK_ACTION_BUFFER_SECONDS = 3 * 60
+# Human supervisory cadence window. One human prompt/AUQ answer is a real
+# "Emperor is here" signal for a sparse supervisory interval, not merely the
+# old short agent-heartbeat bridge. This is the single dial for the widened
+# human work-action window; hook-driven/automated pane activity stays on the
+# short freshness path below.
+SUPERVISORY_HUMAN_WORK_ACTION_WINDOW_SECONDS = 20 * 60
+WORK_ACTION_BUFFER_SECONDS = SUPERVISORY_HUMAN_WORK_ACTION_WINDOW_SECONDS
+AGENT_ACTIVITY_FRESH_SECONDS = 3 * 60
 TYPING_GUARD_ACTIVE_SECONDS = 15
 # Deskflow KVM client heartbeat freshness. The Mac deskflow-client supervisor
 # heartbeats DESKTOP_STATE["deskflow_active"]/["deskflow_last_seen"] while the
@@ -5689,6 +5702,19 @@ TYPING_GUARD_ACTIVE_SECONDS = 15
 # dead/quiet client stops anchoring work within one window. Matches the 3-minute
 # work-activity cutoff used for agent panes.
 DESKFLOW_ACTIVE_TTL_SECONDS = 3 * 60
+
+
+def human_supervision_idle_exempt(
+    *, human_anchored: bool, within_human_work_action_window: bool
+) -> bool:
+    """Shared idle-break exemption predicate for compute_work_state + timer.
+
+    Custodes Option A: an AUQ-human-anchored run OR a non-discounted human
+    work-action still inside the supervisory window exempts the timer from the
+    idle_timeout→idle_break transition.
+    """
+
+    return bool(human_anchored or within_human_work_action_window)
 
 
 def _deskflow_active_fresh(now: datetime | None = None) -> bool:
@@ -5747,13 +5773,12 @@ def _format_countdown_seconds(seconds: int | None) -> str | None:
 
 async def compute_work_state() -> WorkStateResponse:
     now = datetime.now()
-    # Work should decay quickly. A live/idle agent pane is not, by itself,
-    # evidence of ongoing work for half an hour; it is only a short bridge
-    # between a human work action (typing/prompt/Stream Deck) and the agent
-    # actually getting moving. After 3 minutes with no qualifying activity, the
-    # productivity layer should drop to IDLE; TimerEngine then gives IDLE 7
-    # more minutes before auto-break. Total grace from last work action: 10 min.
-    work_activity_cutoff = now - timedelta(minutes=3)
+    # Agent-pane heartbeats still decay quickly. A live/idle agent pane is not,
+    # by itself, evidence of ongoing work for half an hour; it is only a short
+    # bridge between a human work action (typing/prompt/Stream Deck) and the
+    # agent actually getting moving. Human work_action events themselves use the
+    # separate supervisory window below, after the automated/hook-driven discount.
+    work_activity_cutoff = now - timedelta(seconds=AGENT_ACTIVITY_FRESH_SECONDS)
     # Human override for the automated-activation discount: a recent human
     # keystroke (the same #{client_activity} predicate the send gate uses)
     # disables the discount this tick, so genuine typing always anchors WORKING.
@@ -5777,7 +5802,7 @@ async def compute_work_state() -> WorkStateResponse:
         cursor = await db.execute(
             """
             SELECT i.id, i.name AS tab_name, i.status, i.engine, i.working_dir,
-                   i.device_id, i.last_activity,
+                   i.device_id, i.last_activity, i.human_anchored_at, i.human_anchor_source,
                    COALESCE(p.slug, 'astartes') AS legion,
                    COALESCE(i.hook_driven, 0) AS hook_driven
             FROM instances i
@@ -5841,8 +5866,8 @@ async def compute_work_state() -> WorkStateResponse:
             except Exception:
                 continue
 
-        # Widen to LIMIT 5 (was 1) so an interleaved human work_action still
-        # anchors even when the most-recent row is a discounted automated wake.
+        # Scan the bounded supervisory window so newer discounted automated
+        # wakes cannot hide an earlier non-discounted human work_action.
         recent_work_action_cursor = await db.execute(
             """
             SELECT
@@ -5851,10 +5876,10 @@ async def compute_work_state() -> WorkStateResponse:
                 CAST((julianday('now') - julianday(created_at)) * 86400 AS INTEGER) AS age_seconds
             FROM events
             WHERE event_type = 'work_action'
-              AND datetime(created_at) >= datetime('now', '-3 minutes')
+              AND datetime(created_at) >= datetime('now', ?)
             ORDER BY created_at DESC
-            LIMIT 5
-            """
+            """,
+            (f"-{SUPERVISORY_HUMAN_WORK_ACTION_WINDOW_SECONDS} seconds",),
         )
         work_action_rows = await recent_work_action_cursor.fetchall()
 
@@ -5864,6 +5889,7 @@ async def compute_work_state() -> WorkStateResponse:
         # typing, the action is attributable to the injection and skipped. A
         # tmux-typing-guard source is human input and is never discounted.
         recent_work_action = None
+        recent_work_action_is_human_window = False
         for wa_row in work_action_rows:
             try:
                 wa_details = json.loads(wa_row["details"] or "{}")
@@ -5871,10 +5897,15 @@ async def compute_work_state() -> WorkStateResponse:
                 wa_details = {}
             wa_source = wa_details.get("source")
             wa_note = wa_details.get("note") or ""
+            try:
+                wa_age_seconds = max(0, int(wa_row["age_seconds"] or 0))
+            except Exception:
+                wa_age_seconds = None
             discounted = False
+            attributed_session = False
             if (
                 not human_typing
-                and wa_source != "tmux-typing-guard"
+                and wa_source not in {"tmux-typing-guard", "ask_user_question_answered"}
                 and wa_note.startswith("session_id=")
             ):
                 wa_sid = wa_note[len("session_id=") :].strip()
@@ -5885,6 +5916,7 @@ async def compute_work_state() -> WorkStateResponse:
                         (wa_sid,),
                     )
                     wa_pane_row = await wa_pane_cursor.fetchone()
+                    attributed_session = wa_pane_row is not None
                     wa_lp = live_panes_by_instance.get(wa_sid)
                     wa_pane = wa_lp["pane_id"] if wa_lp else None
                     wa_hook_driven = bool(wa_pane_row["hook_driven"]) if wa_pane_row else False
@@ -5906,9 +5938,23 @@ async def compute_work_state() -> WorkStateResponse:
                         if wa_age is not None and wa_age <= injected_age:
                             discounted = True
             if not discounted:
+                intrinsic_human = (
+                    wa_source in {"tmux-typing-guard", "ask_user_question_answered"}
+                    or bool(wa_details.get("explicit"))
+                    or human_typing
+                    or attributed_session
+                )
+                if intrinsic_human:
+                    recent_work_action_is_human_window = True
+                elif wa_age_seconds is not None and wa_age_seconds > AGENT_ACTIVITY_FRESH_SECONDS:
+                    # Unattributed hook/internal signals keep the old short bridge.
+                    # Only proven human, non-discounted work-actions get the
+                    # supervisory window.
+                    continue
                 recent_work_action = wa_row
                 break
 
+        human_anchored_instance_count = 0
     for row in rows:
         last_activity = row["last_activity"]
         is_recent = False
@@ -5918,6 +5964,7 @@ async def compute_work_state() -> WorkStateResponse:
             is_recent = last_activity_dt >= work_activity_cutoff
         except Exception:
             pass
+        human_anchored = bool(row["human_anchored_at"])
         live_pane = None
         pane_is_agent = None
         # Resolve this instance's pane live from the oracle. A live pane in the
@@ -5932,11 +5979,11 @@ async def compute_work_state() -> WorkStateResponse:
             pane_is_agent = live_pane
         if row["status"] == "working" and is_recent:
             processing_recent_count += 1
-        if not is_recent:
+        if not (is_recent or human_anchored):
             continue
         if row["device_id"] == LOCAL_DEVICE_NAME and not pane_is_agent:
             continue
-        if row["device_id"] != LOCAL_DEVICE_NAME and not is_recent:
+        if row["device_id"] != LOCAL_DEVICE_NAME and not (is_recent or human_anchored):
             continue
         if live_pane is False:
             continue
@@ -5956,8 +6003,10 @@ async def compute_work_state() -> WorkStateResponse:
             and last_activity_dt >= marker_injected
         )
         hook_driven_discount = bool(row["hook_driven"])
-        if (marker_discount or hook_driven_discount) and not human_typing:
+        if (marker_discount or hook_driven_discount) and not (human_typing or human_anchored):
             continue
+        if human_anchored:
+            human_anchored_instance_count += 1
         if canonical_tmux_pane:
             tracked_panes.add(canonical_tmux_pane)
         active_instances.append(
@@ -6026,6 +6075,7 @@ async def compute_work_state() -> WorkStateResponse:
     work_action_note = None
     work_action_age_seconds = None
     work_action_buffer_remaining_seconds = None
+    within_human_work_action_window = False
     typing_active = False
     if recent_work_action:
         try:
@@ -6039,8 +6089,17 @@ async def compute_work_state() -> WorkStateResponse:
         except Exception:
             work_action_age_seconds = None
         if work_action_age_seconds is not None:
+            selected_window_seconds = (
+                SUPERVISORY_HUMAN_WORK_ACTION_WINDOW_SECONDS
+                if recent_work_action_is_human_window
+                else AGENT_ACTIVITY_FRESH_SECONDS
+            )
             work_action_buffer_remaining_seconds = max(
-                0, WORK_ACTION_BUFFER_SECONDS - work_action_age_seconds
+                0, selected_window_seconds - work_action_age_seconds
+            )
+            within_human_work_action_window = (
+                recent_work_action_is_human_window
+                and work_action_age_seconds <= SUPERVISORY_HUMAN_WORK_ACTION_WINDOW_SECONDS
             )
         typing_active = (
             work_action_source == "tmux-typing-guard"
@@ -6054,6 +6113,11 @@ async def compute_work_state() -> WorkStateResponse:
     # pane, tmux typing, or explicit work_action. This is the feed the timer was
     # missing — without it, genuine desk work decayed to idle_break all day.
     deskflow_active = _deskflow_active_fresh(now)
+
+    shared_idle_timeout_exempt = human_supervision_idle_exempt(
+        human_anchored=human_anchored_instance_count > 0,
+        within_human_work_action_window=within_human_work_action_window,
+    )
 
     productivity_active = bool(
         active_instances or observed_agents or recent_work_action or deskflow_active
@@ -6073,7 +6137,10 @@ async def compute_work_state() -> WorkStateResponse:
         else:
             unknown_active_count += 1
 
-    if active_instances or observed_agents:
+    if human_anchored_instance_count:
+        reason = "human_anchored_run"
+        productivity_hold = "human_anchor"
+    elif active_instances or observed_agents:
         reason = "recent_tracked_or_observed_agent"
         productivity_hold = "active_process"
     elif typing_active:
@@ -6109,6 +6176,9 @@ async def compute_work_state() -> WorkStateResponse:
         desktop_mode=DESKTOP_STATE.get("current_mode", "silence"),
         phone_app=PHONE_STATE.get("current_app"),
         productivity_hold=productivity_hold,
+        idle_timeout_exempt=shared_idle_timeout_exempt,
+        human_anchored_instance_count=human_anchored_instance_count,
+        within_human_work_action_window=within_human_work_action_window,
         work_action_source=work_action_source,
         work_action_note=work_action_note,
         work_action_age_seconds=work_action_age_seconds,
@@ -16222,17 +16292,23 @@ async def _resolve_work_action_attribution(
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT COALESCE(hook_driven, 0) AS hook_driven FROM instances WHERE id = ?",
+                "SELECT status, COALESCE(hook_driven, 0) AS hook_driven "
+                "FROM instances WHERE id = ?",
                 (session_id,),
             )
             row = await cursor.fetchone()
             if row is None:
                 return (None, False)
+            if row["status"] in {"stopped", "archived"}:
+                return (None, False)
             # A human keystroke overrides every discount (mirrors compute_work_state:
             # tmux-typing-guard source + a hot global typing guard are never
             # discounted). _typing_guard_active() is the same predicate the read path
             # consults, kept in sync deliberately.
-            if source == "tmux-typing-guard" or _typing_guard_active():
+            if (
+                source in {"tmux-typing-guard", "ask_user_question_answered"}
+                or _typing_guard_active()
+            ):
                 return (session_id, True)
             if bool(row["hook_driven"]):
                 return (session_id, False)
@@ -16332,10 +16408,18 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
     if instance_id and should_bump_activity:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
+                updates = {"last_activity": datetime.now().isoformat()}
+                if request.source == "ask_user_question_answered":
+                    updates.update(
+                        {
+                            "human_anchored_at": datetime.now().isoformat(),
+                            "human_anchor_source": "ask_user_question_answered",
+                        }
+                    )
                 await sanctioned_update_instance(
                     db,
                     instance_id=instance_id,
-                    updates={"last_activity": datetime.now().isoformat()},
+                    updates=updates,
                     mutation_type="instance_updated",
                     write_source="api",
                     actor=f"work_action-{request.source}",
@@ -16347,6 +16431,29 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
             logger.warning(
                 "work_action: last_activity heartbeat failed for %s: %s", instance_id, exc
             )
+    elif instance_id and request.source == "ask_user_question_answered":
+        # AUQ answers are a gold-standard human-presence signal. In normal flow
+        # _resolve_work_action_attribution returns should_bump_activity=True for
+        # this source; this defensive arm preserves the anchor if a future
+        # discount branch changes the heartbeat decision.
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=instance_id,
+                    updates={
+                        "human_anchored_at": datetime.now().isoformat(),
+                        "human_anchor_source": "ask_user_question_answered",
+                    },
+                    mutation_type="instance_updated",
+                    write_source="api",
+                    actor="work_action-ask_user_question_answered",
+                )
+                await db.commit()
+        except LookupError:
+            pass
+        except Exception as exc:
+            logger.warning("work_action: AUQ human anchor failed for %s: %s", instance_id, exc)
 
     # Canonical, durable record: append to today's daily-note frontmatter — only
     # for explicit presses, never hook-driven satisfy signals (prompt_submit etc.
@@ -19760,6 +19867,7 @@ async def timer_worker():
     global _current_session_id, _session_start_ms, _mode_change_count
     last_db_save = 0.0
     last_sample_save = 0.0
+    work_idle_timeout_exempt = False
     last_mode = timer_engine.current_mode.value
     last_pushed_seg: str | None = None
     today = datetime.now().strftime("%Y-%m-%d")
@@ -19780,9 +19888,24 @@ async def timer_worker():
         try:
             await asyncio.sleep(1)
             now_ms = int(time.monotonic() * 1000)
-            now = datetime.now()
-            today = now.strftime("%Y-%m-%d")
-            current_hour = now.hour
+            now_dt = datetime.now()
+            today = now_dt.strftime("%Y-%m-%d")
+            current_hour = now_dt.hour
+            now_epoch = time.time()
+
+            # Refresh the shared idle-timeout exemption before tick() can cross
+            # the IDLE→IDLE_BREAK boundary. Reuse this work_state below for the
+            # 10s productivity update so compute_work_state remains single-shot
+            # per poll interval.
+            location_zone = DESKTOP_STATE.get("location_zone")
+            work_state_for_productivity: WorkStateResponse | None = None
+            if now_epoch - last_db_save >= 10:  # piggyback on DB save interval
+                work_state_for_productivity = await compute_work_state()
+                work_idle_timeout_exempt = work_state_for_productivity.idle_timeout_exempt
+            timer_engine.idle_timeout_exempt = (
+                location_zone == "campus"
+            ) or work_idle_timeout_exempt
+
             result = timer_engine.tick(now_ms, today, current_hour)
 
             # Handle events (some events come paired with MODE_CHANGED — handle specially)
@@ -19966,17 +20089,11 @@ async def timer_worker():
             # as lower assertion confidence; the source is cleared only by explicit
             # close/new-app telemetry or an intentional correction endpoint.
 
-            now = time.time()
-
-            # Update idle_timeout_exempt based on location only
-            # NOTE: work_mode is manual-only now (user clocks in/out explicitly).
-            # Location-based exemptions still apply (e.g., campus = studying).
-            location_zone = DESKTOP_STATE.get("location_zone")
-            timer_engine.idle_timeout_exempt = location_zone == "campus"
+            now = now_epoch
 
             # Productivity layer update (every 10s) — poll DB for active instances
-            if now - last_db_save >= 10:  # piggyback on DB save interval
-                work_state = await compute_work_state()
+            if work_state_for_productivity is not None:
+                work_state = work_state_for_productivity
                 productivity_active = work_state.productivity_active
 
                 # Feed per-class active counts for shadow accrual (billable vs

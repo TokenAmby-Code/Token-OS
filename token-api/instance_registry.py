@@ -43,6 +43,8 @@ IDENTITY_COLUMNS = [
     "notification_mode",
     "interaction_mode",
     "golden_throne",
+    "human_anchored_at",
+    "human_anchor_source",
 ]
 
 # Transitional runtime annex (see module docstring). Order matters: it is the
@@ -250,6 +252,8 @@ def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = Non
         "interaction_mode": row.get("interaction_mode")
         or normalize_interaction_mode(row.get("tts_mode")),
         "golden_throne": row.get("golden_throne") or golden_throne_binding(row),
+        "human_anchored_at": row.get("human_anchored_at"),
+        "human_anchor_source": row.get("human_anchor_source"),
     }
     # Runtime annex passthrough: any annex column present on the legacy row
     # carries over verbatim (the extraction backfill and transitional
