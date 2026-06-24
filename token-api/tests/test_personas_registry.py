@@ -101,7 +101,8 @@ async def test_resolver_silent_and_voiced_personas(app_env):
 
     assert fg["tts_voice"] is None and fg["silent"] is True
     assert admin["tts_voice"] is None and admin["silent"] is True
-    assert fg["pane_tint"] == admin["pane_tint"] == "#300808"
+    assert fg["pane_tint"] == "#300808"
+    assert admin["pane_tint"] == "#24201a"
 
     # The Custodes Trinity shares the daily-note-as-session-doc default; workers do not.
     assert custodes["default_session_doc"] == "daily_note"
@@ -113,8 +114,44 @@ async def test_resolver_silent_and_voiced_personas(app_env):
     assert chapter["assignment_pool"] == "primary"
     assert chapter["tts_voice"] == "Microsoft Ravi"
     assert chapter["chip_color"] == "#b1191e"
-    assert chapter["pane_tint"] == "#300808"
+    assert chapter["pane_tint"] == "#2a1020"
     assert chapter["notification_sound"] == "notify.wav"
+
+
+def test_overseer_tints_do_not_collide_with_worker_or_primarch_tints(app_env):
+    """Pane backgrounds are an operator-recognition channel.
+
+    Worker tints include chapter personas plus shared worker coats such as
+    mechanicus-worker. Nothing outside the overseer tier may reuse an overseer
+    pane tint; exact collisions made Blood Angels / Mechanicus workers look like
+    the Fabricator-General and Imperial Fists look like Custodes.
+    """
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT slug, default_rank, pane_tint
+            FROM personas
+            WHERE pane_tint IS NOT NULL AND pane_tint <> 'default'
+            """
+        ).fetchall()
+
+    overseer_by_tint = {
+        row["pane_tint"]: row["slug"] for row in rows if row["default_rank"] == "overseer"
+    }
+    non_overseer_collisions = [
+        (row["slug"], row["default_rank"], row["pane_tint"], overseer_by_tint[row["pane_tint"]])
+        for row in rows
+        if row["default_rank"] != "overseer" and row["pane_tint"] in overseer_by_tint
+    ]
+    assert non_overseer_collisions == []
+
+    overseer_counts: dict[str, list[str]] = {}
+    for row in rows:
+        if row["default_rank"] == "overseer":
+            overseer_counts.setdefault(row["pane_tint"], []).append(row["slug"])
+    duplicate_overseers = {tint: slugs for tint, slugs in overseer_counts.items() if len(slugs) > 1}
+    assert duplicate_overseers == {}
 
 
 @pytest.mark.asyncio
@@ -122,10 +159,10 @@ async def test_group_a_astartes_seed_preferred_voices_and_dark_tints(app_env):
     import personas
 
     expected = {
-        "blood-angels": ("Microsoft Ravi", "#b1191e", "#300808"),
+        "blood-angels": ("Microsoft Ravi", "#b1191e", "#2a1020"),
         "ultramarines": ("Microsoft Susan", "#1f4e9b", "#081c30"),
         "salamanders": ("Microsoft Sean", "#1b7a3d", "#082810"),
-        "imperial-fists": ("Microsoft Catherine", "#e6b800", "#302800"),
+        "imperial-fists": ("Microsoft Catherine", "#e6b800", "#3a3000"),
         "raven-guard": ("Microsoft Heera", "#2b2b2b", "#101010"),
     }
     async with aiosqlite.connect(app_env.db_path) as db:

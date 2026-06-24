@@ -539,7 +539,7 @@ class TestCivicAutoDetect:
             },
         )
         assert resp.status_code == 200, resp.text
-        assert ("%chapter", "#300808") in tint_calls
+        assert ("%chapter", "#2a1020") in tint_calls
 
     def test_cron_autodetect_mechanicus(self, client):
         """Cron origin should auto-detect as mechanicus."""

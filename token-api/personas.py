@@ -50,7 +50,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "astartes",
         "primary",
         10,
-        "#300808",
+        "#2a1020",
         "#b1191e",
         "Microsoft Ravi",
         "1",
@@ -86,7 +86,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "astartes",
         "primary",
         40,
-        "#302800",
+        "#3a3000",
         "#e6b800",
         "Microsoft Catherine",
         "1",
@@ -228,7 +228,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         "overseer",
         None,
         None,
-        "#300808",
+        "#24201a",
         "#6f1d1d",
         None,
         None,
@@ -272,18 +272,18 @@ PRIMARCH_PERSONAS: tuple[PersonaSeed, ...] = (
         "guilliman", "Guilliman", "primarch", None, None, "#081c30", "#1f4e9b", None, None, None
     ),
     PersonaSeed(
-        "sanguinius", "Sanguinius", "primarch", None, None, "#300808", "#b1191e", None, None, None
+        "sanguinius", "Sanguinius", "primarch", None, None, "#2b0d16", "#b1191e", None, None, None
     ),
     PersonaSeed(
         "alpharius", "Alpharius", "primarch", None, None, "#082c30", "#2f9e9e", None, None, None
     ),
-    PersonaSeed("dorn", "Dorn", "primarch", None, None, "#302800", "#e6b800", None, None, None),
+    PersonaSeed("dorn", "Dorn", "primarch", None, None, "#2c2400", "#e6b800", None, None, None),
     PersonaSeed("corax", "Corax", "primarch", None, None, "#101010", "#5f6368", None, None, None),
     PersonaSeed(
         "perturabo", "Perturabo", "primarch", None, None, "#202020", "#7f8c8d", None, None, None
     ),
     PersonaSeed(
-        "mechanicus", "Mechanicus", "primarch", None, None, "#300808", "#8b1a1a", None, None, None
+        "mechanicus", "Mechanicus", "primarch", None, None, "#1f1b18", "#8b1a1a", None, None, None
     ),
     PersonaSeed(
         "malcador", "Malcador", "primarch", None, None, "#302810", "#8a7a4a", None, None, None
@@ -309,7 +309,7 @@ MECHANICUS_WORKER = PersonaSeed(
     "astartes",
     None,
     None,
-    "#300808",
+    "#182126",
     "#8b1a1a",
     None,
     None,
