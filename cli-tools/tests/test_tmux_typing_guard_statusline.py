@@ -44,8 +44,12 @@ def _fake_tmux(tmp_path: Path) -> Path:
                 ;;
               show-options|show)
                 if [[ "$opt" == "@TYPING_LOCK_UNTIL" ]]; then
-                  key="LOCK_${target//%/}"
-                  printf '%s\n' "${!key:-}"
+                  if [[ -n "${FAKE_LOCK_FILE:-}" ]]; then
+                    cat "${FAKE_LOCK_FILE}"
+                  else
+                    key="LOCK_${target//%/}"
+                    printf '%s\n' "${!key:-}"
+                  fi
                 else
                   exit 1
                 fi
@@ -66,7 +70,9 @@ def _fake_tmux(tmp_path: Path) -> Path:
     return fake
 
 
-def _env(tmp_path: Path, *, active: str = "%1", locks: dict[str, float] | None = None) -> dict[str, str]:
+def _env(
+    tmp_path: Path, *, active: str = "%1", locks: dict[str, float] | None = None
+) -> dict[str, str]:
     calls = tmp_path / "calls.log"
     setopt = tmp_path / "setopt.log"
     calls.write_text("")
@@ -139,8 +145,40 @@ def test_publish_clears_one_pane_guard_without_scanning(tmp_path: Path) -> None:
     assert "list-panes" not in _calls(env)
 
 
+def test_publish_requires_explicit_state(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    proc = _run(env, "--publish", "-t", "%1")
+    assert proc.returncode == 2
+    assert _setopts(env) == []
+
+
 def test_clear_expired_clears_only_target_when_lock_expired(tmp_path: Path) -> None:
     env = _env(tmp_path, locks={"%1": time.time() - 1, "%2": time.time() + 60})
     _run(env, "--clear-expired", "-t", "%1")
     assert ("@GUARD", "%1", "") in _setopts(env)
     assert "list-panes" not in _calls(env)
+
+
+def test_clear_expired_follows_refreshed_deadline_before_clearing(tmp_path: Path) -> None:
+    lock_file = tmp_path / "lock.txt"
+    lock_file.write_text(str(time.time() + 0.15))
+    env = _env(tmp_path)
+    env["FAKE_LOCK_FILE"] = str(lock_file)
+
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        [sys.executable, str(STATUS), "--clear-expired", "-t", "%1"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    time.sleep(0.05)
+    lock_file.write_text(str(time.time() + 0.3))
+    stdout, stderr = proc.communicate(timeout=2)
+    elapsed = time.monotonic() - started
+
+    assert proc.returncode == 0, stderr
+    assert stdout == ""
+    assert elapsed >= 0.3
+    assert ("@GUARD", "%1", "") in _setopts(env)

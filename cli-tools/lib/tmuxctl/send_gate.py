@@ -458,13 +458,12 @@ _TYPING_LOCK_RECHECK_SECONDS = 1.0
 
 
 def _typing_delay_sleep(target: str | None, deadline: float | None) -> bool:
-    if not target:
-        return True
-    until = typing_guard_deadline(target=target)
+    until = typing_guard_deadline(target=target) if target else None
     if until is None:
-        return True
-    sleep_for = max(0.0, (until + _DELAY_WAKE_MARGIN_SECONDS) - time.time())
-    sleep_for = min(sleep_for, _TYPING_LOCK_RECHECK_SECONDS)
+        sleep_for = _TYPING_LOCK_RECHECK_SECONDS
+    else:
+        sleep_for = max(0.0, (until + _DELAY_WAKE_MARGIN_SECONDS) - time.time())
+        sleep_for = min(sleep_for, _TYPING_LOCK_RECHECK_SECONDS)
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:

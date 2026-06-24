@@ -246,22 +246,20 @@ def test_tmux_shim_delays_under_typing_guard_then_delivers(tmp_path: Path) -> No
     env = _env(tmp_path, "> draft\n")
     env.pop("TMUX_SEND_GATE_POLICY", None)
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
-    capture = Path(env["FAKE_TMUX_CAPTURE"])
+    env["FAKE_TMUX_LOCK_UNTIL"] = str(time.time() + 0.2)
+    started = time.monotonic()
     proc = subprocess.run(
-        [
-            "bash",
-            "-lc",
-            f"(sleep 0.2; printf '> \\n' > '{capture}') & exec '{TMUX_SHIM}' send-keys -t %1 peer-bytes",
-        ],
+        ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
         text=True,
         capture_output=True,
         env=env,
         timeout=3,
         check=False,
     )
+    elapsed = time.monotonic() - started
 
     assert proc.returncode == 0
+    assert elapsed >= 0.15
     sent = Path(env["FAKE_TMUX_SENT"]).read_text()
     assert "SEND send-keys -t %1 peer-bytes" in sent
     assert "ALLOW= SEND" in sent
@@ -330,7 +328,7 @@ def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path)
     env = _env(tmp_path, "> draft\n")
     env.pop("TMUX_SEND_GATE_POLICY", None)
     env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
+    env["FAKE_TMUX_LOCK_UNTIL"] = str(time.time() + 0.2)
     stub = tmp_path / "tmuxctl-stub"
     stub.write_text(
         "#!/usr/bin/env bash\n"
@@ -348,21 +346,19 @@ def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path)
     )
     stub.chmod(0o755)
     env["TMUXCTL_BIN"] = str(stub)
-    capture = Path(env["FAKE_TMUX_CAPTURE"])
+    started = time.monotonic()
     proc = subprocess.run(
-        [
-            "bash",
-            "-lc",
-            f"(sleep 0.2; printf '> \\n' > '{capture}') & exec '{AGENT_CMD}' --pane %1 'hello from peer'",
-        ],
+        ["bash", str(AGENT_CMD), "--pane", "%1", "hello from peer"],
         text=True,
         capture_output=True,
         env=env,
         timeout=4,
         check=False,
     )
+    elapsed = time.monotonic() - started
 
     assert proc.returncode == 0
+    assert elapsed >= 0.15
     payload = json.loads(proc.stdout)
     assert payload["verification_status"] == "sent"
     assert payload["pane"] == "%1"

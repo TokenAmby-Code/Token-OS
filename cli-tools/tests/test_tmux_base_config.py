@@ -150,7 +150,6 @@ def test_mark_for_close_script_is_committed_executable() -> None:
     assert mode == "100755", f"tmux-mark-for-close must be committed executable, got {mode}"
 
 
-
 def _setting(path: pathlib.Path, prefix: str) -> str:
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith(prefix):
