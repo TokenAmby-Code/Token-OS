@@ -961,6 +961,12 @@ def _render_state_injection(kind: str, payload: dict) -> str:
             lines.append(f"- exit_summary: {payload['exit_summary']}")
         lines.append("</system-reminder>")
         return "\n".join(lines)
+    if kind == "worker_poked":
+        worker = payload.get("child_instance_id") or "a worker"
+        doc = payload.get("child_session_doc_id")
+        label = f"{worker} (session_doc {doc})" if doc else str(worker)
+        prompt_text = payload.get("prompt_text") or ""
+        return f'<system-reminder>\n⬆ Emperor poked {label}: "{prompt_text}"\n</system-reminder>'
     return f"<system-reminder>\nState injection: {kind}\n{json.dumps(payload, sort_keys=True)}\n</system-reminder>"
 
 
@@ -1089,6 +1095,59 @@ async def _enqueue_child_stop_fanout(instance: dict, payload: dict) -> dict | No
     return {
         "injection_id": injection_id,
         "audience_instance_id": parent_instance_id,
+        "payload": injection_payload,
+    }
+
+
+async def _enqueue_poke_fanout(db, instance: dict, payload: dict) -> dict | None:
+    """Sister to `_enqueue_child_stop_fanout`: a genuine human poke (a
+    UserPromptSubmit on an instance whose `hook_driven` is falsy — no automated
+    wake preceded it) to a commanded worker enqueues a `worker_poked`
+    state-injection addressed to that worker's commander, carrying the verbatim
+    prompt so the commander gets the actual instruction, not just a "you were
+    touched" ping.
+
+    Reuses the already-open `db` (handle_prompt_submit holds the connection) —
+    unlike the Stop fanout we do NOT open a nested connection or commit here; the
+    caller commits. Resolves only the immediate chapter-edge commander (the FG
+    case); persona/Custodes-commanded workers resolve to None and are out of
+    scope, mirroring the Stop fanout's current chapter-only reach."""
+    commander_id = _normalize_text(_row_parent_instance_id(instance))
+    if not commander_id:
+        return None
+
+    prompt_text = next(iter(_iter_prompt_texts(payload)), None)
+    if not prompt_text:
+        return None
+
+    child_instance_id = instance["id"]
+    injection_payload = {
+        "kind": "worker_poked",
+        "child_instance_id": child_instance_id,
+        "child_session_doc_id": instance.get("session_doc_id"),
+        "prompt_text": prompt_text,
+        "prompt_hash": payload.get("prompt_hash") or payload.get("payload_hash"),
+    }
+    injection_id = await _enqueue_state_injection(
+        db,
+        audience_instance_id=commander_id,
+        source_instance_id=child_instance_id,
+        kind="worker_poked",
+        payload=injection_payload,
+    )
+    await log_event(
+        "state_injection_enqueued",
+        instance_id=child_instance_id,
+        details={
+            "audience_instance_id": commander_id,
+            "kind": "worker_poked",
+            "injection_id": injection_id,
+            "payload": injection_payload,
+        },
+    )
+    return {
+        "injection_id": injection_id,
+        "audience_instance_id": commander_id,
         "payload": injection_payload,
     }
 
@@ -4681,6 +4740,16 @@ async def handle_prompt_submit(payload: dict) -> dict:
             }
 
         consumed_injections = await _consume_state_injections(db, session_id)
+
+        # Sister to Stop→commander: a genuine human poke (hook_driven falsy = not an
+        # automated wake) to a commanded worker notifies that worker's commander,
+        # carrying the verbatim prompt. hook_driven=1 means an automated wake (FG
+        # talk/brief, state fanout, dispatch brief) preceded this prompt — the
+        # self-notify-loop guard, so the commander is never pinged about its own
+        # messages. No dedup table: handle_prompt_submit runs once per
+        # UserPromptSubmit, so one poke = one injection.
+        if not existing_dict.get("hook_driven"):
+            await _enqueue_poke_fanout(db, existing_dict, payload)
 
         planning_event = None
         preplan_subscription = None
