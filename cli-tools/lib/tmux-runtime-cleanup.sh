@@ -10,7 +10,8 @@ tmux_runtime_cleanup_pane() {
 
     # Clear visible title/style chrome that belongs to the departed runtime.
     tmux select-pane -t "$pane" -T "" >/dev/null 2>&1 || true
-    tmux select-pane -t "$pane" -P "bg=default,fg=default" >/dev/null 2>&1 || true
+    tmux set-option -pu -t "$pane" window-style >/dev/null 2>&1 || true
+    tmux set-option -pu -t "$pane" window-active-style >/dev/null 2>&1 || true
 
     local opt
     for opt in \

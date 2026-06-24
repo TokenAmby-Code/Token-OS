@@ -657,11 +657,7 @@ class TmuxControlPlane:
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False}
         bg = color or "default"
-        # select-pane -P is camera-neutral (style only) — no focus snapshot or
-        # restore needed (mirrors token-api shared.apply_pane_tint, relocated here).
-        self.adapter.run(
-            "select-pane", "-t", resolved["pane_id"], "-P", f"bg={bg}", allow_failure=True
-        )
+        self.adapter.set_pane_tint(resolved["pane_id"], bg)
         return {"instance_id": instance_id, "found": True, "tint": bg}
 
     def instance_clear_tint(self, instance_id: str) -> dict:

@@ -1957,7 +1957,8 @@ def _spawn_stack_enforce(window_target: str | None) -> None:
 async def _cleanup_tmux_pane_cosmetic(pane: str) -> None:
     commands: list[tuple[str, ...]] = [
         ("tmux", "select-pane", "-t", pane, "-T", ""),
-        ("tmux", "select-pane", "-t", pane, "-P", "bg=default,fg=default"),
+        ("tmux", "set-option", "-pu", "-t", pane, "window-style"),
+        ("tmux", "set-option", "-pu", "-t", pane, "window-active-style"),
     ]
     for cmd in commands:
         try:
@@ -3992,7 +3993,7 @@ async def handle_session_start(payload: dict) -> dict:
             # rotation pools); every other persona is voiceless (tts_voice=None) so
             # it never TTSes and frees the chapter voice it briefly held. All persona
             # voiceless personas keep tts_voice=NULL (silent). Pane colour is applied
-            # only through tmux select-pane -P bg=<personas.pane_tint>.
+            # only through focus-neutral per-pane style options.
             if persona_identity:
                 # Persona panes are identified by their label's primarch, not their
                 # legion. Malcador shares the astartes legion with regiment workers,

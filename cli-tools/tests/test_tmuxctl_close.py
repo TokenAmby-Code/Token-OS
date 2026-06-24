@@ -239,26 +239,28 @@ class InvariantAdapter(TmuxAdapter):
         return ""
 
 
-def test_unsetting_instance_id_clears_style_first():
+def test_unsetting_instance_id_clears_style_first() -> None:
     adapter = InvariantAdapter()
 
     adapter._preflight_runtime_invariants(["set-option", "-pu", "-t", "%9", "@INSTANCE_ID"])
 
     assert adapter.raw[:2] == [
-        ("select-pane", "-t", "%9", "-P", "bg=default"),
-        ("select-pane", "-t", "%9", "-T", ""),
+        ("set-option", "-pu", "-t", "%9", "window-style"),
+        ("set-option", "-pu", "-t", "%9", "window-active-style"),
     ]
+    assert ("select-pane", "-t", "%9", "-T", "") in adapter.raw
 
 
-def test_respawn_preflight_clears_runtime_and_style_first():
+def test_respawn_preflight_clears_runtime_and_style_first() -> None:
     adapter = InvariantAdapter()
 
     adapter._preflight_runtime_invariants(["respawn-pane", "-k", "-t", "%9"])
 
     assert adapter.raw[0:2] == [
-        ("select-pane", "-t", "%9", "-P", "bg=default"),
-        ("select-pane", "-t", "%9", "-T", ""),
+        ("set-option", "-pu", "-t", "%9", "window-style"),
+        ("set-option", "-pu", "-t", "%9", "window-active-style"),
     ]
+    assert ("select-pane", "-t", "%9", "-T", "") in adapter.raw
     assert ("set-option", "-pu", "-t", "%9", "@INSTANCE_ID") in adapter.raw
 
 

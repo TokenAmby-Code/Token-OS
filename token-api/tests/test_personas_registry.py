@@ -214,7 +214,8 @@ def test_recoloring_has_no_slash_color_path():
         assert "/color" not in path.read_text(encoding="utf-8")
 
     shared = (root / "token-api" / "shared.py").read_text(encoding="utf-8")
-    assert '"select-pane", "-t", tmux_pane, "-P", f"bg={bg}"' in shared
+    assert "adapter.set_pane_tint(tmux_pane, bg)" in shared
+    assert 'select-pane", "-t", tmux_pane, "-P"' not in shared
     assert "LEGION_PANE_COLORS" not in shared
 
 
