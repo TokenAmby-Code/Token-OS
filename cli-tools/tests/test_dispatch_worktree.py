@@ -96,11 +96,45 @@ def test_worktree_requires_branch_value(env: Env) -> None:
 
 def test_already_isolated_worktree_skips(env: Env) -> None:
     wt = env.parent / "wt-existing"
-    wt.mkdir()
+    _git("init", "-b", "existing", str(wt), env=env.base)
+    _git(
+        "-C",
+        str(wt),
+        "remote",
+        "add",
+        "origin",
+        "git@github.com:Someone/Other.git",
+        env=env.base,
+    )
     res = _run(env, "--dir", str(wt), "do it")
     assert res.returncode == 0, res.stderr
     line = _worktree_line(res.stdout).lower()
     assert "isolated" in line or "n/a" in line
+
+
+def test_already_isolated_non_git_dir_is_refused(env: Env) -> None:
+    wt = env.parent / "wt-not-git"
+    wt.mkdir()
+    res = _run(env, "--dir", str(wt), "do it")
+    assert res.returncode == 64
+    assert "not a git worktree" in res.stderr
+
+
+def test_already_isolated_rejects_github_com_substring_origin(env: Env) -> None:
+    wt = env.parent / "wt-evil-origin"
+    _git("init", "-b", "evil-origin", str(wt), env=env.base)
+    _git(
+        "-C",
+        str(wt),
+        "remote",
+        "add",
+        "origin",
+        "https://github.com.evil/Someone/Other.git",
+        env=env.base,
+    )
+    res = _run(env, "--dir", str(wt), "do it")
+    assert res.returncode == 64
+    assert "does not map to GitHub" in res.stderr
 
 
 def _instance_type_line(stdout: str) -> str:
@@ -394,3 +428,21 @@ def test_dispatch_worktree_accepts_token_os_github_origin(
     res = _run_token_os_worktree(token_os_worktree_env, "--worktree", "remote-guard", "do it")
     assert res.returncode == 0, res.stderr
     assert "already isolated worktree" in _worktree_line(res.stdout)
+
+
+def test_dispatch_worktree_refuses_github_com_substring_origin(
+    token_os_worktree_env: TokenOsWorktreeEnv,
+) -> None:
+    _git(
+        "-C",
+        str(token_os_worktree_env.worktree),
+        "remote",
+        "add",
+        "origin",
+        "https://github.com.evil/TokenAmby-Code/Token-OS.git",
+        env=token_os_worktree_env.base,
+    )
+
+    res = _run_token_os_worktree(token_os_worktree_env, "--worktree", "remote-guard", "do it")
+    assert res.returncode == 64
+    assert "TokenAmby-Code/Token-OS" in res.stderr
