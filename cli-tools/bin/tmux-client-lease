@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# tmux-client-lease — soft lease policy for desktop/mobile tmux clients
+set -euo pipefail
+_THIS="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")"
+_LIB_DIR="$(dirname "$(dirname "$_THIS")")/lib"
+export PYTHONPATH="$_LIB_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m tmux_client_lease "$@"
