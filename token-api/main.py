@@ -38,6 +38,31 @@ UI_DIR = Path(__file__).resolve().parent / "ui"
 import subprocess
 import tempfile
 
+
+def _capture_launched_git_sha() -> str | None:
+    """Git SHA of the checkout this process loaded code from.
+
+    Captured ONCE at import so it reflects the code THIS process is running and
+    cannot drift if the live checkout advances under a still-running server.
+    SCRIPTS_DIR is the live checkout root (holds the protected-but-readable
+    .git). `git rev-parse` is canonical and robust to ref-based HEAD on dev runs.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(SCRIPTS_DIR),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
+LAUNCHED_GIT_SHA = _capture_launched_git_sha()
+
 import aiosqlite
 import httpx
 import requests
@@ -18199,6 +18224,7 @@ async def health_check():
         },
         "tts_global_mode": TTS_GLOBAL_MODE["mode"],
         "in_meeting": DESKTOP_STATE.get("in_meeting", False),
+        "git_sha": LAUNCHED_GIT_SHA,
     }
 
 

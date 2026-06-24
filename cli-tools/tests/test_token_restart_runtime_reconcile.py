@@ -51,11 +51,28 @@ def _stub_side_effect_tools(tmp_path: Path) -> Path:
         "tmux",
         "tmuxctl",
         "tx",
-        "curl",
     ]:
         p = stub_bin / name
         p.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         p.chmod(0o755)
+
+    # curl: the /health payload self-reports git_sha = the runtime's CURRENT HEAD
+    # (real git, read at call time from STUB_RUNTIME_DIR) so token-restart's
+    # staleness check sees running==checkout and does NOT falsely report the live
+    # process stale — preserving these tests' no-op/refresh assertions. The
+    # %{http_code} refresh path still emits a bare 200.
+    curl = stub_bin / "curl"
+    curl.write_text(
+        "#!/usr/bin/env bash\n"
+        'for arg in "$@"; do\n'
+        '  if [[ "$arg" == *"%{http_code}"* ]]; then echo 200; exit 0; fi\n'
+        "done\n"
+        'sha="$(git -C "${STUB_RUNTIME_DIR:-}" rev-parse HEAD 2>/dev/null || true)"\n'
+        'echo "{\\"connected\\": true, \\"git_sha\\": \\"$sha\\"}"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
 
     uname = stub_bin / "uname"
     uname.write_text('#!/usr/bin/env bash\necho "Darwin"\n', encoding="utf-8")
@@ -101,6 +118,9 @@ def _env(tmp_path: Path, bare: Path, runtime: Path) -> dict[str, str]:
         "TOKEN_OS_WORKTREE_CONF": str(tmp_path / "missing.conf"),
         "TOKEN_OS_SECRETS_DIR": "",
         "TOKEN_SATELLITE_REFRESH_SECRET": "refresh-secret",
+        # Lets the curl stub self-report the live process's SHA as the runtime's
+        # real HEAD → never falsely stale (see _stub_side_effect_tools).
+        "STUB_RUNTIME_DIR": str(runtime),
     }
 
 

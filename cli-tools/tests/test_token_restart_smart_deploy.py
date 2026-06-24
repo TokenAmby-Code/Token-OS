@@ -85,6 +85,8 @@ def _stub_env(
 
     # curl: log + emit a connected payload (discord health greps for it) + exit 0.
     # For token-restart's -w '%{http_code}' refresh path, emit a bare 200.
+    # The /health payload self-reports git_sha = STUB_RUNNING_SHA so token-restart
+    # can compare the live process's launched SHA against the checkout HEAD.
     curl = stub_bin / "curl"
     curl.write_text(
         f"""#!/usr/bin/env bash
@@ -92,7 +94,7 @@ echo "curl $*" >> "{logfile}"
 for arg in "$@"; do
   if [[ "$arg" == *"%{{http_code}}"* ]]; then echo 200; exit 0; fi
 done
-echo '{{"connected": true}}'
+echo '{{"connected": true, "git_sha": "'"${{STUB_RUNNING_SHA:-}}"'"}}'
 exit 0
 """
     )
@@ -189,6 +191,12 @@ esac
         "MERGE_FAIL_TIMES": str(fail_times),
         "MERGE_FAIL_MSG": merge_fail_msg,
         "MERGE_COUNTER": str(tmp_path / "merge_count.txt"),
+        # Default the live process's self-reported SHA to whatever the git stub
+        # reports for the checkout HEAD (NEW111 when no-advance, else OLD000) so
+        # running==checkout → NOT stale, and every existing test keeps its
+        # current no-op/selective assertions. A test opts into staleness by
+        # overriding env["STUB_RUNNING_SHA"] (e.g. "STALE999").
+        "STUB_RUNNING_SHA": "NEW111" if no_advance else "OLD000",
     }
     if no_advance:
         env["STUB_NO_ADVANCE"] = "1"

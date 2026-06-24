@@ -196,6 +196,17 @@ check_mac_health() {
     curl -sf "${TOKEN_API_URL:-http://localhost:7777}/health" > /dev/null 2>&1
 }
 
+# Git SHA the LIVE token-api process launched from, self-reported via /health.
+# Used to detect a stale process (checkout advanced without a paired restart).
+# Matches the QUOTED string value of git_sha; an unquoted `null`, an absent
+# field, or an unreachable server all yield empty -> treated as stale by the
+# caller (a down server is the worst stale state). `[^"]*` (not `[0-9a-f]*`) so
+# the captured token is the SHA verbatim regardless of charset.
+mac_running_git_sha() {
+    curl -sf "${TOKEN_API_URL:-http://localhost:7777}/health" 2>/dev/null \
+        | sed -n 's/.*"git_sha"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
 # PID of the launchd-managed token-api process, asked of launchd directly
 # (authoritative). The process now runs as `python main.py` (not `-m uvicorn …`),
 # so the old uvicorn-by-port pgrep pattern no longer matches the command line.
@@ -1433,10 +1444,25 @@ full_restart() {
         echo ""
     fi
 
+    # 0b. Reconcile process state with checkout state. Deciding what to restart
+    #     from SYNC_DID_ADVANCE alone conflates "git is at SHA X" with "the
+    #     process is serving SHA X" — they diverge whenever the checkout advanced
+    #     without a paired restart (skipped/contended deploy). token-api
+    #     self-reports its launched SHA via /health; if that != the checkout HEAD
+    #     (or /health is unreachable), the live process is stale and MUST bounce
+    #     regardless of whether THIS invocation advanced git.
+    local token_api_stale=false _checkout_sha _running_sha
+    _checkout_sha="$(git -C "$(runtime_root)" rev-parse -q --verify HEAD 2>/dev/null || true)"
+    _running_sha="$(mac_running_git_sha)"
+    [[ -z "$_running_sha" || "$_running_sha" != "$_checkout_sha" ]] && token_api_stale=true
+
     # 1. Decide what to restart.
     if [[ "$SYNC_DID_ADVANCE" == true ]]; then
         # Smart deploy: restart ONLY the services whose files the pull changed.
         map_changed_to_services
+        # A stale live process must bounce even if only non-service files (docs)
+        # changed this pull — the process is still serving older code.
+        [[ "$token_api_stale" == true ]] && RESTART_TOKENAPI=true
         if [[ "$RESTART_TOKENAPI" != true && "$RESTART_DISCORD" != true \
             && "$RESTART_WSL" != true && "$RESTART_MOBILE" != true ]]; then
             echo -e "${GREEN}✓${NC} No deployable services changed — nothing to restart."
@@ -1452,10 +1478,18 @@ full_restart() {
         echo ""
     elif [[ "$DEPLOY_COALESCE_TRAILING" == true ]]; then
         # Trailing coalescing re-run that found nothing new: the primary deploy
-        # already landed the newest SHA. Do NOT fall back to a full restart —
-        # that would needlessly bounce every service. Converged; nothing to do.
-        echo -e "${GREEN}✓${NC} Trailing re-sync: runtime already at newest main — nothing further to redeploy."
-        return 0
+        # already landed the newest SHA. Normally converged — but if the live
+        # token-api is STALE (checkout advanced without a paired restart, e.g.
+        # the primary deploy skipped the bounce), the deploy is NOT finished.
+        # Bounce token-api ONLY (Discord/WSL stay false → token-api-only scope)
+        # and fall through to the restart section; do NOT return early.
+        if [[ "$token_api_stale" == true ]]; then
+            echo -e "${YELLOW}⚠${NC} Runtime at ${_checkout_sha:-?} but live token-api serving '${_running_sha:-unreachable}' — restarting token-api."
+            RESTART_TOKENAPI=true
+        else
+            echo -e "${GREEN}✓${NC} Trailing re-sync: runtime already at newest main — nothing further to redeploy."
+            return 0
+        fi
     else
         # No new commits (already current / --no-sync / sync degraded): full
         # restart of the standard set — the human "restart my stuff now" path.
