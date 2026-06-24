@@ -11,7 +11,8 @@ from tmuxctl.api import build_client_attachments
 from tmuxctl.builder import (
     PERSONA_WINDOWS,
     _window_dir,
-    build_legion_window,
+    build_council_window,
+    build_mechanicus_window,
     build_workspace,
 )
 from tmuxctl.enums import (
@@ -241,7 +242,7 @@ def test_restart_plan_flags_codex_targets_busy():
     assert not plan.has_errors
 
 
-def test_restart_plan_marks_promoted_custodes_for_legion_tombstone():
+def test_restart_plan_marks_promoted_custodes_for_council_tombstone():
     workspace = _workspace(_pane("%2", "somnium:NE", stamp_instance_id="custodes"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
@@ -251,7 +252,8 @@ def test_restart_plan_marks_promoted_custodes_for_legion_tombstone():
     plan = build_restart_plan(workspace, registry)
 
     assert plan.resumes[0].pane_label == "somnium:NE"
-    assert plan.resumes[0].tombstone_role == "legion:custodes"
+    # Custodes' canonical seat moved from legion to the council page.
+    assert plan.resumes[0].tombstone_role == "council:custodes"
 
 
 def test_restart_plan_marks_promoted_fabricator_for_mechanicus_tombstone():
@@ -387,7 +389,7 @@ def test_build_client_attachments_classifies_local_remote_and_grouped():
 def test_restart_executor_uses_public_label_not_stale_pane_id() -> None:
     resume = PlannedResume(
         instance_id="abc123",
-        pane_label="mechanicus:admin",
+        pane_label="council:administratum",
         target_pane_id="%73",
         working_dir="/Volumes/Imperium/Imperium-ENV",
         disposition=ResumeDisposition.RESUME,
@@ -396,7 +398,7 @@ def test_restart_executor_uses_public_label_not_stale_pane_id() -> None:
 
     target = RestartExecutor()._resume_target_ref(resume)
 
-    assert target == "mechanicus:admin"
+    assert target == "council:administratum"
 
 
 def test_restart_executor_does_not_fall_back_to_internal_pane_id() -> None:
@@ -537,9 +539,8 @@ def test_builder_creates_canonical_workspace_roles():
     assert adapter.windows["main"] == [
         "palace",
         "somnium",
-        "legion",
+        "council",
         "mechanicus",
-        "koronus",
         "reservists",
     ]
     roles = {
@@ -560,21 +561,32 @@ def test_builder_creates_canonical_workspace_roles():
         "somnium:S",
         "somnium:SE",
     } <= set(roles.values())
-    assert roles["main:legion.1"] == "legion:custodes"
-    # The legion window is back to two overseer seats split down the middle:
-    # Custodes (.1) and Malcador (.2). The civic seat moved to the koronus page.
-    assert roles["main:legion.2"] == "legion:malcador"
-    assert "main:legion.3" not in roles
+    # The council page reuses the somnium 5-pane geometry but seats fixed personas:
+    # W custodes, N pax, NE malcador, SE administratum, S true-terminal (plain shell).
+    assert roles["main:council.1"] == "council:custodes"
+    assert roles["main:council.2"] == "council:pax"
+    assert roles["main:council.3"] == "council:malcador"
+    assert roles["main:council.4"] == "council:true-terminal"
+    assert roles["main:council.5"] == "council:administratum"
+    # The legion and koronus pages are retired.
+    assert "legion" not in adapter.windows["main"]
+    assert "koronus" not in adapter.windows["main"]
+    # Mechanicus seats the Fabricator-General (.1) over the orchestrator (.2); the
+    # admin seat moved to council, the orchestrator moved in from the retired koronus.
     assert roles["main:mechanicus.1"] == "mechanicus:fabricator-general"
-    # The koronus civic page seats pax (.1) over orchestrator (.2).
-    assert roles["main:koronus.1"] == "koronus:pax"
-    assert roles["main:koronus.2"] == "koronus:orchestrator"
+    assert roles["main:mechanicus.2"] == "mechanicus:orchestrator"
     assert roles["main:reservists.1"] == "reservists:civic"
-    assert adapter.pane_options["main:legion.1"]["@PANE_TYPE"] == "legion"
-    assert adapter.pane_options["main:legion.2"]["@PANE_TYPE"] == "legion"
+    for pane in (
+        "main:council.1",
+        "main:council.2",
+        "main:council.3",
+        "main:council.5",
+    ):
+        assert adapter.pane_options[pane]["@PANE_TYPE"] == "council"
+    # true-terminal is a plain shell seat — no persona, so no @PANE_TYPE.
+    assert "@PANE_TYPE" not in adapter.pane_options["main:council.4"]
     assert adapter.pane_options["main:mechanicus.1"]["@PANE_TYPE"] == "mechanicus"
-    assert adapter.pane_options["main:koronus.1"]["@PANE_TYPE"] == "koronus"
-    assert adapter.pane_options["main:koronus.2"]["@PANE_TYPE"] == "koronus"
+    assert adapter.pane_options["main:mechanicus.2"]["@PANE_TYPE"] == "mechanicus"
     assert adapter.pane_options["main:reservists.1"]["@PANE_TYPE"] == "reservists"
     # The civic reservist pane carries the hook the civic-thread fallthrough resolves.
     assert adapter.pane_options["main:reservists.1"]["@CIVIC_RESERVIST"] == "1"
@@ -602,60 +614,66 @@ def test_window_dir_falls_back_to_home_when_vault_unmounted(tmp_path, monkeypatc
         assert _window_dir(window) == str(pathlib.Path.home())
 
 
-def test_build_legion_window_seats_two_overseers_in_order() -> None:
-    # The legion column is split down the middle into two seats: Custodes (.1) on
-    # top and Malcador (.2) on the bottom. The civic Pax seat moved off legion to
-    # the dedicated koronus page, so legion no longer seats a third pane.
+def test_build_council_window_seats_five_personas_in_cardinal_positions() -> None:
+    # The council page reuses the somnium 5-pane geometry (W rail + right 2x2) but
+    # seats fixed personas by cardinal position: W custodes, N pax, NE malcador,
+    # SE administratum, S true-terminal (a plain shell — no persona, no agent).
     adapter = FakeBuilderAdapter()
     adapter.sessions.add("main")
     adapter.windows["main"] = []
-    adapter.panes["main:legion"] = ["main:legion.1"]
+    adapter.panes["main:council"] = ["main:council.1"]
 
-    build_legion_window(adapter, "main")  # type: ignore[arg-type]
+    build_council_window(adapter, "main")  # type: ignore[arg-type]
 
     seats = {
         target: options["@PANE_ID"]
         for target, options in adapter.pane_options.items()
-        if options.get("@PANE_ID", "").startswith("legion:")
+        if options.get("@PANE_ID", "").startswith("council:")
     }
     assert seats == {
-        "main:legion.1": "legion:custodes",
-        "main:legion.2": "legion:malcador",
+        "main:council.1": "council:custodes",
+        "main:council.2": "council:pax",
+        "main:council.3": "council:malcador",
+        "main:council.4": "council:true-terminal",
+        "main:council.5": "council:administratum",
     }
-    assert "main:legion.3" not in adapter.pane_options
-    for pane in ("main:legion.1", "main:legion.2"):
-        assert adapter.pane_options[pane]["@PANE_TYPE"] == "legion"
+    for pane in (
+        "main:council.1",
+        "main:council.2",
+        "main:council.3",
+        "main:council.5",
+    ):
+        assert adapter.pane_options[pane]["@PANE_TYPE"] == "council"
+    # The plain shell seat carries no persona type.
+    assert "@PANE_TYPE" not in adapter.pane_options["main:council.4"]
+    # The west rail is a side pane; the right 2x2 are small grid panes.
+    assert adapter.pane_options["main:council.1"]["@GRID_STATE"] == "side"
+    for pane in ("main:council.2", "main:council.3", "main:council.5"):
+        assert adapter.pane_options[pane]["@GRID_STATE"] == "small"
 
 
-def test_build_koronus_window_seats_pax_over_orchestrator_in_civic_vault() -> None:
-    # The koronus civic page is split down the middle into pax (.1) over
-    # orchestrator (.2), both tagged with @PANE_TYPE koronus and launched from the
-    # Civic vault so the civic persona notes resolve.
-    from tmuxctl.builder import KORONUS_DIR, build_koronus_window
-
+def test_build_mechanicus_window_seats_fabricator_over_orchestrator() -> None:
+    # Mechanicus seats the Fabricator-General (.1) over the orchestrator (.2), both
+    # tagged @PANE_TYPE mechanicus. The admin seat moved to council; the orchestrator
+    # moved in from the retired koronus page.
     adapter = FakeBuilderAdapter()
     adapter.sessions.add("main")
     adapter.windows["main"] = []
-    adapter.panes["main:koronus"] = ["main:koronus.1"]
+    adapter.panes["main:mechanicus"] = ["main:mechanicus.1"]
 
-    build_koronus_window(adapter, "main")  # type: ignore[arg-type]
+    build_mechanicus_window(adapter, "main")  # type: ignore[arg-type]
 
     seats = {
         target: options["@PANE_ID"]
         for target, options in adapter.pane_options.items()
-        if options.get("@PANE_ID", "").startswith("koronus:")
+        if options.get("@PANE_ID", "").startswith("mechanicus:")
     }
     assert seats == {
-        "main:koronus.1": "koronus:pax",
-        "main:koronus.2": "koronus:orchestrator",
+        "main:mechanicus.1": "mechanicus:fabricator-general",
+        "main:mechanicus.2": "mechanicus:orchestrator",
     }
-    for pane in ("main:koronus.1", "main:koronus.2"):
-        assert adapter.pane_options[pane]["@PANE_TYPE"] == "koronus"
-    # The window and both seats are created in the Civic vault, not $HOME.
-    new_window = next(c for c in adapter.commands if c[0] == "new-window" and "koronus" in c)
-    assert new_window[new_window.index("-c") + 1] == KORONUS_DIR
-    splits = [c for c in adapter.commands if c[0] == "split-window"]
-    assert splits and all(c[c.index("-c") + 1] == KORONUS_DIR for c in splits)
+    for pane in ("main:mechanicus.1", "main:mechanicus.2"):
+        assert adapter.pane_options[pane]["@PANE_TYPE"] == "mechanicus"
 
 
 def test_normalize_instance_status_accepts_live_api_vocabulary():

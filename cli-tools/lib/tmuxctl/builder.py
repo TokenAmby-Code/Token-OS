@@ -10,16 +10,9 @@ from .tmux_adapter import TmuxAdapter
 SESSION_NAME = "main"
 PALACE_WINDOW = "palace"
 SOMNIUM_WINDOW = "somnium"
-LEGION_WINDOW = "legion"
+COUNCIL_WINDOW = "council"
 MECHANICUS_WINDOW = "mechanicus"
-KORONUS_WINDOW = "koronus"
 RESERVISTS_WINDOW = "reservists"
-
-# The koronus civic page launches from the Civic vault, where the civic persona
-# notes (pax / orchestrator / agentic-worker) live. The legion/mechanicus windows
-# launch from the Imperium-ENV vault (see PERSONA_WINDOWS / _window_dir); all other
-# windows stay in $HOME.
-KORONUS_DIR = "/Volumes/Civic/Pax-ENV"
 
 DETACHED_W = 240
 DETACHED_H = 60
@@ -30,9 +23,11 @@ def _home() -> str:
 
 
 # Windows whose panes seat Imperium personas/overseers. These launch from the
-# Imperium-ENV vault (their canon home) instead of $HOME. koronus (civic) seats
-# resolve their own Civic-vault dir; see build_koronus_window.
-PERSONA_WINDOWS = {LEGION_WINDOW, MECHANICUS_WINDOW}
+# Imperium-ENV vault (their canon home) instead of $HOME. The council page seats
+# four fixed personas (custodes/malcador/administratum from the Imperium vault,
+# plus the civic pax seat which re-resolves its Civic-vault dir at persona-assert
+# time); mechanicus seats the Fabricator-General + orchestrator.
+PERSONA_WINDOWS = {COUNCIL_WINDOW, MECHANICUS_WINDOW}
 
 
 def _imperium_vault() -> str | None:
@@ -45,15 +40,14 @@ def _imperium_vault() -> str | None:
 def _window_dir(window: str) -> str:
     """Start-directory for a window's panes.
 
-    Persona windows (legion, mechanicus) launch from the Imperium-ENV vault so
-    seated personas (Custodes, Malcador, Fabricator-General, Administratum) open
-    in their canon home rather than $HOME. Falls back to $HOME when the vault is
-    not mounted so pane creation never fails on a missing SMB mount. The koronus
-    (civic) window launches from the Civic vault. Non-persona windows (palace,
+    Persona windows (council, mechanicus) launch from the Imperium-ENV vault so
+    seated personas (Custodes, Malcador, Fabricator-General, Administratum,
+    orchestrator) open in their canon home rather than $HOME. Falls back to $HOME
+    when the vault is not mounted so pane creation never fails on a missing SMB
+    mount. The civic seats (council:pax, mechanicus:orchestrator) re-resolve their
+    Civic-vault launch dir at persona-assert time. Non-persona windows (palace,
     somnium, reservists) stay in $HOME.
     """
-    if window == KORONUS_WINDOW:
-        return KORONUS_DIR
     if window in PERSONA_WINDOWS:
         vault = _imperium_vault()
         if vault:
@@ -208,43 +202,111 @@ def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNI
     adapter.run("select-pane", "-t", west)
 
 
-def build_legion_window(adapter: TmuxAdapter, session: str) -> None:
-    """Build the legion stack window.
+def _council_seat(
+    adapter: TmuxAdapter,
+    pane_id: str,
+    role: str,
+    grid_state: str,
+    *,
+    persona: bool,
+) -> None:
+    """Tag a council seat: @PANE_ID, explicit @GRID_STATE, and @PANE_TYPE.
 
-    The left column holds two overseer seats split down the middle: Custodes on
-    top and Malcador (the advisor seat) on the bottom. Pane 1 is the Custodes
-    orchestrator slot. If that orchestrator is promoted to an audience surface,
-    this pane becomes its tombstone.
-
-    The civic Pax seat used to dock here (PR #219) but now lives on its own
-    ``koronus`` page; legion is back to its clean two-seat state.
+    Council seats carry persona-named @PANE_IDs (``council:custodes``), not the
+    positional labels the somnium grid uses, so the persona/stop-hook resolution
+    stays label-keyed and page-index independent. Persona seats are typed
+    ``council`` so the assertion + audience layers recognize them; the
+    true-terminal seat is a plain shell and stays untyped.
     """
-    target = f"{session}:{LEGION_WINDOW}"
-    adapter.run(
-        "new-window",
-        "-t",
-        session,
-        "-n",
-        LEGION_WINDOW,
-        "-d",
-        "-c",
-        _window_dir(LEGION_WINDOW),
+    _set_pane_option(adapter, pane_id, "@PANE_ID", role)
+    _set_pane_option(adapter, pane_id, "@GRID_STATE", grid_state)
+    _set_pane_option(adapter, pane_id, "@GRID_RESERVED", "false")
+    if persona:
+        _set_pane_option(adapter, pane_id, "@PANE_TYPE", "council")
+
+
+def build_council_window(adapter: TmuxAdapter, session: str, window: str = COUNCIL_WINDOW) -> None:
+    """Build the council page: the somnium 5-pane geometry seating fixed personas.
+
+    Geometry mirrors :func:`build_somnium_window` (a full-height west rail plus a
+    right 2x2 grid), but each seat is a fixed persona by cardinal position:
+
+      W  = council:custodes      NE = council:malcador
+      N  = council:pax           SE = council:administratum
+      S  = council:true-terminal (a plain shell — no persona, no agent)
+
+    Custodes, Malcador and Administratum relocated here from the retired legion /
+    mechanicus seats; Pax relocated from the retired koronus page. Their persona
+    identities (and civic launch dir for Pax) are owned by token-api / persona
+    assertion — this builder only lays out the seats and stamps their labels.
+    """
+    target = f"{session}:{window}"
+    wdir = _window_dir(window)
+
+    total_w = _window_dim(adapter, target, "#{window_width}")
+    total_h = _window_dim(adapter, target, "#{window_height}")
+
+    layout = WORKSPACE_LAYOUT.somnium
+    _, east_grid_w = layout.grid_column_widths(total_w)
+    half_h = total_h // 2
+
+    west = _pane_id(adapter, f"{target}.1")
+    right = _split_pane(
+        adapter,
+        west,
+        "-h",
+        "-l",
+        str(layout.right_grid_split_width(total_w)),
+        cwd=wdir,
     )
-    custodes = f"{target}.1"
-    malcador = _split_pane(adapter, custodes, "-v", "-l", "50%", cwd=_window_dir(LEGION_WINDOW))
-    _pane_tag(adapter, custodes, "legion:custodes")
-    _set_pane_option(adapter, custodes, "@PANE_TYPE", "legion")
-    _pane_tag(adapter, malcador, "legion:malcador")
-    _set_pane_option(adapter, malcador, "@PANE_TYPE", "legion")
+    ne = _split_pane(adapter, right, "-h", "-l", str(east_grid_w), cwd=wdir)
+    south = _split_pane(adapter, right, "-v", "-l", str(half_h), cwd=wdir)
+    se = _split_pane(adapter, ne, "-v", "-l", str(half_h), cwd=wdir)
+
+    _council_seat(adapter, west, "council:custodes", "side", persona=True)
+    _council_seat(adapter, right, "council:pax", "small", persona=True)
+    _council_seat(adapter, ne, "council:malcador", "small", persona=True)
+    _council_seat(adapter, south, "council:true-terminal", "small", persona=False)
+    _council_seat(adapter, se, "council:administratum", "small", persona=True)
+
+    _set_window_option(adapter, target, "@FOCUSED", "false")
+    _set_window_option(adapter, target, "@GRID_EXPANDED", "none")
+    _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")
+    _set_window_option(adapter, target, "@GRID_STASH", "")
+
+    adapter.run("select-pane", "-t", west)
+
+
+def ensure_council_window(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
+    """Ensure the council window exists with its five seats; idempotent.
+
+    The council page is normally laid out once by :func:`build_workspace`. This is
+    the recovery fallback for callers that need a council seat (e.g. the Custodes
+    asserter) when the page is somehow absent from a partial session — a full
+    ``tx restart`` rebuilds it properly.
+    """
+    names = [
+        name.split("(", 1)[0]
+        for name in adapter.run(
+            "list-windows", "-t", session, "-F", "#{window_name}", allow_failure=True
+        ).splitlines()
+    ]
+    if COUNCIL_WINDOW in names:
+        return
+    adapter.run(
+        "new-window", "-t", session, "-n", COUNCIL_WINDOW, "-d", "-c", _window_dir(COUNCIL_WINDOW)
+    )
+    build_council_window(adapter, session, COUNCIL_WINDOW)
 
 
 def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
     """Build the mechanicus stack window.
 
-    The left column contains Fabricator-General plus Administratum persona
-    panes. Fabricator-General has the ``4:0`` positional abbreviation when the
-    mechanicus window is index 4; Administratum uses ``4:admin`` only. Worker
-    panes are added by stack.add_stack_pane on the right stack.
+    The left column contains the Fabricator-General (the stack orchestrator
+    anchor, pane 1) over the orchestrator persona seat. The orchestrator (the
+    civic dispatch seat) relocated here from the retired koronus page; the
+    Administratum seat moved to the council page. Worker panes are added by
+    stack.add_stack_pane on the right stack — the shared flat worker stack.
     """
     target = f"{session}:{MECHANICUS_WINDOW}"
     adapter.run(
@@ -258,45 +320,13 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
         _window_dir(MECHANICUS_WINDOW),
     )
     fabricator = f"{target}.1"
-    admin = _split_pane(adapter, fabricator, "-v", "-l", "50%", cwd=_window_dir(MECHANICUS_WINDOW))
+    orchestrator = _split_pane(
+        adapter, fabricator, "-v", "-l", "50%", cwd=_window_dir(MECHANICUS_WINDOW)
+    )
     _pane_tag(adapter, fabricator, "mechanicus:fabricator-general")
     _set_pane_option(adapter, fabricator, "@PANE_TYPE", "mechanicus")
-    _pane_tag(adapter, admin, "mechanicus:admin")
-    _set_pane_option(adapter, admin, "@PANE_TYPE", "mechanicus")
-
-
-def build_koronus_window(adapter: TmuxAdapter, session: str) -> None:
-    """Build the koronus civic stack window (index 5).
-
-    The left column holds two civic overseer seats split down the middle: ``pax``
-    (the combined Custodes+Administratum human-facing/record-keeper seat) on top
-    and ``orchestrator`` (the civic dispatch seat) on the bottom. The right stack
-    is reserved for ``agentic-worker`` panes added by ``stack.add_stack_pane``.
-
-    Modeled on ``build_mechanicus_window``: pax is the orchestrator anchor (pane
-    1), orchestrator is the secondary persona seat. Panes are tagged ``koronus:*``
-    with ``@PANE_TYPE koronus`` and launch from the Civic vault so the civic
-    persona notes resolve. ``koronus`` is a recognized orchestrator stack base
-    (see stack.STACK_PAGE_SPECS), so worker dispatch docks onto the right stack.
-    """
-    target = f"{session}:{KORONUS_WINDOW}"
-    wdir = _window_dir(KORONUS_WINDOW)
-    adapter.run(
-        "new-window",
-        "-t",
-        session,
-        "-n",
-        KORONUS_WINDOW,
-        "-d",
-        "-c",
-        wdir,
-    )
-    pax = f"{target}.1"
-    orchestrator = _split_pane(adapter, pax, "-v", "-l", "50%", cwd=wdir)
-    _pane_tag(adapter, pax, "koronus:pax")
-    _set_pane_option(adapter, pax, "@PANE_TYPE", "koronus")
-    _pane_tag(adapter, orchestrator, "koronus:orchestrator")
-    _set_pane_option(adapter, orchestrator, "@PANE_TYPE", "koronus")
+    _pane_tag(adapter, orchestrator, "mechanicus:orchestrator")
+    _set_pane_option(adapter, orchestrator, "@PANE_TYPE", "mechanicus")
 
 
 def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
@@ -359,9 +389,11 @@ def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
         "new-window", "-t", session, "-n", SOMNIUM_WINDOW, "-d", "-c", _window_dir(SOMNIUM_WINDOW)
     )
     build_somnium_window(adapter, session, SOMNIUM_WINDOW)
-    build_legion_window(adapter, session)
+    adapter.run(
+        "new-window", "-t", session, "-n", COUNCIL_WINDOW, "-d", "-c", _window_dir(COUNCIL_WINDOW)
+    )
+    build_council_window(adapter, session, COUNCIL_WINDOW)
     build_mechanicus_window(adapter, session)
-    build_koronus_window(adapter, session)
     build_reservists_window(adapter, session)
     adapter.run("select-window", "-t", f"{session}:{PALACE_WINDOW}")
 
