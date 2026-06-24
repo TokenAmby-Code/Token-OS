@@ -1667,7 +1667,19 @@ COMMON_ENV=(
 )
 [[ -n "$CODEX_PROFILE" ]] && COMMON_ENV+=("TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}")
 [[ -n "$CLAUDE_MODEL" ]] && COMMON_ENV+=("TOKEN_API_CLAUDE_MODEL=${CLAUDE_MODEL}")
-[[ -n "$PERSONA" ]] && COMMON_ENV+=("TOKEN_API_PERSONA=${PERSONA}")
+# ``--persona mechanicus`` is the worker prompt/behavior coat for the mechanicus
+# stack, not a durable singleton identity.  Exporting TOKEN_API_PERSONA=mechanicus
+# makes SessionStart treat a generic worker as a primarch/persona launch; in the
+# legacy alias path that previously resolved to Administratum and let the worker
+# supplant the recorder row. Keep the prompt, but let token-api derive the durable
+# worker identity from the mechanicus dispatch target -> FG commander trigger.
+PERSONA_IDENTITY_EXPORT="$PERSONA"
+if [[ "$(printf '%s' "$PERSONA" | tr '[:upper:]' '[:lower:]')" == "mechanicus" ]]; then
+  case "${TARGET}:${DISPATCH_WINDOW}" in
+    mechanicus:*|*:mechanicus) PERSONA_IDENTITY_EXPORT="" ;;
+  esac
+fi
+[[ -n "$PERSONA_IDENTITY_EXPORT" ]] && COMMON_ENV+=("TOKEN_API_PERSONA=${PERSONA_IDENTITY_EXPORT}")
 if [[ -n "$DISCORD_CHANNEL" ]]; then
   COMMON_ENV+=(
     "TOKEN_API_DISCORD_HOSTED=1"

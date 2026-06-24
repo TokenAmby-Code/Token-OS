@@ -144,7 +144,7 @@ def test_administratum_bypass_resolver_uses_canonical_singleton_filter(
 
     # Pane geometry is resolved live from the oracle (instances.tmux_pane is gone).
     async def fake_resolve_pane(instance_id):
-        return ("%10", "mechanicus:administratum") if instance_id == "admin-live" else (None, None)
+        return ("%10", "council:administratum") if instance_id == "admin-live" else (None, None)
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", fake_resolve_pane)
 
@@ -153,6 +153,100 @@ def test_administratum_bypass_resolver_uses_canonical_singleton_filter(
     assert resolved is not None
     assert resolved["id"] == "admin-live"
     assert resolved["tmux_pane"] == "%10"
+
+
+def test_administratum_resolver_rejects_poisoned_worker_persona_row(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    main = app_env.main
+    conn = _conn(app_env.db_path)
+    for trigger in ("trg_instances_singleton_guard", "trg_instances_singleton_guard_update"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.commit()
+    admin = _persona(conn, "administratum")
+    _insert_instance(
+        conn,
+        id="admin-good",
+        name="admin-good",
+        persona_id=admin,
+        commander_type="emperor",
+        commander_id=None,
+        rank="overseer",
+        status="working",
+        last_activity="2025-01-01T00:00:00",
+    )
+    # Poison reproduction: a mechanicus worker row wearing Administratum persona
+    # and newer than the true recorder. It must never receive state hooks.
+    _insert_instance(
+        conn,
+        id="admin-poison-worker",
+        name="mechanicus-worker-poison",
+        persona_id=admin,
+        commander_type="persona",
+        commander_id=_persona(conn, "fabricator-general"),
+        rank="overseer",
+        status="working",
+        last_activity="2025-12-31T00:00:00",
+    )
+    conn.commit()
+    conn.close()
+
+    async def fake_resolve_pane(instance_id):
+        if instance_id == "admin-poison-worker":
+            return "%121", "mechanicus:1"
+        if instance_id == "admin-good":
+            return "%30", "council:administratum"
+        return None, None
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", fake_resolve_pane)
+
+    resolved = asyncio.run(main._resolve_administratum_instance())
+
+    assert resolved is not None
+    assert resolved["id"] == "admin-good"
+    assert resolved["tmux_pane"] == "%30"
+
+
+def test_administratum_resolver_uses_rowless_admin_pane_not_poisoned_worker(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    main = app_env.main
+    conn = _conn(app_env.db_path)
+    admin = _persona(conn, "administratum")
+    _insert_instance(
+        conn,
+        id="admin-poison-worker",
+        name="mechanicus-worker-poison",
+        persona_id=admin,
+        commander_type="persona",
+        commander_id=_persona(conn, "fabricator-general"),
+        rank="overseer",
+        status="working",
+        last_activity="2025-12-31T00:00:00",
+    )
+    conn.commit()
+    conn.close()
+
+    async def fake_resolve_pane(instance_id):
+        if instance_id == "admin-poison-worker":
+            return "%121", "mechanicus:1"
+        return None, None
+
+    async def fake_find_admin_pane():
+        return "%30"
+
+    async def fake_instance_id_for_pane(pane):
+        return "admin-rowless-live" if pane == "%30" else None
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", fake_resolve_pane)
+    monkeypatch.setattr(main, "_find_administratum_tmux_pane", fake_find_admin_pane)
+    monkeypatch.setattr(main.shared, "instance_id_for_pane", fake_instance_id_for_pane)
+
+    resolved = asyncio.run(main._resolve_administratum_instance())
+
+    assert resolved is not None
+    assert resolved["id"] == "admin-rowless-live"
+    assert resolved["tmux_pane"] == "%30"
 
 
 def test_custodes_morning_brief_injects_into_canonical_singleton(

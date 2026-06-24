@@ -9000,13 +9000,16 @@ async def _find_administratum_tmux_pane() -> str | None:
 
 
 async def _resolve_administratum_instance() -> dict | None:
-    """Resolve the live local Administratum singleton row (the recorder).
+    """Resolve the live local Administratum recorder pane.
 
-    Administratum is registered with `primarch='administratum'` (its class is
-    not an allowed `legion` value). Returns None when no live local recorder
-    exists — callers then no-op rather than spawning one (Admin is a passive
-    recorder, never auto-launched by the dispatcher).
+    Administratum identity is not just ``persona_id=administratum``. The recorder
+    must also be bound to the live ``@PANE_ID=council:administratum`` pane. Poisoned
+    worker rows can otherwise wear the Administratum persona and steal the
+    state-hook stream. Prefer a canonical row+pane match; if the singleton pane is
+    alive but rowless, still return the pane so records reach the recorder while
+    the registry fault remains visible via persona_unregistered_live_runtime.
     """
+    rows: list[dict] = []
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -9028,26 +9031,34 @@ async def _resolve_administratum_instance() -> dict | None:
                  i.last_activity DESC,
                  i.created_at DESC,
                  i.id DESC
-               LIMIT 1""",
+               LIMIT 10""",
             (LOCAL_DEVICE_NAME,),
         )
-        row = await cursor.fetchone()
+        rows = [dict(row) for row in await cursor.fetchall()]
 
-    if not row:
-        return None
-    instance = dict(row)
-
-    # The row is guaranteed local (scoped above). Resolve its pane live from the
-    # oracle (instances.tmux_pane is gone); fall back to scanning tmux for the
-    # Administratum-marked pane only when the oracle has no live pane for it.
-    pane, _role = await shared.resolve_instance_pane(instance["id"])
-    if not pane:
-        pane = await _find_administratum_tmux_pane()
+    for instance in rows:
+        pane, role = await shared.resolve_instance_pane(instance["id"])
         if not pane:
-            return None
-    instance["tmux_pane"] = pane
+            continue
+        if role == ADMINISTRATUM_PANE_MARKER:
+            instance["tmux_pane"] = pane
+            return instance
+        logger.warning(
+            "Administratum resolver rejected persona row %s on non-recorder pane %s (%s)",
+            str(instance["id"])[:12],
+            pane,
+            role or "no-role",
+        )
 
-    return instance
+    pane = await _find_administratum_tmux_pane()
+    if not pane:
+        return None
+    return {
+        "id": await shared.instance_id_for_pane(pane) or "administratum-rowless",
+        "device_id": LOCAL_DEVICE_NAME,
+        "dispatch_session_doc_path": None,
+        "tmux_pane": pane,
+    }
 
 
 def _administratum_log_path(instance: dict | None) -> Path:

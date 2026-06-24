@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
+from typing import Any
 
 # A pane id that does NOT exist on any live tmux server. The hooks' tmux-WRITE
 # paths are mocked below too, but a fake pane is a second guard: never let a hook
@@ -160,3 +161,37 @@ def test_singleton_own_refire_still_adopts_its_row(app_env, monkeypatch):
     assert "custodes-old" not in rows, f"prior row must be adopted, not a zombie: {dict(rows)}"
     assert len(rows) == 1, f"singleton re-fire must not mint a duplicate: {dict(rows)}"
     assert rows["custodes-new"]["persona_slug"] == "custodes"
+
+
+def test_mechanicus_prompt_persona_is_not_durable_singleton_identity(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    """`--persona mechanicus` on the mechanicus stack is a worker prompt, not a
+    singleton identity. SessionStart must ignore it for durable persona binding so
+    the FG commander trigger assigns the shared mechanicus-worker coat instead of
+    supplanting Administratum or minting a Mechanicus primarch row.
+    """
+    hooks = sys.modules["routes.hooks"]
+    _blind_tmuxctl(hooks, monkeypatch)
+
+    _start(
+        hooks,
+        {
+            "session_id": "mech-worker-new",
+            "cwd": "/tmp",
+            "pid": 9999,
+            "env": {
+                "TMUX_PANE": _FAKE_PANE,
+                "TOKEN_API_ENGINE": "claude",
+                "TOKEN_API_LAUNCHER": "dispatch",
+                "TOKEN_API_PERSONA": "mechanicus",
+                "TOKEN_API_DISPATCH_TARGET": "mechanicus:new",
+                "TOKEN_API_DISPATCH_WINDOW": "mechanicus",
+            },
+        },
+    )
+
+    rows = _rows(app_env.db_path)
+    assert rows["mech-worker-new"]["persona_slug"] == "mechanicus-worker"
+    assert rows["mech-worker-new"]["persona_slug"] != "administratum"
+    assert rows["mech-worker-new"]["default_rank"] == "astartes"

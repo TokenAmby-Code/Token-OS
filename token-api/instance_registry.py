@@ -146,7 +146,6 @@ LEGACY_PERSONA_ALIASES = {
     "council:pax": "pax",
     "mechanicus:orchestrator": "orchestrator",
     "mechanicus:worker": "agentic-worker",
-    "mechanicus": "administratum",
 }
 
 

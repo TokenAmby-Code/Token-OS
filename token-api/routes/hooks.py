@@ -2760,6 +2760,21 @@ async def handle_session_start(payload: dict) -> dict:
     # left in the env-derived fields (dispatch_legion for doc resolution, primarch,
     # instance_type) so an explicit dispatch can still tune those.
     persona_identity = PERSONA_PANE_IDENTITY.get(pane_label or "")
+    # Backstop for older dispatch scripts / resumed workers that still export
+    # TOKEN_API_PERSONA=mechanicus while launching into the mechanicus worker stack.
+    # That value selects the Mechanicus prompt, but it must not be treated as a
+    # durable primarch/persona singleton identity. The durable worker identity is
+    # derived below from dispatch_target -> FG commander -> mechanicus-worker
+    # trigger. Without this gate, a worker can supplant a singleton row via the
+    # primarch adoption path.
+    if (
+        primarch_name.strip().lower() == "mechanicus"
+        and not persona_identity
+        and (dispatch_window == "mechanicus" or (dispatch_target or "").startswith("mechanicus:"))
+    ):
+        if not dispatch_legion:
+            dispatch_legion = "mechanicus"
+        primarch_name = ""
     if persona_identity:
         if not dispatch_legion:
             dispatch_legion = persona_identity["legion"]
