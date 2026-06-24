@@ -139,7 +139,7 @@ def test_parent_prompt_submit_consumes_pending_injection(app_env):
 # --- UserPromptSubmit→commander poke fanout (sister to Stop→commander) ----------
 
 
-def test_human_poke_to_commanded_worker_enqueues_fanout(app_env):
+def test_human_poke_to_commanded_worker_enqueues_fanout(app_env) -> None:
     # hook_driven defaults to 0 (genuine human poke); commanded via chapter edge.
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "fg-cmdr")
@@ -171,7 +171,7 @@ def test_human_poke_to_commanded_worker_enqueues_fanout(app_env):
     assert payload["prompt_text"] == "rebase onto main and rerun pytest"
 
 
-def test_system_induced_prompt_does_not_enqueue_poke(app_env):
+def test_system_induced_prompt_does_not_enqueue_poke(app_env) -> None:
     # The self-notify-loop guard: hook_driven=1 means an automated wake preceded
     # this prompt (FG talk/brief, state fanout) → NOT a human poke → no notify.
     hooks = sys.modules["routes.hooks"]
@@ -198,7 +198,7 @@ def test_system_induced_prompt_does_not_enqueue_poke(app_env):
     assert count == 0
 
 
-def test_uncommanded_worker_no_poke(app_env):
+def test_uncommanded_worker_no_poke(app_env) -> None:
     # No parent → commander_type 'emperor' → uncommanded → no-op.
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "solo")
@@ -219,7 +219,7 @@ def test_uncommanded_worker_no_poke(app_env):
     assert count == 0
 
 
-def test_empty_prompt_no_poke(app_env):
+def test_empty_prompt_no_poke(app_env) -> None:
     # An empty / resume UserPromptSubmit (no prompt text) is not a real poke.
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "fg-cmdr3")
@@ -239,7 +239,7 @@ def test_empty_prompt_no_poke(app_env):
     assert count == 0
 
 
-def test_commander_consumes_worker_poked(app_env):
+def test_commander_consumes_worker_poked(app_env) -> None:
     # The commander surfaces the poke on its next UserPromptSubmit via the generic
     # _consume_state_injections path, identical to child_stopped.
     hooks = sys.modules["routes.hooks"]

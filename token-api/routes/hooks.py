@@ -1135,6 +1135,14 @@ async def _enqueue_poke_fanout(db, instance: dict, payload: dict) -> dict | None
         kind="worker_poked",
         payload=injection_payload,
     )
+    # Redact verbatim prompt from telemetry — event logs are long-lived, so keep
+    # the raw text only in the injection payload (delivered once, then consumed),
+    # never in the event stream. Carry length for observability.
+    redacted_payload = {
+        **injection_payload,
+        "prompt_text": None,
+        "prompt_len": len(prompt_text),
+    }
     await log_event(
         "state_injection_enqueued",
         instance_id=child_instance_id,
@@ -1142,7 +1150,7 @@ async def _enqueue_poke_fanout(db, instance: dict, payload: dict) -> dict | None
             "audience_instance_id": commander_id,
             "kind": "worker_poked",
             "injection_id": injection_id,
-            "payload": injection_payload,
+            "payload": redacted_payload,
         },
     )
     return {
