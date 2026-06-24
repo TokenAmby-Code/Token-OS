@@ -8,13 +8,15 @@ from .labels import canonical_pane_role
 from .stack import stack_base_of
 from .tmux_adapter import TmuxAdapter
 
-CUSTODES_ROLE = "legion:custodes"
-MALCADOR_ROLE = "legion:malcador"
+# Council seats (custodes/malcador) are fixed personas on the somnium-layout
+# council page, no longer stack orchestrators. They keep their role constants so
+# the persona/audience/close layers can name them by their canonical @PANE_ID.
+CUSTODES_ROLE = "council:custodes"
+MALCADOR_ROLE = "council:malcador"
 FABRICATOR_ROLE = "mechanicus:fabricator-general"
-KORONUS_PAX_ROLE = "koronus:pax"
-KORONUS_ORCHESTRATOR_ROLE = "koronus:orchestrator"
-KORONUS_WORKER_ROLE = "koronus:worker"
-REGIMENT_ROLE = "legion:worker"
+# The orchestrator (civic dispatch seat) relocated onto the mechanicus page as the
+# secondary persona docked under the Fabricator-General.
+MECHANICUS_ORCHESTRATOR_ROLE = "mechanicus:orchestrator"
 STACK_COLLAPSED_HEIGHT = 3
 STACK_ORCHESTRATOR_RATIO = 40
 STACK_FOCUS_GUARD_OPTION = "@STACK_FOCUS_GUARD"
@@ -43,40 +45,20 @@ class StackPageSpec:
     secondary_personas: tuple[PersonaPaneSpec, ...] = ()
 
 
+# Mechanicus is the single shared flat worker stack (the per-fleet legion and civic stacks retired).
+# Fleets share this physical stack but stay logically separate; the Fabricator-
+# General anchors it, with the orchestrator (civic dispatch seat) docked under it.
 STACK_PAGE_SPECS: dict[str, StackPageSpec] = {
-    "legion": StackPageSpec(
-        base="legion",
-        orchestrator_role=CUSTODES_ROLE,
-        orchestrator_type="legion",
-        worker_role=REGIMENT_ROLE,
-        # Malcador (advisor) is a durable overseer seat docked under Custodes in
-        # the left column, not a regiment worker. Without registering it here,
-        # enforce_stack_layout classifies it as an untyped worker and retags it
-        # legion:N, clobbering the seat identity. The civic Pax seat moved off
-        # legion onto the dedicated `koronus` page (it is no longer docked here).
-        secondary_personas=(PersonaPaneSpec(MALCADOR_ROLE, "legion"),),
-    ),
     "mechanicus": StackPageSpec(
         base="mechanicus",
         orchestrator_role=FABRICATOR_ROLE,
         orchestrator_type="mechanicus",
         worker_role="mechanicus:worker",
-        secondary_personas=(PersonaPaneSpec("mechanicus:admin", "mechanicus"),),
-    ),
-    "koronus": StackPageSpec(
-        base="koronus",
-        # pax is the civic page's anchor seat (Custodes+Administratum combo); the
-        # orchestrator seat docks under it as a secondary persona, mirroring how
-        # the mechanicus admin seat docks under the Fabricator-General. Workers
-        # are the civic `agentic-worker` persona on the right stack.
-        orchestrator_role=KORONUS_PAX_ROLE,
-        orchestrator_type="koronus",
-        worker_role=KORONUS_WORKER_ROLE,
-        secondary_personas=(PersonaPaneSpec(KORONUS_ORCHESTRATOR_ROLE, "koronus"),),
+        secondary_personas=(PersonaPaneSpec(MECHANICUS_ORCHESTRATOR_ROLE, "mechanicus"),),
     ),
 }
 
-LEGACY_WORKER_ROLES = {"legion:regiment"}
+LEGACY_WORKER_ROLES: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -215,10 +197,6 @@ def _orchestrator_and_workers(
 
 def _secondary_persona_panes(panes: list[StackPane], spec: StackPageSpec) -> dict[str, StackPane]:
     return {pane.role: pane for pane in panes if _is_secondary_persona_role(pane.role, spec)}
-
-
-def _is_legion_window(window_name: str) -> bool:
-    return stack_base_of(_window_base(window_name)) == "legion"
 
 
 def _is_managed_stack_window(window_name: str) -> bool:
@@ -396,14 +374,16 @@ def _clear_pending(adapter: TmuxAdapter, pane: str) -> None:
 
 
 def focus_selected(adapter: TmuxAdapter, pane: str) -> str:
-    """Make the selected legion regiment the only expanded right-side pane.
+    """Make the selected worker the only expanded right-side pane in its stack.
 
-    Selecting Custodes intentionally does nothing. This function is idempotent
-    and guarded so tmux hooks can call it on every pane selection.
+    Selecting the orchestrator anchor intentionally does nothing. This function is
+    idempotent and guarded so tmux hooks can call it on every pane selection. It
+    applies to any managed worker stack (the merged mechanicus floor), not a
+    single page.
     """
     session, window_index, window_name = _pane_window(adapter, pane)
-    if not _is_legion_window(window_name):
-        return f"noop stack focus {pane}: not a legion window"
+    if not _is_managed_stack_window(window_name):
+        return f"noop stack focus {pane}: not a managed stack window"
 
     target = f"{session}:{window_index}"
     if _stack_window_option(adapter, target, STACK_FOCUS_GUARD_OPTION) == "true":
@@ -417,7 +397,7 @@ def focus_selected(adapter: TmuxAdapter, pane: str) -> str:
     if selected is None:
         return f"noop stack focus {pane}: pane not in window"
     if selected.role == spec.orchestrator_role:
-        return f"noop stack focus {pane}: custodes"
+        return f"noop stack focus {pane}: orchestrator"
 
     return enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
 
@@ -619,7 +599,7 @@ def _enforce_stack_layout_impl(
                 worker.command,
                 worker.pending,
             )
-        elif worker.pane_type not in {spec.worker_type, "legion"}:
+        elif worker.pane_type != spec.worker_type:
             _refresh_worker_metadata(adapter, worker.pane_id, spec)
         if admit and worker.clear:
             _set_pane_option(adapter, worker.pane_id, "@STACK_PENDING", "true")
@@ -857,7 +837,7 @@ def add_orchestrator_stack_pane(
         return pane
     except Exception:
         # If post-split normalization fails, do not leave a blank pending worker
-        # pane behind. This was the visible failure mode of legion:new dispatch:
+        # pane behind. This was the visible failure mode of mechanicus:new dispatch:
         # an empty stack pane opened, then no agent ever started. Never kill an
         # adopted pane — it is the user's live agent, joined in from elsewhere.
         if pane and not adopt_pane:
@@ -870,7 +850,7 @@ def add_stack_worker_pane(
     session: str,
     *,
     cwd: str | None = None,
-    window: str = "legion",
+    window: str = "mechanicus",
     focus: bool = True,
 ) -> str:
     return add_orchestrator_stack_pane(adapter, session, window, cwd=cwd, focus=focus)

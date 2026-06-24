@@ -334,7 +334,7 @@ def test_worker_snaps_explicit_queue_playback(app_env, monkeypatch) -> None:
     tts.hot_queue.clear()
     tts.hot_queue.append(_make_item(tts, "alpha", tmux_pane="palace:1", focus_on_playback=True))
     tts.hot_queue.append(
-        _make_item(tts, "bravo", tmux_pane="legion:custodes", focus_on_playback=True)
+        _make_item(tts, "bravo", tmux_pane="council:custodes", focus_on_playback=True)
     )
 
     async def drive():

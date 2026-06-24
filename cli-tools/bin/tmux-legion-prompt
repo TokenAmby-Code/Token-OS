@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# tmux-legion-prompt — Capture a prompt, open a fresh legion pane, and launch via d
-# TAGS: tmux, legion, launcher, prompt
+# tmux-legion-prompt — Capture a prompt, open a fresh mechanicus worker pane, and launch via d
+# TAGS: tmux, mechanicus, launcher, prompt
 # AUDIENCE: human
 
 set -euo pipefail
 
 SESSION="${TMUX_LEGION_PROMPT_SESSION:-main}"
-WINDOW="${TMUX_LEGION_PROMPT_WINDOW:-legion}"
+WINDOW="${TMUX_LEGION_PROMPT_WINDOW:-mechanicus}"
 
 log() { printf '%s\n' "$*" >&2; }
 
@@ -19,7 +19,7 @@ Usage:
   tmux-legion-prompt --stdin
   tmux-legion-prompt --dry-run --prompt "text"
 
-Captures prompt text, creates a new managed main:legion shell, then sends:
+Captures prompt text, creates a new managed main:mechanicus shell, then sends:
   cd ~ && d "text"
 USAGE
 }
@@ -104,15 +104,15 @@ if $DRY_RUN; then
     log "session: $SESSION"
     log "window:  $WINDOW"
     log "command: $LAUNCH_CMD"
-    log "layout:  tmuxctl stack dispatch legion"
+    log "layout:  tmuxctl stack dispatch mechanicus"
     exit 0
 fi
 
 PANE_ID="$(
     PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m tmuxctl.cli stack dispatch legion \
+        python3 -m tmuxctl.cli stack dispatch mechanicus \
             --session "$SESSION" \
             --cwd "$HOME" \
             --command "$LAUNCH_CMD"
 )"
-tmux display-message "Legion dispatch prompt launched in ${PANE_ID}"
+tmux display-message "Mechanicus dispatch prompt launched in ${PANE_ID}"

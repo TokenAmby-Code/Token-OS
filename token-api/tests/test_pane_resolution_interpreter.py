@@ -29,7 +29,7 @@ import subprocess
 import sys
 
 _GOOD_INSTANCE_JSON = (
-    b'{"instance_id": "u", "pane_id": "%103", "pane_role": "legion:custodes", "found": true}'
+    b'{"instance_id": "u", "pane_id": "%103", "pane_role": "council:custodes", "found": true}'
 )
 
 
@@ -77,7 +77,7 @@ def test_resolve_instance_pane_uses_own_interpreter(app_env, monkeypatch):
     # With the correct interpreter the live pane resolves (the /api/instances
     # runtime block sets live_pane=bool(pane) directly from this return).
     assert pane == "%103"
-    assert role == "legion:custodes"
+    assert role == "council:custodes"
 
 
 def test_resolve_instance_pane_null_when_forced_through_python3_shim(app_env, monkeypatch):
@@ -104,7 +104,7 @@ def test_resolve_tmux_pane_id_uses_own_interpreter(app_env, monkeypatch):
     monkeypatch.setattr(shared, "_run_subprocess_offloop", _dispatching_offloop(captured))
     # A non-% target forces the tmuxctl resolve-pane subprocess (a "%" id resolves
     # directly without shelling out).
-    pane = asyncio.run(shared.resolve_tmux_pane_id("legion:custodes"))
+    pane = asyncio.run(shared.resolve_tmux_pane_id("council:custodes"))
 
     assert captured, "resolve_tmux_pane_id did not spawn a subprocess"
     argv = captured[0]

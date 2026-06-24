@@ -9,10 +9,10 @@ from .models import (
 )
 from .revert import is_transient_window_name
 
-CANONICAL_WINDOWS = {"palace", "somnium", "legion", "mechanicus", "koronus", "reservists"}
-# Stack windows may spill into sibling windows suffixed `-N` (e.g. legion-2).
+CANONICAL_WINDOWS = {"palace", "somnium", "council", "mechanicus", "reservists"}
+# Stack windows may spill into sibling windows suffixed `-N` (e.g. mechanicus-2).
 # These match a canonical base and should not flag as missing or unknown.
-STACK_BASES = {"legion", "mechanicus", "koronus", "mars", "kreig", "reservists"}
+STACK_BASES = {"mechanicus", "mars", "kreig", "reservists"}
 
 
 def _canonical_base(window_name: str) -> str:

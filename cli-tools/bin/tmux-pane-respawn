@@ -22,9 +22,12 @@ WINDOW_BASE="${WINDOW_NAME%%(*}"
 WINDOW_TARGET=$(tmux display-message -p -t "$PANE_ID" '#{session_name}:#{window_index}' 2>/dev/null || echo "")
 
 case "$WINDOW_BASE:$PANE_ROLE" in
-    legion:legion:custodes|mechanicus:mechanicus:fabricator-general|mechanicus:mechanicus:admin)
+    council:*|mechanicus:mechanicus:fabricator-general|mechanicus:mechanicus:orchestrator)
+        # Council page seats (fixed personas + the true-terminal shell) and the
+        # mechanicus persona anchors (Fabricator-General, orchestrator) are
+        # perpetual; let the default respawn restore them rather than killing.
         ;;
-    legion:*|mechanicus:*)
+    mechanicus:*)
         # Stack workers are disposable process panes. If the process exits,
         # remove the pane instead of respawning a blank shell, then reassert
         # the remaining page layout.

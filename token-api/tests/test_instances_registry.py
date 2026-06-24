@@ -572,12 +572,12 @@ def test_session_start_dispatch_targets_bind_persona_commanders(app_env):
     async def run():
         result = await hooks.handle_session_start(
             {
-                "session_id": "legion-target-worker",
+                "session_id": "mechanicus-target-worker",
                 "cwd": "/tmp",
                 "env": {
                     "TOKEN_API_ENGINE": "codex",
                     "TOKEN_API_LAUNCHER": "dispatch",
-                    "TOKEN_API_DISPATCH_TARGET": "legion:new",
+                    "TOKEN_API_DISPATCH_TARGET": "mechanicus:new",
                 },
             }
         )
@@ -589,10 +589,13 @@ def test_session_start_dispatch_targets_bind_persona_commanders(app_env):
         """SELECT i.commander_type, p.slug AS commander_slug
              FROM instances i
              LEFT JOIN personas p ON p.id = i.commander_id
-            WHERE i.id = 'legion-target-worker'"""
+            WHERE i.id = 'mechanicus-target-worker'"""
     ).fetchone()
     conn.close()
-    assert (row["commander_type"], row["commander_slug"]) == ("persona", "custodes")
+    # Mechanicus is the single merged worker stack; the Fabricator-General anchors
+    # it and commands every freshly dispatched worker (the retired legion page's
+    # custodes orchestrator no longer commands workers).
+    assert (row["commander_type"], row["commander_slug"]) == ("persona", "fabricator-general")
 
 
 def test_banish_chapter_instance_moves_to_black_shields_without_retiring(app_env):

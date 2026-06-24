@@ -1,14 +1,16 @@
-"""Stack window management — auto-scaling pane stacks for legion/mechanicus.
+"""Stack window management — auto-scaling pane stacks for the mechanicus floor.
 
 Stack windows hold a vertical list of worker panes. Pane 1 of each stack window
-is the orchestrator anchor (custodes for legion, fabricator-general for
-mechanicus); panes 2..N are workers added by dispatch.
+is the orchestrator anchor (fabricator-general for mechanicus); panes 2..N are
+workers added by dispatch. The per-fleet legion and civic stacks retired into this single
+shared worker floor — fleets share the physical stack but stay logically
+separate (the split is token-api's view via the commander stamp, never tmux).
 
 Auto-scaling: when tmux refuses split-window in the canonical window because
 the geometry can't fit another pane, we spill into a sibling window suffixed
-`-N` (legion -> legion-2 -> legion-3, ...). The visible set of stack panes
-spans all of these windows, so dispatch is never blocked by a single window's
-geometric ceiling.
+`-N` (mechanicus -> mechanicus-2 -> mechanicus-3, ...). The visible set of stack
+panes spans all of these windows, so dispatch is never blocked by a single
+window's geometric ceiling.
 
 send-keys safety: this module never resizes existing panes. A new pane is just
 a fresh split that takes its share of the host window's height; existing panes
@@ -32,11 +34,11 @@ from .tmux_adapter import TmuxAdapter, TmuxError
 # Instance statuses that denote a live, drive-able runtime worth rebinding.
 _LIVE_STATUSES = frozenset({"processing", "idle"})
 
-STACK_BASES: tuple[str, ...] = ("legion", "mechanicus", "koronus", "mars", "kreig", "reservists")
+STACK_BASES: tuple[str, ...] = ("mechanicus", "mars", "kreig", "reservists")
 
-# Orchestrator-backed stacks have a persona anchor in pane 1 (custodes/FG/pax)
+# Orchestrator-backed stacks have a persona anchor in pane 1 (fabricator-general)
 # and route worker adds through add_orchestrator_stack_pane.
-ORCHESTRATOR_STACK_BASES = frozenset({"legion", "mechanicus", "koronus"})
+ORCHESTRATOR_STACK_BASES = frozenset({"mechanicus"})
 SPILL_RE = re.compile(r"^(?P<base>[a-z]+)(?:-(?P<n>\d+))?$")
 
 
@@ -123,8 +125,7 @@ def add_stack_pane(
 
     When ``adopt_pane`` is given, the existing live pane is joined into the stack
     (preserving its pane id + running process) instead of opening a fresh shell.
-    Only the orchestrator-backed stacks (legion/mechanicus/koronus) support
-    adoption.
+    Only the orchestrator-backed stack (mechanicus) supports adoption.
 
     Returns the new pane id. Raises ValueError if `base` is not a known stack window.
     """
@@ -177,8 +178,8 @@ def dispatch_stack_command(
 ) -> str:
     """Create one managed stack worker pane and run a command in it.
 
-    This is the pane-backed dispatch primitive for legion/mechanicus worker
-    launches. Callers may still use ``stack add`` when they need to stage their
+    This is the pane-backed dispatch primitive for mechanicus worker launches.
+    Callers may still use ``stack add`` when they need to stage their
     own input, but entry points that create-and-launch work should route through
     this function instead of doing raw ``tmux split-window`` themselves.
     """
@@ -411,12 +412,9 @@ def sweep_stack_assertions(
 from ._stack_core import (  # noqa: E402,F401
     CUSTODES_ROLE,
     FABRICATOR_ROLE,
-    KORONUS_ORCHESTRATOR_ROLE,
-    KORONUS_PAX_ROLE,
-    KORONUS_WORKER_ROLE,
     LEGACY_WORKER_ROLES,
     MALCADOR_ROLE,
-    REGIMENT_ROLE,
+    MECHANICUS_ORCHESTRATOR_ROLE,
     STACK_COLLAPSED_HEIGHT,
     STACK_ORCHESTRATOR_RATIO,
     STACK_PAGE_SPECS,

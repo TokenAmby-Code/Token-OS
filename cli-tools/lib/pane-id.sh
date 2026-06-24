@@ -7,7 +7,8 @@
 #
 # Palace positions:  W N S E          (4-pane H layout)
 # Somnium positions: W N NE S SE      (left side rail + right 2x2)
-# Mechanicus/Legion: named/worker roles
+# Council seats:     custodes/pax/malcador/administratum/true-terminal
+# Mechanicus:        named persona anchors + numeric/worker roles
 # TUI: legacy compatibility only; no default workspace TUI window
 
 _TMUX_STATE_LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"

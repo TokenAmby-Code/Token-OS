@@ -32,7 +32,7 @@ fi
 INSTANCE_ID="$(tmux show-options -pv -t "$PANE" @INSTANCE_ID 2>/dev/null || true)"
 PANE_ROLE="$(tmux show-options -pv -t "$PANE" @PANE_ID 2>/dev/null || true)"
 case "$PANE_ROLE" in
-    legion:custodes|mechanicus:fabricator-general|mechanicus:admin|legion:malcador|koronus:pax|koronus:orchestrator)
+    council:custodes|mechanicus:fabricator-general|council:administratum|council:malcador|council:pax|mechanicus:orchestrator)
         tmux display-message "mark-for-close refused for static persona pane: $PANE_ROLE" 2>/dev/null || true
         echo "Static persona panes are not closeout targets: $PANE_ROLE" >&2
         exit 1

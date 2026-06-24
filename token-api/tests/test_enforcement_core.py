@@ -556,7 +556,7 @@ async def test_golden_throne_empty_legion_pane_fails_closed(app_env, monkeypatch
     async def no_agent_process(pane, engine):
         return False
 
-    async def empty_legion():
+    async def empty_mechanicus():
         return ""
 
     async def fake_subprocess_exec(*args, **kwargs):
@@ -571,7 +571,7 @@ async def test_golden_throne_empty_legion_pane_fails_closed(app_env, monkeypatch
     monkeypatch.setattr(app_env.main, "_tmux_pane_label", pane_label)
     monkeypatch.setattr(app_env.main, "_tmux_pane_exists", pane_exists)
     monkeypatch.setattr(app_env.main, "_tmux_pane_has_agent_process", no_agent_process)
-    monkeypatch.setattr(app_env.main, "_get_or_create_legion_pane", empty_legion)
+    monkeypatch.setattr(app_env.main, "_get_or_create_mechanicus_pane", empty_mechanicus)
     monkeypatch.setattr(app_env.main.asyncio, "create_subprocess_exec", fake_subprocess_exec)
 
     await app_env.main.golden_throne_followup("gt-empty-legion")

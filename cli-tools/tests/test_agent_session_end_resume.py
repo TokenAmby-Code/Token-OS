@@ -41,7 +41,7 @@ def test_agent_session_end_resume_stages_generic_dispatch_command(
         )
         conn.execute(
             """INSERT INTO instances (id, tmux_pane, pane_label, status, last_activity)
-               VALUES ('iid-generic', ?, 'legion:worker', 'idle', '2026-06-22T12:00:00')""",
+               VALUES ('iid-generic', ?, 'mechanicus:worker', 'idle', '2026-06-22T12:00:00')""",
             (pane,),
         )
 
@@ -53,7 +53,7 @@ def test_agent_session_end_resume_stages_generic_dispatch_command(
 if [[ "$*" == *"@INSTANCE_ID"* ]]; then
   printf 'iid-generic\n'
 elif [[ "$*" == *"@PANE_ID"* ]]; then
-  printf 'legion:worker\n'
+  printf 'mechanicus:worker\n'
 fi
 """,
     )

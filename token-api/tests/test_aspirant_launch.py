@@ -32,7 +32,7 @@ class _FakeProc:
     def __init__(
         self,
         returncode: int = 0,
-        stdout: bytes = b"dispatched claude to legion:new",
+        stdout: bytes = b"dispatched claude to mechanicus:new",
         stderr: bytes = b"",
     ) -> None:
         self.returncode = returncode
@@ -104,7 +104,7 @@ def test_inbox_create_launches_managed_legion_session(aspirant_env, monkeypatch)
     fm = _frontmatter(note_path)
     assert fm["aspirant_session_status"] == "launched"
     assert fm["aspirant_launcher"] == "dispatch"
-    assert fm["aspirant_dispatch_target"] == "legion:new"
+    assert fm["aspirant_dispatch_target"] == "mechanicus:new"
     assert Path(fm["aspirant_session_doc"]).exists()
 
     assert len(calls) == 1
@@ -112,7 +112,7 @@ def test_inbox_create_launches_managed_legion_session(aspirant_env, monkeypatch)
     assert args[:5] == (
         str(Path(aspirant_env.main.SCRIPTS_DIR) / "cli-tools" / "bin" / "dispatch"),
         "--target",
-        "legion:new",
+        "mechanicus:new",
         "--dir",
         str(aspirant_env.vault),
     )

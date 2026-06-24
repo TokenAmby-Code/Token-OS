@@ -199,7 +199,7 @@ def mechanicus_adapter(
         },
         {
             "pane_id": "%A",
-            "role": "mechanicus:admin",
+            "role": "mechanicus:orchestrator",
             "type": "mechanicus",
             "left": 0,
             "top": 25,
@@ -233,137 +233,15 @@ def mechanicus_adapter(
     )
 
 
-def legion_adapter(*, current: str = "%C", workers: bool = True) -> FakePaneSelectAdapter:
-    panes: list[dict[str, object]] = [
-        {
-            "pane_id": "%C",
-            "role": "legion:custodes",
-            "type": "legion",
-            "left": 0,
-            "top": 0,
-        },
-        {
-            "pane_id": "%M",
-            "role": "legion:malcador",
-            "type": "legion",
-            "left": 0,
-            "top": 25,
-        },
-    ]
-    if workers:
-        panes.extend(
-            [
-                {
-                    "pane_id": "%1",
-                    "role": "legion:1",
-                    "type": "stack-worker",
-                    "left": 81,
-                    "top": 8,
-                },
-                {
-                    "pane_id": "%2",
-                    "role": "legion:2",
-                    "type": "stack-worker",
-                    "left": 81,
-                    "top": 20,
-                },
-            ]
-        )
-    return FakePaneSelectAdapter(
-        window_index="3",
-        window_name="legion",
-        panes=panes,
-        current=current,
-    )
-
-
-def koronus_adapter(*, current: str = "%P", workers: bool = True) -> FakePaneSelectAdapter:
-    panes: list[dict[str, object]] = [
-        {
-            "pane_id": "%P",
-            "role": "koronus:pax",
-            "type": "koronus",
-            "left": 0,
-            "top": 0,
-        },
-        {
-            "pane_id": "%O",
-            "role": "koronus:orchestrator",
-            "type": "koronus",
-            "left": 0,
-            "top": 25,
-        },
-    ]
-    if workers:
-        panes.extend(
-            [
-                {
-                    "pane_id": "%1",
-                    "role": "koronus:1",
-                    "type": "stack-worker",
-                    "left": 81,
-                    "top": 8,
-                },
-                {
-                    "pane_id": "%2",
-                    "role": "koronus:2",
-                    "type": "stack-worker",
-                    "left": 81,
-                    "top": 20,
-                },
-            ]
-        )
-    return FakePaneSelectAdapter(
-        window_index="7",
-        window_name="koronus",
-        panes=panes,
-        current=current,
-    )
-
-
-def test_legion_absolute_arrows_select_persona_and_worker_extremes():
-    expected = {
-        "left": "legion:custodes",
-        "right": "legion:malcador",
-        "up": "legion:1",
-        "down": "legion:2",
-    }
-    for direction, target in expected.items():
-        adapter = legion_adapter(current="%2")
-
-        result = select_pane(adapter, mode="absolute", direction=direction, client="/dev/ttys001")
-
-        assert result.endswith(target)
-        assert adapter._pane()["role"] == target
-        assert ("select-pane", "-t", target) in adapter.commands
-
-
 def test_mechanicus_absolute_arrows_select_persona_and_worker_extremes():
     expected = {
         "left": "mechanicus:fabricator-general",
-        "right": "mechanicus:admin",
+        "right": "mechanicus:orchestrator",
         "up": "mechanicus:1",
         "down": "mechanicus:2",
     }
     for direction, target in expected.items():
         adapter = mechanicus_adapter(current="%2")
-
-        result = select_pane(adapter, mode="absolute", direction=direction, client="/dev/ttys001")
-
-        assert result.endswith(target)
-        assert adapter._pane()["role"] == target
-        assert ("select-pane", "-t", target) in adapter.commands
-
-
-def test_koronus_absolute_arrows_select_persona_and_worker_extremes():
-    expected = {
-        "left": "koronus:pax",
-        "right": "koronus:orchestrator",
-        "up": "koronus:1",
-        "down": "koronus:2",
-    }
-    for direction, target in expected.items():
-        adapter = koronus_adapter(current="%2")
 
         result = select_pane(adapter, mode="absolute", direction=direction, client="/dev/ttys001")
 
@@ -401,13 +279,13 @@ def test_mechanicus_absolute_left_selects_fabricator_general():
     assert ("select-pane", "-t", "mechanicus:fabricator-general") in adapter.commands
 
 
-def test_mechanicus_absolute_right_selects_admin():
+def test_mechanicus_absolute_right_selects_orchestrator():
     adapter = mechanicus_adapter(current="%F", focused="%2")
 
     select_pane(adapter, mode="absolute", direction="right", client="/dev/ttys001")
 
-    assert adapter._pane()["role"] == "mechanicus:admin"
-    assert ("select-pane", "-t", "mechanicus:admin") in adapter.commands
+    assert adapter._pane()["role"] == "mechanicus:orchestrator"
+    assert ("select-pane", "-t", "mechanicus:orchestrator") in adapter.commands
 
 
 def test_mechanicus_absolute_up_down_select_worker_top_bottom():

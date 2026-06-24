@@ -4,8 +4,8 @@
 # AUDIENCE: human (keybind: prefix + d)
 #
 # Window-aware behavior:
-#   palace/somnium      → demote current pane to legion (fresh shell replaces it)
-#   legion/mechanicus   → popup selector to promote (swap) into a palace or somnium slot
+#   palace/somnium      → demote current pane to mechanicus (fresh shell replaces it)
+#   mechanicus          → popup selector to promote (swap) into a palace or somnium slot
 #
 # Selector layout:
 #   1-4  Palace slots  (W N S E)
@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Resolve a base window name to its actual tmux name (may have instance count suffix)
-# e.g. "legion" → "legion(2)" if renamed by instance count system
+# e.g. "mechanicus" → "mechanicus(2)" if renamed by instance count system
 resolve_window() {
     local base="$1"
     tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -m1 "^${base}" || echo "$base"
@@ -76,10 +76,10 @@ if [[ "${1:-}" == "--do-swap" ]]; then
     # Get source pane's current tag before swap
     src_tag=$(pane_id_of "$src") || true
     src_window="${src_tag%%:*}"
-    src_window="${src_window:-legion}"
+    src_window="${src_window:-mechanicus}"
     tombstone_source=""
     case "$src_tag" in
-        legion:custodes|mechanicus:fabricator-general|mechanicus:anchor)
+        council:custodes|mechanicus:fabricator-general|mechanicus:anchor)
             tombstone_source="$src_tag"
             ;;
     esac
@@ -89,7 +89,7 @@ if [[ "${1:-}" == "--do-swap" ]]; then
     # After swap: src content is at dst's position, dst content is at src's position.
     # Pane IDs (%N) follow content, so:
     #   $src (now in somnium position) gets the somnium tag
-    #   $dst (now in legion/mechanicus position) gets demoted tag
+    #   $dst (now in mechanicus position) gets demoted tag
     pane_tag "$src" "$dst_tag" || true
     if [[ -n "$tombstone_source" ]]; then
         pane_tag "$dst" "$tombstone_source" || true
@@ -131,7 +131,7 @@ if [[ "$current_type" == "tombstone" ]]; then
     PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m tmuxctl.cli "${args[@]}"
 fi
 
-# --- DEMOTE: palace/somnium → legion stack ---
+# --- DEMOTE: palace/somnium → mechanicus stack ---
 demote() {
     # Remember the slot identity + working directory before we swap.
     local slot_tag="$current_tag"
@@ -142,21 +142,21 @@ demote() {
     # Allocate a real managed stack worker first, then swap the live pane into
     # that stack slot. This preserves the source leaf exactly: the fresh stack
     # shell becomes the palace/somnium replacement, and the live pane takes the
-    # allocator-created legion:N slot. Joining the live pane out first collapses
+    # allocator-created mechanicus:N slot. Joining the live pane out first collapses
     # the source layout; a later split can only guess where the vacated leaf was.
     local stack_pane stack_tag
     stack_pane=$(PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m tmuxctl.cli stack add legion \
+        python3 -m tmuxctl.cli stack add mechanicus \
             --session "$SESSION" \
             --cwd "${wdir:-$HOME}" \
             --no-focus)
-    [[ -n "$stack_pane" ]] || { tmux display-message "Shuttle: failed to allocate legion stack pane"; return 1; }
+    [[ -n "$stack_pane" ]] || { tmux display-message "Shuttle: failed to allocate mechanicus stack pane"; return 1; }
     stack_tag=$(pane_id_of "$stack_pane")
-    [[ -n "$stack_tag" ]] || stack_tag="legion:worker"
+    [[ -n "$stack_tag" ]] || stack_tag="mechanicus:worker"
 
     tmux swap-pane -d -s "$current_pane" -t "$stack_pane" || {
         tmux kill-pane -t "$stack_pane" 2>/dev/null || true
-        tmux display-message "Shuttle: swap into legion stack failed"
+        tmux display-message "Shuttle: swap into mechanicus stack failed"
         return 1
     }
 
@@ -177,10 +177,10 @@ demote() {
     tmux-refresh-layout "$src_target" 2>/dev/null || true
     tmux select-pane -t "$stack_pane" 2>/dev/null || true
 
-    tmux display-message "Shipped to legion stack"
+    tmux display-message "Shipped to mechanicus stack"
 }
 
-# --- PROMOTE: legion/mechanicus → somnium (selector) ---
+# --- PROMOTE: mechanicus → somnium (selector) ---
 promote() {
     # Collect pane data into flat parallel arrays (no associative arrays — compat)
     local pd_tags="" pd_pids="" pd_cmds="" pd_states=""
@@ -259,10 +259,10 @@ case "$current_window" in
     palace|somnium)
         demote
         ;;
-    legion|mechanicus|mars|kreig)
+    mechanicus|mars|kreig)
         promote
         ;;
     *)
-        tmux display-message "Shuttle: only works on palace/somnium/legion/mechanicus"
+        tmux display-message "Shuttle: only works on palace/somnium/mechanicus"
         ;;
 esac

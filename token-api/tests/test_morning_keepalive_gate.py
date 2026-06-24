@@ -10,7 +10,7 @@ join, so a resting Custodes owns keepalive only while timer mode is morning_sess
 - a non-custodes / non-sync instance             → never reaches the keepalive
 - POST /api/morning/end durably writes status="ended" to the state file
 
-Part B — Custodes Discord injection resolves the target via the `legion:custodes`
+Part B — Custodes Discord injection resolves the target via the `council:custodes`
 pane marker, never via a synced/live DB-row hunt, succeeding even when the DB row is
 stale/one_off/synced=0 as long as the pane is alive.
 """
@@ -449,7 +449,7 @@ def _msg(channel_name="chat", content="hello"):
 
 
 def test_custodes_injection_resolves_via_pane_marker_not_synced(app_env, monkeypatch):
-    """Custodes injection resolves via the legion:custodes marker and succeeds even when
+    """Custodes injection resolves via the council:custodes marker and succeeds even when
     the DB row is stale (one_off, synced=0) — no synced/sync query gates the path."""
     main = app_env.main
 
@@ -507,7 +507,7 @@ def test_custodes_injection_no_pane_delegates_to_assert(app_env, monkeypatch):
         return None
 
     async def fake_assert(formatted, *, source):
-        return {"dispatched": True, "pane": "legion:custodes"}
+        return {"dispatched": True, "pane": "council:custodes"}
 
     async def fake_agent_cmd(*a, **k):
         raise AssertionError("agent-cmd must not run when no marked pane is alive")

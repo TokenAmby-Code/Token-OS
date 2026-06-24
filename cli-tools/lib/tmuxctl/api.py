@@ -171,7 +171,7 @@ def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
     """Resolve a cardinal pane label to its linked session document.
 
     This intentionally keys on stable @PANE_ID/pane_label values such as
-    ``palace:N`` or ``legion:custodes``. It does not accept or require raw tmux
+    ``palace:N`` or ``council:custodes``. It does not accept or require raw tmux
     ``%pane`` ids.
     """
     instances = _api_get_json("/api/instances?status=processing&sort=recent_activity")

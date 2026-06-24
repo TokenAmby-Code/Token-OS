@@ -150,7 +150,7 @@ def test_singleton_own_refire_still_adopts_its_row(app_env, monkeypatch):
             "pid": 8888,
             "wrapper_launch_id": "CUSTODES-LAUNCH",
             # the re-fire presents the custodes identity via its pane label
-            "pane_label": hooks.CUSTODES_PANE_LABEL,
+            "pane_label": hooks.COUNCIL_CUSTODES_LABEL,
             "env": {"TMUX_PANE": _FAKE_PANE, "TOKEN_API_ENGINE": "claude"},
         },
     )

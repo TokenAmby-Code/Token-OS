@@ -25,9 +25,9 @@ def test_pane_select_prefix_arrows_use_stack_aware_absolute_selection() -> None:
         assert f"#{'{session_name}'}:#{'{window_index}'}.{pane_index}" in line
         assert "tmuxctl pane-select --mode absolute" in line
         assert f"--direction {direction}" in line
-        assert "m:legion*,#{window_name}" in line
         assert "m:mechanicus*,#{window_name}" in line
-        assert "m:koronus*,#{window_name}" in line
+        # The retired per-fleet stack-page globs must not reappear in the matcher.
+        assert "m:legion*" not in line
         assert "select-pane -L" not in line
         assert "select-pane -R" not in line
         assert "select-pane -U" not in line

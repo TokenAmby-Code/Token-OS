@@ -1,19 +1,20 @@
 """Assert-custodes: tmuxctl owns the detect→upsert/restart decision for the
-legion:custodes orchestrator pane.
+council:custodes pane.
 
 Callers (token-api state hook, morning_session launcher, any future trigger)
 should only know "I want to deliver this prompt to Custodes." This module
 decides:
 
-- If the legion:custodes pane has a live `claude` process → upsert the prompt
+- If the council:custodes pane has a live `claude` process → upsert the prompt
   via `claude-cmd --pane`.
 - Otherwise (shell, empty, dead) → fresh launch via `dispatch --persona
   custodes --pane <id> --prompt-file <path> --sync` (the non-deprecated
   replacement for `primarch custodes`).
 
-The pane is resolved through the `@PANE_ID = legion:custodes` tag — the
-canonical identity signal. If no pane carries the tag yet, the legion stack
-is created via `add_orchestrator_stack_pane`.
+The pane is resolved through the `@PANE_ID = council:custodes` tag — the
+canonical identity signal (Custodes is a fixed seat on the council page, not a
+stack orchestrator). If no pane carries the tag yet, the council page is built
+via `builder.ensure_council_window`.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .resolver import resolve_pane
-from .stack import CUSTODES_ROLE, add_orchestrator_stack_pane
+from .stack import CUSTODES_ROLE
 from .tmux_adapter import TmuxAdapter
 
 DISPATCH_BIN = "dispatch"
@@ -40,7 +41,9 @@ def _ensure_custodes_pane(adapter: TmuxAdapter, session: str) -> str:
         return resolve_pane(adapter, CUSTODES_ROLE).pane_id
     except ValueError:
         pass
-    add_orchestrator_stack_pane(adapter, session, "legion")
+    from .builder import ensure_council_window
+
+    ensure_council_window(adapter, session)
     return resolve_pane(adapter, CUSTODES_ROLE).pane_id
 
 
@@ -202,7 +205,7 @@ def assert_custodes(
     *,
     session: str = "main",
 ) -> dict[str, Any]:
-    """Deliver `prompt` to the legion:custodes pane, upserting or launching."""
+    """Deliver `prompt` to the council:custodes pane, upserting or launching."""
     pane_id = _ensure_custodes_pane(adapter, session)
     pane_pid = _pane_pid(adapter, pane_id)
 

@@ -460,7 +460,7 @@ def test_wait_for_gate_clear_honors_delay_timeout(
 # The clobber's root cause: the gate's typing-lock read shells out to
 # `tmux show-options -pqv -t <target> @TYPING_LOCK_UNTIL`. tmux only understands
 # physical %pane ids (and native session:window addresses). An Imperium
-# canonical id (mechanicus:fabricator-general, legion:custodes, 1:N…) cannot be
+# canonical id (mechanicus:fabricator-general, council:custodes, 1:N…) cannot be
 # resolved at the tmux boundary, so the read errors and the guard MISSES an
 # actively-typed pane — then a send would clobber the human's live draft. The
 # fix is to resolve canonical→physical BEFORE the gate (see the adapter test).

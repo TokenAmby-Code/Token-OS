@@ -176,7 +176,7 @@ def test_custodes_morning_brief_injects_into_canonical_singleton(
     # Pane geometry is resolved live from the oracle (instances.tmux_pane is gone);
     # the canonical singleton must resolve to its live pane without the tmux fallback.
     async def fake_resolve_pane(instance_id):
-        return ("%10", "legion:custodes") if instance_id == "cust-live" else (None, None)
+        return ("%10", "council:custodes") if instance_id == "cust-live" else (None, None)
 
     async def fake_inject(_prompt, pane, *, instance_id=None):
         return {"dispatched": True, "pane": pane, "instance_id": instance_id}

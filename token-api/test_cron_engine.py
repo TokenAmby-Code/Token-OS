@@ -945,7 +945,7 @@ class TestPersonaSweep:
             returncode = 0
 
             async def communicate(self):
-                return (b'[{"ok": true, "pane_label": "legion:custodes"}]', b"")
+                return (b'[{"ok": true, "pane_label": "council:custodes"}]', b"")
 
         async def _fake_exec(*args, **kwargs):
             captured["args"] = args
@@ -978,30 +978,31 @@ class TestPersonaSweep:
             run(engine._run_persona_sweep_job())
 
     def test_sweep_summary_excludes_absent_panes(self, engine, capsys):
-        # An absent persona seat (resolve failure -> action="error", e.g. koronus
-        # not seated) is the expected, uninteresting state and must NOT appear in
+        # An absent persona seat (resolve failure -> action="error", e.g. a council
+        # seat not seated) is the expected, uninteresting state and must NOT appear in
         # the per-interval summary — only a genuinely present-but-unhealthy pane does.
         results = [
-            {"ok": True, "pane_label": "legion:custodes", "action": "none"},
-            {"ok": False, "pane_label": "koronus:pax", "action": "error"},
+            {"ok": True, "pane_label": "council:custodes", "action": "none"},
+            {"ok": False, "pane_label": "council:pax", "action": "error"},
             {
                 "ok": False,
-                "pane_label": "mechanicus:admin",
+                "pane_label": "council:administratum",
                 "action": "persona_unregistered_noted",
             },
         ]
         self._run_sweep_with_results(engine, results)
         out = capsys.readouterr().out
         assert "acted on 1" in out
-        assert "mechanicus:admin=persona_unregistered_noted" in out
-        assert "koronus" not in out
+        assert "council:administratum=persona_unregistered_noted" in out
+        # The absent/errored seat (council:pax) is excluded from the summary.
+        assert "council:pax" not in out
 
     def test_sweep_stays_quiet_when_all_healthy_or_absent(self, engine, capsys):
-        # No present-pane action -> no summary line at all (absent koronus seats
+        # No present-pane action -> no summary line at all (absent council seats
         # alone never trip the log).
         results = [
-            {"ok": True, "pane_label": "legion:custodes", "action": "none"},
-            {"ok": False, "pane_label": "koronus:orchestrator", "action": "error"},
+            {"ok": True, "pane_label": "council:custodes", "action": "none"},
+            {"ok": False, "pane_label": "mechanicus:orchestrator", "action": "error"},
         ]
         self._run_sweep_with_results(engine, results)
         out = capsys.readouterr().out

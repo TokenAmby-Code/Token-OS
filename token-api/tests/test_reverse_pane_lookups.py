@@ -356,7 +356,7 @@ async def test_stop_instance_clears_tint_on_live_resolved_pane(
     _insert_instance(app_env.db_path, "inst-F", legion="custodes")
 
     async def _resolve(instance_id):
-        return ("%LIVE", "legion:custodes") if instance_id == "inst-F" else (None, None)
+        return ("%LIVE", "council:custodes") if instance_id == "inst-F" else (None, None)
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve)
 

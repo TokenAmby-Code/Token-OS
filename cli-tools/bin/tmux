@@ -4,7 +4,7 @@
 # AUDIENCE: system, agent, user
 #
 # For pane-scoped tmux commands, this shim accepts Imperium stable pane ids
-# (1:N, palace:N, somnium:SE, legion:custodes) anywhere a %pane target is accepted.
+# (1:N, palace:N, somnium:SE, council:custodes) anywhere a %pane target is accepted.
 # It resolves them live via tmuxctl, then execs the real tmux binary.
 
 set -euo pipefail

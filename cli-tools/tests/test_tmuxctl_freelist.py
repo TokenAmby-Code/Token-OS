@@ -39,7 +39,7 @@ LIVE = [
     # clean + no agent + no cardinal role → FREE, role None
     ("%43", "1", "", "", "scratch", "103"),
     # explicit non-1 stamp value → NOT free
-    ("%50", "0", "", "legion:S", "legion", "104"),
+    ("%50", "0", "", "mechanicus:1", "mechanicus", "104"),
 ]
 
 
@@ -62,8 +62,8 @@ def test_list_free_panes_excludes_live_agent_even_when_instance_stamp_missing(mo
 
     monkeypatch.setattr(custodes, "pane_has_active_agent", fake_active)
     rows = [
-        ("%custodes", "1", "", "legion:custodes", "legion", "999"),
-        ("%worker", "1", "", "legion:1", "legion", "1000"),
+        ("%custodes", "1", "", "council:custodes", "council", "999"),
+        ("%worker", "1", "", "mechanicus:1", "mechanicus", "1000"),
     ]
 
     free = list_free_panes(FakeAdapter(rows))

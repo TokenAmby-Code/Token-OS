@@ -227,11 +227,11 @@ token_wrapper_enforce_stack_if_needed() {
   [[ -n "$meta" ]] || return 0
   IFS=$'\t' read -r window_target pane_role pane_type <<< "$meta"
   case "$pane_role" in
-    legion:custodes|mechanicus:fabricator-general|mechanicus:admin)
+    council:custodes|mechanicus:fabricator-general|council:administratum)
       return 0
       ;;
   esac
-  if [[ "$pane_type" != "stack-worker" && "$pane_role" != "legion:worker" && "$pane_role" != "legion:regiment" && "$pane_role" != "mechanicus:worker" && ! "$pane_role" =~ ^(legion|mechanicus):[1-9][0-9]*$ ]]; then
+  if [[ "$pane_type" != "stack-worker" && "$pane_role" != "mechanicus:worker" && ! "$pane_role" =~ ^mechanicus:[1-9][0-9]*$ ]]; then
     return 0
   fi
   (

@@ -295,7 +295,7 @@ class RestartExecutor:
 
         Restart execution must not carry volatile tmux ``%N`` ids across
         teardown. The durable pane label (for example ``palace:N`` or
-        ``mechanicus:admin``) is the writer-facing target; ``TmuxAdapter`` then
+        ``council:administratum``) is the writer-facing target; ``TmuxAdapter`` then
         resolves that public target against the live rebuilt workspace at the
         last possible moment. ``target_pane_id`` should be empty for restart
         plans and is not used as a writer target.

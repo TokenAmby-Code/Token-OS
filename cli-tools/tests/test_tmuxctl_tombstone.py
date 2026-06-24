@@ -136,15 +136,15 @@ def test_single_tombstone_resolves_to_target():
 
 def test_double_tombstone_resolves_to_final_target():
     workspace = _workspace(
-        _pane("%1", "legion:custodes", kind=PaneKind.TOMBSTONE, target="palace:N"),
+        _pane("%1", "council:custodes", kind=PaneKind.TOMBSTONE, target="palace:N"),
         _pane("%2", "palace:N", kind=PaneKind.TOMBSTONE, target="%9"),
         _pane("%9", "audience:palace:N", window="_palace_audience"),
     )
 
-    resolved = resolve_pane_in_snapshot(workspace, "legion:custodes")
+    resolved = resolve_pane_in_snapshot(workspace, "council:custodes")
 
     assert resolved.pane_id == "%9"
-    assert resolved.chain == ("legion:custodes", "palace:N", "audience:palace:N")
+    assert resolved.chain == ("council:custodes", "palace:N", "audience:palace:N")
 
 
 def test_missing_tombstone_target_errors_clearly():
@@ -165,9 +165,9 @@ def test_tombstone_cycle_errors_clearly():
 
 
 def test_audience_window_base_strips_stack_spill_suffixes():
-    assert _window_base("legion-2") == "legion"
+    assert _window_base("mechanicus-2") == "mechanicus"
     assert _window_base("mechanicus-12") == "mechanicus"
-    assert _window_base("legion-2(3)") == "legion"
+    assert _window_base("mechanicus-2(3)") == "mechanicus"
 
 
 def test_audience_window_base_does_not_strip_non_audience_names():
@@ -237,8 +237,8 @@ def test_audience_jump_reports_coordinate_id_not_percent_id(monkeypatch):
     assert selected == ["%9"]
 
 
-def test_numeric_legion_worker_abbreviation_resolves_by_window_index():
-    workspace = _workspace(_pane("%5", "legion:5", window="legion", window_index=3))
+def test_numeric_mechanicus_worker_abbreviation_resolves_by_window_index():
+    workspace = _workspace(_pane("%5", "mechanicus:5", window="mechanicus", window_index=3))
 
     resolved = resolve_pane_in_snapshot(workspace, "3:5")
 
@@ -246,18 +246,18 @@ def test_numeric_legion_worker_abbreviation_resolves_by_window_index():
 
 
 def test_legion_custodes_has_zero_abbreviation():
-    workspace = _workspace(_pane("%C", "legion:custodes", window="legion", window_index=3))
+    workspace = _workspace(_pane("%C", "council:custodes", window="legion", window_index=3))
 
     resolved = resolve_pane_in_snapshot(workspace, "3:0")
 
     assert resolved.pane_id == "%C"
 
 
-def test_mechanicus_fabricator_has_zero_abbreviation_and_admin_named_slot():
+def test_mechanicus_fabricator_has_zero_abbreviation_and_orchestrator_named_slot():
     workspace = _workspace(
         _pane("%F", "mechanicus:fabricator-general", window="mechanicus", window_index=4),
-        _pane("%A", "mechanicus:admin", window="mechanicus", window_index=4),
+        _pane("%A", "mechanicus:orchestrator", window="mechanicus", window_index=4),
     )
 
     assert resolve_pane_in_snapshot(workspace, "4:0").pane_id == "%F"
-    assert resolve_pane_in_snapshot(workspace, "4:admin").pane_id == "%A"
+    assert resolve_pane_in_snapshot(workspace, "4:orchestrator").pane_id == "%A"

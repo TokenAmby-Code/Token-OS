@@ -299,12 +299,14 @@ def build_parser() -> argparse.ArgumentParser:
     stack_subparsers = stack_parser.add_subparsers(dest="stack_command", required=True)
 
     stack_add = stack_subparsers.add_parser("add")
-    stack_add.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
+    stack_add.add_argument("base", help="stack window base: mechanicus, mars, kreig, reservists")
     stack_add.add_argument("--cwd", default=None)
     stack_add.add_argument("--session", default="main")
     stack_add.add_argument("--no-focus", action="store_true")
     stack_dispatch = stack_subparsers.add_parser("dispatch")
-    stack_dispatch.add_argument("base", help="stack window base: legion, mechanicus, mars, kreig")
+    stack_dispatch.add_argument(
+        "base", help="stack window base: mechanicus, mars, kreig, reservists"
+    )
     stack_dispatch.add_argument("--cwd", default=None)
     stack_dispatch.add_argument("--session", default="main")
     stack_dispatch.add_argument("--command", dest="launch_command", required=True)
@@ -328,14 +330,16 @@ def build_parser() -> argparse.ArgumentParser:
     stack_sweep.add_argument("--session", default="main")
     stack_sweep.add_argument("--keep-pending-clear", action="store_true")
 
-    legion_parser = subparsers.add_parser("legion")
-    legion_subparsers = legion_parser.add_subparsers(dest="legion_command", required=True)
+    mechanicus_parser = subparsers.add_parser("mechanicus")
+    mechanicus_subparsers = mechanicus_parser.add_subparsers(
+        dest="mechanicus_command", required=True
+    )
 
-    legion_focus = legion_subparsers.add_parser("focus-selected")
-    legion_focus.add_argument("--pane", default="current")
+    mechanicus_focus = mechanicus_subparsers.add_parser("focus-selected")
+    mechanicus_focus.add_argument("--pane", default="current")
 
-    legion_enforce = legion_subparsers.add_parser("enforce")
-    legion_enforce.add_argument("--pane", default="current")
+    mechanicus_enforce = mechanicus_subparsers.add_parser("enforce")
+    mechanicus_enforce.add_argument("--pane", default="current")
 
     create_parser = subparsers.add_parser("create")
     create_parser.add_argument("--session", default="main")
@@ -840,16 +844,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(layout_result)
                 return 0
 
-        if args.command == "legion":
+        if args.command == "mechanicus":
             pane = args.pane
             if pane == "current":
                 pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
-            if args.legion_command == "focus-selected":
+            if args.mechanicus_command == "focus-selected":
                 from .stack import focus_selected
 
                 print(focus_selected(control.adapter, pane))
                 return 0
-            if args.legion_command == "enforce":
+            if args.mechanicus_command == "enforce":
                 from .stack import enforce_stack_layout
 
                 target = control.adapter.run(
@@ -858,16 +862,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(enforce_stack_layout(control.adapter, target, focused_pane=pane, focus=True))
                 return 0
 
-        if args.command == "legion":
+        if args.command == "mechanicus":
             pane = args.pane
             if pane == "current":
                 pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
-            if args.legion_command == "focus-selected":
+            if args.mechanicus_command == "focus-selected":
                 from .stack import focus_selected
 
                 print(focus_selected(control.adapter, pane))
                 return 0
-            if args.legion_command == "enforce":
+            if args.mechanicus_command == "enforce":
                 from .stack import enforce_stack_layout
 
                 target = control.adapter.run(

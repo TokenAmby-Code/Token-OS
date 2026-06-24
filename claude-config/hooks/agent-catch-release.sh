@@ -143,7 +143,7 @@ SESSIONEOF
 log "Created session doc: ${SESSION_DOC_REL}"
 
 # --- Dispatch via `dispatch` (async — don't block the hook response) ---
-# Pane allocation is delegated to dispatch via `--target legion:new`, which routes
+# Pane allocation is delegated to dispatch via `--target mechanicus:new`, which routes
 # through tmuxctl stack allocation. If no pane can be allocated, dispatch fails
 # and we fall back to allowing the subagent inline.
 DISPATCH_OUTPUT=""
@@ -153,7 +153,7 @@ DISPATCH_TMP=$(mktemp /tmp/catch-release-XXXXXX)
 if ! "$DISPATCH_BIN" \
       --session-doc "$SESSION_DOC_REL" \
       --dir "$PARENT_CWD" \
-      --target legion:new \
+      --target mechanicus:new \
       > "$DISPATCH_TMP" 2>&1; then
   DISPATCH_ERR=$(cat "$DISPATCH_TMP" 2>/dev/null)
   log "FALLBACK: dispatch failed — ${DISPATCH_ERR:0:200} — allowing subagent"

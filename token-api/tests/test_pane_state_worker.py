@@ -185,12 +185,12 @@ async def test_stopped_on_persona_role_skips_assertion(
     app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
     """The assert-persona guard keys on the LIVE role: a stopped instance whose
-    live role is a persona label (e.g. ``legion:custodes``) must NOT spawn an
+    live role is a persona label (e.g. ``council:custodes``) must NOT spawn an
     assertion — even though the stored column never enters the decision."""
     main = app_env.main
 
     async def _resolve_persona(_instance_id):
-        return ("%5", "legion:custodes")
+        return ("%5", "council:custodes")
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_persona)
 

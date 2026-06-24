@@ -57,7 +57,7 @@ Usage:
   dispatch [legion|mechanicus|civic] [options]
 
   The optional leading word is target shorthand:
-    dispatch legion ...       ≡  dispatch --target legion:new ...
+    dispatch legion ...       ≡  dispatch --target mechanicus:new ...
     dispatch mechanicus ...   ≡  dispatch --target mechanicus:new ...
     dispatch civic ...        ≡  dispatch --target civic:new ...
 
@@ -85,7 +85,7 @@ Options:
   --prompt-file <path>         Read initial prompt from file
   --system-prompt <text>       Append a Claude system prompt
   --system-prompt-file <path>  Read appended Claude system prompt from file
-  --target <target>            legion:new, mechanicus:new, or a tmux pane id
+  --target <target>            mechanicus:new, mechanicus:new, or a tmux pane id
   --pane <target|self>         Alias for --target; with --id, pane to resume into
   --gt | --no-gt               Golden Throne lane toggle (default: --no-gt)
   --zealotry <1-10>            Zealotry (default: 5 with --gt, 3 with --no-gt)
@@ -157,7 +157,7 @@ INTERACTIVE=false
 DISPATCH_AUTO_EXPANDED_PANE=""
 DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
 
-# Positional target shorthand: `dispatch legion ...` ≡ `dispatch --target legion:new ...`
+# Positional target shorthand: `dispatch legion ...` ≡ `dispatch --target mechanicus:new ...`
 # (same for mechanicus, civic). Only the leading token is consumed so a prompt word
 # like "legion" is never swallowed. An explicit --target later still wins.
 case "${1:-}" in
@@ -848,7 +848,7 @@ fi
 default_human_surface_target() {
   # A typed `d`/`cdc` dispatch from inside tmux should occupy the invoking pane by
   # default. Prefix+Space remains the explicit new-legion-pane launcher because it
-  # passes --target legion:new.
+  # passes --target mechanicus:new.
   [[ -z "$TARGET" ]] || return 0
   dispatch_origin_is_human_surface || return 0
   [[ -n "$(dispatch_tmux_pane)" ]] || return 0
@@ -1209,7 +1209,7 @@ launch_dispatch_aspirant_session() {
     mode_flag="--no-gt"
   fi
 
-  local launch_target="${TARGET:-legion:new}"
+  local launch_target="${TARGET:-mechanicus:new}"
   launch_args=(
     --direct
     --engine "$ENGINE"
@@ -1546,7 +1546,7 @@ assert_dispatch_target_unoccupied() {
   pane_pid="${meta%%|*}"
   instance_id="${meta#*|}"
   case "$pane_label" in
-    legion:custodes|legion:malcador|mechanicus:fabricator-general|mechanicus:admin|koronus:pax|koronus:orchestrator)
+    council:custodes|council:malcador|mechanicus:fabricator-general|council:administratum|council:pax|mechanicus:orchestrator)
       err "target pane $TARGET is a protected singleton seat ($pane_label); refusing dispatch injection"
       err "use a worker pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
       exit 73
@@ -1600,7 +1600,7 @@ fi
 # 2026-06-18). Legion/persona are NOT env-injectable: sources of truth are the tmux
 # pane stamp + the DB. Leave NULL when no --persona / non-custodes target so the server
 # assigns a fresh worker (astartes) identity. Automated custodes launches still bind
-# correctly: they target the `legion:custodes` slot, handled by the DISPATCH_SLOT case
+# correctly: they target the `council:custodes` slot, handled by the DISPATCH_SLOT case
 # below.
 LEGION=""
 if [[ -z "$LEGION" && -n "$PERSONA" ]]; then
@@ -1609,7 +1609,7 @@ if [[ -z "$LEGION" && -n "$PERSONA" ]]; then
     inquisitor|inquisition) LEGION="inquisition" ;;
   esac
 fi
-# The state-hook dispatcher targets the `legion:custodes` slot without a persona.
+# The state-hook dispatcher targets the `council:custodes` slot without a persona.
 if [[ -z "$LEGION" ]]; then
   case "$(printf '%s' "$DISPATCH_SLOT" | tr '[:upper:]' '[:lower:]')" in
     custodes) LEGION="custodes" ;;

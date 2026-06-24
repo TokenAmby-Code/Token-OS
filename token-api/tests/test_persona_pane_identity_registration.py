@@ -1,10 +1,10 @@
 """Persona pane identity derivation regressions (2026-06-12 reboot wave).
 
-R-M1 — legion:malcador map miss. tmuxctl stamps @PANE_ID=legion:malcador on the
+R-M1 — council:malcador map miss. tmuxctl stamps @PANE_ID=council:malcador on the
 advisor seat (builder.py) and assertions expect persona malcador on its row,
 but PERSONA_PANE_IDENTITY had no entry for the label — a fresh SessionStart in
 the pane resolved the label and still registered as a generic astartes row
-(live 8ff5aef5: pane_label='legion:malcador', no persona identity).
+(live 8ff5aef5: pane_label='council:malcador', no persona identity).
 
 R-M2 — chapter-child poisoning. A persona relaunch chain (the old persona
 session dispatching/resuming its successor) leaks the predecessor into
@@ -110,14 +110,14 @@ def _no_pane_occupant(monkeypatch, hooks):
     monkeypatch.setattr(hooks.shared, "instance_id_for_pane", none)
 
 
-# ── R-M1: legion:malcador derives the advisor seat identity ────────────────────
+# ── R-M1: council:malcador derives the advisor seat identity ────────────────────
 
 
 def test_malcador_pane_registers_with_primarch_identity(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     hooks = sys.modules["routes.hooks"]
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:malcador"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:malcador"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "malc-1")
@@ -131,19 +131,19 @@ def test_malcador_pane_registers_with_primarch_identity(
     assert row["commander_type"] == "emperor"
 
 
-# ── Pax: the civic overseer seat on the koronus page ───────────────────────────
+# ── Pax: the civic overseer seat on the council page ───────────────────────────
 
 
 def test_pax_pane_registers_with_overseer_identity(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A fresh SessionStart in the koronus:pax pane IS Pax: its identity is derived
+    # A fresh SessionStart in the council:pax pane IS Pax: its identity is derived
     # from PERSONA_PANE_IDENTITY (primarch='pax' → the `pax` personas row), and
     # the rank-stamp trigger must promote the freshly inserted row off the
     # 'astartes' column default to 'overseer'. Emperor-commanded, like every
     # persona singleton.
     hooks = sys.modules["routes.hooks"]
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:pax"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:pax"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "pax-1")
@@ -164,7 +164,7 @@ def test_pax_pane_parent_env_does_not_register_chapter_child(
     # singleton must register Emperor-commanded, always.
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "dispatcher-pax")
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:pax"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:pax"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "pax-2", env={"TOKEN_API_PARENT_INSTANCE_ID": "dispatcher-pax"})
@@ -181,11 +181,11 @@ def test_pax_pane_parent_env_does_not_register_chapter_child(
 def test_orchestrator_pane_registers_with_overseer_identity(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The koronus:orchestrator pane IS the civic Orchestrator seat: identity is
+    # The mechanicus:orchestrator pane IS the civic Orchestrator seat: identity is
     # derived from PERSONA_PANE_IDENTITY (primarch='orchestrator' → the
     # `orchestrator` personas row), promoted off the astartes default to overseer.
     hooks = sys.modules["routes.hooks"]
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("koronus:orchestrator"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("mechanicus:orchestrator"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "orch-1")
@@ -197,10 +197,10 @@ def test_orchestrator_pane_registers_with_overseer_identity(
     assert row["commander_type"] == "emperor"
 
 
-def test_pax_pane_off_koronus_page_falls_back_to_astartes(
+def test_pax_pane_off_council_page_falls_back_to_astartes(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Off-page fallback: a civic seat promoted to palace/somnium (or any non-koronus
+    # Off-page fallback: a civic seat promoted to palace/somnium (or any non-council
     # pane) has no PERSONA_PANE_IDENTITY entry, so it must NOT register as the pax
     # overseer singleton. It falls through to a normal astartes registration so it
     # obeys the standard tint + TTS rules.
@@ -224,7 +224,7 @@ def test_persona_pane_parent_env_does_not_register_chapter_child(
 ) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "dispatcher-fg")
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:malcador"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:malcador"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(hooks, "malc-2", env={"TOKEN_API_PARENT_INSTANCE_ID": "dispatcher-fg"})
@@ -251,7 +251,7 @@ def test_custodes_relaunch_over_zombie_predecessor_absorbs_it(
     # left behind for the resolver to find.
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "zombie-cust", persona_slug="custodes", rank="overseer")
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:custodes"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:custodes"))
     _no_pane_occupant(monkeypatch, hooks)
 
     result = _start_session(
@@ -279,7 +279,7 @@ def test_custodes_paneless_start_resolves_label_for_stamp_and_gold_tint(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Custodes SessionStart can arrive with no TMUX_PANE while still carrying
-    # pane_label=legion:custodes. The hook must resolve that stable label through
+    # pane_label=council:custodes. The hook must resolve that stable label through
     # the live pane oracle and use the effective pane for both @INSTANCE_ID stamp
     # and personas.pane_tint application.
     hooks = sys.modules["routes.hooks"]
@@ -287,7 +287,7 @@ def test_custodes_paneless_start_resolves_label_for_stamp_and_gold_tint(
     tint_calls: list[tuple[str | None, str | None]] = []
 
     async def resolve_label(target):
-        return "%custodes" if target == "legion:custodes" else None
+        return "%custodes" if target == "council:custodes" else None
 
     async def stamp(pane, session_id, **_kwargs):
         stamps.append((pane, session_id))
@@ -305,7 +305,7 @@ def test_custodes_paneless_start_resolves_label_for_stamp_and_gold_tint(
             {
                 "session_id": "cust-paneless",
                 "cwd": "/tmp",
-                "pane_label": "legion:custodes",
+                "pane_label": "council:custodes",
                 "env": {"TOKEN_API_ENGINE": "claude"},
             }
         )
@@ -343,7 +343,7 @@ def test_persona_supplant_does_not_steal_live_prior_parent(
         commander_id="dead-dispatcher",
         created_at="2026-06-11T08:00:00",
     )
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("legion:custodes"))
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:custodes"))
     _no_pane_occupant(monkeypatch, hooks)
 
     with pytest.raises(sqlite3.IntegrityError, match="live singleton incumbent exists"):

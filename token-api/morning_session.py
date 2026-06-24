@@ -4,10 +4,10 @@
 Triggered by POST /api/morning/start (from phone macro after alarm dismiss)
 or directly via `python3 morning_launcher.py` (cron).
 
-Gathers context, builds the Custodes prompt inline, resolves the managed
-main:legion Custodes orchestrator pane, and launches an interactive Claude
+Gathers context, builds the Custodes prompt inline, resolves the fixed
+`council:custodes` seat, and launches an interactive Claude
 session via `primarch custodes`. The session's identity (persona=custodes,
-rank=overseer) is owned by the SessionStart hook from the legion:custodes pane;
+rank=overseer) is owned by the SessionStart hook from the council:custodes pane;
 the launcher then sets sync MODE while the morning session is live.
 
 The launcher exits after launch — the Claude session is autonomous from there.
@@ -502,8 +502,8 @@ abandoned sessions, overdue items).
 
 ## Interactive Session
 
-This is a LIVE conversation. You run in an interactive tmux pane in
-main:legion. The Emperor interacts primarily via **Discord voice
+This is a LIVE conversation. You run in the fixed `council:custodes` seat
+on the council page. The Emperor interacts primarily via **Discord voice
 channel** — he speaks, Whisper transcribes, Token-API routes to you (as
 the custodes singleton). You speak back via `tts` for every response.
 
@@ -736,75 +736,60 @@ def ensure_daily_notes():
             print(f"Warning: could not create daily note in {vault}: {e}")
 
 
-def create_legion_pane() -> str | None:
-    """Return the managed Custodes orchestrator pane in main:legion.
+def resolve_custodes_pane() -> str | None:
+    """Return the fixed Custodes seat on the council page.
 
     Morning launch is not a worker dispatch and must not create duplicate
-    Custodes panes. The legion page invariant is owned by tmuxctl; this launcher
-    only resolves the fixed orchestrator target.
+    Custodes panes. Custodes is a fixed council seat (built by
+    `builder.ensure_council_window` at workspace creation), so this launcher only
+    resolves the durable `council:custodes` target — `resolve-pane` is the
+    operation that gates the launch.
 
-    The `stack enforce` call is a BEST-EFFORT pre-assertion of the legion-stack
-    invariant. The legion stack/pane is persistent across the day, so a slow or
-    hung enforce must NOT abort the morning launch — `resolve-pane` is the
-    operation that actually gates the launch. We therefore swallow the enforce's
-    5s timeout (and any other subprocess error) and proceed to resolve the pane.
-
-    Regression (P0, 2026-06-05): an uncaught `subprocess.TimeoutExpired` from
-    this enforce propagated out of `run_morning_session()`, so the Emperor was
-    never placed into morning-session mode and the break was never paused. See
-    test_morning_session.py and the morning-session-failure-cascade memory.
+    Historical note: an earlier version pre-asserted a per-fleet legion *stack*
+    with `tmuxctl stack enforce --window main:legion`. That page was retired into
+    the council page and `legion` is no longer a stack base, so the pre-assertion
+    is gone — the durable seat needs no enforce and `resolve-pane` already fails
+    closed (returns None) when the seat is absent. The P0 regression that motivated
+    swallowing that enforce's timeout (uncaught `subprocess.TimeoutExpired`
+    aborting `run_morning_session()`, 2026-06-05) cannot recur now that the call
+    is removed.
     """
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
     try:
-        subprocess.run(
-            [str(tmuxctl), "stack", "enforce", "--window", f"{TMUX_SESSION}:legion"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "tmuxctl stack enforce legion timed out (5s) — continuing; "
-            "the legion stack is persistent and resolve-pane gates the launch"
-        )
-    except Exception as e:
-        logger.warning("tmuxctl stack enforce legion failed (%s) — continuing", e)
-
-    try:
         result = subprocess.run(
-            [str(tmuxctl), "resolve-pane", "--format", "physical", "legion:custodes"],
+            [str(tmuxctl), "resolve-pane", "--format", "physical", "council:custodes"],
             capture_output=True,
             text=True,
             timeout=5,
         )
     except subprocess.TimeoutExpired:
-        logger.error("tmuxctl resolve-pane legion:custodes timed out (5s)")
+        logger.error("tmuxctl resolve-pane council:custodes timed out (5s)")
         return None
     except Exception as e:
-        logger.error("tmuxctl resolve-pane legion:custodes failed: %s", e)
+        logger.error("tmuxctl resolve-pane council:custodes failed: %s", e)
         return None
     if result.returncode != 0:
-        logger.error("could not resolve legion:custodes: %s", result.stderr)
+        logger.error("could not resolve council:custodes: %s", result.stderr)
         return None
     pane_id = result.stdout.strip()
     if not pane_id:
-        logger.error("tmuxctl resolve-pane did not return a pane_id for legion:custodes")
+        logger.error("tmuxctl resolve-pane did not return a pane_id for council:custodes")
         return None
     return pane_id
 
 
-def launch_in_legion(prompt_text: str, pane_id: str) -> dict:
-    """Assert `legion:custodes`, then send the morning prompt after assertion is true."""
+def launch_in_custodes(prompt_text: str, pane_id: str) -> dict:
+    """Assert `council:custodes`, then send the morning prompt after assertion is true."""
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
     dispatch = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "dispatch"
 
-    def _fallback_new_legion_pane(reason: str) -> dict:
+    def _fallback_new_custodes_pane(reason: str) -> dict:
         """Launch a fresh Custodes when the fixed pane is live but undeliverable.
 
         The morning path is a wake/rescue path, not a normal state-hook nudge.
-        If the durable legion:custodes pane is stuck in an unregistered or
+        If the durable council:custodes pane is stuck in an unregistered or
         human-modal state, failing closed recreates the exact disaster this
-        launcher exists to prevent. A :new legion target gives the morning a
+        launcher exists to prevent. A `mechanicus:new` target gives the morning a
         clean prompt without writing bytes into the blocked pane.
         """
         fd, prompt_path = tempfile.mkstemp(prefix="custodes-morning-", suffix=".md")
@@ -816,7 +801,7 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> dict:
                 [
                     str(dispatch),
                     "--target",
-                    "legion:new",
+                    "mechanicus:new",
                     "--persona",
                     "custodes",
                     "--model",
@@ -863,7 +848,7 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> dict:
                 result.stderr.strip()[:200],
             )
             return {"launched": False, "pane_id": pane_id}
-        logger.info("Morning session: fallback dispatched to legion:new after %s", reason)
+        logger.info("Morning session: fallback dispatched to mechanicus:new after %s", reason)
         return {
             "launched": True,
             "pane_id": None,
@@ -874,7 +859,7 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> dict:
 
     def _assert_once() -> dict:
         result = subprocess.run(
-            [str(tmuxctl), "assert-instance", "--pane", "legion:custodes"],
+            [str(tmuxctl), "assert-instance", "--pane", "council:custodes"],
             capture_output=True,
             text=True,
             timeout=45,
@@ -903,29 +888,29 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> dict:
                 "persona_unregistered_noted",
                 "persona_unregistered_suppressed",
             }:
-                return _fallback_new_legion_pane(str(assertion.get("action")))
-            logger.error("tmuxctl assert-instance legion:custodes failed: %s", assertion)
+                return _fallback_new_custodes_pane(str(assertion.get("action")))
+            logger.error("tmuxctl assert-instance council:custodes failed: %s", assertion)
             return {"launched": False, "pane_id": pane_id}
         result = subprocess.run(
-            [str(tmuxctl), "send-text", "--pane", "legion:custodes", "--stdin"],
+            [str(tmuxctl), "send-text", "--pane", "council:custodes", "--stdin"],
             input=prompt_text,
             capture_output=True,
             text=True,
             timeout=45,
         )
     except subprocess.TimeoutExpired:
-        logger.error("tmuxctl assert/send legion:custodes timed out")
+        logger.error("tmuxctl assert/send council:custodes timed out")
         return {"launched": False, "pane_id": pane_id}
     except Exception as e:
-        logger.error("Error launching in legion pane: %s", e)
+        logger.error("Error launching in council:custodes pane: %s", e)
         return {"launched": False, "pane_id": pane_id}
 
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "send suppressed by gate" in stderr or "user input not cleared" in stderr:
-            return _fallback_new_legion_pane("fixed_pane_send_gated")
+            return _fallback_new_custodes_pane("fixed_pane_send_gated")
         logger.error(
-            "tmuxctl send-text legion:custodes rc=%s: stdout=%s stderr=%s",
+            "tmuxctl send-text council:custodes rc=%s: stdout=%s stderr=%s",
             result.returncode,
             result.stdout.strip()[:200],
             stderr[:200],
@@ -936,7 +921,7 @@ def launch_in_legion(prompt_text: str, pane_id: str) -> dict:
 
 
 def inject_morning_lifecycle_prompt(prompt_text: str | None = None) -> dict:
-    """Inject the official 06:00 lifecycle prompt into ``legion:custodes``.
+    """Inject the official 06:00 lifecycle prompt into ``council:custodes``.
 
     This is the scheduler path for first-class ``morning_session`` mode. It uses
     tmuxctl's pane marker and assert/send flow; no physical pane id is hardcoded.
@@ -945,7 +930,7 @@ def inject_morning_lifecycle_prompt(prompt_text: str | None = None) -> dict:
     tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
     try:
         assertion = subprocess.run(
-            [str(tmuxctl), "assert-instance", "--pane", "legion:custodes"],
+            [str(tmuxctl), "assert-instance", "--pane", "council:custodes"],
             capture_output=True,
             text=True,
             timeout=45,
@@ -963,7 +948,7 @@ def inject_morning_lifecycle_prompt(prompt_text: str | None = None) -> dict:
                 "returncode": assertion.returncode,
             }
         sent = subprocess.run(
-            [str(tmuxctl), "send-text", "--pane", "legion:custodes", "--stdin"],
+            [str(tmuxctl), "send-text", "--pane", "council:custodes", "--stdin"],
             input=prompt,
             capture_output=True,
             text=True,
@@ -985,7 +970,7 @@ def inject_morning_lifecycle_prompt(prompt_text: str | None = None) -> dict:
         )
         return {"injected": False, "reason": "send_failed", "returncode": sent.returncode}
 
-    return {"injected": True, "pane": "legion:custodes"}
+    return {"injected": True, "pane": "council:custodes"}
 
 
 def run_morning_session() -> dict:
@@ -999,7 +984,7 @@ def run_morning_session() -> dict:
     # already launched OR already ended — the latter produced the evening misfires:
     # the phone re-POSTed hours after the real morning ended, and an "ended" record
     # (the only guarded status before) sailed past this gate and relaunched Custodes
-    # into the legion pane in the evening. Failure statuses (nas_unavailable, no_pane,
+    # into the council:custodes pane in the evening. Failure statuses (nas_unavailable, no_pane,
     # launch_failed) are intentionally NOT guarded so a genuine retry can proceed.
     if state_file.exists():
         data = json.loads(state_file.read_text())
@@ -1094,10 +1079,10 @@ def run_morning_session() -> dict:
     ctx["daily_thread_id"] = daily_thread_id or ""
     prompt = build_prompt(ctx)
 
-    # Phase 4: Create legion pane and launch
-    pane_id = create_legion_pane()
+    # Phase 4: Resolve the council Custodes seat and launch
+    pane_id = resolve_custodes_pane()
     if not pane_id:
-        send_tts("Morning session failed: could not create legion pane")
+        send_tts("Morning session failed: could not resolve council Custodes pane")
         state_file.write_text(
             json.dumps(
                 {
@@ -1108,9 +1093,9 @@ def run_morning_session() -> dict:
         )
         return {"status": "no_pane"}
 
-    launch_result = launch_in_legion(prompt, pane_id)
+    launch_result = launch_in_custodes(prompt, pane_id)
     if not launch_result.get("launched"):
-        send_tts("Morning session failed: could not launch in legion pane")
+        send_tts("Morning session failed: could not launch in council Custodes pane")
         state_file.write_text(
             json.dumps(
                 {
@@ -1140,7 +1125,7 @@ def run_morning_session() -> dict:
     )
     logger.info(
         "Morning session launched in %s; confirming registration",
-        launched_pane_id or "fallback legion:new pane",
+        launched_pane_id or "fallback mechanicus:new pane",
     )
 
     # In-pathway self-validation. The launch is otherwise fire-and-forget: a

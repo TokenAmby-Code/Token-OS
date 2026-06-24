@@ -97,7 +97,7 @@ def test_internal_aspirant_create_dispatch_creates_mars_session_doc_for_trials(t
             "--dir",
             str(ROOT),
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--zealotry",
             "4",
             "--victory-condition",
@@ -140,7 +140,7 @@ def test_internal_aspirant_create_dispatch_creates_mars_session_doc_for_trials(t
     assert 'engine: "claude"' in session_text
     assert 'persona: "vulkan"' in session_text
     assert f"target_working_dir: {json.dumps(str(ROOT))}" in session_text
-    assert 'dispatch_target: "legion:new"' in session_text
+    assert 'dispatch_target: "mechanicus:new"' in session_text
     assert "zealotry: 4" in session_text
     assert "victory_conditions:" in session_text
     assert '  - "Tests pass"' in session_text
@@ -231,7 +231,7 @@ def test_aspirant_create_dispatch_defaults_dir_to_imperium_env_vault(tmp_path):
             "--persona",
             "vulkan",
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--victory-condition",
             "Tests pass",
         ],
@@ -267,7 +267,7 @@ def test_aspirant_create_rejects_empty_objective_without_staging(tmp_path):
             "--persona",
             "vulkan",
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--victory-condition",
             "Tests pass",
         ],
@@ -299,7 +299,7 @@ def test_aspirant_create_allows_trivial_non_empty_objective(tmp_path):
             "--persona",
             "vulkan",
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--victory-condition",
             "Tests pass",
         ],
@@ -355,7 +355,7 @@ def test_dispatch_aspirant_dispatch_dry_run_delegates_without_launch(tmp_path):
             "--dir",
             str(ROOT),
             "--target",
-            "legion:new",
+            "mechanicus:new",
             "--victory-condition",
             "Boundary verified",
             "Prepare dispatch but do not launch",

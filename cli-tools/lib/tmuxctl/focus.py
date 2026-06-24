@@ -389,7 +389,7 @@ def execute_focus_plan(adapter: TmuxAdapter, plan: FocusPlan) -> str:
 
 def focus_window(adapter: TmuxAdapter, session_name: str, window_index: int, mode: str) -> str:
     window = build_window_snapshot(adapter, session_name, window_index)
-    if window.archetype in {WindowArchetype.LEGION_STACK, WindowArchetype.MECHANICUS_STACK}:
+    if window.archetype is WindowArchetype.MECHANICUS_STACK:
         from .stack import enforce_stack_layout
 
         active = _active_pane(window)

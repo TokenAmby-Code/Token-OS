@@ -371,7 +371,7 @@ async def _ensure_instances(db) -> None:
             ) THEN RAISE(ABORT, 'persona_id must reference personas.id') END;
         END
     """)
-    # Persona-binding null-clobber fail-safe (the P1 koronus:pax/orchestrator
+    # Persona-binding null-clobber fail-safe (the P1 council:pax/orchestrator
     # slug-null corruption). A `legion=civic` PATCH — civic is an ALLOWED_LEGION
     # but has no persona, and the legion column itself died into persona_id — must
     # NEVER drop a row's existing persona binding to NULL. When it did, the live

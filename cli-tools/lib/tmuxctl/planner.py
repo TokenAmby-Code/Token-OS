@@ -366,7 +366,7 @@ def _legal_restart_labels(workspace: WorkspaceSnapshot) -> set[str]:
             legal.update(PALACE_ROLES)
         elif window.archetype.value == "somnium":
             legal.update(SOMNIUM_ROLES)
-        elif window.archetype.value in {"legion_stack", "mechanicus_stack"}:
+        elif window.archetype.value in {"mechanicus_stack", "council"}:
             legal.update({pane.pane_role for pane in window.panes if pane.pane_role})
     return legal
 
@@ -389,8 +389,8 @@ def _resume_reason(instance: InstanceRegistryEntry, disposition: ResumeDispositi
 
 def _orchestrator_tombstone_role(instance: InstanceRegistryEntry, pane_label: str) -> str:
     legion = instance.legion.strip().lower()
-    if legion == "custodes" and pane_label != "legion:custodes":
-        return "legion:custodes"
+    if legion == "custodes" and pane_label != "council:custodes":
+        return "council:custodes"
     if legion == "fabricator" and pane_label != "mechanicus:fabricator-general":
         return "mechanicus:fabricator-general"
     return ""

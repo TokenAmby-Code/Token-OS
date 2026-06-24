@@ -22,7 +22,7 @@ class FakeLegionAdapter:
         self,
         *,
         guard: bool = False,
-        window_name: str = "legion",
+        window_name: str = "mechanicus",
         rows: list[str] | None = None,
         zoomed: bool = False,
         window_present: bool = True,
@@ -76,9 +76,9 @@ class FakeLegionAdapter:
                 return "\n".join(self.rows)
             return "\n".join(
                 [
-                    "%C\tlegion:custodes\t0\t0\t50",
-                    "%1\tlegion:regiment\t0\t0\t3",
-                    "%2\tlegion:regiment\t1\t4\t42",
+                    "%C\tmechanicus:fabricator-general\t0\t0\t50",
+                    "%1\tmechanicus:regiment\t0\t0\t3",
+                    "%2\tmechanicus:regiment\t1\t4\t42",
                 ]
             )
         if args[0] == "set-option" and "-w" in args:
@@ -126,7 +126,7 @@ def test_add_stack_pane_kills_new_worker_when_layout_fails(monkeypatch):
     import tmuxctl._stack_core as stack_core
 
     rows = [
-        "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+        "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
     ]
     adapter = FakeLegionAdapter(rows=rows)
 
@@ -136,27 +136,29 @@ def test_add_stack_pane_kills_new_worker_when_layout_fails(monkeypatch):
     monkeypatch.setattr(stack_core, "enforce_stack_layout", _boom)
 
     with pytest.raises(OSError):
-        stack_core.add_orchestrator_stack_pane(adapter, "main", "legion", cwd="/tmp", focus=False)
+        stack_core.add_orchestrator_stack_pane(
+            adapter, "main", "mechanicus", cwd="/tmp", focus=False
+        )
 
     assert any(command[0] == "kill-pane" and "%N" in command for command in adapter.commands)
     assert not any(row.startswith("%N\t") for row in adapter.rows or [])
 
 
-def test_selecting_custodes_does_not_resize_legion():
+def test_selecting_orchestrator_anchor_does_not_resize_stack():
     adapter = FakeLegionAdapter()
 
     result = focus_selected(adapter, "%C")  # type: ignore[arg-type]
 
-    assert result.endswith(": custodes")
+    assert result.endswith(": orchestrator")
     assert not any(command[0] == "resize-pane" for command in adapter.commands)
 
 
-def test_selecting_custodes_is_noop_even_when_window_zoomed():
+def test_selecting_orchestrator_anchor_is_noop_even_when_window_zoomed():
     adapter = FakeLegionAdapter(zoomed=True)
 
     result = focus_selected(adapter, "%C")  # type: ignore[arg-type]
 
-    assert result.endswith(": custodes")
+    assert result.endswith(": orchestrator")
     assert not any(command[0] == "resize-pane" for command in adapter.commands)
     assert adapter.zoomed is True
 
@@ -211,8 +213,8 @@ def test_legion_focus_guard_makes_hook_reentry_noop():
 def test_clear_legion_worker_is_killed_instead_of_becoming_blank_stack_pane():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t50\tclaude",
-            "%1\tlegion:worker\tstack-worker\t1\t81\t0\t80\t10\tzsh",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t50\tclaude",
+            "%1\tmechanicus:worker\tstack-worker\t1\t81\t0\t80\t10\tzsh",
         ]
     )
 
@@ -242,7 +244,7 @@ def test_mechanicus_stack_uses_fabricator_left_column_and_worker_right_stack():
 def test_blank_orchestrator_tag_is_moved_to_single_untyped_live_pane():
     adapter = FakeLegionAdapter(
         rows=[
-            "%blank\tlegion:custodes\tlegion\t0\t0\t0\t80\t20\tzsh",
+            "%blank\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t20\tzsh",
             "%live\t\t\t1\t0\t0\t160\t50\tclaude",
         ]
     )
@@ -250,28 +252,35 @@ def test_blank_orchestrator_tag_is_moved_to_single_untyped_live_pane():
     result = enforce_stack_layout(adapter, "main:3")  # type: ignore[arg-type]
 
     assert result == "normalized stack layout main:3: orchestrator only"
-    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "legion:custodes") in adapter.commands
+    assert (
+        "set-option",
+        "-p",
+        "-t",
+        "%live",
+        "@PANE_ID",
+        "mechanicus:fabricator-general",
+    ) in adapter.commands
     assert ("kill-pane", "-t", "%blank") in adapter.commands
 
 
 def test_stack_dispatch_creates_managed_worker_and_launches_command():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
         ]
     )
 
     pane = dispatch_stack_command(  # type: ignore[arg-type]
         adapter,
         "main",
-        "legion",
+        "mechanicus",
         "echo hello",
         cwd="/tmp",
         settle_seconds=0,
     )
 
     assert pane == "%N"
-    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "legion:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "mechanicus:1") in adapter.commands
     assert ("set-option", "-p", "-t", "%N", "@PANE_TYPE", "stack-worker") in adapter.commands
     assert ("send-keys", "-t", "%N", "echo hello", "Enter") in adapter.commands
 
@@ -279,55 +288,55 @@ def test_stack_dispatch_creates_managed_worker_and_launches_command():
 def test_stack_enforce_preserves_existing_numeric_worker_ids_with_gap():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t50\tclaude\tfalse",
-            "%1\tlegion:1\tstack-worker\t0\t81\t0\t80\t10\tclaude\tfalse",
-            "%5\tlegion:5\tstack-worker\t1\t81\t11\t80\t39\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t50\tclaude\tfalse",
+            "%1\tmechanicus:1\tstack-worker\t0\t81\t0\t80\t10\tclaude\tfalse",
+            "%5\tmechanicus:5\tstack-worker\t1\t81\t11\t80\t39\tclaude\tfalse",
         ]
     )
 
     enforce_stack_layout(adapter, "main:3")  # type: ignore[arg-type]
 
-    assert ("set-option", "-p", "-t", "%5", "@PANE_ID", "legion:2") not in adapter.commands
-    assert any(row.startswith("%5\tlegion:5\t") for row in adapter.rows or [])
+    assert ("set-option", "-p", "-t", "%5", "@PANE_ID", "mechanicus:2") not in adapter.commands
+    assert any(row.startswith("%5\tmechanicus:5\t") for row in adapter.rows or [])
 
 
 def test_stack_dispatch_reuses_lowest_available_worker_id():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
-            "%2\tlegion:2\tstack-worker\t0\t81\t0\t80\t10\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%2\tmechanicus:2\tstack-worker\t0\t81\t0\t80\t10\tclaude\tfalse",
         ]
     )
 
     dispatch_stack_command(  # type: ignore[arg-type]
         adapter,
         "main",
-        "legion",
+        "mechanicus",
         "echo hello",
         cwd="/tmp",
         settle_seconds=0,
     )
 
-    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "legion:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "mechanicus:1") in adapter.commands
 
 
 def test_stack_add_no_focus_allocates_worker_without_selecting_it():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
         ]
     )
 
     pane = add_stack_pane(  # type: ignore[arg-type]
         adapter,
         "main",
-        "legion",
+        "mechanicus",
         cwd="/tmp",
         focus=False,
     )
 
     assert pane == "%N"
-    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "legion:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "mechanicus:1") in adapter.commands
     assert ("set-option", "-p", "-t", "%N", "@PANE_TYPE", "stack-worker") in adapter.commands
     assert not any(
         command[0] == "select-pane" and "-T" not in command for command in adapter.commands
@@ -397,12 +406,12 @@ def test_stale_stored_stack_focus_falls_back_to_live_worker():
     ) in adapter.commands
 
 
-def test_mechanicus_admin_is_not_treated_as_worker_and_workers_are_numeric():
+def test_mechanicus_orchestrator_is_not_treated_as_worker_and_workers_are_numeric():
     adapter = FakeLegionAdapter(
         window_name="mechanicus",
         rows=[
             "%F\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t25\tclaude\tfalse",
-            "%A\tmechanicus:admin\tmechanicus\t0\t0\t26\t80\t24\tclaude\tfalse",
+            "%A\tmechanicus:orchestrator\tmechanicus\t0\t0\t26\t80\t24\tclaude\tfalse",
             "%W\tmechanicus:worker\tstack-worker\t1\t81\t0\t80\t42\tcodex\tfalse",
         ],
     )
@@ -413,7 +422,7 @@ def test_mechanicus_admin_is_not_treated_as_worker_and_workers_are_numeric():
     assert ("set-option", "-p", "-t", "%W", "@PANE_ID", "mechanicus:1") in adapter.commands
 
 
-def test_mechanicus_enforce_creates_admin_pane_when_missing():
+def test_mechanicus_enforce_creates_orchestrator_pane_when_missing():
     adapter = FakeLegionAdapter(
         window_name="mechanicus",
         rows=[
@@ -423,7 +432,14 @@ def test_mechanicus_enforce_creates_admin_pane_when_missing():
 
     enforce_stack_layout(adapter, "main:4")  # type: ignore[arg-type]
 
-    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "mechanicus:admin") in adapter.commands
+    assert (
+        "set-option",
+        "-p",
+        "-t",
+        "%N",
+        "@PANE_ID",
+        "mechanicus:orchestrator",
+    ) in adapter.commands
 
 
 def test_zoomed_stack_enforce_defers_structural_layout_mutations():
@@ -467,9 +483,9 @@ def test_zoomed_stack_sweep_noops_and_does_not_issue_focus_or_layout_commands():
 def test_selecting_already_focused_worker_does_not_reenforce():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t50\tclaude\tfalse",
-            "%1\tlegion:1\tstack-worker\t1\t81\t0\t80\t10\tclaude\tfalse",
-            "%2\tlegion:2\tstack-worker\t0\t81\t11\t80\t39\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t50\tclaude\tfalse",
+            "%1\tmechanicus:1\tstack-worker\t1\t81\t0\t80\t10\tclaude\tfalse",
+            "%2\tmechanicus:2\tstack-worker\t0\t81\t11\t80\t39\tclaude\tfalse",
         ]
     )
     adapter.window_options["@STACK_FOCUSED_PANE"] = "%1"
@@ -483,17 +499,17 @@ def test_selecting_already_focused_worker_does_not_reenforce():
 def test_adopt_joins_existing_pane_without_splitting_a_fresh_shell():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t25\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t25\tclaude\tfalse",
             # The durable Malcador seat is already present (builder creates it),
-            # so enforce docks rather than re-splits it. (Pax moved to koronus.)
-            "%M\tlegion:malcador\tlegion\t0\t0\t25\t80\t25\tclaude\tfalse",
+            # so enforce docks rather than re-splits it. (Pax moved to council.)
+            "%M\tmechanicus:orchestrator\tmechanicus\t0\t0\t25\t80\t25\tclaude\tfalse",
         ]
     )
 
     pane = add_stack_pane(  # type: ignore[arg-type]
         adapter,
         "main",
-        "legion",
+        "mechanicus",
         cwd="/tmp",
         focus=False,
         adopt_pane="%live",
@@ -508,7 +524,7 @@ def test_adopt_joins_existing_pane_without_splitting_a_fresh_shell():
         for command in adapter.commands
     )
     # The allocator tags it as the lowest free worker ordinal.
-    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "legion:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "mechanicus:1") in adapter.commands
     assert ("set-option", "-p", "-t", "%live", "@PANE_TYPE", "stack-worker") in adapter.commands
     # A live worker is never flagged pending (that would mark it for the reap).
     assert not any(
@@ -521,17 +537,17 @@ def test_adopt_joins_existing_pane_without_splitting_a_fresh_shell():
 def test_adopt_with_existing_workers_joins_vertically_onto_the_stack():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t25\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t25\tclaude\tfalse",
             # Durable Malcador seat present alongside the worker stack.
-            "%M\tlegion:malcador\tlegion\t0\t0\t25\t80\t25\tclaude\tfalse",
-            "%1\tlegion:1\tstack-worker\t1\t81\t0\t80\t10\tclaude\tfalse",
+            "%M\tmechanicus:orchestrator\tmechanicus\t0\t0\t25\t80\t25\tclaude\tfalse",
+            "%1\tmechanicus:1\tstack-worker\t1\t81\t0\t80\t10\tclaude\tfalse",
         ]
     )
 
     pane = add_stack_pane(  # type: ignore[arg-type]
         adapter,
         "main",
-        "legion",
+        "mechanicus",
         cwd="/tmp",
         focus=False,
         adopt_pane="%live",
@@ -550,8 +566,8 @@ def test_adopt_with_existing_workers_joins_vertically_onto_the_stack():
         "-l",
         str(STACK_COLLAPSED_HEIGHT),
     ) in adapter.commands
-    # Existing worker keeps legion:1; the adopted pane takes the next ordinal.
-    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "legion:2") in adapter.commands
+    # Existing worker keeps mechanicus:1; the adopted pane takes the next ordinal.
+    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "mechanicus:2") in adapter.commands
 
 
 def test_adopt_creates_legion_window_and_custodes_before_joining():
@@ -560,7 +576,7 @@ def test_adopt_creates_legion_window_and_custodes_before_joining():
     add_stack_pane(  # type: ignore[arg-type]
         adapter,
         "main",
-        "legion",
+        "mechanicus",
         cwd="/tmp",
         focus=False,
         adopt_pane="%live",
@@ -572,7 +588,8 @@ def test_adopt_creates_legion_window_and_custodes_before_joining():
     custodes_idx = next(
         i
         for i, command in enumerate(adapter.commands)
-        if command[:2] == ("set-option", "-p") and command[-2:] == ("@PANE_ID", "legion:custodes")
+        if command[:2] == ("set-option", "-p")
+        and command[-2:] == ("@PANE_ID", "mechanicus:fabricator-general")
     )
     join_idx = next(i for i, command in enumerate(adapter.commands) if command[0] == "join-pane")
 
@@ -585,7 +602,7 @@ def test_adopt_does_not_kill_the_live_pane_when_enforce_fails(monkeypatch):
 
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
         ]
     )
 
@@ -596,7 +613,7 @@ def test_adopt_does_not_kill_the_live_pane_when_enforce_fails(monkeypatch):
 
     with pytest.raises(OSError):
         stack_core.add_orchestrator_stack_pane(
-            adapter, "main", "legion", cwd="/tmp", focus=False, adopt_pane="%live"
+            adapter, "main", "mechanicus", cwd="/tmp", focus=False, adopt_pane="%live"
         )
 
     # The user's live agent must survive a post-join enforce failure.
@@ -607,14 +624,14 @@ def test_adopt_does_not_kill_the_live_pane_when_enforce_fails(monkeypatch):
 def test_adopt_no_focus_does_not_select_or_record_focused_pane():
     adapter = FakeLegionAdapter(
         rows=[
-            "%C\tlegion:custodes\tlegion\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
         ]
     )
 
     add_stack_pane(  # type: ignore[arg-type]
         adapter,
         "main",
-        "legion",
+        "mechanicus",
         cwd="/tmp",
         focus=False,
         adopt_pane="%live",
@@ -642,12 +659,12 @@ def test_adopt_rejected_for_non_orchestrator_stack():
         )
 
 
-def test_koronus_stack_uses_pax_left_column_and_worker_right_stack():
+def test_merged_stack_stack_uses_pax_left_column_and_worker_right_stack():
     adapter = FakeLegionAdapter(
-        window_name="koronus",
+        window_name="mechanicus",
         rows=[
-            "%P\tkoronus:pax\tkoronus\t0\t0\t0\t80\t50\tclaude",
-            "%1\tkoronus:worker\tstack-worker\t1\t81\t0\t80\t42\tclaude",
+            "%P\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t50\tclaude",
+            "%1\tmechanicus:worker\tstack-worker\t1\t81\t0\t80\t42\tclaude",
         ],
     )
 
@@ -659,55 +676,62 @@ def test_koronus_stack_uses_pax_left_column_and_worker_right_stack():
     assert adapter.window_options["@STACK_FOCUSED_PANE"] == "%1"
 
 
-def test_koronus_orchestrator_is_not_treated_as_worker_and_workers_are_numeric():
+def test_merged_stack_orchestrator_is_not_treated_as_worker_and_workers_are_numeric():
     adapter = FakeLegionAdapter(
-        window_name="koronus",
+        window_name="mechanicus",
         rows=[
-            "%P\tkoronus:pax\tkoronus\t0\t0\t0\t80\t25\tclaude\tfalse",
-            "%O\tkoronus:orchestrator\tkoronus\t0\t0\t26\t80\t24\tclaude\tfalse",
-            "%W\tkoronus:worker\tstack-worker\t1\t81\t0\t80\t42\tclaude\tfalse",
+            "%P\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t25\tclaude\tfalse",
+            "%O\tmechanicus:orchestrator\tmechanicus\t0\t0\t26\t80\t24\tclaude\tfalse",
+            "%W\tmechanicus:worker\tstack-worker\t1\t81\t0\t80\t42\tclaude\tfalse",
         ],
     )
 
     enforce_stack_layout(adapter, "main:5")  # type: ignore[arg-type]
 
     # The orchestrator seat is a secondary persona, never reclassified as a worker.
-    assert ("set-option", "-p", "-t", "%O", "@PANE_ID", "koronus:1") not in adapter.commands
-    assert ("set-option", "-p", "-t", "%W", "@PANE_ID", "koronus:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%O", "@PANE_ID", "mechanicus:1") not in adapter.commands
+    assert ("set-option", "-p", "-t", "%W", "@PANE_ID", "mechanicus:1") in adapter.commands
 
 
-def test_koronus_enforce_creates_orchestrator_pane_when_missing():
+def test_merged_stack_enforce_creates_orchestrator_pane_when_missing():
     adapter = FakeLegionAdapter(
-        window_name="koronus",
+        window_name="mechanicus",
         rows=[
-            "%P\tkoronus:pax\tkoronus\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%P\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
         ],
     )
 
     enforce_stack_layout(adapter, "main:5")  # type: ignore[arg-type]
 
-    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "koronus:orchestrator") in adapter.commands
+    assert (
+        "set-option",
+        "-p",
+        "-t",
+        "%N",
+        "@PANE_ID",
+        "mechanicus:orchestrator",
+    ) in adapter.commands
 
 
-def test_koronus_stack_dispatch_creates_managed_worker_and_launches_command():
+def test_merged_stack_stack_dispatch_creates_managed_worker_and_launches_command():
     adapter = FakeLegionAdapter(
-        window_name="koronus",
+        window_name="mechanicus",
         rows=[
-            "%P\tkoronus:pax\tkoronus\t1\t0\t0\t80\t50\tclaude\tfalse",
+            "%P\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
         ],
     )
 
     pane = dispatch_stack_command(  # type: ignore[arg-type]
         adapter,
         "main",
-        "koronus",
+        "mechanicus",
         "echo civic",
         cwd="/Volumes/Civic/Pax-ENV",
         settle_seconds=0,
     )
 
     assert pane == "%N"
-    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "koronus:1") in adapter.commands
+    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "mechanicus:1") in adapter.commands
     assert ("set-option", "-p", "-t", "%N", "@PANE_TYPE", "stack-worker") in adapter.commands
     assert ("send-keys", "-t", "%N", "echo civic", "Enter") in adapter.commands
 

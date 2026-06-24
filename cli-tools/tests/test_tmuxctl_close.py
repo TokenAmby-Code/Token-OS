@@ -14,7 +14,7 @@ from tmuxctl.tmux_adapter import TmuxAdapter
 
 
 class FakeCloseAdapter:
-    def __init__(self, *, role: str = "legion:worker", exists_count: int = 99) -> None:
+    def __init__(self, *, role: str = "mechanicus:worker", exists_count: int = 99) -> None:
         self.role = role
         self.exists_count = exists_count
         self.commands: list[tuple[str, ...]] = []
@@ -44,11 +44,11 @@ class FakeCloseAdapter:
             args[0] == "display-message"
             and args[-1] == "#{session_name}:#{window_index}\t#{window_name}"
         ):
-            return "main:3\tlegion\n"
+            return "main:3\tcouncil\n"
         if args[0] == "display-message" and args[-1] == "#{window_index}":
             return "3\n"
         if args[0] == "display-message" and args[-1] == "#{window_name}":
-            return "legion\n"
+            return "council\n"
         if args[0] == "display-message" and args[-1] == "#{window_width}":
             return "120\n"
         if args[0] == "display-message" and args[-1] == "#{window_height}":
@@ -56,14 +56,14 @@ class FakeCloseAdapter:
         if args[0] == "display-message" and args[-1] == "#{window_zoomed_flag}":
             return "0\n"
         if args[0] == "display-message" and args[-1] == "#{session_name}:#{window_name}":
-            return "main:legion\n"
+            return "main:council\n"
         if args[0] == "list-panes":
-            return "%C\tlegion:custodes\tlegion\t0\t0\t0\t80\t40\tclaude\tfalse\n"
+            return "%C\tcouncil:custodes\tcouncil\t0\t0\t0\t80\t40\tclaude\tfalse\n"
         return ""
 
 
 def test_close_pane_refuses_protected_static_persona_panes():
-    adapter = FakeCloseAdapter(role="legion:custodes")
+    adapter = FakeCloseAdapter(role="council:custodes")
 
     result = close_pane(adapter, "%9")
 

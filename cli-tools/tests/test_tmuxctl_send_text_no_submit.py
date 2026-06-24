@@ -40,18 +40,18 @@ def _run(argv: list[str], assertion: dict | None = None):
 
 def test_no_submit_routes_to_insert_only_never_submits():
     rc, control = _run(
-        ["send-text", "--pane", "legion:custodes", "--text", "draft body", "--no-submit"]
+        ["send-text", "--pane", "council:custodes", "--text", "draft body", "--no-submit"]
     )
 
     assert rc == 0
     # Insert-only: the draft goes through insert_text (no C-m) ...
-    control.insert_text.assert_called_once_with("legion:custodes", "draft body")
+    control.insert_text.assert_called_once_with("council:custodes", "draft body")
     # ... and the auto-submitting primitive is NEVER touched.
     control.adapter.send_text_then_submit.assert_not_called()
 
 
 def test_default_send_text_still_submits():
-    rc, control = _run(["send-text", "--pane", "legion:custodes", "--text", "go now"])
+    rc, control = _run(["send-text", "--pane", "council:custodes", "--text", "go now"])
 
     assert rc == 0
     control.adapter.send_text_then_submit.assert_called_once()
@@ -65,7 +65,7 @@ def test_no_submit_is_mutually_exclusive_with_clear_prompt():
         [
             "send-text",
             "--pane",
-            "legion:custodes",
+            "council:custodes",
             "--text",
             "x",
             "--no-submit",

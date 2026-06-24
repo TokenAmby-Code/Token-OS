@@ -19,7 +19,7 @@ from tmuxctl.stack import _is_token_pane, reconcile_token_valued_panes
 
 def test_is_token_pane_distinguishes_tokens_from_concrete_panes():
     assert _is_token_pane("mechanicus:new")
-    assert _is_token_pane("legion:new")
+    assert _is_token_pane("mechanicus:new")
     assert not _is_token_pane("%16")
     assert not _is_token_pane("%0")
     assert not _is_token_pane("")
@@ -37,7 +37,7 @@ def test_reconcile_rebinds_token_pane_by_pid_and_skips_the_rest():
         # token but stopped (not live) -> skip
         {"id": "dead", "tmux_pane": "mechanicus:new", "status": "stopped", "pid": 4296},
         # token + live but pid not in any pane subtree -> skip
-        {"id": "orphan", "tmux_pane": "legion:new", "status": "processing", "pid": 7777},
+        {"id": "orphan", "tmux_pane": "mechanicus:new", "status": "processing", "pid": 7777},
     ]
     calls: list[tuple[str, str]] = []
     rebinds = reconcile_token_valued_panes(

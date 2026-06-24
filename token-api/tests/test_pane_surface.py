@@ -91,9 +91,9 @@ def test_golden_throne_human_surface_dynamic_workspace_uses_name(app_env):
         app_env.main._golden_throne_human_surface(
             "custodes-cascade-intervention",
             "%102",
-            "legion:custodes",
+            "council:custodes",
         )
-        == "legion:custodes custodes-cascade-intervention"
+        == "council:custodes custodes-cascade-intervention"
     )
 
 
@@ -113,15 +113,15 @@ def test_human_surface_rejects_embedded_raw_tmux_label(app_env) -> None:
 
 def test_golden_throne_human_surface_dynamic_workspace_uses_public_label(app_env):
     assert (
-        app_env.main._golden_throne_human_surface("Claude 08:14", "%210", "legion:aspirant")
-        == "legion:aspirant"
+        app_env.main._golden_throne_human_surface("Claude 08:14", "%210", "mechanicus:aspirant")
+        == "mechanicus:aspirant"
     )
 
 
 def test_golden_throne_surface_does_not_embed_raw_tmux(app_env):
     assert (
-        app_env.main._golden_throne_surface("Claude 08:14", "%210", "legion:aspirant")
-        == "legion:aspirant"
+        app_env.main._golden_throne_surface("Claude 08:14", "%210", "mechanicus:aspirant")
+        == "mechanicus:aspirant"
     )
     assert app_env.main._golden_throne_surface("Claude 08:14", "%210", None) == "session"
 

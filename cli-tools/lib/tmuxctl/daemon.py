@@ -449,12 +449,12 @@ def _h_stack_sweep(control, params):
     )
 
 
-def _h_legion_focus_selected(control, params):
-    return control.legion_focus_selected(_s(params, "pane", "current"))
+def _h_mechanicus_focus_selected(control, params):
+    return control.mechanicus_focus_selected(_s(params, "pane", "current"))
 
 
-def _h_legion_enforce(control, params):
-    return control.legion_enforce(_s(params, "pane", "current"))
+def _h_mechanicus_enforce(control, params):
+    return control.mechanicus_enforce(_s(params, "pane", "current"))
 
 
 def _h_normalize(control, params):
@@ -622,8 +622,8 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/stack/adopt"): _h_stack_adopt,
     ("POST", "/stack/enforce"): _h_stack_enforce,
     ("POST", "/stack/sweep"): _h_stack_sweep,
-    ("POST", "/legion/focus-selected"): _h_legion_focus_selected,
-    ("POST", "/legion/enforce"): _h_legion_enforce,
+    ("POST", "/mechanicus/focus-selected"): _h_mechanicus_focus_selected,
+    ("POST", "/mechanicus/enforce"): _h_mechanicus_enforce,
     ("POST", "/normalize"): _h_normalize,
     ("POST", "/focus"): _h_focus,
     ("POST", "/pane-select"): _h_pane_select,

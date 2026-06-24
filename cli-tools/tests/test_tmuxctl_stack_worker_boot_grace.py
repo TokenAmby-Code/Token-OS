@@ -42,7 +42,7 @@ class FakeAdapter:
 def _worker_row(created_at: str, **kw):
     base = dict(
         instance_id="i-worker",
-        pane_label="legion:1",
+        pane_label="mechanicus:1",
         created_at=created_at,
     )
     base.update(kw)
@@ -153,7 +153,7 @@ def test_build_snapshot_carries_created_at() -> None:
             {
                 "id": "i-c",
                 "device_id": "Mac-Mini",
-                "pane_label": "legion:1",
+                "pane_label": "mechanicus:1",
                 "status": "working",
                 "created_at": "2026-06-15T12:00:00",
             }

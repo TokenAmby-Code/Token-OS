@@ -8,16 +8,16 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 AUDIT = ROOT / "bin" / "tmux-audit"
 
 # list-panes -F is "#{pane_id}\t#{pane_current_command}\t#{@PANE_TYPE}\t#{@PANE_ID}"
-LEGION_ROWS = "\n".join(
+STACK_ROWS = "\n".join(
     [
-        # Custodes idle at a shell prompt — protected by @PANE_TYPE=legion.
-        "%C\tzsh\tlegion\tlegion:custodes",
+        # Fabricator-General idle at a shell prompt — protected by @PANE_TYPE=mechanicus.
+        "%C\tzsh\tmechanicus\tmechanicus:fabricator-general",
         # A demoted live agent — a stack-worker, but running claude, never idle.
-        "%live\tclaude\tstack-worker\tlegion:1",
+        "%live\tclaude\tstack-worker\tmechanicus:1",
         # An untyped grid pane that wandered in — not an explicit stack-worker.
         "%grid\tzsh\t\tpalace:N",
         # A genuinely blank pending worker — the only legitimate cull target.
-        "%idle\tzsh\tstack-worker\tlegion:2",
+        "%idle\tzsh\tstack-worker\tmechanicus:2",
     ]
 )
 
@@ -27,7 +27,7 @@ case "$1" in
   list-panes)
     tgt=""
     while [[ $# -gt 0 ]]; do [[ "$1" == "-t" ]] && tgt="$2"; shift; done
-    [[ "$tgt" == *legion* ]] && printf '%s\\n' "$LEGION_ROWS"
+    [[ "$tgt" == *mechanicus* ]] && printf '%s\\n' "$STACK_ROWS"
     exit 0 ;;
   kill-pane)
     while [[ $# -gt 0 ]]; do [[ "$1" == "-t" ]] && echo "$2" >> "$KILL_LOG"; shift; done
@@ -49,7 +49,7 @@ def _run_backburner(tmp_path: pathlib.Path) -> list[str]:
 
     env = dict(os.environ)
     env["PATH"] = f"{fake_dir}:{env['PATH']}"
-    env["LEGION_ROWS"] = LEGION_ROWS
+    env["STACK_ROWS"] = STACK_ROWS
     env["KILL_LOG"] = str(kill_log)
     # Keep the audit's debounce stamp out of the shared /tmp location.
     env["TMUX_AUDIT_STAMP_FILE"] = str(stamp)
@@ -67,10 +67,10 @@ def _run_backburner(tmp_path: pathlib.Path) -> list[str]:
     return [line for line in kill_log.read_text().splitlines() if line]
 
 
-def test_backburner_never_culls_custodes_or_non_stack_workers(tmp_path):
+def test_backburner_never_culls_fabricator_or_non_stack_workers(tmp_path):
     killed = _run_backburner(tmp_path)
 
-    assert "%C" not in killed  # Custodes orchestrator
+    assert "%C" not in killed  # Fabricator-General anchor
     assert "%live" not in killed  # demoted live agent
     assert "%grid" not in killed  # untyped grid pane
 
