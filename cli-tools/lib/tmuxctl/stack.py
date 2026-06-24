@@ -2,7 +2,7 @@
 
 Stack windows hold a vertical list of worker panes. Pane 1 of each stack window
 is the orchestrator anchor (fabricator-general for mechanicus); panes 2..N are
-workers added by dispatch. The legion + koronus stacks retired into this single
+workers added by dispatch. The per-fleet legion and civic stacks retired into this single
 shared worker floor — fleets share the physical stack but stay logically
 separate (the split is token-api's view via the commander stamp, never tmux).
 

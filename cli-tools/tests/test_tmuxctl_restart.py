@@ -568,11 +568,10 @@ def test_builder_creates_canonical_workspace_roles():
     assert roles["main:council.3"] == "council:malcador"
     assert roles["main:council.4"] == "council:true-terminal"
     assert roles["main:council.5"] == "council:administratum"
-    # The legion and koronus pages are retired.
-    assert "legion" not in adapter.windows["main"]
-    assert "koronus" not in adapter.windows["main"]
+    # The retired per-fleet stack pages are gone (enforced by the exact window-list
+    # equality above).
     # Mechanicus seats the Fabricator-General (.1) over the orchestrator (.2); the
-    # admin seat moved to council, the orchestrator moved in from the retired koronus.
+    # admin seat moved to council, the orchestrator docked in as the secondary persona.
     assert roles["main:mechanicus.1"] == "mechanicus:fabricator-general"
     assert roles["main:mechanicus.2"] == "mechanicus:orchestrator"
     assert roles["main:reservists.1"] == "reservists:civic"
@@ -655,7 +654,7 @@ def test_build_council_window_seats_five_personas_in_cardinal_positions() -> Non
 def test_build_mechanicus_window_seats_fabricator_over_orchestrator() -> None:
     # Mechanicus seats the Fabricator-General (.1) over the orchestrator (.2), both
     # tagged @PANE_TYPE mechanicus. The admin seat moved to council; the orchestrator
-    # moved in from the retired koronus page.
+    # docked in as the secondary persona under the Fabricator-General.
     adapter = FakeBuilderAdapter()
     adapter.sessions.add("main")
     adapter.windows["main"] = []

@@ -136,27 +136,29 @@ def test_add_stack_pane_kills_new_worker_when_layout_fails(monkeypatch):
     monkeypatch.setattr(stack_core, "enforce_stack_layout", _boom)
 
     with pytest.raises(OSError):
-        stack_core.add_orchestrator_stack_pane(adapter, "main", "mechanicus", cwd="/tmp", focus=False)
+        stack_core.add_orchestrator_stack_pane(
+            adapter, "main", "mechanicus", cwd="/tmp", focus=False
+        )
 
     assert any(command[0] == "kill-pane" and "%N" in command for command in adapter.commands)
     assert not any(row.startswith("%N\t") for row in adapter.rows or [])
 
 
-def test_selecting_custodes_does_not_resize_legion():
+def test_selecting_orchestrator_anchor_does_not_resize_stack():
     adapter = FakeLegionAdapter()
 
     result = focus_selected(adapter, "%C")  # type: ignore[arg-type]
 
-    assert result.endswith(": custodes")
+    assert result.endswith(": orchestrator")
     assert not any(command[0] == "resize-pane" for command in adapter.commands)
 
 
-def test_selecting_custodes_is_noop_even_when_window_zoomed():
+def test_selecting_orchestrator_anchor_is_noop_even_when_window_zoomed():
     adapter = FakeLegionAdapter(zoomed=True)
 
     result = focus_selected(adapter, "%C")  # type: ignore[arg-type]
 
-    assert result.endswith(": custodes")
+    assert result.endswith(": orchestrator")
     assert not any(command[0] == "resize-pane" for command in adapter.commands)
     assert adapter.zoomed is True
 
@@ -250,7 +252,14 @@ def test_blank_orchestrator_tag_is_moved_to_single_untyped_live_pane():
     result = enforce_stack_layout(adapter, "main:3")  # type: ignore[arg-type]
 
     assert result == "normalized stack layout main:3: orchestrator only"
-    assert ("set-option", "-p", "-t", "%live", "@PANE_ID", "mechanicus:fabricator-general") in adapter.commands
+    assert (
+        "set-option",
+        "-p",
+        "-t",
+        "%live",
+        "@PANE_ID",
+        "mechanicus:fabricator-general",
+    ) in adapter.commands
     assert ("kill-pane", "-t", "%blank") in adapter.commands
 
 
@@ -397,12 +406,12 @@ def test_stale_stored_stack_focus_falls_back_to_live_worker():
     ) in adapter.commands
 
 
-def test_mechanicus_admin_is_not_treated_as_worker_and_workers_are_numeric():
+def test_mechanicus_orchestrator_is_not_treated_as_worker_and_workers_are_numeric():
     adapter = FakeLegionAdapter(
         window_name="mechanicus",
         rows=[
             "%F\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t25\tclaude\tfalse",
-            "%A\tcouncil:administratum\tmechanicus\t0\t0\t26\t80\t24\tclaude\tfalse",
+            "%A\tmechanicus:orchestrator\tmechanicus\t0\t0\t26\t80\t24\tclaude\tfalse",
             "%W\tmechanicus:worker\tstack-worker\t1\t81\t0\t80\t42\tcodex\tfalse",
         ],
     )
@@ -413,7 +422,7 @@ def test_mechanicus_admin_is_not_treated_as_worker_and_workers_are_numeric():
     assert ("set-option", "-p", "-t", "%W", "@PANE_ID", "mechanicus:1") in adapter.commands
 
 
-def test_mechanicus_enforce_creates_admin_pane_when_missing():
+def test_mechanicus_enforce_creates_orchestrator_pane_when_missing():
     adapter = FakeLegionAdapter(
         window_name="mechanicus",
         rows=[
@@ -423,7 +432,14 @@ def test_mechanicus_enforce_creates_admin_pane_when_missing():
 
     enforce_stack_layout(adapter, "main:4")  # type: ignore[arg-type]
 
-    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "council:administratum") in adapter.commands
+    assert (
+        "set-option",
+        "-p",
+        "-t",
+        "%N",
+        "@PANE_ID",
+        "mechanicus:orchestrator",
+    ) in adapter.commands
 
 
 def test_zoomed_stack_enforce_defers_structural_layout_mutations():
@@ -572,7 +588,8 @@ def test_adopt_creates_legion_window_and_custodes_before_joining():
     custodes_idx = next(
         i
         for i, command in enumerate(adapter.commands)
-        if command[:2] == ("set-option", "-p") and command[-2:] == ("@PANE_ID", "mechanicus:fabricator-general")
+        if command[:2] == ("set-option", "-p")
+        and command[-2:] == ("@PANE_ID", "mechanicus:fabricator-general")
     )
     join_idx = next(i for i, command in enumerate(adapter.commands) if command[0] == "join-pane")
 
@@ -686,7 +703,14 @@ def test_merged_stack_enforce_creates_orchestrator_pane_when_missing():
 
     enforce_stack_layout(adapter, "main:5")  # type: ignore[arg-type]
 
-    assert ("set-option", "-p", "-t", "%N", "@PANE_ID", "mechanicus:orchestrator") in adapter.commands
+    assert (
+        "set-option",
+        "-p",
+        "-t",
+        "%N",
+        "@PANE_ID",
+        "mechanicus:orchestrator",
+    ) in adapter.commands
 
 
 def test_merged_stack_stack_dispatch_creates_managed_worker_and_launches_command():

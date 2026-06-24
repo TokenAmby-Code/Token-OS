@@ -66,7 +66,7 @@ fi
 
 # ============================================================
 # ASSERTION: backburner
-# No extra idle shells in stack windows. The first legion/mechanicus panes are
+# No extra idle shells in stack windows. The first mechanicus panes are
 # orchestrator slots, not synthetic backstops; when promoted, those slots should
 # be occupied by tombstones.
 # ============================================================
@@ -87,15 +87,15 @@ assert_backburner() {
     is_protected_slot() {
         local ptype="$1" label="$2"
         case "$ptype" in
-            legion|mechanicus|tombstone) return 0 ;;
+            mechanicus|council|tombstone) return 0 ;;
         esac
         case "$label" in
-            council:custodes|mechanicus:fabricator-general|council:administratum) return 0 ;;
+            council:custodes|mechanicus:fabricator-general|mechanicus:orchestrator) return 0 ;;
         esac
         return 1
     }
 
-    for win in legion mechanicus mars kreig; do
+    for win in mechanicus mars kreig; do
         local pane_data
         pane_data=$(tmux list-panes -t "${SESSION}:${win}" \
             -F '#{pane_id}	#{pane_current_command}	#{@PANE_TYPE}	#{@PANE_ID}' 2>/dev/null) || continue

@@ -736,8 +736,8 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
         )
     if spec.persona in {"pax", "orchestrator"}:
         # Civic singleton panes share the `civic` legion with generic Pax-ENV
-        # workers, so legion is not identity. The stable identity is the koronus
-        # pane label plus persona/primarch, with overseer rank when surfaced.
+        # workers, so legion is not identity. The stable identity is the council/
+        # mechanicus pane label plus persona/primarch, with overseer rank when surfaced.
         rank = (getattr(row, "rank", "") or "").strip().lower()
         return (
             row.pane_label == spec.pane_label

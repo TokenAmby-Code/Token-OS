@@ -55,7 +55,7 @@ tmux_is_valid_pane_slot() {
         somnium:NW|somnium:SW|somnium:NE|somnium:SE|somnium:EE) return 0 ;;
         palace:SL|palace:TL|palace:BL|palace:TR|palace:BR|palace:SR) return 0 ;;
         somnium:TL|somnium:BL|somnium:TR|somnium:BR|somnium:SR) return 0 ;;
-        mechanicus:*|mars:*|kreig:*|legion:*) return 0 ;;
+        mechanicus:*|mars:*|kreig:*|council:*|reservists:*) return 0 ;;
         *) return 1 ;;
     esac
 }

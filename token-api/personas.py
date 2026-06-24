@@ -174,12 +174,12 @@ BLACK_SHIELDS = PersonaSeed(
     None,
 )
 
-# Civic worker persona for the koronus/pax-stack worker agents (the right-side
-# stack), analogous to how mechanicus workers are astartes. ``astartes`` rank so
-# it is resolvable like a chapter, but with NO assignment pool so it never enters
-# the rotating Astartes auto-assignment — koronus workers resolve it by slug. It
-# only applies while ON the koronus page; a civic worker started off-page falls
-# through to the normal astartes assignment instead.
+# Civic worker persona for the civic Pax-ENV worker agents, analogous to how
+# mechanicus workers are astartes. ``astartes`` rank so it is resolvable like a
+# chapter, but with NO assignment pool so it never enters the rotating Astartes
+# auto-assignment — civic workers resolve it by slug. It only applies in a civic
+# worker context; a civic worker started without that context falls through to the
+# normal astartes assignment instead.
 CIVIC_WORKER_PERSONAS: tuple[PersonaSeed, ...] = (
     PersonaSeed(
         "agentic-worker",

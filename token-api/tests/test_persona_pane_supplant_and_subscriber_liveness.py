@@ -234,7 +234,7 @@ def test_custodes_pane_assigns_reserved_george_profile(app_env, monkeypatch):
     from shared import CUSTODES_PROFILE
 
     async def custodes_label(_pane):
-        return hooks.CUSTODES_PANE_LABEL  # "council:custodes"
+        return hooks.COUNCIL_CUSTODES_LABEL  # "council:custodes"
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", custodes_label)
 

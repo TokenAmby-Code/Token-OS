@@ -323,7 +323,7 @@ class CronEngine:
             return
         # Surface only panes the sweep genuinely acted on or found unhealthy WHILE
         # PRESENT — a clean sweep stays quiet. An absent persona pane (resolve
-        # failure -> action="error", e.g. koronus seats that aren't always seated)
+        # failure -> action="error", e.g. council seats that aren't always seated)
         # is the expected, uninteresting state and is excluded so it can't spam the
         # log every interval; run `tmuxctl assert-personas` manually to see those.
         out = (stdout or b"").decode("utf-8", errors="replace").strip()

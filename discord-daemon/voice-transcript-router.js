@@ -1,7 +1,7 @@
 // voice-transcript-router.js — route Discord voice transcripts directly to tmux.
 //
 // The routing source of truth for persona panes is tmux, not Token API:
-//   custodes       -> tmuxctl public target 3:0 (legion:custodes)
+//   custodes       -> tmuxctl public target 3:0 (council:custodes)
 //   mechanicus     -> tmuxctl public target 4:0 (mechanicus:fabricator-general)
 //   imperial_guard -> daemon-locked live pane converted to a tmuxctl public target
 //
@@ -144,8 +144,8 @@ function paneExists(pane, execSync = execFileSync) {
 
 function staticTargetSpec(target) {
   const raw = String(target || '').trim();
-  if (raw === '3:0' || raw === 'legion:custodes') {
-    return { target: raw, windowIndex: '3', marker: 'legion:custodes' };
+  if (raw === '3:0' || raw === 'council:custodes') {
+    return { target: raw, windowIndex: '3', marker: 'council:custodes' };
   }
   if (raw === '4:0' || raw === 'mechanicus:fabricator-general') {
     return { target: raw, windowIndex: '4', marker: 'mechanicus:fabricator-general' };

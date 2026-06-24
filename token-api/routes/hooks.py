@@ -421,11 +421,11 @@ _self_eval_pending: dict[str, float] = {}  # session_id -> timestamp of block
 SELF_EVAL_TTL_SECONDS = 120  # expire stale blocks after 2 minutes
 
 MECHANICUS_FG_LABEL = "mechanicus:fabricator-general"
-MECHANICUS_ADMIN_LABEL = "council:administratum"
-CUSTODES_PANE_LABEL = "council:custodes"
-LEGION_MALCADOR_LABEL = "council:malcador"
-KORONUS_PAX_LABEL = "council:pax"
-KORONUS_ORCHESTRATOR_LABEL = "mechanicus:orchestrator"
+MECHANICUS_ORCHESTRATOR_LABEL = "mechanicus:orchestrator"
+COUNCIL_CUSTODES_LABEL = "council:custodes"
+COUNCIL_MALCADOR_LABEL = "council:malcador"
+COUNCIL_PAX_LABEL = "council:pax"
+COUNCIL_ADMINISTRATUM_LABEL = "council:administratum"
 
 # Persona/orchestrator singleton panes → canonical DB identity. tmuxctl stamps a
 # stable @PANE_ID on each of these panes; a fresh SessionStart inside one IS that
@@ -440,7 +440,7 @@ KORONUS_ORCHESTRATOR_LABEL = "mechanicus:orchestrator"
 # are not personas and resolve their legion from dispatch env / working-dir
 # auto-detect, not from a fixed identity.
 PERSONA_PANE_IDENTITY: dict[str, dict] = {
-    CUSTODES_PANE_LABEL: {
+    COUNCIL_CUSTODES_LABEL: {
         "legion": "custodes",
         "primarch": "custodes",
         # Custodes identity is persona + rank (resolve_live_persona_instance), not
@@ -460,7 +460,7 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         "instance_type": "hook_driven",
         "synced": False,
     },
-    MECHANICUS_ADMIN_LABEL: {
+    COUNCIL_ADMINISTRATUM_LABEL: {
         # Administratum has no dedicated legion; it registers under the shared
         # mechanicus legion. Its load-bearing resolution key is primarch (token-api
         # _resolve_administratum_instance keys on primarch='administratum').
@@ -469,7 +469,7 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         "instance_type": "hook_driven",
         "synced": False,
     },
-    LEGION_MALCADOR_LABEL: {
+    COUNCIL_MALCADOR_LABEL: {
         # Malcador (advisor seat) shares the astartes legion with regiment workers,
         # so legion cannot identify it — its load-bearing key is primarch='malcador'
         # (personas seed default_rank='primarch'; tmuxctl
@@ -480,15 +480,15 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         "instance_type": "hook_driven",
         "synced": False,
     },
-    KORONUS_PAX_LABEL: {
-        # Pax (civic overseer seat on the koronus page — the combined
+    COUNCIL_PAX_LABEL: {
+        # Pax (civic overseer seat on the council page — the combined
         # Custodes+Administratum interaction/record-keeper seat) registers under
         # the shared `civic` legion (an ALLOWED_LEGION), so legion cannot identify
         # it — its load-bearing key is primarch='pax'. That resolves to the `pax`
         # personas row (default_rank='overseer'), and the rank-stamp trigger
         # promotes the freshly inserted row off the 'astartes' column default. A
         # fresh SessionStart in this pane IS Pax: Emperor-commanded, never a
-        # chapter child. The civic identity is keyed strictly on this koronus pane
+        # chapter child. The civic identity is keyed strictly on this council pane
         # label, so a pax pane promoted to palace/somnium gets no entry here and
         # falls through to the normal astartes registration. Never sync.
         "legion": "civic",
@@ -496,14 +496,14 @@ PERSONA_PANE_IDENTITY: dict[str, dict] = {
         "instance_type": "hook_driven",
         "synced": False,
     },
-    KORONUS_ORCHESTRATOR_LABEL: {
-        # Orchestrator (civic dispatch seat on the koronus page — the role the
-        # Fabricator-General plays for mechanicus). Shares the `civic` legion with
-        # pax, so legion cannot identify it — its load-bearing key is
-        # primarch='orchestrator', which resolves to the `orchestrator` personas
-        # row (default_rank='overseer'). Like pax, the civic identity applies only
-        # while ON the koronus page (resolved from this pane label); started
-        # elsewhere it falls through to the astartes default. Never sync.
+    MECHANICUS_ORCHESTRATOR_LABEL: {
+        # Orchestrator (civic dispatch seat docked under the Fabricator-General on
+        # the mechanicus page — the role the FG plays for mechanicus). Shares the
+        # `civic` legion with pax, so legion cannot identify it — its load-bearing
+        # key is primarch='orchestrator', which resolves to the `orchestrator`
+        # personas row (default_rank='overseer'). Like pax, the civic identity
+        # applies only while ON this docked seat (resolved from this pane label);
+        # started elsewhere it falls through to the astartes default. Never sync.
         "legion": "civic",
         "primarch": "orchestrator",
         "instance_type": "hook_driven",
@@ -669,8 +669,8 @@ async def _apply_commander_binding(
     target = (_normalize_text(dispatch_target) or "").lower()
     commander_slug = None
     if target == "mechanicus:new":
-        commander_slug = "custodes"
-    elif target == "mechanicus:new":
+        # Mechanicus is the single merged worker stack; the Fabricator-General
+        # anchors it and commands every freshly dispatched worker.
         commander_slug = "fabricator-general"
     if not commander_slug:
         return
@@ -1265,7 +1265,7 @@ def _is_mechanicus_worker_label(label: str | None) -> bool:
     label = _normalize_text(label)
     if not label:
         return False
-    if label in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL}:
+    if label in {MECHANICUS_FG_LABEL, MECHANICUS_ORCHESTRATOR_LABEL}:
         return False
     prefix, _, suffix = label.partition(":")
     if prefix != "mechanicus":
@@ -1282,7 +1282,7 @@ def _is_mechanicus_stack_window(value: str | None) -> bool:
 
 def _is_mechanicus_worker_row(row: dict) -> bool:
     label = row.get("effective_pane_label")
-    if label in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL}:
+    if label in {MECHANICUS_FG_LABEL, MECHANICUS_ORCHESTRATOR_LABEL}:
         return False
     if _is_mechanicus_worker_label(label):
         return True
@@ -1386,7 +1386,10 @@ async def _reconcile_mechanicus_stop_subscriptions(
             counts["skipped"] += 1
             skipped.append({"instance_id": target_id, "reason": "missing_target"})
             continue
-        if target_id == fg.get("id") or label in {MECHANICUS_FG_LABEL, MECHANICUS_ADMIN_LABEL}:
+        if target_id == fg.get("id") or label in {
+            MECHANICUS_FG_LABEL,
+            MECHANICUS_ORCHESTRATOR_LABEL,
+        }:
             counts["skipped"] += 1
             skipped.append({"instance_id": target_id, "pane_label": label, "reason": "persona"})
             continue
@@ -1827,9 +1830,9 @@ async def _tmux_pane_stack_window(pane: str | None) -> str | None:
         return None
     if pane_type == "stack-worker":
         return window_target
-    if pane_role in {"mechanicus:worker", "mechanicus:regiment", "mechanicus:worker"}:
+    if pane_role == "mechanicus:worker":
         return window_target
-    if re.fullmatch(r"(legion|mechanicus):[1-9]\d*", pane_role or ""):
+    if re.fullmatch(r"mechanicus:[1-9]\d*", pane_role or ""):
         return window_target
     return None
 

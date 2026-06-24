@@ -83,9 +83,9 @@ async def test_broadcast_temp_message_selector_grammar(
                 "instance_id": "codex-1",
             },
             "%3": {
-                "tmux_session": "legion",
-                "tmux_window": "SW",
-                "tmux_session_window": "legion:SW",
+                "tmux_session": "mechanicus",
+                "tmux_window": "1",
+                "tmux_session_window": "mechanicus:1",
                 "instance_id": "claude-2",
             },
         }

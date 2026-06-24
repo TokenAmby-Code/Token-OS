@@ -131,7 +131,7 @@ def test_malcador_pane_registers_with_primarch_identity(
     assert row["commander_type"] == "emperor"
 
 
-# ── Pax: the civic overseer seat on the koronus page ───────────────────────────
+# ── Pax: the civic overseer seat on the council page ───────────────────────────
 
 
 def test_pax_pane_registers_with_overseer_identity(
@@ -197,10 +197,10 @@ def test_orchestrator_pane_registers_with_overseer_identity(
     assert row["commander_type"] == "emperor"
 
 
-def test_pax_pane_off_koronus_page_falls_back_to_astartes(
+def test_pax_pane_off_council_page_falls_back_to_astartes(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Off-page fallback: a civic seat promoted to palace/somnium (or any non-koronus
+    # Off-page fallback: a civic seat promoted to palace/somnium (or any non-council
     # pane) has no PERSONA_PANE_IDENTITY entry, so it must NOT register as the pax
     # overseer singleton. It falls through to a normal astartes registration so it
     # obeys the standard tint + TTS rules.

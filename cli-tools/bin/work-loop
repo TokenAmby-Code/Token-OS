@@ -10,7 +10,7 @@
 #   work-loop complete [options]                   # Wrap up: merge, cleanup, exit
 #   work-loop status                               # Show active work-loop panes
 #
-# Dispatch creates a managed legion worker pane through tmuxctl, launches Claude
+# Dispatch creates a managed mechanicus worker pane through tmuxctl, launches Claude
 # in the vault, and briefs it to create a worktree, transplant, and work
 # autonomously. Callable from any instance, voice injection, or directly.
 #
@@ -53,27 +53,27 @@ log_dry()     { echo -e "${CYAN}~${NC} $1" >&2; }
 # --- Vault path ---
 VAULT_DIR="${IMPERIUM}/Imperium-ENV"
 
-# --- Managed legion worker pane allocation ---
-# Create a new managed legion worker pane. Returns the new pane ID.
+# --- Managed mechanicus worker pane allocation ---
+# Create a new managed mechanicus worker pane. Returns the new pane ID.
 create_workloop_pane() {
     local session="${1:-main}"
     local new_pane
-    new_pane=$("${_LIB_DIR}/../bin/tmuxctl" stack add legion --session "$session" --cwd "$HOME" 2>/dev/null || true)
+    new_pane=$("${_LIB_DIR}/../bin/tmuxctl" stack add mechanicus --session "$session" --cwd "$HOME" 2>/dev/null || true)
     if [[ -z "$new_pane" ]]; then
-        log_error "Could not allocate managed legion worker pane"
+        log_error "Could not allocate managed mechanicus worker pane"
         return 1
     fi
     tmux set-option -p -t "$new_pane" @WORK_LOOP "true" 2>/dev/null || true
     echo "$new_pane"
 }
 
-# List work-loop panes in the managed legion worker stack.
+# List work-loop panes in the managed mechanicus worker stack.
 list_workloop_panes() {
     local session="${1:-main}"
     local panes=()
 
     while IFS=$'	' read -r pane_id work_loop cmd window_name pane_role; do
-        [[ "${window_name%%(*}" == "legion" ]] || continue
+        [[ "${window_name%%(*}" == "mechanicus" ]] || continue
         [[ "$pane_role" == "mechanicus:worker" ]] || continue
         [[ "$work_loop" == "true" ]] || continue
         panes+=("$pane_id")
@@ -136,7 +136,7 @@ You are dispatched into the work loop. Your mission:
 IMPORTANT:
 - Do NOT use TTS
 - Do NOT block on AskUserQuestion — make judgment calls instead
-- You are running in a managed legion worker pane — this is autonomous background work
+- You are running in a managed mechanicus worker pane — this is autonomous background work
 - Your zealotry level is ${zealotry} (1=minimal follow-up, 5=aggressive)
 PROMPT
 
@@ -221,11 +221,11 @@ do_dispatch() {
     if [[ -z "$target_pane" ]]; then
         target_pane=$(create_workloop_pane "$tmux_session")
         if [[ -z "$target_pane" ]]; then
-            log_error "Could not create managed legion worker pane"
+            log_error "Could not create managed mechanicus worker pane"
             exit 1
         fi
         created_managed_pane=true
-        log_success "Created managed legion worker pane: $target_pane"
+        log_success "Created managed mechanicus worker pane: $target_pane"
     else
         if ! tmux display-message -t "$target_pane" -p '#{pane_id}' &>/dev/null; then
             log_error "Pane not found: $target_pane"
@@ -449,9 +449,9 @@ do_status() {
 
     local found=false
 
-    # Check managed legion workers for work-loop metadata.
+    # Check managed mechanicus workers for work-loop metadata.
     while IFS=$'\t' read -r pane_id work_loop cmd window_name pane_role; do
-        [[ "${window_name%%(*}" == "legion" ]] || continue
+        [[ "${window_name%%(*}" == "mechanicus" ]] || continue
         [[ "$pane_role" == "mechanicus:worker" ]] || continue
 
         local session_doc branch project dispatched
@@ -508,7 +508,7 @@ Usage:
 Dispatch Options:
   --branch <name>       Branch name (default: derived from session doc filename)
   --project <name>      Project config (default: auto-detected from vault)
-  --pane <id>           Use specific tmux pane instead of creating a managed legion worker
+  --pane <id>           Use specific tmux pane instead of creating a managed mechanicus worker
   --primarch <name>     Launch as a primarch persona
   --zealotry <1-5>      Golden Throne follow-up aggressiveness (default: 3)
   --context <text>      Extra context for the dispatch prompt

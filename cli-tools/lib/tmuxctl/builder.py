@@ -236,7 +236,7 @@ def build_council_window(adapter: TmuxAdapter, session: str, window: str = COUNC
       S  = council:true-terminal (a plain shell — no persona, no agent)
 
     Custodes, Malcador and Administratum relocated here from the retired legion /
-    mechanicus seats; Pax relocated from the retired koronus page. Their persona
+    mechanicus seats; Pax relocated from the retired civic page. Their persona
     identities (and civic launch dir for Pax) are owned by token-api / persona
     assertion — this builder only lays out the seats and stamps their labels.
     """
@@ -304,7 +304,7 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
 
     The left column contains the Fabricator-General (the stack orchestrator
     anchor, pane 1) over the orchestrator persona seat. The orchestrator (the
-    civic dispatch seat) relocated here from the retired koronus page; the
+    civic dispatch seat) relocated here from the retired civic page; the
     Administratum seat moved to the council page. Worker panes are added by
     stack.add_stack_pane on the right stack — the shared flat worker stack.
     """

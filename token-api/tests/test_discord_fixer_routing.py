@@ -86,7 +86,7 @@ async def test_no_live_fg_returns_none(app_env: Any, monkeypatch) -> None:
     main = app_env.main
     # Only a non-FG instance is live.
     _insert_instance(app_env.db_path, "somebody")
-    _patch_panes(app_env, monkeypatch, [_pane("%12", "somebody", pane_label="legion:1")])
+    _patch_panes(app_env, monkeypatch, [_pane("%12", "somebody", pane_label="mechanicus:1")])
 
     result = await main._resolve_discord_fixer_target()
 

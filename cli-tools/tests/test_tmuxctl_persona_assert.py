@@ -281,7 +281,7 @@ def test_admin_fails_on_pane_label_mismatch_even_with_right_primarch():
     assert _row_matches_persona(row, spec) is False
 
 
-def test_koronus_pax_matches_on_canonical_persona_slug_and_rank() -> None:
+def test_pax_matches_on_canonical_persona_slug_and_rank() -> None:
     spec = persona_spec("council:pax")
     row = SimpleNamespace(
         instance_id="i-pax",
@@ -296,7 +296,7 @@ def test_koronus_pax_matches_on_canonical_persona_slug_and_rank() -> None:
     assert _row_matches_persona(row, spec) is True
 
 
-def test_koronus_orchestrator_matches_on_primarch_fallback() -> None:
+def test_orchestrator_matches_on_primarch_fallback() -> None:
     spec = persona_spec("mechanicus:orchestrator")
     row = SimpleNamespace(
         instance_id="i-orch",
@@ -311,7 +311,7 @@ def test_koronus_orchestrator_matches_on_primarch_fallback() -> None:
     assert _row_matches_persona(row, spec) is True
 
 
-def test_koronus_pax_fails_on_wrong_rank() -> None:
+def test_pax_fails_on_wrong_rank() -> None:
     spec = persona_spec("council:pax")
     row = SimpleNamespace(
         instance_id="i-pax",
@@ -437,7 +437,7 @@ def test_assert_instance_notes_singleton_mismatch_without_persona_injection() ->
     resolved = SimpleNamespace(pane_id="%25", pane_role="council:pax")
     with (
         patch.object(assertions, "resolve_pane", return_value=resolved),
-        patch.object(assertions, "_pane_type", return_value="koronus"),
+        patch.object(assertions, "_pane_type", return_value="council"),
         patch.object(assertions, "_runtime_has_instance", return_value=True),
         patch.object(assertions, "_registry_entries", return_value=[row]),
         patch.object(assertions, "_send_persona_command", return_value=(True, "sent")) as send,

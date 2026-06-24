@@ -16,7 +16,7 @@ def test_demote_allocates_stack_shell_then_swaps() -> None:
     # Demote must allocate the replacement through the unified stack allocator,
     # then swap. Creating the replacement after join-pane collapses the source
     # leaf and cannot reliably put the shell back in the original slot.
-    assert "tmuxctl.cli stack add legion" in demote_body
+    assert "tmuxctl.cli stack add mechanicus" in demote_body
     assert 'tmux swap-pane -d -s "$current_pane" -t "$stack_pane"' in demote_body
     assert 'set-option -pu -t "$stack_pane" @PANE_TYPE' in demote_body
     assert "--no-focus" in demote_body

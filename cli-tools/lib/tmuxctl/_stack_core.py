@@ -45,7 +45,7 @@ class StackPageSpec:
     secondary_personas: tuple[PersonaPaneSpec, ...] = ()
 
 
-# Mechanicus is the single shared flat worker stack (legion + koronus retired).
+# Mechanicus is the single shared flat worker stack (the per-fleet legion and civic stacks retired).
 # Fleets share this physical stack but stay logically separate; the Fabricator-
 # General anchors it, with the orchestrator (civic dispatch seat) docked under it.
 STACK_PAGE_SPECS: dict[str, StackPageSpec] = {

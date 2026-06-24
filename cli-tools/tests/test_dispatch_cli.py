@@ -902,7 +902,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
         # stack dispatch so the resolve step is genuinely exercised.
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then\n'
         '  printf "%s\\n" "$*" > "$TMUXCTL_LOG"\n'
-        '  printf "legion:1\\n"\n'
+        '  printf "mechanicus:1\\n"\n'
         "  exit 0\n"
         "fi\n"
         'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then\n'
@@ -1057,7 +1057,7 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
         'printf "%s\\n" "$*" > "$TMUXCTL_LOG"\n'
         # Campaign contract: stack dispatch emits canonical page:index; dispatch
         # materializes physical only at the raw-tmux send via resolve-pane.
-        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then printf "legion:3\\n"; exit 0; fi\n'
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then printf "mechanicus:3\\n"; exit 0; fi\n'
         'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then printf "%%84\\n"; exit 0; fi\n'
         'printf "%%84\\n"\n',
         encoding="utf-8",

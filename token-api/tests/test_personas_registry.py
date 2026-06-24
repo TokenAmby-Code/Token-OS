@@ -31,7 +31,7 @@ async def test_personas_seed_and_schema_constraints(app_env):
 
 @pytest.mark.asyncio
 async def test_pax_overseer_seed_resolves_silent_civic_seat(app_env):
-    # Pax is the anchor seat of the koronus civic page: a non-40k civic overseer
+    # Pax is the civic overseer seat on the council page: a non-40k civic overseer
     # singleton (the combined Custodes+Administratum interaction/record-keeper).
     # resolve_persona must surface it as an overseer (so the rank-stamp trigger
     # promotes its instance row off the astartes default) with the civic slate/
@@ -54,13 +54,13 @@ async def test_pax_overseer_seed_resolves_silent_civic_seat(app_env):
 
 
 @pytest.mark.asyncio
-async def test_koronus_civic_seats_resolve_after_seed(app_env):
-    # The koronus civic page seeds three personas: pax (overseer, above),
+async def test_civic_seats_resolve_after_seed(app_env):
+    # The civic persona set seeds three personas: pax (overseer, above),
     # orchestrator (civic dispatch overseer) and agentic-worker (the civic worker
     # persona). All three must resolve after seeding, with civic-slate tints, and
     # all are silent (non-40k, no TTS). orchestrator is a singleton overseer;
     # agentic-worker is an astartes-rank worker kept OUT of the rotation pool so
-    # it is resolved by slug while ON the koronus page, never auto-assigned.
+    # it is resolved by slug in a civic worker context, never auto-assigned.
     import personas
 
     async with aiosqlite.connect(app_env.db_path) as db:
