@@ -326,6 +326,107 @@ def test_install_shims_preserves_vendor_and_installs_bypass_shim(tmp_path: Path)
     )
 
 
+def _staple_vault(tmp_path: Path) -> dict[str, str]:
+    """Provision a persona DB + vault so the wrapper can build a real staple."""
+    import sqlite3
+
+    db = tmp_path / "agents.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE personas (id TEXT PRIMARY KEY, slug TEXT UNIQUE, "
+            "display_name TEXT, default_rank TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO personas (id, slug, display_name, default_rank) VALUES (?, ?, ?, ?)",
+            ("p0", "blood-angels", "Blood Angels", "astartes"),
+        )
+    imperium = tmp_path / "vaults" / "Imperium" / "Imperium-ENV"
+    (imperium / "Personas" / "Ranks").mkdir(parents=True)
+    (tmp_path / "vaults" / "Civic" / "Pax-ENV" / "Personas" / "Ranks").mkdir(parents=True)
+    (imperium / "Personas" / "Astartes.md").write_text(
+        "## System Prompt\nPERSONA_BODY_MARKER\n", encoding="utf-8"
+    )
+    (imperium / "Personas" / "Ranks" / "Astartes.md").write_text(
+        "RANK_DOCTRINE_MARKER\n", encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "TOKEN_API_DB": str(db),
+            "IMPERIUM": str(tmp_path / "vaults" / "Imperium"),
+            "CIVIC": str(tmp_path / "vaults" / "Civic"),
+        }
+    )
+    return env
+
+
+def test_wrapper_composes_staple_rank_first_with_operational_appendix(tmp_path: Path) -> None:
+    """A managed worker (TOKEN_API_PERSONA set) gets the rank+persona staple,
+    rank doctrine FIRST, persona body second, with the operational appendix folded
+    in AFTER — the single injection contract the exec adapters consume."""
+    env = _staple_vault(tmp_path)
+    env.update(
+        {
+            "TOKEN_API_PERSONA": "blood-angels",
+            "TOKEN_API_VAULT_DOMAIN": "Imperium-ENV",
+            "TOKEN_API_INSTANCE_NAME_PREFIX": "blood-angels",
+        }
+    )
+    script = f"""
+set -euo pipefail
+source {str(CLI_TOOLS / "lib" / "agent-wrapper-common.sh")!r}
+TOKEN_WRAPPER_LIB_DIR={str(CLI_TOOLS / "lib")!r}
+TMUX_PANE_VALUE=""
+token_wrapper_compose_system_text
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, text=True, capture_output=True, check=True
+    )
+    out = result.stdout
+    rank_i = out.find("RANK_DOCTRINE_MARKER")
+    body_i = out.find("PERSONA_BODY_MARKER")
+    appendix_i = out.find("Instance name prefix: blood-angels")
+    assert rank_i >= 0 and body_i >= 0 and appendix_i >= 0, out
+    assert rank_i < body_i < appendix_i, out
+
+
+def test_wrapper_codex_preamble_wraps_staple_in_system_identity(tmp_path: Path) -> None:
+    env = _staple_vault(tmp_path)
+    env["TOKEN_API_PERSONA"] = "blood-angels"
+    script = f"""
+set -euo pipefail
+source {str(CLI_TOOLS / "lib" / "agent-wrapper-common.sh")!r}
+TOKEN_WRAPPER_LIB_DIR={str(CLI_TOOLS / "lib")!r}
+TMUX_PANE_VALUE=""
+token_wrapper_codex_system_preamble
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, text=True, capture_output=True, check=True
+    )
+    out = result.stdout
+    assert out.startswith("<SYSTEM IDENTITY>"), out
+    assert out.rstrip().endswith("</SYSTEM IDENTITY>"), out
+    assert "RANK_DOCTRINE_MARKER" in out
+    assert "PERSONA_BODY_MARKER" in out
+
+
+def test_wrapper_unmanaged_session_gets_no_staple(tmp_path: Path) -> None:
+    """No persona env and no singleton pane label → unmanaged → no staple, silent."""
+    env = _staple_vault(tmp_path)
+    env.pop("TOKEN_API_PERSONA", None)
+    script = f"""
+set -euo pipefail
+source {str(CLI_TOOLS / "lib" / "agent-wrapper-common.sh")!r}
+TOKEN_WRAPPER_LIB_DIR={str(CLI_TOOLS / "lib")!r}
+TMUX_PANE_VALUE=""
+token_wrapper_compose_system_text
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, text=True, capture_output=True, check=True
+    )
+    assert result.stdout == ""
+
+
 def test_static_launch_code_avoids_raw_agent_front_doors() -> None:
     allowed = {
         CLI_TOOLS / "scripts" / "agent-wrapper.sh",

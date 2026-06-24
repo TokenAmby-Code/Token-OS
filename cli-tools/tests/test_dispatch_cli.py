@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -1503,6 +1504,15 @@ def _persona_env(tmp_path: Path, db: Path) -> dict[str, str]:
     civic = tmp_path / "vaults" / "Civic"
     (imperium / "Imperium-ENV" / "Personas").mkdir(parents=True)
     (civic / "Pax-ENV" / "Personas").mkdir(parents=True)
+    # The rank+persona staple invariant now requires a rank doc per persona, so
+    # provision the standard Ranks/ tree in both vaults. Tests that exercise a
+    # MISSING behavior file still fail closed on the behavior half (the rank half
+    # is satisfied here), keeping those assertions about the behavior file.
+    for root in (imperium / "Imperium-ENV", civic / "Pax-ENV"):
+        ranks = root / "Personas" / "Ranks"
+        ranks.mkdir(parents=True, exist_ok=True)
+        for rank in ("Astartes", "Overseer", "Primarch"):
+            (ranks / f"{rank}.md").write_text(f"{rank} rank doctrine\n", encoding="utf-8")
     env["IMPERIUM"] = str(imperium)
     env["CIVIC"] = str(civic)
     return env
@@ -1527,7 +1537,42 @@ def test_dispatch_persona_invariant_fails_loud_when_astartes_file_missing(tmp_pa
     assert "persona behavior-file invariant failed" in result.stderr
 
 
-def test_dispatch_astartes_row_uses_generic_rank_file_when_slug_file_absent(tmp_path: Path) -> None:
+def test_dispatch_persona_invariant_fails_closed_when_rank_doc_missing(tmp_path: Path) -> None:
+    """The staple is rank+persona, so preflight must refuse dispatch when a managed
+    persona resolves a behavior doc but no rank doc — as fatal as a missing behavior
+    file. (The wrapper fails loud-but-open at runtime; the hard gate is here.)"""
+    db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
+    env = _persona_env(tmp_path, db)
+    # Behavior half present, rank half removed → the rank-doc invariant must fire.
+    (Path(env["IMPERIUM"]) / "Imperium-ENV" / "Personas" / "Astartes.md").write_text(
+        "## System Prompt\nGeneric\n", encoding="utf-8"
+    )
+    shutil.rmtree(Path(env["IMPERIUM"]) / "Imperium-ENV" / "Personas" / "Ranks")
+
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "--dir", str(ROOT), "work"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+        timeout=60,
+    )
+
+    assert result.returncode == 66
+    assert "persona rank doc missing: slug=blood-angels" in result.stderr
+    assert "persona behavior-file invariant failed" in result.stderr
+
+
+def test_dispatch_persona_forwards_metadata_env_without_injecting_doctrine_body(
+    tmp_path: Path,
+) -> None:
+    """Dispatch no longer assembles/injects the persona doctrine body — the agent
+    wrapper is the sole injector (TOKEN_API_PERSONA → token_wrapper_system_doc).
+    Dispatch only resolves the persona (so preflight passes) and forwards the
+    *operational* metadata (vault domain, instance-name prefix) as env the wrapper
+    folds in beneath the staple. The doctrine body must NOT appear on the staged
+    command line, and there must be no double-inject via --append-system-prompt."""
     db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
     env = _persona_env(tmp_path, db)
     (Path(env["IMPERIUM"]) / "Imperium-ENV" / "Personas" / "Astartes.md").write_text(
@@ -1555,7 +1600,11 @@ def test_dispatch_astartes_row_uses_generic_rank_file_when_slug_file_absent(tmp_
 
     assert result.returncode == 0, result.stderr
     assert "persona:         blood-angels" in result.stdout
-    assert "Generic rank behavior" in result.stdout
+    # Operational metadata is forwarded as env; doctrine body is NOT injected here.
+    assert "TOKEN_API_INSTANCE_NAME_PREFIX=blood-angels" in result.stdout
+    assert "TOKEN_API_VAULT_DOMAIN=Imperium-ENV" in result.stdout
+    assert "Generic rank behavior" not in result.stdout
+    assert "--append-system-prompt" not in result.stdout
 
 
 def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Path) -> None:
@@ -2424,8 +2473,10 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
     A false exit-70 before the naming step is exactly why agents land needs-name
     and untracked. With the liveness-driven gate the launch reaches exit 0, so the
     launched agent is neither reaped nor retried and proceeds through its
-    SessionStart naming — the staged launch command carries the
-    ``instance-name "<prefix>-..."`` directive that performs it.
+    SessionStart naming. The naming directive now rides as the
+    ``TOKEN_API_INSTANCE_NAME_PREFIX`` env the wrapper folds into the operational
+    appendix (``instance-name "<prefix>-<task>"``), so the staged launch command
+    carries that prefix env rather than the literal directive text.
     """
     db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
     env = _persona_env(tmp_path, db)
@@ -2492,12 +2543,13 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
     assert "launch failed" not in result.stderr
 
     # Proof the naming step reaches the pane on the success path: the staged
-    # launch command carries the self-naming directive.
+    # launch command carries the instance-name prefix env the wrapper expands into
+    # the self-naming directive.
     calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
     staged_arg = next((c for c in calls if c.startswith("bash /")), None)
     assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
     staged = Path(staged_arg.split(" ", 1)[1]).read_text(encoding="utf-8", errors="replace")
-    assert 'instance-name "blood-angels-' in staged, staged
+    assert "TOKEN_API_INSTANCE_NAME_PREFIX=blood-angels" in staged, staged
 
 
 def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Path) -> None:

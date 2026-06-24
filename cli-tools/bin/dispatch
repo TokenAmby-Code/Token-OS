@@ -471,29 +471,16 @@ find_local_persona_file() {
   return 0
 }
 
-extract_persona_system_prompt() {
-  local file="$1"
-  [[ -f "$file" ]] || return 1
-  python3 - "$file" <<'PY_EXTRACT_PERSONA'
-import sys
-from pathlib import Path
-content = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-marker = "## System Prompt"
-idx = content.find(marker)
-if idx < 0:
-    parts = content.split("---", 2)
-    body = parts[2].strip() if len(parts) >= 3 else content.strip()
-else:
-    rest = content[idx + len(marker):].strip()
-    next_h2 = rest.find("\n## ")
-    body = rest[:next_h2].strip() if next_h2 >= 0 else rest
-print(body)
-PY_EXTRACT_PERSONA
-}
-
-build_claude_persona_system_prompt() {
-  local persona="$1" persona_sql row title vault_name prefix note_path vault_root persona_file doc_id prompt
-  [[ -n "$persona" ]] || return 1
+# Operational metadata for a persona launch — vault domain, instance-name prefix,
+# and linked session-doc id. The DOCTRINE body (the rank+persona system-doc staple)
+# is no longer assembled here: the agent wrapper is now the single injector
+# (token_wrapper_system_doc reads Personas/*.md + Ranks/*.md, rank-first). Dispatch
+# only forwards this *operational* metadata as env vars the wrapper folds in beneath
+# the staple (token_wrapper_operational_appendix). Emits vault_name<US>prefix<US>doc_id
+# on stdout; any field may be empty (the wrapper omits the corresponding lines).
+persona_operational_env() {
+  local persona="$1" persona_sql row title vault_name prefix note_path vault_root persona_file doc_id
+  [[ -n "$persona" ]] || return 0
   persona_file="$(persona_behavior_file_for "$persona")"
   persona_sql="$(sql_literal "$persona")"
   row="$(sqlite_query_usv "
@@ -510,25 +497,13 @@ build_claude_persona_system_prompt() {
   if [[ -z "${persona_file:-}" || ! -f "$persona_file" ]]; then
     persona_file="$(find_local_persona_file "$persona")"
   fi
-  [[ -n "$persona_file" && -f "$persona_file" ]] || { err "persona file not found for --persona $persona"; return 66; }
-  [[ -n "${title:-}" ]] || title="$persona"
-  [[ -n "${vault_name:-}" ]] || vault_name="$(basename "$(dirname "$(dirname "$persona_file")")")"
-  [[ -n "${prefix:-}" ]] || prefix="$persona"
-  prompt="$(extract_persona_system_prompt "$persona_file")" || return $?
-  prompt="${prompt}
-
-Vault domain: ${vault_name}
-Instance name prefix: ${prefix}"
-  doc_id="$(sqlite_query "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = '${persona_sql}' AND unlinked_at IS NULL LIMIT 1;")"
-  if [[ -n "$doc_id" ]]; then
-    prompt="${prompt}
-
-You have a linked session document (ID: ${doc_id}). Invoke the vault-mind skill on startup to load it."
+  # Vault domain falls back to the persona file's owning vault (…/<Vault>/Personas/x.md).
+  if [[ -z "${vault_name:-}" && -n "${persona_file:-}" && -f "$persona_file" ]]; then
+    vault_name="$(basename "$(dirname "$(dirname "$persona_file")")")"
   fi
-  prompt="${prompt}
-
-On startup, name this instance with: instance-name \"${prefix}-<task-description>\""
-  printf '%s' "$prompt"
+  [[ -n "${prefix:-}" ]] || prefix="$persona"
+  doc_id="$(sqlite_query "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = '${persona_sql}' AND unlinked_at IS NULL LIMIT 1;")"
+  printf '%s\x1f%s\x1f%s' "${vault_name:-}" "${prefix:-}" "${doc_id:-}"
 }
 
 dedupe_tsv() {
@@ -1672,6 +1647,19 @@ fi
 if [[ -n "$RESUME_PRIMARCH" && -z "$PERSONA" ]]; then
   COMMON_ENV+=("TOKEN_API_PERSONA=${RESUME_PRIMARCH}")
 fi
+# Operational metadata (vault domain, instance-name prefix, linked session-doc) for
+# the persona — forwarded as env so the agent wrapper folds it in beneath the
+# rank+persona staple it now injects. The doctrine body no longer rides on the
+# dispatch command line; the wrapper is the sole injector.
+_op_persona="${PERSONA:-}"
+[[ -z "$_op_persona" && -n "$RESUME_PRIMARCH" ]] && _op_persona="$RESUME_PRIMARCH"
+if [[ -n "$_op_persona" ]]; then
+  _op_meta="$(persona_operational_env "$_op_persona")"
+  IFS=$'\x1f' read -r _op_vault _op_prefix _op_doc <<< "$_op_meta"
+  [[ -n "$_op_vault" ]] && COMMON_ENV+=("TOKEN_API_VAULT_DOMAIN=${_op_vault}")
+  [[ -n "$_op_prefix" ]] && COMMON_ENV+=("TOKEN_API_INSTANCE_NAME_PREFIX=${_op_prefix}")
+  [[ -n "$_op_doc" ]] && COMMON_ENV+=("TOKEN_API_SESSION_DOC_ID=${_op_doc}")
+fi
 if [[ -n "$RESUME_PARENT_INSTANCE_ID" && -z "$AUTO_PARENT_INSTANCE_ID" ]]; then
   COMMON_ENV+=("TOKEN_API_PARENT_INSTANCE_ID=${RESUME_PARENT_INSTANCE_ID}")
 fi
@@ -1721,12 +1709,12 @@ build_agent_command() {
     cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
     [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
     if [[ -n "$PERSONA" ]]; then
-      local persona_prompt profile_dir line
-      persona_prompt="$(build_claude_persona_system_prompt "$PERSONA")"
-      [[ -n "$SYSTEM_PROMPT" ]] && persona_prompt="${persona_prompt}"$'
-
-'"${SYSTEM_PROMPT}"
-      cmd+=(--append-system-prompt "$persona_prompt")
+      local profile_dir line
+      # The rank+persona doctrine staple is injected by the agent wrapper now
+      # (TOKEN_API_PERSONA → token_wrapper_system_doc), so dispatch no longer
+      # appends the persona body here — that would double-inject. A caller-supplied
+      # --system-prompt still rides through; the wrapper layers the staple above it.
+      [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
       profile_dir="$HOME/.claude/profiles/$PERSONA"
       if [[ -d "$profile_dir" ]]; then
         [[ -f "$profile_dir/.mcp.json" ]] && cmd+=(--mcp-config "$profile_dir/.mcp.json" --strict-mcp-config)
@@ -1746,7 +1734,7 @@ build_agent_command() {
     fi
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
-  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME -u TOKEN_API_WRAPPER_LAUNCH_ID TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
+  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME -u TOKEN_API_WRAPPER_LAUNCH_ID -u TOKEN_API_VAULT_DOMAIN -u TOKEN_API_INSTANCE_NAME_PREFIX -u TOKEN_API_SESSION_DOC_ID TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
   local e
   for e in "${envs[@]}"; do printf ' %q' "$e"; done
   local a
