@@ -21,11 +21,13 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKTREE_SETUP = ROOT / "cli-tools" / "bin" / "worktree-setup"
+Project = dict[str, Any]
 
 
 def _git(*args: str, cwd: Path | None = None, env: dict | None = None) -> str:
@@ -35,7 +37,7 @@ def _git(*args: str, cwd: Path | None = None, env: dict | None = None) -> str:
 
 
 @pytest.fixture
-def project(tmp_path: Path) -> dict[str, object]:
+def project(tmp_path: Path) -> Project:
     home = tmp_path / "home"
     home.mkdir()
     src = tmp_path / "src"
@@ -51,6 +53,7 @@ def project(tmp_path: Path) -> dict[str, object]:
             "GIT_COMMITTER_NAME": "t",
             "GIT_COMMITTER_EMAIL": "t@t",
             "WORKTREE_PORTS_NO_FLOCK": "1",
+            "IMPERIUM": str(tmp_path / "Imperium"),
         }
     )
 
@@ -114,20 +117,20 @@ def project(tmp_path: Path) -> dict[str, object]:
 # ── main/master creation guard ───────────────────────────────────────────────
 
 
-def test_refuses_main_worktree(project) -> None:
+def test_refuses_main_worktree(project: Project) -> None:
     res = project["setup"]("main", "--existing")
     assert res.returncode != 0, res.stdout
     assert "protected" in res.stderr.lower() or "main/master" in res.stderr.lower()
     assert not (project["parent"] / "wt-main").exists()
 
 
-def test_refuses_master_worktree(project) -> None:
+def test_refuses_master_worktree(project: Project) -> None:
     res = project["setup"]("master")
     assert res.returncode != 0
     assert not (project["parent"] / "wt-master").exists()
 
 
-def test_allows_feature_branch(project) -> None:
+def test_allows_feature_branch(project: Project) -> None:
     res = project["setup"]("feature-x")
     assert res.returncode == 0, res.stderr
     wt = project["parent"] / "wt-feature-x"
@@ -135,7 +138,7 @@ def test_allows_feature_branch(project) -> None:
     assert _git("-C", str(wt), "branch", "--show-current", env=project["env"]) == "feature-x"
 
 
-def test_admin_escape_allows_main(project) -> None:
+def test_admin_escape_allows_main(project: Project) -> None:
     res = project["setup"]("main", "--existing", "--allow-protected-branch")
     assert res.returncode == 0, res.stderr
     assert (project["parent"] / "wt-main").exists()
@@ -144,7 +147,7 @@ def test_admin_escape_allows_main(project) -> None:
 # ── quarantine bare guard ────────────────────────────────────────────────────
 
 
-def test_refuses_recycle_bin_bare(project) -> None:
+def test_refuses_recycle_bin_bare(project: Project) -> None:
     """A BARE_REPO inside #recycle must be refused — never bind a worktree there."""
     recycle_bare = project["tmp"] / "#recycle" / "proj.git"
     recycle_bare.parent.mkdir(parents=True)
@@ -159,7 +162,7 @@ def test_refuses_recycle_bin_bare(project) -> None:
     assert not (project["parent"] / "wt-feature-y").exists()
 
 
-def test_refuses_dated_legacy_archive_bare(project) -> None:
+def test_refuses_dated_legacy_archive_bare(project: Project) -> None:
     legacy_bare = project["tmp"] / "Token-OS.legacy-20260610" / "proj.git"
     legacy_bare.parent.mkdir(parents=True)
     _git("clone", "--bare", str(project["bare"]), str(legacy_bare), env=project["env"])
@@ -173,7 +176,7 @@ def test_refuses_dated_legacy_archive_bare(project) -> None:
 # ── canonical remote provenance guard ───────────────────────────────────────
 
 
-def test_token_os_github_origin_forces_worktree_origin_and_github(project) -> None:
+def test_token_os_github_origin_forces_worktree_origin_and_github(project: Project) -> None:
     parent = project["home"] / "worktrees" / "Token-OS"
     project["write_named_conf"]("Token-OS", project["bare"], parent)
     _git(
@@ -207,7 +210,7 @@ def test_token_os_github_origin_forces_worktree_origin_and_github(project) -> No
     )
 
 
-def test_token_os_refuses_dead_nas_origin_before_worktree_create(project) -> None:
+def test_token_os_refuses_dead_nas_origin_before_worktree_create(project: Project) -> None:
     parent = project["home"] / "worktrees" / "Token-OS"
     project["write_named_conf"]("Token-OS", project["bare"], parent)
     _git(
@@ -216,7 +219,7 @@ def test_token_os_refuses_dead_nas_origin_before_worktree_create(project) -> Non
         "remote",
         "set-url",
         "origin",
-        "/Volumes/Imperium/token-os.git",
+        f"{project['env']['IMPERIUM']}/token-os.git",
         env=project["env"],
     )
 
@@ -226,7 +229,7 @@ def test_token_os_refuses_dead_nas_origin_before_worktree_create(project) -> Non
     assert not (parent / "wt-dead-remote").exists()
 
 
-def test_token_os_refuses_recycle_origin_before_worktree_create(project) -> None:
+def test_token_os_refuses_recycle_origin_before_worktree_create(project: Project) -> None:
     parent = project["home"] / "worktrees" / "Token-OS"
     project["write_named_conf"]("Token-OS", project["bare"], parent)
     _git(
@@ -245,7 +248,7 @@ def test_token_os_refuses_recycle_origin_before_worktree_create(project) -> None
     assert not (parent / "wt-recycle-remote").exists()
 
 
-def test_token_os_refuses_non_token_os_github_origin(project) -> None:
+def test_token_os_refuses_non_token_os_github_origin(project: Project) -> None:
     parent = project["home"] / "worktrees" / "Token-OS"
     project["write_named_conf"]("Token-OS", project["bare"], parent)
     _git(
@@ -264,7 +267,26 @@ def test_token_os_refuses_non_token_os_github_origin(project) -> None:
     assert not (parent / "wt-wrong-github").exists()
 
 
-def test_non_token_project_is_not_hardcoded_to_token_os_remote(project) -> None:
+def test_token_os_refuses_plaintext_http_github_origin(project: Project) -> None:
+    parent = project["home"] / "worktrees" / "Token-OS"
+    project["write_named_conf"]("Token-OS", project["bare"], parent)
+    _git(
+        "--git-dir",
+        str(project["bare"]),
+        "remote",
+        "set-url",
+        "origin",
+        "http://github.com/TokenAmby-Code/Token-OS.git",
+        env=project["env"],
+    )
+
+    res = project["setup"]("http-github", project_name="Token-OS")
+    assert res.returncode == 64
+    assert "Token-OS worktrees must use GitHub origin" in res.stderr
+    assert not (parent / "wt-http-github").exists()
+
+
+def test_non_token_project_is_not_hardcoded_to_token_os_remote(project: Project) -> None:
     parent = project["home"] / "worktrees" / "OtherProject"
     project["write_named_conf"]("OtherProject", project["bare"], parent)
     _git(
@@ -287,7 +309,7 @@ def test_non_token_project_is_not_hardcoded_to_token_os_remote(project) -> None:
     )
 
 
-def test_refuses_missing_bare_origin(project) -> None:
+def test_refuses_missing_bare_origin(project: Project) -> None:
     _git("--git-dir", str(project["bare"]), "remote", "remove", "origin", env=project["env"])
 
     res = project["setup"]("missing-remote")

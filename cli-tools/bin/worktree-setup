@@ -20,7 +20,10 @@ set -euo pipefail
 
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 _HOOKS_DIR="$(dirname "$(readlink -f "$0")")/../git-hooks"
+_CALLER_IMPERIUM="${IMPERIUM:-}"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
+[[ -n "$_CALLER_IMPERIUM" ]] && export IMPERIUM="$_CALLER_IMPERIUM"
+source "${_LIB_DIR}/git-remote.sh" 2>/dev/null || true
 source "${_LIB_DIR}/worktree-ports.sh" 2>/dev/null || true
 
 # Ensure Homebrew is on PATH (Apple Silicon Macs, non-interactive shells)
@@ -122,33 +125,6 @@ log_error() {
     echo -e "${RED}✗${NC} $1" >&2
 }
 
-is_token_os_github_remote() {
-    local url="${1%.git}"
-    case "$url" in
-        git@github.com:TokenAmby-Code/Token-OS|\
-        ssh://git@github.com/TokenAmby-Code/Token-OS|\
-        https://github.com/TokenAmby-Code/Token-OS|\
-        http://github.com/TokenAmby-Code/Token-OS)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-remote_url_is_forbidden_worktree_source() {
-    local url="${1%/}"
-    case "$url" in
-        /Volumes/Imperium/token-os.git|file:///Volumes/Imperium/token-os.git|*'#recycle'*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
 validate_canonical_remote() {
     local project="$1" config="$2"
     CANONICAL_REMOTE="$(git --git-dir="$BARE_REPO" remote get-url origin 2>/dev/null || true)"
@@ -157,12 +133,12 @@ validate_canonical_remote() {
         log_error "Set origin in $config to the canonical GitHub remote before creating PR-capable worktrees."
         exit 64
     fi
-    if remote_url_is_forbidden_worktree_source "$CANONICAL_REMOTE"; then
+    if dead_or_quarantined_remote "$CANONICAL_REMOTE"; then
         log_error "Refusing canonical remote with dead/quarantined provenance: $CANONICAL_REMOTE"
         log_error "Expected a live GitHub remote, not the old NAS/recycle Token-OS source."
         exit 64
     fi
-    if [[ "$project" == "Token-OS" ]] && ! is_token_os_github_remote "$CANONICAL_REMOTE"; then
+    if [[ "$project" == "Token-OS" ]] && ! token_os_github_remote "$CANONICAL_REMOTE"; then
         log_error "Token-OS worktrees must use GitHub origin git@github.com:TokenAmby-Code/Token-OS.git"
         log_error "Configured bare origin is: $CANONICAL_REMOTE"
         exit 64

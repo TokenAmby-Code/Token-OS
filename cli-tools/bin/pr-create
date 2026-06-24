@@ -38,33 +38,6 @@ warn() { echo -e "${YELLOW}[pr-create]${NC} $1" >&2; }
 error() { echo -e "${RED}[pr-create]${NC} $1" >&2; }
 success() { echo -e "${GREEN}[pr-create]${NC} $1" >&2; }
 
-token_os_github_remote() {
-    local url="${1%.git}"
-    case "$url" in
-        git@github.com:TokenAmby-Code/Token-OS|\
-        ssh://git@github.com/TokenAmby-Code/Token-OS|\
-        https://github.com/TokenAmby-Code/Token-OS|\
-        http://github.com/TokenAmby-Code/Token-OS)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-dead_or_quarantined_remote() {
-    local url="${1%/}"
-    case "$url" in
-        ""|/Volumes/Imperium/token-os.git|file:///Volumes/Imperium/token-os.git|*'#recycle'*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
 assert_pr_capable_remote() {
     local top origin
     top="$(git rev-parse --show-toplevel 2>/dev/null || true)"

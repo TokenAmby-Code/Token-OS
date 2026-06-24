@@ -344,6 +344,7 @@ def token_os_worktree_env(tmp_path: Path) -> TokenOsWorktreeEnv:
     env["GIT_AUTHOR_EMAIL"] = "t@t"
     env["GIT_COMMITTER_NAME"] = "t"
     env["GIT_COMMITTER_EMAIL"] = "t@t"
+    env["IMPERIUM"] = str(tmp_path / "Imperium")
     _git("init", "-b", "remote-guard", str(worktree), env=env)
     return TokenOsWorktreeEnv(home=home, parent=parent, worktree=worktree, base=env)
 
@@ -367,7 +368,7 @@ def test_dispatch_worktree_refuses_dead_token_os_origin(
         "remote",
         "add",
         "origin",
-        "/Volumes/Imperium/token-os.git",
+        f"{token_os_worktree_env.base['IMPERIUM']}/token-os.git",
         env=token_os_worktree_env.base,
     )
 
