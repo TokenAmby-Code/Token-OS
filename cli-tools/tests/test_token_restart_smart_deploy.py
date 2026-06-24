@@ -23,8 +23,12 @@ TOKENAPI_LABEL = "ai.openclaw.tokenapi"
 DISCORD_LABEL = "ai.tokenclaw.discord"
 UID = str(os.getuid())
 
-# Convenience matchers for the call log.
-KICK_TOKENAPI = f"kickstart -k gui/501/{TOKENAPI_LABEL}"
+# Convenience matchers for the call log. token-api now restarts via a graceful
+# drain (SIGTERM to the launchd pid, KeepAlive respawns onto the retained socket)
+# rather than `kickstart -k`; restart_mac's signature in the log is the
+# `launchctl print <mac label>` pid query, emitted only when restart_mac runs.
+# Discord still bounces via `kickstart -k`.
+RESTART_TOKENAPI = f"print gui/{UID}/{TOKENAPI_LABEL}"
 KICK_DISCORD = f"kickstart -k gui/{UID}/{DISCORD_LABEL}"
 
 
@@ -210,7 +214,7 @@ def test_token_api_change_restarts_only_token_api(tmp_path: Path) -> None:
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert KICK_TOKENAPI in calls
+    assert RESTART_TOKENAPI in calls
     assert KICK_DISCORD not in calls
     assert "push-mobile -a" not in calls
 
@@ -221,7 +225,7 @@ def test_discord_change_restarts_only_discord(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert KICK_DISCORD in calls
-    assert KICK_TOKENAPI not in calls
+    assert RESTART_TOKENAPI not in calls
     assert "push-mobile -a" not in calls
 
 
@@ -231,7 +235,7 @@ def test_mobile_change_runs_push_mobile_only(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert "push-mobile -a" in calls
-    assert KICK_TOKENAPI not in calls
+    assert RESTART_TOKENAPI not in calls
     assert KICK_DISCORD not in calls
 
 
@@ -243,7 +247,7 @@ def test_satellite_or_refresh_helper_change_refreshes_wsl_only(tmp_path: Path) -
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert KICK_TOKENAPI not in calls
+    assert RESTART_TOKENAPI not in calls
     assert "/runtime/refresh" in calls
     assert "/restart" not in calls
     assert KICK_DISCORD not in calls
@@ -255,7 +259,7 @@ def test_ahk_and_cli_changes_refresh_wsl_runtime(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert "/runtime/refresh" in calls
-    assert KICK_TOKENAPI not in calls
+    assert RESTART_TOKENAPI not in calls
     assert KICK_DISCORD not in calls
 
 
@@ -264,7 +268,7 @@ def test_token_api_lockfile_change_restarts_mac_and_refreshes_wsl(tmp_path: Path
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert KICK_TOKENAPI in calls
+    assert RESTART_TOKENAPI in calls
     assert "/runtime/refresh" in calls
     assert KICK_DISCORD not in calls
 
@@ -274,7 +278,7 @@ def test_multiple_changed_services_all_restart(tmp_path: Path) -> None:
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert KICK_TOKENAPI in calls
+    assert RESTART_TOKENAPI in calls
     assert KICK_DISCORD in calls
 
 
@@ -286,7 +290,7 @@ def test_docs_only_change_restarts_nothing(tmp_path: Path) -> None:
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert KICK_TOKENAPI not in calls
+    assert RESTART_TOKENAPI not in calls
     assert KICK_DISCORD not in calls
     assert "push-mobile -a" not in calls
     assert "No deployable services changed" in proc.stdout
@@ -299,7 +303,7 @@ def test_no_advance_falls_back_to_full_restart(tmp_path: Path) -> None:
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert KICK_TOKENAPI in calls
+    assert RESTART_TOKENAPI in calls
     assert KICK_DISCORD in calls
     # mobile is NOT part of the full-restart standard set
     assert "push-mobile -a" not in calls
@@ -320,7 +324,7 @@ def test_bare_main_non_ff_aborts_without_restart(tmp_path: Path) -> None:
     assert proc.returncode != 0
     assert "bare main is not a fast-forward" in proc.stdout
     calls = logfile.read_text()
-    assert KICK_TOKENAPI not in calls
+    assert RESTART_TOKENAPI not in calls
     assert KICK_DISCORD not in calls
 
 
@@ -337,7 +341,7 @@ def test_dirty_runtime_shunts_then_restarts_changed_service(tmp_path: Path) -> N
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "auto-preserving WIP to wip/live-dirty-" in proc.stdout
     calls = logfile.read_text()
-    assert KICK_TOKENAPI in calls
+    assert RESTART_TOKENAPI in calls
     assert KICK_DISCORD not in calls
 
 
@@ -372,7 +376,7 @@ def test_locked_runtime_is_unlocked_for_git_sync_then_relocked(tmp_path: Path) -
     assert "runtime write-protected" in proc.stdout
     assert not _has_any_write_bit(runtime)
     assert not _has_any_write_bit(git_dir)
-    assert KICK_TOKENAPI in logfile.read_text()
+    assert RESTART_TOKENAPI in logfile.read_text()
 
 
 def test_cd_bare_repo_config_is_distinct_from_worktree_bare_repo(tmp_path: Path) -> None:
@@ -431,7 +435,7 @@ def test_mac_affecting_deploy_reloads_without_wiping_fleet(tmp_path: Path) -> No
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert KICK_TOKENAPI in calls  # it DID reload the service…
+    assert RESTART_TOKENAPI in calls  # it DID reload the service…
     _assert_no_fleet_wipe(calls)  # …without wiping the fleet.
 
 
@@ -443,6 +447,6 @@ def test_no_advance_full_restart_still_never_wipes_fleet(tmp_path: Path) -> None
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert KICK_TOKENAPI in calls
+    assert RESTART_TOKENAPI in calls
     assert KICK_DISCORD in calls
     _assert_no_fleet_wipe(calls)

@@ -26811,4 +26811,27 @@ hooks_init_deps(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
+    from launchd_socket import activated_fd
+
+    # Bound on how long uvicorn lets in-flight requests drain on SIGTERM before
+    # forcing shutdown. Pairs with token-restart's graceful (SIGTERM) restart so
+    # a planned deploy finishes requests in flight rather than resetting them.
+    GRACEFUL_SHUTDOWN_TIMEOUT = 10
+
+    # On macOS the service is launched by launchd with a Sockets entry, so the
+    # listening socket (and its kernel accept backlog) is owned by launchd and
+    # survives uvicorn restarts: incoming hooks stall briefly instead of being
+    # connection-refused. Everywhere else (dev, `token-restart --from`, the WSL
+    # satellite) there is no activated socket and we fall back to a host/port
+    # bind.
+    fd = activated_fd("Listeners")
+    if fd is not None:
+        logger.info("serving on launchd-activated socket fd=%d", fd)
+        uvicorn.run(app, fd=fd, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT)
+    else:
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=SERVER_PORT,
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
+        )

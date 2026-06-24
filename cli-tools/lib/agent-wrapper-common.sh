@@ -49,13 +49,65 @@ normalize_pane_to_canonical() {
   printf '%s' "$pane"
 }
 
+# Where token_wrapper_post_hook tallies dropped hooks, one TSV line per failure
+# (ts \t action \t cause). Cheap instrumentation to quantify how material the
+# restart window (conn-refused) is vs the fd-burst path (server-side EMFILE,
+# tagged in routes/hooks.py) — `sort -k3 | uniq -c` by cause. Not a suppressor:
+# we never gate or dedup on it (see anti-blind-dedup / no-suppress-debounce).
+TOKEN_WRAPPER_HOOK_FAILURE_LOG="${TOKEN_WRAPPER_HOOK_FAILURE_LOG:-${HOME}/.claude/logs/hook-post-failures.log}"
+
+token_wrapper_record_hook_failure() {
+  local action_type="$1" cause="$2"
+  local dir
+  dir="$(dirname "$TOKEN_WRAPPER_HOOK_FAILURE_LOG")"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action_type" "$cause" \
+    >> "$TOKEN_WRAPPER_HOOK_FAILURE_LOG" 2>/dev/null || true
+}
+
 token_wrapper_post_hook() {
   local action_type="$1"
   local payload="$2"
-  curl -s --connect-timeout 2 --max-time 5 \
+  # Bounded retry belt. launchd socket activation (the primary fix) holds new
+  # connections in the kernel accept backlog across a planned restart, so they
+  # stall instead of being connection-refused; this belt covers the residuals it
+  # can't (backlog overflow under burst, a request killed mid-flight). Flags
+  # mirror the SessionStart sender in claude-config/hooks/generic-hook.sh:
+  # --retry-connrefused retries the restart window; --retry-max-time caps the
+  # total window so a genuinely-down server can't hang the wrapper. No dedup/gate
+  # and no idempotency key — there is no replay (SessionStart dedups on
+  # session_id at the row level).
+  # `&& rc=0 || rc=$?` keeps this set -e safe: a non-zero curl (e.g. rc=7 when the
+  # server is down) would otherwise abort a sourcing wrapper that runs under
+  # `set -euo pipefail` (dispatch does) right at the assignment, before we can
+  # tally the cause. The compound always succeeds, so errexit never fires here.
+  local http_code rc
+  http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+    --connect-timeout 2 --max-time 5 \
+    --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 12 \
     -X POST "${API_URL}/api/hooks/${action_type}" \
     -H "Content-Type: application/json" \
-    -d "$payload" >/dev/null 2>&1 || true
+    -d "$payload" 2>/dev/null) && rc=0 || rc=$?
+
+  if [[ "$rc" -eq 0 && "$http_code" == 2* ]]; then
+    return 0
+  fi
+
+  # Tag the failure cause for the tally above. The EMFILE fd-burst path is
+  # tagged server-side (routes/hooks.py); from the client we distinguish the
+  # restart window (conn-refused) from a slow/hung accept (timeout) and HTTP
+  # errors. Stay fire-and-forget: always return 0 so a dropped hook never breaks
+  # the wrapper.
+  local cause
+  case "$rc" in
+    7)  cause="conn-refused" ;;            # ECONNREFUSED: restart window / backlog overflow
+    28) cause="timeout" ;;                 # --connect-timeout / --max-time exceeded
+    0)  cause="http-${http_code:-000}" ;;  # connected but non-2xx
+    *)  cause="other-rc${rc}" ;;
+  esac
+  token_wrapper_record_hook_failure "$action_type" "$cause"
+  return 0
 }
 
 token_wrapper_build_payload() {

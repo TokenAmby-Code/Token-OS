@@ -71,4 +71,6 @@ def test_assert_personas_text_format(capsys):
     assert rc == 0
     lines = out.strip().splitlines()
     assert lines[0] == "council:custodes\tok\tnone\tlive"
-    assert lines[1] == "council:administratum\tFAIL\tpersona_unregistered_noted\tlive_runtime_no_row"
+    assert (
+        lines[1] == "council:administratum\tFAIL\tpersona_unregistered_noted\tlive_runtime_no_row"
+    )

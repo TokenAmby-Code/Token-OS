@@ -90,7 +90,11 @@ def test_full_restart_includes_discord(tmp_path: Path) -> None:
     proc = _run(["--no-sync"], env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert f"kickstart -k gui/501/{TOKENAPI_LABEL}" in calls
+    # token-api now restarts via a graceful drain — restart_mac queries the
+    # launchd pid (`launchctl print <mac label>`) instead of `kickstart -k`.
+    assert f"print gui/{UID}/{TOKENAPI_LABEL}" in calls
+    assert f"kickstart -k gui/{UID}/{TOKENAPI_LABEL}" not in calls
+    # Discord still bounces via kickstart -k.
     assert f"kickstart -k gui/{UID}/{DISCORD_LABEL}" in calls
 
 

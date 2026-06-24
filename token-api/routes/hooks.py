@@ -10,6 +10,7 @@ Uses dependency injection from main.py for runtime-owned callbacks.
 """
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -961,6 +962,12 @@ def _render_state_injection(kind: str, payload: dict) -> str:
             lines.append(f"- exit_summary: {payload['exit_summary']}")
         lines.append("</system-reminder>")
         return "\n".join(lines)
+    if kind == "worker_poked":
+        worker = payload.get("child_instance_id") or "a worker"
+        doc = payload.get("child_session_doc_id")
+        label = f"{worker} (session_doc {doc})" if doc else str(worker)
+        prompt_text = payload.get("prompt_text") or ""
+        return f'<system-reminder>\n⬆ Emperor poked {label}: "{prompt_text}"\n</system-reminder>'
     return f"<system-reminder>\nState injection: {kind}\n{json.dumps(payload, sort_keys=True)}\n</system-reminder>"
 
 
@@ -1089,6 +1096,67 @@ async def _enqueue_child_stop_fanout(instance: dict, payload: dict) -> dict | No
     return {
         "injection_id": injection_id,
         "audience_instance_id": parent_instance_id,
+        "payload": injection_payload,
+    }
+
+
+async def _enqueue_poke_fanout(db, instance: dict, payload: dict) -> dict | None:
+    """Sister to `_enqueue_child_stop_fanout`: a genuine human poke (a
+    UserPromptSubmit on an instance whose `hook_driven` is falsy — no automated
+    wake preceded it) to a commanded worker enqueues a `worker_poked`
+    state-injection addressed to that worker's commander, carrying the verbatim
+    prompt so the commander gets the actual instruction, not just a "you were
+    touched" ping.
+
+    Reuses the already-open `db` (handle_prompt_submit holds the connection) —
+    unlike the Stop fanout we do NOT open a nested connection or commit here; the
+    caller commits. Resolves only the immediate chapter-edge commander (the FG
+    case); persona/Custodes-commanded workers resolve to None and are out of
+    scope, mirroring the Stop fanout's current chapter-only reach."""
+    commander_id = _normalize_text(_row_parent_instance_id(instance))
+    if not commander_id:
+        return None
+
+    prompt_text = next(iter(_iter_prompt_texts(payload)), None)
+    if not prompt_text:
+        return None
+
+    child_instance_id = instance["id"]
+    injection_payload = {
+        "kind": "worker_poked",
+        "child_instance_id": child_instance_id,
+        "child_session_doc_id": instance.get("session_doc_id"),
+        "prompt_text": prompt_text,
+        "prompt_hash": payload.get("prompt_hash") or payload.get("payload_hash"),
+    }
+    injection_id = await _enqueue_state_injection(
+        db,
+        audience_instance_id=commander_id,
+        source_instance_id=child_instance_id,
+        kind="worker_poked",
+        payload=injection_payload,
+    )
+    # Redact verbatim prompt from telemetry — event logs are long-lived, so keep
+    # the raw text only in the injection payload (delivered once, then consumed),
+    # never in the event stream. Carry length for observability.
+    redacted_payload = {
+        **injection_payload,
+        "prompt_text": None,
+        "prompt_len": len(prompt_text),
+    }
+    await log_event(
+        "state_injection_enqueued",
+        instance_id=child_instance_id,
+        details={
+            "audience_instance_id": commander_id,
+            "kind": "worker_poked",
+            "injection_id": injection_id,
+            "payload": redacted_payload,
+        },
+    )
+    return {
+        "injection_id": injection_id,
+        "audience_instance_id": commander_id,
         "payload": injection_payload,
     }
 
@@ -4685,6 +4753,16 @@ async def handle_prompt_submit(payload: dict) -> dict:
 
         consumed_injections = await _consume_state_injections(db, session_id)
 
+        # Sister to Stop→commander: a genuine human poke (hook_driven falsy = not an
+        # automated wake) to a commanded worker notifies that worker's commander,
+        # carrying the verbatim prompt. hook_driven=1 means an automated wake (FG
+        # talk/brief, state fanout, dispatch brief) preceded this prompt — the
+        # self-notify-loop guard, so the commander is never pinged about its own
+        # messages. No dedup table: handle_prompt_submit runs once per
+        # UserPromptSubmit, so one poke = one injection.
+        if not existing_dict.get("hook_driven"):
+            await _enqueue_poke_fanout(db, existing_dict, payload)
+
         planning_event = None
         preplan_subscription = None
         if _payload_starts_preplan(payload):
@@ -6721,6 +6799,39 @@ async def prune_hook_subscriptions(request: HookPruneRequest) -> dict:
 
 
 # Hook dispatcher endpoint
+# Running tally of critical-hook (SessionStart) registration failures by cause,
+# so we can confirm how material each drop source is. Pairs with the client-side
+# tally in cli-tools/lib/agent-wrapper-common.sh: conn-refused/timeout are tagged
+# THERE (the request never reached the server — restart window / hung accept);
+# what reaches this handler and still fails is the fd-burst path (EMFILE) or a
+# lock/other server-side failure. This distinguishes the restart-window drops
+# (which socket activation + graceful drain target) from the EMFILE path (which
+# the fd-limit bump band-aids) — see the OPEN_PROBLEMS note on fd bursts.
+_SESSION_START_FAILURE_CAUSES: dict[str, int] = {}
+
+
+def _classify_session_start_failure(exc: BaseException) -> str:
+    """Coarse cause tag for a failed SessionStart registration write.
+
+    EMFILE is the signal we most want to isolate (fd exhaustion under burst);
+    everything else collapses to db-locked vs other. conn-refused / timeout do
+    not appear here — those mean the POST never landed and are tagged client-side.
+    """
+    err: BaseException | None = exc
+    while err is not None:
+        if isinstance(err, OSError) and err.errno == errno.EMFILE:
+            return "emfile"
+        err = err.__cause__ or err.__context__
+    msg = str(exc).lower()
+    if "too many open files" in msg:
+        return "emfile"
+    if "database is locked" in msg:
+        return "db-locked"
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    return "other"
+
+
 @router.post("/api/hooks/{action_type}")
 async def dispatch_hook(action_type: str, payload: dict, request: Request) -> dict:
     """
@@ -6771,15 +6882,28 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
         return await handler(payload)
     except Exception as e:
         logger.error(f"Hook handler error ({normalized_action_type}): {e}")
-        try:
-            await log_event(
-                "hook_error",
-                details={
-                    "action_type": normalized_action_type,
-                    "raw_action_type": action_type,
-                    "error": str(e),
-                },
+
+        # Tag + count the failure cause on the critical SessionStart path so we
+        # can quantify which drop source is material (EMFILE fd-burst vs other).
+        cause = None
+        if normalized_action_type == "SessionStart":
+            cause = _classify_session_start_failure(e)
+            _SESSION_START_FAILURE_CAUSES[cause] = _SESSION_START_FAILURE_CAUSES.get(cause, 0) + 1
+            logger.warning(
+                "Hook: SessionStart registration failed cause=%s tally=%s",
+                cause,
+                dict(_SESSION_START_FAILURE_CAUSES),
             )
+
+        try:
+            details: dict[str, Any] = {
+                "action_type": normalized_action_type,
+                "raw_action_type": action_type,
+                "error": str(e),
+            }
+            if cause is not None:
+                details["cause"] = cause
+            await log_event("hook_error", details=details)
         except Exception:  # noqa: BLE001 — event log shares the DB; never mask the real failure
             pass
 
@@ -6790,6 +6914,6 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
         if normalized_action_type == "SessionStart":
             raise HTTPException(
                 status_code=503,
-                detail=f"SessionStart registration write failed: {e}",
+                detail=f"SessionStart registration write failed [{cause}]: {e}",
             ) from e
         return {"success": False, "action": "handler_error", "error": str(e)}
