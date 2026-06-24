@@ -38,13 +38,13 @@ class _FakeProc:
         return SimpleNamespace(decode=lambda *a, **k: "")
 
 
-def _insert_claude_row(conn, sid, *, instance_type, tmux_pane, legion, status="idle"):
+def _insert_claude_row(conn, sid, *, instance_type, legion, status="idle"):
     now = datetime.now().isoformat()
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, legion, instance_type, tmux_pane, registered_at, last_activity)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?, ?)""",
+            status, legion, instance_type, registered_at, last_activity)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, ?, ?, ?)""",
         (
             sid,
             str(uuid.uuid4()),
@@ -53,7 +53,6 @@ def _insert_claude_row(conn, sid, *, instance_type, tmux_pane, legion, status="i
             status,
             legion,
             instance_type,
-            tmux_pane,
             now,
             now,
         ),
@@ -61,7 +60,7 @@ def _insert_claude_row(conn, sid, *, instance_type, tmux_pane, legion, status="i
 
 
 def _insert_custodes_instance(
-    db_path, *, instance_type="hook_driven", tmux_pane="%42", rank="overseer", status="idle"
+    db_path, *, instance_type="hook_driven", rank="overseer", status="idle"
 ):
     """A resting Custodes: an instances row with persona=custodes, rank=overseer,
     and NO sync mode by default. The keepalive must fire on persona identity
@@ -77,7 +76,6 @@ def _insert_custodes_instance(
         conn,
         sid,
         instance_type=instance_type,
-        tmux_pane=tmux_pane,
         legion="custodes",
         status=status,
     )
@@ -107,12 +105,12 @@ def _insert_custodes_instance(
     return sid
 
 
-def _insert_plain_instance(db_path, *, instance_type="sync", tmux_pane="%42", legion="mechanicus"):
+def _insert_plain_instance(db_path, *, instance_type="sync", legion="mechanicus"):
     """A claude_instances row with NO canonical custodes identity — used to exercise
     the residual sync-MODE branch (non-custodes) and the non-custodes/non-sync case."""
     sid = str(uuid.uuid4())
     conn = sqlite3.connect(db_path)
-    _insert_claude_row(conn, sid, instance_type=instance_type, tmux_pane=tmux_pane, legion=legion)
+    _insert_claude_row(conn, sid, instance_type=instance_type, legion=legion)
     conn.commit()
     conn.close()
     return sid
@@ -205,7 +203,13 @@ def test_custodes_timer_morning_reinjects_keepalive_without_sync_mode(app_env, m
         calls.append(cmd)
         return _FakeProc(0)
 
+    # Pane geometry is resolved live from the oracle now (no stored tmux_pane):
+    # the Custodes pane resolves to %42, the keepalive target.
+    async def fake_resolve_pane(_instance_id):
+        return ("%42", "main")
+
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_offloop)
+    monkeypatch.setattr(hooks.shared, "resolve_instance_pane", fake_resolve_pane)
 
     result = asyncio.run(hooks.handle_stop({"session_id": sid}))
     assert result["action"] == "stop_processed_sync"
@@ -456,8 +460,8 @@ def test_custodes_injection_resolves_via_pane_marker_not_synced(app_env, monkeyp
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, legion, synced, instance_type, tmux_pane, registered_at, last_activity)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', 'custodes', 0, 'one_off', '%42', ?, ?)""",
+            status, legion, synced, instance_type, registered_at, last_activity)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'idle', 'custodes', 0, 'one_off', ?, ?)""",
         ("cust-stale", str(uuid.uuid4()), "cust", "/tmp", now, now),
     )
     conn.commit()

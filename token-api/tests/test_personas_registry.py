@@ -103,6 +103,12 @@ async def test_resolver_silent_and_voiced_personas(app_env):
     assert admin["tts_voice"] is None and admin["silent"] is True
     assert fg["pane_tint"] == admin["pane_tint"] == "#300808"
 
+    # The Custodes Trinity shares the daily-note-as-session-doc default; workers do not.
+    assert custodes["default_session_doc"] == "daily_note"
+    assert fg["default_session_doc"] == "daily_note"
+    assert admin["default_session_doc"] == "daily_note"
+    assert chapter["default_session_doc"] is None
+
     assert chapter["display_name"] == "Blood Angels"
     assert chapter["assignment_pool"] == "primary"
     assert chapter["tts_voice"] == "Microsoft Ravi"

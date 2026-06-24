@@ -51,7 +51,7 @@ from shared import (
     is_phone_reachable,
     is_satellite_tts_available,
     log_event,
-    resolve_tmux_pane_id,
+    resolve_instance_pane,
 )
 
 logger = logging.getLogger("token_api")
@@ -85,16 +85,20 @@ router = APIRouter()
 # Set by init_deps() called from main.py after import.
 
 _send_to_phone = None
+_custodes_state_event_handler = None
+TTS_LANGUISHING_THRESHOLD = 5
 
 
-def init_deps(*, send_to_phone=None):
+def init_deps(*, send_to_phone=None, custodes_state_event_handler=None):
     """Receive dependencies from main.py to avoid circular imports.
 
     Called once during app startup, before any requests are served.
     """
-    global _send_to_phone
+    global _send_to_phone, _custodes_state_event_handler
     if send_to_phone is not None:
         _send_to_phone = send_to_phone
+    if custodes_state_event_handler is not None:
+        _custodes_state_event_handler = custodes_state_event_handler
 
 
 # ============ Pydantic Models ============
@@ -728,8 +732,8 @@ class TTSQueueItem:
     queue_target: str = "pause"  # "hot" or "pause"
     queued_at: datetime = field(default_factory=datetime.now)
     status: str = "queued"  # queued, playing, completed
-    tmux_pane: str | None = None  # pane ID for @TTS_STATE tracking
-    focus_on_playback: bool = False  # true only for event/urgent hot speech
+    tmux_pane: str | None = None  # live-resolved pane id for @TTS_STATE tracking (set at playback)
+    focus_on_playback: bool = False  # true only for explicit operator-initiated playback
 
 
 # Global TTS queue state — two-queue model
@@ -907,7 +911,7 @@ async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """SELECT device_id, tmux_pane,
+                """SELECT device_id,
                           CASE WHEN interaction_mode = 'voice_chat'
                                THEN 'voice-chat' ELSE notification_mode END AS tts_mode
                    FROM instances WHERE id = ?""",
@@ -919,7 +923,6 @@ async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
             return {"snapped": False, "reason": "instance_gone"}
 
         device_id = row["device_id"]
-        tmux_pane = row["tmux_pane"]
         tts_mode = row["tts_mode"]
 
         # Voice-chat: the operator is conversing by voice, not reading the pane.
@@ -931,10 +934,6 @@ async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
         if not local or device_id != local:
             return {"snapped": False, "reason": "remote_pane", "device_id": device_id}
 
-        # Custodes/cron-originated TTS with no real pane: nothing to snap to.
-        if not tmux_pane:
-            return {"snapped": False, "reason": "no_pane"}
-
         # Discord voice backend: audio plays in the VC, not at a tmux pane.
         try:
             routing = resolve_tts_device(instance_id=item.instance_id)
@@ -943,9 +942,11 @@ async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
         except Exception:
             pass  # routing probe is best-effort; never block the snap on it
 
-        pane_id = await resolve_tmux_pane_id(tmux_pane)
+        # Live oracle: resolve the originating instance to its current pane.
+        # Custodes/cron-originated TTS with no live pane yields (None, _) -> no_pane.
+        pane_id, _role = await resolve_instance_pane(item.instance_id)
         if not pane_id:
-            return {"snapped": False, "reason": "pane_dead"}
+            return {"snapped": False, "reason": "no_pane"}
 
         result = await _focus_zoom_and_mark(pane_id)
         logger.info(f"TTS focus snap -> {pane_id} ({result.get('actions')})")
@@ -972,7 +973,7 @@ async def select_instance_pane(instance_id: str) -> dict:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT device_id, tmux_pane FROM instances WHERE id = ?",
+                "SELECT device_id FROM instances WHERE id = ?",
                 (instance_id,),
             )
             row = await cursor.fetchone()
@@ -981,19 +982,16 @@ async def select_instance_pane(instance_id: str) -> dict:
             return {"snapped": False, "reason": "instance_gone"}
 
         device_id = row["device_id"]
-        tmux_pane = row["tmux_pane"]
 
         # Local-only: only the machine that owns the pane can focus it.
         local = _local_device_name()
         if not local or device_id != local:
             return {"snapped": False, "reason": "remote_pane", "device_id": device_id}
 
-        if not tmux_pane:
-            return {"snapped": False, "reason": "no_pane"}
-
-        pane_id = await resolve_tmux_pane_id(tmux_pane)
+        # Live oracle: resolve the instance to its current pane.
+        pane_id, _role = await resolve_instance_pane(instance_id)
         if not pane_id:
-            return {"snapped": False, "reason": "pane_dead"}
+            return {"snapped": False, "reason": "no_pane"}
 
         result = await _focus_zoom_and_mark(pane_id)
         logger.info(f"Ops manual focus -> {pane_id} ({result.get('actions')})")
@@ -1014,7 +1012,7 @@ async def focus_instance_pane(instance_id: str) -> dict:
     return await select_instance_pane(instance_id)
 
 
-async def tts_queue_worker():
+async def tts_queue_worker() -> None:
     """Background worker that processes TTS hot queue sequentially.
 
     Only drains from hot_queue. Pause queue items must be promoted to hot
@@ -1052,6 +1050,11 @@ async def tts_queue_worker():
                         "tab_name": tts_current.tab_name,
                     },
                 )
+
+                # Resolve the source pane LIVE (oracle) at playback time and stash
+                # it on the item for the speaking/clear @TTS_STATE writes below.
+                # (None on a dead/unstamped pane -> _set_tts_state no-ops.)
+                tts_current.tmux_pane, _ = await resolve_instance_pane(tts_current.instance_id)
 
                 # Set @TTS_STATE on source pane
                 _set_tts_state(tts_current.tmux_pane, "speaking")
@@ -1143,6 +1146,14 @@ async def tts_queue_worker():
 
         except Exception as e:
             logger.error(f"TTS worker error: {e}")
+            # Never leave the source pane stuck "speaking" when playback raises
+            # after @TTS_STATE was set: clear it before looping (best-effort).
+            try:
+                if tts_current is not None and getattr(tts_current, "tmux_pane", None):
+                    _set_tts_state(tts_current.tmux_pane, "")
+            except Exception:
+                pass
+            tts_current = None
             await asyncio.sleep(1)
 
 
@@ -1181,8 +1192,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         cursor = await db.execute(
             """SELECT name AS tab_name, tts_voice, notification_sound,
                       CASE WHEN interaction_mode = 'voice_chat'
-                           THEN 'voice-chat' ELSE notification_mode END AS tts_mode,
-                      tmux_pane
+                           THEN 'voice-chat' ELSE notification_mode END AS tts_mode
                FROM instances WHERE id = ?""",
             (instance_id,),
         )
@@ -1197,7 +1207,6 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     voice = row["tts_voice"]
     sound = row["notification_sound"]
     tab_name = row["tab_name"] or instance_id
-    tmux_pane = row["tmux_pane"] if "tmux_pane" in row.keys() else None
 
     # Check TTS mode (per-instance and global, most restrictive wins)
     instance_mode = row["tts_mode"] or "verbose"
@@ -1224,7 +1233,6 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             sound=sound,
             tab_name=tab_name,
             queue_target=queue_target,
-            tmux_pane=tmux_pane,
             focus_on_playback=False,
         )
     else:
@@ -1235,7 +1243,6 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             sound=sound,
             tab_name=tab_name,
             queue_target=queue_target,
-            tmux_pane=tmux_pane,
             focus_on_playback=False,
         )
 
@@ -1246,6 +1253,9 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         else:
             pause_queue.append(item)
             position = len(pause_queue)
+
+    if queue_target == "pause":
+        await _maybe_emit_tts_languishing_enforcement(position=position, item=item)
 
     # Log queued event
     await log_event(
@@ -1276,6 +1286,48 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         "voice": voice,
         "sound": sound,
     }
+
+
+async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQueueItem) -> None:
+    """Escalate when the manually-played TTS pause queue starts languishing.
+
+    Pause-queue length above the threshold means speech is accumulating but not
+    being heard. That is an attention failure, so emit a recognized enforcement
+    state event to the Custodes/Administratum hook path. The state-event router
+    owns dedupe; this helper stays best-effort and never blocks queueing.
+    """
+    if position <= TTS_LANGUISHING_THRESHOLD or _custodes_state_event_handler is None:
+        return
+
+    payload = {
+        "app": "tts_queue",
+        "queue": "pause",
+        "pause_queue_length": position,
+        "threshold": TTS_LANGUISHING_THRESHOLD,
+        "latest_instance_id": item.instance_id,
+        "latest_tab_name": item.tab_name,
+        "oldest_queued_at": pause_queue[0].queued_at.isoformat() if pause_queue else None,
+    }
+    try:
+        await _custodes_state_event_handler(
+            "tts_queue_languishing",
+            "tts_queue",
+            instance_id=item.instance_id,
+            severity=4 if position >= 10 else 3,
+            payload=payload,
+            event_class="enforcement",
+        )
+    except Exception as exc:
+        logger.warning("TTS languishing enforcement emit failed: %s", exc)
+        try:
+            await log_event(
+                "tts_languishing_enforcement_failed",
+                instance_id=item.instance_id,
+                device_id="tts_queue",
+                details={"error": str(exc), **payload},
+            )
+        except Exception:
+            pass
 
 
 def _queue_item_to_dict(item: TTSQueueItem) -> dict:

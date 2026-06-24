@@ -2,18 +2,18 @@
 
 Ticket: Mars/Tasks/TTS Playback Focus Snap.md
 
-Rule: when an event-hot TTS item begins *playback* (the moment the playback
-dispatcher transitions `tts_current` from None -> item), snap the operator's tmux
-focus to the originating pane and zoom it. Pause-queue summaries promoted later
-do not snap focus; they are notification backlog, not a live pane speaking event.
+Rule: TTS playback focus snap is opt-in. Direct hot TTS produced by hooks must
+not steal tmux focus; items explicitly promoted/played from the pause queue may
+snap because the operator's play action is the focus intent.
 
 These tests pin the hook (`_snap_focus_to_speaker`), the zoom-dedup primitive
 (`_focus_and_zoom_pane`), and the wiring into `tts_queue_worker`. They cover
 every edge case the ticket enumerates:
 
 - pane no longer exists -> skip snap, playback continues
-- rapid successive event-hot items from different panes -> snap on each transition
-- promoted pause-queue items -> no snap
+- rapid successive explicit-play items from different panes -> snap on each transition
+- direct hot TTS -> no snap by default
+- promoted pause-queue items -> snap
 - custodes/cron-originated TTS with no real pane -> skip
 - voice chat / Discord backend -> no snap
 - cross-machine -> local-only snap (remote panes skipped)
@@ -47,14 +47,17 @@ def _insert_instance(
     status="idle",
 ):
     iid = instance_id or str(uuid.uuid4())
+    # ``tmux_pane`` is accepted for caller readability but no longer stored: the
+    # snap resolves the pane live from the tmuxctl oracle (resolve_instance_pane),
+    # which tests control via monkeypatch. Only the device/mode columns matter here.
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, tmux_pane, tts_mode, registered_at, last_activity)
-           VALUES (?, ?, ?, '/tmp/test', 'local', ?, ?, ?, ?,
+            status, tts_mode, registered_at, last_activity)
+           VALUES (?, ?, ?, '/tmp/test', 'local', ?, ?, ?,
                    datetime('now'), datetime('now'))""",
-        (iid, str(uuid.uuid4()), f"test-{iid[:8]}", device_id, status, tmux_pane, tts_mode),
+        (iid, str(uuid.uuid4()), f"test-{iid[:8]}", device_id, status, tts_mode),
     )
     conn.commit()
     conn.close()
@@ -172,11 +175,11 @@ def test_snap_happy_path_local_pane(app_env, monkeypatch):
     _patch_local_machine(tts, monkeypatch)
     _patch_routing_local(tts, monkeypatch)
 
-    async def fake_resolve(pane):
-        assert pane == "palace:1"  # canonical surface value, not a raw %id
-        return "%42"
+    async def fake_resolve(resolved_instance_id):
+        assert resolved_instance_id == iid  # oracle keyed by instance id
+        return ("%42", "palace:speaker")
 
-    monkeypatch.setattr(tts, "resolve_tmux_pane_id", fake_resolve)
+    monkeypatch.setattr(tts, "resolve_instance_pane", fake_resolve)
 
     focused = {}
 
@@ -206,10 +209,10 @@ def test_snap_skips_when_pane_dead(app_env, monkeypatch):
     _patch_local_machine(tts, monkeypatch)
     _patch_routing_local(tts, monkeypatch)
 
-    async def fake_resolve(pane):
-        return None  # pane gone
+    async def fake_resolve(resolved_instance_id):
+        return (None, None)  # pane gone
 
-    monkeypatch.setattr(tts, "resolve_tmux_pane_id", fake_resolve)
+    monkeypatch.setattr(tts, "resolve_instance_pane", fake_resolve)
 
     called = {"focus": False}
 
@@ -221,7 +224,9 @@ def test_snap_skips_when_pane_dead(app_env, monkeypatch):
 
     result = asyncio.run(tts._snap_focus_to_speaker(_make_item(tts, iid)))
     assert result["snapped"] is False
-    assert result["reason"] == "pane_dead"
+    # The oracle collapses "pane no longer resolves" into no_pane (no stored
+    # column to distinguish a dead pane from an absent one).
+    assert result["reason"] == "no_pane"
     assert called["focus"] is False
 
 
@@ -291,14 +296,14 @@ def test_snap_never_raises_on_error(app_env, monkeypatch):
     _patch_local_machine(tts, monkeypatch)
     _patch_routing_local(tts, monkeypatch)
 
-    async def fake_resolve(pane):
-        return "%42"
+    async def fake_resolve(resolved_instance_id):
+        return ("%42", "palace:speaker")
 
     async def boom(pane_id):
         raise RuntimeError("tmux exploded")
 
-    monkeypatch.setattr(tts, "resolve_tmux_pane_id", fake_resolve)
-    monkeypatch.setattr(tts, "_focus_and_zoom_pane", boom)
+    monkeypatch.setattr(tts, "resolve_instance_pane", fake_resolve)
+    monkeypatch.setattr(tts, "_focus_zoom_and_mark", boom)
 
     result = asyncio.run(tts._snap_focus_to_speaker(_make_item(tts, iid)))
     assert result["snapped"] is False
@@ -501,11 +506,11 @@ def test_select_instance_pane_happy_path(app_env, monkeypatch):
     iid = _insert_instance(app_env.db_path, tmux_pane="palace:1")
     _patch_local_machine(tts, monkeypatch)
 
-    async def fake_resolve(pane):
-        assert pane == "palace:1"
-        return "%42"
+    async def fake_resolve(resolved_instance_id):
+        assert resolved_instance_id == iid
+        return ("%42", "palace:speaker")
 
-    monkeypatch.setattr(tts, "resolve_tmux_pane_id", fake_resolve)
+    monkeypatch.setattr(tts, "resolve_instance_pane", fake_resolve)
     rec = {}
     _patch_focus_zoom_mark(tts, monkeypatch, rec)
 
@@ -522,10 +527,10 @@ def test_select_instance_pane_bypasses_voice_chat(app_env, monkeypatch):
     iid = _insert_instance(app_env.db_path, tts_mode="voice-chat", tmux_pane="palace:1")
     _patch_local_machine(tts, monkeypatch)
 
-    async def fake_resolve(pane):
-        return "%42"
+    async def fake_resolve(resolved_instance_id):
+        return ("%42", "palace:speaker")
 
-    monkeypatch.setattr(tts, "resolve_tmux_pane_id", fake_resolve)
+    monkeypatch.setattr(tts, "resolve_instance_pane", fake_resolve)
     rec = {}
     _patch_focus_zoom_mark(tts, monkeypatch, rec)
 
@@ -573,10 +578,10 @@ def test_select_instance_pane_dead(app_env, monkeypatch):
     iid = _insert_instance(app_env.db_path, tmux_pane="palace:1")
     _patch_local_machine(tts, monkeypatch)
 
-    async def fake_resolve(pane):
-        return None
+    async def fake_resolve(resolved_instance_id):
+        return (None, None)
 
-    monkeypatch.setattr(tts, "resolve_tmux_pane_id", fake_resolve)
+    monkeypatch.setattr(tts, "resolve_instance_pane", fake_resolve)
     result = asyncio.run(tts.select_instance_pane(iid))
     assert result["snapped"] is False
-    assert result["reason"] == "pane_dead"
+    assert result["reason"] == "no_pane"

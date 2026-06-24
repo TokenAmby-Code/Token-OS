@@ -16,6 +16,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -620,7 +622,6 @@ async def queue_pane_var(
     instance_id: str,
     variable: str,
     value: str | None,
-    tmux_pane: str | None,
 ) -> None:
     """Enqueue one pushed pane @-var via ``pane_state_queue``.
 
@@ -628,12 +629,13 @@ async def queue_pane_var(
     ``pane_state_worker`` stays the only writer of pane options. ``value`` is coerced
     to "" when None so the NOT NULL ``value`` column never aborts the insert; the
     border treats "" as unset (the ``#{?@VAR,…,}`` conditional renders the empty
-    branch). The caller's transaction owns the commit.
+    branch). The caller's transaction owns the commit. No pane id is stored — the
+    worker re-resolves the live pane from ``instance_id`` per drain.
     """
     await db.execute(
-        """INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-           VALUES (?, ?, ?, ?)""",
-        (instance_id, variable, value or "", tmux_pane),
+        """INSERT INTO pane_state_queue (instance_id, variable, value)
+           VALUES (?, ?, ?)""",
+        (instance_id, variable, value or ""),
     )
 
 
@@ -642,41 +644,96 @@ async def push_agnostic_pane_vars(
 ) -> dict[str, str]:
     """Resolve + enqueue the engine-agnostic nametag vars from the canonical row.
 
-    Reads ``persona_id``/``session_doc_id``/``working_dir``/``tmux_pane`` from the
-    freshly-written ``instances`` row (uncommitted writes on the same connection are
-    visible) and enqueues ``@PERSONA``/``@SESSION_DOC``/``@CWD``. Identical for
-    ``engine='codex'`` and ``engine='claude'`` — agnosticism by construction. The
-    stored ``tmux_pane`` is only the queue's bookkeeping column; the worker
-    re-resolves the live pane per row. Best-effort: never raises into a caller in a
-    registration/legion critical section. Returns the resolved values (for tests).
+    Reads ``persona_id``/``session_doc_id``/``working_dir`` from the freshly-written
+    ``instances`` row (uncommitted writes on the same connection are visible) and
+    enqueues ``@PERSONA``/``@SESSION_DOC``/``@CWD``. Identical for ``engine='codex'``
+    and ``engine='claude'`` — agnosticism by construction. No pane id is read or
+    stored; the worker re-resolves the live pane from ``instance_id`` per drain.
+    Best-effort: never raises into a caller in a registration/legion critical
+    section. Returns the resolved values (for tests).
     """
     if not instance_id:
         return {}
     try:
         cursor = await db.execute(
-            "SELECT persona_id, session_doc_id, working_dir, tmux_pane FROM instances WHERE id = ?",
+            "SELECT persona_id, session_doc_id, working_dir FROM instances WHERE id = ?",
             (instance_id,),
         )
         row = await cursor.fetchone()
         if not row:
             return {}
-        persona_id, session_doc_id, working_dir, tmux_pane = (
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-        )
+        persona_id, session_doc_id, working_dir = (row[0], row[1], row[2])
         values = {
             "@PERSONA": await _persona_display_name(db, persona_id),
             "@SESSION_DOC": await _session_doc_title(db, session_doc_id),
             "@CWD": cwd_basename(working_dir),
         }
         for variable, value in values.items():
-            await queue_pane_var(db, instance_id, variable, value, tmux_pane)
+            await queue_pane_var(db, instance_id, variable, value)
         return values
     except Exception as exc:  # pragma: no cover - defensive, never fail the caller
         logger.warning("push_agnostic_pane_vars failed for %s: %s", instance_id, exc)
         return {}
+
+
+# ============ tmuxctld loopback client ============
+#
+# Optional fast path: when TMUXCTLD_URL is set, pane/instance resolution prefers
+# the local tmuxctld HTTP daemon (loopback, stdlib-only) over a fresh subprocess.
+# The subprocess path remains the fail-closed fallback when the daemon is absent
+# or errors. Requests go through an opener built with an EMPTY ProxyHandler so a
+# loopback call to 127.0.0.1 never gets routed through a system/env HTTP proxy
+# (http_proxy / HTTPS_PROXY / macOS system proxy) — that would break or hang it.
+
+_TMUXCTLD_OPENER: urllib.request.OpenerDirector = urllib.request.build_opener(
+    urllib.request.ProxyHandler({})
+)
+
+# The daemon is loopback-only and unauthenticated; the client refuses to speak to
+# anything but a loopback host, so a stray/hostile TMUXCTLD_URL cannot turn this
+# into an SSRF or exfiltration vector.
+_TMUXCTLD_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _tmuxctld_url() -> str | None:
+    """Return the configured tmuxctld base URL, or None.
+
+    Trailing slash trimmed; only ``http`` loopback URLs are honoured — a
+    non-loopback (or non-http) host is rejected (returns None) so the client
+    never reaches off-box.
+    """
+    url = str(os.environ.get("TMUXCTLD_URL") or "").strip().rstrip("/")
+    if not url:
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "http" or (parsed.hostname or "") not in _TMUXCTLD_LOOPBACK_HOSTS:
+        return None
+    return url
+
+
+def _tmuxctld_get_json(path: str, params: dict[str, str], *, timeout: float = 0.5) -> dict | None:
+    """GET ``path`` from the tmuxctld daemon and return the unwrapped ``result`` dict.
+
+    Returns None when the daemon is not configured, is unreachable, replies
+    non-200, or returns a non-``ok`` envelope — so every caller falls through to
+    its subprocess fallback. Proxy bypass is enforced via the module opener.
+    """
+    base = _tmuxctld_url()
+    if not base:
+        return None
+    query = urllib.parse.urlencode(params)
+    url = f"{base}{path}?{query}" if query else f"{base}{path}"
+    try:
+        with _TMUXCTLD_OPENER.open(url, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            payload = json.loads(resp.read().decode(errors="ignore") or "{}")
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return None
+    result = payload.get("result")
+    return result if isinstance(result, dict) else None
 
 
 async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, str | None]:
@@ -690,6 +747,18 @@ async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, st
     """
     if not instance_id:
         return (None, None)
+    # Fast path: prefer the tmuxctld loopback daemon when configured. Its
+    # /tmux/resolve-instance result is canonical-only and fail-closed, so a
+    # `found:false` is authoritative — no subprocess fallback in that case.
+    result = await asyncio.to_thread(
+        _tmuxctld_get_json, "/tmux/resolve-instance", {"instance_id": instance_id}, timeout=0.5
+    )
+    if result is not None:
+        if not result.get("found"):
+            return (None, None)
+        pane_id = (result.get("pane_id") or "").strip() or None
+        role = (result.get("pane_role") or "").strip() or None
+        return (pane_id, role)
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         # sys.executable, never bare "python3": on the live host "python3" resolves
@@ -742,6 +811,14 @@ async def instance_id_for_pane(pane: str | None) -> str | None:
     """
     if not (pane or "").strip():
         return None
+    # Fast path: prefer the tmuxctld loopback daemon when configured. A reachable
+    # daemon's /tmux/instance-id-for-pane result is authoritative (empty stamp ->
+    # None); only fall through to the tmux subprocess when the daemon is absent.
+    result = await asyncio.to_thread(
+        _tmuxctld_get_json, "/tmux/instance-id-for-pane", {"pane": pane or ""}, timeout=0.5
+    )
+    if result is not None:
+        return (result.get("instance_id") or "").strip() or None
     try:
         proc = await _run_subprocess_offloop(
             ("tmux", "show-options", "-pv", "-t", pane, "@INSTANCE_ID"),

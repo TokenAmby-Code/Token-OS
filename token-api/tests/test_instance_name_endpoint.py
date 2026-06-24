@@ -4,26 +4,23 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+# Pane -> instance_id mapping seeded by ``_insert_instance``. The rename route
+# resolves a pane to its instance via the pane's live @INSTANCE_ID stamp
+# (tmuxctl owns resolution); there is no stored tmux_pane column and no tmux
+# server in tests, so the stubbed resolver consults this in-test map instead.
+_PANE_STAMPS: dict[str, str] = {}
+
 
 @pytest.fixture
 def client(app_env, monkeypatch):
-    # The rename route now resolves pane -> instance via the pane's live
-    # @INSTANCE_ID stamp (tmuxctl owns resolution). There is no tmux server in
-    # tests, so the real resolver fails closed and every rename would 404. Stub it
-    # to echo the active row whose stored tmux_pane matches — the dual-write reality
-    # where the live pane still equals the stored one — so these endpoint tests
-    # exercise their real contract.
+    _PANE_STAMPS.clear()
+
     async def _stamp(pane):
-        with sqlite3.connect(app_env.db_path) as conn:
-            r = conn.execute(
-                "SELECT id FROM instances WHERE tmux_pane = ? AND status != 'stopped' "
-                "ORDER BY last_activity DESC LIMIT 1",
-                (pane,),
-            ).fetchone()
-        return r[0] if r else None
+        return _PANE_STAMPS.get(pane)
 
     monkeypatch.setattr(app_env.main.shared, "instance_id_for_pane", _stamp)
-    return TestClient(app_env.main.app)
+    yield TestClient(app_env.main.app)
+    _PANE_STAMPS.clear()
 
 
 def _db(app_env):
@@ -37,14 +34,18 @@ def _insert_instance(app_env, *, tmux_pane="%77", status="idle", tab_name="Claud
     conn = _db(app_env)
     conn.execute(
         """INSERT INTO instances
-           (id, name, working_dir, origin_type, device_id, status, tmux_pane,
+           (id, name, working_dir, origin_type, device_id, status,
             engine, created_at, last_activity)
-           VALUES (?, ?, '/tmp', 'local', 'Mac-Mini', ?, ?, 'codex',
+           VALUES (?, ?, '/tmp', 'local', 'Mac-Mini', ?, 'codex',
                    '2026-05-10T13:00:00', '2026-05-10T13:00:00')""",
-        (instance_id, tab_name, status, tmux_pane),
+        (instance_id, tab_name, status),
     )
     conn.commit()
     conn.close()
+    # The live pane stamp resolves to this instance only while it is active —
+    # mirror the route's status guard by stamping every row, since the route
+    # itself rejects stopped/archived rows after resolution.
+    _PANE_STAMPS[tmux_pane] = instance_id
     return instance_id
 
 

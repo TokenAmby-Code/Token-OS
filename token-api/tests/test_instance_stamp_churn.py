@@ -36,13 +36,15 @@ _NEW_PANE = "%900918"
 
 
 def _insert(db_path, instance_id, *, pane=None, status="working", transplant_target=None):
+    # Pane liveness is no longer a stored column; ``pane`` only documents the
+    # live pane the test drives via TMUX_PANE / the unstamp spy.
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status, tmux_pane)
-           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?)""",
-        (instance_id, f"{instance_id}-session", instance_id, status, pane),
+            profile_name, tts_voice, notification_sound, status)
+           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'p', 'v', 's', ?)""",
+        (instance_id, f"{instance_id}-session", instance_id, status),
     )
     if transplant_target is not None:
         conn.execute(
@@ -72,10 +74,17 @@ def _spy_stamp_writes(hooks, monkeypatch):
     async def _no_stamp(_pane):
         return None
 
+    # The oracle owns the prior pane now (no stored tmux_pane column): the live
+    # instance resolves to the pane it still occupies so the unstamp guard has a
+    # real old pane to (not) vacate.
+    async def _resolve_pane(_instance_id):
+        return (_LIVE_PANE, "main")
+
     monkeypatch.setattr(hooks, "_stamp_instance_id", _astamp)
     monkeypatch.setattr(hooks, "_unstamp_instance_id", _aunstamp)
     monkeypatch.setattr(hooks, "_tmux_pane_label", _no_label)
     monkeypatch.setattr(hooks.shared, "instance_id_for_pane", _no_stamp)
+    monkeypatch.setattr(hooks.shared, "resolve_instance_pane", _resolve_pane)
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", _sync_noop)
     monkeypatch.setattr(hooks.shared, "apply_instance_pane_tint", _astamp)
     return unstamped

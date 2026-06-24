@@ -4,6 +4,7 @@ import fcntl
 import os
 import pathlib
 import subprocess
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "tmux-plan-approve-clear"
@@ -87,6 +88,32 @@ def test_codex_current_plan_modal_aborts_when_option_down_is_not_clear_context(
     assert out == "action=none timeout"
 
 
+def test_classifier_none_with_plan_tokens_logs_once_per_watcher(
+    tmp_path: pathlib.Path,
+) -> None:
+    fixture = tmp_path / "plan-token-no-modal.txt"
+    fixture.write_text("Implement this plan after reviewing the proposed steps.\n")
+    proc = subprocess.run(
+        [
+            str(SCRIPT),
+            "--capture-file",
+            str(fixture),
+            "--agent",
+            "codex",
+            "--timeout",
+            "1",
+            "--interval",
+            "0.1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.stdout == ""
+    assert proc.stderr.count("result=classifier-none-with-plan-tokens") == 1
+    assert "result=timeout" in proc.stderr
+
+
 def test_claude_ignores_stale_scrollback_modal_above_live_clear_context(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -154,8 +181,8 @@ def test_single_flight_lock_aborts_overlapping_watcher(tmp_path: pathlib.Path) -
     # failure, not a flake.) fcntl.flock contends with shell `flock(1)` because
     # both use the flock(2) syscall.
     safe = "%99".replace("%", "_")  # mirrors the script's `tr -c 'A-Za-z0-9_.-' '_'`
-    root = tmp_path / "tmux-plan-approve-clear"
-    root.mkdir(parents=True)
+    root = tmp_path / f"tmux-plan-approve-clear-{os.getuid()}"
+    root.mkdir(parents=True, mode=0o700)
     (root / f"{safe}.lockd").mkdir()  # mkdir-fallback backend (macOS)
     env = os.environ.copy()
     env["TMPDIR"] = str(tmp_path)
@@ -180,7 +207,7 @@ def test_successful_click_leaves_state_for_session_start(tmp_path):
     tmux_log = tmp_path / "tmux.log"
     (fakebin / "curl").write_text(
         "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' \"$*\" >> {curl_log!s}\n"
+        f'printf \'%s\\n\' "$*" >> "{curl_log!s}"\n'
         'case "$*" in\n'
         "  *'-G'*) printf '%s\\n' '{\"success\":true,\"planning_state\":\"planning\"}' ;;\n"
         "esac\n"
@@ -190,7 +217,7 @@ def test_successful_click_leaves_state_for_session_start(tmp_path):
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f"  capture-pane) cat {fixture!s} ;;\n"
-        f"  send-keys) printf '%s\\n' \"$*\" >> {tmux_log!s} ;;\n"
+        f'  send-keys) printf \'%s\\n\' "$*" >> "{tmux_log!s}" ;;\n'
         "esac\n"
     )
     for script in fakebin.iterdir():
@@ -274,3 +301,111 @@ def test_codex_truncated_current_plan_modal_accepts_fresh_thread_option(
         text=True,
     ).strip()
     assert out == "action=codex option-2 Down Enter"
+
+
+def test_lease_extension_keeps_locked_watcher_alive_past_original_timeout(
+    tmp_path: pathlib.Path,
+) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "tmux").write_text(
+        "#!/usr/bin/env bash\ncase \"$1\" in\n  capture-pane) printf 'no modal yet\\n' ;;\nesac\n"
+    )
+    (fakebin / "tmux").chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["TOKEN_API_TMUX_BIN"] = str(fakebin / "tmux")
+    env["TMPDIR"] = str(tmp_path)
+    root = tmp_path / f"tmux-plan-approve-clear-{os.getuid()}"
+    root.mkdir(mode=0o700)
+    lease = root / "_99.deadline"
+    start = time.monotonic()
+    proc = subprocess.Popen(
+        [str(SCRIPT), "--pane", "%99", "--agent", "codex", "--timeout", "1", "--no-state"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(0.4)
+    lease_tmp = lease.with_name(f"{lease.name}.tmp")
+    lease_tmp.write_text(str(int(time.time() + 2)))
+    os.replace(lease_tmp, lease)
+    stdout, stderr = proc.communicate(timeout=5)
+    elapsed = time.monotonic() - start
+    assert proc.returncode == 0
+    assert stdout == ""
+    assert elapsed >= 1.5
+    assert "result=timeout" in stderr
+
+
+def test_positional_pane_target_resolves_in_consumer_not_launcher(tmp_path: pathlib.Path) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+    (fakebin / "tmuxctl").write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "resolve-pane" ]]; then printf "%%55\\n"; exit 0; fi\n'
+        "exit 1\n"
+    )
+    (fakebin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  display-message) exit 1 ;;\n"
+        "  capture-pane) printf 'Implement this plan?\\n› 1. Yes, implement this plan\\n  2. Yes, clear context and implement  Fresh thread.\\n' ;;\n"
+        f'  send-keys) printf \'%s\\n\' "$*" >> "{tmux_log!s}" ;;\n'
+        "esac\n"
+    )
+    for script in fakebin.iterdir():
+        script.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["TOKEN_API_TMUX_BIN"] = str(fakebin / "tmux")
+    subprocess.check_call(
+        [str(SCRIPT), "--pane", "somnium:SE", "--agent", "codex", "--timeout", "1", "--no-state"],
+        env=env,
+    )
+    assert tmux_log.read_text().strip() == "send-keys -t %55 Down Enter"
+
+
+def test_instance_id_state_calls_avoid_tmux_pane_payload(tmp_path: pathlib.Path) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    curl_log = tmp_path / "curl.log"
+    tmux_log = tmp_path / "tmux.log"
+    (fakebin / "tmuxctl").write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "resolve-instance" ]]; then printf "%%56\\n"; exit 0; fi\n'
+        "exit 1\n"
+    )
+    (fakebin / "curl").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' "$*" >> "{curl_log!s}"\n'
+        'cat >> "' + str(curl_log) + '"\n'
+        'case "$*" in\n'
+        "  *'-G'*) printf '%s\\n' '{\"success\":true,\"planning_state\":\"planning\"}' ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    (fakebin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  display-message) exit 1 ;;\n"
+        "  capture-pane) printf 'Implement this plan?\\n› 1. Yes, implement this plan\\n  2. Yes, clear context and implement  Fresh thread.\\n' ;;\n"
+        f'  send-keys) printf \'%s\\n\' "$*" >> "{tmux_log!s}" ;;\n'
+        "esac\n"
+    )
+    for script in fakebin.iterdir():
+        script.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["TOKEN_API_TMUX_BIN"] = str(fakebin / "tmux")
+    env["TOKEN_API_URL"] = "http://token-api.test"
+    subprocess.check_call(
+        [str(SCRIPT), "--instance-id", "api-instance-1", "--agent", "codex", "--timeout", "1"],
+        env=env,
+    )
+    curl_text = curl_log.read_text()
+    assert "instance_id=api-instance-1" in curl_text
+    assert "tmux_pane" not in curl_text
+    assert tmux_log.read_text().strip() == "send-keys -t %56 Down Enter"

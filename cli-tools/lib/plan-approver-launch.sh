@@ -82,11 +82,99 @@ plan_approver_json_value_from() {
 plan_approver_trigger_timeout() {
     case "${1:-}" in
         precise_permission) printf '10\n' ;;
-        early_prompt) printf '90\n' ;;
-        post_tool) printf '30\n' ;;
-        late_stop) printf '10\n' ;;
+        early_prompt) printf '300\n' ;;
+        post_tool) printf '120\n' ;;
+        late_stop) printf '30\n' ;;
         *) return 1 ;;
     esac
+}
+
+plan_approver_safe_key_name() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9_.:-' '_'
+}
+
+plan_approver_runtime_root() {
+    local uid root mode
+    uid="${UID:-$(id -u 2>/dev/null || printf 'unknown')}"
+    root="${TMPDIR:-/tmp}/tmux-plan-approve-clear-${uid}"
+    ( umask 077 && mkdir -p "$root" ) 2>/dev/null || return 1
+    [[ -d "$root" && -O "$root" && ! -L "$root" ]] || return 1
+    mode="$(stat -c %a "$root" 2>/dev/null || stat -f %Lp "$root" 2>/dev/null || true)"
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 077) == 0 )) || return 1
+    printf '%s\n' "$root"
+}
+
+plan_approver_lease_path() {
+    local key="$1" safe root
+    safe="$(plan_approver_safe_key_name "$key")"
+    root="$(plan_approver_runtime_root)" || return 1
+    printf '%s/%s.deadline\n' "$root" "$safe"
+}
+
+plan_approver_write_lease_deadline() {
+    local lease="$1" deadline="$2" tmp
+    tmp="$(mktemp "${lease}.tmp.XXXXXX" 2>/dev/null)" || return 1
+    if printf '%s\n' "$deadline" > "$tmp" && mv -f "$tmp" "$lease"; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+}
+
+plan_approver_refresh_lease() {
+    local key="$1" timeout="$2" lease deadline existing now lock lockdir
+    [[ -n "$key" && -n "$timeout" ]] || return 1
+    lease="$(plan_approver_lease_path "$key")" || return 1
+    now="$(date +%s)"
+    deadline=$(( now + timeout ))
+    lock="${lease}.lock"
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -x 9 || exit 1
+            existing="$(cat "$lease" 2>/dev/null || true)"
+            if [[ "$existing" =~ ^[0-9]+$ && "$existing" -gt "$deadline" ]]; then
+                deadline="$existing"
+            fi
+            plan_approver_write_lease_deadline "$lease" "$deadline"
+        ) 9>"$lock" 2>/dev/null || return 1
+        return 0
+    fi
+
+    lockdir="${lease}.lockd"
+    for _ in {1..20}; do
+        if mkdir "$lockdir" 2>/dev/null; then
+            existing="$(cat "$lease" 2>/dev/null || true)"
+            if [[ "$existing" =~ ^[0-9]+$ && "$existing" -gt "$deadline" ]]; then
+                deadline="$existing"
+            fi
+            plan_approver_write_lease_deadline "$lease" "$deadline" 2>/dev/null || {
+                rm -rf "$lockdir" 2>/dev/null || true
+                return 1
+            }
+            rm -rf "$lockdir" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+plan_approver_resolve_instance_id() {
+    local hook_input="${1:-${HOOK_INPUT:-}}" instance_id
+    instance_id=""
+    if [[ -n "$hook_input" ]]; then
+        instance_id="$(plan_approver_json_value_from "$hook_input" '.env.TOKEN_API_SESSION_ID // empty' || true)"
+    fi
+    if [[ -z "$instance_id" && -n "$hook_input" ]]; then
+        instance_id="$(plan_approver_json_value_from "$hook_input" '.instance_id // empty' || true)"
+    fi
+    if [[ -z "$instance_id" && -n "$hook_input" ]]; then
+        instance_id="$(plan_approver_json_value_from "$hook_input" '.session_id // empty' || true)"
+    fi
+    [[ -n "$instance_id" ]] || instance_id="${TOKEN_API_SESSION_ID:-}"
+    [[ -n "$instance_id" ]] || return 1
+    printf '%s\n' "$instance_id"
 }
 
 plan_approver_resolve_pane() {
@@ -147,8 +235,16 @@ plan_approver_resolve_approver() {
 }
 
 plan_approver_get_planning_state() {
-    local pane="$1" api_url="${2:-${TOKEN_API_URL:-}}"
-    [[ -n "$pane" && -n "$api_url" ]] || return 1
+    local pane="$1" api_url="${2:-${TOKEN_API_URL:-}}" instance_id="${3:-}"
+    [[ -n "$api_url" ]] || return 1
+    if [[ -n "$instance_id" ]]; then
+        curl -fsS -G --connect-timeout 1 --max-time 2 \
+            --data-urlencode "instance_id=${instance_id}" \
+            "${api_url}/api/planning/state" 2>/dev/null \
+            | jq -r '.planning_state // empty' 2>/dev/null || true
+        return 0
+    fi
+    [[ -n "$pane" ]] || return 1
     curl -fsS -G --connect-timeout 1 --max-time 2 \
         --data-urlencode "tmux_pane=${pane}" \
         "${api_url}/api/planning/state" 2>/dev/null \
@@ -320,7 +416,7 @@ PY
 plan_approver_launch() {
     local agent="" trigger_class="" explicit_pane="" reason="" detector=""
     local hook_input="${HOOK_INPUT:-}" log_file="" approver="" pane_resolver=""
-    local timeout pane state_policy="no-state"
+    local timeout pane instance_id lease_key state_policy="no-state"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -361,8 +457,13 @@ plan_approver_launch() {
     fi
 
     pane="$(plan_approver_resolve_pane "$explicit_pane" "$hook_input" "$pane_resolver" 2>/dev/null || true)"
-    if [[ -z "$pane" ]]; then
-        plan_approver_log "$log_file" "plan-approver-skip engine=$agent trigger=$trigger_class reason=$reason error=no-pane"
+    if [[ "$agent" == "codex" ]]; then
+        instance_id="$(plan_approver_resolve_instance_id "$hook_input" 2>/dev/null || true)"
+    else
+        instance_id=""
+    fi
+    if [[ -z "$pane" && -z "$instance_id" ]]; then
+        plan_approver_log "$log_file" "plan-approver-skip engine=$agent trigger=$trigger_class reason=$reason error=no-target"
         return 0
     fi
 
@@ -370,14 +471,21 @@ plan_approver_launch() {
         approver="$(plan_approver_resolve_approver 2>/dev/null || true)"
     fi
     if [[ -z "$approver" || ! -x "$approver" ]]; then
-        plan_approver_log "$log_file" "plan-approver-skip engine=$agent trigger=$trigger_class pane=$pane reason=$reason error=no-approver"
+        plan_approver_log "$log_file" "plan-approver-skip engine=$agent trigger=$trigger_class pane=$pane instance_id=$instance_id reason=$reason error=no-approver"
         return 0
     fi
 
+    lease_key="${instance_id:-$pane}"
+    plan_approver_refresh_lease "$lease_key" "$timeout" || true
+
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null || true
     (
-        "$approver" --pane "$pane" --agent "$agent" --timeout "$timeout" --no-state >> "$log_file" 2>&1 || true
+        args=(--agent "$agent" --timeout "$timeout" --no-state)
+        [[ -z "$pane" ]] || args+=(--pane "$pane")
+        [[ -z "$instance_id" ]] || args+=(--instance-id "$instance_id")
+        PLAN_APPROVER_LOG_FILE="$log_file" "$approver" "${args[@]}" >> "$log_file" 2>&1 || true
     ) </dev/null >/dev/null 2>&1 &
     disown 2>/dev/null || true
 
-    plan_approver_log "$log_file" "plan-approver-launch engine=$agent trigger=$trigger_class pane=$pane reason=$reason timeout=$timeout state_policy=$state_policy approver=$approver"
+    plan_approver_log "$log_file" "plan-approver-launch engine=$agent trigger=$trigger_class pane=$pane instance_id=$instance_id reason=$reason timeout=$timeout state_policy=$state_policy approver=$approver"
 }

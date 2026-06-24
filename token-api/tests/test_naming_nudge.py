@@ -9,7 +9,6 @@ def _insert_instance(
     *,
     instance_id="inst-naming",
     tab_name="Claude 13:13",
-    tmux_pane="%10",
     session_doc_id=1,
     workflow_blocked_reason=None,
 ):
@@ -31,20 +30,32 @@ def _insert_instance(
         """
         INSERT INTO legacy_instances (
             id, session_id, tab_name, origin_type, device_id, status,
-            tmux_pane, session_doc_id, workflow_blocked_reason
-        ) VALUES (?, ?, ?, 'hook', 'Mac-Mini', 'processing', ?, ?, ?)
+            session_doc_id, workflow_blocked_reason
+        ) VALUES (?, ?, ?, 'hook', 'Mac-Mini', 'processing', ?, ?)
         """,
         (
             instance_id,
             f"session-{instance_id}",
             tab_name,
-            tmux_pane,
             session_doc_id,
             workflow_blocked_reason,
         ),
     )
     conn.commit()
     conn.close()
+
+
+def _patch_pane(app_env, monkeypatch, pane="%10", instance_id="inst-naming"):
+    """The nudge pane is resolved live from the oracle now (no stored tmux_pane);
+    pin it so the placeholder pane is addressable for the nudge enqueue. Asserts the
+    code resolves the EXPECTED instance — a wrong-row resolve fails the test instead
+    of silently passing."""
+
+    async def _resolve(_instance_id):
+        assert _instance_id == instance_id, f"unexpected instance resolved: {_instance_id!r}"
+        return (pane, "main")
+
+    monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve)
 
 
 def _fetchone(db_path, query, params=()):
@@ -58,6 +69,7 @@ def _fetchone(db_path, query, params=()):
 @pytest.mark.asyncio
 async def test_naming_nudge_sends_for_placeholder_and_derives_slug(app_env, monkeypatch):
     _insert_instance(app_env.db_path)
+    _patch_pane(app_env, monkeypatch)
     enqueued = []
 
     async def fake_enqueue(**kwargs):
@@ -115,6 +127,7 @@ async def test_naming_nudge_noops_after_instance_named(app_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_naming_nudge_caps_at_three_and_marks_refused(app_env, monkeypatch):
     _insert_instance(app_env.db_path)
+    _patch_pane(app_env, monkeypatch)
     conn = sqlite3.connect(app_env.db_path)
     for n in range(3):
         conn.execute(
@@ -145,6 +158,7 @@ async def test_naming_nudge_caps_at_three_and_marks_refused(app_env, monkeypatch
 @pytest.mark.asyncio
 async def test_naming_nudge_does_not_duplicate_pending_queue_item(app_env, monkeypatch):
     _insert_instance(app_env.db_path)
+    _patch_pane(app_env, monkeypatch)
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
         """
@@ -173,6 +187,7 @@ async def test_naming_nudge_sends_for_numbered_placeholder(app_env, monkeypatch)
     """Numbered placeholder variants (needs-session-name-345) are now caught by
     the centralized regex and must be nudged, not silently treated as named."""
     _insert_instance(app_env.db_path, tab_name="needs-session-name-345")
+    _patch_pane(app_env, monkeypatch)
     enqueued = []
 
     async def fake_enqueue(**kwargs):
@@ -200,6 +215,7 @@ async def test_naming_nudge_doc_less_instance_uses_instance_name_message(
     """A placeholder-named instance with NO session doc must be told to run
     `instance-name` (it owns its pane name directly), not `session-doc-name`."""
     _insert_instance(app_env.db_path, tab_name="needs-name", session_doc_id=None)
+    _patch_pane(app_env, monkeypatch)
     enqueued = []
 
     async def fake_enqueue(**kwargs):

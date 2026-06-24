@@ -111,6 +111,8 @@ async def _create_instances_table(db) -> None:
             interaction_mode TEXT NOT NULL DEFAULT 'text'
                 CHECK(interaction_mode IN ('text','voice_chat')),
             golden_throne TEXT,
+            human_anchored_at TIMESTAMP,
+            human_anchor_source TEXT,
             -- ── RUNTIME ANNEX (transitional) ─────────────────────────────
             -- Inherited verbatim from the extracted claude_instances table so
             -- exterminatus could land without redesigning every subsystem.
@@ -118,8 +120,10 @@ async def _create_instances_table(db) -> None:
             -- Do NOT add columns here: each is slated for per-column removal
             -- (tmux geometry -> @INSTANCE_ID stamps, GT state -> golden_throne
             -- table, workflow/planning -> status enum).
-            tmux_pane TEXT,
-            pane_label TEXT,
+            -- tmux_pane / pane_label: EXTERMINATED. Pane ids are too volatile to
+            -- persist; the tmuxctl runtime oracle (@INSTANCE_ID stamps ->
+            -- _live_agent_panes) is the sole source of pane geometry. Never
+            -- re-add these — a stored pane id is always a regression.
             dispatch_target TEXT,
             dispatch_window TEXT,
             dispatch_mode TEXT,
@@ -365,6 +369,30 @@ async def _ensure_instances(db) -> None:
             SELECT CASE WHEN NOT EXISTS (
                 SELECT 1 FROM personas WHERE id = NEW.persona_id
             ) THEN RAISE(ABORT, 'persona_id must reference personas.id') END;
+        END
+    """)
+    # Persona-binding null-clobber fail-safe (the P1 koronus:pax/orchestrator
+    # slug-null corruption). A `legion=civic` PATCH — civic is an ALLOWED_LEGION
+    # but has no persona, and the legion column itself died into persona_id — must
+    # NEVER drop a row's existing persona binding to NULL. When it did, the live
+    # singleton pane resolved as "no live instance" (persona_unregistered_suppressed)
+    # and every registry-mediated send was suppressed while the pane was demonstrably
+    # alive. Nulling persona_id is never a sanctioned operation anywhere in the
+    # service (release-on-stop is keyed on status/rank, not by nulling the binding —
+    # see personas.active_non_retired_persona_ids), so this guard is writer-agnostic:
+    # whatever path fires the bad write, the DB refuses to null the slug and the prior
+    # valid binding is preserved. AFTER-UPDATE restore (SQLite BEFORE triggers cannot
+    # mutate NEW.*) mirrors trg_instances_stamp_persona_rank; it converges as a fixed
+    # point (the restore writes persona_id non-NULL → WHEN false on any re-fire) under
+    # recursive_triggers ON or OFF, and lets the rest of the offending UPDATE's columns
+    # land untouched.
+    await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_no_null_clobber")
+    await db.execute("""
+        CREATE TRIGGER trg_instances_persona_no_null_clobber
+        AFTER UPDATE OF persona_id ON instances
+        WHEN OLD.persona_id IS NOT NULL AND NEW.persona_id IS NULL
+        BEGIN
+            UPDATE instances SET persona_id = OLD.persona_id WHERE id = NEW.id;
         END
     """)
     await db.execute("DROP TRIGGER IF EXISTS trg_instances_persona_commander_guard")
@@ -1705,7 +1733,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 instance_id TEXT NOT NULL,
                 variable TEXT NOT NULL,
                 value TEXT NOT NULL,
-                tmux_pane TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -1719,8 +1746,8 @@ async def init_database_async(db_path: Path | None = None) -> None:
             AFTER UPDATE OF status ON instances
             WHEN OLD.status IS NOT NEW.status
             BEGIN
-                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-                VALUES (NEW.id, '@CC_STATE', NEW.status, NEW.tmux_pane);
+                INSERT INTO pane_state_queue (instance_id, variable, value)
+                VALUES (NEW.id, '@CC_STATE', NEW.status);
             END
         """)
 
@@ -1730,8 +1757,8 @@ async def init_database_async(db_path: Path | None = None) -> None:
             AFTER UPDATE OF planning_state ON instances
             WHEN OLD.planning_state IS NOT NEW.planning_state
             BEGIN
-                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-                VALUES (NEW.id, '@PLANNING_STATE', NEW.planning_state, NEW.tmux_pane);
+                INSERT INTO pane_state_queue (instance_id, variable, value)
+                VALUES (NEW.id, '@PLANNING_STATE', NEW.planning_state);
             END
         """)
 
@@ -1748,10 +1775,30 @@ async def init_database_async(db_path: Path | None = None) -> None:
             AFTER UPDATE OF name ON instances
             WHEN OLD.name IS NOT NEW.name AND NEW.name IS NOT NULL
             BEGIN
-                INSERT INTO pane_state_queue (instance_id, variable, value, tmux_pane)
-                VALUES (NEW.id, '@PANE_LABEL', NEW.name, NEW.tmux_pane);
+                INSERT INTO pane_state_queue (instance_id, variable, value)
+                VALUES (NEW.id, '@PANE_LABEL', NEW.name);
             END
         """)
+
+        # ── TRANSITIONAL: drop the exterminated pane-id columns ──
+        # Pane ids (tmux_pane/pane_label) are no longer created by any CREATE TABLE
+        # or written by any code path — the tmuxctl @INSTANCE_ID oracle is the sole
+        # source of pane geometry. Older live DBs (Mac + WSL satellite + phone) still
+        # carry the physical columns with stale `%NN` values. Drop them once, now
+        # that no trigger (trg_tmux_pane_recolor is dropped above; the pane_state
+        # triggers were just recreated without the column) or writer references them.
+        #
+        # This is NOT a permanent disease-suppressor: nothing recreates these
+        # columns, so a regressed writer fails LOUDLY ("no such column") rather than
+        # being silently masked. REMOVE this block once every satellite DB has
+        # converged (follow-up #7).
+        for _drop_table, _drop_col in (
+            ("instances", "tmux_pane"),
+            ("instances", "pane_label"),
+            ("pane_state_queue", "tmux_pane"),
+        ):
+            if _drop_col in await _table_columns(db, _drop_table):
+                await db.execute(f"ALTER TABLE {_drop_table} DROP COLUMN {_drop_col}")
 
         # ── Session Doc Sync Queue ──
         # Trigger-driven session doc frontmatter updates. Fires on status change,

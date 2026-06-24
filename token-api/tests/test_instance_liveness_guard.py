@@ -28,20 +28,24 @@ def _insert(
     *,
     status="idle",
     last_activity=None,
-    tmux_pane=None,
     legion="astartes",
     instance_id=None,
 ):
-    """Insert a minimal instance via the legacy_instances compatibility view."""
+    """Insert a minimal instance via the legacy_instances compatibility view.
+
+    Pane liveness is no longer a stored column — it is controlled per-test by
+    patching ``_live_agent_panes`` (see ``_patch_panes``), so there is no pane id
+    to seed here.
+    """
     iid = instance_id or str(uuid.uuid4())
     now = last_activity or datetime.now().isoformat()
     conn = sqlite3.connect(str(app_env.db_path))
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, legion, synced, tmux_pane, registered_at, last_activity)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, 0, ?, ?, ?)""",
-        (iid, str(uuid.uuid4()), f"t-{iid[:8]}", "/tmp", status, legion, tmux_pane, now, now),
+            status, legion, synced, registered_at, last_activity)
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', ?, ?, 0, ?, ?)""",
+        (iid, str(uuid.uuid4()), f"t-{iid[:8]}", "/tmp", status, legion, now, now),
     )
     conn.commit()
     conn.close()
@@ -170,8 +174,8 @@ def test_reconcile_reactivates_swept_live_row(app_env, monkeypatch):
     row = _row(app_env, swept)
     assert row["status"] == "idle", "swept-but-live row should be reactivated"
     assert row["stopped_at"] is None, "stopped_at must be cleared on reactivation"
-    assert row["tmux_pane"] == "%21", "tmux_pane must be refreshed from the live pane"
-    assert row["pane_label"] == "mechanicus:somnium", "pane_label must be refreshed"
+    # Pane geometry is NOT stored: reconcile only heals status/stopped_at. Pane
+    # identity is resolved live from the @INSTANCE_ID stamp via the tmuxctl oracle.
     assert result["reactivated"] == 1
 
 
@@ -294,8 +298,8 @@ def test_reconcile_heals_fully_collapsed_state(app_env, monkeypatch):
 
 def test_cleanup_prunes_dead_hook_subscription(app_env, monkeypatch):
     """A subscription whose watched target is dead is GC'd as part of the sweep."""
-    subscriber = _insert(app_env, status="idle", tmux_pane="%10")  # DB-live
-    dead_target = _insert(app_env, status="stopped", tmux_pane=None)  # gone
+    subscriber = _insert(app_env, status="idle")  # DB-live
+    dead_target = _insert(app_env, status="stopped")  # gone
     _set_stopped_at(app_env, dead_target)
     _insert_sub(app_env, target=dead_target, subscriber=subscriber)
     _patch_panes(app_env, monkeypatch, [])  # no live panes for the dead target
@@ -313,8 +317,8 @@ def test_cleanup_spares_hook_for_swept_but_live_target(app_env, monkeypatch):
     but-live instance (the very Symptom-1 state) would have its still-valid hooks
     garbage-collected before the reconciler reactivates the row.
     """
-    subscriber = _insert(app_env, status="idle", tmux_pane="%10")  # DB-live
-    swept_live = _insert(app_env, status="stopped", tmux_pane=None)  # DB-dead...
+    subscriber = _insert(app_env, status="idle")  # DB-live
+    swept_live = _insert(app_env, status="stopped")  # DB-dead...
     _set_stopped_at(app_env, swept_live)
     _insert_sub(app_env, target=swept_live, subscriber=subscriber)
     # ...but its pane is genuinely alive (tmux oracle), so it must be protected.
@@ -328,8 +332,8 @@ def test_cleanup_spares_hook_for_swept_but_live_target(app_env, monkeypatch):
 
 def test_cleanup_keeps_fully_live_hook(app_env, monkeypatch):
     """A subscription with both endpoints live survives the sweep untouched."""
-    a = _insert(app_env, status="idle", tmux_pane="%14")
-    b = _insert(app_env, status="idle", tmux_pane="%10")
+    a = _insert(app_env, status="idle")
+    b = _insert(app_env, status="idle")
     _insert_sub(app_env, target=a, target_pane="%14", subscriber=b)
     _patch_panes(app_env, monkeypatch, [])
 

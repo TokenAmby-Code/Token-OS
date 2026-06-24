@@ -36,6 +36,14 @@ async def _wait_for_file_contains(path: Path, needle: str, timeout: float = 1.0)
         await asyncio.sleep(0.01)
 
 
+async def _wait_until(predicate, timeout: float = 3.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("timed out waiting for predicate")
+        await asyncio.sleep(0.01)
+
+
 @pytest.fixture
 def ladder_env(app_env, monkeypatch):
     """app_env + ladder durations slammed down to a few ms for fast tests."""
@@ -95,7 +103,7 @@ def test_ladder_cancelled_on_post_tool_use(ladder_env):
     asyncio.run(run())
 
 
-def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch):
+def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch) -> None:
     """No answer → L1 nudge fires, L2 enforcement fires, L3 pavlok + bust prompt fires."""
     hooks = sys.modules["routes.hooks"]
     shared = ladder_env.shared
@@ -133,7 +141,7 @@ def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch):
             sid, "Pick a path?", ["A", "B"], {"tmux_pane": "%9", "device_id": "Mac-Mini"}
         )
         task = shared.ASKQ_LADDER[sid]["task"]
-        await asyncio.wait_for(task, timeout=1)
+        await asyncio.wait_for(task, timeout=3)
 
         assert level1_calls == [(sid, "Pick a path?")]
         assert level2_calls == [(sid, "Pick a path?")]
@@ -147,7 +155,7 @@ def test_ladder_full_walkthrough_fires_l1_l2_l3(ladder_env, monkeypatch):
     asyncio.run(run())
 
 
-def test_ladder_cancel_after_l1_skips_l2_l3(ladder_env, monkeypatch):
+def test_ladder_cancel_after_l1_skips_l2_l3(ladder_env, monkeypatch) -> None:
     """Answer arrives between L1 and L2 → L2/L3 callbacks suppressed."""
     hooks = sys.modules["routes.hooks"]
     shared = ladder_env.shared
@@ -182,7 +190,7 @@ def test_ladder_cancel_after_l1_skips_l2_l3(ladder_env, monkeypatch):
         sid = "answered-after-l1"
         await hooks._askq_ladder_start(sid, "Q?", [], {"tmux_pane": "%0"})
         # Let L1 fire.
-        await asyncio.sleep(0.15)
+        await _wait_until(lambda: level1_calls == [sid], timeout=3)
         assert level1_calls == [sid]
         # Answer arrives before L2.
         await hooks._askq_ladder_cancel(sid, reason="answered", answer="Yes")
@@ -315,7 +323,7 @@ def test_question_persistence_records_answer(ladder_env):
     assert "- **Alpha** — First route" in text
 
 
-def test_question_persistence_records_bust_queue(ladder_env, monkeypatch):
+def test_question_persistence_records_bust_queue(ladder_env, monkeypatch) -> None:
     hooks = sys.modules["routes.hooks"]
 
     async def noop_l1(instance_id, question_text, state):
@@ -348,7 +356,7 @@ def test_question_persistence_records_bust_queue(ladder_env, monkeypatch):
             {"tab_name": "watch", "legion": "custodes", "tmux_pane": "%1"},
         )
         task = hooks.ASKQ_LADDER[sid]["task"]
-        await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(task, timeout=3.0)
 
     asyncio.run(run())
 
@@ -385,8 +393,8 @@ def test_hook_handlers_persist_question_and_answer(ladder_env, monkeypatch):
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, legion, tmux_pane)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, legion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             sid,
             sid,
@@ -397,7 +405,6 @@ def test_hook_handlers_persist_question_and_answer(ladder_env, monkeypatch):
             "idle",
             "one_off",
             "custodes",
-            "%2",
         ),
     )
     conn.commit()

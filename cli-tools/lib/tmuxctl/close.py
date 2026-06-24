@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from .focus_guard import preserve_focus
+from .liveness import detect_pane_tui, instance_live_tui
 from .stack import stack_base_of
 from .tmux_adapter import TmuxAdapter
 
@@ -230,6 +231,7 @@ def close_instance(
     mode: str = "now",
     pane: str | None = None,
     timeout: float = 3.0,
+    force: bool = False,
 ) -> dict[str, Any]:
     with close_contract_signal_shield():
         lifecycle = normalize_lifecycle(lifecycle)
@@ -258,8 +260,68 @@ def close_instance(
                 "result": result,
             }
 
+        # --- mode == "now": refuse-retire-while-TUI-live guard + atomic order ---
+        # The reap lifecycle must NEVER retire a DB row whose pane still runs a
+        # live Claude/Codex TUI. We detect liveness from the process tree (robust
+        # to stamp churn and to a stale resolved-pane handle, the #314 orphan),
+        # and either fail closed or kill the proc atomically BEFORE the retire.
+        live = instance_live_tui(adapter, instance_id, resolved_pane)
+        if live is not None and not force:
+            # Fail closed: do not retire, do not kill. A live worker flagged on a
+            # stale stamp (the mechanicus:1 near-miss) is refused at the tool
+            # layer; pass --force to deliberately kill-then-retire.
+            return {
+                "status": "refused",
+                "reason": "live_tui",
+                "guard": "refuse-retire-while-tui-live",
+                "instance_id": instance_id,
+                "lifecycle": lifecycle,
+                "pane": live.pane_id,
+                "pane_pid": live.pane_pid,
+                "agent_pid": live.agent_pid,
+                "agent_command": live.agent_command,
+                "hint": (
+                    "pane has a live agent TUI; verify the worker is idle, or pass "
+                    "--force to kill the process and retire atomically"
+                ),
+            }
+
+        # Atomic kill-before-retire: close the pane FIRST, then retire — and only
+        # retire once the pane is confirmed clear. The target is the live pane if
+        # the divergence sweep relocated it, else the resolved handle.
+        target_pane = (live.pane_id if live is not None else resolved_pane) or ""
+        close_result: dict[str, Any] | None = None
+        if target_pane:
+            close_result = _close_pane_unshielded(adapter, target_pane, timeout=timeout)
+            # Re-verify the pane we acted on: a kill that failed to clear the TUI
+            # must not be papered over by retiring the row.
+            post = detect_pane_tui(adapter, target_pane)
+            if post.live:
+                return {
+                    "status": "refused",
+                    "reason": "live_tui_survived_close",
+                    "guard": "refuse-retire-while-tui-live",
+                    "instance_id": instance_id,
+                    "lifecycle": lifecycle,
+                    "pane": target_pane,
+                    "agent_pid": post.agent_pid,
+                    "agent_command": post.agent_command,
+                    "close": close_result,
+                }
+            if close_result.get("status") == "failed":
+                # Pane stubbornly persists (no agent, but kill-pane could not
+                # remove it). Fail closed rather than retire a still-present pane.
+                return {
+                    "status": "failed",
+                    "reason": "pane_close_failed",
+                    "instance_id": instance_id,
+                    "lifecycle": lifecycle,
+                    "close": close_result,
+                }
+
+        # Pane confirmed clear (or genuinely absent). Retire the DB row LAST.
         lifecycle_result = _http_json("PATCH", f"/api/instances/{instance_id}/{lifecycle}")
-        if not resolved_pane:
+        if close_result is None:
             return {
                 "status": "lifecycle_applied",
                 "instance_id": instance_id,
@@ -267,10 +329,9 @@ def close_instance(
                 "lifecycle_result": lifecycle_result,
                 "close": {"status": "skipped", "reason": "pane_unresolved"},
             }
-        close_result = _close_pane_unshielded(adapter, resolved_pane, timeout=timeout)
         return {
             "status": "closed"
-            if close_result.get("status") == "closed"
+            if close_result.get("status") in {"closed", "already_closed"}
             else close_result.get("status"),
             "instance_id": instance_id,
             "lifecycle": lifecycle,

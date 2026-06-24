@@ -3,6 +3,7 @@
 import sqlite3
 import sys
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,6 +14,43 @@ def client(app_env):
     from fastapi.testclient import TestClient
 
     return TestClient(app_env.main.app)
+
+
+@pytest.fixture
+def pane_oracle(app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Register a live pane<->instance map over the conftest no-op oracle default.
+
+    Pane ids are no longer stored on the row: supplant + reconcile resolve a pane's
+    occupant live through the tmuxctl oracle (shared.resolve_instance_pane /
+    instance_id_for_pane). A test that seeds a row which *would* occupy a pane binds
+    that mapping here so the oracle reports it, replacing the old reliance on the
+    exterminated instances.tmux_pane column."""
+    forward: dict[str, str] = {}
+    reverse: dict[str, str] = {}
+
+    async def _resolve(instance_id):
+        pane = forward.get(instance_id)
+        return (pane, "agent") if pane else (None, None)
+
+    async def _id_for(pane):
+        return reverse.get(pane)
+
+    monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", _resolve)
+    monkeypatch.setattr(app_env.main.shared, "instance_id_for_pane", _id_for)
+
+    def _bind(instance_id: str, pane: str) -> None:
+        # One pane has exactly one live occupant and one instance one live pane:
+        # evict any stale mapping before rebinding so forward/reverse stay consistent.
+        old_pane = forward.get(instance_id)
+        if old_pane is not None and old_pane != pane:
+            reverse.pop(old_pane, None)
+        old_instance = reverse.get(pane)
+        if old_instance is not None and old_instance != instance_id:
+            forward.pop(old_instance, None)
+        forward[instance_id] = pane
+        reverse[pane] = instance_id
+
+    return SimpleNamespace(bind=_bind)
 
 
 def _db(app_env):
@@ -79,10 +117,10 @@ class TestProvenance:
         conn.execute(
             """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, synced, tmux_pane, pane_label, engine, stopped_at,
+                status, synced, engine, stopped_at,
                 registered_at, last_activity)
                VALUES (?, ?, 'stale codex', '/tmp/old', 'local', 'Mac-Mini',
-                       'stopped', 0, '%old', 'somnium:NW', 'codex',
+                       'stopped', 0, 'codex',
                        '2026-01-01T00:00:00',
                        '2026-01-01T00:00:00', '2026-01-01T00:00:00')""",
             (instance_id, str(uuid.uuid4())),
@@ -115,7 +153,7 @@ class TestProvenance:
 
         conn = _db(app_env)
         row = conn.execute(
-            """SELECT status, stopped_at, tmux_pane, pane_label, working_dir,
+            """SELECT status, stopped_at, working_dir,
                       engine, launcher, wrapper_launch_id
                FROM legacy_instances WHERE id = ?""",
             (instance_id,),
@@ -124,8 +162,6 @@ class TestProvenance:
 
         assert row["status"] == "idle"
         assert row["stopped_at"] is None
-        assert row["tmux_pane"] == "%new"
-        assert row["pane_label"] == "somnium:NE"
         assert row["working_dir"] == "/Volumes/Imperium/Imperium-ENV"
         assert row["engine"] == "codex"
         assert row["launcher"] == "codex-dispatch"
@@ -197,8 +233,12 @@ class TestReconciliation:
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "unprovenanced_write"
 
-    def test_pending_projection_detected_from_queue(self, client):
+    def test_pending_projection_detected_from_queue(self, client, pane_oracle):
         instance_id = _session_start(client, tmux_pane="%99")
+        # The instance lives on %99; bind it so reconcile resolves a live pane and
+        # detects the pending pane_state_queue projection (a None pane skips the
+        # projection check entirely and reports clean).
+        pane_oracle.bind(instance_id, "%99")
         resp = client.post(
             f"/api/instances/{instance_id}/activity", json={"action": "prompt_submit"}
         )
@@ -268,7 +308,7 @@ class TestReconciliation:
         assert latest["actor"] == "stop-hook"
 
     def test_primarch_supplant_repaints_panes_event_driven(
-        self, client: Any, app_env: Any, monkeypatch: pytest.MonkeyPatch
+        self, client: Any, app_env: Any, monkeypatch: pytest.MonkeyPatch, pane_oracle: Any
     ) -> None:
         """Supplant paints panes via the event-driven tint path (no recolor queue):
         the new pane is painted from canonical persona tint and the vacated pane cleared."""
@@ -292,14 +332,18 @@ class TestReconciliation:
         conn.execute(
             """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, legion, synced, tmux_pane, primarch, registered_at, last_activity)
+                status, legion, synced, primarch, registered_at, last_activity)
                VALUES (?, ?, 'old-custodes', '/tmp/old', 'local', 'Mac-Mini',
-                       'idle', 'custodes', 1, '%old', 'custodes',
+                       'idle', 'custodes', 1, 'custodes',
                        datetime('now'), datetime('now'))""",
             (old_id, str(uuid.uuid4())),
         )
         conn.commit()
         conn.close()
+
+        # The supplanted custodes currently occupies %old; the oracle is the sole
+        # source of the vacated pane the repaint must clear.
+        pane_oracle.bind(old_id, "%old")
 
         resp = client.post(
             "/api/hooks/SessionStart",
@@ -318,7 +362,7 @@ class TestReconciliation:
         assert ("apply", "%new", "#302800") in tint_calls
         assert ("clear", "%old") in tint_calls
 
-    def test_pid_pane_supplant_preserves_legion_synced(self, client, app_env):
+    def test_pid_pane_supplant_preserves_legion_synced(self, client, app_env, pane_oracle):
         """Plan-mode context-clear: Claude Code emits fresh session_id but same pid+pane.
         The supplant chain must catch this so legion='custodes' and synced=1 survive."""
         old_id = str(uuid.uuid4())
@@ -327,15 +371,19 @@ class TestReconciliation:
         conn.execute(
             """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, legion, synced, instance_type, tmux_pane, pid,
+                status, legion, synced, instance_type, pid,
                 registered_at, last_activity)
                VALUES (?, ?, 'custodes-pre-plan', '/tmp/c', 'local', 'Mac-Mini',
-                       'idle', 'custodes', 1, 'sync', '%42', 7777,
+                       'idle', 'custodes', 1, 'sync', 7777,
                        datetime('now'), datetime('now'))""",
             (old_id, str(uuid.uuid4())),
         )
         conn.commit()
         conn.close()
+
+        # The pre-plan custodes still occupies %42; case-4 pane-occupant supplant
+        # resolves that occupant via the oracle (no stored tmux_pane to match on).
+        pane_oracle.bind(old_id, "%42")
 
         resp = client.post(
             "/api/hooks/SessionStart",
@@ -353,7 +401,7 @@ class TestReconciliation:
         # Old id should be gone (replaced by new_id)
         old_row = conn.execute("SELECT id FROM legacy_instances WHERE id = ?", (old_id,)).fetchone()
         new_row = conn.execute(
-            "SELECT legion, synced, instance_type, tmux_pane FROM legacy_instances WHERE id = ?",
+            "SELECT legion, synced, instance_type FROM legacy_instances WHERE id = ?",
             (new_id,),
         ).fetchone()
         conn.close()
@@ -362,7 +410,6 @@ class TestReconciliation:
         assert new_row["legion"] == "custodes"
         assert new_row["synced"] == 1
         assert new_row["instance_type"] == "sync"
-        assert new_row["tmux_pane"] == "%42"
 
     def test_pid_pane_supplant_only_matches_active_rows(self, client, app_env):
         """Stopped rows with same pid+pane should NOT be supplanted (they're dead)."""
@@ -372,10 +419,10 @@ class TestReconciliation:
         conn.execute(
             """INSERT INTO legacy_instances
                (id, session_id, tab_name, working_dir, origin_type, device_id,
-                status, legion, synced, instance_type, tmux_pane, pid,
+                status, legion, synced, instance_type, pid,
                 registered_at, last_activity)
                VALUES (?, ?, 'dead-row', '/tmp/c', 'local', 'Mac-Mini',
-                       'stopped', 'custodes', 0, 'sync', '%42', 7777,
+                       'stopped', 'custodes', 0, 'sync', 7777,
                        datetime('now'), datetime('now'))""",
             (old_id, str(uuid.uuid4())),
         )

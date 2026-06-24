@@ -12,6 +12,8 @@
 set -euo pipefail
 
 PANE=""
+INSTANCE_ID=""
+CONTROL_PANE=""
 AGENT="auto"
 TIMEOUT=10
 INTERVAL="0.25"
@@ -33,6 +35,7 @@ source "${_script_dir}/../lib/nas-path.sh" >/dev/null 2>&1 || true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pane) PANE="$2"; shift 2 ;;
+        --instance-id) INSTANCE_ID="$2"; shift 2 ;;
         --agent) AGENT="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --interval) INTERVAL="$2"; shift 2 ;;
@@ -44,13 +47,72 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$PANE" && -z "$CAPTURE_FILE" ]]; then
+if [[ -z "$PANE" && -z "$INSTANCE_ID" && -z "$CAPTURE_FILE" ]]; then
     PANE="${TMUX_PANE:-}"
 fi
-if [[ -z "$PANE" && -z "$CAPTURE_FILE" ]]; then
-    echo "tmux-plan-approve-clear: --pane or --capture-file required" >&2
+if [[ -z "$PANE" && -z "$INSTANCE_ID" && -z "$CAPTURE_FILE" ]]; then
+    echo "tmux-plan-approve-clear: --pane, --instance-id, or --capture-file required" >&2
     exit 2
 fi
+
+
+find_tmuxctl() {
+    local candidate root
+    candidate="$(command -v tmuxctl 2>/dev/null || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    candidate="${TOKEN_OS:-}/cli-tools/bin/tmuxctl"
+    if [[ -n "${TOKEN_OS:-}" && -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    root="${IMPERIUM:-}"
+    candidate="${root%/}/runtimes/token-os/live/cli-tools/bin/tmuxctl"
+    if tmux_plan_approve_mount_live "$root" && [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+tmux_plan_approve_mount_live() {
+    local root="$1"
+    [[ -n "$root" && -d "$root" ]] || return 1
+    ls "$root" >/dev/null 2>&1
+}
+
+resolve_control_pane() {
+    local target="$PANE" tmuxctl resolved
+    [[ -z "$CAPTURE_FILE" ]] || return 0
+    if [[ -n "$INSTANCE_ID" ]]; then
+        tmuxctl="$(find_tmuxctl 2>/dev/null || true)"
+        if [[ -n "$tmuxctl" ]]; then
+            resolved="$("$tmuxctl" resolve-instance --format physical "$INSTANCE_ID" 2>/dev/null || true)"
+            if [[ "$resolved" == %* ]]; then
+                CONTROL_PANE="$resolved"
+                return 0
+            fi
+        fi
+    fi
+    [[ -n "$target" ]] || return 1
+    resolved="$("$REAL_TMUX" display-message -p -t "$target" '#{pane_id}' 2>/dev/null || true)"
+    if [[ "$resolved" == %* ]]; then
+        CONTROL_PANE="$resolved"
+        return 0
+    fi
+    tmuxctl="$(find_tmuxctl 2>/dev/null || true)"
+    if [[ -n "$tmuxctl" ]]; then
+        resolved="$("$tmuxctl" resolve-pane --format physical "$target" 2>/dev/null || true)"
+        if [[ "$resolved" == %* ]]; then
+            CONTROL_PANE="$resolved"
+            return 0
+        fi
+    fi
+    [[ "$target" == %* ]] || return 1
+    CONTROL_PANE="$target"
+}
 
 json_escape() {
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
@@ -58,22 +120,43 @@ json_escape() {
 
 set_planning_state() {
     local state="$1"
-    if ! $UPDATE_STATE || $DRY_RUN || [[ -n "$CAPTURE_FILE" || -z "$PANE" || -z "${TOKEN_API_URL:-}" ]]; then
+    if ! $UPDATE_STATE || $DRY_RUN || [[ -n "$CAPTURE_FILE" || -z "${TOKEN_API_URL:-}" ]]; then
         return 0
     fi
-    local body
-    body="{\"tmux_pane\":$(json_escape "$PANE"),\"state\":$(json_escape "$state"),\"source\":\"tmux-plan-approve-clear\"}"
+    if [[ -z "$INSTANCE_ID" && -z "$PANE" ]]; then
+        return 0
+    fi
+    local body target_field
+    if [[ -n "$INSTANCE_ID" ]]; then
+        target_field="\"instance_id\":$(json_escape "$INSTANCE_ID")"
+    else
+        target_field="\"tmux_pane\":$(json_escape "$PANE")"
+    fi
+    body="{$target_field,\"state\":$(json_escape "$state"),\"source\":\"tmux-plan-approve-clear\"}"
     curl -sf --max-time 1 -X POST "${TOKEN_API_URL}/api/planning/state" \
         -H 'Content-Type: application/json' \
         -d "$body" >/dev/null || true
 }
 
 
+
 get_planning_state() {
     # Read-only GET: dry-run must NOT bypass here (dry-run gates writes only).
     # Reading real state in dry-run is what makes the `state-not-planning` /
     # `state-left-planning` no-op branches below reachable and testable.
-    if ! $UPDATE_STATE || [[ -n "$CAPTURE_FILE" || -z "$PANE" || -z "${TOKEN_API_URL:-}" ]]; then
+    if ! $UPDATE_STATE || [[ -n "$CAPTURE_FILE" || -z "${TOKEN_API_URL:-}" ]]; then
+        echo "bypass"
+        return 0
+    fi
+    if [[ -n "$INSTANCE_ID" ]]; then
+        curl -fsS -G --connect-timeout 1 --max-time 2 \
+            --data-urlencode "instance_id=${INSTANCE_ID}" \
+            "${TOKEN_API_URL}/api/planning/state" 2>/dev/null \
+            | python3 -c 'import json,sys; print((json.load(sys.stdin).get("planning_state") or ""))' 2>/dev/null \
+            || true
+        return 0
+    fi
+    if [[ -z "$PANE" ]]; then
         echo "bypass"
         return 0
     fi
@@ -97,8 +180,68 @@ capture() {
     if [[ -n "$CAPTURE_FILE" ]]; then
         cat "$CAPTURE_FILE" 2>/dev/null || true
     else
-        "$REAL_TMUX" capture-pane -p -t "$PANE" -S -80 2>/dev/null || true
+        "$REAL_TMUX" capture-pane -p -t "$CONTROL_PANE" -S -80 2>/dev/null || true
     fi
+}
+
+log_result() {
+    local result="$1" extra="${2:-}"
+    local pane_label="$PANE"
+    [[ -z "$CAPTURE_FILE" ]] || pane_label="capture-file"
+    printf '[%s] tmux-plan-approve-clear result=%s pane=%s instance_id=%s control_pane=%s agent=%s%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$result" "$pane_label" "$INSTANCE_ID" "$CONTROL_PANE" "$AGENT" "${extra:+ $extra}" >&2
+}
+
+safe_pane_name() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9_.:-' '_'
+}
+
+runtime_root() {
+    local uid root mode
+    uid="${UID:-$(id -u 2>/dev/null || printf 'unknown')}"
+    root="${TMPDIR:-/tmp}/tmux-plan-approve-clear-${uid}"
+    ( umask 077 && mkdir -p "$root" ) 2>/dev/null || return 1
+    [[ -d "$root" && -O "$root" && ! -L "$root" ]] || return 1
+    mode="$(stat -c %a "$root" 2>/dev/null || stat -f %Lp "$root" 2>/dev/null || true)"
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 077) == 0 )) || return 1
+    printf '%s\n' "$root"
+}
+
+lease_path() {
+    local safe root
+    [[ -z "$CAPTURE_FILE" ]] || return 1
+    [[ -n "$INSTANCE_ID" || -n "$PANE" ]] || return 1
+    safe="$(safe_pane_name "${INSTANCE_ID:-$PANE}")"
+    root="$(runtime_root)" || return 1
+    printf '%s/%s.deadline\n' "$root" "$safe"
+}
+
+current_deadline() {
+    local lease value fallback
+    fallback=$(( start + TIMEOUT ))
+    lease="$(lease_path 2>/dev/null || true)"
+    if [[ -n "$lease" && -r "$lease" ]]; then
+        value="$(cat "$lease" 2>/dev/null || true)"
+        if [[ "$value" =~ ^[0-9]+$ && "$value" -gt "$fallback" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
+    printf '%s\n' "$fallback"
+}
+
+save_timeout_snippet() {
+    local content="$1" dir file
+    [[ "$AGENT" == "codex" ]] || return 0
+    [[ "${PLAN_APPROVER_SAVE_TIMEOUT_SNIPPET:-}" == "1" ]] || return 0
+    dir="${PLAN_APPROVER_LOG_FILE:+$(dirname "$PLAN_APPROVER_LOG_FILE")}"
+    [[ -n "$dir" ]] || dir="${HOME}/.codex/log"
+    ( umask 077 && mkdir -p "$dir" ) 2>/dev/null || true
+    local target_name="${INSTANCE_ID:-$PANE}"
+    file="$dir/plan-approver-timeout-${target_name//[^A-Za-z0-9_.:-]/_}-$(date +%Y%m%d-%H%M%S).txt"
+    ( umask 077 && printf '%s' "$content" | tail -c 4000 > "$file" ) 2>/dev/null || true
+    printf '%s\n' "$file"
 }
 
 LOCK_FD_OPEN=false
@@ -111,11 +254,11 @@ _release_single_flight() {
 }
 
 acquire_single_flight() {
-    [[ -n "$PANE" && -z "$CAPTURE_FILE" ]] || return 0
+    [[ -z "$CAPTURE_FILE" ]] || return 0
+    [[ -n "$CONTROL_PANE" || -n "$INSTANCE_ID" || -n "$PANE" ]] || return 0
     local safe root lockfile
-    safe="$(printf '%s' "$PANE" | tr -c 'A-Za-z0-9_.-' '_')"
-    root="${TMPDIR:-/tmp}/tmux-plan-approve-clear"
-    mkdir -p "$root" 2>/dev/null || true
+    safe="$(safe_pane_name "${CONTROL_PANE:-${INSTANCE_ID:-$PANE}}")"
+    root="$(runtime_root)" || return 1
     lockfile="$root/${safe}.lock"
     if command -v flock >/dev/null 2>&1; then
         exec 9>"$lockfile" || return 1
@@ -235,26 +378,38 @@ send_action() {
         return 0
     fi
     if [[ "$detected" == "codex" ]]; then
-        "$REAL_TMUX" send-keys -t "$PANE" Down Enter
+        "$REAL_TMUX" send-keys -t "$CONTROL_PANE" Down Enter
     else
-        "$REAL_TMUX" send-keys -t "$PANE" Enter
+        "$REAL_TMUX" send-keys -t "$CONTROL_PANE" Enter
     fi
 }
 
+if [[ -z "$CAPTURE_FILE" ]]; then
+    if ! resolve_control_pane; then
+        log_result "target-unresolved"
+        $DRY_RUN && echo "action=none target-unresolved"
+        exit 0
+    fi
+fi
+
 if ! acquire_single_flight; then
+    log_result "locked"
     $DRY_RUN && echo "action=none locked"
     exit 0
 fi
 
 if ! planning_state_allows_poll; then
+    log_result "state-not-planning"
     $DRY_RUN && echo "action=none state-not-planning"
     exit 0
 fi
 set_planning_state approving
 
 start=$(date +%s)
+classifier_none_plan_tokens_logged=false
 while true; do
     if ! planning_state_allows_poll; then
+        log_result "state-left-planning"
         $DRY_RUN && echo "action=none state-left-planning"
         exit 0
     fi
@@ -262,19 +417,31 @@ while true; do
     detected="$(classify "$AGENT" <<<"$content")"
     if [[ "$detected" != "none" ]]; then
         send_action "$detected"
+        log_result "clicked" "detected=$detected"
         # Do not mark planning complete here.  A successful clear-context
         # approval causes the harness to re-fire SessionStart/supplant; that
         # canonical row transition owns planning_state=none.
         exit 0
     fi
     now=$(date +%s)
-    if (( now - start >= TIMEOUT )); then
+    deadline="$(current_deadline)"
+    if ! $classifier_none_plan_tokens_logged && [[ "$detected" == "none" ]] && grep -qiE '(<proposed_plan>|implement this plan|clear context|fresh thread)' <<<"$content"; then
+        log_result "classifier-none-with-plan-tokens"
+        classifier_none_plan_tokens_logged=true
+    fi
+    if (( now >= deadline )); then
+        snippet=""
         # Leave planning_state at `approving` (set at launch) — the accurate
         # "approval requested, outcome unobserved" state. The post-approval
         # Write/Edit (PostToolUse auto-clear) or the next SessionStart resolves it
         # to `none`. This watcher is no longer the authority for that transition;
         # it stays only as the auto-clicker for the clear-context modal.
-        $DRY_RUN && echo "action=none timeout"
+        if $DRY_RUN; then
+            echo "action=none timeout"
+        else
+            snippet="$(save_timeout_snippet "$content" 2>/dev/null || true)"
+        fi
+        $DRY_RUN || log_result "timeout" "${snippet:+snippet=$snippet}"
         exit 0
     fi
     sleep "$INTERVAL"

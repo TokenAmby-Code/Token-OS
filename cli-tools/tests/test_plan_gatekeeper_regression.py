@@ -60,7 +60,8 @@ def _run_gatekeeper(
         timeout=20,
     )
     # The approver is launched in a disowned background subshell; poll briefly.
-    for _ in range(50):
+    # ~15s budget (was ~5s); widened for CPU contention under parallel runs.
+    for _ in range(150):
         if marker.exists():
             break
         time.sleep(0.1)

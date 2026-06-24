@@ -115,11 +115,12 @@ maybe_launch_plan_approver() {
     command -v jq >/dev/null 2>&1 || return 0
     type plan_approver_launch >/dev/null 2>&1 || return 0
 
-    local pane state state_hint reason trigger_class
+    local pane instance_id state state_hint reason trigger_class
     pane="$(plan_approver_resolve_pane "" "$HOOK_INPUT" "" 2>/dev/null || true)"
-    [[ -n "$pane" ]] || return 0
+    instance_id="$(plan_approver_resolve_instance_id "$HOOK_INPUT" 2>/dev/null || true)"
+    [[ -n "$pane" || -n "$instance_id" ]] || return 0
 
-    state="$(plan_approver_get_planning_state "$pane" "$API_URL" 2>/dev/null || true)"
+    state="$(plan_approver_get_planning_state "$pane" "$API_URL" "$instance_id" 2>/dev/null || true)"
     state_hint=""
     case "$state" in
         planning|approving) state_hint="state-${state}" ;;
@@ -142,8 +143,12 @@ maybe_launch_plan_approver() {
             ;;
         PostToolUse)
             trigger_class="post_tool"
+            # Refresh the active watcher on every tool completion. The watcher is
+            # classifier-gated, and overlapping launches only renew its lease.
             if plan_approver_current_transcript_turn_is_plan_mode; then
                 reason="plan-mode-post-tool"
+            else
+                reason="post-tool-watch"
             fi
             ;;
         Stop)
@@ -152,6 +157,8 @@ maybe_launch_plan_approver() {
                 reason="payload-plan"
             elif plan_approver_latest_transcript_turn_has_plan; then
                 reason="transcript-plan"
+            elif [[ -n "$state_hint" ]]; then
+                reason="state-plan"
             fi
             ;;
     esac

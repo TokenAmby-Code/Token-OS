@@ -8,7 +8,7 @@ from typing import Any
 
 import shared
 from instance_mutation import sanctioned_update_instance
-from personas import BLACK_SHIELDS, seed_params
+from personas import BLACK_SHIELDS, UPSERT_SQL, seed_params
 from session_doc_helpers import update_frontmatter
 
 logger = logging.getLogger("token_api")
@@ -41,24 +41,10 @@ def _resolve_session_doc_path(raw_path: str | None) -> Path | None:
 
 
 async def _ensure_persona_seed(db, seed) -> str:
-    await db.execute(
-        """INSERT INTO personas
-           (id, slug, display_name, default_rank, assignment_pool, assignment_order,
-            pane_tint, chip_color, tts_voice, tts_rate, notification_sound)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-             slug = excluded.slug,
-             display_name = excluded.display_name,
-             default_rank = excluded.default_rank,
-             assignment_pool = excluded.assignment_pool,
-             assignment_order = excluded.assignment_order,
-             pane_tint = excluded.pane_tint,
-             chip_color = excluded.chip_color,
-             tts_voice = excluded.tts_voice,
-             tts_rate = excluded.tts_rate,
-             notification_sound = excluded.notification_sound""",
-        seed_params(seed),
-    )
+    # Reuse the canonical UPSERT from personas.py rather than a local copy so the
+    # column list cannot drift out of sync with seed_params() (e.g. when a column
+    # like default_session_doc is added).
+    await db.execute(UPSERT_SQL, seed_params(seed))
     return seed.id
 
 

@@ -24,7 +24,7 @@ def _insert_instance(
     db_path,
     instance_id,
     *,
-    pane=None,
+    pane=None,  # accepted for call-site compat; pane geometry is no longer stored
     planning_state="none",
     status="idle",
     legion="astartes",
@@ -35,16 +35,15 @@ def _insert_instance(
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status, tmux_pane,
+            profile_name, tts_voice, notification_sound, status,
             legion, planning_state, engine, wrapper_launch_id)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?, ?)""",
         (
             instance_id,
             f"{instance_id}-session",
             instance_id,
             "/tmp",
             status,
-            pane,
             legion,
             planning_state,
             engine,
@@ -230,10 +229,14 @@ def _subscription(db_path, instance_id):
 
 
 def test_slash_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, monkeypatch) -> None:
-    _insert_instance(app_env.db_path, "slash-preplan-1", pane="%54", engine="claude")
+    _insert_instance(app_env.db_path, "slash-preplan-1", engine="claude")
 
+    # Pane geometry is no longer stored; the arm binds the live pane the hook
+    # carries in its payload.
     _prompt_submit(
-        app_env, monkeypatch, {"session_id": "slash-preplan-1", "prompt": "/preplan prepare"}
+        app_env,
+        monkeypatch,
+        {"session_id": "slash-preplan-1", "prompt": "/preplan prepare", "tmux_pane": "%54"},
     )
 
     state, source = _planning(app_env.db_path, "slash-preplan-1")
@@ -252,9 +255,13 @@ def test_slash_preplan_prompt_sets_preplanning_and_arms_plan_followup(app_env, m
 def test_dollar_preplan_prompt_sets_preplanning_and_arms_plan_followup(
     app_env, monkeypatch
 ) -> None:
-    _insert_instance(app_env.db_path, "dollar-preplan-1", pane="%55", engine="codex")
+    _insert_instance(app_env.db_path, "dollar-preplan-1", engine="codex")
 
-    _prompt_submit(app_env, monkeypatch, {"session_id": "dollar-preplan-1", "prompt": "$preplan"})
+    _prompt_submit(
+        app_env,
+        monkeypatch,
+        {"session_id": "dollar-preplan-1", "prompt": "$preplan", "tmux_pane": "%55"},
+    )
 
     state, source = _planning(app_env.db_path, "dollar-preplan-1")
     assert state == "preplanning"
@@ -336,12 +343,16 @@ _WRAPPED_PLAN_PROMPT = (
 def test_wrapped_preplan_skill_sets_preplanning_and_arms_plan_followup(
     app_env, monkeypatch
 ) -> None:
-    _insert_instance(app_env.db_path, "wrapped-preplan-1", pane="%80", engine="claude")
+    _insert_instance(app_env.db_path, "wrapped-preplan-1", engine="claude")
 
     _prompt_submit(
         app_env,
         monkeypatch,
-        {"session_id": "wrapped-preplan-1", "prompt": _WRAPPED_PREPLAN_PROMPT},
+        {
+            "session_id": "wrapped-preplan-1",
+            "prompt": _WRAPPED_PREPLAN_PROMPT,
+            "tmux_pane": "%80",
+        },
     )
 
     state, source = _planning(app_env.db_path, "wrapped-preplan-1")
