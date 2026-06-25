@@ -369,7 +369,7 @@ def test_wrapper_composes_staple_rank_first_with_operational_appendix(tmp_path: 
         {
             "TOKEN_API_PERSONA": "blood-angels",
             "TOKEN_API_VAULT_DOMAIN": "Imperium-ENV",
-            "TOKEN_API_INSTANCE_NAME_PREFIX": "blood-angels",
+            "TOKEN_API_SESSION_DOC_ID": "17",
         }
     )
     script = f"""
@@ -385,9 +385,11 @@ token_wrapper_compose_system_text
     out = result.stdout
     rank_i = out.find("RANK_DOCTRINE_MARKER")
     body_i = out.find("PERSONA_BODY_MARKER")
-    appendix_i = out.find("Instance name prefix: blood-angels")
+    appendix_i = out.find("Vault domain: Imperium-ENV")
     assert rank_i >= 0 and body_i >= 0 and appendix_i >= 0, out
     assert rank_i < body_i < appendix_i, out
+    assert "Instance name prefix:" not in out
+    assert "On startup, name this instance" not in out
 
 
 def test_wrapper_codex_preamble_wraps_staple_in_system_identity(tmp_path: Path) -> None:

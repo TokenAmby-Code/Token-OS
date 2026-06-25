@@ -255,11 +255,57 @@ class TestReconciliation:
 
         latest = _mutations_for(app_env, instance_id)[-1]
         assert latest["mutation_type"] == "instance_updated"
-        assert latest["actor"] == "rename-instance"
+        assert latest["actor"] == "instance-name-cli"
 
         resp = client.get(f"/api/instances/{instance_id}/reconciliation")
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "clean"
+
+    def test_unofficial_name_write_is_rejected(self, app_env):
+        from instance_mutation import sanctioned_update_instance_sync
+
+        instance_id = "unauth-name"
+        conn = _db(app_env)
+        conn.execute(
+            """INSERT INTO instances
+               (id, name, working_dir, device_id, origin_type, status, created_at, last_activity)
+               VALUES (?, 'needs-name', '/tmp', 'Mac-Mini', 'local', 'idle', datetime('now'), datetime('now'))""",
+            (instance_id,),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="official rename path"):
+            sanctioned_update_instance_sync(
+                conn,
+                instance_id=instance_id,
+                updates={"name": "path-derived-name"},
+                mutation_type="instance_updated",
+                write_source="hooks",
+                actor="SessionStart",
+            )
+        conn.close()
+
+    def test_official_name_write_rejects_deprecated_placeholders(self, app_env):
+        from instance_mutation import sanctioned_update_instance_sync
+
+        instance_id = "deprecated-placeholder-name"
+        conn = _db(app_env)
+        conn.execute(
+            """INSERT INTO instances
+               (id, name, working_dir, device_id, origin_type, status, created_at, last_activity)
+               VALUES (?, 'needs-name', '/tmp', 'Mac-Mini', 'local', 'idle', datetime('now'), datetime('now'))""",
+            (instance_id,),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="deprecated placeholder"):
+            sanctioned_update_instance_sync(
+                conn,
+                instance_id=instance_id,
+                updates={"name": "needs-session-name-123"},
+                mutation_type="instance_updated",
+                write_source="api",
+                actor="instance-name-cli",
+            )
+        conn.close()
 
     def test_hard_delete_session_doc_writes_continuity_mutation(self, client, app_env):
         instance_id = _session_start(client)

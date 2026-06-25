@@ -50,6 +50,13 @@ RESP=$(jq -n --arg title "$TITLE" '{title: $title}' \
       --data-binary @- 2>/dev/null || true)
 
 if echo "$RESP" | jq -e '.updated == true' >/dev/null 2>&1; then
+  # Explicit session-doc-name is an official naming-interview response. Rename
+  # the current instance through the sanctioned instance-name boundary as well;
+  # no server-side session-doc slug mirroring is allowed.
+  if ! "$(dirname "$0")/instance-name" "$TITLE" --no-ui >/dev/null 2>&1; then
+    echo "Error: session doc renamed, but instance rename failed" >&2
+    exit 1
+  fi
   echo "Session doc named: $TITLE"
 else
   echo "Error: $(echo "$RESP" | jq -r '.detail // "session doc rename failed"' 2>/dev/null || echo "session doc rename failed")" >&2

@@ -116,6 +116,10 @@ if [[ "$RAW_NAME" =~ ^Claude[[:space:]][0-9]{2}:[0-9]{2}$ ]]; then
     echo "Error: name cannot be a placeholder like 'Claude HH:MM'" >&2
     exit 2
 fi
+if [[ "$RAW_NAME" =~ ^(needs-name|needs-session-name|unnamed-session|session-doc|session)(-[0-9]+)?$ ]]; then
+    echo "Error: name cannot be a placeholder" >&2
+    exit 2
+fi
 
 # Preserve historical kebab-case behavior for the display slug.
 NAME=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9 -]//g' | tr -s ' ' '-' | sed 's/^-//;s/-$//')
@@ -126,6 +130,10 @@ if [[ -z "$NAME" ]]; then
 fi
 if [[ ${#NAME} -gt 40 ]]; then
     echo "Error: normalized name must be 40 characters or fewer" >&2
+    exit 2
+fi
+if [[ "$NAME" =~ ^(needs-name|needs-session-name|unnamed-session|session-doc|session)(-[0-9]+)?$ ]]; then
+    echo "Error: normalized name cannot be a placeholder" >&2
     exit 2
 fi
 

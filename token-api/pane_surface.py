@@ -51,7 +51,7 @@ def human_tab_name(tab_name: str | None) -> str | None:
     cleaned = tab_name.lstrip("✳⠐⠸ ").strip()
     if not cleaned:
         return None
-    if cleaned in {"needs-name", "needs-session-name"} or DEFAULT_TAB_NAME_RX.match(cleaned):
+    if is_placeholder_tab_name(cleaned):
         return None
     return cleaned
 

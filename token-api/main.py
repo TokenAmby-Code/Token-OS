@@ -103,11 +103,12 @@ from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
     create_golden_throne_binding,  # noqa: F401 — used in PATCH /type GT promotion
     get_instance_mutations,
+    is_official_instance_name_actor,
     reconcile_instance,
     sanctioned_insert_instance,
     sanctioned_update_instance,
 )
-from instance_registry import derived_cockpit_label
+from instance_registry import DEFAULT_INSTANCE_NAME, derived_cockpit_label
 from morning_supervisor import arm_morning_supervisor
 from pane_surface import (
     human_pane_surface as _format_human_pane_surface,
@@ -1946,8 +1947,8 @@ async def _has_pending_naming_nudge(db, instance_id: str) -> bool:
 
 
 def _build_naming_nudge_message(slug: str | None, has_session_doc: bool) -> str:
-    # Doc-bound instances name themselves by naming their session doc
-    # (_apply_session_doc_instance_name mirrors the doc title onto the tab).
+    # Doc-bound instances answer through session-doc-name; that CLI explicitly
+    # calls the sanctioned instance rename boundary after renaming the document.
     if has_session_doc:
         derived = (slug or "").strip()
         hint = f" Current rough doc slug is `{derived}`." if derived else ""
@@ -3042,6 +3043,11 @@ def _validate_instance_name_slug(tab_name: str | None) -> str:
             status_code=400,
             detail="Name cannot be a placeholder like 'Claude HH:MM'",
         )
+    if _is_placeholder_tab_name(placeholder_candidate):
+        raise HTTPException(
+            status_code=400,
+            detail="Name cannot be a placeholder; choose a descriptive title",
+        )
     return clean
 
 
@@ -3076,6 +3082,11 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     clean = "-".join(clean.split("-")[:4])
     if not clean:
         raise HTTPException(status_code=400, detail="Name cannot be empty after normalization")
+    if _is_placeholder_tab_name(clean):
+        raise HTTPException(
+            status_code=400,
+            detail="Name cannot be a placeholder; choose a descriptive title",
+        )
     request.tab_name = clean
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -3097,7 +3108,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
             updates={"name": request.tab_name},
             mutation_type="instance_updated",
             write_source="api",
-            actor="rename-instance",
+            actor="instance-name-cli",
         )
 
         # Instance renames are instance-local. Session doc naming is doc-owned
@@ -20443,6 +20454,38 @@ def _tab_name_session_doc_mismatch(tab_name: str | None, file_path: str | None) 
     return a not in b and b not in a
 
 
+async def _official_instance_name_provenance_map(
+    db: aiosqlite.Connection, instance_ids: set[str]
+) -> set[tuple[str, str]]:
+    """Return (instance_id, name) pairs produced by official rename actors."""
+    if not instance_ids:
+        return set()
+    placeholders = ",".join("?" for _ in instance_ids)
+    cursor = await db.execute(
+        f"""
+        SELECT instance_id, actor, field_names_json, after_json
+        FROM instance_mutations
+        WHERE instance_id IN ({placeholders})
+          AND field_names_json LIKE '%"name"%'
+        ORDER BY created_at DESC, id DESC
+        """,
+        tuple(instance_ids),
+    )
+    provenanced: set[tuple[str, str]] = set()
+    for row in await cursor.fetchall():
+        if not is_official_instance_name_actor(row[1]):
+            continue
+        try:
+            fields = json.loads(row[2] or "[]") or []
+            after = json.loads(row[3] or "{}") or {}
+        except Exception:
+            continue
+        name = after.get("name")
+        if "name" in fields and isinstance(name, str):
+            provenanced.add((str(row[0]), name))
+    return provenanced
+
+
 def _schedule_reconciler_naming_nudge(instance_id: str | None) -> None:
     """Best-effort naming interview from the live-pane reconciler.
 
@@ -20473,6 +20516,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
         "pane_label_drift": 0,
         "superseded_duplicate": 0,
         "placeholder_tab_name_drift": 0,
+        "illegal_instance_name_reset": 0,
         "tab_name_session_doc_mismatch": 0,
         "naming_nudge_scheduled": 0,
     }
@@ -20520,17 +20564,47 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
         )
         rows = [dict(r) for r in await cursor.fetchall()]
         naming_nudge_instance_ids: list[str] = []
+        official_names = await _official_instance_name_provenance_map(
+            db, {row["id"] for row in rows if row.get("tab_name") != DEFAULT_INSTANCE_NAME}
+        )
 
         for row in rows:
             row_is_live = row["id"] in live_ids
+            official_name = (row["id"], row.get("tab_name")) in official_names
+            illegal_name = row.get("tab_name") != DEFAULT_INSTANCE_NAME and not official_name
             if (
                 row_is_live
-                and _is_placeholder_tab_name(row.get("tab_name"))
-                and not row.get("session_doc_id")
-                and row.get("has_prompt_submit")
+                and (_is_placeholder_tab_name(row.get("tab_name")) or illegal_name)
+                and (row.get("has_prompt_submit") or illegal_name)
                 and not row.get("has_naming_nudge")
             ):
                 naming_nudge_instance_ids.append(row["id"])
+
+            if row_is_live and illegal_name:
+                old_name = row.get("tab_name")
+                try:
+                    await sanctioned_update_instance(
+                        db,
+                        instance_id=row["id"],
+                        updates={
+                            "name": DEFAULT_INSTANCE_NAME,
+                            "workflow_blocked_reason": "tab_name_placeholder",
+                        },
+                        mutation_type="reconcile_reset_illegal_name",
+                        write_source="tmux_db_reconciler",
+                        actor="reconciler",
+                    )
+                    row["tab_name"] = DEFAULT_INSTANCE_NAME
+                    counts["illegal_instance_name_reset"] += 1
+                    deferred_events.append(
+                        (
+                            "illegal_instance_name_reset",
+                            row["id"],
+                            {"old_name": old_name},
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Reconciler illegal-name reset failed for {row.get('id')}: {e}")
 
             if not _reconcile_eligible(row, now):
                 continue
@@ -25685,32 +25759,6 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
         params.append(doc_id)
 
         await db.execute(f"UPDATE session_documents SET {', '.join(updates)} WHERE id = ?", params)
-        if request.title is not None:
-            base = human_filename_stem(request.title, fallback="session-doc")
-            cursor = await db.execute(
-                """SELECT id, name AS tab_name
-                   FROM instances
-                   WHERE session_doc_id = ?
-                   ORDER BY created_at ASC, id ASC""",
-                (doc_id,),
-            )
-            linked = await cursor.fetchall()
-            ordinal = 1
-            for inst_id, tab_name in linked:
-                current = str(tab_name or "")
-                if re.match(rf"^{re.escape(base)}-\d+$", current):
-                    continue
-                if current and not _is_placeholder_tab_name(current):
-                    continue
-                await sanctioned_update_instance(
-                    db,
-                    instance_id=inst_id,
-                    updates={"name": f"{base}-{ordinal}"},
-                    mutation_type="instance_updated",
-                    write_source="api",
-                    actor="session-doc-rename",
-                )
-                ordinal += 1
         await db.commit()
 
     logger.info(f"Updated session doc {doc_id}: {updates}")

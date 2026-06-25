@@ -10,10 +10,12 @@ from pathlib import Path
 import aiosqlite
 
 from instance_registry import (
+    DEFAULT_INSTANCE_NAME,
     INSTANCE_COLUMNS,
     legacy_row_to_instance_values,
     slug_from_legacy,
 )
+from pane_surface import is_placeholder_tab_name
 from personas import persona_tint_for_instance
 
 logger = logging.getLogger("token_api")
@@ -23,7 +25,16 @@ RECONCILIATION_SUSPICIOUS = {
     "unprovenanced_write",
     "state_drift",
     "projection_drift",
+    "illegal_instance_name",
 }
+
+OFFICIAL_INSTANCE_NAME_ACTORS = frozenset(
+    {
+        "instance-name-cli",
+        "naming-interview",
+        "session-doc-name",
+    }
+)
 
 # Tracked mutation surface = durable identity + runtime annex. Legacy column names
 # (tab_name/legion/synced/instance_type/primarch/parent_instance_id/tts_mode/pid)
@@ -129,6 +140,40 @@ def _instance_values_from_legacy_row(row: dict | None, persona_id: int | None = 
     return {key: values.get(key) for key in INSTANCE_COLUMNS if key in values}
 
 
+def is_official_instance_name_actor(actor: str | None) -> bool:
+    return (actor or "").strip() in OFFICIAL_INSTANCE_NAME_ACTORS
+
+
+def _coerce_insert_name(values: dict) -> dict:
+    """Force every insert through the single placeholder name.
+
+    Official naming is an explicit post-registration update, never an insert-time
+    derivation.
+    """
+    if values.get("name") == DEFAULT_INSTANCE_NAME:
+        return values
+    return {**values, "name": DEFAULT_INSTANCE_NAME}
+
+
+def _assert_name_update_authorized(
+    updates: dict, *, actor: str, current_name: str | None = None
+) -> None:
+    if "name" not in updates:
+        return
+    if updates.get("name") == current_name:
+        return
+    if updates.get("name") == DEFAULT_INSTANCE_NAME:
+        return
+    if is_placeholder_tab_name(updates.get("name")):
+        raise ValueError("instances.name cannot be set to a deprecated placeholder")
+    if is_official_instance_name_actor(actor):
+        return
+    raise ValueError(
+        "instances.name may only be set to a non-placeholder value by the official "
+        "rename path (instance-name-cli, naming-interview, session-doc-name)"
+    )
+
+
 async def _prepare_chapter_commander(db, values: dict) -> dict:
     if values.get("commander_type") != "chapter" or not values.get("commander_id"):
         return values
@@ -221,6 +266,7 @@ async def sanctioned_update_instance_record(
     before_row = await _fetch_instance_record(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
+    _assert_name_update_authorized(updates, actor=actor, current_name=before_row.get("name"))
 
     changed_fields = [field for field, value in updates.items() if before_row.get(field) != value]
     assignments = ", ".join(f"{field} = ?" for field in updates)
@@ -405,6 +451,7 @@ async def sanctioned_update_instance(
     before_row = await _fetch_instance_row(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
+    _assert_name_update_authorized(updates, actor=actor, current_name=before_row.get("name"))
 
     tracked = set(tracked_fields) if tracked_fields is not None else set(INSTANCE_MUTATION_FIELDS)
     if force_clear_human_anchor:
@@ -487,6 +534,7 @@ def sanctioned_update_instance_sync(
     before_row = _fetch_instance_row_sync(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
+    _assert_name_update_authorized(updates, actor=actor, current_name=before_row.get("name"))
 
     tracked = set(tracked_fields) if tracked_fields is not None else set(INSTANCE_MUTATION_FIELDS)
     if force_clear_human_anchor:
@@ -552,6 +600,7 @@ async def sanctioned_insert_instance(
         values, await _persona_id_for_row(db, values)
     )
     instance_values = await _prepare_chapter_commander(db, instance_values)
+    instance_values = _coerce_insert_name(instance_values)
     if not instance_values.get("id"):
         raise ValueError("sanctioned_insert_instance requires an id")
     columns = [column for column in INSTANCE_COLUMNS if column in instance_values]
@@ -597,6 +646,7 @@ def sanctioned_insert_instance_sync(
     """Sync twin of sanctioned_insert_instance."""
     instance_values = _instance_values_from_legacy_row(values, _persona_id_for_row_sync(db, values))
     instance_values = _prepare_chapter_commander_sync(db, instance_values)
+    instance_values = _coerce_insert_name(instance_values)
     if not instance_values.get("id"):
         raise ValueError("sanctioned_insert_instance_sync requires an id")
     columns = [column for column in INSTANCE_COLUMNS if column in instance_values]
@@ -798,6 +848,34 @@ def _current_row_matches_sanctioned_fields(
     return not mismatches, mismatches, latest_by_field
 
 
+async def _has_official_name_provenance(db, instance_id: str, row: dict) -> bool:
+    name = row.get("name")
+    if name == DEFAULT_INSTANCE_NAME:
+        return True
+    cursor = await db.execute(
+        """
+        SELECT actor, field_names_json, after_json
+        FROM instance_mutations
+        WHERE instance_id = ?
+        ORDER BY created_at DESC, id DESC
+        """,
+        (instance_id,),
+    )
+    for mutation in await cursor.fetchall():
+        try:
+            fields = json.loads(mutation[1] or "[]") or []
+            after = json.loads(mutation[2] or "{}") or {}
+        except Exception:
+            continue
+        if (
+            "name" in fields
+            and after.get("name") == name
+            and is_official_instance_name_actor(mutation[0])
+        ):
+            return True
+    return False
+
+
 async def reconcile_instance(db, instance_id: str) -> dict | None:
     row = await _fetch_instance_row(db, instance_id)
     if row is None:
@@ -823,6 +901,16 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
                 "field_write_txn_ids": {
                     field: latest_by_field.get(field, {}).get("write_txn_id") for field in fields
                 },
+            }
+        )
+
+    if not await _has_official_name_provenance(db, instance_id, row):
+        findings.append(
+            {
+                "category": "illegal_instance_name",
+                "message": "instance name was not produced by an official rename path",
+                "fields": ["name"],
+                "observed": row.get("name"),
             }
         )
 
@@ -890,7 +978,9 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
 
     status = "clean"
     categories = {finding["category"] for finding in findings}
-    if "state_drift" in categories:
+    if "illegal_instance_name" in categories:
+        status = "illegal_instance_name"
+    elif "state_drift" in categories:
         status = "state_drift"
     elif "projection_drift" in categories:
         status = "projection_drift"

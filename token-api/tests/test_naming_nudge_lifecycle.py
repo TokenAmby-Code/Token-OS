@@ -24,7 +24,7 @@ def _insert_wrapper_instance(
             conn,
             values={
                 "id": instance_id,
-                "name": name,
+                "name": "needs-name",
                 "engine": "codex",
                 "working_dir": "/tmp",
                 "device_id": "Mac-Mini",
@@ -39,6 +39,15 @@ def _insert_wrapper_instance(
             write_source="test",
             actor="test",
         )
+        if name != "needs-name":
+            sanctioned_update_instance_sync(
+                conn,
+                instance_id=instance_id,
+                updates={"name": name},
+                mutation_type="instance_updated",
+                write_source="test",
+                actor="instance-name-cli",
+            )
         conn.commit()
 
 
@@ -233,8 +242,8 @@ async def test_reconciler_schedules_live_placeholder_with_prompt_evidence(
 
 
 @pytest.mark.asyncio
-async def test_reconciler_does_not_nudge_placeholder_with_session_doc(app_env, monkeypatch) -> None:
-    """Session-doc placeholder drift is flagged by reconciler, not renamed."""
+async def test_reconciler_nudges_placeholder_with_session_doc(app_env, monkeypatch) -> None:
+    """Live session-doc placeholder drift is flagged and interviewed."""
     main = app_env.main
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
@@ -265,17 +274,21 @@ async def test_reconciler_does_not_nudge_placeholder_with_session_doc(app_env, m
     async def live_ids():
         return {"reconcile-doc-drift"}
 
-    async def fail_maybe(instance_id):
-        raise AssertionError(f"unexpected naming nudge: {instance_id}")
+    nudged = []
+
+    async def fake_maybe(instance_id):
+        nudged.append(instance_id)
+        return {"success": True}
 
     monkeypatch.setattr(main, "_read_tmux_panes", reachable_tmux)
     monkeypatch.setattr(main, "_live_agent_instance_ids", live_ids)
-    monkeypatch.setattr(main, "_maybe_naming_nudge", fail_maybe)
+    monkeypatch.setattr(main, "_maybe_naming_nudge", fake_maybe)
 
     counts = await main._run_tmux_db_reconcile_cycle()
     await asyncio.sleep(0)
 
-    assert counts["naming_nudge_scheduled"] == 0
+    assert counts["naming_nudge_scheduled"] == 1
+    assert nudged == ["reconcile-doc-drift"]
     assert counts["placeholder_tab_name_drift"] == 1
 
 
@@ -336,6 +349,83 @@ async def test_reconciler_does_not_nudge_live_placeholder_without_prompt_evidenc
     await asyncio.sleep(0)
 
     assert counts["naming_nudge_scheduled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciler_resets_unofficial_date_name_and_interviews(app_env, monkeypatch) -> None:
+    """Illegal non-provenanced names are reset to needs-name and interviewed."""
+    main = app_env.main
+    _insert_wrapper_instance(
+        app_env.db_path,
+        instance_id="illegal-date-name",
+        wrapper_id="wrap-date",
+    )
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute("UPDATE instances SET name = '2026-06-25' WHERE id = 'illegal-date-name'")
+        conn.commit()
+
+    async def reachable_tmux():
+        return {}
+
+    async def live_ids():
+        return {"illegal-date-name"}
+
+    nudged = []
+
+    async def fake_maybe(instance_id):
+        nudged.append(instance_id)
+        return {"success": True}
+
+    monkeypatch.setattr(main, "_read_tmux_panes", reachable_tmux)
+    monkeypatch.setattr(main, "_live_agent_instance_ids", live_ids)
+    monkeypatch.setattr(main, "_maybe_naming_nudge", fake_maybe)
+
+    counts = await main._run_tmux_db_reconcile_cycle()
+    await asyncio.sleep(0)
+
+    assert counts["illegal_instance_name_reset"] == 1
+    assert counts["naming_nudge_scheduled"] == 1
+    assert nudged == ["illegal-date-name"]
+    with sqlite3.connect(app_env.db_path) as conn:
+        row = conn.execute(
+            "SELECT name, workflow_blocked_reason FROM instances WHERE id = 'illegal-date-name'"
+        ).fetchone()
+    assert row == ("needs-name", "tab_name_placeholder")
+
+
+@pytest.mark.asyncio
+async def test_reconciler_preserves_officially_renamed_row(app_env, monkeypatch) -> None:
+    """A non-placeholder name with official rename provenance is untouched."""
+    main = app_env.main
+    _insert_wrapper_instance(
+        app_env.db_path,
+        instance_id="official-name",
+        wrapper_id="wrap-official",
+        name="official-human-name",
+    )
+
+    async def reachable_tmux():
+        return {}
+
+    async def live_ids():
+        return {"official-name"}
+
+    monkeypatch.setattr(main, "_read_tmux_panes", reachable_tmux)
+    monkeypatch.setattr(main, "_live_agent_instance_ids", live_ids)
+    monkeypatch.setattr(
+        main,
+        "_maybe_naming_nudge",
+        lambda instance_id: (_ for _ in ()).throw(AssertionError(instance_id)),
+    )
+
+    counts = await main._run_tmux_db_reconcile_cycle()
+    await asyncio.sleep(0)
+
+    assert counts["illegal_instance_name_reset"] == 0
+    assert counts["naming_nudge_scheduled"] == 0
+    with sqlite3.connect(app_env.db_path) as conn:
+        row = conn.execute("SELECT name FROM instances WHERE id = 'official-name'").fetchone()
+    assert row == ("official-human-name",)
 
 
 @pytest.mark.asyncio
