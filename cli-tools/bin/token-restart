@@ -66,6 +66,24 @@ DISCORD_LABEL="ai.tokenclaw.discord"
 DISCORD_PLIST="$HOME/Library/LaunchAgents/${DISCORD_LABEL}.plist"
 DISCORD_URL="http://127.0.0.1:7779"
 
+# tmuxctld daemon — launchd-supervised, Mac-only, loopback HTTP control plane on
+# 127.0.0.1:7778 (ai.tokenclaw.tmuxctld, KeepAlive). Like Discord, token-restart
+# bounces it via launchctl DIRECTLY (not `tmuxctld-ctl restart`) so the deploy's
+# launchctl calls stay uniform and stub-testable, and so a deploy never shells out
+# to the tmux/tmuxctl/tx tooling (the CD "never wipe the fleet" invariant). The
+# daemon CODE lands via the normal main→live sync, but Python is not hot-reloaded,
+# so the running process must be restarted to pick it up. A PLIST change
+# additionally needs bootout+bootstrap of the freshly-synced plist (kickstart -k
+# reuses the already-bootstrapped service definition) — mirroring restart_mac's
+# plist path and what `tmuxctld-ctl install` does.
+TMUXCTLD_LABEL="ai.tokenclaw.tmuxctld"
+TMUXCTLD_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+# Source plist ships in the runtime checkout (token-restart runs from there in
+# production, so _BIN_DIR resolves to the synced copy); installed copy lives in
+# LaunchAgents. Both overridable so tests redirect them off the live LaunchAgent.
+TMUXCTLD_SRC_PLIST="${TMUXCTLD_SRC_PLIST:-${_BIN_DIR}/../launchd/${TMUXCTLD_LABEL}.plist}"
+TMUXCTLD_PLIST="${TMUXCTLD_PLIST:-$HOME/Library/LaunchAgents/${TMUXCTLD_LABEL}.plist}"
+
 # Local CD topology. Values can be overridden for tests/emergency deploys, or via
 # ~/.config/worktrees/Token-OS.conf. The bare repo is the read-only skeleton; the
 # runtime checkout is deploy-owned and must stay clean.
@@ -471,6 +489,8 @@ _reset_deploy_run_state() {
     RESTART_TOKENAPI=false
     RESTART_OPS=false
     RESTART_DISCORD=false
+    RESTART_TMUXCTLD=false
+    TMUXCTLD_PLIST_CHANGED=false
     RESTART_WSL=false
     REFRESH_WSL=false
     RESTART_MOBILE=false
@@ -1009,6 +1029,75 @@ restart_discord() {
     return 0
 }
 
+# ============ tmuxctld daemon ============
+
+check_tmuxctld_health() {
+    curl -sf "${TMUXCTLD_URL}/health" > /dev/null 2>&1
+}
+
+get_tmuxctld_status() {
+    echo -e "${BOLD}tmuxctld daemon${NC} (${TMUXCTLD_URL})"
+
+    if launchctl print "gui/$(id -u)/${TMUXCTLD_LABEL}" > /dev/null 2>&1; then
+        echo -e "  Launchd: ${GREEN}loaded${NC}"
+    else
+        echo -e "  Launchd: ${RED}not loaded${NC}"
+    fi
+
+    if check_tmuxctld_health; then
+        echo -e "  Health:  ${GREEN}●${NC} healthy"
+    else
+        echo -e "  Health:  ${RED}●${NC} not responding"
+    fi
+}
+
+# Restart the launchd-supervised tmuxctld daemon to pick up freshly-synced code.
+# Fail-soft: a daemon that won't come back must NOT abort the rest of the deploy
+# (mirrors restart_discord — launchd KeepAlive owns liveness; this only confirms).
+restart_tmuxctld() {
+    echo -e "${BLUE}→${NC} Restarting tmuxctld daemon (launchd)..."
+
+    if [[ "${TMUXCTLD_PLIST_CHANGED:-false}" == true ]]; then
+        # A changed plist is NOT honored by `kickstart -k` (launchd reuses the
+        # already-bootstrapped service definition), so reinstall: copy the synced
+        # plist into LaunchAgents, then bootout+bootstrap. Same shape as
+        # restart_mac's plist-changed path and `tmuxctld-ctl install`.
+        echo -e "  ${BLUE}→${NC} plist changed — reinstalling (bootout+bootstrap)"
+        if [[ -f "$TMUXCTLD_SRC_PLIST" ]]; then
+            mkdir -p "$(dirname "$TMUXCTLD_PLIST")"
+            cp "$TMUXCTLD_SRC_PLIST" "$TMUXCTLD_PLIST" 2>/dev/null \
+                || echo -e "  ${YELLOW}⚠${NC} could not copy plist → $TMUXCTLD_PLIST (continuing)"
+        else
+            echo -e "  ${YELLOW}⚠${NC} source plist not found: $TMUXCTLD_SRC_PLIST (continuing)"
+        fi
+        launchctl bootout "gui/$(id -u)/${TMUXCTLD_LABEL}" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$TMUXCTLD_PLIST" 2>/dev/null || true
+    else
+        # Code-only change: kickstart -k restarts the running process (or starts it
+        # if down). Bootstrap the plist as a fallback if the service isn't loaded.
+        launchctl kickstart -k "gui/$(id -u)/${TMUXCTLD_LABEL}" 2>/dev/null || {
+            echo "  Service not loaded, bootstrapping..."
+            launchctl bootstrap "gui/$(id -u)" "$TMUXCTLD_PLIST" 2>/dev/null || true
+        }
+    fi
+
+    # Best-effort confirmation only — launchd (KeepAlive) already owns liveness.
+    local attempts=0
+    local max_attempts=15
+    while [[ $attempts -lt $max_attempts ]]; do
+        sleep 1
+        if check_tmuxctld_health; then
+            echo -e "  ${GREEN}✓${NC} tmuxctld daemon is up and healthy"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+    done
+
+    echo -e "  ${YELLOW}○${NC} Restart issued; tmuxctld not yet healthy — launchd will bring it up."
+    echo -e "    confirm with: tmuxctld-ctl status"
+    return 0
+}
+
 # ============ WSL ============
 
 check_wsl_health() {
@@ -1232,6 +1321,8 @@ get_status_all() {
     echo ""
     get_discord_status
     echo ""
+    get_tmuxctld_status
+    echo ""
     get_wsl_status
     echo ""
     get_phone_status
@@ -1392,6 +1483,33 @@ map_changed_to_services() {
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
         case "$path" in
+            cli-tools/launchd/ai.tokenclaw.tmuxctld.plist)
+                # The daemon's LaunchAgent plist changed. kickstart -k won't reload
+                # a changed plist, so flag a reinstall (cp + bootout + bootstrap of
+                # the freshly-synced copy). MUST precede the cli-tools/lib/* WSL arm.
+                RESTART_TMUXCTLD=true
+                TMUXCTLD_PLIST_CHANGED=true
+                ;;
+            cli-tools/lib/tmuxctl/*)
+                # tmuxctld daemon code area (the loopback tmux control plane:
+                # daemon.py + the service/adapter/api modules it imports). Python is
+                # not hot-reloaded, so new daemon code lands via main→live sync but
+                # the running process must be bounced to load it. This arm MUST
+                # precede the general cli-tools/lib/* arm below, which otherwise
+                # swallows cli-tools/lib/tmuxctl/* into the WSL-only route. The
+                # tmuxctl subtree lives under cli-tools/lib, which the WSL arm
+                # refreshes today — keep that WSL refresh (purely additive) so this
+                # change never regresses the satellite's cli-tools sync.
+                RESTART_TMUXCTLD=true
+                RESTART_WSL=true
+                REFRESH_WSL=true
+                ;;
+            cli-tools/bin/tmuxctld)
+                # The daemon entrypoint (the single source of truth for the
+                # interpreter the plist invokes). Mac-local; unmapped today, so it
+                # routes to the daemon restart only — no WSL refresh.
+                RESTART_TMUXCTLD=true
+                ;;
             token-api/token-satellite.py | token-api/scripts/token-satellite-refresh | ahk/* | cli-tools/bin/dispatch | cli-tools/lib/* | config/deskflow/*)
                 # WSL-hosted runtime dependencies. Push the target SHA into the
                 # WSL-local runtime/AHK cache instead of merely restarting NAS code.
@@ -1464,7 +1582,8 @@ full_restart() {
         # changed this pull — the process is still serving older code.
         [[ "$token_api_stale" == true ]] && RESTART_TOKENAPI=true
         if [[ "$RESTART_TOKENAPI" != true && "$RESTART_DISCORD" != true \
-            && "$RESTART_WSL" != true && "$RESTART_MOBILE" != true ]]; then
+            && "$RESTART_WSL" != true && "$RESTART_MOBILE" != true \
+            && "$RESTART_TMUXCTLD" != true ]]; then
             echo -e "${GREEN}✓${NC} No deployable services changed — nothing to restart."
             return 0
         fi
@@ -1472,6 +1591,7 @@ full_restart() {
         [[ "$RESTART_TOKENAPI" == true ]] && changed_list+=" token-api"
         [[ "$RESTART_OPS" == true ]] && changed_list+=" ops-ui"
         [[ "$RESTART_DISCORD" == true ]] && changed_list+=" discord"
+        [[ "$RESTART_TMUXCTLD" == true ]] && changed_list+=" tmuxctld"
         [[ "$RESTART_WSL" == true ]] && changed_list+=" wsl"
         [[ "$RESTART_MOBILE" == true ]] && changed_list+=" mobile"
         echo -e "${BLUE}→${NC} Changed services:${changed_list}"
@@ -1507,6 +1627,14 @@ full_restart() {
     # 3. Discord daemon (Mac-only, launchd-supervised)
     if [[ "$RESTART_DISCORD" == true ]]; then
         restart_discord || true
+        echo ""
+    fi
+
+    # 3b. tmuxctld daemon (Mac-only, launchd-supervised loopback control plane).
+    #     Fail-soft like Discord: a daemon that won't come back must not abort the
+    #     rest of the deploy.
+    if [[ "$RESTART_TMUXCTLD" == true ]]; then
+        restart_tmuxctld || true
         echo ""
     fi
 
@@ -1547,6 +1675,13 @@ full_restart() {
             echo -e "  Discord: ${RED}●${NC} not responding"
         fi
     fi
+    if [[ "$RESTART_TMUXCTLD" == true ]]; then
+        if check_tmuxctld_health; then
+            echo -e "  tmuxctld:${GREEN}●${NC} healthy"
+        else
+            echo -e "  tmuxctld:${YELLOW}○${NC} not responding"
+        fi
+    fi
     if [[ "$RESTART_WSL" == true ]]; then
         if check_wsl_health; then
             echo -e "  WSL:     ${GREEN}●${NC} healthy"
@@ -1578,6 +1713,10 @@ CD_SYNC_MERGE_ERR=""
 RESTART_TOKENAPI=false
 RESTART_OPS=false
 RESTART_DISCORD=false
+# tmuxctld daemon: set by map_changed_to_services() when the daemon area changed.
+# TMUXCTLD_PLIST_CHANGED forces a reinstall (bootout+bootstrap) vs a kickstart.
+RESTART_TMUXCTLD=false
+TMUXCTLD_PLIST_CHANGED=false
 RESTART_WSL=false
 REFRESH_WSL=false
 RESTART_MOBILE=false
