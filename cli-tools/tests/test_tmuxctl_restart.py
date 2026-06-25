@@ -591,6 +591,14 @@ def test_builder_creates_canonical_workspace_roles():
     assert adapter.pane_options["main:reservists.1"]["@CIVIC_RESERVIST"] == "1"
     pane_types = [options.get("@PANE_TYPE") for options in adapter.pane_options.values()]
     assert "tui" not in pane_types
+    for target in (
+        "main:palace",
+        "main:somnium",
+        "main:council",
+        "main:mechanicus",
+        "main:reservists",
+    ):
+        assert adapter.window_options[target]["window-size"] == "latest"
 
 
 def test_window_dir_persona_windows_use_vault_when_mounted(tmp_path, monkeypatch) -> None:

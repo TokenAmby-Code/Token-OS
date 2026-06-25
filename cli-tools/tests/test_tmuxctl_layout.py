@@ -50,7 +50,7 @@ def test_workspace_layout_ratios_are_canonical() -> None:
 def test_layout_widths_keep_side_panes_equal_and_center_remainder_typed() -> None:
     layout = WorkspaceLayout()
 
-    # Detached builder default: 239 columns, shared ColumnSpec -> 71-column sides.
+    # Detached builder reference: 239 columns, shared ColumnSpec -> 71-column sides.
     assert DETACHED_W == layout.column.reference_total_width == 239
     assert layout.column.usable_width == 237
     assert layout.column.width == 71
@@ -65,6 +65,22 @@ def test_layout_widths_keep_side_panes_equal_and_center_remainder_typed() -> Non
     assert layout.somnium.grid_column_widths(239) == (83, 83)
     assert layout.somnium.grid_row_height(60) == 29
     assert layout.somnium.right_grid_split_width(239) == 167
+
+
+def test_layout_widths_scale_to_phone_client_width() -> None:
+    layout = WorkspaceLayout()
+
+    # Phone-width clients must not inherit the detached 71-column side rails.
+    assert layout.palace.usable_width(174) == 172
+    assert layout.palace.side_width(174) == 51
+    assert layout.palace.center_width(174) == 70
+    assert layout.palace.center_plus_east_split_width(174) == 122
+
+    assert layout.somnium.usable_width(174) == 172
+    assert layout.somnium.west_width(174) == layout.palace.side_width(174)
+    assert layout.somnium.grid_width(174) == 122
+    assert layout.somnium.grid_column_widths(174) == (61, 60)
+    assert layout.somnium.right_grid_split_width(174) == 122
 
 
 def test_somnium_right_grid_cells_are_equal_sized() -> None:
