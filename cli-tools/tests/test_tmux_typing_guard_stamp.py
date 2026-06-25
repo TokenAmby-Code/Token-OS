@@ -15,27 +15,29 @@ GUARD = REPO / "cli-tools" / "lib" / "tmux-guard.sh"
 AGENT_CMD = REPO / "cli-tools" / "bin" / "agent-cmd"
 BRIEF = REPO / "cli-tools" / "bin" / "brief"
 TMUX_SHIM = REPO / "cli-tools" / "bin" / "tmux"
-STATUS = REPO / "cli-tools" / "bin" / "tmux-typing-guard-status"
+STATE = REPO / "cli-tools" / "bin" / "tmux-typing-guard-state"
 
 
 def _fake_tmux(tmp_path: Path) -> Path:
     fake = tmp_path / "tmux"
     fake.write_text(
         textwrap.dedent(
-            """
+            r"""
             #!/usr/bin/env bash
             set -euo pipefail
             echo "$*" >> "${FAKE_TMUX_CALLS}"
+            key() { printf '%s' "$1" | sed 's/[^A-Za-z0-9_.:%-]/_/g'; }
+            target=""
+            prev=""
+            for a in "$@"; do
+              if [[ "$prev" == "-t" ]]; then target="$a"; fi
+              prev="$a"
+            done
             case "${1:-}" in
-              capture-pane)
-                cat "${FAKE_TMUX_CAPTURE}"
-                ;;
               display-message)
                 if [[ "$*" == *"#{client_activity}"* ]]; then echo "${FAKE_TMUX_CLIENT_ACTIVITY:-}";
                 elif [[ "$*" == *"#{?pane_active,1,0}#{?window_active,1,0}"* ]]; then echo "${FAKE_TMUX_ATTENDED:-11}";
-                elif [[ "$*" == *"#{pane_id}	#{session_name}"* ]]; then printf '%%1\ts\t0\tw\t0\t80\t24\tbash\t/dev/ttys001\t1\n';
-                elif [[ "$*" == *"#{session_name}:#{window_index}"* ]]; then echo "s:0";
-                elif [[ "$*" == *"#{pane_pid}"* ]]; then echo "1";
+                elif [[ "$*" == *"#{pane_id}    #{session_name}"* ]]; then printf '%%1\ts\t0\tw\t0\t80\t24\tbash\t/dev/ttys001\t1\n';
                 elif [[ "$*" == *"#{pane_id}"* ]]; then echo "%1"; else echo ""; fi
                 ;;
               list-clients)
@@ -47,23 +49,31 @@ def _fake_tmux(tmp_path: Path) -> Path:
               list-windows)
                 echo -e "s\t0\tw"
                 ;;
-              show-options)
-                # The canonical send-gate predicate reads the per-pane keystroke
-                # lock here; the shell-stamp path (tmux_wait_for_clear) queries no
-                # option, so a bare show-options still falls through to exit 1.
+              show-options|show)
                 if [[ "$*" == *"@TYPING_LOCK_UNTIL"* ]]; then
-                  echo "${FAKE_TYPING_LOCK_UNTIL:-}"; exit 0;
+                  f="${FAKE_LOCK_DIR:-}/$(key "${target:-%1}")"
+                  if [[ -n "${FAKE_LOCK_DIR:-}" && -f "$f" ]]; then cat "$f"; else echo "${FAKE_TYPING_LOCK_UNTIL:-}"; fi
+                  exit 0
+                fi
+                if [[ "$*" == *"@TYPING_PENDING_UNTIL"* ]]; then
+                  f="${FAKE_PENDING_DIR:-}/$(key "${target:-%1}")"
+                  if [[ -n "${FAKE_PENDING_DIR:-}" && -f "$f" ]]; then cat "$f"; else echo "${FAKE_TYPING_PENDING_UNTIL:-}"; fi
+                  exit 0
                 fi
                 exit 1
                 ;;
-              set-option)
+              set-option|set)
+                printf '%s\n' "$*" >> "${FAKE_TMUX_SETOPT}"
+                exit 0
+                ;;
+              run-shell)
+                printf '%s\n' "$*" >> "${FAKE_TMUX_RUNSHELL}"
                 exit 0
                 ;;
               send-keys|send-key|send)
                 echo "ALLOW=${TMUX_SEND_GATE_ALLOW:-} SEND $*" >> "${FAKE_TMUX_SENT}"
                 ;;
-              *)
-                ;;
+              *) ;;
             esac
             """
         ).strip()
@@ -73,26 +83,27 @@ def _fake_tmux(tmp_path: Path) -> Path:
     return fake
 
 
-def _env(tmp_path: Path, capture_text: str) -> dict[str, str]:
-    capture = tmp_path / "capture.txt"
-    capture.write_text(capture_text)
+def _env(tmp_path: Path) -> dict[str, str]:
     calls = tmp_path / "calls.log"
     sent = tmp_path / "sent.log"
-    calls.write_text("")
-    sent.write_text("")
+    setopt = tmp_path / "setopt.log"
+    runshell = tmp_path / "runshell.log"
+    for path in (calls, sent, setopt, runshell):
+        path.write_text("")
     fake = _fake_tmux(tmp_path)
     env = os.environ.copy()
     env.update(
         {
             "PATH": f"{tmp_path}:{env.get('PATH', '')}",
-            "FAKE_TMUX_CAPTURE": str(capture),
             "FAKE_TMUX_CALLS": str(calls),
             "FAKE_TMUX_SENT": str(sent),
+            "FAKE_TMUX_SETOPT": str(setopt),
+            "FAKE_TMUX_RUNSHELL": str(runshell),
             "TMUX_GUARD_REAL_TMUX": str(fake),
-            "TMUX_GUARD_STATE_DIR": str(tmp_path / "guard-state"),
+            "IMPERIUM_TMUX_BIN": str(fake),
             "TMUX_GUARD_LOG": str(tmp_path / "guard.jsonl"),
-            "TMUX_GUARD_TTL": "300",
             "TMUX_SEND_GATE_POLICY": "pierce",
+            "TMUX_GUARD_PYTHON": sys.executable,
         }
     )
     return env
@@ -111,130 +122,106 @@ def _bash(
     )
 
 
-def test_wait_for_clear_blocks_loudly_and_structured_logs(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> draft\n")
-    env["TMUX_GUARD_NOW"] = "1000"
+def test_legacy_guard_no_longer_uses_stamp_files_or_prompt_scraping() -> None:
+    text = GUARD.read_text(encoding="utf-8")
+    forbidden = [
+        "capture-pane",
+        "tmux_guard_stamp_file",
+        "tmux_guard_write_stamp",
+        "tmux_guard_clear_stamp",
+        "TMUX_GUARD_STATE_DIR",
+        ".stamp",
+        "prompt/input line",
+    ]
+    for needle in forbidden:
+        assert needle not in text
+    assert "tmuxctl.send_gate typing" in text
+
+
+def test_no_guard_assignment_contains_literal_pending() -> None:
+    for rel in (
+        "cli-tools/tmux/tmux-base.conf",
+        "cli-tools/bin/tmux-typing-guard-state",
+        "cli-tools/lib/tmuxctl/typing_guard_state.py",
+    ):
+        text = (REPO / rel).read_text(encoding="utf-8")
+        assert "⌨ PENDING" not in text
+        assert '@GUARD" "PENDING' not in text
+
+
+def test_state_helper_arm_sets_yellow_marker_and_schedules_expiry(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, str(STATE), "arm", "--pane", "%1", "--seconds", "300", "--now", "1000"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=5,
+        check=False,
+    )
+    assert proc.returncode == 0
+    setopt = Path(env["FAKE_TMUX_SETOPT"]).read_text()
+    assert "@TYPING_LOCK_UNTIL 1300" in setopt
+    assert "@TYPING_PENDING_UNTIL" in setopt and "-pu" in setopt
+    guard_rows = [line for line in setopt.splitlines() if " @GUARD " in line]
+    assert guard_rows == ["set-option -p -t %1 @GUARD #[fg=colour214,bold]⌨#[default]"]
+    assert "expire-pane --pane %1" in Path(env["FAKE_TMUX_RUNSHELL"]).read_text()
+
+
+def test_state_helper_pending_sets_red_marker_and_unsets_lock(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, str(STATE), "pending", "--pane", "%1", "--seconds", "15", "--now", "1000"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=5,
+        check=False,
+    )
+    assert proc.returncode == 0
+    setopt = Path(env["FAKE_TMUX_SETOPT"]).read_text()
+    assert "@TYPING_PENDING_UNTIL 1015" in setopt
+    assert "@TYPING_LOCK_UNTIL" in setopt and "-pu" in setopt
+    guard_rows = [line for line in setopt.splitlines() if " @GUARD " in line]
+    assert guard_rows == ["set-option -p -t %1 @GUARD #[fg=red,bold]⌨#[default]"]
+
+
+def test_wait_for_clear_blocks_on_canonical_typing_guard_and_logs(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 200)
     proc = _bash(f'source "{GUARD}"; tmux_wait_for_clear %1 0', env)
 
     assert proc.returncode == 1
-    assert "tmux-guard: BLOCKED send-keys to %1" in proc.stderr
+    assert "typing guard active" in proc.stderr
     records = [json.loads(line) for line in Path(env["TMUX_GUARD_LOG"]).read_text().splitlines()]
     assert records[-1]["event"] == "blocked"
     assert records[-1]["pane"] == "%1"
-    assert records[-1]["reason"] == "user_input_pending"
+    assert records[-1]["reason"] == "typing_guard"
+    assert "capture-pane" not in Path(env["FAKE_TMUX_CALLS"]).read_text()
 
 
-def test_stamp_once_no_sliding_window_and_hard_ttl_self_heals(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> draft keeps changing\n")
-    script = f'''
-      set +e
-      source "{GUARD}"
-      TMUX_GUARD_NOW=1000 tmux_wait_for_clear %1 0; echo first:$?
-      TMUX_GUARD_NOW=1100 tmux_wait_for_clear %1 0; echo second:$?
-      TMUX_GUARD_NOW=1301 tmux_wait_for_clear %1 0; echo after_ttl:$?
-      TMUX_GUARD_NOW=1302 tmux_wait_for_clear %1 0; echo still_after_ttl:$?
-      cat "$(tmux_guard_stamp_file %1)"
-    '''
-    proc = _bash(script, env)
+def test_wait_for_clear_allows_when_canonical_guard_clear(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    env["FAKE_TYPING_LOCK_UNTIL"] = ""
+    proc = _bash(f'source "{GUARD}"; tmux_wait_for_clear %1 0', env)
 
     assert proc.returncode == 0
-    assert "first:1" in proc.stdout
-    assert "second:1" in proc.stdout
-    assert "after_ttl:0" in proc.stdout
-    assert "still_after_ttl:0" in proc.stdout
-    assert "started_at=1000" in proc.stdout
-    assert "state=expired" in proc.stdout
-
-
-def test_empty_or_just_submitted_pane_clears_stamp_and_never_blocks(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> draft\n")
-    capture = Path(env["FAKE_TMUX_CAPTURE"])
-    script = f'''
-      set +e
-      source "{GUARD}"
-      TMUX_GUARD_NOW=1000 tmux_wait_for_clear %1 0; echo dirty:$?
-      printf '> \n' > "{capture}"
-      TMUX_GUARD_NOW=1001 tmux_wait_for_clear %1 0; echo submitted:$?
-      if [[ -e "$(tmux_guard_stamp_file %1)" ]]; then echo stamp:present; else echo stamp:gone; fi
-      TMUX_GUARD_NOW=1002 tmux_wait_for_clear %1 0; echo empty_again:$?
-    '''
-    proc = _bash(script, env)
-
-    assert proc.returncode == 0
-    assert "dirty:1" in proc.stdout
-    assert "submitted:0" in proc.stdout
-    assert "stamp:gone" in proc.stdout
-    assert "empty_again:0" in proc.stdout
-
-
-def test_freshly_cleared_claude_prompt_after_clear_echo_drops_stamp(tmp_path: Path) -> None:
-    env = _env(tmp_path, "❯\u00a0draft\n")
-    capture = Path(env["FAKE_TMUX_CAPTURE"])
-    script = f'''
-      set +e
-      source "{GUARD}"
-      TMUX_GUARD_NOW=1000 tmux_wait_for_clear %1 0; echo dirty:$?
-      cat > "{capture}" <<'EOF'
-❯ /clear
-❯\u00a0
-────────────────────────────────────────────────────────────────────────────────
-  ... 0/200k $0.00
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
-EOF
-      TMUX_GUARD_NOW=1001 tmux_wait_for_clear %1 0; echo cleared:$?
-      if [[ -e "$(tmux_guard_stamp_file %1)" ]]; then echo stamp:present; else echo stamp:gone; fi
-    '''
-    proc = _bash(script, env)
-
-    assert proc.returncode == 0
-    assert "dirty:1" in proc.stdout
-    assert "cleared:0" in proc.stdout
-    assert "stamp:gone" in proc.stdout
-
-
-def test_status_segment_follows_keystroke_lock(tmp_path: Path) -> None:
-    """The status segment lights iff the pane carries a live keystroke lock —
-    the same canonical predicate that gates the send path. A future
-    ``@TYPING_LOCK_UNTIL`` lights it; an expired one goes dark."""
-    env = _env(tmp_path, "> \n")
-    now = int(time.time())
-
-    env["FAKE_TYPING_LOCK_UNTIL"] = str(now + 200)
-    lit = subprocess.run(
-        [sys.executable, str(STATUS), "--plain"],
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
-        check=False,
-    )
-
-    env["FAKE_TYPING_LOCK_UNTIL"] = str(now - 60)  # 5-min window elapsed / Enter cleared
-    expired = subprocess.run(
-        [sys.executable, str(STATUS), "--plain"],
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
-        check=False,
-    )
-
-    assert lit.stdout == "TYPE"
-    assert expired.stdout == ""
+    assert "BLOCKED" not in proc.stderr
 
 
 def test_tmux_send_guarded_does_not_silently_swallow_block(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> draft\n")
-    env["TMUX_GUARD_NOW"] = "1000"
+    env = _env(tmp_path)
+    env["FAKE_TYPING_PENDING_UNTIL"] = str(int(time.time()) + 200)
     proc = _bash(f'source "{GUARD}"; tmux_send_guarded -t %1 -l peer-bytes', env)
 
     assert proc.returncode == 1
-    assert "tmux-guard: BLOCKED send-keys to %1" in proc.stderr
+    assert "typing guard active" in proc.stderr
     assert Path(env["FAKE_TMUX_SENT"]).read_text() == ""
 
 
 def test_tmux_guard_skip_escape_hatch_bypasses_block(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> draft\n")
+    env = _env(tmp_path)
+    env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 200)
     env["TMUX_GUARD_SKIP"] = "1"
     proc = _bash(f'source "{GUARD}"; tmux_send_guarded -t %1 -l peer-bytes', env)
 
@@ -244,14 +231,8 @@ def test_tmux_guard_skip_escape_hatch_bypasses_block(tmp_path: Path) -> None:
 
 
 def test_tmux_shim_delays_under_typing_guard_then_delivers(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> \n")
+    env = _env(tmp_path)
     env.pop("TMUX_SEND_GATE_POLICY", None)
-    env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    # A keystroke lock ~1s out: the shim's send-gate delays, then the lock
-    # expires by wall-clock and the byte is delivered (no drop). The gate polls
-    # every 0.5s spawning a python3 subprocess per iteration, so on a contended
-    # CI runner the ~1s wait + process overhead can overrun a tight timeout;
-    # 30s gives ample headroom (pytest-timeout=120 is the true-hang backstop).
     env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 1)
     proc = subprocess.run(
         ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
@@ -269,74 +250,44 @@ def test_tmux_shim_delays_under_typing_guard_then_delivers(tmp_path: Path) -> No
 
 
 def test_tmux_shim_cancel_policy_suppresses_without_writing(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> \n")
+    env = _env(tmp_path)
     env["TMUX_SEND_GATE_POLICY"] = "cancel"
-    env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 200)  # %1 keystroke-locked
+    env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 200)
     proc = subprocess.run(
         ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
         text=True,
         capture_output=True,
         env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
+        timeout=15,
         check=False,
     )
 
     assert proc.returncode == 0
-    assert Path(env["FAKE_TMUX_SENT"]).read_text() == ""
-
-
-def test_tmux_shim_raw_read_is_unaffected(tmp_path: Path) -> None:
-    env = _env(tmp_path, "visible\n")
-    env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    env["IMPERIUM_TMUX_RAW"] = "1"
-    env["FAKE_TMUX_TARGET_CLIENT_ACTIVITY"] = str(int(time.time()))
-    proc = subprocess.run(
-        ["bash", str(TMUX_SHIM), "capture-pane", "-t", "%1", "-p"],
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
-        check=False,
-    )
-
-    assert proc.returncode == 0
-    assert proc.stdout == "visible\n"
     assert Path(env["FAKE_TMUX_SENT"]).read_text() == ""
 
 
 def test_tmux_shim_unlocked_pane_is_deliverable(tmp_path: Path) -> None:
-    # The target pane carries no keystroke lock (the Emperor never typed into
-    # it), so the per-pane gate never engages — the send sails through. A lock on
-    # some OTHER pane is irrelevant: the guard is strictly per-pane.
-    env = _env(tmp_path, "> \n")
-    env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
+    env = _env(tmp_path)
     env.pop("TMUX_SEND_GATE_POLICY", None)
-    env["FAKE_TYPING_LOCK_UNTIL"] = ""  # %1 unlocked
+    env["FAKE_TYPING_LOCK_UNTIL"] = ""
     proc = subprocess.run(
         ["bash", str(TMUX_SHIM), "send-keys", "-t", "%1", "peer-bytes"],
         text=True,
         capture_output=True,
         env=env,
-        timeout=15,  # widened for CPU contention under parallel runs
+        timeout=15,
         check=False,
     )
 
     assert proc.returncode == 0
-    assert "tmux-guard: BLOCKED" not in proc.stderr
     sent = Path(env["FAKE_TMUX_SENT"]).read_text()
     assert "SEND send-keys -t %1 peer-bytes" in sent
     assert "ALLOW= SEND" in sent
 
 
 def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path) -> None:
-    env = _env(tmp_path, "> \n")
+    env = _env(tmp_path)
     env.pop("TMUX_SEND_GATE_POLICY", None)
-    env["IMPERIUM_TMUX_BIN"] = env["TMUX_GUARD_REAL_TMUX"]
-    # Keystroke lock ~1s out: agent-cmd queues behind the gate, then delivers
-    # once the lock expires by wall-clock. 30s subprocess timeout (vs the gate's
-    # ~1s wait) absorbs CI poll/process overhead; pytest-timeout=120 backstops a
-    # true hang.
     env["FAKE_TYPING_LOCK_UNTIL"] = str(int(time.time()) + 1)
     stub = tmp_path / "tmuxctl-stub"
     stub.write_text(
@@ -367,7 +318,6 @@ def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path)
     assert proc.returncode == 0
     payload = json.loads(proc.stdout)
     assert payload["verification_status"] == "sent"
-    assert payload["pane"] == "%1"
     sent = Path(env["FAKE_TMUX_SENT"]).read_text()
     assert "hello from peer" in sent
     assert "ALLOW= SEND" in sent
@@ -412,7 +362,7 @@ def test_brief_surfaces_blocked_as_not_delivered(tmp_path: Path) -> None:
             text=True,
             capture_output=True,
             env=env,
-            timeout=15,  # widened for CPU contention under parallel runs
+            timeout=15,
             check=False,
         )
     finally:

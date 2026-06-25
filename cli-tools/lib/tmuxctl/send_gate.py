@@ -83,6 +83,11 @@ _SEND_GATE_DELAY_TIMEOUT_ENV = "TMUX_SEND_GATE_DELAY_TIMEOUT"  # unset/0 = no ti
 # table). This replaces the old focus-coupled ``#{client_activity}`` shadow.
 _TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
 _TYPING_PENDING_OPTION = "@TYPING_PENDING_UNTIL"
+# Set by tmuxctld while a daemon send holds a pane (the green ⌨ AGENT state). The
+# gate treats it as just another active (non-off) hold — state-blind: it never
+# inspects WHICH state is live, only that one is. So every existing delay/pierce
+# policy applies unchanged, and concurrent sends to a held pane queue behind it.
+_TYPING_AGENT_OPTION = "@TYPING_AGENT_UNTIL"
 
 # Poll cap (seconds) while a send is delayed behind a typing lock. The lock has a
 # concrete absolute expiry, so the delay sleeps toward it; the cap bounds the
@@ -351,10 +356,48 @@ def _pane_pending_until(target: str) -> int | None:
         return None
 
 
+def _pane_agent_until(target: str) -> int | None:
+    """Return the pane's daemon-send (AGENT) hold epoch, if any.
+
+    tmuxctld stamps ``@TYPING_AGENT_UNTIL`` while it works a pane (the green ⌨
+    state). The gate reads it identically to the keystroke lock — state-blind —
+    so a concurrent send to a held pane delays exactly as it would behind a human
+    lock. Fail-open on any tmux error / unset / unparsable value (no hold).
+    """
+    if not target:
+        return None
+    try:
+        proc = subprocess.run(
+            [_real_tmux_binary(), "show-options", "-pqv", "-t", target, _TYPING_AGENT_OPTION],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.3,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _pane_hold_until(target: str) -> int | None:
-    """Return the latest active typing/pending hold epoch for ``target``."""
+    """Return the latest active typing/pending/agent hold epoch for ``target``."""
     deadlines = [
-        v for v in (_pane_lock_until(target), _pane_pending_until(target)) if v is not None
+        v
+        for v in (
+            _pane_lock_until(target),
+            _pane_pending_until(target),
+            _pane_agent_until(target),
+        )
+        if v is not None
     ]
     if not deadlines:
         return None
@@ -362,18 +405,23 @@ def _pane_hold_until(target: str) -> int | None:
 
 
 def _pane_keystroke_locked(target: str) -> bool:
-    """True iff ``target`` carries a live typing or pending hold.
+    """True iff ``target`` carries a live typing, pending, or agent hold.
 
     The ON lock is keystroke-anchored and focus-decoupled. Enter moves the pane
     into a short PENDING hold (``@TYPING_PENDING_UNTIL``), which remains
-    send-blocking so automation cannot race the human's submitted prompt.
+    send-blocking so automation cannot race the human's submitted prompt. A
+    daemon send sets the AGENT hold (``@TYPING_AGENT_UNTIL``); the gate counts it
+    the same way (state-blind) so concurrent sends to that pane delay behind it.
     """
     now = time.time()
     lock_until = _pane_lock_until(target)
     if lock_until is not None and now < lock_until:
         return True
     pending_until = _pane_pending_until(target)
-    return pending_until is not None and now < pending_until
+    if pending_until is not None and now < pending_until:
+        return True
+    agent_until = _pane_agent_until(target)
+    return agent_until is not None and now < agent_until
 
 
 def _live_pane_ids() -> list[str] | None:

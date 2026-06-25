@@ -190,54 +190,61 @@ def test_persona_renders_in_statusline_not_pane_border_nametag() -> None:
         assert expected in border
 
 
-def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> None:
-    """The root-table any-key binding is the sole arming surface for the
-    keystroke-anchored typing lock. It must:
-
-      * stamp the per-pane @TYPING_LOCK_UNTIL on a real keystroke,
-      * KEEP an existing future value (no refresh — "5 min since FIRST
-        keystroke", not since LAST), re-arming only when absent/expired,
-      * source "now" from #{client_activity} (zero-fork; set -F can't expand %s),
-      * publish @GUARD immediately on the same pane and schedule a one-shot
-        expiry helper (not an all-pane scan),
-      * pass mouse events through (`send-keys -M`) WITHOUT arming (focus/click
-        must never lock a pane), discriminated by a fresh non-empty #{mouse_x},
-      * faithfully REPLAY the real keystroke with a bare `send-keys`.
-    """
-    line = _line_starting("    set -Fp @TYPING_LOCK_UNTIL ")
-    # No-refresh keep-or-rearm: keep @TYPING_LOCK_UNTIL while it is >= now, else
-    # rearm to client_activity + 300s.
-    assert "#{?#{e|>=:#{@TYPING_LOCK_UNTIL},#{client_activity}}" in line
-    assert "#{e|+:#{client_activity},300}" in line
-    # The kept branch re-writes the SAME value (the proof of no-refresh).
-    assert "},#{@TYPING_LOCK_UNTIL}," in line
-
+def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> None:
+    """The root-table any-key binding only calls the state helper when the pane is
+    OFF. Live ON/PENDING state is preserved and the real key is replayed."""
     conf = CONF.read_text(encoding="utf-8")
     assert "bind -n Any {" in conf
-    # Mouse keys are excluded from arming and passed straight through.
-    assert "if -F '#{!=:#{mouse_x},}' {" in conf
-    assert "send-keys -M" in conf
-    assert 'set -p @GUARD "#[fg=colour214,bold]⌨#[default]"' in conf
-    assert "tmux-typing-guard-status --expire-pane #{q:pane_id}" in conf
+    assert "tmux-typing-guard-state arm --pane #{q:pane_id} --seconds 300" in conf
+    assert "--now #{client_activity}" in conf
+    assert "@TYPING_PENDING_UNTIL" in conf
+    assert "@TYPING_LOCK_UNTIL" in conf
+    assert "tmux-typing-guard-status --expire-pane" not in conf
     assert "tmux-typing-guard-status --scan" not in conf
-    # Faithful replay of the matched key: a bare `send-keys` with no args
-    # (tmux re-sends the bound key). Distinct from the `send-keys -M` mouse line.
-    stripped = [ln.strip() for ln in conf.splitlines()]
-    assert "send-keys" in stripped, "the keep branch must replay the key with a bare send-keys"
+    assert "set -p @GUARD" not in conf, "@GUARD writes must be centralized in the helper"
+    assert "set -Fp @TYPING_PENDING_UNTIL" not in conf
+    assert "set -Fp @TYPING_LOCK_UNTIL" not in conf
+
+    # Mouse/focus input is inert: mouse gets native pass-through, focus is consumed.
+    assert "#{mouse_any_flag}" in conf
+    assert "#{mouse_x}" in conf
+    assert "send-keys -M" in conf
+    assert "bind -n FocusIn { }" in conf
+    assert "bind -n FocusOut { }" in conf
 
 
-def test_keystroke_lock_enter_moves_to_pending_and_submits() -> None:
-    """Enter clears the ON lock, enters short PENDING, and submits.
+def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
+    for key in (
+        "MouseDown1Status",
+        "MouseDown1Pane",
+        "WheelUpPane",
+        "WheelDownPane",
+        "FocusIn",
+        "FocusOut",
+    ):
+        line = _line_starting(f"bind -n {key} ")
+        assert "tmux-typing-guard-state arm" not in line
+        assert "tmux-typing-guard-state pending" not in line
+        assert "@TYPING_LOCK_UNTIL" not in line
+        assert "@TYPING_PENDING_UNTIL" not in line
 
-    Pending remains send-blocking, so automation cannot race the human's submit.
-    """
+
+def test_typing_guard_submit_and_backspace_use_one_pending_helper() -> None:
+    """Enter/C-m/Backspace variants use the same pending transition helper; only
+    the timeout differs. No @GUARD value may contain literal PENDING text."""
+    conf = CONF.read_text(encoding="utf-8")
+    assert "⌨ PENDING" not in conf
     for key in ("Enter", "C-m"):
         line = _line_starting(f"bind -n {key} ")
-        assert "set -pu @TYPING_LOCK_UNTIL" in line, f"{key} must UNSET the pane lock"
-        assert "set -Fp @TYPING_PENDING_UNTIL '#{e|+:#{client_activity},5}'" in line
-        assert 'set -p @GUARD "#[fg=colour214,bold]⌨ PENDING#[default]"' in line
-        assert "tmux-typing-guard-status --expire-pane #{q:pane_id}" in line
-        assert "send-keys" in line, f"{key} must still pass through (submit)"
+        assert "tmux-typing-guard-state pending --pane #{q:pane_id} --seconds 5" in line
+        assert "send-keys" in line
+    for key in ("BSpace", "C-h"):
+        line = _line_starting(f"bind -n {key} ")
+        assert "tmux-typing-guard-state pending --pane #{q:pane_id} --seconds 15" in line
+        assert "@TYPING_PENDING_UNTIL" in line
+        # Repeated Backspace while pending is the first branch and contains no helper call.
+        pending_branch = line.split("} {")[0]
+        assert "tmux-typing-guard-state" not in pending_branch
 
 
 def test_pane_border_identity_is_blank_by_default() -> None:
