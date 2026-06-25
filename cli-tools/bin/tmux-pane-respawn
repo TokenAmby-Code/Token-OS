@@ -21,11 +21,28 @@ WINDOW_NAME=$(tmux display-message -p -t "$PANE_ID" '#{window_name}' 2>/dev/null
 WINDOW_BASE="${WINDOW_NAME%%(*}"
 WINDOW_TARGET=$(tmux display-message -p -t "$PANE_ID" '#{session_name}:#{window_index}' 2>/dev/null || echo "")
 
+# Perpetual singleton persona seats self-heal through the tmuxctld daemon, not a
+# bare respawn. When one's agent dies, hand re-seating to the engine via a
+# fire-and-forget POST /event: the daemon respawns the thin persona-seat shim into
+# the pane (event-driven, no poll — the 2-min assert-personas cron that used to do
+# this was retired). We must NOT also bare-respawn the pane here: that would race
+# the daemon's reseat and could clobber a freshly-seated agent. The daemon's
+# boot-grace dedups concurrent reseats; this hook just rings the bell once.
+case "$PANE_ROLE" in
+    council:custodes|council:malcador|council:administratum|council:pax|mechanicus:fabricator-general|mechanicus:orchestrator)
+        PORT="${TMUXCTLD_PORT:-7778}"
+        curl -s -o /dev/null --connect-timeout 1 --max-time 3 \
+            -X POST "http://127.0.0.1:${PORT}/event" \
+            -H 'Content-Type: application/json' \
+            -d "{\"event\":\"pane-died\",\"pane\":\"${PANE_ROLE}\"}" >/dev/null 2>&1 || true
+        exit 0
+        ;;
+esac
+
 case "$WINDOW_BASE:$PANE_ROLE" in
-    council:*|mechanicus:mechanicus:fabricator-general|mechanicus:mechanicus:orchestrator)
-        # Council page seats (fixed personas + the true-terminal shell) and the
-        # mechanicus persona anchors (Fabricator-General, orchestrator) are
-        # perpetual; let the default respawn restore them rather than killing.
+    council:*)
+        # The council true-terminal (a plain shell, not a persona) is perpetual;
+        # let the default respawn restore it rather than killing.
         ;;
     mechanicus:*)
         # Stack workers are disposable process panes. If the process exits,

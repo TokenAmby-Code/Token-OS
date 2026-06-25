@@ -377,8 +377,15 @@ def _h_assert_instance(control, params):
     return control.assert_instance(_s(params, "pane"))
 
 
-def _h_assert_personas(control, params):
-    return control.assert_personas()
+def _h_reconcile(control, params):
+    # The detached daemon has no ambient tmux session; the fleet lives in `main`.
+    return {"results": control.reconcile_personas(session=_s(params, "session", "main"))}
+
+
+def _h_event(control, params):
+    return control.handle_event(
+        _s(params, "event"), pane=_s(params, "pane"), session=_s(params, "session", "main")
+    )
 
 
 def _h_clear_runtime(control, params):
@@ -612,7 +619,11 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/prompt-end"): _h_prompt_end,
     ("POST", "/invoke-skill"): _h_invoke_skill,
     ("POST", "/assert-instance"): _h_assert_instance,
-    ("POST", "/assert-personas"): _h_assert_personas,
+    # Event-driven persona reconcile (replaces the retired 2-min assert-personas
+    # poll). /reconcile re-seats all must-fill seats; /event ingests a single tmux
+    # lifecycle event (a persona pane-died self-heal). Nothing polls these.
+    ("POST", "/reconcile"): _h_reconcile,
+    ("POST", "/event"): _h_event,
     ("POST", "/clear-runtime"): _h_clear_runtime,
     ("POST", "/close-pane"): _h_close_pane,
     ("POST", "/close"): _h_close,
