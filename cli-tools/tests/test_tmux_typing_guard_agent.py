@@ -36,7 +36,7 @@ class _FakeTmux:
         self.unsets: list[str] = []
         self.run_shells: list[str] = []
 
-    def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+    def run(self, *args: str, timeout: float = 0.5) -> _FakeProc:  # noqa: ARG002
         verb = args[0] if args else ""
         if verb == "show-options":
             option = args[-1]

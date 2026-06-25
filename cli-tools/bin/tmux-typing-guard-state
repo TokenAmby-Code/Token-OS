@@ -11,7 +11,11 @@ if str(_LIB) not in sys.path:
 
 try:
     from tmuxctl.typing_guard_state import main
-except Exception:  # pragma: no cover - import failure must fail-open, never break typing
+except ImportError as exc:  # only the expected missing-module case fails open
+    # A syntax/runtime error inside the helper is NOT swallowed — it propagates
+    # so the state machine fails loudly instead of silently no-op'ing every pane
+    # transition. Only a genuinely absent module degrades to a harmless exit 0.
+    sys.stderr.write(f"tmux-typing-guard-state: state helper unavailable: {exc}\n")
 
     def main() -> int:
         return 0

@@ -153,7 +153,9 @@ def _expire_pane(binary: str, pane: str) -> None:
             _state_expire_pane(_StateTmux(binary), pane)
             return
         except Exception:
-            return
+            # Fall through to the legacy clear rather than leaving a stale
+            # @GUARD marker stuck until the next event touches the pane.
+            pass
     _publish(binary, pane, False)
 
 

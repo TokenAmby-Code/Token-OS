@@ -25,6 +25,7 @@ STATUS = REPO / "cli-tools" / "bin" / "tmux-typing-guard-status"
 STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
 ON_MARKER = "#[fg=colour214,bold]⌨#[default]"
 PENDING_MARKER = "#[fg=red,bold]⌨#[default]"
+AGENT_MARKER = "#[fg=green,bold]⌨#[default]"
 
 
 def _fake_tmux(tmp_path: Path) -> Path:
@@ -74,6 +75,11 @@ def _fake_tmux(tmp_path: Path) -> Path:
                   if [[ -f "$f" ]]; then cat "$f"; fi
                   exit 0
                 fi
+                if [[ "$*" == *"@TYPING_AGENT_UNTIL"* ]]; then
+                  f="${FAKE_AGENT_DIR}/$(key "$target")"
+                  if [[ -f "$f" ]]; then cat "$f"; fi
+                  exit 0
+                fi
                 exit 1
                 ;;
               set-option|set)
@@ -100,6 +106,7 @@ def _env(
     *,
     locks: dict[str, int],
     pending: dict[str, int] | None = None,
+    agent: dict[str, int] | None = None,
     active: str = "%1",
 ) -> dict[str, str]:
     """Build the env, stamping each pane's keystroke-lock epoch into FAKE_LOCK_DIR."""
@@ -111,6 +118,10 @@ def _env(
     pending_dir.mkdir()
     for pane, epoch in (pending or {}).items():
         (pending_dir / _key(pane)).write_text(f"{int(epoch)}\n")
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    for pane, epoch in (agent or {}).items():
+        (agent_dir / _key(pane)).write_text(f"{int(epoch)}\n")
     calls = tmp_path / "calls.log"
     setopt = tmp_path / "setopt.log"
     calls.write_text("")
@@ -125,6 +136,7 @@ def _env(
             "FAKE_SETOPT": str(setopt),
             "FAKE_LOCK_DIR": str(lock_dir),
             "FAKE_PENDING_DIR": str(pending_dir),
+            "FAKE_AGENT_DIR": str(agent_dir),
             "FAKE_ACTIVE_PANE": active,
             "FAKE_PANES": "%1",
         }
@@ -193,6 +205,14 @@ def test_segment_publishes_red_marker_for_pending(tmp_path: Path) -> None:
     env = _env(tmp_path, locks={}, pending={"%1": int(time.time()) + 5})
     _run(env)
     assert _guard_value_for(env, "%1") == PENDING_MARKER
+
+
+def test_segment_publishes_green_marker_for_agent(tmp_path: Path) -> None:
+    # A daemon send holding the pane (the AGENT state) projects the green ⌨ —
+    # the gate counts it active (state-blind) and the border renders green.
+    env = _env(tmp_path, locks={}, agent={"%1": int(time.time()) + 8})
+    _run(env)
+    assert _guard_value_for(env, "%1") == AGENT_MARKER
 
 
 def test_segment_clears_pane_guard_option_when_dark(tmp_path: Path) -> None:

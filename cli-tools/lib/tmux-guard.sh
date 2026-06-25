@@ -3,7 +3,8 @@
 # TAGS: tmux, guard, send-keys, safety
 #
 # The guard state has one source of truth: tmuxctl.send_gate.typing_guard_active,
-# backed by per-pane tmux options @TYPING_LOCK_UNTIL and @TYPING_PENDING_UNTIL.
+# backed by per-pane tmux options @TYPING_LOCK_UNTIL, @TYPING_PENDING_UNTIL, and
+# @TYPING_AGENT_UNTIL (the daemon-send hold).
 # This shell library intentionally does not inspect pane contents or maintain
 # sidecar files. Legacy callers may still source it, but the reader and waiter
 # below are thin wrappers over the canonical predicate.
@@ -73,14 +74,14 @@ tmux_typing_guard_active() {
     lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || return 1
     PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
         IMPERIUM_TMUX_BIN="${TMUX_GUARD_REAL_TMUX:-${IMPERIUM_TMUX_BIN:-}}" \
-        ${TMUXCTL_PYTHON:-${TMUX_GUARD_PYTHON:-python}} -m tmuxctl.send_gate typing "$pane" >/dev/null 2>&1 || rc=$?
+        "${TMUXCTL_PYTHON:-${TMUX_GUARD_PYTHON:-python3}}" -m tmuxctl.send_gate typing "$pane" >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 0 ]]
 }
 
 # Backward-compatible name: historically meant "prompt has pending input".
 # Now it means exactly "canonical typing guard active".
 tmux_pane_has_input() {
-    tmux_typing_guard_active "$1"
+    tmux_typing_guard_active "${1:-}"
 }
 
 # Wait for the canonical guard to clear. Timeout 0 means check once and fail loud.
