@@ -105,7 +105,13 @@ def _no_override(monkeypatch):
     monkeypatch.setattr(send_gate, "sanctioned_override", lambda: None)
 
 
-def _lock_tmux(monkeypatch, locks: dict[str, int | None], *, panes: list[str] | None = None):
+def _lock_tmux(
+    monkeypatch,
+    locks: dict[str, int | None],
+    *,
+    pending: dict[str, int | None] | None = None,
+    panes: list[str] | None = None,
+):
     """Fake real tmux so the keystroke-lock reader sees ``locks`` (pane -> epoch).
 
     Answers exactly the two commands the predicate issues:
@@ -126,6 +132,15 @@ def _lock_tmux(monkeypatch, locks: dict[str, int | None], *, panes: list[str] | 
                     target = cmd[idx + 1]
                     break
             value = locks.get(target)
+            proc.stdout = "" if value is None else f"{int(value)}\n"
+            return proc
+        if "show-options" in cmd and send_gate._TYPING_PENDING_OPTION in cmd:
+            target = None
+            for idx, tok in enumerate(cmd):
+                if tok == "-t" and idx + 1 < len(cmd):
+                    target = cmd[idx + 1]
+                    break
+            value = (pending or {}).get(target)
             proc.stdout = "" if value is None else f"{int(value)}\n"
             return proc
         if "list-panes" in cmd:
@@ -352,6 +367,51 @@ def test_locked_pane_is_held_until_expiry_regardless_of_focus(
 
     # Same pane, expiry now in the past → released. Nothing else changed.
     locks["%active"] = now - 1
+    assert send_gate.typing_guard_active(target="%active") is False
+
+
+def test_pending_pane_remains_send_blocking_after_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enter moves ON -> PENDING; the lock is gone, but sends still hold."""
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _lock_tmux(monkeypatch, {"%active": None}, pending={"%active": now + 5})
+
+    assert send_gate.typing_guard_active(target="%active") is True
+    held = send_gate.evaluate(("send-keys", "-t", "%active", "queued"))
+    assert held is not None and held["reason"] == "typing_guard"
+
+
+def test_live_lock_short_circuits_pending_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_700_000_000
+    calls: list[list[str]] = []
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        proc = _FakeCompleted()
+        if "show-options" in cmd and send_gate._TYPING_LOCK_OPTION in cmd:
+            proc.stdout = f"{now + 200}\n"
+            return proc
+        raise AssertionError("pending option should not be read while lock is live")
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
+
+    assert send_gate.typing_guard_active(target="%active") is True
+    assert len(calls) == 1
+
+
+def test_expired_pending_pane_releases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _lock_tmux(monkeypatch, {"%active": None}, pending={"%active": now - 1})
+
     assert send_gate.typing_guard_active(target="%active") is False
 
 

@@ -154,17 +154,12 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     """The typing-guard indicator lives in each pane's border, not the global bar.
 
     Emperor UX directive: drop the global "⌨ GUARD" status-right segment and show
-    guard state per-pane via @GUARD. status-right keeps tmux-typing-guard-status
-    only as a SILENT --scan reconciler (one fork/interval, no visible segment) so
-    every pane's @GUARD is refreshed honestly and stale markers clear.
+    guard state per-pane via @GUARD. status-right must not run the old silent
+    --scan reconciler; @GUARD is now an event-updated pane option.
     """
     status_right = _line_starting("set -g status-right ")
-    # The reconciler must run in --scan mode (all panes), never the current-pane
-    # visible-segment mode.
-    assert "tmux-typing-guard-status --scan" in status_right
-    assert "#(tmux-typing-guard-status 2>/dev/null)" not in status_right, (
-        "the visible current-pane guard segment must be removed from the global bar"
-    )
+    assert "tmux-typing-guard-status" not in status_right
+    assert "#(" not in status_right, "typing guard status rendering must be zero-fork"
     # The per-pane border is the sole guard surface now.
     border = _line_starting("set -g pane-border-format ")
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
@@ -208,6 +203,8 @@ def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> Non
       * KEEP an existing future value (no refresh — "5 min since FIRST
         keystroke", not since LAST), re-arming only when absent/expired,
       * source "now" from #{client_activity} (zero-fork; set -F can't expand %s),
+      * publish @GUARD immediately on the same pane and schedule a one-shot
+        expiry helper (not an all-pane scan),
       * pass mouse events through (`send-keys -M`) WITHOUT arming (focus/click
         must never lock a pane), discriminated by a fresh non-empty #{mouse_x},
       * faithfully REPLAY the real keystroke with a bare `send-keys`.
@@ -225,18 +222,26 @@ def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> Non
     # Mouse keys are excluded from arming and passed straight through.
     assert "if -F '#{!=:#{mouse_x},}' {" in conf
     assert "send-keys -M" in conf
+    assert 'set -p @GUARD "#[fg=colour214,bold]⌨#[default]"' in conf
+    assert "tmux-typing-guard-status --expire-pane #{q:pane_id}" in conf
+    assert "tmux-typing-guard-status --scan" not in conf
     # Faithful replay of the matched key: a bare `send-keys` with no args
     # (tmux re-sends the bound key). Distinct from the `send-keys -M` mouse line.
     stripped = [ln.strip() for ln in conf.splitlines()]
     assert "send-keys" in stripped, "the keep branch must replay the key with a bare send-keys"
 
 
-def test_keystroke_lock_enter_clears_lock_and_submits() -> None:
-    """Enter (and tmux's C-m resolution of Return) clears the pane lock and
-    passes the key through to submit. No focus-based clearing exists."""
+def test_keystroke_lock_enter_moves_to_pending_and_submits() -> None:
+    """Enter clears the ON lock, enters short PENDING, and submits.
+
+    Pending remains send-blocking, so automation cannot race the human's submit.
+    """
     for key in ("Enter", "C-m"):
         line = _line_starting(f"bind -n {key} ")
         assert "set -pu @TYPING_LOCK_UNTIL" in line, f"{key} must UNSET the pane lock"
+        assert "set -Fp @TYPING_PENDING_UNTIL '#{e|+:#{client_activity},5}'" in line
+        assert 'set -p @GUARD "#[fg=colour214,bold]⌨ PENDING#[default]"' in line
+        assert "tmux-typing-guard-status --expire-pane #{q:pane_id}" in line
         assert "send-keys" in line, f"{key} must still pass through (submit)"
 
 
@@ -276,5 +281,5 @@ def test_portable_status_guard_indicator_is_also_per_pane() -> None:
     status_right = next(
         line for line in portable.splitlines() if line.startswith("set status-right ")
     )
-    assert "tmux-typing-guard-status --scan" in status_right
-    assert "#(tmux-typing-guard-status 2>/dev/null)" not in status_right
+    assert "tmux-typing-guard-status" not in status_right
+    assert "#(" not in status_right

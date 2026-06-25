@@ -23,6 +23,9 @@ Modes:
                    This is the per-pane border updater; it is intentionally kept
                    OUT of the per-render path so it never reintroduces the
                    N-shell-out status-bar lag (see cli-tools/tmux/tmux-base.conf).
+  * ``--expire-pane <pane>`` — one-shot expiry helper used by the tmux key
+                   bindings. It clears ``@GUARD`` only after both the ON lock and
+                   the PENDING hold have expired; it does not scan panes.
 
 Fail-open everywhere: any tmux/predicate error renders dark and never raises, so
 a transient fault can neither brick the status bar nor fake a guard light.
@@ -43,6 +46,8 @@ if str(_LIB) not in sys.path:
 SEGMENT_STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
 SEGMENT_PLAIN = "TYPE"
 BORDER_MARKER = "#[fg=colour214,bold]⌨#[default]"
+_TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
+_TYPING_PENDING_OPTION = "@TYPING_PENDING_UNTIL"
 
 
 def _imports() -> tuple:
@@ -92,6 +97,33 @@ def _publish(binary: str, pane: str, active: bool) -> None:
     _tmux(binary, "set-option", "-p", "-t", pane, "@GUARD", value)
 
 
+def _pane_option_epoch(binary: str, pane: str, option: str) -> int | None:
+    out = _tmux(binary, "show-options", "-pqv", "-t", pane, option)
+    raw = (out or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _expire_pane(binary: str, pane: str) -> None:
+    """Clear stale guard projection for one pane, without scanning all panes."""
+    import time
+
+    now = time.time()
+    lock_until = _pane_option_epoch(binary, pane, _TYPING_LOCK_OPTION)
+    pending_until = _pane_option_epoch(binary, pane, _TYPING_PENDING_OPTION)
+    if (lock_until is not None and now < lock_until) or (
+        pending_until is not None and now < pending_until
+    ):
+        return
+    _tmux(binary, "set-option", "-pu", "-t", pane, _TYPING_LOCK_OPTION)
+    _tmux(binary, "set-option", "-pu", "-t", pane, _TYPING_PENDING_OPTION)
+    _publish(binary, pane, False)
+
+
 def main() -> int:
     argv = sys.argv[1:]
     plain = "--plain" in argv
@@ -104,6 +136,14 @@ def main() -> int:
     try:
         binary = tmux_binary()
     except Exception:
+        return 0
+
+    if "--expire-pane" in argv:
+        try:
+            pane = argv[argv.index("--expire-pane") + 1]
+        except (ValueError, IndexError):
+            return 0
+        _expire_pane(binary, pane)
         return 0
 
     if scan:
