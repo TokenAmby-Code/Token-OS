@@ -63,9 +63,13 @@ def _fake_tmux(tmp_path: Path) -> Path:
                 for p in ${FAKE_PANES:-}; do echo "$p"; done
                 ;;
               show-options|show)
-                # The canonical predicate's only read: the per-pane keystroke lock.
                 if [[ "$*" == *"@TYPING_LOCK_UNTIL"* ]]; then
                   f="${FAKE_LOCK_DIR}/$(key "$target")"
+                  if [[ -f "$f" ]]; then cat "$f"; fi
+                  exit 0
+                fi
+                if [[ "$*" == *"@TYPING_PENDING_UNTIL"* ]]; then
+                  f="${FAKE_PENDING_DIR}/$(key "$target")"
                   if [[ -f "$f" ]]; then cat "$f"; fi
                   exit 0
                 fi
@@ -90,12 +94,22 @@ def _key(pane: str) -> str:
     return "".join(c if (c.isalnum() or c in "_.:%-") else "_" for c in pane)
 
 
-def _env(tmp_path: Path, *, locks: dict[str, int], active: str = "%1") -> dict[str, str]:
+def _env(
+    tmp_path: Path,
+    *,
+    locks: dict[str, int],
+    pending: dict[str, int] | None = None,
+    active: str = "%1",
+) -> dict[str, str]:
     """Build the env, stamping each pane's keystroke-lock epoch into FAKE_LOCK_DIR."""
     lock_dir = tmp_path / "locks"
     lock_dir.mkdir()
     for pane, epoch in locks.items():
         (lock_dir / _key(pane)).write_text(f"{int(epoch)}\n")
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    for pane, epoch in (pending or {}).items():
+        (pending_dir / _key(pane)).write_text(f"{int(epoch)}\n")
     calls = tmp_path / "calls.log"
     setopt = tmp_path / "setopt.log"
     calls.write_text("")
@@ -109,6 +123,7 @@ def _env(tmp_path: Path, *, locks: dict[str, int], active: str = "%1") -> dict[s
             "FAKE_TMUX_CALLS": str(calls),
             "FAKE_SETOPT": str(setopt),
             "FAKE_LOCK_DIR": str(lock_dir),
+            "FAKE_PENDING_DIR": str(pending_dir),
             "FAKE_ACTIVE_PANE": active,
             "FAKE_PANES": "%1",
             # Isolate the legacy stamp dir so a stray host stamp can't leak in.
@@ -202,3 +217,21 @@ def test_scan_marks_guarded_panes_and_clears_clean_ones(tmp_path: Path) -> None:
 
     assert _guard_value_for(env, "%1") not in (None, ""), "%1 locked"
     assert _guard_value_for(env, "%2") == "", "%2 clear (expired lock)"
+
+
+def test_expire_pane_clears_stale_event_projection(tmp_path: Path) -> None:
+    now = int(time.time())
+    env = _env(tmp_path, locks={"%1": now - 10}, pending={"%1": now - 5})
+
+    _run(env, "--expire-pane", "%1")
+
+    assert _guard_value_for(env, "%1") == ""
+
+
+def test_expire_pane_keeps_pending_projection(tmp_path: Path) -> None:
+    now = int(time.time())
+    env = _env(tmp_path, locks={}, pending={"%1": now + 5})
+
+    _run(env, "--expire-pane", "%1")
+
+    assert _guard_value_for(env, "%1") is None

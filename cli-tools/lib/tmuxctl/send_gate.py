@@ -82,6 +82,7 @@ _SEND_GATE_DELAY_TIMEOUT_ENV = "TMUX_SEND_GATE_DELAY_TIMEOUT"  # unset/0 = no ti
 # by focus/click or by the fleet's own ``send-keys`` (those bypass the key
 # table). This replaces the old focus-coupled ``#{client_activity}`` shadow.
 _TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
+_TYPING_PENDING_OPTION = "@TYPING_PENDING_UNTIL"
 
 # Poll cap (seconds) while a send is delayed behind a typing lock. The lock has a
 # concrete absolute expiry, so the delay sleeps toward it; the cap bounds the
@@ -324,15 +325,55 @@ def _pane_lock_until(target: str) -> int | None:
         return None
 
 
-def _pane_keystroke_locked(target: str) -> bool:
-    """True iff ``target`` carries a live keystroke lock (expiry still future).
+def _pane_pending_until(target: str) -> int | None:
+    """Return the pane's post-submit pending hold epoch, if any."""
+    if not target:
+        return None
+    try:
+        proc = subprocess.run(
+            [_real_tmux_binary(), "show-options", "-pqv", "-t", target, _TYPING_PENDING_OPTION],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.3,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
-    The lock is purely keystroke-anchored and focus-decoupled: it engages when
-    the Emperor types into the pane and holds until the 5-min timer or an Enter
-    clears it, regardless of which pane currently has focus.
+
+def _pane_hold_until(target: str) -> int | None:
+    """Return the latest active typing/pending hold epoch for ``target``."""
+    deadlines = [
+        v for v in (_pane_lock_until(target), _pane_pending_until(target)) if v is not None
+    ]
+    if not deadlines:
+        return None
+    return max(deadlines)
+
+
+def _pane_keystroke_locked(target: str) -> bool:
+    """True iff ``target`` carries a live typing or pending hold.
+
+    The ON lock is keystroke-anchored and focus-decoupled. Enter moves the pane
+    into a short PENDING hold (``@TYPING_PENDING_UNTIL``), which remains
+    send-blocking so automation cannot race the human's submitted prompt.
     """
-    until = _pane_lock_until(target)
-    return until is not None and time.time() < until
+    now = time.time()
+    lock_until = _pane_lock_until(target)
+    if lock_until is not None and now < lock_until:
+        return True
+    pending_until = _pane_pending_until(target)
+    return pending_until is not None and now < pending_until
 
 
 def _live_pane_ids() -> list[str] | None:
@@ -368,10 +409,10 @@ def typing_guard_active(*, target: str | None = None) -> bool:
     """Canonical typing-guard predicate — the keystroke-anchored per-pane lock.
 
     With ``target`` set, the guard holds iff that pane carries a live keystroke
-    lock (``@TYPING_LOCK_UNTIL`` still in the future): the Emperor typed into the
-    pane within the last 5 min and has not pressed Enter. This is the single,
-    honest, focus-DECOUPLED signal both surfaces consume — the ⌨ pane-border
-    diagnostic (``tmux-typing-guard-status --scan``) and the universal send-hold.
+    lock (``@TYPING_LOCK_UNTIL``) or a post-submit pending hold
+    (``@TYPING_PENDING_UNTIL``). This is the single, honest, focus-DECOUPLED
+    signal both surfaces consume — the event-updated ⌨ pane-border diagnostic and
+    the universal send-hold.
     Focus/click never set, move, or clear it; the fleet's own ``send-keys`` never
     arms it (those bypass the key table). A genuine unsent draft is covered by
     the lock the keystroke that typed it armed — no prompt-line screen-scraping,
@@ -445,13 +486,13 @@ _QUIET_DELAY_RECHECK_SECONDS = 60.0
 def _typing_delay_sleep(target: str | None) -> float:
     """Seconds to sleep before re-checking a typing-guard delay.
 
-    The keystroke lock carries an absolute expiry, so sleep toward it — a quiet
-    5-min lock costs ~one wake per second rather than a busy-spin — but cap the
-    interval at ``_TYPING_LOCK_RECHECK_SECONDS`` so an Enter-clear (which retires
-    the lock early) or a vanished draft releases the held send within ~1s. With
-    no live lock (draft-only hold, or tmux unreadable) fall back to the cap.
+    The keystroke/pending hold carries an absolute expiry, so sleep toward it —
+    a quiet 5-min lock costs ~one wake per second rather than a busy-spin — but
+    cap the interval at ``_TYPING_LOCK_RECHECK_SECONDS`` so a clear releases the
+    held send within ~1s. With no live hold (or tmux unreadable) fall back to the
+    cap.
     """
-    until = _pane_lock_until(target) if target else None
+    until = _pane_hold_until(target) if target else None
     if until is None:
         return _TYPING_LOCK_RECHECK_SECONDS
     remaining = (until + _DELAY_WAKE_MARGIN_SECONDS) - time.time()
