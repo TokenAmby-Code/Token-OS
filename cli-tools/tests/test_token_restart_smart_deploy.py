@@ -21,6 +21,7 @@ TOKEN_RESTART = BIN / "token-restart"
 
 TOKENAPI_LABEL = "ai.openclaw.tokenapi"
 DISCORD_LABEL = "ai.tokenclaw.discord"
+TMUXCTLD_LABEL = "ai.tokenclaw.tmuxctld"
 UID = str(os.getuid())
 
 # Convenience matchers for the call log. token-api now restarts via a graceful
@@ -30,6 +31,11 @@ UID = str(os.getuid())
 # Discord still bounces via `kickstart -k`.
 RESTART_TOKENAPI = f"print gui/{UID}/{TOKENAPI_LABEL}"
 KICK_DISCORD = f"kickstart -k gui/{UID}/{DISCORD_LABEL}"
+# tmuxctld bounces via launchctl directly (like Discord): kickstart -k for a
+# code change, bootout+bootstrap for a plist change.
+KICK_TMUXCTLD = f"kickstart -k gui/{UID}/{TMUXCTLD_LABEL}"
+BOOTOUT_TMUXCTLD = f"bootout gui/{UID}/{TMUXCTLD_LABEL}"
+BOOTSTRAP_TMUXCTLD = f"bootstrap gui/{UID}"
 
 
 def _stub_env(
@@ -288,6 +294,65 @@ def test_multiple_changed_services_all_restart(tmp_path: Path) -> None:
     calls = logfile.read_text()
     assert RESTART_TOKENAPI in calls
     assert KICK_DISCORD in calls
+
+
+# ── tmuxctld daemon: area change → launchd bounce (mirrors discord) ──────────
+
+
+def test_tmuxctld_daemon_code_change_restarts_tmuxctld(tmp_path: Path) -> None:
+    # A change in the daemon code area bounces the tmuxctld daemon (launchctl
+    # kickstart -k, like discord). token-api/discord are untouched. The tmuxctl
+    # subtree lives under cli-tools/lib, so the existing WSL refresh is preserved.
+    env, logfile = _stub_env(tmp_path, "cli-tools/lib/tmuxctl/daemon.py")
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr
+    calls = logfile.read_text()
+    assert KICK_TMUXCTLD in calls
+    assert RESTART_TOKENAPI not in calls
+    assert KICK_DISCORD not in calls
+    # cli-tools/lib/* still refreshes the WSL runtime (additive, no regression).
+    assert "/runtime/refresh" in calls
+    # The daemon bounce must NOT shell out to the tmux/tmuxctl/tx fleet tooling.
+    _assert_no_fleet_wipe(calls)
+
+
+def test_tmuxctld_entrypoint_change_restarts_tmuxctld_only(tmp_path: Path) -> None:
+    # The Mac-local entrypoint routes to the daemon restart only — no WSL refresh.
+    env, logfile = _stub_env(tmp_path, "cli-tools/bin/tmuxctld")
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr
+    calls = logfile.read_text()
+    assert KICK_TMUXCTLD in calls
+    assert RESTART_TOKENAPI not in calls
+    assert KICK_DISCORD not in calls
+    assert "/runtime/refresh" not in calls
+    _assert_no_fleet_wipe(calls)
+
+
+def test_tmuxctld_plist_change_reinstalls_daemon(tmp_path: Path) -> None:
+    # A plist change is not honored by `kickstart -k`, so the daemon must be
+    # reinstalled: copy the synced plist into LaunchAgents, then bootout+bootstrap.
+    # TMUXCTLD_SRC_PLIST/TMUXCTLD_PLIST are overridden to tmp paths so the test
+    # never touches the live LaunchAgent.
+    env, logfile = _stub_env(tmp_path, "cli-tools/launchd/ai.tokenclaw.tmuxctld.plist")
+    src_plist = tmp_path / "src.tmuxctld.plist"
+    src_plist.write_text("<plist>synced</plist>\n")
+    dst_plist = tmp_path / "LaunchAgents" / "ai.tokenclaw.tmuxctld.plist"
+    env["TMUXCTLD_SRC_PLIST"] = str(src_plist)
+    env["TMUXCTLD_PLIST"] = str(dst_plist)
+
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    calls = logfile.read_text()
+    # Plist path uses bootout+bootstrap, NOT kickstart.
+    assert BOOTOUT_TMUXCTLD in calls
+    assert f"{BOOTSTRAP_TMUXCTLD} {dst_plist}" in calls
+    assert KICK_TMUXCTLD not in calls
+    # The freshly-synced plist was copied into the (overridden) LaunchAgents path.
+    assert dst_plist.exists()
+    assert dst_plist.read_text() == src_plist.read_text()
+    assert RESTART_TOKENAPI not in calls
+    _assert_no_fleet_wipe(calls)
 
 
 # ── Nothing deployable / no-op / fallback ────────────────────
