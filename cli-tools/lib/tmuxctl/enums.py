@@ -27,6 +27,34 @@ class PaneKind(str, Enum):
     TOMBSTONE = "tombstone"
 
 
+class SeatVacancyPolicy(str, Enum):
+    """How a vacated (runtime-dead) standing seat is treated by reconcile.
+
+    ``MUST_FILL`` — a perpetual seat: when its runtime dies the daemon respawns it
+    unconditionally (the six persona singleton seats and the standing reservist
+    seats). ``FILL_IF_ROW`` — an ephemeral seat: refill only when a registry row
+    still binds the pane, otherwise let it die (stack workers).
+    """
+
+    MUST_FILL = "must_fill"
+    FILL_IF_ROW = "fill_if_row"
+
+
+# Vacancy policy per seat CLASS — the normalized seat kind, NOT the raw live
+# ``@PANE_TYPE`` (the persona singleton seats carry their page region as the type,
+# ``council`` / ``mechanicus``, and are recognized by their stable pane LABEL).
+# ``assertions._seat_class`` maps a pane (label, type) onto one of these keys.
+#
+#   persona      — the six singleton persona seats (council:custodes, …)
+#   reservists   — the two standing reservist seats
+#   stack-worker — ephemeral mechanicus/stack workers
+VACANCY_POLICY: dict[str, SeatVacancyPolicy] = {
+    "persona": SeatVacancyPolicy.MUST_FILL,
+    "reservists": SeatVacancyPolicy.MUST_FILL,
+    "stack-worker": SeatVacancyPolicy.FILL_IF_ROW,
+}
+
+
 class InstanceStatus(str, Enum):
     UNKNOWN = "unknown"
     IDLE = "idle"
