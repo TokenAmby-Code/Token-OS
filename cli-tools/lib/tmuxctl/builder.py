@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+from .invariants import assert_window_build_contract
 from .layout import WORKSPACE_LAYOUT
 from .tmux_adapter import TmuxAdapter
 
@@ -14,8 +15,56 @@ COUNCIL_WINDOW = "council"
 MECHANICUS_WINDOW = "mechanicus"
 RESERVISTS_WINDOW = "reservists"
 
-DETACHED_W = 240
+DETACHED_W = WORKSPACE_LAYOUT.column.reference_total_width
 DETACHED_H = 60
+
+
+def _prepare_window_geometry(adapter: TmuxAdapter, target: str) -> None:
+    if not hasattr(adapter, "list_panes"):
+        return
+    adapter.run(
+        "resize-window",
+        "-t",
+        target,
+        "-x",
+        str(DETACHED_W),
+        "-y",
+        str(DETACHED_H),
+        allow_failure=True,
+    )
+
+
+def _side_roles_for_window(window: str) -> set[str]:
+    base = window.split("(", 1)[0]
+    if base == PALACE_WINDOW:
+        return {"palace:W", "palace:E"}
+    if base == SOMNIUM_WINDOW:
+        return {"somnium:W"}
+    if base == COUNCIL_WINDOW:
+        return {"council:custodes"}
+    return set()
+
+
+def _assert_side_column_postcondition(adapter: TmuxAdapter, target: str, window: str) -> None:
+    """Hard-fail if built side columns do not match the shared ColumnSpec width."""
+    side_roles = _side_roles_for_window(window)
+    if not side_roles or not hasattr(adapter, "list_panes"):
+        return
+    roles: list[str] = []
+    side_widths: dict[str, int] = {}
+    for pane in adapter.list_panes(target):
+        role = adapter.show_pane_option(pane["pane_id"], "@PANE_ID")
+        if not role:
+            continue
+        roles.append(role)
+        if role in side_roles:
+            side_widths[role] = int(pane["width"])
+    assert_window_build_contract(
+        window,
+        roles,
+        side_widths=side_widths,
+        expected_column_width=WORKSPACE_LAYOUT.column.width,
+    )
 
 
 def _home() -> str:
@@ -119,6 +168,7 @@ def build_palace_window(adapter: TmuxAdapter, session: str, window: str = PALACE
     target = f"{session}:{window}"
     wdir = _window_dir(window)
 
+    _prepare_window_geometry(adapter, target)
     total_w = _window_dim(adapter, target, "#{window_width}")
     total_h = _window_dim(adapter, target, "#{window_height}")
 
@@ -151,6 +201,7 @@ def build_palace_window(adapter: TmuxAdapter, session: str, window: str = PALACE
     _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")
     _set_window_option(adapter, target, "@GRID_STASH", "")
 
+    _assert_side_column_postcondition(adapter, target, window)
     adapter.run("select-pane", "-t", center)
 
 
@@ -165,12 +216,13 @@ def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNI
     target = f"{session}:{window}"
     wdir = _window_dir(window)
 
+    _prepare_window_geometry(adapter, target)
     total_w = _window_dim(adapter, target, "#{window_width}")
     total_h = _window_dim(adapter, target, "#{window_height}")
 
     layout = WORKSPACE_LAYOUT.somnium
     _, east_grid_w = layout.grid_column_widths(total_w)
-    half_h = total_h // 2
+    half_h = layout.grid_row_height(total_h)
 
     west = _pane_id(adapter, f"{target}.1")
     right = _split_pane(
@@ -199,6 +251,7 @@ def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNI
     _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")
     _set_window_option(adapter, target, "@GRID_STASH", "")
 
+    _assert_side_column_postcondition(adapter, target, window)
     adapter.run("select-pane", "-t", west)
 
 
@@ -243,12 +296,13 @@ def build_council_window(adapter: TmuxAdapter, session: str, window: str = COUNC
     target = f"{session}:{window}"
     wdir = _window_dir(window)
 
+    _prepare_window_geometry(adapter, target)
     total_w = _window_dim(adapter, target, "#{window_width}")
     total_h = _window_dim(adapter, target, "#{window_height}")
 
     layout = WORKSPACE_LAYOUT.somnium
     _, east_grid_w = layout.grid_column_widths(total_w)
-    half_h = total_h // 2
+    half_h = layout.grid_row_height(total_h)
 
     west = _pane_id(adapter, f"{target}.1")
     right = _split_pane(
@@ -274,6 +328,7 @@ def build_council_window(adapter: TmuxAdapter, session: str, window: str = COUNC
     _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")
     _set_window_option(adapter, target, "@GRID_STASH", "")
 
+    _assert_side_column_postcondition(adapter, target, window)
     adapter.run("select-pane", "-t", west)
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Self
 
 from .enums import (
     AttachmentClass,
@@ -13,6 +15,45 @@ from .enums import (
     ResumeDisposition,
     WindowArchetype,
 )
+from .labels import canonical_pane_role
+
+_ROLE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+class PaneRole(str):
+    """Typed, canonical pane identity from @PANE_ID.
+
+    Empty/unset roles are represented as ``None`` by ``parse``. Non-empty roles
+    must be public logical identities such as ``palace:N``, ``mechanicus:1``,
+    ``council:custodes``, or ``audience:palace:N``; raw tmux ``%pane`` ids and
+    whitespace-bearing values are rejected at construction.
+    """
+
+    def __new__(cls, value: str) -> Self:
+        if not isinstance(value, str):
+            raise ValueError(f"pane role must be a string, got {type(value).__name__}")
+        raw = value.strip()
+        if not raw:
+            raise ValueError("pane role must not be empty")
+        if raw.startswith("%") or any(ch.isspace() for ch in raw):
+            raise ValueError(f"invalid pane role: {value!r}")
+        canonical = canonical_pane_role(raw)
+        parts = canonical.split(":")
+        if len(parts) < 2:
+            raise ValueError(f"pane role must be page-qualified: {value!r}")
+        if parts[0] == "audience" and len(parts) < 3:
+            raise ValueError(f"audience pane role must include source page and slot: {value!r}")
+        if any(not _ROLE_SEGMENT_RE.fullmatch(part) for part in parts):
+            raise ValueError(f"invalid pane role: {value!r}")
+        return str.__new__(cls, canonical)
+
+    @classmethod
+    def parse(cls, value: str | None | Self) -> Self | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, cls):
+            return value
+        return cls(value)
 
 
 @dataclass(frozen=True)
@@ -26,7 +67,7 @@ class PaneSnapshot:
     height: int
     current_command: str
     tty: str
-    pane_role: str
+    pane_role: PaneRole | str | None
     grid_state: GridState
     pane_kind: PaneKind
     reserved: bool
@@ -39,6 +80,23 @@ class PaneSnapshot:
     cwd: str = ""
     runtime_engine: str = ""
     wrapper_launch_id: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pane_role", PaneRole.parse(self.pane_role))
+        if not isinstance(self.grid_state, GridState):
+            try:
+                object.__setattr__(self, "grid_state", GridState(str(self.grid_state)))
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid grid state for {self.pane_id}: {self.grid_state!r}"
+                ) from exc
+        if not isinstance(self.pane_kind, PaneKind):
+            try:
+                object.__setattr__(self, "pane_kind", PaneKind(str(self.pane_kind)))
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid pane kind for {self.pane_id}: {self.pane_kind!r}"
+                ) from exc
 
 
 @dataclass(frozen=True)
