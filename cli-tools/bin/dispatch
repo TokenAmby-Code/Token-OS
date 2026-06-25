@@ -915,6 +915,9 @@ except Exception as exc:
 if not isinstance(data, dict) or data.get("id") != iid:
     print(f"Token API instance lookup returned invalid payload for {iid}", file=sys.stderr)
     sys.exit(1)
+if not data.get("engine") or not (data.get("target_working_dir") or data.get("working_dir")):
+    print(f"Token API instance lookup returned incomplete metadata for {iid}", file=sys.stderr)
+    sys.exit(1)
 
 session_doc = data.get("session_doc") if isinstance(data.get("session_doc"), dict) else {}
 persona = data.get("persona") if isinstance(data.get("persona"), dict) else {}

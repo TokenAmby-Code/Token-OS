@@ -2669,6 +2669,48 @@ def test_dispatch_resume_api_rejects_mismatched_id(tmp_path: Path) -> None:
     assert "pass explicit --engine and --dir" not in result.stderr
 
 
+def test_dispatch_resume_api_rejects_incomplete_metadata(tmp_path: Path) -> None:
+    requested_iid = "incomplete-session"
+    server = _run_instance_api_server(
+        {
+            requested_iid: {
+                "id": requested_iid,
+                "engine": "claude",
+            }
+        }
+    )
+    try:
+        env = os.environ.copy()
+        env["TOKEN_API_URL"] = f"http://127.0.0.1:{server.server_port}"
+        env["TOKEN_API_DB"] = str(tmp_path / "missing-agents.db")
+        result = subprocess.run(
+            [
+                str(DISPATCH),
+                "--dry-run",
+                "--id",
+                requested_iid,
+                "--engine",
+                "claude",
+                "--dir",
+                str(ROOT),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+            env=env,
+            timeout=60,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.returncode == 70
+    assert f"incomplete metadata for {requested_iid}" in result.stderr
+    assert "metadata lookup failed via Token API" in result.stderr
+    assert "pass explicit --engine and --dir" not in result.stderr
+
+
 def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path) -> None:
     """The core repro: row lags but the pane is live → exit 0 AND naming runs.
 
