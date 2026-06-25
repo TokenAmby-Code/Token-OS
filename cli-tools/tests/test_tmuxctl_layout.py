@@ -115,6 +115,22 @@ def test_builder_column_postcondition_accepts_uniform_side_columns() -> None:
     _assert_side_column_postcondition(adapter, "main:palace", "palace")
 
 
+def test_builder_column_postcondition_relaxes_recovery_width_only() -> None:
+    adapter = WidthAdapter(
+        [
+            ("%1", "council:custodes", 60),
+            ("%2", "council:pax", 58),
+            ("%3", "council:malcador", 58),
+            ("%4", "council:true-terminal", 58),
+            ("%5", "council:administratum", 58),
+        ]
+    )
+
+    _assert_side_column_postcondition(
+        adapter, "main:council", "council", enforce_column_width=False
+    )
+
+
 def test_pane_role_is_typed_and_canonicalized() -> None:
     pane = PaneSnapshot(
         pane_id="%1",

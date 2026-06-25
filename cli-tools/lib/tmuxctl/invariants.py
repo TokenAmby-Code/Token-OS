@@ -6,7 +6,13 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 
 from .enums import GridState, PaneKind, WindowArchetype
-from .labels import PALACE_GRID_ROLES, PALACE_ROLES, PALACE_SIDE_ROLES, SOMNIUM_GRID_ROLES
+from .labels import (
+    PALACE_GRID_ROLES,
+    PALACE_ROLES,
+    PALACE_SIDE_ROLES,
+    SOMNIUM_GRID_ROLES,
+    SOMNIUM_SIDE_ROLES,
+)
 from .models import PaneRole, PaneSnapshot, WindowSnapshot
 
 COUNCIL_ROLES = (
@@ -116,7 +122,7 @@ def assert_window_snapshot(
     assert_grid_cardinality(snapshot.window_name, roles)
     if expected_column_width is None:
         return
-    side_roles = _side_roles_for(snapshot.window_name)
+    side_roles = side_roles_for(snapshot.window_name)
     if not side_roles:
         return
     side_widths = {
@@ -127,12 +133,12 @@ def assert_window_snapshot(
     assert_uniform_column_width(snapshot.window_name, side_widths, expected_column_width)
 
 
-def _side_roles_for(window_name: str) -> set[str]:
+def side_roles_for(window_name: str) -> set[str]:
     base = window_name.split("(", 1)[0]
     if base == "palace":
         return set(PALACE_SIDE_ROLES)
     if base == "somnium":
-        return {"somnium:W"}
+        return set(SOMNIUM_SIDE_ROLES)
     if base == "council":
         return set(COUNCIL_SIDE_ROLES)
     return set()
@@ -159,7 +165,7 @@ def assert_known_archetype(snapshot: WindowSnapshot) -> None:
 
 def assert_side_pane_states(snapshot: WindowSnapshot) -> None:
     """Side roles in known side-column pages must carry GridState.SIDE."""
-    side_roles = _side_roles_for(snapshot.window_name)
+    side_roles = side_roles_for(snapshot.window_name)
     for pane in snapshot.panes:
         if _role_text(pane.pane_role) in side_roles and pane.grid_state is not GridState.SIDE:
             raise InvariantViolation(f"{snapshot.window_name} {pane.pane_role} must be side state")
