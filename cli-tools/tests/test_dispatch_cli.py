@@ -815,6 +815,35 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     assert "TOKEN_API_CODEX_PROFILE=sisters-of-battle" not in vulkan.stdout
 
 
+def test_dispatch_mechanicus_persona_prompt_does_not_export_identity() -> None:
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--target",
+            "mechanicus:new",
+            "--persona",
+            "mechanicus",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "persona:         mechanicus" in result.stdout
+    assert "TOKEN_API_DISPATCH_TARGET=mechanicus:new" in result.stdout
+    assert "TOKEN_API_PERSONA=" not in result.stdout
+
+
 def test_dispatch_codex_profile_is_explicit_env_passthrough(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
