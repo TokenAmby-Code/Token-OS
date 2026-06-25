@@ -262,7 +262,7 @@ async def test_pushes_pane_label_generically(
     app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
     """The worker pushes @PANE_LABEL like any other variable — the raw name lives in
-    the var; styling stays in the format string. Delivered to the LIVE-resolved pane."""
+    the var for compatibility/debugging. Delivered to the LIVE-resolved pane."""
     main = app_env.main
 
     async def _resolve_live(_instance_id):
@@ -286,9 +286,9 @@ async def test_pushes_pane_label_generically(
 async def test_pane_label_value_stopped_does_not_assert(
     app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
 ) -> None:
-    """@PANE_LABEL is name data, not state: even a literal value of 'stopped' (an
-    instance named that) must never drive the @CC_STATE close-down assertion, which
-    keys on the variable, not the value."""
+    """@PANE_LABEL is compatibility name data, not rendered border state. Even a
+    literal value of 'stopped' (an instance named that) must never drive the
+    @CC_STATE close-down assertion, which keys on the variable, not the value."""
     main = app_env.main
 
     async def _resolve_live(_instance_id):

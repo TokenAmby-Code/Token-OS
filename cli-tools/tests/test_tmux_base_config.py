@@ -170,6 +170,35 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
 
 
+def test_persona_is_statusline_not_pane_border_nametag() -> None:
+    """Persona displays in generic status-left; pane border nametag shows instance name.
+
+    The blue pane-border box must read @PANE_LABEL (for values like needs-name),
+    never @PERSONA. It also must not fall back to pane_title/hostname.
+    """
+    status_left = _line_starting("set -g status-left ")
+    assert "#S" in status_left
+    assert "@PERSONA" in status_left
+
+    border = _line_starting("set -g pane-border-format ")
+    assert "@PANE_LABEL" in border
+    assert "@PERSONA" not in border
+    assert "pane_title" not in border
+    assert "@PANE_TITLE_SUPPRESS" not in border
+    for expected in (
+        "@GUARD",
+        "@OPS_SELECTED",
+        "@GT_FIRE",
+        "@DISCORD_VOICE_PROCESSING",
+        "@DISCORD_VOICE_LOCK",
+        "@TTS_STATE",
+        "@CC_STATE",
+        "@SESSION_DOC",
+        "@CWD",
+    ):
+        assert expected in border
+
+
 def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> None:
     """The root-table any-key binding is the sole arming surface for the
     keystroke-anchored typing lock. It must:

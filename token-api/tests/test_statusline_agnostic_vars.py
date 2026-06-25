@@ -1,7 +1,8 @@
 """Engine-agnostic pushed statusline @-vars (unified-statusline-display).
 
-The pane-border nametag is engine-agnostic: every field sources from the
-engine-agnostic ``instances`` table via the existing ``pane_state_queue`` push
+The pushed statusline identity vars are engine-agnostic: every field sources
+from the engine-agnostic ``instances`` table via the existing
+``pane_state_queue`` push
 pipeline, so Claude and Codex panes light up IDENTICALLY (only
 ``instances.engine`` distinguishes them, and nothing in the resolvers branches on
 it). These tests exercise the real ``shared`` helpers against a real SQLite

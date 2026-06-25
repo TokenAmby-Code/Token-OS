@@ -9832,7 +9832,7 @@ async def set_instance_legion(instance_id: str, request: Request):
         async with aiosqlite.connect(DB_PATH) as db:
             await shared.apply_instance_pane_tint(db, instance_id, tmux_pane, source="set-legion")
 
-    # Mid-session /persona path: refresh the engine-agnostic nametag vars so the
+    # Mid-session /persona path: refresh the engine-agnostic statusline identity vars so the
     # @PERSONA segment tracks the new legion/persona binding (@SESSION_DOC/@CWD are
     # re-pushed harmlessly from the canonical row).
     async with aiosqlite.connect(DB_PATH) as db:

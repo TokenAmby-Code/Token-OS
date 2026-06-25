@@ -99,7 +99,7 @@ def test_mechanicus_worker_seeded_voiceless_and_shared(app_env):
     assert row["assignment_order"] is None
     # default_rank='astartes' is the deliberate "non-singleton / shared" encoding.
     assert row["default_rank"] == "astartes"
-    assert row["pane_tint"] == "#300808", "uniform mechanicus tint"
+    assert row["pane_tint"] == "#182126", "uniform mechanicus steel tint"
     assert row["chip_color"] == "#8b1a1a"
 
 
