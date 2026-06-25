@@ -526,6 +526,49 @@ def test_assert_instance_notes_singleton_mismatch_without_persona_injection() ->
     send.assert_not_called()
 
 
+def test_assert_instance_no_respawn_when_persona_pane_pid_is_execd_agent() -> None:
+    # The P0: PR #366's persona-seat.sh exec's the engine, so #{pane_pid} IS the
+    # claude process (no children). Through the REAL _runtime_has_instance →
+    # pane_has_active_agent → _find_active_process walk, that seat must read LIVE,
+    # so assert_instance no-ops ("live") instead of taking the not-runtime_ok path
+    # that respawn-pane -k's (kills) the live agent.
+    from tmuxctl import custodes
+    from tmuxctl.assertions import assert_instance
+
+    adapter = FakeAdapter()
+    pane_pid = 25905
+    # Exec'd seat: pane_pid IS claude, zero descendants (the live-reproduced shape).
+    tree = (
+        {19448: [pane_pid]},
+        {pane_pid: "/users/tokenclaw/.local/bin/claude.token-os-real --model opus"},
+    )
+    row = SimpleNamespace(
+        instance_id="i-c",
+        pane_label="council:custodes",
+        persona_slug="custodes",
+        legion="",
+        instance_type="",
+        tab_name="custodes-morning",
+    )
+    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="council"),
+        patch.object(assertions, "_pane_pid", return_value=pane_pid),
+        patch.object(custodes, "_process_tree", return_value=tree),
+        patch.object(assertions, "_registry_entries", return_value=[row]),
+        patch.object(assertions, "launch_persona_seat", return_value=(True, "launched")) as launch,
+        patch.object(assertions, "log_event"),
+    ):
+        result = assert_instance(adapter, "council:custodes")
+
+    assert result["ok"] is True
+    assert result["reason"] == "live"
+    assert result["action"] not in ("launched", "launch_failed")
+    launch.assert_not_called()  # never reaches the respawn-killing seat launch
+    assert not any(c and c[0] == "respawn-pane" for c in adapter.calls)
+
+
 def test_guard_allows_resend_after_row_changes():
     adapter = FakeAdapter()
     spec = _fg_spec()

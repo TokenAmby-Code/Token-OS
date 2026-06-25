@@ -8,7 +8,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import custodes
-from tmuxctl.custodes import assert_custodes, pane_has_active_agent, pane_has_active_claude
+from tmuxctl.custodes import (
+    active_agent_in_pane,
+    assert_custodes,
+    pane_has_active_agent,
+    pane_has_active_claude,
+)
 
 
 class FakeAdapter:
@@ -50,6 +55,56 @@ def test_detector_walks_bash_wrapper_to_claude():
     )
     with patch.object(custodes, "_process_tree", return_value=(children, commands)):
         assert pane_has_active_claude(14030) is True
+
+
+def test_detector_matches_execd_claude_as_pane_pid_with_no_children():
+    # PR #366's persona-seat.sh `exec`s the engine, so #{pane_pid} IS the claude
+    # process itself — no wrapper-bash parent, no descendants. The walk must match
+    # the pane_pid process's OWN command, not only its (nonexistent) children.
+    # Mirrors the live council:custodes seat: pane_pid=25905 command
+    # `/Users/tokenclaw/.local/bin/claude.token-os-real …`, zero children.
+    children, commands = _tree(
+        parent_pid=19448,
+        descendants={
+            25905: (19448, "/Users/tokenclaw/.local/bin/claude.token-os-real --model opus"),
+        },
+    )
+    with patch.object(custodes, "_process_tree", return_value=(children, commands)):
+        assert pane_has_active_claude(25905) is True
+        assert pane_has_active_agent(25905) is True
+        assert active_agent_in_pane(25905) == (
+            25905,
+            "/users/tokenclaw/.local/bin/claude.token-os-real --model opus",
+        )
+
+
+def test_detector_matches_execd_codex_as_pane_pid_with_no_children():
+    # Same exec'd-seat shape for a Codex persona seat — the agent IS the pane proc.
+    children, commands = _tree(
+        parent_pid=19448,
+        descendants={
+            25910: (19448, "/opt/homebrew/bin/node /opt/homebrew/bin/codex"),
+        },
+    )
+    with patch.object(custodes, "_process_tree", return_value=(children, commands)):
+        assert pane_has_active_agent(25910) is True
+        assert pane_has_active_claude(25910) is False  # codex is not claude
+
+
+def test_detector_false_for_execd_bare_shell_as_pane_pid():
+    # Negative: an exec'd-style pane whose pane_pid IS a bare login shell (no agent
+    # anywhere) must still read not-live — the seeded-pane-pid walk must not
+    # false-positive on the shell itself and let the retire/respawn guards misfire.
+    children, commands = _tree(
+        parent_pid=400,
+        descendants={
+            500: (400, "-zsh"),
+        },
+    )
+    with patch.object(custodes, "_process_tree", return_value=(children, commands)):
+        assert pane_has_active_agent(500) is False
+        assert pane_has_active_claude(500) is False
+        assert active_agent_in_pane(500) is None
 
 
 def test_detector_finds_claude_via_node_argv():
