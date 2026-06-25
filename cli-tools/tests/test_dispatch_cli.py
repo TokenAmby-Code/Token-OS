@@ -375,7 +375,7 @@ def test_dispatch_aspirant_uses_internal_backend_without_public_command(tmp_path
     assert "aspirant backend not installed" not in result.stderr
 
 
-def test_dispatch_auto_policy_ignores_resume(monkeypatch):
+def test_dispatch_auto_policy_ignores_resume(monkeypatch) -> None:
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     server = _run_instance_api_server({})
     monkeypatch.setenv("TOKEN_API_URL", f"http://127.0.0.1:{server.server_port}")
@@ -405,7 +405,7 @@ def test_dispatch_auto_policy_ignores_resume(monkeypatch):
     assert "dispatch aspirant dry-run" not in result.stdout
 
 
-def test_dispatch_resume_aliases_are_open(monkeypatch):
+def test_dispatch_resume_aliases_are_open(monkeypatch) -> None:
     monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
     for flag in ("--resume", "-r"):
         server = _run_instance_api_server({})
@@ -435,7 +435,7 @@ def test_dispatch_resume_aliases_are_open(monkeypatch):
         assert "dispatch aspirant dry-run" not in result.stdout
 
 
-def test_dispatch_interactive_session_doc_resume_option(tmp_path, monkeypatch):
+def test_dispatch_interactive_session_doc_resume_option(tmp_path, monkeypatch) -> None:
     db = tmp_path / "agents.db"
     import sqlite3
 
@@ -2622,6 +2622,49 @@ def test_dispatch_resume_api_failure_is_not_treated_as_missing_row(tmp_path: Pat
     )
 
     assert result.returncode == 70
+    assert "metadata lookup failed via Token API" in result.stderr
+    assert "pass explicit --engine and --dir" not in result.stderr
+
+
+def test_dispatch_resume_api_rejects_mismatched_id(tmp_path: Path) -> None:
+    requested_iid = "requested-session"
+    server = _run_instance_api_server(
+        {
+            requested_iid: {
+                "id": "different-session",
+                "engine": "claude",
+                "working_dir": str(ROOT),
+            }
+        }
+    )
+    try:
+        env = os.environ.copy()
+        env["TOKEN_API_URL"] = f"http://127.0.0.1:{server.server_port}"
+        env["TOKEN_API_DB"] = str(tmp_path / "missing-agents.db")
+        result = subprocess.run(
+            [
+                str(DISPATCH),
+                "--dry-run",
+                "--id",
+                requested_iid,
+                "--engine",
+                "claude",
+                "--dir",
+                str(ROOT),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(ROOT),
+            env=env,
+            timeout=60,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.returncode == 70
+    assert f"invalid payload for {requested_iid}" in result.stderr
     assert "metadata lookup failed via Token API" in result.stderr
     assert "pass explicit --engine and --dir" not in result.stderr
 

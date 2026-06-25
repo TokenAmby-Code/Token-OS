@@ -912,7 +912,7 @@ except Exception as exc:
     print(f"Token API instance lookup failed for {iid}: {exc}", file=sys.stderr)
     sys.exit(1)
 
-if not isinstance(data, dict) or not data.get("id"):
+if not isinstance(data, dict) or data.get("id") != iid:
     print(f"Token API instance lookup returned invalid payload for {iid}", file=sys.stderr)
     sys.exit(1)
 
