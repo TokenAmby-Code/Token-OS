@@ -160,9 +160,15 @@ send_command() {
         done
     fi
 
+    # Prefer the daemon-native send (verified handshake). Exit codes from the
+    # helper: 0 = ok, 2 = daemon RESPONDED with ok:false (a real, handled
+    # failure — do NOT fall back, the daemon owns it), 3 = daemon UNREACHABLE
+    # (connection refused / timeout — fall back to direct tmuxctl so a daemon
+    # that is down or mid-restart never wedges a send).
     out=$(python3 - "$TMUXCTLD_URL" "$pane" "$cmd" "$NO_SUBMIT" <<'PY' 2>&1
 import json
 import sys
+import urllib.error
 import urllib.request
 
 url, pane, text, no_submit = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "true"
@@ -179,24 +185,45 @@ req = urllib.request.Request(
     headers={"Content-Type": "application/json"},
     method="POST",
 )
-with urllib.request.urlopen(req, timeout=12) as resp:
-    payload = json.loads(resp.read().decode("utf-8") or "{}")
+try:
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8") or "{}")
+except urllib.error.HTTPError as exc:  # daemon answered with a transport error
+    sys.stderr.write(f"tmuxctld http error: {exc}\n")
+    raise SystemExit(2)
+except urllib.error.URLError as exc:  # daemon down / unreachable -> fall back
+    sys.stderr.write(f"tmuxctld unreachable: {exc}\n")
+    raise SystemExit(3)
 print(json.dumps(payload, separators=(",", ":")))
 if not payload.get("ok"):
     raise SystemExit(2)
 PY
-    ) || {
+    ) || rc=$?
+    if [[ "$rc" == 3 ]]; then
+        # Daemon unreachable — fall back to the direct tmuxctl send path so the
+        # send still lands (still routed through the universal send gate).
+        local -a send_args=(send-text --pane "$pane" --text "$cmd")
+        [[ "$NO_SUBMIT" == true ]] && send_args+=(--no-submit)
+        if out=$("$TMUXCTL_BIN" "${send_args[@]}" 2>&1); then
+            rc=0
+            verification_status="sent"
+            verified_by="tmuxctl"
+        else
+            echo "$out" >&2
+            rc=1
+            verification_status="failed"
+            verified_by="tmuxctl"
+        fi
+    elif [[ "$rc" != 0 ]]; then
         echo "$out" >&2
-        rc=1
-    }
-    if [[ "$rc" == 0 ]]; then
+        verification_status="failed"
+        verified_by="tmuxctld"
+    fi
+    if [[ "$rc" == 0 && "$verified_by" == "tmuxctld" ]]; then
         verification_status=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verification_status") or "unverified")' <<<"$out" 2>/dev/null || echo "unverified")
         verified_by=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verified_by") or "tmuxctld")' <<<"$out" 2>/dev/null || echo "tmuxctld")
         dispatch_id=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("dispatch_id") or "")' <<<"$out" 2>/dev/null || true)
         [[ -n "$dispatch_id" ]] || dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
-    else
-        verification_status="failed"
-        verified_by="tmuxctld"
     fi
 
     if [[ "$locked" == true ]]; then

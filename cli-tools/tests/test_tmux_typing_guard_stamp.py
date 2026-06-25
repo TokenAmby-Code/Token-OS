@@ -104,6 +104,11 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "TMUX_GUARD_LOG": str(tmp_path / "guard.jsonl"),
             "TMUX_SEND_GATE_POLICY": "pierce",
             "TMUX_GUARD_PYTHON": sys.executable,
+            # agent-cmd prefers the tmuxctld daemon; point it at a closed port so
+            # these CLI/stub-path tests deterministically exercise the
+            # daemon-unreachable fallback (direct tmuxctl via TMUXCTL_BIN),
+            # regardless of whether a live daemon happens to be running.
+            "TMUXCTLD_URL": "http://127.0.0.1:1",
         }
     )
     return env
