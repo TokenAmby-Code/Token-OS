@@ -126,6 +126,9 @@ def test_builder_column_postcondition_relaxes_recovery_width_only() -> None:
         ]
     )
 
+    with pytest.raises(InvariantViolation, match="expected 71, actual 60"):
+        _assert_side_column_postcondition(adapter, "main:council", "council")
+
     _assert_side_column_postcondition(
         adapter, "main:council", "council", enforce_column_width=False
     )
