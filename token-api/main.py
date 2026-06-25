@@ -20526,6 +20526,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
             if (
                 row_is_live
                 and _is_placeholder_tab_name(row.get("tab_name"))
+                and not row.get("session_doc_id")
                 and row.get("has_prompt_submit")
                 and not row.get("has_naming_nudge")
             ):

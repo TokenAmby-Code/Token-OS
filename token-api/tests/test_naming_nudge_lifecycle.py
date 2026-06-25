@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -11,7 +11,12 @@ from instance_mutation import sanctioned_insert_instance_sync, sanctioned_update
 
 
 def _insert_wrapper_instance(
-    db_path, *, instance_id="wrap-unnamed", wrapper_id="wrap-1", name="needs-name"
+    db_path,
+    *,
+    instance_id="wrap-unnamed",
+    wrapper_id="wrap-1",
+    name="needs-name",
+    session_doc_id=None,
 ) -> None:
     now = datetime.now().isoformat()
     with sqlite3.connect(db_path) as conn:
@@ -26,7 +31,7 @@ def _insert_wrapper_instance(
                 "status": "working",
                 "rank": "astartes",
                 "wrapper_launch_id": wrapper_id,
-                "session_doc_id": None,
+                "session_doc_id": session_doc_id,
                 "created_at": now,
                 "last_activity": now,
             },
@@ -225,6 +230,53 @@ async def test_reconciler_schedules_live_placeholder_with_prompt_evidence(
 
     assert counts["naming_nudge_scheduled"] == 1
     assert nudged == ["reconcile-unnamed"]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_does_not_nudge_placeholder_with_session_doc(app_env, monkeypatch) -> None:
+    """Session-doc placeholder drift is flagged by reconciler, not renamed."""
+    main = app_env.main
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            "INSERT INTO session_documents (id, file_path, title, status) VALUES (7, 'Sessions/named-doc.md', 'Named Doc', 'active')"
+        )
+    _insert_wrapper_instance(
+        app_env.db_path,
+        instance_id="reconcile-doc-drift",
+        wrapper_id="wrap-doc",
+        session_doc_id=7,
+    )
+    with sqlite3.connect(app_env.db_path) as conn:
+        sanctioned_update_instance_sync(
+            conn,
+            instance_id="reconcile-doc-drift",
+            updates={"last_activity": (datetime.now() - timedelta(seconds=30)).isoformat()},
+            mutation_type="instance_updated",
+            write_source="test",
+            actor="test",
+        )
+        conn.execute(
+            "INSERT INTO events (event_type, instance_id) VALUES ('hook_user_prompt_submit', 'reconcile-doc-drift')"
+        )
+
+    async def reachable_tmux():
+        return {}
+
+    async def live_ids():
+        return {"reconcile-doc-drift"}
+
+    async def fail_maybe(instance_id):
+        raise AssertionError(f"unexpected naming nudge: {instance_id}")
+
+    monkeypatch.setattr(main, "_read_tmux_panes", reachable_tmux)
+    monkeypatch.setattr(main, "_live_agent_instance_ids", live_ids)
+    monkeypatch.setattr(main, "_maybe_naming_nudge", fail_maybe)
+
+    counts = await main._run_tmux_db_reconcile_cycle()
+    await asyncio.sleep(0)
+
+    assert counts["naming_nudge_scheduled"] == 0
+    assert counts["placeholder_tab_name_drift"] == 1
 
 
 @pytest.mark.asyncio
