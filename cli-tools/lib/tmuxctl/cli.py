@@ -351,12 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
     assert_instance_parser = subparsers.add_parser("assert-instance")
     assert_instance_parser.add_argument("--pane", required=True)
 
-    assert_personas_parser = subparsers.add_parser(
-        "assert-personas",
-        help="Re-assert every singleton persona pane against the live session "
-        "(no teardown). Idempotent self-heal for a dropped registration.",
-    )
-    assert_personas_parser.add_argument("--format", choices=["json", "text"], default="json")
+    # `assert-personas` (the manual persona sweep) was retired with the 2-min cron
+    # that drove it: persona reconcile is now event-driven via the tmuxctld daemon
+    # (POST /reconcile + /event). For a manual reconcile, curl :7778/reconcile.
 
     guard_parser = subparsers.add_parser("mechanicus-focus-guard")
     guard_parser.add_argument("--pane", default="")
@@ -901,27 +898,6 @@ def main(argv: list[str] | None = None) -> int:
             assertion_result = assert_instance(control.adapter, args.pane)
             print(_json.dumps(assertion_result))
             return 0 if assertion_result.get("ok") else 1
-
-        if args.command == "assert-personas":
-            import json as _json
-
-            from .assertions import sweep_persona_panes
-
-            sweep_results = sweep_persona_panes(control.adapter)
-            if args.format == "json":
-                print(_json.dumps(sweep_results))
-            else:
-                for entry in sweep_results:
-                    state = "ok" if entry.get("ok") else "FAIL"
-                    print(
-                        f"{entry.get('pane_label', '?')}\t{state}\t"
-                        f"{entry.get('action', '')}\t{entry.get('reason', '')}".rstrip()
-                    )
-            # Always exit 0: a missing/unregistered persona pane is the expected,
-            # informational state this sweep exists to NOTE and self-heal, not a
-            # hard failure — a non-zero exit would mark every idempotent cron run
-            # as an error.
-            return 0
 
         if args.command == "mechanicus-focus-guard":
             import json as _json
