@@ -1572,13 +1572,16 @@ pane_has_active_agent_process() {
   #   exclusion) for backward-compatible single-arg callers.
   # needles: match agent *program* forms only — the launcher binary paths
   #   (.../claude, .../codex, the .token-os-real real-binaries) and the wrapper
-  #   scripts. The path forms require a leading slash (/claude, /codex) so a
-  #   `--engine codex|claude` flag *value* in an argv (space-delimited, no slash)
-  #   can never masquerade as a live agent — that was the self-referential bug.
+  #   scripts. The claude/codex program forms anchor the name to the *start of the
+  #   command* or a leading slash ((^|/)claude, (^|/)codex) so they catch both a
+  #   bare PATH-launched argv[0] (`codex resume …`) and an absolute launcher path
+  #   (`.../bin/codex …`), while a `--engine codex|claude` flag *value* in an argv
+  #   (space-delimited, mid-command, no slash) can never masquerade as a live
+  #   agent — that was the self-referential bug.
   #   Literal dots are written [.] so the awk program's own command line (which
   #   carries this very pattern via -v) cannot match the needle it scans for.
   local root_pid="$1" self_pid="${2:-0}"
-  local needles='/claude( |$)|claude[.]token-os-real|/codex( |$)|codex[.]token-os-real|agent-wrapper[.]sh|claude-wrapper[.]sh|codex-wrapper[.]sh'
+  local needles='(^|/)claude( |$)|claude[.]token-os-real|(^|/)codex( |$)|codex[.]token-os-real|agent-wrapper[.]sh|claude-wrapper[.]sh|codex-wrapper[.]sh'
   [[ -n "$root_pid" && "$root_pid" =~ ^[0-9]+$ && "$root_pid" != "0" ]] || return 1
   ps -A -o pid=,ppid=,command= 2>/dev/null | awk -v root="$root_pid" -v self="$self_pid" -v needles="$needles" '
     {
