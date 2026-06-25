@@ -120,6 +120,82 @@ def behavior_file_for(row: PersonaRow) -> tuple[Path | None, list[Path]]:
     return _first_existing(candidates), candidates
 
 
+def _root_for(row: PersonaRow) -> Path:
+    """The vault root that owns a persona — Pax for the Civic orchestrators,
+    Imperium for everyone else. Mirrors the root selection in behavior_file_for
+    so a persona's rank doc resolves under the same vault as its behavior doc."""
+    slug = _safe_path_component(row.slug.strip().lower())
+    if slug in {"pax", "orchestrator"}:
+        return _pax_root()
+    return _imperium_root()
+
+
+def rank_file_for(row: PersonaRow) -> Path | None:
+    """Resolve <root>/Personas/Ranks/<Rank>.md for a persona's default_rank.
+
+    Ranks are Overseer/Astartes/Primarch. Resolution is case-insensitive so a
+    default_rank stored as 'OVERSEER' / 'overseer' / 'Overseer' all land on
+    Overseer.md. Returns None when no rank doc exists (the invariant fails closed
+    on that at preflight; the wrapper fails loud-but-open at runtime)."""
+    rank = _safe_path_component((row.default_rank or "astartes").strip())
+    if not rank:
+        return None
+    ranks_dir = _root_for(row) / "Personas" / "Ranks"
+    if not ranks_dir.is_dir():
+        return None
+    # Scan for the real on-disk entry rather than constructing a path: on a
+    # case-insensitive FS (macOS) `(dir / "OVERSEER.md").is_file()` is true but
+    # leaks the constructed casing, so the canonical Overseer.md name is the dir
+    # entry. Prefer the title-cased match, then any case-insensitive hit.
+    target = f"{rank.lower()}.md"
+    titled = f"{rank[:1].upper() + rank[1:]}.md"
+    matches = [
+        entry
+        for entry in sorted(ranks_dir.iterdir())
+        if entry.is_file() and entry.name.lower() == target
+    ]
+    for entry in matches:
+        if entry.name == titled:
+            return entry
+    return matches[0] if matches else None
+
+
+def extract_body(path: Path) -> str:
+    """Extract the doctrine body from a persona OR rank doc, identically.
+
+    Ported from the bash extract_persona_system_prompt: prefer a `## System
+    Prompt` section (up to the next H2); else strip a leading `--- ... ---`
+    frontmatter block; else return the whole body. Rank docs carry no marker and
+    no frontmatter, so they round-trip as their whole body."""
+    content = path.read_text(encoding="utf-8", errors="replace")
+    marker = "## System Prompt"
+    idx = content.find(marker)
+    if idx < 0:
+        parts = content.split("---", 2)
+        return parts[2].strip() if len(parts) >= 3 else content.strip()
+    rest = content[idx + len(marker) :].strip()
+    next_h2 = rest.find("\n## ")
+    return rest[:next_h2].strip() if next_h2 >= 0 else rest
+
+
+def system_doc_for(name: str, db_path: Path | None = None) -> str | None:
+    """Assemble the rank+persona system-doc staple for a persona, rank FIRST.
+
+    This is the one code path every launch surface (workers, codex, singletons)
+    shares. Returns None when the persona is unknown/unmanaged, or when either
+    half (behavior doc / rank doc) can't be resolved — the wrapper treats an
+    empty doc for a resolved persona as a loud-but-open runtime warning, while
+    preflight + doctor fail closed via invariant_issues()."""
+    row = resolve_persona(name, db_path)
+    if row is None:
+        return None
+    behavior, _ = behavior_file_for(row)
+    rank = rank_file_for(row)
+    if behavior is None or rank is None:
+        return None
+    return f"{extract_body(rank)}\n\n---\n\n{extract_body(behavior)}"
+
+
 def iter_persona_rows(conn: sqlite3.Connection) -> list[PersonaRow]:
     if not invariant_applicable(conn):
         return []
@@ -151,6 +227,18 @@ def invariant_issues(db_path: Path | None = None) -> list[str]:
                 candidate_text = ", ".join(str(p) for p in candidates)
                 issues.append(
                     f"persona behavior file missing: slug={row.slug} default_rank={row.default_rank} searched=[{candidate_text}]"
+                )
+            # Every managed persona must also resolve a rank doc — the staple is
+            # rank+persona, so a missing rank doc is as fatal as a missing
+            # behavior doc. Fail closed here (preflight + tmuxctl doctor consume
+            # this); the wrapper fails loud-but-open at runtime.
+            if rank_file_for(row) is None:
+                ranks_dir = _root_for(row) / "Personas" / "Ranks"
+                rank_name = (row.default_rank or "astartes").strip()
+                titled = rank_name[:1].upper() + rank_name[1:] if rank_name else rank_name
+                issues.append(
+                    f"persona rank doc missing: slug={row.slug} default_rank={row.default_rank} "
+                    f"searched=[{ranks_dir / f'{titled}.md'}]"
                 )
         return issues
     finally:
@@ -218,6 +306,10 @@ if __name__ == "__main__":
     sub.add_parser("check")
     res = sub.add_parser("resolve")
     res.add_argument("name")
+    doc = sub.add_parser("system-doc")
+    doc.add_argument("name")
+    rank = sub.add_parser("rank-file")
+    rank.add_argument("name")
     args = parser.parse_args()
     if args.cmd == "check":
         issues = invariant_issues()
@@ -232,3 +324,19 @@ if __name__ == "__main__":
         if path is None:
             sys.exit(2)
         print(f"{row.display_name}\t{path}")
+    if args.cmd == "system-doc":
+        # The wrapper shells out to this to assemble the rank+persona staple.
+        # Exit 3 with no output when the doc can't be built (unknown persona or
+        # a missing half) so the wrapper sees empty stdout and fails loud-open.
+        document = system_doc_for(args.name)
+        if not document:
+            sys.exit(3)
+        print(document)
+    if args.cmd == "rank-file":
+        row = resolve_persona(args.name)
+        if row is None:
+            sys.exit(1)
+        path = rank_file_for(row)
+        if path is None:
+            sys.exit(2)
+        print(path)

@@ -258,3 +258,123 @@ token_wrapper_end() {
   token_wrapper_post_hook "WrapperEnd" "$end_payload"
   token_wrapper_enforce_stack_if_needed "$TMUX_PANE_VALUE"
 }
+
+# ---------------------------------------------------------------------------
+# Rank+persona system-doc staple (infra invariant: every managed fleet instance
+# is born with a rank doc + persona doc system briefing, rank doc FIRST).
+#
+# One injection point covers all launch surfaces: Claude/Codex workers carry
+# their persona via TOKEN_API_PERSONA (dispatch env); singletons (Custodes / FG /
+# Admin) have no such env, so we derive the persona from the stable pane label
+# tmuxctl stamps on each singleton pane (the @PANE_ID role), mirroring
+# PERSONA_PANE_IDENTITY in token-api/routes/hooks.py. Unmanaged sessions resolve
+# to nothing and get no staple, silently.
+# ---------------------------------------------------------------------------
+
+token_wrapper_resolve_persona() {
+  # Workers: persona is explicit in the dispatch env.
+  if [[ -n "${TOKEN_API_PERSONA:-}" ]]; then
+    printf '%s' "$TOKEN_API_PERSONA"
+    return 0
+  fi
+  # Singletons: derive from the pane label. A fresh agent born in one of these
+  # panes IS that persona (same map as PERSONA_PANE_IDENTITY).
+  local pane="$TMUX_PANE_VALUE" label
+  [[ -n "$pane" ]] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  label="$(tmux display-message -p -t "$pane" '#{@PANE_ID}' 2>/dev/null || true)"
+  case "$label" in
+    legion:custodes) printf '%s' "custodes" ;;
+    mechanicus:fabricator-general) printf '%s' "fabricator-general" ;;
+    mechanicus:admin) printf '%s' "administratum" ;;
+    *) return 0 ;; # unmanaged pane → no staple
+  esac
+}
+
+token_wrapper_warn_missing_system_doc() {
+  local persona="$1"
+  # Loud-but-open: never brick a live launch over a missing doc. The fail-CLOSED
+  # gate lives at dispatch preflight + tmuxctl doctor (persona_behavior check);
+  # here we warn to stderr and emit a best-effort hook event so Admin/doctor can
+  # catch the drift. Consistent with the wrapper's deliberate fail-open posture.
+  printf 'token-wrapper: WARNING persona=%s resolved but its rank+persona system doc is empty/unbuildable; launching WITHOUT the staple (fail-open). Run `tmuxctl doctor` or dispatch preflight to repair the rank/persona docs.\n' \
+    "$persona" >&2
+  local payload
+  payload="$(token_wrapper_build_payload "WrapperStapleMissing")" || return 0
+  token_wrapper_post_hook "WrapperStapleMissing" "$payload"
+}
+
+# Echo the path to a temp file holding the assembled rank+persona staple for the
+# resolved persona, or nothing. Callers (run_claude/run_codex) read the file and
+# fold it into the engine's system instructions. Empty output = no staple
+# (unmanaged session, or a resolved persona whose doc could not be built — the
+# latter emits the loud-but-open warning).
+token_wrapper_system_doc() {
+  local persona doc_file rc
+  persona="$(token_wrapper_resolve_persona)"
+  [[ -n "$persona" ]] || return 0 # unmanaged → silent, no staple
+
+  doc_file="$(mktemp "${TMPDIR:-/tmp}/token-system-doc.XXXXXX")" || return 0
+  PYTHONPATH="${TOKEN_WRAPPER_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m persona_behavior system-doc "$persona" >"$doc_file" 2>/dev/null && rc=0 || rc=$?
+
+  if [[ "$rc" -ne 0 || ! -s "$doc_file" ]]; then
+    rm -f "$doc_file" 2>/dev/null || true
+    token_wrapper_warn_missing_system_doc "$persona"
+    return 0
+  fi
+  printf '%s' "$doc_file"
+}
+
+# Operational metadata that used to ride inside dispatch's persona prompt (vault
+# domain, instance-name prefix, linked session doc). Relocated to dispatch env
+# vars so it stays OUT of the doctrine doc and the wrapper folds it in AFTER the
+# staple. Echoes nothing unless dispatch set the persona launch vars.
+token_wrapper_operational_appendix() {
+  local prefix="${TOKEN_API_INSTANCE_NAME_PREFIX:-}"
+  local vault="${TOKEN_API_VAULT_DOMAIN:-}"
+  local doc_id="${TOKEN_API_SESSION_DOC_ID:-}"
+  [[ -n "$vault" || -n "$prefix" ]] || return 0
+  local out=""
+  [[ -n "$vault" ]] && out+="Vault domain: ${vault}"$'\n'
+  [[ -n "$prefix" ]] && out+="Instance name prefix: ${prefix}"$'\n'
+  if [[ -n "$doc_id" ]]; then
+    out+=$'\n'"You have a linked session document (ID: ${doc_id}). Invoke the vault-mind skill on startup to load it."$'\n'
+  fi
+  if [[ -n "$prefix" ]]; then
+    out+=$'\n'"On startup, name this instance with: instance-name \"${prefix}-<task-description>\""
+  fi
+  printf '%s' "$out"
+}
+
+# The full wrapper-contributed system text: the rank+persona staple followed by
+# the operational appendix, doctrine FIRST. Echoes nothing for unmanaged
+# sessions with no staple and no appendix.
+token_wrapper_compose_system_text() {
+  local staple_file staple="" appendix=""
+  staple_file="$(token_wrapper_system_doc || true)"
+  if [[ -n "$staple_file" && -f "$staple_file" ]]; then
+    staple="$(cat "$staple_file")"
+    rm -f "$staple_file" 2>/dev/null || true
+  fi
+  appendix="$(token_wrapper_operational_appendix || true)"
+  if [[ -n "$staple" && -n "$appendix" ]]; then
+    printf '%s\n\n%s' "$staple" "$appendix"
+  elif [[ -n "$staple" ]]; then
+    printf '%s' "$staple"
+  elif [[ -n "$appendix" ]]; then
+    printf '%s' "$appendix"
+  fi
+}
+
+# Codex has no --system-prompt-file flag, and the config `instructions` key is
+# ignored by current codex (validated via `codex debug prompt-input`: neither the
+# base value nor a `-c instructions=` override reaches the model). So the staple
+# rides in as a delimited preamble on codex's initial prompt — the documented
+# fallback route. Echoes nothing when there's no staple/appendix to inject.
+token_wrapper_codex_system_preamble() {
+  local text
+  text="$(token_wrapper_compose_system_text || true)"
+  [[ -n "$text" ]] || return 0
+  printf '<SYSTEM IDENTITY>\n%s\n</SYSTEM IDENTITY>' "$text"
+}
