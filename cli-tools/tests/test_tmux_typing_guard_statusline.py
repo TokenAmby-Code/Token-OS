@@ -6,9 +6,8 @@ pane right now?" — so it must consult ``send_gate.typing_guard_active(target=�
 (the predicate that actually gates the Python clobber path: state-hooks,
 enforcement, dispatch). That predicate is now the keystroke-anchored per-pane
 lock: it reads ``@TYPING_LOCK_UNTIL`` (an absolute expiry epoch the tmux any-key
-binding stamps on first keystroke). It must NOT answer from the legacy 300s shell
-stamp files, which over-report. The divergence test below pins exactly that: a
-live stamp present, but no keystroke lock ⇒ the segment is dark.
+binding stamps on first keystroke). It must NOT answer from sidecar files or
+pane-content heuristics.
 """
 
 from __future__ import annotations
@@ -24,6 +23,9 @@ REPO = Path(__file__).resolve().parents[2]
 STATUS = REPO / "cli-tools" / "bin" / "tmux-typing-guard-status"
 
 STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
+ON_MARKER = "#[fg=colour214,bold]⌨#[default]"
+PENDING_MARKER = "#[fg=red,bold]⌨#[default]"
+AGENT_MARKER = "#[fg=green,bold]⌨#[default]"
 
 
 def _fake_tmux(tmp_path: Path) -> Path:
@@ -73,6 +75,11 @@ def _fake_tmux(tmp_path: Path) -> Path:
                   if [[ -f "$f" ]]; then cat "$f"; fi
                   exit 0
                 fi
+                if [[ "$*" == *"@TYPING_AGENT_UNTIL"* ]]; then
+                  f="${FAKE_AGENT_DIR}/$(key "$target")"
+                  if [[ -f "$f" ]]; then cat "$f"; fi
+                  exit 0
+                fi
                 exit 1
                 ;;
               set-option|set)
@@ -99,6 +106,7 @@ def _env(
     *,
     locks: dict[str, int],
     pending: dict[str, int] | None = None,
+    agent: dict[str, int] | None = None,
     active: str = "%1",
 ) -> dict[str, str]:
     """Build the env, stamping each pane's keystroke-lock epoch into FAKE_LOCK_DIR."""
@@ -110,6 +118,10 @@ def _env(
     pending_dir.mkdir()
     for pane, epoch in (pending or {}).items():
         (pending_dir / _key(pane)).write_text(f"{int(epoch)}\n")
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    for pane, epoch in (agent or {}).items():
+        (agent_dir / _key(pane)).write_text(f"{int(epoch)}\n")
     calls = tmp_path / "calls.log"
     setopt = tmp_path / "setopt.log"
     calls.write_text("")
@@ -124,10 +136,9 @@ def _env(
             "FAKE_SETOPT": str(setopt),
             "FAKE_LOCK_DIR": str(lock_dir),
             "FAKE_PENDING_DIR": str(pending_dir),
+            "FAKE_AGENT_DIR": str(agent_dir),
             "FAKE_ACTIVE_PANE": active,
             "FAKE_PANES": "%1",
-            # Isolate the legacy stamp dir so a stray host stamp can't leak in.
-            "TMUX_GUARD_STATE_DIR": str(tmp_path / "guard-state"),
         }
     )
     return env
@@ -183,23 +194,25 @@ def test_segment_dark_when_lock_expired(tmp_path: Path) -> None:
     assert _run(env).stdout == ""
 
 
-def test_segment_follows_lock_not_legacy_stamp(tmp_path: Path) -> None:
-    """Divergence pin: the segment tracks the CANONICAL keystroke lock, not the
-    legacy shell stamp. A stale ``%1.stamp`` is present and the pane has NO live
-    lock — the honest diagnostic must stay dark, proving it ignores the stamp."""
-    env = _env(tmp_path, locks={})  # no keystroke lock
-    state_dir = Path(env["TMUX_GUARD_STATE_DIR"])
-    state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "%1.stamp").write_text("started_at=1\nstate=active\n")  # stale/irrelevant
-
-    assert _run(env).stdout == "", "must follow the canonical lock, not the legacy stamp"
-
-
 def test_segment_publishes_pane_scoped_guard_option(tmp_path: Path) -> None:
     """The active pane's border var is pushed so it renders with zero fork."""
     env = _env(tmp_path, locks={"%1": int(time.time()) + 200})
     _run(env)
-    assert _guard_value_for(env, "%1") not in (None, ""), "locked pane must get a non-empty @GUARD"
+    assert _guard_value_for(env, "%1") == ON_MARKER
+
+
+def test_segment_publishes_red_marker_for_pending(tmp_path: Path) -> None:
+    env = _env(tmp_path, locks={}, pending={"%1": int(time.time()) + 5})
+    _run(env)
+    assert _guard_value_for(env, "%1") == PENDING_MARKER
+
+
+def test_segment_publishes_green_marker_for_agent(tmp_path: Path) -> None:
+    # A daemon send holding the pane (the AGENT state) projects the green ⌨ —
+    # the gate counts it active (state-blind) and the border renders green.
+    env = _env(tmp_path, locks={}, agent={"%1": int(time.time()) + 8})
+    _run(env)
+    assert _guard_value_for(env, "%1") == AGENT_MARKER
 
 
 def test_segment_clears_pane_guard_option_when_dark(tmp_path: Path) -> None:
@@ -215,7 +228,7 @@ def test_scan_marks_guarded_panes_and_clears_clean_ones(tmp_path: Path) -> None:
     env["FAKE_PANES"] = "%1 %2"
     _run(env, "--scan")
 
-    assert _guard_value_for(env, "%1") not in (None, ""), "%1 locked"
+    assert _guard_value_for(env, "%1") == ON_MARKER, "%1 locked"
     assert _guard_value_for(env, "%2") == "", "%2 clear (expired lock)"
 
 
@@ -234,4 +247,4 @@ def test_expire_pane_keeps_pending_projection(tmp_path: Path) -> None:
 
     _run(env, "--expire-pane", "%1")
 
-    assert _guard_value_for(env, "%1") is None
+    assert _guard_value_for(env, "%1") == PENDING_MARKER

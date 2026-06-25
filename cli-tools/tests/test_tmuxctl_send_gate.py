@@ -110,6 +110,7 @@ def _lock_tmux(
     locks: dict[str, int | None],
     *,
     pending: dict[str, int | None] | None = None,
+    agent: dict[str, int | None] | None = None,
     panes: list[str] | None = None,
 ):
     """Fake real tmux so the keystroke-lock reader sees ``locks`` (pane -> epoch).
@@ -141,6 +142,15 @@ def _lock_tmux(
                     target = cmd[idx + 1]
                     break
             value = (pending or {}).get(target)
+            proc.stdout = "" if value is None else f"{int(value)}\n"
+            return proc
+        if "show-options" in cmd and send_gate._TYPING_AGENT_OPTION in cmd:
+            target = None
+            for idx, tok in enumerate(cmd):
+                if tok == "-t" and idx + 1 < len(cmd):
+                    target = cmd[idx + 1]
+                    break
+            value = (agent or {}).get(target)
             proc.stdout = "" if value is None else f"{int(value)}\n"
             return proc
         if "list-panes" in cmd:
@@ -383,6 +393,33 @@ def test_pending_pane_remains_send_blocking_after_enter(
     assert send_gate.typing_guard_active(target="%active") is True
     held = send_gate.evaluate(("send-keys", "-t", "%active", "queued"))
     assert held is not None and held["reason"] == "typing_guard"
+
+
+def test_agent_hold_alone_reports_typing_guard_active_and_delays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane carrying ONLY ``@TYPING_AGENT_UNTIL`` (a daemon send holding it)
+    reads as guard-active and a concurrent send delays — state-blind: the gate
+    never inspects which state is live, only that one is. This is the pile-on
+    prevention: a second send to the held pane queues behind the first."""
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _lock_tmux(monkeypatch, {"%held": None}, agent={"%held": now + 8})
+
+    assert send_gate.typing_guard_active(target="%held") is True
+    held = send_gate.evaluate(("send-keys", "-t", "%held", "concurrent"))
+    assert held is not None and held["reason"] == "typing_guard"
+    assert held["policy"] == "delay"
+
+
+def test_expired_agent_hold_releases(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_700_000_000
+    monkeypatch.setattr(send_gate.time, "time", lambda: now)
+    _lock_tmux(monkeypatch, {"%held": None}, agent={"%held": now - 1})
+
+    assert send_gate.typing_guard_active(target="%held") is False
 
 
 def test_live_lock_short_circuits_pending_read(monkeypatch: pytest.MonkeyPatch) -> None:

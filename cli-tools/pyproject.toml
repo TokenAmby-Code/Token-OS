@@ -47,6 +47,7 @@ ignore = ["E501"]  # line-length handled by formatter
 [tool.ruff.lint.per-file-ignores]
 "tests/test_tmuxctl_*.py" = ["E402"]
 "tests/test_tmuxctld_*.py" = ["E402"]
+"tests/test_tmux_typing_guard_agent.py" = ["E402"]
 "tests/test_dispatch_liveness.py" = ["E402"]
 "tests/test_automated_pane_activity.py" = ["E402"]
 "lib/tmuxctl/enums.py" = ["UP042"]

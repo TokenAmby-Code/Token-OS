@@ -9,10 +9,8 @@ ONE job is to answer honestly: *would the universal send gate hold an automated
 write to this pane right now?* So it consults the single canonical predicate,
 ``tmuxctl.send_gate.typing_guard_active(target=pane)`` — the same predicate that
 gates the Python clobber path (state-hooks, enforcement, dispatch via
-``TmuxAdapter.run``). It deliberately does NOT read the legacy 300s shell
-``*.stamp`` files: those over-report (they light long after a keystroke and
-across unattended agent panes), so a stamp-driven light could not tell "the
-guard never engaged" from "the guard was pierced." This reads the real gate.
+``TmuxAdapter.run``). It deliberately does NOT use any sidecar-state or pane-content heuristic; this
+reads the real gate.
 
 Modes:
   * default      — print the status-right segment for the *current* (active)
@@ -41,13 +39,46 @@ _LIB = Path(__file__).resolve().parents[1] / "lib"
 if str(_LIB) not in sys.path:
     sys.path.insert(0, str(_LIB))
 
-# Styled status-right segment (matches the bar's colour theme) and the compact
-# marker pushed into the per-pane @GUARD border var.
+# Styled status-right segment is retained only for manual invocation; the real
+# UX is the per-pane @GUARD marker. Marker constants come from the canonical
+# state helper so ON/PENDING cannot drift.
 SEGMENT_STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
 SEGMENT_PLAIN = "TYPE"
-BORDER_MARKER = "#[fg=colour214,bold]⌨#[default]"
-_TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
-_TYPING_PENDING_OPTION = "@TYPING_PENDING_UNTIL"
+
+try:
+    from tmuxctl.typing_guard_state import (
+        GUARD_OPTION,
+        ON_MARKER,
+        PENDING_MARKER,
+    )
+    from tmuxctl.typing_guard_state import (
+        LOCK_OPTION as _TYPING_LOCK_OPTION,
+    )
+    from tmuxctl.typing_guard_state import (
+        PENDING_OPTION as _TYPING_PENDING_OPTION,
+    )
+    from tmuxctl.typing_guard_state import (
+        Tmux as _StateTmux,
+    )
+    from tmuxctl.typing_guard_state import (
+        expire_pane as _state_expire_pane,
+    )
+    from tmuxctl.typing_guard_state import (
+        live_state as _state_live_state,
+    )
+    from tmuxctl.typing_guard_state import (
+        publish as _state_publish,
+    )
+except Exception:  # pragma: no cover - import failure is handled fail-open in main
+    GUARD_OPTION = "@GUARD"
+    _TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
+    _TYPING_PENDING_OPTION = "@TYPING_PENDING_UNTIL"
+    ON_MARKER = "#[fg=colour214,bold]⌨#[default]"
+    PENDING_MARKER = "#[fg=red,bold]⌨#[default]"
+    _state_expire_pane = None
+    _state_live_state = None
+    _state_publish = None
+    _StateTmux = None
 
 
 def _imports() -> tuple:
@@ -92,9 +123,16 @@ def _live_panes(binary: str) -> list[str]:
 
 def _publish(binary: str, pane: str, active: bool) -> None:
     """Push the pane-scoped @GUARD border var (zero-fork to render later)."""
-    value = BORDER_MARKER if active else ""
+    if _state_live_state is not None and _state_publish is not None and _StateTmux is not None:
+        try:
+            state = _state_live_state(_StateTmux(binary), pane) if active else "off"
+            _state_publish(_StateTmux(binary), pane, state)
+            return
+        except Exception:
+            pass
+    value = ON_MARKER if active else ""
     # Best-effort: a failed option write must never break the segment render.
-    _tmux(binary, "set-option", "-p", "-t", pane, "@GUARD", value)
+    _tmux(binary, "set-option", "-p", "-t", pane, GUARD_OPTION, value)
 
 
 def _pane_option_epoch(binary: str, pane: str, option: str) -> int | None:
@@ -109,18 +147,15 @@ def _pane_option_epoch(binary: str, pane: str, option: str) -> int | None:
 
 
 def _expire_pane(binary: str, pane: str) -> None:
-    """Clear stale guard projection for one pane, without scanning all panes."""
-    import time
-
-    now = time.time()
-    lock_until = _pane_option_epoch(binary, pane, _TYPING_LOCK_OPTION)
-    pending_until = _pane_option_epoch(binary, pane, _TYPING_PENDING_OPTION)
-    if (lock_until is not None and now < lock_until) or (
-        pending_until is not None and now < pending_until
-    ):
-        return
-    _tmux(binary, "set-option", "-pu", "-t", pane, _TYPING_LOCK_OPTION)
-    _tmux(binary, "set-option", "-pu", "-t", pane, _TYPING_PENDING_OPTION)
+    """Compatibility wrapper; the state helper owns expiry semantics."""
+    if _state_expire_pane is not None and _StateTmux is not None:
+        try:
+            _state_expire_pane(_StateTmux(binary), pane)
+            return
+        except Exception:
+            # Fall through to the legacy clear rather than leaving a stale
+            # @GUARD marker stuck until the next event touches the pane.
+            pass
     _publish(binary, pane, False)
 
 
