@@ -261,6 +261,8 @@ def test_keystroke_lock_backspace_moves_on_to_pending_without_text() -> None:
         assert "#{e|+:#{client_activity},15}" in block
         assert "set -pu @TYPING_LOCK_UNTIL" in block
         assert 'set -p @GUARD "#[fg=red,bold]⌨#[default]"' in block
+        assert "tmux-client-lease activity" in block
+        assert "--reason key" in block
         assert "⌨ PENDING" not in block, "pending marker must never include literal text"
 
         pending_branch = block.split(
