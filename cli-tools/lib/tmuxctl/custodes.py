@@ -95,18 +95,27 @@ def _process_tree() -> tuple[dict[int, list[int]], dict[int, str]]:
 
 
 def _find_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> tuple[int, str] | None:
-    """First descendant of pane_pid whose command contains a needle: (pid, command).
+    """First match in pane_pid's own process subtree (incl. pane_pid itself):
+    (pid, command) whose command contains a needle.
 
     Returns the live match (not just a bool) so callers that need to *report*
     the offending process — the close-lifecycle liveness guard names the agent
     pid/command in its refusal — share one canonical tree walk.
+
+    The walk is seeded at pane_pid itself, not at its children: PR #366's
+    persona-seat.sh `exec`s the engine, so for a persona seat #{pane_pid} IS the
+    claude/codex process (no wrapper-bash parent, no descendants). Checking only
+    descendants read those exec'd seats as dead and respawn-killed the live
+    agent on every hook delivery. Seeding at pane_pid is backward-compatible: a
+    wrapper/bash pane_pid carries no needle, so the walk still descends to the
+    claude child; a bare idle shell still matches nothing.
     """
     if not pane_pid:
         return None
     children, commands = _process_tree()
     if not commands:
         return None
-    stack = list(children.get(pane_pid, []))
+    stack = [pane_pid]
     seen: set[int] = set()
     while stack:
         pid = stack.pop()

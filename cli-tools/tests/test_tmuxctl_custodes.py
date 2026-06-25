@@ -4,11 +4,18 @@ import pathlib
 import sys
 from unittest.mock import patch
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import custodes
-from tmuxctl.custodes import assert_custodes, pane_has_active_agent, pane_has_active_claude
+from tmuxctl.custodes import (
+    active_agent_in_pane,
+    assert_custodes,
+    pane_has_active_agent,
+    pane_has_active_claude,
+)
 
 
 class FakeAdapter:
@@ -50,6 +57,53 @@ def test_detector_walks_bash_wrapper_to_claude():
     )
     with patch.object(custodes, "_process_tree", return_value=(children, commands)):
         assert pane_has_active_claude(14030) is True
+
+
+@pytest.mark.parametrize(
+    "command, is_claude",
+    [
+        # PR #366's persona-seat.sh `exec`s the engine, so #{pane_pid} IS the agent
+        # itself — no wrapper-bash parent, no descendants. persona-seat.sh exec's
+        # BOTH claude and codex this way, so both engines must read live off the
+        # pane_pid's OWN command. Parametrizing locks claude/codex to the SAME
+        # detector — neither can drift to an engine-specific code path later.
+        # The claude case mirrors the live council:custodes seat: pane_pid=25905
+        # command `/Users/tokenclaw/.local/bin/claude.token-os-real …`, zero kids.
+        ("/Users/tokenclaw/.local/bin/claude.token-os-real --model opus", True),
+        ("/opt/homebrew/bin/node /opt/homebrew/bin/codex", False),
+    ],
+)
+def test_detector_matches_execd_agent_as_pane_pid_with_no_children(
+    command: str, is_claude: bool
+) -> None:
+    children, commands = _tree(
+        parent_pid=19448,
+        descendants={
+            25905: (19448, command),
+        },
+    )
+    with patch.object(custodes, "_process_tree", return_value=(children, commands)):
+        # Both engines read live off the agent-neutral detector...
+        assert pane_has_active_agent(25905) is True
+        assert active_agent_in_pane(25905) == (25905, command.lower())
+        # ...and the claude-only detector still discriminates engine.
+        assert pane_has_active_claude(25905) is is_claude
+
+
+def test_detector_false_for_execd_bare_shell_as_pane_pid() -> None:
+    # Negative: an exec'd-style pane whose pane_pid IS a bare login shell (no agent
+    # anywhere) must still read not-live — the seeded-pane-pid walk must not
+    # false-positive on the shell itself and let the retire/respawn guards misfire.
+    children, commands = _tree(
+        parent_pid=400,
+        descendants={
+            500: (400, "-zsh"),
+        },
+    )
+    with patch.object(custodes, "_process_tree", return_value=(children, commands)):
+        assert pane_has_active_agent(500) is False
+        assert pane_has_active_claude(500) is False
+        assert active_agent_in_pane(500) is None
 
 
 def test_detector_finds_claude_via_node_argv():
