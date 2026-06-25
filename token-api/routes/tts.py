@@ -1631,13 +1631,17 @@ async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQue
         "oldest_queued_at": snapshot["oldest_queued_at"],
     }
     try:
+        # No event_class here: pause-queue length/severity/payload are
+        # observational signals, not a classification. The state-event policy
+        # (custodes_state_policy.classify_trigger) is the single authority that
+        # classifies tts_queue_languishing as "enforcement". TTS holds no
+        # opinion about enforcement.
         await _custodes_state_event_handler(
             "tts_queue_languishing",
             "tts_queue",
             instance_id=item.instance_id,
             severity=4 if live_pause_queue_length >= 10 else 3,
             payload=payload,
-            event_class="state",
         )
     except Exception as exc:
         if (
@@ -1936,6 +1940,30 @@ async def promote_from_pause(request: PromoteRequest):
     return {"success": True, "promoted": promoted}
 
 
+@router.post("/api/tts/queue/play-all")
+async def play_all_from_pause():
+    """Drain the entire pause queue into the hot queue, preserving FIFO order.
+
+    Operator "Play all" control (e.g. a Stream Deck button): empties the
+    accumulated pause buffer so everything plays. Unlike promote/play-pane,
+    this is a bulk drain and must NOT yank tmux focus per item, so each item
+    keeps focus_on_playback=False.
+
+    Body: {} (empty/ignored).
+    """
+    promoted = 0
+    async with tts_queue_lock:
+        while pause_queue:
+            item = pause_queue.popleft()
+            item.queue_target = "hot"
+            item.focus_on_playback = False
+            hot_queue.append(item)
+            promoted += 1
+
+    logger.info(f"play-all: Drained {promoted} item(s) from pause to hot queue")
+    return {"success": True, "promoted": promoted}
+
+
 @router.post("/api/tts/queue/play-pane")
 async def play_pane(request: PlayPaneRequest):
     """Promote all items from a specific instance to the front of hot queue.
@@ -1979,6 +2007,10 @@ async def set_global_tts_mode(request: Request):
     """Set global TTS mode. Overrides all instances."""
     body = await request.json()
     mode = body.get("mode", "verbose")
+    # One-button operator mute toggle (e.g. a Stream Deck button): resolve
+    # "toggle" to the opposite of the current global mode before validation.
+    if mode == "toggle":
+        mode = "muted" if TTS_GLOBAL_MODE["mode"] == "verbose" else "verbose"
     if mode not in ("verbose", "muted", "silent"):
         raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
 
