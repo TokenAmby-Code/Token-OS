@@ -289,20 +289,3 @@ def test_malformed_content_length_is_bad_request() -> None:
         assert json.loads(body)["error"]["code"] == "bad_request"
     finally:
         server.shutdown()
-
-
-def test_heartbeat_written_only_when_reachable(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    # Reachable -> file written atomically.
-    assert daemon.write_heartbeat(7778, reachable=True, home=str(tmp_path)) is True
-    path = daemon.heartbeat_path(str(tmp_path))
-    assert path.exists()
-    payload = json.loads(path.read_text())
-    assert payload["tmux_reachable"] is True
-    assert payload["port"] == 7778
-
-    # Unreachable -> deliberately NOT written (watchdog distinguishes alive-but-
-    # tmux-dead from process-dead by heartbeat freshness).
-    path.unlink()
-    assert daemon.write_heartbeat(7778, reachable=False, home=str(tmp_path)) is False
-    assert not path.exists()

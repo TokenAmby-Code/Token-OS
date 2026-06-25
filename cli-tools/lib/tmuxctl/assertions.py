@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
-import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -19,12 +20,17 @@ from .api import (
     update_instance_activity,
 )
 from .custodes import _pane_pid, pane_has_active_agent
-from .enums import InstanceStatus
+from .enums import VACANCY_POLICY, InstanceStatus, SeatVacancyPolicy
 from .resolver import resolve_pane
-from .tmux_adapter import TmuxAdapter
+from .tmux_adapter import TmuxAdapter, TmuxError
 
-DISPATCH_BIN = "dispatch"
 CLAUDE_CMD_BIN = "claude-cmd"
+# The thin persona-seat shim that ``launch_persona_seat`` respawns into a vacated
+# singleton pane. It is the daemon-native replacement for shelling ``dispatch``
+# (which ``exit 73``s on the protected singleton-seat labels): it sets minimal
+# env, folds in the rank+persona staple, and ``exec``s the engine so the agent
+# becomes the pane process (agent-exit == pane-died, no lingering wrapper).
+PERSONA_SEAT_SHIM = str(Path(__file__).resolve().parents[2] / "scripts" / "persona-seat.sh")
 PERSONA_LABELS = {
     "council:custodes",
     "council:malcador",
@@ -200,55 +206,107 @@ def _runtime_has_instance(adapter: TmuxAdapter, pane_id: str) -> bool:
     return pane_has_active_agent(_pane_pid(adapter, pane_id))
 
 
-def _dispatch_args(
-    pane_id: str, upsert: dict[str, Any], prompt_file: Path | None = None
-) -> list[str]:
-    engine = str(upsert.get("engine") or "claude")
-    args = [DISPATCH_BIN, "--engine", engine, "--pane", pane_id]
-    if persona := upsert.get("persona"):
-        args += ["--persona", str(persona)]
-    if session_doc := upsert.get("session_doc"):
-        args += ["--session-doc", str(session_doc)]
-    if model := upsert.get("model"):
-        args += ["--model", str(model)]
-    if work_dir := upsert.get("dir") or upsert.get("working_dir"):
-        args += ["--dir", str(work_dir)]
-    if upsert.get("instance_type"):
-        args += ["--instance-type", str(upsert["instance_type"])]
-    if prompt_file is not None:
-        args += ["--prompt-file", str(prompt_file)]
-    elif prompt := upsert.get("prompt"):
-        args += ["--prompt", str(prompt)]
-    if upsert.get("sync"):
-        args.append("--sync")
-    elif upsert.get("no_gt", True):
-        args.append("--no-gt")
-    return args
+# Identity env vars scrubbed off the inherited tmux-server environment before a
+# seat respawn, so a stale singleton identity carried in the server's launch env
+# can never bleed into the fresh seat (the dispatch-persona-leak failure mode).
+# The seat's own identity (PERSONA / WRAPPER_LAUNCH_ID / …) is set explicitly
+# below. TMUX_PANE is deliberately NOT scrubbed: tmux provides the correct pane id
+# to the respawned process and SessionStart needs it.
+_PERSONA_SEAT_ENV_SCRUB = (
+    "TOKEN_API_INSTANCE_ID",
+    "TOKEN_API_PARENT_INSTANCE_ID",
+    "TOKEN_API_LEGION",
+    "TOKEN_API_PERSONA_SLUG",
+    "TOKEN_API_PERSONA_ID",
+    "TOKEN_API_DISPLAY_NAME",
+    "TOKEN_API_VAULT_DOMAIN",
+    "TOKEN_API_INSTANCE_NAME_PREFIX",
+    "TOKEN_API_SESSION_DOC_ID",
+)
 
 
-def _launch(pane_id: str, upsert: dict[str, Any], prompt: str = "") -> tuple[bool, str]:
-    prompt_file = None
+def persona_seat_command(
+    spec: PersonaSpec,
+    *,
+    wrapper_launch_id: str,
+    shim_path: str = PERSONA_SEAT_SHIM,
+) -> str:
+    """Pure builder for the shell command a seat respawn runs.
+
+    Mirrors dispatch's launch env contract (so the agent's own SessionStart hook
+    registers the row identically — persona derived from the stable pane label,
+    session-doc/model/working-dir from the env) while invoking the thin exec-ing
+    ``persona-seat.sh`` shim instead of the heavy agent wrapper. Engine-agnostic:
+    the shim takes the engine as ``argv[1]``. No third-party imports — stdlib
+    ``shlex`` only — so a unit test can assert the string without a live tmux.
+    """
+    working_dir = spec.working_dir or os.environ.get("HOME", "")
+    env: list[tuple[str, str]] = [
+        ("TOKEN_API_LAUNCHER", "persona-seat"),
+        ("TOKEN_API_ENGINE", spec.engine or "claude"),
+        ("TOKEN_API_WRAPPER_LAUNCH_ID", wrapper_launch_id),
+        ("TOKEN_API_PERSONA", spec.persona),
+        ("TOKEN_API_INSTANCE_TYPE", spec.instance_type),
+        ("TOKEN_API_DISPATCH_SESSION_DOC_PATH", spec.session_doc),
+    ]
+    if working_dir:
+        env.append(("TOKEN_API_TARGET_WORKING_DIR", working_dir))
+    if spec.model:
+        env.append(("TOKEN_API_CLAUDE_MODEL", spec.model))
+    # GT (golden-throne) posture rides as a flag the shim forwards; sync seats
+    # (Custodes/Pax) opt in, the rest default to no-GT.
+    env.append(("TOKEN_API_PERSONA_SEAT_SYNC", "1" if spec.sync else "0"))
+
+    scrub = " ".join(f"-u {name}" for name in _PERSONA_SEAT_ENV_SCRUB)
+    assignments = " ".join(f"{key}={shlex.quote(value)}" for key, value in env)
+    invocation = (
+        f"env {scrub} {assignments} {shlex.quote(shim_path)} {shlex.quote(spec.engine or 'claude')}"
+    )
+    if working_dir:
+        return f"cd {shlex.quote(working_dir)} && {invocation}"
+    return invocation
+
+
+def launch_persona_seat(
+    adapter: TmuxAdapter,
+    pane_id: str,
+    spec: PersonaSpec,
+    *,
+    session: str | None = None,
+) -> tuple[bool, str]:
+    """Seat a persona by respawning the thin shim into its (vacated) pane.
+
+    The daemon-native replacement for shelling ``dispatch`` (which ``exit 73``s on
+    the protected singleton-seat labels): a tmux ``respawn-pane -k`` issued through
+    the already-gated adapter funnel — a pane write is a syscall of the daemon, the
+    daemon never writes ``agents.db``. The agent's own SessionStart hook
+    creates/reactivates the registry row.
+
+    ``@PANE_BORN`` is stamped AFTER the respawn (the respawn preflight clears
+    runtime state, which would wipe a pre-stamp) so a reconcile event firing
+    mid-boot reads the seat as occupied (the double-seat guard).
+    """
+    wrapper_launch_id = uuid.uuid4().hex
+    command = persona_seat_command(spec, wrapper_launch_id=wrapper_launch_id)
     try:
-        if prompt:
-            fd, path = tempfile.mkstemp(prefix="tmuxctl-assert-", suffix=".md")
-            os.close(fd)
-            prompt_file = Path(path)
-            prompt_file.write_text(prompt)
-        proc = subprocess.run(
-            _dispatch_args(pane_id, upsert, prompt_file),
-            capture_output=True,
-            text=True,
-            timeout=45,
-            check=False,
-        )
-        if proc.returncode != 0:
-            return False, f"dispatch rc={proc.returncode}: {proc.stderr.strip()[:240]}"
-        return True, "launched"
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
-    finally:
-        if prompt_file:
-            prompt_file.unlink(missing_ok=True)
+        adapter.run("respawn-pane", "-k", "-t", pane_id, command)
+    except TmuxError as exc:
+        return False, f"respawn-pane failed: {str(exc)[:200]}"
+    if adapter.last_send_gate_result is not None:
+        # The universal send gate suppressed the respawn (e.g. quiet hours / typing
+        # guard on this pane). Zero structural change happened; surface it so the
+        # reconcile retries rather than recording a phantom launch.
+        return False, "respawn_suppressed_by_gate"
+    adapter.run(
+        "set-option",
+        "-p",
+        "-t",
+        pane_id,
+        "@PANE_BORN",
+        str(int(time.time())),
+        allow_failure=True,
+    )
+    return True, "launched"
 
 
 def _upsert_prompt(pane_id: str, prompt: str) -> tuple[bool, str]:
@@ -304,6 +362,14 @@ PERSONA_FAILOPEN_ATTEMPTS = 4
 # on the newborn, and kills it — a stillbirth. Hold off pruning until the worker
 # is older than this window; the value sits safely above the observed ~1.5s race.
 STACK_WORKER_BOOT_GRACE_SECONDS = 30.0
+# Boot-grace for the persona/reservist seat reconcile, mirroring the stack-worker
+# grace end-to-end. A freshly respawned persona seat is observable (its @PANE_BORN
+# stamp + eventual registry row) before its agent process is observable to
+# `_runtime_has_instance` (the ~1.5s engine-boot race). Without a grace a reconcile
+# EVENT firing mid-boot would respawn-kill the booting agent — a double-seat. Hold
+# off re-seating until the seat is older than this window. Same value as the
+# stack-worker grace; the boot race is the same engine launch.
+PERSONA_BOOT_GRACE_SECONDS = 30.0
 # Tolerated clock skew between the host that stamps a row's created_at and the
 # sweep host. A future timestamp within this window is treated as just-born
 # (age 0.0); beyond it the stamp is anomalous and does not extend the grace.
@@ -806,13 +872,13 @@ def _pane_age_seconds(born: str) -> float | None:
         return None
 
 
-def _stack_worker_within_boot_grace(adapter: TmuxAdapter, pane_id: str, rows) -> bool:
-    """True while a stack worker is still inside its boot-grace window.
+def _within_boot_grace(adapter: TmuxAdapter, pane_id: str, rows, grace_seconds: float) -> bool:
+    """True while a pane is still inside its boot-grace window.
 
     Source of truth for age is the registry row's `created_at` (youngest known
     row when several map to the pane); absent any row, the pane's `@PANE_BORN`
     birth stamp. Rows whose timestamp is missing/unparseable do NOT extend the
-    grace — they contribute no age and a worker with only such rows is prunable.
+    grace — they contribute no age and a pane with only such rows is past grace.
     """
     if rows:
         ages = [
@@ -822,9 +888,44 @@ def _stack_worker_within_boot_grace(adapter: TmuxAdapter, pane_id: str, rows) ->
         ]
         if not ages:
             return False
-        return min(ages) < STACK_WORKER_BOOT_GRACE_SECONDS
+        return min(ages) < grace_seconds
     age = _pane_age_seconds(adapter.show_pane_option(pane_id, "@PANE_BORN"))
-    return age is not None and age < STACK_WORKER_BOOT_GRACE_SECONDS
+    return age is not None and age < grace_seconds
+
+
+def _stack_worker_within_boot_grace(adapter: TmuxAdapter, pane_id: str, rows) -> bool:
+    """True while a stack worker is still inside its boot-grace window."""
+    return _within_boot_grace(adapter, pane_id, rows, STACK_WORKER_BOOT_GRACE_SECONDS)
+
+
+def _persona_within_boot_grace(adapter: TmuxAdapter, pane_id: str, rows) -> bool:
+    """True while a freshly respawned persona/reservist seat is still booting.
+
+    The double-seat guard: a seat younger than the boot-grace is a booting agent
+    (its respawn fired, the engine is not yet observable to `_runtime_has_instance`),
+    not a dead pane — so a reconcile must read it as occupied and NOT re-respawn it.
+    """
+    return _within_boot_grace(adapter, pane_id, rows, PERSONA_BOOT_GRACE_SECONDS)
+
+
+def seat_class(pane_label: str, pane_type: str) -> str:
+    """Normalized seat CLASS for `enums.VACANCY_POLICY` lookup.
+
+    Persona singleton seats are recognized by their stable pane LABEL (their
+    `@PANE_TYPE` is the page region, ``council`` / ``mechanicus``). Reservist and
+    stack-worker seats are recognized by `@PANE_TYPE`. Returns ``""`` for panes
+    that are neither (no vacancy policy applies).
+    """
+    if pane_label in PERSONA_LABELS:
+        return "persona"
+    if pane_type in {"reservists", "stack-worker"}:
+        return pane_type
+    return ""
+
+
+def seat_vacancy_policy(pane_label: str, pane_type: str) -> SeatVacancyPolicy | None:
+    """Vacancy policy for a pane, or None when no standing-seat policy applies."""
+    return VACANCY_POLICY.get(seat_class(pane_label, pane_type))
 
 
 def _base_result(pane_id: str, pane_label: str, pane_type: str, row) -> dict[str, Any]:
@@ -884,24 +985,22 @@ def _assert_instance_impl(
     if pane_label in PERSONA_LABELS:
         spec = persona_spec(pane_label)
         if not runtime_ok:
+            # Double-seat guard: a seat younger than the boot-grace is a booting
+            # agent (its respawn fired; the engine is not yet observable), NOT a
+            # dead pane. A reconcile event firing in this window must read the seat
+            # as occupied and leave it alone instead of respawn-killing it.
+            if _persona_within_boot_grace(adapter, pane_id, rows):
+                result.update({"ok": False, "action": "boot_grace", "reason": "persona_boot_grace"})
+                return finish(result, clear_failed=False)
             if rows:
                 _stop_rows(
                     rows, pane_id=pane_id, pane_label=pane_label, reason="persona_runtime_dead"
                 )
-            launch_upsert = {
-                "engine": spec.engine,
-                "persona": spec.persona,
-                "instance_type": spec.instance_type,
-                "session_doc": spec.session_doc,
-                "sync": spec.sync,
-                "model": spec.model,
-                # Launch the persona from its vault, not $HOME. The legion/mechanicus
-                # seats pin the (mount-guarded) Imperium-ENV vault and civic seats pin
-                # the Civic vault; _dispatch_args omits --dir when blank.
-                "working_dir": spec.working_dir,
-                "no_gt": not spec.sync,
-            }
-            ok, reason = _launch(pane_id, launch_upsert, str((upsert or {}).get("prompt") or ""))
+            # Daemon-native seat launch: respawn the thin shim into the pane
+            # (replaces the dispatch shell-out that exit-73'd on these protected
+            # singleton labels). SessionStart registers the row; we never write the
+            # registry here.
+            ok, reason = launch_persona_seat(adapter, pane_id, spec, session=session)
             result.update(
                 {"ok": ok, "action": "launched" if ok else "launch_failed", "reason": reason}
             )

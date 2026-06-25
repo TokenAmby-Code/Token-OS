@@ -27,13 +27,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import re
 import signal
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,7 +43,6 @@ from .tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7778
-HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 # The daemon is unauthenticated and does powerful tmux ops — it binds loopback
 # ONLY. serve() refuses any other --host (fail-closed).
@@ -73,7 +70,7 @@ def _safe_public_role(role: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Boot-time metadata (version / sha) + heartbeat
+# Boot-time metadata (version / sha)
 # ---------------------------------------------------------------------------
 
 
@@ -107,38 +104,11 @@ def read_sha() -> str:
         return "unknown"
 
 
-def heartbeat_path(home: str | None = None) -> Path:
-    """Path of the liveness heartbeat file (``~/.claude/tmuxctld-heartbeat.json``)."""
-    base = Path(home) if home else Path.home()
-    return base / ".claude" / "tmuxctld-heartbeat.json"
-
-
-def heartbeat_payload(port: int, *, reachable: bool) -> dict:
-    """Build the heartbeat record (pid, port, tmux reachability, wall-clock ts)."""
-    return {
-        "pid": os.getpid(),
-        "port": port,
-        "tmux_reachable": reachable,
-        "ts": time.time(),
-    }
-
-
-def write_heartbeat(port: int, *, reachable: bool, home: str | None = None) -> bool:
-    """Atomically write the heartbeat file — ONLY when tmux is reachable.
-
-    A future ``StartInterval`` watchdog uses the presence + freshness of this
-    file to distinguish "process alive but tmux dead" (no recent heartbeat,
-    process still serving ``/health``) from "process dead". So we deliberately
-    do NOT write when tmux is unreachable.
-    """
-    if not reachable:
-        return False
-    path = heartbeat_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(heartbeat_payload(port, reachable=reachable)), encoding="utf-8")
-    os.replace(tmp, path)
-    return True
+# The write-only liveness heartbeat (`~/.claude/tmuxctld-heartbeat.json` + its
+# 30s writer thread) was RETIRED with the daemon-native persona work: nothing ever
+# read it (it was scaffolding for a never-built StartInterval watchdog). /health is
+# the live liveness contract; launchd `KeepAlive` owns process supervision. Do NOT
+# reintroduce a heartbeat-file poller — prefer /health.
 
 
 def tmux_reachable(adapter: TmuxAdapter) -> bool:
@@ -148,18 +118,6 @@ def tmux_reachable(adapter: TmuxAdapter) -> bool:
         return True
     except Exception:
         return False
-
-
-def _heartbeat_loop(server: TmuxctldServer, stop: threading.Event) -> None:
-    """Background loop: write the liveness heartbeat every interval until stopped."""
-    while not stop.is_set():
-        try:
-            write_heartbeat(
-                server.advertised_port, reachable=tmux_reachable(server.adapter_factory())
-            )
-        except Exception:
-            pass
-        stop.wait(HEARTBEAT_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +335,15 @@ def _h_assert_instance(control, params):
     return control.assert_instance(_s(params, "pane"))
 
 
-def _h_assert_personas(control, params):
-    return control.assert_personas()
+def _h_reconcile(control, params):
+    # The detached daemon has no ambient tmux session; the fleet lives in `main`.
+    return {"results": control.reconcile_personas(session=_s(params, "session", "main"))}
+
+
+def _h_event(control, params):
+    return control.handle_event(
+        _s(params, "event"), pane=_s(params, "pane"), session=_s(params, "session", "main")
+    )
 
 
 def _h_clear_runtime(control, params):
@@ -612,7 +577,11 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/prompt-end"): _h_prompt_end,
     ("POST", "/invoke-skill"): _h_invoke_skill,
     ("POST", "/assert-instance"): _h_assert_instance,
-    ("POST", "/assert-personas"): _h_assert_personas,
+    # Event-driven persona reconcile (replaces the retired 2-min assert-personas
+    # poll). /reconcile re-seats all must-fill seats; /event ingests a single tmux
+    # lifecycle event (a persona pane-died self-heal). Nothing polls these.
+    ("POST", "/reconcile"): _h_reconcile,
+    ("POST", "/event"): _h_event,
     ("POST", "/clear-runtime"): _h_clear_runtime,
     ("POST", "/close-pane"): _h_close_pane,
     ("POST", "/close"): _h_close,
@@ -819,9 +788,9 @@ def build_parser() -> argparse.ArgumentParser:
 def serve(host: str, port: int) -> int:
     """Run the daemon on ``host:port`` until SIGTERM/Ctrl-C; returns the exit code.
 
-    Starts the background heartbeat thread, installs a SIGTERM handler that
-    raises ``SystemExit`` for a clean ``server_close()``, and blocks in
-    ``serve_forever()`` (which sets the server ready event once listening).
+    Installs a SIGTERM handler that raises ``SystemExit`` for a clean
+    ``server_close()`` and blocks in ``serve_forever()`` (which sets the server
+    ready event once listening).
 
     The daemon performs powerful, UNAUTHENTICATED tmux operations, so it must
     only ever bind loopback. A non-loopback ``--host`` is refused (fail-closed)
@@ -841,11 +810,6 @@ def serve(host: str, port: int) -> int:
         sha=read_sha(),
         advertised_port=port,
     )
-    stop = threading.Event()
-    heartbeat = threading.Thread(
-        target=_heartbeat_loop, args=(server, stop), name="tmuxctld-heartbeat", daemon=True
-    )
-    heartbeat.start()
 
     def _shutdown(_signum, _frame):
         raise SystemExit(0)
@@ -857,7 +821,6 @@ def serve(host: str, port: int) -> int:
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        stop.set()
         server.server_close()
     return 0
 

@@ -254,87 +254,13 @@ class CronEngine:
     # footprint is written once at the end-of-day flush
     # (`_sync_generate_daily_analytics`). Do not reintroduce a per-tick note writer.
 
-    def register_persona_sweep_job(self, interval_minutes: int = 2) -> None:
-        """Register the periodic singleton-persona registration sweep.
-
-        Re-asserts the standing persona panes (Custodes/Malcador/FG/Admin) against
-        the live `main` session every few minutes by shelling out to
-        `tmuxctl assert-personas`. The reconcile logic is the SAME one `tx restart`
-        runs (assert_instance over PERSONA_LABELS); scheduling it here closes the
-        gap where it only ran on a full teardown/rebuild. A persona pane that
-        silently lost its registry row — e.g. its SessionStart POST failed while
-        token-api was briefly out of file descriptors (EMFILE) — self-heals within
-        one interval instead of staying dead (and enforcement-blind) until the next
-        `tx restart`. The sweep is idempotent: assert_instance no-ops on a healthy
-        row, so re-running it every couple of minutes is cheap and side-effect-free.
-        """
-        self.scheduler.add_job(
-            self._run_persona_sweep_job,
-            trigger=IntervalTrigger(minutes=interval_minutes, timezone=ZoneInfo("America/Phoenix")),
-            id="persona_registration_sweep",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=60,
-            name="persona-registration-sweep",
-        )
-        # print() (not logging) deliberately: the whole CronEngine class writes
-        # operational messages to stdout so launchd captures them in
-        # ~/.claude/token-api-stdout.log (the documented log operators grep). A
-        # logging.getLogger("cron_engine") record is swallowed here — main.py only
-        # wires the `token_api` logger to a handler — so it would land nowhere
-        # (verified on live 2026-06-15).
-        print(f"CronEngine: Registered persona-registration-sweep (interval: {interval_minutes}m)")
-
-    async def _run_persona_sweep_job(self) -> None:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "tmuxctl",
-                "assert-personas",
-                "--format",
-                "json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_subprocess_env(),
-                # Own a fresh process group so a timeout can kill the whole tree —
-                # tmuxctl shells out to dispatch/claude-cmd/tmux, which proc.kill()
-                # (direct child only) would orphan. Mirrors _execute()'s pattern.
-                start_new_session=True,
-            )
-        except FileNotFoundError:
-            print("CronEngine: persona-registration-sweep skipped — tmuxctl not on PATH")
-            return
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
-        except TimeoutError:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await proc.wait()
-            print("CronEngine: persona-registration-sweep timed out after 90s")
-            return
-        except Exception as exc:
-            print(f"CronEngine: persona-registration-sweep failed: {exc}")
-            return
-        if proc.returncode != 0:
-            err = (stderr or b"").decode("utf-8", errors="replace")[-500:]
-            print(f"CronEngine: persona-registration-sweep rc={proc.returncode}: {err}")
-            return
-        # Surface only panes the sweep genuinely acted on or found unhealthy WHILE
-        # PRESENT — a clean sweep stays quiet. An absent persona pane (resolve
-        # failure -> action="error", e.g. council seats that aren't always seated)
-        # is the expected, uninteresting state and is excluded so it can't spam the
-        # log every interval; run `tmuxctl assert-personas` manually to see those.
-        out = (stdout or b"").decode("utf-8", errors="replace").strip()
-        try:
-            results = json.loads(out) if out else []
-        except json.JSONDecodeError:
-            return
-        acted = [r for r in results if not r.get("ok") and r.get("action") != "error"]
-        if acted:
-            summary = ", ".join(f"{r.get('pane_label', '?')}={r.get('action', '?')}" for r in acted)
-            print(f"CronEngine: persona-registration-sweep acted on {len(acted)}: {summary}")
+    # The periodic singleton-persona registration sweep (a 2-min cron that shelled
+    # `tmuxctl assert-personas`) was RETIRED in the daemon-native persona seat work.
+    # It was the wrong shape: a poll that `exit 73`'d on the six protected
+    # singleton labels and failed silently ~360x overnight, leaving the fleet dead.
+    # Re-seating is now event-driven — the tmuxctld daemon's POST /reconcile and
+    # POST /event (fired by the pane-died hook) re-seat must-fill persona seats with
+    # no polling. Do NOT reintroduce a periodic persona sweep here.
 
     async def ensure_permanent_jobs(self):
         """Seed permanent jobs into DB on first boot only (INSERT OR IGNORE).

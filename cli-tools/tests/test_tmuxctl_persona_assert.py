@@ -16,16 +16,21 @@ from tmuxctl.assertions import (
     PERSONA_LABELS,
     PersonaSpec,
     _clear_pane_overlay,
-    _dispatch_args,
     _guarded_note_mismatched,
     _guarded_note_unregistered,
     _guarded_send_persona_command,
     _observed_row_hash,
+    _persona_within_boot_grace,
     _persona_working_dir,
     _row_matches_persona,
+    launch_persona_seat,
+    persona_seat_command,
     persona_spec,
+    seat_class,
+    seat_vacancy_policy,
     sweep_persona_panes,
 )
+from tmuxctl.enums import SeatVacancyPolicy
 
 FG_LABEL = "mechanicus:fabricator-general"
 ADMIN_LABEL = "council:administratum"
@@ -74,6 +79,7 @@ class FakeAdapter:
     def __init__(self) -> None:
         self.options: dict[str, str] = {}
         self.calls: list[tuple[str, ...]] = []
+        self.last_send_gate_result = None
 
     def run(self, *args, allow_failure: bool = False) -> str:
         self.calls.append(args)
@@ -90,7 +96,7 @@ class FakeAdapter:
         return self.options.get(option, "")
 
 
-def test_persona_specs_pin_model_defaults():
+def test_persona_specs_pin_model_defaults() -> None:
     assert persona_spec("council:custodes").model == "opus"
     assert persona_spec("council:malcador").model == "fable"
     assert persona_spec("mechanicus:fabricator-general").model == ""
@@ -106,40 +112,109 @@ def test_malcador_spec_is_not_sync() -> None:
     assert spec.session_doc.endswith("Terra/Sessions/malcador.md")
 
 
-def test_dispatch_args_include_model_when_present():
-    args = _dispatch_args(
-        "%99",
-        {
-            "engine": "claude",
-            "persona": "administratum",
-            "model": "sonnet",
-            "session_doc": "/tmp/admin.md",
-            "instance_type": "hook_driven",
-        },
+def test_persona_seat_command_carries_persona_model_and_session_doc() -> None:
+    spec = PersonaSpec(
+        ADMIN_LABEL,
+        "administratum",
+        "hook_driven",
+        "/tmp/admin.md",
+        model="sonnet",
+        working_dir="/Volumes/Imperium/Imperium-ENV",
+    )
+    cmd = persona_seat_command(spec, wrapper_launch_id="wl-123", shim_path="/x/persona-seat.sh")
+
+    # cd into the working dir, then env-prefixed shim invocation with the engine arg.
+    assert cmd.startswith("cd /Volumes/Imperium/Imperium-ENV && env ")
+    assert "TOKEN_API_PERSONA=administratum" in cmd
+    assert "TOKEN_API_CLAUDE_MODEL=sonnet" in cmd
+    assert "TOKEN_API_DISPATCH_SESSION_DOC_PATH=/tmp/admin.md" in cmd
+    assert "TOKEN_API_INSTANCE_TYPE=hook_driven" in cmd
+    assert "TOKEN_API_WRAPPER_LAUNCH_ID=wl-123" in cmd
+    assert "TOKEN_API_LAUNCHER=persona-seat" in cmd
+    # The thin shim, then the engine as argv[1].
+    assert cmd.rstrip().endswith("/x/persona-seat.sh claude")
+
+
+def test_persona_seat_command_scrubs_inherited_identity_env() -> None:
+    spec = persona_spec("council:custodes")
+    cmd = persona_seat_command(spec, wrapper_launch_id="wl-1")
+
+    # Stale singleton identity inherited from the tmux-server env is scrubbed so it
+    # cannot bleed into the fresh seat; the seat's own PERSONA is set explicitly.
+    assert "-u TOKEN_API_INSTANCE_ID" in cmd
+    assert "-u TOKEN_API_PARENT_INSTANCE_ID" in cmd
+    assert "-u TOKEN_API_LEGION" in cmd
+    # TMUX_PANE is NOT scrubbed — tmux provides it and SessionStart needs it.
+    assert "-u TMUX_PANE" not in cmd
+
+
+def test_persona_seat_command_omits_model_when_blank() -> None:
+    spec = persona_spec("mechanicus:fabricator-general")  # model == ""
+    cmd = persona_seat_command(spec, wrapper_launch_id="wl-1")
+
+    assert "TOKEN_API_CLAUDE_MODEL=" not in cmd
+
+
+def test_persona_seat_command_sync_flag_reflects_spec() -> None:
+    assert "TOKEN_API_PERSONA_SEAT_SYNC=1" in persona_seat_command(
+        persona_spec("council:custodes"), wrapper_launch_id="w"
+    )
+    assert "TOKEN_API_PERSONA_SEAT_SYNC=0" in persona_seat_command(
+        persona_spec("council:malcador"), wrapper_launch_id="w"
     )
 
-    assert "--model" in args
-    assert args[args.index("--model") + 1] == "sonnet"
 
-
-def test_dispatch_args_include_dir_when_present():
-    args = _dispatch_args(
-        "%99",
-        {
-            "engine": "claude",
-            "persona": "custodes",
-            "dir": "/Volumes/Imperium/Imperium-ENV",
-        },
+def test_vacancy_policy_map_classifies_seats() -> None:
+    assert seat_vacancy_policy("council:custodes", "council") is SeatVacancyPolicy.MUST_FILL
+    assert seat_vacancy_policy("mechanicus:fabricator-general", "mechanicus") is (
+        SeatVacancyPolicy.MUST_FILL
     )
+    assert seat_vacancy_policy("reservists:civic", "reservists") is SeatVacancyPolicy.MUST_FILL
+    assert seat_vacancy_policy("mechanicus:5", "stack-worker") is SeatVacancyPolicy.FILL_IF_ROW
+    # A plain pane (true-terminal) has no standing-seat policy.
+    assert seat_vacancy_policy("council:true-terminal", "") is None
 
-    assert "--dir" in args
-    assert args[args.index("--dir") + 1] == "/Volumes/Imperium/Imperium-ENV"
+
+def test_seat_class_keys_persona_by_label_not_type() -> None:
+    # Persona seats carry the page region as their @PANE_TYPE, recognized by LABEL.
+    assert seat_class("council:custodes", "council") == "persona"
+    assert seat_class("mechanicus:orchestrator", "mechanicus") == "persona"
+    assert seat_class("reservists:civic", "reservists") == "reservists"
+    assert seat_class("mechanicus:5", "stack-worker") == "stack-worker"
+    assert seat_class("council:true-terminal", "council") == ""
 
 
-def test_dispatch_args_omit_dir_when_blank():
-    args = _dispatch_args("%99", {"engine": "claude", "persona": "custodes", "dir": ""})
+def test_launch_persona_seat_respawns_then_stamps_born() -> None:
+    spec = persona_spec("council:custodes")
+    adapter = FakeAdapter()
+    ok, reason = launch_persona_seat(adapter, "%7", spec)
 
-    assert "--dir" not in args
+    assert ok is True
+    assert reason == "launched"
+    # The respawn-pane -k must precede the @PANE_BORN stamp — boot grace keys on the
+    # stamp, so a pre-stamp regression would let a reconcile read a vacated seat as
+    # occupied. Compare call indices, not just presence.
+    respawn_idx, respawn = next(
+        (i, c) for i, c in enumerate(adapter.calls) if c and c[0] == "respawn-pane"
+    )
+    stamp_idx = next(
+        i
+        for i, c in enumerate(adapter.calls)
+        if c[:5] == ("set-option", "-p", "-t", "%7", "@PANE_BORN")
+    )
+    assert "-k" in respawn and "%7" in respawn
+    assert respawn_idx < stamp_idx
+    assert adapter.options.get("@PANE_BORN", "").isdigit()
+
+
+def test_persona_within_boot_grace_holds_freshly_born_seat() -> None:
+    adapter = FakeAdapter()
+    import time as _t
+
+    adapter.options["@PANE_BORN"] = str(int(_t.time()))
+    assert _persona_within_boot_grace(adapter, "%7", []) is True
+    adapter.options["@PANE_BORN"] = str(int(_t.time()) - 999)
+    assert _persona_within_boot_grace(adapter, "%7", []) is False
 
 
 def test_persona_working_dir_resolves_vault_when_mounted(tmp_path, monkeypatch):

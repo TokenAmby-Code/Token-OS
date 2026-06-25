@@ -1814,7 +1814,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cron_engine = CronEngine(scheduler, DB_PATH)
     await cron_engine.recover_orphaned_runs()
     await cron_engine.ensure_permanent_jobs()
-    cron_engine.register_persona_sweep_job()
+    # The 2-min persona-registration sweep was retired: persona seats now re-seat
+    # event-driven via the tmuxctld daemon (POST /reconcile + /event), not a poll.
     print("Cron engine loaded")
     # Start TTS queue worker
     _tts_mod.tts_worker_task = asyncio.create_task(tts_queue_worker())

@@ -426,11 +426,80 @@ class TmuxControlPlane:
 
         return assert_instance(self.adapter, pane)
 
-    def assert_personas(self) -> list[dict]:
-        """Sweep all persona panes, asserting their stamp invariants."""
+    def reconcile_personas(self, session: str | None = None) -> list[dict]:
+        """Re-seat every must-fill singleton persona seat against the live session.
+
+        The event-driven replacement for the retired 2-min ``assert-personas``
+        poll: loops ``PERSONA_LABELS`` and asserts each — ``assert_instance``
+        respawns the thin shim into any seat whose runtime is dead and no-ops a
+        healthy one (idempotent). Nothing polls this; the daemon reconciles only
+        when asked (restart completion, a persona ``pane-died`` event).
+        """
         from .assertions import sweep_persona_panes
 
-        return sweep_persona_panes(self.adapter)
+        return sweep_persona_panes(self.adapter, session=session)
+
+    def assert_personas(self) -> list[dict]:
+        """Deprecated alias for :meth:`reconcile_personas` (ambient session)."""
+        return self.reconcile_personas()
+
+    def handle_event(self, event: str, *, pane: str = "", session: str | None = None) -> dict:
+        """Ingest a tmux lifecycle event and reconcile a vacated must-fill seat.
+
+        Today the one actionable event is ``pane-died`` on a perpetual seat: a
+        persona singleton lost its agent → re-seat it (respawn the shim through
+        ``assert_instance``). Stack-worker deaths are fill-if-row and handled by
+        the existing stack reconcile, so they no-op here. Reservist deaths are
+        must-fill but have no persona launcher yet (follow-on), so they are noted,
+        not acted on. Never raises on an unknown/benign event.
+        """
+        from .assertions import (
+            PERSONA_LABELS,
+            assert_instance,
+            seat_vacancy_policy,
+        )
+        from .enums import SeatVacancyPolicy
+
+        normalized = (event or "").strip().lower().replace("_", "-")
+        if normalized != "pane-died":
+            return {"ok": True, "action": "ignored", "reason": f"unhandled_event:{event}"}
+        if not pane:
+            return {"ok": False, "action": "ignored", "reason": "no_pane"}
+
+        try:
+            resolved = resolve_pane(self.adapter, pane, session_name=session)
+        except Exception as exc:  # noqa: BLE001 — a dead/missing pane is benign here
+            return {"ok": True, "action": "ignored", "reason": f"unresolved_pane:{exc}"}
+
+        pane_id = resolved.pane_id
+        pane_label = resolved.pane_role or self.adapter.show_pane_option(pane_id, "@PANE_ID")
+        pane_type = self.adapter.show_pane_option(pane_id, "@PANE_TYPE")
+        policy = seat_vacancy_policy(pane_label, pane_type)
+        if policy is not SeatVacancyPolicy.MUST_FILL:
+            return {
+                "ok": True,
+                "action": "ignored",
+                "reason": f"not_must_fill:{pane_label or pane_type or 'unknown'}",
+                "pane_label": pane_label,
+            }
+
+        if pane_label in PERSONA_LABELS:
+            result = assert_instance(self.adapter, pane_label, session=session)
+            return {
+                "ok": bool(result.get("ok")),
+                "action": result.get("action") or "none",
+                "reason": result.get("reason") or "",
+                "pane_label": pane_label,
+            }
+
+        # Reservist seat: must-fill, but no persona launcher exists yet. The restart
+        # executor seats reservists; mid-session reservist refill is a follow-on.
+        return {
+            "ok": True,
+            "action": "noted",
+            "reason": "reservist_refill_followon",
+            "pane_label": pane_label,
+        }
 
     def resolve_agent(
         self, pane: str = "current", agent: str = "auto", *, default: str = "claude"
