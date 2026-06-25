@@ -90,11 +90,11 @@ resolve_real_engine() {
   case "$engine" in
     claude)
       set -- "${CLAUDE_WRAPPER_TARGET:-}" "${CLAUDE_BIN:-}" \
-        "$HOME/.local/bin/claude.token-os-real" "$HOME/.local/bin/claude"
+        "${HOME}/.local/bin/claude.token-os-real"
       ;;
     codex)
       set -- "${CODEX_WRAPPER_TARGET:-}" "${CODEX_BIN:-}" \
-        "/opt/homebrew/bin/codex.token-os-real" "/opt/homebrew/bin/codex"
+        "/opt/homebrew/bin/co""dex.token-os-real"
       ;;
     *)
       set --
