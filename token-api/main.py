@@ -995,7 +995,7 @@ class SessionDocMergeRequest(BaseModel):
 
 
 class NamingNudgeRequest(BaseModel):
-    """Stop-hook payload for active tab-name enforcement."""
+    """Manual/legacy payload for active tab-name enforcement."""
 
     session_id: str | None = None
     instance_id: str | None = None
@@ -1968,11 +1968,12 @@ def _build_naming_nudge_message(slug: str | None, has_session_doc: bool) -> str:
 
 @app.post("/api/orchestrator/naming_nudge")
 async def orchestrator_naming_nudge(request: NamingNudgeRequest):
-    """Nudge a stopped pane that still has a placeholder tab name.
+    """Nudge a pane that still has a placeholder tab name.
 
-    Thin HTTP wrapper (keybind + Claude's naming-nudge.sh Stop shim) around
-    ``_maybe_naming_nudge``. The shared core is idempotent for renamed panes
-    and capped to three nudges per instance.
+    Thin HTTP wrapper for manual/legacy callers around ``_maybe_naming_nudge``.
+    Normal delivery is server-side after the first real UserPromptSubmit. The
+    shared core is idempotent for renamed panes and capped to three nudges per
+    instance.
     """
     return await _maybe_naming_nudge(request.instance_id or request.session_id)
 
@@ -1982,9 +1983,9 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
 
     Idempotent for renamed panes (no-op via ``_is_placeholder_tab_name``),
     guarded against duplicate pending nudges, and capped to three nudges per
-    instance. Engine-agnostic: invoked both by the HTTP wrapper above and
-    server-side on the Stop hook so Codex panes (which have no naming-nudge.sh)
-    get interviewed too. Durable writes go through sanctioned mutation helpers;
+    instance. Engine-agnostic: invoked by the first-prompt hook, the live-pane
+    reconciler belt-and-suspenders path, and the HTTP wrapper above for
+    manual/legacy callers. Durable writes go through sanctioned mutation helpers;
     the nudge count is derived from the append-only events table.
     """
     if not instance_id:
@@ -20442,6 +20443,29 @@ def _tab_name_session_doc_mismatch(tab_name: str | None, file_path: str | None) 
     return a not in b and b not in a
 
 
+def _schedule_reconciler_naming_nudge(instance_id: str | None) -> None:
+    """Best-effort naming interview from the live-pane reconciler.
+
+    The reconciler only decides that the row is live, placeholder-named, and has
+    prompt-submit evidence. The shared nudge core owns all repeat-suppression
+    gates (already named, pending queue item, per-instance cap).
+    """
+    if not instance_id:
+        return
+
+    async def _safe_nudge() -> None:
+        try:
+            await _maybe_naming_nudge(instance_id)
+        except Exception as exc:  # noqa: BLE001 - background repair must not kill worker
+            logger.warning(
+                "Reconciler naming nudge failed for %s: %s",
+                str(instance_id)[:12],
+                exc,
+            )
+
+    asyncio.create_task(_safe_nudge())
+
+
 async def _run_tmux_db_reconcile_cycle() -> dict:
     """Single reconciliation pass. Returns counts dict for telemetry."""
     counts = {
@@ -20450,6 +20474,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
         "superseded_duplicate": 0,
         "placeholder_tab_name_drift": 0,
         "tab_name_session_doc_mismatch": 0,
+        "naming_nudge_scheduled": 0,
     }
     # _read_tmux_panes is used ONLY as a tmux-reachability gate: None means tmux is
     # unreachable, so skip the cycle rather than mass-stop a live fleet. Its pane
@@ -20474,7 +20499,19 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
             """SELECT ci.id, ci.name AS tab_name, ci.session_doc_id,
                       ci.status, ci.last_activity, ci.workflow_blocked_reason,
                       ci.golden_throne, ci.rank, ci.zealotry,
-                      sd.file_path AS session_doc_path
+                      sd.file_path AS session_doc_path,
+                      EXISTS (
+                          SELECT 1 FROM events e
+                          WHERE e.instance_id = ci.id
+                            AND e.event_type = 'hook_user_prompt_submit'
+                          LIMIT 1
+                      ) AS has_prompt_submit,
+                      EXISTS (
+                          SELECT 1 FROM events e
+                          WHERE e.instance_id = ci.id
+                            AND e.event_type = 'naming_nudge_sent'
+                          LIMIT 1
+                      ) AS has_naming_nudge
                FROM instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
                WHERE ci.status NOT IN ('stopped', 'archived')
@@ -20482,8 +20519,19 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
             (LOCAL_DEVICE_NAME,),
         )
         rows = [dict(r) for r in await cursor.fetchall()]
+        naming_nudge_instance_ids: list[str] = []
 
         for row in rows:
+            row_is_live = row["id"] in live_ids
+            if (
+                row_is_live
+                and _is_placeholder_tab_name(row.get("tab_name"))
+                and not row.get("session_doc_id")
+                and row.get("has_prompt_submit")
+                and not row.get("has_naming_nudge")
+            ):
+                naming_nudge_instance_ids.append(row["id"])
+
             if not _reconcile_eligible(row, now):
                 continue
 
@@ -20495,7 +20543,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
             # live_ids and is stopped here. No stored pane means no pane_label_drift
             # to reconcile — the pane border reads @PANE_LABEL pushed from
             # instances.name by trigger.
-            if row["id"] not in live_ids:
+            if not row_is_live:
                 marker = row.get("golden_throne")
                 pane_vanished_updates = {
                     "status": "stopped",
@@ -20577,6 +20625,10 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
                 )
 
         await db.commit()
+
+    for instance_id in naming_nudge_instance_ids:
+        _schedule_reconciler_naming_nudge(instance_id)
+    counts["naming_nudge_scheduled"] = len(naming_nudge_instance_ids)
 
     # Emit deferred events after the reconciler's connection is closed so we
     # don't fight ourselves on the SQLite write lock.

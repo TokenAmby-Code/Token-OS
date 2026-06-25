@@ -1,37 +1,11 @@
 #!/bin/bash
 set -euo pipefail
-# naming-nudge.sh - thin Stop hook shim for active tab-name enforcement.
+# naming-nudge.sh - no-op compatibility stub.
+#
+# Naming is Token-API-owned: normal delivery happens after the first real
+# UserPromptSubmit, with the live-pane reconciler as a backstop. This file remains
+# only so stale Stop-hook configs and manual installs exit successfully without
+# sending post-exit rename prompts.
 
-INPUT=$(cat 2>/dev/null || echo "{}")
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-# Drop NAS mount roots that are not live so the `-f` probe below can't hang on a
-# stale SMB mount; resolution falls through to script-relative / localhost.
-if [[ -n "${IMPERIUM:-}" ]] && ! ls "${IMPERIUM}" >/dev/null 2>&1; then
-  IMPERIUM=""
-fi
-if [[ -n "${CIVIC:-}" ]] && ! ls "${CIVIC}" >/dev/null 2>&1; then
-  CIVIC=""
-fi
-for _nas_lib in \
-  "${TOKEN_OS:-}/cli-tools/lib/nas-path.sh" \
-  "${IMPERIUM:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
-  "${CIVIC:-}/runtimes/token-os/live/cli-tools/lib/nas-path.sh" \
-  "${SCRIPT_DIR}/../../cli-tools/lib/nas-path.sh" \
-  "${HOME}/runtimes/Token-OS/live/cli-tools/lib/nas-path.sh" \
-  "${HOME}/runtimes/token-os/live/cli-tools/lib/nas-path.sh"; do
-  if [[ -n "$_nas_lib" && -f "$_nas_lib" ]]; then
-    # shellcheck source=/dev/null
-    source "$_nas_lib" 2>/dev/null || true
-    break
-  fi
-done
-API_URL="${TOKEN_API_URL:-http://localhost:7777}"
-
-# Best-effort only: never block or fail the harness if token-api is unreachable.
-echo "$INPUT" | curl -s --connect-timeout 2 --max-time 5 \
-  -X POST "${API_URL}/api/orchestrator/naming_nudge" \
-  -H "Content-Type: application/json" \
-  -d @- >/dev/null 2>&1 || true
-
+cat >/dev/null 2>&1 || true
 exit 0

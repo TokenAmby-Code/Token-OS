@@ -45,7 +45,7 @@ from instance_mutation import (
     sanctioned_update_instance_record,
 )
 from instance_registry import LEGACY_PERSONA_ALIASES
-from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface
+from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface, is_placeholder_tab_name
 from personas import assign_astartes_persona, persona_to_profile
 from phone_service import _send_to_phone
 from questions_gate import trials_clear
@@ -255,8 +255,9 @@ _timer_engine: Any = None
 _timer_log_shift: Callable[..., Any] | None = None
 _run_stop_evaluators: Callable[..., Any] | None = None
 _auto_name_instance: Callable[..., Any] | None = None
-# Server-side naming interview (main._maybe_naming_nudge). Fired from generic
-# lifecycle boundaries so unnamed-pane detection is harness-agnostic.
+# Server-side naming interview (main._maybe_naming_nudge). Fired after the first
+# real UserPromptSubmit commit so deferred session-doc creation is visible before
+# the nudge message is built.
 _maybe_naming_nudge: Callable[..., Any] | None = None
 _work_action_callback: Callable[..., Any] | None = None
 _schedule_golden_throne_callback: Callable[..., Any] | None = None
@@ -315,13 +316,10 @@ def _require_dep(name: str, value):
 
 
 def _schedule_naming_nudge(instance_id: str | None, source: str) -> None:
-    """Best-effort unnamed-pane interview for any harness lifecycle event.
+    """Best-effort unnamed-pane interview for post-prompt naming enforcement.
 
-    Claude, Codex, wrapper-only launches, and future harnesses do not all emit
-    the same terminal hook set. Keep the policy here: if a lifecycle event sees
-    an instance that might still be reachable and unnamed, ask the shared
-    Token-API nudge core to decide. The core is idempotent and enforces the
-    placeholder/pending/cap gates.
+    The shared core is idempotent and enforces the placeholder/pending/cap gates;
+    this wrapper keeps hook response latency independent from pane delivery.
     """
     if not instance_id:
         return
@@ -2579,11 +2577,6 @@ async def handle_wrapper_end(payload: dict) -> dict:
                         )
                     except Exception:
                         pass
-    if stopped_instance_id:
-        # WrapperEnd is terminal for wrappers that may not emit Stop/SessionEnd
-        # (notably some Codex launches). Reuse the same generic nudge policy.
-        _schedule_naming_nudge(stopped_instance_id, "WrapperEnd")
-
     details["stopped_instance_id"] = stopped_instance_id
     await log_event("wrapper_end", instance_id=stopped_instance_id or None, details=details)
     return {
@@ -3211,7 +3204,6 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_mode=dispatch_mode,
                 )
                 await db.commit()
-
                 cursor = await db.execute(
                     """SELECT i.*, (SELECT slug FROM personas WHERE id = i.persona_id)
                               AS persona_slug
@@ -3648,7 +3640,6 @@ async def handle_session_start(payload: dict) -> dict:
                         "primarch": primarch_name or None,
                     },
                 )
-
                 return {
                     "success": True,
                     "action": "supplanted",
@@ -4391,10 +4382,6 @@ async def handle_session_end(payload: dict) -> dict:
                 },
             )
 
-        # Terminal SessionEnd is a harness-neutral chance to catch unnamed panes
-        # before close-time assertions/cleanup can clear runtime pane stamps.
-        _schedule_naming_nudge(session_id, "SessionEnd")
-
         try:
             if _stop_pane:
                 await asyncio.to_thread(shared.clear_pane_tint, _stop_pane, source="SessionEnd")
@@ -4753,6 +4740,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
         },
     )
     consumed_injections: list[dict] = []
+    should_schedule_naming_nudge = False
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
@@ -4761,6 +4749,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
         if not existing:
             return {"success": False, "action": "not_found"}
         existing_dict = dict(existing)
+        should_schedule_naming_nudge = is_placeholder_tab_name(existing_dict.get("name"))
         if await _stop_if_dead_pane(db, session_id, existing_dict, "PromptSubmit"):
             return {
                 "success": True,
@@ -4869,6 +4858,9 @@ async def handle_prompt_submit(payload: dict) -> dict:
                     "trigger": "first_prompt",
                 },
             )
+
+    if should_schedule_naming_nudge:
+        _schedule_naming_nudge(session_id, "UserPromptSubmit")
 
     if planning_event:
         await log_event("planning_state_changed", instance_id=session_id, details=planning_event)
@@ -5171,11 +5163,6 @@ async def handle_stop(payload: dict) -> dict:
                 actor="Stop",
             )
         await db.commit()
-
-    # Interview unnamed panes from the shared lifecycle helper. The policy is not
-    # Claude- or Codex-specific; the nudge core self-guards on placeholder name,
-    # missing pane, duplicate pending request, and the 3-nudge cap.
-    _schedule_naming_nudge(session_id, "Stop")
 
     # Trinity Chunk 1: resolve any open `talk` pairs awaiting natural-stop
     # slash-copy of this target's final response. Fires for every Stop hook —
