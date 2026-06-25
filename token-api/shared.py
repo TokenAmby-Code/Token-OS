@@ -505,7 +505,7 @@ async def tmux_pane_exists(tmux_pane: str | None) -> bool:
 
 # ── Persona pane tint (event-driven) ────────────────────────────────────────
 # Pane background colour is resolved from canonical instances.persona_id →
-# personas.pane_tint and applied only with `tmux select-pane -P bg=...`.
+# personas.pane_tint and applied by setting per-pane style options directly.
 # Claude slash-color is not used.
 
 
@@ -544,9 +544,11 @@ def apply_pane_tint(
         ).strip()
         if voice_locked == "1":
             return
-        # select-pane -P is camera-neutral (style only) — no focus snapshot or
-        # restore needed around it.
-        adapter.run("select-pane", "-t", tmux_pane, "-P", f"bg={bg}", allow_failure=True)
+        # Tint is pane style, not focus.  Do not route this through
+        # `select-pane -P`: tmux selects the target pane and clears native zoom
+        # as a side effect, which matches live SessionStart/PostCompact focus
+        # snap reports during tint/assertion churn.
+        adapter.set_pane_tint(tmux_pane, bg)
     except Exception as exc:
         logger.warning("pane tint failed for %s (bg=%s): %s", tmux_pane, bg, exc)
 

@@ -637,6 +637,23 @@ def _stop_rows(rows, *, pane_id: str, pane_label: str, reason: str) -> None:
             )
 
 
+def _set_pane_tint(adapter: TmuxAdapter, pane_id: str, bg: str) -> None:
+    """Set pane tint through TmuxAdapter when available, with a fake-adapter
+    fallback for pure unit tests that only implement ``run``.
+    """
+    setter = getattr(adapter, "set_pane_tint", None)
+    if callable(setter):
+        setter(pane_id, bg)
+        return
+    if not bg or bg == "default":
+        adapter.run("set-option", "-pu", "-t", pane_id, "window-style", allow_failure=True)
+        adapter.run("set-option", "-pu", "-t", pane_id, "window-active-style", allow_failure=True)
+        return
+    style = f"bg={bg}"
+    adapter.run("set-option", "-p", "-t", pane_id, "window-style", style, allow_failure=True)
+    adapter.run("set-option", "-p", "-t", pane_id, "window-active-style", style, allow_failure=True)
+
+
 def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec) -> None:
     current = adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
     if current != pane_id:
@@ -652,17 +669,15 @@ def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec)
     if voice_locked == "1":
         return
     if spec.persona == "custodes":
-        adapter.run("select-pane", "-t", pane_id, "-P", "bg=#302800", allow_failure=True)
+        _set_pane_tint(adapter, pane_id, "#302800")
     elif spec.persona == "fabricator-general":
-        adapter.run("select-pane", "-t", pane_id, "-P", "bg=#300808", allow_failure=True)
+        _set_pane_tint(adapter, pane_id, "#300808")
 
 
 def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:
     """Clear close-time pane chrome/state without touching durable pane identity."""
-    current = adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
     pane_label = adapter.show_pane_option(pane_id, "@PANE_ID")
-    if current == pane_id:
-        adapter.run("select-pane", "-t", pane_id, "-P", "bg=default", allow_failure=True)
+    _set_pane_tint(adapter, pane_id, "default")
     adapter.run("select-pane", "-t", pane_id, "-T", "", allow_failure=True)
     adapter.run(
         "set-option", "-p", "-t", pane_id, "@PANE_TITLE_SUPPRESS", "true", allow_failure=True

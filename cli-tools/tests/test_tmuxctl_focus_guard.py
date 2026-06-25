@@ -100,7 +100,13 @@ class FakeTmuxServer:
             return out + "\n"
         if cmd == "select-window":
             self.window = argv[argv.index("-t") + 1]
-        elif cmd == "select-pane" and "-t" in argv and "-P" not in argv and "-T" not in argv:
+        elif (
+            cmd == "select-pane"
+            and "-t" in argv
+            and not ("-T" in argv and "-Z" not in argv and "-P" not in argv)
+        ):
+            # Real tmux selects the target for `select-pane -P` and for
+            # select/zoom combinations even when they also set a title.
             pane = argv[argv.index("-t") + 1]
             self.pane = pane
             self.window = self.pane_window.get(pane, self.window)
@@ -144,23 +150,66 @@ def test_preserve_focus_restores_window_and_pane_after_automation_snap() -> None
 def test_preserve_focus_skips_restore_when_op_never_moved_camera(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The live resnap bug: a camera-neutral op (tint, option write) must not
-    yank the human back to a stale start-of-op snapshot when they navigated
-    mid-operation."""
+    """A genuinely camera-neutral option write must not yank the human back to
+    a stale start-of-op snapshot when they navigated mid-operation."""
     server = FakeTmuxServer()
     server.patch_into(monkeypatch)
     adapter = TmuxAdapter(tmux_binary="tmux")
 
     with preserve_focus(adapter, source="SessionEnd", attempted_target="%1"):
-        adapter.run("select-pane", "-t", "%1", "-P", "bg=colour52", allow_failure=True)
+        adapter.run(
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            "window-style",
+            "bg=colour52",
+            allow_failure=True,
+        )
         server.human_moves_to("%2")
 
     assert server.pane == "%2", "human's camera position must stand"
     assert server.window == "main:2"
-    assert not any(
-        argv[0] in {"select-window", "select-pane"} and "-P" not in argv for argv in server.argv_log
-    ), "no restore commands may be issued for a camera-neutral op"
+    assert not any(argv[0] in {"select-window", "select-pane"} for argv in server.argv_log), (
+        "no restore commands may be issued for a camera-neutral op"
+    )
     assert not any(event["event"] == "restored" for event in _general_log_events())
+
+
+def test_preserve_focus_treats_select_pane_title_plus_zoom_as_camera_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FakeTmuxServer()
+    server.patch_into(monkeypatch)
+    adapter = TmuxAdapter(tmux_binary="tmux")
+
+    with preserve_focus(adapter, source="title-plus-zoom", attempted_target="%2"):
+        adapter.run("select-pane", "-t", "%2", "-Z", "-T", "worker", allow_failure=True)
+
+    assert server.window == "main:1"
+    assert server.pane == "%1"
+    assert ("select-window", "-t", "main:1") in server.argv_log
+
+
+def test_preserve_focus_treats_select_pane_style_as_camera_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real tmux selects the target and clears zoom for `select-pane -P`; this
+    must be classified as focus-mutating until production callers stop using it."""
+    server = FakeTmuxServer()
+    server.zoomed_windows.add("main:1")
+    server.patch_into(monkeypatch)
+    adapter = TmuxAdapter(tmux_binary="tmux")
+
+    with preserve_focus(adapter, source="style-regression", attempted_target="%2"):
+        adapter.run("select-pane", "-t", "%2", "-P", "bg=colour52", allow_failure=True)
+
+    assert server.window == "main:1"
+    assert server.pane == "%1"
+    assert "main:1" in server.zoomed_windows
+    assert ("select-window", "-t", "main:1") in server.argv_log
+    assert ("select-pane", "-Z", "-t", "%1") in server.argv_log
+    assert any(event["event"] == "restored" for event in _general_log_events())
 
 
 def test_preserve_focus_restores_when_op_displaced_camera(monkeypatch: pytest.MonkeyPatch) -> None:

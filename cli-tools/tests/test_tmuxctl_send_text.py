@@ -101,20 +101,58 @@ def test_focus_guard_allow_env_opens_override_and_executes(monkeypatch):
     assert ["tmux", "select-pane", "-t", "%42"] in calls
 
 
-def test_automation_focus_guard_does_not_block_style_changes(monkeypatch):
+def test_automation_focus_guard_does_not_block_style_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     adapter = TmuxAdapter(tmux_binary="tmux")
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setenv("IMPERIUM_TMUX_AUTOMATION", "1")
     monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
 
-    adapter.run("select-pane", "-t", "%42", "-P", "bg=default")
+    adapter.run("set-option", "-p", "-t", "%42", "window-style", "bg=#300808")
 
-    assert calls == [["tmux", "select-pane", "-t", "%42", "-P", "bg=default"]]
+    assert calls == [["tmux", "set-option", "-p", "-t", "%42", "window-style", "bg=#300808"]]
+
+
+def test_set_pane_tint_uses_pane_options_not_select_pane(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    adapter.set_pane_tint("%42", "#300808")
+
+    assert calls == [
+        ["tmux", "set-option", "-p", "-t", "%42", "window-style", "bg=#300808"],
+        ["tmux", "set-option", "-p", "-t", "%42", "window-active-style", "bg=#300808"],
+    ]
+
+
+def test_clear_pane_tint_unsets_pane_style_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    adapter.set_pane_tint("%42", "default")
+
+    assert calls == [
+        ["tmux", "set-option", "-pu", "-t", "%42", "window-style"],
+        ["tmux", "set-option", "-pu", "-t", "%42", "window-active-style"],
+    ]
 
 
 def test_automation_focus_guard_blocks_non_mechanicus_select_pane(monkeypatch):

@@ -84,6 +84,7 @@ RUNTIME_PANE_OPTIONS = (
     "@TOKEN_API_LAUNCH_MODE",
     "@TOKEN_API_TARGET_WORKING_DIR",
 )
+PANE_STYLE_OPTIONS = ("window-style", "window-active-style")
 
 
 def normalize_prompt_payload(text: str) -> str:
@@ -186,6 +187,23 @@ def _has_flag(args: list[str] | tuple[str, ...], flag: str) -> bool:
     return any(arg == flag or (arg.startswith(flag) and arg != flag) for arg in args[1:])
 
 
+def _select_pane_title_only(args: list[str] | tuple[str, ...]) -> bool:
+    """True only for select-pane calls whose sole pane-affecting action is -T."""
+    if not any(arg == "-T" or (arg.startswith("-T") and arg != "-T") for arg in args[1:]):
+        return False
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg in {"-t", "-T"}:
+            i += 2
+            continue
+        if (arg.startswith("-t") and arg != "-t") or (arg.startswith("-T") and arg != "-T"):
+            i += 1
+            continue
+        return False
+    return True
+
+
 def _camera_mutating(args: list[str] | tuple[str, ...]) -> bool:
     """Whether a resolved tmux command can move the client's camera.
 
@@ -199,8 +217,10 @@ def _camera_mutating(args: list[str] | tuple[str, ...]) -> bool:
         return False
     command = args[0]
     if command == "select-pane":
-        # select-pane -P/-T changes pane style/title, not the active camera.
-        return not any(arg in ("-P", "-T") for arg in args[1:])
+        # `select-pane -T` only sets a title when it is the sole pane-affecting
+        # action.  `select-pane -P` looks like style state, but tmux still selects
+        # the target pane and clears native zoom when the target is not active.
+        return not _select_pane_title_only(args)
     if command in {"select-window", "switch-client"}:
         return True
     if command in {"split-window", "new-window", "join-pane", "break-pane"}:
@@ -278,8 +298,10 @@ class TmuxAdapter:
         target = ""
         focus_command = False
         if command == "select-pane":
-            # select-pane -P/-T changes pane style/title, not the active camera.
-            if any(arg == "-P" or arg == "-T" for arg in args[1:]):
+            # `select-pane -T` is title-only only by itself.  `select-pane -P` and
+            # `select-pane -Z ... -T ...` select/zoom as side effects, so guard
+            # them like ordinary select-pane calls.
+            if _select_pane_title_only(args):
                 return False
             target = _target_arg(args)
             if not target:
@@ -346,11 +368,39 @@ class TmuxAdapter:
         return proc.stdout
 
     def clear_pane_style(self, target: str) -> None:
-        """Clear pane tint/title overlays. Best-effort and camera-neutral."""
+        """Clear pane tint/title overlays. Best-effort and camera-neutral.
+
+        Do not use ``select-pane -P`` here.  It is named like a focus command,
+        trips human-facing audits, and has been suspected in live focus
+        rubber-banding.  Pane tint is just per-pane style state, so mutate the
+        pane options directly through raw tmux instead.
+        """
         if not target:
             return
-        self._run_raw_tmux(["select-pane", "-t", target, "-P", "bg=default"])
+        target = self._resolve_pane_target_arg(target)
+        for option in PANE_STYLE_OPTIONS:
+            self._run_raw_tmux(["set-option", "-pu", "-t", target, option])
         self._run_raw_tmux(["select-pane", "-t", target, "-T", ""])
+
+    def clear_pane_tint(self, target: str) -> None:
+        """Clear only pane background tint without touching the pane title."""
+        if not target:
+            return
+        target = self._resolve_pane_target_arg(target)
+        for option in PANE_STYLE_OPTIONS:
+            self._run_raw_tmux(["set-option", "-pu", "-t", target, option])
+
+    def set_pane_tint(self, target: str, bg: str) -> None:
+        """Apply or clear a pane background tint without selecting the pane."""
+        if not target:
+            return
+        target = self._resolve_pane_target_arg(target)
+        if not bg or bg == "default":
+            self.clear_pane_tint(target)
+            return
+        style = f"bg={bg}"
+        for option in PANE_STYLE_OPTIONS:
+            self._run_raw_tmux(["set-option", "-p", "-t", target, option, style])
 
     def clear_runtime_state(self, target: str) -> None:
         """Clear runtime stamps and pane close/assertion chrome together."""
