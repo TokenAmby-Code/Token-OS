@@ -73,7 +73,9 @@ def test_detector_walks_bash_wrapper_to_claude():
         ("/opt/homebrew/bin/node /opt/homebrew/bin/codex", False),
     ],
 )
-def test_detector_matches_execd_agent_as_pane_pid_with_no_children(command, is_claude):
+def test_detector_matches_execd_agent_as_pane_pid_with_no_children(
+    command: str, is_claude: bool
+) -> None:
     children, commands = _tree(
         parent_pid=19448,
         descendants={
@@ -88,7 +90,7 @@ def test_detector_matches_execd_agent_as_pane_pid_with_no_children(command, is_c
         assert pane_has_active_claude(25905) is is_claude
 
 
-def test_detector_false_for_execd_bare_shell_as_pane_pid():
+def test_detector_false_for_execd_bare_shell_as_pane_pid() -> None:
     # Negative: an exec'd-style pane whose pane_pid IS a bare login shell (no agent
     # anywhere) must still read not-live — the seeded-pane-pid walk must not
     # false-positive on the shell itself and let the retire/respawn guards misfire.
