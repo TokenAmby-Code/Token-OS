@@ -1981,7 +1981,6 @@ async def _cleanup_tmux_pane_runtime_stamps(pane: str) -> None:
         "@ACTIVE_TITLE",
         "@PROGRESS_TITLE",
         "@PANE_PROGRESS",
-        "@PANE_TITLE_SUPPRESS",
         "@TTS_STATE",
         "@CONTEXT_INFO",
         "@STACK_PENDING",

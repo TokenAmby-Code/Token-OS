@@ -170,11 +170,12 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
 
 
-def test_persona_is_statusline_not_pane_border_nametag() -> None:
-    """Persona displays in generic status-left; pane border nametag shows instance name.
+def test_persona_renders_in_both_statusline_and_pane_border_nametag() -> None:
+    """Persona displays in generic status-left AND in the pane-border nametag.
 
-    The blue pane-border box must read @PANE_LABEL (for values like needs-name),
-    never @PERSONA. It also must not fall back to pane_title/hostname.
+    Post-WS3 (blank-default identity) the blue pane-border box reads @PERSONA with
+    precedence over @PANE_LABEL (the instance name, for values like needs-name), and
+    renders blank when neither is stamped — never a pane_title/hostname fallback.
     """
     status_left = _line_starting("set -g status-left ")
     assert "#S" in status_left
@@ -182,7 +183,7 @@ def test_persona_is_statusline_not_pane_border_nametag() -> None:
 
     border = _line_starting("set -g pane-border-format ")
     assert "@PANE_LABEL" in border
-    assert "@PERSONA" not in border
+    assert "@PERSONA" in border
     assert "pane_title" not in border
     assert "@PANE_TITLE_SUPPRESS" not in border
     for expected in (
@@ -237,6 +238,37 @@ def test_keystroke_lock_enter_clears_lock_and_submits() -> None:
         line = _line_starting(f"bind -n {key} ")
         assert "set -pu @TYPING_LOCK_UNTIL" in line, f"{key} must UNSET the pane lock"
         assert "send-keys" in line, f"{key} must still pass through (submit)"
+
+
+def test_pane_border_identity_is_blank_by_default() -> None:
+    """A clean pane (no agent) shows NO nametag.
+
+    Regression: the border used to fall through to `#{pane_title}` (the machine
+    hostname) whenever neither @PERSONA nor @PANE_LABEL was stamped, gated by a
+    @PANE_TITLE_SUPPRESS flag that was never set. The fix makes blank the DEFAULT:
+    the identity segment renders an agent tag ONLY when @PERSONA or @PANE_LABEL is
+    stamped, and renders empty otherwise — no hostname fallback, no suppress flag.
+    """
+    border = _line_starting("set -g pane-border-format ")
+    # Agent identity still renders: persona takes precedence over the pane label.
+    assert "#{?@PERSONA," in border
+    assert "#{@PERSONA}" in border
+    assert "#{?@PANE_LABEL," in border
+    assert "#{@PANE_LABEL}" in border
+    # The @PANE_LABEL false-branch is empty — neither the hostname fallback nor the
+    # retired suppress flag may reappear.
+    assert "#{pane_title}" not in border, "hostname #{pane_title} fallback must be gone"
+    assert "@PANE_TITLE_SUPPRESS" not in border, "retired suppress flag must be gone"
+    # Structural proof of blank-by-default: the @PANE_LABEL conditional closes with
+    # an empty false-branch (`,}`) directly into the @GUARD segment.
+    assert "#{@PANE_LABEL} #[default],}}#{?@GUARD," in border
+
+
+def test_pane_title_suppress_concept_is_fully_retired() -> None:
+    """@PANE_TITLE_SUPPRESS must not survive anywhere in the tmux config: not in the
+    border format, not in comments documenting the (now-removed) inverted default."""
+    conf = CONF.read_text(encoding="utf-8")
+    assert "@PANE_TITLE_SUPPRESS" not in conf
 
 
 def test_portable_status_guard_indicator_is_also_per_pane() -> None:

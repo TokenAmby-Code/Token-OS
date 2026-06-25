@@ -679,9 +679,9 @@ def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:
     pane_label = adapter.show_pane_option(pane_id, "@PANE_ID")
     _set_pane_tint(adapter, pane_id, "default")
     adapter.run("select-pane", "-t", pane_id, "-T", "", allow_failure=True)
-    adapter.run(
-        "set-option", "-p", "-t", pane_id, "@PANE_TITLE_SUPPRESS", "true", allow_failure=True
-    )
+    # Clearing @PANE_LABEL (via PANE_CLOSE_TRANSIENT_OPTIONS below) is sufficient to
+    # blank the border: the format renders the identity segment empty when neither
+    # @PERSONA nor @PANE_LABEL is set (blank-by-default, no @PANE_TITLE_SUPPRESS flag).
     for option in PANE_CLOSE_TRANSIENT_OPTIONS:
         adapter.run("set-option", "-pu", "-t", pane_id, option, allow_failure=True)
     if pane_label not in PERSONA_LABELS:
