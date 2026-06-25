@@ -25,14 +25,18 @@ Design (locked decisions):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
+import os
 import re
 import signal
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -40,9 +44,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from . import typing_guard_state
 from .api import RegistryError
+from .send_gate import thread_local_override
 from .service import TmuxControlPlane
-from .tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated, prompt_payload_hash
+from .tmux_adapter import (
+    TmuxAdapter,
+    TmuxError,
+    TmuxSendGated,
+    normalize_prompt_payload,
+    prompt_payload_hash,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7778
@@ -371,6 +383,76 @@ def _h_send_keys(control, params):
     return {"pane": pane, "sent": True}
 
 
+# The captured composer slice we fingerprint for the white-whale "submit
+# swallowed as a prompt newline" failure. A short head of the payload is enough
+# to confirm the bytes landed in the composer.
+_SWALLOW_NEEDLE_LEN = 48
+
+
+def _detect_swallowed_submit(capture: str, payload: str) -> bool:
+    """Heuristic: did the TUI swallow the Enter into the prompt body?
+
+    The white-whale failure (live Codex/Claude repro) is: the literal payload
+    bytes land in the composer, but the C-m that should submit is ingested as a
+    newline *inside* the draft instead. The capture signature is therefore (a) a
+    representative head of the submitted payload still sitting in the composer
+    AND (b) the captured composer region ending in a trailing newline (the
+    swallowed Enter left the cursor on a fresh line rather than submitting).
+
+    A clean submit leaves an empty composer (needle absent) — returns False, so
+    the recovery C-m is fired only when there is real evidence of a stuck draft.
+    Tuning the exact composer fingerprint against each TUI is a follow-on; the
+    behavioral contract this guards is: detect → still recover → surface loudly.
+    """
+    if not capture or not payload:
+        return False
+    needle = normalize_prompt_payload(payload).strip()[:_SWALLOW_NEEDLE_LEN]
+    if not needle or needle not in capture:
+        return False
+    return capture.endswith("\n")
+
+
+def _notify_swallowed_submit(*, pane_public: str, instance_id: str, payload_hash: str) -> None:
+    """Surface a swallowed-submit recovery on the human notify path (best-effort).
+
+    The loud surfacing of record is the ``logger.warning`` at the call site; this
+    additionally routes a notice to token-api's ``/api/notify`` (TTS/Discord
+    router) so the recovery is reported, not silently eaten (per the
+    no-error-suppressing-debounce / surface-don't-suppress discipline). Failure
+    to notify must never break the send path, so all errors are swallowed here
+    AFTER the warning has already been logged.
+    """
+    base = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+    target = pane_public if pane_public and pane_public != "unresolved" else "a pane"
+    message = (
+        f"tmuxctld recovered a swallowed submit on {target}"
+        f"{f' (instance {instance_id})' if instance_id else ''} — "
+        "Enter was ingested as a prompt newline; recovery C-m fired."
+    )
+    body = json.dumps(
+        {
+            "message": message,
+            "vibe": "alert",
+            "instance_id": instance_id or None,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base}/api/notify",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2.0):
+            pass
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log.warning(
+            "tmuxctld: swallowed-submit notify failed hash=%s (surfaced via log only): %s",
+            payload_hash,
+            exc,
+        )
+
+
 def _h_send_text(control, params):
     pane = _s(params, "pane")
     text = _s(params, "text")
@@ -399,37 +481,45 @@ def _h_send_text(control, params):
     except Exception:
         instance_id = ""
 
-    started = time.monotonic()
-    if hasattr(control.adapter, "send_text_then_submit"):
-        control.adapter.send_text_then_submit(
-            pane,
-            text,
-            clear_prompt=clear_prompt,
-            pre_submit_keys=pre_submit_keys,
-            submit_settle_seconds=submit_settle_seconds,
+    # Resolve the physical pane id once for the guard + capture ops. tmux pane
+    # options (@TYPING_AGENT_UNTIL) and capture-pane key off the real %NN; the
+    # caller-supplied id may be a canonical page:id. _resolve is a no-op on a raw
+    # %NN, so it is safe either way and tolerant of resolver failure.
+    try:
+        phys_pane = control.adapter._resolve_pane_target_arg(pane)
+    except Exception:
+        phys_pane = pane
+
+    # Hold the typing guard (green ⌨ AGENT state) for the handshake window so
+    # concurrent sends to this pane delay behind it (state-blind, the existing
+    # gate path). Budget the hold to outlast the worst-case send+verify+retry.
+    hold_seconds = max(
+        8,
+        int(verify_timeout * (max(0, ack_submit_retries) + 1) + submit_settle_seconds * 4) + 2,
+    )
+    held = False
+    try:
+        held = bool(
+            typing_guard_state.hold(
+                typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+                phys_pane,
+                seconds=hold_seconds,
+                now=typing_guard_state.now_epoch(),
+            )
         )
-    else:
-        normalized = re.sub(r"[\r\n]+", " ", text).rstrip()
-        if not normalized.strip():
-            raise ValueError("prompt payload is empty after normalization")
-        if clear_prompt:
-            control.adapter.send_keys(pane, "C-u")
-        control.adapter.run("send-keys", "-t", pane, "-l", normalized)
-        gate = getattr(control.adapter, "last_send_gate_result", None)
-        if gate and gate.get("suppressed"):
-            raise TmuxSendGated(gate)
-        # Test-adapter fallback. Real daemon sends use TmuxAdapter's canonical
-        # method above; callers must not assemble send-keys outside tmuxctld.
-        if submit_settle_seconds > 0:
-            time.sleep(submit_settle_seconds)
-        for key in pre_submit_keys:
-            control.adapter.send_keys(pane, key)
-        if pre_submit_keys and submit_settle_seconds > 0:
-            time.sleep(submit_settle_seconds)
-        control.adapter.send_keys(pane, "C-m")
-        if submit_settle_seconds > 0:
-            time.sleep(submit_settle_seconds)
-        control.adapter.send_keys(pane, "C-m")
+    except Exception as exc:  # tmux unreachable / no live server (e.g. unit tests)
+        log.debug("tmuxctld: agent-guard hold skipped pane=%s: %s", phys_pane, exc)
+        held = False
+
+    # When we hold, pierce our OWN agent lock so the send we just guarded is not
+    # delayed by the green state we set — thread-locally, so a concurrent send to
+    # another pane on another worker thread is never granted the pierce (and so
+    # never stomps a human lock there). When the hold was DENIED (a live human
+    # on/pending lock), we do NOT pierce: the send routes through the normal gate
+    # and delays behind the human, never stomping the Emperor's keystrokes.
+    override_ctx = (
+        thread_local_override("tmuxctld-send-holder") if held else contextlib.nullcontext()
+    )
 
     def _send_submit_key() -> None:
         if hasattr(control.adapter, "send_keys"):
@@ -437,24 +527,108 @@ def _h_send_text(control, params):
         else:
             control.adapter.run("send-keys", "-t", pane, "C-m")
 
+    started = time.monotonic()
     ack = None
-    if verify:
-        for attempt in range(max(0, ack_submit_retries) + 1):
-            ack = _PROMPT_SUBMIT_SNIFFER.wait(
-                instance_id=instance_id,
-                payload_hash=payload_hash,
-                since=started,
-                timeout=verify_timeout,
-            )
-            if ack or attempt >= max(0, ack_submit_retries):
-                break
-            # Handshake recovery: if the TUI swallowed the prior submit as a
-            # prompt newline, a later standalone carriage return is the proven
-            # white-whale recovery key. The daemon owns this retry; callers do
-            # not pile on their own raw send-keys.
-            _send_submit_key()
-            if submit_settle_seconds > 0:
-                time.sleep(submit_settle_seconds)
+    swallowed_submit_detected = False
+    recovery_attempts = 0
+    failures: list[dict] = []
+    try:
+        with override_ctx:
+            if hasattr(control.adapter, "send_text_then_submit"):
+                control.adapter.send_text_then_submit(
+                    pane,
+                    text,
+                    clear_prompt=clear_prompt,
+                    pre_submit_keys=pre_submit_keys,
+                    submit_settle_seconds=submit_settle_seconds,
+                )
+            else:
+                normalized = re.sub(r"[\r\n]+", " ", text).rstrip()
+                if not normalized.strip():
+                    raise ValueError("prompt payload is empty after normalization")
+                if clear_prompt:
+                    control.adapter.send_keys(pane, "C-u")
+                control.adapter.run("send-keys", "-t", pane, "-l", normalized)
+                gate = getattr(control.adapter, "last_send_gate_result", None)
+                if gate and gate.get("suppressed"):
+                    raise TmuxSendGated(gate)
+                # Test-adapter fallback. Real daemon sends use TmuxAdapter's
+                # canonical method above; callers must not assemble send-keys
+                # outside tmuxctld.
+                if submit_settle_seconds > 0:
+                    time.sleep(submit_settle_seconds)
+                for key in pre_submit_keys:
+                    control.adapter.send_keys(pane, key)
+                if pre_submit_keys and submit_settle_seconds > 0:
+                    time.sleep(submit_settle_seconds)
+                control.adapter.send_keys(pane, "C-m")
+                if submit_settle_seconds > 0:
+                    time.sleep(submit_settle_seconds)
+                control.adapter.send_keys(pane, "C-m")
+
+            if verify:
+                for attempt in range(max(0, ack_submit_retries) + 1):
+                    ack = _PROMPT_SUBMIT_SNIFFER.wait(
+                        instance_id=instance_id,
+                        payload_hash=payload_hash,
+                        since=started,
+                        timeout=verify_timeout,
+                    )
+                    if ack or attempt >= max(0, ack_submit_retries):
+                        break
+                    # Handshake recovery: the prior submit was not acknowledged.
+                    # Pane-sniff FIRST — if the composer still holds the draft
+                    # with a swallowed Enter (trailing newline), that is the
+                    # white-whale failure: surface it loudly instead of silently
+                    # eating it, but STILL fire the recovery C-m to sink the
+                    # stuck draft. The daemon owns this retry; callers do not pile
+                    # on their own raw send-keys.
+                    capture = ""
+                    try:
+                        capture = control.adapter.capture_pane(phys_pane, lines=12)
+                    except Exception as exc:
+                        log.debug("tmuxctld: capture-pane failed pane=%s: %s", phys_pane, exc)
+                    if _detect_swallowed_submit(capture, text):
+                        swallowed_submit_detected = True
+                        pane_public = _safe_public_role(pane)
+                        log.warning(
+                            "tmuxctld send: SWALLOWED SUBMIT pane=%s instance=%s hash=%s — "
+                            "draft present in composer with trailing newline; firing recovery "
+                            "C-m and surfacing (not eaten)",
+                            pane_public,
+                            instance_id,
+                            payload_hash,
+                        )
+                        failures.append(
+                            {
+                                "type": "swallowed_submit",
+                                "attempt": attempt + 1,
+                                "detail": "Enter ingested as prompt newline; recovery C-m fired",
+                            }
+                        )
+                        _notify_swallowed_submit(
+                            pane_public=pane_public,
+                            instance_id=instance_id,
+                            payload_hash=payload_hash,
+                        )
+                    _send_submit_key()
+                    recovery_attempts += 1
+                    if submit_settle_seconds > 0:
+                        time.sleep(submit_settle_seconds)
+    finally:
+        # The guard must never leak green past the handshake. Release only what
+        # we acquired (release clears @TYPING_AGENT_UNTIL only and re-projects a
+        # human lock that may have arrived mid-hold via expire_pane semantics).
+        if held:
+            try:
+                typing_guard_state.release(
+                    typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+                    phys_pane,
+                    now=typing_guard_state.now_epoch(),
+                )
+            except Exception as exc:
+                log.warning("tmuxctld: agent-guard release failed pane=%s: %s", phys_pane, exc)
+
     verification_status = "submitted" if ack else ("unverified" if verify else "not_requested")
     return {
         "status": "submitted" if ack else "unverified",
@@ -465,6 +639,10 @@ def _h_send_text(control, params):
         "verification_status": verification_status,
         "verified_by": "UserPromptSubmit" if ack else None,
         "ack": ack,
+        "guard_held": held,
+        "swallowed_submit_detected": swallowed_submit_detected,
+        "recovery_attempts": recovery_attempts,
+        "failures": failures,
     }
 
 

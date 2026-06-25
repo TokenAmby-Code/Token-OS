@@ -14,10 +14,25 @@ import time
 import urllib.error
 import urllib.request
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import daemon
+
+
+@pytest.fixture(autouse=True)
+def _no_live_tmux_guard(monkeypatch):
+    """No daemon test may touch a live tmux server (hook-tests-no-live-tmux).
+
+    ``_h_send_text`` now acquires/releases the typing-guard AGENT hold, which
+    shells real tmux. Stub it module-wide so the default is "hold DENIED"
+    (held=False) — the no-live-tmux outcome — keeping every existing send-path
+    assertion unchanged. Tests exercising the hold explicitly re-patch these.
+    """
+    monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: False)
+    monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
 
 
 class StubAdapter:
@@ -387,5 +402,158 @@ def test_malformed_content_length_is_bad_request() -> None:
         status_line, _, body = raw.partition("\r\n\r\n")
         assert "400" in status_line.splitlines()[0]
         assert json.loads(body)["error"]["code"] == "bad_request"
+    finally:
+        server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Agent-guard hold (B1) + loud swallowed-submit recovery (B2)
+# ---------------------------------------------------------------------------
+
+
+class StuckDraftAdapter:
+    """send-keys recorded; capture-pane returns a stuck draft (Enter swallowed).
+
+    The composer still holds the payload head AND ends in a trailing newline —
+    the white-whale signature ``_detect_swallowed_submit`` matches. The sniffer
+    is never fed an ack, so the verify loop exhausts its retries.
+    """
+
+    calls: list[tuple[str, ...]] = []
+
+    def __init__(self) -> None:
+        self.last_send_gate_result = None
+
+    def list_sessions(self) -> list:
+        return []
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        type(self).calls.append(tuple(args))
+        return ""
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+    def capture_pane(self, pane_id: str, *, lines: int = 10) -> str:
+        return "do the thing\n"
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        return "inst-stuck" if option == "@INSTANCE_ID" else ""
+
+
+def test_agent_guard_hold_acquired_and_released_even_when_verify_times_out(monkeypatch) -> None:
+    # The hold is taken before the send and released in `finally` even when no
+    # ack ever arrives (verify times out) — the guard must never leak green.
+    SendAckAdapter.calls = []
+    events: list[str] = []
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "hold", lambda *a, **k: events.append("hold") or True
+    )
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "release", lambda *a, **k: events.append("release")
+    )
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+        assert result["guard_held"] is True
+        assert result["verification_status"] == "unverified"
+        assert events == ["hold", "release"], "hold acquired, then released in finally"
+    finally:
+        server.shutdown()
+
+
+def test_agent_guard_hold_denied_does_not_release_and_send_still_routes(monkeypatch) -> None:
+    # A live human lock denies the hold (held=False, the autouse default). The
+    # daemon must NOT force/release — the send still routes (through the normal
+    # gate, which would delay behind the human) and guard_held is False.
+    SendAckAdapter.calls = []
+    released: list[str] = []
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "release", lambda *a, **k: released.append("release")
+    )
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+        assert result["guard_held"] is False
+        assert released == [], "a denied hold must never call release"
+        assert ("send-keys", "-t", "%42", "-l", "do the thing") in SendAckAdapter.calls
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "capture,payload,expected",
+    [
+        ("do the thing\n", "do the thing", True),  # draft present + trailing newline
+        ("$ prompt> do the thing\n", "do the thing", True),  # head present inside composer
+        ("do the thing", "do the thing", False),  # no trailing newline → submitted/clean line
+        ("", "do the thing", False),  # empty composer → clean submit
+        ("unrelated shell output\n", "do the thing", False),  # payload absent
+        ("do the thing\n", "", False),  # empty payload never matches
+    ],
+)
+def test_detect_swallowed_submit(capture: str, payload: str, expected: bool) -> None:
+    assert daemon._detect_swallowed_submit(capture, payload) is expected
+
+
+def test_swallowed_submit_fires_recovery_and_surfaces_loudly(monkeypatch) -> None:
+    # The white-whale: bytes landed, Enter swallowed. The daemon must STILL fire
+    # the recovery C-m (sink the stuck draft) AND surface the failure loudly —
+    # never silently eat it.
+    StuckDraftAdapter.calls = []
+    notified: list[dict] = []
+    monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: True)
+    monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_notify_swallowed_submit", lambda **kw: notified.append(kw))
+    server, _ = _serve(StuckDraftAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "ack_submit_retries": 1,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+        assert result["swallowed_submit_detected"] is True
+        assert result["recovery_attempts"] >= 1
+        assert any(f["type"] == "swallowed_submit" for f in result["failures"])
+        # Recovery C-m still fired to sink the stuck draft.
+        assert ("send-keys", "-t", "%42", "C-m") in StuckDraftAdapter.calls
+        # And the failure was surfaced on the notify path, not eaten.
+        assert notified, "swallowed submit must be surfaced via notify"
     finally:
         server.shutdown()

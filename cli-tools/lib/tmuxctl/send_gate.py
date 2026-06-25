@@ -42,13 +42,16 @@ Design properties:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -488,10 +491,44 @@ def _extract_target(args: tuple[str, ...] | list[str]) -> str | None:
     return None
 
 
+# Per-thread sanctioned override. The daemon (``tmuxctld``) is a
+# ``ThreadingHTTPServer``: one request == one thread, and a holder that pierces
+# its OWN agent-guard hold around a send must not leak that pierce to a
+# concurrent send to a DIFFERENT pane on another thread (which could stomp a live
+# human lock there). A process-global ``os.environ`` override would do exactly
+# that, so the daemon sets the override thread-locally via
+# ``thread_local_override`` and ``sanctioned_override`` consults it FIRST.
+_thread_override = threading.local()
+
+
 def sanctioned_override() -> str | None:
-    """Return the sanctioned-send reason if one is set, else None."""
+    """Return the sanctioned-send reason if one is set, else None.
+
+    Precedence: a thread-local override (set by ``thread_local_override``) wins
+    over the process-global ``TMUX_SEND_GATE_ALLOW`` env, so a daemon worker
+    thread piercing its own hold never bleeds the pierce into other threads.
+    """
+    local_reason = getattr(_thread_override, "reason", None)
+    if local_reason:
+        return str(local_reason).strip() or None
     reason = os.environ.get(_SEND_GATE_ALLOW_ENV, "").strip()
     return reason or None
+
+
+@contextlib.contextmanager
+def thread_local_override(reason: str) -> Iterator[None]:
+    """Set a THREAD-LOCAL sanctioned override for the duration of the block.
+
+    Thread-local — not ``os.environ`` — because the daemon is threaded: a global
+    override would leak to concurrent sends to other panes and pierce a human
+    lock there. Restores the prior thread-local value on exit (nestable).
+    """
+    prev = getattr(_thread_override, "reason", None)
+    _thread_override.reason = str(reason).strip()
+    try:
+        yield
+    finally:
+        _thread_override.reason = prev
 
 
 def send_gate_policy(*, override: str | None = None, reason: str | None = None) -> str:
