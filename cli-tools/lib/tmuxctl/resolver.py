@@ -219,7 +219,9 @@ def resolve_pane_in_snapshot(workspace: WorkspaceSnapshot, target: str) -> PaneR
         current = next_pane
 
 
-def resolve_pane(adapter: TmuxAdapter, target: str) -> PaneResolution:
+def resolve_pane(
+    adapter: TmuxAdapter, target: str, session_name: str | None = None
+) -> PaneResolution:
     """Resolve physical ids, @PANE_ID roles, and positional pane addresses.
 
     Positional addresses are live runtime aliases such as ``1:N``:
@@ -228,12 +230,24 @@ def resolve_pane(adapter: TmuxAdapter, target: str) -> PaneResolution:
     restrict custom pane-target interception to numeric window indexes and the
     managed page prefixes so tmux window targets like ``session:palace`` pass
     through unchanged.
+
+    ``session_name`` pins which session the live snapshot is built from. The
+    restart path MUST pass it (directly or via the adapter's resolution pin):
+    the executor runs detached after parking clients into ``_stash`` and killing
+    the old leader, so the ambient ``current_session_name()`` no longer returns
+    the freshly rebuilt session and every public label would resolve against the
+    wrong session. Precedence: a physical ``%`` target's own session wins; then
+    the explicit ``session_name`` argument; then the adapter's resolution pin;
+    finally the ambient session for normal in-pane callers (back-compat).
     """
     if target.startswith("%"):
         first = _snapshot_from_live(adapter, target)
         session_name = first.session_name
     else:
-        session_name = adapter.current_session_name()
+        if session_name is None:
+            session_name = getattr(adapter, "pinned_resolution_session", None)
+        if session_name is None:
+            session_name = adapter.current_session_name()
 
     from .snapshot import build_workspace_snapshot
 

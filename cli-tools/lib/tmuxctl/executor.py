@@ -61,6 +61,7 @@ class RestartExecutor:
 
         holding_session = "_stash"
         self._create_holding_session(holding_session)
+        prev_pinned_session = self.adapter.pinned_resolution_session
         try:
             for attachment in plan.client_attachments:
                 if attachment.attachment_class in {
@@ -84,6 +85,16 @@ class RestartExecutor:
 
             build_workspace(self.adapter, plan.session_name)
             time.sleep(0.5)
+
+            # Pin every custom-target resolution at the freshly rebuilt session
+            # for the rest of the restart. The executor runs detached after
+            # parking clients into _stash and killing the old leader, so the
+            # ambient current_session_name() no longer returns this session;
+            # without the pin the resume loop's generic run() interception
+            # (display-message / capture-pane / send-keys on a public label like
+            # `council:custodes`) would resolve against the wrong session and
+            # report "pane target not found" for panes that exist.
+            self.adapter.pinned_resolution_session = plan.session_name
 
             rebuilt = build_workspace_snapshot(self.adapter, plan.session_name)
             for window in rebuilt.windows:
@@ -262,6 +273,7 @@ class RestartExecutor:
             )
 
         finally:
+            self.adapter.pinned_resolution_session = prev_pinned_session
             # Keep local clients parked in _stash on verification failure. A
             # successful restart switches them back before teardown; at that
             # point the holding session is safe to remove.
@@ -417,7 +429,10 @@ done
 
             for pane_label in sorted(PERSONA_LABELS):
                 try:
-                    result = assert_instance(self.adapter, pane_label)
+                    # Pin resolution to the rebuilt session so the persona pane is
+                    # found against `main`, not the detached executor's ambient
+                    # (now-dead) session.
+                    result = assert_instance(self.adapter, pane_label, session=session_name)
                 except Exception as exc:
                     violations.append(f"persistent pane assertion failed for {pane_label}: {exc}")
                     continue
@@ -429,6 +444,20 @@ done
                     violations.append(
                         f"persistent pane assertion failed for {pane_label}: "
                         f"{result.get('action') or 'none'} {result.get('reason') or ''}".strip()
+                    )
+                    continue
+                # R2: a persona seat counts only when the pane actually hosts a
+                # live agent process. A clean assert verdict or a launched
+                # dispatch is not proof the agent came up — verify the runtime.
+                pane_id = self._resolve_optional_pane(pane_label, session_name)
+                if not pane_id:
+                    violations.append(f"persona pane missing after assertion: {pane_label}")
+                    continue
+                if result.get("action") == "launched":
+                    time.sleep(1.0)
+                if not self._pane_has_agent_runtime(pane_id):
+                    violations.append(
+                        f"persona pane has no live agent after assertion: {pane_label}"
                     )
         except Exception as exc:
             violations.append(f"persistent persona assertion unavailable: {exc}")
@@ -450,7 +479,7 @@ done
             ),
         ):
             try:
-                violation = self._ensure_reservist_runtime(label, target, cwd, prompt)
+                violation = self._ensure_reservist_runtime(label, target, cwd, prompt, session_name)
                 if violation:
                     violations.append(violation)
             except Exception as exc:
@@ -459,9 +488,14 @@ done
         return violations
 
     def _ensure_reservist_runtime(
-        self, label: str, target: str, working_dir: Path, prompt: str
+        self,
+        label: str,
+        target: str,
+        working_dir: Path,
+        prompt: str,
+        session_name: str | None = None,
     ) -> str:
-        pane_id = self._resolve_optional_pane(target)
+        pane_id = self._resolve_optional_pane(target, session_name)
         if not pane_id:
             return f"{label} pane missing after rebuild"
         if self._pane_has_agent_runtime(pane_id):
@@ -510,11 +544,11 @@ done
             return Path(imperium) / "runtimes" / "token-os" / "live"
         return Path(__file__).resolve().parents[3]
 
-    def _resolve_optional_pane(self, target: str) -> str:
+    def _resolve_optional_pane(self, target: str, session_name: str | None = None) -> str:
         try:
             from .resolver import resolve_pane
 
-            return resolve_pane(self.adapter, target).pane_id
+            return resolve_pane(self.adapter, target, session_name=session_name).pane_id
         except Exception:
             return ""
 

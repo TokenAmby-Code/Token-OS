@@ -845,11 +845,12 @@ def assert_instance(
     *,
     upsert: dict[str, Any] | None = None,
     prune: bool = False,
+    session: str | None = None,
 ) -> dict[str, Any]:
     from .focus_guard import preserve_focus
 
     with preserve_focus(adapter, source="tmuxctl assert-instance", attempted_target=target):
-        return _assert_instance_impl(adapter, target, upsert=upsert, prune=prune)
+        return _assert_instance_impl(adapter, target, upsert=upsert, prune=prune, session=session)
 
 
 def _assert_instance_impl(
@@ -858,9 +859,12 @@ def _assert_instance_impl(
     *,
     upsert: dict[str, Any] | None = None,
     prune: bool = False,
+    session: str | None = None,
 ) -> dict[str, Any]:
     # upsert/prune are accepted only for internal compatibility; public CLI no longer exposes them.
-    resolved = resolve_pane(adapter, target)
+    # session pins resolution to the restart target (`main`); None keeps the
+    # ambient session for normal in-pane callers (back-compat).
+    resolved = resolve_pane(adapter, target, session_name=session)
     pane_id = resolved.pane_id
     pane_label = _pane_label(adapter, pane_id, resolved.pane_role)
     pane_type = _pane_type(adapter, pane_id)
@@ -1024,7 +1028,9 @@ def _assert_instance_impl(
     return finish(result)
 
 
-def sweep_persona_panes(adapter: TmuxAdapter) -> list[dict[str, Any]]:
+def sweep_persona_panes(
+    adapter: TmuxAdapter, *, session: str | None = None
+) -> list[dict[str, Any]]:
     """Re-assert every singleton persona pane against the live session.
 
     Runs the SAME per-pane assertion `tx restart` performs (``assert_instance``
@@ -1041,7 +1047,12 @@ def sweep_persona_panes(adapter: TmuxAdapter) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for pane_label in sorted(PERSONA_LABELS):
         try:
-            results.append(assert_instance(adapter, pane_label))
+            # Only pin when a session was requested; the ambient in-pane sweep
+            # (service/cli) resolves against the current session unchanged.
+            if session is None:
+                results.append(assert_instance(adapter, pane_label))
+            else:
+                results.append(assert_instance(adapter, pane_label, session=session))
         except Exception as exc:  # noqa: BLE001 — one bad pane must not stop the sweep
             results.append(
                 {
@@ -1060,13 +1071,13 @@ def assert_persona(
     # Compatibility helper for in-process callers; public CLI surface is assert-instance.
     persona_spec(pane_label)
     try:
-        pane_id = resolve_pane(adapter, pane_label).pane_id
+        pane_id = resolve_pane(adapter, pane_label, session_name=session).pane_id
     except ValueError:
         from .stack import add_orchestrator_stack_pane
 
         base = pane_label.split(":", 1)[0]
         add_orchestrator_stack_pane(adapter, session, base)
-        pane_id = resolve_pane(adapter, pane_label).pane_id
+        pane_id = resolve_pane(adapter, pane_label, session_name=session).pane_id
     result = assert_instance(adapter, pane_id)
     if result.get("ok") and prompt:
         ok, reason = _upsert_prompt(pane_id, prompt)
