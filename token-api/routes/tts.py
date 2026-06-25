@@ -48,7 +48,6 @@ from shared import (
     DISCORD_DAEMON_URL,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
-    ULTIMATE_FALLBACK,
     get_quiet_hours_status,
     is_phone_reachable,
     is_satellite_tts_available,
@@ -94,6 +93,8 @@ router = APIRouter()
 _send_to_phone = None
 _custodes_state_event_handler = None
 TTS_LANGUISHING_THRESHOLD = 5
+# The sender whose TTS innately bypasses the pause queue (plays immediately).
+CUSTODES_PERSONA_SLUG = "custodes"
 
 
 def init_deps(*, send_to_phone=None, custodes_state_event_handler=None):
@@ -483,17 +484,25 @@ def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int 
 def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
     """Determine which device should receive TTS output.
 
+    Phone-first doctrine (Emperor decree, 2026-06-25): the phone is first-contact
+    for ALL TTS, regardless of geofence. Mac `say` (local speakers) is a deep
+    fallback ONLY — reached when phone delivery is unreachable. This supersedes
+    the old geofence(away) → WSL-satellite → phone → Mac ordering; the WSL
+    satellite era is over and geofence no longer gates device selection.
+
     Priority cascade:
-    1. Discord voice — if any bot is connected to a VC
-    2. Geofence — if user is away from home, phone only (skip WSL/Mac)
-    3. WSL satellite — if satellite is healthy
-    4. Phone — if reachable
-    5. Mac — last resort, local speakers
+    1. Discord voice — if the operator is actively in a voice channel, audio goes
+       there (a deliberate live conversation surface, not ambient routing).
+    2. Phone — first-contact whenever reachable.
+    3. Mac — deep fallback, only when the phone is unreachable.
+
+    The WSL satellite is intentionally NOT in this cascade. ``wsl_voice`` is kept
+    in the signature for caller compatibility but no longer influences routing.
 
     Returns:
-        {"device": "discord"|"wsl"|"phone"|"mac"|None, "reason": str, "discord_bot": str|None}
+        {"device": "discord"|"phone"|"mac"|None, "reason": str, "discord_bot": str|None}
     """
-    # 1. Discord voice channel — operator in VC means audio goes there
+    # 1. Discord voice channel — operator in VC means audio goes there.
     discord_bot = _get_discord_voice_bot()
     if discord_bot:
         return {
@@ -502,39 +511,17 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
             "discord_bot": discord_bot,
         }
 
-    # 2. Geofence — away from home means phone-only
-    location_zone = DESKTOP_STATE.get("location_zone")
-    if location_zone is not None and location_zone != "home":
-        # User is at gym, campus, or other known zone — phone is the only option
-        if _phone_tts_available():
-            return {"device": "phone", "reason": f"geofence: {location_zone}", "discord_bot": None}
-        # Away from home is phone-only. If the phone is unreachable, fail closed
-        # instead of leaking speech to local Mac speakers nobody can hear.
-        return {
-            "device": None,
-            "reason": "geofence_phone_unreachable",
-            "discord_bot": None,
-        }
-
-    # 3. WSL satellite — best audio quality when at home.
-    # Route to WSL whenever the satellite is healthy; speak_tts() will
-    # substitute a default voice if the caller didn't provide one. Gating
-    # on wsl_voice here used to silently demote every voice-less call
-    # (e.g. /api/notify/tts) to phone, contradicting the "WSL first" doctrine.
-    if is_satellite_tts_available():
-        return {"device": "wsl", "reason": "satellite healthy", "discord_bot": None}
-
-    # 4. Phone — reachable as secondary home device
+    # 2. Phone — first-contact for all TTS, regardless of geofence zone.
     if _phone_tts_available():
+        return {"device": "phone", "reason": "phone-first", "discord_bot": None}
+
+    # 3. Mac — deep fallback, only when phone delivery is unreachable.
+    if _mac_tts_available():
         return {
-            "device": "phone",
-            "reason": "wsl unavailable, phone reachable",
+            "device": "mac",
+            "reason": "deep fallback: phone unreachable",
             "discord_bot": None,
         }
-
-    # 5. Mac — local speakers as last resort
-    if _mac_tts_available():
-        return {"device": "mac", "reason": "last resort, local speakers", "discord_bot": None}
 
     return {"device": None, "reason": "no playback backend", "discord_bot": None}
 
@@ -550,17 +537,19 @@ def speak_tts(
 ) -> dict:
     """Route TTS to the best available device via resolve_tts_device().
 
-    Dispatches to speak_tts_discord(), speak_tts_wsl(), speak_tts_mac(), or phone
-    notification based on the resolved device. Falls through on failure.
+    Dispatches to Discord voice, phone TTS, or Mac local speech based on the
+    resolved device. WSL args remain accepted for caller compatibility but are no
+    longer part of the phone-first routing cascade. Falls through on failed live
+    delivery, and never reports success without a concrete playback method.
 
     Args:
         message: Text to speak
         voice: macOS voice name (for Mac fallback / Discord TTS voice)
         rate: Rate for Mac TTS
         instance_id: Optional instance ID for logging
-        wsl_voice: Windows SAPI voice name (for WSL)
-        wsl_rate: Rate for WSL TTS (-10 to 10)
-        use_file_playback: If True, use file-based synthesis + WMP playback (supports transport controls)
+        wsl_voice: Deprecated Windows SAPI voice name (ignored for routing)
+        wsl_rate: Deprecated WSL TTS rate (ignored for routing)
+        use_file_playback: Deprecated WSL playback flag (ignored for routing)
     """
     if not message:
         return {"success": False, "error": "No message provided"}
@@ -592,10 +581,12 @@ def speak_tts(
     def _send_phone_tts() -> dict:
         """Send spoken text to the phone transport and stamp truthful routing.
 
-        Phone can be either the selected device or a fallthrough from Discord/WSL.
+        Phone can be either the selected device or a fallthrough from Discord.
         The transport returns only success/failure, so stamp `method=phone`
         before `_finish()` derives the public `route`.
         """
+        if _send_to_phone is None:
+            return _no_playback_backend("phone_transport_unavailable")
         result = dict(_send_to_phone("/notify", {"tts_text": message}) or {})
         if result.get("success"):
             result.setdefault("method", "phone")
@@ -606,42 +597,13 @@ def speak_tts(
         result["route_reason"] = routing.get("reason")
         return _finish(result)
 
-    # If WSL was selected without an explicit voice (e.g. /api/notify/tts caller),
-    # fall back to ULTIMATE_FALLBACK so the satellite gets a usable SAPI voice.
-    if device == "wsl" and not wsl_voice:
-        wsl_voice = ULTIMATE_FALLBACK["wsl_voice"]
-        if wsl_rate is None:
-            wsl_rate = ULTIMATE_FALLBACK.get("wsl_rate", 0)
-
-    # Dispatch with fallthrough on failure
+    # Dispatch with fallthrough on failure. Phone-first: every non-Discord path
+    # starts at the phone when reachable and demotes only to a real Mac backend.
     if device == "discord":
         result = speak_tts_discord(message, routing["discord_bot"], voice, rate)
         if result.get("success"):
             return _finish(result)
-        logger.info(f"TTS: Discord failed ({result.get('error')}), falling through")
-
-        # Discord is checked before geofence so VC audio can work anywhere. If
-        # that VC leg fails while away from home, fall through only to the
-        # phone. Never leak away-from-home speech to local WSL/Mac speakers.
-        location_zone = DESKTOP_STATE.get("location_zone")
-        if location_zone is not None and location_zone != "home":
-            if _phone_tts_available():
-                result = _send_phone_tts()
-                if result.get("success"):
-                    return _finish(result)
-            return _finish(_no_playback_backend("geofence_phone_failed"))
-
-        # Re-resolve skipping discord — try WSL/phone/mac
-        if is_satellite_tts_available():
-            fallthrough_voice = wsl_voice or ULTIMATE_FALLBACK["wsl_voice"]
-            fallthrough_rate = (
-                wsl_rate if wsl_rate is not None else ULTIMATE_FALLBACK.get("wsl_rate", 0)
-            )
-            result = speak_tts_wsl(
-                message, fallthrough_voice, fallthrough_rate, use_file_playback=use_file_playback
-            )
-            if result.get("success"):
-                return _finish(result)
+        logger.info(f"TTS: Discord failed ({result.get('error')}), falling through to phone/Mac")
         if _phone_tts_available():
             result = _send_phone_tts()
             if result.get("success"):
@@ -650,44 +612,21 @@ def speak_tts(
             return _finish(speak_tts_mac(message, voice, rate))
         return _finish(_no_playback_backend("no_fallthrough_playback_backend"))
 
-    if device == "wsl":
-        result = speak_tts_wsl(
-            message,
-            wsl_voice,
-            wsl_rate if wsl_rate is not None else 0,
-            use_file_playback=use_file_playback,
-        )
-        if result.get("success"):
-            return _finish(result)
-        logger.info(f"TTS: WSL failed ({result.get('error')}), falling through to phone/Mac")
-        if _phone_tts_available():
-            result = _send_phone_tts()
-            if result.get("success"):
-                return _finish(result)
-        if _mac_tts_available():
-            return _finish(speak_tts_mac(message, voice, rate))
-        return _finish(_no_playback_backend("wsl_failed_no_fallthrough_backend"))
-
     if device == "phone":
         # Reaching this branch means the router selected phone. The router may be
         # monkeypatched in invariant tests; do not re-probe reachability here.
-        if _send_to_phone:
-            result = _send_phone_tts()
-            if result.get("success"):
-                return _finish(result)
-            logger.info(f"TTS: Phone failed ({result.get('error')})")
-        if str(routing.get("reason") or "").startswith("geofence:"):
-            return _finish(_no_playback_backend("geofence_phone_failed"))
-        logger.info("TTS: Phone unavailable/failed, falling back to Mac")
+        result = _send_phone_tts()
+        if result.get("success"):
+            return _finish(result)
+        logger.info(f"TTS: Phone failed ({result.get('error')})")
         if _mac_tts_available():
             return _finish(speak_tts_mac(message, voice, rate))
         return _finish(_no_playback_backend("phone_failed_no_fallthrough_backend"))
 
-    # device == "mac" (or unknown)
     if device == "mac":
         return _finish(speak_tts_mac(message, voice, rate))
-    return _finish(_no_playback_backend("unknown_playback_backend"))
 
+    return _finish(_no_playback_backend("unknown_playback_backend"))
 
 async def dispatch_notify(
     message: str,
@@ -1365,10 +1304,13 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT name AS tab_name, tts_voice, notification_sound,
-                      CASE WHEN interaction_mode = 'voice_chat'
-                           THEN 'voice-chat' ELSE notification_mode END AS tts_mode
-               FROM instances WHERE id = ?""",
+            """SELECT i.name AS tab_name, i.tts_voice, i.notification_sound,
+                      CASE WHEN i.interaction_mode = 'voice_chat'
+                           THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
+                      p.slug AS persona_slug
+               FROM instances i
+               LEFT JOIN personas p ON p.id = i.persona_id
+               WHERE i.id = ?""",
             (instance_id,),
         )
         row = await cursor.fetchone()
@@ -1389,6 +1331,15 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     is_voice_chat = instance_mode == "voice-chat"
     if is_voice_chat:
         instance_mode = "verbose"
+        queue_target = "hot"
+
+    # Custodes-sender bypass (Emperor decree, 2026-06-25): TTS originating from
+    # the Custodes persona never enqueues to the silent pause queue — it plays
+    # immediately. Bypass is a property of the SENDER, not the message: because
+    # enforcement TTS only ever originates from Custodes, keying on the sender's
+    # persona subsumes "enforcement bypass" and keeps the queue free of any
+    # opinion about message type.
+    if row["persona_slug"] == CUSTODES_PERSONA_SLUG:
         queue_target = "hot"
     global_mode = TTS_GLOBAL_MODE["mode"]
     # Restrictiveness order: silent > muted > verbose
