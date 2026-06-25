@@ -46,7 +46,11 @@ from instance_mutation import (
 )
 from instance_registry import LEGACY_PERSONA_ALIASES
 from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface
-from personas import assign_astartes_persona, persona_to_profile
+from personas import (
+    assign_astartes_persona,
+    persona_to_profile,
+    resolve_live_persona_instance,
+)
 from phone_service import _send_to_phone
 from questions_gate import trials_clear
 from routes.tts import dispatch_notify, play_sound, queue_tts
@@ -997,15 +1001,28 @@ async def _enqueue_state_injection(
     return int(cursor.lastrowid)
 
 
-async def _consume_state_injections(db, audience_instance_id: str) -> list[dict]:
+async def _consume_state_injections(db, audience_instance_ids) -> list[dict]:
+    """Drain pending injections addressed to ANY of ``audience_instance_ids``.
+
+    A consumer addresses its own ``session_id`` (the chapter/instance-parent edge)
+    and, when it is the live FG/Custodes singleton, its own ``persona_id`` (the
+    persona edge — see ``_commander_audience_key``). Accepts a single id or a
+    sequence; falsy entries are dropped.
+    """
+    if isinstance(audience_instance_ids, str):
+        audience_instance_ids = [audience_instance_ids]
+    audience_instance_ids = [a for a in audience_instance_ids if a]
+    if not audience_instance_ids:
+        return []
     db.row_factory = aiosqlite.Row
+    placeholders = ",".join("?" for _ in audience_instance_ids)
     cursor = await db.execute(
-        """SELECT id, source_instance_id, kind, payload_json, rendered_text, created_at
+        f"""SELECT id, source_instance_id, kind, payload_json, rendered_text, created_at
            FROM state_injections
-           WHERE audience_instance_id = ? AND status = 'pending'
+           WHERE audience_instance_id IN ({placeholders}) AND status = 'pending'
            ORDER BY created_at ASC, id ASC
            LIMIT 10""",
-        (audience_instance_id,),
+        tuple(audience_instance_ids),
     )
     rows = await cursor.fetchall()
     if not rows:
@@ -1042,8 +1059,43 @@ def _row_parent_instance_id(row: dict) -> str | None:
     return None
 
 
+def _commander_audience_key(row: dict) -> str | None:
+    """Resolve a worker's commander to a state-injection audience key.
+
+    Generalizes `_row_parent_instance_id` past the chapter-only edge:
+
+    - `chapter` → `commander_id` is a direct parent INSTANCE id; the commander
+      consumes via its own `session_id`.
+    - `persona` → `commander_id` is a `personas.id` ("report to THE current
+      FG/Custodes"). We address the injection to that durable persona id; the
+      live singleton drains injections addressed to its own `persona_id` at
+      consume time (see `handle_prompt_submit`), so a singleton restart in the
+      enqueue→consume window loses nothing.
+    - legacy `parent_instance_id` is honored first.
+
+    Self-loop guard: a singleton commanded by its own persona (resolved key ==
+    the row's own `persona_id`) must not notify itself → `None`.
+    """
+    key = row.get("parent_instance_id")
+    if key is None and row.get("commander_type") in ("chapter", "persona"):
+        key = row.get("commander_id")
+    if key is None:
+        return None
+    if key == row.get("persona_id"):
+        return None
+    return key
+
+
+async def _slug_for_persona_id(db, persona_id: str) -> str | None:
+    cursor = await db.execute("SELECT slug FROM personas WHERE id = ?", (persona_id,))
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return row[0] if not hasattr(row, "keys") else row["slug"]
+
+
 async def _enqueue_child_stop_fanout(instance: dict, payload: dict) -> dict | None:
-    parent_instance_id = _normalize_text(_row_parent_instance_id(instance))
+    parent_instance_id = _normalize_text(_commander_audience_key(instance))
     if not parent_instance_id:
         return None
 
@@ -1112,10 +1164,11 @@ async def _enqueue_poke_fanout(db, instance: dict, payload: dict) -> dict | None
 
     Reuses the already-open `db` (handle_prompt_submit holds the connection) —
     unlike the Stop fanout we do NOT open a nested connection or commit here; the
-    caller commits. Resolves only the immediate chapter-edge commander (the FG
-    case); persona/Custodes-commanded workers resolve to None and are out of
-    scope, mirroring the Stop fanout's current chapter-only reach."""
-    commander_id = _normalize_text(_row_parent_instance_id(instance))
+    caller commits. Resolves the commander via `_commander_audience_key`, which
+    covers BOTH edges: the `chapter` instance-parent and the canonical `persona`
+    edge (FG/Custodes-dispatched workers). The persona case addresses the durable
+    persona id; the live singleton drains it at consume time."""
+    commander_id = _normalize_text(_commander_audience_key(instance))
     if not commander_id:
         return None
 
@@ -4753,7 +4806,29 @@ async def handle_prompt_submit(payload: dict) -> dict:
                 "instance_id": session_id,
             }
 
-        consumed_injections = await _consume_state_injections(db, session_id)
+        # A consumer always drains injections addressed to its own session_id (the
+        # chapter / instance-parent edge). The live FG/Custodes singleton ALSO drains
+        # injections addressed to its own persona_id (the canonical persona edge) —
+        # resolved here, at consume time, so a singleton restart in the
+        # enqueue→consume window loses nothing. The gate short-circuits cheaply: only
+        # a correctly-stamped overseer/primarch that is NOT a chapter child pays the
+        # resolve_live_persona_instance query, and it appends persona_id only when it
+        # is in fact the live singleton (guards against a stale/duplicate row draining
+        # another instance's persona-addressed mail).
+        audience_ids = [session_id]
+        persona_id = existing_dict.get("persona_id")
+        rank = existing_dict.get("rank")
+        if (
+            persona_id
+            and rank in ("overseer", "primarch")
+            and existing_dict.get("commander_type") != "chapter"
+        ):
+            slug = await _slug_for_persona_id(db, persona_id)
+            if slug:
+                live = await resolve_live_persona_instance(db, slug)
+                if live and live["id"] == session_id:
+                    audience_ids.append(persona_id)
+        consumed_injections = await _consume_state_injections(db, audience_ids)
 
         # Sister to Stop→commander: a genuine human poke (hook_driven falsy = not an
         # automated wake) to a commanded worker notifies that worker's commander,
