@@ -1583,7 +1583,11 @@ pane_has_active_agent_process() {
   local root_pid="$1" self_pid="${2:-0}"
   local needles='(^|/)claude( |$)|claude[.]token-os-real|(^|/)codex( |$)|codex[.]token-os-real|agent-wrapper[.]sh|claude-wrapper[.]sh|codex-wrapper[.]sh'
   [[ -n "$root_pid" && "$root_pid" =~ ^[0-9]+$ && "$root_pid" != "0" ]] || return 1
-  ps -A -o pid=,ppid=,command= 2>/dev/null | awk -v root="$root_pid" -v self="$self_pid" -v needles="$needles" '
+  # -ww: unlimited output width. Without it Linux procps truncates `command` to
+  # ~80 cols when stdout is not a TTY, which can lop the launcher basename off a
+  # long argv/path and hide a real agent from the needle. (BSD/macOS ps honours
+  # -ww too; it never truncates by default.)
+  ps -ww -A -o pid=,ppid=,command= 2>/dev/null | awk -v root="$root_pid" -v self="$self_pid" -v needles="$needles" '
     {
       pid=$1; ppid=$2; $1=""; $2=""; sub(/^  */, "", $0)
       parent[pid]=ppid
