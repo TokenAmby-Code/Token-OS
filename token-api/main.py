@@ -20505,7 +20505,13 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
                           WHERE e.instance_id = ci.id
                             AND e.event_type = 'hook_user_prompt_submit'
                           LIMIT 1
-                      ) AS has_prompt_submit
+                      ) AS has_prompt_submit,
+                      EXISTS (
+                          SELECT 1 FROM events e
+                          WHERE e.instance_id = ci.id
+                            AND e.event_type = 'naming_nudge_sent'
+                          LIMIT 1
+                      ) AS has_naming_nudge
                FROM instances ci
                LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
                WHERE ci.status NOT IN ('stopped', 'archived')
@@ -20521,6 +20527,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
                 row_is_live
                 and _is_placeholder_tab_name(row.get("tab_name"))
                 and row.get("has_prompt_submit")
+                and not row.get("has_naming_nudge")
             ):
                 naming_nudge_instance_ids.append(row["id"])
 

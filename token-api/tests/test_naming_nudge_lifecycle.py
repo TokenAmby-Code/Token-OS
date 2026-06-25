@@ -7,21 +7,34 @@ from datetime import datetime
 
 import pytest
 
+from instance_mutation import sanctioned_insert_instance_sync, sanctioned_update_instance_sync
+
 
 def _insert_wrapper_instance(
     db_path, *, instance_id="wrap-unnamed", wrapper_id="wrap-1", name="needs-name"
 ) -> None:
+    now = datetime.now().isoformat()
     with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO instances (
-                id, name, engine, working_dir, device_id, status, rank,
-                wrapper_launch_id, session_doc_id
-            ) VALUES (?, ?, 'codex', '/tmp', 'Mac-Mini', 'working',
-                      'astartes', ?, NULL)
-            """,
-            (instance_id, name, wrapper_id),
+        sanctioned_insert_instance_sync(
+            conn,
+            values={
+                "id": instance_id,
+                "name": name,
+                "engine": "codex",
+                "working_dir": "/tmp",
+                "device_id": "Mac-Mini",
+                "status": "working",
+                "rank": "astartes",
+                "wrapper_launch_id": wrapper_id,
+                "session_doc_id": None,
+                "created_at": now,
+                "last_activity": now,
+            },
+            mutation_type="instance_registered",
+            write_source="test",
+            actor="test",
         )
+        conn.commit()
 
 
 @pytest.mark.asyncio
@@ -156,7 +169,15 @@ async def test_stop_does_not_schedule_naming_nudge(app_env, monkeypatch) -> None
     hooks = sys.modules["routes.hooks"]
     _insert_wrapper_instance(app_env.db_path, instance_id="stop-unnamed", wrapper_id="wrap-stop")
     with sqlite3.connect(app_env.db_path) as conn:
-        conn.execute("UPDATE instances SET is_subagent = 1 WHERE id = 'stop-unnamed'")
+        sanctioned_update_instance_sync(
+            conn,
+            instance_id="stop-unnamed",
+            updates={"is_subagent": 1},
+            mutation_type="instance_updated",
+            write_source="test",
+            actor="test",
+        )
+        conn.commit()
 
     monkeypatch.setattr(
         hooks,
@@ -207,6 +228,38 @@ async def test_reconciler_schedules_live_placeholder_with_prompt_evidence(
 
 
 @pytest.mark.asyncio
+async def test_reconciler_does_not_reschedule_after_naming_nudge_sent(app_env, monkeypatch) -> None:
+    """Backstop is once-only after a sent naming nudge; the core handles repeats."""
+    main = app_env.main
+    _insert_wrapper_instance(app_env.db_path, instance_id="reconcile-nudged", wrapper_id="wrap-n")
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            "INSERT INTO events (event_type, instance_id) VALUES ('hook_user_prompt_submit', 'reconcile-nudged')"
+        )
+        conn.execute(
+            "INSERT INTO events (event_type, instance_id) VALUES ('naming_nudge_sent', 'reconcile-nudged')"
+        )
+
+    async def reachable_tmux():
+        return {}
+
+    async def live_ids():
+        return {"reconcile-nudged"}
+
+    async def fail_maybe(instance_id):
+        raise AssertionError(f"unexpected naming nudge: {instance_id}")
+
+    monkeypatch.setattr(main, "_read_tmux_panes", reachable_tmux)
+    monkeypatch.setattr(main, "_live_agent_instance_ids", live_ids)
+    monkeypatch.setattr(main, "_maybe_naming_nudge", fail_maybe)
+
+    counts = await main._run_tmux_db_reconcile_cycle()
+    await asyncio.sleep(0)
+
+    assert counts["naming_nudge_scheduled"] == 0
+
+
+@pytest.mark.asyncio
 async def test_reconciler_does_not_nudge_live_placeholder_without_prompt_evidence(
     app_env, monkeypatch
 ) -> None:
@@ -243,8 +296,6 @@ async def test_codex_one_off_session_end_preserves_instance_stamp_resolution(
     process had exited, stack-worker assertion pruned/cleared the pane stamp, so
     tmuxctl resolve-instance failed immediately after completion.
     """
-    from instance_mutation import sanctioned_insert_instance_sync
-
     hooks = sys.modules["routes.hooks"]
     now = datetime.now().isoformat()
     with sqlite3.connect(app_env.db_path) as conn:
