@@ -1563,20 +1563,44 @@ resolve_pane_label_for_env() {
 }
 
 pane_has_active_agent_process() {
-  local root_pid="$1" needles="claude|codex"
+  # root_pid: the target pane's pane_pid; scan its process subtree for a live agent.
+  # self_pid: this dispatch process's own pid. On the resume path dispatch is typed
+  #   INTO the target pane's shell (executor send_keys), so the running dispatch — and
+  #   its staged temp-script child, and the ps|awk pipeline below — are themselves
+  #   descendants of pane_pid. Excluding self's lineage stops the guard from counting
+  #   itself as a "live agent" and refusing its own dispatch. Defaults to 0 (no
+  #   exclusion) for backward-compatible single-arg callers.
+  # needles: match agent *program* forms only — the launcher binary paths
+  #   (.../claude, .../codex, the .token-os-real real-binaries) and the wrapper
+  #   scripts. The path forms require a leading slash (/claude, /codex) so a
+  #   `--engine codex|claude` flag *value* in an argv (space-delimited, no slash)
+  #   can never masquerade as a live agent — that was the self-referential bug.
+  #   Literal dots are written [.] so the awk program's own command line (which
+  #   carries this very pattern via -v) cannot match the needle it scans for.
+  local root_pid="$1" self_pid="${2:-0}"
+  local needles='/claude( |$)|claude[.]token-os-real|/codex( |$)|codex[.]token-os-real|agent-wrapper[.]sh|claude-wrapper[.]sh|codex-wrapper[.]sh'
   [[ -n "$root_pid" && "$root_pid" =~ ^[0-9]+$ && "$root_pid" != "0" ]] || return 1
-  ps -A -o pid=,ppid=,command= 2>/dev/null | awk -v root="$root_pid" -v needles="$needles" '
+  ps -A -o pid=,ppid=,command= 2>/dev/null | awk -v root="$root_pid" -v self="$self_pid" -v needles="$needles" '
     {
       pid=$1; ppid=$2; $1=""; $2=""; sub(/^  */, "", $0)
       parent[pid]=ppid
       cmd[pid]=tolower($0)
+    }
+    function is_self_lineage(p,   c) {
+      if (self == "" || self == "0") return 0
+      c = p
+      while (c in parent) {
+        if (c == self) return 1
+        c = parent[c]
+      }
+      return (p == self)
     }
     END {
       for (pid in parent) {
         cur=pid
         while (cur in parent) {
           if (parent[cur] == root) {
-            if (cmd[pid] ~ needles) exit 0
+            if (cmd[pid] ~ needles && !is_self_lineage(pid)) exit 0
             break
           }
           cur=parent[cur]
@@ -1615,7 +1639,7 @@ assert_dispatch_target_unoccupied() {
     err "use an empty shell pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
     exit 73
   fi
-  if pane_has_active_agent_process "$pane_pid"; then
+  if pane_has_active_agent_process "$pane_pid" "$$"; then
     err "target pane $TARGET has a live Claude/Codex descendant (pane_pid=$pane_pid); refusing dispatch injection"
     err "use an empty shell pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
     exit 73
