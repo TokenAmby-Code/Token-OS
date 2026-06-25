@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import replace
 from pathlib import Path
 
@@ -409,58 +412,99 @@ done
 """.strip()
         return f"bash -lc {shlex.quote(script)}"
 
+    def _daemon_reconcile_personas(self, session_name: str) -> list[dict]:
+        """Route persona seating through tmuxctld — the sole persona launcher.
+
+        ``POST /reconcile`` asks the daemon to re-seat every must-fill persona
+        seat against the rebuilt session (the same per-seat ``assert_instance``
+        sweep the retired in-process loop ran, but executed *inside* the daemon
+        so the daemon owns every persona respawn). Uses stdlib ``urllib`` (same
+        idiom as ``api.py``/``close.py``); ``timeout=20`` because respawns return
+        fast while agent boot is async. Raises on transport failure or an
+        ``ok=false`` envelope so the caller can fail loudly — if the daemon is
+        down, restart seating MUST NOT silently succeed.
+        """
+        port = os.environ.get("TMUXCTLD_PORT", "7778")
+        url = f"http://127.0.0.1:{port}/reconcile"
+        data = json.dumps({"session": session_name}, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                text = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise ValueError(f"tmuxctld POST /reconcile failed: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise ValueError(f"tmuxctld unreachable at {url}: {exc}") from exc
+
+        payload = json.loads(text) if text.strip() else {}
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            raise ValueError(f"tmuxctld /reconcile returned non-ok envelope: {payload}")
+        result = payload.get("result") or {}
+        return list(result.get("results") or [])
+
     def _assert_persistent_runtime_panes(self, session_name: str) -> list[str]:
         """Best-effort post-rebuild repair for panes that should host daemons.
 
-        The restart planner restores registry-backed instances. Some standing
-        panes are intentionally hook-driven and may not have a fresh resumable
-        registry row after teardown. Assert them after restore so `tx restart`
-        leaves the workspace operational instead of with blank FG/Admin shells.
+        Persona seating is routed through the tmuxctld daemon (`POST /reconcile`),
+        the *sole* persona launcher — this process never seats personas in-process.
+        If the daemon is down, persona seating fails loudly rather than silently
+        falling back to a cold path. A read-only R2 liveness check still verifies
+        each seat actually hosts a live agent (tmux reads = observability; the
+        daemon owns every write/respawn).
 
-        The civic reservist pane is a special case: `civic-thread fallthrough`
-        injects through tmux-resume, which requires an already-running agent TUI.
-        If the reservist pane is only a shell, seed a low-cost idle Claude in the
-        Civic working dir; the invariant can then deliver its activation prompt.
+        The civic reservist pane stays in-process (the daemon has no reservist
+        launcher yet): `civic-thread fallthrough` injects through tmux-resume,
+        which requires an already-running agent TUI. If the reservist pane is only
+        a shell, seed a low-cost idle Claude in the Civic working dir; the
+        invariant can then deliver its activation prompt.
         """
         violations: list[str] = []
 
+        # The daemon is the sole persona launcher: route restart seating through
+        # POST /reconcile. Any failure is loud — no in-process cold path remains.
         try:
-            from .assertions import PERSONA_LABELS, assert_instance
-
-            for pane_label in sorted(PERSONA_LABELS):
-                try:
-                    # Pin resolution to the rebuilt session so the persona pane is
-                    # found against `main`, not the detached executor's ambient
-                    # (now-dead) session.
-                    result = assert_instance(self.adapter, pane_label, session=session_name)
-                except Exception as exc:
-                    violations.append(f"persistent pane assertion failed for {pane_label}: {exc}")
-                    continue
-                if not result.get("ok") and result.get("action") not in {
-                    "launched",
-                    "persona_correction_sent",
-                    "registry_reactivated",
-                }:
-                    violations.append(
-                        f"persistent pane assertion failed for {pane_label}: "
-                        f"{result.get('action') or 'none'} {result.get('reason') or ''}".strip()
-                    )
-                    continue
-                # R2: a persona seat counts only when the pane actually hosts a
-                # live agent process. A clean assert verdict or a launched
-                # dispatch is not proof the agent came up — verify the runtime.
-                pane_id = self._resolve_optional_pane(pane_label, session_name)
-                if not pane_id:
-                    violations.append(f"persona pane missing after assertion: {pane_label}")
-                    continue
-                if result.get("action") == "launched":
-                    time.sleep(1.0)
-                if not self._pane_has_agent_runtime(pane_id):
-                    violations.append(
-                        f"persona pane has no live agent after assertion: {pane_label}"
-                    )
+            results = self._daemon_reconcile_personas(session_name)
         except Exception as exc:
-            violations.append(f"persistent persona assertion unavailable: {exc}")
+            violations.append(
+                f"tmuxctld reconcile unreachable ({exc}); persona seats NOT "
+                "filled — the daemon is the sole persona launcher and must be "
+                "running (tmuxctld-ctl start)"
+            )
+            results = []
+
+        # Translate per-seat daemon failures into restart violations.
+        for result in results:
+            if not result.get("ok") and result.get("action") not in {
+                "launched",
+                "persona_correction_sent",
+                "registry_reactivated",
+            }:
+                label = result.get("pane_label") or "persona"
+                violations.append(
+                    f"persistent pane assertion failed for {label}: "
+                    f"{result.get('action') or 'none'} {result.get('reason') or ''}".strip()
+                )
+
+        # R2 (read-only, observability — NOT seating): a persona seat counts only
+        # when its pane actually hosts a live agent. If the daemon launched any
+        # seat, allow a one-shot boot grace before checking liveness.
+        from .assertions import PERSONA_LABELS
+
+        if any(r.get("action") == "launched" for r in results):
+            time.sleep(1.0)
+        for pane_label in sorted(PERSONA_LABELS):
+            pane_id = self._resolve_optional_pane(pane_label, session_name)
+            if not pane_id:
+                violations.append(f"persona pane missing after assertion: {pane_label}")
+                continue
+            if not self._pane_has_agent_runtime(pane_id):
+                violations.append(f"persona pane has no live agent after assertion: {pane_label}")
 
         for label, target, cwd, prompt in (
             (

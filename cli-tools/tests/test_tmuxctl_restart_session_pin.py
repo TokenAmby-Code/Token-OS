@@ -16,8 +16,10 @@ Two verified defects are guarded here:
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
+import urllib.error
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -133,31 +135,58 @@ def test_pin_resolution_session_context_restores_previous():
     assert adapter.pinned_resolution_session is None
 
 
-# ── Defect 2: unconditional, live-agent-verified persona/reservist boot ────────
+# ── Defect 2: daemon-routed persona seating + live-agent-verified boot ─────────
 
 
 def _executor() -> RestartExecutor:
     return RestartExecutor(adapter=SimpleNamespace(pinned_resolution_session="main"))
 
 
-def test_persistent_panes_boot_all_personas_and_reservists_session_pinned():
-    # Every persona seat and both perpetual reservist seats are asserted on every
-    # restart, independent of any DB row, and all resolution is pinned to the
-    # rebuilt session (`main`).
+class _FakeResp:
+    """Minimal context-manager stand-in for urllib's HTTPResponse."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def read(self) -> bytes:
+        return self._text.encode("utf-8")
+
+    def __enter__(self) -> _FakeResp:
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+def _envelope(results: list[dict]) -> str:
+    return json.dumps({"ok": True, "result": {"results": results}})
+
+
+def _ok_results() -> list[dict]:
+    return [{"ok": True, "action": "none", "pane_label": label} for label in sorted(PERSONA_LABELS)]
+
+
+def test_persistent_panes_seat_personas_via_daemon_reconcile():
+    # The daemon (tmuxctld) is the SOLE persona launcher: restart seating routes
+    # through POST /reconcile, NOT an in-process assert loop. The R2 liveness
+    # check still runs read-only, and reservists still seat in-process.
     executor = _executor()
-    asserted: list[tuple[str, str | None]] = []
+    captured: dict[str, object] = {}
     reservists: list[tuple[str, str | None]] = []
 
-    def fake_assert(adapter, label, *, session=None):
-        asserted.append((label, session))
-        return {"ok": True, "action": "none"}
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["method"] = req.get_method()
+        captured["body"] = req.data.decode("utf-8")
+        return _FakeResp(_envelope(_ok_results()))
 
     def fake_ensure(label, target, cwd, prompt, session_name=None):
         reservists.append((target, session_name))
         return ""
 
     with (
-        patch("tmuxctl.assertions.assert_instance", fake_assert),
+        patch("urllib.request.urlopen", fake_urlopen),
         patch.object(executor, "_resolve_optional_pane", return_value="%99"),
         patch.object(executor, "_pane_has_agent_runtime", return_value=True),
         patch.object(executor, "_ensure_reservist_runtime", side_effect=fake_ensure),
@@ -165,18 +194,69 @@ def test_persistent_panes_boot_all_personas_and_reservists_session_pinned():
         violations = executor._assert_persistent_runtime_panes("main")
 
     assert violations == []
-    assert sorted(label for label, _ in asserted) == sorted(PERSONA_LABELS)
-    assert all(session == "main" for _, session in asserted)
+    assert str(captured["url"]).endswith("/reconcile")
+    assert captured["method"] == "POST"
+    assert captured["timeout"] == 20
+    assert json.loads(str(captured["body"])) == {"session": "main"}
+    # Reservists stay in-process (the daemon has no reservist launcher yet).
     assert {target for target, _ in reservists} == {"reservists:civic", "reservists:slot"}
     assert all(session == "main" for _, session in reservists)
 
 
-def test_persistent_panes_flag_persona_without_live_agent():
-    # R2: a persona whose assertion "succeeds" but whose pane hosts no live agent
-    # is a hard verification failure — not silently accepted.
+def test_persistent_panes_loud_violation_when_daemon_unreachable():
+    # If tmuxctld is down, persona seating fails LOUDLY — the cold path is gone.
     executor = _executor()
+
+    def boom(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
     with (
-        patch("tmuxctl.assertions.assert_instance", return_value={"ok": True, "action": "none"}),
+        patch("urllib.request.urlopen", boom),
+        patch.object(executor, "_resolve_optional_pane", return_value="%99"),
+        patch.object(executor, "_pane_has_agent_runtime", return_value=True),
+        patch.object(executor, "_ensure_reservist_runtime", return_value=""),
+    ):
+        violations = executor._assert_persistent_runtime_panes("main")
+
+    assert any("tmuxctld reconcile unreachable" in v for v in violations)
+    assert any("sole persona launcher" in v for v in violations)
+
+
+def test_persistent_panes_translate_per_seat_daemon_failure():
+    # A per-seat daemon failure (ok=false, non-launch action) becomes a violation.
+    executor = _executor()
+    bad_label = sorted(PERSONA_LABELS)[0]
+    results = [
+        {"ok": False, "action": "error", "reason": "boom", "pane_label": bad_label}
+        if label == bad_label
+        else {"ok": True, "action": "none", "pane_label": label}
+        for label in sorted(PERSONA_LABELS)
+    ]
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(_envelope(results))
+
+    with (
+        patch("urllib.request.urlopen", fake_urlopen),
+        patch.object(executor, "_resolve_optional_pane", return_value="%99"),
+        patch.object(executor, "_pane_has_agent_runtime", return_value=True),
+        patch.object(executor, "_ensure_reservist_runtime", return_value=""),
+    ):
+        violations = executor._assert_persistent_runtime_panes("main")
+
+    assert any(f"persistent pane assertion failed for {bad_label}" in v for v in violations)
+
+
+def test_persistent_panes_flag_persona_without_live_agent():
+    # R2: a seat the daemon reports OK but whose pane hosts no live agent is a
+    # hard verification failure — not silently accepted.
+    executor = _executor()
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(_envelope(_ok_results()))
+
+    with (
+        patch("urllib.request.urlopen", fake_urlopen),
         patch.object(executor, "_resolve_optional_pane", return_value="%99"),
         patch.object(executor, "_pane_has_agent_runtime", return_value=False),
         patch.object(executor, "_ensure_reservist_runtime", return_value=""),
@@ -191,8 +271,12 @@ def test_persistent_panes_flag_missing_persona_pane():
     # A persona pane absent from the rebuilt session is a verification failure,
     # never a silent pass.
     executor = _executor()
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(_envelope(_ok_results()))
+
     with (
-        patch("tmuxctl.assertions.assert_instance", return_value={"ok": True, "action": "none"}),
+        patch("urllib.request.urlopen", fake_urlopen),
         patch.object(executor, "_resolve_optional_pane", return_value=""),
         patch.object(executor, "_pane_has_agent_runtime", return_value=True),
         patch.object(executor, "_ensure_reservist_runtime", return_value=""),
