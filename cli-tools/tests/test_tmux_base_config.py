@@ -205,10 +205,12 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     assert "set -Fp @TYPING_PENDING_UNTIL" not in conf
     assert "set -Fp @TYPING_LOCK_UNTIL" not in conf
 
-    # Mouse/focus input is inert: mouse gets native pass-through, focus is consumed.
-    assert "#{mouse_any_flag}" in conf
-    assert "#{mouse_x}" in conf
-    assert "send-keys -M" in conf
+    # The typing-guard Any binding is keyboard-only: no mouse format predicates
+    # and no mouse replay. Mouse bindings live outside the guard path.
+    any_binding = conf.split("bind -n Any {", 1)[1].split("}\nbind -n Enter", 1)[0]
+    assert "mouse_any_flag" not in any_binding
+    assert "mouse_x" not in any_binding
+    assert "send-keys -M" not in any_binding
     assert "bind -n FocusIn { }" in conf
     assert "bind -n FocusOut { }" in conf
 
@@ -227,6 +229,7 @@ def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
         assert "tmux-typing-guard-state pending" not in line
         assert "@TYPING_LOCK_UNTIL" not in line
         assert "@TYPING_PENDING_UNTIL" not in line
+    assert "send-keys -M" not in _line_starting("bind -n MouseDown1Pane ")
 
 
 def test_typing_guard_submit_and_backspace_use_one_pending_helper() -> None:
