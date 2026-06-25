@@ -433,6 +433,12 @@ def test_static_launch_code_avoids_raw_agent_front_doors() -> None:
         CLI_TOOLS / "bin" / "claude",
         CLI_TOOLS / "bin" / "codex",
         CLI_TOOLS / "bin" / "agent-wrapper-install-shims",
+        # persona-seat.sh:resolve_real_engine() deliberately references the real
+        # engine binaries (and their front-door fallbacks) to *bypass* the launch
+        # wrapper — re-entering a shim would re-stall the pane reap. It prefers
+        # *.token-os-real and greps out wrapper shims, so the front-door paths are
+        # last-resort resolution targets, not raw launches. (Introduced by #366.)
+        CLI_TOOLS / "scripts" / "persona-seat.sh",
     }
     launch_files = [
         CLI_TOOLS / "bin" / "dispatch",

@@ -2961,3 +2961,156 @@ def test_dispatch_dup_guard_force_occupied_override_allows_launch(tmp_path: Path
     assert result.returncode == 0, result.stderr
     assert "a live agent is already running" not in result.stderr
     assert "dispatched claude to mechanicus:new" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Occupancy guard: pane_has_active_agent_process self-referential false-positive
+#
+# The resume path types `dispatch ... --engine codex ...` into the *target pane's
+# own shell* (executor.send_keys), so the running dispatch — argv carrying the
+# literal "codex" — is a child of pane_pid. The occupancy guard walks pane_pid's
+# subtree; the old `claude|codex` substring needle matched dispatch's own
+# `--engine codex` argument, so dispatch refused itself on every resume. These
+# tests use live process fixtures (per shop convention) to pin the fix:
+#   - a dispatch self-invocation with --engine codex must NOT be counted
+#   - a genuine live claude/codex *program* in the subtree must still be counted
+#   - a real agent that is part of dispatch's own (self) lineage is excluded
+# ---------------------------------------------------------------------------
+
+_GUARD_FN = "pane_has_active_agent_process"
+
+
+def _extract_bash_function(name: str) -> str:
+    text = DISPATCH.read_text(encoding="utf-8")
+    start = text.index(f"{name}() {{")
+    end = text.index("\n}\n", start) + len("\n}\n")
+    return text[start:end]
+
+
+# Distinct sentinel exit codes so a harness/shell failure (unbound var, missing
+# fixture, syntax error → exit 1/2/127/…) can never be mistaken for a genuine
+# guard "clear" verdict. The guard's own 0/1 is mapped onto these before exit.
+_GUARD_FOUND = 10  # guard counted a live agent (dispatch would refuse)
+_GUARD_CLEAR = 11  # guard found nothing (dispatch would proceed)
+
+
+def _sleep_bin() -> str:
+    """Absolute path to the real `sleep` binary, portable across mac/Linux CI.
+
+    The genuine-agent fixtures symlink an agent-named launcher onto this so the
+    process actually runs; a hardcoded /bin/sleep is absent on some Linux runners
+    (sleep lives at /usr/bin/sleep), which silently kills the fixture.
+    """
+    found = shutil.which("sleep")
+    assert found, "no `sleep` on PATH"
+    return found
+
+
+def _run_guard_scenario(scenario: str, tmp_path: Path) -> int:
+    """Run the live occupancy guard against a real process tree.
+
+    `scenario` is bash that must spawn the fixture processes, append their pids to
+    the ``PIDS`` array, and set ``ROOT`` (the pane_pid subtree to scan) and ``SELF``
+    (dispatch's own pid, whose lineage is excluded). Returns the guard's exit
+    status: 0 = a live agent was found (dispatch would refuse), 1 = clear.
+    """
+    harness = "\n".join(
+        [
+            "set -u",
+            _extract_bash_function(_GUARD_FN),
+            "PIDS=()",
+            scenario,
+            "sleep 0.5",
+            f'if {_GUARD_FN} "$ROOT" "$SELF"; then rc={_GUARD_FOUND}; else rc={_GUARD_CLEAR}; fi',
+            'for p in "${PIDS[@]}"; do pkill -P "$p" 2>/dev/null || true; '
+            'kill "$p" 2>/dev/null || true; done',
+            "exit $rc",
+        ]
+    )
+    script = tmp_path / "guard_harness.sh"
+    script.write_text(harness, encoding="utf-8")
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, check=False)
+    assert proc.returncode in (_GUARD_FOUND, _GUARD_CLEAR), (
+        f"harness failed (rc={proc.returncode}): {proc.stderr}"
+    )
+    return 0 if proc.returncode == _GUARD_FOUND else 1
+
+
+def test_guard_does_not_self_refuse_dispatch_with_engine_codex_arg(tmp_path: Path) -> None:
+    # Bug repro: dispatch typed into the target pane's shell is a child of pane_pid
+    # and its argv carries "--engine codex". It must not be counted as a live agent.
+    scenario = (
+        '( exec -a "bash /x/cli-tools/bin/dispatch --id u --pane palace:5 '
+        '--engine codex --dir /tmp/wt" /bin/sleep 30 ) &\n'
+        "child=$!\n"
+        'PIDS+=("$child")\n'
+        "ROOT=$$\n"  # the harness shell stands in for the pane shell (pane_pid)
+        "SELF=$child\n"  # dispatch passes its own pid; its lineage is excluded
+    )
+    assert _run_guard_scenario(scenario, tmp_path) == 1
+
+
+def test_guard_does_not_self_refuse_dispatch_with_engine_claude_arg(tmp_path: Path) -> None:
+    # Same bug, claude engine: "--engine claude" as an argument is not a live agent.
+    scenario = (
+        '( exec -a "bash /x/cli-tools/bin/dispatch --id u --pane palace:5 '
+        '--engine claude --dir /tmp/wt" /bin/sleep 30 ) &\n'
+        "child=$!\n"
+        'PIDS+=("$child")\n'
+        "ROOT=$$\n"
+        "SELF=$child\n"
+    )
+    assert _run_guard_scenario(scenario, tmp_path) == 1
+
+
+def test_guard_refuses_genuine_live_codex_descendant(tmp_path: Path) -> None:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "codex").symlink_to(_sleep_bin())
+    scenario = (
+        f'"{bindir}/codex" 30 &\n'
+        "agent=$!\n"
+        'PIDS+=("$agent")\n'
+        "sleep 30 &\n"  # dispatch's own pid is a sibling of a pre-existing agent,
+        "self=$!\n"  # never its ancestor, so self-exclusion must not apply here
+        'PIDS+=("$self")\n'
+        "ROOT=$$\n"
+        "SELF=$self\n"
+    )
+    assert _run_guard_scenario(scenario, tmp_path) == 0
+
+
+def test_guard_refuses_genuine_live_claude_real_descendant(tmp_path: Path) -> None:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "claude.token-os-real").symlink_to(_sleep_bin())
+    scenario = (
+        f'"{bindir}/claude.token-os-real" 30 &\n'
+        "agent=$!\n"
+        'PIDS+=("$agent")\n'
+        "sleep 30 &\n"  # sibling self pid (dispatch's own), not an ancestor
+        "self=$!\n"
+        'PIDS+=("$self")\n'
+        "ROOT=$$\n"
+        "SELF=$self\n"
+    )
+    assert _run_guard_scenario(scenario, tmp_path) == 0
+
+
+def test_guard_excludes_real_agent_in_self_lineage(tmp_path: Path) -> None:
+    # A genuine codex program, but spawned as a descendant of the dispatch process
+    # (self) — e.g. dispatch's staged child tree. It must never count against self.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "codex").symlink_to(_sleep_bin())
+    parent = tmp_path / "self_parent.sh"
+    parent.write_text(f'#!/bin/bash\n"{bindir}/codex" 30 &\nsleep 30\n', encoding="utf-8")
+    parent.chmod(0o755)
+    scenario = (
+        f'bash "{parent}" &\n'
+        "self=$!\n"
+        'PIDS+=("$self")\n'
+        "ROOT=$$\n"
+        "SELF=$self\n"  # the codex agent is a child of $self -> excluded by lineage
+    )
+    assert _run_guard_scenario(scenario, tmp_path) == 1
