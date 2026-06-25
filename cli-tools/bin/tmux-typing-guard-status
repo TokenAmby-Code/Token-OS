@@ -42,10 +42,11 @@ if str(_LIB) not in sys.path:
     sys.path.insert(0, str(_LIB))
 
 # Styled status-right segment (matches the bar's colour theme) and the compact
-# marker pushed into the per-pane @GUARD border var.
+# colour-by-state markers pushed into the per-pane @GUARD border var.
 SEGMENT_STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
 SEGMENT_PLAIN = "TYPE"
-BORDER_MARKER = "#[fg=colour214,bold]⌨#[default]"
+BORDER_MARKER_ON = "#[fg=colour214,bold]⌨#[default]"
+BORDER_MARKER_PENDING = "#[fg=red,bold]⌨#[default]"
 _TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
 _TYPING_PENDING_OPTION = "@TYPING_PENDING_UNTIL"
 
@@ -90,9 +91,26 @@ def _live_panes(binary: str) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+def _pending_active(binary: str, pane: str) -> bool:
+    """True iff the pane is inside its short pending hold."""
+    import time
+
+    pending_until = _pane_option_epoch(binary, pane, _TYPING_PENDING_OPTION)
+    return pending_until is not None and time.time() < pending_until
+
+
 def _publish(binary: str, pane: str, active: bool) -> None:
-    """Push the pane-scoped @GUARD border var (zero-fork to render later)."""
-    value = BORDER_MARKER if active else ""
+    """Push the pane-scoped @GUARD border var (zero-fork to render later).
+
+    ON renders as yellow keyboard; pending renders as red keyboard. No literal
+    text is included in @GUARD, so pane borders/statusline stay compact.
+    """
+    if not active:
+        value = ""
+    elif _pending_active(binary, pane):
+        value = BORDER_MARKER_PENDING
+    else:
+        value = BORDER_MARKER_ON
     # Best-effort: a failed option write must never break the segment render.
     _tmux(binary, "set-option", "-p", "-t", pane, "@GUARD", value)
 

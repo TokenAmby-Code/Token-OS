@@ -24,6 +24,8 @@ REPO = Path(__file__).resolve().parents[2]
 STATUS = REPO / "cli-tools" / "bin" / "tmux-typing-guard-status"
 
 STYLED = "#[fg=colour214,bold]⌨ GUARD#[default] "
+MARKER_ON = "#[fg=colour214,bold]⌨#[default]"
+MARKER_PENDING = "#[fg=red,bold]⌨#[default]"
 
 
 def _fake_tmux(tmp_path: Path) -> Path:
@@ -199,7 +201,18 @@ def test_segment_publishes_pane_scoped_guard_option(tmp_path: Path) -> None:
     """The active pane's border var is pushed so it renders with zero fork."""
     env = _env(tmp_path, locks={"%1": int(time.time()) + 200})
     _run(env)
-    assert _guard_value_for(env, "%1") not in (None, ""), "locked pane must get a non-empty @GUARD"
+    assert _guard_value_for(env, "%1") == MARKER_ON, "ON pane must get yellow keyboard @GUARD"
+
+
+def test_segment_publishes_pending_as_red_keyboard_only(tmp_path: Path) -> None:
+    """Pending must recolor the emoji red, not append literal PENDING text."""
+    env = _env(tmp_path, locks={}, pending={"%1": int(time.time()) + 5})
+
+    assert _run(env).stdout == STYLED
+
+    marker = _guard_value_for(env, "%1")
+    assert marker == MARKER_PENDING
+    assert "PENDING" not in marker
 
 
 def test_segment_clears_pane_guard_option_when_dark(tmp_path: Path) -> None:

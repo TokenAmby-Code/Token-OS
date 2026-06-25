@@ -232,7 +232,7 @@ def test_keystroke_lock_any_key_binding_arms_first_keystroke_no_refresh() -> Non
 
 
 def test_keystroke_lock_enter_moves_to_pending_and_submits() -> None:
-    """Enter clears the ON lock, enters short PENDING, and submits.
+    """Enter clears the ON lock, enters short pending, and submits.
 
     Pending remains send-blocking, so automation cannot race the human's submit.
     """
@@ -240,9 +240,36 @@ def test_keystroke_lock_enter_moves_to_pending_and_submits() -> None:
         line = _line_starting(f"bind -n {key} ")
         assert "set -pu @TYPING_LOCK_UNTIL" in line, f"{key} must UNSET the pane lock"
         assert "set -Fp @TYPING_PENDING_UNTIL '#{e|+:#{client_activity},5}'" in line
-        assert 'set -p @GUARD "#[fg=colour214,bold]⌨ PENDING#[default]"' in line
+        assert 'set -p @GUARD "#[fg=red,bold]⌨#[default]"' in line
+        assert "⌨ PENDING" not in line, "pending marker must be red emoji only, no literal text"
         assert "tmux-typing-guard-status --expire-pane #{q:pane_id}" in line
         assert "send-keys" in line, f"{key} must still pass through (submit)"
+
+
+def test_keystroke_lock_backspace_moves_on_to_pending_without_text() -> None:
+    """Backspace is a special key, so it must be bound explicitly.
+
+    When the pane is ON, Backspace enters a compact pending hold and turns the
+    keyboard emoji red. Repeated Backspace while already pending must be a bare
+    send-keys fast path with no option writes.
+    """
+    for key in ("BSpace", "C-h", "C-?"):
+        block = (
+            CONF.read_text(encoding="utf-8").split(f"bind -n {key} {{", 1)[1].split("\n}\n", 1)[0]
+        )
+        assert "@TYPING_PENDING_UNTIL" in block
+        assert "#{e|+:#{client_activity},15}" in block
+        assert "set -pu @TYPING_LOCK_UNTIL" in block
+        assert 'set -p @GUARD "#[fg=red,bold]⌨#[default]"' in block
+        assert "⌨ PENDING" not in block, "pending marker must never include literal text"
+
+        pending_branch = block.split(
+            "if -F '#{?#{e|>=:#{@TYPING_PENDING_UNTIL},#{client_activity}},1,0}' {",
+            1,
+        )[1].split("} {", 1)[0]
+        assert "set " not in pending_branch
+        assert "run-shell" not in pending_branch
+        assert "send-keys" in pending_branch
 
 
 def test_pane_border_identity_is_blank_by_default() -> None:
