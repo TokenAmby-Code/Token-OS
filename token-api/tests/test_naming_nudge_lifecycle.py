@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import sys
 from datetime import datetime
@@ -7,31 +8,109 @@ from datetime import datetime
 import pytest
 
 
-def _insert_wrapper_instance(db_path, *, instance_id="wrap-unnamed", wrapper_id="wrap-1") -> None:
+def _insert_wrapper_instance(
+    db_path, *, instance_id="wrap-unnamed", wrapper_id="wrap-1", name="needs-name"
+) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO instances (
                 id, name, engine, working_dir, device_id, status, rank,
                 wrapper_launch_id, session_doc_id
-            ) VALUES (?, 'needs-name', 'codex', '/tmp', 'Mac-Mini', 'working',
+            ) VALUES (?, ?, 'codex', '/tmp', 'Mac-Mini', 'working',
                       'astartes', ?, NULL)
             """,
-            (instance_id, wrapper_id),
+            (instance_id, name, wrapper_id),
         )
 
 
 @pytest.mark.asyncio
-async def test_wrapper_end_schedules_harness_agnostic_naming_nudge(app_env, monkeypatch) -> None:
-    """Wrapper-only Codex launches may miss Stop/SessionEnd; terminal WrapperEnd
-    must still route through the same unnamed-pane nudge policy.
-    """
+async def test_prompt_submit_on_placeholder_row_schedules_naming_nudge(
+    app_env, monkeypatch
+) -> None:
+    """Normal naming interview is scheduled after the first prompt-submit commit."""
     hooks = sys.modules["routes.hooks"]
-    _insert_wrapper_instance(app_env.db_path)
+    _insert_wrapper_instance(app_env.db_path, instance_id="prompt-unnamed", wrapper_id="wrap-p")
 
     scheduled: list[tuple[str | None, str]] = []
     monkeypatch.setattr(
         hooks, "_schedule_naming_nudge", lambda iid, source: scheduled.append((iid, source))
+    )
+
+    result = await hooks.handle_prompt_submit({"session_id": "prompt-unnamed"})
+
+    assert result["action"] == "processing"
+    assert scheduled == [("prompt-unnamed", "UserPromptSubmit")]
+    with sqlite3.connect(app_env.db_path) as conn:
+        assert conn.execute(
+            """
+            SELECT 1 FROM events
+            WHERE instance_id = 'prompt-unnamed'
+              AND event_type = 'hook_user_prompt_submit'
+            """
+        ).fetchone()
+
+
+@pytest.mark.asyncio
+async def test_prompt_submit_on_named_row_does_not_schedule_naming_nudge(
+    app_env, monkeypatch
+) -> None:
+    """Already named panes must not get a rename interview on prompt submit."""
+    hooks = sys.modules["routes.hooks"]
+    _insert_wrapper_instance(
+        app_env.db_path,
+        instance_id="prompt-named",
+        wrapper_id="wrap-named",
+        name="active-naming-hook",
+    )
+
+    scheduled: list[tuple[str | None, str]] = []
+    monkeypatch.setattr(
+        hooks, "_schedule_naming_nudge", lambda iid, source: scheduled.append((iid, source))
+    )
+
+    result = await hooks.handle_prompt_submit({"session_id": "prompt-named"})
+
+    assert result["action"] == "processing"
+    assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_session_start_does_not_schedule_naming_nudge(app_env, monkeypatch) -> None:
+    """SessionStart only registers/stamps; naming waits for the first real prompt."""
+    hooks = sys.modules["routes.hooks"]
+    monkeypatch.setattr(
+        hooks,
+        "_schedule_naming_nudge",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("SessionStart must not schedule naming nudges")
+        ),
+    )
+
+    result = await hooks.handle_session_start(
+        {
+            "session_id": "sess-needs-name",
+            "cwd": "/tmp",
+            "pid": 1001,
+            "env": {"TMUX_PANE": "%42", "TOKEN_API_ENGINE": "claude"},
+        }
+    )
+
+    assert result["action"] == "registered"
+
+
+@pytest.mark.asyncio
+async def test_wrapper_end_does_not_schedule_naming_nudge(app_env, monkeypatch) -> None:
+    """WrapperEnd is terminal cleanup only; no post-exit rename prompt."""
+    hooks = sys.modules["routes.hooks"]
+    _insert_wrapper_instance(app_env.db_path)
+
+    monkeypatch.setattr(
+        hooks,
+        "_schedule_naming_nudge",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("WrapperEnd must not schedule naming nudges")
+        ),
     )
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
 
@@ -46,20 +125,20 @@ async def test_wrapper_end_schedules_harness_agnostic_naming_nudge(app_env, monk
     )
 
     assert result["action"] == "wrapper_end_stopped_instance"
-    assert scheduled == [("wrap-unnamed", "WrapperEnd")]
 
 
 @pytest.mark.asyncio
-async def test_session_end_schedules_harness_agnostic_naming_nudge(app_env, monkeypatch) -> None:
-    """SessionEnd is also terminal; the rename interview should not depend on
-    Claude's separate naming-nudge shell shim or Codex's Stop hook.
-    """
+async def test_session_end_does_not_schedule_naming_nudge(app_env, monkeypatch) -> None:
+    """SessionEnd must not bury the real exit blurb with a naming interview."""
     hooks = sys.modules["routes.hooks"]
     _insert_wrapper_instance(app_env.db_path, instance_id="sess-unnamed", wrapper_id="wrap-2")
 
-    scheduled: list[tuple[str | None, str]] = []
     monkeypatch.setattr(
-        hooks, "_schedule_naming_nudge", lambda iid, source: scheduled.append((iid, source))
+        hooks,
+        "_schedule_naming_nudge",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("SessionEnd must not schedule naming nudges")
+        ),
     )
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
     monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
@@ -69,7 +148,89 @@ async def test_session_end_schedules_harness_agnostic_naming_nudge(app_env, monk
     )
 
     assert result["action"] == "stopped"
-    assert scheduled == [("sess-unnamed", "SessionEnd")]
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_schedule_naming_nudge(app_env, monkeypatch) -> None:
+    """Stop must not bury the real exit blurb with a naming interview."""
+    hooks = sys.modules["routes.hooks"]
+    _insert_wrapper_instance(app_env.db_path, instance_id="stop-unnamed", wrapper_id="wrap-stop")
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute("UPDATE instances SET is_subagent = 1 WHERE id = 'stop-unnamed'")
+
+    monkeypatch.setattr(
+        hooks,
+        "_schedule_naming_nudge",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("Stop must not schedule naming nudges")
+        ),
+    )
+
+    result = await hooks.handle_stop({"session_id": "stop-unnamed", "pid": 1003})
+
+    assert result["action"] == "stop_processed_subagent"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_schedules_live_placeholder_with_prompt_evidence(
+    app_env, monkeypatch
+) -> None:
+    """Daemon backstop nudges live placeholder rows only after a real prompt event."""
+    main = app_env.main
+    _insert_wrapper_instance(app_env.db_path, instance_id="reconcile-unnamed", wrapper_id="wrap-r")
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            "INSERT INTO events (event_type, instance_id) VALUES ('hook_user_prompt_submit', 'reconcile-unnamed')"
+        )
+
+    async def reachable_tmux():
+        return {}
+
+    async def live_ids():
+        return {"reconcile-unnamed"}
+
+    nudged: list[str] = []
+
+    async def fake_maybe(instance_id):
+        nudged.append(instance_id)
+        return {"success": True, "action": "nudge_sent"}
+
+    monkeypatch.setattr(main, "_read_tmux_panes", reachable_tmux)
+    monkeypatch.setattr(main, "_live_agent_instance_ids", live_ids)
+    monkeypatch.setattr(main, "_maybe_naming_nudge", fake_maybe)
+
+    counts = await main._run_tmux_db_reconcile_cycle()
+    await asyncio.sleep(0)
+
+    assert counts["naming_nudge_scheduled"] == 1
+    assert nudged == ["reconcile-unnamed"]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_does_not_nudge_live_placeholder_without_prompt_evidence(
+    app_env, monkeypatch
+) -> None:
+    """A merely opened placeholder pane is not interviewed until UserPromptSubmit."""
+    main = app_env.main
+    _insert_wrapper_instance(app_env.db_path, instance_id="reconcile-quiet", wrapper_id="wrap-q")
+
+    async def reachable_tmux():
+        return {}
+
+    async def live_ids():
+        return {"reconcile-quiet"}
+
+    async def fail_maybe(instance_id):
+        raise AssertionError(f"unexpected naming nudge: {instance_id}")
+
+    monkeypatch.setattr(main, "_read_tmux_panes", reachable_tmux)
+    monkeypatch.setattr(main, "_live_agent_instance_ids", live_ids)
+    monkeypatch.setattr(main, "_maybe_naming_nudge", fail_maybe)
+
+    counts = await main._run_tmux_db_reconcile_cycle()
+    await asyncio.sleep(0)
+
+    assert counts["naming_nudge_scheduled"] == 0
 
 
 @pytest.mark.asyncio

@@ -29,6 +29,14 @@ def _stamp_calls(calls: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
     ]
 
 
+def _pane_label_calls(calls: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    return [
+        c
+        for c in calls
+        if len(c) >= 6 and c[0] == "tmux" and c[1] == "set-option" and c[5] == "@PANE_LABEL"
+    ]
+
+
 def test_fresh_registration_stamps_instance_id(app_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
     calls, fake_offloop = _recorder()
@@ -56,6 +64,11 @@ def test_fresh_registration_stamps_instance_id(app_env, monkeypatch):
     value = stamps[-1][6]
     assert pane == "%77"
     assert value == session_id
+
+    labels = _pane_label_calls(calls)
+    assert labels, f"no @PANE_LABEL stamp recorded; calls={calls}"
+    assert labels[-1][4] == "%77"
+    assert labels[-1][6] == "needs-name"
 
 
 def test_reregistration_restamps_instance_id(app_env, monkeypatch):
