@@ -32,6 +32,9 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+import uuid
+from collections import deque
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,7 +42,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .api import RegistryError
 from .service import TmuxControlPlane
-from .tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated
+from .tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated, prompt_payload_hash
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7778
@@ -54,6 +57,87 @@ log = logging.getLogger("tmuxctld")
 
 _RAW_TMUX_ID_RX = re.compile(r"%\d+")
 _PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
+
+
+class PromptSubmitSniffer:
+    """In-memory UserPromptSubmit acknowledgement bus for daemon send transactions.
+
+    The daemon is the only process that can know "I issued this prompt send" at
+    the exact time the bytes hit tmux. Token-API owns the agent hook receiver.
+    The hook handler echoes UserPromptSubmit facts back here; the daemon waits
+    on that echo before reporting a prompt send as verified.
+    """
+
+    def __init__(self, *, max_events: int = 2048) -> None:
+        self._cond = threading.Condition()
+        self._events: deque[dict] = deque(maxlen=max_events)
+
+    def record(self, payload: dict) -> dict:
+        instance_id = str(
+            payload.get("session_id") or payload.get("instance_id") or payload.get("id") or ""
+        ).strip()
+        prompt_hash = str(payload.get("prompt_hash") or payload.get("payload_hash") or "").strip()
+        event = {
+            "event": "UserPromptSubmit",
+            "instance_id": instance_id,
+            "pane": str(payload.get("pane") or "").strip(),
+            "prompt_hash": prompt_hash,
+            "at": time.monotonic(),
+            "wall_time": time.time(),
+        }
+        with self._cond:
+            self._events.append(event)
+            self._cond.notify_all()
+        return event
+
+    @staticmethod
+    def _matches(
+        event: dict,
+        *,
+        instance_id: str,
+        payload_hash: str,
+        since: float,
+    ) -> bool:
+        if event.get("at", 0) < since:
+            return False
+        if instance_id and event.get("instance_id") != instance_id:
+            return False
+        event_hash = str(event.get("prompt_hash") or "").strip()
+        # Prefer exact hash matching when the hook surface supplies it. Some
+        # current Claude/Codex UserPromptSubmit payloads do not; in that case,
+        # same-instance-after-send is still a real submit acknowledgement.
+        if event_hash and payload_hash and event_hash != payload_hash:
+            return False
+        return True
+
+    def wait(
+        self,
+        *,
+        instance_id: str,
+        payload_hash: str,
+        since: float,
+        timeout: float,
+    ) -> dict | None:
+        if not instance_id or timeout <= 0:
+            return None
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                for event in reversed(self._events):
+                    if self._matches(
+                        event,
+                        instance_id=instance_id,
+                        payload_hash=payload_hash,
+                        since=since,
+                    ):
+                        return dict(event)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(timeout=remaining)
+
+
+_PROMPT_SUBMIT_SNIFFER = PromptSubmitSniffer()
 
 
 def _safe_public_role(role: str | None) -> str:
@@ -288,12 +372,100 @@ def _h_send_keys(control, params):
 
 
 def _h_send_text(control, params):
-    return control.send_text(
-        _s(params, "pane"),
-        _s(params, "text"),
-        clear_prompt=_b(params, "clear_prompt"),
-        submit=_b(params, "submit", True),
-    )
+    pane = _s(params, "pane")
+    text = _s(params, "text")
+    submit = _b(params, "submit", True)
+    clear_prompt = _b(params, "clear_prompt")
+    verify = _b(params, "verify", submit)
+    verify_timeout = _f(params, "verify_timeout", 5.0)
+    submit_settle_seconds = _f(params, "submit_settle_seconds", 1.0)
+    ack_submit_retries = _i(params, "ack_submit_retries", 2)
+    pre_submit_raw = params.get("pre_submit_keys", ())
+    if isinstance(pre_submit_raw, str):
+        pre_submit_keys = tuple(k for k in pre_submit_raw.split(",") if k)
+    elif isinstance(pre_submit_raw, list | tuple):
+        pre_submit_keys = tuple(str(k) for k in pre_submit_raw if str(k))
+    else:
+        pre_submit_keys = ()
+
+    if not submit:
+        return control.send_text(pane, text, clear_prompt=clear_prompt, submit=False)
+
+    payload_hash = prompt_payload_hash(text)
+    dispatch_id = str(uuid.uuid4())
+    instance_id = ""
+    try:
+        instance_id = str(control.instance_id_for_pane(pane).get("instance_id") or "").strip()
+    except Exception:
+        instance_id = ""
+
+    started = time.monotonic()
+    if hasattr(control.adapter, "send_text_then_submit"):
+        control.adapter.send_text_then_submit(
+            pane,
+            text,
+            clear_prompt=clear_prompt,
+            pre_submit_keys=pre_submit_keys,
+            submit_settle_seconds=submit_settle_seconds,
+        )
+    else:
+        normalized = re.sub(r"[\r\n]+", " ", text).rstrip()
+        if not normalized.strip():
+            raise ValueError("prompt payload is empty after normalization")
+        if clear_prompt:
+            control.adapter.send_keys(pane, "C-u")
+        control.adapter.run("send-keys", "-t", pane, "-l", normalized)
+        gate = getattr(control.adapter, "last_send_gate_result", None)
+        if gate and gate.get("suppressed"):
+            raise TmuxSendGated(gate)
+        # Test-adapter fallback. Real daemon sends use TmuxAdapter's canonical
+        # method above; callers must not assemble send-keys outside tmuxctld.
+        if submit_settle_seconds > 0:
+            time.sleep(submit_settle_seconds)
+        for key in pre_submit_keys:
+            control.adapter.send_keys(pane, key)
+        if pre_submit_keys and submit_settle_seconds > 0:
+            time.sleep(submit_settle_seconds)
+        control.adapter.send_keys(pane, "C-m")
+        if submit_settle_seconds > 0:
+            time.sleep(submit_settle_seconds)
+        control.adapter.send_keys(pane, "C-m")
+
+    def _send_submit_key() -> None:
+        if hasattr(control.adapter, "send_keys"):
+            control.adapter.send_keys(pane, "C-m")
+        else:
+            control.adapter.run("send-keys", "-t", pane, "C-m")
+
+    ack = None
+    if verify:
+        for attempt in range(max(0, ack_submit_retries) + 1):
+            ack = _PROMPT_SUBMIT_SNIFFER.wait(
+                instance_id=instance_id,
+                payload_hash=payload_hash,
+                since=started,
+                timeout=verify_timeout,
+            )
+            if ack or attempt >= max(0, ack_submit_retries):
+                break
+            # Handshake recovery: if the TUI swallowed the prior submit as a
+            # prompt newline, a later standalone carriage return is the proven
+            # white-whale recovery key. The daemon owns this retry; callers do
+            # not pile on their own raw send-keys.
+            _send_submit_key()
+            if submit_settle_seconds > 0:
+                time.sleep(submit_settle_seconds)
+    verification_status = "submitted" if ack else ("unverified" if verify else "not_requested")
+    return {
+        "status": "submitted" if ack else "unverified",
+        "pane": pane,
+        "instance_id": instance_id,
+        "dispatch_id": dispatch_id,
+        "payload_hash": payload_hash,
+        "verification_status": verification_status,
+        "verified_by": "UserPromptSubmit" if ack else None,
+        "ack": ack,
+    }
 
 
 def _h_insert_text(control, params):
@@ -344,6 +516,10 @@ def _h_event(control, params):
     return control.handle_event(
         _s(params, "event"), pane=_s(params, "pane"), session=_s(params, "session", "main")
     )
+
+
+def _h_hook_user_prompt_submit(_control, params):
+    return _PROMPT_SUBMIT_SNIFFER.record(params)
 
 
 def _h_clear_runtime(control, params):
@@ -528,12 +704,26 @@ def _h_instance_unset_option(control, params):
 
 
 def _h_instance_send_text(control, params):
-    return control.instance_send_text(
-        _s(params, "instance_id"),
-        _s(params, "text"),
-        clear_prompt=_b(params, "clear_prompt"),
-        submit=_b(params, "submit", True),
+    instance_id = _s(params, "instance_id")
+    if not _b(params, "submit", True):
+        return control.instance_send_text(
+            instance_id,
+            _s(params, "text"),
+            clear_prompt=_b(params, "clear_prompt"),
+            submit=False,
+        )
+    resolved = control.resolve_instance(instance_id)
+    if not resolved["found"]:
+        return {"instance_id": instance_id, "found": False}
+    result = _h_send_text(
+        control,
+        {
+            **params,
+            "pane": resolved["pane_id"],
+            "verify": _b(params, "verify", True),
+        },
     )
+    return {**result, "instance_id": instance_id, "found": True}
 
 
 def _h_instance_tint(control, params):
@@ -577,6 +767,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/prompt-end"): _h_prompt_end,
     ("POST", "/invoke-skill"): _h_invoke_skill,
     ("POST", "/assert-instance"): _h_assert_instance,
+    ("POST", "/hooks/user-prompt-submit"): _h_hook_user_prompt_submit,
     # Event-driven persona reconcile (replaces the retired 2-min assert-personas
     # poll). /reconcile re-seats all must-fill seats; /event ingests a single tmux
     # lifecycle event (a persona pane-died self-heal). Nothing polls these.

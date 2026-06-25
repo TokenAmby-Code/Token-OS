@@ -8,6 +8,7 @@ source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${_LIB_DIR}/tmux-guard.sh"
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+TMUXCTLD_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
 TMUXCTL_BIN="${TMUXCTL_BIN:-${_BIN_DIR}/tmuxctl}"
 TARGET_MODE="self"
 TARGET_VALUE=""
@@ -143,7 +144,7 @@ fi
 send_command() {
     local pane="$1" cmd="$2" locker="agent-cmd-$$" locked=false rc=0 out lock_resp
     local dispatch_id hash
-    local blocked=false reason="" verification_status="sent"
+    local blocked=false reason="" verification_status="unverified" verified_by="tmuxctld"
     dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
     hash=$(printf '%s' "$cmd" | payload_hash)
 
@@ -159,13 +160,44 @@ send_command() {
         done
     fi
 
-    local -a send_args=(send-text --pane "$pane" --text "$cmd")
-    [[ "$NO_SUBMIT" == true ]] && send_args+=(--no-submit)
-    out=$("$TMUXCTL_BIN" "${send_args[@]}" 2>&1) || {
+    out=$(python3 - "$TMUXCTLD_URL" "$pane" "$cmd" "$NO_SUBMIT" <<'PY' 2>&1
+import json
+import sys
+import urllib.request
+
+url, pane, text, no_submit = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "true"
+body = {
+    "pane": pane,
+    "text": text,
+    "submit": not no_submit,
+    "verify": not no_submit,
+    "verify_timeout": 6.0,
+}
+req = urllib.request.Request(
+    url.rstrip("/") + "/send-text",
+    data=json.dumps(body).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=12) as resp:
+    payload = json.loads(resp.read().decode("utf-8") or "{}")
+print(json.dumps(payload, separators=(",", ":")))
+if not payload.get("ok"):
+    raise SystemExit(2)
+PY
+    ) || {
         echo "$out" >&2
         rc=1
     }
-    [[ "$rc" == 0 ]] || verification_status="failed"
+    if [[ "$rc" == 0 ]]; then
+        verification_status=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verification_status") or "unverified")' <<<"$out" 2>/dev/null || echo "unverified")
+        verified_by=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verified_by") or "tmuxctld")' <<<"$out" 2>/dev/null || echo "tmuxctld")
+        dispatch_id=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("dispatch_id") or "")' <<<"$out" 2>/dev/null || true)
+        [[ -n "$dispatch_id" ]] || dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+    else
+        verification_status="failed"
+        verified_by="tmuxctld"
+    fi
 
     if [[ "$locked" == true ]]; then
         curl -s --connect-timeout 1 --max-time 2 \
@@ -174,7 +206,7 @@ send_command() {
     fi
 
     printf '{"dispatch_id":"%s","payload_hash":"%s","pane":"%s","instance_id":"%s","verification_status":"%s","verified_by":"%s","blocked":%s,"reason":"%s"}\n' \
-        "$dispatch_id" "$hash" "$pane" "${INSTANCE_ID:-}" "$verification_status" "$([[ "$blocked" == true ]] && echo tmux-guard || echo tmuxctl)" "$blocked" "$reason"
+        "$dispatch_id" "$hash" "$pane" "${INSTANCE_ID:-}" "$verification_status" "$verified_by" "$blocked" "$reason"
     return "$rc"
 }
 

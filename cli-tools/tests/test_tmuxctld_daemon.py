@@ -10,6 +10,7 @@ import pathlib
 import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -59,6 +60,15 @@ def _post(server, path: str, body):
         url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+def _post_timeout(server, path: str, body, *, timeout: float = 5):
+    url = f"http://127.0.0.1:{server.server_address[1]}{path}"
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
@@ -250,6 +260,96 @@ def test_bad_json_body_is_400() -> None:
             assert exc.code == 400
             body = json.loads(exc.read().decode("utf-8"))
             assert body["error"]["code"] == "bad_request"
+    finally:
+        server.shutdown()
+
+
+class SendAckAdapter:
+    """Pane carries an instance stamp; send-keys calls are recorded."""
+
+    calls: list[tuple[str, ...]] = []
+
+    def __init__(self) -> None:
+        self.last_send_gate_result = None
+
+    def list_sessions(self) -> list:
+        return []
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        type(self).calls.append(tuple(args))
+        return ""
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        return "inst-ack" if option == "@INSTANCE_ID" else ""
+
+
+def test_send_text_waits_for_user_prompt_submit_ack() -> None:
+    SendAckAdapter.calls = []
+    server, _ = _serve(SendAckAdapter)
+    try:
+        result_box: dict = {}
+
+        def send() -> None:
+            result_box["status"], result_box["payload"] = _post_timeout(
+                server,
+                "/send-text",
+                {
+                    "pane": "%42",
+                    "text": "do the thing",
+                    "verify": True,
+                    "verify_timeout": 2,
+                    "submit_settle_seconds": 0.01,
+                },
+                timeout=5,
+            )
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        time.sleep(0.05)
+        _, ack = _post(
+            server,
+            "/hooks/user-prompt-submit",
+            {"session_id": "inst-ack"},
+        )
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert ack["ok"] is True
+        payload = result_box["payload"]
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["verification_status"] == "submitted"
+        assert result["verified_by"] == "UserPromptSubmit"
+        assert result["instance_id"] == "inst-ack"
+        assert ("send-keys", "-t", "%42", "-l", "do the thing") in SendAckAdapter.calls
+        assert ("send-keys", "-t", "%42", "C-m") in SendAckAdapter.calls
+    finally:
+        server.shutdown()
+
+
+def test_send_text_reports_unverified_without_prompt_submit_ack() -> None:
+    SendAckAdapter.calls = []
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["verification_status"] == "unverified"
+        assert result["verified_by"] is None
     finally:
         server.shutdown()
 

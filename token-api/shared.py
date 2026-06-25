@@ -697,14 +697,17 @@ _TMUXCTLD_OPENER: urllib.request.OpenerDirector = urllib.request.build_opener(
 _TMUXCTLD_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
-def _tmuxctld_url() -> str | None:
+def _tmuxctld_url(*, default_loopback: bool = False) -> str | None:
     """Return the configured tmuxctld base URL, or None.
 
     Trailing slash trimmed; only ``http`` loopback URLs are honoured — a
     non-loopback (or non-http) host is rejected (returns None) so the client
     never reaches off-box.
     """
-    url = str(os.environ.get("TMUXCTLD_URL") or "").strip().rstrip("/")
+    configured = str(os.environ.get("TMUXCTLD_URL") or "").strip()
+    if configured.lower() in {"0", "false", "off", "disabled"}:
+        return None
+    url = (configured or ("http://127.0.0.1:7778" if default_loopback else "")).rstrip("/")
     if not url:
         return None
     parsed = urllib.parse.urlsplit(url)
@@ -736,6 +739,36 @@ def _tmuxctld_get_json(path: str, params: dict[str, str], *, timeout: float = 0.
         return None
     result = payload.get("result")
     return result if isinstance(result, dict) else None
+
+
+def _tmuxctld_post_json(
+    path: str, body: dict, *, timeout: float = 10.0, default_loopback: bool = False
+) -> dict | None:
+    """POST JSON to tmuxctld and return the full daemon envelope.
+
+    Unlike the GET resolver helper, callers need both ok:true results and
+    ok:false structured errors such as code=gated. Returns None only for absent
+    config, transport errors, non-200, or malformed responses.
+    """
+    base = _tmuxctld_url(default_loopback=default_loopback)
+    if not base:
+        return None
+    url = f"{base}{path}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with _TMUXCTLD_OPENER.open(req, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            payload = json.loads(resp.read().decode(errors="ignore") or "{}")
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, str | None]:
