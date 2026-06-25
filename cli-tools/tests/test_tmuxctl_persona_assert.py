@@ -572,7 +572,10 @@ def test_clear_pane_overlay_removes_close_time_state_but_keeps_identity():
     assert PERSONA_GUARD_OPTION not in adapter.options
     assert adapter.options["@PANE_ID"] == "palace:N"
     assert adapter.options["@PANE_TYPE"] == "palace"
-    assert adapter.options["@PANE_TITLE_SUPPRESS"] == "true"
+    # @PANE_LABEL is cleared (it is in PANE_CLOSE_TRANSIENT_OPTIONS), which blanks
+    # the border by construction — no @PANE_TITLE_SUPPRESS flag is set anymore.
+    assert "@PANE_LABEL" not in adapter.options
+    assert "@PANE_TITLE_SUPPRESS" not in adapter.options
 
 
 def test_clear_pane_overlay_preserves_static_persona_guard():

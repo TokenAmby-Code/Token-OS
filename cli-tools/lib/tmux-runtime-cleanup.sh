@@ -21,7 +21,6 @@ tmux_runtime_cleanup_pane() {
         @ACTIVE_TITLE \
         @PROGRESS_TITLE \
         @PANE_PROGRESS \
-        @PANE_TITLE_SUPPRESS \
         @TTS_STATE \
         @CONTEXT_INFO \
         @STACK_PENDING \
