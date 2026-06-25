@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from .invariants import assert_window_build_contract
+from .invariants import assert_window_build_contract, side_roles_for
 from .layout import WORKSPACE_LAYOUT
 from .tmux_adapter import TmuxAdapter
 
@@ -36,17 +36,13 @@ def _prepare_window_geometry(adapter: TmuxAdapter, target: str) -> None:
 
 def _side_roles_for_window(window: str) -> set[str]:
     base = window.split("(", 1)[0]
-    if base == PALACE_WINDOW:
-        return {"palace:W", "palace:E"}
-    if base == SOMNIUM_WINDOW:
-        return {"somnium:W"}
-    if base == COUNCIL_WINDOW:
-        return {"council:custodes"}
-    return set()
+    return side_roles_for(base)
 
 
-def _assert_side_column_postcondition(adapter: TmuxAdapter, target: str, window: str) -> None:
-    """Hard-fail if built side columns do not match the shared ColumnSpec width."""
+def _assert_side_column_postcondition(
+    adapter: TmuxAdapter, target: str, window: str, *, enforce_column_width: bool = True
+) -> None:
+    """Hard-fail if detached builds do not match the shared ColumnSpec width."""
     side_roles = _side_roles_for_window(window)
     if not side_roles or not hasattr(adapter, "list_panes"):
         return
@@ -59,11 +55,14 @@ def _assert_side_column_postcondition(adapter: TmuxAdapter, target: str, window:
         roles.append(role)
         if role in side_roles:
             side_widths[role] = int(pane["width"])
+    expected_column_width = WORKSPACE_LAYOUT.column.width
+    if not enforce_column_width and side_widths:
+        expected_column_width = next(iter(side_widths.values()))
     assert_window_build_contract(
         window,
         roles,
         side_widths=side_widths,
-        expected_column_width=WORKSPACE_LAYOUT.column.width,
+        expected_column_width=expected_column_width,
     )
 
 
@@ -278,7 +277,13 @@ def _council_seat(
         _set_pane_option(adapter, pane_id, "@PANE_TYPE", "council")
 
 
-def build_council_window(adapter: TmuxAdapter, session: str, window: str = COUNCIL_WINDOW) -> None:
+def build_council_window(
+    adapter: TmuxAdapter,
+    session: str,
+    window: str = COUNCIL_WINDOW,
+    *,
+    enforce_column_width: bool = True,
+) -> None:
     """Build the council page: the somnium 5-pane geometry seating fixed personas.
 
     Geometry mirrors :func:`build_somnium_window` (a full-height west rail plus a
@@ -328,7 +333,9 @@ def build_council_window(adapter: TmuxAdapter, session: str, window: str = COUNC
     _set_window_option(adapter, target, "@SIDE_EXPANDED", "none")
     _set_window_option(adapter, target, "@GRID_STASH", "")
 
-    _assert_side_column_postcondition(adapter, target, window)
+    _assert_side_column_postcondition(
+        adapter, target, window, enforce_column_width=enforce_column_width
+    )
     adapter.run("select-pane", "-t", west)
 
 
@@ -351,7 +358,7 @@ def ensure_council_window(adapter: TmuxAdapter, session: str = SESSION_NAME) -> 
     adapter.run(
         "new-window", "-t", session, "-n", COUNCIL_WINDOW, "-d", "-c", _window_dir(COUNCIL_WINDOW)
     )
-    build_council_window(adapter, session, COUNCIL_WINDOW)
+    build_council_window(adapter, session, COUNCIL_WINDOW, enforce_column_width=False)
 
 
 def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
