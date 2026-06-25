@@ -43,7 +43,7 @@ class SeatVacancyPolicy(str, Enum):
 # Vacancy policy per seat CLASS — the normalized seat kind, NOT the raw live
 # ``@PANE_TYPE`` (the persona singleton seats carry their page region as the type,
 # ``council`` / ``mechanicus``, and are recognized by their stable pane LABEL).
-# ``assertions._seat_class`` maps a pane (label, type) onto one of these keys.
+# ``assertions.seat_class`` maps a pane (label, type) onto one of these keys.
 #
 #   persona      — the six singleton persona seats (council:custodes, …)
 #   reservists   — the two standing reservist seats

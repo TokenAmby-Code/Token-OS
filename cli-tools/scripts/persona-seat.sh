@@ -26,7 +26,7 @@
 # the stable pane label. token-api owns the single sqlite writer; this shim never
 # touches agents.db.
 
-set -uo pipefail
+set -euo pipefail
 
 ENGINE="${1:-claude}"
 
@@ -56,6 +56,20 @@ WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-}"
 CLAUDE_MODEL="${TOKEN_API_CLAUDE_MODEL:-}"
 PERSONA="${TOKEN_API_PERSONA:-}"
 
+# --- local execution log (non-blocking backstop for the fire-and-forget ping) --
+# The audit ping below discards its result, so token-api downtime would otherwise
+# erase all launch telemetry. A best-effort local append keeps a breadcrumb on the
+# seat host without ever blocking or failing the hot path.
+PERSONA_SEAT_LOG="${PERSONA_SEAT_LOG:-${HOME}/.claude/logs/persona-seat.log}"
+persona_seat_log() {
+  local dir
+  dir="$(dirname "$PERSONA_SEAT_LOG")"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" \
+    >> "$PERSONA_SEAT_LOG" 2>/dev/null || true
+}
+persona_seat_log "launch persona=${PERSONA:-?} engine=${ENGINE} pane=${TMUX_PANE_VALUE:-?} wrapper_launch_id=${WRAPPER_LAUNCH_ID:-?}"
+
 # --- async, fire-and-forget audit ping (no retry belt on the hot path) ---------
 persona_seat_audit_ping() {
   local payload
@@ -63,7 +77,8 @@ persona_seat_audit_ping() {
     "$PERSONA" "$ENGINE" "$WRAPPER_LAUNCH_ID" "$TMUX_PANE_VALUE")"
   curl -s -o /dev/null --connect-timeout 1 --max-time 3 \
     -X POST "${API_URL}/api/hooks/PersonaSeatLaunch" \
-    -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1 || true
+    -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1 \
+    || persona_seat_log "audit-ping-failed persona=${PERSONA:-?} engine=${ENGINE}"
 }
 persona_seat_audit_ping & disown
 
@@ -98,21 +113,13 @@ resolve_real_engine() {
   [[ -n "$found" && -x "$found" ]] && printf '%s' "$found"
 }
 
-ENGINE_BIN="$(resolve_real_engine "$ENGINE")"
+# `|| true` so a no-match return doesn't trip `set -e` before the debug-shell fallback.
+ENGINE_BIN="$(resolve_real_engine "$ENGINE" || true)"
 if [[ -z "$ENGINE_BIN" || ! -x "$ENGINE_BIN" ]]; then
   echo "persona-seat: $ENGINE binary not found (looked for *.token-os-real and PATH)" >&2
   # Park an interactive shell so the pane is debuggable rather than churn-respawning
   # against a genuinely-missing engine; an operator will see the seat is empty.
   exec "${SHELL:-/bin/bash}" -l
-fi
-
-# --- compose the rank+persona staple (ONE source of truth) ---------------------
-# Synchronous on purpose: identity must be in hand before exec. Fail-open — an
-# empty staple launches the agent without the doctrine layer rather than bricking
-# the seat (the same posture the shared wrapper takes).
-STAPLE=""
-if declare -F token_wrapper_compose_system_text >/dev/null 2>&1; then
-  STAPLE="$(token_wrapper_compose_system_text 2>/dev/null || true)"
 fi
 
 export TOKEN_API_AGENT_WRAPPER_BYPASS=1
@@ -135,6 +142,15 @@ if [[ "$ENGINE" == "codex" ]]; then
 fi
 
 # --- claude ---------------------------------------------------------------------
+# Compose the rank+persona staple (ONE source of truth) only on the claude path —
+# the codex branch above builds its own preamble via token_wrapper_codex_system_preamble.
+# Synchronous on purpose: identity must be in hand before exec. Fail-open — an empty
+# staple launches the agent without the doctrine layer rather than bricking the seat.
+STAPLE=""
+if declare -F token_wrapper_compose_system_text >/dev/null 2>&1; then
+  STAPLE="$(token_wrapper_compose_system_text 2>/dev/null || true)"
+fi
+
 claude_argv=(--dangerously-skip-permissions)
 [[ -n "$CLAUDE_MODEL" ]] && claude_argv+=(--model "$CLAUDE_MODEL")
 

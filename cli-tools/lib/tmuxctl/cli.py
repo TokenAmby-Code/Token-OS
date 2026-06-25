@@ -353,7 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # `assert-personas` (the manual persona sweep) was retired with the 2-min cron
     # that drove it: persona reconcile is now event-driven via the tmuxctld daemon
-    # (POST /reconcile + /event). For a manual reconcile, curl :7778/reconcile.
+    # (POST /reconcile + /event). For a manual reconcile, curl -X POST :7778/reconcile.
 
     guard_parser = subparsers.add_parser("mechanicus-focus-guard")
     guard_parser.add_argument("--pane", default="")

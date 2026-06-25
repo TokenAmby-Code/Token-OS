@@ -96,7 +96,7 @@ class FakeAdapter:
         return self.options.get(option, "")
 
 
-def test_persona_specs_pin_model_defaults():
+def test_persona_specs_pin_model_defaults() -> None:
     assert persona_spec("council:custodes").model == "opus"
     assert persona_spec("council:malcador").model == "fable"
     assert persona_spec("mechanicus:fabricator-general").model == ""
@@ -112,7 +112,7 @@ def test_malcador_spec_is_not_sync() -> None:
     assert spec.session_doc.endswith("Terra/Sessions/malcador.md")
 
 
-def test_persona_seat_command_carries_persona_model_and_session_doc():
+def test_persona_seat_command_carries_persona_model_and_session_doc() -> None:
     spec = PersonaSpec(
         ADMIN_LABEL,
         "administratum",
@@ -135,7 +135,7 @@ def test_persona_seat_command_carries_persona_model_and_session_doc():
     assert cmd.rstrip().endswith("/x/persona-seat.sh claude")
 
 
-def test_persona_seat_command_scrubs_inherited_identity_env():
+def test_persona_seat_command_scrubs_inherited_identity_env() -> None:
     spec = persona_spec("council:custodes")
     cmd = persona_seat_command(spec, wrapper_launch_id="wl-1")
 
@@ -148,14 +148,14 @@ def test_persona_seat_command_scrubs_inherited_identity_env():
     assert "-u TMUX_PANE" not in cmd
 
 
-def test_persona_seat_command_omits_model_when_blank():
+def test_persona_seat_command_omits_model_when_blank() -> None:
     spec = persona_spec("mechanicus:fabricator-general")  # model == ""
     cmd = persona_seat_command(spec, wrapper_launch_id="wl-1")
 
     assert "TOKEN_API_CLAUDE_MODEL=" not in cmd
 
 
-def test_persona_seat_command_sync_flag_reflects_spec():
+def test_persona_seat_command_sync_flag_reflects_spec() -> None:
     assert "TOKEN_API_PERSONA_SEAT_SYNC=1" in persona_seat_command(
         persona_spec("council:custodes"), wrapper_launch_id="w"
     )
@@ -164,7 +164,7 @@ def test_persona_seat_command_sync_flag_reflects_spec():
     )
 
 
-def test_vacancy_policy_map_classifies_seats():
+def test_vacancy_policy_map_classifies_seats() -> None:
     assert seat_vacancy_policy("council:custodes", "council") is SeatVacancyPolicy.MUST_FILL
     assert seat_vacancy_policy("mechanicus:fabricator-general", "mechanicus") is (
         SeatVacancyPolicy.MUST_FILL
@@ -175,7 +175,7 @@ def test_vacancy_policy_map_classifies_seats():
     assert seat_vacancy_policy("council:true-terminal", "") is None
 
 
-def test_seat_class_keys_persona_by_label_not_type():
+def test_seat_class_keys_persona_by_label_not_type() -> None:
     # Persona seats carry the page region as their @PANE_TYPE, recognized by LABEL.
     assert seat_class("council:custodes", "council") == "persona"
     assert seat_class("mechanicus:orchestrator", "mechanicus") == "persona"
@@ -184,20 +184,30 @@ def test_seat_class_keys_persona_by_label_not_type():
     assert seat_class("council:true-terminal", "council") == ""
 
 
-def test_launch_persona_seat_respawns_then_stamps_born():
+def test_launch_persona_seat_respawns_then_stamps_born() -> None:
     spec = persona_spec("council:custodes")
     adapter = FakeAdapter()
     ok, reason = launch_persona_seat(adapter, "%7", spec)
 
     assert ok is True
     assert reason == "launched"
-    # First a respawn-pane -k, then a @PANE_BORN stamp (in that order).
-    respawn = next(c for c in adapter.calls if c and c[0] == "respawn-pane")
+    # The respawn-pane -k must precede the @PANE_BORN stamp — boot grace keys on the
+    # stamp, so a pre-stamp regression would let a reconcile read a vacated seat as
+    # occupied. Compare call indices, not just presence.
+    respawn_idx, respawn = next(
+        (i, c) for i, c in enumerate(adapter.calls) if c and c[0] == "respawn-pane"
+    )
+    stamp_idx = next(
+        i
+        for i, c in enumerate(adapter.calls)
+        if c[:5] == ("set-option", "-p", "-t", "%7", "@PANE_BORN")
+    )
     assert "-k" in respawn and "%7" in respawn
+    assert respawn_idx < stamp_idx
     assert adapter.options.get("@PANE_BORN", "").isdigit()
 
 
-def test_persona_within_boot_grace_holds_freshly_born_seat():
+def test_persona_within_boot_grace_holds_freshly_born_seat() -> None:
     adapter = FakeAdapter()
     import time as _t
 
