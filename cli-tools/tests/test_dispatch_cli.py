@@ -661,6 +661,37 @@ def test_dispatch_human_origin_missing_or_invalid_harness_state_defaults_claude(
         assert "Sisters" not in result.stdout
 
 
+def test_dispatch_human_dir_picker_defaults_home_to_pax_vault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    imperium = tmp_path / "Imperium"
+    civic = tmp_path / "Civic"
+    pax = civic / "Pax-ENV"
+    (imperium / "Imperium-ENV").mkdir(parents=True)
+    pax.mkdir(parents=True)
+    home.mkdir()
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("IMPERIUM", str(imperium))
+    monkeypatch.setenv("CIVIC", str(civic))
+    monkeypatch.setenv("TOKEN_API_DISPATCH_ORIGIN", "d")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_SESSION_DOC", "__none__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_PERSONA", "__astartes__")
+    monkeypatch.setenv("DISPATCH_INTERACTIVE_MODE", "one_off")
+
+    result = subprocess.run(
+        [str(DISPATCH), "--dry-run", "--direct", "launch directly"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(home),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"dir:             {pax}" in result.stdout
+
+
 def test_dispatch_noninteractive_ignores_harness_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2833,8 +2864,9 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
     so a row-less / undercounted duplicate is still caught) and refuses, sending
     no launch.
     """
-    work_dir = tmp_path / "wt-live"
-    work_dir.mkdir()
+    home = tmp_path / "home"
+    work_dir = home / "worktrees" / "Token-OS" / "wt-live"
+    work_dir.mkdir(parents=True)
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -2864,6 +2896,7 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["HOME"] = str(home)
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     # Re-enable the guard the conftest disables for hermeticity.
@@ -2898,10 +2931,75 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
     assert "send-keys" not in tmux_calls
 
 
+def test_dispatch_dup_guard_skips_non_worktree_dirs(tmp_path: Path) -> None:
+    """Multiple live agents in a vault/non-worktree cwd are valid and must launch."""
+    home = tmp_path / "home"
+    vault_dir = tmp_path / "Imperium-ENV"
+    home.mkdir()
+    vault_dir.mkdir()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "live-agents" ]]; then\n'
+        f'  printf "%s\\n" "mechanicus:3\\t%%91\\tcodex\\t{vault_dir}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        '#!/usr/bin/env bash\nif [[ "$1" == "display-message" ]]; then printf "%%77\\n"; fi\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["HOME"] = str(home)
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_WORKTREE_DUP_CHECK"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "0"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(vault_dir),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "a live agent is already running" not in result.stderr
+    assert "dispatched claude to mechanicus:new" in result.stdout
+
+
 def test_dispatch_dup_guard_force_occupied_override_allows_launch(tmp_path: Path) -> None:
     """TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 overrides the duplicate-refusal guard."""
-    work_dir = tmp_path / "wt-live"
-    work_dir.mkdir()
+    home = tmp_path / "home"
+    work_dir = home / "worktrees" / "Token-OS" / "wt-live"
+    work_dir.mkdir(parents=True)
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -2929,6 +3027,7 @@ def test_dispatch_dup_guard_force_occupied_override_allows_launch(tmp_path: Path
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["HOME"] = str(home)
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env["DISPATCH_WORKTREE_DUP_CHECK"] = "1"

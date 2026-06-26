@@ -8,11 +8,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
 CALLER_IMPERIUM="${IMPERIUM:-}"
+CALLER_CIVIC="${CIVIC:-}"
 source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
 source "${LIB_DIR}/agent-wrapper-common.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
 [[ -n "$CALLER_IMPERIUM" ]] && export IMPERIUM="$CALLER_IMPERIUM"
+[[ -n "$CALLER_CIVIC" ]] && export CIVIC="$CALLER_CIVIC"
 source "${LIB_DIR}/git-remote.sh"
 
 # Harden the ctype locale internally. dispatch pipes arbitrary prompt/title text
@@ -516,7 +518,137 @@ compact_path() {
   printf '%s' "$path"
 }
 
+vault_path_for_domain() {
+  local domain="$1"
+  case "$domain" in
+    Pax-ENV)
+      if [[ -n "${CIVIC:-}" && -d "$CIVIC/Pax-ENV" ]]; then
+        printf '%s/Pax-ENV' "$CIVIC"
+      elif [[ -d "/Volumes/Civic/Pax-ENV" ]]; then
+        printf '%s' "/Volumes/Civic/Pax-ENV"
+      fi
+      ;;
+    Imperium-ENV)
+      if [[ -n "${IMPERIUM:-}" && -d "$IMPERIUM/Imperium-ENV" ]]; then
+        printf '%s/Imperium-ENV' "$IMPERIUM"
+      elif [[ -d "/Volumes/Imperium/Imperium-ENV" ]]; then
+        printf '%s' "/Volumes/Imperium/Imperium-ENV"
+      fi
+      ;;
+  esac
+}
+
+dir_domain_context() {
+  local dir="$1" pax imperium
+  dir="$(expand_path "$dir")"
+  pax="$(vault_path_for_domain Pax-ENV)"
+  imperium="$(vault_path_for_domain Imperium-ENV)"
+  if [[ -n "$imperium" && ( "$dir" == "$imperium" || "$dir" == "$imperium"/* ) ]]; then
+    printf '%s' "Imperium-ENV"
+    return 0
+  fi
+  if [[ -n "$pax" && ( "$dir" == "$pax" || "$dir" == "$pax"/* ) ]]; then
+    printf '%s' "Pax-ENV"
+    return 0
+  fi
+  case "$dir" in
+    "$HOME"/worktrees/Token-OS|"$HOME"/worktrees/Token-OS/*) printf '%s' "Imperium-ENV" ;;
+    "$HOME"/worktrees/askCivic|"$HOME"/worktrees/askCivic/*) printf '%s' "Pax-ENV" ;;
+    *) printf '%s' "Pax-ENV" ;;
+  esac
+}
+
+project_for_vault_domain() {
+  case "$1" in
+    Imperium-ENV) printf '%s' "Token-OS" ;;
+    *)            printf '%s' "askCivic" ;;
+  esac
+}
+
+worktree_parent_for_project() {
+  local project="$1" conf="$HOME/.config/worktrees/${project}.conf" parent=""
+  if [[ -f "$conf" ]]; then
+    parent="$( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; SYNC_SUBDIR=""; PROTECTED_ROOT=""; RUNTIME_CHECKOUT=""
+      # shellcheck disable=SC1090
+      source "$conf" 2>/dev/null || true
+      printf '%s' "${WORKTREE_PARENT:-}" )"
+  fi
+  [[ -n "$parent" ]] || parent="$HOME/worktrees/$project"
+  printf '%s' "$(expand_path "$parent")"
+}
+
 directory_candidates() {
+  local current primary secondary primary_path secondary_path project
+  current="$(expand_path "$WORK_DIR")"
+  primary="$(dir_domain_context "$current")"
+  if [[ "$primary" == "Imperium-ENV" ]]; then secondary="Pax-ENV"; else secondary="Imperium-ENV"; fi
+  primary_path="$(vault_path_for_domain "$primary")"
+  secondary_path="$(vault_path_for_domain "$secondary")"
+  project="$(project_for_vault_domain "$primary")"
+
+  # Human `d` launches should be vault-first. Do not flood the top-level picker
+  # with every recent worktree, and do not offer ~ there: from ~, `d` means "go to
+  # a vault". Worktrees live behind the explicit submenu below.
+  [[ -n "$primary_path" && -d "$primary_path" ]] && printf '%s\t%s\n' "$primary_path" "$primary"
+  [[ -n "$secondary_path" && -d "$secondary_path" ]] && printf '%s\t%s\n' "$secondary_path" "$secondary"
+  printf '__worktrees__:%s:%s\tworktrees\n' "$project" "$primary"
+}
+
+worktree_directory_candidates() {
+  local project="$1" domain="$2" vault parent dir label current
+  vault="$(vault_path_for_domain "$domain")"
+  [[ -n "$vault" && -d "$vault" ]] && printf '%s\t%s\n' "$vault" "$domain"
+
+  current="$(expand_path "$WORK_DIR")"
+  # Exception to the top-level "~" exclusion: if the operator launched from real
+  # filesystem root or the displayed vault root, make home reachable from the
+  # submenu.
+  if [[ ( "$current" == "/" || "$current" == "$vault" ) && -d "$HOME" ]]; then
+    printf '%s\t~\n' "$HOME"
+  fi
+
+  parent="$(worktree_parent_for_project "$project")"
+  [[ -d "$parent" ]] || return 0
+  while IFS= read -r dir; do
+    [[ -n "$dir" && -d "$dir" ]] || continue
+    label="$(basename "$dir")"
+    printf '%s\t%s\n' "$dir" "$label"
+  done < <(find "$parent" -mindepth 1 -maxdepth 2 -type d -name 'wt-*' -print 2>/dev/null | sort)
+}
+
+pick_worktree_dir_value() {
+  local project="$1" domain="$2" default_value="$3" selected override
+  override="${DISPATCH_INTERACTIVE_WORKTREE_DIR:-}"
+  if [[ -n "$override" ]]; then
+    printf '%s' "$(expand_path "$override")"
+    return 0
+  fi
+  selected="$(worktree_directory_candidates "$project" "$domain" | dedupe_tsv | pick_fzf_value worktree_dir 'worktrees> ' "$default_value")"
+  [[ -n "$selected" ]] && printf '%s' "$selected"
+}
+
+pick_directory_value() {
+  local default_value="$1" selected payload project domain vault input first_line fallback
+  input="$(directory_candidates | dedupe_tsv)"
+  first_line="${input%%$'\n'*}"
+  fallback="${first_line%%$'\t'*}"
+  [[ -n "$fallback" ]] || fallback="$default_value"
+  selected="$(printf '%s\n' "$input" | pick_fzf_value dir 'dir> ' "$fallback")"
+  case "$selected" in
+    __worktrees__:*)
+      payload="${selected#__worktrees__:}"
+      project="${payload%%:*}"
+      domain="${payload#*:}"
+      vault="$(vault_path_for_domain "$domain")"
+      pick_worktree_dir_value "$project" "$domain" "${vault:-$default_value}"
+      ;;
+    *)
+      printf '%s' "$selected"
+      ;;
+  esac
+}
+
+legacy_directory_candidates() {
   local current
   current="$(expand_path "$WORK_DIR")"
   printf '%s\tcurrent: %s\n' "$current" "$(compact_path "$current")"
@@ -759,7 +891,7 @@ run_interactive_selection() {
 
   WORK_DIR="$(expand_path "$WORK_DIR")"
   if ! $WORK_DIR_EXPLICIT; then
-    selected="$(directory_candidates | dedupe_tsv | pick_fzf_value dir 'dir> ' "$WORK_DIR")"
+    selected="$(pick_directory_value "$WORK_DIR")"
     [[ -n "$selected" ]] && WORK_DIR="$selected"
   fi
 
@@ -2026,8 +2158,17 @@ refuse_if_worktree_has_live_agent() {
   # agent is ALREADY rooted there. Detection is by LIVENESS (process tree + pane
   # cwd via `tmuxctl live-agents`), never the DB stamp — the duplicate may itself
   # be a row-less / undercounted live agent, which is exactly the case that bit FG.
-  local dir="$1" self_pane="${2:-}" matches
+  local dir="$1" self_pane="${2:-}" matches resolved_dir resolved_parent
   [[ -n "$dir" ]] || return 0
+  resolved_dir="$(cd "$dir" 2>/dev/null && pwd -P || printf '%s' "$(expand_path "$dir")")"
+  resolved_parent="$(cd "$HOME/worktrees" 2>/dev/null && pwd -P || printf '%s' "$HOME/worktrees")"
+  # Scope the guard to actual local git worktree space. Multiple workers rooted
+  # in Obsidian vaults (or other non-worktree folders) are expected; globally
+  # deduping by cwd there blocks valid dispatches.
+  case "$resolved_dir" in
+    "$resolved_parent"|"$resolved_parent"/*) ;;
+    *) return 0 ;;
+  esac
   # Hermetic opt-out: tests set DISPATCH_WORKTREE_DUP_CHECK=0 so the suite never
   # enumerates the operator's LIVE tmux server. Default (unset) = enabled.
   [[ "${DISPATCH_WORKTREE_DUP_CHECK:-1}" == "0" ]] && return 0
@@ -2039,9 +2180,9 @@ refuse_if_worktree_has_live_agent() {
     warn "dup-guard skipped: tmuxctl unavailable, cannot verify $dir is free of a live agent"
     return 0
   fi
-  matches="$(tmuxctl live-agents --dir "$dir" ${self_pane:+--exclude-pane "$self_pane"} 2>/dev/null || true)"
+  matches="$(tmuxctl live-agents --dir "$resolved_dir" ${self_pane:+--exclude-pane "$self_pane"} 2>/dev/null || true)"
   [[ -n "$matches" ]] || return 0
-  err "refusing to dispatch: a live agent is already running in the target worktree $dir:"
+  err "refusing to dispatch: a live agent is already running in the target worktree $resolved_dir:"
   while IFS= read -r line; do
     [[ -n "$line" ]] && err "  $line"
   done <<< "$matches"
@@ -2114,11 +2255,13 @@ EOF_DRY
   exit 0
 fi
 
-# Duplicate-refusal guard: a launch into a pre-existing worktree (resume,
-# --no-worktree, or --worktree resume) must never STACK a second agent onto a
-# worktree that already hosts a live one. A freshly-cut worktree is provably
-# exclusive, so skip it there. The dispatcher's own pane is excluded so an agent
-# launching a worker into its own dir (to a NEW pane) is not refused by itself.
+# Duplicate-refusal guard: a launch into a pre-existing dir under ~/worktrees
+# (resume, --no-worktree, or --worktree resume) must never STACK a second agent
+# onto a worktree that already hosts a live one. Non-worktree dirs are allowed to
+# host multiple workers (notably Obsidian vault roots). A freshly-cut worktree is
+# provably exclusive, so skip it there. The dispatcher's own pane is excluded so
+# an agent launching a worker into its own dir (to a NEW pane) is not refused by
+# itself.
 if [[ "$WORKTREE_FRESHLY_CREATED" != true ]]; then
   refuse_if_worktree_has_live_agent "$WORK_DIR" "${TMUX_PANE:-}"
 fi
