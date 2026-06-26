@@ -98,7 +98,7 @@ from dailynote_callout import (
     CalloutError,
     apply_callout,
 )
-from db_schema import init_database_async
+from db_schema import init_database_async, init_timer_database_async
 from instance_lifecycle import apply_instance_lifecycle
 from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
@@ -193,6 +193,8 @@ from shared import (
     DESKTOP_STATE,
     DICTATION_STATE,
     DISCORD_DAEMON_URL,
+    LEGACY_AGENTS_DB_PATH,
+    LEGACY_TIMER_DB_PATH,
     PAVLOK_CONFIG,
     PAVLOK_STATE,
     PEDAL_BUFFER_MS,
@@ -205,6 +207,7 @@ from shared import (
     SERVER_PORT,
     STASH_DIR,
     STASH_MAX_AGE_HOURS,
+    TIMER_DB_PATH,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
     default_sessions_dir,
@@ -317,6 +320,123 @@ ASSERT_PERSONA_PANE_LABELS = {
     "mechanicus:fabricator-general",
     "council:administratum",
 }
+
+
+def _sqlite_backup_file(source: Path, dest: Path) -> None:
+    """Copy a SQLite DB with sqlite backup API instead of raw file copying."""
+    import sqlite3
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(source, timeout=10.0)) as src:
+        with contextlib.closing(sqlite3.connect(dest, timeout=10.0)) as dst:
+            src.backup(dst)
+            dst.commit()
+
+
+def _copy_timer_tables_from_agents_db(source: Path, dest: Path) -> bool:
+    """Migrate embedded timer tables from the legacy agents DB into timer.db."""
+    import sqlite3
+
+    timer_tables = (
+        "timer_state",
+        "timer_state_daily",
+        "timer_sessions",
+        "timer_mode_changes",
+        "timer_daily_scores",
+        "timer_shifts",
+        "timer_samples",
+    )
+    copied = False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(source, timeout=10.0)) as src:
+        src.row_factory = sqlite3.Row
+        with contextlib.closing(sqlite3.connect(dest, timeout=10.0)) as dst:
+            dst.execute("PRAGMA busy_timeout=5000")
+            for table in timer_tables:
+                schema_row = src.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone()
+                if not schema_row or not schema_row["sql"]:
+                    continue
+                exists = dst.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone()
+                if exists:
+                    continue
+                dst.execute(schema_row["sql"])
+                columns = [row["name"] for row in src.execute(f'PRAGMA table_info("{table}")')]
+                if columns:
+                    col_sql = ", ".join(f'"{col}"' for col in columns)
+                    rows = src.execute(f'SELECT {col_sql} FROM "{table}"').fetchall()
+                    if rows:
+                        placeholders = ", ".join("?" for _ in columns)
+                        dst.executemany(
+                            f'INSERT INTO "{table}" ({col_sql}) VALUES ({placeholders})',
+                            [tuple(row[col] for col in columns) for row in rows],
+                        )
+                copied = True
+            dst.commit()
+    return copied
+
+
+def migrate_runtime_databases_if_needed() -> None:
+    """First-start migration for the stable runtime database directory.
+
+    - agents.db moves from ~/.claude/agents.db to ~/runtimes/database/agents.db.
+    - timer.db is created separately. Prefer an existing ~/.claude/timer.db; if
+      none exists, extract existing timer_* tables from the legacy agents DB.
+    """
+    token_api_db = os.environ.get("TOKEN_API_DB")
+    legacy_compat_db = (
+        token_api_db
+        and not os.environ.get("TOKEN_API_AGENTS_DB")
+        and Path(token_api_db).expanduser().resolve() != LEGACY_AGENTS_DB_PATH.resolve()
+    )
+    if legacy_compat_db:
+        logger.info("DB migration skipped: TOKEN_API_DB compatibility override is active")
+        return
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if DB_PATH.resolve() != LEGACY_AGENTS_DB_PATH.resolve():
+            if LEGACY_AGENTS_DB_PATH.exists() and not DB_PATH.exists():
+                _sqlite_backup_file(LEGACY_AGENTS_DB_PATH, DB_PATH)
+                logger.info("Migrated agents DB %s -> %s", LEGACY_AGENTS_DB_PATH, DB_PATH)
+            else:
+                logger.info(
+                    "Agents DB migration skipped (source_exists=%s dest_exists=%s)",
+                    LEGACY_AGENTS_DB_PATH.exists(),
+                    DB_PATH.exists(),
+                )
+    except Exception as exc:
+        logger.warning("Agents DB migration failed: %s", exc)
+
+    try:
+        if TIMER_DB_PATH.resolve() == DB_PATH.resolve():
+            logger.info("Timer DB migration skipped: timer DB path equals agents DB path")
+            return
+        if TIMER_DB_PATH.exists():
+            logger.info("Timer DB migration skipped: destination exists at %s", TIMER_DB_PATH)
+            return
+        if LEGACY_TIMER_DB_PATH.exists():
+            _sqlite_backup_file(LEGACY_TIMER_DB_PATH, TIMER_DB_PATH)
+            logger.info("Migrated timer DB %s -> %s", LEGACY_TIMER_DB_PATH, TIMER_DB_PATH)
+        elif LEGACY_AGENTS_DB_PATH.exists():
+            copied = _copy_timer_tables_from_agents_db(LEGACY_AGENTS_DB_PATH, TIMER_DB_PATH)
+            logger.info(
+                "Migrated embedded timer tables from %s -> %s (copied=%s)",
+                LEGACY_AGENTS_DB_PATH,
+                TIMER_DB_PATH,
+                copied,
+            )
+        else:
+            logger.info("Timer DB migration skipped: no legacy source found")
+    except Exception as exc:
+        logger.warning("Timer DB migration failed: %s", exc)
 
 
 def _is_assert_persona_label(value: str | None) -> bool:
@@ -1696,20 +1816,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pass
 
     # Fail closed (P0 2026-06-09): a worktree dev server must never write the live
-    # ~/.claude/agents.db. If this code is running from under a worktrees/ tree but
-    # DB_PATH still resolves to the live DB, refuse to start instead of racing the
-    # production :7777 writer (timer/enforcement corruption, phantom shocks).
-    _live_db = (Path.home() / ".claude" / "agents.db").resolve()
+    # runtime agents DB. If this code is running from under a worktrees/ tree but
+    # DB_PATH still resolves to a live DB, refuse to start instead of racing the
+    # production :7777 writer.
+    _live_dbs = {
+        (Path.home() / ".claude" / "agents.db").resolve(),
+        (Path.home() / "runtimes" / "database" / "agents.db").resolve(),
+    }
     _run_roots = (Path(__file__).resolve(), Path.cwd().resolve())
-    if any("worktrees" in p.parts for p in _run_roots) and DB_PATH.resolve() == _live_db:
+    if any("worktrees" in p.parts for p in _run_roots) and DB_PATH.resolve() in _live_dbs:
         raise SystemExit(
-            "REFUSING TO START: running from a worktree but TOKEN_API_DB resolves to "
-            f"the live {_live_db}. Set TOKEN_API_DB in .worktree.env to an isolated "
+            "REFUSING TO START: running from a worktree but the agents DB resolves to "
+            f"a live DB ({DB_PATH}). Set TOKEN_API_DB in .worktree.env to an isolated "
             "copy (worktree-setup does this automatically)."
         )
 
     # Startup
+    migrate_runtime_databases_if_needed()
     await init_database_async(DB_PATH)
+    await init_timer_database_async(TIMER_DB_PATH)
     await load_tasks_from_db()
     timer_load_from_db()
     load_zap_count_from_daily_note()
@@ -13374,7 +13499,7 @@ def _sync_generate_daily_analytics(date_str: str):
     import sqlite3
     from collections import defaultdict
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(TIMER_DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
 
@@ -13528,7 +13653,8 @@ def _sync_save_to_db(state_json: str):
     import sqlite3
 
     today = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE)).date().isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(TIMER_DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """INSERT INTO timer_state (id, state_json, updated_at)
@@ -13570,7 +13696,8 @@ def _sync_log_mode_change(old_mode: str | None, new_mode: str, is_automatic: boo
     import sqlite3
     from datetime import datetime
 
-    conn = sqlite3.connect(DB_PATH)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(TIMER_DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """INSERT INTO timer_mode_changes (timestamp, old_mode, new_mode, is_automatic)
@@ -13594,7 +13721,8 @@ def _sync_start_session(mode: str, date: str):
     import sqlite3
     from datetime import datetime
 
-    conn = sqlite3.connect(DB_PATH)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(TIMER_DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     cursor = conn.execute(
         """INSERT INTO timer_sessions (date, start_time, mode)
@@ -13623,7 +13751,8 @@ def _sync_end_session(
     import sqlite3
     from datetime import datetime
 
-    conn = sqlite3.connect(DB_PATH)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(TIMER_DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """UPDATE timer_sessions SET end_time = ?, duration_ms = ?, break_earned_ms = ?, break_used_ms = ?
@@ -13657,7 +13786,8 @@ def _sync_save_daily_score(
     """Save daily productivity score."""
     import sqlite3
 
-    conn = sqlite3.connect(DB_PATH)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(TIMER_DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """INSERT INTO timer_daily_scores (date, productivity_score, total_work_ms, total_break_used_ms, session_count, mode_change_count, updated_at)
@@ -13712,7 +13842,7 @@ def timer_load_from_db() -> None:
     now_ms = int(time.monotonic() * 1000)
     today = datetime.now(ZoneInfo(MORNING_SESSION_TIMEZONE)).date().isoformat()
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(TIMER_DB_PATH)
         conn.execute("PRAGMA busy_timeout=5000")
         try:
             row = conn.execute(
@@ -16021,7 +16151,7 @@ async def get_timer_shifts():
         reset_today -= timedelta(days=1)
     cutoff = reset_today.isoformat()
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(TIMER_DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM timer_shifts WHERE timestamp >= ? ORDER BY id",
@@ -18516,7 +18646,7 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
     samples: list[dict] = []
     shift_rows: list[dict] = []
     samples_available = True
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(TIMER_DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         try:
             cursor = await db.execute(
