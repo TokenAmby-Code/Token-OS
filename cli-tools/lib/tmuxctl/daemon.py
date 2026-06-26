@@ -45,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import typing_guard_state
+from . import send_gate, typing_guard_state
 from .api import RegistryError
 from .send_gate import thread_local_override
 from .service import TmuxControlPlane
@@ -588,6 +588,15 @@ def _h_send_text(control, params):
         phys_pane = control.adapter._resolve_pane_target_arg(pane)
     except Exception:
         phys_pane = pane
+
+    # Fail closed BEFORE acquiring our own agent hold. If a human/pending/other
+    # agent guard is already live, do not enter send_gate's default delay path:
+    # that holds the HTTP request until caller timeouts and can later release a
+    # stale send onto active typing. Surface a structured gated result instead;
+    # Token-API can queue/retry, but tmuxctld will issue zero bytes now.
+    pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
+    if pre_gate is not None and pre_gate.get("suppressed"):
+        raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
 
     # Hold the typing guard (green ⌨ AGENT state) for the handshake window so
     # concurrent sends to this pane delay behind it (state-blind, the existing

@@ -32,6 +32,7 @@ def _no_live_tmux_guard(monkeypatch):
     """
     monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: False)
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
+    monkeypatch.setattr(daemon.send_gate, "evaluate", lambda *a, **k: None)
 
 
 class StubAdapter:
@@ -609,6 +610,47 @@ def test_agent_guard_hold_denied_does_not_release_and_send_still_routes(monkeypa
         assert result["guard_held"] is False
         assert released == [], "a denied hold must never call release"
         assert ("send-keys", "-t", "%42", "-l", "do the thing") in SendAckAdapter.calls
+    finally:
+        server.shutdown()
+
+
+def test_send_text_returns_gated_without_waiting_or_writing_under_typing_guard(monkeypatch) -> None:
+    SendAckAdapter.calls = []
+    hold_calls: list[str] = []
+    monkeypatch.setattr(
+        daemon.send_gate,
+        "evaluate",
+        lambda *a, **k: {
+            "suppressed": True,
+            "policy": "delay",
+            "reason": "typing_guard",
+            "target": "%42",
+        },
+    )
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "hold", lambda *a, **k: hold_calls.append("hold") or True
+    )
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 5,
+                "submit_settle_seconds": 0,
+            },
+            timeout=1,
+        )
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "gated"
+        assert payload["error"]["detail"]["reason"] == "typing_guard"
+        assert payload["error"]["detail"]["deferred"] is True
+        assert hold_calls == [], "do not acquire agent hold behind a live human guard"
+        assert SendAckAdapter.calls == [], "zero bytes issued while human guard is active"
     finally:
         server.shutdown()
 

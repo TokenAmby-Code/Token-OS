@@ -76,7 +76,7 @@ def test_hold_off_pane_acquires_agent_and_publishes_green() -> None:
     assert acquired is True
     assert tmux.options[tg.AGENT_OPTION] == "1008"
     assert _guard_value(tmux) == tg.AGENT_MARKER
-    assert any("expire-pane --pane %1" in cmd for cmd in tmux.run_shells)
+    assert tmux.run_shells == []
     assert tg.live_state(tmux, "%1", now=1001) == "agent"
 
 
