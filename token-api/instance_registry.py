@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
+DEFAULT_INSTANCE_NAME = "needs-name"
+
 IDENTITY_COLUMNS = [
     "id",
     "name",
@@ -226,7 +228,10 @@ def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = Non
     created = row.get("registered_at") or row.get("created_at") or datetime.now().isoformat()
     values = {
         "id": row.get("id") or row.get("session_id"),
-        "name": row.get("tab_name") or row.get("name") or row.get("id") or row.get("session_id"),
+        # New/default names are never synthesized from ids, session docs, cwd,
+        # persona, dates, or dispatch metadata.  Official renames are explicit
+        # updates after registration.
+        "name": row.get("tab_name") or row.get("name") or DEFAULT_INSTANCE_NAME,
         "engine": row.get("engine"),
         "working_dir": row.get("working_dir"),
         "device_id": row.get("device_id") or "unknown",

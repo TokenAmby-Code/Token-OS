@@ -80,7 +80,7 @@ before persisting. Non-runtime instance state is mirrored into `instances` by
 `instance_mutation.py`. Historical stale tmux columns may exist only as migration
 debt. Key legacy columns:
 - `id` - Instance UUID
-- `tab_name` - Display name (set via rename, or auto "Claude HH:MM")
+- `tab_name` - Display name (set only via official rename; default placeholder is `needs-name`)
 - `working_dir` - Instance working directory
 - `status` - typically `idle`, `processing`, or `stopped`
 - `last_activity` - heartbeat timestamp used for stale detection and reconciliation ordering
@@ -328,9 +328,9 @@ GET    /api/timer/shifts              # Today's shift analytics
 
 The `tab_name` field stores the instance display name. The TUI displays:
 1. Custom `tab_name` (if user renamed it)
-2. `working_dir` path (if using default "Claude HH:MM" name)
+2. `working_dir` path (while the default `needs-name` placeholder is still present)
 
-Auto-generated names match pattern `Claude HH:MM`. Any other name is considered custom.
+The only default placeholder is `needs-name`. Any non-placeholder name must come from the official rename path.
 
 Rename via:
 - CLI: `instance-name "my-name"`
@@ -345,7 +345,7 @@ Headless Claude instances spawned by `subagent --claude`, cron jobs, or scripts 
 1. The `subagent` CLI exports `TOKEN_API_SUBAGENT="subagent:claude"` before invoking `claude -p`
 2. The Claude Code hook (`~/.claude/hooks/generic-hook.sh`) forwards this env var in the `.env` payload
 3. The server reads `TOKEN_API_SUBAGENT` from the hook payload and sets `is_subagent=1`, `spawner=<value>`
-4. Subagents are auto-named `"sub: <spawner>"` and **skip TTS profile assignment** (no voice slot consumed)
+4. Subagents start as `needs-name` like every other pane and **skip TTS profile assignment** (no voice slot consumed)
 
 **TUI/display behavior:**
 - Subagents are **hidden by default** — press `a` to toggle visibility
@@ -461,7 +461,7 @@ Current sanctioned coverage:
 - API writes for rename, activity/status, stop, kill fallback stop-marking, unstick PID refresh, legion, synced, input_lock
 - API writes for transplant pending, zealotry, discord linkage, instance type, archive / unarchive, and victory metadata
 - per-instance voice reassignment, per-instance `tts_mode`, voice-chat mode sync, and global TTS mode fanout
-- background/system writes for stale cleanup, stale processing clear, stop-evaluator idle transition, auto-name rename
+- background/system writes for stale cleanup, stale processing clear, stop-evaluator idle transition, naming-nudge workflow
 - sync stop-hook stop marking via `sanctioned_update_instance_sync()`
 
 Remaining direct-write debt worth tracking:
@@ -475,6 +475,7 @@ Remaining direct-write debt worth tracking:
 - `clean` - current row and pane projection align with sanctioned writes
 - `pending_projection` - pane queue entries exist, so tmux projection is expected to catch up
 - `unprovenanced_write` - current row diverges from latest sanctioned value for one or more tracked fields
+- `illegal_instance_name` - instance name is non-placeholder without official rename provenance
 - `state_drift` - workflow / continuity fields are internally incoherent
 - `projection_drift` - tmux pane state is stale or missing with no pending queue
 

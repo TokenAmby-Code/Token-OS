@@ -40,13 +40,14 @@ from instance_lifecycle import apply_instance_lifecycle, normalize_instance_life
 from instance_mutation import (
     _fetch_instance_row,
     create_golden_throne_binding,
+    is_official_instance_name_actor,
     sanctioned_delete_instance,
     sanctioned_insert_instance,
     sanctioned_update_instance,
     sanctioned_update_instance_record,
 )
-from instance_registry import LEGACY_PERSONA_ALIASES
-from pane_surface import PLACEHOLDER_TAB_NAME_RX, human_pane_surface, is_placeholder_tab_name
+from instance_registry import DEFAULT_INSTANCE_NAME, LEGACY_PERSONA_ALIASES
+from pane_surface import human_pane_surface, is_placeholder_tab_name
 from personas import assign_astartes_persona, persona_to_profile
 from phone_service import _send_to_phone
 from questions_gate import trials_clear
@@ -864,92 +865,42 @@ def _normalize_text(value: Any) -> str | None:
     return text or None
 
 
-def _instance_name_base_from_session_doc(title: str | None, file_path: str | None) -> str:
-    """Return the shared instance-name prefix for a session doc.
-
-    Instances are named after the document they are attached to, with a
-    monotonic per-document suffix: `<session-doc-name>-1`, `...-2`, etc.
-    Dates remain metadata, so strip legacy date prefixes/suffixes if they are
-    present on old docs.
-    """
-    raw = (title or "").strip()
-    if not raw and file_path:
-        raw = Path(file_path).stem
-    raw = re.sub(r"^\d{4}-\d{2}-\d{2}[- ]+", "", raw)
-    raw = re.sub(r"[- ]+\d{4}-\d{2}-\d{2}(?:-\d+)?$", "", raw)
-    raw = re.sub(r"[^\w\s-]", " ", raw)
-    raw = re.sub(r"[_\s-]+", "-", raw.lower()).strip("-")
-    return raw[:80].strip("-") or "session-doc"
-
-
-def _is_unnamed_session_doc_base(base: str | None) -> bool:
-    # Centralized in pane_surface so all four placeholder detectors agree and
-    # numbered variants (needs-session-name-345) cannot leak into instance names.
-    return bool(PLACEHOLDER_TAB_NAME_RX.match(base or ""))
-
-
-async def _next_session_doc_instance_name(db: aiosqlite.Connection, doc_id: int) -> str:
-    cursor = await db.execute(
-        "SELECT title, file_path FROM session_documents WHERE id = ?", (doc_id,)
-    )
-    row = await cursor.fetchone()
-    title = row[0] if row else None
-    file_path = row[1] if row else None
-    base = _instance_name_base_from_session_doc(title, file_path)
-    if _is_unnamed_session_doc_base(base):
-        return "needs-name"
-
-    # Monotonic by existing suffix, not row count: stopped/historical rows
-    # remain in the DB and prior instance renames may leave gaps.
-    cursor = await db.execute("SELECT name FROM instances WHERE session_doc_id = ?", (doc_id,))
-    rows = await cursor.fetchall()
-    suffix_rx = re.compile(rf"^{re.escape(base)}-(\d+)$")
-    max_suffix = 0
-    for row in rows:
-        match = suffix_rx.match(str(row[0] or ""))
-        if match:
-            max_suffix = max(max_suffix, int(match.group(1)))
-    return f"{base}-{max_suffix + 1}"
-
-
-async def _apply_session_doc_instance_name(
-    db: aiosqlite.Connection,
-    *,
-    instance_id: str,
-    session_doc_id: int | None,
-    wrapper_launch_id: str | None = None,
-) -> str | None:
-    """Name instance from its session doc: `<doc-slug>-<monotonic ordinal>`."""
-    if not session_doc_id:
-        return None
+async def _name_has_official_provenance(
+    db: aiosqlite.Connection, instance_id: str, current_name: str | None
+) -> bool:
+    if current_name == DEFAULT_INSTANCE_NAME:
+        return True
     cursor = await db.execute(
         """
-        SELECT ci.name, sd.title, sd.file_path
-        FROM instances ci
-        LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
-        WHERE ci.id = ?
+        SELECT actor, field_names_json, after_json
+        FROM instance_mutations
+        WHERE instance_id = ?
+        ORDER BY created_at DESC, id DESC
         """,
         (instance_id,),
     )
-    row = await cursor.fetchone()
-    if not row:
-        return None
-    base = _instance_name_base_from_session_doc(row[1], row[2])
-    if _is_unnamed_session_doc_base(base):
-        return None
-    if re.match(rf"^{re.escape(base)}-\d+$", str(row[0] or "")):
-        return str(row[0])
-    new_name = await _next_session_doc_instance_name(db, session_doc_id)
-    await sanctioned_update_instance(
-        db,
-        instance_id=instance_id,
-        updates={"name": new_name},
-        mutation_type="instance_updated",
-        write_source="hooks",
-        actor="SessionStart:session-doc-instance-name",
-        wrapper_launch_id=wrapper_launch_id,
-    )
-    return new_name
+    rows = await cursor.fetchall()
+    for row in rows:
+        try:
+            fields = json.loads(row[1] or "[]") or []
+            after = json.loads(row[2] or "{}") or {}
+        except Exception:
+            continue
+        if (
+            "name" in fields
+            and after.get("name") == current_name
+            and is_official_instance_name_actor(row[0])
+        ):
+            return True
+    return False
+
+
+async def _official_or_placeholder_name(
+    db: aiosqlite.Connection, instance_id: str, current_name: str | None
+) -> str:
+    if await _name_has_official_provenance(db, instance_id, current_name):
+        return current_name or DEFAULT_INSTANCE_NAME
+    return DEFAULT_INSTANCE_NAME
 
 
 def _json_or_none(value: str | None) -> Any:
@@ -2704,10 +2655,7 @@ async def handle_session_start(payload: dict) -> dict:
 
     # Get working directory and tab name
     working_dir = payload.get("cwd") or os.getcwd()
-    raw_tab_name = payload.get("env", {}).get("CLAUDE_TAB_NAME") or ""
-    # Strip Claude Code's ✳ prefix and whitespace artifacts from pane titles
-    tab_name = raw_tab_name.lstrip("✳ ").strip() if raw_tab_name else ""
-    tab_name = tab_name or "needs-name"
+    tab_name = DEFAULT_INSTANCE_NAME
 
     # Detect subagent from env var
     subagent_env = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
@@ -2739,10 +2687,6 @@ async def handle_session_start(payload: dict) -> dict:
     if pane_stamp_instance_id == session_id:
         # Own stamp: same instance re-registering, not a supplant source.
         pane_stamp_instance_id = None
-
-    # Auto-name subagents
-    if is_subagent and not payload.get("env", {}).get("CLAUDE_TAB_NAME"):
-        tab_name = f"sub: {subagent_env or 'agent'}"
 
     # Resolve device_id from HTTP client IP (where the instance actually runs)
     # SSH_CLIENT gives the SSH origin (Mac), not the instance's machine (WSL)
@@ -3112,6 +3056,9 @@ async def handle_session_start(payload: dict) -> dict:
                 # below; primarch/instance_type land on persona_id/golden_throne.
                 now = datetime.now().isoformat()
                 transplant_updates = {
+                    "name": await _official_or_placeholder_name(
+                        db, session_id, existing_row["name"]
+                    ),
                     "working_dir": working_dir,
                     "device_id": device_id,
                     "status": "idle",
@@ -3184,7 +3131,9 @@ async def handle_session_start(payload: dict) -> dict:
                     parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
-                await _stamp_instance_id(target_pane, session_id, display_name=existing_row["name"])
+                await _stamp_instance_id(
+                    target_pane, session_id, display_name=transplant_updates["name"]
+                )
                 # Only vacate the old pane when a NEW addressable pane was actually
                 # stamped. A blank `tmux_pane` (in-wrapper re-fire arriving with no
                 # live TMUX_PANE) means nothing moved — the instance is still on
@@ -3201,12 +3150,6 @@ async def handle_session_start(payload: dict) -> dict:
                     workflow_state=workflow_state,
                     previous_session_doc_id=existing_row["session_doc_id"],
                     previous_workflow_state=existing_row["workflow_state"],
-                )
-                await _apply_session_doc_instance_name(
-                    db,
-                    instance_id=session_id,
-                    session_doc_id=resolved_session_doc_id or existing_row["session_doc_id"],
-                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
                 )
                 await db.commit()
                 auto_subscription = await _auto_subscribe_parent_on_start(
@@ -3295,6 +3238,9 @@ async def handle_session_start(payload: dict) -> dict:
                 # parent_instance_id) is applied by _apply_commander_binding
                 # below; instance_type lands on the golden_throne marker.
                 updates = {
+                    "name": await _official_or_placeholder_name(
+                        db, session_id, existing_row["name"]
+                    ),
                     "working_dir": working_dir,
                     "device_id": device_id,
                     "status": "idle",
@@ -3364,16 +3310,10 @@ async def handle_session_start(payload: dict) -> dict:
                 await _stamp_instance_id(
                     tmux_pane or prior_pane,
                     session_id,
-                    display_name=existing_row["name"],
+                    display_name=updates["name"],
                 )
                 if tmux_pane and prior_pane and tmux_pane != prior_pane:
                     await _unstamp_instance_id(prior_pane, session_id)
-                await _apply_session_doc_instance_name(
-                    db,
-                    instance_id=session_id,
-                    session_doc_id=existing_row["session_doc_id"],
-                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
-                )
                 await db.commit()
                 auto_subscription = await _auto_subscribe_parent_on_start(
                     db,
@@ -3496,6 +3436,7 @@ async def handle_session_start(payload: dict) -> dict:
                 # _apply_commander_binding below.
                 supplant_updates = {
                     "id": session_id,
+                    "name": await _official_or_placeholder_name(db, supplant_id, old_inst["name"]),
                     "working_dir": working_dir,
                     "status": "idle",
                     "device_id": device_id,
@@ -3568,7 +3509,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_mode=dispatch_mode,
                 )
                 await _stamp_instance_id(
-                    target_tmux_pane, session_id, display_name=old_inst["name"]
+                    target_tmux_pane, session_id, display_name=supplant_updates["name"]
                 )
                 # If the agent moved panes, vacate the old pane's @INSTANCE_ID so the
                 # oracle never reports the supplanted (now-defunct) id there.
@@ -3612,12 +3553,6 @@ async def handle_session_start(payload: dict) -> dict:
                     workflow_state=workflow_state,
                     previous_session_doc_id=old_inst["session_doc_id"],
                     previous_workflow_state=old_inst["workflow_state"],
-                )
-                await _apply_session_doc_instance_name(
-                    db,
-                    instance_id=session_id,
-                    session_doc_id=session_doc_id,
-                    wrapper_launch_id=wrapper_launch_id or old_inst["wrapper_launch_id"],
                 )
                 dispatch_bound_doc = (
                     session_doc_policy or old_inst["session_doc_policy"]
@@ -3989,15 +3924,8 @@ async def handle_session_start(payload: dict) -> dict:
             previous_session_doc_id=_prior_session_doc_id,
             previous_workflow_state=_prior_workflow_state,
         )
-        tab_name = (
-            await _apply_session_doc_instance_name(
-                db,
-                instance_id=session_id,
-                session_doc_id=session_doc_id,
-                wrapper_launch_id=wrapper_launch_id,
-            )
-            or tab_name
-        )
+        # Instance naming remains at DEFAULT_INSTANCE_NAME until an official
+        # rename command/interview writes a human title.
 
         # Auto-detect legion from context
         auto_legion = None

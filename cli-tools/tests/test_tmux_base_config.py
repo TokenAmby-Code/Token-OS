@@ -165,14 +165,29 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
 
 
-def test_persona_renders_in_statusline_not_pane_border_nametag() -> None:
-    """Persona displays in generic status-left but never as pane-border fallback."""
+def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None:
+    """Only the blue nametag segment is protected; other context may render outside it."""
     status_left = _line_starting("set -g status-left ")
     assert "#S" in status_left
     assert "@PERSONA" in status_left
 
     border = _line_starting("set -g pane-border-format ")
-    assert "@PANE_LABEL" in border
+    start = border.index("#{?@PANE_LABEL,")
+    end = border.index("}#{?@GUARD", start) + 1
+    blue_nametag = border[start:end]
+
+    assert "#[bg=colour31]" in blue_nametag
+    assert "#{@PANE_LABEL}" in blue_nametag
+    for forbidden in (
+        "@PERSONA",
+        "@SESSION_DOC",
+        "@CWD",
+        "pane_title",
+        "pane_current_path",
+        "pane_current_command",
+    ):
+        assert forbidden not in blue_nametag
+
     assert "@PERSONA" not in border
     assert "pane_title" not in border
     assert "@PANE_TITLE_SUPPRESS" not in border

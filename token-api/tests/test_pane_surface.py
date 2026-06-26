@@ -37,36 +37,26 @@ REAL_NAMES = [
 @pytest.mark.parametrize("name", PLACEHOLDER_NAMES)
 def test_placeholder_names_agree_across_all_detectors(app_env, name):
     pane_surface = __import__("pane_surface")
-    hooks = sys.modules["routes.hooks"]
     # 1. pane_surface (canonical, protected)
     assert pane_surface.is_meaningful_tab_name(name) is False
     assert pane_surface.human_tab_name(name) is None
     # 2. main reconciler / nudge gate
     assert app_env.main._is_placeholder_tab_name(name) is True
-    # 3. hooks instance-name base
-    assert hooks._is_unnamed_session_doc_base(name) is True
 
 
 @pytest.mark.parametrize("name", REAL_NAMES)
 def test_real_names_agree_across_all_detectors(app_env, name):
     pane_surface = __import__("pane_surface")
-    hooks = sys.modules["routes.hooks"]
     assert pane_surface.is_meaningful_tab_name(name) is True
     assert pane_surface.human_tab_name(name) == name
     assert app_env.main._is_placeholder_tab_name(name) is False
-    assert hooks._is_unnamed_session_doc_base(name) is False
 
 
-def test_numbered_placeholder_stem_yields_needs_name(app_env):
-    """A numbered placeholder filename stem reaching the instance namer must be
-    detected as unnamed and collapse to the generic `needs-name`, not leak the
-    numbered stem into a tab name like needs-session-name-345-1."""
+def test_session_doc_instance_namer_is_removed(app_env) -> None:
+    """Session document paths/slugs must not provide an instance-name path."""
     hooks = sys.modules["routes.hooks"]
-    base = hooks._instance_name_base_from_session_doc(
-        "", "/Volumes/Imperium/Imperium-ENV/Terra/Sessions/needs-session-name-345.md"
-    )
-    assert base == "needs-session-name-345"
-    assert hooks._is_unnamed_session_doc_base(base) is True
+    assert not hasattr(hooks, "_apply_session_doc_instance_name")
+    assert not hasattr(hooks, "_instance_name_base_from_session_doc")
 
 
 def test_golden_throne_human_surface_includes_position_and_name(app_env):

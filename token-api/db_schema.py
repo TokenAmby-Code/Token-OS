@@ -16,6 +16,7 @@ import aiosqlite
 
 from cron_engine import CronEngine
 from instance_registry import (
+    DEFAULT_INSTANCE_NAME,
     INSTANCE_COLUMNS,
     RUNTIME_ANNEX_COLUMNS,
     golden_throne_binding,
@@ -81,10 +82,10 @@ async def _persona_id_for_legacy_row(db, row: dict) -> str | None:
 
 
 async def _create_instances_table(db) -> None:
-    await db.execute("""
+    await db.execute(f"""
         CREATE TABLE instances (
             id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '{DEFAULT_INSTANCE_NAME}',
             engine TEXT,
             working_dir TEXT,
             device_id TEXT NOT NULL,

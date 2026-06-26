@@ -126,7 +126,7 @@ def test_victory_ack_cascade_dry_run_emits_actions_and_mutates_nothing(
             "instances": [
                 {
                     "id": "inst-dry",
-                    "tab_name": "inst-dry",
+                    "tab_name": "needs-name",
                     "status": "working",
                     "working_dir": str(wt_path),
                     "pr_state": "merged",

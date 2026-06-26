@@ -388,7 +388,7 @@ class TestSanctionedWritesV2Only:
         conn.commit()
         row = conn.execute("SELECT name FROM instances WHERE id = ?", (instance_id,)).fetchone()
         conn.close()
-        assert row is not None and row["name"] == "exterminatus-test"
+        assert row is not None and row["name"] == "needs-name"
 
 
 # ── legacy PATCH endpoints write instance-table ─────────────────────────────────────────

@@ -62,12 +62,16 @@ def client(app_env, monkeypatch):
 
 
 def _register(client, name: str) -> dict:
+    instance_id = str(uuid.uuid4())
     resp = client.post(
         "/api/instances/register",
-        json={"instance_id": str(uuid.uuid4()), "tab_name": name, "working_dir": f"/tmp/{name}"},
+        json={"instance_id": instance_id, "tab_name": name, "working_dir": f"/tmp/{name}"},
     )
     assert resp.status_code == 200, resp.text
-    return resp.json()
+    data = resp.json()
+    data["instance_id"] = instance_id
+    data["requested_name"] = name
+    return data
 
 
 def test_registration_exhausts_primary_before_backup(client, app_env):
@@ -85,9 +89,7 @@ def test_stopped_instance_releases_persona(client):
     first = _register(client, "inst-0")
     assert first["profile"]["name"] == "blood-angels"
 
-    instances = client.get("/api/instances").json()
-    inst = [row for row in instances if row["tab_name"] == "inst-0"][0]
-    client.delete(f"/api/instances/{inst['id']}")
+    client.delete(f"/api/instances/{first['instance_id']}")
 
     again = _register(client, "inst-1")
     assert again["profile"]["name"] == "blood-angels"
@@ -107,10 +109,8 @@ def test_manual_voice_change_updates_persona_and_tts_fields(client, app_env):
     assert first["profile"]["name"] == "blood-angels"
     assert second["profile"]["name"] == "ultramarines"
 
-    instances = client.get("/api/instances").json()
-    second_row = [row for row in instances if row["tab_name"] == "inst-1"][0]
     resp = client.patch(
-        f"/api/instances/{second_row['id']}/voice",
+        f"/api/instances/{second['instance_id']}/voice",
         json={"voice": "Microsoft Catherine"},
     )
     assert resp.status_code == 200, resp.text
@@ -124,7 +124,7 @@ def test_manual_voice_change_updates_persona_and_tts_fields(client, app_env):
     with sqlite3.connect(app_env.db_path) as conn:
         row = conn.execute(
             "SELECT profile_name, tts_voice, notification_sound FROM legacy_instances WHERE id = ?",
-            (second_row["id"],),
+            (second["instance_id"],),
         ).fetchone()
     assert row == ("imperial-fists", "Microsoft Catherine", "ding.wav")
 
@@ -135,10 +135,8 @@ def test_manual_voice_change_rejects_collision_without_bumping(client, app_env):
     assert first["profile"]["tts_voice"] == "Microsoft Ravi"
     assert second["profile"]["tts_voice"] == "Microsoft Susan"
 
-    instances = client.get("/api/instances").json()
-    second_row = [row for row in instances if row["tab_name"] == "inst-1"][0]
     resp = client.patch(
-        f"/api/instances/{second_row['id']}/voice",
+        f"/api/instances/{second['instance_id']}/voice",
         json={"voice": "Microsoft Ravi"},
     )
     assert resp.status_code == 409, resp.text
@@ -148,22 +146,20 @@ def test_manual_voice_change_rejects_collision_without_bumping(client, app_env):
 
     with sqlite3.connect(app_env.db_path) as conn:
         rows = conn.execute(
-            "SELECT tab_name, profile_name, tts_voice FROM legacy_instances ORDER BY tab_name"
+            "SELECT working_dir, profile_name, tts_voice FROM legacy_instances ORDER BY working_dir"
         ).fetchall()
     assert rows == [
-        ("inst-0", "blood-angels", "Microsoft Ravi"),
-        ("inst-1", "ultramarines", "Microsoft Susan"),
+        ("/tmp/inst-0", "blood-angels", "Microsoft Ravi"),
+        ("/tmp/inst-1", "ultramarines", "Microsoft Susan"),
     ]
 
 
 def test_manual_voice_change_rejects_reserved_custodes_voice(client):
     row = _register(client, "inst-0")
-    instances = client.get("/api/instances").json()
-    inst = [item for item in instances if item["tab_name"] == "inst-0"][0]
     assert row["profile"]["name"] == "blood-angels"
 
     resp = client.patch(
-        f"/api/instances/{inst['id']}/voice",
+        f"/api/instances/{row['instance_id']}/voice",
         json={"voice": "Microsoft George"},
     )
     assert resp.status_code == 400, resp.text

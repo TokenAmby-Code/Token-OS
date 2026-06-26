@@ -1631,7 +1631,7 @@ def test_dispatch_persona_forwards_metadata_env_without_injecting_doctrine_body(
     """Dispatch no longer assembles/injects the persona doctrine body — the agent
     wrapper is the sole injector (TOKEN_API_PERSONA → token_wrapper_system_doc).
     Dispatch only resolves the persona (so preflight passes) and forwards the
-    *operational* metadata (vault domain, instance-name prefix) as env the wrapper
+    *operational* metadata (vault domain/session doc) as env the wrapper
     folds in beneath the staple. The doctrine body must NOT appear on the staged
     command line, and there must be no double-inject via --append-system-prompt."""
     db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
@@ -1662,7 +1662,7 @@ def test_dispatch_persona_forwards_metadata_env_without_injecting_doctrine_body(
     assert result.returncode == 0, result.stderr
     assert "persona:         blood-angels" in result.stdout
     # Operational metadata is forwarded as env; doctrine body is NOT injected here.
-    assert "TOKEN_API_INSTANCE_NAME_PREFIX=blood-angels" in result.stdout
+    assert "TOKEN_API_INSTANCE_NAME_PREFIX" not in result.stdout
     assert "TOKEN_API_VAULT_DOMAIN=Imperium-ENV" in result.stdout
     assert "Generic rank behavior" not in result.stdout
     assert "--append-system-prompt" not in result.stdout
@@ -2745,11 +2745,9 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
 
     A false exit-70 before the naming step is exactly why agents land needs-name
     and untracked. With the liveness-driven gate the launch reaches exit 0, so the
-    launched agent is neither reaped nor retried and proceeds through its
-    SessionStart naming. The naming directive now rides as the
-    ``TOKEN_API_INSTANCE_NAME_PREFIX`` env the wrapper folds into the operational
-    appendix (``instance-name "<prefix>-<task>"``), so the staged launch command
-    carries that prefix env rather than the literal directive text.
+    launched agent is neither reaped nor retried. Naming is no longer delivered
+    by dispatch-derived prefixes; it happens only through the naming interview
+    / instance-name boundary.
     """
     db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
     env = _persona_env(tmp_path, db)
@@ -2815,14 +2813,14 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
     assert "registration slow" in result.stderr
     assert "launch failed" not in result.stderr
 
-    # Proof the naming step reaches the pane on the success path: the staged
-    # launch command carries the instance-name prefix env the wrapper expands into
-    # the self-naming directive.
+    # Proof the success path reaches the pane without smuggling a dispatch-derived
+    # naming prefix into the staged launch command.
     calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
     staged_arg = next((c for c in calls if c.startswith("bash /")), None)
     assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
     staged = Path(staged_arg.split(" ", 1)[1]).read_text(encoding="utf-8", errors="replace")
-    assert "TOKEN_API_INSTANCE_NAME_PREFIX=blood-angels" in staged, staged
+    assert "TOKEN_API_INSTANCE_NAME_PREFIX" not in staged, staged
+    assert "On startup, name this instance" not in staged, staged
 
 
 def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Path) -> None:

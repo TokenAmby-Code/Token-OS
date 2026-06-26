@@ -327,22 +327,17 @@ token_wrapper_system_doc() {
 }
 
 # Operational metadata that used to ride inside dispatch's persona prompt (vault
-# domain, instance-name prefix, linked session doc). Relocated to dispatch env
+# domain, linked session doc). Relocated to dispatch env
 # vars so it stays OUT of the doctrine doc and the wrapper folds it in AFTER the
 # staple. Echoes nothing unless dispatch set the persona launch vars.
 token_wrapper_operational_appendix() {
-  local prefix="${TOKEN_API_INSTANCE_NAME_PREFIX:-}"
   local vault="${TOKEN_API_VAULT_DOMAIN:-}"
   local doc_id="${TOKEN_API_SESSION_DOC_ID:-}"
-  [[ -n "$vault" || -n "$prefix" ]] || return 0
+  [[ -n "$vault" || -n "$doc_id" ]] || return 0
   local out=""
   [[ -n "$vault" ]] && out+="Vault domain: ${vault}"$'\n'
-  [[ -n "$prefix" ]] && out+="Instance name prefix: ${prefix}"$'\n'
   if [[ -n "$doc_id" ]]; then
     out+=$'\n'"You have a linked session document (ID: ${doc_id}). Invoke the vault-mind skill on startup to load it."$'\n'
-  fi
-  if [[ -n "$prefix" ]]; then
-    out+=$'\n'"On startup, name this instance with: instance-name \"${prefix}-<task-description>\""
   fi
   printf '%s' "$out"
 }
