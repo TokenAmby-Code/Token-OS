@@ -137,6 +137,10 @@ def test_depth_fuse_fails_closed_on_malformed_counter(tmp_path) -> None:
       * non-numeric (e.g. ``abc``, ``1; rm``) — arithmetic injection / garbage;
       * oversized (e.g. INT64_MAX) — ``+1`` would wrap to a negative intmax_t
         and silently slip past the ``> max`` comparison.
+      * leading-zero (e.g. ``08``/``09``) — bash arithmetic parses these as
+        OCTAL, and under ``set -e`` an invalid octal digit aborts with a raw
+        bash error (rc!=70) instead of cleanly tripping the fuse; ``10#`` forces
+        base-10 so they trip on the ``>= max`` bound like any other 8/9.
     """
     bad_values = (
         "-100",
@@ -145,6 +149,8 @@ def test_depth_fuse_fails_closed_on_malformed_counter(tmp_path) -> None:
         "3.5",
         "9223372036854775807",  # INT64_MAX: +1 wraps negative if not rejected
         "99999999999999999999999",  # far beyond intmax_t
+        "08",  # octal trap: invalid octal digit; must read as decimal 8 >= 3
+        "09",  # octal trap: invalid octal digit; must read as decimal 9 >= 3
     )
     for bad in bad_values:
         env = _base_env(tmp_path)

@@ -32,6 +32,11 @@ _IMPERIUM_TMUX_SHIM_MAX_DEPTH=3
 #      DIGIT COUNT before any arithmetic, so an overflowing value never reaches
 #      the numeric comparison.
 #   3. already at/above the bound — we are genuinely re-entering.
+#   4. leading-zero literal (e.g. 08/09) — bash arithmetic would parse it as
+#      OCTAL, and under `set -e` an invalid octal digit aborts the script with
+#      a raw bash error (rc!=70) instead of cleanly tripping the fuse. Every
+#      arithmetic use of the inherited value is therefore forced to base 10
+#      with `10#` so a digit-only counter is always read as decimal.
 # Comparing the inherited value against max (rather than max+1 after a bump) is
 # equivalent to the old post-increment `> max` test, and guarantees the `+1`
 # below only ever runs on a small in-range value (<= max-1), so it cannot
@@ -41,12 +46,12 @@ case "$_inherited_tmux_depth" in
     (''|*[!0-9]*) _inherited_tmux_depth="" ;;   # mark invalid
 esac
 if [[ -z "$_inherited_tmux_depth" || ${#_inherited_tmux_depth} -gt 3 ]] \
-   || (( _inherited_tmux_depth >= _IMPERIUM_TMUX_SHIM_MAX_DEPTH )); then
+   || (( 10#$_inherited_tmux_depth >= _IMPERIUM_TMUX_SHIM_MAX_DEPTH )); then
     printf 'tmux: FATAL recursion fuse tripped or invalid IMPERIUM_TMUX_SHIM_DEPTH=%s (max depth %s) — real tmux likely misresolved to this shim. Refusing to recurse to prevent a fork bomb.\n' \
         "${IMPERIUM_TMUX_SHIM_DEPTH:-}" "$_IMPERIUM_TMUX_SHIM_MAX_DEPTH" >&2
     exit 70
 fi
-IMPERIUM_TMUX_SHIM_DEPTH=$(( _inherited_tmux_depth + 1 ))
+IMPERIUM_TMUX_SHIM_DEPTH=$(( 10#$_inherited_tmux_depth + 1 ))
 export IMPERIUM_TMUX_SHIM_DEPTH
 unset _inherited_tmux_depth
 
