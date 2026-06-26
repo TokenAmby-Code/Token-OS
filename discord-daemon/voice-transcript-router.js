@@ -46,6 +46,16 @@ export function parseVoiceCommand(text) {
   return { command: null, draftText: String(text || '').trim() };
 }
 
+/**
+ * @typedef {object} VoiceTranscriptRouter
+ * @property {function(object): Promise<object>} route
+ * @property {function(): object[]} listDrafts
+ * @property {function(object=): Promise<object[]>} clear
+ */
+
+/**
+ * @returns {VoiceTranscriptRouter}
+ */
 export function createVoiceTranscriptRouter({
   logger,
   voiceManager = null,

@@ -30,6 +30,30 @@ function normalizeBotName(botName) {
   return String(botName || 'unknown').trim().toLowerCase().replaceAll('-', '_');
 }
 
+/**
+ * @typedef {object} VoiceManager
+ * @property {function(string, string=): Promise<object>} joinChannel
+ * @property {function(string=, string=): Promise<object>} leaveChannel
+ * @property {function(string=): object} startListening
+ * @property {function(string=): object} stopListening
+ * @property {function(string=): object} getStatus
+ * @property {function(): void} setupAutoJoin
+ * @property {function(string, string=): Promise<object>} playAudio
+ * @property {function(string=): object} stopPlayback
+ * @property {function(string, string=, object=): Promise<object>} playTTS
+ * @property {function(string=, string=, string=): object} clearLocalVoiceSession
+ * @property {function(string, string=, number=): Promise<object>} muteMember
+ * @property {function(string, string=): Promise<object>} unmuteMember
+ * @property {function(function): void} setAudioFrameCallback
+ * @property {function(function): void} setAudioEndCallback
+ * @property {function(function): void} setAudioCommitCallback
+ * @property {function(function): void} setVoiceLeaveCallback
+ * @property {function(string=): Promise<object>} reconcileOperatorVoiceState
+ */
+
+/**
+ * @returns {VoiceManager}
+ */
 export function createVoiceManager(botClients, config, logger) {
   const guildId = config.guild_id;
   const operatorUserId = config.operator_user_id;
@@ -211,6 +235,7 @@ export function createVoiceManager(botClients, config, logger) {
     let voiceSessionId = null;
     let voiceSessionStartInFlight = false;
     let voiceSessionGeneration = 0;
+    let pendingCommitRequest = null;
     let discarded = false;
     let suppressEndClose = false;
 
@@ -232,6 +257,14 @@ export function createVoiceManager(botClients, config, logger) {
       if (silenceTimer) {
         clearTimeout(silenceTimer);
         silenceTimer = null;
+      }
+      if (voiceSessionStartInFlight) {
+        pendingCommitRequest = { reason, extra };
+        logger.debug?.(
+          `Voice [${botName}]: deferring realtime audio commit from ${userId} ` +
+          `until voice session start completes (reason=${reason})`
+        );
+        return true;
       }
       if (!hasAudioSinceCommit) return false;
       const audioMs = downsampledDurationMs(bytesSinceCommit);
@@ -264,6 +297,7 @@ export function createVoiceManager(botClients, config, logger) {
       voiceSessionId = null;
       voiceSessionStartInFlight = false;
       voiceSessionGeneration += 1;
+      pendingCommitRequest = null;
       discarded = true;
     }
 
@@ -322,6 +356,11 @@ export function createVoiceManager(botClients, config, logger) {
         }).finally(() => {
           if (!discarded) {
             voiceSessionStartInFlight = false;
+            const pending = pendingCommitRequest;
+            pendingCommitRequest = null;
+            if (pending && hasAudioSinceCommit) {
+              commitPending(pending.reason, pending.extra);
+            }
           }
         });
       }

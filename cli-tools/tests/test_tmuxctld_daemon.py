@@ -622,11 +622,13 @@ def test_voice_append_ship_scratch_clear_mutate_public_role(
     rec = RecordingVoiceAdapter()
     monkeypatch.setattr(daemon, "_voice_resolve_target", lambda _control, _bot: "palace:E")
     server, _ = _serve(lambda: rec)
+    created_session_ids: list[str] = []
     try:
         _, started = _post(
             server, "/voice/session/start", {"bot_name": "imperial_guard", "user_id": "u1"}
         )
         sid = started["result"]["voice_session_id"]
+        created_session_ids.append(sid)
         _, appended = _post(
             server, "/voice/session/append", {"voice_session_id": sid, "text": "draft"}
         )
@@ -644,6 +646,7 @@ def test_voice_append_ship_scratch_clear_mutate_public_role(
             server, "/voice/session/start", {"bot_name": "imperial_guard", "user_id": "u1"}
         )
         sid2 = started2["result"]["voice_session_id"]
+        created_session_ids.append(sid2)
         _, scratched = _post(server, "/voice/session/scratch", {"voice_session_id": sid2})
         assert scratched["result"]["scratched"] is True
         assert ("send-keys-helper", "palace:E", "C-c") in rec.calls
@@ -652,10 +655,13 @@ def test_voice_append_ship_scratch_clear_mutate_public_role(
             server, "/voice/session/start", {"bot_name": "imperial_guard", "user_id": "u1"}
         )
         sid3 = started3["result"]["voice_session_id"]
+        created_session_ids.append(sid3)
         _, cleared = _post(server, "/voice/session/clear", {"voice_session_id": sid3})
         assert cleared["result"]["cleared"] == 1
     finally:
         server.shutdown()
+        for session_id in created_session_ids:
+            daemon.VOICE_SESSIONS.remove(session_id)
 
 
 class ImperialGuardNoClientAdapter(StubAdapter):

@@ -1,6 +1,9 @@
 // voice-route-retry.js — loud warning wrapper for Discord voice routing.
 // There is deliberately no retry loop and no fallback route.
 
+/**
+ * @returns {boolean}
+ */
 export function isRetryableVoiceRouteFailure(resultOrError) {
   if (!resultOrError) return false;
   if (resultOrError.routed === false) {
