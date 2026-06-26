@@ -118,4 +118,15 @@ Token-API `WrapperEnd` must never be on the synchronous shell-return path. Slow
 Token-API orchestration, mechanicus sync, or session cleanup may continue in the
 background, but visible tmux pane cleanup must not wait for it.
 
+### Child stdin must stay a TTY
+
+The wrapper backgrounds the native agent (`"$@" & ; wait`) so the lifecycle
+traps above can forward signals and run cleanup while the child is alive. POSIX
+redirects an async list's stdin to `/dev/null` unless it is explicitly
+redirected, so the child must be launched with an explicit `<&0` to dup the
+wrapper's own stdin (the pane pty) through. Without it the engine sees a non-TTY
+stdin: `codex` aborts with `stdin is not a terminal` and `claude` silently
+tolerates it (masking the regression). `wrapper_run_child` owns this; the pty
+inheritance is locked by `test_engine_child_inherits_controlling_tty_on_stdin`.
+
 See also: [`aspirant-dispatch.md`](aspirant-dispatch.md) for the full aspirant launch contract and real validation walk.

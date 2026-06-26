@@ -131,6 +131,48 @@ def test_wrapperend_emits_on_nonzero_child_exit_and_preserves_status(tmp_path: P
     assert "wrapper-test-id" in hook_text
 
 
+def test_engine_child_inherits_controlling_tty_on_stdin(tmp_path: Path) -> None:
+    """Regression: the engine must see a real TTY on stdin.
+
+    A bare ``"$@" &`` makes a non-interactive shell redirect the async child's
+    stdin to /dev/null (POSIX), so codex aborts with "stdin is not a terminal"
+    and claude silently tolerates it. wrapper_run_child dups the wrapper's own
+    stdin (the pane pty) into the child via ``<&0`` to restore the TTY. Driving
+    the wrapper under a real pty proves the child inherits it.
+    """
+    import pty
+
+    target = tmp_path / "claude-target"
+    marker = tmp_path / "child-stdin.txt"
+    _write_executable(
+        target,
+        f"#!/usr/bin/env bash\nif [ -t 0 ]; then echo TTY > {str(marker)!r}; "
+        f"else echo NOTTY > {str(marker)!r}; fi\nexit 0\n",
+    )
+    env, _hooks = _wrapper_env(tmp_path, target)
+
+    pid, fd = pty.fork()
+    if pid == 0:  # child: become the wrapper, with the pty as its stdin
+        os.chdir(tmp_path)
+        os.execve(
+            str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"),
+            [str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"), "claude", "arg"],
+            env,
+        )
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            if not os.read(fd, 1024):
+                break
+        except OSError:
+            break
+    _, status = os.waitpid(pid, 0)
+
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    assert marker.exists(), "engine child never ran"
+    assert marker.read_text(encoding="utf-8").strip() == "TTY"
+
+
 def _signal_wrapper(tmp_path: Path, sig: signal.Signals, *, spam: int = 1) -> tuple[int, str]:
     ready = tmp_path / "child.ready"
     target = tmp_path / "claude-target"

@@ -89,7 +89,15 @@ wrapper_wait_child() {
 }
 
 wrapper_run_child() {
-  "$@" &
+  # Hand the engine child the real controlling TTY on stdin. POSIX redirects an
+  # async list's stdin to /dev/null UNLESS it is explicitly redirected, so a bare
+  # `"$@" &` gives the child stdin=/dev/null=non-TTY: codex aborts with "stdin is
+  # not a terminal" and claude silently tolerates it (masking the bug). The
+  # explicit `<&0` dups the wrapper's own stdin (the pane pty) into the child,
+  # overriding that default while preserving the background + wait machinery so
+  # the INT/TERM/HUP forwarding traps keep working for signals sent to the
+  # wrapper alone (e.g. tmuxctld kills) — not just to the foreground group.
+  "$@" <&0 &
   WRAPPER_CHILD_PID=$!
   wrapper_wait_child
 }
