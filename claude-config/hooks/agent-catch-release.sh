@@ -11,6 +11,12 @@
 #   HOOK_ACTION_TYPE=PreToolUse bash ~/.claude/hooks/agent-catch-release.sh
 
 set -euo pipefail
+# Best-effort hook: must never block Claude Code. Keep strict mode for real bugs,
+# but force a clean exit 0 even if errexit aborts mid-script on a transient
+# subprocess-spawn failure (EMFILE / token-api-restart race). Block/dispatch
+# decisions are relayed via stdout JSON, never via the exit code, so forcing
+# exit 0 is safe.
+trap 'exit 0' EXIT
 
 LOG_FILE="${HOME}/.claude/logs/hook-debug.log"
 mkdir -p "${HOME}/.claude/logs"
