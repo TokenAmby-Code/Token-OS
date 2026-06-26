@@ -234,6 +234,13 @@ def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
     for key in (
         "MouseDown1Status",
         "MouseDown1Pane",
+        "MouseUp1Pane",
+        "MouseDrag1Pane",
+        "MouseDragEnd1Pane",
+        "MouseDown2Pane",
+        "MouseUp2Pane",
+        "MouseDown3Pane",
+        "MouseUp3Pane",
         "WheelUpPane",
         "WheelDownPane",
         "FocusIn",
@@ -267,6 +274,13 @@ def test_mouse_bindings_never_reach_the_green_agent_guard_state() -> None:
     mouse_keys = (
         "MouseDown1Status",
         "MouseDown1Pane",
+        "MouseUp1Pane",
+        "MouseDrag1Pane",
+        "MouseDragEnd1Pane",
+        "MouseDown2Pane",
+        "MouseUp2Pane",
+        "MouseDown3Pane",
+        "MouseUp3Pane",
         "WheelUpPane",
         "WheelDownPane",
     )

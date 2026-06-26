@@ -22,7 +22,6 @@ files live here.
 from __future__ import annotations
 
 import argparse
-import shlex
 import subprocess
 import sys
 import time
@@ -125,9 +124,16 @@ def publish(tmux: Tmux, pane: str, state: str) -> None:
 
 
 def schedule_expiry(tmux: Tmux, pane: str, seconds: int) -> None:
-    delay = max(1, int(seconds) + 1)
-    cmd = f"sleep {delay}; tmux-typing-guard-state expire-pane --pane {shlex.quote(pane)} >/dev/null 2>&1 || true"
-    tmux.run("run-shell", "-b", cmd, timeout=0.3)
+    """Deliberately do not spawn a delayed shell for guard expiry.
+
+    The previous implementation used ``tmux run-shell -b "sleep N; ..."`` for
+    every human key/submit/agent hold. Under active use, that created hundreds of
+    ``sh``+``sleep`` processes. The authoritative state already lives in absolute
+    tmux option deadlines and all gate checks evaluate those deadlines lazily, so
+    expiry does not need a background timer. Markers are refreshed by the next
+    guard state transition or explicit ``expire-pane`` call.
+    """
+    return None
 
 
 def mark_client_activity(

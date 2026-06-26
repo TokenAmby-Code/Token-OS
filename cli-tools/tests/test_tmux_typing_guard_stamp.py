@@ -154,7 +154,7 @@ def test_no_guard_assignment_contains_literal_pending() -> None:
         assert '@GUARD" "PENDING' not in text
 
 
-def test_state_helper_arm_sets_yellow_marker_and_schedules_expiry(tmp_path: Path) -> None:
+def test_state_helper_arm_sets_yellow_marker_without_sleep_poll(tmp_path: Path) -> None:
     env = _env(tmp_path)
     proc = subprocess.run(
         [sys.executable, str(STATE), "arm", "--pane", "%1", "--seconds", "300", "--now", "1000"],
@@ -170,7 +170,7 @@ def test_state_helper_arm_sets_yellow_marker_and_schedules_expiry(tmp_path: Path
     assert "@TYPING_PENDING_UNTIL" in setopt and "-pu" in setopt
     guard_rows = [line for line in setopt.splitlines() if " @GUARD " in line]
     assert guard_rows == ["set-option -p -t %1 @GUARD #[fg=colour214,bold]⌨#[default]"]
-    assert "expire-pane --pane %1" in Path(env["FAKE_TMUX_RUNSHELL"]).read_text()
+    assert Path(env["FAKE_TMUX_RUNSHELL"]).read_text() == ""
 
 
 def test_state_helper_pending_sets_red_marker_and_unsets_lock(tmp_path: Path) -> None:
