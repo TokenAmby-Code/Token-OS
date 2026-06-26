@@ -38,6 +38,61 @@ WORKING_DIR="$(pwd)"
 TMUX_PANE_VALUE="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
 DISPATCH_TARGET_WINDOW="${TOKEN_API_PRINT_REDIRECT_WINDOW:-main:mechanicus}"
 WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(token_wrapper_uuid)}"
+WRAPPER_CHILD_PID=""
+WRAPPER_CLEANUP_DONE=0
+
+wrapper_mode_cleanup() {
+  :
+}
+
+wrapper_cleanup() {
+  local exit_code="${1:-$?}"
+  trap - EXIT
+  trap '' INT TERM HUP
+  if [[ "${WRAPPER_CLEANUP_DONE:-0}" -eq 1 ]]; then
+    exit "$exit_code"
+  fi
+  WRAPPER_CLEANUP_DONE=1
+  set +e
+  wrapper_mode_cleanup
+  token_wrapper_end "$exit_code"
+  exit "$exit_code"
+}
+
+wrapper_forward_signal() {
+  local sig="$1"
+  local child="${WRAPPER_CHILD_PID:-}"
+  if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then
+    kill "-$sig" "$child" 2>/dev/null || true
+  fi
+}
+
+wrapper_wait_child() {
+  local status final_status child shell_opts="$-"
+  set +e
+  while true; do
+    child="$WRAPPER_CHILD_PID"
+    wait "$child"
+    status=$?
+    if kill -0 "$child" 2>/dev/null; then
+      continue
+    fi
+    if [[ "$status" -ge 128 ]]; then
+      wait "$child"
+      final_status=$?
+      [[ "$final_status" -ne 127 ]] && status=$final_status
+    fi
+    WRAPPER_CHILD_PID=""
+    [[ "$shell_opts" == *e* ]] && set -e
+    return "$status"
+  done
+}
+
+wrapper_run_child() {
+  "$@" &
+  WRAPPER_CHILD_PID=$!
+  wrapper_wait_child
+}
 
 is_token_wrapper_file() {
   local path="$1"
@@ -89,15 +144,11 @@ run_engine_binary() {
     echo "$engine binary not found" >&2
     exit 127
   }
-  TOKEN_API_AGENT_WRAPPER_BYPASS=1 "$bin" "$@"
+  wrapper_run_child env TOKEN_API_AGENT_WRAPPER_BYPASS=1 "$bin" "$@"
 }
 
 cleanup_common() {
-  local exit_code=$?
-  trap - EXIT INT TERM HUP
-  token_wrapper_cleanup_pane "$TMUX_PANE_VALUE"
-  token_wrapper_end "$exit_code"
-  exit "$exit_code"
+  wrapper_cleanup "$?"
 }
 
 run_claude() {
@@ -174,7 +225,10 @@ run_claude() {
     exit 0
   fi
 
-  trap cleanup_common EXIT INT TERM HUP
+  trap cleanup_common EXIT
+  trap 'wrapper_forward_signal INT' INT
+  trap 'wrapper_forward_signal TERM' TERM
+  trap 'wrapper_forward_signal HUP' HUP
   token_wrapper_start
   export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
 
@@ -274,20 +328,18 @@ run_codex_legacy_subagent() {
 
   local temp_log
   temp_log="$(mktemp)"
-  codex_legacy_cleanup() {
-    local exit_code=$?
-    trap - EXIT INT TERM HUP
+  wrapper_mode_cleanup() {
     rm -f "$temp_log"
-    token_wrapper_cleanup_pane "$TMUX_PANE_VALUE"
-    token_wrapper_end "$exit_code"
-    exit "$exit_code"
   }
-  trap codex_legacy_cleanup EXIT INT TERM HUP
+  trap cleanup_common EXIT
+  trap 'wrapper_forward_signal INT' INT
+  trap 'wrapper_forward_signal TERM' TERM
+  trap 'wrapper_forward_signal HUP' HUP
   token_wrapper_start
   export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
 
   set +e
-  TOKEN_API_AGENT_WRAPPER_BYPASS=1 script -a -f -e -c "$codex_path $(printf '%q' "$command_str")" "$temp_log"
+  wrapper_run_child env TOKEN_API_AGENT_WRAPPER_BYPASS=1 script -a -f -e -c "$codex_path $(printf '%q' "$command_str")" "$temp_log"
   status=$?
   set -e
 
@@ -325,15 +377,13 @@ run_codex() {
   export TOKEN_API_LAUNCHER="$LAUNCHER"
   export TOKEN_API_ENGINE="codex"
 
-  codex_cleanup() {
-    local exit_code=$?
-    trap - EXIT INT TERM HUP
+  wrapper_mode_cleanup() {
     [[ -n "${bridge_dir:-}" && -n "${bridge_id:-}" ]] && rm -f "${bridge_dir}/${bridge_id}.session_id" 2>/dev/null || true
-    token_wrapper_cleanup_pane "$TMUX_PANE_VALUE"
-    token_wrapper_end "$exit_code"
-    exit "$exit_code"
   }
-  trap codex_cleanup EXIT INT TERM HUP
+  trap cleanup_common EXIT
+  trap 'wrapper_forward_signal INT' INT
+  trap 'wrapper_forward_signal TERM' TERM
+  trap 'wrapper_forward_signal HUP' HUP
   token_wrapper_start
 
   # Fold the rank+persona staple into codex's initial prompt as a delimited

@@ -1,6 +1,10 @@
 import json
 import os
+import signal
 import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -61,6 +65,200 @@ def test_common_cleanup_prefers_tmuxctl_clear_runtime() -> None:
 def _write_executable(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _wrapper_env(tmp_path: Path, target: Path, *, fake_curl: bool = True) -> tuple[dict, Path]:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir(exist_ok=True)
+    hooks = tmp_path / "hooks.log"
+    if fake_curl:
+        _write_executable(fakebin / "curl", f'#!/usr/bin/env bash\necho "$*" >> {str(hooks)!r}\n')
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fakebin}:{env.get('PATH', '')}",
+            "CLAUDE_BIN": str(target),
+            "TOKEN_API_URL": "http://token-api.invalid",
+            "TMUXCTLD_URL": "http://tmuxctld.invalid",
+            "TOKEN_API_WRAPPER_LAUNCH_ID": "wrapper-test-id",
+        }
+    )
+    env.pop("TMUX_PANE", None)
+    env.pop("TOKEN_API_DISPATCH_RESOLVED_PANE", None)
+    return env, hooks
+
+
+def _read_hooks_after_async(hooks: Path, *, timeout: float = 2.0) -> str:
+    deadline = time.time() + timeout
+    text = hooks.read_text(encoding="utf-8") if hooks.exists() else ""
+    while time.time() < deadline:
+        if "/hooks/wrapperend" in text and "/api/hooks/WrapperEnd" in text:
+            return text
+        time.sleep(0.02)
+        text = hooks.read_text(encoding="utf-8") if hooks.exists() else ""
+    return text
+
+
+def _run_wrapper(tmp_path: Path, child_body: str) -> tuple[subprocess.CompletedProcess, str]:
+    target = tmp_path / "claude-target"
+    _write_executable(target, child_body)
+    env, hooks = _wrapper_env(tmp_path, target)
+    result = subprocess.run(
+        [str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"), "claude", "arg"],
+        env=env,
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+    )
+    return result, _read_hooks_after_async(hooks)
+
+
+def test_wrapperend_emits_on_normal_child_exit_and_preserves_zero(tmp_path: Path) -> None:
+    result, hook_text = _run_wrapper(tmp_path, "#!/usr/bin/env bash\nexit 0\n")
+
+    assert result.returncode == 0
+    assert "/hooks/wrapperend" in hook_text
+    assert "/api/hooks/WrapperEnd" in hook_text
+    assert hook_text.count("/api/hooks/WrapperEnd") == 1
+
+
+def test_wrapperend_emits_on_nonzero_child_exit_and_preserves_status(tmp_path: Path) -> None:
+    result, hook_text = _run_wrapper(tmp_path, "#!/usr/bin/env bash\nexit 7\n")
+
+    assert result.returncode == 7
+    assert "/hooks/wrapperend" in hook_text
+    assert "/api/hooks/WrapperEnd" in hook_text
+    assert "wrapper-test-id" in hook_text
+
+
+def _signal_wrapper(tmp_path: Path, sig: signal.Signals, *, spam: int = 1) -> tuple[int, str]:
+    ready = tmp_path / "child.ready"
+    target = tmp_path / "claude-target"
+    _write_executable(
+        target,
+        f"""#!/usr/bin/env python3
+import signal
+import sys
+import time
+from pathlib import Path
+
+Path({str(ready)!r}).touch()
+
+def handler(signum, _frame):
+    if signum == signal.SIGINT:
+        raise SystemExit(130)
+    if signum == signal.SIGTERM:
+        raise SystemExit(143)
+    if signum == signal.SIGHUP:
+        raise SystemExit(129)
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGINT, handler)
+signal.signal(signal.SIGTERM, handler)
+signal.signal(signal.SIGHUP, handler)
+while True:
+    time.sleep(0.1)
+""",
+    )
+    env, hooks = _wrapper_env(tmp_path, target)
+    proc = subprocess.Popen(
+        [str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"), "claude", "arg"],
+        env=env,
+        cwd=tmp_path,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.time() + 5
+    while time.time() < deadline and not ready.exists():
+        time.sleep(0.02)
+    assert ready.exists(), "child never started"
+    for _ in range(spam):
+        os.kill(proc.pid, sig)
+        time.sleep(0.02)
+    stdout, stderr = proc.communicate(timeout=5)
+    assert stdout == ""
+    assert stderr == ""
+    return proc.returncode, _read_hooks_after_async(hooks)
+
+
+def test_wrapperend_emits_on_sigint_and_preserves_signal_status(tmp_path: Path) -> None:
+    returncode, hook_text = _signal_wrapper(tmp_path, signal.SIGINT)
+
+    assert returncode == 130
+    assert "/hooks/wrapperend" in hook_text
+    assert hook_text.count("/api/hooks/WrapperEnd") == 1
+
+
+def test_wrapperend_emits_on_sigterm_and_preserves_signal_status(tmp_path: Path) -> None:
+    returncode, hook_text = _signal_wrapper(tmp_path, signal.SIGTERM)
+
+    assert returncode == 143
+    assert "/hooks/wrapperend" in hook_text
+    assert hook_text.count("/api/hooks/WrapperEnd") == 1
+
+
+def test_wrapperend_is_once_under_repeated_interrupt_spam(tmp_path: Path) -> None:
+    returncode, hook_text = _signal_wrapper(tmp_path, signal.SIGINT, spam=8)
+
+    assert returncode == 130
+    assert hook_text.count("/hooks/wrapperend") == 1
+    assert hook_text.count("/api/hooks/WrapperEnd") == 1
+
+
+class _SlowWrapperHookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        if self.path.endswith("/WrapperStart"):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+            return
+        time.sleep(5)
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *_args) -> None:
+        return
+
+
+def test_wrapper_cleanup_is_bounded_when_receivers_are_slow(tmp_path: Path) -> None:
+    token_api = ThreadingHTTPServer(("127.0.0.1", 0), _SlowWrapperHookHandler)
+    tmuxctld = ThreadingHTTPServer(("127.0.0.1", 0), _SlowWrapperHookHandler)
+    threads = [
+        threading.Thread(target=token_api.serve_forever, daemon=True),
+        threading.Thread(target=tmuxctld.serve_forever, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        target = tmp_path / "claude-target"
+        _write_executable(target, "#!/usr/bin/env bash\nexit 0\n")
+        env, _hooks = _wrapper_env(tmp_path, target, fake_curl=False)
+        env["TOKEN_API_URL"] = f"http://127.0.0.1:{token_api.server_address[1]}"
+        env["TMUXCTLD_URL"] = f"http://127.0.0.1:{tmuxctld.server_address[1]}"
+        env["TOKEN_WRAPPER_TMUXCTLD_MAX_TIME"] = "0.4"
+        env["TOKEN_WRAPPER_TOKEN_API_MAX_TIME"] = "0.4"
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"), "claude", "arg"],
+            env=env,
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            timeout=3,
+        )
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0
+        assert elapsed < 2.0
+    finally:
+        token_api.shutdown()
+        tmuxctld.shutdown()
 
 
 def test_claude_command_resolves_agent_wrapper_through_symlink(tmp_path: Path) -> None:
@@ -211,11 +409,22 @@ def test_dispatch_uses_agent_wrapper_not_inline_launcher() -> None:
         assert f"{engine}-wrapper.sh" not in dispatch
 
 
-def test_agent_wrapper_owns_stack_enforcement() -> None:
+def test_wrapperend_posts_token_api_async_before_tmuxctld_bomb() -> None:
+    common = (CLI_TOOLS / "lib" / "agent-wrapper-common.sh").read_text(encoding="utf-8")
+    end_body = common.split("token_wrapper_end() {", 1)[1].split("}\n\n#", 1)[0]
+    assert "token_wrapper_post_hook_async" in end_body
+    assert "token_wrapper_post_tmuxctld_wrapperend" in end_body
+    assert end_body.index("token_wrapper_post_hook_async") < end_body.index(
+        "token_wrapper_post_tmuxctld_wrapperend"
+    )
+    assert "token_wrapper_enforce_stack_if_needed" not in end_body
+
+
+def test_stack_enforcement_helper_remains_available() -> None:
     wrapper = (CLI_TOOLS / "scripts" / "agent-wrapper.sh").read_text(encoding="utf-8")
     assert 'token_wrapper_enforce_stack_if_needed "$TMUX_PANE_VALUE"' not in wrapper
     common = (CLI_TOOLS / "lib" / "agent-wrapper-common.sh").read_text(encoding="utf-8")
-    assert 'token_wrapper_enforce_stack_if_needed "$TMUX_PANE_VALUE"' in common
+    assert "token_wrapper_enforce_stack_if_needed()" in common
     assert "tmuxctl stack enforce" in common
 
 

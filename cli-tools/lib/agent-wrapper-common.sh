@@ -110,6 +110,59 @@ token_wrapper_post_hook() {
   return 0
 }
 
+token_wrapper_post_hook_async() {
+  local action_type="$1"
+  local payload="$2"
+  (
+    local http_code rc cause
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+      --connect-timeout "${TOKEN_WRAPPER_TOKEN_API_CONNECT_TIMEOUT:-0.25}" \
+      --max-time "${TOKEN_WRAPPER_TOKEN_API_MAX_TIME:-0.75}" \
+      -X POST "${API_URL}/api/hooks/${action_type}" \
+      -H "Content-Type: application/json" \
+      -d "$payload" 2>/dev/null) && rc=0 || rc=$?
+
+    if [[ "$rc" -eq 0 && "$http_code" == 2* ]]; then
+      exit 0
+    fi
+
+    case "$rc" in
+      7)  cause="conn-refused" ;;
+      28) cause="timeout" ;;
+      0)  cause="http-${http_code:-000}" ;;
+      *)  cause="other-rc${rc}" ;;
+    esac
+    token_wrapper_record_hook_failure "$action_type" "$cause"
+  ) >/dev/null 2>&1 &
+  return 0
+}
+
+token_wrapper_post_tmuxctld_wrapperend() {
+  local payload="$1"
+  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+  local http_code rc
+  http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+    --connect-timeout "${TOKEN_WRAPPER_TMUXCTLD_CONNECT_TIMEOUT:-0.20}" \
+    --max-time "${TOKEN_WRAPPER_TMUXCTLD_MAX_TIME:-0.60}" \
+    -X POST "${tmuxctld_url%/}/hooks/wrapperend" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null) && rc=0 || rc=$?
+
+  if [[ "$rc" -eq 0 && "$http_code" == 2* ]]; then
+    return 0
+  fi
+
+  local cause
+  case "$rc" in
+    7)  cause="conn-refused" ;;
+    28) cause="timeout" ;;
+    0)  cause="http-${http_code:-000}" ;;
+    *)  cause="other-rc${rc}" ;;
+  esac
+  token_wrapper_record_hook_failure "TmuxctldWrapperEnd" "$cause"
+  return 0
+}
+
 token_wrapper_build_payload() {
   local action_type="$1"
   local exit_code="${2:-}"
@@ -255,8 +308,8 @@ token_wrapper_end() {
   local exit_code="${1:-0}"
   local end_payload
   end_payload="$(token_wrapper_build_payload "WrapperEnd" "$exit_code")"
-  token_wrapper_post_hook "WrapperEnd" "$end_payload"
-  token_wrapper_enforce_stack_if_needed "$TMUX_PANE_VALUE"
+  token_wrapper_post_hook_async "WrapperEnd" "$end_payload"
+  token_wrapper_post_tmuxctld_wrapperend "$end_payload"
 }
 
 # ---------------------------------------------------------------------------

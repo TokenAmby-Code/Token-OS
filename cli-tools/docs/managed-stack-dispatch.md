@@ -87,4 +87,35 @@ Operational note: after plan-mode or any mode transition that can drop persona r
 
 If a new tool needs a legion/mechanicus pane, wire it to `tmuxctl stack add` or `tmuxctl stack dispatch`. Do not duplicate layout, split, tagging, or focus behavior in shell.
 
+## Wrapper lifecycle cleanup
+
+Agent launches route through `cli-tools/scripts/agent-wrapper.sh`. The wrapper owns
+the `WrapperStart`/`WrapperEnd` boundary around the native agent process; Token-API
+continues to own process/session lifecycle and native agent `SessionStart` /
+`SessionStop`.
+
+On wrapper exit, the contract is:
+
+1. Preserve the native agent's real exit code.
+2. Forward `INT`, `TERM`, and `HUP` to the child agent while the wrapper remains
+   alive.
+3. Run one guarded cleanup path exactly once, even under repeated Ctrl+C spam.
+4. Emit Token-API `WrapperEnd` asynchronously first as telemetry / lifecycle
+   confirmation only.
+5. Emit tmuxctld `POST /hooks/wrapperend` last. This is the authoritative
+   "drop the bomb on my head" ping: as soon as tmuxctld receives it, tmuxctld
+   immediately clears wrapper-owned pane visual/runtime state.
+
+tmuxctld owns wrapper visual cleanup:
+
+- clear persona/tint/statusline/runtime pane options for the pane whose
+  `@TOKEN_API_WRAPPER_LAUNCH_ID` matches the payload;
+- resolve the pane by wrapper id if the payload has no live pane target;
+- treat duplicate, already-cleared, or missing panes as idempotent success;
+- reject a live pane owned by a different wrapper as an ownership error.
+
+Token-API `WrapperEnd` must never be on the synchronous shell-return path. Slow
+Token-API orchestration, mechanicus sync, or session cleanup may continue in the
+background, but visible tmux pane cleanup must not wait for it.
+
 See also: [`aspirant-dispatch.md`](aspirant-dispatch.md) for the full aspirant launch contract and real validation walk.
