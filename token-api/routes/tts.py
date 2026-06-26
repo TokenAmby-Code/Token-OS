@@ -141,10 +141,6 @@ class QueueTTSRequest(BaseModel):
     queue_target: str = "pause"  # "hot" or "pause"
 
 
-class PromoteRequest(BaseModel):
-    instance_id: str | None = None  # If set, promote that instance's items
-
-
 class PlayPaneRequest(BaseModel):
     instance_id: str  # Promote all items from this instance to hot queue
 
@@ -587,7 +583,11 @@ def speak_tts(
         """
         if _send_to_phone is None:
             return _no_playback_backend("phone_transport_unavailable")
-        result = dict(_send_to_phone("/notify", {"tts_text": message}) or {})
+        try:
+            result = dict(_send_to_phone("/notify", {"tts_text": message}) or {})
+        except Exception as exc:
+            logger.warning("TTS: Phone send failed (%s), will fall through", exc)
+            return {"success": False, "error": "phone_send_failed", "reason": str(exc)}
         if result.get("success"):
             result.setdefault("method", "phone")
         return result
@@ -627,6 +627,7 @@ def speak_tts(
         return _finish(speak_tts_mac(message, voice, rate))
 
     return _finish(_no_playback_backend("unknown_playback_backend"))
+
 
 async def dispatch_notify(
     message: str,
@@ -1886,7 +1887,7 @@ async def notify_sound(request: SoundRequest):
 
 
 @router.post("/api/notify/queue")
-async def queue_tts_message(request: QueueTTSRequest):
+async def queue_tts_message(request: QueueTTSRequest) -> dict:
     """Queue a TTS message for an instance. Uses the instance's profile voice/sound.
 
     Messages are played sequentially - if another TTS is playing, this will queue.
@@ -1896,26 +1897,41 @@ async def queue_tts_message(request: QueueTTSRequest):
 
 
 @router.get("/api/notify/queue/status")
-async def get_queue_status():
+async def get_queue_status() -> dict:
     """Get current TTS queue status."""
     return get_tts_queue_status()
 
 
 @router.post("/api/tts/queue/promote")
-async def promote_from_pause(request: PromoteRequest):
+async def promote_from_pause(request: Request, instance_id: str | None = None) -> dict:
     """Move item(s) from pause queue to the front of hot queue.
 
-    Body: {} → promotes the next item.
-    Body: {"instance_id": "xxx"} → promotes all items from that instance.
+    Plugin-friendly: takes its argument as a query param OR a JSON body, and a
+    bare POST (no body, or a body without a JSON Content-Type — common from
+    Stream Deck web-request plugins) is fine.
+
+    - no arg                       → promotes the next (oldest) item.
+    - ?instance_id=xxx  (query)    → promotes all items from that instance.
+    - {"instance_id":"xxx"} (body) → same, back-compat.
     """
+    if instance_id is None:
+        # Back-compat: accept {"instance_id": "..."} JSON body. Tolerate empty /
+        # missing / non-JSON bodies rather than 422-ing the operator's button.
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                instance_id = body.get("instance_id")
+        except Exception:
+            instance_id = None
+
     promoted = 0
     async with tts_queue_lock:
         if not pause_queue:
             return {"success": True, "promoted": 0, "reason": "pause_queue_empty"}
 
-        if request.instance_id:
+        if instance_id:
             # Promote all items from this instance, oldest first on playback.
-            to_promote = [item for item in pause_queue if item.instance_id == request.instance_id]
+            to_promote = [item for item in pause_queue if item.instance_id == instance_id]
             for item in to_promote:
                 pause_queue.remove(item)
                 item.queue_target = "hot"
@@ -1941,7 +1957,7 @@ async def promote_from_pause(request: PromoteRequest):
 
 
 @router.post("/api/tts/queue/play-all")
-async def play_all_from_pause():
+async def play_all_from_pause() -> dict:
     """Drain the entire pause queue into the hot queue, preserving FIFO order.
 
     Operator "Play all" control (e.g. a Stream Deck button): empties the
@@ -1965,7 +1981,7 @@ async def play_all_from_pause():
 
 
 @router.post("/api/tts/queue/play-pane")
-async def play_pane(request: PlayPaneRequest):
+async def play_pane(request: PlayPaneRequest) -> dict:
     """Promote all items from a specific instance to the front of hot queue.
 
     Equivalent to promote with instance_id, provided as a convenience endpoint.
@@ -1988,7 +2004,7 @@ async def play_pane(request: PlayPaneRequest):
 
 
 @router.post("/api/tts/skip")
-async def api_tts_skip(clear_queue: bool = False):
+async def api_tts_skip(clear_queue: bool = False) -> dict:
     """Skip current TTS playback and optionally clear the queue.
 
     Args:
@@ -2003,10 +2019,20 @@ async def api_tts_skip(clear_queue: bool = False):
 
 
 @router.post("/api/tts/global-mode")
-async def set_global_tts_mode(request: Request):
-    """Set global TTS mode. Overrides all instances."""
-    body = await request.json()
-    mode = body.get("mode", "verbose")
+async def set_global_tts_mode(request: Request, mode: str | None = None) -> dict:
+    """Set global TTS mode. Overrides all instances.
+
+    Plugin-friendly: `mode` may come from a query param (?mode=toggle) OR a
+    JSON body ({"mode":"toggle"}). Query params are the safest form for Stream
+    Deck web-request plugins, which often omit the JSON Content-Type.
+    """
+    if mode is None:
+        # Tolerate empty / missing / non-JSON bodies; fall back to verbose.
+        try:
+            body = await request.json()
+            mode = body.get("mode", "verbose") if isinstance(body, dict) else "verbose"
+        except Exception:
+            mode = "verbose"
     # One-button operator mute toggle (e.g. a Stream Deck button): resolve
     # "toggle" to the opposite of the current global mode before validation.
     if mode == "toggle":
@@ -2040,7 +2066,7 @@ async def set_global_tts_mode(request: Request):
 
 
 @router.get("/api/notify/test")
-async def test_notification():
+async def test_notification() -> dict:
     """Test the notification system with a simple message."""
     sound_result = play_sound()
     tts_result = speak_tts("Token API notification test")

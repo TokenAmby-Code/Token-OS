@@ -32,7 +32,7 @@ def _load_tts():
 
 def _insert_voiced_instance(db_path: Path, *, persona_slug: str | None) -> str:
     """Insert an idle, voiced instance; optionally bind it to a seeded persona."""
-    from instance_mutation import sanctioned_insert_instance_sync
+    from instance_mutation import sanctioned_insert_instance_sync, sanctioned_update_instance_sync
     from personas import persona_id_for_slug
 
     iid = str(uuid.uuid4())
@@ -56,12 +56,17 @@ def _insert_voiced_instance(db_path: Path, *, persona_slug: str | None) -> str:
         write_source="test",
         actor="test",
     )
-    conn.execute("UPDATE instances SET tts_voice = 'Microsoft George' WHERE id = ?", (iid,))
+    updates = {"tts_voice": "Microsoft George"}
     if persona_slug is not None:
-        conn.execute(
-            "UPDATE instances SET persona_id = ? WHERE id = ?",
-            (persona_id_for_slug(persona_slug), iid),
-        )
+        updates["persona_id"] = persona_id_for_slug(persona_slug)
+    sanctioned_update_instance_sync(
+        conn,
+        instance_id=iid,
+        updates=updates,
+        mutation_type="instance_test_profile_update",
+        write_source="test",
+        actor="test",
+    )
     conn.commit()
     conn.close()
     return iid
@@ -70,12 +75,21 @@ def _insert_voiced_instance(db_path: Path, *, persona_slug: str | None) -> str:
 def _quiet_world(tts, monkeypatch):
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
     monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
+    monkeypatch.setattr(
+        tts,
+        "_resolve_queue_playback_target",
+        lambda **kw: {
+            "success": True,
+            "playback_target": "mac",
+            "routing": {"device": "mac", "reason": "test backend"},
+        },
+    )
     monkeypatch.setattr(tts, "_custodes_state_event_handler", None)
     tts.pause_queue.clear()
     tts.hot_queue.clear()
 
 
-def test_custodes_sender_bypasses_pause_queue(app_env, monkeypatch):
+def test_custodes_sender_bypasses_pause_queue(app_env, monkeypatch) -> None:
     """A Custodes-persona sender's 'pause' request is forced onto the hot queue."""
     tts = _load_tts()
     _quiet_world(tts, monkeypatch)
@@ -89,7 +103,7 @@ def test_custodes_sender_bypasses_pause_queue(app_env, monkeypatch):
     assert len(tts.pause_queue) == 0
 
 
-def test_non_custodes_sender_still_pauses(app_env, monkeypatch):
+def test_non_custodes_sender_still_pauses(app_env, monkeypatch) -> None:
     """A non-Custodes sender's 'pause' request is untouched — still the pause queue."""
     tts = _load_tts()
     _quiet_world(tts, monkeypatch)
@@ -103,7 +117,7 @@ def test_non_custodes_sender_still_pauses(app_env, monkeypatch):
     assert len(tts.hot_queue) == 0
 
 
-def test_bypass_is_sender_keyed_not_message_keyed(app_env, monkeypatch):
+def test_bypass_is_sender_keyed_not_message_keyed(app_env, monkeypatch) -> None:
     """The same innocuous message bypasses from Custodes but pauses from a normal
     sender — proving the bypass keys on the SENDER, never the message text."""
     tts = _load_tts()
@@ -117,3 +131,17 @@ def test_bypass_is_sender_keyed_not_message_keyed(app_env, monkeypatch):
 
     assert cust_result["queue"] == "hot"
     assert norm_result["queue"] == "pause"
+
+
+def test_quiet_hours_win_over_custodes_bypass(app_env, monkeypatch) -> None:
+    """Quiet-hours suppression happens before Custodes hot-queue bypass."""
+    tts = _load_tts()
+    _quiet_world(tts, monkeypatch)
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: True)
+    iid = _insert_voiced_instance(app_env.db_path, persona_slug="custodes")
+
+    result = asyncio.run(tts.queue_tts(iid, "hold until morning", queue_target="pause"))
+
+    assert result == {"success": True, "queued": False, "reason": "quiet_hours"}
+    assert len(tts.hot_queue) == 0
+    assert len(tts.pause_queue) == 0
