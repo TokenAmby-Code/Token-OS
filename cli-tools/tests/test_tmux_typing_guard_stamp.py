@@ -16,6 +16,9 @@ AGENT_CMD = REPO / "cli-tools" / "bin" / "agent-cmd"
 BRIEF = REPO / "cli-tools" / "bin" / "brief"
 TMUX_SHIM = REPO / "cli-tools" / "bin" / "tmux"
 STATE = REPO / "cli-tools" / "bin" / "tmux-typing-guard-state"
+sys.path.insert(0, str(REPO / "cli-tools" / "lib"))
+
+from tmuxctl import typing_guard_state  # noqa: E402
 
 
 def _fake_tmux(tmp_path: Path) -> Path:
@@ -171,6 +174,43 @@ def test_state_helper_arm_sets_yellow_marker_without_sleep_poll(tmp_path: Path) 
     guard_rows = [line for line in setopt.splitlines() if " @GUARD " in line]
     assert guard_rows == ["set-option -p -t %1 @GUARD #[fg=colour214,bold]⌨#[default]"]
     assert Path(env["FAKE_TMUX_RUNSHELL"]).read_text() == ""
+
+
+def test_human_arm_overrides_existing_agent_hold() -> None:
+    """A real keystroke during tmuxctld's green hold becomes a human lock.
+
+    The AGENT hold serializes daemon sends; it must not cause ``arm()`` to ignore
+    human typing.  Otherwise the daemon thread's holder override can continue
+    piercing and clobber the Emperor's active input.
+    """
+
+    class FakeTmux:
+        binary = "tmux"
+
+        def __init__(self) -> None:
+            self.options = {typing_guard_state.AGENT_OPTION: "1300"}
+            self.calls: list[tuple[str, ...]] = []
+
+        def run(self, *args: str, timeout: float = 0.5):
+            self.calls.append(args)
+            if args[:2] == ("show-options", "-pqv"):
+                option = args[-1]
+                return subprocess.CompletedProcess(["tmux", *args], 0, self.options.get(option, ""))
+            if args[:2] == ("set-option", "-p"):
+                self.options[args[-2]] = args[-1]
+                return subprocess.CompletedProcess(["tmux", *args], 0, "")
+            if args[:2] == ("set-option", "-pu"):
+                self.options.pop(args[-1], None)
+                return subprocess.CompletedProcess(["tmux", *args], 0, "")
+            return subprocess.CompletedProcess(["tmux", *args], 0, "")
+
+    fake = FakeTmux()
+
+    typing_guard_state.arm(fake, "%1", seconds=300, now=1000)
+
+    assert fake.options.get(typing_guard_state.LOCK_OPTION) == "1300"
+    assert typing_guard_state.AGENT_OPTION not in fake.options
+    assert fake.options.get(typing_guard_state.GUARD_OPTION) == typing_guard_state.ON_MARKER
 
 
 def test_state_helper_pending_sets_red_marker_and_unsets_lock(tmp_path: Path) -> None:

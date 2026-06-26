@@ -15,7 +15,6 @@ Central reference for all custom startup automations across devices.
 | **ai.openclaw.tokenapi** | enabled | Token API — FastAPI on `:7777` (uvicorn). KeepAlive on crash. Logs: `~/.claude/token-api-std{out,err}.log` |
 | **ai.openclaw.caffeinate** | enabled | `caffeinate -dims` — prevents display, idle, system, and disk sleep. KeepAlive always. **Added 2026-02-22** (was previously relying on openclaw cron watchdog, which used wrong flags) |
 | **ai.openclaw.gateway** | enabled | OpenClaw gateway |
-| **ai.openclaw.discord-context** | enabled | Discord context collector |
 
 ### Disabled / Backed Up
 
@@ -29,7 +28,7 @@ Central reference for all custom startup automations across devices.
 2. launchd loads all `~/Library/LaunchAgents/*.plist` with `RunAtLoad`
 3. **caffeinate** starts immediately — display stays on
 4. **tokenapi** starts on `:7777`
-5. **gateway** + **discord-context** start
+5. **gateway** starts
 6. Windows PC boots → Deskflow KVM connects → Mac Token-API runs keymap guard and starts/reloads Deskflow client
 
 ## Power Settings (`pmset`)

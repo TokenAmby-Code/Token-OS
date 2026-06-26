@@ -407,6 +407,26 @@ def _pane_hold_until(target: str) -> int | None:
     return max(deadlines)
 
 
+def _pane_human_hold_until(target: str) -> int | None:
+    """Return latest active human ON/PENDING hold epoch for ``target``.
+
+    Excludes the daemon AGENT hold.  tmuxctld's thread-local override may pierce
+    only its own AGENT marker; it must never pierce a human keystroke/pending
+    lock that appeared before or during the send transaction.
+    """
+    deadlines = [
+        v for v in (_pane_lock_until(target), _pane_pending_until(target)) if v is not None
+    ]
+    if not deadlines:
+        return None
+    return max(deadlines)
+
+
+def _pane_human_locked(target: str) -> bool:
+    until = _pane_human_hold_until(target)
+    return until is not None and time.time() < until
+
+
 def _pane_keystroke_locked(target: str) -> bool:
     """True iff ``target`` carries a live typing, pending, or agent hold.
 
@@ -651,7 +671,23 @@ def evaluate(
         return None
 
     reason = "quiet_hours" if quiet else "typing_guard"
+    # tmuxctld sets this only around the daemon's own green AGENT hold so its
+    # first byte can pass the state-blind gate it just raised.  If a real human
+    # ON/PENDING lock is present, ignore that override: human typing beats the
+    # daemon hold.  This closes the mid-transaction clobber where a later C-m
+    # pierced through a human keystroke lock because the request thread still
+    # carried "tmuxctld-send-holder".
+    effective_override = override
+    if (
+        reason == "typing_guard"
+        and override == "tmuxctld-send-holder"
+        and target
+        and _pane_human_locked(target)
+    ):
+        effective_override = None
     policy = send_gate_policy(override=override, reason=reason)
+    if effective_override != override:
+        policy = send_gate_policy(override=effective_override, reason=reason)
     result = {
         "suppressed": policy != "pierce",
         "policy": policy,
@@ -661,7 +697,8 @@ def evaluate(
         "quiet_hours": quiet,
         "typing_guard": typing,
         "quiet_context": quiet_ctx,
-        "override": override,
+        "override": effective_override,
+        "ignored_override": override if effective_override != override else None,
     }
     return result
 
