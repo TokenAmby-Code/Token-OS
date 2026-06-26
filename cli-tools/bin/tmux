@@ -217,10 +217,47 @@ is_read_command_with_pane_ids() {
             # pass them through the public-id sanitizer.
             return 0 ;;
         display-message|display)
-            local arg
+            # `display-message` has two distinct uses, and only one is a leak
+            # surface:
+            #   * Human-facing — a status-line message (or a print) whose format
+            #     embeds a %pane id inside descriptive text. Sanitize to public
+            #     ids so raw %ids never reach a human.
+            #   * Programmatic — `display-message -p '#{pane_id}'` (or #D /
+            #     #{window_id} / #{session_id}) fetches a RAW machine id on
+            #     stdout for immediate reuse as a `-t` target (e.g.
+            #     tmux-grid-expand resolving its own pane). Rewriting that pure
+            #     id to a public id yields an unresolvable target
+            #     ("can't find session: council"), so it MUST pass through
+            #     untranslated.
+            # Parse just enough to isolate the format string and the print flag,
+            # then exempt ONLY the pure-id print form: -p present, the format is
+            # exactly one id token, nothing embedded.
+            local arg fmt="" has_print=0 want=""
             for arg in "$@"; do
-                [[ "$arg" == *'#{pane_id}'* || "$arg" == *'#D'* || "$arg" == *'#{window_id}'* || "$arg" == *'#{session_id}'* ]] && return 0
+                if [[ -n "$want" ]]; then
+                    [[ "$want" == -F ]] && fmt="$arg"
+                    want=""
+                    continue
+                fi
+                case "$arg" in
+                    -c|-d|-t|-F) want="$arg" ;;          # consumes the next arg
+                    -F?*) fmt="${arg#-F}" ;;             # -F<format> combined
+                    -c?*|-d?*|-t?*) : ;;                 # opt+value combined
+                    -p) has_print=1 ;;
+                    -*p*) has_print=1 ;;                 # clustered flags w/ p
+                    -*) : ;;                             # other flags (-a/-l/-v…)
+                    *) fmt="$arg" ;;                     # positional = format
+                esac
             done
+            case "$fmt" in
+                '#{pane_id}'|'#D'|'#{window_id}'|'#{session_id}')
+                    # Pure id token: raw on stdout when printed (programmatic),
+                    # otherwise a human status-line render.
+                    (( has_print )) && return 1
+                    return 0 ;;
+                *'#{pane_id}'*|*'#D'*|*'#{window_id}'*|*'#{session_id}'*)
+                    return 0 ;;                          # id embedded in text
+            esac
             return 1 ;;
         *) return 1 ;;
     esac
