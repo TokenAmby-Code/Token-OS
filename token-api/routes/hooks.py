@@ -5078,6 +5078,14 @@ async def handle_stop(payload: dict) -> dict:
         return await _fanout_stop_for_orphan_session(session_id, payload)
 
     instance = dict(instance)
+
+    # Dev-worktree instances are test traffic: their Stop hook must produce NO
+    # Emperor-facing side-effects (completion TTS, phone/Discord notify, evaluators).
+    # DB registration already lands in the isolated dev DB (TOKEN_API_DB) — only the
+    # notification fanout is the spam. Bail before any of it. See _is_dev_worktree_dir.
+    if _is_dev_worktree_dir(instance.get("working_dir") or payload.get("cwd")):
+        return {"success": True, "action": "skipped_dev_worktree", "instance_id": session_id}
+
     # The oracle is the sole source of pane geometry: resolve the live pane + role
     # from the instance's @INSTANCE_ID stamp and carry them transiently on the row
     # so downstream targeting/surfacing uses live values, never stored columns.
@@ -6138,6 +6146,10 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     session_id = payload.get("session_id")
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {})
+    # Dev-worktree instances are test traffic: suppress Emperor-facing notify
+    # fanout (AskUserQuestion phone/Discord buzz) below. Bash-blocking guardrails
+    # still apply. payload cwd absent → None → False (no suppression, safe default).
+    _dev_traffic = _is_dev_worktree_dir(payload.get("cwd"))
 
     # Mark instance as processing (catches cases where prompt_submit was missed)
     # Also resurrect stopped instances - activity means they're active
@@ -6161,6 +6173,12 @@ async def handle_pre_tool_use(payload: dict) -> dict:
             f"PreToolUse: Task background launched for {session_id[:12]} (pending: {_pending_background_tasks[session_id]})"
         )
         return {"success": True, "action": "allowed"}
+
+    # Dev-worktree instances are test traffic: never route their AskUserQuestion to
+    # the Emperor (TTS ladder, Discord mirror, phone buzz). Returns allowed exactly as
+    # a non-Bash tool falls through below — only the notify fanout is skipped.
+    if tool_name == "AskUserQuestion" and _dev_traffic:
+        return {"success": True, "action": "allowed_dev_worktree"}
 
     # AskUserQuestion three-touch ladder + voice-chat AHK side effect.
     # Fetch instance row once for ladder eligibility (voice-chat OR golden_throne).
