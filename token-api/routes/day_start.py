@@ -190,8 +190,70 @@ async def _consumer_daily_note_creation() -> dict:
     }
 
 
-async def _notify_daily_note_missed(result: dict) -> None:
-    """Loud alert when the daily note was not created. Best-effort; never raises."""
+def _today_daily_note_exists() -> bool:
+    """True iff today's canonical Terra daily note exists as file or session doc.
+
+    The live canonical path is recorded in ``session_documents`` and may include
+    the vault root segment (``Imperium-ENV``). Do not TTS a miss while that doc
+    exists, even if a validation/re-check path forced the miss branch.
+    """
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        from session_doc_helpers import daily_notes_dir
+
+        if (daily_notes_dir() / f"{date_str}.md").exists():
+            return True
+    except Exception as exc:
+        logger.warning("daily_note_exists file preflight failed: %s", exc)
+
+    try:
+        import sqlite3
+
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM session_documents
+                WHERE title = ?
+                   OR file_path LIKE ?
+                LIMIT 1
+                """,
+                (date_str, f"%/{date_str}.md"),
+            ).fetchone()
+        return row is not None
+    except Exception as exc:
+        logger.warning("daily_note_exists db preflight failed: %s", exc)
+        return False
+
+
+def _is_validation_source(source: str | None, result: dict | None = None) -> bool:
+    text = (
+        " ".join(
+            str(part or "")
+            for part in (
+                source,
+                (result or {}).get("reason"),
+                (result or {}).get("error"),
+                (result or {}).get("validation"),
+            )
+        )
+        .strip()
+        .lower()
+    )
+    return (
+        text.startswith("test")
+        or "validation" in text
+        or "dry_run" in text
+        or "dry-run" in text
+        or "recheck" in text
+        or "re-check" in text
+        or "forced_miss" in text
+        or "simulated" in text
+    )
+
+
+async def _notify_daily_note_missed(result: dict, *, source: str | None = None) -> None:
+    """Loud alert when the daily note is genuinely absent. Best-effort; never raises."""
     import httpx
 
     status = result.get("status", "unknown")
@@ -201,7 +263,30 @@ async def _notify_daily_note_missed(result: dict) -> None:
         "Check NAS mount and Terra vault. Trigger manually if needed."
     )
 
-    await log_event("daily_note_creation_missed", details={"result": result, "message": msg})
+    note_exists = _today_daily_note_exists()
+    validation_source = _is_validation_source(source, result)
+    if note_exists or validation_source:
+        await log_event(
+            "daily_note_creation_miss_suppressed",
+            details={
+                "result": result,
+                "message": msg,
+                "source": source,
+                "note_exists": note_exists,
+                "validation_source": validation_source,
+            },
+        )
+        logger.warning(
+            "daily_note_creation_miss_suppressed: source=%s note_exists=%s message=%s",
+            source,
+            note_exists,
+            msg,
+        )
+        return
+
+    await log_event(
+        "daily_note_creation_missed", details={"result": result, "message": msg, "source": source}
+    )
     logger.warning("daily_note_creation_missed: %s", msg)
 
     try:
@@ -332,7 +417,7 @@ async def fire_day_start_internal(
         else:
             missed_result = daily_note_item.get("result") or {}
         if missed_result.get("status") != "ok":
-            await _notify_daily_note_missed(missed_result)
+            await _notify_daily_note_missed(missed_result, source=source)
 
     return {
         "success": True,
