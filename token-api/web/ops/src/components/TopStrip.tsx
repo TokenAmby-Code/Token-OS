@@ -8,7 +8,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { OpsState } from '../types';
 import { modeVisual, desktopGlyph, phoneGlyph } from '../modes';
 import { formatSignedClock, formatClock } from '../format';
-import { clearPhoneAttention } from '../api';
+import { clearPhoneAttention, endMorningSession } from '../api';
 import { Ring } from './Ring';
 
 // One banked hour of break fills the ring; debt fills it in hazard.
@@ -93,14 +93,24 @@ export function HudRings({ state }: { state: OpsState }) {
     phoneArmTimer.current = window.setTimeout(() => setPhoneArmed(false), PHONE_CLEAR_ARM_MS);
   }
 
+  function tapTimerDial() {
+    if (state.timer.mode !== 'morning_session') return;
+    endMorningSession().catch((err) => console.error('morning session end failed', err));
+  }
+
   return (
     <div className="rings">
       <Ring
         label="Timer"
         glyph={mv.glyph}
-        detail={mv.label.toLowerCase()}
+        detail={state.timer.mode === 'morning_session' ? 'tap to end' : mv.label.toLowerCase()}
         color={mv.color}
-        title={`Timer mode · ${mv.label}`}
+        title={
+          state.timer.mode === 'morning_session'
+            ? 'Timer mode · MORNING · tap to end morning session'
+            : `Timer mode · ${mv.label}`
+        }
+        onClick={state.timer.mode === 'morning_session' ? tapTimerDial : undefined}
       />
       <Ring
         label="Break"
