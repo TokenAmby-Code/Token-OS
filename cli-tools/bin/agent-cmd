@@ -145,6 +145,11 @@ send_command() {
     local pane="$1" cmd="$2" locker="agent-cmd-$$" locked=false rc=0 out lock_resp
     local dispatch_id hash
     local blocked=false reason="" verification_status="unverified" verified_by="tmuxctld"
+    # Swallowed-submit recovery surface (memories: ack-is-hack,
+    # no-error-suppressing-debounce). Defaults are mouse-free safe values: the
+    # direct/blocked paths neither hold the green agent guard nor sniff for a
+    # swallowed submit, so they report no hold, no detection, no recovery.
+    local guard_held=false swallowed_submit_detected=false recovery_attempts=0 failures='[]'
     dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
     hash=$(printf '%s' "$cmd" | payload_hash)
 
@@ -224,6 +229,13 @@ PY
         verified_by=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verified_by") or "tmuxctld")' <<<"$out" 2>/dev/null || echo "tmuxctld")
         dispatch_id=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("dispatch_id") or "")' <<<"$out" 2>/dev/null || true)
         [[ -n "$dispatch_id" ]] || dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+        # Surface the swallowed-submit recovery telemetry the daemon now exposes
+        # so a caller can see a submit was eaten and re-driven. Booleans/ints are
+        # emitted lower-case/unquoted; failures stays raw JSON for a real array.
+        guard_held=$(python3 -c 'import json,sys; print(str(bool((json.loads(sys.stdin.read()).get("result") or {}).get("guard_held"))).lower())' <<<"$out" 2>/dev/null || echo false)
+        swallowed_submit_detected=$(python3 -c 'import json,sys; print(str(bool((json.loads(sys.stdin.read()).get("result") or {}).get("swallowed_submit_detected"))).lower())' <<<"$out" 2>/dev/null || echo false)
+        recovery_attempts=$(python3 -c 'import json,sys; print(int((json.loads(sys.stdin.read()).get("result") or {}).get("recovery_attempts") or 0))' <<<"$out" 2>/dev/null || echo 0)
+        failures=$(python3 -c 'import json,sys; print(json.dumps((json.loads(sys.stdin.read()).get("result") or {}).get("failures") or []))' <<<"$out" 2>/dev/null || echo '[]')
     fi
 
     if [[ "$locked" == true ]]; then
@@ -232,8 +244,37 @@ PY
             >/dev/null 2>&1 || true
     fi
 
-    printf '{"dispatch_id":"%s","payload_hash":"%s","pane":"%s","instance_id":"%s","verification_status":"%s","verified_by":"%s","blocked":%s,"reason":"%s"}\n' \
-        "$dispatch_id" "$hash" "$pane" "${INSTANCE_ID:-}" "$verification_status" "$verified_by" "$blocked" "$reason"
+    # Build the envelope with json.dumps so the raw `failures` JSON array and any
+    # special chars in the fields can't corrupt the output under set -euo pipefail.
+    python3 - "$dispatch_id" "$hash" "$pane" "${INSTANCE_ID:-}" "$verification_status" \
+        "$verified_by" "$blocked" "$reason" "$guard_held" "$swallowed_submit_detected" \
+        "$recovery_attempts" "$failures" <<'PY'
+import json
+import sys
+
+(
+    dispatch_id, payload_hash, pane, instance_id, verification_status,
+    verified_by, blocked, reason, guard_held, swallowed, recovery_attempts, failures,
+) = sys.argv[1:13]
+try:
+    failures_val = json.loads(failures or "[]")
+except (ValueError, TypeError):
+    failures_val = []
+print(json.dumps({
+    "dispatch_id": dispatch_id,
+    "payload_hash": payload_hash,
+    "pane": pane,
+    "instance_id": instance_id,
+    "verification_status": verification_status,
+    "verified_by": verified_by,
+    "blocked": blocked == "true",
+    "reason": reason,
+    "guard_held": guard_held == "true",
+    "swallowed_submit_detected": swallowed == "true",
+    "recovery_attempts": int(recovery_attempts or 0),
+    "failures": failures_val,
+}, separators=(",", ":")))
+PY
     return "$rc"
 }
 

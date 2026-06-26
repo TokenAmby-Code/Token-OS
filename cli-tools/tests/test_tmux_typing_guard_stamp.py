@@ -328,6 +328,53 @@ def test_agent_cmd_queues_and_delivers_after_typing_guard_clears(tmp_path: Path)
     assert "ALLOW= SEND" in sent
 
 
+def test_agent_cmd_envelope_carries_recovery_fields_on_fallback(tmp_path: Path) -> None:
+    """The agent-cmd JSON envelope always surfaces the swallowed-submit recovery
+    fields the daemon exposes (memories: ack-is-hack, no-error-suppressing-debounce).
+    On the daemon-unreachable fallback path they default to mouse-free safe values:
+    the direct tmuxctl send neither holds the green agent guard nor sniffs for a
+    swallowed submit, so it reports no hold, no detection, no recovery."""
+    env = _env(tmp_path)
+    env.pop("TMUX_SEND_GATE_POLICY", None)
+    stub = tmp_path / "tmuxctl-stub"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'pane=""\n'
+        'text=""\n'
+        "while [[ $# -gt 0 ]]; do\n"
+        '  case "$1" in\n'
+        '    --pane) pane="$2"; shift 2 ;;\n'
+        '    --text) text="$2"; shift 2 ;;\n'
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        f'exec "{TMUX_SHIM}" send-keys -t "$pane" -l "$text"\n'
+    )
+    stub.chmod(0o755)
+    env["TMUXCTL_BIN"] = str(stub)
+    proc = subprocess.run(
+        [str(AGENT_CMD), "--pane", "%1", "hello from peer"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    # All four recovery keys present, never dropped from the envelope ...
+    assert payload["guard_held"] is False
+    assert payload["swallowed_submit_detected"] is False
+    assert payload["recovery_attempts"] == 0
+    assert payload["failures"] == []
+    # ... and typed as a real array/bools/int, not quoted strings.
+    assert isinstance(payload["failures"], list)
+    assert isinstance(payload["guard_held"], bool)
+    assert isinstance(payload["recovery_attempts"], int)
+
+
 class _BriefHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         self.send_response(200)

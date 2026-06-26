@@ -232,6 +232,48 @@ def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
     assert "send-keys -M" not in _line_starting("bind -n MouseDown1Pane ")
 
 
+def test_mouse_bindings_never_reach_the_green_agent_guard_state() -> None:
+    """The green `agent` typing-guard state (@TYPING_AGENT_UNTIL) is set ONLY by
+    the daemon around a verified send — it must be unreachable from any mouse
+    event. A regression here would re-open the softlock class fixed by 13789e5
+    (a mouse branch arming/holding the guard, then `send-keys -M` with no mouse
+    target). Asserts every mouse binding is keyboard/data-free of the guard."""
+    conf = CONF.read_text(encoding="utf-8")
+
+    # The whole conf must never bind the agent hold from a key/mouse table; it is
+    # a daemon-only option (lib/tmuxctl/typing_guard_state.py + send_gate.py).
+    for line in conf.splitlines():
+        if line.lstrip().startswith("bind"):
+            assert "@TYPING_AGENT_UNTIL" not in line, (
+                "no key/mouse binding may set or read the green agent hold; "
+                "@TYPING_AGENT_UNTIL is daemon-only"
+            )
+
+    mouse_keys = (
+        "MouseDown1Status",
+        "MouseDown1Pane",
+        "WheelUpPane",
+        "WheelDownPane",
+    )
+    for key in mouse_keys:
+        line = _line_starting(f"bind -n {key} ")
+        # Never touches any typing-guard option (human OR agent) ...
+        assert "@TYPING_AGENT_UNTIL" not in line
+        assert "@TYPING_LOCK_UNTIL" not in line
+        assert "@TYPING_PENDING_UNTIL" not in line
+        # ... never arms/holds/pends the guard ...
+        assert "tmux-typing-guard-state arm" not in line
+        assert "tmux-typing-guard-state pending" not in line
+        assert "tmux-typing-guard-state hold" not in line
+        # ... and never replays via the stale mouse-target path that softlocked.
+        assert "send-keys -M" not in line
+        assert "mouse_x" not in line
+        assert "mouse_any_flag" not in line
+
+    # MouseDown1Pane is the minimal keyboard-free focus move, not a guard arm.
+    assert "select-pane -t =" in _line_starting("bind -n MouseDown1Pane ")
+
+
 def test_typing_guard_submit_and_backspace_use_one_pending_helper() -> None:
     """Enter/C-m/Backspace variants use the same pending transition helper; only
     the timeout differs. No @GUARD value may contain literal PENDING text."""
