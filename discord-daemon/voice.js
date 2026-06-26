@@ -356,6 +356,12 @@ export function createVoiceManager(botClients, config, logger) {
         }).finally(() => {
           if (!discarded) {
             voiceSessionStartInFlight = false;
+            if (!voiceSessionId) {
+              pendingCommitRequest = null;
+              hasAudioSinceCommit = false;
+              bytesSinceCommit = 0;
+              return;
+            }
             const pending = pendingCommitRequest;
             pendingCommitRequest = null;
             if (pending && hasAudioSinceCommit) {
