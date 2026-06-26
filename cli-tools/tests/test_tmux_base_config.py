@@ -220,14 +220,58 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     assert "set -Fp @TYPING_PENDING_UNTIL" not in conf
     assert "set -Fp @TYPING_LOCK_UNTIL" not in conf
 
-    # The typing-guard Any binding is keyboard-only: no mouse format predicates
-    # and no mouse replay. Mouse bindings live outside the guard path.
+    # The typing-guard Any binding gates on #{mouse_x}: a mouse event (any
+    # button/location/modifier/motion/version) is rejected at the catch-all with
+    # zero enumeration. The mouse (true) branch is INERT — no helper, no replay,
+    # no @TYPING_* write — and the arm + replay live ONLY in the keyboard branch.
     any_binding = conf.split("bind -n Any {", 1)[1].split("}\nbind -n Enter", 1)[0]
     assert "mouse_any_flag" not in any_binding
-    assert "mouse_x" not in any_binding
     assert "send-keys -M" not in any_binding
+
+    # The first predicate is the mouse-rejecting #{mouse_x} non-empty test.
+    assert "if -F '#{!=:#{mouse_x},}'" in any_binding
+    mouse_branch, keyboard_branch = any_binding.split("} {", 1)
+    # The mouse (true) branch is empty: it never arms, replays, or writes guard
+    # state.
+    assert "tmux-typing-guard-state" not in mouse_branch
+    assert "send-keys" not in mouse_branch
+    assert "@TYPING_LOCK_UNTIL" not in mouse_branch
+    assert "@TYPING_PENDING_UNTIL" not in mouse_branch
+    # The arm helper and the bare send-keys replay live only in the keyboard
+    # (false) branch.
+    assert "tmux-typing-guard-state arm --pane #{q:pane_id} --seconds 300" in keyboard_branch
+    assert "send-keys" in keyboard_branch
+
     assert "bind -n FocusIn { }" in conf
     assert "bind -n FocusOut { }" in conf
+
+
+def test_any_binding_rejects_all_mouse_via_mouse_x_gate() -> None:
+    """Structural root-cause guard: no mouse event can reach `arm`.
+
+    `bind -n Any` is a root-table catch-all that matches unbound MOUSE keys —
+    clicks, motion (MouseMovePane on hover), drags, wheel, and every S-/C-/M-
+    modified variant, across tmux versions. The fix gates the binding on
+    #{mouse_x} (set for any mouse key, empty for a real keystroke) so a single
+    predicate rejects them all without enumerating the ~585-name mouse grammar.
+
+    This asserts the #{mouse_x} non-empty test is the FIRST thing `Any`
+    evaluates and that `tmux-typing-guard-state arm` appears strictly AFTER it
+    (in the else/keyboard branch) — which covers motion, modified clicks, and any
+    future mouse name with no enumeration.
+    """
+    conf = CONF.read_text(encoding="utf-8")
+    any_binding = conf.split("bind -n Any {", 1)[1].split("}\nbind -n Enter", 1)[0]
+
+    gate = "if -F '#{!=:#{mouse_x},}'"
+    gate_idx = any_binding.find(gate)
+    arm_idx = any_binding.find("tmux-typing-guard-state arm")
+    assert gate_idx != -1, "Any must gate on the #{mouse_x} non-empty test"
+    assert arm_idx != -1, "Any keyboard branch must still arm via the helper"
+    assert gate_idx < arm_idx, "the #{mouse_x} mouse gate must precede the arm helper"
+    # The gate is the very first predicate evaluated in `Any` (nothing arms before
+    # mouse is rejected).
+    assert any_binding.lstrip().startswith(gate)
 
 
 def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
