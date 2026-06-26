@@ -677,6 +677,28 @@ class TmuxAdapter:
     def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
         self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
 
+    def _preflight_send_text_transaction(self, target: str, payload: str) -> None:
+        """Hold-or-release the whole prompt transaction as one gate unit.
+
+        ``send_text_then_submit`` is text + submit key(s), not independent tmux
+        writes.  If the target pane is guarded, wait/cancel before issuing the
+        first byte; once the transaction starts, the submit key(s) must not be
+        separately delayed or cancelled after the literal text has landed.
+        """
+        self.last_send_gate_result = None
+        resolved_args = self._resolve_tmux_args(("send-keys", "-t", target, "-l", payload))
+        gate = send_gate.evaluate(resolved_args)
+        if gate is not None and gate.get("policy") == "delay":
+            send_gate.record_suppression(gate)
+            if send_gate.wait_for_gate_clear(resolved_args):
+                return
+            gate = {**gate, "policy": "cancel", "suppressed": True, "delay_failed": True}
+        if gate is not None:
+            send_gate.record_suppression(gate)
+            if gate.get("suppressed"):
+                self.last_send_gate_result = gate
+                raise TmuxSendGated(gate)
+
     def send_text_then_submit(
         self,
         target: str,
@@ -700,24 +722,21 @@ class TmuxAdapter:
         swallowed as a newline, the delayed second C-m submits the queued prompt.
         """
         payload = normalize_prompt_payload(text)
-        if clear_prompt:
-            self.send_keys(target, "C-u")
-        self.run("send-keys", "-t", target, "-l", payload)
-        # The literal payload is the byte-bearing send. If the universal gate
-        # suppressed it (quiet hours / typing guard) run() wrote nothing and
-        # left the structured result on last_send_gate_result. Abort the whole
-        # submit atomically rather than firing a bare C-m at an empty prompt —
-        # zero bytes issued means the caller can re-queue cleanly.
-        gate = getattr(self, "last_send_gate_result", None)
-        if gate and gate.get("suppressed"):
-            raise TmuxSendGated(gate)
-        if submit_settle_seconds > 0:
-            time.sleep(submit_settle_seconds)
-        for key in pre_submit_keys:
-            self.send_keys(target, key)
-        if pre_submit_keys and submit_settle_seconds > 0:
-            time.sleep(submit_settle_seconds)
-        self.send_keys(target, "C-m")
-        if submit_settle_seconds > 0:
-            time.sleep(submit_settle_seconds)
-        self.send_keys(target, "C-m")
+        self._preflight_send_text_transaction(target, payload)
+        # The transaction gate has cleared.  From here through the submit keys,
+        # pierce per-command rechecks so there is no split-brain state where
+        # text reaches the pane but Enter is held/cancelled separately.
+        with send_gate.thread_local_override("tmuxctl-submit-transaction"):
+            if clear_prompt:
+                self.send_keys(target, "C-u")
+            self.run("send-keys", "-t", target, "-l", payload)
+            if submit_settle_seconds > 0:
+                time.sleep(submit_settle_seconds)
+            for key in pre_submit_keys:
+                self.send_keys(target, key)
+            if pre_submit_keys and submit_settle_seconds > 0:
+                time.sleep(submit_settle_seconds)
+            self.send_keys(target, "C-m")
+            if submit_settle_seconds > 0:
+                time.sleep(submit_settle_seconds)
+            self.send_keys(target, "C-m")

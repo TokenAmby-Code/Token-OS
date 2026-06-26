@@ -113,3 +113,45 @@ def test_send_text_then_submit_proceeds_when_gate_open(monkeypatch, captured_sub
     # literal payload + two C-m submits all issued.
     assert len(sends) == 3
     assert adapter.last_send_gate_result is None
+
+
+def test_send_text_then_submit_keeps_enter_in_same_transaction(monkeypatch, captured_subprocess):
+    """Once prompt text starts landing, submit keys cannot be gated separately.
+
+    Regression class: a guard transition after the literal payload could hold
+    or cancel the terminating Enter while leaving the text in the composer.  The
+    prompt transaction now preflights once, then pierces per-command rechecks
+    until text + Enter + recovery Enter have all been issued.
+    """
+    _force_quiet(monkeypatch, False)
+    monkeypatch.setattr(
+        send_gate,
+        "send_gate_policy",
+        lambda *, override=None, reason=None: "pierce" if override else "cancel",
+    )
+    monkeypatch.setattr(tmux_adapter.time, "sleep", lambda _: None)
+
+    gate_active = {"value": False}
+
+    def _typing(*, target=None, **_kw):
+        return gate_active["value"]
+
+    monkeypatch.setattr(send_gate, "typing_guard_active", _typing)
+
+    def _fake_run(cmd, *args, **kwargs):
+        captured_subprocess.append(cmd)
+        if cmd[1:5] == ["send-keys", "-t", "%9", "-l"]:
+            gate_active["value"] = True
+        return _FakeCompleted()
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", _fake_run)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    adapter.send_text_then_submit("%9", "brief for FG")
+
+    sends = [c for c in captured_subprocess if c[1] == "send-keys"]
+    assert sends == [
+        ["tmux", "send-keys", "-t", "%9", "-l", "brief for FG"],
+        ["tmux", "send-keys", "-t", "%9", "C-m"],
+        ["tmux", "send-keys", "-t", "%9", "C-m"],
+    ]
