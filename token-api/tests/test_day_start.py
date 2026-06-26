@@ -269,5 +269,59 @@ def test_daily_note_creation_failure_emits_missed_event(app_env, monkeypatch):
     assert note_item is not None
     assert note_item["success"] is False
 
-    # Missed-note alert was emitted.
-    assert _count_events(app_env.db_path, "daily_note_creation_missed") == 1
+    # test_dry_run sources are validation-only: log suppressed diagnostics, but
+    # never route a simulated miss as Emperor-facing TTS.
+    assert _count_events(app_env.db_path, "daily_note_creation_missed") == 0
+    assert _count_events(app_env.db_path, "daily_note_creation_miss_suppressed") == 1
+
+
+def test_daily_note_creation_failure_suppressed_when_note_exists(app_env, monkeypatch):
+    """A forced miss-path re-check must not TTS if today's note is already present."""
+    from fastapi.testclient import TestClient
+
+    import routes.day_start as day_start
+
+    async def fake_morning():
+        return {"status": "ok", "result": "launched", "pane_id": "%99"}
+
+    async def fake_phone(_state):
+        return {"status": "ok", "reachable": True}
+
+    async def fake_rebind():
+        return {"status": "ok", "rebound": [], "skipped": []}
+
+    async def failing_note_creation():
+        return {"status": "error", "reason": "forced validation miss"}
+
+    notified: list[dict] = []
+
+    async def fail_if_notify(*_args, **_kwargs):
+        notified.append({"args": _args, "kwargs": _kwargs})
+        raise AssertionError("false-positive daily-note miss must not call /api/notify")
+
+    monkeypatch.setattr(day_start, "_consumer_custodes_morning_session", fake_morning)
+    monkeypatch.setattr(day_start, "_consumer_phone_reachability", fake_phone)
+    monkeypatch.setattr(day_start, "_consumer_custodes_doc_rebind", fake_rebind)
+    monkeypatch.setattr(day_start, "_consumer_daily_note_creation", failing_note_creation)
+    monkeypatch.setattr(day_start, "_today_daily_note_exists", lambda: True)
+
+    # Make any attempted httpx notification explode visibly.
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        post = fail_if_notify
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _Client())
+
+    client = TestClient(app_env.main.app)
+    resp = client.post("/api/day-start/fire", json={"source": "manual", "force": True})
+    assert resp.status_code == 200
+    assert notified == []
+    assert _count_events(app_env.db_path, "daily_note_creation_missed") == 0
+    assert _count_events(app_env.db_path, "daily_note_creation_miss_suppressed") == 1
