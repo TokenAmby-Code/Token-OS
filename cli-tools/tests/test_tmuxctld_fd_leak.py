@@ -8,11 +8,10 @@ call. The send path leaked two per send-text and eventually hit "too many open
 files". The fix wraps every connect in ``contextlib.closing(...)`` (keeping the
 trailing ``, conn`` so commit/rollback semantics are preserved).
 
-This drives the gate's read AND write helpers in a loop against a temp DB and
-asserts the process's open-fd count against the db file stays bounded — it must
-not grow with iterations. Runtime over mocks: it exercises the real connect path.
-
-RED before the fix (fd count climbs ~2/iteration), GREEN after.
+Rather than count process file descriptors (platform-specific, needs psutil),
+this wraps ``sqlite3.connect`` and asserts every connection the gate helpers open
+is also closed — a direct, deterministic check of the fix. RED before it (the
+unclosed connections never reach ``close``), GREEN after.
 """
 
 from __future__ import annotations
@@ -21,17 +20,16 @@ import pathlib
 import sqlite3
 import sys
 
-import psutil
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-import tmuxctl.send_gate as send_gate
+import tmuxctl.send_gate as send_gate  # noqa: E402
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
+def db(tmp_path):
     """A temp agents.db with the tables the gate helpers touch."""
     path = tmp_path / "agents.db"
     conn = sqlite3.connect(path)
@@ -54,55 +52,47 @@ def db(tmp_path, monkeypatch):
     )
     conn.commit()
     conn.close()
-    monkeypatch.setenv("TOKEN_API_DB", str(path))
     return path
 
 
-def _open_db_fds(db_path: pathlib.Path) -> int:
-    """Count this process's open file descriptors pointing at ``db_path``."""
-    target = str(pathlib.Path(db_path).resolve())
-    proc = psutil.Process()
-    count = 0
-    for handle in proc.open_files():
-        try:
-            if str(pathlib.Path(handle.path).resolve()) == target:
-                count += 1
-        except OSError:
-            continue
-    return count
+def test_send_gate_helpers_close_every_connection(db, monkeypatch):
+    """Driving the read + write helpers must close every connection they open.
 
-
-def test_send_gate_helpers_do_not_leak_db_fds(db):
-    """Driving the read + write helpers many times must not strand connections.
-
-    Each ``quiet_hours_active`` call opens two connections (``_read_day_state`` +
-    ``_session_quiet_latch``); ``record_suppression`` and ``register_automated_send``
-    each open one for a write. Pre-fix every one leaked an fd. We warm up to reach
-    steady state, snapshot the open-fd count against the db, then loop hard and
-    assert the count has not grown.
+    ``quiet_hours_active`` opens two connections (``_read_day_state`` +
+    ``_session_quiet_latch``); ``record_suppression`` and
+    ``register_automated_send`` each open one for a write. Pre-fix none of them
+    reached ``close``. We wrap ``sqlite3.connect`` (via a Connection subclass so
+    ``close`` can be tracked — the C type forbids instance attributes) and assert
+    every opened connection is also closed.
     """
-    args = ("send-keys", "-t", "%1", "hello")
+    real_connect = sqlite3.connect
+    opened: list[sqlite3.Connection] = []  # keep refs so ids stay stable
+    closed_ids: set[int] = set()
 
-    def drive() -> None:
+    class _Tracked(sqlite3.Connection):
+        def close(self) -> None:
+            closed_ids.add(id(self))
+            super().close()
+
+    def tracking_connect(*args, **kwargs):
+        kwargs.setdefault("factory", _Tracked)
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+
+    args = ("send-keys", "-t", "%1", "hello")
+    for _ in range(5):
         send_gate.quiet_hours_active(db_path=db)
         result = send_gate.evaluate(args, db_path=db)
         if result is not None:
             send_gate.record_suppression(result, db_path=db)
         send_gate.register_automated_send(args, db_path=db)
 
-    # Warm up so any one-time fds (module/table caches) settle before the snapshot.
-    for _ in range(10):
-        drive()
-    baseline = _open_db_fds(db)
-
-    for _ in range(150):
-        drive()
-    after = _open_db_fds(db)
-
-    # With the fix, every connection is closed, so the count is flat (≈0). A leak
-    # would add roughly four fds per iteration → hundreds. Allow a tiny tolerance
-    # for transient WAL/-shm handles, but nothing that scales with iterations.
-    assert after <= baseline + 3, (
-        f"db fd count grew from {baseline} to {after} across 150 iterations — "
-        "a sqlite connection is being leaked (missing contextlib.closing)"
+    assert opened, "no connections were opened — test wired wrong"
+    leaked = [id(c) for c in opened if id(c) not in closed_ids]
+    assert not leaked, (
+        f"{len(opened)} connections opened, {len(closed_ids)} closed — "
+        f"{len(leaked)} leaked (missing contextlib.closing)"
     )
