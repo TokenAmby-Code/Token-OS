@@ -159,14 +159,24 @@ def test_engine_child_inherits_controlling_tty_on_stdin(tmp_path: Path) -> None:
             [str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"), "claude", "arg"],
             env,
         )
+    import select
+
     deadline = time.time() + 10
     timed_out = True
-    while time.time() < deadline:
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        # select keeps the deadline live even if the wrapper goes silent but
+        # stays alive — a blocking os.read() would never re-check the timeout.
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            continue
         try:
-            if not os.read(fd, 1024):
+            if not os.read(fd, 1024):  # EOF: child closed the pty
                 timed_out = False
                 break
-        except OSError:
+        except OSError:  # pty master raises on child exit
             timed_out = False
             break
     if timed_out:
