@@ -634,8 +634,11 @@ def _h_send_text(control, params):
                 log.warning("tmuxctld: agent-guard release failed pane=%s: %s", phys_pane, exc)
 
     verification_status = "submitted" if ack else ("unverified" if verify else "not_requested")
+    # When verification was never requested, a completed send is "submitted", not
+    # "unverified" — only a requested-but-unacked send is genuinely unverified.
+    status = "submitted" if ack or not verify else "unverified"
     return {
-        "status": "submitted" if ack else "unverified",
+        "status": status,
         "pane": pane,
         "instance_id": instance_id,
         "dispatch_id": dispatch_id,

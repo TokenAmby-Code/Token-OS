@@ -251,7 +251,9 @@ print(detail.get("reason") or err.get("message") or "gated")' <<<"$out" 2>/dev/n
     fi
     if [[ "$rc" == 0 && "$verified_by" == "tmuxctld" ]]; then
         verification_status=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verification_status") or "unverified")' <<<"$out" 2>/dev/null || echo "unverified")
-        verified_by=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verified_by") or "tmuxctld")' <<<"$out" 2>/dev/null || echo "tmuxctld")
+        # Keep verified_by empty (-> null in the envelope) when the daemon reports
+        # no verifier — do NOT invent "tmuxctld" for an unverified send.
+        verified_by=$(python3 -c 'import json,sys; print((json.loads(sys.stdin.read()).get("result") or {}).get("verified_by") or "")' <<<"$out" 2>/dev/null || echo "")
         dispatch_id=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("dispatch_id") or "")' <<<"$out" 2>/dev/null || true)
         [[ -n "$dispatch_id" ]] || dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
         # Surface the swallowed-submit recovery telemetry the daemon now exposes
@@ -291,7 +293,7 @@ print(json.dumps({
     "pane": pane,
     "instance_id": instance_id,
     "verification_status": verification_status,
-    "verified_by": verified_by,
+    "verified_by": verified_by or None,
     "blocked": blocked == "true",
     "reason": reason,
     "guard_held": guard_held == "true",

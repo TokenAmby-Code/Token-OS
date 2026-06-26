@@ -5260,6 +5260,12 @@ async def _tmux_send_payload_then_submit(
             "gated": False,
             "verification_status": result.get("verification_status") or "unverified",
             "verified_by": result.get("verified_by"),
+            # Surface the daemon's swallowed-submit recovery telemetry so token-api
+            # callers can see a submit was eaten and re-driven (surface-don't-suppress).
+            "guard_held": bool(result.get("guard_held")),
+            "swallowed_submit_detected": bool(result.get("swallowed_submit_detected")),
+            "recovery_attempts": int(result.get("recovery_attempts") or 0),
+            "failures": result.get("failures") if isinstance(result.get("failures"), list) else [],
             "pane": tmux_pane,
             "instance_id": result.get("instance_id"),
         }
