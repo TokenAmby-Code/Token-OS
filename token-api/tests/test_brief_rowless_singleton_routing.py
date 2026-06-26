@@ -163,6 +163,7 @@ async def test_brief_registry_row_path_still_uses_queue(
             "purpose": "brief_send",
             "payload": "row path",
             "hook_driven": True,
+            "message_id": None,
         }
     ]
     assert "fallback" not in result["resolved"][0]
