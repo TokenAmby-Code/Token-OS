@@ -79,7 +79,7 @@ def test_classify_engine_exact_basenames():
         classify_engine("/Users/x/.local/bin/claude --dangerously-skip-permissions -r") == "claude"
     )
     assert classify_engine("/opt/homebrew/bin/codex resume abc") == "codex"
-    assert classify_engine("bash /x/cli-tools/scripts/claude-wrapper.sh --foo") is None
+    assert classify_engine("bash /x/cli-tools/scripts/agent-wrapper.sh claude --foo") is None
     assert classify_engine("zsh") is None
     assert classify_engine("") is None
 
@@ -88,7 +88,10 @@ def test_find_agent_process_walks_through_wrapper():
     # pane shell -> wrapper bash -> claude binary (the live shape on mac).
     table = {
         100: (1, "zsh"),
-        101: (100, "bash /live/cli-tools/scripts/claude-wrapper.sh --dangerously-skip-permissions"),
+        101: (
+            100,
+            "bash /live/cli-tools/scripts/agent-wrapper.sh claude --dangerously-skip-permissions",
+        ),
         102: (101, "/Users/x/.local/bin/claude --dangerously-skip-permissions"),
         103: (102, "npm exec chrome-devtools-mcp"),
     }
@@ -212,7 +215,7 @@ def test_resolve_resume_claude_pane(tmp_path):
     _write_claude_transcript(tmp_path / "projects", "/scratch/a", CLAUDE_SESSION, mtime=2_000)
     table = {
         100: (1, "zsh"),
-        101: (100, "bash /live/cli-tools/scripts/claude-wrapper.sh"),
+        101: (100, "bash /live/cli-tools/scripts/agent-wrapper.sh claude"),
         102: (101, "/Users/x/.local/bin/claude --resume"),
     }
     observation = resolve_resume(_pane(pane_pid=100, cwd="/scratch/a"), _probe(tmp_path, table))

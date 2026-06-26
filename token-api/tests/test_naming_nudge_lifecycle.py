@@ -145,7 +145,7 @@ async def test_wrapper_end_does_not_schedule_naming_nudge(app_env, monkeypatch) 
         {
             "wrapper_launch_id": "wrap-1",
             "engine": "codex",
-            "launcher": "codex-wrapper",
+            "launcher": "codex",
             "tmux_pane": "%9",
             "env": {"TOKEN_API_WRAPPER_LAUNCH_ID": "wrap-1", "TMUX_PANE": "%9"},
         }

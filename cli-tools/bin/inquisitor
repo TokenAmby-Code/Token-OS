@@ -4,7 +4,6 @@
 # AUDIENCE: deprecated
 set -euo pipefail
 case "inquisitor" in
-  claude-launcher) replacement='dispatch --interactive' ;;
   inquisitor) replacement='dispatch --persona inquisition --prompt <task>' ;;
   subagent) replacement='dispatch --prompt <task>' ;;
 esac

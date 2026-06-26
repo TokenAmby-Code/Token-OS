@@ -147,7 +147,7 @@ def pane_has_active_claude(pane_pid: int | None) -> bool:
     """True if any descendant of pane_pid is a live claude process.
 
     tmux's ``#{pane_current_command}`` returns the foreground process group
-    leader at the TTY — for panes launched via ``claude-wrapper.sh`` that is
+    leader at the TTY — for panes launched via ``agent-wrapper.sh claude`` that is
     bash, not claude. Walking the process tree is the canonical signal.
     """
     return _pane_has_active_process(pane_pid, CLAUDE_PROCESS_NEEDLES)

@@ -7,11 +7,10 @@ while [[ -L "$SCRIPT_PATH" ]]; do
   [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_PATH}"
 done
 BIN_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
-WRAPPER="${BIN_DIR}/../scripts/claude-wrapper.sh"
+AGENT_WRAPPER="${BIN_DIR}/../scripts/agent-wrapper.sh"
 
 if [[ "${TOKEN_API_AGENT_WRAPPER_BYPASS:-}" == "1" ]]; then
   for candidate in \
-    "${CLAUDE_WRAPPER_TARGET:-}" \
     "${CLAUDE_BIN:-}" \
     "$HOME/.local/bin/claude.token-os-real"
   do
@@ -23,4 +22,4 @@ if [[ "${TOKEN_API_AGENT_WRAPPER_BYPASS:-}" == "1" ]]; then
   exit 127
 fi
 
-exec "$WRAPPER" "$@"
+exec "$AGENT_WRAPPER" claude "$@"

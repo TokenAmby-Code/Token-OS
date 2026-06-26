@@ -9,6 +9,15 @@
 #   WSL: ~/.bash_aliases
 #   Mac: ~/.zsh_aliases
 
+# Agent binary front doors are PATH shims, not shell functions. Clear stale
+# definitions before the double-source guard so reloading an existing shell makes
+# `claude` and `codex` resolve directly to cli-tools/bin/{claude,codex}, which
+# then exec agent-wrapper.sh.
+# Transitional cleanup only: remove on sight after 2026-07-07 or after any tx
+# restart, whichever happens first.
+unalias claude codex 2>/dev/null || true
+unset -f claude codex _claude_launch _codex_launch _resolve_claude_wrapper_bin 2>/dev/null || true
+
 # Guard against double-sourcing
 [[ -n "${_IMPERIUM_ALIASES_LOADED:-}" ]] && return 0 2>/dev/null
 _IMPERIUM_ALIASES_LOADED=1
@@ -150,9 +159,8 @@ api-ping() {
 }
 
 # =============================================================================
-# Claude Code — unified launcher
+# Dispatch launcher helpers
 # =============================================================================
-# Smart resume: queries token-api if session not found locally
 
 _resolve_dispatch_bin() {
     local candidate=""
@@ -168,29 +176,6 @@ _resolve_dispatch_bin() {
         "${TOKEN_OS:-}/cli-tools/bin/dispatch" \
         "$HOME/runtimes/Token-OS/live/cli-tools/bin/dispatch" \
         "/home/token/runtimes/token-os/live/cli-tools/bin/dispatch"
-    do
-        [[ -n "$candidate" && -x "$candidate" ]] || continue
-        echo "$candidate"
-        return 0
-    done
-
-    return 1
-}
-
-_resolve_claude_wrapper_bin() {
-    local candidate=""
-
-    candidate="$(command -v claude-wrapper.sh 2>/dev/null || true)"
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-        echo "$candidate"
-        return 0
-    fi
-
-    for candidate in \
-        "${CLI_TOOLS:-}/scripts/claude-wrapper.sh" \
-        "${TOKEN_OS:-}/cli-tools/scripts/claude-wrapper.sh" \
-        "$HOME/runtimes/Token-OS/live/cli-tools/scripts/claude-wrapper.sh" \
-        "/home/token/runtimes/token-os/live/cli-tools/scripts/claude-wrapper.sh"
     do
         [[ -n "$candidate" && -x "$candidate" ]] || continue
         echo "$candidate"
@@ -224,134 +209,10 @@ _pane_drop_clean() {
 }
 
 # Wrap `clear` so every clear stamps the pane clean. `command clear` runs the
-# real binary; the stamp follows. c() calls this, so it inherits the stamp; the
-# post-agent reset (precmd / _agent_post_exit_reset) does too.
+# real binary; the stamp follows. c() calls this, so it inherits the stamp.
 clear() {
     command clear "$@"
     _pane_stamp_clean
-}
-
-# Post-agent reset, run synchronously in-shell the instant the agent wrapper
-# returns (typed-`claude`/`codex` path). Clears + stamps clean immediately so a
-# freshly-closed pane is visually reset without waiting on the racy resume
-# sentinel. The resume command is dropped into history by the prompt hook
-# (_agent_resume_precmd fires before the user can type; if the sentinel lands
-# late, the preexec/^C cancel path prints it on the user's first action). Either
-# way the pending auto-reset can never wipe a command the user has already run.
-_agent_post_exit_reset() {
-    clear
-}
-
-_codex_launch() {
-    local dispatch_bin=""
-    dispatch_bin="$(_resolve_dispatch_bin)" || {
-        echo "dispatch not found" >&2
-        return 1
-    }
-
-    local rc=0
-    clear
-    if [[ $# -gt 0 ]]; then
-        "$dispatch_bin" --engine codex --dir "$PWD" --prompt "$*"
-    else
-        "$dispatch_bin" --engine codex --dir "$PWD"
-    fi
-    rc=$?
-    # Only reset on a clean exit — a failed launch must keep its error output
-    # on screen and propagate its exit code, not be cleared into a fresh prompt.
-    [[ $rc -eq 0 ]] && _agent_post_exit_reset
-    return "$rc"
-}
-
-_claude_launch() {
-    local claude_wrapper_bin=""
-    claude_wrapper_bin="$(_resolve_claude_wrapper_bin)" || {
-        echo "claude-wrapper.sh not found" >&2
-        return 1
-    }
-
-    local rc=0
-    clear
-    TOKEN_API_LAUNCHER="${TOKEN_API_LAUNCHER:-shell-aliases}" \
-    TOKEN_API_ENGINE="${TOKEN_API_ENGINE:-claude}" \
-    "$claude_wrapper_bin" --dangerously-skip-permissions "$@"
-    rc=$?
-    # Only reset on a clean exit — preserve a failed wrapper's error + exit code.
-    [[ $rc -eq 0 ]] && _agent_post_exit_reset
-    return "$rc"
-}
-
-claude() {
-    local primarch=""
-    local args=()
-    local resume_id=""
-    local use_codex=false
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --codex)
-                use_codex=true
-                shift
-                ;;
-            --primarch|-P)
-                echo "claude --primarch is deprecated; use dispatch --persona <name>" >&2
-                return 64
-                ;;
-            -r|--resume)
-                args+=("$1")
-                shift
-                # Capture session ID if next arg isn't a flag
-                if [[ $# -gt 0 && "$1" != -* ]]; then
-                    resume_id="$1"
-                    args+=("$1")
-                    shift
-                fi
-                ;;
-            *)
-                args+=("$1")
-                shift
-                ;;
-        esac
-    done
-
-    if $use_codex; then
-        _codex_launch "${args[@]}"
-        return
-    fi
-
-    # Smart resume: if session ID given but not found locally, query token-api
-    if [[ -n "$resume_id" ]]; then
-        local encoded_dir
-        encoded_dir="$(pwd | sed 's|/|-|g')"
-        local session_file="$HOME/.claude/projects/${encoded_dir}/${resume_id}.jsonl"
-        if [[ ! -f "$session_file" ]]; then
-            local api_url="${TOKEN_API_URL:-http://localhost:7777}"
-            local instance
-            instance=$(curl -sf "$api_url/api/instances/$resume_id" 2>/dev/null)
-            if [[ -n "$instance" && "$instance" != *"not found"* && "$instance" != *"Not Found"* ]]; then
-                local target_dir
-                target_dir=$(echo "$instance" | python3 -c "import sys,json; print(json.load(sys.stdin).get('working_dir',''))" 2>/dev/null)
-                if [[ -n "$target_dir" && -d "$target_dir" ]]; then
-                    echo "Session not in $(pwd) — found in token-api"
-                    echo "  cd $target_dir"
-                    cd "$target_dir" || return 1
-                fi
-            fi
-        fi
-    fi
-
-    # At $HOME with no meaningful args: open launcher if available
-    if [[ "$PWD" == "$HOME" && ${#args[@]} -eq 0 ]] && command -v claude-launcher &>/dev/null; then
-        claude-launcher
-        return
-    fi
-
-    # Auto-cd to vault if launched from $HOME and NAS is available
-    if [[ "$PWD" == "$HOME" && -n "${IMPERIUM:-}" && -d "$IMPERIUM/Imperium-ENV" ]]; then
-        cd "$IMPERIUM/Imperium-ENV"
-    fi
-
-    _claude_launch "${args[@]}"
 }
 
 _dispatch_has_flag() {

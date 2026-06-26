@@ -14,8 +14,6 @@ def test_wrapper_scripts_are_bash_syntax_valid() -> None:
             "-n",
             str(CLI_TOOLS / "lib" / "agent-wrapper-common.sh"),
             str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"),
-            str(CLI_TOOLS / "scripts" / "claude-wrapper.sh"),
-            str(CLI_TOOLS / "scripts" / "codex-wrapper.sh"),
             str(CLI_TOOLS / "bin" / "claude"),
             str(CLI_TOOLS / "bin" / "codex"),
             str(CLI_TOOLS / "bin" / "agent-wrapper-install-shims"),
@@ -65,7 +63,7 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def test_claude_wrapper_resolves_common_lib_through_symlink(tmp_path: Path) -> None:
+def test_claude_command_resolves_agent_wrapper_through_symlink(tmp_path: Path) -> None:
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
     called = tmp_path / "claude-called.txt"
@@ -76,14 +74,14 @@ def test_claude_wrapper_resolves_common_lib_through_symlink(tmp_path: Path) -> N
         f'#!/usr/bin/env bash\nprintf \'id=%s args=%s\\n\' "$TOKEN_API_WRAPPER_LAUNCH_ID" "$*" > {str(called)!r}\n',
     )
     _write_executable(fakebin / "curl", f'#!/usr/bin/env bash\necho "$*" >> {str(hooks)!r}\n')
-    link = tmp_path / "claude-wrapper.sh"
-    link.symlink_to(CLI_TOOLS / "scripts" / "claude-wrapper.sh")
+    link = tmp_path / "claude"
+    link.symlink_to(CLI_TOOLS / "bin" / "claude")
 
     env = os.environ.copy()
     env.update(
         {
             "PATH": f"{fakebin}:{env.get('PATH', '')}",
-            "CLAUDE_WRAPPER_TARGET": str(target),
+            "CLAUDE_BIN": str(target),
             "TOKEN_API_URL": "http://token-api.invalid",
             "TOKEN_API_WRAPPER_LAUNCH_ID": "fixed-wrapper-id",
         }
@@ -99,7 +97,7 @@ def test_claude_wrapper_resolves_common_lib_through_symlink(tmp_path: Path) -> N
     assert "/api/hooks/WrapperEnd" in hook_text
 
 
-def test_codex_wrapper_exports_id_posts_hooks_and_preserves_exit(tmp_path: Path) -> None:
+def test_codex_command_exports_id_posts_hooks_and_preserves_exit(tmp_path: Path) -> None:
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
     hooks = tmp_path / "hooks.log"
@@ -128,15 +126,15 @@ bash -c "$cmd"
         codex_target,
         f'#!/usr/bin/env bash\nprintf \'id=%s args=%s\\n\' "$TOKEN_API_WRAPPER_LAUNCH_ID" "$*" > {str(codex_called)!r}\nexit 3\n',
     )
-    link = tmp_path / "codex-wrapper.sh"
-    link.symlink_to(CLI_TOOLS / "scripts" / "codex-wrapper.sh")
+    link = tmp_path / "codex"
+    link.symlink_to(CLI_TOOLS / "bin" / "codex")
 
     env = os.environ.copy()
     env.update(
         {
             "PATH": f"{fakebin}:{env.get('PATH', '')}",
             "TOKEN_API_URL": "http://token-api.invalid",
-            "TOKEN_API_WRAPPER_LAUNCH_ID": "codex-wrapper-id",
+            "TOKEN_API_WRAPPER_LAUNCH_ID": "codex-launch-id",
             "TOKEN_API_DISPATCH_RESOLVED_PANE": "%99",
         }
     )
@@ -149,9 +147,7 @@ bash -c "$cmd"
     )
 
     assert result.returncode == 3
-    assert (
-        codex_called.read_text(encoding="utf-8").strip() == "id=codex-wrapper-id args=hello world"
-    )
+    assert codex_called.read_text(encoding="utf-8").strip() == "id=codex-launch-id args=hello world"
     agent_log = log_file.read_text(encoding="utf-8")
     assert "=== Codex Agent 7" in agent_log
     assert "wrapped output" in agent_log
@@ -159,7 +155,7 @@ bash -c "$cmd"
     hook_text = hooks.read_text(encoding="utf-8")
     assert "/api/hooks/WrapperStart" in hook_text
     assert "/api/hooks/WrapperEnd" in hook_text
-    assert "codex-wrapper-id" in hook_text
+    assert "codex-launch-id" in hook_text
 
 
 def test_wrapper_stack_enforcement_runs_only_for_stack_panes(tmp_path: Path) -> None:
@@ -206,12 +202,13 @@ wait
     )
 
 
-def test_dispatch_uses_codex_wrapper_not_inline_launcher() -> None:
+def test_dispatch_uses_agent_wrapper_not_inline_launcher() -> None:
     dispatch = (CLI_TOOLS / "bin" / "dispatch").read_text(encoding="utf-8")
     assert 'source "${LIB_DIR}/agent-wrapper-common.sh"' in dispatch
     assert "dispatch_codex_launch_inline" not in dispatch
-    assert "codex-wrapper.sh" in dispatch
-    assert "claude-wrapper.sh" in dispatch
+    assert "agent-wrapper.sh" in dispatch
+    for engine in ("codex", "claude"):
+        assert f"{engine}-wrapper.sh" not in dispatch
 
 
 def test_agent_wrapper_owns_stack_enforcement() -> None:
@@ -242,8 +239,8 @@ def test_command_shims_route_through_wrappers_and_bypass_to_real(tmp_path: Path)
     env.update(
         {
             "PATH": f"{CLI_TOOLS / 'bin'}:{fakebin}:{env.get('PATH', '')}",
-            "CLAUDE_WRAPPER_TARGET": str(fakebin / "claude-real"),
-            "CODEX_WRAPPER_TARGET": str(fakebin / "codex-real"),
+            "CLAUDE_BIN": str(fakebin / "claude-real"),
+            "CODEX_BIN": str(fakebin / "codex-real"),
             "TOKEN_API_URL": "http://token-api.invalid",
             "TOKEN_API_WRAPPER_LAUNCH_ID": "shim-wrapper-id",
         }

@@ -14,14 +14,14 @@ def _build_paths(tmp_path: Path) -> subagent_main.CodexPaths:
     logs_dir = repo_root / "logs" / "agents"
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
-    wrapper = scripts_dir / "codex-wrapper.sh"
-    wrapper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    agent_wrapper = scripts_dir / "agent-wrapper.sh"
+    agent_wrapper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     return subagent_main.CodexPaths(
         invocation_root=repo_root,
         logs_dir=logs_dir,
         counter_path=logs_dir / ".codex-agent-counter",
         launches_path=logs_dir / ".launches.json",
-        wrapper_path=wrapper,
+        agent_wrapper_path=agent_wrapper,
     )
 
 
@@ -60,7 +60,7 @@ def test_handle_codex_launch_success(
         pass
 
     def fake_launch(command, cwd=None, title=None, env=None, skip_wrapper=False):
-        log_path = Path(command[3])
+        log_path = Path(command[4])
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("started\n", encoding="utf-8")
         launches["command"] = command
@@ -86,8 +86,9 @@ def test_handle_codex_launch_success(
 
     command = launches["command"]
     assert command[0] == "bash"
-    assert command[2] == "1"
-    assert Path(command[1]) == paths.wrapper_path
+    assert command[2] == "codex"
+    assert command[3] == "1"
+    assert Path(command[1]) == paths.agent_wrapper_path
     assert launches["cwd"] == paths.invocation_root
     assert launches["title"] == "Codex Agent 1"
     assert launches["skip_wrapper"] is True
@@ -111,7 +112,7 @@ def test_handle_codex_uses_packaged_env_when_configured(
         pass
 
     def fake_launch(command, cwd=None, title=None, env=None, skip_wrapper=False):
-        log_path = Path(command[3])
+        log_path = Path(command[4])
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("started\n", encoding="utf-8")
         launches["command"] = command
@@ -127,7 +128,7 @@ def test_handle_codex_uses_packaged_env_when_configured(
     subagent_main._handle_codex(args, paths)
 
     command = launches["command"]
-    assert command[4] == str(codex_stub)
+    assert command[5] == str(codex_stub)
 
 
 def test_handle_codex_falls_back_to_repo_venv(
@@ -141,7 +142,7 @@ def test_handle_codex_falls_back_to_repo_venv(
         pass
 
     def fake_launch(command, cwd=None, title=None, env=None, skip_wrapper=False):
-        log_path = Path(command[3])
+        log_path = Path(command[4])
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("started\n", encoding="utf-8")
         launches["command"] = command
@@ -157,7 +158,7 @@ def test_handle_codex_falls_back_to_repo_venv(
     subagent_main._handle_codex(args, paths)
 
     command = launches["command"]
-    assert command[4] == str(codex_stub)
+    assert command[5] == str(codex_stub)
 
 
 def test_handle_codex_launch_retries_and_fails(

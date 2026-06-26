@@ -56,7 +56,7 @@ def test_detect_live_claude_tui_is_live():
     children, commands = _tree(
         14030,
         {
-            15215: (14030, "bash claude-wrapper.sh --dangerously-skip-permissions"),
+            15215: (14030, "bash agent-wrapper.sh claude --dangerously-skip-permissions"),
             15230: (15215, "claude"),
         },
     )
