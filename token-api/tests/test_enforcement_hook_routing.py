@@ -319,6 +319,154 @@ def test_state_class_hook_routes_administratum_only(client, monkeypatch, event_t
     assert len(_events("custodes_intervention")) == 0
 
 
+# ── (e) Dedupe-key correctness: distinct/worsening languishing must NOT collide ─
+#
+# CORRECTED DIRECTION (Emperor 2026-06-26): the `tts_queue_languishing` re-fires
+# are GENUINE — the queue really is languishing and worsening. The bug was a
+# malformed dedupe key (`subject` resolved to the CONSTANT `app="tts_queue"`, ==
+# source, giving `tts_queue_languishing:tts_queue:tts_queue` for EVERY alert), so
+# distinct legitimate alerts collided and got wrongly deduped-away — enforcement
+# stopped reaching the Emperor. The failure mode is OVER-suppression of
+# legitimate delivery, NOT spam. The fix distinguishes the key by queue depth so
+# distinct/worsening alerts keep escalating. We do NOT suppress genuine re-alerts.
+
+
+def _wire_admin_recorder(monkeypatch):
+    """Stub a live Administratum recorder pane and count its pane injections.
+
+    The Custodes path is mocked separately, so `_inject_custodes_prompt_to_pane`
+    is reached only by the Administratum record sink — its call count is the
+    number of Admin record deliveries. Fake pane id + no-op log so the test never
+    touches live tmux or the vault (hook-tests-no-live-tmux).
+    """
+    admin_injects: list[str] = []
+
+    async def fake_resolve():
+        return {"id": "administratum-rec", "tmux_pane": "%fake-admin", "tab_name": "administratum"}
+
+    async def fake_inject(prompt, tmux_pane, *, instance_id=None, cancel_check=None):
+        admin_injects.append(prompt)
+        return {"dispatched": True, "reason": "dispatched", "instance_id": instance_id}
+
+    async def fake_log(*a, **k):
+        return None
+
+    async def fake_snapshot():
+        # Snapshot metadata is frozen (break/panes/threads unchanged) — but the
+        # queue DEPTH in the payload is what is genuinely worsening per fire.
+        return {
+            "open_panes": 9,
+            "active_threads": {"count": 4},
+            "timer": {"break_balance_ms": 3300000},
+        }
+
+    monkeypatch.setattr(main, "_resolve_administratum_instance", fake_resolve)
+    monkeypatch.setattr(main, "_inject_custodes_prompt_to_pane", fake_inject)
+    monkeypatch.setattr(main, "_append_administratum_log", fake_log)
+    monkeypatch.setattr(main, "_custodes_state_snapshot", fake_snapshot)
+    monkeypatch.setattr(main, "is_quiet_hours", lambda *a, **k: False)
+    return admin_injects
+
+
+def _languishing_payload(pause_queue_length):
+    return {
+        "app": "tts_queue",
+        "queue": "pause",
+        "pause_queue_length": pause_queue_length,
+        "threshold": 5,
+    }
+
+
+def test_languishing_dedupe_key_distinguishes_depth():
+    """The malformed constant key is gone: distinct depths → distinct keys."""
+    from custodes_state_policy import StateEvent, build_dedupe_key
+
+    def key(depth):
+        return build_dedupe_key(
+            StateEvent(
+                event_type="tts_queue_languishing",
+                source="tts_queue",
+                payload=_languishing_payload(depth),
+            )
+        )
+
+    # Distinct legitimate alerts must NOT collapse onto one key.
+    assert key(6) != key(7) != key(8)
+    # And the key must carry the escalation dimension, not be the bare collision.
+    assert key(6) != "tts_queue_languishing:tts_queue:tts_queue"
+    assert key(6).endswith(":len=6")
+
+
+async def test_distinct_languishing_alerts_each_deliver(monkeypatch):
+    """Two DISTINCT legitimate languishing alerts both reach Custodes + Admin.
+
+    Inverted from the wrong-direction draft: the bug ATE legitimate delivery via
+    key collision. Distinct depths must each escalate (no collision, no eating).
+    """
+    admin_injects = _wire_admin_recorder(monkeypatch)
+    custodes_calls: list[str] = []
+
+    async def fake_dispatch(prompt):
+        custodes_calls.append(prompt)
+        return {"dispatched": True, "reason": "dispatched", "instance_id": "custodes-1"}
+
+    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fake_dispatch)
+
+    first = await main.handle_custodes_state_event(
+        "tts_queue_languishing",
+        "tts_queue",
+        severity=3,
+        payload=_languishing_payload(6),
+        event_class="enforcement",
+    )
+    second = await main.handle_custodes_state_event(
+        "tts_queue_languishing",
+        "tts_queue",
+        severity=3,
+        payload=_languishing_payload(7),
+        event_class="enforcement",
+    )
+
+    assert first["intervention_dispatched"] is True
+    assert second["intervention_dispatched"] is True, (
+        "distinct alert must not be eaten by collision"
+    )
+    assert len(custodes_calls) == 2, "both legitimate alerts must escalate to Custodes"
+    assert len(admin_injects) == 2, "both legitimate alerts must reach the Administratum recorder"
+
+
+async def test_persistent_languishing_keeps_escalating(monkeypatch):
+    """A worsening queue (depth 6→7→8) keeps alerting — NOT swallowed to once.
+
+    This is the exact regression: with the old constant key, fires 2 and 3 would
+    dedup-collapse and Custodes would be hit ONCE. The Emperor would stop hearing
+    the cascade as it worsens. Each genuine escalation must get through.
+    """
+    admin_injects = _wire_admin_recorder(monkeypatch)
+    custodes_calls: list[str] = []
+
+    async def fake_dispatch(prompt):
+        custodes_calls.append(prompt)
+        return {"dispatched": True, "reason": "dispatched", "instance_id": "custodes-1"}
+
+    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fake_dispatch)
+
+    for depth in (6, 7, 8):
+        result = await main.handle_custodes_state_event(
+            "tts_queue_languishing",
+            "tts_queue",
+            severity=3,
+            payload=_languishing_payload(depth),
+            event_class="enforcement",
+        )
+        assert result["intervention_dispatched"] is True, f"depth {depth} alert was swallowed"
+
+    assert len(custodes_calls) == 3, (
+        "persistent worsening condition must keep escalating, not dedup to 1"
+    )
+    assert len(admin_injects) == 3, "the recorder must receive every legitimate alert (ungated)"
+
+
 # ── enforce()/Pavlok stays typing_guard-blocked (D2 physical-path guardrail) ──
 
 

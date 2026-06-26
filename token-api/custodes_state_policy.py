@@ -97,6 +97,19 @@ def build_dedupe_key(event: StateEvent) -> str:
         or "global"
     )
     base = f"{event.event_type}:{event.source}:{subject}"
+    if event.event_type == "tts_queue_languishing":
+        # The languishing alert ESCALATES with queue depth: each new message that
+        # deepens the pause queue is a distinct, legitimate re-alert that the
+        # condition is worsening — not a repeat. `subject` here resolves to the
+        # constant `app="tts_queue"` (== source), so the base key is constant
+        # (`tts_queue_languishing:tts_queue:tts_queue`) and EVERY distinct alert
+        # collides onto it. The dedup framework then eats all but the first, so a
+        # persistent/growing queue stops reaching the Emperor — enforcement is
+        # wrongly swallowed. Distinguish by depth so distinct alerts get distinct
+        # keys and keep escalating (retrigger-escalate), never collapsed-away.
+        length = payload.get("pause_queue_length")
+        if length is not None:
+            return f"{base}:len={length}"
     if event.event_type == "enforcement_cascade_escalate" and payload.get("level") is not None:
         return f"{base}:level={payload['level']}"
     if event.event_type == "expected_ack_escalated":
