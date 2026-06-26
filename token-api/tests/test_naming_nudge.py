@@ -11,6 +11,7 @@ def _insert_instance(
     tab_name="Claude 13:13",
     session_doc_id=1,
     workflow_blocked_reason=None,
+    persona_slug=None,
 ):
     conn = sqlite3.connect(db_path)
     if session_doc_id is not None:
@@ -26,21 +27,41 @@ def _insert_instance(
                 "anti-archaeology-v2",
             ),
         )
-    conn.execute(
-        """
-        INSERT INTO legacy_instances (
-            id, session_id, tab_name, origin_type, device_id, status,
-            session_doc_id, workflow_blocked_reason
-        ) VALUES (?, ?, ?, 'hook', 'Mac-Mini', 'processing', ?, ?)
-        """,
-        (
-            instance_id,
-            f"session-{instance_id}",
-            tab_name,
-            session_doc_id,
-            workflow_blocked_reason,
-        ),
-    )
+    if persona_slug:
+        conn.execute(
+            """
+            INSERT INTO instances (
+                id, name, origin_type, device_id, status, session_doc_id,
+                workflow_blocked_reason, persona_id, rank
+            ) VALUES (?, ?, 'api', 'Mac-Mini', 'working', ?, ?,
+                      (SELECT id FROM personas WHERE slug = ?),
+                      (SELECT default_rank FROM personas WHERE slug = ?))
+            """,
+            (
+                instance_id,
+                tab_name,
+                session_doc_id,
+                workflow_blocked_reason,
+                persona_slug,
+                persona_slug,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO legacy_instances (
+                id, session_id, tab_name, origin_type, device_id, status,
+                session_doc_id, workflow_blocked_reason
+            ) VALUES (?, ?, ?, 'hook', 'Mac-Mini', 'processing', ?, ?)
+            """,
+            (
+                instance_id,
+                f"session-{instance_id}",
+                tab_name,
+                session_doc_id,
+                workflow_blocked_reason,
+            ),
+        )
     conn.commit()
     conn.close()
 
@@ -122,6 +143,34 @@ async def test_naming_nudge_noops_after_instance_named(app_env, monkeypatch):
     )
 
     assert result["action"] == "noop_named"
+
+
+@pytest.mark.asyncio
+async def test_naming_nudge_noops_for_singleton_persona_pane(app_env, monkeypatch):
+    """Persona seats keep their persona-managed identity and must not be
+    interrupted with the interactive pane/session naming interview."""
+    _insert_instance(
+        app_env.db_path,
+        tab_name="needs-name",
+        session_doc_id=None,
+        persona_slug="fabricator-general",
+    )
+
+    async def fail_resolve(_instance_id):
+        raise AssertionError("persona panes should be exempt before pane resolution")
+
+    async def fail_enqueue(**_kwargs):
+        raise AssertionError("persona panes must not be naming-nudged")
+
+    monkeypatch.setattr(app_env.main.shared, "resolve_instance_pane", fail_resolve)
+    monkeypatch.setattr(app_env.main, "enqueue_pane_write", fail_enqueue)
+
+    result = await app_env.main.orchestrator_naming_nudge(
+        app_env.main.NamingNudgeRequest(instance_id="inst-naming")
+    )
+
+    assert result["action"] == "noop_persona_pane"
+    assert result["persona_slug"] == "fabricator-general"
 
 
 @pytest.mark.asyncio

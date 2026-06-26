@@ -1947,6 +1947,20 @@ async def _has_pending_naming_nudge(db, instance_id: str) -> bool:
     return bool(await cursor.fetchone())
 
 
+def _is_persona_pane_naming_exempt(instance: dict) -> bool:
+    """Return True for named singleton persona seats that must not be interviewed.
+
+    Ordinary workers may have an Astartes persona/profile assigned for voice and
+    tint. The singleton persona panes (Custodes, Fabricator-General,
+    Administratum, Pax, etc.) are distinguished by their persona registry
+    ``default_rank``: they are not Astartes workers and their pane/session names
+    are managed by the persona seat, not by the interactive naming interview.
+    """
+    default_rank = str(instance.get("persona_default_rank") or "astartes").lower()
+    rank = str(instance.get("rank") or "").lower()
+    return bool(default_rank and default_rank != "astartes" and rank != "retired")
+
+
 def _build_naming_nudge_message(slug: str | None, has_session_doc: bool) -> str:
     # Doc-bound instances answer through session-doc-name; that CLI explicitly
     # calls the sanctioned instance rename boundary after renaming the document.
@@ -1997,10 +2011,12 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT ci.id, ci.name AS tab_name, ci.workflow_blocked_reason,
+            SELECT ci.id, ci.name AS tab_name, ci.rank, ci.workflow_blocked_reason,
                    ci.session_doc_id, ci.dispatch_session_doc_path,
+                   p.slug AS persona_slug, p.default_rank AS persona_default_rank,
                    sd.file_path AS session_doc_path
             FROM instances ci
+            LEFT JOIN personas p ON ci.persona_id = p.id
             LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
             WHERE ci.id = ?
             """,
@@ -2017,6 +2033,15 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
                 "action": "noop_named",
                 "instance_id": instance_id,
                 "tab_name": instance.get("tab_name"),
+            }
+
+        if _is_persona_pane_naming_exempt(instance):
+            return {
+                "success": True,
+                "action": "noop_persona_pane",
+                "instance_id": instance_id,
+                "persona_slug": instance.get("persona_slug"),
+                "rank": instance.get("rank"),
             }
 
         if instance.get("workflow_blocked_reason") == "naming_refused":
