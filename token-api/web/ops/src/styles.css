@@ -283,7 +283,7 @@ h1 {
 }
 .ring--pulse .ring__arc { animation: ringpulse 1.1s ease-in-out infinite; }
 @keyframes ringpulse { 50% { opacity: 0.38; } }
-.ring--clickable { cursor: pointer; }
+.ring--clickable { cursor: pointer; pointer-events: auto; }
 
 /* ── panels ─────────────────────────────────────────────────────────── */
 
