@@ -51,7 +51,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
       pendingAudio: [],
       pendingCommitMeta: null,
       lastCommitMeta: null,
-      lockedTmuxPane: null,
+      voiceSessionId: null,
       routeEpoch: null,
       channelId: null,
       committed: false,
@@ -190,7 +190,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
           startedAt: session.startedAt,
           firstDeltaAt: session.lastDeltaAt,
           commitMeta: session.lastCommitMeta || null,
-          lockedTmuxPane: session.lastCommitMeta?.lockedTmuxPane || session.lockedTmuxPane || null,
+          voice_session_id: session.lastCommitMeta?.voice_session_id || session.voiceSessionId || null,
           routeEpoch: session.lastCommitMeta?.routeEpoch ?? session.routeEpoch ?? null,
           channelId: session.lastCommitMeta?.channelId ?? session.channelId ?? null,
         });
@@ -275,7 +275,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     if (!pcmChunk || pcmChunk.length === 0) return;
     const session = getSession(botName, userId);
     if (!session || session.closed) return;
-    if (meta?.lockedTmuxPane) session.lockedTmuxPane = meta.lockedTmuxPane;
+    if (meta?.voice_session_id) session.voiceSessionId = meta.voice_session_id;
     if (meta?.routeEpoch !== undefined) session.routeEpoch = meta.routeEpoch;
     if (meta?.channelId !== undefined) session.channelId = meta.channelId;
     const audio = downsample48kTo24k(session, pcmChunk);
@@ -331,7 +331,7 @@ export function createRealtimeTranscriber(config, logger, emitTranscript) {
     session.committed = true;
     logger.info(
       `Realtime [${botName}]: committing audio for user ${userId} ` +
-      `(${session.appendedFrames} frames, ${Math.round(bufferedMs)}ms, reason=${meta.reason || 'manual'}, pane=${meta.lockedTmuxPane || 'none'})`
+      `(${session.appendedFrames} frames, ${Math.round(bufferedMs)}ms, reason=${meta.reason || 'manual'}, voice_session=${meta.voice_session_id || session.voiceSessionId || 'none'})`
     );
     return send(session, { type: 'input_audio_buffer.commit' });
   }

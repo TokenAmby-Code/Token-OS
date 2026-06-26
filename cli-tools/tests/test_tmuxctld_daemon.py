@@ -47,6 +47,18 @@ class StubAdapter:
         return self.run("show-options", "-pv", "-t", pane_id, option, allow_failure=True).strip()
 
 
+class RecordingVoiceAdapter(StubAdapter):
+    def __init__(self) -> None:
+        self.calls = []
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        self.calls.append(args)
+        return ""
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.calls.append(("send-keys-helper", target, *keys))
+
+
 def _serve(adapter_factory):
     server = daemon.TmuxctldServer(
         ("127.0.0.1", 0),
@@ -563,5 +575,119 @@ def test_swallowed_submit_fires_recovery_and_surfaces_loudly(monkeypatch) -> Non
         assert ("send-keys", "-t", "%42", "C-m") in StuckDraftAdapter.calls
         # And the failure was surfaced on the notify path, not eaten.
         assert notified, "swallowed submit must be surfaced via notify"
+    finally:
+        server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Discord voice-session API
+# ---------------------------------------------------------------------------
+
+
+def test_voice_start_returns_opaque_id_and_public_role_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = RecordingVoiceAdapter()
+    monkeypatch.setattr(daemon, "_voice_resolve_target", lambda _control, _bot: "palace:E")
+    server, _ = _serve(lambda: rec)
+    session_id = None
+    try:
+        status, payload = _post(
+            server,
+            "/voice/session/start",
+            {
+                "bot_name": "imperial_guard",
+                "user_id": "operator",
+                "channel_id": "cadia",
+                "route_epoch": 7,
+            },
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        session_id = result["voice_session_id"]
+        assert result["target_role"] == "palace:E"
+        assert session_id
+        assert "%" not in json.dumps(payload)
+        assert "pane" not in json.dumps(payload).lower()
+    finally:
+        server.shutdown()
+        if session_id:
+            daemon.VOICE_SESSIONS.remove(session_id)
+
+
+def test_voice_append_ship_scratch_clear_mutate_public_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = RecordingVoiceAdapter()
+    monkeypatch.setattr(daemon, "_voice_resolve_target", lambda _control, _bot: "palace:E")
+    server, _ = _serve(lambda: rec)
+    try:
+        _, started = _post(
+            server, "/voice/session/start", {"bot_name": "imperial_guard", "user_id": "u1"}
+        )
+        sid = started["result"]["voice_session_id"]
+        _, appended = _post(
+            server, "/voice/session/append", {"voice_session_id": sid, "text": "draft"}
+        )
+        assert appended["result"]["inserted"] is True
+        assert ("send-keys", "-t", "palace:E", "-l", " ") in rec.calls
+        assert ("send-keys", "-t", "palace:E", "-l", "draft") in rec.calls
+
+        _, shipped = _post(
+            server, "/voice/session/ship", {"voice_session_id": sid, "text": "final"}
+        )
+        assert shipped["result"]["shipped"] is True
+        assert ("send-keys-helper", "palace:E", "Enter") in rec.calls
+
+        _, started2 = _post(
+            server, "/voice/session/start", {"bot_name": "imperial_guard", "user_id": "u1"}
+        )
+        sid2 = started2["result"]["voice_session_id"]
+        _, scratched = _post(server, "/voice/session/scratch", {"voice_session_id": sid2})
+        assert scratched["result"]["scratched"] is True
+        assert ("send-keys-helper", "palace:E", "C-c") in rec.calls
+
+        _, started3 = _post(
+            server, "/voice/session/start", {"bot_name": "imperial_guard", "user_id": "u1"}
+        )
+        sid3 = started3["result"]["voice_session_id"]
+        _, cleared = _post(server, "/voice/session/clear", {"voice_session_id": sid3})
+        assert cleared["result"]["cleared"] == 1
+    finally:
+        server.shutdown()
+
+
+class ImperialGuardNoClientAdapter(StubAdapter):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:2] == ("list-clients", "-F"):
+            return ""
+        return ""
+
+
+def test_voice_imperial_guard_fails_closed_with_no_routable_client() -> None:
+    server, _ = _serve(ImperialGuardNoClientAdapter)
+    try:
+        _, payload = _post(
+            server, "/voice/session/start", {"bot_name": "imperial_guard", "user_id": "u1"}
+        )
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+        assert "no routable" in payload["error"]["message"]
+    finally:
+        server.shutdown()
+
+
+def test_voice_clear_by_bot_clears_stale_target_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = RecordingVoiceAdapter()
+    monkeypatch.setattr(daemon, "_voice_resolve_target", lambda _control, _bot: "palace:E")
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/voice/session/clear", {"bot_name": "imperial_guard"})
+        assert payload["result"]["cleared"] == 0
+        assert payload["result"]["cleared_options"] is True
+        assert ("set-option", "-p", "-t", "palace:E", "@DISCORD_VOICE_LOCK", "0") in rec.calls
     finally:
         server.shutdown()
