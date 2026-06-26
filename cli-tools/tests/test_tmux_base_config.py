@@ -220,12 +220,37 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     assert "set -Fp @TYPING_PENDING_UNTIL" not in conf
     assert "set -Fp @TYPING_LOCK_UNTIL" not in conf
 
-    # The typing-guard Any binding is keyboard-only: no mouse format predicates
-    # and no mouse replay. Mouse bindings live outside the guard path.
+    # Root-table Any is the catch-all backstop for EVERY mouse event lacking a
+    # more specific binding (border clicks, status clicks, double/triple/second
+    # clicks, status-left/right, …). The explicit MouseUp1Pane/Wheel*/… no-ops
+    # below cover only the common cases and provably MISS others — which is how
+    # "mouse arms the typing guard" regressed ~5x (each fix whack-a-moled a few
+    # more event names while Any kept catching the rest). So Any itself must
+    # discriminate: a real mouse event carries a non-empty #{mouse_x}; a
+    # keystroke leaves it empty. Branch on emptiness — #{==:#{mouse_x},} is true
+    # ONLY for a keystroke and, unlike the truthiness form #{?mouse_x,…},
+    # classifies a column-0 click (mouse_x=="0") correctly as a mouse event.
     any_binding = conf.split("bind -n Any {", 1)[1].split("}\nbind -n Enter", 1)[0]
+    assert "if -F '#{==:#{mouse_x},}'" in any_binding, (
+        "Any must discriminate keystroke (mouse_x empty) from mouse event "
+        "(mouse_x set) via an emptiness test — not the broken #{mouse_any_flag} "
+        "app-mode flag, and not the col-0-unsafe #{?mouse_x,…} truthiness form"
+    )
+    # #{mouse_any_flag} is the pane APP's mouse-reporting mode, not a per-event
+    # discriminator (it reads 0 for real click/release events); it must not gate
+    # the arm. And a mouse event must never replay via -M (the "no mouse target"
+    # softlock, cf. 13789e5) — the discriminator is read-only and the mouse
+    # branch consumes without re-sending.
     assert "mouse_any_flag" not in any_binding
-    assert "mouse_x" not in any_binding
     assert "send-keys -M" not in any_binding
+    # Arming lives ONLY on the keystroke side; the mouse (else) branch is empty —
+    # nothing after the keystroke branch's final send-keys but closing braces.
+    assert "tmux-typing-guard-state arm" in any_binding
+    mouse_else_branch = any_binding.rsplit("send-keys", 1)[1]
+    assert mouse_else_branch.strip(" \n\t{}") == "", (
+        "the mouse (else) branch of Any must consume the event — no arm and no "
+        "send-keys after the keystroke branch"
+    )
     assert "bind -n FocusIn { }" in conf
     assert "bind -n FocusOut { }" in conf
 
