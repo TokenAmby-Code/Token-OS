@@ -46,6 +46,11 @@
 	<integer>10</integer>
 	<key>ProcessType</key>
 	<string>Background</string>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>4096</integer>
+	</dict>
 	<key>WorkingDirectory</key>
 	<string>/Users/tokenclaw/runtimes/Token-OS/live/cli-tools</string>
 	<key>StandardOutPath</key>

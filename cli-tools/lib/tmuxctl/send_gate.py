@@ -204,7 +204,7 @@ def _read_day_state(db_path: Path, local_date: str) -> tuple[str | None, str | N
     gate never trusts an in-memory value — it reads the row fresh every time.
     """
     try:
-        with sqlite3.connect(db_path, timeout=2.0) as conn:
+        with contextlib.closing(sqlite3.connect(db_path, timeout=2.0)) as conn, conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT day_started_at, source FROM day_state WHERE date = ?",
@@ -227,7 +227,7 @@ def _session_quiet_latch(db_path: Path) -> bool:
     and is the session-driven half of the predicate.
     """
     try:
-        with sqlite3.connect(db_path, timeout=2.0) as conn:
+        with contextlib.closing(sqlite3.connect(db_path, timeout=2.0)) as conn, conn:
             row = conn.execute("SELECT state_json FROM timer_state WHERE id = 1").fetchone()
     except Exception as exc:
         logger.debug("send_gate timer_state read failed: %s", exc)
@@ -695,7 +695,7 @@ def record_suppression(result: dict, *, db_path: Path | None = None) -> None:
 
     path = db_path or _db_path()
     try:
-        with sqlite3.connect(path, timeout=2.0) as conn:
+        with contextlib.closing(sqlite3.connect(path, timeout=2.0)) as conn, conn:
             conn.execute("PRAGMA busy_timeout=2000")
             conn.execute(
                 "INSERT INTO events (event_type, device_id, details) VALUES (?, ?, ?)",
@@ -747,7 +747,7 @@ def register_automated_send(
     expires_at = (now + timedelta(seconds=automated_activity_ttl())).isoformat()
     path = db_path or _db_path()
     try:
-        with sqlite3.connect(path, timeout=2.0) as conn:
+        with contextlib.closing(sqlite3.connect(path, timeout=2.0)) as conn, conn:
             conn.execute("PRAGMA busy_timeout=2000")
             conn.execute(
                 """

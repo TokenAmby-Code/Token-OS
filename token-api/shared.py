@@ -8,6 +8,7 @@ Phase 2 will convert these raw dicts into TypedDicts/dataclasses.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -132,7 +133,7 @@ def ensure_day_state_table_sync(db_path: Path | None = None) -> None:
     """Create the day-state table used by the day-start hook if needed."""
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with contextlib.closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute(
             """
@@ -159,7 +160,7 @@ def get_day_state_sync(date_str: str | None = None, db_path: Path | None = None)
     local_date = date_str or quiet_hours_local_now().date().isoformat()
     try:
         ensure_day_state_table_sync(db_path)
-        with sqlite3.connect(db_path or DB_PATH) as conn:
+        with contextlib.closing(sqlite3.connect(db_path or DB_PATH)) as conn, conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM day_state WHERE date = ?", (local_date,)).fetchone()
         result = dict(row) if row else None
@@ -193,7 +194,7 @@ def set_day_started_at_sync(
     details_json = json.dumps(details or {}, sort_keys=True)
 
     ensure_day_state_table_sync(db_path)
-    with sqlite3.connect(db_path or DB_PATH) as conn:
+    with contextlib.closing(sqlite3.connect(db_path or DB_PATH)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
         existing = conn.execute("SELECT * FROM day_state WHERE date = ?", (date_str,)).fetchone()
@@ -1146,7 +1147,7 @@ def _log_event_sync_insert(
     with _LOG_EVENT_WRITE_LOCK:
         for attempt in range(3):
             try:
-                with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+                with contextlib.closing(sqlite3.connect(DB_PATH, timeout=5.0)) as conn, conn:
                     conn.execute("PRAGMA busy_timeout=5000")
                     conn.execute(
                         """INSERT INTO events (event_type, instance_id, device_id, details)

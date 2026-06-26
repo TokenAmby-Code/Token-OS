@@ -13,6 +13,7 @@ doc or daily note. MiniMax never writes directly to curated documents.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
@@ -81,7 +82,7 @@ def mark_cron_instance_stopped(instance_id: str):
 def clear_human_anchor_on_stop(instance_id: str) -> None:
     """Defensively clear AUQ human-time anchors when a Stop hook fires."""
     try:
-        with sqlite3.connect(str(DB_PATH)) as con:
+        with contextlib.closing(sqlite3.connect(str(DB_PATH))) as con, con:
             try:
                 sanctioned_update_instance_sync(
                     con,
