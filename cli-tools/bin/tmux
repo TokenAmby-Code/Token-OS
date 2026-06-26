@@ -12,12 +12,38 @@ set -euo pipefail
 _THIS="$(readlink -f "$0")"
 _BIN_DIR="$(dirname "$_THIS")"
 _TX_BIN="${_BIN_DIR}/tx"
+
+# Hard recursion fuse — belt-and-suspenders, independent of resolution
+# correctness. If the shim ever re-enters itself (a poisoned
+# IMPERIUM_TMUX_BIN/REAL_TMUX pointing back at this script, a PATH loop, a
+# self-referencing wrapper), this bounds the blast radius so it can never
+# again exhaust the process table and brick the machine. The counter is
+# exported so it survives BOTH exec re-entry and $(...) child invocations.
+# In correct operation the shim never re-enters itself (real tmux is the
+# resolved system binary), so depth stays at 1; a bound of 3 leaves slack
+# for any benign one-level nesting while killing an exponential fork bomb
+# almost immediately.
+_IMPERIUM_TMUX_SHIM_MAX_DEPTH=3
+IMPERIUM_TMUX_SHIM_DEPTH=$(( ${IMPERIUM_TMUX_SHIM_DEPTH:-0} + 1 ))
+export IMPERIUM_TMUX_SHIM_DEPTH
+if (( IMPERIUM_TMUX_SHIM_DEPTH > _IMPERIUM_TMUX_SHIM_MAX_DEPTH )); then
+    printf 'tmux: FATAL recursion fuse tripped (IMPERIUM_TMUX_SHIM_DEPTH=%s > %s) — the tmux shim re-entered itself, real tmux likely misresolved to this shim. Refusing to recurse to prevent a fork bomb.\n' \
+        "$IMPERIUM_TMUX_SHIM_DEPTH" "$_IMPERIUM_TMUX_SHIM_MAX_DEPTH" >&2
+    exit 70
+fi
+
 find_real_tmux() {
-    if [[ -n "${IMPERIUM_TMUX_BIN:-}" && -x "${IMPERIUM_TMUX_BIN}" ]]; then
+    # A self-pointing override (IMPERIUM_TMUX_BIN/REAL_TMUX resolving to THIS
+    # shim) must be REJECTED so resolution falls through to a real binary —
+    # otherwise _REAL_TMUX becomes the shim and every invocation re-execs the
+    # shim (the self-fork-bomb). Mirror the PATH-scan self-reference guard.
+    if [[ -n "${IMPERIUM_TMUX_BIN:-}" && -x "${IMPERIUM_TMUX_BIN}" \
+          && "$(readlink -f "${IMPERIUM_TMUX_BIN}")" != "$_THIS" ]]; then
         echo "${IMPERIUM_TMUX_BIN}"
         return 0
     fi
-    if [[ -n "${REAL_TMUX:-}" && -x "${REAL_TMUX}" ]]; then
+    if [[ -n "${REAL_TMUX:-}" && -x "${REAL_TMUX}" \
+          && "$(readlink -f "${REAL_TMUX}")" != "$_THIS" ]]; then
         echo "${REAL_TMUX}"
         return 0
     fi
@@ -28,7 +54,7 @@ find_real_tmux() {
             echo "$candidate"
             return 0
         fi
-    done < <(command -v -a tmux 2>/dev/null || true)
+    done < <(type -aP tmux 2>/dev/null || true)
     for candidate in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux /bin/tmux; do
         if [[ -x "$candidate" && "$(readlink -f "$candidate")" != "$_THIS" ]]; then
             echo "$candidate"
@@ -177,62 +203,6 @@ is_read_command_with_pane_ids() {
     esac
 }
 
-automation_focus_guard_active() {
-    [[ "${IMPERIUM_TMUX_FOCUS_RESTORE:-}" != "1" ]] || return 1
-    [[ "${IMPERIUM_ALLOW_TMUX_FOCUS:-}" != "1" ]] || return 1
-    [[ "${IMPERIUM_ALLOW_MECHANICUS_FOCUS:-}" != "1" ]] || return 1
-    ! mechanicus_override_active
-}
-
-automation_env_active() {
-    [[ -n "${IMPERIUM_TMUX_AUTOMATION:-}" || -n "${TOKEN_API_INTERNAL_DISPATCH:-}" ]]
-}
-
-mechanicus_focus_log() {
-    local event="$1" target="${2:-}" command_name="${3:-}" previous client ts
-    ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    previous="$("$_REAL_TMUX" display-message -p '#{pane_id}' 2>/dev/null || true)"
-    client="$("$_REAL_TMUX" display-message -p '#{client_tty}' 2>/dev/null || true)"
-    local line
-    line="$(printf '%s event=%s action=%s attempted_target=%q previous_pane=%q current_client=%q command_surface=tmux-shim command=%q' \
-        "$ts" "$event" "$event" "$target" "$previous" "$client" "$command_name")"
-    printf '%s\n' "$line" >> /tmp/mechanicus-focus-guard.log 2>/dev/null || true
-    printf '%s\n' "$line" >> /tmp/tmux-focus-guard.log 2>/dev/null || true
-}
-
-mechanicus_override_active() {
-    local raw now
-    raw="$("$_REAL_TMUX" show-options -gqv @IMPERIUM_ALLOW_MECHANICUS_FOCUS_UNTIL 2>/dev/null || true)"
-    [[ -n "$raw" ]] || return 1
-    now="$(python3 - <<'PY'
-import time
-print(time.time())
-PY
-)"
-    python3 - "$raw" "$now" <<'PY'
-import sys
-try:
-    sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)
-except Exception:
-    sys.exit(1)
-PY
-}
-
-mechanicus_open_override_from_env() {
-    local target="$1" command_name="$2" until
-    [[ "${IMPERIUM_ALLOW_MECHANICUS_FOCUS:-}" == "1" ]] || return 1
-    target_window_is_mechanicus "$target" || return 1
-    until="$(python3 - <<'PY'
-import time
-print(f"{time.time() + 4:.3f}")
-PY
-)"
-    "$_REAL_TMUX" set-option -g @IMPERIUM_ALLOW_MECHANICUS_FOCUS_UNTIL "$until" 2>/dev/null || true
-    "$_REAL_TMUX" set-option -g @IMPERIUM_ALLOW_MECHANICUS_FOCUS_REASON "env:tmux-shim:${command_name}" 2>/dev/null || true
-    mechanicus_focus_log "allowed" "$target" "$command_name"
-    return 0
-}
-
 extract_target_flag() {
     local flag="$1"; shift
     local arg
@@ -249,81 +219,6 @@ extract_target_flag() {
         shift
     done
     return 1
-}
-
-target_window_is_mechanicus() {
-    local target="$1" name
-    [[ -n "$target" ]] || return 1
-    [[ "$target" == mechanicus:* ]] && return 0
-    name="${target##*:}"
-    name="${name%%.*}"
-    [[ "$name" == mechanicus* ]] && return 0
-    name="$("$_REAL_TMUX" display-message -t "$target" -p '#{window_name}' 2>/dev/null || true)"
-    name="${name%%(*}"
-    [[ "$name" == mechanicus* ]]
-}
-
-guard_automation_focus() {
-    automation_focus_guard_active || return 1
-    [[ $# -gt 0 ]] || return 1
-	case "$1" in
-	    select-window|switch-client)
-	        local target
-	        target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
-	        automation_env_active && return 0
-	        [[ -n "$target" ]] || return 1
-	        target_window_is_mechanicus "$target"
-	        ;;
-	    select-pane)
-	        local arg target
-	        for arg in "${@:2}"; do
-	            [[ "$arg" == "-P" || "$arg" == "-T" ]] && return 1
-	        done
-	        target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
-	        automation_env_active && return 0
-	        [[ -n "$target" ]] || return 1
-	        target_window_is_mechanicus "$target"
-	        ;;
-	    split-window|new-window)
-	        local arg target
-	        for arg in "${@:2}"; do
-	            [[ "$arg" == "-d" || "$arg" == -*d* ]] && return 1
-	        done
-	        target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
-	        automation_env_active && return 0
-	        [[ -n "$target" ]] || return 1
-	        target_window_is_mechanicus "$target"
-	        ;;
-        *) return 1 ;;
-    esac
-}
-
-maybe_open_mechanicus_override() {
-    [[ $# -gt 0 ]] || return 1
-    case "$1" in
-        select-window|switch-client)
-            local target
-            target="$(extract_target_flag -t "$@")" || return 1
-            mechanicus_open_override_from_env "$target" "$1"
-            ;;
-        select-pane)
-            local arg target
-            for arg in "${@:2}"; do
-                [[ "$arg" == "-P" || "$arg" == "-T" ]] && return 1
-            done
-            target="$(extract_target_flag -t "$@")" || return 1
-            mechanicus_open_override_from_env "$target" "$1"
-            ;;
-        split-window|new-window)
-            local arg target
-            for arg in "${@:2}"; do
-                [[ "$arg" == "-d" || "$arg" == -*d* ]] && return 1
-            done
-            target="$(extract_target_flag -t "$@")" || return 1
-            mechanicus_open_override_from_env "$target" "$1"
-            ;;
-        *) return 1 ;;
-    esac
 }
 
 runtime_invariant_preflight() {
@@ -356,14 +251,6 @@ runtime_invariant_preflight() {
 
 if [[ "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_launch_command "$@"; then
     exec "$_TX_BIN" start
-fi
-
-maybe_open_mechanicus_override "$@" || true
-
-if guard_automation_focus "$@"; then
-    target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
-    mechanicus_focus_log "wrapper-blocked" "$target" "${1:-}"
-    exit 0
 fi
 
 if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" == "1" ]]; then
