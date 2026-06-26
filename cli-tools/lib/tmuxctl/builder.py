@@ -34,6 +34,24 @@ def _prepare_window_geometry(adapter: TmuxAdapter, target: str) -> None:
     )
 
 
+def _release_window_geometry(adapter: TmuxAdapter, target: str) -> None:
+    """Let attached clients drive the window size after detached construction.
+
+    ``resize-window`` is useful while building detached windows, but tmux also
+    flips the target to ``window-size manual``. Leaving that bit set prevents a
+    phone-sized client from reclaiming the layout when it attaches.
+    """
+    adapter.run(
+        "set-option",
+        "-w",
+        "-t",
+        target,
+        "window-size",
+        "latest",
+        allow_failure=True,
+    )
+
+
 def _side_roles_for_window(window: str) -> set[str]:
     base = window.split("(", 1)[0]
     return side_roles_for(base)
@@ -202,6 +220,7 @@ def build_palace_window(adapter: TmuxAdapter, session: str, window: str = PALACE
 
     _assert_side_column_postcondition(adapter, target, window)
     adapter.run("select-pane", "-t", center)
+    _release_window_geometry(adapter, target)
 
 
 def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNIUM_WINDOW) -> None:
@@ -252,6 +271,7 @@ def build_somnium_window(adapter: TmuxAdapter, session: str, window: str = SOMNI
 
     _assert_side_column_postcondition(adapter, target, window)
     adapter.run("select-pane", "-t", west)
+    _release_window_geometry(adapter, target)
 
 
 def _council_seat(
@@ -337,6 +357,7 @@ def build_council_window(
         adapter, target, window, enforce_column_width=enforce_column_width
     )
     adapter.run("select-pane", "-t", west)
+    _release_window_geometry(adapter, target)
 
 
 def ensure_council_window(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:
@@ -389,6 +410,7 @@ def build_mechanicus_window(adapter: TmuxAdapter, session: str) -> None:
     _set_pane_option(adapter, fabricator, "@PANE_TYPE", "mechanicus")
     _pane_tag(adapter, orchestrator, "mechanicus:orchestrator")
     _set_pane_option(adapter, orchestrator, "@PANE_TYPE", "mechanicus")
+    _release_window_geometry(adapter, target)
 
 
 def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
@@ -430,6 +452,7 @@ def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
     _pane_tag(adapter, token_os, "reservists:token-os")
     _set_pane_option(adapter, token_os, "@PANE_TYPE", "reservists")
     _set_pane_option(adapter, token_os, "@TOKEN_OS_RESERVIST", "1")
+    _release_window_geometry(adapter, target)
 
 
 def build_workspace(adapter: TmuxAdapter, session: str = SESSION_NAME) -> None:

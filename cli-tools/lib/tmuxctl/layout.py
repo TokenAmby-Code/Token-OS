@@ -15,9 +15,9 @@ def _floor_fraction(value: int, fraction: Fraction) -> int:
 class ColumnSpec:
     """Shared side-column geometry contract.
 
-    ``width`` is realized once from ``reference_total_width`` and then reused by
-    every side-column page. Page-specific flex/grid panes absorb any remainder
-    from their own current window width.
+    ``width`` is the reference detached-build width. Runtime layouts must call
+    :meth:`width_for_total` so side columns remain proportional to the current
+    client/window width (phone, laptop, desktop, etc.).
     """
 
     ratio: Fraction = Fraction(3, 10)
@@ -41,7 +41,7 @@ class ColumnSpec:
         return max(1, _floor_fraction(self.usable_width, self.ratio))
 
     def width_for_total(self, total_width: int) -> int:
-        """Compatibility helper for callers that need the old per-total math."""
+        """Return this column's proportional width for a concrete window width."""
         return max(1, _floor_fraction(max(1, total_width - self.vertical_borders), self.ratio))
 
 
@@ -52,7 +52,7 @@ class PalaceLayout:
     Palace is horizontally:
       west side column | center stack flex | east side column
 
-    The side columns use the shared :class:`ColumnSpec`; integer remainder
+    The side columns use the shared :class:`ColumnSpec` ratio; integer remainder
     columns stay in the center so the two side panes remain exactly equal.
     """
 
@@ -75,8 +75,8 @@ class PalaceLayout:
     def usable_width(self, total_width: int) -> int:
         return max(1, total_width - self.vertical_borders)
 
-    def side_width(self, total_width: int | None = None) -> int:
-        return cast(ColumnSpec, self.side).width
+    def side_width(self, total_width: int) -> int:
+        return cast(ColumnSpec, self.side).width_for_total(total_width)
 
     def center_width(self, total_width: int) -> int:
         return max(1, self.usable_width(total_width) - (2 * self.side_width(total_width)))
@@ -93,8 +93,9 @@ class SomniumLayout:
     Somnium is horizontally:
       west side column | right grid flex
 
-    The west side uses the shared :class:`ColumnSpec`; integer remainder columns
-    stay in the right grid so the side column remains uniform across pages.
+    The west side uses the shared :class:`ColumnSpec` ratio; integer remainder
+    columns stay in the right grid so the side column remains uniform across
+    pages at the same current width.
     """
 
     west: ColumnSpec | Fraction = field(default_factory=ColumnSpec)
@@ -116,8 +117,8 @@ class SomniumLayout:
     def usable_width(self, total_width: int) -> int:
         return max(1, total_width - self.vertical_borders)
 
-    def west_width(self, total_width: int | None = None) -> int:
-        return cast(ColumnSpec, self.west).width
+    def west_width(self, total_width: int) -> int:
+        return cast(ColumnSpec, self.west).width_for_total(total_width)
 
     def grid_width(self, total_width: int) -> int:
         return max(1, total_width - self.west_width(total_width) - 1)
