@@ -7,6 +7,7 @@ sites are bridged here until the instances table grows ``persona_id``/``rank``.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import sqlite3
 import uuid
@@ -431,7 +432,7 @@ async def _migrate_persona_columns(db: aiosqlite.Connection) -> None:
 
 
 def ensure_personas_table_sync(db_path: Path) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with contextlib.closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute(persona_schema_sql())
         _migrate_persona_columns_sync(conn)
@@ -494,7 +495,7 @@ def _row_to_dict(row) -> dict | None:
 
 def resolve_persona_sync(db_path: Path, persona_id_or_slug: str) -> dict | None:
     ensure_personas_table_sync(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with contextlib.closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM personas WHERE id = ? OR slug = ?",

@@ -9,6 +9,7 @@ This server provides:
 """
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import inspect
@@ -13717,7 +13718,7 @@ async def _wipe_prior_day_timer_events(cutoff_date: str) -> None:
     import sqlite3
 
     def _wipe_old_timer_events():
-        with sqlite3.connect(DB_PATH) as conn:
+        with contextlib.closing(sqlite3.connect(DB_PATH)) as conn, conn:
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute(
                 "DELETE FROM events WHERE event_type IN "
