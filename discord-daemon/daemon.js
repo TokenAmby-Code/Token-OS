@@ -11,10 +11,10 @@ import { writeFileSync, unlinkSync, mkdirSync, appendFileSync, readFileSync } fr
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { SlashCommandBuilder, Events } from 'discord.js';
-import { execFile, execFileSync } from 'child_process';
 import { isBenignFixerError } from './fixer-classify.js';
 import { createVoiceTranscriptRouter } from './voice-transcript-router.js';
 import { routeVoiceTranscriptWithRetry } from './voice-route-retry.js';
+import { tmuxctldClient } from './tmuxctld-client.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -31,12 +31,7 @@ const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 // The actual target is resolved against LIVE instances by token-api at fire
 // time — no stale @DISCORD_VOICE_FIXER_INSTANCE_ID / _PANE markers are trusted.
 const FIXER_REDIRECT_ENV = 'DISCORD_VOICE_FIXER_REDIRECT';
-const FIXER_REDIRECT_TMUX_OPTION = '@DISCORD_VOICE_FIXER_REDIRECT';
-
-function tmuxExecOptions(extra = {}) {
-  const { TMUX, ...env } = process.env;
-  return { ...extra, env };
-}
+const FIXER_TARGET_ENV = 'DISCORD_VOICE_FIXER_TARGET';
 
 function classifyErrorCode(msg, meta = {}) {
   if (meta.errorCode) return meta.errorCode;
@@ -60,86 +55,19 @@ function tailFile(path, maxLines = 80) {
   }
 }
 
-function createDiscordFixerHook() {
+function createDiscordFixerHook({ writeLine = null } = {}) {
   const recent = new Map();
   const RECENT_TTL_MS = 10 * 60_000;
   const RECENT_MAX = 500;
-  const agentCmd = join(BASE_DIR, 'cli-tools', 'bin', 'agent-cmd');
-  const tmuxctl = join(BASE_DIR, 'cli-tools', 'bin', 'tmuxctl');
 
-  function resolveFixerRedirect() {
-    // FG's config knob: the pane label/role that receives Discord error logs.
-    const envValue = process.env[FIXER_REDIRECT_ENV];
-    if (envValue) return envValue.trim();
-    try {
-      return execFileSync('tmux', ['show-options', '-gqv', FIXER_REDIRECT_TMUX_OPTION], tmuxExecOptions({
-        encoding: 'utf8',
-        timeout: 3000,
-      })).trim();
-    } catch {
-      return '';
-    }
-  }
-
-  async function resolveLiveFixerTarget() {
-    // Resolve directly against tmux at fire time. The Fixer target is a stable
-    // pane role or physical %pane, not a Token API instance id. Default to FG;
-    // the redirect knob may point to any live tmuxctl-resolvable pane label
-    // (e.g. palace:W for the current Codex Fixer pane).
-    const redirect = resolveFixerRedirect();
-    const label = redirect || 'mechanicus:fabricator-general';
-    try {
-      const pane = execFileSync(tmuxctl, ['resolve-pane', '--format', 'physical', label], tmuxExecOptions({
-        encoding: 'utf8',
-        timeout: 5000,
-      })).trim();
-      if (!pane.startsWith('%')) return null;
-      execFileSync('tmux', ['display-message', '-p', '-t', pane, '#{pane_id}'], tmuxExecOptions({
-        encoding: 'utf8',
-        timeout: 3000,
-      }));
-      return { tmux_pane: pane, label, source: redirect ? 'redirect_pane' : 'fg_pane' };
-    } catch {
-      return null;
-    }
-  }
-
-  function pasteFixerPromptToPane(pane, prompt, logFile) {
-    const bufferName = `discord-fixer-hook-${process.pid}`;
-    try {
-      execFileSync('tmux', ['set-buffer', '-b', bufferName, prompt], tmuxExecOptions({ timeout: 5000 }));
-      execFileSync('tmux', ['paste-buffer', '-d', '-b', bufferName, '-t', pane], tmuxExecOptions({ timeout: 5000 }));
-      execFileSync('tmux', ['send-keys', '-t', pane, 'Enter'], tmuxExecOptions({ timeout: 5000 }));
-    } catch (err) {
-      const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook raw tmux paste failed pane=${pane}: ${err.message}`;
-      console.log(failLine);
-      try { appendFileSync(logFile, failLine + '\n'); } catch {}
-    }
-  }
-
-  function sendFixerPrompt(args, prompt, logFile, fallback = null) {
-    execFile(agentCmd, [...args, prompt], {
-      env: {
-        ...process.env,
-        PATH: [
-          join(BASE_DIR, 'cli-tools', 'bin'),
-          '/opt/homebrew/bin',
-          '/usr/local/bin',
-          process.env.PATH || '',
-        ].join(':'),
-      },
-      timeout: 45_000,
-      maxBuffer: 1024 * 1024,
-    }, (err, stdout, stderr) => {
-      if (!err) return;
-      if (fallback) {
-        fallback(`${err.message}; ${String(stderr || stdout || '').slice(0, 240)}`);
-        return;
-      }
-      const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook failed: ${err.message}; ${String(stderr || stdout || '').slice(0, 240)}`;
-      console.log(failLine);
-      try { appendFileSync(logFile, failLine + '\n'); } catch {}
-    });
+  function resolveFixerTarget() {
+    // Stable public role only. tmuxctld resolves it internally and fails closed
+    // if it is not live. Existing REDIRECT env remains a compatibility alias.
+    const primary = (process.env[FIXER_TARGET_ENV] || '').trim();
+    if (primary) return primary;
+    const legacy = (process.env[FIXER_REDIRECT_ENV] || '').trim();
+    if (legacy) return legacy;
+    return 'mechanicus:fabricator-general';
   }
 
   return async function hookDiscordError(line, msg, meta = {}, logFile) {
@@ -165,30 +93,13 @@ function createDiscordFixerHook() {
     if (now - last < 30_000) return;
     recent.set(key, now);
 
-    // Resolve the routing target against LIVE tmux panes at fire time. If
-    // nothing live resolves, DROP — never dead-letter into a stale stub or
-    // someone else's pane.
-    let target = null;
-    try {
-      target = await resolveLiveFixerTarget();
-    } catch {
-      target = null;
-    }
-    if (!target || !target.tmux_pane) {
-      const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook: no LIVE fixer pane (FG offline / redirect dead); dropping ${errorCode}`;
-      console.log(failLine);
-      try { appendFileSync(logFile, failLine + '\n'); } catch {}
-      return;
-    }
-
+    const target = resolveFixerTarget();
     const recentLog = tailFile(logFile, 80);
     const prompt = [
       'Discord voice routing state hook to active fixer.',
       '',
       `error_code: ${errorCode}`,
-      `fixer_pane: ${target.tmux_pane}`,
-      `fixer_label: ${target.label || ''}`,
-      `fixer_source: ${target.source || ''}`,
+      `fixer_target: ${target}`,
       `timestamp: ${new Date(now).toISOString()}`,
       `trigger: ${msg}`,
       '',
@@ -198,30 +109,38 @@ function createDiscordFixerHook() {
       '```',
     ].join('\n');
 
-    sendFixerPrompt(['--pane', target.tmux_pane], prompt, logFile, (paneError) => {
-      // Live-pane fallback: only the pane the resolver verified for THIS target
-      // (never a hardcoded/stale pane).
-      const fallbackPrompt = `${prompt}\n\n(agent-cmd pane delivery failed, raw live-pane fallback used: ${paneError})`;
-      pasteFixerPromptToPane(target.tmux_pane, fallbackPrompt, logFile);
-    });
+    try {
+      await tmuxctldClient.sendText({ target, text: prompt, submit: true });
+    } catch (err) {
+      const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook: no_target target=${target} error=${err.code || err.message}; dropping ${errorCode}`;
+      if (writeLine) {
+        writeLine(failLine);
+      } else {
+        try { appendFileSync(logFile, failLine + '\n'); } catch {}
+      }
+    }
   };
 }
-
-const discordFixerHook = createDiscordFixerHook();
 
 function createLogger(level = 'info') {
   const minLevel = LOG_LEVELS[level] ?? 1;
   const logFile = join(LOG_DIR, `daemon-${new Date().toISOString().slice(0, 10)}.log`);
 
-  function log(lvl, msg, meta = {}) {
-    if (LOG_LEVELS[lvl] < minLevel) return;
-    const line = `${new Date().toISOString()} [${lvl.toUpperCase().padEnd(5)}] ${msg}`;
+  function writeLine(line) {
     console.log(line);
     try {
       appendFileSync(logFile, line + '\n');
     } catch {
       // Don't crash on log write failure
     }
+  }
+
+  const discordFixerHook = createDiscordFixerHook({ writeLine });
+
+  function log(lvl, msg, meta = {}) {
+    if (LOG_LEVELS[lvl] < minLevel) return;
+    const line = `${new Date().toISOString()} [${lvl.toUpperCase().padEnd(5)}] ${msg}`;
+    writeLine(line);
     if (lvl === 'error') {
       try { Promise.resolve(discordFixerHook(line, msg, meta, logFile)).catch(() => {}); } catch {}
     }
@@ -278,6 +197,16 @@ async function main() {
   const transcriber = createTranscriber(config, logger);
   const voiceTranscriptRouter = createVoiceTranscriptRouter({ logger, voiceManager });
 
+  // Clear stale tmuxctld voice locks/options from a previous Discord daemon
+  // process before any new VC auto-join can create fresh sessions.
+  for (const botName of Object.keys(config.voice_channels || {})) {
+    try {
+      await voiceTranscriptRouter.clear({ bot: botName });
+    } catch (err) {
+      logger.warn(`Voice [${botName}]: startup voice cleanup failed: ${err.code || err.message}`);
+    }
+  }
+
   // Wire live decoded Discord PCM frames into OpenAI Realtime transcription.
   voiceManager.setAudioFrameCallback((userId, pcmChunk, botName, meta) => {
     return transcriber.handleAudioFrame?.(userId, pcmChunk, botName, meta);
@@ -305,9 +234,8 @@ async function main() {
     }
   });
 
-  // Route voice transcripts directly to tmux. Persona panes have stable
-  // @PANE_ID roles and Cadia/Imperial Guard already carries a locked live pane,
-  // so delivery must not depend on Token API instance-row freshness.
+  // Route voice transcripts through tmuxctld. Persona and active-client
+  // target policy are daemon-owned and never depend on Token API row freshness.
   transcriber.onTranscription(async (result) => {
     const botLabel = result.botName || 'voice';
     logger.info(`Transcription [${botLabel}] from ${result.userId}: "${result.text}"`);
@@ -319,16 +247,19 @@ async function main() {
         result,
         botLabel,
       });
-      logger.info(`Transcription [${botLabel}]: tmux route ${JSON.stringify(routed)}`);
-      if (routed && routed.routed === false && routed.reason && !routed.ignored && !routed.warning_sent && !routed.tmux_lag) {
+      logger.info(`Transcription [${botLabel}]: voice route ${JSON.stringify(routed)}`);
+      if (routed?.voice_session_invalidated) {
+        voiceManager.clearLocalVoiceSession?.(botLabel, result.userId, routed.voice_session_id || '');
+      }
+      if (routed && routed.routed === false && routed.reason && !routed.ignored && !routed.warning_sent && !routed.route_failure) {
         try {
           await voiceManager.playTTS(`Voice route failed: ${routed.reason}`, botLabel);
         } catch {}
       }
     } catch (err) {
       const message = err?.message || String(err);
-      logger.warn(`Transcription [${botLabel}]: tmux route failed: ${message}`);
-      if (!err?.warning_sent && !err?.tmux_lag) {
+      logger.warn(`Transcription [${botLabel}]: voice route failed: ${message}`);
+      if (!err?.warning_sent && !err?.route_failure) {
         try {
           await voiceManager.playTTS('Voice route failed. Check Discord daemon logs.', botLabel);
         } catch {}

@@ -1,351 +1,160 @@
 #!/usr/bin/env python3
-# discord-routing - Diagnose the Discord voice/mention routing chain
+# discord-routing - Diagnose Discord voice routing through tmuxctld
 # TAGS: discord, voice, routing, diagnostic
 # AUDIENCE: agent, user
-"""Diagnose the Discord voice/mention injection routing chain.
+"""Diagnose Discord voice routing without crossing the Discord/tmux boundary.
 
-Checks each legion's routing path and prints a status table and fix suggestions.
-- Custodes routes to stable tmuxctl public target `3:0` (`council:custodes`).
-- Mechanicus routes to stable tmuxctl public target `4:0` (`mechanicus:fabricator-general`).
-- DB rows are supplementary display only; stale/missing/synced=0 rows do not fail
-  voice routing.
+Discord does not inspect panes. This diagnostic asks tmuxctld for semantic
+voice targets and active voice-session state.
 
 Usage:
-    discord-routing              # Full diagnostic
-    discord-routing --json       # JSON output for programmatic use
-    discord-routing --fix        # Print fix commands only
-    discord-routing -h, --help   # Show help
+    discord-routing              # status table
+    discord-routing --json       # JSON output
+    discord-routing --fix        # Print fix suggestions only
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
-import subprocess
 import sys
-from pathlib import Path
+import urllib.parse
+import urllib.request
 
-DB_PATH = Path.home() / ".claude" / "agents.db"
-API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
-
-# Legions that have Discord bots routing to them
-ROUTABLE_LEGIONS = ["custodes", "mechanicus"]
+TMUXCTLD_URL = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:7778").rstrip("/")
+TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+ROUTABLE_BOTS = ["custodes", "mechanicus", "imperial_guard"]
 
 
-def get_db():
-    if not DB_PATH.exists():
+def http_json(url: str, timeout: float = 5.0):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
         return None
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
-def api_get(path: str):
-    """GET from Token-API, return parsed JSON or None."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", "--connect-timeout", "2", "--max-time", "5", f"{API_URL}{path}"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
-    except (json.JSONDecodeError, Exception):
-        pass
-    return None
+def tmuxctld_get(path: str, params: dict[str, str] | None = None):
+    query = ""
+    if params:
+        query = "?" + urllib.parse.urlencode(params)
+    payload = http_json(f"{TMUXCTLD_URL}{path}{query}")
+    if not payload:
+        return None
+    if payload.get("ok") is False:
+        return {"ok": False, "error": payload.get("error") or {}}
+    return {"ok": True, "result": payload.get("result", payload)}
 
 
-def get_live_panes():
-    """Return set of alive tmux pane IDs."""
-    try:
-        result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return set(result.stdout.strip().split("\n"))
-    except Exception:
-        pass
-    return set()
+def token_api_get(path: str):
+    return http_json(f"{TOKEN_API_URL}{path}", timeout=2.0)
 
 
-def get_marker_physical_pane(marker: str) -> str | None:
-    """Resolve a live pane by its @PANE_ID marker."""
-    try:
-        result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{@PANE_ID}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return None
-        for line in result.stdout.splitlines():
-            parts = line.split("\t", 1)
-            if len(parts) == 2 and parts[0].startswith("%") and parts[1] == marker:
-                return parts[0]
-    except Exception:
-        pass
-    return None
-
-
-def get_tmuxctl_physical_pane(target: str) -> str | None:
-    """Resolve a public tmuxctl target to the current physical %pane."""
-    if target.startswith("%") and target in get_live_panes():
-        return target
-    try:
-        result = subprocess.run(
-            ["tmuxctl", "resolve-pane", "--format", "physical", target],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        pane = result.stdout.strip()
-        if result.returncode == 0 and pane.startswith("%"):
-            return pane
-    except Exception:
-        pass
-
-    marker_fallbacks = {
-        "3:0": "council:custodes",
-        "council:custodes": "council:custodes",
-        "4:0": "mechanicus:fabricator-general",
-        "mechanicus:fabricator-general": "mechanicus:fabricator-general",
-    }
-    marker = marker_fallbacks.get(target)
-    return get_marker_physical_pane(marker) if marker else None
-
-
-def check_api_reachable():
-    """Check if Token-API is reachable."""
-    data = api_get("/api/status")
-    return data is not None
+def check_tmuxctld_reachable() -> bool:
+    payload = http_json(f"{TMUXCTLD_URL}/health", timeout=2.0)
+    return bool(payload and payload.get("ok"))
 
 
 def check_dictation_state():
-    """Check dictation endpoint for voice_chat_instance."""
-    return api_get("/api/dictation")
+    return token_api_get("/api/dictation")
 
 
-def check_static_persona_route(
-    legion: str,
-    public_target: str,
-    db: sqlite3.Connection | None,
-    live_panes: set[str],
-) -> dict[str, object]:
-    """Check a Discord voice route backed by a static persona pane marker.
-
-    Verdict OK ⇔ the public tmuxctl target resolves to a live pane. DB data is supplementary
-    display only; stale/missing/synced=0 rows do not fail routing.
-    """
-    result = {
-        "legion": legion,
-        "instance_id": None,
-        "instance_status": None,
-        "synced": None,
-        "tmux_pane": None,
-        "pane_alive": False,
-        "voice_chat": False,
-        "last_activity": None,
-        "input_lock": None,
+def check_bot(bot_name: str) -> dict[str, object]:
+    result: dict[str, object] = {
+        "bot_name": bot_name,
+        "target_role": None,
+        "active_sessions": 0,
         "issues": [],
         "fixes": [],
         "verdict": "BROKEN",
     }
-
-    pane = get_tmuxctl_physical_pane(public_target)
-    if not pane:
-        result["issues"].append(f"No live pane for tmuxctl target {public_target}")
-        result["fixes"].append(
-            f"Launch/restore the persona pane: tmuxctl assert-instance --pane {public_target}"
-        )
+    target = tmuxctld_get("/voice/target", {"bot_name": bot_name})
+    if not target or not target.get("ok"):
+        message = (target or {}).get("error", {}).get("message") or "tmuxctld unavailable"
+        result["issues"].append(f"No semantic target: {message}")
+        if bot_name == "imperial_guard":
+            result["fixes"].append("Attach a routable operator client to a pane with a public @PANE_ID")
+        else:
+            result["fixes"].append(f"Restore the {bot_name} persona pane in the managed workspace")
         return result
 
-    result["tmux_pane"] = pane
-    # The marker came from the live pane list, so the pane is alive by construction.
-    result["pane_alive"] = pane in live_panes if live_panes else True
+    target_role = target["result"].get("target_role")
+    result["target_role"] = target_role
 
-    # DB row is supplementary display only; it never decides the target.
-    if db is not None:
-        cursor = db.cursor()
-        cursor.execute(
-            """SELECT id, status, (golden_throne = 'sync') AS synced, last_activity, input_lock
-               FROM instances
-               WHERE tmux_pane = ? AND status != 'stopped'
-               ORDER BY last_activity DESC LIMIT 1""",
-            (pane,),
-        )
-        row = cursor.fetchone()
-        if row:
-            result["instance_id"] = row["id"]
-            result["instance_status"] = row["status"]
-            result["synced"] = bool(row["synced"])
-            result["last_activity"] = row["last_activity"]
-            result["input_lock"] = row["input_lock"]
-            if row["input_lock"]:
-                result["issues"].append(f"Input lock held: {row['input_lock']}")
-                result["fixes"].append(
-                    f"Clear if stale: curl -X DELETE {API_URL}/api/instances/{row['id']}/input-lock"
-                )
-        else:
-            result["instance_status"] = "pane-only"
+    status = tmuxctld_get("/voice/status", {"bot_name": bot_name})
+    if not status or not status.get("ok"):
+        message = (status or {}).get("error", {}).get("message") or "tmuxctld unavailable"
+        result["issues"].append(f"Unable to read voice sessions: {message}")
+        return result
 
-    # Pane alive + marker present ⇒ OK; a held input lock is a non-fatal WARN.
-    result["verdict"] = "WARN" if result["issues"] else "OK"
+    sessions = status["result"].get("sessions") or []
+    result["active_sessions"] = len(sessions)
+
+    result["verdict"] = "OK"
     return result
 
 
-def check_custodes(db: sqlite3.Connection | None, live_panes: set[str]) -> dict[str, object]:
-    return check_static_persona_route("custodes", "3:0", db, live_panes)
-
-
-def check_legion(legion: str, db, live_panes: set):
-    """Check the full routing chain for a legion. Returns a diagnostic dict."""
-    if legion == "custodes":
-        return check_custodes(db, live_panes)
-    if legion == "mechanicus":
-        return check_static_persona_route(
-            "mechanicus", "4:0", db, live_panes
-        )
-
-    return {
-        "legion": legion,
-        "instance_id": None,
-        "instance_status": "unsupported",
-        "synced": None,
-        "tmux_pane": None,
-        "pane_alive": False,
-        "voice_chat": False,
-        "last_activity": None,
-        "input_lock": None,
-        "issues": [f"No static Discord voice route configured for {legion}"],
-        "fixes": [],
-        "verdict": "BROKEN",
-    }
-
-
-def print_table(results, dictation_data, api_ok):
-    """Print a formatted status table."""
-    # Header
+def print_table(results, dictation_data, tmuxctld_ok):
     print()
-    print(f"  Discord Routing Diagnostic")
-    print(f"  Token-API: {API_URL} {'[OK]' if api_ok else '[UNREACHABLE]'}")
+    print("  Discord Voice Routing Diagnostic")
+    print(f"  tmuxctld: {TMUXCTLD_URL} {'[OK]' if tmuxctld_ok else '[UNREACHABLE]'}")
     if dictation_data:
-        vc_inst = dictation_data.get("voice_chat_instance")
-        dictation_on = dictation_data.get("active", False)
-        print(
-            f"  Dictation: {'ON' if dictation_on else 'OFF'}"
-            f"  |  Voice-chat instance: {vc_inst or 'none'}"
-        )
+        print(f"  Dictation: {'ON' if dictation_data.get('active') else 'OFF'}")
     print()
-
-    # Table
-    cols = ["Legion", "Instance", "Status", "Pane", "Alive", "Voice", "Verdict"]
-    widths = [12, 14, 11, 8, 7, 7, 8]
-
-    header = "  ".join(c.ljust(w) for c, w in zip(cols, widths))
-    sep = "  ".join("-" * w for w in widths)
-    print(f"  {header}")
-    print(f"  {sep}")
-
-    for r in results:
-        inst = (r["instance_id"] or "-")[:14]
-        status = r["instance_status"] or "-"
-        pane = r["tmux_pane"] or "-"
-        alive = "yes" if r["pane_alive"] else "no"
-        voice = "yes" if r["voice_chat"] else "no"
-        verdict = r["verdict"]
-
+    cols = ["Bot", "Target Role", "Sessions", "Verdict"]
+    widths = [16, 32, 8, 8]
+    print("  " + "  ".join(c.ljust(w) for c, w in zip(cols, widths)))
+    print("  " + "  ".join("-" * w for w in widths))
+    for item in results:
         row = [
-            r["legion"].ljust(widths[0]),
-            inst.ljust(widths[1]),
-            status.ljust(widths[2]),
-            pane.ljust(widths[3]),
-            alive.ljust(widths[4]),
-            voice.ljust(widths[5]),
-            verdict.ljust(widths[6]),
+            str(item["bot_name"]).ljust(widths[0]),
+            str(item.get("target_role") or "-").ljust(widths[1]),
+            str(item.get("active_sessions") or 0).ljust(widths[2]),
+            str(item["verdict"]).ljust(widths[3]),
         ]
-        print(f"  {'  '.join(row)}")
-
+        print("  " + "  ".join(row))
     print()
-
-    # Issues and fixes
-    any_issues = False
-    for r in results:
-        if r["issues"]:
-            if not any_issues:
-                print("  Issues:")
-                any_issues = True
-            for issue in r["issues"]:
-                print(f"    [{r['legion']}] {issue}")
-
-    if any_issues:
+    issues = [(r["bot_name"], issue) for r in results for issue in r["issues"]]
+    if issues:
+        print("  Issues:")
+        for bot, issue in issues:
+            print(f"    [{bot}] {issue}")
         print()
-
-    any_fixes = False
-    for r in results:
-        if r["fixes"]:
-            if not any_fixes:
-                print("  Suggested fixes:")
-                any_fixes = True
-            for fix in r["fixes"]:
-                print(f"    [{r['legion']}] {fix}")
-
-    if any_fixes:
-        print()
-
-    if not any_issues:
+    else:
         print("  All routing chains healthy.")
         print()
 
 
-def main():
+def main() -> None:
     args = sys.argv[1:]
-
     if "-h" in args or "--help" in args:
         print(__doc__)
         return
-
     json_mode = "--json" in args
     fix_mode = "--fix" in args
 
-    # Run checks
-    api_ok = check_api_reachable()
+    tmuxctld_ok = check_tmuxctld_reachable()
     dictation_data = check_dictation_state()
-    db = get_db()
-    live_panes = get_live_panes()
-
-    results = []
-    for legion in ROUTABLE_LEGIONS:
-        results.append(check_legion(legion, db, live_panes))
-
-    if db:
-        db.close()
+    results = [check_bot(bot) for bot in ROUTABLE_BOTS]
 
     if json_mode:
-        output = {
-            "api_reachable": api_ok,
-            "api_url": API_URL,
+        print(json.dumps({
+            "tmuxctld_reachable": tmuxctld_ok,
+            "tmuxctld_url": TMUXCTLD_URL,
             "dictation": dictation_data,
-            "legions": results,
-        }
-        print(json.dumps(output, indent=2, default=str))
+            "bots": results,
+        }, indent=2))
         return
 
     if fix_mode:
-        any_fixes = False
-        for r in results:
-            for fix in r["fixes"]:
-                print(fix)
-                any_fixes = True
-        if not any_fixes:
+        fixes = [fix for item in results for fix in item["fixes"]]
+        if fixes:
+            print("\n".join(fixes))
+        else:
             print("No fixes needed — all routing chains healthy.")
         return
 
-    print_table(results, dictation_data, api_ok)
+    print_table(results, dictation_data, tmuxctld_ok)
 
 
 if __name__ == "__main__":

@@ -91,7 +91,7 @@ test('dropBot closes sessions and ignores late transcripts after VC leave', () =
   const ws = FakeWebSocket.instances[0];
   ws.emit('open');
   ws.emit('message', Buffer.from(JSON.stringify({ type: 'session.updated' })));
-  transcriber.commitUser('user-1', 'imperial_guard', { reason: 'leave', lockedTmuxPane: '%0' });
+  transcriber.commitUser('user-1', 'imperial_guard', { reason: 'leave', voice_session_id: 'vs-1' });
 
   assert.equal(transcriber.dropBot('imperial_guard'), 1);
   assert.equal(ws.closed, true);

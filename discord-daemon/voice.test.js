@@ -1,33 +1,36 @@
-// voice.test.js — pins tmux field parsing used by launchd-hosted voice routing.
+// voice.test.js — pins Discord-owned voice lifecycle behavior.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createVoiceManager, parseTmuxFields, TMUX_FIELD_SEP } from './voice.js';
+import { createVoiceManager } from './voice.js';
 
-test('tmux field parsing does not depend on literal tab output', () => {
-  const line = ['1780603214', '/dev/ttys024', 'main'].join(TMUX_FIELD_SEP);
+test('voice manager status exposes Discord-only routing state', () => {
+  const voiceManager = createVoiceManager(
+    {},
+    {
+      guild_id: 'guild',
+      operator_user_id: 'operator',
+      voice_channels: {
+        imperial_guard: 'cadia',
+      },
+    },
+    { debug() {}, info() {}, warn() {}, error() {} },
+  );
 
-  assert.deepEqual(parseTmuxFields(line), ['1780603214', '/dev/ttys024', 'main']);
-});
+  const status = voiceManager.getStatus('imperial_guard');
 
-test('tmux field parsing preserves literal tabs inside field values', () => {
-  const sessionName = 'main\twith-tab';
-  const line = ['1780603214', '/dev/ttys024', sessionName].join(TMUX_FIELD_SEP);
-
-  assert.deepEqual(parseTmuxFields(line), ['1780603214', '/dev/ttys024', sessionName]);
-});
-
-test('tmux field parsing handles the four-field paneInfo format', () => {
-  const fields = ['%42', 'main', 'nvim', '/Users/tokenclaw/project'];
-  const line = fields.join(TMUX_FIELD_SEP);
-
-  assert.deepEqual(parseTmuxFields(line), fields);
-});
-
-test('tmux field separator is explicit for launchd C-locale tmux calls', () => {
-  assert.equal(TMUX_FIELD_SEP.includes('\t'), false);
-  // Keep the separator visually distinct from path fragments such as pane_current_path values.
-  assert.equal(TMUX_FIELD_SEP.includes('_/'), false);
+  assert.deepEqual(Object.keys(status).sort(), [
+    'activeListeners',
+    'botName',
+    'channelId',
+    'connected',
+    'connectionState',
+    'listening',
+    'routeEpoch',
+  ]);
+  assert.equal(status.botName, 'imperial_guard');
+  assert.equal(status.connected, false);
+  assert.equal(status.activeListeners, 0);
 });
 
 test('VC hop runs old-channel leave cleanup before new-channel join routing', async () => {

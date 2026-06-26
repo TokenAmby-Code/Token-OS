@@ -40,6 +40,7 @@ import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -69,6 +70,9 @@ log = logging.getLogger("tmuxctld")
 
 _RAW_TMUX_ID_RX = re.compile(r"%\d+")
 _PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
+_VOICE_LIST_SEP = "__TMUXCTLD_VOICE_FIELD__"
+_VOICE_LOCK_OPTION = "@DISCORD_VOICE_LOCK"
+_VOICE_PROCESSING_OPTION = "@DISCORD_VOICE_PROCESSING"
 
 
 class PromptSubmitSniffer:
@@ -163,6 +167,95 @@ def _safe_public_role(role: str | None) -> str:
     if not value or _RAW_TMUX_ID_RX.search(value):
         return "unresolved"
     return value if _PUBLIC_PANE_ID_RX.fullmatch(value) else "unresolved"
+
+
+def _normalize_bot_name(bot_name: str | None) -> str:
+    return (bot_name or "unknown").strip().lower().replace("-", "_")
+
+
+def _voice_static_target(bot_name: str) -> str | None:
+    bot = _normalize_bot_name(bot_name)
+    if bot == "custodes":
+        return "council:custodes"
+    if bot in {"mechanicus", "fabricator_general", "fabricator-general", "fg"}:
+        return "mechanicus:fabricator-general"
+    return None
+
+
+@dataclass
+class VoiceSession:
+    """In-memory Discord voice draft state.
+
+    External callers only know ``voice_session_id`` and the public target role.
+    The raw tmux ``%`` id is intentionally not stored here; it can appear only
+    inside ``TmuxAdapter`` while executing a request.
+    """
+
+    voice_session_id: str
+    bot_name: str
+    user_id: str
+    channel_id: str
+    route_epoch: str
+    target_role: str
+    created_at: float = field(default_factory=time.time)
+    utterances: int = 0
+
+
+class VoiceSessionStore:
+    """Thread-safe process-local Discord voice draft registry."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._sessions: dict[str, VoiceSession] = {}
+
+    def put(self, session: VoiceSession) -> None:
+        with self._lock:
+            # One active voice draft per bot/user. Starting a new one replaces
+            # old in-memory state; the handler clears old pane options first.
+            for sid, existing in list(self._sessions.items()):
+                if existing.bot_name == session.bot_name and existing.user_id == session.user_id:
+                    del self._sessions[sid]
+            self._sessions[session.voice_session_id] = session
+
+    def get(self, voice_session_id: str) -> VoiceSession | None:
+        with self._lock:
+            return self._sessions.get(voice_session_id)
+
+    def update(self, session: VoiceSession) -> None:
+        with self._lock:
+            if session.voice_session_id not in self._sessions:
+                raise KeyError("voice session not found")
+            self._sessions[session.voice_session_id] = session
+
+    def matching(
+        self,
+        *,
+        voice_session_id: str = "",
+        bot_name: str = "",
+        user_id: str = "",
+    ) -> list[VoiceSession]:
+        bot = _normalize_bot_name(bot_name) if bot_name else ""
+        uid = str(user_id) if user_id else ""
+        with self._lock:
+            if voice_session_id:
+                item = self._sessions.get(voice_session_id)
+                return [item] if item else []
+            return [
+                item
+                for item in self._sessions.values()
+                if (not bot or item.bot_name == bot) and (not uid or item.user_id == uid)
+            ]
+
+    def remove(self, voice_session_id: str) -> VoiceSession | None:
+        with self._lock:
+            return self._sessions.pop(voice_session_id, None)
+
+    def list(self) -> list[VoiceSession]:
+        with self._lock:
+            return list(self._sessions.values())
+
+
+VOICE_SESSIONS = VoiceSessionStore()
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +1018,260 @@ def _h_instance_focus(control, params):
     )
 
 
+def _voice_session_payload(session: VoiceSession) -> dict:
+    return {
+        "voice_session_id": session.voice_session_id,
+        "bot_name": session.bot_name,
+        "user_id": session.user_id,
+        "channel_id": session.channel_id,
+        "route_epoch": session.route_epoch,
+        "target_role": session.target_role,
+        "created_at": session.created_at,
+        "utterances": session.utterances,
+    }
+
+
+def _voice_public_target_for_client(control: TmuxControlPlane, client_name: str) -> str:
+    raw = control.adapter.run(
+        "display-message",
+        "-c",
+        client_name,
+        "-p",
+        _VOICE_LIST_SEP.join(
+            [
+                "#{pane_id}",
+                "#{session_name}",
+                "#{pane_current_command}",
+                "#{pane_current_path}",
+                "#{@PANE_ID}",
+            ]
+        ),
+        allow_failure=True,
+    ).strip()
+    parts = raw.split(_VOICE_LIST_SEP)
+    if len(parts) != 5:
+        return ""
+    pane_id, session_name, _command, current_path, pane_role = parts
+    if not pane_id.startswith("%"):
+        return ""
+    if session_name == "discord-daemon" or session_name.startswith("tx_test_"):
+        return ""
+    if current_path.endswith("/runtimes/token-os/live/discord-daemon"):
+        return ""
+    role = _safe_public_role(pane_role)
+    if role == "unresolved":
+        return ""
+    # Force a full public resolution through tmuxctld. This proves the public
+    # role is routable now, but returns only the semantic role.
+    try:
+        resolved = _safe_public_role(control.public_pane_id(role))
+    except Exception:
+        return ""
+    return "" if resolved == "unresolved" else resolved
+
+
+def _voice_resolve_imperial_guard_target(control: TmuxControlPlane) -> str:
+    raw = control.adapter.run(
+        "list-clients",
+        "-F",
+        _VOICE_LIST_SEP.join(["#{client_activity}", "#{client_name}", "#{session_name}"]),
+        allow_failure=True,
+    )
+    clients: list[tuple[int, str]] = []
+    for line in raw.splitlines():
+        if not line:
+            continue
+        parts = line.split(_VOICE_LIST_SEP)
+        if len(parts) != 3:
+            continue
+        raw_activity, client_name, session_name = parts
+        if not client_name or session_name == "discord-daemon":
+            continue
+        try:
+            activity = int(raw_activity or "0")
+        except ValueError:
+            continue
+        clients.append((activity, client_name))
+    clients.sort(reverse=True)
+    for _activity, client_name in clients:
+        role = _voice_public_target_for_client(control, client_name)
+        if role:
+            return role
+    raise ValueError("no routable attached operator client target")
+
+
+def _voice_resolve_target(control: TmuxControlPlane, bot_name: str) -> str:
+    bot = _normalize_bot_name(bot_name)
+    if bot == "imperial_guard":
+        return _voice_resolve_imperial_guard_target(control)
+    target = _voice_static_target(bot)
+    if not target:
+        raise ValueError(f"no voice target policy for bot {bot!r}")
+    role = _safe_public_role(control.public_pane_id(target))
+    if role == "unresolved":
+        raise ValueError(f"voice target is not routable: {target}")
+    return role
+
+
+def _voice_set_option_best_effort(
+    control: TmuxControlPlane, target_role: str, option: str, value: str
+) -> None:
+    try:
+        control.adapter.run(
+            "set-option", "-p", "-t", target_role, option, value, allow_failure=True
+        )
+    except Exception:
+        pass
+
+
+def _voice_clear_options(control: TmuxControlPlane, target_role: str) -> None:
+    _voice_set_option_best_effort(control, target_role, _VOICE_PROCESSING_OPTION, "0")
+    _voice_set_option_best_effort(control, target_role, _VOICE_LOCK_OPTION, "0")
+
+
+def _voice_clear_sessions(
+    control: TmuxControlPlane,
+    *,
+    voice_session_id: str = "",
+    bot_name: str = "",
+    user_id: str = "",
+) -> list[dict]:
+    cleared: list[dict] = []
+    for session in VOICE_SESSIONS.matching(
+        voice_session_id=voice_session_id, bot_name=bot_name, user_id=user_id
+    ):
+        removed = VOICE_SESSIONS.remove(session.voice_session_id)
+        if not removed:
+            continue
+        _voice_clear_options(control, removed.target_role)
+        cleared.append(_voice_session_payload(removed))
+    return cleared
+
+
+def _h_voice_start(control, params):
+    bot_name = _normalize_bot_name(_s(params, "bot_name", "voice"))
+    user_id = _s(params, "user_id")
+    if not user_id:
+        raise ValueError("user_id required")
+    channel_id = _s(params, "channel_id")
+    route_epoch = _s(params, "route_epoch")
+    # Replace any existing draft for this bot/user and release its lock before
+    # acquiring the new route.
+    _voice_clear_sessions(control, bot_name=bot_name, user_id=user_id)
+    target_role = _voice_resolve_target(control, bot_name)
+    session = VoiceSession(
+        voice_session_id=uuid.uuid4().hex,
+        bot_name=bot_name,
+        user_id=user_id,
+        channel_id=channel_id,
+        route_epoch=route_epoch,
+        target_role=target_role,
+    )
+    VOICE_SESSIONS.put(session)
+    _voice_set_option_best_effort(control, target_role, _VOICE_LOCK_OPTION, "1")
+    _voice_set_option_best_effort(control, target_role, _VOICE_PROCESSING_OPTION, "0")
+    return {
+        "voice_session_id": session.voice_session_id,
+        "target_role": session.target_role,
+    }
+
+
+def _require_voice_session(params) -> VoiceSession:
+    voice_session_id = _s(params, "voice_session_id")
+    if not voice_session_id:
+        raise ValueError("voice_session_id required")
+    session = VOICE_SESSIONS.get(voice_session_id)
+    if not session:
+        raise KeyError("voice session not found")
+    return session
+
+
+def _h_voice_append(control, params):
+    session = _require_voice_session(params)
+    text = _s(params, "text").strip()
+    if not text:
+        return {"inserted": False, "reason": "empty", "target_role": session.target_role}
+    segment = f" {text}" if session.utterances else text
+    try:
+        _voice_set_option_best_effort(control, session.target_role, _VOICE_PROCESSING_OPTION, "1")
+        control.send_text(session.target_role, segment, submit=False)
+    finally:
+        _voice_set_option_best_effort(control, session.target_role, _VOICE_PROCESSING_OPTION, "0")
+    session.utterances += 1
+    VOICE_SESSIONS.update(session)
+    return {"inserted": True, "target_role": session.target_role, "utterances": session.utterances}
+
+
+def _h_voice_ship(control, params):
+    session = _require_voice_session(params)
+    text = _s(params, "text").strip()
+    if text:
+        _h_voice_append(control, {"voice_session_id": session.voice_session_id, "text": text})
+        session = _require_voice_session({"voice_session_id": session.voice_session_id})
+    try:
+        _voice_set_option_best_effort(control, session.target_role, _VOICE_PROCESSING_OPTION, "1")
+        control.adapter.send_keys(session.target_role, "Enter")
+    finally:
+        _voice_set_option_best_effort(control, session.target_role, _VOICE_PROCESSING_OPTION, "0")
+        removed = VOICE_SESSIONS.remove(session.voice_session_id)
+        if removed:
+            _voice_clear_options(control, removed.target_role)
+    return {"shipped": True, "target_role": session.target_role}
+
+
+def _h_voice_scratch(control, params):
+    session = _require_voice_session(params)
+    try:
+        control.adapter.send_keys(session.target_role, "C-c")
+    finally:
+        removed = VOICE_SESSIONS.remove(session.voice_session_id)
+        if removed:
+            _voice_clear_options(control, removed.target_role)
+    return {"scratched": True, "target_role": session.target_role}
+
+
+def _h_voice_clear(control, params):
+    bot_name = _s(params, "bot_name")
+    cleared = _voice_clear_sessions(
+        control,
+        voice_session_id=_s(params, "voice_session_id"),
+        bot_name=bot_name,
+        user_id=_s(params, "user_id"),
+    )
+    cleared_options = False
+    # Startup/leave cleanup must also clear stale pane status left by a prior
+    # Discord/tmuxctld process. If there is no in-memory session but a bot owner
+    # was supplied, resolve that bot's semantic target now and clear the public
+    # role's voice options. No DB, no physical id, no fallback target.
+    if not cleared and bot_name:
+        try:
+            target_role = _voice_resolve_target(control, bot_name)
+            _voice_clear_options(control, target_role)
+            cleared_options = True
+        except Exception:
+            cleared_options = False
+    return {"cleared": len(cleared), "sessions": cleared, "cleared_options": cleared_options}
+
+
+def _h_voice_status(control, params):
+    return {
+        "sessions": [
+            _voice_session_payload(session)
+            for session in VOICE_SESSIONS.matching(
+                voice_session_id=_s(params, "voice_session_id"),
+                bot_name=_s(params, "bot_name"),
+                user_id=_s(params, "user_id"),
+            )
+        ]
+    }
+
+
+def _h_voice_target(control, params):
+    bot_name = _normalize_bot_name(_s(params, "bot_name", "voice"))
+    target_role = _voice_resolve_target(control, bot_name)
+    return {"bot_name": bot_name, "target_role": target_role}
+
+
 RouteHandler = Callable[["TmuxControlPlane", dict], object]
 
 ROUTES: dict[tuple[str, str], RouteHandler] = {
@@ -993,6 +1340,14 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/instance/tint"): _h_instance_tint,
     ("POST", "/instance/clear-tint"): _h_instance_clear_tint,
     ("POST", "/instance/focus"): _h_instance_focus,
+    # Discord voice session API (semantic boundary; no raw physical panes)
+    ("POST", "/voice/session/start"): _h_voice_start,
+    ("POST", "/voice/session/append"): _h_voice_append,
+    ("POST", "/voice/session/ship"): _h_voice_ship,
+    ("POST", "/voice/session/scratch"): _h_voice_scratch,
+    ("POST", "/voice/session/clear"): _h_voice_clear,
+    ("GET", "/voice/status"): _h_voice_status,
+    ("GET", "/voice/target"): _h_voice_target,
 }
 
 

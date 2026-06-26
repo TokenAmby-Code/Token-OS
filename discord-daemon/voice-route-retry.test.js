@@ -6,14 +6,15 @@ import {
   routeVoiceTranscriptWithRetry,
 } from './voice-route-retry.js';
 
-test('retry predicate recognizes tmux route failures', () => {
+test('retry predicate recognizes voice route failures', () => {
   assert.equal(isRetryableVoiceRouteFailure({ routed: false, reason: 'no_target' }), true);
-  assert.equal(isRetryableVoiceRouteFailure(new Error('target not live: %9')), true);
-  assert.equal(isRetryableVoiceRouteFailure(new Error('Command failed: tmux-dictate')), true);
+  assert.equal(isRetryableVoiceRouteFailure({ routed: false, reason: 'voice_session_not_found' }), true);
+  assert.equal(isRetryableVoiceRouteFailure(new Error('target not live')), true);
+  assert.equal(isRetryableVoiceRouteFailure(new Error('voice session not found')), true);
   assert.equal(isRetryableVoiceRouteFailure({ routed: false, reason: 'no_draft' }), false);
 });
 
-test('route wrapper warns once and does not retry tmux lag failures', async () => {
+test('route wrapper warns once and does not retry route failures', async () => {
   const calls = [];
   const tts = [];
   const router = {
@@ -32,16 +33,15 @@ test('route wrapper warns once and does not retry tmux lag failures', async () =
   });
 
   assert.equal(calls.length, 1);
-  assert.deepEqual(tts, ['tmux lagging']);
+  assert.deepEqual(tts, ['voice route failed']);
   assert.equal(result.routed, false);
   assert.equal(result.reason, 'no_target');
   assert.equal(result.attempts, 1);
   assert.equal(result.warning_sent, true);
   assert.equal(result.retry_disabled, true);
-  assert.equal(result.tmux_lag, true);
 });
 
-test('route wrapper warns once and does not retry thrown tmux errors', async () => {
+test('route wrapper warns once and does not retry thrown route errors', async () => {
   let calls = 0;
   const tts = [];
   await assert.rejects(
@@ -49,7 +49,7 @@ test('route wrapper warns once and does not retry thrown tmux errors', async () 
       router: {
         async route() {
           calls += 1;
-          throw new Error('tmux timed out');
+          throw new Error('route timed out');
         },
       },
       voiceManager: { playTTS: async msg => tts.push(msg) },
@@ -62,12 +62,11 @@ test('route wrapper warns once and does not retry thrown tmux errors', async () 
       assert.equal(err.attempts, 1);
       assert.equal(err.warning_sent, true);
       assert.equal(err.retry_disabled, true);
-      assert.equal(err.tmux_lag, true);
       return true;
     }
   );
   assert.equal(calls, 1);
-  assert.deepEqual(tts, ['tmux lagging']);
+  assert.deepEqual(tts, ['voice route failed']);
 });
 
 test('route wrapper does not retry non-retryable command states', async () => {

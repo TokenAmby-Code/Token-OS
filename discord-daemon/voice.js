@@ -15,32 +15,45 @@ import {
 import { mkdirSync, existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { Transform } from 'stream';
-import { execFile, execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { Events } from 'discord.js';
+import { tmuxctldClient } from './tmuxctld-client.js';
 import prism from 'prism-media';
 
 const execFileAsync = promisify(execFile);
 
 const AUDIO_DIR = join(process.env.HOME || '/tmp', '.discord-cli', 'audio');
 mkdirSync(AUDIO_DIR, { recursive: true });
-export const TMUX_FIELD_SEP = '__TOKEN_DISCORD_FIELD__';
-
-/**
- * Split tmux output fields using the daemon-owned separator.
- * Null or undefined input is treated as an empty string and returns [''].
- *
- * @param {string | null | undefined} line
- * @returns {string[]}
- */
-export function parseTmuxFields(line) {
-  return String(line || '').split(TMUX_FIELD_SEP);
-}
 
 function normalizeBotName(botName) {
   return String(botName || 'unknown').trim().toLowerCase().replaceAll('-', '_');
 }
 
+/**
+ * @typedef {object} VoiceManager
+ * @property {function(string, string=): Promise<object>} joinChannel
+ * @property {function(string=, string=): Promise<object>} leaveChannel
+ * @property {function(string=): object} startListening
+ * @property {function(string=): object} stopListening
+ * @property {function(string=): object} getStatus
+ * @property {function(): void} setupAutoJoin
+ * @property {function(string, string=): Promise<object>} playAudio
+ * @property {function(string=): object} stopPlayback
+ * @property {function(string, string=, object=): Promise<object>} playTTS
+ * @property {function(string=, string=, string=): object} clearLocalVoiceSession
+ * @property {function(string, string=, number=): Promise<object>} muteMember
+ * @property {function(string, string=): Promise<object>} unmuteMember
+ * @property {function(function): void} setAudioFrameCallback
+ * @property {function(function): void} setAudioEndCallback
+ * @property {function(function): void} setAudioCommitCallback
+ * @property {function(function): void} setVoiceLeaveCallback
+ * @property {function(string=): Promise<object>} reconcileOperatorVoiceState
+ */
+
+/**
+ * @returns {VoiceManager}
+ */
 export function createVoiceManager(botClients, config, logger) {
   const guildId = config.guild_id;
   const operatorUserId = config.operator_user_id;
@@ -53,124 +66,6 @@ export function createVoiceManager(botClients, config, logger) {
   // Collect all bot user IDs to filter out of audio capture (prevent ouroboros)
   // Populated lazily after bots connect
   const botUserIds = new Set();
-
-
-  function tmuxExecOptions(extra = {}) {
-    // The daemon runs inside its own tmux pane. If TMUX is inherited, tmux
-    // client-scoped queries such as `display-message -c /dev/ttys000` can be
-    // evaluated against the daemon's pane instead of the human client. Route
-    // discovery must query the server as an external client.
-    const { TMUX, ...env } = process.env;
-    return { ...extra, env };
-  }
-
-  function paneInfo(pane) {
-    if (!pane?.startsWith?.('%')) return null;
-    try {
-      const raw = execFileSync('tmux', [
-        'display-message',
-        '-t',
-        pane,
-        '-p',
-        `#{pane_id}${TMUX_FIELD_SEP}#{session_name}${TMUX_FIELD_SEP}#{pane_current_command}${TMUX_FIELD_SEP}#{pane_current_path}`,
-      ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 })).trim();
-      const [paneId, sessionName, command, currentPath] = parseTmuxFields(raw);
-      if (paneId !== pane) return null;
-      return { paneId, sessionName, command, currentPath };
-    } catch {
-      return null;
-    }
-  }
-
-  function isRoutablePane(pane) {
-    const info = paneInfo(pane);
-    if (!info) return false;
-    if (info.sessionName === 'discord-daemon') return false;
-    if (info.sessionName?.startsWith?.('tx_test_')) return false;
-    if ((info.currentPath || '').endsWith('/runtimes/token-os/live/discord-daemon')) return false;
-    return true;
-  }
-
-  function resolveFallbackTmuxPane() {
-    try {
-      const windowsOut = execFileSync('tmux', [
-        'list-windows',
-        '-a',
-        '-F',
-        `#{session_name}${TMUX_FIELD_SEP}#{window_active}${TMUX_FIELD_SEP}#{window_index}${TMUX_FIELD_SEP}#{pane_id}`,
-      ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 }));
-
-      const candidates = [];
-      for (const line of windowsOut.split(/\r?\n/)) {
-        if (!line) continue;
-        const [sessionName, rawActive, rawIndex, pane] = parseTmuxFields(line);
-        if (!pane?.startsWith?.('%')) continue;
-        if (sessionName === 'discord-daemon' || sessionName?.startsWith?.('tx_test_')) continue;
-        if (!isRoutablePane(pane)) continue;
-        const active = rawActive === '1' ? 1 : 0;
-        const index = Number.parseInt(rawIndex || '9999', 10);
-        candidates.push({ sessionName, pane, active, index: Number.isFinite(index) ? index : 9999 });
-      }
-
-      candidates.sort((a, b) => {
-        if (a.sessionName === 'main' && b.sessionName !== 'main') return -1;
-        if (b.sessionName === 'main' && a.sessionName !== 'main') return 1;
-        if (b.active !== a.active) return b.active - a.active;
-        return a.index - b.index;
-      });
-
-      if (candidates.length > 0) {
-        const chosen = candidates[0];
-        logger.warn(`Voice: falling back to active ${chosen.sessionName} pane ${chosen.pane}`);
-        return chosen.pane;
-      }
-    } catch (err) {
-      logger.warn(`Voice: fallback tmux pane resolve failed: ${err.message}`);
-    }
-    return null;
-  }
-
-  function resolveSelectedTmuxPane() {
-    try {
-      const clientsOut = execFileSync('tmux', [
-        'list-clients',
-        '-F',
-        `#{client_activity}${TMUX_FIELD_SEP}#{client_name}${TMUX_FIELD_SEP}#{session_name}`,
-      ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 }));
-
-      const clients = [];
-      for (const line of clientsOut.split(/\r?\n/)) {
-        if (!line) continue;
-        const [rawActivity, clientName, sessionName] = parseTmuxFields(line);
-        const activity = Number.parseInt(rawActivity || '0', 10);
-        if (clientName && Number.isFinite(activity) && sessionName !== 'discord-daemon') {
-          clients.push({ clientName, sessionName, activity });
-        }
-      }
-      clients.sort((a, b) => b.activity - a.activity);
-
-      for (const client of clients) {
-        const pane = execFileSync('tmux', [
-          'display-message',
-          '-c',
-          client.clientName,
-          '-p',
-          '#{pane_id}',
-        ], tmuxExecOptions({ encoding: 'utf8', timeout: 5000 })).trim();
-        if (isRoutablePane(pane)) {
-          logger.info(`Voice: selected tmux client ${client.clientName} (${client.sessionName}) pane ${pane}`);
-          return pane;
-        }
-        logger.warn(`Voice: selected pane ${pane || '?'} from client ${client.clientName} is not routable`);
-      }
-
-      logger.warn('Voice: no routable attached tmux client pane found');
-      return resolveFallbackTmuxPane();
-    } catch (err) {
-      logger.warn(`Voice: selected tmux pane resolve failed: ${err.message}`);
-      return resolveFallbackTmuxPane();
-    }
-  }
 
   function refreshBotUserIds() {
     for (const client of Object.values(botClients)) {
@@ -337,14 +232,18 @@ export function createVoiceManager(botClients, config, logger) {
     let hasAudioSinceCommit = false;
     let bytesSinceCommit = 0;
     let silenceTimer = null;
-    let lockedTmuxPane = null;
+    let voiceSessionId = null;
+    let voiceSessionStartInFlight = false;
+    let voiceSessionGeneration = 0;
+    let pendingCommitRequest = null;
+    let discarded = false;
     let suppressEndClose = false;
 
     function currentRouteMeta(extra = {}) {
       return {
         routeEpoch: state.routeEpoch,
         channelId: state.channelId,
-        lockedTmuxPane,
+        voice_session_id: voiceSessionId,
         ...extra,
       };
     }
@@ -359,6 +258,14 @@ export function createVoiceManager(botClients, config, logger) {
         clearTimeout(silenceTimer);
         silenceTimer = null;
       }
+      if (voiceSessionStartInFlight) {
+        pendingCommitRequest = { reason, extra };
+        logger.debug?.(
+          `Voice [${botName}]: deferring realtime audio commit from ${userId} ` +
+          `until voice session start completes (reason=${reason})`
+        );
+        return true;
+      }
       if (!hasAudioSinceCommit) return false;
       const audioMs = downsampledDurationMs(bytesSinceCommit);
       if (audioMs < MIN_LOCAL_COMMIT_AUDIO_MS) {
@@ -368,7 +275,6 @@ export function createVoiceManager(botClients, config, logger) {
         );
         hasAudioSinceCommit = false;
         bytesSinceCommit = 0;
-        lockedTmuxPane = null;
         return false;
       }
       logger.info(`Voice [${botName}]: committing realtime audio from ${userId} (${bytesSinceCommit} bytes, reason=${reason})`);
@@ -377,7 +283,6 @@ export function createVoiceManager(botClients, config, logger) {
       }
       hasAudioSinceCommit = false;
       bytesSinceCommit = 0;
-      lockedTmuxPane = null;
       return true;
     }
 
@@ -389,7 +294,21 @@ export function createVoiceManager(botClients, config, logger) {
       }
       hasAudioSinceCommit = false;
       bytesSinceCommit = 0;
-      lockedTmuxPane = null;
+      voiceSessionId = null;
+      voiceSessionStartInFlight = false;
+      voiceSessionGeneration += 1;
+      pendingCommitRequest = null;
+      discarded = true;
+    }
+
+    function clearLocalVoiceSession(expectedVoiceSessionId = '') {
+      if (expectedVoiceSessionId && voiceSessionId && voiceSessionId !== expectedVoiceSessionId) {
+        return false;
+      }
+      if (!voiceSessionId && !voiceSessionStartInFlight) return false;
+      voiceSessionId = null;
+      voiceSessionGeneration += 1;
+      return true;
     }
 
     function startSilenceTimer() {
@@ -409,20 +328,47 @@ export function createVoiceManager(botClients, config, logger) {
     });
 
     decoder.on('data', (chunk) => {
-      // First real audio frame of a local utterance: only Cadia/Imperial Guard
-      // owns active-pane locks. Static persona bots must never receive or fall
-      // back to this Cadia pane.
-      if (!hasAudioSinceCommit) {
-        if (normalizeBotName(botName) === 'imperial_guard') {
-          lockedTmuxPane = resolveSelectedTmuxPane();
-          if (lockedTmuxPane) {
-            logger.info(`Voice [${botName}]: locked selected tmux pane ${lockedTmuxPane} for user ${userId}`);
-          } else {
-            logger.warn(`Voice [${botName}]: no selected tmux pane lock for user ${userId}`);
+      if (discarded) return;
+      // First real audio frame of a local utterance: tmuxctld creates the
+      // semantic voice session. Discord carries only the opaque session id.
+      if (!hasAudioSinceCommit && !voiceSessionId && !voiceSessionStartInFlight) {
+        const startGeneration = voiceSessionGeneration + 1;
+        voiceSessionGeneration = startGeneration;
+        voiceSessionStartInFlight = true;
+        tmuxctldClient.startVoiceSession({
+          botName: normalizeBotName(botName),
+          userId,
+          channelId: state.channelId,
+          routeEpoch: state.routeEpoch,
+        }).then((started) => {
+          if (discarded || voiceSessionGeneration !== startGeneration) {
+            const staleId = started.voice_session_id || '';
+            if (staleId) {
+              tmuxctldClient.clearVoiceSession({ voiceSessionId: staleId }).catch(() => {});
+            }
+            return;
           }
-        } else {
-          lockedTmuxPane = null;
-        }
+          voiceSessionId = started.voice_session_id || null;
+          logger.info(`Voice [${botName}]: started voice session ${voiceSessionId || 'none'} for user ${userId}`);
+        }).catch((err) => {
+          if (discarded || voiceSessionGeneration !== startGeneration) return;
+          logger.warn(`Voice [${botName}]: voice session start failed for user ${userId}: ${err.code || err.message}`);
+        }).finally(() => {
+          if (!discarded) {
+            voiceSessionStartInFlight = false;
+            if (!voiceSessionId) {
+              pendingCommitRequest = null;
+              hasAudioSinceCommit = false;
+              bytesSinceCommit = 0;
+              return;
+            }
+            const pending = pendingCommitRequest;
+            pendingCommitRequest = null;
+            if (pending && hasAudioSinceCommit) {
+              commitPending(pending.reason, pending.extra);
+            }
+          }
+        });
       }
 
       if (onAudioFrame) {
@@ -465,7 +411,21 @@ export function createVoiceManager(botClients, config, logger) {
       }
     });
 
-    state.activeSubscriptions.set(userId, { stream: audioStream, decoder, commit: commitPending, discard: discardPending });
+    state.activeSubscriptions.set(userId, {
+      stream: audioStream,
+      decoder,
+      commit: commitPending,
+      discard: discardPending,
+      clearVoiceSession: clearLocalVoiceSession,
+    });
+  }
+
+  function clearLocalVoiceSession(botName = 'mechanicus', userId = '', voiceSessionId = '') {
+    const state = getBotState(botName);
+    const sub = state.activeSubscriptions.get(String(userId || ''));
+    if (!sub?.clearVoiceSession) return { cleared: false, reason: 'no_subscription', botName, userId };
+    const cleared = sub.clearVoiceSession(String(voiceSessionId || ''));
+    return { cleared, botName, userId, voiceSessionId };
   }
 
   async function runVoiceLeaveCleanup(botName, meta = {}) {
@@ -1045,6 +1005,7 @@ export function createVoiceManager(botClients, config, logger) {
     playAudio,
     stopPlayback,
     playTTS,
+    clearLocalVoiceSession,
     muteMember,
     unmuteMember,
     setAudioFrameCallback(cb) { onAudioFrame = cb; },

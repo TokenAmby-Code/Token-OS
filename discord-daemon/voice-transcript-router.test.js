@@ -3,324 +3,240 @@ import assert from 'node:assert/strict';
 
 import {
   createVoiceTranscriptRouter,
-  defaultVoiceTargetForBot,
   normalizeVoiceCommand,
   parseVoiceCommand,
-  resolveStaticVoiceTargetToPane,
-  selectInitialVoiceTarget,
 } from './voice-transcript-router.js';
 
-
-test('Custodes static resolver uses main:3 marker even when other panes exist', () => {
-  const calls = [];
-  const execSync = (cmd, args) => {
-    calls.push([cmd, args]);
-    assert.equal(cmd, 'tmux');
-    assert.equal(args[0], 'list-panes');
-    return [
-      'main|3|1|%8|',
-      'main|3|0|%9|council:custodes',
-      'main|1|0|%42|imperial_guard:cadia',
-    ].join('\n');
-  };
-
-  const pane = resolveStaticVoiceTargetToPane('3:0', {
-    execSync,
-    paneExistsFn: p => p === '%9' || p === '%8' || p === '%42',
-  });
-
-  assert.equal(pane, '%9');
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][1][3], '#{session_name}|#{window_index}|#{pane_index}|#{pane_id}|#{@PANE_ID}');
-});
-
-test('Mechanicus static resolver uses main:4 Fabricator-General marker', () => {
-  const pane = resolveStaticVoiceTargetToPane('4:0', {
-    execSync: () => [
-      'main|4|2|%10|',
-      'main|4|0|%11|mechanicus:fabricator-general',
-      'main|3|0|%9|council:custodes',
-    ].join('\n'),
-    paneExistsFn: () => true,
-  });
-
-  assert.equal(pane, '%11');
-});
-
-test('static resolver falls back only to first live pane in persona window', () => {
-  const pane = resolveStaticVoiceTargetToPane('3:0', {
-    execSync: () => [
-      'main|1|0|%42|imperial_guard:cadia',
-      'main|3|1|%8|',
-      'main|3|0|%9|wrong-marker',
-    ].join('\n'),
-    paneExistsFn: p => p === '%8',
-  });
-
-  assert.equal(pane, '%8');
-});
-
-test('static resolver reads via the local tmux binary, not the NAS guard wrapper', () => {
-  // The hot-path spawn must prefer /opt/homebrew/bin over the SMB-hosted
-  // cli-tools/bin wrapper. When that wrapper is first on PATH and the NAS
-  // stalls, the spawn times out (ETIMEDOUT) and the transcript is dropped.
-  let seenPath = '';
-  resolveStaticVoiceTargetToPane('3:0', {
-    execSync: (_cmd, _args, opts) => {
-      seenPath = opts?.env?.PATH || '';
-      return 'main|3|0|%9|council:custodes';
+function fakeClient(ops) {
+  let seq = 0;
+  return {
+    async startVoiceSession({ botName, userId, channelId, routeEpoch }) {
+      const id = `vs-${++seq}`;
+      ops.push(['start', { botName, userId, channelId, routeEpoch, id }]);
+      return { voice_session_id: id, target_role: botName === 'custodes' ? 'council:custodes' : 'palace:E' };
     },
-    paneExistsFn: () => true,
-  });
+    async appendVoiceSession({ voiceSessionId, text }) {
+      ops.push(['append', voiceSessionId, text]);
+      return { inserted: true, target_role: 'palace:E', utterances: ops.filter(op => op[0] === 'append').length };
+    },
+    async shipVoiceSession({ voiceSessionId, text }) {
+      ops.push(['ship', voiceSessionId, text]);
+      return { shipped: true, target_role: 'palace:E' };
+    },
+    async scratchVoiceSession({ voiceSessionId }) {
+      ops.push(['scratch', voiceSessionId]);
+      return { scratched: true, target_role: 'palace:E' };
+    },
+    async clearVoiceSession(args) {
+      ops.push(['clear', args]);
+      return { cleared: 1, sessions: [] };
+    },
+  };
+}
 
-  const brew = seenPath.indexOf('/opt/homebrew/bin');
-  const nas = seenPath.indexOf('cli-tools/bin');
-  assert.ok(brew >= 0, `resolution PATH must include the local tmux dir: ${seenPath}`);
-  assert.ok(
-    nas === -1 || brew < nas,
-    `resolution PATH must prefer local tmux over the NAS wrapper: ${seenPath}`,
-  );
-});
-
-test('persona bots use stable tmuxctl public targets, not physical pane ids', () => {
-  assert.equal(defaultVoiceTargetForBot('custodes'), '3:0');
-  assert.equal(defaultVoiceTargetForBot('mechanicus'), '4:0');
-  assert.equal(defaultVoiceTargetForBot('fabricator-general'), '4:0');
-  assert.equal(defaultVoiceTargetForBot('fg'), '4:0');
-});
-
-test('persona initial targets ignore Cadia active-pane locks', () => {
-  assert.equal(selectInitialVoiceTarget('custodes', '%99'), '3:0');
-  assert.equal(selectInitialVoiceTarget('mechanicus', '%99'), '4:0');
-  assert.equal(selectInitialVoiceTarget('fabricator-general', '%99'), '4:0');
-  assert.equal(selectInitialVoiceTarget('imperial_guard', '%99'), '%99');
-});
-
-test('unavailable persona static target fails instead of falling back to locked pane', async () => {
-  const router = createVoiceTranscriptRouter({
-    logger: { warn() {}, info() {} },
-    resolveTargetToPane() { return null; },
-  });
-
-  const result = await router.route({
-    botName: 'custodes',
-    userId: 'u1',
-    text: 'hello Terra',
-    lockedTmuxPane: '%99',
-  });
-
-  assert.deepEqual(result, { routed: false, reason: 'no_target' });
-});
-
-test('Imperial Guard clear restores Cadia overlay ownership for its own draft', async () => {
+test('router starts a tmuxctld voice session and appends transcript text', async () => {
   const ops = [];
   const router = createVoiceTranscriptRouter({
     logger: { warn() {}, info() {} },
-    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue() { return 'old-title'; },
-    async setPaneTitle(target, title) { ops.push(['title', target, title]); },
-    async setPaneOption(target, option, value) { ops.push(['option', target, option, value]); },
-    async typeIntoTarget(target, text) { ops.push(['type', target, text]); },
-    lockedPaneTarget(result) { return result.lockedTmuxPane; },
+    client: fakeClient(ops),
   });
 
-  const first = await router.route({
+  const result = await router.route({
     botName: 'imperial_guard',
     userId: 'u1',
     text: 'hold this draft',
-    lockedTmuxPane: '%42',
+    channelId: 'cadia',
+    routeEpoch: 3,
   });
-  assert.equal(first.routed, true);
 
-  const cleared = await router.clear({ bot: 'imperial_guard' });
-  assert.equal(cleared.length, 1);
-
+  assert.equal(result.routed, true);
+  assert.equal(result.voice_session_id, 'vs-1');
   assert.deepEqual(ops, [
-    ['title', '%42', 'IG🔒 old-title'],
-    ['option', '%42', '@DISCORD_VOICE_LOCK', '1'],
-    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
-    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '1'],
-    ['type', '%42', 'hold this draft'],
-    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
-    ['title', '%42', 'old-title'],
-    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
-    ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
+    ['start', { botName: 'imperial_guard', userId: 'u1', channelId: 'cadia', routeEpoch: 3, id: 'vs-1' }],
+    ['append', 'vs-1', 'hold this draft'],
   ]);
 });
 
-
-test('Imperial Guard cleanup clears voice lock even if processing clear fails', async () => {
+test('router uses a voice_session_id created by voice manager without physical pane state', async () => {
   const ops = [];
-  let clearing = false;
-  const router = createVoiceTranscriptRouter({
-    logger: { warn() {}, info() {} },
-    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue() { return 'old-title'; },
-    async setPaneTitle() {},
-    async setPaneOption(target, option, value) {
-      ops.push(['option', target, option, value]);
-      if (clearing && option === '@DISCORD_VOICE_PROCESSING') throw new Error('processing clear failed');
-    },
-    async typeIntoTarget() {},
-    lockedPaneTarget(result) { return result.lockedTmuxPane; },
-  });
-
-  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft', lockedTmuxPane: '%42' });
-  clearing = true;
-  const cleared = await router.clear({ bot: 'imperial_guard' });
-
-  assert.equal(cleared.length, 1);
-  assert.deepEqual(ops.slice(-2), [
-    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
-    ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
-  ]);
-});
-
-test('a flaky processing-flag write never blocks transcript delivery', async () => {
-  const typed = [];
-  const router = createVoiceTranscriptRouter({
-    logger: { warn() {}, info() {} },
-    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue() { return 'old-title'; },
-    async setPaneTitle() {},
-    async setPaneOption(_target, option) {
-      // Lock acquire works; only the cosmetic processing edges flake.
-      if (option === '@DISCORD_VOICE_PROCESSING') throw new Error('set-option flaked');
-    },
-    async typeIntoTarget(target, text) { typed.push([target, text]); },
-    lockedPaneTarget(result) { return result.lockedTmuxPane; },
-  });
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client: fakeClient(ops) });
 
   const result = await router.route({
     botName: 'imperial_guard',
     userId: 'u1',
-    text: 'must still land',
-    lockedTmuxPane: '%42',
+    text: 'already locked',
+    voice_session_id: 'opaque-1',
   });
 
   assert.equal(result.routed, true);
-  assert.deepEqual(typed, [['%42', 'must still land']]);
-  assert.equal(router.listDrafts().length, 1);
+  assert.equal(result.voice_session_id, 'opaque-1');
+  assert.deepEqual(ops, [['append', 'opaque-1', 'already locked']]);
 });
 
-test('voice processing flag is cleared even when typing into the pane fails', async () => {
+test('stale voice_session_id is replaced through tmuxctld without fallback routing', async () => {
   const ops = [];
-  const router = createVoiceTranscriptRouter({
-    logger: { warn() {}, info() {} },
-    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue() { return 'old-title'; },
-    async setPaneTitle() {},
-    async setPaneOption(target, option, value) { ops.push(['option', target, option, value]); },
-    async typeIntoTarget() { throw new Error('pane write failed'); },
-    lockedPaneTarget(result) { return result.lockedTmuxPane; },
+  let failed = false;
+  const client = fakeClient(ops);
+  const originalAppend = client.appendVoiceSession;
+  client.appendVoiceSession = async (args) => {
+    if (!failed && args.voiceSessionId === 'stale-1') {
+      failed = true;
+      const err = new Error('voice session not found');
+      err.code = 'KeyError';
+      throw err;
+    }
+    return originalAppend(args);
+  };
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client });
+
+  const result = await router.route({
+    botName: 'imperial_guard',
+    userId: 'u1',
+    text: 'new words',
+    voice_session_id: 'stale-1',
   });
 
-  await assert.rejects(
-    router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft', lockedTmuxPane: '%42' }),
-    /pane write failed/
-  );
-
-  // First-utterance failure tears the draft down: processing cleared, lock released.
-  assert.deepEqual(router.listDrafts(), []);
-  assert.deepEqual(ops.slice(-3), [
-    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
-    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
-    ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
+  assert.equal(result.routed, true);
+  assert.equal(result.voice_session_id, 'vs-1');
+  assert.deepEqual(ops, [
+    ['start', { botName: 'imperial_guard', userId: 'u1', channelId: '', routeEpoch: '', id: 'vs-1' }],
+    ['append', 'vs-1', 'new words'],
   ]);
 });
 
-test('clearing a persona bot leaves Cadia drafts intact', async () => {
-  const typed = [];
+test('ship appends optional final text then submits through tmuxctld', async () => {
+  const ops = [];
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client: fakeClient(ops) });
+
+  await router.route({ botName: 'custodes', userId: 'u1', text: 'draft one' });
+  const shipped = await router.route({ botName: 'custodes', userId: 'u1', text: 'final words ship it' });
+
+  assert.equal(shipped.command, 'ship');
+  assert.equal(shipped.routed, true);
+  assert.equal(shipped.voice_session_invalidated, true);
+  assert.deepEqual(ops.map(op => op[0]), ['start', 'append', 'ship']);
+  assert.deepEqual(ops[2], ['ship', 'vs-1', 'final words']);
+  assert.deepEqual(router.listDrafts(), []);
+});
+
+test('scratch cancels prompt through tmuxctld and clears local draft', async () => {
+  const ops = [];
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client: fakeClient(ops) });
+
+  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft' });
+  const scratched = await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'scratch that' });
+
+  assert.equal(scratched.routed, true);
+  assert.equal(scratched.voice_session_invalidated, true);
+  assert.deepEqual(ops.at(-1), ['scratch', 'vs-1']);
+  assert.deepEqual(router.listDrafts(), []);
+});
+
+test('stale scratch clears local draft and reports missing voice session', async () => {
+  const ops = [];
+  const client = fakeClient(ops);
+  client.scratchVoiceSession = async ({ voiceSessionId }) => {
+    ops.push(['scratch', voiceSessionId]);
+    const err = new Error('voice session not found');
+    err.code = 'KeyError';
+    throw err;
+  };
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client });
+
+  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft' });
+  const scratched = await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'scratch that' });
+
+  assert.equal(scratched.routed, false);
+  assert.equal(scratched.reason, 'voice_session_not_found');
+  assert.equal(scratched.voice_session_invalidated, true);
+  assert.deepEqual(router.listDrafts(), []);
+});
+
+test('stale ship clears local draft and reports missing voice session', async () => {
+  const ops = [];
+  const client = fakeClient(ops);
+  client.shipVoiceSession = async ({ voiceSessionId, text }) => {
+    ops.push(['ship', voiceSessionId, text]);
+    const err = new Error('voice session not found');
+    err.code = 'KeyError';
+    throw err;
+  };
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client });
+
+  await router.route({ botName: 'custodes', userId: 'u1', text: 'draft one' });
+  const shipped = await router.route({ botName: 'custodes', userId: 'u1', text: 'ship it' });
+
+  assert.equal(shipped.routed, false);
+  assert.equal(shipped.reason, 'voice_session_not_found');
+  assert.equal(shipped.voice_session_invalidated, true);
+  assert.deepEqual(router.listDrafts(), []);
+});
+
+test('clear calls tmuxctld cleanup by session id', async () => {
+  const ops = [];
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client: fakeClient(ops) });
+
+  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft' });
+  const cleared = await router.clear({ bot: 'imperial_guard' });
+
+  assert.equal(cleared.length, 1);
+  assert.deepEqual(ops.at(-2), ['clear', { voiceSessionId: 'vs-1' }]);
+  assert.deepEqual(ops.at(-1), ['clear', { botName: 'imperial_guard', userId: '' }]);
+});
+
+test('no target is loud and fail-closed', async () => {
+  const warnings = [];
+  const client = {
+    async startVoiceSession() { const err = new Error('no routable attached operator client target'); err.code = 'ValueError'; throw err; },
+  };
   const router = createVoiceTranscriptRouter({
-    logger: { warn() {}, info() {} },
-    resolveTargetToPane(target) { return target === '3:0' || target === '%42' ? target : null; },
-    displayValue() { return 'old-title'; },
-    async setPaneTitle() {},
-    async setPaneOption() {},
-    async typeIntoTarget(target, text) { typed.push([target, text]); },
-    lockedPaneTarget(result) { return result.lockedTmuxPane; },
+    logger: { warn(msg) { warnings.push(msg); }, info() {} },
+    client,
   });
 
-  await router.route({ botName: 'custodes', userId: 'u1', text: 'terra draft', lockedTmuxPane: '%42' });
-  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'cadia draft', lockedTmuxPane: '%42' });
+  const result = await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'hello' });
+  assert.equal(result.routed, false);
+  assert.equal(result.reason, 'no_target');
+  assert.ok(warnings.some(msg => String(msg).includes('no target')));
+});
 
-  const cleared = await router.clear({ bot: 'custodes' });
-  assert.equal(cleared.length, 1);
-  assert.deepEqual(router.listDrafts().map(d => d.bot_name), ['imperial_guard']);
-  assert.deepEqual(typed, [['3:0', 'terra draft'], ['%42', 'cadia draft']]);
+test('mute/unmute remain Discord-only except optional draft append', async () => {
+  const ops = [];
+  const muted = [];
+  const router = createVoiceTranscriptRouter({
+    logger: { warn() {}, info() {} },
+    client: fakeClient(ops),
+    voiceManager: {
+      async muteMember(userId, botName) { muted.push(['mute', userId, botName]); return { muted: true }; },
+      async unmuteMember(userId, botName) { muted.push(['unmute', userId, botName]); return { unmuted: true }; },
+    },
+  });
+
+  await router.route({ botName: 'custodes', userId: 'u1', text: 'draft' });
+  await router.route({ botName: 'custodes', userId: 'u1', text: 'more words mute' });
+  await router.route({ botName: 'custodes', userId: 'u1', text: 'unmute' });
+
+  assert.deepEqual(muted, [['mute', 'u1', 'custodes'], ['unmute', 'u1', 'custodes']]);
+  assert.deepEqual(ops.map(op => op[0]), ['start', 'append', 'append']);
 });
 
 test('late transcript after bot leave is ignored and clears stale draft', async () => {
+  const ops = [];
   let connected = true;
   let listening = true;
   const router = createVoiceTranscriptRouter({
     logger: { warn() {}, info() {} },
-    voiceManager: {
-      getStatus() { return { connected, listening }; },
-    },
-    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue() { return 'old-title'; },
-    async setPaneTitle() {},
-    async setPaneOption() {},
-    async typeIntoTarget() {},
-    lockedPaneTarget(result) { return result.lockedTmuxPane; },
+    client: fakeClient(ops),
+    voiceManager: { getStatus() { return { connected, listening }; } },
   });
 
-  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'cadia draft', lockedTmuxPane: '%42' });
-  assert.equal(router.listDrafts().length, 1);
-
+  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft' });
   connected = false;
   listening = false;
-  const result = await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'late stale text', lockedTmuxPane: '%42' });
+  const result = await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'late text' });
 
   assert.deepEqual(result, { routed: false, ignored: true, reason: 'bot_not_connected', cleared: 1 });
   assert.deepEqual(router.listDrafts(), []);
-});
-
-
-test('late transcript with stale epoch/channel is ignored and clears Cadia lock draft', async () => {
-  const ops = [];
-  const warnings = [];
-  let status = { connected: true, listening: true, channelId: 'cadia', routeEpoch: 1 };
-  const router = createVoiceTranscriptRouter({
-    logger: { warn(msg) { warnings.push(msg); }, info() {} },
-    voiceManager: { getStatus() { return status; } },
-    resolveTargetToPane(target) { return target === '%42' ? '%42' : null; },
-    displayValue() { return 'old-title'; },
-    async setPaneTitle(target, title) { ops.push(['title', target, title]); },
-    async setPaneOption(target, option, value) { ops.push(['option', target, option, value]); },
-    async typeIntoTarget(target, text) { ops.push(['type', target, text]); },
-    lockedPaneTarget(result) { return result.lockedTmuxPane; },
-  });
-
-  await router.route({
-    botName: 'imperial_guard',
-    userId: 'u1',
-    text: 'cadia draft',
-    lockedTmuxPane: '%42',
-    routeEpoch: 1,
-    channelId: 'cadia',
-  });
-  assert.equal(router.listDrafts().length, 1);
-
-  status = { connected: true, listening: true, channelId: 'terra', routeEpoch: 2 };
-  const result = await router.route({
-    botName: 'imperial_guard',
-    userId: 'u1',
-    text: 'late text',
-    lockedTmuxPane: '%42',
-    routeEpoch: 1,
-    channelId: 'cadia',
-  });
-
-  assert.deepEqual(result, { routed: false, ignored: true, reason: 'stale_transcript', cleared: 1 });
-  assert.equal(router.listDrafts().length, 0);
-  assert.ok(warnings.some(msg => String(msg).includes('ignored stale transcript')));
-  assert.deepEqual(ops.slice(-3), [
-    ['title', '%42', 'old-title'],
-    ['option', '%42', '@DISCORD_VOICE_PROCESSING', '0'],
-    ['option', '%42', '@DISCORD_VOICE_LOCK', '0'],
-  ]);
 });
 
 test('normalizes voice command text', () => {
