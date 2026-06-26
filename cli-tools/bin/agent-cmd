@@ -8,6 +8,7 @@ source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${_LIB_DIR}/tmux-guard.sh"
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+TMUXCTLD_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
 TMUXCTL_BIN="${TMUXCTL_BIN:-${_BIN_DIR}/tmuxctl}"
 TARGET_MODE="self"
 TARGET_VALUE=""
@@ -143,7 +144,12 @@ fi
 send_command() {
     local pane="$1" cmd="$2" locker="agent-cmd-$$" locked=false rc=0 out lock_resp
     local dispatch_id hash
-    local blocked=false reason="" verification_status="sent"
+    local blocked=false reason="" verification_status="unverified" verified_by="tmuxctld"
+    # Swallowed-submit recovery surface (memories: ack-is-hack,
+    # no-error-suppressing-debounce). Defaults are mouse-free safe values: the
+    # direct/blocked paths neither hold the green agent guard nor sniff for a
+    # swallowed submit, so they report no hold, no detection, no recovery.
+    local guard_held=false swallowed_submit_detected=false recovery_attempts=0 failures='[]'
     dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
     hash=$(printf '%s' "$cmd" | payload_hash)
 
@@ -159,13 +165,105 @@ send_command() {
         done
     fi
 
-    local -a send_args=(send-text --pane "$pane" --text "$cmd")
-    [[ "$NO_SUBMIT" == true ]] && send_args+=(--no-submit)
-    out=$("$TMUXCTL_BIN" "${send_args[@]}" 2>&1) || {
+    # Prefer the daemon-native send (verified handshake). Exit codes from the
+    # helper: 0 = ok, 2 = daemon RESPONDED with ok:false (a real, handled
+    # failure — do NOT fall back, the daemon owns it), 3 = daemon UNREACHABLE
+    # (connection refused / timeout — fall back to direct tmuxctl so a daemon
+    # that is down or mid-restart never wedges a send).
+    out=$(python3 - "$TMUXCTLD_URL" "$pane" "$cmd" "$NO_SUBMIT" <<'PY' 2>&1
+import json
+import sys
+import urllib.error
+import urllib.request
+
+url, pane, text, no_submit = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "true"
+body = {
+    "pane": pane,
+    "text": text,
+    "submit": not no_submit,
+    "verify": not no_submit,
+    "verify_timeout": 6.0,
+}
+req = urllib.request.Request(
+    url.rstrip("/") + "/send-text",
+    data=json.dumps(body).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        payload = json.loads(resp.read().decode("utf-8") or "{}")
+except urllib.error.HTTPError as exc:  # daemon answered with a transport error
+    sys.stderr.write(f"tmuxctld http error: {exc}\n")
+    raise SystemExit(2)
+except urllib.error.URLError as exc:  # daemon down / unreachable -> fall back
+    sys.stderr.write(f"tmuxctld unreachable: {exc}\n")
+    raise SystemExit(3)
+print(json.dumps(payload, separators=(",", ":")))
+if not payload.get("ok"):
+    raise SystemExit(2)
+PY
+    ) || rc=$?
+    if [[ "$rc" == 3 ]]; then
+        # Daemon unreachable — fall back to the direct tmuxctl send path so the
+        # send still lands (still routed through the universal send gate).
+        local -a send_args=(send-text --pane "$pane" --text "$cmd")
+        [[ "$NO_SUBMIT" == true ]] && send_args+=(--no-submit)
+        if out=$("$TMUXCTL_BIN" "${send_args[@]}" 2>&1); then
+            rc=0
+            verification_status="sent"
+            verified_by="tmuxctl"
+        else
+            echo "$out" >&2
+            rc=1
+            verification_status="failed"
+            verified_by="tmuxctl"
+        fi
+    elif [[ "$rc" != 0 ]]; then
         echo "$out" >&2
-        rc=1
-    }
-    [[ "$rc" == 0 ]] || verification_status="failed"
+        # A daemon `ok:false` with error.code=="gated" means ZERO bytes were
+        # written and the send is re-queueable — surface it as blocked (with the
+        # gate reason) rather than collapsing it to a generic failure, so the
+        # caller keeps the no-bytes-written retry signal (surface-don't-suppress).
+        local gate_code=""
+        gate_code=$(python3 -c 'import json,sys
+try:
+    p=json.loads(sys.stdin.read())
+except Exception:
+    p={}
+print((p.get("error") or {}).get("code") or "" if isinstance(p, dict) else "")' <<<"$out" 2>/dev/null || true)
+        if [[ "$gate_code" == "gated" ]]; then
+            blocked=true
+            verification_status="gated"
+            verified_by=""
+            reason=$(python3 -c 'import json,sys
+try:
+    p=json.loads(sys.stdin.read())
+except Exception:
+    p={}
+err=(p.get("error") or {}) if isinstance(p, dict) else {}
+detail=err.get("detail") if isinstance(err.get("detail"), dict) else {}
+print(detail.get("reason") or err.get("message") or "gated")' <<<"$out" 2>/dev/null || echo "gated")
+        else
+            verification_status="failed"
+            verified_by="tmuxctld"
+        fi
+    fi
+    if [[ "$rc" == 0 && "$verified_by" == "tmuxctld" ]]; then
+        verification_status=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verification_status") or "unverified")' <<<"$out" 2>/dev/null || echo "unverified")
+        # Keep verified_by empty (-> null in the envelope) when the daemon reports
+        # no verifier — do NOT invent "tmuxctld" for an unverified send.
+        verified_by=$(python3 -c 'import json,sys; print((json.loads(sys.stdin.read()).get("result") or {}).get("verified_by") or "")' <<<"$out" 2>/dev/null || echo "")
+        dispatch_id=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("dispatch_id") or "")' <<<"$out" 2>/dev/null || true)
+        [[ -n "$dispatch_id" ]] || dispatch_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+        # Surface the swallowed-submit recovery telemetry the daemon now exposes
+        # so a caller can see a submit was eaten and re-driven. Booleans/ints are
+        # emitted lower-case/unquoted; failures stays raw JSON for a real array.
+        guard_held=$(python3 -c 'import json,sys; print(str(bool((json.loads(sys.stdin.read()).get("result") or {}).get("guard_held"))).lower())' <<<"$out" 2>/dev/null || echo false)
+        swallowed_submit_detected=$(python3 -c 'import json,sys; print(str(bool((json.loads(sys.stdin.read()).get("result") or {}).get("swallowed_submit_detected"))).lower())' <<<"$out" 2>/dev/null || echo false)
+        recovery_attempts=$(python3 -c 'import json,sys; print(int((json.loads(sys.stdin.read()).get("result") or {}).get("recovery_attempts") or 0))' <<<"$out" 2>/dev/null || echo 0)
+        failures=$(python3 -c 'import json,sys; print(json.dumps((json.loads(sys.stdin.read()).get("result") or {}).get("failures") or []))' <<<"$out" 2>/dev/null || echo '[]')
+    fi
 
     if [[ "$locked" == true ]]; then
         curl -s --connect-timeout 1 --max-time 2 \
@@ -173,8 +271,37 @@ send_command() {
             >/dev/null 2>&1 || true
     fi
 
-    printf '{"dispatch_id":"%s","payload_hash":"%s","pane":"%s","instance_id":"%s","verification_status":"%s","verified_by":"%s","blocked":%s,"reason":"%s"}\n' \
-        "$dispatch_id" "$hash" "$pane" "${INSTANCE_ID:-}" "$verification_status" "$([[ "$blocked" == true ]] && echo tmux-guard || echo tmuxctl)" "$blocked" "$reason"
+    # Build the envelope with json.dumps so the raw `failures` JSON array and any
+    # special chars in the fields can't corrupt the output under set -euo pipefail.
+    python3 - "$dispatch_id" "$hash" "$pane" "${INSTANCE_ID:-}" "$verification_status" \
+        "$verified_by" "$blocked" "$reason" "$guard_held" "$swallowed_submit_detected" \
+        "$recovery_attempts" "$failures" <<'PY'
+import json
+import sys
+
+(
+    dispatch_id, payload_hash, pane, instance_id, verification_status,
+    verified_by, blocked, reason, guard_held, swallowed, recovery_attempts, failures,
+) = sys.argv[1:13]
+try:
+    failures_val = json.loads(failures or "[]")
+except (ValueError, TypeError):
+    failures_val = []
+print(json.dumps({
+    "dispatch_id": dispatch_id,
+    "payload_hash": payload_hash,
+    "pane": pane,
+    "instance_id": instance_id,
+    "verification_status": verification_status,
+    "verified_by": verified_by or None,
+    "blocked": blocked == "true",
+    "reason": reason,
+    "guard_held": guard_held == "true",
+    "swallowed_submit_detected": swallowed == "true",
+    "recovery_attempts": int(recovery_attempts or 0),
+    "failures": failures_val,
+}, separators=(",", ":")))
+PY
     return "$rc"
 }
 

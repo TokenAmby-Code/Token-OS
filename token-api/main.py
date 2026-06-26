@@ -5198,8 +5198,77 @@ async def _tmux_send_payload_then_submit(
     clear_prompt: bool = False,
     enable_skill_sink: bool = False,
 ) -> dict:
-    """Send text and submit through tmuxctl's pane-write primitive."""
+    """Send text and submit through tmuxctld/tmuxctl's pane-write primitive."""
     from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated
+
+    daemon_payload = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/send-text",
+        {
+            "pane": tmux_pane,
+            "text": payload,
+            "clear_prompt": clear_prompt,
+            "submit": True,
+            "verify": True,
+            "verify_timeout": 6.0,
+            "pre_submit_keys": ["Tab"]
+            if enable_skill_sink and _looks_like_codex_skill(payload)
+            else [],
+        },
+        timeout=12,
+        default_loopback=DB_PATH.resolve() == (Path.home() / ".claude" / "agents.db").resolve(),
+    )
+    if daemon_payload is not None:
+        if not daemon_payload.get("ok"):
+            err = (
+                daemon_payload.get("error") if isinstance(daemon_payload.get("error"), dict) else {}
+            )
+            if err.get("code") == "gated":
+                gate = err.get("detail") if isinstance(err.get("detail"), dict) else {}
+                return {
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "",
+                    "operation": "tmuxctld.send_text",
+                    "gated": True,
+                    "gate_reason": gate.get("reason"),
+                    "gate": gate,
+                    "verification_status": "gated",
+                    "verified_by": None,
+                    "pane": tmux_pane,
+                    "instance_id": None,
+                }
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": err.get("message") or json.dumps(daemon_payload),
+                "failed_operation": ["tmuxctld", "send-text"],
+            }
+        result = (
+            daemon_payload.get("result") if isinstance(daemon_payload.get("result"), dict) else {}
+        )
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "operation": "tmuxctld.send_text",
+            "dispatch_id": result.get("dispatch_id") or str(uuid.uuid4()),
+            "payload_hash": result.get("payload_hash")
+            or hashlib.sha256(
+                re.sub(r"[\r\n]+", " ", payload).rstrip().encode("utf-8")
+            ).hexdigest(),
+            "gated": False,
+            "verification_status": result.get("verification_status") or "unverified",
+            "verified_by": result.get("verified_by"),
+            # Surface the daemon's swallowed-submit recovery telemetry so token-api
+            # callers can see a submit was eaten and re-driven (surface-don't-suppress).
+            "guard_held": bool(result.get("guard_held")),
+            "swallowed_submit_detected": bool(result.get("swallowed_submit_detected")),
+            "recovery_attempts": int(result.get("recovery_attempts") or 0),
+            "failures": result.get("failures") if isinstance(result.get("failures"), list) else [],
+            "pane": tmux_pane,
+            "instance_id": result.get("instance_id"),
+        }
 
     adapter = TmuxAdapter()
     try:
@@ -5241,10 +5310,6 @@ async def _tmux_send_payload_then_submit(
             "stderr": str(exc),
             "failed_operation": ["tmuxctl", "send_text_then_submit"],
         }
-
-    import hashlib
-    import re
-    import uuid
 
     normalized = re.sub(r"[\r\n]+", " ", payload).rstrip()
     # Bytes were issued, but delivery is NOT proven here — never default to

@@ -21,6 +21,7 @@ import shlex
 import subprocess
 import tempfile
 import time
+import urllib.request
 import uuid
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -76,6 +77,58 @@ from shared import (
 logger = logging.getLogger("token_api")
 
 router = APIRouter()
+
+
+def _tmuxctld_loopback_url() -> str | None:
+    """Loopback tmuxctld URL for hook acks, or None when not loopback.
+
+    UserPromptSubmit is the acknowledgement edge for daemon send transactions.
+    This echo defaults to the local daemon because tmuxctld is launchd-supervised
+    and always expected on the Mac; failures are best-effort and must never
+    block the hook handler. Routes through the shared resolver so an arbitrary
+    ``TMUXCTLD_URL`` can never POST prompt-submit metadata off-box (the resolver
+    rejects any non-loopback / non-http host).
+    """
+
+    return shared._tmuxctld_url(default_loopback=True)
+
+
+def _echo_prompt_submit_to_tmuxctld_sync(payload: dict) -> None:
+    base = _tmuxctld_loopback_url()
+    if not base:
+        return
+    url = f"{base}/hooks/user-prompt-submit"
+    env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
+    body = {
+        "session_id": payload.get("session_id"),
+        "instance_id": payload.get("session_id"),
+        "pane": (
+            payload.get("pane")
+            or env.get("TMUX_PANE")
+            or env.get("TOKEN_API_DISPATCH_RESOLVED_PANE")
+            or ""
+        ),
+        "prompt_hash": payload.get("prompt_hash") or payload.get("payload_hash") or "",
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # Tight timeout: the daemon wait path needs this promptly, but Token-API hook
+    # processing must never wedge if tmuxctld is restarting.
+    with shared._TMUXCTLD_OPENER.open(req, timeout=0.25) as resp:
+        resp.read(256)
+
+
+async def _echo_prompt_submit_to_tmuxctld(payload: dict) -> None:
+    try:
+        await asyncio.to_thread(_echo_prompt_submit_to_tmuxctld_sync, payload)
+    except Exception:
+        return
+
 
 # Bounded in-band retry for transient WAL "database is locked" (SQLITE_BUSY) on
 # hook DB writes. Total added latency on full exhaustion is
@@ -4719,6 +4772,11 @@ async def handle_prompt_submit(payload: dict) -> dict:
     session_id = payload.get("session_id")
     if not session_id:
         return {"success": False, "action": "no_session_id"}
+
+    # Backside of daemon send transactions: tmuxctld sends the prompt; this hook
+    # confirms the target TUI actually submitted it. Best-effort and before DB
+    # work so the daemon's waiter observes the ack as soon as possible.
+    await _echo_prompt_submit_to_tmuxctld(payload)
 
     # Each UserPromptSubmit for a session with pending tasks = one background task result delivered.
     if session_id in _pending_background_tasks:
