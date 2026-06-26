@@ -208,6 +208,92 @@ def test_instance_id_for_pane_fail_closed_when_unstamped() -> None:
         server.shutdown()
 
 
+class WrapperEndAdapter:
+    def __init__(self) -> None:
+        self.wrapper_owner = "wrap-1"
+        self.instance_id = "inst-1"
+        self.cleared: list[str] = []
+        self.calls: list[tuple[str, ...]] = []
+
+    def list_sessions(self) -> list:
+        return []
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        self.calls.append(tuple(args))
+        if args[:3] == ("display-message", "-t", "%42"):
+            return "%42" if self.instance_id or self.wrapper_owner else ""
+        if args[:3] == ("list-panes", "-a", "-F"):
+            return f"%42__TMUXCTLD_WRAPPEREND_FIELD__{self.wrapper_owner}"
+        return ""
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@TOKEN_API_WRAPPER_LAUNCH_ID":
+            return self.wrapper_owner
+        if option == "@INSTANCE_ID":
+            return self.instance_id
+        return ""
+
+    def clear_runtime_state(self, target: str) -> None:
+        self.cleared.append(target)
+        self.wrapper_owner = ""
+        self.instance_id = ""
+
+
+def test_wrapperend_clears_owned_runtime_state_immediately_and_idempotently() -> None:
+    rec = WrapperEndAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperend",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42", "exit_code": 0},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "cleared"
+        assert rec.cleared == ["%42"]
+
+        _, duplicate = _post(
+            server,
+            "/hooks/wrapperend",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42", "exit_code": 0},
+        )
+        assert duplicate["ok"] is True
+        assert duplicate["result"]["status"] in {"already_cleared", "already_missing"}
+        assert rec.cleared == ["%42"]
+    finally:
+        server.shutdown()
+
+
+def test_wrapperend_resolves_pane_by_wrapper_id_when_payload_pane_missing() -> None:
+    rec = WrapperEndAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/hooks/wrapperend", {"wrapper_launch_id": "wrap-1"})
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "cleared"
+        assert rec.cleared == ["%42"]
+    finally:
+        server.shutdown()
+
+
+def test_wrapperend_rejects_unowned_mismatched_pane_without_clearing() -> None:
+    rec = WrapperEndAdapter()
+    rec.wrapper_owner = "other-wrap"
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperend",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42"},
+        )
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+        assert "owned by another wrapper" in payload["error"]["message"]
+        assert rec.cleared == []
+    finally:
+        server.shutdown()
+
+
 class RecordingFocusAdapter:
     """Resolves focus-uuid -> palace:1 and records every run() call."""
 

@@ -804,6 +804,96 @@ def _h_clear_runtime(control, params):
     return control.clear_runtime(_s(params, "pane"))
 
 
+_WRAPPEREND_LIST_SEP = "__TMUXCTLD_WRAPPEREND_FIELD__"
+
+
+def _adapter_show_pane_option(control: TmuxControlPlane, pane: str, option: str) -> str:
+    if hasattr(control.adapter, "show_pane_option"):
+        return str(control.adapter.show_pane_option(pane, option) or "").strip()
+    return str(
+        control.adapter.run("show-options", "-pv", "-t", pane, option, allow_failure=True) or ""
+    ).strip()
+
+
+def _pane_exists_for_wrapperend(control: TmuxControlPlane, pane: str) -> bool:
+    if not pane:
+        return False
+    return bool(
+        control.adapter.run(
+            "display-message", "-t", pane, "-p", "#{pane_id}", allow_failure=True
+        ).strip()
+    )
+
+
+def _find_pane_by_wrapper_id(control: TmuxControlPlane, wrapper_launch_id: str) -> str:
+    if not wrapper_launch_id:
+        return ""
+    raw = control.adapter.run(
+        "list-panes",
+        "-a",
+        "-F",
+        _WRAPPEREND_LIST_SEP.join(["#{pane_id}", "#{@TOKEN_API_WRAPPER_LAUNCH_ID}"]),
+        allow_failure=True,
+    )
+    for line in raw.splitlines():
+        if not line:
+            continue
+        pane_id, owner = (line.split(_WRAPPEREND_LIST_SEP, 1) + [""])[:2]
+        if owner.strip() == wrapper_launch_id and pane_id.strip():
+            return pane_id.strip()
+    return ""
+
+
+def _h_hook_wrapperend(control, params):
+    """Authoritative wrapper-owned visual/runtime cleanup for tmux panes.
+
+    Token-API owns process/session lifecycle. tmuxctld owns pane-local visual
+    state, so WrapperEnd clears only the pane whose @TOKEN_API_WRAPPER_LAUNCH_ID
+    matches the exiting wrapper. Missing/already-cleared panes are successful
+    no-ops; a pane owned by a different wrapper is surfaced as an error.
+    """
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
+    wrapper_launch_id = _s(params, "wrapper_launch_id") or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
+    if not wrapper_launch_id:
+        log.error("tmuxctld wrapperend missing wrapper_launch_id pane=%s", pane)
+        raise ValueError("wrapper_launch_id required")
+
+    if pane and not _pane_exists_for_wrapperend(control, pane):
+        pane = ""
+    if not pane:
+        pane = _find_pane_by_wrapper_id(control, wrapper_launch_id)
+    if not pane:
+        return {
+            "status": "already_missing",
+            "wrapper_launch_id": wrapper_launch_id,
+            "pane": "",
+        }
+
+    owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    if owner and owner != wrapper_launch_id:
+        log.error(
+            "tmuxctld wrapperend ownership mismatch pane=%s payload_wrapper=%s pane_wrapper=%s",
+            pane,
+            wrapper_launch_id,
+            owner,
+        )
+        raise ValueError("wrapperend pane is owned by another wrapper")
+    if not owner:
+        return {
+            "status": "already_cleared",
+            "wrapper_launch_id": wrapper_launch_id,
+            "pane": pane,
+        }
+
+    result = control.clear_runtime(pane)
+    return {
+        "status": "cleared",
+        "wrapper_launch_id": wrapper_launch_id,
+        "pane": result.get("pane", pane) if isinstance(result, dict) else pane,
+    }
+
+
 def _h_close_pane(control, params):
     return control.close_pane(_s(params, "pane"), timeout=_f(params, "timeout", 3.0))
 
@@ -1300,6 +1390,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/invoke-skill"): _h_invoke_skill,
     ("POST", "/assert-instance"): _h_assert_instance,
     ("POST", "/hooks/user-prompt-submit"): _h_hook_user_prompt_submit,
+    ("POST", "/hooks/wrapperend"): _h_hook_wrapperend,
     # Event-driven persona reconcile (replaces the retired 2-min assert-personas
     # poll). /reconcile re-seats all must-fill seats; /event ingests a single tmux
     # lifecycle event (a persona pane-died self-heal). Nothing polls these.
