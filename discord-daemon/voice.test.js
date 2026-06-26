@@ -1,16 +1,36 @@
 // voice.test.js — pins Discord-owned voice lifecycle behavior.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 
 import { createVoiceManager } from './voice.js';
 
-test('voice manager source does not resolve or store raw pane locks', () => {
-  const source = readFileSync(new URL('./voice.js', import.meta.url), 'utf8');
-  assert.equal(source.includes('lockedTmuxPane'), false);
-  assert.equal(source.includes('execFileSync'), false);
-  assert.equal(source.includes("'tmux'"), false);
-  assert.equal(source.includes('resolveSelectedTmuxPane'), false);
+test('voice manager status exposes Discord-only routing state', () => {
+  const voiceManager = createVoiceManager(
+    {},
+    {
+      guild_id: 'guild',
+      operator_user_id: 'operator',
+      voice_channels: {
+        imperial_guard: 'cadia',
+      },
+    },
+    { debug() {}, info() {}, warn() {}, error() {} },
+  );
+
+  const status = voiceManager.getStatus('imperial_guard');
+
+  assert.deepEqual(Object.keys(status).sort(), [
+    'activeListeners',
+    'botName',
+    'channelId',
+    'connected',
+    'connectionState',
+    'listening',
+    'routeEpoch',
+  ]);
+  assert.equal(status.botName, 'imperial_guard');
+  assert.equal(status.connected, false);
+  assert.equal(status.activeListeners, 0);
 });
 
 test('VC hop runs old-channel leave cleanup before new-channel join routing', async () => {

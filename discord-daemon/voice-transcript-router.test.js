@@ -113,6 +113,7 @@ test('ship appends optional final text then submits through tmuxctld', async () 
 
   assert.equal(shipped.command, 'ship');
   assert.equal(shipped.routed, true);
+  assert.equal(shipped.voice_session_invalidated, true);
   assert.deepEqual(ops.map(op => op[0]), ['start', 'append', 'ship']);
   assert.deepEqual(ops[2], ['ship', 'vs-1', 'final words']);
   assert.deepEqual(router.listDrafts(), []);
@@ -126,7 +127,48 @@ test('scratch cancels prompt through tmuxctld and clears local draft', async () 
   const scratched = await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'scratch that' });
 
   assert.equal(scratched.routed, true);
+  assert.equal(scratched.voice_session_invalidated, true);
   assert.deepEqual(ops.at(-1), ['scratch', 'vs-1']);
+  assert.deepEqual(router.listDrafts(), []);
+});
+
+test('stale scratch clears local draft and reports missing voice session', async () => {
+  const ops = [];
+  const client = fakeClient(ops);
+  client.scratchVoiceSession = async ({ voiceSessionId }) => {
+    ops.push(['scratch', voiceSessionId]);
+    const err = new Error('voice session not found');
+    err.code = 'KeyError';
+    throw err;
+  };
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client });
+
+  await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'draft' });
+  const scratched = await router.route({ botName: 'imperial_guard', userId: 'u1', text: 'scratch that' });
+
+  assert.equal(scratched.routed, false);
+  assert.equal(scratched.reason, 'voice_session_not_found');
+  assert.equal(scratched.voice_session_invalidated, true);
+  assert.deepEqual(router.listDrafts(), []);
+});
+
+test('stale ship clears local draft and reports missing voice session', async () => {
+  const ops = [];
+  const client = fakeClient(ops);
+  client.shipVoiceSession = async ({ voiceSessionId, text }) => {
+    ops.push(['ship', voiceSessionId, text]);
+    const err = new Error('voice session not found');
+    err.code = 'KeyError';
+    throw err;
+  };
+  const router = createVoiceTranscriptRouter({ logger: { warn() {}, info() {} }, client });
+
+  await router.route({ botName: 'custodes', userId: 'u1', text: 'draft one' });
+  const shipped = await router.route({ botName: 'custodes', userId: 'u1', text: 'ship it' });
+
+  assert.equal(shipped.routed, false);
+  assert.equal(shipped.reason, 'voice_session_not_found');
+  assert.equal(shipped.voice_session_invalidated, true);
   assert.deepEqual(router.listDrafts(), []);
 });
 

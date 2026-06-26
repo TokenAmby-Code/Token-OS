@@ -75,8 +75,8 @@ export function createVoiceTranscriptRouter({
   async function clearDraft(key) {
     const state = drafts.get(key.value);
     if (!state) return null;
-    drafts.delete(key.value);
     await client.clearVoiceSession({ voiceSessionId: state.voiceSessionId });
+    drafts.delete(key.value);
     return summarizeDraft(key, state);
   }
 
@@ -139,6 +139,10 @@ export function createVoiceTranscriptRouter({
     return result;
   }
 
+  function isMissingVoiceSession(err) {
+    return err?.code === 'KeyError' || String(err?.message || '').includes('voice session not found');
+  }
+
   async function route(result) {
     const key = keyFor(result);
     const text = String(result.text || '').trim();
@@ -181,10 +185,29 @@ export function createVoiceTranscriptRouter({
 
     if (parsed.command === 'scratch') {
       if (!state) return { routed: false, command: 'scratch', reason: 'no_draft' };
-      await client.scratchVoiceSession({ voiceSessionId: state.voiceSessionId });
+      try {
+        await client.scratchVoiceSession({ voiceSessionId: state.voiceSessionId });
+      } catch (err) {
+        if (!isMissingVoiceSession(err)) throw err;
+        drafts.delete(key.value);
+        logger?.warn?.(`Voice route [${key.bot}/${key.userId}]: scratch session missing ${state.voiceSessionId}`);
+        return {
+          routed: false,
+          command: 'scratch',
+          reason: 'voice_session_not_found',
+          voice_session_id: state.voiceSessionId,
+          voice_session_invalidated: true,
+        };
+      }
       drafts.delete(key.value);
       logger?.info?.(`Voice route [${key.bot}/${key.userId}]: scratched ${state.voiceSessionId}`);
-      return { routed: true, command: 'scratch', voice_session_id: state.voiceSessionId, target_role: state.targetRole || '' };
+      return {
+        routed: true,
+        command: 'scratch',
+        voice_session_id: state.voiceSessionId,
+        target_role: state.targetRole || '',
+        voice_session_invalidated: true,
+      };
     }
 
     if (parsed.command === 'mute') {
@@ -206,10 +229,30 @@ export function createVoiceTranscriptRouter({
 
     if (parsed.command === 'ship') {
       if (!state) return { routed: false, command: 'ship', reason: 'no_draft' };
-      const shipped = await client.shipVoiceSession({ voiceSessionId: state.voiceSessionId, text: parsed.draftText || '' });
+      let shipped;
+      try {
+        shipped = await client.shipVoiceSession({ voiceSessionId: state.voiceSessionId, text: parsed.draftText || '' });
+      } catch (err) {
+        if (!isMissingVoiceSession(err)) throw err;
+        drafts.delete(key.value);
+        logger?.warn?.(`Voice route [${key.bot}/${key.userId}]: ship session missing ${state.voiceSessionId}`);
+        return {
+          routed: false,
+          command: 'ship',
+          reason: 'voice_session_not_found',
+          voice_session_id: state.voiceSessionId,
+          voice_session_invalidated: true,
+        };
+      }
       drafts.delete(key.value);
       logger?.info?.(`Voice route [${key.bot}/${key.userId}]: shipped ${state.voiceSessionId}`);
-      return { routed: true, command: 'ship', voice_session_id: state.voiceSessionId, target_role: shipped.target_role || state.targetRole || '' };
+      return {
+        routed: true,
+        command: 'ship',
+        voice_session_id: state.voiceSessionId,
+        target_role: shipped.target_role || state.targetRole || '',
+        voice_session_invalidated: true,
+      };
     }
 
     if (!parsed.draftText) return { routed: false, reason: 'empty' };
@@ -229,7 +272,7 @@ export function createVoiceTranscriptRouter({
       // cleared on a prior ship/scratch/restart. Fail closed, then create a
       // fresh semantic session through tmuxctld instead of falling back to a
       // pane or dropping the transcript silently.
-      if (err.code !== 'KeyError' && !String(err.message || '').includes('voice session not found')) {
+      if (!isMissingVoiceSession(err)) {
         throw err;
       }
       drafts.delete(key.value);

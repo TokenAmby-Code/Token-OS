@@ -4,7 +4,7 @@
 export function isRetryableVoiceRouteFailure(resultOrError) {
   if (!resultOrError) return false;
   if (resultOrError.routed === false) {
-    return ['no_target', 'target_not_live', 'route_timeout'].includes(String(resultOrError.reason || ''));
+    return ['no_target', 'target_not_live', 'route_timeout', 'voice_session_not_found'].includes(String(resultOrError.reason || ''));
   }
   const message = String(resultOrError?.message || resultOrError || '').toLowerCase();
   return (

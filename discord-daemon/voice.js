@@ -210,6 +210,8 @@ export function createVoiceManager(botClients, config, logger) {
     let silenceTimer = null;
     let voiceSessionId = null;
     let voiceSessionStartInFlight = false;
+    let voiceSessionGeneration = 0;
+    let discarded = false;
     let suppressEndClose = false;
 
     function currentRouteMeta(extra = {}) {
@@ -261,6 +263,18 @@ export function createVoiceManager(botClients, config, logger) {
       bytesSinceCommit = 0;
       voiceSessionId = null;
       voiceSessionStartInFlight = false;
+      voiceSessionGeneration += 1;
+      discarded = true;
+    }
+
+    function clearLocalVoiceSession(expectedVoiceSessionId = '') {
+      if (expectedVoiceSessionId && voiceSessionId && voiceSessionId !== expectedVoiceSessionId) {
+        return false;
+      }
+      if (!voiceSessionId && !voiceSessionStartInFlight) return false;
+      voiceSessionId = null;
+      voiceSessionGeneration += 1;
+      return true;
     }
 
     function startSilenceTimer() {
@@ -280,9 +294,12 @@ export function createVoiceManager(botClients, config, logger) {
     });
 
     decoder.on('data', (chunk) => {
+      if (discarded) return;
       // First real audio frame of a local utterance: tmuxctld creates the
       // semantic voice session. Discord carries only the opaque session id.
       if (!hasAudioSinceCommit && !voiceSessionId && !voiceSessionStartInFlight) {
+        const startGeneration = voiceSessionGeneration + 1;
+        voiceSessionGeneration = startGeneration;
         voiceSessionStartInFlight = true;
         tmuxctldClient.startVoiceSession({
           botName: normalizeBotName(botName),
@@ -290,12 +307,22 @@ export function createVoiceManager(botClients, config, logger) {
           channelId: state.channelId,
           routeEpoch: state.routeEpoch,
         }).then((started) => {
+          if (discarded || voiceSessionGeneration !== startGeneration) {
+            const staleId = started.voice_session_id || '';
+            if (staleId) {
+              tmuxctldClient.clearVoiceSession({ voiceSessionId: staleId }).catch(() => {});
+            }
+            return;
+          }
           voiceSessionId = started.voice_session_id || null;
           logger.info(`Voice [${botName}]: started voice session ${voiceSessionId || 'none'} for user ${userId}`);
         }).catch((err) => {
+          if (discarded || voiceSessionGeneration !== startGeneration) return;
           logger.warn(`Voice [${botName}]: voice session start failed for user ${userId}: ${err.code || err.message}`);
         }).finally(() => {
-          voiceSessionStartInFlight = false;
+          if (!discarded) {
+            voiceSessionStartInFlight = false;
+          }
         });
       }
 
@@ -339,7 +366,21 @@ export function createVoiceManager(botClients, config, logger) {
       }
     });
 
-    state.activeSubscriptions.set(userId, { stream: audioStream, decoder, commit: commitPending, discard: discardPending });
+    state.activeSubscriptions.set(userId, {
+      stream: audioStream,
+      decoder,
+      commit: commitPending,
+      discard: discardPending,
+      clearVoiceSession: clearLocalVoiceSession,
+    });
+  }
+
+  function clearLocalVoiceSession(botName = 'mechanicus', userId = '', voiceSessionId = '') {
+    const state = getBotState(botName);
+    const sub = state.activeSubscriptions.get(String(userId || ''));
+    if (!sub?.clearVoiceSession) return { cleared: false, reason: 'no_subscription', botName, userId };
+    const cleared = sub.clearVoiceSession(String(voiceSessionId || ''));
+    return { cleared, botName, userId, voiceSessionId };
   }
 
   async function runVoiceLeaveCleanup(botName, meta = {}) {
@@ -919,6 +960,7 @@ export function createVoiceManager(botClients, config, logger) {
     playAudio,
     stopPlayback,
     playTTS,
+    clearLocalVoiceSession,
     muteMember,
     unmuteMember,
     setAudioFrameCallback(cb) { onAudioFrame = cb; },

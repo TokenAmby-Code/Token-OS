@@ -82,9 +82,13 @@ def check_bot(bot_name: str) -> dict[str, object]:
     result["target_role"] = target_role
 
     status = tmuxctld_get("/voice/status", {"bot_name": bot_name})
-    if status and status.get("ok"):
-      sessions = status["result"].get("sessions") or []
-      result["active_sessions"] = len(sessions)
+    if not status or not status.get("ok"):
+        message = (status or {}).get("error", {}).get("message") or "tmuxctld unavailable"
+        result["issues"].append(f"Unable to read voice sessions: {message}")
+        return result
+
+    sessions = status["result"].get("sessions") or []
+    result["active_sessions"] = len(sessions)
 
     result["verdict"] = "OK"
     return result

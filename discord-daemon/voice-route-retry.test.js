@@ -8,6 +8,7 @@ import {
 
 test('retry predicate recognizes voice route failures', () => {
   assert.equal(isRetryableVoiceRouteFailure({ routed: false, reason: 'no_target' }), true);
+  assert.equal(isRetryableVoiceRouteFailure({ routed: false, reason: 'voice_session_not_found' }), true);
   assert.equal(isRetryableVoiceRouteFailure(new Error('target not live')), true);
   assert.equal(isRetryableVoiceRouteFailure(new Error('voice session not found')), true);
   assert.equal(isRetryableVoiceRouteFailure({ routed: false, reason: 'no_draft' }), false);

@@ -55,7 +55,7 @@ function tailFile(path, maxLines = 80) {
   }
 }
 
-function createDiscordFixerHook() {
+function createDiscordFixerHook({ writeLine = null } = {}) {
   const recent = new Map();
   const RECENT_TTL_MS = 10 * 60_000;
   const RECENT_MAX = 500;
@@ -63,11 +63,11 @@ function createDiscordFixerHook() {
   function resolveFixerTarget() {
     // Stable public role only. tmuxctld resolves it internally and fails closed
     // if it is not live. Existing REDIRECT env remains a compatibility alias.
-    return (
-      process.env[FIXER_TARGET_ENV] ||
-      process.env[FIXER_REDIRECT_ENV] ||
-      'mechanicus:fabricator-general'
-    ).trim();
+    const primary = (process.env[FIXER_TARGET_ENV] || '').trim();
+    if (primary) return primary;
+    const legacy = (process.env[FIXER_REDIRECT_ENV] || '').trim();
+    if (legacy) return legacy;
+    return 'mechanicus:fabricator-general';
   }
 
   return async function hookDiscordError(line, msg, meta = {}, logFile) {
@@ -113,27 +113,34 @@ function createDiscordFixerHook() {
       await tmuxctldClient.sendText({ target, text: prompt, submit: true });
     } catch (err) {
       const failLine = `${new Date().toISOString()} [WARN ] Discord fixer hook: no_target target=${target} error=${err.code || err.message}; dropping ${errorCode}`;
-      console.log(failLine);
-      try { appendFileSync(logFile, failLine + '\n'); } catch {}
+      if (writeLine) {
+        writeLine(failLine);
+      } else {
+        try { appendFileSync(logFile, failLine + '\n'); } catch {}
+      }
     }
   };
 }
-
-const discordFixerHook = createDiscordFixerHook();
 
 function createLogger(level = 'info') {
   const minLevel = LOG_LEVELS[level] ?? 1;
   const logFile = join(LOG_DIR, `daemon-${new Date().toISOString().slice(0, 10)}.log`);
 
-  function log(lvl, msg, meta = {}) {
-    if (LOG_LEVELS[lvl] < minLevel) return;
-    const line = `${new Date().toISOString()} [${lvl.toUpperCase().padEnd(5)}] ${msg}`;
+  function writeLine(line) {
     console.log(line);
     try {
       appendFileSync(logFile, line + '\n');
     } catch {
       // Don't crash on log write failure
     }
+  }
+
+  const discordFixerHook = createDiscordFixerHook({ writeLine });
+
+  function log(lvl, msg, meta = {}) {
+    if (LOG_LEVELS[lvl] < minLevel) return;
+    const line = `${new Date().toISOString()} [${lvl.toUpperCase().padEnd(5)}] ${msg}`;
+    writeLine(line);
     if (lvl === 'error') {
       try { Promise.resolve(discordFixerHook(line, msg, meta, logFile)).catch(() => {}); } catch {}
     }
@@ -241,6 +248,9 @@ async function main() {
         botLabel,
       });
       logger.info(`Transcription [${botLabel}]: voice route ${JSON.stringify(routed)}`);
+      if (routed?.voice_session_invalidated) {
+        voiceManager.clearLocalVoiceSession?.(botLabel, result.userId, routed.voice_session_id || '');
+      }
       if (routed && routed.routed === false && routed.reason && !routed.ignored && !routed.warning_sent && !routed.route_failure) {
         try {
           await voiceManager.playTTS(`Voice route failed: ${routed.reason}`, botLabel);
