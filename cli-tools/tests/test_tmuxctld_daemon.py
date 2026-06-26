@@ -10,7 +10,6 @@ import pathlib
 import socket
 import sys
 import threading
-import time
 import urllib.error
 import urllib.request
 
@@ -283,6 +282,9 @@ class SendAckAdapter:
     """Pane carries an instance stamp; send-keys calls are recorded."""
 
     calls: list[tuple[str, ...]] = []
+    # Set once the literal `send-keys -l` injection is recorded, so the test can
+    # post its ack deterministically AFTER the send started (no sleep race).
+    literal_sent: threading.Event | None = None
 
     def __init__(self) -> None:
         self.last_send_gate_result = None
@@ -292,6 +294,8 @@ class SendAckAdapter:
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         type(self).calls.append(tuple(args))
+        if args[:1] == ("send-keys",) and "-l" in args and type(self).literal_sent is not None:
+            type(self).literal_sent.set()
         return ""
 
     def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
@@ -303,6 +307,7 @@ class SendAckAdapter:
 
 def test_send_text_waits_for_user_prompt_submit_ack() -> None:
     SendAckAdapter.calls = []
+    SendAckAdapter.literal_sent = threading.Event()
     server, _ = _serve(SendAckAdapter)
     try:
         result_box: dict = {}
@@ -323,7 +328,10 @@ def test_send_text_waits_for_user_prompt_submit_ack() -> None:
 
         thread = threading.Thread(target=send)
         thread.start()
-        time.sleep(0.05)
+        # Wait for the literal send to be recorded before posting the ack, so the
+        # sniffer's `since` window is already open and can never drop it as stale.
+        assert SendAckAdapter.literal_sent is not None
+        assert SendAckAdapter.literal_sent.wait(timeout=2)
         _, ack = _post(
             server,
             "/hooks/user-prompt-submit",

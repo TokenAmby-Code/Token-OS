@@ -79,20 +79,25 @@ logger = logging.getLogger("token_api")
 router = APIRouter()
 
 
-def _tmuxctld_loopback_url() -> str:
-    """Loopback tmuxctld URL for hook acks.
+def _tmuxctld_loopback_url() -> str | None:
+    """Loopback tmuxctld URL for hook acks, or None when not loopback.
 
     UserPromptSubmit is the acknowledgement edge for daemon send transactions.
     This echo defaults to the local daemon because tmuxctld is launchd-supervised
     and always expected on the Mac; failures are best-effort and must never
-    block the hook handler.
+    block the hook handler. Routes through the shared resolver so an arbitrary
+    ``TMUXCTLD_URL`` can never POST prompt-submit metadata off-box (the resolver
+    rejects any non-loopback / non-http host).
     """
 
-    return (os.environ.get("TMUXCTLD_URL") or "http://127.0.0.1:7778").rstrip("/")
+    return shared._tmuxctld_url(default_loopback=True)
 
 
 def _echo_prompt_submit_to_tmuxctld_sync(payload: dict) -> None:
-    url = f"{_tmuxctld_loopback_url()}/hooks/user-prompt-submit"
+    base = _tmuxctld_loopback_url()
+    if not base:
+        return
+    url = f"{base}/hooks/user-prompt-submit"
     env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
     body = {
         "session_id": payload.get("session_id"),

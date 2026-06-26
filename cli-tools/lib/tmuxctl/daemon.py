@@ -473,7 +473,13 @@ def _h_send_text(control, params):
     if not submit:
         return control.send_text(pane, text, clear_prompt=clear_prompt, submit=False)
 
-    payload_hash = prompt_payload_hash(text)
+    # Hash the NORMALIZED payload that is actually injected (newlines collapsed,
+    # rstripped) — not the raw text. The UserPromptSubmit ack hashes the prompt
+    # the agent received (post-normalization; cf. agent-cmd's payload_hash), so
+    # hashing raw multiline text here would never match and force a false
+    # `unverified` + needless recovery.
+    normalized_payload = normalize_prompt_payload(text)
+    payload_hash = prompt_payload_hash(normalized_payload)
     dispatch_id = str(uuid.uuid4())
     instance_id = ""
     try:
@@ -543,9 +549,7 @@ def _h_send_text(control, params):
                     submit_settle_seconds=submit_settle_seconds,
                 )
             else:
-                normalized = re.sub(r"[\r\n]+", " ", text).rstrip()
-                if not normalized.strip():
-                    raise ValueError("prompt payload is empty after normalization")
+                normalized = normalized_payload
                 if clear_prompt:
                     control.adapter.send_keys(pane, "C-u")
                 control.adapter.run("send-keys", "-t", pane, "-l", normalized)

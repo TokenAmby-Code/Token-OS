@@ -221,8 +221,33 @@ PY
         fi
     elif [[ "$rc" != 0 ]]; then
         echo "$out" >&2
-        verification_status="failed"
-        verified_by="tmuxctld"
+        # A daemon `ok:false` with error.code=="gated" means ZERO bytes were
+        # written and the send is re-queueable — surface it as blocked (with the
+        # gate reason) rather than collapsing it to a generic failure, so the
+        # caller keeps the no-bytes-written retry signal (surface-don't-suppress).
+        local gate_code=""
+        gate_code=$(python3 -c 'import json,sys
+try:
+    p=json.loads(sys.stdin.read())
+except Exception:
+    p={}
+print((p.get("error") or {}).get("code") or "" if isinstance(p, dict) else "")' <<<"$out" 2>/dev/null || true)
+        if [[ "$gate_code" == "gated" ]]; then
+            blocked=true
+            verification_status="gated"
+            verified_by=""
+            reason=$(python3 -c 'import json,sys
+try:
+    p=json.loads(sys.stdin.read())
+except Exception:
+    p={}
+err=(p.get("error") or {}) if isinstance(p, dict) else {}
+detail=err.get("detail") if isinstance(err.get("detail"), dict) else {}
+print(detail.get("reason") or err.get("message") or "gated")' <<<"$out" 2>/dev/null || echo "gated")
+        else
+            verification_status="failed"
+            verified_by="tmuxctld"
+        fi
     fi
     if [[ "$rc" == 0 && "$verified_by" == "tmuxctld" ]]; then
         verification_status=$(python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); print((p.get("result") or {}).get("verification_status") or "unverified")' <<<"$out" 2>/dev/null || echo "unverified")
