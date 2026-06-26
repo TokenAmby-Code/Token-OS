@@ -6,7 +6,9 @@ morning fan-out work. Keep it side-effect-light until each consumer is wired.
 
 import asyncio
 import logging
+import os
 import re
+from datetime import datetime
 from typing import Any
 
 import aiosqlite
@@ -26,6 +28,14 @@ from shared import (
 logger = logging.getLogger("token_api")
 
 router = APIRouter()
+
+_NAS_MOUNT = "/Volumes/Imperium"
+_DISCORD_DAEMON = "http://localhost:7779"
+_LOCAL_API = "http://localhost:7777"
+
+
+def _nas_is_mounted() -> bool:
+    return os.path.ismount(_NAS_MOUNT)
 
 
 class DayStartFireRequest(BaseModel):
@@ -151,6 +161,70 @@ async def _consumer_custodes_doc_rebind() -> dict:
     return {"status": "ok", "rebound": rebound, "skipped": skipped}
 
 
+async def _consumer_daily_note_creation() -> dict:
+    """Verify or create today's Terra daily note (Terra/Journal/Daily/YYYY-MM-DD.md).
+
+    Idempotent: if the note already exists, returns ok with already_existed=True.
+    NAS preflight: if /Volumes/Imperium is not mounted, returns skipped rather
+    than failing loudly, so the rest of the fan-out continues.
+    """
+    from session_doc_helpers import daily_notes_dir, resolve_or_create_today_daily_note_session_doc
+
+    if not _nas_is_mounted():
+        return {"status": "skipped", "reason": "NAS not mounted"}
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    note_path = daily_notes_dir() / f"{date_str}.md"
+    already_existed = note_path.exists()
+
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        db.row_factory = aiosqlite.Row
+        doc_id = await resolve_or_create_today_daily_note_session_doc(db)
+        await db.commit()
+
+    return {
+        "status": "ok",
+        "path": str(note_path),
+        "already_existed": already_existed,
+        "doc_id": doc_id,
+    }
+
+
+async def _notify_daily_note_missed(result: dict) -> None:
+    """Loud alert when the daily note was not created. Best-effort; never raises."""
+    import httpx
+
+    status = result.get("status", "unknown")
+    reason = result.get("reason") or result.get("error", "unknown")
+    msg = (
+        f"Daily note NOT created today (status={status}, reason={reason}). "
+        "Check NAS mount and Terra vault. Trigger manually if needed."
+    )
+
+    await log_event("daily_note_creation_missed", details={"result": result, "message": msg})
+    logger.warning("daily_note_creation_missed: %s", msg)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{_LOCAL_API}/api/notify",
+                json={"message": msg, "tts": True},
+                timeout=5,
+            )
+    except Exception as exc:
+        logger.warning("daily_note_missed TTS notify failed: %s", exc)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{_DISCORD_DAEMON}/send",
+                json={"channel": "briefing", "content": msg, "bot": "custodes"},
+                timeout=5,
+            )
+    except Exception as exc:
+        logger.warning("daily_note_missed discord alert failed: %s", exc)
+
+
 async def _consumer_stub(name: str, follow_up: str) -> dict:
     return {"status": "stubbed", "consumer": name, "follow_up": follow_up}
 
@@ -188,13 +262,7 @@ async def _day_start_fanout(day_state: dict) -> list[dict]:
         ),
         ("phone_reachability_check", _consumer_phone_reachability(day_state)),
         ("music_auto_start", _consumer_stub("music_auto_start", "start default morning audio")),
-        (
-            "daily_note_creation",
-            _consumer_stub(
-                "daily_note_creation",
-                "verify/create Terra/Journal/Daily/YYYY-MM-DD.md via Obsidian CLI",
-            ),
-        ),
+        ("daily_note_creation", _consumer_daily_note_creation()),
         (
             "morning_session_start",
             _consumer_stub(
@@ -249,6 +317,23 @@ async def fire_day_start_internal(
         }
 
     fanout = await _day_start_fanout(state)
+
+    # Loud alert if daily note was not successfully created.
+    daily_note_item = next(
+        (item for item in fanout if item.get("consumer") == "daily_note_creation"),
+        None,
+    )
+    if daily_note_item is not None:
+        if not daily_note_item.get("success"):
+            missed_result = {
+                "status": "error",
+                "reason": daily_note_item.get("error", "consumer_exception"),
+            }
+        else:
+            missed_result = daily_note_item.get("result") or {}
+        if missed_result.get("status") != "ok":
+            await _notify_daily_note_missed(missed_result)
+
     return {
         "success": True,
         "already_started": False,
@@ -256,6 +341,25 @@ async def fire_day_start_internal(
         "fanout": fanout,
         "quiet_hours": get_quiet_hours_status(),
     }
+
+
+async def fire_day_start_schedule_fallback() -> dict:
+    """Idempotent 08:30 backstop: fires day-start only if today hasn't started yet.
+
+    This is the safety net when the Hatch alarm-silence pathway is broken and
+    the morning_supervisor has not yet armed (or failed to arm after a reboot).
+    Uses source='schedule_fallback' — intentionally NOT in OFFICIAL_MORNING_SOURCES
+    so it does not release the quiet-hours morning latch; the morning_supervisor's
+    custodes-sourced backstop handles that separately.
+    """
+    local_now = quiet_hours_local_now()
+    state = await get_day_state(local_now.date().isoformat())
+    if state and state.get("day_started_at"):
+        logger.info("day_start_schedule_fallback: day already started, skipping")
+        return {"skipped": True, "reason": "already_started"}
+
+    logger.info("day_start_schedule_fallback: day not started, firing day-start fanout")
+    return await fire_day_start_internal(source="schedule_fallback")
 
 
 @router.post("/api/day-start/fire")

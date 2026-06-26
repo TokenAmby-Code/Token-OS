@@ -1939,6 +1939,18 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "0 4 * * *",
                 0,
             ),
+            (
+                "day_start_schedule_fallback",
+                "Day-Start Schedule Fallback",
+                "Idempotent 08:30 backstop: fires the day-start fan-out only if today has "
+                "not already started via Hatch alarm-silence. Restores daily-note creation "
+                "and other fan-out tasks when the Hatch pathway is broken. Uses "
+                "source='schedule_fallback' (not in OFFICIAL_MORNING_SOURCES) so it does "
+                "not release the quiet-hours morning latch.",
+                "cron",
+                "30 8 * * *",
+                0,
+            ),
         ]
         for task_id, name, description, task_type, schedule, max_retries in scheduled_task_seed:
             await db.execute(
@@ -1948,14 +1960,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
             """,
                 (task_id, name, description, task_type, schedule, max_retries),
             )
-
-        # Retire the legacy magic-number day-start fallback. There is no fixed
-        # wake-anchor cron anymore: the reactive day-start is event-driven
-        # (alarm_silenced), and "expected wake" lives only in the morning
-        # supervisor. Drop any pre-existing row so an older DB stops firing the
-        # phantom 08:30 morning session. History in task_executions is retained.
-        await db.execute("DELETE FROM scheduled_tasks WHERE id = 'day_start_schedule_fallback'")
-        await db.execute("DELETE FROM task_locks WHERE task_id = 'day_start_schedule_fallback'")
 
         checkin_tasks = [
             (

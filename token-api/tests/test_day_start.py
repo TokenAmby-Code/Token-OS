@@ -1,5 +1,7 @@
+import asyncio
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
@@ -9,6 +11,15 @@ def _row(db_path, query, params=()):
     row = conn.execute(query, params).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def _count_events(db_path, event_type):
+    conn = sqlite3.connect(db_path)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE event_type = ?", (event_type,)
+    ).fetchone()[0]
+    conn.close()
+    return count
 
 
 def test_day_state_table_exists(app_env):
@@ -144,3 +155,119 @@ def test_alarm_silenced_fires_day_start_and_launches_morning(app_env, monkeypatc
     second = client.post("/api/morning/alarm-silenced").json()
     assert second["already_started"] is True
     assert launches == [True]
+
+
+# ── Task D: daily_note_creation consumer tests ────────────────────────────────
+
+
+def test_daily_note_creation_consumer_skipped_when_nas_not_mounted(monkeypatch):
+    """Consumer returns skipped immediately when /Volumes/Imperium is not mounted."""
+    import routes.day_start as day_start
+
+    monkeypatch.setattr(day_start, "_nas_is_mounted", lambda: False)
+    result = asyncio.run(day_start._consumer_daily_note_creation())
+    assert result["status"] == "skipped"
+    assert "NAS" in result["reason"]
+
+
+def test_daily_note_creation_consumer_creates_note_when_nas_mounted(app_env, monkeypatch):
+    """Consumer creates the Terra daily note when NAS is mounted and note is absent."""
+    import routes.day_start as day_start
+
+    monkeypatch.setattr(day_start, "_nas_is_mounted", lambda: True)
+    result = asyncio.run(day_start._consumer_daily_note_creation())
+    assert result["status"] == "ok"
+    assert result["already_existed"] is False
+    assert Path(result["path"]).exists()
+
+
+def test_daily_note_creation_consumer_idempotent(app_env, monkeypatch):
+    """Consumer returns ok with already_existed=True when the note already exists."""
+    import routes.day_start as day_start
+
+    monkeypatch.setattr(day_start, "_nas_is_mounted", lambda: True)
+    first = asyncio.run(day_start._consumer_daily_note_creation())
+    assert first["status"] == "ok"
+    assert first["already_existed"] is False
+
+    second = asyncio.run(day_start._consumer_daily_note_creation())
+    assert second["status"] == "ok"
+    assert second["already_existed"] is True
+
+
+def test_daily_note_creation_ok_no_missed_event(app_env, monkeypatch):
+    """fire_day_start_internal with NAS mounted: note created, daily_note_creation_missed NOT emitted."""
+    from fastapi.testclient import TestClient
+
+    import routes.day_start as day_start
+
+    async def fake_morning():
+        return {"status": "ok", "result": "launched", "pane_id": "%99"}
+
+    async def fake_phone(_state):
+        return {"status": "ok", "reachable": True}
+
+    async def fake_rebind():
+        return {"status": "ok", "rebound": [], "skipped": []}
+
+    monkeypatch.setattr(day_start, "_nas_is_mounted", lambda: True)
+    monkeypatch.setattr(day_start, "_consumer_custodes_morning_session", fake_morning)
+    monkeypatch.setattr(day_start, "_consumer_phone_reachability", fake_phone)
+    monkeypatch.setattr(day_start, "_consumer_custodes_doc_rebind", fake_rebind)
+
+    client = TestClient(app_env.main.app)
+    resp = client.post("/api/day-start/fire", json={"source": "test_dry_run", "force": True})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+
+    note_item = next(
+        (item for item in data["fanout"] if item["consumer"] == "daily_note_creation"),
+        None,
+    )
+    assert note_item is not None
+    assert note_item["result"]["status"] == "ok"
+
+    # No missed-note alert emitted on success.
+    assert _count_events(app_env.db_path, "daily_note_creation_missed") == 0
+
+
+def test_daily_note_creation_failure_emits_missed_event(app_env, monkeypatch):
+    """fire_day_start_internal: consumer exception emits daily_note_creation_missed event."""
+    from fastapi.testclient import TestClient
+
+    import routes.day_start as day_start
+
+    async def fake_morning():
+        return {"status": "ok", "result": "launched", "pane_id": "%99"}
+
+    async def fake_phone(_state):
+        return {"status": "ok", "reachable": True}
+
+    async def fake_rebind():
+        return {"status": "ok", "rebound": [], "skipped": []}
+
+    async def failing_note_creation():
+        raise RuntimeError("obsidian CLI unavailable in test")
+
+    monkeypatch.setattr(day_start, "_nas_is_mounted", lambda: True)
+    monkeypatch.setattr(day_start, "_consumer_custodes_morning_session", fake_morning)
+    monkeypatch.setattr(day_start, "_consumer_phone_reachability", fake_phone)
+    monkeypatch.setattr(day_start, "_consumer_custodes_doc_rebind", fake_rebind)
+    monkeypatch.setattr(day_start, "_consumer_daily_note_creation", failing_note_creation)
+
+    client = TestClient(app_env.main.app)
+    resp = client.post("/api/day-start/fire", json={"source": "test_dry_run", "force": True})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+
+    note_item = next(
+        (item for item in data["fanout"] if item["consumer"] == "daily_note_creation"),
+        None,
+    )
+    assert note_item is not None
+    assert note_item["success"] is False
+
+    # Missed-note alert was emitted.
+    assert _count_events(app_env.db_path, "daily_note_creation_missed") == 1
