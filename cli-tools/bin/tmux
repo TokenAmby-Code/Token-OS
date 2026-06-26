@@ -24,6 +24,17 @@ _TX_BIN="${_BIN_DIR}/tx"
 # for any benign one-level nesting while killing an exponential fork bomb
 # almost immediately.
 _IMPERIUM_TMUX_SHIM_MAX_DEPTH=3
+# Fail closed on a malformed inherited counter: a non-digit/negative value
+# (e.g. IMPERIUM_TMUX_SHIM_DEPTH=-100) would otherwise keep the `> max` check
+# false for many re-entries and silently defeat the fork-bomb fuse. Treat any
+# value that is not a bare non-negative integer as a tripped fuse.
+case "${IMPERIUM_TMUX_SHIM_DEPTH:-0}" in
+    (''|*[!0-9]*)
+        printf 'tmux: FATAL invalid IMPERIUM_TMUX_SHIM_DEPTH=%s (expected a non-negative integer) — refusing to run.\n' \
+            "${IMPERIUM_TMUX_SHIM_DEPTH:-}" >&2
+        exit 70
+        ;;
+esac
 IMPERIUM_TMUX_SHIM_DEPTH=$(( ${IMPERIUM_TMUX_SHIM_DEPTH:-0} + 1 ))
 export IMPERIUM_TMUX_SHIM_DEPTH
 if (( IMPERIUM_TMUX_SHIM_DEPTH > _IMPERIUM_TMUX_SHIM_MAX_DEPTH )); then

@@ -120,11 +120,32 @@ def test_depth_fuse_aborts_loudly_above_bound(tmp_path) -> None:
 
     proc = _run(env, "display-message", "-p", "hello")
 
-    assert proc.returncode != 0, (proc.returncode, proc.stdout)
+    # The recursion fuse aborts with the documented EX_SOFTWARE (70); lock the
+    # contract to that exact code, not merely "any non-zero".
+    assert proc.returncode == 70, (proc.returncode, proc.stdout, proc.stderr)
     # The real tmux must NOT have been invoked — the fuse pre-empted it.
     assert MARKER not in proc.stdout, proc.stdout
     # Loud: a clear recursion error on stderr.
     assert "recursion" in proc.stderr.lower() or "depth" in proc.stderr.lower(), proc.stderr
+
+
+def test_depth_fuse_fails_closed_on_malformed_counter(tmp_path) -> None:
+    """A non-integer / negative inherited counter must trip the fuse.
+
+    A negative pre-seed (e.g. -100) would otherwise keep ``> max`` false for
+    many re-entries and silently defeat the fork-bomb guard, so the shim must
+    reject any value that is not a bare non-negative integer.
+    """
+    for bad in ("-100", "abc", "1; rm", "3.5"):
+        env = _base_env(tmp_path)
+        env["IMPERIUM_TMUX_BIN"] = str(_fake_real_tmux(tmp_path))
+        env["IMPERIUM_TMUX_SHIM_DEPTH"] = bad
+
+        proc = _run(env, "display-message", "-p", "hello")
+
+        assert proc.returncode == 70, (bad, proc.returncode, proc.stdout, proc.stderr)
+        assert MARKER not in proc.stdout, (bad, proc.stdout)
+        assert "IMPERIUM_TMUX_SHIM_DEPTH" in proc.stderr, (bad, proc.stderr)
 
 
 def test_depth_fuse_allows_normal_single_invocation(tmp_path) -> None:
