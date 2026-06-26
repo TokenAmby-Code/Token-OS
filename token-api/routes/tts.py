@@ -1581,14 +1581,20 @@ async def promote_from_pause(request: PromoteRequest):
             return {"success": True, "promoted": 0, "reason": "pause_queue_empty"}
 
         if request.instance_id:
-            # Promote all items from this instance
+            # Promote all items from this instance, oldest first on playback.
             to_promote = [item for item in pause_queue if item.instance_id == request.instance_id]
             for item in to_promote:
                 pause_queue.remove(item)
                 item.queue_target = "hot"
                 item.focus_on_playback = True
+            # `to_promote` is in pause order (oldest→newest). The hot queue drains
+            # left→right (popleft, FIFO), so to make the batch play oldest-first at
+            # the FRONT of the hot queue we appendleft in REVERSE: the oldest ends
+            # up leftmost. appendleft-in-forward-order would reverse the cascade —
+            # the Emperor heard it backwards ("draining ... playing in reverse").
+            for item in reversed(to_promote):
                 hot_queue.appendleft(item)
-                promoted += 1
+            promoted += len(to_promote)
         else:
             # Promote the next (oldest) item
             item = pause_queue.popleft()
@@ -1614,8 +1620,11 @@ async def play_pane(request: PlayPaneRequest):
             pause_queue.remove(item)
             item.queue_target = "hot"
             item.focus_on_playback = True
+        # Preserve chronological playback: oldest first. See promote_from_pause —
+        # appendleft in reverse so the batch drains oldest→newest, not reversed.
+        for item in reversed(to_promote):
             hot_queue.appendleft(item)
-            promoted += 1
+        promoted += len(to_promote)
 
     logger.info(f"play-pane: Promoted {promoted} item(s) for {request.instance_id} to hot queue")
     return {"success": True, "promoted": promoted, "instance_id": request.instance_id}

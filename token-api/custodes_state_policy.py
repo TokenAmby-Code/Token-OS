@@ -77,6 +77,7 @@ class CustodesIntervention:
 
 
 def normalize_severity(value: int | str | None) -> int:
+    """Return a positive integer severity, defaulting invalid values to 1."""
     if value is None:
         return 1
     try:
@@ -86,6 +87,7 @@ def normalize_severity(value: int | str | None) -> int:
 
 
 def build_dedupe_key(event: StateEvent) -> str:
+    """Build the stable dedupe key for a state event."""
     payload = event.payload or {}
     subject = (
         payload.get("phone_app")
@@ -97,6 +99,19 @@ def build_dedupe_key(event: StateEvent) -> str:
         or "global"
     )
     base = f"{event.event_type}:{event.source}:{subject}"
+    if event.event_type == "tts_queue_languishing":
+        # The languishing alert ESCALATES with queue depth: each new message that
+        # deepens the pause queue is a distinct, legitimate re-alert that the
+        # condition is worsening — not a repeat. `subject` here resolves to the
+        # constant `app="tts_queue"` (== source), so the base key is constant
+        # (`tts_queue_languishing:tts_queue:tts_queue`) and EVERY distinct alert
+        # collides onto it. The dedup framework then eats all but the first, so a
+        # persistent/growing queue stops reaching the Emperor — enforcement is
+        # wrongly swallowed. Distinguish by depth so distinct alerts get distinct
+        # keys and keep escalating (retrigger-escalate), never collapsed-away.
+        length = payload.get("pause_queue_length")
+        if length is not None:
+            return f"{base}:len={length}"
     if event.event_type == "enforcement_cascade_escalate" and payload.get("level") is not None:
         return f"{base}:level={payload['level']}"
     if event.event_type == "expected_ack_escalated":
@@ -110,6 +125,7 @@ def build_dedupe_key(event: StateEvent) -> str:
 
 
 def _format_minutes(ms: Any) -> str | None:
+    """Format millisecond deltas as signed minute strings."""
     try:
         minutes = round(abs(int(ms)) / 60000)
     except (TypeError, ValueError):
@@ -144,6 +160,7 @@ PHONE_APP_SOURCES = {
 
 
 def _source_allows_app_as_phone_app(source: str) -> bool:
+    """Return whether an app field from this source names a phone app."""
     return source in PHONE_APP_SOURCES or source.startswith("phone_")
 
 
@@ -152,6 +169,7 @@ def _snapshot_items(
     payload: dict[str, Any],
     source: str,
 ) -> list[str]:
+    """Render relevant snapshot and payload fields for the prompt."""
     timer = snapshot.get("timer") or {}
     phone = snapshot.get("phone") or {}
     desktop = snapshot.get("desktop") or {}
