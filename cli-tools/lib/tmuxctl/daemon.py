@@ -563,6 +563,26 @@ def _h_send_text(control, params):
     else:
         pre_submit_keys = ()
 
+    # Resolve the physical pane id once for all guard + capture ops. tmux pane
+    # options (@TYPING_*_UNTIL) and capture-pane key off the real %NN; the
+    # caller-supplied id may be a canonical page:id. _resolve is a no-op on a raw
+    # %NN, so it is safe either way and tolerant of resolver failure.
+    try:
+        phys_pane = control.adapter._resolve_pane_target_arg(pane)
+    except Exception:
+        phys_pane = pane
+
+    # Fail closed before ANY byte-bearing send, including insert-only calls. If a
+    # human/pending/other agent guard is already live, do not enter send_gate's
+    # default delay path: that holds the HTTP request until caller timeouts and
+    # can later release a stale send onto active typing. Surface a structured
+    # gated result instead; Token-API can queue/retry, but tmuxctld issues zero
+    # bytes now.
+    normalized_payload = normalize_prompt_payload(text)
+    pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
+    if pre_gate is not None and pre_gate.get("suppressed"):
+        raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
+
     if not submit:
         return control.send_text(pane, text, clear_prompt=clear_prompt, submit=False)
 
@@ -571,7 +591,6 @@ def _h_send_text(control, params):
     # the agent received (post-normalization; cf. agent-cmd's payload_hash), so
     # hashing raw multiline text here would never match and force a false
     # `unverified` + needless recovery.
-    normalized_payload = normalize_prompt_payload(text)
     payload_hash = prompt_payload_hash(normalized_payload)
     dispatch_id = str(uuid.uuid4())
     instance_id = ""
@@ -579,24 +598,6 @@ def _h_send_text(control, params):
         instance_id = str(control.instance_id_for_pane(pane).get("instance_id") or "").strip()
     except Exception:
         instance_id = ""
-
-    # Resolve the physical pane id once for the guard + capture ops. tmux pane
-    # options (@TYPING_AGENT_UNTIL) and capture-pane key off the real %NN; the
-    # caller-supplied id may be a canonical page:id. _resolve is a no-op on a raw
-    # %NN, so it is safe either way and tolerant of resolver failure.
-    try:
-        phys_pane = control.adapter._resolve_pane_target_arg(pane)
-    except Exception:
-        phys_pane = pane
-
-    # Fail closed BEFORE acquiring our own agent hold. If a human/pending/other
-    # agent guard is already live, do not enter send_gate's default delay path:
-    # that holds the HTTP request until caller timeouts and can later release a
-    # stale send onto active typing. Surface a structured gated result instead;
-    # Token-API can queue/retry, but tmuxctld will issue zero bytes now.
-    pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
-    if pre_gate is not None and pre_gate.get("suppressed"):
-        raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
 
     # Hold the typing guard (green ⌨ AGENT state) for the handshake window so
     # concurrent sends to this pane delay behind it (state-blind, the existing

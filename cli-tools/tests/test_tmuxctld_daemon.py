@@ -655,6 +655,40 @@ def test_send_text_returns_gated_without_waiting_or_writing_under_typing_guard(m
         server.shutdown()
 
 
+def test_insert_only_send_text_is_also_gated_under_typing_guard(monkeypatch) -> None:
+    SendAckAdapter.calls = []
+    monkeypatch.setattr(
+        daemon.send_gate,
+        "evaluate",
+        lambda *a, **k: {
+            "suppressed": True,
+            "policy": "delay",
+            "reason": "typing_guard",
+            "target": "%42",
+        },
+    )
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "insert only",
+                "submit": False,
+                "verify": False,
+                "submit_settle_seconds": 0,
+            },
+            timeout=1,
+        )
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "gated"
+        assert SendAckAdapter.calls == []
+    finally:
+        server.shutdown()
+
+
 @pytest.mark.parametrize(
     "capture,payload,expected",
     [
