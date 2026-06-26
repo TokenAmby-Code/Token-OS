@@ -160,14 +160,21 @@ def test_engine_child_inherits_controlling_tty_on_stdin(tmp_path: Path) -> None:
             env,
         )
     deadline = time.time() + 10
+    timed_out = True
     while time.time() < deadline:
         try:
             if not os.read(fd, 1024):
+                timed_out = False
                 break
         except OSError:
+            timed_out = False
             break
+    if timed_out:
+        # Wrapper wedged (regression): kill so the final reap can't block CI.
+        os.kill(pid, signal.SIGKILL)
     _, status = os.waitpid(pid, 0)
 
+    assert not timed_out, "wrapper did not exit within deadline"
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
     assert marker.exists(), "engine child never ran"
     assert marker.read_text(encoding="utf-8").strip() == "TTY"
