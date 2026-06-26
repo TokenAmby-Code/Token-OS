@@ -662,3 +662,42 @@ def test_run_resolves_canonical_target_to_physical_before_gating(
     assert captured_subprocess == [], "locked-pane send must write zero bytes, never clobber"
     assert recorded_suppressions and recorded_suppressions[-1]["reason"] == "typing_guard"
     assert result == ""
+
+
+def test_tmuxctld_holder_override_cannot_pierce_human_lock(monkeypatch) -> None:
+    """The daemon may pierce only its own AGENT hold, never a human lock.
+
+    Incident regression: tmuxctld held a pane green, then a human keystroke
+    arrived.  The request thread still carried the local
+    ``tmuxctld-send-holder`` override, so later submit keys pierced and clobbered
+    active typing.  A live ON/PENDING hold must nullify that override.
+    """
+    _force_quiet(monkeypatch, False)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: target == "%44")
+
+    with send_gate.thread_local_override("tmuxctld-send-holder"):
+        result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "delay"
+    assert result["suppressed"] is True
+    assert result["override"] is None
+    assert result["ignored_override"] == "tmuxctld-send-holder"
+
+
+def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> None:
+    _force_quiet(monkeypatch, False)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: False)
+
+    with send_gate.thread_local_override("tmuxctld-send-holder"):
+        result = send_gate.evaluate(("send-keys", "-t", "%44", "-l", "payload"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "pierce"
+    assert result["suppressed"] is False
+    assert result["override"] == "tmuxctld-send-holder"
+    assert result["ignored_override"] is None
