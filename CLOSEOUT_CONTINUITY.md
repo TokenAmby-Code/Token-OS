@@ -8,6 +8,6 @@ Branch: fix/enforcement-dedup-routing
 PR#: #390 — https://github.com/TokenAmby-Code/Token-OS/pull/390
 Landed: branch contains per-message/idempotency-related delivery work plus recent commits ef6b27a and a287b04; PR remains OPEN, not merged/deployed.
 Remains: drive PR #390 through checks/review, then merge and deploy only after restart/clearance.
-Exact resume point / next command: cd /Users/tokenclaw/worktrees/Token-OS/wt-fix/enforcement-dedup-routing && gh pr view 390 --json state,reviewDecision,statusCheckRollup && git status --short --branch
+Exact resume point / next command: cd "$(git rev-parse --show-toplevel)" && gh pr view 390 --json state,reviewDecision,statusCheckRollup && git status --short --branch
 
 Stand-down state: worktree parked on branch; pane/process must be left alive if present; no human escalation.
