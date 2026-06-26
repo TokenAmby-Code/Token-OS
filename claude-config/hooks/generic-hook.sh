@@ -1,5 +1,10 @@
 #!/bin/bash
 set -euo pipefail
+# Best-effort hook: must never block Claude Code. Keep strict mode for real bugs,
+# but force a clean exit 0 even if errexit aborts mid-script on a transient
+# subprocess-spawn failure (EMFILE / token-api-restart race). Block decisions are
+# relayed via stdout JSON, never via the exit code, so forcing exit 0 is safe.
+trap 'exit 0' EXIT
 # generic-hook.sh - Unified hook dispatcher for Claude Code
 # Forwards hook JSON + action_type to token-api server for centralized handling
 #
