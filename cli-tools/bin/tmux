@@ -24,24 +24,31 @@ _TX_BIN="${_BIN_DIR}/tx"
 # for any benign one-level nesting while killing an exponential fork bomb
 # almost immediately.
 _IMPERIUM_TMUX_SHIM_MAX_DEPTH=3
-# Fail closed on a malformed inherited counter: a non-digit/negative value
-# (e.g. IMPERIUM_TMUX_SHIM_DEPTH=-100) would otherwise keep the `> max` check
-# false for many re-entries and silently defeat the fork-bomb fuse. Treat any
-# value that is not a bare non-negative integer as a tripped fuse.
-case "${IMPERIUM_TMUX_SHIM_DEPTH:-0}" in
-    (''|*[!0-9]*)
-        printf 'tmux: FATAL invalid IMPERIUM_TMUX_SHIM_DEPTH=%s (expected a non-negative integer) — refusing to run.\n' \
-            "${IMPERIUM_TMUX_SHIM_DEPTH:-}" >&2
-        exit 70
-        ;;
+# Validate the INHERITED counter and trip the fuse BEFORE incrementing. Three
+# ways a poisoned value could otherwise defeat the guard, all failed closed:
+#   1. non-digit / negative (e.g. -100) — never a valid counter.
+#   2. oversized literal (e.g. 9223372036854775807) — `+1` would wrap to a
+#      negative intmax_t and silently slip past the `> max` check. We reject by
+#      DIGIT COUNT before any arithmetic, so an overflowing value never reaches
+#      the numeric comparison.
+#   3. already at/above the bound — we are genuinely re-entering.
+# Comparing the inherited value against max (rather than max+1 after a bump) is
+# equivalent to the old post-increment `> max` test, and guarantees the `+1`
+# below only ever runs on a small in-range value (<= max-1), so it cannot
+# overflow.
+_inherited_tmux_depth="${IMPERIUM_TMUX_SHIM_DEPTH:-0}"
+case "$_inherited_tmux_depth" in
+    (''|*[!0-9]*) _inherited_tmux_depth="" ;;   # mark invalid
 esac
-IMPERIUM_TMUX_SHIM_DEPTH=$(( ${IMPERIUM_TMUX_SHIM_DEPTH:-0} + 1 ))
-export IMPERIUM_TMUX_SHIM_DEPTH
-if (( IMPERIUM_TMUX_SHIM_DEPTH > _IMPERIUM_TMUX_SHIM_MAX_DEPTH )); then
-    printf 'tmux: FATAL recursion fuse tripped (IMPERIUM_TMUX_SHIM_DEPTH=%s > %s) — the tmux shim re-entered itself, real tmux likely misresolved to this shim. Refusing to recurse to prevent a fork bomb.\n' \
-        "$IMPERIUM_TMUX_SHIM_DEPTH" "$_IMPERIUM_TMUX_SHIM_MAX_DEPTH" >&2
+if [[ -z "$_inherited_tmux_depth" || ${#_inherited_tmux_depth} -gt 3 ]] \
+   || (( _inherited_tmux_depth >= _IMPERIUM_TMUX_SHIM_MAX_DEPTH )); then
+    printf 'tmux: FATAL recursion fuse tripped or invalid IMPERIUM_TMUX_SHIM_DEPTH=%s (max depth %s) — real tmux likely misresolved to this shim. Refusing to recurse to prevent a fork bomb.\n' \
+        "${IMPERIUM_TMUX_SHIM_DEPTH:-}" "$_IMPERIUM_TMUX_SHIM_MAX_DEPTH" >&2
     exit 70
 fi
+IMPERIUM_TMUX_SHIM_DEPTH=$(( _inherited_tmux_depth + 1 ))
+export IMPERIUM_TMUX_SHIM_DEPTH
+unset _inherited_tmux_depth
 
 find_real_tmux() {
     # A self-pointing override (IMPERIUM_TMUX_BIN/REAL_TMUX resolving to THIS

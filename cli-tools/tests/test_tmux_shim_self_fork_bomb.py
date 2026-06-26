@@ -130,13 +130,23 @@ def test_depth_fuse_aborts_loudly_above_bound(tmp_path) -> None:
 
 
 def test_depth_fuse_fails_closed_on_malformed_counter(tmp_path) -> None:
-    """A non-integer / negative inherited counter must trip the fuse.
+    """A non-integer / negative / oversized inherited counter must trip the fuse.
 
-    A negative pre-seed (e.g. -100) would otherwise keep ``> max`` false for
-    many re-entries and silently defeat the fork-bomb guard, so the shim must
-    reject any value that is not a bare non-negative integer.
+    Three bypasses are guarded, all failing closed:
+      * negative (e.g. -100) — would keep ``> max`` false for many re-entries;
+      * non-numeric (e.g. ``abc``, ``1; rm``) — arithmetic injection / garbage;
+      * oversized (e.g. INT64_MAX) — ``+1`` would wrap to a negative intmax_t
+        and silently slip past the ``> max`` comparison.
     """
-    for bad in ("-100", "abc", "1; rm", "3.5"):
+    bad_values = (
+        "-100",
+        "abc",
+        "1; rm",
+        "3.5",
+        "9223372036854775807",  # INT64_MAX: +1 wraps negative if not rejected
+        "99999999999999999999999",  # far beyond intmax_t
+    )
+    for bad in bad_values:
         env = _base_env(tmp_path)
         env["IMPERIUM_TMUX_BIN"] = str(_fake_real_tmux(tmp_path))
         env["IMPERIUM_TMUX_SHIM_DEPTH"] = bad
