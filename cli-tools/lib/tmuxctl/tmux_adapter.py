@@ -723,13 +723,17 @@ class TmuxAdapter:
         """
         payload = normalize_prompt_payload(text)
         self._preflight_send_text_transaction(target, payload)
-        # The transaction gate has cleared.  From here through the submit keys,
-        # pierce per-command rechecks so there is no split-brain state where
-        # text reaches the pane but Enter is held/cancelled separately.
+        # Initial mutating sends run in the normal gate path so a re-armed guard
+        # after the preflight is caught rather than silently pierced.  After the
+        # first write lands, check last_send_gate_result and raise if it is set,
+        # then open thread_local_override only for the submit and recovery keys so
+        # Enter cannot be held separately once text has reached the pane.
+        if clear_prompt:
+            self.send_keys(target, "C-u")
+        self.run("send-keys", "-t", target, "-l", payload)
+        if self.last_send_gate_result is not None and self.last_send_gate_result.get("suppressed"):
+            raise TmuxSendGated(self.last_send_gate_result)
         with send_gate.thread_local_override("tmuxctl-submit-transaction"):
-            if clear_prompt:
-                self.send_keys(target, "C-u")
-            self.run("send-keys", "-t", target, "-l", payload)
             if submit_settle_seconds > 0:
                 time.sleep(submit_settle_seconds)
             for key in pre_submit_keys:

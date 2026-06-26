@@ -115,7 +115,9 @@ def test_send_text_then_submit_proceeds_when_gate_open(monkeypatch, captured_sub
     assert adapter.last_send_gate_result is None
 
 
-def test_send_text_then_submit_keeps_enter_in_same_transaction(monkeypatch, captured_subprocess):
+def test_send_text_then_submit_keeps_enter_in_same_transaction(
+    monkeypatch, captured_subprocess
+) -> None:
     """Once prompt text starts landing, submit keys cannot be gated separately.
 
     Regression class: a guard transition after the literal payload could hold
