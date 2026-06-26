@@ -16129,8 +16129,17 @@ async def go_to_sleep_mode():
 
 @app.post("/api/timer/resume")
 async def resume_work_mode():
-    """Exit break/sleeping and resume. Also sets productivity active."""
+    """Exit break/sleeping and resume. Also sets productivity active.
+
+    Morning-session mode has a dedicated lifecycle endpoint because ending it
+    must also write the durable morning state/audit record and emit the
+    morning_session_end event. Treat generic resume as an alias there so any
+    timer dial or legacy client cannot half-exit morning mode.
+    """
     global _current_session_id, _session_start_ms
+    if timer_engine.current_mode == TimerMode.MORNING_SESSION:
+        return await end_morning_session()
+
     now_ms = int(time.monotonic() * 1000)
     old_mode = timer_engine.current_mode.value
     changed, tick_result = timer_engine.resume(now_ms)

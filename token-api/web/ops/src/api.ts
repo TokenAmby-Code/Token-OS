@@ -94,6 +94,7 @@ export type SkipResult = { skipped: boolean; cleared: number; backend?: string |
 export type PromoteResult = { success: boolean; promoted: number };
 export type GlobalModeResult = { status: string; mode: TtsGlobalMode; old_mode: string };
 export type FocusResult = { snapped: boolean; reason: string | null };
+export type MorningEndResult = { status: string; changed: boolean; morning_status: string };
 
 /** Skip current TTS; optionally clear the whole queue. */
 export function skipTts(clearQueue = false): Promise<SkipResult> {
@@ -118,6 +119,11 @@ export function setGlobalMode(mode: TtsGlobalMode): Promise<GlobalModeResult> {
 /** Human-initiated tmux focus: select + zoom the instance's pane (server-resolved). */
 export function focusPane(instanceId: string): Promise<FocusResult> {
   return postJson<FocusResult>(`/api/instances/${encodeURIComponent(instanceId)}/focus-pane`);
+}
+
+/** Officially end the first-class morning-session timer mode. */
+export function endMorningSession(): Promise<MorningEndResult> {
+  return postJson<MorningEndResult>('/api/morning/end');
 }
 
 export type OpenDocResult = {

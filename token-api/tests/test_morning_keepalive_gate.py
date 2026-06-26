@@ -348,6 +348,28 @@ def test_timer_api_reports_morning_session(app_env):
     assert body["manual_mode"] == "morning_session"
 
 
+def test_timer_resume_in_morning_session_uses_morning_end_endpoint(app_env):
+    """Legacy timer-dial resume must run the official morning-end lifecycle."""
+    from fastapi.testclient import TestClient
+
+    import morning_session
+
+    _write_morning_state(status="launched")
+    _enter_timer_morning(app_env)
+    client = TestClient(app_env.main.app)
+
+    resp = client.post("/api/timer/resume")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["morning_status"] == "ended"
+    assert body["status"] == "working"
+
+    state = morning_session.read_morning_state()
+    assert state["status"] == "ended"
+    assert state["ended_by"] == "morning-end"
+
+
 def test_morning_entry_resets_metrics_logs_and_injects(app_env, monkeypatch):
     main = app_env.main
     main.timer_engine._total_work_time_ms = 123_000
