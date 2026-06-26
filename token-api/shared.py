@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,7 +33,72 @@ _LOG_EVENT_WRITE_LOCK = threading.Lock()
 
 # ============ Configuration ============
 
-DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
+RUNTIME_DATABASE_DIR = Path(
+    os.environ.get("TOKEN_API_DATABASE_DIR", Path.home() / "runtimes" / "database")
+).expanduser()
+DEFAULT_AGENTS_DB_PATH = RUNTIME_DATABASE_DIR / "agents.db"
+DEFAULT_TIMER_DB_PATH = RUNTIME_DATABASE_DIR / "timer.db"
+
+
+def _configured_agents_db_path() -> Path:
+    """Resolve the Token-API agents database path.
+
+    TOKEN_API_AGENTS_DB is the canonical override. TOKEN_API_DB remains a
+    compatibility override for existing worktree/test isolation.
+    """
+    value = os.environ.get("TOKEN_API_AGENTS_DB")
+    legacy = os.environ.get("TOKEN_API_DB")
+    if not value and legacy:
+        legacy_path = Path(legacy).expanduser()
+        if legacy_path.resolve() != (Path.home() / ".claude" / "agents.db").resolve():
+            value = legacy
+    return Path(value).expanduser() if value else DEFAULT_AGENTS_DB_PATH
+
+
+def _configured_timer_db_path() -> Path:
+    """Resolve the Token-API timer database path.
+
+    TOKEN_API_TIMER_DB is the canonical override. If legacy TOKEN_API_DB is set
+    and no timer-specific override exists, keep timer writes on that same
+    isolated DB for existing dev/test harnesses. Production defaults split timer
+    writes into ~/runtimes/database/timer.db.
+    """
+    value = os.environ.get("TOKEN_API_TIMER_DB")
+    if value:
+        return Path(value).expanduser()
+    legacy = os.environ.get("TOKEN_API_DB")
+    if legacy:
+        legacy_path = Path(legacy).expanduser()
+        if legacy_path.resolve() != (Path.home() / ".claude" / "agents.db").resolve():
+            return legacy_path
+    return DEFAULT_TIMER_DB_PATH
+
+
+DB_PATH = _configured_agents_db_path()
+AGENTS_DB_PATH = DB_PATH
+TIMER_DB_PATH = _configured_timer_db_path()
+LEGACY_AGENTS_DB_PATH = Path.home() / ".claude" / "agents.db"
+LEGACY_TIMER_DB_PATH = Path.home() / ".claude" / "timer.db"
+
+
+@asynccontextmanager
+async def hook_db():
+    """Autocommit DB connection for hook hot paths.
+
+    Hook handlers perform slow side effects (tmux, vault/frontmatter, routing).
+    A deferred SQLite transaction can hold the write lock across those awaits.
+    Autocommit commits each statement immediately so write locks are not held
+    across non-DB awaits; explicit commits remain harmless no-ops.
+    """
+    import aiosqlite
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(DB_PATH, timeout=5.0, isolation_level=None)
+    try:
+        await db.execute("PRAGMA busy_timeout=5000")
+        yield db
+    finally:
+        await db.close()
 
 
 def _vault_root() -> Path:
@@ -1270,9 +1336,30 @@ def _ensure_timer_samples_table(conn) -> None:
     )
 
 
+def _sync_count_agent_rows(sql: str, timer_conn=None) -> int:
+    """Run a read-only count against the agents DB.
+
+    Timer writes live in TIMER_DB_PATH, but timer samples still include current
+    instance counts from the agents DB. When both paths intentionally point at
+    one isolated test DB, reuse the caller's connection.
+    """
+    try:
+        if timer_conn is not None and TIMER_DB_PATH.resolve() == DB_PATH.resolve():
+            cursor = timer_conn.execute(sql)
+            return int(cursor.fetchone()[0] or 0)
+        with contextlib.closing(sqlite3.connect(DB_PATH, timeout=5.0)) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            cursor = conn.execute(sql)
+            return int(cursor.fetchone()[0] or 0)
+    except Exception as exc:
+        logger.warning("timer agent-count read failed: %s", exc)
+        return 0
+
+
 def _sync_write_timer_sample(source: str, work_state=None, timestamp: str | None = None) -> None:
     """Persist a point-in-time timer read-model sample."""
-    conn = sqlite3.connect(DB_PATH)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(TIMER_DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     try:
         _sync_insert_timer_sample(conn, source=source, work_state=work_state, timestamp=timestamp)
@@ -1294,17 +1381,17 @@ def _sync_insert_timer_sample(
     if active_instances is None:
         active_instances = _coerce_work_state_value(work_state, "active_instance_count")
     if active_instances is None:
-        cursor = conn.execute(
-            "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
+        active_instances = _sync_count_agent_rows(
+            "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0",
+            conn,
         )
-        active_instances = int(cursor.fetchone()[0] or 0)
 
     processing_recent = _coerce_work_state_value(work_state, "processing_recent_count")
     if processing_recent is None:
-        cursor = conn.execute(
-            "SELECT COUNT(*) FROM instances WHERE status = 'working' AND COALESCE(is_subagent, 0) = 0"
+        processing_recent = _sync_count_agent_rows(
+            "SELECT COUNT(*) FROM instances WHERE status = 'working' AND COALESCE(is_subagent, 0) = 0",
+            conn,
         )
-        processing_recent = int(cursor.fetchone()[0] or 0)
 
     observed_agents = _coerce_work_state_value(work_state, "observed_agent_count")
     if observed_agents is None:
@@ -1348,13 +1435,14 @@ def _sync_log_shift(
     """Log a timer mode shift to the analytics table (sync, for thread offload)."""
     from datetime import datetime as _dt
 
-    conn = sqlite3.connect(DB_PATH)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(TIMER_DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
 
-    cursor = conn.execute(
-        "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
+    active_instances = _sync_count_agent_rows(
+        "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0",
+        conn,
     )
-    active_instances = cursor.fetchone()[0]
 
     conn.execute(
         """INSERT INTO timer_shifts (timestamp, old_mode, new_mode, trigger, source,

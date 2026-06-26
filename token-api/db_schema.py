@@ -34,7 +34,116 @@ from personas import (
     validate_mechanicus_invariant,
 )
 
-DEFAULT_DB_PATH = Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
+RUNTIME_DATABASE_DIR = Path(
+    os.environ.get("TOKEN_API_DATABASE_DIR", Path.home() / "runtimes" / "database")
+).expanduser()
+DEFAULT_AGENTS_DB_PATH = RUNTIME_DATABASE_DIR / "agents.db"
+DEFAULT_TIMER_DB_PATH = RUNTIME_DATABASE_DIR / "timer.db"
+LEGACY_AGENTS_DB_PATH = Path.home() / ".claude" / "agents.db"
+
+
+def _legacy_token_api_db_unless_live() -> str | None:
+    value = os.environ.get("TOKEN_API_DB")
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if path.resolve() == LEGACY_AGENTS_DB_PATH.resolve():
+        return None
+    return value
+
+
+DEFAULT_DB_PATH = Path(
+    os.environ.get("TOKEN_API_AGENTS_DB")
+    or _legacy_token_api_db_unless_live()
+    or DEFAULT_AGENTS_DB_PATH
+).expanduser()
+DEFAULT_TIMER_PATH = Path(
+    os.environ.get("TOKEN_API_TIMER_DB")
+    or _legacy_token_api_db_unless_live()
+    or DEFAULT_TIMER_DB_PATH
+).expanduser()
+
+
+_TIMER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS timer_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    state_json TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS timer_state_daily (
+    date TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS timer_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    start_time TIMESTAMP NOT NULL,
+    end_time TIMESTAMP,
+    mode TEXT NOT NULL,
+    duration_ms INTEGER DEFAULT 0,
+    break_earned_ms INTEGER DEFAULT 0,
+    break_used_ms INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS timer_mode_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP NOT NULL,
+    old_mode TEXT,
+    new_mode TEXT NOT NULL,
+    is_automatic INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS timer_daily_scores (
+    date TEXT PRIMARY KEY,
+    productivity_score INTEGER,
+    total_work_ms INTEGER DEFAULT 0,
+    total_break_used_ms INTEGER DEFAULT 0,
+    session_count INTEGER DEFAULT 0,
+    mode_change_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS timer_shifts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    old_mode TEXT,
+    new_mode TEXT NOT NULL,
+    trigger TEXT,
+    source TEXT,
+    break_balance_ms INTEGER,
+    break_backlog_ms INTEGER,
+    work_time_ms INTEGER,
+    active_instances INTEGER,
+    phone_app TEXT,
+    details TEXT
+);
+
+CREATE TABLE IF NOT EXISTS timer_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    activity TEXT,
+    productivity_active INTEGER,
+    break_balance_ms INTEGER,
+    break_backlog_ms INTEGER,
+    work_time_ms INTEGER,
+    active_instance_count INTEGER,
+    processing_recent_count INTEGER,
+    observed_agent_count INTEGER,
+    desktop_mode TEXT,
+    phone_app TEXT,
+    source TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_timer_samples_timestamp ON timer_samples(timestamp);
+"""
 
 
 def archive_db_path_for(db_path: Path) -> Path:
@@ -2044,3 +2153,20 @@ async def init_database_async(db_path: Path | None = None) -> None:
 def init_database_sync(db_path: Path | None = None) -> None:
     """Synchronous wrapper for the canonical async DB initialization."""
     asyncio.run(init_database_async(db_path))
+
+
+async def init_timer_database_async(db_path: Path | None = None) -> None:
+    """Initialize the separate timer SQLite database."""
+    path = db_path or DEFAULT_TIMER_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    async with aiosqlite.connect(path) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
+        await db.executescript(_TIMER_SCHEMA_SQL)
+        await db.commit()
+        print(f"Timer database initialized at {path}")
+
+
+def init_timer_database_sync(db_path: Path | None = None) -> None:
+    """Synchronous wrapper for timer DB initialization."""
+    asyncio.run(init_timer_database_async(db_path))

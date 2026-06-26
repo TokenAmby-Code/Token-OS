@@ -148,6 +148,29 @@ def _runtime_checkout() -> str:
 TOKEN_OS = _runtime_checkout()
 CLI_TOOLS = f"{TOKEN_OS}/cli-tools"
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL") or cfg("token_api_url")
+RUNTIME_DATABASE_DIR = os.path.expanduser(
+    os.environ.get("TOKEN_API_DATABASE_DIR") or "~/runtimes/database"
+)
+_LEGACY_AGENTS_DB = os.path.expanduser("~/.claude/agents.db")
+
+
+def _legacy_token_api_db_unless_live() -> str:
+    value = os.environ.get("TOKEN_API_DB") or ""
+    if value and os.path.abspath(os.path.expanduser(value)) != os.path.abspath(_LEGACY_AGENTS_DB):
+        return os.path.expanduser(value)
+    return ""
+
+
+TOKEN_API_AGENTS_DB = os.path.expanduser(
+    os.environ.get("TOKEN_API_AGENTS_DB")
+    or _legacy_token_api_db_unless_live()
+    or os.path.join(RUNTIME_DATABASE_DIR, "agents.db")
+)
+TOKEN_API_TIMER_DB = os.path.expanduser(
+    os.environ.get("TOKEN_API_TIMER_DB")
+    or _legacy_token_api_db_unless_live()
+    or os.path.join(RUNTIME_DATABASE_DIR, "timer.db")
+)
 
 # All Tailscale IPs for device resolution (replaces DEVICE_IPS in main.py)
 DEVICE_IPS: dict[str, str] = {}

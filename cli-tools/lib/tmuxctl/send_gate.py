@@ -139,7 +139,18 @@ _OFFICIAL_MORNING_SOURCES = frozenset(
 
 
 def _db_path() -> Path:
-    return Path(os.environ.get("TOKEN_API_DB", Path.home() / ".claude" / "agents.db"))
+    legacy = Path.home() / ".claude" / "agents.db"
+    token_api_db = os.environ.get("TOKEN_API_DB")
+    compat = None
+    if token_api_db:
+        token_api_path = Path(token_api_db).expanduser()
+        if token_api_path.resolve() != legacy.resolve():
+            compat = token_api_db
+    return Path(
+        os.environ.get("TOKEN_API_AGENTS_DB")
+        or compat
+        or Path.home() / "runtimes" / "database" / "agents.db"
+    ).expanduser()
 
 
 def _quiet_config() -> tuple[int, int, str]:

@@ -2796,7 +2796,7 @@ async def handle_session_start(payload: dict) -> dict:
     session_doc_policy = None
     dispatch_bound_doc = False
 
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with shared.hook_db() as db:
         db.row_factory = aiosqlite.Row
 
         # Cron-launched custodes carries its legion on the cron_jobs row, not in
