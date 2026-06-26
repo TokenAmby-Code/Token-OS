@@ -136,7 +136,7 @@ from phone_service import (
     send_pavlok_stimulus,
 )
 from questions_gate import trials_clear
-from routes.day_start import fire_day_start_internal
+from routes.day_start import fire_day_start_internal, fire_day_start_schedule_fallback
 from routes.day_start import router as day_start_router
 from routes.hooks import (
     NUDGE_COOLDOWN_SECONDS,
@@ -1435,6 +1435,8 @@ TASK_REGISTRY = {
     # from history and arms the relative morning watchdog. It never launches a
     # session — that stays event-driven via /api/morning/alarm-silenced.
     "morning_supervisor_arm": arm_morning_supervisor,
+    # 08:30 backstop: fires fan-out only if day hasn't started yet (Hatch broken).
+    "day_start_schedule_fallback": fire_day_start_schedule_fallback,
     "checkin_morning_start": lambda: trigger_checkin("morning_start"),
     "checkin_mid_morning": lambda: trigger_checkin("mid_morning"),
     "checkin_decision_point": lambda: trigger_checkin("decision_point"),
