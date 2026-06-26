@@ -1169,12 +1169,22 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 sent_at TIMESTAMP,
                 cancelled_at TIMESTAMP,
                 last_error TEXT,
-                last_result_json TEXT
+                last_result_json TEXT,
+                message_id TEXT
             )
         """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_pane_write_queue_pending
             ON pane_write_queue(status, created_at)
+        """)
+        try:
+            await db.execute("ALTER TABLE pane_write_queue ADD COLUMN message_id TEXT")
+        except Exception:
+            pass
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pane_write_queue_message_id
+            ON pane_write_queue(source, purpose, message_id)
+            WHERE message_id IS NOT NULL
         """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_pane_write_queue_instance_source

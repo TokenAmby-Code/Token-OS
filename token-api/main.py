@@ -529,6 +529,7 @@ class TalkSendRequest(BaseModel):
     caller_pane: str = Field(..., min_length=1)
     target_pane: str = Field(..., min_length=1)
     payload: str = Field(..., min_length=1)
+    message_id: str | None = None
 
 
 class TalkReturnRequest(BaseModel):
@@ -543,6 +544,7 @@ class BriefSendRequest(BaseModel):
     pages: list[str] = Field(default_factory=list)
     payload: str = Field(..., min_length=1)
     ephemeral: bool = False
+    message_id: str | None = None
 
 
 class ProfileResponse(BaseModel):
@@ -5133,6 +5135,7 @@ async def enqueue_pane_write(
     purpose: str,
     payload: str,
     hook_driven: bool = False,
+    message_id: str | None = None,
 ) -> dict:
     if not (tmux_pane or "").strip():
         raise ValueError("pane write requires a concrete tmux pane target")
@@ -5144,14 +5147,38 @@ async def enqueue_pane_write(
     queue_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
+        if message_id:
+            cursor = await db.execute(
+                """
+                SELECT id, instance_id, tmux_pane, source, purpose, payload, status, created_at
+                FROM pane_write_queue
+                WHERE source = ? AND purpose = ? AND message_id = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (source, purpose, message_id),
+            )
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "id": row[0],
+                    "instance_id": row[1],
+                    "tmux_pane": row[2],
+                    "source": row[3],
+                    "purpose": row[4],
+                    "payload": row[5],
+                    "status": row[6],
+                    "created_at": row[7],
+                    "idempotent_replay": True,
+                    "message_id": message_id,
+                }
         await db.execute(
             """
             INSERT INTO pane_write_queue (
                 id, instance_id, tmux_pane, source, purpose, payload,
-                status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                status, created_at, updated_at, message_id
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
             """,
-            (queue_id, instance_id, tmux_pane, source, purpose, payload, now, now),
+            (queue_id, instance_id, tmux_pane, source, purpose, payload, now, now, message_id),
         )
         await db.commit()
     return {
@@ -5163,6 +5190,7 @@ async def enqueue_pane_write(
         "payload": payload,
         "status": PANE_WRITE_PENDING,
         "created_at": now,
+        "message_id": message_id,
     }
 
 
@@ -12001,7 +12029,13 @@ async def _direct_tmux_pane_delivery(
     }
 
 
-async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: bool = False) -> dict:
+async def _talk_send_payload(
+    target_pane: str,
+    payload: str,
+    *,
+    hook_driven: bool = False,
+    message_id: str | None = None,
+) -> dict:
     """Inject `payload` into ``target_pane`` via the existing pane-write queue.
 
     Drained synchronously so a CLI long-poll sees an actual delivery state.
@@ -12013,7 +12047,10 @@ async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: boo
         purpose="talk_send",
         payload=payload,
         hook_driven=hook_driven,
+        message_id=message_id,
     )
+    if queued.get("idempotent_replay"):
+        return queued
     drained = await process_pane_write_queue_once(queued["id"])
     return drained[0] if drained else queued
 
@@ -12054,7 +12091,10 @@ async def talk_send(request: TalkSendRequest):
         # listener actually sees the response in its input stream.
         try:
             send_result = await _talk_send_payload(
-                target_pane, request.payload, hook_driven=talk_hook_driven
+                target_pane,
+                request.payload,
+                hook_driven=talk_hook_driven,
+                message_id=request.message_id,
             )
         except Exception as exc:  # noqa: BLE001
             send_result = {"status": "failed", "error": str(exc)}
@@ -12102,7 +12142,10 @@ async def talk_send(request: TalkSendRequest):
                 )
         else:
             send_result = await _talk_send_payload(
-                target_pane, request.payload, hook_driven=talk_hook_driven
+                target_pane,
+                request.payload,
+                hook_driven=talk_hook_driven,
+                message_id=request.message_id,
             )
     except Exception as exc:  # noqa: BLE001
         await talk_service.cancel_talk(record["talk_id"], reason="delivery_failed")
@@ -12207,7 +12250,15 @@ async def brief_send(request: BriefSendRequest):
                         purpose="brief_send",
                         payload=request.payload,
                         hook_driven=brief_hook_driven,
+                        message_id=(
+                            f"{request.message_id}:{pane_id}" if request.message_id else None
+                        ),
                     )
+                    if queued.get("idempotent_replay"):
+                        receipt = queued
+                        receipt = {**receipt, **target}
+                        delivered.append(receipt)
+                        continue
                     drained = await process_pane_write_queue_once(queued["id"])
                     receipt = drained[0] if drained else queued
                 receipt = {**receipt, **target}

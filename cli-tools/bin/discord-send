@@ -33,5 +33,4 @@ openclaw message send --channel discord "$@"
 DRY=0
 for arg in "$@"; do [[ "$arg" == "--dry-run" ]] && DRY=1; done
 if [[ "$DRY" -eq 0 ]]; then
-  discord-context --limit 10 >/dev/null 2>&1 &
 fi

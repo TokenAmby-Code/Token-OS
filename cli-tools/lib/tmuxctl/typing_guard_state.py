@@ -22,7 +22,6 @@ files live here.
 from __future__ import annotations
 
 import argparse
-import shlex
 import subprocess
 import sys
 import time
@@ -125,9 +124,8 @@ def publish(tmux: Tmux, pane: str, state: str) -> None:
 
 
 def schedule_expiry(tmux: Tmux, pane: str, seconds: int) -> None:
-    delay = max(1, int(seconds) + 1)
-    cmd = f"sleep {delay}; tmux-typing-guard-state expire-pane --pane {shlex.quote(pane)} >/dev/null 2>&1 || true"
-    tmux.run("run-shell", "-b", cmd, timeout=0.3)
+    """No background sleeper: expiry is lazy/event-driven via live_state/expire_pane."""
+    return None
 
 
 def mark_client_activity(

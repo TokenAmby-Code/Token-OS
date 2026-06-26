@@ -18,10 +18,7 @@ grep -A1 'Channel aliases' /Volumes/Imperium/runtimes/token-os/live/cli-tools/bi
 grep -c 'cmd_thread' /Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/discord | should be greater than 0 (thread function exists)
 grep 'thread)' /Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/discord | should exist (thread in case dispatch)
 grep -c '\-\-thread' /Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/discord | should be greater than 0 (--thread flag exists in send)
-grep 'CHANNELS=' /Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/discord-context | should contain "fleet forge approvals alerts briefing chat"
-grep -c 'fleet)' /Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/discord-context | should be greater than 0 (fleet in legacy case)
-grep -c 'briefing)' /Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/discord-context | should be greater than 0 (briefing in legacy case)
-grep -c 'general)' /Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/discord-context | should be 0 (no general in legacy case)
+test ! -e /Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/discord-context | should pass (openclaw discord-context uninstalled)
 
 # === Thread Support Daemon (8 checks) ===
 grep -c "thread/create" ~/.discord-cli/node/http-server.js | should be greater than 0

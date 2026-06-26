@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import sys
+import uuid
 import urllib.error
 import urllib.request
 
@@ -99,6 +100,7 @@ def main(argv: list[str]) -> int:
         "pages": args.page,
         "payload": args.message,
         "ephemeral": args.ephemeral,
+        "message_id": os.environ.get("TOKEN_MESSAGE_ID") or str(uuid.uuid4()),
     }
     try:
         result = _post("/api/brief/send", body, timeout=60.0)

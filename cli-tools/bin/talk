@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import sys
+import uuid
 import time
 import urllib.error
 import urllib.request
@@ -135,6 +136,7 @@ def main(argv: list[str]) -> int:
         "caller_pane": caller,
         "target_pane": args.pane,
         "payload": args.prompt,
+        "message_id": os.environ.get("TOKEN_MESSAGE_ID") or str(uuid.uuid4()),
     }
     try:
         send = _post("/api/talk/send", body, timeout=60.0)
