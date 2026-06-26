@@ -1570,8 +1570,8 @@ pane_has_active_agent_process() {
   #   itself as a "live agent" and refusing its own dispatch. Defaults to 0 (no
   #   exclusion) for backward-compatible single-arg callers.
   # needles: match agent *program* forms only — the launcher binary paths
-  #   (.../claude, .../codex, the .token-os-real real-binaries) and the wrapper
-  #   scripts. The claude/codex program forms anchor the name to the *start of the
+  #   (.../claude, .../codex, the .token-os-real real-binaries) and agent-wrapper.
+  #   The claude/codex program forms anchor the name to the *start of the
   #   command* or a leading slash ((^|/)claude, (^|/)codex) so they catch both a
   #   bare PATH-launched argv[0] (`codex resume …`) and an absolute launcher path
   #   (`.../bin/codex …`), while a `--engine codex|claude` flag *value* in an argv
@@ -1580,7 +1580,7 @@ pane_has_active_agent_process() {
   #   Literal dots are written [.] so the awk program's own command line (which
   #   carries this very pattern via -v) cannot match the needle it scans for.
   local root_pid="$1" self_pid="${2:-0}"
-  local needles='(^|/)claude( |$)|claude[.]token-os-real|(^|/)codex( |$)|codex[.]token-os-real|agent-wrapper[.]sh|claude-wrapper[.]sh|codex-wrapper[.]sh'
+  local needles='(^|/)claude( |$)|claude[.]token-os-real|(^|/)codex( |$)|codex[.]token-os-real|agent-wrapper[.]sh'
   [[ -n "$root_pid" && "$root_pid" =~ ^[0-9]+$ && "$root_pid" != "0" ]] || return 1
   # -ww: unlimited output width. Without it Linux procps truncates `command` to
   # ~80 cols when stdout is not a TTY, which can lop the launcher basename off a
@@ -1813,11 +1813,11 @@ build_agent_command() {
   fi
   if [[ -n "$RESUME_ID" ]]; then
     if [[ "$ENGINE" == "codex" ]]; then
-      cmd=("${SCRIPT_DIR}/../scripts/codex-wrapper.sh")
+      cmd=("${SCRIPT_DIR}/../scripts/agent-wrapper.sh" codex)
       envs+=("TOKEN_API_CODEX_RESUME_ID=${RESUME_ID}")
       [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
     else
-      cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
+      cmd=("${SCRIPT_DIR}/../scripts/agent-wrapper.sh" claude --dangerously-skip-permissions)
       [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
       cmd+=(--resume "$RESUME_ID")
       [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
@@ -1827,10 +1827,10 @@ build_agent_command() {
       [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
     fi
   elif [[ "$ENGINE" == "codex" ]]; then
-    cmd=("${SCRIPT_DIR}/../scripts/codex-wrapper.sh")
+    cmd=("${SCRIPT_DIR}/../scripts/agent-wrapper.sh" codex)
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   else
-    cmd=("${SCRIPT_DIR}/../scripts/claude-wrapper.sh" --dangerously-skip-permissions)
+    cmd=("${SCRIPT_DIR}/../scripts/agent-wrapper.sh" claude --dangerously-skip-permissions)
     [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
     if [[ -n "$PERSONA" ]]; then
       local profile_dir line

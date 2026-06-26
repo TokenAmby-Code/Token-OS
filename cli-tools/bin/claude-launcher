@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# claude-launcher - human UI compatibility route
-# TAGS: launcher, dispatch, compatibility
-# AUDIENCE: human
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "${SCRIPT_DIR}/dispatch" --interactive "$@"

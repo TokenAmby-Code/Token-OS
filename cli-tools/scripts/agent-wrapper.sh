@@ -32,7 +32,7 @@ case "$ENGINE_ARG" in
 esac
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
-LAUNCHER="${TOKEN_API_LAUNCHER:-${ENGINE_ARG}-wrapper}"
+LAUNCHER="${TOKEN_API_LAUNCHER:-$ENGINE_ARG}"
 ENGINE="${TOKEN_API_ENGINE:-$ENGINE_ARG}"
 WORKING_DIR="$(pwd)"
 TMUX_PANE_VALUE="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
@@ -42,21 +42,19 @@ WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(token_wrapper_uuid)}"
 is_token_wrapper_file() {
   local path="$1"
   [[ -f "$path" ]] || return 1
-  grep -q 'agent-wrapper.sh\|claude-wrapper.sh\|codex-wrapper.sh' "$path" 2>/dev/null
+  grep -q 'agent-wrapper.sh' "$path" 2>/dev/null
 }
 
 wrapper_real_candidates() {
   local engine="$1"
   case "$engine" in
     claude)
-      [[ -n "${CLAUDE_WRAPPER_TARGET:-}" ]] && printf '%s\n' "$CLAUDE_WRAPPER_TARGET"
       [[ -n "${CLAUDE_BIN:-}" ]] && printf '%s\n' "$CLAUDE_BIN"
       printf '%s\n' \
         "$HOME/.local/bin/claude.token-os-real" \
         "$HOME/.local/bin/claude"
       ;;
     codex)
-      [[ -n "${CODEX_WRAPPER_TARGET:-}" ]] && printf '%s\n' "$CODEX_WRAPPER_TARGET"
       [[ -n "${CODEX_BIN:-}" ]] && printf '%s\n' "$CODEX_BIN"
       printf '%s\n' \
         "/opt/homebrew/bin/codex.token-os-real" \
@@ -132,9 +130,9 @@ run_claude() {
       exit 1
     fi
 
-    local quoted_wrapper quoted_workdir quoted_launcher quoted_engine quoted_wrapper_id
+    local quoted_agent_wrapper quoted_workdir quoted_launcher quoted_engine quoted_wrapper_id
     local quoted_discord_hosted quoted_discord_channel quoted_discord_bot cmd
-    quoted_wrapper="$(printf '%q' "${SCRIPT_DIR}/claude-wrapper.sh")"
+    quoted_agent_wrapper="$(printf '%q' "${SCRIPT_DIR}/agent-wrapper.sh")"
     quoted_workdir="$(printf '%q' "$WORKING_DIR")"
     quoted_launcher="$(printf '%q' "$LAUNCHER")"
     quoted_engine="$(printf '%q' "$ENGINE")"
@@ -142,7 +140,7 @@ run_claude() {
     quoted_discord_hosted="$(printf '%q' "${TOKEN_API_DISCORD_HOSTED:-}")"
     quoted_discord_channel="$(printf '%q' "${TOKEN_API_DISCORD_CHANNEL:-}")"
     quoted_discord_bot="$(printf '%q' "${TOKEN_API_DISCORD_BOT:-}")"
-    cmd="cd $quoted_workdir && TOKEN_API_LAUNCHER=$quoted_launcher TOKEN_API_ENGINE=$quoted_engine TOKEN_API_WRAPPER_LAUNCH_ID=$quoted_wrapper_id TOKEN_API_DISCORD_HOSTED=$quoted_discord_hosted TOKEN_API_DISCORD_CHANNEL=$quoted_discord_channel TOKEN_API_DISCORD_BOT=$quoted_discord_bot $quoted_wrapper --dangerously-skip-permissions"
+    cmd="cd $quoted_workdir && TOKEN_API_LAUNCHER=$quoted_launcher TOKEN_API_ENGINE=$quoted_engine TOKEN_API_WRAPPER_LAUNCH_ID=$quoted_wrapper_id TOKEN_API_DISCORD_HOSTED=$quoted_discord_hosted TOKEN_API_DISCORD_CHANNEL=$quoted_discord_channel TOKEN_API_DISCORD_BOT=$quoted_discord_bot $quoted_agent_wrapper claude --dangerously-skip-permissions"
     for arg in "${redirect_args[@]}"; do
       cmd+=" $(printf '%q' "$arg")"
     done
@@ -240,7 +238,7 @@ run_codex_legacy_subagent() {
   local agent_id="$1" log_file="$2" codex_path prompt_arg command_str command_display prompt_file status end_timestamp start_timestamp
   shift 2
   if ! command -v script >/dev/null 2>&1; then
-    echo "codex-wrapper.sh requires the 'script' utility for TTY-preserving logging." >&2
+    echo "agent-wrapper.sh codex requires the 'script' utility for TTY-preserving logging." >&2
     exit 65
   fi
 

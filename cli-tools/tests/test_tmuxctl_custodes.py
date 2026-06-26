@@ -47,11 +47,11 @@ def _tree(*, parent_pid: int, descendants: dict[int, tuple[int, str]]):
 
 
 def test_detector_walks_bash_wrapper_to_claude():
-    # pane_pid 14030 (bash) → 15215 (claude-wrapper.sh) → 15230 (claude)
+    # pane_pid 14030 (bash) → 15215 (agent-wrapper.sh claude) → 15230 (claude)
     children, commands = _tree(
         parent_pid=14030,
         descendants={
-            15215: (14030, "bash claude-wrapper.sh --dangerously-skip-permissions"),
+            15215: (14030, "bash agent-wrapper.sh claude --dangerously-skip-permissions"),
             15230: (15215, "claude"),
         },
     )

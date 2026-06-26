@@ -572,6 +572,53 @@ def test_human_shell_surfaces_call_dispatch_interactive_direct_by_default(tmp_pa
     assert lines[5] == "d|--interactive --target mechanicus:new new pane"
 
 
+def test_shell_aliases_do_not_define_agent_front_doors(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name in ("claude", "codex"):
+        path = fake_bin / name
+        path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    script = """
+      set -euo pipefail
+      claude() { echo stale; }
+      codex() { echo stale; }
+      alias claude='echo stale-alias'
+      alias codex='echo stale-alias'
+      source "$SHELL_ALIASES"
+      ! declare -F claude >/dev/null
+      ! declare -F codex >/dev/null
+      ! alias claude >/dev/null 2>&1
+      ! alias codex >/dev/null 2>&1
+      [[ "$(type -P claude)" == "$FAKE_CLAUDE" ]]
+      [[ "$(type -P codex)" == "$FAKE_CODEX" ]]
+    """
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env.get('PATH', '')}",
+            "SHELL_ALIASES": str(ROOT / "cli-tools" / "lib" / "shell-aliases.sh"),
+            "FAKE_CLAUDE": str(fake_bin / "claude"),
+            "FAKE_CODEX": str(fake_bin / "codex"),
+            "CLI_TOOLS": str(ROOT / "cli-tools"),
+            "TOKEN_OS": str(ROOT),
+            "IMPERIUM": str(ROOT.parent),
+            "TERM": "xterm",
+        }
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_dispatch_human_origin_defaults_to_self_pane_in_tmux(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -626,7 +673,7 @@ def test_dispatch_human_origin_uses_codex_harness_state_for_astartes(
     assert "engine:          codex" in result.stdout
     assert "persona:         Astartes — Codex" in result.stdout
     assert "instance_type:   one_off" in result.stdout
-    assert "codex-wrapper.sh" in result.stdout
+    assert "agent-wrapper.sh codex" in result.stdout
     assert "dispatch_codex_launch_inline" not in result.stdout
     assert "TOKEN_API_PERSONA=codex-dispatch" not in result.stdout
     assert "sisters-of-battle" not in result.stdout
@@ -791,7 +838,7 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     assert custodes.returncode == 0, custodes.stderr
     assert "engine:          claude" in custodes.stdout
     assert "primarch custodes" not in custodes.stdout
-    assert "claude-wrapper.sh" in custodes.stdout
+    assert "agent-wrapper.sh claude" in custodes.stdout
     assert "TOKEN_API_PERSONA=custodes" in custodes.stdout
 
     inquisitor = subprocess.run(
@@ -818,7 +865,7 @@ def test_dispatch_persona_engine_bindings_and_generic_engine_choice() -> None:
     assert "TOKEN_API_CODEX_PROFILE=inquisitor" not in inquisitor.stdout
     assert "TOKEN_API_CODEX_PROFILE=sisters-of-battle" not in inquisitor.stdout
     assert "TOKEN_API_PERSONA=inquisitor" in inquisitor.stdout
-    assert "codex-wrapper.sh" in inquisitor.stdout
+    assert "agent-wrapper.sh codex" in inquisitor.stdout
     assert "dispatch_codex_launch_inline" not in inquisitor.stdout
 
     vulkan = subprocess.run(
@@ -1175,7 +1222,7 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     send_line = next(line for line in tmux_text.splitlines() if "send-keys -t %84 bash " in line)
     staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
     staged = staged_path.read_text(encoding="utf-8", errors="replace")
-    assert "codex-wrapper.sh" in staged
+    assert "agent-wrapper.sh codex" in staged
     assert "dispatch_codex_launch_inline" not in staged
     assert "--append-system-prompt" not in staged
     assert "Aspirant Session Startup" in staged

@@ -89,11 +89,11 @@ resolve_real_engine() {
   local engine="$1" candidate found
   case "$engine" in
     claude)
-      set -- "${CLAUDE_WRAPPER_TARGET:-}" "${CLAUDE_BIN:-}" \
+      set -- "${CLAUDE_BIN:-}" \
         "${HOME}/.local/bin/claude.token-os-real"
       ;;
     codex)
-      set -- "${CODEX_WRAPPER_TARGET:-}" "${CODEX_BIN:-}" \
+      set -- "${CODEX_BIN:-}" \
         "/opt/homebrew/bin/co""dex.token-os-real"
       ;;
     *)
@@ -103,7 +103,7 @@ resolve_real_engine() {
   for candidate in "$@"; do
     [[ -n "$candidate" && -x "$candidate" ]] || continue
     if [[ "$candidate" != *.token-os-real ]] \
-        && grep -q 'agent-wrapper.sh\|claude-wrapper.sh\|codex-wrapper.sh' "$candidate" 2>/dev/null; then
+        && grep -q 'agent-wrapper.sh' "$candidate" 2>/dev/null; then
       continue
     fi
     printf '%s' "$candidate"

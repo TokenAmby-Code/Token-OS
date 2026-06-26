@@ -165,7 +165,7 @@ def find_agent_process(
 ) -> tuple[str, int] | None:
     """Breadth-first walk of the pane's descendants for the first claude/codex.
 
-    Wrapper-launched agents (claude-wrapper.sh, codex-wrapper.sh) put a
+    Wrapper-launched agents (agent-wrapper.sh claude/codex) put a
     shell between pane_pid and the engine binary, so ``pane_current_command``
     reads ``bash`` — the engine truth lives deeper in the tree.
     """

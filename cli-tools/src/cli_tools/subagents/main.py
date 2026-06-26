@@ -46,7 +46,7 @@ class CodexPaths:
     logs_dir: Path
     counter_path: Path
     launches_path: Path
-    wrapper_path: Path
+    agent_wrapper_path: Path
 
     @classmethod
     def build(cls) -> CodexPaths:
@@ -57,7 +57,7 @@ class CodexPaths:
             logs_dir=logs_dir,
             counter_path=logs_dir / ".codex-agent-counter",
             launches_path=logs_dir / ".launches.json",
-            wrapper_path=CLI_TOOLS_ROOT / "scripts" / "codex-wrapper.sh",
+            agent_wrapper_path=CLI_TOOLS_ROOT / "scripts" / "agent-wrapper.sh",
         )
 
 
@@ -287,9 +287,9 @@ def _validate_codex_launch(paths: CodexPaths, command_parts: Sequence[str]) -> s
             "Install a supported emulator (e.g., gnome-terminal or Windows Terminal)."
         )
 
-    if not paths.wrapper_path.exists():
+    if not paths.agent_wrapper_path.exists():
         raise SystemExit(
-            f"codex-wrapper.sh not found: {paths.wrapper_path}. Ensure cli-tools/scripts/codex-wrapper.sh exists."
+            f"agent-wrapper.sh not found: {paths.agent_wrapper_path}. Ensure cli-tools/scripts/agent-wrapper.sh exists."
         )
 
     return codex_path
@@ -373,9 +373,10 @@ def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
     print(f"📝 Logs: {relative_log}")
 
     prompt_arg = f"@FILE:{temp_prompt_file}"
-    wrapper_command = [
+    agent_command = [
         "bash",
-        str(paths.wrapper_path),
+        str(paths.agent_wrapper_path),
+        "codex",
         agent_id,
         str(log_path),
         codex_path,
@@ -402,7 +403,7 @@ def _handle_codex(args: argparse.Namespace, paths: CodexPaths) -> None:
 
         try:
             process = launch_in_new_terminal(
-                wrapper_command,
+                agent_command,
                 cwd=paths.invocation_root,
                 title=f"Codex Agent {agent_id}",
                 skip_wrapper=True,
