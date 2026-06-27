@@ -1288,32 +1288,61 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     }
 
 
+async def get_pause_queue_languishing_snapshot(*, threshold: int | None = None) -> dict:
+    """Return the live pause-queue state used for languishing enforcement.
+
+    This is intentionally read under ``tts_queue_lock``. Languishing checks must
+    use the current deque state, not a queue position captured when an item was
+    appended and later baked into an immutable event payload.
+    """
+    effective_threshold = (
+        TTS_LANGUISHING_THRESHOLD
+        if threshold is None
+        else max(TTS_LANGUISHING_THRESHOLD, threshold)
+    )
+    async with tts_queue_lock:
+        pause_queue_length = len(pause_queue)
+        oldest_queued_at = pause_queue[0].queued_at if pause_queue else None
+
+    return {
+        "pause_queue_length": pause_queue_length,
+        "threshold": effective_threshold,
+        "oldest_queued_at": oldest_queued_at.isoformat() if oldest_queued_at else None,
+        "languishing": pause_queue_length > effective_threshold,
+    }
+
+
 async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQueueItem) -> None:
     """Escalate when the manually-played TTS pause queue starts languishing.
 
     Pause-queue length above the threshold means speech is accumulating but not
-    being heard. That is an attention failure, so emit a recognized enforcement
-    state event to the Custodes/Administratum hook path. The state-event router
+    being heard. Re-read the live pause queue at evaluation time so a drained
+    queue cannot fire from a stale queue-add snapshot. The state-event router
     owns dedupe; this helper stays best-effort and never blocks queueing.
     """
-    if position <= TTS_LANGUISHING_THRESHOLD or _custodes_state_event_handler is None:
+    if _custodes_state_event_handler is None:
+        return
+
+    snapshot = await get_pause_queue_languishing_snapshot()
+    live_pause_queue_length = snapshot["pause_queue_length"]
+    if not snapshot["languishing"]:
         return
 
     payload = {
         "app": "tts_queue",
         "queue": "pause",
-        "pause_queue_length": position,
-        "threshold": TTS_LANGUISHING_THRESHOLD,
+        "pause_queue_length": live_pause_queue_length,
+        "threshold": snapshot["threshold"],
         "latest_instance_id": item.instance_id,
         "latest_tab_name": item.tab_name,
-        "oldest_queued_at": pause_queue[0].queued_at.isoformat() if pause_queue else None,
+        "oldest_queued_at": snapshot["oldest_queued_at"],
     }
     try:
         await _custodes_state_event_handler(
             "tts_queue_languishing",
             "tts_queue",
             instance_id=item.instance_id,
-            severity=4 if position >= 10 else 3,
+            severity=4 if live_pause_queue_length >= 10 else 3,
             payload=payload,
             event_class="enforcement",
         )
