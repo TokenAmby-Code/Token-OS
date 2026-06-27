@@ -124,6 +124,29 @@ async def send_temp_message(
     return result
 
 
+def preview_temp_message(
+    pane: str,
+    payload: str,
+    engine: str | None = None,
+    *,
+    instance_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a temp-message receipt without enqueueing or dispatching to tmux."""
+    command_payload, mode = temp_command_for_engine(engine, payload)
+    return {
+        "instance_id": instance_id,
+        "tmux_pane": pane,
+        "engine": engine,
+        "mode": mode,
+        "channel": temp_channel_metadata(engine),
+        "queue_id": None,
+        "queued_status": None,
+        "payload": command_payload,
+        "dispatch": {"status": "skipped_dry_run"},
+        "status": "previewed",
+    }
+
+
 def _split_session_window(value: str | None) -> tuple[str | None, str | None]:
     if not value or ":" not in value:
         return None, value or None
@@ -288,6 +311,7 @@ async def broadcast_temp_message(
     db_path: Path = DB_PATH,
     queue_sender: QueueSender | None = None,
     queue_drainer: QueueDrainer | None = None,
+    dry_run: bool = False,
 ) -> list[dict[str, Any]]:
     selector_parts = _parse_selector(selector)
     poll_id = (idempotency_key or "").strip() or str(uuid.uuid4())
@@ -298,14 +322,22 @@ async def broadcast_temp_message(
     receipts: list[dict[str, Any]] = []
     for target in targets:
         try:
-            receipt = await send_temp_message(
-                target["tmux_pane"],
-                payload,
-                target.get("engine"),
-                instance_id=target["instance_id"],
-                queue_sender=queue_sender,
-                queue_drainer=queue_drainer,
-            )
+            if dry_run:
+                receipt = preview_temp_message(
+                    target["tmux_pane"],
+                    payload,
+                    target.get("engine"),
+                    instance_id=target["instance_id"],
+                )
+            else:
+                receipt = await send_temp_message(
+                    target["tmux_pane"],
+                    payload,
+                    target.get("engine"),
+                    instance_id=target["instance_id"],
+                    queue_sender=queue_sender,
+                    queue_drainer=queue_drainer,
+                )
             receipt.update(
                 {
                     "poll_id": poll_id,
