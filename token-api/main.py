@@ -8737,7 +8737,17 @@ async def _tts_queue_languishing_live_status(payload: dict | None = None) -> tup
         snapshot = await tts_mod.get_pause_queue_languishing_snapshot(threshold=threshold)
     except Exception as exc:
         logger.warning("TTS languishing live-state check failed; fail-open: %s", exc)
-        return True, "live_state_check_failed", {"error": str(exc)}
+        return (
+            True,
+            "live_state_check_failed",
+            {
+                "pause_queue_length": payload.get("pause_queue_length"),
+                "threshold": payload.get("threshold"),
+                "oldest_queued_at": payload.get("oldest_queued_at"),
+                "languishing": True,
+                "error": str(exc),
+            },
+        )
 
     if snapshot["pause_queue_length"] <= 0:
         return False, "pause_queue_empty", snapshot

@@ -1295,7 +1295,11 @@ async def get_pause_queue_languishing_snapshot(*, threshold: int | None = None) 
     use the current deque state, not a queue position captured when an item was
     appended and later baked into an immutable event payload.
     """
-    effective_threshold = TTS_LANGUISHING_THRESHOLD if threshold is None else threshold
+    effective_threshold = (
+        TTS_LANGUISHING_THRESHOLD
+        if threshold is None
+        else max(TTS_LANGUISHING_THRESHOLD, threshold)
+    )
     async with tts_queue_lock:
         pause_queue_length = len(pause_queue)
         oldest_queued_at = pause_queue[0].queued_at if pause_queue else None
