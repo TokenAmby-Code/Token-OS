@@ -508,16 +508,11 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
         # User is at gym, campus, or other known zone — phone is the only option
         if _phone_tts_available():
             return {"device": "phone", "reason": f"geofence: {location_zone}", "discord_bot": None}
-        # Phone unreachable while away — Mac only if it is a real local backend.
-        if _mac_tts_available():
-            return {
-                "device": "mac",
-                "reason": f"geofence: {location_zone}, phone unreachable",
-                "discord_bot": None,
-            }
+        # Away from home is phone-only. If the phone is unreachable, fail closed
+        # instead of leaking speech to local Mac speakers nobody can hear.
         return {
             "device": None,
-            "reason": f"geofence: {location_zone}, no playback backend",
+            "reason": "geofence_phone_unreachable",
             "discord_bot": None,
         }
 
@@ -595,7 +590,9 @@ def speak_tts(
         return result
 
     if device is None:
-        return _finish(_no_playback_backend(str(routing.get("reason") or "no_playback_backend")))
+        result = _no_playback_backend("no_playback_backend")
+        result["route_reason"] = routing.get("reason")
+        return _finish(result)
 
     # If WSL was selected without an explicit voice (e.g. /api/notify/tts caller),
     # fall back to ULTIMATE_FALLBACK so the satellite gets a usable SAPI voice.
@@ -650,11 +647,16 @@ def speak_tts(
         return _finish(_no_playback_backend("wsl_failed_no_fallthrough_backend"))
 
     if device == "phone":
-        if _phone_tts_available():
+        # Reaching this branch means the router selected phone. The router may be
+        # monkeypatched in invariant tests; do not re-probe reachability here.
+        if _send_to_phone:
             result = _send_to_phone("/notify", {"tts_text": message})
             if result.get("success"):
                 return _finish(result)
-            logger.info(f"TTS: Phone failed ({result.get('error')}), falling back to Mac")
+            logger.info(f"TTS: Phone failed ({result.get('error')})")
+        if str(routing.get("reason") or "").startswith("geofence:"):
+            return _finish(_no_playback_backend("geofence_phone_failed"))
+        logger.info("TTS: Phone unavailable/failed, falling back to Mac")
         if _mac_tts_available():
             return _finish(speak_tts_mac(message, voice, rate))
         return _finish(_no_playback_backend("phone_failed_no_fallthrough_backend"))

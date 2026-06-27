@@ -17,6 +17,7 @@ import asyncio
 import importlib
 import sys
 from pathlib import Path
+from typing import Any
 
 TOKEN_API_DIR = Path(__file__).resolve().parents[1]
 
@@ -77,6 +78,12 @@ def test_notify_endpoint_surface(app_env):
     """`/api/notify` is the single authoritative entry. The TTS-only sibling
     `/api/notify/tts` is retired (CLIs repointed to /api/notify)."""
     paths = {getattr(r, "path", None) for r in app_env.main.app.routes}
+    for route in app_env.main.app.routes:
+        original_router = getattr(route, "original_router", None)
+        if original_router is None:
+            continue
+        prefix = getattr(getattr(route, "include_context", None), "prefix", "") or ""
+        paths.update(prefix + r.path for r in getattr(original_router, "routes", []))
     assert "/api/notify" in paths
     assert "/api/notify/tts" not in paths
 
@@ -118,7 +125,7 @@ def test_dispatch_notify_speaks_via_router_and_never_phone_direct(monkeypatch):
     assert result.get("delivered") is True
 
 
-def test_dispatch_notify_tts_failure_is_not_masked_by_tactile(monkeypatch):
+def test_dispatch_notify_tts_failure_is_not_masked_by_tactile(monkeypatch: Any) -> None:
     """For spoken notifications, top-level delivered means true audio playback.
 
     A successful banner/vibe leg must not recreate the false-success condition

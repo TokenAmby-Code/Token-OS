@@ -5,6 +5,7 @@ import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from custodes_state_policy import StateEvent, classify_trigger, evaluate_state_event
 
@@ -110,7 +111,7 @@ def test_queue_tts_languishing_ignores_direct_hot_tts(app_env, monkeypatch) -> N
     assert calls == []
 
 
-def test_queue_tts_refuses_when_no_playback_target(app_env, monkeypatch) -> None:
+def test_queue_tts_refuses_when_no_playback_target(app_env: Any, monkeypatch: Any) -> None:
     """Do not accept queue work when routing resolves to backend:null."""
     tts = _load_tts()
     iid = _insert_tts_instance(app_env.db_path)
@@ -137,7 +138,10 @@ def test_queue_tts_refuses_when_no_playback_target(app_env, monkeypatch) -> None
     assert result["playback_target"] is None
     assert len(tts.pause_queue) == 0
     assert len(tts.hot_queue) == 0
-    assert any(args[0] == "tts_enqueue_refused" for args, _ in logs)
+    assert [args[0] for args, _ in logs] == ["tts_enqueue_refused"]
+    refused_details = logs[0][1]["details"]
+    assert refused_details["reason"] == "no_playback_target"
+    assert refused_details["routing"]["device"] is None
 
 
 def test_tts_queue_languishing_is_internal_state_trigger() -> None:
