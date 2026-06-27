@@ -160,7 +160,7 @@ def test_send_text_then_submit_keeps_enter_in_same_transaction(
 
 
 def test_send_text_then_submit_delays_submit_once_if_human_lock_appears_after_literal(
-    monkeypatch, captured_subprocess
+    monkeypatch: pytest.MonkeyPatch, captured_subprocess: list[list[str]]
 ) -> None:
     """A human ON/PENDING lock nullifies submit-transaction pierce.
 

@@ -687,7 +687,9 @@ def test_tmuxctld_holder_override_cannot_pierce_human_lock(monkeypatch) -> None:
     assert result["ignored_override"] == "tmuxctld-send-holder"
 
 
-def test_submit_transaction_override_cannot_pierce_human_lock(monkeypatch) -> None:
+def test_submit_transaction_override_cannot_pierce_human_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The adapter's text+submit override also yields to ON/PENDING.
 
     The transaction override exists to keep submit keys behind the daemon's own
@@ -726,7 +728,9 @@ def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> Non
     assert result["ignored_override"] is None
 
 
-def test_submit_transaction_override_can_pierce_agent_only_hold(monkeypatch) -> None:
+def test_submit_transaction_override_can_pierce_agent_only_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
     monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: False)
