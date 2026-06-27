@@ -271,6 +271,9 @@ async def _create_instances_table(db) -> None:
             gt_resume_count INTEGER DEFAULT 0,
             gt_resume_window_started_at TIMESTAMP,
             gt_last_resume_at TIMESTAMP,
+            gt_no_op_counter INTEGER DEFAULT 0,
+            gt_no_op_summaries_json TEXT,
+            gt_last_dispatch_fingerprint TEXT,
             follow_up_sop TEXT,
             stop_allowed INTEGER DEFAULT 1,
             -- ── end runtime annex ────────────────────────────────────────

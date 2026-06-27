@@ -97,6 +97,9 @@ RUNTIME_ANNEX_COLUMNS = [
     "gt_resume_count",
     "gt_resume_window_started_at",
     "gt_last_resume_at",
+    "gt_no_op_counter",
+    "gt_no_op_summaries_json",
+    "gt_last_dispatch_fingerprint",
     "follow_up_sop",
     "stop_allowed",
 ]
