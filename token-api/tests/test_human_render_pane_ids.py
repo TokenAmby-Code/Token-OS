@@ -54,3 +54,34 @@ def test_tts_public_sanitizer_uses_render_translation(monkeypatch: pytest.Monkey
 
     assert rendered == "TTS should say mechanicus, not mechanicus:1"
     assert "%" not in rendered
+
+
+def test_sync_public_sanitizer_not_called_from_async_tts_paths() -> None:
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "routes" / "tts.py"
+    tree = ast.parse(path.read_text())
+    offenders: list[tuple[str, int]] = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.async_stack: list[str] = []
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self.async_stack.append(node.name)
+            self.generic_visit(node)
+            self.async_stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if (
+                self.async_stack
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_sanitize_public_text"
+            ):
+                offenders.append((self.async_stack[-1], node.lineno))
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+
+    assert offenders == []
