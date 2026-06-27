@@ -1446,22 +1446,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                state_json TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_state_daily (
-                date TEXT PRIMARY KEY,
-                state_json TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        await db.execute("""
             CREATE TABLE IF NOT EXISTS day_state (
                 date TEXT PRIMARY KEY,
                 day_started_at TEXT,
@@ -1469,44 +1453,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 details_json TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                start_time TIMESTAMP NOT NULL,
-                end_time TIMESTAMP,
-                mode TEXT NOT NULL,
-                duration_ms INTEGER DEFAULT 0,
-                break_earned_ms INTEGER DEFAULT 0,
-                break_used_ms INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_mode_changes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TIMESTAMP NOT NULL,
-                old_mode TEXT,
-                new_mode TEXT NOT NULL,
-                is_automatic INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_daily_scores (
-                date TEXT PRIMARY KEY,
-                productivity_score INTEGER,
-                total_work_ms INTEGER DEFAULT 0,
-                total_break_used_ms INTEGER DEFAULT 0,
-                session_count INTEGER DEFAULT 0,
-                mode_change_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -1539,45 +1485,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_shifts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                old_mode TEXT,
-                new_mode TEXT NOT NULL,
-                trigger TEXT,
-                source TEXT,
-                break_balance_ms INTEGER,
-                break_backlog_ms INTEGER,
-                work_time_ms INTEGER,
-                active_instances INTEGER,
-                phone_app TEXT,
-                details TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS timer_samples (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                activity TEXT,
-                productivity_active INTEGER,
-                break_balance_ms INTEGER,
-                break_backlog_ms INTEGER,
-                work_time_ms INTEGER,
-                active_instance_count INTEGER,
-                processing_recent_count INTEGER,
-                observed_agent_count INTEGER,
-                desktop_mode TEXT,
-                phone_app TEXT,
-                source TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_timer_samples_timestamp ON timer_samples(timestamp)"
-        )
 
         await CronEngine.init_tables(db)
 
