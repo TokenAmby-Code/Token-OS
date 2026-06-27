@@ -748,6 +748,38 @@ tts_queue_lock = asyncio.Lock()
 tts_worker_task: asyncio.Task | None = None
 
 
+def _positive_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    """Read a positive integer env var with a safe fallback."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is invalid; using %s", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning("%s=%r is below minimum %s; using %s", name, raw, minimum, default)
+        return default
+    return value
+
+
+# Passive held-message drain policy.  Pause queue entries older than this are no
+# longer actionable as speech; they are deliberately expired and logged when the
+# authoritative languishing snapshot is read.  This is a source drain, not an
+# alert debounce.
+TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS = _positive_int_env(
+    "TOKEN_API_TTS_PAUSE_HELD_MAX_AGE_SECONDS", 3600
+)
+TTS_PAUSE_QUEUE_SWEEP_TTL_SECONDS = _positive_int_env("TOKEN_API_TTS_PAUSE_SWEEP_TTL_SECONDS", 30)
+_last_pause_queue_expiry_sweep = 0.0
+
+# Languishing emit latch: alert once for a stuck head, then only re-alert when
+# the same head genuinely worsens (depth increases) or a different head reaches
+# languishing.  Cleared on negative edge.
+_tts_languishing_emit_latch: dict[str, object] = {}
+
+
 def _set_tts_state(pane_id: str | None, state: str):
     """Set @TTS_STATE on a tmux pane. Fire-and-forget."""
     if not pane_id:
@@ -1288,6 +1320,106 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     }
 
 
+def _pause_queue_head_key_locked() -> str | None:
+    """Return a stable identity for the current pause-queue head.
+
+    Caller must hold ``tts_queue_lock``.  The key uses the object at the head of
+    the queue, not the just-appended item, so dedup follows the stuck episode.
+    """
+    if not pause_queue:
+        return None
+    head = pause_queue[0]
+    message_hash = hashlib.sha256((head.message or "").encode("utf-8")).hexdigest()[:16]
+    return "|".join(
+        (
+            head.instance_id or "",
+            head.tab_name or "",
+            head.queued_at.isoformat(),
+            message_hash,
+        )
+    )
+
+
+async def _sweep_stale_pause_queue_items_for_snapshot() -> list[dict]:
+    """Expire stale held pause-queue items during authoritative snapshot reads.
+
+    The sweep is passive: no worker, no polling loop.  It only runs when callers
+    ask for the live languishing state, and it follows the existing TTL-cache
+    pattern used for TTS backend probes so repeated reads don't churn the deque.
+    """
+    global _last_pause_queue_expiry_sweep
+
+    now_ts = time.time()
+    if (
+        _last_pause_queue_expiry_sweep
+        and now_ts - _last_pause_queue_expiry_sweep < TTS_PAUSE_QUEUE_SWEEP_TTL_SECONDS
+    ):
+        return []
+    _last_pause_queue_expiry_sweep = now_ts
+
+    now = datetime.now()
+    expired: list[TTSQueueItem] = []
+    async with tts_queue_lock:
+        kept: deque[TTSQueueItem] = deque()
+        for queued in pause_queue:
+            age_seconds = (now - queued.queued_at).total_seconds()
+            if age_seconds >= TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS:
+                expired.append(queued)
+            else:
+                kept.append(queued)
+        if expired:
+            pause_queue.clear()
+            pause_queue.extend(kept)
+
+    expired_details = []
+    for expired_item in expired:
+        age_seconds = max(0, int((now - expired_item.queued_at).total_seconds()))
+        detail = {
+            "instance_id": expired_item.instance_id,
+            "tab_name": expired_item.tab_name,
+            "queue": "pause",
+            "queued_at": expired_item.queued_at.isoformat(),
+            "age_seconds": age_seconds,
+            "held_max_age_seconds": TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS,
+            "message_hash": hashlib.sha256(
+                (expired_item.message or "").encode("utf-8")
+            ).hexdigest()[:16],
+            "message_length": len(expired_item.message or ""),
+            "message_truncated": len(expired_item.message or "") > 300,
+        }
+        expired_details.append(detail)
+
+    if expired_details:
+        _tts_languishing_emit_latch.clear()
+
+    for expired_item, detail in zip(expired, expired_details, strict=False):
+        try:
+            await log_event(
+                "tts_pause_queue_item_expired",
+                instance_id=expired_item.instance_id,
+                device_id="tts_queue",
+                details=detail,
+            )
+        except Exception:
+            logger.warning("Failed to log expired TTS pause item", exc_info=True)
+
+    if expired_details:
+        try:
+            await log_event(
+                "tts_pause_queue_expiry_sweep",
+                device_id="tts_queue",
+                details={
+                    "expired": len(expired_details),
+                    "held_max_age_seconds": TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS,
+                    "per_item_events_logged": len(expired_details),
+                },
+            )
+        except Exception:
+            logger.warning("Failed to log TTS pause expiry sweep", exc_info=True)
+
+    return expired_details
+
+
 async def get_pause_queue_languishing_snapshot(*, threshold: int | None = None) -> dict:
     """Return the live pause-queue state used for languishing enforcement.
 
@@ -1295,6 +1427,7 @@ async def get_pause_queue_languishing_snapshot(*, threshold: int | None = None) 
     use the current deque state, not a queue position captured when an item was
     appended and later baked into an immutable event payload.
     """
+    expired = await _sweep_stale_pause_queue_items_for_snapshot()
     effective_threshold = (
         TTS_LANGUISHING_THRESHOLD
         if threshold is None
@@ -1303,12 +1436,15 @@ async def get_pause_queue_languishing_snapshot(*, threshold: int | None = None) 
     async with tts_queue_lock:
         pause_queue_length = len(pause_queue)
         oldest_queued_at = pause_queue[0].queued_at if pause_queue else None
+        head_key = _pause_queue_head_key_locked()
 
     return {
         "pause_queue_length": pause_queue_length,
         "threshold": effective_threshold,
         "oldest_queued_at": oldest_queued_at.isoformat() if oldest_queued_at else None,
+        "head_key": head_key,
         "languishing": pause_queue_length > effective_threshold,
+        "expired_count": len(expired),
     }
 
 
@@ -1326,13 +1462,43 @@ async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQue
     snapshot = await get_pause_queue_languishing_snapshot()
     live_pause_queue_length = snapshot["pause_queue_length"]
     if not snapshot["languishing"]:
+        _tts_languishing_emit_latch.clear()
         return
+    head_key = snapshot.get("head_key")
+    if not head_key:
+        _tts_languishing_emit_latch.clear()
+        return
+
+    previous_head = _tts_languishing_emit_latch.get("head_key")
+    previous_depth = int(_tts_languishing_emit_latch.get("max_depth", 0) or 0)
+    if previous_head == head_key and live_pause_queue_length <= previous_depth:
+        try:
+            await log_event(
+                "tts_languishing_enforcement_deduped",
+                instance_id=item.instance_id,
+                device_id="tts_queue",
+                details={
+                    "reason": "same_head_not_worse",
+                    "head_key": head_key,
+                    "pause_queue_length": live_pause_queue_length,
+                    "previous_depth": previous_depth,
+                    "threshold": snapshot["threshold"],
+                },
+            )
+        except Exception:
+            pass
+        return
+
+    latched_depth = live_pause_queue_length
+    _tts_languishing_emit_latch["head_key"] = head_key
+    _tts_languishing_emit_latch["max_depth"] = latched_depth
 
     payload = {
         "app": "tts_queue",
         "queue": "pause",
         "pause_queue_length": live_pause_queue_length,
         "threshold": snapshot["threshold"],
+        "head_key": head_key,
         "latest_instance_id": item.instance_id,
         "latest_tab_name": item.tab_name,
         "oldest_queued_at": snapshot["oldest_queued_at"],
@@ -1347,6 +1513,11 @@ async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQue
             event_class="enforcement",
         )
     except Exception as exc:
+        if (
+            _tts_languishing_emit_latch.get("head_key") == head_key
+            and _tts_languishing_emit_latch.get("max_depth") == latched_depth
+        ):
+            _tts_languishing_emit_latch.clear()
         logger.warning("TTS languishing enforcement emit failed: %s", exc)
         try:
             await log_event(
