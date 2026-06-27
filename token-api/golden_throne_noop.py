@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -52,6 +53,37 @@ def _json_records_from_tail(transcript_tail: str | None) -> list[dict[str, Any]]
     return records
 
 
+def _trusted_transcript_roots() -> tuple[Path, ...]:
+    return (Path.home() / ".claude" / "projects",)
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _trusted_transcript_path(transcript_path: str | None) -> Path | None:
+    if not transcript_path:
+        return None
+    try:
+        path = Path(transcript_path).expanduser().resolve(strict=False)
+    except Exception:
+        return None
+    if path.suffix != ".jsonl":
+        return None
+    for root in _trusted_transcript_roots():
+        try:
+            resolved_root = root.expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        if _path_is_under(path, resolved_root):
+            return path
+    return None
+
+
 def load_transcript_records(
     transcript_tail: str | None = None,
     transcript_path: str | None = None,
@@ -62,8 +94,8 @@ def load_transcript_records(
     if records or not transcript_path:
         return records
     try:
-        path = Path(transcript_path)
-        if not path.exists():
+        path = _trusted_transcript_path(transcript_path)
+        if path is None or not path.exists():
             return []
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
     except Exception:
@@ -95,17 +127,21 @@ def _tool_name(value: Any) -> str:
     return ""
 
 
+def _is_tool_invocation_node(node: dict[str, Any]) -> bool:
+    node_type = str(node.get("type") or "").lower()
+    if node_type in {"tool_use", "tool_call", "function_call"}:
+        return True
+    if node.get("tool_use_id") or node.get("tool_call_id"):
+        return True
+    if node.get("tool_name"):
+        return True
+    return bool(node_type == "function" and _tool_name(node))
+
+
 def has_tool_calls(records: list[dict[str, Any]]) -> bool:
     for record in records:
         for node in _walk(record):
-            if not isinstance(node, dict):
-                continue
-            node_type = str(node.get("type") or "").lower()
-            if node_type in {"tool_use", "tool_call", "function_call"}:
-                return True
-            if node.get("tool_use_id") or node.get("tool_call_id"):
-                return True
-            if node.get("tool_name"):
+            if isinstance(node, dict) and _is_tool_invocation_node(node):
                 return True
     return False
 
@@ -114,14 +150,11 @@ def declares_victory(records: list[dict[str, Any]]) -> bool:
     needles = ("victory_declare", "declare_victory")
     for record in records:
         for node in _walk(record):
-            if isinstance(node, dict):
-                name = _tool_name(node).lower().replace("-", "_")
-                if any(needle in name for needle in needles):
-                    return True
-            elif isinstance(node, str):
-                lowered = node.lower().replace("-", "_")
-                if any(needle in lowered for needle in needles):
-                    return True
+            if not isinstance(node, dict) or not _is_tool_invocation_node(node):
+                continue
+            name = _tool_name(node).lower().replace("-", "_")
+            if any(needle in name for needle in needles):
+                return True
     return False
 
 
@@ -166,6 +199,31 @@ def append_summary(existing_json: str | None, summary: str) -> list[str]:
     return [str(item) for item in current[-MAX_SUMMARIES:]]
 
 
+_GIT_BASE_CMD = (
+    "git",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+)
+
+
+def _git_probe_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return env
+
+
 def worktree_fingerprint(working_dir: str | None) -> str | None:
     """Return a cheap git worktree fingerprint, or None when unavailable.
 
@@ -180,30 +238,33 @@ def worktree_fingerprint(working_dir: str | None) -> str | None:
         if not cwd.exists() or not cwd.is_dir():
             return None
         root = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+            [*_GIT_BASE_CMD, "rev-parse", "--show-toplevel"],
             cwd=str(cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=2,
             check=False,
+            env=_git_probe_env(),
         )
         if root.returncode != 0:
             return None
         head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            [*_GIT_BASE_CMD, "rev-parse", "HEAD"],
             cwd=str(cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=2,
             check=False,
+            env=_git_probe_env(),
         )
         status = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            [*_GIT_BASE_CMD, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=str(cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=3,
             check=False,
+            env=_git_probe_env(),
         )
         if head.returncode != 0 or status.returncode != 0:
             return None

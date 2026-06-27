@@ -5117,16 +5117,18 @@ async def _record_gt_response_classification(
     }
 
     if classification.outcome == "active":
+        updates = {
+            "gt_no_op_counter": 0,
+            "gt_no_op_summaries_json": json.dumps(summaries),
+            "workflow_blocked_reason": None,
+        }
+        if current_fingerprint is not None:
+            updates["gt_last_dispatch_fingerprint"] = current_fingerprint
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
             await sanctioned_update_instance(
                 db,
                 instance_id=instance_id,
-                updates={
-                    "gt_no_op_counter": 0,
-                    "gt_no_op_summaries_json": json.dumps(summaries),
-                    "gt_last_dispatch_fingerprint": current_fingerprint,
-                    "workflow_blocked_reason": None,
-                },
+                updates=updates,
                 mutation_type="instance_updated",
                 write_source="hooks",
                 actor="Stop-golden-throne-classifier",
@@ -5152,8 +5154,9 @@ async def _record_gt_response_classification(
     updates = {
         "gt_no_op_counter": next_count,
         "gt_no_op_summaries_json": json.dumps(summaries),
-        "gt_last_dispatch_fingerprint": current_fingerprint,
     }
+    if current_fingerprint is not None:
+        updates["gt_last_dispatch_fingerprint"] = current_fingerprint
     if force_reason:
         updates.update(
             {
@@ -5373,26 +5376,6 @@ async def handle_stop(payload: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.warning("talk: slash-copy hook failed for %s: %s", session_id[:12], exc)
 
-    # Fire async stop evaluators (action_validator, plan_auditor, etc.)
-    # Skips subagents, sync instances, and intermediate stops.
-    if will_evaluate:
-        session_doc_id = instance.get("session_doc_id")
-        stop_context = (
-            payload.get("transcript_tail", "")[:4000] if payload.get("transcript_tail") else ""
-        )
-        # Signal TUI that evaluators are running for this instance
-        _tui_signal_dir = Path.home() / ".claude" / "tui-signals"
-        _tui_signal_dir.mkdir(parents=True, exist_ok=True)
-        (_tui_signal_dir / f"evaluating-{session_id}").touch()
-        asyncio.create_task(
-            _require_dep("run_stop_evaluators", _run_stop_evaluators)(
-                session_id, session_doc_id, stop_context, tab_name
-            )
-        )
-        # Automatic rename is disabled. Instance names are DB-authoritative and
-        # should change only through explicit rename actions; the future trigger
-        # router can project those DB mutations back into tmux/Claude UI.
-
     result = {
         "success": True,
         "action": "stop_processed",
@@ -5405,12 +5388,11 @@ async def handle_stop(payload: dict) -> dict:
 
     # ── Golden Throne timer arm ──
     # StopValidate may block once for self-eval, but the async Stop hook owns
-    # durable persistence after the model actually goes quiet.
+    # durable persistence after the model actually goes quiet. Classify before
+    # evaluator launch so a forced review-mode close cannot race an evaluator
+    # that would re-mark the instance active or re-arm a fourth ping.
     if instance_type == "golden_throne":
-        gt_response = None
-        is_gt_ping_response = was_hook_driven or (hook_driven_actor or "").startswith(
-            "enqueue:golden_throne"
-        )
+        is_gt_ping_response = (hook_driven_actor or "").startswith("enqueue:golden_throne")
         if is_gt_ping_response:
             gt_response = await _record_gt_response_classification(
                 instance, payload, hook_driven_actor=hook_driven_actor
@@ -5437,6 +5419,26 @@ async def handle_stop(payload: dict) -> dict:
             "schedule_golden_throne_callback", _schedule_golden_throne_callback
         )(dict(instance), reason="stop_hook")
         result["golden_throne"] = schedule_result
+
+    # Fire async stop evaluators (action_validator, plan_auditor, etc.)
+    # Skips subagents, sync instances, and intermediate stops.
+    if will_evaluate:
+        session_doc_id = instance.get("session_doc_id")
+        stop_context = (
+            payload.get("transcript_tail", "")[:4000] if payload.get("transcript_tail") else ""
+        )
+        # Signal TUI that evaluators are running for this instance
+        _tui_signal_dir = Path.home() / ".claude" / "tui-signals"
+        _tui_signal_dir.mkdir(parents=True, exist_ok=True)
+        (_tui_signal_dir / f"evaluating-{session_id}").touch()
+        asyncio.create_task(
+            _require_dep("run_stop_evaluators", _run_stop_evaluators)(
+                session_id, session_doc_id, stop_context, tab_name
+            )
+        )
+        # Automatic rename is disabled. Instance names are DB-authoritative and
+        # should change only through explicit rename actions; the future trigger
+        # router can project those DB mutations back into tmux/Claude UI.
 
     # Extract TTS text from transcript (prefer embedded tail for remote access,
     # fall back to direct file read if local). Used by both mobile and desktop paths.
