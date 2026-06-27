@@ -22,6 +22,8 @@ import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+from fastapi.testclient import TestClient
+
 
 def _insert(
     app_env,
@@ -168,6 +170,13 @@ def test_reconcile_reactivates_swept_live_row(app_env, monkeypatch):
         monkeypatch,
         [_pane("%21", swept, pane_role="mechanicus:somnium")],
     )
+    repaints: list[tuple[str, str, str]] = []
+
+    async def fake_tint(db, instance_id, tmux_pane, *, source="pane-tint"):
+        repaints.append((instance_id, tmux_pane, source))
+        return "#302800"
+
+    monkeypatch.setattr(app_env.main.shared, "apply_instance_pane_tint", fake_tint)
 
     result = _run(app_env.main.reconcile_live_panes())
 
@@ -177,6 +186,37 @@ def test_reconcile_reactivates_swept_live_row(app_env, monkeypatch):
     # Pane geometry is NOT stored: reconcile only heals status/stopped_at. Pane
     # identity is resolved live from the @INSTANCE_ID stamp via the tmuxctl oracle.
     assert result["reactivated"] == 1
+    assert repaints == [(swept, "%21", "reconcile-live-panes")]
+
+
+def test_instances_read_overlays_stopped_but_stamped_row_as_live(app_env, monkeypatch):
+    """The registry read path must verify liveness from tmux, not stored status.
+
+    Regression for Custodes false-dead: a DB-stopped row whose pane still carries
+    its @INSTANCE_ID stamp must read as live immediately, before the background
+    reconciler gets a chance to mutate the durable row.
+    """
+    swept = _insert(app_env, status="stopped", legion="custodes")
+    _set_stopped_at(app_env, swept)
+
+    async def fake_resolve(instance_id):
+        if instance_id == swept:
+            return ("%47", "council:custodes")
+        return (None, None)
+
+    monkeypatch.setattr(app_env.shared, "resolve_instance_pane", fake_resolve)
+    app_env.main._INSTANCES_READ_CACHE.clear()
+
+    resp = TestClient(app_env.main.app).get("/api/instances", params={"include_runtime": True})
+    assert resp.status_code == 200
+    row = next(item for item in resp.json() if item["id"] == swept)
+    assert row["durable_status"] == "stopped"
+    assert row["stale_status"] == "stopped"
+    assert row["status"] == "idle"
+    assert row["status_source"] == "tmuxctl-live-overlay"
+    assert row["runtime"]["live_pane"] is True
+    assert row["runtime"]["tmux_pane"] == "%47"
+    assert row["runtime"]["pane_label"] == "council:custodes"
 
 
 def test_reconcile_ignores_unmatched_and_unstamped(app_env, monkeypatch):

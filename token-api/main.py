@@ -1498,6 +1498,7 @@ async def reconcile_live_panes() -> dict:
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        tint_repaints: list[tuple[str, str]] = []
         for pane in panes:
             instance_id = pane.get("instance_id")
             if not instance_id:
@@ -1523,8 +1524,21 @@ async def reconcile_live_panes() -> dict:
             # No pane geometry is persisted: the live pane (already in `pane`) keeps
             # its @INSTANCE_ID stamp, so resolve_instance_pane(instance_id) recovers
             # pane/role on demand. Reactivating the row is the whole job.
+            if pane.get("pane_id"):
+                tint_repaints.append((instance_id, pane["pane_id"]))
             reactivated += 1
         await db.commit()
+        for instance_id, pane_id in tint_repaints:
+            try:
+                await shared.apply_instance_pane_tint(
+                    db, instance_id, pane_id, source="reconcile-live-panes"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "reconcile-live-panes tint repaint failed for %s: %s",
+                    str(instance_id)[:12],
+                    exc,
+                )
 
     if reactivated > 0:
         await log_event(
@@ -11553,20 +11567,29 @@ async def list_instances(
             row["gt_next_fire"] = (
                 gt_job.next_run_time.isoformat() if gt_job and gt_job.next_run_time else None
             )
+            row["durable_status"] = row.get("status")
             if include_runtime:
-                if row.get("device_id") != LOCAL_DEVICE_NAME or row.get("status") in {
-                    "stopped",
-                    "archived",
-                }:
+                if row.get("device_id") != LOCAL_DEVICE_NAME:
                     row["runtime"] = {"live_pane": False, "source": "tmuxctl"}
                 else:
+                    # Always ask the tmux oracle for local rows, even when the
+                    # durable row says stopped/archived. The false-dead failure
+                    # mode is exactly "DB status stale/dead while a live pane
+                    # still carries this row's @INSTANCE_ID stamp"; skipping
+                    # stopped rows here made /api/instances report dead and the
+                    # morning supervisor relaunch a live Custodes.
                     pane, role = await shared.resolve_instance_pane(row.get("id"))
+                    live = bool(pane)
                     row["runtime"] = {
-                        "live_pane": bool(pane),
+                        "live_pane": live,
                         "tmux_pane": pane,
                         "pane_label": role,
                         "source": "tmuxctl",
                     }
+                    if live and row.get("status") in {"stopped", "archived"}:
+                        row["stale_status"] = row.get("status")
+                        row["status"] = "idle"
+                        row["status_source"] = "tmuxctl-live-overlay"
             return row
 
         instances = await asyncio.gather(*(enrich(row) for row in rows))

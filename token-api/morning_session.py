@@ -163,11 +163,14 @@ def find_live_custodes() -> dict | None:
         if not isinstance(inst, dict):
             continue
         persona = inst.get("persona") or {}
+        runtime = inst.get("runtime") or {}
+        live_by_tmux = runtime.get("live_pane") is True or bool(runtime.get("tmux_pane"))
+        durable_status = inst.get("durable_status", inst.get("status"))
         if (
             persona.get("slug") == "custodes"
             and inst.get("rank") != "retired"
             and inst.get("commander_type") != "chapter"
-            and inst.get("status") not in ("stopped", "archived")
+            and (live_by_tmux or durable_status not in ("stopped", "archived"))
         ):
             return inst
     return None
