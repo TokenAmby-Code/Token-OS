@@ -154,15 +154,25 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     """The typing-guard indicator lives in each pane's border, not the global bar.
 
     Emperor UX directive: drop the global "⌨ GUARD" status-right segment and show
-    guard state per-pane via @GUARD. status-right must not run the old silent
-    --scan reconciler; @GUARD is now an event-updated pane option.
+    guard state per-pane. status-right must not run the old silent --scan
+    reconciler; pane-border liveness must come from live deadline math.
     """
     status_right = _line_starting("set -g status-right ")
     assert "tmux-typing-guard-status" not in status_right
     assert "#(" not in status_right, "typing guard status rendering must be zero-fork"
-    # The per-pane border is the sole guard surface now.
+    # The per-pane border is the sole guard surface now, but it must compute
+    # liveness from deadlines instead of trusting stored @GUARD projection.
     border = _line_starting("set -g pane-border-format ")
-    assert "@GUARD" in border, "pane border must render the per-pane @GUARD marker"
+    assert "@TYPING_LOCK_UNTIL" in border
+    assert "@TYPING_PENDING_UNTIL" in border
+    assert "@GUARD" not in border, "stored @GUARD must not drive live marker rendering"
+
+
+def test_typing_guard_marker_is_live_deadline_computed() -> None:
+    border = _line_starting("set -g pane-border-format ")
+    assert "#{?#{e|>=:#{@TYPING_PENDING_UNTIL},%s}, #[fg=red]#[bold]⌨#[default] ," in border
+    assert "#{?#{e|>=:#{@TYPING_LOCK_UNTIL},%s}, #[fg=colour214]#[bold]⌨#[default] ,}" in border
+    assert "#{?@GUARD," not in border
 
 
 def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None:
@@ -173,7 +183,7 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
 
     border = _line_starting("set -g pane-border-format ")
     start = border.index("#{?@PANE_LABEL,")
-    end = border.index("}#{?@GUARD", start) + 1
+    end = border.index("}#{?#{e|>=:#{@TYPING_PENDING_UNTIL},%s}", start) + 1
     blue_nametag = border[start:end]
 
     assert "#[bg=colour31]" in blue_nametag
@@ -192,7 +202,8 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
     assert "pane_title" not in border
     assert "@PANE_TITLE_SUPPRESS" not in border
     for expected in (
-        "@GUARD",
+        "@TYPING_LOCK_UNTIL",
+        "@TYPING_PENDING_UNTIL",
         "@OPS_SELECTED",
         "@GT_FIRE",
         "@DISCORD_VOICE_PROCESSING",
@@ -222,8 +233,8 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
 
     # Root-table Any is the catch-all backstop for EVERY mouse event lacking a
     # more specific binding (border clicks, status clicks, double/triple/second
-    # clicks, status-left/right, …). The explicit MouseUp1Pane/Wheel*/… no-ops
-    # below cover only the common cases and provably MISS others — which is how
+    # clicks, status-left/right, …). The explicit MouseUp/Drag no-ops below cover
+    # only common cases and provably MISS others — which is how
     # "mouse arms the typing guard" regressed ~5x (each fix whack-a-moled a few
     # more event names while Any kept catching the rest). So Any itself must
     # discriminate: a real mouse event carries a non-empty #{mouse_x}; a
@@ -251,8 +262,8 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
         "the mouse (else) branch of Any must consume the event — no arm and no "
         "send-keys after the keystroke branch"
     )
-    assert "bind -n FocusIn { }" in conf
-    assert "bind -n FocusOut { }" in conf
+    assert "bind -n FocusIn" not in conf
+    assert "bind -n FocusOut" not in conf
 
 
 def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
@@ -268,8 +279,6 @@ def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
         "MouseUp3Pane",
         "WheelUpPane",
         "WheelDownPane",
-        "FocusIn",
-        "FocusOut",
     ):
         line = _line_starting(f"bind -n {key} ")
         assert "tmux-typing-guard-state arm" not in line
@@ -366,8 +375,8 @@ def test_pane_border_identity_is_blank_by_default() -> None:
     assert "#{pane_title}" not in border, "hostname #{pane_title} fallback must be gone"
     assert "@PANE_TITLE_SUPPRESS" not in border, "retired suppress flag must be gone"
     # Structural proof of blank-by-default: the @PANE_LABEL conditional closes with
-    # an empty false-branch (`,}`) directly into the @GUARD segment.
-    assert "#{@PANE_LABEL} #[default],}#{?@GUARD," in border
+    # an empty false-branch (`,}`) directly into the live typing-guard deadline segment.
+    assert "#{@PANE_LABEL} #[default],}#{?#{e|>=:#{@TYPING_PENDING_UNTIL},%s}," in border
 
 
 def test_pane_title_suppress_concept_is_fully_retired() -> None:

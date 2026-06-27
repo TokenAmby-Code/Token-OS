@@ -486,6 +486,7 @@ _reset_deploy_run_state() {
     SYNC_DID_ADVANCE=false
     SYNC_CHANGED_PATHS=""
     SYNC_TARGET_SHA=""
+    TMUX_CONFIG_CHANGED=false
     RESTART_TOKENAPI=false
     RESTART_OPS=false
     RESTART_DISCORD=false
@@ -891,6 +892,66 @@ sync_live_checkout() {
     set -e
     [[ "$rc" -eq 0 ]] || return "$rc"
     return "$lock_rc"
+}
+
+real_tmux_binary() {
+    # Match tmuxctl.tmux_adapter._tmux_binary: honor explicit real-binary env
+    # overrides first, then skip this repo's optional cli-tools/bin/tmux shim.
+    local env_name candidate wrapper
+    for env_name in IMPERIUM_TMUX_BIN REAL_TMUX TMUX_BIN; do
+        candidate="${!env_name:-}"
+        if [[ -n "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    wrapper="${_BIN_DIR}/tmux"
+    for candidate in \
+        "$(command -v tmux 2>/dev/null || true)" \
+        "/opt/homebrew/bin/tmux" \
+        "/usr/local/bin/tmux" \
+        "/usr/bin/tmux" \
+        "/bin/tmux"
+    do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        if [[ -e "$wrapper" ]]; then
+            local resolved_candidate resolved_wrapper
+            resolved_candidate="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+            resolved_wrapper="$(readlink -f "$wrapper" 2>/dev/null || printf '%s' "$wrapper")"
+            [[ "$resolved_candidate" == "$resolved_wrapper" ]] && continue
+        fi
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    printf '%s\n' "tmux"
+}
+
+source_tmux_config_if_changed() {
+    [[ "${TMUX_CONFIG_CHANGED:-false}" == true ]] || return 0
+    [[ "${SYNC_DID_ADVANCE:-false}" == true ]] || return 0
+
+    local tmux_bin tmux_conf
+    tmux_bin="$(real_tmux_binary)"
+    tmux_conf="$HOME/.tmux.conf"
+
+    if [[ ! -f "$tmux_conf" ]]; then
+        echo -e "  ${YELLOW}⚠${NC} tmux config changed, but $tmux_conf is missing — skipping live source"
+        return 0
+    fi
+
+    if ! "$tmux_bin" has-session >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}○${NC} tmux config changed, but no running tmux server is available — skipping live source"
+        return 0
+    fi
+
+    echo -e "${BLUE}→${NC} tmux config changed — sourcing ${tmux_conf} into the running server..."
+    if "$tmux_bin" source-file "$tmux_conf"; then
+        echo -e "  ${GREEN}✓${NC} tmux config sourced"
+        return 0
+    fi
+    echo -e "  ${RED}✗${NC} tmux source-file failed: ${tmux_conf}"
+    return 1
 }
 
 restart_mac() {
@@ -1483,6 +1544,12 @@ map_changed_to_services() {
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
         case "$path" in
+            cli-tools/tmux/*)
+                # The deploy sync updates the on-disk tmux config, but the running
+                # tmux server does not read it until source-file. Source once after
+                # the sync (no sweep/timer/poll), using the real tmux binary.
+                TMUX_CONFIG_CHANGED=true
+                ;;
             cli-tools/launchd/ai.tokenclaw.tmuxctld.plist)
                 # The daemon's LaunchAgent plist changed. kickstart -k won't reload
                 # a changed plist, so flag a reinstall (cp + bootout + bootstrap of
@@ -1578,6 +1645,7 @@ full_restart() {
     if [[ "$SYNC_DID_ADVANCE" == true ]]; then
         # Smart deploy: restart ONLY the services whose files the pull changed.
         map_changed_to_services
+        source_tmux_config_if_changed || return 1
         # A stale live process must bounce even if only non-service files (docs)
         # changed this pull — the process is still serving older code.
         [[ "$token_api_stale" == true ]] && RESTART_TOKENAPI=true
@@ -1705,6 +1773,7 @@ SYNC_BEFORE_RESTART=true
 SYNC_DID_ADVANCE=false
 SYNC_CHANGED_PATHS=""
 SYNC_TARGET_SHA=""
+TMUX_CONFIG_CHANGED=false
 # Stderr from the last failed ff-merge attempt — surfaced on a genuine non-ff so the
 # failure is never silent (see _cd_sync_ff_with_retry / sync_live_checkout).
 CD_SYNC_MERGE_ERR=""

@@ -369,6 +369,27 @@ def test_docs_only_change_restarts_nothing(tmp_path: Path) -> None:
     assert "No deployable services changed" in proc.stdout
 
 
+def test_tmux_config_change_sources_running_server_once_without_service_restart(
+    tmp_path: Path,
+) -> None:
+    env, logfile = _stub_env(tmp_path, "cli-tools/tmux/tmux-base.conf")
+    stub_tmux = Path(env["PATH"].split(os.pathsep, 1)[0]) / "tmux"
+    env["IMPERIUM_TMUX_BIN"] = str(stub_tmux)
+    env["HOME"] = str(tmp_path)
+    (tmp_path / ".tmux.conf").write_text("# test config; stub tmux only\n")
+
+    proc = _run(env)
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    calls = logfile.read_text()
+    assert "tmux has-session" in calls
+    assert f"tmux source-file {tmp_path / '.tmux.conf'}" in calls
+    assert RESTART_TOKENAPI not in calls
+    assert KICK_DISCORD not in calls
+    assert "push-mobile -a" not in calls
+    assert "No deployable services changed" in proc.stdout
+
+
 def test_no_advance_falls_back_to_full_restart(tmp_path: Path) -> None:
     # Sync is a no-op (HEAD already current) → full restart of the standard set,
     # regardless of what the (irrelevant) diff would say.
@@ -496,7 +517,8 @@ def _assert_no_fleet_wipe(calls: str) -> None:
         assert bad not in calls, (
             f"deploy must never emit destructive tmux command {bad!r}:\n{calls}"
         )
-    # token-restart should not shell to tmux/tmuxctl/tx at all.
+    # For non-tmux-config deploys, token-restart should not shell to tmux/tmuxctl/tx at all.
+    # (tmux config changes are the one explicit exception: they source ~/.tmux.conf.)
     for tool in ("tmux ", "tmuxctl ", "tx "):
         assert tool not in calls, f"deploy unexpectedly invoked {tool!r}:\n{calls}"
 
