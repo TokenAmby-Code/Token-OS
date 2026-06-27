@@ -36,6 +36,12 @@ from pydantic import BaseModel
 import shared
 import talk as talk_service
 from enforcement_service import close_distraction_windows
+from golden_throne_noop import (
+    NO_OP_THRESHOLD,
+    append_summary,
+    classify_gt_response,
+    worktree_fingerprint,
+)
 from human_render import sanitize_human_render_text
 from instance_lifecycle import apply_instance_lifecycle, normalize_instance_lifecycle
 from instance_mutation import (
@@ -5074,6 +5080,157 @@ async def _post_discord_mirror(channel: str, bot: str, content: str):
         logger.warning(f"Discord mirror failed for {channel}: {e}")
 
 
+async def _record_gt_response_classification(
+    instance: dict,
+    payload: dict,
+    *,
+    hook_driven_actor: str | None,
+) -> dict:
+    """Classify an autonomous Golden-Throne ping response and update loop state.
+
+    Returns a dict with ``force_closed`` true when the caller must not re-arm the
+    Golden Throne timer. The force-close path writes the state directly (clear GT
+    marker + review_mode workflow) and never calls victory/victory-ack routes.
+    """
+    instance_id = instance["id"]
+    prior_fingerprint = instance.get("gt_last_dispatch_fingerprint")
+    current_fingerprint = await asyncio.to_thread(worktree_fingerprint, instance.get("working_dir"))
+    classification = classify_gt_response(
+        transcript_tail=payload.get("transcript_tail"),
+        transcript_path=payload.get("transcript_path"),
+        prior_fingerprint=prior_fingerprint,
+        current_fingerprint=current_fingerprint,
+    )
+    previous_count = int(instance.get("gt_no_op_counter") or 0)
+    summaries = append_summary(instance.get("gt_no_op_summaries_json"), classification.summary)
+    now = datetime.now().isoformat()
+
+    details = {
+        "instance_id": instance_id,
+        "outcome": classification.outcome,
+        "reason": classification.reason,
+        "has_tool_calls": classification.has_tool_calls,
+        "has_delta": classification.has_delta,
+        "hook_driven_actor": hook_driven_actor,
+        "previous_no_op_counter": previous_count,
+        "response_summary": classification.summary,
+    }
+
+    if classification.outcome == "active":
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            await sanctioned_update_instance(
+                db,
+                instance_id=instance_id,
+                updates={
+                    "gt_no_op_counter": 0,
+                    "gt_no_op_summaries_json": json.dumps(summaries),
+                    "gt_last_dispatch_fingerprint": current_fingerprint,
+                    "workflow_blocked_reason": None,
+                },
+                mutation_type="instance_updated",
+                write_source="hooks",
+                actor="Stop-golden-throne-classifier",
+            )
+            await db.commit()
+        await log_event(
+            "golden_throne_response_classified",
+            instance_id=instance_id,
+            details=details,
+        )
+        return {**details, "no_op_counter": 0, "force_closed": False}
+
+    force_reason = None
+    if classification.outcome == "victory_declare":
+        next_count = 0
+        force_reason = "victory_declare"
+    else:
+        next_count = previous_count + 1
+        details["no_op_counter"] = next_count
+        if next_count >= NO_OP_THRESHOLD:
+            force_reason = "sisyphus_no_op_threshold"
+
+    updates = {
+        "gt_no_op_counter": next_count,
+        "gt_no_op_summaries_json": json.dumps(summaries),
+        "gt_last_dispatch_fingerprint": current_fingerprint,
+    }
+    if force_reason:
+        updates.update(
+            {
+                "golden_throne": None,
+                "status": "reviewing",
+                "workflow_state": "review_mode",
+                "workflow_updated_at": now,
+                "workflow_blocked_reason": force_reason,
+                "next_required_action": "review",
+                "next_action_owner": "human",
+                "hook_driven": 0,
+                "stop_allowed": 1,
+            }
+        )
+
+    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type="status_changed" if force_reason else "instance_updated",
+            write_source="hooks",
+            actor="Stop-golden-throne-classifier",
+        )
+        if force_reason:
+            await append_workflow_event(
+                db,
+                instance_id=instance_id,
+                workflow_state="review_mode",
+                event_type="workflow_state_changed",
+                event_owner="hooks",
+                details={
+                    "old_workflow_state": instance.get("workflow_state"),
+                    "new_workflow_state": "review_mode",
+                    "reason": force_reason,
+                },
+            )
+            await append_workflow_event(
+                db,
+                instance_id=instance_id,
+                workflow_state="review_mode",
+                event_type="gt_review_mode_forced",
+                event_owner="hooks",
+                details={**details, "count": next_count, "last_3_response_summaries": summaries},
+            )
+        await db.commit()
+
+    event_details = {**details, "count": next_count, "last_3_response_summaries": summaries}
+    if force_reason == "sisyphus_no_op_threshold":
+        try:
+            if _scheduler is not None:
+                _scheduler.remove_job(f"golden-throne-{instance_id}")
+        except Exception:
+            pass
+        await log_event("sisyphus_force_close", instance_id=instance_id, details=event_details)
+        return {**event_details, "force_closed": True, "force_reason": force_reason}
+    if force_reason == "victory_declare":
+        try:
+            if _scheduler is not None:
+                _scheduler.remove_job(f"golden-throne-{instance_id}")
+        except Exception:
+            pass
+        await log_event(
+            "golden_throne_victory_declare_review_mode",
+            instance_id=instance_id,
+            details=event_details,
+        )
+        return {**event_details, "force_closed": True, "force_reason": force_reason}
+
+    await log_event(
+        "golden_throne_response_classified",
+        instance_id=instance_id,
+        details=event_details,
+    )
+    return {**event_details, "force_closed": False}
+
+
 async def handle_stop(payload: dict) -> dict:
     """Handle Stop hook - response completed, trigger TTS/notifications."""
     session_id = payload.get("session_id")
@@ -5116,7 +5273,7 @@ async def handle_stop(payload: dict) -> dict:
 
     instance = dict(instance)
     was_hook_driven = bool(instance.get("hook_driven"))
-    hook_driven_actor = None
+    hook_driven_actor = shared.pop_hook_driven_actor(session_id)
 
     # Dev-worktree instances are test traffic: their Stop hook must produce NO
     # Emperor-facing side-effects (completion TTS, phone/Discord notify, evaluators).
@@ -5250,6 +5407,22 @@ async def handle_stop(payload: dict) -> dict:
     # StopValidate may block once for self-eval, but the async Stop hook owns
     # durable persistence after the model actually goes quiet.
     if instance_type == "golden_throne":
+        gt_response = None
+        is_gt_ping_response = was_hook_driven or (hook_driven_actor or "").startswith(
+            "enqueue:golden_throne"
+        )
+        if is_gt_ping_response:
+            gt_response = await _record_gt_response_classification(
+                instance, payload, hook_driven_actor=hook_driven_actor
+            )
+            result["golden_throne_response"] = gt_response
+            if gt_response.get("force_closed"):
+                result["golden_throne"] = {
+                    "scheduled": False,
+                    "reason": gt_response.get("force_reason", "review_mode_forced"),
+                }
+                result["action"] = "stop_processed_gt_review_mode"
+                return result
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
             await sanctioned_update_instance(
                 db,
@@ -5412,7 +5585,8 @@ async def handle_stop(payload: dict) -> dict:
 
         return result
 
-    hook_driven_actor = shared.pop_hook_driven_actor(session_id)
+    if hook_driven_actor is None:
+        hook_driven_actor = shared.pop_hook_driven_actor(session_id)
 
     # Discord output mirroring — fire before TTS markdown sanitization (Discord renders markdown)
     if tts_text and instance.get("discord_hosted") and instance.get("discord_channel"):

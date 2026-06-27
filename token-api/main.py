@@ -39,6 +39,8 @@ UI_DIR = Path(__file__).resolve().parent / "ui"
 import subprocess
 import tempfile
 
+from golden_throne_noop import worktree_fingerprint
+
 
 def _capture_launched_git_sha() -> str | None:
     """Git SHA of the checkout this process loaded code from.
@@ -8048,6 +8050,24 @@ async def golden_throne_followup(session_id: str):
     else:
         sop_prompt = _load_golden_throne_sop()
     working_dir = instance.get("working_dir") or "~"
+    dispatch_fingerprint = await asyncio.to_thread(worktree_fingerprint, working_dir)
+    if dispatch_fingerprint:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await sanctioned_update_instance(
+                    db,
+                    instance_id=session_id,
+                    updates={"gt_last_dispatch_fingerprint": dispatch_fingerprint},
+                    mutation_type="instance_updated",
+                    write_source="golden_throne",
+                    actor="golden-throne-fingerprint",
+                )
+                await db.commit()
+            instance["gt_last_dispatch_fingerprint"] = dispatch_fingerprint
+        except Exception as exc:
+            logger.warning(
+                f"Golden Throne: failed to store dispatch fingerprint for {session_id[:12]}: {exc}"
+            )
     tab_name = instance.get("tab_name", "session")
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     # tmuxctl owns instance_id -> pane resolution. token-api keeps no stored pane
