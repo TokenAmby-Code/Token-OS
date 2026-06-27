@@ -70,6 +70,171 @@ def _events(event_type):
     return [dict(row) for row in rows]
 
 
+def _cascade_started_state_events():
+    return [
+        json.loads(e["details"])
+        for e in _events("custodes_state_event")
+        if json.loads(e["details"]).get("event_type") == "enforcement_cascade_started"
+    ]
+
+
+def _suppressions():
+    return [json.loads(e["details"]) for e in _events("cascade_decision_suppressed")]
+
+
+def _wire_cascade_route_sinks(monkeypatch):
+    async def fake_admin_record(event, intervention, classification):
+        return {"dispatched": False, "reason": "test_admin_sink"}
+
+    async def fake_custodes_dispatch(prompt):
+        return {"dispatched": True, "reason": "test_custodes_sink", "instance_id": "custodes-test"}
+
+    monkeypatch.setattr(main, "_dispatch_administratum_record", fake_admin_record)
+    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fake_custodes_dispatch)
+    monkeypatch.setattr(main, "is_quiet_hours", lambda *a, **k: False)
+
+
+def test_cascade_route_suppresses_ack_source_without_phone_app(client, monkeypatch):
+    _wire_cascade_route_sinks(monkeypatch)
+
+    resp = client.post(
+        "/api/custodes/state-event",
+        json={
+            "event_type": "enforcement_cascade_started",
+            "source": "golden_throne",
+            "severity": 4,
+            "payload": {"ack_source": "golden_throne", "phone_app": None},
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intervention_dispatched"] is False
+    assert data["reason"] == "missing_phone_app"
+    assert _cascade_started_state_events() == []
+    suppressions = _suppressions()
+    assert len(suppressions) == 1
+    assert suppressions[0]["reason"] == "missing_phone_app"
+
+
+def test_cascade_route_suppresses_internal_cached_phone_app(client, monkeypatch):
+    _wire_cascade_route_sinks(monkeypatch)
+
+    resp = client.post(
+        "/api/custodes/state-event",
+        json={
+            "event_type": "enforcement_cascade_started",
+            "source": "golden_throne",
+            "severity": 4,
+            "payload": {"ack_source": "golden_throne", "phone_app": "Claude 14:40"},
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intervention_dispatched"] is False
+    assert data["reason"] == "internal_or_cached_phone_app"
+    assert _cascade_started_state_events() == []
+    suppressions = _suppressions()
+    assert len(suppressions) == 1
+    assert suppressions[0]["phone_app"] == "Claude 14:40"
+
+
+def test_cascade_route_allows_concrete_allowlisted_distraction_app(client, monkeypatch):
+    _wire_cascade_route_sinks(monkeypatch)
+
+    resp = client.post(
+        "/api/custodes/state-event",
+        json={
+            "event_type": "enforcement_cascade_started",
+            "source": "phone",
+            "severity": 4,
+            "payload": {"phone_app": "slay the spire"},
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intervention_dispatched"] is True
+    assert data["reason"] == "test_custodes_sink"
+    assert len(_cascade_started_state_events()) == 1
+    assert _suppressions() == []
+
+
+@pytest.mark.parametrize(
+    ("status", "live_pane", "expected_reason"),
+    [
+        ("stopped", "%10", "pane_instance_stopped"),
+        ("idle", None, "pane_not_live"),
+    ],
+)
+def test_cascade_route_suppresses_stopped_or_nonexistent_pane(
+    client, monkeypatch, status, live_pane, expected_reason
+):
+    _wire_cascade_route_sinks(monkeypatch)
+    instance_id = _insert_instance(status=status, synced=0)
+
+    async def fake_resolve_instance_pane(candidate):
+        assert candidate == instance_id
+        return (live_pane, None)
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", fake_resolve_instance_pane)
+
+    resp = client.post(
+        "/api/custodes/state-event",
+        json={
+            "event_type": "enforcement_cascade_started",
+            "source": "phone",
+            "instance_id": instance_id,
+            "severity": 4,
+            "payload": {"phone_app": "youtube", "tmux_pane": "%10"},
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intervention_dispatched"] is False
+    assert data["reason"] == expected_reason
+    assert _cascade_started_state_events() == []
+    suppressions = _suppressions()
+    assert len(suppressions) == 1
+    assert suppressions[0]["reason"] == expected_reason
+
+
+def test_enforcement_pane_reference_uses_live_oracle_before_routing(client, monkeypatch):
+    _wire_cascade_route_sinks(monkeypatch)
+    instance_id = _insert_instance(status="idle", synced=0)
+
+    async def fake_resolve_instance_pane(candidate):
+        assert candidate == instance_id
+        return (None, None)
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", fake_resolve_instance_pane)
+
+    resp = client.post(
+        "/api/custodes/state-event",
+        json={
+            "event_type": "expected_ack_escalated",
+            "source": "askq_ladder",
+            "instance_id": instance_id,
+            "severity": 4,
+            "payload": {
+                "ack_source": "askuserquestion",
+                "level": 2,
+                "tmux_pane": "%134",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intervention_dispatched"] is False
+    assert data["reason"] == "pane_not_live"
+    suppressions = _suppressions()
+    assert len(suppressions) == 1
+    assert suppressions[0]["event_type"] == "expected_ack_escalated"
+
+
 def test_no_live_custodes_launches_replacement(client, monkeypatch):
     launches = []
 
