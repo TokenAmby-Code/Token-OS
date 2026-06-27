@@ -200,6 +200,100 @@ def test_phone_direct_tts_only_occurs_inside_the_router(monkeypatch):
 
     assert any(p.get("tts_text") == "away from home" for _e, p in sent)
     assert result.get("success") is True
+    assert result.get("method") == "phone"
+    assert result.get("route") == "phone"
+
+
+def test_discord_fallthrough_respects_geofence_phone_only(monkeypatch: Any) -> None:
+    """If Discord VC fails while geofenced away, fallback is phone-only.
+
+    Discord is intentionally checked before the geofence, but a failed Discord
+    leg must not leak away-from-home speech to local WSL/Mac speakers.
+    """
+    tts = _load("routes.tts")
+    sent = []
+
+    monkeypatch.setitem(tts.DESKTOP_STATE, "location_zone", "gym")
+    monkeypatch.setattr(
+        tts,
+        "resolve_tts_device",
+        lambda **kw: {
+            "device": "discord",
+            "reason": "operator in voice channel",
+            "discord_bot": "token-bot",
+        },
+    )
+    monkeypatch.setattr(
+        tts,
+        "speak_tts_discord",
+        lambda *a, **k: {
+            "success": False,
+            "error": "discord_voice_not_played",
+            "reason": "bot_not_in_channel",
+        },
+    )
+    monkeypatch.setattr(tts, "_phone_tts_available", lambda: True)
+
+    def fake_send_to_phone(endpoint, params):
+        sent.append((endpoint, dict(params or {})))
+        return {"success": True}
+
+    monkeypatch.setattr(tts, "_send_to_phone", fake_send_to_phone)
+    monkeypatch.setattr(
+        tts,
+        "is_satellite_tts_available",
+        lambda: (_ for _ in ()).throw(AssertionError("WSL fallback bypassed geofence")),
+    )
+    monkeypatch.setattr(
+        tts,
+        "speak_tts_mac",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Mac fallback bypassed geofence")),
+    )
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
+
+    result = tts.speak_tts("away discord fallback")
+
+    assert result.get("success") is True
+    assert result.get("method") == "phone"
+    assert result.get("route") == "phone"
+    assert any(p.get("tts_text") == "away discord fallback" for _e, p in sent)
+
+
+def test_wsl_fallthrough_reports_phone_route(monkeypatch: Any) -> None:
+    """When WSL falls through to phone, public route telemetry says phone."""
+    tts = _load("routes.tts")
+    sent = []
+
+    monkeypatch.setattr(
+        tts,
+        "resolve_tts_device",
+        lambda **kw: {"device": "wsl", "reason": "satellite healthy", "discord_bot": None},
+    )
+    monkeypatch.setattr(
+        tts,
+        "speak_tts_wsl",
+        lambda *a, **k: {
+            "success": False,
+            "error": "wsl_failed",
+            "reason": "wsl_failed",
+        },
+    )
+    monkeypatch.setattr(tts, "_phone_tts_available", lambda: True)
+
+    def fake_send_to_phone(endpoint, params):
+        sent.append((endpoint, dict(params or {})))
+        return {"success": True}
+
+    monkeypatch.setattr(tts, "_send_to_phone", fake_send_to_phone)
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
+
+    result = tts.speak_tts("wsl fallback")
+
+    assert result.get("success") is True
+    assert result.get("requested_device") == "wsl"
+    assert result.get("method") == "phone"
+    assert result.get("route") == "phone"
+    assert any(p.get("tts_text") == "wsl fallback" for _e, p in sent)
 
 
 # ---------------- Router consolidation: notify.py delegates ----------------

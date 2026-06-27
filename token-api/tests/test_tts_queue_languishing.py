@@ -47,7 +47,7 @@ def _insert_tts_instance(db_path: Path) -> str:
     return iid
 
 
-def test_queue_tts_languishing_emits_internal_state_label(app_env, monkeypatch) -> None:
+def test_queue_tts_languishing_emits_internal_state_label(app_env: Any, monkeypatch: Any) -> None:
     """Pause queue length > 5 emits an internal state label, not enforcement."""
     tts = _load_tts()
     iid = _insert_tts_instance(app_env.db_path)
@@ -83,7 +83,7 @@ def test_queue_tts_languishing_emits_internal_state_label(app_env, monkeypatch) 
     assert kwargs["payload"]["threshold"] == 5
 
 
-def test_queue_tts_languishing_ignores_direct_hot_tts(app_env, monkeypatch) -> None:
+def test_queue_tts_languishing_ignores_direct_hot_tts(app_env: Any, monkeypatch: Any) -> None:
     """Direct hot TTS should not trip pause-queue languishing enforcement."""
     tts = _load_tts()
     iid = _insert_tts_instance(app_env.db_path)
@@ -414,7 +414,9 @@ def test_pause_queue_languishing_snapshot_expires_stale_held_items(monkeypatch) 
     assert sweep["per_item_events_logged"] == 1
 
 
-def test_languishing_alert_stop_tts_does_not_feed_pause_queue(app_env, monkeypatch) -> None:
+def test_languishing_alert_stop_tts_does_not_feed_pause_queue(
+    app_env: Any, monkeypatch: Any
+) -> None:
     """The autonomous alert response is logged but excluded from the alerted queue."""
     hooks = sys.modules["routes.hooks"]
     tts = _load_tts()
@@ -522,7 +524,9 @@ def test_tts_languishing_state_event_rechecks_live_queue_before_routing(
     assert result["live_tts_queue"]["pause_queue_length"] == 0
 
 
-def test_tts_languishing_state_event_drops_near_empty_live_queue(app_env, monkeypatch) -> None:
+def test_tts_languishing_state_event_drops_near_empty_live_queue(
+    app_env: Any, monkeypatch: Any
+) -> None:
     """A stale languishing payload must not page when the live pause queue has one item."""
     main = app_env.main
     tts = _load_tts()

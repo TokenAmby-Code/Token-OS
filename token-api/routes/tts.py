@@ -589,6 +589,18 @@ def speak_tts(
             result.setdefault("reason", result.get("error") or "tts_delivery_failed")
         return result
 
+    def _send_phone_tts() -> dict:
+        """Send spoken text to the phone transport and stamp truthful routing.
+
+        Phone can be either the selected device or a fallthrough from Discord/WSL.
+        The transport returns only success/failure, so stamp `method=phone`
+        before `_finish()` derives the public `route`.
+        """
+        result = dict(_send_to_phone("/notify", {"tts_text": message}) or {})
+        if result.get("success"):
+            result.setdefault("method", "phone")
+        return result
+
     if device is None:
         result = _no_playback_backend("no_playback_backend")
         result["route_reason"] = routing.get("reason")
@@ -607,6 +619,18 @@ def speak_tts(
         if result.get("success"):
             return _finish(result)
         logger.info(f"TTS: Discord failed ({result.get('error')}), falling through")
+
+        # Discord is checked before geofence so VC audio can work anywhere. If
+        # that VC leg fails while away from home, fall through only to the
+        # phone. Never leak away-from-home speech to local WSL/Mac speakers.
+        location_zone = DESKTOP_STATE.get("location_zone")
+        if location_zone is not None and location_zone != "home":
+            if _phone_tts_available():
+                result = _send_phone_tts()
+                if result.get("success"):
+                    return _finish(result)
+            return _finish(_no_playback_backend("geofence_phone_failed"))
+
         # Re-resolve skipping discord — try WSL/phone/mac
         if is_satellite_tts_available():
             fallthrough_voice = wsl_voice or ULTIMATE_FALLBACK["wsl_voice"]
@@ -619,7 +643,7 @@ def speak_tts(
             if result.get("success"):
                 return _finish(result)
         if _phone_tts_available():
-            result = _send_to_phone("/notify", {"tts_text": message})
+            result = _send_phone_tts()
             if result.get("success"):
                 return _finish(result)
         if _mac_tts_available():
@@ -635,22 +659,20 @@ def speak_tts(
         )
         if result.get("success"):
             return _finish(result)
-        logger.info(
-            f"TTS: WSL failed ({result.get('error')}), falling back to Mac ({voice or 'Daniel'})"
-        )
-        if _mac_tts_available():
-            return _finish(speak_tts_mac(message, voice, rate))
+        logger.info(f"TTS: WSL failed ({result.get('error')}), falling through to phone/Mac")
         if _phone_tts_available():
-            result = _send_to_phone("/notify", {"tts_text": message})
+            result = _send_phone_tts()
             if result.get("success"):
                 return _finish(result)
+        if _mac_tts_available():
+            return _finish(speak_tts_mac(message, voice, rate))
         return _finish(_no_playback_backend("wsl_failed_no_fallthrough_backend"))
 
     if device == "phone":
         # Reaching this branch means the router selected phone. The router may be
         # monkeypatched in invariant tests; do not re-probe reachability here.
         if _send_to_phone:
-            result = _send_to_phone("/notify", {"tts_text": message})
+            result = _send_phone_tts()
             if result.get("success"):
                 return _finish(result)
             logger.info(f"TTS: Phone failed ({result.get('error')})")
