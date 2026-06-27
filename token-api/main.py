@@ -643,6 +643,7 @@ class TempMessageRequest(BaseModel):
     selector: str = Field(..., min_length=1)
     payload: str = Field(..., min_length=1)
     idempotency_key: str | None = None
+    dry_run: bool = False
 
 
 class TalkSendRequest(BaseModel):
@@ -12789,7 +12790,11 @@ async def brief_send(request: BriefSendRequest):
 
 @app.post("/api/orchestrator/temp_message")
 async def orchestrator_temp_message(request: TempMessageRequest):
-    """Dispatch an ephemeral roll-call prompt to panes selected by engine/page/name."""
+    """Dispatch an ephemeral roll-call prompt to panes selected by engine/page/name.
+
+    Set ``dry_run=true`` to evaluate selectors and return preview receipts without
+    enqueueing or sending any text to tmux.
+    """
     poll_id = request.idempotency_key or str(uuid.uuid4())
     try:
         receipts = await temp_message_service.broadcast_temp_message(
@@ -12799,6 +12804,7 @@ async def orchestrator_temp_message(request: TempMessageRequest):
             db_path=DB_PATH,
             queue_sender=enqueue_pane_write,
             queue_drainer=process_pane_write_queue_once,
+            dry_run=request.dry_run,
         )
     except temp_message_service.SelectorError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

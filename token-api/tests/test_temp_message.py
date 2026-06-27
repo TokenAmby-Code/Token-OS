@@ -1,6 +1,7 @@
 import sqlite3
 
 import pytest
+from fastapi.testclient import TestClient
 
 
 def _insert_instance(
@@ -241,3 +242,111 @@ async def test_temp_message_deferral_keeps_pending_poll(app_env, monkeypatch):
     rows = conn.execute("SELECT poll_id, instance_id, status FROM pending_polls").fetchall()
     conn.close()
     assert rows == [("poll-deferred", "claude-1", "pending")]
+
+
+def test_temp_message_route_dry_run_previews_without_dispatch(app_env, monkeypatch) -> None:
+    temp_message = app_env.main.temp_message_service
+    _insert_instance(
+        app_env.db_path,
+        instance_id="claude-dry-run",
+        session_id="s-claude-dry-run",
+        pane="%1",
+        engine="claude",
+        tab_name="dry-run-target",
+    )
+
+    async def fake_tmux_panes():
+        return {
+            "%1": {
+                "tmux_session": "palace",
+                "tmux_window": "NW",
+                "tmux_session_window": "palace:NW",
+                "instance_id": "claude-dry-run",
+            }
+        }
+
+    send_calls = []
+    drain_calls = []
+
+    async def fake_queue_sender(**kwargs):
+        send_calls.append(kwargs)
+        return {"id": "q-dry-run", "status": "pending"}
+
+    async def fake_drainer(queue_id):
+        drain_calls.append(queue_id)
+        return [{"queue_id": queue_id, "status": "sent"}]
+
+    monkeypatch.setattr(temp_message, "_read_tmux_panes", fake_tmux_panes)
+    monkeypatch.setattr(app_env.main, "enqueue_pane_write", fake_queue_sender)
+    monkeypatch.setattr(app_env.main, "process_pane_write_queue_once", fake_drainer)
+
+    client = TestClient(app_env.main.app)
+    response = client.post(
+        "/api/orchestrator/temp_message",
+        json={"selector": "engine=claude", "payload": "roll call", "dry_run": True},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["target_count"] == 1
+    receipt = body["receipts"][0]
+    assert receipt["status"] == "previewed"
+    assert receipt["dispatch"] == {"status": "skipped_dry_run"}
+    assert receipt["payload"] == "/btw roll call"
+    assert receipt["instance_id"] == "claude-dry-run"
+    assert send_calls == []
+    assert drain_calls == []
+
+
+def test_temp_message_route_without_dry_run_dispatches_normally(app_env, monkeypatch) -> None:
+    temp_message = app_env.main.temp_message_service
+    _insert_instance(
+        app_env.db_path,
+        instance_id="claude-live-path",
+        session_id="s-claude-live-path",
+        pane="%1",
+        engine="claude",
+        tab_name="live-path-target",
+    )
+
+    async def fake_tmux_panes():
+        return {
+            "%1": {
+                "tmux_session": "palace",
+                "tmux_window": "NW",
+                "tmux_session_window": "palace:NW",
+                "instance_id": "claude-live-path",
+            }
+        }
+
+    send_calls = []
+    drain_calls = []
+
+    async def fake_queue_sender(**kwargs):
+        send_calls.append(kwargs)
+        return {"id": "q-live-path", "status": "pending"}
+
+    async def fake_drainer(queue_id):
+        drain_calls.append(queue_id)
+        return [{"queue_id": queue_id, "status": "sent"}]
+
+    monkeypatch.setattr(temp_message, "_read_tmux_panes", fake_tmux_panes)
+    monkeypatch.setattr(app_env.main, "enqueue_pane_write", fake_queue_sender)
+    monkeypatch.setattr(app_env.main, "process_pane_write_queue_once", fake_drainer)
+
+    client = TestClient(app_env.main.app)
+    response = client.post(
+        "/api/orchestrator/temp_message",
+        json={"selector": "engine=claude", "payload": "roll call"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["target_count"] == 1
+    receipt = body["receipts"][0]
+    assert receipt["status"] == "sent"
+    assert len(send_calls) == 1
+    assert len(drain_calls) == 1
+    assert send_calls[0]["payload"] == "/btw roll call"
+    assert send_calls[0]["instance_id"] == "claude-live-path"
