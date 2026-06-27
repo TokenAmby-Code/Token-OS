@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from custodes_state_policy import StateEvent, evaluate_state_event
+from custodes_state_policy import StateEvent, classify_trigger, evaluate_state_event
 
 
 def _load_tts():
@@ -46,15 +46,15 @@ def _insert_tts_instance(db_path: Path) -> str:
     return iid
 
 
-def test_queue_tts_languishing_emits_custodes_enforcement(app_env, monkeypatch) -> None:
-    """Pause queue length > 5 emits a recognized Custodes enforcement event."""
+def test_queue_tts_languishing_emits_internal_state_label(app_env, monkeypatch) -> None:
+    """Pause queue length > 5 emits an internal state label, not enforcement."""
     tts = _load_tts()
     iid = _insert_tts_instance(app_env.db_path)
     calls = []
 
     async def fake_state_event(event_type, source, **kwargs):
         calls.append((event_type, source, kwargs))
-        return {"received": True, "classification": "enforcement"}
+        return {"received": True, "classification": "state"}
 
     monkeypatch.setattr(tts, "_custodes_state_event_handler", fake_state_event)
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
@@ -75,7 +75,7 @@ def test_queue_tts_languishing_emits_custodes_enforcement(app_env, monkeypatch) 
     event_type, source, kwargs = calls[0]
     assert event_type == "tts_queue_languishing"
     assert source == "tts_queue"
-    assert kwargs["event_class"] == "enforcement"
+    assert kwargs["event_class"] == "state"
     assert kwargs["severity"] == 3
     assert kwargs["payload"]["pause_queue_length"] == 6
     assert kwargs["payload"]["threshold"] == 5
@@ -108,7 +108,7 @@ def test_queue_tts_languishing_ignores_direct_hot_tts(app_env, monkeypatch) -> N
     assert calls == []
 
 
-def test_tts_queue_languishing_is_enforcement_trigger() -> None:
+def test_tts_queue_languishing_is_internal_state_trigger() -> None:
     event = StateEvent(
         event_type="tts_queue_languishing",
         source="tts_queue",
@@ -120,7 +120,8 @@ def test_tts_queue_languishing_is_enforcement_trigger() -> None:
 
     assert intervention is not None
     assert intervention.event_type == "tts_queue_languishing"
-    assert "TTS pause queue is languishing" in intervention.behavioral_prompt
+    assert classify_trigger("tts_queue_languishing") == "state"
+    assert "internal diagnostics only" in intervention.behavioral_prompt
 
 
 def test_tts_languishing_emit_reads_live_pause_queue(monkeypatch) -> None:
@@ -483,3 +484,65 @@ def test_tts_languishing_state_event_rechecks_live_queue_before_routing(
     assert result["classification"] == "stale"
     assert result["reason"] == "pause_queue_empty"
     assert result["live_tts_queue"]["pause_queue_length"] == 0
+
+
+def test_tts_languishing_state_event_drops_near_empty_live_queue(app_env, monkeypatch) -> None:
+    """A stale languishing payload must not page when the live pause queue has one item."""
+    main = app_env.main
+    tts = _load_tts()
+    tts.pause_queue.clear()
+    tts.hot_queue.clear()
+    monkeypatch.setattr(tts, "TTS_LANGUISHING_THRESHOLD", 2)
+    monkeypatch.setattr(main, "is_quiet_hours", lambda *a, **k: False)
+
+    async def fail_dispatch(*args, **kwargs):  # pragma: no cover - assertion path
+        raise AssertionError("near-empty tts_queue_languishing must not dispatch/page")
+
+    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fail_dispatch)
+    monkeypatch.setattr(main, "_dispatch_administratum_record", fail_dispatch)
+
+    stale_payload = {
+        "app": "tts_queue",
+        "queue": "pause",
+        "pause_queue_length": 6,
+        "threshold": 2,
+        "latest_instance_id": "stale-iid",
+        "latest_tab_name": "stale-tab",
+    }
+
+    async def drive():
+        async with tts.tts_queue_lock:
+            tts.pause_queue.clear()
+            tts.pause_queue.append(
+                tts.TTSQueueItem(
+                    instance_id="only-live-item",
+                    message="still queued",
+                    voice="Daniel",
+                    sound="none",
+                    tab_name="only-tab",
+                    queue_target="pause",
+                )
+            )
+
+        return await main.handle_custodes_state_event(
+            "tts_queue_languishing",
+            "tts_queue",
+            severity=3,
+            payload=stale_payload,
+            event_class="enforcement",
+        )
+
+    try:
+        result = asyncio.run(drive())
+    finally:
+
+        async def cleanup():
+            async with tts.tts_queue_lock:
+                tts.pause_queue.clear()
+
+        asyncio.run(cleanup())
+
+    assert result["intervention_dispatched"] is False
+    assert result["classification"] == "stale"
+    assert result["reason"] == "pause_queue_below_languishing_threshold"
+    assert result["live_tts_queue"]["pause_queue_length"] == 1

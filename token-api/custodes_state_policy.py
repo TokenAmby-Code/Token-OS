@@ -24,6 +24,8 @@ V1_TRIGGERS = {
     "enforcement_cascade_started",
     "enforcement_cascade_escalate",
     "expected_ack_escalated",
+    # Internal/diagnostic only: recognized so it can be recorded, but it must
+    # never attach to the Custodes enforcement/paging path.
     "tts_queue_languishing",
 }
 
@@ -39,7 +41,6 @@ ENFORCEMENT_TRIGGERS = {
     "phone_distraction_blocked",
     "phone_distraction_enforce",
     "desktop_mode_blocked",
-    "tts_queue_languishing",
 }
 
 
@@ -100,15 +101,11 @@ def build_dedupe_key(event: StateEvent) -> str:
     )
     base = f"{event.event_type}:{event.source}:{subject}"
     if event.event_type == "tts_queue_languishing":
-        # The languishing alert ESCALATES with queue depth: each new message that
-        # deepens the pause queue is a distinct, legitimate re-alert that the
-        # condition is worsening — not a repeat. `subject` here resolves to the
-        # constant `app="tts_queue"` (== source), so the base key is constant
-        # (`tts_queue_languishing:tts_queue:tts_queue`) and EVERY distinct alert
-        # collides onto it. The dedup framework then eats all but the first, so a
-        # persistent/growing queue stops reaching the Emperor — enforcement is
-        # wrongly swallowed. Distinguish by depth so distinct alerts get distinct
-        # keys and keep escalating (retrigger-escalate), never collapsed-away.
+        # Internal diagnostic records still need useful identity. `subject` here
+        # resolves to the constant `app="tts_queue"` (== source), so the base key
+        # is constant (`tts_queue_languishing:tts_queue:tts_queue`). Include depth
+        # so separate observed queue depths remain distinguishable in logs without
+        # attaching the label to enforcement/paging.
         length = payload.get("pause_queue_length")
         if length is not None:
             return f"{base}:len={length}"
@@ -261,7 +258,7 @@ def evaluate_state_event(
         "enforcement_cascade_started": "Intervene because enforcement has escalated; get explicit closure from the Emperor.",
         "enforcement_cascade_escalate": "Intervene about active escalation; the loop is escalating — get explicit closure now.",
         "expected_ack_escalated": "Intervene about the missed acknowledgement ladder; mirror the Discord-channel cascade and pull the Emperor back to the work surface.",
-        "tts_queue_languishing": "Intervene because the TTS pause queue is languishing; get the Emperor to play or clear the queued speech before more messages pile up.",
+        "tts_queue_languishing": "Record that the TTS pause queue is languishing for internal diagnostics only; do not page or enforce from this label.",
     }[event.event_type]
 
     prompt = (

@@ -780,9 +780,10 @@ TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS = _positive_int_env(
 TTS_PAUSE_QUEUE_SWEEP_TTL_SECONDS = _positive_int_env("TOKEN_API_TTS_PAUSE_SWEEP_TTL_SECONDS", 30)
 _last_pause_queue_expiry_sweep = 0.0
 
-# Languishing emit latch: alert once for a stuck head, then only re-alert when
+# Languishing emit latch: record once for a stuck head, then only re-record when
 # the same head genuinely worsens (depth increases) or a different head reaches
-# languishing.  Cleared on negative edge.
+# languishing.  Cleared on negative edge.  The label is internal/diagnostic only;
+# it must not declare or route as enforcement.
 _tts_languishing_emit_latch: dict[str, object] = {}
 
 
@@ -1455,12 +1456,14 @@ async def get_pause_queue_languishing_snapshot(*, threshold: int | None = None) 
 
 
 async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQueueItem) -> None:
-    """Escalate when the manually-played TTS pause queue starts languishing.
+    """Record when the manually-played TTS pause queue starts languishing.
 
     Pause-queue length above the threshold means speech is accumulating but not
     being heard. Re-read the live pause queue at evaluation time so a drained
-    queue cannot fire from a stale queue-add snapshot. The state-event router
-    owns dedupe; this helper stays best-effort and never blocks queueing.
+    queue cannot fire from a stale queue-add snapshot. This is internal /
+    diagnostic only: it deliberately declares state, not enforcement, and must
+    not page Custodes. The state-event router owns dedupe; this helper stays
+    best-effort and never blocks queueing.
     """
     if _custodes_state_event_handler is None:
         return
@@ -1516,7 +1519,7 @@ async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQue
             instance_id=item.instance_id,
             severity=4 if live_pause_queue_length >= 10 else 3,
             payload=payload,
-            event_class="enforcement",
+            event_class="state",
         )
     except Exception as exc:
         if (

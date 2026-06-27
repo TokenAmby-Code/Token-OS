@@ -319,16 +319,13 @@ def test_state_class_hook_routes_administratum_only(client, monkeypatch, event_t
     assert len(_events("custodes_intervention")) == 0
 
 
-# ── (e) Dedupe-key correctness: distinct/worsening languishing must NOT collide ─
+# ── (e) TTS languishing is internal-only, never paged ───────────────────────
 #
-# CORRECTED DIRECTION (Emperor 2026-06-26): the `tts_queue_languishing` re-fires
-# are GENUINE — the queue really is languishing and worsening. The bug was a
-# malformed dedupe key (`subject` resolved to the CONSTANT `app="tts_queue"`, ==
-# source, giving `tts_queue_languishing:tts_queue:tts_queue` for EVERY alert), so
-# distinct legitimate alerts collided and got wrongly deduped-away — enforcement
-# stopped reaching the Emperor. The failure mode is OVER-suppression of
-# legitimate delivery, NOT spam. The fix distinguishes the key by queue depth so
-# distinct/worsening alerts keep escalating. We do NOT suppress genuine re-alerts.
+# D2 freeze (2026-06-27): ``tts_queue_languishing`` can remain a recognized
+# diagnostic label, including depth-sensitive keys for observability, but it is
+# detached from the Custodes/Administratum paging path. Older emitters may still
+# declare event_class="enforcement"; the router must ignore that declaration for
+# this label and log it internally only.
 
 
 def _wire_admin_recorder(monkeypatch):
@@ -352,8 +349,6 @@ def _wire_admin_recorder(monkeypatch):
         return None
 
     async def fake_snapshot():
-        # Snapshot metadata is frozen (break/panes/threads unchanged) — but the
-        # queue DEPTH in the payload is what is genuinely worsening per fire.
         return {
             "open_panes": 9,
             "active_threads": {"count": 4},
@@ -404,7 +399,7 @@ async def _clear_live_tts_pause_queue() -> None:
 
 
 def test_languishing_dedupe_key_distinguishes_depth():
-    """The malformed constant key is gone: distinct depths → distinct keys."""
+    """The diagnostic key keeps depth so internal records remain distinguishable."""
     from custodes_state_policy import StateEvent, build_dedupe_key
 
     def key(depth):
@@ -416,71 +411,48 @@ def test_languishing_dedupe_key_distinguishes_depth():
             )
         )
 
-    # Distinct legitimate alerts must NOT collapse onto one key.
     assert key(6) != key(7) != key(8)
-    # And the key must carry the escalation dimension, not be the bare collision.
     assert key(6) != "tts_queue_languishing:tts_queue:tts_queue"
     assert key(6).endswith(":len=6")
 
 
-async def test_distinct_languishing_alerts_each_deliver(monkeypatch):
-    """Two DISTINCT legitimate languishing alerts both reach Custodes + Admin.
-
-    Inverted from the wrong-direction draft: the bug ATE legitimate delivery via
-    key collision. Distinct depths must each escalate (no collision, no eating).
-    """
+async def test_languishing_declared_enforcement_routes_internal_only(monkeypatch) -> None:
+    """Even if declared as enforcement, languishing is internal/log-only."""
     admin_injects = _wire_admin_recorder(monkeypatch)
-    custodes_calls: list[str] = []
 
-    async def fake_dispatch(prompt):
-        custodes_calls.append(prompt)
-        return {"dispatched": True, "reason": "dispatched", "instance_id": "custodes-1"}
+    async def fail_custodes_dispatch(prompt):  # pragma: no cover - assertion path
+        raise AssertionError("tts_queue_languishing must not reach Custodes")
 
-    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fake_dispatch)
+    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fail_custodes_dispatch)
 
     try:
         await _set_live_tts_pause_queue(6)
-        first = await main.handle_custodes_state_event(
+        result = await main.handle_custodes_state_event(
             "tts_queue_languishing",
             "tts_queue",
             severity=3,
             payload=_languishing_payload(6),
             event_class="enforcement",
         )
-        await _set_live_tts_pause_queue(7)
-        second = await main.handle_custodes_state_event(
-            "tts_queue_languishing",
-            "tts_queue",
-            severity=3,
-            payload=_languishing_payload(7),
-            event_class="enforcement",
-        )
     finally:
         await _clear_live_tts_pause_queue()
 
-    assert first["intervention_dispatched"] is True
-    assert second["intervention_dispatched"] is True, (
-        "distinct alert must not be eaten by collision"
-    )
-    assert len(custodes_calls) == 2, "both legitimate alerts must escalate to Custodes"
-    assert len(admin_injects) == 2, "both legitimate alerts must reach the Administratum recorder"
+    assert result["intervention_dispatched"] is False
+    assert result["classification"] == "internal"
+    assert result["routed_to"] == "internal"
+    assert result["reason"] == "internal_label_only"
+    assert len(admin_injects) == 0
+    assert len(main._custodes_enforcement_defer_queue) == 0
 
 
-async def test_persistent_languishing_keeps_escalating(monkeypatch):
-    """A worsening queue (depth 6→7→8) keeps alerting — NOT swallowed to once.
-
-    This is the exact regression: with the old constant key, fires 2 and 3 would
-    dedup-collapse and Custodes would be hit ONCE. The Emperor would stop hearing
-    the cascade as it worsens. Each genuine escalation must get through.
-    """
+async def test_persistent_languishing_records_without_escalating(monkeypatch) -> None:
+    """A worsening queue can keep internal records without paging anyone."""
     admin_injects = _wire_admin_recorder(monkeypatch)
-    custodes_calls: list[str] = []
 
-    async def fake_dispatch(prompt):
-        custodes_calls.append(prompt)
-        return {"dispatched": True, "reason": "dispatched", "instance_id": "custodes-1"}
+    async def fail_custodes_dispatch(prompt):  # pragma: no cover - assertion path
+        raise AssertionError("tts_queue_languishing must not reach Custodes")
 
-    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fake_dispatch)
+    monkeypatch.setattr(main, "_dispatch_custodes_intervention", fail_custodes_dispatch)
 
     try:
         for depth in (6, 7, 8):
@@ -492,14 +464,15 @@ async def test_persistent_languishing_keeps_escalating(monkeypatch):
                 payload=_languishing_payload(depth),
                 event_class="enforcement",
             )
-            assert result["intervention_dispatched"] is True, f"depth {depth} alert was swallowed"
+            assert result["intervention_dispatched"] is False
+            assert result["classification"] == "internal"
+            assert result["routed_to"] == "internal"
+            assert result["reason"] == "internal_label_only"
     finally:
         await _clear_live_tts_pause_queue()
 
-    assert len(custodes_calls) == 3, (
-        "persistent worsening condition must keep escalating, not dedup to 1"
-    )
-    assert len(admin_injects) == 3, "the recorder must receive every legitimate alert (ungated)"
+    assert len(admin_injects) == 0
+    assert len(main._custodes_enforcement_defer_queue) == 0
 
 
 # ── enforce()/Pavlok stays typing_guard-blocked (D2 physical-path guardrail) ──

@@ -9797,6 +9797,39 @@ async def handle_custodes_state_event(
             "threshold": live_state["threshold"],
             "oldest_queued_at": live_state["oldest_queued_at"],
         }
+        normalized_severity = normalize_severity(severity)
+        internal_event = StateEvent(
+            event_type=event_type,
+            source=source,
+            instance_id=instance_id,
+            severity=severity,
+            payload=payload,
+        )
+        dedupe_key = build_dedupe_key(internal_event)
+        await log_event(
+            "custodes_state_event",
+            instance_id=instance_id,
+            device_id=source,
+            details={
+                "event_type": event_type,
+                "source": source,
+                "severity": normalized_severity,
+                "dedupe_key": dedupe_key,
+                "payload": payload,
+                "classification": "internal",
+                "reason": "internal_label_only",
+                "live_tts_queue": live_state,
+            },
+        )
+        return {
+            "received": True,
+            "intervention_dispatched": False,
+            "routed_to": "internal",
+            "classification": "internal",
+            "dedupe_key": dedupe_key,
+            "reason": "internal_label_only",
+            "live_tts_queue": live_state,
+        }
 
     event = StateEvent(
         event_type=event_type,
@@ -9865,6 +9898,8 @@ async def handle_custodes_state_event(
         }
 
     # Declared class (envelope) wins over the policy-set fallback.
+    # Internal-only labels (currently ``tts_queue_languishing``) return above
+    # before this dispatch branch, so they cannot be re-attached to paging here.
     if event_class in ("state", "enforcement"):
         classification = event_class
     else:
