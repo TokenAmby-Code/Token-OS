@@ -345,56 +345,22 @@ class FreePane:
 
 
 def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
-    """Single global tmux scan → the clean, agent-free panes (the freelist).
+    """Single global tmux scan → the clean, dispatch-available panes.
 
-    Mirrors ``_instance_pane_index``: one ``list-panes -a -F`` reading the
-    clean stamp, the instance stamp, the cardinal role, and the window name. A
-    pane qualifies when ``@PANE_CLEAN == 1`` AND no live ``@INSTANCE_ID``. Order
-    follows tmux enumeration so the result is deterministic across calls.
+    Availability is read from the daemon-native occupancy ledger: a pane is free
+    only when it is clean, has no instance stamp, has no live Claude/Codex TUI,
+    and is not a protected singleton label.  The singleton exclusion is
+    unconditional so a corrupted/missing ``@INSTANCE_ID`` cannot expose Custodes,
+    Fabricator-General, Administratum/Admin, etc. as a worker target.
     """
-    from .custodes import pane_has_active_agent
+    from .occupancy import scan_pane_occupancy
 
-    raw = adapter.run(
-        "list-panes",
-        "-a",
-        "-F",
-        "\t".join(
-            [
-                "#{pane_id}",
-                "#{@PANE_CLEAN}",
-                "#{@INSTANCE_ID}",
-                "#{@PANE_ID}",
-                "#{window_name}",
-                "#{pane_pid}",
-            ]
-        ),
-        allow_failure=True,
-    )
-    free: list[FreePane] = []
-    for line in raw.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 6:
-            continue
-        pane_id, clean, instance_id, pane_role, window_name, pane_pid_raw = parts
-        if clean.strip() != "1":
-            continue
-        if instance_id.strip():
-            # A live agent owns this pane — never free, regardless of the stamp.
-            continue
-        try:
-            pane_pid = int(pane_pid_raw.strip()) if pane_pid_raw.strip() else None
-        except ValueError:
-            pane_pid = None
-        if pane_has_active_agent(pane_pid):
-            # Defense-in-depth: stale/missing @INSTANCE_ID must not make a live
-            # singleton/agent pane available for dispatch target selection.
-            continue
-        role = canonical_pane_role(pane_role.strip()) if pane_role.strip() else ""
-        free.append(
-            FreePane(
-                pane_id=pane_id,
-                pane_role=role or None,
-                window_name=window_name.strip(),
-            )
+    return [
+        FreePane(
+            pane_id=entry.pane_id,
+            pane_role=entry.pane_role or None,
+            window_name=entry.window_name,
         )
-    return free
+        for entry in scan_pane_occupancy(adapter)
+        if entry.dispatch_available
+    ]

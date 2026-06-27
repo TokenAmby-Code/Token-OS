@@ -1634,7 +1634,7 @@ assert_dispatch_target_unoccupied() {
   pane_pid="${meta%%|*}"
   instance_id="${meta#*|}"
   case "$pane_label" in
-    council:custodes|council:malcador|mechanicus:fabricator-general|council:administratum|council:pax|mechanicus:orchestrator)
+    council:custodes|legion:custodes|council:malcador|mechanicus:fabricator-general|council:administratum|mechanicus:admin|council:pax|mechanicus:orchestrator)
       err "target pane $TARGET is a protected singleton seat ($pane_label); refusing dispatch injection"
       err "use a worker pane, a :new target, or set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 if intentional"
       exit 73

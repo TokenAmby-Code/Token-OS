@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 
 from .labels import canonical_pane_role
+from .singleton_labels import is_persona_singleton_label
 from .stack import stack_base_of
 from .tmux_adapter import TmuxAdapter
 
@@ -189,7 +190,7 @@ def _orchestrator_and_workers(
         pane
         for pane in panes
         if pane.pane_id != (orchestrator.pane_id if orchestrator else "")
-        and not _is_secondary_persona_role(pane.role, spec)
+        and not _is_protected_persona_role(pane.role, spec)
     ]
     workers.sort(key=lambda pane: (pane.left, pane.top, pane.pane_id))
     return orchestrator, workers
@@ -229,6 +230,14 @@ def _log_retag(pane: str, old_role: str, new_role: str, reason: str) -> None:
 
 def _is_secondary_persona_role(role: str, spec: StackPageSpec) -> bool:
     return any(persona.role == role for persona in spec.secondary_personas)
+
+
+def _is_protected_persona_role(role: str, spec: StackPageSpec) -> bool:
+    return bool(role) and (
+        role == spec.orchestrator_role
+        or _is_secondary_persona_role(role, spec)
+        or is_persona_singleton_label(role)
+    )
 
 
 def _is_worker_role(role: str, spec: StackPageSpec) -> bool:
@@ -461,10 +470,7 @@ def _enforce_stack_layout_impl(
 
     if focus and focused_pane:
         selected = next((pane for pane in panes if pane.pane_id == focused_pane), None)
-        if selected and (
-            selected.role == spec.orchestrator_role
-            or _is_secondary_persona_role(selected.role, spec)
-        ):
+        if selected and (_is_protected_persona_role(selected.role, spec)):
             return f"noop stack focus {focused_pane}: persona pane"
         if (
             selected
@@ -493,7 +499,7 @@ def _enforce_stack_layout_impl(
             if pane.pane_id != orchestrator.pane_id
             and not pane.clear
             and not _is_worker_role(pane.role, spec)
-            and not _is_secondary_persona_role(pane.role, spec)
+            and not _is_protected_persona_role(pane.role, spec)
         ]
         if len(untyped_live) == 1:
             _tag_worker(
