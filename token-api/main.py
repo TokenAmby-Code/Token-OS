@@ -13154,6 +13154,12 @@ PHONE_DISTRACTION_ACK_AFTER_SECONDS = int(
 PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS = int(
     os.environ.get("PHONE_DISTRACTION_RECOVERY_WINDOW_SECONDS", str(4 * 60 * 60))
 )
+# Sustained-foreground guard for the games/backlog enforce. A distraction enforce
+# is deferred by this many seconds and only fires if the app is still foreground,
+# so a recents-swipe flash (open→close within the delay) never shocks.
+PHONE_DISTRACTION_ENFORCE_DELAY_SECONDS = int(
+    os.environ.get("PHONE_DISTRACTION_ENFORCE_DELAY_SECONDS", "10")
+)
 
 # Human-readable display names for phone apps (key = lowercased app name or package)
 PHONE_APP_DISPLAY_NAMES = {
@@ -13166,6 +13172,9 @@ PHONE_APP_DISPLAY_NAMES = {
     "slay": "Slay the Spire",
     "com.humble.SlayTheSpire": "Slay the Spire",
     "com.humble.slaythespire": "Slay the Spire",
+    # Non-distraction phone media
+    "spotify": "Spotify",
+    "com.spotify.music": "Spotify",
 }
 
 
@@ -14277,6 +14286,15 @@ PHONE_YOUTUBE_APP_KEYS = {
     "youtube background",
 }
 
+PHONE_SPOTIFY_APP_KEYS = {
+    "spotify",
+    "com.spotify.music",
+}
+
+# Non-distraction phone media apps: a play-edge lights the activity icon via
+# PHONE_STATE["current_app"] but never enters the distraction/enforce pipeline.
+PHONE_MEDIA_APPS = set(PHONE_SPOTIFY_APP_KEYS)
+
 
 def phone_youtube_active() -> bool:
     """Return true when phone telemetry says YouTube is the active media source."""
@@ -14630,13 +14648,79 @@ def start_enforcement_cascade(app_name: str) -> None:
         pass
 
 
-def stop_enforcement_cascade(reason: str = "app_close") -> None:
-    """No-op shim retained for in-tree callers after cascade removal.
+# Pending deferred phone enforcement tasks, keyed by lowercased app key. The
+# games/backlog enforce is scheduled with a short delay so a recents-swipe flash
+# (open→close within the delay) never fires the shock; a close/replace edge
+# cancels it before it lands.
+_PENDING_PHONE_ENFORCE: dict[str, asyncio.Task] = {}
 
-    Golden Throne now owns any ongoing escalation state, so there is nothing
-    to stop here. Kept so prompt-submit, quiet-enter, negative-edge close,
-    and work-action paths keep their call signatures.
+
+def _cancel_pending_phone_enforce(app_name: str | None = None) -> None:
+    """Cancel pending deferred enforce(s). None cancels every pending enforce."""
+    if app_name is None:
+        keys = list(_PENDING_PHONE_ENFORCE.keys())
+    else:
+        key = app_name.lower()
+        keys = [key] if key in _PENDING_PHONE_ENFORCE else []
+    for key in keys:
+        task = _PENDING_PHONE_ENFORCE.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+
+def schedule_deferred_enforcement_cascade(app_name: str) -> None:
+    """Defer start_enforcement_cascade so a brief foreground flash never enforces.
+
+    Fires after PHONE_DISTRACTION_ENFORCE_DELAY_SECONDS only if the app is still
+    the foreground app (not closed or replaced by another app). The close path and
+    stop_enforcement_cascade cancel any pending task.
     """
+    key = app_name.lower()
+    # Replace any in-flight enforce for the same app so we don't stack timers.
+    _cancel_pending_phone_enforce(key)
+
+    async def _deferred() -> None:
+        try:
+            await asyncio.sleep(PHONE_DISTRACTION_ENFORCE_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            return
+        current = (PHONE_STATE.get("current_app") or "").lower()
+        if current != key:
+            await log_event(
+                "phone_enforce_deferred_skipped",
+                details={
+                    "app": app_name,
+                    "current_app": PHONE_STATE.get("current_app"),
+                    "delay_seconds": PHONE_DISTRACTION_ENFORCE_DELAY_SECONDS,
+                },
+            )
+            return
+        start_enforcement_cascade(app_name)
+
+    try:
+        task = asyncio.ensure_future(_deferred())
+    except RuntimeError:
+        # No running event loop (not expected in a request context) — enforce now.
+        start_enforcement_cascade(app_name)
+        return
+    _PENDING_PHONE_ENFORCE[key] = task
+
+    def _cleanup(t: asyncio.Task, k: str = key) -> None:
+        if _PENDING_PHONE_ENFORCE.get(k) is t:
+            _PENDING_PHONE_ENFORCE.pop(k, None)
+
+    task.add_done_callback(_cleanup)
+
+
+def stop_enforcement_cascade(reason: str = "app_close") -> None:
+    """Cancel any pending deferred phone enforce; Golden Throne owns escalation.
+
+    The deferred games/backlog enforce (schedule_deferred_enforcement_cascade)
+    must be cancelled when the app closes or is replaced, when the user submits a
+    prompt, enters quiet hours, or signals a work-action — so a brief flash or a
+    recovered user never gets shocked. Kept on all those caller paths.
+    """
+    _cancel_pending_phone_enforce()
     asyncio.ensure_future(log_event("enforcement_stop_shim", details={"reason": reason}))
 
 
@@ -15426,6 +15510,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             PHONE_STATE["app_opened_at"] = None
             PHONE_STATE["is_distracted"] = False
         PHONE_STATE["last_activity"] = datetime.now().isoformat()
+        # Close cancels any pending deferred enforce for this app so a flash
+        # (open→close within the guard delay) never lands.
+        _cancel_pending_phone_enforce(app_name)
 
         # Phone close only clears the phone substate, then recomputes composite
         # timer activity from any remaining independent attention sources.
@@ -15475,6 +15562,24 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         )
 
         return PhoneActivityResponse(allowed=True, reason="closed", message="App closed")
+
+    # Non-distraction phone media (e.g. Spotify). Lights the ♪ activity icon via
+    # PHONE_STATE["current_app"] without entering the distraction pipeline: no
+    # enforcement, no DISTRACTION activity. The desktop AHK detector owns
+    # DESKTOP_STATE["current_mode"]="music", so we never write that field here.
+    # Close is handled by the generic close path above (mirrors any app close).
+    if app_name in PHONE_MEDIA_APPS or (package and package.lower() in PHONE_MEDIA_APPS):
+        PHONE_STATE["current_app"] = app_name
+        PHONE_STATE["app_opened_at"] = datetime.now().isoformat()
+        PHONE_STATE["is_distracted"] = False
+        PHONE_STATE["last_activity"] = datetime.now().isoformat()
+        await log_event(
+            "phone_media_open",
+            device_id="phone",
+            details={"app": app_name, "display_name": display_name, "package": package},
+        )
+        print(f"    Phone media (non-distraction) open: {app_name}")
+        return PhoneActivityResponse(allowed=True, reason="media", message=f"Media: {display_name}")
 
     # Determine distraction category
     distraction_mode = PHONE_DISTRACTION_APPS.get(app_name)
@@ -15723,7 +15828,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
                 details={"reason": "backlog_violation"},
             )
         else:
-            start_enforcement_cascade(app_name)
+            # Sustained-foreground guard: defer so a recents-swipe flash that
+            # opens then closes within the delay never enforces (Bug D).
+            schedule_deferred_enforcement_cascade(app_name)
         await log_event(
             "phone_backlog_violation",
             details={
@@ -15950,16 +16057,20 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
             if parsed.get("type") == "app"
             else normalize_macrodroid_app_key(raw_trigger)
         )
-        if play_app_key not in PHONE_YOUTUBE_APP_KEYS:
+        if play_app_key in PHONE_YOUTUBE_APP_KEYS:
+            resolved_play_app = "youtube"
+        elif play_app_key in PHONE_SPOTIFY_APP_KEYS:
+            resolved_play_app = "spotify"
+        else:
             return {
                 "received": True,
-                "error": "play param only supported for YouTube telemetry",
+                "error": "play param only supported for media telemetry (youtube/spotify)",
                 "app": play_app_key or raw_trigger,
                 "play": request.play,
             }
         parsed = {
             "type": "app",
-            "app": "youtube",
+            "app": resolved_play_app,
             "action": "open" if play_state else "close",
             "play": play_state,
         }
