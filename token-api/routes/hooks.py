@@ -5075,9 +5075,12 @@ async def handle_stop(payload: dict) -> dict:
         # delivery path must not silently no-op. An armed one-shot (e.g. the
         # /preplan → /plan handoff) is keyed on this session_id and carries its
         # own target pane, so fanout can still deliver without a live row.
+        shared.pop_hook_driven_actor(session_id)
         return await _fanout_stop_for_orphan_session(session_id, payload)
 
     instance = dict(instance)
+    was_hook_driven = bool(instance.get("hook_driven"))
+    hook_driven_actor = None
 
     # Dev-worktree instances are test traffic: their Stop hook must produce NO
     # Emperor-facing side-effects (completion TTS, phone/Discord notify, evaluators).
@@ -5373,6 +5376,8 @@ async def handle_stop(payload: dict) -> dict:
 
         return result
 
+    hook_driven_actor = shared.pop_hook_driven_actor(session_id)
+
     # Discord output mirroring — fire before TTS markdown sanitization (Discord renders markdown)
     if tts_text and instance.get("discord_hosted") and instance.get("discord_channel"):
         discord_bot = _LEGION_BOT_MAP.get(instance.get("legion", ""), "mechanicus")
@@ -5434,7 +5439,27 @@ async def handle_stop(payload: dict) -> dict:
             pass
 
     # Queue TTS if enabled and we have text
-    if tts_enabled and tts_text:
+    suppress_languishing_alert_tts = (
+        was_hook_driven and hook_driven_actor == "state-hook-fanout:tts_queue_languishing"
+    )
+    if tts_enabled and tts_text and suppress_languishing_alert_tts:
+        details = {
+            "reason": "languishing_alert_tts_excluded_from_pause_queue",
+            "hook_driven_actor": hook_driven_actor,
+            "tts_length": len(tts_text),
+        }
+        logger.info(
+            "Hook: Stop excluded languishing-alert TTS from pause queue for %s",
+            session_id[:12],
+        )
+        await log_event(
+            "tts_languishing_alert_tts_bypassed",
+            instance_id=session_id,
+            device_id="tts_queue",
+            details=details,
+        )
+        result["tts"] = {"success": True, "queued": False, **details}
+    elif tts_enabled and tts_text:
         logger.info(f"Hook: Stop queuing TTS, {len(tts_text)} chars: {tts_text[:80]}...")
         tts_result = await queue_tts(session_id, tts_text)
         logger.info(f"Hook: Stop queue_tts result: {json.dumps(tts_result)}")

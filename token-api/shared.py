@@ -460,6 +460,26 @@ TTS_GLOBAL_MODE = {
     "mode": "verbose",  # "verbose" | "muted" | "silent"
 }
 
+# In-process provenance for hook-driven autonomous wakes.  The durable
+# ``instances.hook_driven`` bit answers "was this row driven by automation?";
+# this sidecar answers "which automation did it?" for the narrow places that
+# must avoid self-feeding loops without adding broad notification suppression.
+HOOK_DRIVEN_ACTORS: dict[str, str] = {}
+
+
+def note_hook_driven_actor(instance_id: str | None, actor: str) -> None:
+    """Remember the actor for a hook-driven wake until that instance stops."""
+    if not instance_id:
+        return
+    HOOK_DRIVEN_ACTORS[str(instance_id)] = str(actor or "")
+
+
+def pop_hook_driven_actor(instance_id: str | None) -> str | None:
+    """Consume the actor sidecar for an instance stop."""
+    if not instance_id:
+        return None
+    return HOOK_DRIVEN_ACTORS.pop(str(instance_id), None)
+
 
 def is_satellite_tts_available() -> bool:
     """Check if the WSL satellite TTS endpoint is reachable. Cached with 30s TTL."""

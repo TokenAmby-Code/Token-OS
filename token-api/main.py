@@ -5234,6 +5234,7 @@ async def _flag_hook_driven(
             if target_id is None:
                 # Target row not registered yet — nothing to flag (rare race).
                 return
+            shared.note_hook_driven_actor(target_id, actor)
             await sanctioned_update_instance(
                 db,
                 instance_id=target_id,
@@ -8858,6 +8859,7 @@ async def _inject_custodes_prompt_to_pane(
     *,
     instance_id: str | None = None,
     cancel_check=None,
+    hook_actor: str = "state-hook-fanout",
 ) -> dict:
     """Inject a Custodes prompt into a known tmux pane."""
     if cancel_check:
@@ -8869,7 +8871,7 @@ async def _inject_custodes_prompt_to_pane(
     # outbound, so flag hook_driven=1 before the byte lands; its reflex PromptSubmit
     # is then discounted at read-time. Custodes-OUT (talk/brief/dispatch) never
     # reaches this helper.
-    await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor="state-hook-fanout")
+    await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=hook_actor)
     try:
         claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
         proc = await asyncio.create_subprocess_exec(
@@ -9062,7 +9064,9 @@ async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
     return {"dispatched": True, "reason": "sent", "pane": result.get("pane"), "assertion": result}
 
 
-async def _launch_custodes_for_intervention(prompt: str, *, cancel_check=None) -> dict:
+async def _launch_custodes_for_intervention(
+    prompt: str, *, cancel_check=None, hook_actor: str = "state-hook-fanout"
+) -> dict:
     """Assert `council:custodes`, then send the intervention only after assertion is true."""
     if cancel_check:
         canceled = await cancel_check("pre_launch_prompt")
@@ -9084,6 +9088,12 @@ async def _launch_custodes_for_intervention(prompt: str, *, cancel_check=None) -
     if not result.get("dispatched"):
         logger.warning(f"Custodes state hook: delivery failed: {result.get('reason')}")
     else:
+        pane = result.get("pane")
+        if pane:
+            instance_id = await shared.instance_id_for_pane(pane)
+            if instance_id:
+                shared.note_hook_driven_actor(instance_id, hook_actor)
+                await _flag_hook_driven(instance_id, tmux_pane=pane, actor=hook_actor)
         logger.warning(f"Custodes state hook: delivered pane={result.get('pane')}")
     return result
 
@@ -9094,48 +9104,60 @@ async def _inject_custodes_prompt_to_pane_maybe_cancel(
     *,
     instance_id: str | None = None,
     cancel_check=None,
+    hook_actor: str = "state-hook-fanout",
 ) -> dict:
     inject = _inject_custodes_prompt_to_pane
     try:
-        supports_cancel_check = "cancel_check" in inspect.signature(inject).parameters
+        inject_params = inspect.signature(inject).parameters
     except (TypeError, ValueError):
-        supports_cancel_check = False
+        inject_params = {}
+    supports_cancel_check = "cancel_check" in inject_params
+    supports_hook_actor = "hook_actor" in inject_params
     if supports_cancel_check:
-        return await inject(
-            prompt,
-            tmux_pane,
-            instance_id=instance_id,
-            cancel_check=cancel_check,
-        )
+        kwargs = {"instance_id": instance_id, "cancel_check": cancel_check}
+        if supports_hook_actor:
+            kwargs["hook_actor"] = hook_actor
+        return await inject(prompt, tmux_pane, **kwargs)
 
     if cancel_check:
         canceled = await cancel_check("pre_pane_inject")
         if canceled:
             return canceled
-    return await inject(prompt, tmux_pane, instance_id=instance_id)
+    kwargs = {"instance_id": instance_id}
+    if supports_hook_actor:
+        kwargs["hook_actor"] = hook_actor
+    return await inject(prompt, tmux_pane, **kwargs)
 
 
 async def _launch_custodes_for_intervention_maybe_cancel(
     prompt: str,
     *,
     cancel_check=None,
+    hook_actor: str = "state-hook-fanout",
 ) -> dict:
     launch = _launch_custodes_for_intervention
     try:
-        supports_cancel_check = "cancel_check" in inspect.signature(launch).parameters
+        launch_params = inspect.signature(launch).parameters
     except (TypeError, ValueError):
-        supports_cancel_check = False
+        launch_params = {}
+    supports_cancel_check = "cancel_check" in launch_params
+    supports_hook_actor = "hook_actor" in launch_params
     if supports_cancel_check:
+        if supports_hook_actor:
+            return await launch(prompt, cancel_check=cancel_check, hook_actor=hook_actor)
         return await launch(prompt, cancel_check=cancel_check)
 
     if cancel_check:
         canceled = await cancel_check("pre_launch_prompt")
         if canceled:
             return canceled
-    return await launch(prompt)
+    kwargs = {"hook_actor": hook_actor} if supports_hook_actor else {}
+    return await launch(prompt, **kwargs)
 
 
-async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> dict:
+async def _dispatch_custodes_intervention(
+    prompt: str, *, cancel_check=None, hook_actor: str = "state-hook-fanout"
+) -> dict:
     """Inject into Custodes, recovering or launching the singleton if needed.
 
     Identity is resolved by **persona + rank** on the canonical ``instances``
@@ -9160,6 +9182,7 @@ async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> 
         return await _launch_custodes_for_intervention_maybe_cancel(
             prompt,
             cancel_check=cancel_check,
+            hook_actor=hook_actor,
         )
 
     # Only stamp the resolved id when the singleton is local; a remote-owned row
@@ -9173,6 +9196,7 @@ async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> 
         tmux_pane,
         instance_id=instance_id,
         cancel_check=cancel_check,
+        hook_actor=hook_actor,
     )
     # L4: the marked pane was stale/occupied (rc=73 occupied, no live instance).
     # Re-resolve the live Custodes pane from the marker and retry once; if the
@@ -9185,11 +9209,13 @@ async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> 
                 f"Custodes state hook: pane {tmux_pane} stale/occupied; "
                 f"re-resolved live pane={recovered_pane}"
             )
+            recovered_instance_id = await shared.instance_id_for_pane(recovered_pane)
             retry = await _inject_custodes_prompt_to_pane_maybe_cancel(
                 prompt,
                 recovered_pane,
-                instance_id=instance_id,
+                instance_id=recovered_instance_id,
                 cancel_check=cancel_check,
+                hook_actor=hook_actor,
             )
             if retry.get("dispatched"):
                 retry["reason"] = "recovered_tmux_pane"
@@ -9201,11 +9227,14 @@ async def _dispatch_custodes_intervention(prompt: str, *, cancel_check=None) -> 
         return await _launch_custodes_for_intervention_maybe_cancel(
             prompt,
             cancel_check=cancel_check,
+            hook_actor=hook_actor,
         )
     return delivery
 
 
-async def _dispatch_custodes_intervention_maybe_cancel(prompt: str, cancel_check) -> dict:
+async def _dispatch_custodes_intervention_maybe_cancel(
+    prompt: str, cancel_check, *, hook_actor: str = "state-hook-fanout"
+) -> dict:
     """Call the intervention dispatcher with cancellation when supported.
 
     Tests often monkeypatch `_dispatch_custodes_intervention` with a one-arg
@@ -9214,16 +9243,21 @@ async def _dispatch_custodes_intervention_maybe_cancel(prompt: str, cancel_check
     """
     dispatch = _dispatch_custodes_intervention
     try:
-        supports_cancel_check = "cancel_check" in inspect.signature(dispatch).parameters
+        dispatch_params = inspect.signature(dispatch).parameters
     except (TypeError, ValueError):
-        supports_cancel_check = False
+        dispatch_params = {}
+    supports_cancel_check = "cancel_check" in dispatch_params
+    supports_hook_actor = "hook_actor" in dispatch_params
     if supports_cancel_check:
+        if supports_hook_actor:
+            return await dispatch(prompt, cancel_check=cancel_check, hook_actor=hook_actor)
         return await dispatch(prompt, cancel_check=cancel_check)
 
     canceled = await cancel_check("pre_dispatch")
     if canceled:
         return canceled
-    return await dispatch(prompt)
+    kwargs = {"hook_actor": hook_actor} if supports_hook_actor else {}
+    return await dispatch(prompt, **kwargs)
 
 
 # ── Administratum: the state-hook recorder ────────────────────────────
@@ -9461,11 +9495,15 @@ async def _dispatch_administratum_record(
         "silent unless it breaks state coherence (false positive, spam, cascade, "
         "same failure N× today)."
     )
-    return await _inject_custodes_prompt_to_pane(
-        record_prompt,
-        instance["tmux_pane"],
-        instance_id=instance["id"],
-    )
+    inject = _inject_custodes_prompt_to_pane
+    try:
+        supports_hook_actor = "hook_actor" in inspect.signature(inject).parameters
+    except (TypeError, ValueError):
+        supports_hook_actor = False
+    kwargs = {"instance_id": instance["id"]}
+    if supports_hook_actor:
+        kwargs["hook_actor"] = f"state-hook-fanout:{event.event_type}"
+    return await inject(record_prompt, instance["tmux_pane"], **kwargs)
 
 
 # ── L2: enforcement defer queue (hold-and-queue under typing guard) ────────────
@@ -9570,7 +9608,9 @@ async def _custodes_enforcement_defer_flush_once() -> list[dict]:
             os.environ["TMUX_SEND_GATE_ALLOW"] = override_reason
         try:
             delivery = await _dispatch_custodes_intervention_maybe_cancel(
-                intervention.behavioral_prompt, cancel_check
+                intervention.behavioral_prompt,
+                cancel_check,
+                hook_actor=f"state-hook-fanout:{event.event_type}",
             )
         finally:
             if override_reason is not None:
@@ -9965,6 +10005,7 @@ async def handle_custodes_state_event(
     delivery = await _dispatch_custodes_intervention_maybe_cancel(
         intervention.behavioral_prompt,
         cancel_check,
+        hook_actor=f"state-hook-fanout:{event.event_type}",
     )
     if delivery.get("canceled"):
         return {
