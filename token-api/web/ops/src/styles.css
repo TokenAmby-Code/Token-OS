@@ -1044,3 +1044,147 @@ a.pcard:hover .pcard__open,
   color: var(--faint);
   border-top: 1px dashed var(--line);
 }
+
+/* ── compact cockpit: small field displays / mini-monitor surfaces ─────────
+   Keep this view-only: no component/API affordances change, just trim chrome
+   and non-critical panels so the live cockpit fits a cramped surface. */
+@media (max-width: 1000px) and (max-aspect-ratio: 4/3),
+       (max-width: 1000px) and (orientation: landscape) {
+  :root { font-size: 14px; }
+
+  .cockpit {
+    padding: 12px 10px 30px;
+  }
+
+  .masthead {
+    gap: 10px;
+    padding: 0 230px 10px 0;
+    margin-bottom: 10px;
+  }
+  .masthead__id { gap: 10px; }
+  .masthead__sigil { font-size: 28px; }
+  h1 { font-size: clamp(22px, 4vw, 30px); }
+  .eyebrow {
+    font-size: 9.5px;
+    letter-spacing: 0.22em;
+  }
+  .conn__text { font-size: 12px; }
+  .conn__sub { font-size: 10px; }
+
+  .dials {
+    top: 8px;
+    right: 10px;
+  }
+  .rings {
+    max-width: 220px;
+    gap: 5px 7px;
+  }
+  .rings .ring { display: none; }
+  .rings .ring:nth-child(1),
+  .rings .ring:nth-child(2),
+  .rings .ring:nth-child(4) {
+    display: flex;
+  }
+  .rings .ring:nth-child(1) { order: 1; }
+  .rings .ring:nth-child(4) { order: 2; }
+  .rings .ring:nth-child(2) { order: 3; }
+  .ring { width: 64px; gap: 3px; }
+  .ring__dial {
+    width: 64px;
+    height: 64px;
+  }
+  .ring__center { width: 44px; }
+  .ring__glyph { font-size: 18px; }
+  .ring__value { font-size: 12.5px; }
+  .ring__label {
+    font-size: 7.5px;
+    letter-spacing: 0.12em;
+  }
+  .ring__detail {
+    font-size: 8px;
+    max-width: 68px;
+  }
+  .ring--clickable { pointer-events: auto; }
+
+  .ttsstrip {
+    gap: 8px;
+    margin-bottom: 10px;
+    padding: 6px 8px;
+    padding-right: 230px;
+    font-size: 11px;
+  }
+  .ttsstrip__now { max-width: 28ch; }
+  .ttsstrip__stat { letter-spacing: 0.06em; }
+  .ttsstrip__route,
+  .ttsstrip__div,
+  .ttsstrip__note { display: none; }
+  .ttsstrip__mode,
+  .ttsstrip__skip {
+    font-size: 10px;
+    padding: 2px 7px;
+  }
+
+  .panel {
+    padding: 11px 12px;
+    margin-bottom: 10px;
+  }
+  .panel__head {
+    gap: 8px;
+    margin-bottom: 9px;
+  }
+  .panel h2 {
+    font-size: 12px;
+    letter-spacing: 0.12em;
+  }
+  .panel__meta-note,
+  .chip {
+    font-size: 10px;
+  }
+  .chips { gap: 4px; }
+
+  .panel--timerGraph {
+    padding: 0 0 6px;
+  }
+
+  /* Hide non-critical panels in the compact read-only cockpit. The pipeline
+     panel has no class hook, so keep a structural fallback for the 4th top-level
+     section and a semantic :has() selector for modern engines. */
+  .cockpit > section.panel:nth-of-type(4),
+  .panel:has(.pipeline__toolbar),
+  .panel:has(.lanes),
+  .panel--graph {
+    display: none;
+  }
+
+  .row--split {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .row--split .panel:first-child {
+    margin-bottom: 0;
+  }
+
+  .only-narrow.fleet-cards { display: flex; }
+  .only-wide { display: none; }
+  .fleet-cards { gap: 8px; }
+  .fcard {
+    padding: 9px 10px;
+  }
+  .fcard__head strong { font-size: 13.5px; }
+  .fcard__grid {
+    gap: 6px 10px;
+    margin-top: 7px;
+  }
+  .fcard__grid > div,
+  .subline {
+    font-size: 12px;
+  }
+
+  .statuscards { grid-template-columns: 1fr; }
+  .vq { gap: 10px; }
+  .vq__routing { gap: 8px; }
+  .footnote {
+    margin-top: 14px;
+    font-size: 10px;
+  }
+}
