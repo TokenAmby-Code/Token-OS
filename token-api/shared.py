@@ -767,12 +767,13 @@ async def push_agnostic_pane_vars(
 
 # ============ tmuxctld loopback client ============
 #
-# Optional fast path: when TMUXCTLD_URL is set, pane/instance resolution prefers
-# the local tmuxctld HTTP daemon (loopback, stdlib-only) over a fresh subprocess.
-# The subprocess path remains the fail-closed fallback when the daemon is absent
-# or errors. Requests go through an opener built with an EMPTY ProxyHandler so a
-# loopback call to 127.0.0.1 never gets routed through a system/env HTTP proxy
-# (http_proxy / HTTPS_PROXY / macOS system proxy) — that would break or hang it.
+# Fast path: pane/instance resolution prefers the local tmuxctld HTTP daemon
+# (loopback, stdlib-only) over a fresh subprocess; callers can use the default
+# loopback daemon even when TMUXCTLD_URL is not exported. The subprocess path
+# remains the fail-closed fallback when the daemon is disabled, absent, or errors.
+# Requests go through an opener built with an EMPTY ProxyHandler so a loopback
+# call to 127.0.0.1 never gets routed through a system/env HTTP proxy (http_proxy
+# / HTTPS_PROXY / macOS system proxy) — that would break or hang it.
 
 _TMUXCTLD_OPENER: urllib.request.OpenerDirector = urllib.request.build_opener(
     urllib.request.ProxyHandler({})
@@ -803,14 +804,20 @@ def _tmuxctld_url(*, default_loopback: bool = False) -> str | None:
     return url
 
 
-def _tmuxctld_get_json(path: str, params: dict[str, str], *, timeout: float = 0.5) -> dict | None:
+def _tmuxctld_get_json(
+    path: str,
+    params: dict[str, str],
+    *,
+    timeout: float = 0.5,
+    default_loopback: bool = False,
+) -> dict | None:
     """GET ``path`` from the tmuxctld daemon and return the unwrapped ``result`` dict.
 
     Returns None when the daemon is not configured, is unreachable, replies
     non-200, or returns a non-``ok`` envelope — so every caller falls through to
     its subprocess fallback. Proxy bypass is enforced via the module opener.
     """
-    base = _tmuxctld_url()
+    base = _tmuxctld_url(default_loopback=default_loopback)
     if not base:
         return None
     query = urllib.parse.urlencode(params)
@@ -869,11 +876,21 @@ async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, st
     """
     if not instance_id:
         return (None, None)
-    # Fast path: prefer the tmuxctld loopback daemon when configured. Its
+    # Fast path: prefer the launchd-supervised tmuxctld loopback daemon. Token-API
+    # runs under launchd, where a fresh tmux subprocess can fail closed even
+    # while the interactive tmux server is healthy; tmuxctld is the local
+    # canonical liveness oracle for that service context. Its
     # /tmux/resolve-instance result is canonical-only and fail-closed, so a
     # `found:false` is authoritative — no subprocess fallback in that case.
     result = await asyncio.to_thread(
-        _tmuxctld_get_json, "/tmux/resolve-instance", {"instance_id": instance_id}, timeout=0.5
+        _tmuxctld_get_json,
+        "/tmux/resolve-instance",
+        {"instance_id": instance_id},
+        # First loopback hit after daemon/code churn can spend just over 0.5s in
+        # the daemon handler; keep this tight but not so tight Token-API falls
+        # back to launchd's weaker subprocess context and reports false-dead panes.
+        timeout=1.0,
+        default_loopback=True,
     )
     if result is not None:
         if not result.get("found"):
@@ -933,11 +950,16 @@ async def instance_id_for_pane(pane: str | None) -> str | None:
     """
     if not (pane or "").strip():
         return None
-    # Fast path: prefer the tmuxctld loopback daemon when configured. A reachable
-    # daemon's /tmux/instance-id-for-pane result is authoritative (empty stamp ->
-    # None); only fall through to the tmux subprocess when the daemon is absent.
+    # Fast path: prefer the launchd-supervised tmuxctld loopback daemon. A
+    # reachable daemon's /tmux/instance-id-for-pane result is authoritative
+    # (empty stamp -> None); only fall through to the tmux subprocess when the
+    # daemon is absent.
     result = await asyncio.to_thread(
-        _tmuxctld_get_json, "/tmux/instance-id-for-pane", {"pane": pane or ""}, timeout=0.5
+        _tmuxctld_get_json,
+        "/tmux/instance-id-for-pane",
+        {"pane": pane or ""},
+        timeout=1.0,
+        default_loopback=True,
     )
     if result is not None:
         return (result.get("instance_id") or "").strip() or None

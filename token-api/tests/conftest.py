@@ -349,6 +349,10 @@ def app_env(tmp_path, monkeypatch):
     monkeypatch.setenv("TOKEN_API_DB", str(db_path))
     monkeypatch.setenv("IMPERIUM_ENV", str(tmp_path / "Imperium-ENV"))
     monkeypatch.setenv("CIVIC_ENV", str(tmp_path / "Pax-ENV"))
+    # The live Mac may have a launchd tmuxctld on 127.0.0.1:7778. Unit tests must
+    # not consult that real daemon through shared's production default-loopback
+    # resolver; individual tmuxctld client tests opt back in with their own URL.
+    monkeypatch.setenv("TMUXCTLD_URL", "disabled")
     # Isolate morning-session state from the real /tmp so the keepalive gate and
     # morning/end endpoint operate on a per-test directory.
     monkeypatch.setenv("CUSTODES_MORNING_DIR", str(tmp_path / "custodes_morning"))

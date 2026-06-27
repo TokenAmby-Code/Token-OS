@@ -456,6 +456,35 @@ def test_find_live_custodes_matches_by_persona_and_rank():
     assert inst["id"] == "live1"
 
 
+def test_find_live_custodes_trusts_tmux_liveness_over_stale_status():
+    """A live @INSTANCE_ID stamp beats a stale stopped DB status.
+
+    This is the Morning Supervisor false-relaunch regression: /api/instances can
+    contain a stale/dead durable status during SessionStart lock contention or
+    registry freeze, but the runtime overlay proves the Custodes pane is alive.
+    """
+    instances = [
+        {
+            "id": "custodes-stale-dead",
+            "persona": {"slug": "custodes"},
+            "rank": "overseer",
+            "status": "idle",
+            "durable_status": "stopped",
+            "stale_status": "stopped",
+            "status_source": "tmuxctl-live-overlay",
+            "runtime": {
+                "live_pane": True,
+                "tmux_pane": "%47",
+                "pane_label": "council:custodes",
+            },
+        }
+    ]
+    with patch("morning_session._get", lambda path: instances):
+        inst = morning_session.find_live_custodes()
+    assert inst is not None
+    assert inst["id"] == "custodes-stale-dead"
+
+
 def test_find_live_custodes_none_when_no_custodes_alive():
     """No live custodes persona → None (the one genuine launch failure)."""
     instances = [
