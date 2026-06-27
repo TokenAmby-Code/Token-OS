@@ -66,8 +66,37 @@ def test_zap_rejects_unknown_type(client: TestClient) -> None:
     assert resp.status_code == 400
 
 
-def test_toggle_persists_enable_state(client: TestClient) -> None:
-    """POST /api/pavlok/toggle with explicit ?enabled flips PAVLOK_CONFIG state."""
+def test_toggle_body_false_from_disabled_is_idempotent(client: TestClient) -> None:
+    """POST /api/pavlok/toggle with {"enabled": false} keeps disabled state."""
+    from shared import PAVLOK_CONFIG
+
+    PAVLOK_CONFIG["enabled"] = False
+
+    resp = client.post("/api/pavlok/toggle", json={"enabled": False})
+    assert resp.status_code == 200
+    assert resp.json()["enabled"] is False
+    assert PAVLOK_CONFIG["enabled"] is False
+
+
+def test_toggle_body_true_is_idempotent(client: TestClient) -> None:
+    """POST /api/pavlok/toggle with {"enabled": true} sets/enforces enabled."""
+    from shared import PAVLOK_CONFIG
+
+    PAVLOK_CONFIG["enabled"] = False
+
+    resp = client.post("/api/pavlok/toggle", json={"enabled": True})
+    assert resp.status_code == 200
+    assert resp.json()["enabled"] is True
+    assert PAVLOK_CONFIG["enabled"] is True
+
+    resp = client.post("/api/pavlok/toggle", json={"enabled": True})
+    assert resp.status_code == 200
+    assert resp.json()["enabled"] is True
+    assert PAVLOK_CONFIG["enabled"] is True
+
+
+def test_toggle_query_enable_state_remains_supported(client: TestClient) -> None:
+    """Legacy ?enabled= callers (CLI `pavlok on/off`) still set state."""
     from shared import PAVLOK_CONFIG
 
     resp = client.post("/api/pavlok/toggle", params={"enabled": "false"})

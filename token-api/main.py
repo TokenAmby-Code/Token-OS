@@ -16972,13 +16972,33 @@ async def pavlok_zap(
     return result
 
 
+class PavlokToggleRequest(BaseModel):
+    enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Explicit Pavlok enabled state. If omitted, /api/pavlok/toggle "
+            "inverts the current state."
+        ),
+    )
+
+
 @app.post("/api/pavlok/toggle")
-async def pavlok_toggle(enabled: bool | None = None) -> dict:
-    """Toggle or set Pavlok enforcement. No arg = invert current state."""
-    if enabled is None:
+async def pavlok_toggle(
+    body: PavlokToggleRequest | None = Body(default=None),
+    enabled: bool | None = None,
+) -> dict:
+    """Toggle or set Pavlok enforcement.
+
+    JSON body ``{"enabled": true|false}`` sets the state idempotently. Legacy
+    query ``?enabled=true|false`` is also accepted for existing CLI callers. If
+    neither body nor query provides ``enabled``, the route inverts the current
+    state.
+    """
+    requested_enabled = body.enabled if body is not None and body.enabled is not None else enabled
+    if requested_enabled is None:
         PAVLOK_CONFIG["enabled"] = not PAVLOK_CONFIG["enabled"]
     else:
-        PAVLOK_CONFIG["enabled"] = enabled
+        PAVLOK_CONFIG["enabled"] = requested_enabled
     await log_event("pavlok_toggled", details={"enabled": PAVLOK_CONFIG["enabled"]})
     return {"enabled": PAVLOK_CONFIG["enabled"]}
 
