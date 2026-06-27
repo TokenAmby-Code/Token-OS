@@ -6,7 +6,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl import custodes
+from tmuxctl import occupancy
 from tmuxctl.resolver import list_free_panes
 from tmuxctl.service import TmuxControlPlane
 
@@ -60,10 +60,10 @@ def test_list_free_panes_excludes_live_agent_even_when_instance_stamp_missing(mo
     def fake_active(pid: int | None) -> bool:
         return pid == 999
 
-    monkeypatch.setattr(custodes, "pane_has_active_agent", fake_active)
+    monkeypatch.setattr(occupancy, "_active_agent", fake_active)
     rows = [
-        ("%custodes", "1", "", "council:custodes", "council", "999"),
-        ("%worker", "1", "", "mechanicus:1", "mechanicus", "1000"),
+        ("%occupied", "1", "", "mechanicus:1", "mechanicus", "999"),
+        ("%worker", "1", "", "mechanicus:2", "mechanicus", "1000"),
     ]
 
     free = list_free_panes(FakeAdapter(rows))
@@ -97,3 +97,16 @@ def test_service_freelist_shape():
         {"pane_id": "%24", "pane_role": "palace:N", "window_name": "palace"},
         {"pane_id": "%43", "pane_role": "", "window_name": "scratch"},
     ]
+
+
+def test_list_free_panes_hard_excludes_singleton_label_even_without_stamp_or_agent():
+    rows = [
+        ("%custodes", "1", "", "legion:custodes", "legion", "999"),
+        ("%fg", "1", "", "mechanicus:fabricator-general", "mechanicus", "1000"),
+        ("%admin", "1", "", "mechanicus:admin", "mechanicus", "1001"),
+        ("%worker", "1", "", "mechanicus:1", "mechanicus", "1002"),
+    ]
+
+    free = list_free_panes(FakeAdapter(rows))
+
+    assert [p.pane_id for p in free] == ["%worker"]

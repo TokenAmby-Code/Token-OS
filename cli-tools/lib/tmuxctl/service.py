@@ -521,7 +521,17 @@ class TmuxControlPlane:
 
         ``submit=False`` routes through the insert-only primitive (draft mode —
         never issues C-m), mirroring ``tmuxctl send-text --no-submit``.
+        Dispatch launcher payloads (``clear`` warmups and staged
+        ``dispatch-agent`` commands) are additionally checked against the live
+        occupancy ledger before any byte-bearing send.
         """
+        from .occupancy import (
+            assert_dispatch_target_available,
+            looks_like_dispatch_launcher_payload,
+        )
+
+        if looks_like_dispatch_launcher_payload(text):
+            assert_dispatch_target_available(self.adapter, pane)
         if not submit:
             self.insert_text(pane, text)
             return {"status": "inserted", "pane": pane}
@@ -572,8 +582,10 @@ class TmuxControlPlane:
     ) -> str:
         """Adopt an existing pane into a stack base under focus preservation."""
         from .focus_guard import preserve_focus
+        from .occupancy import assert_dispatch_target_available
         from .stack import add_stack_pane
 
+        assert_dispatch_target_available(self.adapter, pane)
         with preserve_focus(
             self.adapter,
             source="tmuxctld stack adopt",

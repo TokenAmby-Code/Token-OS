@@ -462,6 +462,10 @@ def _h_instance_show_option(control, params):
 def _h_send_keys(control, params):
     pane = _s(params, "pane")
     command = _s(params, "command")
+    from .occupancy import assert_dispatch_target_available, looks_like_dispatch_launcher_payload
+
+    if looks_like_dispatch_launcher_payload(command):
+        assert_dispatch_target_available(control.adapter, pane)
     if _b(params, "no_escape"):
         control.adapter.run("send-keys", "-t", pane, "-l", command)
     else:
@@ -579,6 +583,10 @@ def _h_send_text(control, params):
     # gated result instead; Token-API can queue/retry, but tmuxctld issues zero
     # bytes now.
     normalized_payload = normalize_prompt_payload(text)
+    from .occupancy import assert_dispatch_target_available, looks_like_dispatch_launcher_payload
+
+    if looks_like_dispatch_launcher_payload(normalized_payload):
+        assert_dispatch_target_available(control.adapter, phys_pane)
     pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
     if pre_gate is not None and pre_gate.get("suppressed"):
         raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
