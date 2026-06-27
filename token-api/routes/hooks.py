@@ -36,6 +36,7 @@ from pydantic import BaseModel
 import shared
 import talk as talk_service
 from enforcement_service import close_distraction_windows
+from human_render import sanitize_human_render_text
 from instance_lifecycle import apply_instance_lifecycle, normalize_instance_lifecycle
 from instance_mutation import (
     _fetch_instance_row,
@@ -983,7 +984,7 @@ async def _enqueue_state_injection(
     kind: str,
     payload: dict,
 ) -> int:
-    rendered_text = _render_state_injection(kind, payload)
+    rendered_text = await sanitize_human_render_text(_render_state_injection(kind, payload))
     cursor = await db.execute(
         """INSERT INTO state_injections
            (audience_instance_id, source_instance_id, kind, payload_json, rendered_text)
@@ -2286,6 +2287,7 @@ async def _fanout_stop_subscriptions(
         f"{response or '[no final assistant text captured]'}\n"
         "</system-reminder>"
     )
+    default_notice = await sanitize_human_render_text(default_notice) or default_notice
     # Match the armed subscription by the Stop session id, OR — when a pane is
     # known — by the target pane. The pane fallback covers id drift: a pane that
     # re-registered under a new instance id (or whose row was reaped mid-turn)
@@ -2319,7 +2321,10 @@ async def _fanout_stop_subscriptions(
             if row.get("delivery") == "close-pane":
                 result = await _execute_close_pane_stop_subscription(db, subscription=row)
             else:
-                delivery_payload = row.get("payload") or default_notice
+                delivery_payload = await sanitize_human_render_text(
+                    row.get("payload") or default_notice
+                )
+                delivery_payload = delivery_payload or default_notice
                 result = await _enqueue_and_send_stop_delivery(
                     db,
                     subscription=row,
@@ -5290,7 +5295,7 @@ async def handle_stop(payload: dict) -> dict:
             )
 
     if tts_text:
-        tts_text = re.sub(r"%\d+", "unresolved", tts_text)
+        tts_text = await sanitize_human_render_text(tts_text)
 
     # Trinity Chunk 2: live Stop-hook subscriptions. Deliver before legacy
     # state_injections so a subscribed parent gets an immediate prompt instead

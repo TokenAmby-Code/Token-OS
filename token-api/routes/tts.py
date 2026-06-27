@@ -33,6 +33,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from human_render import sanitize_human_render_text, sanitize_human_render_text_sync
 from instance_mutation import sanctioned_update_instance
 from personas import (
     BACKUP_ASTARTES,
@@ -67,14 +68,19 @@ TTS_AUTO_FOCUS_ENABLED = os.environ.get("TOKEN_API_TTS_AUTO_FOCUS", "").lower() 
     "on",
 }
 
-RAW_TMUX_PANE_RX = re.compile(r"%\d+")
-
 
 def _sanitize_public_text(value: str | None) -> str:
-    """Fail-closed sanitizer for human-facing notification/TTS text."""
+    """Translate/redact raw tmux pane ids at synchronous human boundaries."""
     if not value:
         return ""
-    return RAW_TMUX_PANE_RX.sub("unresolved", str(value))
+    return sanitize_human_render_text_sync(str(value)) or ""
+
+
+async def _sanitize_public_text_async(value: str | None) -> str:
+    """Async/offloaded variant for event-loop notification/TTS paths."""
+    if not value:
+        return ""
+    return await sanitize_human_render_text(str(value)) or ""
 
 
 router = APIRouter()
@@ -622,8 +628,8 @@ async def dispatch_notify(
     transport internals (_send_to_phone, speak_tts_{mac,wsl,discord}) directly,
     circumvents this middleware and is always a violation.
     """
-    message = _sanitize_public_text(message)
-    banner = _sanitize_public_text(banner) if banner is not None else None
+    message = await _sanitize_public_text_async(message)
+    banner = await _sanitize_public_text_async(banner) if banner is not None else None
 
     if _is_quiet_hours():
         logger.info(f"Notify suppressed (quiet hours): {(message or banner or '')[:80]}")
@@ -1206,7 +1212,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         queue_target: "hot" for immediate playback (VC/sync sessions),
                       "pause" for silent accumulation (default).
     """
-    message = _sanitize_public_text(message)
+    message = await _sanitize_public_text_async(message)
 
     # Silence TTS during quiet hours (11 PM - 9 AM)
     if _is_quiet_hours():
