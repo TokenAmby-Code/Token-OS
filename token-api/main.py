@@ -3871,13 +3871,24 @@ async def record_golden_throne_resume(instance: dict) -> dict:
             human_pane_surface=human_surface,
             resume_count=count,
         )
-        await handle_custodes_state_event(
-            "enforcement_cascade_started",
-            "golden_throne",
-            instance_id=session_id,
-            severity=4,
-            payload=payload,
+        cascade_result = (
+            await handle_custodes_state_event(
+                "enforcement_cascade_started",
+                "golden_throne",
+                instance_id=session_id,
+                severity=4,
+                payload=payload,
+            )
+            or {}
         )
+        if cascade_result.get("classification") == "suppressed":
+            result["cascade_suppressed"] = cascade_result
+            await log_event(
+                "golden_throne_second_resume_suppressed",
+                instance_id=session_id,
+                details={**payload, "cascade_result": cascade_result},
+            )
+            return result
         enforcement = await enforce(
             EnforceRequest(
                 message=f"Golden Throne second resume: {human_surface}",
@@ -7752,13 +7763,33 @@ async def _golden_throne_handle_victorious_bug(
         human_pane_surface=human_pane_surface,
         doc_id=doc_id,
     )
-    await handle_custodes_state_event(
-        "enforcement_cascade_started",
-        "golden_throne",
-        instance_id=session_id,
-        severity=4,
-        payload=payload,
+    cascade_result = (
+        await handle_custodes_state_event(
+            "enforcement_cascade_started",
+            "golden_throne",
+            instance_id=session_id,
+            severity=4,
+            payload=payload,
+        )
+        or {}
     )
+    if cascade_result.get("classification") == "suppressed":
+        await log_event(
+            "golden_throne_victorious_bug_suppressed",
+            instance_id=session_id,
+            details={
+                "doc_id": doc_id,
+                "doc_path": str(doc_path) if doc_path else None,
+                "rubric_key": status.rubric_key,
+                "human_pane_surface": human_pane_surface,
+                "cascade_result": cascade_result,
+            },
+        )
+        return {
+            "state": "victorious_bug_suppressed",
+            "doc_id": doc_id,
+            "cascade_result": cascade_result,
+        }
     enforcement = await enforce(
         EnforceRequest(
             message=tts_body or f"GT bug on victorious {human_pane_surface}",
@@ -8771,6 +8802,209 @@ async def _tts_queue_languishing_live_status(payload: dict | None = None) -> tup
     return True, "pause_queue_languishing", snapshot
 
 
+_CLAUDE_CACHED_PHONE_APP_RE = re.compile(r"^claude\s+\d{1,2}:\d{2}$", re.IGNORECASE)
+_INTERNAL_CASCADE_PHONE_APP_VALUES = {
+    "administratum",
+    "askq_ladder",
+    "askuserquestion",
+    "claude",
+    "custodes",
+    "discord",
+    "fabricator",
+    "fabricator-general",
+    "golden_throne",
+    "mechanicus",
+    "sanguinius",
+    "tts_queue",
+}
+_INTERNAL_CASCADE_PHONE_APP_PREFIXES = (
+    "askuserquestion-",
+    "expected_ack",
+    "golden_throne-",
+)
+_CASCADE_PHONE_APP_SOURCES = {
+    "phone",
+    "phone_detection",
+    "phone_distraction",
+    "phone_gaming",
+    "backlog_violation",
+}
+
+
+def _cascade_phone_app_candidate(source: str, payload: dict) -> str | None:
+    """Resolve concrete phone-app telemetry for a cascade decision.
+
+    ``ack_source`` is provenance only. It must never satisfy the phone-app
+    precondition by itself.
+    """
+    phone_app = payload.get("phone_app")
+    if isinstance(phone_app, str) and phone_app.strip():
+        return phone_app.strip()
+    if phone_app is not None:
+        return None
+    app = payload.get("app")
+    if (
+        (source in _CASCADE_PHONE_APP_SOURCES or source.startswith("phone_"))
+        and isinstance(app, str)
+        and app.strip()
+    ):
+        return app.strip()
+    return None
+
+
+def _cascade_phone_app_is_internal_or_cached(phone_app: str) -> bool:
+    normalized = phone_app.strip().lower()
+    if not normalized:
+        return True
+    if _CLAUDE_CACHED_PHONE_APP_RE.match(normalized):
+        return True
+    if normalized in _INTERNAL_CASCADE_PHONE_APP_VALUES:
+        return True
+    return any(normalized.startswith(prefix) for prefix in _INTERNAL_CASCADE_PHONE_APP_PREFIXES)
+
+
+def _cascade_phone_app_is_allowlisted_distraction(phone_app: str) -> bool:
+    normalized = phone_app.strip().lower()
+    if not normalized:
+        return False
+    allowlist = {str(key).lower() for key in PHONE_DISTRACTION_APPS}
+    display_names_by_lower_key = {
+        str(key).lower(): str(value).lower() for key, value in PHONE_APP_DISPLAY_NAMES.items()
+    }
+    allowlist.update(
+        display for key, display in display_names_by_lower_key.items() if key in allowlist
+    )
+    return normalized in allowlist
+
+
+async def _cascade_instance_status(instance_id: str | None) -> str | None:
+    if not instance_id:
+        return None
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (
+                await db.execute("SELECT status FROM instances WHERE id = ?", (instance_id,))
+            ).fetchone()
+    except Exception:
+        return None
+    return str(row["status"]).lower() if row and row["status"] is not None else None
+
+
+async def _cascade_pane_suppression_reason(instance_id: str | None, payload: dict) -> str | None:
+    """Reject stale pane-backed cascade decisions before emission.
+
+    Stored rows are not liveness. If a cascade carries an instance/pane
+    reference, resolve it through the daemon-native tmux oracle and fail closed
+    on stopped/archived rows or live-oracle misses.
+    """
+    tmux_pane_raw = payload.get("tmux_pane") or payload.get("pane")
+    tmux_pane = str(tmux_pane_raw).strip() if tmux_pane_raw is not None else None
+    if not instance_id and not tmux_pane:
+        return None
+
+    if instance_id:
+        status = await _cascade_instance_status(instance_id)
+        if status in {"stopped", "archived"}:
+            return "pane_instance_stopped"
+        live_pane, _role = await shared.resolve_instance_pane(instance_id)
+        if not live_pane:
+            return "pane_not_live"
+        if tmux_pane and tmux_pane != live_pane:
+            return "pane_not_live"
+        return None
+
+    # Bare pane reference: verify it is a live stamped pane via the reverse oracle.
+    live_instance_id = await shared.instance_id_for_pane(tmux_pane)
+    if not live_instance_id:
+        return "pane_not_live"
+    status = await _cascade_instance_status(live_instance_id)
+    if status in {"stopped", "archived"}:
+        return "pane_instance_stopped"
+    return None
+
+
+async def _cascade_decision_suppression(
+    *,
+    event_type: str = "enforcement_cascade_started",
+    source: str,
+    instance_id: str | None,
+    severity: int | None,
+    payload: dict,
+) -> dict | None:
+    phone_app = _cascade_phone_app_candidate(source, payload)
+    reason: str | None = None
+    if not phone_app:
+        reason = "missing_phone_app"
+    elif _cascade_phone_app_is_internal_or_cached(phone_app):
+        reason = "internal_or_cached_phone_app"
+    elif not _cascade_phone_app_is_allowlisted_distraction(phone_app):
+        reason = "phone_app_not_allowlisted_distraction"
+    else:
+        reason = await _cascade_pane_suppression_reason(instance_id, payload)
+
+    if reason is None:
+        return None
+
+    await log_event(
+        "cascade_decision_suppressed",
+        instance_id=instance_id,
+        device_id=source,
+        details={
+            "event_type": event_type,
+            "source": source,
+            "severity": normalize_severity(severity),
+            "reason": reason,
+            "phone_app": phone_app,
+            "ack_source": payload.get("ack_source"),
+            "payload": payload,
+        },
+    )
+    return {
+        "received": True,
+        "intervention_dispatched": False,
+        "routed_to": "none",
+        "classification": "suppressed",
+        "reason": reason,
+    }
+
+
+async def _pane_reference_decision_suppression(
+    *,
+    event_type: str,
+    source: str,
+    instance_id: str | None,
+    severity: int | None,
+    payload: dict,
+) -> dict | None:
+    if "tmux_pane" not in payload and "pane" not in payload:
+        return None
+    reason = await _cascade_pane_suppression_reason(instance_id, payload)
+    if reason is None:
+        return None
+    await log_event(
+        "cascade_decision_suppressed",
+        instance_id=instance_id,
+        device_id=source,
+        details={
+            "event_type": event_type,
+            "source": source,
+            "severity": normalize_severity(severity),
+            "reason": reason,
+            "phone_app": payload.get("phone_app"),
+            "ack_source": payload.get("ack_source"),
+            "payload": payload,
+        },
+    )
+    return {
+        "received": True,
+        "intervention_dispatched": False,
+        "routed_to": "none",
+        "classification": "suppressed",
+        "reason": reason,
+    }
+
+
 async def _custodes_intervention_negative_edge_cancel_result(
     event: StateEvent,
     intervention,
@@ -9780,6 +10014,27 @@ async def handle_custodes_state_event(
     ``event_type`` is no longer dropped to /dev/null — it defaults to an
     Administratum record so the leak is captured, not lost.
     """
+    if event_type == "enforcement_cascade_started":
+        suppression = await _cascade_decision_suppression(
+            event_type=event_type,
+            source=source,
+            instance_id=instance_id,
+            severity=severity,
+            payload=payload or {},
+        )
+        if suppression is not None:
+            return suppression
+    elif classify_trigger(event_type) == "enforcement":
+        suppression = await _pane_reference_decision_suppression(
+            event_type=event_type,
+            source=source,
+            instance_id=instance_id,
+            severity=severity,
+            payload=payload or {},
+        )
+        if suppression is not None:
+            return suppression
+
     if event_type == "tts_queue_languishing":
         warranted, stale_reason, live_state = await _tts_queue_languishing_live_status(payload)
         if not warranted:
