@@ -218,7 +218,8 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
 
 def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> None:
     """The root-table any-key binding only calls the state helper when the pane is
-    OFF. Live ON/PENDING state is preserved and the real key is replayed."""
+    not ON. Live ON is preserved; PENDING is re-armed by the helper and the real
+    key is replayed."""
     conf = CONF.read_text(encoding="utf-8")
     assert "bind -n Any {" in conf
     assert "tmux-typing-guard-state arm --pane #{q:pane_id} --seconds 300" in conf
@@ -257,6 +258,10 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     # Arming lives ONLY on the keystroke side; the mouse (else) branch is empty —
     # nothing after the keystroke branch's final send-keys but closing braces.
     assert "tmux-typing-guard-state arm" in any_binding
+    assert "#{||:#{e|>=:#{@TYPING_LOCK_UNTIL}" not in any_binding, (
+        "Any must not treat PENDING as already-armed; a follow-up keystroke after "
+        "Backspace/Ctrl+C pending must run the arm helper and convert PENDING to ON"
+    )
     mouse_else_branch = any_binding.rsplit("send-keys", 1)[1]
     assert mouse_else_branch.strip(" \n\t{}") == "", (
         "the mouse (else) branch of Any must consume the event — no arm and no "
