@@ -2514,12 +2514,22 @@ async def handle_wrapper_start(payload: dict) -> dict:
 
 
 async def handle_wrapper_end(payload: dict) -> dict:
-    """Handle terminal wrapper exit and stop the correlated live instance row.
+    """Handle terminal wrapper exit and stop the correlated dead instance row.
 
     Claude normally emits SessionEnd before WrapperEnd; Codex and crashy wrappers
     may not. WrapperEnd is terminal, so use wrapper_launch_id as the durable
-    correlation key and mark any still-live row stopped. This is best-effort and
+    correlation key and mark the correlated row stopped. This is best-effort and
     idempotent: already stopped/archived/retired rows are left alone.
+
+    LIVENESS GUARD (universal — every live pane, not mechanicus-scoped): the
+    wrapper_launch_id correlation alone is not authority to cull. A spurious or
+    duplicate WrapperEnd can target a row whose tmux pane is still alive and
+    working (a single such event orphaned 4 live mechanicus rows + a live worker).
+    Before marking stopped, consult tmuxctld's runtime liveness oracle
+    (shared.resolve_instance_pane → the @INSTANCE_ID stamp scan; fail-closed). If
+    the pane is verifiably LIVE, REFUSE the stop and leave the row untouched. Only
+    a genuine exit — pane torn down / dead per the oracle — passes through to the
+    status update.
     """
     wrapper_launch_id = _normalize_text(
         payload.get("wrapper_launch_id")
@@ -2543,6 +2553,7 @@ async def handle_wrapper_end(payload: dict) -> dict:
         "source": "wrapper",
     }
     stopped_instance_id = None
+    refused_live_instance_id = None
     if wrapper_launch_id:
         now = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
@@ -2557,35 +2568,55 @@ async def handle_wrapper_end(payload: dict) -> dict:
             )
             row = await cursor.fetchone()
             if row and row["status"] not in {"stopped", "archived"} and row["rank"] != "retired":
-                stopped_instance_id = row["id"]
-                await sanctioned_update_instance(
-                    db,
-                    instance_id=stopped_instance_id,
-                    updates={
-                        "status": "stopped",
-                        "input_lock": None,
-                        "stopped_at": now,
-                        "hook_driven": 0,
-                        "golden_throne": None,
-                    },
-                    mutation_type="instance_stopped",
-                    write_source="hooks",
-                    actor="WrapperEnd",
-                    wrapper_launch_id=wrapper_launch_id,
-                )
-                await db.commit()
-                # The WrapperEnd payload carries the live pane being torn down;
-                # fall back to the oracle's live resolution if absent.
-                pane_to_clear = tmux_pane
-                if not pane_to_clear:
-                    pane_to_clear, _ = await shared.resolve_instance_pane(stopped_instance_id)
-                if pane_to_clear:
-                    try:
-                        await asyncio.to_thread(
-                            shared.clear_pane_tint, pane_to_clear, source="WrapperEnd"
-                        )
-                    except Exception:
-                        pass
+                candidate_id = row["id"]
+                # Daemon-native liveness truth: tmuxctld resolves the instance to a
+                # live pane only when its @INSTANCE_ID stamp is present on a real
+                # pane. Fail-closed — a returned pane_id is authoritative, not a
+                # stale DB row. Never mark stopped while the pane is verifiably live.
+                live_pane, _live_role = await shared.resolve_instance_pane(candidate_id)
+                if live_pane:
+                    # Spurious/duplicate WrapperEnd vs a live pane → REFUSE the stop.
+                    refused_live_instance_id = candidate_id
+                else:
+                    stopped_instance_id = candidate_id
+                    await sanctioned_update_instance(
+                        db,
+                        instance_id=stopped_instance_id,
+                        updates={
+                            "status": "stopped",
+                            "input_lock": None,
+                            "stopped_at": now,
+                            "hook_driven": 0,
+                            "golden_throne": None,
+                        },
+                        mutation_type="instance_stopped",
+                        write_source="hooks",
+                        actor="WrapperEnd",
+                        wrapper_launch_id=wrapper_launch_id,
+                    )
+                    await db.commit()
+                    # The oracle already confirmed the pane is dead, so only the
+                    # WrapperEnd payload's torn-down pane is worth clearing.
+                    if tmux_pane:
+                        try:
+                            await asyncio.to_thread(
+                                shared.clear_pane_tint, tmux_pane, source="WrapperEnd"
+                            )
+                        except Exception:
+                            pass
+    if refused_live_instance_id:
+        details["refused_live_instance_id"] = refused_live_instance_id
+        await log_event(
+            "wrapper_end_refused_live_pane",
+            instance_id=refused_live_instance_id,
+            details=details,
+        )
+        return {
+            "success": True,
+            "action": "wrapper_end_refused_live",
+            "wrapper_launch_id": wrapper_launch_id,
+            "instance_id": refused_live_instance_id,
+        }
     details["stopped_instance_id"] = stopped_instance_id
     await log_event("wrapper_end", instance_id=stopped_instance_id or None, details=details)
     return {
