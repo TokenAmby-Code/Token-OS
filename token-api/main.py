@@ -8719,6 +8719,33 @@ async def _custodes_state_dedupe_decision(dedupe_key: str, severity: int) -> tup
     return False, "not_duplicate"
 
 
+async def _tts_queue_languishing_live_status(payload: dict | None = None) -> tuple[bool, str, dict]:
+    """Return whether a TTS languishing event is still warranted from live queue state.
+
+    ``tts_queue_languishing`` payloads can sit behind dispatch gates. The payload's
+    queue length is therefore only historical; the source of truth is the live
+    pause queue guarded by ``routes.tts.tts_queue_lock``.
+    """
+    payload = payload or {}
+    try:
+        from routes import tts as tts_mod
+
+        try:
+            threshold = int(payload.get("threshold", tts_mod.TTS_LANGUISHING_THRESHOLD))
+        except (TypeError, ValueError):
+            threshold = tts_mod.TTS_LANGUISHING_THRESHOLD
+        snapshot = await tts_mod.get_pause_queue_languishing_snapshot(threshold=threshold)
+    except Exception as exc:
+        logger.warning("TTS languishing live-state check failed; fail-open: %s", exc)
+        return True, "live_state_check_failed", {"error": str(exc)}
+
+    if snapshot["pause_queue_length"] <= 0:
+        return False, "pause_queue_empty", snapshot
+    if not snapshot["languishing"]:
+        return False, "pause_queue_below_languishing_threshold", snapshot
+    return True, "pause_queue_languishing", snapshot
+
+
 async def _custodes_intervention_negative_edge_cancel_result(
     event: StateEvent,
     intervention,
@@ -8749,6 +8776,14 @@ async def _custodes_intervention_negative_edge_cancel_result(
                 "ack_status": ack.get("status"),
                 "ack_source": ack.get("source"),
                 "ack_instance_id": ack.get("instance_id"),
+            }
+
+    if event.event_type == "tts_queue_languishing":
+        warranted, reason, live_state = await _tts_queue_languishing_live_status(payload)
+        if not warranted:
+            cancel_details = {
+                "reason": reason,
+                "live_tts_queue": live_state,
             }
 
     if cancel_details is None:
@@ -9456,6 +9491,12 @@ async def _enforcement_still_warranted(
         if not PHONE_STATE.get("is_distracted", False):
             return False, "phone_distraction_cleared"
 
+    # TTS languishing: do not flush an old payload after the pause queue drained.
+    if event.event_type == "tts_queue_languishing":
+        warranted, reason, _live_state = await _tts_queue_languishing_live_status(payload)
+        if not warranted:
+            return False, reason
+
     return True, "warranted"
 
 
@@ -9675,6 +9716,38 @@ async def handle_custodes_state_event(
     ``event_type`` is no longer dropped to /dev/null — it defaults to an
     Administratum record so the leak is captured, not lost.
     """
+    if event_type == "tts_queue_languishing":
+        warranted, stale_reason, live_state = await _tts_queue_languishing_live_status(payload)
+        if not warranted:
+            normalized_severity = normalize_severity(severity)
+            await log_event(
+                "custodes_state_event_dropped",
+                instance_id=instance_id,
+                device_id=source,
+                details={
+                    "event_type": event_type,
+                    "source": source,
+                    "severity": normalized_severity,
+                    "reason": stale_reason,
+                    "payload": payload or {},
+                    "live_tts_queue": live_state,
+                },
+            )
+            return {
+                "received": True,
+                "intervention_dispatched": False,
+                "routed_to": "none",
+                "classification": "stale",
+                "reason": stale_reason,
+                "live_tts_queue": live_state,
+            }
+        payload = {
+            **(payload or {}),
+            "pause_queue_length": live_state["pause_queue_length"],
+            "threshold": live_state["threshold"],
+            "oldest_queued_at": live_state["oldest_queued_at"],
+        }
+
     event = StateEvent(
         event_type=event_type,
         source=source,

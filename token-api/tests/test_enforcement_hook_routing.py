@@ -377,6 +377,25 @@ def _languishing_payload(pause_queue_length):
     }
 
 
+async def _set_live_tts_pause_queue(length: int) -> None:
+    """Seed the live TTS source-of-truth for genuine languishing hook tests."""
+    from routes import tts
+
+    async with tts.tts_queue_lock:
+        tts.pause_queue.clear()
+        for n in range(length):
+            tts.pause_queue.append(
+                tts.TTSQueueItem(
+                    instance_id=f"tts-{n}",
+                    message=f"queued {n}",
+                    voice="Daniel",
+                    sound="none",
+                    tab_name=f"tts-tab-{n}",
+                    queue_target="pause",
+                )
+            )
+
+
 def test_languishing_dedupe_key_distinguishes_depth():
     """The malformed constant key is gone: distinct depths → distinct keys."""
     from custodes_state_policy import StateEvent, build_dedupe_key
@@ -412,6 +431,7 @@ async def test_distinct_languishing_alerts_each_deliver(monkeypatch):
 
     monkeypatch.setattr(main, "_dispatch_custodes_intervention", fake_dispatch)
 
+    await _set_live_tts_pause_queue(6)
     first = await main.handle_custodes_state_event(
         "tts_queue_languishing",
         "tts_queue",
@@ -419,6 +439,7 @@ async def test_distinct_languishing_alerts_each_deliver(monkeypatch):
         payload=_languishing_payload(6),
         event_class="enforcement",
     )
+    await _set_live_tts_pause_queue(7)
     second = await main.handle_custodes_state_event(
         "tts_queue_languishing",
         "tts_queue",
@@ -452,6 +473,7 @@ async def test_persistent_languishing_keeps_escalating(monkeypatch):
     monkeypatch.setattr(main, "_dispatch_custodes_intervention", fake_dispatch)
 
     for depth in (6, 7, 8):
+        await _set_live_tts_pause_queue(depth)
         result = await main.handle_custodes_state_event(
             "tts_queue_languishing",
             "tts_queue",
