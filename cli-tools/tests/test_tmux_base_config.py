@@ -258,8 +258,8 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     # Arming lives ONLY on the keystroke side; the mouse (else) branch is empty —
     # nothing after the keystroke branch's final send-keys but closing braces.
     assert "tmux-typing-guard-state arm" in any_binding
-    assert "#{||:#{e|>=:#{@TYPING_LOCK_UNTIL}" not in any_binding, (
-        "Any must not treat PENDING as already-armed; a follow-up keystroke after "
+    assert "@TYPING_PENDING_UNTIL" not in any_binding, (
+        "Any must not depend directly on PENDING; a follow-up keystroke after "
         "Backspace/Ctrl+C pending must run the arm helper and convert PENDING to ON"
     )
     mouse_else_branch = any_binding.rsplit("send-keys", 1)[1]
