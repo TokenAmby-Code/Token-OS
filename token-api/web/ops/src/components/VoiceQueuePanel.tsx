@@ -10,6 +10,7 @@ import type { OpsState, TtsQueueItem, TtsGlobalMode, VoiceDraft } from '../types
 import { skipTts, promotePause, playPane, setGlobalMode, focusPane } from '../api';
 
 const MODES: TtsGlobalMode[] = ['verbose', 'muted', 'silent'];
+const TTS_LANGUISHING_THRESHOLD = 5;
 
 /** Age of an ISO timestamp in a compact "3h12m" / "45s" form. */
 function ageSince(iso: string | null | undefined): string {
@@ -119,8 +120,9 @@ export function VoiceQueuePanel({ state, refresh }: { state: OpsState; refresh: 
   const mode = (tts.global_mode ?? 'verbose') as TtsGlobalMode;
   const { busy, note, run } = useDeckAction(refresh);
 
-  // pause queue is the silent-languish risk — make depth loud when non-zero.
-  const pauseDeep = tts.pause_queue_length > 0;
+  // Languishing is derived from live pause-queue depth only; it is not a stored state.
+  const pauseHasItems = tts.pause_queue_length > 0;
+  const pauseLanguishing = tts.pause_queue_length > TTS_LANGUISHING_THRESHOLD;
 
   // Distinct instance ids in the pause queue — "promote all" fans out per
   // instance (the promote endpoint's all-of-instance semantics) to drain them.
@@ -213,8 +215,8 @@ export function VoiceQueuePanel({ state, refresh }: { state: OpsState; refresh: 
 
       <div className="vq__section">
         <h4>
-          Pause queue {pauseDeep ? <span className="vq__warn">languishing</span> : null}
-          {pauseDeep ? (
+          Pause queue {pauseLanguishing ? <span className="vq__warn">languishing</span> : null}
+          {pauseHasItems ? (
             <button
               type="button"
               className="pill vq__btn vq__btn--go vq__promote-all"
@@ -241,7 +243,7 @@ export function VoiceQueuePanel({ state, refresh }: { state: OpsState; refresh: 
         ) : (
           <p className="empty">empty</p>
         )}
-        {pauseDeep ? (
+        {pauseHasItems ? (
           <p className="vq__hint">
             Paused items wait silently — <code>play</code> a row or <code>promote all</code> to
             voice them.

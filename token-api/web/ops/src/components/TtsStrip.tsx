@@ -9,6 +9,7 @@ import type { OpsState, TtsGlobalMode } from '../types';
 import { skipTts, setGlobalMode } from '../api';
 
 const MODES: TtsGlobalMode[] = ['verbose', 'muted', 'silent'];
+const TTS_LANGUISHING_THRESHOLD = 5;
 
 /** Clamp a message to a single short glance-line for the strip. */
 function clamp(msg: string | null | undefined, n = 64): string {
@@ -22,7 +23,7 @@ export function TtsStrip({ state, refresh }: { state: OpsState; refresh: () => v
   const current = tts.current;
   const routing = tts.routing ?? null;
   const mode = (tts.global_mode ?? 'verbose') as TtsGlobalMode;
-  const pauseDeep = tts.pause_queue_length > 0;
+  const pauseLanguishing = tts.pause_queue_length > TTS_LANGUISHING_THRESHOLD;
 
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -62,7 +63,7 @@ export function TtsStrip({ state, refresh }: { state: OpsState; refresh: () => v
         hot <b className={tts.hot_queue_length ? 'ok' : 'muted'}>{tts.hot_queue_length}</b>
       </span>
       <span className="ttsstrip__stat">
-        pause <b className={pauseDeep ? 'bad' : 'muted'}>{tts.pause_queue_length}</b>
+        pause <b className={pauseLanguishing ? 'bad' : 'muted'}>{tts.pause_queue_length}</b>
       </span>
 
       {routing ? (
