@@ -118,6 +118,34 @@ def test_dispatch_notify_speaks_via_router_and_never_phone_direct(monkeypatch):
     assert result.get("delivered") is True
 
 
+def test_dispatch_notify_tts_failure_is_not_masked_by_tactile(monkeypatch):
+    """For spoken notifications, top-level delivered means true audio playback.
+
+    A successful banner/vibe leg must not recreate the false-success condition
+    where /api/notify returns delivered:true while the TTS backend played nothing.
+    """
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    calls = _recorders(
+        monkeypatch,
+        tts,
+        speak_result={
+            "success": False,
+            "route": None,
+            "method": None,
+            "reason": "no_playback_backend",
+        },
+    )
+
+    result = asyncio.run(tts.dispatch_notify("hello world", vibe=30, banner="hi"))
+
+    assert calls["speak"] == ["hello world"]
+    assert len(calls["phone"]) == 1
+    assert result.get("delivered") is False
+    assert result.get("audio_delivered") is False
+    assert result.get("tactile", {}).get("success") is True
+
+
 def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch):
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)

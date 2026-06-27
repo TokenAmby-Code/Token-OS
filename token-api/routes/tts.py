@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -249,12 +250,41 @@ def clean_markdown_for_tts(text: str) -> str:
     return text.strip()
 
 
+def _mac_tts_available() -> bool:
+    """True only when a local `say` backend can plausibly render audible speech."""
+    return IS_MACOS and shutil.which("say") is not None
+
+
+def _mac_sound_available() -> bool:
+    """True only when a local `afplay` backend can plausibly render a sound."""
+    return IS_MACOS and shutil.which("afplay") is not None
+
+
+def _phone_tts_available() -> bool:
+    """Phone TTS is a real playback target only when the transport is initialized
+    and its reachability probe is green."""
+    return _send_to_phone is not None and is_phone_reachable()
+
+
+def _no_playback_backend(reason: str = "no_playback_backend") -> dict:
+    return {
+        "success": False,
+        "error": reason,
+        "reason": reason,
+        "method": None,
+        "route": None,
+    }
+
+
 def speak_tts_mac(message: str, voice: str = None, rate: int = 0) -> dict:
     """Speak a message using macOS `say` command.
 
     Uses Popen instead of run() to allow process termination via skip_tts().
     """
     global tts_current_process, tts_skip_requested
+
+    if not _mac_tts_available():
+        return _no_playback_backend("mac_tts_unavailable")
 
     voice = voice or "Daniel"
     TTS_BACKEND["current"] = "mac"
@@ -278,7 +308,13 @@ def speak_tts_mac(message: str, voice: str = None, rate: int = 0) -> dict:
             return {"success": True, "method": "macos_say", "voice": voice, "message": message[:50]}
         if tts_skip_requested:
             tts_skip_requested = False
-            return {"success": True, "method": "skipped", "message": message[:50]}
+            return {
+                "success": False,
+                "skipped": True,
+                "method": "skipped",
+                "reason": "skipped",
+                "message": message[:50],
+            }
         return {"success": False, "error": f"say failed with code {process.returncode}"}
     except subprocess.TimeoutExpired:
         if tts_current_process:
@@ -336,8 +372,11 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
                     "message_chars": len(message),
                     "rendered_chars": data.get("rendered_chars"),
                 }
+            skipped = bool(data.get("skipped"))
             return {
-                "success": data.get("success", False),
+                # A skip is controlled interruption, but it is not true playback.
+                "success": bool(data.get("success", False)) and not skipped,
+                "skipped": skipped,
                 "method": method,
                 "voice": voice,
                 "message": message[:50],
@@ -345,6 +384,7 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
                 "rendered_chars": data.get("rendered_chars"),
                 "rendered_hash": rendered_hash,
                 "transport": data.get("transport"),
+                "reason": "skipped" if skipped else data.get("reason"),
             }
         elif resp.status_code == 409:
             return {"success": False, "error": "satellite_busy"}
@@ -451,7 +491,7 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
     5. Mac — last resort, local speakers
 
     Returns:
-        {"device": "discord"|"wsl"|"phone"|"mac", "reason": str, "discord_bot": str|None}
+        {"device": "discord"|"wsl"|"phone"|"mac"|None, "reason": str, "discord_bot": str|None}
     """
     # 1. Discord voice channel — operator in VC means audio goes there
     discord_bot = _get_discord_voice_bot()
@@ -466,12 +506,18 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
     location_zone = DESKTOP_STATE.get("location_zone")
     if location_zone is not None and location_zone != "home":
         # User is at gym, campus, or other known zone — phone is the only option
-        if is_phone_reachable():
+        if _phone_tts_available():
             return {"device": "phone", "reason": f"geofence: {location_zone}", "discord_bot": None}
-        # Phone unreachable while away — Mac as last resort (shouldn't happen often)
+        # Phone unreachable while away — Mac only if it is a real local backend.
+        if _mac_tts_available():
+            return {
+                "device": "mac",
+                "reason": f"geofence: {location_zone}, phone unreachable",
+                "discord_bot": None,
+            }
         return {
-            "device": "mac",
-            "reason": f"geofence: {location_zone}, phone unreachable",
+            "device": None,
+            "reason": f"geofence: {location_zone}, no playback backend",
             "discord_bot": None,
         }
 
@@ -484,7 +530,7 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
         return {"device": "wsl", "reason": "satellite healthy", "discord_bot": None}
 
     # 4. Phone — reachable as secondary home device
-    if is_phone_reachable():
+    if _phone_tts_available():
         return {
             "device": "phone",
             "reason": "wsl unavailable, phone reachable",
@@ -492,7 +538,10 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
         }
 
     # 5. Mac — local speakers as last resort
-    return {"device": "mac", "reason": "last resort, local speakers", "discord_bot": None}
+    if _mac_tts_available():
+        return {"device": "mac", "reason": "last resort, local speakers", "discord_bot": None}
+
+    return {"device": None, "reason": "no playback backend", "discord_bot": None}
 
 
 def speak_tts(
@@ -525,7 +574,7 @@ def speak_tts(
     message = _sanitize_public_text(clean_markdown_for_tts(message))
 
     routing = resolve_tts_device(instance_id=instance_id, wsl_voice=wsl_voice)
-    device = routing["device"]
+    device = routing.get("device")
     logger.info(f"TTS: Routing to {device} ({routing['reason']})")
 
     def _finish(result: dict) -> dict:
@@ -544,6 +593,9 @@ def speak_tts(
             result["route"] = None
             result.setdefault("reason", result.get("error") or "tts_delivery_failed")
         return result
+
+    if device is None:
+        return _finish(_no_playback_backend(str(routing.get("reason") or "no_playback_backend")))
 
     # If WSL was selected without an explicit voice (e.g. /api/notify/tts caller),
     # fall back to ULTIMATE_FALLBACK so the satellite gets a usable SAPI voice.
@@ -569,11 +621,13 @@ def speak_tts(
             )
             if result.get("success"):
                 return _finish(result)
-        if is_phone_reachable() and _send_to_phone:
+        if _phone_tts_available():
             result = _send_to_phone("/notify", {"tts_text": message})
             if result.get("success"):
                 return _finish(result)
-        return _finish(speak_tts_mac(message, voice, rate))
+        if _mac_tts_available():
+            return _finish(speak_tts_mac(message, voice, rate))
+        return _finish(_no_playback_backend("no_fallthrough_playback_backend"))
 
     if device == "wsl":
         result = speak_tts_wsl(
@@ -587,18 +641,28 @@ def speak_tts(
         logger.info(
             f"TTS: WSL failed ({result.get('error')}), falling back to Mac ({voice or 'Daniel'})"
         )
-        return _finish(speak_tts_mac(message, voice, rate))
+        if _mac_tts_available():
+            return _finish(speak_tts_mac(message, voice, rate))
+        if _phone_tts_available():
+            result = _send_to_phone("/notify", {"tts_text": message})
+            if result.get("success"):
+                return _finish(result)
+        return _finish(_no_playback_backend("wsl_failed_no_fallthrough_backend"))
 
     if device == "phone":
-        if _send_to_phone:
+        if _phone_tts_available():
             result = _send_to_phone("/notify", {"tts_text": message})
             if result.get("success"):
                 return _finish(result)
             logger.info(f"TTS: Phone failed ({result.get('error')}), falling back to Mac")
-        return _finish(speak_tts_mac(message, voice, rate))
+        if _mac_tts_available():
+            return _finish(speak_tts_mac(message, voice, rate))
+        return _finish(_no_playback_backend("phone_failed_no_fallthrough_backend"))
 
     # device == "mac" (or unknown)
-    return _finish(speak_tts_mac(message, voice, rate))
+    if device == "mac":
+        return _finish(speak_tts_mac(message, voice, rate))
+    return _finish(_no_playback_backend("unknown_playback_backend"))
 
 
 async def dispatch_notify(
@@ -664,8 +728,9 @@ async def dispatch_notify(
         except Exception as e:
             logger.warning(f"notify: voice profile lookup failed for {instance_id}: {e}")
 
+    audio_requested = bool(tts and message)
     tts_result = None
-    if tts and message:
+    if audio_requested:
         tts_result = await loop.run_in_executor(
             None,
             functools.partial(speak_tts, message, voice, 0, instance_id, wsl_voice, wsl_rate),
@@ -691,16 +756,17 @@ async def dispatch_notify(
             functools.partial(_send_to_phone, "/notify", phone_params),
         )
 
-    delivered = bool(
-        (tts_result and tts_result.get("success"))
-        or (
-            tactile_result
-            and (tactile_result.get("success") or tactile_result.get("overall_success"))
-        )
+    tactile_delivered = bool(
+        tactile_result and (tactile_result.get("success") or tactile_result.get("overall_success"))
     )
+    audio_delivered = bool(tts_result and tts_result.get("success"))
+    # If the caller requested spoken audio, top-level delivery means true audio
+    # playback. A phone banner/vibe must not mask a failed/no-backend TTS leg.
+    delivered = audio_delivered if audio_requested else tactile_delivered
     route = tts_result.get("route") if tts_result else None
     result = {
         "delivered": delivered,
+        "audio_delivered": audio_delivered,
         "route": route,
         "tts": tts_result,
         "tactile": tactile_result,
@@ -716,6 +782,8 @@ async def dispatch_notify(
             "banner": banner_text,
             "route": route,
             "delivered": delivered,
+            "audio_delivered": audio_delivered,
+            "tactile_delivered": tactile_delivered,
             "context": context,
         },
     )
@@ -740,6 +808,7 @@ class TTSQueueItem:
     status: str = "queued"  # queued, playing, completed
     tmux_pane: str | None = None  # live-resolved pane id for @TTS_STATE tracking (set at playback)
     focus_on_playback: bool = False  # true only for explicit operator-initiated playback
+    playback_target: str | None = None  # resolved non-null audio target at enqueue time
 
 
 # Global TTS queue state — two-queue model
@@ -1138,26 +1207,25 @@ async def tts_queue_worker() -> None:
                     logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
 
                     # Log completion, skip, or failure
-                    if tts_result.get("success"):
-                        if tts_result.get("method") == "skipped":
-                            logger.info(f"TTS skipped for {tts_current.instance_id}")
-                            await log_event(
-                                "tts_skipped",
-                                instance_id=tts_current.instance_id,
-                                details={
-                                    "message": tts_current.message[:50],
-                                    "voice": tts_current.voice,
-                                },
-                            )
-                        else:
-                            await log_event(
-                                "tts_completed",
-                                instance_id=tts_current.instance_id,
-                                details={
-                                    "message": tts_current.message[:50],
-                                    "voice": tts_current.voice,
-                                },
-                            )
+                    if tts_result.get("skipped") or tts_result.get("method") == "skipped":
+                        logger.info(f"TTS skipped for {tts_current.instance_id}")
+                        await log_event(
+                            "tts_skipped",
+                            instance_id=tts_current.instance_id,
+                            details={
+                                "message": tts_current.message[:50],
+                                "voice": tts_current.voice,
+                            },
+                        )
+                    elif tts_result.get("success"):
+                        await log_event(
+                            "tts_completed",
+                            instance_id=tts_current.instance_id,
+                            details={
+                                "message": tts_current.message[:50],
+                                "voice": tts_current.voice,
+                            },
+                        )
                     else:
                         logger.error(
                             f"TTS failed for {tts_current.instance_id}: {tts_result.get('error')}"
@@ -1197,6 +1265,50 @@ async def tts_queue_worker() -> None:
 
 
 # ============ TTS Helpers ============
+
+
+def _resolve_queue_playback_target(
+    *, message: str, sound: str | None, instance_id: str, voice: str | None
+) -> dict:
+    """Return the real backend a queued item could play through, or a refusal.
+
+    Queue entries are delayed work. Accepting one when every playback backend is
+    absent creates the `backend:null` burn-loop: usage piles up, but no audio can
+    ever render. Speech uses the same router as live notify. Muted/sound-only
+    items require a real local sound backend because `play_sound()` is Mac afplay.
+    """
+    if message:
+        routing = resolve_tts_device(instance_id=instance_id, wsl_voice=voice)
+        device = routing.get("device")
+        if device:
+            return {"success": True, "playback_target": device, "routing": routing}
+        return {
+            "success": False,
+            "reason": "no_playback_target",
+            "routing": routing,
+            "playback_target": None,
+        }
+
+    if sound:
+        if _mac_sound_available():
+            return {
+                "success": True,
+                "playback_target": "mac_sound",
+                "routing": {"device": "mac_sound", "reason": "local sound backend"},
+            }
+        return {
+            "success": False,
+            "reason": "no_sound_playback_target",
+            "routing": {"device": None, "reason": "no local sound backend"},
+            "playback_target": None,
+        }
+
+    return {
+        "success": False,
+        "reason": "empty_audio_payload",
+        "routing": {"device": None, "reason": "empty audio payload"},
+        "playback_target": None,
+    }
 
 
 def _is_quiet_hours(now: datetime | None = None) -> bool:
@@ -1285,6 +1397,35 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             focus_on_playback=False,
         )
 
+    target = _resolve_queue_playback_target(
+        message=item.message,
+        sound=item.sound,
+        instance_id=instance_id,
+        voice=voice,
+    )
+    if not target.get("success"):
+        reason = target.get("reason") or "no_playback_target"
+        await log_event(
+            "tts_enqueue_refused",
+            instance_id=instance_id,
+            device_id="tts_queue",
+            details={
+                "message": message[:100],
+                "voice": voice,
+                "queue": queue_target,
+                "reason": reason,
+                "routing": target.get("routing"),
+            },
+        )
+        return {
+            "success": False,
+            "queued": False,
+            "reason": reason,
+            "playback_target": None,
+            "routing": target.get("routing"),
+        }
+    item.playback_target = target.get("playback_target")
+
     async with tts_queue_lock:
         if queue_target == "hot":
             hot_queue.append(item)
@@ -1306,6 +1447,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             "position": position,
             "queue": queue_target,
             "focus_on_playback": item.focus_on_playback,
+            "playback_target": item.playback_target,
         },
     )
 
@@ -1324,6 +1466,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         "queue": queue_target,
         "voice": voice,
         "sound": sound,
+        "playback_target": item.playback_target,
     }
 
 
@@ -1546,6 +1689,7 @@ def _queue_item_to_dict(item: TTSQueueItem) -> dict:
         "tab_name": item.tab_name,
         "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
         "voice": item.voice,
+        "playback_target": item.playback_target,
         "queue": item.queue_target,
         "queued_at": item.queued_at.isoformat(),
     }
@@ -1565,6 +1709,7 @@ def get_tts_queue_status() -> dict:
             if len(tts_current.message) > 50
             else tts_current.message,
             "voice": tts_current.voice,
+            "playback_target": tts_current.playback_target,
         }
 
     return {

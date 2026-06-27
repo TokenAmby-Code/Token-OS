@@ -58,6 +58,7 @@ def test_queue_tts_languishing_emits_internal_state_label(app_env, monkeypatch) 
 
     monkeypatch.setattr(tts, "_custodes_state_event_handler", fake_state_event)
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
     monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
     tts._tts_languishing_emit_latch.clear()
     tts.pause_queue.clear()
@@ -93,6 +94,7 @@ def test_queue_tts_languishing_ignores_direct_hot_tts(app_env, monkeypatch) -> N
 
     monkeypatch.setattr(tts, "_custodes_state_event_handler", fake_state_event)
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
     tts._tts_languishing_emit_latch.clear()
     tts.pause_queue.clear()
     tts.hot_queue.clear()
@@ -106,6 +108,36 @@ def test_queue_tts_languishing_ignores_direct_hot_tts(app_env, monkeypatch) -> N
 
     assert len(tts.hot_queue) == 6
     assert calls == []
+
+
+def test_queue_tts_refuses_when_no_playback_target(app_env, monkeypatch) -> None:
+    """Do not accept queue work when routing resolves to backend:null."""
+    tts = _load_tts()
+    iid = _insert_tts_instance(app_env.db_path)
+    logs = []
+
+    async def fake_log_event(*args, **kwargs):
+        logs.append((args, kwargs))
+
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda: None)
+    monkeypatch.setattr(tts, "is_satellite_tts_available", lambda: False)
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda: False)
+    monkeypatch.setattr(tts, "_send_to_phone", None)
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: False)
+    monkeypatch.setattr(tts, "log_event", fake_log_event)
+    tts.pause_queue.clear()
+    tts.hot_queue.clear()
+
+    result = asyncio.run(tts.queue_tts(iid, "unplayable", queue_target="pause"))
+
+    assert result["success"] is False
+    assert result["queued"] is False
+    assert result["reason"] == "no_playback_target"
+    assert result["playback_target"] is None
+    assert len(tts.pause_queue) == 0
+    assert len(tts.hot_queue) == 0
+    assert any(args[0] == "tts_enqueue_refused" for args, _ in logs)
 
 
 def test_tts_queue_languishing_is_internal_state_trigger() -> None:
