@@ -33,6 +33,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from human_render import sanitize_human_render_text_sync
 from instance_mutation import sanctioned_update_instance
 from personas import (
     BACKUP_ASTARTES,
@@ -67,14 +68,12 @@ TTS_AUTO_FOCUS_ENABLED = os.environ.get("TOKEN_API_TTS_AUTO_FOCUS", "").lower() 
     "on",
 }
 
-RAW_TMUX_PANE_RX = re.compile(r"%\d+")
-
 
 def _sanitize_public_text(value: str | None) -> str:
-    """Fail-closed sanitizer for human-facing notification/TTS text."""
+    """Translate/redact raw tmux pane ids at human notification/TTS boundaries."""
     if not value:
         return ""
-    return RAW_TMUX_PANE_RX.sub("unresolved", str(value))
+    return sanitize_human_render_text_sync(str(value)) or ""
 
 
 router = APIRouter()
