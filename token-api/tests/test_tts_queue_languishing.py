@@ -5,6 +5,7 @@ import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from custodes_state_policy import StateEvent, classify_trigger, evaluate_state_event
 
@@ -46,7 +47,7 @@ def _insert_tts_instance(db_path: Path) -> str:
     return iid
 
 
-def test_queue_tts_languishing_emits_internal_state_label(app_env, monkeypatch) -> None:
+def test_queue_tts_languishing_emits_internal_state_label(app_env: Any, monkeypatch: Any) -> None:
     """Pause queue length > 5 emits an internal state label, not enforcement."""
     tts = _load_tts()
     iid = _insert_tts_instance(app_env.db_path)
@@ -58,6 +59,7 @@ def test_queue_tts_languishing_emits_internal_state_label(app_env, monkeypatch) 
 
     monkeypatch.setattr(tts, "_custodes_state_event_handler", fake_state_event)
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
     monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
     tts._tts_languishing_emit_latch.clear()
     tts.pause_queue.clear()
@@ -81,7 +83,7 @@ def test_queue_tts_languishing_emits_internal_state_label(app_env, monkeypatch) 
     assert kwargs["payload"]["threshold"] == 5
 
 
-def test_queue_tts_languishing_ignores_direct_hot_tts(app_env, monkeypatch) -> None:
+def test_queue_tts_languishing_ignores_direct_hot_tts(app_env: Any, monkeypatch: Any) -> None:
     """Direct hot TTS should not trip pause-queue languishing enforcement."""
     tts = _load_tts()
     iid = _insert_tts_instance(app_env.db_path)
@@ -93,6 +95,7 @@ def test_queue_tts_languishing_ignores_direct_hot_tts(app_env, monkeypatch) -> N
 
     monkeypatch.setattr(tts, "_custodes_state_event_handler", fake_state_event)
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
     tts._tts_languishing_emit_latch.clear()
     tts.pause_queue.clear()
     tts.hot_queue.clear()
@@ -106,6 +109,39 @@ def test_queue_tts_languishing_ignores_direct_hot_tts(app_env, monkeypatch) -> N
 
     assert len(tts.hot_queue) == 6
     assert calls == []
+
+
+def test_queue_tts_refuses_when_no_playback_target(app_env: Any, monkeypatch: Any) -> None:
+    """Do not accept queue work when routing resolves to backend:null."""
+    tts = _load_tts()
+    iid = _insert_tts_instance(app_env.db_path)
+    logs = []
+
+    async def fake_log_event(*args, **kwargs):
+        logs.append((args, kwargs))
+
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda: None)
+    monkeypatch.setattr(tts, "is_satellite_tts_available", lambda: False)
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda: False)
+    monkeypatch.setattr(tts, "_send_to_phone", None)
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: False)
+    monkeypatch.setattr(tts, "log_event", fake_log_event)
+    tts.pause_queue.clear()
+    tts.hot_queue.clear()
+
+    result = asyncio.run(tts.queue_tts(iid, "unplayable", queue_target="pause"))
+
+    assert result["success"] is False
+    assert result["queued"] is False
+    assert result["reason"] == "no_playback_target"
+    assert result["playback_target"] is None
+    assert len(tts.pause_queue) == 0
+    assert len(tts.hot_queue) == 0
+    assert [args[0] for args, _ in logs] == ["tts_enqueue_refused"]
+    refused_details = logs[0][1]["details"]
+    assert refused_details["reason"] == "no_playback_target"
+    assert refused_details["routing"]["device"] is None
 
 
 def test_tts_queue_languishing_is_internal_state_trigger() -> None:
@@ -378,7 +414,9 @@ def test_pause_queue_languishing_snapshot_expires_stale_held_items(monkeypatch) 
     assert sweep["per_item_events_logged"] == 1
 
 
-def test_languishing_alert_stop_tts_does_not_feed_pause_queue(app_env, monkeypatch) -> None:
+def test_languishing_alert_stop_tts_does_not_feed_pause_queue(
+    app_env: Any, monkeypatch: Any
+) -> None:
     """The autonomous alert response is logged but excluded from the alerted queue."""
     hooks = sys.modules["routes.hooks"]
     tts = _load_tts()
@@ -486,7 +524,9 @@ def test_tts_languishing_state_event_rechecks_live_queue_before_routing(
     assert result["live_tts_queue"]["pause_queue_length"] == 0
 
 
-def test_tts_languishing_state_event_drops_near_empty_live_queue(app_env, monkeypatch) -> None:
+def test_tts_languishing_state_event_drops_near_empty_live_queue(
+    app_env: Any, monkeypatch: Any
+) -> None:
     """A stale languishing payload must not page when the live pause queue has one item."""
     main = app_env.main
     tts = _load_tts()
