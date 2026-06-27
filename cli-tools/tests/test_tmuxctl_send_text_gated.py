@@ -157,3 +157,52 @@ def test_send_text_then_submit_keeps_enter_in_same_transaction(
         ["tmux", "send-keys", "-t", "%9", "C-m"],
         ["tmux", "send-keys", "-t", "%9", "C-m"],
     ]
+
+
+def test_send_text_then_submit_delays_submit_once_if_human_lock_appears_after_literal(
+    monkeypatch, captured_subprocess
+) -> None:
+    """A human ON/PENDING lock nullifies submit-transaction pierce.
+
+    The text+submit unit may pierce the daemon's own AGENT hold, but if a real
+    human lock appears after the literal text lands, the next submit key must
+    wait for that lock to clear and then continue once, in order, without
+    dropping or duplicating the held key.
+    """
+    _force_quiet(monkeypatch, False)
+    monkeypatch.delenv("TMUX_SEND_GATE_ALLOW", raising=False)
+    monkeypatch.setattr(tmux_adapter.time, "sleep", lambda _: None)
+
+    gate_active = {"value": False}
+    waits: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        send_gate, "typing_guard_active", lambda *, target=None: gate_active["value"]
+    )
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: gate_active["value"])
+
+    def _wait(args, **_kw):
+        waits.append(tuple(args))
+        gate_active["value"] = False
+        return True
+
+    monkeypatch.setattr(send_gate, "wait_for_gate_clear", _wait)
+
+    def _fake_run(cmd, *args, **kwargs):
+        captured_subprocess.append(cmd)
+        if cmd[1:5] == ["send-keys", "-t", "%9", "-l"]:
+            gate_active["value"] = True
+        return _FakeCompleted()
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", _fake_run)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    adapter.send_text_then_submit("%9", "brief for FG")
+
+    assert waits == [("send-keys", "-t", "%9", "C-m")]
+    sends = [c for c in captured_subprocess if c[1] == "send-keys"]
+    assert sends == [
+        ["tmux", "send-keys", "-t", "%9", "-l", "brief for FG"],
+        ["tmux", "send-keys", "-t", "%9", "C-m"],
+        ["tmux", "send-keys", "-t", "%9", "C-m"],
+    ]

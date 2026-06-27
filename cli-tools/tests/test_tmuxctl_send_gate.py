@@ -687,6 +687,29 @@ def test_tmuxctld_holder_override_cannot_pierce_human_lock(monkeypatch) -> None:
     assert result["ignored_override"] == "tmuxctld-send-holder"
 
 
+def test_submit_transaction_override_cannot_pierce_human_lock(monkeypatch) -> None:
+    """The adapter's text+submit override also yields to ON/PENDING.
+
+    The transaction override exists to keep submit keys behind the daemon's own
+    AGENT hold in the same text+submit unit.  It must not become a blanket
+    pierce after a human keystroke/backspace/Ctrl+C creates a real lock/pending
+    hold on the pane.
+    """
+    _force_quiet(monkeypatch, False)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: target == "%44")
+
+    with send_gate.thread_local_override("tmuxctl-submit-transaction"):
+        result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "delay"
+    assert result["suppressed"] is True
+    assert result["override"] is None
+    assert result["ignored_override"] == "tmuxctl-submit-transaction"
+
+
 def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> None:
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
@@ -700,4 +723,20 @@ def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> Non
     assert result["policy"] == "pierce"
     assert result["suppressed"] is False
     assert result["override"] == "tmuxctld-send-holder"
+    assert result["ignored_override"] is None
+
+
+def test_submit_transaction_override_can_pierce_agent_only_hold(monkeypatch) -> None:
+    _force_quiet(monkeypatch, False)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: False)
+
+    with send_gate.thread_local_override("tmuxctl-submit-transaction"):
+        result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "pierce"
+    assert result["suppressed"] is False
+    assert result["override"] == "tmuxctl-submit-transaction"
     assert result["ignored_override"] is None

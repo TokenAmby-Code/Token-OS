@@ -337,20 +337,21 @@ def test_mouse_bindings_never_reach_the_green_agent_guard_state() -> None:
     assert "select-pane -t =" in _line_starting("bind -n MouseDown1Pane ")
 
 
-def test_typing_guard_submit_and_backspace_use_one_pending_helper() -> None:
-    """Enter/C-m/Backspace variants use the same pending transition helper; only
-    the timeout differs. No @GUARD value may contain literal PENDING text."""
+def test_typing_guard_submit_backspace_and_ctrl_c_use_one_pending_helper() -> None:
+    """Enter/C-m/Backspace/Ctrl+C variants use the same pending transition
+    helper; only the timeout differs. No @GUARD value may contain literal
+    PENDING text."""
     conf = CONF.read_text(encoding="utf-8")
     assert "⌨ PENDING" not in conf
     for key in ("Enter", "C-m"):
         line = _line_starting(f"bind -n {key} ")
         assert "tmux-typing-guard-state pending --pane #{q:pane_id} --seconds 5" in line
         assert "send-keys" in line
-    for key in ("BSpace", "C-h"):
+    for key in ("BSpace", "C-h", "C-c"):
         line = _line_starting(f"bind -n {key} ")
         assert "tmux-typing-guard-state pending --pane #{q:pane_id} --seconds 15" in line
         assert "@TYPING_PENDING_UNTIL" in line
-        # Repeated Backspace while pending is the first branch and contains no helper call.
+        # Repeated Backspace/Ctrl+C while pending is the first branch and contains no helper call.
         pending_branch = line.split("} {")[0]
         assert "tmux-typing-guard-state" not in pending_branch
 
