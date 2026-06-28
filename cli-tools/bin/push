@@ -7,8 +7,11 @@ set -euo pipefail
 
 git push "$@"
 
+# Dev-server auto-boot is OFF by default (split-brain enforce/Pavlok safety — see
+# git-hooks/post-push). Only invoke the hook when explicitly armed; this is the
+# single shared chokepoint, so the gate here covers every worktree at once.
 hook_path="$(git rev-parse --git-path hooks/post-push 2>/dev/null || true)"
-if [[ -n "$hook_path" && -x "$hook_path" ]]; then
+if [[ "${WORKTREE_DEV_AUTOBOOT:-0}" == "1" && -n "$hook_path" && -x "$hook_path" ]]; then
     "$hook_path" || true
 fi
 
