@@ -96,7 +96,6 @@ def test_session_end_clears_input_lock(app_env, monkeypatch):
             ("claude-cmd", "locked-1"),
         )
         conn.commit()
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
     monkeypatch.setattr(hooks.subprocess, "Popen", lambda *a, **k: None)
 
     async def run():

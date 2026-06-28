@@ -177,7 +177,6 @@ def test_dispatched_null_doc_not_minted_on_prompt(app_env, monkeypatch) -> None:
 
 
 def _run_session_end(hooks, monkeypatch, session_id) -> dict:
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
     monkeypatch.setattr(hooks, "_schedule_naming_nudge", lambda *a, **k: None)
     monkeypatch.setattr(hooks.subprocess, "Popen", lambda *a, **k: None)
 

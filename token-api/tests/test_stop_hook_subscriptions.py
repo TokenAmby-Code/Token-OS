@@ -1018,27 +1018,28 @@ def test_mark_for_close_supports_banish(app_env: object, monkeypatch: object) ->
     assert row == ("stopped", "astartes", None)
 
 
-def test_mark_for_close_executor_invokes_tmuxctl_close_pane(
+def test_mark_for_close_executor_does_not_invoke_tmuxctl_close_pane(
     app_env: object, monkeypatch: object
 ) -> None:
+    """PHASE B sever: ``_close_tmux_pane_for_mark`` no longer reaches across to
+    invoke ``tmuxctl close-pane``. Pane teardown is owned solely by tmuxctld
+    (remain-on-exit + pane-died hook). The executor returns a non-failed
+    ``severed`` status so the downstream DB lifecycle retire still applies."""
     hooks = sys.modules["routes.hooks"]
     calls = []
 
-    class Proc:
-        returncode = 0
-        stdout = b'{"status":"closed","pane":"%105","method":"kill-pane"}'
-        stderr = b""
-
     async def fake_run(args, **kwargs):
         calls.append(tuple(args))
-        return Proc()
+        return None
 
     monkeypatch.setattr(hooks, "_run_subprocess_offloop", fake_run)
 
     result = asyncio.run(hooks._close_tmux_pane_for_mark("%105"))
 
-    assert result["status"] == "closed"
-    assert calls == [(str(hooks._tmuxctl_bin()), "close-pane", "--pane", "%105")]
+    assert calls == [], "token-api must make ZERO tmux kill decisions"
+    assert result["status"] == "severed"
+    assert result["status"] not in {"failed", "refused"}, "lifecycle retire must still apply"
+    assert result["pane"] == "%105"
 
 
 def test_mark_for_close_archive_fails_when_session_doc_row_missing(

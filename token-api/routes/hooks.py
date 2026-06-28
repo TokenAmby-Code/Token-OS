@@ -152,9 +152,9 @@ VALID_LAUNCH_INSTANCE_TYPES = {"golden_throne", "sync", "one_off", "hook_driven"
 
 # SessionEnd `reason` values that are NON-terminal: the wrapper is still alive
 # and a paired SessionStart re-fire follows in the SAME wrapper (plan-accept /
-# `/clear` / compaction). Tearing the row down on these (status=stopped +
-# _spawn_session_end_assertion, which unsets @INSTANCE_ID) destroys the
-# continuity stamp the re-fire needs to re-key — forcing a mint + orphan doc.
+# `/clear` / compaction). Marking the row `stopped` on these would race the
+# re-fire and drop the row out of active state mid-session — forcing a mint +
+# orphan doc when the paired SessionStart re-keys.
 # Everything else (logout, prompt_input_exit, bypass_permissions_disabled,
 # other, unknown/missing) keeps the full terminal teardown. Gate STRICTLY: an
 # unknown reason must fail closed to teardown, never silently preserve a row.
@@ -240,72 +240,12 @@ def _spawn_dev_server_stop(working_dir: str | None, session_id: str) -> None:
                 pass
 
 
-def _spawn_session_end_assertion(tmux_pane: str, session_id: str) -> None:
-    """Assert/prune a just-closed pane without blocking hook completion."""
-    if not tmux_pane:
-        return
-    tmuxctl = _tmuxctl_bin()
-    if not tmuxctl.exists():
-        logger.warning("Hook: SessionEnd assert skipped for %s — tmuxctl not found", tmux_pane)
-        return
-    code = r"""
-import os
-import subprocess
-import sys
-import time
-
-tmuxctl, pane, session_id = sys.argv[1:4]
-env = os.environ.copy()
-env.setdefault("IMPERIUM_TMUX_AUTOMATION", "1")
-try:
-    # Let the DB-triggered pane_state_queue publish its stopped state first;
-    # assert-instance then owns the final close-down cleanup and clears stale
-    # stopped/idle header chrome rather than racing the queue worker.
-    time.sleep(2)
-    proc = subprocess.run(
-        [tmuxctl, "assert-instance", "--pane", pane],
-        text=True,
-        capture_output=True,
-        timeout=75,
-        check=False,
-        env=env,
-    )
-    sys.stdout.write(proc.stdout)
-    sys.stderr.write(proc.stderr)
-    raise SystemExit(proc.returncode)
-except subprocess.TimeoutExpired as exc:
-    sys.stderr.write(f"SessionEnd assert-instance timeout pane={pane} session={session_id}: {exc}\n")
-    raise SystemExit(124)
-"""
-    log_path = Path("/tmp/session-end-assert-instance.log")
-    log_handle = None
-    try:
-        log_handle = log_path.open("a")
-        subprocess.Popen(
-            ["python3", "-c", code, str(tmuxctl), tmux_pane, session_id],
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=log_handle,
-            start_new_session=True,
-            close_fds=True,
-        )
-        logger.info(
-            "Hook: SessionEnd spawned assert-instance for %s (%s)",
-            tmux_pane,
-            session_id[:12],
-        )
-    except Exception as exc:
-        logger.warning(
-            "Hook: SessionEnd failed to spawn assert-instance for %s: %s",
-            tmux_pane,
-            exc,
-        )
-    finally:
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except Exception:
-                pass
+# NOTE: There is deliberately no SessionEnd → tmuxctl `assert-instance` helper
+# here. That COLD-path call (bypassing the daemon) reached across the boundary
+# from an instance-level hook into tmuxctld's pane-control domain and culled
+# live panes during plan-mode context-clears. SessionEnd now updates the
+# instance row and stops; pane/wrapper teardown is tmuxctld's job, driven by
+# wrapper-level signals only. See handle_session_end / handle_wrapper_end.
 
 
 # ============ Injected Dependencies ============
@@ -2024,32 +1964,18 @@ async def _cleanup_tmux_pane_runtime_stamps(pane: str) -> None:
 
 
 async def _close_tmux_pane_for_mark(pane: str | None) -> dict:
+    # Boundary doctrine (PHASE B sever): token-api makes ZERO tmux kill
+    # decisions. The mark-for-close stop-subscription still drives the DB
+    # lifecycle retire downstream, but it no longer reaches across to invoke
+    # `tmuxctl close-pane`. Pane teardown is owned solely by tmuxctld
+    # (remain-on-exit + pane-died hook), driven by the wrapper/process exiting —
+    # never by an instance-level lifecycle mark. The plumbing is left in place
+    # (callers still expect a result dict) and returns a non-failed status so the
+    # lifecycle retire applies; it simply does not touch tmux.
     pane = _normalize_text(pane)
     if not pane:
         return {"status": "skipped", "reason": "no_pane"}
-    try:
-        proc = await _run_subprocess_offloop(
-            (str(_tmuxctl_bin()), "close-pane", "--pane", pane),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=15,
-        )
-        stdout = proc.stdout.decode(errors="ignore").strip()
-        if stdout:
-            try:
-                payload = json.loads(stdout)
-                if isinstance(payload, dict):
-                    return payload
-            except json.JSONDecodeError:
-                pass
-        if proc.returncode != 0:
-            return {
-                "status": "failed",
-                "error": proc.stderr.decode(errors="ignore").strip() or "tmuxctl close-pane failed",
-            }
-        return {"status": "closed", "pane": pane, "method": "tmuxctl"}
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "failed", "error": str(exc)}
+    return {"status": "severed", "pane": pane, "reason": "tmux_teardown_owned_by_daemon"}
 
 
 def _resolve_session_doc_path(raw_path: str | None) -> Path | None:
@@ -2601,15 +2527,12 @@ async def handle_wrapper_end(payload: dict) -> dict:
                         wrapper_launch_id=wrapper_launch_id,
                     )
                     await db.commit()
-                    # The oracle already confirmed the pane is dead, so only the
-                    # WrapperEnd payload's torn-down pane is worth clearing.
-                    if tmux_pane:
-                        try:
-                            await asyncio.to_thread(
-                                shared.clear_pane_tint, tmux_pane, source="WrapperEnd"
-                            )
-                        except Exception:
-                            pass
+                    # Boundary doctrine: this instance-level hook updates the
+                    # instance row and stops. Pane teardown (tint clear, prune)
+                    # is tmuxctld's job, driven by wrapper-level signals — we do
+                    # not reach across to invoke tmuxctl pane-control here. The
+                    # liveness oracle consulted above is a daemon-mediated READ
+                    # informing an instance-domain decision, not pane-control.
     if refused_live_instance_id:
         details["refused_live_instance_id"] = refused_live_instance_id
         await log_event(
@@ -4215,40 +4138,17 @@ async def handle_session_end(payload: dict) -> dict:
         row = await cursor.fetchone()
 
         if not row:
-            fallback_pane = _normalize_text(
-                payload.get("pane_label")
-                or payload.get("tmux_pane")
-                or payload.get("env", {}).get("TMUX_PANE", "")
-            )
-            _spawn_session_end_assertion(fallback_pane, session_id)
             return {"success": False, "action": "not_found", "instance_id": session_id}
 
         is_subagent = row[2]
         session_doc_id = row[3]
-        # The oracle is the sole source of pane geometry: resolve the live pane +
-        # role from the instance's @INSTANCE_ID stamp for close-time cleanup.
-        _stop_pane, _stop_role = await shared.resolve_instance_pane(session_id)
-        _stop_pane_label = _normalize_text(_stop_role)
+        # Boundary doctrine: tmuxctld owns the wrapper/pane, token-api owns the
+        # instance row. SessionEnd is an instance-level signal — it updates the
+        # instance row and STOPS. It does not resolve pane geometry or reach
+        # across to invoke tmuxctl pane-control; pane teardown is tmuxctld's job.
         _prior_workflow_state = row[5]
         _gt_marker = row[6]
         _existing_status = row[7]
-        _existing_rank = row[8]
-        _engine = row[9] if len(row) > 9 else _normalize_text(payload.get("engine") or "")
-        _hook_driven = row[10] if len(row) > 10 else 0
-        _payload_instance_type = _normalize_text(
-            payload.get("instance_type")
-            or payload.get("env", {}).get("TOKEN_API_INSTANCE_TYPE", "")
-        )
-        _normalized_engine = _normalize_text(_engine or payload.get("engine") or "")
-        _has_payload_instance_type = bool(_payload_instance_type)
-        _is_codex_completed_one_off = (_normalized_engine == "codex") and (
-            _payload_instance_type == "one_off"
-            or (
-                not _has_payload_instance_type
-                and _gt_marker is None
-                and int(_hook_driven or 0) == 0
-            )
-        )
         _origin_type = row[11]
         _commander_type = row[12]
         _dispatch_session_doc_path = row[13]
@@ -4258,11 +4158,10 @@ async def handle_session_end(payload: dict) -> dict:
 
         # Layer 1 — non-terminal SessionEnd short-circuit (in-wrapper re-fire).
         # plan-accept / `/clear` / compaction fire SessionEnd→SessionStart inside
-        # the SAME wrapper. The default teardown below marks the row `stopped` and
-        # spawns _spawn_session_end_assertion, which (registry row now stopped →
-        # assert ok=False) unsets @INSTANCE_ID — destroying the continuity stamp
-        # the paired SessionStart needs to re-key, so it mints a new id + orphan
-        # doc. The wrapper is still alive: leave the row + stamp intact and let the
+        # the SAME wrapper. The default teardown below marks the row `stopped`,
+        # which races the paired SessionStart re-key and drops the row out of
+        # active state mid-session — so the re-fire mints a new id + orphan doc.
+        # The wrapper is still alive: leave the row + stamp intact and let the
         # re-fire adopt it (clean stamp path; Layer 2 is the backstop).
         if end_reason in NON_TERMINAL_SESSION_END_REASONS:
             await log_event(
@@ -4405,30 +4304,11 @@ async def handle_session_end(payload: dict) -> dict:
                 },
             )
 
-        try:
-            if _stop_pane:
-                await asyncio.to_thread(shared.clear_pane_tint, _stop_pane, source="SessionEnd")
-        except Exception as exc:
-            logger.warning(
-                "Hook: SessionEnd tint clear failed for %s: %s",
-                session_id[:12],
-                exc,
-            )
-
-        # Close-time pane cleanup is centralized through tmuxctl assertion:
-        # persona panes launch/reactivate/recolor (identity mismatches are
-        # diagnosed, not in-band patched), dead stack workers prune, and failed
-        # assertions clear stale overlays. Spawn bounded work out-of-band so the
-        # hook response is not held hostage by a relaunch.
-        if _is_codex_completed_one_off:
-            logger.info(
-                "Hook: SessionEnd preserving Codex one-off pane stamp for %s (%s)",
-                _stop_pane_label or _stop_pane,
-                session_id[:12],
-            )
-        else:
-            _spawn_session_end_assertion(_stop_pane_label or _stop_pane, session_id)
-
+        # Close-time pane cleanup (tint clear, dead-pane prune, persona
+        # reactivation) is deliberately NOT done here. SessionEnd is an
+        # instance-level signal; pane/wrapper teardown is tmuxctld's domain,
+        # driven by wrapper-level signals. token-api updates the instance row
+        # and stops — it never reaches across to invoke tmuxctl pane-control.
         if not is_subagent:
             _spawn_dev_server_stop(_working_dir, session_id)
 

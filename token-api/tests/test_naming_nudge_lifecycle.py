@@ -168,7 +168,6 @@ async def test_session_end_does_not_schedule_naming_nudge(app_env, monkeypatch) 
         ),
     )
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
 
     result = await hooks.handle_session_end(
         {"session_id": "sess-unnamed", "wrapper_launch_id": "wrap-2", "reason": "logout"}
@@ -434,9 +433,12 @@ async def test_codex_one_off_session_end_preserves_instance_stamp_resolution(
 ) -> None:
     """Completed Codex one-shots must keep the pane @INSTANCE_ID resolvable.
 
-    Regression: terminal SessionEnd spawned assert-instance; because the Codex
-    process had exited, stack-worker assertion pruned/cleared the pane stamp, so
-    tmuxctl resolve-instance failed immediately after completion.
+    Regression: terminal SessionEnd spawned the tmuxctl assert-instance COLD
+    path; because the Codex process had exited, stack-worker assertion
+    pruned/cleared the pane stamp, so resolve-instance failed immediately after
+    completion. The COLD path was severed entirely (boundary doctrine: SessionEnd
+    is instance-level and never reaches across to invoke tmuxctl pane-control),
+    so SessionEnd now spawns NO tmuxctl assertion and the stamp is never pruned.
     """
     hooks = sys.modules["routes.hooks"]
     now = datetime.now().isoformat()
@@ -466,8 +468,16 @@ async def test_codex_one_off_session_end_preserves_instance_stamp_resolution(
         )
         conn.commit()
 
-    spawned: list[tuple[str, str]] = []
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a: spawned.append(a))
+    # Record any tmuxctl / assert-instance subprocess SessionEnd might spawn.
+    tmuxctl_calls: list[tuple[str, ...]] = []
+
+    def _spy_popen(args, *_a, **_k):
+        argv = list(args) if isinstance(args, (list, tuple)) else [args]
+        if any("assert-instance" in str(x) or str(x).endswith("tmuxctl") for x in argv):
+            tmuxctl_calls.append(tuple(str(x) for x in argv))
+        return None
+
+    monkeypatch.setattr(hooks.subprocess, "Popen", _spy_popen)
     monkeypatch.setattr(hooks, "_schedule_naming_nudge", lambda *a, **k: None)
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
 
@@ -482,4 +492,6 @@ async def test_codex_one_off_session_end_preserves_instance_stamp_resolution(
     )
 
     assert result["action"] == "stopped"
-    assert spawned == []
+    # SessionEnd severed the tmuxctl assert-instance COLD path: no tmuxctl
+    # subprocess is spawned, so the completed one-shot's stamp is never pruned.
+    assert tmuxctl_calls == [], f"SessionEnd must not invoke tmuxctl: {tmuxctl_calls}"

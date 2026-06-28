@@ -52,7 +52,6 @@ async def test_session_end_spawns_dev_server_stop_for_dev_worktree(app_env, monk
             popen_calls.append((list(args), kwargs))
 
     monkeypatch.setattr(hooks.subprocess, "Popen", DummyPopen)
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
     monkeypatch.setattr(hooks, "_schedule_naming_nudge", lambda *a, **k: None)
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
 
@@ -86,7 +85,6 @@ async def test_session_end_does_not_spawn_dev_server_stop_for_subagent(
             popen_calls.append((args, kwargs))
 
     monkeypatch.setattr(hooks.subprocess, "Popen", DummyPopen)
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
     monkeypatch.setattr(hooks, "_schedule_naming_nudge", lambda *a, **k: None)
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
 
@@ -108,7 +106,6 @@ async def test_session_end_does_not_spawn_dev_server_stop_for_non_worktree(app_e
             popen_calls.append((args, kwargs))
 
     monkeypatch.setattr(hooks.subprocess, "Popen", DummyPopen)
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
     monkeypatch.setattr(hooks, "_schedule_naming_nudge", lambda *a, **k: None)
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", lambda *a, **k: None)
 
