@@ -2,11 +2,10 @@
 # post-push — local git hook installed per-worktree by worktree-setup.
 #
 # Git does not natively fire a post-push hook, so this script is invoked
-# explicitly by a wrapper alias. To install:
-#   - worktree-setup writes this file to .git/hooks/post-push (chmod +x)
-#   - shell wrapper (alias gp='git push "$@" && .git/hooks/post-push') runs it
-#     after a successful push, OR a `pre-push` hook in the same dir invokes it
-#     in its exit trap.
+# explicitly by the `push` cli-tool wrapper after a successful `git push`.
+# worktree-setup writes this file to .git/hooks/post-push, DISARMED (non-exec)
+# unless WORKTREE_DEV_AUTOBOOT=1; the `push` wrapper only runs it when it is both
+# armed and the same env gate is set. Plain `git push` / `gpush` never trigger it.
 #
 # Behavior:
 #   - Sources .worktree.env to learn $PORT (and optional $DEV_CMD)
@@ -16,6 +15,18 @@
 # Designed to fail loudly but never block the push (push already happened).
 
 set -uo pipefail
+
+# Kill-switch (default OFF). Worktree dev-server auto-boot is disabled unless
+# WORKTREE_DEV_AUTOBOOT=1. A worktree token-api boots the FULL app — including the
+# enforce loop, whose phone/Pavlok client always hits the real devices regardless
+# of which DB it reads. Against a stale/seeded .dev-agents.db it computes phantom
+# "break debt" and fires real notifications + Pavlok zaps (split-brain). The DB
+# guard below only protects the live agents.db; it does nothing for those side
+# effects. So auto-boot stays opt-in. Re-arm explicitly with WORKTREE_DEV_AUTOBOOT=1.
+if [[ "${WORKTREE_DEV_AUTOBOOT:-0}" != "1" ]]; then
+    echo "post-push: dev-server auto-boot disabled (set WORKTREE_DEV_AUTOBOOT=1 to enable) — skipping"
+    exit 0
+fi
 
 WORKTREE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
 [[ -z "$WORKTREE_ROOT" ]] && { echo "post-push: not in a git worktree, skipping"; exit 0; }

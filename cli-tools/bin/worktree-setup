@@ -665,8 +665,17 @@ if [[ -f "$_HOOKS_DIR/post-push" ]]; then
     if [[ -n "$HOOK_DIR" ]]; then
         mkdir -p "$HOOK_DIR"
         cat "$_HOOKS_DIR/post-push" > "$HOOK_DIR/post-push"
-        chmod +x "$HOOK_DIR/post-push"
-        log_success "Installed post-push hook at $HOOK_DIR/post-push"
+        # Install DISARMED by default. An armed hook auto-boots a worktree dev
+        # token-api on push, whose unguarded enforce loop fires real phone/Pavlok
+        # side effects off a stale DB (split-brain). Arm only when explicitly
+        # opted in via WORKTREE_DEV_AUTOBOOT=1; the push wrapper gates on this too.
+        if [[ "${WORKTREE_DEV_AUTOBOOT:-0}" == "1" ]]; then
+            chmod +x "$HOOK_DIR/post-push"
+            log_success "Installed post-push hook (armed) at $HOOK_DIR/post-push"
+        else
+            chmod -x "$HOOK_DIR/post-push" 2>/dev/null || true
+            log_info "Installed post-push hook DISARMED at $HOOK_DIR/post-push (set WORKTREE_DEV_AUTOBOOT=1 to arm)"
+        fi
     fi
 fi
 
