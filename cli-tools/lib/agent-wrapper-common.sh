@@ -137,6 +137,42 @@ token_wrapper_post_hook_async() {
   return 0
 }
 
+# Symmetric front-half of the WrapperEnd daemon ping. The tmuxctld daemon is the
+# authoritative registrar for the wrapper's tmux-side identity (stamp + persona
+# tint); this ping is what lets it stamp @TOKEN_API_WRAPPER_LAUNCH_ID and paint
+# the seat's persona tint at birth — derived from the durable @PANE_ID label, NOT
+# from @INSTANCE_ID, so a singleton seat is never tint-less in the window between
+# the prior WrapperEnd clearing the pane and the next SessionStart landing. The
+# belt-and-suspenders POST to token-api (token_wrapper_post_hook "WrapperStart")
+# still fires separately; this is the missing daemon leg of the dual-ping.
+# Fire-and-forget like its WrapperEnd mirror: a down/restarting daemon must never
+# block a launch, so we always return 0 and only tally the drop cause.
+token_wrapper_post_tmuxctld_wrapperstart() {
+  local payload="$1"
+  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+  local http_code rc
+  http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+    --connect-timeout "${TOKEN_WRAPPER_TMUXCTLD_CONNECT_TIMEOUT:-0.20}" \
+    --max-time "${TOKEN_WRAPPER_TMUXCTLD_MAX_TIME:-0.60}" \
+    -X POST "${tmuxctld_url%/}/hooks/wrapperstart" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null) && rc=0 || rc=$?
+
+  if [[ "$rc" -eq 0 && "$http_code" == 2* ]]; then
+    return 0
+  fi
+
+  local cause
+  case "$rc" in
+    7)  cause="conn-refused" ;;
+    28) cause="timeout" ;;
+    0)  cause="http-${http_code:-000}" ;;
+    *)  cause="other-rc${rc}" ;;
+  esac
+  token_wrapper_record_hook_failure "TmuxctldWrapperStart" "$cause"
+  return 0
+}
+
 token_wrapper_post_tmuxctld_wrapperend() {
   local payload="$1"
   local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
@@ -300,8 +336,13 @@ token_wrapper_enforce_stack_if_needed() {
 token_wrapper_start() {
   local start_payload
   start_payload="$(token_wrapper_build_payload "WrapperStart")"
+  # Dual-ping: token-api (instance/DB row registrar) AND the tmuxctld daemon
+  # (wrapper/stamp/tint registrar). Each is authoritative for its own system and
+  # belt-and-suspenders for the other. stamp_start runs the local fast-path stamp
+  # first; the daemon ping then re-affirms ownership and paints the persona tint.
   token_wrapper_post_hook "WrapperStart" "$start_payload"
   token_wrapper_stamp_start
+  token_wrapper_post_tmuxctld_wrapperstart "$start_payload"
 }
 
 token_wrapper_end() {

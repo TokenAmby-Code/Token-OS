@@ -912,6 +912,74 @@ def _h_hook_wrapperend(control, params):
     }
 
 
+def _h_hook_wrapperstart(control, params):
+    """Authoritative tmux-side wrapper registration at agent birth.
+
+    The symmetric front-half of :func:`_h_hook_wrapperend`. Token-API owns the
+    instance (DB row + ``@INSTANCE_ID``, stamped from SessionStart); tmuxctld owns
+    the wrapper's pane-local identity. So at wrapper start the daemon:
+
+    1. Stamps the wrapper-ownership id (``@TOKEN_API_WRAPPER_LAUNCH_ID``) so the
+       later WrapperEnd can always find + clear its own pane, even if the wrapper's
+       local stamp never landed.
+    2. Derives the persona from the pane's durable ``@PANE_ID`` label and paints
+       its tint immediately. This binds from the LABEL, not from ``@INSTANCE_ID``,
+       so a singleton seat (Custodes / Fabricator-General) is never left tint-less
+       in the window between WrapperEnd clearing the pane and the next
+       SessionStart/reconcile landing — the empty-stamp → no-tint root.
+
+    Fail-open and idempotent: a missing pane is a successful no-op (the wrapper
+    fires this best-effort; it must never block a launch).
+    """
+    from . import assertions
+
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
+    wrapper_launch_id = _s(params, "wrapper_launch_id") or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
+    if not wrapper_launch_id:
+        log.error("tmuxctld wrapperstart missing wrapper_launch_id pane=%s", pane)
+        raise ValueError("wrapper_launch_id required")
+
+    if pane and not _pane_exists_for_wrapperend(control, pane):
+        pane = ""
+    if not pane:
+        pane = _find_pane_by_wrapper_id(control, wrapper_launch_id)
+    if not pane:
+        return {
+            "status": "no_pane",
+            "wrapper_launch_id": wrapper_launch_id,
+            "pane": "",
+            "tint": "",
+        }
+
+    # (1) Daemon-authoritative wrapper-ownership stamp (idempotent).
+    control.adapter.run(
+        "set-option",
+        "-p",
+        "-t",
+        pane,
+        "@TOKEN_API_WRAPPER_LAUNCH_ID",
+        wrapper_launch_id,
+        allow_failure=True,
+    )
+
+    # (2) Persona tint from the durable pane label (no @INSTANCE_ID dependency).
+    pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
+    tint = ""
+    try:
+        tint = assertions.apply_persona_pane_tint(control.adapter, pane, pane_label) or ""
+    except Exception as exc:  # never let a tint failure break wrapper registration
+        log.warning("tmuxctld wrapperstart tint failed pane=%s label=%s: %s", pane, pane_label, exc)
+
+    return {
+        "status": "stamped",
+        "wrapper_launch_id": wrapper_launch_id,
+        "pane": pane,
+        "pane_label": pane_label,
+        "tint": tint,
+    }
+
+
 def _h_close_pane(control, params):
     return control.close_pane(_s(params, "pane"), timeout=_f(params, "timeout", 3.0))
 
@@ -1408,6 +1476,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/invoke-skill"): _h_invoke_skill,
     ("POST", "/assert-instance"): _h_assert_instance,
     ("POST", "/hooks/user-prompt-submit"): _h_hook_user_prompt_submit,
+    ("POST", "/hooks/wrapperstart"): _h_hook_wrapperstart,
     ("POST", "/hooks/wrapperend"): _h_hook_wrapperend,
     # Event-driven persona reconcile (replaces the retired 2-min assert-personas
     # poll). /reconcile re-seats all must-fill seats; /event ingests a single tmux
