@@ -459,11 +459,52 @@ def _h_instance_show_option(control, params):
 # -- Send + act (POST) ------------------------------------------------------
 
 
+def _refuse_send_into_human_lock(control, pane: str) -> str:
+    """Resolve ``pane`` and fail closed on a live HUMAN keystroke/pending lock.
+
+    The send gate honors a process-global ``TMUX_SEND_GATE_ALLOW`` sanctioned
+    override and yields it back to a human lock for ONLY the daemon's own two
+    thread-local holder reasons (``tmuxctld-send-holder`` /
+    ``tmuxctl-submit-transaction``). Every OTHER override reason — including the
+    process-global env override an enforce-action sets (e.g. token-api's
+    ``custodes_enforcement_deferred_timeout`` deferred-timeout Custodes nag) —
+    sails past the typing guard and pierces the Emperor's live keystroke lock at
+    this send-path chokepoint.
+
+    The daemon treats a human ON/PENDING lock as inviolable: no ambient override
+    may clobber active typing. This check reads ONLY the keystroke/pending hold
+    (``send_gate._pane_human_locked`` excludes the daemon's own green AGENT hold),
+    so the daemon's legitimate self-pierce of its AGENT marker is unaffected and
+    an OFF pane still sends. Raises :class:`TmuxSendGated` (zero bytes written,
+    re-queueable) when locked; returns the resolved physical pane id otherwise.
+    """
+    try:
+        phys = control.adapter._resolve_pane_target_arg(pane)
+    except Exception:
+        phys = pane
+    if send_gate._pane_human_locked(phys):
+        raise TmuxSendGated(
+            {
+                "suppressed": True,
+                "reason": "typing_guard",
+                "gate": "human_lock",
+                "policy": "cancel",
+                "target": phys,
+                "deferred": True,
+            }
+        )
+    return phys
+
+
 def _h_send_keys(control, params):
     pane = _s(params, "pane")
     command = _s(params, "command")
     from .occupancy import assert_dispatch_target_available, looks_like_dispatch_launcher_payload
 
+    # Inviolable human-lock fail-closed before any byte-bearing send: an ambient
+    # TMUX_SEND_GATE_ALLOW override (enforce-action / quiet-hours pierce) must
+    # never clobber active typing at this chokepoint.
+    _refuse_send_into_human_lock(control, pane)
     if looks_like_dispatch_launcher_payload(command):
         assert_dispatch_target_available(control.adapter, pane)
     if _b(params, "no_escape"):
@@ -570,11 +611,12 @@ def _h_send_text(control, params):
     # Resolve the physical pane id once for all guard + capture ops. tmux pane
     # options (@TYPING_*_UNTIL) and capture-pane key off the real %NN; the
     # caller-supplied id may be a canonical page:id. _resolve is a no-op on a raw
-    # %NN, so it is safe either way and tolerant of resolver failure.
-    try:
-        phys_pane = control.adapter._resolve_pane_target_arg(pane)
-    except Exception:
-        phys_pane = pane
+    # %NN, so it is safe either way and tolerant of resolver failure. The same
+    # resolution feeds the inviolable human-lock fail-closed: a live keystroke /
+    # pending lock gates the send NOW (zero bytes), immune to any ambient
+    # TMUX_SEND_GATE_ALLOW enforce-action override, and before we acquire our own
+    # AGENT hold over a pane the Emperor is typing into.
+    phys_pane = _refuse_send_into_human_lock(control, pane)
 
     # Fail closed before ANY byte-bearing send, including insert-only calls. If a
     # human/pending/other agent guard is already live, do not enter send_gate's
