@@ -68,6 +68,9 @@ def _run_start(tmp_path: pathlib.Path) -> tuple[subprocess.CompletedProcess[str]
     fake_tmux.chmod(0o755)
 
     fake_log = tmp_path / "tmux-calls.log"
+    fake_vault = tmp_path / "Imperium" / "Imperium-ENV"
+    (fake_vault / "Personas").mkdir(parents=True)
+    (fake_vault / "Terra").mkdir()
 
     env = {k: v for k, v in os.environ.items()}
     # `tx start` short-circuits when already inside tmux ($TMUX set); the test
@@ -76,6 +79,7 @@ def _run_start(tmp_path: pathlib.Path) -> tuple[subprocess.CompletedProcess[str]
     env["PATH"] = f"{stub}:{env['PATH']}"
     env["TX_FAKE_TMUX_LOG"] = str(fake_log)
     env["TX_INVOCATION_LOG"] = str(tmp_path / "tx-invocations.log")
+    env["TX_NAS_WAIT_PATH"] = str(fake_vault)
     env["IMPERIUM_MACHINE"] = "test"
 
     proc = subprocess.run(
@@ -140,4 +144,49 @@ def test_start_refuses_to_create_workspace_when_vault_unmounted(tmp_path: pathli
     assert proc.returncode == 1
     assert "refusing to build a ghost-town tmux workspace" in proc.stderr
     assert "Creating workspace session" not in proc.stderr
-    assert "has-session -t main" in fake_log.read_text()
+    assert not fake_log.exists()
+
+
+def test_start_rejects_invalid_nas_wait_timeout(tmp_path: pathlib.Path) -> None:
+    missing_vault = tmp_path / "Imperium" / "Imperium-ENV"
+
+    env = {k: v for k, v in os.environ.items()}
+    env.pop("TMUX", None)
+    env["TX_INVOCATION_LOG"] = str(tmp_path / "tx-invocations.log")
+    env["TX_NAS_WAIT_PATH"] = str(missing_vault)
+    env["TX_NAS_WAIT_TIMEOUT"] = "not-an-int"
+    env["IMPERIUM_MACHINE"] = "test"
+
+    proc = subprocess.run(
+        [str(TX), "start"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert proc.returncode == 1
+    assert "TX_NAS_WAIT_TIMEOUT must be a non-negative integer" in proc.stderr
+
+
+def test_start_rejects_zero_nas_wait_interval(tmp_path: pathlib.Path) -> None:
+    missing_vault = tmp_path / "Imperium" / "Imperium-ENV"
+
+    env = {k: v for k, v in os.environ.items()}
+    env.pop("TMUX", None)
+    env["TX_INVOCATION_LOG"] = str(tmp_path / "tx-invocations.log")
+    env["TX_NAS_WAIT_PATH"] = str(missing_vault)
+    env["TX_NAS_WAIT_TIMEOUT"] = "0"
+    env["TX_NAS_WAIT_INTERVAL"] = "0"
+    env["IMPERIUM_MACHINE"] = "test"
+
+    proc = subprocess.run(
+        [str(TX), "start"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert proc.returncode == 1
+    assert "TX_NAS_WAIT_INTERVAL must be a positive integer" in proc.stderr

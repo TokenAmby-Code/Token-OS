@@ -433,7 +433,7 @@ def test_restart_executor_does_not_fall_back_to_internal_pane_id() -> None:
     assert target == ""
 
 
-def test_dry_run_emits_deterministic_action_order():
+def test_dry_run_emits_deterministic_action_order() -> None:
     workspace = _workspace(_pane("%1", "somnium:NW", stamp_instance_id="abc12345"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
@@ -521,6 +521,16 @@ def test_restart_reaper_switches_stranded_stash_clients_before_killing_spinners(
     assert ("switch-client", "-c", "/dev/ttys003", "-t", "main") not in adapter.commands
     assert ("kill-session", "-t", "_stash") in adapter.commands
     assert ("kill-session", "-t", "_tmuxctl_restart") in adapter.commands
+    first_kill = min(
+        adapter.commands.index(("kill-session", "-t", "_stash")),
+        adapter.commands.index(("kill-session", "-t", "_tmuxctl_restart")),
+    )
+    assert (
+        adapter.commands.index(("switch-client", "-c", "/dev/ttys001", "-t", "main")) < first_kill
+    )
+    assert (
+        adapter.commands.index(("switch-client", "-c", "/dev/ttys002", "-t", "main")) < first_kill
+    )
     assert "_stash" not in adapter.sessions
     assert "_tmuxctl_restart" not in adapter.sessions
 

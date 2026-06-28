@@ -205,6 +205,14 @@ _tx_wait_for_vault_mount() {
 
     timeout="${TX_NAS_WAIT_TIMEOUT:-120}"
     interval="${TX_NAS_WAIT_INTERVAL:-2}"
+    if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
+        log_error "TX_NAS_WAIT_TIMEOUT must be a non-negative integer."
+        return 1
+    fi
+    if ! [[ "$interval" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "TX_NAS_WAIT_INTERVAL must be a positive integer."
+        return 1
+    fi
     waited=0
     log_warn "Imperium vault is not mounted at ${vault_path}; waiting before tmux workspace build."
 
@@ -452,14 +460,14 @@ cmd_start() {
         return 0
     fi
 
+    _tx_wait_for_vault_mount || return 1
+
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         ensure_workspace_before_attach "$SESSION_NAME"
         _tx_log_invocation "start" "attached" || true
         log_info "Attaching to existing session '${SESSION_NAME}'"
         exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$SESSION_NAME"
     fi
-
-    _tx_wait_for_vault_mount || return 1
 
     _tx_log_invocation "start" "attached" || true
     log_info "Creating workspace session '${SESSION_NAME}'"
