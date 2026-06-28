@@ -203,8 +203,13 @@ def _live_snapshot_candidates(
     live: list[InstanceRegistryEntry] = []
     now = datetime.now(UTC).isoformat()
     for pane in workspace.iter_panes():
+        # Unmanaged/transient panes can legitimately have no @PANE_ID. Skip them
+        # before canonicalizing; canonical_pane_role expects a non-empty string.
+        # A blank role is never restart intent, even if other pane metadata exists.
+        if not pane.pane_role or not pane.instance_id:
+            continue
         pane_label = canonical_pane_role(pane.pane_role)
-        if not pane_label or not pane.instance_id:
+        if not pane_label:
             continue
         base = registry_by_id.get(pane.instance_id)
         engine = _pane_engine(pane, base)

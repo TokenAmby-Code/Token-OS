@@ -191,6 +191,23 @@ def test_restart_plan_ignores_db_only_recent_stop_and_stale_activity():
     assert plan.resumes == ()
 
 
+def test_restart_plan_ignores_unmanaged_blank_pane_roles() -> None:
+    # Transient/unmanaged windows in the main session (e.g. stash/verify panes)
+    # can have no @PANE_ID. They must not crash restart planning.
+    workspace = _workspace(
+        _pane("%1", "somnium:N", stamp_instance_id="live"),
+        _pane("%2", None),  # type: ignore[arg-type]
+    )
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(_instance("live", "somnium:N", tmux_pane="%1"),),
+    )
+
+    plan = build_restart_plan(workspace, registry)
+
+    assert [(r.instance_id, r.pane_label) for r in plan.resumes] == [("live", "somnium:N")]
+
+
 def test_restart_plan_resumes_live_stopped_pane_and_continues_if_processing():
     workspace = _workspace(_pane("%2", "somnium:NE", stamp_instance_id="recent-stop"))
     registry = InstanceRegistrySnapshot(
