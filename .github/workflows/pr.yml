@@ -4,16 +4,18 @@ name: PR Gate (blocking)
 # Triggered on PR open / synchronize / reopen against main. Failures here
 # block merge via branch protection. CodeRabbit GitHub App handles the
 # assertive review (governed by .coderabbit.yaml in repo root) — this
-# workflow runs the deterministic gates: format, lint, typecheck, pytest.
+# workflow runs the fast deterministic gates: format, lint, typecheck.
 #
-# pytest is now a BLOCKING gate (the shadow-then-flip rollout completed). It runs
-# under pytest-xdist: token-api parallel (`-n auto --dist loadfile`, the long
-# pole) and cli-tools serial (its parallel "flakes" were CPU contention; its 3
-# CI-only failures were fixed in #320). Reliability was confirmed before the flip
-# via prod-gate.yml workflow_dispatch 10×10 green (randomized order each run).
-# The job name stays `quality` (already branch-protection-required), so the flip
-# needed no branch-protection edit. ROLLBACK: re-add `continue-on-error: true` to
-# the "Test (pytest)" step (one line) — never touch branch protection.
+# pytest does NOT run here. Per Emperor CI-policy decree, the heavyweight
+# regression suite was stripped from the dev PR->main hot path entirely: it wastes
+# Actions minutes and pollutes agent attention on every dev PR. The full suite is
+# preserved intact in prod-gate.yml and runs as the merge-to-prod gate (and
+# nightly) on the `prod` branch — NOT here. Do not re-add a pytest step to this
+# job. Authority model: dev = CodeRabbit + CD; prod = full regression suite.
+#
+# The job name stays `quality` (branch-protection-required on main). Branch
+# protection on main requires `quality` (this job) + `secrets-scan` + the
+# CodeRabbit commit status — unchanged by this strip.
 
 on:
   pull_request:
@@ -98,18 +100,9 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports .)
           fi
 
-      # BLOCKING: token-api runs first (long pole) parallel, cli-tools serial.
-      # ROLLBACK if a flake slips = re-add `continue-on-error: true` here (one
-      # line); never touch branch protection.
-      - name: Test (pytest)
-        run: |
-          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
-            (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --timeout=120 --tb=short)
-          fi
-          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
-            # -n0 overrides the addopts parallel default; cli-tools stays serial on CI (contended runner unverified for parallel).
-            (cd cli-tools && uv run --python 3.11 --group dev pytest -n0 --timeout=120 --tb=short)
-          fi
+      # NOTE: pytest intentionally does NOT run on the dev PR->main hot path.
+      # The full regression suite lives in prod-gate.yml (prod branch + nightly).
+      # See the header comment. Do not re-add a pytest step here.
 
       - name: CodeRabbit PR gate
         env:

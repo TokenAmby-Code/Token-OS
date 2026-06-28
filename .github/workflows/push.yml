@@ -90,19 +90,11 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports . 2>&1 | tail -100) || echo "::warning::mypy failed (token-api)"
           fi
 
-      - name: Test (pytest)
-        id: test
-        continue-on-error: true
-        run: |
-          # token-api runs parallel (already green on clean CI); cli-tools runs
-          # serial — its parallel flakes were CPU contention, not the bottleneck.
-          if [ -f token-api/pyproject.toml ] && [ -d token-api/tests ]; then
-            (cd token-api && uv run --python 3.11 --group dev pytest -n auto --dist loadfile --timeout=120 --tb=short) || echo "::warning::pytest failed (token-api)"
-          fi
-          if [ -f cli-tools/pyproject.toml ] && [ -d cli-tools/tests ]; then
-            # -n0 overrides the addopts parallel default; cli-tools stays serial on CI (contended runner unverified for parallel).
-            (cd cli-tools && uv run --python 3.11 --group dev pytest -n0 --timeout=120 --tb=short) || echo "::warning::pytest failed (cli-tools)"
-          fi
+      # NOTE: pytest intentionally does NOT run on the dev path (not even advisory).
+      # Per Emperor CI-policy decree the heavyweight regression suite was stripped
+      # from dev entirely — it wasted Actions minutes and polluted agent attention
+      # on every push. The full suite lives in prod-gate.yml (prod branch + nightly).
+      # Do not re-add a pytest step here.
 
       - name: CodeRabbit chill review
         id: cr
@@ -144,6 +136,5 @@ jobs:
             echo "| format-check | ${{ steps.fmt.outcome }} |"
             echo "| lint | ${{ steps.lint.outcome }} |"
             echo "| typecheck | ${{ steps.types.outcome }} |"
-            echo "| tests | ${{ steps.test.outcome }} |"
             echo "| coderabbit (chill) | ${{ steps.cr.outcome }} |"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -8,9 +8,9 @@ merge-triggered webhook that reaches the Mac over Tailscale.
 
 | Workflow | Trigger | Role |
 |---|---|---|
-| `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, pytest, chill CodeRabbit — all **non-blocking** annotations. pytest runs under `pytest-xdist -n auto --dist loadfile` (~7 min on a 10-core box vs ~20 min single-threaded). |
-| `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. **pytest is NOT yet on this hot path** — re-adding it as a blocking gate is the intended next step now that xdist makes it fast, but it is blocked on test-suite hermeticity (the suite still flakes under parallel execution). The full suite is preserved in `prod-gate.yml` and runs advisory in `push.yml`. |
-| `prod-gate.yml` — *Prod Gate (tests)* | PR/push → `prod`, `workflow_dispatch` | Full pytest suite under `pytest-xdist -n auto --dist loadfile`, RESERVED for the future prod-branch CI. Inert until a `prod` branch exists — never runs on PRs into `main`, so it can't block the hot path. Run on demand via the Actions tab. |
+| `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, chill CodeRabbit — all **non-blocking** annotations. **No pytest** — the regression suite was stripped from the dev path entirely (Emperor CI-policy decree); it lives only on `prod` (`prod-gate.yml`). |
+| `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. **pytest does NOT run on this hot path, by policy** — the heavyweight regression suite wastes Actions minutes and pollutes agent attention on every dev PR, so it was removed from dev entirely and reserved for `prod`. Do not re-add it here. |
+| `prod-gate.yml` — *Prod Gate (tests)* | PR/push → `prod`, nightly cron, `workflow_dispatch` | Full pytest suite — the **active** prod-branch regression gate (token-api runs parallel `pytest-xdist -n auto --dist loadfile`; cli-tools is forced serial `-n0` on CI — see "Running tests locally") (the `prod` branch now exists, created off the post-#420/#373 stable `main` HEAD). Runs as the merge-to-prod gate (PR → `prod`), post-merge (push → `prod`), nightly (08:00 UTC sweep of `prod`), and on demand. Never runs on PRs into `main`, so it can't block the dev hot path. To make it a *blocking* merge-to-prod gate, branch protection on `prod` must require the `tests` check. |
 | `secrets-scan.yml` | push/PR → `main` | Blocks on leaked IPs/secrets (patterns kept in repo secrets). |
 | `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD. Path-filter → changed-service list → Tailscale ephemeral node → POST `/api/cd/restart` on the Mac (ack-first). Post-merge restart + deployed smoke. |
 
@@ -31,8 +31,9 @@ session that shells out to it) gets the xdist speedup for free, no `-n` flag to 
 - **token-api** runs parallel everywhere — local *and* CI (the CI commands already pass
   `-n auto --dist loadfile` explicitly; the addopts is a harmless duplicate).
 - **cli-tools** runs parallel **locally** but is pinned **serial on CI** via an explicit
-  `pytest -n0 …` in all three workflows (the contended GH runner is unverified for
-  cli-tools parallel, so CI keeps the proven serial behavior).
+  `pytest -n0 …` in `prod-gate.yml` (now the only workflow that runs pytest — the
+  contended GH runner is unverified for cli-tools parallel, so CI keeps the proven
+  serial behavior).
 - To **debug**, disable parallelism with `pytest -n0` (required for `pdb`, `-s`, and
   reliable single-test runs). Removing the `addopts` line reverts that suite to
   serial-default — a local-only knob, independent of branch protection.
@@ -43,6 +44,14 @@ Required status checks: **`quality`** (pr.yml) + **`secrets-scan`**. The advisor
 push job is deliberately named `push-advisory` (not `quality`) so the required
 check is unambiguous — it also fires on the PR head-branch push and would
 otherwise collide by name.
+
+## Branch protection (prod)
+
+Authority model: **dev = CodeRabbit + CD; prod = full regression suite.** The
+`prod` branch carries the heavyweight pytest regression that `main` intentionally
+skips (`prod-gate.yml`). To make merge-to-prod *blocking*, configure branch
+protection on `prod` to require the **`tests`** check (the `prod-gate.yml` job) —
+this is a GitHub settings change, outside the repo, and needs admin.
 
 ## CD secrets (provisioned OUTSIDE the repo)
 

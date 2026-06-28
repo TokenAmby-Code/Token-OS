@@ -1,16 +1,27 @@
 name: Prod Gate (tests)
 
-# Full pytest suite — RESERVED for the future prod-branch CI.
+# Full pytest suite — the ACTIVE prod-branch regression gate.
 #
-# Background: pytest was stripped from the hot main-path gate (pr.yml's `quality`
-# job) so PRs reach `main` fast (Emperor-decreed CI-policy change). The tests were
-# NOT deleted or weakened — the complete suite lives here, intact, and will run as
-# a blocking gate on the prod branch once that branch exists.
+# Background: pytest was stripped from the dev hot path (pr.yml's `quality` job and
+# push.yml's advisory run) so PRs reach `main` fast and dev CI stays quiet
+# (Emperor-decreed CI-policy change). The tests were NOT deleted or weakened — the
+# complete suite lives here, intact, and is the heavyweight regression that `main`
+# intentionally skips. Authority model: dev = CodeRabbit + CD; prod = full
+# regression suite.
 #
-# Until a `prod` branch is created, the pull_request/push triggers below simply
-# never fire, so this workflow is inert on the hot path — it does not run on PRs
-# into `main` and cannot block them. It can be exercised on demand any time via
-# the Actions tab (workflow_dispatch) to confirm the suite still passes.
+# The `prod` branch now exists (created off the post-#420/#373 stable main HEAD),
+# so the triggers below are live:
+#   - pull_request -> prod   : the merge-to-prod gate (runs the full suite before
+#                              anything lands on prod).
+#   - push -> prod           : post-merge confirmation on prod.
+#   - schedule (nightly)     : daily regression sweep of `prod`, catching
+#                              environmental drift (dep updates, order-dependence)
+#                              even on days with no merge.
+#   - workflow_dispatch      : run on demand any time via the Actions tab.
+# It still never runs on PRs into `main`, so it cannot block the dev hot path.
+#
+# To make this a BLOCKING merge-to-prod gate, branch protection on `prod` must
+# require the `tests` check (configured in GitHub settings, outside this file).
 #
 # Runs under pytest-xdist (-n auto --dist loadfile) — parallelized across runner
 # cores so the full suite finishes in a few minutes instead of ~20 min serial.
@@ -21,6 +32,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [prod]
+  schedule:
+    # 08:00 UTC daily — nightly heavyweight regression on the prod branch.
+    - cron: "0 8 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -41,14 +55,22 @@ jobs:
     # Least-privilege: this job only checks out and runs pytest.
     permissions:
       contents: read
-    if: github.event.pull_request.draft == false
+    # `!= true` (not `== false`) so the job also runs on push/schedule/dispatch,
+    # where `github.event.pull_request` is null — only a draft PR is skipped.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.2
         with:
           fetch-depth: 0
+          # This job only checks out and runs pytest — no downstream git ops
+          # need the token, so don't persist it into git config.
+          persist-credentials: false
+          # schedule runs default to the repo default branch (main); pin the
+          # nightly sweep to `prod` so it tests the prod branch, not main.
+          ref: ${{ github.event_name == 'schedule' && 'prod' || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
