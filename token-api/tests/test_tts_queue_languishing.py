@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from custodes_state_policy import StateEvent, classify_trigger, evaluate_state_event
 
 
@@ -466,7 +468,7 @@ def test_pause_queue_languishing_snapshot_expires_stale_held_items(monkeypatch) 
     assert sweep["per_item_events_logged"] == 1
 
 
-def test_stale_pause_queue_backend_null_surfaces_alarm(monkeypatch) -> None:
+def test_stale_pause_queue_backend_null_surfaces_alarm(monkeypatch: pytest.MonkeyPatch) -> None:
     """Legacy backend:null items must surface loudly when discovered stale."""
     tts = _load_tts()
     logs = []

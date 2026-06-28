@@ -108,7 +108,7 @@ except ValueError:
 
 def init_deps(
     *, send_to_phone=None, custodes_state_event_handler=None, audio_proxy_health_checker=None
-):
+) -> None:
     """Receive dependencies from main.py to avoid circular imports.
 
     Called once during app startup, before any requests are served.

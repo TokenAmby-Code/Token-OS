@@ -20,6 +20,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 
 def _load_tts():
     token_api_dir = Path(__file__).resolve().parents[1]
@@ -105,7 +107,9 @@ def test_phone_first_regardless_of_geofence(monkeypatch) -> None:
         assert routing["device"] == "phone", (zone, routing)
 
 
-def test_coarse_phone_reachable_is_not_audio_proxy_reachable(monkeypatch) -> None:
+def test_coarse_phone_reachable_is_not_audio_proxy_reachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Regression: MacroDroid HTTP reachability alone must not route TTS to phone.
 
     The dead-audio-proxy failure had `phone_reachable=True` but
@@ -135,7 +139,9 @@ def test_coarse_phone_reachable_is_not_audio_proxy_reachable(monkeypatch) -> Non
     assert routing["phone_audio_proxy"]["reason"] == "audio_proxy_phone_disconnected"
 
 
-def test_audio_proxy_requires_fresh_receiver_heartbeat(monkeypatch) -> None:
+def test_audio_proxy_requires_fresh_receiver_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tts = _load_tts()
     monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: True)
     monkeypatch.setattr(tts, "_send_to_phone", lambda *a, **k: {"success": True})

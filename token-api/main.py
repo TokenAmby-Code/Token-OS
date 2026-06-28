@@ -18029,7 +18029,7 @@ async def audio_proxy_disconnect(request: AudioProxyDisconnectRequest):
 
 
 @app.post("/api/audio-proxy/heartbeat")
-async def audio_proxy_heartbeat(request: AudioProxyHeartbeatRequest):
+async def audio_proxy_heartbeat(request: AudioProxyHeartbeatRequest) -> dict:
     """Record a live heartbeat from the phone audio-proxy receiver."""
     check = check_audio_receiver_running()
     actual_running = bool(check.get("running", False))

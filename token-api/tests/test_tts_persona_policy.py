@@ -24,6 +24,9 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 
 def _load_tts():
@@ -154,7 +157,9 @@ def test_pause_policy_respects_caller_target(app_env, monkeypatch) -> None:
     assert pause_result["queue"] == "pause"
 
 
-def test_system_instance_enqueues_hot_custodes_voiced(app_env, monkeypatch) -> None:
+def test_system_instance_enqueues_hot_custodes_voiced(
+    app_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The synthetic ``system`` sender short-circuits the DB lookup to a fixed,
     always-resolved profile: Custodes-voiced (Microsoft George), hot policy. It
     enqueues to the hot queue WITHOUT any instance row — instance-less system pings

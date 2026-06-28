@@ -33,21 +33,18 @@ function makeFakePlayer() {
     play(resource) {
       this.playCalls.push(resource);
     },
+    // Real discord.js takes the player to Idle on stop(); mirror that so the
+    // in-flight playAudioNow promise resolves.
+    stop() {
+      this.emit('idle');
+    },
   };
 }
 
-test('two concurrent playAudio on one bot serialize via playChain (no overlap)', async () => {
-  const player = makeFakePlayer();
-  const fakeConnection = {
-    state: { status: 'ready' },
-    subscribe() {},
-    destroy() {},
-    receiver: { speaking: { on() {} } },
-  };
-
-  mock.module('@discordjs/voice', {
+function fakeDiscordVoiceExports(player, connection) {
+  return {
     namedExports: {
-      joinVoiceChannel: () => fakeConnection,
+      joinVoiceChannel: () => connection,
       entersState: async () => true,
       VoiceConnectionStatus: { Ready: 'ready' },
       AudioPlayerStatus: { Playing: 'playing', Idle: 'idle' },
@@ -56,17 +53,11 @@ test('two concurrent playAudio on one bot serialize via playChain (no overlap)',
       createAudioPlayer: () => player,
       createAudioResource: () => ({}),
     },
-  });
+  };
+}
 
-  const { createVoiceManager } = await import('./voice.js');
-
-  // playAudioNow requires the file to exist before it reaches player.play().
-  const fileA = join(tmpdir(), 'pra-playchain-a.pcm');
-  const fileB = join(tmpdir(), 'pra-playchain-b.pcm');
-  writeFileSync(fileA, 'x');
-  writeFileSync(fileB, 'x');
-
-  const botClient = {
+function fakeBotClient() {
+  return {
     client: {
       user: { id: 'bot' },
       guilds: {
@@ -78,31 +69,89 @@ test('two concurrent playAudio on one bot serialize via playChain (no overlap)',
       },
     },
   };
-  const voiceManager = createVoiceManager(
-    { mechanicus: botClient },
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 10));
+
+function makeReadyConnection() {
+  return {
+    state: { status: 'ready' },
+    subscribe() {},
+    destroy() {},
+    receiver: { speaking: { on() {} } },
+  };
+}
+
+// Each test imports voice.js under a unique query so it re-evaluates against its
+// own active mock — ESM caches modules by resolved URL, so two tests sharing
+// './voice.js' would otherwise both bind the first test's fake player.
+async function loadVoiceManager(player, tag) {
+  mock.module('@discordjs/voice', fakeDiscordVoiceExports(player, makeReadyConnection()));
+  const { createVoiceManager } = await import(`./voice.js?case=${tag}`);
+  const vm = createVoiceManager(
+    { mechanicus: fakeBotClient() },
     { guild_id: 'g', operator_user_id: 'op', voice_channels: { mechanicus: 'vc' } },
     { debug() {}, info() {}, warn() {}, error() {} },
   );
+  await vm.joinChannel('vc', 'mechanicus');
+  return vm;
+}
 
-  await voiceManager.joinChannel('vc', 'mechanicus');
+function tmpPcm(name) {
+  const path = join(tmpdir(), name);
+  writeFileSync(path, 'x'); // playAudioNow requires the file to exist before play()
+  return path;
+}
+
+test('two concurrent playAudio on one bot serialize via playChain (no overlap)', async () => {
+  const player = makeFakePlayer();
+  const vm = await loadVoiceManager(player, 'serialize');
+  const fileA = tmpPcm('pra-playchain-a.pcm');
+  const fileB = tmpPcm('pra-playchain-b.pcm');
 
   // Fire both plays at once. Neither auto-finishes; the fake player only goes Idle
   // when we emit it, so we can observe whether the second started early.
-  const first = voiceManager.playAudio(fileA, 'mechanicus');
-  const second = voiceManager.playAudio(fileB, 'mechanicus');
+  const first = vm.playAudio(fileA, 'mechanicus');
+  const second = vm.playAudio(fileB, 'mechanicus');
 
-  await new Promise((r) => setTimeout(r, 10));
+  await tick();
   // Only the first line may have reached player.play(); the second is parked.
   assert.equal(player.playCalls.length, 1, 'second play must wait for the first');
 
   player.emit('idle'); // first line finishes
   await first;
-  await new Promise((r) => setTimeout(r, 10));
+  await tick();
 
   // Now — and only now — the second line starts.
   assert.equal(player.playCalls.length, 2, 'second play runs after the first completes');
   player.emit('idle');
   await second;
+
+  mock.reset();
+});
+
+test('stopPlayback drains the queued backlog instead of resuming after Idle', async () => {
+  const player = makeFakePlayer();
+  const vm = await loadVoiceManager(player, 'stop');
+  const fileA = tmpPcm('pra-playchain-stop-a.pcm');
+  const fileB = tmpPcm('pra-playchain-stop-b.pcm');
+
+  const first = vm.playAudio(fileA, 'mechanicus');
+  const second = vm.playAudio(fileB, 'mechanicus');
+
+  await tick();
+  assert.equal(player.playCalls.length, 1, 'first line is playing, second queued');
+
+  // Stop while a backlog exists: it invalidates the queued generation AND takes the
+  // current line to Idle. The queued second line must be dropped, not played next.
+  vm.stopPlayback('mechanicus');
+  await first;
+
+  const secondResult = await second;
+  await tick();
+
+  assert.equal(player.playCalls.length, 1, 'queued line must NOT play after stop');
+  assert.equal(secondResult.skipped, true, 'queued line is dropped with skipped=true');
 
   mock.reset();
 });

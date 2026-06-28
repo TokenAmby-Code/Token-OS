@@ -8,6 +8,9 @@
     "start": "node daemon.js",
     "test": "node --test --experimental-test-module-mocks"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.19.2",

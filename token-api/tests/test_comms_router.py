@@ -124,7 +124,7 @@ def _recorders(monkeypatch, tts, *, enqueue_result=None, completion_outcome=None
     return calls
 
 
-def test_dispatch_notify_speaks_via_router_and_never_phone_direct(monkeypatch):
+def test_dispatch_notify_speaks_via_router_and_never_phone_direct(monkeypatch: Any) -> None:
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
     calls = _recorders(monkeypatch, tts)
@@ -133,9 +133,12 @@ def test_dispatch_notify_speaks_via_router_and_never_phone_direct(monkeypatch):
 
     # Spoken text went through the SINGLE gated queue (queue_tts), once, to hot.
     assert len(calls["enqueue"]) == 1
-    _iid, msg, queue_target = calls["enqueue"][0]
+    iid, msg, queue_target = calls["enqueue"][0]
     assert msg == "hello world"
     assert queue_target == "hot"
+    # Instance-less notify rides the synthetic ``system`` sender (not None): a
+    # regression to a bare None would still enqueue but break the contract.
+    assert iid == tts.SYSTEM_INSTANCE_ID
     # Tactile/banner reached the phone as device-control — but NEVER a tts_text.
     assert len(calls["phone"]) == 1
     _ep, params = calls["phone"][0]
@@ -193,7 +196,7 @@ def test_dispatch_notify_not_queued_fails_closed(monkeypatch: Any) -> None:
     assert result.get("tts", {}).get("reason") == "instance_not_found"
 
 
-def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch):
+def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch: Any) -> None:
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
     calls = _recorders(monkeypatch, tts)
@@ -207,7 +210,7 @@ def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch):
     assert params.get("banner_text") == "blocked"
 
 
-def test_dispatch_notify_suppressed_in_quiet_hours(monkeypatch):
+def test_dispatch_notify_suppressed_in_quiet_hours(monkeypatch: Any) -> None:
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: True)
     calls = _recorders(monkeypatch, tts)
@@ -437,22 +440,29 @@ def test_phone_playback_confirmed_when_callback_arrives(monkeypatch: Any) -> Non
 
     worker = threading.Thread(target=run)
     worker.start()
-    # Wait until the worker thread has registered its playback_id and is blocking.
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if sent_ids and sent_ids[0] in tts.pending_phone_playbacks:
-            break
-        time.sleep(0.01)
-    assert sent_ids, "phone never received a playback_id"
-    pid = sent_ids[0]
+    try:
+        # Wait until the worker thread has registered its playback_id and is blocking.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if sent_ids and sent_ids[0] in tts.pending_phone_playbacks:
+                break
+            time.sleep(0.01)
+        assert sent_ids, "phone never received a playback_id"
+        pid = sent_ids[0]
 
-    asyncio.run(tts.tts_playback_complete(tts.PlaybackCompleteRequest(playback_id=pid)))
-    worker.join(timeout=5)
+        asyncio.run(tts.tts_playback_complete(tts.PlaybackCompleteRequest(playback_id=pid)))
+        worker.join(timeout=5)
 
-    assert worker.is_alive() is False
-    assert holder["result"].get("success") is True
-    assert holder["result"].get("route") == "phone"
-    assert holder["result"].get("playback_confirmed") is True
+        assert worker.is_alive() is False
+        assert holder["result"].get("success") is True
+        assert holder["result"].get("route") == "phone"
+        assert holder["result"].get("playback_confirmed") is True
+    finally:
+        # Never leak the non-daemon worker if an assertion above fails while it is
+        # still parked on the watchdog: release any pending waiter and join.
+        for event in list(tts.pending_phone_playbacks.values()):
+            event.set()
+        worker.join(timeout=5)
 
 
 # ---------------- Router consolidation: notify.py delegates ----------------
