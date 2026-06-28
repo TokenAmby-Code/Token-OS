@@ -307,6 +307,10 @@ class WrapperStartAdapter:
         self.pane_label = "council:custodes"
         self.wrapper_owner = ""
         self.voice_lock = ""
+        # Owner reported by the list-panes -a fallback (the local fast-path stamp
+        # already on the pane), used when the payload omits tmux_pane so the
+        # handler must resolve via _find_pane_by_wrapper_id.
+        self.listed_owner = ""
         self.set_options: list[tuple[str, ...]] = []
 
     def list_sessions(self) -> list:
@@ -315,6 +319,8 @@ class WrapperStartAdapter:
     def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[:3] == ("display-message", "-t", "%42"):
             return "%42"
+        if args[:3] == ("list-panes", "-a", "-F"):
+            return f"%42__TMUXCTLD_WRAPPEREND_FIELD__{self.listed_owner}"
         if args[:1] == ("set-option",):
             self.set_options.append(tuple(args))
             if "@TOKEN_API_WRAPPER_LAUNCH_ID" in args:
@@ -360,6 +366,32 @@ def test_wrapperstart_stamps_wrapper_owner_and_paints_persona_tint() -> None:
         server.shutdown()
 
 
+def test_wrapperstart_resolves_pane_by_wrapper_id_when_payload_pane_missing() -> None:
+    # The hardening path: no tmux_pane in the payload (stale/missing TMUX_PANE),
+    # so _h_hook_wrapperstart must fall back to _find_pane_by_wrapper_id and still
+    # stamp + tint the resolved seat.
+    rec = WrapperStartAdapter()
+    rec.listed_owner = "wrap-10"  # local fast-path stamp already on %42
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperstart",
+            {"wrapper_launch_id": "wrap-10"},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "stamped"
+        assert payload["result"]["pane"] == "%42"  # resolved by wrapper id
+        assert rec.wrapper_owner == "wrap-10"  # re-affirmed by the daemon
+        assert payload["result"]["tint"] == "#302800"  # custodes tint still painted
+        tint_writes = [
+            opt for opt in rec.set_options if "window-style" in opt and "bg=#302800" in opt
+        ]
+        assert tint_writes, f"expected a custodes tint write, got {rec.set_options}"
+    finally:
+        server.shutdown()
+
+
 def test_wrapperstart_skips_tint_for_non_persona_pane() -> None:
     rec = WrapperStartAdapter()
     rec.pane_label = "mechanicus:3"  # a stack worker, not a tinted singleton seat
@@ -374,6 +406,9 @@ def test_wrapperstart_skips_tint_for_non_persona_pane() -> None:
         assert payload["result"]["status"] == "stamped"
         assert rec.wrapper_owner == "wrap-8"  # wrapper stamp still lands
         assert payload["result"]["tint"] == ""  # but no persona tint
+        # And no tmux styling was mutated — guards against a handler that paints
+        # but forgets to report the tint (mirrors the voice-lock coverage).
+        assert not [opt for opt in rec.set_options if "window-style" in opt]
     finally:
         server.shutdown()
 
