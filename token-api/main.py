@@ -721,6 +721,7 @@ class AudioProxyState(BaseModel):
     phone_connected: bool = False
     receiver_running: bool = False
     receiver_pid: int | None = None
+    last_heartbeat: str | None = None
     last_connect_time: str | None = None
     last_disconnect_time: str | None = None
 
@@ -750,6 +751,14 @@ class AudioProxyDisconnectRequest(BaseModel):
     source: str = "macrodroid"
 
 
+class AudioProxyHeartbeatRequest(BaseModel):
+    """Receiver heartbeat for the phone audio-proxy path."""
+
+    phone_device_id: str = "Token-S24"
+    receiver_pid: int | None = None
+    source: str = "macrodroid"
+
+
 class MediaPauseRequest(BaseModel):
     """Request from a desktop media pause key."""
 
@@ -762,6 +771,8 @@ class AudioProxyStatusResponse(BaseModel):
     phone_connected: bool
     receiver_running: bool
     receiver_pid: int | None = None
+    last_heartbeat: str | None = None
+    heartbeat_age_seconds: int | None = None
     last_connect_time: str | None = None
     last_disconnect_time: str | None = None
 
@@ -14483,6 +14494,7 @@ AUDIO_PROXY_STATE = {
     "phone_connected": False,
     "receiver_running": False,
     "receiver_pid": None,
+    "last_heartbeat": None,
     "last_connect_time": None,
     "last_disconnect_time": None,
 }
@@ -14611,6 +14623,47 @@ def check_audio_receiver_running() -> dict:
     return {"running": False, "pid": None}
 
 
+def _audio_proxy_heartbeat_age_seconds(now: datetime | None = None) -> int | None:
+    last = AUDIO_PROXY_STATE.get("last_heartbeat")
+    if not last:
+        return None
+    try:
+        seen = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if seen.tzinfo is not None:
+        seen = seen.astimezone().replace(tzinfo=None)
+    return max(0, int(((now or datetime.now()) - seen).total_seconds()))
+
+
+def get_audio_proxy_health() -> dict:
+    """Return receiver-level audio-proxy health for TTS routing.
+
+    TTS must not use the coarse phone HTTP reachability flag as an audio
+    predicate. This health object exposes the actual receiver signals the TTS
+    router validates: phone_connected, receiver_pid, receiver_running, and a
+    recent heartbeat timestamp.
+    """
+    check = check_audio_receiver_running()
+    actual_running = bool(check.get("running", False))
+    actual_pid = check.get("pid")
+
+    if actual_running != AUDIO_PROXY_STATE.get("receiver_running"):
+        AUDIO_PROXY_STATE["receiver_running"] = actual_running
+    if actual_pid != AUDIO_PROXY_STATE.get("receiver_pid"):
+        AUDIO_PROXY_STATE["receiver_pid"] = actual_pid
+
+    return {
+        "phone_connected": bool(AUDIO_PROXY_STATE.get("phone_connected")),
+        "receiver_running": actual_running,
+        "receiver_pid": actual_pid,
+        "last_heartbeat": AUDIO_PROXY_STATE.get("last_heartbeat"),
+        "heartbeat_age_seconds": _audio_proxy_heartbeat_age_seconds(),
+        "last_connect_time": AUDIO_PROXY_STATE.get("last_connect_time"),
+        "last_disconnect_time": AUDIO_PROXY_STATE.get("last_disconnect_time"),
+    }
+
+
 # [MOVED to enforcement_service.py] — close_distraction_windows, enforce_desktop_app, check_desktop_reachable
 from enforcement_service import (
     check_desktop_reachable,
@@ -14737,6 +14790,7 @@ from routes.tts import init_deps as tts_init_deps
 tts_init_deps(
     send_to_phone=_send_to_phone,
     custodes_state_event_handler=handle_custodes_state_event,
+    audio_proxy_health_checker=get_audio_proxy_health,
 )
 
 # Wire enforce dependencies (atomic emitter). The notify path is the unified
@@ -17803,6 +17857,10 @@ async def audio_proxy_connect(request: AudioProxyConnectRequest):
     if AUDIO_PROXY_STATE["phone_connected"]:
         # Verify receiver is actually running
         check = check_audio_receiver_running()
+        if check.get("running") and check.get("pid"):
+            AUDIO_PROXY_STATE["receiver_running"] = True
+            AUDIO_PROXY_STATE["receiver_pid"] = check.get("pid")
+            AUDIO_PROXY_STATE["last_heartbeat"] = datetime.now().isoformat()
         return AudioProxyConnectResponse(
             success=True,
             action="already_connected",
@@ -17819,6 +17877,7 @@ async def audio_proxy_connect(request: AudioProxyConnectRequest):
         AUDIO_PROXY_STATE["phone_connected"] = True
         AUDIO_PROXY_STATE["receiver_running"] = True
         AUDIO_PROXY_STATE["receiver_pid"] = result.get("pid")
+        AUDIO_PROXY_STATE["last_heartbeat"] = datetime.now().isoformat()
         AUDIO_PROXY_STATE["last_connect_time"] = datetime.now().isoformat()
 
         # Log event
@@ -17872,6 +17931,7 @@ async def audio_proxy_disconnect(request: AudioProxyDisconnectRequest):
     AUDIO_PROXY_STATE["phone_connected"] = False
     AUDIO_PROXY_STATE["receiver_running"] = False
     AUDIO_PROXY_STATE["receiver_pid"] = None
+    AUDIO_PROXY_STATE["last_heartbeat"] = None
     AUDIO_PROXY_STATE["last_disconnect_time"] = datetime.now().isoformat()
 
     # Log event
@@ -17886,6 +17946,44 @@ async def audio_proxy_disconnect(request: AudioProxyDisconnectRequest):
         "action": "disconnected",
         "stopped_count": result.get("stopped_count", 0),
         "message": "Audio proxy deactivated. Phone can reconnect to headphones.",
+    }
+
+
+@app.post("/api/audio-proxy/heartbeat")
+async def audio_proxy_heartbeat(request: AudioProxyHeartbeatRequest) -> dict:
+    """Record a live heartbeat from the phone audio-proxy receiver."""
+    check = check_audio_receiver_running()
+    actual_running = bool(check.get("running", False))
+    actual_pid = check.get("pid") or request.receiver_pid
+
+    AUDIO_PROXY_STATE["receiver_running"] = actual_running
+    AUDIO_PROXY_STATE["receiver_pid"] = actual_pid
+    if AUDIO_PROXY_STATE.get("phone_connected") and actual_running and actual_pid:
+        AUDIO_PROXY_STATE["last_heartbeat"] = datetime.now().isoformat()
+        return {
+            "success": True,
+            "phone_connected": True,
+            "receiver_running": True,
+            "receiver_pid": actual_pid,
+            "last_heartbeat": AUDIO_PROXY_STATE["last_heartbeat"],
+        }
+
+    await log_event(
+        "audio_proxy_heartbeat_unhealthy",
+        device_id=request.phone_device_id,
+        details={
+            "source": request.source,
+            "phone_connected": AUDIO_PROXY_STATE.get("phone_connected"),
+            "receiver_running": actual_running,
+            "receiver_pid": actual_pid,
+        },
+    )
+    return {
+        "success": False,
+        "phone_connected": bool(AUDIO_PROXY_STATE.get("phone_connected")),
+        "receiver_running": actual_running,
+        "receiver_pid": actual_pid,
+        "last_heartbeat": AUDIO_PROXY_STATE.get("last_heartbeat"),
     }
 
 
@@ -17910,6 +18008,8 @@ async def audio_proxy_status():
         phone_connected=AUDIO_PROXY_STATE["phone_connected"],
         receiver_running=actual_running,
         receiver_pid=actual_pid,
+        last_heartbeat=AUDIO_PROXY_STATE["last_heartbeat"],
+        heartbeat_age_seconds=_audio_proxy_heartbeat_age_seconds(),
         last_connect_time=AUDIO_PROXY_STATE["last_connect_time"],
         last_disconnect_time=AUDIO_PROXY_STATE["last_disconnect_time"],
     )

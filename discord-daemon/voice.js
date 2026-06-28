@@ -91,6 +91,8 @@ export function createVoiceManager(botClients, config, logger) {
         joining: false,
         player: null,       // AudioPlayer for playback
         playing: false,      // Currently playing audio
+        playChain: Promise.resolve(),  // per-bot playback mutex (serialize plays)
+        playGeneration: 0,   // bumped by stopPlayback to invalidate queued plays
         leaveTimer: null,
         routeEpoch: 0,
       });
@@ -891,8 +893,34 @@ export function createVoiceManager(botClients, config, logger) {
   /**
    * Play an audio file through a bot's voice connection.
    * Supports: WAV, MP3, OGG, AIFF, and raw PCM (s16le 48kHz mono).
+   *
+   * Serialized per bot via a promise-chain mutex: `playAudioNow` already awaits
+   * AudioPlayerStatus.Idle, but nothing stopped a SECOND concurrent caller from
+   * invoking `player.play()` mid-line on the shared player → two overlapping
+   * voices. Chaining each play behind the previous makes "one voice per bot"
+   * structurally true even if something bypasses the single server-side queue
+   * (defense-in-depth under PR A). playTTS routes through here too.
+   *
+   * `stopPlayback()` bumps `playGeneration`; a queued call captured under an older
+   * generation skips instead of starting, so "stop" drains the backlog (silence)
+   * rather than resuming with the next queued line after the forced Idle.
    */
   async function playAudio(filePath, botName = 'mechanicus') {
+    const state = getBotState(botName);
+    const generation = state.playGeneration;
+    const run = state.playChain.then(() => {
+      if (state.playGeneration !== generation) {
+        return { skipped: true, reason: 'stopped', file: filePath, botName };
+      }
+      return playAudioNow(filePath, botName);
+    });
+    // Keep the chain alive regardless of this call's success/failure so one
+    // rejected play never poisons subsequent plays.
+    state.playChain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  async function playAudioNow(filePath, botName = 'mechanicus') {
     const state = getBotState(botName);
     if (!connectionUsable(state)) {
       throw new Error(`Bot '${botName}' not connected to a voice channel`);
@@ -946,6 +974,11 @@ export function createVoiceManager(botClients, config, logger) {
 
   function stopPlayback(botName = 'mechanicus') {
     const state = getBotState(botName);
+    // Invalidate any queued plays so the backlog drains instead of resuming after
+    // the forced Idle, and reset the chain so the next play starts clean. "Stop"
+    // must mean silence, not "play the next queued line."
+    state.playGeneration += 1;
+    state.playChain = Promise.resolve();
     if (!state.player) return { stopped: false, reason: 'no player' };
     state.player.stop(true);
     state.playing = false;

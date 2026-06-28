@@ -6,7 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "node daemon.js",
-    "test": "node --test"
+    "test": "node --test --experimental-test-module-mocks"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "dependencies": {
     "@discordjs/opus": "^0.10.0",

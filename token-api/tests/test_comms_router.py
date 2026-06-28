@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -91,31 +94,51 @@ def test_notify_endpoint_surface(app_env):
 # ---------------- dispatch_notify core ----------------
 
 
-def _recorders(monkeypatch, tts, *, speak_result=None):
-    calls = {"speak": [], "phone": []}
+def _recorders(monkeypatch, tts, *, enqueue_result=None, completion_outcome=None):
+    """Record dispatch_notify's router calls.
 
-    def fake_speak_tts(message, voice=None, rate=0, instance_id=None, *a, **kw):
-        calls["speak"].append(message)
-        return speak_result or {"success": True, "route": "wsl", "method": "wsl_sapi"}
+    dispatch_notify no longer speaks directly — it enqueues via the single gated
+    queue (``queue_tts``) and awaits a completion future the worker resolves when
+    playback truly finishes. The fake records each enqueue and, when the enqueue
+    reports ``queued``, resolves the completion with a truthful
+    ``{success, route, audio_delivered}`` outcome so the awaited front door
+    unblocks instantly (no 90s ``wait_for`` hang). Tactile/banner still reach the
+    phone transport directly, but NEVER a ``tts_text`` payload.
+    """
+    calls = {"enqueue": [], "phone": []}
+    outcome = completion_outcome or {"success": True, "route": "phone", "audio_delivered": True}
+    enqueue_ret = enqueue_result or {"success": True, "queued": True}
+
+    async def fake_queue_tts(instance_id, message, queue_target="pause", completion=None):
+        calls["enqueue"].append((instance_id, message, queue_target))
+        if enqueue_ret.get("queued") and completion is not None and not completion.done():
+            completion.set_result(outcome)
+        return enqueue_ret
 
     def fake_send_to_phone(endpoint, params):
         calls["phone"].append((endpoint, dict(params or {})))
         return {"success": True}
 
-    monkeypatch.setattr(tts, "speak_tts", fake_speak_tts)
+    monkeypatch.setattr(tts, "queue_tts", fake_queue_tts)
     monkeypatch.setattr(tts, "_send_to_phone", fake_send_to_phone)
     return calls
 
 
-def test_dispatch_notify_speaks_via_router_and_never_phone_direct(monkeypatch):
+def test_dispatch_notify_speaks_via_router_and_never_phone_direct(monkeypatch: Any) -> None:
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
     calls = _recorders(monkeypatch, tts)
 
     result = asyncio.run(tts.dispatch_notify("hello world", vibe=30, banner="hi"))
 
-    # Spoken text went through the router (speak_tts → resolve_tts_device), once.
-    assert calls["speak"] == ["hello world"]
+    # Spoken text went through the SINGLE gated queue (queue_tts), once, to hot.
+    assert len(calls["enqueue"]) == 1
+    iid, msg, queue_target = calls["enqueue"][0]
+    assert msg == "hello world"
+    assert queue_target == "hot"
+    # Instance-less notify rides the synthetic ``system`` sender (not None): a
+    # regression to a bare None would still enqueue but break the contract.
+    assert iid == tts.SYSTEM_INSTANCE_ID
     # Tactile/banner reached the phone as device-control — but NEVER a tts_text.
     assert len(calls["phone"]) == 1
     _ep, params = calls["phone"][0]
@@ -130,44 +153,64 @@ def test_dispatch_notify_tts_failure_is_not_masked_by_tactile(monkeypatch: Any) 
 
     A successful banner/vibe leg must not recreate the false-success condition
     where /api/notify returns delivered:true while the TTS backend played nothing.
+    The line enqueues, but the worker resolves the completion with a dead-backend
+    outcome — that truthful failure must surface, not be masked by the tactile leg.
     """
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
     calls = _recorders(
         monkeypatch,
         tts,
-        speak_result={
-            "success": False,
-            "route": None,
-            "method": None,
-            "reason": "no_playback_backend",
-        },
+        completion_outcome={"success": False, "route": None, "audio_delivered": False},
     )
 
     result = asyncio.run(tts.dispatch_notify("hello world", vibe=30, banner="hi"))
 
-    assert calls["speak"] == ["hello world"]
+    assert len(calls["enqueue"]) == 1
     assert len(calls["phone"]) == 1
     assert result.get("delivered") is False
     assert result.get("audio_delivered") is False
     assert result.get("tactile", {}).get("success") is True
 
 
-def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch):
+def test_dispatch_notify_not_queued_fails_closed(monkeypatch: Any) -> None:
+    """An enqueue that is refused (e.g. instance_not_found) is truthful non-delivery.
+
+    queue_tts can decline to queue (no backend / persona_silent / instance_not_found).
+    dispatch_notify must NOT silent-direct-speak around that, and must report
+    audio_delivered=False with the refusal reason — never a false success.
+    """
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    calls = _recorders(
+        monkeypatch,
+        tts,
+        enqueue_result={"success": False, "queued": False, "reason": "instance_not_found"},
+    )
+
+    result = asyncio.run(tts.dispatch_notify("hello world", vibe=30))
+
+    assert len(calls["enqueue"]) == 1
+    assert result.get("delivered") is False
+    assert result.get("audio_delivered") is False
+    assert result.get("tts", {}).get("reason") == "instance_not_found"
+
+
+def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch: Any) -> None:
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
     calls = _recorders(monkeypatch, tts)
 
     asyncio.run(tts.dispatch_notify("", tts=False, vibe=30, banner="blocked"))
 
-    assert calls["speak"] == []
+    assert calls["enqueue"] == []
     assert len(calls["phone"]) == 1
     _ep, params = calls["phone"][0]
     assert "tts_text" not in params
     assert params.get("banner_text") == "blocked"
 
 
-def test_dispatch_notify_suppressed_in_quiet_hours(monkeypatch):
+def test_dispatch_notify_suppressed_in_quiet_hours(monkeypatch: Any) -> None:
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: True)
     calls = _recorders(monkeypatch, tts)
@@ -175,7 +218,7 @@ def test_dispatch_notify_suppressed_in_quiet_hours(monkeypatch):
     result = asyncio.run(tts.dispatch_notify("hi", vibe=30, banner="hi"))
 
     assert result.get("suppressed") is True
-    assert calls["speak"] == []
+    assert calls["enqueue"] == []
     assert calls["phone"] == []
 
 
@@ -184,6 +227,12 @@ def test_phone_direct_tts_only_occurs_inside_the_router(monkeypatch):
     router), reached only when resolve_tts_device selects the phone."""
     tts = _load("routes.tts")
     sent = []
+
+    # The phone leg now BLOCKS on the playback-complete callback (real audio-finish)
+    # up to PHONE_PLAYBACK_WATCHDOG_S. No callback fires in this structural test, so
+    # shrink the watchdog to keep it fast — a missed callback is still a success
+    # (playback_confirmed=False), which is exactly what this guard asserts.
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.05)
 
     def fake_send_to_phone(endpoint, params):
         sent.append((endpoint, dict(params or {})))
@@ -213,6 +262,9 @@ def test_discord_fallthrough_respects_geofence_phone_only(monkeypatch: Any) -> N
     tts = _load("routes.tts")
     sent = []
 
+    # Phone leg blocks on the playback-complete callback; shrink the watchdog so a
+    # missed callback in this structural test advances fast (see note above).
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.05)
     monkeypatch.setitem(tts.DESKTOP_STATE, "location_zone", "gym")
     monkeypatch.setattr(
         tts,
@@ -291,6 +343,126 @@ def test_retired_wsl_route_fails_closed_not_false_success(monkeypatch: Any) -> N
     assert result.get("route") is None
     assert result.get("reason") == "unknown_playback_backend"
     assert sent == []
+
+
+# ---------------- Phone playback-complete (real serialization signal) ----------------
+
+
+def test_playback_complete_sets_waiting_event() -> None:
+    """The phone callback sets the Event the worker thread blocks on.
+
+    This is the whole phone-leg serialization mechanism: ``_send_phone_tts`` parks
+    on a ``threading.Event`` keyed by ``playback_id`` until the device POSTs
+    /api/tts/playback-complete with that id. The endpoint must set exactly that
+    event and report a match.
+    """
+    tts = _load("routes.tts")
+    event = threading.Event()
+    tts.pending_phone_playbacks["pid-abc"] = event
+    try:
+        res = asyncio.run(
+            tts.tts_playback_complete(tts.PlaybackCompleteRequest(playback_id="pid-abc"))
+        )
+        assert res.get("matched") is True
+        assert event.is_set()
+    finally:
+        tts.pending_phone_playbacks.pop("pid-abc", None)
+
+
+def test_playback_complete_unknown_id_is_tolerated_and_warned(caplog: Any) -> None:
+    """An unknown/expired/duplicate id returns 200 + a warning — never errors the
+    phone, never silently swallows ([[no-suppress-debounce]])."""
+    tts = _load("routes.tts")
+    with caplog.at_level(logging.WARNING):
+        res = asyncio.run(
+            tts.tts_playback_complete(tts.PlaybackCompleteRequest(playback_id="ghost"))
+        )
+    assert res.get("success") is True
+    assert res.get("matched") is False
+    assert any("unknown/expired" in rec.getMessage() for rec in caplog.records)
+
+
+def test_phone_watchdog_advances_on_missed_callback(monkeypatch: Any, caplog: Any) -> None:
+    """A missed playback-complete callback must not wedge the worker: the watchdog
+    fires, logs, and advances with playback_confirmed=False (still a delivery)."""
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.05)
+    monkeypatch.setattr(
+        tts,
+        "resolve_tts_device",
+        lambda **kw: {"device": "phone", "reason": "geofence: gym", "discord_bot": None},
+    )
+    sent = []
+
+    def fake_send_to_phone(endpoint, params):
+        sent.append((endpoint, dict(params or {})))
+        return {"success": True}
+
+    monkeypatch.setattr(tts, "_send_to_phone", fake_send_to_phone)
+
+    with caplog.at_level(logging.WARNING):
+        result = tts.speak_tts("missed callback line")
+
+    assert result.get("success") is True
+    assert result.get("route") == "phone"
+    assert result.get("playback_confirmed") is False
+    # The phone was handed a playback_id to echo back.
+    assert any(p.get("playback_id") for _e, p in sent)
+    assert any("playback-complete callback missed" in rec.getMessage() for rec in caplog.records)
+    # The waiter id is always cleaned up (finally pop).
+    assert tts.pending_phone_playbacks == {}
+
+
+def test_phone_playback_confirmed_when_callback_arrives(monkeypatch: Any) -> None:
+    """When the device POSTs playback-complete, the blocked worker advances with
+    playback_confirmed=True — real audio-finish drives serialization, no estimate."""
+    tts = _load("routes.tts")
+    # Generous watchdog: the callback (not the watchdog) must be what releases it.
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 5)
+    monkeypatch.setattr(
+        tts,
+        "resolve_tts_device",
+        lambda **kw: {"device": "phone", "reason": "geofence: gym", "discord_bot": None},
+    )
+    sent_ids: list[str] = []
+
+    def fake_send_to_phone(endpoint, params):
+        if params and params.get("playback_id"):
+            sent_ids.append(params["playback_id"])
+        return {"success": True}
+
+    monkeypatch.setattr(tts, "_send_to_phone", fake_send_to_phone)
+
+    holder: dict[str, Any] = {}
+
+    def run():
+        holder["result"] = tts.speak_tts("confirmed line")
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        # Wait until the worker thread has registered its playback_id and is blocking.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if sent_ids and sent_ids[0] in tts.pending_phone_playbacks:
+                break
+            time.sleep(0.01)
+        assert sent_ids, "phone never received a playback_id"
+        pid = sent_ids[0]
+
+        asyncio.run(tts.tts_playback_complete(tts.PlaybackCompleteRequest(playback_id=pid)))
+        worker.join(timeout=5)
+
+        assert worker.is_alive() is False
+        assert holder["result"].get("success") is True
+        assert holder["result"].get("route") == "phone"
+        assert holder["result"].get("playback_confirmed") is True
+    finally:
+        # Never leak the non-daemon worker if an assertion above fails while it is
+        # still parked on the watchdog: release any pending waiter and join.
+        for event in list(tts.pending_phone_playbacks.values()):
+            event.set()
+        worker.join(timeout=5)
 
 
 # ---------------- Router consolidation: notify.py delegates ----------------

@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from custodes_state_policy import StateEvent, classify_trigger, evaluate_state_event
 
 
@@ -157,6 +159,43 @@ def test_queue_tts_refuses_when_no_playback_target(app_env: Any, monkeypatch: An
     refused_details = logs[0][1]["details"]
     assert refused_details["reason"] == "no_playback_target"
     assert refused_details["routing"]["device"] is None
+
+
+def test_queue_tts_refuses_coarse_phone_reachable_but_audio_proxy_dead(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    """Red regression: enqueue with backend null must return failure, not success."""
+    tts = _load_tts()
+    iid = _insert_tts_instance(app_env.db_path)
+
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda: None)
+    monkeypatch.setattr(tts, "is_satellite_tts_available", lambda: False)
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda: True)  # coarse flag lies
+    monkeypatch.setattr(tts, "_send_to_phone", lambda *a, **k: {"success": True})
+    monkeypatch.setattr(
+        tts,
+        "_audio_proxy_health_checker",
+        lambda: {
+            "phone_connected": False,
+            "receiver_running": False,
+            "receiver_pid": None,
+            "last_heartbeat": None,
+        },
+    )
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: False)
+    tts.pause_queue.clear()
+    tts.hot_queue.clear()
+
+    result = asyncio.run(tts.queue_tts(iid, "dies into backend null", queue_target="pause"))
+
+    assert result["success"] is False
+    assert result["queued"] is False
+    assert result["reason"] == "no_playback_target"
+    assert result["playback_target"] is None
+    assert result["routing"]["device"] is None
+    assert result["routing"]["phone_audio_proxy"]["reason"] == "audio_proxy_phone_disconnected"
+    assert len(tts.pause_queue) == 0
 
 
 def test_tts_queue_languishing_is_internal_state_trigger() -> None:
@@ -427,6 +466,47 @@ def test_pause_queue_languishing_snapshot_expires_stale_held_items(monkeypatch) 
     )
     assert "items" not in sweep
     assert sweep["per_item_events_logged"] == 1
+
+
+def test_stale_pause_queue_backend_null_surfaces_alarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy backend:null items must surface loudly when discovered stale."""
+    tts = _load_tts()
+    logs = []
+    state_events = []
+
+    async def fake_log_event(*args, **kwargs):
+        logs.append((args, kwargs))
+
+    async def fake_state_event(*args, **kwargs):
+        state_events.append((args, kwargs))
+        return {"received": True}
+
+    monkeypatch.setattr(tts, "log_event", fake_log_event)
+    monkeypatch.setattr(tts, "_custodes_state_event_handler", fake_state_event)
+    monkeypatch.setattr(tts, "TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS", 60)
+    monkeypatch.setattr(tts, "TTS_PAUSE_QUEUE_SWEEP_TTL_SECONDS", 0)
+    tts._last_pause_queue_expiry_sweep = 0.0
+    tts._tts_languishing_emit_latch.clear()
+    tts.pause_queue.clear()
+    tts.hot_queue.clear()
+
+    stale = tts.TTSQueueItem("old-iid", "old backend null", "Daniel", "none", "old-tab")
+    stale.playback_target = None
+    stale.queued_at = datetime.now() - timedelta(seconds=120)
+
+    async def drive():
+        async with tts.tts_queue_lock:
+            tts.pause_queue.append(stale)
+        return await tts.get_pause_queue_languishing_snapshot(threshold=1)
+
+    snapshot = asyncio.run(drive())
+
+    assert snapshot["expired_count"] == 1
+    assert any(args[0] == "tts_backend_null_queue_stale" for args, _ in logs)
+    alarm_args, alarm_kwargs = state_events[0]
+    assert alarm_args == ("tts_backend_null_queue_stale", "tts_queue")
+    assert alarm_kwargs["severity"] == 4
+    assert alarm_kwargs["payload"]["backend_null_count"] == 1
 
 
 def test_languishing_alert_stop_tts_does_not_feed_pause_queue(
