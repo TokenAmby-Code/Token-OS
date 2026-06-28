@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 import pytest
 import tmuxctl.send_gate as send_gate
 import tmuxctl.tmux_adapter as tmux_adapter
+import tmuxctl.typing_guard_state as typing_guard_state
 from tmuxctl.tmux_adapter import TmuxAdapter
 
 
@@ -539,6 +540,92 @@ def test_wait_for_gate_clear_releases_promptly_when_lock_cleared_early(
     )
 
 
+def test_backspace_pending_followup_keystroke_rearms_and_flushes_held_send_once(
+    monkeypatch: pytest.MonkeyPatch, fake_clock: dict
+) -> None:
+    """Exact one-shot wedge: key -> BACKSPACE pending -> key must leave pending.
+
+    A held automated send starts while the pane is in the 15s Backspace PENDING
+    hold.  On the first wait wake, a follow-up human keystroke arrives.  That
+    keystroke must convert PENDING back to a real ON lock; then the held send
+    releases exactly once when that ON lock expires.  The regression was that
+    ``arm()`` preserved PENDING, so the send stayed behind the stale Backspace
+    pending hold instead of the fresh keystroke lock.
+    """
+    _force_quiet(monkeypatch, False)
+    _no_override(monkeypatch)
+    pane = "%9"
+    state: dict[str, str] = {}
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            proc = _FakeCompleted()
+            if args and args[0] == "show-options":
+                proc.stdout = state.get(args[-1], "")
+                return proc
+            if args[:2] == ("set-option", "-p"):
+                state[args[-2]] = args[-1]
+                return proc
+            if args[:2] == ("set-option", "-pu"):
+                state.pop(args[-1], None)
+                return proc
+            return proc
+
+    fake_tmux = FakeTmux()
+    typing_guard_state.arm(fake_tmux, pane, seconds=300, now=int(fake_clock["now"]))
+    typing_guard_state.pending(fake_tmux, pane, seconds=15, now=int(fake_clock["now"]))
+    assert typing_guard_state.PENDING_OPTION in state
+    assert typing_guard_state.LOCK_OPTION not in state
+
+    monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+
+    actual_sends: list[list[str]] = []
+
+    def _fake_subprocess_run(cmd, *args, **kwargs):
+        proc = _FakeCompleted()
+        if "show-options" in cmd:
+            option = cmd[-1]
+            tmux_option = {
+                send_gate._TYPING_LOCK_OPTION: typing_guard_state.LOCK_OPTION,
+                send_gate._TYPING_PENDING_OPTION: typing_guard_state.PENDING_OPTION,
+                send_gate._TYPING_AGENT_OPTION: typing_guard_state.AGENT_OPTION,
+            }.get(option)
+            proc.stdout = state.get(tmux_option or "", "")
+            return proc
+        if len(cmd) >= 2 and cmd[1:] == ["send-keys", "-t", pane, "-l", "HELD_ONCE"]:
+            actual_sends.append(cmd)
+            return proc
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(send_gate.subprocess, "run", _fake_subprocess_run)
+    sleeps: list[float] = []
+    keystroke_rearmed = False
+
+    def _sleep(seconds: float) -> None:
+        nonlocal keystroke_rearmed
+        sleeps.append(seconds)
+        fake_clock["now"] += seconds
+        if not keystroke_rearmed:
+            keystroke_rearmed = True
+            typing_guard_state.arm(
+                fake_tmux,
+                pane,
+                seconds=2,
+                now=int(fake_clock["now"]),
+            )
+
+    monkeypatch.setattr(send_gate.time, "sleep", _sleep)
+
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    adapter.run("send-keys", "-t", pane, "-l", "HELD_ONCE")
+
+    assert state.get(typing_guard_state.PENDING_OPTION) is None
+    assert int(state[typing_guard_state.LOCK_OPTION]) <= int(fake_clock["now"])
+    assert sum(sleeps) <= 4, "follow-up keystroke re-arm must avoid waiting out stale pending"
+    assert len(actual_sends) == 1
+
+
 def test_wait_for_gate_clear_honors_delay_timeout(
     monkeypatch: pytest.MonkeyPatch, fake_clock: dict
 ) -> None:
@@ -687,6 +774,31 @@ def test_tmuxctld_holder_override_cannot_pierce_human_lock(monkeypatch) -> None:
     assert result["ignored_override"] == "tmuxctld-send-holder"
 
 
+def test_submit_transaction_override_cannot_pierce_human_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The adapter's text+submit override also yields to ON/PENDING.
+
+    The transaction override exists to keep submit keys behind the daemon's own
+    AGENT hold in the same text+submit unit.  It must not become a blanket
+    pierce after a human keystroke/backspace/Ctrl+C creates a real lock/pending
+    hold on the pane.
+    """
+    _force_quiet(monkeypatch, False)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: target == "%44")
+
+    with send_gate.thread_local_override("tmuxctl-submit-transaction"):
+        result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "delay"
+    assert result["suppressed"] is True
+    assert result["override"] is None
+    assert result["ignored_override"] == "tmuxctl-submit-transaction"
+
+
 def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> None:
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
@@ -700,4 +812,22 @@ def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> Non
     assert result["policy"] == "pierce"
     assert result["suppressed"] is False
     assert result["override"] == "tmuxctld-send-holder"
+    assert result["ignored_override"] is None
+
+
+def test_submit_transaction_override_can_pierce_agent_only_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_quiet(monkeypatch, False)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: False)
+
+    with send_gate.thread_local_override("tmuxctl-submit-transaction"):
+        result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "pierce"
+    assert result["suppressed"] is False
+    assert result["override"] == "tmuxctl-submit-transaction"
     assert result["ignored_override"] is None

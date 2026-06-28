@@ -74,6 +74,17 @@ _SEND_GATE_ALLOW_ENV = "TMUX_SEND_GATE_ALLOW"
 _SEND_GATE_POLICY_ENV = "TMUX_SEND_GATE_POLICY"
 _SEND_GATE_POLICIES = frozenset({"delay", "cancel", "pierce"})
 _SEND_GATE_DELAY_TIMEOUT_ENV = "TMUX_SEND_GATE_DELAY_TIMEOUT"  # unset/0 = no timeout
+_HUMAN_LOCK_YIELDING_OVERRIDES = frozenset(
+    {
+        # tmuxctld may pierce only its own green AGENT hold.
+        "tmuxctld-send-holder",
+        # Adapter-local text+submit transaction may pierce only non-human holds
+        # (normally that same AGENT hold).  If the Emperor typed or pended the
+        # pane after text landed, submit/recovery keys must queue behind the
+        # human lock instead of clobbering it.
+        "tmuxctl-submit-transaction",
+    }
+)
 
 # Per-pane keystroke-anchored typing lock. The tmux root-table any-key binding
 # (cli-tools/tmux/tmux-base.conf) stamps this pane option with an ABSOLUTE expiry
@@ -682,16 +693,17 @@ def evaluate(
         return None
 
     reason = "quiet_hours" if quiet else "typing_guard"
-    # tmuxctld sets this only around the daemon's own green AGENT hold so its
-    # first byte can pass the state-blind gate it just raised.  If a real human
-    # ON/PENDING lock is present, ignore that override: human typing beats the
-    # daemon hold.  This closes the mid-transaction clobber where a later C-m
-    # pierced through a human keystroke lock because the request thread still
-    # carried "tmuxctld-send-holder".
+    # tmuxctld/adapter set these overrides only around their own non-human
+    # transaction holds so the bytes they deliberately serialized are not
+    # blocked by the state-blind AGENT gate.  If a real human ON/PENDING lock is
+    # present, ignore those overrides: human typing beats the daemon hold.  This
+    # closes the mid-transaction clobber where a later C-m pierced through a
+    # human keystroke/pending lock because the request thread still carried a
+    # send-holder or submit-transaction override.
     effective_override = override
     if (
         reason == "typing_guard"
-        and override == "tmuxctld-send-holder"
+        and override in _HUMAN_LOCK_YIELDING_OVERRIDES
         and target
         and _pane_human_locked(target)
     ):

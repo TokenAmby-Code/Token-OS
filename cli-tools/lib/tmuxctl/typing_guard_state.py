@@ -176,16 +176,18 @@ def arm(
 ) -> None:
     """Move OFF -> ON for a genuine human keystroke.
 
-    Existing human ON/PENDING state is preserved, not refreshed.  An AGENT hold
-    is different: it is only a daemon serialization marker, not permission to
-    ignore a later human keystroke.  If the Emperor types while a daemon send is
-    holding the pane green, the human keystroke wins immediately: clear the
-    agent marker and stamp the real keystroke lock.  This prevents the daemon's
-    thread-local "I own my green hold" override from turning into a blanket
-    license to clobber active typing.
+    Existing human ON state is preserved, not refreshed.  PENDING is different:
+    it is a short post-submit/backspace/interruption hold, not permission to
+    wedge future composition.  If a real follow-up keystroke arrives while
+    PENDING is live, the keystroke wins immediately and re-arms ON by clearing
+    the stale pending hold and stamping the real keystroke lock.  AGENT is also
+    cleared on a human keystroke; it is only a daemon serialization marker, not
+    permission to ignore later typing.  This prevents both stale PENDING and the
+    daemon's thread-local "I own my green hold" override from turning into a
+    blanket license to clobber or wedge active typing.
     """
     state = live_state(tmux, pane, now=now)
-    if state in {"on", "pending"}:
+    if state == "on":
         publish(tmux, pane, state)
         return
     mark_client_activity(client=client, term=term, pid=pid, session=session)
