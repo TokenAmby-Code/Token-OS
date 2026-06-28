@@ -191,7 +191,7 @@ def test_restart_plan_ignores_db_only_recent_stop_and_stale_activity():
     assert plan.resumes == ()
 
 
-def test_restart_plan_ignores_unmanaged_blank_pane_roles():
+def test_restart_plan_ignores_unmanaged_blank_pane_roles() -> None:
     # Transient/unmanaged windows in the main session (e.g. stash/verify panes)
     # can have no @PANE_ID. They must not crash restart planning.
     workspace = _workspace(
