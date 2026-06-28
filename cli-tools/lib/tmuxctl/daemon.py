@@ -499,7 +499,10 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
         # Resolution genuinely failed: we cannot key the lock read on the physical
         # %NN, and falling back to the canonical id would silently miss the lock and
         # pierce. Fail closed (zero bytes, re-queueable) rather than risk clobbering
-        # active typing.
+        # active typing. Log the raw cause SERVER-SIDE only; the gate payload rides
+        # back to the caller, so it must not leak resolver internals — gate
+        # ``pane_unresolved`` is enough to distinguish the fail-closed case.
+        log.warning("tmuxctld: pane resolution failed for %s; failing closed: %s", pane, exc)
         raise TmuxSendGated(
             {
                 "suppressed": True,
@@ -508,7 +511,6 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
                 "policy": "cancel",
                 "target": pane,
                 "deferred": True,
-                "resolve_error": str(exc),
             }
         ) from exc
     if send_gate._pane_human_locked(phys):
