@@ -30,6 +30,42 @@ async def test_personas_seed_and_schema_constraints(app_env):
 
 
 @pytest.mark.asyncio
+async def test_tts_policy_seeded_per_persona_deny_by_default(app_env):
+    """``personas.tts_policy`` is seeded with deny-by-default semantics: Custodes is
+    ``hot``, voiced Astartes are ``pause``, and every voiceless persona (FG,
+    mechanicus, mechanicus-worker, primarchs, civic seats) is ``silent``."""
+    expected = {
+        "custodes": "hot",
+        "blood-angels": "pause",
+        "ultramarines": "pause",
+        "salamanders": "pause",
+        "imperial-fists": "pause",
+        "raven-guard": "pause",
+        "space-wolves": "pause",
+        "dark-angels": "pause",
+        "white-scars": "pause",
+        "deathwatch": "pause",
+        "fabricator-general": "silent",
+        "administratum": "silent",
+        "mechanicus": "silent",
+        "mechanicus-worker": "silent",
+        "pax": "silent",
+        "orchestrator": "silent",
+        "agentic-worker": "silent",
+    }
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = {
+            row["slug"]: row["tts_policy"]
+            for row in conn.execute("SELECT slug, tts_policy FROM personas").fetchall()
+        }
+    for slug, policy in expected.items():
+        assert rows.get(slug) == policy, f"{slug} expected {policy}, got {rows.get(slug)!r}"
+    # Deny-by-default: no seeded persona may carry a NULL/unknown policy.
+    assert all(policy in ("silent", "hot", "pause") for policy in rows.values())
+
+
+@pytest.mark.asyncio
 async def test_pax_overseer_seed_resolves_silent_civic_seat(app_env):
     # Pax is the civic overseer seat on the council page: a non-40k civic overseer
     # singleton (the combined Custodes+Administratum interaction/record-keeper).
