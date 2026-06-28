@@ -243,7 +243,9 @@ def test_wrapper_launch_id_blank_does_not_adopt(app_env, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_clear_session_end_preserves_row_and_skips_tmuxctl(app_env, monkeypatch):
+def test_clear_session_end_preserves_row_and_skips_tmuxctl(
+    app_env: object, monkeypatch: object
+) -> None:
     """reason='clear' is non-terminal: the row stays live and no tmuxctl
     pane-control is invoked. RED before #198: the row went stopped.
     """
@@ -259,7 +261,9 @@ def test_clear_session_end_preserves_row_and_skips_tmuxctl(app_env, monkeypatch)
     assert calls == [], f"non-terminal clear must not invoke tmuxctl: {calls}"
 
 
-def test_compact_session_end_preserves_row_and_skips_tmuxctl(app_env, monkeypatch):
+def test_compact_session_end_preserves_row_and_skips_tmuxctl(
+    app_env: object, monkeypatch: object
+) -> None:
     """reason='compact' is the other in-wrapper boundary — same treatment."""
     hooks = sys.modules["routes.hooks"]
     _insert(app_env.db_path, "cmp", pane=_FAKE_PANE, status="working")
@@ -276,7 +280,9 @@ def test_compact_session_end_preserves_row_and_skips_tmuxctl(app_env, monkeypatc
 # --------------------------------------------------------------------------- #
 
 
-def test_terminal_session_end_stops_row_without_tmuxctl(app_env, monkeypatch):
+def test_terminal_session_end_stops_row_without_tmuxctl(
+    app_env: object, monkeypatch: object
+) -> None:
     """A terminal reason (logout) stops the row (instance-domain) but invokes NO
     tmuxctl pane-control — the severed COLD path. The non-terminal allow-list
     must not over-reach: terminal ends still stop the row.
@@ -291,7 +297,9 @@ def test_terminal_session_end_stops_row_without_tmuxctl(app_env, monkeypatch):
     assert calls == [], f"terminal end must not invoke tmuxctl pane-control: {calls}"
 
 
-def test_missing_reason_session_end_stops_row_without_tmuxctl(app_env, monkeypatch):
+def test_missing_reason_session_end_stops_row_without_tmuxctl(
+    app_env: object, monkeypatch: object
+) -> None:
     """No reason field (legacy / unknown) defaults to terminal teardown: row
     stopped, still no tmuxctl pane-control."""
     hooks = sys.modules["routes.hooks"]

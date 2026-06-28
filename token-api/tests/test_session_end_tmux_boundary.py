@@ -82,7 +82,9 @@ def _install_boundary_spies(hooks, monkeypatch):
     return tmuxctl_calls, tint_calls, resolve_calls
 
 
-def test_terminal_session_end_updates_row_but_never_touches_tmux(app_env, monkeypatch):
+def test_terminal_session_end_updates_row_but_never_touches_tmux(
+    app_env: object, monkeypatch: object
+) -> None:
     """A terminal SessionEnd on a LIVE row stops the row (instance-domain) and
     invokes NO tmuxctl / pane-control / pane-resolution at all."""
     hooks = sys.modules["routes.hooks"]
@@ -103,7 +105,9 @@ def test_terminal_session_end_updates_row_but_never_touches_tmux(app_env, monkey
     )
 
 
-def test_missing_reason_session_end_updates_row_but_never_touches_tmux(app_env, monkeypatch):
+def test_missing_reason_session_end_updates_row_but_never_touches_tmux(
+    app_env: object, monkeypatch: object
+) -> None:
     """A missing/unknown reason defaults to terminal teardown — same boundary."""
     hooks = sys.modules["routes.hooks"]
     _insert(app_env.db_path, "live-2", status="working")
@@ -118,11 +122,11 @@ def test_missing_reason_session_end_updates_row_but_never_touches_tmux(app_env, 
     assert resolve_calls == []
 
 
-def test_session_end_not_found_does_not_touch_tmux(app_env, monkeypatch):
+def test_session_end_not_found_does_not_touch_tmux(app_env: object, monkeypatch: object) -> None:
     """The not-found branch (no matching row) must also not reach across — the
     old code spawned an assert-instance against the payload's fallback pane."""
     hooks = sys.modules["routes.hooks"]
-    tmuxctl_calls, tint_calls, _resolve_calls = _install_boundary_spies(hooks, monkeypatch)
+    tmuxctl_calls, tint_calls, resolve_calls = _install_boundary_spies(hooks, monkeypatch)
 
     result = asyncio.run(
         hooks.handle_session_end(
@@ -138,3 +142,6 @@ def test_session_end_not_found_does_not_touch_tmux(app_env, monkeypatch):
     assert result["action"] == "not_found"
     assert tmuxctl_calls == [], f"not-found SessionEnd must not invoke tmuxctl: {tmuxctl_calls}"
     assert tint_calls == []
+    assert resolve_calls == [], (
+        f"not-found SessionEnd must not resolve pane geometry across the boundary: {resolve_calls}"
+    )

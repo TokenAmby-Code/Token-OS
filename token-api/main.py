@@ -21061,10 +21061,10 @@ async def process_pane_state_queue_once() -> list[dict]:
     trusting the stored ``pane_state_queue.tmux_pane`` (which the trigger stamped
     from ``instances.tmux_pane`` and which goes stale the moment geometry
     changes, a pane is reused, or the agent dies). It fails closed when the pane no
-    longer resolves: no ``set-option``, no close-down assertion — but the queue row
-    is still drained so a dead instance cannot wedge the queue. The
-    ``@CC_STATE=stopped`` assert-persona decision keys on the *live role*, not a
-    stored ``pane_label``. Returns one result dict per drained row.
+    longer resolves: no ``set-option`` — but the queue row is still drained so a
+    dead instance cannot wedge the queue. ``@CC_STATE=stopped`` is observability
+    only and never drives a close-down assertion (PHASE B sever: token-api makes
+    zero tmux kill decisions). Returns one result dict per drained row.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

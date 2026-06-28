@@ -185,6 +185,7 @@ async def test_stopped_pushes_set_option_but_spawns_no_assertion(
     results = await main.process_pane_state_queue_once()
 
     sets = _set_options(_capture_set_option)
+    assert _capture_set_option == sets, "no non-set-option subprocess calls are allowed"
     assert len(sets) == 1, "stopped is a normal observability push to the live pane"
     assert sets[0][-2:] == ("@CC_STATE", "stopped")
     assert "%77" in sets[0]
@@ -211,6 +212,11 @@ async def test_stopped_on_persona_role_spawns_no_assertion(
     _enqueue_pane_state(app_env.db_path, "inst-custodes", "@CC_STATE", "stopped")
     await main.process_pane_state_queue_once()
 
+    sets = _set_options(_capture_set_option)
+    assert _capture_set_option == sets, "no non-set-option subprocess calls are allowed"
+    assert len(sets) == 1
+    assert sets[0][-2:] == ("@CC_STATE", "stopped")
+    assert "%5" in sets[0]
     assert _spy_no_subprocess == [], "no role spawns a close-down assertion anymore"
 
 
@@ -234,7 +240,10 @@ async def test_bounced_state_in_one_drain_spawns_no_assertion(
     _enqueue_pane_state(app_env.db_path, "inst-bounce", "@CC_STATE", "idle")
     await main.process_pane_state_queue_once()
 
-    assert len(_set_options(_capture_set_option)) == 2, "both states push to the live pane"
+    sets = _set_options(_capture_set_option)
+    assert _capture_set_option == sets, "no non-set-option subprocess calls are allowed"
+    assert len(sets) == 2, "both states push to the live pane"
+    assert [s[-2:] for s in sets] == [("@CC_STATE", "stopped"), ("@CC_STATE", "idle")]
     assert _spy_no_subprocess == [], "no drain spawns a close-down assertion"
 
 
@@ -285,6 +294,11 @@ async def test_pane_label_value_stopped_spawns_no_assertion(
     _enqueue_pane_state(app_env.db_path, "inst-x", "@PANE_LABEL", "stopped")
     await main.process_pane_state_queue_once()
 
+    sets = _set_options(_capture_set_option)
+    assert _capture_set_option == sets, "no non-set-option subprocess calls are allowed"
+    assert len(sets) == 1
+    assert sets[0][-2:] == ("@PANE_LABEL", "stopped")
+    assert "%3" in sets[0]
     assert _spy_no_subprocess == [], "a @PANE_LABEL value must never drive a close-down assertion"
 
 
