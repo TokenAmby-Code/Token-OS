@@ -6507,6 +6507,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                             "Claude is asking a question in Discord.",
                             vibe=40,
                             banner=q_parts[0][:80],
+                            instance_id=session_id,  # session_id IS the instance id
                         )
                     )
                     logger.info(
@@ -6532,6 +6533,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
                         vibe=40,
                         beep=30,
                         banner=q_text[:80],
+                        instance_id=session_id,  # session_id IS the instance id
                     )
                 )
                 logger.info(

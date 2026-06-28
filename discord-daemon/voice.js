@@ -91,6 +91,7 @@ export function createVoiceManager(botClients, config, logger) {
         joining: false,
         player: null,       // AudioPlayer for playback
         playing: false,      // Currently playing audio
+        playChain: Promise.resolve(),  // per-bot playback mutex (serialize plays)
         leaveTimer: null,
         routeEpoch: 0,
       });
@@ -891,8 +892,24 @@ export function createVoiceManager(botClients, config, logger) {
   /**
    * Play an audio file through a bot's voice connection.
    * Supports: WAV, MP3, OGG, AIFF, and raw PCM (s16le 48kHz mono).
+   *
+   * Serialized per bot via a promise-chain mutex: `playAudioNow` already awaits
+   * AudioPlayerStatus.Idle, but nothing stopped a SECOND concurrent caller from
+   * invoking `player.play()` mid-line on the shared player → two overlapping
+   * voices. Chaining each play behind the previous makes "one voice per bot"
+   * structurally true even if something bypasses the single server-side queue
+   * (defense-in-depth under PR A). playTTS routes through here too.
    */
   async function playAudio(filePath, botName = 'mechanicus') {
+    const state = getBotState(botName);
+    const run = state.playChain.then(() => playAudioNow(filePath, botName));
+    // Keep the chain alive regardless of this call's success/failure so one
+    // rejected play never poisons subsequent plays.
+    state.playChain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  async function playAudioNow(filePath, botName = 'mechanicus') {
     const state = getBotState(botName);
     if (!connectionUsable(state)) {
       throw new Error(`Bot '${botName}' not connected to a voice channel`);

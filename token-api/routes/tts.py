@@ -23,7 +23,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -156,6 +158,10 @@ class PlayPaneRequest(BaseModel):
     instance_id: str  # Promote all items from this instance to hot queue
 
 
+class PlaybackCompleteRequest(BaseModel):
+    playback_id: str  # echoed back by the phone when it finishes speaking a line
+
+
 # ============ TTS/Notification System ============
 
 # Platform detection
@@ -193,6 +199,8 @@ def clean_markdown_for_tts(text: str) -> str:
     Removes/transforms markdown that sounds bad when spoken aloud,
     like table separators ("pipe dash dash dash") or headers ("hash hash").
     """
+    # TODO(tts-sanitize): strip SHAs/commit-ids/formatting — this is already the
+    # single TTS chokepoint (called in speak_tts), so the future home is here.
     # Unicode arrows/symbols that TTS mispronounces
     text = text.replace("\u2192", " to ")
     text = text.replace("\u2190", " from ")
@@ -386,9 +394,8 @@ def speak_tts_mac(message: str, voice: str = None, rate: int = 0) -> dict:
     voice = voice or "Daniel"
     TTS_BACKEND["current"] = "mac"
 
-    # Map SAPI rate scale (-10..10) to say WPM; default 0 → 190 WPM (slightly fast)
-    wpm = 190 if rate == 0 else 175 + (rate * 15)
-    wpm = max(80, min(300, wpm))
+    # Map SAPI rate scale (-10..10) to say WPM via the shared base tunable.
+    wpm = _wpm_for_rate(rate)
 
     try:
         process = subprocess.Popen(
@@ -437,7 +444,8 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
     TTS_BACKEND["current"] = "wsl"
 
     endpoint = "/tts/synth-and-play" if use_file_playback else "/tts/speak"
-    payload = {"message": message, "voice": voice, "rate": rate}
+    biased_rate = max(-10, min(10, rate + TTS_WSL_RATE_BIAS))
+    payload = {"message": message, "voice": voice, "rate": biased_rate}
 
     try:
         resp = requests.post(
@@ -536,14 +544,16 @@ def _get_discord_voice_bot() -> str | None:
 def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int = 0) -> dict:
     """Route TTS through Discord voice channel. Device-agnostic — audio plays wherever the operator is listening."""
     mac_voice = voice or "Daniel"
-    wpm = 190 if rate == 0 else 175 + (rate * 15)
-    wpm = max(80, min(300, wpm))
+    wpm = _wpm_for_rate(rate)
 
     try:
         resp = requests.post(
             f"{DISCORD_DAEMON_URL}/voice/tts",
             json={"message": message, "bot": bot_name, "voice": mac_voice, "rate": wpm},
-            timeout=60,
+            # Long lines legitimately block on the daemon's AudioPlayerStatus.Idle
+            # (now serialized per-bot), so allow generous headroom over a single
+            # spoken line before declaring a transport timeout.
+            timeout=TTS_DISCORD_HTTP_TIMEOUT_S,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -689,22 +699,49 @@ def speak_tts(
         return result
 
     def _send_phone_tts() -> dict:
-        """Send spoken text to the phone transport and stamp truthful routing.
+        """Send spoken text to the phone and BLOCK until real audio-finish.
 
-        Phone can be either the selected device or a fallthrough from Discord.
-        The transport returns only success/failure, so stamp `method=phone`
-        before `_finish()` derives the public `route`.
+        Phone can be the selected device or a Discord fallthrough. Accept is not
+        delivery: the device echoes a ``playback_id`` to
+        ``POST /api/tts/playback-complete`` when it finishes speaking, which sets
+        the Event we block on here. ``speak_tts`` runs in ``run_in_executor`` (a
+        thread), so a ``threading.Event`` is the correct primitive — it parks the
+        worker thread, never the event loop. The watchdog is a logged safety cap
+        for a *missed* callback, not a duration estimate. Always pop the id.
         """
         if _send_to_phone is None:
             return _no_playback_backend("phone_transport_unavailable")
+        playback_id = uuid.uuid4().hex
+        event = threading.Event()
+        pending_phone_playbacks[playback_id] = event
         try:
-            result = dict(_send_to_phone("/notify", {"tts_text": message}) or {})
-        except Exception as exc:
-            logger.warning("TTS: Phone send failed (%s), will fall through", exc)
-            return {"success": False, "error": "phone_send_failed", "reason": str(exc)}
-        if result.get("success"):
+            try:
+                result = dict(
+                    _send_to_phone("/notify", {"tts_text": message, "playback_id": playback_id})
+                    or {}
+                )
+            except Exception as exc:
+                logger.warning("TTS: Phone send failed (%s), will fall through", exc)
+                return {"success": False, "error": "phone_send_failed", "reason": str(exc)}
+            if not result.get("success"):
+                # Accept failed — nothing will ever speak, so don't block.
+                return result
             result.setdefault("method", "phone")
-        return result
+            # Block until the device reports playback finished (real audio-finish),
+            # or the watchdog caps a missed callback.
+            confirmed = event.wait(timeout=PHONE_PLAYBACK_WATCHDOG_S)
+            if not confirmed:
+                logger.warning(
+                    "TTS phone: playback-complete callback missed for %s after %ss; "
+                    "advancing (watchdog) — a missed callback stays visible",
+                    playback_id,
+                    PHONE_PLAYBACK_WATCHDOG_S,
+                )
+            result["playback_id"] = playback_id
+            result["playback_confirmed"] = confirmed
+            return result
+        finally:
+            pending_phone_playbacks.pop(playback_id, None)
 
     if device is None:
         result = _no_playback_backend("no_playback_backend")
@@ -784,35 +821,57 @@ async def dispatch_notify(
 
     loop = asyncio.get_event_loop()
 
-    # Resolve the instance's voice profile when one is named and no explicit
-    # voice override was given (mirrors the retired /api/notify/tts behavior).
-    wsl_voice = None
-    wsl_rate = None
-    if tts and message and instance_id and not voice:
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                cursor = await db.execute(
-                    "SELECT tts_voice FROM instances WHERE id = ?", (instance_id,)
-                )
-                row = await cursor.fetchone()
-            if row and row["tts_voice"] is None:
-                tts = False
-            elif row and row["tts_voice"]:
-                wsl_voice = row["tts_voice"]
-                settings = voice_settings_for_tts_voice(wsl_voice)
-                voice = settings["mac_voice"]
-                wsl_rate = settings["wsl_rate"]
-        except Exception as e:
-            logger.warning(f"notify: voice profile lookup failed for {instance_id}: {e}")
-
+    # Audio leg: route through the SINGLE gated queue (the one speak_tts call site
+    # is the worker). dispatch_notify NEVER speaks directly — it enqueues and
+    # awaits a completion future the worker resolves when playback truly finishes.
+    # The old fire-and-forget direct speak_tts here was the second playback engine
+    # behind the drain bug and the "cockpit idle while a voice plays" report. A
+    # notify with no named instance rides the synthetic ``system`` sender
+    # (Custodes-voiced, hot): per the Emperor's two-part contract these terse pings
+    # ARE "the Custodes are impending," and a recognized synthetic id keeps the
+    # single-queue invariant without a parallel speak path. queue_tts owns voice +
+    # the deny-by-default persona gate, so the inline voice lookup is gone.
     audio_requested = bool(tts and message)
     tts_result = None
     if audio_requested:
-        tts_result = await loop.run_in_executor(
-            None,
-            functools.partial(speak_tts, message, voice, 0, instance_id, wsl_voice, wsl_rate),
+        completion: asyncio.Future = loop.create_future()
+        audio_instance_id = instance_id or SYSTEM_INSTANCE_ID
+        enqueue = await queue_tts(
+            audio_instance_id, message, queue_target="hot", completion=completion
         )
+        if enqueue.get("queued"):
+            try:
+                outcome = await asyncio.wait_for(
+                    completion, timeout=NOTIFY_AUDIO_COMPLETION_TIMEOUT_S
+                )
+            except TimeoutError:
+                logger.warning(
+                    "notify: audio completion timed out (instance=%s, %ss); the "
+                    "line may still finish out-of-band",
+                    audio_instance_id,
+                    NOTIFY_AUDIO_COMPLETION_TIMEOUT_S,
+                )
+                tts_result = {
+                    "success": False,
+                    "route": None,
+                    "audio_delivered": False,
+                    "reason": "audio_completion_timeout",
+                }
+            else:
+                tts_result = {
+                    "success": bool(outcome.get("success")),
+                    "route": outcome.get("route"),
+                    "audio_delivered": bool(outcome.get("audio_delivered")),
+                }
+        else:
+            # Not queued = truthful non-delivery (persona_silent / no backend /
+            # in_meeting / instance_not_found). NEVER a silent direct-speak.
+            tts_result = {
+                "success": False,
+                "route": None,
+                "audio_delivered": False,
+                "reason": enqueue.get("reason"),
+            }
 
     # Tactile + banner are the phone attention signal. This is a *router*
     # policy (the phone is currently the only tactile/banner surface), kept in
@@ -837,7 +896,7 @@ async def dispatch_notify(
     tactile_delivered = bool(
         tactile_result and (tactile_result.get("success") or tactile_result.get("overall_success"))
     )
-    audio_delivered = bool(tts_result and tts_result.get("success"))
+    audio_delivered = bool(tts_result and tts_result.get("audio_delivered"))
     # If the caller requested spoken audio, top-level delivery means true audio
     # playback. A phone banner/vibe must not mask a failed/no-backend TTS leg.
     delivered = audio_delivered if audio_requested else tactile_delivered
@@ -887,6 +946,12 @@ class TTSQueueItem:
     tmux_pane: str | None = None  # live-resolved pane id for @TTS_STATE tracking (set at playback)
     focus_on_playback: bool = False  # true only for explicit operator-initiated playback
     playback_target: str | None = None  # resolved non-null audio target at enqueue time
+    started_at: str | None = None  # ISO; stamped when the worker begins audible playback
+    # Future resolved by the worker when this item reaches a terminal playback
+    # state (success/skip/fail/muted/exception). The single front door
+    # (dispatch_notify) awaits it for truthful delivery; agent-TTS enqueues leave
+    # it None. Excluded from equality/repr so a pending Future never trips them.
+    completion: "asyncio.Future | None" = field(default=None, compare=False, repr=False)
 
 
 # Global TTS queue state — two-queue model
@@ -899,6 +964,29 @@ tts_current_process: subprocess.Popen | None = None  # Current TTS/sound process
 tts_skip_requested: bool = False  # Flag to indicate skip was requested (vs. actual failure)
 tts_queue_lock = asyncio.Lock()
 tts_worker_task: asyncio.Task | None = None
+
+
+def _resolve_completion(
+    item: "TTSQueueItem", *, success: bool, route: str | None, audio_delivered: bool
+) -> None:
+    """Resolve a queue item's completion future, if one is attached and pending.
+
+    The worker calls this from EVERY terminal branch (success / skip / failure /
+    muted / exception) so the single front door (``dispatch_notify``) that awaits
+    the future always unblocks with a truthful ``{success, route, audio_delivered}``
+    outcome. No-ops when there is no future (agent-TTS enqueues) or it is already
+    done/cancelled (e.g. the awaiter's ``wait_for`` timed out and cancelled it).
+    Must run on the event-loop thread — the worker is a coroutine, so it is.
+    """
+    completion = getattr(item, "completion", None)
+    if completion is None or completion.done():
+        return
+    try:
+        completion.set_result(
+            {"success": success, "route": route, "audio_delivered": audio_delivered}
+        )
+    except asyncio.InvalidStateError:  # raced to done between the guard and set
+        pass
 
 
 def _positive_int_env(name: str, default: int, *, minimum: int = 1) -> int:
@@ -926,6 +1014,67 @@ TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS = _positive_int_env(
 )
 TTS_PAUSE_QUEUE_SWEEP_TTL_SECONDS = _positive_int_env("TOKEN_API_TTS_PAUSE_SWEEP_TTL_SECONDS", 30)
 _last_pause_queue_expiry_sweep = 0.0
+
+# Synthetic, always-resolved sender for system/enforcement pings that carry no
+# live persona instance (e.g. "distraction logged", "break exhausted", an
+# AskUserQuestion with no wired instance). Voiced as Custodes (Microsoft George,
+# hot policy): per the Emperor's two-part contract these terse pings ARE "the
+# Custodes are impending." It is the ONE recognized synthetic id — it holds the
+# single-queue invariant (still enqueues to the same worker, no parallel speak
+# path) and can never fall to ``persona_unresolved``. This supersedes the earlier
+# "fail loud / go silent on missing instance_id" plan: system notifies must still
+# be heard, just through the gate like everything else.
+SYSTEM_INSTANCE_ID = "system"
+_SYSTEM_TTS_ROW: dict[str, object] = {
+    "tab_name": "System",
+    "tts_voice": "Microsoft George",  # Custodes' reserved voice
+    "notification_sound": "chimes.wav",
+    "tts_mode": "verbose",
+    "persona_slug": "system",
+    "tts_policy": "hot",  # jump ahead of the pause queue, but the worker still
+    # serializes — a system ping waits out whatever is currently audible.
+}
+
+# Phone playback completion (real audio-finish, not accept). The device echoes
+# the ``playback_id`` to POST /api/tts/playback-complete when it finishes
+# speaking; ``_send_phone_tts`` (in a worker thread) blocks on the Event until
+# then, or until this watchdog cap fires. The watchdog is a named safety cap for
+# a *missed* callback (logged, never swallowed — [[no-suppress-debounce]]), not a
+# duration estimate. Tune generously; phone TTS lines are short.
+PHONE_PLAYBACK_WATCHDOG_S = _positive_int_env("TOKEN_API_PHONE_PLAYBACK_WATCHDOG_S", 30)
+pending_phone_playbacks: dict[str, "threading.Event"] = {}
+
+# How long the awaited front door (``dispatch_notify`` / ``POST /api/notify``)
+# waits for the worker to finish playing the line it enqueued before reporting
+# ``audio_delivered=False`` truthfully. Generous cap > worst-case single playback
+# (phone watchdog + render). On timeout the line may still finish out-of-band; we
+# just stop blocking the HTTP caller. Not a duration estimate.
+NOTIFY_AUDIO_COMPLETION_TIMEOUT_S = _positive_int_env(
+    "TOKEN_API_NOTIFY_AUDIO_COMPLETION_TIMEOUT_S", 90
+)
+
+# Single base words-per-minute tunable shared by every speech backend. The SAPI
+# rate scale (-10..10) biases around it: wpm = BASE if rate==0 else BASE-15 +
+# rate*15, clamped 80..300. Bumped from the old hardcoded 190 for snappier speech.
+TTS_RATE_BASE_WPM = _positive_int_env("TOKEN_API_TTS_RATE_BASE_WPM", 210, minimum=80)
+
+# HTTP timeout for the Discord daemon /voice/tts call. The daemon blocks until
+# playback reaches Idle (now per-bot serialized), so a long line legitimately
+# holds the request open — keep this well above a single spoken line so long
+# lines don't false-timeout (was a hardcoded 60s).
+TTS_DISCORD_HTTP_TIMEOUT_S = _positive_int_env("TOKEN_API_TTS_DISCORD_HTTP_TIMEOUT_S", 180)
+
+# Small positive SAPI rate bias for the (retired) WSL satellite path, from the
+# same tunable family, so when it is reached speech is a touch snappier. Clamped
+# into the SAPI -10..10 scale at the callsite.
+TTS_WSL_RATE_BIAS = _positive_int_env("TOKEN_API_TTS_WSL_RATE_BIAS", 1, minimum=0)
+
+
+def _wpm_for_rate(rate: int = 0) -> int:
+    """Map the SAPI rate scale to a clamped WPM around TTS_RATE_BASE_WPM."""
+    wpm = TTS_RATE_BASE_WPM if rate == 0 else (TTS_RATE_BASE_WPM - 15) + (rate * 15)
+    return max(80, min(300, wpm))
+
 
 # Languishing emit latch: record once for a stuck head, then only re-record when
 # the same head genuinely worsens (depth increases) or a different head reaches
@@ -1208,6 +1357,10 @@ async def tts_queue_worker() -> None:
     global tts_current
 
     while True:
+        # Local handle so completion is always resolvable even after the global
+        # is cleared (and survives an exception below). This is the sole place
+        # that calls speak_tts — the single-playback invariant.
+        item: TTSQueueItem | None = None
         try:
             # Wait for items in hot queue
             async with tts_queue_lock:
@@ -1215,50 +1368,53 @@ async def tts_queue_worker() -> None:
                     tts_current = hot_queue.popleft()
                 else:
                     tts_current = None
+                item = tts_current
 
-            if tts_current:
+            if item:
                 # Playback focus snap is explicit-action only. Direct hot TTS
                 # may fire from background hooks at arbitrary times; do not
                 # steal focus for that. Promoting/playing from the pause queue
                 # sets focus_on_playback=True because the operator pressed play.
-                if tts_current.message and (
-                    tts_current.focus_on_playback or TTS_AUTO_FOCUS_ENABLED
-                ):
-                    await _snap_focus_to_speaker(tts_current)
+                if item.message and (item.focus_on_playback or TTS_AUTO_FOCUS_ENABLED):
+                    await _snap_focus_to_speaker(item)
 
                 # Log TTS starting
                 await log_event(
                     "tts_playing",
-                    instance_id=tts_current.instance_id,
+                    instance_id=item.instance_id,
                     details={
-                        "message": tts_current.message[:100],
-                        "voice": tts_current.voice,
-                        "tab_name": tts_current.tab_name,
+                        "message": item.message[:100],
+                        "voice": item.voice,
+                        "tab_name": item.tab_name,
                     },
                 )
 
                 # Resolve the source pane LIVE (oracle) at playback time and stash
                 # it on the item for the speaking/clear @TTS_STATE writes below.
                 # (None on a dead/unstamped pane -> _set_tts_state no-ops.)
-                tts_current.tmux_pane, _ = await resolve_instance_pane(tts_current.instance_id)
+                item.tmux_pane, _ = await resolve_instance_pane(item.instance_id)
 
                 # Set @TTS_STATE on source pane
-                _set_tts_state(tts_current.tmux_pane, "speaking")
+                _set_tts_state(item.tmux_pane, "speaking")
+
+                # Stamp the audible-playback start so the cockpit shows a real
+                # started_at for the WHOLE duration the line blocks below.
+                item.started_at = datetime.now().isoformat()
 
                 # Play notification sound first (run in executor to not block event loop)
                 sound_result = None
-                if tts_current.sound:
+                if item.sound:
                     loop = asyncio.get_event_loop()
-                    sound_result = await loop.run_in_executor(None, play_sound, tts_current.sound)
+                    sound_result = await loop.run_in_executor(None, play_sound, item.sound)
                     logger.info(f"TTS worker: sound result = {json.dumps(sound_result)}")
                     if not sound_result.get("success"):
                         logger.warning(f"Sound failed: {sound_result.get('error')}")
                     await asyncio.sleep(0.3)  # Brief pause after sound
 
-                if tts_current.message:
+                if item.message:
                     # Resolve persona playback settings by WSL voice
                     # (DB tts_voice stores the Windows voice name).
-                    wsl_voice = tts_current.voice
+                    wsl_voice = item.voice
                     settings = voice_settings_for_tts_voice(wsl_voice)
                     mac_voice = settings["mac_voice"]
                     wsl_rate = settings["wsl_rate"]
@@ -1266,17 +1422,17 @@ async def tts_queue_worker() -> None:
                     # Speak the message (run in executor to allow skip API to interrupt)
                     # Queue items use file-based playback for transport controls (pause/resume/speed)
                     logger.info(
-                        f"TTS worker: speaking {len(tts_current.message)} chars with {wsl_voice} (mac={mac_voice}, file_playback=True)"
+                        f"TTS worker: speaking {len(item.message)} chars with {wsl_voice} (mac={mac_voice}, file_playback=True)"
                     )
                     loop = asyncio.get_event_loop()
                     tts_result = await loop.run_in_executor(
                         None,
                         functools.partial(
                             speak_tts,
-                            tts_current.message,
+                            item.message,
                             mac_voice,
                             0,
-                            tts_current.instance_id,
+                            item.instance_id,
                             wsl_voice,
                             wsl_rate,
                             use_file_playback=True,
@@ -1284,46 +1440,65 @@ async def tts_queue_worker() -> None:
                     )
                     logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
 
-                    # Log completion, skip, or failure
+                    # Log completion, skip, or failure — and resolve the awaiting
+                    # front door truthfully in EVERY branch.
                     if tts_result.get("skipped") or tts_result.get("method") == "skipped":
-                        logger.info(f"TTS skipped for {tts_current.instance_id}")
+                        logger.info(f"TTS skipped for {item.instance_id}")
                         await log_event(
                             "tts_skipped",
-                            instance_id=tts_current.instance_id,
-                            details={
-                                "message": tts_current.message[:50],
-                                "voice": tts_current.voice,
-                            },
+                            instance_id=item.instance_id,
+                            details={"message": item.message[:50], "voice": item.voice},
+                        )
+                        _resolve_completion(
+                            item,
+                            success=False,
+                            route=tts_result.get("route"),
+                            audio_delivered=False,  # a skip is not delivery
                         )
                     elif tts_result.get("success"):
                         await log_event(
                             "tts_completed",
-                            instance_id=tts_current.instance_id,
-                            details={
-                                "message": tts_current.message[:50],
-                                "voice": tts_current.voice,
-                            },
+                            instance_id=item.instance_id,
+                            details={"message": item.message[:50], "voice": item.voice},
+                        )
+                        _resolve_completion(
+                            item,
+                            success=True,
+                            route=tts_result.get("route"),
+                            audio_delivered=True,
                         )
                     else:
                         logger.error(
-                            f"TTS failed for {tts_current.instance_id}: {tts_result.get('error')}"
+                            f"TTS failed for {item.instance_id}: {tts_result.get('error')}"
                         )
                         await log_event(
                             "tts_failed",
-                            instance_id=tts_current.instance_id,
+                            instance_id=item.instance_id,
                             details={
-                                "message": tts_current.message[:50],
-                                "voice": tts_current.voice,
+                                "message": item.message[:50],
+                                "voice": item.voice,
                                 "error": tts_result.get("error", "Unknown error"),
                                 "sound_result": sound_result,
                             },
                         )
+                        _resolve_completion(item, success=False, route=None, audio_delivered=False)
                 else:
-                    logger.info(f"TTS worker: muted mode, sound only for {tts_current.instance_id}")
+                    logger.info(f"TTS worker: muted mode, sound only for {item.instance_id}")
+                    # Muted (sound-only): no spoken audio delivered. Resolve on the
+                    # sound outcome so any awaiter unblocks rather than timing out.
+                    _resolve_completion(
+                        item,
+                        success=bool(sound_result and sound_result.get("success")),
+                        route="sound" if sound_result and sound_result.get("success") else None,
+                        audio_delivered=False,
+                    )
 
                 # Clear @TTS_STATE on source pane
-                _set_tts_state(tts_current.tmux_pane, "")
-                tts_current = None
+                _set_tts_state(item.tmux_pane, "")
+                # Clear the current-playing marker UNDER the lock so a cockpit
+                # poll can't catch the set→clear window.
+                async with tts_queue_lock:
+                    tts_current = None
                 await asyncio.sleep(0.5)  # Brief pause between items
             else:
                 # No items - wait a bit before checking again
@@ -1334,11 +1509,15 @@ async def tts_queue_worker() -> None:
             # Never leave the source pane stuck "speaking" when playback raises
             # after @TTS_STATE was set: clear it before looping (best-effort).
             try:
-                if tts_current is not None and getattr(tts_current, "tmux_pane", None):
-                    _set_tts_state(tts_current.tmux_pane, "")
+                if item is not None and getattr(item, "tmux_pane", None):
+                    _set_tts_state(item.tmux_pane, "")
             except Exception:
                 pass
-            tts_current = None
+            # Unblock any awaiting front door so an exception can't wedge it.
+            if item is not None:
+                _resolve_completion(item, success=False, route=None, audio_delivered=False)
+            async with tts_queue_lock:
+                tts_current = None
             await asyncio.sleep(1)
 
 
@@ -1394,14 +1573,29 @@ def _is_quiet_hours(now: datetime | None = None) -> bool:
     return bool(get_quiet_hours_status(now).get("active"))
 
 
-async def queue_tts(instance_id: str, message: str, queue_target: str = "pause") -> dict:
+async def queue_tts(
+    instance_id: str,
+    message: str,
+    queue_target: str = "pause",
+    completion: "asyncio.Future | None" = None,
+) -> dict:
     """Queue a TTS message for an instance, using their profile's voice/sound.
 
+    This is THE gated single-queue enqueue: both the agent-TTS endpoint and the
+    notify front door (``dispatch_notify``) feed it, so the worker is the only
+    place audio plays. The deny-by-default persona gate (PR B) stays intact.
+
     Args:
-        instance_id: The instance ID that triggered TTS.
+        instance_id: The instance ID that triggered TTS. The synthetic
+            ``SYSTEM_INSTANCE_ID`` ("system") is a recognized always-resolved
+            sender (Custodes-voiced, hot) for system/enforcement pings with no
+            live persona instance.
         message: The text to speak.
         queue_target: "hot" for immediate playback (VC/sync sessions),
                       "pause" for silent accumulation (default).
+        completion: Optional future the worker resolves with
+            ``{success, route, audio_delivered}`` when this item reaches a
+            terminal playback state. Only the awaiting front door passes one.
     """
     message = await _sanitize_public_text_async(message)
 
@@ -1415,23 +1609,40 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         logger.info(f"TTS suppressed (in meeting): {message[:80]}")
         return {"success": True, "queued": False, "reason": "in_meeting"}
 
-    # Look up instance to get their profile
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """SELECT i.name AS tab_name, i.tts_voice, i.notification_sound,
-                      CASE WHEN i.interaction_mode = 'voice_chat'
-                           THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
-                      p.slug AS persona_slug, p.tts_policy AS tts_policy
-               FROM instances i
-               LEFT JOIN personas p ON p.id = i.persona_id
-               WHERE i.id = ?""",
-            (instance_id,),
-        )
-        row = await cursor.fetchone()
+    if instance_id == SYSTEM_INSTANCE_ID:
+        # Synthetic sender: skip the DB lookup, use the fixed always-resolved
+        # profile. Holds the single-queue invariant without a parallel path.
+        row = _SYSTEM_TTS_ROW
+    else:
+        # Look up instance to get their profile
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT i.name AS tab_name, i.tts_voice, i.notification_sound,
+                          CASE WHEN i.interaction_mode = 'voice_chat'
+                               THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
+                          p.slug AS persona_slug, p.tts_policy AS tts_policy
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE i.id = ?""",
+                (instance_id,),
+            )
+            row = await cursor.fetchone()
 
     if not row:
-        return {"success": False, "error": f"Instance {instance_id} not found"}
+        # Fail loud (never silently swallow — [[anti-blind-dedup]]): an audio
+        # request naming a nonexistent instance is a registration/wiring bug.
+        logger.warning(
+            "TTS denied (instance_not_found): instance=%s message=%r",
+            instance_id,
+            message[:80],
+        )
+        return {
+            "success": False,
+            "queued": False,
+            "reason": "instance_not_found",
+            "error": f"Instance {instance_id} not found",
+        }
 
     # Per-persona TTS policy, deny-by-default (Emperor decree, 2026-06-28:
     # "one route, one authority, one serialized queue"). Submission is gated on a
@@ -1503,6 +1714,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             tab_name=tab_name,
             queue_target=queue_target,
             focus_on_playback=False,
+            completion=completion,
         )
     else:
         item = TTSQueueItem(
@@ -1513,6 +1725,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             tab_name=tab_name,
             queue_target=queue_target,
             focus_on_playback=False,
+            completion=completion,
         )
 
     target = _resolve_queue_playback_target(
@@ -1859,16 +2072,23 @@ def get_tts_queue_status() -> dict:
     hot_list = [_queue_item_to_dict(item) for item in hot_queue]
     pause_list = [_queue_item_to_dict(item) for item in pause_queue]
 
+    # Snapshot the current-playing item into a local first: every attribute below
+    # reads from that single handle, so a concurrent worker clear (now done under
+    # tts_queue_lock) can't blank it mid-build. Combined with playback truly
+    # blocking the worker (steps 1-4), `current` now reflects audible state for the
+    # whole line — the cockpit stops flashing "idle" mid-utterance.
+    current_item = tts_current
     current = None
-    if tts_current:
+    if current_item:
         current = {
-            "instance_id": tts_current.instance_id,
-            "tab_name": tts_current.tab_name,
-            "message": tts_current.message[:50] + "..."
-            if len(tts_current.message) > 50
-            else tts_current.message,
-            "voice": tts_current.voice,
-            "playback_target": tts_current.playback_target,
+            "instance_id": current_item.instance_id,
+            "tab_name": current_item.tab_name,
+            "message": current_item.message[:50] + "..."
+            if len(current_item.message) > 50
+            else current_item.message,
+            "voice": current_item.voice,
+            "playback_target": current_item.playback_target,
+            "started_at": current_item.started_at,
         }
 
     return {
@@ -2183,6 +2403,31 @@ async def play_pane(request: PlayPaneRequest) -> dict:
 
     logger.info(f"play-pane: Promoted {promoted} item(s) for {request.instance_id} to hot queue")
     return {"success": True, "promoted": promoted, "instance_id": request.instance_id}
+
+
+@router.post("/api/tts/playback-complete")
+async def tts_playback_complete(request: PlaybackCompleteRequest) -> dict:
+    """Phone audio-finish callback — the real serialization signal.
+
+    The device POSTs the ``playback_id`` it was handed (in the ``/notify``
+    ``tts_text`` payload) once it has finished speaking that line. We set the
+    matching Event so the blocked worker thread advances to the next queued item.
+    No server-side duration estimation: the phone alone decides when "done."
+
+    Unknown / expired / duplicate ids are tolerated with 200 + a warning (never
+    error the phone, never silently swallow — [[no-suppress-debounce]]).
+    """
+    playback_id = request.playback_id
+    event = pending_phone_playbacks.get(playback_id)
+    if event is None:
+        logger.warning(
+            "tts playback-complete: unknown/expired playback_id=%s (no waiter); ignoring",
+            playback_id,
+        )
+        return {"success": True, "matched": False, "reason": "unknown_playback_id"}
+    event.set()
+    logger.info("tts playback-complete: playback_id=%s confirmed", playback_id)
+    return {"success": True, "matched": True}
 
 
 @router.post("/api/tts/skip")
