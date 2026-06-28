@@ -61,7 +61,7 @@ def test_promote_by_instance_promotes_oldest_first():
     for msg in ("A-oldest", "B", "C-newest"):
         tts.pause_queue.append(_make_item(tts, iid, msg))
 
-    asyncio.run(tts.promote_from_pause(tts.PromoteRequest(instance_id=iid)))
+    asyncio.run(tts.promote_from_pause(object(), instance_id=iid))
 
     assert _drain_order(tts) == ["A-oldest", "B", "C-newest"]
     assert len(tts.pause_queue) == 0

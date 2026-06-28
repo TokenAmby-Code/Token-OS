@@ -47,8 +47,14 @@ def _insert_tts_instance(db_path: Path) -> str:
     return iid
 
 
-def test_queue_tts_languishing_emits_internal_state_label(app_env: Any, monkeypatch: Any) -> None:
-    """Pause queue length > 5 emits an internal state label, not enforcement."""
+def test_queue_tts_languishing_emits_custodes_enforcement(app_env: Any, monkeypatch: Any) -> None:
+    """Pause queue length > 5 emits a recognized Custodes state event.
+
+    The emitter passes only observational signals (event_type/source/severity/
+    payload) and deliberately does NOT self-declare event_class — the policy
+    (custodes_state_policy.classify_trigger) is the sole authority that
+    classifies tts_queue_languishing as enforcement.
+    """
     tts = _load_tts()
     iid = _insert_tts_instance(app_env.db_path)
     calls = []
@@ -77,7 +83,8 @@ def test_queue_tts_languishing_emits_internal_state_label(app_env: Any, monkeypa
     event_type, source, kwargs = calls[0]
     assert event_type == "tts_queue_languishing"
     assert source == "tts_queue"
-    assert kwargs["event_class"] == "state"
+    # Doctrine lock: the emitter must NOT self-declare classification.
+    assert "event_class" not in kwargs
     assert kwargs["severity"] == 3
     assert kwargs["payload"]["pause_queue_length"] == 6
     assert kwargs["payload"]["threshold"] == 5

@@ -259,8 +259,13 @@ def test_discord_fallthrough_respects_geofence_phone_only(monkeypatch: Any) -> N
     assert any(p.get("tts_text") == "away discord fallback" for _e, p in sent)
 
 
-def test_wsl_fallthrough_reports_phone_route(monkeypatch: Any) -> None:
-    """When WSL falls through to phone, public route telemetry says phone."""
+def test_retired_wsl_route_fails_closed_not_false_success(monkeypatch: Any) -> None:
+    """A stale WSL routing decision must not claim successful phone delivery.
+
+    Phone-first retired WSL from the live cascade. If a monkeypatched/stale route
+    still names WSL, the router fails closed with no method/route instead of
+    recreating the old false-success shape.
+    """
     tts = _load("routes.tts")
     sent = []
 
@@ -269,31 +274,23 @@ def test_wsl_fallthrough_reports_phone_route(monkeypatch: Any) -> None:
         "resolve_tts_device",
         lambda **kw: {"device": "wsl", "reason": "satellite healthy", "discord_bot": None},
     )
-    monkeypatch.setattr(
-        tts,
-        "speak_tts_wsl",
-        lambda *a, **k: {
-            "success": False,
-            "error": "wsl_failed",
-            "reason": "wsl_failed",
-        },
-    )
-    monkeypatch.setattr(tts, "_phone_tts_available", lambda: True)
 
     def fake_send_to_phone(endpoint, params):
         sent.append((endpoint, dict(params or {})))
         return {"success": True}
 
     monkeypatch.setattr(tts, "_send_to_phone", fake_send_to_phone)
+    monkeypatch.setattr(tts, "_phone_tts_available", lambda: True)
     monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
 
     result = tts.speak_tts("wsl fallback")
 
-    assert result.get("success") is True
+    assert result.get("success") is False
     assert result.get("requested_device") == "wsl"
-    assert result.get("method") == "phone"
-    assert result.get("route") == "phone"
-    assert any(p.get("tts_text") == "wsl fallback" for _e, p in sent)
+    assert result.get("method") is None
+    assert result.get("route") is None
+    assert result.get("reason") == "unknown_playback_backend"
+    assert sent == []
 
 
 # ---------------- Router consolidation: notify.py delegates ----------------
