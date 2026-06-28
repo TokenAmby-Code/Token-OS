@@ -799,6 +799,23 @@ def _h_invoke_skill(control, params):
     return {"pane": pane, "submitted": False, "rendered": rendered}
 
 
+def _h_insert_invocation(control, params):
+    """Engine-agnostic, kind-aware skill/command insert at a pane's prompt start.
+
+    The warm-daemon replacement for the Shift+Tab menu's 3 cold ``tmuxctl`` spawns
+    (resolve/prompt-start, insert-text, prompt-end). One loopback round-trip does
+    the whole prompt-start -> insert -> Codex-sink -> prompt-end, with the leader
+    policy (``$skill`` vs ``/skill`` vs universal ``/command``) resolved here.
+    """
+    pane = _s(params, "pane")
+    name = _s(params, "name") or _s(params, "skill")
+    agent = _s(params, "agent", "auto")
+    kind = _s(params, "kind", "skill")
+    arguments = _s(params, "arguments") or None
+    result = control.insert_invocation(pane, name, agent=agent, kind=kind, arguments=arguments)
+    return {"status": "inserted", **result}
+
+
 def _h_assert_instance(control, params):
     return control.assert_instance(_s(params, "pane"))
 
@@ -1406,6 +1423,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/prompt-start"): _h_prompt_start,
     ("POST", "/prompt-end"): _h_prompt_end,
     ("POST", "/invoke-skill"): _h_invoke_skill,
+    ("POST", "/insert-invocation"): _h_insert_invocation,
     ("POST", "/assert-instance"): _h_assert_instance,
     ("POST", "/hooks/user-prompt-submit"): _h_hook_user_prompt_submit,
     ("POST", "/hooks/wrapperend"): _h_hook_wrapperend,

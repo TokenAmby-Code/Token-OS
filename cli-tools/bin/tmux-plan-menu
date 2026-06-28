@@ -26,6 +26,7 @@ SELECTION=""
 AGENT="auto"
 DRY_RUN=false
 API_URL=""
+DAEMON_URL=""
 
 # Guard value-taking flags so a missing operand is a clean error, not a `set -u`
 # "unbound variable $2" crash.
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
         --agent) _require_arg $# --agent; AGENT="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         --api-url) _require_arg $# --api-url; API_URL="$2"; shift 2 ;;
+        --daemon-url) _require_arg $# --daemon-url; DAEMON_URL="$2"; shift 2 ;;
         -h|--help) sed -n '2,/^$/s/^# //p' "$0"; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -47,6 +49,23 @@ _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${_script_dir}/../lib/nas-path.sh" >/dev/null 2>&1 || true
 API_URL="${API_URL:-${TOKEN_API_URL:-}}"
+
+# Daemon fast-path: route the post-selection insert (prompt-start -> insert leader
+# -> Codex sink -> prompt-end) through the warm tmuxctld in ONE loopback round-trip
+# instead of 3 cold `tmuxctl` Python spawns — the Shift+Tab-menu 50x slowdown. The
+# daemon resolves the engine and applies the leader (/skill vs $skill for SKILLS;
+# /command stays universal). Opt-in: the BTab keybinding sets TMUX_PLAN_MENU_DAEMON=1
+# so the URL derives from the canonical TMUXCTLD_URL; otherwise off, so unit tests
+# exercise the local tmuxctl path and never touch a live daemon. An explicit
+# --daemon-url / $TMUX_PLAN_MENU_DAEMON_URL always wins. On ANY daemon miss the
+# action falls back to the local cursor-op path, preserving fail-closed semantics.
+if [[ -z "$DAEMON_URL" ]]; then
+    if [[ -n "${TMUX_PLAN_MENU_DAEMON_URL:-}" ]]; then
+        DAEMON_URL="$TMUX_PLAN_MENU_DAEMON_URL"
+    elif [[ "${TMUX_PLAN_MENU_DAEMON:-0}" == "1" ]]; then
+        DAEMON_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+    fi
+fi
 
 # --- pane resolution -------------------------------------------------------
 # A bare Shift+Tab routes through:  display-popup -e "BTAB_PANE=#{pane_id}"
@@ -228,6 +247,21 @@ insert_text()           { "${_script_dir}/tmuxctl" insert-text  --pane "$PANE" -
 move_prompt_end()       { "${_script_dir}/tmuxctl" prompt-end   --pane "$PANE" --page-downs "$PAGE_DOWNS"; }
 sink_codex_skill()      { tmux send-keys -t "$PANE" Tab; }
 
+# Warm-daemon insert: prompt-start -> leader insert -> Codex sink -> prompt-end in
+# one POST. Returns 0 only when the daemon actually performed the insert (HTTP 2xx);
+# any non-2xx (`curl -f` -> 22) or transport failure (daemon down) returns non-zero
+# so run_action falls through to the local tmuxctl path. The daemon restores its own
+# cursor, so a daemon-handled insert owes no extra prompt-end. `name` is the BARE
+# skill/command (no leader) and `kind` is skill|command; the daemon owns the leader.
+daemon_insert() {
+    local name="$1" kind="$2" agent="$3" body
+    [[ -n "$DAEMON_URL" && -n "$PANE" ]] || return 1
+    body="{\"pane\":$(json_escape "$PANE"),\"name\":$(json_escape "$name"),\"kind\":$(json_escape "$kind"),\"agent\":$(json_escape "$agent")}"
+    curl -sf --max-time "${TMUX_PLAN_MENU_DAEMON_MAX_TIME:-2}" \
+        -X POST "${DAEMON_URL%/}/insert-invocation" \
+        -H 'Content-Type: application/json' -d "$body" >/dev/null
+}
+
 # Optional pre-buffer: disabled by default.  The old default moved the prompt
 # cursor while the picker was still open, which made Shift+Tab feel like a slow
 # visible macro and increased the chance of stray typing into the wrong part of
@@ -346,20 +380,29 @@ run_action() {
                     log_failure preplan "$agent" subscribe "rc=${rc} ${sub_err}"
                 else
                     set_planning_state preplanning >/dev/null 2>&1   # advisory hint
-                    text="$(preplan_leader "$agent") "
-                    # Fail closed on a missed prompt-start (already logged inside
-                    # _ensure_at_prompt_start): skip the leader insert and the Codex
-                    # Tab sink rather than typing into an unknown cursor position.
-                    if _ensure_at_prompt_start; then
-                        # Sink the Codex skill chip only after a confirmed insert —
-                        # a Tab after a failed insert lands at an unknown cursor and
-                        # never materializes the skill.
-                        if insert_text "$text"; then
-                            if [[ "$agent" == codex ]]; then
-                                sink_codex_skill || log_failure preplan "$agent" sink-tab "tmux send-keys Tab rc=$?"
+                    # Fast path: the warm daemon does prompt-start + the engine
+                    # leader insert + Codex sink + prompt-end in one round-trip (it
+                    # restores its own cursor, so no _PROMPT_MOVED restore is owed).
+                    # Pass the BARE name + the agent already resolved above, so the
+                    # daemon never re-probes and never has to fail-closed itself.
+                    if daemon_insert preplan skill "$agent"; then
+                        :
+                    else
+                        text="$(preplan_leader "$agent") "
+                        # Fail closed on a missed prompt-start (already logged inside
+                        # _ensure_at_prompt_start): skip the leader insert and the Codex
+                        # Tab sink rather than typing into an unknown cursor position.
+                        if _ensure_at_prompt_start; then
+                            # Sink the Codex skill chip only after a confirmed insert —
+                            # a Tab after a failed insert lands at an unknown cursor and
+                            # never materializes the skill.
+                            if insert_text "$text"; then
+                                if [[ "$agent" == codex ]]; then
+                                    sink_codex_skill || log_failure preplan "$agent" sink-tab "tmux send-keys Tab rc=$?"
+                                fi
+                            else
+                                log_failure preplan "$agent" insert "insert-text rc=$?"
                             fi
-                        else
-                            log_failure preplan "$agent" insert "insert-text rc=$?"
                         fi
                     fi
                 fi
@@ -367,14 +410,21 @@ run_action() {
             ;;
         plan)
             set_planning_state planning >/dev/null 2>&1   # advisory; /plan is token-api-independent
-            # Fail closed on a missed prompt-start (already logged): skip the insert
-            # rather than dropping /plan mid-draft at an unknown cursor position.
-            if _ensure_at_prompt_start; then
+            # /plan is a COMMAND: universal "/" leader in both harnesses, so the
+            # daemon skips engine resolution entirely. Fast path first; on a daemon
+            # miss fall back to the local cursor ops. Fail closed on a missed
+            # prompt-start (already logged): skip the insert rather than dropping
+            # /plan mid-draft at an unknown cursor position.
+            if daemon_insert plan command "$AGENT"; then
+                :
+            elif _ensure_at_prompt_start; then
                 insert_text "/plan " || log_failure plan "$agent" insert "insert-text rc=$?"
             fi
             ;;
         compact)
-            if _ensure_at_prompt_start; then
+            if daemon_insert compact command "$AGENT"; then
+                :
+            elif _ensure_at_prompt_start; then
                 insert_text "/compact " || log_failure compact "$agent" insert "insert-text rc=$?"
             fi
             ;;

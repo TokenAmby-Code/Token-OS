@@ -43,6 +43,7 @@ from .resolver import (
     resolve_to_public,
 )
 from .skill_invoke import (
+    insert_invocation_in_pane,
     insert_text,
     invoke_skill_in_pane,
     move_to_prompt_end,
@@ -275,6 +276,20 @@ class TmuxControlPlane:
     ) -> str:
         """Invoke a skill in a target pane via the agent's invocation primitive."""
         return invoke_skill_in_pane(self.adapter, target, skill, agent=agent, arguments=arguments)
+
+    def insert_invocation(
+        self,
+        target: str,
+        name: str,
+        *,
+        agent: str = "auto",
+        kind: str = "skill",
+        arguments: str | None = None,
+    ) -> dict:
+        """Insert a kind-aware invocation (skill or command) at a pane's prompt start."""
+        return insert_invocation_in_pane(
+            self.adapter, target, name, agent=agent, kind=kind, arguments=arguments
+        )
 
     def send_skill(
         self,
