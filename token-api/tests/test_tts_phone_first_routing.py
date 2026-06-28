@@ -8,8 +8,8 @@ device selection).
 
 `resolve_tts_device` must therefore:
   * NEVER select the WSL satellite, even when it probes healthy;
-  * select the phone whenever it is reachable, regardless of geofence zone;
-  * fall back to Mac only when the phone is unreachable;
+  * select the phone only when its audio-proxy receiver is live, regardless of geofence zone;
+  * fall back to Mac only when the phone audio-proxy receiver is unavailable;
   * still pre-empt to Discord voice when the operator is in a voice channel.
 """
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -41,6 +42,27 @@ def _patch_world(
         tts,
         "_send_to_phone",
         (lambda *a, **k: {"success": True}) if phone_reachable else None,
+    )
+    monkeypatch.setattr(
+        tts,
+        "_audio_proxy_health_checker",
+        (
+            lambda: {
+                "phone_connected": True,
+                "receiver_running": True,
+                "receiver_pid": 1234,
+                "last_heartbeat": datetime.now().isoformat(),
+            }
+        )
+        if phone_reachable
+        else (
+            lambda: {
+                "phone_connected": False,
+                "receiver_running": False,
+                "receiver_pid": None,
+                "last_heartbeat": None,
+            }
+        ),
     )
     monkeypatch.setattr(tts, "is_satellite_tts_available", lambda *a, **k: satellite_healthy)
     monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda *a, **k: discord_bot)
@@ -81,6 +103,59 @@ def test_phone_first_regardless_of_geofence(monkeypatch) -> None:
         _patch_world(tts, monkeypatch, phone_reachable=True, location_zone=zone)
         routing = tts.resolve_tts_device()
         assert routing["device"] == "phone", (zone, routing)
+
+
+def test_coarse_phone_reachable_is_not_audio_proxy_reachable(monkeypatch) -> None:
+    """Regression: MacroDroid HTTP reachability alone must not route TTS to phone.
+
+    The dead-audio-proxy failure had `phone_reachable=True` but
+    receiver_pid/heartbeat/phone_connected were null/false, causing a false
+    success into backend:null.
+    """
+    tts = _load_tts()
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(tts, "_send_to_phone", lambda *a, **k: {"success": True})
+    monkeypatch.setattr(
+        tts,
+        "_audio_proxy_health_checker",
+        lambda: {
+            "phone_connected": False,
+            "receiver_running": False,
+            "receiver_pid": None,
+            "last_heartbeat": None,
+        },
+    )
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: False)
+    monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda *a, **k: None)
+
+    routing = tts.resolve_tts_device()
+
+    assert routing["device"] is None
+    assert routing["phone_audio_proxy"]["available"] is False
+    assert routing["phone_audio_proxy"]["reason"] == "audio_proxy_phone_disconnected"
+
+
+def test_audio_proxy_requires_fresh_receiver_heartbeat(monkeypatch) -> None:
+    tts = _load_tts()
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(tts, "_send_to_phone", lambda *a, **k: {"success": True})
+    monkeypatch.setattr(
+        tts,
+        "_audio_proxy_health_checker",
+        lambda: {
+            "phone_connected": True,
+            "receiver_running": True,
+            "receiver_pid": 1234,
+            "last_heartbeat": None,
+        },
+    )
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: False)
+    monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda *a, **k: None)
+
+    routing = tts.resolve_tts_device()
+
+    assert routing["device"] is None
+    assert routing["phone_audio_proxy"]["reason"] == "audio_proxy_heartbeat_missing"
 
 
 def test_mac_is_deep_fallback_when_phone_unreachable(monkeypatch) -> None:

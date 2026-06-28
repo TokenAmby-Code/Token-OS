@@ -1013,7 +1013,7 @@ def is_phone_reachable() -> bool:
     PHONE_TTS_CONFIG["reachable"] = available
     PHONE_TTS_CONFIG["last_health_check"] = now
     if available:
-        logger.info("TTS: Phone reachable for TTS routing")
+        logger.info("TTS: Phone MacroDroid HTTP reachable (diagnostic; not audio-proxy health)")
     return available
 
 

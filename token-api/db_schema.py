@@ -1441,6 +1441,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 phone_connected INTEGER DEFAULT 0,
                 receiver_running INTEGER DEFAULT 0,
                 receiver_pid INTEGER,
+                last_heartbeat TEXT,
                 last_connect_time TEXT,
                 last_disconnect_time TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

@@ -92,21 +92,32 @@ router = APIRouter()
 
 _send_to_phone = None
 _custodes_state_event_handler = None
+_audio_proxy_health_checker = None
 TTS_LANGUISHING_THRESHOLD = 5
+try:
+    PHONE_AUDIO_PROXY_HEARTBEAT_TTL_SECONDS = max(
+        1, int(os.environ.get("TOKEN_API_PHONE_AUDIO_PROXY_HEARTBEAT_TTL_SECONDS", "120"))
+    )
+except ValueError:
+    PHONE_AUDIO_PROXY_HEARTBEAT_TTL_SECONDS = 120
 # The sender whose TTS innately bypasses the pause queue (plays immediately).
 CUSTODES_PERSONA_SLUG = "custodes"
 
 
-def init_deps(*, send_to_phone=None, custodes_state_event_handler=None):
+def init_deps(
+    *, send_to_phone=None, custodes_state_event_handler=None, audio_proxy_health_checker=None
+):
     """Receive dependencies from main.py to avoid circular imports.
 
     Called once during app startup, before any requests are served.
     """
-    global _send_to_phone, _custodes_state_event_handler
+    global _send_to_phone, _custodes_state_event_handler, _audio_proxy_health_checker
     if send_to_phone is not None:
         _send_to_phone = send_to_phone
     if custodes_state_event_handler is not None:
         _custodes_state_event_handler = custodes_state_event_handler
+    if audio_proxy_health_checker is not None:
+        _audio_proxy_health_checker = audio_proxy_health_checker
 
 
 # ============ Pydantic Models ============
@@ -257,10 +268,99 @@ def _mac_sound_available() -> bool:
     return IS_MACOS and shutil.which("afplay") is not None
 
 
+def _parse_audio_proxy_heartbeat(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def get_phone_audio_proxy_health() -> dict:
+    """Return receiver-level phone audio health.
+
+    The old router treated MacroDroid HTTP reachability as "phone TTS is live".
+    That is a false-positive for the current phone audio path: speech is only
+    audible when the phone audio-proxy receiver is connected, has a concrete
+    receiver PID, and has heartbeated recently. Fail closed when the checker is
+    not wired or any receiver-level signal is missing.
+    """
+    if _audio_proxy_health_checker is None:
+        return {
+            "available": False,
+            "reason": "audio_proxy_health_checker_unwired",
+            "phone_connected": False,
+            "receiver_pid": None,
+            "receiver_running": False,
+            "last_heartbeat": None,
+            "heartbeat_age_seconds": None,
+        }
+
+    try:
+        health = dict(_audio_proxy_health_checker() or {})
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": "audio_proxy_health_check_failed",
+            "error": str(exc),
+            "phone_connected": False,
+            "receiver_pid": None,
+            "receiver_running": False,
+            "last_heartbeat": None,
+            "heartbeat_age_seconds": None,
+        }
+
+    phone_connected = bool(health.get("phone_connected"))
+    receiver_pid = health.get("receiver_pid")
+    receiver_running = bool(health.get("receiver_running"))
+    last_heartbeat_raw = health.get("last_heartbeat")
+    last_heartbeat = _parse_audio_proxy_heartbeat(last_heartbeat_raw)
+    heartbeat_age_seconds = None
+    heartbeat_fresh = False
+    if last_heartbeat is not None:
+        heartbeat_age_seconds = max(0, int((datetime.now() - last_heartbeat).total_seconds()))
+        heartbeat_fresh = heartbeat_age_seconds <= PHONE_AUDIO_PROXY_HEARTBEAT_TTL_SECONDS
+
+    reason = None
+    if not phone_connected:
+        reason = "audio_proxy_phone_disconnected"
+    elif not receiver_pid:
+        reason = "audio_proxy_receiver_pid_missing"
+    elif not receiver_running:
+        reason = "audio_proxy_receiver_not_running"
+    elif last_heartbeat is None:
+        reason = "audio_proxy_heartbeat_missing"
+    elif not heartbeat_fresh:
+        reason = "audio_proxy_heartbeat_stale"
+
+    health.update(
+        {
+            "available": reason is None,
+            "reason": reason,
+            "phone_connected": phone_connected,
+            "receiver_pid": receiver_pid,
+            "receiver_running": receiver_running,
+            "last_heartbeat": last_heartbeat_raw,
+            "heartbeat_age_seconds": heartbeat_age_seconds,
+            "heartbeat_ttl_seconds": PHONE_AUDIO_PROXY_HEARTBEAT_TTL_SECONDS,
+        }
+    )
+    return health
+
+
 def _phone_tts_available() -> bool:
-    """Phone TTS is a real playback target only when the transport is initialized
-    and its reachability probe is green."""
-    return _send_to_phone is not None and is_phone_reachable()
+    """Phone TTS is a real playback target only with a live audio-proxy receiver."""
+    return _send_to_phone is not None and bool(get_phone_audio_proxy_health().get("available"))
+
+
+def _phone_tts_unavailable_reason() -> str:
+    if _send_to_phone is None:
+        return "phone_transport_unavailable"
+    return get_phone_audio_proxy_health().get("reason") or "phone_audio_proxy_unavailable"
 
 
 def _no_playback_backend(reason: str = "no_playback_backend") -> dict:
@@ -507,19 +607,33 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
             "discord_bot": discord_bot,
         }
 
-    # 2. Phone — first-contact for all TTS, regardless of geofence zone.
-    if _phone_tts_available():
-        return {"device": "phone", "reason": "phone-first", "discord_bot": None}
+    # 2. Phone — first-contact for all TTS, regardless of geofence zone. This
+    # is NOT the coarse MacroDroid HTTP reachability flag; it is receiver-level
+    # audio-proxy health (phone_connected + receiver_pid + fresh heartbeat).
+    phone_health = get_phone_audio_proxy_health()
+    if _send_to_phone is not None and phone_health.get("available"):
+        return {
+            "device": "phone",
+            "reason": "phone-first: audio proxy live",
+            "discord_bot": None,
+            "phone_audio_proxy": phone_health,
+        }
 
     # 3. Mac — deep fallback, only when phone delivery is unreachable.
     if _mac_tts_available():
         return {
             "device": "mac",
-            "reason": "deep fallback: phone unreachable",
+            "reason": f"deep fallback: phone unavailable ({_phone_tts_unavailable_reason()})",
             "discord_bot": None,
+            "phone_audio_proxy": phone_health,
         }
 
-    return {"device": None, "reason": "no playback backend", "discord_bot": None}
+    return {
+        "device": None,
+        "reason": "no playback backend",
+        "discord_bot": None,
+        "phone_audio_proxy": phone_health,
+    }
 
 
 def speak_tts(
@@ -1498,6 +1612,7 @@ async def _sweep_stale_pause_queue_items_for_snapshot() -> list[dict]:
             pause_queue.extend(kept)
 
     expired_details = []
+    backend_null_expired_details = []
     for expired_item in expired:
         age_seconds = max(0, int((now - expired_item.queued_at).total_seconds()))
         detail = {
@@ -1507,6 +1622,7 @@ async def _sweep_stale_pause_queue_items_for_snapshot() -> list[dict]:
             "queued_at": expired_item.queued_at.isoformat(),
             "age_seconds": age_seconds,
             "held_max_age_seconds": TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS,
+            "playback_target": expired_item.playback_target,
             "message_hash": hashlib.sha256(
                 (expired_item.message or "").encode("utf-8")
             ).hexdigest()[:16],
@@ -1514,6 +1630,8 @@ async def _sweep_stale_pause_queue_items_for_snapshot() -> list[dict]:
             "message_truncated": len(expired_item.message or "") > 300,
         }
         expired_details.append(detail)
+        if expired_item.playback_target is None:
+            backend_null_expired_details.append(detail)
 
     if expired_details:
         _tts_languishing_emit_latch.clear()
@@ -1529,6 +1647,38 @@ async def _sweep_stale_pause_queue_items_for_snapshot() -> list[dict]:
         except Exception:
             logger.warning("Failed to log expired TTS pause item", exc_info=True)
 
+    for detail in backend_null_expired_details:
+        try:
+            await log_event(
+                "tts_backend_null_queue_stale",
+                instance_id=detail["instance_id"],
+                device_id="tts_queue",
+                details={**detail, "reason": "stale_pause_queue_item_had_backend_null"},
+            )
+        except Exception:
+            logger.warning("Failed to log backend-null stale TTS pause item", exc_info=True)
+
+    if backend_null_expired_details and _custodes_state_event_handler is not None:
+        oldest = max(backend_null_expired_details, key=lambda d: d["age_seconds"])
+        try:
+            await _custodes_state_event_handler(
+                "tts_backend_null_queue_stale",
+                "tts_queue",
+                instance_id=oldest["instance_id"],
+                severity=4,
+                payload={
+                    "app": "tts_queue",
+                    "queue": "pause",
+                    "backend_null_count": len(backend_null_expired_details),
+                    "oldest_queued_at": oldest["queued_at"],
+                    "oldest_age_seconds": oldest["age_seconds"],
+                    "held_max_age_seconds": TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS,
+                    "reason": "stale_pause_queue_item_had_backend_null",
+                },
+            )
+        except Exception:
+            logger.warning("Failed to emit backend-null stale TTS state event", exc_info=True)
+
     if expired_details:
         try:
             await log_event(
@@ -1536,6 +1686,7 @@ async def _sweep_stale_pause_queue_items_for_snapshot() -> list[dict]:
                 device_id="tts_queue",
                 details={
                     "expired": len(expired_details),
+                    "backend_null_expired": len(backend_null_expired_details),
                     "held_max_age_seconds": TTS_PAUSE_QUEUE_HELD_MAX_AGE_SECONDS,
                     "per_item_events_logged": len(expired_details),
                 },
@@ -1845,7 +1996,10 @@ async def get_tts_routing():
             "in_meeting": in_meeting,
             "global_mode": global_mode,
             "satellite_available": is_satellite_tts_available(),
-            "phone_reachable": is_phone_reachable(),
+            # Diagnostic only: coarse HTTP reachability is not a TTS routing
+            # predicate. `phone_audio_proxy.available` is the actual audio gate.
+            "phone_server_reachable": is_phone_reachable(),
+            "phone_audio_proxy": get_phone_audio_proxy_health(),
             "discord_vc_active": routing["device"] == "discord",
         },
     }
