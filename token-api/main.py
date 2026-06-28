@@ -318,11 +318,6 @@ from tmuxctl.skill_invoke import skill_invocation_text as _tmuxctl_skill_invocat
 from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
-ASSERT_PERSONA_PANE_LABELS = {
-    "council:custodes",
-    "mechanicus:fabricator-general",
-    "council:administratum",
-}
 
 
 def _sqlite_backup_file(source: Path, dest: Path) -> None:
@@ -442,10 +437,6 @@ def migrate_runtime_databases_if_needed() -> None:
         logger.warning("Timer DB migration failed: %s", exc)
 
 
-def _is_assert_persona_label(value: str | None) -> bool:
-    return (value or "") in ASSERT_PERSONA_PANE_LABELS
-
-
 def _run_tmux_focus_preserved(
     args: tuple[str, ...] | list[str],
     *,
@@ -465,76 +456,6 @@ def _run_tmux_focus_preserved(
         attempted_target=attempted_target,
     ):
         return adapter.run(*tmux_args, allow_failure=allow_failure)
-
-
-def spawn_tmux_assert_instance(
-    pane_target: str | None, instance_id: str = "", source: str = "system"
-) -> None:
-    """Run close-down pane assertion out-of-band and log stdout/stderr.
-
-    This is intentionally shared by hook-adjacent fallback paths (pane-state
-    projection, dead-pane cleanup, reconciler). SessionEnd is preferred, but
-    real exits can be observed first by these workers; stale pane chrome must
-    still converge through tmuxctl's single assert-instance path.
-    """
-    if not pane_target:
-        return
-    tmuxctl = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
-    if not tmuxctl.exists():
-        logger.warning(
-            "%s: assert-instance skipped for %s — tmuxctl not found", source, pane_target
-        )
-        return
-    code = r"""
-import os
-import subprocess
-import sys
-import time
-
-tmuxctl, pane, instance_id, source = sys.argv[1:5]
-env = os.environ.copy()
-env.setdefault("IMPERIUM_TMUX_AUTOMATION", "1")
-try:
-    time.sleep(2)
-    proc = subprocess.run(
-        [tmuxctl, "assert-instance", "--pane", pane],
-        text=True,
-        capture_output=True,
-        timeout=75,
-        check=False,
-        env=env,
-    )
-    sys.stdout.write(f"[{source}] pane={pane} instance={instance_id}\n")
-    sys.stdout.write(proc.stdout)
-    sys.stderr.write(proc.stderr)
-    raise SystemExit(proc.returncode)
-except subprocess.TimeoutExpired as exc:
-    sys.stderr.write(f"[{source}] assert-instance timeout pane={pane} instance={instance_id}: {exc}\n")
-    raise SystemExit(124)
-"""
-    log_path = Path("/tmp/session-end-assert-instance.log")
-    log_handle = None
-    try:
-        log_handle = log_path.open("a")
-        subprocess.Popen(
-            ["python3", "-c", code, str(tmuxctl), pane_target, instance_id, source],
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=log_handle,
-            start_new_session=True,
-            close_fds=True,
-        )
-        logger.info(
-            "%s: spawned assert-instance for %s (%s)", source, pane_target, instance_id[:12]
-        )
-    except Exception as exc:
-        logger.warning("%s: failed to spawn assert-instance for %s: %s", source, pane_target, exc)
-    finally:
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except Exception:
-                pass
 
 
 def log_crash(exc_type, exc_value, exc_tb, context: str = "unhandled"):
@@ -21156,20 +21077,11 @@ async def process_pane_state_queue_once() -> list[dict]:
 
         processed: list[int] = []
         results: list[dict] = []
-        # Track the FINAL queued @CC_STATE per instance in this drain. A status that
-        # bounces (stopped -> idle) inserts two rows in one batch; asserting off the
-        # early "stopped" row would fire a false close-down against a pane whose
-        # final drained state is no longer stopped. Keep only the last @CC_STATE per
-        # instance and assert after the loop. (instance_id -> (value, role, pane).)
-        latest_cc_state: dict[str, tuple[str, str | None, str | None]] = {}
         for row in rows:
             # Resolve the live pane and fail closed. A pane that no longer resolves
             # (agent died, geometry changed, tmux server cycled) must never receive
-            # a set-option nor spawn a stale close-down assertion. The row drains
-            # either way.
+            # a set-option. The row drains either way.
             pane, role = await shared.resolve_instance_pane(row["instance_id"])
-            if row["variable"] == "@CC_STATE":
-                latest_cc_state[row["instance_id"]] = (row["value"], role, pane)
             if not pane:
                 processed.append(row["id"])
                 results.append(
@@ -21223,12 +21135,10 @@ async def process_pane_state_queue_once() -> list[dict]:
             ph = ",".join("?" * len(processed))
             await db.execute(f"DELETE FROM pane_state_queue WHERE id IN ({ph})", processed)
             await db.commit()
-    # Spawn a close-down assertion only for instances whose FINAL @CC_STATE this
-    # drain is "stopped", whose pane still resolves live, and whose live role is not
-    # an asserted persona. Keyed on the live role, never a stored pane_label.
-    for instance_id, (value, role, pane) in latest_cc_state.items():
-        if value == "stopped" and pane and not _is_assert_persona_label(role):
-            spawn_tmux_assert_instance(role or pane, instance_id, "pane-state-stopped")
+    # token-api makes ZERO tmux kill decisions (PHASE B sever). This drainer pushes
+    # @CC_STATE observability variables only; it never spawns a close-down assertion
+    # against a pane. Pane teardown is owned solely by tmuxctld (remain-on-exit +
+    # pane-died hook). A @CC_STATE=stopped is a state read, not a teardown trigger.
     return results
 
 

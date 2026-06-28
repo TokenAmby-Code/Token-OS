@@ -9,18 +9,23 @@ stamp-reuse was meant to close.
 Root cause is a race, not a wrong handler. Plan-accept fires ``SessionEnd``
 then ``SessionStart`` in the SAME wrapper:
 
-  1. ``handle_session_end`` unconditionally stops the row + spawns the tmuxctl
-     assertion, which (registry row now ``stopped`` → assert ``ok=False``)
-     clears ``@INSTANCE_ID``.
+  1. ``handle_session_end`` unconditionally stops the row (and, historically,
+     spawned the tmuxctl assert-instance COLD path, which on a now-``stopped``
+     row asserted ``ok=False`` and cleared ``@INSTANCE_ID``). That COLD path has
+     since been severed entirely (boundary doctrine: SessionEnd is instance-level
+     and never reaches across to invoke tmuxctl pane-control) — but marking the
+     row ``stopped`` alone still races the re-fire and drops it out of active
+     state mid-session.
   2. The paired ``SessionStart`` arrives with a fresh ``session_id`` but the
-     stamp is already gone, so #198's rescue has nothing to read and the
+     row is gone/stopped, so #198's rescue has nothing to read and the
      handler mints a new id + orphan doc.
 
 Two layers under test:
 
   * **Layer 1** — a non-terminal ``SessionEnd`` (``reason`` in {clear, compact})
-    short-circuits BEFORE the stop + assertion, so the live row + stamp survive
-    and the clean #198 stamp path re-keys with no further change.
+    short-circuits BEFORE the stop, so the live row + stamp survive and the
+    clean #198 stamp path re-keys with no further change. As a boundary guard it
+    also confirms no tmuxctl pane-control is invoked.
   * **Layer 2** — a stamp-independent backstop: a ``SessionStart`` carrying a
     known ``wrapper_launch_id`` adopts the existing row keyed on that id
     (re-key, one row, no zombie) even if the stamp is lost for any reason.
@@ -111,15 +116,24 @@ def _mute_tmux_writes(hooks, monkeypatch):
     monkeypatch.setattr(hooks.shared, "apply_instance_pane_tint", _astamp)
 
 
-def _spy_assertion(hooks, monkeypatch):
-    """Record (never run) the tmuxctl SessionEnd assertion — the stamp-clearer."""
+def _spy_tmuxctl(hooks, monkeypatch):
+    """Record any tmuxctl / assert-instance subprocess SessionEnd might spawn.
+
+    The SessionEnd → tmuxctl assert-instance COLD path was severed (it reached
+    from an instance-level hook into tmuxctld's pane domain and culled live
+    panes during plan-mode context-clears). SessionEnd must now spawn NO tmuxctl
+    call at all; this records the subprocess seam so a regression is caught. The
+    stop_hook spawn (non-tmuxctl argv) is filtered out and runs as a no-op.
+    """
     calls = []
 
-    def rec(pane, session_id):
-        calls.append((pane, session_id))
+    def _spy_popen(args, *_a, **_k):
+        argv = list(args) if isinstance(args, (list, tuple)) else [args]
+        if any("assert-instance" in str(x) or str(x).endswith("tmuxctl") for x in argv):
+            calls.append(tuple(str(x) for x in argv))
+        return None
 
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", rec)
-    monkeypatch.setattr(hooks.subprocess, "Popen", lambda *a, **k: None)
+    monkeypatch.setattr(hooks.subprocess, "Popen", _spy_popen)
     _mute_tmux_writes(hooks, monkeypatch)
     return calls
 
@@ -229,60 +243,62 @@ def test_wrapper_launch_id_blank_does_not_adopt(app_env, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_clear_session_end_preserves_row_and_skips_assertion(app_env, monkeypatch):
-    """reason='clear' is non-terminal: the row stays live and the stamp-clearing
-    assertion is NOT spawned. RED today: the row goes stopped + assertion fires.
+def test_clear_session_end_preserves_row_and_skips_tmuxctl(app_env, monkeypatch):
+    """reason='clear' is non-terminal: the row stays live and no tmuxctl
+    pane-control is invoked. RED before #198: the row went stopped.
     """
     hooks = sys.modules["routes.hooks"]
     _insert(app_env.db_path, "clr", pane=_FAKE_PANE, status="working")
-    calls = _spy_assertion(hooks, monkeypatch)
+    calls = _spy_tmuxctl(hooks, monkeypatch)
 
     _end(hooks, {"session_id": "clr", "reason": "clear"})
 
     assert _status(app_env.db_path, "clr") != "stopped", (
         "non-terminal clear must not stop the row (stamp/continuity must survive)"
     )
-    assert calls == [], f"non-terminal clear must not spawn the assertion: {calls}"
+    assert calls == [], f"non-terminal clear must not invoke tmuxctl: {calls}"
 
 
-def test_compact_session_end_preserves_row_and_skips_assertion(app_env, monkeypatch):
+def test_compact_session_end_preserves_row_and_skips_tmuxctl(app_env, monkeypatch):
     """reason='compact' is the other in-wrapper boundary — same treatment."""
     hooks = sys.modules["routes.hooks"]
     _insert(app_env.db_path, "cmp", pane=_FAKE_PANE, status="working")
-    calls = _spy_assertion(hooks, monkeypatch)
+    calls = _spy_tmuxctl(hooks, monkeypatch)
 
     _end(hooks, {"session_id": "cmp", "reason": "compact"})
 
     assert _status(app_env.db_path, "cmp") != "stopped"
-    assert calls == [], f"non-terminal compact must not spawn the assertion: {calls}"
+    assert calls == [], f"non-terminal compact must not invoke tmuxctl: {calls}"
 
 
 # --------------------------------------------------------------------------- #
-# Regression guard — a terminal SessionEnd still tears down                    #
+# Boundary guard — a terminal SessionEnd stops the row but NEVER calls tmuxctl #
 # --------------------------------------------------------------------------- #
 
 
-def test_terminal_session_end_still_stops_and_asserts(app_env, monkeypatch):
-    """A terminal reason (logout) keeps today's full teardown: row stopped +
-    assertion spawned. The non-terminal allow-list must not over-reach.
+def test_terminal_session_end_stops_row_without_tmuxctl(app_env, monkeypatch):
+    """A terminal reason (logout) stops the row (instance-domain) but invokes NO
+    tmuxctl pane-control — the severed COLD path. The non-terminal allow-list
+    must not over-reach: terminal ends still stop the row.
     """
     hooks = sys.modules["routes.hooks"]
     _insert(app_env.db_path, "bye", pane=_FAKE_PANE, status="working")
-    calls = _spy_assertion(hooks, monkeypatch)
+    calls = _spy_tmuxctl(hooks, monkeypatch)
 
     _end(hooks, {"session_id": "bye", "reason": "logout"})
 
     assert _status(app_env.db_path, "bye") == "stopped", "terminal end must stop the row"
-    assert calls, "terminal end must still spawn the SessionEnd assertion"
+    assert calls == [], f"terminal end must not invoke tmuxctl pane-control: {calls}"
 
 
-def test_missing_reason_session_end_still_stops(app_env, monkeypatch):
-    """No reason field (legacy / unknown) defaults to the full terminal teardown."""
+def test_missing_reason_session_end_stops_row_without_tmuxctl(app_env, monkeypatch):
+    """No reason field (legacy / unknown) defaults to terminal teardown: row
+    stopped, still no tmuxctl pane-control."""
     hooks = sys.modules["routes.hooks"]
     _insert(app_env.db_path, "noreason", pane=_FAKE_PANE, status="working")
-    calls = _spy_assertion(hooks, monkeypatch)
+    calls = _spy_tmuxctl(hooks, monkeypatch)
 
     _end(hooks, {"session_id": "noreason"})
 
     assert _status(app_env.db_path, "noreason") == "stopped"
-    assert calls, "unknown reason must keep today's teardown"
+    assert calls == [], f"unknown reason must not invoke tmuxctl pane-control: {calls}"

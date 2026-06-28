@@ -7,11 +7,13 @@ tmuxctl is the sole owner of ``instance_id -> pane``. The pane-state queue (the
 resolves the live pane per row via ``shared.resolve_instance_pane`` and:
 
   * delivers ``tmux set-option`` to the live-resolved pane, never the stored one;
-  * fails closed when the pane no longer resolves — no ``set-option``, no
-    close-down assertion — while still draining the queue row so a dead instance
-    cannot wedge the queue;
-  * keys the ``@CC_STATE=stopped`` assert-persona decision on the *live role*
-    from the resolver, not the stored ``pane_label``.
+  * fails closed when the pane no longer resolves — no ``set-option`` — while
+    still draining the queue row so a dead instance cannot wedge the queue.
+
+PHASE B sever: this worker makes ZERO tmux kill decisions. A ``@CC_STATE=stopped``
+row pushes the observability variable to the live pane like any other value; it
+NEVER spawns a close-down ``assert-instance`` against the pane. Pane teardown is
+owned solely by tmuxctld (remain-on-exit + pane-died hook).
 
 File-scoped resolver stub (mirrors the proven Tier 2(b) pattern) so the real
 resolver elsewhere is untouched; each test sets the live-resolution it asserts.
@@ -133,14 +135,10 @@ async def test_pane_gone_drains_row_without_touching_tmux(
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _gone)
 
-    spawned: list[Any] = []
-    monkeypatch.setattr(main, "spawn_tmux_assert_instance", lambda *a, **k: spawned.append((a, k)))
-
     _enqueue_pane_state(app_env.db_path, "inst-gone", "@CC_STATE", "stopped")
     results = await main.process_pane_state_queue_once()
 
     assert _set_options(_capture_set_option) == [], "vanished pane must get no set-option"
-    assert spawned == [], "vanished pane must not spawn a close-down assertion"
     assert results[0]["status"] == "skipped"
     assert results[0]["reason"] == "pane_unresolved"
     assert results[0]["tmux_pane"] is None
@@ -148,14 +146,34 @@ async def test_pane_gone_drains_row_without_touching_tmux(
     assert _queue_count(app_env.db_path) == 0
 
 
-# ---- @CC_STATE=stopped spawns the assertion keyed on the LIVE role ----------
+# ---- @CC_STATE=stopped pushes the variable but NEVER spawns an assertion -----
 
 
-async def test_stopped_spawns_assertion_with_live_role(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
+@pytest.fixture
+def _spy_no_subprocess(app_env: Any, monkeypatch: Any) -> list[tuple]:
+    """Spy ``main.subprocess.Popen`` — the mechanism the severed close-down
+    assertion used. Any call is a boundary violation (token-api makes no tmux
+    kill decisions). Returns the (empty) call log for assertion."""
+    main = app_env.main
+    popen_calls: list[tuple] = []
+
+    def _spy_popen(args, *_a, **_k):
+        popen_calls.append(tuple(args) if isinstance(args, (list, tuple)) else (args,))
+        return None
+
+    monkeypatch.setattr(main.subprocess, "Popen", _spy_popen)
+    return popen_calls
+
+
+async def test_stopped_pushes_set_option_but_spawns_no_assertion(
+    app_env: Any,
+    monkeypatch: Any,
+    _capture_set_option: list[tuple[str, ...]],
+    _spy_no_subprocess: list[tuple],
 ) -> None:
-    """A live-resolved stopped instance with a non-persona role spawns the
-    close-down assertion targeting the live role (resolved, not stored)."""
+    """A live-resolved stopped instance pushes ``@CC_STATE=stopped`` to the live
+    pane (observability) and spawns NO close-down assertion. PHASE B sever:
+    token-api never reaches across to assert/kill a pane."""
     main = app_env.main
 
     async def _resolve_live(_instance_id):
@@ -163,30 +181,26 @@ async def test_stopped_spawns_assertion_with_live_role(
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
 
-    spawned: list[tuple] = []
-    monkeypatch.setattr(
-        main,
-        "spawn_tmux_assert_instance",
-        lambda pane_target, instance_id="", source="system": spawned.append(
-            (pane_target, instance_id, source)
-        ),
-    )
-
     _enqueue_pane_state(app_env.db_path, "inst-stop", "@CC_STATE", "stopped")
-    await main.process_pane_state_queue_once()
+    results = await main.process_pane_state_queue_once()
 
-    assert len(spawned) == 1
-    pane_target, instance_id, _source = spawned[0]
-    assert pane_target == "palace:N", "assertion must target the LIVE role"
-    assert instance_id == "inst-stop"
+    sets = _set_options(_capture_set_option)
+    assert len(sets) == 1, "stopped is a normal observability push to the live pane"
+    assert sets[0][-2:] == ("@CC_STATE", "stopped")
+    assert "%77" in sets[0]
+    assert results[0]["status"] == "applied"
+    assert _spy_no_subprocess == [], "stopped must NOT spawn any close-down subprocess"
 
 
-async def test_stopped_on_persona_role_skips_assertion(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
+async def test_stopped_on_persona_role_spawns_no_assertion(
+    app_env: Any,
+    monkeypatch: Any,
+    _capture_set_option: list[tuple[str, ...]],
+    _spy_no_subprocess: list[tuple],
 ) -> None:
-    """The assert-persona guard keys on the LIVE role: a stopped instance whose
-    live role is a persona label (e.g. ``council:custodes``) must NOT spawn an
-    assertion — even though the stored column never enters the decision."""
+    """A stopped instance whose live role is a persona label is no different:
+    it pushes the variable and spawns no assertion. There is no longer any
+    persona-keyed assert decision at all."""
     main = app_env.main
 
     async def _resolve_persona(_instance_id):
@@ -194,65 +208,34 @@ async def test_stopped_on_persona_role_skips_assertion(
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_persona)
 
-    spawned: list[Any] = []
-    monkeypatch.setattr(main, "spawn_tmux_assert_instance", lambda *a, **k: spawned.append((a, k)))
-
     _enqueue_pane_state(app_env.db_path, "inst-custodes", "@CC_STATE", "stopped")
     await main.process_pane_state_queue_once()
 
-    assert spawned == [], "persona role must not spawn a close-down assertion"
+    assert _spy_no_subprocess == [], "no role spawns a close-down assertion anymore"
 
 
-async def test_bounced_state_in_one_drain_does_not_assert_stale_stopped(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
+async def test_bounced_state_in_one_drain_spawns_no_assertion(
+    app_env: Any,
+    monkeypatch: Any,
+    _capture_set_option: list[tuple[str, ...]],
+    _spy_no_subprocess: list[tuple],
 ) -> None:
-    """A status that bounces stopped -> idle within one drain queues two @CC_STATE
-    rows. The early ``stopped`` must NOT fire a close-down assertion when the FINAL
-    drained state for that instance is no longer stopped."""
+    """A status that bounces stopped -> idle within one drain pushes both values
+    to the live pane and spawns no assertion for either."""
     main = app_env.main
 
     async def _resolve_live(_instance_id):
         return ("%77", "palace:N")
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
-
-    spawned: list[Any] = []
-    monkeypatch.setattr(main, "spawn_tmux_assert_instance", lambda *a, **k: spawned.append((a, k)))
 
     # Same instance: stopped then idle, both drained in one batch (ORDER BY id).
     _enqueue_pane_state(app_env.db_path, "inst-bounce", "@CC_STATE", "stopped")
     _enqueue_pane_state(app_env.db_path, "inst-bounce", "@CC_STATE", "idle")
     await main.process_pane_state_queue_once()
 
-    assert spawned == [], "final state is idle — no stale stopped assertion"
-
-
-async def test_repeated_stopped_in_one_drain_asserts_once(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
-) -> None:
-    """Two ``stopped`` rows for the same instance in one drain collapse to a single
-    close-down assertion (deduped on the final per-instance state)."""
-    main = app_env.main
-
-    async def _resolve_live(_instance_id):
-        return ("%77", "palace:N")
-
-    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
-
-    spawned: list[tuple] = []
-    monkeypatch.setattr(
-        main,
-        "spawn_tmux_assert_instance",
-        lambda pane_target, instance_id="", source="system": spawned.append(
-            (pane_target, instance_id)
-        ),
-    )
-
-    _enqueue_pane_state(app_env.db_path, "inst-stop2", "@CC_STATE", "stopped")
-    _enqueue_pane_state(app_env.db_path, "inst-stop2", "@CC_STATE", "stopped")
-    await main.process_pane_state_queue_once()
-
-    assert spawned == [("palace:N", "inst-stop2")], "stopped must assert exactly once"
+    assert len(_set_options(_capture_set_option)) == 2, "both states push to the live pane"
+    assert _spy_no_subprocess == [], "no drain spawns a close-down assertion"
 
 
 # ---- @PANE_LABEL pushes generically (Phase 1 Part A) ------------------------
@@ -283,25 +266,26 @@ async def test_pushes_pane_label_generically(
     assert _queue_count(app_env.db_path) == 0
 
 
-async def test_pane_label_value_stopped_does_not_assert(
-    app_env: Any, monkeypatch: Any, _capture_set_option: list[tuple[str, ...]]
+async def test_pane_label_value_stopped_spawns_no_assertion(
+    app_env: Any,
+    monkeypatch: Any,
+    _capture_set_option: list[tuple[str, ...]],
+    _spy_no_subprocess: list[tuple],
 ) -> None:
     """@PANE_LABEL is compatibility name data, not rendered border state. Even a
-    literal value of 'stopped' (an instance named that) must never drive the
-    @CC_STATE close-down assertion, which keys on the variable, not the value."""
+    literal value of 'stopped' (an instance named that) pushes the variable and
+    spawns no assertion — the worker spawns no assertion for any row."""
     main = app_env.main
 
     async def _resolve_live(_instance_id):
         return ("%3", "palace:N")
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
-    spawned: list[Any] = []
-    monkeypatch.setattr(main, "spawn_tmux_assert_instance", lambda *a, **k: spawned.append((a, k)))
 
     _enqueue_pane_state(app_env.db_path, "inst-x", "@PANE_LABEL", "stopped")
     await main.process_pane_state_queue_once()
 
-    assert spawned == [], "a @PANE_LABEL value must never drive the close-down assertion"
+    assert _spy_no_subprocess == [], "a @PANE_LABEL value must never drive a close-down assertion"
 
 
 # ---- trg_tab_name_pane_state: rename enqueues @PANE_LABEL -------------------

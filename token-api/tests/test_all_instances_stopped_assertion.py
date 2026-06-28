@@ -93,8 +93,7 @@ def test_session_end_zeroing_count_does_not_emit_all_stopped(app_env, monkeypatc
 
     # Intercept every phone-direct path the old detector could take.
     monkeypatch.setattr(phone_service, "_send_to_phone", fake_send_to_phone)
-    # Keep the hook from spawning tmuxctl / stop_hook subprocesses in the test.
-    monkeypatch.setattr(hooks, "_spawn_session_end_assertion", lambda *a, **k: None)
+    # Keep the hook from spawning stop_hook subprocesses in the test.
     monkeypatch.setattr(hooks.subprocess, "Popen", lambda *a, **k: None)
 
     _insert_instance(app_env.db_path, "sess-churn")
