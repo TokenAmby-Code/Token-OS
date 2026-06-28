@@ -93,7 +93,7 @@ def _post(server, path: str, body):
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
-def _mock_human_lock(monkeypatch, *, pending: bool = False) -> None:
+def _mock_human_lock(monkeypatch: pytest.MonkeyPatch, *, pending: bool = False) -> None:
     """Simulate a live human keystroke (or pending) lock with NO live tmux.
 
     Patches the send_gate option primitives so both the gate predicate and the
@@ -112,7 +112,9 @@ def _mock_human_lock(monkeypatch, *, pending: bool = False) -> None:
     monkeypatch.setattr(typing_guard_state, "hold", lambda *a, **k: False)
 
 
-def test_enforce_override_cannot_pierce_human_keystroke_lock(monkeypatch) -> None:
+def test_enforce_override_cannot_pierce_human_keystroke_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _RecordingAdapter.sends.clear()
     _mock_human_lock(monkeypatch)
     # The enforce-action's process-global sanctioned override (NOT one of the
@@ -135,7 +137,7 @@ def test_enforce_override_cannot_pierce_human_keystroke_lock(monkeypatch) -> Non
     assert _RecordingAdapter.sends == [], "bytes reached the pane over a live human lock"
 
 
-def test_enforce_override_cannot_pierce_human_pending_lock(monkeypatch) -> None:
+def test_enforce_override_cannot_pierce_human_pending_lock(monkeypatch: pytest.MonkeyPatch) -> None:
     _RecordingAdapter.sends.clear()
     _mock_human_lock(monkeypatch, pending=True)
     monkeypatch.setenv("TMUX_SEND_GATE_ALLOW", "custodes_enforcement_deferred_timeout")
@@ -156,7 +158,9 @@ def test_enforce_override_cannot_pierce_human_pending_lock(monkeypatch) -> None:
     assert _RecordingAdapter.sends == []
 
 
-def test_enforce_override_cannot_pierce_human_lock_via_send_keys(monkeypatch) -> None:
+def test_enforce_override_cannot_pierce_human_lock_via_send_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The /tmux/send-keys handler honors the same inviolable human-lock guard."""
     _RecordingAdapter.sends.clear()
     _mock_human_lock(monkeypatch)
@@ -178,7 +182,7 @@ def test_enforce_override_cannot_pierce_human_lock_via_send_keys(monkeypatch) ->
     assert _RecordingAdapter.sends == [], "keys reached the pane over a live human lock"
 
 
-def test_pane_resolution_failure_fails_closed(monkeypatch) -> None:
+def test_pane_resolution_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """A genuine resolver failure must gate the send, never fall through and pierce.
 
     No human lock is mocked here: the point is that an UNRESOLVED canonical id
@@ -208,7 +212,7 @@ def test_pane_resolution_failure_fails_closed(monkeypatch) -> None:
     assert _RecordingAdapter.sends == []
 
 
-def test_unlocked_pane_still_sends_under_enforce_override(monkeypatch) -> None:
+def test_unlocked_pane_still_sends_under_enforce_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """Guard must not over-block: an OFF pane still delivers under the override."""
     _RecordingAdapter.sends.clear()
     monkeypatch.setattr(send_gate, "_pane_lock_until", lambda target: None)
