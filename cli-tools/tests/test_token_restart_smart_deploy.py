@@ -1,5 +1,6 @@
 """token-restart is a git-aware smart deploy: sync the live checkout, then restart
-ONLY the services whose files the pull changed.
+the services whose files the pull changed, plus token-api as the deploy-proof
+anchor for /health.git_sha.
 
 These tests run the real token-restart with a stubbed `git` on PATH that fakes a
 fast-forward and reports a controlled set of changed paths (STUB_CHANGED_PATHS).
@@ -197,12 +198,10 @@ esac
         "MERGE_FAIL_TIMES": str(fail_times),
         "MERGE_FAIL_MSG": merge_fail_msg,
         "MERGE_COUNTER": str(tmp_path / "merge_count.txt"),
-        # Default the live process's self-reported SHA to whatever the git stub
-        # reports for the checkout HEAD (NEW111 when no-advance, else OLD000) so
-        # running==checkout → NOT stale, and every existing test keeps its
-        # current no-op/selective assertions. A test opts into staleness by
-        # overriding env["STUB_RUNNING_SHA"] (e.g. "STALE999").
-        "STUB_RUNNING_SHA": "NEW111" if no_advance else "OLD000",
+        # Default the post-restart /health SHA to the deploy target so the new
+        # deploy-verification gate can pass under stubs. Tests can still opt into
+        # a stale process by overriding env["STUB_RUNNING_SHA"] (e.g. "STALE999").
+        "STUB_RUNNING_SHA": "NEW111",
     }
     if no_advance:
         env["STUB_NO_ADVANCE"] = "1"
@@ -233,27 +232,31 @@ def test_token_api_change_restarts_only_token_api(tmp_path: Path) -> None:
     assert "push-mobile -a" not in calls
 
 
-def test_discord_change_restarts_only_discord(tmp_path: Path) -> None:
+def test_discord_change_restarts_discord_and_verifies_token_api(tmp_path: Path) -> None:
     env, logfile = _stub_env(tmp_path, "discord-daemon/daemon.js")
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert KICK_DISCORD in calls
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert "push-mobile -a" not in calls
 
 
-def test_mobile_change_runs_push_mobile_only(tmp_path: Path) -> None:
+def test_mobile_change_runs_push_mobile_and_verifies_token_api(tmp_path: Path) -> None:
     env, logfile = _stub_env(tmp_path, "mobile/termux-toolbar-toggle")
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert "push-mobile -a" in calls
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
 
 
-def test_satellite_or_refresh_helper_change_refreshes_wsl_only(tmp_path: Path) -> None:
+def test_satellite_or_refresh_helper_change_refreshes_wsl_and_verifies_token_api(
+    tmp_path: Path,
+) -> None:
     env, logfile = _stub_env(
         tmp_path,
         "token-api/token-satellite.py\ntoken-api/scripts/token-satellite-refresh",
@@ -261,7 +264,8 @@ def test_satellite_or_refresh_helper_change_refreshes_wsl_only(tmp_path: Path) -
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert "/runtime/refresh" in calls
     assert "/restart" not in calls
     assert KICK_DISCORD not in calls
@@ -273,7 +277,8 @@ def test_ahk_and_cli_changes_refresh_wsl_runtime(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert "/runtime/refresh" in calls
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
 
 
@@ -301,14 +306,16 @@ def test_multiple_changed_services_all_restart(tmp_path: Path) -> None:
 
 def test_tmuxctld_daemon_code_change_restarts_tmuxctld(tmp_path: Path) -> None:
     # A change in the daemon code area bounces the tmuxctld daemon (launchctl
-    # kickstart -k, like discord). token-api/discord are untouched. The tmuxctl
-    # subtree lives under cli-tools/lib, so the existing WSL refresh is preserved.
+    # kickstart -k, like discord). token-api also restarts so /health.git_sha
+    # verifies the merged SHA. The tmuxctl subtree lives under cli-tools/lib, so
+    # the existing WSL refresh is preserved.
     env, logfile = _stub_env(tmp_path, "cli-tools/lib/tmuxctl/daemon.py")
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert KICK_TMUXCTLD in calls
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
     # cli-tools/lib/* still refreshes the WSL runtime (additive, no regression).
     assert "/runtime/refresh" in calls
@@ -316,14 +323,17 @@ def test_tmuxctld_daemon_code_change_restarts_tmuxctld(tmp_path: Path) -> None:
     _assert_no_fleet_wipe(calls)
 
 
-def test_tmuxctld_entrypoint_change_restarts_tmuxctld_only(tmp_path: Path) -> None:
+def test_tmuxctld_entrypoint_change_restarts_tmuxctld_and_verifies_token_api(
+    tmp_path: Path,
+) -> None:
     # The Mac-local entrypoint routes to the daemon restart only — no WSL refresh.
     env, logfile = _stub_env(tmp_path, "cli-tools/bin/tmuxctld")
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
     assert KICK_TMUXCTLD in calls
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
     assert "/runtime/refresh" not in calls
     _assert_no_fleet_wipe(calls)
@@ -351,22 +361,23 @@ def test_tmuxctld_plist_change_reinstalls_daemon(tmp_path: Path) -> None:
     # The freshly-synced plist was copied into the (overridden) LaunchAgents path.
     assert dst_plist.exists()
     assert dst_plist.read_text() == src_plist.read_text()
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     _assert_no_fleet_wipe(calls)
 
 
 # ── Nothing deployable / no-op / fallback ────────────────────
 
 
-def test_docs_only_change_restarts_nothing(tmp_path: Path) -> None:
+def test_docs_only_change_still_restarts_token_api_for_deploy_proof(tmp_path: Path) -> None:
     env, logfile = _stub_env(tmp_path, "README.md\nTerra/Journal/Daily/2026-06-06.md")
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
     assert "push-mobile -a" not in calls
-    assert "No deployable services changed" in proc.stdout
 
 
 def test_tmux_config_change_sources_running_server_once_without_service_restart(
@@ -384,10 +395,10 @@ def test_tmux_config_change_sources_running_server_once_without_service_restart(
     calls = logfile.read_text()
     assert "tmux has-session" in calls
     assert f"tmux source-file {tmp_path / '.tmux.conf'}" in calls
-    assert RESTART_TOKENAPI not in calls
+    assert RESTART_TOKENAPI in calls
+    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
     assert "push-mobile -a" not in calls
-    assert "No deployable services changed" in proc.stdout
 
 
 def test_no_advance_falls_back_to_full_restart(tmp_path: Path) -> None:
@@ -545,3 +556,74 @@ def test_no_advance_full_restart_still_never_wipes_fleet(tmp_path: Path) -> None
     assert RESTART_TOKENAPI in calls
     assert KICK_DISCORD in calls
     _assert_no_fleet_wipe(calls)
+
+
+def test_trailing_resync_clears_pinned_sha_to_converge_newest_main(tmp_path: Path) -> None:
+    """Regression for #413/#418-style lag: a lock contender queued a trailing
+    re-sync, but the holder kept its original TOKEN_RESTART_TARGET_SHA pinned.
+    The trailing pass must unset that target so resolve_deploy_target uses the
+    freshly fetched bare main instead of falsely no-oping on the older SHA.
+    """
+    env, _logfile = _stub_env(tmp_path, "token-api/main.py")
+    script = f"""
+set -euo pipefail
+source {TOKEN_RESTART!s}
+TOKEN_RESTART_TARGET_SHA=oldpinned
+SYNC_DID_ADVANCE=true
+SYNC_CHANGED_PATHS=stale
+RESTART_TOKENAPI=true
+_reset_deploy_run_state
+[[ -z "${{TOKEN_RESTART_TARGET_SHA}}" ]] || {{ echo "still pinned: $TOKEN_RESTART_TARGET_SHA"; exit 42; }}
+[[ "$SYNC_DID_ADVANCE" == false ]]
+[[ -z "$SYNC_CHANGED_PATHS" ]]
+[[ "$RESTART_TOKENAPI" == false ]]
+"""
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_deploy_verify_alarm_fails_when_health_sha_mismatch(tmp_path: Path) -> None:
+    env, _logfile = _stub_env(tmp_path, "token-api/main.py")
+    env["STUB_RUNNING_SHA"] = "STALE999"
+    proc = _run(env)
+    assert proc.returncode != 0
+    assert "DEPLOY VERIFY ALARM" in proc.stdout
+    assert "STALE999" in proc.stdout
+
+
+def test_superseded_deploy_drops_current_restart_set(tmp_path: Path) -> None:
+    """Last-merge-wins invariant: while holding the deploy mutex, a pending
+    sentinel means a newer webhook arrived. The current deploy must stop doing
+    obsolete restarts and let the trailing pass re-sync newest main.
+    """
+    env, _logfile = _stub_env(tmp_path, "token-api/main.py")
+    lockdir = tmp_path / "deploy.lock"
+    lockdir.mkdir()
+    (lockdir / "redeploy-pending").write_text("1")
+    script = f"""
+set -euo pipefail
+source {TOKEN_RESTART!s}
+DEPLOY_LOCKDIR={str(lockdir)!r}
+DEPLOY_LOCK_HELD=true
+abort_deploy_if_superseded "unit-test"
+rm -f "$DEPLOY_LOCKDIR/redeploy-pending"
+if abort_deploy_if_superseded "unit-test"; then
+  echo "false supersede"
+  exit 42
+fi
+"""
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "deploy superseded during unit-test" in proc.stdout

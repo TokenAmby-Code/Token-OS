@@ -44,7 +44,10 @@ env:
 
 concurrency:
   group: deploy-prod
-  cancel-in-progress: false
+  # Last merge wins: a newer push to main invalidates any older deploy run. The
+  # latest run will POST/verify the tip; the local Mac deploy mutex also drops
+  # obsolete in-flight restart sets when a newer webhook arrives.
+  cancel-in-progress: true
 
 jobs:
   # ── Hit the restart endpoint. token-restart (git-aware) does the rest. ──
@@ -110,3 +113,28 @@ jobs:
             echo "::error::CD restart webhook returned HTTP $code"
             exit 1
           fi
+
+      - name: Verify live deployment SHA
+        if: steps.gate.outputs.go == 'true'
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          deadline=$((SECONDS + 180))
+          last=""
+          echo "Verifying live /health git_sha reaches $SHA"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if curl -fsS -m 5 "http://${CD_HOST}:7777/health" -o /tmp/cd_health.json; then
+              last=$(jq -r '.git_sha // empty' /tmp/cd_health.json)
+              if [ "$last" = "$SHA" ]; then
+                echo "Live deploy verified: /health git_sha=$last"
+                exit 0
+              fi
+              echo "Waiting for live sha: got '${last:-empty}', want '$SHA'"
+            else
+              echo "Waiting for /health to respond"
+            fi
+            sleep 5
+          done
+          echo "::error::DEPLOY VERIFY ALARM: live /health git_sha='${last:-unreachable}' != merged sha '$SHA' after 180s"
+          cat /tmp/cd_health.json 2>/dev/null || true
+          exit 1

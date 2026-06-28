@@ -483,6 +483,11 @@ deploy_lock_acquire() {
 # Reset the per-run sync/restart globals so a trailing coalescing re-run starts
 # clean and re-resolves the newest target instead of inheriting the prior run.
 _reset_deploy_run_state() {
+    # A queued trailing re-sync must converge on the newest fetched main, not stay
+    # pinned to the first webhook's TOKEN_RESTART_TARGET_SHA. Leaving the target
+    # env set made rapid merges falsely report "already at newest" while the bare
+    # repo had advanced past the pinned SHA.
+    TOKEN_RESTART_TARGET_SHA=""
     SYNC_DID_ADVANCE=false
     SYNC_CHANGED_PATHS=""
     SYNC_TARGET_SHA=""
@@ -951,6 +956,26 @@ source_tmux_config_if_changed() {
         return 0
     fi
     echo -e "  ${RED}✗${NC} tmux source-file failed: ${tmux_conf}"
+    return 1
+}
+
+
+verify_mac_git_sha() {
+    local expected="${SYNC_TARGET_SHA:-${TOKEN_RESTART_TARGET_SHA:-}}"
+    [[ -n "$expected" ]] || return 0
+
+    local attempts=0 running=""
+    while [[ $attempts -lt 15 ]]; do
+        running="$(mac_running_git_sha)"
+        if [[ "$running" == "$expected" ]]; then
+            echo -e "  ${GREEN}✓${NC} deploy verified: /health git_sha=${expected:0:9}"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+
+    echo -e "  ${RED}✗${NC} DEPLOY VERIFY ALARM: /health git_sha='${running:-unreachable}' != expected ${expected}"
     return 1
 }
 
@@ -1612,6 +1637,23 @@ map_changed_to_services() {
     return 0
 }
 
+# True when a newer webhook arrived while this holder was deploying. In last-merge
+# wins mode, the current restart set is now stale: the code is losslessly included
+# in the newer main tip, so drop the old deploy and let the trailing re-sync deploy
+# the newest SHA instead of serializing obsolete restarts.
+deploy_superseded() {
+    [[ "$DEPLOY_LOCK_HELD" == true && -f "$DEPLOY_LOCKDIR/redeploy-pending" ]]
+}
+
+abort_deploy_if_superseded() {
+    local stage="${1:-deploy}"
+    if deploy_superseded; then
+        echo -e "${YELLOW}⚠${NC} deploy superseded during ${stage} — dropping current restart set; trailing re-sync will deploy newest main"
+        return 0
+    fi
+    return 1
+}
+
 # ============ Full Restart ============
 
 full_restart() {
@@ -1627,6 +1669,7 @@ full_restart() {
             return 1
         fi
         echo ""
+        abort_deploy_if_superseded "sync" && return 0
     fi
 
     # 0b. Reconcile process state with checkout state. Deciding what to restart
@@ -1643,12 +1686,14 @@ full_restart() {
 
     # 1. Decide what to restart.
     if [[ "$SYNC_DID_ADVANCE" == true ]]; then
-        # Smart deploy: restart ONLY the services whose files the pull changed.
+        # Smart deploy: restart changed services, and ALWAYS bounce token-api for
+        # every advanced merge so /health.git_sha becomes a deploy-verification
+        # proof for the merged SHA. Without this, docs/discord/mobile-only merges
+        # could update the runtime checkout while live /health kept reporting an
+        # older process SHA, creating an unguarded merge→live gap.
         map_changed_to_services
         source_tmux_config_if_changed || return 1
-        # A stale live process must bounce even if only non-service files (docs)
-        # changed this pull — the process is still serving older code.
-        [[ "$token_api_stale" == true ]] && RESTART_TOKENAPI=true
+        RESTART_TOKENAPI=true
         if [[ "$RESTART_TOKENAPI" != true && "$RESTART_DISCORD" != true \
             && "$RESTART_WSL" != true && "$RESTART_MOBILE" != true \
             && "$RESTART_TMUXCTLD" != true ]]; then
@@ -1687,26 +1732,34 @@ full_restart() {
     fi
 
     # 2. Mac token-api
+    abort_deploy_if_superseded "before token-api restart" && return 0
     if [[ "$RESTART_TOKENAPI" == true ]]; then
-        restart_mac || true
+        restart_mac || return 1
+        abort_deploy_if_superseded "after token-api restart" && return 0
+        verify_mac_git_sha || return 1
         echo ""
     fi
 
     # 3. Discord daemon (Mac-only, launchd-supervised)
+    abort_deploy_if_superseded "before discord restart" && return 0
     if [[ "$RESTART_DISCORD" == true ]]; then
         restart_discord || true
+        abort_deploy_if_superseded "after discord restart" && return 0
         echo ""
     fi
 
     # 3b. tmuxctld daemon (Mac-only, launchd-supervised loopback control plane).
     #     Fail-soft like Discord: a daemon that won't come back must not abort the
     #     rest of the deploy.
+    abort_deploy_if_superseded "before tmuxctld restart" && return 0
     if [[ "$RESTART_TMUXCTLD" == true ]]; then
         restart_tmuxctld || true
+        abort_deploy_if_superseded "after tmuxctld restart" && return 0
         echo ""
     fi
 
     # 4. WSL satellite (background; never blocks the deploy)
+    abort_deploy_if_superseded "before WSL refresh" && return 0
     local wsl_pid=""
     if [[ "$RESTART_WSL" == true ]]; then
         restart_wsl &
@@ -1714,12 +1767,14 @@ full_restart() {
     fi
 
     # 5. Mobile (phone push)
+    abort_deploy_if_superseded "before mobile push" && return 0
     if [[ "$RESTART_MOBILE" == true ]]; then
         restart_mobile || true
         echo ""
     fi
 
     [[ -n "$wsl_pid" ]] && { wait "$wsl_pid" 2>/dev/null || true; }
+    abort_deploy_if_superseded "after async WSL refresh" && return 0
 
     # 6. Browser cockpit refresh — only if token-api was (re)started and healthy.
     if [[ "$RESTART_TOKENAPI" == true ]] && check_mac_health; then
