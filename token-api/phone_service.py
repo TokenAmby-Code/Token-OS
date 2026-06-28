@@ -283,6 +283,25 @@ def _send_pavlok_to_phone(stimulus_type: str, value: int) -> dict:
     return _send_to_phone_raw("/zap", {"action": stimulus_type, "intensity": value})
 
 
+def _send_eject_to_phone(method: str = "redirect") -> dict:
+    """Eject transport: phone MacroDroid `/eject` → no-ADB app eviction.
+
+    `method=redirect` (default, validated vs immersive Slay the Spire) foregrounds
+    Spotify and plays it, punching through immersive fullscreen with no root/ADB.
+    The `method=` param is the future audio-routing seam. A pure action by decree
+    (no-warnings-enforcement-decree): no banner/TTS.
+    """
+    if PHONE_STATE.get("reachable") is False:
+        PHONE_STATE["last_reachable_check"] = datetime.now().isoformat()
+        print("EJECT: phone dispatch skipped; phone is known offline")
+        return {
+            "success": False,
+            "skipped_phone": True,
+            "reason": "phone_known_offline",
+        }
+    return _send_to_phone_raw("/eject", {"method": method})
+
+
 def _send_pavlok_api(stimulus_type: str, value: int, reason: str) -> dict:
     """Fallback Pavlok API transport."""
     if not PAVLOK_CONFIG["token"]:

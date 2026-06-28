@@ -27,6 +27,11 @@ class EnforceRequest(BaseModel):
     intensity: int = 50
     source: str = "api"
     context: dict | None = None
+    # When False, suppress the phone notification (TTS/banner). The phone path
+    # sets this to avoid a focus-stealing banner that blips immersive fullscreen
+    # apps (no-warnings-enforcement-decree: the eject is a pure action). The
+    # Pavlok zap is a separate lane and always fires.
+    notify: bool = True
 
 
 _is_quiet_hours = None
@@ -148,12 +153,15 @@ async def enforce(request: EnforceRequest) -> dict:
     )
     await log_event("pavlok_stimulus", details=pavlok_result)
 
-    notify_result = await dispatch_notification(
-        NotifyRequest(
-            message=request.message,
-            type="tts",
+    if request.notify:
+        notify_result = await dispatch_notification(
+            NotifyRequest(
+                message=request.message,
+                type="tts",
+            )
         )
-    )
+    else:
+        notify_result = {"sent": False, "skipped": "notify_suppressed"}
 
     await log_event(
         "enforce",
