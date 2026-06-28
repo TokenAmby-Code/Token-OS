@@ -380,7 +380,8 @@ def persona_schema_sql() -> str:
             tts_rate TEXT,
             notification_sound TEXT,
             default_session_doc TEXT,
-            tts_policy TEXT DEFAULT 'silent',
+            tts_policy TEXT NOT NULL DEFAULT 'silent'
+                CHECK (tts_policy IN ('silent', 'hot', 'pause')),
             CHECK (default_rank = 'astartes' OR assignment_pool IS NULL)
         )
     """
@@ -434,7 +435,11 @@ UPSERT_SQL = """
 # follows then backfills values onto existing rows.
 _PERSONA_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("default_session_doc", "ALTER TABLE personas ADD COLUMN default_session_doc TEXT"),
-    ("tts_policy", "ALTER TABLE personas ADD COLUMN tts_policy TEXT DEFAULT 'silent'"),
+    (
+        "tts_policy",
+        "ALTER TABLE personas ADD COLUMN tts_policy TEXT NOT NULL DEFAULT 'silent' "
+        "CHECK (tts_policy IN ('silent', 'hot', 'pause'))",
+    ),
 )
 
 

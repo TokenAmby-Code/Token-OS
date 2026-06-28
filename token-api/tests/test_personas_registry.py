@@ -1,6 +1,7 @@
 import sqlite3
 import uuid
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 import pytest
@@ -30,7 +31,7 @@ async def test_personas_seed_and_schema_constraints(app_env):
 
 
 @pytest.mark.asyncio
-async def test_tts_policy_seeded_per_persona_deny_by_default(app_env):
+async def test_tts_policy_seeded_per_persona_deny_by_default(app_env: Any) -> None:
     """``personas.tts_policy`` is seeded with deny-by-default semantics: Custodes is
     ``hot``, voiced Astartes are ``pause``, and every voiceless persona (FG,
     mechanicus, mechanicus-worker, primarchs, civic seats) is ``silent``."""
@@ -47,6 +48,7 @@ async def test_tts_policy_seeded_per_persona_deny_by_default(app_env):
         "deathwatch": "pause",
         "fabricator-general": "silent",
         "administratum": "silent",
+        "inquisitor": "silent",
         "mechanicus": "silent",
         "mechanicus-worker": "silent",
         "pax": "silent",
