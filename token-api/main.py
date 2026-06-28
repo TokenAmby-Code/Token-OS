@@ -132,6 +132,7 @@ from personas import (
     resolve_persona,
 )
 from phone_service import (
+    _send_eject_to_phone,
     _send_to_phone,
     load_zap_count_from_daily_note,
     push_phone_widget_async,
@@ -13442,6 +13443,12 @@ PHONE_DISTRACTION_ENFORCE_DELAY_SECONDS = int(
     os.environ.get("PHONE_DISTRACTION_ENFORCE_DELAY_SECONDS", "10")
 )
 
+# Minimum gap between phone enforce fires for the same app. Inside this window a
+# repeat enforce (zap + eject) is skipped, so a residual immersive flap can't
+# re-shoot in a tight loop. Doubles as the "sustained gap" threshold that tells a
+# clean app close (resets the ramp) apart from a close→reopen flap (keeps it).
+PHONE_ENFORCE_MIN_GAP_SECONDS = float(os.environ.get("PHONE_ENFORCE_MIN_GAP_SECONDS", "45"))
+
 # Human-readable display names for phone apps (key = lowercased app name or package)
 PHONE_APP_DISPLAY_NAMES = {
     "youtube": "YouTube",
@@ -14888,6 +14895,13 @@ def start_enforcement_cascade(app_name: str) -> None:
     Replaces the legacy 5-level cascade. Golden Throne owns any repetition.
     Distraction-source is set to "phone" so the notification is never routed
     back to the device the user is being asked to put down.
+
+    Phone enforcement is a pure action (no-warnings-enforcement-decree): the
+    enforce fires with notify=False (no focus-stealing banner that would blip an
+    immersive game's fullscreen and self-sustain a close→reopen loop) plus a
+    no-ADB eject that foregrounds+plays Spotify to evict the app. A per-app
+    cooldown (PHONE_ENFORCE_MIN_GAP_SECONDS) suppresses tight re-fire loops, and
+    the intensity ramps min(30 + 10*rep, 100) across repeats.
     """
     if is_quiet_hours():
         print(f"ENFORCE: quiet hours suppressed for {app_name}")
@@ -14903,7 +14917,43 @@ def start_enforcement_cascade(app_name: str) -> None:
             pass
         return
 
-    print(f"ENFORCE: phone distraction app={app_name}")
+    key = app_name.lower()
+    now_mono = time.monotonic()
+    state = _PHONE_ENFORCE_STATE.get(key)
+    last_fired = state.get("last_fired_mono") if state else None
+
+    # Cooldown: skip the whole enforce (zap + eject) inside the min gap so a
+    # residual immersive flap can't re-shoot in a tight loop.
+    if last_fired is not None and now_mono - last_fired < PHONE_ENFORCE_MIN_GAP_SECONDS:
+        elapsed = now_mono - last_fired
+        print(
+            f"ENFORCE: cooldown holds for {app_name} "
+            f"({elapsed:.1f}s < {PHONE_ENFORCE_MIN_GAP_SECONDS}s)"
+        )
+        try:
+            asyncio.ensure_future(
+                log_event(
+                    "phone_enforce_cooldown_skipped",
+                    details={
+                        "app": app_name,
+                        "since_last_fire_seconds": round(elapsed, 1),
+                        "min_gap_seconds": PHONE_ENFORCE_MIN_GAP_SECONDS,
+                        "rep": state.get("rep") if state else None,
+                    },
+                )
+            )
+        except RuntimeError:
+            pass
+        return
+
+    # Ramp: increment the per-app rep and commit the fire timestamp. A flap that
+    # kept prior state (see _maybe_reset_phone_enforce_state) climbs from there
+    # instead of restarting at rep 1.
+    rep = (state.get("rep", 0) if state else 0) + 1
+    _PHONE_ENFORCE_STATE[key] = {"rep": rep, "last_fired_mono": now_mono}
+    intensity = min(30 + 10 * rep, 100)
+
+    print(f"ENFORCE: phone distraction app={app_name} rep={rep} intensity={intensity}")
     try:
         asyncio.ensure_future(
             handle_custodes_state_event(
@@ -14920,13 +14970,21 @@ def start_enforcement_cascade(app_name: str) -> None:
             enforce(
                 EnforceRequest(
                     message=f"Close {app_name}",
-                    intensity=50,
+                    intensity=intensity,
                     source=f"phone_distraction_{app_name}",
+                    notify=False,
                 )
             )
         )
     except RuntimeError:
         pass
+    # No-ADB eject: foreground + play Spotify to evict the immersive app. A pure
+    # action by decree — no banner/TTS. method hardcoded for now.
+    # TODO: route by audio source / yt_bg — Spotify-snub vs direct Termux park
+    try:
+        _send_eject_to_phone("redirect")
+    except Exception:
+        logger.exception("ENFORCE: eject dispatch failed for %s", app_name)
 
 
 # Pending deferred phone enforcement tasks, keyed by lowercased app key. The
@@ -14934,6 +14992,31 @@ def start_enforcement_cascade(app_name: str) -> None:
 # (open→close within the delay) never fires the shock; a close/replace edge
 # cancels it before it lands.
 _PENDING_PHONE_ENFORCE: dict[str, asyncio.Task] = {}
+
+# Per-app phone-enforce ramp + cooldown state, keyed by lowercased app:
+#   {"rep": int, "last_fired_mono": float}
+# `rep` drives the intensity ramp (min(30 + 10*rep, 100)); `last_fired_mono`
+# gates the cooldown AND distinguishes a clean close (sustained gap → reset the
+# ramp) from a close→reopen immersive flap (recent fire → keep the ramp).
+_PHONE_ENFORCE_STATE: dict[str, dict] = {}
+
+
+def _maybe_reset_phone_enforce_state(app_name: str) -> None:
+    """Clear per-app ramp state only on a *clean* close.
+
+    A close→reopen flap within PHONE_ENFORCE_MIN_GAP_SECONDS of the last fire is a
+    residual immersive blip, not a genuine recovery — keep the ramp so the next
+    enforce climbs instead of restarting at rep 1. Only a sustained gap since the
+    last fire (or no fire on record) counts as the user actually putting the app
+    down, which resets the ramp.
+    """
+    key = app_name.lower()
+    state = _PHONE_ENFORCE_STATE.get(key)
+    if not state:
+        return
+    last_fired = state.get("last_fired_mono")
+    if last_fired is None or time.monotonic() - last_fired >= PHONE_ENFORCE_MIN_GAP_SECONDS:
+        _PHONE_ENFORCE_STATE.pop(key, None)
 
 
 def _cancel_pending_phone_enforce(app_name: str | None = None) -> None:
@@ -15794,6 +15877,9 @@ async def handle_phone_activity(request: PhoneActivityRequest):
         # Close cancels any pending deferred enforce for this app so a flash
         # (open→close within the guard delay) never lands.
         _cancel_pending_phone_enforce(app_name)
+        # Reset the intensity ramp only on a clean close (sustained gap since the
+        # last fire). A close→reopen immersive flap keeps the ramp climbing.
+        _maybe_reset_phone_enforce_state(app_name)
 
         # Phone close only clears the phone substate, then recomputes composite
         # timer activity from any remaining independent attention sources.
