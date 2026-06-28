@@ -477,11 +477,40 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
     so the daemon's legitimate self-pierce of its AGENT marker is unaffected and
     an OFF pane still sends. Raises :class:`TmuxSendGated` (zero bytes written,
     re-queueable) when locked; returns the resolved physical pane id otherwise.
+
+    The human lock is keyed on the PHYSICAL ``%NN`` (the tmux any-key binding
+    stamps ``@TYPING_LOCK_UNTIL`` per physical pane). A canonical caller id
+    (``council:custodes``, ``mechanicus:N``, …) must therefore be resolved before
+    the lock read, or the read keys off a non-physical target tmux does not
+    understand, the lock reads as unset, and the send pierces. So resolution is
+    split: a missing resolver (``AttributeError`` — a fail-open test/shim adapter)
+    falls back to the caller id (a raw ``%NN`` is already physical), but a GENUINE
+    resolution failure fails closed — we will not gamble a pierce on an unresolved
+    canonical id.
     """
     try:
         phys = control.adapter._resolve_pane_target_arg(pane)
-    except Exception:
+    except AttributeError:
+        # Adapter has no resolver (fail-open shim / test double); the caller id is
+        # used as-is. A real daemon's TmuxAdapter always provides the resolver, and
+        # a raw %NN is already physical, so this branch never masks a canonical id.
         phys = pane
+    except Exception as exc:
+        # Resolution genuinely failed: we cannot key the lock read on the physical
+        # %NN, and falling back to the canonical id would silently miss the lock and
+        # pierce. Fail closed (zero bytes, re-queueable) rather than risk clobbering
+        # active typing.
+        raise TmuxSendGated(
+            {
+                "suppressed": True,
+                "reason": "typing_guard",
+                "gate": "pane_unresolved",
+                "policy": "cancel",
+                "target": pane,
+                "deferred": True,
+                "resolve_error": str(exc),
+            }
+        ) from exc
     if send_gate._pane_human_locked(phys):
         raise TmuxSendGated(
             {

@@ -55,6 +55,25 @@ class _RecordingAdapter:
     ) -> None:
         type(self).sends.append((target, text))
 
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:1] == ("send-keys",):
+            type(self).sends.append(args)
+        return ""
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        type(self).sends.append((target, *keys))
+
+
+class _ResolveExplodesAdapter(_RecordingAdapter):
+    """tmux reachable, but pane resolution genuinely fails (not AttributeError).
+
+    A canonical id that cannot be resolved must NOT fall back to the unresolved
+    id and gamble a pierce — the daemon fails closed.
+    """
+
+    def _resolve_pane_target_arg(self, pane: str) -> str:
+        raise RuntimeError("resolver blew up")
+
 
 def _serve(adapter_factory):
     server = daemon.TmuxctldServer(
@@ -134,6 +153,58 @@ def test_enforce_override_cannot_pierce_human_pending_lock(monkeypatch) -> None:
     assert status == 200
     assert payload["ok"] is False, f"human pending lock was pierced: {payload}"
     assert payload["error"]["code"] == "gated"
+    assert _RecordingAdapter.sends == []
+
+
+def test_enforce_override_cannot_pierce_human_lock_via_send_keys(monkeypatch) -> None:
+    """The /tmux/send-keys handler honors the same inviolable human-lock guard."""
+    _RecordingAdapter.sends.clear()
+    _mock_human_lock(monkeypatch)
+    monkeypatch.setenv("TMUX_SEND_GATE_ALLOW", "custodes_enforcement_deferred_timeout")
+
+    server = _serve(_RecordingAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/tmux/send-keys",
+            {"pane": "%9", "command": "C-c"},
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 200
+    assert payload["ok"] is False, f"human lock was pierced via send-keys: {payload}"
+    assert payload["error"]["code"] == "gated"
+    assert _RecordingAdapter.sends == [], "keys reached the pane over a live human lock"
+
+
+def test_pane_resolution_failure_fails_closed(monkeypatch) -> None:
+    """A genuine resolver failure must gate the send, never fall through and pierce.
+
+    No human lock is mocked here: the point is that an UNRESOLVED canonical id
+    cannot be cleared, so the daemon refuses rather than keying the lock read on a
+    non-physical target tmux would not understand.
+    """
+    _RecordingAdapter.sends.clear()
+    # Lock primitives are irrelevant — resolution fails before the lock read.
+    monkeypatch.setattr(send_gate, "quiet_hours_active", lambda **_kw: (False, {}))
+    monkeypatch.setattr(typing_guard_state, "hold", lambda *a, **k: False)
+    monkeypatch.setenv("TMUX_SEND_GATE_ALLOW", "custodes_enforcement_deferred_timeout")
+
+    server = _serve(_ResolveExplodesAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/send-text",
+            {"pane": "council:custodes", "text": "nag", "submit": True, "verify": False},
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 200
+    assert payload["ok"] is False, f"unresolved pane was not failed closed: {payload}"
+    assert payload["error"]["code"] == "gated"
+    assert payload["error"]["detail"].get("gate") == "pane_unresolved"
     assert _RecordingAdapter.sends == []
 
 
