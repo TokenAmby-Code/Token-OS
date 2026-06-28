@@ -25,6 +25,8 @@ import threading
 import time
 import urllib.request
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
