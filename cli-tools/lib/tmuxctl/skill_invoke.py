@@ -9,6 +9,22 @@ from .tmux_adapter import TmuxAdapter
 
 SkillSinkKeys = tuple[str, ...]
 
+# An invocation is either a SKILL (engine-specific leader: ``$`` for Codex, ``/``
+# for Claude) or a COMMAND (a universal ``/`` leader in every harness). Keeping the
+# two kinds explicit is the whole point of the daemon primitive: the Shift+Tab menu
+# hands the daemon a bare name + kind, and the leader/sink policy lives in ONE place
+# instead of being re-derived in bash per call.
+INVOCATION_KINDS = ("skill", "command")
+
+
+def normalize_invocation_kind(kind: str | None) -> str:
+    value = (kind or "skill").strip().lower()
+    if value == "":
+        return "skill"
+    if value not in INVOCATION_KINDS:
+        raise ValueError(f"invocation kind must be one of {INVOCATION_KINDS}, got {kind!r}")
+    return value
+
 
 def normalize_agent(value: str | None) -> str:
     raw = (value or "").strip().lower()
@@ -35,14 +51,47 @@ def normalize_skill_name(skill: str) -> str:
     return name
 
 
+def invocation_leader(agent: str | None, *, kind: str = "skill") -> str:
+    """The prompt leader for an invocation of ``kind``.
+
+    Commands are universal slash leaders in every harness; only skills take the
+    engine-specific leader (``$`` for Codex, ``/`` for Claude).
+    """
+    if normalize_invocation_kind(kind) == "command":
+        return "/"
+    return skill_invocation_leader(agent)
+
+
+def invocation_text(
+    name: str,
+    agent: str | None,
+    *,
+    kind: str = "skill",
+    arguments: str | None = None,
+) -> str:
+    prefix = f"{invocation_leader(agent, kind=kind)}{normalize_skill_name(name)}"
+    args = (arguments or "").strip()
+    return f"{prefix} {args}" if args else f"{prefix} "
+
+
+def invocation_sink_keys(agent: str | None, *, kind: str = "skill") -> SkillSinkKeys:
+    """Keys to send after typing an invocation but before any submit.
+
+    A command renders no skill chip, so it must never receive the Codex Tab-sink
+    (a stray Tab on a universal slash command would mangle or submit it). Only a
+    Codex *skill* needs the sink.
+    """
+    if normalize_invocation_kind(kind) == "command":
+        return ()
+    return codex_skill_sink_keys(agent)
+
+
 def skill_invocation_text(
     skill: str,
     agent: str | None,
     arguments: str | None = None,
 ) -> str:
-    prefix = f"{skill_invocation_leader(agent)}{normalize_skill_name(skill)}"
-    args = (arguments or "").strip()
-    return f"{prefix} {args}" if args else f"{prefix} "
+    return invocation_text(skill, agent, kind="skill", arguments=arguments)
 
 
 def codex_skill_sink_keys(agent: str | None) -> SkillSinkKeys:
@@ -238,6 +287,41 @@ def insert_at_prompt_start(
     move_to_prompt_end(adapter, pane)
 
 
+def insert_invocation_in_pane(
+    adapter: TmuxAdapter,
+    pane: str,
+    name: str,
+    *,
+    agent: str = "auto",
+    kind: str = "skill",
+    arguments: str | None = None,
+    settle_seconds: float = 0.0,
+) -> dict:
+    """Engine-agnostic daemon primitive: insert an invocation at the prompt start.
+
+    The caller hands a BARE name plus a ``kind``; this resolves the engine (skills
+    only), applies the correct leader, types it at the prompt start, sinks the
+    Codex skill chip when needed, and returns the cursor to the prompt end -- the
+    whole Shift+Tab insert in one warm in-process call. A command short-circuits
+    engine resolution entirely: its leader is universal, so probing the pane would
+    only add latency and risk a wrong leader.
+    """
+    resolved_kind = normalize_invocation_kind(kind)
+    if resolved_kind == "command":
+        resolved_agent = "auto"
+    else:
+        resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
+    text = invocation_text(name, resolved_agent, kind=resolved_kind, arguments=arguments)
+    insert_at_prompt_start(
+        adapter,
+        pane,
+        text,
+        settle_seconds=settle_seconds,
+        sink_keys=invocation_sink_keys(resolved_agent, kind=resolved_kind),
+    )
+    return {"pane": pane, "agent": resolved_agent, "kind": resolved_kind, "rendered": text}
+
+
 def invoke_skill_in_pane(
     adapter: TmuxAdapter,
     pane: str,
@@ -247,16 +331,15 @@ def invoke_skill_in_pane(
     arguments: str | None = None,
     settle_seconds: float = 0.0,
 ) -> str:
-    resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
-    text = skill_invocation_text(skill, resolved_agent, arguments)
-    insert_at_prompt_start(
+    return insert_invocation_in_pane(
         adapter,
         pane,
-        text,
+        skill,
+        agent=agent,
+        kind="skill",
+        arguments=arguments,
         settle_seconds=settle_seconds,
-        sink_keys=codex_skill_sink_keys(resolved_agent),
-    )
-    return text
+    )["rendered"]
 
 
 def send_skill_invocation_to_pane(

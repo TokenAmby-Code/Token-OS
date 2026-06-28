@@ -457,3 +457,119 @@ def test_subscribe_preplan_retries_once_then_fails_closed(tmp_path: pathlib.Path
     assert logfile.exists()
     content = logfile.read_text()
     assert "step=subscribe" in content
+
+
+# --- daemon fast-path integration ------------------------------------------
+# The Shift+Tab-menu speedup: when the warm tmuxctld is reachable, the whole
+# post-selection insert is ONE loopback POST to /insert-invocation instead of 3
+# cold `tmuxctl` Python spawns. These run the real script against stub tmux + curl
+# and assert the action takes the daemon path (and falls back cleanly when it is
+# down). The leader/engine policy itself is unit-tested in test_insert_invocation.
+
+
+def _run_action_daemon(
+    tmp_path: pathlib.Path,
+    selection: str,
+    *,
+    agent: str = "claude",
+    daemon_url: str = "http://stub",
+    api_url: str | None = None,
+    curl_body: str | None = None,
+) -> tuple[list[str], list[str], pathlib.Path]:
+    """Run a real action with the daemon fast-path enabled (``--daemon-url``).
+
+    Returns (recorded tmux sends, recorded curl argv, failure-log path). The
+    default curl stub records each invocation and returns HTTP-2xx success.
+    """
+    tmux_recorder = tmp_path / "sends.txt"
+    curl_recorder = tmp_path / "curls.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> {shlex.quote(str(tmux_recorder))}\nexit 0\n'
+    )
+    fake_tmux.chmod(0o755)
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        curl_body
+        or (
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> {shlex.quote(str(curl_recorder))}\n'
+            "printf '%s\\n' '{\"success\":true}'\n"
+            "exit 0\n"
+        )
+    )
+    fake_curl.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HOME": str(home),
+        "IMPERIUM_TMUX_BIN": str(fake_tmux),
+        "TOKEN_API_DB": str(tmp_path / "gate.db"),
+        "TMUX_PLAN_MENU_NO_DETACH": "1",
+        "TMUX_PLAN_MENU_PAGE_UPS": "3",
+        "TMUX_PLAN_MENU_PAGE_DOWNS": "3",
+        "TMUX_SEND_GATE_DELAY_TIMEOUT": "0.1",
+    }
+    cmd = [
+        str(SCRIPT),
+        "--pane",
+        "%1",
+        "--selection",
+        selection,
+        "--agent",
+        agent,
+        "--daemon-url",
+        daemon_url,
+    ]
+    if api_url is not None:
+        cmd += ["--api-url", api_url]
+    subprocess.check_output(cmd, text=True, timeout=20, env=env)
+    tmux_lines = tmux_recorder.read_text().splitlines() if tmux_recorder.exists() else []
+    curl_lines = curl_recorder.read_text().splitlines() if curl_recorder.exists() else []
+    logfile = home / ".claude" / "logs" / "tmux-plan-menu.log"
+    return tmux_lines, curl_lines, logfile
+
+
+def test_plan_routes_through_daemon_when_enabled(tmp_path: pathlib.Path) -> None:
+    tmux_lines, curl_lines, logfile = _run_action_daemon(tmp_path, "plan")
+    # The insert went to the daemon: one POST to /insert-invocation with a command
+    # kind and the bare name; the universal "/" leader is the daemon's job.
+    joined = "\n".join(curl_lines)
+    assert "/insert-invocation" in joined
+    assert '"kind":"command"' in joined
+    assert '"name":"plan"' in joined
+    # The local cursor ops never ran: no leader insert, no page-key macro.
+    assert not any(" -l " in line for line in tmux_lines)
+    assert not any("PgUp" in line or "PgDn" in line for line in tmux_lines)
+    assert not logfile.exists()
+
+
+def test_preplan_routes_skill_through_daemon_with_resolved_agent(tmp_path: pathlib.Path) -> None:
+    # preplan resolves the engine in the menu (fail-closed), then hands the daemon
+    # the BARE name + kind=skill + the concrete agent — the daemon applies $preplan.
+    tmux_lines, curl_lines, logfile = _run_action_daemon(
+        tmp_path, "preplan", agent="codex", api_url="http://stub"
+    )
+    joined = "\n".join(curl_lines)
+    assert "/api/hooks/subscribe" in joined  # one-shot armed BEFORE the insert
+    assert "/insert-invocation" in joined
+    assert '"kind":"skill"' in joined
+    assert '"name":"preplan"' in joined
+    assert '"agent":"codex"' in joined
+    # The daemon owns the leader + the Codex Tab-sink, so the menu sends neither.
+    assert not any(" -l " in line for line in tmux_lines)
+    assert not any(line.strip().endswith(" Tab") for line in tmux_lines)
+    assert not logfile.exists()
+
+
+def test_falls_back_to_local_path_when_daemon_unreachable(tmp_path: pathlib.Path) -> None:
+    # Daemon down: curl to /insert-invocation fails (exit 7), so the action falls
+    # back to the local tmuxctl cursor ops and the leader still lands.
+    curl_body = "#!/usr/bin/env bash\nexit 7\n"  # connection refused
+    tmux_lines, _curl_lines, logfile = _run_action_daemon(tmp_path, "plan", curl_body=curl_body)
+    assert any("-l /plan" in line for line in tmux_lines)  # local insert happened
+    assert not logfile.exists()
