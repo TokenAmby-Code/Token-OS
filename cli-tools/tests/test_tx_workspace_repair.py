@@ -29,6 +29,7 @@ TX = ROOT / "bin" / "tx"
 # council=5 with council:custodes at .1, mechanicus>=1 with the
 # fabricator-general at .1, reservists present).
 _FAKE_TMUX = r"""#!/usr/bin/env bash
+trap '' PIPE
 printf '%s\n' "$*" >> "$TX_FAKE_TMUX_LOG"
 cmd="${1:-}"; shift || true
 case "$cmd" in
@@ -101,3 +102,42 @@ def test_custodes_check_reads_council_window_not_legion(tmp_path: pathlib.Path) 
     assert "list-panes -t main:council" in calls, calls
     # ...and the retired legion window must never be queried.
     assert "main:legion" not in calls, calls
+
+
+def test_start_refuses_to_create_workspace_when_vault_unmounted(tmp_path: pathlib.Path) -> None:
+    stub = tmp_path / "bin"
+    stub.mkdir(exist_ok=True)
+    fake_tmux = stub / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\n\' "$*" >> "$TX_FAKE_TMUX_LOG"\n'
+        'case "${1:-}" in\n'
+        "  has-session) exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    fake_tmux.chmod(0o755)
+    fake_log = tmp_path / "tmux-calls.log"
+    missing_vault = tmp_path / "Imperium" / "Imperium-ENV"
+
+    env = {k: v for k, v in os.environ.items()}
+    env.pop("TMUX", None)
+    env["PATH"] = f"{stub}:{env['PATH']}"
+    env["TX_FAKE_TMUX_LOG"] = str(fake_log)
+    env["TX_INVOCATION_LOG"] = str(tmp_path / "tx-invocations.log")
+    env["TX_NAS_WAIT_PATH"] = str(missing_vault)
+    env["TX_NAS_WAIT_TIMEOUT"] = "0"
+    env["IMPERIUM_MACHINE"] = "test"
+
+    proc = subprocess.run(
+        [str(TX), "start"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert proc.returncode == 1
+    assert "refusing to build a ghost-town tmux workspace" in proc.stderr
+    assert "Creating workspace session" not in proc.stderr
+    assert "has-session -t main" in fake_log.read_text()

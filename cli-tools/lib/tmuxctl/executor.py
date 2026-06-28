@@ -261,6 +261,8 @@ class RestartExecutor:
                 self._switch_client(attachment.client_tty, target_session)
                 restored += 1
 
+            self._reap_holding_sessions(plan.session_name, holding_session)
+
             return RestartExecutionResult(
                 session_name=plan.session_name,
                 phase=RestartPhase.COMPLETE,
@@ -281,7 +283,32 @@ class RestartExecutor:
             # successful restart switches them back before teardown; at that
             # point the holding session is safe to remove.
             if restored >= parked:
-                self.adapter.run("kill-session", "-t", holding_session, allow_failure=True)
+                self._reap_holding_sessions(plan.session_name, holding_session)
+
+    def _reap_holding_sessions(self, target_session: str, holding_session: str = "_stash") -> None:
+        """Switch any clients stranded in restart holding sessions back to main.
+
+        The normal path switches every known client back before killing the
+        holding session. This final sweep is deliberately redundant: it catches
+        late/reconnected clients that attached to the spinner after the capture
+        list was frozen, then destroys every restart-spinner session so one
+        cannot survive in the background for days.
+        """
+        stale_sessions = (holding_session, "_tmuxctl_restart")
+        if not self.adapter.has_session(target_session):
+            return
+
+        try:
+            clients = self.adapter.list_clients()
+        except Exception:
+            clients = []
+
+        for client in clients:
+            if client.get("session_name") in stale_sessions and client.get("client_tty"):
+                self._switch_client(client["client_tty"], target_session)
+
+        for stale in stale_sessions:
+            self.adapter.run("kill-session", "-t", stale, allow_failure=True)
 
     def _report_holding_failure(self, holding_session: str, violations: list[str]) -> None:
         message = "tx restart verification failed; staying in _stash.\n\n" + "\n".join(
@@ -700,4 +727,5 @@ done
                     )
                 )
         actions.append(RestartAction(RestartPhase.VERIFY, "verify pane labels and resume outcomes"))
+        actions.append(RestartAction(RestartPhase.VERIFY, "reap restart holding-session spinners"))
         return actions
