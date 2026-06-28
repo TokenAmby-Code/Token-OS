@@ -38,6 +38,14 @@ class PersonaSeed:
     # dispatch/interactive resolver decides). Trailing + defaulted so the many
     # positional Astartes/Primarch seeds below need no change.
     default_session_doc: str | None = None
+    # Per-persona TTS submission policy, resolved at queue time (Emperor decree,
+    # 2026-06-28: "one route, one authority, one serialized queue"). Deny-by-default:
+    # ``'silent'`` → never speaks (the safe default for every voiceless persona and
+    # for any unresolved/needs-name persona); ``'hot'`` → immediate playback
+    # (Custodes/enforcement); ``'pause'`` → respects the caller's queue target
+    # (voiced Astartes). Trailing + defaulted so positional seeds need no change;
+    # the startup UPSERT backfills this onto existing rows authoritatively.
+    tts_policy: str = "silent"
 
     @property
     def id(self) -> str:
@@ -56,6 +64,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "Microsoft Ravi",
         "1",
         "notify.wav",
+        tts_policy="pause",
     ),
     PersonaSeed(
         "ultramarines",
@@ -68,6 +77,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "Microsoft Susan",
         "1",
         "notify.wav",
+        tts_policy="pause",
     ),
     PersonaSeed(
         "salamanders",
@@ -80,6 +90,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "Microsoft Sean",
         "0",
         "chord.wav",
+        tts_policy="pause",
     ),
     PersonaSeed(
         "imperial-fists",
@@ -92,6 +103,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "Microsoft Catherine",
         "1",
         "ding.wav",
+        tts_policy="pause",
     ),
     PersonaSeed(
         "raven-guard",
@@ -104,6 +116,7 @@ PRIMARY_ASTARTES: tuple[PersonaSeed, ...] = (
         "Microsoft Heera",
         "1",
         "chimes.wav",
+        tts_policy="pause",
     ),
 )
 
@@ -119,6 +132,7 @@ BACKUP_ASTARTES: tuple[PersonaSeed, ...] = (
         "Microsoft David",
         "1",
         "tada.wav",
+        tts_policy="pause",
     ),
     PersonaSeed(
         "dark-angels",
@@ -131,6 +145,7 @@ BACKUP_ASTARTES: tuple[PersonaSeed, ...] = (
         "Microsoft Zira",
         "1",
         "chord.wav",
+        tts_policy="pause",
     ),
     PersonaSeed(
         "white-scars",
@@ -143,6 +158,7 @@ BACKUP_ASTARTES: tuple[PersonaSeed, ...] = (
         "Microsoft Mark",
         "1",
         "recycle.wav",
+        tts_policy="pause",
     ),
 )
 
@@ -157,6 +173,7 @@ ULTIMATE_ASTARTES = PersonaSeed(
     "Microsoft David",
     "1",
     "chimes.wav",
+    tts_policy="pause",
 )
 
 # Retirement/quarantine persona used when an Astartes chapter child is banished.
@@ -209,6 +226,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         "2",
         "chimes.wav",
         default_session_doc="daily_note",
+        tts_policy="hot",
     ),
     PersonaSeed(
         "fabricator-general",
@@ -362,6 +380,8 @@ def persona_schema_sql() -> str:
             tts_rate TEXT,
             notification_sound TEXT,
             default_session_doc TEXT,
+            tts_policy TEXT NOT NULL DEFAULT 'silent'
+                CHECK (tts_policy IN ('silent', 'hot', 'pause')),
             CHECK (default_rank = 'astartes' OR assignment_pool IS NULL)
         )
     """
@@ -381,6 +401,7 @@ def seed_params(seed: PersonaSeed) -> tuple:
         seed.tts_rate,
         seed.notification_sound,
         seed.default_session_doc,
+        seed.tts_policy,
     )
 
 
@@ -388,8 +409,8 @@ UPSERT_SQL = """
     INSERT INTO personas (
         id, slug, display_name, default_rank, assignment_pool, assignment_order,
         pane_tint, chip_color, tts_voice, tts_rate, notification_sound,
-        default_session_doc
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        default_session_doc, tts_policy
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
         slug=excluded.slug,
         display_name=excluded.display_name,
@@ -401,7 +422,8 @@ UPSERT_SQL = """
         tts_voice=excluded.tts_voice,
         tts_rate=excluded.tts_rate,
         notification_sound=excluded.notification_sound,
-        default_session_doc=excluded.default_session_doc
+        default_session_doc=excluded.default_session_doc,
+        tts_policy=excluded.tts_policy
 """
 
 
@@ -413,6 +435,11 @@ UPSERT_SQL = """
 # follows then backfills values onto existing rows.
 _PERSONA_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("default_session_doc", "ALTER TABLE personas ADD COLUMN default_session_doc TEXT"),
+    (
+        "tts_policy",
+        "ALTER TABLE personas ADD COLUMN tts_policy TEXT NOT NULL DEFAULT 'silent' "
+        "CHECK (tts_policy IN ('silent', 'hot', 'pause'))",
+    ),
 )
 
 

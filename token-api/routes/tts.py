@@ -100,8 +100,8 @@ try:
     )
 except ValueError:
     PHONE_AUDIO_PROXY_HEARTBEAT_TTL_SECONDS = 120
-# The sender whose TTS innately bypasses the pause queue (plays immediately).
-CUSTODES_PERSONA_SLUG = "custodes"
+# Which senders bypass the pause queue is now data, not a hardcoded slug: it is
+# carried by ``personas.tts_policy`` ('hot' → immediate playback). See queue_tts.
 
 
 def init_deps(
@@ -1422,7 +1422,7 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
             """SELECT i.name AS tab_name, i.tts_voice, i.notification_sound,
                       CASE WHEN i.interaction_mode = 'voice_chat'
                            THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
-                      p.slug AS persona_slug
+                      p.slug AS persona_slug, p.tts_policy AS tts_policy
                FROM instances i
                LEFT JOIN personas p ON p.id = i.persona_id
                WHERE i.id = ?""",
@@ -1433,6 +1433,35 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
     if not row:
         return {"success": False, "error": f"Instance {instance_id} not found"}
 
+    # Per-persona TTS policy, deny-by-default (Emperor decree, 2026-06-28:
+    # "one route, one authority, one serialized queue"). Submission is gated on a
+    # RESOLVED persona's explicit policy. The needs-name Fabricator-General leaked
+    # because the old code inferred silence from ``tts_voice IS NULL`` and only
+    # ever forced "hot" for a literal custodes slug — an unresolved persona (LEFT
+    # JOIN → NULL slug/policy) fell through and spoke. Now an absent persona row or
+    # an unknown/NULL policy is SILENT + WARN: a visible registration failure, never
+    # a leak (see [[anti-blind-dedup]] — never silently swallow). The voiced
+    # Astartes already resolve, so normal speech is unaffected.
+    tts_policy = row["tts_policy"]
+    persona_slug = row["persona_slug"]
+    if tts_policy not in ("silent", "hot", "pause"):
+        logger.warning(
+            "TTS denied (persona_unresolved): instance=%s persona_slug=%r "
+            "tts_policy=%r — register the persona to grant a voice policy; "
+            "message=%r",
+            instance_id,
+            persona_slug,
+            tts_policy,
+            message[:80],
+        )
+        return {"success": True, "queued": False, "reason": "persona_unresolved"}
+
+    if tts_policy == "silent":
+        logger.info(f"TTS suppressed (persona_silent): {message[:80]}")
+        return {"success": True, "queued": False, "reason": "persona_silent"}
+
+    # Belt-and-suspenders: an independent silence guarantee. A voiced policy on a
+    # voiceless instance (no resolved voice) still must not speak.
     if row["tts_voice"] is None:
         return {"success": True, "queued": False, "reason": "persona_silent"}
 
@@ -1448,13 +1477,12 @@ async def queue_tts(instance_id: str, message: str, queue_target: str = "pause")
         instance_mode = "verbose"
         queue_target = "hot"
 
-    # Custodes-sender bypass (Emperor decree, 2026-06-25): TTS originating from
-    # the Custodes persona never enqueues to the silent pause queue — it plays
-    # immediately. Bypass is a property of the SENDER, not the message: because
-    # enforcement TTS only ever originates from Custodes, keying on the sender's
-    # persona subsumes "enforcement bypass" and keeps the queue free of any
-    # opinion about message type.
-    if row["persona_slug"] == CUSTODES_PERSONA_SLUG:
+    # Policy-driven queue target (replaces the hardcoded custodes-slug bypass).
+    # ``hot`` → immediate playback (Custodes/enforcement: enforcement TTS only ever
+    # originates from Custodes, so keying on the policy subsumes "enforcement
+    # bypass" and keeps the queue free of any opinion about message type).
+    # ``pause`` → respect the caller's queue_target (the default; no-op here).
+    if tts_policy == "hot":
         queue_target = "hot"
     global_mode = TTS_GLOBAL_MODE["mode"]
     # Restrictiveness order: silent > muted > verbose

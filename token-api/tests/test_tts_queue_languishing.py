@@ -19,6 +19,7 @@ def _load_tts():
 
 def _insert_tts_instance(db_path: Path) -> str:
     from instance_mutation import sanctioned_insert_instance_sync
+    from personas import persona_id_for_slug
 
     iid = str(uuid.uuid4())
     now = datetime.now().isoformat()
@@ -41,7 +42,14 @@ def _insert_tts_instance(db_path: Path) -> str:
         write_source="test",
         actor="test",
     )
-    conn.execute("UPDATE instances SET tts_voice = 'Microsoft George' WHERE id = ?", (iid,))
+    # Bind a voiced persona with the ``pause`` policy (Blood Angels). queue_tts now
+    # denies submissions from instances with no resolved persona (deny-by-default),
+    # so these queue-mechanics fixtures must carry an explicit voiced policy. ``pause``
+    # respects the caller's queue_target, preserving the prior queue semantics.
+    conn.execute(
+        "UPDATE instances SET tts_voice = 'Microsoft George', persona_id = ? WHERE id = ?",
+        (persona_id_for_slug("blood-angels"), iid),
+    )
     conn.commit()
     conn.close()
     return iid
