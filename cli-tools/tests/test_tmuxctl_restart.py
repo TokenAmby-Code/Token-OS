@@ -433,7 +433,7 @@ def test_restart_executor_does_not_fall_back_to_internal_pane_id() -> None:
     assert target == ""
 
 
-def test_dry_run_emits_deterministic_action_order():
+def test_dry_run_emits_deterministic_action_order() -> None:
     workspace = _workspace(_pane("%1", "somnium:NW", stamp_instance_id="abc12345"))
     registry = InstanceRegistrySnapshot(
         device_id="Mac-Mini",
@@ -484,7 +484,65 @@ def test_dry_run_emits_deterministic_action_order():
         "resume abc12345 into somnium:W with resume",
         "recreate grouped session phone on somnium",
         "verify pane labels and resume outcomes",
+        "reap restart holding-session spinners",
     ]
+
+
+class FakeHoldingReaperAdapter:
+    def __init__(self) -> None:
+        self.sessions = {"main", "_stash", "_tmuxctl_restart"}
+        self.clients = [
+            {"client_tty": "/dev/ttys001", "session_name": "_stash"},
+            {"client_tty": "/dev/ttys002", "session_name": "_tmuxctl_restart"},
+            {"client_tty": "/dev/ttys003", "session_name": "main"},
+        ]
+        self.commands: list[tuple[str, ...]] = []
+
+    def has_session(self, session_name: str) -> bool:
+        return session_name in self.sessions
+
+    def list_clients(self) -> list[dict[str, str]]:
+        return list(self.clients)
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        self.commands.append(args)
+        if args[:1] == ("kill-session",):
+            self.sessions.discard(args[args.index("-t") + 1])
+        return ""
+
+
+def test_restart_reaper_switches_stranded_stash_clients_before_killing_spinners() -> None:
+    adapter = FakeHoldingReaperAdapter()
+
+    RestartExecutor(adapter)._reap_holding_sessions("main")  # type: ignore[arg-type]
+
+    assert ("switch-client", "-c", "/dev/ttys001", "-t", "main") in adapter.commands
+    assert ("switch-client", "-c", "/dev/ttys002", "-t", "main") in adapter.commands
+    assert ("switch-client", "-c", "/dev/ttys003", "-t", "main") not in adapter.commands
+    assert ("kill-session", "-t", "_stash") in adapter.commands
+    assert ("kill-session", "-t", "_tmuxctl_restart") in adapter.commands
+    first_kill = min(
+        adapter.commands.index(("kill-session", "-t", "_stash")),
+        adapter.commands.index(("kill-session", "-t", "_tmuxctl_restart")),
+    )
+    assert (
+        adapter.commands.index(("switch-client", "-c", "/dev/ttys001", "-t", "main")) < first_kill
+    )
+    assert (
+        adapter.commands.index(("switch-client", "-c", "/dev/ttys002", "-t", "main")) < first_kill
+    )
+    assert "_stash" not in adapter.sessions
+    assert "_tmuxctl_restart" not in adapter.sessions
+
+
+def test_restart_reaper_does_not_kill_stash_when_main_missing() -> None:
+    adapter = FakeHoldingReaperAdapter()
+    adapter.sessions.remove("main")
+
+    RestartExecutor(adapter)._reap_holding_sessions("main")  # type: ignore[arg-type]
+
+    assert adapter.commands == []
+    assert "_stash" in adapter.sessions
 
 
 class FakeBuilderAdapter:

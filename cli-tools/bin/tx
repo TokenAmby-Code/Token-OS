@@ -181,6 +181,55 @@ _tx_is_agent_context() {
     return 1
 }
 
+_tx_vault_mount_path() {
+    if [[ -n "${TX_NAS_WAIT_PATH:-}" ]]; then
+        printf '%s\n' "$TX_NAS_WAIT_PATH"
+    elif [[ -n "${IMPERIUM:-}" ]]; then
+        printf '%s/Imperium-ENV\n' "${IMPERIUM%/}"
+    fi
+}
+
+_tx_vault_mounted() {
+    local vault_path="${1:-}"
+    [[ -n "$vault_path" ]] || return 0
+    [[ -d "$vault_path" && -d "$vault_path/Personas" && -d "$vault_path/Terra" ]]
+}
+
+_tx_wait_for_vault_mount() {
+    [[ "${TX_NAS_WAIT_DISABLE:-}" == "1" ]] && return 0
+
+    local vault_path timeout interval waited
+    vault_path="$(_tx_vault_mount_path)"
+    [[ -n "$vault_path" ]] || return 0
+    _tx_vault_mounted "$vault_path" && return 0
+
+    timeout="${TX_NAS_WAIT_TIMEOUT:-120}"
+    interval="${TX_NAS_WAIT_INTERVAL:-2}"
+    if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
+        log_error "TX_NAS_WAIT_TIMEOUT must be a non-negative integer."
+        return 1
+    fi
+    if ! [[ "$interval" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "TX_NAS_WAIT_INTERVAL must be a positive integer."
+        return 1
+    fi
+    waited=0
+    log_warn "Imperium vault is not mounted at ${vault_path}; waiting before tmux workspace build."
+
+    while [[ "$waited" -lt "$timeout" ]]; do
+        sleep "$interval" 2>/dev/null || sleep 2
+        waited=$((waited + interval))
+        if _tx_vault_mounted "$vault_path"; then
+            log_success "Imperium vault mounted at ${vault_path}"
+            return 0
+        fi
+    done
+
+    log_error "Imperium vault is still unavailable at ${vault_path}; refusing to build a ghost-town tmux workspace."
+    log_error "Mount the NAS and rerun tx, or set TX_NAS_WAIT_DISABLE=1 only for an intentional degraded shell-only start."
+    return 1
+}
+
 # --- Workspace flag detection ---
 # Legacy workspace flags (now mapped to tx subcommands or removed).
 # If someone does `tx --focus`, route to the right subcommand.
@@ -411,6 +460,8 @@ cmd_start() {
         return 0
     fi
 
+    _tx_wait_for_vault_mount || return 1
+
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         ensure_workspace_before_attach "$SESSION_NAME"
         _tx_log_invocation "start" "attached" || true
@@ -527,6 +578,8 @@ cmd_restart() {
         group=$(tmux display-message -p '#{session_group}')
         session="${group:-$current_session}"
     fi
+
+    _tx_wait_for_vault_mount || return 1
 
     log_info "Restarting session '${session}' via tmuxctl…"
 
