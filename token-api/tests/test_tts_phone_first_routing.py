@@ -181,6 +181,10 @@ def test_discord_failure_demotes_to_phone_first(monkeypatch) -> None:
     tts = _load_tts()
     sent = []
     _patch_world(tts, monkeypatch, phone_reachable=True, discord_bot="custodes-bot")
+    # The phone leg now blocks on the playback-complete callback up to
+    # PHONE_PLAYBACK_WATCHDOG_S; no callback fires here, so shrink it to keep the
+    # test fast (a missed callback is still a phone success — what we assert).
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.05)
     monkeypatch.setattr(
         tts,
         "speak_tts_discord",

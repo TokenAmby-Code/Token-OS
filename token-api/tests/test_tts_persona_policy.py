@@ -152,3 +152,60 @@ def test_pause_policy_respects_caller_target(app_env, monkeypatch) -> None:
     pause_iid = _insert_instance(app_env.db_path, persona_slug="blood-angels", voiced=True)
     pause_result = asyncio.run(tts.queue_tts(pause_iid, "for Sanguinius", queue_target="pause"))
     assert pause_result["queue"] == "pause"
+
+
+def test_system_instance_enqueues_hot_custodes_voiced(app_env, monkeypatch) -> None:
+    """The synthetic ``system`` sender short-circuits the DB lookup to a fixed,
+    always-resolved profile: Custodes-voiced (Microsoft George), hot policy. It
+    enqueues to the hot queue WITHOUT any instance row — instance-less system pings
+    SPEAK through the single gate, never go silent and never need a registration."""
+    tts = _load_tts()
+    _quiet_world(tts, monkeypatch)
+
+    # A 'pause' request: the hot policy on the synthetic row must force it hot.
+    result = asyncio.run(
+        tts.queue_tts(tts.SYSTEM_INSTANCE_ID, "distraction logged", queue_target="pause")
+    )
+
+    assert result["queued"] is True
+    assert result["queue"] == "hot"
+    assert result["voice"] == "Microsoft George"
+    assert len(tts.hot_queue) == 1
+    assert len(tts.pause_queue) == 0
+    item = tts.hot_queue[0]
+    assert item.instance_id == "system"
+    assert item.voice == "Microsoft George"
+
+
+def test_wpm_for_rate_base_and_clamp() -> None:
+    """The single TTS_RATE_BASE_WPM tunable drives rate 0 and clamps to 80..300."""
+    tts = _load_tts()
+    assert tts.TTS_RATE_BASE_WPM == 210
+    assert tts._wpm_for_rate(0) == 210
+    # SAPI scale biases around the base; extremes clamp to the audible band.
+    assert tts._wpm_for_rate(-100) == 80
+    assert tts._wpm_for_rate(100) == 300
+
+
+def test_cockpit_status_never_null_while_item_playing() -> None:
+    """``get_tts_queue_status`` snapshots ``tts_current`` once, so a concurrent
+    worker clear can't blank ``current`` mid-build; ``started_at`` surfaces for the
+    cockpit so a playing line never flashes 'idle' mid-utterance."""
+    tts = _load_tts()
+    item = tts.TTSQueueItem(
+        instance_id="custodes",
+        message="the Emperor must hear this",
+        voice="Microsoft George",
+        sound="chimes.wav",
+        tab_name="Custodes",
+        started_at="2026-06-28T10:00:00",
+    )
+    prev = tts.tts_current
+    tts.tts_current = item
+    try:
+        status = tts.get_tts_queue_status()
+        assert status["current"] is not None
+        assert status["current"]["instance_id"] == "custodes"
+        assert status["current"]["started_at"] == "2026-06-28T10:00:00"
+    finally:
+        tts.tts_current = prev
