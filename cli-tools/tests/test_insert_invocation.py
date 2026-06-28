@@ -58,36 +58,36 @@ PGDN_END = ("send-keys", "-N", "50", "-t", "%42", "PgDn", "End")
 # --- pure leader / text / sink policy --------------------------------------
 
 
-def test_invocation_text_skill_uses_engine_leader():
+def test_invocation_text_skill_uses_engine_leader() -> None:
     assert invocation_text("preplan", "claude", kind="skill") == "/preplan "
     assert invocation_text("preplan", "codex", kind="skill") == "$preplan "
 
 
-def test_invocation_text_command_is_universal_slash_in_every_engine():
+def test_invocation_text_command_is_universal_slash_in_every_engine() -> None:
     assert invocation_text("plan", "claude", kind="command") == "/plan "
     assert invocation_text("plan", "codex", kind="command") == "/plan "
     assert invocation_text("compact", "codex", kind="command") == "/compact "
 
 
-def test_invocation_text_strips_caller_supplied_leader():
+def test_invocation_text_strips_caller_supplied_leader() -> None:
     assert invocation_text("/plan", "codex", kind="command") == "/plan "
     assert invocation_text("$preplan", "claude", kind="skill") == "/preplan "
 
 
-def test_invocation_leader_splits_on_kind():
+def test_invocation_leader_splits_on_kind() -> None:
     assert invocation_leader("codex", kind="skill") == "$"
     assert invocation_leader("codex", kind="command") == "/"
     assert invocation_leader("claude", kind="skill") == "/"
     assert invocation_leader("claude", kind="command") == "/"
 
 
-def test_invocation_sink_keys_only_for_codex_skills():
+def test_invocation_sink_keys_only_for_codex_skills() -> None:
     assert invocation_sink_keys("codex", kind="skill") == ("Tab",)
     assert invocation_sink_keys("codex", kind="command") == ()
     assert invocation_sink_keys("claude", kind="skill") == ()
 
 
-def test_normalize_invocation_kind():
+def test_normalize_invocation_kind() -> None:
     assert normalize_invocation_kind(None) == "skill"
     assert normalize_invocation_kind("") == "skill"
     assert normalize_invocation_kind("COMMAND") == "command"
@@ -98,7 +98,9 @@ def test_normalize_invocation_kind():
 # --- full in-pane insert sequence ------------------------------------------
 
 
-def test_insert_invocation_codex_skill_inserts_dollar_then_tab(monkeypatch):
+def test_insert_invocation_codex_skill_inserts_dollar_then_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     adapter = RecordingAdapter()
     monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
 
@@ -115,7 +117,9 @@ def test_insert_invocation_codex_skill_inserts_dollar_then_tab(monkeypatch):
     ]
 
 
-def test_insert_invocation_codex_command_stays_slash_and_skips_tab(monkeypatch):
+def test_insert_invocation_codex_command_stays_slash_and_skips_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     adapter = RecordingAdapter()
     monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
 
@@ -133,7 +137,9 @@ def test_insert_invocation_codex_command_stays_slash_and_skips_tab(monkeypatch):
     ]
 
 
-def test_insert_invocation_command_never_resolves_the_engine(monkeypatch):
+def test_insert_invocation_command_never_resolves_the_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # A command leader is engine-independent, so it must NOT pay the (registry +
     # process-tree) resolve cost or risk a wrong leader -- prove resolve is never
     # called by making it explode.
@@ -151,7 +157,7 @@ def test_insert_invocation_command_never_resolves_the_engine(monkeypatch):
     assert result["agent"] == "auto"
 
 
-def test_insert_invocation_skill_resolves_auto_engine(monkeypatch):
+def test_insert_invocation_skill_resolves_auto_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = RecordingAdapter()
     monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
     monkeypatch.setattr(
@@ -167,11 +173,11 @@ def test_insert_invocation_skill_resolves_auto_engine(monkeypatch):
 # --- daemon route ----------------------------------------------------------
 
 
-def test_insert_invocation_route_registered():
+def test_insert_invocation_route_registered() -> None:
     assert ("POST", "/insert-invocation") in daemon.ROUTES
 
 
-def test_h_insert_invocation_command_keeps_slash(monkeypatch):
+def test_h_insert_invocation_command_keeps_slash(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
     control = TmuxControlPlane(adapter=RecordingAdapter())
 
@@ -184,7 +190,7 @@ def test_h_insert_invocation_command_keeps_slash(monkeypatch):
     assert out["status"] == "inserted"
 
 
-def test_h_insert_invocation_skill_uses_engine_leader(monkeypatch):
+def test_h_insert_invocation_skill_uses_engine_leader(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
     control = TmuxControlPlane(adapter=RecordingAdapter())
 
