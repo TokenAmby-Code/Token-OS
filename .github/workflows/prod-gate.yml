@@ -62,9 +62,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.2
         with:
           fetch-depth: 0
+          # This job only checks out and runs pytest — no downstream git ops
+          # need the token, so don't persist it into git config.
+          persist-credentials: false
           # schedule runs default to the repo default branch (main); pin the
           # nightly sweep to `prod` so it tests the prod branch, not main.
           ref: ${{ github.event_name == 'schedule' && 'prod' || github.ref }}
