@@ -104,10 +104,12 @@ def test_custodes_sender_bypasses_pause_queue(app_env, monkeypatch) -> None:
 
 
 def test_non_custodes_sender_still_pauses(app_env, monkeypatch) -> None:
-    """A non-Custodes sender's 'pause' request is untouched — still the pause queue."""
+    """A non-Custodes voiced sender's 'pause' request is untouched — still the pause
+    queue. Blood Angels carries the ``pause`` policy (respects the caller's target).
+    """
     tts = _load_tts()
     _quiet_world(tts, monkeypatch)
-    iid = _insert_voiced_instance(app_env.db_path, persona_slug=None)
+    iid = _insert_voiced_instance(app_env.db_path, persona_slug="blood-angels")
 
     result = asyncio.run(tts.queue_tts(iid, "routine status update", queue_target="pause"))
 
@@ -123,7 +125,7 @@ def test_bypass_is_sender_keyed_not_message_keyed(app_env, monkeypatch) -> None:
     tts = _load_tts()
     _quiet_world(tts, monkeypatch)
     custodes = _insert_voiced_instance(app_env.db_path, persona_slug="custodes")
-    normal = _insert_voiced_instance(app_env.db_path, persona_slug=None)
+    normal = _insert_voiced_instance(app_env.db_path, persona_slug="blood-angels")
 
     msg = "identical text"
     cust_result = asyncio.run(tts.queue_tts(custodes, msg, queue_target="pause"))
