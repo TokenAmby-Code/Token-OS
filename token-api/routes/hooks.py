@@ -33,6 +33,7 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+import ask_service
 import shared
 import talk as talk_service
 from enforcement_service import close_distraction_windows
@@ -4850,6 +4851,12 @@ async def handle_post_tool_use(payload: dict) -> dict:
             answer=_askq_extract_answer(payload),
         )
 
+    # AskUserQuestion answered in the terminal first → abandon any pending
+    # phone-ask so it doesn't later ESC-cancel a fresh turn and inject a stale
+    # answer. Idempotent no-op when there's no pending phone-ask.
+    if tool_name == "AskUserQuestion":
+        ask_service.cancel(session_id)
+
     # Plan approved → clear planning_state. Mutating tools are blocked in Claude
     # plan mode, so the first Write/Edit after approval is a poll-free, race-proof
     # "planning ended" signal — it owns the planning→none transition, replacing the
@@ -6403,22 +6410,15 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     ):
         questions = tool_input.get("questions", [])
         if questions:
-            q_text = re.sub(r"%\d+", "unresolved", questions[0].get("question", "")[:200])
-            if q_text:
-                # Through the comms middleware: spoken part geofence-routed,
-                # buzz + beep + banner ride along (no callsite-level split).
-                asyncio.create_task(
-                    dispatch_notify(
-                        f"Claude is asking: {q_text}",
-                        vibe=40,
-                        beep=30,
-                        banner=q_text[:80],
-                        instance_id=session_id,  # session_id IS the instance id
-                    )
-                )
-                logger.info(
-                    f"PreToolUse: AskUserQuestion phone notify for {session_id[:12]}: {q_text[:60]}"
-                )
+            # Fire the rich /ask bubble(s) and own the async answer→inject
+            # lifecycle in ask_service. Returns immediately (the hook can't block
+            # past generic-hook.sh's 3s curl cap); the terminal selector renders
+            # and stands as the fallback if the phone never answers.
+            started = ask_service.start_phone_ask(session_id, questions)
+            logger.info(
+                f"PreToolUse: AskUserQuestion phone-ask started={started} "
+                f"for {session_id[:12]} ({len(questions)} question(s))"
+            )
 
     # Only check Bash commands for blocking
     if tool_name != "Bash":
