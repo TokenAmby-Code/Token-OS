@@ -158,10 +158,10 @@ If you have a linked session document, invoke the **vault-mind** skill. It reads
 | Tier | Agent Class | Vault Access |
 |------|------------|--------------|
 | Imperial Guard | MiniMax | Session doc only |
-| Astartes+ | Claude | Session doc + **earned** vault writes via **vault-canon** skill |
+| Astartes+ | Claude | Session doc + **earned** vault writes via **vault-update** skill |
 | Administratum | Sonnet+ cron | Processes completed session docs > vault, then archives |
 
-Direct vault writes are rare and significant. Use **vault-canon** when you have a hard decision, a correction, a pattern, or an architectural truth. Everything else goes in the session doc.
+Direct vault writes are rare and significant. Use **vault-update** when you have a hard decision, a correction, a pattern, or an architectural truth. Everything else goes in the session doc.
 
 ### Obsidian CLI Quick Reference
 

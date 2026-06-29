@@ -1,6 +1,6 @@
 ---
 name: vault-update
-description: Earned institutional vault write procedure. Use when an Astartes+ agent has a confirmed decision, correction, pattern, or architectural truth that belongs directly in the Obsidian vault; prefer this generic name over legacy $vault-canon.
+description: Earned institutional vault write procedure. Use when an Astartes+ agent has a confirmed decision, correction, pattern, or architectural truth that belongs directly in the Obsidian vault.
 ---
 
 # Vault Update — Earned Institutional Write
@@ -33,5 +33,3 @@ If unsure, it is not earned. Put it in the session doc and let Administratum pro
 - Do not create duplicate notes when an existing canonical note should be updated.
 - Do not promote speculation to canon.
 - MiniMax/Imperial Guard tier agents do not use this procedure; they write session docs only.
-
-Legacy `$vault-canon` is the compatibility alias for this same earned-write procedure.
