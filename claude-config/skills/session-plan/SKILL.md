@@ -61,9 +61,9 @@ obsidian vault=<name> backlinks path="<key-note>.md"
 Every top-level session auto-creates a session doc on SessionStart. Check if you already have one:
 
 ```bash
-# Resolve your own instance
-CLAUDE_PID=$(pid=$$; for _ in 1 2 3 4 5; do [ -z "$pid" ] || [ "$pid" = "1" ] && break; comm=$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)" 2>/dev/null); [ "$comm" = "claude" ] && echo "$pid" && break; pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); done)
-token-ping instances/resolve pid=$CLAUDE_PID cwd=$(pwd)
+# Resolve your own Claude/Codex instance
+INSTANCE_PID=$(pid=$$; for _ in 1 2 3 4 5 6 7 8; do [ -z "$pid" ] || [ "$pid" = "1" ] && break; comm=$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)" 2>/dev/null); case "$comm" in claude|codex) echo "$pid" && break ;; esac; pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); done)
+token-ping instances/resolve pid=$INSTANCE_PID cwd=$(pwd)
 ```
 
 **If `session_doc_id` is present** (expected — auto-created on SessionStart):
@@ -110,7 +110,7 @@ ls ~/.config/worktrees/
 git -C /Volumes/Civic/askcivic.git worktree list
 
 # For Token-OS:
-git -C /Volumes/Imperium/token-os.git worktree list
+git -C ~/runtimes/Token-OS/token-os.git worktree list
 
 # Local worktrees
 ls ~/worktrees/<project>/

@@ -5,14 +5,14 @@ description: Token-OS SQLite database orientation. Use when inspecting agents.db
 
 # DB
 
-Token-OS SQLite state lives under `~/runtimes/Token-OS/database` on the Mac host unless a worktree or service env overrides it.
+Token-OS SQLite state defaults to `~/runtimes/database` on the Mac host. Worktrees and services may override it. Do not hardcode database paths; resolve them through the machine config helpers or service env.
 
 ## Files
 
 - `agents.db` — primary registry for live agents, instances, session docs, dispatch state, and related control tables.
 - `timer.db` — high-spam timer/telemetry data. Query only when that stream is relevant.
 
-Use the configured path instead of hardcoding when a helper exists. For shell/Python, prefer the machine config helpers named in the vault instructions (`nas-path.sh`, `imperium_config.py`) or the service env.
+Use the configured path. Shell should source `nas-path.sh`; Python should import `imperium_config.py` and read `TOKEN_API_AGENTS_DB` / `TOKEN_API_TIMER_DB`.
 
 ## Primary Table
 
@@ -21,15 +21,21 @@ Use the configured path instead of hardcoding when a helper exists. For shell/Py
 Typical read-only probes:
 
 ```bash
-source "${TOKEN_OS_ROOT:-$HOME/runtimes/Token-OS/live}/cli-tools/lib/nas-path.sh" 2>/dev/null || true
-DB_ROOT="${TOKEN_OS_DB_DIR:-${TOKEN_OS_DATABASE_DIR:-$HOME/runtimes/Token-OS/database}}"
-AGENTS_DB="${TOKEN_API_DB:-$DB_ROOT/agents.db}"
-TIMER_DB="${TOKEN_TIMER_DB:-$DB_ROOT/timer.db}"
+source "${TOKEN_OS_ROOT:-${TOKEN_OS:-$HOME/runtimes/Token-OS/live}}/cli-tools/lib/nas-path.sh" 2>/dev/null || true
+DB_ROOT="${TOKEN_API_DATABASE_DIR:-$HOME/runtimes/database}"
+AGENTS_DB="${TOKEN_API_AGENTS_DB:-${TOKEN_API_DB:-$DB_ROOT/agents.db}}"
+TIMER_DB="${TOKEN_API_TIMER_DB:-$DB_ROOT/timer.db}"
 
 sqlite3 "$AGENTS_DB" '.tables'
 sqlite3 "$AGENTS_DB" 'PRAGMA table_info(instances);'
-sqlite3 "$AGENTS_DB" "SELECT id, name, legion, primarch, instance_type, session_doc_id, pane_label, updated_at FROM instances ORDER BY updated_at DESC LIMIT 20;"
+sqlite3 "$AGENTS_DB" "SELECT id, name, legion, primarch, instance_type, session_doc_id, updated_at FROM instances ORDER BY updated_at DESC LIMIT 20;"
 sqlite3 "$TIMER_DB" '.tables'
+```
+
+Python path resolution:
+
+```python
+from imperium_config import TOKEN_API_AGENTS_DB, TOKEN_API_TIMER_DB
 ```
 
 Prefer Token-API for live behavior when an endpoint exists:

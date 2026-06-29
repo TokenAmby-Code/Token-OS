@@ -12,8 +12,8 @@ Dispatch is an overseer procedure: designate work, preserve singleton context, a
 - Dispatch, `talk`, and `brief` require no fresh approval when they are the natural routing step.
 - Do not ask “may I launch?” after a designation exists. Launch, then report.
 - Do not implement from an overseer pane. Workers implement; overseers route and verify reports.
-- Preserve focus. Dispatch must not steal the Emperor's camera/focus; use the no-focus path unless explicit inspection requires focus.
-- Keep work bounded. A dispatch brief must name objective, repo/worktree if known, validation, stop/report shape, and explicit gates.
+- Preserve focus. New dispatch allocation already uses the internal focus-preserving path; do not add focus-control flags.
+- Keep work bounded. A dispatch prompt must name objective, repo/worktree if known, validation, stop/report shape, and explicit gates.
 
 ## Routing
 
@@ -29,7 +29,13 @@ Use `talk` for peer/status/clarification messages. Use `brief` when assigning or
 New Mechanicus allocation pattern:
 
 ```bash
-dispatch --target mechanicus:new --no-focus --brief "<bounded objective, context, validation, report shape>"
+dispatch --target mechanicus:new --prompt "<bounded objective, context, validation, report shape>"
+```
+
+Validate allocation syntax without launching:
+
+```bash
+dispatch --target mechanicus:new --prompt "dry run validation" --dry-run
 ```
 
 If the local CLI spelling differs, inspect `dispatch --help` rather than improvising a pane target. Never allocate with `mechanicus:1`, `mechanicus:2`, etc.; numbered panes are live or retired identities, not allocation requests.

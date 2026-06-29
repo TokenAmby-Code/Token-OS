@@ -7,7 +7,7 @@ Local FastAPI server for Claude instance management, notifications, and system c
 - **Mac Server**: `main.py` - FastAPI app on port 7777 (LaunchAgent `ai.openclaw.tokenapi`)
 - **WSL Satellite**: `token-satellite.py` - Companion server on WSL port 7777 (systemd `token-satellite.service`)
 - **Ops cockpit**: Terminus pilot TypeScript web cockpit is live at `/ui/ops`, polling `/api/ui/ops/state` every 2s; tmux owns active-pane operational keybindings
-- **Database**: `~/.claude/agents.db` (SQLite, shared with Claude Code)
+- **Database**: `TOKEN_API_AGENTS_DB` / `TOKEN_API_TIMER_DB`, defaulting under `~/runtimes/database` (SQLite; resolve via `imperium_config.py`)
 
 ### Multi-Device Network
 
@@ -141,7 +141,7 @@ Launch contract:
 - Suppress duplicate launches when the note already has `aspirant_launch_id` and status `launching` or `launched`.
 - On failure, mark the note `aspirant_session_status: failed` and record `aspirant_launch_error`.
 
-Related CLI behavior is documented in `/Volumes/Imperium/runtimes/token-os/live/cli-tools/docs/aspirant-dispatch.md`.
+Related CLI behavior is documented in `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/docs/aspirant-dispatch.md`.
 
 ### Instance Management
 ```

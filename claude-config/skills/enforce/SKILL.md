@@ -16,13 +16,20 @@ Parse the user's arguments:
 
 ## Quick Reference
 
+Source machine config before using phone endpoints:
+
+```bash
+source "${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/lib/nas-path.sh"
+PHONE_URL="http://$(imperium_cfg tailscale_ip phone):7777"
+```
+
 ### Unified Phone Endpoint Schema (v3)
 
 Both `/notify` and `/enforce` on the phone (MacroDroid HTTP server, port 7777) accept the same parameter schema. All params are passed as query string key-value pairs and parsed into a `request-params` dictionary variable. The macro iterates over the dictionary, dispatching each key to the appropriate action.
 
 ```
-GET http://100.102.92.24:7777/notify?<params>
-GET http://100.102.92.24:7777/enforce?<params>
+GET $PHONE_URL/notify?<params>
+GET $PHONE_URL/enforce?<params>
 ```
 
 | Parameter | Type | Range | Description |
@@ -60,7 +67,7 @@ Any param combo is valid. Missing params simply don't match. Empty calls return 
 Direct Pavlok zap via `SendIntent` — no notification, TTS, or Spotify. Lighter weight.
 
 ```
-GET http://100.102.92.24:7777/zap?zap=30
+GET $PHONE_URL/zap?zap=30
 ```
 
 ### /notify vs /enforce
@@ -138,32 +145,32 @@ When `/enforce --build` is invoked, read these files before starting implementat
 
    ```bash
    # Read key sections
-   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '275,300p'   # models
-   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '4055,4130p' # pavlok
-   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '4805,4960p' # enforcement
-   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '8742,8820p' # notify
-   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '9610,9730p' # stop hook
-   cat -n /Volumes/Imperium/runtimes/token-os/live/token-api/main.py | sed -n '9768,9855p' # pretooluse
+   cat -n ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/token-api/main.py | sed -n '275,300p'   # models
+   cat -n ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/token-api/main.py | sed -n '4055,4130p' # pavlok
+   cat -n ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/token-api/main.py | sed -n '4805,4960p' # enforcement
+   cat -n ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/token-api/main.py | sed -n '8742,8820p' # notify
+   cat -n ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/token-api/main.py | sed -n '9610,9730p' # stop hook
+   cat -n ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/token-api/main.py | sed -n '9768,9855p' # pretooluse
    ```
 
 2. **Phone-side macros:**
-   - `/Volumes/Imperium/runtimes/token-os/live/mobile/macros/v2-enforce-cascade.yaml` — MacroDroid enforce spec
-   - `/Volumes/Imperium/runtimes/token-os/live/mobile/macros/MACRODROID.md` — full macro inventory
-   - MDR export: `macrodroid-read /Volumes/Imperium/runtimes/token-os/live/mobile/macros/EXPORT.mdr --macro "Enforce" --detail`
+   - `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/mobile/macros/v2-enforce-cascade.yaml` — MacroDroid enforce spec
+   - `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/mobile/macros/MACRODROID.md` — full macro inventory
+   - MDR export: `macrodroid-read ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/mobile/macros/EXPORT.mdr --macro "Enforce" --detail`
    - Fresh pull (if phone reachable): `macrodroid-read --refresh --detail`
 
 3. **Phone config & connectivity:**
-   - Phone IP: `100.102.92.24`, MacroDroid HTTP port: `7777`
+   - Phone IP: resolve with `imperium_cfg tailscale_ip phone`; MacroDroid HTTP port: `7777`
    - SSH: `ssh-phone` (port 8022)
    - Discord fallback webhook: `DISCORD_FALLBACK_WEBHOOK` env var in main.py (~line 4833)
 
 ### Architecture Docs
 4. **Vault notes:**
    - `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Phone Enforcement Architecture.md`
-   - `/Volumes/Imperium/runtimes/token-os/live/mobile/AGENTS.md` — mobile dev tools, macro spec format, CLI tools
+   - `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/mobile/AGENTS.md` — mobile dev tools, macro spec format, CLI tools
 
 ### Mobile CLI Tools
-5. **CLI tools** (all in `/Volumes/Imperium/runtimes/token-os/live/cli-tools/bin/`):
+5. **CLI tools** (all in `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/bin/`):
    - `macrodroid-read` — parse .mdr backups
    - `macrodroid-gen` — generate .macro from YAML
    - `macrodroid-push` — push .macro to phone
@@ -172,7 +179,7 @@ When `/enforce --build` is invoked, read these files before starting implementat
    - `notify` — desktop notification CLI
 
 ### Phone Directory
-6. **`/Volumes/Imperium/runtimes/token-os/live/mobile/`** — templates, macro specs, tasker scripts
+6. **`${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/mobile/`** — templates, macro specs, tasker scripts
    - `macros/` — YAML specs, MDR exports, archive
    - `tasker-scripts/` — Termux:Tasker integration (pavlok.sh etc.)
    - `termux-*` — shell/tmux config templates
@@ -182,4 +189,4 @@ When `/enforce --build` is invoked, read these files before starting implementat
 - Update MacroDroid macro specs (YAML → macrodroid-gen → push)
 - Adjust hook handlers (Stop, PreToolUse) to use new schema
 - Update the Phone Enforcement Architecture vault note
-- Test reachability: `curl http://100.102.92.24:7777/server-heartbeat`
+- Test reachability: `curl "http://$(imperium_cfg tailscale_ip phone):7777/server-heartbeat"`
