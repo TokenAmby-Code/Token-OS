@@ -191,3 +191,75 @@ def test_bounded_retry_flags_present_in_source() -> None:
     src = HOOK.read_text(encoding="utf-8")
     for flag in ("--retry", "--retry-connrefused", "--retry-delay", "--retry-max-time"):
         assert flag in src, f"missing bounded-retry flag {flag}"
+
+
+# --------------------------------------------------------------------------- #
+# REG-ROOT: raw SessionStart must be SELF-SUFFICIENT. A transient pre-POST
+# subprocess-spawn / resource failure (EMFILE, fork-exhaustion, a
+# token-api-restart fd-pressure race, a stale-NAS $HOME) must NOT abort the hook
+# under `set -euo pipefail` before the registration curl — the sole registration
+# leg of a bare launch. Pinned root: an unguarded `mkdir`/`echo >` aborted
+# pre-POST, so no row / no @INSTANCE_ID / no persona/tint were ever created.
+# --------------------------------------------------------------------------- #
+
+
+def _failing_mkdir_bin(tmp_path: Path) -> Path:
+    """A `mkdir` shadow that fails like an EMFILE / fork-exhaustion spawn would.
+    Prepended to PATH so every mkdir the hook runs pre-POST hits it."""
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir()
+    fail_mkdir = stub_bin / "mkdir"
+    fail_mkdir.write_text(
+        "#!/bin/bash\necho 'mkdir: fork: Resource temporarily unavailable' >&2\nexit 1\n"
+    )
+    fail_mkdir.chmod(0o755)
+    return stub_bin
+
+
+def test_sessionstart_reaches_post_despite_transient_prepost_spawn_failure(
+    tmp_path: Path,
+) -> None:
+    # The logs dir already exists (the common case): only the transient spawn
+    # fails, not a persistent inability to create it. curl -o writes its response
+    # file under this dir, so it must be present.
+    (tmp_path / ".claude" / "logs").mkdir(parents=True)
+    stub_bin = _failing_mkdir_bin(tmp_path)
+
+    server = _StubServer(
+        200, b'{"success":true,"action":"registered","instance_id":"raw-test-uuid"}'
+    )
+    try:
+        fail_log = tmp_path / "sessionstart-failures.log"
+        env = _env(tmp_path, server.url, fail_log)
+        # Shadow `mkdir` first on PATH so the unguarded-spawn abort would fire.
+        env["PATH"] = f"{stub_bin}:{env['PATH']}"
+        res = _run_hook(env)
+        # Self-sufficient: the registration POST landed despite the mkdir failure.
+        # (Before the fix the hook aborted under errexit and the POST never
+        # reached the server — a silent strand.)
+        assert server.received == ["/api/hooks/SessionStart"], (
+            "transient pre-POST mkdir failure aborted the hook before registration"
+        )
+        # A confirmed registration → clean exit 0, no failure record.
+        assert res.returncode == 0, (res.returncode, res.stderr)
+        assert not fail_log.exists(), fail_log.read_text() if fail_log.exists() else ""
+    finally:
+        server.stop()
+
+
+def test_prepost_writes_are_guarded_in_source() -> None:
+    src = HOOK.read_text(encoding="utf-8")
+    # The reg-critical marker must be set from the env BEFORE any subprocess spawn,
+    # so even an abort during early setup is loud (gated trap) — never a silent
+    # exit-0 strand.
+    assert '[[ "${HOOK_ACTION_TYPE:-}" == "SessionStart" ]] && SESSIONSTART_CRITICAL=1' in src, (
+        "SESSIONSTART_CRITICAL is not marked from the env before the first spawn"
+    )
+    # The pre-POST logs + session-pid-cache writes must be guarded so a transient
+    # spawn/resource failure cannot abort before the registration curl.
+    assert 'mkdir -p "${HOME}/.claude/logs" 2>/dev/null || true' in src
+    assert 'mkdir -p "${HOME}/.claude/session-pids" 2>/dev/null || true' in src
+    assert (
+        'echo "$SESSION_ID" > "${HOME}/.claude/session-pids/${CLAUDE_PID}" 2>/dev/null || true'
+        in src
+    )

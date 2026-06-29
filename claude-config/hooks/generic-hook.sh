@@ -15,7 +15,21 @@ set -euo pipefail
 # a SessionStart that never confirms a bound row exits NON-ZERO and writes a
 # visible failure record; every other hook stays best-effort exit-0. A non-zero
 # SessionStart hook exit does not block session startup, so this is still safe.
+#
+# SELF-SUFFICIENCY (the reg-root): a bare/bypass launch must REACH the
+# registration curl. Every bare external command and filesystem write in the
+# SessionStart pre-POST path is guarded so a transient subprocess-spawn /
+# resource failure (EMFILE, fork-exhaustion, a token-api-restart fd-pressure
+# race, a stale-NAS-mounted $HOME) cannot trip errexit and abort the hook BEFORE
+# the curl — the sole registration leg of a bare launch. Pinned root: an
+# unguarded `mkdir`/`echo >` (the logs dir, the session-pid cache) aborted
+# pre-POST under `set -euo pipefail`, so no row / no @INSTANCE_ID / no
+# persona/tint were ever created. The curl's OWN failure is still surfaced loud.
+# The critical marker is set FROM THE ENV IMMEDIATELY (before any subprocess
+# spawn) so even an abort during early setup trips the gated trap (visible)
+# rather than the blanket exit-0 (silent strand).
 SESSIONSTART_CRITICAL=0   # 1 once this invocation is known to be SessionStart
+[[ "${HOOK_ACTION_TYPE:-}" == "SessionStart" ]] && SESSIONSTART_CRITICAL=1
 REGISTRATION_OK=0         # 1 only after a confirmed-successful registration reply
 REGISTRATION_QUEUED=0     # 1 when SessionStart was durably queued for replay
 FAILURE_LOGGED=0          # de-dupe: the inline failure logger already fired
@@ -66,7 +80,9 @@ trap _hook_exit EXIT
 # Always exits 0 to never block Claude Code
 
 LOG_FILE="${HOME}/.claude/logs/hook-debug.log"
-mkdir -p "${HOME}/.claude/logs"
+# Guarded: a transient mkdir spawn/resource failure must NOT abort the hook
+# before the SessionStart registration curl (the reg-root pre-POST abort).
+mkdir -p "${HOME}/.claude/logs" 2>/dev/null || true
 
 # Read hook input from stdin
 HOOK_INPUT=$(cat 2>/dev/null || echo "{}")
@@ -82,15 +98,9 @@ if [[ -z "$HOOK_INPUT" ]]; then
 fi
 
 # Get action type from environment (set by settings.json hook command)
+# (SESSIONSTART_CRITICAL was already marked from this same env value at the top,
+# before any subprocess spawn, so an early abort is never a silent strand.)
 ACTION_TYPE="${HOOK_ACTION_TYPE:-Unknown}"
-
-# Mark the registration-critical path as early as possible so even an EMFILE
-# abort during payload assembly trips the gated trap (visible) rather than the
-# blanket exit-0 (silent strand). Cleared back to non-critical for every other
-# hook type, which stay best-effort.
-if [[ "$ACTION_TYPE" == "SessionStart" ]]; then
-  SESSIONSTART_CRITICAL=1
-fi
 
 # Resolve token-api URL from centralized machine config.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -288,10 +298,13 @@ if [ -n "$CLAUDE_PID" ]; then
   SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null) || true
   if [ -n "$SESSION_ID" ]; then
     if [ "$ACTION_TYPE" = "SessionStart" ]; then
-      mkdir -p "${HOME}/.claude/session-pids"
-      echo "$SESSION_ID" > "${HOME}/.claude/session-pids/${CLAUDE_PID}"
+      # Guarded: this PID cache is a best-effort worktree-setup transplant aid.
+      # An unguarded mkdir/write here aborted a bare SessionStart pre-POST under
+      # errexit (the visible http=? reg-root) — it must never strand the row.
+      mkdir -p "${HOME}/.claude/session-pids" 2>/dev/null || true
+      echo "$SESSION_ID" > "${HOME}/.claude/session-pids/${CLAUDE_PID}" 2>/dev/null || true
     elif [ "$ACTION_TYPE" = "SessionEnd" ]; then
-      rm -f "${HOME}/.claude/session-pids/${CLAUDE_PID}"
+      rm -f "${HOME}/.claude/session-pids/${CLAUDE_PID}" 2>/dev/null || true
     fi
   fi
 fi
@@ -310,7 +323,7 @@ if [[ "$ACTION_TYPE" == "SessionStart" ]]; then
       HANDOFF_TMP="${HANDOFF_FILE}.consumed.$$"
       if mv "$HANDOFF_FILE" "$HANDOFF_TMP" 2>/dev/null; then
         TRANSPLANT_FROM=$(cat "$HANDOFF_TMP" 2>/dev/null) || true
-        rm -f "$HANDOFF_TMP"
+        rm -f "$HANDOFF_TMP" 2>/dev/null || true
         if [[ -n "$TRANSPLANT_FROM" ]]; then
           HOOK_INPUT=$(echo "$HOOK_INPUT" | jq -c --arg tf "$TRANSPLANT_FROM" '.transplant_from = $tf') || true
           [[ "${HOOK_DEBUG:-0}" == "1" ]] && echo "[$(date '+%H:%M:%S')] Transplant handoff: $TRANSPLANT_FROM -> pane $TRANSPLANT_PANE" >> "$LOG_FILE"
@@ -399,7 +412,7 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   # Clear stale tmux-context flush marker so fresh context window gets fresh threshold
   if [[ -n "${TMUX_PANE:-}" ]]; then
     SAFE_PANE="${TMUX_PANE#%}"
-    rm -f "/tmp/claude-panes/flush-${SAFE_PANE}.ts" 2>/dev/null
+    rm -f "/tmp/claude-panes/flush-${SAFE_PANE}.ts" 2>/dev/null || true
   fi
 
   # SessionStart carries the pane's registration. It is the ONLY registration
