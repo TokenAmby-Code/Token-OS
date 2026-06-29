@@ -310,9 +310,10 @@ cdc() {
 }
 
 # d — direct dispatch selector
-# Replaces cc as the human dispatch namespace.
+# Replaces cc as the human dispatch namespace. Clears the pane before opening the
+# fzf selector so the menu always starts from a clean screen (matches cdc).
 d() {
-    _dispatch_human_surface d false "$@"
+    _dispatch_human_surface d true "$@"
 }
 
 # c — clear only. Dispatch routing lives on d/cdc.

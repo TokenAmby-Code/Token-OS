@@ -2892,7 +2892,7 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
         "#!/usr/bin/env bash\n"
         # A live agent is already rooted in the target worktree.
         'if [[ "$1" == "live-agents" ]]; then\n'
-        f'  printf "%s\\n" "mechanicus:3\\t%%91\\tcodex\\t{work_dir}"\n'
+        f'  printf "%s\\t%s\\t%s\\t%s\\n" "mechanicus:3" "%91" "codex" "{work_dir}"\n'
         "  exit 0\n"
         "fi\n"
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
@@ -2915,6 +2915,10 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     # Re-enable the guard the conftest disables for hermeticity.
     env["DISPATCH_WORKTREE_DUP_CHECK"] = "1"
+    # The guard is scoped to the ~/worktrees tree; point that root at the tmp dir
+    # holding work_dir so the dir counts as a worktree and the guard fires.
+    # Include a trailing slash to pin normalization before the prefix check.
+    env["IMPERIUM_WORKTREES_ROOT"] = f"{tmp_path}/"
 
     result = subprocess.run(
         [
@@ -2939,6 +2943,8 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
     assert result.returncode == 73, result.stderr
     assert "a live agent is already running in the target worktree" in result.stderr
     assert "do NOT stack a second" in result.stderr
+    assert "%91" not in result.stderr
+    assert "mechanicus:3\t<tmux-pane>\tcodex" in result.stderr
     assert "dispatched" not in result.stdout
     # No launch was staged: the guard refused before the send.
     tmux_calls = tmux_log.read_text(encoding="utf-8")
@@ -2957,7 +2963,7 @@ def test_dispatch_dup_guard_force_occupied_override_allows_launch(tmp_path: Path
     fake_tmuxctl.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$1" == "live-agents" ]]; then\n'
-        f'  printf "%s\\n" "mechanicus:3\\t%%91\\tcodex\\t{work_dir}"\n'
+        f'  printf "%s\\t%s\\t%s\\t%s\\n" "mechanicus:3" "%91" "codex" "{work_dir}"\n'
         "  exit 0\n"
         "fi\n"
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
@@ -2979,8 +2985,85 @@ def test_dispatch_dup_guard_force_occupied_override_allows_launch(tmp_path: Path
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env["DISPATCH_WORKTREE_DUP_CHECK"] = "1"
+    env["IMPERIUM_WORKTREES_ROOT"] = str(tmp_path)
     env["TOKEN_API_DISPATCH_FORCE_OCCUPIED"] = "1"
     # Liveness gate disabled so the test asserts only the guard override, fast.
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "0"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(work_dir),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "a live agent is already running" not in result.stderr
+    assert "dispatched claude to mechanicus:new" in result.stdout
+
+
+def test_dispatch_dup_guard_scoped_to_worktrees_allows_shared_checkout(
+    tmp_path: Path,
+) -> None:
+    """The dup-guard de-duplicates WITHIN ~/worktrees ONLY, never globally.
+
+    Dispatching several agents into a shared non-worktree checkout (e.g. the
+    Imperium-ENV vault) is legitimate: 1-branch-1-worktree-1-PR does not apply
+    there. A live agent already rooted in such a dir must NOT refuse a second
+    dispatch — the guard only fires for dirs under the worktrees root.
+    """
+    # work_dir is OUTSIDE the worktrees root → guard must not fire.
+    work_dir = tmp_path / "vault" / "Imperium-ENV"
+    work_dir.mkdir(parents=True)
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        # A live agent IS rooted in the target dir — but it is not a worktree, so
+        # the guard should never even ask tmuxctl about it.
+        'if [[ "$1" == "live-agents" ]]; then\n'
+        f'  printf "%s\\t%s\\t%s\\t%s\\n" "mechanicus:3" "%91" "codex" "{work_dir}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        '#!/usr/bin/env bash\nif [[ "$1" == "display-message" ]]; then printf "%%77\\n"; fi\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_WORKTREE_DUP_CHECK"] = "1"
+    env["IMPERIUM_WORKTREES_ROOT"] = str(wt_root)
+    # Liveness gate disabled so the test asserts only the guard scope, fast.
     env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "0"
 
     result = subprocess.run(

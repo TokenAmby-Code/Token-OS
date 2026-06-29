@@ -2026,8 +2026,17 @@ refuse_if_worktree_has_live_agent() {
   # agent is ALREADY rooted there. Detection is by LIVENESS (process tree + pane
   # cwd via `tmuxctl live-agents`), never the DB stamp — the duplicate may itself
   # be a row-less / undercounted live agent, which is exactly the case that bit FG.
-  local dir="$1" self_pane="${2:-}" matches
+  local dir="$1" self_pane="${2:-}" matches wt_root
   [[ -n "$dir" ]] || return 0
+  # Scope: this is a WORKTREE dup-guard (1 branch = 1 worktree = 1 PR). It must
+  # only de-duplicate WITHIN the ~/worktrees tree, NEVER globally. Dispatching
+  # several agents into a shared non-worktree checkout (e.g. the Imperium-ENV
+  # vault) is legitimate and must not be refused — those dirs are not the
+  # two-agents-one-worktree corruption this guard exists to prevent.
+  dir="${dir%/}"
+  wt_root="${IMPERIUM_WORKTREES_ROOT:-$HOME/worktrees}"
+  wt_root="${wt_root%/}"
+  [[ "$dir" == "$wt_root" || "$dir" == "$wt_root"/* ]] || return 0
   # Hermetic opt-out: tests set DISPATCH_WORKTREE_DUP_CHECK=0 so the suite never
   # enumerates the operator's LIVE tmux server. Default (unset) = enabled.
   [[ "${DISPATCH_WORKTREE_DUP_CHECK:-1}" == "0" ]] && return 0
@@ -2043,7 +2052,7 @@ refuse_if_worktree_has_live_agent() {
   [[ -n "$matches" ]] || return 0
   err "refusing to dispatch: a live agent is already running in the target worktree $dir:"
   while IFS= read -r line; do
-    [[ -n "$line" ]] && err "  $line"
+    [[ -n "$line" ]] && err "  $(printf '%s' "$line" | redact_tmux_panes_for_display)"
   done <<< "$matches"
   err "resume that agent (do NOT stack a second into one worktree), or launch a fresh --worktree; set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 to override"
   exit 73
