@@ -479,6 +479,22 @@ def test_wrapperend_posts_token_api_async_before_tmuxctld_bomb() -> None:
     assert "token_wrapper_enforce_stack_if_needed" not in end_body
 
 
+def test_wrapperstart_dual_pings_token_api_and_tmuxctld() -> None:
+    common = (CLI_TOOLS / "lib" / "agent-wrapper-common.sh").read_text(encoding="utf-8")
+    start_body = common.split("token_wrapper_start() {", 1)[1].split("}\n", 1)[0]
+    # Both registrars get pinged at wrapper start: token-api (instance row) AND
+    # the tmuxctld daemon (wrapper stamp + persona tint) — the daemon leg was the
+    # missing half of the empty-stamp/tint dual-ping.
+    assert 'token_wrapper_post_hook "WrapperStart"' in start_body
+    assert "token_wrapper_post_tmuxctld_wrapperstart" in start_body
+    # Local fast-path stamp lands before the daemon re-affirms it.
+    assert start_body.index("token_wrapper_stamp_start") < start_body.index(
+        "token_wrapper_post_tmuxctld_wrapperstart"
+    )
+    # The daemon sender targets the /hooks/wrapperstart endpoint.
+    assert "/hooks/wrapperstart" in common
+
+
 def test_stack_enforcement_helper_remains_available() -> None:
     wrapper = (CLI_TOOLS / "scripts" / "agent-wrapper.sh").read_text(encoding="utf-8")
     assert 'token_wrapper_enforce_stack_if_needed "$TMUX_PANE_VALUE"' not in wrapper

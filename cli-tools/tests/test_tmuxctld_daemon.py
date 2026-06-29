@@ -295,6 +295,152 @@ def test_wrapperend_rejects_unowned_mismatched_pane_without_clearing() -> None:
         server.shutdown()
 
 
+class WrapperStartAdapter:
+    """Singleton seat at %42 labelled council:custodes, voice unlocked.
+
+    Records set-option writes so the wrapperstart contract (daemon-authoritative
+    wrapper-ownership stamp + persona tint derived from the durable @PANE_ID
+    label, NOT from @INSTANCE_ID) can be asserted without a live tmux.
+    """
+
+    def __init__(self) -> None:
+        self.pane_label = "council:custodes"
+        self.wrapper_owner = ""
+        self.voice_lock = ""
+        # Owner reported by the list-panes -a fallback (the local fast-path stamp
+        # already on the pane), used when the payload omits tmux_pane so the
+        # handler must resolve via _find_pane_by_wrapper_id.
+        self.listed_owner = ""
+        self.set_options: list[tuple[str, ...]] = []
+
+    def list_sessions(self) -> list:
+        return []
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("display-message", "-t", "%42"):
+            return "%42"
+        if args[:3] == ("list-panes", "-a", "-F"):
+            return f"%42__TMUXCTLD_WRAPPEREND_FIELD__{self.listed_owner}"
+        if args[:1] == ("set-option",):
+            self.set_options.append(tuple(args))
+            if "@TOKEN_API_WRAPPER_LAUNCH_ID" in args:
+                self.wrapper_owner = args[-1]
+            return ""
+        if args[:2] == ("show-options", "-pqv") and "@DISCORD_VOICE_LOCK" in args:
+            return self.voice_lock
+        return ""
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@PANE_ID":
+            return self.pane_label
+        if option == "@TOKEN_API_WRAPPER_LAUNCH_ID":
+            return self.wrapper_owner
+        if option == "@DISCORD_VOICE_LOCK":
+            return self.voice_lock
+        return ""
+
+
+def test_wrapperstart_stamps_wrapper_owner_and_paints_persona_tint() -> None:
+    rec = WrapperStartAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        status, payload = _post(
+            server,
+            "/hooks/wrapperstart",
+            {"wrapper_launch_id": "wrap-7", "tmux_pane": "%42"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "stamped"
+        assert payload["result"]["pane"] == "%42"
+        # (1) Daemon-authoritative wrapper-ownership stamp landed.
+        assert rec.wrapper_owner == "wrap-7"
+        # (2) Custodes persona tint painted from the @PANE_ID label, with NO
+        #     @INSTANCE_ID present — the empty-stamp-at-birth case.
+        assert payload["result"]["tint"] == "#302800"
+        tint_writes = [
+            opt for opt in rec.set_options if "window-style" in opt and "bg=#302800" in opt
+        ]
+        assert tint_writes, f"expected a custodes tint write, got {rec.set_options}"
+    finally:
+        server.shutdown()
+
+
+def test_wrapperstart_resolves_pane_by_wrapper_id_when_payload_pane_missing() -> None:
+    # The hardening path: no tmux_pane in the payload (stale/missing TMUX_PANE),
+    # so _h_hook_wrapperstart must fall back to _find_pane_by_wrapper_id and still
+    # stamp + tint the resolved seat.
+    rec = WrapperStartAdapter()
+    rec.listed_owner = "wrap-10"  # local fast-path stamp already on %42
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperstart",
+            {"wrapper_launch_id": "wrap-10"},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "stamped"
+        assert payload["result"]["pane"] == "%42"  # resolved by wrapper id
+        assert rec.wrapper_owner == "wrap-10"  # re-affirmed by the daemon
+        assert payload["result"]["tint"] == "#302800"  # custodes tint still painted
+        tint_writes = [
+            opt for opt in rec.set_options if "window-style" in opt and "bg=#302800" in opt
+        ]
+        assert tint_writes, f"expected a custodes tint write, got {rec.set_options}"
+    finally:
+        server.shutdown()
+
+
+def test_wrapperstart_skips_tint_for_non_persona_pane() -> None:
+    rec = WrapperStartAdapter()
+    rec.pane_label = "mechanicus:3"  # a stack worker, not a tinted singleton seat
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperstart",
+            {"wrapper_launch_id": "wrap-8", "tmux_pane": "%42"},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "stamped"
+        assert rec.wrapper_owner == "wrap-8"  # wrapper stamp still lands
+        assert payload["result"]["tint"] == ""  # but no persona tint
+        # And no tmux styling was mutated — guards against a handler that paints
+        # but forgets to report the tint (mirrors the voice-lock coverage).
+        assert not [opt for opt in rec.set_options if "window-style" in opt]
+    finally:
+        server.shutdown()
+
+
+def test_wrapperstart_honors_discord_voice_lock() -> None:
+    rec = WrapperStartAdapter()
+    rec.voice_lock = "1"
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperstart",
+            {"wrapper_launch_id": "wrap-9", "tmux_pane": "%42"},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["tint"] == ""  # voice lock wins over persona tint
+        assert not [opt for opt in rec.set_options if "window-style" in opt]
+    finally:
+        server.shutdown()
+
+
+def test_wrapperstart_requires_wrapper_launch_id() -> None:
+    rec = WrapperStartAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/hooks/wrapperstart", {"tmux_pane": "%42"})
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+    finally:
+        server.shutdown()
+
+
 class RecordingFocusAdapter:
     """Resolves focus-uuid -> palace:1 and records every run() call."""
 
