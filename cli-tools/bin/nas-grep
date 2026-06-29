@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Executable shim for nas_grep."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+LIB_DIR = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(LIB_DIR))
+
+from nas_grep import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

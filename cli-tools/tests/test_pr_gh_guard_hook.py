@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-HOOK = REPO_ROOT / "claude-config" / "hooks" / "pr-gh-guard.sh"
+HOOK = REPO_ROOT / "claude-config" / "hooks" / "command-boundary-guard.sh"
 
 
 def run_hook(command: str):
