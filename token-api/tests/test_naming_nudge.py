@@ -114,6 +114,8 @@ async def test_naming_nudge_sends_for_placeholder_and_derives_slug(app_env, monk
     assert enqueued[0]["source"] == "naming_nudge"
     assert 'session-doc-name "Your Descriptive Title"' in enqueued[0]["payload"]
     assert "Do not use dates" in enqueued[0]["payload"]
+    assert "continue the original user task uninterrupted" in enqueued[0]["payload"]
+    assert "do not chase it" in enqueued[0]["payload"]
 
     row = _fetchone(
         app_env.db_path,
@@ -285,6 +287,8 @@ async def test_naming_nudge_doc_less_instance_uses_instance_name_message(
     payload = enqueued[0]["payload"]
     assert 'instance-name "your-title"' in payload
     assert "session-doc-name" not in payload
+    assert "continue the original user task uninterrupted" in payload
+    assert "do not chase it" in payload
 
     row = _fetchone(
         app_env.db_path,
