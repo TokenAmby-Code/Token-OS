@@ -5,7 +5,7 @@ rubric and routes on its state instead of always firing a flat SOP:
 
   - ``incomplete``     → accountability prompt naming the unmet conditions,
                          plus condition-specific TTS/banner.
-  - ``legacy``         → the exact static SOP (behavior preserved).
+  - invalid binding    → no dispatch/notify; GT binding is cleared.
   - ``ready_for_ack``  → notify-only; never re-prompts the agent.
   - ``victorious_bug`` → Pavlok enforcement; never re-prompts the agent.
   - ``acknowledged``   → skipped entirely.
@@ -255,33 +255,59 @@ async def test_incomplete_rubric_humanizes_underscored_condition(gt_env, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_legacy_no_rubric_fires_exact_static_sop(gt_env, monkeypatch):
+async def test_no_linked_session_doc_clears_gt_binding_no_dispatch(gt_env, monkeypatch):
     main = gt_env.main
     rec = _Recorder(main, monkeypatch)
-    # No linked session doc at all → legacy fallback.
     iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=None)
 
     await main.golden_throne_followup(iid)
 
-    assert len(rec.posts) == 1
-    assert rec.posts[0]["json"]["prompt"] == main._load_golden_throne_sop()
-    # Generic resume notification, not the rubric variant.
-    assert len(rec.notifies) == 1
-    assert "needs" not in rec.notifies[0]["message"]
-    assert rec.notifies[0]["banner"].startswith("GT resume:")
+    assert rec.posts == []
+    assert rec.enqueues == []
+    assert rec.notifies == []
+    conn = sqlite3.connect(gt_env.db_path)
+    row = conn.execute(
+        "SELECT golden_throne, gt_resume_count FROM instances WHERE id = ?",
+        (iid,),
+    ).fetchone()
+    conn.close()
+    assert row == (None, 0)
 
 
 @pytest.mark.asyncio
-async def test_legacy_scalar_rubric_fires_exact_static_sop(gt_env, monkeypatch):
+async def test_scalar_rubric_clears_gt_binding_no_dispatch(gt_env, monkeypatch):
     main = gt_env.main
     rec = _Recorder(main, monkeypatch)
-    # Scalar-string victory → legacy_string → legacy branch (unchanged SOP).
     doc = _write_doc(gt_env.docs_dir, "victory: pending")
     iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=doc)
 
     await main.golden_throne_followup(iid)
 
-    assert rec.posts[0]["json"]["prompt"] == main._load_golden_throne_sop()
+    assert rec.posts == []
+    assert rec.enqueues == []
+    assert rec.notifies == []
+    conn = sqlite3.connect(gt_env.db_path)
+    row = conn.execute("SELECT golden_throne FROM instances WHERE id = ?", (iid,)).fetchone()
+    conn.close()
+    assert row[0] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_rubric_clears_gt_binding_no_dispatch(gt_env, monkeypatch):
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+    doc = _write_doc(gt_env.docs_dir, "status: active")
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME + "-remote", doc_path=doc)
+
+    await main.golden_throne_followup(iid)
+
+    assert rec.posts == []
+    assert rec.enqueues == []
+    assert rec.notifies == []
+    conn = sqlite3.connect(gt_env.db_path)
+    row = conn.execute("SELECT golden_throne FROM instances WHERE id = ?", (iid,)).fetchone()
+    conn.close()
+    assert row[0] is None
 
 
 @pytest.mark.asyncio
@@ -359,7 +385,8 @@ async def test_local_fire_fails_closed_when_pane_unresolved(gt_env, monkeypatch)
     rec = _Recorder(main, monkeypatch)
     # gt_env default: resolve_instance_pane -> (None, None) [pane gone]. Stored
     # column carries a stale %N that must NOT be used as a fallback.
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None)
+    doc = _write_doc(gt_env.docs_dir, "victory:\n  a: false")
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=doc)
 
     await main.golden_throne_followup(iid)
 
@@ -410,7 +437,8 @@ async def test_local_fire_targets_live_resolved_pane_not_stored_column(gt_env, m
     monkeypatch.setattr(main, "_tmux_pane_exists", _pane_exists)
 
     # Stored column is deliberately stale; live resolution must win.
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None)
+    doc = _write_doc(gt_env.docs_dir, "victory:\n  a: false")
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=doc)
 
     await main.golden_throne_followup(iid)
 
@@ -452,7 +480,8 @@ async def test_local_dispatch_failure_marks_quiet_edge_handled(gt_env, monkeypat
 
     monkeypatch.setattr(main, "_tmux_pane_exists", _pane_exists)
 
-    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None)
+    doc = _write_doc(gt_env.docs_dir, "victory:\n  a: false")
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=doc)
 
     await main.golden_throne_followup(iid)
 
@@ -535,10 +564,11 @@ async def test_remote_fire_fails_closed_when_satellite_cannot_resolve(gt_env, mo
     monkeypatch.setattr(main, "_resolve_remote_instance_pane", _gone)
 
     # Stored column carries a stale %N that must NOT be used as a fallback.
+    doc = _write_doc(gt_env.docs_dir, "victory:\n  a: false")
     iid = _insert(
         gt_env.db_path,
         device_id=main.LOCAL_DEVICE_NAME + "-remote",
-        doc_path=None,
+        doc_path=doc,
     )
 
     await main.golden_throne_followup(iid)
@@ -573,10 +603,11 @@ async def test_remote_fire_resolves_via_satellite_not_stored_column(gt_env, monk
     monkeypatch.setattr(main, "_resolve_remote_instance_pane", _resolved)
 
     # Stored column is deliberately stale; live remote resolution must win.
+    doc = _write_doc(gt_env.docs_dir, "victory:\n  a: false")
     iid = _insert(
         gt_env.db_path,
         device_id=main.LOCAL_DEVICE_NAME + "-remote",
-        doc_path=None,
+        doc_path=doc,
     )
 
     await main.golden_throne_followup(iid)

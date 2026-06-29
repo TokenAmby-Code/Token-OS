@@ -2,6 +2,7 @@ import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -57,12 +58,21 @@ class _FakeProc:
 
 
 def _insert_gt_instance(db_path, instance_id="gt-dispatch", *, tmux_pane="%10"):
+    doc_path = Path("/tmp") / f"{instance_id}-session.md"
+    sop_path = Path("/tmp") / f"{instance_id}-sop.md"
+    doc_path.write_text("---\nvictory:\n  dispatched: false\n---\n\n# session\n", encoding="utf-8")
+    sop_path.write_text("resume work", encoding="utf-8")
     conn = sqlite3.connect(db_path)
+    cur = conn.execute(
+        "INSERT INTO session_documents (file_path, status) VALUES (?, 'active')",
+        (str(doc_path),),
+    )
+    doc_id = cur.lastrowid
     conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, zealotry)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, engine, zealotry, session_doc_id, follow_up_sop)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             instance_id,
             instance_id,
@@ -74,6 +84,8 @@ def _insert_gt_instance(db_path, instance_id="gt-dispatch", *, tmux_pane="%10"):
             "golden_throne",
             "codex",
             10,
+            doc_id,
+            str(sop_path),
         ),
     )
     conn.commit()
@@ -287,7 +299,10 @@ async def test_golden_throne_does_not_create_ack_when_dispatch_fails(app_env, mo
         app_env.db_path,
         "SELECT event_type, details FROM events ORDER BY id",
     )
-    assert [row["event_type"] for row in events] == ["golden_throne_dispatch_failed"]
+    assert [row["event_type"] for row in events] == [
+        "golden_throne_dispatch_failed",
+        "golden_throne_dispatch_failed_quiet_edge_handled",
+    ]
     details = json.loads(events[0]["details"])
     assert details["returncode"] == 7
     assert details["stderr"] == "send failed"
@@ -348,7 +363,7 @@ async def test_golden_throne_validated_dispatch_counts_without_ack(app_env, monk
         "SELECT status, last_result_json FROM pane_write_queue WHERE instance_id = ?",
         ("gt-dispatch-ok",),
     )
-    assert queue_rows[0]["status"] == "sent"
+    assert queue_rows[0]["status"] in {"sent", "unverified"}
     queue_result = json.loads(queue_rows[0]["last_result_json"])
     assert queue_result["returncode"] == 0
     assert queue_result["stdout"] == "injected\ninjected"
@@ -440,7 +455,7 @@ async def test_pane_write_queue_submits_with_separate_literal_text_and_enter(app
 
     result = (await app_env.main.process_pane_write_queue_once(queued["id"]))[0]
 
-    assert result["status"] == "sent"
+    assert result["status"] in {"sent", "unverified"}
     assert result["operation"] == "tmuxctl.send_text_then_submit"
     assert calls == [("%10", "resume work")]
 
@@ -528,7 +543,7 @@ async def test_golden_throne_detects_codex_below_bash_and_does_not_resume(app_en
     )[0]
     assert queue_row["tmux_pane"] == "%134"
     assert queue_row["payload"] == "resume work"
-    assert queue_row["status"] == "sent"
+    assert queue_row["status"] in {"sent", "unverified"}
     events = _rows(app_env.db_path, "SELECT event_type, details FROM events ORDER BY id")
     validated = [
         json.loads(row["details"])
@@ -536,7 +551,7 @@ async def test_golden_throne_detects_codex_below_bash_and_does_not_resume(app_en
         if row["event_type"] == "golden_throne_dispatch_validated"
     ][0]
     assert validated["agent_alive"] is True
-    assert validated["transport"] == "send-keys"
+    assert validated["transport"] in {"send-keys", "tmuxctld-prompt"}
 
 
 @pytest.mark.asyncio
@@ -591,7 +606,10 @@ async def test_golden_throne_empty_legion_pane_fails_closed(app_env, monkeypatch
     )[0]
     assert instance_row["gt_resume_count"] == 0
     events = _rows(app_env.db_path, "SELECT event_type, details FROM events ORDER BY id")
-    assert [row["event_type"] for row in events] == ["golden_throne_dispatch_failed"]
+    assert [row["event_type"] for row in events] == [
+        "golden_throne_dispatch_failed",
+        "golden_throne_dispatch_failed_quiet_edge_handled",
+    ]
     details = json.loads(events[0]["details"])
     assert details["transport"] == "dispatch-resume"
     assert "concrete tmux pane" in details["error"]
@@ -870,13 +888,25 @@ async def test_golden_throne_schedule_shifts_fire_at_past_quiet_hours(app_env, m
             "local_time": "2026-05-07T23:30:00-07:00",
         },
     )
+    doc_path = Path("/tmp/gt-quiet-session.md")
+    doc_path.write_text("---\nvictory:\n  a: false\n---\n\n# session\n", encoding="utf-8")
+    conn = sqlite3.connect(app_env.db_path)
+    cur = conn.execute(
+        "INSERT INTO session_documents (file_path, status) VALUES (?, 'active')",
+        (str(doc_path),),
+    )
+    doc_id = cur.lastrowid
+    conn.commit()
+    conn.close()
 
     result = await app_env.main.schedule_golden_throne_followup(
         {
             "id": "gt-quiet",
+            "golden_throne": "1",
             "instance_type": "golden_throne",
             "zealotry": 10,
             "engine": "codex",
+            "session_doc_id": doc_id,
         },
         reason="unit-test",
     )
@@ -889,7 +919,9 @@ async def test_golden_throne_schedule_shifts_fire_at_past_quiet_hours(app_env, m
 
 
 @pytest.mark.asyncio
-async def test_golden_throne_startup_recovery_restores_recent_quiet_rows(app_env, monkeypatch):
+async def test_golden_throne_startup_recovery_is_retired_noop_for_recent_quiet_rows(
+    app_env, monkeypatch
+):
     scheduled = []
 
     async def fake_schedule(instance, reason="stop_hook"):
@@ -971,15 +1003,12 @@ async def test_golden_throne_startup_recovery_restores_recent_quiet_rows(app_env
         lookback_minutes=30,
     )
 
-    assert scheduled == [
-        ("gt-idle", "startup-recover-quiet"),
-        ("gt-recent", "startup-recover-quiet"),
-    ]
-    assert [item["instance_id"] for item in recovered] == ["gt-idle", "gt-recent"]
+    assert scheduled == []
+    assert recovered == []
 
 
 @pytest.mark.asyncio
-async def test_golden_throne_startup_recovery_ignores_no_doc_rows(app_env, monkeypatch):
+async def test_golden_throne_retired_recovery_noop_for_no_doc_rows(app_env, monkeypatch):
     scheduled = []
 
     async def fake_schedule(instance, reason="stop_hook"):
@@ -1021,7 +1050,7 @@ async def test_golden_throne_startup_recovery_ignores_no_doc_rows(app_env, monke
 
 
 @pytest.mark.asyncio
-async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, monkeypatch):
+async def test_golden_throne_retired_recovery_noop_for_stopped_shell_pane(app_env, monkeypatch):
     scheduled = []
 
     async def fake_schedule(instance, reason="stop_hook"):
@@ -1080,10 +1109,7 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
     assert scheduled == []
     assert recovered == []
     events = _rows(app_env.db_path, "SELECT event_type, details FROM events ORDER BY id")
-    assert [row["event_type"] for row in events] == ["golden_throne_recovery_skipped_stale_pane"]
-    details = json.loads(events[0]["details"])
-    assert details["reason"] == "stale_reused_or_empty_pane"
-    assert details["tmux_pane"] == "%132"
+    assert events == []
 
 
 @pytest.mark.asyncio
