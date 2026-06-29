@@ -3,6 +3,8 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
@@ -363,3 +365,60 @@ def test_zoomed_selection_reexpands_if_select_pane_z_does_not_preserve_zoom():
     assert adapter._pane()["role"] == "palace:E"
     assert adapter.zoomed is True
     assert ("resize-pane", "-Z", "-t", "%E") in adapter.commands
+
+
+def test_select_pane_rejects_invalid_mode_and_direction() -> None:
+    adapter = palace_adapter()
+
+    with pytest.raises(ValueError, match="invalid pane-select mode: diagonal"):
+        select_pane(adapter, mode="diagonal", direction="right", client="/dev/ttys001")
+    with pytest.raises(ValueError, match="invalid pane-select direction: northwest"):
+        select_pane(adapter, mode="absolute", direction="northwest", client="/dev/ttys001")
+
+
+def test_relative_right_ignores_stale_focused_worker_and_falls_back_to_uppermost() -> None:
+    adapter = mechanicus_adapter(current="%F", focused="%missing")
+
+    result = select_pane(adapter, mode="relative", direction="right", client="/dev/ttys001")
+
+    assert result.endswith("mechanicus:1")
+    assert adapter._pane()["pane_id"] == "%1"
+    assert ("select-pane", "-t", "mechanicus:1") in adapter.commands
+
+
+def test_duplicate_worker_roles_select_by_physical_pane_for_stability() -> None:
+    adapter = FakePaneSelectAdapter(
+        window_index="4",
+        window_name="mechanicus",
+        panes=[
+            {
+                "pane_id": "%F",
+                "role": "mechanicus:fabricator-general",
+                "type": "mechanicus",
+                "left": 0,
+                "top": 0,
+            },
+            {
+                "pane_id": "%1",
+                "role": "mechanicus:1",
+                "type": "stack-worker",
+                "left": 81,
+                "top": 8,
+            },
+            {
+                "pane_id": "%dupe",
+                "role": "mechanicus:1",
+                "type": "stack-worker",
+                "left": 81,
+                "top": 20,
+            },
+        ],
+        current="%F",
+        window_options={"@STACK_FOCUSED_PANE": "%dupe"},
+    )
+
+    result = select_pane(adapter, mode="relative", direction="right", client="/dev/ttys001")
+
+    assert result.endswith("%dupe")
+    assert adapter._pane()["pane_id"] == "%dupe"
+    assert ("select-pane", "-t", "%dupe") in adapter.commands

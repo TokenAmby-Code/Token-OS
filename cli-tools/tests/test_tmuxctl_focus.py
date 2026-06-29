@@ -208,3 +208,93 @@ def test_transient_window_cleanup_is_centralized_for_all_stash_families():
     ]
     assert is_transient_window_name("_focus_stash_somnium")
     assert not is_transient_window_name("palace")
+
+
+def test_grid_focus_refuses_when_another_grid_focus_is_active() -> None:
+    window = _window(
+        _pane("%2", "palace:N", active=True),
+        _pane("%3", "palace:S"),
+        focused=True,
+        grid_focus_active=True,
+        grid_focus_pane="%3",
+        grid_focus_stash="%4:palace:E:E",
+    )
+
+    plan = build_focus_plan(FakeAdapter(), window, "focus-grid")
+
+    assert plan.operation == "refuse"
+    assert plan.reason == "grid focus already active; unfocus first"
+    assert plan.actions == ()
+
+
+def test_grid_focus_noops_when_active_grid_has_no_siblings() -> None:
+    window = _window(_pane("%2", "palace:N", active=True))
+
+    plan = build_focus_plan(FakeAdapter(), window, "focus-grid")
+
+    assert plan.operation == "noop"
+    assert plan.reason == "no grid siblings to stash"
+    assert plan.actions == ()
+
+
+def test_grid_focus_noops_when_active_pane_is_not_grid() -> None:
+    window = _window(_pane("%1", "palace:W", state=GridState.SIDE, active=True))
+
+    plan = build_focus_plan(FakeAdapter(), window, "focus-grid")
+
+    assert plan.operation == "noop"
+    assert plan.reason == "active pane is not a grid pane"
+    assert plan.actions == ()
+
+
+def test_grid_unfocus_refuses_malformed_or_missing_stash_state() -> None:
+    cases = [
+        ("%3:broken", "invalid focus stash entry: %3:broken", {"%2", "%3"}),
+        ("%3:palace:X:X", "invalid restore coordinate: %3:palace:X:X", {"%2", "%3"}),
+        ("%3:palace:S:S", "stashed pane is missing: %3", {"%2"}),
+        (
+            "%3:palace:S:S,%4:palace:S:S",
+            "grid focus stash must contain exactly 1 or 3 panes",
+            {"%2", "%3", "%4"},
+        ),
+    ]
+    for stash, reason, exists in cases:
+        window = _window(
+            _pane("%2", "palace:N", active=True),
+            focused=True,
+            grid_focus_active=True,
+            grid_focus_pane="%2",
+            grid_focus_stash=stash,
+        )
+
+        plan = build_focus_plan(FakeAdapter(exists=exists), window, "unfocus-grid")
+
+        assert plan.operation == "refuse"
+        assert plan.reason == reason
+        assert plan.actions == ()
+
+
+def test_grid_unfocus_refuses_missing_focused_pane() -> None:
+    window = _window(
+        _pane("%2", "palace:N", active=True),
+        focused=True,
+        grid_focus_active=True,
+        grid_focus_pane="%missing",
+        grid_focus_stash="%3:palace:S:S",
+    )
+
+    plan = build_focus_plan(FakeAdapter(exists={"%3"}), window, "unfocus-grid")
+
+    assert plan.operation == "refuse"
+    assert plan.reason == "focused grid pane is missing"
+    assert plan.actions == ()
+
+
+def test_side_focus_noops_for_non_side_pane() -> None:
+    window = _window(_pane("%2", "palace:N", active=True), _pane("%3", "palace:S"))
+
+    plan = build_focus_plan(FakeAdapter(), window, "focus-side")
+
+    assert plan.operation == "noop"
+    assert plan.reason == "active pane is not a side pane"
+    assert plan.actions == ()

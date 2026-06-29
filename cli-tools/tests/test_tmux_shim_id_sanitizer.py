@@ -60,6 +60,9 @@ def _fake_tmux(tmp_path: pathlib.Path) -> pathlib.Path:
               "capturep -p -t %11")
                 printf 'Last raw panes: %%11 and %%99\n'
                 ;;
+              "select-pane -t %11")
+                printf 'selected %%11\n'
+                ;;
               *)
                 printf 'unexpected args: %s\n' "$*" >&2
                 exit 64
@@ -73,7 +76,9 @@ def _fake_tmux(tmp_path: pathlib.Path) -> pathlib.Path:
     return fake
 
 
-def _run_shim(tmp_path: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run_shim(
+    tmp_path: pathlib.Path, *args: str, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "IMPERIUM_TMUX_BIN": str(_fake_tmux(tmp_path)),
@@ -82,6 +87,8 @@ def _run_shim(tmp_path: pathlib.Path, *args: str) -> subprocess.CompletedProcess
     }
     env.pop("IMPERIUM_TMUX_SANITIZE_IDS", None)
     env.pop("IMPERIUM_TMUX_RAW", None)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run([str(TMUX_SHIM), *args], text=True, capture_output=True, env=env)
 
 
@@ -161,3 +168,17 @@ def test_human_facing_display_still_sanitizes(tmp_path) -> None:
     assert embedded.returncode == 0, embedded.stderr
     assert embedded.stdout == "[palace:N]\n", embedded.stdout
     assert "%" not in embedded.stdout
+
+
+def test_tmux_raw_env_disables_read_sanitizer(tmp_path) -> None:
+    proc = _run_shim(tmp_path, "list-panes", extra_env={"IMPERIUM_TMUX_RAW": "1"})
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "0: [80x24] [history 1/2000] %11 (active)\n"
+
+
+def test_non_read_physical_target_command_passes_through_without_sanitizing(tmp_path) -> None:
+    proc = _run_shim(tmp_path, "select-pane", "-t", "%11")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "selected %11\n"

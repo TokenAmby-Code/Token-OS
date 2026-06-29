@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 
@@ -133,6 +134,23 @@ def test_terminate_agent_sigterm_clean_exit():
     )
     assert ok
     assert len(kills) == 1  # no SIGKILL escalation needed
+
+
+def test_terminate_agent_zero_timeout_escalates_without_sleeping() -> None:
+    kills: list[tuple[int, int]] = []
+    sleeps: list[float] = []
+
+    ok = terminate_agent(
+        42,
+        table_reader=lambda: {42: (1, "claude")},
+        kill_fn=lambda pid, sig: kills.append((pid, sig)),
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+        timeout_seconds=0,
+    )
+
+    assert not ok
+    assert kills == [(42, signal.SIGTERM), (42, signal.SIGKILL)]
+    assert sleeps == []
 
 
 def test_terminate_agent_already_gone():
