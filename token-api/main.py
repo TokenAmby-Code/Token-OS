@@ -111,7 +111,7 @@ from instance_mutation import (
     sanctioned_insert_instance,
     sanctioned_update_instance,
 )
-from instance_registry import DEFAULT_INSTANCE_NAME, derived_cockpit_label
+from instance_registry import DEFAULT_INSTANCE_NAME, VALID_STATUSES, derived_cockpit_label
 from morning_supervisor import arm_morning_supervisor
 from pane_surface import (
     human_pane_surface as _format_human_pane_surface,
@@ -562,6 +562,13 @@ class InstanceResponse(BaseModel):
 
 class ActivityRequest(BaseModel):
     action: str  # "prompt_submit" or "stop"
+
+
+class InstanceStatusRequest(BaseModel):
+    status: str
+    workflow_state: str | None = None
+    next_required_action: str | None = None
+    next_action_owner: str | None = None
 
 
 class TempMessageRequest(BaseModel):
@@ -3474,6 +3481,52 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         "new_status": new_status,
         "acknowledged_expected_acks": acknowledged_acks,
     }
+
+
+@app.patch("/api/instances/{instance_id}/status")
+async def set_instance_status(
+    instance_id: str, request: InstanceStatusRequest
+) -> dict[str, object]:
+    """Set an instance lifecycle status through sanctioned mutation.
+
+    Intended for workflow CLIs that need to mark an agent as reviewing,
+    planning, etc. Do not write the SQLite registry directly.
+    """
+    status = (request.status or "").strip().lower()
+    if status not in VALID_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"status must be one of: {', '.join(sorted(VALID_STATUSES))}",
+        )
+
+    updates: dict = {"status": status, "last_activity": datetime.now().isoformat()}
+    fields_set = request.model_fields_set
+    if "workflow_state" in fields_set:
+        updates["workflow_state"] = request.workflow_state
+    if "next_required_action" in fields_set:
+        updates["next_required_action"] = request.next_required_action
+    if "next_action_owner" in fields_set:
+        updates["next_action_owner"] = request.next_action_owner
+    if status not in ("stopped", "archived"):
+        updates["stopped_at"] = None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type="status_changed",
+            write_source="api",
+            actor="set-status",
+        )
+        await db.commit()
+
+    logger.info(f"Status: {instance_id[:12]} → {updates}")
+    return {"instance_id": instance_id, **updates}
 
 
 @app.get("/api/instances/{instance_id}/todos")

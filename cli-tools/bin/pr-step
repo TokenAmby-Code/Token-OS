@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# PR Step
+# TAGS: git, pr, workflow
+# AUDIENCE: agent
+#
+# One-command PR lifecycle step:
+#   - if no PR exists for this worktree branch: commit pending changes, push,
+#     create a PR, wait for CodeRabbit
+#   - if a PR exists: commit pending changes, push, request deterministic
+#     CodeRabbit re-review, wait for current-head results
+#   - after every step: if review + checks are green, merge automatically
+#
+# Usage: pr-step [--message MSG] [--title TITLE] [--body BODY]
+#        pr-step --no-merge
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+source "$SCRIPT_DIR/../lib/git-remote.sh"
+source "$SCRIPT_DIR/../lib/nas-path.sh" >/dev/null 2>&1 || true
+
+PUSH_WRAPPER="$SCRIPT_DIR/push"
+REVIEW_LOOP="$SCRIPT_DIR/pr-review-loop"
+PR_CREATE="$SCRIPT_DIR/pr-create"
+PR_MERGE="$SCRIPT_DIR/pr-merge"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+log() { echo -e "${BLUE}[pr-step]${NC} $1" >&2; }
+warn() { echo -e "${YELLOW}[pr-step]${NC} $1" >&2; }
+error() { echo -e "${RED}[pr-step]${NC} $1" >&2; }
+success() { echo -e "${GREEN}[pr-step]${NC} $1" >&2; }
+
+MESSAGE=""
+TITLE=""
+BODY=""
+AUTO_MERGE=true
+TIMEOUT_MINS=15
+
+usage() {
+    cat <<'USAGE'
+PR Step
+
+Usage: pr-step [options]
+
+Options:
+  --message MSG       Commit/re-review message. Default derives from branch/head.
+  --title TITLE       PR title for first create. Default uses latest commit subject.
+  --body BODY         PR body for first create. Default is generated.
+  --timeout MINS      CodeRabbit wait timeout per review cycle (default: 15)
+  --no-merge          Do not auto-merge even if checks are green.
+  -h, --help          Show this help.
+
+Behavior:
+  No PR: commit pending changes, push, create PR, return CodeRabbit review.
+  PR:    commit pending changes, push, request re-review, return CodeRabbit review.
+  Green: auto-merge with pr-merge -y.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --message|--title|--body|--timeout)
+            [[ $# -ge 2 ]] || { error "Missing value for $1"; usage >&2; exit 2; }
+            case "$1" in
+                --message) MESSAGE="$2" ;;
+                --title) TITLE="$2" ;;
+                --body) BODY="$2" ;;
+                --timeout) TIMEOUT_MINS="$2" ;;
+            esac
+            shift 2
+            ;;
+        --no-merge) AUTO_MERGE=false; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) error "Unknown argument: $1"; usage >&2; exit 2 ;;
+    esac
+done
+
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+mark_instance_status() {
+    local status="$1" api iid body
+    iid="${TOKEN_API_INSTANCE_ID:-}"
+    [[ -n "$iid" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    case "$status" in
+        reviewing)
+            body="{\"status\":$(json_escape "$status"),\"workflow_state\":\"review_mode\",\"next_required_action\":\"review\",\"next_action_owner\":\"human\"}"
+            ;;
+        victorious)
+            body="{\"status\":$(json_escape "$status"),\"workflow_state\":\"complete\",\"next_required_action\":null,\"next_action_owner\":null}"
+            ;;
+        *)
+            body="{\"status\":$(json_escape "$status")}"
+            ;;
+    esac
+    curl -fsS -m 5 -X PATCH -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/instances/${iid}/status" >/dev/null 2>&1 || true
+}
+
+mark_pr_flag() {
+    local pr_url="$1" pr_state="${2:-open}" api iid body
+    iid="${TOKEN_API_INSTANCE_ID:-}"
+    [[ -n "$iid" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    body="{\"pr_url\":$(json_escape "$pr_url"),\"pr_state\":$(json_escape "$pr_state")}"
+    curl -fsS -m 5 -X PATCH -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/instances/${iid}/pr" >/dev/null 2>&1 || true
+}
+
+inject_plan_after_stop() {
+    local pane api body resp
+    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
+    [[ -n "$pane" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_step_plan\",\"payload\":\"/plan \" ,\"oneshot\":true}"
+    resp=$(curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/hooks/subscribe" 2>/dev/null || true)
+    [[ -n "$resp" ]] || true
+}
+
+assert_pr_capable_remote() {
+    local top origin
+    top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    origin="$(git remote get-url origin 2>/dev/null || true)"
+    if [[ "$top" == *"/Token-OS/"* || "$top" == *"/Token-OS" ]]; then
+        if ! token_os_github_remote "$origin"; then
+            error "worktree is not PR-capable; expected TokenAmby-Code/Token-OS GitHub remote"
+            error "origin remote: ${origin:-<missing>}"
+            exit 64
+        fi
+        return 0
+    fi
+    if dead_or_quarantined_remote "$origin"; then
+        error "worktree is not PR-capable; origin remote is missing, dead, or quarantined: ${origin:-<missing>}"
+        exit 64
+    fi
+}
+
+assert_repo() {
+    git rev-parse --show-toplevel >/dev/null 2>&1 || { error "Must be run in a git repository"; exit 1; }
+    local branch
+    branch="$(git branch --show-current)"
+    [[ -n "$branch" ]] || { error "Detached HEAD; cannot manage PR"; exit 1; }
+    case "$branch" in main|master|prod) error "Refusing to run pr-step on protected branch: $branch"; exit 64 ;; esac
+    assert_pr_capable_remote
+}
+
+commit_if_needed() {
+    local msg="$1"
+    if git diff --quiet --ignore-submodules -- && git diff --cached --quiet --ignore-submodules -- && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+        log "No local changes to commit."
+        return 1
+    fi
+    git add -A
+    if git diff --cached --quiet --ignore-submodules --; then
+        log "No staged changes after git add -A."
+        return 1
+    fi
+    if [[ -z "$msg" ]]; then
+        local branch
+        branch="$(git branch --show-current | sed 's/[-_]/ /g')"
+        msg="chore: ${branch:-update}"
+    fi
+    log "Committing pending changes..."
+    git commit -m "$msg"
+    return 0
+}
+
+push_branch() {
+    local branch
+    branch="$(git branch --show-current)"
+    if git rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+        "$PUSH_WRAPPER" "$GIT_GITHUB_REMOTE" "$branch"
+    else
+        "$PUSH_WRAPPER" -u "$GIT_GITHUB_REMOTE" "$branch"
+    fi
+}
+
+current_pr_number() {
+    gh pr view --json number -q '.number' 2>/dev/null || true
+}
+
+current_pr_url() {
+    local pr="$1"
+    gh pr view "$pr" --json url -q '.url' 2>/dev/null || true
+}
+
+default_body() {
+    local subject="$1"
+    cat <<BODY
+## Summary
+- ${subject}
+
+## Test plan
+- [ ] Review automated checks
+- [ ] CodeRabbit review
+
+Generated by pr-step.
+BODY
+}
+
+create_pr() {
+    local subject body pr_url pr_num
+    subject="${TITLE:-$(git log -1 --pretty=%s)}"
+    body="${BODY:-$(default_body "$subject")}"
+    log "Creating PR..."
+    "$PR_CREATE" --title "$subject" --body "$body" --wait --timeout "$TIMEOUT_MINS"
+    pr_num="$(current_pr_number)"
+    pr_url="$(current_pr_url "$pr_num")"
+    [[ -n "$pr_num" ]] || { error "Could not determine created PR number"; exit 1; }
+    mark_pr_flag "$pr_url" open
+    printf '%s\n' "$pr_num"
+}
+
+run_review() {
+    local pr="$1" mode_msg="$2"
+    # Let CodeRabbit's initial push webhook start before forcing a full review.
+    # Avoid command spam; pr-review-loop also guards API/command rate limits.
+    "$REVIEW_LOOP" "$pr" --message "$mode_msg" --timeout "$TIMEOUT_MINS"
+}
+
+checks_green() {
+    local pr="$1" repo head cr_state latest_review changes conclusion rollup mergeable state
+    repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || return 1
+    head=$(gh api "repos/${repo}/pulls/${pr}" --jq '.head.sha' 2>/dev/null || true)
+    [[ -n "$head" ]] || return 1
+    state=$(gh pr view "$pr" --json state -q '.state' 2>/dev/null || true)
+    [[ "$state" == "OPEN" ]] || return 1
+    mergeable=$(gh pr view "$pr" --json mergeable -q '.mergeable' 2>/dev/null || true)
+    [[ "$mergeable" != "CONFLICTING" ]] || return 1
+    cr_state=$(gh api "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true)
+    [[ "$cr_state" == "success" ]] || return 1
+    changes=$(gh api "repos/${repo}/pulls/${pr}/reviews" 2>/dev/null | jq -r '
+        sort_by(.user.login, .submitted_at)
+        | group_by(.user.login)
+        | map(max_by(.submitted_at))
+        | [.[] | select(.state == "CHANGES_REQUESTED")]
+        | length
+    ' 2>/dev/null || echo 1)
+    [[ "$changes" == "0" ]] || return 1
+    # gh pr checks exits nonzero while checks are pending/failing. No required checks
+    # also counts as green for repos that only gate on CodeRabbit.
+    local checks_tmp
+    checks_tmp="$(mktemp -t pr-step-checks.XXXXXX)"
+    if gh pr checks "$pr" --watch=false --fail-fast=false >"$checks_tmp" 2>/dev/null; then
+        rm -f "$checks_tmp"
+        return 0
+    fi
+    # tolerate repos with no checks reported by gh
+    if grep -qi "no checks" "$checks_tmp" 2>/dev/null; then
+        rm -f "$checks_tmp"
+        return 0
+    fi
+    rm -f "$checks_tmp"
+    return 1
+}
+
+main() {
+    assert_repo
+    inject_plan_after_stop
+    mark_instance_status reviewing
+
+    local pr msg pr_url
+    pr="$(current_pr_number)"
+    msg="${MESSAGE:-}"
+
+    if [[ -z "$pr" ]]; then
+        log "No PR found for current branch; creating one."
+        commit_if_needed "$msg" || true
+        push_branch
+            create_pr
+        pr="$(current_pr_number)"
+        # pr-create --wait returns the initial review; do a read pass to normalize output.
+        "$REVIEW_LOOP" "$pr" --read --timeout "$TIMEOUT_MINS" || true
+    else
+        pr_url="$(current_pr_url "$pr")"
+        [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" open
+        log "PR #$pr found; updating current-head review."
+        commit_if_needed "$msg" || true
+        push_branch
+        run_review "$pr" "${msg:-Updated branch; request deterministic full review of latest head.}" || true
+    fi
+
+    if [[ "$AUTO_MERGE" == "true" ]] && checks_green "$pr"; then
+        success "PR #$pr is green; auto-merging."
+        "$PR_MERGE" "$pr" -y
+        pr_url="$(current_pr_url "$pr")"
+        [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
+        mark_instance_status victorious
+    else
+        log "PR #$pr is not yet green; leaving it open."
+    fi
+}
+
+main "$@"

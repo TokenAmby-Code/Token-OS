@@ -23,6 +23,49 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 source "$SCRIPT_DIR/../lib/git-remote.sh"
 source "$SCRIPT_DIR/../lib/worktree-park.sh" 2>/dev/null || true
 source "$SCRIPT_DIR/../lib/worktree-resolve.sh"
+source "$SCRIPT_DIR/../lib/nas-path.sh" >/dev/null 2>&1 || true
+
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+pr_set_instance_status() {
+    local status="$1" api iid body
+    iid="${TOKEN_API_INSTANCE_ID:-}"
+    [[ -n "$iid" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    case "$status" in
+        reviewing)
+            body="{\"status\":$(json_escape "$status"),\"workflow_state\":\"review_mode\",\"next_required_action\":\"review\",\"next_action_owner\":\"human\"}"
+            ;;
+        victorious)
+            body="{\"status\":$(json_escape "$status"),\"workflow_state\":\"complete\",\"next_required_action\":null,\"next_action_owner\":null}"
+            ;;
+        *)
+            body="{\"status\":$(json_escape "$status")}"
+            ;;
+    esac
+    curl -fsS -m 5 -X PATCH -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/instances/${iid}/status" >/dev/null 2>&1 || true
+}
+
+pr_inject_plan_after_stop() {
+    local pane api body
+    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
+    [[ -n "$pane" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_lifecycle_plan\",\"payload\":\"/plan \",\"oneshot\":true}"
+    curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
+}
+
+pr_set_instance_pr_state() {
+    local url="$1" state="$2" api iid body
+    iid="${TOKEN_API_INSTANCE_ID:-}"
+    [[ -n "$iid" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    body="{\"pr_url\":$(json_escape "$url"),\"pr_state\":$(json_escape "$state")}"
+    curl -fsS -m 5 -X PATCH -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/instances/${iid}/pr" >/dev/null 2>&1 || true
+}
 
 # Colors
 RED='\033[0;31m'
@@ -46,6 +89,8 @@ info() { echo -e "${CYAN}   $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}[pr-merge]${NC} $1" >&2; }
 error() { echo -e "${RED}[pr-merge]${NC} $1" >&2; }
 success() { echo -e "${GREEN}[pr-merge]${NC} $1" >&2; }
+
+pr_inject_plan_after_stop
 
 # Defaults
 MERGE_METHOD="squash"
@@ -197,7 +242,7 @@ fi
 IN_WORKTREE=false
 WORKTREE_PATH=""
 PR_WORKTREE_PATH="$(resolve_worktree_for_branch "$BRANCH_NAME")"
-MAIN_WORKTREE_PATH=$(git worktree list --porcelain | grep -m1 "^worktree " | cut -d' ' -f2)
+MAIN_WORKTREE_PATH=$(git worktree list --porcelain | awk 'found == 0 && /^worktree / { sub(/^worktree /, ""); print; found = 1 }')
 
 if [[ -n "$PR_WORKTREE_PATH" && -f "$PR_WORKTREE_PATH/.git" ]]; then
     # The PR's head branch is checked out in a *linked* worktree (its .git is a
@@ -309,6 +354,11 @@ fi
 
 success "${SUCCESS} PR merged successfully"
 echo ""
+PR_URL_AFTER_MERGE=$(gh pr view "$PR_NUMBER" --json url -q '.url' 2>/dev/null || echo "")
+if [[ -n "$PR_URL_AFTER_MERGE" ]]; then
+    pr_set_instance_pr_state "$PR_URL_AFTER_MERGE" merged
+fi
+pr_set_instance_status victorious
 
 # Exit if no cleanup requested
 if [[ "$NO_CLEANUP" == "true" ]]; then
