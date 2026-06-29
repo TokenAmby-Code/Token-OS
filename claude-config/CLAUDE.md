@@ -100,7 +100,7 @@ Use tasks for anything with 3+ steps or that involves multiple files.
 | `db-query` | Cloud SQL access |
 | `db-migrate` | SQL migrations |
 | `deploy` | Deployments |
-| `pr-create` | PR + review |
+| `pr-step` | PR lifecycle: commit/create/update/review/merge |
 | `test` | Local testing |
 | `ssh-connect` | Standardized SSH with redirect-on-exit (`ssh-mac`, `ssh-wsl`, `ssh-phone`) |
 | `time-convert` | Timezone conversion |
