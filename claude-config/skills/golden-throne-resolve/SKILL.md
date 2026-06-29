@@ -9,12 +9,12 @@ Resolve the live instance and read the linked session doc before doing any recov
 
 1. Load machine config if available:
    ```bash
-   source "${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV/Scripts/cli-tools/lib/nas-path.sh" 2>/dev/null || true
+   source "${TOKEN_OS_ROOT:-$HOME/runtimes/Token-OS/live}/cli-tools/lib/nas-path.sh" 2>/dev/null || source "${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV/Scripts/cli-tools/lib/nas-path.sh" 2>/dev/null || true
    ```
 2. Resolve the instance:
    ```bash
-   CLAUDE_PID=$(pid=$$; for _ in 1 2 3 4 5 6 7 8; do [ -z "$pid" ] || [ "$pid" = "1" ] && break; comm=$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)" 2>/dev/null); [ "$comm" = "claude" ] && echo "$pid" && break; pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); done)
-   token-ping instances/resolve pid=$CLAUDE_PID cwd="$(pwd)"
+   INSTANCE_PID=$(pid=$$; for _ in 1 2 3 4 5 6 7 8; do [ -z "$pid" ] || [ "$pid" = "1" ] && break; comm=$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)" 2>/dev/null); case "$comm" in claude|codex) echo "$pid" && break ;; esac; pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); done)
+   token-ping instances/resolve pid="$INSTANCE_PID" cwd="$(pwd)"
    ```
 3. Read `session_doc_id` / `session_doc.file_path` from the response.
 4. Read current content:

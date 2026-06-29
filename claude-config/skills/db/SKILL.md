@@ -21,9 +21,15 @@ Use the configured path instead of hardcoding when a helper exists. For shell/Py
 Typical read-only probes:
 
 ```bash
-sqlite3 ~/runtimes/Token-OS/database/agents.db '.tables'
-sqlite3 ~/runtimes/Token-OS/database/agents.db 'PRAGMA table_info(instances);'
-sqlite3 ~/runtimes/Token-OS/database/agents.db "SELECT id, name, legion, primarch, instance_type, session_doc_id, pane_label, updated_at FROM instances ORDER BY updated_at DESC LIMIT 20;"
+source "${TOKEN_OS_ROOT:-$HOME/runtimes/Token-OS/live}/cli-tools/lib/nas-path.sh" 2>/dev/null || true
+DB_ROOT="${TOKEN_OS_DB_DIR:-${TOKEN_OS_DATABASE_DIR:-$HOME/runtimes/Token-OS/database}}"
+AGENTS_DB="${TOKEN_API_DB:-$DB_ROOT/agents.db}"
+TIMER_DB="${TOKEN_TIMER_DB:-$DB_ROOT/timer.db}"
+
+sqlite3 "$AGENTS_DB" '.tables'
+sqlite3 "$AGENTS_DB" 'PRAGMA table_info(instances);'
+sqlite3 "$AGENTS_DB" "SELECT id, name, legion, primarch, instance_type, session_doc_id, pane_label, updated_at FROM instances ORDER BY updated_at DESC LIMIT 20;"
+sqlite3 "$TIMER_DB" '.tables'
 ```
 
 Prefer Token-API for live behavior when an endpoint exists:
