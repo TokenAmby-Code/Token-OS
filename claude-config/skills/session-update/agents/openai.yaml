@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Update"
+  short_description: "Update linked session docs"
+  default_prompt: "Use $session-update to merge a progress update into the linked session doc."

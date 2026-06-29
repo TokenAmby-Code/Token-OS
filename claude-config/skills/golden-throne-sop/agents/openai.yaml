@@ -1,6 +1,4 @@
 interface:
   display_name: "Golden Throne SOP"
-  short_description: "Resume unmet victory rubric work"
-  default_prompt: "Use $golden-throne-sop to address the unmet Golden Throne victory condition."
-policy:
-  allow_implicit_invocation: true
+  short_description: "Recover unmet victory criteria"
+  default_prompt: "Use $golden-throne-sop to resolve an unmet victory condition."

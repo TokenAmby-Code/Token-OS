@@ -1,0 +1,4 @@
+interface:
+  display_name: "Daily Note"
+  short_description: "Maintain the Custodes daily note"
+  default_prompt: "Use $daily-note to update today’s daily note with evidence."

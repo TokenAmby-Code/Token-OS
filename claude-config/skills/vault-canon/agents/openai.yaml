@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vault Canon"
+  short_description: "Legacy earned vault write alias"
+  default_prompt: "Use $vault-canon for a legacy earned vault write."

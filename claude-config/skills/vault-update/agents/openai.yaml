@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vault Update"
+  short_description: "Make an earned vault write"
+  default_prompt: "Use $vault-update to record an earned institutional correction."
