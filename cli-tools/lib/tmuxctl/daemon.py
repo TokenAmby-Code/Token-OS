@@ -60,6 +60,12 @@ from .tmux_adapter import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7778
 
+# tmux owns pane-death detection. tmuxctld owns persona re-seating. The global
+# hook is therefore daemon-critical: if tmux.conf was not sourced (or hooks were
+# cleared during a live reload), must-fill persona panes can remain forever at
+# "Pane is dead" now that the old correctness poll is retired.
+_PANE_DIED_HOOK = 'run-shell "tmux-run tmux-pane-respawn #{pane_id}"'
+
 # The daemon is unauthenticated and does powerful tmux ops — it binds loopback
 # ONLY. serve() refuses any other --host (fail-closed).
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -73,6 +79,50 @@ _PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
 _VOICE_LIST_SEP = "__TMUXCTLD_VOICE_FIELD__"
 _VOICE_LOCK_OPTION = "@DISCORD_VOICE_LOCK"
 _VOICE_PROCESSING_OPTION = "@DISCORD_VOICE_PROCESSING"
+
+
+def ensure_tmux_lifecycle_hooks() -> dict:
+    """Best-effort install of the tmux hooks that feed daemon reconciliation.
+
+    The canonical config also declares these, but daemon startup is the correct
+    backstop because tmuxctld is the consumer that needs the event stream. This
+    is deliberately non-fatal: tmux may be unavailable during launchd startup, in
+    which case the normal tmux config still installs hooks when the workspace is
+    created/sourced.
+    """
+    commands = [
+        ("set-option", "-g", "remain-on-exit", "on"),
+        ("set-hook", "-g", "pane-died", _PANE_DIED_HOOK),
+    ]
+    results = []
+    ok = True
+    for command in commands:
+        try:
+            proc = subprocess.run(
+                ("tmux", *command),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            entry = {
+                "command": command[0],
+                "ok": proc.returncode == 0,
+                "returncode": proc.returncode,
+                "stderr": (proc.stderr or "").strip()[:300],
+            }
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            entry = {
+                "command": command[0],
+                "ok": False,
+                "returncode": None,
+                "stderr": str(exc)[:300],
+            }
+        results.append(entry)
+        ok = ok and entry["ok"]
+    if not ok:
+        log.warning("tmux lifecycle hook install incomplete: %s", results)
+    return {"ok": ok, "results": results}
 
 
 class PromptSubmitSniffer:
@@ -1745,6 +1795,7 @@ def serve(host: str, port: int) -> int:
             flush=True,
         )
         return 2
+    ensure_tmux_lifecycle_hooks()
     server = TmuxctldServer(
         (host, port),
         version=read_version(),
