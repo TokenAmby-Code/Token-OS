@@ -21,6 +21,8 @@ from typing import Any
 
 DEFAULT_DB = Path.home() / ".claude" / "generic-token-api-durable-retry-outbox.sqlite3"
 DEFAULT_LOG = Path.home() / ".claude" / "logs" / "generic-token-api-durable-retry-outbox.log"
+SESSION_SINGLETON_ACTIONS = frozenset({"SessionStart", "SessionEnd"})
+WRAPPER_SINGLETON_ACTIONS = frozenset({"WrapperStart", "WrapperEnd"})
 
 
 def _utc() -> str:
@@ -82,9 +84,11 @@ def _payload_obj(payload: str) -> dict[str, Any]:
 def _idem_key(action_type: str, payload: str) -> str:
     data = _payload_obj(payload)
     env = data.get("env") if isinstance(data.get("env"), dict) else {}
-    primary = data.get("session_id") or data.get("wrapper_launch_id") or env.get("TOKEN_API_WRAPPER_LAUNCH_ID")
-    if primary:
-        return f"{action_type}:{primary}"
+    if action_type in SESSION_SINGLETON_ACTIONS and data.get("session_id"):
+        return f"{action_type}:session:{data['session_id']}"
+    wrapper_id = data.get("wrapper_launch_id") or env.get("TOKEN_API_WRAPPER_LAUNCH_ID")
+    if action_type in WRAPPER_SINGLETON_ACTIONS and wrapper_id:
+        return f"{action_type}:wrapper:{wrapper_id}"
     digest = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
     return f"{action_type}:sha256:{digest}"
 
@@ -155,11 +159,24 @@ def drain(args: argparse.Namespace) -> int:
     drained = replayed = failed = 0
     with _connect() as conn:
         while drained < args.limit:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM hook_posts WHERE status = 'pending' ORDER BY id LIMIT 1"
             ).fetchone()
             if row is None:
+                conn.commit()
                 break
+            claimed = conn.execute(
+                """
+                UPDATE hook_posts
+                   SET status='inflight', updated_at=?
+                 WHERE id=? AND status='pending'
+                """,
+                (_utc(), row["id"]),
+            )
+            conn.commit()
+            if claimed.rowcount != 1:
+                continue
             drained += 1
             http_code, error = _post(row["url"], row["payload"], args.timeout)
             now = _utc()
@@ -169,7 +186,7 @@ def drain(args: argparse.Namespace) -> int:
                     UPDATE hook_posts
                        SET status='done', attempts=attempts+1, updated_at=?,
                            last_http_code=?, last_error=NULL
-                     WHERE id=?
+                     WHERE id=? AND status='inflight'
                     """,
                     (now, http_code, row["id"]),
                 )
@@ -181,8 +198,9 @@ def drain(args: argparse.Namespace) -> int:
                 conn.execute(
                     """
                     UPDATE hook_posts
-                       SET attempts=attempts+1, updated_at=?, last_http_code=?, last_error=?
-                     WHERE id=?
+                       SET status='pending', attempts=attempts+1, updated_at=?,
+                           last_http_code=?, last_error=?
+                     WHERE id=? AND status='inflight'
                     """,
                     (now, http_code, error[:500], row["id"]),
                 )
@@ -194,7 +212,7 @@ def drain(args: argparse.Namespace) -> int:
                 UPDATE hook_posts
                    SET status='failed', attempts=attempts+1, updated_at=?,
                        last_http_code=?, last_error=?
-                 WHERE id=?
+                 WHERE id=? AND status='inflight'
                 """,
                 (now, http_code, error[:500], row["id"]),
             )

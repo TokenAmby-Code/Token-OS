@@ -197,6 +197,9 @@ fi
             --action-type "$ACTION_TYPE" \
             --url "${API_URL}/api/hooks/${ACTION_TYPE}" \
             --cause "http-000" >/dev/null 2>&1 || true
+    elif [[ "$http_code" != 2* ]]; then
+        printf '[%s] codex-hook-bridge token-api POST failed action=%s http=%s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$ACTION_TYPE" "${http_code:-?}" >> "$LOG_FILE" 2>/dev/null || true
     fi
 ) &
 disown 2>/dev/null || true

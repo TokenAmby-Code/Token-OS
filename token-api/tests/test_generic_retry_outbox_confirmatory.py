@@ -8,8 +8,10 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
+from pytest import MonkeyPatch
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTBOX = ROOT / "cli-tools" / "bin" / "generic-token-api-durable-retry-outbox"
@@ -49,7 +51,7 @@ class _TokenApiBridge:
                 self.end_headers()
                 self.wfile.write(resp.content)
 
-            def log_message(self, *a) -> None:
+            def log_message(self, *args: object) -> None:
                 pass
 
         self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
@@ -59,11 +61,12 @@ class _TokenApiBridge:
 
     def close(self) -> None:
         self.server.shutdown()
+        self.server.server_close()
         self.thread.join(timeout=2)
 
 
 def test_dropped_sessionstart_ping_has_no_row_until_outbox_replay_then_identity_lands(
-    app_env, tmp_path: Path, monkeypatch
+    app_env: Any, tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     """Confirm W2 diagnosis and recovery without mutating the live registry.
 
@@ -107,6 +110,7 @@ def test_dropped_sessionstart_ping_has_no_row_until_outbox_replay_then_identity_
         input_text=json.dumps(payload),
     )
     assert enq.returncode == 0, enq.stderr
+    enqueued = json.loads(enq.stdout)
     conn = sqlite3.connect(app_env.db_path)
     assert (
         conn.execute("SELECT 1 FROM instances WHERE id = ?", (payload["session_id"],)).fetchone()
@@ -125,8 +129,8 @@ def test_dropped_sessionstart_ping_has_no_row_until_outbox_replay_then_identity_
         # without requiring a real port-7777 outage in unit tests.
         db = sqlite3.connect(tmp_path / "outbox.sqlite3")
         db.execute(
-            "UPDATE hook_posts SET url = ? WHERE idempotency_key = ?",
-            (f"{bridge.base}/api/hooks/SessionStart", "SessionStart:queued-session"),
+            "UPDATE hook_posts SET url = ? WHERE id = ?",
+            (f"{bridge.base}/api/hooks/SessionStart", enqueued["id"]),
         )
         db.commit()
         db.close()

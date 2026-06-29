@@ -2,7 +2,8 @@
 
 Durable client-side retry/replay outbox for hook → Token-API POSTs that fail because the service is unreachable (`http=000` / connection refused).
 
-Old alias: `hook-token-api-retry-queue`.
+Compatibility alias: `hook-token-api-queue` (old ticket slug:
+`hook-token-api-retry-queue`).
 
 ## Library survey / chosen approach
 
@@ -26,10 +27,11 @@ Schema table: `hook_posts` ordered by autoincrement `id`.
 
 Idempotency key:
 
-1. `<action_type>:<session_id>` when payload has `session_id`
-2. `<action_type>:<wrapper_launch_id>` when payload has `wrapper_launch_id`
-3. `<action_type>:<env.TOKEN_API_WRAPPER_LAUNCH_ID>` when present
-4. `<action_type>:sha256:<payload>` fallback
+1. `SessionStart`/`SessionEnd`: `<action_type>:session:<session_id>`
+2. `WrapperStart`/`WrapperEnd`: `<action_type>:wrapper:<wrapper_launch_id>`
+   or `<action_type>:wrapper:<env.TOKEN_API_WRAPPER_LAUNCH_ID>`
+3. Repeatable hook actions (`PreToolUse`, `UserPromptSubmit`, etc.):
+   `<action_type>:sha256:<payload>`
 
 ## Drain trigger
 

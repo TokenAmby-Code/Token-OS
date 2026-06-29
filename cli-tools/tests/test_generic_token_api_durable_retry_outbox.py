@@ -54,7 +54,7 @@ class _Server:
                 self.end_headers()
                 self.wfile.write(b'{"success":true}')
 
-            def log_message(self, *a) -> None:
+            def log_message(self, *args: object) -> None:
                 pass
 
         self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
@@ -64,6 +64,7 @@ class _Server:
 
     def close(self) -> None:
         self.server.shutdown()
+        self.server.server_close()
         self.thread.join(timeout=2)
 
 
@@ -93,6 +94,32 @@ def test_enqueue_is_idempotent_by_action_and_session_id(tmp_path: Path) -> None:
     assert json.loads(second.stdout)["duplicate"] is True
     status = _run_queue(tmp_path, "status")
     assert json.loads(status.stdout) == {"pending": 1}
+
+
+def test_repeatable_actions_use_payload_hash_not_session_singleton(tmp_path: Path) -> None:
+    first = _run_queue(
+        tmp_path,
+        "enqueue",
+        "--action-type",
+        "PreToolUse",
+        "--url",
+        "http://127.0.0.1:9/api/hooks/PreToolUse",
+        input_text='{"session_id":"sid-1","tool":"Read"}',
+    )
+    second = _run_queue(
+        tmp_path,
+        "enqueue",
+        "--action-type",
+        "PreToolUse",
+        "--url",
+        "http://127.0.0.1:9/api/hooks/PreToolUse",
+        input_text='{"session_id":"sid-1","tool":"Write"}',
+    )
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert json.loads(first.stdout)["queued"] is True
+    assert json.loads(second.stdout)["queued"] is True
+    assert json.loads(_run_queue(tmp_path, "status").stdout) == {"pending": 2}
 
 
 def test_drain_replays_in_insert_order_and_marks_done(tmp_path: Path) -> None:
@@ -224,8 +251,13 @@ def test_hook_sources_queue_only_http_000_not_prepost_abort() -> None:
     assert "http=?" in hook or "pre-POST" in hook
     assert "token_wrapper_enqueue_hook_post" in wrapper
     assert '"$http_code" == "000"' in wrapper
+    assert '"$rc" -eq 7' in wrapper
+    assert "return 0" in wrapper
     assert "generic-token-api-durable-retry-outbox" in codex
     assert '"$http_code" == "000"' in codex
+    assert "codex-hook-bridge token-api POST failed" in codex
     assert "generic-token-api-durable-retry-outbox" in stop_validator
     assert 'HTTP_CODE" == "000"' in stop_validator
+    assert "Pass through block decision if present; exit 0 otherwise" in stop_validator
     assert "token_wrapper_enqueue_hook_post" in persona_seat
+    assert "audit-ping-failed" in persona_seat

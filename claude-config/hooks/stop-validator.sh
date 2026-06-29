@@ -34,8 +34,42 @@ for _nas_lib in \
   fi
 done
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
-OUTBOX_BIN="${SCRIPT_DIR}/../../cli-tools/bin/generic-token-api-durable-retry-outbox"
-[[ -x "$OUTBOX_BIN" ]] || OUTBOX_BIN="${HOME}/runtimes/Token-OS/live/cli-tools/bin/generic-token-api-durable-retry-outbox"
+
+_mount_live() {
+  local root="$1"
+  [[ -n "$root" && -d "$root" ]] || return 1
+  ls "$root" >/dev/null 2>&1
+}
+
+_resolve_token_os_bin() {
+  local tool="$1" found root cand
+  found=$(command -v "$tool" 2>/dev/null) || true
+  if [[ -n "$found" && -x "$found" ]]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  for root in "${IMPERIUM:-}" "${CIVIC:-}"; do
+    [[ -n "$root" ]] || continue
+    cand="${root%/}/runtimes/token-os/live/cli-tools/bin/${tool}"
+    if _mount_live "$root" && [[ -x "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  for cand in \
+    "${SCRIPT_DIR}/../../cli-tools/bin/${tool}" \
+    "${HOME}/runtimes/Token-OS/live/cli-tools/bin/${tool}" \
+    "${HOME}/runtimes/token-os/live/cli-tools/bin/${tool}"; do
+    if [[ -x "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+OUTBOX_BIN=$(_resolve_token_os_bin generic-token-api-durable-retry-outbox) || true
+: "${OUTBOX_BIN:=false}"
 
 # Walk process tree to inject the claude PID (portable: uses ps)
 CLAUDE_PID=""
@@ -82,6 +116,7 @@ fi
 
 # Forward to token-api synchronously
 RESP_FILE="${HOME}/.claude/logs/.stopvalidate-resp.$$"
+mkdir -p "$(dirname "$RESP_FILE")" 2>/dev/null || true
 HTTP_CODE=$(echo "$INPUT" | curl -s -o "$RESP_FILE" -w '%{http_code}' --connect-timeout 2 --max-time 5 \
   -X POST "${API_URL}/api/hooks/StopValidate" \
   -H "Content-Type: application/json" \
@@ -89,7 +124,7 @@ HTTP_CODE=$(echo "$INPUT" | curl -s -o "$RESP_FILE" -w '%{http_code}' --connect-
 RESPONSE=$(cat "$RESP_FILE" 2>/dev/null || echo "")
 rm -f "$RESP_FILE" 2>/dev/null || true
 
-if [[ "$HTTP_CODE" == "000" && -x "$OUTBOX_BIN" ]]; then
+if [[ "$HTTP_CODE" == "000" && "$OUTBOX_BIN" != "false" ]]; then
   printf '%s' "$INPUT" | "$OUTBOX_BIN" enqueue \
     --action-type "StopValidate" \
     --url "${API_URL}/api/hooks/StopValidate" \

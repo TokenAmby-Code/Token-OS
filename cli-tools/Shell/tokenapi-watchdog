@@ -5,7 +5,7 @@
 # after a stale/down state, drains the durable hook->Token-API retry outbox once.
 # No blind queue poll: drain is recovery-edge triggered only.
 
-set -u
+set -euo pipefail
 
 HEARTBEAT_FILE="${TOKEN_API_HEARTBEAT_FILE:-$HOME/.claude/token-api-heartbeat.json}"
 COOLDOWN_FILE="${TOKEN_API_WATCHDOG_COOLDOWN_FILE:-$HOME/.claude/tokenapi-watchdog.last-restart}"
@@ -60,9 +60,11 @@ drain_hook_queue() {
     return 0
   }
   local out rc
+  set +e
   out=$("$QUEUE_BIN" drain --limit "${GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX_DRAIN_LIMIT:-100}" 2>&1); rc=$?
+  set -e
   log "recovery drain rc=$rc result=${out}"
-  return 0
+  return "$rc"
 }
 
 age_s=$(heartbeat_age)
@@ -73,7 +75,15 @@ if (( age_s < STALE_THRESHOLD )); then
   previous_state=$(read_state)
   if [[ "$previous_state" == "down" ]]; then
     log "heartbeat recovered age=${age_s}s — draining retry outbox"
+    set +e
     drain_hook_queue
+    drain_rc=$?
+    set -e
+    if (( drain_rc != 0 )); then
+      log "recovery drain failed rc=${drain_rc}"
+    fi
+    mark_state "up"
+    exit "$drain_rc"
   fi
   mark_state "up"
   exit 0

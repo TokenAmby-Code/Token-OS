@@ -17,6 +17,7 @@ set -euo pipefail
 # SessionStart hook exit does not block session startup, so this is still safe.
 SESSIONSTART_CRITICAL=0   # 1 once this invocation is known to be SessionStart
 REGISTRATION_OK=0         # 1 only after a confirmed-successful registration reply
+REGISTRATION_QUEUED=0     # 1 when SessionStart was durably queued for replay
 FAILURE_LOGGED=0          # de-dupe: the inline failure logger already fired
 HTTP_CODE=""              # last SessionStart POST status (for the failure record)
 RESPONSE=""               # last SessionStart POST body (for the failure record)
@@ -45,7 +46,11 @@ _hook_exit() {
   # mask it with exit 0. Surface it (visible record + non-zero) so a stranded
   # pane is never silent again. SessionStart's exit code cannot block startup.
   if [[ "$SESSIONSTART_CRITICAL" == "1" && "$REGISTRATION_OK" != "1" ]]; then
-    [[ "$FAILURE_LOGGED" == "1" ]] || _log_sessionstart_failure "hook exited without confirmed registration (rc=${rc})"
+    if [[ "$REGISTRATION_QUEUED" == "1" ]]; then
+      [[ "$FAILURE_LOGGED" == "1" ]] || _log_sessionstart_failure "registration queued for replay but not yet confirmed (rc=${rc})"
+    else
+      [[ "$FAILURE_LOGGED" == "1" ]] || _log_sessionstart_failure "hook exited without confirmed registration (rc=${rc})"
+    fi
     exit 1
   fi
   # Every other hook stays best-effort: never block Claude Code.
@@ -431,9 +436,10 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
     REGISTRATION_OK=1
   elif [[ "$HTTP_CODE" == "000" ]] && _enqueue_hook_token_api_post "$ACTION_TYPE" "$HOOK_INPUT" "${API_URL}/api/hooks/${ACTION_TYPE}" "http-000"; then
     # Durable recovery path accepted: the hook's own SessionStart intent will be
-    # replayed by the recovery-triggered drainer. Treat as non-silent (not a
-    # confirmed row yet, but not lost) and leave a visible queue log entry.
-    REGISTRATION_OK=1
+    # replayed by the recovery-triggered drainer. This is intentionally NOT a
+    # confirmed registration; keep the #436 loud nonzero path while making the
+    # survivable queue state visible and durable.
+    REGISTRATION_QUEUED=1
     echo "token-api SessionStart registration queued for replay: token-api unreachable (http=000)" >&2
   else
     _log_sessionstart_failure "token-api POST ${API_URL}/api/hooks/SessionStart did not confirm a bound row"
