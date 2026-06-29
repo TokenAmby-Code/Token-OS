@@ -87,19 +87,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash ~/.claude/hooks/command-boundary-guard.sh"
+          },
+          {
+            "type": "command",
             "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=PreToolUse bash ~/.claude/hooks/generic-hook.sh"
           },
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/uv-python-policy.sh"
-          },
-          {
-            "type": "command",
-            "command": "bash ~/.claude/hooks/runtime-unlock-guard.sh"
-          },
-          {
-            "type": "command",
-            "command": "bash ~/.claude/hooks/pr-gh-guard.sh"
           }
         ]
       },

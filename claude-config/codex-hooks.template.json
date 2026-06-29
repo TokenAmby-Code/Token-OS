@@ -1,0 +1,92 @@
+{
+  "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_AGENT=codex bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/post-compact-recenter.sh",
+            "timeout": 5,
+            "statusMessage": "Recentering after compaction"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/codex-hook-bridge.sh SessionStart",
+            "timeout": 5,
+            "statusMessage": "Registering Codex session"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/codex-hook-bridge.sh UserPromptSubmit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/codex-hook-bridge.sh Stop",
+            "timeout": 5,
+            "statusMessage": "Syncing Codex stop state"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_AGENT=codex bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/post-tool-format.sh",
+            "timeout": 15,
+            "statusMessage": "Formatting touched Python files"
+          },
+          {
+            "type": "command",
+            "command": "bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/codex-hook-bridge.sh PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/codex-hook-bridge.sh SessionEnd",
+            "timeout": 5,
+            "statusMessage": "Staging Codex resume"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOOK_AGENT=codex COMMAND_BOUNDARY_RULES_CONFIG=${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/claude-config/hooks/command-boundary-rules.json bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/claude-config/hooks/command-boundary-guard.sh",
+            "timeout": 5,
+            "statusMessage": "Command boundary guard"
+          }
+        ]
+      }
+    ]
+  }
+}

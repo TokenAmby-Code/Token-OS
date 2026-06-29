@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "direct-gh-pr",
+      "description": "Boundary: PR lifecycle work must go through the pr skill / pr-step workflow, not raw GitHub CLI PR subcommands.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr ...` is not an agent workflow.",
+        "redirect": "Invoke the `pr` skill and use `pr-step`; it owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "runtime-unlock",
+      "description": "Boundary: the deploy-owned Token-OS live runtime must not be unlocked for direct agent edits.",
+      "enabled": true,
+      "fast_path_terms": [
+        "chmod",
+        "chflags",
+        "runtime-write-protect.sh"
+      ],
+      "matcher": {
+        "type": "runtime_unlock",
+        "runtime_path_regex": "(?i)(runtimes/token-os/live)|(\\$\\{?TOKEN_OS\\}?)",
+        "escape_env": "IMPERIUM_ALLOW_RUNTIME_WRITE",
+        "escape_values": [
+          "1",
+          "true"
+        ],
+        "commands": {
+          "chmod": true,
+          "chflags": true,
+          "runtime_write_protect_helper": true
+        },
+        "helper_names": [
+          "runtime-write-protect.sh"
+        ],
+        "helper_unlock_action": "unlock",
+        "helper_default_targets_runtime": true,
+        "helper_allow_flags": []
+      },
+      "deny": {
+        "reason": "The Token-OS live runtime (~/runtimes/Token-OS/live) is intentionally write-locked. This is an ARCHITECTURE CONSTRAINT set by the user, not a bug to work around: workers must not unlock deploy-owned runtime paths for direct edits.",
+        "redirect": "Make the change in a worktree and ship it through PR/CD instead: `worktree-setup <branch> --project Token-OS`, edit there, then push and run `pr-step` / the `pr` skill. Do not retry the unlock or look for another path to the same write; escalate if in-place runtime maintenance is genuinely required."
+      }
+    },
+    {
+      "id": "broad-nas-search",
+      "description": "Boundary: root-wide NAS searches must use the lag-aware nas-grep wrapper or narrower repo-local search.",
+      "enabled": true,
+      "fast_path_terms": [
+        "find",
+        "bfs",
+        "rg",
+        "ugrep",
+        "grep",
+        "/Volumes",
+        "/mnt/imperium",
+        "$IMPERIUM"
+      ],
+      "matcher": {
+        "type": "broad_nas_search",
+        "commands": [
+          "find",
+          "bfs",
+          "rg",
+          "ugrep",
+          "grep"
+        ]
+      },
+      "deny": {
+        "reason": "Root-wide NAS search is a user-defined performance boundary. Raw recursive search across /Volumes, /Volumes/Imperium, /Volumes/Civic, /mnt/imperium, or $IMPERIUM can wedge the NAS/Mac and should not be run directly.",
+        "redirect": "Use `nas-grep <pattern> <NAS-path>` for NAS-root scans, or narrow the root to `$IMPERIUM/Imperium-ENV/<subdir>`. For Git repositories, prefer `git grep <pattern> -- <paths>` or repo-local `rg` from the checkout. Non-filesystem stdin filtering remains fine."
+      }
+    },
+    {
+      "id": "raw-tmux-mutation",
+      "description": "Boundary: raw tmux mutating commands bypass Token-OS pane identity, typing guards, dispatch, and tmuxctl invariants.",
+      "enabled": true,
+      "fast_path_terms": [
+        "tmux"
+      ],
+      "matcher": {
+        "type": "command_subcommand",
+        "commands": [
+          "tmux"
+        ],
+        "subcommands": [
+          "send-keys",
+          "split-window",
+          "new-window",
+          "new-session",
+          "kill-pane",
+          "kill-window",
+          "respawn-pane"
+        ]
+      },
+      "deny": {
+        "reason": "Raw mutating `tmux` commands cross the Token-OS pane-control boundary. They bypass tmuxctl, typing guards, dispatch identity, and the agent prompt-delivery wrappers.",
+        "redirect": "Use the sanctioned wrapper for the intent: `agent-cmd`/`talk`/`brief` for live agent text, `dispatch --target mechanicus:new` for new workers, `tmuxctl stack ...` for managed-stack changes, or `tmux-mark-for-close` / `instance-stop` for teardown. Read-only tmux inspection such as capture/list/display remains allowed."
+      }
+    }
+  ]
+}

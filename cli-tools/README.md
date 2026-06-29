@@ -44,6 +44,16 @@ See `test --help` for full documentation.
 
 
 
+### NAS-safe search (`nas-grep`)
+
+`nas-grep` is the agent-safe search wrapper for NAS/vault paths such as `/Volumes/Imperium` and `/mnt/imperium`. It prefers `rg` when available, otherwise uses a Python fallback, and always applies conservative excludes, bounded result/file limits, low-priority execution, and a shared NAS lease for known NAS mounts. Use it instead of raw broad `grep`, `rg`, or `ugrep` against the NAS.
+
+```bash
+nas-grep "session_id" /Volumes/Imperium/Terra
+nas-grep -F "literal text" /mnt/imperium/Vault --max-results 50
+nas-grep --dry-run "pattern" /Volumes/Imperium
+```
+
 ### Shared agent skills (`skills-sync`)
 
 `skills-sync --check` verifies that the NAS-backed canonical skills in `claude-config/skills` are visible to Claude and Codex and resolve to the same real paths. `skills-sync --install` repairs symlinks only: it keeps `~/.codex/skills/.system` intact and exposes shared skills under both `~/.agents/skills` and `~/.codex/skills`.

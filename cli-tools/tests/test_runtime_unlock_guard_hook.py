@@ -19,7 +19,7 @@ import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-HOOK = REPO_ROOT / "claude-config" / "hooks" / "runtime-unlock-guard.sh"
+HOOK = REPO_ROOT / "claude-config" / "hooks" / "command-boundary-guard.sh"
 
 
 def run_hook(command: str, env: dict | None = None):
@@ -98,6 +98,32 @@ def test_full_bypass_chain_is_denied():
     assert_denied(run_hook(chain))
 
 
+def test_runtime_write_protect_helper_unlock_runtime_is_denied():
+    reason = assert_denied(
+        run_hook(
+            "cli-tools/scripts/runtime-write-protect.sh unlock "
+            "/Users/tokenclaw/runtimes/Token-OS/live"
+        )
+    )
+    assert "worktree" in reason
+    assert "PR/CD" in reason
+
+
+def test_runtime_write_protect_helper_lock_runtime_is_allowed():
+    assert_allowed(
+        run_hook(
+            "cli-tools/scripts/runtime-write-protect.sh lock "
+            "/Users/tokenclaw/runtimes/Token-OS/live"
+        )
+    )
+
+
+def test_runtime_write_protect_helper_unlock_worktree_is_allowed():
+    assert_allowed(
+        run_hook("cli-tools/scripts/runtime-write-protect.sh unlock ~/worktrees/Token-OS/wt-foo")
+    )
+
+
 # --------------------------------------------------------------------------- #
 # ALLOW: re-locking, non-runtime targets, and unrelated commands.
 # --------------------------------------------------------------------------- #
@@ -127,6 +153,12 @@ def test_chmod_non_runtime_is_unaffected():
 
 def test_chflags_non_runtime_is_unaffected():
     assert_allowed(run_hook("chflags nouchg ~/Downloads/x"))
+
+
+def test_echo_describing_runtime_unlock_is_allowed():
+    assert_allowed(
+        run_hook("echo 'do not run chflags nouchg ~/runtimes/Token-OS/live or chmod +w there'")
+    )
 
 
 def test_command_without_chmod_or_chflags_is_silent():
