@@ -139,6 +139,7 @@ from phone_service import (
     send_pavlok_stimulus,
 )
 from questions_gate import trials_clear
+from routes.ask import router as ask_router
 from routes.day_start import fire_day_start_internal, fire_day_start_schedule_fallback
 from routes.day_start import router as day_start_router
 from routes.hooks import (
@@ -1991,6 +1992,7 @@ app.include_router(tts_router)
 app.include_router(voice_router)
 app.include_router(hooks_router)
 app.include_router(day_start_router)
+app.include_router(ask_router)
 
 
 NAMING_NUDGE_MAX_PER_INSTANCE = 3
