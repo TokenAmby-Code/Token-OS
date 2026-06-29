@@ -320,7 +320,13 @@ LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, e
 
 
 def _tmuxctld_default_loopback() -> bool:
-    return DB_PATH.resolve() == (Path.home() / ".claude" / "agents.db").resolve()
+    """Token-API may use the local tmuxctld send boundary by default.
+
+    The daemon is a loopback-only local control plane, not a property of where
+    agents.db is stored. Keep ``TMUXCTLD_URL`` as the override/disable switch in
+    ``shared._tmuxctld_url``; do not couple the default to DB migration state.
+    """
+    return True
 
 
 def _tmuxctld_gate_result(
@@ -359,7 +365,10 @@ def _tmuxctld_failed_result(
     instance_id: str | None = None,
 ) -> dict:
     if daemon_payload is None:
-        stderr = "tmuxctld unavailable"
+        stderr = (
+            f"{' '.join(failed_operation)} unavailable: no daemon envelope returned "
+            "(no loopback URL configured or HTTP transport failed)"
+        )
     else:
         err = daemon_payload.get("error") if isinstance(daemon_payload.get("error"), dict) else {}
         stderr = err.get("message") or json.dumps(daemon_payload)
@@ -372,6 +381,108 @@ def _tmuxctld_failed_result(
         "gated": False,
         "pane": tmux_pane,
         "instance_id": instance_id,
+    }
+
+
+def _text_from_completed(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="ignore")
+    return str(value or "")
+
+
+def _prompt_payload_hash(prompt: str) -> str:
+    return hashlib.sha256(re.sub(r"[\r\n]+", " ", prompt).rstrip().encode("utf-8")).hexdigest()
+
+
+async def _tmuxctl_send_text_fallback(
+    tmux_pane: str,
+    prompt: str,
+    *,
+    clear_prompt: bool,
+    submit: bool,
+) -> dict:
+    """Cold ``tmuxctl send-text`` fallback for Token-API's daemon send facade."""
+    operation = "tmuxctl.send_text_fallback"
+    if clear_prompt and not submit:
+        return {
+            "returncode": 2,
+            "stdout": "",
+            "stderr": "tmuxctl send-text fallback invalid args: --no-submit cannot clear prompt",
+            "operation": operation,
+            "failed_operation": ["tmuxctl", "send-text"],
+            "gated": False,
+            "pane": tmux_pane,
+            "instance_id": None,
+        }
+
+    cli_lib = SCRIPTS_DIR / "cli-tools" / "lib"
+    args: list[str] = [
+        sys.executable,
+        "-m",
+        "tmuxctl.cli",
+        "send-text",
+        "--pane",
+        tmux_pane,
+        "--stdin",
+    ]
+    if clear_prompt:
+        args.append("--clear-prompt")
+    if not submit:
+        args.append("--no-submit")
+    try:
+        proc = await shared._run_subprocess_offloop(
+            tuple(args),
+            input=prompt,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            },
+            timeout=15,
+        )
+    except Exception as exc:
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": f"tmuxctl send-text fallback failed: {type(exc).__name__}: {exc}",
+            "operation": operation,
+            "failed_operation": ["tmuxctl", "send-text"],
+            "gated": False,
+            "pane": tmux_pane,
+            "instance_id": None,
+        }
+
+    stdout = _text_from_completed(proc.stdout)
+    stderr = _text_from_completed(proc.stderr)
+    if proc.returncode != 0:
+        return {
+            "returncode": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr.strip() or f"tmuxctl send-text failed with rc={proc.returncode}",
+            "operation": operation,
+            "failed_operation": ["tmuxctl", "send-text"],
+            "gated": False,
+            "pane": tmux_pane,
+            "instance_id": None,
+        }
+    return {
+        "returncode": 0,
+        "stdout": stdout,
+        "stderr": stderr,
+        "operation": operation,
+        "dispatch_id": str(uuid.uuid4()),
+        "payload_hash": _prompt_payload_hash(prompt),
+        "gated": False,
+        "verification_status": "unverified",
+        "verified_by": None,
+        "guard_held": False,
+        "swallowed_submit_detected": False,
+        "recovery_attempts": 0,
+        "failures": [],
+        "pane": tmux_pane,
+        "instance_id": None,
     }
 
 
@@ -399,11 +510,11 @@ async def send_prompt_to_pane(
         default_loopback=_tmuxctld_default_loopback(),
     )
     if daemon_payload is None:
-        return _tmuxctld_failed_result(
-            operation="tmuxctld.send_text",
-            failed_operation=["tmuxctld", "send-text"],
-            daemon_payload=None,
-            tmux_pane=tmux_pane,
+        return await _tmuxctl_send_text_fallback(
+            tmux_pane,
+            prompt,
+            clear_prompt=clear_prompt,
+            submit=submit,
         )
     if not daemon_payload.get("ok"):
         gated = _tmuxctld_gate_result(
@@ -425,8 +536,7 @@ async def send_prompt_to_pane(
         "stderr": "",
         "operation": "tmuxctld.send_text",
         "dispatch_id": result.get("dispatch_id") or str(uuid.uuid4()),
-        "payload_hash": result.get("payload_hash")
-        or hashlib.sha256(re.sub(r"[\r\n]+", " ", prompt).rstrip().encode("utf-8")).hexdigest(),
+        "payload_hash": result.get("payload_hash") or _prompt_payload_hash(prompt),
         "gated": False,
         "verification_status": result.get("verification_status") or "unverified",
         "verified_by": result.get("verified_by"),
