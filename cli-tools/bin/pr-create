@@ -232,7 +232,7 @@ do_merge() {
     if [[ "$git_common_dir" != "$git_dir" ]]; then
         is_worktree=true
         # Main worktree is the parent of .git common dir
-        main_worktree=$(git worktree list --porcelain | head -1 | sed 's/^worktree //')
+        main_worktree=$(git worktree list --porcelain | awk 'found == 0 && /^worktree / { sub(/^worktree /, ""); print; found = 1 }')
         log "Detected worktree. Main worktree: $main_worktree"
     else
         main_worktree=$(git rev-parse --show-toplevel)
