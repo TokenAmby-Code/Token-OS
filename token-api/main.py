@@ -993,10 +993,9 @@ sys.excepthook = _global_exception_handler
 # worker.
 
 
-# Scheduler instance. Jobs stay in memory; restart recovery is driven from the
-# application DB by recover_expected_ack_jobs() and
-# recover_recent_stopped_golden_throne_timers(). Avoid APScheduler's synchronous
-# SQLite job store on the asyncio thread.
+# Scheduler instance. Jobs stay in memory; restart recovery is limited to
+# explicitly recoverable non-GT jobs. Golden Throne timers are event-driven only.
+# Avoid APScheduler's synchronous SQLite job store on the asyncio thread.
 scheduler = AsyncIOScheduler()
 shared.scheduler = scheduler
 APP_LOOP: asyncio.AbstractEventLoop | None = None
@@ -2345,20 +2344,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:
         logger.warning(f"Morning session startup recovery failed: {exc}")
     await recover_expected_ack_jobs()
-    recovered_gt = await recover_recent_stopped_golden_throne_timers()
-    if recovered_gt:
-        print(f"Golden Throne recovered {len(recovered_gt)} stopped timer(s)")
-    # Safety net: re-run GT recovery on an interval so a timer the in-memory
-    # scheduler loses *after* startup (restart mid-wait, transient stale-pane
-    # skip) self-heals instead of stranding the session until the next restart.
-    scheduler.add_job(
-        _golden_throne_sweep_sync,
-        IntervalTrigger(seconds=GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS),
-        id="golden_throne_timer_sweep",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
     # Re-arm the morning supervisor poller if we restarted inside today's
     # supervision window (the relative poller lives in the in-memory jobstore
     # and is otherwise lost across a restart; the 04:00 cron only re-arms daily).
@@ -4060,17 +4045,6 @@ ZEALOTRY_DELAY_MAP = {4: 1800, 5: 1200, 6: 900, 7: 600, 8: 420, 9: 300, 10: 60}
 GT_ENFORCEMENT_RESUME_THRESHOLD = 2
 GT_RESUME_WINDOW = timedelta(hours=24)
 GOLDEN_THRONE_QUIET_HOURS_BUFFER = timedelta(minutes=5)
-# Safety-net cadence for re-arming GT timers the in-memory scheduler lost. The
-# scheduler has no persistent jobstore (by design — see the morning-supervisor
-# recovery note), so a token-api restart mid-wait drops every pending GT
-# date-job, and the one-shot startup recovery runs only once. Without a periodic
-# re-run, a dropped timer (or one skipped by a transient stale-pane check)
-# strands the session until the next restart or a human intervenes — the >12h
-# stall seen in the GT proof. This interval bounds that stranding. Env-tunable.
-GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS = int(
-    os.environ.get("TOKEN_API_GT_SWEEP_INTERVAL_SECONDS", "120")
-)
-
 EXPECTED_ACK_PENDING = "pending"
 EXPECTED_ACK_TERMINAL_STATUSES = {
     "acknowledged",
@@ -4231,31 +4205,43 @@ async def _tmux_pane_current_command(tmux_pane: str | None) -> str:
         return ""
 
 
-async def _golden_throne_recovery_blocked_by_stale_pane(instance: dict) -> str | None:
-    """Fail closed on startup recovery when the live pane is now just a shell.
+async def _golden_throne_mark_quiet_edge_handled(
+    instance_id: str,
+    *,
+    actor: str,
+    mutation_type: str = "instance_stopped",
+    extra_updates: dict | None = None,
+) -> str:
+    """Mark a failed/invalid GT wake edge consumed so recovery cannot loop it.
 
-    Normal stop-hook scheduling still owns fresh GT timers. Startup recovery is
-    only a repair path; if the instance's pane resolves live but no longer
-    contains the target agent, resuming risks driving the wrong pane. The pane is
-    resolved live from the tmuxctl oracle (there is no stored pane to go stale);
-    when no live pane resolves, there is simply nothing to mis-drive.
+    Golden Throne's durable truth lives in SQLite; APScheduler jobs are
+    best-effort runtime state. If a recovery/dead-pane wake has no valid
+    target, logging the failure is not enough: the periodic recovery sweep will
+    otherwise rediscover the same quiet edge and re-arm it forever. Stamp
+    ``gt_last_resume_at`` at the same time as ``stopped_at`` so the recovery
+    predicate treats this quiet edge as handled until real activity creates a
+    newer edge.
     """
-    if instance.get("status") != "stopped":
-        return None
-    if instance.get("device_id") != LOCAL_DEVICE_NAME:
-        return None
-    tmux_pane, _role = await shared.resolve_instance_pane(instance["id"])
-    if not tmux_pane:
-        return None
-    if not await _tmux_pane_exists(tmux_pane):
-        return None
-    engine = _agent_engine(instance)
-    current_cmd = await _tmux_pane_current_command(tmux_pane)
-    if _agent_is_alive_command(engine, current_cmd):
-        return None
-    if await _tmux_pane_has_agent_process(tmux_pane, engine):
-        return None
-    return "stale_reused_or_empty_pane"
+    now = datetime.now().isoformat()
+    updates = {
+        "status": "stopped",
+        "input_lock": None,
+        "stopped_at": now,
+        "gt_last_resume_at": now,
+    }
+    if extra_updates:
+        updates.update(extra_updates)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type=mutation_type,
+            write_source="golden_throne",
+            actor=actor,
+        )
+        await db.commit()
+    return now
 
 
 def _quiet_hour_datetime(local_now: datetime, hour_float: float) -> datetime:
@@ -4450,21 +4436,43 @@ async def _load_instance_session_doc(instance: dict) -> dict:
 async def _read_instance_session_doc_rubric(
     instance: dict,
 ) -> tuple[RubricStatus | None, dict]:
-    """Read the rubric from the linked session doc, if any.
+    """Read and validate the linked session doc's dict victory rubric.
 
-    Returns (RubricStatus|None, doc_meta_dict). Status is None when no doc is
-    linked, the file is missing, or the read fails. Callers should treat
-    None as "no rubric" and fall back to legacy GT behavior.
+    Golden Throne is strict: a real GT binding is valid only when it points to
+    an active session doc whose selected rubric field is a dict. Missing docs,
+    missing files, missing rubrics, scalar rubrics, and read errors return
+    ``(None, meta_with_invalid_reason)`` so callers can clear the binding.
     """
     meta = await _load_instance_session_doc(instance)
+    if not meta.get("doc_id"):
+        meta["invalid_reason"] = "no_session_doc"
+        return None, meta
+    if meta.get("doc_status") != "active":
+        meta["invalid_reason"] = "session_doc_not_active"
+        return None, meta
     fp = meta.get("file_path")
     if not fp or not fp.exists():
+        meta["invalid_reason"] = "session_doc_file_missing"
         return None, meta
     try:
         fm, _body = await asyncio.to_thread(read_frontmatter, fp)
+        rk = fm.get("rubric_key") or DEFAULT_RUBRIC_KEY
+        rubric_value = fm.get(rk)
+        if rubric_value is None:
+            meta["frontmatter"] = fm
+            meta["rubric_key"] = rk
+            meta["invalid_reason"] = "missing_rubric"
+            return None, meta
+        if not isinstance(rubric_value, dict):
+            meta["frontmatter"] = fm
+            meta["rubric_key"] = rk
+            meta["invalid_reason"] = "invalid_rubric"
+            return None, meta
         status = evaluate_rubric(fm)
     except Exception as exc:
         logger.warning(f"GT: rubric read failed for {fp}: {exc}")
+        meta["invalid_reason"] = "session_doc_read_failed"
+        meta["read_error"] = str(exc)
         return None, meta
     # Stash the full frontmatter so the fire path's poke renderer can reach the
     # sibling coderabbit_comments / coderabbit_review_state fields. Both callers
@@ -4473,18 +4481,93 @@ async def _read_instance_session_doc_rubric(
     return status, meta
 
 
-def _golden_throne_rubric_state(status: RubricStatus | None) -> str:
-    """Classify a RubricStatus into one of four GT dispatch states.
+def _remove_golden_throne_job(instance_id: str) -> None:
+    try:
+        scheduler.remove_job(f"golden-throne-{instance_id}")
+    except Exception:
+        pass
 
-    Returns one of:
-      - 'legacy'         → no rubric / scalar-string rubric → fire static SOP
-      - 'incomplete'     → rubric present, conditions unmet → adaptive accountability fire
-      - 'ready_for_ack'  → rubric complete, Emperor not yet notified → notify-only
-      - 'victorious_bug' → rubric complete, Emperor notified, GT still firing → bug-event
-      - 'acknowledged'   → Emperor already acked; should never fire (skip)
+
+async def clear_invalid_golden_throne_binding(
+    instance_id: str,
+    *,
+    reason: str,
+    source: str,
+    instance: dict | None = None,
+    details: dict | None = None,
+) -> dict:
+    """Sanctioned cleanup for invalid GT bindings.
+
+    Clears the instance marker and GT counters, removes the in-memory timer and
+    pane countdown projection, and deletes now-unreferenced ``golden_throne``
+    rows. This is the only fail-closed path for no-doc/no-rubric/scalar-rubric
+    GT state; it never dispatches or notifies.
+    """
+    previous_marker = (instance or {}).get("golden_throne")
+    _remove_golden_throne_job(instance_id)
+    await _gt_clear_fire(instance_id)
+    now = datetime.now().isoformat()
+    deleted_rows = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if previous_marker is None:
+            cursor = await db.execute(
+                "SELECT golden_throne FROM instances WHERE id = ?",
+                (instance_id,),
+            )
+            row = await cursor.fetchone()
+            previous_marker = row["golden_throne"] if row else None
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates={
+                "golden_throne": None,
+                "gt_resume_count": 0,
+                "gt_resume_window_started_at": None,
+                "gt_last_resume_at": None,
+                "gt_no_op_counter": 0,
+                "gt_no_op_summaries_json": None,
+                "gt_last_dispatch_fingerprint": None,
+            },
+            mutation_type="instance_updated",
+            write_source="golden_throne",
+            actor="golden-throne-invalid-binding",
+        )
+        cursor = await db.execute(
+            """
+            DELETE FROM golden_throne
+             WHERE NOT EXISTS (
+               SELECT 1 FROM instances
+                WHERE instances.golden_throne = CAST(golden_throne.id AS TEXT)
+             )
+            """
+        )
+        deleted_rows = cursor.rowcount or 0
+        await db.commit()
+    event_details = {
+        "reason": reason,
+        "source": source,
+        "previous_marker": previous_marker,
+        "deleted_unreferenced_golden_throne_rows": deleted_rows,
+        "cleared_at": now,
+        **(details or {}),
+    }
+    await log_event(
+        "golden_throne_invalid_binding_cleared",
+        instance_id=instance_id,
+        details=event_details,
+    )
+    return event_details
+
+
+def _golden_throne_rubric_state(status: RubricStatus | None) -> str:
+    """Classify a RubricStatus into a strict GT dispatch state.
+
+    Golden Throne has no legacy/no-doc/scalar fallback. Missing, scalar, or
+    otherwise non-dict rubrics are invalid and must fail closed before dispatch.
     """
     if status is None or not status.present or status.legacy_string:
-        return "legacy"
+        return "invalid"
     if status.acknowledged_at:
         return "acknowledged"
     if not status.complete:
@@ -5063,6 +5146,8 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
     if instance_type is None:
         instance_type = "sync" if marker == "sync" else ("golden_throne" if marker else "one_off")
     zealotry = int(instance.get("zealotry") or 4)
+    if not marker or marker == "sync":
+        return {"scheduled": False, "reason": "no_golden_throne_binding"}
     if instance_type != "golden_throne":
         return {"scheduled": False, "reason": "not_golden_throne"}
     # A retired seat is dead identity — never ARM a GT timer for it, no matter what
@@ -5070,20 +5155,30 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
     # here covers every caller (stop-hook activity endpoint, recovery sweep, the
     # stop hook) so a retired seat's defunct pane can never get a queued resume.
     if (instance.get("rank") or "") == "retired":
-        try:
-            scheduler.remove_job(f"golden-throne-{instance_id}")
-        except Exception:
-            pass
+        _remove_golden_throne_job(instance_id)
         await _gt_clear_fire(instance_id)
         return {"scheduled": False, "reason": "retired"}
 
     status, doc_meta = await _read_instance_session_doc_rubric(instance)
     rubric_state = _golden_throne_rubric_state(status)
+    invalid_reason = doc_meta.get("invalid_reason")
+    if invalid_reason or rubric_state == "invalid":
+        cleanup = await clear_invalid_golden_throne_binding(
+            instance_id,
+            reason=invalid_reason or "invalid_rubric",
+            source=f"schedule:{reason}",
+            instance=instance,
+            details={"schedule_reason": reason, "doc_id": doc_meta.get("doc_id")},
+        )
+        return {
+            "scheduled": False,
+            "reason": invalid_reason or "invalid_rubric",
+            "doc_id": doc_meta.get("doc_id"),
+            "cleanup": cleanup,
+        }
+
     if rubric_state == "acknowledged" or doc_meta.get("doc_status") == "archived":
-        try:
-            scheduler.remove_job(f"golden-throne-{instance_id}")
-        except Exception:
-            pass
+        _remove_golden_throne_job(instance_id)
         await _gt_clear_fire(instance_id)
         return {
             "scheduled": False,
@@ -5092,10 +5187,7 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
         }
 
     if zealotry < 4:
-        try:
-            scheduler.remove_job(f"golden-throne-{instance_id}")
-        except Exception:
-            pass
+        _remove_golden_throne_job(instance_id)
         await _gt_clear_fire(instance_id)
         return {"scheduled": False, "reason": "zealotry_below_threshold", "zealotry": zealotry}
 
@@ -5145,110 +5237,18 @@ async def recover_recent_stopped_golden_throne_timers(
     *,
     lookback_minutes: int = 24 * 60,
 ) -> list[dict]:
-    """Arm GT timers for quiet sessions that missed or lost scheduling.
+    """Retired compatibility shim.
 
-    Golden Throne state is persisted in SQLite, but APScheduler date jobs are a
-    runtime concern. A restart, a manual promotion to golden_throne, or a missed
-    stop-hook can leave an idle GT instance with no in-memory follow-up job. Use
-    a day-scale recovery window so active panes restored from tmux are enforced
-    after restart instead of silently sitting idle.
+    Golden Throne no longer resurrects timers from historical instance state.
+    Scheduling is event-driven from stop/activity hooks only. Keep this function
+    as a harmless no-op for old callers/tests during rollout.
     """
-    recovered: list[dict] = []
-    now = datetime.now()
-    lookback = timedelta(minutes=lookback_minutes)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """
-            SELECT ci.*,
-                   CASE WHEN ci.golden_throne = 'sync' THEN 'sync'
-                        WHEN ci.golden_throne IS NOT NULL THEN 'golden_throne'
-                        ELSE 'one_off'
-                   END AS instance_type
-            FROM instances ci
-            LEFT JOIN session_documents sd ON ci.session_doc_id = sd.id
-            WHERE ci.status IN ('idle', 'stopped')
-              AND ci.rank != 'retired'
-              AND ci.golden_throne IS NOT NULL
-              AND ci.golden_throne != 'sync'
-              AND COALESCE(ci.zealotry, 4) >= 4
-              AND (sd.status IS NULL OR sd.status != 'archived')
-              AND COALESCE(ci.stopped_at, ci.last_activity) IS NOT NULL
-            ORDER BY COALESCE(ci.stopped_at, ci.last_activity) DESC
-            """,
-        )
-        rows = await cursor.fetchall()
-
-    for row in rows:
-        instance = dict(row)
-        instance_id = instance["id"]
-        quiet_at_raw = instance.get("stopped_at") or instance.get("last_activity")
-        try:
-            quiet_at = datetime.fromisoformat(quiet_at_raw)
-        except Exception:
-            continue
-        if now - quiet_at > lookback:
-            continue
-        if instance.get("status") == "stopped":
-            gt_last_resume_raw = instance.get("gt_last_resume_at")
-            try:
-                gt_last_resume_at = (
-                    datetime.fromisoformat(gt_last_resume_raw) if gt_last_resume_raw else None
-                )
-            except Exception:
-                gt_last_resume_at = None
-            if gt_last_resume_at and gt_last_resume_at >= quiet_at:
-                continue
-        stale_pane_reason = await _golden_throne_recovery_blocked_by_stale_pane(instance)
-        if stale_pane_reason:
-            live_pane, _live_role = await shared.resolve_instance_pane(instance_id)
-            await log_event(
-                "golden_throne_recovery_skipped_stale_pane",
-                instance_id=instance_id,
-                details={
-                    "reason": stale_pane_reason,
-                    "tmux_pane": live_pane,
-                    "status": instance.get("status"),
-                    "quiet_at": quiet_at.isoformat(),
-                },
-            )
-            continue
-        if scheduler.get_job(f"golden-throne-{instance_id}"):
-            continue
-        result = await schedule_golden_throne_followup(instance, reason="startup-recover-quiet")
-        if result.get("scheduled"):
-            recovered.append({"instance_id": instance_id, **result})
-
-    if recovered:
-        await log_event(
-            "golden_throne_recovered_stopped_timers",
-            details={"count": len(recovered), "instances": recovered},
-        )
-        logger.info(f"Golden Throne: recovered {len(recovered)} stopped GT timer(s)")
-    return recovered
+    return []
 
 
 def _golden_throne_sweep_sync() -> dict:
-    """Interval-job entry: periodically re-run GT timer recovery.
-
-    The one-shot startup recovery cannot heal a timer dropped *after* startup (a
-    restart mid-wait, or a session whose pane was transiently stale at startup).
-    Running the same idempotent recovery on an interval lets such timers
-    self-heal within GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS instead of stranding
-    the session. Bridges to the loop like _golden_throne_followup_sync.
-    """
-    try:
-        if APP_LOOP and APP_LOOP.is_running():
-            future = asyncio.run_coroutine_threadsafe(
-                recover_recent_stopped_golden_throne_timers(), APP_LOOP
-            )
-            recovered = future.result(timeout=120)
-        else:
-            recovered = asyncio.run(recover_recent_stopped_golden_throne_timers())
-        return {"success": True, "recovered": len(recovered)}
-    except Exception as exc:
-        logger.exception("Golden Throne: periodic timer sweep failed")
-        return {"success": False, "error": str(exc)}
+    """Retired compatibility shim. GT has no periodic timer sweep."""
+    return {"success": True, "recovered": 0, "disabled": True}
 
 
 def quiet_hours_status(now: datetime | None = None) -> dict:
@@ -8361,12 +8361,25 @@ async def golden_throne_followup(session_id: str):
         logger.info(f"Golden Throne: {session_id[:12]} retired, skipping")
         return
 
-    # Read the linked session doc rubric and classify the fire state. This is
-    # the one genuinely new line of data flow: the fire path now sees the
-    # rubric and can name the specific unmet condition instead of a flat SOP.
-    # None status / scalar-string rubric / no linked doc → 'legacy' (unchanged).
+    # Read the linked active session doc's dict rubric and classify the fire
+    # state. No linked doc, no victory dict, or scalar/legacy rubric is invalid:
+    # clear the GT binding and fail closed without dispatch/notify.
     rubric_status, doc_meta = await _read_instance_session_doc_rubric(instance)
     rubric_state = _golden_throne_rubric_state(rubric_status)
+    invalid_reason = doc_meta.get("invalid_reason")
+    if invalid_reason or rubric_state == "invalid":
+        cleanup = await clear_invalid_golden_throne_binding(
+            session_id,
+            reason=invalid_reason or "invalid_rubric",
+            source="followup",
+            instance=instance,
+            details={"doc_id": doc_meta.get("doc_id")},
+        )
+        logger.info(
+            f"Golden Throne: cleared invalid binding for {session_id[:12]} "
+            f"reason={cleanup.get('reason')}"
+        )
+        return
     if rubric_state == "acknowledged":
         # The Emperor already acked this doc (schedule-time gate normally
         # removes the job; this catches an ack that landed between schedule
@@ -8426,16 +8439,19 @@ async def golden_throne_followup(session_id: str):
     doc_path = doc_meta.get("file_path")
     engine = _agent_engine(instance)
     rubric_prompt_active = False
+    custom_sop_loaded = False
     if custom_sop_path:
         # Explicit per-instance override wins over the rubric-derived prompt.
         expanded = Path(custom_sop_path).expanduser()
         if expanded.exists():
             sop_prompt = expanded.read_text()
+            custom_sop_loaded = True
             logger.info(f"Golden Throne: using custom SOP {custom_sop_path} for {session_id[:12]}")
         else:
-            logger.warning(f"Golden Throne: custom SOP {custom_sop_path} not found, using default")
-            sop_prompt = _load_golden_throne_sop()
-    elif rubric_state == "incomplete":
+            logger.warning(
+                f"Golden Throne: custom SOP {custom_sop_path} not found; using rubric prompt"
+            )
+    if not custom_sop_loaded and rubric_state == "incomplete":
         fm = doc_meta.get("frontmatter")
         if _golden_throne_is_coderabbit_hold(rubric_status, fm):
             # A pending CodeRabbit review is not agent work. Preserve the benign
@@ -8453,8 +8469,10 @@ async def golden_throne_followup(session_id: str):
                 f"Golden Throne: using rubric skill invocation for {session_id[:12]} "
                 f"(missing: {rubric_status.missing})"
             )
-    else:
-        sop_prompt = _load_golden_throne_sop()
+    elif not custom_sop_loaded:
+        # Strict GT has no legacy/static SOP fallback. Complete rubric states
+        # are notify/enforce-only and return below before any dispatch.
+        sop_prompt = ""
     working_dir = instance.get("working_dir") or "~"
     dispatch_fingerprint = await asyncio.to_thread(worktree_fingerprint, working_dir)
     if dispatch_fingerprint:
@@ -8814,6 +8832,23 @@ async def golden_throne_followup(session_id: str):
         return
     if not dispatch_ok:
         await _log_golden_throne_dispatch_failed(session_id, dispatch_details)
+        try:
+            handled_at = await _golden_throne_mark_quiet_edge_handled(
+                session_id,
+                actor="golden-throne-dispatch-failed",
+                mutation_type="instance_stopped",
+            )
+            dispatch_details["quiet_edge_handled_at"] = handled_at
+            await log_event(
+                "golden_throne_dispatch_failed_quiet_edge_handled",
+                instance_id=session_id,
+                details=dispatch_details,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Golden Throne: failed to mark dispatch failure handled for "
+                f"{session_id[:12]}: {exc}"
+            )
         return
 
     resume_state = await record_golden_throne_resume(instance)
@@ -26996,8 +27031,7 @@ async def get_golden_throne_timers():
     The driven agent has no in-thread signal distinguishing "leash loosened"
     (longer zealotry delay) from "timer stalled" (job lost on a restart). This
     surfaces the actual scheduler state — armed/next_fire/overdue — so liveness
-    is auditable from outside the thread. `unarmed`/`overdue` counts > 0 mean the
-    next sweep (every sweep_interval_seconds) should re-arm them. Read-only.
+    is auditable from outside the thread. Read-only; GT has no recovery sweep.
     """
     now = datetime.now()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -27060,7 +27094,6 @@ async def get_golden_throne_timers():
 
     return {
         "now": now.isoformat(),
-        "sweep_interval_seconds": GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS,
         "count": len(timers),
         "unarmed": unarmed,
         "overdue": overdue_count,

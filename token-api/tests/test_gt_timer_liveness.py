@@ -1,13 +1,8 @@
-"""Tests for Golden Throne timer liveness (Bug 2 of the GT-harness plan).
+"""Tests for strict event-driven Golden Throne timer liveness.
 
-The scheduler has no persistent jobstore, so a token-api restart mid-wait drops
-pending GT date-jobs and the one-shot startup recovery runs only once — a dropped
-timer could strand a session for >12h. These tests cover the two fixes:
-
-  - the periodic sweep re-arms a GT timer that was lost (recovery is idempotent
-    and safe to re-run), and
-  - GET /api/golden-throne/timers surfaces armed/next_fire/overdue so liveness is
-    auditable from outside the driven thread.
+Lost in-memory GT timers are no longer resurrected from historical DB state:
+there is no startup recovery sweep and no periodic timer sweep. The diagnostic
+endpoint remains read-only and does not advertise a sweep interval.
 """
 
 import sqlite3
@@ -63,7 +58,7 @@ def _insert_gt(db_path: Path, *, doc_path: Path, status: str = "idle", zealotry:
 
 
 @pytest.mark.asyncio
-async def test_sweep_recovery_rearms_lost_gt_timer(gt, tmp_path):
+async def test_recovery_helper_is_retired_noop_does_not_rearm_lost_gt_timer(gt, tmp_path):
     main = gt.main
     doc = _write_doc(tmp_path, "victory:\n  a: true\n  b: false")  # incomplete -> schedulable
     iid = _insert_gt(gt.db_path, doc_path=doc, status="idle")
@@ -75,14 +70,19 @@ async def test_sweep_recovery_rearms_lost_gt_timer(gt, tmp_path):
         main.scheduler.remove_job(job_id)
     assert main.scheduler.get_job(job_id) is None
 
-    # The sweep's underlying recovery re-arms it.
+    # Historical recovery is retired: direct calls do not resurrect DB rows.
     recovered = await main.recover_recent_stopped_golden_throne_timers()
-    assert any(r["instance_id"] == iid for r in recovered)
-    assert main.scheduler.get_job(job_id) is not None
+    assert recovered == []
+    assert main.scheduler.get_job(job_id) is None
 
 
 @pytest.mark.asyncio
-async def test_sweep_recovery_skips_acknowledged_doc(gt, tmp_path):
+async def test_no_golden_throne_timer_sweep_job_registered(gt):
+    assert gt.main.scheduler.get_job("golden_throne_timer_sweep") is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_helper_retired_noop_for_acknowledged_doc(gt, tmp_path):
     main = gt.main
     # Archived/acked doc must never be re-armed.
     doc = _write_doc(
@@ -100,7 +100,7 @@ async def test_sweep_recovery_skips_acknowledged_doc(gt, tmp_path):
     conn.close()
 
     recovered = await main.recover_recent_stopped_golden_throne_timers()
-    assert all(r["instance_id"] != iid for r in recovered)
+    assert recovered == []
     assert main.scheduler.get_job(f"golden-throne-{iid}") is None
 
 
@@ -134,7 +134,7 @@ def test_timers_endpoint_reports_armed_and_overdue(gt, tmp_path):
 
     assert body["unarmed"] >= 1
     assert body["overdue"] >= 1
-    assert body["sweep_interval_seconds"] == main.GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS
+    assert "sweep_interval_seconds" not in body
 
 
 def test_timers_endpoint_excludes_archived_docs(gt, tmp_path):
@@ -196,7 +196,7 @@ def _retire_with_stale_gt(db_path: Path, iid: str, *, status: str = "idle") -> N
 
 
 @pytest.mark.asyncio
-async def test_sweep_recovery_skips_retired_seat(gt, tmp_path):
+async def test_recovery_helper_retired_noop_skips_retired_seat(gt, tmp_path):
     """A retired seat carrying a real GT binding + active doc must NOT be re-armed.
 
     This is the phantom-dispatch source: the recovery query selected on
@@ -212,7 +212,7 @@ async def test_sweep_recovery_skips_retired_seat(gt, tmp_path):
         main.scheduler.remove_job(job_id)
 
     recovered = await main.recover_recent_stopped_golden_throne_timers()
-    assert all(r["instance_id"] != iid for r in recovered)
+    assert recovered == []
     assert main.scheduler.get_job(job_id) is None
 
 
