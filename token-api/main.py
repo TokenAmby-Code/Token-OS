@@ -2041,6 +2041,12 @@ def _is_persona_pane_naming_exempt(instance: dict) -> bool:
 
 
 def _build_naming_nudge_message(slug: str | None, has_session_doc: bool) -> str:
+    continuation = (
+        " Treat this as brief housekeeping, not a task replacement: after the "
+        "naming command, continue the original user task uninterrupted. If the "
+        "naming command errors or reports a non-fatal UI-queue issue, do not "
+        "chase it; stay on the original task."
+    )
     # Doc-bound instances answer through session-doc-name; that CLI explicitly
     # calls the sanctioned instance rename boundary after renaming the document.
     if has_session_doc:
@@ -2052,12 +2058,14 @@ def _build_naming_nudge_message(slug: str | None, has_session_doc: bool) -> str:
             '`session-doc-name "Your Descriptive Title"`. '
             "Do not use dates, timestamps, UUIDs, pane IDs, model names, or generic project roots."
             f"{hint}"
+            f"{continuation}"
         )
     # Doc-less interactive instances name the pane directly via instance-name.
     return (
         "This pane isn't named yet. Choose a 3-6 word kebab title for what "
         'you\'re working on and run `instance-name "your-title"`. '
         "No dates/UUIDs/pane-ids/model-names/generic roots."
+        f"{continuation}"
     )
 
 
