@@ -1,28 +1,41 @@
 ---
 name: custodes
-description: Custodes persona and singleton shorthand. Use when checking Custodes responsibilities, daily-note ownership, enforcement routing, dispatch posture, or persona-pane identity constraints.
+description: Worker/overseer routing guide for reporting to or about Custodes, checking Custodes singleton identity, daily-note ownership, enforcement escalation, and deciding whether to dispatch, brief, or escalate to Custodes.
 ---
 
 # Custodes
 
+Use this skill to route work **to or about Custodes**. It is not a self-manual for becoming Custodes and not permission to patch Custodes identity.
+
 Custodes is the Emperor-facing overseer singleton: first contact, escalation tier, accountability/enforcement seat, daily-note semantic owner, and dispatch designator.
 
-## Canonical Context
+## Route to Custodes When
+
+- The task concerns daily-note meaning, Emperor-facing accountability, enforcement posture, or operator-facing escalation.
+- A worker needs a scope/gate decision that its commander cannot answer.
+- A singleton identity, pane, or registry invariant appears wrong and needs harness/registry escalation.
+- A result must be reported to Custodes rather than implemented from the current pane.
+
+## Routing Surfaces
 
 - Persona note: `$IMPERIUM/Imperium-ENV/Personas/Custodes.md`.
-- Skill surfaces: `$daily-note`, `$dispatch`, `$session-update`, `$vault-update`.
-- Singleton pane identity is infrastructure-owned. SessionStart/registry derive persona + rank; agents verify and report bugs, they do not self-patch.
-- Canonical live identity check: one non-retired row with `persona.slug == "custodes"` and `rank != "retired"`.
+- Related skills: `$daily-note`, `$dispatch`, `$session-update`, `$vault-update`.
+- Use `talk` for status/clarification, `brief` for structured assignment or escalation, and `$dispatch custodes` for bounded worker routing under Custodes authority.
 
-## Safe checks
+## Identity Check
+
+Singleton pane identity is infrastructure-owned. SessionStart/registry derive persona + rank; agents verify and report bugs, they do not self-patch.
+
+Canonical live check: exactly one non-retired row with `persona.slug == "custodes"` and `rank != "retired"`.
 
 ```bash
-curl -s "$TOKEN_API_URL/api/instances"   | jq '[.[] | select(.persona.slug=="custodes" and .rank!="retired")] | {count: length, row: .[0] | {id, rank, status}}'
+curl -s "$TOKEN_API_URL/api/instances" \
+  | jq '[.[] | select(.persona.slug=="custodes" and .rank!="retired")] | {count: length, row: .[0] | {id, rank, status, pane_label}}'
 ```
 
 ## Do Not
 
-- Do not implement broad repo work from a Custodes pane; dispatch or use an explorer.
+- Do not implement broad repo work from a Custodes pane; dispatch or use a worker.
 - Do not rewrite the daily note from non-Custodes context unless explicitly assigned.
-- Do not PATCH Custodes identity, legion, rank, sync, or singleton binding locally; report harness/registry bugs upward.
+- Do not PATCH Custodes identity, legion, rank, sync, singleton binding, or registry rows locally.
 - Do not compact/plan-cycle Custodes casually; protect its conversational context.

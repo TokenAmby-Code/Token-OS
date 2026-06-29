@@ -1,11 +1,11 @@
 ---
 name: ops-cockpit
-description: Ops cockpit shorthand. Use when working on the Token-API Terminus web cockpit, /ui/ops frontend, aggregate read-model endpoints, dashboard state contracts, or live operator surface.
+description: "Token-OS ops cockpit work: /ui/ops Vite/React/TypeScript frontend, Token-API aggregate read-model endpoints, dashboard state contracts, typed operator controls, Terminus pilot surface, and live operator observation/verification."
 ---
 
 # Ops Cockpit
 
-The ops cockpit is the live Token-OS dashboard surface served by Token-API. Extend this cockpit rather than creating parallel live dashboards.
+The ops cockpit is the current Token-OS Terminus demo surface and live operator dashboard served by Token-API. Extend it rather than creating parallel dashboards. For architecture detail, read `references/architecture.md`.
 
 ## Surfaces
 
@@ -24,9 +24,14 @@ npm run build
 curl -sf "$TOKEN_API_URL/api/ui/ops/state" | jq .surface
 ```
 
+## Doctrine
+
+- Observation-first: degraded real state is better than fake state.
+- Token-API-routed controls are allowed when they preserve service boundaries and typed contracts.
+- Keep nested components using centralized typed data access instead of stitching legacy endpoints directly.
+
 ## Do Not
 
 - Do not build a parallel live dashboard, static Obsidian replacement, or alternate state stitcher.
-- Do not have nested components call legacy endpoints directly; keep typed data access centralized.
-- Do not fake live timer data; degraded state is better than mock state on the operator surface.
-- Do not run browser automation against the physical Windows vertical-monitor cockpit; use same-host localhost Mac cockpit for tests.
+- Do not fake live timer, instance, dispatch, or health data on the operator surface.
+- Do not run browser automation against the physical Windows vertical-monitor cockpit unless physical display behavior is the task.
