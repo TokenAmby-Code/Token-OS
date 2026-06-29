@@ -106,3 +106,54 @@ def test_legacy_positional_invocation_fails_loudly(tmp_path: Path) -> None:
     assert proc.returncode != 0, "a stray positional call must fail, not silently no-op"
     assert "usage" in proc.stderr.lower()
     assert not log.exists(), "a rejected invocation must not shell out to tmux"
+
+
+def test_backfill_missing_db_fails_open_without_tmux(tmp_path: Path) -> None:
+    db = tmp_path / "missing.db"
+    bindir, log = _fake_tmux(tmp_path)
+
+    proc = _run(["--backfill"], db=db, bindir=bindir, log=log)
+
+    assert proc.returncode == 0
+    assert "DB read failed" in proc.stderr
+    assert "no live panes" in proc.stdout
+    assert not log.exists()
+
+
+def test_backfill_reports_tmux_failures_and_keeps_exit_zero(tmp_path: Path) -> None:
+    db = tmp_path / "agents.db"
+    _make_db(db, [("live1", "auth-refactor", "%1", "idle")])
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    log = tmp_path / "tmux-calls.log"
+    fake = bindir / "tmux"
+    fake.write_text('#!/bin/sh\necho "$*" >> "$TMUX_CALL_LOG"\nexit 42\n')
+    fake.chmod(0o755)
+
+    proc = _run(["--backfill"], db=db, bindir=bindir, log=log)
+
+    assert proc.returncode == 0
+    assert "0 pane(s), 1 failed" in proc.stdout
+    assert "set-option -p -t %1 @PANE_LABEL auth-refactor" in log.read_text()
+
+
+def test_backfill_includes_non_stopped_status_values(tmp_path: Path) -> None:
+    db = tmp_path / "agents.db"
+    _make_db(
+        db,
+        [
+            ("live1", "queued-title", "%1", "queued"),
+            ("live2", "errored-title", "%2", "error"),
+            ("dead", "stopped-title", "%3", "stopped"),
+        ],
+    )
+    bindir, log = _fake_tmux(tmp_path)
+
+    proc = _run(["--backfill"], db=db, bindir=bindir, log=log)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "2 pane(s)" in proc.stdout
+    calls = log.read_text().splitlines()
+    assert "set-option -p -t %1 @PANE_LABEL queued-title" in calls
+    assert "set-option -p -t %2 @PANE_LABEL errored-title" in calls
+    assert not any("%3" in call for call in calls)

@@ -5,6 +5,8 @@ import os
 import pathlib
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
@@ -288,3 +290,20 @@ def test_observe_session_parses_panes():
     assert panes[0].pane_pid == 100
     assert panes[1].cwd == "/scratch/b"
     assert panes[1].current_command == "codex"
+
+
+def test_observe_session_raises_on_malformed_tmux_rows() -> None:
+    adapter = _FakeAdapter(lines=["%1\t1\tmetalrt"], options={})
+
+    with pytest.raises(ValueError):
+        observe_session(adapter, "metalrt")
+
+
+def test_observe_session_raises_on_non_integer_pane_pid() -> None:
+    adapter = _FakeAdapter(
+        lines=["%1\t1\tmetalrt\t1\tbash\tnot-a-pid\t/scratch/a"],
+        options={("%1", "@PANE_ID"): "metalrt:A"},
+    )
+
+    with pytest.raises(ValueError):
+        observe_session(adapter, "metalrt")
