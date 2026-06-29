@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 
 from .api import RegistryError
 from .service import TmuxControlPlane
@@ -29,6 +32,37 @@ def _safe_public_role(role: str | None) -> str:
     if _RAW_TMUX_ID_RX.search(value):
         return "unresolved"
     return value if _PUBLIC_PANE_ID_RX.fullmatch(value) else "unresolved"
+
+
+def _tmuxctld_url() -> str:
+    return os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:7778").rstrip("/")
+
+
+def _post_tmuxctld(path: str, payload: dict, *, timeout: float = 30.0) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{_tmuxctld_url()}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            envelope = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.URLError as exc:
+        raise ValueError(f"tmuxctld unreachable for {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"tmuxctld returned invalid JSON for {path}: {exc}") from exc
+    if not isinstance(envelope, dict):
+        raise ValueError(f"tmuxctld returned invalid envelope for {path}: {envelope!r}")
+    if not envelope.get("ok"):
+        err = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
+        message = err.get("message") or envelope.get("error") or "unknown daemon error"
+        raise ValueError(f"tmuxctld {path} failed: {message}")
+    result = envelope.get("result", {})
+    if not isinstance(result, dict):
+        raise ValueError(f"tmuxctld returned invalid result for {path}: {result!r}")
+    return result
 
 
 def _parse_window_ref(value: str, control: TmuxControlPlane) -> tuple[str, int]:
@@ -733,21 +767,24 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "persona-engine":
-            import json
-
-            from .persona_engine import rotate_persona_engine
-
             pane = args.pane
             if pane == "current":
+                # Capture the invoking pane once in the foreground client, then hand
+                # that concrete target to tmuxctld. The daemon performs the only
+                # respawn and never sweeps adjacent persona seats for this action.
                 pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
-            result = rotate_persona_engine(
-                control.adapter,
-                pane,
-                engine=args.engine,
-                toggle=args.toggle,
-                session=args.session,
+            result = _post_tmuxctld(
+                "/persona-engine",
+                {
+                    "pane": pane,
+                    "engine": args.engine or "",
+                    "toggle": bool(args.toggle),
+                    "session": args.session or "",
+                },
             )
-            print(json.dumps(result, sort_keys=True))
+            import json as _persona_json
+
+            print(_persona_json.dumps(result, sort_keys=True))
             return 0 if result.get("ok") else 1
 
         if args.command == "audience":

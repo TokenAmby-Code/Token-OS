@@ -904,6 +904,15 @@ def _h_event(control, params):
     )
 
 
+def _h_persona_engine(control, params):
+    return control.rotate_persona_engine(
+        _s(params, "pane"),
+        engine=(_s(params, "engine") or None),
+        toggle=_b(params, "toggle"),
+        session=(_s(params, "session") or None),
+    )
+
+
 def _h_hook_user_prompt_submit(_control, params):
     return _PROMPT_SUBMIT_SNIFFER.record(params)
 
@@ -1505,6 +1514,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     # lifecycle event (a persona pane-died self-heal). Nothing polls these.
     ("POST", "/reconcile"): _h_reconcile,
     ("POST", "/event"): _h_event,
+    ("POST", "/persona-engine"): _h_persona_engine,
     ("POST", "/clear-runtime"): _h_clear_runtime,
     ("POST", "/close-pane"): _h_close_pane,
     ("POST", "/close"): _h_close,
