@@ -1337,6 +1337,7 @@ async def _active_hook_instances(db) -> list[dict]:
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(
         """SELECT id, name AS tab_name, status, last_activity,
+                  persona_id, commander_type, commander_id,
                   dispatch_target, dispatch_window,
                   CASE WHEN commander_type = 'chapter' THEN commander_id END AS parent_instance_id
            FROM instances
@@ -1367,11 +1368,70 @@ async def _with_effective_pane_labels(rows: list[dict]) -> list[dict]:
 
 
 async def _find_live_fabricator_general(db) -> dict | None:
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute(
+        """SELECT i.id, i.name AS tab_name, i.status, i.last_activity,
+                  i.persona_id, i.commander_type, i.commander_id,
+                  i.dispatch_target, i.dispatch_window,
+                  CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id
+           FROM instances i
+           JOIN personas p ON p.id = i.persona_id
+           WHERE p.slug = 'fabricator-general'
+             AND i.status NOT IN ('stopped', 'archived')
+             AND i.rank != 'retired'
+           ORDER BY i.last_activity DESC, i.created_at DESC"""
+    )
+    # Fast path: resolve only durable FG singleton candidates. Liveness still
+    # comes from the tmux oracle, not the DB row.
+    for row in await cursor.fetchall():
+        resolved = await _with_effective_pane_labels([dict(row)])
+        if resolved and resolved[0].get("effective_pane_label") == MECHANICUS_FG_LABEL:
+            return resolved[0]
+
+    # Defensive fallback for legacy/repair rows: a live pane carrying the FG role
+    # is still the commander, but it must resolve through the oracle.
     rows = await _with_effective_pane_labels(await _active_hook_instances(db))
     for row in rows:
         if row.get("effective_pane_label") == MECHANICUS_FG_LABEL:
             return row
     return None
+
+
+async def _commander_resolves_to_live_fabricator_general(
+    db, row: dict, fg: dict
+) -> tuple[bool, str, dict]:
+    """Return whether ``row`` is commanded by the live FG singleton.
+
+    Modern Mechanicus workers use a restart-stable persona commander edge:
+    ``commander_type='persona'`` + ``commander_id=<fabricator-general persona id>``.
+    Older children use ``commander_type='chapter'`` + a volatile commander
+    instance id. Accept either, after the caller has proven the FG row's live
+    pane through the tmux oracle.
+    """
+    commander_type = _normalize_text(row.get("commander_type"))
+    commander_id = _normalize_text(row.get("commander_id"))
+    if commander_type == "persona":
+        if commander_id and commander_id == _normalize_text(fg.get("persona_id")):
+            return True, "commander_persona_fg", {"commander_id": commander_id}
+        return (
+            False,
+            "commander_persona_not_fg",
+            {"commander_id": commander_id, "fg_persona_id": fg.get("persona_id")},
+        )
+
+    if commander_type == "chapter":
+        parent = await _resolve_live_instance(db, commander_id)
+        if not parent:
+            return False, "parent_not_live", {"parent_instance_id": commander_id}
+        if parent.get("id") != fg.get("id"):
+            return False, "parent_not_fg", {"parent_instance_id": commander_id}
+        return True, "commander_chapter_fg", {"parent_instance_id": commander_id}
+
+    return (
+        False,
+        "commander_not_fg",
+        {"commander_type": commander_type, "commander_id": commander_id},
+    )
 
 
 async def _reconcile_mechanicus_stop_subscriptions(
@@ -1420,32 +1480,23 @@ async def _reconcile_mechanicus_stop_subscriptions(
             )
             continue
 
-        # Only subscribe VERIFIED true children of FG. A mechanicus-labelled pane
-        # is NOT proof of parentage: the additive reconcile used to wire every
-        # worker to FG, mis-attributing orphans (parent FK = dead/phantom uuid)
-        # and workers owned by a different live commander. Require the worker's
-        # parent FK to resolve to a LIVE row that IS this FG before subscribing.
-        parent_id = _normalize_text(row.get("parent_instance_id"))
-        parent = await _resolve_live_instance(db, parent_id)
-        if not parent:
+        # Only subscribe VERIFIED true workers commanded by FG. A
+        # mechanicus-labelled pane is NOT proof of parentage; verify the durable
+        # commander edge. Current workers point at FG by persona id; legacy
+        # workers point at a live commander instance id.
+        (
+            commander_ok,
+            commander_reason,
+            commander_details,
+        ) = await _commander_resolves_to_live_fabricator_general(db, row, fg)
+        if not commander_ok:
             counts["skipped"] += 1
             skipped.append(
                 {
                     "instance_id": target_id,
                     "pane_label": label,
-                    "reason": "parent_not_live",
-                    "parent_instance_id": parent_id,
-                }
-            )
-            continue
-        if parent.get("id") != fg.get("id"):
-            counts["skipped"] += 1
-            skipped.append(
-                {
-                    "instance_id": target_id,
-                    "pane_label": label,
-                    "reason": "parent_not_fg",
-                    "parent_instance_id": parent_id,
+                    "reason": commander_reason,
+                    **commander_details,
                 }
             )
             continue
@@ -5393,6 +5444,28 @@ async def handle_stop(payload: dict) -> dict:
     # Trinity Chunk 2: live Stop-hook subscriptions. Deliver before legacy
     # state_injections so a subscribed parent gets an immediate prompt instead
     # of waiting until its next PromptSubmit.
+    # Self-heal before delivery: workers already live before this fix may have
+    # missed SessionStart subscription creation. A Stop hook still has the
+    # watched row and live @INSTANCE_ID pane, so reconcile the single Mechanicus
+    # worker just-in-time and then deliver through the normal subscription path.
+    mechanicus_stop_reconcile = None
+    mechanicus_probe = {
+        **instance,
+        "effective_pane_label": instance.get("pane_label"),
+    }
+    if _is_mechanicus_worker_row(mechanicus_probe):
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            mechanicus_stop_reconcile = await _reconcile_mechanicus_stop_subscriptions(
+                db, source_instance_id=session_id
+            )
+            if mechanicus_stop_reconcile and (
+                mechanicus_stop_reconcile.get("created")
+                or mechanicus_stop_reconcile.get("existing")
+            ):
+                await db.commit()
+    if mechanicus_stop_reconcile:
+        result["mechanicus_stop_reconcile"] = mechanicus_stop_reconcile
+
     live_stop_deliveries = await _fanout_stop_subscriptions(instance, payload, tts_text)
     if live_stop_deliveries:
         result["stop_subscriptions"] = live_stop_deliveries
