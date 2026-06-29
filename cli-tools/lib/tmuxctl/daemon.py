@@ -92,7 +92,7 @@ def ensure_tmux_lifecycle_hooks() -> dict:
     """
     commands = [
         ("set-option", "-g", "remain-on-exit", "on"),
-        ("set-hook", "-g", "pane-died", _PANE_DIED_HOOK),
+        ("set-hook", "-g", "pane-died[90]", _PANE_DIED_HOOK),
     ]
     results = []
     ok = True
@@ -111,7 +111,7 @@ def ensure_tmux_lifecycle_hooks() -> dict:
                 "returncode": proc.returncode,
                 "stderr": (proc.stderr or "").strip()[:300],
             }
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
             entry = {
                 "command": command[0],
                 "ok": False,

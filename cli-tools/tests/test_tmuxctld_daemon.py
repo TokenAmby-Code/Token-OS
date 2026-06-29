@@ -861,7 +861,7 @@ def test_voice_clear_by_bot_clears_stale_target_options(
         server.shutdown()
 
 
-def test_startup_installs_tmux_lifecycle_hooks(monkeypatch) -> None:
+def test_startup_installs_tmux_lifecycle_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
 
     class Proc:
@@ -888,7 +888,7 @@ def test_startup_installs_tmux_lifecycle_hooks(monkeypatch) -> None:
             },
         ),
         (
-            ("tmux", "set-hook", "-g", "pane-died", daemon._PANE_DIED_HOOK),
+            ("tmux", "set-hook", "-g", "pane-died[90]", daemon._PANE_DIED_HOOK),
             {
                 "capture_output": True,
                 "text": True,
@@ -900,9 +900,9 @@ def test_startup_installs_tmux_lifecycle_hooks(monkeypatch) -> None:
     assert "tmux-pane-respawn #{pane_id}" in daemon._PANE_DIED_HOOK
 
 
-def test_startup_lifecycle_hook_install_is_best_effort(monkeypatch) -> None:
+def test_startup_lifecycle_hook_install_is_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(*_args, **_kwargs):
-        raise FileNotFoundError("tmux")
+        raise PermissionError("tmux denied")
 
     monkeypatch.setattr(daemon.subprocess, "run", fake_run)
 
