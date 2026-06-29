@@ -8,10 +8,12 @@ no-supervision path — plus the arm/poll/failure state machine:
     today-exclusion, no-history -> None.
   - arm_morning_supervisor: schedules the relative poller; no-history and
     recover-past-window are no-ops.
-  - _supervisor_poll_job: ack+custodes -> disarm; ack-no-custodes -> alert+retry;
+  - _supervisor_poll_job: inactive timer suppresses all supervisor actions;
+    ack+active+live Custodes -> disarm; ack+active+no Custodes -> alert+retry;
     no-ack within grace -> wait; no-ack past grace -> alert + Custodes day-start backstop.
   - _handle_failure: no_ack latches day-start through /api/day-start/fire;
-    ack_no_custodes retries /api/morning/start.
+    ack_no_custodes retries /api/morning/start only when the morning is not
+    already ended and no Custodes is live.
 
 Run:
     cd token-api && .venv/bin/python -m pytest tests/test_morning_supervisor.py -v
@@ -212,26 +214,33 @@ def _poll(
     now,
     ack,
     morning_active=False,
+    stopped_state=None,
     custodes=None,
     anchor="2026-06-05T08:00:00-07:00",
     deadline="2026-06-05T08:15:00-07:00",
 ):
     """Drive one poll tick with stubbed signals; return recorded failures + disarm.
 
-    The health gate is ``morning_is_active`` (the deterministic state-file signal),
-    not bare custodes-process liveness; ``custodes`` only feeds the ok-log detail.
+    The lifecycle gate is ``morning_is_active`` (first-class timer mode);
+    ``custodes`` verifies the live singleton only after that gate is active.
     """
     fake = FakeScheduler()
+    ack_calls = 0
     fake.jobs[ms.SUPERVISOR_POLL_JOB_ID] = {"placeholder": True}
     monkeypatch.setattr(ms.shared, "scheduler", fake)
     monkeypatch.setattr(ms, "log_event", _anoop)
     monkeypatch.setattr(ms, "quiet_hours_local_now", lambda: now)
 
     async def fake_ack(*, now_local=None, db_path=None):
+        nonlocal ack_calls
+        ack_calls += 1
         return ack
 
     async def fake_active(date_str=None):
         return morning_active
+
+    async def fake_stopped(date_str=None):
+        return stopped_state
 
     async def fake_cust():
         return custodes
@@ -243,16 +252,17 @@ def _poll(
 
     monkeypatch.setattr(ms, "ack_seen_today", fake_ack)
     monkeypatch.setattr(ms, "morning_is_active", fake_active)
+    monkeypatch.setattr(ms, "morning_was_stopped", fake_stopped)
     monkeypatch.setattr(ms, "custodes_running", fake_cust)
     monkeypatch.setattr(ms, "_handle_failure", fake_failure)
 
     asyncio.run(ms._supervisor_poll_job("2026-06-05", anchor, deadline))
-    return failures, fake.removed
+    return failures, fake.removed, ack_calls
 
 
-def test_poll_ack_and_active_morning_disarms(monkeypatch):
+def test_poll_ack_and_active_morning_disarms(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
-    failures, removed = _poll(
+    failures, removed, ack_calls = _poll(
         monkeypatch,
         now=now,
         ack={"day_started_at": "x"},
@@ -261,42 +271,83 @@ def test_poll_ack_and_active_morning_disarms(monkeypatch):
     )
     assert failures == []
     assert ms.SUPERVISOR_POLL_JOB_ID in removed
+    assert ack_calls == 1
 
 
-def test_poll_ack_but_morning_not_active_alerts_and_disarms(monkeypatch):
-    # A custodes process is alive (the singleton always is), but the morning
-    # session never confirmed active — the reactive launch failed. The supervisor
-    # must catch this rather than be fooled by the resting singleton.
+def test_poll_inactive_morning_timer_suppresses_even_with_ack_and_live_custodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Binding is to the first-class timer mode. If the operator ended morning,
+    # the supervisor dies instead of relaunching or poking Custodes.
     now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
-    failures, removed = _poll(
+    failures, removed, ack_calls = _poll(
         monkeypatch,
         now=now,
         ack={"day_started_at": "x"},
         morning_active=False,
+        stopped_state={"status": "ended", "ended_by": "morning-end"},
         custodes={"id": "resting-singleton"},
+    )
+    assert failures == []
+    assert ms.SUPERVISOR_POLL_JOB_ID in removed
+    assert ack_calls == 0
+
+
+def test_poll_inactive_morning_timer_suppresses_no_ack_harassment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 6, 5, 8, 20, tzinfo=_TZ)
+    failures, removed, ack_calls = _poll(
+        monkeypatch,
+        now=now,
+        ack=None,
+        morning_active=False,
+        stopped_state={"status": "ended", "ended_by": "morning-end"},
+        custodes={"id": "resting-singleton"},
+    )
+    assert failures == []
+    assert ms.SUPERVISOR_POLL_JOB_ID in removed
+    assert ack_calls == 0
+
+
+def test_poll_ack_active_timer_but_no_custodes_alerts_and_disarms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
+    failures, removed, ack_calls = _poll(
+        monkeypatch,
+        now=now,
+        ack={"day_started_at": "x"},
+        morning_active=True,
+        custodes=None,
     )
     assert failures == ["ack_no_custodes"]
     assert ms.SUPERVISOR_POLL_JOB_ID in removed
+    assert ack_calls == 1
 
 
-def test_poll_no_ack_before_deadline_keeps_waiting(monkeypatch):
+def test_poll_no_ack_before_deadline_keeps_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)  # before 08:15 deadline
-    failures, removed = _poll(monkeypatch, now=now, ack=None)
+    failures, removed, ack_calls = _poll(monkeypatch, now=now, ack=None, morning_active=True)
     assert failures == []
     assert removed == []  # still armed
+    assert ack_calls == 1
 
 
-def test_poll_no_ack_past_deadline_alerts(monkeypatch):
+def test_poll_no_ack_past_deadline_alerts(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 6, 5, 8, 20, tzinfo=_TZ)  # past 08:15 deadline
-    failures, removed = _poll(monkeypatch, now=now, ack=None)
+    failures, removed, ack_calls = _poll(monkeypatch, now=now, ack=None, morning_active=True)
     assert failures == ["no_ack"]
     assert ms.SUPERVISOR_POLL_JOB_ID in removed
+    assert ack_calls == 1
 
 
 # ── _handle_failure recovery actions ──────────────────────────
 
 
-def _capture_failure(monkeypatch):
+def _capture_failure(monkeypatch, *, custodes=None, stopped_state=None):
     posts = []
     notices = []
 
@@ -308,7 +359,15 @@ def _capture_failure(monkeypatch):
         notices.append(message)
         return {"ok": True}
 
+    async def fake_custodes():
+        return custodes
+
+    async def fake_stopped(date_str=None):
+        return stopped_state
+
     monkeypatch.setattr(ms, "log_event", _anoop)
+    monkeypatch.setattr(ms, "custodes_running", fake_custodes)
+    monkeypatch.setattr(ms, "morning_was_stopped", fake_stopped)
     monkeypatch.setattr(ms, "_post_local", fake_post)
     monkeypatch.setattr(ms, "_notify", fake_notify)
     monkeypatch.setattr(ms, "_discord_alert", _anoop)
@@ -344,7 +403,7 @@ def test_handle_failure_no_ack_fires_custodes_day_start_backstop(
 
 
 def test_handle_failure_ack_no_custodes_relaunches(monkeypatch: pytest.MonkeyPatch) -> None:
-    posts, notices = _capture_failure(monkeypatch)
+    posts, notices = _capture_failure(monkeypatch, custodes=None)
     now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
     asyncio.run(
         ms._handle_failure(
@@ -358,3 +417,39 @@ def test_handle_failure_ack_no_custodes_relaunches(monkeypatch: pytest.MonkeyPat
     assert any(path == "/api/morning/start" for path, _ in posts)
     assert not any(path == "/api/day-start/fire" for path, _ in posts)
     assert notices
+
+
+def test_handle_failure_ack_no_custodes_suppresses_when_custodes_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posts, notices = _capture_failure(monkeypatch, custodes={"id": "custodes-live"})
+    now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
+    asyncio.run(
+        ms._handle_failure(
+            failure_type="ack_no_custodes",
+            now_local=now,
+            anchor_iso="2026-06-05T08:00:00-07:00",
+            ack={"day_started_at": "2026-06-05T08:00:00-07:00"},
+        )
+    )
+    assert not any(path == "/api/morning/start" for path, _ in posts)
+    assert notices == []
+
+
+def test_handle_failure_ack_no_custodes_suppresses_when_morning_already_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posts, notices = _capture_failure(
+        monkeypatch, stopped_state={"status": "ended", "ended_by": "morning-end"}
+    )
+    now = datetime(2026, 6, 5, 8, 5, tzinfo=_TZ)
+    asyncio.run(
+        ms._handle_failure(
+            failure_type="ack_no_custodes",
+            now_local=now,
+            anchor_iso="2026-06-05T08:00:00-07:00",
+            ack={"day_started_at": "2026-06-05T08:00:00-07:00"},
+        )
+    )
+    assert not any(path == "/api/morning/start" for path, _ in posts)
+    assert notices == []

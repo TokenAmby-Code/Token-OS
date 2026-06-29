@@ -148,17 +148,22 @@ async def custodes_running() -> dict | None:
 
 
 async def morning_is_active(date_str: str | None = None) -> bool:
-    """Whether today's morning session is confirmed active (state-file signal).
-
-    This is the deterministic "the morning came up" signal that
-    run_morning_session writes after it confirms + reconciles a live custodes.
-    The supervisor checks THIS rather than mere custodes-process liveness:
-    custodes is a singleton and is usually alive even when no morning launched,
-    so "a custodes exists" would mask a real launch failure. "active" here means
-    a session was actually confirmed for today.
-    """
+    """Whether today's morning session is confirmed active."""
     active, _ = await asyncio.to_thread(morning_session.morning_session_active, date_str)
     return active
+
+
+async def morning_was_stopped(date_str: str | None = None) -> dict | None:
+    """Return today's ended morning state, if the operator already stopped it.
+
+    A stopped morning is explicit operator intent. The supervisor must not turn an
+    already-ended morning record back into a reactive launch just because the
+    learned wake window still has a poller armed.
+    """
+    state = await asyncio.to_thread(morning_session.read_morning_state, date_str)
+    if isinstance(state, dict) and state.get("status") == "ended":
+        return state
+    return None
 
 
 # ── Arming ─────────────────────────────────────────────────────
@@ -263,23 +268,51 @@ async def _supervisor_poll_job(date_str: str, anchor_iso: str, deadline_iso: str
         _disarm()
         return
 
+    morning_active = await morning_is_active(date_str)
+    if not morning_active:
+        # Lifecycle binding: the supervisor is only allowed to act while the
+        # first-class timer is in morning_session mode. Ending morning must kill
+        # the watchdog, including the no-ack path that previously harassed a live
+        # Custodes hours after the operator had already ended morning.
+        stopped_state = await morning_was_stopped(date_str)
+        cust = await custodes_running()
+        await log_event(
+            "morning_supervisor_suppressed",
+            details={
+                "date": date_str,
+                "reason": "morning_timer_inactive",
+                "stopped": bool(stopped_state),
+                "ended_by": stopped_state.get("ended_by") if stopped_state else None,
+                "ended_at": stopped_state.get("ended_at") if stopped_state else None,
+                "custodes_liveness": bool(cust),
+                "custodes_instance_id": cust.get("id") if cust else None,
+            },
+        )
+        logger.info("Morning supervisor: timer not in morning_session — disarming")
+        _disarm()
+        return
+
     ack = await ack_seen_today(now_local=now_local)
     if ack is not None:
-        if await morning_is_active(date_str):
-            # Healthy: real ack + confirmed-active morning session. Self-disarm.
-            cust = await custodes_running()
+        cust = await custodes_running()
+        if cust is not None:
+            # Healthy: real ack + active timer-bound morning + live Custodes.
             await log_event(
                 "morning_supervisor_ok",
                 details={
                     "date": date_str,
                     "day_started_at": ack.get("day_started_at"),
-                    "custodes_instance_id": cust.get("id") if cust else None,
+                    "custodes_liveness": True,
+                    "custodes_instance_id": cust.get("id"),
                 },
             )
-            logger.info("Morning supervisor: ack + active morning session confirmed — disarming")
+            logger.info(
+                "Morning supervisor: ack + active timer + live Custodes confirmed — disarming"
+            )
             _disarm()
             return
-        # Ack landed but the morning session is not active — reactive launch failed.
+
+        # Ack landed and the timer-bound morning is active, but no Custodes is live.
         await _handle_failure(
             failure_type="ack_no_custodes",
             now_local=now_local,
@@ -315,6 +348,39 @@ async def _handle_failure(
     day_type = "weekend" if _is_weekend(now_local) else "weekday"
     expected_hm = anchor.strftime("%H:%M")
     now_hm = now_local.strftime("%H:%M")
+
+    if failure_type == "ack_no_custodes":
+        stopped_state = await morning_was_stopped(now_local.date().isoformat())
+        cust = await custodes_running()
+        if stopped_state is not None:
+            await log_event(
+                "morning_supervisor_backup",
+                details={
+                    "action": "suppressed",
+                    "reason": "morning_already_ended",
+                    "ended_by": stopped_state.get("ended_by"),
+                    "ended_at": stopped_state.get("ended_at"),
+                    "custodes_liveness": bool(cust),
+                    "custodes_instance_id": cust.get("id") if cust else None,
+                },
+            )
+            logger.info("Morning supervisor: reactive launch suppressed; morning already ended")
+            return
+        if cust is not None:
+            await log_event(
+                "morning_supervisor_backup",
+                details={
+                    "action": "suppressed",
+                    "reason": "live_custodes_present",
+                    "custodes_liveness": True,
+                    "custodes_instance_id": cust.get("id"),
+                },
+            )
+            logger.info(
+                "Morning supervisor: reactive launch suppressed; live Custodes %s present",
+                str(cust.get("id", ""))[:12],
+            )
+            return
 
     if failure_type == "no_ack":
         # The Hatch ack itself never registered. That is no longer allowed to be
@@ -352,7 +418,7 @@ async def _handle_failure(
     # timeouts; the durable day-start latch is the thing that prevents the
     # morning from continuing to drift.
     if failure_type == "ack_no_custodes":
-        # There WAS a real ack — relaunching the morning session is legitimate.
+        # There WAS a real ack and no live Custodes — relaunching is legitimate.
         retry = await _post_local("/api/morning/start")
         await log_event(
             "morning_supervisor_backup",
