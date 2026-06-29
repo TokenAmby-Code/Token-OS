@@ -1367,34 +1367,108 @@ async def _with_effective_pane_labels(rows: list[dict]) -> list[dict]:
     return resolved
 
 
-async def _find_live_fabricator_general(db) -> dict | None:
+async def _find_live_persona_singleton(db, persona_id_or_slug: str | None) -> dict | None:
+    """Resolve a live persona commander singleton by persona slug/id.
+
+    The singleton identity rule is deliberately ``persona slug`` + non-retired
+    rank + ``commander_type != 'chapter'``.  Chapter children can share the same
+    persona_id, but they are workers, not the singleton commander to notify.
+    Liveness still comes from the tmux oracle via ``_with_effective_pane_labels``.
+    """
+    persona_id_or_slug = _normalize_text(persona_id_or_slug)
+    if not persona_id_or_slug:
+        return None
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(
         """SELECT i.id, i.name AS tab_name, i.status, i.last_activity,
                   i.persona_id, i.commander_type, i.commander_id,
-                  i.dispatch_target, i.dispatch_window,
+                  i.dispatch_target, i.dispatch_window, i.rank,
                   CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id
            FROM instances i
            JOIN personas p ON p.id = i.persona_id
-           WHERE p.slug = 'fabricator-general'
+           WHERE (p.id = ? OR p.slug = ?)
              AND i.status NOT IN ('stopped', 'archived')
              AND i.rank != 'retired'
-           ORDER BY i.last_activity DESC, i.created_at DESC"""
+             AND i.commander_type != 'chapter'
+           ORDER BY
+             CASE i.rank
+               WHEN 'primarch' THEN 3
+               WHEN 'overseer' THEN 2
+               WHEN 'astartes' THEN 1
+               ELSE 0
+             END DESC,
+             i.last_activity DESC,
+             i.created_at DESC,
+             i.id DESC""",
+        (persona_id_or_slug, persona_id_or_slug),
     )
-    # Fast path: resolve only durable FG singleton candidates. Liveness still
-    # comes from the tmux oracle, not the DB row.
     for row in await cursor.fetchall():
         resolved = await _with_effective_pane_labels([dict(row)])
-        if resolved and resolved[0].get("effective_pane_label") == MECHANICUS_FG_LABEL:
+        if resolved:
             return resolved[0]
+    return None
 
-    # Defensive fallback for legacy/repair rows: a live pane carrying the FG role
-    # is still the commander, but it must resolve through the oracle.
+
+async def _find_live_fabricator_general(db) -> dict | None:
+    """Compatibility resolver for legacy Mechanicus chapter-parent tests.
+
+    New persona-commanded workers use ``_find_live_persona_singleton``.  This
+    fallback keeps the old FG chapter-parent reconcile behavior for rows that
+    predate canonical persona binding.
+    """
+    fg = await _find_live_persona_singleton(db, "fabricator-general")
+    if fg:
+        return fg
     rows = await _with_effective_pane_labels(await _active_hook_instances(db))
     for row in rows:
         if row.get("effective_pane_label") == MECHANICUS_FG_LABEL:
             return row
     return None
+
+
+async def _resolve_persona_commander_for_stop_subscription(
+    db, row: dict
+) -> tuple[bool, str, dict, dict | None]:
+    commander_id = _normalize_text(row.get("commander_id"))
+    if not commander_id:
+        return False, "commander_persona_missing", {}, None
+
+    db.row_factory = aiosqlite.Row
+    cursor = await db.execute(
+        "SELECT id, slug FROM personas WHERE id = ? OR slug = ? LIMIT 1",
+        (commander_id, commander_id),
+    )
+    persona = await cursor.fetchone()
+    if not persona:
+        return False, "commander_persona_unknown", {"commander_id": commander_id}, None
+
+    persona_id = persona["id"]
+    persona_slug = persona["slug"]
+    commander = await _find_live_persona_singleton(db, persona_slug)
+    if not commander:
+        return (
+            False,
+            "commander_persona_not_live",
+            {"commander_id": commander_id, "commander_persona_slug": persona_slug},
+            None,
+        )
+    if _normalize_text(commander.get("persona_id")) != _normalize_text(persona_id):
+        return (
+            False,
+            "commander_persona_mismatch",
+            {
+                "commander_id": commander_id,
+                "commander_persona_slug": persona_slug,
+                "resolved_persona_id": commander.get("persona_id"),
+            },
+            None,
+        )
+    return (
+        True,
+        "commander_persona_singleton",
+        {"commander_id": commander_id, "commander_persona_slug": persona_slug},
+        commander,
+    )
 
 
 async def _commander_resolves_to_live_fabricator_general(
@@ -1434,25 +1508,23 @@ async def _commander_resolves_to_live_fabricator_general(
     )
 
 
-async def _reconcile_mechanicus_stop_subscriptions(
+async def _reconcile_commander_stop_subscriptions(
     db,
     *,
     source_instance_id: str | None = None,
 ) -> dict:
-    """Ensure active Mechanicus stack workers deliver Stop notices to FG."""
+    """Ensure persona-commanded workers deliver Stop notices to commanders.
+
+    Generic path: any row with ``commander_type='persona'`` subscribes to the
+    commander's live singleton resolved by persona slug/rank.  Legacy path:
+    Mechanicus chapter-parent rows keep the previous verified-FG behavior so
+    existing FG workers remain unchanged while durable persona commander edges
+    become commander-agnostic.
+    """
     fg = await _find_live_fabricator_general(db)
     counts = {"created": 0, "existing": 0, "skipped": 0}
     skipped: list[dict] = []
     subscriptions: list[dict] = []
-    if not fg or not fg.get("id") or not fg.get("tmux_pane"):
-        return {
-            "success": True,
-            "action": "no_live_fabricator_general",
-            "page": "mechanicus",
-            **counts,
-            "subscriber": None,
-            "subscriptions": [],
-        }
 
     rows = await _with_effective_pane_labels(await _active_hook_instances(db))
     if source_instance_id:
@@ -1466,36 +1538,84 @@ async def _reconcile_mechanicus_stop_subscriptions(
             counts["skipped"] += 1
             skipped.append({"instance_id": target_id, "reason": "missing_target"})
             continue
-        if target_id == fg.get("id") or label in {
-            MECHANICUS_FG_LABEL,
-            MECHANICUS_ORCHESTRATOR_LABEL,
-        }:
-            counts["skipped"] += 1
-            skipped.append({"instance_id": target_id, "pane_label": label, "reason": "persona"})
-            continue
-        if not _is_mechanicus_worker_row(row):
+        commander_type = _normalize_text(row.get("commander_type"))
+        commander: dict | None = None
+        commander_reason = ""
+        commander_details: dict = {}
+
+        if commander_type == "persona":
+            (
+                commander_ok,
+                commander_reason,
+                commander_details,
+                commander,
+            ) = await _resolve_persona_commander_for_stop_subscription(db, row)
+            if not commander_ok or not commander:
+                counts["skipped"] += 1
+                skipped.append(
+                    {
+                        "instance_id": target_id,
+                        "pane_label": label,
+                        "reason": commander_reason,
+                        **commander_details,
+                    }
+                )
+                continue
+        elif _is_mechanicus_worker_row(row):
+            # Legacy compatibility: pre-persona Mechanicus workers used a
+            # volatile chapter parent edge.  Keep the old verified-FG constraint
+            # for those rows; generic commander fanout is intentionally provided
+            # by durable persona commander edges.
+            if not fg or not fg.get("id") or not fg.get("tmux_pane"):
+                counts["skipped"] += 1
+                skipped.append(
+                    {
+                        "instance_id": target_id,
+                        "pane_label": label,
+                        "reason": "no_live_fabricator_general",
+                    }
+                )
+                continue
+            (
+                commander_ok,
+                commander_reason,
+                commander_details,
+            ) = await _commander_resolves_to_live_fabricator_general(db, row, fg)
+            if not commander_ok:
+                counts["skipped"] += 1
+                skipped.append(
+                    {
+                        "instance_id": target_id,
+                        "pane_label": label,
+                        "reason": commander_reason,
+                        **commander_details,
+                    }
+                )
+                continue
+            commander = fg
+        else:
             counts["skipped"] += 1
             skipped.append(
-                {"instance_id": target_id, "pane_label": label, "reason": "not_mechanicus_worker"}
+                {"instance_id": target_id, "pane_label": label, "reason": "not_persona_commanded"}
             )
             continue
 
-        # Only subscribe VERIFIED true workers commanded by FG. A
-        # mechanicus-labelled pane is NOT proof of parentage; verify the durable
-        # commander edge. Current workers point at FG by persona id; legacy
-        # workers point at a live commander instance id.
-        (
-            commander_ok,
-            commander_reason,
-            commander_details,
-        ) = await _commander_resolves_to_live_fabricator_general(db, row, fg)
-        if not commander_ok:
+        if target_id == commander.get("id"):
+            counts["skipped"] += 1
+            skipped.append(
+                {"instance_id": target_id, "pane_label": label, "reason": "commander_self"}
+            )
+            continue
+
+        subscriber_id = commander.get("id")
+        subscriber_pane = _normalize_text(commander.get("tmux_pane"))
+        if not subscriber_id or not subscriber_pane:
             counts["skipped"] += 1
             skipped.append(
                 {
                     "instance_id": target_id,
                     "pane_label": label,
-                    "reason": commander_reason,
+                    "reason": "commander_not_live",
                     **commander_details,
                 }
             )
@@ -1504,15 +1624,15 @@ async def _reconcile_mechanicus_stop_subscriptions(
         existing_id = await _active_stop_subscription_id(
             db,
             target_instance_id=target_id,
-            subscriber_instance_id=fg.get("id"),
-            subscriber_pane=fg["tmux_pane"],
+            subscriber_instance_id=subscriber_id,
+            subscriber_pane=subscriber_pane,
         )
         sub_id = await _upsert_stop_subscription(
             db,
             target_instance_id=target_id,
             target_pane=target_pane,
-            subscriber_instance_id=fg.get("id"),
-            subscriber_pane=fg["tmux_pane"],
+            subscriber_instance_id=subscriber_id,
+            subscriber_pane=subscriber_pane,
             event="stop",
             delivery="prompt",
         )
@@ -1526,24 +1646,47 @@ async def _reconcile_mechanicus_stop_subscriptions(
                 "target_instance_id": target_id,
                 "target_pane": target_pane,
                 "target_pane_label": label,
-                "subscriber_instance_id": fg.get("id"),
-                "subscriber_pane": fg["tmux_pane"],
+                "subscriber_instance_id": subscriber_id,
+                "subscriber_pane": subscriber_pane,
+                "commander_reason": commander_reason,
             }
         )
 
     return {
         "success": True,
         "action": "reconciled",
-        "page": "mechanicus",
+        "page": "commander",
         **counts,
         "subscriber": {
-            "instance_id": fg.get("id"),
-            "pane": fg.get("tmux_pane"),
-            "pane_label": fg.get("effective_pane_label"),
-        },
+            "instance_id": fg.get("id") if fg else None,
+            "pane": fg.get("tmux_pane") if fg else None,
+            "pane_label": fg.get("effective_pane_label") if fg else None,
+        }
+        if fg
+        else None,
         "subscriptions": subscriptions,
         "skipped_targets": skipped,
     }
+
+
+async def _reconcile_mechanicus_stop_subscriptions(
+    db,
+    *,
+    source_instance_id: str | None = None,
+) -> dict:
+    """Compatibility wrapper for the historical Mechanicus reconcile endpoint."""
+    result = await _reconcile_commander_stop_subscriptions(
+        db, source_instance_id=source_instance_id
+    )
+    result["page"] = "mechanicus"
+    if (
+        not result.get("created")
+        and not result.get("existing")
+        and result.get("skipped_targets")
+        and all(s.get("reason") == "no_live_fabricator_general" for s in result["skipped_targets"])
+    ):
+        result["action"] = "no_live_fabricator_general"
+    return result
 
 
 async def _prune_dangling_stop_subscriptions(
@@ -1633,6 +1776,8 @@ async def _reconcile_mechanicus_on_session_start(db, instance_id: str) -> dict |
     if not current:
         return None
     label = current.get("effective_pane_label")
+    if _normalize_text(current.get("commander_type")) == "persona":
+        return await _reconcile_commander_stop_subscriptions(db, source_instance_id=instance_id)
     if label == MECHANICUS_FG_LABEL:
         return await _reconcile_mechanicus_stop_subscriptions(db)
     if _is_mechanicus_worker_row(current):
@@ -3243,6 +3388,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "session_doc_id": updated_inst["session_doc_id"] if updated_inst else None,
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
+                    "commander_stop_subscription": mechanicus_subscription,
                 }
             else:
                 # Normal re-registration / Codex resume. Refresh transport fields so
@@ -3395,6 +3541,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "instance_id": session_id,
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
+                    "commander_stop_subscription": mechanicus_subscription,
                 }
 
         if supplant_id:
@@ -3657,6 +3804,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "session_doc_id": session_doc_id,
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
+                    "commander_stop_subscription": mechanicus_subscription,
                 }
 
         # --- Normal registration (no supplant) ---
@@ -4157,6 +4305,7 @@ async def handle_session_start(payload: dict) -> dict:
         "session_doc_id": session_doc_id,
         "stop_subscription": auto_subscription,
         "mechanicus_stop_subscription": mechanicus_subscription,
+        "commander_stop_subscription": mechanicus_subscription,
     }
 
 
@@ -5448,23 +5597,32 @@ async def handle_stop(payload: dict) -> dict:
     # missed SessionStart subscription creation. A Stop hook still has the
     # watched row and live @INSTANCE_ID pane, so reconcile the single Mechanicus
     # worker just-in-time and then deliver through the normal subscription path.
-    mechanicus_stop_reconcile = None
-    mechanicus_probe = {
+    commander_stop_reconcile = None
+    commander_probe = {
         **instance,
         "effective_pane_label": instance.get("pane_label"),
     }
-    if _is_mechanicus_worker_row(mechanicus_probe):
+    if _normalize_text(commander_probe.get("commander_type")) == "persona":
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            mechanicus_stop_reconcile = await _reconcile_mechanicus_stop_subscriptions(
+            commander_stop_reconcile = await _reconcile_commander_stop_subscriptions(
                 db, source_instance_id=session_id
             )
-            if mechanicus_stop_reconcile and (
-                mechanicus_stop_reconcile.get("created")
-                or mechanicus_stop_reconcile.get("existing")
+            if commander_stop_reconcile and (
+                commander_stop_reconcile.get("created") or commander_stop_reconcile.get("existing")
             ):
                 await db.commit()
-    if mechanicus_stop_reconcile:
-        result["mechanicus_stop_reconcile"] = mechanicus_stop_reconcile
+    elif _is_mechanicus_worker_row(commander_probe):
+        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+            commander_stop_reconcile = await _reconcile_mechanicus_stop_subscriptions(
+                db, source_instance_id=session_id
+            )
+            if commander_stop_reconcile and (
+                commander_stop_reconcile.get("created") or commander_stop_reconcile.get("existing")
+            ):
+                await db.commit()
+    if commander_stop_reconcile:
+        result["commander_stop_reconcile"] = commander_stop_reconcile
+        result["mechanicus_stop_reconcile"] = commander_stop_reconcile
 
     live_stop_deliveries = await _fanout_stop_subscriptions(instance, payload, tts_text)
     if live_stop_deliveries:
