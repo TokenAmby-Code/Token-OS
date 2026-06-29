@@ -900,10 +900,19 @@ async def test_golden_throne_startup_recovery_restores_recent_quiet_rows(app_env
     now = datetime.now()
     conn = sqlite3.connect(app_env.db_path)
     conn.executemany(
+        "INSERT INTO session_documents (id, file_path, status) VALUES (?, ?, 'active')",
+        [
+            (9101, "/tmp/gt-recent.md"),
+            (9102, "/tmp/gt-idle.md"),
+            (9103, "/tmp/gt-stale.md"),
+        ],
+    )
+    conn.executemany(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, zealotry, stopped_at, last_activity, gt_last_resume_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, engine, zealotry, stopped_at, last_activity, gt_last_resume_at,
+            session_doc_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 "gt-recent",
@@ -919,6 +928,7 @@ async def test_golden_throne_startup_recovery_restores_recent_quiet_rows(app_env
                 (now - timedelta(minutes=5)).isoformat(),
                 (now - timedelta(minutes=5)).isoformat(),
                 None,
+                9101,
             ),
             (
                 "gt-idle",
@@ -934,6 +944,7 @@ async def test_golden_throne_startup_recovery_restores_recent_quiet_rows(app_env
                 None,
                 (now - timedelta(minutes=3)).isoformat(),
                 None,
+                9102,
             ),
             (
                 "gt-stale",
@@ -949,6 +960,7 @@ async def test_golden_throne_startup_recovery_restores_recent_quiet_rows(app_env
                 (now - timedelta(minutes=45)).isoformat(),
                 (now - timedelta(minutes=45)).isoformat(),
                 None,
+                9103,
             ),
         ],
     )
@@ -964,6 +976,48 @@ async def test_golden_throne_startup_recovery_restores_recent_quiet_rows(app_env
         ("gt-recent", "startup-recover-quiet"),
     ]
     assert [item["instance_id"] for item in recovered] == ["gt-idle", "gt-recent"]
+
+
+@pytest.mark.asyncio
+async def test_golden_throne_startup_recovery_ignores_no_doc_rows(app_env, monkeypatch):
+    scheduled = []
+
+    async def fake_schedule(instance, reason="stop_hook"):
+        scheduled.append((instance["id"], reason))
+        return {"scheduled": True, "reason": reason}
+
+    monkeypatch.setattr(app_env.main, "schedule_golden_throne_followup", fake_schedule)
+    now = datetime.now()
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO legacy_instances
+           (id, session_id, tab_name, working_dir, origin_type, device_id, status,
+            instance_type, engine, zealotry, stopped_at, last_activity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "gt-no-doc",
+            "gt-no-doc",
+            "GT No Doc",
+            "/tmp",
+            "local",
+            "Mac-Mini",
+            "stopped",
+            "golden_throne",
+            "codex",
+            10,
+            (now - timedelta(minutes=5)).isoformat(),
+            (now - timedelta(minutes=5)).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    recovered = await app_env.main.recover_recent_stopped_golden_throne_timers(
+        lookback_minutes=30,
+    )
+
+    assert scheduled == []
+    assert recovered == []
 
 
 @pytest.mark.asyncio
@@ -991,10 +1045,14 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
     now = datetime.now()
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
+        "INSERT INTO session_documents (id, file_path, status) VALUES (?, ?, 'active')",
+        (9104, "/tmp/gt-stopped-shell.md"),
+    )
+    conn.execute(
         """INSERT INTO legacy_instances
            (id, session_id, tab_name, working_dir, origin_type, device_id, status,
-            instance_type, engine, zealotry, stopped_at, last_activity)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            instance_type, engine, zealotry, stopped_at, last_activity, session_doc_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             "gt-stopped-shell",
             "gt-stopped-shell",
@@ -1008,6 +1066,7 @@ async def test_golden_throne_startup_recovery_skips_stopped_shell_pane(app_env, 
             10,
             (now - timedelta(minutes=5)).isoformat(),
             (now - timedelta(minutes=5)).isoformat(),
+            9104,
         ),
     )
     conn.commit()

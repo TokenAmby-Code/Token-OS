@@ -427,6 +427,49 @@ async def test_local_fire_targets_live_resolved_pane_not_stored_column(gt_env, m
 
 
 @pytest.mark.asyncio
+async def test_local_dispatch_failure_marks_quiet_edge_handled(gt_env, monkeypatch):
+    """A failed GT send must consume the quiet edge, not become a recovery loop."""
+    main = gt_env.main
+    rec = _Recorder(main, monkeypatch)
+
+    async def _resolved(_instance_id):
+        return ("%77", "palace:N")
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolved)
+
+    async def _alive(*a, **k):
+        return True
+
+    monkeypatch.setattr(main, "_tmux_pane_has_agent_process", _alive)
+
+    async def _failed(*a, **k):
+        return [{"status": "failed", "returncode": 1, "stdout": "", "stderr": "send failed"}]
+
+    monkeypatch.setattr(main, "process_pane_write_queue_once", _failed)
+
+    async def _pane_exists(_pane):
+        return True
+
+    monkeypatch.setattr(main, "_tmux_pane_exists", _pane_exists)
+
+    iid = _insert(gt_env.db_path, device_id=main.LOCAL_DEVICE_NAME, doc_path=None)
+
+    await main.golden_throne_followup(iid)
+
+    assert rec.resumes == []
+    assert rec.notifies == []
+    conn = sqlite3.connect(gt_env.db_path)
+    row = conn.execute(
+        "SELECT status, stopped_at, gt_last_resume_at FROM instances WHERE id = ?",
+        (iid,),
+    ).fetchone()
+    conn.close()
+    assert row[0] == "stopped"
+    assert row[1] is not None
+    assert row[2] == row[1]
+
+
+@pytest.mark.asyncio
 async def test_local_live_agent_receives_skill_invocation_for_missing_condition(
     gt_env, monkeypatch
 ):

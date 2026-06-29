@@ -4070,6 +4070,12 @@ GOLDEN_THRONE_QUIET_HOURS_BUFFER = timedelta(minutes=5)
 GOLDEN_THRONE_SWEEP_INTERVAL_SECONDS = int(
     os.environ.get("TOKEN_API_GT_SWEEP_INTERVAL_SECONDS", "120")
 )
+GT_RECOVERY_SCHEDULE_REASONS = {
+    "startup-recover-quiet",
+    "clear-dead-tmux-pane",
+    "clear-stale-processing",
+    "reconciler-dead-pane",
+}
 
 EXPECTED_ACK_PENDING = "pending"
 EXPECTED_ACK_TERMINAL_STATUSES = {
@@ -4256,6 +4262,49 @@ async def _golden_throne_recovery_blocked_by_stale_pane(instance: dict) -> str |
     if await _tmux_pane_has_agent_process(tmux_pane, engine):
         return None
     return "stale_reused_or_empty_pane"
+
+
+def _golden_throne_recovery_reason(reason: str | None) -> bool:
+    return (reason or "") in GT_RECOVERY_SCHEDULE_REASONS
+
+
+async def _golden_throne_mark_quiet_edge_handled(
+    instance_id: str,
+    *,
+    actor: str,
+    mutation_type: str = "instance_stopped",
+    extra_updates: dict | None = None,
+) -> str:
+    """Mark a failed/invalid GT wake edge consumed so recovery cannot loop it.
+
+    Golden Throne's durable truth lives in SQLite; APScheduler jobs are
+    best-effort runtime state. If a recovery/dead-pane wake has no valid
+    target, logging the failure is not enough: the periodic recovery sweep will
+    otherwise rediscover the same quiet edge and re-arm it forever. Stamp
+    ``gt_last_resume_at`` at the same time as ``stopped_at`` so the recovery
+    predicate treats this quiet edge as handled until real activity creates a
+    newer edge.
+    """
+    now = datetime.now().isoformat()
+    updates = {
+        "status": "stopped",
+        "input_lock": None,
+        "stopped_at": now,
+        "gt_last_resume_at": now,
+    }
+    if extra_updates:
+        updates.update(extra_updates)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await sanctioned_update_instance(
+            db,
+            instance_id=instance_id,
+            updates=updates,
+            mutation_type=mutation_type,
+            write_source="golden_throne",
+            actor=actor,
+        )
+        await db.commit()
+    return now
 
 
 def _quiet_hour_datetime(local_now: datetime, hour_float: float) -> datetime:
@@ -5079,6 +5128,30 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
 
     status, doc_meta = await _read_instance_session_doc_rubric(instance)
     rubric_state = _golden_throne_rubric_state(status)
+    if _golden_throne_recovery_reason(reason) and not doc_meta.get("doc_id"):
+        try:
+            scheduler.remove_job(f"golden-throne-{instance_id}")
+        except Exception:
+            pass
+        await _gt_clear_fire(instance_id)
+        try:
+            await _golden_throne_mark_quiet_edge_handled(
+                instance_id,
+                actor="golden-throne-no-doc-recovery",
+                mutation_type="instance_stopped",
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Golden Throne: failed to mark no-doc recovery handled for "
+                f"{instance_id[:12]}: {exc}"
+            )
+        await log_event(
+            "golden_throne_recovery_suppressed_no_session_doc",
+            instance_id=instance_id,
+            details={"reason": reason, "status": instance.get("status")},
+        )
+        return {"scheduled": False, "reason": "no_session_doc_for_recovery"}
+
     if rubric_state == "acknowledged" or doc_meta.get("doc_status") == "archived":
         try:
             scheduler.remove_job(f"golden-throne-{instance_id}")
@@ -5171,6 +5244,7 @@ async def recover_recent_stopped_golden_throne_timers(
               AND ci.rank != 'retired'
               AND ci.golden_throne IS NOT NULL
               AND ci.golden_throne != 'sync'
+              AND ci.session_doc_id IS NOT NULL
               AND COALESCE(ci.zealotry, 4) >= 4
               AND (sd.status IS NULL OR sd.status != 'archived')
               AND COALESCE(ci.stopped_at, ci.last_activity) IS NOT NULL
@@ -8814,6 +8888,23 @@ async def golden_throne_followup(session_id: str):
         return
     if not dispatch_ok:
         await _log_golden_throne_dispatch_failed(session_id, dispatch_details)
+        try:
+            handled_at = await _golden_throne_mark_quiet_edge_handled(
+                session_id,
+                actor="golden-throne-dispatch-failed",
+                mutation_type="instance_stopped",
+            )
+            dispatch_details["quiet_edge_handled_at"] = handled_at
+            await log_event(
+                "golden_throne_dispatch_failed_quiet_edge_handled",
+                instance_id=session_id,
+                details=dispatch_details,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Golden Throne: failed to mark dispatch failure handled for "
+                f"{session_id[:12]}: {exc}"
+            )
         return
 
     resume_state = await record_golden_throne_resume(instance)
