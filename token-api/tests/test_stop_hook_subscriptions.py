@@ -538,7 +538,7 @@ def test_stop_self_reconciles_and_notifies_persona_commanded_fg_worker(app_env, 
     assert row == ("worker-stop-persona", "fg-stop-persona", "%64", "active")
 
 
-def test_stop_self_reconciles_and_notifies_non_fg_persona_commander(app_env, monkeypatch):
+def test_stop_self_reconciles_and_notifies_non_fg_persona_commander(app_env, monkeypatch) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(
         app_env.db_path,
