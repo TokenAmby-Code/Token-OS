@@ -154,6 +154,13 @@ def test_missing_tombstone_target_errors_clearly():
         resolve_pane_in_snapshot(workspace, "palace:S")
 
 
+def test_tombstone_without_target_errors_clearly():
+    workspace = _workspace(_pane("%1", "palace:S", kind=PaneKind.TOMBSTONE, target=""))
+
+    with pytest.raises(ValueError, match="missing @TOMBSTONE_TARGET"):
+        resolve_pane_in_snapshot(workspace, "palace:S")
+
+
 def test_tombstone_cycle_errors_clearly():
     workspace = _workspace(
         _pane("%1", "palace:S", kind=PaneKind.TOMBSTONE, target="palace:N"),

@@ -72,3 +72,28 @@ def test_numeric_se_resolves_to_somnium_se():
 def test_deprecated_public_aliases_rejected(target: str):
     with pytest.raises(ValueError, match="pane target not found"):
         resolve_pane_in_snapshot(workspace(), target)
+
+
+def test_duplicate_public_roles_resolve_first_writer_wins():
+    snapshot = WorkspaceSnapshot(
+        session_name="main",
+        windows=(
+            WindowSnapshot(
+                session_name="main",
+                window_index=2,
+                window_name="somnium",
+                archetype=WindowArchetype.SOMNIUM,
+                focused=False,
+                grid_expanded="",
+                grid_stash="",
+                side_expanded="",
+                panes=(
+                    pane("%31", "somnium:NE"),
+                    pane("%32", "somnium:NE"),
+                ),
+            ),
+        ),
+    )
+
+    assert resolve_pane_in_snapshot(snapshot, "somnium:NE").pane_id == "%31"
+    assert resolve_pane_in_snapshot(snapshot, "2:NE").pane_id == "%31"
