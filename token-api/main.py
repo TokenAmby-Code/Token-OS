@@ -10019,16 +10019,31 @@ async def _resolve_administratum_instance() -> dict | None:
     }
 
 
+ADMINISTRATUM_LOG_REL_DIR = Path("Ultramar") / "Logs" / "Mars"
+
+
+def _administratum_vault_root() -> Path:
+    """Return the vault root for the deterministic Administratum state-hook log.
+
+    Tests set IMPERIUM_ENV to a temp vault; production falls back to the legacy
+    module-level OBSIDIAN_VAULT_PATH rooted at /Volumes/Imperium/Imperium-ENV.
+    """
+    env_root = os.environ.get("IMPERIUM_ENV")
+    return Path(env_root) if env_root else OBSIDIAN_VAULT_PATH
+
+
 def _administratum_log_path(instance: dict | None) -> Path:
-    """Canonical Administratum record-keeping log for today."""
-    if instance and instance.get("dispatch_session_doc_path"):
-        return Path(instance["dispatch_session_doc_path"])
+    """Canonical Administratum record-keeping log for today.
+
+    The deterministic state-hook stream is a daily dispatcher-written log, not an
+    instance/session document. Do not redirect it through dispatch_session_doc_path.
+    """
     date = datetime.now().strftime("%Y-%m-%d")
-    return OBSIDIAN_VAULT_PATH / "Mars" / "Logs" / f"administratum-{date}.md"
+    return _administratum_vault_root() / ADMINISTRATUM_LOG_REL_DIR / f"administratum-{date}.md"
 
 
 async def _append_administratum_log(
-    instance: dict,
+    instance: dict | None,
     *,
     classification: str,
     event: StateEvent,
@@ -10042,33 +10057,50 @@ async def _append_administratum_log(
     """
     path = _administratum_log_path(instance)
     stamp = datetime.now().strftime("%H:%M:%S")
-    line = (
-        f"- `{stamp}` **{classification}** `{intervention.event_type}` "
-        f"sev={intervention.severity} src=`{event.source}` — "
-        f"observed: {intervention.observed} "
-        f"(dedupe `{intervention.dedupe_key}`)\n"
+    entry_identity = (
+        f"**{classification}** `{intervention.event_type}` "
+        f"sev={intervention.severity} src=`{event.source}`"
     )
+    dedupe_identity = f"(dedupe `{intervention.dedupe_key}`)"
+    line = f"- `{stamp}` {entry_identity} — observed: {intervention.observed} {dedupe_identity}\n"
+
+    def _header(date: str) -> str:
+        return (
+            f"---\ntitle: Administratum {date}\ntype: log/administratum\n---\n\n"
+            f"# Administratum — {date}\n\n"
+            "Deterministic state-hook record (written by the dispatcher; "
+            "Administratum reads).\n\n## State-hook stream\n\n"
+        )
 
     def _write():
         path.parent.mkdir(parents=True, exist_ok=True)
-        header = ""
-        if not path.exists():
-            date = datetime.now().strftime("%Y-%m-%d")
-            header = (
-                f"---\ntitle: Administratum {date}\ntype: log/administratum\n---\n\n"
-                f"# Administratum — {date}\n\n"
-                "Deterministic state-hook record (written by the dispatcher; "
-                "Administratum reads).\n\n## State-hook stream\n\n"
+        date = datetime.now().strftime("%Y-%m-%d")
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        frontmatter_blocks = existing.count("---\n")
+        if existing and frontmatter_blocks != 2:
+            raise RuntimeError(
+                f"malformed Administratum log frontmatter at {path}: "
+                f"expected 1 block, found {frontmatter_blocks // 2}"
             )
+        if entry_identity in existing and dedupe_identity in existing:
+            logger.info(
+                "Administratum record: duplicate append suppressed for %s:%s",
+                classification,
+                intervention.dedupe_key,
+            )
+            return
+        prefix = _header(date) if not existing else ""
         with open(path, "a", encoding="utf-8") as fh:
-            if header:
-                fh.write(header)
+            if prefix:
+                fh.write(prefix)
             fh.write(line)
 
     try:
         await asyncio.to_thread(_write)
     except Exception as exc:
-        logger.warning(f"Administratum record: log append failed: {exc}")
+        message = f"Administratum record: log append failed for {path}: {exc}"
+        logger.exception(message)
+        raise RuntimeError(message) from exc
 
 
 async def _dispatch_administratum_record(
