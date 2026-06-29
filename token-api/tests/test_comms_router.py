@@ -253,6 +253,45 @@ def test_phone_direct_tts_only_occurs_inside_the_router(monkeypatch):
     assert result.get("route") == "phone"
 
 
+def test_phone_tts_targets_speak_endpoint_with_playback_id(monkeypatch: Any) -> None:
+    """The phone utterance MUST go to the device's ``/speak`` macro, not ``/notify``.
+
+    The phone exposes a single keystone TTS atom at
+    ``GET /speak?tts_text=…&playback_id=…`` (m_waitToFinish:true) that fast-acks,
+    speaks locally, then POSTs ``/api/tts/playback-complete`` at true speech end.
+    The phone exposes NO ``/notify`` HTTP macro, so a ``/notify`` send never
+    triggers speech and every line would silently fall to the watchdog. This guard
+    pins the endpoint + the per-utterance opaque ``playback_id`` so the serialization
+    handshake can never be re-pointed at a dead path.
+    """
+    tts = _load("routes.tts")
+    sent = []
+
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.05)
+
+    def fake_send_to_phone(endpoint, params):
+        sent.append((endpoint, dict(params or {})))
+        return {"success": True}
+
+    monkeypatch.setattr(tts, "_send_to_phone", fake_send_to_phone)
+    monkeypatch.setattr(
+        tts,
+        "resolve_tts_device",
+        lambda **kw: {"device": "phone", "reason": "geofence: gym", "discord_bot": None},
+    )
+
+    result = tts.speak_tts("contract line")
+
+    speak_calls = [(e, p) for e, p in sent if e == "/speak"]
+    assert speak_calls, f"expected a /speak send, got endpoints {[e for e, _ in sent]}"
+    assert not any(e == "/notify" for e, _ in sent), "TTS must not use the dead /notify path"
+    endpoint, params = speak_calls[0]
+    assert params.get("tts_text") == "contract line"
+    pid = params.get("playback_id")
+    assert isinstance(pid, str) and pid, "a per-utterance opaque playback_id is required"
+    assert result.get("route") == "phone"
+
+
 def test_discord_fallthrough_respects_geofence_phone_only(monkeypatch: Any) -> None:
     """If Discord VC fails while geofenced away, fallback is phone-only.
 
