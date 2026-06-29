@@ -361,14 +361,20 @@ def get_phone_audio_proxy_health() -> dict:
 
 
 def _phone_tts_available() -> bool:
-    """Phone TTS is a real playback target only with a live audio-proxy receiver."""
-    return _send_to_phone is not None and bool(get_phone_audio_proxy_health().get("available"))
+    """Phone TTS is reachable when the MacroDroid HTTP server is up.
+
+    The /speak transport speaks locally on the device and proves delivery via the
+    playback-complete callback (watchdog-capped), so availability gates on coarse
+    MacroDroid reachability — NOT the audio-proxy receiver heartbeat (#423), which
+    governs a different transport and is surfaced only as a diagnostic.
+    """
+    return _send_to_phone is not None and is_phone_reachable()
 
 
 def _phone_tts_unavailable_reason() -> str:
     if _send_to_phone is None:
         return "phone_transport_unavailable"
-    return get_phone_audio_proxy_health().get("reason") or "phone_audio_proxy_unavailable"
+    return "phone_macrodroid_unreachable"
 
 
 def _no_playback_backend(reason: str = "no_playback_backend") -> dict:
@@ -617,14 +623,19 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
             "discord_bot": discord_bot,
         }
 
-    # 2. Phone — first-contact for all TTS, regardless of geofence zone. This
-    # is NOT the coarse MacroDroid HTTP reachability flag; it is receiver-level
-    # audio-proxy health (phone_connected + receiver_pid + fresh heartbeat).
+    # 2. Phone — first-contact for all TTS, regardless of geofence zone. The
+    # /speak transport speaks LOCALLY on the device (Android TTS, m_waitToFinish)
+    # and proves delivery via the playback-complete callback (watchdog-capped), so
+    # selection gates on coarse MacroDroid HTTP reachability — NOT the audio-proxy
+    # *receiver* heartbeat (#423), which governed a different (receiver-based)
+    # transport and is surfaced here only as a diagnostic. Emperor decree
+    # 2026-06-28: route to the phone whenever its MacroDroid server is up; a
+    # genuinely unreachable phone fails this probe (or the send) and demotes to Mac.
     phone_health = get_phone_audio_proxy_health()
-    if _send_to_phone is not None and phone_health.get("available"):
+    if _send_to_phone is not None and is_phone_reachable():
         return {
             "device": "phone",
-            "reason": "phone-first: audio proxy live",
+            "reason": "phone-first: MacroDroid reachable (/speak + playback-complete)",
             "discord_bot": None,
             "phone_audio_proxy": phone_health,
         }
