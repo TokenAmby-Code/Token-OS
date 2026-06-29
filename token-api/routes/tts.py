@@ -701,13 +701,20 @@ def speak_tts(
     def _send_phone_tts() -> dict:
         """Send spoken text to the phone and BLOCK until real audio-finish.
 
-        Phone can be the selected device or a Discord fallthrough. Accept is not
-        delivery: the device echoes a ``playback_id`` to
-        ``POST /api/tts/playback-complete`` when it finishes speaking, which sets
-        the Event we block on here. ``speak_tts`` runs in ``run_in_executor`` (a
-        thread), so a ``threading.Event`` is the correct primitive — it parks the
-        worker thread, never the event loop. The watchdog is a logged safety cap
-        for a *missed* callback, not a duration estimate. Always pop the id.
+        Phone can be the selected device or a Discord fallthrough. The device's
+        ``GET /speak?tts_text=…&playback_id=…`` macro (the "Notify : Speak"
+        keystone TTS atom) speaks LOCALLY with ``m_waitToFinish:true`` and returns
+        only a FAST ACK — accept is not delivery. The device echoes the
+        ``playback_id`` to ``POST /api/tts/playback-complete`` at true speech end,
+        which sets the Event we block on here. ``speak_tts`` runs in
+        ``run_in_executor`` (a thread), so a ``threading.Event`` is the correct
+        primitive — it parks the worker thread, never the event loop. The watchdog
+        is a logged safety cap for a *missed* callback, not a duration estimate.
+        Always pop the id.
+
+        NB: the utterance goes to ``/speak``, NOT ``/notify`` — the phone exposes
+        no ``/notify`` HTTP macro, so a ``/notify`` send never triggers speech and
+        every line would fall to the watchdog.
         """
         if _send_to_phone is None:
             return _no_playback_backend("phone_transport_unavailable")
@@ -717,7 +724,7 @@ def speak_tts(
         try:
             try:
                 result = dict(
-                    _send_to_phone("/notify", {"tts_text": message, "playback_id": playback_id})
+                    _send_to_phone("/speak", {"tts_text": message, "playback_id": playback_id})
                     or {}
                 )
             except Exception as exc:
@@ -2409,8 +2416,8 @@ async def play_pane(request: PlayPaneRequest) -> dict:
 async def tts_playback_complete(request: PlaybackCompleteRequest) -> dict:
     """Phone audio-finish callback — the real serialization signal.
 
-    The device POSTs the ``playback_id`` it was handed (in the ``/notify``
-    ``tts_text`` payload) once it has finished speaking that line. We set the
+    The device POSTs the ``playback_id`` it was handed (in the ``/speak``
+    ``tts_text`` query) once it has finished speaking that line. We set the
     matching Event so the blocked worker thread advances to the next queued item.
     No server-side duration estimation: the phone alone decides when "done."
 
