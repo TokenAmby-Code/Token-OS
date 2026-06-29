@@ -538,6 +538,74 @@ def test_stop_self_reconciles_and_notifies_persona_commanded_fg_worker(app_env, 
     assert row == ("worker-stop-persona", "fg-stop-persona", "%64", "active")
 
 
+def test_stop_self_reconciles_and_notifies_non_fg_persona_commander(app_env, monkeypatch) -> None:
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(
+        app_env.db_path,
+        "custodes-stop-persona",
+        pane="%66",
+        pane_label="council:custodes",
+    )
+    custodes_persona = _set_persona(app_env.db_path, "custodes-stop-persona", "custodes")
+
+    # Same-persona chapter children can be more recent/live, but the singleton
+    # resolver must ignore them (commander_type != 'chapter') and pick the
+    # commander singleton above.
+    _insert_instance(
+        app_env.db_path,
+        "custodes-chapter-child",
+        pane="%67",
+        parent="custodes-stop-persona",
+        pane_label="council:custodes",
+    )
+    _set_persona(app_env.db_path, "custodes-chapter-child", "custodes")
+
+    _insert_instance(
+        app_env.db_path,
+        "worker-stop-non-fg-persona",
+        pane="%68",
+        pane_label="one-off:worker",
+    )
+    _set_commander(app_env.db_path, "worker-stop-non-fg-persona", "persona", custodes_persona)
+    sent = []
+
+    async def fake_write(pane, payload):
+        sent.append((pane, payload))
+        return {"status": "sent", "operation": "fake"}
+
+    monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
+    tail = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "NON_FG_PERSONA_STOP_NOTIFY_OK"}],
+            },
+        },
+        separators=(",", ":"),
+    )
+
+    async def run() -> None:
+        result = await hooks.handle_stop(
+            {"session_id": "worker-stop-non-fg-persona", "transcript_tail": tail}
+        )
+        assert result["commander_stop_reconcile"]["created"] == 1
+        assert result["stop_subscriptions"][0]["status"] == "sent"
+
+    asyncio.run(run())
+
+    assert len(sent) == 1
+    assert sent[0][0] == "%66"
+    assert "NON_FG_PERSONA_STOP_NOTIFY_OK" in sent[0][1]
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        """SELECT target_instance_id, subscriber_instance_id, subscriber_pane, status
+           FROM stop_hook_subscriptions"""
+    ).fetchone()
+    conn.close()
+    assert row == ("worker-stop-non-fg-persona", "custodes-stop-persona", "%66", "active")
+
+
 def test_mechanicus_worker_start_without_fg_does_not_create_subscription(app_env):
     hooks = sys.modules["routes.hooks"]
     # Worker registers inside handle_session_start; seed its stamped pane/role so
