@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Diagnostic/reporting wrapper for live-derived worktree dev-port allocation.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/worktree-ports.sh
+source "$SCRIPT_DIR/../lib/worktree-ports.sh"
+
+usage() {
+    cat <<'USAGE'
+usage: worktree-ports [list|lookup <worktree-dir>|prune]
+
+Reports live-derived worktree dev-port ownership. The legacy
+~/.local/state/imperium/worktree-ports.json file is ignored as an allocation
+source; owners come from live Token-API instance rows, short-lived setup leases,
+and OS listeners.
+USAGE
+}
+
+cmd="${1:-list}"
+case "$cmd" in
+    list)
+        list_ports
+        ;;
+    lookup)
+        shift
+        [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+        lookup_port "$1"
+        ;;
+    prune)
+        prune_ports
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
