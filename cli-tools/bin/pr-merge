@@ -402,7 +402,7 @@ if [[ "$IN_WORKTREE" == "true" ]]; then
 
     # Delete local branch
     info "Deleting local branch: ${BRANCH_NAME}"
-    git branch -d "$BRANCH_NAME" 2>/dev/null || {
+    git branch -D "$BRANCH_NAME" 2>/dev/null || {
         warn "Could not delete branch ${BRANCH_NAME} (may already be deleted)"
     }
 else
@@ -434,7 +434,9 @@ echo ""
 #   - bare repo / no main work tree: fast-forward the local `main` ref only,
 #     without a checkout, tolerating refusal.
 #   - real `main` working tree: guarded `--ff-only` pull.
-MAIN_BRANCH=$(git symbolic-ref "refs/remotes/${GIT_GITHUB_REMOTE}/HEAD" 2>/dev/null | sed "s@^refs/remotes/${GIT_GITHUB_REMOTE}/@@")
+MAIN_BRANCH_REF="$(git symbolic-ref "refs/remotes/${GIT_GITHUB_REMOTE}/HEAD" 2>/dev/null || true)"
+MAIN_BRANCH="${MAIN_BRANCH_REF#refs/remotes/${GIT_GITHUB_REMOTE}/}"
+[[ "$MAIN_BRANCH" == "$MAIN_BRANCH_REF" ]] && MAIN_BRANCH=""
 [[ -z "$MAIN_BRANCH" ]] && MAIN_BRANCH="main"
 log "${PULL} Updating ${MAIN_BRANCH}..."
 
