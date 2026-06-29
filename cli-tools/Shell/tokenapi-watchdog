@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# tokenapi-watchdog - out-of-band liveness monitor for Token-API.
+# Reads the heartbeat file mtime written by token_api_heartbeat_worker.
+# On stale heartbeat, kickstarts the launchd service. On the first healthy tick
+# after a stale/down state, drains the durable hook->Token-API retry outbox once.
+# No blind queue poll: drain is recovery-edge triggered only.
+
+set -u
+
+HEARTBEAT_FILE="${TOKEN_API_HEARTBEAT_FILE:-$HOME/.claude/token-api-heartbeat.json}"
+COOLDOWN_FILE="${TOKEN_API_WATCHDOG_COOLDOWN_FILE:-$HOME/.claude/tokenapi-watchdog.last-restart}"
+STATE_FILE="${TOKEN_API_WATCHDOG_STATE_FILE:-$HOME/.claude/tokenapi-watchdog.state}"
+LOG_FILE="${TOKEN_API_WATCHDOG_LOG:-$HOME/.claude/tokenapi-watchdog.log}"
+SERVICE_LABEL="${TOKEN_API_SERVICE_LABEL:-ai.openclaw.tokenapi}"
+PORT="${TOKEN_API_PORT:-7777}"
+QUEUE_BIN="${GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX_BIN:-generic-token-api-durable-retry-outbox}"
+
+STALE_THRESHOLD="${TOKEN_API_STALE_THRESHOLD:-180}"
+COOLDOWN="${TOKEN_API_RESTART_COOLDOWN:-300}"
+ESCALATE_THRESHOLD="${TOKEN_API_ESCALATE_THRESHOLD:-600}"
+
+now_epoch() { date +%s; }
+
+log() {
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+notify_discord() {
+  local msg="$1"
+  if [[ -n "${DISCORD_FALLBACK_WEBHOOK:-}" ]]; then
+    curl -fsS -m 5 -X POST -H 'Content-Type: application/json' \
+      -d "{\"content\": $(printf '%s' "$msg" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}" \
+      "$DISCORD_FALLBACK_WEBHOOK" >/dev/null 2>&1 || true
+  fi
+}
+
+mark_state() {
+  mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+  printf '%s\n' "$1" > "$STATE_FILE" 2>/dev/null || true
+}
+
+read_state() {
+  [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" 2>/dev/null || printf 'unknown\n'
+}
+
+heartbeat_age() {
+  if [[ ! -f "$HEARTBEAT_FILE" ]]; then
+    printf '99999\n'
+    return 0
+  fi
+  local mtime
+  mtime=$(stat -f %m "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
+  printf '%s\n' "$(( $(now_epoch) - mtime ))"
+}
+
+drain_hook_queue() {
+  command -v "$QUEUE_BIN" >/dev/null 2>&1 || [[ -x "$QUEUE_BIN" ]] || {
+    log "recovery detected but outbox drainer not found: $QUEUE_BIN"
+    return 0
+  }
+  local out rc
+  out=$("$QUEUE_BIN" drain --limit "${GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX_DRAIN_LIMIT:-100}" 2>&1); rc=$?
+  log "recovery drain rc=$rc result=${out}"
+  return 0
+}
+
+age_s=$(heartbeat_age)
+
+# Healthy path. If the previous watchdog state was down/stale, this is the
+# down→up transition: drain queued hook intents once, in serialized order.
+if (( age_s < STALE_THRESHOLD )); then
+  previous_state=$(read_state)
+  if [[ "$previous_state" == "down" ]]; then
+    log "heartbeat recovered age=${age_s}s — draining retry outbox"
+    drain_hook_queue
+  fi
+  mark_state "up"
+  exit 0
+fi
+
+mark_state "down"
+
+if [[ -f "$COOLDOWN_FILE" ]]; then
+  last_restart=$(stat -f %m "$COOLDOWN_FILE" 2>/dev/null || echo 0)
+  since_restart=$(( $(now_epoch) - last_restart ))
+  if (( since_restart < COOLDOWN )); then
+    log "stale age=${age_s}s BUT cooldown active (${since_restart}s < ${COOLDOWN}s) — skipping restart"
+    if (( age_s >= ESCALATE_THRESHOLD )); then
+      log "ESCALATE: age=${age_s}s >= ${ESCALATE_THRESHOLD}s with no restart success"
+      notify_discord "Token-API heartbeat stale ${age_s}s — escalating (restart cooldown active)"
+    fi
+    exit 2
+  fi
+fi
+
+log "stale age=${age_s}s >= ${STALE_THRESHOLD}s — kickstarting $SERVICE_LABEL"
+
+stale_pid=$(lsof -ti:"$PORT" 2>/dev/null | head -n1 || true)
+if [[ -n "$stale_pid" ]]; then
+  log "killing stale PID $stale_pid on port $PORT"
+  kill -9 "$stale_pid" 2>/dev/null || true
+fi
+
+if launchctl kickstart -k "gui/$UID/$SERVICE_LABEL" >/dev/null 2>&1; then
+  log "kickstart OK"
+  touch "$COOLDOWN_FILE"
+  notify_discord "Token-API heartbeat stale ${age_s}s — kickstarted $SERVICE_LABEL"
+  exit 0
+else
+  log "kickstart FAILED"
+  notify_discord "Token-API heartbeat stale ${age_s}s — kickstart FAILED"
+  exit 1
+fi

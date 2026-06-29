@@ -34,6 +34,8 @@ for _nas_lib in \
   fi
 done
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
+OUTBOX_BIN="${SCRIPT_DIR}/../../cli-tools/bin/generic-token-api-durable-retry-outbox"
+[[ -x "$OUTBOX_BIN" ]] || OUTBOX_BIN="${HOME}/runtimes/Token-OS/live/cli-tools/bin/generic-token-api-durable-retry-outbox"
 
 # Walk process tree to inject the claude PID (portable: uses ps)
 CLAUDE_PID=""
@@ -79,10 +81,20 @@ if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
 fi
 
 # Forward to token-api synchronously
-RESPONSE=$(echo "$INPUT" | curl -s --connect-timeout 2 --max-time 5 \
+RESP_FILE="${HOME}/.claude/logs/.stopvalidate-resp.$$"
+HTTP_CODE=$(echo "$INPUT" | curl -s -o "$RESP_FILE" -w '%{http_code}' --connect-timeout 2 --max-time 5 \
   -X POST "${API_URL}/api/hooks/StopValidate" \
   -H "Content-Type: application/json" \
   -d @- 2>/dev/null) || true
+RESPONSE=$(cat "$RESP_FILE" 2>/dev/null || echo "")
+rm -f "$RESP_FILE" 2>/dev/null || true
+
+if [[ "$HTTP_CODE" == "000" && -x "$OUTBOX_BIN" ]]; then
+  printf '%s' "$INPUT" | "$OUTBOX_BIN" enqueue \
+    --action-type "StopValidate" \
+    --url "${API_URL}/api/hooks/StopValidate" \
+    --cause "http-000" >/dev/null 2>&1 || true
+fi
 
 # Pass through block decision if present; exit 0 otherwise (allow on server unreachable)
 if echo "$RESPONSE" | grep -q '"decision"'; then

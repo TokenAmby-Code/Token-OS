@@ -75,13 +75,19 @@ persona_seat_log "launch persona=${PERSONA:-?} engine=${ENGINE} pane=${TMUX_PANE
 
 # --- async, fire-and-forget audit ping (no retry belt on the hot path) ---------
 persona_seat_audit_ping() {
-  local payload
+  local payload http_code
   payload="$(printf '{"persona":"%s","engine":"%s","wrapper_launch_id":"%s","tmux_pane":"%s","launcher":"persona-seat"}' \
     "$PERSONA" "$ENGINE" "$WRAPPER_LAUNCH_ID" "$TMUX_PANE_VALUE")"
-  curl -s -o /dev/null --connect-timeout 1 --max-time 3 \
+  http_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 3 \
     -X POST "${API_URL}/api/hooks/PersonaSeatLaunch" \
-    -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1 \
-    || persona_seat_log "audit-ping-failed persona=${PERSONA:-?} engine=${ENGINE}"
+    -H 'Content-Type: application/json' -d "$payload" 2>/dev/null) || true
+  if [[ "$http_code" == 2* ]]; then
+    return 0
+  fi
+  persona_seat_log "audit-ping-failed persona=${PERSONA:-?} engine=${ENGINE} http=${http_code:-?}"
+  if [[ "$http_code" == "000" ]]; then
+    token_wrapper_enqueue_hook_post "PersonaSeatLaunch" "$payload" "http-000" || true
+  fi
 }
 persona_seat_audit_ping & disown
 

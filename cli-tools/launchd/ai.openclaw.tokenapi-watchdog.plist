@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ai.openclaw.tokenapi-watchdog — out-of-band Token-API heartbeat watchdog.
+  Canonical repo template; deployed script is copied to ~/.local/bin/tokenapi-watchdog.
+  It drains generic-token-api-durable-retry-outbox only on a heartbeat down→up recovery edge.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.openclaw.tokenapi-watchdog</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/tokenclaw/.local/bin/tokenapi-watchdog</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/tokenclaw</string>
+		<key>PATH</key>
+		<string>/Users/tokenclaw/runtimes/Token-OS/live/cli-tools/bin:/Users/tokenclaw/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/tokenclaw/.claude/tokenapi-watchdog-stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/tokenclaw/.claude/tokenapi-watchdog-stderr.log</string>
+</dict>
+</plist>

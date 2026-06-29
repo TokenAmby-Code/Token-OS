@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Compatibility alias for old slug hook-token-api-retry-queue.
+exec "$(cd "$(dirname "$0")" && pwd)/generic-token-api-durable-retry-outbox" "$@"

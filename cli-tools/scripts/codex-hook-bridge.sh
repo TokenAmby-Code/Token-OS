@@ -21,6 +21,7 @@ fi
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 LOG_DIR="${HOME}/.codex/log"
 LOG_FILE="${LOG_DIR}/hook-bridge.log"
+OUTBOX_BIN="${SCRIPT_DIR}/../bin/generic-token-api-durable-retry-outbox"
 TOKEN_API_CODEX_LAUNCHER="${TOKEN_API_LAUNCHER:-codex-hooks}"
 TOKEN_API_CODEX_ENGINE="${TOKEN_API_ENGINE:-codex}"
 RESUME_SCRIPT="${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/agent-session-end-resume.sh"
@@ -187,10 +188,16 @@ fi
 
 (
     exec 0</dev/null 1>/dev/null 2>/dev/null
-    printf '%s' "$HOOK_INPUT" | curl -s --connect-timeout 2 --max-time 5 \
+    http_code=$(printf '%s' "$HOOK_INPUT" | curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
         -X POST "${API_URL}/api/hooks/${ACTION_TYPE}" \
         -H "Content-Type: application/json" \
-        -d @- >/dev/null 2>&1 || true
+        -d @- 2>/dev/null) || true
+    if [[ "$http_code" == "000" && -x "$OUTBOX_BIN" ]]; then
+        printf '%s' "$HOOK_INPUT" | "$OUTBOX_BIN" enqueue \
+            --action-type "$ACTION_TYPE" \
+            --url "${API_URL}/api/hooks/${ACTION_TYPE}" \
+            --cause "http-000" >/dev/null 2>&1 || true
+    fi
 ) &
 disown 2>/dev/null || true
 

@@ -147,6 +147,22 @@ CLAUDE_CMD=$(_resolve_token_os_bin claude-cmd) || true
 PENDING_UI_FLUSH=$(_resolve_token_os_bin pending-ui-flush) || true
 : "${PENDING_UI_FLUSH:=false}"
 
+# Durable cross-restart retry outbox. This is only invoked after an actual
+# Token-API-unreachable POST result (curl http=000 / connection refused class);
+# it is NOT a workaround for pre-POST shell aborts (http=?), which must stay
+# loud under the SessionStart critical trap.
+GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX=$(_resolve_token_os_bin generic-token-api-durable-retry-outbox) || true
+: "${GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX:=false}"
+
+_enqueue_hook_token_api_post() {
+  local action_type="$1" payload="$2" url="$3" cause="${4:-http-000}"
+  [[ "$GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX" != "false" ]] || return 1
+  printf '%s' "$payload" | "$GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX" enqueue \
+    --action-type "$action_type" \
+    --url "$url" \
+    --cause "$cause" >/dev/null 2>&1
+}
+
 # Inject shell environment variables for device detection, primarch identity,
 # and structured dispatch metadata from launcher wrappers.
 if [[ -n "${SSH_CLIENT:-}" || -n "${TMUX:-}" || -n "${TMUX_PANE:-}" || -n "${TOKEN_API_PANE_LABEL:-}" || -n "${TOKEN_API_PERSONA:-}" || -n "${TOKEN_API_LAUNCHER:-}" || -n "${TOKEN_API_ENGINE:-}" || -n "${TOKEN_API_DISPATCH_TARGET:-}" || -n "${TOKEN_API_DISPATCH_WINDOW:-}" || -n "${TOKEN_API_DISPATCH_MODE:-}" || -n "${TOKEN_API_DISPATCH_SLOT:-}" || -n "${TOKEN_API_PARENT_INSTANCE_ID:-}" || -n "${TOKEN_API_DISPATCH_SESSION_DOC_PATH:-}" || -n "${TOKEN_API_TARGET_WORKING_DIR:-}" || -n "${TOKEN_API_LAUNCH_MODE:-}" || -n "${TOKEN_API_TRANSPLANT_EXPECTED:-}" || -n "${TOKEN_API_DISPATCH_RESOLVED_PANE:-}" || -n "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" || -n "${TOKEN_API_INSTANCE_TYPE:-}" || -n "${TOKEN_API_ZEALOTRY:-}" || -n "${TOKEN_API_DISCORD_HOSTED:-}" || -n "${TOKEN_API_DISCORD_CHANNEL:-}" || -n "${TOKEN_API_DISCORD_BOT:-}" || -n "${TOKEN_API_DISPATCH_MCP:-}" || -n "${TOKEN_API_DISPATCH_WITH_BROWSER:-}" || -n "${TOKEN_API_DISPATCH_WITH_DESKTOP:-}" || -n "${TOKEN_API_DISPATCH_MCP_LIST:-}" ]]; then
@@ -347,11 +363,18 @@ fi
 # PreToolUse needs synchronous response for permission decisions
 # All other hooks fire-and-forget in background to never block Claude
 if [[ "$ACTION_TYPE" == "PreToolUse" ]]; then
-  RESPONSE=$(echo "${HOOK_INPUT}" | \
-    curl -s --connect-timeout 2 --max-time 3 \
+  RESP_FILE="${HOME}/.claude/logs/.pretooluse-resp.$$"
+  HTTP_CODE=$(echo "${HOOK_INPUT}" | \
+    curl -s -o "$RESP_FILE" -w '%{http_code}' --connect-timeout 2 --max-time 3 \
       -X POST "${API_URL}/api/hooks/${ACTION_TYPE}" \
       -H "Content-Type: application/json" \
       -d @- 2>/dev/null) || true
+  RESPONSE=$(cat "$RESP_FILE" 2>/dev/null || echo "")
+  rm -f "$RESP_FILE" 2>/dev/null || true
+
+  if [[ "$HTTP_CODE" == "000" ]]; then
+    _enqueue_hook_token_api_post "$ACTION_TYPE" "$HOOK_INPUT" "${API_URL}/api/hooks/${ACTION_TYPE}" "http-000" || true
+  fi
 
   if echo "$RESPONSE" | grep -q '"permissionDecision"'; then
     echo "$RESPONSE"
@@ -406,6 +429,12 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
   REG_SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false' 2>/dev/null || echo false)
   if [[ "$HTTP_CODE" == 2* && "$REG_SUCCESS" == "true" ]]; then
     REGISTRATION_OK=1
+  elif [[ "$HTTP_CODE" == "000" ]] && _enqueue_hook_token_api_post "$ACTION_TYPE" "$HOOK_INPUT" "${API_URL}/api/hooks/${ACTION_TYPE}" "http-000"; then
+    # Durable recovery path accepted: the hook's own SessionStart intent will be
+    # replayed by the recovery-triggered drainer. Treat as non-silent (not a
+    # confirmed row yet, but not lost) and leave a visible queue log entry.
+    REGISTRATION_OK=1
+    echo "token-api SessionStart registration queued for replay: token-api unreachable (http=000)" >&2
   else
     _log_sessionstart_failure "token-api POST ${API_URL}/api/hooks/SessionStart did not confirm a bound row"
   fi
@@ -425,11 +454,14 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
 else
   (
     exec 0</dev/null 1>/dev/null 2>/dev/null
-    echo "${HOOK_INPUT}" | \
-      curl -s --connect-timeout 2 --max-time 10 \
+    http_code=$(echo "${HOOK_INPUT}" | \
+      curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 10 \
         -X POST "${API_URL}/api/hooks/${ACTION_TYPE}" \
         -H "Content-Type: application/json" \
-        -d @-
+        -d @- 2>/dev/null) || true
+    if [[ "$http_code" == "000" ]]; then
+      _enqueue_hook_token_api_post "$ACTION_TYPE" "$HOOK_INPUT" "${API_URL}/api/hooks/${ACTION_TYPE}" "http-000" || true
+    fi
   ) </dev/null >/dev/null 2>&1 &
   disown 2>/dev/null || true
 fi
