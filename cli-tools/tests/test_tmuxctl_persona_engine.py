@@ -19,6 +19,8 @@ class FakeAdapter:
 
     def run(self, *args, allow_failure: bool = False):
         self.commands.append(tuple(args))
+        if args[:5] == ("display-message", "-t", "%42", "-p", "#{pane_id}"):
+            return "%42"
         if args[:3] == ("display-message", "-p", "#{pane_id}"):
             return "%42"
         if args and args[0] == "show-options":

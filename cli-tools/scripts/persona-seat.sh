@@ -43,6 +43,9 @@ COMMON_LIB="${SCRIPT_DIR}/../lib/agent-wrapper-common.sh"
 NAS_PATH_LIB="${SCRIPT_DIR}/../lib/nas-path.sh"
 # shellcheck source=../lib/nas-path.sh
 [[ -f "$NAS_PATH_LIB" ]] && source "$NAS_PATH_LIB" 2>/dev/null || true
+RUNTIME_CLEANUP_LIB="${SCRIPT_DIR}/../lib/tmux-runtime-cleanup.sh"
+# shellcheck source=../lib/tmux-runtime-cleanup.sh
+[[ -f "$RUNTIME_CLEANUP_LIB" ]] && source "$RUNTIME_CLEANUP_LIB" 2>/dev/null || true
 
 # Minimal lifecycle context the shared compose/warn helpers reference. Defined so
 # any fail-open path inside the common lib (e.g. token_wrapper_warn_missing_system_doc)
@@ -126,6 +129,9 @@ export TOKEN_API_AGENT_WRAPPER_BYPASS=1
 export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
 export TOKEN_API_ENGINE="$ENGINE"
 export TOKEN_API_LAUNCHER="$LAUNCHER"
+if declare -F tmux_runtime_stamp_wrapper >/dev/null 2>&1; then
+  tmux_runtime_stamp_wrapper "$TMUX_PANE_VALUE" "$WRAPPER_LAUNCH_ID" "$ENGINE" "$LAUNCHER" "$WORKING_DIR"
+fi
 
 if [[ "$ENGINE" == "codex" ]]; then
   PREAMBLE=""
