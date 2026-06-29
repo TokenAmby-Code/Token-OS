@@ -9927,7 +9927,7 @@ async def _find_administratum_tmux_pane() -> str | None:
             "list-panes",
             "-a",
             "-F",
-            "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}",
+            "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}\t#{@TOKEN_API_ENGINE}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -9941,18 +9941,27 @@ async def _find_administratum_tmux_pane() -> str | None:
 
     for line in stdout.decode().splitlines():
         try:
-            pane_id, pane_marker, current_cmd = line.split("\t", 2)
+            pane_id, pane_marker, current_cmd, runtime_engine = line.split("\t", 3)
         except ValueError:
             continue
         if pane_marker != ADMINISTRATUM_PANE_MARKER:
             continue
-        # Match "claude" directly, or a node-version-style command column
-        # (e.g. "20.11.0") that Claude can surface as in tmux's
-        # #{pane_current_command}.
-        cmd_is_claude = "claude" in current_cmd.lower() or (
-            current_cmd[0:1].isdigit() and "." in current_cmd
+        # Match explicit engine stamps first. Fall back to common engine command
+        # surfaces when the row is absent/partial: Claude may appear as a
+        # node-version-style command (e.g. "20.11.0"), Codex may appear as node.
+        current_cmd_l = current_cmd.lower()
+        runtime_engine_l = runtime_engine.lower()
+        cmd_is_agent = (
+            "claude" in current_cmd_l
+            or "codex" in current_cmd_l
+            or runtime_engine_l in {"claude", "codex"}
+            # Claude can surface as a node-version-style command column; Codex
+            # can surface as node. The stable pane marker + TOKEN_API_ENGINE
+            # above is preferred, but keep the older command fallbacks.
+            or (current_cmd[0:1].isdigit() and "." in current_cmd)
+            or current_cmd_l == "node"
         )
-        if cmd_is_claude:
+        if cmd_is_agent:
             return pane_id
     return None
 
@@ -10586,6 +10595,8 @@ async def handle_custodes_state_event(
                 "audience_instance_id": "administratum",
                 "delivery": administratum_delivery,
                 "declared_class": event_class,
+                "observed": unknown_intervention.observed,
+                "payload": payload or {},
             },
         )
         return {
@@ -10626,6 +10637,8 @@ async def handle_custodes_state_event(
                 "classification": "state",
                 "audience_instance_id": "administratum",
                 "delivery": administratum_delivery,
+                "observed": intervention.observed,
+                "payload": payload or {},
             },
         )
         return {
@@ -10654,6 +10667,8 @@ async def handle_custodes_state_event(
             "audience_instance_id": "administratum",
             "delivery": administratum_delivery,
             "note": "record_copy_alongside_custodes_escalation",
+            "observed": intervention.observed,
+            "payload": payload or {},
         },
     )
 
@@ -11709,8 +11724,38 @@ async def session_doc_worktrees(doc_id: int, request: Request):
             logger.warning(f"worktrees: write failed for doc {doc_id}: {exc}")
             raise HTTPException(status_code=500, detail=f"worktree registry write failed: {exc}")
 
+    administratum_delivery = None
+    if action == "claim":
+        active = next(
+            (
+                wt
+                for wt in wts
+                if isinstance(wt, dict) and wt.get("path") == path and wt.get("status") == "active"
+            ),
+            {},
+        )
+        administratum_delivery = await handle_custodes_state_event(
+            "worktree_created",
+            "session_doc_worktree_registry",
+            instance_id=None,
+            severity=1,
+            payload={
+                "doc_id": doc_id,
+                "path": path,
+                "branch": body.get("branch") or active.get("branch"),
+                "port": body.get("port") or active.get("port"),
+                "claimed_at": body.get("claimed_at") or active.get("claimed_at"),
+                "action": action,
+            },
+            event_class="state",
+            quiet_hours_exempt=True,
+        )
+
     logger.info(f"worktrees: doc {doc_id} {action} {path}")
-    return {"doc_id": doc_id, "action": action, "worktrees": wts}
+    response = {"doc_id": doc_id, "action": action, "worktrees": wts}
+    if administratum_delivery is not None:
+        response["administratum_delivery"] = administratum_delivery
+    return response
 
 
 @app.post("/api/session-docs/{doc_id}/victory-ack")
@@ -18760,6 +18805,22 @@ async def cd_restart(request: Request):
             merged_flips = await _cd_flip_pr_merged(pr_url)
         except Exception as e:
             logger.warning("CD: pr_state→merged flip failed for %s: %s", pr_url, e)
+    administratum_delivery = None
+    if sha or pr_url:
+        administratum_delivery = await handle_custodes_state_event(
+            "pr_merged",
+            "cd_restart",
+            instance_id=None,
+            severity=1,
+            payload={
+                "sha": sha,
+                "pr_url": pr_url,
+                "services": services,
+                "pr_merged_flips": merged_flips,
+            },
+            event_class="state",
+            quiet_hours_exempt=True,
+        )
 
     # Spawn ONE detached, git-aware token-restart AFTER acking (the child sleeps so
     # this 200 fully flushes before launchd may kick us). `token-restart --sync`
@@ -18803,6 +18864,7 @@ async def cd_restart(request: Request):
         "sha": sha,
         "restart": restart,
         "pr_merged_flips": merged_flips,
+        "administratum_delivery": administratum_delivery,
     }
 
 

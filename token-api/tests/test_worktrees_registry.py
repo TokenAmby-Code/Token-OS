@@ -39,7 +39,20 @@ def _read_worktrees(fp):
 
 
 @pytest.fixture
-def client(app_env):
+def client(app_env, monkeypatch):
+    async def _fake_admin_record(event, intervention, classification):
+        return {
+            "dispatched": True,
+            "reason": "test",
+            "event_type": event.event_type,
+            "classification": classification,
+        }
+
+    async def _fake_snapshot():
+        return {}
+
+    monkeypatch.setattr(app_env.main, "_dispatch_administratum_record", _fake_admin_record)
+    monkeypatch.setattr(app_env.main, "_custodes_state_snapshot", _fake_snapshot)
     return TestClient(app_env.main.app)
 
 
@@ -72,6 +85,20 @@ def test_claim_adds_active_entry(client, app_env, tmp_path):
     assert e["status"] == "active"
     assert str(e["port"]) == "8201"
     assert e["claimed_at"] == "2026-06-02T00:00:00Z"
+    assert resp.json()["administratum_delivery"]["classification"] == "state"
+
+
+def test_claim_records_worktree_created_to_administratum(client, app_env, tmp_path):
+    doc_id, _ = _make_doc(tmp_path, app_env.db_path)
+    resp = _claim(client, doc_id, "/wt/a", branch="feat-a", port="8201")
+    assert resp.status_code == 200, resp.text
+
+    conn = sqlite3.connect(app_env.db_path)
+    rows = conn.execute(
+        "SELECT details FROM events WHERE event_type = 'administratum_record' ORDER BY id DESC LIMIT 3"
+    ).fetchall()
+    conn.close()
+    assert any("worktree_created" in row[0] and "/wt/a" in row[0] for row in rows)
 
 
 def test_second_claim_demotes_prior_active(client, app_env, tmp_path):

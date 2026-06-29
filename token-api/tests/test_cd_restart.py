@@ -42,6 +42,20 @@ def client(app_env, monkeypatch, spawned):
     # (module-level state otherwise leaks across tests in the same process).
     monkeypatch.setattr(app_env.main, "_cd_last_restart_spawn", 0.0, raising=False)
     monkeypatch.setenv("CD_RESTART_SECRET", SECRET)
+
+    async def _fake_admin_record(event, intervention, classification):
+        return {
+            "dispatched": True,
+            "reason": "test",
+            "event_type": event.event_type,
+            "classification": classification,
+        }
+
+    async def _fake_snapshot():
+        return {}
+
+    monkeypatch.setattr(app_env.main, "_dispatch_administratum_record", _fake_admin_record)
+    monkeypatch.setattr(app_env.main, "_custodes_state_snapshot", _fake_snapshot)
     return TestClient(app_env.main.app)
 
 
@@ -161,6 +175,24 @@ def test_merged_pr_flips_instance_badge(client):
     assert resp.status_code == 200, resp.text
     assert resp.json()["pr_merged_flips"] == 1
     assert _pr_state(iid) == "merged"
+    assert resp.json()["administratum_delivery"]["classification"] == "state"
+
+
+def test_merge_records_pr_merged_to_administratum(client, app_env):
+    url = "https://github.com/owner/repo/pull/99"
+    resp = client.post(
+        "/api/cd/restart",
+        json={"sha": "abc999", "pr_url": url, "services": ["token-api"]},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+
+    conn = sqlite3.connect(app_env.db_path)
+    rows = conn.execute(
+        "SELECT details FROM events WHERE event_type = 'administratum_record' ORDER BY id DESC LIMIT 3"
+    ).fetchall()
+    conn.close()
+    assert any("pr_merged" in row[0] and url in row[0] for row in rows)
 
 
 # ── Time-window coalescing ───────────────────────────────────
