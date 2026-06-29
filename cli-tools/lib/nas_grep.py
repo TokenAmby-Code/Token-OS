@@ -19,6 +19,7 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 DEFAULT_EXCLUDE_DIRS = (
     ".git",
@@ -294,7 +295,7 @@ def select_tool(requested: str) -> str:
     return requested
 
 
-def run_rg(config: SearchConfig, stdout: object = sys.stdout, stderr: object = sys.stderr) -> int:
+def run_rg(config: SearchConfig, stdout: TextIO = sys.stdout, stderr: TextIO = sys.stderr) -> int:
     rg = shutil.which("rg")
     if rg is None:
         raise RuntimeError("nas-grep: rg is not on PATH")
@@ -349,7 +350,7 @@ def run_rg(config: SearchConfig, stdout: object = sys.stdout, stderr: object = s
 
 
 def run_python_search(
-    config: SearchConfig, stdout: object = sys.stdout, stderr: object = sys.stderr
+    config: SearchConfig, stdout: TextIO = sys.stdout, stderr: TextIO = sys.stderr
 ) -> int:
     if config.dry_run:
         print("nas-grep: would run Python fallback search", file=stdout)
@@ -545,7 +546,7 @@ def config_from_args(argv: Sequence[str] | None = None) -> SearchConfig:
     )
 
 
-def run(config: SearchConfig, stdout: object = sys.stdout, stderr: object = sys.stderr) -> int:
+def run(config: SearchConfig, stdout: TextIO = sys.stdout, stderr: TextIO = sys.stderr) -> int:
     try:
         tool = select_tool(config.tool)
     except RuntimeError as exc:
@@ -562,7 +563,7 @@ def run(config: SearchConfig, stdout: object = sys.stdout, stderr: object = sys.
 
 
 def _run_selected(
-    tool: str, config: SearchConfig, stdout: object = sys.stdout, stderr: object = sys.stderr
+    tool: str, config: SearchConfig, stdout: TextIO = sys.stdout, stderr: TextIO = sys.stderr
 ) -> int:
     if tool == "rg":
         return run_rg(config, stdout=stdout, stderr=stderr)
