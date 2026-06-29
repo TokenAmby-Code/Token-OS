@@ -2051,7 +2051,7 @@ refuse_if_worktree_has_live_agent() {
   [[ -n "$matches" ]] || return 0
   err "refusing to dispatch: a live agent is already running in the target worktree $dir:"
   while IFS= read -r line; do
-    [[ -n "$line" ]] && err "  $line"
+    [[ -n "$line" ]] && err "  $(printf '%s' "$line" | redact_tmux_panes_for_display)"
   done <<< "$matches"
   err "resume that agent (do NOT stack a second into one worktree), or launch a fresh --worktree; set TOKEN_API_DISPATCH_FORCE_OCCUPIED=1 to override"
   exit 73

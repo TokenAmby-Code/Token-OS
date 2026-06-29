@@ -2892,7 +2892,7 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
         "#!/usr/bin/env bash\n"
         # A live agent is already rooted in the target worktree.
         'if [[ "$1" == "live-agents" ]]; then\n'
-        f'  printf "%s\\n" "mechanicus:3\\t%%91\\tcodex\\t{work_dir}"\n'
+        f'  printf "%s\\n" "mechanicus:3\\t%91\\tcodex\\t{work_dir}"\n'
         "  exit 0\n"
         "fi\n"
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
@@ -2943,6 +2943,8 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
     assert result.returncode == 73, result.stderr
     assert "a live agent is already running in the target worktree" in result.stderr
     assert "do NOT stack a second" in result.stderr
+    assert "%91" not in result.stderr
+    assert r"mechanicus:3\t<tmux-pane>\tcodex" in result.stderr
     assert "dispatched" not in result.stdout
     # No launch was staged: the guard refused before the send.
     tmux_calls = tmux_log.read_text(encoding="utf-8")
@@ -2961,7 +2963,7 @@ def test_dispatch_dup_guard_force_occupied_override_allows_launch(tmp_path: Path
     fake_tmuxctl.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$1" == "live-agents" ]]; then\n'
-        f'  printf "%s\\n" "mechanicus:3\\t%%91\\tcodex\\t{work_dir}"\n'
+        f'  printf "%s\\n" "mechanicus:3\\t%91\\tcodex\\t{work_dir}"\n'
         "  exit 0\n"
         "fi\n"
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
@@ -3038,7 +3040,7 @@ def test_dispatch_dup_guard_scoped_to_worktrees_allows_shared_checkout(
         # A live agent IS rooted in the target dir — but it is not a worktree, so
         # the guard should never even ask tmuxctl about it.
         'if [[ "$1" == "live-agents" ]]; then\n'
-        f'  printf "%s\\n" "mechanicus:3\\t%%91\\tcodex\\t{work_dir}"\n'
+        f'  printf "%s\\n" "mechanicus:3\\t%91\\tcodex\\t{work_dir}"\n'
         "  exit 0\n"
         "fi\n"
         'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
