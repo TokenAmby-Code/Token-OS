@@ -76,3 +76,6 @@ ignore_errors = true
 testpaths = ["tests"]
 pythonpath = ["lib"]
 addopts = "-n auto --dist loadfile"  # local default parallel; CI pins serial with -n0 (see workflows); `-n0` to debug
+markers = [
+    "bounty: 'bounty board' lane — speculative test for an UNBUILT vault feature. Non-blocking: auto-xfail'd by tests/bounty_board/conftest.py, excluded from the required regression run via `-m 'not bounty'`. An xpass means the feature shipped — graduate it into regression.",
+]
