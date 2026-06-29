@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from .assertions import PERSONA_LABELS, launch_persona_seat, persona_spec
+from .assertions import (
+    PERSONA_LABELS,
+    _assert_persona_color,
+    launch_persona_seat,
+    persona_spec,
+)
 from .resolver import resolve_pane
 from .tmux_adapter import TmuxAdapter
 
@@ -57,6 +62,8 @@ def rotate_persona_engine(
 
     launch_spec = replace(spec, engine=target_engine)
     ok, reason = launch_persona_seat(adapter, pane_id, launch_spec, session=session)
+    if ok:
+        _assert_persona_color(adapter, pane_id, launch_spec)
     return {
         "ok": ok,
         "pane": pane_id,

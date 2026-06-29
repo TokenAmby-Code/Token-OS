@@ -516,6 +516,31 @@ class TmuxControlPlane:
             "pane_label": pane_label,
         }
 
+    def rotate_persona_engine(
+        self,
+        pane: str,
+        *,
+        engine: str | None = None,
+        toggle: bool = False,
+        session: str | None = None,
+    ) -> dict:
+        """Hot-swap exactly one protected persona pane.
+
+        This mutating primitive lives on the tmuxctld control plane. CLI/keybinding
+        callers must POST here instead of respawning panes in-process, so the
+        daemon remains the sole persona launcher and the blast radius is the
+        single resolved physical pane supplied by the caller.
+        """
+        from .persona_engine import rotate_persona_engine
+
+        return rotate_persona_engine(
+            self.adapter,
+            pane,
+            engine=engine,
+            toggle=toggle,
+            session=session,
+        )
+
     def resolve_agent(
         self, pane: str = "current", agent: str = "auto", *, default: str = "claude"
     ) -> str:

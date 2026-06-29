@@ -15,6 +15,15 @@ class FakeAdapter:
     def __init__(self, engine: str = "") -> None:
         self.engine = engine
         self.options = {"@PANE_ID": "mechanicus:fabricator-general"}
+        self.commands: list[tuple] = []
+
+    def run(self, *args, allow_failure: bool = False):
+        self.commands.append(tuple(args))
+        if args[:3] == ("display-message", "-p", "#{pane_id}"):
+            return "%42"
+        if args and args[0] == "show-options":
+            return ""
+        return ""
 
     def show_pane_option(self, _pane_id: str, option: str) -> str:
         if option == "@TOKEN_API_ENGINE":
@@ -44,6 +53,15 @@ def test_rotate_persona_engine_toggles_fg_to_codex() -> None:
     assert launched[0][0] == "%42"
     assert launched[0][1].persona == "fabricator-general"
     assert launched[0][1].engine == "codex"
+    assert ("set-option", "-p", "-t", "%42", "window-style", "bg=#300808") in adapter.commands
+    assert (
+        "set-option",
+        "-p",
+        "-t",
+        "%42",
+        "window-active-style",
+        "bg=#300808",
+    ) in adapter.commands
 
 
 def test_rotate_persona_engine_refuses_non_persona_pane() -> None:
@@ -70,3 +88,80 @@ def test_rotate_persona_engine_requires_explicit_mode() -> None:
             assert "must pass --engine or --toggle" in str(exc)
         else:  # pragma: no cover
             raise AssertionError("expected ValueError")
+
+
+def test_cli_persona_engine_posts_to_daemon_with_captured_current_pane() -> None:
+    from unittest.mock import MagicMock
+
+    from tmuxctl import cli
+
+    control = SimpleNamespace(adapter=MagicMock())
+    control.adapter.run.return_value = "%119"
+    posted = []
+
+    def fake_post(path, payload, *, timeout=30.0):
+        posted.append((path, payload, timeout))
+        return {
+            "ok": True,
+            "pane": "%119",
+            "pane_label": "mechanicus:fabricator-general",
+            "engine": "codex",
+        }
+
+    with (
+        patch.object(cli, "TmuxControlPlane", return_value=control),
+        patch.object(cli, "_post_tmuxctld", side_effect=fake_post),
+    ):
+        rc = cli.main(["persona-engine", "--pane", "current", "--toggle"])
+
+    assert rc == 0
+    control.adapter.run.assert_called_once_with("display-message", "-p", "#{pane_id}")
+    assert posted == [
+        (
+            "/persona-engine",
+            {"pane": "%119", "engine": "", "toggle": True, "session": ""},
+            30.0,
+        )
+    ]
+
+
+def test_daemon_persona_engine_route_rotates_only_requested_pane() -> None:
+    import json
+    import threading
+    import urllib.request
+
+    from tmuxctl import daemon
+
+    adapter = FakeAdapter(engine="claude")
+    server = daemon.TmuxctldServer(
+        ("127.0.0.1", 0), adapter_factory=lambda: adapter, version="t", sha="t"
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    assert server.ready.wait(timeout=5)
+    resolved = SimpleNamespace(pane_id="%119", pane_role="mechanicus:fabricator-general")
+    launched = []
+
+    def fake_launch(_adapter, pane_id, spec, *, session=None):
+        launched.append((pane_id, spec.persona, spec.engine, session))
+        return True, "launched"
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{server.server_address[1]}/persona-engine",
+        data=json.dumps({"pane": "%119", "toggle": True, "session": "main"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with (
+            patch.object(persona_engine, "resolve_pane", return_value=resolved) as resolve,
+            patch.object(persona_engine, "launch_persona_seat", side_effect=fake_launch),
+            urllib.request.urlopen(req, timeout=5) as resp,
+        ):
+            payload = json.loads(resp.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+
+    assert payload["ok"] is True
+    assert payload["result"]["pane"] == "%119"
+    assert payload["result"]["pane_label"] == "mechanicus:fabricator-general"
+    resolve.assert_called_once_with(adapter, "%119", session_name="main")
+    assert launched == [("%119", "fabricator-general", "codex", "main")]
