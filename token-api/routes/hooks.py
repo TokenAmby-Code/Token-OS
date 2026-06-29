@@ -726,6 +726,86 @@ async def _persist_runtime_fields(
     )
 
 
+RAW_TMUX_PANE_ID_RE = re.compile(r"^%\d+$")
+
+
+async def _canonical_dispatch_target_for_session_start(
+    *,
+    dispatch_target: str | None,
+    launch_mode: str | None,
+    tmux_pane: str | None,
+    pane_label: str | None,
+) -> str | None:
+    """Return the durable dispatch target for SessionStart registration.
+
+    ``launch_mode=tmux_target`` persona-seat/cutover respawns can arrive with
+    ``TOKEN_API_DISPATCH_TARGET=$TMUX_PANE``. Raw ``%NN`` pane ids are transient
+    tmux runtime addresses and must not be persisted; the durable routing target
+    is the pane's public tmuxctld/@PANE_ID alias (for example
+    ``mechanicus:orchestrator`` or ``council:custodes``). Mainline dispatch
+    already provides the public target, so this is a narrow compatibility
+    resolver for the raw-pane persona-seat path.
+    """
+    target = _normalize_text(dispatch_target)
+    if not target or not RAW_TMUX_PANE_ID_RE.fullmatch(target):
+        return target
+    if (_normalize_text(launch_mode) or "").lower() != "tmux_target":
+        return target
+
+    label = _normalize_text(pane_label)
+    if label:
+        return label
+
+    # Prefer the raw target being persisted; fall back to the effective event pane
+    # when the target was copied from $TMUX_PANE but the effective pane was later
+    # resolved from a stable label.
+    resolved_label = await _tmux_pane_label(target)
+    if resolved_label:
+        return resolved_label
+    if tmux_pane and tmux_pane != target:
+        resolved_label = await _tmux_pane_label(tmux_pane)
+        if resolved_label:
+            return resolved_label
+
+    # Fail closed to the original value when the pane has no public id; the
+    # existing reconciler/tests will surface that unresolved state. Do not invent
+    # aliases.
+    return target
+
+
+async def _apply_persona_seat_name(
+    db,
+    *,
+    instance_id: str,
+    persona_identity: dict | None,
+) -> str | None:
+    """Name alias-backed singleton seats from their persona identity.
+
+    Persona seats are not anonymous work panes. Their stable tmuxctld alias
+    determines the singleton persona, and the row should carry that display
+    identity immediately instead of entering the naming-nudge placeholder flow.
+    """
+    if not persona_identity or not persona_identity.get("primarch"):
+        return None
+    cursor = await db.execute(
+        "SELECT display_name FROM personas WHERE slug = ?",
+        (persona_identity["primarch"],),
+    )
+    row = await cursor.fetchone()
+    display_name = _normalize_text(row["display_name"] if row else None)
+    if not display_name:
+        return None
+    await sanctioned_update_instance(
+        db,
+        instance_id=instance_id,
+        updates={"name": display_name, "workflow_blocked_reason": None},
+        mutation_type="instance_updated",
+        write_source="hooks",
+        actor="persona-seat-registration",
+    )
+    return display_name
+
+
 async def _session_start_effective_pane(
     tmux_pane: str | None,
     pane_label: str | None,
@@ -2943,6 +3023,13 @@ async def handle_session_start(payload: dict) -> dict:
         # zombie d865db2e).
         parent_instance_id = ""
 
+    dispatch_target = await _canonical_dispatch_target_for_session_start(
+        dispatch_target=dispatch_target,
+        launch_mode=launch_mode,
+        tmux_pane=tmux_pane,
+        pane_label=pane_label,
+    )
+
     def _effective_parent(prior_parent: str | None) -> str | None:
         # Same invariant for every restore path (supplant, --continue, prior
         # dispatch env): a persona singleton never inherits a parent — not from
@@ -3293,8 +3380,13 @@ async def handle_session_start(payload: dict) -> dict:
                     parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
+                persona_display_name = await _apply_persona_seat_name(
+                    db, instance_id=session_id, persona_identity=persona_identity
+                )
                 await _stamp_instance_id(
-                    target_pane, session_id, display_name=transplant_updates["name"]
+                    target_pane,
+                    session_id,
+                    display_name=persona_display_name or transplant_updates["name"],
                 )
                 # Only vacate the old pane when a NEW addressable pane was actually
                 # stamped. A blank `tmux_pane` (in-wrapper re-fire arriving with no
@@ -3470,10 +3562,13 @@ async def handle_session_start(payload: dict) -> dict:
                     parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
+                persona_display_name = await _apply_persona_seat_name(
+                    db, instance_id=session_id, persona_identity=persona_identity
+                )
                 await _stamp_instance_id(
                     tmux_pane or prior_pane,
                     session_id,
-                    display_name=updates["name"],
+                    display_name=persona_display_name or updates["name"],
                 )
                 if tmux_pane and prior_pane and tmux_pane != prior_pane:
                     await _unstamp_instance_id(prior_pane, session_id)
@@ -3672,8 +3767,13 @@ async def handle_session_start(payload: dict) -> dict:
                     parent_instance_id=_effective_parent(old_parent_id),
                     dispatch_mode=dispatch_mode,
                 )
+                persona_display_name = await _apply_persona_seat_name(
+                    db, instance_id=session_id, persona_identity=persona_identity
+                )
                 await _stamp_instance_id(
-                    target_tmux_pane, session_id, display_name=supplant_updates["name"]
+                    target_tmux_pane,
+                    session_id,
+                    display_name=persona_display_name or supplant_updates["name"],
                 )
                 # If the agent moved panes, vacate the old pane's @INSTANCE_ID so the
                 # oracle never reports the supplanted (now-defunct) id there.
@@ -4033,7 +4133,12 @@ async def handle_session_start(payload: dict) -> dict:
             parent_instance_id=parent_instance_id,
             dispatch_mode=dispatch_mode,
         )
-        await _stamp_instance_id(tmux_pane, session_id, display_name=tab_name)
+        persona_display_name = await _apply_persona_seat_name(
+            db, instance_id=session_id, persona_identity=persona_identity
+        )
+        await _stamp_instance_id(
+            tmux_pane, session_id, display_name=persona_display_name or tab_name
+        )
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
             db,
