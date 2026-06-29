@@ -8,7 +8,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$SCRIPT_PATH")")" && pwd)"
 source "$SCRIPT_DIR/../lib/git-remote.sh"
 source "$SCRIPT_DIR/../lib/nas-path.sh" >/dev/null 2>&1 || true
 source "$SCRIPT_DIR/../lib/worktree-park.sh" 2>/dev/null || true
@@ -32,6 +33,68 @@ SHOW_RAW_REVIEW=false
 FORCE_MODE=""
 FORCE_ARGS=()
 
+is_denied_worktree_env_path() {
+    local path="${1#./}" base
+    base="${path##*/}"
+    case "$path" in
+        .worktree.env|*/.worktree.env|.worktree.env.*|*/.worktree.env.*)
+            return 0
+            ;;
+    esac
+    case "$base" in
+        .worktree.env|.worktree.env.*|*.worktree.env|*.worktree.env.*|worktree.env|worktree-*.env|*.worktree-env|*.worktree-env.*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+unstage_denied_worktree_env_files() {
+    local path
+    local -a denied=()
+    while IFS= read -r -d '' path; do
+        if is_denied_worktree_env_path "$path"; then
+            denied+=("$path")
+        fi
+    done < <(git diff --cached --name-only -z --diff-filter=ACMRD)
+
+    [[ ${#denied[@]} -gt 0 ]] || return 0
+
+    warn "Refusing to commit generated worktree env file(s): ${denied[*]}"
+    if ! git restore --staged -- "${denied[@]}" 2>/dev/null; then
+        git reset -q HEAD -- "${denied[@]}" 2>/dev/null || true
+    fi
+}
+
+default_commit_message_from_staged() {
+    local count first status verb
+    count="$(git diff --cached --name-only --ignore-submodules -- | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [[ "$count" == "1" ]]; then
+        first="$(git diff --cached --name-only --ignore-submodules -- | sed -n '1p')"
+        status="$(git diff --cached --name-status --ignore-submodules -- | awk 'NR == 1 {print $1}')"
+        case "$status" in
+            A*) verb="add" ;;
+            D*) verb="remove" ;;
+            R*) verb="rename" ;;
+            *) verb="update" ;;
+        esac
+        echo "chore: ${verb} ${first}"
+    elif [[ "$count" =~ ^[0-9]+$ && "$count" -gt 1 ]]; then
+        echo "chore: update ${count} files"
+    else
+        echo "chore: update working tree"
+    fi
+}
+
+emit_coderabbit_heartbeat() {
+    local message="$1"
+    if [[ -n "${PR_STEP_HEARTBEAT_FILE:-}" ]]; then
+        printf '%s\n' "$message" >>"$PR_STEP_HEARTBEAT_FILE" 2>/dev/null || true
+    else
+        log "$message"
+    fi
+}
+
 usage() {
     cat <<'USAGE'
 PR Step
@@ -43,7 +106,7 @@ Usage:
   pr-step --force merge [merge-options]
 
 Normal options:
-  --message MSG          Commit/re-review message. Default derives from branch/head.
+  --message MSG          Commit/re-review message. Default derives from staged diff.
   --title TITLE          PR title for first create. Default uses latest commit subject.
   --body BODY            PR body for first create. Default is generated.
   --timeout MINS         CodeRabbit wait timeout per review cycle (default: 15)
@@ -201,14 +264,13 @@ commit_if_needed() {
         return 1
     fi
     git add -A
+    unstage_denied_worktree_env_files
     if git diff --cached --quiet --ignore-submodules --; then
         log "Commit: no staged changes after git add -A."
         return 1
     fi
     if [[ -z "$msg" ]]; then
-        local branch
-        branch="$(git branch --show-current | sed 's/[-_]/ /g')"
-        msg="chore: ${branch:-update}"
+        msg="$(default_commit_message_from_staged)"
     fi
     local out rc
     out="$(mktemp -t pr-step-commit.XXXXXX)"
@@ -353,17 +415,43 @@ checks_green() {
 }
 
 summarize_actionable_findings() {
-    local pr="$1" repo
+    local pr="$1" head="${2:-}" repo short
     repo="$(repo_slug)"
     [[ -n "$repo" ]] || return 0
-    gh api "repos/${repo}/pulls/${pr}/comments" 2>/dev/null | jq -r '
-        [.[] | select((.user.login // "" | ascii_downcase) as $u | $u == "coderabbitai[bot]" or $u == "coderabbitai" or $u == "coderabbit")]
-        | sort_by(.updated_at)
-        | reverse
-        | .[:8]
-        | .[]
-        | (.body // "" | gsub("\\r\\n"; "\\n") | split("\\n") | map(select(length > 0 and (startswith("<!--") | not))) | .[0] // "") as $first
-        | "  - \(.path // "General"):\(.line // .original_line // "?") — \($first | .[0:220])"
+    short="${head:0:7}"
+    gh api "repos/${repo}/pulls/${pr}/comments" 2>/dev/null | jq -r --arg head "$head" --arg short "$short" '
+        def is_coderabbit:
+            (.user.login // "" | ascii_downcase) as $u
+            | $u == "coderabbitai[bot]" or $u == "coderabbitai" or $u == "coderabbit";
+        def has_live_line:
+            ((.position // .line // .original_line // null) != null);
+        def first_line:
+            (.body // ""
+            | gsub("\\r\\n"; "\\n")
+            | split("\\n")
+            | map(select(length > 0 and (startswith("<!--") | not)))
+            | .[0] // "");
+        def format_finding:
+            "  - \(.path // "General"):\(.line // .original_line // "?") — \(first_line | .[0:220])";
+
+        [.[] | select(is_coderabbit)] as $all
+        | ($all
+            | map(select(($head != "") and ((.commit_id // "") == $head) and has_live_line))
+            | sort_by(.updated_at)
+            | reverse) as $current
+        | ($all
+            | map(select((($head == "") or ((.commit_id // "") != $head) or (has_live_line | not))))
+            | length) as $historical
+        | if ($current | length) > 0 then
+            (($current[:8][] | format_finding),
+             (if $historical > 0 then
+                "  - historical/resolved CodeRabbit findings omitted: \($historical) (not on current head \($short))"
+              else empty end))
+          elif ($all | length) > 0 then
+            "  - none on current head \($short); historical/resolved CodeRabbit findings omitted: \(($all | length))"
+          else
+            empty
+          end
     ' 2>/dev/null || true
 }
 
@@ -391,28 +479,47 @@ summarize_pr() {
     checks_summary "$pr" || true
     echo "  Actionable CodeRabbit findings:"
     local findings
-    findings="$(summarize_actionable_findings "$pr")"
+    findings="$(summarize_actionable_findings "$pr" "$head")"
     if [[ -n "$findings" ]]; then
         printf '%s\n' "$findings"
     else
-        echo "  - none found in latest inline comments"
+        echo "  - none found on current head"
     fi
     echo ""
 }
 
 run_internal_capture() {
     local label="$1" print_on_failure="$2"; shift 2
-    local out rc=0
+    local out heartbeat rc=0 pid last_line="" line
     out="$(mktemp -t "pr-step-${label}.XXXXXX")"
-    if "$@" >"$out" 2>&1; then
+    heartbeat="$(mktemp -t "pr-step-${label}-heartbeat.XXXXXX")"
+    PR_STEP_HEARTBEAT_FILE="$heartbeat" "$@" >"$out" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [[ -s "$heartbeat" ]]; then
+            line="$(tail -n 1 "$heartbeat" 2>/dev/null || true)"
+            if [[ -n "$line" && "$line" != "$last_line" ]]; then
+                log "$line"
+                last_line="$line"
+            fi
+        fi
+        sleep 1
+    done
+    if wait "$pid"; then
         rc=0
     else
         rc=$?
     fi
+    if [[ -s "$heartbeat" ]]; then
+        line="$(tail -n 1 "$heartbeat" 2>/dev/null || true)"
+        if [[ -n "$line" && "$line" != "$last_line" ]]; then
+            log "$line"
+        fi
+    fi
     if [[ "$SHOW_RAW_REVIEW" == "true" || ( "$print_on_failure" == "true" && $rc -ne 0 ) ]]; then
         cat "$out"
     fi
-    rm -f "$out"
+    rm -f "$out" "$heartbeat"
     return "$rc"
 }
 
@@ -861,11 +968,9 @@ while true; do
     fi
 
     REMAINING=$(( (MAX_WAIT_TIME - ELAPSED) / 60 ))
-    printf "\r${BLUE}[pr-create]${NC} Waiting... (%d min remaining, %d comments found)   " "$REMAINING" "$REVIEW_COUNT"
+    emit_coderabbit_heartbeat "CodeRabbit poll: waiting (${REMAINING}m remaining, ${REVIEW_COUNT} comments found)"
     sleep "$POLL_INTERVAL"
 done
-
-echo "" # New line after progress
 
 # Fetch final comments
 log "Fetching review comments..."
@@ -1272,12 +1377,9 @@ while true; do
     if [[ "$OVERVIEW_UPDATED" == "true" ]]; then
         STATUS=" (updated)"
     fi
-    printf "\r  Polling... (%d new inline, %d new summary%s) [%ds]   " \
-        "$NEW_INLINE_COUNT" "$NEW_OVERVIEW_COUNT" "$STATUS" "$ELAPSED_SECS"
+    emit_coderabbit_heartbeat "CodeRabbit poll: ${ELAPSED_SECS}s elapsed, ${NEW_INLINE_COUNT} new inline, ${NEW_OVERVIEW_COUNT} new summary${STATUS}, head=${HEAD_SHA:0:7}"
     sleep "$POLL_INTERVAL"
 done
-
-echo "" # New line after progress
 
 # Step 4: Fetch and output the results
 if [[ "$FOUND_OVERVIEW" == "false" ]] && [[ $NEW_INLINE_COUNT -eq 0 ]] && [[ $NEW_OVERVIEW_COUNT -eq 0 ]]; then
@@ -2047,4 +2149,6 @@ main() {
     fi
 }
 
-main "$@"
+if [[ "${PR_STEP_SOURCE_ONLY:-}" != "1" ]]; then
+    main "$@"
+fi
