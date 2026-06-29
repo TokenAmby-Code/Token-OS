@@ -55,6 +55,7 @@ normalize_pane_to_canonical() {
 # tagged in routes/hooks.py) — `sort -k3 | uniq -c` by cause. Not a suppressor:
 # we never gate or dedup on it (see anti-blind-dedup / no-suppress-debounce).
 TOKEN_WRAPPER_HOOK_FAILURE_LOG="${TOKEN_WRAPPER_HOOK_FAILURE_LOG:-${HOME}/.claude/logs/hook-post-failures.log}"
+TOKEN_WRAPPER_HOOK_QUEUE_BIN="${TOKEN_WRAPPER_HOOK_QUEUE_BIN:-${TOKEN_WRAPPER_LIB_DIR}/../bin/generic-token-api-durable-retry-outbox}"
 
 token_wrapper_record_hook_failure() {
   local action_type="$1" cause="$2"
@@ -64,6 +65,15 @@ token_wrapper_record_hook_failure() {
   printf '%s\t%s\t%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action_type" "$cause" \
     >> "$TOKEN_WRAPPER_HOOK_FAILURE_LOG" 2>/dev/null || true
+}
+
+token_wrapper_enqueue_hook_post() {
+  local action_type="$1" payload="$2" cause="${3:-http-000}"
+  [[ -x "$TOKEN_WRAPPER_HOOK_QUEUE_BIN" ]] || return 1
+  printf '%s' "$payload" | "$TOKEN_WRAPPER_HOOK_QUEUE_BIN" enqueue \
+    --action-type "$action_type" \
+    --url "${API_URL}/api/hooks/${action_type}" \
+    --cause "$cause" >/dev/null 2>&1
 }
 
 token_wrapper_post_hook() {
@@ -107,6 +117,9 @@ token_wrapper_post_hook() {
     *)  cause="other-rc${rc}" ;;
   esac
   token_wrapper_record_hook_failure "$action_type" "$cause"
+  if [[ "$http_code" == "000" || "$rc" -eq 7 ]]; then
+    token_wrapper_enqueue_hook_post "$action_type" "$payload" "$cause" || true
+  fi
   return 0
 }
 
@@ -133,6 +146,9 @@ token_wrapper_post_hook_async() {
       *)  cause="other-rc${rc}" ;;
     esac
     token_wrapper_record_hook_failure "$action_type" "$cause"
+    if [[ "$http_code" == "000" || "$rc" -eq 7 ]]; then
+      token_wrapper_enqueue_hook_post "$action_type" "$payload" "$cause" || true
+    fi
   ) >/dev/null 2>&1 &
   return 0
 }

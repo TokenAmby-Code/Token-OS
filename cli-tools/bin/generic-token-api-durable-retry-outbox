@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Durable serialized retry outbox for hook -> Token-API POST intents.
+
+Queues only the Token-API-unreachable class selected by callers (curl http=000 /
+connection refused). Drains are explicit and recovery-triggered by tokenapi-watchdog;
+this file does not poll.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+DEFAULT_DB = Path.home() / ".claude" / "generic-token-api-durable-retry-outbox.sqlite3"
+DEFAULT_LOG = Path.home() / ".claude" / "logs" / "generic-token-api-durable-retry-outbox.log"
+SESSION_SINGLETON_ACTIONS = frozenset({"SessionStart", "SessionEnd"})
+WRAPPER_SINGLETON_ACTIONS = frozenset({"WrapperStart", "WrapperEnd"})
+
+
+def _utc() -> str:
+    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _log(message: str) -> None:
+    log_path = Path(os.environ.get("GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX_LOG", str(DEFAULT_LOG))).expanduser()
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{_utc()} {message}\n")
+    except Exception:
+        pass
+
+
+def _db_path() -> Path:
+    return Path(os.environ.get("GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX_DB", str(DEFAULT_DB))).expanduser()
+
+
+def _connect() -> sqlite3.Connection:
+    path = _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hook_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_type TEXT NOT NULL,
+            url TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_http_code TEXT,
+            last_error TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hook_posts_status_id ON hook_posts(status, id)"
+    )
+    return conn
+
+
+def _payload_obj(payload: str) -> dict[str, Any]:
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _idem_key(action_type: str, payload: str) -> str:
+    data = _payload_obj(payload)
+    env = data.get("env") if isinstance(data.get("env"), dict) else {}
+    if action_type in SESSION_SINGLETON_ACTIONS and data.get("session_id"):
+        return f"{action_type}:session:{data['session_id']}"
+    wrapper_id = data.get("wrapper_launch_id") or env.get("TOKEN_API_WRAPPER_LAUNCH_ID")
+    if action_type in WRAPPER_SINGLETON_ACTIONS and wrapper_id:
+        return f"{action_type}:wrapper:{wrapper_id}"
+    digest = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+    return f"{action_type}:sha256:{digest}"
+
+
+def enqueue(args: argparse.Namespace) -> int:
+    payload = args.payload if args.payload is not None else sys.stdin.read()
+    if not payload.strip():
+        payload = "{}"
+    key = args.idempotency_key or _idem_key(args.action_type, payload)
+    now = _utc()
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO hook_posts
+              (action_type, url, payload, idempotency_key, status, created_at, updated_at, last_error)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (args.action_type, args.url, payload, key, now, now, args.cause),
+        )
+        if cur.rowcount:
+            row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            _log(f"enqueue id={row_id} action={args.action_type} key={key} cause={args.cause or '-'}")
+            print(json.dumps({"queued": True, "id": row_id, "idempotency_key": key}))
+        else:
+            row = conn.execute(
+                "SELECT id, status FROM hook_posts WHERE idempotency_key = ?", (key,)
+            ).fetchone()
+            _log(
+                f"enqueue-duplicate id={row['id'] if row else '?'} action={args.action_type} "
+                f"key={key} status={row['status'] if row else '?'}"
+            )
+            print(
+                json.dumps(
+                    {
+                        "queued": False,
+                        "duplicate": True,
+                        "id": row["id"] if row else None,
+                        "status": row["status"] if row else None,
+                        "idempotency_key": key,
+                    }
+                )
+            )
+    return 0
+
+
+def _post(url: str, payload: str, timeout: float) -> tuple[str, str]:
+    req = urllib.request.Request(
+        url,
+        data=payload.encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 local/admin URL
+            resp.read(4096)
+            return str(resp.status), ""
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.read(4096)
+        except Exception:
+            pass
+        return str(exc.code), f"http-{exc.code}"
+    except Exception as exc:
+        return "000", f"{type(exc).__name__}: {exc}"
+
+
+def drain(args: argparse.Namespace) -> int:
+    drained = replayed = failed = 0
+    with _connect() as conn:
+        while drained < args.limit:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM hook_posts WHERE status = 'pending' ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                break
+            claimed = conn.execute(
+                """
+                UPDATE hook_posts
+                   SET status='inflight', updated_at=?
+                 WHERE id=? AND status='pending'
+                """,
+                (_utc(), row["id"]),
+            )
+            conn.commit()
+            if claimed.rowcount != 1:
+                continue
+            drained += 1
+            http_code, error = _post(row["url"], row["payload"], args.timeout)
+            now = _utc()
+            if http_code.startswith("2"):
+                conn.execute(
+                    """
+                    UPDATE hook_posts
+                       SET status='done', attempts=attempts+1, updated_at=?,
+                           last_http_code=?, last_error=NULL
+                     WHERE id=? AND status='inflight'
+                    """,
+                    (now, http_code, row["id"]),
+                )
+                conn.commit()
+                replayed += 1
+                _log(f"replay-ok id={row['id']} action={row['action_type']} http={http_code}")
+                continue
+            if http_code == "000":
+                conn.execute(
+                    """
+                    UPDATE hook_posts
+                       SET status='pending', attempts=attempts+1, updated_at=?,
+                           last_http_code=?, last_error=?
+                     WHERE id=? AND status='inflight'
+                    """,
+                    (now, http_code, error[:500], row["id"]),
+                )
+                conn.commit()
+                _log(f"replay-unreachable id={row['id']} action={row['action_type']} err={error[:200]}")
+                break
+            conn.execute(
+                """
+                UPDATE hook_posts
+                   SET status='failed', attempts=attempts+1, updated_at=?,
+                       last_http_code=?, last_error=?
+                 WHERE id=? AND status='inflight'
+                """,
+                (now, http_code, error[:500], row["id"]),
+            )
+            conn.commit()
+            failed += 1
+            _log(f"replay-failed id={row['id']} action={row['action_type']} http={http_code} err={error[:200]}")
+    print(json.dumps({"replayed": replayed, "failed": failed, "examined": drained}))
+    return 0 if failed == 0 else 2
+
+
+def status(args: argparse.Namespace) -> int:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM hook_posts GROUP BY status ORDER BY status"
+        ).fetchall()
+    print(json.dumps({r["status"]: r["n"] for r in rows}, sort_keys=True))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    ep = sub.add_parser("enqueue")
+    ep.add_argument("--action-type", required=True)
+    ep.add_argument("--url", required=True)
+    ep.add_argument("--payload")
+    ep.add_argument("--idempotency-key")
+    ep.add_argument("--cause", default="http-000")
+    ep.set_defaults(func=enqueue)
+    dp = sub.add_parser("drain")
+    dp.add_argument("--limit", type=int, default=100)
+    dp.add_argument("--timeout", type=float, default=5.0)
+    dp.set_defaults(func=drain)
+    sp = sub.add_parser("status")
+    sp.set_defaults(func=status)
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
