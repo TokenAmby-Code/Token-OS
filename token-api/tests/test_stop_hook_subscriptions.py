@@ -98,6 +98,29 @@ def _insert_instance(
         _PANE_MAP[instance_id] = (pane, pane_label)
 
 
+def _set_commander(db_path, instance_id, commander_type, commander_id):
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE instances SET commander_type = ?, commander_id = ? WHERE id = ?",
+        (commander_type, commander_id, instance_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _set_persona(db_path, instance_id, slug, *, rank="overseer"):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT id FROM personas WHERE slug = ?", (slug,)).fetchone()
+    assert row is not None
+    conn.execute(
+        "UPDATE instances SET persona_id = ?, rank = ? WHERE id = ?",
+        (row[0], rank, instance_id),
+    )
+    conn.commit()
+    conn.close()
+    return row[0]
+
+
 def test_session_start_auto_subscribes_parent(app_env, monkeypatch):
     hooks = sys.modules["routes.hooks"]
     _insert_instance(app_env.db_path, "parent-1", pane="%10")
@@ -434,6 +457,85 @@ def test_mechanicus_reconcile_is_idempotent(app_env):
     count = conn.execute("SELECT COUNT(*) FROM stop_hook_subscriptions").fetchone()[0]
     conn.close()
     assert count == 1
+
+
+def test_reconcile_subscribes_persona_commanded_mechanicus_worker_to_live_fg(app_env):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(
+        app_env.db_path,
+        "fg-persona",
+        pane="%62",
+        pane_label="mechanicus:fabricator-general",
+    )
+    fg_persona = _set_persona(app_env.db_path, "fg-persona", "fabricator-general")
+    _insert_instance(app_env.db_path, "worker-persona", pane="%63", pane_label="mechanicus:2")
+    _set_commander(app_env.db_path, "worker-persona", "persona", fg_persona)
+
+    async def run() -> None:
+        result = await hooks.reconcile_hook_subscriptions(
+            hooks.HookReconcileRequest(page="mechanicus")
+        )
+        assert result["created"] == 1
+        assert result["subscriptions"][0]["target_instance_id"] == "worker-persona"
+        assert result["subscriptions"][0]["subscriber_instance_id"] == "fg-persona"
+        assert result["subscriptions"][0]["subscriber_pane"] == "%62"
+
+    asyncio.run(run())
+
+
+def test_stop_self_reconciles_and_notifies_persona_commanded_fg_worker(app_env, monkeypatch):
+    hooks = sys.modules["routes.hooks"]
+    _insert_instance(
+        app_env.db_path,
+        "fg-stop-persona",
+        pane="%64",
+        pane_label="mechanicus:fabricator-general",
+    )
+    fg_persona = _set_persona(app_env.db_path, "fg-stop-persona", "fabricator-general")
+    _insert_instance(
+        app_env.db_path,
+        "worker-stop-persona",
+        pane="%65",
+        pane_label="mechanicus:worker-9",
+    )
+    _set_commander(app_env.db_path, "worker-stop-persona", "persona", fg_persona)
+    sent = []
+
+    async def fake_write(pane, payload):
+        sent.append((pane, payload))
+        return {"status": "sent", "operation": "fake"}
+
+    monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
+    tail = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "PERSONA_STOP_NOTIFY_OK"}],
+            },
+        },
+        separators=(",", ":"),
+    )
+
+    async def run() -> None:
+        result = await hooks.handle_stop(
+            {"session_id": "worker-stop-persona", "transcript_tail": tail}
+        )
+        assert result["mechanicus_stop_reconcile"]["created"] == 1
+        assert result["stop_subscriptions"][0]["status"] == "sent"
+
+    asyncio.run(run())
+
+    assert len(sent) == 1
+    assert sent[0][0] == "%64"
+    assert "PERSONA_STOP_NOTIFY_OK" in sent[0][1]
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        """SELECT target_instance_id, subscriber_instance_id, subscriber_pane, status
+           FROM stop_hook_subscriptions"""
+    ).fetchone()
+    conn.close()
+    assert row == ("worker-stop-persona", "fg-stop-persona", "%64", "active")
 
 
 def test_mechanicus_worker_start_without_fg_does_not_create_subscription(app_env):
@@ -775,13 +877,13 @@ def test_gated_preplan_oneshot_consumes_sub_but_requeues_plan_for_redrain(
     drained = asyncio.run(main.process_pane_write_queue_once(queue_id))
 
     assert sent == [("%90", "/plan create the plan")]
-    assert drained[0]["status"] == main.PANE_WRITE_SENT
+    assert drained[0]["status"] == main.PANE_WRITE_UNVERIFIED
     conn = sqlite3.connect(app_env.db_path)
     final_status = conn.execute(
         "SELECT status FROM pane_write_queue WHERE id = ?", (queue_id,)
     ).fetchone()[0]
     conn.close()
-    assert final_status == "sent"
+    assert final_status == "unverified"
 
 
 def test_mark_for_close_stop_subscription_retires_after_closing_pane(
@@ -1234,14 +1336,15 @@ def test_reconcile_skips_worker_with_dead_parent(app_env):
     _insert_instance(
         app_env.db_path, "fg-dead", pane="%70", pane_label="mechanicus:fabricator-general"
     )
-    # parent FK points at a phantom uuid with no instance row.
+    # commander edge points at a stopped/non-live instance row.
+    _insert_instance(app_env.db_path, "ghost-uuid", status="stopped")
     _insert_instance(
         app_env.db_path,
         "worker-orphan",
         pane="%71",
         pane_label="mechanicus:3",
-        parent="ghost-uuid",
     )
+    _set_commander(app_env.db_path, "worker-orphan", "chapter", "ghost-uuid")
 
     async def run() -> None:
         result = await hooks.reconcile_hook_subscriptions(
@@ -1267,8 +1370,8 @@ def test_reconcile_skips_worker_parented_to_other_live_instance(app_env):
         "worker-elsewhere",
         pane="%74",
         pane_label="mechanicus:6",
-        parent="custodes-live",
     )
+    _set_commander(app_env.db_path, "worker-elsewhere", "chapter", "custodes-live")
 
     async def run() -> None:
         result = await hooks.reconcile_hook_subscriptions(
@@ -1295,7 +1398,7 @@ def test_reconcile_skips_parentless_worker(app_env):
         )
         assert result["created"] == 0
         reasons = {s["reason"] for s in result["skipped_targets"]}
-        assert "parent_not_live" in reasons
+        assert "commander_not_fg" in reasons
 
     asyncio.run(run())
     assert _active_subscription_ids(app_env.db_path) == []
