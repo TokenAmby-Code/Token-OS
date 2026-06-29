@@ -567,7 +567,7 @@ def test_trailing_resync_clears_pinned_sha_to_converge_newest_main(tmp_path: Pat
     env, _logfile = _stub_env(tmp_path, "token-api/main.py")
     script = f"""
 set -euo pipefail
-source {TOKEN_RESTART!s}
+source {str(TOKEN_RESTART)!r}
 TOKEN_RESTART_TARGET_SHA=oldpinned
 SYNC_DID_ADVANCE=true
 SYNC_CHANGED_PATHS=stale
@@ -608,7 +608,7 @@ def test_superseded_deploy_drops_current_restart_set(tmp_path: Path) -> None:
     (lockdir / "redeploy-pending").write_text("1")
     script = f"""
 set -euo pipefail
-source {TOKEN_RESTART!s}
+source {str(TOKEN_RESTART)!r}
 DEPLOY_LOCKDIR={str(lockdir)!r}
 DEPLOY_LOCK_HELD=true
 abort_deploy_if_superseded "unit-test"
