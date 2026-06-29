@@ -1,0 +1,7 @@
+interface:
+  display_name: "Unpause"
+  short_description: "Restore paused fleet jobs"
+  default_prompt: "$unpause restore the paused fleet jobs."
+
+policy:
+  allow_implicit_invocation: true

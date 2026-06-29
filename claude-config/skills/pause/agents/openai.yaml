@@ -1,0 +1,7 @@
+interface:
+  display_name: "Pause"
+  short_description: "Pause Mechanicus fleet jobs"
+  default_prompt: "$pause pause the requested fleet jobs."
+
+policy:
+  allow_implicit_invocation: true

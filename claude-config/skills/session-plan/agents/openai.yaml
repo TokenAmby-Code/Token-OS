@@ -1,0 +1,7 @@
+interface:
+  display_name: "Session Plan"
+  short_description: "Start vault-backed planning"
+  default_prompt: "$session-plan prepare a vault-backed implementation session."
+
+policy:
+  allow_implicit_invocation: true
