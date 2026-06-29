@@ -2034,6 +2034,7 @@ refuse_if_worktree_has_live_agent() {
   # vault) is legitimate and must not be refused — those dirs are not the
   # two-agents-one-worktree corruption this guard exists to prevent.
   local wt_root="${IMPERIUM_WORKTREES_ROOT:-$HOME/worktrees}"
+  wt_root="${wt_root%/}"
   [[ "$dir" == "$wt_root" || "$dir" == "$wt_root"/* ]] || return 0
   # Hermetic opt-out: tests set DISPATCH_WORKTREE_DUP_CHECK=0 so the suite never
   # enumerates the operator's LIVE tmux server. Default (unset) = enabled.

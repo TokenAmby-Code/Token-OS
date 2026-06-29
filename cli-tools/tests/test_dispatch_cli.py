@@ -2917,7 +2917,8 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
     env["DISPATCH_WORKTREE_DUP_CHECK"] = "1"
     # The guard is scoped to the ~/worktrees tree; point that root at the tmp dir
     # holding work_dir so the dir counts as a worktree and the guard fires.
-    env["IMPERIUM_WORKTREES_ROOT"] = str(tmp_path)
+    # Include a trailing slash to pin normalization before the prefix check.
+    env["IMPERIUM_WORKTREES_ROOT"] = f"{tmp_path}/"
 
     result = subprocess.run(
         [
