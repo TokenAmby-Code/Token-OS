@@ -49,6 +49,13 @@ from . import send_gate, typing_guard_state
 from .api import RegistryError
 from .send_gate import thread_local_override
 from .service import TmuxControlPlane
+from .skill_invoke import (
+    ethereal_invocation_text,
+    invocation_sink_keys,
+    invocation_text,
+    normalize_invocation_kind,
+    resolve_agent_for_pane,
+)
 from .tmux_adapter import (
     TmuxAdapter,
     TmuxError,
@@ -622,23 +629,30 @@ def _notify_swallowed_submit(*, pane_public: str, instance_id: str, payload_hash
         )
 
 
-def _h_send_text(control, params):
-    pane = _s(params, "pane")
-    text = _s(params, "text")
-    submit = _b(params, "submit", True)
-    clear_prompt = _b(params, "clear_prompt")
-    verify = _b(params, "verify", submit)
-    verify_timeout = _f(params, "verify_timeout", 5.0)
-    submit_settle_seconds = _f(params, "submit_settle_seconds", 1.0)
-    ack_submit_retries = _i(params, "ack_submit_retries", 2)
-    pre_submit_raw = params.get("pre_submit_keys", ())
-    if isinstance(pre_submit_raw, str):
-        pre_submit_keys = tuple(k for k in pre_submit_raw.split(",") if k)
-    elif isinstance(pre_submit_raw, list | tuple):
-        pre_submit_keys = tuple(str(k) for k in pre_submit_raw if str(k))
-    else:
-        pre_submit_keys = ()
+def _parse_pre_submit_keys(raw) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        return tuple(k for k in raw.split(",") if k)
+    if isinstance(raw, list | tuple):
+        return tuple(str(k) for k in raw if str(k))
+    return ()
 
+
+def _send_text_pipeline(
+    control,
+    *,
+    pane: str,
+    text: str,
+    submit: bool = True,
+    clear_prompt: bool = False,
+    verify: bool | None = None,
+    verify_timeout: float = 5.0,
+    submit_settle_seconds: float = 1.0,
+    ack_submit_retries: int = 2,
+    pre_submit_keys: tuple[str, ...] = (),
+    post_submit_actions: tuple[dict, ...] = (),
+) -> dict:
+    if verify is None:
+        verify = submit
     # Resolve the physical pane id once for all guard + capture ops. tmux pane
     # options (@TYPING_*_UNTIL) and capture-pane key off the real %NN; the
     # caller-supplied id may be a canonical page:id. _resolve is a no-op on a raw
@@ -717,6 +731,29 @@ def _h_send_text(control, params):
         else:
             control.adapter.run("send-keys", "-t", pane, "C-m")
 
+    def _send_literal(value: str) -> None:
+        control.adapter.run("send-keys", "-t", pane, "-l", value)
+
+    def _send_key(value: str) -> None:
+        if hasattr(control.adapter, "send_keys"):
+            control.adapter.send_keys(pane, value)
+        else:
+            control.adapter.run("send-keys", "-t", pane, value)
+
+    def _run_post_submit_actions() -> None:
+        for action in post_submit_actions:
+            kind = str(action.get("type") or "").strip()
+            if kind == "key":
+                _send_key(str(action.get("key") or ""))
+            elif kind == "literal_submit":
+                _send_literal(str(action.get("text") or ""))
+                _send_submit_key()
+            else:
+                raise ValueError(f"unknown post-submit action: {kind!r}")
+            settle = float(action.get("settle_seconds", submit_settle_seconds) or 0)
+            if settle > 0:
+                time.sleep(settle)
+
     started = time.monotonic()
     ack = None
     swallowed_submit_detected = False
@@ -753,6 +790,9 @@ def _h_send_text(control, params):
                 if submit_settle_seconds > 0:
                     time.sleep(submit_settle_seconds)
                 control.adapter.send_keys(pane, "C-m")
+
+            if post_submit_actions:
+                _run_post_submit_actions()
 
             if verify:
                 for attempt in range(max(0, ack_submit_retries) + 1):
@@ -837,6 +877,21 @@ def _h_send_text(control, params):
     }
 
 
+def _h_send_text(control, params):
+    return _send_text_pipeline(
+        control,
+        pane=_s(params, "pane"),
+        text=_s(params, "text"),
+        submit=_b(params, "submit", True),
+        clear_prompt=_b(params, "clear_prompt"),
+        verify=_b(params, "verify", _b(params, "submit", True)),
+        verify_timeout=_f(params, "verify_timeout", 5.0),
+        submit_settle_seconds=_f(params, "submit_settle_seconds", 1.0),
+        ack_submit_retries=_i(params, "ack_submit_retries", 2),
+        pre_submit_keys=_parse_pre_submit_keys(params.get("pre_submit_keys", ())),
+    )
+
+
 def _h_insert_text(control, params):
     control.insert_text(_s(params, "pane"), _s(params, "text"))
     return {"pane": _s(params, "pane"), "status": "inserted"}
@@ -860,16 +915,119 @@ def _h_invoke_skill(control, params):
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False}
         pane = resolved["pane_id"]
-    skill = _s(params, "skill")
+    skill = _s(params, "name") or _s(params, "skill")
     agent = _s(params, "agent", "auto")
+    kind = _s(params, "kind", "skill")
     arguments = _s(params, "arguments") or None
     if _b(params, "submit"):
-        rendered = control.send_skill(
-            pane, skill, agent=agent, arguments=arguments, clear_prompt=_b(params, "clear_prompt")
+        resolved_kind = normalize_invocation_kind(kind)
+        if resolved_kind == "command":
+            resolved_agent = "auto"
+        else:
+            resolved_agent = resolve_agent_for_pane(control.adapter, pane, agent)
+        rendered = invocation_text(
+            skill,
+            resolved_agent,
+            kind=resolved_kind,
+            arguments=arguments,
         )
-        return {"pane": pane, "submitted": True, "rendered": rendered}
-    rendered = control.invoke_skill(pane, skill, agent=agent, arguments=arguments)
-    return {"pane": pane, "submitted": False, "rendered": rendered}
+        result = _send_text_pipeline(
+            control,
+            pane=pane,
+            text=rendered,
+            submit=True,
+            clear_prompt=_b(params, "clear_prompt"),
+            verify=_b(params, "verify", True),
+            verify_timeout=_f(params, "verify_timeout", 5.0),
+            submit_settle_seconds=_f(params, "submit_settle_seconds", 1.0),
+            ack_submit_retries=_i(params, "ack_submit_retries", 2),
+            pre_submit_keys=invocation_sink_keys(resolved_agent, kind=resolved_kind),
+        )
+        return {
+            **result,
+            "submitted": True,
+            "kind": resolved_kind,
+            "agent": resolved_agent,
+            "rendered": rendered,
+        }
+    result = control.insert_invocation(pane, skill, agent=agent, kind=kind, arguments=arguments)
+    return {"submitted": False, **result}
+
+
+def _resolve_target_pane(control, params) -> tuple[str, str]:
+    instance_id = _s(params, "instance_id")
+    pane = _s(params, "pane", "current")
+    if instance_id and (not pane or pane == "current"):
+        resolved = control.resolve_instance(instance_id)
+        if not resolved["found"]:
+            raise ValueError(f"instance not found: {instance_id}")
+        pane = resolved["pane_id"]
+    return pane, instance_id
+
+
+def _h_send_ethereal(control, params):
+    pane, instance_id = _resolve_target_pane(control, params)
+    requested_agent = _s(params, "agent", "auto")
+    resolved_agent = resolve_agent_for_pane(control.adapter, pane, requested_agent, default="auto")
+    message = _s(params, "message") or _s(params, "text")
+    rendered = ethereal_invocation_text(resolved_agent, message)
+    if resolved_agent == "claude":
+        post_actions = (
+            {"type": "key", "key": "c"},
+            {"type": "key", "key": "C-c"},
+        )
+    elif resolved_agent == "codex":
+        post_actions = (
+            {"type": "literal_submit", "text": "/copy"},
+            {"type": "key", "key": "C-c"},
+        )
+    else:  # ethereal_invocation_text should already fail closed; keep explicit.
+        raise ValueError("ethereal send requires claude or codex")
+    result = _send_text_pipeline(
+        control,
+        pane=pane,
+        text=rendered,
+        submit=True,
+        clear_prompt=_b(params, "clear_prompt"),
+        verify=_b(params, "verify", True),
+        verify_timeout=_f(params, "verify_timeout", 5.0),
+        submit_settle_seconds=_f(params, "submit_settle_seconds", 1.0),
+        ack_submit_retries=_i(params, "ack_submit_retries", 2),
+        post_submit_actions=post_actions,
+    )
+    return {
+        **result,
+        "submitted": True,
+        "kind": "ethereal",
+        "agent": resolved_agent,
+        "rendered": rendered,
+        "message": message,
+        "instance_id": result.get("instance_id") or instance_id,
+    }
+
+
+def _h_append_user_text(control, params):
+    pane, instance_id = _resolve_target_pane(control, params)
+    text = _s(params, "text")
+    if not text:
+        raise ValueError("direct-user text is empty")
+    # Human ON/PENDING lock remains inviolable; the sanctioned direct-user
+    # override is only to bypass a green AGENT hold/quiet-hours for operator
+    # keyboard input arriving through Discord.
+    _refuse_send_into_human_lock(control, pane)
+    with thread_local_override("tmuxctld-direct-user"):
+        control.adapter.run("send-keys", "-t", pane, "-l", text)
+    gate = getattr(control.adapter, "last_send_gate_result", None)
+    if gate and gate.get("suppressed"):
+        raise TmuxSendGated(gate)
+    return {
+        "status": "inserted",
+        "pane": pane,
+        "instance_id": instance_id,
+        "direct_user": True,
+        "submitted": False,
+        "clear_prompt": False,
+    }
 
 
 def _h_insert_invocation(control, params):
@@ -1573,6 +1731,8 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/prompt-start"): _h_prompt_start,
     ("POST", "/prompt-end"): _h_prompt_end,
     ("POST", "/invoke-skill"): _h_invoke_skill,
+    ("POST", "/send-ethereal"): _h_send_ethereal,
+    ("POST", "/append-user-text"): _h_append_user_text,
     ("POST", "/insert-invocation"): _h_insert_invocation,
     ("POST", "/assert-instance"): _h_assert_instance,
     ("POST", "/hooks/user-prompt-submit"): _h_hook_user_prompt_submit,

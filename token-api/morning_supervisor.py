@@ -424,14 +424,9 @@ async def _discord_alert(content: str) -> None:
 
 
 async def _backup_message_to_custodes(message: str) -> dict:
-    """Best-effort: resolve the live custodes pane from tmux and agent-cmd it.
-
-    Never hardcode the pane and do not trust registry runtime columns. The live
-    pane identity is the tmux @PANE_ID marker resolved by tmuxctl.
-    """
+    """Best-effort: resolve live Custodes and send through tmuxctld."""
     bin_dir = Path(__file__).resolve().parents[1] / "cli-tools" / "bin"
     tmuxctl = bin_dir / "tmuxctl"
-    agent_cmd = bin_dir / "agent-cmd"
     try:
         resolved = await asyncio.to_thread(
             subprocess.run,
@@ -452,27 +447,17 @@ async def _backup_message_to_custodes(message: str) -> dict:
     pane = resolved.stdout.strip()
     if not pane:
         return {"sent": False, "reason": "no_live_custodes_pane"}
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            str(agent_cmd),
-            "--pane",
-            pane,
-            message,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        except TimeoutError:
-            if proc.returncode is None:
-                proc.kill()
-            _, stderr = await proc.communicate()
-            logger.warning("supervisor agent-cmd timed out: %s", stderr.decode()[:200])
-            return {"sent": False, "reason": "agent_cmd_timeout", "pane": pane}
-        if proc.returncode != 0:
-            logger.warning("supervisor agent-cmd failed: %s", stderr.decode()[:200])
-            return {"sent": False, "reason": "agent_cmd_failed", "pane": pane}
-        return {"sent": True, "pane": pane}
-    except Exception as exc:
-        logger.warning("supervisor agent-cmd error: %s", exc)
-        return {"sent": False, "reason": str(exc)}
+    env = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/send-text",
+        {"pane": pane, "text": message, "submit": True, "verify": True},
+        timeout=15,
+        default_loopback=True,
+    )
+    if env and env.get("ok"):
+        return {"sent": True, "pane": pane, "operation": "tmuxctld.send_text"}
+    err = env.get("error") if isinstance(env, dict) and isinstance(env.get("error"), dict) else {}
+    if err.get("code") == "gated":
+        return {"sent": False, "reason": "send_gated", "pane": pane, "gated": True, "envelope": env}
+    logger.warning("supervisor tmuxctld send failed: %s", env)
+    return {"sent": False, "reason": "tmuxctld_send_failed", "pane": pane, "envelope": env}

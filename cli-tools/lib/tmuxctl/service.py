@@ -48,6 +48,7 @@ from .skill_invoke import (
     invoke_skill_in_pane,
     move_to_prompt_end,
     move_to_prompt_start,
+    send_invocation_to_pane,
     send_skill_invocation_to_pane,
 )
 from .snapshot import build_window_snapshot, build_workspace_snapshot
@@ -306,6 +307,27 @@ class TmuxControlPlane:
             target,
             skill,
             agent=agent,
+            arguments=arguments,
+            clear_prompt=clear_prompt,
+        )
+
+    def send_invocation(
+        self,
+        target: str,
+        name: str,
+        *,
+        agent: str = "auto",
+        kind: str = "skill",
+        arguments: str | None = None,
+        clear_prompt: bool = False,
+    ) -> str:
+        """Send and submit a kind-aware invocation (skill or command)."""
+        return send_invocation_to_pane(
+            self.adapter,
+            target,
+            name,
+            agent=agent,
+            kind=kind,
             arguments=arguments,
             clear_prompt=clear_prompt,
         )

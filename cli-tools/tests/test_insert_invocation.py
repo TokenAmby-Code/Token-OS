@@ -200,3 +200,44 @@ def test_h_insert_invocation_skill_uses_engine_leader(monkeypatch: pytest.Monkey
 
     assert out["rendered"] == "$preplan "
     assert out["agent"] == "codex"
+
+
+def test_h_invoke_skill_submit_sends_codex_tab_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
+    adapter = RecordingAdapter()
+    control = TmuxControlPlane(adapter=adapter)
+
+    out = daemon._h_invoke_skill(
+        control,
+        {
+            "pane": "%42",
+            "name": "preplan",
+            "kind": "skill",
+            "agent": "codex",
+            "submit": True,
+            "verify": False,
+        },
+    )
+
+    assert out["submitted"] is True
+    assert out["rendered"] == "$preplan "
+    assert adapter.calls.count(("send-keys", "-t", "%42", "Tab")) == 1
+    assert adapter.calls[-3:] == [
+        ("send-keys", "-t", "%42", "Tab"),
+        ("send-keys", "-t", "%42", "C-m"),
+        ("send-keys", "-t", "%42", "C-m"),
+    ]
+
+
+def test_h_invoke_skill_submit_command_skips_codex_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
+    adapter = RecordingAdapter()
+    control = TmuxControlPlane(adapter=adapter)
+
+    out = daemon._h_invoke_skill(
+        control,
+        {"pane": "%42", "name": "plan", "kind": "command", "agent": "codex", "submit": True},
+    )
+
+    assert out["rendered"] == "/plan "
+    assert ("send-keys", "-t", "%42", "Tab") not in adapter.calls

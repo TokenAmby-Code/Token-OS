@@ -39,6 +39,14 @@ def test_preplan_codex_inserts_dollar_leader_and_tabs_to_sink_skill() -> None:
     assert "sink:Tab" in out
 
 
+def test_preplan_local_fallback_routes_bare_skill_through_tmuxctl() -> None:
+    script = SCRIPT.read_text()
+    assert 'insert_preplan_skill()  { "${_script_dir}/tmuxctl" invoke-skill preplan' in script
+    assert 'insert_preplan_skill "$agent"' in script
+    assert "sink_codex_skill" not in script
+    assert 'text="$(preplan_leader' not in script
+
+
 def test_plan_inserts_universal_slash_plan() -> None:
     out = _dry("plan")
     assert "selection=plan" in out

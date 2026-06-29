@@ -15,6 +15,7 @@ SkillSinkKeys = tuple[str, ...]
 # hands the daemon a bare name + kind, and the leader/sink policy lives in ONE place
 # instead of being re-derived in bash per call.
 INVOCATION_KINDS = ("skill", "command")
+ETHEREAL_COMMANDS = {"claude": "btw", "codex": "side"}
 
 
 def normalize_invocation_kind(kind: str | None) -> str:
@@ -72,6 +73,24 @@ def invocation_text(
     prefix = f"{invocation_leader(agent, kind=kind)}{normalize_skill_name(name)}"
     args = (arguments or "").strip()
     return f"{prefix} {args}" if args else f"{prefix} "
+
+
+def ethereal_invocation_text(agent: str | None, message: str) -> str:
+    """Render a side-channel message for the resolved harness.
+
+    The caller supplies only semantic ``kind=ethereal`` text.  tmuxctld owns the
+    harness-specific command spelling: Claude gets ``/btw`` and Codex gets
+    ``/side``.  Unknown engines fail closed rather than polluting the main
+    conversation with a bare message.
+    """
+    resolved_agent = normalize_agent(agent)
+    command = ETHEREAL_COMMANDS.get(resolved_agent)
+    if not command:
+        raise ValueError("ethereal send requires a resolved claude or codex agent")
+    payload = (message or "").strip()
+    if not payload:
+        raise ValueError("ethereal message is empty")
+    return invocation_text(command, "auto", kind="command", arguments=payload)
 
 
 def invocation_sink_keys(agent: str | None, *, kind: str = "skill") -> SkillSinkKeys:
@@ -212,6 +231,11 @@ def resolve_agent_for_pane(
     process_agent = detect_agent_from_pane_process(adapter, resolved_pane)
     if process_agent != "auto":
         return process_agent
+
+    token_api_hint = adapter.show_pane_option(resolved_pane, "@TOKEN_API_ENGINE")
+    token_api_agent = normalize_agent(token_api_hint)
+    if token_api_agent != "auto":
+        return token_api_agent
 
     if stopped_match:
         return stopped_match
@@ -357,12 +381,44 @@ def send_skill_invocation_to_pane(
     agent with a skill rather than prose instructions. Target resolution and the
     universal send gate stay inside ``TmuxAdapter.send_text_then_submit``.
     """
-    resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
-    text = skill_invocation_text(skill, resolved_agent, arguments)
+    return send_invocation_to_pane(
+        adapter,
+        pane,
+        skill,
+        agent=agent,
+        kind="skill",
+        arguments=arguments,
+        clear_prompt=clear_prompt,
+    )
+
+
+def send_invocation_to_pane(
+    adapter: TmuxAdapter,
+    pane: str,
+    name: str,
+    *,
+    agent: str = "auto",
+    kind: str = "skill",
+    arguments: str | None = None,
+    clear_prompt: bool = False,
+) -> str:
+    """Build a kind-aware invocation, send it, and submit it.
+
+    This is the submit-side sibling of :func:`insert_invocation_in_pane`: callers
+    provide a bare name plus ``kind`` and the central renderer owns both the
+    leader and any pre-submit sink keys. Commands never resolve an engine and
+    never receive the Codex skill-chip Tab sink.
+    """
+    resolved_kind = normalize_invocation_kind(kind)
+    if resolved_kind == "command":
+        resolved_agent = "auto"
+    else:
+        resolved_agent = resolve_agent_for_pane(adapter, pane, agent)
+    text = invocation_text(name, resolved_agent, kind=resolved_kind, arguments=arguments)
     adapter.send_text_then_submit(
         pane,
         text,
         clear_prompt=clear_prompt,
-        pre_submit_keys=codex_skill_sink_keys(resolved_agent),
+        pre_submit_keys=invocation_sink_keys(resolved_agent, kind=resolved_kind),
     )
     return text

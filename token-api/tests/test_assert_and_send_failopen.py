@@ -1,10 +1,10 @@
 """`_assert_and_send_custodes` must fail open when the persona correction is stuck.
 
-Counterpart to the tmuxctl `send-text` fail-open: when `tmuxctl assert-instance`
+Counterpart to the tmuxctld prompt-send fail-open: when `tmuxctl assert-instance`
 reports the live runtime is present but the persona correction is stuck after
-bounded attempts (`deliverable=True`), the launch/Discord send path must still run
-`tmuxctl send-text` and deliver the payload — emitting a loud diagnostic — instead
-of returning `dispatched=False` and silently dropping the enforcement intervention.
+bounded attempts (`deliverable=True`), the launch/Discord send path must still
+deliver through tmuxctld — emitting a loud diagnostic — instead of returning
+`dispatched=False` and silently dropping the enforcement intervention.
 A genuinely failed assertion (no `deliverable`) must still refuse delivery.
 """
 
@@ -54,11 +54,20 @@ async def test_assert_and_send_fails_open_when_correction_stuck(app_env, monkeyp
         },
     )
 
+    sent = []
+
+    async def fake_send(pane, prompt, **kwargs):
+        sent.append((pane, prompt, kwargs))
+        return {"returncode": 0, "stderr": "", "gated": False}
+
+    monkeypatch.setattr(main, "send_prompt_to_pane", fake_send)
+
     result = await main._assert_and_send_custodes("enforcement payload", source="test")
 
-    # The payload reached the pane via send-text despite the stuck correction.
+    # The payload reached the pane via tmuxctld despite the stuck correction.
     assert result["dispatched"] is True
-    assert any("send-text" in argv for argv in calls)
+    assert sent == [("%25", "enforcement payload", {})]
+    assert not any("send-text" in argv for argv in calls)
 
 
 async def test_assert_and_send_refuses_when_not_deliverable(app_env, monkeypatch) -> None:

@@ -29,19 +29,25 @@ class SelectorError(ValueError):
 
 
 def temp_command_for_engine(engine: str | None, payload: str) -> tuple[str, str]:
+    """Return legacy command metadata and dispatch mode.
+
+    Dispatch no longer uses this to render ``/btw`` or ``/side``.  tmuxctld
+    receives semantic ``kind=ethereal`` and resolves the command itself.
+    """
     normalized = (engine or "").strip().lower()
     if normalized == "claude":
-        return f"/btw {payload}", "side_channel"
+        return "btw", "side_channel"
     if normalized == "codex":
-        return f"/side {payload}", "side_channel"
-    return payload, "direct_unknown_engine"
+        return "side", "side_channel"
+    return "", "direct_unknown_engine"
 
 
 def temp_channel_metadata(engine: str | None) -> dict[str, Any]:
     normalized = (engine or "").strip().lower()
     if normalized == "claude":
         return {
-            "command": "/btw",
+            "kind": "ethereal",
+            "command": None,
             "ephemeral": True,
             "tool_calls_inert": True,
             "availability": "expected",
@@ -49,7 +55,8 @@ def temp_channel_metadata(engine: str | None) -> dict[str, Any]:
         }
     if normalized == "codex":
         return {
-            "command": "/side",
+            "kind": "ethereal",
+            "command": None,
             "ephemeral": True,
             "tool_calls_inert": False,
             "availability": "not_preflighted",
@@ -60,6 +67,7 @@ def temp_channel_metadata(engine: str | None) -> dict[str, Any]:
             ],
         }
     return {
+        "kind": "ethereal",
         "command": None,
         "ephemeral": False,
         "tool_calls_inert": False,
@@ -89,7 +97,7 @@ async def send_temp_message(
     ``main.process_pane_write_queue_once`` so dispatch uses the existing
     server-owned typing guard and send-keys implementation.
     """
-    command_payload, mode = temp_command_for_engine(engine, payload)
+    _, mode = temp_command_for_engine(engine, payload)
     if queue_sender is None:
         raise RuntimeError("send_temp_message requires the existing pane-write queue sender")
 
@@ -98,8 +106,8 @@ async def send_temp_message(
             instance_id=instance_id or pane,
             tmux_pane=pane,
             source=TEMP_MESSAGE_SOURCE,
-            purpose=TEMP_MESSAGE_PURPOSE,
-            payload=command_payload,
+            purpose="ethereal",
+            payload=payload,
         )
     )
     result: dict[str, Any] = {
@@ -110,7 +118,9 @@ async def send_temp_message(
         "channel": temp_channel_metadata(engine),
         "queue_id": queued.get("id"),
         "queued_status": queued.get("status"),
-        "payload": command_payload,
+        "payload": payload,
+        "kind": "ethereal",
+        "command_name": None,
     }
     if queue_drainer and queued.get("id"):
         drained = await _maybe_await(queue_drainer(queued["id"]))
@@ -132,7 +142,7 @@ def preview_temp_message(
     instance_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a temp-message receipt without enqueueing or dispatching to tmux."""
-    command_payload, mode = temp_command_for_engine(engine, payload)
+    _, mode = temp_command_for_engine(engine, payload)
     return {
         "instance_id": instance_id,
         "tmux_pane": pane,
@@ -141,7 +151,9 @@ def preview_temp_message(
         "channel": temp_channel_metadata(engine),
         "queue_id": None,
         "queued_status": None,
-        "payload": command_payload,
+        "payload": payload,
+        "kind": "ethereal",
+        "command_name": None,
         "dispatch": {"status": "skipped_dry_run"},
         "status": "previewed",
     }

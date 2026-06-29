@@ -47,6 +47,35 @@ async def _no_pending_input(_pane: str) -> bool:
     return False
 
 
+def _stub_tmuxctld_send(main, monkeypatch, *, gated: bool = False) -> list[dict]:
+    calls: list[dict] = []
+
+    def _post(path, body, **kwargs):
+        calls.append({"path": path, "body": body, "kwargs": kwargs})
+        if gated:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "gated",
+                    "message": "send suppressed by gate: typing_guard",
+                    "detail": {"reason": "typing_guard", "suppressed": True},
+                },
+            }
+        return {
+            "ok": True,
+            "result": {
+                "dispatch_id": "dispatch-test",
+                "payload_hash": "hash-test",
+                "verification_status": "unverified",
+                "verified_by": None,
+                "pane": body.get("pane"),
+            },
+        }
+
+    monkeypatch.setattr(main.shared, "_tmuxctld_post_json", _post)
+    return calls
+
+
 def _fetch_status(db_path: Any, queue_id: str) -> str | None:
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
@@ -60,12 +89,7 @@ def _fetch_status(db_path: Any, queue_id: str) -> str | None:
 
 async def test_send_payload_translates_gate_to_gated_result(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    import tmuxctl.tmux_adapter as ta
-
-    def _raise_gated(self, target, text, **kwargs):
-        raise ta.TmuxSendGated({"reason": "typing_guard", "suppressed": True})
-
-    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", _raise_gated)
+    _stub_tmuxctld_send(main, monkeypatch, gated=True)
 
     result = await main._tmux_send_payload_then_submit("%9", "hello FG")
 
@@ -78,12 +102,7 @@ async def test_send_payload_translates_gate_to_gated_result(app_env: Any, monkey
 
 async def test_send_payload_success_is_unverified_not_sent(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
-    import tmuxctl.tmux_adapter as ta
-
-    def _ok(self, target, text, **kwargs):
-        return None
-
-    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", _ok)
+    calls = _stub_tmuxctld_send(main, monkeypatch)
 
     result = await main._tmux_send_payload_then_submit("%9", "hello FG")
 
@@ -91,78 +110,80 @@ async def test_send_payload_success_is_unverified_not_sent(app_env: Any, monkeyp
     assert result["verification_status"] == "unverified", "bytes issued != proven delivery"
     assert result["verified_by"] is None
     assert not result.get("gated")
+    assert calls[0]["path"] == "/send-text"
 
 
-async def test_send_payload_tabs_codex_skill_before_submit(app_env: Any, monkeypatch: Any) -> None:
-    main = app_env.main
-    import tmuxctl.tmux_adapter as ta
-
-    seen: dict[str, Any] = {}
-
-    def _ok(self, target, text, **kwargs):
-        seen["target"] = target
-        seen["text"] = text
-        seen["kwargs"] = kwargs
-        return None
-
-    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", _ok)
-
-    result = await main._tmux_send_payload_then_submit(
-        "%9",
-        '$golden-throne-sop victory condition "needs tests passing" is unmet',
-        enable_skill_sink=True,
-    )
-
-    assert result["returncode"] == 0
-    assert seen["kwargs"]["pre_submit_keys"] == ("Tab",)
-
-
-async def test_send_payload_does_not_tab_dollar_text_without_skill_sink(
+async def test_send_skill_to_pane_uses_structured_invocation(
     app_env: Any, monkeypatch: Any
 ) -> None:
     main = app_env.main
-    import tmuxctl.tmux_adapter as ta
+    calls = _stub_tmuxctld_send(main, monkeypatch)
 
-    seen: dict[str, Any] = {}
+    result = await main.send_skill_to_pane(
+        "%9",
+        "golden-throne-sop",
+        arguments='victory condition "needs tests passing" is unmet',
+        agent="codex",
+    )
 
-    def _ok(self, target, text, **kwargs):
-        seen["kwargs"] = kwargs
-        return None
+    assert result["returncode"] == 0
+    assert calls[0]["path"] == "/invoke-skill"
+    assert calls[0]["body"]["kind"] == "skill"
+    assert calls[0]["body"]["name"] == "golden-throne-sop"
+    assert calls[0]["body"]["agent"] == "codex"
 
-    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", _ok)
+
+async def test_send_prompt_to_pane_does_not_classify_dollar_text(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    main = app_env.main
+    calls = _stub_tmuxctld_send(main, monkeypatch)
 
     result = await main._tmux_send_payload_then_submit("%9", "$HOME is not a skill")
 
     assert result["returncode"] == 0
-    assert seen["kwargs"]["pre_submit_keys"] == ()
+    assert calls[0]["path"] == "/send-text"
+    assert "pre_submit_keys" not in calls[0]["body"]
 
 
-async def test_send_payload_does_not_tab_claude_skill(app_env: Any, monkeypatch: Any) -> None:
+async def test_send_command_to_pane_uses_command_kind_without_agent(
+    app_env: Any, monkeypatch: Any
+) -> None:
     main = app_env.main
-    import tmuxctl.tmux_adapter as ta
+    calls = _stub_tmuxctld_send(main, monkeypatch)
 
-    seen: dict[str, Any] = {}
-
-    def _ok(self, target, text, **kwargs):
-        seen["kwargs"] = kwargs
-        return None
-
-    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", _ok)
-
-    result = await main._tmux_send_payload_then_submit("%9", "/golden-throne-sop needs x")
+    result = await main.send_command_to_pane("%9", "side", arguments="needs x")
 
     assert result["returncode"] == 0
-    assert seen["kwargs"]["pre_submit_keys"] == ()
+    assert calls[0]["path"] == "/invoke-skill"
+    assert calls[0]["body"]["kind"] == "command"
+    assert calls[0]["body"]["name"] == "side"
+    assert calls[0]["body"]["agent"] == "auto"
 
 
-async def test_queue_enables_skill_sink_only_for_codex_gt(app_env: Any, monkeypatch: Any) -> None:
+async def test_send_ethereal_to_pane_uses_semantic_daemon_route(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    main = app_env.main
+    calls = _stub_tmuxctld_send(main, monkeypatch)
+
+    result = await main.send_ethereal_to_pane("%9", "roll call", agent="auto")
+
+    assert result["returncode"] == 0
+    assert calls[0]["path"] == "/send-ethereal"
+    assert calls[0]["body"]["kind"] == "ethereal"
+    assert calls[0]["body"]["message"] == "roll call"
+    assert "agent" not in calls[0]["body"]
+
+
+async def test_queue_routes_structured_gt_skill_to_tmuxctld(app_env: Any, monkeypatch: Any) -> None:
     main = app_env.main
     monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
     seen: dict[str, Any] = {}
 
-    async def _ok(pane, payload, **kwargs):
+    async def _ok(pane, skill, **kwargs):
         seen["pane"] = pane
-        seen["payload"] = payload
+        seen["skill"] = skill
         seen["kwargs"] = kwargs
         return {
             "returncode": 0,
@@ -173,7 +194,7 @@ async def test_queue_enables_skill_sink_only_for_codex_gt(app_env: Any, monkeypa
             "verified_by": None,
         }
 
-    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _ok)
+    monkeypatch.setattr(main, "send_skill_to_pane", _ok)
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
             """INSERT INTO legacy_instances
@@ -197,13 +218,69 @@ async def test_queue_enables_skill_sink_only_for_codex_gt(app_env: Any, monkeypa
         instance_id="gt-codex-skill",
         tmux_pane="%9",
         source="golden_throne",
-        purpose="followup",
-        payload='$golden-throne-sop victory condition "needs tests passing" is unmet',
+        purpose="skill:golden-throne-sop",
+        payload='victory condition "needs tests passing" is unmet',
     )
     results = await main.process_pane_write_queue_once(queued["id"])
 
     assert results[0]["status"] == main.PANE_WRITE_SENT
-    assert seen["kwargs"]["enable_skill_sink"] is True
+    assert seen["skill"] == "golden-throne-sop"
+    assert seen["kwargs"]["arguments"] == 'victory condition "needs tests passing" is unmet'
+    assert seen["kwargs"]["agent"] == "codex"
+
+
+async def test_queue_routes_temp_message_as_ethereal_to_tmuxctld(
+    app_env: Any, monkeypatch: Any
+) -> None:
+    main = app_env.main
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
+    seen: dict[str, Any] = {}
+
+    async def _ok(pane, message, **kwargs):
+        seen["pane"] = pane
+        seen["message"] = message
+        seen["kwargs"] = kwargs
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "verification_status": "unverified",
+            "verified_by": None,
+        }
+
+    monkeypatch.setattr(main, "send_ethereal_to_pane", _ok)
+    with sqlite3.connect(app_env.db_path) as conn:
+        conn.execute(
+            """INSERT INTO legacy_instances
+               (id, session_id, tab_name, working_dir, origin_type, device_id,
+                status, instance_type, engine)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "temp-codex-ethereal",
+                "temp-codex-ethereal",
+                "Temp Codex",
+                "/tmp",
+                "local",
+                "Mac-Mini",
+                "idle",
+                "one_off",
+                "codex",
+            ),
+        )
+
+    queued = await main.enqueue_pane_write(
+        instance_id="temp-codex-ethereal",
+        tmux_pane="%9",
+        source="temp_message",
+        purpose="ethereal",
+        payload="roll call",
+    )
+    results = await main.process_pane_write_queue_once(queued["id"])
+
+    assert results[0]["status"] == main.PANE_WRITE_SENT
+    assert seen["message"] == "roll call"
+    assert seen["kwargs"].get("agent", "auto") == "auto"
 
 
 # ---- queue handling: gated stays pending, success goes sent -----------------
@@ -368,28 +445,23 @@ async def test_clear_prompt_confirms_submission_when_composer_clears(
     app_env: Any, monkeypatch: Any
 ) -> None:
     main = app_env.main
-    import tmuxctl.tmux_adapter as ta
-
-    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", lambda self, t, x, **k: None)
-    # After submit the composer is empty -> submission confirmed.
-    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
+    calls = _stub_tmuxctld_send(main, monkeypatch)
+    # tmuxctld owns submission verification; token-api no longer probes composer.
 
     result = await main._tmux_send_payload_then_submit("%9", "hello FG", clear_prompt=True)
 
     assert result["returncode"] == 0
-    assert result["verification_status"] == "submitted"
-    assert result["verified_by"] == "composer_cleared"
+    assert result["verification_status"] == "unverified"
+    assert result["verified_by"] is None
+    assert calls[0]["body"]["clear_prompt"] is True
 
 
 async def test_clear_prompt_stays_unverified_when_composer_not_cleared(
     app_env: Any, monkeypatch: Any
 ) -> None:
     main = app_env.main
-    import tmuxctl.tmux_adapter as ta
-
-    monkeypatch.setattr(ta.TmuxAdapter, "send_text_then_submit", lambda self, t, x, **k: None)
-    # Composer still holds text -> submit not proven, stays unverified.
-    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _has_pending_input)
+    _stub_tmuxctld_send(main, monkeypatch)
+    # tmuxctld owns submission verification; token-api no longer probes composer.
 
     result = await main._tmux_send_payload_then_submit("%9", "hello FG", clear_prompt=True)
 
