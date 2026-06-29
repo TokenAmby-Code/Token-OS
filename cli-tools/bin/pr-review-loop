@@ -98,9 +98,12 @@ except Exception:
     age=999
 print(max(0, int(150-age)))
 PY
-)
+    )
     [[ "$wait_for" =~ ^[0-9]+$ ]] || return 0
-    (( wait_for > 0 )) && sleep "$wait_for"
+    if (( wait_for > 0 )); then
+        sleep "$wait_for"
+    fi
+    return 0
 }
 
 # Show help
