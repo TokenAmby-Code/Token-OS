@@ -4,7 +4,54 @@ set -euo pipefail
 # but force a clean exit 0 even if errexit aborts mid-script on a transient
 # subprocess-spawn failure (EMFILE / token-api-restart race). Block decisions are
 # relayed via stdout JSON, never via the exit code, so forcing exit 0 is safe.
-trap 'exit 0' EXIT
+#
+# EXCEPTION — the registration-critical SessionStart path. A bare claude/codex
+# launch (no dispatch warming) registers its DB row, @INSTANCE_ID stamp, and
+# session-doc binding ONLY through this hook, with no other re-registration leg
+# until the next full `tx restart`. A blanket `trap 'exit 0'` there masks a
+# dropped/failed registration as success, permanently stranding the pane with no
+# row, no @INSTANCE_ID, and no error — the silent-swallow wound that took fleet
+# registration down ~2.4h and killed cold-start workers. So the trap is GATED:
+# a SessionStart that never confirms a bound row exits NON-ZERO and writes a
+# visible failure record; every other hook stays best-effort exit-0. A non-zero
+# SessionStart hook exit does not block session startup, so this is still safe.
+SESSIONSTART_CRITICAL=0   # 1 once this invocation is known to be SessionStart
+REGISTRATION_OK=0         # 1 only after a confirmed-successful registration reply
+FAILURE_LOGGED=0          # de-dupe: the inline failure logger already fired
+HTTP_CODE=""              # last SessionStart POST status (for the failure record)
+RESPONSE=""               # last SessionStart POST body (for the failure record)
+RESOLVED_PANE=""          # set during pane resolution; referenced by the logger
+SESSIONSTART_FAILURE_LOG="${SESSIONSTART_FAILURE_LOG:-${HOME}/.claude/logs/sessionstart-failures.log}"
+
+_log_sessionstart_failure() {
+  # Surface a registration failure VISIBLY and durably. token-api may itself be
+  # the thing that is down, so this must NOT depend on it: append to a dedicated,
+  # greppable failure log AND emit to stderr (shown in-transcript for an
+  # interactive pane; captured by the launching wrapper for an autonomous one).
+  local reason="$1" sid
+  FAILURE_LOGGED=1
+  sid=$(echo "${HOOK_INPUT:-}" | jq -r '.session_id // "?"' 2>/dev/null || echo "?")
+  mkdir -p "$(dirname "$SESSIONSTART_FAILURE_LOG")" 2>/dev/null || true
+  printf '[%s] SessionStart registration FAILED: %s | session=%s pane=%s | http=%s resp=%s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$reason" "$sid" \
+    "${TMUX_PANE:-${RESOLVED_PANE:-?}}" "${HTTP_CODE:-?}" "${RESPONSE:0:300}" \
+    >> "$SESSIONSTART_FAILURE_LOG" 2>/dev/null || true
+  echo "token-api SessionStart registration FAILED: ${reason} (see ${SESSIONSTART_FAILURE_LOG})" >&2
+}
+
+_hook_exit() {
+  local rc=$?
+  # Registration-critical SessionStart that never confirmed a bound row: do NOT
+  # mask it with exit 0. Surface it (visible record + non-zero) so a stranded
+  # pane is never silent again. SessionStart's exit code cannot block startup.
+  if [[ "$SESSIONSTART_CRITICAL" == "1" && "$REGISTRATION_OK" != "1" ]]; then
+    [[ "$FAILURE_LOGGED" == "1" ]] || _log_sessionstart_failure "hook exited without confirmed registration (rc=${rc})"
+    exit 1
+  fi
+  # Every other hook stays best-effort: never block Claude Code.
+  exit 0
+}
+trap _hook_exit EXIT
 # generic-hook.sh - Unified hook dispatcher for Claude Code
 # Forwards hook JSON + action_type to token-api server for centralized handling
 #
@@ -31,6 +78,14 @@ fi
 
 # Get action type from environment (set by settings.json hook command)
 ACTION_TYPE="${HOOK_ACTION_TYPE:-Unknown}"
+
+# Mark the registration-critical path as early as possible so even an EMFILE
+# abort during payload assembly trips the gated trap (visible) rather than the
+# blanket exit-0 (silent strand). Cleared back to non-critical for every other
+# hook type, which stay best-effort.
+if [[ "$ACTION_TYPE" == "SessionStart" ]]; then
+  SESSIONSTART_CRITICAL=1
+fi
 
 # Resolve token-api URL from centralized machine config.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -319,19 +374,41 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
     rm -f "/tmp/claude-panes/flush-${SAFE_PANE}.ts" 2>/dev/null
   fi
 
-  # SessionStart carries the pane's registration. It is fire-and-forget with no
-  # other re-registration path until the next full `tx restart`, so a single
-  # dropped POST (a momentary token-api hiccup — restart race, brief EMFILE fd
+  # SessionStart carries the pane's registration. It is the ONLY registration
+  # path a bare launch has until the next full `tx restart`, so a single dropped
+  # POST (a momentary token-api hiccup — restart race, brief EMFILE fd
   # exhaustion) strands the pane with no registry row. Retry with a bounded
   # backoff so a transient server blip self-recovers in-band. --retry-max-time
   # caps the total retry window so a genuinely-down server still can't block
-  # Claude's startup for long; the hook stays best-effort and exits 0 regardless.
-  RESPONSE=$(echo "${HOOK_INPUT}" | \
-    curl -s --connect-timeout 2 --max-time 5 \
+  # Claude's startup for long.
+  #
+  # Capture BOTH the body and the HTTP status: `curl -s` does not fail on a 503
+  # (only -f does), so the server's bounded fail-loud (503 on a write that could
+  # not self-heal) would otherwise be swallowed exactly like a 200. We validate
+  # the reply below and only a 2xx + {"success": true} counts as a bound row.
+  RESP_FILE="${HOME}/.claude/logs/.sessionstart-resp.$$"
+  HTTP_CODE=$(echo "${HOOK_INPUT}" | \
+    curl -s -o "$RESP_FILE" -w '%{http_code}' \
+      --connect-timeout 2 --max-time 5 \
       --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 12 \
       -X POST "${API_URL}/api/hooks/${ACTION_TYPE}" \
       -H "Content-Type: application/json" \
       -d @- 2>/dev/null) || true
+  RESPONSE=$(cat "$RESP_FILE" 2>/dev/null || echo "")
+  rm -f "$RESP_FILE" 2>/dev/null || true
+
+  # Validate the registration actually bound a row. A confirmed reply is a 2xx
+  # whose body is {"success": true} (action registered / already_registered /
+  # reregistered / supplanted / transplant_refreshed). Anything else — a 503
+  # fail-loud, a connection-refused empty body, a read timeout — is a real
+  # failure on the sole registration path of a bare launch, so surface it
+  # (the gated trap then exits non-zero); never let it pass as a silent strand.
+  REG_SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false' 2>/dev/null || echo false)
+  if [[ "$HTTP_CODE" == 2* && "$REG_SUCCESS" == "true" ]]; then
+    REGISTRATION_OK=1
+  else
+    _log_sessionstart_failure "token-api POST ${API_URL}/api/hooks/SessionStart did not confirm a bound row"
+  fi
 
   # Defer auto-rename to next UserPromptSubmit via pending-ui-cmds. Pane tint is
   # DB/persona-resolved and applied by tmux style only; no slash color path.
@@ -357,5 +434,8 @@ else
   disown 2>/dev/null || true
 fi
 
-# Always exit successfully - hooks must not block Claude Code
+# Hand off to the gated EXIT trap (_hook_exit): non-critical hooks exit 0 (never
+# block Claude Code); a registration-critical SessionStart that never confirmed a
+# bound row exits non-zero with a visible failure record instead of silently
+# stranding the pane.
 exit 0
