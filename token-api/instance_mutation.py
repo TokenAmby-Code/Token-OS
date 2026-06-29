@@ -32,6 +32,7 @@ OFFICIAL_INSTANCE_NAME_ACTORS = frozenset(
     {
         "instance-name-cli",
         "naming-interview",
+        "persona-seat-registration",
         "session-doc-name",
     }
 )

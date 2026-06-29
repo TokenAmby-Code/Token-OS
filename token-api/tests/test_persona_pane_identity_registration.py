@@ -73,8 +73,9 @@ def _insert_instance(
 def _row(db_path, instance_id):
     conn = _conn(db_path)
     row = conn.execute(
-        """SELECT i.rank, i.status, i.commander_type, i.commander_id, i.hook_driven,
-                  p.slug AS persona_slug
+        """SELECT i.name, i.rank, i.status, i.commander_type, i.commander_id,
+                  i.hook_driven, i.dispatch_target, i.launch_mode,
+                  i.workflow_blocked_reason, i.engine, p.slug AS persona_slug
              FROM instances i
              LEFT JOIN personas p ON p.id = i.persona_id
             WHERE i.id = ?""",
@@ -195,6 +196,95 @@ def test_orchestrator_pane_registers_with_overseer_identity(
     assert row["persona_slug"] == "orchestrator"
     assert row["rank"] == "overseer"
     assert row["commander_type"] == "emperor"
+
+
+def test_persona_tmux_target_registration_stores_public_alias_not_raw_pane(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Cutover/persona-seat path regression: launcher env copied
+    # TOKEN_API_DISPATCH_TARGET=$TMUX_PANE ("%pp"). Durable registration must store
+    # the tmuxctld/@PANE_ID alias instead, and the alias-backed persona must not
+    # enter needs-name/tab_name_placeholder drift.
+    hooks = sys.modules["routes.hooks"]
+    stamps: list[tuple[str | None, str | None, str | None]] = []
+
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("mechanicus:orchestrator"))
+    _no_pane_occupant(monkeypatch, hooks)
+
+    async def stamp(pane, session_id, *, display_name=None):
+        stamps.append((pane, session_id, display_name))
+
+    monkeypatch.setattr(hooks, "_stamp_instance_id", stamp)
+
+    result = _start_session(
+        hooks,
+        "orch-raw-pane",
+        env={
+            "TOKEN_API_LAUNCHER": "persona-seat",
+            "TOKEN_API_LAUNCH_MODE": "tmux_target",
+            "TOKEN_API_DISPATCH_TARGET": "%32",
+        },
+    )
+    assert result["success"] is True
+
+    row = _row(app_env.db_path, "orch-raw-pane")
+    assert row["dispatch_target"] == "mechanicus:orchestrator"
+    assert row["launch_mode"] == "tmux_target"
+    assert row["persona_slug"] == "orchestrator"
+    assert row["name"] == "Orchestrator"
+    assert row["workflow_blocked_reason"] is None
+    assert row["hook_driven"] == 0
+    assert ("%pp", "orch-raw-pane", "Orchestrator") in stamps
+
+
+def test_persona_tmux_target_codex_flip_refresh_keeps_alias_registration(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Engine flip claude→codex reuses the same SessionStart registration flow. A
+    # flip payload that again carries raw $TMUX_PANE as dispatch_target must refresh
+    # the row to the public alias, with persona/name/stamp intact.
+    hooks = sys.modules["routes.hooks"]
+    stamps: list[tuple[str | None, str | None, str | None]] = []
+
+    monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:pax"))
+    _no_pane_occupant(monkeypatch, hooks)
+
+    async def stamp(pane, session_id, *, display_name=None):
+        stamps.append((pane, session_id, display_name))
+
+    monkeypatch.setattr(hooks, "_stamp_instance_id", stamp)
+
+    first = _start_session(
+        hooks,
+        "pax-flip",
+        env={
+            "TOKEN_API_ENGINE": "claude",
+            "TOKEN_API_LAUNCHER": "persona-seat",
+            "TOKEN_API_LAUNCH_MODE": "tmux_target",
+            "TOKEN_API_DISPATCH_TARGET": "%32",
+        },
+    )
+    assert first["success"] is True
+    second = _start_session(
+        hooks,
+        "pax-flip",
+        env={
+            "TOKEN_API_ENGINE": "codex",
+            "TOKEN_API_LAUNCHER": "persona-seat",
+            "TOKEN_API_LAUNCH_MODE": "tmux_target",
+            "TOKEN_API_DISPATCH_TARGET": "%32",
+        },
+    )
+    assert second["success"] is True
+
+    row = _row(app_env.db_path, "pax-flip")
+    assert row["engine"] == "codex"
+    assert row["dispatch_target"] == "council:pax"
+    assert row["persona_slug"] == "pax"
+    assert row["name"] == "Pax"
+    assert row["workflow_blocked_reason"] is None
+    assert row["hook_driven"] == 0
+    assert ("%pp", "pax-flip", "Pax") in stamps
 
 
 def test_pax_pane_off_council_page_falls_back_to_astartes(
