@@ -161,17 +161,24 @@ def test_queue_tts_refuses_when_no_playback_target(app_env: Any, monkeypatch: An
     assert refused_details["routing"]["device"] is None
 
 
-def test_queue_tts_refuses_coarse_phone_reachable_but_audio_proxy_dead(
+def test_queue_tts_accepts_phone_via_speak_when_macrodroid_reachable(
     app_env: Any, monkeypatch: Any
 ) -> None:
-    """Red regression: enqueue with backend null must return failure, not success."""
+    """Decree 2026-06-28: a reachable MacroDroid is a real playback target via /speak.
+
+    Reverses the prior #423 queue-level gate. The phone speaks LOCALLY via /speak
+    (delivery proven by the playback-complete callback), so a down audio-proxy
+    *receiver* must NOT make queue_tts refuse — the phone is a valid backend and the
+    line is queued. The audio-proxy health rides along as a diagnostic, not a gate.
+    (Genuine dead-end refusal is covered by test_queue_tts_refuses_when_no_playback_target.)
+    """
     tts = _load_tts()
     iid = _insert_tts_instance(app_env.db_path)
 
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
     monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda: None)
     monkeypatch.setattr(tts, "is_satellite_tts_available", lambda: False)
-    monkeypatch.setattr(tts, "is_phone_reachable", lambda: True)  # coarse flag lies
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda: True)
     monkeypatch.setattr(tts, "_send_to_phone", lambda *a, **k: {"success": True})
     monkeypatch.setattr(
         tts,
@@ -187,15 +194,15 @@ def test_queue_tts_refuses_coarse_phone_reachable_but_audio_proxy_dead(
     tts.pause_queue.clear()
     tts.hot_queue.clear()
 
-    result = asyncio.run(tts.queue_tts(iid, "dies into backend null", queue_target="pause"))
+    result = asyncio.run(tts.queue_tts(iid, "speaks via /speak", queue_target="pause"))
 
-    assert result["success"] is False
-    assert result["queued"] is False
-    assert result["reason"] == "no_playback_target"
-    assert result["playback_target"] is None
-    assert result["routing"]["device"] is None
-    assert result["routing"]["phone_audio_proxy"]["reason"] == "audio_proxy_phone_disconnected"
-    assert len(tts.pause_queue) == 0
+    assert result["success"] is True
+    assert result["queued"] is True
+    # The phone resolved as the playback target (device string), despite the dead
+    # audio-proxy receiver — proving routing gates on /speak reachability, not the
+    # #423 heartbeat.
+    assert result["playback_target"] == "phone"
+    assert len(tts.pause_queue) == 1
 
 
 def test_tts_queue_languishing_is_internal_state_trigger() -> None:

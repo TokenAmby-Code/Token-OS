@@ -8,8 +8,13 @@ device selection).
 
 `resolve_tts_device` must therefore:
   * NEVER select the WSL satellite, even when it probes healthy;
-  * select the phone only when its audio-proxy receiver is live, regardless of geofence zone;
-  * fall back to Mac only when the phone audio-proxy receiver is unavailable;
+  * select the phone whenever its MacroDroid HTTP server is reachable, regardless
+    of geofence zone (Emperor decree 2026-06-28). The `/speak` transport speaks
+    locally on the device and proves delivery via the playback-complete callback,
+    so routing no longer gates on the audio-proxy *receiver* heartbeat (#423) —
+    that subsystem governs a different transport and is now a surfaced diagnostic
+    only, not a routing gate;
+  * fall back to Mac only when the phone is unreachable;
   * still pre-empt to Discord voice when the operator is in a voice channel.
 """
 
@@ -107,14 +112,17 @@ def test_phone_first_regardless_of_geofence(monkeypatch) -> None:
         assert routing["device"] == "phone", (zone, routing)
 
 
-def test_coarse_phone_reachable_is_not_audio_proxy_reachable(
+def test_speak_transport_routes_on_macrodroid_reachability_not_audio_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: MacroDroid HTTP reachability alone must not route TTS to phone.
+    """Decree 2026-06-28: the /speak transport routes on MacroDroid reachability.
 
-    The dead-audio-proxy failure had `phone_reachable=True` but
-    receiver_pid/heartbeat/phone_connected were null/false, causing a false
-    success into backend:null.
+    Reverses the prior #423 routing gate. The dead-audio-proxy false-success was a
+    failure mode of the *receiver-based* transport (which played nothing → false
+    success into backend:null). The /speak transport speaks LOCALLY on the device
+    and proves delivery via the playback-complete callback, so a down audio-proxy
+    receiver must NOT block phone selection. The audio-proxy health is still
+    surfaced as a diagnostic (available=False), but it is no longer a routing gate.
     """
     tts = _load_tts()
     monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: True)
@@ -134,17 +142,39 @@ def test_coarse_phone_reachable_is_not_audio_proxy_reachable(
 
     routing = tts.resolve_tts_device()
 
-    assert routing["device"] is None
+    assert routing["device"] == "phone"
+    # The audio-proxy health rides along as a diagnostic but did not gate routing.
     assert routing["phone_audio_proxy"]["available"] is False
     assert routing["phone_audio_proxy"]["reason"] == "audio_proxy_phone_disconnected"
 
 
-def test_audio_proxy_requires_fresh_receiver_heartbeat(
+def test_unreachable_macrodroid_deep_falls_to_mac(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """When the MacroDroid server is unreachable, the phone is NOT selected even if
+    the transport is wired — routing deep-falls to Mac (the genuine no-phone case)."""
     tts = _load_tts()
-    monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: False)
     monkeypatch.setattr(tts, "_send_to_phone", lambda *a, **k: {"success": True})
+    monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
+    monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda *a, **k: None)
+
+    routing = tts.resolve_tts_device()
+
+    assert routing["device"] == "mac"
+
+
+def test_audio_proxy_health_reports_missing_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`get_phone_audio_proxy_health()` still fails closed on a missing heartbeat.
+
+    The #423 health function is unchanged — it is just no longer a routing gate.
+    A connected receiver with no heartbeat reports ``audio_proxy_heartbeat_missing``
+    and available=False, so the diagnostic stays honest for any future
+    receiver-based transport / observability.
+    """
+    tts = _load_tts()
     monkeypatch.setattr(
         tts,
         "_audio_proxy_health_checker",
@@ -155,13 +185,11 @@ def test_audio_proxy_requires_fresh_receiver_heartbeat(
             "last_heartbeat": None,
         },
     )
-    monkeypatch.setattr(tts, "_mac_tts_available", lambda: False)
-    monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda *a, **k: None)
 
-    routing = tts.resolve_tts_device()
+    health = tts.get_phone_audio_proxy_health()
 
-    assert routing["device"] is None
-    assert routing["phone_audio_proxy"]["reason"] == "audio_proxy_heartbeat_missing"
+    assert health["available"] is False
+    assert health["reason"] == "audio_proxy_heartbeat_missing"
 
 
 def test_mac_is_deep_fallback_when_phone_unreachable(monkeypatch) -> None:
