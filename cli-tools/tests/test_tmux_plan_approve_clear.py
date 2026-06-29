@@ -335,7 +335,12 @@ def test_lease_extension_keeps_locked_watcher_alive_past_original_timeout(
     elapsed = time.monotonic() - start
     assert proc.returncode == 0
     assert stdout == ""
-    assert elapsed >= 1.5
+    # The lease deadline is written as int(time.time() + 2), so integer-second
+    # truncation makes the real elapsed floor ~1.4s (worst-case sub-second
+    # alignment), not 2s. We only need to prove the watcher outlived its
+    # original 1s --timeout; assert comfortably above 1.0 but below the ~1.4s
+    # truncation floor so contended-runner jitter can't tip it red.
+    assert elapsed >= 1.2
     assert "result=timeout" in stderr
 
 
