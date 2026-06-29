@@ -45,9 +45,6 @@ async def test_send_prompt_url_none_falls_back_to_tmuxctl_and_surfaces_real_stde
     main = app_env.main
     fallback_calls: list[tuple[str, ...]] = []
 
-    def _post(path: str, body: dict[str, Any], **kwargs: Any) -> None:
-        return None
-
     async def _fake_subprocess(args: tuple[str, ...] | list[str], **kwargs: Any):
         fallback_calls.append(tuple(args))
         return subprocess.CompletedProcess(
@@ -57,8 +54,8 @@ async def test_send_prompt_url_none_falls_back_to_tmuxctl_and_surfaces_real_stde
             stderr="tmuxctl real send failure: no such pane",
         )
 
+    monkeypatch.setenv("TMUXCTLD_URL", "disabled")
     monkeypatch.setattr(main, "_tmuxctld_default_loopback", lambda: False)
-    monkeypatch.setattr(main.shared, "_tmuxctld_post_json", _post)
     monkeypatch.setattr(main.shared, "_run_subprocess_offloop", _fake_subprocess)
 
     result = await main.send_prompt_to_pane("%dead", "payload")
