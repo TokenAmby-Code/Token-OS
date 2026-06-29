@@ -59,10 +59,16 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --message) MESSAGE="$2"; shift 2 ;;
-        --title) TITLE="$2"; shift 2 ;;
-        --body) BODY="$2"; shift 2 ;;
-        --timeout) TIMEOUT_MINS="$2"; shift 2 ;;
+        --message|--title|--body|--timeout)
+            [[ $# -ge 2 ]] || { error "Missing value for $1"; usage >&2; exit 2; }
+            case "$1" in
+                --message) MESSAGE="$2" ;;
+                --title) TITLE="$2" ;;
+                --body) BODY="$2" ;;
+                --timeout) TIMEOUT_MINS="$2" ;;
+            esac
+            shift 2
+            ;;
         --no-merge) AUTO_MERGE=false; shift ;;
         -h|--help) usage; exit 0 ;;
         *) error "Unknown argument: $1"; usage >&2; exit 2 ;;
@@ -112,12 +118,31 @@ inject_plan_after_stop() {
     [[ -n "$resp" ]] || true
 }
 
+assert_pr_capable_remote() {
+    local top origin
+    top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    origin="$(git remote get-url origin 2>/dev/null || true)"
+    if [[ "$top" == *"/Token-OS/"* || "$top" == *"/Token-OS" ]]; then
+        if ! token_os_github_remote "$origin"; then
+            error "worktree is not PR-capable; expected TokenAmby-Code/Token-OS GitHub remote"
+            error "origin remote: ${origin:-<missing>}"
+            exit 64
+        fi
+        return 0
+    fi
+    if dead_or_quarantined_remote "$origin"; then
+        error "worktree is not PR-capable; origin remote is missing, dead, or quarantined: ${origin:-<missing>}"
+        exit 64
+    fi
+}
+
 assert_repo() {
     git rev-parse --show-toplevel >/dev/null 2>&1 || { error "Must be run in a git repository"; exit 1; }
     local branch
     branch="$(git branch --show-current)"
     [[ -n "$branch" ]] || { error "Detached HEAD; cannot manage PR"; exit 1; }
     case "$branch" in main|master|prod) error "Refusing to run pr-step on protected branch: $branch"; exit 64 ;; esac
+    assert_pr_capable_remote
 }
 
 commit_if_needed() {
@@ -205,20 +230,28 @@ checks_green() {
     [[ "$mergeable" != "CONFLICTING" ]] || return 1
     cr_state=$(gh api "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true)
     [[ "$cr_state" == "success" ]] || return 1
-    changes=$(gh api "repos/${repo}/pulls/${pr}/reviews" 2>/dev/null | jq -r '[.[] | select(.state == "CHANGES_REQUESTED")] | length' 2>/dev/null || echo 1)
+    changes=$(gh api "repos/${repo}/pulls/${pr}/reviews" 2>/dev/null | jq -r '
+        sort_by(.user.login, .submitted_at)
+        | group_by(.user.login)
+        | map(max_by(.submitted_at))
+        | [.[] | select(.state == "CHANGES_REQUESTED")]
+        | length
+    ' 2>/dev/null || echo 1)
     [[ "$changes" == "0" ]] || return 1
     # gh pr checks exits nonzero while checks are pending/failing. No required checks
     # also counts as green for repos that only gate on CodeRabbit.
-    if gh pr checks "$pr" --watch=false --fail-fast=false >/tmp/pr-step-checks.$$ 2>/dev/null; then
-        rm -f /tmp/pr-step-checks.$$
+    local checks_tmp
+    checks_tmp="$(mktemp -t pr-step-checks.XXXXXX)"
+    if gh pr checks "$pr" --watch=false --fail-fast=false >"$checks_tmp" 2>/dev/null; then
+        rm -f "$checks_tmp"
         return 0
     fi
     # tolerate repos with no checks reported by gh
-    if grep -qi "no checks" /tmp/pr-step-checks.$$ 2>/dev/null; then
-        rm -f /tmp/pr-step-checks.$$
+    if grep -qi "no checks" "$checks_tmp" 2>/dev/null; then
+        rm -f "$checks_tmp"
         return 0
     fi
-    rm -f /tmp/pr-step-checks.$$
+    rm -f "$checks_tmp"
     return 1
 }
 
@@ -251,7 +284,8 @@ main() {
     if [[ "$AUTO_MERGE" == "true" ]] && checks_green "$pr"; then
         success "PR #$pr is green; auto-merging."
         "$PR_MERGE" "$pr" -y
-        mark_pr_flag "$(current_pr_url "$pr")" merged
+        pr_url="$(current_pr_url "$pr")"
+        [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
         mark_instance_status victorious
     else
         log "PR #$pr is not yet green; leaving it open."

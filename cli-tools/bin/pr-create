@@ -314,15 +314,18 @@ if ! git rev-parse --show-toplevel &>/dev/null; then
     error "Must be run from within a git repository"
     exit 1
 fi
-pr_inject_plan_after_stop
-pr_set_instance_status reviewing
 assert_pr_capable_remote
 
 # Handle --merge mode
 if [[ "$MERGE_MODE" == "true" ]]; then
+    pr_inject_plan_after_stop
     do_merge
+    pr_set_instance_status victorious
     exit 0
 fi
+
+pr_inject_plan_after_stop
+pr_set_instance_status reviewing
 
 # Get repo info
 REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || {

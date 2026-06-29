@@ -355,7 +355,9 @@ fi
 success "${SUCCESS} PR merged successfully"
 echo ""
 PR_URL_AFTER_MERGE=$(gh pr view "$PR_NUMBER" --json url -q '.url' 2>/dev/null || echo "")
-pr_set_instance_pr_state "$PR_URL_AFTER_MERGE" merged
+if [[ -n "$PR_URL_AFTER_MERGE" ]]; then
+    pr_set_instance_pr_state "$PR_URL_AFTER_MERGE" merged
+fi
 pr_set_instance_status victorious
 
 # Exit if no cleanup requested

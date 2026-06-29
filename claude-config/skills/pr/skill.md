@@ -32,6 +32,7 @@ Use these only when you need manual control:
 
 - `pr-create --title "..." --body "..."`
 - `pr-review-loop [PR_NUMBER] --message "..."`
+- `pr-review-loop [PR_NUMBER] --read` for status/review readback
 - `pr-merge [PR_NUMBER] -y`
 
 `pr-create` and `pr-merge` now also arm a follow-up `/plan` injection for the pane when Token-API/tmux context is available.

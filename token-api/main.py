@@ -3476,7 +3476,9 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
 
 
 @app.patch("/api/instances/{instance_id}/status")
-async def set_instance_status(instance_id: str, request: InstanceStatusRequest):
+async def set_instance_status(
+    instance_id: str, request: InstanceStatusRequest
+) -> dict[str, object]:
     """Set an instance lifecycle status through sanctioned mutation.
 
     Intended for workflow CLIs that need to mark an agent as reviewing,

@@ -141,7 +141,7 @@ def test_ops_state_carries_pr_fields(client):
     assert mine["pr_state"] == "open"
 
 
-def test_patch_status_sets_reviewing(client):
+def test_patch_status_sets_reviewing(client) -> None:
     iid = _insert_instance(status="idle")
     resp = client.patch(
         f"/api/instances/{iid}/status",
@@ -160,7 +160,7 @@ def test_patch_status_sets_reviewing(client):
     assert row["next_action_owner"] == "human"
 
 
-def test_patch_status_rejects_bad_status(client):
+def test_patch_status_rejects_bad_status(client) -> None:
     iid = _insert_instance(status="idle")
     resp = client.patch(f"/api/instances/{iid}/status", json={"status": "PR"})
     assert resp.status_code == 400
