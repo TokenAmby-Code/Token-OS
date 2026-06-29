@@ -622,6 +622,134 @@ def test_send_text_reports_unverified_without_prompt_submit_ack() -> None:
         server.shutdown()
 
 
+def test_invoke_skill_submit_uses_shared_send_core_with_codex_tab() -> None:
+    SendAckAdapter.calls = []
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/invoke-skill",
+            {
+                "pane": "%42",
+                "name": "golden-throne-sop",
+                "kind": "skill",
+                "agent": "codex",
+                "arguments": "needs tests",
+                "submit": True,
+                "verify": False,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["kind"] == "skill"
+        assert result["rendered"] == "$golden-throne-sop needs tests"
+        assert result["dispatch_id"]
+        assert (
+            "send-keys",
+            "-t",
+            "%42",
+            "-l",
+            "$golden-throne-sop needs tests",
+        ) in SendAckAdapter.calls
+        assert ("send-keys", "-t", "%42", "Tab") in SendAckAdapter.calls
+    finally:
+        server.shutdown()
+
+
+def test_invoke_command_submit_never_gets_skill_tab() -> None:
+    SendAckAdapter.calls = []
+    server, _ = _serve(SendAckAdapter)
+    try:
+        _, payload = _post_timeout(
+            server,
+            "/invoke-skill",
+            {
+                "pane": "%42",
+                "name": "plan",
+                "kind": "command",
+                "agent": "codex",
+                "submit": True,
+                "verify": False,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["rendered"] == "/plan "
+        assert ("send-keys", "-t", "%42", "Tab") not in SendAckAdapter.calls
+    finally:
+        server.shutdown()
+
+
+def test_send_ethereal_renders_claude_btw_and_closes_side_channel() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post_timeout(
+            server,
+            "/send-ethereal",
+            {
+                "pane": "%42",
+                "agent": "claude",
+                "message": "roll call",
+                "verify": False,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["rendered"] == "/btw roll call"
+        assert ("send-keys", "-t", "%42", "-l", "/btw roll call") in rec.calls
+        assert ("send-keys-helper", "%42", "c") in rec.calls
+        assert ("send-keys-helper", "%42", "C-c") in rec.calls
+    finally:
+        server.shutdown()
+
+
+def test_send_ethereal_renders_codex_side_copy_and_closes_side_channel() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post_timeout(
+            server,
+            "/send-ethereal",
+            {
+                "pane": "%42",
+                "agent": "codex",
+                "message": "roll call",
+                "verify": False,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["rendered"] == "/side roll call"
+        assert ("send-keys", "-t", "%42", "-l", "/side roll call") in rec.calls
+        assert ("send-keys", "-t", "%42", "-l", "/copy") in rec.calls
+        assert ("send-keys-helper", "%42", "C-c") in rec.calls
+    finally:
+        server.shutdown()
+
+
+def test_append_user_text_inserts_without_clear_or_enter() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/append-user-text",
+            {"pane": "%42", "text": "[discord] hello"},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["direct_user"] is True
+        assert rec.calls == [("send-keys", "-t", "%42", "-l", "[discord] hello")]
+    finally:
+        server.shutdown()
+
+
 def test_serve_refuses_non_loopback_bind() -> None:
     # The daemon is unauthenticated and does powerful tmux ops — serve() must
     # fail closed (no bind) on any non-loopback host.

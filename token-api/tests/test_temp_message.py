@@ -116,7 +116,7 @@ async def test_broadcast_temp_message_selector_grammar(
 
 
 @pytest.mark.asyncio
-async def test_temp_message_uses_btw_for_claude_and_side_for_codex(app_env, monkeypatch):
+async def test_temp_message_queues_semantic_ethereal_for_claude_and_codex(app_env, monkeypatch):
     temp_message = app_env.main.temp_message_service
     _insert_instance(
         app_env.db_path,
@@ -159,10 +159,9 @@ async def test_temp_message_uses_btw_for_claude_and_side_for_codex(app_env, monk
     )
 
     payloads = {item["instance_id"]: item["payload"] for item in queued}
-    assert payloads == {
-        "claude-1": "/btw roll call",
-        "codex-1": "/side roll call",
-    }
+    purposes = {item["instance_id"]: item["purpose"] for item in queued}
+    assert payloads == {"claude-1": "roll call", "codex-1": "roll call"}
+    assert purposes == {"claude-1": "ethereal", "codex-1": "ethereal"}
 
 
 @pytest.mark.asyncio
@@ -198,7 +197,8 @@ async def test_codex_side_runtime_caveats_surface_in_receipt(app_env, monkeypatc
     )
 
     channel = receipts[0]["channel"]
-    assert channel["command"] == "/side"
+    assert channel["kind"] == "ethereal"
+    assert channel["command"] is None
     assert channel["availability"] == "not_preflighted"
     assert channel["tool_calls_inert"] is False
     assert "requires_started_conversation" in channel["caveats"]
@@ -293,7 +293,8 @@ def test_temp_message_route_dry_run_previews_without_dispatch(app_env, monkeypat
     receipt = body["receipts"][0]
     assert receipt["status"] == "previewed"
     assert receipt["dispatch"] == {"status": "skipped_dry_run"}
-    assert receipt["payload"] == "/btw roll call"
+    assert receipt["payload"] == "roll call"
+    assert receipt["kind"] == "ethereal"
     assert receipt["instance_id"] == "claude-dry-run"
     assert send_calls == []
     assert drain_calls == []
@@ -348,5 +349,6 @@ def test_temp_message_route_without_dry_run_dispatches_normally(app_env, monkeyp
     assert receipt["status"] == "sent"
     assert len(send_calls) == 1
     assert len(drain_calls) == 1
-    assert send_calls[0]["payload"] == "/btw roll call"
+    assert send_calls[0]["payload"] == "roll call"
+    assert send_calls[0]["purpose"] == "ethereal"
     assert send_calls[0]["instance_id"] == "claude-live-path"

@@ -22,6 +22,7 @@ from tmuxctl.skill_invoke import (
     move_to_prompt_end,
     move_to_prompt_start,
     normalize_skill_name,
+    send_invocation_to_pane,
     send_skill_invocation_to_pane,
     skill_invocation_text,
 )
@@ -350,6 +351,39 @@ def test_resolve_agent_for_pane_falls_back_to_pane_hint(monkeypatch):
     assert skill_invoke.resolve_agent_for_pane(adapter, "%42") == "codex"
 
 
+def test_resolve_agent_for_pane_prefers_token_api_engine_hint_over_stale_fallbacks(
+    monkeypatch,
+):
+    adapter = RecordingAdapter()
+    adapter.options[("%42", "@TOKEN_API_ENGINE")] = "codex"
+    adapter.options[("%42", "@PLANNING_AGENT")] = "claude"
+    registry = InstanceRegistrySnapshot(
+        device_id="Mac-Mini",
+        instances=(
+            InstanceRegistryEntry(
+                instance_id="i1",
+                device_id="Mac-Mini",
+                pane_label="palace:E",
+                tmux_pane="%42",
+                working_dir="/tmp",
+                status=InstanceStatus.STOPPED,
+                pre_stop_status=InstanceStatus.IDLE,
+                engine="claude",
+            ),
+        ),
+    )
+    monkeypatch.setattr(skill_invoke, "fetch_instance_registry", lambda: registry)
+
+    def fake_run(cmd, **kwargs):
+        # Pane process is inconclusive; @TOKEN_API_ENGINE must beat the stopped
+        # registry row and older @PLANNING_AGENT hint.
+        return subprocess.CompletedProcess(cmd, 0, "bash -l\n", "")
+
+    monkeypatch.setattr(skill_invoke.subprocess, "run", fake_run)
+
+    assert skill_invoke.resolve_agent_for_pane(adapter, "%42", default="auto") == "codex"
+
+
 def test_resolve_agent_for_pane_default_when_inconclusive(monkeypatch):
     adapter = RecordingAdapter()
     monkeypatch.setattr(
@@ -375,3 +409,22 @@ def test_resolve_agent_for_pane_rejects_invalid_default():
     adapter = RecordingAdapter()
     with pytest.raises(ValueError):
         skill_invoke.resolve_agent_for_pane(adapter, "%42", default="bogus")
+
+
+def test_send_invocation_to_pane_command_skips_agent_resolution_and_tab(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(skill_invoke.time, "sleep", lambda _: None)
+
+    def explode(*_a, **_k):
+        raise AssertionError("commands must not resolve an engine")
+
+    monkeypatch.setattr(skill_invoke, "resolve_agent_for_pane", explode)
+
+    text = send_invocation_to_pane(adapter, "%42", "plan", agent="auto", kind="command")
+
+    assert text == "/plan "
+    assert ("send-keys", "-t", "%42", "Tab") not in adapter.calls
+    assert adapter.calls[-2:] == [
+        ("send-keys", "-t", "%42", "C-m"),
+        ("send-keys", "-t", "%42", "C-m"),
+    ]

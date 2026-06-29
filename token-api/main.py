@@ -314,11 +314,375 @@ import traceback
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
 from imperium_config import cfg
 from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
-from tmuxctl.skill_invoke import looks_like_codex_skill_invocation as _looks_like_codex_skill
-from tmuxctl.skill_invoke import skill_invocation_text as _tmuxctl_skill_invocation_text
 from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
+
+
+def _tmuxctld_default_loopback() -> bool:
+    return DB_PATH.resolve() == (Path.home() / ".claude" / "agents.db").resolve()
+
+
+def _tmuxctld_gate_result(
+    *,
+    operation: str,
+    tmux_pane: str,
+    daemon_payload: dict,
+    instance_id: str | None = None,
+) -> dict | None:
+    """Translate a tmuxctld ok:false gated envelope into Token-API send shape."""
+    err = daemon_payload.get("error") if isinstance(daemon_payload.get("error"), dict) else {}
+    if err.get("code") != "gated":
+        return None
+    gate = err.get("detail") if isinstance(err.get("detail"), dict) else {}
+    return {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "",
+        "operation": operation,
+        "gated": True,
+        "gate_reason": gate.get("reason"),
+        "gate": gate,
+        "verification_status": "gated",
+        "verified_by": None,
+        "pane": tmux_pane,
+        "instance_id": instance_id,
+    }
+
+
+def _tmuxctld_failed_result(
+    *,
+    operation: str,
+    failed_operation: list[str],
+    daemon_payload: dict | None,
+    tmux_pane: str,
+    instance_id: str | None = None,
+) -> dict:
+    if daemon_payload is None:
+        stderr = "tmuxctld unavailable"
+    else:
+        err = daemon_payload.get("error") if isinstance(daemon_payload.get("error"), dict) else {}
+        stderr = err.get("message") or json.dumps(daemon_payload)
+    return {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": stderr,
+        "operation": operation,
+        "failed_operation": failed_operation,
+        "gated": False,
+        "pane": tmux_pane,
+        "instance_id": instance_id,
+    }
+
+
+async def send_prompt_to_pane(
+    tmux_pane: str,
+    prompt: str,
+    *,
+    clear_prompt: bool = False,
+    submit: bool = True,
+    verify: bool = True,
+) -> dict:
+    """Token-API pane prompt facade: tmuxctld is the only local byte boundary."""
+    daemon_payload = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/send-text",
+        {
+            "pane": tmux_pane,
+            "text": prompt,
+            "clear_prompt": clear_prompt,
+            "submit": submit,
+            "verify": verify,
+            "verify_timeout": 6.0,
+        },
+        timeout=12,
+        default_loopback=_tmuxctld_default_loopback(),
+    )
+    if daemon_payload is None:
+        return _tmuxctld_failed_result(
+            operation="tmuxctld.send_text",
+            failed_operation=["tmuxctld", "send-text"],
+            daemon_payload=None,
+            tmux_pane=tmux_pane,
+        )
+    if not daemon_payload.get("ok"):
+        gated = _tmuxctld_gate_result(
+            operation="tmuxctld.send_text", tmux_pane=tmux_pane, daemon_payload=daemon_payload
+        )
+        if gated:
+            return gated
+        return _tmuxctld_failed_result(
+            operation="tmuxctld.send_text",
+            failed_operation=["tmuxctld", "send-text"],
+            daemon_payload=daemon_payload,
+            tmux_pane=tmux_pane,
+        )
+
+    result = daemon_payload.get("result") if isinstance(daemon_payload.get("result"), dict) else {}
+    return {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "operation": "tmuxctld.send_text",
+        "dispatch_id": result.get("dispatch_id") or str(uuid.uuid4()),
+        "payload_hash": result.get("payload_hash")
+        or hashlib.sha256(re.sub(r"[\r\n]+", " ", prompt).rstrip().encode("utf-8")).hexdigest(),
+        "gated": False,
+        "verification_status": result.get("verification_status") or "unverified",
+        "verified_by": result.get("verified_by"),
+        "guard_held": bool(result.get("guard_held")),
+        "swallowed_submit_detected": bool(result.get("swallowed_submit_detected")),
+        "recovery_attempts": int(result.get("recovery_attempts") or 0),
+        "failures": result.get("failures") if isinstance(result.get("failures"), list) else [],
+        "pane": tmux_pane,
+        "instance_id": result.get("instance_id"),
+    }
+
+
+async def send_invocation_to_pane(
+    tmux_pane: str,
+    name: str,
+    *,
+    kind: str,
+    arguments: str | None = None,
+    agent: str = "auto",
+    clear_prompt: bool = False,
+) -> dict:
+    """Token-API structured invocation facade over tmuxctld (/invoke-skill)."""
+    daemon_payload = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/invoke-skill",
+        {
+            "pane": tmux_pane,
+            "name": name,
+            "kind": kind,
+            "agent": agent,
+            "arguments": arguments or "",
+            "submit": True,
+            "clear_prompt": clear_prompt,
+            "verify": True,
+            "verify_timeout": 6.0,
+            "ack_submit_retries": 0,
+        },
+        timeout=12,
+        default_loopback=_tmuxctld_default_loopback(),
+    )
+    operation = f"tmuxctld.send_{kind}"
+    if daemon_payload is None:
+        return _tmuxctld_failed_result(
+            operation=operation,
+            failed_operation=["tmuxctld", "invoke-skill"],
+            daemon_payload=None,
+            tmux_pane=tmux_pane,
+        )
+    if not daemon_payload.get("ok"):
+        gated = _tmuxctld_gate_result(
+            operation=operation, tmux_pane=tmux_pane, daemon_payload=daemon_payload
+        )
+        if gated:
+            return gated
+        return _tmuxctld_failed_result(
+            operation=operation,
+            failed_operation=["tmuxctld", "invoke-skill"],
+            daemon_payload=daemon_payload,
+            tmux_pane=tmux_pane,
+        )
+    result = daemon_payload.get("result") if isinstance(daemon_payload.get("result"), dict) else {}
+    rendered = str(result.get("rendered") or "")
+    return {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "operation": operation,
+        "dispatch_id": result.get("dispatch_id") or str(uuid.uuid4()),
+        "payload_hash": hashlib.sha256(
+            re.sub(r"[\r\n]+", " ", rendered).rstrip().encode("utf-8")
+        ).hexdigest()
+        if rendered
+        else None,
+        "gated": False,
+        "verification_status": result.get("verification_status") or "unverified",
+        "verified_by": result.get("verified_by"),
+        "guard_held": bool(result.get("guard_held")),
+        "swallowed_submit_detected": bool(result.get("swallowed_submit_detected")),
+        "recovery_attempts": int(result.get("recovery_attempts") or 0),
+        "failures": result.get("failures") if isinstance(result.get("failures"), list) else [],
+        "pane": result.get("pane") or tmux_pane,
+        "instance_id": result.get("instance_id"),
+        "kind": result.get("kind") or kind,
+        "rendered": rendered,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+async def send_skill_to_pane(
+    tmux_pane: str,
+    skill_name: str,
+    *,
+    arguments: str | None = None,
+    agent: str = "auto",
+    clear_prompt: bool = False,
+) -> dict:
+    return await send_invocation_to_pane(
+        tmux_pane,
+        skill_name,
+        kind="skill",
+        arguments=arguments,
+        agent=agent,
+        clear_prompt=clear_prompt,
+    )
+
+
+async def send_command_to_pane(
+    tmux_pane: str,
+    command_name: str,
+    *,
+    arguments: str | None = None,
+    clear_prompt: bool = False,
+) -> dict:
+    return await send_invocation_to_pane(
+        tmux_pane,
+        command_name.lstrip("/"),
+        kind="command",
+        arguments=arguments,
+        agent="auto",
+        clear_prompt=clear_prompt,
+    )
+
+
+async def send_ethereal_to_pane(
+    tmux_pane: str,
+    message: str,
+    *,
+    agent: str = "auto",
+    clear_prompt: bool = False,
+) -> dict:
+    """Send a semantic side-channel message; tmuxctld renders /btw or /side."""
+    body = {
+        "pane": tmux_pane,
+        "kind": "ethereal",
+        "message": message,
+        "clear_prompt": clear_prompt,
+        "verify": True,
+        "verify_timeout": 6.0,
+        "ack_submit_retries": 0,
+    }
+    if agent != "auto":
+        body["agent"] = agent
+    daemon_payload = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/send-ethereal",
+        body,
+        timeout=12,
+        default_loopback=_tmuxctld_default_loopback(),
+    )
+    operation = "tmuxctld.send_ethereal"
+    if daemon_payload is None:
+        return _tmuxctld_failed_result(
+            operation=operation,
+            failed_operation=["tmuxctld", "send-ethereal"],
+            daemon_payload=None,
+            tmux_pane=tmux_pane,
+        )
+    if not daemon_payload.get("ok"):
+        gated = _tmuxctld_gate_result(
+            operation=operation, tmux_pane=tmux_pane, daemon_payload=daemon_payload
+        )
+        if gated:
+            return gated
+        return _tmuxctld_failed_result(
+            operation=operation,
+            failed_operation=["tmuxctld", "send-ethereal"],
+            daemon_payload=daemon_payload,
+            tmux_pane=tmux_pane,
+        )
+    result = daemon_payload.get("result") if isinstance(daemon_payload.get("result"), dict) else {}
+    rendered = str(result.get("rendered") or "")
+    return {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "operation": operation,
+        "dispatch_id": result.get("dispatch_id") or str(uuid.uuid4()),
+        "payload_hash": result.get("payload_hash")
+        or (
+            hashlib.sha256(re.sub(r"[\r\n]+", " ", rendered).rstrip().encode("utf-8")).hexdigest()
+            if rendered
+            else None
+        ),
+        "gated": False,
+        "verification_status": result.get("verification_status") or "unverified",
+        "verified_by": result.get("verified_by"),
+        "guard_held": bool(result.get("guard_held")),
+        "swallowed_submit_detected": bool(result.get("swallowed_submit_detected")),
+        "recovery_attempts": int(result.get("recovery_attempts") or 0),
+        "failures": result.get("failures") if isinstance(result.get("failures"), list) else [],
+        "pane": result.get("pane") or tmux_pane,
+        "instance_id": result.get("instance_id"),
+        "kind": "ethereal",
+        "rendered": rendered,
+        "message": message,
+        "agent": result.get("agent") or agent,
+    }
+
+
+async def append_direct_user_text_to_pane(
+    tmux_pane: str,
+    text: str,
+    *,
+    instance_id: str | None = None,
+) -> dict:
+    """Append operator keyboard text without submit/clear/prompt semantics."""
+    body = {"pane": tmux_pane, "text": text}
+    if instance_id:
+        body["instance_id"] = instance_id
+    daemon_payload = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/append-user-text",
+        body,
+        timeout=12,
+        default_loopback=_tmuxctld_default_loopback(),
+    )
+    operation = "tmuxctld.append_user_text"
+    if daemon_payload is None:
+        return _tmuxctld_failed_result(
+            operation=operation,
+            failed_operation=["tmuxctld", "append-user-text"],
+            daemon_payload=None,
+            tmux_pane=tmux_pane,
+            instance_id=instance_id,
+        )
+    if not daemon_payload.get("ok"):
+        gated = _tmuxctld_gate_result(
+            operation=operation,
+            tmux_pane=tmux_pane,
+            daemon_payload=daemon_payload,
+            instance_id=instance_id,
+        )
+        if gated:
+            return gated
+        return _tmuxctld_failed_result(
+            operation=operation,
+            failed_operation=["tmuxctld", "append-user-text"],
+            daemon_payload=daemon_payload,
+            tmux_pane=tmux_pane,
+            instance_id=instance_id,
+        )
+    result = daemon_payload.get("result") if isinstance(daemon_payload.get("result"), dict) else {}
+    return {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "operation": operation,
+        "gated": False,
+        "verification_status": "not_submitted",
+        "verified_by": None,
+        "pane": result.get("pane") or tmux_pane,
+        "instance_id": result.get("instance_id") or instance_id,
+        "direct_user": True,
+        "submitted": False,
+    }
 
 
 def _sqlite_backup_file(source: Path, dest: Path) -> None:
@@ -5326,151 +5690,13 @@ async def _tmux_send_payload_then_submit(
     clear_prompt: bool = False,
     enable_skill_sink: bool = False,
 ) -> dict:
-    """Send text and submit through tmuxctld/tmuxctl's pane-write primitive."""
-    from tmuxctl.tmux_adapter import TmuxAdapter, TmuxError, TmuxSendGated
+    """Backward-compatible prompt send wrapper; local delivery is tmuxctld only.
 
-    daemon_payload = await asyncio.to_thread(
-        shared._tmuxctld_post_json,
-        "/send-text",
-        {
-            "pane": tmux_pane,
-            "text": payload,
-            "clear_prompt": clear_prompt,
-            "submit": True,
-            "verify": True,
-            "verify_timeout": 6.0,
-            "pre_submit_keys": ["Tab"]
-            if enable_skill_sink and _looks_like_codex_skill(payload)
-            else [],
-        },
-        timeout=12,
-        default_loopback=DB_PATH.resolve() == (Path.home() / ".claude" / "agents.db").resolve(),
-    )
-    if daemon_payload is not None:
-        if not daemon_payload.get("ok"):
-            err = (
-                daemon_payload.get("error") if isinstance(daemon_payload.get("error"), dict) else {}
-            )
-            if err.get("code") == "gated":
-                gate = err.get("detail") if isinstance(err.get("detail"), dict) else {}
-                return {
-                    "returncode": 1,
-                    "stdout": "",
-                    "stderr": "",
-                    "operation": "tmuxctld.send_text",
-                    "gated": True,
-                    "gate_reason": gate.get("reason"),
-                    "gate": gate,
-                    "verification_status": "gated",
-                    "verified_by": None,
-                    "pane": tmux_pane,
-                    "instance_id": None,
-                }
-            return {
-                "returncode": 1,
-                "stdout": "",
-                "stderr": err.get("message") or json.dumps(daemon_payload),
-                "failed_operation": ["tmuxctld", "send-text"],
-            }
-        result = (
-            daemon_payload.get("result") if isinstance(daemon_payload.get("result"), dict) else {}
-        )
-        return {
-            "returncode": 0,
-            "stdout": "",
-            "stderr": "",
-            "operation": "tmuxctld.send_text",
-            "dispatch_id": result.get("dispatch_id") or str(uuid.uuid4()),
-            "payload_hash": result.get("payload_hash")
-            or hashlib.sha256(
-                re.sub(r"[\r\n]+", " ", payload).rstrip().encode("utf-8")
-            ).hexdigest(),
-            "gated": False,
-            "verification_status": result.get("verification_status") or "unverified",
-            "verified_by": result.get("verified_by"),
-            # Surface the daemon's swallowed-submit recovery telemetry so token-api
-            # callers can see a submit was eaten and re-driven (surface-don't-suppress).
-            "guard_held": bool(result.get("guard_held")),
-            "swallowed_submit_detected": bool(result.get("swallowed_submit_detected")),
-            "recovery_attempts": int(result.get("recovery_attempts") or 0),
-            "failures": result.get("failures") if isinstance(result.get("failures"), list) else [],
-            "pane": tmux_pane,
-            "instance_id": result.get("instance_id"),
-        }
-
-    adapter = TmuxAdapter()
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(
-                adapter.send_text_then_submit,
-                tmux_pane,
-                payload,
-                clear_prompt=clear_prompt,
-                pre_submit_keys=("Tab",)
-                if enable_skill_sink and _looks_like_codex_skill(payload)
-                else (),
-            ),
-            timeout=10,
-        )
-    except TmuxSendGated as exc:
-        # The universal gate suppressed the send: NO bytes reached the pane.
-        # This is NOT a delivery and NOT a failure — surface it as gated so the
-        # queue keeps the item pending and the periodic worker re-drains it once
-        # the gate clears. Never report this as "sent".
-        gate = exc.gate or {}
-        return {
-            "returncode": 1,
-            "stdout": "",
-            "stderr": "",
-            "operation": "tmuxctl.send_text_then_submit",
-            "gated": True,
-            "gate_reason": gate.get("reason"),
-            "gate": gate,
-            "verification_status": "gated",
-            "verified_by": None,
-            "pane": tmux_pane,
-            "instance_id": None,
-        }
-    except TmuxError as exc:
-        return {
-            "returncode": 1,
-            "stdout": "",
-            "stderr": str(exc),
-            "failed_operation": ["tmuxctl", "send_text_then_submit"],
-        }
-
-    normalized = re.sub(r"[\r\n]+", " ", payload).rstrip()
-    # Bytes were issued, but delivery is NOT proven here — never default to
-    # "sent". The proof belt (UserPromptSubmit correlation) upgrades this to a
-    # confirmed delivery; until then it is "unverified".
-    verification_status = "unverified"
-    verified_by = None
-    # Submission confirmation (clear/replace senders, i.e. brief): after the
-    # double-C-m submit + settle, the composer should be empty if the prompt
-    # actually submitted. If it cleared, that is positive evidence the submit
-    # took — upgrade to "submitted". A composer that still holds text (submit
-    # swallowed) stays "unverified" so the truth is reported, not a default.
-    if clear_prompt:
-        try:
-            still_pending = await _tmux_pane_has_pending_input(tmux_pane)
-        except Exception:  # noqa: BLE001
-            still_pending = True
-        if not still_pending:
-            verification_status = "submitted"
-            verified_by = "composer_cleared"
-    return {
-        "returncode": 0,
-        "stdout": "",
-        "stderr": "",
-        "operation": "tmuxctl.send_text_then_submit",
-        "dispatch_id": str(uuid.uuid4()),
-        "payload_hash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
-        "gated": False,
-        "verification_status": verification_status,
-        "verified_by": verified_by,
-        "pane": tmux_pane,
-        "instance_id": None,
-    }
+    ``enable_skill_sink`` is retained for old call signatures, but Token-API no
+    longer renders/sinks skills itself. Structured skill/command callers must use
+    ``send_skill_to_pane`` / ``send_command_to_pane``.
+    """
+    return await send_prompt_to_pane(tmux_pane, payload, clear_prompt=clear_prompt)
 
 
 async def _pane_write_instance_engine(instance_id: str) -> str:
@@ -5548,10 +5774,13 @@ async def process_pane_write_queue_once(
             )
             results.append(result)
             continue
+        purpose = str(item["purpose"] or "")
+        structured_skill = purpose.removeprefix("skill:") if purpose.startswith("skill:") else ""
+        structured_command = (
+            purpose.removeprefix("command:") if purpose.startswith("command:") else ""
+        )
+        structured_ethereal = purpose == "ethereal"
         clear_replace_source = item["source"] in {"brief", NAMING_NUDGE_QUEUE_SOURCE}
-        enable_skill_sink = False
-        if item["source"] == "golden_throne" and _looks_like_codex_skill(item["payload"]):
-            enable_skill_sink = await _pane_write_instance_engine(instance_id) == "codex"
         try:
             # Some system prompts clear/replace a stale composer rather than
             # deferring forever. Live symptom: leftover Codex/Claude drafts kept
@@ -5569,15 +5798,27 @@ async def process_pane_write_queue_once(
                 )
                 results.append(result)
                 continue
-            if clear_replace_source:
-                send_result = await _tmux_send_payload_then_submit(
-                    pane, item["payload"], clear_prompt=True
+            if structured_skill:
+                send_result = await send_skill_to_pane(
+                    pane,
+                    structured_skill,
+                    arguments=item["payload"],
+                    agent=await _pane_write_instance_engine(instance_id),
                 )
-            elif enable_skill_sink:
-                send_result = await _tmux_send_payload_then_submit(
+            elif structured_ethereal:
+                send_result = await send_ethereal_to_pane(
                     pane,
                     item["payload"],
-                    enable_skill_sink=True,
+                )
+            elif structured_command:
+                send_result = await send_command_to_pane(
+                    pane,
+                    structured_command,
+                    arguments=item["payload"],
+                )
+            elif clear_replace_source:
+                send_result = await _tmux_send_payload_then_submit(
+                    pane, item["payload"], clear_prompt=True
                 )
             else:
                 send_result = await _tmux_send_payload_then_submit(pane, item["payload"])
@@ -7326,12 +7567,8 @@ def _quote_skill_argument(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _golden_throne_skill_invocation_prompt(
-    status: RubricStatus,
-    *,
-    engine: str,
-) -> str:
-    """Harness-correct explicit skill wake for incomplete rubric fires."""
+def _golden_throne_skill_invocation_arguments(status: RubricStatus) -> str:
+    """Arguments for the structured Golden Throne skill wake."""
     if status.missing:
         head = ", ".join(_humanize_condition_key(m) for m in status.missing[:3])
         remaining = len(status.missing) - 3
@@ -7339,8 +7576,13 @@ def _golden_throne_skill_invocation_prompt(
             head = f"{head} (+{remaining} more)"
     else:
         head = "session rubric"
-    arguments = f"victory condition {_quote_skill_argument(f'needs {head}')} is unmet"
-    return _tmuxctl_skill_invocation_text("golden-throne-sop", engine, arguments)
+    return f"victory condition {_quote_skill_argument(f'needs {head}')} is unmet"
+
+
+def _golden_throne_rendered_skill_invocation(arguments: str, *, engine: str) -> str:
+    # Compatibility island for satellite hosts that still accept only rendered text.
+    leader = "$" if (engine or "").strip().lower() == "codex" else "/"
+    return f"{leader}golden-throne-sop {arguments}"
 
 
 def _clip_one_line(text: str, max_len: int) -> str:
@@ -8008,7 +8250,7 @@ async def golden_throne_followup(session_id: str):
             # so the injected turn is first-class procedure, not prose saying
             # "execute this SOP". The skill then reads the session doc and acts
             # on the named rubric condition.
-            sop_prompt = _golden_throne_skill_invocation_prompt(rubric_status, engine=engine)
+            sop_prompt = _golden_throne_skill_invocation_arguments(rubric_status)
             rubric_prompt_active = True
             logger.info(
                 f"Golden Throne: using rubric skill invocation for {session_id[:12]} "
@@ -8113,7 +8355,7 @@ async def golden_throne_followup(session_id: str):
     }
     if device_id == LOCAL_DEVICE_NAME and tmux_pane:
         # Local delivery — transport detection per Golden Throne spec:
-        # Check pane_current_command to decide send-keys vs claude --resume
+        # Check pane_current_command to decide live tmuxctld delivery vs dispatch resume.
         try:
             proc = await asyncio.create_subprocess_exec(
                 "tmux",
@@ -8140,8 +8382,8 @@ async def golden_throne_followup(session_id: str):
         dispatch_details["agent_alive"] = agent_alive
 
         if agent_alive:
-            # Agent alive in pane — queue a guarded pane write.
-            # send-keys can only reliably deliver short single-line prompts.
+            # Agent alive in pane — queue a guarded tmuxctld pane write.
+            # Legacy satellite/direct bridges can only reliably deliver short single-line prompts.
             # For long/multi-line SOPs, write to file and send a short read command.
             MAX_SENDKEYS_LEN = 200
             if len(sop_prompt) <= MAX_SENDKEYS_LEN and "\n" not in sop_prompt:
@@ -8159,7 +8401,7 @@ async def golden_throne_followup(session_id: str):
                     instance_id=session_id,
                     tmux_pane=tmux_pane,
                     source="golden_throne",
-                    purpose="followup",
+                    purpose="skill:golden-throne-sop" if rubric_prompt_active else "followup",
                     payload=inject_prompt,
                     # Golden-throne followup is a system-originated autonomous wake.
                     hook_driven=True,
@@ -8168,7 +8410,9 @@ async def golden_throne_followup(session_id: str):
                 queue_result = queue_results[0] if queue_results else queued
                 dispatch_details.update(
                     {
-                        "transport": "send-keys",
+                        "transport": "tmuxctld-skill"
+                        if rubric_prompt_active
+                        else "tmuxctld-prompt",
                         "target_pane": tmux_pane,
                         "returncode": queue_result.get("returncode"),
                         "stdout": queue_result.get("stdout", ""),
@@ -8181,7 +8425,7 @@ async def golden_throne_followup(session_id: str):
                 )
                 if queue_result.get("status") == PANE_WRITE_SENT:
                     logger.info(
-                        f"Golden Throne: follow-up delivered to {session_id[:12]} via send-keys "
+                        f"Golden Throne: follow-up delivered to {session_id[:12]} via tmuxctld "
                         f"engine={engine} pane={tmux_pane}"
                     )
                 elif queue_result.get("reason") == "dispatch_deferred":
@@ -8197,13 +8441,15 @@ async def golden_throne_followup(session_id: str):
             except Exception as e:
                 dispatch_details.update(
                     {
-                        "transport": "send-keys",
+                        "transport": "tmuxctld-skill"
+                        if rubric_prompt_active
+                        else "tmuxctld-prompt",
                         "target_pane": tmux_pane,
                         "error": str(e),
                         "tmux_pane_exists": await _tmux_pane_exists(tmux_pane),
                     }
                 )
-                logger.error(f"Golden Throne: send-keys failed for {session_id[:12]}: {e}")
+                logger.error(f"Golden Throne: tmuxctld delivery failed for {session_id[:12]}: {e}")
         else:
             # Agent not running — resume into a single managed mechanicus worker
             # pane via the canonical `dispatch` launcher. dispatch resumes the agent
@@ -8283,7 +8529,11 @@ async def golden_throne_followup(session_id: str):
                         "session_id": session_id,
                         "tmux_pane": tmux_pane,
                         "working_dir": working_dir,
-                        "prompt": sop_prompt,
+                        "prompt": _golden_throne_rendered_skill_invocation(
+                            sop_prompt, engine=engine
+                        )
+                        if rubric_prompt_active
+                        else sop_prompt,
                         "prompt_summary": rubric_injection_summary,
                         "engine": engine,
                     },
@@ -8476,29 +8726,23 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     # Deliver prompt: local for instances on this machine, satellite for remote
     device_id = instance.get("device_id", LOCAL_DEVICE_NAME)
     if device_id == LOCAL_DEVICE_NAME and tmux_pane:
-        # Local delivery via claude-cmd
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude-cmd",
-                "--pane",
-                tmux_pane,
-                prompt,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        # Local delivery via Token-API tmuxctld prompt facade.
+        send_result = await send_prompt_to_pane(tmux_pane, prompt)
+        if send_result.get("returncode") == 0:
+            logger.info(f"Nudge: delivered to {instance_id[:12]} via tmuxctld pane={tmux_pane}")
+        elif send_result.get("gated"):
+            return {
+                "nudged": False,
+                "reason": f"send_gated:{send_result.get('gate_reason') or 'gated'}",
+                "gated": True,
+                "delivery": send_result,
+            }
+        else:
+            logger.error(
+                f"Nudge: tmuxctld prompt send failed for {instance_id[:12]}: "
+                f"{send_result.get('stderr', '')[:200]}"
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-            if proc.returncode == 0:
-                logger.info(
-                    f"Nudge: delivered to {instance_id[:12]} via claude-cmd pane={tmux_pane}"
-                )
-            else:
-                logger.error(
-                    f"Nudge: claude-cmd failed for {instance_id[:12]}: {stderr.decode()[:200]}"
-                )
-                return {"nudged": False, "reason": f"claude-cmd failed: rc={proc.returncode}"}
-        except Exception as e:
-            logger.error(f"Nudge: local delivery failed for {instance_id[:12]}: {e}")
-            return {"nudged": False, "reason": f"local_failed: {e}"}
+            return {"nudged": False, "reason": "tmuxctld_send_failed", "delivery": send_result}
     else:
         # Remote delivery via WSL satellite
         try:
@@ -9027,11 +9271,10 @@ async def _custodes_intervention_negative_edge_cancel_result(
     }
 
 
-# Signatures the Custodes injection subprocess (`claude-cmd` → `agent-cmd` →
-# `tmuxctl send-text`) surfaces in stderr. The universal send gate raises
-# `TmuxSendGated` ("send suppressed by gate: <reason>"); agent-cmd's own
-# typing-guard wait aborts with "user input not cleared". Both mean NO bytes
-# reached the pane and the write is safe to hold-and-queue (L2), not a loss.
+# Signatures the tmuxctld prompt facade may surface. The universal send gate
+# reports "send suppressed by gate: <reason>"; older callers/tests may still use
+# "user input not cleared". Both mean NO bytes reached the pane and the write is
+# safe to hold-and-queue (L2), not a loss.
 _GATE_SUPPRESSION_SIGNATURES = ("suppressed by gate", "user input not cleared")
 # Signatures meaning the targeted pane is stale/occupied — re-resolve the live
 # Custodes pane rather than fail (L4).
@@ -9065,67 +9308,35 @@ async def _inject_custodes_prompt_to_pane(
     cancel_check=None,
     hook_actor: str = "state-hook-fanout",
 ) -> dict:
-    """Inject a Custodes prompt into a known tmux pane."""
+    """Inject a Custodes prompt into a known tmux pane via tmuxctld only."""
     if cancel_check:
         canceled = await cancel_check("pre_pane_inject")
         if canceled:
             return canceled
-    # State-hook fanout wake (custodes-in / Administratum record — both route
-    # through this helper). The target is being driven autonomously, NOT acting
-    # outbound, so flag hook_driven=1 before the byte lands; its reflex PromptSubmit
-    # is then discounted at read-time. Custodes-OUT (talk/brief/dispatch) never
-    # reaches this helper.
     await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=hook_actor)
-    try:
-        claude_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "claude-cmd"
-        proc = await asyncio.create_subprocess_exec(
-            str(claude_cmd),
-            "--pane",
-            tmux_pane,
-            prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={
-                **os.environ,
-                "PATH": ":".join(
-                    [
-                        str(SCRIPTS_DIR / "cli-tools" / "bin"),
-                        str(Path.home() / ".local" / "bin"),
-                        "/opt/homebrew/bin",
-                        "/usr/local/bin",
-                        os.environ.get("PATH", ""),
-                    ]
-                ),
-            },
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        if proc.returncode != 0:
-            stderr_text = stderr.decode(errors="replace")
-            category, gate_reason = _classify_pane_inject_failure(stderr_text)
-            reason = f"claude-cmd failed: rc={proc.returncode}"
-            logger.warning(f"Custodes state hook: {reason} [{category}]: {stderr_text[:200]}")
-            result = {
-                "dispatched": False,
-                "reason": reason,
-                "instance_id": instance_id,
-                "tmux_pane": tmux_pane,
-            }
-            if category == "gated":
-                # Held-and-queued by the router; surface as a gate hit, not a loss.
-                result["gated"] = True
-                result["gate_reason"] = gate_reason
-                result["reason"] = f"send_gated:{gate_reason}"
-            elif category == "stale_pane":
-                result["stale_pane"] = True
-            return result
-    except Exception as exc:
-        logger.warning(f"Custodes state hook: delivery failed: {exc}")
-        return {
+    send_result = await send_prompt_to_pane(tmux_pane, prompt)
+    if send_result.get("returncode") != 0:
+        stderr_text = str(send_result.get("stderr") or "")
+        category, gate_reason = _classify_pane_inject_failure(stderr_text)
+        if send_result.get("gated"):
+            category = "gated"
+            gate_reason = send_result.get("gate_reason") or gate_reason or "typing_guard"
+        reason = "tmuxctld_send_failed"
+        logger.warning(f"Custodes state hook: {reason} [{category}]: {stderr_text[:200]}")
+        result = {
             "dispatched": False,
-            "reason": f"delivery_failed: {exc}",
+            "reason": reason,
             "instance_id": instance_id,
             "tmux_pane": tmux_pane,
+            "delivery": send_result,
         }
+        if category == "gated":
+            result["gated"] = True
+            result["gate_reason"] = gate_reason
+            result["reason"] = f"send_gated:{gate_reason}"
+        elif category == "stale_pane":
+            result["stale_pane"] = True
+        return result
 
     logger.info(
         f"Custodes state hook: delivered pane={tmux_pane} instance={instance_id or 'unknown'}"
@@ -9135,6 +9346,7 @@ async def _inject_custodes_prompt_to_pane(
         "reason": "dispatched",
         "instance_id": instance_id,
         "tmux_pane": tmux_pane,
+        "delivery": send_result,
     }
 
 
@@ -9237,25 +9449,19 @@ async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
             f"payload to council:custodes: {result.get('reason')}"
         )
 
-    proc = await asyncio.create_subprocess_exec(
-        str(tmuxctl_bin),
-        "send-text",
-        "--pane",
-        "council:custodes",
-        "--stdin",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr_b = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout=45)
-    if proc.returncode != 0:
-        stderr_text = stderr_b.decode(errors="replace")
-        reason = stderr_text.strip()[:240] or stdout.decode().strip()[:240]
+    pane = result.get("pane") or "council:custodes"
+    send_result = await send_prompt_to_pane(pane, prompt)
+    if send_result.get("returncode") != 0:
+        stderr_text = str(send_result.get("stderr") or "")
         category, gate_reason = _classify_pane_inject_failure(stderr_text)
+        if send_result.get("gated"):
+            category = "gated"
+            gate_reason = send_result.get("gate_reason") or gate_reason or "typing_guard"
         delivery = {
             "dispatched": False,
-            "reason": f"send_text_failed: {reason}",
+            "reason": "tmuxctld_send_failed",
             "assertion": result,
+            "delivery": send_result,
         }
         if category == "gated":
             # No bytes reached the pane: hold-and-queue, do not lose (L2).
@@ -9265,7 +9471,13 @@ async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
         elif category == "stale_pane":
             delivery["stale_pane"] = True
         return delivery
-    return {"dispatched": True, "reason": "sent", "pane": result.get("pane"), "assertion": result}
+    return {
+        "dispatched": True,
+        "reason": "sent",
+        "pane": pane,
+        "assertion": result,
+        "delivery": send_result,
+    }
 
 
 async def _launch_custodes_for_intervention(
@@ -12691,7 +12903,8 @@ async def brief_send(request: BriefSendRequest):
         pane_id = target["pane_id"]
         try:
             if request.ephemeral:
-                # Reuse the temp_message side-channel infra (/btw or /side). The
+                # Reuse the temp_message semantic side-channel infra. The
+                # concrete /btw vs /side rendering belongs to tmuxctld. The
                 # temp_message queue_sender path doesn't carry hook_driven, so flag
                 # the target directly before the send (still before the byte lands).
                 if brief_hook_driven:
@@ -22893,6 +23106,11 @@ async def _discord_voice_error_message(bot: str, error_msg: str):
 async def _try_discord_active_pane_injection(message) -> bool:
     """Inject a Discord voice transcript into the pane locked for this utterance.
 
+    Explicit exception to the prompt/skill/command convergence: voice no-submit
+    and append-submit modes are draft-editing controls, not ordinary prompt
+    sends. They stay on tmux-dictate/raw Enter until the tmuxctld voice-session
+    API is wired to this legacy Discord path.
+
     The Discord daemon captures target_tmux_pane at speech start (or, failing
     that, at the silence/commit edge) so click-away during transcription does
     not retarget the final transcript.  If old daemons omit it, fall back to the
@@ -23011,53 +23229,35 @@ async def _agent_cmd_inject(
     formatted: str,
     channel_name: str | None,
 ) -> bool:
-    """Deliver `formatted` to an already-resolved target via agent-cmd.
+    """Append Discord text as direct-user keyboard input.
 
-    Prefers --instance (best routing); falls back to --pane. Returns False if
-    neither a target instance nor a pane was supplied.
+    The old helper name is retained for route-local call sites; no agent-cmd
+    subprocess is invoked here. Discord provides semantic target context only;
+    tmuxctld owns pane validation and writes the text without submit/clear.
     """
-    if not instance_id and not tmux_pane:
+    if not tmux_pane and instance_id:
+        tmux_pane = (await shared.resolve_instance_pane(instance_id))[0]
+    if not tmux_pane:
         return False
-    try:
-        agent_cmd = SCRIPTS_DIR / "cli-tools" / "bin" / "agent-cmd"
-        cmd = [str(agent_cmd)]
-        if instance_id:
-            cmd.extend(["--instance", instance_id])
-        else:
-            cmd.extend(["--pane", tmux_pane])
-        cmd.append(formatted)
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={
-                **os.environ,
-                "PATH": ":".join(
-                    [
-                        str(SCRIPTS_DIR / "cli-tools" / "bin"),
-                        str(Path.home() / ".local" / "bin"),
-                        "/opt/homebrew/bin",
-                        "/usr/local/bin",
-                        os.environ.get("PATH", ""),
-                    ]
-                ),
-            },
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        if proc.returncode == 0:
-            target = instance_id[:12] if instance_id else tmux_pane
-            logger.info(f"Discord injection: {legion} → {target} (#{channel_name})")
-            return True
-        logger.warning(f"Discord injection failed (rc={proc.returncode}): {stderr.decode()[:200]}")
-        return False
-    except TimeoutError:
+    result = await append_direct_user_text_to_pane(
+        tmux_pane,
+        formatted,
+        instance_id=instance_id,
+    )
+    if result.get("returncode") == 0:
         target = instance_id[:12] if instance_id else tmux_pane
-        logger.warning(f"Discord injection timed out for {target}")
-        return False
-    except Exception as e:
-        logger.warning(f"Discord injection error: {e}")
-        return False
+        logger.info(f"Discord injection: {legion} → {target} (#{channel_name})")
+        return True
+    if result.get("gated"):
+        logger.warning(
+            f"Discord injection gated for {instance_id[:12] if instance_id else tmux_pane}: "
+            f"{result.get('gate_reason') or 'gated'}"
+        )
+    else:
+        logger.warning(
+            f"Discord injection failed via tmuxctld: {str(result.get('stderr') or '')[:200]}"
+        )
+    return False
 
 
 async def _inject_custodes_via_singleton_pane(formatted: str, channel_name: str | None) -> bool:
@@ -23308,6 +23508,8 @@ async def _discord_voice_mark_title(bot: str, pane: str) -> str:
 
 
 async def _discord_voice_type(pane: str, text: str) -> bool:
+    # Draft-editing exception: this mutates an in-progress voice draft rather than
+    # submitting a normal prompt. Do not route through send_prompt_to_pane.
     tmux_dictate = SCRIPTS_DIR / "cli-tools" / "bin" / "tmux-dictate"
     proc = await asyncio.create_subprocess_exec(
         str(tmux_dictate),
@@ -23337,6 +23539,8 @@ async def _discord_voice_type(pane: str, text: str) -> bool:
 
 
 async def _discord_voice_send_key(pane: str, key: str) -> bool:
+    # Draft-editing exception: ship/scratch are raw draft controls (Enter/C-c),
+    # not prompt/skill/command submissions.
     proc = await asyncio.create_subprocess_exec(
         "tmux",
         "send-keys",

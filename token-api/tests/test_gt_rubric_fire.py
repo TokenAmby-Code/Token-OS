@@ -467,7 +467,8 @@ async def test_local_live_agent_receives_skill_invocation_for_missing_condition(
 
     assert rec.enqueues, "live agent should receive a guarded pane write"
     payload = rec.enqueues[0]["payload"]
-    assert payload == ('$golden-throne-sop victory condition "needs tests passing" is unmet')
+    assert rec.enqueues[0]["purpose"] == "skill:golden-throne-sop"
+    assert payload == ('victory condition "needs tests passing" is unmet')
     assert "execute that SOP" not in payload
 
 

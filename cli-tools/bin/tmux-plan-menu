@@ -114,11 +114,10 @@ normalize_agent() {
     esac
 }
 
-preplan_leader() {
-    case "$(normalize_agent "$1")" in
-        codex) echo '$preplan' ;;
-        *) echo '/preplan' ;;
-    esac
+render_preplan_invocation() {
+    local rendered
+    rendered="$("${_script_dir}/tmuxctl" invoke-skill preplan --agent "$1" --dry-run)" || return $?
+    printf '%s\n' "${rendered% }"
 }
 
 # --- background harness detection (preplan only) ---------------------------
@@ -245,7 +244,7 @@ set_planning_state() {
 prebuffer_prompt_start() { "${_script_dir}/tmuxctl" prompt-start --pane "$PANE" --page-ups "$PAGE_UPS"; }
 insert_text()           { "${_script_dir}/tmuxctl" insert-text  --pane "$PANE" --text "$1"; }
 move_prompt_end()       { "${_script_dir}/tmuxctl" prompt-end   --pane "$PANE" --page-downs "$PAGE_DOWNS"; }
-sink_codex_skill()      { tmux send-keys -t "$PANE" Tab; }
+insert_preplan_skill()  { "${_script_dir}/tmuxctl" invoke-skill preplan --pane "$PANE" --agent "$1"; }
 
 # Warm-daemon insert: prompt-start -> leader insert -> Codex sink -> prompt-end in
 # one POST. Returns 0 only when the daemon actually performed the insert (HTTP 2xx);
@@ -388,21 +387,14 @@ run_action() {
                     if daemon_insert preplan skill "$agent"; then
                         :
                     else
-                        text="$(preplan_leader "$agent") "
-                        # Fail closed on a missed prompt-start (already logged inside
-                        # _ensure_at_prompt_start): skip the leader insert and the Codex
-                        # Tab sink rather than typing into an unknown cursor position.
-                        if _ensure_at_prompt_start; then
-                            # Sink the Codex skill chip only after a confirmed insert —
-                            # a Tab after a failed insert lands at an unknown cursor and
-                            # never materializes the skill.
-                            if insert_text "$text"; then
-                                if [[ "$agent" == codex ]]; then
-                                    sink_codex_skill || log_failure preplan "$agent" sink-tab "tmux send-keys Tab rc=$?"
-                                fi
-                            else
-                                log_failure preplan "$agent" insert "insert-text rc=$?"
-                            fi
+                        # Compatibility fallback only: keep the daemon as the
+                        # canonical kind-aware API and reuse the existing
+                        # tmuxctl invoke-skill path rather than adding another
+                        # CLI brick. No shell-side skill leader construction
+                        # and no manual Codex Tab.
+                        text="$(insert_preplan_skill "$agent" 2>&1)"; rc=$?
+                        if (( rc != 0 )); then
+                            log_failure preplan "$agent" insert "invoke-skill rc=${rc} ${text}"
                         fi
                     fi
                 fi
@@ -473,7 +465,7 @@ if $DRY_RUN; then
             sink_text=""
             [[ "$agent_dry" == codex ]] && sink_text=" sink:Tab"
             printf 'pane=%s selection=preplan agent=%s insert:%s subscribe:preplan_plan state:preplanning%s\n' \
-                "$PANE" "$agent_dry" "$(preplan_leader "$agent_dry")" "$sink_text"
+                "$PANE" "$agent_dry" "$(render_preplan_invocation "$agent_dry")" "$sink_text"
             ;;
         plan)    printf 'pane=%s selection=plan insert:/plan state:planning\n' "$PANE" ;;
         compact) printf 'pane=%s selection=compact insert:/compact\n' "$PANE" ;;
