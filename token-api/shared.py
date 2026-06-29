@@ -517,6 +517,8 @@ async def _run_subprocess_offloop(
     timeout: float | None = None,
     stdout=None,
     stderr=None,
+    input=None,
+    text: bool = False,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run short tmux resolver subprocesses without forking on the event loop."""
@@ -525,6 +527,8 @@ async def _run_subprocess_offloop(
         list(args),
         stdout=stdout,
         stderr=stderr,
+        input=input,
+        text=text,
         env=env,
         timeout=timeout,
         check=False,
