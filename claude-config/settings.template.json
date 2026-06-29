@@ -96,6 +96,10 @@
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/runtime-unlock-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/pr-gh-guard.sh"
           }
         ]
       },
