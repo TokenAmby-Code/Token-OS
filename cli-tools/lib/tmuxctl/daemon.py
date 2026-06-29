@@ -119,7 +119,7 @@ def ensure_tmux_lifecycle_hooks() -> dict:
                 "stderr": str(exc)[:300],
             }
         results.append(entry)
-        ok = ok and entry["ok"]
+        ok = ok and bool(entry["ok"])
     if not ok:
         log.warning("tmux lifecycle hook install incomplete: %s", results)
     return {"ok": ok, "results": results}
