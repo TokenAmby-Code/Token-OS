@@ -27,6 +27,7 @@ live DB, or the developer's real ``~/.claude`` (HOME is redirected to tmp). The
 from __future__ import annotations
 
 import http.server
+import socket
 import subprocess
 import threading
 import time
@@ -84,14 +85,19 @@ class _StubServer:
                 pass
 
         self._server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
 
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self._server.server_address[1]}"
 
     def stop(self) -> None:
+        # shutdown() stops serve_forever() but leaves the listening socket bound;
+        # server_close() releases the FD so repeated tests can't leak/port-bind.
         self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,10 +143,14 @@ def test_sessionstart_503_failloud_is_visible(tmp_path: Path) -> None:
 
 
 def test_sessionstart_conn_refused_is_visible_and_bounded(tmp_path: Path) -> None:
-    # Port 1 is reserved/unused → connection-refused on every retry.
+    # Bind+close an ephemeral port so it is guaranteed unused → connection-refused
+    # on every retry (hard-coding port 1 is environment-dependent).
     fail_log = tmp_path / "sessionstart-failures.log"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        unused_port = sock.getsockname()[1]
     start = time.monotonic()
-    res = _run_hook(_env(tmp_path, "http://127.0.0.1:1", fail_log))
+    res = _run_hook(_env(tmp_path, f"http://127.0.0.1:{unused_port}", fail_log))
     elapsed = time.monotonic() - start
 
     assert res.returncode != 0, "connection-refused was swallowed as exit 0"
