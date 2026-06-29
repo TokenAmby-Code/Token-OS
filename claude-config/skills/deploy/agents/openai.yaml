@@ -1,0 +1,7 @@
+interface:
+  display_name: "Deploy"
+  short_description: "Deploy services through CI/CD"
+  default_prompt: "$deploy prepare or run the requested deployment workflow."
+
+policy:
+  allow_implicit_invocation: true

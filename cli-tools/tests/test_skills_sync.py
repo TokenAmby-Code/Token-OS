@@ -116,3 +116,20 @@ def test_skills_sync_check_requires_preplan_openai_visibility_policy(tmp_path):
     assert result.returncode == 1
     data = json.loads(result.stdout)
     assert any(f["code"] == "preplan_not_model_visible" for f in data["findings"])
+
+
+def test_skills_sync_skip_commands_repairs_all_skill_roots_without_command_shims(tmp_path):
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    skill = _write_skill(canonical, "sample")
+    home = tmp_path / "home"
+    protected_commands = home / ".claude" / "commands"
+    protected_commands.mkdir(parents=True)
+    (protected_commands / "preplan.md").write_text("do not touch", encoding="utf-8")
+
+    install = _run(tmp_path, canonical, "--install", "--skip-commands", "--json")
+    assert install.returncode == 0, install.stdout + install.stderr
+    assert (home / ".codex" / "skills" / "sample").resolve() == skill.resolve()
+    assert (home / ".agents" / "skills" / "sample").resolve() == skill.resolve()
+    assert (protected_commands / "preplan.md").read_text(encoding="utf-8") == "do not touch"
+    assert (home / ".claude" / "skills").resolve() == canonical.resolve()

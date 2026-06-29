@@ -81,6 +81,7 @@ def _wrapper_env(tmp_path: Path, target: Path, *, fake_curl: bool = True) -> tup
             "TOKEN_API_URL": "http://token-api.invalid",
             "TMUXCTLD_URL": "http://tmuxctld.invalid",
             "TOKEN_API_WRAPPER_LAUNCH_ID": "wrapper-test-id",
+            "TOKEN_WRAPPER_SYNC_SHARED_SKILLS": "0",
         }
     )
     env.pop("TMUX_PANE", None)
@@ -111,6 +112,43 @@ def _run_wrapper(tmp_path: Path, child_body: str) -> tuple[subprocess.CompletedP
         capture_output=True,
     )
     return result, _read_hooks_after_async(hooks)
+
+
+def test_wrapper_repairs_shared_skill_roots_before_codex_launch(tmp_path: Path) -> None:
+    canonical = tmp_path / "canonical-skills"
+    skill = canonical / "sample-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: sample-skill\ndescription: Test skill for Codex wrapper sync.\n---\n\n# Sample\n",
+        encoding="utf-8",
+    )
+
+    codex_target = tmp_path / "codex-target"
+    launched = tmp_path / "codex-launched"
+    _write_executable(codex_target, f"#!/usr/bin/env bash\ntouch {str(launched)!r}\nexit 0\n")
+
+    env, _hooks = _wrapper_env(tmp_path, codex_target)
+    env["CODEX_BIN"] = str(codex_target)
+    env["HOME"] = str(tmp_path / "home")
+    env["SKILLS_SYNC_HOME"] = env["HOME"]
+    env["SKILLS_SYNC_CANONICAL"] = str(canonical)
+    env["TOKEN_WRAPPER_SYNC_SHARED_SKILLS"] = "1"
+    env.pop("CLAUDE_BIN", None)
+
+    result = subprocess.run(
+        [str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"), "codex"],
+        env=env,
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert launched.exists()
+    assert (tmp_path / "home" / ".codex" / "skills" / "sample-skill").resolve() == skill.resolve()
+    assert (tmp_path / "home" / ".agents" / "skills" / "sample-skill").resolve() == skill.resolve()
+    assert (tmp_path / "home" / ".claude" / "skills").resolve() == canonical.resolve()
+    assert not (tmp_path / "home" / ".claude" / "commands" / "preplan.md").exists()
 
 
 def test_wrapperend_emits_on_normal_child_exit_and_preserves_zero(tmp_path: Path) -> None:

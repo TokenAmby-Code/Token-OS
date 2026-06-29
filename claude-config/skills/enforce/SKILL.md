@@ -1,6 +1,7 @@
 ---
 name: enforce
 description: "Phone enforcement and notification system. Usage: /enforce (reference) or /enforce --build (active dev with full file context)."
+user_invocable: true
 ---
 
 # /enforce — Phone Enforcement & Notification System

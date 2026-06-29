@@ -164,7 +164,7 @@ def _check_link(path: Path, expected: Path, findings: list[Finding], code_prefix
     findings.append(Finding("error", f"{code_prefix}_missing", str(path), "missing shared skill link"))
 
 
-def inspect() -> dict[str, Any]:
+def inspect(*, skip_claude: bool = False, skip_commands: bool = False) -> dict[str, Any]:
     home = _home()
     canonical = _canonical()
     claude_root = home / ".claude" / "skills"
@@ -181,10 +181,11 @@ def inspect() -> dict[str, Any]:
         findings.append(Finding("error", "canonical_not_directory", str(canonical), "canonical skills path is not a directory"))
         return _result(canonical, claude_root, codex_roots, skills, findings)
 
-    if claude_root.exists() or claude_root.is_symlink():
-        _check_link(claude_root, canonical, findings, "claude_root")
-    else:
-        findings.append(Finding("error", "claude_root_missing", str(claude_root), "~/.claude/skills is missing"))
+    if not skip_claude:
+        if claude_root.exists() or claude_root.is_symlink():
+            _check_link(claude_root, canonical, findings, "claude_root")
+        else:
+            findings.append(Finding("error", "claude_root_missing", str(claude_root), "~/.claude/skills is missing"))
 
     names: dict[str, list[str]] = {}
     for skill in _skill_dirs(canonical):
@@ -193,7 +194,7 @@ def inspect() -> dict[str, Any]:
             continue
         md = _skill_md(skill)
         legacy = _legacy_skill_md(skill)
-        has_skill_md = _has_exact_child(skill, "SKILL.md") and md.exists()
+        has_skill_md = md.exists()
         if not has_skill_md:
             msg = "missing SKILL.md"
             if legacy.exists():
@@ -240,13 +241,15 @@ def inspect() -> dict[str, Any]:
                         "preplan must remain model-visible because Shift+Tab inserts literal $preplan text in Codex",
                     )
                 )
-            command_path = claude_commands / "preplan.md"
-            _check_link(command_path, md, findings, "claude_preplan_command")
-            canonical_command_path = canonical_commands / "preplan.md"
-            _check_link(canonical_command_path, md, findings, "canonical_preplan_command")
-        claude_path = claude_root / skill.name
-        _check_link(claude_path, skill, findings, "claude_skill")
-        visibility["claude"] = _real(claude_path) if claude_path.exists() else ""
+            if not skip_commands:
+                command_path = claude_commands / "preplan.md"
+                _check_link(command_path, md, findings, "claude_preplan_command")
+                canonical_command_path = canonical_commands / "preplan.md"
+                _check_link(canonical_command_path, md, findings, "canonical_preplan_command")
+        if not skip_claude:
+            claude_path = claude_root / skill.name
+            _check_link(claude_path, skill, findings, "claude_skill")
+            visibility["claude"] = _real(claude_path) if claude_path.exists() else ""
         for root in codex_roots:
             path = root / name
             prefix = "codex_agents" if root.parent.name == ".agents" else "codex_home"
@@ -269,7 +272,8 @@ def inspect() -> dict[str, Any]:
             findings.append(Finding("error", "duplicate_skill_name", name, ", ".join(paths)))
 
     # Check direct children symlinks in managed roots; never descend into .system.
-    for root in [claude_root, *codex_roots]:
+    visible_roots = [*codex_roots] if skip_claude else [claude_root, *codex_roots]
+    for root in visible_roots:
         if not root.exists():
             continue
         for child in root.iterdir():
@@ -310,7 +314,7 @@ def _safe_link(src: Path, dst: Path, findings: list[Finding]) -> bool:
     return True
 
 
-def install() -> dict[str, Any]:
+def install(*, skip_claude: bool = False, skip_commands: bool = False) -> dict[str, Any]:
     home = _home()
     canonical = _canonical()
     findings: list[Finding] = []
@@ -321,7 +325,8 @@ def install() -> dict[str, Any]:
         findings.append(Finding("error", "canonical_not_directory", str(canonical), "canonical skills path is not a directory"))
         return _result(canonical, home / ".claude" / "skills", _codex_roots(home), [], findings)
 
-    _safe_link(canonical, home / ".claude" / "skills", findings)
+    if not skip_claude:
+        _safe_link(canonical, home / ".claude" / "skills", findings)
     claude_commands = home / ".claude" / "commands"
     canonical_commands = _canonical_commands_root(canonical)
     for root in _codex_roots(home):
@@ -333,7 +338,7 @@ def install() -> dict[str, Any]:
             continue
         md = _skill_md(skill)
         legacy = _legacy_skill_md(skill)
-        if not (_has_exact_child(skill, "SKILL.md") and md.exists()) and _has_exact_child(skill, "skill.md") and legacy.exists():
+        if not md.exists() and _has_exact_child(skill, "skill.md") and legacy.exists():
             _safe_link(legacy, md, findings)
         link_name = skill.name
         if md.exists():
@@ -344,13 +349,13 @@ def install() -> dict[str, Any]:
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", link_name):
             findings.append(Finding("error", "skill_name_invalid", str(skill), f"invalid skill name {link_name!r}"))
             continue
-        if link_name == "preplan" and md.exists():
+        if not skip_commands and link_name == "preplan" and md.exists():
             _safe_link(md, canonical_commands / "preplan.md", findings)
             _safe_link(md, claude_commands / "preplan.md", findings)
         for root in _codex_roots(home):
             _safe_link(skill, root / link_name, findings)
 
-    checked = inspect()
+    checked = inspect(skip_claude=skip_claude, skip_commands=skip_commands)
     checked["install_findings"] = [asdict(f) for f in findings]
     if findings:
         checked["findings"] = checked.get("findings", []) + [asdict(f) for f in findings]
@@ -376,10 +381,12 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="Check skill health and visibility")
     mode.add_argument("--install", action="store_true", help="Create/repair symlinks only")
+    parser.add_argument("--skip-claude", action="store_true", help="Skip ~/.claude/skills checks/repairs")
+    parser.add_argument("--skip-commands", action="store_true", help="Skip Claude slash-command shim checks/repairs")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args(argv)
 
-    result = install() if args.install else inspect()
+    result = install(skip_claude=args.skip_claude, skip_commands=args.skip_commands) if args.install else inspect(skip_claude=args.skip_claude, skip_commands=args.skip_commands)
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:

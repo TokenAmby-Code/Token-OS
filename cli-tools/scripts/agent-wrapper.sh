@@ -237,6 +237,7 @@ run_claude() {
   trap 'wrapper_forward_signal INT' INT
   trap 'wrapper_forward_signal TERM' TERM
   trap 'wrapper_forward_signal HUP' HUP
+  sync_shared_skills
   token_wrapper_start
   export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
 
@@ -362,10 +363,35 @@ run_codex_legacy_subagent() {
   exit "$status"
 }
 
+sync_shared_skills() {
+  # Keep shared skill roots repaired before any managed agent launch. The
+  # engines expose them differently (`/skill` in Claude, `$skill` in Codex),
+  # but the source of truth and root sync are intentionally unified. Launch-time
+  # sync skips command shims so a worker cannot mutate slash-command plumbing.
+  [[ "${TOKEN_WRAPPER_SYNC_SHARED_SKILLS:-1}" == "1" ]] || return 0
+  local skills_sync="${SCRIPT_DIR}/../bin/skills-sync"
+  [[ -x "$skills_sync" ]] || return 0
+  local sync_stderr sync_rc=0
+  sync_stderr="$(mktemp "${TMPDIR:-/tmp}/codex-skills-sync.XXXXXX")" || return 0
+  "$skills_sync" --install --skip-commands >/dev/null 2>"$sync_stderr" || sync_rc=$?
+  if [[ "$sync_rc" -ne 0 ]]; then
+    printf 'token-wrapper: WARNING skills-sync --install --skip-commands failed before agent launch (rc=%s); skill autocomplete may be stale. Run `%s --check`.
+' \
+      "$sync_rc" "$skills_sync" >&2
+    if [[ -s "$sync_stderr" ]]; then
+      sed 's/^/token-wrapper skills-sync: /' "$sync_stderr" >&2 || true
+    fi
+  fi
+  rm -f "$sync_stderr" 2>/dev/null || true
+  return 0
+}
+
 run_codex() {
   if codex_legacy_subagent_mode "$@"; then
     run_codex_legacy_subagent "$@"
   fi
+
+  sync_shared_skills
 
   local session_id bridge_id bridge_dir working_dir prompt resume_id bypass_flag output_file status=0
   local -a codex_args
