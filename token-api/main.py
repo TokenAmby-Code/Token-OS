@@ -5201,13 +5201,13 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     ``unverified`` is terminal and loud, not retryable pending, because bytes may
     have reached the composer and a blind retry would duplicate.
     """
-    if send_result.get("returncode") != 0:
-        return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
     verification = str(send_result.get("verification_status") or "").lower()
-    if verification == "submitted":
-        return PANE_WRITE_SENT, None
     if verification == "gated" or send_result.get("gated"):
         return PANE_WRITE_PENDING, f"send_gated:{send_result.get('gate_reason') or 'gated'}"
+    if send_result.get("returncode") != 0:
+        return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
+    if verification == "submitted":
+        return PANE_WRITE_SENT, None
     return (
         PANE_WRITE_UNVERIFIED,
         "submit_unverified:no_UserPromptSubmit_ack; bytes_may_have_been_issued_do_not_blind_retry",
@@ -12681,8 +12681,15 @@ async def talk_send(request: TalkSendRequest):
             send_result = await _talk_send_payload(
                 target_pane, request.payload, hook_driven=talk_hook_driven
             )
+            if send_result.get("status") != PANE_WRITE_SENT:
+                raise RuntimeError(
+                    send_result.get("reason")
+                    or send_result.get("error")
+                    or f"delivery_not_verified:{send_result.get('status')}"
+                )
         except Exception as exc:  # noqa: BLE001
-            send_result = {"status": "failed", "error": str(exc)}
+            detail = await talk_service.publicize_payload(f"talk return delivery failed: {exc}")
+            raise HTTPException(status_code=502, detail=detail) from exc
         return {
             "status": "returned",
             "talk_id": returned["talk_id"],
