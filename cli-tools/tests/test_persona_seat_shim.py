@@ -66,3 +66,10 @@ def test_shim_bypasses_the_front_door_wrapper() -> None:
     assert "TOKEN_API_AGENT_WRAPPER_BYPASS=1" in body
     # Prefers the real engine binary, never re-enters a wrapper shim.
     assert ".token-os-real" in body
+
+
+def test_shim_stamps_runtime_options_before_exec() -> None:
+    body = SHIM.read_text(encoding="utf-8")
+    assert "tmux-runtime-cleanup.sh" in body
+    assert "tmux_runtime_stamp_wrapper" in body
+    assert body.index("tmux_runtime_stamp_wrapper") < body.index('exec "$ENGINE_BIN"')

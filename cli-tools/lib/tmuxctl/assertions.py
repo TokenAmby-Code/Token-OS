@@ -720,7 +720,9 @@ def _set_pane_tint(adapter: TmuxAdapter, pane_id: str, bg: str) -> None:
 
 
 def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec) -> None:
-    current = adapter.run("display-message", "-p", "#{pane_id}", allow_failure=True).strip()
+    current = adapter.run(
+        "display-message", "-t", pane_id, "-p", "#{pane_id}", allow_failure=True
+    ).strip()
     if current != pane_id:
         return
     voice_locked = adapter.run(
