@@ -60,6 +60,9 @@ def test_chflags_nouchg_runtime_is_denied():
     assert "write-locked" in reason
     assert "worktree" in reason
     assert "PR" in reason
+    assert "--force" in reason
+    assert "sanctioned admin/runtime maintenance" in reason
+    assert "Do not use force to make a quick code change" in reason
 
 
 def test_chmod_recursive_u_plus_w_runtime_is_denied():
@@ -98,6 +101,65 @@ def test_full_bypass_chain_is_denied():
     assert_denied(run_hook(chain))
 
 
+def test_sanctioned_helper_unlock_runtime_is_denied():
+    assert_denied(
+        run_hook(
+            "cli-tools/scripts/runtime-write-protect.sh unlock "
+            "/Users/tokenclaw/runtimes/Token-OS/live"
+        )
+    )
+
+
+def test_sanctioned_helper_unlock_without_root_is_denied():
+    # With no root args, the helper unlocks its built-in runtime roots.
+    assert_denied(run_hook("cli-tools/scripts/runtime-write-protect.sh unlock"))
+
+
+def test_sanctioned_helper_unlock_runtime_with_force_is_allowed():
+    assert_allowed(
+        run_hook(
+            "cli-tools/scripts/runtime-write-protect.sh unlock --force "
+            "/Users/tokenclaw/runtimes/Token-OS/live"
+        )
+    )
+
+
+def test_sanctioned_helper_unlock_runtime_with_admin_force_is_allowed():
+    assert_allowed(
+        run_hook(
+            "cli-tools/scripts/runtime-write-protect.sh unlock "
+            "--admin-force ~/runtimes/Token-OS/live"
+        )
+    )
+
+
+def test_sanctioned_helper_unlock_runtime_with_trailing_force_is_allowed():
+    assert_allowed(
+        run_hook(
+            "cli-tools/scripts/runtime-write-protect.sh unlock "
+            "/Users/tokenclaw/runtimes/Token-OS/live --force"
+        )
+    )
+
+
+def test_bash_sanctioned_helper_unlock_runtime_is_denied():
+    assert_denied(
+        run_hook("bash cli-tools/scripts/runtime-write-protect.sh unlock ~/runtimes/Token-OS/live")
+    )
+
+
+def test_cd_runtime_then_relative_helper_unlock_is_denied():
+    assert_denied(
+        run_hook(
+            "cd ~/runtimes/Token-OS/live && cli-tools/scripts/runtime-write-protect.sh unlock ."
+        )
+    )
+
+
+def test_cd_runtime_then_relative_chmod_add_write_is_denied():
+    assert_denied(run_hook("cd ~/runtimes/Token-OS/live && chmod u+w token-api/main.py"))
+
+
 # --------------------------------------------------------------------------- #
 # ALLOW: re-locking, non-runtime targets, and unrelated commands.
 # --------------------------------------------------------------------------- #
@@ -134,6 +196,41 @@ def test_command_without_chmod_or_chflags_is_silent():
     assert_allowed(run_hook("ls -la ~/runtimes/Token-OS/live && git status"))
 
 
+def test_sanctioned_helper_lock_runtime_is_allowed():
+    assert_allowed(
+        run_hook(
+            "cli-tools/scripts/runtime-write-protect.sh lock "
+            "/Users/tokenclaw/runtimes/Token-OS/live"
+        )
+    )
+
+
+def test_sanctioned_helper_unlock_worktree_is_allowed():
+    assert_allowed(
+        run_hook(
+            "cli-tools/scripts/runtime-write-protect.sh unlock "
+            "~/worktrees/Token-OS/wt-runtime-unlock-guard-sanctioned-helper-bypass"
+        )
+    )
+
+
+def test_descriptive_dispatch_prompt_is_allowed():
+    # Regression: this is a dispatch command whose prompt text merely describes
+    # the forbidden operation. The actual command is dispatch, not chmod/chflags
+    # or the helper, so it must not be denied by naive substring matching.
+    prompt = (
+        "Ticket says runtime-write-protect.sh unlock "
+        "/Users/tokenclaw/runtimes/Token-OS/live and chmod +w are forbidden."
+    )
+    assert_allowed(run_hook(f"dispatch --worktree guard-fix --prompt {prompt!r}"))
+
+
+def test_echo_description_is_allowed():
+    assert_allowed(
+        run_hook("echo 'do not run chflags nouchg ~/runtimes/Token-OS/live or chmod +w there'")
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Escape hatch: legitimate deploy path only.
 # --------------------------------------------------------------------------- #
@@ -149,3 +246,12 @@ def test_env_escape_hatch_permits_unlock(monkeypatch):
 
 def test_inline_escape_hatch_permits_unlock():
     assert_allowed(run_hook("IMPERIUM_ALLOW_RUNTIME_WRITE=1 chmod u+w ~/runtimes/Token-OS/live/x"))
+
+
+def test_inline_escape_hatch_permits_helper_unlock():
+    assert_allowed(
+        run_hook(
+            "IMPERIUM_ALLOW_RUNTIME_WRITE=1 "
+            "cli-tools/scripts/runtime-write-protect.sh unlock ~/runtimes/Token-OS/live"
+        )
+    )

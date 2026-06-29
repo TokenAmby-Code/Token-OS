@@ -22,15 +22,19 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-runtime-write-protect.sh lock|unlock|status|assert-locked [runtime-root ...]
+runtime-write-protect.sh lock|unlock [--force|--admin-force] [runtime-root ...]
+runtime-write-protect.sh status|assert-locked [runtime-root ...]
 
 Actions:
   lock           clear write bits + set the user-immutable flag (macOS) recursively
   unlock         clear the immutable flag + restore owner write bits for deploy
+                 --force/--admin-force is an explicit sanctioned-admin marker
   status         print locked/unlocked/missing per root; exits 0
   assert-locked  exits nonzero if any root has a write bit or is missing uchg
 
 If no roots are supplied, protects known Token-OS runtime checkouts on this host.
+Use unlock --force only for deliberate sanctioned admin/runtime maintenance;
+never use it to make a quick code change in the deploy-owned runtime.
 USAGE
 }
 
@@ -49,6 +53,24 @@ case "$ACTION" in
         exit 2
         ;;
 esac
+
+ADMIN_FORCE=0
+if [[ "$ACTION" == "unlock" ]]; then
+    FILTERED_ARGS=()
+    for arg in "$@"; do
+        case "$arg" in
+            --force|--admin-force)
+                ADMIN_FORCE=1
+                ;;
+            --)
+                ;;
+            *)
+                FILTERED_ARGS+=("$arg")
+                ;;
+        esac
+    done
+    set -- "${FILTERED_ARGS[@]}"
+fi
 
 HOME_DIR="${HOME%/}"
 
@@ -278,6 +300,9 @@ for root in "${ROOTS[@]}"; do
 
     case "$ACTION" in
         unlock)
+            if [[ "$ADMIN_FORCE" == "1" ]]; then
+                echo "runtime-write-protect: ADMIN FORCE unlock for sanctioned runtime maintenance only; do not use for quick code changes: $root" >&2
+            fi
             # Clear the immutable flag BEFORE chmod — chmod returns EPERM on a
             # uchg path, and deploy's git sync must be able to overwrite/delete
             # tree files. This ordering is the difference between a clean deploy

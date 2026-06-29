@@ -121,6 +121,37 @@ def test_unlock_restores_owner_write(tmp_path) -> None:
     assert has_owner_write(file)
 
 
+def test_unlock_force_restores_owner_write_with_admin_warning(tmp_path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    file = root / "x.py"
+    file.write_text("x\n")
+    assert run("lock", str(root)).returncode == 0
+
+    proc = run("unlock", "--force", str(root))
+
+    assert proc.returncode == 0, proc.stderr
+    assert has_owner_write(root)
+    assert has_owner_write(file)
+    assert "ADMIN FORCE unlock" in proc.stderr
+    assert "sanctioned runtime maintenance" in proc.stderr
+
+
+def test_unlock_admin_force_accepts_flag_after_root(tmp_path) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    file = root / "x.py"
+    file.write_text("x\n")
+    assert run("lock", str(root)).returncode == 0
+
+    proc = run("unlock", str(root), "--admin-force")
+
+    assert proc.returncode == 0, proc.stderr
+    assert has_owner_write(root)
+    assert has_owner_write(file)
+    assert "ADMIN FORCE unlock" in proc.stderr
+
+
 def test_assert_locked_fails_when_any_write_bit_remains(tmp_path) -> None:
     root = tmp_path / "runtime"
     root.mkdir()
