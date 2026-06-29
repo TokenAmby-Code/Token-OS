@@ -27,6 +27,10 @@ V1_TRIGGERS = {
     # Internal/diagnostic only: recognized so it can be recorded, but it must
     # never attach to the Custodes enforcement/paging path.
     "tts_queue_languishing",
+    # Workflow/audit events. These are pure state records for the Administratum
+    # stream: they must be captured durably, but never page Custodes.
+    "worktree_created",
+    "pr_merged",
 }
 
 # Hooks that carry a physical enforcement action (Pavlok / window-close / ack
@@ -94,6 +98,9 @@ def build_dedupe_key(event: StateEvent) -> str:
         payload.get("phone_app")
         or payload.get("app")
         or payload.get("ack_source")
+        or payload.get("path")
+        or payload.get("pr_url")
+        or payload.get("sha")
         or payload.get("desktop_mode")
         or payload.get("mode")
         or event.instance_id
@@ -210,6 +217,9 @@ def _snapshot_items(
         items.append(f"break_balance={formatted_balance}")
     if payload.get("reason"):
         items.append(f"reason={payload['reason']}")
+    for key in ("doc_id", "path", "branch", "port", "claimed_at", "pr_url", "sha"):
+        if payload.get(key) is not None:
+            items.append(f"{key}={payload[key]}")
 
     cascades_today = snapshot.get("cascade_count_today")
     if cascades_today is not None:
@@ -259,6 +269,8 @@ def evaluate_state_event(
         "enforcement_cascade_escalate": "Intervene about active escalation; the loop is escalating — get explicit closure now.",
         "expected_ack_escalated": "Intervene about the missed acknowledgement ladder; mirror the Discord-channel cascade and pull the Emperor back to the work surface.",
         "tts_queue_languishing": "Record that the TTS pause queue is languishing for internal diagnostics only; do not page or enforce from this label.",
+        "worktree_created": "Record that a worktree was claimed for a session document.",
+        "pr_merged": "Record that a pull request merged and entered the CD restart path.",
     }[event.event_type]
 
     prompt = (

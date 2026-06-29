@@ -86,3 +86,23 @@ def test_administratum_log_append_failure_is_loud(app_env, monkeypatch, tmp_path
                 intervention=_intervention(),
             )
         )
+
+
+def test_rowless_administratum_pane_recovery_accepts_codex_node(app_env, monkeypatch):
+    main = app_env.main
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return (
+                b"%42\tcouncil:administratum\tnode\tcodex\n%43\tcouncil:custodes\tclaude\tclaude\n",
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return Proc()
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    assert asyncio.run(main._find_administratum_tmux_pane()) == "%42"
