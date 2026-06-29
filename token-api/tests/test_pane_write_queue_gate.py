@@ -190,8 +190,8 @@ async def test_queue_routes_structured_gt_skill_to_tmuxctld(app_env: Any, monkey
             "stdout": "",
             "stderr": "",
             "gated": False,
-            "verification_status": "unverified",
-            "verified_by": None,
+            "verification_status": "submitted",
+            "verified_by": "UserPromptSubmit",
         }
 
     monkeypatch.setattr(main, "send_skill_to_pane", _ok)
@@ -355,8 +355,8 @@ async def test_gated_then_cleared_gate_flushes_to_sent(app_env: Any, monkeypatch
             "stdout": "",
             "stderr": "",
             "gated": False,
-            "verification_status": "unverified",
-            "verified_by": None,
+            "verification_status": "submitted",
+            "verified_by": "UserPromptSubmit",
         }
 
     monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _ok)
@@ -364,7 +364,7 @@ async def test_gated_then_cleared_gate_flushes_to_sent(app_env: Any, monkeypatch
 
     assert len(results) == 1
     assert results[0]["status"] == main.PANE_WRITE_SENT
-    assert results[0]["verification_status"] == "unverified"
+    assert results[0]["verification_status"] == "submitted"
     assert _fetch_status(app_env.db_path, queued["id"]) == "sent"
 
 
@@ -496,8 +496,8 @@ async def test_dequeue_sends_to_live_resolved_pane_not_stored_column(
             "stdout": "",
             "stderr": "",
             "gated": False,
-            "verification_status": "unverified",
-            "verified_by": None,
+            "verification_status": "submitted",
+            "verified_by": "UserPromptSubmit",
         }
 
     monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _ok)
