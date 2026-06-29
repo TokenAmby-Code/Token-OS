@@ -1,7 +1,6 @@
 ---
 name: pr
 description: "Canonical PR lifecycle. Usage: /pr or /pr step runs pr-step: commit, create/update PR, summarize CodeRabbit/checks, and auto-merge when green."
-user_invocable: true
 ---
 
 # PR — One-Step Pull Request Lifecycle

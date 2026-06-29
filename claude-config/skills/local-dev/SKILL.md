@@ -1,7 +1,6 @@
 ---
 name: local-dev
 description: "Launch local dev and test via browser. Usage: /local-dev [amendment]"
-user_invocable: true
 ---
 
 # Local Dev

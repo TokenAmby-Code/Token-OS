@@ -1,7 +1,6 @@
 ---
 name: deploy
 description: "Deploy services to Cloud Run. Usage: /deploy [service] [env]. Services: backend (default), web, widget-proxy, chat-proxy, proxies. Envs: dev (default), prod."
-user_invocable: true
 ---
 
 # Deploy
