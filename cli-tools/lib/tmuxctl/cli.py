@@ -272,6 +272,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Value to print when detection is inconclusive (use 'auto' to fail closed).",
     )
 
+    persona_engine_parser = subparsers.add_parser(
+        "persona-engine",
+        help="Hot-swap a protected persona singleton pane between Claude and Codex.",
+    )
+    persona_engine_parser.add_argument("--pane", default="current")
+    persona_engine_parser.add_argument("--session", default=None)
+    persona_engine_mode = persona_engine_parser.add_mutually_exclusive_group(required=True)
+    persona_engine_mode.add_argument("--toggle", action="store_true")
+    persona_engine_mode.add_argument("--engine", choices=["claude", "codex"])
+
     audience_parser = subparsers.add_parser("audience")
     audience_subparsers = audience_parser.add_subparsers(dest="audience_command", required=True)
 
@@ -721,6 +731,24 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+
+        if args.command == "persona-engine":
+            import json
+
+            from .persona_engine import rotate_persona_engine
+
+            pane = args.pane
+            if pane == "current":
+                pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
+            result = rotate_persona_engine(
+                control.adapter,
+                pane,
+                engine=args.engine,
+                toggle=args.toggle,
+                session=args.session,
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result.get("ok") else 1
 
         if args.command == "audience":
             import os as _os

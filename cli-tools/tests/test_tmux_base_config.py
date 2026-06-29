@@ -399,3 +399,10 @@ def test_portable_status_guard_indicator_is_also_per_pane() -> None:
     )
     assert "tmux-typing-guard-status" not in status_right
     assert "#(" not in status_right
+
+
+def test_prefix_e_hot_swaps_persona_engine() -> None:
+    line = _line_starting("bind E ")
+    assert "tmuxctl persona-engine" in line
+    assert "--pane '#{pane_id}'" in line
+    assert "--toggle" in line
