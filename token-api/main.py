@@ -5187,8 +5187,31 @@ async def _tmux_pane_exists(tmux_pane: str | None) -> bool:
 PANE_WRITE_PENDING = "pending"
 PANE_WRITE_SENT = "sent"
 PANE_WRITE_FAILED = "failed"
+PANE_WRITE_UNVERIFIED = "unverified"
 PANE_WRITE_CANCELLED = "cancelled"
 PANE_WRITE_DEFERRED = "deferred"
+
+
+def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
+    """Map low-level pane-send truth to durable queue/front-end status.
+
+    The send path distinguishes bytes-issued from submit/turn consumption. A
+    zero returncode is NOT enough: only ``verification_status=submitted`` means
+    the target agent observed a submitted prompt (UserPromptSubmit/composer proof).
+    ``unverified`` is terminal and loud, not retryable pending, because bytes may
+    have reached the composer and a blind retry would duplicate.
+    """
+    if send_result.get("returncode") != 0:
+        return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
+    verification = str(send_result.get("verification_status") or "").lower()
+    if verification == "submitted":
+        return PANE_WRITE_SENT, None
+    if verification == "gated" or send_result.get("gated"):
+        return PANE_WRITE_PENDING, f"send_gated:{send_result.get('gate_reason') or 'gated'}"
+    return (
+        PANE_WRITE_UNVERIFIED,
+        "submit_unverified:no_UserPromptSubmit_ack; bytes_may_have_been_issued_do_not_blind_retry",
+    )
 
 
 def _pane_input_line_has_text(line: str) -> bool:
@@ -5661,16 +5684,19 @@ async def process_pane_write_queue_once(
                 )
                 results.append(result)
                 continue
+            terminal_status, terminal_error = _pane_send_terminal_status(send_result)
             result = {
                 **base,
-                "status": PANE_WRITE_SENT if send_result["returncode"] == 0 else PANE_WRITE_FAILED,
+                "status": terminal_status,
                 **send_result,
             }
+            if terminal_error and "reason" not in result:
+                result["reason"] = terminal_error
             await _mark_pane_write(
                 item["id"],
-                status=result["status"],
+                status=terminal_status,
                 result=result,
-                error=result["stderr"] if send_result["returncode"] != 0 else None,
+                error=terminal_error,
             )
             results.append(result)
         except Exception as exc:
@@ -12575,11 +12601,15 @@ async def _direct_tmux_pane_delivery(
             **send_result,
             **result,
         }
-    return {
+    terminal_status, terminal_error = _pane_send_terminal_status(send_result)
+    result = {
         **base,
-        "status": PANE_WRITE_SENT if send_result.get("returncode") == 0 else PANE_WRITE_FAILED,
+        "status": terminal_status,
         **send_result,
     }
+    if terminal_error and "reason" not in result:
+        result["reason"] = terminal_error
+    return result
 
 
 async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: bool = False) -> dict:
@@ -12613,9 +12643,23 @@ async def talk_send(request: TalkSendRequest):
     caller_pane = await talk_service.resolve_pane(caller_raw)
     target_pane = await talk_service.resolve_pane(target_raw)
     if not caller_pane:
-        raise HTTPException(status_code=400, detail=f"caller_pane unresolved: {caller_raw}")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"caller_pane unresolved: {caller_raw}. Use a public pane id like "
+                "council:pax / mechanicus:fabricator-general, a unique pane-label suffix, "
+                "or a raw tmux %pane."
+            ),
+        )
     if not target_pane:
-        raise HTTPException(status_code=400, detail=f"target_pane unresolved: {target_raw}")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"target_pane unresolved: {target_raw}. Use a public pane id like "
+                "council:pax / mechanicus:fabricator-general, a unique pane-label suffix, "
+                "or a raw tmux %pane."
+            ),
+        )
     if caller_pane == target_pane:
         raise HTTPException(status_code=400, detail="caller_pane and target_pane are the same")
 
@@ -12677,14 +12721,22 @@ async def talk_send(request: TalkSendRequest):
                 purpose="talk_send",
                 clear_prompt=False,
             )
-            if send_result.get("status") in {PANE_WRITE_CANCELLED, PANE_WRITE_FAILED}:
+            if send_result.get("status") != PANE_WRITE_SENT:
                 raise RuntimeError(
-                    send_result.get("reason") or send_result.get("error") or "delivery_failed"
+                    send_result.get("reason")
+                    or send_result.get("error")
+                    or f"delivery_not_verified:{send_result.get('status')}"
                 )
         else:
             send_result = await _talk_send_payload(
                 target_pane, request.payload, hook_driven=talk_hook_driven
             )
+            if send_result.get("status") != PANE_WRITE_SENT:
+                raise RuntimeError(
+                    send_result.get("reason")
+                    or send_result.get("error")
+                    or f"delivery_not_verified:{send_result.get('status')}"
+                )
     except Exception as exc:  # noqa: BLE001
         await talk_service.cancel_talk(record["talk_id"], reason="delivery_failed")
         detail = await talk_service.publicize_payload(f"talk delivery failed: {exc}")
@@ -12795,10 +12847,21 @@ async def brief_send(request: BriefSendRequest):
             delivered.append(receipt)
         except Exception as exc:  # noqa: BLE001
             delivered.append({**target, "status": "failed", "error": str(exc)})
+    verified_count = len([r for r in delivered if r.get("status") == PANE_WRITE_SENT])
+    unresolved_count = len(unresolved)
+    non_verified_count = len(delivered) - verified_count
+    if verified_count and not unresolved_count and not non_verified_count:
+        brief_status = "ok"
+    elif verified_count:
+        brief_status = "partial"
+    elif any(r.get("status") == PANE_WRITE_PENDING for r in delivered):
+        brief_status = "pending"
+    else:
+        brief_status = "failed"
     return {
-        "status": "ok",
+        "status": brief_status,
         "ephemeral": request.ephemeral,
-        "delivered": len([r for r in delivered if r.get("status") in {"sent", "pending"}]),
+        "delivered": verified_count,
         "resolved": await talk_service.publicize_payload(delivered),
         "unresolved": await talk_service.publicize_payload(unresolved),
     }

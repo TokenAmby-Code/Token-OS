@@ -105,7 +105,7 @@ async def test_brief_rowless_dead_pane_reports_no_delivery(
         main.BriefSendRequest(panes=["mechanicus:administratum"], payload="probe")
     )
 
-    assert result["status"] == "ok"
+    assert result["status"] == "failed"
     assert result["delivered"] == 0
     assert sent == []
     assert result["resolved"][0]["status"] == main.PANE_WRITE_CANCELLED
@@ -169,10 +169,10 @@ async def test_brief_registry_row_path_still_uses_queue(
 
 
 @pytest.mark.asyncio
-async def test_talk_rowless_live_codex_singleton_uses_tmuxctl_fallback(
+async def test_talk_rowless_live_codex_singleton_requires_verified_submit(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """talk uses the same no-row live-agent fallback rather than requiring a DB row."""
+    """talk returns no talk_id when rowless delivery is bytes-issued but unverified."""
     main = app_env.main
 
     async def _resolve(spec):
@@ -215,16 +215,46 @@ async def test_talk_rowless_live_codex_singleton_uses_tmuxctl_fallback(
     monkeypatch.setattr(main, "_tmux_pane_rows", _pane_rows)
     monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
 
-    result = await main.talk_send(
-        main.TalkSendRequest(
-            caller_pane="council:custodes",
-            target_pane="mechanicus:fabricator-general",
-            payload="talk probe",
+    with pytest.raises(main.HTTPException) as excinfo:
+        await main.talk_send(
+            main.TalkSendRequest(
+                caller_pane="council:custodes",
+                target_pane="mechanicus:fabricator-general",
+                payload="talk probe",
+            )
         )
-    )
 
-    assert result["status"] == "open"
-    assert result["target_instance_id"] is None
-    assert result["delivery"]["status"] == main.PANE_WRITE_SENT
-    assert result["delivery"]["fallback"] == "tmuxctl_send_text_no_registry_row"
+    assert excinfo.value.status_code == 502
+    assert "submit_unverified" in str(excinfo.value.detail)
     assert sent == [("%44", "talk probe", False)]
+
+
+@pytest.mark.asyncio
+async def test_talk_resolve_pane_accepts_unique_label_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persona shorthand like `pax` resolves when it uniquely matches a pane label."""
+    import talk
+
+    async def _panes():
+        return [
+            {
+                "pane_id": "%10",
+                "position_id": "council:pax",
+                "session": "main",
+                "window_index": "1",
+                "window_name": "council",
+            },
+            {
+                "pane_id": "%44",
+                "position_id": "mechanicus:orchestrator",
+                "session": "main",
+                "window_index": "4",
+                "window_name": "mechanicus",
+            },
+        ]
+
+    monkeypatch.setattr(talk, "_tmux_list_panes", _panes)
+
+    assert await talk.resolve_pane("pax") == "%10"
+    assert await talk.resolve_pane("orchestrator") == "%44"

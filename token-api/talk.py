@@ -185,6 +185,21 @@ async def resolve_pane(identifier: str) -> str | None:
     for p in panes:
         if p["position_id"] == raw:
             return p["pane_id"]
+
+    # Operator/persona shorthand: accept a unique pane-label suffix (``pax`` ->
+    # ``council:pax``, ``fabricator-general`` -> ``mechanicus:fabricator-general``).
+    # Ambiguous nicknames still fail closed and the API error tells the caller to
+    # use a public pane id. This fixes the cryptic caller_pane unresolved UX
+    # without guessing among multiple live panes.
+    if ":" not in raw:
+        wanted = raw.lower()
+        suffix_matches = [
+            p["pane_id"]
+            for p in panes
+            if (p.get("position_id") or "").lower().rsplit(":", 1)[-1] == wanted
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
     return None
 
 

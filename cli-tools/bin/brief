@@ -115,7 +115,7 @@ def main(argv: list[str]) -> int:
 
     if args.json_out:
         print(json.dumps(result, indent=2, sort_keys=True))
-        return 0 if result.get("status") == "ok" else 1
+        return 0 if result.get("status") in {"ok", "partial"} else 1
 
     status = result.get("status")
     resolved = result.get("resolved", []) or []
@@ -125,10 +125,9 @@ def main(argv: list[str]) -> int:
         _err("no targets resolved" + (f" (unresolved: {unresolved})" if unresolved else ""))
         return 1
 
-    # Report the TRUE send result, not a never-satisfied verification: only a
-    # confirmed "sent" counts as delivered. A "pending" target was accepted but
-    # NOT yet delivered (gated by quiet hours / typing guard, or deferred) and
-    # is surfaced distinctly so a queued brief never reads as a delivery.
+    # Report the TRUE send result: only a confirmed "sent" counts as delivered.
+    # Pending/gated is queued-but-not-submitted, and unverified means bytes may
+    # have been issued but no target turn was proven; neither is a delivery.
     def _is_blocked(row: dict) -> bool:
         status_text = str(row.get("status") or "").lower()
         reason_text = str(row.get("reason") or row.get("error") or "").lower()
@@ -142,6 +141,7 @@ def main(argv: list[str]) -> int:
     sent = sum(1 for r in resolved if r.get("status") == "sent")
     blocked = sum(1 for r in resolved if _is_blocked(r))
     pending = sum(1 for r in resolved if r.get("status") == "pending" and not _is_blocked(r))
+    unverified = sum(1 for r in resolved if r.get("status") == "unverified")
 
     targets = ", ".join(
         f"{r.get('position_id') or r.get('pane_id')}"
@@ -153,6 +153,8 @@ def main(argv: list[str]) -> int:
         suffix_parts.append(f"{pending} pending — not yet delivered")
     if blocked:
         suffix_parts.append(f"{blocked} blocked — not delivered")
+    if unverified:
+        suffix_parts.append(f"{unverified} unverified — bytes may have issued, no target turn proven")
     suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
     print(f"[brief{eph}] delivered={sent}/{len(resolved)}{suffix} → {targets}")
     for r in resolved:
@@ -164,12 +166,17 @@ def main(argv: list[str]) -> int:
             _err(f"  {label}: blocked ({r.get('reason') or r.get('error') or 'typing_guard'}) — not delivered")
         elif st == "pending":
             _err(f"  {label}: pending ({r.get('reason') or 'queued'}) — not yet delivered")
+        elif st == "unverified":
+            _err(
+                f"  {label}: unverified ({r.get('reason') or 'no submit ack'}) — "
+                "bytes may have issued; do not blind-retry"
+            )
         else:
             _err(f"  {label}: status={st} error={r.get('error') or ''}")
     if unresolved:
         for u in unresolved:
             _err(f"  unresolved {u.get('source')}={u.get('spec')} ({u.get('reason')})")
-    return 0 if (sent + pending) > 0 else 1
+    return 0 if sent > 0 else 1
 
 
 if __name__ == "__main__":
