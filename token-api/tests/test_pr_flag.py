@@ -139,3 +139,28 @@ def test_ops_state_carries_pr_fields(client):
     assert mine is not None, "inserted instance not present in ops state"
     assert mine["pr_url"] == url
     assert mine["pr_state"] == "open"
+
+
+def test_patch_status_sets_reviewing(client):
+    iid = _insert_instance(status="idle")
+    resp = client.patch(
+        f"/api/instances/{iid}/status",
+        json={
+            "status": "reviewing",
+            "workflow_state": "review_mode",
+            "next_required_action": "review",
+            "next_action_owner": "human",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    row = _get_instance(iid)
+    assert row["status"] == "reviewing"
+    assert row["workflow_state"] == "review_mode"
+    assert row["next_required_action"] == "review"
+    assert row["next_action_owner"] == "human"
+
+
+def test_patch_status_rejects_bad_status(client):
+    iid = _insert_instance(status="idle")
+    resp = client.patch(f"/api/instances/{iid}/status", json={"status": "PR"})
+    assert resp.status_code == 400

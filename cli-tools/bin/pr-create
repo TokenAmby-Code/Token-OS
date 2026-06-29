@@ -20,6 +20,49 @@ set -euo pipefail
 # Source shared libs
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 source "$SCRIPT_DIR/../lib/git-remote.sh"
+source "$SCRIPT_DIR/../lib/nas-path.sh" >/dev/null 2>&1 || true
+
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+pr_set_instance_status() {
+    local status="$1" api iid body
+    iid="${TOKEN_API_INSTANCE_ID:-}"
+    [[ -n "$iid" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    case "$status" in
+        reviewing)
+            body="{\"status\":$(json_escape "$status"),\"workflow_state\":\"review_mode\",\"next_required_action\":\"review\",\"next_action_owner\":\"human\"}"
+            ;;
+        victorious)
+            body="{\"status\":$(json_escape "$status"),\"workflow_state\":\"complete\",\"next_required_action\":null,\"next_action_owner\":null}"
+            ;;
+        *)
+            body="{\"status\":$(json_escape "$status")}"
+            ;;
+    esac
+    curl -fsS -m 5 -X PATCH -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/instances/${iid}/status" >/dev/null 2>&1 || true
+}
+
+pr_inject_plan_after_stop() {
+    local pane api body
+    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
+    [[ -n "$pane" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_lifecycle_plan\",\"payload\":\"/plan \",\"oneshot\":true}"
+    curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
+}
+
+pr_set_instance_pr_state() {
+    local url="$1" state="$2" api iid body
+    iid="${TOKEN_API_INSTANCE_ID:-}"
+    [[ -n "$iid" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    body="{\"pr_url\":$(json_escape "$url"),\"pr_state\":$(json_escape "$state")}"
+    curl -fsS -m 5 -X PATCH -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/instances/${iid}/pr" >/dev/null 2>&1 || true
+}
 
 POLL_INTERVAL=30        # seconds between checks
 MAX_WAIT_TIME=900       # 15 minutes max wait
@@ -271,6 +314,8 @@ if ! git rev-parse --show-toplevel &>/dev/null; then
     error "Must be run from within a git repository"
     exit 1
 fi
+pr_inject_plan_after_stop
+pr_set_instance_status reviewing
 assert_pr_capable_remote
 
 # Handle --merge mode
@@ -331,6 +376,7 @@ if [[ -n "${TOKEN_API_INSTANCE_ID:-}" ]]; then
         -d "$(printf '{"pr_url":"%s","pr_state":"open"}' "$PR_URL")" \
         "${_pr_api}/api/instances/${TOKEN_API_INSTANCE_ID}/pr" >/dev/null 2>&1 || true
 fi
+pr_set_instance_status reviewing
 
 if [[ "$NO_WAIT" == "true" ]]; then
     printf '%s\n' "$PR_URL"

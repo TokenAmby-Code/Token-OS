@@ -48,6 +48,61 @@ warn() { echo -e "${YELLOW}[pr-review-loop]${NC} $1" >&2; }
 error() { echo -e "${RED}[pr-review-loop]${NC} $1" >&2; }
 success() { echo -e "${GREEN}[pr-review-loop]${NC} $1" >&2; }
 
+# gh_api wrapper: on primary-rate-limit failures, sleep until reset and retry once.
+# This keeps CodeRabbit polling deterministic without exposing rate-limit mechanics
+# to the calling agent.
+gh_api() {
+    local err out rc reset now sleep_for
+    err="$(mktemp -t pr-review-gh-api.XXXXXX)"
+    if out=$(gh api "$@" 2>"$err"); then
+        rm -f "$err"
+        printf '%s
+' "$out"
+        return 0
+    fi
+    rc=$?
+    if grep -qiE 'rate limit|API rate limit|secondary rate' "$err"; then
+        reset=$(gh api rate_limit --jq '.resources.core.reset' 2>/dev/null || echo "")
+        now=$(date +%s)
+        if [[ "$reset" =~ ^[0-9]+$ ]] && (( reset > now )); then
+            sleep_for=$((reset - now + 5))
+        else
+            sleep_for=120
+        fi
+        sleep "$sleep_for"
+        if out=$(gh api "$@" 2>/dev/null); then
+            rm -f "$err"
+            printf '%s
+' "$out"
+            return 0
+        fi
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return "$rc"
+}
+
+sleep_for_coderabbit_command_cooldown() {
+    local latest wait_for
+    latest=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | jq -r '''
+        [.[] | select((.body // "") | test("@coderabbitai"; "i"))] | sort_by(.created_at) | .[-1].created_at // ""
+    ''' 2>/dev/null || true)
+    [[ -n "$latest" ]] || return 0
+    wait_for=$(python3 - "$latest" <<'PY'
+from datetime import datetime, timezone
+import sys
+s=sys.argv[1].replace('Z','+00:00')
+try:
+    age=(datetime.now(timezone.utc)-datetime.fromisoformat(s)).total_seconds()
+except Exception:
+    age=999
+print(max(0, int(150-age)))
+PY
+)
+    [[ "$wait_for" =~ ^[0-9]+$ ]] || return 0
+    (( wait_for > 0 )) && sleep "$wait_for"
+}
+
 # Show help
 if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << 'EOF'
@@ -165,21 +220,22 @@ else
 fi
 
 # Get baseline comment counts and timestamps before posting
-BASELINE_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
+BASELINE_REVIEW_COMMENTS=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
     jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" '[.[] | select(.user.login == $bot or .user.login == $user)] | length')
-BASELINE_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+BASELINE_ISSUE_COMMENTS=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
     jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" '[.[] | select(.user.login == $bot or .user.login == $user)] | length')
 
 # Get the updated_at timestamp of the latest CodeRabbit summary comment (if any)
-BASELINE_OVERVIEW_TIMESTAMP=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+BASELINE_OVERVIEW_TIMESTAMP=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
     jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].updated_at // ""')
 
 # Capture the head SHA so we can check the coderabbit commit status against it.
-HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
+HEAD_SHA=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
 
 # Step 2: Post re-review request comment (skip in --read mode)
 if [[ "$READ_ONLY" == "false" ]]; then
     log "📝 Posting re-review request on PR #$PR_NUMBER..."
+    sleep_for_coderabbit_command_cooldown
 
     # Build comment body
     COMMENT_BODY="## Fixes Applied"
@@ -217,20 +273,20 @@ while true; do
     fi
 
     # Fetch current comments
-    CURRENT_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
+    CURRENT_REVIEW_COMMENTS=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null | \
         jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" '[.[] | select(.user.login == $bot or .user.login == $user)] | length')
-    CURRENT_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+    CURRENT_ISSUE_COMMENTS=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
         jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" '[.[] | select(.user.login == $bot or .user.login == $user)] | length')
 
     NEW_INLINE_COUNT=$((CURRENT_REVIEW_COMMENTS - BASELINE_REVIEW_COMMENTS))
     NEW_OVERVIEW_COUNT=$((CURRENT_ISSUE_COMMENTS - BASELINE_ISSUE_COMMENTS))
 
     # Check for new summary comment OR updated existing one
-    CURRENT_OVERVIEW_TIMESTAMP=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+    CURRENT_OVERVIEW_TIMESTAMP=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
         jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].updated_at // ""')
 
     if [[ $NEW_OVERVIEW_COUNT -gt 0 ]]; then
-        LATEST_ISSUE_COMMENT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+        LATEST_ISSUE_COMMENT=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
             jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '.[] | select(.user.login == $bot or .user.login == $user) | .body' | tail -1)
 
         if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
@@ -240,7 +296,7 @@ while true; do
         fi
     elif [[ -n "$BASELINE_OVERVIEW_TIMESTAMP" ]] && [[ -n "$CURRENT_OVERVIEW_TIMESTAMP" ]] && \
          [[ "$CURRENT_OVERVIEW_TIMESTAMP" != "$BASELINE_OVERVIEW_TIMESTAMP" ]]; then
-        LATEST_ISSUE_COMMENT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
+        LATEST_ISSUE_COMMENT=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
             jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].body')
 
         if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
@@ -253,7 +309,7 @@ while true; do
 
     # Also accept terminal coderabbit commit status (success/failure) as a stop signal.
     if [[ -n "$HEAD_SHA" ]]; then
-        CR_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+        CR_STATE=$(gh_api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
             jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
             '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
         if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" ]]; then
@@ -291,8 +347,8 @@ fi
 log "Fetching review results..."
 
 # Fetch all comments
-ALL_REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
-ALL_ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
+ALL_REVIEW_COMMENTS=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
+ALL_ISSUE_COMMENTS=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null || echo "[]")
 
 # Get new inline comments (after baseline)
 NEW_INLINE_COMMENTS=$(echo "$ALL_REVIEW_COMMENTS" | jq --arg bot "$REVIEWER_BOT" \
@@ -319,12 +375,12 @@ fi
 # Determine review state from PR reviews + commit status.
 REVIEW_STATE=""
 REVIEW_STATUS_ICON=""
-LATEST_REVIEW_STATE=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null | \
+LATEST_REVIEW_STATE=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null | \
     jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r \
     '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.submitted_at) | .[-1].state // ""')
 CR_COMMIT_STATE=""
 if [[ -n "$HEAD_SHA" ]]; then
-    CR_COMMIT_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+    CR_COMMIT_STATE=$(gh_api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
         jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
         '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
 fi
