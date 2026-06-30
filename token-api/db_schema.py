@@ -20,7 +20,6 @@ from instance_registry import (
     INSTANCE_COLUMNS,
     RUNTIME_ANNEX_COLUMNS,
     golden_throne_binding,
-    legacy_row_to_instance_values,
     slug_from_legacy,
 )
 from personas import (
@@ -428,12 +427,7 @@ async def _ensure_instances(db) -> None:
         # by _extract_claude_instances() instead.
         source_rows = old_rows
         for row in source_rows:
-            if set(INSTANCE_COLUMNS).issubset(row.keys()):
-                values = {column: row.get(column) for column in INSTANCE_COLUMNS}
-            else:
-                values = legacy_row_to_instance_values(
-                    row, await _persona_id_for_legacy_row(db, row)
-                )
+            values = {column: row.get(column) for column in INSTANCE_COLUMNS if column in row}
             if not values.get("id"):
                 continue
             columns = [column for column in INSTANCE_COLUMNS if column in values]

@@ -52,11 +52,11 @@ def _insert_instance(
     status: str = "working",
     pr_state: str | None = "merged",
 ) -> None:
-    from instance_mutation import sanctioned_insert_instance_sync
+    from instance_mutation import insert_instance_sync
 
     now = datetime.now().isoformat()
     conn = sqlite3.connect(app_env.db_path)
-    sanctioned_insert_instance_sync(
+    insert_instance_sync(
         conn,
         values={
             "id": iid,

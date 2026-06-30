@@ -94,7 +94,7 @@ async def _consumer_custodes_doc_rebind() -> dict:
     are rebound; bespoke dockets are left untouched. The ``custodes_*`` telemetry
     names are retained for dashboard/event stability.
     """
-    from instance_mutation import sanctioned_update_instance
+    from instance_mutation import update_instance
     from session_doc_helpers import resolve_or_create_today_daily_note_session_doc
 
     rebound: list[dict] = []
@@ -141,7 +141,7 @@ async def _consumer_custodes_doc_rebind() -> dict:
                 skipped.append({"instance_id": row["id"], "reason": "already_today"})
                 continue
 
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=row["id"],
                 updates={"session_doc_id": today_id},

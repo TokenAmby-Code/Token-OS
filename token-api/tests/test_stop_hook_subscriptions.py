@@ -1131,7 +1131,7 @@ def test_mark_for_close_stop_subscription_can_archive_session_doc(
 
     async def bind_doc() -> None:
         async with hooks.aiosqlite.connect(app_env.db_path, timeout=5.0) as db:
-            await hooks.sanctioned_update_instance(
+            await hooks.update_instance(
                 db,
                 instance_id="archive-me",
                 updates={"session_doc_id": doc_id},
@@ -1341,7 +1341,7 @@ def test_mark_for_close_archive_fails_when_session_doc_row_missing(
 
     async def bind_missing_doc() -> None:
         async with hooks.aiosqlite.connect(app_env.db_path, timeout=5.0) as db:
-            await hooks.sanctioned_update_instance(
+            await hooks.update_instance(
                 db,
                 instance_id="missing-doc",
                 updates={"session_doc_id": 424242},

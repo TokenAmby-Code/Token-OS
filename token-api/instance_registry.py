@@ -1,18 +1,8 @@
-"""Instance registry helpers.
+"""Instance registry schema constants and archive import helpers.
 
-The ``instances`` table is the durable registry and — post legacy instance table
-exterminatus — the ONE physical instance table. It has two column tiers:
-
-* IDENTITY_COLUMNS: the durable instance registry charter (persona/rank/commander/
-  origin). Authoritative, never derived from anywhere else.
-* RUNTIME_ANNEX_COLUMNS: transitional runtime/workflow fields inherited from
-  the extracted legacy instance table. Each is slated for per-column
-  demolition as its successor lands (tmux @INSTANCE_ID stamps for pane
-  geometry, the golden_throne table for GT state, status enum for workflow/
-  planning). New code must not grow this list.
-
-The legacy the legacy instance table table itself lives in archive.db only (see
-db_schema.extract_legacy instance table / restore_legacy instance table_from_archive).
+Runtime writes use canonical present-tense ``instances`` columns only. Archive and
+migration imports may translate historical rows, but normal insert/update paths
+must reject dead launch, voice, and projection fields instead of mapping them.
 """
 
 from __future__ import annotations
@@ -49,12 +39,11 @@ IDENTITY_COLUMNS = [
     "human_anchor_source",
 ]
 
-# Transitional runtime annex (see module docstring). Order matters: it is the
-# physical column order in the CREATE TABLE.
+# Existing physical columns beyond core identity. Only columns outside
+# FORBIDDEN_RUNTIME_INSTANCE_FIELDS are writable by normal runtime code.
 RUNTIME_ANNEX_COLUMNS = [
-    # tmux/dispatch geometry — dies when @INSTANCE_ID-stamp resolution lands.
-    # tmux_pane/pane_label are GONE: pane ids are never persisted (too volatile),
-    # the tmuxctl runtime oracle resolves geometry live from @INSTANCE_ID stamps.
+    # Launch geometry/provenance columns that remain physically present in older DBs.
+    # Runtime write helpers reject them; tmuxctl resolves pane geometry live.
     "dispatch_target",
     "dispatch_window",
     "dispatch_mode",
@@ -73,7 +62,7 @@ RUNTIME_ANNEX_COLUMNS = [
     "discord_hosted",
     "discord_channel",
     "discord_bot",
-    # workflow / planning / closure — dies into the status enum
+    # workflow / planning / closure
     "workflow_state",
     "workflow_updated_at",
     "workflow_blocked_reason",
@@ -92,7 +81,7 @@ RUNTIME_ANNEX_COLUMNS = [
     # provenance flags kept distinct from `automated` (semantics differ)
     "is_subagent",
     "hook_driven",
-    # golden-throne engine state — dies into the golden_throne table
+    # golden-throne engine state
     "zealotry",
     "gt_resume_count",
     "gt_resume_window_started_at",
@@ -106,10 +95,50 @@ RUNTIME_ANNEX_COLUMNS = [
 
 INSTANCE_COLUMNS = IDENTITY_COLUMNS + RUNTIME_ANNEX_COLUMNS
 
-# Legacy legacy instance table columns with NO live home: their values exist only in
+FORBIDDEN_RUNTIME_INSTANCE_FIELDS = {
+    # dead projections / historical request names
+    "tab_name",
+    "session_id",
+    "source_ip",
+    "pid",
+    "legion",
+    "primarch",
+    "profile_name",
+    "tts_mode",
+    "instance_type",
+    "synced",
+    "parent_instance_id",
+    "registered_at",
+    "tmux_pane",
+    "pane_label",
+    "pane_tint",
+    "color",
+    "chip_color",
+    # launch geometry/provenance is event/input context, not instance identity
+    "dispatch_target",
+    "dispatch_window",
+    "dispatch_mode",
+    "dispatch_slot",
+    "dispatch_session_doc_path",
+    "target_working_dir",
+    "launch_mode",
+    "launcher",
+    "transplant_target_session",
+    "transplant_expected",
+    # persona voice/sound live on personas, not copied onto instances
+    "tts_voice",
+    "notification_sound",
+}
+
+RUNTIME_WRITE_INSTANCE_COLUMNS = [
+    column for column in INSTANCE_COLUMNS if column not in FORBIDDEN_RUNTIME_INSTANCE_FIELDS
+]
+RUNTIME_WRITE_INSTANCE_FIELDS = set(RUNTIME_WRITE_INSTANCE_COLUMNS)
+
+# Historical instance table columns with NO live home: their values exist only in
 # archive.db. Reads repoint to the instance-table derivation noted inline.
 REMOVED_INSTANCE_COLUMNS = {
-    "tab_name",  # -> instances.name (API responses alias `name AS tab_name`)
+    "tab_name",  # -> instances.name
     "session_id",  # archive-only
     "source_ip",  # archive-only
     "pid",  # archive-only
@@ -212,8 +241,12 @@ def golden_throne_binding(row: dict) -> str | None:
     return None
 
 
-def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
-    """Map a legacy instance table row into instances-table columns."""
+def archive_row_to_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
+    """Map an archived/historical instance row into current table columns.
+
+    This is for schema migration and archive import only. Runtime write helpers
+    must not call it.
+    """
     if not row:
         return {}
     status = normalize_status(row.get("status"))
@@ -262,9 +295,8 @@ def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = Non
         "human_anchored_at": row.get("human_anchored_at"),
         "human_anchor_source": row.get("human_anchor_source"),
     }
-    # Runtime annex passthrough: any annex column present on the legacy row
-    # carries over verbatim (the extraction backfill and transitional
-    # legacy-shaped insert paths both rely on this).
+    # Archive/migration passthrough: preserve historical physical columns when
+    # deliberately importing historical rows.
     for column in RUNTIME_ANNEX_COLUMNS:
         if column in row:
             values[column] = row.get(column)

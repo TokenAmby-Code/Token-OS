@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from instance_mutation import sanctioned_insert_instance_sync, sanctioned_update_instance_sync
+from instance_mutation import insert_instance_sync, update_instance_sync
 
 
 def _insert_wrapper_instance(
@@ -20,7 +20,7 @@ def _insert_wrapper_instance(
 ) -> None:
     now = datetime.now().isoformat()
     with sqlite3.connect(db_path) as conn:
-        sanctioned_insert_instance_sync(
+        insert_instance_sync(
             conn,
             values={
                 "id": instance_id,
@@ -40,7 +40,7 @@ def _insert_wrapper_instance(
             actor="test",
         )
         if name != "needs-name":
-            sanctioned_update_instance_sync(
+            update_instance_sync(
                 conn,
                 instance_id=instance_id,
                 updates={"name": name},
@@ -182,7 +182,7 @@ async def test_stop_does_not_schedule_naming_nudge(app_env, monkeypatch) -> None
     hooks = sys.modules["routes.hooks"]
     _insert_wrapper_instance(app_env.db_path, instance_id="stop-unnamed", wrapper_id="wrap-stop")
     with sqlite3.connect(app_env.db_path) as conn:
-        sanctioned_update_instance_sync(
+        update_instance_sync(
             conn,
             instance_id="stop-unnamed",
             updates={"is_subagent": 1},
@@ -255,7 +255,7 @@ async def test_reconciler_nudges_placeholder_with_session_doc(app_env, monkeypat
         session_doc_id=7,
     )
     with sqlite3.connect(app_env.db_path) as conn:
-        sanctioned_update_instance_sync(
+        update_instance_sync(
             conn,
             instance_id="reconcile-doc-drift",
             updates={"last_activity": (datetime.now() - timedelta(seconds=30)).isoformat()},
@@ -446,7 +446,7 @@ async def test_codex_one_off_session_end_preserves_instance_stamp_resolution(
         # tmux_pane/pane_label are runtime ids the sanctioned writer rejects; the
         # one-off classification this test exercises reads engine/golden_throne/
         # hook_driven only, so seed via the sanctioned helper without them.
-        sanctioned_insert_instance_sync(
+        insert_instance_sync(
             conn,
             values={
                 "id": "codex-done",

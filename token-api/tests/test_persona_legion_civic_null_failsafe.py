@@ -50,16 +50,16 @@ def _seed_instance(db_path, instance_id, *, persona_id=None, rank="astartes", st
     """Seed an instances row through the sanctioned write layer (not raw SQL).
 
     Per the sanctioned-write policy, new instance-row writes go through
-    sanctioned_insert_instance_sync(); it filters the values dict through
+    insert_instance_sync(); it filters the values dict through
     INSTANCE_COLUMNS, so only the columns supplied here are persisted (no tmux
     runtime fields). The raw `persona_id = NULL` UPDATEs in the tests below stay
     raw on purpose — they bypass the service layer to exercise the DB trigger.
     """
-    from instance_mutation import sanctioned_insert_instance_sync
+    from instance_mutation import insert_instance_sync
 
     conn = sqlite3.connect(db_path)
     try:
-        sanctioned_insert_instance_sync(
+        insert_instance_sync(
             conn,
             values={
                 "id": instance_id,
