@@ -518,30 +518,82 @@ class TmuxControlPlane:
         pane_label = resolved.pane_role or self.adapter.show_pane_option(pane_id, "@PANE_ID")
         pane_type = self.adapter.show_pane_option(pane_id, "@PANE_TYPE")
         policy = seat_vacancy_policy(pane_label, pane_type)
-        if policy is not SeatVacancyPolicy.MUST_FILL:
+        if policy is SeatVacancyPolicy.MUST_FILL:
+            if pane_label in PERSONA_LABELS:
+                # PERPETUAL class: a persona singleton seat — REVIVE it (reseat the
+                # thin shim through assert_instance; idempotent, boot-grace dedups).
+                result = assert_instance(self.adapter, pane_label, session=session)
+                return {
+                    "ok": bool(result.get("ok")),
+                    "action": result.get("action") or "none",
+                    "reason": result.get("reason") or "",
+                    "pane_label": pane_label,
+                }
+
+            # Reservist seat: must-fill, but no persona launcher exists yet. The
+            # restart executor seats reservists; mid-session refill is a follow-on.
             return {
                 "ok": True,
-                "action": "ignored",
-                "reason": f"not_must_fill:{pane_label or pane_type or 'unknown'}",
+                "action": "noted",
+                "reason": "reservist_refill_followon",
                 "pane_label": pane_label,
             }
 
-        if pane_label in PERSONA_LABELS:
-            result = assert_instance(self.adapter, pane_label, session=session)
-            return {
-                "ok": bool(result.get("ok")),
-                "action": result.get("action") or "none",
-                "reason": result.get("reason") or "",
-                "pane_label": pane_label,
-            }
+        if policy is None:
+            # No standing-seat policy: a pre-allocated palace/somnium SLOT or a
+            # dynamically-created WORKER. Hand to the unified pane-class teardown
+            # router — the same dispatcher WrapperEnd uses — so a slot is cleared
+            # IN PLACE (preserved, returned to the freelist) and only a worker is
+            # culled. This is the crash/death entry half of that one decision.
+            return self.teardown_pane(pane_id, pane_label=pane_label, source="pane-died")
 
-        # Reservist seat: must-fill, but no persona launcher exists yet. The restart
-        # executor seats reservists; mid-session reservist refill is a follow-on.
+        # FILL_IF_ROW (stack worker): reconciled by the stack sweep / the bash
+        # mechanicus pane-died branch, never here.
         return {
             "ok": True,
-            "action": "noted",
-            "reason": "reservist_refill_followon",
+            "action": "ignored",
+            "reason": f"not_must_fill:{pane_label or pane_type or 'unknown'}",
             "pane_label": pane_label,
+        }
+
+    def teardown_pane(
+        self,
+        pane: str,
+        *,
+        pane_label: str = "",
+        window_name: str | None = None,
+        source: str = "",
+    ) -> dict:
+        """Class-gated pane teardown shared by WrapperEnd and the pane-died hook.
+
+        Classifies the pane (PERPETUAL / SLOT / WORKER) and applies the matching
+        action via the unified router: a SLOT is cleared in place and PRESERVED
+        (returned to the freelist — never culled), a WORKER is culled, a PERPETUAL
+        seat is preserved for the caller to revive.
+        """
+        from .teardown import PaneClass, apply_teardown, classify_pane
+
+        if not pane_label:
+            pane_label = self.adapter.show_pane_option(pane, "@PANE_ID")
+        if window_name is None:
+            window_name = self.adapter.run(
+                "display-message", "-t", pane, "-p", "#{window_name}", allow_failure=True
+            ).strip()
+        pane_class = classify_pane(pane_label, window_name)
+        result = apply_teardown(self.adapter, pane, pane_class, pane_role=pane_label)
+        action = {
+            PaneClass.SLOT: "cleared_in_place",
+            PaneClass.WORKER: "culled",
+            PaneClass.PERPETUAL: "preserved",
+        }[pane_class]
+        return {
+            "ok": result.get("status") != "failed",
+            "action": action,
+            "reason": result.get("status", ""),
+            "pane_label": pane_label,
+            "pane_class": pane_class.value,
+            "source": source,
+            "result": result,
         }
 
     def rotate_persona_engine(

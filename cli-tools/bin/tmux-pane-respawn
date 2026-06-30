@@ -39,6 +39,23 @@ case "$PANE_ROLE" in
         ;;
 esac
 
+# Pre-allocated palace/somnium SLOT panes. A slot exit is CLEARED IN PLACE by the
+# tmuxctld router (runtime stamps scrubbed + the shell revived in place) so the
+# fixed slot is PRESERVED and returned to the freelist — never bare-respawned with
+# stale stamps, and never culled (the morning over-reap killed such a slot). Hand
+# off to the daemon via /event; fire-and-forget — it no-ops a still-live pane.
+case "$WINDOW_BASE" in
+    palace|somnium)
+        PORT="${TMUXCTLD_PORT:-7778}"
+        EVENT_PANE="${PANE_ROLE:-$PANE_ID}"
+        curl -s -o /dev/null --connect-timeout 1 --max-time 3 \
+            -X POST "http://127.0.0.1:${PORT}/event" \
+            -H 'Content-Type: application/json' \
+            -d "{\"event\":\"pane-died\",\"pane\":\"${EVENT_PANE}\"}" >/dev/null 2>&1 || true
+        exit 0
+        ;;
+esac
+
 case "$WINDOW_BASE:$PANE_ROLE" in
     council:*)
         # The council true-terminal (a plain shell, not a persona) is perpetual;

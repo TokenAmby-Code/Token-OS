@@ -20,6 +20,10 @@ sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import daemon
 
+# Captured before any monkeypatching so the dedicated re-assertion tests can
+# restore the genuine method the autouse guard stubs out.
+_REAL_MAYBE_REASSERT = daemon.TmuxctldServer.maybe_reassert_lifecycle_hooks
+
 
 @pytest.fixture(autouse=True)
 def _no_live_tmux_guard(monkeypatch):
@@ -33,6 +37,11 @@ def _no_live_tmux_guard(monkeypatch):
     monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: False)
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
     monkeypatch.setattr(daemon.send_gate, "evaluate", lambda *a, **k: None)
+    # /health now re-asserts the tmux lifecycle hooks (which shells real tmux).
+    # Neutralise the heartbeat-driven re-assertion module-wide so no /health test
+    # touches live tmux; the dedicated re-assertion tests restore the real method.
+    # (ensure_tmux_lifecycle_hooks itself is left intact for the startup tests.)
+    monkeypatch.setattr(daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", lambda self: False)
 
 
 class StubAdapter:
@@ -392,6 +401,90 @@ def test_wrapperend_comprehensively_scrubs_identity_status_guard_and_reaps_dead_
             assert option in rec.unset_options
             assert rec.options.get(option, "") == ""
         assert ("kill-pane", "-t", "%42") in rec.calls
+    finally:
+        server.shutdown()
+
+
+class PalaceSlotWrapperEndAdapter(ComprehensiveWrapperEndAdapter):
+    """A dead palace SLOT husk: same scrub surface, but in a pre-alloced window."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pane_role = "palace:N"
+        self.window_name = "palace"
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args and args[-1] == "#{window_name}":
+            self.calls.append(tuple(args))
+            return self.window_name
+        return super().run(*args, allow_failure=allow_failure)
+
+
+def test_wrapperend_clears_palace_slot_in_place_and_never_culls_it() -> None:
+    # The morning regression: a completed palace:N worker exited and WrapperEnd
+    # CULLED the pre-alloced slot (a later close-pane returned "pane target not
+    # found"). The class-gated router must CLEAR IN PLACE instead — slot preserved.
+    rec = PalaceSlotWrapperEndAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperend",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42", "exit_code": 0},
+        )
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["status"] == "cleared"
+        assert result["teardown"]["pane_class"] == "slot"
+        assert result["teardown"]["action"] == "cleared_in_place"
+        # The pre-allocated slot is PRESERVED — it must never be killed.
+        assert ("kill-pane", "-t", "%42") not in rec.calls
+        # Runtime stamps scrubbed (the #483 clear-in-place primitive) ...
+        assert "@INSTANCE_ID" in rec.unset_options
+        assert rec.options.get("@INSTANCE_ID", "") == ""
+        # ... and the dead husk's shell revived in place so the slot returns free.
+        assert any(c[:1] == ("respawn-pane",) for c in rec.calls)
+    finally:
+        server.shutdown()
+
+
+def test_health_reasserts_lifecycle_hooks_throttled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", _REAL_MAYBE_REASSERT
+    )
+    server, _ = _serve(StubAdapter)
+    try:
+        calls = []
+        monkeypatch.setattr(
+            daemon, "ensure_tmux_lifecycle_hooks", lambda: calls.append(1) or {"ok": True}
+        )
+        # Boot deadline is 0.0 -> first call re-asserts; an immediate second is throttled.
+        assert server.maybe_reassert_lifecycle_hooks() is True
+        assert server.maybe_reassert_lifecycle_hooks() is False
+        assert len(calls) == 1
+        # After the throttle window passes the hook is re-installed again, so a live
+        # tmux reload / hook-clear self-heals within one interval.
+        server._hook_reassert_deadline = 0.0
+        assert server.maybe_reassert_lifecycle_hooks() is True
+        assert len(calls) == 2
+    finally:
+        server.shutdown()
+
+
+def test_health_endpoint_rides_heartbeat_to_reassert_hooks(monkeypatch) -> None:
+    monkeypatch.setattr(
+        daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", _REAL_MAYBE_REASSERT
+    )
+    server, _ = _serve(StubAdapter)
+    try:
+        calls = []
+        monkeypatch.setattr(
+            daemon, "ensure_tmux_lifecycle_hooks", lambda: calls.append(1) or {"ok": True}
+        )
+        status, payload = _get(server, "/health")
+        assert status == 200
+        assert payload["ok"] is True
+        assert calls, "/health did not re-assert the lifecycle hooks"
     finally:
         server.shutdown()
 
