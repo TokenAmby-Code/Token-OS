@@ -430,6 +430,12 @@ class TmuxControlPlane:
 
         return clear_runtime(self.adapter, pane)
 
+    def reap_dead_husk(self, pane: str, *, pane_role: str = "") -> dict:
+        """Kill a dead remain-on-exit pane husk after runtime scrub."""
+        from .close import reap_dead_husk
+
+        return reap_dead_husk(self.adapter, pane, pane_role=pane_role)
+
     def close_pane(self, pane: str, *, timeout: float = 3.0) -> dict:
         """Close a single pane, gracefully clearing its runtime first."""
         from .close import close_pane

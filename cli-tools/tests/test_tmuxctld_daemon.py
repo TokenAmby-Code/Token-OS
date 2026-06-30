@@ -213,6 +213,8 @@ class WrapperEndAdapter:
     def __init__(self) -> None:
         self.wrapper_owner = "wrap-1"
         self.instance_id = "inst-1"
+        self.pane_dead = "0"
+        self.pane_role = "mechanicus:1"
         self.cleared: list[str] = []
         self.calls: list[tuple[str, ...]] = []
 
@@ -222,9 +224,15 @@ class WrapperEndAdapter:
     def run(self, *args: str, allow_failure: bool = False) -> str:
         self.calls.append(tuple(args))
         if args[:3] == ("display-message", "-t", "%42"):
-            return "%42" if self.instance_id or self.wrapper_owner else ""
+            if args[-1] == "#{pane_id}":
+                return "%42" if self.instance_id or self.wrapper_owner else ""
+            if args[-1] == "#{pane_dead}":
+                return self.pane_dead
         if args[:3] == ("list-panes", "-a", "-F"):
             return f"%42__TMUXCTLD_WRAPPEREND_FIELD__{self.wrapper_owner}"
+        if args[:5] == ("set-option", "-p", "-t", "%42", "@TOKEN_API_WRAPPER_LAUNCH_ID"):
+            self.wrapper_owner = args[-1]
+            return ""
         return ""
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
@@ -232,6 +240,8 @@ class WrapperEndAdapter:
             return self.wrapper_owner
         if option == "@INSTANCE_ID":
             return self.instance_id
+        if option == "@PANE_ID":
+            return self.pane_role
         return ""
 
     def clear_runtime_state(self, target: str) -> None:
@@ -295,6 +305,158 @@ def test_wrapperend_rejects_unowned_mismatched_pane_without_clearing() -> None:
         server.shutdown()
 
 
+class ComprehensiveWrapperEndAdapter(WrapperEndAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pane_dead = "1"
+        self.options = {
+            "@TOKEN_API_WRAPPER_LAUNCH_ID": "wrap-1",
+            "@INSTANCE_ID": "inst-1",
+            "@PERSONA": "Custodes",
+            "@SESSION_DOC": "Stale Doc",
+            "@CWD": "old-worktree",
+            "@PANE_LABEL": "stale-slug",
+            "@PANE_PROGRESS": "50%",
+            "@PANE_CLEAN": "1",
+            "@PANE_BORN": "123",
+            "@CC_STATE": "idle",
+            "@TYPING_LOCK_UNTIL": "9999999999",
+            "@TYPING_PENDING_UNTIL": "9999999999",
+            "@TYPING_AGENT_UNTIL": "9999999999",
+            "@GUARD": "#[fg=green]⌨",
+            "@GT_FIRE": "123",
+            "@DISCORD_VOICE_LOCK": "1",
+            "@TOKEN_API_CWD": "/old",
+        }
+        self.unset_options: list[str] = []
+        self.exists_after_kill = False
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@PANE_ID":
+            return self.pane_role
+        return self.options.get(option, "")
+
+    def clear_runtime_state(self, target: str) -> None:
+        self.cleared.append(target)
+        for option in list(self.options):
+            self.unset_options.append(option)
+            self.options.pop(option, None)
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("display-message", "-t", "%42") and args[-1] == "#{pane_id}":
+            return (
+                "%42" if (self.instance_id or self.wrapper_owner or self.exists_after_kill) else ""
+            )
+        result = super().run(*args, allow_failure=allow_failure)
+        if args[:2] == ("kill-pane", "-t"):
+            self.instance_id = ""
+            self.wrapper_owner = "" if not self.exists_after_kill else self.wrapper_owner
+        if args[:5] == ("set-option", "-p", "-t", "%42", "@TOKEN_API_WRAPPER_LAUNCH_ID"):
+            self.options["@TOKEN_API_WRAPPER_LAUNCH_ID"] = args[-1]
+        return result
+
+
+def test_wrapperend_comprehensively_scrubs_identity_status_guard_and_reaps_dead_husk() -> None:
+    rec = ComprehensiveWrapperEndAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperend",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42", "exit_code": 0},
+        )
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["status"] == "cleared"
+        assert result["reap"]["status"] == "killed"
+
+        for option in (
+            "@PERSONA",
+            "@INSTANCE_ID",
+            "@PANE_LABEL",
+            "@PANE_PROGRESS",
+            "@PANE_CLEAN",
+            "@PANE_BORN",
+            "@CC_STATE",
+            "@TYPING_LOCK_UNTIL",
+            "@TYPING_PENDING_UNTIL",
+            "@TYPING_AGENT_UNTIL",
+            "@GUARD",
+            "@SESSION_DOC",
+            "@CWD",
+            "@GT_FIRE",
+            "@DISCORD_VOICE_LOCK",
+            "@TOKEN_API_WRAPPER_LAUNCH_ID",
+            "@TOKEN_API_CWD",
+        ):
+            assert option in rec.unset_options
+            assert rec.options.get(option, "") == ""
+        assert ("kill-pane", "-t", "%42") in rec.calls
+    finally:
+        server.shutdown()
+
+
+def test_wrapperstart_scrubs_persistent_slot_before_reuse_then_registers_new_wrapper() -> None:
+    rec = ComprehensiveWrapperEndAdapter()
+    rec.pane_dead = "0"
+    rec.pane_role = "palace:N"
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperstart",
+            {"wrapper_launch_id": "wrap-new", "tmux_pane": "%42"},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "stamped"
+        assert rec.options.get("@PERSONA", "") == ""
+        assert rec.options.get("@INSTANCE_ID", "") == ""
+        assert rec.options.get("@PANE_LABEL", "") == ""
+        assert rec.options.get("@TOKEN_API_WRAPPER_LAUNCH_ID") == "wrap-new"
+    finally:
+        server.shutdown()
+
+
+def test_wrapperstart_duplicate_same_wrapper_does_not_scrub_own_runtime() -> None:
+    rec = ComprehensiveWrapperEndAdapter()
+    rec.pane_dead = "0"
+    rec.options["@TOKEN_API_WRAPPER_LAUNCH_ID"] = "wrap-1"
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperstart",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42"},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "stamped"
+        assert rec.cleared == []
+        assert rec.options.get("@PERSONA") == "Custodes"
+    finally:
+        server.shutdown()
+
+
+def test_wrapperend_reports_failed_reap_when_dead_husk_survives_kill() -> None:
+    rec = ComprehensiveWrapperEndAdapter()
+    rec.exists_after_kill = True
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperend",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42", "exit_code": 0},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["reap"] == {
+            "status": "failed",
+            "reason": "kill_pane_failed",
+            "pane": "%42",
+            "pane_role": "mechanicus:1",
+        }
+    finally:
+        server.shutdown()
+
+
 class WrapperStartAdapter:
     """Singleton seat at %42 labelled council:custodes, voice unlocked.
 
@@ -338,6 +500,12 @@ class WrapperStartAdapter:
         if option == "@DISCORD_VOICE_LOCK":
             return self.voice_lock
         return ""
+
+    def clear_runtime_state(self, target: str) -> None:
+        # Existing wrapperstart tests care about the subsequent stamp/tint writes;
+        # comprehensive scrub coverage lives in ComprehensiveWrapperEndAdapter.
+        self.set_options.append(("clear_runtime_state", target))
+        self.wrapper_owner = ""
 
 
 def test_wrapperstart_stamps_wrapper_owner_and_paints_persona_tint() -> None:
