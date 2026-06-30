@@ -1,28 +1,55 @@
 ---
 name: custodes
-description: Custodes persona and singleton shorthand. Use when checking Custodes responsibilities, daily-note ownership, enforcement routing, dispatch posture, or persona-pane identity constraints.
+description: Custodes routing guide for reporting to Custodes, escalating operator/accountability issues, checking Custodes singleton identity, daily-note ownership, enforcement routing, and choosing talk, brief, or dispatch paths.
 ---
 
 # Custodes
 
 Custodes is the Emperor-facing overseer singleton: first contact, escalation tier, accountability/enforcement seat, daily-note semantic owner, and dispatch designator.
 
-## Canonical Context
+## Route to Custodes When
 
-- Persona note: `$IMPERIUM/Imperium-ENV/Personas/Custodes.md`.
-- Skill surfaces: `$daily-note`, `$dispatch`, `$session-update`, `$vault-update`.
-- Singleton pane identity is infrastructure-owned. SessionStart/registry derive persona + rank; agents verify and report bugs, they do not self-patch.
-- Canonical live identity check: one non-retired row with `persona.slug == "custodes"` and `rank != "retired"`.
+- Daily-note meaning, Emperor-facing accountability, enforcement posture, or operator escalation is involved.
+- A worker or overseer needs a scope/gate decision from the top command surface.
+- Singleton identity, pane, or registry invariants look wrong.
+- A result should reach the Emperor through the Custodes surface.
 
-## Safe checks
+## Communicate with Custodes
+
+Use `talk` for short status, questions, or heads-up messages:
 
 ```bash
-curl -s "$TOKEN_API_URL/api/instances"   | jq '[.[] | select(.persona.slug=="custodes" and .rank!="retired")] | {count: length, row: .[0] | {id, rank, status}}'
+talk --pane council:custodes "<short status, question, or escalation>"
 ```
 
-## Do Not
+Use `brief` for structured reports, assignments, or decisions needing durable context:
 
-- Do not implement broad repo work from a Custodes pane; dispatch or use an explorer.
-- Do not rewrite the daily note from non-Custodes context unless explicitly assigned.
-- Do not PATCH Custodes identity, legion, rank, sync, or singleton binding locally; report harness/registry bugs upward.
-- Do not compact/plan-cycle Custodes casually; protect its conversational context.
+```bash
+brief --pane council:custodes "<objective/status, evidence, blocker or decision needed, next action>"
+```
+
+If `talk`/`brief` returns `unverified` with “bytes may have issued,” do not blind-retry. Report the uncertainty or use a new clearly-deduplicated message.
+
+## Context
+
+- Persona: `$IMPERIUM/Imperium-ENV/Personas/Custodes.md`.
+- Related procedures: `$daily-note`, `$dispatch`, `$session-update`, `$vault-update`.
+- Dispatch posture: Custodes directly handles bounded one-offs; coordinated waves go to Fabricator-General.
+
+## Identity Check
+
+Singleton pane identity is infrastructure-owned. SessionStart/registry derive persona + rank; agents verify and report mismatches.
+
+Canonical live check: exactly one non-retired row with `persona.slug == "custodes"` and `rank != "retired"`.
+
+```bash
+curl -s "$TOKEN_API_URL/api/instances" \
+  | jq '[.[] | select(.persona.slug=="custodes" and .rank!="retired")] | {count: length, row: .[0] | {id, rank, status, pane_label}}'
+```
+
+## Guardrails
+
+- Keep broad repo work in worker panes.
+- Write daily-note semantics from Custodes context or explicit Custodes assignment.
+- Report identity/registry mismatches upward; leave registry mutation to infrastructure.
+- Preserve Custodes conversational context.

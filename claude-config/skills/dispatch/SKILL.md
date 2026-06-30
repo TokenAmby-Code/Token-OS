@@ -1,54 +1,67 @@
 ---
 name: dispatch
-description: Imperium routing and dispatch procedure for Overseer, Custodes, and Fabricator-General agents. Use when translating a request into worker work, using talk/brief/dispatch mechanics, launching one-off workers or waves, routing to FG, or avoiding focus theft during dispatch.
+description: "Imperium routing and dispatch procedure. Use for $dispatch custodes, $dispatch fabricator-general, or $dispatch worker decisions; launching bounded workers; briefing FG; using talk/brief/dispatch mechanics; preserving singleton focus; or handling the explicitly deputized worker-dispatch exception."
 ---
 
 # Dispatch
 
-Dispatch is an overseer procedure: designate work, preserve singleton context, and send implementation or investigation to workers. It is not optional permission-seeking.
+Dispatch designates work, preserves singleton context, and sends implementation or investigation to the right worker tier. It is not optional permission-seeking once a designation exists.
 
-## Doctrine
+## Forms
 
-- Dispatch, `talk`, and `brief` require no fresh approval when they are the natural routing step.
-- Do not ask “may I launch?” after a designation exists. Launch, then report.
-- Do not implement from an overseer pane. Workers implement; overseers route and verify reports.
-- Preserve focus. New dispatch allocation already uses the internal focus-preserving path; do not add focus-control flags.
-- Keep work bounded. A dispatch prompt must name objective, repo/worktree if known, validation, stop/report shape, and explicit gates.
+### `$dispatch custodes`
 
-## Routing
+Use for Custodes-facing routing.
 
-- **Custodes one-offs (about <=2 agents):** dispatch directly for bounded convenience, harness, palace/somnium, or research tasks.
-- **Custodes waves (>2 agents):** `brief` Fabricator-General with the goal, constraints, expected report shape, and any Emperor approvals. FG orchestrates the wave.
-- **Fabricator-General:** dispatch workers and manage child lifecycle. Use `dispatch --target mechanicus:new ...`; do not target numbered panes for new allocation.
-- **Workers:** do not dispatch other workers. Surface follow-on work upward.
+- Custodes may directly dispatch one-offs for bounded convenience, harness, palace/somnium, or research tasks involving about two agents or fewer.
+- For larger waves, Custodes briefs Fabricator-General with goal, constraints, approvals, validation, and report shape.
+- Custodes should not implement broad repo work from the singleton pane.
+
+### `$dispatch fabricator-general`
+
+Use for Fabricator-General orchestration.
+
+- FG dispatches workers and manages child lifecycle.
+- Allocate new Mechanicus workers with `mechanicus:new`; do not target numbered panes for new allocation.
+- FG owns waves, worker fanout, follow-up briefs, proof review, and blocker routing.
+
+### `$dispatch worker`
+
+Use for worker boundaries.
+
+- Workers implement, validate, update session docs, and report upward.
+- Workers do **not** dispatch other workers by default.
+- Exception: a worker may dispatch only when explicitly deputized in its brief/session/rank instructions, and only within the named scope, budget, validation, and report shape.
+- If more work appears without deputized authority, surface it upward instead of spawning.
 
 ## Mechanics
 
-Use `talk` for peer/status/clarification messages. Use `brief` when assigning or redirecting work with structured context. Use `dispatch` to allocate a new worker.
+Use `talk` for peer/status/clarification messages. Use `brief` for structured assignments or redirection. Use `dispatch` to allocate a new worker.
 
-New Mechanicus allocation pattern:
+New worker allocation:
 
 ```bash
 dispatch --target mechanicus:new --prompt "<bounded objective, context, validation, report shape>"
 ```
 
-Validate allocation syntax without launching:
+Dry-run validation without launching:
 
 ```bash
 dispatch --target mechanicus:new --prompt "dry run validation" --dry-run
 ```
 
-If the local CLI spelling differs, inspect `dispatch --help` rather than improvising a pane target. Never allocate with `mechanicus:1`, `mechanicus:2`, etc.; numbered panes are live or retired identities, not allocation requests.
+If local CLI spelling differs, inspect `dispatch --help`; do not improvise a pane target. Numbered panes are live or retired identities, not allocation requests.
 
 ## Brief Shape
 
 Include:
 
 1. Objective and success condition.
-2. Source paths, repos, or notes to read first.
-3. Hard constraints and gates: merge/deploy/live DB/destructive actions/Emperor approval.
+2. Source paths, repos, notes, or session docs to read first.
+3. Hard constraints and gates: merge, deploy, live DB, destructive actions, Emperor approval.
 4. Validation required before reporting.
 5. Report shape: files changed, commits/PRs/SHAs, tests, live verification, blockers, session-doc update.
+6. Whether worker-dispatch authority is explicitly deputized; absent this line, it is not.
 
 ## Follow-up
 

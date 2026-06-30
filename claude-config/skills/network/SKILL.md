@@ -1,11 +1,11 @@
 ---
 name: network
-description: Imperium network and machine-config shorthand. Use when checking Tailscale, SSH aliases, NAS paths, Token-API reachability, phone/Mac/WSL topology, or replacing hardcoded machine values.
+description: Imperium and askCivic machine topology and config routing. Use for Tailscale, SSH aliases, NAS paths, Token-API reachability, Mac/WSL/phone roles, MacroDroid phone routing, future CIVIC_MACHINE handling, Deskflow/remote operator paths, or replacing hardcoded machine values.
 ---
 
 # Network
 
-Imperium network values are centralized in machine config. Use this skill when a task involves Tailscale, NAS paths, SSH aliases, Token-API reachability, phone/Mac/WSL topology, or replacing hardcoded machine values.
+Imperium network values are centralized in machine config. For topology detail, read `references/topology.md`.
 
 ## Surfaces
 
@@ -15,19 +15,18 @@ Imperium network values are centralized in machine config. Use this skill when a
 - Lookup: `imperium_cfg tailscale_ip mac|wsl|phone`, `imperium_cfg token_api_url`.
 - Diagnostic script: `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/Shell/network-test.sh`.
 
-## Safe checks
+## Safe Checks
 
 ```bash
 source "${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/lib/nas-path.sh"
-printf '%s
-' "$IMPERIUM_MACHINE $IMPERIUM $TOKEN_API_URL"
+printf '%s\n' "$IMPERIUM_MACHINE $IMPERIUM $TOKEN_API_URL"
 imperium_cfg tailscale_ip phone
-token-ping --raw /health
+curl -sf "$TOKEN_API_URL/health"
 ```
 
 ## Do Not
 
 - Do not hardcode Tailscale IPs, NAS paths, Token-API URLs, or runtime checkout paths.
 - Do not assume Mac paths work on WSL/phone; resolve through config.
-- Do not run broad SSH/Tailscale probes against devices unless the task is network diagnosis.
+- Do not run broad SSH/Tailscale probes unless the task is network diagnosis.
 - Do not bind new tooling to quarantined legacy/recycle paths.
