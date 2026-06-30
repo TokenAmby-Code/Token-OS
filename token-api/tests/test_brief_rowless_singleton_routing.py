@@ -290,7 +290,7 @@ async def test_brief_rowless_unverified_issued_bytes_reports_sent(
     sent = []
 
     async def _send(pane, payload, *, clear_prompt=False, operation_id=None, **_kwargs):
-        sent.append((pane, payload, clear_prompt))
+        sent.append((pane, payload, clear_prompt, operation_id))
         return {
             "returncode": 0,
             "stdout": "",
@@ -318,12 +318,87 @@ async def test_brief_rowless_unverified_issued_bytes_reports_sent(
         )
     )
 
+    # The keyless brief still drives a deterministic auto operation_id through the
+    # rowless/codex direct path so a blind retry would dedupe (FIX 2), and the
+    # unverified-but-issued codex send reports SENT (FIX 1).
+    expected_operation_id = main._scoped_send_operation_id(
+        "brief",
+        f"auto:%44:{main._prompt_payload_hash('codex probe')}",
+        "%44",
+        "codex probe",
+    )
+    assert expected_operation_id is not None
     assert result["status"] == "ok"
     assert result["delivered"] == 1
-    assert sent == [("%44", "codex probe", True)]
+    assert sent == [("%44", "codex probe", True, expected_operation_id)]
     receipt = result["resolved"][0]
     assert receipt["status"] == main.PANE_WRITE_SENT
     assert receipt["fallback"] == "tmuxctl_send_text_no_registry_row"
+
+
+@pytest.mark.asyncio
+async def test_brief_rowless_claude_unverified_is_not_marked_sent(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SENT-on-issued relaxation is codex-only: a rowless claude pane that
+
+    issues bytes without an ack must NOT be reported SENT — claude panes ack
+    reliably, so unverified there is a real failure, not a false-negative.
+    """
+    main = app_env.main
+    target = {
+        "pane_id": "%47",
+        "position_id": "council:pax",
+        "source": "pane",
+        "spec": "council:pax",
+    }
+
+    async def _targets(**_kwargs):
+        return [target], []
+
+    async def _no_row(_pane):
+        return None
+
+    async def _resolve_live(pane):
+        return "%47" if pane == "%47" else None
+
+    async def _claude_engine(_pane):
+        return "claude"
+
+    async def _sender_is_custodes(_pane):
+        return True
+
+    async def _send(pane, payload, *, clear_prompt=False, operation_id=None, **_kwargs):
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "operation": "tmuxctl.send_text_then_submit",
+            "gated": False,
+            "verification_status": "unverified",
+            "verified_by": None,
+            "operation_id": operation_id,
+        }
+
+    monkeypatch.setattr(main.talk_service, "resolve_brief_targets", _targets)
+    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _no_row)
+    monkeypatch.setattr(main, "_pane_sender_is_custodes", _sender_is_custodes)
+    monkeypatch.setattr(main.shared, "resolve_tmux_pane_id", _resolve_live)
+    monkeypatch.setattr(main, "_pane_live_agent_engine", _claude_engine)
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
+
+    result = await main.brief_send(
+        main.BriefSendRequest(
+            caller_pane="council:custodes",
+            panes=["council:pax"],
+            payload="claude probe",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["delivered"] == 0
+    receipt = result["resolved"][0]
+    assert receipt["status"] == main.PANE_WRITE_UNVERIFIED
 
 
 @pytest.mark.asyncio

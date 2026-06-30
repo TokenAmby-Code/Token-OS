@@ -13050,9 +13050,11 @@ async def _direct_tmux_pane_delivery(
     live agent-process check.
 
     ``accept_issued_as_sent`` is for fire-and-forget callers (brief): a non-gated
-    ``returncode=0`` send to a rowless/codex pane reports ``SENT`` even without a
-    ``UserPromptSubmit`` ack, since those panes ack late or never. Two-way callers
-    (talk) leave it False so an unconsumed turn still fails loudly.
+    ``returncode=0`` send reports ``SENT`` even without a ``UserPromptSubmit`` ack.
+    It is honored ONLY for a live ``codex`` engine — codex panes ack late or never,
+    so a missing ack there is a false-negative. Rowless ``claude`` panes ack
+    reliably, so they keep strict verification even under this flag, and two-way
+    callers (talk) leave it False so an unconsumed turn still fails loudly.
     """
     pane = await shared.resolve_tmux_pane_id(tmux_pane)
     engine = await _pane_live_agent_engine(pane)
@@ -13099,8 +13101,11 @@ async def _direct_tmux_pane_delivery(
             **send_result,
             **result,
         }
+    # Honor the fire-and-forget relaxation only for codex: claude panes ack
+    # reliably, so an unverified send there is a real signal, not a false-negative.
+    accept_issued = accept_issued_as_sent and engine == "codex"
     terminal_status, terminal_error = _pane_send_terminal_status(
-        send_result, accept_issued_as_sent=accept_issued_as_sent
+        send_result, accept_issued_as_sent=accept_issued
     )
     result = {
         **base,
