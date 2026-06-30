@@ -3399,8 +3399,6 @@ async def handle_session_start(payload: dict) -> dict:
                 updated_inst = await cursor.fetchone()
                 # profiles are persona-keyed; legacy profile_name died into persona_id
                 prof = profile_by_name(updated_inst["persona_slug"] if updated_inst else None)
-                hex_color = (prof.get("chip_color") or prof.get("color")) if prof else "#666666"
-                pane_tint = prof.get("pane_tint") if prof else None
 
                 logger.info(
                     f"Hook: SessionStart transplant-refresh {session_id[:12]}... ({working_dir}) [device:{device_id}]"
@@ -3409,7 +3407,9 @@ async def handle_session_start(payload: dict) -> dict:
                     "success": True,
                     "action": "transplant_refreshed",
                     "instance_id": session_id,
-                    "persona": _persona_response_from_profile(prof, slug=updated_inst["persona_slug"] if updated_inst else None),
+                    "persona": _persona_response_from_profile(
+                        prof, slug=updated_inst["persona_slug"] if updated_inst else None
+                    ),
                     "session_doc_id": updated_inst["session_doc_id"] if updated_inst else None,
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
@@ -3777,8 +3777,6 @@ async def handle_session_start(payload: dict) -> dict:
                 slug_row = await cursor.fetchone()
                 preserved_profile = slug_row["slug"] if slug_row else None
                 prof = profile_by_name(preserved_profile)
-                hex_color = (prof.get("chip_color") or prof.get("color")) if prof else "#666666"
-                pane_tint = prof.get("pane_tint") if prof else None
 
                 supplant_source = (
                     f"transplant:{transplant_from}"
@@ -4258,8 +4256,6 @@ async def handle_session_start(payload: dict) -> dict:
     }
 
 
-
-
 def _persona_response_from_profile(profile: dict | None, *, slug: str | None = None) -> dict | None:
     if not profile:
         return None
@@ -4271,6 +4267,7 @@ def _persona_response_from_profile(profile: dict | None, *, slug: str | None = N
         "tts_voice": profile.get("wsl_voice") or profile.get("tts_voice"),
         "notification_sound": profile.get("notification_sound"),
     }
+
 
 async def handle_session_end(payload: dict) -> dict:
     """Handle SessionEnd hook - deregister Claude instance."""

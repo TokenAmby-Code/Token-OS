@@ -75,8 +75,6 @@ class VoiceChangeRequest(BaseModel):
     voice: str
 
 
-
-
 def _persona_response(profile: dict) -> dict:
     return {
         "slug": profile.get("name"),
@@ -86,6 +84,7 @@ def _persona_response(profile: dict) -> dict:
         "tts_voice": profile.get("wsl_voice"),
         "notification_sound": profile.get("notification_sound"),
     }
+
 
 # ============ Voice Management Endpoints ============
 

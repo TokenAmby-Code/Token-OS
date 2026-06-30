@@ -222,8 +222,6 @@ from shared import (
     is_local_device,
     is_pid_claude,
     log_event,
-    profile_by_name,
-    resolve_device_from_ip,
 )
 from timer import (
     BREAK_MODES,
@@ -12035,7 +12033,11 @@ async def set_instance_golden_throne(instance_id: str, request: Request):
     await log_event(
         "golden_throne_mode_changed",
         instance_id=instance_id,
-        details={"mode": mode, "old_marker": old_marker, "golden_throne": refreshed.get("golden_throne")},
+        details={
+            "mode": mode,
+            "old_marker": old_marker,
+            "golden_throne": refreshed.get("golden_throne"),
+        },
     )
     return {
         "instance_id": instance_id,
@@ -12393,7 +12395,12 @@ async def list_instances(
             row["durable_status"] = row.get("status")
             if include_runtime:
                 if row.get("device_id") != LOCAL_DEVICE_NAME:
-                    row["runtime"] = {"live": False, "pane_id": None, "role": None, "source": "tmuxctl"}
+                    row["runtime"] = {
+                        "live": False,
+                        "pane_id": None,
+                        "role": None,
+                        "source": "tmuxctl",
+                    }
                 else:
                     # Always ask the tmux oracle for local rows, even when the
                     # durable row says stopped/archived. The false-dead failure
@@ -12558,12 +12565,14 @@ async def get_instance_provenance(instance_id: str, limit: int = 20):
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
         mutations = await get_instance_mutations(db, instance_id, limit=limit)
-    return _strip_forbidden_instance_fields({
-        "instance_id": instance_id,
-        "latest_instance_mutation": mutations[0] if mutations else None,
-        "recent_mutations": mutations,
-        "last_write_txn_id": mutations[0]["write_txn_id"] if mutations else None,
-    })
+    return _strip_forbidden_instance_fields(
+        {
+            "instance_id": instance_id,
+            "latest_instance_mutation": mutations[0] if mutations else None,
+            "recent_mutations": mutations,
+            "last_write_txn_id": mutations[0]["write_txn_id"] if mutations else None,
+        }
+    )
 
 
 @app.get("/api/instances/{instance_id}/reconciliation", response_model=dict)

@@ -422,7 +422,9 @@ class TestSanctionedWritesV2Only:
 class TestCanonicalPatchEndpoints:
     def test_patch_persona_sets_persona(self, client, app_env):
         instance_id = _session_start(client)
-        resp = client.patch(f"/api/instances/{instance_id}/persona", json={"persona_slug": "custodes"})
+        resp = client.patch(
+            f"/api/instances/{instance_id}/persona", json={"persona_slug": "custodes"}
+        )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["persona_id"]
