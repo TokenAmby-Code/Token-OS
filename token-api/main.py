@@ -5688,7 +5688,9 @@ PANE_WRITE_CANCELLED = "cancelled"
 PANE_WRITE_DEFERRED = "deferred"
 
 
-def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
+def _pane_send_terminal_status(
+    send_result: dict, *, accept_issued_as_sent: bool = False
+) -> tuple[str, str | None]:
     """Map low-level pane-send truth to durable queue/front-end status.
 
     The send path distinguishes bytes-issued from submit/turn consumption. A
@@ -5696,6 +5698,13 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     the target agent observed a submitted prompt (UserPromptSubmit/composer proof).
     ``unverified`` is terminal and loud, not retryable pending, because bytes may
     have reached the composer and a blind retry would duplicate.
+
+    ``accept_issued_as_sent`` relaxes that exclusively for fire-and-forget direct
+    delivery to rowless/codex panes. Those fire ``UserPromptSubmit`` late or never,
+    so a non-gated ``returncode=0`` send that merely lacks an ack is a verification
+    false-negative, not a miss — the bytes demonstrably issued. With the flag set,
+    issued bytes report ``SENT``. Two-way callers (talk) leave it False so an
+    unconsumed turn still surfaces, and rowed/claude panes are never affected.
     """
     verification = str(send_result.get("verification_status") or "").lower()
     if verification == "gated" or send_result.get("gated"):
@@ -5703,6 +5712,8 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     if send_result.get("returncode") != 0:
         return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
     if verification == "submitted":
+        return PANE_WRITE_SENT, None
+    if accept_issued_as_sent:
         return PANE_WRITE_SENT, None
     return (
         PANE_WRITE_UNVERIFIED,
@@ -13029,6 +13040,7 @@ async def _direct_tmux_pane_delivery(
     purpose: str,
     clear_prompt: bool = False,
     operation_id: str | None = None,
+    accept_issued_as_sent: bool = False,
 ) -> dict:
     """Deliver directly to a live pane when no registry row exists.
 
@@ -13036,6 +13048,11 @@ async def _direct_tmux_pane_delivery(
     registry/tmux stamp path.  Rowless Codex singleton panes have no durable row
     to resolve, so route them through the lower-level tmuxctl primitive after a
     live agent-process check.
+
+    ``accept_issued_as_sent`` is for fire-and-forget callers (brief): a non-gated
+    ``returncode=0`` send to a rowless/codex pane reports ``SENT`` even without a
+    ``UserPromptSubmit`` ack, since those panes ack late or never. Two-way callers
+    (talk) leave it False so an unconsumed turn still fails loudly.
     """
     pane = await shared.resolve_tmux_pane_id(tmux_pane)
     engine = await _pane_live_agent_engine(pane)
@@ -13082,7 +13099,9 @@ async def _direct_tmux_pane_delivery(
             **send_result,
             **result,
         }
-    terminal_status, terminal_error = _pane_send_terminal_status(send_result)
+    terminal_status, terminal_error = _pane_send_terminal_status(
+        send_result, accept_issued_as_sent=accept_issued_as_sent
+    )
     result = {
         **base,
         "status": terminal_status,
@@ -13290,9 +13309,16 @@ async def brief_send(request: BriefSendRequest):
     delivered: list[dict] = []
     for target in resolved:
         pane_id = target["pane_id"]
-        operation_id = _scoped_send_operation_id(
-            "brief", request.idempotency_key, pane_id, request.payload
-        )
+        idempotency_key = request.idempotency_key
+        if not (idempotency_key or "").strip():
+            # Idempotency-by-default (issue #480 double-send): a keyless brief
+            # derives a DETERMINISTIC key from (pane, payload) so blind transport
+            # or tool retries of the same logical send collapse onto one
+            # operation_id and dedupe (tmuxctld idempotency cache on the rowless
+            # path, pane_write_queue id on the registry path). An explicit
+            # caller-provided key stays authoritative.
+            idempotency_key = f"auto:{pane_id}:{_prompt_payload_hash(request.payload)}"
+        operation_id = _scoped_send_operation_id("brief", idempotency_key, pane_id, request.payload)
         try:
             if request.ephemeral:
                 # Reuse the temp_message semantic side-channel infra. The
@@ -13324,6 +13350,7 @@ async def brief_send(request: BriefSendRequest):
                         purpose="brief_send",
                         clear_prompt=True,
                         operation_id=operation_id,
+                        accept_issued_as_sent=True,
                     )
                 else:
                     queued = await enqueue_pane_write(
