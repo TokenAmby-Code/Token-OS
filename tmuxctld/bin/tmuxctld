@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tmuxctld — entrypoint for the standalone HTTP-loopback tmux control-plane daemon.
 #
-# Interpreter probe + PYTHONPATH=../lib for the root tmuxctld home.
+# Interpreter probe + PYTHONPATH=tmuxctld/lib:cli-tools/lib for the root tmuxctld home.
 # This script is the SINGLE SOURCE OF TRUTH
 # for the interpreter the launchd plist invokes (the plist ProgramArguments point
 # at this file in the runtime checkout). Stdlib only — no venv.
