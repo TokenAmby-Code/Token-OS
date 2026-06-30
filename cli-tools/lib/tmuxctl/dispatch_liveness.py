@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .liveness import detect_pane_tui
+from .occupancy import _recently_born
 from .tmux_adapter import TmuxAdapter
 
 
@@ -58,25 +59,30 @@ def _normalize(path: str) -> str:
         return path
 
 
-def _all_panes(adapter: TmuxAdapter) -> list[tuple[str, str]]:
-    """(pane_id, cwd) for every pane in every session. Empty on a dead server."""
+def _all_panes(adapter: TmuxAdapter) -> list[tuple[str, str, str]]:
+    """(pane_id, cwd, born) for every pane in every session. Empty on a dead server.
+
+    ``born`` is the ``@PANE_BORN`` epoch stamp (empty when unstamped) so the
+    duplicate-refusal guard can treat a pane still inside its boot grace as
+    occupying the worktree even before its agent process is observable.
+    """
     raw = adapter.run(
         "list-panes",
         "-a",
         "-F",
-        "#{pane_id}\t#{pane_current_path}",
+        "#{pane_id}\t#{pane_current_path}\t#{@PANE_BORN}",
         allow_failure=True,
     ).strip()
-    panes: list[tuple[str, str]] = []
+    panes: list[tuple[str, str, str]] = []
     if not raw:
         return panes
     for line in raw.splitlines():
-        if "\t" in line:
-            pane_id, cwd = line.split("\t", 1)
-        else:
-            pane_id, cwd = line, ""
+        parts = line.split("\t")
+        pane_id = parts[0] if parts else ""
+        cwd = parts[1] if len(parts) > 1 else ""
+        born = parts[2] if len(parts) > 2 else ""
         if pane_id:
-            panes.append((pane_id, cwd))
+            panes.append((pane_id, cwd, born))
     return panes
 
 
@@ -86,32 +92,44 @@ def live_agents_in_dir(
     *,
     exclude_pane: str | None = None,
 ) -> list[LiveAgentPane]:
-    """Live agent panes whose pane cwd resolves to ``work_dir``.
+    """Live (or cold-starting) agent panes whose pane cwd resolves to ``work_dir``.
 
     ``exclude_pane`` drops one pane (the dispatcher's own pane) so a launch is not
     refused by the launching agent's own liveness. Detection is by the process
     tree, so a row-less / undercounted live agent — exactly the duplicate FG hit —
-    is still caught.
+    is still caught. A pane still inside its ``@PANE_BORN`` boot grace counts too:
+    its agent is cold-starting and not yet observable, but a second dispatch into
+    the same worktree would still be the two-agents-one-worktree corruption (the
+    false-fail retry race), so the guard fails CLOSED and refuses it.
     """
     target = _normalize(work_dir)
     if not target:
         return []
     found: list[LiveAgentPane] = []
-    for pane_id, cwd in _all_panes(adapter):
+    for pane_id, cwd, born in _all_panes(adapter):
         if exclude_pane and pane_id == exclude_pane:
             continue
         if _normalize(cwd) != target:
             continue
         tui = detect_pane_tui(adapter, pane_id)
-        if not tui.live:
-            continue
-        found.append(
-            LiveAgentPane(
-                pane_id=pane_id,
-                pane_pid=tui.pane_pid,
-                agent_pid=tui.agent_pid,
-                agent_command=tui.agent_command,
-                cwd=cwd,
+        if tui.live:
+            found.append(
+                LiveAgentPane(
+                    pane_id=pane_id,
+                    pane_pid=tui.pane_pid,
+                    agent_pid=tui.agent_pid,
+                    agent_command=tui.agent_command,
+                    cwd=cwd,
+                )
             )
-        )
+        elif _recently_born(born):
+            found.append(
+                LiveAgentPane(
+                    pane_id=pane_id,
+                    pane_pid=tui.pane_pid,
+                    agent_pid=None,
+                    agent_command="<agent cold-starting (within boot grace)>",
+                    cwd=cwd,
+                )
+            )
     return found

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import time
 
 import pytest
 
@@ -12,6 +13,7 @@ from tmuxctl.occupancy import (
     assert_dispatch_target_available,
     looks_like_dispatch_launcher_payload,
     occupancy_for_pane,
+    scan_pane_occupancy,
 )
 
 
@@ -136,3 +138,90 @@ def test_dispatch_target_guard_refuses_live_agent(monkeypatch):
 )
 def test_dispatch_launcher_payload_detection(payload: str, expected: bool):
     assert looks_like_dispatch_launcher_payload(payload) is expected
+
+
+# ── Cold-start boot grace ────────────────────────────────────────────────────
+# row fields: pane, clean, instance_id, pane_label, window, pane_pid, born
+
+
+def _row(pane: str, *, born: str) -> str:
+    return f"{pane}\t1\t\tmechanicus:1\tmechanicus\t1000\t{born}"
+
+
+def test_recently_born_worker_reads_occupied(monkeypatch):
+    # A clean, unbound worker (no @INSTANCE_ID, no live process) whose @PANE_BORN
+    # is fresh is cold-starting — it must read occupied so the freelist/selection
+    # never picks and clobbers the agent coming to life there.
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
+    adapter = ResolvingOccupancyAdapter({"%9": _row("%9", born=str(time.time()))})
+
+    occ = occupancy_for_pane(adapter, "%9")
+
+    assert occ is not None
+    assert occ.recently_born is True
+    assert occ.occupied is True
+    assert occ.dispatch_available is False
+
+
+def test_old_born_worker_is_available(monkeypatch):
+    # A worker born long ago and now idle/clean is a genuine free seat.
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
+    adapter = ResolvingOccupancyAdapter({"%9": _row("%9", born=str(time.time() - 10_000))})
+
+    occ = occupancy_for_pane(adapter, "%9")
+
+    assert occ is not None
+    assert occ.recently_born is False
+    assert occ.dispatch_available is True
+
+
+def test_assert_target_allows_recently_born_self_launch(monkeypatch):
+    # The boot grace must NOT bleed into the per-target send guard: the launcher
+    # that just split a worker pane sends its launch bytes into that brand-new
+    # (recently born) pane and must not be refused by its own birth.
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
+    adapter = ResolvingOccupancyAdapter({"%9": _row("%9", born=str(time.time()))})
+
+    result = assert_dispatch_target_available(adapter, "%9")
+
+    assert result.pane_id == "%9"
+    assert result.recently_born is True
+
+
+def test_boot_grace_env_override_zero_disables(monkeypatch):
+    monkeypatch.setenv("TMUXCTL_DISPATCH_BOOT_GRACE_SECONDS", "0")
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
+    adapter = ResolvingOccupancyAdapter({"%9": _row("%9", born=str(time.time()))})
+
+    occ = occupancy_for_pane(adapter, "%9")
+
+    assert occ is not None
+    assert occ.recently_born is False
+    assert occ.dispatch_available is True
+
+
+class ScanAdapter:
+    def __init__(self, rows: list[str]):
+        self.rows = rows
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[0] == "list-panes":
+            return "\n".join(self.rows) + "\n"
+        raise AssertionError(args)
+
+
+def test_scan_excludes_recently_born_from_freelist(monkeypatch):
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
+    fresh = str(time.time())
+    old = str(time.time() - 10_000)
+    adapter = ScanAdapter(
+        [
+            f"%1\t1\t\tmechanicus:1\tmechanicus\t1001\t{fresh}",
+            f"%2\t1\t\tmechanicus:2\tmechanicus\t1002\t{old}",
+        ]
+    )
+
+    ledger = scan_pane_occupancy(adapter)
+
+    available = {o.pane_id: o.dispatch_available for o in ledger}
+    assert available == {"%1": False, "%2": True}
