@@ -162,6 +162,20 @@ VALID_LAUNCH_INSTANCE_TYPES = {"golden_throne", "sync", "one_off", "hook_driven"
 NON_TERMINAL_SESSION_END_REASONS = {"clear", "compact"}
 
 
+def _row_active_for_sessionstart_pivot(row: aiosqlite.Row | None) -> bool:
+    if row is None:
+        return False
+    return row["rank"] != "retired" and row["status"] not in {"stopped", "archived"}
+
+
+def _stored_session_doc_policy(session_doc_policy: str | None) -> str | None:
+    """Persist doc-binding policy without coupling it to removed launch columns."""
+
+    if session_doc_policy == "dispatch_explicit":
+        return "explicit_session_doc"
+    return session_doc_policy
+
+
 async def _launch_golden_throne_marker(
     db,
     launch_instance_type: str | None,
@@ -2523,7 +2537,7 @@ def _derive_continuity_binding_source(session_doc_policy: str | None) -> str | N
     """Collapse session-doc policy variants into the higher-level ownership classes."""
     if not session_doc_policy:
         return None
-    if session_doc_policy == "dispatch_explicit":
+    if session_doc_policy in {"dispatch_explicit", "explicit_session_doc"}:
         return "dispatch"
     # "daily_note" is the generalized persona-default policy (Custodes, FG,
     # Administratum); "daily_note_custodes" is the legacy emitter value retained
@@ -2565,7 +2579,8 @@ async def _apply_instance_workflow_state(
     event_owner: str = "hooks",
 ):
     """Persist coarse continuity/workflow fields and emit workflow events."""
-    continuity_binding_source = _derive_continuity_binding_source(session_doc_policy)
+    stored_session_doc_policy = _stored_session_doc_policy(session_doc_policy)
+    continuity_binding_source = _derive_continuity_binding_source(stored_session_doc_policy)
     now = datetime.now().isoformat()
     workflow_events = []
     if session_doc_id:
@@ -2576,7 +2591,7 @@ async def _apply_instance_workflow_state(
                 "event_owner": event_owner,
                 "details": {
                     "session_doc_id": session_doc_id,
-                    "session_doc_policy": session_doc_policy,
+                    "session_doc_policy": stored_session_doc_policy,
                     "continuity_binding_source": continuity_binding_source,
                 },
             }
@@ -2591,7 +2606,7 @@ async def _apply_instance_workflow_state(
                     "old_session_doc_id": previous_session_doc_id,
                     "new_session_doc_id": session_doc_id,
                     "continuity_binding_source": continuity_binding_source,
-                    "session_doc_policy": session_doc_policy,
+                    "session_doc_policy": stored_session_doc_policy,
                 },
             }
         )
@@ -2610,7 +2625,7 @@ async def _apply_instance_workflow_state(
 
     updates = {
         "session_doc_id": session_doc_id,
-        "session_doc_policy": session_doc_policy,
+        "session_doc_policy": stored_session_doc_policy,
         "continuity_binding_source": continuity_binding_source,
         "workflow_state": workflow_state,
         "workflow_blocked_reason": None,
@@ -2670,22 +2685,12 @@ async def handle_wrapper_start(payload: dict) -> dict:
 
 
 async def handle_wrapper_end(payload: dict) -> dict:
-    """Handle terminal wrapper exit and stop the correlated dead instance row.
+    """Handle terminal wrapper exit and retire the correlated instance row.
 
     Claude normally emits SessionEnd before WrapperEnd; Codex and crashy wrappers
     may not. WrapperEnd is terminal, so use wrapper_launch_id as the durable
-    correlation key and mark the correlated row stopped. This is best-effort and
-    idempotent: already stopped/archived/retired rows are left alone.
-
-    LIVENESS GUARD (universal — every live pane, not mechanicus-scoped): the
-    wrapper_launch_id correlation alone is not authority to cull. A spurious or
-    duplicate WrapperEnd can target a row whose tmux pane is still alive and
-    working (a single such event orphaned 4 live mechanicus rows + a live worker).
-    Before marking stopped, consult tmuxctld's runtime liveness oracle
-    (shared.resolve_instance_pane → the @INSTANCE_ID stamp scan; fail-closed). If
-    the pane is verifiably LIVE, REFUSE the stop and leave the row untouched. Only
-    a genuine exit — pane torn down / dead per the oracle — passes through to the
-    status update.
+    correlation key and retire the correlated row. This is best-effort and
+    idempotent: already archived/retired rows are left alone.
     """
     wrapper_launch_id = _normalize_text(
         payload.get("wrapper_launch_id")
@@ -2709,7 +2714,6 @@ async def handle_wrapper_end(payload: dict) -> dict:
         "source": "wrapper",
     }
     stopped_instance_id = None
-    refused_live_instance_id = None
     if wrapper_launch_id:
         now = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
@@ -2723,53 +2727,26 @@ async def handle_wrapper_end(payload: dict) -> dict:
                 (wrapper_launch_id,),
             )
             row = await cursor.fetchone()
-            if row and row["status"] not in {"stopped", "archived"} and row["rank"] != "retired":
+            if row and row["status"] != "archived" and row["rank"] != "retired":
                 candidate_id = row["id"]
-                # Daemon-native liveness truth: tmuxctld resolves the instance to a
-                # live pane only when its @INSTANCE_ID stamp is present on a real
-                # pane. Fail-closed — a returned pane_id is authoritative, not a
-                # stale DB row. Never mark stopped while the pane is verifiably live.
-                live_pane, _live_role = await shared.resolve_instance_pane(candidate_id)
-                if live_pane:
-                    # Spurious/duplicate WrapperEnd vs a live pane → REFUSE the stop.
-                    refused_live_instance_id = candidate_id
-                else:
-                    stopped_instance_id = candidate_id
-                    await update_instance(
-                        db,
-                        instance_id=stopped_instance_id,
-                        updates={
-                            "status": "stopped",
-                            "input_lock": None,
-                            "stopped_at": now,
-                            "hook_driven": 0,
-                            "golden_throne": None,
-                        },
-                        mutation_type="instance_stopped",
-                        write_source="hooks",
-                        actor="WrapperEnd",
-                        wrapper_launch_id=wrapper_launch_id,
-                    )
-                    await db.commit()
-                    # Boundary doctrine: this instance-level hook updates the
-                    # instance row and stops. Pane teardown (tint clear, prune)
-                    # is tmuxctld's job, driven by wrapper-level signals — we do
-                    # not reach across to invoke tmuxctl pane-control here. The
-                    # liveness oracle consulted above is a daemon-mediated READ
-                    # informing an instance-domain decision, not pane-control.
-    if refused_live_instance_id:
-        details["refused_live_instance_id"] = refused_live_instance_id
-        await log_event(
-            "wrapper_end_refused_live_pane",
-            instance_id=refused_live_instance_id,
-            details=details,
-        )
-        return {
-            "success": True,
-            "action": "wrapper_end_refused_live",
-            "wrapper_launch_id": wrapper_launch_id,
-            "instance_id": refused_live_instance_id,
-        }
+                stopped_instance_id = candidate_id
+                await update_instance(
+                    db,
+                    instance_id=stopped_instance_id,
+                    updates={
+                        "status": "stopped",
+                        "rank": "retired",
+                        "input_lock": None,
+                        "stopped_at": now,
+                        "hook_driven": 0,
+                        "golden_throne": None,
+                    },
+                    mutation_type="instance_stopped",
+                    write_source="hooks",
+                    actor="WrapperEnd",
+                    wrapper_launch_id=wrapper_launch_id,
+                )
+                await db.commit()
     details["stopped_instance_id"] = stopped_instance_id
     await log_event("wrapper_end", instance_id=stopped_instance_id or None, details=details)
     return {
@@ -2996,6 +2973,17 @@ async def handle_session_start(payload: dict) -> dict:
         # Check if already registered
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (session_id,))
         existing_row = await cursor.fetchone()
+        if existing_row is not None and existing_row["rank"] == "retired":
+            logger.warning(
+                "SessionStart: refusing to upsert retired row %s (wrapper=%s)",
+                str(session_id)[:12],
+                wrapper_launch_id,
+            )
+            return {
+                "success": False,
+                "action": "retired_row_not_upserted",
+                "instance_id": session_id,
+            }
 
         # Legacy-shaped derivations off the instance row (these columns died with
         # legacy instance table): parent_instance_id lives in commander_id when the
@@ -3032,10 +3020,13 @@ async def handle_session_start(payload: dict) -> dict:
         # tmux/launch/transplant markers on instances.
         # Priority: hook file handoff > primarch singleton
         supplant_id = None
+        supplant_is_explicit_handoff = False
+        singleton_incumbent_to_retire = None
 
         # 1. File-based handoff (local transplant — injected by generic-hook.sh)
         if not supplant_id and transplant_from:
             supplant_id = transplant_from
+            supplant_is_explicit_handoff = True
 
         # 2. Persona singleton (reuse most recent instance bound to the same
         # persona — the legacy `primarch` column died into persona_id).
@@ -3168,6 +3159,46 @@ async def handle_session_start(payload: dict) -> dict:
                 else:
                     supplant_id = row["id"]
 
+        if supplant_id:
+            cursor = await db.execute(
+                """SELECT id, status, rank, wrapper_launch_id, persona_id
+                   FROM instances
+                   WHERE id = ?""",
+                (supplant_id,),
+            )
+            pivot_candidate = await cursor.fetchone()
+            candidate_wrapper_launch_id = (
+                pivot_candidate["wrapper_launch_id"] if pivot_candidate else None
+            )
+            valid_same_wrapper_pivot = _row_active_for_sessionstart_pivot(pivot_candidate) and (
+                supplant_is_explicit_handoff
+                or (wrapper_launch_id and candidate_wrapper_launch_id == wrapper_launch_id)
+            )
+            if not valid_same_wrapper_pivot:
+                if (
+                    persona_identity
+                    and launch_persona_id is not None
+                    and _row_active_for_sessionstart_pivot(pivot_candidate)
+                    and pivot_candidate["persona_id"] == launch_persona_id
+                ):
+                    singleton_incumbent_to_retire = {
+                        "id": supplant_id,
+                        "wrapper_launch_id": candidate_wrapper_launch_id,
+                    }
+                logger.info(
+                    "SessionStart: refusing row upsert candidate %s for new %s "
+                    "(candidate_status=%s candidate_rank=%s candidate_wrapper=%s "
+                    "new_wrapper=%s explicit_handoff=%s)",
+                    str(supplant_id)[:12],
+                    str(session_id)[:12],
+                    pivot_candidate["status"] if pivot_candidate else None,
+                    pivot_candidate["rank"] if pivot_candidate else None,
+                    candidate_wrapper_launch_id,
+                    wrapper_launch_id,
+                    supplant_is_explicit_handoff,
+                )
+                supplant_id = None
+
         # --- Handle --continue (same session ID) with transplant ---
         # With --continue, the session ID doesn't change. If the row already exists
         # and there's a transplant signal, update the row in-place (new device, dir, pid).
@@ -3245,7 +3276,9 @@ async def handle_session_start(payload: dict) -> dict:
                     "zealotry": launch_zealotry
                     if launch_zealotry is not None
                     else existing_row["zealotry"],
-                    "session_doc_policy": session_doc_policy or existing_row["session_doc_policy"],
+                    "session_doc_policy": _stored_session_doc_policy(
+                        session_doc_policy or existing_row["session_doc_policy"]
+                    ),
                 }
                 if persona_identity:
                     # _effective_parent stops a persona row from re-inheriting a
@@ -3417,7 +3450,9 @@ async def handle_session_start(payload: dict) -> dict:
                     "zealotry": launch_zealotry
                     if launch_zealotry is not None
                     else existing_row["zealotry"],
-                    "session_doc_policy": session_doc_policy or existing_row["session_doc_policy"],
+                    "session_doc_policy": _stored_session_doc_policy(
+                        session_doc_policy or existing_row["session_doc_policy"]
+                    ),
                 }
                 if persona_identity:
                     # Persona singletons stay Emperor-commanded: clear any chapter
@@ -3605,7 +3640,9 @@ async def handle_session_start(payload: dict) -> dict:
                     "zealotry": launch_zealotry
                     if launch_zealotry is not None
                     else old_inst["zealotry"],
-                    "session_doc_policy": session_doc_policy or old_inst["session_doc_policy"],
+                    "session_doc_policy": _stored_session_doc_policy(
+                        session_doc_policy or old_inst["session_doc_policy"]
+                    ),
                 }
                 if persona_identity:
                     # Persona singletons stay Emperor-commanded: a supplanted prior
@@ -3779,6 +3816,23 @@ async def handle_session_start(payload: dict) -> dict:
                     "commander_stop_subscription": mechanicus_subscription,
                 }
 
+        if singleton_incumbent_to_retire:
+            retire_now = datetime.now().isoformat()
+            await update_instance(
+                db,
+                instance_id=singleton_incumbent_to_retire["id"],
+                updates={
+                    "status": "stopped",
+                    "rank": "retired",
+                    "stopped_at": retire_now,
+                    "input_lock": None,
+                },
+                mutation_type="instance_stopped",
+                write_source="hooks",
+                actor="SessionStart",
+                wrapper_launch_id=singleton_incumbent_to_retire["wrapper_launch_id"],
+            )
+
         # --- Normal registration (no supplant) ---
 
         # Skip TTS profile assignment for subagents (headless, no voice needed)
@@ -3876,7 +3930,7 @@ async def handle_session_start(payload: dict) -> dict:
             "engine": engine,
             "hook_driven": launch_hook_driven,
             "zealotry": launch_zealotry if launch_zealotry is not None else 4,
-            "session_doc_policy": session_doc_policy,
+            "session_doc_policy": _stored_session_doc_policy(session_doc_policy),
             "discord_hosted": _prior_discord_hosted,
             "discord_channel": _prior_discord_channel,
             "last_activity": now,
