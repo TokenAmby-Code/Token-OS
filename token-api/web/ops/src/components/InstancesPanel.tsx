@@ -68,19 +68,19 @@ function StatusPill({ status }: { status: string }) {
   return <span className={`pill pill--${statusTone(status)}`}>{status}</span>;
 }
 
-// 40k chapter / persona identity, tinted by its canonical hex shade. The chapter
-// name implies the voice (chapter<->voice is 1:1), so this replaces any raw voice
+// 40k persona identity, tinted by its canonical hex shade. The persona
+// name implies the voice (persona<->voice is 1:1), so this replaces any raw voice
 // surface. null (e.g. a legacy pre-rename profile_name) renders a muted dash.
 function ChapterChip({ inst }: { inst: OpsInstance }) {
-  if (!inst.chapter) return <span className="faint">—</span>;
+  if (!inst.persona?.display_name) return <span className="faint">—</span>;
   return (
     <span
-      className="chapter-chip"
-      style={{ '--chip': inst.chapter_color ?? 'var(--muted)' } as React.CSSProperties}
-      title={inst.chapter}
+      className="persona-chip"
+      style={{ '--chip': inst.persona?.chip_color ?? 'var(--muted)' } as React.CSSProperties}
+      title={inst.persona?.display_name}
     >
-      <span className="chapter-chip__dot" />
-      {inst.chapter}
+      <span className="persona-chip__dot" />
+      {inst.persona?.display_name}
     </span>
   );
 }
@@ -143,7 +143,7 @@ function ExpandedInstance({
       </header>
 
       <span className="subline">
-        {inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}
+        {inst.engine} · {inst.device_id ?? '—'} · {inst.persona?.slug ?? 'no persona'}
         {inst.is_subagent ? ' · subagent' : ''}
       </span>
 
@@ -165,7 +165,7 @@ function ExpandedInstance({
           {formatAge(inst.age_seconds)}
           {inst.stale.is_stale ? <span className="tag tag--stale">stale</span> : null}
         </div>
-        <div><span className="k">pane</span>{inst.pane_label ?? inst.tmux_pane ?? '—'}</div>
+        <div><span className="k">pane</span>{inst.runtime?.role ?? inst.runtime?.pane_id ?? '—'}</div>
         <div><span className="k">Golden Throne</span><GtCell inst={inst} /></div>
         <div className="xi__wide"><span className="k">working dir</span><code>{inst.working_dir ?? '—'}</code></div>
         <div className="xi__wide"><span className="k">session doc</span><SessionDocCell inst={inst} /></div>
@@ -246,7 +246,7 @@ export function InstancesPanel({
               >
                 <td>
                   <strong>{inst.display_name}</strong> <PrBadge inst={inst} />
-                  <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}</span>
+                  <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.persona?.slug ?? 'no persona'}</span>
                 </td>
                 <td><ChapterChip inst={inst} /></td>
                 <td><StatusPill status={inst.status} /></td>
@@ -256,7 +256,7 @@ export function InstancesPanel({
                 </td>
                 <td><Zealotry value={inst.zealotry} /></td>
                 <td>
-                  {inst.pane_label ?? inst.tmux_pane ?? '—'}
+                  {inst.runtime?.role ?? inst.runtime?.pane_id ?? '—'}
                   <span className="subline">{compactPath(inst.working_dir)}</span>
                 </td>
                 <td><SessionDocCell inst={inst} /></td>
@@ -280,12 +280,12 @@ export function InstancesPanel({
               <strong>{inst.display_name}</strong> <PrBadge inst={inst} />
               <StatusPill status={inst.status} />
             </header>
-            <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.legion ?? 'no legion'}</span>
+            <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.persona?.slug ?? 'no persona'}</span>
             <div className="fcard__grid">
-              <div><span className="k">chapter</span><ChapterChip inst={inst} /></div>
+              <div><span className="k">persona</span><ChapterChip inst={inst} /></div>
               <div><span className="k">age</span>{formatAge(inst.age_seconds)}{inst.stale.is_stale ? ' · stale' : ''}</div>
               <div><span className="k">fervor</span><Zealotry value={inst.zealotry} /></div>
-              <div><span className="k">pane</span>{inst.pane_label ?? inst.tmux_pane ?? '—'}</div>
+              <div><span className="k">pane</span>{inst.runtime?.role ?? inst.runtime?.pane_id ?? '—'}</div>
               <div><span className="k">GT</span><GtCell inst={inst} /></div>
               <div className="fcard__wide"><span className="k">doc</span><SessionDocCell inst={inst} /></div>
               <div className="fcard__wide"><span className="k">next</span>{inst.next_required_action ?? inst.workflow_state ?? '—'}</div>

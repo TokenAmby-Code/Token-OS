@@ -31,23 +31,19 @@ export type SessionDoc = {
 
 export type OpsInstance = {
   id: string;
-  session_id: string | null;
   display_name: string;
-  tab_name: string | null;
+  name: string | null;
   status: string;
   engine: string;
   device_id: string | null;
   working_dir: string | null;
-  tmux_pane: string | null;
-  pane_label: string | null;
+  runtime: { live: boolean; pane_id: string | null; role: string | null; source: string };
   last_activity: string | null;
   age_seconds: number | null;
   age_minutes: number | null;
   is_subagent: boolean;
-  legion: string | null;
-  chapter: string | null; // 40k chapter / persona display name (implies the voice)
-  chapter_color: string | null; // hex shade for the chip tint
-  instance_type: string | null;
+  persona: { slug: string | null; display_name: string | null; pane_tint: string | null; chip_color: string | null; tts_voice: string | null; tts_rate?: number | null; notification_sound: string | null } | null;
+  golden_throne: string | null;
   pr_url: string | null;
   pr_state: string | null; // "open" | "merged" | null
   workflow_state: string | null;
@@ -68,7 +64,7 @@ export type OpsInstance = {
 
 export type TtsQueueItem = {
   instance_id: string;
-  tab_name: string | null;
+  name: string | null;
   message: string; // full text — UI clamps with CSS, expands on click
   voice: string | null;
   queue: string; // "hot" | "pause"
@@ -78,7 +74,7 @@ export type TtsQueueItem = {
 
 export type TtsCurrent = {
   instance_id: string;
-  tab_name: string | null;
+  name: string | null;
   message: string;
   voice: string | null;
   backend?: string | null;
@@ -190,7 +186,7 @@ export type OpsState = {
       stale: number;
       by_status: Counts;
       by_engine: Counts;
-      by_legion: Counts;
+      by_persona: Counts;
     };
   };
   events: OpsEvent[];
@@ -329,8 +325,8 @@ export type PipelineDoc = {
   status: string;
   project: string | null;
   primarch: string | null;
-  legion: string | null;
-  instance_type: string | null;
+  persona_slug: string | null;
+  golden_throne: string | null;
   head: string | null; // one-line excerpt only — never the full document
   created_at: string | null;
   /**

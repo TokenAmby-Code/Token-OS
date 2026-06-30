@@ -341,7 +341,7 @@ h1 {
   color: var(--muted); background: var(--surface-2); border: 1px solid var(--line);
   text-transform: lowercase;
 }
-.chip--legion { color: var(--brass-bright); border-color: var(--brass-deep); }
+.chip--persona { color: var(--brass-bright); border-color: var(--brass-deep); }
 
 /* ── chart ──────────────────────────────────────────────────────────── */
 
@@ -533,8 +533,8 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
 .tag--pr-open:hover { background: rgba(88, 196, 99, 0.2); }
 .tag--pr-merged { color: #a779e0; border: 1px solid rgba(167, 121, 224, 0.45); background: rgba(167, 121, 224, 0.08); }
 
-/* chapter / persona identity chip — tinted by its canonical hex (--chip set inline) */
-.chapter-chip {
+/* persona identity chip — tinted by its canonical hex (--chip set inline) */
+.persona-chip {
   --chip: var(--line-bright);
 
   display: inline-flex; align-items: center; gap: 6px;
@@ -543,7 +543,7 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
   background: color-mix(in srgb, var(--chip) 12%, var(--surface-2));
   color: color-mix(in srgb, var(--chip) 65%, var(--text));
 }
-.chapter-chip__dot {
+.persona-chip__dot {
   flex: none; width: 8px; height: 8px; border-radius: 50%;
   background: var(--chip);
   box-shadow: 0 0 8px color-mix(in srgb, var(--chip) 60%, transparent);

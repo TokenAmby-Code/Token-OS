@@ -222,8 +222,6 @@ from shared import (
     is_local_device,
     is_pid_claude,
     log_event,
-    profile_by_name,
-    resolve_device_from_ip,
 )
 from timer import (
     BREAK_MODES,
@@ -1033,25 +1031,23 @@ cron_engine: CronEngine = None
 
 # Pydantic Models
 class InstanceRegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     instance_id: str
     origin_type: str = "local"  # 'local' or 'ssh'
-    source_ip: str | None = None
     device_id: str | None = None
-    pid: int | None = None
-    tab_name: str | None = None
+    name: str | None = None
     working_dir: str | None = None
 
 
 class InstanceResponse(BaseModel):
     id: str
-    session_id: str
     name: str | None
     working_dir: str | None
     origin_type: str
-    source_ip: str | None
     device_id: str
     persona: dict | None = None
-    pid: int | None
+    runtime: dict | None = None
     status: str
     created_at: str
     last_activity: str
@@ -1115,11 +1111,11 @@ class AgentRuntime(BaseModel):
     status: str
     engine: str | None = None
     working_dir: str | None = None
-    tmux_pane: str | None = None
+    pane_id: str | None = None
     device_id: str | None = None
     last_activity: str | None = None
     registered: bool = True
-    live_pane: bool | None = None
+    live: bool | None = None
     # Billable-vs-personal tag (billable=Civic/askCivic, personal=Imperium). See billable.py.
     work_class: str | None = None
 
@@ -2725,14 +2721,11 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
 async def register_instance(request: InstanceRegisterRequest):
     """Register a new Claude instance."""
     logger.info(
-        f"Registering instance: {request.working_dir or request.tab_name or request.instance_id[:8]}"
+        f"Registering instance: {request.working_dir or request.name or request.instance_id[:8]}"
     )
     session_id = str(uuid.uuid4())
 
-    # Resolve device_id from source_ip if not provided
     device_id = request.device_id
-    if not device_id and request.source_ip:
-        device_id = resolve_device_from_ip(request.source_ip)
     if not device_id:
         device_id = "Mac-Mini"  # Default for local sessions on Mac Mini
 
@@ -2815,7 +2808,7 @@ async def register_instance(request: InstanceRegisterRequest):
         "instance_registered",
         instance_id=request.instance_id,
         device_id=device_id,
-        details={"name": request.tab_name, "origin_type": request.origin_type},
+        details={"name": request.name, "origin_type": request.origin_type},
     )
 
     # Push updated instance count to phone widget
@@ -3614,12 +3607,16 @@ async def diagnose_instance(instance_id: str):
 
 
 class RenameInstanceRequest(BaseModel):
-    tab_name: str
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
 
 
 class PaneRenameRequest(BaseModel):
-    tmux_pane: str
-    tab_name: str
+    model_config = ConfigDict(extra="forbid")
+
+    pane_id: str
+    name: str
 
 
 INSTANCE_NAME_MAX_CHARS = 40
@@ -3667,7 +3664,7 @@ class LogsResponse(BaseModel):
 
 @app.patch("/api/instances/{instance_id}/rename")
 async def rename_instance(instance_id: str, request: RenameInstanceRequest):
-    """Rename an instance's tab_name. Auto-generated docs may mirror the title.
+    """Rename an instance's name. Auto-generated docs may mirror the title.
 
     Enforces kebab-case but preserves slot-style identifiers: strips ✳ artifacts,
     converts spaces to hyphens, drops most non-alphanumerics but keeps `:` and
@@ -3675,7 +3672,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
     """
     import re as _re
 
-    clean = (request.tab_name or "").lstrip("✳ ").strip()
+    clean = (request.name or "").lstrip("✳ ").strip()
     clean = _re.sub(r"[^A-Za-z0-9: -]", "", clean)
     clean = _re.sub(r"[ -]+", "-", clean).strip("-")
     clean = "-".join(clean.split("-")[:4])
@@ -3686,7 +3683,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
             status_code=400,
             detail="Name cannot be a placeholder; choose a descriptive title",
         )
-    request.tab_name = clean
+    request.name = clean
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -3704,7 +3701,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         await update_instance(
             db,
             instance_id=instance_id,
-            updates={"name": request.tab_name},
+            updates={"name": request.name},
             mutation_type="instance_updated",
             write_source="api",
             actor="instance-name-cli",
@@ -3723,13 +3720,13 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         instance_id=instance_id,
         details={
             "old_name": old_name,
-            "new_name": request.tab_name,
+            "new_name": request.name,
             "session_doc_updated": session_doc_updated,
             "session_doc_policy": session_doc_policy,
         },
     )
 
-    return {"status": "renamed", "instance_id": instance_id, "tab_name": request.tab_name}
+    return {"status": "renamed", "instance_id": instance_id, "name": request.name}
 
 
 @app.post("/api/instance/rename")
@@ -3739,15 +3736,15 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
     Used by the `instance-name` CLI from inside an agent pane. This route is
     intentionally pane-scoped so agents do not need to know their instance id.
     """
-    tmux_pane = (request.tmux_pane or "").strip()
-    if not tmux_pane:
-        raise HTTPException(status_code=400, detail="tmux_pane is required")
-    tab_name = _validate_instance_name_slug(request.tab_name)
+    pane_id = (request.pane_id or "").strip()
+    if not pane_id:
+        raise HTTPException(status_code=400, detail="pane_id is required")
+    name = _validate_instance_name_slug(request.name)
 
     # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID stamp rather
     # than querying the stored tmux_pane column. The CLI passes the agent's own live
     # $TMUX_PANE, so the stamp is authoritative and current.
-    pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
+    pane_instance_id = await shared.instance_id_for_pane(pane_id)
     if not pane_instance_id:
         raise HTTPException(status_code=404, detail="No active instance found for tmux pane")
 
@@ -3770,7 +3767,7 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
         result = await update_instance(
             db,
             instance_id=instance_id,
-            updates={"name": tab_name},
+            updates={"name": name},
             mutation_type="instance_updated",
             write_source="api",
             actor="instance-name-cli",
@@ -3782,22 +3779,22 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
         instance_id=instance_id,
         details={
             "old_name": old_name,
-            "new_name": tab_name,
-            "tmux_pane": tmux_pane,
+            "new_name": name,
+            "pane_id": pane_id,
             "source": "instance-name-cli",
         },
     )
     return {
         "status": "renamed",
         "instance_id": instance_id,
-        "tmux_pane": tmux_pane,
-        "tab_name": tab_name,
+        "pane_id": pane_id,
+        "name": name,
         "changed_fields": result.get("changed_fields", []),
     }
 
 
 @app.patch("/api/instances/{instance_id}/transplant-pending")
-async def mark_transplant_pending(instance_id: str, target_session: str):
+async def mark_transplant_pending(instance_id: str, request: Request):
     """Reject DB transplant markers as non-canonical instance state."""
     raise HTTPException(
         status_code=410,
@@ -6176,10 +6173,10 @@ async def _detect_tmux_agent_panes() -> list[AgentRuntime]:
                 status="observed",
                 engine=engine,
                 working_dir=cwd,
-                tmux_pane=pane,
+                pane_id=pane,
                 device_id=LOCAL_DEVICE_NAME,
                 registered=False,
-                live_pane=True,
+                live=True,
             )
         )
     return agents
@@ -6740,11 +6737,11 @@ async def compute_work_state() -> WorkStateResponse:
                 status=row["status"],
                 engine=row["engine"],
                 working_dir=row["working_dir"],
-                tmux_pane=canonical_tmux_pane,
+                pane_id=canonical_tmux_pane,
                 device_id=row["device_id"],
                 last_activity=last_activity,
                 registered=True,
-                live_pane=live_pane,
+                live=live_pane,
                 work_class=classify_work_class(row["working_dir"], row["legion"]).value,
             )
         )
@@ -6786,11 +6783,11 @@ async def compute_work_state() -> WorkStateResponse:
                 status="observed",
                 engine=engine,
                 working_dir=cwd,
-                tmux_pane=pane,
+                pane_id=pane,
                 device_id=LOCAL_DEVICE_NAME,
                 last_activity=pane_last_activity_str,
                 registered=False,
-                live_pane=True,
+                live=True,
                 work_class=classify_work_class(cwd, None).value,
             )
         )
@@ -7703,9 +7700,9 @@ def _load_golden_throne_sop() -> str:
         "state transition. If done, call POST $TOKEN_API_URL/api/session-docs/"
         "<doc_id>/victory-ack or POST $TOKEN_API_URL/api/instances/"
         "<instance_id>/victory. If Golden Throne pings are wrong for this "
-        "thread, disable them by setting the instance to one_off: PATCH "
-        "$TOKEN_API_URL/api/instances/<instance_id>/type with "
-        '{"instance_type":"one_off"}. Do not allow yourself to be '
+        "thread, disable them with: PATCH "
+        "$TOKEN_API_URL/api/instances/<instance_id>/golden-throne with "
+        '{"mode":"off"}. Do not allow yourself to be '
         "Sisyphus-looped; either make measurable progress, escalate, disable "
         "Golden Throne for this thread, or perform the victory state transition "
         "so usage limits are not burned."
@@ -8012,9 +8009,9 @@ def _golden_throne_accountability_prompt(
         f"$TOKEN_API_URL/api/session-docs/<doc_id>/victory-ack, or the legacy "
         f"POST $TOKEN_API_URL/api/instances/<instance_id>/victory if no doc id "
         f"is available.\n"
-        f"To disable Golden Throne pings for this thread, set the instance to "
-        f"one_off: PATCH $TOKEN_API_URL/api/instances/<instance_id>/type with "
-        f'{{"instance_type":"one_off"}}.\n'
+        f"To disable Golden Throne pings for this thread: PATCH "
+        f"$TOKEN_API_URL/api/instances/<instance_id>/golden-throne with "
+        f'{{"mode":"off"}}.\n'
         f"Do not allow yourself to be Sisyphus-looped. Either make measurable "
         f"progress, escalate, disable Golden Throne for this thread, or perform "
         f"the victory state transition so usage limits are not burned.\n\n"
@@ -10965,55 +10962,71 @@ LEGION_PERSONA_SLUGS = {
 }
 
 
-@app.patch("/api/instances/{instance_id}/legion")
-async def set_instance_legion(instance_id: str, request: Request):
-    """Set the legion for an instance."""
+@app.patch("/api/instances/{instance_id}/persona")
+async def set_instance_persona(instance_id: str, request: Request):
+    """Set an instance persona using the canonical persona slug."""
     body = await request.json()
-    legion = body.get("legion")
-    if legion not in ALLOWED_LEGIONS:
+    forbidden = {"legion", "profile_name", "tts_voice", "notification_sound"} & set(body)
+    if forbidden:
         raise HTTPException(
-            status_code=400, detail=f"legion must be one of: {', '.join(sorted(ALLOWED_LEGIONS))}"
+            status_code=400,
+            detail=f"forbidden legacy fields: {', '.join(sorted(forbidden))}",
         )
+    persona_slug = (body.get("persona_slug") or "").strip().lower()
+    if not persona_slug:
+        raise HTTPException(status_code=400, detail="persona_slug is required")
 
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        # Resolve the legion to its persona and bind persona_id.
-        updates: dict = {}
-        persona_slug = LEGION_PERSONA_SLUGS.get(legion)
-        if persona_slug:
-            persona = await resolve_persona(db, persona_slug)
-            if persona:
-                updates["persona_id"] = persona["id"]
-        if updates:
-            await update_instance(
-                db,
-                instance_id=instance_id,
-                updates=updates,
-                mutation_type="instance_updated",
-                write_source="api",
-                actor="set-legion",
-            )
+        persona = await resolve_persona(db, persona_slug)
+        if not persona:
+            raise HTTPException(status_code=400, detail=f"unknown persona_slug: {persona_slug}")
+        await update_instance(
+            db,
+            instance_id=instance_id,
+            updates={"persona_id": persona["id"]},
+            mutation_type="instance_updated",
+            write_source="api",
+            actor="set-persona",
+        )
         await db.commit()
 
-    # Event-driven tint: resolve live pane through tmuxctl and paint from
-    # canonical instances.persona_id → personas.pane_tint, never from legion.
-    tmux_pane, _pane_role = await shared.resolve_instance_pane(instance_id)
-    if tmux_pane:
+    pane_id, _pane_role = await shared.resolve_instance_pane(instance_id)
+    if pane_id:
         async with aiosqlite.connect(DB_PATH) as db:
-            await shared.apply_instance_pane_tint(db, instance_id, tmux_pane, source="set-legion")
+            await shared.apply_instance_pane_tint(db, instance_id, pane_id, source="set-persona")
+            await shared.push_agnostic_pane_vars(db, instance_id)
+            await db.commit()
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await shared.push_agnostic_pane_vars(db, instance_id)
+            await db.commit()
 
-    # Mid-session /persona path: refresh the engine-agnostic statusline identity vars so the
-    # @PERSONA segment tracks the new legion/persona binding (@SESSION_DOC/@CWD are
-    # re-pushed harmlessly from the canonical row).
-    async with aiosqlite.connect(DB_PATH) as db:
-        await shared.push_agnostic_pane_vars(db, instance_id)
-        await db.commit()
+    persona_payload = {
+        "id": persona["id"],
+        "slug": persona.get("slug"),
+        "display_name": persona.get("display_name"),
+        "pane_tint": persona.get("pane_tint"),
+        "chip_color": persona.get("chip_color"),
+        "tts_voice": persona.get("tts_voice"),
+        "tts_rate": persona.get("tts_rate"),
+        "notification_sound": persona.get("notification_sound"),
+    }
+    logger.info("Persona: %s → %s", instance_id[:12], persona_slug)
+    return {"instance_id": instance_id, "persona_id": persona["id"], "persona": persona_payload}
 
-    logger.info(f"Legion: {instance_id[:12]} → {legion}")
-    return {"instance_id": instance_id, "legion": legion}
+
+@app.patch("/api/instances/{instance_id}/legion")
+async def set_instance_legion(instance_id: str, request: Request):
+    """Removed legacy legion mutator."""
+    raise HTTPException(
+        status_code=410,
+        detail="legacy legion endpoint removed; use PATCH /api/instances/{id}/persona with persona_slug",
+    )
 
 
 # /api/instances/{instance_id}/tmux-pane intentionally removed. Token-API must
@@ -11023,57 +11036,11 @@ async def set_instance_legion(instance_id: str, request: Request):
 
 @app.patch("/api/instances/{instance_id}/synced")
 async def set_instance_synced(instance_id: str, request: Request):
-    """Set synced flag for an instance. Enforces one synced session per legion."""
-    body = await request.json()
-    synced = body.get("synced")
-    if synced not in (True, False, 0, 1):
-        raise HTTPException(status_code=400, detail="synced must be true or false")
-    synced_int = 1 if synced else 0
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        # The legacy `synced` column died into the golden_throne marker
-        # (synced=1 ⇔ golden_throne='sync'); legion lives in persona_id.
-        cursor = await db.execute(
-            """SELECT i.id, i.persona_id,
-                      (SELECT slug FROM personas WHERE id = i.persona_id) AS legion
-               FROM instances i WHERE i.id = ?""",
-            (instance_id,),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Instance not found")
-        persona_id = row[1]
-        legion = row[2] or "astartes"
-
-        if synced_int:
-            # One synced session per legion: another live row with the same persona
-            # already carrying the 'sync' marker is a conflict.
-            cursor = await db.execute(
-                """SELECT id FROM instances
-                   WHERE ((? IS NOT NULL AND persona_id = ?) OR (? IS NULL AND persona_id IS NULL))
-                     AND golden_throne = 'sync'
-                     AND status NOT IN ('stopped', 'archived') AND id != ?""",
-                (persona_id, persona_id, persona_id, instance_id),
-            )
-            conflict = await cursor.fetchone()
-            if conflict:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Legion '{legion}' already has a synced session: {conflict[0][:12]}",
-                )
-
-        await update_instance(
-            db,
-            instance_id=instance_id,
-            updates={"golden_throne": "sync" if synced_int else None},
-            mutation_type="instance_updated",
-            write_source="api",
-            actor="set-synced",
-        )
-        await db.commit()
-
-    logger.info(f"Synced: {instance_id[:12]} → synced={synced_int} (legion={legion})")
-    return {"instance_id": instance_id, "synced": bool(synced_int), "legion": legion}
+    """Removed legacy sync mutator."""
+    raise HTTPException(
+        status_code=410,
+        detail="legacy synced endpoint removed; use PATCH /api/instances/{id}/golden-throne with mode sync|off",
+    )
 
 
 @app.patch("/api/instances/{instance_id}/pr")
@@ -11960,15 +11927,19 @@ async def trigger_golden_throne_followup(instance_id: str):
 VALID_INSTANCE_TYPES = {"sync", "golden_throne", "one_off", "hook_driven", "archived"}
 
 
-@app.patch("/api/instances/{instance_id}/type")
-async def set_instance_type(instance_id: str, request: Request):
-    """Set instance lifecycle type with transition validation."""
+@app.patch("/api/instances/{instance_id}/golden-throne")
+async def set_instance_golden_throne(instance_id: str, request: Request):
+    """Set canonical Golden Throne mode: off, sync, or follow_up."""
     body = await request.json()
-    new_type = body.get("instance_type")
-    if new_type not in VALID_INSTANCE_TYPES:
+    forbidden = {"instance_type", "synced", "legion"} & set(body)
+    if forbidden:
         raise HTTPException(
-            status_code=400, detail=f"instance_type must be one of {VALID_INSTANCE_TYPES}"
+            status_code=400,
+            detail=f"forbidden legacy fields: {', '.join(sorted(forbidden))}",
         )
+    mode = (body.get("mode") or "").strip().lower()
+    if mode not in {"off", "sync", "follow_up"}:
+        raise HTTPException(status_code=400, detail="mode must be off|sync|follow_up")
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -11977,45 +11948,24 @@ async def set_instance_type(instance_id: str, request: Request):
         if not instance:
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        # Legacy instance_type derived from instance state: status='archived' → archived;
-        # golden_throne='sync' → sync; any other non-null marker (a golden_throne.id)
-        # → golden_throne; NULL → one_off. The instance_type column died with
-        # instances; its durable home is the golden_throne marker.
-        _gt_marker = instance["golden_throne"]
-        if instance["status"] == "archived":
-            old_type = "archived"
-        elif _gt_marker == "sync":
-            old_type = "sync"
-        elif _gt_marker:
-            old_type = "golden_throne"
-        else:
-            old_type = "one_off"
-
-        # Archived instances can only unarchive to one_off
-        if old_type == "archived" and new_type != "one_off":
-            raise HTTPException(
-                status_code=400, detail="Archived instances can only be unarchived to one_off"
-            )
-
-        # Optional follow_up_sop — persist custom SOP path for GT follow-ups
-        follow_up_sop = body.get("follow_up_sop")
-        # Optional zealotry override in same call
         zealotry_override = body.get("zealotry")
         zealotry_value = None
-        if isinstance(zealotry_override, int) and 1 <= zealotry_override <= 10:
+        if zealotry_override is not None:
+            if not isinstance(zealotry_override, int) or not 1 <= zealotry_override <= 10:
+                raise HTTPException(status_code=400, detail="zealotry must be integer 1-10")
             zealotry_value = zealotry_override
-        elif new_type == "golden_throne" and (instance["zealotry"] or 4) < 4:
-            # Auto-set zealotry minimum when promoting to golden_throne
+        elif mode == "follow_up" and (instance["zealotry"] or 4) < 4:
             zealotry_value = 4
 
+        follow_up_sop = body.get("follow_up_sop")
         updates: dict = {}
         if follow_up_sop is not None:
             updates["follow_up_sop"] = follow_up_sop if follow_up_sop else None
         if zealotry_value is not None:
             updates["zealotry"] = zealotry_value
 
-        # Translate the requested type onto the golden_throne marker (its durable home).
-        if new_type == "sync":
+        old_marker = instance["golden_throne"]
+        if mode == "sync":
             cursor = await db.execute(
                 """SELECT id FROM instances
                    WHERE ((? IS NOT NULL AND persona_id = ?) OR (? IS NULL AND persona_id IS NULL))
@@ -12036,19 +11986,11 @@ async def set_instance_type(instance_id: str, request: Request):
                     detail=f"matching persona already has a synced session: {conflict[0][:12]}",
                 )
             updates["golden_throne"] = "sync"
-        elif new_type == "one_off":
+        elif mode == "off":
             updates["golden_throne"] = None
-        elif new_type == "archived":
-            updates["golden_throne"] = None
-            updates["status"] = "archived"
-            updates["rank"] = "retired"
-        elif new_type == "golden_throne":
-            # A golden_throne row holds the GT engine state; the marker references it.
-            # Reuse an existing GT binding when present, else mint one from the
-            # requested values. Insert the row BEFORE setting the marker
-            # (the guard trigger requires the marker to be NULL | 'sync' | a GT id).
-            if _gt_marker and _gt_marker != "sync":
-                marker = _gt_marker
+        else:  # follow_up
+            if old_marker and old_marker != "sync":
+                marker = old_marker
             else:
                 marker = await create_golden_throne_binding(
                     db,
@@ -12057,8 +11999,6 @@ async def set_instance_type(instance_id: str, request: Request):
                     stop_allowed=instance["stop_allowed"],
                 )
             updates["golden_throne"] = marker
-        # new_type == "hook_driven": no marker change (hook_driven is an automation flag,
-        # not a golden_throne state); leave the marker untouched.
 
         await update_instance(
             db,
@@ -12066,39 +12006,54 @@ async def set_instance_type(instance_id: str, request: Request):
             updates=updates,
             mutation_type="instance_updated",
             write_source="api",
-            actor="instance-type",
+            actor="golden-throne-mode",
         )
         await db.commit()
-
-    # Cancel timers when leaving golden_throne or sync
-    if old_type in ("golden_throne", "sync") and new_type not in ("golden_throne", "sync"):
-        try:
-            scheduler.remove_job(f"golden-throne-{instance_id}")
-        except Exception:
-            pass
-        await _gt_clear_fire(instance_id)
-        try:
-            scheduler.remove_job(f"sync-retrigger-{instance_id}")
-        except Exception:
-            pass
-    elif new_type == "golden_throne":
         refreshed = dict(instance)
         refreshed.update(updates)
+
+    if mode == "off":
+        for job_id in (f"golden-throne-{instance_id}", f"sync-retrigger-{instance_id}"):
+            try:
+                scheduler.remove_job(job_id)
+            except Exception:
+                pass
+        await _gt_clear_fire(instance_id)
+    elif mode == "follow_up":
         if refreshed.get("status") in ("idle", "stopped") and not refreshed.get("victory_at"):
             try:
-                await schedule_golden_throne_followup(refreshed, reason="instance-type")
+                await schedule_golden_throne_followup(refreshed, reason="golden-throne-mode")
             except Exception as exc:
                 logger.warning(
-                    f"Golden Throne: failed to schedule after type change "
-                    f"for {instance_id[:12]}: {exc}"
+                    "Golden Throne: failed to schedule after mode change for %s: %s",
+                    instance_id[:12],
+                    exc,
                 )
 
     await log_event(
-        "instance_type_changed",
+        "golden_throne_mode_changed",
         instance_id=instance_id,
-        details={"old_type": old_type, "new_type": new_type},
+        details={
+            "mode": mode,
+            "old_marker": old_marker,
+            "golden_throne": refreshed.get("golden_throne"),
+        },
     )
-    return {"instance_id": instance_id, "instance_type": new_type, "old_type": old_type}
+    return {
+        "instance_id": instance_id,
+        "golden_throne": refreshed.get("golden_throne"),
+        "status": refreshed.get("status"),
+        "rank": refreshed.get("rank"),
+    }
+
+
+@app.patch("/api/instances/{instance_id}/type")
+async def set_instance_type(instance_id: str, request: Request):
+    """Removed legacy lifecycle-type mutator."""
+    raise HTTPException(
+        status_code=410,
+        detail="legacy type endpoint removed; use PATCH /api/instances/{id}/golden-throne",
+    )
 
 
 @app.patch("/api/instances/{instance_id}/retire")
@@ -12197,7 +12152,7 @@ async def archive_instance(instance_id: str):
         except Exception:
             pass
 
-    return {"instance_id": instance_id, "instance_type": "archived"}
+    return {"instance_id": instance_id, "status": "archived"}
 
 
 @app.patch("/api/instances/{instance_id}/unarchive")
@@ -12218,7 +12173,7 @@ async def unarchive_instance(instance_id: str):
         )
         await db.commit()
 
-    return {"instance_id": instance_id, "instance_type": "one_off"}
+    return {"instance_id": instance_id, "status": "idle"}
 
 
 def _send_pedal_enter():
@@ -12315,6 +12270,11 @@ DEAD_INSTANCE_RESPONSE_FIELDS = {
     "synced",
     "instance_type",
     "parent_instance_id",
+    "session_id",
+    "source_ip",
+    "pid",
+    "tmux_pane",
+    "pane_label",
     # Persona-derived presentation/audio fields belong under `persona`.
     "tts_voice",
     "notification_sound",
@@ -12335,6 +12295,20 @@ DEAD_INSTANCE_RESPONSE_FIELDS = {
 }
 
 
+def _strip_forbidden_instance_fields(payload, *, in_persona: bool = False):
+    """Strip legacy instance-shape keys from public /api/instances payloads."""
+    if isinstance(payload, list):
+        return [_strip_forbidden_instance_fields(item, in_persona=in_persona) for item in payload]
+    if not isinstance(payload, dict):
+        return payload
+    cleaned = {}
+    for key, value in payload.items():
+        if not in_persona and key in DEAD_INSTANCE_RESPONSE_FIELDS:
+            continue
+        cleaned[key] = _strip_forbidden_instance_fields(value, in_persona=(key == "persona"))
+    return cleaned
+
+
 def _attach_persona_surface(row: dict) -> dict:
     persona = {
         "id": row.get("persona_id"),
@@ -12350,9 +12324,7 @@ def _attach_persona_surface(row: dict) -> dict:
         row["persona"] = persona
     else:
         row["persona"] = None
-    for field in DEAD_INSTANCE_RESPONSE_FIELDS:
-        row.pop(field, None)
-    return row
+    return _strip_forbidden_instance_fields(row)
 
 
 @app.get("/api/instances", response_model=list[dict])
@@ -12423,7 +12395,12 @@ async def list_instances(
             row["durable_status"] = row.get("status")
             if include_runtime:
                 if row.get("device_id") != LOCAL_DEVICE_NAME:
-                    row["runtime"] = {"live_pane": False, "source": "tmuxctl"}
+                    row["runtime"] = {
+                        "live": False,
+                        "pane_id": None,
+                        "role": None,
+                        "source": "tmuxctl",
+                    }
                 else:
                     # Always ask the tmux oracle for local rows, even when the
                     # durable row says stopped/archived. The false-dead failure
@@ -12434,9 +12411,9 @@ async def list_instances(
                     pane, role = await shared.resolve_instance_pane(row.get("id"))
                     live = bool(pane)
                     row["runtime"] = {
-                        "live_pane": live,
-                        "tmux_pane": pane,
-                        "pane_label": role,
+                        "live": live,
+                        "pane_id": pane,
+                        "role": role,
                         "source": "tmuxctl",
                     }
                     if live and row.get("status") in {"stopped", "archived"}:
@@ -12515,7 +12492,7 @@ async def resolve_instance(pid: int | None = None, cwd: str | None = None):
         else:
             result["session_doc"] = None
 
-        return result
+        return _strip_forbidden_instance_fields(result)
 
 
 @app.get("/api/instances/{instance_id}", response_model=dict)
@@ -12588,12 +12565,14 @@ async def get_instance_provenance(instance_id: str, limit: int = 20):
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
         mutations = await get_instance_mutations(db, instance_id, limit=limit)
-    return {
-        "instance_id": instance_id,
-        "latest_instance_mutation": mutations[0] if mutations else None,
-        "recent_mutations": mutations,
-        "last_write_txn_id": mutations[0]["write_txn_id"] if mutations else None,
-    }
+    return _strip_forbidden_instance_fields(
+        {
+            "instance_id": instance_id,
+            "latest_instance_mutation": mutations[0] if mutations else None,
+            "recent_mutations": mutations,
+            "last_write_txn_id": mutations[0]["write_txn_id"] if mutations else None,
+        }
+    )
 
 
 @app.get("/api/instances/{instance_id}/reconciliation", response_model=dict)
@@ -19877,8 +19856,8 @@ def _ops_instance_staleness(status: str | None, age_seconds: int | None) -> dict
 
 def _ops_display_name(inst: dict) -> str:
     return (
-        inst.get("tab_name")
-        or inst.get("pane_label")
+        inst.get("name")
+        or inst.get("pane_role")
         or inst.get("session_doc_title")
         or inst.get("working_dir")
         or str(inst.get("id") or "")[:12]
@@ -20343,13 +20322,13 @@ async def _ops_read_instances(now: datetime) -> dict:
         cursor = await db.execute(
             """
             SELECT ci.*,
-                   ci.name AS tab_name,
-                   COALESCE(p.slug, 'astartes') AS legion,
-                   COALESCE(p.slug, 'astartes') AS profile_name,
-                   CASE WHEN ci.golden_throne = 'sync' THEN 'sync'
-                        WHEN ci.golden_throne IS NOT NULL THEN 'golden_throne'
-                        ELSE 'one_off'
-                   END AS instance_type,
+                   COALESCE(p.slug, 'astartes') AS persona_slug,
+                   p.display_name AS persona_display_name,
+                   p.pane_tint AS persona_pane_tint,
+                   p.chip_color AS persona_chip_color,
+                   p.tts_voice AS persona_tts_voice,
+                   p.tts_rate AS persona_tts_rate,
+                   p.notification_sound AS persona_notification_sound,
                    sd.title AS session_doc_title,
                    sd.file_path AS session_doc_path,
                    sd.status AS session_doc_status,
@@ -20375,22 +20354,22 @@ async def _ops_read_instances(now: datetime) -> dict:
     active = []
     status_counts: dict[str, int] = {}
     engine_counts: dict[str, int] = {}
-    legion_counts: dict[str, int] = {}
+    persona_counts: dict[str, int] = {}
     work_class_counts: dict[str, int] = {}
     stale_count = 0
     for row in rows:
         inst = dict(row)
         _lp = live_panes.get(inst.get("id"))
-        inst["tmux_pane"] = _lp["pane_id"] if _lp else None
-        inst["pane_label"] = _lp["pane_label"] if _lp else None
+        inst["pane_id"] = _lp["pane_id"] if _lp else None
+        inst["pane_role"] = _lp["pane_label"] if _lp else None
         status = inst.get("status") or "unknown"
         engine = inst.get("engine") or "claude"
-        legion = inst.get("legion") or inst.get("instance_type") or "unassigned"
-        # Billable Civic vs personal Imperium tag (working_dir primary, legion override).
-        work_class = classify_work_class(inst.get("working_dir"), inst.get("legion")).value
+        persona_slug = inst.get("persona_slug") or "unassigned"
+        # Billable Civic vs personal Imperium tag (working_dir primary, persona context secondary).
+        work_class = classify_work_class(inst.get("working_dir"), inst.get("persona_slug")).value
         status_counts[status] = status_counts.get(status, 0) + 1
         engine_counts[engine] = engine_counts.get(engine, 0) + 1
-        legion_counts[legion] = legion_counts.get(legion, 0) + 1
+        persona_counts[persona_slug] = persona_counts.get(persona_slug, 0) + 1
         work_class_counts[work_class] = work_class_counts.get(work_class, 0) + 1
         activity_anchor = inst.get("last_activity") or inst.get("created_at")
         age_seconds = _ops_seconds_since(activity_anchor, now=now)
@@ -20398,33 +20377,37 @@ async def _ops_read_instances(now: datetime) -> dict:
         if staleness["is_stale"]:
             stale_count += 1
         gt_job = scheduler.get_job(f"golden-throne-{inst.get('id')}")
-        _prof = profile_by_name(inst.get("profile_name"))
         active.append(
             {
                 "id": inst.get("id"),
-                "session_id": inst.get("session_id"),
                 "display_name": _ops_display_name(inst),
-                "tab_name": inst.get("tab_name"),
-                # Persona/chapter display identity, resolved at read-time from
-                # profile_name until instances.persona_id lands. chapter_color is
-                # the cockpit chip; pane_tint is the tmux pane background style.
-                "chapter": _prof.get("chapter") if _prof else None,
-                "chapter_color": (_prof.get("chip_color") or _prof.get("color")) if _prof else None,
-                "pane_tint": _prof.get("pane_tint") if _prof else None,
+                "name": inst.get("name"),
+                "persona": {
+                    "slug": inst.get("persona_slug"),
+                    "display_name": inst.get("persona_display_name"),
+                    "pane_tint": inst.get("persona_pane_tint"),
+                    "chip_color": inst.get("persona_chip_color"),
+                    "tts_voice": inst.get("persona_tts_voice"),
+                    "tts_rate": inst.get("persona_tts_rate"),
+                    "notification_sound": inst.get("persona_notification_sound"),
+                },
                 "status": status,
                 "engine": engine,
                 "device_id": inst.get("device_id"),
                 "working_dir": inst.get("working_dir"),
-                "tmux_pane": inst.get("tmux_pane"),
-                "pane_label": inst.get("pane_label"),
+                "runtime": {
+                    "live": bool(inst.get("pane_id")),
+                    "pane_id": inst.get("pane_id"),
+                    "role": inst.get("pane_role"),
+                    "source": "tmuxctl",
+                },
                 "last_activity": inst.get("last_activity"),
                 "created_at": inst.get("created_at"),
                 "age_seconds": age_seconds,
                 "age_minutes": None if age_seconds is None else age_seconds // 60,
                 "is_subagent": bool(inst.get("is_subagent") or 0),
-                "legion": inst.get("legion"),
                 "work_class": work_class,
-                "instance_type": inst.get("instance_type"),
+                "golden_throne": inst.get("golden_throne"),
                 # "Agent has PR open" flag (Phase 1) — /ui/ops renders a badge linking
                 # pr_url when pr_state == 'open'. Flipped to 'merged' by CD (Phase 2).
                 "pr_url": inst.get("pr_url"),
@@ -20466,7 +20449,7 @@ async def _ops_read_instances(now: datetime) -> dict:
             "stale": stale_count,
             "by_status": status_counts,
             "by_engine": engine_counts,
-            "by_legion": legion_counts,
+            "by_persona": persona_counts,
             "by_work_class": work_class_counts,
         },
     }
@@ -21248,8 +21231,8 @@ async def get_ops_session_docs(
                 "status": status,
                 "project": d.get("project") or fm.get("project"),
                 "primarch": d.get("primarch_name") or fm.get("primarch"),
-                "legion": fm.get("legion"),
-                "instance_type": fm.get("instance_type"),
+                "persona_slug": fm.get("persona_slug") or fm.get("persona") or fm.get("legion"),
+                "golden_throne": fm.get("golden_throne") or fm.get("instance_type"),
                 "head": head,
                 "created_at": created,
                 "session_date": session_date,

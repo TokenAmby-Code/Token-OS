@@ -164,7 +164,7 @@ def find_live_custodes() -> dict | None:
             continue
         persona = inst.get("persona") or {}
         runtime = inst.get("runtime") or {}
-        live_by_tmux = runtime.get("live_pane") is True or bool(runtime.get("tmux_pane"))
+        live_by_tmux = runtime.get("live") is True or bool(runtime.get("pane_id"))
         durable_status = inst.get("durable_status", inst.get("status"))
         if (
             persona.get("slug") == "custodes"
@@ -192,8 +192,7 @@ def reconcile_custodes_active(inst: dict) -> dict:
     if not instance_id:
         return {"reconciled": False, "reason": "no_instance_id"}
     results: dict = {
-        "type": _patch(f"/api/instances/{instance_id}/type", {"instance_type": "sync"}),
-        "synced": _patch(f"/api/instances/{instance_id}/synced", {"synced": True}),
+        "golden_throne": _patch(f"/api/instances/{instance_id}/golden-throne", {"mode": "sync"}),
     }
     logger.info("Morning session: set sync mode on custodes %s", instance_id[:12])
     return {"reconciled": True, "instance_id": instance_id, "results": results}
@@ -225,7 +224,7 @@ def confirm_custodes_registered(
     while True:
         inst = find_live_custodes()
         if inst is not None:
-            inst_pane = (inst.get("runtime") or {}).get("tmux_pane")
+            inst_pane = (inst.get("runtime") or {}).get("pane_id")
             if exclude_pane_id and inst_pane == exclude_pane_id:
                 if time.monotonic() - start >= budget:
                     return {
@@ -241,7 +240,7 @@ def confirm_custodes_registered(
                 continue
             recon = reconcile_custodes_active(inst)
             # The canonical surface carries the live pane under `runtime`, not a
-            # top-level tmux_pane (pane identity is never durably stored).
+            # top-level pane id (pane identity is never durably stored).
             return {
                 "live": True,
                 "instance_id": inst.get("id"),

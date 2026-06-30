@@ -163,8 +163,8 @@ else
         echo "Error: TMUX_PANE is not set; run this inside an active tmux pane" >&2
         exit 2
     fi
-    RESPONSE=$(jq -n --arg tmux_pane "$TMUX_PANE_ID" --arg tab_name "$NAME" \
-        '{tmux_pane: $tmux_pane, tab_name: $tab_name}' \
+    RESPONSE=$(jq -n --arg pane_id "$TMUX_PANE_ID" --arg name "$NAME" \
+        '{pane_id: $pane_id, name: $name}' \
         | curl -s -X POST "$API_URL/api/instance/rename" \
             -H "Content-Type: application/json" \
             --data-binary @- 2>/dev/null || true)
@@ -177,7 +177,7 @@ if [[ -n "$EXPLICIT_ID" ]]; then
         exit 1
     fi
 
-    RESPONSE=$(jq -n --arg tab_name "$NAME" '{tab_name: $tab_name}' \
+    RESPONSE=$(jq -n --arg name "$NAME" '{name: $name}' \
         | curl -s -X PATCH "$API_URL/api/instances/$INSTANCE_ID/rename" \
             -H "Content-Type: application/json" \
             --data-binary @- 2>/dev/null || true)

@@ -1159,8 +1159,8 @@ MORNING_KEEPALIVE_PROMPT = (
     "AskUserQuestion to keep things moving — advance the regiment/plan, prompt the "
     "Emperor, pace yourself by blocking on AskUserQuestion between phases. This "
     "session stays alive until the Emperor officially ends it; when he does, call "
-    "`POST /api/morning/end` (or PATCH /api/instances/{{id}}/type to one_off as a "
-    "rip cord) to exit the loop."
+    "`POST /api/morning/end` (or PATCH /api/instances/{{id}}/golden-throne "
+    'with {"mode":"off"} as a rip cord) to exit the loop.'
 )
 
 # Sent ONCE to the morning pane when the {hours}-hour bound trips. It is a notice,
