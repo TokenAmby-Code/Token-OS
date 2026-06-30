@@ -87,6 +87,11 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Emit JSON result instead of human text",
     )
+    parser.add_argument(
+        "--idempotency-key",
+        default=None,
+        help="Explicit per-operation retry key; same key+target+payload replays without re-sending bytes",
+    )
     parser.add_argument("message", help="The message body")
     args = parser.parse_args(argv)
 
@@ -99,6 +104,7 @@ def main(argv: list[str]) -> int:
         "pages": args.page,
         "payload": args.message,
         "ephemeral": args.ephemeral,
+        "idempotency_key": args.idempotency_key,
     }
     try:
         result = _post("/api/brief/send", body, timeout=60.0)

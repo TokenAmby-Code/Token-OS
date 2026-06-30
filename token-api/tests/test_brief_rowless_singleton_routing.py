@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +33,7 @@ async def test_brief_rowless_live_codex_singleton_uses_tmuxctl_fallback(
 
     sent = []
 
-    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False):
+    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False, **_kwargs):
         sent.append((pane, payload, clear_prompt))
         return {
             "returncode": 0,
@@ -163,9 +164,85 @@ async def test_brief_registry_row_path_still_uses_queue(
             "purpose": "brief_send",
             "payload": "row path",
             "hook_driven": True,
+            "operation_id": None,
         }
     ]
     assert "fallback" not in result["resolved"][0]
+
+
+@pytest.mark.asyncio
+async def test_brief_explicit_idempotency_key_reuses_queue_id(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Brief retries with the same explicit key are per-id, not blind re-sends."""
+    main = app_env.main
+    target = {
+        "pane_id": "%46",
+        "position_id": "council:custodes",
+        "source": "pane",
+        "spec": "council:custodes",
+    }
+
+    async def _targets(**_kwargs):
+        return [target], []
+
+    async def _row(_pane):
+        return {"id": "custodes-row", "engine": "claude"}
+
+    async def _resolve_instance_pane(_instance_id):
+        return None, ""
+
+    async def _resolve_tmux_pane_id(pane):
+        return "%46" if pane == "%46" else None
+
+    async def _no_pending(_pane):
+        return False
+
+    physical_sends: list[tuple[str, str, str | None]] = []
+
+    async def _send(pane, payload, *, clear_prompt=False, operation_id=None, **_kwargs):
+        physical_sends.append((pane, payload, operation_id))
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "verification_status": "submitted",
+            "verified_by": "UserPromptSubmit",
+            "operation_id": operation_id,
+        }
+
+    hook_flags: list[tuple[str, str]] = []
+
+    async def _flag(instance_id, *, tmux_pane, actor):
+        hook_flags.append((instance_id, actor))
+
+    monkeypatch.setattr(main.talk_service, "resolve_brief_targets", _targets)
+    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _row)
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_instance_pane)
+    monkeypatch.setattr(main.shared, "resolve_tmux_pane_id", _resolve_tmux_pane_id)
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending)
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
+    monkeypatch.setattr(main, "_flag_hook_driven", _flag)
+
+    req = main.BriefSendRequest(
+        panes=["council:custodes"], payload="row path", idempotency_key="same-op"
+    )
+    first = await main.brief_send(req)
+    second = await main.brief_send(req)
+
+    assert first["delivered"] == second["delivered"] == 1
+    assert len(physical_sends) == 1
+    operation_id = physical_sends[0][2]
+    assert operation_id is not None
+    assert first["resolved"][0]["queue_id"] == second["resolved"][0]["id"] == operation_id
+    assert hook_flags == [("%46", "enqueue:brief")]
+    with sqlite3.connect(main.DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, status, payload FROM pane_write_queue WHERE id = ?",
+            (operation_id,),
+        ).fetchall()
+    assert rows == [(operation_id, main.PANE_WRITE_SENT, "row path")]
 
 
 @pytest.mark.asyncio
@@ -195,7 +272,7 @@ async def test_talk_rowless_live_codex_singleton_requires_verified_submit(
 
     sent = []
 
-    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False):
+    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False, **_kwargs):
         sent.append((pane, payload, clear_prompt))
         return {
             "returncode": 0,

@@ -394,6 +394,22 @@ def _prompt_payload_hash(prompt: str) -> str:
     return hashlib.sha256(re.sub(r"[\r\n]+", " ", prompt).rstrip().encode("utf-8")).hexdigest()
 
 
+def _scoped_send_operation_id(
+    namespace: str, key: str | None, pane: str, payload: str
+) -> str | None:
+    """Build a per-send operation id only when the caller supplies a key."""
+    if not (key or "").strip():
+        return None
+    digest = hashlib.sha256(
+        json.dumps(
+            {"namespace": namespace, "key": key, "pane": pane, "payload": payload},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"{namespace}:{digest}"
+
+
 async def _tmuxctl_send_text_fallback(
     tmux_pane: str,
     prompt: str,
@@ -493,6 +509,7 @@ async def send_prompt_to_pane(
     clear_prompt: bool = False,
     submit: bool = True,
     verify: bool = True,
+    operation_id: str | None = None,
 ) -> dict:
     """Token-API pane prompt facade: tmuxctld is the only local byte boundary."""
     daemon_payload = await asyncio.to_thread(
@@ -505,6 +522,7 @@ async def send_prompt_to_pane(
             "submit": submit,
             "verify": verify,
             "verify_timeout": 6.0,
+            "operation_id": operation_id or "",
         },
         timeout=12,
         default_loopback=_tmuxctld_default_loopback(),
@@ -536,6 +554,7 @@ async def send_prompt_to_pane(
         "stderr": "",
         "operation": "tmuxctld.send_text",
         "dispatch_id": result.get("dispatch_id") or str(uuid.uuid4()),
+        "operation_id": result.get("operation_id") or operation_id,
         "payload_hash": result.get("payload_hash") or _prompt_payload_hash(prompt),
         "gated": False,
         "verification_status": result.get("verification_status") or "unverified",
@@ -543,6 +562,8 @@ async def send_prompt_to_pane(
         "guard_held": bool(result.get("guard_held")),
         "swallowed_submit_detected": bool(result.get("swallowed_submit_detected")),
         "recovery_attempts": int(result.get("recovery_attempts") or 0),
+        "recovery_submit_credited": bool(result.get("recovery_submit_credited")),
+        "idempotent_replay": bool(result.get("idempotent_replay")),
         "failures": result.get("failures") if isinstance(result.get("failures"), list) else [],
         "pane": tmux_pane,
         "instance_id": result.get("instance_id"),
@@ -1069,6 +1090,7 @@ class BriefSendRequest(BaseModel):
     pages: list[str] = Field(default_factory=list)
     payload: str = Field(..., min_length=1)
     ephemeral: bool = False
+    idempotency_key: str | None = None
 
 
 class ProfileResponse(BaseModel):
@@ -5782,27 +5804,44 @@ async def enqueue_pane_write(
     purpose: str,
     payload: str,
     hook_driven: bool = False,
+    operation_id: str | None = None,
 ) -> dict:
     if not (tmux_pane or "").strip():
         raise ValueError("pane write requires a concrete tmux pane target")
-    # Caller-classified autonomous wake: flag the target BEFORE the write lands so
-    # its PromptSubmit observes hook_driven=1 (read-time discount). See classification
-    # table — Emperor-proxied (Custodes-out) / direct-Emperor sends pass hook_driven=False.
-    if hook_driven:
-        await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=f"enqueue:{source}")
-    queue_id = str(uuid.uuid4())
+    queue_id = operation_id or str(uuid.uuid4())
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO pane_write_queue (
-                id, instance_id, tmux_pane, source, purpose, payload,
-                status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-            """,
-            (queue_id, instance_id, tmux_pane, source, purpose, payload, now, now),
-        )
-        await db.commit()
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute(
+                """
+                INSERT INTO pane_write_queue (
+                    id, instance_id, tmux_pane, source, purpose, payload,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (queue_id, instance_id, tmux_pane, source, purpose, payload, now, now),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            cursor = await db.execute("SELECT * FROM pane_write_queue WHERE id = ?", (queue_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise
+            existing = dict(row)
+            if (
+                existing.get("instance_id") != instance_id
+                or existing.get("tmux_pane") != tmux_pane
+                or existing.get("payload") != payload
+            ):
+                raise ValueError("pane write operation_id reused for different target/payload")
+            return existing
+    # Caller-classified autonomous wake: flag the target for newly accepted rows only.
+    # Explicit operation-id replays return the existing row above and must not replay
+    # hook-driven side effects. See classification table — Emperor-proxied
+    # (Custodes-out) / direct-Emperor sends pass hook_driven=False.
+    if hook_driven:
+        await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=f"enqueue:{source}")
     return {
         "id": queue_id,
         "instance_id": instance_id,
@@ -5883,6 +5922,7 @@ async def _tmux_send_payload_then_submit(
     *,
     clear_prompt: bool = False,
     enable_skill_sink: bool = False,
+    operation_id: str | None = None,
 ) -> dict:
     """Backward-compatible prompt send wrapper; local delivery is tmuxctld only.
 
@@ -5890,7 +5930,9 @@ async def _tmux_send_payload_then_submit(
     longer renders/sinks skills itself. Structured skill/command callers must use
     ``send_skill_to_pane`` / ``send_command_to_pane``.
     """
-    return await send_prompt_to_pane(tmux_pane, payload, clear_prompt=clear_prompt)
+    return await send_prompt_to_pane(
+        tmux_pane, payload, clear_prompt=clear_prompt, operation_id=operation_id
+    )
 
 
 async def _pane_write_instance_engine(instance_id: str) -> str:
@@ -6012,10 +6054,12 @@ async def process_pane_write_queue_once(
                 )
             elif clear_replace_source:
                 send_result = await _tmux_send_payload_then_submit(
-                    pane, item["payload"], clear_prompt=True
+                    pane, item["payload"], clear_prompt=True, operation_id=item["id"]
                 )
             else:
-                send_result = await _tmux_send_payload_then_submit(pane, item["payload"])
+                send_result = await _tmux_send_payload_then_submit(
+                    pane, item["payload"], operation_id=item["id"]
+                )
             if send_result.get("gated"):
                 # Gate suppressed the send (no bytes issued). Keep the item
                 # pending so the periodic worker flushes it when the gate
@@ -12984,6 +13028,7 @@ async def _direct_tmux_pane_delivery(
     source: str,
     purpose: str,
     clear_prompt: bool = False,
+    operation_id: str | None = None,
 ) -> dict:
     """Deliver directly to a live pane when no registry row exists.
 
@@ -13011,6 +13056,7 @@ async def _direct_tmux_pane_delivery(
         pane,
         payload,
         clear_prompt=clear_prompt,
+        operation_id=operation_id,
     )
     if send_result.get("gated"):
         # Direct rowless sends have no registry row, but they still must not
@@ -13025,6 +13071,7 @@ async def _direct_tmux_pane_delivery(
             source=source,
             purpose=purpose,
             payload=payload,
+            operation_id=operation_id,
         )
         drained = await process_pane_write_queue_once(queued["id"])
         result = drained[0] if drained else queued
@@ -13243,6 +13290,9 @@ async def brief_send(request: BriefSendRequest):
     delivered: list[dict] = []
     for target in resolved:
         pane_id = target["pane_id"]
+        operation_id = _scoped_send_operation_id(
+            "brief", request.idempotency_key, pane_id, request.payload
+        )
         try:
             if request.ephemeral:
                 # Reuse the temp_message semantic side-channel infra. The
@@ -13273,6 +13323,7 @@ async def brief_send(request: BriefSendRequest):
                         source="brief",
                         purpose="brief_send",
                         clear_prompt=True,
+                        operation_id=operation_id,
                     )
                 else:
                     queued = await enqueue_pane_write(
@@ -13282,6 +13333,7 @@ async def brief_send(request: BriefSendRequest):
                         purpose="brief_send",
                         payload=request.payload,
                         hook_driven=brief_hook_driven,
+                        operation_id=operation_id,
                     )
                     drained = await process_pane_write_queue_once(queued["id"])
                     receipt = drained[0] if drained else queued

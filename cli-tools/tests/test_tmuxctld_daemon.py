@@ -622,6 +622,91 @@ def test_send_text_reports_unverified_without_prompt_submit_ack() -> None:
         server.shutdown()
 
 
+class RecoveryClearsDraftAdapter(SendAckAdapter):
+    """First verify sees a stuck draft; recovery C-m clears it."""
+
+    capture_calls = 0
+
+    def capture_pane(self, pane_id: str, *, lines: int = 10) -> str:
+        type(self).capture_calls += 1
+        return (
+            "do the thing\n" if type(self).capture_calls == 1 else "submitted prompt left composer"
+        )
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        return "inst-recovered" if option == "@INSTANCE_ID" else ""
+
+
+def test_send_text_credits_recovery_path_submit_when_draft_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A swallowed Enter recovered by C-m is a submitted send, not unverified."""
+    RecoveryClearsDraftAdapter.calls = []
+    RecoveryClearsDraftAdapter.capture_calls = 0
+    monkeypatch.setattr(daemon, "_notify_swallowed_submit", lambda **_kwargs: None)
+    server, _ = _serve(RecoveryClearsDraftAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "submit_settle_seconds": 0,
+                "ack_submit_retries": 1,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+        assert result["verification_status"] == "submitted"
+        assert result["verified_by"] == "UserPromptSubmit"
+        assert result["swallowed_submit_detected"] is True
+        assert result["recovery_attempts"] == 1
+        physical_submits = [
+            c for c in RecoveryClearsDraftAdapter.calls if c == ("send-keys", "-t", "%42", "C-m")
+        ]
+        assert len(physical_submits) == 3  # initial submit pair + one recovery C-m
+    finally:
+        server.shutdown()
+
+
+class CountingSendAdapter(SendAckAdapter):
+    literal_count = 0
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:1] == ("send-keys",) and "-l" in args:
+            type(self).literal_count += 1
+        return super().run(*args, allow_failure=allow_failure)
+
+
+def test_send_text_operation_id_is_idempotent_after_unverified_result() -> None:
+    """Retrying the same per-id operation must not issue bytes twice."""
+    CountingSendAdapter.calls = []
+    CountingSendAdapter.literal_count = 0
+    server, _ = _serve(CountingSendAdapter)
+    body = {
+        "pane": "%42",
+        "text": "do the thing",
+        "verify": True,
+        "verify_timeout": 0.01,
+        "submit_settle_seconds": 0,
+        "operation_id": "op-regression-477",
+    }
+    try:
+        first_status, first_payload = _post_timeout(server, "/send-text", body, timeout=5)
+        second_status, second_payload = _post_timeout(server, "/send-text", body, timeout=5)
+        assert first_status == second_status == 200
+        assert first_payload["result"]["verification_status"] == "unverified"
+        assert second_payload["result"]["verification_status"] == "unverified"
+        assert second_payload["result"]["idempotent_replay"] is True
+        assert CountingSendAdapter.literal_count == 1
+    finally:
+        server.shutdown()
+
+
 def test_invoke_skill_submit_uses_shared_send_core_with_codex_tab() -> None:
     SendAckAdapter.calls = []
     server, _ = _serve(SendAckAdapter)
