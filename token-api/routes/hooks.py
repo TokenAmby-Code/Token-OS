@@ -2859,9 +2859,6 @@ async def handle_session_start(payload: dict) -> dict:
     dispatch_mode = _normalize_text(
         payload.get("dispatch_mode") or env.get("TOKEN_API_DISPATCH_MODE", "")
     )
-    dispatch_slot = _normalize_text(
-        payload.get("dispatch_slot") or env.get("TOKEN_API_DISPATCH_SLOT", "")
-    )
     dispatch_session_doc_path = _normalize_text(
         payload.get("dispatch_session_doc_path")
         or env.get("TOKEN_API_DISPATCH_SESSION_DOC_PATH", "")
@@ -3974,7 +3971,6 @@ async def handle_session_start(payload: dict) -> dict:
             working_dir=working_dir,
             target_working_dir=target_working_dir,
         )
-        dispatch_bound_doc = session_doc_policy == "dispatch_explicit"
         await _apply_instance_workflow_state(
             db,
             instance_id=session_id,
