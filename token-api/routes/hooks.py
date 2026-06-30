@@ -620,6 +620,7 @@ async def _apply_commander_binding(
     dispatch_target: str | None,
     parent_instance_id: str | None,
     dispatch_mode: str | None = None,
+    dispatch_legion: str | None = None,
 ) -> None:
     """Set durable commander semantics from SessionStart context.
 
@@ -672,9 +673,12 @@ async def _apply_commander_binding(
     target = (_normalize_text(dispatch_target) or "").lower()
     commander_slug = None
     if target == "mechanicus:new":
-        # Mechanicus is the single merged worker stack; the Fabricator-General
-        # anchors it and commands every freshly dispatched worker.
-        commander_slug = "fabricator-general"
+        legion = (_normalize_text(dispatch_legion) or "").lower()
+        # mechanicus:new is the shared worker launcher.  Durable commander
+        # routing follows the launch legion's live singleton: Civic workers
+        # report to the Civic Orchestrator, while Mechanicus-legion workers
+        # preserve the historical Fabricator-General binding.
+        commander_slug = "orchestrator" if legion == "civic" else "fabricator-general"
     if not commander_slug:
         return
     commander_persona_id = await _persona_id_by_slug(db, commander_slug)
@@ -3379,6 +3383,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_target=dispatch_target,
                     parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
+                    dispatch_legion=dispatch_legion,
                 )
                 persona_display_name = await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
@@ -3452,6 +3457,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_target=dispatch_target,
                     parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
+                    dispatch_legion=dispatch_legion,
                 )
                 await db.commit()
                 cursor = await db.execute(
@@ -3561,6 +3567,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_target=dispatch_target,
                     parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
+                    dispatch_legion=dispatch_legion,
                 )
                 persona_display_name = await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
@@ -3595,6 +3602,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_target=dispatch_target,
                     parent_instance_id=_effective_parent(existing_parent_id),
                     dispatch_mode=dispatch_mode,
+                    dispatch_legion=dispatch_legion,
                 )
                 await db.commit()
                 try:
@@ -3766,6 +3774,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_target=dispatch_target,
                     parent_instance_id=_effective_parent(old_parent_id),
                     dispatch_mode=dispatch_mode,
+                    dispatch_legion=dispatch_legion,
                 )
                 persona_display_name = await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
@@ -3786,6 +3795,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_target=dispatch_target,
                     parent_instance_id=_effective_parent(old_parent_id),
                     dispatch_mode=dispatch_mode,
+                    dispatch_legion=dispatch_legion,
                 )
                 # Auto-link primarch session doc if applicable
                 session_doc_id = resolved_session_doc_id or old_inst["session_doc_id"]
@@ -4132,6 +4142,7 @@ async def handle_session_start(payload: dict) -> dict:
             dispatch_target=dispatch_target,
             parent_instance_id=parent_instance_id,
             dispatch_mode=dispatch_mode,
+            dispatch_legion=dispatch_legion,
         )
         persona_display_name = await _apply_persona_seat_name(
             db, instance_id=session_id, persona_identity=persona_identity
@@ -4305,6 +4316,7 @@ async def handle_session_start(payload: dict) -> dict:
             dispatch_target=dispatch_target,
             parent_instance_id=parent_instance_id,
             dispatch_mode=dispatch_mode,
+            dispatch_legion=dispatch_legion,
         )
         await db.commit()
 
