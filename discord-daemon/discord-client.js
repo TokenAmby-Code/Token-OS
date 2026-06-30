@@ -10,6 +10,27 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, '..', 'config.json');
 const ENV_PATH = join(process.env.HOME, '.discord-cli', '.env');
+export const MAX_DISCORD_CONTENT_LENGTH = 2000;
+
+export function splitDiscordContent(content, maxLength = MAX_DISCORD_CONTENT_LENGTH) {
+  const text = String(content ?? '');
+  if (text.length <= maxLength) return [text];
+
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLength) {
+    let splitAt = remaining.lastIndexOf('\n', maxLength);
+    if (splitAt < Math.floor(maxLength * 0.75)) {
+      splitAt = remaining.lastIndexOf(' ', maxLength);
+    }
+    if (splitAt < 1) splitAt = maxLength;
+
+    chunks.push(remaining.slice(0, splitAt).trimEnd());
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
+}
 
 // Load .env file into a map (does not pollute process.env)
 function loadEnvFile() {
@@ -296,16 +317,24 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
     async sendMessage(channelId, content, options = {}) {
       const channel = await client.channels.fetch(channelId);
       if (!channel) throw new Error(`Channel ${channelId} not found`);
-      const sendOpts = { content };
-      if (options.embeds) sendOpts.embeds = options.embeds;
-      if (options.reply_to) {
-        sendOpts.reply = { messageReference: options.reply_to };
+
+      const chunks = splitDiscordContent(content);
+      const sent = [];
+      for (let i = 0; i < chunks.length; i += 1) {
+        const sendOpts = { content: chunks[i] };
+        if (i === 0 && options.embeds) sendOpts.embeds = options.embeds;
+        if (i === 0 && options.reply_to) {
+          sendOpts.reply = { messageReference: options.reply_to };
+        }
+        sent.push(await channel.send(sendOpts));
       }
-      const msg = await channel.send(sendOpts);
+      const msg = sent[0];
       return {
         message_id: msg.id,
         channel_id: msg.channelId,
         timestamp: msg.createdAt.toISOString(),
+        chunk_count: sent.length,
+        chunks: sent.map(m => m.id),
       };
     },
 
