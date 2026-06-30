@@ -232,3 +232,50 @@ async def test_hook_effect_failure_does_not_reclassify_sent_event(
     assert result["status"] == main.PANE_WRITE_SENT
     assert result["hook_effect_error"] == "flag db busy"
     assert _queue_row(app_env.db_path, queued["id"])[0] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_operation_id_reuse_with_flipped_hook_driven_is_rejected(
+    app_env: Any,
+) -> None:
+    """The deferred hook_driven effect is part of an operation's identity.
+
+    A reuse of the same operation_id + target + payload but a different
+    hook_driven value must not silently release the first row's stored effect;
+    it is a different operation and is rejected like a target/payload mismatch.
+    """
+    main = app_env.main
+
+    first = await main.enqueue_pane_write(
+        instance_id="fg-atomic",
+        tmux_pane="%9",
+        source="brief",
+        purpose="brief_send",
+        payload="same payload",
+        hook_driven=True,
+        operation_id="op-flip",
+    )
+    assert first["id"] == "op-flip"
+
+    with pytest.raises(ValueError, match="different target/payload/effects"):
+        await main.enqueue_pane_write(
+            instance_id="fg-atomic",
+            tmux_pane="%9",
+            source="brief",
+            purpose="brief_send",
+            payload="same payload",
+            hook_driven=False,
+            operation_id="op-flip",
+        )
+
+    # An identical replay (same hook_driven) still dedupes onto the original row.
+    replay = await main.enqueue_pane_write(
+        instance_id="fg-atomic",
+        tmux_pane="%9",
+        source="brief",
+        purpose="brief_send",
+        payload="same payload",
+        hook_driven=True,
+        operation_id="op-flip",
+    )
+    assert replay["id"] == "op-flip"

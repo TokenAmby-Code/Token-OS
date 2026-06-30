@@ -5858,12 +5858,25 @@ async def enqueue_pane_write(
             if row is None:
                 raise
             existing = dict(row)
+            # event_payload_json now carries the deferred hook_driven effect that is
+            # replayed at release, so it is part of the operation's identity: a reuse
+            # that flips hook_driven would otherwise silently release the first row's
+            # stored effect. Treat an effect mismatch as a different operation too.
+            try:
+                existing_effects = (
+                    json.loads(existing.get("event_payload_json") or "{}") or {}
+                ).get("effects") or {}
+            except Exception:  # noqa: BLE001
+                existing_effects = {}
             if (
                 existing.get("instance_id") != instance_id
                 or existing.get("tmux_pane") != tmux_pane
                 or existing.get("payload") != payload
+                or bool(existing_effects.get("hook_driven")) != bool(hook_driven)
             ):
-                raise ValueError("pane write operation_id reused for different target/payload")
+                raise ValueError(
+                    "pane write operation_id reused for different target/payload/effects"
+                )
             return existing
     # Event-level pause contract: the whole send event (text + submit intent +
     # attached hook_driven effect) is stored with the row in event_payload_json and
