@@ -73,6 +73,16 @@ DEFAULT_PORT = 7778
 # "Pane is dead" now that the old correctness poll is retired.
 _PANE_DIED_HOOK = 'run-shell "tmux-run tmux-pane-respawn #{pane_id}"'
 
+# The global pane-died hook can vanish under the daemon: a live ``tmux source-file``
+# or a hook-clear during a workspace reload drops it, and then a dying must-fill
+# seat or one-off slot strands at "Pane is dead" with nothing to reassert it (the
+# witnessed regression). The hook is therefore re-asserted PERIODICALLY, not only
+# at daemon boot. The re-assertion rides the /health heartbeat the watchdog already
+# polls (no new poller — the daemon's reconcile-poll ban stands) and is throttled
+# to this interval so a healthy daemon re-installs the idempotent hook cheaply and
+# self-heals within one interval of any clear.
+_HOOK_REASSERT_INTERVAL_SECONDS = 60.0
+
 # The daemon is unauthenticated and does powerful tmux ops — it binds loopback
 # ONLY. serve() refuses any other --host (fail-closed).
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -1344,14 +1354,24 @@ def _h_hook_wrapperend(control, params):
         }
 
     pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
-    result = control.clear_runtime(pane)
-    reap = control.reap_dead_husk(pane, pane_role=pane_label)
+    window_name = control.adapter.run(
+        "display-message", "-t", pane, "-p", "#{window_name}", allow_failure=True
+    ).strip()
+    # Class-gated teardown — the SAME unified router the pane-died hook uses. A
+    # pre-allocated palace/somnium SLOT is cleared IN PLACE and preserved (the
+    # morning over-reap culled such a slot); only a dynamically-created WORKER is
+    # culled. This scrubs the runtime exactly once (inside the router).
+    teardown = control.teardown_pane(
+        pane, pane_label=pane_label, window_name=window_name, source="wrapperend"
+    )
+    reap = teardown.get("result") if isinstance(teardown, dict) else None
     return {
         "status": "cleared",
         "wrapper_launch_id": wrapper_launch_id,
-        "pane": result.get("pane", pane) if isinstance(result, dict) else pane,
+        "pane": (reap or {}).get("pane", pane),
         "pane_label": pane_label,
         "reap": reap,
+        "teardown": teardown,
     }
 
 
@@ -2018,6 +2038,29 @@ class TmuxctldServer(ThreadingHTTPServer):
         self.sha = sha
         self.advertised_port = advertised_port or server_address[1]
         self.ready = threading.Event()
+        # Throttle state for the /health-driven lifecycle-hook re-assertion. A
+        # 0.0 deadline forces the re-install on the first health check after boot.
+        self._hook_reassert_lock = threading.Lock()
+        self._hook_reassert_deadline = 0.0
+
+    def maybe_reassert_lifecycle_hooks(self) -> bool:
+        """Re-install the tmux lifecycle hooks if the throttle interval has elapsed.
+
+        Rides the /health heartbeat instead of a dedicated poller. Returns True
+        when a re-assertion was performed this call (so it ran), False when the
+        throttle suppressed it. ``ensure_tmux_lifecycle_hooks`` is idempotent and
+        non-fatal, and any failure is swallowed so /health never breaks.
+        """
+        now = time.monotonic()
+        with self._hook_reassert_lock:
+            if now < self._hook_reassert_deadline:
+                return False
+            self._hook_reassert_deadline = now + _HOOK_REASSERT_INTERVAL_SECONDS
+        try:
+            ensure_tmux_lifecycle_hooks()
+        except Exception:  # never let a hook re-install break the health contract
+            log.exception("tmux lifecycle hook re-assertion failed")
+        return True
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
         """Run the accept loop, signalling :attr:`ready` once we own the socket.
@@ -2076,6 +2119,9 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
 
         # /health is the one un-enveloped surface (satellite/watchdog contract).
         if method == "GET" and path == "/health":
+            # Durably keep the global pane-died hook installed by riding this
+            # heartbeat (throttled; idempotent) — no dedicated reconcile poller.
+            self.server.maybe_reassert_lifecycle_hooks()
             self._write(200, self._health_payload())
             return
 

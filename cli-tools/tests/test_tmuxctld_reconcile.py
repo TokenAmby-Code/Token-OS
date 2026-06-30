@@ -94,19 +94,102 @@ def test_handle_event_persona_seat_reseats_via_assert_instance() -> None:
     assert out["pane_label"] == "council:custodes"
 
 
-def test_handle_event_non_must_fill_pane_is_ignored() -> None:
-    # The council true-terminal is a plain shell — no vacancy policy applies.
-    control = _control({"@PANE_ID": "council:true-terminal", "@PANE_TYPE": "council"})
+def test_handle_event_fill_if_row_stack_worker_is_ignored() -> None:
+    # A FILL_IF_ROW stack worker is reconciled by the stack sweep / the bash
+    # mechanicus pane-died branch — handle_event no-ops it (never reaches router).
+    control = _control({"@PANE_ID": "mechanicus:3", "@PANE_TYPE": "stack-worker"})
 
     def fake_resolve(adapter, target, session_name=None):
-        return SimpleNamespace(pane_id="%9", pane_role="council:true-terminal")
+        return SimpleNamespace(pane_id="%4", pane_role="mechanicus:3")
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(service, "resolve_pane", fake_resolve)
-        out = control.handle_event("pane-died", pane="council:true-terminal")
+        out = control.handle_event("pane-died", pane="mechanicus:3")
 
     assert out["action"] == "ignored"
     assert "not_must_fill" in out["reason"]
+
+
+class RouterAdapter(FakeAdapter):
+    """FakeAdapter that answers the teardown router's tmux probes + records effects."""
+
+    def __init__(self, *, window_name: str, pane_dead: bool = True, options=None) -> None:
+        super().__init__(options or {})
+        self.window_name = window_name
+        self._pane_dead = pane_dead
+        self.exists = True
+        self.cleared: list[str] = []
+        self.calls: list[tuple] = []
+
+    def clear_runtime_state(self, target: str) -> None:
+        self.cleared.append(target)
+
+    def run(self, *args, allow_failure: bool = False) -> str:
+        self.calls.append(tuple(args))
+        if args and args[-1] == "#{window_name}":
+            return self.window_name
+        if args and args[-1] == "#{pane_dead}":
+            return "1" if self._pane_dead else "0"
+        if args and args[-1] == "#{pane_id}":
+            return args[2] if self.exists else ""
+        if args[:2] == ("kill-pane", "-t"):
+            self.exists = False
+            return ""
+        if args[:1] == ("respawn-pane",):
+            self._pane_dead = False
+            return ""
+        return ""
+
+    @property
+    def killed(self) -> bool:
+        return any(c[:1] == ("kill-pane",) for c in self.calls)
+
+    @property
+    def respawned(self) -> bool:
+        return any(c[:1] == ("respawn-pane",) for c in self.calls)
+
+
+def test_handle_event_palace_slot_is_cleared_in_place_not_culled() -> None:
+    # A completed one-off worker in a pre-allocated palace slot: the slot is
+    # cleared IN PLACE and revived — PRESERVED, NOT culled (the morning over-reap).
+    adapter = RouterAdapter(
+        window_name="palace", pane_dead=True, options={"@PANE_ID": "palace:N", "@PANE_TYPE": ""}
+    )
+    control = TmuxControlPlane(adapter=adapter)
+
+    def fake_resolve(a, target, session_name=None):
+        return SimpleNamespace(pane_id="%7", pane_role="palace:N")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(service, "resolve_pane", fake_resolve)
+        out = control.handle_event("pane-died", pane="palace:N", session="main")
+
+    assert out["ok"] is True
+    assert out["action"] == "cleared_in_place"
+    assert out["pane_class"] == "slot"
+    assert adapter.killed is False  # slot preserved
+    assert adapter.respawned is True  # revived in place -> back to freelist
+    assert adapter.cleared == ["%7"]
+
+
+def test_handle_event_dynamic_worker_is_culled() -> None:
+    adapter = RouterAdapter(
+        window_name="mechanicus",
+        pane_dead=True,
+        options={"@PANE_ID": "mechanicus:7", "@PANE_TYPE": ""},
+    )
+    control = TmuxControlPlane(adapter=adapter)
+
+    def fake_resolve(a, target, session_name=None):
+        return SimpleNamespace(pane_id="%9", pane_role="mechanicus:7")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(service, "resolve_pane", fake_resolve)
+        out = control.handle_event("pane-died", pane="mechanicus:7")
+
+    assert out["action"] == "culled"
+    assert out["pane_class"] == "worker"
+    assert adapter.killed is True
 
 
 def test_handle_event_reservist_is_noted_not_acted() -> None:

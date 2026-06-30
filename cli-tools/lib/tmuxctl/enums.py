@@ -27,6 +27,20 @@ class PaneKind(str, Enum):
     TOMBSTONE = "tombstone"
 
 
+class PaneClass(str, Enum):
+    """Teardown CLASS of a pane — the single axis the unified teardown router acts on.
+
+    ``PERPETUAL`` — a persona singleton seat (revived/reseated, never torn down).
+    ``SLOT`` — a pre-allocated palace/somnium window pane (cleared IN PLACE and
+    preserved; never culled). ``WORKER`` — a dynamically-created pane outside the
+    fixed windows (culled).
+    """
+
+    PERPETUAL = "perpetual"
+    SLOT = "slot"
+    WORKER = "worker"
+
+
 class SeatVacancyPolicy(str, Enum):
     """How a vacated (runtime-dead) standing seat is treated by reconcile.
 
