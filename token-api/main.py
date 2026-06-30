@@ -5828,10 +5828,28 @@ async def enqueue_pane_write(
                 """
                 INSERT INTO pane_write_queue (
                     id, instance_id, tmux_pane, source, purpose, payload,
-                    status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    status, created_at, updated_at, event_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                 """,
-                (queue_id, instance_id, tmux_pane, source, purpose, payload, now, now),
+                (
+                    queue_id,
+                    instance_id,
+                    tmux_pane,
+                    source,
+                    purpose,
+                    payload,
+                    now,
+                    now,
+                    json.dumps(
+                        {
+                            "type": "pane_prompt_submit",
+                            "text": payload,
+                            "submit": True,
+                            "effects": {"hook_driven": bool(hook_driven)},
+                        },
+                        sort_keys=True,
+                    ),
+                ),
             )
             await db.commit()
         except aiosqlite.IntegrityError:
@@ -5847,12 +5865,14 @@ async def enqueue_pane_write(
             ):
                 raise ValueError("pane write operation_id reused for different target/payload")
             return existing
-    # Caller-classified autonomous wake: flag the target for newly accepted rows only.
-    # Explicit operation-id replays return the existing row above and must not replay
-    # hook-driven side effects. See classification table — Emperor-proxied
-    # (Custodes-out) / direct-Emperor sends pass hook_driven=False.
-    if hook_driven:
-        await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=f"enqueue:{source}")
+    # Event-level pause contract: the whole send event (text + submit intent +
+    # attached hook_driven effect) is stored with the row in event_payload_json and
+    # the effect is replayed only when the event is actually released to tmux. A
+    # gated/held event therefore has no premature hook_driven mark for a later send
+    # to observe. Explicit operation-id replays return the existing row above, so the
+    # stored effect is still released exactly once when that row is drained. See the
+    # classification table — Emperor-proxied (Custodes-out) / direct-Emperor sends
+    # pass hook_driven=False.
     return {
         "id": queue_id,
         "instance_id": instance_id,
@@ -6091,6 +6111,26 @@ async def process_pane_write_queue_once(
                 results.append(result)
                 continue
             terminal_status, terminal_error = _pane_send_terminal_status(send_result)
+            # Event-level pause contract: replay the held event's attached effects
+            # (currently hook_driven marking) only now that the event has actually
+            # been released to tmux. A gated/held event never reaches this point, so
+            # its side effects stay deferred until a real send goes out.
+            hook_effect_error = None
+            if terminal_status in {PANE_WRITE_SENT, PANE_WRITE_UNVERIFIED}:
+                try:
+                    event_payload = json.loads(item.get("event_payload_json") or "{}")
+                except Exception:  # noqa: BLE001
+                    event_payload = {}
+                effects = event_payload.get("effects") if isinstance(event_payload, dict) else {}
+                if isinstance(effects, dict) and effects.get("hook_driven"):
+                    try:
+                        await _flag_hook_driven(
+                            instance_id,
+                            tmux_pane=pane,
+                            actor=f"release:{item['source']}",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        hook_effect_error = str(exc)
             result = {
                 **base,
                 "status": terminal_status,
@@ -6098,6 +6138,8 @@ async def process_pane_write_queue_once(
             }
             if terminal_error and "reason" not in result:
                 result["reason"] = terminal_error
+            if hook_effect_error:
+                result["hook_effect_error"] = hook_effect_error
             await _mark_pane_write(
                 item["id"],
                 status=terminal_status,

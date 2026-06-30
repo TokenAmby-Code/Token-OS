@@ -245,7 +245,9 @@ async def test_brief_explicit_idempotency_key_reuses_queue_id(
     operation_id = physical_sends[0][2]
     assert operation_id is not None
     assert first["resolved"][0]["queue_id"] == second["resolved"][0]["id"] == operation_id
-    assert hook_flags == [("%46", "enqueue:brief")]
+    # Event-level pause defers the hook_driven effect to release: it still fires
+    # exactly once across the idempotent replay, now actored as the release.
+    assert hook_flags == [("%46", "release:brief")]
     with sqlite3.connect(main.DB_PATH) as conn:
         rows = conn.execute(
             "SELECT id, status, payload FROM pane_write_queue WHERE id = ?",

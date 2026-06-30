@@ -1281,9 +1281,13 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 sent_at TIMESTAMP,
                 cancelled_at TIMESTAMP,
                 last_error TEXT,
-                last_result_json TEXT
+                last_result_json TEXT,
+                event_payload_json TEXT
             )
         """)
+        pane_write_columns = await _table_columns(db, "pane_write_queue")
+        if "event_payload_json" not in pane_write_columns:
+            await db.execute("ALTER TABLE pane_write_queue ADD COLUMN event_payload_json TEXT")
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_pane_write_queue_pending
             ON pane_write_queue(status, created_at)
