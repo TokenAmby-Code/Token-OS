@@ -17,14 +17,6 @@ name: Bounty Board (advisory)
 # Imperium vault `Sessions/coherence-wave.md`.
 
 on:
-  pull_request:
-    branches: [main, prod]
-    types: [opened, synchronize, reopened, ready_for_review]
-  push:
-    branches: [main, prod]
-  schedule:
-    # 08:30 UTC daily — render the board once a day even with no merges.
-    - cron: "30 8 * * *"
   workflow_dispatch: {}
 
 permissions:
