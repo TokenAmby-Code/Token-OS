@@ -397,7 +397,7 @@ async def test_repair_legacy_active_persona_assignments(app_env):
 
         repaired = await personas.repair_legacy_instance_personas(db)
         await db.commit()
-        assert repaired == 3
+        assert repaired == 1
 
         cursor = await db.execute(
             """

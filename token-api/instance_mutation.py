@@ -67,20 +67,10 @@ INSTANCE_MUTATION_FIELDS = {
     "wrapper_launch_id",
     # runtime annex
     "input_lock",
-    "tts_voice",
-    "notification_sound",
     "session_doc_policy",
     "workflow_state",
     "workflow_updated_at",
     "workflow_blocked_reason",
-    "dispatch_target",
-    "dispatch_window",
-    "dispatch_mode",
-    "dispatch_slot",
-    "dispatch_session_doc_path",
-    "target_working_dir",
-    "launch_mode",
-    "launcher",
     "follow_up_sop",
     "zealotry",
     "gt_resume_count",
@@ -94,8 +84,6 @@ INSTANCE_MUTATION_FIELDS = {
     "discord_hosted",
     "discord_channel",
     "discord_bot",
-    "transplant_target_session",
-    "transplant_expected",
     "closure_surface",
     "closure_required",
     "stop_allowed",
@@ -817,14 +805,6 @@ def _collect_state_findings(row: dict) -> list[dict]:
                 "category": "state_drift",
                 "message": "dispatch continuity binding has no session_doc_id",
                 "fields": ["continuity_binding_source", "session_doc_id"],
-            }
-        )
-    if row.get("session_doc_policy") == "dispatch_explicit" and not row.get("dispatch_target"):
-        findings.append(
-            {
-                "category": "state_drift",
-                "message": "dispatch_explicit policy has no dispatch_target",
-                "fields": ["session_doc_policy", "dispatch_target"],
             }
         )
     return findings
