@@ -91,7 +91,8 @@ class TestRenameHitsInstances:
         # API reflects the new name.
         got = client.get(f"/api/instances/{instance_id}")
         assert got.status_code == 200, got.text
-        assert got.json()["tab_name"] == "civic-keeper"
+        assert got.json()["name"] == "civic-keeper"
+        assert "tab_name" not in got.json()
 
     def test_pane_scoped_rename_updates_instances_row(self, client, app_env, monkeypatch):
         """POST /api/instance/rename is what the `instance-name` CLI calls from a
@@ -152,6 +153,41 @@ class TestResolveHitsInstances:
         names = _table_names(conn)
         conn.close()
         assert "claude_instances" not in names
+
+    def test_live_instance_surfaces_do_not_emit_dead_aliases(self, client):
+        cwd = f"/tmp/surface-{uuid.uuid4()}"
+        instance_id = _session_start(client, cwd=cwd)
+        dead = {
+            "tab_name",
+            "profile_name",
+            "tts_voice",
+            "notification_sound",
+            "pane_tint",
+            "instance_type",
+            "parent_instance_id",
+            "color",
+            "chip_color",
+            "dispatch_target",
+            "dispatch_window",
+            "dispatch_mode",
+            "dispatch_slot",
+            "dispatch_session_doc_path",
+            "target_working_dir",
+            "launch_mode",
+            "launcher",
+            "transplant_target_session",
+            "transplant_expected",
+        }
+
+        list_body = client.get("/api/instances", params={"include_runtime": "false"}).json()
+        listed = next(row for row in list_body if row["id"] == instance_id)
+        detail = client.get(f"/api/instances/{instance_id}").json()
+        resolved = client.get("/api/instances/resolve", params={"cwd": cwd}).json()
+
+        for body in (listed, detail, resolved):
+            assert body["id"] == instance_id
+            assert not (dead & set(body.keys()))
+            assert "persona" in body
 
     def test_pane_instance_lookup_returns_from_instances(self, client, app_env, monkeypatch):
         """GET /api/panes/{pane}/instance resolves the custodes-style `%25` pane to

@@ -645,23 +645,22 @@ async def repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
 
     The live legacy instance table is gone; callers that still exercise this
     repair path operate through the temporary ``legacy_instances`` projection.
-    Update instance persona/voice fields in place.
+    Repair only the durable persona binding. Voice/sound are persona-table
+    attributes and are never copied onto ``instances``.
     """
     cursor = await db.execute(
-        """SELECT i.id, p.slug, i.persona_id, i.tts_voice, i.notification_sound
+        """SELECT i.id, p.slug, i.persona_id
            FROM instances i
            LEFT JOIN personas p ON p.id = i.persona_id
            WHERE i.status NOT IN ('stopped', 'archived')
              AND (
                i.persona_id IS NULL
                OR p.slug IN ('profile_1','p','emperors-children')
-               OR i.tts_voice IS NOT p.tts_voice
-               OR i.notification_sound IS NOT p.notification_sound
              )
            ORDER BY i.id"""
     )
     repaired = 0
-    for instance_id, slug, persona_id, _tts_voice, _notification_sound in await cursor.fetchall():
+    for instance_id, slug, persona_id in await cursor.fetchall():
         target_slug = slug
         if target_slug in {"profile_1", "p", "emperors-children"}:
             target_slug = "blood-angels"
@@ -672,17 +671,9 @@ async def repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
         persona = await resolve_persona(db, target_slug)
         if not persona:
             continue
-        profile = persona_to_profile(persona)
         await db.execute(
-            """UPDATE instances
-               SET persona_id = ?, tts_voice = ?, notification_sound = ?
-               WHERE id = ?""",
-            (
-                persona["id"],
-                profile["wsl_voice"],
-                profile["notification_sound"],
-                instance_id,
-            ),
+            "UPDATE instances SET persona_id = ? WHERE id = ?",
+            (persona["id"], instance_id),
         )
         repaired += 1
     return repaired

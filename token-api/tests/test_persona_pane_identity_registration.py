@@ -74,7 +74,7 @@ def _row(db_path, instance_id):
     conn = _conn(db_path)
     row = conn.execute(
         """SELECT i.name, i.rank, i.status, i.commander_type, i.commander_id,
-                  i.hook_driven, i.dispatch_target, i.launch_mode,
+                  i.hook_driven,
                   i.workflow_blocked_reason, i.engine, p.slug AS persona_slug
              FROM instances i
              LEFT JOIN personas p ON p.id = i.persona_id
@@ -83,6 +83,17 @@ def _row(db_path, instance_id):
     ).fetchone()
     conn.close()
     return row
+
+
+def _assert_forbidden_instance_columns_absent(db_path):
+    conn = _conn(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(instances)")}
+    conn.close()
+    assert "dispatch_target" not in cols
+    assert "dispatch_window" not in cols
+    assert "dispatch_mode" not in cols
+    assert "dispatch_slot" not in cols
+    assert "launch_mode" not in cols
 
 
 def _start_session(hooks, session_id, env=None):
@@ -228,8 +239,7 @@ def test_persona_tmux_target_registration_stores_public_alias_not_raw_pane(
     assert result["success"] is True
 
     row = _row(app_env.db_path, "orch-raw-pane")
-    assert row["dispatch_target"] == "mechanicus:orchestrator"
-    assert row["launch_mode"] == "tmux_target"
+    _assert_forbidden_instance_columns_absent(app_env.db_path)
     assert row["persona_slug"] == "orchestrator"
     assert row["name"] == "Orchestrator"
     assert row["workflow_blocked_reason"] is None
@@ -279,7 +289,7 @@ def test_persona_tmux_target_codex_flip_refresh_keeps_alias_registration(
 
     row = _row(app_env.db_path, "pax-flip")
     assert row["engine"] == "codex"
-    assert row["dispatch_target"] == "council:pax"
+    _assert_forbidden_instance_columns_absent(app_env.db_path)
     assert row["persona_slug"] == "pax"
     assert row["name"] == "Pax"
     assert row["workflow_blocked_reason"] is None

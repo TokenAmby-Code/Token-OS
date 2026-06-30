@@ -1636,7 +1636,7 @@ async def queue_tts(
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """SELECT i.name AS tab_name, i.tts_voice, i.notification_sound,
+                """SELECT i.name AS tab_name, p.tts_voice, p.notification_sound,
                           CASE WHEN i.interaction_mode = 'voice_chat'
                                THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
                           p.slug AS persona_slug, p.tts_policy AS tts_policy

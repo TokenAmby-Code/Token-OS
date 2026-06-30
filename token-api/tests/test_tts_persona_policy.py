@@ -63,8 +63,8 @@ def _insert_instance(db_path: Path, *, persona_slug: str | None, voiced: bool) -
         actor="test",
     )
     updates: dict[str, str] = {}
-    if voiced:
-        updates["tts_voice"] = "Microsoft George"
+    # Voice/sound are persona attributes now; ``voiced`` is kept for call-site
+    # readability but never writes an instance column.
     if persona_slug is not None:
         updates["persona_id"] = persona_id_for_slug(persona_slug)
     if updates:

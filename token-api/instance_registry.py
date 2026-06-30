@@ -5,11 +5,11 @@ exterminatus — the ONE physical instance table. It has two column tiers:
 
 * IDENTITY_COLUMNS: the durable instance registry charter (persona/rank/commander/
   origin). Authoritative, never derived from anywhere else.
-* RUNTIME_ANNEX_COLUMNS: transitional runtime/workflow fields inherited from
-  the extracted legacy instance table. Each is slated for per-column
-  demolition as its successor lands (tmux @INSTANCE_ID stamps for pane
-  geometry, the golden_throne table for GT state, status enum for workflow/
-  planning). New code must not grow this list.
+* RUNTIME_ANNEX_COLUMNS: transitional subsystem state not yet split to its
+  owning tables. Tmux/dispatch/launch/transient placement fields and
+  persona-derived audio fields are explicitly forbidden here. Tmux routing is
+  tmuxctld state; launch provenance is events/mutations/provenance; audio is
+  persona/chapter-lock state. New code must not grow this list.
 
 The legacy the legacy instance table table itself lives in archive.db only (see
 db_schema.extract_legacy instance table / restore_legacy instance table_from_archive).
@@ -49,26 +49,17 @@ IDENTITY_COLUMNS = [
     "human_anchor_source",
 ]
 
-# Transitional runtime annex (see module docstring). Order matters: it is the
+# Transitional subsystem annex (see module docstring). Order matters: it is the
 # physical column order in the CREATE TABLE.
+#
+# EXTERMINATED from canonical instances:
+# - tmux/dispatch/launch/transient placement/provenance fields
+#   (dispatch_*, launch_mode, launcher, target_working_dir, transplant_*).
+# - persona-derived audio fields (tts_voice, notification_sound).
+# Tmux routing belongs to tmuxctld's live oracle; launch provenance belongs in
+# events/mutations/provenance tables; audio belongs to personas/chapter locks.
 RUNTIME_ANNEX_COLUMNS = [
-    # tmux/dispatch geometry — dies when @INSTANCE_ID-stamp resolution lands.
-    # tmux_pane/pane_label are GONE: pane ids are never persisted (too volatile),
-    # the tmuxctl runtime oracle resolves geometry live from @INSTANCE_ID stamps.
-    "dispatch_target",
-    "dispatch_window",
-    "dispatch_mode",
-    "dispatch_slot",
-    "dispatch_session_doc_path",
-    "target_working_dir",
-    "launch_mode",
-    "launcher",
-    "transplant_target_session",
-    "transplant_expected",
     "input_lock",
-    # per-instance voice overrides
-    "tts_voice",
-    "notification_sound",
     # discord hosting
     "discord_hosted",
     "discord_channel",
