@@ -122,7 +122,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
     """Change an instance's Astartes persona by selecting its seeded voice.
 
     Manual voice changes are persona changes: the requested voice must map to a
-    selectable seeded Astartes persona, and profile_name/tts fields are updated
+                   selectable seeded Astartes persona, and the instance persona is updated
     together. Collisions are rejected; this route never moves another instance.
     """
 
@@ -139,7 +139,8 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
 
         cursor = await db.execute(
             """
-            SELECT ci.id, ci.persona_id, p.tts_voice, p.notification_sound,
+            SELECT ci.id, ci.persona_id,
+                   p.tts_voice, p.notification_sound,
                    COALESCE(p.slug, 'astartes') AS profile_name, ci.name AS tab_name,
                    COALESCE(p.default_rank, 'astartes') AS current_rank
             FROM instances ci
@@ -160,15 +161,14 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
 
         holder_cursor = await db.execute(
             """
-            SELECT ci.id, ci.name AS tab_name
-            FROM instances ci
-            JOIN personas p ON p.id = ci.persona_id
-            WHERE ci.id != ?
-              AND p.tts_voice = ?
-              AND ci.status NOT IN ('stopped', 'archived')
+            SELECT id, name AS tab_name
+            FROM instances
+            WHERE id != ?
+              AND persona_id = ?
+              AND status NOT IN ('stopped', 'archived')
             LIMIT 1
             """,
-            (instance_id, request.voice),
+            (instance_id, target_persona["id"]),
         )
         holder = await holder_cursor.fetchone()
         if holder:
@@ -243,7 +243,8 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT ci.id, ci.persona_id, p.tts_voice, p.notification_sound,
+            SELECT ci.id, ci.persona_id,
+                   p.tts_voice, p.notification_sound,
                    CASE WHEN ci.interaction_mode = 'voice_chat'
                         THEN 'voice-chat' ELSE ci.notification_mode END AS tts_mode,
                    COALESCE(p.slug, 'astartes') AS profile_name,

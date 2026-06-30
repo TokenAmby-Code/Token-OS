@@ -641,13 +641,7 @@ def persona_tint_for_instance_sync(
 
 
 async def repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
-    """Compatibility repair for legacy-shaped test/extraction fixtures.
-
-    The live legacy instance table is gone; callers that still exercise this
-    repair path operate through the temporary ``legacy_instances`` projection.
-    Repair only the durable persona binding. Voice/sound are persona-table
-    attributes and are never copied onto ``instances``.
-    """
+    """Repair unresolved instance persona bindings."""
     cursor = await db.execute(
         """SELECT i.id, p.slug, i.persona_id
            FROM instances i

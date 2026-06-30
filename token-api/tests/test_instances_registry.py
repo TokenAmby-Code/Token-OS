@@ -206,6 +206,9 @@ def test_instance_normalizer_maps_legacy_row_to_expected_fields(app_env):
             # pane ids are exterminated — the normalizer never projects them
             "tmux_pane",
             "pane_label",
+            "dispatch_target",
+            "dispatch_window",
+            "dispatch_slot",
         }
     )
 
