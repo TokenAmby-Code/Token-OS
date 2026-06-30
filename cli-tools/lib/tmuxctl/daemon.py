@@ -1395,10 +1395,14 @@ def _h_hook_wrapperstart(control, params):
             "tint": "",
         }
 
-    # Reuse path: the next wrapper must never inherit statusline/persona/guard
-    # stamps from the prior occupant.  This is the same daemon-owned runtime
-    # cleanup pathway WrapperEnd uses; wrapperstart then stamps the new owner.
-    control.clear_runtime(pane)
+    current_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    if current_owner != wrapper_launch_id:
+        # Reuse path: the next wrapper must never inherit statusline/persona/guard
+        # stamps from the prior occupant.  This is the same daemon-owned runtime
+        # cleanup pathway WrapperEnd uses; wrapperstart then stamps the new owner.
+        # A duplicate WrapperStart from the SAME wrapper is idempotent and must not
+        # scrub its own just-started runtime state.
+        control.clear_runtime(pane)
 
     # (1) Daemon-authoritative wrapper-ownership stamp (idempotent).
     control.adapter.run(

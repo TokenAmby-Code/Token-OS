@@ -180,6 +180,13 @@ def reap_dead_husk(adapter: TmuxAdapter, pane: str, *, pane_role: str = "") -> d
     if not pane_dead(adapter, pane):
         return {"status": "skipped", "reason": "pane_live", "pane": pane}
     adapter.run("kill-pane", "-t", pane, allow_failure=True)
+    if _pane_exists(adapter, pane):
+        return {
+            "status": "failed",
+            "reason": "kill_pane_failed",
+            "pane": pane,
+            "pane_role": pane_role,
+        }
     return {"status": "killed", "pane": pane, "pane_role": pane_role}
 
 

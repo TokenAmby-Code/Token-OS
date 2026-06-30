@@ -329,6 +329,7 @@ class ComprehensiveWrapperEndAdapter(WrapperEndAdapter):
             "@TOKEN_API_CWD": "/old",
         }
         self.unset_options: list[str] = []
+        self.exists_after_kill = False
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
         if option == "@PANE_ID":
@@ -342,7 +343,14 @@ class ComprehensiveWrapperEndAdapter(WrapperEndAdapter):
             self.options.pop(option, None)
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("display-message", "-t", "%42") and args[-1] == "#{pane_id}":
+            return (
+                "%42" if (self.instance_id or self.wrapper_owner or self.exists_after_kill) else ""
+            )
         result = super().run(*args, allow_failure=allow_failure)
+        if args[:2] == ("kill-pane", "-t"):
+            self.instance_id = ""
+            self.wrapper_owner = "" if not self.exists_after_kill else self.wrapper_owner
         if args[:5] == ("set-option", "-p", "-t", "%42", "@TOKEN_API_WRAPPER_LAUNCH_ID"):
             self.options["@TOKEN_API_WRAPPER_LAUNCH_ID"] = args[-1]
         return result
@@ -405,6 +413,46 @@ def test_wrapperstart_scrubs_persistent_slot_before_reuse_then_registers_new_wra
         assert rec.options.get("@INSTANCE_ID", "") == ""
         assert rec.options.get("@PANE_LABEL", "") == ""
         assert rec.options.get("@TOKEN_API_WRAPPER_LAUNCH_ID") == "wrap-new"
+    finally:
+        server.shutdown()
+
+
+def test_wrapperstart_duplicate_same_wrapper_does_not_scrub_own_runtime() -> None:
+    rec = ComprehensiveWrapperEndAdapter()
+    rec.pane_dead = "0"
+    rec.options["@TOKEN_API_WRAPPER_LAUNCH_ID"] = "wrap-1"
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperstart",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42"},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "stamped"
+        assert rec.cleared == []
+        assert rec.options.get("@PERSONA") == "Custodes"
+    finally:
+        server.shutdown()
+
+
+def test_wrapperend_reports_failed_reap_when_dead_husk_survives_kill() -> None:
+    rec = ComprehensiveWrapperEndAdapter()
+    rec.exists_after_kill = True
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(
+            server,
+            "/hooks/wrapperend",
+            {"wrapper_launch_id": "wrap-1", "tmux_pane": "%42", "exit_code": 0},
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["reap"] == {
+            "status": "failed",
+            "reason": "kill_pane_failed",
+            "pane": "%42",
+            "pane_role": "mechanicus:1",
+        }
     finally:
         server.shutdown()
 
