@@ -21,6 +21,12 @@ from tmuxctl.teardown import (  # noqa: E402
     classify_pane,
     window_base,
 )
+from tmuxctl.tmux_adapter import _target_arg  # noqa: E402
+
+# tmux verbs that MUTATE a pane. Teardown of pane A must aim every one of these at
+# A and at A alone — never a sibling (the assassin-by-proxy / cross-pane tint-strip
+# class). respawn-pane revives A's own shell in place; it is pane-local too.
+_MUTATING_VERBS = {"kill-pane", "respawn-pane", "set-option", "set", "select-pane"}
 
 # The full fixed pane set of each pre-allocated window — these must SURVIVE any
 # teardown (a slot exit only clears in place).
@@ -157,3 +163,74 @@ def test_fixed_windows_retain_full_pane_set_after_any_teardown() -> None:
         apply_teardown(adapter, f"%{label}", cls, pane_role=label)
         assert adapter.killed is False
         assert adapter.exists is True
+
+
+class MultiPaneAdapter:
+    """A fake whole tmux: many panes, each with its own stamps; mutations are
+    routed by the explicit target so a cross-pane (assassin-by-proxy) write is
+    observable as a stamp change on a pane OTHER than the teardown target."""
+
+    def __init__(self, panes: dict[str, dict[str, str]], *, dead: set[str]) -> None:
+        self.panes = {pid: dict(stamps) for pid, stamps in panes.items()}
+        self.dead = set(dead)
+        self.targets: list[str] = []  # every target a MUTATING verb aimed at
+
+    def clear_runtime_state(self, target: str) -> None:
+        self.targets.append(target)
+        for opt in list(self.panes.get(target, {})):
+            self.panes[target][opt] = ""  # scrub ONLY this pane's stamps
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        argv = list(args)
+        if argv and argv[-1] == "#{pane_dead}":
+            return "1" if _target_arg(argv) in self.dead else "0"
+        if argv and argv[-1] == "#{pane_id}":
+            t = _target_arg(argv)
+            return t if t in self.panes else ""
+        verb = argv[0] if argv else ""
+        if verb in _MUTATING_VERBS:
+            self.targets.append(_target_arg(argv))
+        if verb == "kill-pane":
+            t = _target_arg(argv)
+            self.panes.pop(t, None)
+            self.dead.discard(t)
+        if verb == "respawn-pane":
+            self.dead.discard(_target_arg(argv))
+        return ""
+
+
+def _siblings_snapshot(adapter: MultiPaneAdapter, target: str) -> dict:
+    return {pid: dict(st) for pid, st in adapter.panes.items() if pid != target}
+
+
+def test_slot_teardown_touches_only_its_own_pane_siblings_byte_identical() -> None:
+    # SCOPE EXPANSION 4: tearing down one slot must leave EVERY other pane's stamps
+    # byte-identical — the somnium-teardown-strips-palace-1:S contamination class.
+    panes = {
+        "%somniumS": {"@INSTANCE_ID": "doomed", "@GUARD": "#[fg=cyan]⌨", "@PANE_ID": "somnium:S"},
+        "%palace1S": {"@INSTANCE_ID": "live", "@GUARD": "#[fg=green]⌨", "@PANE_ID": "palace:S"},
+        "%custodes": {"@GUARD": "#[fg=gold]✠", "@PANE_ID": "council:custodes"},
+    }
+    adapter = MultiPaneAdapter(panes, dead={"%somniumS"})
+    before = _siblings_snapshot(adapter, "%somniumS")
+
+    apply_teardown(adapter, "%somniumS", PaneClass.SLOT, pane_role="somnium:S")
+
+    # Every mutating verb aimed ONLY at the teardown target.
+    assert set(adapter.targets) == {"%somniumS"}
+    # Every other pane's stamps are untouched — byte-identical.
+    assert _siblings_snapshot(adapter, "%somniumS") == before
+
+
+def test_worker_cull_touches_only_its_own_pane_siblings_byte_identical() -> None:
+    panes = {
+        "%worker": {"@INSTANCE_ID": "doomed", "@GUARD": "#[fg=red]⌨", "@PANE_ID": "mechanicus:7"},
+        "%palace1S": {"@INSTANCE_ID": "live", "@GUARD": "#[fg=green]⌨", "@PANE_ID": "palace:S"},
+    }
+    adapter = MultiPaneAdapter(panes, dead={"%worker"})
+    before = _siblings_snapshot(adapter, "%worker")
+
+    apply_teardown(adapter, "%worker", PaneClass.WORKER, pane_role="mechanicus:7")
+
+    assert set(adapter.targets) == {"%worker"}
+    assert _siblings_snapshot(adapter, "%worker") == before
