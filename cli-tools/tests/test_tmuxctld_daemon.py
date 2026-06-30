@@ -1493,6 +1493,7 @@ def test_startup_installs_tmux_lifecycle_hooks(monkeypatch: pytest.MonkeyPatch) 
         return Proc()
 
     monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+    monkeypatch.setattr(daemon, "tmux_binary", lambda: "tmux")
 
     out = daemon.ensure_tmux_lifecycle_hooks()
 

@@ -117,7 +117,17 @@ def _tmux_binary() -> str:
         if candidate:
             return candidate
 
-    wrapper = Path(__file__).resolve().parents[2] / "bin" / "tmux"
+    module_path = Path(__file__).resolve()
+    wrapper_paths = set()
+    for parent in module_path.parents:
+        for relative in ("cli-tools/bin/tmux", "bin/tmux"):
+            wrapper = parent / relative
+            if wrapper.exists():
+                try:
+                    wrapper_paths.add(wrapper.resolve())
+                except OSError:
+                    pass
+
     for candidate in (
         shutil.which("tmux", mode=os.F_OK | os.X_OK, path=os.environ.get("PATH")) or "",
         "/opt/homebrew/bin/tmux",
@@ -128,7 +138,7 @@ def _tmux_binary() -> str:
         if not candidate:
             continue
         try:
-            if Path(candidate).resolve() == wrapper.resolve():
+            if Path(candidate).resolve() in wrapper_paths:
                 continue
         except OSError:
             pass
