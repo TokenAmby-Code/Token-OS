@@ -1,18 +1,9 @@
 """Instance registry helpers.
 
-The ``instances`` table is the durable registry and — post legacy instance table
-exterminatus — the ONE physical instance table. It has two column tiers:
-
-* IDENTITY_COLUMNS: the durable instance registry charter (persona/rank/commander/
-  origin). Authoritative, never derived from anywhere else.
-* RUNTIME_ANNEX_COLUMNS: transitional subsystem state not yet split to its
-  owning tables. Tmux/dispatch/launch/transient placement fields and
-  persona-derived audio fields are explicitly forbidden here. Tmux routing is
-  tmuxctld state; launch provenance is events/mutations/provenance; audio is
-  persona/chapter-lock state. New code must not grow this list.
-
-The legacy the legacy instance table table itself lives in archive.db only (see
-db_schema.extract_legacy instance table / restore_legacy instance table_from_archive).
+The ``instances`` table is the durable live-agent registry. It stores current
+identity, lifecycle, workflow, notification, and Golden Throne binding state.
+Launch envelopes, pane geometry, transplant markers, and copied persona audio
+settings are not instance state.
 """
 
 from __future__ import annotations
@@ -22,7 +13,7 @@ from datetime import datetime
 
 DEFAULT_INSTANCE_NAME = "needs-name"
 
-IDENTITY_COLUMNS = [
+INSTANCE_COLUMNS = [
     "id",
     "name",
     "engine",
@@ -47,24 +38,10 @@ IDENTITY_COLUMNS = [
     "golden_throne",
     "human_anchored_at",
     "human_anchor_source",
-]
-
-# Transitional subsystem annex (see module docstring). Order matters: it is the
-# physical column order in the CREATE TABLE.
-#
-# EXTERMINATED from canonical instances:
-# - tmux/dispatch/launch/transient placement/provenance fields
-#   (dispatch_*, launch_mode, launcher, target_working_dir, transplant_*).
-# - persona-derived audio fields (tts_voice, notification_sound).
-# Tmux routing belongs to tmuxctld's live oracle; launch provenance belongs in
-# events/mutations/provenance tables; audio belongs to personas/chapter locks.
-RUNTIME_ANNEX_COLUMNS = [
     "input_lock",
-    # discord hosting
     "discord_hosted",
     "discord_channel",
     "discord_bot",
-    # workflow / planning / closure — dies into the status enum
     "workflow_state",
     "workflow_updated_at",
     "workflow_blocked_reason",
@@ -95,10 +72,7 @@ RUNTIME_ANNEX_COLUMNS = [
     "stop_allowed",
 ]
 
-INSTANCE_COLUMNS = IDENTITY_COLUMNS + RUNTIME_ANNEX_COLUMNS
-
-# Legacy legacy instance table columns with NO live home: their values exist only in
-# archive.db. Reads repoint to the instance-table derivation noted inline.
+# Columns from extracted historical instance shapes with no live home.
 REMOVED_INSTANCE_COLUMNS = {
     "tab_name",  # -> instances.name (API responses alias `name AS tab_name`)
     "session_id",  # archive-only
@@ -253,11 +227,10 @@ def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = Non
         "human_anchored_at": row.get("human_anchored_at"),
         "human_anchor_source": row.get("human_anchor_source"),
     }
-    # Runtime annex passthrough: any annex column present on the legacy row
-    # carries over verbatim (the extraction backfill and transitional
-    # legacy-shaped insert paths both rely on this).
-    for column in RUNTIME_ANNEX_COLUMNS:
-        if column in row:
+    # Copy only fields that are canonical in the present schema. Extracted
+    # launch/audio/transplant fields remain archive-only.
+    for column in INSTANCE_COLUMNS:
+        if column not in values and column in row:
             values[column] = row.get(column)
     return values
 

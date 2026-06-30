@@ -18,9 +18,7 @@ from cron_engine import CronEngine
 from instance_registry import (
     DEFAULT_INSTANCE_NAME,
     INSTANCE_COLUMNS,
-    RUNTIME_ANNEX_COLUMNS,
     golden_throne_binding,
-    legacy_row_to_instance_values,
     slug_from_legacy,
 )
 from personas import (
@@ -223,13 +221,6 @@ async def _create_instances_table(db) -> None:
             golden_throne TEXT,
             human_anchored_at TIMESTAMP,
             human_anchor_source TEXT,
-            -- ── SUBSYSTEM ANNEX (transitional) ───────────────────────────
-            -- Keep in lockstep with instance_registry.RUNTIME_ANNEX_COLUMNS.
-            -- EXTERMINATED from canonical instances: all tmux/dispatch/launch
-            -- placement/provenance columns and persona-derived audio columns.
-            -- tmux routing belongs to tmuxctld's live oracle (@INSTANCE_ID
-            -- stamps -> _live_agent_panes); launch provenance belongs in
-            -- events/mutations/provenance tables; audio belongs to personas.
             input_lock TEXT,
             discord_hosted INTEGER DEFAULT 0,
             discord_channel TEXT,
@@ -260,12 +251,46 @@ async def _create_instances_table(db) -> None:
             gt_last_dispatch_fingerprint TEXT,
             follow_up_sop TEXT,
             stop_allowed INTEGER DEFAULT 1,
-            -- ── end runtime annex ────────────────────────────────────────
             CHECK((commander_type = 'emperor' AND commander_id IS NULL) OR
                   (commander_type IN ('persona','chapter') AND commander_id IS NOT NULL)),
             CHECK(status != 'archived' OR rank = 'retired')
         )
     """)
+
+
+EXTERMINATED_INSTANCE_COLUMNS = frozenset(
+    {
+        "dispatch_target",
+        "dispatch_window",
+        "dispatch_mode",
+        "dispatch_slot",
+        "dispatch_session_doc_path",
+        "target_working_dir",
+        "launch_mode",
+        "launcher",
+        "transplant_target_session",
+        "transplant_expected",
+        "tts_voice",
+        "notification_sound",
+        # Prior pane-id storage already removed from code; tolerate only here so
+        # contaminated databases converge through one named migration.
+        "tmux_pane",
+        "pane_label",
+    }
+)
+
+
+async def _exterminate_instances_runtime_launch_columns(db, extras: set[str]) -> None:
+    """Drop known dead instance columns from contaminated databases.
+
+    This is the only live startup path allowed to know the removed physical
+    column names. It does not repair missing canonical columns or tolerate
+    unknown extras.
+    """
+    if not extras or not extras.issubset(EXTERMINATED_INSTANCE_COLUMNS):
+        raise RuntimeError(f"invalid instances exterminatus set: {sorted(extras)}")
+    for column in sorted(extras):
+        await db.execute(f"ALTER TABLE instances DROP COLUMN {column}")
 
 
 async def _repair_legacy_instance_personas(db: aiosqlite.Connection) -> int:
@@ -390,44 +415,29 @@ async def _ensure_instances(db) -> None:
         )
     """)
 
-    needs_rebuild = True
-    old_rows: list[dict] = []
+    canonical_columns = set(INSTANCE_COLUMNS)
     if await _table_exists(db, "instances"):
         cols = await _table_columns(db, "instances")
-        needs_rebuild = cols != set(INSTANCE_COLUMNS)
-        if needs_rebuild:
-            db.row_factory = aiosqlite.Row
-            try:
-                cursor = await db.execute("SELECT * FROM instances")
-                old_rows = [dict(row) for row in await cursor.fetchall()]
-            finally:
-                db.row_factory = None
-            await db.execute("DROP TABLE instances")
-    if needs_rebuild:
-        await _create_instances_table(db)
-        # Existing instance rows are the ONLY rebuild source. The legacy
-        # claude_instances projection is gone: it used to take priority here,
-        # clobbering instance identity with table defaults (rank/commander/origin)
-        # and resurrecting ghost rows. Legacy data is extracted to archive.db
-        # by _extract_claude_instances() instead.
-        source_rows = old_rows
-        for row in source_rows:
-            if set(INSTANCE_COLUMNS).issubset(row.keys()):
-                values = {column: row.get(column) for column in INSTANCE_COLUMNS}
-            else:
-                values = legacy_row_to_instance_values(
-                    row, await _persona_id_for_legacy_row(db, row)
-                )
-            if not values.get("id"):
-                continue
-            columns = [column for column in INSTANCE_COLUMNS if column in values]
-            await db.execute(
-                f"INSERT OR REPLACE INTO instances ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-                [values[column] for column in columns],
+        missing = canonical_columns - cols
+        extras = cols - canonical_columns
+        if missing:
+            raise RuntimeError(
+                "instances table schema drift: missing canonical columns "
+                + ", ".join(sorted(missing))
             )
+        unknown_extras = extras - EXTERMINATED_INSTANCE_COLUMNS
+        if unknown_extras:
+            raise RuntimeError(
+                "instances table schema drift: unknown extra columns "
+                + ", ".join(sorted(unknown_extras))
+            )
+        if extras:
+            await _exterminate_instances_runtime_launch_columns(db, extras)
+    else:
+        await _create_instances_table(db)
 
     columns = await _table_columns(db, "instances")
-    if columns != set(INSTANCE_COLUMNS):
+    if columns != canonical_columns:
         raise RuntimeError(
             f"instances table schema mismatch: expected {INSTANCE_COLUMNS}, got {sorted(columns)}"
         )
@@ -905,8 +915,8 @@ async def _copy_legacy_table_to_archive(db, archive_path: Path) -> None:
         await db.execute("DETACH DATABASE archive")
 
 
-async def _backfill_annex_from_legacy(db) -> None:
-    """Fill runtime-annex (and NULL identity gaps) on live instance rows from legacy rows.
+async def _backfill_instance_identity_from_legacy(db) -> None:
+    """Fill NULL canonical identity gaps on live instance rows from legacy rows.
 
     instance identity always wins: persona_id/golden_throne are filled only when
     NULL. Legacy-only rows (no matching instances.id) stay archive-only.
@@ -917,9 +927,6 @@ async def _backfill_annex_from_legacy(db) -> None:
         legacy_rows = [dict(row) for row in await cursor.fetchall()]
     finally:
         db.row_factory = None
-
-    legacy_cols = set(await _ordered_columns(db, "claude_instances"))
-    annex_cols = [col for col in RUNTIME_ANNEX_COLUMNS if col in legacy_cols]
 
     for row in legacy_rows:
         instance_id = row.get("id")
@@ -933,7 +940,7 @@ async def _backfill_annex_from_legacy(db) -> None:
         if existing is None:
             continue  # legacy-only row: archive carries it, live does not
 
-        updates: dict = {col: row.get(col) for col in annex_cols}
+        updates: dict = {}
 
         existing_persona, existing_marker, existing_status = existing
         if existing_persona is None:
@@ -1005,7 +1012,7 @@ async def _rebuild_tables_without_legacy_fk(db) -> None:
 
 
 async def _extract_claude_instances(db, db_path: Path) -> None:
-    """One-shot extraction: archive the legacy table, backfill annex, drop it.
+    """One-shot extraction: archive the legacy table, fill canonical gaps, drop it.
 
     Idempotent (no-op once the table is gone) and reversible
     (restore_claude_instances_from_archive copies it back).
@@ -1015,7 +1022,7 @@ async def _extract_claude_instances(db, db_path: Path) -> None:
 
     archive_path = archive_db_path_for(db_path)
     await _copy_legacy_table_to_archive(db, archive_path)
-    await _backfill_annex_from_legacy(db)
+    await _backfill_instance_identity_from_legacy(db)
     await _rebuild_tables_without_legacy_fk(db)
     await db.execute("DROP TABLE claude_instances")
     await db.commit()
@@ -1098,8 +1105,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 f"violation(s) at init: {mech_violations}"
             )
 
-        # Annex-era indexes on the surviving predicates (golden_throne marker
-        # replaced legion/synced; discord routing reads the annex columns).
+        # Indexes on current registry predicates.
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_instances_gt ON instances(golden_throne, status)"
         )
@@ -1784,26 +1790,6 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 VALUES (NEW.id, '@PANE_LABEL', NEW.name);
             END
         """)
-
-        # ── TRANSITIONAL: drop the exterminated pane-id columns ──
-        # Pane ids (tmux_pane/pane_label) are no longer created by any CREATE TABLE
-        # or written by any code path — the tmuxctl @INSTANCE_ID oracle is the sole
-        # source of pane geometry. Older live DBs (Mac + WSL satellite + phone) still
-        # carry the physical columns with stale `%NN` values. Drop them once, now
-        # that no trigger (trg_tmux_pane_recolor is dropped above; the pane_state
-        # triggers were just recreated without the column) or writer references them.
-        #
-        # This is NOT a permanent disease-suppressor: nothing recreates these
-        # columns, so a regressed writer fails LOUDLY ("no such column") rather than
-        # being silently masked. REMOVE this block once every satellite DB has
-        # converged (follow-up #7).
-        for _drop_table, _drop_col in (
-            ("instances", "tmux_pane"),
-            ("instances", "pane_label"),
-            ("pane_state_queue", "tmux_pane"),
-        ):
-            if _drop_col in await _table_columns(db, _drop_table):
-                await db.execute(f"ALTER TABLE {_drop_table} DROP COLUMN {_drop_col}")
 
         # ── Session Doc Sync Queue ──
         # Trigger-driven session doc frontmatter updates. Fires on status change,

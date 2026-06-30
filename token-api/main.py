@@ -2759,7 +2759,7 @@ async def register_instance(request: InstanceRegisterRequest):
                 profile = persona_to_profile(dict(persona_row))
             else:
                 profile = {
-                    "name": None,
+                    "name": existing["name"],
                     "wsl_voice": None,
                     "notification_sound": None,
                     "color": "#0099ff",
@@ -3801,7 +3801,6 @@ async def mark_transplant_pending(instance_id: str, target_session: str):
         cursor = await db.execute("SELECT 1 FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
-        await db.commit()
 
     await log_event(
         "transplant_pending",
@@ -3809,10 +3808,10 @@ async def mark_transplant_pending(instance_id: str, target_session: str):
         details={"target_session": target_session},
     )
 
-    logger.info(
-        f"Transplant pending: {instance_id[:12]}... → target session {target_session[:12]}..."
+    raise HTTPException(
+        status_code=410,
+        detail="DB transplant markers are removed from instances; use hook handoff files",
     )
-    return {"status": "pending", "instance_id": instance_id, "target_session": target_session}
 
 
 @app.post("/api/instances/{instance_id}/input-lock")
@@ -10934,22 +10933,13 @@ async def set_instance_legion(instance_id: str, request: Request):
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        # The legacy `legion`/`profile_name` columns died with the old table —
-        # legion identity now lives in persona_id. Resolve the legion to its persona
-        # and bind persona_id (plus annex voice/sound from the profile).
+        # Resolve the legion to its persona and bind persona_id.
         updates: dict = {}
         persona_slug = LEGION_PERSONA_SLUGS.get(legion)
         if persona_slug:
             persona = await resolve_persona(db, persona_slug)
             if persona:
-                profile = persona_to_profile(persona)
-                updates.update(
-                    {
-                        "persona_id": persona["id"],
-                        "tts_voice": profile["wsl_voice"],
-                        "notification_sound": profile["notification_sound"],
-                    }
-                )
+                updates.update({"persona_id": persona["id"]})
         if updates:
             await sanctioned_update_instance(
                 db,
@@ -12007,8 +11997,8 @@ async def set_instance_type(instance_id: str, request: Request):
             updates["rank"] = "retired"
         elif new_type == "golden_throne":
             # A golden_throne row holds the GT engine state; the marker references it.
-            # Reuse an existing GT binding when present, else mint one seeded from
-            # the requested/annex values. Insert the row BEFORE setting the marker
+            # Reuse an existing GT binding when present, else mint one from the
+            # requested values. Insert the row BEFORE setting the marker
             # (the guard trigger requires the marker to be NULL | 'sync' | a GT id).
             if _gt_marker and _gt_marker != "sync":
                 marker = _gt_marker
@@ -12020,7 +12010,7 @@ async def set_instance_type(instance_id: str, request: Request):
                     stop_allowed=instance["stop_allowed"],
                 )
             updates["golden_throne"] = marker
-        # new_type == "hook_driven": no marker change (hook_driven is an annex flag,
+        # new_type == "hook_driven": no marker change (hook_driven is an automation flag,
         # not a golden_throne state); leave the marker untouched.
 
         await sanctioned_update_instance(

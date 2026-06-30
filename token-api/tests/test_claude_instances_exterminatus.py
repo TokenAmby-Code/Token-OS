@@ -202,15 +202,13 @@ class TestFreshDatabase:
         assert "claude_instances" not in names
         assert "instances" in names
 
-    def test_instances_has_runtime_annex_columns(self, app_env):
+    def test_instances_exterminates_runtime_launch_audio_columns(self, app_env):
         conn = _db(app_env)
         cols = _columns(conn, "instances")
         conn.close()
-        for annex in (
+        for canonical in (
             "workflow_state",
             "planning_state",
-            "tts_voice",
-            "notification_sound",
             "discord_channel",
             "input_lock",
             "pr_state",
@@ -218,12 +216,10 @@ class TestFreshDatabase:
             "is_subagent",
             "hook_driven",
             "zealotry",
-            "dispatch_target",
         ):
-            assert annex in cols, f"missing runtime annex column: {annex}"
-        # the dead identity duplicates must NOT be reincarnated — and pane ids
-        # (tmux_pane/pane_label) are EXTERMINATED: pane geometry lives only in the
-        # tmuxctl @INSTANCE_ID oracle, never persisted.
+            assert canonical in cols, f"missing canonical column: {canonical}"
+        # Dead identity duplicates and launch/audio/transplant cruft must not be
+        # reincarnated. Pane geometry lives only in the tmuxctl @INSTANCE_ID oracle.
         for dead in (
             "legion",
             "primarch",
@@ -233,6 +229,18 @@ class TestFreshDatabase:
             "tab_name",
             "tmux_pane",
             "pane_label",
+            "dispatch_target",
+            "dispatch_window",
+            "dispatch_mode",
+            "dispatch_slot",
+            "dispatch_session_doc_path",
+            "target_working_dir",
+            "launch_mode",
+            "launcher",
+            "transplant_target_session",
+            "transplant_expected",
+            "tts_voice",
+            "notification_sound",
         ):
             assert dead not in cols, f"dead legacy column reincarnated on instances: {dead}"
 
@@ -295,7 +303,7 @@ class TestArchiveExtraction:
         conn.close()
         assert "claude_instances" not in names, "legacy table still in the live DB"
 
-    def test_instance_identity_wins_and_annex_backfills(self, legacy_seed, app_env):
+    def test_instance_identity_wins_and_canonical_gaps_fill(self, legacy_seed, app_env):
         conn = _db(app_env)
         row = conn.execute(
             """SELECT rank, origin_type, status, workflow_state, golden_throne
@@ -308,7 +316,7 @@ class TestArchiveExtraction:
         assert row["rank"] == "overseer"
         assert row["origin_type"] == "perpetual"
         assert row["status"] == "working"
-        # annex backfilled from the legacy row (pane ids are NOT persisted — exterminated)
+        # canonical workflow state can be filled; launch/audio cruft remains archive-only
         assert row["workflow_state"] == "open"
         # synced=1/instance_type=sync legacy markers land as the instance marker
         assert row["golden_throne"] == "sync"

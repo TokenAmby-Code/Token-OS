@@ -37,9 +37,8 @@ OFFICIAL_INSTANCE_NAME_ACTORS = frozenset(
     }
 )
 
-# Tracked mutation surface = durable identity + runtime annex. Legacy column names
-# (tab_name/legion/synced/instance_type/primarch/parent_instance_id/tts_mode/pid)
-# died with the legacy instance table extraction; their durable homes are name/persona_id/
+# Tracked mutation surface for the current instances schema. Historical column
+# names remain archive-only; their durable homes are name/persona_id/
 # golden_throne/commander_*/notification_mode+interaction_mode.
 INSTANCE_MUTATION_FIELDS = {
     # identity
@@ -65,7 +64,6 @@ INSTANCE_MUTATION_FIELDS = {
     "session_doc_id",
     "continuity_binding_source",
     "wrapper_launch_id",
-    # runtime annex
     "input_lock",
     "session_doc_policy",
     "workflow_state",
@@ -583,7 +581,7 @@ async def sanctioned_insert_instance(
 ) -> dict:
     """Insert a new row into `instances` (the one physical table).
 
-    Accepts both instance-shaped and transitional legacy-shaped value dicts;
+    Accepts both instance-shaped and extracted historical value dicts;
     everything is normalized through legacy_row_to_instance_values
     (legion/profile_name resolve to persona_id, parent_instance_id to a
     chapter commander edge, tts_mode to notification/interaction modes).
