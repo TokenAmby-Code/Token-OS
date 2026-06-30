@@ -121,7 +121,7 @@ def _set_persona(db_path, instance_id, slug, *, rank="overseer"):
     return row[0]
 
 
-def _commander_slug(db_path, instance_id):
+def _commander_slug(db_path: Any, instance_id: str) -> tuple[str, str] | None:
     conn = sqlite3.connect(db_path)
     row = conn.execute(
         """SELECT i.commander_type, p.slug
@@ -346,7 +346,9 @@ def test_mechanicus_worker_session_start_auto_subscribes_to_live_fg(app_env):
     assert row == ("worker-1", "%41", "fg-1", "%40", "active")
 
 
-def test_civic_mechanicus_new_session_start_binds_to_orchestrator_not_fg(app_env, monkeypatch):
+def test_civic_mechanicus_new_session_start_binds_to_orchestrator_not_fg(
+    app_env: Any, monkeypatch: Any
+) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(
         app_env.db_path,
@@ -364,7 +366,7 @@ def test_civic_mechanicus_new_session_start_binds_to_orchestrator_not_fg(app_env
     _set_persona(app_env.db_path, "orch-civic-new", "orchestrator")
     _seed_pane("worker-civic-new", "%45", "mechanicus:10")
 
-    async def no_label(_pane):
+    async def no_label(_pane: str | None) -> None:
         return None
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
@@ -400,7 +402,9 @@ def test_civic_mechanicus_new_session_start_binds_to_orchestrator_not_fg(app_env
     assert rows == [("worker-civic-new", "orch-civic-new", "%44", "active")]
 
 
-def test_mechanicus_legion_mechanicus_new_session_start_still_binds_to_fg(app_env, monkeypatch):
+def test_mechanicus_legion_mechanicus_new_session_start_still_binds_to_fg(
+    app_env: Any, monkeypatch: Any
+) -> None:
     hooks = sys.modules["routes.hooks"]
     _insert_instance(
         app_env.db_path,
@@ -418,7 +422,7 @@ def test_mechanicus_legion_mechanicus_new_session_start_still_binds_to_fg(app_en
     _set_persona(app_env.db_path, "orch-mech-new", "orchestrator")
     _seed_pane("worker-mech-new", "%48", "mechanicus:11")
 
-    async def no_label(_pane):
+    async def no_label(_pane: str | None) -> None:
         return None
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
