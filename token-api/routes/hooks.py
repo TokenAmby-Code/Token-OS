@@ -3656,10 +3656,6 @@ async def handle_session_start(payload: dict) -> dict:
                     previous_session_doc_id=old_inst["session_doc_id"],
                     previous_workflow_state=old_inst["workflow_state"],
                 )
-                dispatch_bound_doc = (
-                    session_doc_policy or old_inst["session_doc_policy"]
-                ) == "dispatch_explicit"
-
                 await db.commit()
                 auto_subscription = await _auto_subscribe_parent_on_start(
                     db,
