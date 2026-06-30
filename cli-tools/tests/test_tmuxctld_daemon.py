@@ -1218,3 +1218,55 @@ def test_voice_clear_by_bot_clears_stale_target_options(
         assert ("set-option", "-p", "-t", "palace:E", "@DISCORD_VOICE_LOCK", "0") in rec.calls
     finally:
         server.shutdown()
+
+
+def test_startup_installs_tmux_lifecycle_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return Proc()
+
+    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+
+    out = daemon.ensure_tmux_lifecycle_hooks()
+
+    assert out["ok"] is True
+    assert calls == [
+        (
+            ("tmux", "set-option", "-g", "remain-on-exit", "on"),
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 5,
+                "check": False,
+            },
+        ),
+        (
+            ("tmux", "set-hook", "-g", "pane-died[90]", daemon._PANE_DIED_HOOK),
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 5,
+                "check": False,
+            },
+        ),
+    ]
+    assert "tmux-pane-respawn #{pane_id}" in daemon._PANE_DIED_HOOK
+
+
+def test_startup_lifecycle_hook_install_is_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*_args, **_kwargs):
+        raise PermissionError("tmux denied")
+
+    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+
+    out = daemon.ensure_tmux_lifecycle_hooks()
+
+    assert out["ok"] is False
+    assert len(out["results"]) == 2
+    assert all(result["returncode"] is None for result in out["results"])
