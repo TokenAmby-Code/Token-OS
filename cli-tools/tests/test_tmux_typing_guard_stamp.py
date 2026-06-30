@@ -150,7 +150,7 @@ def test_no_guard_assignment_contains_literal_pending() -> None:
     for rel in (
         "cli-tools/tmux/tmux-base.conf",
         "cli-tools/bin/tmux-typing-guard-state",
-        "cli-tools/lib/tmuxctl/typing_guard_state.py",
+        "tmuxctld/lib/tmuxctl/typing_guard_state.py",
     ):
         text = (REPO / rel).read_text(encoding="utf-8")
         assert "⌨ PENDING" not in text

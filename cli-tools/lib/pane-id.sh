@@ -12,6 +12,9 @@
 # TUI: legacy compatibility only; no default workspace TUI window
 
 _TMUX_STATE_LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+_TOKEN_OS_ROOT="${TOKEN_OS:-$(cd "${_TMUX_STATE_LIB_DIR}/../.." && pwd)}"
+_TMUXCTLD_LIB_DIR="${TMUXCTLD_LIB:-${_TOKEN_OS_ROOT}/tmuxctld/lib}"
+_CLI_LIB_DIR="${_TOKEN_OS_ROOT}/cli-tools/lib"
 # shellcheck source=./tmux-state.sh
 source "${_TMUX_STATE_LIB_DIR}/tmux-state.sh" 2>/dev/null || true
 
@@ -64,7 +67,7 @@ pane_resolve() {
     local id="$1"
     local resolved
     id="$(pane_canonical_id "$id")"
-    resolved=$(PYTHONPATH="${_TMUX_STATE_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+    resolved=$(PYTHONPATH="${_TMUXCTLD_LIB_DIR}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m tmuxctl.cli resolve-pane --format physical "$id" 2>/dev/null || true)
     if [[ -n "$resolved" ]]; then
         echo "$resolved"

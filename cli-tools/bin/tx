@@ -37,6 +37,9 @@ set -euo pipefail
 
 # Source machine identity (IMPERIUM_MACHINE, NAS paths, etc.)
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+_REPO_ROOT="${TOKEN_OS:-$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)}"
+_TMUXCTLD_LIB_DIR="${TMUXCTLD_LIB:-${_REPO_ROOT}/tmuxctld/lib}"
+_CLI_LIB_DIR="${_REPO_ROOT}/cli-tools/lib"
 # shellcheck source=../lib/nas-path.sh
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 # shellcheck source=../lib/pane-id.sh
@@ -262,7 +265,7 @@ tmuxctl_python() {
 run_tmuxctl() {
     local py
     py=$(tmuxctl_python)
-    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" "$py" -m tmuxctl.cli "$@"
+    PYTHONPATH="${_TMUXCTLD_LIB_DIR}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" "$py" -m tmuxctl.cli "$@"
 }
 
 workspace_needs_repair() {

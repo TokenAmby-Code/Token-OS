@@ -2230,6 +2230,7 @@ def _resolve_instance_pane(session_id: str) -> tuple[str | None, str | None]:
     """
     if not session_id:
         return (None, None)
+    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         # sys.executable, not bare "python3" (the uv shim re-syncs the venv on every
@@ -2249,7 +2250,7 @@ def _resolve_instance_pane(session_id: str) -> tuple[str | None, str | None]:
             timeout=5,
             env={
                 **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             },
         )
     except Exception:

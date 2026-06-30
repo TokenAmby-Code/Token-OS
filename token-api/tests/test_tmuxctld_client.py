@@ -19,9 +19,9 @@ import sys
 import threading
 import urllib.request
 
-# The daemon lives in the sibling cli-tools package; add its lib to the path so
+# The daemon package lives in root tmuxctld; add its lib to the path so
 # the in-process server can be imported here (stdlib-only — no venv needed).
-CLI_LIB = pathlib.Path(__file__).resolve().parents[2] / "cli-tools" / "lib"
+CLI_LIB = pathlib.Path(__file__).resolve().parents[2] / "tmuxctld" / "lib"
 if str(CLI_LIB) not in sys.path:
     sys.path.insert(0, str(CLI_LIB))
 

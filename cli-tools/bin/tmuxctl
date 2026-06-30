@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # tmuxctl — entrypoint for the Python tmux control plane.
 set -euo pipefail
-_LIB_DIR="$(cd "$(dirname "$(readlink -f "$0")")/../lib" && pwd)"
+_BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+_REPO_ROOT="${TOKEN_OS:-$(cd "${_BIN_DIR}/../.." && pwd)}"
+_LIB_DIR="${TMUXCTLD_LIB:-${_REPO_ROOT}/tmuxctld/lib}"
+_CLI_LIB_DIR="${_REPO_ROOT}/cli-tools/lib"
 
 tmuxctl_python() {
     local candidate
@@ -15,4 +18,4 @@ tmuxctl_python() {
     return 1
 }
 
-PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec "$(tmuxctl_python)" -m tmuxctl.cli "$@"
+PYTHONPATH="${_LIB_DIR}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec "$(tmuxctl_python)" -m tmuxctl.cli "$@"

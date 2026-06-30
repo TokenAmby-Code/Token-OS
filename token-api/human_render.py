@@ -22,8 +22,9 @@ from pane_surface import RAW_TMUX_PANE_RX
 _UNRESOLVED = "unresolved"
 
 
-def _cli_lib_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+def _cli_lib_path() -> tuple[Path, Path]:
+    root = Path(__file__).resolve().parents[1]
+    return root / "tmuxctld" / "lib", root / "cli-tools" / "lib"
 
 
 def _translate_with_tmuxctl(text: str, *, unresolved: str = _UNRESOLVED) -> str:
@@ -34,7 +35,7 @@ def _translate_with_tmuxctl(text: str, *, unresolved: str = _UNRESOLVED) -> str:
     must catch failures and fail safe because rendering a report must never be
     black-holed by tmux being unavailable.
     """
-    cli_lib = _cli_lib_path()
+    tmuxctld_lib, cli_lib = _cli_lib_path()
     proc = subprocess.run(
         [sys.executable, "-m", "tmuxctl.cli", "translate-ids", "--unresolved", unresolved],
         input=text,
@@ -44,7 +45,7 @@ def _translate_with_tmuxctl(text: str, *, unresolved: str = _UNRESOLVED) -> str:
         check=False,
         env={
             **os.environ,
-            "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         },
     )
     if proc.returncode != 0:

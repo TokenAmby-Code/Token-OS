@@ -51,9 +51,9 @@ ignore = ["E501"]  # line-length handled by formatter
 "tests/test_tmux_typing_guard_agent.py" = ["E402"]
 "tests/test_dispatch_liveness.py" = ["E402"]
 "tests/test_automated_pane_activity.py" = ["E402"]
-"lib/tmuxctl/enums.py" = ["UP042"]
-"lib/tmuxctl/focus.py" = ["UP042"]
-"lib/tmuxctl/revert.py" = ["UP042"]
+"../tmuxctld/lib/tmuxctl/enums.py" = ["UP042"]
+"../tmuxctld/lib/tmuxctl/focus.py" = ["UP042"]
+"../tmuxctld/lib/tmuxctl/revert.py" = ["UP042"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -74,7 +74,7 @@ ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["lib"]
+pythonpath = ["../tmuxctld/lib", "lib"]
 addopts = "-n auto --dist loadfile"  # local default parallel; CI pins serial with -n0 (see workflows); `-n0` to debug
 markers = [
     "bounty: 'bounty board' lane — speculative test for an UNBUILT vault feature. Non-blocking: auto-xfail'd by tests/bounty_board/conftest.py, excluded from the required regression run via `-m 'not bounty'`. An xpass means the feature shipped — graduate it into regression.",

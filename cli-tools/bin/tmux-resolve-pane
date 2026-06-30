@@ -8,7 +8,10 @@
 
 set -euo pipefail
 
-_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+_BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+_REPO_ROOT="${TOKEN_OS:-$(cd "${_BIN_DIR}/../.." && pwd)}"
+_LIB_DIR="${TMUXCTLD_LIB:-${_REPO_ROOT}/tmuxctld/lib}"
+_CLI_LIB_DIR="${_REPO_ROOT}/cli-tools/lib"
 format="id"
 
 usage() {
@@ -56,4 +59,4 @@ case "$format" in
     *) echo "tmux-resolve-pane: invalid format '$format'" >&2; exit 2 ;;
 esac
 
-PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli resolve-pane --format "$format" "$1"
+PYTHONPATH="${_LIB_DIR}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 -m tmuxctl.cli resolve-pane --format "$format" "$1"

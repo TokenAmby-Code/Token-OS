@@ -316,6 +316,7 @@ import traceback
 
 # Machine identity from centralized config
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
+sys.path.insert(0, str(SCRIPTS_DIR / "tmuxctld" / "lib"))
 from imperium_config import cfg
 from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
 from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
@@ -435,6 +436,7 @@ async def _tmuxctl_send_text_fallback(
             "instance_id": None,
         }
 
+    tmuxctld_lib = SCRIPTS_DIR / "tmuxctld" / "lib"
     cli_lib = SCRIPTS_DIR / "cli-tools" / "lib"
     args: list[str] = [
         sys.executable,
@@ -458,7 +460,7 @@ async def _tmuxctl_send_text_fallback(
             stderr=subprocess.PIPE,
             env={
                 **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             },
             timeout=15,
         )
@@ -6335,6 +6337,7 @@ def _resolve_tmux_pane_id_sync(tmux_pane: str | None) -> str | None:
     if not tmux_pane:
         return None
     cli_bin = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmux-resolve-pane"
+    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         result = subprocess.run(
@@ -6346,7 +6349,7 @@ def _resolve_tmux_pane_id_sync(tmux_pane: str | None) -> str | None:
             check=False,
             env={
                 **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             },
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -13021,6 +13024,7 @@ async def _pane_live_agent_engine(tmux_pane: str | None) -> str | None:
     pane = await shared.resolve_tmux_pane_id(tmux_pane)
     if not pane:
         return None
+    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         proc = await _run_subprocess_offloop(
@@ -13038,7 +13042,7 @@ async def _pane_live_agent_engine(tmux_pane: str | None) -> str | None:
             ),
             env={
                 **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

@@ -564,13 +564,14 @@ async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
         pane_id = await _resolve_tmux_pane_direct(tmux_pane)
         _TMUX_PANE_RESOLVE_CACHE[tmux_pane] = (now, pane_id)
         return pane_id
+    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         proc = await _run_subprocess_offloop(
             (sys.executable, "-m", "tmuxctl.cli", "resolve-pane", tmux_pane),
             env={
                 **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -613,12 +614,14 @@ def apply_pane_tint(
     if not tmux_pane:
         return
     bg = pane_tint or "default"
+    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         import sys
 
-        if str(cli_lib) not in sys.path:
-            sys.path.insert(0, str(cli_lib))
+        for lib in (cli_lib, tmuxctld_lib):
+            if str(lib) not in sys.path:
+                sys.path.insert(0, str(lib))
         from tmuxctl.tmux_adapter import TmuxAdapter
     except Exception as exc:  # tmuxctl unavailable (e.g. non-tmux host)
         logger.warning("pane tint: tmuxctl adapter unavailable (%s)", exc)
@@ -902,6 +905,7 @@ async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, st
         pane_id = (result.get("pane_id") or "").strip() or None
         role = (result.get("pane_role") or "").strip() or None
         return (pane_id, role)
+    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         # sys.executable, never bare "python3": on the live host "python3" resolves
@@ -920,7 +924,7 @@ async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, st
             ),
             env={
                 **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

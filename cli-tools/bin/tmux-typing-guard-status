@@ -31,13 +31,17 @@ a transient fault can neither brick the status bar nor fake a guard light.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-_LIB = Path(__file__).resolve().parents[1] / "lib"
-if str(_LIB) not in sys.path:
-    sys.path.insert(0, str(_LIB))
+_ROOT = Path(os.environ.get("TOKEN_OS") or Path(__file__).resolve().parents[2])
+_LIB = Path(os.environ.get("TMUXCTLD_LIB") or (_ROOT / "tmuxctld" / "lib"))
+_CLI_LIB = _ROOT / "cli-tools" / "lib"
+for _path in (_CLI_LIB, _LIB):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 # Styled status-right segment is retained only for manual invocation; the real
 # UX is the per-pane @GUARD marker. Marker constants come from the canonical

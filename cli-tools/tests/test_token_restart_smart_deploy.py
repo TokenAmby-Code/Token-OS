@@ -307,9 +307,8 @@ def test_multiple_changed_services_all_restart(tmp_path: Path) -> None:
 def test_tmuxctld_daemon_code_change_restarts_tmuxctld(tmp_path: Path) -> None:
     # A change in the daemon code area bounces the tmuxctld daemon (launchctl
     # kickstart -k, like discord). token-api also restarts so /health.git_sha
-    # verifies the merged SHA. The tmuxctl subtree lives under cli-tools/lib, so
-    # the existing WSL refresh is preserved.
-    env, logfile = _stub_env(tmp_path, "cli-tools/lib/tmuxctl/daemon.py")
+    # verifies the merged SHA. The tmuxctl subtree lives under root tmuxctld/lib; daemon code is Mac-local.
+    env, logfile = _stub_env(tmp_path, "tmuxctld/lib/tmuxctl/daemon.py")
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
@@ -317,8 +316,7 @@ def test_tmuxctld_daemon_code_change_restarts_tmuxctld(tmp_path: Path) -> None:
     assert RESTART_TOKENAPI in calls
     assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
-    # cli-tools/lib/* still refreshes the WSL runtime (additive, no regression).
-    assert "/runtime/refresh" in calls
+    assert "/runtime/refresh" not in calls
     # The daemon bounce must NOT shell out to the tmux/tmuxctl/tx fleet tooling.
     _assert_no_fleet_wipe(calls)
 
@@ -327,7 +325,7 @@ def test_tmuxctld_entrypoint_change_restarts_tmuxctld_and_verifies_token_api(
     tmp_path: Path,
 ) -> None:
     # The Mac-local entrypoint routes to the daemon restart only — no WSL refresh.
-    env, logfile = _stub_env(tmp_path, "cli-tools/bin/tmuxctld")
+    env, logfile = _stub_env(tmp_path, "tmuxctld/bin/tmuxctld")
     proc = _run(env)
     assert proc.returncode == 0, proc.stderr
     calls = logfile.read_text()
@@ -344,7 +342,7 @@ def test_tmuxctld_plist_change_reinstalls_daemon(tmp_path: Path) -> None:
     # reinstalled: copy the synced plist into LaunchAgents, then bootout+bootstrap.
     # TMUXCTLD_SRC_PLIST/TMUXCTLD_PLIST are overridden to tmp paths so the test
     # never touches the live LaunchAgent.
-    env, logfile = _stub_env(tmp_path, "cli-tools/launchd/ai.tokenclaw.tmuxctld.plist")
+    env, logfile = _stub_env(tmp_path, "tmuxctld/launchd/ai.tokenclaw.tmuxctld.plist")
     src_plist = tmp_path / "src.tmuxctld.plist"
     src_plist.write_text("<plist>synced</plist>\n")
     dst_plist = tmp_path / "LaunchAgents" / "ai.tokenclaw.tmuxctld.plist"

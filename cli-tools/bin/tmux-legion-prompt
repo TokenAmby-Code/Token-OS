@@ -89,7 +89,9 @@ if ! tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qE 
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-LIB_DIR="${SCRIPT_DIR}/../lib"
+REPO_ROOT="${TOKEN_OS:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+TMUXCTLD_LIB="${TMUXCTLD_LIB:-${REPO_ROOT}/tmuxctld/lib}"
+CLI_LIB="${REPO_ROOT}/cli-tools/lib"
 
 printf -v PROMPT_Q '%q' "$PROMPT_TEXT"
 DISPATCH_BIN="${SCRIPT_DIR}/dispatch"
@@ -109,7 +111,7 @@ if $DRY_RUN; then
 fi
 
 PANE_ID="$(
-    PYTHONPATH="${LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+    PYTHONPATH="${TMUXCTLD_LIB}:${CLI_LIB}${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m tmuxctl.cli stack dispatch mechanicus \
             --session "$SESSION" \
             --cwd "$HOME" \
