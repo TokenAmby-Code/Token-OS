@@ -2934,7 +2934,6 @@ async def handle_session_start(payload: dict) -> dict:
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
     )
     session_doc_policy = None
-    dispatch_bound_doc = False
 
     async with shared.hook_db() as db:
         db.row_factory = aiosqlite.Row
