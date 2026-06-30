@@ -124,3 +124,16 @@ def test_focus_guard_allows_title_only_select_and_restore_override(
     monkeypatch.setenv("IMPERIUM_TMUX_FOCUS_RESTORE", "1")
     adapter.run("select-pane", "-Z", "-t", "main:mechanicus", "-T", "worker", allow_failure=True)
     assert ("select-pane", "-Z", "-t", "main:mechanicus", "-T", "worker") in fake.calls
+
+
+def test_tmux_binary_skips_cli_tools_wrapper_after_root_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    wrapper = repo_root / "cli-tools" / "bin" / "tmux"
+    monkeypatch.delenv("IMPERIUM_TMUX_BIN", raising=False)
+    monkeypatch.delenv("REAL_TMUX", raising=False)
+    monkeypatch.delenv("TMUX_BIN", raising=False)
+    monkeypatch.setattr(tmux_adapter.shutil, "which", lambda *_args, **_kwargs: str(wrapper))
+
+    assert pathlib.Path(tmux_adapter.tmux_binary()).resolve() != wrapper.resolve()

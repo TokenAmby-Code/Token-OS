@@ -62,6 +62,7 @@ from .tmux_adapter import (
     TmuxSendGated,
     normalize_prompt_payload,
     prompt_payload_hash,
+    tmux_binary,
 )
 
 DEFAULT_HOST = "127.0.0.1"
@@ -116,7 +117,7 @@ def ensure_tmux_lifecycle_hooks() -> dict:
     for command in commands:
         try:
             proc = subprocess.run(
-                ("tmux", *command),
+                (tmux_binary(), *command),
                 capture_output=True,
                 text=True,
                 timeout=5,
