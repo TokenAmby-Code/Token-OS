@@ -6,16 +6,6 @@ operator explicitly protects one role. Unknown clients are never detached.
 
 from __future__ import annotations
 
-# 410 GONE tombstone: tmux CLI exterminatus 2026-06-30.
-import sys as _tmux_410_sys
-
-_tmux_410_sys.stderr.write(
-    "410 GONE: cli-tools/lib/tmux_client_lease.py (tmux_client_lease.py) is tombstoned by the 2026-06-30 tmux CLI exterminatus.\\nThis cold tmux feature surface must not be used as an active runtime/control path.\\nDaemon-native replacement: tmuxctld client lease/event route TBD.\\nOriginal body is retained below this early-return as the emergency restore lever; lift only this tombstone block to prove an active blocker, build/cut over the daemon-native replacement, then restore the 410.\\n"
-)
-raise SystemExit(410)
-
-# --- ORIGINAL BODY BELOW: emergency restore lever, intentionally dead under the 410. ---
-
 import argparse
 import os
 import re

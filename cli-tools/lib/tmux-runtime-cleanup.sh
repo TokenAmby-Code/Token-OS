@@ -1,16 +1,4 @@
 #!/usr/bin/env bash
-# 410 GONE tombstone: tmux CLI exterminatus 2026-06-30.
-{
-    cat >&2 <<'__TMUX_410_TOMBSTONE__'
-410 GONE: cli-tools/lib/tmux-runtime-cleanup.sh (tmux-runtime-cleanup.sh) is tombstoned by the 2026-06-30 tmux CLI exterminatus.
-This cold tmux feature surface must not be used as an active runtime/control path.
-Daemon-native replacement: tmuxctld POST /hooks/wrapperend or POST /clear-runtime.
-Original body is retained below this early-return as the emergency restore lever; lift only this tombstone block to prove an active blocker, build/cut over the daemon-native replacement, then restore the 410.
-__TMUX_410_TOMBSTONE__
-}
-return 410 2>/dev/null || exit 410
-
-# --- ORIGINAL BODY BELOW: emergency restore lever, intentionally dead under the 410. ---
 # Shared pane-scoped runtime cleanup for agent wrapper exit and operator closeout.
 
 # Usage: tmux_runtime_cleanup_pane <pane> [--preserve-persona-guard]
