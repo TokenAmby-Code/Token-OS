@@ -1632,7 +1632,7 @@ async def queue_tts(
         # profile. Holds the single-queue invariant without a parallel path.
         row = _SYSTEM_TTS_ROW
     else:
-        # Look up instance to get their profile
+        # Look up instance and resolve audio settings from its persona.
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
@@ -1689,8 +1689,8 @@ async def queue_tts(
         logger.info(f"TTS suppressed (persona_silent): {message[:80]}")
         return {"success": True, "queued": False, "reason": "persona_silent"}
 
-    # Belt-and-suspenders: an independent silence guarantee. A voiced policy on a
-    # voiceless instance (no resolved voice) still must not speak.
+    # Belt-and-suspenders: an independent silence guarantee. A voiced policy
+    # without a resolved persona voice still must not speak.
     if row["tts_voice"] is None:
         return {"success": True, "queued": False, "reason": "persona_silent"}
 

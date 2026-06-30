@@ -4,10 +4,10 @@ Runtime writes use canonical present-tense ``instances`` columns only. Archive a
 migration imports may translate historical rows, but normal insert/update paths
 must reject dead launch, voice, and projection fields instead of mapping them.
 
-The ``instances`` table is durable identity plus explicitly retained subsystem
-state. Tmux/dispatch/launch/transient placement fields and persona-derived audio
-fields are forbidden runtime shape. Tmux routing is tmuxctld state; launch
-provenance is events/provenance; audio is persona/chapter-lock state.
+The ``instances`` table is durable live-agent registry state: identity,
+lifecycle, workflow, notification, and Golden Throne binding. Launch envelopes,
+pane geometry, transplant markers, and copied persona audio settings are not
+instance state.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from datetime import datetime
 
 DEFAULT_INSTANCE_NAME = "needs-name"
 
-IDENTITY_COLUMNS = [
+INSTANCE_COLUMNS = [
     "id",
     "name",
     "engine",
@@ -42,20 +42,7 @@ IDENTITY_COLUMNS = [
     "golden_throne",
     "human_anchored_at",
     "human_anchor_source",
-]
-
-# Transitional subsystem annex (see module docstring). Order matters: it is the
-# physical column order in the CREATE TABLE.
-#
-# EXTERMINATED from canonical instances:
-# - tmux/dispatch/launch/transient placement/provenance fields
-#   (dispatch_*, launch_mode, launcher, target_working_dir, transplant_*).
-# - persona-derived audio fields (tts_voice, notification_sound).
-# Tmux routing belongs to tmuxctld's live oracle; launch provenance belongs in
-# events/mutations/provenance tables; audio belongs to personas/chapter locks.
-RUNTIME_ANNEX_COLUMNS = [
     "input_lock",
-    # discord hosting
     "discord_hosted",
     "discord_channel",
     "discord_bot",
@@ -89,8 +76,6 @@ RUNTIME_ANNEX_COLUMNS = [
     "follow_up_sop",
     "stop_allowed",
 ]
-
-INSTANCE_COLUMNS = IDENTITY_COLUMNS + RUNTIME_ANNEX_COLUMNS
 
 FORBIDDEN_RUNTIME_INSTANCE_FIELDS = {
     # dead projections / historical request names
@@ -127,13 +112,13 @@ FORBIDDEN_RUNTIME_INSTANCE_FIELDS = {
     "notification_sound",
 }
 
-RUNTIME_WRITE_INSTANCE_COLUMNS = [
-    column for column in INSTANCE_COLUMNS if column not in FORBIDDEN_RUNTIME_INSTANCE_FIELDS
-]
+# Runtime writers may only address the canonical physical schema. This alias is
+# intentionally boring so mutation/write code never knows old column names as
+# writable destinations.
+RUNTIME_WRITE_INSTANCE_COLUMNS = list(INSTANCE_COLUMNS)
 RUNTIME_WRITE_INSTANCE_FIELDS = set(RUNTIME_WRITE_INSTANCE_COLUMNS)
 
-# Historical instance table columns with NO live home: their values exist only in
-# archive.db. Reads repoint to the instance-table derivation noted inline.
+# Columns from extracted historical instance shapes with no live home.
 REMOVED_INSTANCE_COLUMNS = {
     "tab_name",  # -> instances.name
     "session_id",  # archive-only
@@ -292,10 +277,10 @@ def archive_row_to_instance_values(row: dict | None, persona_id: int | None = No
         "human_anchored_at": row.get("human_anchored_at"),
         "human_anchor_source": row.get("human_anchor_source"),
     }
-    # Archive/migration passthrough: preserve historical physical columns when
-    # deliberately importing historical rows.
-    for column in RUNTIME_ANNEX_COLUMNS:
-        if column in row:
+    # Copy only fields that are canonical in the present schema. Extracted
+    # launch/audio/transplant fields remain archive-only.
+    for column in INSTANCE_COLUMNS:
+        if column not in values and column in row:
             values[column] = row.get(column)
     return values
 

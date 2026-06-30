@@ -697,6 +697,50 @@ async def _apply_commander_binding(
     )
 
 
+RAW_TMUX_PANE_ID_RE = re.compile(r"^%\d+$")
+
+
+async def _canonical_dispatch_target_for_session_start(
+    *,
+    dispatch_target: str | None,
+    launch_mode: str | None,
+    tmux_pane: str | None,
+    pane_label: str | None,
+) -> str | None:
+    """Return the live dispatch target for SessionStart routing decisions.
+
+    ``launch_mode=tmux_target`` persona-seat/cutover respawns can arrive with
+    ``TOKEN_API_DISPATCH_TARGET=$TMUX_PANE``. Raw ``%NN`` pane ids are transient
+    tmux runtime addresses and must not be persisted; routing should use the
+    pane's public tmuxctld/@PANE_ID alias when available.
+    """
+    target = _normalize_text(dispatch_target)
+    if not target or not RAW_TMUX_PANE_ID_RE.fullmatch(target):
+        return target
+    if (_normalize_text(launch_mode) or "").lower() != "tmux_target":
+        return target
+
+    label = _normalize_text(pane_label)
+    if label:
+        return label
+
+    # Prefer a public pane label; fall back to the effective event pane when the
+    # target was copied from $TMUX_PANE but the effective pane was later resolved
+    # from a stable label.
+    resolved_label = await _tmux_pane_label(target)
+    if resolved_label:
+        return resolved_label
+    if tmux_pane and tmux_pane != target:
+        resolved_label = await _tmux_pane_label(tmux_pane)
+        if resolved_label:
+            return resolved_label
+
+    # Fail closed to the original value when the pane has no public id; the
+    # existing reconciler/tests will surface that unresolved state. Do not invent
+    # aliases.
+    return target
+
+
 async def _apply_persona_seat_name(
     db,
     *,
@@ -1304,9 +1348,7 @@ def _is_mechanicus_worker_row(row: dict) -> bool:
     label = row.get("effective_pane_label")
     if label in {MECHANICUS_FG_LABEL, MECHANICUS_ORCHESTRATOR_LABEL}:
         return False
-    if _is_mechanicus_worker_label(label):
-        return True
-    return False
+    return _is_mechanicus_worker_label(label)
 
 
 async def _active_stop_subscription_id(
@@ -2991,10 +3033,8 @@ async def handle_session_start(payload: dict) -> dict:
         # Priority: hook file handoff > primarch singleton
         supplant_id = None
 
-        # 1. File-based handoff (local transplant — injected by generic-hook.sh).
-        # Cross-device handoff belongs in explicit launch provenance, not an
-        # instances.transplant_target_session column.
-        if transplant_from:
+        # 1. File-based handoff (local transplant — injected by generic-hook.sh)
+        if not supplant_id and transplant_from:
             supplant_id = transplant_from
 
         # 2. Persona singleton (reuse most recent instance bound to the same
@@ -4021,8 +4061,8 @@ async def handle_session_start(payload: dict) -> dict:
                 )
                 cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (auto_slug,))
                 auto_persona_row = await cursor.fetchone()
-                if auto_persona_row:
-                    legion_updates["persona_id"] = auto_persona_row["id"]
+            if auto_persona_row:
+                legion_updates["persona_id"] = auto_persona_row["id"]
             # Persona panes (Custodes, FG, Administratum, …) are recognised by their
             # tmux label. The moment one is, bind its persona_id. Voice/sound are
             # persona-table concepts now, never per-instance columns. Pane colour is

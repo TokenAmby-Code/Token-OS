@@ -40,8 +40,6 @@ OFFICIAL_INSTANCE_NAME_ACTORS = frozenset(
 # Tracked mutation surface for normal runtime writes. Forbidden/dead columns are
 # deliberately absent, so mutation payloads cannot carry them.
 INSTANCE_MUTATION_FIELDS = set(RUNTIME_WRITE_INSTANCE_COLUMNS) - {"id", "created_at"}
-
-
 CANONICAL_INSTANCE_FIELDS = set(RUNTIME_WRITE_INSTANCE_COLUMNS)
 
 

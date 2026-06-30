@@ -2763,7 +2763,7 @@ async def register_instance(request: InstanceRegisterRequest):
                 profile = persona_to_profile(dict(persona_row))
             else:
                 profile = {
-                    "name": None,
+                    "name": existing["name"],
                     "wsl_voice": None,
                     "notification_sound": None,
                     "color": "#0099ff",
@@ -3796,10 +3796,10 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
 
 @app.patch("/api/instances/{instance_id}/transplant-pending")
 async def mark_transplant_pending(instance_id: str, target_session: str):
-    """Reject transplant markers as non-canonical instance state."""
+    """Reject DB transplant markers as non-canonical instance state."""
     raise HTTPException(
         status_code=410,
-        detail="transplant markers are not canonical instance fields",
+        detail="DB transplant markers are removed from instances; use hook handoff files",
     )
 
 
@@ -10922,9 +10922,7 @@ async def set_instance_legion(instance_id: str, request: Request):
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        # The legacy `legion`/`profile_name` columns died with the old table —
-        # legion identity now lives in persona_id. Resolve the legion to its persona
-        # and bind persona_id (plus annex voice/sound from the profile).
+        # Resolve the legion to its persona and bind persona_id.
         updates: dict = {}
         persona_slug = LEGION_PERSONA_SLUGS.get(legion)
         if persona_slug:
@@ -11988,8 +11986,8 @@ async def set_instance_type(instance_id: str, request: Request):
             updates["rank"] = "retired"
         elif new_type == "golden_throne":
             # A golden_throne row holds the GT engine state; the marker references it.
-            # Reuse an existing GT binding when present, else mint one seeded from
-            # the requested/annex values. Insert the row BEFORE setting the marker
+            # Reuse an existing GT binding when present, else mint one from the
+            # requested values. Insert the row BEFORE setting the marker
             # (the guard trigger requires the marker to be NULL | 'sync' | a GT id).
             if _gt_marker and _gt_marker != "sync":
                 marker = _gt_marker
@@ -12001,7 +11999,7 @@ async def set_instance_type(instance_id: str, request: Request):
                     stop_allowed=instance["stop_allowed"],
                 )
             updates["golden_throne"] = marker
-        # new_type == "hook_driven": no marker change (hook_driven is an annex flag,
+        # new_type == "hook_driven": no marker change (hook_driven is an automation flag,
         # not a golden_throne state); leave the marker untouched.
 
         await update_instance(
