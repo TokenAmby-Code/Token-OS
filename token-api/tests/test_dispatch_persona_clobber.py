@@ -62,7 +62,7 @@ def _identity_row(conn: sqlite3.Connection, instance_id: str) -> sqlite3.Row:
 
 
 async def test_chapter_insert_preserves_explicit_worker_persona_and_singleton(app_env):
-    from instance_mutation import sanctioned_insert_instance
+    from instance_mutation import insert_instance
 
     conn = _conn(app_env.db_path)
     _seed_instance(conn, "fg-overseer", persona_slug="fabricator-general", rank="overseer")
@@ -72,7 +72,7 @@ async def test_chapter_insert_preserves_explicit_worker_persona_and_singleton(ap
 
     now = datetime.now().isoformat()
     async with aiosqlite.connect(app_env.db_path) as db:
-        await sanctioned_insert_instance(
+        await insert_instance(
             db,
             values={
                 "id": "salamander-worker",
@@ -109,14 +109,14 @@ async def test_chapter_insert_preserves_explicit_worker_persona_and_singleton(ap
 
 
 def test_chapter_insert_falls_back_to_commander_persona_when_worker_has_none(app_env):
-    from instance_mutation import sanctioned_insert_instance_sync
+    from instance_mutation import insert_instance_sync
 
     conn = _conn(app_env.db_path)
     _seed_instance(conn, "fg-overseer", persona_slug="fabricator-general", rank="overseer")
     conn.commit()
 
     now = datetime.now().isoformat()
-    sanctioned_insert_instance_sync(
+    insert_instance_sync(
         conn,
         values={
             "id": "orphan-persona-worker",

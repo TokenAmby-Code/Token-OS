@@ -34,7 +34,7 @@ def _insert_voiced_instance(db_path: Path) -> str:
     Angels) — a normal pause-queue sender. queue_tts denies submissions from
     instances with no resolved persona (deny-by-default), so the fixture carries an
     explicit voiced policy; ``pause`` respects the caller's queue_target."""
-    from instance_mutation import sanctioned_insert_instance_sync, sanctioned_update_instance_sync
+    from instance_mutation import insert_instance_sync, update_instance_sync
     from personas import persona_id_for_slug
 
     iid = str(uuid.uuid4())
@@ -42,26 +42,21 @@ def _insert_voiced_instance(db_path: Path) -> str:
     import sqlite3
 
     conn = sqlite3.connect(db_path)
-    sanctioned_insert_instance_sync(
+    insert_instance_sync(
         conn,
         values={
             "id": iid,
-            "session_id": str(uuid.uuid4()),
-            "tab_name": f"tts-{iid[:8]}",
             "working_dir": "/tmp/test",
             "origin_type": "local",
             "device_id": "Mac-Mini",
             "status": "idle",
-            "tts_mode": "verbose",
-            "registered_at": now,
             "last_activity": now,
-            "tts_voice": "Microsoft George",
         },
         mutation_type="instance_registered",
         write_source="test",
         actor="test",
     )
-    sanctioned_update_instance_sync(
+    update_instance_sync(
         conn,
         instance_id=iid,
         updates={"persona_id": persona_id_for_slug("blood-angels")},

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import shared
-from instance_mutation import sanctioned_update_instance
+from instance_mutation import update_instance
 from personas import BLACK_SHIELDS, UPSERT_SQL, seed_params
 from session_doc_helpers import update_frontmatter
 
@@ -161,7 +161,7 @@ async def apply_instance_lifecycle(
         actor = actor or "banish-instance"
         result["persona"] = banished_to
 
-    await sanctioned_update_instance(
+    await update_instance(
         db,
         instance_id=instance_id,
         updates=updates,

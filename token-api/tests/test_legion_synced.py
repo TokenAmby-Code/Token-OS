@@ -225,14 +225,14 @@ class TestSetLegion:
         )
 
         iid = _insert_instance()
-        from instance_mutation import sanctioned_update_instance_sync
+        from instance_mutation import update_instance_sync
 
         persona_id = personas.persona_id_for_slug("ultramarines")
         conn = sqlite3.connect(app_env.db_path)
         expected_tint = conn.execute(
             "SELECT pane_tint FROM personas WHERE id = ?", (persona_id,)
         ).fetchone()[0]
-        sanctioned_update_instance_sync(
+        update_instance_sync(
             conn,
             instance_id=iid,
             updates={"persona_id": persona_id},

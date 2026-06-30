@@ -37,7 +37,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from human_render import sanitize_human_render_text, sanitize_human_render_text_sync
-from instance_mutation import sanctioned_update_instance
+from instance_mutation import update_instance
 from personas import (
     BACKUP_ASTARTES,
     PRIMARY_ASTARTES,
@@ -1044,7 +1044,7 @@ _last_pause_queue_expiry_sweep = 0.0
 # be heard, just through the gate like everything else.
 SYSTEM_INSTANCE_ID = "system"
 _SYSTEM_TTS_ROW: dict[str, object] = {
-    "tab_name": "System",
+    "name": "System",
     "tts_voice": "Microsoft George",  # Custodes' reserved voice
     "notification_sound": "chimes.wav",
     "tts_mode": "verbose",
@@ -1636,9 +1636,7 @@ async def queue_tts(
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """SELECT i.name AS tab_name,
-                          p.tts_voice AS tts_voice,
-                          p.notification_sound AS notification_sound,
+                """SELECT i.name, p.tts_voice, p.notification_sound,
                           CASE WHEN i.interaction_mode = 'voice_chat'
                                THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
                           p.slug AS persona_slug, p.tts_policy AS tts_policy
@@ -1698,7 +1696,7 @@ async def queue_tts(
 
     voice = row["tts_voice"]
     sound = row["notification_sound"]
-    tab_name = row["tab_name"] or instance_id
+    tab_name = row["name"] or instance_id
 
     # Check TTS mode (per-instance and global, most restrictive wins)
     instance_mode = row["tts_mode"] or "verbose"
@@ -2498,7 +2496,7 @@ async def set_global_tts_mode(request: Request, mode: str | None = None) -> dict
         )
         rows = await cursor.fetchall()
         for row in rows:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=row[0],
                 updates={"notification_mode": mode},

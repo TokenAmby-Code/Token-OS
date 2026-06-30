@@ -101,7 +101,7 @@ class TestSchema:
 
 
 class TestProvenance:
-    def test_session_start_writes_sanctioned_mutation(self, client, app_env):
+    def test_session_start_writes_instance_mutation(self, client, app_env):
         instance_id = _session_start(client)
         rows = _mutations_for(app_env, instance_id)
         assert rows
@@ -262,7 +262,7 @@ class TestReconciliation:
         assert resp.json()["status"] == "clean"
 
     def test_unofficial_name_write_is_rejected(self, app_env):
-        from instance_mutation import sanctioned_update_instance_sync
+        from instance_mutation import update_instance_sync
 
         instance_id = "unauth-name"
         conn = _db(app_env)
@@ -274,7 +274,7 @@ class TestReconciliation:
         )
         conn.commit()
         with pytest.raises(ValueError, match="official rename path"):
-            sanctioned_update_instance_sync(
+            update_instance_sync(
                 conn,
                 instance_id=instance_id,
                 updates={"name": "path-derived-name"},
@@ -285,7 +285,7 @@ class TestReconciliation:
         conn.close()
 
     def test_official_name_write_rejects_deprecated_placeholders(self, app_env):
-        from instance_mutation import sanctioned_update_instance_sync
+        from instance_mutation import update_instance_sync
 
         instance_id = "deprecated-placeholder-name"
         conn = _db(app_env)
@@ -297,7 +297,7 @@ class TestReconciliation:
         )
         conn.commit()
         with pytest.raises(ValueError, match="deprecated placeholder"):
-            sanctioned_update_instance_sync(
+            update_instance_sync(
                 conn,
                 instance_id=instance_id,
                 updates={"name": "needs-session-name-123"},

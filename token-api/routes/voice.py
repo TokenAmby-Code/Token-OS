@@ -21,7 +21,7 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from instance_mutation import sanctioned_update_instance
+from instance_mutation import update_instance
 from personas import (
     assign_astartes_persona,
     astartes_persona_by_tts_voice,
@@ -194,7 +194,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
                 "profile": profile,
             }
 
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={"persona_id": target_persona["id"]},
@@ -264,7 +264,8 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
         old_sound = row["notification_sound"]
 
         if mode == "silent":
-            await sanctioned_update_instance(
+            # Release voice slot
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates={
@@ -290,7 +291,7 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
             }
             if not row["persona_id"]:
                 updates["persona_id"] = persona["id"]
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates=updates,
@@ -299,7 +300,7 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
                 actor="tts-mode",
             )
         else:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates={
@@ -354,7 +355,7 @@ async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: st
         "interaction_mode": "voice_chat" if active else "text",
     }
     async with aiosqlite.connect(DB_PATH) as db:
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates=updates,

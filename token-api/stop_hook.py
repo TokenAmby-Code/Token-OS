@@ -25,7 +25,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from instance_mutation import sanctioned_update_instance_sync
+from instance_mutation import update_instance_sync
 from pane_surface import human_tab_name
 
 _LEGACY_AGENTS_DB_PATH = (Path.home() / ".claude" / "agents.db").resolve()
@@ -63,7 +63,7 @@ def mark_cron_instance_stopped(instance_id: str):
     try:
         con = sqlite3.connect(str(DB_PATH))
         try:
-            sanctioned_update_instance_sync(
+            update_instance_sync(
                 con,
                 instance_id=instance_id,
                 updates={
@@ -99,7 +99,7 @@ def clear_human_anchor_on_stop(instance_id: str) -> None:
     try:
         with contextlib.closing(sqlite3.connect(str(DB_PATH))) as con, con:
             try:
-                sanctioned_update_instance_sync(
+                update_instance_sync(
                     con,
                     instance_id=instance_id,
                     updates={

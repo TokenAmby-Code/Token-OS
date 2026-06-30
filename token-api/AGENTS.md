@@ -115,7 +115,7 @@ Key fields:
 
 Sanction policy:
 - Direct reads are fine.
-- New instance-row writes should prefer `sanctioned_update_instance()` / `sanctioned_insert_instance()`.
+- New instance-row writes should prefer `update_instance()` / `insert_instance()`.
 - Remaining direct SQL writes to `claude_instances` should be treated as explicit debt and will show up as suspicious in reconciliation until migrated.
 
 ## Core API Endpoints
@@ -462,7 +462,7 @@ Current sanctioned coverage:
 - API writes for transplant pending, zealotry, discord linkage, instance type, archive / unarchive, and victory metadata
 - per-instance voice reassignment, per-instance `tts_mode`, voice-chat mode sync, and global TTS mode fanout
 - background/system writes for stale cleanup, stale processing clear, stop-evaluator idle transition, naming-nudge workflow
-- sync stop-hook stop marking via `sanctioned_update_instance_sync()`
+- sync stop-hook stop marking via `update_instance_sync()`
 
 Remaining direct-write debt worth tracking:
 - bootstrap / migration / full-table admin operations still use direct SQL where provenance is not the goal

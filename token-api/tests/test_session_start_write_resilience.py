@@ -15,7 +15,7 @@ New gap, not a regression of #225/#198:
 - #225 added a client ``curl --retry`` plus a persona-only sweep; the retry is
   defeated by the 200-swallow and the sweep doesn't cover generic workers.
 - #198 made ``POST /api/instances/register`` idempotent on UNIQUE, but the *hook*
-  path's ``sanctioned_insert_instance`` was never made idempotent.
+  path's ``insert_instance`` was never made idempotent.
 
 Fix under test:
 1. The registration INSERT retries on ``database is locked`` at its narrow,
@@ -72,7 +72,7 @@ def test_registration_insert_retries_on_database_locked(
     monkeypatch.setattr(hooks, "_HOOK_DB_LOCKED_BACKOFF", 0.0, raising=False)
     monkeypatch.setattr(hooks, "log_event", _noop_event)
 
-    real_insert = hooks.sanctioned_insert_instance
+    real_insert = hooks.insert_instance
     calls = {"n": 0}
 
     async def flaky_insert(db: object, **kwargs: object) -> object:
@@ -81,7 +81,7 @@ def test_registration_insert_retries_on_database_locked(
             raise aiosqlite.OperationalError("database is locked")
         return await real_insert(db, **kwargs)
 
-    monkeypatch.setattr(hooks, "sanctioned_insert_instance", flaky_insert)
+    monkeypatch.setattr(hooks, "insert_instance", flaky_insert)
 
     resp = client.post("/api/hooks/SessionStart", json={"session_id": "lock-1", "cwd": "/tmp"})
 
@@ -102,7 +102,7 @@ def test_session_start_idempotent_on_unique_insert_race(
     hooks = sys.modules["routes.hooks"]
     monkeypatch.setattr(hooks, "log_event", _noop_event)
 
-    real_insert = hooks.sanctioned_insert_instance
+    real_insert = hooks.insert_instance
     state = {"raised": False}
 
     async def colliding_insert(db: object, **kwargs: object) -> object:
@@ -117,7 +117,7 @@ def test_session_start_idempotent_on_unique_insert_race(
             raise aiosqlite.IntegrityError("UNIQUE constraint failed: instances.id")
         return await real_insert(db, **kwargs)
 
-    monkeypatch.setattr(hooks, "sanctioned_insert_instance", colliding_insert)
+    monkeypatch.setattr(hooks, "insert_instance", colliding_insert)
 
     resp = client.post("/api/hooks/SessionStart", json={"session_id": "race-1", "cwd": "/tmp"})
 
@@ -143,7 +143,7 @@ def test_non_instance_id_unique_failure_is_not_swallowed(
     async def unrelated_unique_failure(db: object, **kwargs: object) -> object:
         raise aiosqlite.IntegrityError("UNIQUE constraint failed: instance_mutations.write_txn_id")
 
-    monkeypatch.setattr(hooks, "sanctioned_insert_instance", unrelated_unique_failure)
+    monkeypatch.setattr(hooks, "insert_instance", unrelated_unique_failure)
 
     resp = client.post("/api/hooks/SessionStart", json={"session_id": "other-1", "cwd": "/tmp"})
 

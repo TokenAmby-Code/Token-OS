@@ -106,12 +106,16 @@ from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
     create_golden_throne_binding,  # noqa: F401 — used in PATCH /type GT promotion
     get_instance_mutations,
+    insert_instance,
     is_official_instance_name_actor,
     reconcile_instance,
-    sanctioned_insert_instance,
-    sanctioned_update_instance,
+    update_instance,
 )
-from instance_registry import DEFAULT_INSTANCE_NAME, VALID_STATUSES, derived_cockpit_label
+from instance_registry import (
+    DEFAULT_INSTANCE_NAME,
+    VALID_STATUSES,
+    derived_cockpit_label,
+)
 from morning_supervisor import arm_morning_supervisor
 from pane_surface import (
     human_pane_surface as _format_human_pane_surface,
@@ -1870,7 +1874,7 @@ async def cleanup_stale_instances() -> dict:
                 continue
             reaped.append(instance_id)
         for instance_id in reaped:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates={
@@ -1950,7 +1954,7 @@ async def reconcile_live_panes() -> dict:
                 continue
             if row["status"] not in ("stopped", "archived"):
                 continue
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates={"status": "idle", "stopped_at": None, "last_activity": now},
@@ -2631,7 +2635,7 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
 
         nudge_count = await _count_naming_nudges(db, instance_id)
         if nudge_count >= NAMING_NUDGE_MAX_PER_INSTANCE:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates={"workflow_blocked_reason": "naming_refused"},
@@ -2662,7 +2666,7 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
             }
 
         if instance.get("workflow_blocked_reason") != "tab_name_placeholder":
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates={"workflow_blocked_reason": "tab_name_placeholder"},
@@ -2740,7 +2744,7 @@ async def register_instance(request: InstanceRegisterRequest):
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (request.instance_id,))
         existing = await cursor.fetchone()
         if existing is not None:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=request.instance_id,
                 updates={"last_activity": datetime.now().isoformat()},
@@ -2784,19 +2788,15 @@ async def register_instance(request: InstanceRegisterRequest):
         now = datetime.now().isoformat()
         instance_values = {
             "id": request.instance_id,
-            "session_id": session_id,
-            "name": request.tab_name,
             "working_dir": request.working_dir,
             "origin_type": request.origin_type,
-            "source_ip": request.source_ip,
             "device_id": device_id,
             "persona_id": persona.get("id"),
-            "pid": request.pid,
             "status": "idle",
             "created_at": now,
             "last_activity": now,
         }
-        await sanctioned_insert_instance(
+        await insert_instance(
             db,
             values=instance_values,
             mutation_type="instance_registered",
@@ -2813,7 +2813,7 @@ async def register_instance(request: InstanceRegisterRequest):
         "instance_registered",
         instance_id=request.instance_id,
         device_id=device_id,
-        details={"tab_name": request.tab_name, "origin_type": request.origin_type},
+        details={"name": request.tab_name, "origin_type": request.origin_type},
     )
 
     # Push updated instance count to phone widget
@@ -3029,7 +3029,7 @@ async def kill_instance(instance_id: str):
             else:
                 # Mark stopped in DB anyway (cleanup)
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await sanctioned_update_instance(
+                    await update_instance(
                         db,
                         instance_id=instance_id,
                         updates={
@@ -3055,7 +3055,7 @@ async def kill_instance(instance_id: str):
         else:
             # Can't scan /proc on remote device
             async with aiosqlite.connect(DB_PATH) as db:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=instance_id,
                     updates={
@@ -3085,7 +3085,7 @@ async def kill_instance(instance_id: str):
         if not is_pid_claude(pid):
             # Process already exited or PID reused by another process
             async with aiosqlite.connect(DB_PATH) as db:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=instance_id,
                     updates={
@@ -3114,7 +3114,7 @@ async def kill_instance(instance_id: str):
         except ProcessLookupError:
             # Already dead
             async with aiosqlite.connect(DB_PATH) as db:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=instance_id,
                     updates={
@@ -3212,7 +3212,7 @@ async def kill_instance(instance_id: str):
 
     # Mark stopped in DB
     async with aiosqlite.connect(DB_PATH) as db:
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={
@@ -3699,7 +3699,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         old_name = row[1]
         session_doc_id = row[2]
         session_doc_policy = row[3]
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={"name": request.tab_name},
@@ -3765,7 +3765,7 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
 
         old_name = row["tab_name"]
         instance_id = row["id"]
-        result = await sanctioned_update_instance(
+        result = await update_instance(
             db,
             instance_id=instance_id,
             updates={"name": tab_name},
@@ -3796,18 +3796,7 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
 
 @app.patch("/api/instances/{instance_id}/transplant-pending")
 async def mark_transplant_pending(instance_id: str, target_session: str):
-    """Record transplant intent without mutating the canonical instance row."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT 1 FROM instances WHERE id = ?", (instance_id,))
-        if not await cursor.fetchone():
-            raise HTTPException(status_code=404, detail="Instance not found")
-
-    await log_event(
-        "transplant_pending",
-        instance_id=instance_id,
-        details={"target_session": target_session},
-    )
-
+    """Reject DB transplant markers as non-canonical instance state."""
     raise HTTPException(
         status_code=410,
         detail="DB transplant markers are removed from instances; use hook handoff files",
@@ -3829,7 +3818,7 @@ async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
             raise HTTPException(status_code=404, detail="Instance not found")
         if row["input_lock"] is not None:
             return {"acquired": False, "held_by": row["input_lock"]}
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={"input_lock": locker},
@@ -3853,7 +3842,7 @@ async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
         if row["input_lock"] == locker:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates={"input_lock": None},
@@ -3916,7 +3905,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
         # Do not consult stored tmux pane columns here. Runtime liveness belongs
         # to tmuxctl; if a caller needs pane truth it must resolve it live.
 
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={"status": new_status, "last_activity": now, "stopped_at": None},
@@ -3981,7 +3970,7 @@ async def set_instance_status(
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates=updates,
@@ -4236,7 +4225,7 @@ async def _golden_throne_mark_quiet_edge_handled(
     if extra_updates:
         updates.update(extra_updates)
     async with aiosqlite.connect(DB_PATH) as db:
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates=updates,
@@ -4292,7 +4281,7 @@ async def record_golden_throne_resume(instance: dict) -> dict:
         "gt_last_resume_at": now.isoformat(),
     }
     async with aiosqlite.connect(DB_PATH) as db:
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=session_id,
             updates=updates,
@@ -4381,7 +4370,7 @@ async def golden_throne_user_activity(instance_id: str, source: str = "prompt_su
     await _gt_clear_fire(instance_id)
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={
@@ -4521,7 +4510,7 @@ async def clear_invalid_golden_throne_binding(
             )
             row = await cursor.fetchone()
             previous_marker = row["golden_throne"] if row else None
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={
@@ -5753,7 +5742,7 @@ async def _flag_hook_driven(
                 # Target row not registered yet — nothing to flag (rare race).
                 return
             shared.note_hook_driven_actor(target_id, actor)
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=target_id,
                 updates={"hook_driven": 1},
@@ -8263,7 +8252,7 @@ async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> N
     """
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=session_id,
             updates={
@@ -8497,7 +8486,7 @@ async def golden_throne_followup(session_id: str):
     if dispatch_fingerprint:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=session_id,
                     updates={"gt_last_dispatch_fingerprint": dispatch_fingerprint},
@@ -10884,7 +10873,7 @@ async def set_zealotry(instance_id: str, request: Request):
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={"zealotry": zealotry},
@@ -10939,9 +10928,9 @@ async def set_instance_legion(instance_id: str, request: Request):
         if persona_slug:
             persona = await resolve_persona(db, persona_slug)
             if persona:
-                updates.update({"persona_id": persona["id"]})
+                updates["persona_id"] = persona["id"]
         if updates:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates=updates,
@@ -11015,7 +11004,7 @@ async def set_instance_synced(instance_id: str, request: Request):
                     detail=f"Legion '{legion}' already has a synced session: {conflict[0][:12]}",
                 )
 
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={"golden_throne": "sync" if synced_int else None},
@@ -11036,7 +11025,7 @@ async def set_instance_pr(instance_id: str, request: Request):
     Phase 1: pr-create calls this best-effort after `gh pr create`, keyed off
     $TOKEN_API_INSTANCE_ID, so /ui/ops badges the originating instance. pr_state is
     flipped to 'merged' by the CD restart-on-merge webhook (Phase 2). Writes go
-    through sanctioned_update_instance (pr_url/pr_state are registered mutable fields).
+    through update_instance (pr_url/pr_state are registered mutable fields).
     """
     body = await request.json()
     pr_state = body.get("pr_state")
@@ -11056,7 +11045,7 @@ async def set_instance_pr(instance_id: str, request: Request):
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates=updates,
@@ -11095,7 +11084,7 @@ async def set_instance_discord(instance_id: str, request: Request):
                 status_code=400, detail="Provide discord_hosted and/or discord_channel"
             )
 
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates=updates,
@@ -11537,7 +11526,7 @@ async def _victory_ack_core(
             linked_instance_ids.append(iid)
             tab = linked["tab_name"] or iid[:12]
             instance_surfaces.append(tab if _is_meaningful_tab_name(tab) else iid[:12])
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=iid,
                 updates={
@@ -11840,7 +11829,7 @@ async def declare_victory(instance_id: str, request: Request):
     # No linked doc — legacy bare-instance path.
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={
@@ -12013,7 +12002,7 @@ async def set_instance_type(instance_id: str, request: Request):
         # new_type == "hook_driven": no marker change (hook_driven is an automation flag,
         # not a golden_throne state); leave the marker untouched.
 
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates=updates,
@@ -12133,7 +12122,7 @@ async def archive_instance(instance_id: str):
             raise HTTPException(status_code=404, detail="Instance not found")
         # Archived is a canonical status; the legacy instance_type='archived' marker died.
         # Clear the golden_throne marker so an archived row carries no GT state.
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={"status": "archived", "golden_throne": None, "rank": "retired"},
@@ -12161,7 +12150,7 @@ async def unarchive_instance(instance_id: str):
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
         # Unarchive → one_off: status back to idle, golden_throne marker cleared.
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={"status": "idle", "golden_throne": None},
@@ -12543,7 +12532,7 @@ async def get_instance_provenance(instance_id: str, limit: int = 20):
         mutations = await get_instance_mutations(db, instance_id, limit=limit)
     return {
         "instance_id": instance_id,
-        "latest_sanctioned_mutation": mutations[0] if mutations else None,
+        "latest_instance_mutation": mutations[0] if mutations else None,
         "recent_mutations": mutations,
         "last_write_txn_id": mutations[0]["write_txn_id"] if mutations else None,
     }
@@ -17855,7 +17844,7 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
                             "human_anchor_source": "ask_user_question_answered",
                         }
                     )
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=instance_id,
                     updates=updates,
@@ -17877,7 +17866,7 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
         # discount branch changes the heartbeat decision.
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=instance_id,
                     updates={
@@ -18822,7 +18811,7 @@ async def _cd_flip_pr_merged(pr_url: str) -> int:
         )
         ids = [r[0] for r in await cursor.fetchall()]
         for iid in ids:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=iid,
                 updates={"pr_state": "merged"},
@@ -22165,7 +22154,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
             if row_is_live and illegal_name:
                 old_name = row.get("tab_name")
                 try:
-                    await sanctioned_update_instance(
+                    await update_instance(
                         db,
                         instance_id=row["id"],
                         updates={
@@ -22211,7 +22200,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
                 if marker == "sync":
                     pane_vanished_updates["golden_throne"] = None
                 try:
-                    await sanctioned_update_instance(
+                    await update_instance(
                         db,
                         instance_id=row["id"],
                         updates=pane_vanished_updates,
@@ -22242,7 +22231,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
                 counts["placeholder_tab_name_drift"] += 1
                 if row.get("workflow_blocked_reason") != "tab_name_placeholder":
                     try:
-                        await sanctioned_update_instance(
+                        await update_instance(
                             db,
                             instance_id=row["id"],
                             updates={"workflow_blocked_reason": "tab_name_placeholder"},
@@ -22305,7 +22294,7 @@ async def tmux_db_reconciler_worker():
     the same ``tmux_pane`` (keeping the newest), and logs (does NOT auto-rename)
     ``Claude HH:MM`` placeholder tab_names plus tab_name↔session_doc mismatches.
 
-    All mutations go through ``sanctioned_update_instance`` so the audit log
+    All mutations go through ``update_instance`` so the audit log
     records the reconciler as the agent. Telemetry: one
     ``tmux_db_reconcile_cycle`` event per cycle that found drift.
     """
@@ -22396,7 +22385,7 @@ async def clear_stale_processing_flags() -> None:
                         if row["id"] in live_ids:
                             continue
                         try:
-                            await sanctioned_update_instance(
+                            await update_instance(
                                 db,
                                 instance_id=row["id"],
                                 updates={
@@ -22422,7 +22411,7 @@ async def clear_stale_processing_flags() -> None:
                 stale_idle_instances = []
                 for row in rows:
                     try:
-                        await sanctioned_update_instance(
+                        await update_instance(
                             db,
                             instance_id=row["id"],
                             updates={"status": "idle"},
@@ -26720,7 +26709,7 @@ async def _run_stop_evaluators(
         )
         async with aiosqlite.connect(DB_PATH) as db:
             try:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=instance_id,
                     updates={"status": "idle"},
@@ -27354,7 +27343,7 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
             )
             linked_rows = await cursor.fetchall()
             for linked_row in linked_rows:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=linked_row[0],
                     updates={
@@ -27507,7 +27496,7 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
 
         # Assign
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={
@@ -27594,7 +27583,7 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
         doc_id = cursor.lastrowid
 
         # Assign to instance
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={
@@ -27678,7 +27667,7 @@ async def unassign_doc_from_instance(instance_id: str):
                 "reason": "No doc was assigned",
             }
 
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates={

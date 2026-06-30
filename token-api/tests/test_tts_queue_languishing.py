@@ -20,24 +20,20 @@ def _load_tts():
 
 
 def _insert_tts_instance(db_path: Path) -> str:
-    from instance_mutation import sanctioned_insert_instance_sync
+    from instance_mutation import insert_instance_sync
     from personas import persona_id_for_slug
 
     iid = str(uuid.uuid4())
     now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
-    sanctioned_insert_instance_sync(
+    insert_instance_sync(
         conn,
         values={
             "id": iid,
-            "session_id": str(uuid.uuid4()),
-            "tab_name": f"tts-{iid[:8]}",
             "working_dir": "/tmp/test",
             "origin_type": "local",
             "device_id": "Mac-Mini",
             "status": "idle",
-            "tts_mode": "verbose",
-            "registered_at": now,
             "last_activity": now,
         },
         mutation_type="instance_registered",
@@ -49,7 +45,7 @@ def _insert_tts_instance(db_path: Path) -> str:
     # so these queue-mechanics fixtures must carry an explicit voiced policy. ``pause``
     # respects the caller's queue_target, preserving the prior queue semantics.
     conn.execute(
-        "UPDATE instances SET tts_voice = 'Microsoft George', persona_id = ? WHERE id = ?",
+        "UPDATE instances SET persona_id = ? WHERE id = ?",
         (persona_id_for_slug("blood-angels"), iid),
     )
     conn.commit()

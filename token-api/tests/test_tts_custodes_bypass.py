@@ -32,41 +32,35 @@ def _load_tts():
 
 def _insert_voiced_instance(db_path: Path, *, persona_slug: str | None) -> str:
     """Insert an idle, voiced instance; optionally bind it to a seeded persona."""
-    from instance_mutation import sanctioned_insert_instance_sync, sanctioned_update_instance_sync
+    from instance_mutation import insert_instance_sync, update_instance_sync
     from personas import persona_id_for_slug
 
     iid = str(uuid.uuid4())
     now = datetime.now().isoformat()
     conn = sqlite3.connect(db_path)
-    sanctioned_insert_instance_sync(
+    insert_instance_sync(
         conn,
         values={
             "id": iid,
-            "session_id": str(uuid.uuid4()),
-            "tab_name": f"tts-{iid[:8]}",
             "working_dir": "/tmp/test",
             "origin_type": "local",
             "device_id": "Mac-Mini",
             "status": "idle",
-            "tts_mode": "verbose",
-            "registered_at": now,
             "last_activity": now,
         },
         mutation_type="instance_registered",
         write_source="test",
         actor="test",
     )
-    updates = {"tts_voice": "Microsoft George"}
     if persona_slug is not None:
-        updates["persona_id"] = persona_id_for_slug(persona_slug)
-    sanctioned_update_instance_sync(
-        conn,
-        instance_id=iid,
-        updates=updates,
-        mutation_type="instance_test_profile_update",
-        write_source="test",
-        actor="test",
-    )
+        update_instance_sync(
+            conn,
+            instance_id=iid,
+            updates={"persona_id": persona_id_for_slug(persona_slug)},
+            mutation_type="instance_test_profile_update",
+            write_source="test",
+            actor="test",
+        )
     conn.commit()
     conn.close()
     return iid

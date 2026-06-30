@@ -54,7 +54,7 @@ def _persona(conn: sqlite3.Connection, slug: str) -> str:
 
 
 def _insert_instance(conn: sqlite3.Connection, **overrides: Any) -> str:
-    from instance_mutation import sanctioned_insert_instance_sync
+    from instance_mutation import insert_instance_sync
 
     now = datetime.now().isoformat()
     values = {
@@ -76,7 +76,7 @@ def _insert_instance(conn: sqlite3.Connection, **overrides: Any) -> str:
     cols = list(values)
     invalid_cols = [col for col in cols if col not in _INSTANCE_INSERT_COLUMNS]
     assert not invalid_cols, f"unexpected instances columns: {invalid_cols}"
-    sanctioned_insert_instance_sync(
+    insert_instance_sync(
         conn,
         values=values,
         mutation_type="instance_registered",

@@ -48,11 +48,11 @@ from instance_lifecycle import apply_instance_lifecycle, normalize_instance_life
 from instance_mutation import (
     _fetch_instance_row,
     create_golden_throne_binding,
+    delete_instance,
+    insert_instance,
     is_official_instance_name_actor,
-    sanctioned_delete_instance,
-    sanctioned_insert_instance,
-    sanctioned_update_instance,
-    sanctioned_update_instance_record,
+    update_instance,
+    update_instance_record,
 )
 from instance_registry import DEFAULT_INSTANCE_NAME, LEGACY_PERSONA_ALIASES
 from pane_surface import human_pane_surface, is_placeholder_tab_name
@@ -650,7 +650,7 @@ async def _apply_commander_binding(
             # parent's persona only for truly persona-less rows.
             if child is not None and child[0] is None:
                 updates["persona_id"] = parent[1]
-            await sanctioned_update_instance_record(
+            await update_instance_record(
                 db,
                 instance_id=instance_id,
                 updates=updates,
@@ -661,7 +661,7 @@ async def _apply_commander_binding(
         return
     mode = (_normalize_text(dispatch_mode) or "").lower()
     if mode in {"silent", "breakoff", "break-off", "break_off"}:
-        await sanctioned_update_instance_record(
+        await update_instance_record(
             db,
             instance_id=instance_id,
             updates={"commander_type": "emperor", "commander_id": None},
@@ -684,7 +684,7 @@ async def _apply_commander_binding(
     commander_persona_id = await _persona_id_by_slug(db, commander_slug)
     if commander_persona_id is None:
         return
-    await sanctioned_update_instance_record(
+    await update_instance_record(
         db,
         instance_id=instance_id,
         updates={
@@ -763,7 +763,7 @@ async def _apply_persona_seat_name(
     display_name = _normalize_text(row["display_name"] if row else None)
     if not display_name:
         return None
-    await sanctioned_update_instance(
+    await update_instance(
         db,
         instance_id=instance_id,
         updates={"name": display_name, "workflow_blocked_reason": None},
@@ -1905,7 +1905,7 @@ async def _flag_subscriber_hook_driven(db, subscription: dict) -> None:
             target_id = declared_id
         if not target_id:
             return
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=target_id,
             updates={"hook_driven": 1},
@@ -2621,7 +2621,7 @@ async def _apply_instance_workflow_state(
     if workflow_state is not None:
         updates["workflow_updated_at"] = now
 
-    await sanctioned_update_instance(
+    await update_instance(
         db,
         instance_id=instance_id,
         updates=updates,
@@ -2735,7 +2735,7 @@ async def handle_wrapper_end(payload: dict) -> dict:
                     refused_live_instance_id = candidate_id
                 else:
                     stopped_instance_id = candidate_id
-                    await sanctioned_update_instance(
+                    await update_instance(
                         db,
                         instance_id=stopped_instance_id,
                         updates={
@@ -2901,9 +2901,6 @@ async def handle_session_start(payload: dict) -> dict:
     dispatch_mode = _normalize_text(
         payload.get("dispatch_mode") or env.get("TOKEN_API_DISPATCH_MODE", "")
     )
-    dispatch_slot = _normalize_text(
-        payload.get("dispatch_slot") or env.get("TOKEN_API_DISPATCH_SLOT", "")
-    )
     dispatch_session_doc_path = _normalize_text(
         payload.get("dispatch_session_doc_path")
         or env.get("TOKEN_API_DISPATCH_SESSION_DOC_PATH", "")
@@ -2920,10 +2917,6 @@ async def handle_session_start(payload: dict) -> dict:
     parent_instance_id = _normalize_text(
         payload.get("parent_instance_id") or env.get("TOKEN_API_PARENT_INSTANCE_ID", "")
     )
-    transplant_expected_raw = payload.get("transplant_expected")
-    if transplant_expected_raw is None:
-        transplant_expected_raw = env.get("TOKEN_API_TRANSPLANT_EXPECTED", "")
-    transplant_expected = str(transplant_expected_raw).lower() in {"1", "true", "yes"}
     launch_instance_type = _normalize_text(
         payload.get("instance_type") or env.get("TOKEN_API_INSTANCE_TYPE", "")
     )
@@ -2983,7 +2976,6 @@ async def handle_session_start(payload: dict) -> dict:
         payload.get("zealotry") or env.get("TOKEN_API_ZEALOTRY", "")
     )
     session_doc_policy = None
-    dispatch_bound_doc = False
 
     async with shared.hook_db() as db:
         db.row_factory = aiosqlite.Row
@@ -3062,7 +3054,7 @@ async def handle_session_start(payload: dict) -> dict:
             if row:
                 supplant_id = row["id"]
 
-        # 3b. Persona pane-label singleton (FG / Administratum / Custodes). A persona
+        # 2b. Persona pane-label singleton (FG / Administratum / Custodes). A persona
         # pane is bound by its tmux pane label, and the `primarch` derived above comes
         # from that label via PERSONA_PANE_IDENTITY — but ONLY when the label resolves
         # at SessionStart. On a fresh persona resume the @PANE_ID may not be stamped
@@ -3096,7 +3088,7 @@ async def handle_session_start(payload: dict) -> dict:
                 if row:
                     supplant_id = row["id"]
 
-        # 4. Pane-occupant match (covers plan-mode context-clear: Claude Code emits
+        # 3. Pane-occupant match (covers plan-mode context-clear: Claude Code emits
         # a fresh session_id but the underlying process keeps the same tmux pane).
         # Without this, a custodes plan-mode exit spawns a duplicate row and the prior
         # row's persona_id/rank identity is stranded — breaking the state-hook
@@ -3273,7 +3265,7 @@ async def handle_session_start(payload: dict) -> dict:
                         zealotry=launch_zealotry,
                         existing_marker=existing_row["golden_throne"],
                     )
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=session_id,
                     updates=transplant_updates,
@@ -3441,7 +3433,7 @@ async def handle_session_start(payload: dict) -> dict:
                         zealotry=launch_zealotry,
                         existing_marker=existing_row["golden_throne"],
                     )
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=session_id,
                     updates=updates,
@@ -3632,7 +3624,7 @@ async def handle_session_start(payload: dict) -> dict:
                         zealotry=launch_zealotry,
                         existing_marker=old_inst["golden_throne"],
                     )
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=supplant_id,
                     updates=supplant_updates,
@@ -3682,7 +3674,7 @@ async def handle_session_start(payload: dict) -> dict:
                     link_row = await cursor.fetchone()
                     if link_row and link_row[0]:
                         session_doc_id = link_row[0]
-                        await sanctioned_update_instance(
+                        await update_instance(
                             db,
                             instance_id=session_id,
                             updates={
@@ -3703,10 +3695,6 @@ async def handle_session_start(payload: dict) -> dict:
                     previous_session_doc_id=old_inst["session_doc_id"],
                     previous_workflow_state=old_inst["workflow_state"],
                 )
-                dispatch_bound_doc = (
-                    session_doc_policy or old_inst["session_doc_policy"]
-                ) == "dispatch_explicit"
-
                 await db.commit()
                 auto_subscription = await _auto_subscribe_parent_on_start(
                     db,
@@ -3772,9 +3760,8 @@ async def handle_session_start(payload: dict) -> dict:
                     device_id=device_id,
                     details={
                         "old_id": supplant_id,
-                        "tab_name": old_inst["name"],
+                        "name": old_inst["name"],
                         "source": supplant_source,
-                        "primarch": primarch_name or None,
                     },
                 )
                 return {
@@ -3833,7 +3820,7 @@ async def handle_session_start(payload: dict) -> dict:
             _prior_workflow_state = _prior_row[7]
             _prior_parent_instance_id = _prior_row[8]
             # Delete old row so INSERT succeeds (id is PRIMARY KEY)
-            await sanctioned_delete_instance(
+            await delete_instance(
                 db,
                 instance_id=session_id,
                 mutation_type="instance_replaced",
@@ -3863,10 +3850,8 @@ async def handle_session_start(payload: dict) -> dict:
             if _parent_row and (_parent_row[0] or "").lower() != "custodes":
                 launch_hook_driven = 1
 
-        # Insert instance. session_id/source_ip/pid died with legacy instance table
-        # (the instance id IS the session uuid); legacy-shaped keys below
-        # (tab_name/legion/primarch/parent_instance_id/registered_at) are
-        # normalized by sanctioned_insert_instance.
+        # Insert instance. The instance id is the session uuid; launch/context
+        # fields are translated before this canonical write boundary.
         now = datetime.now().isoformat()
         launch_marker = await _launch_golden_throne_marker(
             db, launch_instance_type, zealotry=launch_zealotry
@@ -3875,29 +3860,25 @@ async def handle_session_start(payload: dict) -> dict:
             launch_marker = launch_marker or "sync"
         insert_values = {
             "id": session_id,
-            "tab_name": tab_name,
             "working_dir": working_dir,
             "origin_type": origin_type,
             "device_id": device_id,
-            # TOKEN_API_PERSONA is an explicit identity assignment from the
-            # dispatch/env path.  Let it win over the randomly assigned voice
-            # profile so chapter-parent binding cannot steal singleton identity.
-            "profile_name": primarch_name or profile["name"],
+            "persona_id": launch_persona_id if launch_persona_id is not None else profile.get("id"),
+            "commander_type": "chapter" if parent_instance_id else "emperor",
+            "commander_id": parent_instance_id or None,
+            "rank": persona_default_rank or "astartes",
+            "automated": 1 if (is_subagent or parent_instance_id) else 0,
             "status": "idle",
-            "legion": _prior_legion or "astartes",
             "golden_throne": launch_marker,
             "input_lock": None,
             "is_subagent": is_subagent,
-            "primarch": primarch_name or None,
             "wrapper_launch_id": wrapper_launch_id,
             "engine": engine,
-            "parent_instance_id": parent_instance_id,
             "hook_driven": launch_hook_driven,
             "zealotry": launch_zealotry if launch_zealotry is not None else 4,
             "session_doc_policy": session_doc_policy,
             "discord_hosted": _prior_discord_hosted,
             "discord_channel": _prior_discord_channel,
-            "registered_at": now,
             "last_activity": now,
         }
         try:
@@ -3910,7 +3891,7 @@ async def handle_session_start(payload: dict) -> dict:
             # propagates to dispatch_hook, which fails the SessionStart loud (503).
             for attempt in range(_HOOK_DB_LOCKED_RETRIES + 1):
                 try:
-                    await sanctioned_insert_instance(
+                    await insert_instance(
                         db,
                         values=insert_values,
                         mutation_type="instance_registered",
@@ -3947,7 +3928,7 @@ async def handle_session_start(payload: dict) -> dict:
                 session_id[:12],
             )
             try:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=session_id,
                     updates={"last_activity": now},
@@ -4025,7 +4006,6 @@ async def handle_session_start(payload: dict) -> dict:
             working_dir=working_dir,
             target_working_dir=target_working_dir,
         )
-        dispatch_bound_doc = session_doc_policy == "dispatch_explicit"
         await _apply_instance_workflow_state(
             db,
             instance_id=session_id,
@@ -4104,7 +4084,7 @@ async def handle_session_start(payload: dict) -> dict:
                 # persona display/chip/tint data. No Claude slash-color command is emitted.
                 profile = persona_profile
             if legion_updates:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=session_id,
                     updates=legion_updates,
@@ -4120,7 +4100,7 @@ async def handle_session_start(payload: dict) -> dict:
             cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (prior_slug,))
             prior_persona_row = await cursor.fetchone()
             if prior_persona_row:
-                await sanctioned_update_instance(
+                await update_instance(
                     db,
                     instance_id=session_id,
                     updates={"persona_id": prior_persona_row["id"]},
@@ -4206,23 +4186,14 @@ async def handle_session_start(payload: dict) -> dict:
         instance_id=session_id,
         device_id=device_id,
         details={
-            "tab_name": tab_name,
             "origin_type": origin_type,
             "source": "hook",
             "is_subagent": is_subagent,
             "subagent_env": subagent_env or None,
-            "primarch": primarch_name or None,
             "wrapper_launch_id": wrapper_launch_id or None,
             "engine": engine or None,
-            "dispatch_target": dispatch_target or None,
-            "dispatch_window": dispatch_window or None,
-            "dispatch_slot": dispatch_slot or None,
-            "dispatch_session_doc_path": dispatch_session_doc_path or None,
-            "parent_instance_id": parent_instance_id or None,
-            "transplant_expected": transplant_expected,
-            "instance_type": launch_instance_type or "one_off",
+            "golden_throne": launch_marker,
             "zealotry": launch_zealotry if launch_zealotry is not None else 4,
-            "dispatch_bound_doc": dispatch_bound_doc,
             "session_doc_policy": session_doc_policy,
         },
     )
@@ -4413,7 +4384,7 @@ async def handle_session_end(payload: dict) -> dict:
         # golden_throne.id binding survives the session ending.
         if _gt_marker == "sync":
             session_end_updates["golden_throne"] = None
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=session_id,
             updates=session_end_updates,
@@ -4882,7 +4853,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
 
         # Also resurrect stopped instances - activity means they're active.
         # (pid died with legacy instance table; nothing to backfill.)
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=session_id,
             updates=status_updates,
@@ -5037,7 +5008,7 @@ async def handle_post_tool_use(payload: dict) -> dict:
                 "action": "ignored_dead_pane",
                 "instance_id": session_id,
             }
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=session_id,
             updates={
@@ -5145,7 +5116,7 @@ async def _record_gt_response_classification(
         if current_fingerprint is not None:
             updates["gt_last_dispatch_fingerprint"] = current_fingerprint
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=instance_id,
                 updates=updates,
@@ -5193,7 +5164,7 @@ async def _record_gt_response_classification(
         )
 
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-        await sanctioned_update_instance(
+        await update_instance(
             db,
             instance_id=instance_id,
             updates=updates,
@@ -5364,7 +5335,7 @@ async def handle_stop(payload: dict) -> dict:
         # has run its course. Idempotent (clearing an already-0 row is a no-op), so
         # this is a safe generic clear on every Stop regardless of how it was woken.
         if will_evaluate or is_sync_instance:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=session_id,
                 updates={"last_activity": now, "hook_driven": 0},
@@ -5373,7 +5344,7 @@ async def handle_stop(payload: dict) -> dict:
                 actor="Stop",
             )
         else:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=session_id,
                 updates={"status": "idle", "last_activity": now, "hook_driven": 0},
@@ -5432,7 +5403,7 @@ async def handle_stop(payload: dict) -> dict:
                 result["action"] = "stop_processed_gt_review_mode"
                 return result
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=session_id,
                 updates={"status": "idle", "last_activity": now, "hook_driven": 0},
@@ -6450,7 +6421,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     if session_id:
         now = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=session_id,
                 updates={"status": "working", "last_activity": now, "stopped_at": None},
@@ -6681,7 +6652,7 @@ async def handle_stop_validate(payload: dict) -> dict:
         issued_at = _self_eval_pending.pop(session_id)
         elapsed = now - issued_at
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=session_id,
                 updates={
@@ -6787,7 +6758,7 @@ async def handle_stop_validate(payload: dict) -> dict:
                     "Top blockers:\n" + "\n".join(blocker_lines)
                 )
                 async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-                    await sanctioned_update_instance(
+                    await update_instance(
                         db,
                         instance_id=session_id,
                         updates={
@@ -6857,7 +6828,7 @@ async def handle_stop_validate(payload: dict) -> dict:
         _self_eval_pending[session_id] = now
         blocked_at = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=session_id,
                 updates={
@@ -7106,7 +7077,7 @@ async def _set_planning_state(
     # The oracle is the sole source of pane geometry for the projection/response.
     tmux_pane, _ = await shared.resolve_instance_pane(instance_id)
     now = datetime.now().isoformat()
-    await sanctioned_update_instance(
+    await update_instance(
         db,
         instance_id=instance_id,
         updates={

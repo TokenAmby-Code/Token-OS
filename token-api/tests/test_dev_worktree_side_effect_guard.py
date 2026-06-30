@@ -15,11 +15,11 @@ import pytest
 
 
 def _insert_instance(db_path: Path, instance_id: str, working_dir: str) -> None:
-    from instance_mutation import sanctioned_insert_instance_sync
+    from instance_mutation import insert_instance_sync
 
     now = datetime.now().isoformat()
     with sqlite3.connect(db_path) as conn:
-        sanctioned_insert_instance_sync(
+        insert_instance_sync(
             conn,
             values={
                 "id": instance_id,

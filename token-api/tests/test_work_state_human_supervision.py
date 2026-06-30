@@ -11,7 +11,8 @@ from typing import Any
 import pytest
 
 import stop_hook
-from instance_mutation import sanctioned_insert_instance_sync, sanctioned_update_instance_sync
+from instance_mutation import insert_instance_sync, update_instance_sync
+from personas import persona_id_for_slug
 
 PANE = "%812"
 SESSION_ID = "sess-human-supervision"
@@ -19,7 +20,7 @@ SESSION_ID = "sess-human-supervision"
 
 def _insert_instance(db_path, *, last_activity: datetime, hook_driven: int = 0) -> None:
     with sqlite3.connect(db_path) as conn:
-        sanctioned_insert_instance_sync(
+        insert_instance_sync(
             conn,
             values={
                 "id": SESSION_ID,
@@ -29,7 +30,7 @@ def _insert_instance(db_path, *, last_activity: datetime, hook_driven: int = 0) 
                 "working_dir": "/work",
                 "device_id": "Mac-Mini",
                 "last_activity": last_activity.isoformat(),
-                "legion": "mechanicus",
+                "persona_id": persona_id_for_slug("administratum"),
                 "is_subagent": 0,
                 "hook_driven": hook_driven,
             },
@@ -154,7 +155,7 @@ def test_ask_user_question_answer_sets_anchor_and_status_stop_clears(
         assert row[0] is not None
         assert row[1] == "ask_user_question_answered"
         # Simulate >20 minutes with no further input; the AUQ run anchor must still hold.
-        sanctioned_update_instance_sync(
+        update_instance_sync(
             conn,
             instance_id=SESSION_ID,
             updates={"last_activity": (datetime.now() - timedelta(hours=1)).isoformat()},
@@ -174,10 +175,10 @@ def test_ask_user_question_answer_sets_anchor_and_status_stop_clears(
     async def _stop() -> None:
         import aiosqlite
 
-        from instance_mutation import sanctioned_update_instance
+        from instance_mutation import update_instance
 
         async with aiosqlite.connect(supervised_env.db_path) as db:
-            await sanctioned_update_instance(
+            await update_instance(
                 db,
                 instance_id=SESSION_ID,
                 updates={"status": "stopped"},
@@ -199,7 +200,7 @@ def test_ask_user_question_answer_sets_anchor_and_status_stop_clears(
 def test_stop_hook_clears_human_anchor(supervised_env: Any) -> None:
     _insert_instance(supervised_env.db_path, last_activity=datetime.now())
     with sqlite3.connect(supervised_env.db_path) as conn:
-        sanctioned_update_instance_sync(
+        update_instance_sync(
             conn,
             instance_id=SESSION_ID,
             updates={
@@ -227,7 +228,7 @@ def test_late_ask_user_question_answer_does_not_anchor_stopped_instance(
 ) -> None:
     _insert_instance(supervised_env.db_path, last_activity=datetime.now())
     with sqlite3.connect(supervised_env.db_path) as conn:
-        sanctioned_update_instance_sync(
+        update_instance_sync(
             conn,
             instance_id=SESSION_ID,
             updates={"status": "stopped"},

@@ -376,12 +376,12 @@ class TestArchiveExtraction:
 
 
 class TestSanctionedWritesV2Only:
-    def test_sanctioned_insert_writes_instances(self, app_env):
+    def test_insert_instance_writes_instances(self, app_env):
         import instance_mutation
 
         conn = _db(app_env)
         instance_id = str(uuid.uuid4())
-        instance_mutation.sanctioned_insert_instance_sync(
+        instance_mutation.insert_instance_sync(
             conn,
             values={
                 "id": instance_id,

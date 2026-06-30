@@ -1,9 +1,13 @@
-"""Instance registry helpers.
+"""Instance registry schema constants and archive import helpers.
 
-The ``instances`` table is the durable live-agent registry. It stores current
-identity, lifecycle, workflow, notification, and Golden Throne binding state.
-Launch envelopes, pane geometry, transplant markers, and copied persona audio
-settings are not instance state.
+Runtime writes use canonical present-tense ``instances`` columns only. Archive and
+migration imports may translate historical rows, but normal insert/update paths
+must reject dead launch, voice, and projection fields instead of mapping them.
+
+The ``instances`` table is durable live-agent registry state: identity,
+lifecycle, workflow, notification, and Golden Throne binding. Launch envelopes,
+pane geometry, transplant markers, and copied persona audio settings are not
+instance state.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ INSTANCE_COLUMNS = [
     "discord_hosted",
     "discord_channel",
     "discord_bot",
+    # workflow / planning / closure
     "workflow_state",
     "workflow_updated_at",
     "workflow_blocked_reason",
@@ -60,7 +65,7 @@ INSTANCE_COLUMNS = [
     # provenance flags kept distinct from `automated` (semantics differ)
     "is_subagent",
     "hook_driven",
-    # golden-throne engine state — dies into the golden_throne table
+    # golden-throne engine state
     "zealotry",
     "gt_resume_count",
     "gt_resume_window_started_at",
@@ -72,9 +77,50 @@ INSTANCE_COLUMNS = [
     "stop_allowed",
 ]
 
+FORBIDDEN_RUNTIME_INSTANCE_FIELDS = {
+    # dead projections / historical request names
+    "tab_name",
+    "session_id",
+    "source_ip",
+    "pid",
+    "legion",
+    "primarch",
+    "profile_name",
+    "tts_mode",
+    "instance_type",
+    "synced",
+    "parent_instance_id",
+    "registered_at",
+    "tmux_pane",
+    "pane_label",
+    "pane_tint",
+    "color",
+    "chip_color",
+    # launch geometry/provenance is event/input context, not instance identity
+    "dispatch_target",
+    "dispatch_window",
+    "dispatch_mode",
+    "dispatch_slot",
+    "dispatch_session_doc_path",
+    "target_working_dir",
+    "launch_mode",
+    "launcher",
+    "transplant_target_session",
+    "transplant_expected",
+    # persona voice/sound live on personas, not copied onto instances
+    "tts_voice",
+    "notification_sound",
+}
+
+# Runtime writers may only address the canonical physical schema. This alias is
+# intentionally boring so mutation/write code never knows old column names as
+# writable destinations.
+RUNTIME_WRITE_INSTANCE_COLUMNS = list(INSTANCE_COLUMNS)
+RUNTIME_WRITE_INSTANCE_FIELDS = set(RUNTIME_WRITE_INSTANCE_COLUMNS)
+
 # Columns from extracted historical instance shapes with no live home.
 REMOVED_INSTANCE_COLUMNS = {
-    "tab_name",  # -> instances.name (API responses alias `name AS tab_name`)
+    "tab_name",  # -> instances.name
     "session_id",  # archive-only
     "source_ip",  # archive-only
     "pid",  # archive-only
@@ -177,8 +223,12 @@ def golden_throne_binding(row: dict) -> str | None:
     return None
 
 
-def legacy_row_to_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
-    """Map a legacy instance table row into instances-table columns."""
+def archive_row_to_instance_values(row: dict | None, persona_id: int | None = None) -> dict:
+    """Map an archived/historical instance row into current table columns.
+
+    This is for schema migration and archive import only. Runtime write helpers
+    must not call it.
+    """
     if not row:
         return {}
     status = normalize_status(row.get("status"))

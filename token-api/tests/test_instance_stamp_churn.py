@@ -35,7 +35,7 @@ _LIVE_PANE = "%900917"
 _NEW_PANE = "%900918"
 
 
-def _insert(db_path, instance_id, *, pane=None, status="working", transplant_target=None):
+def _insert(db_path, instance_id, *, pane=None, status="working"):
     # Pane liveness is no longer a stored column; ``pane`` only documents the
     # live pane the test drives via TMUX_PANE / the unstamp spy.
     conn = sqlite3.connect(db_path)
@@ -46,11 +46,6 @@ def _insert(db_path, instance_id, *, pane=None, status="working", transplant_tar
            VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'p', 'v', 's', ?)""",
         (instance_id, f"{instance_id}-session", instance_id, status),
     )
-    if transplant_target is not None:
-        conn.execute(
-            "UPDATE instances SET transplant_target_session = ? WHERE id = ?",
-            (transplant_target, instance_id),
-        )
     conn.commit()
     conn.close()
 
@@ -101,7 +96,7 @@ def test_blank_pane_refire_does_not_unstamp_live_pane(app_env, monkeypatch):
     zeroing @INSTANCE_ID on a pane that never moved.
     """
     hooks = sys.modules["routes.hooks"]
-    _insert(app_env.db_path, "churn-1", pane=_LIVE_PANE, transplant_target="churn-1")
+    _insert(app_env.db_path, "churn-1", pane=_LIVE_PANE)
     unstamped = _spy_stamp_writes(hooks, monkeypatch)
 
     _start(
@@ -125,7 +120,7 @@ def test_genuine_pane_move_still_unstamps_old_pane(app_env, monkeypatch):
     old one's stamp so two panes never resolve to one UUID.
     """
     hooks = sys.modules["routes.hooks"]
-    _insert(app_env.db_path, "move-1", pane=_LIVE_PANE, transplant_target="move-1")
+    _insert(app_env.db_path, "move-1", pane=_LIVE_PANE)
     unstamped = _spy_stamp_writes(hooks, monkeypatch)
 
     _start(

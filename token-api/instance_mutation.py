@@ -11,9 +11,9 @@ import aiosqlite
 
 from instance_registry import (
     DEFAULT_INSTANCE_NAME,
-    INSTANCE_COLUMNS,
-    legacy_row_to_instance_values,
-    slug_from_legacy,
+    FORBIDDEN_RUNTIME_INSTANCE_FIELDS,
+    RUNTIME_WRITE_INSTANCE_COLUMNS,
+    RUNTIME_WRITE_INSTANCE_FIELDS,
 )
 from pane_surface import is_placeholder_tab_name
 from personas import persona_tint_for_instance
@@ -37,97 +37,48 @@ OFFICIAL_INSTANCE_NAME_ACTORS = frozenset(
     }
 )
 
-# Tracked mutation surface for the current instances schema. Historical column
-# names remain archive-only; their durable homes are name/persona_id/
-# golden_throne/commander_*/notification_mode+interaction_mode.
-INSTANCE_MUTATION_FIELDS = {
-    # identity
-    "name",
-    "engine",
-    "status",
-    "last_activity",
-    "stopped_at",
-    "archived_at",
-    "working_dir",
-    "device_id",
-    "origin_type",
-    "persona_id",
-    "rank",
-    "commander_type",
-    "commander_id",
-    "automated",
-    "notification_mode",
-    "interaction_mode",
-    "golden_throne",
-    "human_anchored_at",
-    "human_anchor_source",
-    "session_doc_id",
-    "continuity_binding_source",
-    "wrapper_launch_id",
-    "input_lock",
-    "session_doc_policy",
-    "workflow_state",
-    "workflow_updated_at",
-    "workflow_blocked_reason",
-    "follow_up_sop",
-    "zealotry",
-    "gt_resume_count",
-    "gt_resume_window_started_at",
-    "gt_last_resume_at",
-    "gt_no_op_counter",
-    "gt_no_op_summaries_json",
-    "gt_last_dispatch_fingerprint",
-    "victory_at",
-    "victory_reason",
-    "discord_hosted",
-    "discord_channel",
-    "discord_bot",
-    "closure_surface",
-    "closure_required",
-    "stop_allowed",
-    "next_required_action",
-    "next_action_owner",
-    "planning_state",
-    "planning_updated_at",
-    "planning_source",
-    "pr_url",
-    "pr_state",
-    "hook_driven",
-    "is_subagent",
-}
-
-# Canonical registry columns. These deliberately exclude every raw tmux pane
-# id and tmuxctl positional/cardinal field. Token-API may return live runtime
-# resolution data, but the DB must not persist it; tmuxctl is the oracle.
-CANONICAL_INSTANCE_FIELDS = set(INSTANCE_COLUMNS)
+# Tracked mutation surface for normal runtime writes. Forbidden/dead columns are
+# deliberately absent, so mutation payloads cannot carry them.
+INSTANCE_MUTATION_FIELDS = set(RUNTIME_WRITE_INSTANCE_COLUMNS) - {"id", "created_at"}
+CANONICAL_INSTANCE_FIELDS = set(RUNTIME_WRITE_INSTANCE_COLUMNS)
 
 
-async def _persona_id_for_row(db, row: dict) -> int | None:
-    slug = slug_from_legacy(row)
-    if not slug:
-        return row.get("persona_id")
-    cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (slug,))
-    found = await cursor.fetchone()
-    return found[0] if found else row.get("persona_id")
+def _format_field_list(fields: set[str]) -> str:
+    return ", ".join(sorted(fields))
 
 
-def _persona_id_for_row_sync(db, row: dict) -> int | None:
-    slug = slug_from_legacy(row)
-    if not slug:
-        return row.get("persona_id")
-    cursor = db.execute("SELECT id FROM personas WHERE slug = ?", (slug,))
-    found = cursor.fetchone()
-    return found[0] if found else row.get("persona_id")
+def _assert_runtime_instance_fields(payload: dict, *, operation: str) -> None:
+    fields = set(payload)
+    forbidden = fields & FORBIDDEN_RUNTIME_INSTANCE_FIELDS
+    if forbidden:
+        raise ValueError(
+            f"{operation} rejects non-canonical instance field(s): {_format_field_list(forbidden)}"
+        )
+    unknown = fields - RUNTIME_WRITE_INSTANCE_FIELDS
+    if unknown:
+        raise ValueError(
+            f"{operation} rejects unknown instance field(s): {_format_field_list(unknown)}"
+        )
 
 
-def _instance_values_from_legacy_row(row: dict | None, persona_id: int | None = None) -> dict:
+def _canonical_tracked_fields(tracked_fields: set[str] | None) -> set[str]:
+    if tracked_fields is None:
+        return set(INSTANCE_MUTATION_FIELDS)
+    tracked = set(tracked_fields)
+    forbidden = tracked & FORBIDDEN_RUNTIME_INSTANCE_FIELDS
+    if forbidden:
+        raise ValueError(
+            "mutation tracking rejects non-canonical instance field(s): "
+            f"{_format_field_list(forbidden)}"
+        )
+    return tracked & INSTANCE_MUTATION_FIELDS
+
+
+def _instance_values_from_runtime_row(row: dict | None) -> dict:
     if not row:
         return {}
-    if set(INSTANCE_COLUMNS).issubset(row.keys()):
-        values = {key: row.get(key) for key in INSTANCE_COLUMNS}
-    else:
-        values = legacy_row_to_instance_values(row, persona_id)
-    return {key: values.get(key) for key in INSTANCE_COLUMNS if key in values}
+    _assert_runtime_instance_fields(row, operation="instance insert")
+    return {key: row.get(key) for key in RUNTIME_WRITE_INSTANCE_COLUMNS if key in row}
 
 
 def is_official_instance_name_actor(actor: str | None) -> bool:
@@ -204,11 +155,6 @@ def _prepare_chapter_commander_sync(db, values: dict) -> dict:
     return values
 
 
-# The dual-write mirror layer (mirror_instance_to_legacy*) died with the
-# legacy instance table extraction: every sanctioned write now lands directly on
-# `instances`, the one physical table.
-
-
 async def create_golden_throne_binding(
     db,
     *,
@@ -243,7 +189,7 @@ async def _fetch_instance_record(db, instance_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-async def sanctioned_update_instance_record(
+async def update_instance_record(
     db,
     *,
     instance_id: str,
@@ -253,6 +199,7 @@ async def sanctioned_update_instance_record(
     actor: str,
     wrapper_launch_id: str | None = None,
 ) -> dict:
+    _assert_runtime_instance_fields(updates, operation="instance update")
     before_row = await _fetch_instance_record(db, instance_id)
     if before_row is None:
         raise LookupError(f"Instance not found: {instance_id}")
@@ -265,7 +212,7 @@ async def sanctioned_update_instance_record(
         [*updates.values(), instance_id],
     )
     if cursor.rowcount == 0:
-        raise LookupError(f"Sanctioned instance-record update matched no rows for {instance_id}")
+        raise LookupError(f"Instance-record update matched no rows for {instance_id}")
 
     after_row = dict(before_row)
     after_row.update(updates)
@@ -415,7 +362,7 @@ def _append_instance_mutation_sync(
     )
 
 
-async def sanctioned_update_instance(
+async def update_instance(
     db,
     *,
     instance_id: str,
@@ -431,6 +378,7 @@ async def sanctioned_update_instance(
 ) -> dict:
     if not updates:
         raise ValueError("no fields to update")
+    _assert_runtime_instance_fields(updates, operation="instance update")
     force_clear_human_anchor = updates.get("status") in {"stopped", "archived"}
     if force_clear_human_anchor:
         updates = {
@@ -443,7 +391,7 @@ async def sanctioned_update_instance(
         raise LookupError(f"Instance not found: {instance_id}")
     _assert_name_update_authorized(updates, actor=actor, current_name=before_row.get("name"))
 
-    tracked = set(tracked_fields) if tracked_fields is not None else set(INSTANCE_MUTATION_FIELDS)
+    tracked = _canonical_tracked_fields(tracked_fields)
     if force_clear_human_anchor:
         tracked.update({"human_anchored_at", "human_anchor_source"})
     changed_fields = []
@@ -458,7 +406,7 @@ async def sanctioned_update_instance(
     cursor = await db.execute(f"UPDATE instances SET {assignments} WHERE {clause}", params)
 
     if cursor.rowcount == 0:
-        raise LookupError(f"Sanctioned update matched no rows for instance {instance_id}")
+        raise LookupError(f"Instance update matched no rows for instance {instance_id}")
 
     after_row = dict(before_row)
     after_row.update(updates)
@@ -499,7 +447,7 @@ async def sanctioned_update_instance(
     }
 
 
-def sanctioned_update_instance_sync(
+def update_instance_sync(
     db,
     *,
     instance_id: str,
@@ -514,6 +462,7 @@ def sanctioned_update_instance_sync(
 ) -> dict:
     if not updates:
         raise ValueError("no fields to update")
+    _assert_runtime_instance_fields(updates, operation="instance update")
     force_clear_human_anchor = updates.get("status") in {"stopped", "archived"}
     if force_clear_human_anchor:
         updates = {
@@ -526,7 +475,7 @@ def sanctioned_update_instance_sync(
         raise LookupError(f"Instance not found: {instance_id}")
     _assert_name_update_authorized(updates, actor=actor, current_name=before_row.get("name"))
 
-    tracked = set(tracked_fields) if tracked_fields is not None else set(INSTANCE_MUTATION_FIELDS)
+    tracked = _canonical_tracked_fields(tracked_fields)
     if force_clear_human_anchor:
         tracked.update({"human_anchored_at", "human_anchor_source"})
     changed_fields = []
@@ -541,7 +490,7 @@ def sanctioned_update_instance_sync(
     cursor = db.execute(f"UPDATE instances SET {assignments} WHERE {clause}", params)
 
     if cursor.rowcount == 0:
-        raise LookupError(f"Sanctioned update matched no rows for instance {instance_id}")
+        raise LookupError(f"Instance update matched no rows for instance {instance_id}")
 
     after_row = dict(before_row)
     after_row.update(updates)
@@ -569,7 +518,7 @@ def sanctioned_update_instance_sync(
     }
 
 
-async def sanctioned_insert_instance(
+async def insert_instance(
     db,
     *,
     values: dict,
@@ -579,28 +528,20 @@ async def sanctioned_insert_instance(
     wrapper_launch_id: str | None = None,
     tracked_fields: set[str] | None = None,
 ) -> dict:
-    """Insert a new row into `instances` (the one physical table).
-
-    Accepts both instance-shaped and extracted historical value dicts;
-    everything is normalized through legacy_row_to_instance_values
-    (legion/profile_name resolve to persona_id, parent_instance_id to a
-    chapter commander edge, tts_mode to notification/interaction modes).
-    """
-    instance_values = _instance_values_from_legacy_row(
-        values, await _persona_id_for_row(db, values)
-    )
+    """Insert a new canonical row into `instances`."""
+    instance_values = _instance_values_from_runtime_row(values)
     instance_values = await _prepare_chapter_commander(db, instance_values)
     instance_values = _coerce_insert_name(instance_values)
     if not instance_values.get("id"):
-        raise ValueError("sanctioned_insert_instance requires an id")
-    columns = [column for column in INSTANCE_COLUMNS if column in instance_values]
+        raise ValueError("insert_instance requires an id")
+    columns = [column for column in RUNTIME_WRITE_INSTANCE_COLUMNS if column in instance_values]
     placeholders = ", ".join("?" for _ in columns)
     await db.execute(
         f"INSERT INTO instances ({', '.join(columns)}) VALUES ({placeholders})",
         [instance_values[column] for column in columns],
     )
 
-    tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
+    tracked = _canonical_tracked_fields(tracked_fields)
     field_names = [field for field in columns if field in tracked]
     after = {field: instance_values.get(field) for field in field_names}
     write_txn_id = str(uuid.uuid4())
@@ -623,7 +564,7 @@ async def sanctioned_insert_instance(
     }
 
 
-def sanctioned_insert_instance_sync(
+def insert_instance_sync(
     db,
     *,
     values: dict,
@@ -633,20 +574,20 @@ def sanctioned_insert_instance_sync(
     wrapper_launch_id: str | None = None,
     tracked_fields: set[str] | None = None,
 ) -> dict:
-    """Sync twin of sanctioned_insert_instance."""
-    instance_values = _instance_values_from_legacy_row(values, _persona_id_for_row_sync(db, values))
+    """Sync twin of insert_instance."""
+    instance_values = _instance_values_from_runtime_row(values)
     instance_values = _prepare_chapter_commander_sync(db, instance_values)
     instance_values = _coerce_insert_name(instance_values)
     if not instance_values.get("id"):
-        raise ValueError("sanctioned_insert_instance_sync requires an id")
-    columns = [column for column in INSTANCE_COLUMNS if column in instance_values]
+        raise ValueError("insert_instance_sync requires an id")
+    columns = [column for column in RUNTIME_WRITE_INSTANCE_COLUMNS if column in instance_values]
     placeholders = ", ".join("?" for _ in columns)
     db.execute(
         f"INSERT INTO instances ({', '.join(columns)}) VALUES ({placeholders})",
         [instance_values[column] for column in columns],
     )
 
-    tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
+    tracked = _canonical_tracked_fields(tracked_fields)
     field_names = [field for field in columns if field in tracked]
     after = {field: instance_values.get(field) for field in field_names}
     write_txn_id = str(uuid.uuid4())
@@ -669,7 +610,7 @@ def sanctioned_insert_instance_sync(
     }
 
 
-async def sanctioned_delete_instance(
+async def delete_instance(
     db,
     *,
     instance_id: str,
@@ -685,9 +626,9 @@ async def sanctioned_delete_instance(
 
     cursor = await db.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
     if cursor.rowcount == 0:
-        raise LookupError(f"Sanctioned delete matched no rows for instance {instance_id}")
+        raise LookupError(f"Instance delete matched no rows for instance {instance_id}")
 
-    tracked = tracked_fields or INSTANCE_MUTATION_FIELDS
+    tracked = _canonical_tracked_fields(tracked_fields)
     field_names = [field for field in before_row.keys() if field in tracked]
     write_txn_id = str(uuid.uuid4())
     await _append_instance_mutation(
@@ -729,9 +670,22 @@ async def get_instance_mutations(db, instance_id: str, *, limit: int = 20) -> li
     mutations = []
     for row in rows:
         item = dict(row)
-        item["field_names"] = _parse_json_column(item.pop("field_names_json"))
-        item["before"] = _parse_json_column(item.pop("before_json"))
-        item["after"] = _parse_json_column(item.pop("after_json"))
+        fields = _parse_json_column(item.pop("field_names_json")) or []
+        before = _parse_json_column(item.pop("before_json"))
+        after = _parse_json_column(item.pop("after_json"))
+        item["field_names"] = [
+            field for field in fields if field not in FORBIDDEN_RUNTIME_INSTANCE_FIELDS
+        ]
+        item["before"] = (
+            {k: v for k, v in before.items() if k not in FORBIDDEN_RUNTIME_INSTANCE_FIELDS}
+            if isinstance(before, dict)
+            else before
+        )
+        item["after"] = (
+            {k: v for k, v in after.items() if k not in FORBIDDEN_RUNTIME_INSTANCE_FIELDS}
+            if isinstance(after, dict)
+            else after
+        )
         mutations.append(item)
     return mutations
 
@@ -808,7 +762,7 @@ def _collect_state_findings(row: dict) -> list[dict]:
     return findings
 
 
-def _current_row_matches_sanctioned_fields(
+def _current_row_matches_mutation_fields(
     row: dict, mutations: list[dict]
 ) -> tuple[bool, list[str], dict]:
     if not mutations:
@@ -865,7 +819,7 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
 
     mutations = await get_instance_mutations(db, instance_id, limit=10)
     latest = mutations[0] if mutations else None
-    matches_latest, provenance_mismatches, latest_by_field = _current_row_matches_sanctioned_fields(
+    matches_latest, provenance_mismatches, latest_by_field = _current_row_matches_mutation_fields(
         row, mutations
     )
     findings = []
@@ -977,7 +931,7 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
         "current_row": {
             field: row.get(field) for field in sorted(INSTANCE_MUTATION_FIELDS | {"id"})
         },
-        "latest_sanctioned_mutation": latest,
+        "latest_instance_mutation": latest,
         "findings": findings,
         "pending_projection": pending_projection,
         "observed_projection": observed_projection,
@@ -986,7 +940,7 @@ async def reconcile_instance(db, instance_id: str) -> dict | None:
             "pane_bg": expected_pane_bg,
         },
         "last_write_txn_id": latest.get("write_txn_id") if latest else None,
-        "last_sanctioned_write_source": latest.get("write_source") if latest else None,
-        "last_sanctioned_write_time": latest.get("created_at") if latest else None,
+        "last_instance_write_source": latest.get("write_source") if latest else None,
+        "last_instance_write_time": latest.get("created_at") if latest else None,
         "recent_mutations": mutations,
     }
