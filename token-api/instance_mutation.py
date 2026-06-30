@@ -761,14 +761,6 @@ def _collect_state_findings(row: dict) -> list[dict]:
                 "fields": ["continuity_binding_source", "session_doc_id"],
             }
         )
-    if row.get("session_doc_policy") == "dispatch_explicit" and not row.get("dispatch_target"):
-        findings.append(
-            {
-                "category": "state_drift",
-                "message": "dispatch_explicit policy has no dispatch_target",
-                "fields": ["session_doc_policy", "dispatch_target"],
-            }
-        )
     return findings
 
 

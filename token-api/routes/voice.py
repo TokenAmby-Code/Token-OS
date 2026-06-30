@@ -160,12 +160,12 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
 
         holder_cursor = await db.execute(
             """
-            SELECT id, name AS tab_name
-            FROM instances i
-            JOIN personas p ON p.id = i.persona_id
-            WHERE i.id != ?
+            SELECT ci.id, ci.name AS tab_name
+            FROM instances ci
+            JOIN personas p ON p.id = ci.persona_id
+            WHERE ci.id != ?
               AND p.tts_voice = ?
-              AND i.status NOT IN ('stopped', 'archived')
+              AND ci.status NOT IN ('stopped', 'archived')
             LIMIT 1
             """,
             (instance_id, request.voice),

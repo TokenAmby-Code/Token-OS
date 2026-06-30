@@ -113,7 +113,6 @@ from instance_mutation import (
 )
 from instance_registry import (
     DEFAULT_INSTANCE_NAME,
-    FORBIDDEN_RUNTIME_INSTANCE_FIELDS,
     VALID_STATUSES,
     derived_cockpit_label,
 )
@@ -1044,14 +1043,12 @@ class InstanceRegisterRequest(BaseModel):
 class InstanceResponse(BaseModel):
     id: str
     session_id: str
-    tab_name: str | None
+    name: str | None
     working_dir: str | None
     origin_type: str
     source_ip: str | None
     device_id: str
-    profile_name: str
-    tts_voice: str
-    notification_sound: str
+    persona: dict | None = None
     pid: int | None
     status: str
     created_at: str
@@ -2592,7 +2589,7 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
         cursor = await db.execute(
             """
             SELECT ci.id, ci.name AS tab_name, ci.rank, ci.workflow_blocked_reason,
-                   ci.session_doc_id, ci.dispatch_session_doc_path,
+                   ci.session_doc_id,
                    p.slug AS persona_slug, p.default_rank AS persona_default_rank,
                    sd.file_path AS session_doc_path
             FROM instances ci
@@ -2679,7 +2676,7 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
             )
             await db.commit()
 
-    session_doc_path = instance.get("session_doc_path") or instance.get("dispatch_session_doc_path")
+    session_doc_path = instance.get("session_doc_path")
     slug = _derive_session_doc_slug(session_doc_path)
     has_session_doc = bool(instance.get("session_doc_id") or session_doc_path)
     message = _build_naming_nudge_message(slug, has_session_doc)
@@ -2766,9 +2763,12 @@ async def register_instance(request: InstanceRegisterRequest):
                 profile = persona_to_profile(dict(persona_row))
             else:
                 profile = {
-                    "name": existing["profile_name"],
-                    "wsl_voice": existing["tts_voice"],
-                    "notification_sound": existing["notification_sound"],
+                    "name": None,
+                    "wsl_voice": None,
+                    "notification_sound": None,
+                    "color": "#0099ff",
+                    "chip_color": None,
+                    "pane_tint": None,
                 }
             return ProfileResponse(
                 session_id=session_id,
@@ -4074,9 +4074,6 @@ def _agent_engine(instance: dict) -> str:
     engine = (instance.get("engine") or "").strip().lower()
     if engine in {"codex", "claude"}:
         return engine
-    launcher = (instance.get("launcher") or "").strip().lower()
-    if "codex" in launcher:
-        return "codex"
     return "claude"
 
 
@@ -5227,24 +5224,6 @@ async def schedule_golden_throne_followup(instance: dict, reason: str = "stop_ho
         f"quiet_hours_shifted={quiet_hours_shifted} rubric_state={rubric_state}"
     )
     return {"scheduled": True, **details}
-
-
-async def recover_recent_stopped_golden_throne_timers(
-    *,
-    lookback_minutes: int = 24 * 60,
-) -> list[dict]:
-    """Retired compatibility shim.
-
-    Golden Throne no longer resurrects timers from historical instance state.
-    Scheduling is event-driven from stop/activity hooks only. Keep this function
-    as a harmless no-op for old callers/tests during rollout.
-    """
-    return []
-
-
-def _golden_throne_sweep_sync() -> dict:
-    """Retired compatibility shim. GT has no periodic timer sweep."""
-    return {"success": True, "recovered": 0, "disabled": True}
 
 
 def quiet_hours_status(now: datetime | None = None) -> dict:
@@ -10009,7 +9988,7 @@ async def _resolve_administratum_instance() -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT i.id, i.device_id, i.dispatch_session_doc_path
+            """SELECT i.id, i.device_id
                FROM instances i
                JOIN personas p ON p.id = i.persona_id
                WHERE p.slug = 'administratum'
@@ -10052,7 +10031,6 @@ async def _resolve_administratum_instance() -> dict | None:
     return {
         "id": await shared.instance_id_for_pane(pane) or "administratum-rowless",
         "device_id": LOCAL_DEVICE_NAME,
-        "dispatch_session_doc_path": None,
         "tmux_pane": pane,
     }
 
@@ -10074,7 +10052,7 @@ def _administratum_log_path(instance: dict | None) -> Path:
     """Canonical Administratum record-keeping log for today.
 
     The deterministic state-hook stream is a daily dispatcher-written log, not an
-    instance/session document. Do not redirect it through dispatch_session_doc_path.
+    instance/session document.
     """
     date = datetime.now().strftime("%Y-%m-%d")
     return _administratum_vault_root() / ADMINISTRATUM_LOG_REL_DIR / f"administratum-{date}.md"
@@ -12272,6 +12250,54 @@ _INSTANCES_READ_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
 _INSTANCES_READ_CACHE_LOCK = asyncio.Lock()
 _INSTANCES_READ_CACHE_TTL_SECONDS = 0.5
 
+DEAD_INSTANCE_RESPONSE_FIELDS = {
+    # Old claude_instances aliases.
+    "tab_name",
+    "profile_name",
+    "legion",
+    "primarch",
+    "synced",
+    "instance_type",
+    "parent_instance_id",
+    # Persona-derived presentation/audio fields belong under `persona`.
+    "tts_voice",
+    "notification_sound",
+    "pane_tint",
+    "chip_color",
+    "color",
+    # Launch/tmux/transplant provenance is not canonical instance shape.
+    "dispatch_target",
+    "dispatch_window",
+    "dispatch_mode",
+    "dispatch_slot",
+    "dispatch_session_doc_path",
+    "target_working_dir",
+    "launch_mode",
+    "launcher",
+    "transplant_target_session",
+    "transplant_expected",
+}
+
+
+def _attach_persona_surface(row: dict) -> dict:
+    persona = {
+        "id": row.get("persona_id"),
+        "slug": row.pop("persona_slug", None),
+        "display_name": row.pop("persona_display_name", None),
+        "pane_tint": row.pop("persona_pane_tint", None),
+        "chip_color": row.pop("persona_chip_color", None),
+        "tts_voice": row.pop("persona_tts_voice", None),
+        "tts_rate": row.pop("persona_tts_rate", None),
+        "notification_sound": row.pop("persona_notification_sound", None),
+    }
+    if any(value is not None for value in persona.values()):
+        row["persona"] = persona
+    else:
+        row["persona"] = None
+    for field in DEAD_INSTANCE_RESPONSE_FIELDS:
+        row.pop(field, None)
+    return row
+
 
 @app.get("/api/instances", response_model=list[dict])
 async def list_instances(
@@ -12329,19 +12355,7 @@ async def list_instances(
             rows = [dict(row) for row in await cursor.fetchall()]
 
         async def enrich(row: dict) -> dict:
-            for field in FORBIDDEN_RUNTIME_INSTANCE_FIELDS:
-                row.pop(field, None)
-            row["persona"] = {
-                "id": row.get("persona_id"),
-                "slug": row.pop("persona_slug", None),
-                "display_name": row.pop("persona_display_name", None),
-                "pane_tint": row.pop("persona_pane_tint", None),
-                "chip_color": row.pop("persona_chip_color", None),
-                "tts_voice": row.pop("persona_tts_voice", None),
-                "tts_rate": row.pop("persona_tts_rate", None),
-                "notification_sound": row.pop("persona_notification_sound", None),
-            }
-            row["cockpit_color"] = row["persona"].get("chip_color")
+            row = _attach_persona_surface(row)
             row["cockpit_label"] = derived_cockpit_label(row)
             row["voice_chat"] = row.get("interaction_mode") == "voice_chat"
             if row["voice_chat"]:
@@ -12397,12 +12411,16 @@ async def resolve_instance(pid: int | None = None, cwd: str | None = None):
         # Method 2: CWD match (prefer processing)
         if not instance and cwd:
             cursor = await db.execute(
-                """SELECT i.*, i.name AS tab_name,
-                          CASE WHEN i.golden_throne = 'sync' THEN 'sync'
-                               WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
-                               ELSE 'one_off'
-                          END AS instance_type
+                """SELECT i.*,
+                          p.slug AS persona_slug,
+                          p.display_name AS persona_display_name,
+                          p.pane_tint AS persona_pane_tint,
+                          p.chip_color AS persona_chip_color,
+                          p.tts_voice AS persona_tts_voice,
+                          p.tts_rate AS persona_tts_rate,
+                          p.notification_sound AS persona_notification_sound
                    FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
                    WHERE i.working_dir = ? AND i.status = 'working'
                    ORDER BY i.last_activity DESC LIMIT 1""",
                 (cwd,),
@@ -12410,12 +12428,16 @@ async def resolve_instance(pid: int | None = None, cwd: str | None = None):
             instance = await cursor.fetchone()
             if not instance:
                 cursor = await db.execute(
-                    """SELECT i.*, i.name AS tab_name,
-                              CASE WHEN i.golden_throne = 'sync' THEN 'sync'
-                                   WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
-                                   ELSE 'one_off'
-                              END AS instance_type
+                    """SELECT i.*,
+                              p.slug AS persona_slug,
+                              p.display_name AS persona_display_name,
+                              p.pane_tint AS persona_pane_tint,
+                              p.chip_color AS persona_chip_color,
+                              p.tts_voice AS persona_tts_voice,
+                              p.tts_rate AS persona_tts_rate,
+                              p.notification_sound AS persona_notification_sound
                        FROM instances i
+                       LEFT JOIN personas p ON p.id = i.persona_id
                        WHERE i.working_dir = ? AND i.status = 'idle'
                        ORDER BY i.last_activity DESC LIMIT 1""",
                     (cwd,),
@@ -12425,7 +12447,7 @@ async def resolve_instance(pid: int | None = None, cwd: str | None = None):
         if not instance:
             raise HTTPException(404, "No matching instance found")
 
-        result = dict(instance)
+        result = _attach_persona_surface(dict(instance))
 
         # Attach session doc if linked
         if result.get("session_doc_id"):
@@ -12446,16 +12468,14 @@ async def get_instance(instance_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT i.*, i.name AS tab_name,
-                      COALESCE(p.slug, 'astartes') AS legion,
-                      COALESCE(p.slug, 'astartes') AS profile_name,
-                      CASE WHEN i.golden_throne = 'sync' THEN 1 ELSE 0 END AS synced,
-                      CASE WHEN i.status = 'archived' THEN 'archived'
-                           WHEN i.golden_throne = 'sync' THEN 'sync'
-                           WHEN i.golden_throne IS NOT NULL THEN 'golden_throne'
-                           ELSE 'one_off'
-                      END AS instance_type,
-                      CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id
+            """SELECT i.*,
+                      p.slug AS persona_slug,
+                      p.display_name AS persona_display_name,
+                      p.pane_tint AS persona_pane_tint,
+                      p.chip_color AS persona_chip_color,
+                      p.tts_voice AS persona_tts_voice,
+                      p.tts_rate AS persona_tts_rate,
+                      p.notification_sound AS persona_notification_sound
                FROM instances i
                LEFT JOIN personas p ON p.id = i.persona_id
                WHERE i.id = ?""",
@@ -12466,15 +12486,7 @@ async def get_instance(instance_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        instance = dict(row)
-        # Resolve display/chip/tint from persona/profile slug.
-        profile_name = instance.get("profile_name")
-        prof = profile_by_name(profile_name)
-        if prof:
-            instance["color"] = prof.get("chip_color") or prof.get("color")
-            instance["chip_color"] = prof.get("chip_color") or prof.get("color")
-            instance["pane_tint"] = prof.get("pane_tint")
-            instance["chapter"] = prof.get("chapter")
+        instance = _attach_persona_surface(dict(row))
         return instance
 
 
@@ -13391,11 +13403,20 @@ async def get_dashboard():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # Get all instances
         cursor = await db.execute(
-            "SELECT i.*, i.name AS tab_name, COALESCE(p.slug, 'astartes') AS legion, COALESCE(p.slug, 'astartes') AS profile_name, COALESCE(p.slug, 'astartes') AS primarch, CASE WHEN i.golden_throne = 'sync' THEN 1 ELSE 0 END AS synced, CASE WHEN i.status = 'archived' THEN 'archived' WHEN i.golden_throne = 'sync' THEN 'sync' WHEN i.golden_throne IS NOT NULL THEN 'golden_throne' ELSE 'one_off' END AS instance_type, CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id FROM instances i LEFT JOIN personas p ON p.id = i.persona_id ORDER BY i.status ASC, i.created_at DESC"
+            """SELECT i.*,
+                      p.slug AS persona_slug,
+                      p.display_name AS persona_display_name,
+                      p.pane_tint AS persona_pane_tint,
+                      p.chip_color AS persona_chip_color,
+                      p.tts_voice AS persona_tts_voice,
+                      p.tts_rate AS persona_tts_rate,
+                      p.notification_sound AS persona_notification_sound
+               FROM instances i
+               LEFT JOIN personas p ON p.id = i.persona_id
+               ORDER BY i.status ASC, i.created_at DESC"""
         )
-        instances = [dict(row) for row in await cursor.fetchall()]
+        instances = [_attach_persona_surface(dict(row)) for row in await cursor.fetchall()]
 
         # Check productivity (any active instances = productive)
         active_count = sum(1 for i in instances if i["status"] not in ("stopped", "archived"))
@@ -20359,7 +20380,7 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "session_doc": {
                     "id": inst.get("session_doc_id"),
                     "title": inst.get("session_doc_title"),
-                    "path": inst.get("session_doc_path") or inst.get("dispatch_session_doc_path"),
+                    "path": inst.get("session_doc_path"),
                     "status": inst.get("session_doc_status"),
                     "project": inst.get("session_doc_project"),
                     "policy": inst.get("session_doc_policy"),

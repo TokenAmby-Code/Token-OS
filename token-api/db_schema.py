@@ -222,30 +222,14 @@ async def _create_instances_table(db) -> None:
             golden_throne TEXT,
             human_anchored_at TIMESTAMP,
             human_anchor_source TEXT,
-            -- ── RUNTIME ANNEX (transitional) ─────────────────────────────
-            -- Inherited verbatim from the extracted claude_instances table so
-            -- exterminatus could land without redesigning every subsystem.
+            -- ── SUBSYSTEM ANNEX (transitional) ───────────────────────────
             -- Keep in lockstep with instance_registry.RUNTIME_ANNEX_COLUMNS.
-            -- Do NOT add columns here: each is slated for per-column removal
-            -- (tmux geometry -> @INSTANCE_ID stamps, GT state -> golden_throne
-            -- table, workflow/planning -> status enum).
-            -- tmux_pane / pane_label: EXTERMINATED. Pane ids are too volatile to
-            -- persist; the tmuxctl runtime oracle (@INSTANCE_ID stamps ->
-            -- _live_agent_panes) is the sole source of pane geometry. Never
-            -- re-add these — a stored pane id is always a regression.
-            dispatch_target TEXT,
-            dispatch_window TEXT,
-            dispatch_mode TEXT,
-            dispatch_slot TEXT,
-            dispatch_session_doc_path TEXT,
-            target_working_dir TEXT,
-            launch_mode TEXT,
-            launcher TEXT,
-            transplant_target_session TEXT,
-            transplant_expected INTEGER DEFAULT 0,
+            -- EXTERMINATED from canonical instances: all tmux/dispatch/launch
+            -- placement/provenance columns and persona-derived audio columns.
+            -- tmux routing belongs to tmuxctld's live oracle (@INSTANCE_ID
+            -- stamps -> _live_agent_panes); launch provenance belongs in
+            -- events/mutations/provenance tables; audio belongs to personas.
             input_lock TEXT,
-            tts_voice TEXT,
-            notification_sound TEXT,
             discord_hosted INTEGER DEFAULT 0,
             discord_channel TEXT,
             discord_bot TEXT,

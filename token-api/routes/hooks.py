@@ -697,53 +697,6 @@ async def _apply_commander_binding(
     )
 
 
-RAW_TMUX_PANE_ID_RE = re.compile(r"^%\d+$")
-
-
-async def _canonical_dispatch_target_for_session_start(
-    *,
-    dispatch_target: str | None,
-    launch_mode: str | None,
-    tmux_pane: str | None,
-    pane_label: str | None,
-) -> str | None:
-    """Return the durable dispatch target for SessionStart registration.
-
-    ``launch_mode=tmux_target`` persona-seat/cutover respawns can arrive with
-    ``TOKEN_API_DISPATCH_TARGET=$TMUX_PANE``. Raw ``%NN`` pane ids are transient
-    tmux runtime addresses and must not be persisted; the durable routing target
-    is the pane's public tmuxctld/@PANE_ID alias (for example
-    ``mechanicus:orchestrator`` or ``council:custodes``). Mainline dispatch
-    already provides the public target, so this is a narrow compatibility
-    resolver for the raw-pane persona-seat path.
-    """
-    target = _normalize_text(dispatch_target)
-    if not target or not RAW_TMUX_PANE_ID_RE.fullmatch(target):
-        return target
-    if (_normalize_text(launch_mode) or "").lower() != "tmux_target":
-        return target
-
-    label = _normalize_text(pane_label)
-    if label:
-        return label
-
-    # Prefer the raw target being persisted; fall back to the effective event pane
-    # when the target was copied from $TMUX_PANE but the effective pane was later
-    # resolved from a stable label.
-    resolved_label = await _tmux_pane_label(target)
-    if resolved_label:
-        return resolved_label
-    if tmux_pane and tmux_pane != target:
-        resolved_label = await _tmux_pane_label(tmux_pane)
-        if resolved_label:
-            return resolved_label
-
-    # Fail closed to the original value when the pane has no public id; the
-    # existing reconciler/tests will surface that unresolved state. Do not invent
-    # aliases.
-    return target
-
-
 async def _apply_persona_seat_name(
     db,
     *,
@@ -1033,11 +986,7 @@ async def _consume_state_injections(db, audience_instance_id: str) -> list[dict]
 
 
 def _row_parent_instance_id(row: dict) -> str | None:
-    """Legacy `parent_instance_id` derived from the canonical commander edge: only a
-    `commander_type='chapter'` edge carries a parent instance id (the column died
-    with legacy instance table). Works for raw `SELECT *` rows that lack the alias."""
-    if row.get("parent_instance_id") is not None:
-        return row.get("parent_instance_id")
+    """Return the canonical chapter commander edge for this row."""
     if row.get("commander_type") == "chapter":
         return row.get("commander_id")
     return None
@@ -1357,9 +1306,7 @@ def _is_mechanicus_worker_row(row: dict) -> bool:
         return False
     if _is_mechanicus_worker_label(label):
         return True
-    return _normalize_text(
-        row.get("dispatch_target")
-    ) == "mechanicus:new" or _is_mechanicus_stack_window(row.get("dispatch_window"))
+    return False
 
 
 async def _active_stop_subscription_id(
@@ -1389,7 +1336,6 @@ async def _active_hook_instances(db) -> list[dict]:
     cursor = await db.execute(
         """SELECT id, name AS tab_name, status, last_activity,
                   persona_id, commander_type, commander_id,
-                  dispatch_target, dispatch_window,
                   CASE WHEN commander_type = 'chapter' THEN commander_id END AS parent_instance_id
            FROM instances
            WHERE status NOT IN ('stopped', 'archived')
@@ -1433,7 +1379,7 @@ async def _find_live_persona_singleton(db, persona_id_or_slug: str | None) -> di
     cursor = await db.execute(
         """SELECT i.id, i.name AS tab_name, i.status, i.last_activity,
                   i.persona_id, i.commander_type, i.commander_id,
-                  i.dispatch_target, i.dispatch_window, i.rank,
+                  i.rank,
                   CASE WHEN i.commander_type = 'chapter' THEN i.commander_id END AS parent_instance_id
            FROM instances i
            JOIN personas p ON p.id = i.persona_id
@@ -1461,20 +1407,8 @@ async def _find_live_persona_singleton(db, persona_id_or_slug: str | None) -> di
 
 
 async def _find_live_fabricator_general(db) -> dict | None:
-    """Compatibility resolver for legacy Mechanicus chapter-parent tests.
-
-    New persona-commanded workers use ``_find_live_persona_singleton``.  This
-    fallback keeps the old FG chapter-parent reconcile behavior for rows that
-    predate canonical persona binding.
-    """
-    fg = await _find_live_persona_singleton(db, "fabricator-general")
-    if fg:
-        return fg
-    rows = await _with_effective_pane_labels(await _active_hook_instances(db))
-    for row in rows:
-        if row.get("effective_pane_label") == MECHANICUS_FG_LABEL:
-            return row
-    return None
+    """Resolve the live Fabricator-General singleton by canonical persona."""
+    return await _find_live_persona_singleton(db, "fabricator-general")
 
 
 async def _resolve_persona_commander_for_stop_subscription(
@@ -2990,13 +2924,6 @@ async def handle_session_start(payload: dict) -> dict:
         # zombie d865db2e).
         parent_instance_id = ""
 
-    dispatch_target = await _canonical_dispatch_target_for_session_start(
-        dispatch_target=dispatch_target,
-        launch_mode=launch_mode,
-        tmux_pane=tmux_pane,
-        pane_label=pane_label,
-    )
-
     def _effective_parent(prior_parent: str | None) -> str | None:
         # Same invariant for every restore path (supplant, --continue, prior
         # dispatch env): a persona singleton never inherits a parent — not from
@@ -3063,13 +2990,14 @@ async def handle_session_start(payload: dict) -> dict:
             rank_row = await cursor.fetchone()
             persona_default_rank = rank_row["default_rank"] if rank_row else None
 
-        # --- Supplant logic: reuse existing instance row instead of creating new ---
-        # Priority: DB transplant marker > hook file handoff > primarch singleton
+        # --- Supplant logic: create a new row for a new session; never persist
+        # tmux/launch/transplant markers on instances.
+        # Priority: hook file handoff > primarch singleton
         supplant_id = None
 
         # 1. File-based handoff (local transplant — injected by generic-hook.sh).
-        # DB transplant marker columns are not canonical instance state and are not
-        # consulted by runtime registration.
+        # Cross-device handoff belongs in explicit launch provenance, not an
+        # instances.transplant_target_session column.
         if transplant_from:
             supplant_id = transplant_from
 
@@ -4105,13 +4033,9 @@ async def handle_session_start(payload: dict) -> dict:
                 if auto_persona_row:
                     legion_updates["persona_id"] = auto_persona_row["id"]
             # Persona panes (Custodes, FG, Administratum, …) are recognised by their
-            # tmux label. The moment one is, fold in its persona profile, overriding
-            # whatever random chapter it drew at registration: Custodes gets the
-            # reserved George voice (the only path to it — George lives outside the
-            # rotation pools); every other persona is voiceless (tts_voice=None) so
-            # it never TTSes and frees the chapter voice it briefly held. All persona
-            # voiceless personas keep tts_voice=NULL (silent). Pane colour is applied
-            # only through focus-neutral per-pane style options.
+            # tmux label. The moment one is, bind its persona_id. Voice/sound are
+            # persona-table concepts now, never per-instance columns. Pane colour is
+            # applied only through focus-neutral per-pane style options.
             if persona_identity:
                 # Persona panes are identified by their label's primarch, not their
                 # legion. Malcador shares the astartes legion with regiment workers,
@@ -4280,7 +4204,7 @@ async def handle_session_end(payload: dict) -> dict:
                       (SELECT slug FROM personas WHERE id = instances.persona_id) AS legion,
                       workflow_state, golden_throne, status, rank,
                       engine, COALESCE(hook_driven, 0),
-                      origin_type, commander_type, dispatch_session_doc_path,
+                      origin_type, commander_type, session_doc_policy,
                       COALESCE(automated, 0), persona_id, working_dir
                FROM instances WHERE id = ?""",
             (session_id,),
@@ -4301,7 +4225,7 @@ async def handle_session_end(payload: dict) -> dict:
         _existing_status = row[7]
         _origin_type = row[11]
         _commander_type = row[12]
-        _dispatch_session_doc_path = row[13]
+        _session_doc_policy = row[13]
         _automated = row[14]
         _persona_id = row[15]
         _working_dir = row[16] if len(row) > 16 else None
@@ -4412,7 +4336,7 @@ async def handle_session_end(payload: dict) -> dict:
                 commander_type=_commander_type,
                 persona_id=_persona_id,
                 is_subagent=is_subagent,
-                dispatch_session_doc_path=_dispatch_session_doc_path,
+                session_doc_policy=_session_doc_policy,
                 automated=_automated,
                 golden_throne=_gt_marker,
             )
@@ -4743,14 +4667,14 @@ def _row_is_genuine_interactive(
     commander_type,
     persona_id,
     is_subagent,
-    dispatch_session_doc_path,
+    session_doc_policy,
     automated,
     golden_throne,
 ) -> bool:
     """True when an instance row is a genuine top-level interactive human session.
 
     Mirrors the SessionStart precedence in ``resolve_session_doc_for_start``: not
-    a subagent, not cron/dispatch, no explicit dispatch doc, no persona/legion,
+    a subagent, not cron/dispatch, no dispatch session-doc policy, no persona/legion,
     emperor-commanded, not automated, no golden-throne binding. Gates both the
     deferred-doc lazy mint (first prompt) and the never-acted reap (SessionEnd),
     so a dispatched worker whose doc legitimately resolved to NULL
@@ -4761,7 +4685,7 @@ def _row_is_genuine_interactive(
         and (commander_type or "emperor") == "emperor"
         and not persona_id
         and not is_subagent
-        and not dispatch_session_doc_path
+        and not session_doc_policy
         and not automated
         and not golden_throne
     )
@@ -4889,7 +4813,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
             commander_type=existing_dict.get("commander_type"),
             persona_id=existing_dict.get("persona_id"),
             is_subagent=existing_dict.get("is_subagent"),
-            dispatch_session_doc_path=existing_dict.get("dispatch_session_doc_path"),
+            session_doc_policy=existing_dict.get("session_doc_policy"),
             automated=existing_dict.get("automated"),
             golden_throne=existing_dict.get("golden_throne"),
         ):
@@ -5283,7 +5207,13 @@ async def handle_stop(payload: dict) -> dict:
     # Get instance info
     async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (session_id,))
+        cursor = await db.execute(
+            """SELECT i.*, p.notification_sound AS persona_notification_sound
+               FROM instances i
+               LEFT JOIN personas p ON p.id = i.persona_id
+               WHERE i.id = ?""",
+            (session_id,),
+        )
         instance = await cursor.fetchone()
 
         # Is this session the live Custodes orchestrator by persona identity (NOT
@@ -5333,7 +5263,7 @@ async def handle_stop(payload: dict) -> dict:
         tab_name, instance.get("tmux_pane"), instance.get("pane_label")
     )
     notify_surface = _resolved_surface if _resolved_surface != "session" else session_id[:12]
-    notification_sound = instance.get("notification_sound", "chimes.wav")
+    notification_sound = instance.get("persona_notification_sound") or "chimes.wav"
 
     # Update last_activity but DON'T set idle yet — that's the evaluators' job.
     # Sync instances never go idle (permanent processing until SessionEnd).
@@ -6491,10 +6421,11 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT golden_throne, name AS tab_name, "
-                "(SELECT slug FROM personas WHERE id = instances.persona_id) AS legion, "
-                "device_id, tts_voice "
-                "FROM instances WHERE id = ?",
+                """SELECT i.golden_throne, i.name AS tab_name, p.slug AS legion,
+                          i.device_id, p.tts_voice
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE i.id = ?""",
                 (session_id,),
             )
             row = await cursor.fetchone()
@@ -6649,7 +6580,11 @@ async def handle_notification(payload: dict) -> dict:
         async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT notification_sound FROM instances WHERE id = ?", (session_id,)
+                """SELECT p.notification_sound
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE i.id = ?""",
+                (session_id,),
             )
             row = await cursor.fetchone()
             if row and row["notification_sound"]:

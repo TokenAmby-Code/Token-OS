@@ -3,6 +3,11 @@
 Runtime writes use canonical present-tense ``instances`` columns only. Archive and
 migration imports may translate historical rows, but normal insert/update paths
 must reject dead launch, voice, and projection fields instead of mapping them.
+
+The ``instances`` table is durable identity plus explicitly retained subsystem
+state. Tmux/dispatch/launch/transient placement fields and persona-derived audio
+fields are forbidden runtime shape. Tmux routing is tmuxctld state; launch
+provenance is events/provenance; audio is persona/chapter-lock state.
 """
 
 from __future__ import annotations
@@ -39,25 +44,17 @@ IDENTITY_COLUMNS = [
     "human_anchor_source",
 ]
 
-# Existing physical columns beyond core identity. Only columns outside
-# FORBIDDEN_RUNTIME_INSTANCE_FIELDS are writable by normal runtime code.
+# Transitional subsystem annex (see module docstring). Order matters: it is the
+# physical column order in the CREATE TABLE.
+#
+# EXTERMINATED from canonical instances:
+# - tmux/dispatch/launch/transient placement/provenance fields
+#   (dispatch_*, launch_mode, launcher, target_working_dir, transplant_*).
+# - persona-derived audio fields (tts_voice, notification_sound).
+# Tmux routing belongs to tmuxctld's live oracle; launch provenance belongs in
+# events/mutations/provenance tables; audio belongs to personas/chapter locks.
 RUNTIME_ANNEX_COLUMNS = [
-    # Launch geometry/provenance columns that remain physically present in older DBs.
-    # Runtime write helpers reject them; tmuxctl resolves pane geometry live.
-    "dispatch_target",
-    "dispatch_window",
-    "dispatch_mode",
-    "dispatch_slot",
-    "dispatch_session_doc_path",
-    "target_working_dir",
-    "launch_mode",
-    "launcher",
-    "transplant_target_session",
-    "transplant_expected",
     "input_lock",
-    # per-instance voice overrides
-    "tts_voice",
-    "notification_sound",
     # discord hosting
     "discord_hosted",
     "discord_channel",
