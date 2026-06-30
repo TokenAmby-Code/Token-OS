@@ -75,6 +75,18 @@ class VoiceChangeRequest(BaseModel):
     voice: str
 
 
+
+
+def _persona_response(profile: dict) -> dict:
+    return {
+        "slug": profile.get("name"),
+        "display_name": profile.get("display_name"),
+        "pane_tint": profile.get("pane_tint"),
+        "chip_color": profile.get("chip_color"),
+        "tts_voice": profile.get("wsl_voice"),
+        "notification_sound": profile.get("notification_sound"),
+    }
+
 # ============ Voice Management Endpoints ============
 
 
@@ -95,10 +107,7 @@ async def list_voices():
                 "voice": wsl_voice,
                 "mac_voice": profile["mac_voice"],
                 "short_name": short_name,
-                "profile_name": profile["name"],
-                "display_name": profile["display_name"],
-                "chip_color": profile["chip_color"],
-                "pane_tint": profile["pane_tint"],
+                "persona": _persona_response(profile),
                 "fallback": profile["assignment_pool"] == "backup",
             }
         )
@@ -109,7 +118,7 @@ async def list_voices():
             "voice": CUSTODES_PROFILE["wsl_voice"],
             "mac_voice": CUSTODES_PROFILE["mac_voice"],
             "short_name": CUSTODES_PROFILE["wsl_voice"].replace("Microsoft ", ""),
-            "profile_name": CUSTODES_PROFILE["name"],
+            "persona": _persona_response(CUSTODES_PROFILE),
             "fallback": False,
             "reserved": "custodes",
         }
@@ -190,8 +199,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
                 "status": "no_change",
                 "instance_id": instance_id,
                 "voice": request.voice,
-                "profile_name": profile["name"],
-                "profile": profile,
+                "persona": _persona_response(profile),
             }
 
         await update_instance(
@@ -220,8 +228,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
         "status": "voice_changed",
         "instance_id": instance_id,
         "voice": request.voice,
-        "profile_name": profile["name"],
-        "profile": profile,
+        "persona": _persona_response(profile),
     }
 
 
@@ -332,20 +339,19 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
 
 
 @router.post("/api/instances/{instance_id}/voice-chat")
-async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: str = ""):
+async def toggle_voice_chat(instance_id: str, active: bool = True, pane_id: str = ""):
     """Toggle voice chat mode for an instance. Sets tts_mode='voice-chat' or restores to 'verbose'.
 
     Args:
-        tmux_pane: Target tmux pane for send-keys (e.g., 'main:grid.2').
-                   If empty, AHK script will use default.
+        pane_id: Target pane id for send-keys. If empty, AHK script uses default.
     """
     if active:
         VOICE_CHAT_SESSIONS[instance_id] = {
             "active": True,
             "started_at": datetime.now().isoformat(),
-            "tmux_pane": tmux_pane or "",
+            "pane_id": pane_id or "",
         }
-        logger.info(f"Voice chat STARTED for {instance_id[:12]} (pane: {tmux_pane or 'default'})")
+        logger.info(f"Voice chat STARTED for {instance_id[:12]} (pane: {pane_id or 'default'})")
     else:
         VOICE_CHAT_SESSIONS.pop(instance_id, None)
         logger.info(f"Voice chat ENDED for {instance_id[:12]}")
@@ -364,7 +370,7 @@ async def toggle_voice_chat(instance_id: str, active: bool = True, tmux_pane: st
             actor="voice-chat",
         )
         await db.commit()
-    return {"instance_id": instance_id, "voice_chat": active, "tmux_pane": tmux_pane}
+    return {"instance_id": instance_id, "voice_chat": active, "pane_id": pane_id}
 
 
 @router.get("/api/instances/{instance_id}/voice-chat")

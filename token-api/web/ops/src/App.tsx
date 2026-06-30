@@ -217,8 +217,8 @@ export function App() {
                 {Object.entries(state.instances.counts.by_status).map(([k, v]) => (
                   <span className="chip" key={k}>{k} {v}</span>
                 ))}
-                {Object.entries(state.instances.counts.by_legion).map(([k, v]) => (
-                  <span className="chip chip--legion" key={k}>{k} {v}</span>
+                {Object.entries(state.instances.counts.by_persona).map(([k, v]) => (
+                  <span className="chip chip--persona" key={k}>{k} {v}</span>
                 ))}
               </div>
             }

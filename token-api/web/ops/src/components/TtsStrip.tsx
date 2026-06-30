@@ -49,7 +49,7 @@ export function TtsStrip({ state, refresh }: { state: OpsState; refresh: () => v
         {current ? (
           <>
             <span className="ttsstrip__led" aria-hidden />
-            <b className="ttsstrip__tab">{current.tab_name || current.instance_id.slice(0, 8)}</b>
+            <b className="ttsstrip__tab">{current.name || current.instance_id.slice(0, 8)}</b>
             <span className="ttsstrip__msg" title={current.message}>
               {clamp(current.message)}
             </span>

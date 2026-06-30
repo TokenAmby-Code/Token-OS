@@ -957,7 +957,7 @@ class TTSQueueItem:
     message: str
     voice: str
     sound: str
-    tab_name: str
+    name: str
     queue_target: str = "pause"  # "hot" or "pause"
     queued_at: datetime = field(default_factory=datetime.now)
     status: str = "queued"  # queued, playing, completed
@@ -1403,7 +1403,7 @@ async def tts_queue_worker() -> None:
                     details={
                         "message": item.message[:100],
                         "voice": item.voice,
-                        "tab_name": item.tab_name,
+                        "name": item.name,
                     },
                 )
 
@@ -1696,7 +1696,7 @@ async def queue_tts(
 
     voice = row["tts_voice"]
     sound = row["notification_sound"]
-    tab_name = row["name"] or instance_id
+    name = row["name"] or instance_id
 
     # Check TTS mode (per-instance and global, most restrictive wins)
     instance_mode = row["tts_mode"] or "verbose"
@@ -1729,7 +1729,7 @@ async def queue_tts(
             message="",  # Empty message = no speech
             voice=voice,
             sound=sound,
-            tab_name=tab_name,
+            name=name,
             queue_target=queue_target,
             focus_on_playback=False,
             completion=completion,
@@ -1740,7 +1740,7 @@ async def queue_tts(
             message=message,
             voice=voice,
             sound=sound,
-            tab_name=tab_name,
+            name=name,
             queue_target=queue_target,
             focus_on_playback=False,
             completion=completion,
@@ -1832,7 +1832,7 @@ def _pause_queue_head_key_locked() -> str | None:
     return "|".join(
         (
             head.instance_id or "",
-            head.tab_name or "",
+            head.name or "",
             head.queued_at.isoformat(),
             message_hash,
         )
@@ -1876,7 +1876,7 @@ async def _sweep_stale_pause_queue_items_for_snapshot() -> list[dict]:
         age_seconds = max(0, int((now - expired_item.queued_at).total_seconds()))
         detail = {
             "instance_id": expired_item.instance_id,
-            "tab_name": expired_item.tab_name,
+            "name": expired_item.name,
             "queue": "pause",
             "queued_at": expired_item.queued_at.isoformat(),
             "age_seconds": age_seconds,
@@ -2038,7 +2038,7 @@ async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQue
         "threshold": snapshot["threshold"],
         "head_key": head_key,
         "latest_instance_id": item.instance_id,
-        "latest_tab_name": item.tab_name,
+        "latest_name": item.name,
         "oldest_queued_at": snapshot["oldest_queued_at"],
     }
     try:
@@ -2076,7 +2076,7 @@ def _queue_item_to_dict(item: TTSQueueItem) -> dict:
     """Serialize a TTSQueueItem for API responses."""
     return {
         "instance_id": item.instance_id,
-        "tab_name": item.tab_name,
+        "name": item.name,
         "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
         "voice": item.voice,
         "playback_target": item.playback_target,
@@ -2100,7 +2100,7 @@ def get_tts_queue_status() -> dict:
     if current_item:
         current = {
             "instance_id": current_item.instance_id,
-            "tab_name": current_item.tab_name,
+            "name": current_item.name,
             "message": current_item.message[:50] + "..."
             if len(current_item.message) > 50
             else current_item.message,

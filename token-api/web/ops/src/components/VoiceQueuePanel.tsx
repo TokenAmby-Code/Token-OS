@@ -60,7 +60,7 @@ function QueueRow({
   onAction: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const who = item.tab_name || item.instance_id.slice(0, 8);
+  const who = item.name || item.instance_id.slice(0, 8);
 
   return (
     <li className={`vq__row vq__row--act ${open ? 'is-open' : ''}`}>
@@ -142,7 +142,7 @@ export function VoiceQueuePanel({ state, refresh }: { state: OpsState; refresh: 
         {current ? (
           <>
             <span className="vq__now-led" aria-hidden />
-            <span className="vq__who">{current.tab_name || current.instance_id.slice(0, 8)}</span>
+            <span className="vq__who">{current.name || current.instance_id.slice(0, 8)}</span>
             <span className="vq__now-msg" title={current.message}>{current.message}</span>
             <span className="vq__now-meta">
               {current.voice ?? '—'}

@@ -64,7 +64,7 @@ export function summarizeDetails(details: unknown): string {
   if (typeof details === 'string') return details;
   if (typeof details !== 'object') return String(details);
   const obj = details as Record<string, unknown>;
-  for (const key of ['message', 'reason', 'name', 'tab_name', 'app', 'mode', 'status']) {
+  for (const key of ['message', 'reason', 'name', 'app', 'mode', 'status']) {
     const v = obj[key];
     if (typeof v === 'string' && v.trim()) return v;
   }

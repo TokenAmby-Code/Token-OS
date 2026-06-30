@@ -447,7 +447,7 @@ def test_find_live_custodes_matches_by_persona_and_rank():
             "persona": {"slug": "custodes"},
             "rank": "overseer",
             "status": "working",
-            "runtime": {"tmux_pane": "%9"},
+            "runtime": {"pane_id": "%9"},
         },
     ]
     with patch("morning_session._get", lambda path: instances):
@@ -473,9 +473,9 @@ def test_find_live_custodes_trusts_tmux_liveness_over_stale_status():
             "stale_status": "stopped",
             "status_source": "tmuxctl-live-overlay",
             "runtime": {
-                "live_pane": True,
-                "tmux_pane": "%47",
-                "pane_label": "council:custodes",
+                "live": True,
+                "pane_id": "%47",
+                "role": "council:custodes",
             },
         }
     ]
@@ -515,8 +515,7 @@ def test_reconcile_custodes_active_sets_sync_mode():
     with patch("morning_session._patch", side_effect=fake_patch):
         result = morning_session.reconcile_custodes_active(inst)
     assert result["reconciled"] is True
-    assert sent["/api/instances/abc123def456/type"] == {"instance_type": "sync"}
-    assert sent["/api/instances/abc123def456/synced"] == {"synced": True}
+    assert sent["/api/instances/abc123def456/golden-throne"] == {"mode": "sync"}
 
 
 def test_reconcile_custodes_active_no_instance_id():
@@ -533,7 +532,7 @@ def test_reconcile_custodes_active_no_instance_id():
 def test_confirm_custodes_registered_finds_by_identity():
     """confirm finds the custodes by identity, sets sync mode, returns live.
 
-    The live pane comes from runtime.tmux_pane (pane identity is never durably
+    The live pane comes from runtime.pane_id (pane identity is never durably
     stored on the canonical row).
     """
     inst = {
@@ -541,7 +540,7 @@ def test_confirm_custodes_registered_finds_by_identity():
         "persona": {"slug": "custodes"},
         "rank": "overseer",
         "status": "working",
-        "runtime": {"tmux_pane": "%9"},
+        "runtime": {"pane_id": "%9"},
     }
     with (
         patch("morning_session._get", lambda path: [inst]),

@@ -10,7 +10,7 @@ Written RED-first for the claude-instances-archive-extraction branch:
   `claude_instances` so provenance logging survives the drop
 - pane_state_queue triggers live on `instances` and push instance status vocab
 - sanctioned writes touch only `instances`
-- legacy PATCH endpoints (/legion, /synced, /type) write instance-table semantics
+- legacy PATCH endpoints (/legion, /synced, /type) are gone; canonical persona/golden-throne endpoints write instance-table semantics
 """
 
 import sqlite3
@@ -101,30 +101,8 @@ def legacy_seed(tmp_path):
             zealotry INTEGER DEFAULT 4,
             session_doc_id INTEGER
         );
-        CREATE TABLE instances (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            engine TEXT,
-            working_dir TEXT,
-            device_id TEXT NOT NULL,
-            origin_type TEXT NOT NULL DEFAULT 'local',
-            commander_type TEXT NOT NULL DEFAULT 'emperor',
-            commander_id TEXT,
-            status TEXT NOT NULL DEFAULT 'idle',
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            last_activity TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            stopped_at TIMESTAMP,
-            archived_at TIMESTAMP,
-            persona_id TEXT,
-            rank TEXT NOT NULL DEFAULT 'astartes',
-            session_doc_id INTEGER,
-            continuity_binding_source TEXT,
-            wrapper_launch_id TEXT,
-            automated INTEGER NOT NULL DEFAULT 0,
-            notification_mode TEXT NOT NULL DEFAULT 'verbose',
-            interaction_mode TEXT NOT NULL DEFAULT 'text',
-            golden_throne TEXT
-        );
+        CREATE TABLE __instances_placeholder (id TEXT PRIMARY KEY);
+        DROP TABLE __instances_placeholder;
         CREATE TABLE instance_mutations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             instance_id TEXT NOT NULL,
@@ -152,6 +130,45 @@ def legacy_seed(tmp_path):
         );
         """
     )
+    from instance_registry import DEFAULT_INSTANCE_NAME, INSTANCE_COLUMNS
+
+    type_overrides = {
+        "automated": "INTEGER NOT NULL DEFAULT 0",
+        "discord_hosted": "INTEGER DEFAULT 0",
+        "closure_required": "INTEGER DEFAULT 0",
+        "is_subagent": "INTEGER DEFAULT 0",
+        "hook_driven": "INTEGER DEFAULT 0",
+        "zealotry": "INTEGER DEFAULT 4",
+        "gt_resume_count": "INTEGER DEFAULT 0",
+        "gt_no_op_counter": "INTEGER DEFAULT 0",
+        "stop_allowed": "INTEGER DEFAULT 1",
+        "session_doc_id": "INTEGER",
+    }
+    defs = []
+    for column in INSTANCE_COLUMNS:
+        if column == "id":
+            defs.append("id TEXT PRIMARY KEY")
+        elif column == "name":
+            defs.append(f"name TEXT NOT NULL DEFAULT '{DEFAULT_INSTANCE_NAME}'")
+        elif column == "device_id":
+            defs.append("device_id TEXT NOT NULL DEFAULT 'test-device'")
+        elif column == "origin_type":
+            defs.append("origin_type TEXT NOT NULL DEFAULT 'local'")
+        elif column == "commander_type":
+            defs.append("commander_type TEXT NOT NULL DEFAULT 'emperor'")
+        elif column == "status":
+            defs.append("status TEXT NOT NULL DEFAULT 'idle'")
+        elif column == "rank":
+            defs.append("rank TEXT NOT NULL DEFAULT 'astartes'")
+        elif column == "notification_mode":
+            defs.append("notification_mode TEXT NOT NULL DEFAULT 'verbose'")
+        elif column == "interaction_mode":
+            defs.append("interaction_mode TEXT NOT NULL DEFAULT 'text'")
+        elif column in type_overrides:
+            defs.append(f"{column} {type_overrides[column]}")
+        else:
+            defs.append(f"{column} TEXT")
+    conn.execute(f"CREATE TABLE instances ({', '.join(defs)})")
     # Active session: present in BOTH tables. The legacy row carries runtime
     # annex data; the instance row carries identity the old projection used to
     # clobber (rank=primarch, working vocab).
@@ -316,8 +333,8 @@ class TestArchiveExtraction:
         assert row["rank"] == "overseer"
         assert row["origin_type"] == "perpetual"
         assert row["status"] == "working"
-        # canonical workflow state can be filled; launch/audio cruft remains archive-only
-        assert row["workflow_state"] == "open"
+        # Legacy workflow/launch/audio cruft remains archive-only; only canonical identity gaps fill.
+        assert row["workflow_state"] is None
         # synced=1/instance_type=sync legacy markers land as the instance marker
         assert row["golden_throne"] == "sync"
 
@@ -399,14 +416,18 @@ class TestSanctionedWritesV2Only:
         assert row is not None and row["name"] == "needs-name"
 
 
-# ── legacy PATCH endpoints write instance-table ─────────────────────────────────────────
+# ── canonical instance mutators; legacy endpoints are gone ─────────────────────────────
 
 
-class TestLegacyPatchEndpoints:
-    def test_patch_legion_sets_persona(self, client, app_env):
+class TestCanonicalPatchEndpoints:
+    def test_patch_persona_sets_persona(self, client, app_env):
         instance_id = _session_start(client)
-        resp = client.patch(f"/api/instances/{instance_id}/legion", json={"legion": "custodes"})
+        resp = client.patch(f"/api/instances/{instance_id}/persona", json={"persona_slug": "custodes"})
         assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["persona_id"]
+        assert body["persona"]["slug"] == "custodes"
+        assert "legion" not in body
         conn = _db(app_env)
         row = conn.execute(
             """SELECT p.slug FROM instances i JOIN personas p ON p.id = i.persona_id
@@ -416,31 +437,40 @@ class TestLegacyPatchEndpoints:
         conn.close()
         assert row is not None and row["slug"] == "custodes"
 
-    def test_patch_synced_sets_golden_throne_marker(self, client, app_env):
+    def test_patch_golden_throne_sync_sets_marker(self, client, app_env):
         instance_id = _session_start(client)
-        resp = client.patch(f"/api/instances/{instance_id}/synced", json={"synced": True})
+        resp = client.patch(f"/api/instances/{instance_id}/golden-throne", json={"mode": "sync"})
         assert resp.status_code == 200, resp.text
+        assert resp.json()["golden_throne"] == "sync"
         conn = _db(app_env)
         row = conn.execute(
             "SELECT golden_throne FROM instances WHERE id = ?", (instance_id,)
         ).fetchone()
         assert row["golden_throne"] == "sync"
 
-        resp = client.patch(f"/api/instances/{instance_id}/synced", json={"synced": False})
+        resp = client.patch(f"/api/instances/{instance_id}/golden-throne", json={"mode": "off"})
         assert resp.status_code == 200, resp.text
+        assert resp.json()["golden_throne"] is None
         row = conn.execute(
             "SELECT golden_throne FROM instances WHERE id = ?", (instance_id,)
         ).fetchone()
         conn.close()
         assert row["golden_throne"] is None
 
-    def test_patch_type_golden_throne_creates_gt_row(self, client, app_env):
+    def test_patch_golden_throne_follow_up_creates_gt_row(self, client, app_env):
         instance_id = _session_start(client)
+        conn = _db(app_env)
+        conn.execute("UPDATE instances SET status = 'working' WHERE id = ?", (instance_id,))
+        conn.commit()
+        conn.close()
         resp = client.patch(
-            f"/api/instances/{instance_id}/type",
-            json={"instance_type": "golden_throne", "zealotry": 6},
+            f"/api/instances/{instance_id}/golden-throne",
+            json={"mode": "follow_up", "zealotry": 6},
         )
         assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert set(body) >= {"instance_id", "golden_throne", "status", "rank"}
+        assert "instance_type" not in body
         conn = _db(app_env)
         row = conn.execute(
             "SELECT golden_throne, zealotry FROM instances WHERE id = ?",
@@ -455,10 +485,10 @@ class TestLegacyPatchEndpoints:
         conn.close()
         assert gt is not None, "golden_throne marker does not reference a golden_throne row"
 
-    def test_patch_type_one_off_clears_marker(self, client, app_env):
+    def test_patch_golden_throne_off_clears_marker(self, client, app_env):
         instance_id = _session_start(client)
-        client.patch(f"/api/instances/{instance_id}/synced", json={"synced": True})
-        resp = client.patch(f"/api/instances/{instance_id}/type", json={"instance_type": "one_off"})
+        client.patch(f"/api/instances/{instance_id}/golden-throne", json={"mode": "sync"})
+        resp = client.patch(f"/api/instances/{instance_id}/golden-throne", json={"mode": "off"})
         assert resp.status_code == 200, resp.text
         conn = _db(app_env)
         row = conn.execute(
@@ -466,3 +496,15 @@ class TestLegacyPatchEndpoints:
         ).fetchone()
         conn.close()
         assert row["golden_throne"] is None
+
+    def test_legacy_instance_mutators_return_410(self, client):
+        instance_id = _session_start(client)
+        cases = (
+            ("legion", {"legion": "custodes"}),
+            ("synced", {"synced": True}),
+            ("type", {"instance_type": "sync"}),
+            ("transplant-pending", {"target_session": "legacy"}),
+        )
+        for suffix, payload in cases:
+            resp = client.patch(f"/api/instances/{instance_id}/{suffix}", json=payload)
+            assert resp.status_code == 410, (suffix, resp.text)

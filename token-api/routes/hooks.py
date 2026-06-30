@@ -3409,10 +3409,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "success": True,
                     "action": "transplant_refreshed",
                     "instance_id": session_id,
-                    "profile": updated_inst["persona_slug"] if updated_inst else None,
-                    "color": hex_color,
-                    "chip_color": hex_color,
-                    "pane_tint": pane_tint,
+                    "persona": _persona_response_from_profile(prof, slug=updated_inst["persona_slug"] if updated_inst else None),
                     "session_doc_id": updated_inst["session_doc_id"] if updated_inst else None,
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
@@ -3806,10 +3803,7 @@ async def handle_session_start(payload: dict) -> dict:
                     "action": "supplanted",
                     "instance_id": session_id,
                     "supplanted_from": supplant_id,
-                    "profile": preserved_profile,
-                    "color": hex_color,
-                    "chip_color": hex_color,
-                    "pane_tint": pane_tint,
+                    "persona": _persona_response_from_profile(prof, slug=preserved_profile),
                     "session_doc_id": session_doc_id,
                     "stop_subscription": auto_subscription,
                     "mechanicus_stop_subscription": mechanicus_subscription,
@@ -4256,16 +4250,27 @@ async def handle_session_start(payload: dict) -> dict:
         "success": True,
         "action": "registered",
         "instance_id": session_id,
-        "profile": profile["name"] if not is_subagent else None,
-        "color": profile.get("color") if not is_subagent else None,
-        "chip_color": profile.get("chip_color") if not is_subagent else None,
-        "pane_tint": profile.get("pane_tint") if not is_subagent else None,
+        "persona": _persona_response_from_profile(profile) if not is_subagent else None,
         "session_doc_id": session_doc_id,
         "stop_subscription": auto_subscription,
         "mechanicus_stop_subscription": mechanicus_subscription,
         "commander_stop_subscription": mechanicus_subscription,
     }
 
+
+
+
+def _persona_response_from_profile(profile: dict | None, *, slug: str | None = None) -> dict | None:
+    if not profile:
+        return None
+    return {
+        "slug": slug or profile.get("name"),
+        "display_name": profile.get("display_name") or profile.get("name"),
+        "pane_tint": profile.get("pane_tint"),
+        "chip_color": profile.get("chip_color"),
+        "tts_voice": profile.get("wsl_voice") or profile.get("tts_voice"),
+        "notification_sound": profile.get("notification_sound"),
+    }
 
 async def handle_session_end(payload: dict) -> dict:
     """Handle SessionEnd hook - deregister Claude instance."""
@@ -6547,7 +6552,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     # Voice chat: trigger AHK so dictation captures the answer (voice-chat only).
     if tool_name == "AskUserQuestion" and session_id and session_id in VOICE_CHAT_SESSIONS:
         vc_session = VOICE_CHAT_SESSIONS.get(session_id, {})
-        tmux_pane = vc_session.get("tmux_pane", "")
+        tmux_pane = vc_session.get("pane_id", "")
         pane_arg = f' "{tmux_pane}"' if tmux_pane else ""
         logger.info(
             f"PreToolUse: Voice chat local_exec for {session_id[:12]} (pane: {tmux_pane or 'default'})"
