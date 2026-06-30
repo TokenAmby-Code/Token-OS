@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -188,19 +189,41 @@ async def test_brief_explicit_idempotency_key_reuses_queue_id(
     async def _row(_pane):
         return {"id": "custodes-row", "engine": "claude"}
 
-    queued_ids: list[str | None] = []
+    async def _resolve_instance_pane(_instance_id):
+        return None, ""
 
-    async def _enqueue(**kwargs):
-        queued_ids.append(kwargs.get("operation_id"))
-        return {"id": kwargs.get("operation_id"), "status": main.PANE_WRITE_PENDING}
+    async def _resolve_tmux_pane_id(pane):
+        return "%46" if pane == "%46" else None
 
-    async def _drain(queue_id):
-        return [{"queue_id": queue_id, "status": main.PANE_WRITE_SENT, "tmux_pane": "%46"}]
+    async def _no_pending(_pane):
+        return False
+
+    physical_sends: list[tuple[str, str, str | None]] = []
+
+    async def _send(pane, payload, *, clear_prompt=False, operation_id=None, **_kwargs):
+        physical_sends.append((pane, payload, operation_id))
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "verification_status": "submitted",
+            "verified_by": "UserPromptSubmit",
+            "operation_id": operation_id,
+        }
+
+    hook_flags: list[tuple[str, str]] = []
+
+    async def _flag(instance_id, *, tmux_pane, actor):
+        hook_flags.append((instance_id, actor))
 
     monkeypatch.setattr(main.talk_service, "resolve_brief_targets", _targets)
     monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _row)
-    monkeypatch.setattr(main, "enqueue_pane_write", _enqueue)
-    monkeypatch.setattr(main, "process_pane_write_queue_once", _drain)
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_instance_pane)
+    monkeypatch.setattr(main.shared, "resolve_tmux_pane_id", _resolve_tmux_pane_id)
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending)
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
+    monkeypatch.setattr(main, "_flag_hook_driven", _flag)
 
     req = main.BriefSendRequest(
         panes=["council:custodes"], payload="row path", idempotency_key="same-op"
@@ -209,9 +232,17 @@ async def test_brief_explicit_idempotency_key_reuses_queue_id(
     second = await main.brief_send(req)
 
     assert first["delivered"] == second["delivered"] == 1
-    assert len(queued_ids) == 2
-    assert queued_ids[0] == queued_ids[1]
-    assert queued_ids[0] is not None
+    assert len(physical_sends) == 1
+    operation_id = physical_sends[0][2]
+    assert operation_id is not None
+    assert first["resolved"][0]["queue_id"] == second["resolved"][0]["id"] == operation_id
+    assert hook_flags == [("%46", "enqueue:brief")]
+    with sqlite3.connect(main.DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, status, payload FROM pane_write_queue WHERE id = ?",
+            (operation_id,),
+        ).fetchall()
+    assert rows == [(operation_id, main.PANE_WRITE_SENT, "row path")]
 
 
 @pytest.mark.asyncio

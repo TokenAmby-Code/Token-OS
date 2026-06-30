@@ -629,13 +629,17 @@ class RecoveryClearsDraftAdapter(SendAckAdapter):
 
     def capture_pane(self, pane_id: str, *, lines: int = 10) -> str:
         type(self).capture_calls += 1
-        return "do the thing\n" if type(self).capture_calls == 1 else ""
+        return (
+            "do the thing\n" if type(self).capture_calls == 1 else "submitted prompt left composer"
+        )
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
         return "inst-recovered" if option == "@INSTANCE_ID" else ""
 
 
-def test_send_text_credits_recovery_path_submit_when_draft_clears(monkeypatch) -> None:
+def test_send_text_credits_recovery_path_submit_when_draft_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A swallowed Enter recovered by C-m is a submitted send, not unverified."""
     RecoveryClearsDraftAdapter.calls = []
     RecoveryClearsDraftAdapter.capture_calls = 0

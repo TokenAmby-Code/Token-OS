@@ -195,13 +195,16 @@ class SendOperationIdempotency:
                     result = dict(entry.get("result") or {})
                     result["idempotent_replay"] = True
                     return result
-                if time.monotonic() - float(entry.get("started_at") or 0) > 60.0:
-                    # Do not let a crashed producer poison this explicit
-                    # operation id forever. This is still per-id only; no broad
-                    # payload dedup is performed.
-                    self._entries.pop(operation_id, None)
-                    continue
                 self._cond.wait(timeout=5.0)
+
+    def abort(self, operation_id: str) -> None:
+        if not operation_id:
+            return
+        with self._cond:
+            entry = self._entries.get(operation_id)
+            if entry and entry.get("state") == "inflight":
+                self._entries.pop(operation_id, None)
+            self._cond.notify_all()
 
     def finish(self, operation_id: str, *, pane: str, payload_hash: str, result: dict) -> None:
         if not operation_id:
@@ -215,13 +218,14 @@ class SendOperationIdempotency:
                 "finished_at": time.monotonic(),
             }
             while len(self._entries) > self._max_entries:
+                done_keys = [
+                    key for key, entry in self._entries.items() if entry.get("state") == "done"
+                ]
+                if not done_keys:
+                    break
                 oldest = min(
-                    self._entries,
-                    key=lambda key: float(
-                        self._entries[key].get("finished_at")
-                        or self._entries[key].get("started_at")
-                        or 0
-                    ),
+                    done_keys,
+                    key=lambda key: float(self._entries[key].get("finished_at") or 0),
                 )
                 self._entries.pop(oldest, None)
             self._cond.notify_all()
@@ -533,6 +537,49 @@ def _h_instance_show_option(control, params):
 # -- Send + act (POST) ------------------------------------------------------
 
 
+def _resolve_physical_pane_or_gate(control, pane: str) -> str:
+    """Resolve ``pane`` to the physical tmux ``%NN`` or fail closed."""
+    try:
+        return control.adapter._resolve_pane_target_arg(pane)
+    except AttributeError:
+        # Adapter has no resolver (fail-open shim / test double); the caller id is
+        # used as-is. A real daemon's TmuxAdapter always provides the resolver, and
+        # a raw %NN is already physical, so this branch never masks a canonical id.
+        return pane
+    except Exception as exc:
+        # Resolution genuinely failed: we cannot key the lock read on the physical
+        # %NN, and falling back to the canonical id would silently miss the lock and
+        # pierce. Fail closed (zero bytes, re-queueable) rather than risk clobbering
+        # active typing. Log the raw cause SERVER-SIDE only; the gate payload rides
+        # back to the caller, so it must not leak resolver internals — gate
+        # ``pane_unresolved`` is enough to distinguish the fail-closed case.
+        log.warning("tmuxctld: pane resolution failed for %s; failing closed: %s", pane, exc)
+        raise TmuxSendGated(
+            {
+                "suppressed": True,
+                "reason": "typing_guard",
+                "gate": "pane_unresolved",
+                "policy": "cancel",
+                "target": pane,
+                "deferred": True,
+            }
+        ) from exc
+
+
+def _raise_if_human_locked(phys: str) -> None:
+    if send_gate._pane_human_locked(phys):
+        raise TmuxSendGated(
+            {
+                "suppressed": True,
+                "reason": "typing_guard",
+                "gate": "human_lock",
+                "policy": "cancel",
+                "target": phys,
+                "deferred": True,
+            }
+        )
+
+
 def _refuse_send_into_human_lock(control, pane: str) -> str:
     """Resolve ``pane`` and fail closed on a live HUMAN keystroke/pending lock.
 
@@ -562,42 +609,8 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
     resolution failure fails closed — we will not gamble a pierce on an unresolved
     canonical id.
     """
-    try:
-        phys = control.adapter._resolve_pane_target_arg(pane)
-    except AttributeError:
-        # Adapter has no resolver (fail-open shim / test double); the caller id is
-        # used as-is. A real daemon's TmuxAdapter always provides the resolver, and
-        # a raw %NN is already physical, so this branch never masks a canonical id.
-        phys = pane
-    except Exception as exc:
-        # Resolution genuinely failed: we cannot key the lock read on the physical
-        # %NN, and falling back to the canonical id would silently miss the lock and
-        # pierce. Fail closed (zero bytes, re-queueable) rather than risk clobbering
-        # active typing. Log the raw cause SERVER-SIDE only; the gate payload rides
-        # back to the caller, so it must not leak resolver internals — gate
-        # ``pane_unresolved`` is enough to distinguish the fail-closed case.
-        log.warning("tmuxctld: pane resolution failed for %s; failing closed: %s", pane, exc)
-        raise TmuxSendGated(
-            {
-                "suppressed": True,
-                "reason": "typing_guard",
-                "gate": "pane_unresolved",
-                "policy": "cancel",
-                "target": pane,
-                "deferred": True,
-            }
-        ) from exc
-    if send_gate._pane_human_locked(phys):
-        raise TmuxSendGated(
-            {
-                "suppressed": True,
-                "reason": "typing_guard",
-                "gate": "human_lock",
-                "policy": "cancel",
-                "target": phys,
-                "deferred": True,
-            }
-        )
+    phys = _resolve_physical_pane_or_gate(control, pane)
+    _raise_if_human_locked(phys)
     return phys
 
 
@@ -729,7 +742,7 @@ def _send_text_pipeline(
     # pending lock gates the send NOW (zero bytes), immune to any ambient
     # TMUX_SEND_GATE_ALLOW enforce-action override, and before we acquire our own
     # AGENT hold over a pane the Emperor is typing into.
-    phys_pane = _refuse_send_into_human_lock(control, pane)
+    phys_pane = _resolve_physical_pane_or_gate(control, pane)
 
     # Fail closed before ANY byte-bearing send, including insert-only calls. If a
     # human/pending/other agent guard is already live, do not enter send_gate's
@@ -740,24 +753,34 @@ def _send_text_pipeline(
     normalized_payload = normalize_prompt_payload(text)
     from .occupancy import assert_dispatch_target_available, looks_like_dispatch_launcher_payload
 
-    if looks_like_dispatch_launcher_payload(normalized_payload):
-        assert_dispatch_target_available(control.adapter, phys_pane)
-    pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
-    if pre_gate is not None and pre_gate.get("suppressed"):
-        raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
-
     if not submit:
+        _raise_if_human_locked(phys_pane)
+        if looks_like_dispatch_launcher_payload(normalized_payload):
+            assert_dispatch_target_available(control.adapter, phys_pane)
+        pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
+        if pre_gate is not None and pre_gate.get("suppressed"):
+            raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
         return control.send_text(pane, text, clear_prompt=clear_prompt, submit=False)
 
     # Hash the NORMALIZED payload that is actually injected (newlines collapsed,
     # rstripped) — not the raw text. The UserPromptSubmit ack hashes the prompt
     # the agent received (post-normalization; cf. agent-cmd's payload_hash), so
     # hashing raw multiline text here would never match and force a false
-    # `unverified` + needless recovery.
+    # `unverified` + needless recovery. Check explicit operation-id replay before
+    # mutable gates so a safe retry reports the prior result instead of being
+    # reclassified by current human-lock state.
     payload_hash = prompt_payload_hash(normalized_payload)
     idempotent = _SEND_IDEMPOTENCY.begin(operation_id, pane=phys_pane, payload_hash=payload_hash)
     if idempotent is not None:
         return idempotent
+
+    _raise_if_human_locked(phys_pane)
+    if looks_like_dispatch_launcher_payload(normalized_payload):
+        assert_dispatch_target_available(control.adapter, phys_pane)
+    pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
+    if pre_gate is not None and pre_gate.get("suppressed"):
+        _SEND_IDEMPOTENCY.abort(operation_id)
+        raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
     dispatch_id = str(uuid.uuid4())
     instance_id = ""
     try:
@@ -831,6 +854,7 @@ def _send_text_pipeline(
     recovery_attempts = 0
     failures: list[dict] = []
     recovery_submit_credited = False
+    send_exception: BaseException | None = None
     try:
         with override_ctx:
             if hasattr(control.adapter, "send_text_then_submit"):
@@ -927,7 +951,9 @@ def _send_text_pipeline(
                                 exc,
                             )
                             post_recovery_capture = capture
-                        if not _detect_swallowed_submit(post_recovery_capture, text):
+                        if post_recovery_capture.strip() and not _detect_swallowed_submit(
+                            post_recovery_capture, text
+                        ):
                             ack = {
                                 "event": "UserPromptSubmit",
                                 "instance_id": instance_id,
@@ -938,6 +964,9 @@ def _send_text_pipeline(
                             }
                             recovery_submit_credited = True
                             break
+    except BaseException as exc:
+        send_exception = exc
+        raise
     finally:
         # The guard must never leak green past the handshake. Release only what
         # we acquired (release clears @TYPING_AGENT_UNTIL only and re-projects a
@@ -951,6 +980,8 @@ def _send_text_pipeline(
                 )
             except Exception as exc:
                 log.warning("tmuxctld: agent-guard release failed pane=%s: %s", phys_pane, exc)
+        if send_exception is not None:
+            _SEND_IDEMPOTENCY.abort(operation_id)
 
     verification_status = "submitted" if ack else ("unverified" if verify else "not_requested")
     # When verification was never requested, a completed send is "submitted", not

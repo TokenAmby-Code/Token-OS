@@ -5808,11 +5808,6 @@ async def enqueue_pane_write(
 ) -> dict:
     if not (tmux_pane or "").strip():
         raise ValueError("pane write requires a concrete tmux pane target")
-    # Caller-classified autonomous wake: flag the target BEFORE the write lands so
-    # its PromptSubmit observes hook_driven=1 (read-time discount). See classification
-    # table — Emperor-proxied (Custodes-out) / direct-Emperor sends pass hook_driven=False.
-    if hook_driven:
-        await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=f"enqueue:{source}")
     queue_id = operation_id or str(uuid.uuid4())
     now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -5841,6 +5836,12 @@ async def enqueue_pane_write(
             ):
                 raise ValueError("pane write operation_id reused for different target/payload")
             return existing
+    # Caller-classified autonomous wake: flag the target for newly accepted rows only.
+    # Explicit operation-id replays return the existing row above and must not replay
+    # hook-driven side effects. See classification table — Emperor-proxied
+    # (Custodes-out) / direct-Emperor sends pass hook_driven=False.
+    if hook_driven:
+        await _flag_hook_driven(instance_id, tmux_pane=tmux_pane, actor=f"enqueue:{source}")
     return {
         "id": queue_id,
         "instance_id": instance_id,
