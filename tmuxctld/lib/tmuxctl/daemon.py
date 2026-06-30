@@ -72,7 +72,11 @@ DEFAULT_PORT = 7778
 # hook is therefore daemon-critical: if tmux.conf was not sourced (or hooks were
 # cleared during a live reload), must-fill persona panes can remain forever at
 # "Pane is dead" now that the old correctness poll is retired.
-_PANE_DIED_HOOK = 'run-shell "tmux-run tmux-pane-respawn #{pane_id}"'
+_PANE_DIED_HOOK = (
+    'run-shell -b "tmuxctld-ping POST /event event=pane-died pane=#{pane_id} '
+    '>/dev/null || env IMPERIUM_TMUX_RAW=1 tmux display-message '
+    'tmuxctld-ping-/event-failed"'
+)
 
 # The global pane-died hook can vanish under the daemon: a live ``tmux source-file``
 # or a hook-clear during a workspace reload drops it, and then a dying must-fill
@@ -141,6 +145,28 @@ def ensure_tmux_lifecycle_hooks() -> dict:
     if not ok:
         log.warning("tmux lifecycle hook install incomplete: %s", results)
     return {"ok": ok, "results": results}
+
+
+class TmuxctldNotImplementedAnchor(RuntimeError):
+    """Loud daemon-native placeholder for a route that is named but not built.
+
+    A 501 anchor is the forward twin of a 410 CLI tombstone: deliberate, stable,
+    and never a surface for feature logic. The route exists so callers can bind
+    to the daemon URL first; until the real handler replaces the anchor it fails
+    loudly with HTTP 501.
+    """
+
+    def __init__(self, method: str, path: str, *, detail: str = "") -> None:
+        self.method = method.upper()
+        self.path = path
+        self.detail = detail
+        super().__init__(f"{self.method} {self.path} is not implemented")
+
+
+def not_implemented_anchor(method: str, path: str, *, detail: str = "") -> object:
+    """Raise a loud 501 anchor for an intentionally unimplemented daemon route."""
+
+    raise TmuxctldNotImplementedAnchor(method, path, detail=detail)
 
 
 class PromptSubmitSniffer:
@@ -2135,6 +2161,18 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             control = TmuxControlPlane(self.server.adapter_factory())
             result = handler(control, params)
             self._write(200, {"ok": True, "result": result})
+        except TmuxctldNotImplementedAnchor as exc:
+            # Forward tombstone: the daemon route is intentionally named but not
+            # built. This must be an actual HTTP 501 so transport shims fail
+            # loudly and tmux hooks can surface the crater via display-message.
+            self._write(
+                501,
+                self._error(
+                    "not_implemented",
+                    str(exc),
+                    detail={"method": exc.method, "path": exc.path, "detail": exc.detail},
+                ),
+            )
         except TmuxSendGated as exc:
             # Zero bytes were written; the structured gate result rides in detail
             # so the caller can re-queue cleanly.

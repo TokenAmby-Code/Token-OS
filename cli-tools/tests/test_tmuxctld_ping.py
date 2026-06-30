@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PING = ROOT / "bin" / "tmuxctld-ping"
+
+
+class RecordingHandler(BaseHTTPRequestHandler):
+    calls: list[dict] = []
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length).decode("utf-8")
+        self.__class__.calls.append(
+            {
+                "method": "POST",
+                "path": self.path,
+                "body": json.loads(body),
+                "content_type": self.headers.get("Content-Type"),
+            }
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "11")
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+    def log_message(self, *_args):
+        return
+
+
+def _serve():
+    RecordingHandler.calls = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RecordingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def test_tmuxctld_ping_posts_key_value_payload_to_configured_daemon_url() -> None:
+    server = _serve()
+    try:
+        env = os.environ.copy()
+        env["TMUXCTLD_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+        proc = subprocess.run(
+            [str(PING), "POST", "/event", "event=pane-died", "pane=%42"],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == ""
+        assert RecordingHandler.calls == [
+            {
+                "method": "POST",
+                "path": "/event",
+                "body": {"event": "pane-died", "pane": "%42"},
+                "content_type": "application/json",
+            }
+        ]
+    finally:
+        server.shutdown()
+
+
+def test_tmuxctld_ping_is_executable_and_contains_no_feature_routing() -> None:
+    assert os.access(PING, os.X_OK)
+    body = PING.read_text(encoding="utf-8")
+    assert "tmux-pane-respawn" not in body
+    assert "pane-died" not in body
+    assert "@PANE_ID" not in body
+    assert "@PANE_TYPE" not in body
+
+
+def test_tmuxctld_ping_exits_nonzero_on_transport_failure() -> None:
+    env = os.environ.copy()
+    env["TMUXCTLD_URL"] = "http://127.0.0.1:1"
+    env["TMUXCTLD_CONNECT_TIMEOUT"] = "0.2"
+    env["TMUXCTLD_MAX_TIME"] = "0.5"
+    proc = subprocess.run(
+        [str(PING), "POST", "/event", "event=x"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=10,
+    )
+    assert proc.returncode != 0
+    assert proc.stdout == ""
+    assert "tmuxctld-ping: POST /event failed" in proc.stderr

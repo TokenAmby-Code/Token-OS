@@ -8,6 +8,7 @@
 #   TOKEN_OS         — Token-OS runtime checkout (machine-local when available)
 #   CLI_TOOLS        — CLI tools directory ($TOKEN_OS/cli-tools)
 #   TOKEN_API_URL    — Token-API base URL (localhost on mac, tailscale elsewhere)
+#   TMUXCTLD_URL     — tmuxctld loopback base URL (Mac-local daemon)
 #
 # Functions:
 #   imperium_cfg <key>  — Look up machine-specific config value
@@ -56,6 +57,7 @@ fi
 #   nas_civic     — NAS mount path for Civic share
 #   tailscale_ip  — This machine's Tailscale IP
 #   token_api_url — How this machine reaches Token-API
+#   tmuxctld_url  — How tmux hooks reach the loopback tmuxctld daemon
 #   ssh_alias     — SSH config host alias for this machine
 #   device_name   — Canonical device name (matches Token-API DEVICE_IPS)
 #   shell         — Default interactive shell (zsh/bash)
@@ -66,6 +68,7 @@ _IMPERIUM_CFG_mac_nas_imperium="/Volumes/Imperium"
 _IMPERIUM_CFG_mac_nas_civic="/Volumes/Civic"
 _IMPERIUM_CFG_mac_tailscale_ip="100.95.109.23"
 _IMPERIUM_CFG_mac_token_api_url="http://localhost:7777"
+_IMPERIUM_CFG_mac_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_mac_ssh_alias="mini"
 _IMPERIUM_CFG_mac_device_name="Mac-Mini"
 _IMPERIUM_CFG_mac_shell="zsh"
@@ -76,6 +79,7 @@ _IMPERIUM_CFG_wsl_nas_imperium="/mnt/imperium"
 _IMPERIUM_CFG_wsl_nas_civic="/mnt/civic"
 _IMPERIUM_CFG_wsl_tailscale_ip="100.66.10.74"
 _IMPERIUM_CFG_wsl_token_api_url="http://100.95.109.23:7777"
+_IMPERIUM_CFG_wsl_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_wsl_ssh_alias="wsl"
 _IMPERIUM_CFG_wsl_device_name="TokenPC"
 _IMPERIUM_CFG_wsl_shell="bash"
@@ -86,6 +90,7 @@ _IMPERIUM_CFG_phone_nas_imperium=""
 _IMPERIUM_CFG_phone_nas_civic=""
 _IMPERIUM_CFG_phone_tailscale_ip="100.102.92.24"
 _IMPERIUM_CFG_phone_token_api_url="http://100.95.109.23:7777"
+_IMPERIUM_CFG_phone_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_phone_ssh_alias="phone"
 _IMPERIUM_CFG_phone_device_name="Token-S24"
 _IMPERIUM_CFG_phone_shell="bash"
@@ -96,6 +101,7 @@ _IMPERIUM_CFG_linux_nas_imperium="/mnt/imperium"
 _IMPERIUM_CFG_linux_nas_civic="/mnt/civic"
 _IMPERIUM_CFG_linux_tailscale_ip=""
 _IMPERIUM_CFG_linux_token_api_url="http://100.95.109.23:7777"
+_IMPERIUM_CFG_linux_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_linux_ssh_alias=""
 _IMPERIUM_CFG_linux_device_name=""
 _IMPERIUM_CFG_linux_shell="bash"
@@ -150,3 +156,4 @@ fi
 unset _token_os_runtime
 export CLI_TOOLS="$TOKEN_OS/cli-tools"
 export TOKEN_API_URL="${TOKEN_API_URL:-$(imperium_cfg token_api_url)}"
+export TMUXCTLD_URL="${TMUXCTLD_URL:-$(imperium_cfg tmuxctld_url)}"

@@ -1518,7 +1518,31 @@ def test_startup_installs_tmux_lifecycle_hooks(monkeypatch: pytest.MonkeyPatch) 
             },
         ),
     ]
-    assert "tmux-pane-respawn #{pane_id}" in daemon._PANE_DIED_HOOK
+    assert "tmuxctld-ping POST /event" in daemon._PANE_DIED_HOOK
+    assert "pane=#{pane_id}" in daemon._PANE_DIED_HOOK
+    assert "display-message" in daemon._PANE_DIED_HOOK
+    assert "tmux-pane-respawn" not in daemon._PANE_DIED_HOOK
+
+
+def test_not_implemented_anchor_returns_loud_http_501(monkeypatch: pytest.MonkeyPatch) -> None:
+    def anchor(_control, _params):
+        return daemon.not_implemented_anchor(
+            "POST", "/future-anchor", detail="daemon-native replacement not built yet"
+        )
+
+    monkeypatch.setitem(daemon.ROUTES, ("POST", "/future-anchor"), anchor)
+    server, _ = _serve(StubAdapter)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(server, "/future-anchor", {})
+        assert excinfo.value.code == 501
+        payload = json.loads(excinfo.value.read().decode("utf-8"))
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "not_implemented"
+        assert payload["error"]["detail"]["method"] == "POST"
+        assert payload["error"]["detail"]["path"] == "/future-anchor"
+    finally:
+        server.shutdown()
 
 
 def test_startup_lifecycle_hook_install_is_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
