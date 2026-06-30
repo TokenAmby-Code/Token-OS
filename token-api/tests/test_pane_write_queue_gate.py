@@ -245,8 +245,8 @@ async def test_queue_routes_temp_message_as_ethereal_to_tmuxctld(
             "stdout": "",
             "stderr": "",
             "gated": False,
-            "verification_status": "unverified",
-            "verified_by": None,
+            "verification_status": "submitted",
+            "verified_by": "UserPromptSubmit",
         }
 
     monkeypatch.setattr(main, "send_ethereal_to_pane", _ok)
@@ -290,7 +290,7 @@ async def test_gated_send_keeps_item_pending(app_env: Any, monkeypatch: Any) -> 
     main = app_env.main
     monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
 
-    async def _gated(pane, payload, *, clear_prompt=False):
+    async def _gated(pane, payload, *, clear_prompt=False, **_kwargs):
         return {
             "returncode": 1,
             "stdout": "",
@@ -324,7 +324,7 @@ async def test_gated_then_cleared_gate_flushes_to_sent(app_env: Any, monkeypatch
     main = app_env.main
     monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending_input)
 
-    async def _gated(pane, payload, *, clear_prompt=False):
+    async def _gated(pane, payload, *, clear_prompt=False, **_kwargs):
         return {
             "returncode": 1,
             "stdout": "",
@@ -349,7 +349,7 @@ async def test_gated_then_cleared_gate_flushes_to_sent(app_env: Any, monkeypatch
     assert _fetch_status(app_env.db_path, queued["id"]) == "pending"
 
     # Guard clears: the same still-pending item now delivers on the next drain.
-    async def _ok(pane, payload, *, clear_prompt=False):
+    async def _ok(pane, payload, *, clear_prompt=False, **_kwargs):
         return {
             "returncode": 0,
             "stdout": "",
@@ -390,7 +390,7 @@ async def test_brief_clears_stale_composer_instead_of_deferring(
 
     seen: dict[str, Any] = {}
 
-    async def _ok(pane, payload, *, clear_prompt=False):
+    async def _ok(pane, payload, *, clear_prompt=False, **_kwargs):
         seen["clear_prompt"] = clear_prompt
         return {
             "returncode": 0,
@@ -489,7 +489,7 @@ async def test_dequeue_sends_to_live_resolved_pane_not_stored_column(
 
     seen: dict[str, Any] = {}
 
-    async def _ok(pane, payload, *, clear_prompt=False):
+    async def _ok(pane, payload, *, clear_prompt=False, **_kwargs):
         seen["pane"] = pane
         return {
             "returncode": 0,
@@ -532,7 +532,7 @@ async def test_dequeue_fails_closed_when_pane_unresolved(app_env: Any, monkeypat
 
     sent: list[Any] = []
 
-    async def _send(pane, payload, *, clear_prompt=False):
+    async def _send(pane, payload, *, clear_prompt=False, **_kwargs):
         sent.append(pane)
         return {
             "returncode": 0,
@@ -584,7 +584,7 @@ async def test_brief_raw_pane_falls_back_to_live_at_pane_id(app_env: Any, monkey
 
     sent: list[Any] = []
 
-    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False):
+    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False, **_kwargs):
         sent.append(pane)
         return {
             "returncode": 0,
@@ -628,7 +628,7 @@ async def test_naming_nudge_clears_stale_composer_instead_of_deferring(
 
     seen: dict[str, Any] = {}
 
-    async def _ok(pane, payload, *, clear_prompt=False):
+    async def _ok(pane, payload, *, clear_prompt=False, **_kwargs):
         seen["clear_prompt"] = clear_prompt
         return {
             "returncode": 0,

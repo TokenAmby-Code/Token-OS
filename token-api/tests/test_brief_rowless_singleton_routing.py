@@ -32,7 +32,7 @@ async def test_brief_rowless_live_codex_singleton_uses_tmuxctl_fallback(
 
     sent = []
 
-    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False):
+    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False, **_kwargs):
         sent.append((pane, payload, clear_prompt))
         return {
             "returncode": 0,
@@ -163,9 +163,55 @@ async def test_brief_registry_row_path_still_uses_queue(
             "purpose": "brief_send",
             "payload": "row path",
             "hook_driven": True,
+            "operation_id": None,
         }
     ]
     assert "fallback" not in result["resolved"][0]
+
+
+@pytest.mark.asyncio
+async def test_brief_explicit_idempotency_key_reuses_queue_id(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Brief retries with the same explicit key are per-id, not blind re-sends."""
+    main = app_env.main
+    target = {
+        "pane_id": "%46",
+        "position_id": "council:custodes",
+        "source": "pane",
+        "spec": "council:custodes",
+    }
+
+    async def _targets(**_kwargs):
+        return [target], []
+
+    async def _row(_pane):
+        return {"id": "custodes-row", "engine": "claude"}
+
+    queued_ids: list[str | None] = []
+
+    async def _enqueue(**kwargs):
+        queued_ids.append(kwargs.get("operation_id"))
+        return {"id": kwargs.get("operation_id"), "status": main.PANE_WRITE_PENDING}
+
+    async def _drain(queue_id):
+        return [{"queue_id": queue_id, "status": main.PANE_WRITE_SENT, "tmux_pane": "%46"}]
+
+    monkeypatch.setattr(main.talk_service, "resolve_brief_targets", _targets)
+    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _row)
+    monkeypatch.setattr(main, "enqueue_pane_write", _enqueue)
+    monkeypatch.setattr(main, "process_pane_write_queue_once", _drain)
+
+    req = main.BriefSendRequest(
+        panes=["council:custodes"], payload="row path", idempotency_key="same-op"
+    )
+    first = await main.brief_send(req)
+    second = await main.brief_send(req)
+
+    assert first["delivered"] == second["delivered"] == 1
+    assert len(queued_ids) == 2
+    assert queued_ids[0] == queued_ids[1]
+    assert queued_ids[0] is not None
 
 
 @pytest.mark.asyncio
@@ -195,7 +241,7 @@ async def test_talk_rowless_live_codex_singleton_requires_verified_submit(
 
     sent = []
 
-    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False):
+    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False, **_kwargs):
         sent.append((pane, payload, clear_prompt))
         return {
             "returncode": 0,

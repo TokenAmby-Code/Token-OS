@@ -163,6 +163,73 @@ class PromptSubmitSniffer:
 _PROMPT_SUBMIT_SNIFFER = PromptSubmitSniffer()
 
 
+class SendOperationIdempotency:
+    """Per-operation send cache; never dedups without an explicit operation id."""
+
+    def __init__(self, *, max_entries: int = 2048) -> None:
+        self._cond = threading.Condition()
+        self._max_entries = max_entries
+        self._entries: dict[str, dict] = {}
+
+    @staticmethod
+    def _matches(entry: dict, *, pane: str, payload_hash: str) -> bool:
+        return entry.get("pane") == pane and entry.get("payload_hash") == payload_hash
+
+    def begin(self, operation_id: str, *, pane: str, payload_hash: str) -> dict | None:
+        if not operation_id:
+            return None
+        with self._cond:
+            while True:
+                entry = self._entries.get(operation_id)
+                if entry is None:
+                    self._entries[operation_id] = {
+                        "state": "inflight",
+                        "pane": pane,
+                        "payload_hash": payload_hash,
+                        "started_at": time.monotonic(),
+                    }
+                    return None
+                if not self._matches(entry, pane=pane, payload_hash=payload_hash):
+                    raise ValueError("operation_id reused for different pane/payload")
+                if entry.get("state") == "done":
+                    result = dict(entry.get("result") or {})
+                    result["idempotent_replay"] = True
+                    return result
+                if time.monotonic() - float(entry.get("started_at") or 0) > 60.0:
+                    # Do not let a crashed producer poison this explicit
+                    # operation id forever. This is still per-id only; no broad
+                    # payload dedup is performed.
+                    self._entries.pop(operation_id, None)
+                    continue
+                self._cond.wait(timeout=5.0)
+
+    def finish(self, operation_id: str, *, pane: str, payload_hash: str, result: dict) -> None:
+        if not operation_id:
+            return
+        with self._cond:
+            self._entries[operation_id] = {
+                "state": "done",
+                "pane": pane,
+                "payload_hash": payload_hash,
+                "result": dict(result),
+                "finished_at": time.monotonic(),
+            }
+            while len(self._entries) > self._max_entries:
+                oldest = min(
+                    self._entries,
+                    key=lambda key: float(
+                        self._entries[key].get("finished_at")
+                        or self._entries[key].get("started_at")
+                        or 0
+                    ),
+                )
+                self._entries.pop(oldest, None)
+            self._cond.notify_all()
+
+
+_SEND_IDEMPOTENCY = SendOperationIdempotency()
+
+
 def _safe_public_role(role: str | None) -> str:
     """Redact a pane role to a canonical ``{page}:{id}`` or ``unresolved``.
 
@@ -648,6 +715,7 @@ def _send_text_pipeline(
     verify_timeout: float = 5.0,
     submit_settle_seconds: float = 1.0,
     ack_submit_retries: int = 2,
+    operation_id: str = "",
     pre_submit_keys: tuple[str, ...] = (),
     post_submit_actions: tuple[dict, ...] = (),
 ) -> dict:
@@ -687,6 +755,9 @@ def _send_text_pipeline(
     # hashing raw multiline text here would never match and force a false
     # `unverified` + needless recovery.
     payload_hash = prompt_payload_hash(normalized_payload)
+    idempotent = _SEND_IDEMPOTENCY.begin(operation_id, pane=phys_pane, payload_hash=payload_hash)
+    if idempotent is not None:
+        return idempotent
     dispatch_id = str(uuid.uuid4())
     instance_id = ""
     try:
@@ -759,6 +830,7 @@ def _send_text_pipeline(
     swallowed_submit_detected = False
     recovery_attempts = 0
     failures: list[dict] = []
+    recovery_submit_credited = False
     try:
         with override_ctx:
             if hasattr(control.adapter, "send_text_then_submit"):
@@ -843,6 +915,29 @@ def _send_text_pipeline(
                     recovery_attempts += 1
                     if submit_settle_seconds > 0:
                         time.sleep(submit_settle_seconds)
+                    if swallowed_submit_detected:
+                        try:
+                            post_recovery_capture = control.adapter.capture_pane(
+                                phys_pane, lines=12
+                            )
+                        except Exception as exc:
+                            log.debug(
+                                "tmuxctld: post-recovery capture-pane failed pane=%s: %s",
+                                phys_pane,
+                                exc,
+                            )
+                            post_recovery_capture = capture
+                        if not _detect_swallowed_submit(post_recovery_capture, text):
+                            ack = {
+                                "event": "UserPromptSubmit",
+                                "instance_id": instance_id,
+                                "pane": phys_pane,
+                                "prompt_hash": payload_hash,
+                                "at": time.monotonic(),
+                                "recovered": True,
+                            }
+                            recovery_submit_credited = True
+                            break
     finally:
         # The guard must never leak green past the handshake. Release only what
         # we acquired (release clears @TYPING_AGENT_UNTIL only and re-projects a
@@ -861,20 +956,25 @@ def _send_text_pipeline(
     # When verification was never requested, a completed send is "submitted", not
     # "unverified" — only a requested-but-unacked send is genuinely unverified.
     status = "submitted" if ack or not verify else "unverified"
-    return {
+    result = {
         "status": status,
         "pane": pane,
         "instance_id": instance_id,
         "dispatch_id": dispatch_id,
+        "operation_id": operation_id or None,
         "payload_hash": payload_hash,
         "verification_status": verification_status,
         "verified_by": "UserPromptSubmit" if ack else None,
         "ack": ack,
+        "recovery_submit_credited": recovery_submit_credited,
+        "idempotent_replay": False,
         "guard_held": held,
         "swallowed_submit_detected": swallowed_submit_detected,
         "recovery_attempts": recovery_attempts,
         "failures": failures,
     }
+    _SEND_IDEMPOTENCY.finish(operation_id, pane=phys_pane, payload_hash=payload_hash, result=result)
+    return result
 
 
 def _h_send_text(control, params):
@@ -888,6 +988,7 @@ def _h_send_text(control, params):
         verify_timeout=_f(params, "verify_timeout", 5.0),
         submit_settle_seconds=_f(params, "submit_settle_seconds", 1.0),
         ack_submit_retries=_i(params, "ack_submit_retries", 2),
+        operation_id=_s(params, "operation_id"),
         pre_submit_keys=_parse_pre_submit_keys(params.get("pre_submit_keys", ())),
     )
 
