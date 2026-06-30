@@ -696,6 +696,7 @@ async def _apply_commander_binding(
         actor="SessionStart",
     )
 
+
 RAW_TMUX_PANE_ID_RE = re.compile(r"^%\d+$")
 
 
