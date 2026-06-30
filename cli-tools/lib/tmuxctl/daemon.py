@@ -1343,11 +1343,15 @@ def _h_hook_wrapperend(control, params):
             "pane": pane,
         }
 
+    pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
     result = control.clear_runtime(pane)
+    reap = control.reap_dead_husk(pane, pane_role=pane_label)
     return {
         "status": "cleared",
         "wrapper_launch_id": wrapper_launch_id,
         "pane": result.get("pane", pane) if isinstance(result, dict) else pane,
+        "pane_label": pane_label,
+        "reap": reap,
     }
 
 
@@ -1390,6 +1394,11 @@ def _h_hook_wrapperstart(control, params):
             "pane": "",
             "tint": "",
         }
+
+    # Reuse path: the next wrapper must never inherit statusline/persona/guard
+    # stamps from the prior occupant.  This is the same daemon-owned runtime
+    # cleanup pathway WrapperEnd uses; wrapperstart then stamps the new owner.
+    control.clear_runtime(pane)
 
     # (1) Daemon-authoritative wrapper-ownership stamp (idempotent).
     control.adapter.run(

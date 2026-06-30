@@ -16,17 +16,27 @@ tmux_runtime_cleanup_pane() {
     local opt
     for opt in \
         @INSTANCE_ID \
+        @PERSONA \
+        @SESSION_DOC \
+        @CWD \
         @CC_STATE \
         @PANE_LABEL \
+        @PANE_CLEAN \
+        @PANE_BORN \
         @ACTIVE_TITLE \
         @PROGRESS_TITLE \
         @PANE_PROGRESS \
         @TTS_STATE \
+        @OPS_SELECTED \
         @CONTEXT_INFO \
         @STACK_PENDING \
         @GT_FIRE \
         @PLANNING_STATE \
         @PLANNING_AGENT \
+        @TYPING_LOCK_UNTIL \
+        @TYPING_PENDING_UNTIL \
+        @TYPING_AGENT_UNTIL \
+        @GUARD \
         @DISCORD_VOICE_LOCK \
         @DISCORD_VOICE_PROCESSING \
         @TOKEN_API_WRAPPER_LAUNCH_ID \

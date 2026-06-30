@@ -163,6 +163,26 @@ def clear_runtime(adapter: TmuxAdapter, pane: str) -> dict[str, Any]:
     return {"status": "cleared", "pane": pane}
 
 
+def pane_dead(adapter: TmuxAdapter, pane: str) -> bool:
+    value = adapter.run(
+        "display-message", "-t", pane, "-p", "#{pane_dead}", allow_failure=True
+    ).strip()
+    return value in {"1", "true", "yes"}
+
+
+def reap_dead_husk(adapter: TmuxAdapter, pane: str, *, pane_role: str = "") -> dict[str, Any]:
+    """Kill a dead remain-on-exit husk after runtime scrub.
+
+    WrapperEnd is already terminal for the departed wrapper.  If tmux reports
+    the pane as dead, leaving it behind creates the empty husk graveyard.  Live
+    panes are left alone; SessionStop/SessionEnd never call this surface.
+    """
+    if not pane_dead(adapter, pane):
+        return {"status": "skipped", "reason": "pane_live", "pane": pane}
+    adapter.run("kill-pane", "-t", pane, allow_failure=True)
+    return {"status": "killed", "pane": pane, "pane_role": pane_role}
+
+
 def _close_pane_unshielded(
     adapter: TmuxAdapter, pane: str, *, timeout: float = 3.0
 ) -> dict[str, Any]:
