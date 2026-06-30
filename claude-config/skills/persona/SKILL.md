@@ -39,6 +39,33 @@ curl -s "$TOKEN_API_URL/api/instances" \
   | jq '.[] | {id, persona: .persona.slug, rank, status, pane_label, commander_instance_id, session_doc_id}'
 ```
 
+## Civic Mirror & Drift
+
+The civic singleton seats are **manual redubs** of their personal-side counterparts, hosted in
+`Pax-ENV/Personas/`:
+
+- **Pax** ⇄ **Custodes** (`Personas/Custodes.md`)
+- **Orchestrator** ⇄ **Fabricator-General** (`Personas/Fabricator-General.md`)
+
+They are produced by hand with civic naming swaps (`custodes`→`pax`, `fabricator-general`→
+`orchestrator`, `mechanicus`→`civic`, Imperium framing→un-themed civic, daily note→civic record).
+They are **not** auto-generated and they **deliberately diverge** where civic behavior differs —
+e.g. **Pax has no enforcement seat** and is silent/day-job-scoped.
+
+**Drift rule:** whenever you edit a personal-side persona doc (Custodes / Fabricator-General),
+**consider a fast-follow patch to its civic mirror** (Pax / Orchestrator) so they do not drift.
+Treat the mirror update as part of the same change unless the edit is purely personal-side behavior.
+
+**Future option (not built):** have the runtime doc-staple process — which already staples persona +
+rank files together — also hot-read the personal-side file and apply the key-term swaps at
+compile/staple time, so the civic seats can't drift. This is **deferred**: a naive text-swap is
+unsafe because of the deliberate behavioral deltas above (it would re-introduce enforcement into
+Pax). Any such system must subtract the civic-specific deltas, not just rename tokens.
+
+**Engine note:** `PersonaSeed` carries no engine field; engine is chosen at launch/dispatch
+(`dispatch` defaults to `--engine claude`). Per-seat engine defaults (e.g. FG + Orchestrator on
+Codex) are set on the seat's launch/respawn lever, not in the persona doc or seed.
+
 ## Do Not
 
 - Do not invoke `/persona <name>` as a local self-registration escape hatch.
