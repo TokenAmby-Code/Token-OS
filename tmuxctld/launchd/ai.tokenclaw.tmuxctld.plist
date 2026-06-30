@@ -3,11 +3,11 @@
   ai.tokenclaw.tmuxctld — LaunchAgent for the tmuxctld HTTP-loopback daemon.
 
   Install / refresh:
-    cli-tools/bin/tmuxctld-ctl install
+    tmuxctld/bin/tmuxctld-ctl install
   (copies this plist to ~/Library/LaunchAgents/ then bootout + bootstrap)
 
   Or manually:
-    cp cli-tools/launchd/ai.tokenclaw.tmuxctld.plist ~/Library/LaunchAgents/
+    cp tmuxctld/launchd/ai.tokenclaw.tmuxctld.plist ~/Library/LaunchAgents/
     launchctl bootout  gui/$(id -u)/ai.tokenclaw.tmuxctld 2>/dev/null
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.tokenclaw.tmuxctld.plist
 
@@ -22,7 +22,7 @@
 	<string>ai.tokenclaw.tmuxctld</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/tokenclaw/runtimes/Token-OS/live/cli-tools/bin/tmuxctld</string>
+		<string>/Users/tokenclaw/runtimes/Token-OS/live/tmuxctld/bin/tmuxctld</string>
 		<string>--host</string>
 		<string>127.0.0.1</string>
 		<string>--port</string>
@@ -52,7 +52,7 @@
 		<integer>4096</integer>
 	</dict>
 	<key>WorkingDirectory</key>
-	<string>/Users/tokenclaw/runtimes/Token-OS/live/cli-tools</string>
+	<string>/Users/tokenclaw/runtimes/Token-OS/live/tmuxctld</string>
 	<key>StandardOutPath</key>
 	<string>/Users/tokenclaw/.claude/tmuxctld-stdout.log</string>
 	<key>StandardErrorPath</key>

@@ -29,14 +29,16 @@ def tmux_msg(text: str) -> None:
 
 
 def resolve_pane(target: str) -> str:
-    lib_dir = Path(__file__).resolve().parents[1] / "lib"
+    root = Path(__file__).resolve().parents[2]
+    lib_dir = root / "tmuxctld" / "lib"
+    cli_lib_dir = root / "cli-tools" / "lib"
     proc = subprocess.run(
         [
             "python3",
             "-c",
             (
                 "import os,sys;"
-                f"sys.path.insert(0, {str(lib_dir)!r});"
+                f"sys.path.insert(0, {str(cli_lib_dir)!r});sys.path.insert(0, {str(lib_dir)!r});"
                 "from tmuxctl.service import TmuxControlPlane;"
                 f"print(TmuxControlPlane().resolve_pane_resolution({target!r}).pane_id)"
             ),

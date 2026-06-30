@@ -11,6 +11,9 @@ set -euo pipefail
 
 _THIS="$(readlink -f "$0")"
 _BIN_DIR="$(dirname "$_THIS")"
+_REPO_ROOT="${TOKEN_OS:-$(cd "${_BIN_DIR}/../.." && pwd)}"
+_TMUXCTLD_LIB_DIR="${TMUXCTLD_LIB:-${_REPO_ROOT}/tmuxctld/lib}"
+_CLI_LIB_DIR="${_REPO_ROOT}/cli-tools/lib"
 _TX_BIN="${_BIN_DIR}/tx"
 
 # Hard recursion fuse — belt-and-suspenders, independent of resolution
@@ -160,11 +163,11 @@ send_gate_suppresses() {
         send-keys|send-key|send|paste-buffer) ;;
         *) return 1 ;;  # not a mutating send verb — never gated
     esac
-    local lib_dir rc=0
-    lib_dir="$(cd "${_BIN_DIR}/../lib" 2>/dev/null && pwd)" || return 1
+    local lib_dir="${_TMUXCTLD_LIB_DIR}" rc=0
+    [[ -d "$lib_dir" ]] || return 1
     # TMUX_SEND_GATE_ALLOW (if set) is inherited by the child, which logs the
     # override and returns allow (rc 0); only rc 100 means suppress.
-    PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+    PYTHONPATH="${lib_dir}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m tmuxctl.send_gate check "$@" >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 100 ]]
 }
@@ -191,14 +194,14 @@ inbound_typing_guard_allows() {
 }
 
 sanitize_pane_ids() {
-    local lib_dir
-    lib_dir="$(cd "${_BIN_DIR}/../lib" 2>/dev/null && pwd)" || {
+    local lib_dir="${_TMUXCTLD_LIB_DIR}"
+    if [[ ! -d "$lib_dir" ]]; then
         # Fail closed: if tmuxctl cannot be located, raw pane ids still must not
         # reach a human surface.
         perl -pe 's/%[0-9]+/unresolved/g'
         return 0
-    }
-    PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+    fi
+    PYTHONPATH="${lib_dir}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
         IMPERIUM_TMUX_BIN="$_REAL_TMUX" \
         python3 -m tmuxctl.cli translate-ids 2>/dev/null || \
         perl -pe 's/%[0-9]+/unresolved/g'

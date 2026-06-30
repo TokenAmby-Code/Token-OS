@@ -18,6 +18,9 @@ export IMPERIUM_ALLOW_TMUX_FOCUS="${IMPERIUM_ALLOW_TMUX_FOCUS:-1}"
 export IMPERIUM_ALLOW_MECHANICUS_FOCUS="${IMPERIUM_ALLOW_MECHANICUS_FOCUS:-1}"
 
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+_REPO_ROOT="${TOKEN_OS:-$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)}"
+_TMUXCTLD_LIB_DIR="${TMUXCTLD_LIB:-${_REPO_ROOT}/tmuxctld/lib}"
+_CLI_LIB_DIR="${_REPO_ROOT}/cli-tools/lib"
 # shellcheck source=../lib/nas-path.sh
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 # shellcheck source=../lib/pane-id.sh
@@ -128,7 +131,7 @@ if [[ "$current_type" == "tombstone" ]]; then
     if [[ -n "$CLIENT" ]]; then
         args+=(--client "$CLIENT")
     fi
-    PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m tmuxctl.cli "${args[@]}"
+    PYTHONPATH="${_TMUXCTLD_LIB_DIR}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m tmuxctl.cli "${args[@]}"
 fi
 
 # --- DEMOTE: palace/somnium → mechanicus stack ---
@@ -145,7 +148,7 @@ demote() {
     # allocator-created mechanicus:N slot. Joining the live pane out first collapses
     # the source layout; a later split can only guess where the vacated leaf was.
     local stack_pane stack_tag
-    stack_pane=$(PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+    stack_pane=$(PYTHONPATH="${_TMUXCTLD_LIB_DIR}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m tmuxctl.cli stack add mechanicus \
             --session "$SESSION" \
             --cwd "${wdir:-$HOME}" \

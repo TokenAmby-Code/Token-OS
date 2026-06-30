@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # tmuxctld — entrypoint for the standalone HTTP-loopback tmux control-plane daemon.
 #
-# Near-clone of `tmuxctl`: same interpreter probe + PYTHONPATH=.../lib, but execs
-# the daemon module instead of the CLI. This script is the SINGLE SOURCE OF TRUTH
+# Interpreter probe + PYTHONPATH=../lib for the root tmuxctld home.
+# This script is the SINGLE SOURCE OF TRUTH
 # for the interpreter the launchd plist invokes (the plist ProgramArguments point
 # at this file in the runtime checkout). Stdlib only — no venv.
 set -euo pipefail
-_LIB_DIR="$(cd "$(dirname "$(readlink -f "$0")")/../lib" && pwd)"
+_BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+_REPO_ROOT="${TOKEN_OS:-$(cd "${_BIN_DIR}/../.." && pwd)}"
+_LIB_DIR="${TMUXCTLD_LIB:-${_REPO_ROOT}/tmuxctld/lib}"
+_CLI_LIB_DIR="${_REPO_ROOT}/cli-tools/lib"
 
 tmuxctl_python() {
     local candidate
@@ -20,4 +23,4 @@ tmuxctl_python() {
     return 1
 }
 
-PYTHONPATH="${_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec "$(tmuxctl_python)" -m tmuxctl.daemon "$@"
+PYTHONPATH="${_LIB_DIR}:${_CLI_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" exec "$(tmuxctl_python)" -m tmuxctl.daemon "$@"

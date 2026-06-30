@@ -11,8 +11,8 @@ description: tmuxctld loopback daemon, tmuxctl transport contract, pane-send/lif
 
 - CLI daemon: `tmuxctld --host 127.0.0.1 --port 7778`.
 - Control: `tmuxctld-ctl status|health|logs|start|restart|stop|install`.
-- Implementation: `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/lib/tmuxctl/daemon.py`.
-- LaunchAgent: `cli-tools/launchd/ai.tokenclaw.tmuxctld.plist`.
+- Implementation: `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/tmuxctld/lib/tmuxctl/daemon.py`.
+- LaunchAgent: `tmuxctld/launchd/ai.tokenclaw.tmuxctld.plist`.
 - Tests: `cli-tools/tests/test_tmuxctld_*.py`.
 
 ## Safe Checks

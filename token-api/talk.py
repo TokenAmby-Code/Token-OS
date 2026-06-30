@@ -234,6 +234,7 @@ async def lookup_instance_for_pane(pane_id: str) -> dict[str, Any] | None:
 
 async def _resolve_agent_for_pane(pane_id: str) -> str | None:
     """Return claude/codex for a live rowless pane via tmuxctl's ps detector."""
+    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
     cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
         proc = await asyncio.to_thread(
@@ -252,7 +253,7 @@ async def _resolve_agent_for_pane(pane_id: str) -> str | None:
             ],
             env={
                 **os.environ,
-                "PYTHONPATH": f"{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             },
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

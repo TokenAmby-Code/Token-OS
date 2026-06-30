@@ -1,0 +1,30 @@
+[project]
+name = "tmuxctld"
+version = "1.0.0"
+description = "Root-level tmuxctld daemon authority and tmuxctl control package"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lib/tmuxctl"]
+
+[tool.pytest.ini_options]
+testpaths = ["../cli-tools/tests"]
+pythonpath = ["lib", "../cli-tools/lib"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"lib/tmuxctl/enums.py" = ["UP042"]
+"lib/tmuxctl/focus.py" = ["UP042"]
+"lib/tmuxctl/revert.py" = ["UP042"]

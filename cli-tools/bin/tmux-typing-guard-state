@@ -5,9 +5,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_LIB = Path(__file__).resolve().parents[1] / "lib"
-if str(_LIB) not in sys.path:
-    sys.path.insert(0, str(_LIB))
+_ROOT = Path(__file__).resolve().parents[2]
+_LIB = _ROOT / "tmuxctld" / "lib"
+_CLI_LIB = _ROOT / "cli-tools" / "lib"
+for _path in (_CLI_LIB, _LIB):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 try:
     from tmuxctl.typing_guard_state import main

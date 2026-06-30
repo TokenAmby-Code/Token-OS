@@ -81,7 +81,7 @@ TMUXCTLD_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
 # Source plist ships in the runtime checkout (token-restart runs from there in
 # production, so _BIN_DIR resolves to the synced copy); installed copy lives in
 # LaunchAgents. Both overridable so tests redirect them off the live LaunchAgent.
-TMUXCTLD_SRC_PLIST="${TMUXCTLD_SRC_PLIST:-${_BIN_DIR}/../launchd/${TMUXCTLD_LABEL}.plist}"
+TMUXCTLD_SRC_PLIST="${TMUXCTLD_SRC_PLIST:-${_BIN_DIR}/../../tmuxctld/launchd/${TMUXCTLD_LABEL}.plist}"
 TMUXCTLD_PLIST="${TMUXCTLD_PLIST:-$HOME/Library/LaunchAgents/${TMUXCTLD_LABEL}.plist}"
 
 # Local CD topology. Values can be overridden for tests/emergency deploys, or via
@@ -1575,28 +1575,22 @@ map_changed_to_services() {
                 # the sync (no sweep/timer/poll), using the real tmux binary.
                 TMUX_CONFIG_CHANGED=true
                 ;;
-            cli-tools/launchd/ai.tokenclaw.tmuxctld.plist)
+            tmuxctld/launchd/ai.tokenclaw.tmuxctld.plist)
                 # The daemon's LaunchAgent plist changed. kickstart -k won't reload
                 # a changed plist, so flag a reinstall (cp + bootout + bootstrap of
-                # the freshly-synced copy). MUST precede the cli-tools/lib/* WSL arm.
+                # the freshly-synced copy). MUST precede broad service arms.
                 RESTART_TMUXCTLD=true
                 TMUXCTLD_PLIST_CHANGED=true
                 ;;
-            cli-tools/lib/tmuxctl/*)
+            tmuxctld/lib/tmuxctl/*)
                 # tmuxctld daemon code area (the loopback tmux control plane:
                 # daemon.py + the service/adapter/api modules it imports). Python is
                 # not hot-reloaded, so new daemon code lands via main→live sync but
-                # the running process must be bounced to load it. This arm MUST
-                # precede the general cli-tools/lib/* arm below, which otherwise
-                # swallows cli-tools/lib/tmuxctl/* into the WSL-only route. The
-                # tmuxctl subtree lives under cli-tools/lib, which the WSL arm
-                # refreshes today — keep that WSL refresh (purely additive) so this
-                # change never regresses the satellite's cli-tools sync.
+                # the running process must be bounced to load it. This arm is root-level daemon authority, not part of the general
+                # cli-tools/lib WSL refresh surface.
                 RESTART_TMUXCTLD=true
-                RESTART_WSL=true
-                REFRESH_WSL=true
                 ;;
-            cli-tools/bin/tmuxctld)
+            tmuxctld/bin/tmuxctld)
                 # The daemon entrypoint (the single source of truth for the
                 # interpreter the plist invokes). Mac-local; unmapped today, so it
                 # routes to the daemon restart only — no WSL refresh.
@@ -1605,8 +1599,6 @@ map_changed_to_services() {
             token-api/token-satellite.py | token-api/scripts/token-satellite-refresh | ahk/* | cli-tools/bin/dispatch | cli-tools/lib/* | config/deskflow/*)
                 # WSL-hosted runtime dependencies. Push the target SHA into the
                 # WSL-local runtime/AHK cache instead of merely restarting NAS code.
-                RESTART_WSL=true
-                REFRESH_WSL=true
                 ;;
             token-api/ui/ops/* | token-api/web/ops/*)
                 # Ops cockpit is served by token-api; a restart bumps the build-id
@@ -1616,8 +1608,6 @@ map_changed_to_services() {
                 ;;
             token-api/uv.lock | token-api/pyproject.toml)
                 RESTART_TOKENAPI=true
-                RESTART_WSL=true
-                REFRESH_WSL=true
                 ;;
             token-api/*.py)
                 RESTART_TOKENAPI=true

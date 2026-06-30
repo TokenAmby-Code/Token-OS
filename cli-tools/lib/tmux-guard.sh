@@ -70,9 +70,13 @@ tmux_guard_emit_blocked() {
 tmux_typing_guard_active() {
     local pane="${1:-${TMUX_PANE:-}}"
     [[ -n "$pane" ]] || return 1
-    local lib_dir rc=0
-    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || return 1
-    PYTHONPATH="${lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+    local shell_lib_dir token_os_root lib_dir cli_lib_dir rc=0
+    shell_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || return 1
+    token_os_root="${TOKEN_OS:-$(cd "${shell_lib_dir}/../.." && pwd)}"
+    lib_dir="${TMUXCTLD_LIB:-${token_os_root}/tmuxctld/lib}"
+    cli_lib_dir="${token_os_root}/cli-tools/lib"
+    [[ -d "$lib_dir" ]] || return 1
+    PYTHONPATH="${lib_dir}:${cli_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
         IMPERIUM_TMUX_BIN="${TMUX_GUARD_REAL_TMUX:-${IMPERIUM_TMUX_BIN:-}}" \
         "${TMUXCTL_PYTHON:-${TMUX_GUARD_PYTHON:-python3}}" -m tmuxctl.send_gate typing "$pane" >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 0 ]]
