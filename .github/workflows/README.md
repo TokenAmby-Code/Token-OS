@@ -12,7 +12,7 @@ merge-triggered webhook that reaches the Mac over Tailscale.
 | `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. **pytest does NOT run on this hot path, by policy** — the heavyweight regression suite wastes Actions minutes and pollutes agent attention on every dev PR, so it was removed from dev entirely and reserved for `prod`. Do not re-add it here. |
 | `prod-gate.yml` — *Prod Gate (tests)* | PR/push → `prod`, nightly cron, `workflow_dispatch` | Full pytest suite — the **active** prod-branch regression gate (token-api runs parallel `pytest-xdist -n auto --dist loadfile`; cli-tools is forced serial `-n0` on CI — see "Running tests locally") (the `prod` branch now exists, created off the post-#420/#373 stable `main` HEAD). Runs as the merge-to-prod gate (PR → `prod`), post-merge (push → `prod`), nightly (08:00 UTC sweep of `prod`), and on demand. Never runs on PRs into `main`, so it can't block the dev hot path. To make it a *blocking* merge-to-prod gate, branch protection on `prod` must require the `tests` check. |
 | `secrets-scan.yml` | push/PR → `main` | Blocks on leaked IPs/secrets (patterns kept in repo secrets). |
-| `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD. Path-filter → changed-service list → Tailscale ephemeral node → POST `/api/cd/restart` on the Mac (ack-first). Post-merge restart + deployed smoke. |
+| `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD. Tailscale ephemeral node → POST `/api/cd/restart` on the Mac (ack-first) → poll `/health` until `git_sha == github.sha`; mismatch after 180s is a deploy alarm/failure. |
 
 ### Ruff never-drift
 

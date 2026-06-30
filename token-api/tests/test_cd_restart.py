@@ -220,3 +220,17 @@ def test_distinct_sha_not_coalesced(client, spawned):
     assert "scheduled" in first.json()["restart"]
     assert "scheduled" in second.json()["restart"]
     assert len(_self_restarts(spawned)) == 2
+
+
+def test_deploy_workflow_verifies_live_health_git_sha() -> None:
+    """Post-merge CD must not stop at webhook ACK; it gates on live SHA proof."""
+    from pathlib import Path
+
+    workflow = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "deploy-prod.yml"
+    text = workflow.read_text()
+    assert "Verify live deployment SHA" in text
+    assert "/health" in text
+    assert "git_sha" in text
+    assert "DEPLOY VERIFY ALARM" in text
+    assert "after 180s" in text
+    assert "cancel-in-progress: true" in text
