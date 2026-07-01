@@ -17,7 +17,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-
 LEDGER_VERSION = 1
 ACTIVE_STATES = frozenset({"SHIPPED", "OPEN"})
 DEFAULT_LEDGER_PATH = Path.home() / ".claude" / "tmuxctld-wrapper-ledger.json"
@@ -55,7 +54,7 @@ class WrapperLedgerRow:
     state: str
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "WrapperLedgerRow":
+    def from_mapping(cls, data: dict[str, Any]) -> WrapperLedgerRow:
         return cls(
             wrapper_id=_s(data.get("wrapper_id") or data.get("wrapper_launch_id")),
             instance_id=_s(data.get("instance_id")),
@@ -69,7 +68,7 @@ class WrapperLedgerRow:
             state=(_s(data.get("state")) or "OPEN").upper(),
         )
 
-    def merge(self, **updates: object) -> "WrapperLedgerRow":
+    def merge(self, **updates: object) -> WrapperLedgerRow:
         data = asdict(self)
         for key, value in updates.items():
             if key == "born_epoch":
@@ -96,6 +95,7 @@ class WrapperLedger:
     """Thread-safe wrapper_id keyed runtime oracle."""
 
     def __init__(self, path: Path | None = None) -> None:
+        self._explicit_path = path is not None
         self._path = path or ledger_path()
         self._lock = threading.RLock()
         self._loaded = False
@@ -111,7 +111,8 @@ class WrapperLedger:
         with self._lock:
             if self._loaded and not force:
                 return {"loaded": True, "path": str(self._path), "rows": len(self._rows)}
-            self._path = ledger_path()
+            if not self._explicit_path:
+                self._path = ledger_path()
             rows: dict[str, WrapperLedgerRow] = {}
             try:
                 payload = json.loads(self._path.read_text(encoding="utf-8"))
@@ -152,8 +153,7 @@ class WrapperLedger:
     def _write_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         rows = [
-            row.as_dict()
-            for row in sorted(self._rows.values(), key=lambda item: item.wrapper_id)
+            row.as_dict() for row in sorted(self._rows.values(), key=lambda item: item.wrapper_id)
         ]
         payload = {
             "version": LEDGER_VERSION,
@@ -227,15 +227,35 @@ class WrapperLedger:
             if wrapper_id:
                 candidates = [_s(wrapper_id)]
             elif instance_id:
-                candidates = [self._by_instance.get(_s(instance_id), "")]
+                instance_key = _s(instance_id)
+                candidates = [self._by_instance.get(instance_key, "")]
+                if include_closed:
+                    candidates.extend(
+                        row.wrapper_id
+                        for row in self._rows.values()
+                        if row.instance_id == instance_key
+                    )
             elif pane_positional_id:
-                candidates = [self._by_pane_positional.get(_s(pane_positional_id), "")]
+                pane_key = _s(pane_positional_id)
+                candidates = [self._by_pane_positional.get(pane_key, "")]
+                if include_closed:
+                    candidates.extend(
+                        row.wrapper_id
+                        for row in self._rows.values()
+                        if row.pane_positional_id == pane_key
+                    )
             elif needle:
                 candidates = [
                     needle,
                     self._by_instance.get(needle, ""),
                     self._by_pane_positional.get(needle, ""),
                 ]
+                if include_closed:
+                    candidates.extend(
+                        row.wrapper_id
+                        for row in self._rows.values()
+                        if row.instance_id == needle or row.pane_positional_id == needle
+                    )
             else:
                 candidates = []
             for key in candidates:

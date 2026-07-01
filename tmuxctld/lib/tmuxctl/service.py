@@ -46,7 +46,6 @@ from .normalize import normalize_window
 from .planner import build_restart_plan
 from .resolver import (
     list_free_panes,
-    resolve_instance,
     resolve_pane,
     resolve_to_physical,
     resolve_to_public,
@@ -337,22 +336,13 @@ class TmuxControlPlane:
                 "live_agent": bool(row.engine),
                 "ledger": row.as_dict(),
             }
-        resolved = resolve_instance(self.adapter, instance_id)
-        agent = "auto"
-        if resolved.pane_id:
-            from .skill_invoke import resolve_agent_for_pane
-
-            try:
-                agent = resolve_agent_for_pane(self.adapter, resolved.pane_id, default="auto")
-            except Exception:
-                agent = "auto"
         return {
-            "instance_id": resolved.instance_id,
-            "pane_id": resolved.pane_id or "",
-            "pane_role": resolved.pane_role or "",
-            "found": resolved.found,
-            "agent": agent,
-            "live_agent": agent != "auto",
+            "instance_id": instance_id,
+            "pane_id": "",
+            "pane_role": "",
+            "found": False,
+            "agent": "auto",
+            "live_agent": False,
         }
 
     def instance_id_for_pane(self, pane: str) -> dict:
@@ -379,9 +369,7 @@ class TmuxControlPlane:
                 "found": bool(row.instance_id),
                 "ledger": row.as_dict(),
             }
-        resolved_pane = self._resolve_current(pane)
-        value = self.adapter.show_pane_option(resolved_pane, "@INSTANCE_ID")
-        return {"pane": resolved_pane, "instance_id": value or "", "found": bool(value)}
+        return {"pane": pane_positional_id, "instance_id": "", "found": False}
 
     def ledger_upsert(
         self,

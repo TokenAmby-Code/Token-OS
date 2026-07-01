@@ -224,6 +224,20 @@ async def _upsert_tmuxctld_ledger_from_agents_db(payload: dict, result: dict) ->
         )
 
 
+def _schedule_tmuxctld_ledger_upsert(payload: dict, result: dict) -> None:
+    """Queue best-effort tmuxctld ledger hydration off the hook response path."""
+
+    task = asyncio.create_task(_upsert_tmuxctld_ledger_from_agents_db(dict(payload), dict(result)))
+
+    def _log_task_failure(done: asyncio.Task[None]) -> None:
+        try:
+            done.result()
+        except Exception as exc:
+            logger.warning("SessionStart: tmuxctld ledger hydration task failed: %s", exc)
+
+    task.add_done_callback(_log_task_failure)
+
+
 # Bounded in-band retry for transient WAL "database is locked" (SQLITE_BUSY) on
 # hook DB writes. Total added latency on full exhaustion is
 # 0.15*(1+2+3+4) = 1.5s — well under the client hook's --max-time/--retry-max-time
@@ -7472,7 +7486,7 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
     try:
         result = await handler(payload)
         if normalized_action_type == "SessionStart" and isinstance(result, dict):
-            await _upsert_tmuxctld_ledger_from_agents_db(payload, result)
+            _schedule_tmuxctld_ledger_upsert(payload, result)
         return result
     except Exception as e:
         logger.error(f"Hook handler error ({normalized_action_type}): {e}")
