@@ -134,7 +134,7 @@ def _pane_position_matches(pane: dict[str, str], window_ref: str, position: str)
     page, live_position = position_id.rsplit(":", 1)
     wanted_window = (window_ref or "").strip().lower()
     window_name = _normalize_pane(pane.get("window_name")).rstrip("-")
-    window_base = window_name.split("(", 1)[0]
+    window_base = window_name.split("(", 1)[0].strip()
     if wanted_window not in {
         _normalize_pane(pane.get("window_index")).lower(),
         window_name.lower(),
@@ -267,9 +267,11 @@ async def resolve_pane(identifier: str) -> str | None:
     # resolver without depending on stored registry rows.
     if raw.count(":") == 1:
         window_ref, pos = raw.split(":", 1)
-        for p in panes:
-            if _pane_position_matches(p, window_ref, pos):
-                return p["pane_id"]
+        positional_matches = [
+            p["pane_id"] for p in panes if _pane_position_matches(p, window_ref, pos)
+        ]
+        if len(positional_matches) == 1:
+            return positional_matches[0]
 
     # Operator/persona shorthand: accept a unique pane-label suffix (``pax`` ->
     # ``council:pax``, ``fabricator-general`` -> ``mechanicus:fabricator-general``).
