@@ -8,7 +8,7 @@ Daemon-native replacement: tmuxctld-owned focus/layout endpoint plus platform wi
 Original body is retained below this early-return as the emergency restore lever; lift only this tombstone block to prove an active blocker, build/cut over the daemon-native replacement, then restore the 410.
 __TMUX_410_TOMBSTONE__
 }
-return 410 2>/dev/null || exit 410
+return 1 2>/dev/null || exit 1
 
 # --- ORIGINAL BODY BELOW: emergency restore lever, intentionally dead under the 410. ---
 # wt-focus - Toggle Windows Terminal focus mode (snap + tab bar)
