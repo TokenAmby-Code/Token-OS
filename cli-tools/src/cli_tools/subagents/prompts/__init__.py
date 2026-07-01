@@ -1,1 +1,0 @@
-# Subagent type-specific prompts

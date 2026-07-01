@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# Convert times between timezones
-# TAGS: system
-# AUDIENCE: human
-set -euo pipefail
-CLI_TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec uv run --directory "$CLI_TOOLS_DIR" python -m cli_tools.timezone.cli "$@"

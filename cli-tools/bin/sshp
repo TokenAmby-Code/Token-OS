@@ -1,5 +1,0 @@
-#!/bin/bash
-# sshp - SSH to phone (backwards-compatible alias for ssh-phone)
-# TAGS: mobile, ssh
-# AUDIENCE: human
-exec ssh-connect phone "$@"

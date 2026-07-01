@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# daily-build - Assemble the day's Obsidian-hosted build review note
-# TAGS: vault, build, review
-# AUDIENCE: human, agent
-set -euo pipefail
-CLI_TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec uv run --directory "$CLI_TOOLS_DIR" python -m cli_tools.daily_build.cli "$@"

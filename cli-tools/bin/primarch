@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# primarch - retired launcher stub
-# Dispatch is the sole agent launch engine. Use: dispatch --persona <name> [...flags]
-set -euo pipefail
-echo "primarch has been retired. Use: dispatch --persona <name>" >&2
-exit 64

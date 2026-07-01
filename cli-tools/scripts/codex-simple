@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Backwards-compatibility shim: reroute codex-simple to the new subagent CLI.
-
-set -euo pipefail
-
-exec "$HOME/cli-tools/bin/subagent" "$@"

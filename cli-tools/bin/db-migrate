@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# Run Cloud SQL schema migrations
-# TAGS: db
-# AUDIENCE: human, agent
-set -euo pipefail
-CLI_TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec uv run --directory "$CLI_TOOLS_DIR" python -m cli_tools.db_migrate.cli "$@"
