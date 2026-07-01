@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -186,6 +187,108 @@ def test_typing_guard_state_endpoint_rejects_unknown_command() -> None:
         assert payload["error"]["code"] == "ValueError"
     finally:
         server.shutdown()
+
+
+def test_typing_guard_arm_disables_any_and_pending_reenables_any() -> None:
+    state: dict[str, str] = {}
+    calls: list[tuple[str, ...]] = []
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "show-options":
+                proc.stdout = state.get(args[-1], "")
+            elif args[:2] == ("set-option", "-p"):
+                state[args[-2]] = args[-1]
+            return proc
+
+    fake = FakeTmux()
+    daemon.typing_guard_state.arm(fake, "%42", seconds=300, now=100)
+    assert json.loads(state[daemon.typing_guard_state.GUARD_JSON_OPTION])["kind"] == "human"
+    assert ("unbind-key", "-q", "-n", "Any") in calls
+
+    calls.clear()
+    daemon.typing_guard_state.pending(fake, "%42", seconds=15, now=110)
+    assert json.loads(state[daemon.typing_guard_state.GUARD_JSON_OPTION])["kind"] == "pending"
+    assert any(call[0] == "source-file" for call in calls), "pending must re-enable root Any"
+    assert not any(call[:4] == ("unbind-key", "-q", "-n", "Any") for call in calls)
+
+
+def test_typing_guard_rehydrate_reads_projections_without_mutating_state() -> None:
+    calls: list[tuple[str, ...]] = []
+    projections = {
+        daemon.typing_guard_state.GUARD_KIND_OPTION: "human",
+        daemon.typing_guard_state.GUARD_UNTIL_OPTION: "999",
+    }
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "show-options":
+                proc.stdout = projections.get(args[-1], "")
+            return proc
+
+    result = daemon.typing_guard_state.rehydrate_any_binding(FakeTmux(), "%42", now=100)
+    assert result["topology"] == "disabled"
+    assert ("unbind-key", "-q", "-n", "Any") in calls
+    assert not any(call and call[0] == "set-option" for call in calls)
+    assert not any(daemon.typing_guard_state.GUARD_JSON_OPTION in call for call in calls)
+
+    calls.clear()
+    projections[daemon.typing_guard_state.GUARD_KIND_OPTION] = "pending"
+    result = daemon.typing_guard_state.rehydrate_any_binding(FakeTmux(), "%42", now=100)
+    assert result["topology"] == "enabled"
+    assert any(call and call[0] == "source-file" for call in calls)
+    assert not any(call and call[0] == "set-option" for call in calls)
+
+
+def test_typing_guard_topology_endpoint_rehydrates_without_state_command(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_rehydrate(tmux, pane="", *, now=None):  # noqa: ARG001
+        calls.append((pane, str(now)))
+        return {"topology": "enabled", "pane": pane}
+
+    monkeypatch.setattr(daemon.typing_guard_state, "rehydrate_any_binding", fake_rehydrate)
+    server, _ = _serve(StubAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/typing-guard-topology",
+            {"cmd": "rehydrate", "pane": "%42", "now": "123"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["result"]["topology"] == "enabled"
+        assert calls == [("%42", "123")]
+    finally:
+        server.shutdown()
+
+
+def test_typing_guard_arm_schedules_expiry_rehydrate(monkeypatch) -> None:
+    fired = threading.Event()
+
+    def fake_rehydrate(*args, **kwargs):  # noqa: ANN002, ANN003
+        fired.set()
+        return {"topology": "enabled"}
+
+    monkeypatch.setattr(daemon.typing_guard_state, "rehydrate_any_binding", fake_rehydrate)
+    daemon._schedule_typing_guard_expiry_rehydrate(
+        {"kind": "human", "active": True, "until": time.time() - 1}
+    )
+    assert fired.wait(timeout=1)
 
 
 def test_resolve_instance_fail_closed_envelope() -> None:

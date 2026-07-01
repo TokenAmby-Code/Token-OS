@@ -1710,7 +1710,58 @@ def _h_typing_guard_state(control, params):
                 _s(params, "pane"),
             )
         )
+    if cmd == "arm":
+        _schedule_typing_guard_expiry_rehydrate(payload)
     return payload
+
+
+def _schedule_typing_guard_expiry_rehydrate(payload: dict) -> None:
+    """One-shot topology repair after a HUMAN guard's deadline.
+
+    The timer must not clear/extend state.  It only re-reads the currently
+    focused pane's existing guard projections and enables root ``Any`` if no
+    active HUMAN guard remains there.
+    """
+
+    if str(payload.get("kind") or "").lower() != typing_guard_state.HUMAN:
+        return
+    if not payload.get("active"):
+        return
+    try:
+        until = int(float(payload.get("until")))
+    except (TypeError, ValueError):
+        return
+
+    def _fire() -> None:
+        delay = max(0.0, until - time.time())
+        if delay:
+            time.sleep(delay)
+        try:
+            typing_guard_state.rehydrate_any_binding(
+                typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+                now=typing_guard_state.now_epoch(),
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_fire, name="typing-guard-expiry-rehydrate", daemon=True).start()
+
+
+def _h_typing_guard_topology(control, params):
+    del control
+    cmd = _s(params, "cmd", _s(params, "action", "rehydrate"))
+    tmux = typing_guard_state.Tmux(typing_guard_state.tmux_binary())
+    if cmd == "rehydrate":
+        return typing_guard_state.rehydrate_any_binding(
+            tmux,
+            _s(params, "pane"),
+            now=typing_guard_state.now_epoch(_opt(params, "now")),
+        )
+    if cmd == "enable":
+        return typing_guard_state.enable_any_binding(tmux)
+    if cmd == "disable":
+        return typing_guard_state.disable_any_binding(tmux)
+    raise ValueError("typing guard topology cmd must be rehydrate, enable, or disable")
 
 
 def _h_client_lease(control, params):
@@ -2205,6 +2256,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/open-session-doc"): _h_open_session_doc,
     ("POST", "/goto-spoken"): _h_goto_spoken,
     ("POST", "/typing-guard-state"): _h_typing_guard_state,
+    ("POST", "/typing-guard-topology"): _h_typing_guard_topology,
     ("POST", "/client-lease"): _h_client_lease,
     ("POST", "/pane-rename"): _h_pane_rename,
     ("POST", "/shuttle"): _keybind_anchor(

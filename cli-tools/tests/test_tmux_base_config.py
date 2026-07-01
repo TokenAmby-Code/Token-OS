@@ -217,8 +217,9 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
 
 def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> None:
     """The root-table any-key binding only calls the state helper when the pane is
-    not ON. Live ON is preserved; PENDING is re-armed by the helper and the real
-    key is replayed."""
+    reachable by the root Any topology. Live HUMAN disables that topology;
+    PENDING re-enables it so the next ordinary key is re-armed by the helper and
+    the real key is replayed."""
     conf = CONF.read_text(encoding="utf-8")
     assert "bind -n Any {" in conf
     assert "tmuxctld-ping POST /typing-guard-state cmd=arm pane=#{q:pane_id} seconds=300" in conf
@@ -254,6 +255,8 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     # Arming lives ONLY on the keystroke side; the mouse (else) branch is empty —
     # nothing after the keystroke branch's final send-keys but closing braces.
     assert "tmuxctld-ping POST /typing-guard-state cmd=arm" in any_binding
+    assert "@TYPING_GUARD_KIND" not in any_binding
+    assert "@TYPING_GUARD_UNTIL" not in any_binding
     assert "@TYPING_GUARD_KIND},pending" not in any_binding, (
         "Any must not depend directly on pending; a follow-up keystroke after "
         "Backspace/Ctrl+C pending must run the arm endpoint and convert pending to human"
@@ -265,6 +268,57 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     )
     assert "bind -n FocusIn" not in conf
     assert "bind -n FocusOut" not in conf
+
+
+def test_typing_guard_focus_hooks_only_rehydrate_topology() -> None:
+    conf = CONF.read_text(encoding="utf-8")
+    for prefix in (
+        "set-hook -g client-attached[20] ",
+        "set-hook -g after-select-pane[20] ",
+        "set-hook -g after-select-window[20] ",
+    ):
+        line = _line_starting(prefix)
+        assert "tmuxctld-ping POST /typing-guard-topology" in line
+        assert "cmd=rehydrate" in line
+        assert "/typing-guard-state" not in line
+        for forbidden in ("cmd=arm", "cmd=pending", "cmd=hold", "cmd=release", "cmd=expire-pane"):
+            assert forbidden not in line
+    focus_hook_lines = [
+        line
+        for line in conf.splitlines()
+        if line.startswith("set-hook -g after-select")
+        or line.startswith("set-hook -g client-attached[20]")
+    ]
+    assert focus_hook_lines
+    assert all("@TYPING_GUARD" not in line for line in focus_hook_lines)
+
+
+def test_typing_guard_pending_keys_are_permanently_bound() -> None:
+    """Hard infra lock: topology may toggle root Any only.
+
+    Pending/control keys must stay permanently bound so Backspace/C-h/C-c/Enter
+    cannot fall through to root Any and be misclassified as ordinary typing.
+    """
+    conf = CONF.read_text(encoding="utf-8")
+    any_index = conf.index("bind -n Any {")
+    for key, seconds in {
+        "Enter": "5",
+        "C-m": "5",
+        "BSpace": "15",
+        "C-h": "15",
+        "C-c": "15",
+    }.items():
+        line = _line_starting(f"bind -n {key} ")
+        assert conf.index(line) > any_index
+        assert "tmuxctld-ping POST /typing-guard-state cmd=pending" in line
+        assert f"seconds={seconds}" in line
+        assert "send-keys" in line
+
+    assert "unbind-key -n Enter" not in conf
+    assert "unbind-key -n C-m" not in conf
+    assert "unbind-key -n BSpace" not in conf
+    assert "unbind-key -n C-h" not in conf
+    assert "unbind-key -n C-c" not in conf
 
 
 def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:

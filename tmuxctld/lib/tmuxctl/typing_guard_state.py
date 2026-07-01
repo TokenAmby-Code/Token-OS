@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -33,6 +34,16 @@ SOURCE = "tmuxctld"
 ON_MARKER = "#[fg=colour214,bold]⌨#[default]"
 PENDING_MARKER = "#[fg=red,bold]⌨#[default]"
 AGENT_MARKER = "#[fg=green,bold]⌨#[default]"
+
+ANY_BINDING = """\
+bind -n Any {
+  if -F '#{==:#{mouse_x},}' {
+    run-shell -b "tmuxctld-ping POST /typing-guard-state cmd=arm pane=#{q:pane_id} seconds=300 now=#{client_activity} client=#{q:client_tty} term=#{q:client_termname} pid=#{q:client_pid} session=#{q:session_name} >/dev/null || env IMPERIUM_TMUX_RAW=1 tmux display-message tmuxctld-ping-/typing-guard-state-failed"
+    send-keys
+  } {
+  }
+}
+"""
 
 
 @dataclass(frozen=True)
@@ -88,6 +99,93 @@ def _read_option(tmux: Tmux, pane: str, option: str) -> str:
     if proc is None or proc.returncode != 0:
         return ""
     return proc.stdout.strip()
+
+
+def _run_ok(tmux: Tmux, *args: str, timeout: float = 0.5) -> bool:
+    proc = tmux.run(*args, timeout=timeout)
+    return proc is not None and proc.returncode == 0
+
+
+def enable_any_binding(tmux: Tmux) -> dict[str, Any]:
+    """Enable the root-table ordinary-key hook.
+
+    tmux key bindings are global, not per-pane, so this deliberately changes only
+    hook topology.  It does not inspect, write, extend, or clear guard state.
+    """
+
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write(ANY_BINDING)
+            path = handle.name
+        ok = _run_ok(tmux, "source-file", path, timeout=1.0)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return {"topology": "enabled", "any_bound": bool(ok)}
+
+
+def disable_any_binding(tmux: Tmux) -> dict[str, Any]:
+    """Disable the root-table ordinary-key hook without touching guard state."""
+
+    ok = _run_ok(tmux, "unbind-key", "-q", "-n", "Any")
+    return {"topology": "disabled", "any_bound": False, "ok": bool(ok)}
+
+
+def focused_pane(tmux: Tmux) -> str:
+    proc = tmux.run("display-message", "-p", "#{pane_id}", timeout=0.3)
+    if proc is None or proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def projection_status(tmux: Tmux, pane: str, *, now: int | None = None) -> dict[str, Any]:
+    """Read only tmux-facing projection options for focus/topology decisions."""
+
+    current = now_epoch() if now is None else now
+    kind = (_read_option(tmux, pane, GUARD_KIND_OPTION) or OFF).strip().lower()
+    if kind == "on":
+        kind = HUMAN
+    if kind not in {HUMAN, PENDING, AGENT, OFF}:
+        kind = OFF
+    until_raw = _read_option(tmux, pane, GUARD_UNTIL_OPTION)
+    try:
+        until = int(float(until_raw)) if until_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        until = None
+    active = kind in {HUMAN, PENDING, AGENT} and until is not None and current < int(until)
+    if not active:
+        kind = OFF
+        until = None
+    return {"kind": kind, "until": until, "active": active, "pane": pane}
+
+
+def rehydrate_any_binding(
+    tmux: Tmux, pane: str = "", *, now: int | None = None
+) -> dict[str, Any]:
+    """Rebuild ordinary-key hook topology from existing focused-pane projections.
+
+    Focus changes must not mutate typing-guard state.  This function only reads
+    ``@TYPING_GUARD_KIND``/``@TYPING_GUARD_UNTIL`` and toggles the global root
+    ``Any`` binding: active HUMAN guard => disabled; anything else => enabled.
+    """
+
+    target = pane or focused_pane(tmux)
+    projected = projection_status(tmux, target, now=now) if target else {
+        "kind": OFF,
+        "until": None,
+        "active": False,
+        "pane": "",
+    }
+    topology = (
+        disable_any_binding(tmux)
+        if projected["kind"] == HUMAN and projected["active"]
+        else enable_any_binding(tmux)
+    )
+    return {"pane": target, "projection": projected, **topology}
 
 
 
@@ -212,13 +310,18 @@ def arm(
 ) -> dict[str, Any]:
     current = status(tmux, pane, now=now)
     if current["kind"] == HUMAN and current["active"]:
+        disable_any_binding(tmux)
         return current
     mark_client_activity(client=client, term=term, pid=pid, session=session)
-    return write_record(tmux, pane, kind=HUMAN, until=now + int(seconds), owner=None, now=now)
+    result = write_record(tmux, pane, kind=HUMAN, until=now + int(seconds), owner=None, now=now)
+    disable_any_binding(tmux)
+    return result
 
 
 def pending(tmux: Tmux, pane: str, *, seconds: int, now: int) -> dict[str, Any]:
-    return write_record(tmux, pane, kind=PENDING, until=now + int(seconds), owner=None, now=now)
+    result = write_record(tmux, pane, kind=PENDING, until=now + int(seconds), owner=None, now=now)
+    enable_any_binding(tmux)
+    return result
 
 
 def hold(
@@ -296,6 +399,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="print structured guard status")
     add_common(p_status)
 
+    p_rehydrate = sub.add_parser("rehydrate", help="rehydrate root Any hook from projections")
+    add_common(p_rehydrate)
+
+    sub.add_parser("enable-any", help="enable root Any ordinary-key hook")
+    sub.add_parser("disable-any", help="disable root Any ordinary-key hook")
+
     return parser
 
 
@@ -303,7 +412,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     pane = args.pane or os.environ.get("TMUX_PANE", "")
-    if not pane:
+    pane_optional_commands = {"enable-any", "disable-any", "rehydrate"}
+    if not pane and args.cmd not in pane_optional_commands:
         if args.cmd == "status":
             sys.stdout.write(json.dumps(status(Tmux(tmux_binary()), pane)))
         return 0
@@ -338,6 +448,12 @@ def main(argv: list[str] | None = None) -> int:
             result = expire_pane(tmux, pane, now=current)
         elif args.cmd == "status":
             result = expire_pane(tmux, pane, now=current)
+        elif args.cmd == "rehydrate":
+            result = rehydrate_any_binding(tmux, pane, now=current)
+        elif args.cmd == "enable-any":
+            result = enable_any_binding(tmux)
+        elif args.cmd == "disable-any":
+            result = disable_any_binding(tmux)
         if result is not None:
             sys.stdout.write(json.dumps(result, separators=(",", ":"), sort_keys=True))
     except Exception:
