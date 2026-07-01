@@ -77,10 +77,10 @@ RUNTIME_PANE_OPTIONS = (
     "@PLANNING_STATE",
     "@PLANNING_AGENT",
     "@PERSONA_ASSERT_GUARD",
-    "@TYPING_LOCK_UNTIL",
-    "@TYPING_PENDING_UNTIL",
-    "@TYPING_AGENT_UNTIL",
-    "@GUARD",
+    "@TYPING_GUARD_JSON",
+    "@TYPING_GUARD_UNTIL",
+    "@TYPING_GUARD_KIND",
+    "@TYPING_GUARD_MARKER",
     "@DISCORD_VOICE_LOCK",
     "@DISCORD_VOICE_PROCESSING",
     "@TOKEN_API_WRAPPER_LAUNCH_ID",
@@ -157,7 +157,7 @@ def tmux_binary() -> str:
     """Public accessor for the resolved real tmux binary (never the shim).
 
     A thin, stable wrapper over ``_tmux_binary`` so out-of-package readers (e.g.
-    the ``tmux-typing-guard-status`` diagnostic) can depend on a public name
+    the pane-border diagnostics can depend on a public name
     rather than the private resolver.
     """
     return _tmux_binary()
@@ -488,7 +488,7 @@ class TmuxAdapter:
         # Resolve Imperium canonical pane targets (mechanicus:N, council:custodes,
         # 1:N, …) to physical %pane ids BEFORE the gate evaluates. The gate's
         # keystroke-lock read shells out to
-        # `tmux show-options -pqv -t <target> @TYPING_LOCK_UNTIL`; tmux only
+        # `tmux show-options -pqv -t <target> @TYPING_GUARD_JSON`; tmux only
         # understands physical ids and native session:window addresses, so a
         # canonical id silently mis-resolves, the lock reads as unset, and the
         # gate then MISSES a keystroke-locked pane and clobbers the human's live

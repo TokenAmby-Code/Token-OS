@@ -207,9 +207,17 @@ def test_slot_teardown_touches_only_its_own_pane_siblings_byte_identical() -> No
     # SCOPE EXPANSION 4: tearing down one slot must leave EVERY other pane's stamps
     # byte-identical — the somnium-teardown-strips-palace-1:S contamination class.
     panes = {
-        "%somniumS": {"@INSTANCE_ID": "doomed", "@GUARD": "#[fg=cyan]⌨", "@PANE_ID": "somnium:S"},
-        "%palace1S": {"@INSTANCE_ID": "live", "@GUARD": "#[fg=green]⌨", "@PANE_ID": "palace:S"},
-        "%custodes": {"@GUARD": "#[fg=gold]✠", "@PANE_ID": "council:custodes"},
+        "%somniumS": {
+            "@INSTANCE_ID": "doomed",
+            "@TYPING_GUARD_MARKER": "#[fg=cyan]⌨",
+            "@PANE_ID": "somnium:S",
+        },
+        "%palace1S": {
+            "@INSTANCE_ID": "live",
+            "@TYPING_GUARD_MARKER": "#[fg=green]⌨",
+            "@PANE_ID": "palace:S",
+        },
+        "%custodes": {"@TYPING_GUARD_MARKER": "#[fg=gold]✠", "@PANE_ID": "council:custodes"},
     }
     adapter = MultiPaneAdapter(panes, dead={"%somniumS"})
     before = _siblings_snapshot(adapter, "%somniumS")
@@ -224,8 +232,16 @@ def test_slot_teardown_touches_only_its_own_pane_siblings_byte_identical() -> No
 
 def test_worker_cull_touches_only_its_own_pane_siblings_byte_identical() -> None:
     panes = {
-        "%worker": {"@INSTANCE_ID": "doomed", "@GUARD": "#[fg=red]⌨", "@PANE_ID": "mechanicus:7"},
-        "%palace1S": {"@INSTANCE_ID": "live", "@GUARD": "#[fg=green]⌨", "@PANE_ID": "palace:S"},
+        "%worker": {
+            "@INSTANCE_ID": "doomed",
+            "@TYPING_GUARD_MARKER": "#[fg=red]⌨",
+            "@PANE_ID": "mechanicus:7",
+        },
+        "%palace1S": {
+            "@INSTANCE_ID": "live",
+            "@TYPING_GUARD_MARKER": "#[fg=green]⌨",
+            "@PANE_ID": "palace:S",
+        },
     }
     adapter = MultiPaneAdapter(panes, dead={"%worker"})
     before = _siblings_snapshot(adapter, "%worker")

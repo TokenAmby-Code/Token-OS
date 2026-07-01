@@ -723,7 +723,7 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
     re-queueable) when locked; returns the resolved physical pane id otherwise.
 
     The human lock is keyed on the PHYSICAL ``%NN`` (the tmux any-key binding
-    stamps ``@TYPING_LOCK_UNTIL`` per physical pane). A canonical caller id
+    reads daemon-owned JSON guard state per physical pane). A canonical caller id
     (``council:custodes``, ``mechanicus:N``, …) must therefore be resolved before
     the lock read, or the read keys off a non-physical target tmux does not
     understand, the lock reads as unset, and the send pierces. So resolution is
@@ -789,6 +789,43 @@ def _detect_swallowed_submit(capture: str, payload: str) -> bool:
     if not needle or needle not in capture:
         return False
     return capture.endswith("\n")
+
+
+@contextlib.contextmanager
+def _agent_guard_transaction(control, pane: str, *, seconds: int = 8):
+    """Own a multi-part daemon pane-write transaction with a JSON AGENT guard."""
+    phys_pane = _resolve_physical_pane_or_gate(control, pane)
+    _raise_if_human_locked(phys_pane)
+    owner = None
+    try:
+        owner = typing_guard_state.hold(
+            typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+            phys_pane,
+            seconds=seconds,
+            now=typing_guard_state.now_epoch(),
+        )
+    except Exception as exc:
+        log.debug("tmuxctld: agent-guard transaction hold skipped pane=%s: %s", phys_pane, exc)
+        owner = None
+    ctx = (
+        thread_local_override("tmuxctld-send-holder", owner=owner)
+        if owner
+        else contextlib.nullcontext()
+    )
+    try:
+        with ctx:
+            yield owner
+    finally:
+        if owner:
+            try:
+                typing_guard_state.release(
+                    typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+                    phys_pane,
+                    now=typing_guard_state.now_epoch(),
+                    owner=owner,
+                )
+            except Exception as exc:
+                log.warning("tmuxctld: agent-guard transaction release failed pane=%s: %s", phys_pane, exc)
 
 
 def _notify_swallowed_submit(*, pane_public: str, instance_id: str, payload_hash: str) -> None:
@@ -919,18 +956,19 @@ def _send_text_pipeline(
         int(verify_timeout * (max(0, ack_submit_retries) + 1) + submit_settle_seconds * 4) + 2,
     )
     held = False
+    guard_owner = None
     try:
-        held = bool(
-            typing_guard_state.hold(
-                typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
-                phys_pane,
-                seconds=hold_seconds,
-                now=typing_guard_state.now_epoch(),
-            )
+        guard_owner = typing_guard_state.hold(
+            typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+            phys_pane,
+            seconds=hold_seconds,
+            now=typing_guard_state.now_epoch(),
         )
+        held = bool(guard_owner)
     except Exception as exc:  # tmux unreachable / no live server (e.g. unit tests)
         log.debug("tmuxctld: agent-guard hold skipped pane=%s: %s", phys_pane, exc)
         held = False
+        guard_owner = None
 
     # When we hold, pierce our OWN agent lock so the send we just guarded is not
     # delayed by the green state we set — thread-locally, so a concurrent send to
@@ -939,7 +977,9 @@ def _send_text_pipeline(
     # on/pending lock), we do NOT pierce: the send routes through the normal gate
     # and delays behind the human, never stomping the Emperor's keystrokes.
     override_ctx = (
-        thread_local_override("tmuxctld-send-holder") if held else contextlib.nullcontext()
+        thread_local_override("tmuxctld-send-holder", owner=guard_owner)
+        if held
+        else contextlib.nullcontext()
     )
 
     def _send_submit_key() -> None:
@@ -1091,15 +1131,15 @@ def _send_text_pipeline(
         send_exception = exc
         raise
     finally:
-        # The guard must never leak green past the handshake. Release only what
-        # we acquired (release clears @TYPING_AGENT_UNTIL only and re-projects a
-        # human lock that may have arrived mid-hold via expire_pane semantics).
+        # The guard must never leak green past the handshake. Release only the
+        # owner token this request acquired; never clear a concurrent guard.
         if held:
             try:
                 typing_guard_state.release(
                     typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
                     phys_pane,
                     now=typing_guard_state.now_epoch(),
+                    owner=guard_owner,
                 )
             except Exception as exc:
                 log.warning("tmuxctld: agent-guard release failed pane=%s: %s", phys_pane, exc)
@@ -1123,6 +1163,7 @@ def _send_text_pipeline(
         "recovery_submit_credited": recovery_submit_credited,
         "idempotent_replay": False,
         "guard_held": held,
+        "guard_owner": guard_owner,
         "swallowed_submit_detected": swallowed_submit_detected,
         "recovery_attempts": recovery_attempts,
         "failures": failures,
@@ -1148,18 +1189,24 @@ def _h_send_text(control, params):
 
 
 def _h_insert_text(control, params):
-    control.insert_text(_s(params, "pane"), _s(params, "text"))
-    return {"pane": _s(params, "pane"), "status": "inserted"}
+    pane = _s(params, "pane")
+    with _agent_guard_transaction(control, pane):
+        control.insert_text(pane, _s(params, "text"))
+    return {"pane": pane, "status": "inserted"}
 
 
 def _h_prompt_start(control, params):
-    control.move_to_prompt_start(_s(params, "pane"), page_ups=_i(params, "page_ups", 50))
-    return {"pane": _s(params, "pane"), "status": "prompt-start"}
+    pane = _s(params, "pane")
+    with _agent_guard_transaction(control, pane):
+        control.move_to_prompt_start(pane, page_ups=_i(params, "page_ups", 50))
+    return {"pane": pane, "status": "prompt-start"}
 
 
 def _h_prompt_end(control, params):
-    control.move_to_prompt_end(_s(params, "pane"), page_downs=_i(params, "page_downs", 50))
-    return {"pane": _s(params, "pane"), "status": "prompt-end"}
+    pane = _s(params, "pane")
+    with _agent_guard_transaction(control, pane):
+        control.move_to_prompt_end(pane, page_downs=_i(params, "page_downs", 50))
+    return {"pane": pane, "status": "prompt-end"}
 
 
 def _h_invoke_skill(control, params):
@@ -1205,7 +1252,8 @@ def _h_invoke_skill(control, params):
             "agent": resolved_agent,
             "rendered": rendered,
         }
-    result = control.insert_invocation(pane, skill, agent=agent, kind=kind, arguments=arguments)
+    with _agent_guard_transaction(control, pane):
+        result = control.insert_invocation(pane, skill, agent=agent, kind=kind, arguments=arguments)
     return {"submitted": False, **result}
 
 
@@ -1298,7 +1346,8 @@ def _h_insert_invocation(control, params):
     agent = _s(params, "agent", "auto")
     kind = _s(params, "kind", "skill")
     arguments = _s(params, "arguments") or None
-    result = control.insert_invocation(pane, name, agent=agent, kind=kind, arguments=arguments)
+    with _agent_guard_transaction(control, pane):
+        result = control.insert_invocation(pane, name, agent=agent, kind=kind, arguments=arguments)
     return {"status": "inserted", **result}
 
 
@@ -1635,14 +1684,33 @@ def _h_goto_spoken(control, params):
 def _h_typing_guard_state(control, params):
     del control
     cmd = _s(params, "cmd", _s(params, "action"))
-    if cmd not in {"arm", "pending", "hold", "release", "expire-pane"}:
-        raise ValueError("typing guard state cmd must be arm, pending, hold, release, or expire-pane")
+    if cmd not in {"arm", "pending", "hold", "release", "expire-pane", "status"}:
+        raise ValueError(
+            "typing guard state cmd must be arm, pending, hold, release, expire-pane, or status"
+        )
     argv = [cmd]
-    for key in ("pane", "seconds", "now", "client", "term", "pid", "session"):
+    for key in ("pane", "seconds", "now", "client", "term", "pid", "session", "owner"):
         value = _opt(params, key)
         if value is not None and value != "":
             argv.extend([f"--{key}", str(value)])
-    return {"returncode": typing_guard_state.main(argv)}
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        rc = typing_guard_state.main(argv)
+    text = stdout.getvalue().strip()
+    payload = {"returncode": int(rc or 0)}
+    if text:
+        try:
+            payload.update(json.loads(text))
+        except json.JSONDecodeError:
+            payload["stdout"] = text
+    elif _s(params, "pane"):
+        payload.update(
+            typing_guard_state.status(
+                typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+                _s(params, "pane"),
+            )
+        )
+    return payload
 
 
 def _h_client_lease(control, params):
