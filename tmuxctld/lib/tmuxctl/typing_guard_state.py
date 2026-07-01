@@ -2,7 +2,8 @@
 
 The guard has one state machine per pane:
 
-    off -> on -> pending -> off          (human keystroke lifecycle)
+    off -> on -> pending -> off          (ordinary human keystroke lifecycle)
+    off -> pending -> off                (submit/edit/interrupt key without ON)
     off -> agent -> off                  (daemon send holds the pane)
 
 State is represented only by tmux pane options:
