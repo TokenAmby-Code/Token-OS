@@ -29,20 +29,20 @@ tmux show-hooks -g | grep 'pane-died'
 ## Manual revive
 
 1. Confirm the seat is a must-fill persona label: `council:custodes`, `council:malcador`, `council:administratum`, `council:pax`, `mechanicus:fabricator-general`, or `mechanicus:orchestrator`.
-2. Trigger the daemon reconciler:
+1. Trigger the daemon reconciler:
 
 ```bash
 curl -sS --max-time 20 -X POST http://127.0.0.1:7778/reconcile \
   -H 'Content-Type: application/json' -d '{"session":"main"}'
 ```
 
-3. If only one seat needs attention, assert it directly:
+1. If only one seat needs attention, assert it directly:
 
 ```bash
 tmuxctl assert-instance --pane council:custodes
 ```
 
-4. Re-list panes and verify dead persona seats are no longer dead. If respawn exits with status `127`, check that `tmuxctl.assertions.PERSONA_SEAT_SHIM` resolves to `cli-tools/scripts/persona-seat.sh`.
+1. Re-list panes and verify dead persona seats are no longer dead. If respawn exits with status `127`, check that `tmuxctl.assertions.PERSONA_SEAT_SHIM` resolves to `cli-tools/scripts/persona-seat.sh`.
 
 ## Real fix verification
 
