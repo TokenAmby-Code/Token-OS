@@ -169,6 +169,20 @@ def _pane_type(adapter: TmuxAdapter, pane_id: str) -> str:
     return adapter.show_pane_option(pane_id, "@PANE_TYPE")
 
 
+def _pane_dead(adapter: TmuxAdapter, pane_id: str) -> bool:
+    return (
+        adapter.run(
+            "display-message",
+            "-t",
+            pane_id,
+            "-p",
+            "#{pane_dead}",
+            allow_failure=True,
+        ).strip()
+        == "1"
+    )
+
+
 def _registry_entries(
     pane_id: str,
     pane_label: str,
@@ -1034,11 +1048,37 @@ def _assert_instance_impl(
     pane_id = resolved.pane_id
     pane_label = _pane_label(adapter, pane_id, resolved.pane_role)
     pane_type = _pane_type(adapter, pane_id)
+
+    if pane_label in PERSONA_LABELS and _pane_dead(adapter, pane_id):
+        spec = persona_spec(pane_label)
+        result = _base_result(pane_id, pane_label, pane_type, None)
+        if _persona_within_boot_grace(adapter, pane_id, []):
+            result.update({"ok": False, "action": "boot_grace", "reason": "persona_boot_grace"})
+            return result
+        ok, reason = launch_persona_seat(adapter, pane_id, spec, session=session)
+        result.update(
+            {"ok": ok, "action": "launched" if ok else "launch_failed", "reason": reason}
+        )
+        return result
+
     runtime_ok = _runtime_has_instance(adapter, pane_id)
     # Resolve the registry row through the pane's live @INSTANCE_ID stamp (the
     # source of truth resolve-instance uses), not just the stored tmux_pane column.
     instance_stamp = adapter.show_pane_option(pane_id, "@INSTANCE_ID")
-    rows = _registry_entries(pane_id, pane_label, instance_stamp=instance_stamp)
+    try:
+        rows = _registry_entries(pane_id, pane_label, instance_stamp=instance_stamp)
+    except Exception as exc:  # noqa: BLE001 — pane-death reconciliation must degrade
+        if pane_label in PERSONA_LABELS:
+            result = _base_result(pane_id, pane_label, pane_type, None)
+            result.update(
+                {
+                    "ok": bool(runtime_ok),
+                    "action": "registry_unavailable",
+                    "reason": f"registry_unavailable:{exc}",
+                }
+            )
+            return result
+        raise
     row = rows[0] if rows else None
     result = _base_result(pane_id, pane_label, pane_type, row)
 

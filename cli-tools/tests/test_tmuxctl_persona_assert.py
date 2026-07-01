@@ -578,6 +578,55 @@ def test_assert_instance_no_respawn_when_persona_pane_pid_is_execd_agent() -> No
     assert not any(c and c[0] == "respawn-pane" for c in adapter.calls)
 
 
+def test_dead_persona_reseats_without_registry_fetch() -> None:
+    from tmuxctl.assertions import assert_instance
+
+    adapter = FakeAdapter()
+    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="council"),
+        patch.object(assertions, "_pane_dead", return_value=True),
+        patch.object(
+            assertions,
+            "_runtime_has_instance",
+            side_effect=AssertionError("runtime not needed"),
+        ),
+        patch.object(
+            assertions,
+            "_registry_entries",
+            side_effect=AssertionError("registry not needed"),
+        ),
+        patch.object(assertions, "launch_persona_seat", return_value=(True, "launched")) as launch,
+    ):
+        result = assert_instance(adapter, "council:custodes")
+
+    assert result["ok"] is True
+    assert result["action"] == "launched"
+    launch.assert_called_once()
+
+
+def test_live_persona_degrades_when_registry_unavailable() -> None:
+    from tmuxctl.assertions import assert_instance
+
+    adapter = FakeAdapter()
+    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="council"),
+        patch.object(assertions, "_pane_dead", return_value=False),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "_registry_entries", side_effect=RuntimeError("api timeout")),
+        patch.object(assertions, "launch_persona_seat", return_value=(True, "launched")) as launch,
+    ):
+        result = assert_instance(adapter, "council:custodes")
+
+    assert result["ok"] is True
+    assert result["action"] == "registry_unavailable"
+    assert "api timeout" in result["reason"]
+    launch.assert_not_called()
+
+
 def test_guard_allows_resend_after_row_changes():
     adapter = FakeAdapter()
     spec = _fg_spec()
