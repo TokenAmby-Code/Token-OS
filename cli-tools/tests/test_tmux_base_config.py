@@ -67,9 +67,11 @@ def test_pane_select_prefix_hjkl_deexpand_before_routing() -> None:
 
 def test_pane_select_enter_expands_without_status_flash() -> None:
     line = _line_starting("bind -T pane-select Enter ")
-    assert "tmux-grid-expand" in line
-    assert "--expand" in line
+    assert "tmuxctld-ping POST /grid-expand" in line
+    assert "expand=1" in line
     assert "#{client_tty}" in line
+    assert "tmux-run" not in line
+    assert "tmux-grid-expand" not in line
     assert "display-message" not in line
 
 
@@ -403,9 +405,11 @@ def test_portable_status_guard_indicator_is_also_per_pane() -> None:
 
 def test_prefix_e_hot_swaps_persona_engine() -> None:
     line = _line_starting("bind E ")
-    assert "tmuxctl persona-engine" in line
-    assert "--pane '#{pane_id}'" in line
-    assert "--toggle" in line
+    assert "tmuxctld-ping POST /persona-engine" in line
+    assert 'pane=\\"#{pane_id}\\"' in line
+    assert "toggle=1" in line
+    assert "tmux-run" not in line
+    assert "tmuxctl persona-engine" not in line
 
 
 def test_pane_died_hook_routes_to_tmuxctld_event_not_raw_respawn() -> None:
@@ -416,3 +420,45 @@ def test_pane_died_hook_routes_to_tmuxctld_event_not_raw_respawn() -> None:
     assert ">/dev/null" in line
     assert "display-message" in line
     assert "tmux-pane-respawn" not in line
+
+
+def test_in_scope_keybinds_route_to_tmuxctld_ping_not_tmux_run() -> None:
+    """Config-side contract for the #495 keybind rebind wave.
+
+    Some endpoints are implemented in HEAD already (/focus, /persona-engine,
+    /send-ethereal); the rest are the proposed daemon route map owned by the
+    daemon-route worker. The config must point at the route names directly, not
+    keep cold tmux-run wrappers around the retired/legacy tools.
+    """
+    expected = {
+        "bind -T pane-select Enter ": ("/grid-expand", ('client=\\"#{client_tty}\\"', "expand=1")),
+        "bind n ": ("/instance/rename", ('pane=\\"#{pane_id}\\"', 'name=\\"%%\\"')),
+        "bind F ": ("/focus", ('window=\\"#{session_name}:#{window_index}\\"', "mode=toggle")),
+        "bind e ": ("/grid-expand", ('client=\\"#{client_tty}\\"',)),
+        "bind E ": ("/persona-engine", ('pane=\\"#{pane_id}\\"', "toggle=1")),
+        "bind M ": ("/mode-toggle", ('pane=\\"#{pane_id}\\"',)),
+        "bind d ": ("/shuttle", ('client=\\"#{client_tty}\\"',)),
+        "bind P ": ("/tts/listen", ('pane=\\"#{pane_id}\\"',)),
+        "bind B ": ("/send-ethereal", ('pane=\\"#{pane_id}\\"',)),
+        "bind S ": ("/session-doc/open", ('pane=\\"#{pane_id}\\"',)),
+        "bind g ": ("/tts/goto-spoken", ('client=\\"#{client_tty}\\"',)),
+    }
+
+    for prefix, (path, payload_parts) in expected.items():
+        line = _line_starting(prefix)
+        assert f"tmuxctld-ping POST {path}" in line
+        for payload in payload_parts:
+            assert payload in line
+        assert "tmux-run" not in line
+
+
+def test_only_workspace_launcher_remains_on_tmux_run_and_is_documented() -> None:
+    conf = CONF.read_text(encoding="utf-8")
+    active_tmux_run_lines = [
+        line
+        for line in conf.splitlines()
+        if line.lstrip().startswith(("bind ", "bind-", "set-hook ")) and "tmux-run" in line
+    ]
+    assert active_tmux_run_lines == ['bind W run-shell "tmux-run tx start"']
+    assert "# Workspace launcher. Deliberately left as the shell CLI" in conf
+    assert "out of scope for daemon keybind rebinding" in conf
