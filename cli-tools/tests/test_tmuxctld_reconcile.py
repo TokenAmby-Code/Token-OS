@@ -44,6 +44,12 @@ def _control(options=None) -> TmuxControlPlane:
     return TmuxControlPlane(adapter=FakeAdapter(options or {}))
 
 
+def test_pane_died_hook_targets_tmuxctld_event_route() -> None:
+    assert "POST /event" in daemon._PANE_DIED_HOOK
+    assert "event=pane-died" in daemon._PANE_DIED_HOOK
+    assert "pane=#{pane_id}" in daemon._PANE_DIED_HOOK
+
+
 def test_handle_event_ignores_unhandled_event_type() -> None:
     out = _control().handle_event("pane-focus-in", pane="council:custodes")
     assert out["action"] == "ignored"
