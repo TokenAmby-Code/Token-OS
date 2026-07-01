@@ -14,7 +14,6 @@ import logging
 import os
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
 import urllib.parse
@@ -536,20 +535,11 @@ async def _run_subprocess_offloop(
 
 
 async def _resolve_tmux_pane_direct(tmux_pane: str) -> str | None:
-    try:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_id}"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
-            timeout=1,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    pane_id = proc.stdout.decode(errors="ignore").strip()
-    return pane_id or None
+    stdout = await tmuxctld_stdout(
+        ("display-message", "-t", tmux_pane, "-p", "#{pane_id}"),
+        timeout=1,
+    )
+    return (stdout or "").strip() or None
 
 
 async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
@@ -564,28 +554,18 @@ async def resolve_tmux_pane_id(tmux_pane: str | None) -> str | None:
         pane_id = await _resolve_tmux_pane_direct(tmux_pane)
         _TMUX_PANE_RESOLVE_CACHE[tmux_pane] = (now, pane_id)
         return pane_id
-    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
-    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
-    try:
-        proc = await _run_subprocess_offloop(
-            (sys.executable, "-m", "tmuxctl.cli", "resolve-pane", tmux_pane),
-            env={
-                **os.environ,
-                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            },
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=3,
-        )
-        if proc.returncode == 0:
-            for line in proc.stdout.decode(errors="ignore").splitlines():
-                if line.startswith("pane_id: "):
-                    pane_id = line.split(": ", 1)[1].strip()
-                    if pane_id:
-                        _TMUX_PANE_RESOLVE_CACHE[tmux_pane] = (now, pane_id)
-                        return pane_id
-    except Exception:
-        pass
+    result = await asyncio.to_thread(
+        _tmuxctld_get_value,
+        "/resolve-pane",
+        {"target": tmux_pane, "format": "physical"},
+        timeout=3,
+        default_loopback=True,
+    )
+    if result is not None:
+        pane_id = str(result or "").strip()
+        if pane_id:
+            _TMUX_PANE_RESOLVE_CACHE[tmux_pane] = (now, pane_id)
+            return pane_id
     pane_id = await _resolve_tmux_pane_direct(tmux_pane)
     _TMUX_PANE_RESOLVE_CACHE[tmux_pane] = (now, pane_id)
     return pane_id
@@ -608,41 +588,34 @@ def apply_pane_tint(
 
     Event-driven — call this when an instance registers or changes persona
     (apply the colour) or vacates a pane (pass ``default`` to clear).
-    Synchronous (runs a tmux subprocess); async callers should wrap it in
+    Synchronous tmuxctld transport; async callers should wrap it in
     asyncio.to_thread.
     """
     if not tmux_pane:
         return
     bg = pane_tint or "default"
-    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
-    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
     try:
-        import sys
-
-        for lib in (cli_lib, tmuxctld_lib):
-            if str(lib) not in sys.path:
-                sys.path.insert(0, str(lib))
-        from tmuxctl.tmux_adapter import TmuxAdapter
-    except Exception as exc:  # tmuxctl unavailable (e.g. non-tmux host)
-        logger.warning("pane tint: tmuxctl adapter unavailable (%s)", exc)
-        return
-    try:
-        adapter = TmuxAdapter()
-        voice_locked = adapter.run(
-            "show-options",
-            "-pqv",
-            "-t",
-            tmux_pane,
-            "@DISCORD_VOICE_LOCK",
-            allow_failure=True,
-        ).strip()
+        voice = _tmuxctld_run_tmux(
+            ("show-options", "-pqv", "-t", tmux_pane, "@DISCORD_VOICE_LOCK"),
+            timeout=2,
+        )
+        voice_locked = str((voice or {}).get("stdout") or "").strip()
         if voice_locked == "1":
             return
-        # Tint is pane style, not focus.  Do not route this through
-        # `select-pane -P`: tmux selects the target pane and clears native zoom
-        # as a side effect, which matches live SessionStart/PostCompact focus
-        # snap reports during tint/assertion churn.
-        adapter.set_pane_tint(tmux_pane, bg)
+        style_args: list[tuple[str, ...]]
+        if not bg or bg == "default":
+            style_args = [
+                ("set-option", "-pu", "-t", tmux_pane, "window-style"),
+                ("set-option", "-pu", "-t", tmux_pane, "window-active-style"),
+            ]
+        else:
+            style = f"bg={bg}"
+            style_args = [
+                ("set-option", "-p", "-t", tmux_pane, "window-style", style),
+                ("set-option", "-p", "-t", tmux_pane, "window-active-style", style),
+            ]
+        for args in style_args:
+            _tmuxctld_run_tmux(args, timeout=2)
     except Exception as exc:
         logger.warning("pane tint failed for %s (bg=%s): %s", tmux_pane, bg, exc)
 
@@ -842,6 +815,32 @@ def _tmuxctld_get_json(
     return result if isinstance(result, dict) else None
 
 
+def _tmuxctld_get_value(
+    path: str,
+    params: dict[str, str],
+    *,
+    timeout: float = 0.5,
+    default_loopback: bool = False,
+) -> object | None:
+    """GET ``path`` from tmuxctld and return any ok result value."""
+
+    base = _tmuxctld_url(default_loopback=default_loopback)
+    if not base:
+        return None
+    query = urllib.parse.urlencode(params)
+    url = f"{base}{path}?{query}" if query else f"{base}{path}"
+    try:
+        with _TMUXCTLD_OPENER.open(url, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            payload = json.loads(resp.read().decode(errors="ignore") or "{}")
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return None
+    return payload.get("result")
+
+
 def _tmuxctld_post_json(
     path: str, body: dict, *, timeout: float = 10.0, default_loopback: bool = False
 ) -> dict | None:
@@ -870,6 +869,61 @@ def _tmuxctld_post_json(
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _tmuxctld_run_tmux(
+    args: list[str] | tuple[str, ...],
+    *,
+    timeout: float = 5.0,
+    default_loopback: bool = True,
+) -> dict | None:
+    """Run an allowlisted tmux argv through tmuxctld's loopback transport.
+
+    Token-API must not shell out to tmux directly.  This helper uses the existing
+    tmuxctld JSON client; the daemon owns the real TmuxAdapter call and rejects
+    non-allowlisted operations.
+    """
+
+    envelope = _tmuxctld_post_json(
+        "/tmux/run",
+        {"args": [str(arg) for arg in args]},
+        timeout=timeout,
+        default_loopback=default_loopback,
+    )
+    if not isinstance(envelope, dict) or not envelope.get("ok"):
+        return None
+    result = envelope.get("result")
+    return result if isinstance(result, dict) else None
+
+
+async def tmuxctld_run_tmux(
+    args: list[str] | tuple[str, ...],
+    *,
+    timeout: float = 5.0,
+    default_loopback: bool = True,
+) -> dict | None:
+    return await asyncio.to_thread(
+        _tmuxctld_run_tmux,
+        args,
+        timeout=timeout,
+        default_loopback=default_loopback,
+    )
+
+
+async def tmuxctld_stdout(
+    args: list[str] | tuple[str, ...],
+    *,
+    timeout: float = 5.0,
+    default_loopback: bool = True,
+) -> str | None:
+    result = await tmuxctld_run_tmux(
+        args,
+        timeout=timeout,
+        default_loopback=default_loopback,
+    )
+    if result is None:
+        return None
+    return str(result.get("stdout") or "")
 
 
 async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, str | None]:
@@ -905,44 +959,7 @@ async def resolve_instance_pane(instance_id: str | None) -> tuple[str | None, st
         pane_id = (result.get("pane_id") or "").strip() or None
         role = (result.get("pane_role") or "").strip() or None
         return (pane_id, role)
-    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
-    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
-    try:
-        # sys.executable, never bare "python3": on the live host "python3" resolves
-        # to the uv shim, which re-syncs token-api's venv on every spawn and fails
-        # closed (no stdout) on a corrupt venv — null panes for every row. tmuxctl's
-        # CLI is stdlib-only, so the running interpreter runs it directly via PYTHONPATH.
-        proc = await _run_subprocess_offloop(
-            (
-                sys.executable,
-                "-m",
-                "tmuxctl.cli",
-                "resolve-instance",
-                instance_id,
-                "--format",
-                "json",
-            ),
-            env={
-                **os.environ,
-                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            },
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=3,
-        )
-    except Exception:
-        return (None, None)
-    # Exit 1 is the not-found sentinel; --format json still prints the payload on
-    # both exit codes, so parse stdout regardless and trust the `found` flag.
-    try:
-        payload = json.loads(proc.stdout.decode(errors="ignore").strip() or "{}")
-    except (ValueError, json.JSONDecodeError):
-        return (None, None)
-    if not payload.get("found"):
-        return (None, None)
-    pane_id = (payload.get("pane_id") or "").strip() or None
-    role = (payload.get("pane_role") or "").strip() or None
-    return (pane_id, role)
+    return (None, None)
 
 
 async def instance_id_for_pane(pane: str | None) -> str | None:
@@ -958,10 +975,8 @@ async def instance_id_for_pane(pane: str | None) -> str | None:
     """
     if not (pane or "").strip():
         return None
-    # Fast path: prefer the launchd-supervised tmuxctld loopback daemon. A
-    # reachable daemon's /tmux/instance-id-for-pane result is authoritative
-    # (empty stamp -> None); only fall through to the tmux subprocess when the
-    # daemon is absent.
+    # tmuxctld is the only tmux boundary. A miss, absent daemon, or empty stamp
+    # fails closed to None.
     result = await asyncio.to_thread(
         _tmuxctld_get_json,
         "/tmux/instance-id-for-pane",
@@ -971,19 +986,7 @@ async def instance_id_for_pane(pane: str | None) -> str | None:
     )
     if result is not None:
         return (result.get("instance_id") or "").strip() or None
-    try:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "show-options", "-pv", "-t", pane, "@INSTANCE_ID"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=3,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    value = proc.stdout.decode(errors="ignore").strip() if proc.stdout else ""
-    return value or None
+    return None
 
 
 # Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)

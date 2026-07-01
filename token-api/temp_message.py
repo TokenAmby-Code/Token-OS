@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import re
-import subprocess
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
@@ -14,6 +12,7 @@ from typing import Any
 
 import aiosqlite
 
+import shared
 from shared import DB_PATH
 
 TEMP_MESSAGE_SOURCE = "temp_message"
@@ -167,27 +166,19 @@ def _split_session_window(value: str | None) -> tuple[str | None, str | None]:
 
 
 async def _read_tmux_panes() -> dict[str, dict[str, str]]:
-    try:
-        proc = await asyncio.to_thread(
-            subprocess.run,
-            [
-                "tmux",
-                "list-panes",
-                "-a",
-                "-F",
-                "#{pane_id}|#{session_name}|#{window_name}|#{@INSTANCE_ID}|#{@PANE_ID}",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return {}
-    if proc.returncode != 0:
+    stdout = await shared.tmuxctld_stdout(
+        (
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}|#{session_name}|#{window_name}|#{@INSTANCE_ID}|#{@PANE_ID}",
+        ),
+        timeout=5,
+    )
+    if stdout is None:
         return {}
     panes: dict[str, dict[str, str]] = {}
-    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+    for line in stdout.splitlines():
         parts = line.split("|", 4)
         if len(parts) != 5:
             continue

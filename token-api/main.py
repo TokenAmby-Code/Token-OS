@@ -316,8 +316,6 @@ import traceback
 sys.path.insert(0, str(SCRIPTS_DIR / "cli-tools" / "lib"))
 sys.path.insert(0, str(SCRIPTS_DIR / "tmuxctld" / "lib"))
 from imperium_config import cfg
-from tmuxctl.focus_guard import preserve_focus as _tmuxctl_preserve_focus
-from tmuxctl.tmux_adapter import TmuxAdapter as _TmuxCtlAdapter
 
 LOCAL_DEVICE_NAME = cfg("device_name")  # "Mac-Mini" on mac, "TokenPC" on wsl, etc.
 
@@ -421,6 +419,22 @@ async def _tmuxctl_send_text_fallback(
     submit: bool,
 ) -> dict:
     """Cold ``tmuxctl send-text`` fallback for Token-API's daemon send facade."""
+    logger.error(
+        "410 retired raw-tmux fallback touched: tmuxctl send-text fallback is disabled; "
+        "Token-API must use tmuxctld /send-text only"
+    )
+    return {
+        "returncode": 410,
+        "stdout": "",
+        "stderr": "410 retired raw-tmux fallback: tmuxctl send-text fallback is disabled",
+        "operation": "tmuxctl.send_text_fallback_retired",
+        "failed_operation": ["tmuxctld", "send-text"],
+        "gated": False,
+        "pane": tmux_pane,
+        "instance_id": None,
+        "retired": True,
+    }
+
     operation = "tmuxctl.send_text_fallback"
     if clear_prompt and not submit:
         return {
@@ -958,18 +972,13 @@ def _run_tmux_focus_preserved(
     attempted_target: str = "",
     allow_failure: bool = True,
 ) -> str:
-    """Run a tmux operation from Token-API without leaving the client focused elsewhere."""
+    """Run a tmux operation through tmuxctld."""
     argv = tuple(args)
     if not argv:
         return ""
     tmux_args = argv[1:] if Path(argv[0]).name == "tmux" else argv
-    adapter = _TmuxCtlAdapter()
-    with _tmuxctl_preserve_focus(
-        adapter,
-        source=source,
-        attempted_target=attempted_target,
-    ):
-        return adapter.run(*tmux_args, allow_failure=allow_failure)
+    result = shared._tmuxctld_run_tmux(tmux_args, timeout=5)
+    return str((result or {}).get("stdout") or "")
 
 
 def log_crash(exc_type, exc_value, exc_tb, context: str = "unhandled"):
@@ -1790,26 +1799,20 @@ async def _live_agent_panes() -> list[dict]:
     instances ``pane_label`` column). Fails closed: returns ``[]`` on any tmux
     error so a transient hiccup never reaps or churns the fleet.
     """
-    try:
-        proc = await _run_subprocess_offloop(
-            (
-                "tmux",
-                "list-panes",
-                "-a",
-                "-F",
-                "#{pane_id}\t#{pane_pid}\t#{@INSTANCE_ID}\t#{@PANE_LABEL}\t#{@PANE_ID}\t#{pane_current_command}",
-            ),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
-        )
-        if proc.returncode != 0 or not proc.stdout:
-            return []
-    except Exception:
+    stdout = await shared.tmuxctld_stdout(
+        (
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{pane_pid}\t#{@INSTANCE_ID}\t#{@PANE_LABEL}\t#{@PANE_ID}\t#{pane_current_command}",
+        ),
+        timeout=5,
+    )
+    if not stdout:
         return []
 
     raw: list[dict] = []
-    for line in proc.stdout.decode(errors="replace").splitlines():
+    for line in stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 6:
             parts += [""] * (6 - len(parts))
@@ -4129,15 +4132,11 @@ async def _tmux_pane_pid(tmux_pane: str | None) -> int | None:
     if not tmux_pane:
         return None
     try:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_pid}"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        stdout = await shared.tmuxctld_stdout(
+            ("display-message", "-t", tmux_pane, "-p", "#{pane_pid}"),
             timeout=5,
         )
-        if proc.returncode != 0:
-            return None
-        raw = proc.stdout.decode().strip()
+        raw = (stdout or "").strip()
         return int(raw) if raw else None
     except Exception:
         return None
@@ -4198,15 +4197,11 @@ async def _tmux_pane_current_command(tmux_pane: str | None) -> str:
     if not tmux_pane:
         return ""
     try:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_current_command}"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        stdout = await shared.tmuxctld_stdout(
+            ("display-message", "-t", tmux_pane, "-p", "#{pane_current_command}"),
             timeout=5,
         )
-        if proc.returncode != 0:
-            return ""
-        return proc.stdout.decode(errors="replace").strip()
+        return (stdout or "").strip()
     except Exception:
         return ""
 
@@ -4595,10 +4590,8 @@ async def _gt_push_fire(instance_id: str, fire_at_epoch: int) -> None:
     if not pane:
         return
     try:
-        await _run_subprocess_offloop(
-            ("tmux", "set-option", "-p", "-t", pane, "@GT_FIRE", str(fire_at_epoch)),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        await shared.tmuxctld_run_tmux(
+            ("set-option", "-p", "-t", pane, "@GT_FIRE", str(fire_at_epoch)),
             timeout=2,
         )
     except Exception as exc:
@@ -4616,10 +4609,8 @@ async def _gt_clear_fire(instance_id: str) -> None:
     if not pane:
         return
     try:
-        await _run_subprocess_offloop(
-            ("tmux", "set-option", "-p", "-u", "-t", pane, "@GT_FIRE"),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        await shared.tmuxctld_run_tmux(
+            ("set-option", "-p", "-u", "-t", pane, "@GT_FIRE"),
             timeout=2,
         )
     except Exception as exc:
@@ -4717,10 +4708,8 @@ async def _timer_push_segment(segment: str) -> None:
     is a singleton. Best-effort, never raises — no tmux server just no-ops.
     """
     try:
-        await _run_subprocess_offloop(
-            ("tmux", "set-option", "-g", "@TIMER_SEG", segment),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        await shared.tmuxctld_run_tmux(
+            ("set-option", "-g", "@TIMER_SEG", segment),
             timeout=2,
         )
     except Exception as exc:
@@ -5702,16 +5691,13 @@ def _pane_input_line_has_text(line: str) -> bool:
 
 async def _tmux_pane_has_pending_input(tmux_pane: str) -> bool:
     """Server-owned typing guard for automated pane writes."""
-    proc = await _run_subprocess_offloop(
-        ("tmux", "capture-pane", "-t", tmux_pane, "-p"),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
+    stdout = await shared.tmuxctld_stdout(
+        ("capture-pane", "-t", tmux_pane, "-p"),
         timeout=5,
     )
-    if proc.returncode != 0:
+    if stdout is None:
         return False
-    lines = [line for line in proc.stdout.decode(errors="replace").splitlines() if line.strip()]
+    lines = [line for line in stdout.splitlines() if line.strip()]
     if not lines:
         return False
     return _pane_input_line_has_text(lines[-1])
@@ -6249,28 +6235,20 @@ async def _tmux_pane_rows() -> list[tuple[str, str, str, str, str]]:
 
 
 def _tmux_pane_rows_sync() -> list[tuple[str, str, str, str, str]]:
-    try:
-        result = subprocess.run(
-            [
-                "tmux",
-                "list-panes",
-                "-a",
-                "-F",
-                "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}\t#{pane_tty}",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        if result.returncode != 0:
-            return []
-    except Exception:
+    result = shared._tmuxctld_run_tmux(
+        (
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}\t#{pane_tty}",
+        ),
+        timeout=3,
+    )
+    if result is None:
         return []
 
     rows = []
-    for line in result.stdout.splitlines():
+    for line in str(result.get("stdout") or "").splitlines():
         parts = line.split("\t")
         if len(parts) < 4:
             continue
@@ -6347,41 +6325,11 @@ def _pane_is_agent_from_snapshot(
 def _resolve_tmux_pane_id_sync(tmux_pane: str | None) -> str | None:
     if not tmux_pane:
         return None
-    cli_bin = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmux-resolve-pane"
-    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
-    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
-    try:
-        result = subprocess.run(
-            [str(cli_bin), "--format", "id", tmux_pane],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=3,
-            check=False,
-            env={
-                **os.environ,
-                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            },
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_id}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=1,
-            check=False,
-            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
-        )
-        if result.returncode != 0:
-            return None
-        return result.stdout.strip() or None
-    except Exception:
-        return None
+    result = shared._tmuxctld_run_tmux(
+        ("display-message", "-t", tmux_pane, "-p", "#{pane_id}"),
+        timeout=3,
+    )
+    return str((result or {}).get("stdout") or "").strip() or None
 
 
 async def _resolve_tmux_pane_id_for_read_model(tmux_pane: str | None) -> str | None:
@@ -7730,20 +7678,11 @@ async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
 def _tmux_pane_label_sync(tmux_pane: str | None) -> str | None:
     if not tmux_pane:
         return None
-    try:
-        result = subprocess.run(
-            ["tmux", "show-options", "-pv", "-t", tmux_pane, "@PANE_ID"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        if result.returncode == 0:
-            label = result.stdout.strip()
-            return label or None
-    except Exception as exc:
-        logger.debug(f"Golden Throne: pane label lookup failed for {tmux_pane}: {exc}")
-    return None
+    result = shared._tmuxctld_run_tmux(
+        ("show-options", "-pv", "-t", tmux_pane, "@PANE_ID"),
+        timeout=3,
+    )
+    return str((result or {}).get("stdout") or "").strip() or None
 
 
 _PANE_LABEL_REPAIR_TASK: asyncio.Task | None = None
@@ -8041,26 +7980,20 @@ async def _get_or_create_mechanicus_pane() -> str:
     ``mechanicus`` worker stack, so autonomous resume panes file in behind the
     Fabricator-General/orchestrator anchors as flat workers.
     """
-    tmuxctl = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
-    proc = await asyncio.create_subprocess_exec(
-        str(tmuxctl),
-        "stack",
-        "add",
-        "mechanicus",
-        "--session",
-        "main",
-        "--cwd",
-        str(Path.home()),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    envelope = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/stack/add",
+        {"base": "mechanicus", "session": "main", "cwd": str(Path.home())},
+        timeout=10,
+        default_loopback=True,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"failed to allocate managed mechanicus worker pane: "
-            f"{stderr.decode(errors='replace').strip()}"
-        )
-    pane_id = stdout.decode().strip().splitlines()[0] if stdout.decode().strip() else ""
+    if not isinstance(envelope, dict) or not envelope.get("ok"):
+        raise RuntimeError(f"failed to allocate managed mechanicus worker pane: {envelope}")
+    result = envelope.get("result")
+    if isinstance(result, dict):
+        pane_id = str(result.get("pane_id") or result.get("pane") or "").strip()
+    else:
+        pane_id = str(result or "").strip().splitlines()[0] if str(result or "").strip() else ""
     if not pane_id:
         raise RuntimeError("managed mechanicus worker allocation returned empty pane id")
     logger.info(f"Golden Throne: allocated managed mechanicus worker pane {pane_id}")
@@ -8649,21 +8582,14 @@ async def golden_throne_followup(session_id: str):
         # Local delivery — transport detection per Golden Throne spec:
         # Check pane_current_command to decide live tmuxctld delivery vs dispatch resume.
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "tmux",
-                "display-message",
-                "-t",
-                tmux_pane,
-                "-p",
-                "#{pane_current_command}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            stdout = await shared.tmuxctld_stdout(
+                ("display-message", "-t", tmux_pane, "-p", "#{pane_current_command}"),
+                timeout=5,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-            current_cmd = stdout.decode().strip() if proc.returncode == 0 else ""
-            dispatch_details["pane_current_command_returncode"] = proc.returncode
-            dispatch_details["pane_current_command_stdout"] = _snippet(stdout)
-            dispatch_details["pane_current_command_stderr"] = _snippet(stderr)
+            current_cmd = (stdout or "").strip()
+            dispatch_details["pane_current_command_returncode"] = 0 if stdout is not None else 1
+            dispatch_details["pane_current_command_stdout"] = _snippet((stdout or "").encode())
+            dispatch_details["pane_current_command_stderr"] = ""
         except Exception as exc:
             current_cmd = ""
             dispatch_details["pane_current_command_error"] = str(exc)
@@ -9114,20 +9040,11 @@ def _typing_guard_active() -> bool:
     consults, so the flusher's notion of "typing stopped" matches the gate's.
     Fail-open: if tmux is unreachable or reports nothing, returns False.
     """
-    try:
-        proc = subprocess.run(
-            ["tmux", "display-message", "-p", "#{client_activity}"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=1,
-        )
-    except Exception:
-        return False
-    if proc.returncode != 0:
-        return False
-    value = proc.stdout.strip()
+    result = shared._tmuxctld_run_tmux(
+        ("display-message", "-p", "#{client_activity}"),
+        timeout=1,
+    )
+    value = str((result or {}).get("stdout") or "").strip()
     if not value:
         return False
     try:
@@ -9669,27 +9586,16 @@ async def _find_custodes_tmux_pane() -> str | None:
     recovery on color creates a circular SoT dependency
     where a missed recolor makes Custodes "disappear" to the dispatcher.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-    except Exception as exc:
-        logger.warning(f"Custodes state hook: tmux pane recovery failed: {exc}")
-        return None
-
-    if proc.returncode != 0:
+    stdout = await shared.tmuxctld_stdout(
+        ("list-panes", "-a", "-F", "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}"),
+        timeout=5,
+    )
+    if stdout is None:
         return None
 
     candidates: list[str] = []
     marker_fallbacks: list[str] = []
-    for line in stdout.decode().splitlines():
+    for line in stdout.splitlines():
         try:
             pane_id, pane_marker, current_cmd = line.split("\t", 2)
         except ValueError:
@@ -9712,28 +9618,24 @@ async def _find_custodes_tmux_pane() -> str | None:
 
 
 async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
-    tmuxctl_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "tmuxctl"
-
     async def _run_assert() -> tuple[dict, str]:
-        proc = await asyncio.create_subprocess_exec(
-            str(tmuxctl_bin),
-            "assert-instance",
-            "--pane",
-            "council:custodes",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        envelope = await asyncio.to_thread(
+            shared._tmuxctld_post_json,
+            "/assert-instance",
+            {"pane": "council:custodes"},
+            timeout=45,
+            default_loopback=True,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
-        raw = stdout.decode().strip()
-        try:
-            result = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            result = {
+        if not isinstance(envelope, dict):
+            return {"ok": False, "reason": "tmuxctld_assert_unavailable"}, ""
+        if not envelope.get("ok"):
+            err = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
+            return {
                 "ok": False,
-                "reason": f"bad_assert_output rc={proc.returncode}",
-                "raw": raw[:200],
-            }
-        return result, stderr.decode()
+                "reason": err.get("message") or err.get("code") or "assert_failed",
+            }, str(err)
+        result = envelope.get("result")
+        return (result if isinstance(result, dict) else {}), ""
 
     result, stderr = await _run_assert()
     if result.get("action") in {"launched", "persona_correction_sent"}:
@@ -9998,25 +9900,19 @@ ADMINISTRATUM_PANE_MARKER = "council:administratum"
 
 async def _find_administratum_tmux_pane() -> str | None:
     """Recover the live Administratum pane from tmux (@PANE_ID = council:administratum)."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
+    stdout = await shared.tmuxctld_stdout(
+        (
             "list-panes",
             "-a",
             "-F",
             "#{pane_id}\t#{@PANE_ID}\t#{pane_current_command}\t#{@TOKEN_API_ENGINE}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-    except Exception as exc:
-        logger.warning(f"Administratum record: tmux pane recovery failed: {exc}")
+        ),
+        timeout=5,
+    )
+    if stdout is None:
         return None
 
-    if proc.returncode != 0:
-        return None
-
-    for line in stdout.decode().splitlines():
+    for line in stdout.splitlines():
         try:
             pane_id, pane_marker, current_cmd, runtime_engine = line.split("\t", 3)
         except ValueError:
@@ -12884,18 +12780,11 @@ async def _resolve_instance_pane(instance_id: str) -> str | None:
 
 async def _tmux_pane_pipe_active(tmux_pane: str) -> bool:
     """Return True when the pane currently has an open ``pipe-pane`` sink."""
-    try:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_pipe}"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=5,
-        )
-        if proc.returncode != 0:
-            return False
-        return proc.stdout.decode(errors="replace").strip() == "1"
-    except Exception:
-        return False
+    stdout = await shared.tmuxctld_stdout(
+        ("display-message", "-t", tmux_pane, "-p", "#{pane_pipe}"),
+        timeout=5,
+    )
+    return (stdout or "").strip() == "1"
 
 
 @app.post("/api/panes/{instance_id}/tap")
@@ -12922,14 +12811,12 @@ async def arm_pane_tap(instance_id: str):
     already_armed = await _tmux_pane_pipe_active(tmux_pane)
     if not already_armed:
         command = f"cat >> {shlex.quote(str(log_path))}"
-        proc = await _run_subprocess_offloop(
-            ("tmux", "pipe-pane", "-o", "-t", tmux_pane, command),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await shared.tmuxctld_run_tmux(
+            ("pipe-pane", "-o", "-t", tmux_pane, command),
             timeout=5,
         )
-        if proc.returncode != 0:
-            detail = proc.stderr.decode(errors="replace").strip() or "pipe-pane failed"
+        if result is None:
+            detail = "pipe-pane failed"
             raise HTTPException(status_code=500, detail=f"failed to arm tap: {detail}")
 
     armed = await _tmux_pane_pipe_active(tmux_pane)
@@ -12954,13 +12841,11 @@ async def disarm_pane_tap(instance_id: str):
     if tmux_pane:
         panes = await _read_tmux_panes()
         if panes and tmux_pane in panes and await _tmux_pane_pipe_active(tmux_pane):
-            proc = await _run_subprocess_offloop(
-                ("tmux", "pipe-pane", "-t", tmux_pane),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            result = await shared.tmuxctld_run_tmux(
+                ("pipe-pane", "-t", tmux_pane),
                 timeout=5,
             )
-            disarmed = proc.returncode == 0
+            disarmed = result is not None
 
     log_path = PANE_TAP_DIR / f"{instance_id}.log"
     log_deleted = log_path.exists()
@@ -13017,36 +12902,16 @@ async def _pane_live_agent_engine(tmux_pane: str | None) -> str | None:
     pane = await shared.resolve_tmux_pane_id(tmux_pane)
     if not pane:
         return None
-    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
-    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
-    try:
-        proc = await _run_subprocess_offloop(
-            (
-                sys.executable,
-                "-m",
-                "tmuxctl.cli",
-                "resolve-agent",
-                "--pane",
-                pane,
-                "--agent",
-                "auto",
-                "--default",
-                "auto",
-            ),
-            env={
-                **os.environ,
-                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            },
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=3,
-        )
-        if proc.returncode == 0:
-            engine = proc.stdout.decode(errors="ignore").strip().lower()
-            if engine in {"claude", "codex"}:
-                return engine
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("tmuxctl resolve-agent probe failed for pane %s: %s", pane, exc)
+    result = await asyncio.to_thread(
+        shared._tmuxctld_get_value,
+        "/resolve-agent",
+        {"pane": pane, "agent": "auto", "default": "auto"},
+        timeout=3,
+        default_loopback=True,
+    )
+    engine = str(result or "").strip().lower()
+    if engine in {"claude", "codex"}:
+        return engine
     for row_pane, command, cwd, window, tty in await _tmux_pane_rows():
         if row_pane != pane:
             continue
@@ -21908,9 +21773,8 @@ async def process_pane_state_queue_once() -> list[dict]:
                 continue
             status = "applied"
             try:
-                await _run_subprocess_offloop(
+                result = await shared.tmuxctld_run_tmux(
                     (
-                        "tmux",
                         "set-option",
                         "-p",
                         "-t",
@@ -21918,10 +21782,10 @@ async def process_pane_state_queue_once() -> list[dict]:
                         row["variable"],
                         row["value"],
                     ),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
                     timeout=5,
                 )
+                if result is None:
+                    status = "failed"
                 logger.info(
                     f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
                 )
@@ -21980,25 +21844,19 @@ async def _read_tmux_panes() -> dict[str, dict] | None:
     Returns ``None`` when tmux itself is unreachable (don't reconcile a blind cycle).
     Returns ``{}`` when tmux is alive but has zero panes.
     """
-    try:
-        proc = await _run_subprocess_offloop(
-            (
-                "tmux",
-                "list-panes",
-                "-a",
-                "-F",
-                "#{pane_id}|#{@PANE_ID}|#{session_name}:#{window_name}|#{pane_current_command}|#{pane_title}",
-            ),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=5,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
+    stdout = await shared.tmuxctld_stdout(
+        (
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}|#{@PANE_ID}|#{session_name}:#{window_name}|#{pane_current_command}|#{pane_title}",
+        ),
+        timeout=5,
+    )
+    if stdout is None:
         return None
     panes: dict[str, dict] = {}
-    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+    for line in stdout.splitlines():
         parts = line.split("|", 4)
         if len(parts) < 5:
             continue
@@ -23421,25 +23279,17 @@ async def _resolve_selected_tmux_pane() -> str | None:
     selected in the human's most recently active attached client.
     """
     try:
-        clients = await asyncio.create_subprocess_exec(
-            "tmux",
-            "list-clients",
-            "-F",
-            "#{client_activity}\t#{client_name}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        clients_stdout = await shared.tmuxctld_stdout(
+            ("list-clients", "-F", "#{client_activity}\t#{client_name}"),
+            timeout=5,
         )
-        clients_stdout, clients_stderr = await asyncio.wait_for(clients.communicate(), timeout=5)
-        if clients.returncode != 0:
-            logger.warning(
-                "Discord active-pane injection: tmux client resolve failed: "
-                f"{clients_stderr.decode().strip()[:200]}"
-            )
+        if clients_stdout is None:
+            logger.warning("Discord active-pane injection: tmux client resolve failed")
             return None
 
         selected_client = None
         selected_activity = -1
-        for line in clients_stdout.decode().splitlines():
+        for line in clients_stdout.splitlines():
             try:
                 raw_activity, client_name = line.split("\t", 1)
                 activity = int(raw_activity or "0")
@@ -23453,39 +23303,24 @@ async def _resolve_selected_tmux_pane() -> str | None:
             logger.warning("Discord active-pane injection: no attached tmux client found")
             return None
 
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "display-message",
-            "-c",
-            selected_client,
-            "-p",
-            "#{pane_id}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        stdout = await shared.tmuxctld_stdout(
+            ("display-message", "-c", selected_client, "-p", "#{pane_id}"),
+            timeout=5,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode != 0:
-            logger.warning(
-                f"Discord active-pane injection: tmux selected-pane resolve failed: {stderr.decode().strip()[:200]}"
-            )
+        if stdout is None:
+            logger.warning("Discord active-pane injection: tmux selected-pane resolve failed")
             return None
-        pane = stdout.decode().strip()
+        pane = stdout.strip()
         if not pane.startswith("%"):
             logger.warning(f"Discord active-pane injection: invalid selected pane {pane!r}")
             return None
 
         # Verify the pane still exists before writing to it.
-        check = await asyncio.create_subprocess_exec(
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_id}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        check_stdout = await shared.tmuxctld_stdout(
+            ("list-panes", "-a", "-F", "#{pane_id}"),
+            timeout=5,
         )
-        check_stdout, _ = await asyncio.wait_for(check.communicate(), timeout=5)
-        if pane not in set(check_stdout.decode().splitlines()):
+        if pane not in set((check_stdout or "").splitlines()):
             logger.warning(f"Discord active-pane injection: selected pane {pane} is not alive")
             return None
         logger.info(f"Discord active-pane injection: selected client {selected_client} pane {pane}")
@@ -23601,10 +23436,8 @@ async def _discord_voice_error_message(bot: str, error_msg: str):
 async def _try_discord_active_pane_injection(message) -> bool:
     """Inject a Discord voice transcript into the pane locked for this utterance.
 
-    Explicit exception to the prompt/skill/command convergence: voice no-submit
-    and append-submit modes are draft-editing controls, not ordinary prompt
-    sends. They stay on tmux-dictate/raw Enter until the tmuxctld voice-session
-    API is wired to this legacy Discord path.
+    Voice no-submit and append-submit modes are draft-editing controls, not
+    ordinary prompt sends, but bytes still route through tmuxctld.
 
     The Discord daemon captures target_tmux_pane at speech start (or, failing
     that, at the silence/commit edge) so click-away during transcription does
@@ -23629,53 +23462,33 @@ async def _try_discord_active_pane_injection(message) -> bool:
     formatted = _format_discord_injection("imperial_guard", message.content or "")
 
     try:
-        tmux_dictate = SCRIPTS_DIR / "cli-tools" / "bin" / "tmux-dictate"
-        dictate_args = [str(tmux_dictate), "-t", pane]
-        if not getattr(message, "voice_no_submit", False) and not getattr(
-            message, "voice_append_submit", False
-        ):
-            dictate_args.append("--submit")
         if getattr(message, "voice_append_submit", False):
             # A pooled short utterance is already sitting in the prompt bar.
             # Append only the new speech, then submit the combined prompt.
             formatted = f" {message.content or ''}"
-        dictate_args.append(formatted)
-        proc = await asyncio.create_subprocess_exec(
-            *dictate_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={
-                **os.environ,
-                "PATH": ":".join(
-                    [
-                        str(SCRIPTS_DIR / "cli-tools" / "bin"),
-                        str(Path.home() / ".local" / "bin"),
-                        "/opt/homebrew/bin",
-                        "/usr/local/bin",
-                        os.environ.get("PATH", ""),
-                    ]
-                ),
-            },
+        submit = not getattr(message, "voice_no_submit", False) and not getattr(
+            message, "voice_append_submit", False
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        if proc.returncode == 0:
+        result = await asyncio.to_thread(
+            shared._tmuxctld_post_json,
+            "/send-text",
+            {"pane": pane, "text": formatted, "submit": submit, "verify": submit},
+            timeout=15,
+            default_loopback=True,
+        )
+        if isinstance(result, dict) and result.get("ok"):
             if getattr(message, "voice_append_submit", False):
-                enter = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "send-keys",
-                    "-t",
-                    pane,
-                    "Enter",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                await asyncio.to_thread(
+                    shared._tmuxctld_post_json,
+                    "/tmux/send-keys",
+                    {"pane": pane, "command": "Enter"},
+                    timeout=5,
+                    default_loopback=True,
                 )
-                await asyncio.wait_for(enter.communicate(), timeout=5)
             mode = "no-submit" if getattr(message, "voice_no_submit", False) else "submit"
             logger.info(f"Discord active-pane injection: imperial_guard → {pane} ({mode})")
             return True
-        logger.warning(
-            f"Discord active-pane injection failed for {pane} (rc={proc.returncode}): {stderr.decode()[:200]}"
-        )
+        logger.warning(f"Discord active-pane injection failed for {pane}: {result}")
         return False
     except TimeoutError:
         logger.warning(f"Discord active-pane injection timed out for {pane}")
@@ -23960,26 +23773,19 @@ async def _discord_voice_mute_member(bot: str, author_id: str) -> bool:
 
 
 async def _tmux_display_value(pane: str, fmt: str) -> str | None:
-    proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        "display-message",
-        "-p",
-        "-t",
-        pane,
-        fmt,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    stdout = await shared.tmuxctld_stdout(
+        ("display-message", "-p", "-t", pane, fmt),
+        timeout=5,
     )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-    if proc.returncode != 0:
+    if stdout is None:
         return None
-    return stdout.decode(errors="replace").rstrip("\n")
+    return stdout.rstrip("\n")
 
 
 async def _tmux_set_pane_title(pane: str, title: str) -> None:
     await asyncio.to_thread(
         _run_tmux_focus_preserved,
-        ("tmux", "select-pane", "-t", pane, "-T", title),
+        ("select-pane", "-t", pane, "-T", title),
         source="token-api pane-title",
         attempted_target=pane,
     )
@@ -24004,31 +23810,16 @@ async def _discord_voice_mark_title(bot: str, pane: str) -> str:
 
 async def _discord_voice_type(pane: str, text: str) -> bool:
     # Draft-editing exception: this mutates an in-progress voice draft rather than
-    # submitting a normal prompt. Do not route through send_prompt_to_pane.
-    tmux_dictate = SCRIPTS_DIR / "cli-tools" / "bin" / "tmux-dictate"
-    proc = await asyncio.create_subprocess_exec(
-        str(tmux_dictate),
-        "-t",
-        pane,
-        text,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={
-            **os.environ,
-            "PATH": ":".join(
-                [
-                    str(SCRIPTS_DIR / "cli-tools" / "bin"),
-                    str(Path.home() / ".local" / "bin"),
-                    "/opt/homebrew/bin",
-                    "/usr/local/bin",
-                    os.environ.get("PATH", ""),
-                ]
-            ),
-        },
+    # submitting a normal prompt. Route through tmuxctld insert-text.
+    result = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/insert-text",
+        {"pane": pane, "text": text},
+        timeout=15,
+        default_loopback=True,
     )
-    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-    if proc.returncode != 0:
-        logger.warning(f"Voice draft: tmux-dictate failed for {pane}: {stderr.decode()[:200]}")
+    if not isinstance(result, dict) or not result.get("ok"):
+        logger.warning(f"Voice draft: insert-text failed for {pane}: {result}")
         return False
     return True
 
@@ -24036,18 +23827,15 @@ async def _discord_voice_type(pane: str, text: str) -> bool:
 async def _discord_voice_send_key(pane: str, key: str) -> bool:
     # Draft-editing exception: ship/scratch are raw draft controls (Enter/C-c),
     # not prompt/skill/command submissions.
-    proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        "send-keys",
-        "-t",
-        pane,
-        key,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    result = await asyncio.to_thread(
+        shared._tmuxctld_post_json,
+        "/tmux/send-keys",
+        {"pane": pane, "command": key},
+        timeout=5,
+        default_loopback=True,
     )
-    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-    if proc.returncode != 0:
-        logger.warning(f"Voice draft: send-key {key} failed for {pane}: {stderr.decode()[:200]}")
+    if not isinstance(result, dict) or not result.get("ok"):
+        logger.warning(f"Voice draft: send-key {key} failed for {pane}: {result}")
         return False
     return True
 
