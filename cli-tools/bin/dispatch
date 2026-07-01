@@ -316,7 +316,7 @@ sql_literal() {
 ledger_resolve_field() {
   local query_key="$1" query_value="$2" field="$3"
   [[ -n "$query_value" ]] || return 0
-  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:8765}"
+  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
   TMUXCTLD_URL="$tmuxctld_url" QUERY_KEY="$query_key" QUERY_VALUE="$query_value" FIELD="$field" python3 - <<'PYLEDGER'
 import json
 import os
@@ -324,7 +324,7 @@ import sys
 import urllib.parse
 import urllib.request
 
-base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:8765").rstrip("/")
+base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:7778").rstrip("/")
 key = os.environ.get("QUERY_KEY", "")
 value = os.environ.get("QUERY_VALUE", "")
 field = os.environ.get("FIELD", "")
@@ -336,9 +336,13 @@ try:
         data = json.loads(resp.read().decode("utf-8"))
 except Exception:
     sys.exit(0)
-if not isinstance(data, dict) or not data.get("found"):
+if not isinstance(data, dict) or not data.get("ok"):
     sys.exit(0)
-value = data.get(field) or ""
+result = data.get("result") if isinstance(data.get("result"), dict) else {}
+if not result.get("found"):
+    sys.exit(0)
+row = result.get("row") if isinstance(result.get("row"), dict) else {}
+value = row.get(field) or result.get(field) or ""
 if value:
     print(str(value), end="")
 PYLEDGER
@@ -351,7 +355,7 @@ resolve_caller_instance_id() {
   row="$(ledger_resolve_field wrapper_id "${TOKEN_API_WRAPPER_ID:-${TOKEN_API_WRAPPER_LAUNCH_ID:-}}" instance_id || true)"
   [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
   if [[ -n "${TMUX_PANE:-}" ]]; then
-    row="$(ledger_resolve_field pane "$TMUX_PANE" instance_id || true)"
+    row="$(pane_instance_id "$TMUX_PANE" || true)"
     [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
   fi
   return 0
@@ -1877,6 +1881,27 @@ redact_tmux_panes_for_display() {
   LC_ALL=C sed -E 's/%[0-9]+/<tmux-pane>/g'
 }
 
+dispatch_send_text_via_tmuxctld() {
+  # The launcher's back half must dogfood the daemon resolver. Token-API still
+  # owns the registry/session/front-half work above; byte-bearing pane sends go
+  # through tmuxctld so canonical ids (palace:E, somnium:N, mechanicus:2, …) are
+  # resolved by the same oracle the rest of the fleet uses, not by raw tmux.
+  local pane="$1" text="$2" settle="${DISPATCH_TMUXCTLD_SUBMIT_SETTLE_SECONDS:-0.2}"
+  if ! command -v tmuxctld-ping >/dev/null 2>&1; then
+    err "tmuxctld-ping is required to send dispatch launch commands to $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
+    return 69
+  fi
+  if ! tmuxctld-ping POST /send-text \
+      pane="$pane" \
+      text="$text" \
+      submit=true \
+      verify=false \
+      submit_settle_seconds="$settle"; then
+    err "tmuxctld send failed for dispatch target $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
+    return 70
+  fi
+}
+
 stamp_resume_instance_id() {
   # On resume, stamp the allocated pane with the instance UUID immediately so
   # tmuxctl resolve-instance finds it before the agent re-registers — closing
@@ -1925,10 +1950,32 @@ dispatch_launch_observe_timeout() {
 
 pane_instance_id() {
   local pane="$1"
-  ledger_resolve_field pane "$pane" instance_id || true
+  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+  TMUXCTLD_URL="$tmuxctld_url" PANE="$pane" python3 - <<'PYINSTANCE'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:7778").rstrip("/")
+pane = os.environ.get("PANE", "")
+if not pane:
+    sys.exit(0)
+url = f"{base}/tmux/instance-id-for-pane?{urllib.parse.urlencode({'pane': pane})}"
+try:
+    with urllib.request.urlopen(url, timeout=1) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+except Exception:
+    sys.exit(0)
+result = data.get("result") if isinstance(data, dict) else {}
+value = result.get("instance_id") if isinstance(result, dict) else ""
+if value:
+    print(str(value), end="")
+PYINSTANCE
 }
 
-clear_pane_wrapper_id() {
+clear_pane_wrapper_launch_id() {
   local pane="$1"
   command -v tmux >/dev/null 2>&1 || return 0
   tmux set-option -pu -t "$pane" @TOKEN_API_WRAPPER_ID >/dev/null 2>&1 || true
@@ -1974,18 +2021,20 @@ reconcile_dispatch_registry_bind() {
   # singleton-undercount path, never bind at all. A single best-effort check: if
   # the row is already live, stay silent; otherwise emit an ADVISORY "registration
   # slow" warning and return success regardless. Never fails the launch.
-  local pane="$1" target_display="$2" instance_id row status row_workdir
+  local pane="$1" target_display="$2" instance_id row status row_workdir row_label expected_label
   command -v sqlite3 >/dev/null 2>&1 || return 0
   [[ -f "$DB_PATH" ]] || return 0
   instance_id="$(pane_instance_id "$pane")"
   if [[ -n "$instance_id" ]]; then
     row="$(sqlite3 -separator $'\t' "$DB_PATH" \
-      "SELECT COALESCE(status,''), COALESCE(working_dir,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
+      "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
       2>/dev/null || true)"
     if [[ -n "$row" ]]; then
-      IFS=$'\t' read -r status row_workdir <<< "$row"
+      IFS=$'\t' read -r status row_workdir row_label <<< "$row"
+      expected_label="$(resolve_pane_label_for_env "$pane")"
       if [[ "$status" != "stopped" && "$status" != "archived" ]] \
-        && { [[ -n "$RESUME_ID" ]] || [[ "$row_workdir" == "$WORK_DIR" ]]; }; then
+        && { [[ -n "$RESUME_ID" ]] || [[ "$row_workdir" == "$WORK_DIR" ]]; } \
+        && { [[ -z "$expected_label" ]] || [[ -n "$row_label" ]]; }; then
         return 0
       fi
     fi
@@ -2175,8 +2224,8 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   phys_pane="$(materialize_physical_pane "$pane_id")"
-  clear_pane_wrapper_id "$phys_pane"
-  tmux send-keys -t "$phys_pane" "$STAGED_COMMAND" Enter
+  clear_pane_wrapper_launch_id "$phys_pane"
+  dispatch_send_text_via_tmuxctld "$pane_id" "$STAGED_COMMAND" || exit $?
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
   # Success = pane up + live agent process (liveness), NOT a DB-row bind clock.
@@ -2201,11 +2250,11 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   assert_dispatch_target_unoccupied "$RESOLVED_TARGET"
   stamp_resume_instance_id "$RESOLVED_TARGET"
   PHYSICAL_TARGET="$(materialize_physical_pane "$RESOLVED_TARGET")"
-  tmux send-keys -t "$PHYSICAL_TARGET" "clear" Enter
+  dispatch_send_text_via_tmuxctld "$RESOLVED_TARGET" "clear" || exit $?
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
-  clear_pane_wrapper_id "$PHYSICAL_TARGET"
-  tmux send-keys -t "$PHYSICAL_TARGET" "$STAGED_COMMAND" Enter
+  clear_pane_wrapper_launch_id "$PHYSICAL_TARGET"
+  dispatch_send_text_via_tmuxctld "$RESOLVED_TARGET" "$STAGED_COMMAND" || exit $?
   target_display="${RESOLVED_TARGET:-$TARGET}"
   if [[ "$TARGET" == %* ]]; then
     if command -v pane_id_of >/dev/null 2>&1; then

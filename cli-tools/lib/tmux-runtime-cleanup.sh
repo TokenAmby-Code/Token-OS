@@ -33,12 +33,13 @@ tmux_runtime_cleanup_pane() {
         @GT_FIRE \
         @PLANNING_STATE \
         @PLANNING_AGENT \
-        @TYPING_LOCK_UNTIL \
-        @TYPING_PENDING_UNTIL \
-        @TYPING_AGENT_UNTIL \
-        @GUARD \
+        @TYPING_GUARD_JSON \
+        @TYPING_GUARD_UNTIL \
+        @TYPING_GUARD_KIND \
+        @TYPING_GUARD_MARKER \
         @DISCORD_VOICE_LOCK \
         @DISCORD_VOICE_PROCESSING \
+        @TOKEN_API_WRAPPER_ID \
         @TOKEN_API_WRAPPER_LAUNCH_ID \
         @TOKEN_API_ENGINE \
         @TOKEN_API_LAUNCHER \
@@ -64,6 +65,7 @@ tmux_runtime_stamp_wrapper() {
     local pane="${1:-}" wrapper_launch_id="${2:-}" engine="${3:-}" launcher="${4:-}" cwd="${5:-}"
     [[ -n "$pane" ]] || return 0
     command -v tmux >/dev/null 2>&1 || return 0
+    [[ -n "$wrapper_launch_id" ]] && tmux set-option -p -t "$pane" @TOKEN_API_WRAPPER_ID "$wrapper_launch_id" >/dev/null 2>&1 || true
     [[ -n "$wrapper_launch_id" ]] && tmux set-option -p -t "$pane" @TOKEN_API_WRAPPER_LAUNCH_ID "$wrapper_launch_id" >/dev/null 2>&1 || true
     [[ -n "$engine" ]] && tmux set-option -p -t "$pane" @TOKEN_API_ENGINE "$engine" >/dev/null 2>&1 || true
     [[ -n "$launcher" ]] && tmux set-option -p -t "$pane" @TOKEN_API_LAUNCHER "$launcher" >/dev/null 2>&1 || true

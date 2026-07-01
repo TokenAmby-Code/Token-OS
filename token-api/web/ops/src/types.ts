@@ -118,6 +118,24 @@ export type StateAssertion = {
   details: Record<string, unknown>;
 };
 
+export type OpsHealthStatus = 'ok' | 'warn' | 'bad' | 'unknown';
+
+export type OpsSourceHealth = {
+  status: OpsHealthStatus;
+  available: boolean | null;
+  message: string | null;
+  details: Record<string, unknown>;
+};
+
+export type OpsRecommendedAction = {
+  id: string;
+  source_assertion_id: string;
+  severity: 'warn' | 'bad';
+  label: string;
+  action: string;
+  evidence: string[];
+};
+
 export type InstanceCounts = {
   active: number;
   stale: number;
@@ -228,6 +246,68 @@ export type OpsState = {
     source: string | null;
   };
   work_actions?: WorkActionSummary;
+};
+
+// Concise agent/script read model (GET /api/ops/status).
+export type OpsStatus = {
+  surface: 'ops-status';
+  generated_at: string;
+  status: OpsHealthStatus;
+  summary: string;
+  sources: {
+    token_api: OpsSourceHealth;
+    agents_db: OpsSourceHealth;
+    timer_engine: OpsSourceHealth;
+    tmuxctld: OpsSourceHealth;
+    cron: OpsSourceHealth;
+    enforcement: OpsSourceHealth;
+    tts: OpsSourceHealth;
+  };
+  timer: {
+    mode: string;
+    activity: string;
+    productivity_active: boolean;
+    break_balance_ms: number;
+    break_available_ms: number;
+    break_backlog_ms: number;
+    is_in_backlog: boolean;
+  };
+  attention: {
+    desktop_mode: string;
+    desktop_work_mode: string;
+    phone_app: string | null;
+    phone_distracted: boolean;
+    phone_heartbeat_age_seconds: number | null;
+  };
+  fleet: {
+    active: number;
+    stale: number;
+    by_status: Counts;
+    by_engine: Counts;
+    by_persona: Counts;
+  };
+  tmux: {
+    reachable: boolean | null;
+    tmux_reachable: boolean | null;
+    version: string | null;
+    sha: string | null;
+    live_instance_panes: number | null;
+    projection_drift: number | null;
+  };
+  tts: {
+    current: string | null;
+    queue_length: number;
+    hot_queue_length: number;
+    pause_queue_length: number;
+    satellite_available: boolean | null;
+    global_mode: string | null;
+  };
+  enforcement: {
+    pending_count: number;
+    pavlok_enabled: boolean | null;
+  };
+  assertions: StateAssertion[];
+  recommended_actions: OpsRecommendedAction[];
 };
 
 // One explicit work-action press: timeline tick + dial input.

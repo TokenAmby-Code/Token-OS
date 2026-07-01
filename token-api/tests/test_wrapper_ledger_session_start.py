@@ -20,6 +20,7 @@ def test_stamp_posts_canonical_instance_id_for_wrapper(app_env, monkeypatch):
 
     monkeypatch.setattr(hooks.shared, "_tmuxctld_post_json", fake_post)
     monkeypatch.setattr(hooks.shared, "tmuxctld_run_tmux", fake_run_tmux)
+    monkeypatch.setattr(hooks, "_tmux_pane_label", lambda _pane: asyncio.sleep(0, "somnium:W"))
 
     async def run_case():
         async with aiosqlite.connect(app_env.db_path) as db:
@@ -49,14 +50,15 @@ def test_stamp_posts_canonical_instance_id_for_wrapper(app_env, monkeypatch):
 
     assert posted == [
         (
-            "/ledger/session-start",
+            "/ledger/upsert",
             {
                 "wrapper_id": "wrap-1",
                 "instance_id": "canonical-instance",
-                "pane": "%42",
+                "pane_positional_id": "somnium:W",
                 "engine": "codex",
                 "working_dir": "/tmp/work",
                 "persona": "salamanders",
+                "state": "OPEN",
             },
         )
     ]

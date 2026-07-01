@@ -138,6 +138,108 @@ async def _echo_prompt_submit_to_tmuxctld(payload: dict) -> None:
         return
 
 
+def _post_tmuxctld_ledger_upsert_sync(body: dict) -> None:
+    base = _tmuxctld_loopback_url()
+    if not base:
+        return
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/ledger/upsert",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # This is the belt leg from SessionStart into the daemon ledger. Do not make
+    # agent registration depend on tmuxctld being up; wrapperstart/reconcile can
+    # rebuild it. Keep the timeout tighter than the hook client budget.
+    with shared._TMUXCTLD_OPENER.open(req, timeout=0.35) as resp:
+        resp.read(512)
+
+
+async def _upsert_tmuxctld_ledger_from_agents_db(payload: dict, result: dict) -> None:
+    instance_id = _normalize_text(result.get("instance_id") or payload.get("session_id") or "")
+    if not instance_id:
+        return
+    env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
+    pane_label = _normalize_text(payload.get("pane_label") or env.get("TOKEN_API_PANE_LABEL") or "")
+    tmux_pane = _normalize_text(
+        payload.get("tmux_pane")
+        or env.get("TMUX_PANE")
+        or env.get("TOKEN_API_DISPATCH_RESOLVED_PANE")
+        or ""
+    )
+    if not pane_label and tmux_pane:
+        try:
+            pane_label = await _tmux_pane_label(tmux_pane)
+        except Exception:
+            pane_label = ""
+
+    try:
+        async with shared.hook_db() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT i.id, i.wrapper_launch_id, i.working_dir, i.engine, i.status,
+                          (SELECT slug FROM personas WHERE id = i.persona_id) AS persona_slug
+                   FROM instances i
+                   WHERE i.id = ?""",
+                (instance_id,),
+            )
+            row = await cursor.fetchone()
+    except Exception as exc:
+        logger.warning(
+            "SessionStart: tmuxctld ledger agents.db read failed for %s: %s", instance_id[:12], exc
+        )
+        return
+    if row is None:
+        return
+
+    wrapper_id = _normalize_text(
+        row["wrapper_launch_id"]
+        or payload.get("wrapper_launch_id")
+        or payload.get("wrapper_id")
+        or env.get("TOKEN_API_WRAPPER_ID")
+        or env.get("TOKEN_API_WRAPPER_LAUNCH_ID")
+        or ""
+    )
+    if not wrapper_id:
+        return
+    result_persona = result.get("persona") if isinstance(result.get("persona"), dict) else {}
+    body = {
+        "wrapper_id": wrapper_id,
+        "instance_id": row["id"],
+        "persona": _normalize_text(row["persona_slug"] or result_persona.get("slug") or ""),
+        "pane_positional_id": pane_label,
+        "engine": _normalize_text(
+            row["engine"] or env.get("TOKEN_API_ENGINE") or payload.get("engine") or ""
+        ),
+        "working_dir": _normalize_text(row["working_dir"] or payload.get("cwd") or ""),
+        "state": "OPEN" if _normalize_text(row["status"]) != "stopped" else "CLOSED",
+    }
+    try:
+        await asyncio.to_thread(_post_tmuxctld_ledger_upsert_sync, body)
+    except Exception as exc:
+        logger.warning(
+            "SessionStart: tmuxctld ledger upsert failed for %s wrapper=%s: %s",
+            instance_id[:12],
+            wrapper_id[:12],
+            exc,
+        )
+
+
+def _schedule_tmuxctld_ledger_upsert(payload: dict, result: dict) -> None:
+    """Queue best-effort tmuxctld ledger hydration off the hook response path."""
+
+    task = asyncio.create_task(_upsert_tmuxctld_ledger_from_agents_db(dict(payload), dict(result)))
+
+    def _log_task_failure(done: asyncio.Task[None]) -> None:
+        try:
+            done.result()
+        except Exception as exc:
+            logger.warning("SessionStart: tmuxctld ledger hydration task failed: %s", exc)
+
+    task.add_done_callback(_log_task_failure)
+
+
 # Bounded in-band retry for transient WAL "database is locked" (SQLITE_BUSY) on
 # hook DB writes. Total added latency on full exhaustion is
 # 0.15*(1+2+3+4) = 1.5s — well under the client hook's --max-time/--retry-max-time
@@ -607,14 +709,15 @@ async def _stamp_instance_id(
     if wrapper_id:
         await asyncio.to_thread(
             shared._tmuxctld_post_json,
-            "/ledger/session-start",
+            "/ledger/upsert",
             {
                 "wrapper_id": wrapper_id,
                 "instance_id": canonical_instance_id,
-                "pane": tmux_pane,
+                "pane_positional_id": await _tmux_pane_label(tmux_pane) or "",
                 "engine": engine or "",
                 "working_dir": working_dir or "",
                 "persona": persona or "",
+                "state": "OPEN",
             },
             timeout=1.0,
             default_loopback=True,
@@ -7450,7 +7553,10 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
     # write boundary inside each handler that needs it (see handle_session_start's
     # registration INSERT); this dispatcher only swallows-or-surfaces the outcome.
     try:
-        return await handler(payload)
+        result = await handler(payload)
+        if normalized_action_type == "SessionStart" and isinstance(result, dict):
+            _schedule_tmuxctld_ledger_upsert(payload, result)
+        return result
     except Exception as e:
         logger.error(f"Hook handler error ({normalized_action_type}): {e}")
 

@@ -69,6 +69,101 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env):
     )
 
 
+def test_ops_status_returns_expected_top_level_keys(client, app_env):
+    _insert_ops_fixture(app_env)
+
+    resp = client.get("/api/ops/status")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["surface"] == "ops-status"
+    for key in (
+        "generated_at",
+        "status",
+        "summary",
+        "sources",
+        "timer",
+        "attention",
+        "fleet",
+        "tmux",
+        "tts",
+        "enforcement",
+        "assertions",
+        "recommended_actions",
+    ):
+        assert key in body
+    assert set(body["sources"]) == {
+        "token_api",
+        "agents_db",
+        "timer_engine",
+        "tmuxctld",
+        "cron",
+        "enforcement",
+        "tts",
+    }
+    assert body["fleet"]["active"] == 1
+    assert body["fleet"]["by_engine"]["codex"] == 1
+    assert body["fleet"]["by_persona"]["astartes"] == 1
+
+
+def test_ops_status_negative_break_balance_is_bad(client, app_env):
+    app_env.main.timer_engine._break_balance_ms = -60_000
+
+    resp = client.get("/api/ops/status")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["timer"]["is_in_backlog"] is True
+    assert body["timer"]["break_backlog_ms"] == 60_000
+    assert body["status"] == "bad"
+    break_assertion = next(item for item in body["assertions"] if item["id"] == "break_balance")
+    assert break_assertion["status"] == "bad"
+
+
+def test_ops_status_pending_enforcement_recommends_action(client, app_env):
+    conn = sqlite3.connect(app_env.db_path)
+    now = datetime.now()
+    conn.execute(
+        """INSERT INTO expected_acknowledgements
+           (id, source, instance_id, reason, status, created_at,
+            ack_due_at, level2_due_at, pavlok_due_at, fired_levels_json, details_json)
+           VALUES (?, 'pytest', NULL, 'confirm test', 'pending', ?, ?, ?, ?, '[]', '{}')""",
+        (
+            str(uuid.uuid4()),
+            now.isoformat(),
+            (now - timedelta(seconds=1)).isoformat(),
+            (now + timedelta(minutes=1)).isoformat(),
+            (now + timedelta(minutes=2)).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/status")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "bad"
+    assert body["enforcement"]["pending_count"] == 1
+    enforcement_assertion = next(item for item in body["assertions"] if item["id"] == "enforcement")
+    assert enforcement_assertion["status"] == "bad"
+    assert any(
+        action["source_assertion_id"] == "enforcement" and "acknowledge/resolve" in action["action"]
+        for action in body["recommended_actions"]
+    )
+
+
+def test_ops_status_tmuxctld_health_unavailable_degrades_without_crash(client):
+    resp = client.get("/api/ops/status")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sources"]["tmuxctld"]["status"] == "warn"
+    assert body["sources"]["tmuxctld"]["available"] is False
+    assert body["tmux"]["reachable"] is False
+    assert body["tmux"]["tmux_reachable"] is None
+
+
 def test_ops_timer_history_returns_live_shape(client, app_env):
     now = datetime.now()
     conn = sqlite3.connect(app_env.db_path)

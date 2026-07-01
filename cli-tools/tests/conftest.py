@@ -9,6 +9,7 @@ investigation. Every test gets redirected paths, unconditionally.
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 import pytest
@@ -32,6 +33,23 @@ def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
     # connect is acceptable because the launch wrappers treat hook delivery as
     # best-effort.
     monkeypatch.setenv("TOKEN_API_URL", "http://127.0.0.1:9")
+    # Subprocess dispatch tests must not post pane sends to the developer's live
+    # tmuxctld. Provide a no-op tmuxctld-ping early on PATH; tests that need to
+    # assert the payload can set TMUXCTLD_PING_LOG or shadow it with a narrower
+    # fake in their own PATH prefix. Dedicated tmuxctld-ping tests execute the
+    # real script by absolute path, so this transport stub does not mask them.
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir(exist_ok=True)
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'if [[ -n "${TMUXCTLD_PING_LOG:-}" ]]; then printf \'%s\\n\' "$*" >> "$TMUXCTLD_PING_LOG"; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
     # Most dispatch CLI tests use tiny fake tmux shims that only implement the
     # command under direct assertion. Keep the production launch observer opt-in
     # inside tests; tests that exercise the observer override this to a small

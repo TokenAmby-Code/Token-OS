@@ -1,10 +1,9 @@
 """Wrapper-first tmuxctld runtime ledger.
 
-The daemon owns pane/wrapper occupancy.  This ledger is intentionally
-pseudo-volatile: an in-process dict is authoritative while tmuxctld is alive and
-a single JSON file is rewritten after each mutation so a daemon bounce has a warm
-hint.  The recovery authority is a one-shot tmux scan via ``reconcile_from_tmux``;
-this is not sqlite-grade durability and must not become a rival token-api DB.
+The daemon keeps this intentionally cheap: an in-process dictionary is the live
+source of truth, with a single JSON write-behind file rewritten on every change.
+It is not a registry database. If it is lost, ``/reconcile`` rebuilds the open
+rows from the live tmux wrapper stamps.
 """
 
 from __future__ import annotations
@@ -14,364 +13,338 @@ import os
 import tempfile
 import threading
 import time
-import contextlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .tmux_adapter import TmuxAdapter
-
-LEDGER_STATES = frozenset({"SHIPPED", "OPEN", "CLOSED"})
-_ACTIVE_STATES = frozenset({"SHIPPED", "OPEN"})
-_LEDGER_ENV = "TMUXCTLD_WRAPPER_LEDGER_PATH"
-_SCAN_SEP = "__TMUXCTLD_LEDGER_FIELD__"
+LEDGER_VERSION = 1
+ACTIVE_STATES = frozenset({"SHIPPED", "OPEN"})
+DEFAULT_LEDGER_PATH = Path.home() / ".claude" / "tmuxctld-wrapper-ledger.json"
+_SCAN_SEP = "__TMUXCTLD_WRAPPER_LEDGER_FIELD__"
 
 
-def _default_ledger_path() -> Path:
-    return Path(os.environ.get(_LEDGER_ENV, "~/.claude/tmuxctld-wrapper-ledger.json")).expanduser()
+def ledger_path() -> Path:
+    raw = os.environ.get("TMUXCTLD_WRAPPER_LEDGER_PATH", "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_LEDGER_PATH
 
 
-def _clean(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
+def _s(value: object) -> str:
+    return "" if value is None else str(value).strip()
 
 
-def _state(value: Any, default: str = "OPEN") -> str:
-    candidate = _clean(value).upper()
-    return candidate if candidate in LEDGER_STATES else default
+def _epoch(value: object | None = None) -> float:
+    if value in (None, ""):
+        return time.time()
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return time.time()
+    return parsed if parsed > 0 else time.time()
 
 
 @dataclass(frozen=True)
 class WrapperLedgerRow:
-    """One wrapper-owned pane occupancy/runtime row.
-
-    ``wrapper_id`` is the primary key.  ``instance_id`` and ``pane_label`` (the
-    stable pane-positional id such as ``somnium:W``) are secondary oracle keys.
-    ``pane_id`` is the current physical tmux backing, included for local daemon
-    operations and client handoff; tmux remains the basement physical authority.
-    """
-
     wrapper_id: str
-    instance_id: str = ""
-    persona: str = ""
-    pane_id: str = ""
-    pane_label: str = ""
-    engine: str = ""
-    working_dir: str = ""
-    born_epoch: str = ""
-    state: str = "OPEN"
-
-    @property
-    def pane_positional_id(self) -> str:
-        return self.pane_label
-
-    @property
-    def occupied(self) -> bool:
-        return self.state in _ACTIVE_STATES
+    instance_id: str
+    persona: str
+    pane_positional_id: str
+    engine: str
+    working_dir: str
+    born_epoch: float
+    state: str
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "WrapperLedgerRow":
-        pane_label = _clean(data.get("pane_label") or data.get("pane_positional_id"))
+    def from_mapping(cls, data: dict[str, Any]) -> WrapperLedgerRow:
         return cls(
-            wrapper_id=_clean(data.get("wrapper_id") or data.get("wrapper_launch_id")),
-            instance_id=_clean(data.get("instance_id")),
-            persona=_clean(data.get("persona")),
-            pane_id=_clean(data.get("pane_id") or data.get("pane")),
-            pane_label=pane_label,
-            engine=_clean(data.get("engine")),
-            working_dir=_clean(data.get("working_dir") or data.get("cwd")),
-            born_epoch=_clean(data.get("born_epoch")),
-            state=_state(data.get("state")),
+            wrapper_id=_s(data.get("wrapper_id") or data.get("wrapper_launch_id")),
+            instance_id=_s(data.get("instance_id")),
+            persona=_s(data.get("persona")),
+            pane_positional_id=_s(
+                data.get("pane_positional_id") or data.get("pane_label") or data.get("pane_id")
+            ),
+            engine=_s(data.get("engine")),
+            working_dir=_s(data.get("working_dir") or data.get("cwd")),
+            born_epoch=_epoch(data.get("born_epoch")),
+            state=(_s(data.get("state")) or "OPEN").upper(),
         )
 
-    def to_dict(self) -> dict[str, str | bool]:
-        return {
-            "wrapper_id": self.wrapper_id,
-            "instance_id": self.instance_id,
-            "persona": self.persona,
-            "pane_id": self.pane_id,
-            "pane_label": self.pane_label,
-            "pane_positional_id": self.pane_label,
-            "engine": self.engine,
-            "working_dir": self.working_dir,
-            "born_epoch": self.born_epoch,
-            "state": self.state,
-            "occupied": self.occupied,
-        }
+    def merge(self, **updates: object) -> WrapperLedgerRow:
+        data = asdict(self)
+        for key, value in updates.items():
+            if key == "born_epoch":
+                if value not in (None, ""):
+                    data[key] = _epoch(value)
+            elif key == "state":
+                if _s(value):
+                    data[key] = _s(value).upper()
+            elif key in data and _s(value):
+                data[key] = _s(value)
+        return WrapperLedgerRow.from_mapping(data)
 
-    def merged(self, **updates: Any) -> "WrapperLedgerRow":
-        data = self.to_dict()
-        data.update({k: v for k, v in updates.items() if v is not None})
-        return WrapperLedgerRow.from_dict(data)
+    @property
+    def active(self) -> bool:
+        return self.state in ACTIVE_STATES
+
+    def as_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["born_epoch"] = float(self.born_epoch)
+        return data
 
 
 class WrapperLedger:
-    """Thread-safe wrapper-keyed in-memory ledger with JSON write-behind."""
+    """Thread-safe wrapper_id keyed runtime oracle."""
 
     def __init__(self, path: Path | None = None) -> None:
-        self.path = path or _default_ledger_path()
+        self._explicit_path = path is not None
+        self._path = path or ledger_path()
         self._lock = threading.RLock()
+        self._loaded = False
         self._rows: dict[str, WrapperLedgerRow] = {}
         self._by_instance: dict[str, str] = {}
-        self._by_pane_label: dict[str, str] = {}
-        self._by_pane_id: dict[str, str] = {}
-        self._load()
+        self._by_pane_positional: dict[str, str] = {}
 
-    def _load(self) -> None:
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def load(self, *, force: bool = False) -> dict[str, Any]:
         with self._lock:
-            self._rows = {}
-            if self.path.exists():
-                try:
-                    payload = json.loads(self.path.read_text(encoding="utf-8"))
-                    raw_rows = payload.get("rows", []) if isinstance(payload, dict) else []
-                    for raw in raw_rows:
-                        if not isinstance(raw, dict):
-                            continue
-                        row = WrapperLedgerRow.from_dict(raw)
-                        if row.wrapper_id:
-                            self._rows[row.wrapper_id] = row
-                except (OSError, ValueError, TypeError):
-                    self._rows = {}
-            self._rebuild_indexes_locked()
+            if self._loaded and not force:
+                return {"loaded": True, "path": str(self._path), "rows": len(self._rows)}
+            if not self._explicit_path:
+                self._path = ledger_path()
+            rows: dict[str, WrapperLedgerRow] = {}
+            try:
+                payload = json.loads(self._path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                payload = {}
+            except Exception:
+                # Corrupt write-behind is not a disaster; the next reconcile scan
+                # reconstructs open rows. Start empty and overwrite on change.
+                payload = {}
+            raw_rows = payload.get("rows") if isinstance(payload, dict) else None
+            if isinstance(raw_rows, list):
+                for item in raw_rows:
+                    if not isinstance(item, dict):
+                        continue
+                    row = WrapperLedgerRow.from_mapping(item)
+                    if row.wrapper_id:
+                        rows[row.wrapper_id] = row
+            self._rows = rows
+            self._reindex_locked()
+            self._loaded = True
+            return {"loaded": True, "path": str(self._path), "rows": len(self._rows)}
 
-    def _write_locked(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "updated_epoch": time.time(),
-            "rows": [row.to_dict() for row in sorted(self._rows.values(), key=lambda r: r.wrapper_id)],
-        }
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=str(self.path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2, sort_keys=True)
-                fh.write("\n")
-            os.replace(tmp_name, self.path)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmp_name)
+    def _ensure_loaded_locked(self) -> None:
+        if not self._loaded:
+            self.load()
 
-    def _rebuild_indexes_locked(self) -> None:
+    def _reindex_locked(self) -> None:
         self._by_instance = {}
-        self._by_pane_label = {}
-        self._by_pane_id = {}
+        self._by_pane_positional = {}
         for wrapper_id, row in self._rows.items():
+            if not row.active:
+                continue
             if row.instance_id:
                 self._by_instance[row.instance_id] = wrapper_id
-            if row.pane_label:
-                self._by_pane_label[row.pane_label] = wrapper_id
-            if row.pane_id:
-                self._by_pane_id[row.pane_id] = wrapper_id
+            if row.pane_positional_id:
+                self._by_pane_positional[row.pane_positional_id] = wrapper_id
 
-    def _put_locked(self, row: WrapperLedgerRow) -> WrapperLedgerRow:
-        if not row.wrapper_id:
-            raise ValueError("wrapper_id required")
-        self._rows[row.wrapper_id] = row
-        self._rebuild_indexes_locked()
-        self._write_locked()
-        return row
+    def _write_locked(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            row.as_dict() for row in sorted(self._rows.values(), key=lambda item: item.wrapper_id)
+        ]
+        payload = {
+            "version": LEDGER_VERSION,
+            "updated_epoch": time.time(),
+            "rows": rows,
+        }
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self._path.name}.", suffix=".tmp", dir=str(self._path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
+                fh.write("\n")
+            os.replace(tmp_name, self._path)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
 
-    def rows(self) -> list[WrapperLedgerRow]:
-        with self._lock:
-            return list(self._rows.values())
-
-    def resolve(
-        self,
-        *,
-        wrapper_id: str = "",
-        instance_id: str = "",
-        pane: str = "",
-        include_closed: bool = True,
-    ) -> WrapperLedgerRow | None:
-        """Resolve wrapper_id, instance_id, physical pane id, or pane label."""
-        wrapper_id = _clean(wrapper_id)
-        instance_id = _clean(instance_id)
-        pane = _clean(pane)
-        with self._lock:
-            key = wrapper_id
-            if not key and instance_id:
-                key = self._by_instance.get(instance_id, "")
-            if not key and pane:
-                key = self._by_pane_label.get(pane, "") or self._by_pane_id.get(pane, "")
-            row = self._rows.get(key) if key else None
-            if row and (include_closed or row.state != "CLOSED"):
-                return row
-            return None
-
-    def wrapper_start(
-        self,
-        *,
-        wrapper_id: str,
-        pane_id: str = "",
-        pane_label: str = "",
-        persona: str = "",
-        engine: str = "",
-        working_dir: str = "",
-        born_epoch: str = "",
-        instance_id: str = "",
-        state: str = "OPEN",
-    ) -> WrapperLedgerRow:
-        wrapper_id = _clean(wrapper_id)
+    def upsert(self, **fields: object) -> WrapperLedgerRow:
+        wrapper_id = _s(fields.get("wrapper_id") or fields.get("wrapper_launch_id"))
         if not wrapper_id:
             raise ValueError("wrapper_id required")
         with self._lock:
+            self._ensure_loaded_locked()
             existing = self._rows.get(wrapper_id)
-            row = existing or WrapperLedgerRow(wrapper_id=wrapper_id)
-            row = row.merged(
-                instance_id=_clean(instance_id) or row.instance_id,
-                persona=_clean(persona) or row.persona,
-                pane_id=_clean(pane_id) or row.pane_id,
-                pane_label=_clean(pane_label) or row.pane_label,
-                engine=_clean(engine) or row.engine,
-                working_dir=_clean(working_dir) or row.working_dir,
-                born_epoch=_clean(born_epoch) or row.born_epoch or str(int(time.time())),
-                state=_state(state, "OPEN"),
-            )
-            return self._put_locked(row)
+            if existing is None:
+                row = WrapperLedgerRow.from_mapping(
+                    {
+                        **fields,
+                        "wrapper_id": wrapper_id,
+                        "born_epoch": fields.get("born_epoch") or time.time(),
+                        "state": fields.get("state") or "OPEN",
+                    }
+                )
+            else:
+                row = existing.merge(**{**fields, "wrapper_id": wrapper_id})
+            self._rows[wrapper_id] = row
+            self._reindex_locked()
+            self._write_locked()
+            return row
 
-    def session_start(
+    def close(self, wrapper_id: str, *, state: str = "CLOSED") -> WrapperLedgerRow | None:
+        wrapper_id = _s(wrapper_id)
+        if not wrapper_id:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            existing = self._rows.get(wrapper_id)
+            if existing is None:
+                return None
+            row = existing.merge(state=state)
+            self._rows[wrapper_id] = row
+            self._reindex_locked()
+            self._write_locked()
+            return row
+
+    def resolve(
         self,
+        value: str = "",
         *,
         wrapper_id: str = "",
-        instance_id: str,
-        pane: str = "",
-        pane_label: str = "",
-        persona: str = "",
-        engine: str = "",
-        working_dir: str = "",
-        born_epoch: str = "",
-    ) -> WrapperLedgerRow:
-        instance_id = _clean(instance_id)
-        if not instance_id:
-            raise ValueError("instance_id required")
-        wrapper_id = _clean(wrapper_id)
-        pane = _clean(pane)
-        pane_label = _clean(pane_label)
+        instance_id: str = "",
+        pane_positional_id: str = "",
+        include_closed: bool = False,
+    ) -> WrapperLedgerRow | None:
+        needle = _s(value)
         with self._lock:
-            if not wrapper_id and pane:
-                wrapper_id = self._by_pane_id.get(pane, "") or self._by_pane_label.get(pane, "")
-            if not wrapper_id and pane_label:
-                wrapper_id = self._by_pane_label.get(pane_label, "")
-            if not wrapper_id:
-                wrapper_id = self._by_instance.get(instance_id, "")
-            if not wrapper_id:
-                raise ValueError("wrapper_id required")
-            existing = self._rows.get(wrapper_id) or WrapperLedgerRow(wrapper_id=wrapper_id)
-            row = existing.merged(
-                instance_id=instance_id,
-                persona=_clean(persona) or existing.persona,
-                pane_id=pane if pane.startswith("%") else existing.pane_id,
-                pane_label=pane_label or (pane if pane and not pane.startswith("%") else existing.pane_label),
-                engine=_clean(engine) or existing.engine,
-                working_dir=_clean(working_dir) or existing.working_dir,
-                born_epoch=_clean(born_epoch) or existing.born_epoch or str(int(time.time())),
-                state="OPEN",
-            )
-            return self._put_locked(row)
-
-    def wrapper_end(self, *, wrapper_id: str = "", pane: str = "") -> WrapperLedgerRow | None:
-        wrapper_id = _clean(wrapper_id)
-        pane = _clean(pane)
-        with self._lock:
-            if not wrapper_id and pane:
-                wrapper_id = self._by_pane_id.get(pane, "") or self._by_pane_label.get(pane, "")
-            row = self._rows.get(wrapper_id) if wrapper_id else None
-            if not row:
-                return None
-            return self._put_locked(row.merged(state="CLOSED"))
-
-    def reconcile_from_tmux(self, adapter: TmuxAdapter) -> dict[str, Any]:
-        """Rebuild active rows from a one-shot tmux scan.
-
-        This intentionally trusts tmux only for the scan-time physical facts and
-        previously stamped bootstrap facts.  Rows without a wrapper id are not
-        ledger rows yet and are skipped.
-        """
-        raw = adapter.run(
-            "list-panes",
-            "-a",
-            "-F",
-            _SCAN_SEP.join(
-                [
-                    "#{pane_id}",
-                    "#{@TOKEN_API_WRAPPER_LAUNCH_ID}",
-                    "#{@INSTANCE_ID}",
-                    "#{@PANE_ID}",
-                    "#{@PERSONA}",
-                    "#{@TOKEN_API_ENGINE}",
-                    "#{@TOKEN_API_CWD}",
-                    "#{@PANE_BORN}",
-                    "#{pane_current_path}",
-                    "#{pane_dead}",
+            self._ensure_loaded_locked()
+            if wrapper_id:
+                candidates = [_s(wrapper_id)]
+            elif instance_id:
+                instance_key = _s(instance_id)
+                candidates = [self._by_instance.get(instance_key, "")]
+                if include_closed:
+                    candidates.extend(
+                        row.wrapper_id
+                        for row in self._rows.values()
+                        if row.instance_id == instance_key
+                    )
+            elif pane_positional_id:
+                pane_key = _s(pane_positional_id)
+                candidates = [self._by_pane_positional.get(pane_key, "")]
+                if include_closed:
+                    candidates.extend(
+                        row.wrapper_id
+                        for row in self._rows.values()
+                        if row.pane_positional_id == pane_key
+                    )
+            elif needle:
+                candidates = [
+                    needle,
+                    self._by_instance.get(needle, ""),
+                    self._by_pane_positional.get(needle, ""),
                 ]
-            ),
-            allow_failure=True,
+                if include_closed:
+                    candidates.extend(
+                        row.wrapper_id
+                        for row in self._rows.values()
+                        if row.instance_id == needle or row.pane_positional_id == needle
+                    )
+            else:
+                candidates = []
+            for key in candidates:
+                row = self._rows.get(key) if key else None
+                if row and (include_closed or row.active):
+                    return row
+            return None
+
+    def rows(self, *, include_closed: bool = True) -> list[WrapperLedgerRow]:
+        with self._lock:
+            self._ensure_loaded_locked()
+            return [
+                row
+                for row in sorted(self._rows.values(), key=lambda r: r.wrapper_id)
+                if include_closed or row.active
+            ]
+
+    def reconcile_from_tmux(self, adapter: Any) -> dict[str, Any]:
+        """Replace active rows from a single live tmux scan.
+
+        Existing CLOSED rows are retained for cheap post-mortem/debug continuity;
+        SHIPPED/OPEN rows not present in tmux are pruned because the physical pane
+        truth says the wrapper is no longer open.
+        """
+        fields = _SCAN_SEP.join(
+            [
+                "#{@TOKEN_API_WRAPPER_ID}",
+                "#{@TOKEN_API_WRAPPER_LAUNCH_ID}",
+                "#{@INSTANCE_ID}",
+                "#{@PERSONA}",
+                "#{@PANE_ID}",
+                "#{@TOKEN_API_ENGINE}",
+                "#{@TOKEN_API_CWD}",
+                "#{@PANE_BORN}",
+            ]
         )
-        rebuilt: dict[str, WrapperLedgerRow] = {}
-        skipped = 0
+        raw = adapter.run("list-panes", "-a", "-F", fields, allow_failure=True)
+        live_rows: dict[str, WrapperLedgerRow] = {}
         for line in raw.splitlines():
-            if not line:
-                continue
             parts = line.split(_SCAN_SEP)
-            if len(parts) != 10:
-                skipped += 1
+            if len(parts) == 7:
+                # Backward compatibility for older scan formats.
+                parts = ["", *parts]
+            if len(parts) != 8:
                 continue
             (
-                pane_id,
                 wrapper_id,
+                legacy_wrapper_id,
                 instance_id,
-                pane_label,
                 persona,
+                pane_positional_id,
                 engine,
                 working_dir,
                 born_epoch,
-                pane_current_path,
-                pane_dead,
-            ) = (_clean(part) for part in parts)
+            ) = parts
+            wrapper_id = _s(wrapper_id) or _s(legacy_wrapper_id)
             if not wrapper_id:
-                skipped += 1
                 continue
-            # A remain-on-exit dead pane still exists but no longer hosts an open
-            # wrapper.  Reconcile is a live-runtime rebuild, so prune it.
-            if pane_dead == "1":
-                skipped += 1
-                continue
-            rebuilt[wrapper_id] = WrapperLedgerRow(
-                wrapper_id=wrapper_id,
-                instance_id=instance_id,
-                persona=persona or pane_label,
-                pane_id=pane_id,
-                pane_label=pane_label,
-                engine=engine,
-                working_dir=working_dir or pane_current_path,
-                born_epoch=born_epoch or str(int(time.time())),
-                state="OPEN",
+            row = WrapperLedgerRow.from_mapping(
+                {
+                    "wrapper_id": wrapper_id,
+                    "instance_id": instance_id,
+                    "persona": persona,
+                    "pane_positional_id": pane_positional_id,
+                    "engine": engine,
+                    "working_dir": working_dir,
+                    "born_epoch": born_epoch or time.time(),
+                    "state": "OPEN",
+                }
             )
+            live_rows[row.wrapper_id] = row
+
         with self._lock:
-            self._rows = rebuilt
-            self._rebuild_indexes_locked()
+            self._ensure_loaded_locked()
+            active_before = {key for key, row in self._rows.items() if row.active}
+            closed_rows = {
+                key: row
+                for key, row in self._rows.items()
+                if not row.active and key not in live_rows
+            }
+            self._rows = {**closed_rows, **live_rows}
+            self._reindex_locked()
             self._write_locked()
-        return {"rows": len(rebuilt), "skipped": skipped, "path": str(self.path)}
-
-_GLOBAL_LOCK = threading.RLock()
-_GLOBAL_LEDGER: WrapperLedger | None = None
-_GLOBAL_PATH: Path | None = None
-
-
-def get_wrapper_ledger() -> WrapperLedger:
-    global _GLOBAL_LEDGER, _GLOBAL_PATH
-    path = _default_ledger_path()
-    with _GLOBAL_LOCK:
-        if _GLOBAL_LEDGER is None or _GLOBAL_PATH != path:
-            _GLOBAL_LEDGER = WrapperLedger(path)
-            _GLOBAL_PATH = path
-        return _GLOBAL_LEDGER
+            return {
+                "path": str(self._path),
+                "loaded_rows": len(self._rows),
+                "open_rows": len(live_rows),
+                "pruned_open_rows": len(active_before - set(live_rows)),
+            }
 
 
-def reset_wrapper_ledger_for_tests(path: Path | None = None) -> WrapperLedger:
-    global _GLOBAL_LEDGER, _GLOBAL_PATH
-    with _GLOBAL_LOCK:
-        _GLOBAL_PATH = path or _default_ledger_path()
-        _GLOBAL_LEDGER = WrapperLedger(_GLOBAL_PATH)
-        return _GLOBAL_LEDGER
+LEDGER = WrapperLedger()
