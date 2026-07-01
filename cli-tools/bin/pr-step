@@ -28,7 +28,7 @@ MESSAGE=""
 TITLE=""
 BODY=""
 AUTO_MERGE=true
-TIMEOUT_MINS=15
+TIMEOUT_MINS=""
 SHOW_RAW_REVIEW=false
 FORCE_MODE=""
 FORCE_ARGS=()
@@ -95,6 +95,33 @@ emit_coderabbit_heartbeat() {
     fi
 }
 
+normalize_timeout_mins() {
+    local value="${1:-}"
+    case "$value" in
+        ""|0|none|never|unbounded)
+            return 0
+            ;;
+    esac
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value > 0 )) || return 1
+    printf '%s' "$value"
+}
+
+timeout_mins_to_seconds() {
+    local mins="${1:-}"
+    [[ -n "$mins" ]] || { echo 0; return 0; }
+    echo $((mins * 60))
+}
+
+wait_is_bounded() {
+    local max_wait="${1:-0}"
+    [[ "$max_wait" =~ ^[0-9]+$ ]] && (( max_wait > 0 ))
+}
+
+wait_timed_out() {
+    local elapsed="${1:-0}" max_wait="${2:-0}"
+    wait_is_bounded "$max_wait" && (( elapsed >= max_wait ))
+}
+
 usage() {
     cat <<'USAGE'
 PR Step
@@ -109,7 +136,7 @@ Normal options:
   --message MSG          Commit/re-review message. Default derives from staged diff.
   --title TITLE          PR title for first create. Default uses latest commit subject.
   --body BODY            PR body for first create. Default is generated.
-  --timeout MINS         CodeRabbit wait timeout per review cycle (default: 15)
+  --timeout MINS         Explicit CodeRabbit wait cap; default is no timeout
   --no-merge             Do not auto-merge even if checks are green.
   --show-raw-review      Print full CodeRabbit/GitHub review output.
   -h, --help             Show this help.
@@ -135,7 +162,7 @@ Usage: pr-step --force create [gh pr create options] [--wait] [--timeout MINS]
 
 Explicit escape hatch for jammed create states. Prefer plain `pr-step`.
 Common options: --title/-t, --body/-b, --base/-B, --head/-H, --draft, --wait,
---no-wait, --timeout MINS.
+--no-wait, --timeout MINS (explicit emergency cap; default unbounded).
 USAGE
 }
 
@@ -146,7 +173,7 @@ PR Step --force review
 Usage: pr-step --force review [PR_NUMBER] [options]
 
 Explicit escape hatch for jammed review states. Prefer plain `pr-step`.
-Options: --message MSG, --no-push, --read, --timeout MINS.
+Options: --message MSG, --no-push, --read, --timeout MINS (explicit emergency cap; default unbounded).
 USAGE
 }
 
@@ -170,7 +197,12 @@ parse_args() {
                     --message) MESSAGE="$2" ;;
                     --title) TITLE="$2" ;;
                     --body) BODY="$2" ;;
-                    --timeout) TIMEOUT_MINS="$2" ;;
+                    --timeout)
+                        TIMEOUT_MINS="$(normalize_timeout_mins "$2")" || {
+                            error "Invalid --timeout value: $2 (use positive minutes, 0, none, never, or unbounded)"
+                            exit 2
+                        }
+                        ;;
                 esac
                 shift 2
                 ;;
@@ -591,7 +623,7 @@ pr_set_instance_pr_state() {
 }
 
 POLL_INTERVAL=30        # seconds between checks
-MAX_WAIT_TIME=900       # 15 minutes max wait
+MAX_WAIT_TIME=0         # 0 means unbounded; CodeRabbit may legitimately take a long time
 REVIEWERS=("coderabbitai[bot]" "coderabbitai" "coderabbit")
 PUSH_WRAPPER="$SCRIPT_DIR/push"
 
@@ -650,7 +682,8 @@ if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
 PR Create
 
 Creates a pull request and prints the PR URL. Long CodeRabbit review retrieval
-is handled by pr-review-loop --read unless --wait is provided.
+is handled by pr-review-loop --read unless --wait is provided. When waiting,
+CodeRabbit polling is unbounded by default.
 
 Usage: pr-create [gh pr create options]
 
@@ -662,9 +695,9 @@ Options (passed to gh pr create):
   --draft             Create as draft PR
 
 Additional options:
-  --wait              Wait briefly for initial CodeRabbit signal
+  --wait              Wait for initial CodeRabbit signal
   --no-wait           Compatibility no-op; default behavior
-  --timeout <mins>    Max wait time in minutes (default: 15)
+  --timeout <mins>    Explicit max wait in minutes (default: no timeout)
   --merge             Merge current branch into base via worktree-safe squash
   --base <branch>     Base branch for --merge (default: auto-detect or main)
   -h, --help          Show this help
@@ -685,7 +718,7 @@ fi
 # Parse our custom options
 NO_WAIT=true
 MERGE_MODE=false
-TIMEOUT_MINS=15
+TIMEOUT_MINS=""
 BASE_BRANCH=""
 GH_ARGS=()
 
@@ -700,8 +733,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --timeout)
-            TIMEOUT_MINS="$2"
-            MAX_WAIT_TIME=$((TIMEOUT_MINS * 60))
+            TIMEOUT_MINS="$(normalize_timeout_mins "$2")" || {
+                error "Invalid --timeout value: $2 (use positive minutes, 0, none, never, or unbounded)"
+                exit 2
+            }
+            MAX_WAIT_TIME="$(timeout_mins_to_seconds "$TIMEOUT_MINS")"
             shift 2
             ;;
         --merge)
@@ -914,17 +950,23 @@ if [[ "$NO_WAIT" == "true" ]]; then
 fi
 
 log "Waiting for automated reviews (CodeRabbit)..."
-log "Polling every ${POLL_INTERVAL}s for up to ${TIMEOUT_MINS} minutes..."
+if wait_is_bounded "$MAX_WAIT_TIME"; then
+    log "Polling every ${POLL_INTERVAL}s for up to ${TIMEOUT_MINS} minutes..."
+else
+    log "Polling every ${POLL_INTERVAL}s until CodeRabbit responds (no timeout)."
+fi
 
 # Poll for reviews
 START_TIME=$(date +%s)
 FOUND_REVIEWS=false
+HEAD_SHA=""
+CR_STATE=""
 
 while true; do
     ELAPSED=$(($(date +%s) - START_TIME))
 
-    if [[ $ELAPSED -ge $MAX_WAIT_TIME ]]; then
-        warn "Timeout reached (${TIMEOUT_MINS} minutes). Fetching any available comments..."
+    if wait_timed_out "$ELAPSED" "$MAX_WAIT_TIME"; then
+        warn "Explicit timeout reached (${TIMEOUT_MINS} minutes). Fetching any available comments..."
         break
     fi
 
@@ -967,8 +1009,27 @@ while true; do
         break
     fi
 
-    REMAINING=$(( (MAX_WAIT_TIME - ELAPSED) / 60 ))
-    emit_coderabbit_heartbeat "CodeRabbit poll: waiting (${REMAINING}m remaining, ${REVIEW_COUNT} comments found)"
+    # CodeRabbit can complete cleanly without leaving review comments. Treat its
+    # terminal commit status as a stop signal; otherwise unbounded create waits
+    # would keep waiting after a comment-free success.
+    HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
+    if [[ -n "$HEAD_SHA" ]]; then
+        CR_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+            jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' \
+            2>/dev/null || true)
+        if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" ]]; then
+            FOUND_REVIEWS=true
+            log "CodeRabbit commit status reached terminal state: $CR_STATE"
+            break
+        fi
+    fi
+
+    if wait_is_bounded "$MAX_WAIT_TIME"; then
+        REMAINING=$(( (MAX_WAIT_TIME - ELAPSED) / 60 ))
+        emit_coderabbit_heartbeat "CodeRabbit poll: waiting (${REMAINING}m remaining, ${REVIEW_COUNT} comments found, status=${CR_STATE:-none})"
+    else
+        emit_coderabbit_heartbeat "CodeRabbit poll: waiting (${ELAPSED}s elapsed, no timeout, ${REVIEW_COUNT} comments found, status=${CR_STATE:-none})"
+    fi
     sleep "$POLL_INTERVAL"
 done
 
@@ -1030,7 +1091,9 @@ if [[ -n "$REVIEWER_REVIEWS" ]]; then
     OUTPUT_COUNT=$((OUTPUT_COUNT + 1))
 fi
 
-if [[ $OUTPUT_COUNT -eq 0 ]]; then
+if [[ $OUTPUT_COUNT -eq 0 && -n "${CR_STATE:-}" ]]; then
+    warn "No automated review comments found. CodeRabbit commit status: ${CR_STATE}."
+elif [[ $OUTPUT_COUNT -eq 0 ]]; then
     warn "No automated review comments found."
     echo ""
     echo "This could mean:"
@@ -1079,7 +1142,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 source "$SCRIPT_DIR/../lib/git-remote.sh"
 
 POLL_INTERVAL=30        # seconds between checks
-MAX_WAIT_TIME=480       # 8 minutes default — CodeRabbit assertive on large diffs runs 1–5 min
+MAX_WAIT_TIME=0         # 0 means unbounded; CodeRabbit/rate limits may take a long time
 REVIEWER_BOT="coderabbitai[bot]"
 REVIEWER_USER="coderabbitai"
 SUMMARY_MARKER="^## Summary by CodeRabbit"
@@ -1173,7 +1236,7 @@ Options:
   --message MSG       Description of fixes applied (included in PR comment)
   --no-push           Skip git push step (if already pushed)
   --read              Read-only: skip push and comment, just poll for results
-  --timeout MINS      Max wait time in minutes (default: 8)
+  --timeout MINS      Explicit max wait in minutes (default: no timeout)
   -h, --help          Show this help
 
 Examples:
@@ -1198,7 +1261,7 @@ PR_NUMBER=""
 MESSAGE=""
 NO_PUSH=false
 READ_ONLY=false
-TIMEOUT_MINS=8
+TIMEOUT_MINS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1216,8 +1279,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --timeout)
-            TIMEOUT_MINS="$2"
-            MAX_WAIT_TIME=$((TIMEOUT_MINS * 60))
+            TIMEOUT_MINS="$(normalize_timeout_mins "$2")" || {
+                error "Invalid --timeout value: $2 (use positive minutes, 0, none, never, or unbounded)"
+                exit 2
+            }
+            MAX_WAIT_TIME="$(timeout_mins_to_seconds "$TIMEOUT_MINS")"
             shift 2
             ;;
         -h|--help)
@@ -1309,7 +1375,11 @@ else
 fi
 
 # Step 3: Poll for new review comments
-log "⏳ Waiting for CodeRabbit re-review (timeout: ${TIMEOUT_MINS}m)..."
+if wait_is_bounded "$MAX_WAIT_TIME"; then
+    log "⏳ Waiting for CodeRabbit re-review (timeout: ${TIMEOUT_MINS}m)..."
+else
+    log "⏳ Waiting for CodeRabbit re-review (no timeout)..."
+fi
 
 START_TIME=$(date +%s)
 NEW_INLINE_COUNT=0
@@ -1320,8 +1390,8 @@ OVERVIEW_UPDATED=false
 while true; do
     ELAPSED=$(($(date +%s) - START_TIME))
 
-    if [[ $ELAPSED -ge $MAX_WAIT_TIME ]]; then
-        warn "Timeout reached (${TIMEOUT_MINS} minutes)."
+    if wait_timed_out "$ELAPSED" "$MAX_WAIT_TIME"; then
+        warn "Explicit timeout reached (${TIMEOUT_MINS} minutes)."
         break
     fi
 
@@ -1377,13 +1447,18 @@ while true; do
     if [[ "$OVERVIEW_UPDATED" == "true" ]]; then
         STATUS=" (updated)"
     fi
-    emit_coderabbit_heartbeat "CodeRabbit poll: ${ELAPSED_SECS}s elapsed, ${NEW_INLINE_COUNT} new inline, ${NEW_OVERVIEW_COUNT} new summary${STATUS}, head=${HEAD_SHA:0:7}"
+    if wait_is_bounded "$MAX_WAIT_TIME"; then
+        REMAINING=$(( (MAX_WAIT_TIME - ELAPSED) / 60 ))
+        emit_coderabbit_heartbeat "CodeRabbit poll: ${ELAPSED_SECS}s elapsed, ${REMAINING}m remaining, ${NEW_INLINE_COUNT} new inline, ${NEW_OVERVIEW_COUNT} new summary${STATUS}, head=${HEAD_SHA:0:7}"
+    else
+        emit_coderabbit_heartbeat "CodeRabbit poll: ${ELAPSED_SECS}s elapsed, no timeout, ${NEW_INLINE_COUNT} new inline, ${NEW_OVERVIEW_COUNT} new summary${STATUS}, head=${HEAD_SHA:0:7}"
+    fi
     sleep "$POLL_INTERVAL"
 done
 
 # Step 4: Fetch and output the results
 if [[ "$FOUND_OVERVIEW" == "false" ]] && [[ $NEW_INLINE_COUNT -eq 0 ]] && [[ $NEW_OVERVIEW_COUNT -eq 0 ]]; then
-    warn "No new review comments found within timeout period."
+    warn "No new review comments found before the explicit timeout."
     echo ""
     echo "Possible reasons:"
     echo "  - CodeRabbit is still processing"
@@ -2035,13 +2110,16 @@ echo ""
 
 create_pr_normal() {
     local subject body pr_url pr_num
+    local -a wait_args
     subject="${TITLE:-$(git log -1 --pretty=%s)}"
     body="${BODY:-$(default_body "$subject")}"
+    wait_args=(--wait)
+    [[ -n "$TIMEOUT_MINS" ]] && wait_args+=(--timeout "$TIMEOUT_MINS")
     log "Creating PR..."
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
-        pr_create_main --title "$subject" --body "$body" --wait --timeout "$TIMEOUT_MINS"
+        pr_create_main --title "$subject" --body "$body" "${wait_args[@]}"
     else
-        run_internal_capture create true pr_create_main --title "$subject" --body "$body" --wait --timeout "$TIMEOUT_MINS"
+        run_internal_capture create true pr_create_main --title "$subject" --body "$body" "${wait_args[@]}"
     fi
     pr_num="$(current_pr_number)"
     [[ -n "$pr_num" ]] || { error "Could not determine created PR number"; exit 1; }
@@ -2053,21 +2131,27 @@ create_pr_normal() {
 
 review_pr_normal() {
     local pr="$1" mode_msg="$2" rc=0
+    local -a review_args
+    review_args=("$pr" --message "$mode_msg")
+    [[ -n "$TIMEOUT_MINS" ]] && review_args+=(--timeout "$TIMEOUT_MINS")
     log "Requesting CodeRabbit review for PR #${pr}..."
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
-        pr_review_main "$pr" --message "$mode_msg" --timeout "$TIMEOUT_MINS" || rc=$?
+        pr_review_main "${review_args[@]}" || rc=$?
     else
-        run_internal_capture review false pr_review_main "$pr" --message "$mode_msg" --timeout "$TIMEOUT_MINS" || rc=$?
+        run_internal_capture review false pr_review_main "${review_args[@]}" || rc=$?
     fi
     return "$rc"
 }
 
 read_review_normal() {
     local pr="$1" rc=0
+    local -a review_args
+    review_args=("$pr" --read)
+    [[ -n "$TIMEOUT_MINS" ]] && review_args+=(--timeout "$TIMEOUT_MINS")
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
-        pr_review_main "$pr" --read --timeout "$TIMEOUT_MINS" || rc=$?
+        pr_review_main "${review_args[@]}" || rc=$?
     else
-        run_internal_capture review-read false pr_review_main "$pr" --read --timeout "$TIMEOUT_MINS" || rc=$?
+        run_internal_capture review-read false pr_review_main "${review_args[@]}" || rc=$?
     fi
     return "$rc"
 }

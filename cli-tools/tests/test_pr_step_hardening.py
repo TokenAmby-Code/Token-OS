@@ -81,6 +81,87 @@ def test_coderabbit_heartbeat_writes_visible_status(tmp_path: Path) -> None:
     assert "CodeRabbit poll: still waiting" in heartbeat.read_text()
 
 
+def test_coderabbit_wait_is_unbounded_by_default(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+parse_args
+printf 'timeout=<%s> seconds=%s timed_out=' "$TIMEOUT_MINS" "$(timeout_mins_to_seconds "$TIMEOUT_MINS")"
+if wait_timed_out 999999 "$(timeout_mins_to_seconds "$TIMEOUT_MINS")"; then
+  printf 'yes\\n'
+else
+  printf 'no\\n'
+fi
+""",
+        repo,
+    )
+
+    assert "timeout=<> seconds=0 timed_out=no" in result.stdout
+
+
+def test_explicit_timeout_remains_available_as_operator_cap(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+parse_args --timeout 2
+printf 'timeout=<%s> seconds=%s timed_out=' "$TIMEOUT_MINS" "$(timeout_mins_to_seconds "$TIMEOUT_MINS")"
+if wait_timed_out 120 "$(timeout_mins_to_seconds "$TIMEOUT_MINS")"; then
+  printf 'yes\\n'
+else
+  printf 'no\\n'
+fi
+""",
+        repo,
+    )
+
+    assert "timeout=<2> seconds=120 timed_out=yes" in result.stdout
+
+
+def test_normal_review_does_not_inject_empty_timeout(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    arg_log = tmp_path / "args.log"
+
+    bash_with_pr_step(
+        f"""
+run_internal_capture() {{
+  shift 2
+  printf '%s\\n' "$@" > {str(arg_log)!r}
+}}
+review_pr_normal 7 "check latest head"
+""",
+        repo,
+    )
+
+    args = arg_log.read_text().splitlines()
+    assert args == ["pr_review_main", "7", "--message", "check latest head"]
+    assert "--timeout" not in args
+
+
+def test_normal_create_does_not_inject_empty_timeout(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    arg_log = tmp_path / "args.log"
+
+    bash_with_pr_step(
+        f"""
+run_internal_capture() {{
+  shift 2
+  printf '%s\\n' "$@" > {str(arg_log)!r}
+}}
+current_pr_number() {{ echo 7; }}
+current_pr_url() {{ echo https://example.invalid/pr/7; }}
+mark_pr_flag() {{ :; }}
+create_pr_normal >/dev/null
+""",
+        repo,
+    )
+
+    args = arg_log.read_text().splitlines()
+    assert "--wait" in args
+    assert "--timeout" not in args
+
+
 def test_findings_summary_filters_to_current_head_and_marks_historical(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     fake_bin = tmp_path / "bin"
