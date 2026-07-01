@@ -19,7 +19,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl import daemon
+from tmuxctl import daemon, wrapper_ledger
 from tmuxctl import service as tmux_service
 
 # Captured before any monkeypatching so the dedicated re-assertion tests can
@@ -28,7 +28,7 @@ _REAL_MAYBE_REASSERT = daemon.TmuxctldServer.maybe_reassert_lifecycle_hooks
 
 
 @pytest.fixture(autouse=True)
-def _no_live_tmux_guard(monkeypatch):
+def _no_live_tmux_guard(monkeypatch, tmp_path):
     """No daemon test may touch a live tmux server (hook-tests-no-live-tmux).
 
     ``_h_send_text`` now acquires/releases the typing-guard AGENT hold, which
@@ -39,6 +39,10 @@ def _no_live_tmux_guard(monkeypatch):
     monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: False)
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
     monkeypatch.setattr(daemon.send_gate, "evaluate", lambda *a, **k: None)
+    monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
+    wrapper_ledger.LEDGER._rows = {}
+    wrapper_ledger.LEDGER._loaded = False
+    wrapper_ledger.LEDGER.load(force=True)
     # /health now re-asserts the tmux lifecycle hooks (which shells real tmux).
     # Neutralise the heartbeat-driven re-assertion module-wide so no /health test
     # touches live tmux; the dedicated re-assertion tests restore the real method.
@@ -700,6 +704,97 @@ def test_wrapperstart_requires_wrapper_launch_id() -> None:
         _, payload = _post(server, "/hooks/wrapperstart", {"tmux_pane": "%42"})
         assert payload["ok"] is False
         assert payload["error"]["code"] == "ValueError"
+    finally:
+        server.shutdown()
+
+
+def test_wrapper_ledger_upsert_resolves_triple_id_and_reloads_json(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "ledger.json"
+    monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(path))
+    wrapper_ledger.LEDGER.load(force=True)
+
+    server, _ = _serve(StubAdapter)
+    try:
+        _, upserted = _post(
+            server,
+            "/ledger/upsert",
+            {
+                "wrapper_id": "wrap-core",
+                "instance_id": "inst-core",
+                "persona": "custodes",
+                "pane_positional_id": "council:custodes",
+                "engine": "codex",
+                "working_dir": "/tmp/core",
+                "state": "OPEN",
+            },
+        )
+        assert upserted["ok"] is True
+        assert path.exists()
+
+        resolved = []
+        for query in (
+            "/ledger/resolve?wrapper_id=wrap-core",
+            "/ledger/resolve?instance_id=inst-core",
+            "/ledger/resolve?pane_positional_id=council:custodes",
+        ):
+            _, payload = _get(server, query)
+            assert payload["ok"] is True
+            assert payload["result"]["found"] is True
+            resolved.append(payload["result"]["row"])
+        assert resolved[0] == resolved[1] == resolved[2]
+    finally:
+        server.shutdown()
+
+    # Simulate daemon boot: a fresh load reconstructs the in-memory indexes from
+    # the write-behind JSON, before any live tmux reconcile scan runs.
+    wrapper_ledger.LEDGER._rows = {}
+    wrapper_ledger.LEDGER._loaded = False
+    wrapper_ledger.LEDGER.load(force=True)
+    assert wrapper_ledger.LEDGER.resolve(instance_id="inst-core").pane_positional_id == (
+        "council:custodes"
+    )
+
+
+class ReconcileLedgerAdapter(StubAdapter):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("list-panes", "-a", "-F"):
+            sep = wrapper_ledger._SCAN_SEP
+            return sep.join(
+                [
+                    "wrap-live",
+                    "inst-live",
+                    "fabricator-general",
+                    "mechanicus:fabricator-general",
+                    "codex",
+                    "/tmp/live",
+                    "123.5",
+                ]
+            )
+        return ""
+
+
+def test_reconcile_rebuilds_wrapper_ledger_from_tmux_scan(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "ledger.json"
+    monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(path))
+    wrapper_ledger.LEDGER.load(force=True)
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="stale-open",
+        instance_id="stale-inst",
+        pane_positional_id="palace:W",
+        state="OPEN",
+    )
+
+    server, _ = _serve(ReconcileLedgerAdapter)
+    try:
+        _, payload = _post(server, "/reconcile", {})
+        assert payload["ok"] is True
+        assert payload["result"]["ledger"]["open_rows"] == 1
+        assert payload["result"]["ledger"]["pruned_open_rows"] == 1
+        _, resolved = _get(server, "/ledger/resolve?instance_id=inst-live")
+        assert resolved["result"]["row"]["wrapper_id"] == "wrap-live"
+        assert resolved["result"]["row"]["pane_positional_id"] == "mechanicus:fabricator-general"
+        _, stale = _get(server, "/ledger/resolve?instance_id=stale-inst")
+        assert stale["result"]["found"] is False
     finally:
         server.shutdown()
 

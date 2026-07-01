@@ -317,13 +317,26 @@ class TmuxControlPlane:
         return "\n".join(lines)
 
     def resolve_instance(self, instance_id: str) -> dict:
-        """Resolve an instance UUID to its live pane (pure tmux, fail-closed).
+        """Resolve an instance UUID to its live pane via the wrapper ledger.
 
         Returns ``{instance_id, pane_id, pane_role, found, agent, live_agent}``.
-        When no live pane carries the stamp, ``found`` is False,
+        When no active ledger row carries the instance, ``found`` is False,
         ``pane_id``/``pane_role`` are empty strings, ``agent`` is ``auto``, and
         ``live_agent`` is False.
         """
+        from .wrapper_ledger import LEDGER
+
+        row = LEDGER.resolve(instance_id=instance_id)
+        if row is not None:
+            return {
+                "instance_id": row.instance_id,
+                "pane_id": row.pane_positional_id,
+                "pane_role": row.pane_positional_id,
+                "found": True,
+                "agent": row.engine or "auto",
+                "live_agent": bool(row.engine),
+                "ledger": row.as_dict(),
+            }
         resolved = resolve_instance(self.adapter, instance_id)
         agent = "auto"
         if resolved.pane_id:
@@ -343,16 +356,98 @@ class TmuxControlPlane:
         }
 
     def instance_id_for_pane(self, pane: str) -> dict:
-        """Reverse of :meth:`resolve_instance`: read a pane's live ``@INSTANCE_ID``.
+        """Reverse of :meth:`resolve_instance`: resolve through the wrapper ledger.
 
-        The pane's stamp is the authoritative ``pane -> instance_id`` bridge.
         Fails closed: an unstamped or dead pane yields ``instance_id:""`` and
         ``found:False`` — never a guess. Returns
         ``{pane, instance_id, found}``.
         """
+        from .wrapper_ledger import LEDGER
+
+        pane_positional_id = pane
+        if pane == "current" or pane.startswith("%"):
+            try:
+                target = self._resolve_current(pane)
+                pane_positional_id = self.adapter.show_pane_option(target, "@PANE_ID")
+            except Exception:
+                pane_positional_id = pane
+        row = LEDGER.resolve(pane_positional_id=pane_positional_id)
+        if row is not None:
+            return {
+                "pane": row.pane_positional_id,
+                "instance_id": row.instance_id,
+                "found": bool(row.instance_id),
+                "ledger": row.as_dict(),
+            }
         resolved_pane = self._resolve_current(pane)
         value = self.adapter.show_pane_option(resolved_pane, "@INSTANCE_ID")
         return {"pane": resolved_pane, "instance_id": value or "", "found": bool(value)}
+
+    def ledger_upsert(
+        self,
+        *,
+        wrapper_id: str,
+        instance_id: str = "",
+        persona: str = "",
+        pane_positional_id: str = "",
+        engine: str = "",
+        working_dir: str = "",
+        born_epoch: float | str | None = None,
+        state: str = "OPEN",
+    ) -> dict:
+        """Upsert one wrapper-ledger row and return the authoritative row."""
+        from .wrapper_ledger import LEDGER
+
+        return LEDGER.upsert(
+            wrapper_id=wrapper_id,
+            instance_id=instance_id,
+            persona=persona,
+            pane_positional_id=pane_positional_id,
+            engine=engine,
+            working_dir=working_dir,
+            born_epoch=born_epoch,
+            state=state,
+        ).as_dict()
+
+    def ledger_close(self, wrapper_id: str) -> dict:
+        """Mark a wrapper-ledger row closed."""
+        from .wrapper_ledger import LEDGER
+
+        row = LEDGER.close(wrapper_id)
+        return {"closed": bool(row), "row": row.as_dict() if row else None}
+
+    def ledger_resolve(
+        self,
+        value: str = "",
+        *,
+        wrapper_id: str = "",
+        instance_id: str = "",
+        pane_positional_id: str = "",
+        include_closed: bool = False,
+    ) -> dict:
+        """Resolve wrapper_id, instance_id, or positional pane id to one row."""
+        from .wrapper_ledger import LEDGER
+
+        row = LEDGER.resolve(
+            value,
+            wrapper_id=wrapper_id,
+            instance_id=instance_id,
+            pane_positional_id=pane_positional_id,
+            include_closed=include_closed,
+        )
+        return {"found": bool(row), "row": row.as_dict() if row else None}
+
+    def ledger_rows(self, *, include_closed: bool = True) -> list[dict]:
+        """Return wrapper-ledger rows."""
+        from .wrapper_ledger import LEDGER
+
+        return [row.as_dict() for row in LEDGER.rows(include_closed=include_closed)]
+
+    def ledger_reconcile(self) -> dict:
+        """Rebuild active wrapper-ledger rows from one live tmux scan."""
+        from .wrapper_ledger import LEDGER
+
+        return LEDGER.reconcile_from_tmux(self.adapter)
 
     def freelist(self) -> list[dict]:
         """List the clean, agent-free panes (the freelist).
