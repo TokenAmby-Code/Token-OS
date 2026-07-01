@@ -20,13 +20,13 @@ def _insert_ops_fixture(app_env):
     instance_id = str(uuid.uuid4())
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, engine, registered_at, last_activity, zealotry)
-           VALUES (?, ?, 'ops-test', '/tmp/ops', 'local', 'Mac-Mini',
-                   'processing', 'codex',
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id,
+            status, engine, created_at, last_activity, zealotry)
+           VALUES (?, 'ops-test', '/tmp/ops', 'local', 'Mac-Mini',
+                   'working', 'codex',
                    '2026-05-25T10:00:00', '2026-05-25T10:01:00', 5)""",
-        (instance_id, str(uuid.uuid4())),
+        (instance_id,),
     )
     conn.execute(
         "INSERT INTO events (event_type, instance_id, device_id, details, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -59,6 +59,9 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env):
     ):
         assert key in body
     assert body["instances"]["counts"]["active"] == 1
+    assert "by_persona" in body["instances"]["counts"]
+    assert isinstance(body["instances"]["counts"]["by_persona"], dict)
+    assert "by_legion" not in body["instances"]["counts"]
     assert body["instances"]["active"][0]["display_name"] == "ops-test"
     assertion_ids = {item["id"] for item in body["assertions"]}
     assert {"timer_mode", "productivity", "desktop_attention", "phone_attention"}.issubset(
@@ -319,13 +322,13 @@ def test_ops_timer_history_may_28_sparse_snap_regression(client, app_env):
 def test_work_state_ignores_stale_idle_instances(client, app_env):
     conn = sqlite3.connect(app_env.db_path)
     conn.execute(
-        """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, engine, registered_at, last_activity)
-           VALUES (?, ?, 'stale-idle', '/tmp/ops', 'local', 'Mac-Mini',
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id,
+            status, engine, created_at, last_activity)
+           VALUES (?, 'stale-idle', '/tmp/ops', 'local', 'Mac-Mini',
                    'idle', 'codex',
                    datetime('now', '-20 minutes'), datetime('now', '-10 minutes'))""",
-        (str(uuid.uuid4()), str(uuid.uuid4())),
+        (str(uuid.uuid4()),),
     )
     conn.commit()
     conn.close()
