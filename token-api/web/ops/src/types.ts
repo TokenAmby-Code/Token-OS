@@ -118,6 +118,15 @@ export type StateAssertion = {
   details: Record<string, unknown>;
 };
 
+export type InstanceCounts = {
+  active: number;
+  stale: number;
+  by_status: Counts;
+  by_engine: Counts;
+  by_persona: Counts;
+  by_work_class?: Counts;
+};
+
 export type OpsState = {
   surface: 'ops';
   ui_build_id: string | null;
@@ -181,13 +190,7 @@ export type OpsState = {
   };
   instances: {
     active: OpsInstance[];
-    counts: {
-      active: number;
-      stale: number;
-      by_status: Counts;
-      by_engine: Counts;
-      by_persona: Counts;
-    };
+    counts: InstanceCounts;
   };
   events: OpsEvent[];
   cron: {

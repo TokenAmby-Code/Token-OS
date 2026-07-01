@@ -2,7 +2,7 @@
 // components never call endpoints ad-hoc. Each hook owns one read-model.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { OpsState, TimerHistory, OpsGraph, SessionDocsFeed, TtsGlobalMode } from './types';
+import type { Counts, OpsState, TimerHistory, OpsGraph, SessionDocsFeed, TtsGlobalMode } from './types';
 import { mockOpsGraph } from './mock';
 
 export type Feed<T> = {
@@ -70,9 +70,53 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   return (await res.json()) as T;
 }
 
+function countMap(value: unknown): Counts {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).filter(
+      (entry): entry is [string, number] => typeof entry[1] === 'number',
+    ),
+  );
+}
+
+function count(value: unknown): number {
+  return typeof value === 'number' ? value : 0;
+}
+
+/**
+ * Runtime JSON still crosses an untyped boundary. Keep contract normalization
+ * centralized here so components consume the first-class OpsState TypeScript
+ * shape instead of carrying defensive `Object.entries(x ?? {})` guards.
+ */
+function normalizeOpsState(payload: OpsState): OpsState {
+  const rawInstances = payload.instances ?? { active: [], counts: {} };
+  const rawCounts = rawInstances.counts ?? {};
+  return {
+    ...payload,
+    assertions: payload.assertions ?? [],
+    events: payload.events ?? [],
+    voice_drafts: payload.voice_drafts ?? [],
+    instances: {
+      ...rawInstances,
+      active: rawInstances.active ?? [],
+      counts: {
+        active: count(rawCounts.active),
+        stale: count(rawCounts.stale),
+        by_status: countMap(rawCounts.by_status),
+        by_engine: countMap(rawCounts.by_engine),
+        by_persona: countMap(rawCounts.by_persona),
+        by_work_class: countMap(rawCounts.by_work_class),
+      },
+    },
+  };
+}
+
 /** Live cockpit state — polled fast (brief: every 2s). */
 export function useOpsState(intervalMs = 2000): Feed<OpsState> {
-  return usesPolling<OpsState>((signal) => getJson<OpsState>('/api/ui/ops/state', signal), intervalMs);
+  return usesPolling<OpsState>(
+    async (signal) => normalizeOpsState(await getJson<OpsState>('/api/ui/ops/state', signal)),
+    intervalMs,
+  );
 }
 
 // ── Control-deck actions ──────────────────────────────────────────────────
