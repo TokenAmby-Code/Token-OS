@@ -140,6 +140,33 @@ def test_health_shape() -> None:
         server.shutdown()
 
 
+@pytest.mark.parametrize(
+    "disconnect",
+    [
+        ConnectionResetError("reset"),
+        BrokenPipeError("pipe"),
+        ConnectionAbortedError("aborted"),
+        OSError(daemon.errno.EPIPE, "pipe"),
+    ],
+)
+def test_response_write_client_disconnect_is_benign(disconnect, caplog) -> None:
+    class FailingWfile:
+        def write(self, _body):
+            raise disconnect
+
+    handler = object.__new__(daemon.TmuxctldHandler)
+    handler.send_response = lambda _status: None
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
+    handler.wfile = FailingWfile()
+
+    daemon.TmuxctldHandler._write(handler, 200, {"ok": True})
+
+    assert not [
+        record for record in caplog.records if "unhandled error dispatching" in record.message
+    ]
+
+
 def test_typing_guard_state_endpoint_routes_supported_json_commands(monkeypatch) -> None:
     calls: list[list[str]] = []
 
@@ -198,6 +225,8 @@ def test_typing_guard_arm_disables_any_and_pending_reenables_any() -> None:
     calls: list[tuple[str, ...]] = []
 
     class FakeTmux:
+        any_bound = True
+
         def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
             calls.append(tuple(args))
 
@@ -208,8 +237,20 @@ def test_typing_guard_arm_disables_any_and_pending_reenables_any() -> None:
             proc = Proc()
             if args and args[0] == "show-options":
                 proc.stdout = state.get(args[-1], "")
+            elif args and args[0] == "list-keys":
+                proc.returncode = 0 if self.any_bound else 1
+                proc.stdout = (
+                    "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+                    "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=arm\"; send-keys'"
+                    if self.any_bound
+                    else ""
+                )
             elif args[:2] == ("set-option", "-p"):
                 state[args[-2]] = args[-1]
+            elif args[:4] == ("unbind-key", "-q", "-n", "Any"):
+                self.any_bound = False
+            elif args and args[0] == "source-file":
+                self.any_bound = True
             return proc
 
     fake = FakeTmux()
@@ -232,6 +273,9 @@ def test_typing_guard_rehydrate_reads_projections_without_mutating_state() -> No
     }
 
     class FakeTmux:
+        def __init__(self, *, any_bound: bool) -> None:
+            self.any_bound = any_bound
+
         def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
             calls.append(tuple(args))
 
@@ -242,9 +286,23 @@ def test_typing_guard_rehydrate_reads_projections_without_mutating_state() -> No
             proc = Proc()
             if args and args[0] == "show-options":
                 proc.stdout = projections.get(args[-1], "")
+            elif args and args[0] == "list-keys":
+                proc.returncode = 0 if self.any_bound else 1
+                proc.stdout = (
+                    "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+                    "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=arm\"; send-keys'"
+                    if self.any_bound
+                    else ""
+                )
+            elif args[:4] == ("unbind-key", "-q", "-n", "Any"):
+                self.any_bound = False
+            elif args and args[0] == "source-file":
+                self.any_bound = True
             return proc
 
-    result = daemon.typing_guard_state.rehydrate_any_binding(FakeTmux(), "%42", now=100)
+    result = daemon.typing_guard_state.rehydrate_any_binding(
+        FakeTmux(any_bound=True), "%42", now=100
+    )
     assert result["topology"] == "disabled"
     assert ("unbind-key", "-q", "-n", "Any") in calls
     assert not any(call and call[0] == "set-option" for call in calls)
@@ -252,10 +310,94 @@ def test_typing_guard_rehydrate_reads_projections_without_mutating_state() -> No
 
     calls.clear()
     projections[daemon.typing_guard_state.GUARD_KIND_OPTION] = "pending"
-    result = daemon.typing_guard_state.rehydrate_any_binding(FakeTmux(), "%42", now=100)
+    result = daemon.typing_guard_state.rehydrate_any_binding(
+        FakeTmux(any_bound=False), "%42", now=100
+    )
     assert result["topology"] == "enabled"
     assert any(call and call[0] == "source-file" for call in calls)
     assert not any(call and call[0] == "set-option" for call in calls)
+
+
+def test_typing_guard_enable_any_is_idempotent_when_canonical_binding_present() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "list-keys":
+                proc.stdout = (
+                    "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+                    "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=arm\"; send-keys'"
+                )
+            return proc
+
+    result = daemon.typing_guard_state.enable_any_binding(FakeTmux())
+
+    assert result["changed"] is False
+    assert result["any_bound"] is True
+    assert not any(call and call[0] == "source-file" for call in calls)
+
+
+def test_typing_guard_disable_any_is_idempotent_when_binding_absent() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 1
+                stdout = ""
+
+            return Proc()
+
+    result = daemon.typing_guard_state.disable_any_binding(FakeTmux())
+
+    assert result["changed"] is False
+    assert result["any_bound"] is False
+    assert not any(call[:4] == ("unbind-key", "-q", "-n", "Any") for call in calls)
+
+
+def test_typing_guard_expired_off_transition_clears_legacy_guard_options() -> None:
+    tg = daemon.typing_guard_state
+    state = {
+        tg.GUARD_JSON_OPTION: json.dumps(
+            {"kind": tg.HUMAN, "until": 100, "owner": None, "source": tg.SOURCE}
+        ),
+        tg.GUARD_UNTIL_OPTION: "100",
+        tg.GUARD_KIND_OPTION: tg.HUMAN,
+        tg.GUARD_MARKER_OPTION: tg.ON_MARKER,
+        **{option: "stale" for option in tg.LEGACY_GUARD_OPTIONS},
+    }
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "show-options":
+                proc.stdout = state.get(args[-1], "")
+            elif args[:2] == ("set-option", "-p"):
+                state[args[-2]] = args[-1]
+            elif args[:2] == ("set-option", "-pu"):
+                state.pop(args[-1], None)
+            return proc
+
+    result = tg.expire_pane(FakeTmux(), "%42", now=200)
+
+    assert result["kind"] == tg.OFF
+    assert state[tg.GUARD_KIND_OPTION] == tg.OFF
+    assert state[tg.GUARD_UNTIL_OPTION] == "0"
+    assert state[tg.GUARD_MARKER_OPTION] == ""
+    assert all(option not in state for option in tg.LEGACY_GUARD_OPTIONS)
 
 
 def test_typing_guard_topology_endpoint_rehydrates_without_state_command(monkeypatch) -> None:
