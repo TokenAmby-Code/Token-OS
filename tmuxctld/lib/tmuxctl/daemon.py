@@ -553,6 +553,42 @@ def _h_instance_id_for_pane(control, params):
 
 def _h_resolve_pane(control, params):
     target = _s(params, "target")
+    ledger_row = control.ledger_resolve(
+        target,
+        wrapper_id=_s(params, "wrapper_id"),
+        instance_id=_s(params, "instance_id"),
+        pane_positional_id=_s(params, "pane_positional_id") or _s(params, "pane_label"),
+    )
+    if ledger_row.get("found"):
+        row = ledger_row["row"]
+        if _s(params, "format", "full") == "json":
+            return {
+                "requested": target
+                or _s(params, "wrapper_id")
+                or _s(params, "instance_id")
+                or _s(params, "pane_positional_id")
+                or _s(params, "pane_label"),
+                "pane_id": row["pane_positional_id"],
+                "role": row["pane_positional_id"],
+                "kind": "ledger",
+                "agent": row["engine"] or "auto",
+                "live_agent": bool(row["engine"]),
+                "ledger": row,
+            }
+        if _s(params, "format", "full") == "id":
+            return row["pane_positional_id"]
+        return "\n".join(
+            [
+                f"requested: {target or row['wrapper_id']}",
+                f"pane_id: {row['pane_positional_id'] or '(unset)'}",
+                f"role: {row['pane_positional_id'] or '(unset)'}",
+                "kind: ledger",
+                f"agent: {row['engine'] or 'auto'}",
+                f"live_agent: {str(bool(row['engine'])).lower()}",
+                f"wrapper_id: {row['wrapper_id']}",
+                f"instance_id: {row['instance_id']}",
+            ]
+        )
     fmt = _s(params, "format", "full")
     if fmt == "id":
         return control.public_pane_id(target)
@@ -1357,10 +1393,24 @@ def _h_assert_instance(control, params):
 
 def _h_reconcile(control, params):
     # The detached daemon has no ambient tmux session; the fleet lives in `main`.
-    return {"results": control.reconcile_personas(session=_s(params, "session", "main"))}
+    return {
+        "ledger": control.ledger_reconcile(),
+        "results": control.reconcile_personas(session=_s(params, "session", "main")),
+    }
 
 
 def _h_event(control, params):
+    if (_s(params, "event").strip().lower().replace("_", "-") == "pane-died") and _s(
+        params, "pane"
+    ):
+        try:
+            pane_label = _adapter_show_pane_option(control, _s(params, "pane"), "@PANE_ID")
+            if pane_label:
+                row = control.ledger_resolve(pane_positional_id=pane_label).get("row")
+                if row and row.get("wrapper_id"):
+                    control.ledger_close(row["wrapper_id"])
+        except Exception:
+            log.exception("tmuxctld ledger close on pane-died failed")
     return control.handle_event(
         _s(params, "event"), pane=_s(params, "pane"), session=_s(params, "session", "main")
     )
@@ -1381,6 +1431,42 @@ def _h_hook_user_prompt_submit(_control, params):
 
 def _h_clear_runtime(control, params):
     return control.clear_runtime(_s(params, "pane"))
+
+
+def _h_ledger_upsert(control, params):
+    return control.ledger_upsert(
+        wrapper_id=_s(params, "wrapper_id") or _s(params, "wrapper_launch_id"),
+        instance_id=_s(params, "instance_id"),
+        persona=_s(params, "persona"),
+        pane_positional_id=_s(params, "pane_positional_id")
+        or _s(params, "pane_label")
+        or _s(params, "pane_id"),
+        engine=_s(params, "engine"),
+        working_dir=_s(params, "working_dir") or _s(params, "cwd"),
+        born_epoch=params.get("born_epoch"),
+        state=_s(params, "state", "OPEN"),
+    )
+
+
+def _h_ledger_resolve(control, params):
+    return control.ledger_resolve(
+        _s(params, "id") or _s(params, "value"),
+        wrapper_id=_s(params, "wrapper_id") or _s(params, "wrapper_launch_id"),
+        instance_id=_s(params, "instance_id"),
+        pane_positional_id=_s(params, "pane_positional_id")
+        or _s(params, "pane_label")
+        or _s(params, "pane_id"),
+        include_closed=_b(params, "include_closed"),
+    )
+
+
+def _h_ledger_rows(control, params):
+    from .wrapper_ledger import LEDGER
+
+    return {
+        "path": str(LEDGER.path),
+        "rows": control.ledger_rows(include_closed=_b(params, "include_closed", True)),
+    }
 
 
 _WRAPPEREND_LIST_SEP = "__TMUXCTLD_WRAPPEREND_FIELD__"
@@ -1466,6 +1552,7 @@ def _h_hook_wrapperend(control, params):
         }
 
     pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
+    ledger_close = control.ledger_close(wrapper_launch_id)
     window_name = control.adapter.run(
         "display-message", "-t", pane, "-p", "#{window_name}", allow_failure=True
     ).strip()
@@ -1482,6 +1569,7 @@ def _h_hook_wrapperend(control, params):
         "wrapper_launch_id": wrapper_launch_id,
         "pane": (reap or {}).get("pane", pane),
         "pane_label": pane_label,
+        "ledger": ledger_close,
         "reap": reap,
         "teardown": teardown,
     }
@@ -1529,6 +1617,8 @@ def _h_hook_wrapperstart(control, params):
 
     current_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
     if current_owner != wrapper_launch_id:
+        if current_owner:
+            control.ledger_close(current_owner)
         # Reuse path: the next wrapper must never inherit statusline/persona/guard
         # stamps from the prior occupant.  This is the same daemon-owned runtime
         # cleanup pathway WrapperEnd uses; wrapperstart then stamps the new owner.
@@ -1549,6 +1639,18 @@ def _h_hook_wrapperstart(control, params):
 
     # (2) Persona tint from the durable pane label (no @INSTANCE_ID dependency).
     pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
+    engine = _s(params, "engine") or _s(env, "TOKEN_API_ENGINE")
+    working_dir = _s(params, "cwd") or _s(params, "working_dir") or _s(env, "TOKEN_API_CWD")
+    persona = _s(params, "persona") or _s(env, "TOKEN_API_PERSONA") or pane_label
+    ledger_row = control.ledger_upsert(
+        wrapper_id=wrapper_launch_id,
+        persona=persona,
+        pane_positional_id=pane_label,
+        engine=engine,
+        working_dir=working_dir,
+        born_epoch=time.time(),
+        state="OPEN",
+    )
     tint = ""
     try:
         tint = assertions.apply_persona_pane_tint(control.adapter, pane, pane_label) or ""
@@ -1560,6 +1662,7 @@ def _h_hook_wrapperstart(control, params):
         "wrapper_launch_id": wrapper_launch_id,
         "pane": pane,
         "pane_label": pane_label,
+        "ledger": ledger_row,
         "tint": tint,
     }
 
@@ -2205,6 +2308,10 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("GET", "/tmux/resolve-instance"): _h_resolve_instance,
     ("GET", "/tmux/instance-id-for-pane"): _h_instance_id_for_pane,
     ("GET", "/resolve-pane"): _h_resolve_pane,
+    ("GET", "/ledger/resolve"): _h_ledger_resolve,
+    ("POST", "/ledger/resolve"): _h_ledger_resolve,
+    ("GET", "/ledger/rows"): _h_ledger_rows,
+    ("POST", "/ledger/upsert"): _h_ledger_upsert,
     ("GET", "/resolve-agent"): _h_resolve_agent,
     ("GET", "/freelist"): _h_freelist,
     ("GET", "/session-doc"): _h_session_doc,
@@ -2349,6 +2456,12 @@ class TmuxctldServer(ThreadingHTTPServer):
         self.sha = sha
         self.advertised_port = advertised_port or server_address[1]
         self.ready = threading.Event()
+        try:
+            from .wrapper_ledger import LEDGER
+
+            LEDGER.load()
+        except Exception:
+            log.exception("tmuxctld wrapper ledger load failed")
         # Throttle state for the /health-driven lifecycle-hook re-assertion. A
         # 0.0 deadline forces the re-install on the first health check after boot.
         self._hook_reassert_lock = threading.Lock()
