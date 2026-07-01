@@ -781,16 +781,17 @@ def test_sweep_asserts_every_persona_label_once():
     # The periodic reconciler runs the same assert_instance the restart path runs,
     # once per PERSONA_LABELS entry — no teardown, no duplicated predicate.
     adapter = FakeAdapter()
-    seen: list[str] = []
+    seen: list[tuple[str, dict]] = []
 
-    def fake_assert(_adapter, label):
-        seen.append(label)
+    def fake_assert(_adapter, label, **kwargs):
+        seen.append((label, kwargs))
         return {"ok": True, "pane_label": label, "action": "none", "reason": "live"}
 
     with patch.object(assertions, "assert_instance", side_effect=fake_assert):
         results = sweep_persona_panes(adapter)
 
-    assert sorted(seen) == sorted(PERSONA_LABELS)
+    assert sorted(label for label, _kwargs in seen) == sorted(PERSONA_LABELS)
+    assert all(kwargs == {"registry_optional": True} for _label, kwargs in seen)
     assert len(results) == len(PERSONA_LABELS)
     assert all(r["ok"] for r in results)
 
@@ -803,11 +804,40 @@ def test_sweep_noops_on_healthy_rows():
     with patch.object(
         assertions,
         "assert_instance",
-        side_effect=lambda _a, label: {"ok": True, "pane_label": label, "action": "none"},
+        side_effect=lambda _a, label, **_kwargs: {
+            "ok": True,
+            "pane_label": label,
+            "action": "none",
+        },
     ):
         results = sweep_persona_panes(adapter)
 
     assert {r["action"] for r in results} == {"none"}
+
+
+def test_sweep_skips_registry_for_live_persona() -> None:
+    from tmuxctl.assertions import assert_instance
+
+    adapter = FakeAdapter()
+    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="council"),
+        patch.object(assertions, "_pane_dead", return_value=False),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(
+            assertions,
+            "_registry_entries",
+            side_effect=AssertionError("registry skipped"),
+        ),
+        patch.object(assertions, "_assert_persona_color"),
+        patch.object(assertions, "_clear_persona_guard"),
+    ):
+        result = assert_instance(adapter, "council:custodes", registry_optional=True)
+
+    assert result["ok"] is True
+    assert result["action"] == "none"
+    assert result["reason"] == "live_registry_skipped"
 
 
 def test_sweep_captures_per_pane_errors_without_aborting():
@@ -815,7 +845,7 @@ def test_sweep_captures_per_pane_errors_without_aborting():
     # the error is captured for that label and the others still run.
     adapter = FakeAdapter()
 
-    def fake_assert(_adapter, label):
+    def fake_assert(_adapter, label, **_kwargs):
         if label == "council:malcador":
             raise ValueError("no live pane: council:malcador")
         return {"ok": True, "pane_label": label, "action": "none"}

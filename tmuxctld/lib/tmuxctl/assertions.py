@@ -1026,11 +1026,19 @@ def assert_instance(
     upsert: dict[str, Any] | None = None,
     prune: bool = False,
     session: str | None = None,
+    registry_optional: bool = False,
 ) -> dict[str, Any]:
     from .focus_guard import preserve_focus
 
     with preserve_focus(adapter, source="tmuxctl assert-instance", attempted_target=target):
-        return _assert_instance_impl(adapter, target, upsert=upsert, prune=prune, session=session)
+        return _assert_instance_impl(
+            adapter,
+            target,
+            upsert=upsert,
+            prune=prune,
+            session=session,
+            registry_optional=registry_optional,
+        )
 
 
 def _assert_instance_impl(
@@ -1040,6 +1048,7 @@ def _assert_instance_impl(
     upsert: dict[str, Any] | None = None,
     prune: bool = False,
     session: str | None = None,
+    registry_optional: bool = False,
 ) -> dict[str, Any]:
     # upsert/prune are accepted only for internal compatibility; public CLI no longer exposes them.
     # session pins resolution to the restart target (`main`); None keeps the
@@ -1062,6 +1071,14 @@ def _assert_instance_impl(
         return result
 
     runtime_ok = _runtime_has_instance(adapter, pane_id)
+    if pane_label in PERSONA_LABELS and runtime_ok and registry_optional:
+        spec = persona_spec(pane_label)
+        _assert_persona_color(adapter, pane_id, spec)
+        _clear_persona_guard(adapter, pane_id)
+        result = _base_result(pane_id, pane_label, pane_type, None)
+        result.update({"ok": True, "action": "none", "reason": "live_registry_skipped"})
+        return result
+
     # Resolve the registry row through the pane's live @INSTANCE_ID stamp (the
     # source of truth resolve-instance uses), not just the stored tmux_pane column.
     instance_stamp = adapter.show_pane_option(pane_id, "@INSTANCE_ID")
@@ -1254,9 +1271,11 @@ def sweep_persona_panes(
             # Only pin when a session was requested; the ambient in-pane sweep
             # (service/cli) resolves against the current session unchanged.
             if session is None:
-                results.append(assert_instance(adapter, pane_label))
+                results.append(assert_instance(adapter, pane_label, registry_optional=True))
             else:
-                results.append(assert_instance(adapter, pane_label, session=session))
+                results.append(
+                    assert_instance(adapter, pane_label, session=session, registry_optional=True)
+                )
         except Exception as exc:  # noqa: BLE001 — one bad pane must not stop the sweep
             results.append(
                 {
