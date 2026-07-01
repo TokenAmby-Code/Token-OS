@@ -135,6 +135,59 @@ def test_health_shape() -> None:
         server.shutdown()
 
 
+def test_typing_guard_state_endpoint_routes_supported_json_commands(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        cmd = argv[0]
+        print(
+            json.dumps(
+                {
+                    "kind": "agent" if cmd == "hold" else cmd,
+                    "active": cmd != "release",
+                    "owner": "req-1" if cmd == "hold" else None,
+                }
+            )
+        )
+        return 0
+
+    monkeypatch.setattr(daemon.typing_guard_state, "main", fake_main)
+    server, _ = _serve(StubAdapter)
+    try:
+        for cmd in ("arm", "pending", "hold", "release", "expire-pane", "status"):
+            status, payload = _post(
+                server,
+                "/typing-guard-state",
+                {"cmd": cmd, "pane": "%42", "seconds": 8, "owner": "req-1"},
+            )
+            assert status == 200
+            assert payload["ok"] is True
+            assert payload["result"]["returncode"] == 0
+        assert [call[0] for call in calls] == [
+            "arm",
+            "pending",
+            "hold",
+            "release",
+            "expire-pane",
+            "status",
+        ]
+        assert all("--pane" in call and "%42" in call for call in calls)
+    finally:
+        server.shutdown()
+
+
+def test_typing_guard_state_endpoint_rejects_unknown_command() -> None:
+    server, _ = _serve(StubAdapter)
+    try:
+        status, payload = _post(server, "/typing-guard-state", {"cmd": "legacy", "pane": "%42"})
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+    finally:
+        server.shutdown()
+
+
 def test_resolve_instance_fail_closed_envelope() -> None:
     server, _ = _serve(StubAdapter)
     try:
@@ -331,10 +384,10 @@ class ComprehensiveWrapperEndAdapter(WrapperEndAdapter):
             "@PANE_CLEAN": "1",
             "@PANE_BORN": "123",
             "@CC_STATE": "idle",
-            "@TYPING_LOCK_UNTIL": "9999999999",
-            "@TYPING_PENDING_UNTIL": "9999999999",
-            "@TYPING_AGENT_UNTIL": "9999999999",
-            "@GUARD": "#[fg=green]⌨",
+            "@TYPING_GUARD_JSON": '{"kind":"agent","owner":"wrap-1","source":"tmuxctld","until":9999999999}',
+            "@TYPING_GUARD_UNTIL": "9999999999",
+            "@TYPING_GUARD_KIND": "agent",
+            "@TYPING_GUARD_MARKER": "#[fg=green]⌨",
             "@GT_FIRE": "123",
             "@DISCORD_VOICE_LOCK": "1",
             "@TOKEN_API_CWD": "/old",
@@ -389,10 +442,10 @@ def test_wrapperend_comprehensively_scrubs_identity_status_guard_and_reaps_dead_
             "@PANE_CLEAN",
             "@PANE_BORN",
             "@CC_STATE",
-            "@TYPING_LOCK_UNTIL",
-            "@TYPING_PENDING_UNTIL",
-            "@TYPING_AGENT_UNTIL",
-            "@GUARD",
+            "@TYPING_GUARD_JSON",
+            "@TYPING_GUARD_UNTIL",
+            "@TYPING_GUARD_KIND",
+            "@TYPING_GUARD_MARKER",
             "@SESSION_DOC",
             "@CWD",
             "@GT_FIRE",
@@ -1176,7 +1229,7 @@ def test_agent_guard_hold_acquired_and_released_even_when_verify_times_out(monke
     SendAckAdapter.calls = []
     events: list[str] = []
     monkeypatch.setattr(
-        daemon.typing_guard_state, "hold", lambda *a, **k: events.append("hold") or True
+        daemon.typing_guard_state, "hold", lambda *a, **k: events.append("hold") or "req-1"
     )
     monkeypatch.setattr(
         daemon.typing_guard_state, "release", lambda *a, **k: events.append("release")
@@ -1250,7 +1303,7 @@ def test_send_text_returns_gated_without_waiting_or_writing_under_typing_guard(m
         },
     )
     monkeypatch.setattr(
-        daemon.typing_guard_state, "hold", lambda *a, **k: hold_calls.append("hold") or True
+        daemon.typing_guard_state, "hold", lambda *a, **k: hold_calls.append("hold") or "req-1"
     )
     server, _ = _serve(SendAckAdapter)
     try:
@@ -1332,7 +1385,7 @@ def test_swallowed_submit_fires_recovery_and_surfaces_loudly(monkeypatch) -> Non
     # never silently eat it.
     StuckDraftAdapter.calls = []
     notified: list[dict] = []
-    monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: True)
+    monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: "req-1")
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_notify_swallowed_submit", lambda **kw: notified.append(kw))
     server, _ = _serve(StuckDraftAdapter)

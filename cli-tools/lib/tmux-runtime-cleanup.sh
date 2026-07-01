@@ -33,10 +33,10 @@ tmux_runtime_cleanup_pane() {
         @GT_FIRE \
         @PLANNING_STATE \
         @PLANNING_AGENT \
-        @TYPING_LOCK_UNTIL \
-        @TYPING_PENDING_UNTIL \
-        @TYPING_AGENT_UNTIL \
-        @GUARD \
+        @TYPING_GUARD_JSON \
+        @TYPING_GUARD_UNTIL \
+        @TYPING_GUARD_KIND \
+        @TYPING_GUARD_MARKER \
         @DISCORD_VOICE_LOCK \
         @DISCORD_VOICE_PROCESSING \
         @TOKEN_API_WRAPPER_LAUNCH_ID \
