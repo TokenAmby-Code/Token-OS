@@ -164,6 +164,91 @@ class TmuxControlPlane:
         """Apply a focus mode to a window (e.g. zoom/spread the panes)."""
         return focus_window(self.adapter, session_name, window_index, mode)
 
+    def grid_expand(
+        self,
+        *,
+        pane: str = "",
+        client: str = "",
+        expand: bool = False,
+        retract: bool = False,
+    ) -> dict:
+        """Toggle native tmux zoom for a pane or client-selected pane.
+
+        This is the daemon-native equivalent of ``tmux-grid-expand``. It uses
+        native tmux zoom only (``resize-pane -Z``), preserving pane identity,
+        window membership, running processes, and explicit pane targets.
+        """
+
+        if pane:
+            target_pane = pane
+        elif client:
+            target_pane = self.adapter.run(
+                "display-message", "-c", client, "-p", "#{pane_id}"
+            ).strip()
+        else:
+            target_pane = self.adapter.run("display-message", "-p", "#{pane_id}").strip()
+        if not target_pane:
+            raise ValueError("grid-expand could not resolve target pane")
+
+        self.adapter.run("display-message", "-t", target_pane, "-p", "", allow_failure=False)
+        target_window = self.adapter.run(
+            "display-message", "-t", target_pane, "-p", "#{session_name}:#{window_index}"
+        ).strip()
+        if not target_window:
+            raise ValueError(f"grid-expand could not resolve target window for {target_pane}")
+        zoomed_before = (
+            self.adapter.run(
+                "display-message", "-t", target_window, "-p", "#{window_zoomed_flag}"
+            ).strip()
+            == "1"
+        )
+
+        for option in (
+            "@GRID_EXPANDED",
+            "@GRID_STASH",
+            "@GENERIC_EXPANDED",
+            "@GENERIC_STASH",
+            "@SIDE_EXPANDED",
+        ):
+            value = "" if option.endswith("_STASH") else "none"
+            self.adapter.run(
+                "set-option",
+                "-w",
+                "-t",
+                target_window,
+                option,
+                value,
+                allow_failure=True,
+            )
+
+        action = "noop"
+        if retract:
+            if zoomed_before:
+                self.adapter.run("resize-pane", "-Z", "-t", target_pane)
+                action = "retract"
+        elif expand:
+            if not zoomed_before:
+                self.adapter.run("resize-pane", "-Z", "-t", target_pane)
+                action = "expand"
+        else:
+            self.adapter.run("resize-pane", "-Z", "-t", target_pane)
+            action = "toggle"
+
+        zoomed_after = (
+            self.adapter.run(
+                "display-message", "-t", target_window, "-p", "#{window_zoomed_flag}"
+            ).strip()
+            == "1"
+        )
+        return {
+            "status": "ok",
+            "pane": self.public_pane_id(target_pane),
+            "window": target_window,
+            "action": action,
+            "zoomed_before": zoomed_before,
+            "zoomed_after": zoomed_after,
+        }
+
     def resolve_pane(self, target: str) -> str:
         """Resolve a pane target and render its identity, role, kind, and agent."""
         resolved = resolve_pane(self.adapter, target)
