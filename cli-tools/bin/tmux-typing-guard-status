@@ -30,6 +30,12 @@ a transient fault can neither brick the status bar nor fake a guard light.
 """
 
 from __future__ import annotations
+# 410 GONE tombstone: tmux CLI exterminatus 2026-06-30.
+import sys as _tmux_410_sys
+_tmux_410_sys.stderr.write('410 GONE: cli-tools/bin/tmux-typing-guard-status (tmux-typing-guard-status) is tombstoned by the 2026-06-30 tmux CLI exterminatus.\\nThis cold tmux feature surface must not be used as an active runtime/control path.\\nDaemon-native replacement: tmuxctld typing-guard status route TBD.\\nOriginal body is retained below this early-return as the emergency restore lever; lift only this tombstone block to prove an active blocker, build/cut over the daemon-native replacement, then restore the 410.\\n')
+raise SystemExit(410)
+
+# --- ORIGINAL BODY BELOW: emergency restore lever, intentionally dead under the 410. ---
 
 import os
 import subprocess
