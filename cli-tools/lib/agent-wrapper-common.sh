@@ -159,7 +159,7 @@ token_wrapper_post_hook_async() {
 
 # Symmetric front-half of the WrapperEnd daemon ping. The tmuxctld daemon is the
 # authoritative registrar for the wrapper's tmux-side identity (stamp + persona
-# tint); this ping is what lets it stamp @TOKEN_API_WRAPPER_LAUNCH_ID and paint
+# tint); this ping is what lets it stamp @TOKEN_API_WRAPPER_ID and paint
 # the seat's persona tint at birth — derived from the durable @PANE_ID label, NOT
 # from @INSTANCE_ID, so a singleton seat is never tint-less in the window between
 # the prior WrapperEnd clearing the pane and the next SessionStart landing. The
@@ -224,7 +224,7 @@ token_wrapper_build_payload() {
   local exit_code="${2:-}"
   jq -nc \
     --arg action "$action_type" \
-    --arg wrapper_launch_id "$WRAPPER_LAUNCH_ID" \
+    --arg wrapper_id "${WRAPPER_ID:-${WRAPPER_LAUNCH_ID:-}}" \
     --arg launcher "$LAUNCHER" \
     --arg engine "$ENGINE" \
     --arg cwd "$WORKING_DIR" \
@@ -258,12 +258,12 @@ token_wrapper_build_payload() {
     --arg token_api_claude_model "${TOKEN_API_CLAUDE_MODEL:-}" \
     --arg token_api_persona "${TOKEN_API_PERSONA:-}" \
     --arg token_api_legion "${TOKEN_API_LEGION:-}" \
-    --arg token_api_wrapper_launch_id "$WRAPPER_LAUNCH_ID" \
+    --arg token_api_wrapper_id "${WRAPPER_ID:-${WRAPPER_LAUNCH_ID:-}}" \
     --argjson pid "$$" \
     --argjson exit_code "${exit_code:-null}" \
     '{
       action: $action,
-      wrapper_launch_id: $wrapper_launch_id,
+      wrapper_id: $wrapper_id,
       launcher: $launcher,
       engine: $engine,
       cwd: $cwd,
@@ -301,14 +301,14 @@ token_wrapper_build_payload() {
         TOKEN_API_CLAUDE_MODEL: $token_api_claude_model,
         TOKEN_API_PERSONA: $token_api_persona,
         TOKEN_API_LEGION: $token_api_legion,
-        TOKEN_API_WRAPPER_LAUNCH_ID: $token_api_wrapper_launch_id
+        TOKEN_API_WRAPPER_ID: $token_api_wrapper_id
       }
     }'
 }
 
 token_wrapper_stamp_start() {
   if declare -F tmux_runtime_stamp_wrapper >/dev/null 2>&1; then
-    tmux_runtime_stamp_wrapper "$TMUX_PANE_VALUE" "$WRAPPER_LAUNCH_ID" "$ENGINE" "$LAUNCHER" "$WORKING_DIR"
+    tmux_runtime_stamp_wrapper "$TMUX_PANE_VALUE" "${WRAPPER_ID:-${WRAPPER_LAUNCH_ID:-}}" "$ENGINE" "$LAUNCHER" "$WORKING_DIR"
   fi
 }
 

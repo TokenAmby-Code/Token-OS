@@ -12338,18 +12338,39 @@ async def list_instances(
 
 
 @app.get("/api/instances/resolve")
-async def resolve_instance(pid: int | None = None, cwd: str | None = None):
+async def resolve_instance(
+    pid: int | None = None,
+    cwd: str | None = None,
+    wrapper_id: str | None = None,
+    wrapper_launch_id: str | None = None,
+):
     """Resolve the calling agent's instance using PID and/or CWD fallback.
 
     Returns instance + session doc info in a single call.
-    Resolution order: PID match → CWD match (prefer processing over idle).
+    Resolution order: wrapper_id → CWD match (prefer processing over idle).
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         instance = None
 
-        # Method 1 used to match a persisted PID. PID is archive-only after the
-        # instance-table cutover; callers should pass cwd or use tmux @INSTANCE_ID.
+        wrapper_key = (wrapper_id or wrapper_launch_id or "").strip()
+        if wrapper_key:
+            cursor = await db.execute(
+                """SELECT i.*,
+                          p.slug AS persona_slug,
+                          p.display_name AS persona_display_name,
+                          p.pane_tint AS persona_pane_tint,
+                          p.chip_color AS persona_chip_color,
+                          p.tts_voice AS persona_tts_voice,
+                          p.tts_rate AS persona_tts_rate,
+                          p.notification_sound AS persona_notification_sound
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE i.wrapper_launch_id = ? AND i.rank != 'retired'
+                   ORDER BY i.last_activity DESC LIMIT 1""",
+                (wrapper_key,),
+            )
+            instance = await cursor.fetchone()
 
         # Method 2: CWD match (prefer processing)
         if not instance and cwd:

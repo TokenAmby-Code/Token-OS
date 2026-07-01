@@ -313,42 +313,45 @@ sql_literal() {
   printf "%s" "$1" | sed "s/'/''/g"
 }
 
+ledger_resolve_field() {
+  local query_key="$1" query_value="$2" field="$3"
+  [[ -n "$query_value" ]] || return 0
+  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:8765}"
+  TMUXCTLD_URL="$tmuxctld_url" QUERY_KEY="$query_key" QUERY_VALUE="$query_value" FIELD="$field" python3 - <<'PYLEDGER'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:8765").rstrip("/")
+key = os.environ.get("QUERY_KEY", "")
+value = os.environ.get("QUERY_VALUE", "")
+field = os.environ.get("FIELD", "")
+if not key or not value or not field:
+    sys.exit(0)
+url = f"{base}/ledger/resolve?{urllib.parse.urlencode({key: value})}"
+try:
+    with urllib.request.urlopen(url, timeout=1) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict) or not data.get("found"):
+    sys.exit(0)
+value = data.get(field) or ""
+if value:
+    print(str(value), end="")
+PYLEDGER
+}
+
 resolve_caller_instance_id() {
-  local pane_sql row label_sql
-  # 1. By the caller's own tmux pane (interactive / pane-bound dispatch).
+  local row
+  # tmuxctld ledger is the runtime oracle. Prefer wrapper_id because plan-cycle
+  # re-execs churn engine session ids while the wrapper process persists.
+  row="$(ledger_resolve_field wrapper_id "${TOKEN_API_WRAPPER_ID:-${TOKEN_API_WRAPPER_LAUNCH_ID:-}}" instance_id || true)"
+  [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
   if [[ -n "${TMUX_PANE:-}" ]]; then
-    pane_sql="$(sql_literal "$TMUX_PANE")"
-    row="$(sqlite_query "
-      SELECT id
-      FROM instances
-      WHERE tmux_pane = '${pane_sql}'
-        AND COALESCE(status, '') != 'stopped'
-      ORDER BY last_activity DESC
-      LIMIT 1;
-    ")"
-    [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
-  fi
-  # 2. Explicit instance id from the harness env. An agent's Bash-tool subshell
-  #    often lacks $TMUX_PANE but still carries the dispatching instance's id.
-  if [[ -n "${TOKEN_API_INSTANCE_ID:-}" ]]; then
-    printf '%s' "${TOKEN_API_INSTANCE_ID}"
-    return 0
-  fi
-  # 3. Persona singleton by bound pane label. Headless personas (e.g. the
-  #    Fabricator-General) dispatch from an agent context with neither
-  #    $TMUX_PANE nor an instance-id env; resolve the live row by its pane label
-  #    (e.g. pane_label='mechanicus:fabricator-general' for TOKEN_API_PERSONA).
-  local persona_env="${TOKEN_API_PERSONA:-}"
-  if [[ -n "$persona_env" ]]; then
-    label_sql="$(sql_literal "$persona_env")"
-    row="$(sqlite_query "
-      SELECT id
-      FROM instances
-      WHERE pane_label LIKE '%:' || '${label_sql}'
-        AND COALESCE(status, '') != 'stopped'
-      ORDER BY last_activity DESC
-      LIMIT 1;
-    ")"
+    row="$(ledger_resolve_field pane "$TMUX_PANE" instance_id || true)"
     [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
   fi
   return 0
@@ -1720,8 +1723,8 @@ AUTO_PARENT_INSTANCE_ID=""
 # Add a dispatch CLI flag later if trusted orchestrators need explicit parentage.
 
 # A dispatched worker is always a NEW wrapper launch, so it must mint its OWN
-# wrapper_launch_id — never inherit the dispatching agent's. token-api SessionStart
-# treats wrapper_launch_id as unique per wrapper launch and re-keys the most-recent
+# wrapper_id — never inherit the dispatching agent's. token-api SessionStart
+# treats wrapper_id as unique per wrapper launch and re-keys the most-recent
 # row carrying it (routes/hooks.py branch 5); inheriting the dispatcher's id makes
 # the worker supplant the dispatcher's registry row and clobber its (singleton)
 # persona — the systemic singleton-decapitation channel. The caller-pane-identity
@@ -1730,7 +1733,7 @@ WRAPPER_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 COMMON_ENV=(
   "TOKEN_API_LAUNCHER=dispatch"
   "TOKEN_API_ENGINE=${ENGINE}"
-  "TOKEN_API_WRAPPER_LAUNCH_ID=${WRAPPER_ID}"
+  "TOKEN_API_WRAPPER_ID=${WRAPPER_ID}"
   "TOKEN_API_DISPATCH_TARGET=${TARGET}"
   "TOKEN_API_LEGION=${LEGION}"
   "TOKEN_API_DISPATCH_WINDOW=${DISPATCH_WINDOW}"
@@ -1858,7 +1861,7 @@ build_agent_command() {
     fi
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
-  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME -u TOKEN_API_WRAPPER_LAUNCH_ID -u TOKEN_API_VAULT_DOMAIN -u TOKEN_API_SESSION_DOC_ID TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
+  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME -u TOKEN_API_WRAPPER_ID -u TOKEN_API_WRAPPER_LAUNCH_ID -u TOKEN_API_VAULT_DOMAIN -u TOKEN_API_SESSION_DOC_ID TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
   local e
   for e in "${envs[@]}"; do printf ' %q' "$e"; done
   local a
@@ -1922,13 +1925,13 @@ dispatch_launch_observe_timeout() {
 
 pane_instance_id() {
   local pane="$1"
-  command -v tmux >/dev/null 2>&1 || return 0
-  tmux display-message -p -t "$pane" '#{@INSTANCE_ID}' 2>/dev/null || true
+  ledger_resolve_field pane "$pane" instance_id || true
 }
 
-clear_pane_wrapper_launch_id() {
+clear_pane_wrapper_id() {
   local pane="$1"
   command -v tmux >/dev/null 2>&1 || return 0
+  tmux set-option -pu -t "$pane" @TOKEN_API_WRAPPER_ID >/dev/null 2>&1 || true
   tmux set-option -pu -t "$pane" @TOKEN_API_WRAPPER_LAUNCH_ID >/dev/null 2>&1 || true
   tmux set-option -pu -t "$pane" @INSTANCE_ID >/dev/null 2>&1 || true
 }
@@ -1971,20 +1974,18 @@ reconcile_dispatch_registry_bind() {
   # singleton-undercount path, never bind at all. A single best-effort check: if
   # the row is already live, stay silent; otherwise emit an ADVISORY "registration
   # slow" warning and return success regardless. Never fails the launch.
-  local pane="$1" target_display="$2" instance_id row status row_workdir row_label expected_label
+  local pane="$1" target_display="$2" instance_id row status row_workdir
   command -v sqlite3 >/dev/null 2>&1 || return 0
   [[ -f "$DB_PATH" ]] || return 0
   instance_id="$(pane_instance_id "$pane")"
   if [[ -n "$instance_id" ]]; then
     row="$(sqlite3 -separator $'\t' "$DB_PATH" \
-      "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
+      "SELECT COALESCE(status,''), COALESCE(working_dir,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
       2>/dev/null || true)"
     if [[ -n "$row" ]]; then
-      IFS=$'\t' read -r status row_workdir row_label <<< "$row"
-      expected_label="$(resolve_pane_label_for_env "$pane")"
+      IFS=$'\t' read -r status row_workdir <<< "$row"
       if [[ "$status" != "stopped" && "$status" != "archived" ]] \
-        && { [[ -n "$RESUME_ID" ]] || [[ "$row_workdir" == "$WORK_DIR" ]]; } \
-        && { [[ -z "$expected_label" ]] || [[ -n "$row_label" ]]; }; then
+        && { [[ -n "$RESUME_ID" ]] || [[ "$row_workdir" == "$WORK_DIR" ]]; }; then
         return 0
       fi
     fi
@@ -2174,7 +2175,7 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   sleep 0.3
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   phys_pane="$(materialize_physical_pane "$pane_id")"
-  clear_pane_wrapper_launch_id "$phys_pane"
+  clear_pane_wrapper_id "$phys_pane"
   tmux send-keys -t "$phys_pane" "$STAGED_COMMAND" Enter
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
@@ -2203,7 +2204,7 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   tmux send-keys -t "$PHYSICAL_TARGET" "clear" Enter
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
-  clear_pane_wrapper_launch_id "$PHYSICAL_TARGET"
+  clear_pane_wrapper_id "$PHYSICAL_TARGET"
   tmux send-keys -t "$PHYSICAL_TARGET" "$STAGED_COMMAND" Enter
   target_display="${RESOLVED_TARGET:-$TARGET}"
   if [[ "$TARGET" == %* ]]; then

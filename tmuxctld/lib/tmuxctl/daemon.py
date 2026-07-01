@@ -1410,6 +1410,7 @@ def _ledger_wrapper_id(params: dict) -> str:
     return (
         _s(params, "wrapper_id")
         or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
         or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
     ).strip()
 
@@ -1583,7 +1584,12 @@ def _h_hook_wrapperend(control, params):
     no-ops; a pane owned by a different wrapper is surfaced as an error.
     """
     env = params.get("env") if isinstance(params.get("env"), dict) else {}
-    wrapper_launch_id = _s(params, "wrapper_launch_id") or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    wrapper_launch_id = (
+        _s(params, "wrapper_id")
+        or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
+        or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    )
     pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
     if not wrapper_launch_id:
         log.error("tmuxctld wrapperend missing wrapper_launch_id pane=%s", pane)
@@ -1666,7 +1672,12 @@ def _h_hook_wrapperstart(control, params):
     from . import assertions
 
     env = params.get("env") if isinstance(params.get("env"), dict) else {}
-    wrapper_launch_id = _s(params, "wrapper_launch_id") or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    wrapper_launch_id = (
+        _s(params, "wrapper_id")
+        or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
+        or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    )
     pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
     if not wrapper_launch_id:
         log.error("tmuxctld wrapperstart missing wrapper_launch_id pane=%s", pane)
