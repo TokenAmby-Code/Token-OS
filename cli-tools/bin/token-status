@@ -10,44 +10,72 @@ Usage:
     token-status --json       # JSON output
 """
 
-import os
-import re
-import sys
 import json
+import os
+import sys
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
-API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+REQUEST_TIMEOUT_SECONDS = 5
+
+LIVE_STATUSES = {
+    "idle",
+    "working",
+    "questioning",
+    "preplanning",
+    "planning",
+    "compacting",
+    "reviewing",
+    "victorious",
+}
+NOT_LIVE_STATUSES = {"stopped", "archived"}
+
+
+def api_url(path, **query):
+    url = f"{API_URL}{path}"
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query)}"
+    return url
 
 
 def check_health():
     try:
-        req = urllib.request.Request(f"{API_URL}/health", method="GET")
-        with urllib.request.urlopen(req, timeout=2) as resp:
+        req = urllib.request.Request(api_url("/health"), method="GET")
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
             return True, json.loads(resp.read().decode())
     except Exception as e:
         return False, str(e)
 
 
 def get_instances():
+    """Read the canonical instance read-model only; no tmux/runtime enrichment."""
     try:
-        req = urllib.request.Request(f"{API_URL}/api/instances", method="GET")
-        with urllib.request.urlopen(req, timeout=2) as resp:
+        req = urllib.request.Request(
+            api_url("/api/instances", include_runtime="false"), method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read().decode())
     except Exception:
         return []
 
 
-def format_duration(registered_at):
+def format_duration(created_at):
     try:
-        start = datetime.fromisoformat(registered_at.replace("Z", "+00:00"))
-        delta = datetime.now() - start.replace(tzinfo=None)
-        mins = int(delta.total_seconds() // 60)
+        start = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        now = datetime.now(start.tzinfo) if start.tzinfo else datetime.now()
+        delta = now - start
+        mins = max(0, int(delta.total_seconds() // 60))
         if mins >= 60:
             return f"{mins // 60}h{mins % 60}m"
         return f"{mins}m"
-    except:
+    except Exception:
         return "?"
+
+
+def display_name(inst):
+    return inst.get("name") or "?"
 
 
 def display_status(json_output=False):
@@ -55,38 +83,47 @@ def display_status(json_output=False):
     instances = get_instances()
 
     if json_output:
-        print(json.dumps({
-            "healthy": healthy,
-            "health": health_data if healthy else None,
-            "instances": instances
-        }, indent=2, default=str))
+        print(
+            json.dumps(
+                {
+                    "healthy": healthy,
+                    "health": health_data if healthy else None,
+                    "instances": instances,
+                },
+                indent=2,
+                default=str,
+            )
+        )
         return
 
     # Header
     status_icon = "\033[32m●\033[0m" if healthy else "\033[31m●\033[0m"
-    print(f"{status_icon} Token-API @ localhost:7777")
+    print(f"{status_icon} Token-API @ {API_URL}")
 
     if not healthy:
         print(f"  \033[31mError: {health_data}\033[0m")
         return
 
     # Instances
-    active = [i for i in instances if i.get("status") in ("processing", "idle")]
-    stopped = [i for i in instances if i.get("status") == "stopped"]
+    active = [i for i in instances if i.get("status") in LIVE_STATUSES]
+    stopped = [i for i in instances if i.get("status") in NOT_LIVE_STATUSES]
 
     print(f"\n  Active: {len(active)}  Stopped: {len(stopped)}")
 
     if active:
         print()
         for inst in active:
-            name = inst.get("tab_name") or inst.get("working_dir", "?").split("/")[-1]
-            if re.match(r'^Claude \d{2}:\d{2}$', name):
-                wd = inst.get("working_dir", "")
-                name = "/".join(wd.split("/")[-2:]) if wd else name
-            device = inst.get("device_id", "?")
-            duration = format_duration(inst.get("registered_at", ""))
-            processing = " \033[33m>\033[0m" if inst.get("status") == "processing" else "  "
-            print(f"  {processing} {name[:25]:<25} {device:<12} {duration}")
+            status = inst.get("status") or "?"
+            label = inst.get("cockpit_label") or status
+            name = display_name(inst)
+            device = inst.get("device_id") or "?"
+            duration = format_duration(inst.get("created_at"))
+            working_dir = inst.get("working_dir") or "?"
+            marker = "\033[33m>\033[0m" if status == "working" else " "
+            print(
+                f"  {marker} {label[:12]:<12} {name[:25]:<25} "
+                f"{device:<12} {duration:<7} {working_dir}"
+            )
 
 
 def main():
@@ -100,6 +137,7 @@ def main():
 
     if "--watch" in args or "-w" in args:
         import time
+
         try:
             while True:
                 print("\033[2J\033[H", end="")  # Clear screen
