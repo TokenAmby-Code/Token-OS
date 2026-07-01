@@ -74,7 +74,7 @@ DEFAULT_PORT = 7778
 # "Pane is dead" now that the old correctness poll is retired.
 _PANE_DIED_HOOK = (
     'run-shell -b "tmuxctld-ping POST /event event=pane-died pane=#{pane_id} '
-    '>/dev/null || env IMPERIUM_TMUX_RAW=1 tmux display-message '
+    ">/dev/null || env IMPERIUM_TMUX_RAW=1 tmux display-message "
     'tmuxctld-ping-/event-failed"'
 )
 
@@ -1563,6 +1563,15 @@ def _h_focus(control, params):
     )
 
 
+def _h_grid_expand(control, params):
+    return control.grid_expand(
+        pane=_s(params, "pane"),
+        client=_s(params, "client"),
+        expand=_b(params, "expand"),
+        retract=_b(params, "retract"),
+    )
+
+
 def _h_pane_select(control, params):
     return control.pane_select(
         mode=_s(params, "mode"), direction=_s(params, "direction"), client=_s(params, "client")
@@ -1999,6 +2008,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/mechanicus/enforce"): _h_mechanicus_enforce,
     ("POST", "/normalize"): _h_normalize,
     ("POST", "/focus"): _h_focus,
+    ("POST", "/grid-expand"): _h_grid_expand,
     ("POST", "/pane-select"): _h_pane_select,
     ("POST", "/create"): _h_create,
     ("POST", "/rebuild-window"): _h_rebuild_window,
