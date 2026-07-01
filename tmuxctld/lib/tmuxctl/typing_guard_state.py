@@ -143,7 +143,6 @@ def mark_client_activity(
     if not client:
         return
     args = [
-        "tmux-client-lease",
         "activity",
         "--client",
         client,
@@ -157,9 +156,9 @@ def mark_client_activity(
     if session:
         args.extend(["--session", session])
     try:
-        subprocess.run(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=1.0
-        )
+        from tmux_client_lease import main as client_lease_main
+
+        client_lease_main(args)
     except Exception:
         pass
 

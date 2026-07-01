@@ -13,6 +13,12 @@
 #
 # Dirty panes (Claude processing) are dimmed in the selector.
 
+
+# 410-on-touch shim: this cold CLI/keybind path is retired.  The dead body
+# below is intentionally retained for the separately-gated atomic wipe.
+echo "tmux-shuttle: HTTP 410 Gone — shuttle live path is tmuxctld-ping POST /shuttle." >&2
+exit 154  # 410 modulo POSIX shell's 8-bit exit status
+
 set -euo pipefail
 export IMPERIUM_ALLOW_TMUX_FOCUS="${IMPERIUM_ALLOW_TMUX_FOCUS:-1}"
 export IMPERIUM_ALLOW_MECHANICUS_FOCUS="${IMPERIUM_ALLOW_MECHANICUS_FOCUS:-1}"

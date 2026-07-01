@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # tmux-client-lease — soft lease policy for desktop/mobile tmux clients
+
+# 410-on-touch shim: this cold CLI/keybind path is retired.  The dead body
+# below is intentionally retained for the separately-gated atomic wipe.
+echo "tmux-client-lease: HTTP 410 Gone — client lease live path is tmuxctld-ping POST /client-lease." >&2
+exit 154  # 410 modulo POSIX shell's 8-bit exit status
+
 set -euo pipefail
 _THIS="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")"
 _LIB_DIR="$(dirname "$(dirname "$_THIS")")/lib"

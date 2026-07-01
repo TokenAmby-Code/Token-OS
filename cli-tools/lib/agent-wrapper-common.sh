@@ -29,7 +29,7 @@ token_wrapper_uuid() {
 # "translate physical->public on the way out" layer).
 #
 #   already-canonical (page:index)  -> kept verbatim
-#   raw %NNN / self / current       -> `tmuxctl resolve-pane --format id`
+#   raw %NNN / self / current       -> tmuxctld /resolve-pane
 #   empty / no @PANE_ID role / error -> FAIL OPEN to the input (today's behavior)
 #
 # Fail-open is deliberate: a pane with no canonical cardinal (e.g. no @PANE_ID
@@ -42,8 +42,12 @@ normalize_pane_to_canonical() {
     printf '%s' "$pane"
     return 0
   fi
-  if command -v tmuxctl >/dev/null 2>&1; then
-    resolved="$(tmuxctl resolve-pane --format id "$pane" 2>/dev/null || true)"
+  if command -v curl >/dev/null 2>&1; then
+    resolved="$(curl -sfG --max-time 1 \
+      --data-urlencode "target=$pane" \
+      --data-urlencode "format=id" \
+      "${TMUXCTLD_URL:-http://127.0.0.1:7778}/resolve-pane" 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("result") or "")' 2>/dev/null || true)"
     [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
   fi
   printf '%s' "$pane"
@@ -310,11 +314,11 @@ token_wrapper_stamp_start() {
 
 token_wrapper_cleanup_pane() {
   local pane="${1:-$TMUX_PANE_VALUE}"
-  local tmuxctl_bin="${TOKEN_WRAPPER_LIB_DIR}/../bin/tmuxctl"
-  if [[ -n "$pane" && -x "$tmuxctl_bin" ]]; then
-    IMPERIUM_TMUX_AUTOMATION=1 "$tmuxctl_bin" clear-runtime --pane "$pane" >/dev/null 2>&1 && return 0
-  elif [[ -n "$pane" ]] && command -v tmuxctl >/dev/null 2>&1; then
-    IMPERIUM_TMUX_AUTOMATION=1 tmuxctl clear-runtime --pane "$pane" >/dev/null 2>&1 && return 0
+  local tmuxctld_ping="${TOKEN_WRAPPER_LIB_DIR}/../bin/tmuxctld-ping"
+  if [[ -n "$pane" && -x "$tmuxctld_ping" ]]; then
+    "$tmuxctld_ping" POST /clear-runtime pane="$pane" >/dev/null 2>&1 && return 0
+  elif [[ -n "$pane" ]] && command -v tmuxctld-ping >/dev/null 2>&1; then
+    tmuxctld-ping POST /clear-runtime pane="$pane" >/dev/null 2>&1 && return 0
   fi
   if declare -F tmux_runtime_cleanup_pane >/dev/null 2>&1; then
     tmux_runtime_cleanup_pane "$pane"
@@ -340,11 +344,11 @@ token_wrapper_enforce_stack_if_needed() {
     return 0
   fi
   (
-    local tmuxctl_bin="${TOKEN_WRAPPER_LIB_DIR}/../bin/tmuxctl"
-    if [[ -x "$tmuxctl_bin" ]]; then
-      IMPERIUM_TMUX_AUTOMATION=1 "$tmuxctl_bin" stack enforce --window "$window_target" --kill-pending-clear
+    local tmuxctld_ping="${TOKEN_WRAPPER_LIB_DIR}/../bin/tmuxctld-ping"
+    if [[ -x "$tmuxctld_ping" ]]; then
+      "$tmuxctld_ping" POST /stack/enforce window="$window_target" kill_pending_clear=1
     else
-      IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack enforce --window "$window_target" --kill-pending-clear
+      tmuxctld-ping POST /stack/enforce window="$window_target" kill_pending_clear=1
     fi
   ) >/dev/null 2>&1 &
 }
