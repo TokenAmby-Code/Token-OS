@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { focusPane, useOpsState, useTimerHistory, useOpsGraph, useSessionDocs } from './api';
-import type { TtsCurrent } from './types';
+import type { OpsState, TtsCurrent } from './types';
 import { formatClock } from './format';
 import { HudRings } from './components/TopStrip';
 import { TimerGraph } from './components/TimerGraph';
@@ -30,6 +30,30 @@ function Panel({
       </header>
       {children}
     </section>
+  );
+}
+
+function FreshnessDebug({ state }: { state: OpsState }) {
+  return (
+    <div className="freshness-debug">
+      <ul>
+        {Object.entries(state.source_freshness).map(([name, item]) => (
+          <li key={name}>
+            <code>{name}</code>: <strong>{item.status}</strong>
+            {' · age '}
+            {item.age_seconds ?? 'n/a'}s
+            {' · last '}
+            {item.last_seen ?? 'n/a'}
+            {' · stale_after '}
+            {item.stale_after_seconds ?? 'n/a'}s
+            <span className="subline">
+              {item.message}
+              {item.evidence?.length ? ` · ${item.evidence.join(' · ')}` : ''}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -188,6 +212,13 @@ export function App() {
         </div>
       ) : (
         <>
+          <Panel
+            title="Freshness"
+            meta={<span className="panel__meta-note">debug read-model contract</span>}
+          >
+            <FreshnessDebug state={state} />
+          </Panel>
+
           <Panel
             title="State assertions"
             meta={<span className="panel__meta-note">what Token-API believes is true</span>}

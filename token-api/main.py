@@ -19738,6 +19738,65 @@ def _ops_instance_staleness(status: str | None, age_seconds: int | None) -> dict
     }
 
 
+def _ops_instance_attention(
+    inst: dict,
+    *,
+    staleness: dict,
+    gt_next_fire: datetime | None,
+    now: datetime,
+) -> dict:
+    """Backend-derived urgency for active fleet ordering.
+
+    Lower rank means the operator should look sooner. This is intentionally a
+    small additive read-model field; it does not mutate workflow state.
+    """
+    status = str(inst.get("status") or "unknown").lower()
+    workflow_state = str(inst.get("workflow_state") or "").lower()
+    processing_like = status in {"processing", "working"} or workflow_state in {
+        "processing",
+        "working",
+        "running",
+        "in_progress",
+        "active",
+    }
+    reasons: list[str] = []
+
+    if staleness.get("is_stale") and processing_like:
+        reasons.append("stale_processing")
+        return {"attention_rank": 0, "attention_reasons": reasons}
+
+    if staleness.get("is_stale"):
+        reasons.append(str(staleness.get("reason") or "stale_activity"))
+        return {"attention_rank": 1, "attention_reasons": reasons}
+
+    next_required_action = inst.get("next_required_action")
+    if next_required_action:
+        reasons.append(f"next_required_action:{next_required_action}")
+        return {"attention_rank": 2, "attention_reasons": reasons}
+
+    if inst.get("pr_state") == "open":
+        reasons.append("pr_open")
+        return {"attention_rank": 3, "attention_reasons": reasons}
+
+    if gt_next_fire is not None:
+        try:
+            due = gt_next_fire.replace(tzinfo=None) <= now.replace(tzinfo=None)
+        except Exception:
+            due = False
+        reasons.append("golden_throne_due" if due else "golden_throne_armed")
+        return {"attention_rank": 4, "attention_reasons": reasons}
+    if inst.get("golden_throne"):
+        reasons.append("golden_throne_bound")
+        return {"attention_rank": 4, "attention_reasons": reasons}
+
+    if processing_like:
+        reasons.append("processing_or_working")
+        return {"attention_rank": 5, "attention_reasons": reasons}
+
+    reasons.append("normal_idle")
+    return {"attention_rank": 6, "attention_reasons": reasons}
+
+
 def _ops_display_name(inst: dict) -> str:
     return (
         inst.get("name")
@@ -20261,6 +20320,13 @@ async def _ops_read_instances(now: datetime) -> dict:
         if staleness["is_stale"]:
             stale_count += 1
         gt_job = scheduler.get_job(f"golden-throne-{inst.get('id')}")
+        gt_next_fire = gt_job.next_run_time if gt_job and gt_job.next_run_time else None
+        attention = _ops_instance_attention(
+            inst,
+            staleness=staleness,
+            gt_next_fire=gt_next_fire,
+            now=now,
+        )
         active.append(
             {
                 "id": inst.get("id"),
@@ -20312,11 +20378,11 @@ async def _ops_read_instances(now: datetime) -> dict:
                     "cron_job_id": inst.get("session_doc_cron_job_id"),
                 },
                 "stale": staleness,
+                "attention_rank": attention["attention_rank"],
+                "attention_reasons": attention["attention_reasons"],
                 "zealotry": inst.get("zealotry") or 4,
                 "gt": {
-                    "next_fire": gt_job.next_run_time.isoformat()
-                    if gt_job and gt_job.next_run_time
-                    else None,
+                    "next_fire": gt_next_fire.isoformat() if gt_next_fire else None,
                     "resume_count": inst.get("gt_resume_count") or 0,
                     "resume_window_started_at": inst.get("gt_resume_window_started_at"),
                     "last_resume_at": inst.get("gt_last_resume_at"),
@@ -20325,6 +20391,8 @@ async def _ops_read_instances(now: datetime) -> dict:
                 },
             }
         )
+
+    active.sort(key=lambda item: item.get("attention_rank", 99))
 
     return {
         "active": active,
@@ -20528,6 +20596,219 @@ def _ops_source_health(
         "message": message,
         "details": details or {},
     }
+
+
+def _ops_freshness_timestamp(value: str | datetime | None) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value:
+        return str(value)
+    return None
+
+
+def _ops_freshness_record(
+    status: str,
+    *,
+    age_seconds: int | None,
+    last_seen: str | datetime | None,
+    stale_after_seconds: int | None,
+    message: str,
+    evidence: list[str] | None = None,
+) -> dict:
+    normalized = status if status in {"fresh", "stale", "missing", "unknown"} else "unknown"
+    return {
+        "status": normalized,
+        "age_seconds": age_seconds,
+        "last_seen": _ops_freshness_timestamp(last_seen),
+        "stale_after_seconds": stale_after_seconds,
+        "message": message,
+        "evidence": evidence or [],
+    }
+
+
+def _ops_timestamp_freshness(
+    label: str,
+    last_seen: str | datetime | None,
+    *,
+    now: datetime,
+    stale_after_seconds: int | None,
+    evidence: list[str] | None = None,
+    missing_status: str = "missing",
+) -> dict:
+    if not last_seen:
+        return _ops_freshness_record(
+            missing_status,
+            age_seconds=None,
+            last_seen=None,
+            stale_after_seconds=stale_after_seconds,
+            message=f"{label} has no timestamp",
+            evidence=evidence,
+        )
+    age_seconds = _ops_seconds_since(last_seen, now=now)
+    if age_seconds is None:
+        return _ops_freshness_record(
+            "unknown",
+            age_seconds=None,
+            last_seen=last_seen,
+            stale_after_seconds=stale_after_seconds,
+            message=f"{label} timestamp could not be interpreted",
+            evidence=evidence,
+        )
+    if stale_after_seconds is not None and age_seconds >= stale_after_seconds:
+        return _ops_freshness_record(
+            "stale",
+            age_seconds=age_seconds,
+            last_seen=last_seen,
+            stale_after_seconds=stale_after_seconds,
+            message=f"{label} is stale ({age_seconds}s old)",
+            evidence=evidence,
+        )
+    return _ops_freshness_record(
+        "fresh",
+        age_seconds=age_seconds,
+        last_seen=last_seen,
+        stale_after_seconds=stale_after_seconds,
+        message=f"{label} is fresh ({age_seconds}s old)",
+        evidence=evidence,
+    )
+
+
+def _ops_build_source_freshness(
+    *,
+    generated_at: datetime,
+    source_errors: dict[str, list[str]],
+    work_state: WorkStateResponse,
+    instances: dict,
+    events: list[dict],
+    cron_summary: dict,
+    enforcement_summary: dict,
+    tts_summary: dict,
+    tmux_health: dict,
+) -> dict:
+    active_instances = instances.get("active") or []
+    instance_times = [
+        value
+        for item in active_instances
+        for value in (item.get("last_activity"), item.get("created_at"))
+        if value
+    ]
+    event_times = [event.get("created_at") for event in events if event.get("created_at")]
+    agents_seen = max([generated_at.isoformat(), *instance_times, *event_times])
+
+    work_generated_at = getattr(work_state, "generated_at", None) or generated_at
+    freshness = {
+        "desktop_attention": _ops_timestamp_freshness(
+            "desktop attention",
+            DESKTOP_STATE.get("last_detection"),
+            now=generated_at,
+            stale_after_seconds=300,
+            evidence=[
+                f"mode={DESKTOP_STATE.get('current_mode', 'silence')}",
+                f"work_mode={DESKTOP_STATE.get('work_mode', 'clocked_in')}",
+                f"ahk_reachable={DESKTOP_STATE.get('ahk_reachable')}",
+            ],
+        ),
+        "phone_activity": _ops_timestamp_freshness(
+            "phone activity",
+            PHONE_STATE.get("last_activity"),
+            now=generated_at,
+            stale_after_seconds=180,
+            evidence=[
+                f"app={PHONE_STATE.get('current_app') or 'none'}",
+                f"is_distracted={PHONE_STATE.get('is_distracted', False)}",
+            ],
+        ),
+        "phone_heartbeat": _ops_timestamp_freshness(
+            "phone heartbeat",
+            PHONE_HEARTBEAT.get("last_seen"),
+            now=generated_at,
+            stale_after_seconds=600,
+            evidence=[
+                f"device_id={PHONE_HEARTBEAT.get('device_id') or 'unknown'}",
+                f"alert_state={PHONE_HEARTBEAT.get('alert_state') or 'none'}",
+            ],
+        ),
+        "work_state": _ops_timestamp_freshness(
+            "work-state snapshot",
+            work_generated_at,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"productivity_active={work_state.productivity_active}",
+                f"reason={work_state.reason}",
+            ],
+            missing_status="unknown",
+        ),
+        "timer_engine": _ops_timestamp_freshness(
+            "timer-engine snapshot",
+            generated_at,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"mode={timer_engine.current_mode.value}",
+                f"activity={timer_engine.activity.value}",
+            ],
+        ),
+        "agents_db": _ops_timestamp_freshness(
+            "agents database read model",
+            None if "agents_db" in source_errors else agents_seen,
+            now=generated_at,
+            stale_after_seconds=300,
+            evidence=[
+                f"active_instances={(instances.get('counts') or {}).get('active', 0)}",
+                f"events={len(events)}",
+                *(f"error={err}" for err in source_errors.get("agents_db", [])[:2]),
+            ],
+            missing_status="unknown",
+        ),
+        "tmuxctld": _ops_timestamp_freshness(
+            "tmuxctld health",
+            generated_at if tmux_health.get("reachable") else None,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"reachable={tmux_health.get('reachable')}",
+                f"tmux_reachable={tmux_health.get('tmux_reachable')}",
+            ],
+            missing_status="missing",
+        ),
+        "cron": _ops_timestamp_freshness(
+            "cron summary",
+            generated_at if cron_summary.get("available") else None,
+            now=generated_at,
+            stale_after_seconds=300,
+            evidence=[
+                f"available={cron_summary.get('available')}",
+                f"running={cron_summary.get('running', 0)}",
+                f"runs_last_24h={cron_summary.get('runs_last_24h', 0)}",
+            ],
+            missing_status="unknown",
+        ),
+        "enforcement": _ops_timestamp_freshness(
+            "enforcement summary",
+            generated_at if enforcement_summary.get("available") else None,
+            now=generated_at,
+            stale_after_seconds=300,
+            evidence=[
+                f"available={enforcement_summary.get('available')}",
+                f"pending_count={enforcement_summary.get('pending_count', 0)}",
+            ],
+            missing_status="unknown",
+        ),
+        "tts": _ops_timestamp_freshness(
+            "TTS queue snapshot",
+            None if "tts" in source_errors else generated_at,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"queue_length={tts_summary.get('queue_length', 0)}",
+                f"satellite_available={tts_summary.get('satellite_available')}",
+                *(f"error={err}" for err in source_errors.get("tts", [])[:2]),
+            ],
+            missing_status="unknown",
+        ),
+    }
+    return freshness
 
 
 def _ops_empty_work_state(generated_at: datetime, reason: str) -> WorkStateResponse:
@@ -20859,10 +21140,22 @@ async def _ops_collect_facts(now: datetime) -> dict:
             "heartbeat_age_seconds": _ops_seconds_since(PHONE_HEARTBEAT.get("last_seen")),
         },
     }
+    source_freshness = _ops_build_source_freshness(
+        generated_at=now,
+        source_errors=source_errors,
+        work_state=work_state,
+        instances=instances,
+        events=events,
+        cron_summary=cron_summary,
+        enforcement_summary=enforcement_summary,
+        tts_summary=tts_summary,
+        tmux_health=tmux_health,
+    )
 
     return {
         "generated_at": now,
         "sources": sources,
+        "source_freshness": source_freshness,
         "work_state": work_state,
         "instances": instances,
         "events": events,
@@ -20886,6 +21179,7 @@ def _ops_build_ui_state(facts: dict) -> dict:
         "timer": facts["timer"],
         "billable": _ops_billable_summary(facts["work_state"]),
         "assertions": facts["assertions"],
+        "source_freshness": facts["source_freshness"],
         "attention": facts["attention"],
         "work_state": facts["work_state"].model_dump(),
         "instances": facts["instances"],
@@ -20970,6 +21264,7 @@ def _ops_build_status(facts: dict) -> dict:
         "status": aggregate_status,
         "summary": summary,
         "sources": facts["sources"],
+        "source_freshness": facts["source_freshness"],
         "timer": {
             "mode": facts["timer"]["mode"],
             "activity": facts["timer"]["activity"],

@@ -49,6 +49,7 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env):
         "generated_at",
         "timer",
         "assertions",
+        "source_freshness",
         "attention",
         "work_state",
         "instances",
@@ -67,6 +68,27 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env):
     assert {"timer_mode", "productivity", "desktop_attention", "phone_attention"}.issubset(
         assertion_ids
     )
+    assert set(body["source_freshness"]) == {
+        "desktop_attention",
+        "phone_activity",
+        "phone_heartbeat",
+        "work_state",
+        "timer_engine",
+        "agents_db",
+        "tmuxctld",
+        "cron",
+        "enforcement",
+        "tts",
+    }
+    freshness = body["source_freshness"]["phone_heartbeat"]
+    assert set(freshness) == {
+        "status",
+        "age_seconds",
+        "last_seen",
+        "stale_after_seconds",
+        "message",
+        "evidence",
+    }
 
 
 def test_ops_status_returns_expected_top_level_keys(client, app_env):
@@ -82,6 +104,7 @@ def test_ops_status_returns_expected_top_level_keys(client, app_env):
         "status",
         "summary",
         "sources",
+        "source_freshness",
         "timer",
         "attention",
         "fleet",
@@ -104,6 +127,85 @@ def test_ops_status_returns_expected_top_level_keys(client, app_env):
     assert body["fleet"]["active"] == 1
     assert body["fleet"]["by_engine"]["codex"] == 1
     assert body["fleet"]["by_persona"]["astartes"] == 1
+    assert set(body["source_freshness"]) == {
+        "desktop_attention",
+        "phone_activity",
+        "phone_heartbeat",
+        "work_state",
+        "timer_engine",
+        "agents_db",
+        "tmuxctld",
+        "cron",
+        "enforcement",
+        "tts",
+    }
+
+
+def test_ops_source_freshness_marks_stale_phone_heartbeat(client, app_env):
+    app_env.main.PHONE_HEARTBEAT["last_seen"] = datetime.now() - timedelta(minutes=20)
+    app_env.main.PHONE_HEARTBEAT["device_id"] = "pytest-phone"
+
+    resp = client.get("/api/ui/ops/state")
+
+    assert resp.status_code == 200, resp.text
+    heartbeat = resp.json()["source_freshness"]["phone_heartbeat"]
+    assert heartbeat["status"] == "stale"
+    assert heartbeat["age_seconds"] >= 20 * 60
+    assert heartbeat["stale_after_seconds"] == 600
+
+
+def test_ops_source_freshness_missing_desktop_timestamp_does_not_crash(client, app_env):
+    app_env.main.DESKTOP_STATE["last_detection"] = None
+
+    resp = client.get("/api/ops/status")
+
+    assert resp.status_code == 200, resp.text
+    desktop = resp.json()["source_freshness"]["desktop_attention"]
+    assert desktop["status"] in {"missing", "unknown"}
+    assert desktop["age_seconds"] is None
+
+
+def test_ops_instances_include_attention_rank_and_sort_by_urgency(client, app_env):
+    now = datetime.now()
+    conn = sqlite3.connect(app_env.db_path)
+    stale_idle_id = str(uuid.uuid4())
+    working_id = str(uuid.uuid4())
+    conn.executemany(
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id,
+            status, engine, created_at, last_activity)
+           VALUES (?, ?, '/tmp/ops', 'local', 'Mac-Mini',
+                   ?, 'codex', ?, ?)""",
+        [
+            (
+                working_id,
+                "fresh-working",
+                "working",
+                (now - timedelta(minutes=2)).isoformat(),
+                (now - timedelta(minutes=1)).isoformat(),
+            ),
+            (
+                stale_idle_id,
+                "stale-idle",
+                "idle",
+                (now - timedelta(hours=4)).isoformat(),
+                (now - timedelta(hours=3)).isoformat(),
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ui/ops/state")
+
+    assert resp.status_code == 200, resp.text
+    active = resp.json()["instances"]["active"]
+    assert active[0]["id"] == stale_idle_id
+    assert active[0]["attention_rank"] == 1
+    assert active[0]["attention_reasons"]
+    assert active[0]["stale"]["is_stale"] is True
+    fresh = next(item for item in active if item["id"] == working_id)
+    assert fresh["attention_rank"] == 5
 
 
 def test_ops_status_negative_break_balance_is_bad(client, app_env):

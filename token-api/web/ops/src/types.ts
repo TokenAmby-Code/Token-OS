@@ -51,6 +51,8 @@ export type OpsInstance = {
   stop_allowed: boolean | null;
   session_doc: SessionDoc;
   stale: { is_stale: boolean; threshold_seconds: number | null; reason: string | null };
+  attention_rank: number;
+  attention_reasons: string[];
   zealotry: number;
   gt: {
     next_fire: string | null;
@@ -127,6 +129,30 @@ export type OpsSourceHealth = {
   details: Record<string, unknown>;
 };
 
+export type OpsSourceFreshnessStatus = 'fresh' | 'stale' | 'missing' | 'unknown';
+
+export type OpsSourceFreshness = {
+  status: OpsSourceFreshnessStatus;
+  age_seconds: number | null;
+  last_seen: string | null;
+  stale_after_seconds: number | null;
+  message: string;
+  evidence: string[];
+};
+
+export type OpsSourceFreshnessMap = {
+  desktop_attention: OpsSourceFreshness;
+  phone_activity: OpsSourceFreshness;
+  phone_heartbeat: OpsSourceFreshness;
+  work_state: OpsSourceFreshness;
+  timer_engine: OpsSourceFreshness;
+  agents_db: OpsSourceFreshness;
+  tmuxctld: OpsSourceFreshness;
+  cron: OpsSourceFreshness;
+  enforcement: OpsSourceFreshness;
+  tts: OpsSourceFreshness;
+};
+
 export type OpsRecommendedAction = {
   id: string;
   source_assertion_id: string;
@@ -171,6 +197,7 @@ export type OpsState = {
     };
   };
   assertions: StateAssertion[];
+  source_freshness: OpsSourceFreshnessMap;
   attention: {
     desktop: {
       mode: string;
@@ -263,6 +290,7 @@ export type OpsStatus = {
     enforcement: OpsSourceHealth;
     tts: OpsSourceHealth;
   };
+  source_freshness: OpsSourceFreshnessMap;
   timer: {
     mode: string;
     activity: string;
