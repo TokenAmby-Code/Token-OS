@@ -14,6 +14,14 @@ ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "cli-tools" / "bin" / "dispatch"
 
 
+def _staged_command_from_tmuxctld_log(log: Path) -> str:
+    text = log.read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        if " /send-text " in line and " text=bash " in line and " submit=true" in line:
+            return line.split(" text=", 1)[1].split(" submit=true", 1)[0]
+    raise AssertionError(f"no staged tmuxctld /send-text call recorded; log={text!r}")
+
+
 def test_dispatch_claude_system_prompt_file_dry_run(tmp_path):
     prompt_file = tmp_path / "prompt.txt"
     system_file = tmp_path / "system.txt"
@@ -1023,6 +1031,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     )
     fake_tmuxctl.chmod(0o755)
     tmux_log = tmp_path / "tmux.log"
+    ping_log = tmp_path / "tmuxctld-ping.log"
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
         '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$TMUX_LOG"\n',
@@ -1034,6 +1043,7 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["TMUXCTL_LOG"] = str(tmuxctl_log)
     env["TMUX_LOG"] = str(tmux_log)
+    env["TMUXCTLD_PING_LOG"] = str(ping_log)
     result = subprocess.run(
         [
             str(DISPATCH),
@@ -1085,16 +1095,16 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "--prompt-file" in result.stdout
     launched = tmuxctl_log.read_text(encoding="utf-8", errors="replace")
     assert "stack dispatch mechanicus --session main" in launched
-    # tmuxctl now spawns the pane with a throwaway `clear` warmup that absorbs
-    # any leading-char loss from the upstream type-check guard; the real
-    # `bash <staged>` is sent via a follow-up tmux send-keys after a settle.
+    # tmuxctl still spawns the pane with a throwaway `clear` warmup; the real
+    # `bash <staged>` launch is sent through tmuxctld using the canonical pane id.
     assert "--command clear" in launched
     assert "%83" not in launched
     tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
-    assert "send-keys -t %83 bash " in tmux_text
-    assert "Enter" in tmux_text
-    send_line = next(line for line in tmux_text.splitlines() if "send-keys -t %83 bash " in line)
-    staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
+    assert "send-keys" not in tmux_text
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "POST /send-text pane=mechanicus:1 text=bash " in ping_text
+    assert "%83" not in ping_text
+    staged_path = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1])
     staged = staged_path.read_text(encoding="utf-8", errors="replace")
     assert "--append-system-prompt" in staged
     assert "Aspirant Session Startup" in staged
@@ -1173,6 +1183,7 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     )
     fake_tmuxctl.chmod(0o755)
     tmux_log = tmp_path / "tmux.log"
+    ping_log = tmp_path / "tmuxctld-ping.log"
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
         '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$TMUX_LOG"\n',
@@ -1184,6 +1195,7 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["TMUXCTL_LOG"] = str(tmuxctl_log)
     env["TMUX_LOG"] = str(tmux_log)
+    env["TMUXCTLD_PING_LOG"] = str(ping_log)
 
     result = subprocess.run(
         [
@@ -1219,8 +1231,11 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     assert "dispatched codex to mechanicus:new" in result.stdout
 
     tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
-    send_line = next(line for line in tmux_text.splitlines() if "send-keys -t %84 bash " in line)
-    staged_path = Path(send_line.rsplit("bash ", 1)[1].rsplit(" Enter", 1)[0].strip())
+    assert "send-keys" not in tmux_text
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "POST /send-text pane=mechanicus:3 text=bash " in ping_text
+    assert "%84" not in ping_text
+    staged_path = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1])
     staged = staged_path.read_text(encoding="utf-8", errors="replace")
     assert "agent-wrapper.sh codex" in staged
     assert "dispatch_codex_launch_inline" not in staged
@@ -1453,6 +1468,7 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     rec = tmp_path / "tmux_calls.txt"
+    ping_log = tmp_path / "tmuxctld-ping.log"
 
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
@@ -1479,6 +1495,7 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     # Skip the caller-instance resolution network hop so the test is hermetic.
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["TMUXCTLD_PING_LOG"] = str(ping_log)
 
     result = subprocess.run(
         [
@@ -1502,12 +1519,13 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     assert result.returncode == 0, result.stderr
 
     calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
-    # The staged launcher is sent via `tmux send-keys -t %77 'bash /tmp/...' Enter`
-    # — physical materialized from the canonical id immediately before the syscall.
-    staged_arg = next((c for c in calls if c.startswith("bash /")), None)
-    assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
-    assert "%77" in calls, f"launch not targeted at the materialized physical pane; calls={calls}"
-    staged_path = Path(staged_arg.split(" ", 1)[1])
+    # The staged launcher is sent through tmuxctld using the canonical pane id;
+    # raw tmux is still used only for non-byte-bearing pane option cleanup.
+    assert "%77" in calls, f"physical pane option cleanup did not target %77; calls={calls}"
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "POST /send-text pane=mechanicus:2 text=bash " in ping_text
+    assert "%77" not in ping_text
+    staged_path = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1])
     content = staged_path.read_text(encoding="utf-8")
 
     # PR-A keeps the child env (and DB tmux_pane column) PHYSICAL: the concrete
@@ -1531,6 +1549,7 @@ def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path: Path) -> Non
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     rec = tmp_path / "tmux_calls.txt"
+    ping_log = tmp_path / "tmuxctld-ping.log"
 
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
@@ -1553,6 +1572,7 @@ def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path: Path) -> Non
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["TMUXCTLD_PING_LOG"] = str(ping_log)
 
     result = subprocess.run(
         [
@@ -1578,9 +1598,12 @@ def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path: Path) -> Non
 
     calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
     assert "-t" in calls and "%77" in calls, calls
-    staged_arg = next((c for c in calls if c.startswith("bash /")), None)
-    assert staged_arg is not None, calls
-    content = Path(staged_arg.split(" ", 1)[1]).read_text(encoding="utf-8")
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "POST /send-text pane=mechanicus:6 text=bash " in ping_text
+    assert "%77" not in ping_text
+    content = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1]).read_text(
+        encoding="utf-8"
+    )
     assert "TMUX_PANE=%77" in content, content
     assert "TOKEN_API_DISPATCH_RESOLVED_PANE=%77" in content, content
     assert "TMUX_PANE=mechanicus:6" not in content, content
@@ -1803,6 +1826,7 @@ def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path: Pat
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     rec = tmp_path / "tmux_calls.txt"
+    ping_log = tmp_path / "tmuxctld-ping.log"
 
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
@@ -1828,6 +1852,7 @@ def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path: Pat
     # Skip the caller-instance resolution network hop so the test is hermetic.
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["TMUXCTLD_PING_LOG"] = str(ping_log)
 
     result = subprocess.run(
         [
@@ -1853,11 +1878,15 @@ def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path: Pat
     assert "non-pane id" not in result.stderr
 
     calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
-    staged_arg = next((c for c in calls if c.startswith("bash /")), None)
-    assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
-    # The agent must launch in the resolved physical pane, not the canonical id.
-    assert "-t" in calls and "%77" in calls, f"launch not targeted at %77; calls={calls}"
-    staged_path = Path(staged_arg.split(" ", 1)[1])
+    # The launch env still bakes the resolved physical pane, but the byte-bearing
+    # launch send itself goes through tmuxctld on the canonical id.
+    assert "-t" in calls and "%77" in calls, (
+        f"physical pane option cleanup did not target %77; calls={calls}"
+    )
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "POST /send-text pane=mechanicus:2 text=bash " in ping_text
+    assert "%77" not in ping_text
+    staged_path = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1])
     content = staged_path.read_text(encoding="utf-8")
 
     assert "TMUX_PANE=%77" in content, content
@@ -1923,25 +1952,24 @@ def test_dispatch_stack_new_rejects_non_canonical_id(tmp_path: Path) -> None:
 def test_normalize_pane_to_canonical_ingest_helper(tmp_path: Path) -> None:
     """The ingest helper canonicalizes inbound pane ids; fails open to physical.
 
-    page:index passthrough; raw %NNN / self -> `resolve-pane --format id`; a pane
+    page:index passthrough; raw %NNN / self -> tmuxctld `/resolve-pane?format=id`; a pane
     with no canonical cardinal (resolver emits nothing) keeps its physical id.
     """
     common = ROOT / "cli-tools" / "lib" / "agent-wrapper-common.sh"
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    fake_tmuxctl = fake_bin / "tmuxctl"
-    fake_tmuxctl.write_text(
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
         "#!/usr/bin/env bash\n"
-        # Only %77 has a canonical cardinal; everything else resolves to nothing.
-        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "id" ]]; then\n'
-        '  [[ "$4" == "%77" ]] && { echo "mechanicus:2"; exit 0; }\n'
-        "  exit 0\n"
-        "fi\n"
-        "exit 0\n",
+        'target=""\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in target=*) target="${arg#target=}" ;; esac\n'
+        "done\n"
+        'if [[ "$target" == "%77" ]]; then printf \'{"result":"mechanicus:2"}\'; else printf \'{"result":""}\'; fi\n',
         encoding="utf-8",
     )
-    fake_tmuxctl.chmod(0o755)
+    fake_curl.chmod(0o755)
 
     def normalize(value: str) -> str:
         script = f'source "{common}"; normalize_pane_to_canonical "{value}"'
@@ -2223,6 +2251,68 @@ def test_dispatch_tmux_target_rejects_protected_singleton_seat(tmp_path: Path) -
     assert result.returncode == 73
     assert "protected singleton seat" in result.stderr
     assert "send-keys" not in tmux_log.read_text(encoding="utf-8")
+
+
+def test_dispatch_tmux_target_sends_existing_canonical_target_via_tmuxctld(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+    ping_log = tmp_path / "tmuxctld-ping.log"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%44"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {tmux_log}\n'
+        'if [[ "$1" == "show-options" ]]; then echo "palace:E"; exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "bash||palace:E|999|\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["TMUXCTLD_PING_LOG"] = str(ping_log)
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "palace:E",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
+    assert "send-keys" not in tmux_text
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "POST /send-text pane=palace:E text=clear submit=true" in ping_text
+    assert "POST /send-text pane=palace:E text=bash " in ping_text
+    assert "%44" not in ping_text
 
 
 def test_dispatch_tmux_target_rejects_live_agent_descendant_without_instance_stamp(
@@ -2805,6 +2895,7 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     rec = tmp_path / "tmux_calls.txt"
+    ping_log = tmp_path / "tmuxctld-ping.log"
 
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
@@ -2832,6 +2923,7 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+    env["TMUXCTLD_PING_LOG"] = str(ping_log)
 
     result = subprocess.run(
         [
@@ -2863,9 +2955,13 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
     # Proof the success path reaches the pane without smuggling a dispatch-derived
     # naming prefix into the staged launch command.
     calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
-    staged_arg = next((c for c in calls if c.startswith("bash /")), None)
-    assert staged_arg is not None, f"no staged send-keys recorded; calls={calls}"
-    staged = Path(staged_arg.split(" ", 1)[1]).read_text(encoding="utf-8", errors="replace")
+    assert "%77" in calls, f"physical pane option cleanup did not target %77; calls={calls}"
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "POST /send-text pane=mechanicus:2 text=bash " in ping_text
+    assert "%77" not in ping_text
+    staged = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1]).read_text(
+        encoding="utf-8", errors="replace"
+    )
     assert "TOKEN_API_INSTANCE_NAME_PREFIX" not in staged, staged
     assert "On startup, name this instance" not in staged, staged
 

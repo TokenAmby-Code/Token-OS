@@ -1874,6 +1874,27 @@ redact_tmux_panes_for_display() {
   LC_ALL=C sed -E 's/%[0-9]+/<tmux-pane>/g'
 }
 
+dispatch_send_text_via_tmuxctld() {
+  # The launcher's back half must dogfood the daemon resolver. Token-API still
+  # owns the registry/session/front-half work above; byte-bearing pane sends go
+  # through tmuxctld so canonical ids (palace:E, somnium:N, mechanicus:2, …) are
+  # resolved by the same oracle the rest of the fleet uses, not by raw tmux.
+  local pane="$1" text="$2" settle="${DISPATCH_TMUXCTLD_SUBMIT_SETTLE_SECONDS:-0.2}"
+  if ! command -v tmuxctld-ping >/dev/null 2>&1; then
+    err "tmuxctld-ping is required to send dispatch launch commands to $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
+    return 69
+  fi
+  if ! tmuxctld-ping POST /send-text \
+      pane="$pane" \
+      text="$text" \
+      submit=true \
+      verify=false \
+      submit_settle_seconds="$settle"; then
+    err "tmuxctld send failed for dispatch target $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
+    return 70
+  fi
+}
+
 stamp_resume_instance_id() {
   # On resume, stamp the allocated pane with the instance UUID immediately so
   # tmuxctl resolve-instance finds it before the agent re-registers — closing
@@ -2175,7 +2196,7 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   phys_pane="$(materialize_physical_pane "$pane_id")"
   clear_pane_wrapper_launch_id "$phys_pane"
-  tmux send-keys -t "$phys_pane" "$STAGED_COMMAND" Enter
+  dispatch_send_text_via_tmuxctld "$pane_id" "$STAGED_COMMAND" || exit $?
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
   # Success = pane up + live agent process (liveness), NOT a DB-row bind clock.
@@ -2200,11 +2221,11 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   assert_dispatch_target_unoccupied "$RESOLVED_TARGET"
   stamp_resume_instance_id "$RESOLVED_TARGET"
   PHYSICAL_TARGET="$(materialize_physical_pane "$RESOLVED_TARGET")"
-  tmux send-keys -t "$PHYSICAL_TARGET" "clear" Enter
+  dispatch_send_text_via_tmuxctld "$RESOLVED_TARGET" "clear" || exit $?
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   clear_pane_wrapper_launch_id "$PHYSICAL_TARGET"
-  tmux send-keys -t "$PHYSICAL_TARGET" "$STAGED_COMMAND" Enter
+  dispatch_send_text_via_tmuxctld "$RESOLVED_TARGET" "$STAGED_COMMAND" || exit $?
   target_display="${RESOLVED_TARGET:-$TARGET}"
   if [[ "$TARGET" == %* ]]; then
     if command -v pane_id_of >/dev/null 2>&1; then
