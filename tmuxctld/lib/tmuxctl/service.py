@@ -179,29 +179,34 @@ class TmuxControlPlane:
         window membership, running processes, and explicit pane targets.
         """
 
+        info_format = "\t".join(
+            [
+                "#{pane_id}",
+                "#{@PANE_ID}",
+                "#{session_name}:#{window_index}",
+                "#{window_zoomed_flag}",
+            ]
+        )
         if pane:
-            target_pane = pane
+            raw_info = self.adapter.run("display-message", "-t", pane, "-p", info_format).strip()
         elif client:
-            target_pane = self.adapter.run(
-                "display-message", "-c", client, "-p", "#{pane_id}"
-            ).strip()
+            raw_info = self.adapter.run("display-message", "-c", client, "-p", info_format).strip()
         else:
-            target_pane = self.adapter.run("display-message", "-p", "#{pane_id}").strip()
+            raw_info = self.adapter.run("display-message", "-p", info_format).strip()
+
+        parts = raw_info.split("\t")
+        if len(parts) != 4:
+            raise ValueError("grid-expand could not resolve target pane")
+        target_pane, pane_label, target_window, raw_zoomed_before = (part.strip() for part in parts)
         if not target_pane:
             raise ValueError("grid-expand could not resolve target pane")
-
-        self.adapter.run("display-message", "-t", target_pane, "-p", "", allow_failure=False)
-        target_window = self.adapter.run(
-            "display-message", "-t", target_pane, "-p", "#{session_name}:#{window_index}"
-        ).strip()
         if not target_window:
             raise ValueError(f"grid-expand could not resolve target window for {target_pane}")
-        zoomed_before = (
-            self.adapter.run(
-                "display-message", "-t", target_window, "-p", "#{window_zoomed_flag}"
-            ).strip()
-            == "1"
-        )
+        zoomed_before = raw_zoomed_before == "1"
+
+        pane_label = canonical_pane_role(pane_label) if pane_label else ""
+        if not pane_label and pane and not pane.startswith("%") and pane != "current":
+            pane_label = canonical_pane_role(pane)
 
         for option in (
             "@GRID_EXPANDED",
@@ -242,7 +247,7 @@ class TmuxControlPlane:
         )
         return {
             "status": "ok",
-            "pane": self.public_pane_id(target_pane),
+            "pane": pane_label or "unresolved",
             "window": target_window,
             "action": action,
             "zoomed_before": zoomed_before,
