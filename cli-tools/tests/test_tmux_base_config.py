@@ -430,6 +430,9 @@ def test_first_slice_keybinds_route_to_tmuxctld_ping_not_tmux_run() -> None:
         "bind F ": ("/focus", ('window=\\"#{session_name}:#{window_index}\\"', "mode=toggle")),
         "bind e ": ("/grid-expand", ('client=\\"#{client_tty}\\"',)),
         "bind E ": ("/persona-engine", ('pane=\\"#{pane_id}\\"', "toggle=1")),
+        "bind M ": ("/mode-toggle", ('pane=\\"#{pane_id}\\"',)),
+        "bind S ": ("/open-session-doc", ('pane=\\"#{pane_id}\\"',)),
+        "bind g ": ("/goto-spoken", ()),
     }
 
     for prefix, (path, payload_parts) in expected.items():
@@ -440,22 +443,46 @@ def test_first_slice_keybinds_route_to_tmuxctld_ping_not_tmux_run() -> None:
         assert "tmux-run" not in line
 
 
-def test_missing_daemon_endpoint_keybinds_remain_legacy_tmux_run() -> None:
+def test_prefix_n_hybrid_uses_daemon_for_empty_name_and_legacy_for_explicit_name() -> None:
+    line = _line_starting("bind n ")
+    assert "command-prompt" in line
+    assert 'if [ -z \\"%%\\" ]' in line
+    assert "tmuxctld-ping POST /pane-rename" in line
+    assert 'pane=\\"#{pane_id}\\"' in line
+    assert 'name=\\"\\"' in line
+    assert "tmuxctld-ping-/pane-rename-failed" in line
+    assert "tmux-run tmux-pane-rename" in line
+    assert '\\"%%\\"' in line
+
+
+def test_missing_daemon_endpoint_keybinds_remain_on_legacy_paths() -> None:
     expected = {
-        "bind n ": "tmux-pane-rename",
-        "bind M ": "tmux-mode-toggle",
         "bind d ": "tmux-shuttle",
         "bind P ": "tmux-tts-listen",
         "bind B ": "ethereal-prompt",
-        "bind S ": "open-session-doc current",
-        "bind g ": "tmux-goto-spoken",
+        "bind R ": "tmux-reset",
+        "bind Space ": "tmux-legion-prompt-popup",
+        "bind Q ": "tmux-mark-for-close",
+        "bind W ": "tmux-run tx start",
     }
 
     for prefix, command in expected.items():
         line = _line_starting(prefix)
-        assert "tmux-run" in line
         assert command in line
         assert "tmuxctld-ping POST" not in line
+
+
+def test_501_anchor_paths_are_not_bound_through_tmuxctld_ping() -> None:
+    conf = CONF.read_text(encoding="utf-8")
+    for route in (
+        "/shuttle",
+        "/mark-for-close",
+        "/reset",
+        "/ethereal-prompt",
+        "/tts/listen",
+        "/legion-prompt",
+    ):
+        assert f"tmuxctld-ping POST {route}" not in conf
 
 
 def test_workspace_launcher_remains_on_tmux_run_and_is_documented() -> None:
