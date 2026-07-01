@@ -61,10 +61,89 @@ def _normalize_pane(value: str | None) -> str:
 
 _PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
 
+_POSITION_ALIASES = {
+    "TL": "NW",
+    "TR": "NE",
+    "BL": "SW",
+    "BR": "SE",
+    "SL": "WW",
+    "SR": "EE",
+}
+
+_PAGE_POSITION_ALIASES = {
+    "palace": {
+        "WW": "W",
+        "EE": "E",
+        "SL": "W",
+        "SR": "E",
+        "NW": "N",
+        "NE": "N",
+        "TL": "N",
+        "TR": "N",
+        "SW": "S",
+        "SE": "S",
+        "BL": "S",
+        "BR": "S",
+    },
+    "somnium": {
+        "NW": "W",
+        "SW": "W",
+        "TL": "W",
+        "BL": "W",
+        "TR": "NE",
+        "BR": "SE",
+    },
+}
+
 
 def _is_public_pane_id(value: str | None) -> bool:
     normalized = _normalize_pane(value)
     return bool(normalized and _PUBLIC_PANE_ID_RX.fullmatch(normalized))
+
+
+def _canonical_position_for_page(page: str, position: str) -> str:
+    """Canonicalize pane position aliases using the tmuxctl public-id rules.
+
+    Token-API's talk/brief resolver reads live tmux state directly, but it must
+    accept the same operator-facing aliases as tmuxctl.  In particular, ``1:W``
+    and ``palace:W`` are equivalent selectors for the palace west pane.
+    """
+
+    raw = (position or "").strip()
+    key = raw.upper()
+    page_key = (page or "").strip().lower()
+    if key in _PAGE_POSITION_ALIASES.get(page_key, {}):
+        return _PAGE_POSITION_ALIASES[page_key][key]
+    if key in _POSITION_ALIASES:
+        return _POSITION_ALIASES[key]
+    if key in {"N", "S", "E", "W", "NE", "NW", "SE", "SW", "WW", "EE"}:
+        return key
+    return raw
+
+
+def _pane_position_matches(pane: dict[str, str], window_ref: str, position: str) -> bool:
+    """Return true when a live tmux pane matches ``<window-ref>:<position>``.
+
+    ``window_ref`` may be the numeric tmux window index (``1``), the managed page
+    name (``palace``), or a tmux window-name base with a transient suffix stripped.
+    """
+
+    position_id = _normalize_pane(pane.get("position_id"))
+    if ":" not in position_id:
+        return False
+    page, live_position = position_id.rsplit(":", 1)
+    wanted_window = (window_ref or "").strip().lower()
+    window_name = _normalize_pane(pane.get("window_name")).rstrip("-")
+    window_base = window_name.split("(", 1)[0].strip()
+    if wanted_window not in {
+        _normalize_pane(pane.get("window_index")).lower(),
+        window_name.lower(),
+        window_base.lower(),
+    }:
+        return False
+    return _canonical_position_for_page(page, live_position) == _canonical_position_for_page(
+        page, position
+    )
 
 
 async def _tmux_list_panes() -> list[dict[str, str]]:
@@ -162,6 +241,7 @@ async def resolve_pane(identifier: str) -> str | None:
 
     Accepts:
       * position ids (``somnium:SE``)
+      * window-position aliases (``1:W`` / ``palace:W``)
       * fully qualified ``session:window:position`` (``main:2:SE`` → ``somnium:SE``)
     """
     raw = _normalize_pane(identifier)
@@ -171,20 +251,27 @@ async def resolve_pane(identifier: str) -> str | None:
         return raw
     panes = await _tmux_list_panes()
 
-    # main:2:SE -> match by session+window_index+position_id-suffix
+    # main:2:SE -> match by session+window_index+position.
     if raw.count(":") == 2:
         session, window_index, pos = raw.split(":", 2)
         for p in panes:
-            if (
-                p["session"] == session
-                and p["window_index"] == window_index
-                and p["position_id"].endswith(f":{pos}")
-            ):
+            if p["session"] == session and _pane_position_matches(p, window_index, pos):
                 return p["pane_id"]
 
     for p in panes:
         if p["position_id"] == raw:
             return p["pane_id"]
+
+    # 1:W / palace:W -> match by live tmux window index/name plus canonical
+    # pane position.  This keeps Token-API brief/talk aligned with tmuxctl's
+    # resolver without depending on stored registry rows.
+    if raw.count(":") == 1:
+        window_ref, pos = raw.split(":", 1)
+        positional_matches = [
+            p["pane_id"] for p in panes if _pane_position_matches(p, window_ref, pos)
+        ]
+        if len(positional_matches) == 1:
+            return positional_matches[0]
 
     # Operator/persona shorthand: accept a unique pane-label suffix (``pax`` ->
     # ``council:pax``, ``fabricator-general`` -> ``mechanicus:fabricator-general``).
@@ -762,8 +849,10 @@ async def fire_slash_copy_for_pane(
 PAGE_WINDOW_NAMES = {
     "palace": "palace",
     "somnium": "somnium",
+    "council": "council",
     "legion": "legion",
     "mechanicus": "mechanicus",
+    "reservists": "reservists",
 }
 
 
