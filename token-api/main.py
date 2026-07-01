@@ -20586,7 +20586,16 @@ def _ops_empty_work_actions() -> dict:
 
 async def _ops_read_tmuxctld_health() -> dict:
     """Read loopback-only tmuxctld health without failing the ops endpoint."""
-    base = shared._tmuxctld_url(default_loopback=True)
+    try:
+        base = shared._tmuxctld_url(default_loopback=True)
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": f"tmuxctld loopback URL invalid: {exc}",
+        }
     if not base:
         return {
             "reachable": False,
@@ -20911,13 +20920,15 @@ def _ops_build_status(facts: dict) -> dict:
         aggregate_status = "bad"
     elif warn_assertions or "warn" in source_statuses:
         aggregate_status = "warn"
-    elif not assertions:
+    elif "unknown" in source_statuses or not assertions:
         aggregate_status = "unknown"
     else:
         aggregate_status = "ok"
 
     degraded_sources = [
-        name for name, source in facts["sources"].items() if source.get("status") in {"warn", "bad"}
+        name
+        for name, source in facts["sources"].items()
+        if source.get("status") in {"warn", "bad", "unknown"}
     ]
     if bad_assertions or warn_assertions:
         summary = (
@@ -21304,7 +21315,7 @@ async def get_ops_display_state():
 
 
 @app.get("/api/ops/status")
-async def get_ops_status():
+async def get_ops_status() -> dict:
     """Concise shared ops status read model for agents and scripts."""
     now = datetime.now()
     return _ops_build_status(await _ops_collect_facts(now))

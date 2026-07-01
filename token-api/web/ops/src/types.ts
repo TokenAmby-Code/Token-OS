@@ -118,8 +118,10 @@ export type StateAssertion = {
   details: Record<string, unknown>;
 };
 
+export type OpsHealthStatus = 'ok' | 'warn' | 'bad' | 'unknown';
+
 export type OpsSourceHealth = {
-  status: 'ok' | 'warn' | 'bad' | 'unknown' | string;
+  status: OpsHealthStatus;
   available: boolean | null;
   message: string | null;
   details: Record<string, unknown>;
@@ -128,7 +130,7 @@ export type OpsSourceHealth = {
 export type OpsRecommendedAction = {
   id: string;
   source_assertion_id: string;
-  severity: 'warn' | 'bad' | string;
+  severity: 'warn' | 'bad';
   label: string;
   action: string;
   evidence: string[];
@@ -250,7 +252,7 @@ export type OpsState = {
 export type OpsStatus = {
   surface: 'ops-status';
   generated_at: string;
-  status: 'ok' | 'warn' | 'bad' | 'unknown' | string;
+  status: OpsHealthStatus;
   summary: string;
   sources: {
     token_api: OpsSourceHealth;
