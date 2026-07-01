@@ -406,3 +406,13 @@ def test_prefix_e_hot_swaps_persona_engine() -> None:
     assert "tmuxctl persona-engine" in line
     assert "--pane '#{pane_id}'" in line
     assert "--toggle" in line
+
+
+def test_pane_died_hook_routes_to_tmuxctld_event_not_raw_respawn() -> None:
+    line = _line_starting("set-hook -g pane-died[90] ")
+    assert "tmuxctld-ping POST /event" in line
+    assert "event=pane-died" in line
+    assert "pane=#{pane_id}" in line
+    assert ">/dev/null" in line
+    assert "display-message" in line
+    assert "tmux-pane-respawn" not in line

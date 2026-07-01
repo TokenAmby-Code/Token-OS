@@ -47,6 +47,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "nas_civic": "/Volumes/Civic",
         "tailscale_ip": "100.95.109.23",
         "token_api_url": "http://localhost:7777",
+        "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "mini",
         "device_name": "Mac-Mini",
         "token_os_runtime": "~/runtimes/Token-OS/live",
@@ -56,6 +57,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "nas_civic": "/mnt/civic",
         "tailscale_ip": "100.66.10.74",
         "token_api_url": "http://100.95.109.23:7777",
+        "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "wsl",
         "device_name": "TokenPC",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
@@ -65,6 +67,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "nas_civic": "",
         "tailscale_ip": "100.102.92.24",
         "token_api_url": "http://100.95.109.23:7777",
+        "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "phone",
         "device_name": "Token-S24",
         "token_os_runtime": "",
@@ -74,6 +77,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "nas_civic": "/mnt/civic",
         "tailscale_ip": "",
         "token_api_url": "http://100.95.109.23:7777",
+        "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "",
         "device_name": "",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
@@ -148,6 +152,7 @@ def _runtime_checkout() -> str:
 TOKEN_OS = _runtime_checkout()
 CLI_TOOLS = f"{TOKEN_OS}/cli-tools"
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL") or cfg("token_api_url")
+TMUXCTLD_URL = os.environ.get("TMUXCTLD_URL") or cfg("tmuxctld_url")
 RUNTIME_DATABASE_DIR = os.path.expanduser(
     os.environ.get("TOKEN_API_DATABASE_DIR") or "~/runtimes/database"
 )

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# tmuxctld-ping — minimal tmux hook transport to the tmuxctld loopback daemon
+# TAGS: tmux, daemon, transport
+# AUDIENCE: system (tmux hooks)
+#
+# Usage: tmuxctld-ping METHOD /path key=value [key=value ...]
+#
+# This shim owns transport only: it builds a JSON object from key=value pairs and
+# POSTs it to tmuxctld. It contains no feature branching; the daemon is the sole
+# actor for lifecycle decisions.
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: tmuxctld-ping METHOD /path key=value [key=value ...]" >&2
+}
+
+if [[ $# -lt 2 ]]; then
+    usage
+    exit 64
+fi
+
+METHOD="$1"
+PATH_PART="$2"
+shift 2
+
+case "$METHOD" in
+    GET|POST|PUT|PATCH|DELETE) ;;
+    get|post|put|patch|delete) METHOD="${METHOD^^}" ;;
+    *) echo "tmuxctld-ping: unsupported method: $METHOD" >&2; exit 64 ;;
+esac
+
+case "$PATH_PART" in
+    /*) ;;
+    *) echo "tmuxctld-ping: path must start with /: $PATH_PART" >&2; exit 64 ;;
+esac
+
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${_SCRIPT_DIR}/../lib/nas-path.sh" >/dev/null 2>&1 || true
+
+DAEMON_URL="${TMUXCTLD_URL:-}"
+if [[ -z "$DAEMON_URL" ]] && type imperium_cfg >/dev/null 2>&1; then
+    DAEMON_URL="$(imperium_cfg tmuxctld_url 2>/dev/null || true)"
+fi
+DAEMON_URL="${DAEMON_URL:-http://127.0.0.1:7778}"
+DAEMON_URL="${DAEMON_URL%/}"
+
+PAYLOAD="$(
+python3 - "$@" <<'PY'
+import json
+import sys
+
+payload = {}
+for item in sys.argv[1:]:
+    if "=" not in item:
+        raise SystemExit(f"tmuxctld-ping: payload argument must be key=value: {item}")
+    key, value = item.split("=", 1)
+    key = key.strip()
+    if not key:
+        raise SystemExit("tmuxctld-ping: payload key must not be empty")
+    payload[key] = value
+sys.stdout.write(json.dumps(payload, separators=(",", ":")))
+PY
+)" || exit 64
+
+URL="${DAEMON_URL}${PATH_PART}"
+if curl -fsS --connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" \
+        --max-time "${TMUXCTLD_MAX_TIME:-3}" \
+        -X "$METHOD" \
+        -H 'Content-Type: application/json' \
+        -d "$PAYLOAD" \
+        -o /dev/null \
+        "$URL"; then
+    exit 0
+else
+    rc=$?
+    echo "tmuxctld-ping: ${METHOD} ${PATH_PART} failed via ${DAEMON_URL} (curl rc=${rc})" >&2
+    exit "$rc"
+fi
