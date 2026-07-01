@@ -20514,6 +20514,510 @@ def _ops_timer_idle_status(work_state: WorkStateResponse, now_mono_ms: int) -> d
     }
 
 
+def _ops_source_health(
+    status: str,
+    *,
+    available: bool | None = None,
+    message: str | None = None,
+    details: dict | None = None,
+) -> dict:
+    normalized = status if status in {"ok", "warn", "bad", "unknown"} else "unknown"
+    return {
+        "status": normalized,
+        "available": available,
+        "message": message,
+        "details": details or {},
+    }
+
+
+def _ops_empty_work_state(generated_at: datetime, reason: str) -> WorkStateResponse:
+    return WorkStateResponse(
+        productivity_active=False,
+        reason=reason,
+        active_instance_count=0,
+        processing_recent_count=0,
+        observed_agent_count=0,
+        billable_active_count=0,
+        personal_active_count=0,
+        unknown_active_count=0,
+        active_instances=[],
+        observed_agents=[],
+        activity_icons=[],
+        timer_mode=timer_engine.current_mode.value,
+        activity=timer_engine.activity.value,
+        desktop_mode=DESKTOP_STATE.get("current_mode", "silence"),
+        phone_app=PHONE_STATE.get("current_app"),
+        productivity_hold="none",
+        idle_timeout_exempt=timer_engine.idle_timeout_exempt,
+        human_anchored_instance_count=0,
+        within_human_work_action_window=False,
+        work_action_source=None,
+        work_action_note=None,
+        work_action_age_seconds=None,
+        work_action_buffer_remaining_seconds=None,
+        typing_active=False,
+        generated_at=generated_at.isoformat(),
+    )
+
+
+def _ops_empty_instances() -> dict:
+    return {
+        "active": [],
+        "counts": {
+            "active": 0,
+            "stale": 0,
+            "by_status": {},
+            "by_engine": {},
+            "by_persona": {},
+            "by_work_class": {},
+        },
+    }
+
+
+def _ops_empty_work_actions() -> dict:
+    return {
+        "count": 0,
+        "ticks": [],
+        "last_at": None,
+        "score": 0,
+        "stale_fade_minutes": WORK_ACTION_STALE_FADE_MINUTES,
+    }
+
+
+async def _ops_read_tmuxctld_health() -> dict:
+    """Read loopback-only tmuxctld health without failing the ops endpoint."""
+    try:
+        base = shared._tmuxctld_url(default_loopback=True)
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": f"tmuxctld loopback URL invalid: {exc}",
+        }
+    if not base:
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": "tmuxctld loopback URL disabled or invalid",
+        }
+
+    def _read_health_payload() -> dict:
+        with shared._TMUXCTLD_OPENER.open(f"{base}/health", timeout=0.75) as resp:
+            return json.loads(resp.read().decode(errors="ignore") or "{}")
+
+    try:
+        payload = await asyncio.to_thread(_read_health_payload)
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": str(exc),
+        }
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": "tmuxctld health returned non-ok payload",
+            "payload": payload if isinstance(payload, dict) else None,
+        }
+    return {
+        "reachable": True,
+        "tmux_reachable": payload.get("tmux_reachable"),
+        "version": payload.get("version"),
+        "sha": payload.get("sha"),
+        "error": None,
+    }
+
+
+async def _ops_collect_facts(now: datetime) -> dict:
+    """Collect the shared facts backing both ops cockpit state and ops status."""
+    sources: dict[str, dict] = {
+        "token_api": _ops_source_health(
+            "ok",
+            available=True,
+            message="Token-API request handler is running",
+            details={"git_sha": LAUNCHED_GIT_SHA},
+        )
+    }
+    source_errors: dict[str, list[str]] = {}
+
+    def record_error(source: str, exc: Exception | str) -> None:
+        source_errors.setdefault(source, []).append(str(exc))
+
+    try:
+        work_state = await get_cached_work_state()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading work state: %s", exc)
+        record_error("timer_engine", exc)
+        work_state = _ops_empty_work_state(now, "work_state_unavailable")
+
+    try:
+        instances = await _ops_read_instances(now)
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading instances: %s", exc)
+        record_error("agents_db", exc)
+        instances = _ops_empty_instances()
+
+    try:
+        events = await _ops_read_events()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading events: %s", exc)
+        record_error("agents_db", exc)
+        events = []
+
+    try:
+        cron_summary = await _ops_read_cron_summary()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading cron: %s", exc)
+        record_error("cron", exc)
+        cron_summary = {
+            "available": False,
+            "error": str(exc),
+            "total_jobs": 0,
+            "enabled": 0,
+            "running": 0,
+            "runs_last_24h": 0,
+            "jobs": [],
+        }
+
+    try:
+        enforcement_summary = await _ops_read_enforcement_summary()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading enforcement: %s", exc)
+        record_error("enforcement", exc)
+        enforcement_summary = {
+            "available": False,
+            "error": str(exc),
+            "pending_count": 0,
+            "pending": [],
+            "pavlok": {"enabled": PAVLOK_CONFIG.get("enabled")},
+        }
+
+    try:
+        tts_summary = get_tts_queue_status()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading TTS status: %s", exc)
+        record_error("tts", exc)
+        tts_summary = {
+            "current": None,
+            "hot_queue": [],
+            "pause_queue": [],
+            "hot_queue_length": 0,
+            "pause_queue_length": 0,
+            "queue_length": 0,
+            "backend": None,
+            "satellite_available": None,
+            "global_mode": None,
+            "routing": None,
+        }
+
+    try:
+        work_actions = await _ops_read_work_actions(now=now)
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading work actions: %s", exc)
+        record_error("agents_db", exc)
+        work_actions = _ops_empty_work_actions()
+
+    tmux_health = await _ops_read_tmuxctld_health()
+
+    if "agents_db" in source_errors:
+        sources["agents_db"] = _ops_source_health(
+            "bad",
+            available=False,
+            message="agents database read failed",
+            details={"errors": source_errors["agents_db"]},
+        )
+    else:
+        sources["agents_db"] = _ops_source_health(
+            "ok",
+            available=True,
+            message="agents database reads succeeded",
+            details={"active_instances": (instances.get("counts") or {}).get("active", 0)},
+        )
+
+    if "timer_engine" in source_errors:
+        sources["timer_engine"] = _ops_source_health(
+            "bad",
+            available=False,
+            message="timer/work-state read failed",
+            details={"errors": source_errors["timer_engine"]},
+        )
+    else:
+        sources["timer_engine"] = _ops_source_health(
+            "ok",
+            available=True,
+            message="timer engine snapshot available",
+            details={"mode": timer_engine.current_mode.value},
+        )
+
+    sources["tmuxctld"] = _ops_source_health(
+        "ok" if tmux_health.get("reachable") else "warn",
+        available=bool(tmux_health.get("reachable")),
+        message="tmuxctld health available"
+        if tmux_health.get("reachable")
+        else "tmuxctld health unavailable",
+        details=tmux_health,
+    )
+
+    sources["cron"] = _ops_source_health(
+        "ok" if cron_summary.get("available") else "warn",
+        available=bool(cron_summary.get("available")),
+        message="cron summary available"
+        if cron_summary.get("available")
+        else "cron summary unavailable",
+        details={"error": cron_summary.get("error")} if cron_summary.get("error") else {},
+    )
+
+    sources["enforcement"] = _ops_source_health(
+        "ok" if enforcement_summary.get("available") else "warn",
+        available=bool(enforcement_summary.get("available")),
+        message="enforcement summary available"
+        if enforcement_summary.get("available")
+        else "enforcement summary unavailable",
+        details={"error": enforcement_summary.get("error")}
+        if enforcement_summary.get("error")
+        else {},
+    )
+
+    tts_available = "tts" not in source_errors
+    satellite_available = tts_summary.get("satellite_available")
+    sources["tts"] = _ops_source_health(
+        "bad"
+        if not tts_available
+        else "warn"
+        if satellite_available is False
+        else "unknown"
+        if satellite_available is None
+        else "ok",
+        available=tts_available,
+        message="TTS queue unavailable"
+        if not tts_available
+        else "TTS satellite unavailable"
+        if satellite_available is False
+        else "TTS satellite health unknown"
+        if satellite_available is None
+        else "TTS queue available",
+        details={
+            "backend": tts_summary.get("backend"),
+            "satellite_available": satellite_available,
+            "errors": source_errors.get("tts", []),
+        },
+    )
+
+    assertions = _ops_build_state_assertions(
+        generated_at=now,
+        work_state=work_state,
+        instances=instances,
+        events=events,
+        enforcement_summary=enforcement_summary,
+        tts_summary=tts_summary,
+    )
+
+    break_balance_ms = int(timer_engine.break_balance_ms)
+    timer_snapshot = {
+        "mode": timer_engine.current_mode.value,
+        "activity": timer_engine.activity.value,
+        "productivity_active": work_state.productivity_active,
+        "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
+        "manual_mode_lock": timer_engine.manual_mode_lock,
+        "manual_trigger": timer_engine.manual_trigger,
+        "focus_active": timer_engine.focus_active,
+        "break_balance_ms": break_balance_ms,
+        "break_available_ms": max(0, break_balance_ms),
+        "break_backlog_ms": abs(min(0, break_balance_ms)),
+        "is_in_backlog": break_balance_ms < 0,
+        "total_work_time_ms": timer_engine.total_work_time_ms,
+        "total_break_time_ms": timer_engine.total_break_time_ms,
+        "daily_start_date": timer_engine.daily_start_date,
+        "idle_timer": _ops_timer_idle_status(work_state, int(time.monotonic() * 1000)),
+    }
+    attention_snapshot = {
+        "desktop": {
+            "mode": DESKTOP_STATE.get("current_mode", "silence"),
+            "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+            "last_detection": DESKTOP_STATE.get("last_detection"),
+            "location_zone": DESKTOP_STATE.get("location_zone"),
+            "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
+            "steam_app_id": DESKTOP_STATE.get("steam_app_id"),
+            "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
+            "steam_exe": DESKTOP_STATE.get("steam_exe"),
+            "in_meeting": DESKTOP_STATE.get("in_meeting", False),
+        },
+        "phone": {
+            "app": PHONE_STATE.get("current_app"),
+            "is_distracted": PHONE_STATE.get("is_distracted", False),
+            "last_activity": PHONE_STATE.get("last_activity"),
+            "app_opened_at": PHONE_STATE.get("app_opened_at"),
+            "heartbeat_age_seconds": _ops_seconds_since(PHONE_HEARTBEAT.get("last_seen")),
+        },
+    }
+
+    return {
+        "generated_at": now,
+        "sources": sources,
+        "work_state": work_state,
+        "instances": instances,
+        "events": events,
+        "cron": cron_summary,
+        "enforcement": enforcement_summary,
+        "tts": tts_summary,
+        "work_actions": work_actions,
+        "assertions": assertions,
+        "timer": timer_snapshot,
+        "attention": attention_snapshot,
+        "tmux": tmux_health,
+    }
+
+
+def _ops_build_ui_state(facts: dict) -> dict:
+    tts_summary = facts["tts"]
+    return {
+        "surface": "ops",
+        "ui_build_id": _ops_ui_build_id(),
+        "generated_at": facts["generated_at"].isoformat(),
+        "timer": facts["timer"],
+        "billable": _ops_billable_summary(facts["work_state"]),
+        "assertions": facts["assertions"],
+        "attention": facts["attention"],
+        "work_state": facts["work_state"].model_dump(),
+        "instances": facts["instances"],
+        "events": facts["events"],
+        "cron": facts["cron"],
+        "tts": {
+            "current": tts_summary.get("current"),
+            "hot_queue": tts_summary.get("hot_queue", []),
+            "pause_queue": tts_summary.get("pause_queue", []),
+            "hot_queue_length": tts_summary.get("hot_queue_length", 0),
+            "pause_queue_length": tts_summary.get("pause_queue_length", 0),
+            "queue_length": tts_summary.get("queue_length", 0),
+            "backend": tts_summary.get("backend"),
+            "satellite_available": tts_summary.get("satellite_available"),
+            "global_mode": tts_summary.get("global_mode"),
+            "routing": tts_summary.get("routing"),
+        },
+        "voice_drafts": [
+            _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
+        ],
+        "enforcement": facts["enforcement"],
+        "work_actions": facts["work_actions"],
+    }
+
+
+def _ops_build_status(facts: dict) -> dict:
+    assertions = facts["assertions"]
+    source_statuses = [source.get("status", "unknown") for source in facts["sources"].values()]
+    bad_assertions = [item for item in assertions if item.get("status") == "bad"]
+    warn_assertions = [item for item in assertions if item.get("status") == "warn"]
+    if bad_assertions or "bad" in source_statuses:
+        aggregate_status = "bad"
+    elif warn_assertions or "warn" in source_statuses:
+        aggregate_status = "warn"
+    elif "unknown" in source_statuses or not assertions:
+        aggregate_status = "unknown"
+    else:
+        aggregate_status = "ok"
+
+    degraded_sources = [
+        name
+        for name, source in facts["sources"].items()
+        if source.get("status") in {"warn", "bad", "unknown"}
+    ]
+    if bad_assertions or warn_assertions:
+        summary = (
+            f"{len(bad_assertions)} bad assertion(s), {len(warn_assertions)} warn assertion(s)"
+        )
+    elif degraded_sources:
+        summary = f"{len(degraded_sources)} degraded source(s): {', '.join(degraded_sources)}"
+    elif aggregate_status == "unknown":
+        summary = "Ops status unknown"
+    else:
+        summary = "Ops nominal"
+
+    counts = facts["instances"].get("counts") or {}
+    tts_summary = facts["tts"]
+    enforcement_summary = facts["enforcement"]
+    tmux_health = facts["tmux"]
+    current_tts = tts_summary.get("current")
+    current_tts_label = (
+        str(current_tts.get("name") or current_tts.get("message"))
+        if isinstance(current_tts, dict)
+        else current_tts
+    )
+    recommended_actions = [
+        {
+            "id": f"action-{item.get('id')}",
+            "source_assertion_id": item.get("id"),
+            "severity": item.get("status"),
+            "label": item.get("label"),
+            "action": item.get("correction_hint"),
+            "evidence": (item.get("evidence") or [])[:3],
+        }
+        for item in assertions
+        if item.get("status") in {"bad", "warn"} and item.get("correction_hint")
+    ]
+
+    return {
+        "surface": "ops-status",
+        "generated_at": facts["generated_at"].isoformat(),
+        "status": aggregate_status,
+        "summary": summary,
+        "sources": facts["sources"],
+        "timer": {
+            "mode": facts["timer"]["mode"],
+            "activity": facts["timer"]["activity"],
+            "productivity_active": facts["timer"]["productivity_active"],
+            "break_balance_ms": facts["timer"]["break_balance_ms"],
+            "break_available_ms": facts["timer"]["break_available_ms"],
+            "break_backlog_ms": facts["timer"]["break_backlog_ms"],
+            "is_in_backlog": facts["timer"]["is_in_backlog"],
+        },
+        "attention": {
+            "desktop_mode": facts["attention"]["desktop"]["mode"],
+            "desktop_work_mode": facts["attention"]["desktop"]["work_mode"],
+            "phone_app": facts["attention"]["phone"]["app"],
+            "phone_distracted": facts["attention"]["phone"]["is_distracted"],
+            "phone_heartbeat_age_seconds": facts["attention"]["phone"]["heartbeat_age_seconds"],
+        },
+        "fleet": {
+            "active": int(counts.get("active") or 0),
+            "stale": int(counts.get("stale") or 0),
+            "by_status": counts.get("by_status") or {},
+            "by_engine": counts.get("by_engine") or {},
+            "by_persona": counts.get("by_persona") or {},
+        },
+        "tmux": {
+            "reachable": tmux_health.get("reachable"),
+            "tmux_reachable": tmux_health.get("tmux_reachable"),
+            "version": tmux_health.get("version"),
+            "sha": tmux_health.get("sha"),
+            "live_instance_panes": None,
+            "projection_drift": None,
+        },
+        "tts": {
+            "current": current_tts_label,
+            "queue_length": int(tts_summary.get("queue_length") or 0),
+            "hot_queue_length": int(tts_summary.get("hot_queue_length") or 0),
+            "pause_queue_length": int(tts_summary.get("pause_queue_length") or 0),
+            "satellite_available": tts_summary.get("satellite_available"),
+            "global_mode": tts_summary.get("global_mode"),
+        },
+        "enforcement": {
+            "pending_count": int(enforcement_summary.get("pending_count") or 0),
+            "pavlok_enabled": (enforcement_summary.get("pavlok") or {}).get("enabled"),
+        },
+        "assertions": assertions,
+        "recommended_actions": recommended_actions,
+    }
+
+
 def _ops_build_state_assertions(
     *,
     generated_at: datetime,
@@ -20807,88 +21311,14 @@ async def get_ops_timer_history(window: str = "6h", bucket: str = "60s"):
 async def get_ops_display_state():
     """Aggregate read model for the Terminus ops cockpit."""
     now = datetime.now()
-    work_state = await get_cached_work_state()
-    instances = await _ops_read_instances(now)
-    events = await _ops_read_events()
-    cron_summary = await _ops_read_cron_summary()
-    enforcement_summary = await _ops_read_enforcement_summary()
-    tts_summary = get_tts_queue_status()
-    work_actions = await _ops_read_work_actions(now=now)
-    assertions = _ops_build_state_assertions(
-        generated_at=now,
-        work_state=work_state,
-        instances=instances,
-        events=events,
-        enforcement_summary=enforcement_summary,
-        tts_summary=tts_summary,
-    )
+    return _ops_build_ui_state(await _ops_collect_facts(now))
 
-    break_balance_ms = timer_engine.break_balance_ms
-    return {
-        "surface": "ops",
-        "ui_build_id": _ops_ui_build_id(),
-        "generated_at": now.isoformat(),
-        "timer": {
-            "mode": timer_engine.current_mode.value,
-            "activity": timer_engine.activity.value,
-            "productivity_active": work_state.productivity_active,
-            "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
-            "manual_mode_lock": timer_engine.manual_mode_lock,
-            "manual_trigger": timer_engine.manual_trigger,
-            "focus_active": timer_engine.focus_active,
-            "break_balance_ms": break_balance_ms,
-            "break_available_ms": max(0, break_balance_ms),
-            "break_backlog_ms": abs(min(0, break_balance_ms)),
-            "is_in_backlog": break_balance_ms < 0,
-            "total_work_time_ms": timer_engine.total_work_time_ms,
-            "total_break_time_ms": timer_engine.total_break_time_ms,
-            "daily_start_date": timer_engine.daily_start_date,
-            "idle_timer": _ops_timer_idle_status(work_state, int(time.monotonic() * 1000)),
-        },
-        "billable": _ops_billable_summary(work_state),
-        "assertions": assertions,
-        "attention": {
-            "desktop": {
-                "mode": DESKTOP_STATE.get("current_mode", "silence"),
-                "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
-                "last_detection": DESKTOP_STATE.get("last_detection"),
-                "location_zone": DESKTOP_STATE.get("location_zone"),
-                "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
-                "steam_app_id": DESKTOP_STATE.get("steam_app_id"),
-                "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
-                "steam_exe": DESKTOP_STATE.get("steam_exe"),
-                "in_meeting": DESKTOP_STATE.get("in_meeting", False),
-            },
-            "phone": {
-                "app": PHONE_STATE.get("current_app"),
-                "is_distracted": PHONE_STATE.get("is_distracted", False),
-                "last_activity": PHONE_STATE.get("last_activity"),
-                "app_opened_at": PHONE_STATE.get("app_opened_at"),
-                "heartbeat_age_seconds": _ops_seconds_since(PHONE_HEARTBEAT.get("last_seen")),
-            },
-        },
-        "work_state": work_state.model_dump(),
-        "instances": instances,
-        "events": events,
-        "cron": cron_summary,
-        "tts": {
-            "current": tts_summary.get("current"),
-            "hot_queue": tts_summary.get("hot_queue", []),
-            "pause_queue": tts_summary.get("pause_queue", []),
-            "hot_queue_length": tts_summary.get("hot_queue_length", 0),
-            "pause_queue_length": tts_summary.get("pause_queue_length", 0),
-            "queue_length": tts_summary.get("queue_length", 0),
-            "backend": tts_summary.get("backend"),
-            "satellite_available": tts_summary.get("satellite_available"),
-            "global_mode": tts_summary.get("global_mode"),
-            "routing": tts_summary.get("routing"),
-        },
-        "voice_drafts": [
-            _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
-        ],
-        "enforcement": enforcement_summary,
-        "work_actions": work_actions,
-    }
+
+@app.get("/api/ops/status")
+async def get_ops_status() -> dict:
+    """Concise shared ops status read model for agents and scripts."""
+    now = datetime.now()
+    return _ops_build_status(await _ops_collect_facts(now))
 
 
 @app.post("/api/ui/ops/phone/clear")
