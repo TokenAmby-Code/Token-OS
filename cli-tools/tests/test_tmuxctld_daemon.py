@@ -19,7 +19,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl import daemon
+from tmuxctl import daemon, wrapper_ledger
 from tmuxctl import service as tmux_service
 
 # Captured before any monkeypatching so the dedicated re-assertion tests can
@@ -28,7 +28,7 @@ _REAL_MAYBE_REASSERT = daemon.TmuxctldServer.maybe_reassert_lifecycle_hooks
 
 
 @pytest.fixture(autouse=True)
-def _no_live_tmux_guard(monkeypatch):
+def _no_live_tmux_guard(monkeypatch, tmp_path):
     """No daemon test may touch a live tmux server (hook-tests-no-live-tmux).
 
     ``_h_send_text`` now acquires/releases the typing-guard AGENT hold, which
@@ -39,6 +39,8 @@ def _no_live_tmux_guard(monkeypatch):
     monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: False)
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
     monkeypatch.setattr(daemon.send_gate, "evaluate", lambda *a, **k: None)
+    monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
+    wrapper_ledger.reset_wrapper_ledger_for_tests(tmp_path / "wrapper-ledger.json")
     # /health now re-asserts the tmux lifecycle hooks (which shells real tmux).
     # Neutralise the heartbeat-driven re-assertion module-wide so no /health test
     # touches live tmux; the dedicated re-assertion tests restore the real method.
@@ -700,6 +702,131 @@ def test_wrapperstart_requires_wrapper_launch_id() -> None:
         _, payload = _post(server, "/hooks/wrapperstart", {"tmux_pane": "%42"})
         assert payload["ok"] is False
         assert payload["error"]["code"] == "ValueError"
+    finally:
+        server.shutdown()
+
+
+class LedgerAdapter(StubAdapter):
+    def __init__(self) -> None:
+        self.facts = {
+            "pane_id": "%42",
+            "pane_label": "somnium:W",
+            "persona": "Space Wolves",
+            "engine": "codex",
+            "working_dir": "/worktree",
+            "born_epoch": "12345",
+            "current_path": "/worktree",
+        }
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("display-message", "-t", "%42") and args[-1] == "#{pane_id}":
+            return "%42"
+        if args[:3] == ("display-message", "-t", "%42"):
+            fmt = args[-1]
+            if "__TMUXCTLD_LEDGER_FACT__" in fmt:
+                sep = "__TMUXCTLD_LEDGER_FACT__"
+                return sep.join(
+                    [
+                        self.facts["pane_id"],
+                        self.facts["pane_label"],
+                        self.facts["persona"],
+                        self.facts["engine"],
+                        self.facts["working_dir"],
+                        self.facts["born_epoch"],
+                        self.facts["current_path"],
+                    ]
+                )
+        if args[:3] == ("list-panes", "-a", "-F"):
+            fmt = args[-1]
+            if "__TMUXCTLD_LEDGER_FIELD__" in fmt:
+                sep = "__TMUXCTLD_LEDGER_FIELD__"
+                return sep.join(
+                    [
+                        "%77",
+                        "wrap-reconciled",
+                        "iid-reconciled",
+                        "mechanicus:3",
+                        "Iron Hands",
+                        "claude",
+                        "/reconciled",
+                        "456",
+                        "/reconciled",
+                        "0",
+                    ]
+                )
+        return ""
+
+
+def test_ledger_exact_interface_resolves_wrapper_instance_and_pane(tmp_path) -> None:
+    rec = LedgerAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, opened = _post(
+            server,
+            "/ledger/wrapper-start",
+            {"wrapper_id": "wrap-1", "pane": "%42"},
+        )
+        assert opened["ok"] is True
+        assert opened["result"]["found"] is True
+        assert opened["result"]["wrapper_id"] == "wrap-1"
+        assert opened["result"]["pane_id"] == "%42"
+        assert opened["result"]["pane_label"] == "somnium:W"
+        assert opened["result"]["engine"] == "codex"
+        assert opened["result"]["working_dir"] == "/worktree"
+        assert opened["result"]["state"] == "OPEN"
+
+        _, session = _post(
+            server,
+            "/ledger/session-start",
+            {"wrapper_id": "wrap-1", "instance_id": "iid-1", "persona": "Space Wolves"},
+        )
+        assert session["ok"] is True
+        assert session["result"]["instance_id"] == "iid-1"
+
+        for query in (
+            "wrapper_id=wrap-1",
+            "instance_id=iid-1",
+            "pane=%2542",
+            "pane=somnium%3AW",
+        ):
+            _, resolved = _get(server, f"/ledger/resolve?{query}")
+            assert resolved["ok"] is True
+            assert resolved["result"]["found"] is True
+            assert resolved["result"]["wrapper_id"] == "wrap-1"
+            assert resolved["result"]["instance_id"] == "iid-1"
+            assert resolved["result"]["pane_id"] == "%42"
+            assert resolved["result"]["pane_label"] == "somnium:W"
+
+        _, closed = _post(server, "/ledger/wrapper-end", {"wrapper_id": "wrap-1"})
+        assert closed["ok"] is True
+        assert closed["result"]["state"] == "CLOSED"
+        _, resolved = _get(server, "/ledger/resolve?wrapper_id=wrap-1")
+        assert resolved["result"]["found"] is True
+        assert resolved["result"]["state"] == "CLOSED"
+    finally:
+        server.shutdown()
+
+
+def test_reconcile_rebuilds_wrapper_ledger_from_tmux_scan(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tmux_service.TmuxControlPlane, "reconcile_personas", lambda self, session=None: []
+    )
+    rec = LedgerAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/reconcile", {})
+        assert payload["ok"] is True
+        assert payload["result"]["ledger"]["rows"] == 1
+
+        _, resolved = _get(server, "/ledger/resolve?wrapper_id=wrap-reconciled")
+        assert resolved["ok"] is True
+        assert resolved["result"]["found"] is True
+        assert resolved["result"]["instance_id"] == "iid-reconciled"
+        assert resolved["result"]["pane_id"] == "%77"
+        assert resolved["result"]["pane_label"] == "mechanicus:3"
+        assert resolved["result"]["engine"] == "claude"
+        assert resolved["result"]["working_dir"] == "/reconciled"
+        assert resolved["result"]["state"] == "OPEN"
     finally:
         server.shutdown()
 
