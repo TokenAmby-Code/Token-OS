@@ -83,6 +83,9 @@ _HUMAN_LOCK_YIELDING_OVERRIDES = frozenset(
         # pane after text landed, submit/recovery keys must queue behind the
         # human lock instead of clobbering it.
         "tmuxctl-submit-transaction",
+        # Discord/operator append may pierce daemon AGENT holds and quiet-hours,
+        # but never a real keystroke/pending human lock on the target pane.
+        "tmuxctld-direct-user",
     }
 )
 
@@ -699,7 +702,7 @@ def evaluate(
     # present, ignore those overrides: human typing beats the daemon hold.  This
     # closes the mid-transaction clobber where a later C-m pierced through a
     # human keystroke/pending lock because the request thread still carried a
-    # send-holder or submit-transaction override.
+    # send-holder, submit-transaction, or direct-user override.
     effective_override = override
     if (
         reason == "typing_guard"

@@ -795,11 +795,14 @@ async def append_direct_user_text_to_pane(
     text: str,
     *,
     instance_id: str | None = None,
+    operation_id: str | None = None,
 ) -> dict:
     """Append operator keyboard text without submit/clear/prompt semantics."""
     body = {"pane": tmux_pane, "text": text}
     if instance_id:
         body["instance_id"] = instance_id
+    if operation_id:
+        body["operation_id"] = operation_id
     daemon_payload = await asyncio.to_thread(
         shared._tmuxctld_post_json,
         "/append-user-text",
@@ -839,8 +842,12 @@ async def append_direct_user_text_to_pane(
         "stderr": "",
         "operation": operation,
         "gated": False,
-        "verification_status": "not_submitted",
-        "verified_by": None,
+        "verification_status": result.get("verification_status") or "unverified",
+        "verified_by": result.get("verified_by"),
+        "operation_id": result.get("operation_id") or operation_id,
+        "payload_hash": result.get("payload_hash"),
+        "insert_confirmed": bool(result.get("insert_confirmed")),
+        "failures": result.get("failures") if isinstance(result.get("failures"), list) else [],
         "pane": result.get("pane") or tmux_pane,
         "instance_id": result.get("instance_id") or instance_id,
         "direct_user": True,
@@ -23536,6 +23543,7 @@ async def _agent_cmd_inject(
     tmux_pane: str | None,
     formatted: str,
     channel_name: str | None,
+    operation_key: str | None = None,
 ) -> bool:
     """Append Discord text as direct-user keyboard input.
 
@@ -23551,6 +23559,9 @@ async def _agent_cmd_inject(
         tmux_pane,
         formatted,
         instance_id=instance_id,
+        operation_id=_scoped_send_operation_id(
+            "discord-append", operation_key, tmux_pane, formatted
+        ),
     )
     if result.get("returncode") == 0:
         target = instance_id[:12] if instance_id else tmux_pane
@@ -23568,7 +23579,9 @@ async def _agent_cmd_inject(
     return False
 
 
-async def _inject_custodes_via_singleton_pane(formatted: str, channel_name: str | None) -> bool:
+async def _inject_custodes_via_singleton_pane(
+    formatted: str, channel_name: str | None, operation_key: str | None = None
+) -> bool:
     """Resolve the Custodes Discord target deterministically from the singleton lock.
 
     The authoritative Custodes identity is the `council:custodes` tmux pane marker —
@@ -23585,7 +23598,9 @@ async def _inject_custodes_via_singleton_pane(formatted: str, channel_name: str 
         # pane -> instance, so read the pane's live @INSTANCE_ID stamp directly
         # rather than querying the stored tmux_pane column.
         instance_id = await shared.instance_id_for_pane(tmux_pane)
-        return await _agent_cmd_inject("custodes", instance_id, tmux_pane, formatted, channel_name)
+        return await _agent_cmd_inject(
+            "custodes", instance_id, tmux_pane, formatted, channel_name, operation_key
+        )
 
     # No live council:custodes pane → assert (upsert-or-launch) then send. Voice/mention
     # Custodes must not degrade to a target-failure readback just because no pane is up.
@@ -23618,7 +23633,9 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
     formatted = _format_discord_injection(message.channel_name or "dm", message.content or "")
 
     if legion == "custodes":
-        return await _inject_custodes_via_singleton_pane(formatted, message.channel_name)
+        return await _inject_custodes_via_singleton_pane(
+            formatted, message.channel_name, message.message_id
+        )
 
     async with aiosqlite.connect(DB_PATH) as db:
         if require_synced:
@@ -23659,7 +23676,9 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
             logger.warning(f"Discord injection: no live {legion} instance or recoverable pane")
             return False
 
-    return await _agent_cmd_inject(legion, instance_id, tmux_pane, formatted, message.channel_name)
+    return await _agent_cmd_inject(
+        legion, instance_id, tmux_pane, formatted, message.channel_name, message.message_id
+    )
 
 
 # Dedup cache for Discord messages (daemon sometimes delivers twice)

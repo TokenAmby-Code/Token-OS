@@ -39,11 +39,16 @@ class RecordingAdapter(TmuxAdapter):
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.options: dict[tuple[str, str], str] = {}
+        self.buffer = ""
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         self.calls.append(args)
         if args == ("display-message", "-p", "#{pane_id}"):
             return "%42\n"
+        if args[:1] == ("send-keys",) and "-l" in args:
+            self.buffer += str(args[args.index("-l") + 1])
+        if args[:1] == ("capture-pane",):
+            return self.buffer
         return ""
 
     def show_pane_option(self, pane_id: str, option: str) -> str:

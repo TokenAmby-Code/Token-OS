@@ -62,9 +62,14 @@ class StubAdapter:
 class RecordingVoiceAdapter(StubAdapter):
     def __init__(self) -> None:
         self.calls = []
+        self.buffer = ""
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         self.calls.append(args)
+        if args[:1] == ("send-keys",) and "-l" in args:
+            self.buffer += str(args[args.index("-l") + 1])
+        if args[:1] == ("capture-pane",):
+            return self.buffer
         return ""
 
     def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
@@ -1093,7 +1098,27 @@ def test_append_user_text_inserts_without_clear_or_enter() -> None:
         )
         assert payload["ok"] is True
         assert payload["result"]["direct_user"] is True
-        assert rec.calls == [("send-keys", "-t", "%42", "-l", "[discord] hello")]
+        assert payload["result"]["verification_status"] == "inserted"
+        assert ("send-keys", "-t", "%42", "-l", "[discord] hello") in rec.calls
+        assert not any(c for c in rec.calls if c[:1] == ("send-keys-helper",))
+    finally:
+        server.shutdown()
+
+
+def test_append_user_text_operation_id_replay_does_not_duplicate_bytes() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    body = {"pane": "%42", "text": "[discord] hello", "operation_id": "discord-msg-1"}
+    try:
+        _, first = _post(server, "/append-user-text", body)
+        _, second = _post(server, "/append-user-text", body)
+        assert first["ok"] is True
+        assert second["ok"] is True
+        assert second["result"]["idempotent_replay"] is True
+        literal_sends = [
+            c for c in rec.calls if c == ("send-keys", "-t", "%42", "-l", "[discord] hello")
+        ]
+        assert len(literal_sends) == 1
     finally:
         server.shutdown()
 
@@ -1574,6 +1599,14 @@ class KeybindAdapter(StubAdapter):
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         self.calls.append(tuple(args))
+        if args == ("send-keys", "-t", "%42", "BTab"):
+            if "plan mode on" in self.capture:
+                self.capture = "status: bypass permissions on"
+            elif "bypass permissions on" in self.capture:
+                self.capture = "status: plan mode on"
+            else:
+                self.capture = "status: plan mode on"
+            return ""
         if args and args[0] == "resize-pane":
             self.zoomed = "1" if self.zoomed == "0" else "0"
             return ""
