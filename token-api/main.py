@@ -436,6 +436,18 @@ async def _tmuxctl_send_text_fallback(
 
     tmuxctld_lib = SCRIPTS_DIR / "tmuxctld" / "lib"
     cli_lib = SCRIPTS_DIR / "cli-tools" / "lib"
+    fallback_env = {
+        **os.environ,
+        "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        # The fallback CLI may need to fetch the live registry.  LaunchAgent
+        # environments have drifted before, so bind the subprocess to the local
+        # service/daemon explicitly instead of letting tmuxctl infer a remote
+        # Tailscale URL and report a false delivery failure after bytes landed.
+        "TOKEN_API_URL": os.environ.get("TOKEN_API_URL") or "http://localhost:7777",
+        "TMUXCTLD_URL": os.environ.get("TMUXCTLD_URL")
+        or cfg("tmuxctld_url")
+        or "http://127.0.0.1:7778",
+    }
     args: list[str] = [
         sys.executable,
         "-m",
@@ -456,10 +468,7 @@ async def _tmuxctl_send_text_fallback(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            },
+            env=fallback_env,
             timeout=15,
         )
     except Exception as exc:
@@ -528,7 +537,12 @@ async def send_prompt_to_pane(
             "verify_timeout": 6.0,
             "operation_id": operation_id or "",
         },
-        timeout=12,
+        # A verified tmuxctld send can legitimately take longer than the
+        # low-teens when the target swallows Enter and tmuxctld performs its
+        # recovery/ack handshake.  Do not time out early and fall back to a
+        # second send path; that creates the exact "bytes landed, receipt says
+        # failed" behavior brief is meant to eliminate.
+        timeout=45,
         default_loopback=_tmuxctld_default_loopback(),
     )
     if daemon_payload is None:
