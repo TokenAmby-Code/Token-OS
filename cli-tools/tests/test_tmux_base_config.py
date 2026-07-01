@@ -356,8 +356,11 @@ def test_typing_guard_submit_backspace_and_ctrl_c_use_one_pending_helper() -> No
         assert "send-keys" in line
     for key in ("BSpace", "C-h", "C-c"):
         line = _line_starting(f"bind -n {key} ")
-        assert "tmux-typing-guard-state pending --pane #{q:pane_id} --seconds 15" in line
+        pending_helper = "tmux-typing-guard-state pending --pane #{q:pane_id} --seconds 15"
+        assert line.count(pending_helper) == 2
+        assert "tmux-typing-guard-state arm" not in line
         assert "@TYPING_PENDING_UNTIL" in line
+        assert "@TYPING_LOCK_UNTIL" in line
         # Repeated Backspace/Ctrl+C while pending is the first branch and contains no helper call.
         pending_branch = line.split("} {")[0]
         assert "tmux-typing-guard-state" not in pending_branch
