@@ -8,8 +8,8 @@ merge-triggered webhook that reaches the Mac over Tailscale.
 
 | Workflow | Trigger | Role |
 |---|---|---|
-| `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, ops-cockpit bundle freshness, chill CodeRabbit — all **non-blocking** annotations. **No pytest** — the regression suite was stripped from the dev path entirely (Emperor CI-policy decree); it lives only on `prod` (`prod-gate.yml`). |
-| `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` + ops-cockpit bundle freshness **block**. **pytest does NOT run on this hot path, by policy** — the heavyweight regression suite wastes Actions minutes and pollutes agent attention on every dev PR, so it was removed from dev entirely and reserved for `prod`. Do not re-add it here. |
+| `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, chill CodeRabbit — all **non-blocking** annotations. **No pytest** — the regression suite was stripped from the dev path entirely (Emperor CI-policy decree); it lives only on `prod` (`prod-gate.yml`). |
+| `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. **pytest does NOT run on this hot path, by policy** — the heavyweight regression suite wastes Actions minutes and pollutes agent attention on every dev PR, so it was removed from dev entirely and reserved for `prod`. Do not re-add it here. |
 | `prod-gate.yml` — *Prod Gate (tests)* | PR/push → `prod`, nightly cron, `workflow_dispatch` | Full pytest suite — the **active** prod-branch regression gate (token-api runs parallel `pytest-xdist -n auto --dist loadfile`; cli-tools is forced serial `-n0` on CI — see "Running tests locally") (the `prod` branch now exists, created off the post-#420/#373 stable `main` HEAD). Runs as the merge-to-prod gate (PR → `prod`), post-merge (push → `prod`), nightly (08:00 UTC sweep of `prod`), and on demand. Never runs on PRs into `main`, so it can't block the dev hot path. To make it a *blocking* merge-to-prod gate, branch protection on `prod` must require the `tests` check. |
 | `secrets-scan.yml` | push/PR → `main` | Blocks on leaked IPs/secrets (patterns kept in repo secrets). |
 | `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD. Tailscale ephemeral node → POST `/api/cd/restart` on the Mac (ack-first) → poll `/health` until `git_sha == github.sha`; mismatch after 180s is a deploy alarm/failure. |
@@ -22,13 +22,16 @@ lockfile-pinned ruff CI uses (no floating `uvx`). So local edits are byte-identi
 to the gate and format drift never reaches CI. `worktree-setup` installs the
 pre-commit hook and syncs both projects' dev venvs.
 
-### Ops cockpit bundle never-drift
+### Ops cockpit bundle refresh
 
-Token-API serves the committed Vite build at `token-api/ui/ops` directly. CI runs
-`.github/scripts/check-ops-bundle.sh` when `token-api/web/ops` or
-`token-api/ui/ops` changes. The script runs `npm ci && npm run build` from
-`token-api/web/ops` and fails if the committed `token-api/ui/ops` tree changes.
-So a PR that edits the cockpit source cannot merge with a stale runtime bundle.
+Token-API serves the Vite build at `token-api/ui/ops` directly. PR CI does not
+gate on committed bundle freshness. The local deploy path is authoritative:
+`token-restart --sync` detects changes under `token-api/web/ops` or
+`token-api/ui/ops`, runs `npm ci --no-audit --no-fund && npm run build` from
+`token-api/web/ops` while the runtime checkout is unlocked, and aborts before the
+Token-API restart if that required refresh fails. Generated runtime dirt confined
+to `token-api/ui/ops` is discarded on the next deploy; mixed dirt is preserved via
+the dirty-runtime WIP shunt.
 
 ### Running tests locally
 

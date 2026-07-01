@@ -494,6 +494,7 @@ _reset_deploy_run_state() {
     TMUX_CONFIG_CHANGED=false
     RESTART_TOKENAPI=false
     RESTART_OPS=false
+    SYNC_OPS_REFRESH_REQUIRED=false
     RESTART_DISCORD=false
     RESTART_TMUXCTLD=false
     TMUXCTLD_PLIST_CHANGED=false
@@ -661,6 +662,77 @@ runtime_is_dirty() {
     [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]
 }
 
+runtime_dirty_only_ops_bundle() {
+    local dir="$1" line path saw=false
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        # Porcelain v1 uses a two-column status followed by the path. For rename
+        # records we only care about whether the destination/source is still under
+        # the generated ops bundle, so strip the leading status columns and split
+        # a possible "old -> new" marker below.
+        path="${line:3}"
+        case "$path" in
+            token-api/ui/ops/*) saw=true ;;
+            token-api/ui/ops/*\ -\>\ token-api/ui/ops/*) saw=true ;;
+            *) return 1 ;;
+        esac
+    done < <(git -C "$dir" status --porcelain -- token-api/ui/ops 2>/dev/null)
+
+    [[ "$saw" == true ]] || return 1
+
+    # If there is any dirt outside token-api/ui/ops, this is human/runtime WIP and
+    # must use the preservation shunt instead of being discarded as generated UI.
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        path="${line:3}"
+        case "$path" in
+            token-api/ui/ops/* | token-api/ui/ops/*\ -\>\ token-api/ui/ops/*) ;;
+            *) return 1 ;;
+        esac
+    done < <(git -C "$dir" status --porcelain 2>/dev/null)
+    return 0
+}
+
+discard_ops_bundle_dirt() {
+    local dir="$1"
+    echo -e "${YELLOW}⚠${NC} CD-sync: discarding generated token-api/ui/ops runtime dirt before deploy"
+    git -C "$dir" status --short -- token-api/ui/ops >&2 || true
+    git -C "$dir" checkout -- token-api/ui/ops >/dev/null 2>&1 || true
+    git -C "$dir" clean -fd -- token-api/ui/ops >/dev/null 2>&1 || return 1
+    [[ -z "$(git -C "$dir" status --porcelain -- token-api/ui/ops 2>/dev/null)" ]]
+}
+
+ops_refresh_needed_for_paths() {
+    local changed_paths="$1" path
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        case "$path" in
+            token-api/web/ops/* | token-api/ui/ops/*) return 0 ;;
+        esac
+    done <<< "$changed_paths"
+    return 1
+}
+
+refresh_ops_bundle_unlocked() {
+    local dir="$1" web_dir="${dir}/token-api/web/ops"
+    if ! command -v npm >/dev/null 2>&1; then
+        echo -e "  ${RED}✗${NC} CD-sync: ops cockpit refresh required but npm is not available"
+        return 1
+    fi
+    if [[ ! -d "$web_dir" ]]; then
+        echo -e "  ${RED}✗${NC} CD-sync: ops cockpit source directory missing: $web_dir"
+        return 1
+    fi
+
+    echo -e "${BLUE}→${NC} CD-sync: refreshing ops cockpit bundle..."
+    if (cd "$web_dir" && npm ci --no-audit --no-fund && npm run build); then
+        echo -e "  ${GREEN}✓${NC} CD-sync: ops cockpit bundle refreshed"
+        return 0
+    fi
+    echo -e "  ${RED}✗${NC} CD-sync: ops cockpit bundle refresh failed; aborting before Token-API restart"
+    return 1
+}
+
 sync_bare_main() {
     # Reconciler park-sweep (incident 2026-06-22): any agent worktree left checked
     # out *on* main/master pins the branch ref and jams the bare-main fast-forward
@@ -802,7 +874,7 @@ shunt_dirty_runtime() {
 }
 
 _sync_live_checkout_unlocked() {
-    local dir="$1" target="$2" old_head changed_paths
+    local dir="$1" target="$2" old_head changed_paths ops_bundle_dirt=false
 
     ensure_runtime_checkout "$dir" || return 1
 
@@ -826,13 +898,18 @@ _sync_live_checkout_unlocked() {
     # A dirty runtime NEVER blocks the deploy. This replaces the #280 abort path.
     local did_shunt=false
     if runtime_is_dirty "$dir"; then
-        shunt_dirty_runtime "$dir" || return 1
-        did_shunt=true
+        if runtime_dirty_only_ops_bundle "$dir"; then
+            discard_ops_bundle_dirt "$dir" || return 1
+            ops_bundle_dirt=true
+        else
+            shunt_dirty_runtime "$dir" || return 1
+            did_shunt=true
+        fi
     fi
 
     # Only short-circuit when the tree is already exactly the target AND we did not
     # have to shunt — after a shunt the HEAD has moved, so we must reset onto target.
-    if [[ "$old_head" == "$target" && "$did_shunt" == false ]]; then
+    if [[ "$old_head" == "$target" && "$did_shunt" == false && "$ops_bundle_dirt" == false ]]; then
         echo -e "  ${GREEN}✓${NC} CD-sync: runtime already at ${target:0:9} — no sync needed"
         return 0
     fi
@@ -848,15 +925,24 @@ _sync_live_checkout_unlocked() {
     }
 
     if [[ "$old_head" == "$target" ]]; then
-        # Shunt-only deploy: code is unchanged, we just reclaimed a clean tree.
+        # Clean-only deploy: code is unchanged, we just reclaimed a clean tree.
         changed_paths=""
-        echo -e "  ${GREEN}✓${NC} CD-sync: runtime cleaned to ${target:0:9} (WIP shunted; code unchanged)"
+        if [[ "$ops_bundle_dirt" == true ]]; then
+            echo -e "  ${GREEN}✓${NC} CD-sync: runtime cleaned to ${target:0:9} (generated ops bundle dirt discarded; code unchanged)"
+        else
+            echo -e "  ${GREEN}✓${NC} CD-sync: runtime cleaned to ${target:0:9} (WIP shunted; code unchanged)"
+        fi
     elif [[ -n "$old_head" ]]; then
         changed_paths="$(git --git-dir="$TOKEN_OS_BARE_REPO" diff --name-only "$old_head" "$target" 2>/dev/null || true)"
         echo -e "  ${GREEN}✓${NC} CD-sync: runtime advanced ${old_head:0:9} → ${target:0:9}"
     else
         changed_paths="$(git --git-dir="$TOKEN_OS_BARE_REPO" ls-tree -r --name-only "$target" 2>/dev/null || true)"
         echo -e "  ${GREEN}✓${NC} CD-sync: runtime initialized at ${target:0:9}"
+    fi
+
+    if [[ "$ops_bundle_dirt" == true ]] || ops_refresh_needed_for_paths "$changed_paths"; then
+        SYNC_OPS_REFRESH_REQUIRED=true
+        refresh_ops_bundle_unlocked "$dir" || return 1
     fi
 
     SYNC_DID_ADVANCE=true
@@ -1566,6 +1652,10 @@ restart_mobile() {
 
 map_changed_to_services() {
     local path
+    if [[ "${SYNC_OPS_REFRESH_REQUIRED:-false}" == true ]]; then
+        RESTART_OPS=true
+        RESTART_TOKENAPI=true
+    fi
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
         case "$path" in
@@ -1599,6 +1689,8 @@ map_changed_to_services() {
             token-api/token-satellite.py | token-api/scripts/token-satellite-refresh | ahk/* | cli-tools/bin/dispatch | cli-tools/lib/* | config/deskflow/*)
                 # WSL-hosted runtime dependencies. Push the target SHA into the
                 # WSL-local runtime/AHK cache instead of merely restarting NAS code.
+                RESTART_WSL=true
+                REFRESH_WSL=true
                 ;;
             token-api/ui/ops/* | token-api/web/ops/*)
                 # Ops cockpit is served by token-api; a restart bumps the build-id
@@ -1608,6 +1700,8 @@ map_changed_to_services() {
                 ;;
             token-api/uv.lock | token-api/pyproject.toml)
                 RESTART_TOKENAPI=true
+                RESTART_WSL=true
+                REFRESH_WSL=true
                 ;;
             token-api/*.py)
                 RESTART_TOKENAPI=true
@@ -1826,6 +1920,7 @@ CD_SYNC_MERGE_ERR=""
 # forced on in the full-restart fallback. Must be initialised for `set -u`.
 RESTART_TOKENAPI=false
 RESTART_OPS=false
+SYNC_OPS_REFRESH_REQUIRED=false
 RESTART_DISCORD=false
 # tmuxctld daemon: set by map_changed_to_services() when the daemon area changed.
 # TMUXCTLD_PLIST_CHANGED forces a reinstall (bootout+bootstrap) vs a kickstart.

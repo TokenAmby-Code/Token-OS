@@ -67,6 +67,7 @@ def _stub_env(
     repo = tmp_path / "runtime"
     repo.mkdir(exist_ok=True)
     (repo / ".git").mkdir(exist_ok=True)
+    (repo / "token-api" / "web" / "ops").mkdir(parents=True, exist_ok=True)
     bare = tmp_path / "token-os.git"
     bare.mkdir(exist_ok=True)
 
@@ -82,6 +83,7 @@ def _stub_env(
         "uv",
         "pgrep",
         "push-mobile",
+        "npm",
         "tmux",
         "tmuxctl",
         "tx",
@@ -124,8 +126,27 @@ if [[ "$1" == "-C" ]]; then git_cwd="$2"; shift 2; fi
 if [[ "$1" == --git-dir=* ]]; then shift; fi
 if [[ "$1" == "--git-dir" ]]; then shift 2; fi
 sub="$1"; shift || true
+if [[ ( "$sub" == "checkout" || "$sub" == "clean" ) && "$*" == *"token-api/ui/ops"* && -n "${STUB_OPS_DIRT_CLEARED:-}" ]]; then
+  touch "$STUB_OPS_DIRT_CLEARED"
+  exit 0
+fi
 if [[ "$sub" == "status" && "${STUB_DIRTY_RUNTIME:-}" == "1" ]]; then
-  echo " M token-api/main.py"
+  dirty_paths="${STUB_DIRTY_PATHS:-token-api/main.py}"
+  pathspec=""
+  prev=""
+  for arg in "$@"; do
+    if [[ "$prev" == "--" ]]; then pathspec="$arg"; fi
+    prev="$arg"
+  done
+  for p in $dirty_paths; do
+    if [[ -n "${STUB_OPS_DIRT_CLEARED:-}" && -f "$STUB_OPS_DIRT_CLEARED" && ( "$p" == token-api/ui/ops/* || "$p" == token-api/ui/ops ) ]]; then
+      continue
+    fi
+    if [[ -n "$pathspec" && "$p" != "$pathspec"/* && "$p" != "$pathspec" ]]; then
+      continue
+    fi
+    echo " M $p"
+  done
   exit 0
 fi
 if [[ "${STUB_REQUIRE_RUNTIME_WRITABLE:-}" == "1" && ( "$sub" == "fetch" || "$sub" == "checkout" ) && -n "$git_cwd" ]]; then
@@ -198,6 +219,7 @@ esac
         "MERGE_FAIL_TIMES": str(fail_times),
         "MERGE_FAIL_MSG": merge_fail_msg,
         "MERGE_COUNTER": str(tmp_path / "merge_count.txt"),
+        "STUB_OPS_DIRT_CLEARED": str(tmp_path / "ops_dirt_cleared"),
         # Default the post-restart /health SHA to the deploy target so the new
         # deploy-verification gate can pass under stubs. Tests can still opt into
         # a stale process by overriding env["STUB_RUNNING_SHA"] (e.g. "STALE999").
@@ -362,6 +384,70 @@ def test_tmuxctld_plist_change_reinstalls_daemon(tmp_path: Path) -> None:
     assert RESTART_TOKENAPI in calls
     assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     _assert_no_fleet_wipe(calls)
+
+
+# ── Ops cockpit deploy-time bundle refresh ────────────────────
+
+
+def test_ops_source_change_rebuilds_bundle_restarts_token_api_and_refreshes_tabs(
+    tmp_path: Path,
+) -> None:
+    env, logfile = _stub_env(tmp_path, "token-api/web/ops/src/App.tsx")
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    calls = logfile.read_text()
+    assert "npm ci --no-audit --no-fund" in calls
+    assert "npm run build" in calls
+    assert RESTART_TOKENAPI in calls
+    assert "osascript" in calls
+    assert "ops-ui" in proc.stdout
+
+
+def test_ops_committed_bundle_change_also_rebuilds_bundle(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "token-api/ui/ops/index.html")
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    calls = logfile.read_text()
+    assert "npm ci --no-audit --no-fund" in calls
+    assert "npm run build" in calls
+    assert RESTART_TOKENAPI in calls
+    assert "ops-ui" in proc.stdout
+
+
+def test_docs_only_change_does_not_run_npm_without_generated_ops_dirt(
+    tmp_path: Path,
+) -> None:
+    env, logfile = _stub_env(tmp_path, "README.md")
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "npm " not in logfile.read_text()
+
+
+def test_generated_ops_dirt_is_discarded_and_rebuilt_not_shunted(
+    tmp_path: Path,
+) -> None:
+    env, logfile = _stub_env(tmp_path, "README.md")
+    env["STUB_DIRTY_RUNTIME"] = "1"
+    env["STUB_DIRTY_PATHS"] = "token-api/ui/ops/index.html"
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    calls = logfile.read_text()
+    assert "discarding generated token-api/ui/ops runtime dirt" in proc.stdout
+    assert "auto-preserving WIP" not in proc.stdout
+    assert "npm ci --no-audit --no-fund" in calls
+    assert "npm run build" in calls
+    assert RESTART_TOKENAPI in calls
+
+
+def test_mixed_runtime_dirt_still_uses_wip_preservation(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "README.md")
+    env["STUB_DIRTY_RUNTIME"] = "1"
+    env["STUB_DIRTY_PATHS"] = "token-api/ui/ops/index.html token-api/main.py"
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "auto-preserving WIP to wip/live-dirty-" in proc.stdout
+    calls = logfile.read_text()
+    assert RESTART_TOKENAPI in calls
 
 
 # ── Nothing deployable / no-op / fallback ────────────────────

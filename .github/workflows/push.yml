@@ -39,10 +39,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
 
       - name: Install uv
         run: |
@@ -95,10 +91,6 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports . 2>&1 | tail -100) || echo "::warning::mypy failed (token-api)"
           fi
 
-      - name: Ops cockpit bundle check
-        id: ops_bundle
-        continue-on-error: true
-        run: bash .github/scripts/check-ops-bundle.sh origin/main
 
       # NOTE: pytest intentionally does NOT run on the dev path (not even advisory).
       # Per Emperor CI-policy decree the heavyweight regression suite was stripped
@@ -146,6 +138,5 @@ jobs:
             echo "| format-check | ${{ steps.fmt.outcome }} |"
             echo "| lint | ${{ steps.lint.outcome }} |"
             echo "| typecheck | ${{ steps.types.outcome }} |"
-            echo "| ops-cockpit bundle | ${{ steps.ops_bundle.outcome }} |"
             echo "| coderabbit (chill) | ${{ steps.cr.outcome }} |"
           } >> "$GITHUB_STEP_SUMMARY"

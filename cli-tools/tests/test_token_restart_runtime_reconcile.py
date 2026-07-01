@@ -56,6 +56,14 @@ def _stub_side_effect_tools(tmp_path: Path) -> Path:
         p.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         p.chmod(0o755)
 
+    npm_log = tmp_path / "npm.log"
+    npm = stub_bin / "npm"
+    npm.write_text(
+        f'#!/usr/bin/env bash\necho "npm $*" >> "{npm_log}"\nexit 0\n',
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+
     # curl: the /health payload self-reports git_sha = the runtime's CURRENT HEAD
     # (real git, read at call time from STUB_RUNTIME_DIR) so token-restart's
     # staleness check sees running==checkout and does NOT falsely report the live
@@ -87,7 +95,13 @@ def _make_repos(tmp_path: Path) -> tuple[Path, Path, Path, str, str]:
 
     subprocess.run(["git", "init", "-b", "main", str(upstream)], check=True, capture_output=True)
     (upstream / "README.md").write_text("c1\n", encoding="utf-8")
-    _git(upstream, "add", "README.md")
+    (upstream / "token-api" / "web" / "ops").mkdir(parents=True)
+    (upstream / "token-api" / "web" / "ops" / "package.json").write_text("{}\n", encoding="utf-8")
+    (upstream / "token-api" / "ui" / "ops").mkdir(parents=True)
+    (upstream / "token-api" / "ui" / "ops" / "index.html").write_text(
+        "committed bundle\n", encoding="utf-8"
+    )
+    _git(upstream, "add", "README.md", "token-api")
     _git(upstream, "commit", "-m", "c1")
     c1 = _rev(upstream, "HEAD")
 
@@ -199,6 +213,30 @@ def test_dirty_runtime_already_at_target_still_shunts_and_cleans(tmp_path: Path)
     wips = _wip_branches(bare)
     assert len(wips) == 1, wips
     assert _git_dir(bare, "show", f"{wips[0]}:README.md").stdout == "late dirty edit\n"
+
+
+def test_generated_ops_bundle_dirt_is_discarded_not_wip_shunted(
+    tmp_path: Path,
+) -> None:
+    _upstream, bare, runtime, _c1, c2 = _make_repos(tmp_path)
+    (runtime / "token-api" / "ui" / "ops" / "index.html").write_text(
+        "generated runtime bundle\n", encoding="utf-8"
+    )
+    (runtime / "token-api" / "ui" / "ops" / "old-hash.js").write_text(
+        "stale generated asset\n", encoding="utf-8"
+    )
+
+    proc = _run(_env(tmp_path, bare, runtime))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _rev(runtime, "HEAD") == _rev(bare, "refs/heads/main") == c2
+    assert _git(runtime, "status", "--porcelain").stdout.strip() == ""
+    assert _wip_branches(bare) == []
+    assert "discarding generated token-api/ui/ops runtime dirt" in proc.stdout
+    assert "auto-preserving WIP" not in proc.stdout
+    npm_log = tmp_path / "npm.log"
+    assert "npm ci --no-audit --no-fund" in npm_log.read_text()
+    assert "npm run build" in npm_log.read_text()
 
 
 def test_no_advance_deploy_still_refreshes_runtime_origin_main(tmp_path: Path) -> None:
