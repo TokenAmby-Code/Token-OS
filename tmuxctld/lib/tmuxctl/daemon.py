@@ -1564,12 +1564,57 @@ def _h_focus(control, params):
 
 
 def _h_grid_expand(control, params):
+    action = _s(params, "action", "toggle")
+    if _b(params, "expand"):
+        action = "expand"
+    if _b(params, "retract"):
+        action = "retract"
     return control.grid_expand(
         pane=_s(params, "pane"),
         client=_s(params, "client"),
-        expand=_b(params, "expand"),
-        retract=_b(params, "retract"),
+        expand=action == "expand",
+        retract=action == "retract",
     )
+
+
+def _h_mode_toggle(control, params):
+    return control.mode_toggle(
+        pane=_s(params, "pane", "current"),
+        status_only=_b(params, "status"),
+        delay_seconds=_f(params, "delay", 0.15),
+    )
+
+
+def _h_open_session_doc(control, params):
+    return control.open_session_doc(_s(params, "arg", _s(params, "pane", "current")))
+
+
+def _h_goto_spoken(control, params):
+    return control.goto_spoken(
+        db_path=_opt(params, "db_path"),
+        max_age_seconds=_i(params, "max_age_seconds", 600),
+    )
+
+
+def _h_pane_rename(control, params):
+    name = _s(params, "name")
+    if name.strip():
+        return not_implemented_anchor(
+            "POST",
+            "/pane-rename",
+            detail=(
+                "explicit rename still shells through instance-name plus agent /rename; "
+                "only empty-name interview nudges are daemonized"
+            ),
+        )
+    return control.pane_rename(_s(params, "pane", "current"), name=name)
+
+
+def _keybind_anchor(path: str, detail: str) -> RouteHandler:
+    def _anchor(_control, _params):
+        return not_implemented_anchor("POST", path, detail=detail)
+
+    return _anchor
 
 
 def _h_pane_select(control, params):
@@ -2009,6 +2054,34 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/normalize"): _h_normalize,
     ("POST", "/focus"): _h_focus,
     ("POST", "/grid-expand"): _h_grid_expand,
+    ("POST", "/mode-toggle"): _h_mode_toggle,
+    ("POST", "/open-session-doc"): _h_open_session_doc,
+    ("POST", "/goto-spoken"): _h_goto_spoken,
+    ("POST", "/pane-rename"): _h_pane_rename,
+    ("POST", "/shuttle"): _keybind_anchor(
+        "/shuttle",
+        "tmux-shuttle promotion/demotion is multi-step interactive swap/retag/relocate work",
+    ),
+    ("POST", "/mark-for-close"): _keybind_anchor(
+        "/mark-for-close",
+        "interactive closeout menu and final-message rollback contract remain script-owned",
+    ),
+    ("POST", "/reset"): _keybind_anchor(
+        "/reset",
+        "workspace reset rebuild/reinject flow remains too destructive to half-port",
+    ),
+    ("POST", "/ethereal-prompt"): _keybind_anchor(
+        "/ethereal-prompt",
+        "active-pane /btw capture and codex /side flow need a dedicated safe daemon primitive",
+    ),
+    ("POST", "/tts/listen"): _keybind_anchor(
+        "/tts/listen",
+        "tmux-tts-listen script is not present in this checkout",
+    ),
+    ("POST", "/legion-prompt"): _keybind_anchor(
+        "/legion-prompt",
+        "legion prompt popup is an interactive readline/dispatch selector",
+    ),
     ("POST", "/pane-select"): _h_pane_select,
     ("POST", "/create"): _h_create,
     ("POST", "/rebuild-window"): _h_rebuild_window,
