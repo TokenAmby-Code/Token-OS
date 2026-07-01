@@ -5,6 +5,12 @@
 #
 # Compatibility shim for the tmuxctl normalize path.
 
+
+# 410-on-touch shim: this cold CLI/keybind path is retired.  The dead body
+# below is intentionally retained for the separately-gated atomic wipe.
+echo "tmux-refresh-layout: HTTP 410 Gone — layout normalize live path is tmuxctld-ping POST /normalize." >&2
+exit 154  # 410 modulo POSIX shell's 8-bit exit status
+
 set -euo pipefail
 
 _BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"

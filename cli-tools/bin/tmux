@@ -292,7 +292,7 @@ runtime_invariant_preflight() {
             target="$(extract_target_flag -t "$@" 2>/dev/null || true)"
             [[ -n "$target" ]] || target="$TMUX_PANE"
             [[ -n "$target" ]] || return 0
-            IMPERIUM_TMUX_AUTOMATION=1 "${_BIN_DIR}/tmuxctl" clear-runtime --pane "$target" >/dev/null 2>&1 || true
+            "${_BIN_DIR}/tmuxctld-ping" POST /clear-runtime pane="$target" >/dev/null 2>&1 || true
             ;;
         set-option|set)
             local pane_scope=0 unset_scope=0
@@ -307,7 +307,7 @@ runtime_invariant_preflight() {
             [[ -n "$target" ]] || target="$TMUX_PANE"
             [[ -n "$target" ]] || return 0
             # clear-runtime clears pane tint/title before unsetting @INSTANCE_ID.
-            IMPERIUM_TMUX_AUTOMATION=1 "${_BIN_DIR}/tmuxctl" clear-runtime --pane "$target" >/dev/null 2>&1 || true
+            "${_BIN_DIR}/tmuxctld-ping" POST /clear-runtime pane="$target" >/dev/null 2>&1 || true
             ;;
     esac
 }

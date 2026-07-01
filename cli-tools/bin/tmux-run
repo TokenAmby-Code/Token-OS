@@ -12,6 +12,12 @@
 #   tmux-run --tail [N]             # Tail the log (default 20 lines)
 #   tmux-run --clear                # Truncate the log
 
+
+# 410-on-touch shim: this cold CLI/keybind path is retired.  The dead body
+# below is intentionally retained for the separately-gated atomic wipe.
+echo "tmux-run: HTTP 410 Gone — tmux keybind run wrapper is retired; bind live callers directly to tmuxctld-ping." >&2
+exit 154  # 410 modulo POSIX shell's 8-bit exit status
+
 TMUX_CMD_LOG="/tmp/.tmux-cmd.log"
 
 case "${1:-}" in

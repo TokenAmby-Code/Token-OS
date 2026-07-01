@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import logging
 import os
@@ -1596,6 +1597,48 @@ def _h_goto_spoken(control, params):
     )
 
 
+def _h_typing_guard_state(control, params):
+    del control
+    cmd = _s(params, "cmd", _s(params, "action"))
+    if cmd not in {"arm", "pending", "hold", "release", "expire-pane"}:
+        raise ValueError("typing guard state cmd must be arm, pending, hold, release, or expire-pane")
+    argv = [cmd]
+    for key in ("pane", "seconds", "now", "client", "term", "pid", "session"):
+        value = _opt(params, key)
+        if value is not None and value != "":
+            argv.extend([f"--{key}", str(value)])
+    return {"returncode": typing_guard_state.main(argv)}
+
+
+def _h_client_lease(control, params):
+    del control
+    cmd = _s(params, "cmd", _s(params, "action"))
+    if cmd not in {"attach", "activity", "detach", "away", "protect", "status"}:
+        raise ValueError("client lease cmd must be attach, activity, detach, away, protect, or status")
+    argv = [cmd]
+    if cmd == "protect":
+        argv.extend([_s(params, "role"), str(_i(params, "minutes", 0))])
+    else:
+        for key in ("client", "term", "pid", "session", "role", "reason"):
+            value = _opt(params, key)
+            if value is not None and value != "":
+                argv.extend([f"--{key}", str(value)])
+    try:
+        from tmux_client_lease import main as client_lease_main
+    except Exception as exc:  # pragma: no cover - install/runtime path issue
+        raise ValueError(f"tmux_client_lease unavailable: {exc}") from exc
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        rc = client_lease_main(argv)
+    return {
+        "returncode": int(rc or 0),
+        "stdout": stdout.getvalue(),
+        "stderr": stderr.getvalue(),
+    }
+
+
 def _h_pane_rename(control, params):
     name = _s(params, "name")
     if name.strip():
@@ -2057,6 +2100,8 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/mode-toggle"): _h_mode_toggle,
     ("POST", "/open-session-doc"): _h_open_session_doc,
     ("POST", "/goto-spoken"): _h_goto_spoken,
+    ("POST", "/typing-guard-state"): _h_typing_guard_state,
+    ("POST", "/client-lease"): _h_client_lease,
     ("POST", "/pane-rename"): _h_pane_rename,
     ("POST", "/shuttle"): _keybind_anchor(
         "/shuttle",

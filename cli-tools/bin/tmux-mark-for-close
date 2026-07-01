@@ -10,8 +10,7 @@ _LIB_DIR="${SCRIPT_DIR}/../lib"
 # shellcheck source=../lib/nas-path.sh
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
-TMUXCTL_BIN="${SCRIPT_DIR}/tmuxctl"
-[[ -x "$TMUXCTL_BIN" ]] || TMUXCTL_BIN="tmuxctl"
+TMUXCTLD_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -104,6 +103,24 @@ print(json.dumps({"mode": mode, "lifecycle": lifecycle, "pane": pane}, separator
 PY
 }
 
+_tmuxctld_send_final_message() {
+    local text="$1" body rc=0
+    body="$(python3 - "$PANE" "$text" <<'PY'
+import json, sys
+pane, text = sys.argv[1:]
+print(json.dumps({
+  "pane": pane,
+  "text": text,
+  "submit": True,
+  "clear_prompt": True,
+}, separators=(",", ":")))
+PY
+)"
+    curl -sf --max-time 8 -X POST "${TMUXCTLD_URL%/}/send-text" \
+        -H 'Content-Type: application/json' -d "$body" >/dev/null || rc=$?
+    return "$rc"
+}
+
 _begin_atomic_close_contract() {
     # Once mark-for-close commits an API lifecycle/closeout request, the wrapper
     # owns completion. Extra Ctrl-C keystrokes from close muscle memory must not
@@ -147,7 +164,7 @@ if [[ "$MODE_CHOICE" == "message" ]]; then
     fi
     _begin_atomic_close_contract
     _api_post_json "/api/instances/${INSTANCE_ID}/mark-for-close" "$(_mark_body after-stop)" >/dev/null
-    if ! printf '%s' "$FINAL_MESSAGE" | "$TMUXCTL_BIN" send-text --pane "$PANE" --stdin --clear-prompt; then
+    if ! _tmuxctld_send_final_message "$FINAL_MESSAGE"; then
         if _unsubscribe_mark; then
             tmux display-message "mark-for-close: final send failed; closeout disarmed" 2>/dev/null || true
             echo "tmux-mark-for-close: final send failed; closeout disarmed" >&2

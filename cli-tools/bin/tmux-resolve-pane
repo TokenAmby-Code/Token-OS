@@ -6,6 +6,12 @@
 # Accepts raw tmux pane ids (%5), @PANE_ID roles (palace:N, council:custodes),
 # and positional ids (1:N, palace:N). Resolution is live and uncached.
 
+
+# 410-on-touch shim: this cold CLI/keybind path is retired.  The dead body
+# below is intentionally retained for the separately-gated atomic wipe.
+echo "tmux-resolve-pane: HTTP 410 Gone — resolve live path is tmuxctld GET /resolve-pane; do not spawn cold resolver." >&2
+exit 154  # 410 modulo POSIX shell's 8-bit exit status
+
 set -euo pipefail
 
 _BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"

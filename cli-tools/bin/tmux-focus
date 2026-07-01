@@ -3,6 +3,12 @@
 # TAGS: tmux, focus
 # AUDIENCE: human (keybind: prefix + F via `tx toggle-focus`)
 
+
+# 410-on-touch shim: this cold CLI/keybind path is retired.  The dead body
+# below is intentionally retained for the separately-gated atomic wipe.
+echo "tmux-focus: HTTP 410 Gone — focus live path is tmuxctld-ping POST /focus." >&2
+exit 154  # 410 modulo POSIX shell's 8-bit exit status
+
 set -euo pipefail
 
 mode="${1:-toggle}"

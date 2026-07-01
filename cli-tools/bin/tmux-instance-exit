@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-instance-exit — close the current managed agent instance via tmuxctl.
+# tmux-instance-exit — close the current managed agent instance via tmuxctld.
 # TAGS: tmux, agent, claude, codex, exit, close, keybind
 # AUDIENCE: human
 set -euo pipefail
@@ -10,8 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 _LIB_DIR="${SCRIPT_DIR}/../lib"
 # shellcheck source=../lib/nas-path.sh
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
-TMUXCTL_BIN="${SCRIPT_DIR}/tmuxctl"
-[[ -x "$TMUXCTL_BIN" ]] || TMUXCTL_BIN="tmuxctl"
+TMUXCTLD_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,9 +38,9 @@ _show_close_menu() {
     local quoted_pane
     quoted_pane="$(printf '%q' "$PANE")"
     local -a menu_args=(
-        "Retire instance" r "run-shell \"tmux-run tmux-instance-exit --pane ${quoted_pane} --lifecycle retire\""
-        "Archive session doc" a "run-shell \"tmux-run tmux-instance-exit --pane ${quoted_pane} --lifecycle archive-session-doc\""
-        "Banish" b "run-shell \"tmux-run tmux-instance-exit --pane ${quoted_pane} --lifecycle banish\""
+        "Retire instance" r "run-shell \"tmux-instance-exit --pane ${quoted_pane} --lifecycle retire\""
+        "Archive session doc" a "run-shell \"tmux-instance-exit --pane ${quoted_pane} --lifecycle archive-session-doc\""
+        "Banish" b "run-shell \"tmux-instance-exit --pane ${quoted_pane} --lifecycle banish\""
         ""
         "Cancel" q ""
     )
@@ -81,7 +80,19 @@ if [[ -z "$INSTANCE_ID" ]]; then
 fi
 
 _begin_atomic_close_contract
-if IMPERIUM_TMUX_AUTOMATION=1 "$TMUXCTL_BIN" close --instance-id "$INSTANCE_ID" --pane "$PANE" --lifecycle "$LIFECYCLE" --mode now; then
+body="$(python3 - "$INSTANCE_ID" "$PANE" "$LIFECYCLE" <<'PY'
+import json, sys
+instance_id, pane, lifecycle = sys.argv[1:]
+print(json.dumps({
+  "instance_id": instance_id,
+  "pane": pane,
+  "lifecycle": lifecycle,
+  "mode": "now",
+}, separators=(",", ":")))
+PY
+)"
+if curl -sf --max-time 8 -X POST "${TMUXCTLD_URL%/}/close" \
+    -H 'Content-Type: application/json' -d "$body" >/dev/null; then
     tmux display-message "tmux-instance-exit: $LIFECYCLE executed" 2>/dev/null || true
     echo "CLOSE_CONTRACT_OK lifecycle=$LIFECYCLE instance=$INSTANCE_ID pane=$PANE"
 else
