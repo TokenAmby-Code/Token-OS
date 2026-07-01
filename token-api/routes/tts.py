@@ -29,6 +29,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import aiosqlite
@@ -36,6 +37,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+import shared
 from human_render import sanitize_human_render_text, sanitize_human_render_text_sync
 from instance_mutation import update_instance
 from personas import (
@@ -1107,15 +1109,13 @@ def _set_tts_state(pane_id: str | None, state: str):
         return
     try:
         if state:
-            subprocess.run(
-                ["tmux", "set-option", "-p", "-t", pane_id, "@TTS_STATE", state],
-                capture_output=True,
+            shared._tmuxctld_run_tmux(
+                ("set-option", "-p", "-t", pane_id, "@TTS_STATE", state),
                 timeout=2,
             )
         else:
-            subprocess.run(
-                ["tmux", "set-option", "-p", "-u", "-t", pane_id, "@TTS_STATE"],
-                capture_output=True,
+            shared._tmuxctld_run_tmux(
+                ("set-option", "-p", "-u", "-t", pane_id, "@TTS_STATE"),
                 timeout=2,
             )
     except Exception:
@@ -1146,20 +1146,16 @@ def _local_device_name() -> str | None:
 
 
 def _tmux(args: list[str], timeout: float = 2) -> subprocess.CompletedProcess | None:
-    """Run a tmux command, returning the CompletedProcess (or None on error).
+    """Run a tmux command through tmuxctld, returning a CompletedProcess-like object.
 
-    Centralizes tmux invocation so the focus-snap path is monkeypatchable and
-    never raises into playback. Run off the event loop via asyncio.to_thread.
+    Centralizes invocation so the focus-snap path is monkeypatchable and never
+    raises into playback. Run off the event loop via asyncio.to_thread.
     """
     try:
-        return subprocess.run(
-            ["tmux", *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
-        )
+        result = shared._tmuxctld_run_tmux(args, timeout=timeout)
+        if result is None:
+            return None
+        return SimpleNamespace(returncode=0, stdout=str(result.get("stdout") or ""), stderr="")
     except Exception:
         return None
 

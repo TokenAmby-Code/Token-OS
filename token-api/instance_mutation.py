@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import sqlite3
 import subprocess
 import uuid
@@ -9,6 +8,7 @@ from pathlib import Path
 
 import aiosqlite
 
+import shared
 from instance_registry import (
     DEFAULT_INSTANCE_NAME,
     FORBIDDEN_RUNTIME_INSTANCE_FIELDS,
@@ -715,18 +715,8 @@ async def _get_pending_projection(db, instance_id: str) -> dict:
 
 
 def _tmux_query(*args: str) -> str | None:
-    try:
-        proc = subprocess.run(
-            ["tmux", *args],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
-        )
-    except Exception:
-        return None
-    text = proc.stdout.strip()
+    result = shared._tmuxctld_run_tmux(args, timeout=2)
+    text = str((result or {}).get("stdout") or "").strip()
     return text or None
 
 

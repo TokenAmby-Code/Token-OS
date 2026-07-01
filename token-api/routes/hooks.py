@@ -19,7 +19,6 @@ import posixpath
 import re
 import shlex
 import subprocess
-import tempfile
 import time
 import urllib.request
 import uuid
@@ -556,19 +555,11 @@ async def _tmux_pane_exists(tmux_pane: str | None) -> bool:
 async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
     if not tmux_pane:
         return None
-    try:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "show-options", "-pv", "-t", tmux_pane, "@PANE_ID"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=2,
-        )
-        if proc.returncode == 0:
-            label = proc.stdout.decode(errors="ignore").strip()
-            return label or None
-    except Exception as exc:
-        logger.debug(f"Hook: pane label lookup failed for {tmux_pane}: {exc}")
-    return None
+    stdout = await shared.tmuxctld_stdout(
+        ("show-options", "-pv", "-t", tmux_pane, "@PANE_ID"),
+        timeout=2,
+    )
+    return (stdout or "").strip() or None
 
 
 async def _stamp_instance_id(
@@ -592,33 +583,20 @@ async def _stamp_instance_id(
     """
     if not tmux_pane or not session_id:
         return
-    try:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "set-option", "-p", "-t", tmux_pane, "@INSTANCE_ID", session_id),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=2,
-        )
-        if proc.returncode != 0:
-            logger.debug(
-                f"Hook: @INSTANCE_ID stamp failed for {tmux_pane} "
-                f"({session_id}): {proc.stderr.decode(errors='ignore').strip()}"
-            )
-    except Exception as exc:
-        logger.debug(f"Hook: @INSTANCE_ID stamp errored for {tmux_pane}: {exc}")
+    stamped = await shared.tmuxctld_run_tmux(
+        ("set-option", "-p", "-t", tmux_pane, "@INSTANCE_ID", session_id),
+        timeout=2,
+    )
+    if stamped is None:
+        logger.debug(f"Hook: @INSTANCE_ID stamp failed for {tmux_pane} ({session_id})")
 
     label = (display_name or "").strip()
     if not label:
         return
-    try:
-        await _run_subprocess_offloop(
-            ("tmux", "set-option", "-p", "-t", tmux_pane, "@PANE_LABEL", label),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            timeout=2,
-        )
-    except Exception as exc:
-        logger.debug(f"Hook: @PANE_LABEL stamp errored for {tmux_pane}: {exc}")
+    await shared.tmuxctld_run_tmux(
+        ("set-option", "-p", "-t", tmux_pane, "@PANE_LABEL", label),
+        timeout=2,
+    )
 
 
 async def _persona_id_by_slug(db, slug: str) -> str | None:
@@ -826,20 +804,14 @@ async def _unstamp_instance_id(tmux_pane: str | None, session_id: str | None) ->
     if not tmux_pane or not session_id:
         return
     try:
-        current = await _run_subprocess_offloop(
-            ("tmux", "show-options", "-pqv", "-t", tmux_pane, "@INSTANCE_ID"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        current = await shared.tmuxctld_stdout(
+            ("show-options", "-pqv", "-t", tmux_pane, "@INSTANCE_ID"),
             timeout=2,
         )
-        if current.returncode != 0:
-            return
-        if current.stdout.decode(errors="ignore").strip() != session_id:
+        if (current or "").strip() != session_id:
             return  # pane gone or already owned by a different instance
-        await _run_subprocess_offloop(
-            ("tmux", "set-option", "-p", "-u", "-t", tmux_pane, "@INSTANCE_ID"),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        await shared.tmuxctld_run_tmux(
+            ("set-option", "-p", "-u", "-t", tmux_pane, "@INSTANCE_ID"),
             timeout=2,
         )
     except Exception as exc:
@@ -2046,40 +2018,30 @@ async def _enqueue_and_send_stop_delivery(
 
 
 async def _tmux_show_pane_option(pane: str, option: str) -> str:
-    try:
-        proc = await _run_subprocess_offloop(
-            ("tmux", "show-options", "-pv", "-t", pane, option),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=2,
-        )
-        if proc.returncode != 0:
-            return ""
-        return proc.stdout.decode(errors="ignore").strip()
-    except Exception:
-        return ""
+    stdout = await shared.tmuxctld_stdout(
+        ("show-options", "-pv", "-t", pane, option),
+        timeout=2,
+    )
+    return (stdout or "").strip()
 
 
 async def _tmux_pane_stack_window(pane: str | None) -> str | None:
     pane = _normalize_text(pane)
     if not pane:
         return None
-    proc = await _run_subprocess_offloop(
+    stdout = await shared.tmuxctld_stdout(
         (
-            "tmux",
             "display-message",
             "-p",
             "-t",
             pane,
             "#{session_name}:#{window_index}\t#{@PANE_ID}\t#{@PANE_TYPE}",
         ),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
         timeout=2,
     )
-    if proc.returncode != 0:
+    if stdout is None:
         return None
-    parts = proc.stdout.decode(errors="ignore").strip().split("\t")
+    parts = stdout.strip().split("\t")
     if len(parts) != 3:
         return None
     window_target, pane_role, pane_type = parts
@@ -2098,63 +2060,26 @@ def _spawn_stack_enforce(window_target: str | None) -> None:
     window_target = _normalize_text(window_target)
     if not window_target:
         return
-    tmuxctl = _tmuxctl_bin()
-    if not tmuxctl.exists():
-        return
-    log_handle = None
     try:
-        log_dir = Path.home() / ".claude"
-        log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        log_handle = tempfile.NamedTemporaryFile(
-            mode="a",
-            encoding="utf-8",
-            prefix="mark-for-close-stack-enforce-",
-            suffix=".log",
-            dir=log_dir,
-            delete=False,
-        )
-        env = os.environ.copy()
-        env.setdefault("IMPERIUM_TMUX_AUTOMATION", "1")
-        subprocess.Popen(
-            [
-                str(tmuxctl),
-                "stack",
-                "enforce",
-                "--window",
-                window_target,
-                "--kill-pending-clear",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=log_handle,
-            start_new_session=True,
-            close_fds=True,
-            env=env,
+        shared._tmuxctld_post_json(
+            "/stack/enforce",
+            {"window": window_target, "kill_pending_clear": True},
+            timeout=10,
+            default_loopback=True,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("mark-for-close stack enforce spawn failed for %s: %s", window_target, exc)
-    finally:
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except Exception:
-                pass
 
 
 async def _cleanup_tmux_pane_cosmetic(pane: str) -> None:
     commands: list[tuple[str, ...]] = [
-        ("tmux", "select-pane", "-t", pane, "-T", ""),
-        ("tmux", "set-option", "-pu", "-t", pane, "window-style"),
-        ("tmux", "set-option", "-pu", "-t", pane, "window-active-style"),
+        ("select-pane", "-t", pane, "-T", ""),
+        ("set-option", "-pu", "-t", pane, "window-style"),
+        ("set-option", "-pu", "-t", pane, "window-active-style"),
     ]
     for cmd in commands:
         try:
-            await _run_subprocess_offloop(
-                cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                timeout=2,
-            )
+            await shared.tmuxctld_run_tmux(cmd, timeout=2)
         except Exception:  # noqa: BLE001 - cleanup is best-effort
             pass
 
@@ -2188,15 +2113,10 @@ async def _cleanup_tmux_pane_runtime_stamps(pane: str) -> None:
         "@TOKEN_API_LAUNCH_MODE",
         "@TOKEN_API_TARGET_WORKING_DIR",
     ):
-        commands.append(("tmux", "set-option", "-pu", "-t", pane, opt))
+        commands.append(("set-option", "-pu", "-t", pane, opt))
     for cmd in commands:
         try:
-            await _run_subprocess_offloop(
-                cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                timeout=2,
-            )
+            await shared.tmuxctld_run_tmux(cmd, timeout=2)
         except Exception:  # noqa: BLE001 - cleanup is best-effort
             pass
 

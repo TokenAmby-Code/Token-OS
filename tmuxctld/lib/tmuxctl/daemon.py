@@ -617,6 +617,41 @@ def _h_doctor(control, params):
     return control.doctor(_s(params, "session", "main"))
 
 
+_TOKEN_API_TMUX_RUN_COMMANDS = frozenset(
+    {
+        "capture-pane",
+        "display-message",
+        "list-clients",
+        "list-panes",
+        "pipe-pane",
+        "resize-pane",
+        "select-pane",
+        "set-option",
+        "show-options",
+    }
+)
+
+
+def _h_tmux_run(control, params):
+    """Small allowlisted tmux adapter bridge for legacy Token-API reads/stamps.
+
+    This is not a shell escape hatch: callers supply argv tokens, ``send-keys``
+    is deliberately excluded in favour of the existing send-text/send-keys
+    daemon APIs, and execution goes through ``TmuxAdapter.run`` so target
+    resolution, send/focus guards, and pane runtime invariants remain daemon
+    owned.
+    """
+
+    raw_args = params.get("args")
+    if not isinstance(raw_args, list) or not raw_args:
+        raise ValueError("args list required")
+    args = tuple(str(arg) for arg in raw_args)
+    command = args[0]
+    if command not in _TOKEN_API_TMUX_RUN_COMMANDS:
+        raise ValueError(f"tmux command not allowed through /tmux/run: {command}")
+    return {"stdout": control.adapter.run(*args, allow_failure=False), "args": list(args)}
+
+
 def _h_instance_show_option(control, params):
     return control.instance_show_option(_s(params, "instance_id"), _s(params, "option"))
 
@@ -2020,6 +2055,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("GET", "/inspect/restart-plan"): _h_inspect_restart_plan,
     ("GET", "/doctor"): _h_doctor,
     ("GET", "/instance/show-option"): _h_instance_show_option,
+    ("POST", "/tmux/run"): _h_tmux_run,
     # Send + act (POST)
     ("POST", "/tmux/send-keys"): _h_send_keys,
     ("POST", "/send-text"): _h_send_text,

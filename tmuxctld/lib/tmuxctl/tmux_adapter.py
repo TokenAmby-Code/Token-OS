@@ -137,6 +137,13 @@ def _tmux_binary() -> str:
     ):
         if not candidate:
             continue
+        candidate_path = Path(candidate)
+        if (
+            candidate_path.name == "tmux"
+            and candidate_path.parent.name == "bin"
+            and candidate_path.parent.parent.name == "cli-tools"
+        ):
+            continue
         try:
             if Path(candidate).resolve() in wrapper_paths:
                 continue

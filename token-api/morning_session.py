@@ -22,6 +22,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import shared
+
 logger = logging.getLogger("token_api")
 
 BASE = "http://localhost:7777"
@@ -756,33 +758,19 @@ def resolve_custodes_pane() -> str | None:
     aborting `run_morning_session()`, 2026-06-05) cannot recur now that the call
     is removed.
     """
-    tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
-    try:
-        result = subprocess.run(
-            [str(tmuxctl), "resolve-pane", "--format", "physical", "council:custodes"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("tmuxctl resolve-pane council:custodes timed out (5s)")
-        return None
-    except Exception as e:
-        logger.error("tmuxctl resolve-pane council:custodes failed: %s", e)
-        return None
-    if result.returncode != 0:
-        logger.error("could not resolve council:custodes: %s", result.stderr)
-        return None
-    pane_id = result.stdout.strip()
+    result = shared._tmuxctld_run_tmux(
+        ("display-message", "-t", "council:custodes", "-p", "#{pane_id}"),
+        timeout=5,
+    )
+    pane_id = str((result or {}).get("stdout") or "").strip()
     if not pane_id:
-        logger.error("tmuxctl resolve-pane did not return a pane_id for council:custodes")
+        logger.error("tmuxctld did not resolve council:custodes")
         return None
     return pane_id
 
 
 def launch_in_custodes(prompt_text: str, pane_id: str) -> dict:
     """Assert `council:custodes`, then send the morning prompt after assertion is true."""
-    tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
     dispatch = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "dispatch"
 
     def _fallback_new_custodes_pane(reason: str) -> dict:
@@ -860,24 +848,19 @@ def launch_in_custodes(prompt_text: str, pane_id: str) -> dict:
         }
 
     def _assert_once() -> dict:
-        result = subprocess.run(
-            [str(tmuxctl), "assert-instance", "--pane", "council:custodes"],
-            capture_output=True,
-            text=True,
+        envelope = shared._tmuxctld_post_json(
+            "/assert-instance",
+            {"pane": "council:custodes"},
             timeout=45,
+            default_loopback=True,
         )
-        try:
-            parsed = json.loads(result.stdout.strip() or "{}")
-        except json.JSONDecodeError:
-            return {"ok": False, "reason": f"bad_assert_output rc={result.returncode}"}
-        if not isinstance(parsed, dict):
-            return {"ok": False, "reason": f"bad_assert_output_type rc={result.returncode}"}
-        if result.returncode != 0 and parsed.get("ok"):
-            parsed["ok"] = False
-            parsed["reason"] = parsed.get("reason") or f"assert_failed rc={result.returncode}"
-        if result.returncode != 0:
-            parsed.setdefault("stderr", result.stderr.strip()[:200])
-        return parsed
+        if not isinstance(envelope, dict):
+            return {"ok": False, "reason": "tmuxctld_assert_unavailable"}
+        if not envelope.get("ok"):
+            err = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
+            return {"ok": False, "reason": err.get("message") or err.get("code") or "assert_failed"}
+        result = envelope.get("result")
+        return result if isinstance(result, dict) else {"ok": False, "reason": "bad_assert_output"}
 
     try:
         assertion = _assert_once()
@@ -893,28 +876,28 @@ def launch_in_custodes(prompt_text: str, pane_id: str) -> dict:
                 return _fallback_new_custodes_pane(str(assertion.get("action")))
             logger.error("tmuxctl assert-instance council:custodes failed: %s", assertion)
             return {"launched": False, "pane_id": pane_id}
-        result = subprocess.run(
-            [str(tmuxctl), "send-text", "--pane", "council:custodes", "--stdin"],
-            input=prompt_text,
-            capture_output=True,
-            text=True,
+        result = shared._tmuxctld_post_json(
+            "/send-text",
+            {"pane": "council:custodes", "text": prompt_text, "submit": True},
             timeout=45,
+            default_loopback=True,
         )
-    except subprocess.TimeoutExpired:
-        logger.error("tmuxctl assert/send council:custodes timed out")
-        return {"launched": False, "pane_id": pane_id}
     except Exception as e:
         logger.error("Error launching in council:custodes pane: %s", e)
         return {"launched": False, "pane_id": pane_id}
 
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (
+            result.get("error")
+            if isinstance(result, dict) and isinstance(result.get("error"), dict)
+            else {}
+        )
+        stderr = str(err.get("message") or err.get("code") or "")
         if "send suppressed by gate" in stderr or "user input not cleared" in stderr:
             return _fallback_new_custodes_pane("fixed_pane_send_gated")
         logger.error(
-            "tmuxctl send-text council:custodes rc=%s: stdout=%s stderr=%s",
-            result.returncode,
-            result.stdout.strip()[:200],
+            "tmuxctld send-text council:custodes failed: stdout=%s stderr=%s",
+            str((result or {}).get("result") or "")[:200],
             stderr[:200],
         )
         return {"launched": False, "pane_id": pane_id}
@@ -929,48 +912,38 @@ def inject_morning_lifecycle_prompt(prompt_text: str | None = None) -> dict:
     tmuxctl's pane marker and assert/send flow; no physical pane id is hardcoded.
     """
     prompt = prompt_text or MORNING_LIFECYCLE_PROMPT
-    tmuxctl = Path(__file__).resolve().parents[1] / "cli-tools" / "bin" / "tmuxctl"
     try:
-        assertion = subprocess.run(
-            [str(tmuxctl), "assert-instance", "--pane", "council:custodes"],
-            capture_output=True,
-            text=True,
+        assertion = shared._tmuxctld_post_json(
+            "/assert-instance",
+            {"pane": "council:custodes"},
             timeout=45,
+            default_loopback=True,
         )
-        if assertion.returncode != 0:
+        if not isinstance(assertion, dict) or not assertion.get("ok"):
             logger.error(
-                "morning lifecycle assert-instance rc=%s: stdout=%s stderr=%s",
-                assertion.returncode,
-                assertion.stdout.strip()[:200],
-                assertion.stderr.strip()[:200],
+                "morning lifecycle assert-instance failed: %s",
+                assertion,
             )
             return {
                 "injected": False,
                 "reason": "assert_failed",
-                "returncode": assertion.returncode,
             }
-        sent = subprocess.run(
-            [str(tmuxctl), "send-text", "--pane", "council:custodes", "--stdin"],
-            input=prompt,
-            capture_output=True,
-            text=True,
+        sent = shared._tmuxctld_post_json(
+            "/send-text",
+            {"pane": "council:custodes", "text": prompt, "submit": True},
             timeout=45,
+            default_loopback=True,
         )
-    except subprocess.TimeoutExpired:
-        logger.error("morning lifecycle prompt injection timed out")
-        return {"injected": False, "reason": "timeout"}
     except Exception as exc:
         logger.error("morning lifecycle prompt injection failed: %s", exc)
         return {"injected": False, "reason": "exception", "error": str(exc)}
 
-    if sent.returncode != 0:
+    if not isinstance(sent, dict) or not sent.get("ok"):
         logger.error(
-            "morning lifecycle send-text rc=%s: stdout=%s stderr=%s",
-            sent.returncode,
-            sent.stdout.strip()[:200],
-            sent.stderr.strip()[:200],
+            "morning lifecycle send-text failed: %s",
+            sent,
         )
-        return {"injected": False, "reason": "send_failed", "returncode": sent.returncode}
+        return {"injected": False, "reason": "send_failed"}
 
     return {"injected": True, "pane": "council:custodes"}
 

@@ -18,10 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
-import subprocess
-import sys
 import time
 import uuid
 from datetime import datetime
@@ -30,6 +27,7 @@ from typing import Any
 
 import aiosqlite
 
+import shared
 from pane_surface import RAW_TMUX_PANE_RX
 from shared import DB_PATH, instance_id_for_pane
 
@@ -148,28 +146,19 @@ def _pane_position_matches(pane: dict[str, str], window_ref: str, position: str)
 
 async def _tmux_list_panes() -> list[dict[str, str]]:
     """Return all tmux panes with pane_id + @PANE_ID (the position id)."""
-    try:
-        proc = await asyncio.to_thread(
-            subprocess.run,
-            [
-                "tmux",
-                "list-panes",
-                "-a",
-                "-F",
-                "#D|#{@PANE_ID}|#{session_name}|#{window_index}|#{window_name}",
-            ],
-            env={**os.environ, "IMPERIUM_TMUX_RAW": "1"},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return []
-    if proc.returncode != 0:
+    stdout = await shared.tmuxctld_stdout(
+        (
+            "list-panes",
+            "-a",
+            "-F",
+            "#D|#{@PANE_ID}|#{session_name}|#{window_index}|#{window_name}",
+        ),
+        timeout=5,
+    )
+    if stdout is None:
         return []
     rows: list[dict[str, str]] = []
-    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+    for line in stdout.splitlines():
         parts = line.split("|", 4)
         if len(parts) != 5:
             continue
@@ -320,39 +309,15 @@ async def lookup_instance_for_pane(pane_id: str) -> dict[str, Any] | None:
 
 
 async def _resolve_agent_for_pane(pane_id: str) -> str | None:
-    """Return claude/codex for a live rowless pane via tmuxctl's ps detector."""
-    tmuxctld_lib = Path(__file__).resolve().parents[1] / "tmuxctld" / "lib"
-    cli_lib = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
-    try:
-        proc = await asyncio.to_thread(
-            subprocess.run,
-            [
-                sys.executable,
-                "-m",
-                "tmuxctl.cli",
-                "resolve-agent",
-                "--pane",
-                pane_id,
-                "--agent",
-                "auto",
-                "--default",
-                "auto",
-            ],
-            env={
-                **os.environ,
-                "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            },
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    engine = (proc.stdout or "").strip().lower()
+    """Return claude/codex for a live rowless pane via tmuxctld's ps detector."""
+    result = await asyncio.to_thread(
+        shared._tmuxctld_get_value,
+        "/resolve-agent",
+        {"pane": pane_id, "agent": "auto", "default": "auto"},
+        timeout=3,
+        default_loopback=True,
+    )
+    engine = str(result or "").strip().lower()
     return engine if engine in {"claude", "codex"} else None
 
 
@@ -729,18 +694,11 @@ def _extract_codex_assistant_text_after(path: Path, since_ts: float) -> str:
 
 def _capture_pane_fallback(pane_id: str) -> str:
     """Last-resort: capture visible pane content for slash-copy."""
-    try:
-        proc = subprocess.run(
-            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-200"],
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return ""
-    if proc.returncode != 0:
-        return ""
-    return proc.stdout.decode("utf-8", errors="replace").rstrip()
+    result = shared._tmuxctld_run_tmux(
+        ("capture-pane", "-t", pane_id, "-p", "-S", "-200"),
+        timeout=5,
+    )
+    return str((result or {}).get("stdout") or "").rstrip()
 
 
 async def slash_copy_target(
