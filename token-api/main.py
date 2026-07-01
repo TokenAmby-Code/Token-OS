@@ -13405,6 +13405,11 @@ async def brief_send(request: BriefSendRequest):
         brief_status = "partial"
     elif any(r.get("status") == PANE_WRITE_PENDING for r in delivered):
         brief_status = "pending"
+    elif any(r.get("status") == PANE_WRITE_UNVERIFIED for r in delivered):
+        # Bytes may have been issued, but no target turn was proven.  Surface the
+        # actionable delivery state directly instead of collapsing it to
+        # "failed"; callers must know this is a do-not-blind-retry case.
+        brief_status = "unverified"
     else:
         brief_status = "failed"
     return {
