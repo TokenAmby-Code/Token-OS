@@ -4,17 +4,14 @@ Invariant under test: quiet hours cancel automated pane writes by default;
 the typing guard delays automated writes by default; sanctioned direct-input
 sends pierce but are audited. Reads are never gated.
 
-The typing guard is the keystroke-anchored per-pane lock: the tmux any-key
-binding stamps ``@TYPING_LOCK_UNTIL`` (an absolute expiry epoch) the moment the
-Emperor first types into a pane, and an Enter clears it. The gate reads that one
-option — focus-decoupled, no screen-scraping — so these tests fake
-``show-options -pqv -t <pane> @TYPING_LOCK_UNTIL`` (a future epoch = locked, an
-empty/past value = clear) rather than the retired ``client_activity`` /
-attendance / pending-prompt model.
+The typing guard is the daemon-owned per-pane JSON state. The gate reads
+@TYPING_GUARD_JSON through the same status helper as the daemon endpoint, so
+these tests fake that one canonical option instead of timer compatibility state.
 """
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 
@@ -112,47 +109,34 @@ def _lock_tmux(
     *,
     pending: dict[str, int | None] | None = None,
     agent: dict[str, int | None] | None = None,
+    owners: dict[str, str | None] | None = None,
     panes: list[str] | None = None,
 ):
-    """Fake real tmux so the keystroke-lock reader sees ``locks`` (pane -> epoch).
-
-    Answers exactly the two commands the predicate issues:
-      * ``show-options -pqv -t <pane> @TYPING_LOCK_UNTIL`` → the pane's lock epoch
-        (empty line + exit 0 when unset, matching real ``-pqv``).
-      * ``list-panes -a -F #{pane_id}``                    → the live pane ids.
-    Any other command errors (rc=1), matching the gate's fail-open contract.
-    A pane mapped to ``None`` (or absent) reads as unlocked.
-    """
+    """Fake real tmux so the JSON guard reader sees pane-scoped records."""
     monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
+
+    def _record_for(target: str | None) -> str:
+        until = locks.get(target)
+        kind = "human" if until is not None else "off"
+        owner = None
+        pending_until = (pending or {}).get(target)
+        if pending_until is not None:
+            kind, until = "pending", pending_until
+        agent_until = (agent or {}).get(target)
+        if agent_until is not None:
+            kind, until = "agent", agent_until
+            owner = (owners or {}).get(target)
+        return json.dumps({"kind": kind, "until": until, "owner": owner, "source": "tmuxctld"})
 
     def _fake_run(cmd, *args, **kwargs):
         proc = _FakeCompleted()
-        if "show-options" in cmd and send_gate._TYPING_LOCK_OPTION in cmd:
+        if "show-options" in cmd and typing_guard_state.GUARD_JSON_OPTION in cmd:
             target = None
             for idx, tok in enumerate(cmd):
                 if tok == "-t" and idx + 1 < len(cmd):
                     target = cmd[idx + 1]
                     break
-            value = locks.get(target)
-            proc.stdout = "" if value is None else f"{int(value)}\n"
-            return proc
-        if "show-options" in cmd and send_gate._TYPING_PENDING_OPTION in cmd:
-            target = None
-            for idx, tok in enumerate(cmd):
-                if tok == "-t" and idx + 1 < len(cmd):
-                    target = cmd[idx + 1]
-                    break
-            value = (pending or {}).get(target)
-            proc.stdout = "" if value is None else f"{int(value)}\n"
-            return proc
-        if "show-options" in cmd and send_gate._TYPING_AGENT_OPTION in cmd:
-            target = None
-            for idx, tok in enumerate(cmd):
-                if tok == "-t" and idx + 1 < len(cmd):
-                    target = cmd[idx + 1]
-                    break
-            value = (agent or {}).get(target)
-            proc.stdout = "" if value is None else f"{int(value)}\n"
+            proc.stdout = _record_for(target)
             return proc
         if "list-panes" in cmd:
             ids = panes if panes is not None else list(locks.keys())
@@ -291,9 +275,7 @@ def test_evaluate_defaults_typing_guard_to_delay(monkeypatch):
 
 
 def test_typing_guard_is_scoped_to_target_pane(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The lock is per-pane: a live ``@TYPING_LOCK_UNTIL`` on one pane never
-    leaks onto another. ``%active`` was typed into (lock 200s out); ``%other``
-    carries an expired lock and reads clear."""
+    """The JSON guard is per-pane and never leaks onto another pane."""
     now = 1_700_000_000
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
     _lock_tmux(monkeypatch, {"%active": now + 200, "%other": now - 5})
@@ -320,12 +302,9 @@ def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
 ) -> None:
     """End-to-end per-pane proof (the mandate scenario, real predicate).
 
-    The Emperor typed into ``%active`` ~1 min ago, so its lock is still ~4 min
-    out; ``%other`` is an unrelated worker pane he never typed into (no lock). A
-    dispatch send to ``%other`` MUST sail through while a send to ``%active`` is
-    held — typing in one pane never blocks an unrelated pane. No monkeypatch of
-    the predicate: evaluate() runs the real ``typing_guard_active`` over a faked
-    tmux reading only ``@TYPING_LOCK_UNTIL``.
+    The Emperor typed into ``%active`` ~1 min ago, so its JSON human guard is
+    still live. ``%other`` has no guard. A dispatch send to ``%other`` MUST sail
+    through while a send to ``%active`` is held.
     """
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
@@ -343,15 +322,7 @@ def test_evaluate_does_not_gate_other_pane_while_typing_in_active_pane(
 def test_unattended_pane_without_lock_is_deliverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No screen-scraping: the keystroke lock is the SOLE signal.
-
-    A worker pane the Emperor never typed into carries no lock, so a
-    brief/dispatch send sails through (evaluate → None) even if its screen still
-    shows leftover prompt text. This is the over-block the retired
-    ``_pane_has_pending_input`` detector caused — holding W's brief-delivery to
-    idle worker panes merely because they had prompt text on screen. Stale draft
-    text with no live lock is, by the Emperor's accepted tradeoff, deliverable.
-    """
+    """No screen-scraping: daemon JSON state is the sole signal."""
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
     now = 1_700_000_000
@@ -365,9 +336,7 @@ def test_unattended_pane_without_lock_is_deliverable(
 def test_locked_pane_is_held_until_expiry_regardless_of_focus(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Focus-decoupled persistence: a locked pane stays guarded purely on the
-    absolute expiry, with no focus/attendance/keystroke re-check. The same pane
-    releases the instant its expiry falls into the past."""
+    """A guarded pane stays guarded purely on the absolute JSON expiry."""
     now = 1_700_000_000
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
     locks: dict[str, int | None] = {"%active": now + 1}
@@ -399,10 +368,7 @@ def test_pending_pane_remains_send_blocking_after_enter(
 def test_agent_hold_alone_reports_typing_guard_active_and_delays(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A pane carrying ONLY ``@TYPING_AGENT_UNTIL`` (a daemon send holding it)
-    reads as guard-active and a concurrent send delays — state-blind: the gate
-    never inspects which state is live, only that one is. This is the pile-on
-    prevention: a second send to the held pane queues behind the first."""
+    """A pane carrying only an agent JSON guard delays a concurrent send."""
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
     now = 1_700_000_000
@@ -423,7 +389,7 @@ def test_expired_agent_hold_releases(monkeypatch: pytest.MonkeyPatch) -> None:
     assert send_gate.typing_guard_active(target="%held") is False
 
 
-def test_live_lock_short_circuits_pending_read(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_guard_reader_uses_single_json_option(monkeypatch: pytest.MonkeyPatch) -> None:
     now = 1_700_000_000
     calls: list[list[str]] = []
     monkeypatch.setattr(send_gate.time, "time", lambda: now)
@@ -432,10 +398,12 @@ def test_live_lock_short_circuits_pending_read(monkeypatch: pytest.MonkeyPatch) 
     def _fake_run(cmd, *args, **kwargs):
         calls.append(cmd)
         proc = _FakeCompleted()
-        if "show-options" in cmd and send_gate._TYPING_LOCK_OPTION in cmd:
-            proc.stdout = f"{now + 200}\n"
+        if "show-options" in cmd and typing_guard_state.GUARD_JSON_OPTION in cmd:
+            proc.stdout = json.dumps(
+                {"kind": "human", "until": now + 200, "owner": None, "source": "tmuxctld"}
+            )
             return proc
-        raise AssertionError("pending option should not be read while lock is live")
+        raise AssertionError(f"unexpected tmux call: {cmd}")
 
     monkeypatch.setattr(send_gate.subprocess, "run", _fake_run)
 
@@ -511,8 +479,8 @@ def test_wait_for_gate_clear_sleeps_toward_lock_expiry(
 def test_wait_for_gate_clear_releases_promptly_when_lock_cleared_early(
     monkeypatch: pytest.MonkeyPatch, fake_clock: dict
 ) -> None:
-    """An Enter into the pane clears ``@TYPING_LOCK_UNTIL`` mid-wait. Even though
-    the original lock ran 5 min out, the recheck cap releases the held send
+    """An Enter clears the JSON guard mid-wait. Even though
+    the original guard ran 5 min out, the recheck cap releases the held send
     within ~1 wake of the clear — the gate must not wait out the full window."""
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
@@ -520,10 +488,11 @@ def test_wait_for_gate_clear_releases_promptly_when_lock_cleared_early(
 
     def _fake_run(cmd, *args, **kwargs):
         proc = _FakeCompleted()
-        if "show-options" in cmd and send_gate._TYPING_LOCK_OPTION in cmd:
-            # 5-min lock until an Enter clears it at cleared_at.
-            proc.stdout = (
-                "" if fake_clock["now"] >= cleared_at else f"{int(fake_clock['now'] + 300)}\n"
+        if "show-options" in cmd and typing_guard_state.GUARD_JSON_OPTION in cmd:
+            until = None if fake_clock["now"] >= cleared_at else int(fake_clock["now"] + 300)
+            kind = "off" if until is None else "human"
+            proc.stdout = json.dumps(
+                {"kind": kind, "until": until, "owner": None, "source": "tmuxctld"}
             )
             return proc
         proc.returncode = 1
@@ -574,8 +543,7 @@ def test_backspace_pending_followup_keystroke_rearms_and_flushes_held_send_once(
     fake_tmux = FakeTmux()
     typing_guard_state.arm(fake_tmux, pane, seconds=300, now=int(fake_clock["now"]))
     typing_guard_state.pending(fake_tmux, pane, seconds=15, now=int(fake_clock["now"]))
-    assert typing_guard_state.PENDING_OPTION in state
-    assert typing_guard_state.LOCK_OPTION not in state
+    assert json.loads(state[typing_guard_state.GUARD_JSON_OPTION])["kind"] == "pending"
 
     monkeypatch.setattr(send_gate, "_real_tmux_binary", lambda: "tmux")
 
@@ -583,14 +551,8 @@ def test_backspace_pending_followup_keystroke_rearms_and_flushes_held_send_once(
 
     def _fake_subprocess_run(cmd, *args, **kwargs):
         proc = _FakeCompleted()
-        if "show-options" in cmd:
-            option = cmd[-1]
-            tmux_option = {
-                send_gate._TYPING_LOCK_OPTION: typing_guard_state.LOCK_OPTION,
-                send_gate._TYPING_PENDING_OPTION: typing_guard_state.PENDING_OPTION,
-                send_gate._TYPING_AGENT_OPTION: typing_guard_state.AGENT_OPTION,
-            }.get(option)
-            proc.stdout = state.get(tmux_option or "", "")
+        if "show-options" in cmd and typing_guard_state.GUARD_JSON_OPTION in cmd:
+            proc.stdout = state.get(typing_guard_state.GUARD_JSON_OPTION, "")
             return proc
         if len(cmd) >= 2 and cmd[1:] == ["send-keys", "-t", pane, "-l", "HELD_ONCE"]:
             actual_sends.append(cmd)
@@ -620,8 +582,9 @@ def test_backspace_pending_followup_keystroke_rearms_and_flushes_held_send_once(
     adapter = TmuxAdapter(tmux_binary="tmux")
     adapter.run("send-keys", "-t", pane, "-l", "HELD_ONCE")
 
-    assert state.get(typing_guard_state.PENDING_OPTION) is None
-    assert int(state[typing_guard_state.LOCK_OPTION]) <= int(fake_clock["now"])
+    final_record = json.loads(state[typing_guard_state.GUARD_JSON_OPTION])
+    assert final_record["kind"] == "human"
+    assert int(final_record["until"]) <= int(fake_clock["now"])
     assert sum(sleeps) <= 4, "follow-up keystroke re-arm must avoid waiting out stale pending"
     assert len(actual_sends) == 1
 
@@ -641,13 +604,8 @@ def test_wait_for_gate_clear_honors_delay_timeout(
 
 
 # ── send-gate-attended-scoping-clobber: canonical-id resolution miss ──────────
-# The clobber's root cause: the gate's typing-lock read shells out to
-# `tmux show-options -pqv -t <target> @TYPING_LOCK_UNTIL`. tmux only understands
-# physical %pane ids (and native session:window addresses). An Imperium
-# canonical id (mechanicus:fabricator-general, council:custodes, 1:N…) cannot be
-# resolved at the tmux boundary, so the read errors and the guard MISSES an
-# actively-typed pane — then a send would clobber the human's live draft. The
-# fix is to resolve canonical→physical BEFORE the gate (see the adapter test).
+# The clobber's root cause: the gate's JSON guard read must target a physical
+# %pane id. Canonical ids must be resolved before the tmux boundary.
 
 
 def test_typing_guard_detects_physical_but_misses_canonical_target(monkeypatch) -> None:
@@ -664,16 +622,18 @@ def test_typing_guard_detects_physical_but_misses_canonical_target(monkeypatch) 
 
     def _fake_run(cmd, *args, **kwargs):
         proc = _FakeCompleted()
-        if "show-options" in cmd and send_gate._TYPING_LOCK_OPTION in cmd:
+        if "show-options" in cmd and typing_guard_state.GUARD_JSON_OPTION in cmd:
             target = None
             for idx, tok in enumerate(cmd):
                 if tok == "-t" and idx + 1 < len(cmd):
                     target = cmd[idx + 1]
                     break
             if target == "%44":
-                proc.stdout = f"{now + 200}\n"  # physical pane carries a live lock
+                proc.stdout = json.dumps(
+                    {"kind": "human", "until": now + 200, "owner": None, "source": "tmuxctld"}
+                )
                 return proc
-            proc.returncode = 1  # tmux can't resolve a canonical id → fail-open clear
+            proc.returncode = 1
             return proc
         proc.returncode = 1
         return proc
@@ -761,9 +721,20 @@ def test_tmuxctld_holder_override_cannot_pierce_human_lock(monkeypatch) -> None:
     """
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(
+        send_gate,
+        "_pane_guard_status",
+        lambda target: {
+            "kind": "human",
+            "until": 1300,
+            "owner": None,
+            "active": True,
+            "marker": "",
+        },
+    )
     monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: target == "%44")
 
-    with send_gate.thread_local_override("tmuxctld-send-holder"):
+    with send_gate.thread_local_override("tmuxctld-send-holder", owner="req-1"):
         result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
 
     assert result is not None
@@ -786,9 +757,20 @@ def test_submit_transaction_override_cannot_pierce_human_lock(
     """
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(
+        send_gate,
+        "_pane_guard_status",
+        lambda target: {
+            "kind": "pending",
+            "until": 1300,
+            "owner": None,
+            "active": True,
+            "marker": "",
+        },
+    )
     monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: target == "%44")
 
-    with send_gate.thread_local_override("tmuxctl-submit-transaction"):
+    with send_gate.thread_local_override("tmuxctl-submit-transaction", owner="req-1"):
         result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
 
     assert result is not None
@@ -802,9 +784,20 @@ def test_submit_transaction_override_cannot_pierce_human_lock(
 def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> None:
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(
+        send_gate,
+        "_pane_guard_status",
+        lambda target: {
+            "kind": "agent",
+            "until": 1300,
+            "owner": "req-1",
+            "active": True,
+            "marker": "",
+        },
+    )
     monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: False)
 
-    with send_gate.thread_local_override("tmuxctld-send-holder"):
+    with send_gate.thread_local_override("tmuxctld-send-holder", owner="req-1"):
         result = send_gate.evaluate(("send-keys", "-t", "%44", "-l", "payload"))
 
     assert result is not None
@@ -820,9 +813,20 @@ def test_submit_transaction_override_can_pierce_agent_only_hold(
 ) -> None:
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(
+        send_gate,
+        "_pane_guard_status",
+        lambda target: {
+            "kind": "agent",
+            "until": 1300,
+            "owner": "req-1",
+            "active": True,
+            "marker": "",
+        },
+    )
     monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: False)
 
-    with send_gate.thread_local_override("tmuxctl-submit-transaction"):
+    with send_gate.thread_local_override("tmuxctl-submit-transaction", owner="req-1"):
         result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
 
     assert result is not None
