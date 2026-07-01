@@ -13,7 +13,7 @@
 #   cancel    -> no-op
 #
 # Actions never auto-submit: each drops the command at the FRONT of the prompt
-# and returns the cursor to the END (via tmuxctl invoke-skill -> insert at prompt
+# and returns the cursor to the END (via tmuxctld invoke-skill -> insert at prompt
 # start), so the operator keeps typing and submits when ready. The harness probe
 # preplan needs runs in the background while the picker is open, so a preplan
 # pick reads a ready answer instead of stalling on detection. Replaces the old
@@ -55,10 +55,9 @@ API_URL="${API_URL:-${TOKEN_API_URL:-}}"
 # instead of 3 cold `tmuxctl` Python spawns — the Shift+Tab-menu 50x slowdown. The
 # daemon resolves the engine and applies the leader (/skill vs $skill for SKILLS;
 # /command stays universal). Opt-in: the BTab keybinding sets TMUX_PLAN_MENU_DAEMON=1
-# so the URL derives from the canonical TMUXCTLD_URL; otherwise off, so unit tests
-# exercise the local tmuxctl path and never touch a live daemon. An explicit
-# --daemon-url / $TMUX_PLAN_MENU_DAEMON_URL always wins. On ANY daemon miss the
-# action falls back to the local cursor-op path, preserving fail-closed semantics.
+# so the URL derives from the canonical TMUXCTLD_URL. An explicit --daemon-url /
+# $TMUX_PLAN_MENU_DAEMON_URL always wins. Cold tmuxctl fallback is retired; a
+# daemon miss now fails closed and logs instead of spawning the CLI.
 if [[ -z "$DAEMON_URL" ]]; then
     if [[ -n "${TMUX_PLAN_MENU_DAEMON_URL:-}" ]]; then
         DAEMON_URL="$TMUX_PLAN_MENU_DAEMON_URL"
@@ -92,18 +91,26 @@ if [[ -z "$PANE" ]] && ! $DRY_RUN; then
 fi
 
 # A bare Shift+Tab is the Emperor pressing a key: every action this menu fires —
-# the preplan/plan/compact inserts (via `tmuxctl invoke-skill`) and the literal
+# the preplan/plan/compact inserts (via tmuxctld) and the literal
 # Shift+Tab forward — is direct Emperor input, NOT automation. Mark the sends
 # sanctioned so they PIERCE the universal recent-typing gate instead of delaying
 # behind the very keystroke that opened this menu (a delay the popup outlives, so
 # the insert silently never lands). Same pierce `tmux-dictate` uses, which Discord
-# active-pane injection reuses through it. Still audited by tmuxctl.send_gate as a
+# active-pane injection reuses through it. Still audited by the daemon send gate as a
 # send_gate_override. `${VAR:-default}` so an explicit outer disposition still wins.
 export TMUX_SEND_GATE_ALLOW="${TMUX_SEND_GATE_ALLOW:-tmux-plan-menu-direct-input}"
 export TMUX_SEND_GATE_POLICY="${TMUX_SEND_GATE_POLICY:-pierce}"
 
 json_escape() {
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+daemon_post_json() {
+    local path="$1" body="$2"
+    [[ -n "$DAEMON_URL" ]] || return 1
+    curl -sf --max-time "${TMUX_PLAN_MENU_DAEMON_MAX_TIME:-2}" \
+        -X POST "${DAEMON_URL%/}${path}" \
+        -H 'Content-Type: application/json' -d "$body" >/dev/null
 }
 
 normalize_agent() {
@@ -115,13 +122,24 @@ normalize_agent() {
 }
 
 render_preplan_invocation() {
-    local rendered
-    rendered="$("${_script_dir}/tmuxctl" invoke-skill preplan --agent "$1" --dry-run)" || return $?
-    printf '%s\n' "${rendered% }"
+    case "$(normalize_agent "$1")" in
+        codex) printf '$preplan\n' ;;
+        *) printf '/preplan\n' ;;
+    esac
+}
+
+daemon_resolve_agent() {
+    [[ -n "$DAEMON_URL" && -n "$PANE" ]] || return 1
+    curl -sfG --max-time "${TMUX_PLAN_MENU_DAEMON_MAX_TIME:-2}" \
+        --data-urlencode "pane=$PANE" \
+        --data-urlencode "agent=auto" \
+        --data-urlencode "default=auto" \
+        "${DAEMON_URL%/}/resolve-agent" \
+        | python3 -c 'import json,sys; print((json.load(sys.stdin).get("result") or "auto"))'
 }
 
 # --- background harness detection (preplan only) ---------------------------
-# `tmuxctl resolve-agent` probes the instance registry, then the live pane
+# tmuxctld `/resolve-agent` probes the instance registry, then the live pane
 # process (ps on the pane tty), then the @PLANNING_AGENT hint. Kick it off while
 # fzf is open so a preplan pick reads a ready answer instead of paying the probe
 # latency after selection. --default auto makes it echo "auto" (not a guessed
@@ -155,7 +173,7 @@ _start_agent_detect() {
     # trap '' HUP so the probe survives popup teardown (display-popup -E SIGHUPs the
     # popup pane's process group on close); </dev/null detaches stdin from the dying
     # popup PTY. The detached action reads the result (sync-probe fallback if unset).
-    ( trap '' HUP; "${_script_dir}/tmuxctl" resolve-agent --pane "$PANE" --agent auto --default auto \
+    ( trap '' HUP; daemon_resolve_agent \
         >"$_AGENT_FILE" 2>/dev/null || true ) </dev/null >/dev/null 2>&1 &
 }
 
@@ -171,7 +189,7 @@ _detect_agent() {
             sleep 0.1
         done
     fi
-    a="$(normalize_agent "$("${_script_dir}/tmuxctl" resolve-agent --pane "$PANE" --agent auto --default auto 2>/dev/null)")"
+    a="$(normalize_agent "$(daemon_resolve_agent 2>/dev/null)")"
     echo "$a"
 }
 
@@ -236,36 +254,41 @@ set_planning_state() {
 }
 
 # --- decomposed cursor ops (real-tmux path; pierce env inherited) -----------
-# All three route through `tmuxctl` -> TmuxAdapter -> the real tmux binary with
-# the in-process send gate, NOT the gating `tmux` shim in the keystroke path (the
-# old tmux-plan-prefix freeze: a Python startup + gate eval per PgUp keystroke).
+# All three route through tmuxctld -> TmuxAdapter -> the real tmux binary with
+# the in-process send gate, NOT the gating `tmux` shim in the keystroke path.
 # They run backgrounded / detached so even their modest latency never blocks the
 # popup. plan/compact insert the universal "/" leader (not codex "$").
-prebuffer_prompt_start() { "${_script_dir}/tmuxctl" prompt-start --pane "$PANE" --page-ups "$PAGE_UPS"; }
-insert_text()           { "${_script_dir}/tmuxctl" insert-text  --pane "$PANE" --text "$1"; }
-move_prompt_end()       { "${_script_dir}/tmuxctl" prompt-end   --pane "$PANE" --page-downs "$PAGE_DOWNS"; }
-insert_preplan_skill()  { "${_script_dir}/tmuxctl" invoke-skill preplan --pane "$PANE" --agent "$1"; }
+prebuffer_prompt_start() {
+    daemon_post_json /prompt-start "{\"pane\":$(json_escape "$PANE"),\"page_ups\":$(json_escape "$PAGE_UPS")}"
+}
+insert_text() {
+    daemon_post_json /insert-text "{\"pane\":$(json_escape "$PANE"),\"text\":$(json_escape "$1")}"
+}
+move_prompt_end() {
+    daemon_post_json /prompt-end "{\"pane\":$(json_escape "$PANE"),\"page_downs\":$(json_escape "$PAGE_DOWNS")}"
+}
+insert_preplan_skill() {
+    daemon_post_json /invoke-skill "{\"pane\":$(json_escape "$PANE"),\"name\":\"preplan\",\"agent\":$(json_escape "$1")}"
+}
 
 # Warm-daemon insert: prompt-start -> leader insert -> Codex sink -> prompt-end in
 # one POST. Returns 0 only when the daemon actually performed the insert (HTTP 2xx);
 # any non-2xx (`curl -f` -> 22) or transport failure (daemon down) returns non-zero
-# so run_action falls through to the local tmuxctl path. The daemon restores its own
+# so run_action falls through to a daemonized decomposed cursor-op path. The daemon restores its own
 # cursor, so a daemon-handled insert owes no extra prompt-end. `name` is the BARE
 # skill/command (no leader) and `kind` is skill|command; the daemon owns the leader.
 daemon_insert() {
     local name="$1" kind="$2" agent="$3" body
     [[ -n "$DAEMON_URL" && -n "$PANE" ]] || return 1
     body="{\"pane\":$(json_escape "$PANE"),\"name\":$(json_escape "$name"),\"kind\":$(json_escape "$kind"),\"agent\":$(json_escape "$agent")}"
-    curl -sf --max-time "${TMUX_PLAN_MENU_DAEMON_MAX_TIME:-2}" \
-        -X POST "${DAEMON_URL%/}/insert-invocation" \
-        -H 'Content-Type: application/json' -d "$body" >/dev/null
+    daemon_post_json /insert-invocation "$body"
 }
 
 # Optional pre-buffer: disabled by default.  The old default moved the prompt
 # cursor while the picker was still open, which made Shift+Tab feel like a slow
 # visible macro and increased the chance of stray typing into the wrong part of
 # a draft.  The selected action now performs prompt-start only after selection,
-# using tmux's tight repeat-count macro in tmuxctl. Set
+# using tmux's tight repeat-count macro inside tmuxctld. Set
 # TMUX_PLAN_MENU_PREBUFFER=1 only for profiling the old overlap behavior.
 _start_prebuffer() {
     $DRY_RUN && return 0
@@ -274,7 +297,7 @@ _start_prebuffer() {
     _PRESTART_DONE=$(mktemp -t tmux-plan-menu-prestart.XXXXXX 2>/dev/null) || { _PRESTART_DONE=""; return 0; }
     # Write the done-marker ONLY when prompt-start actually reached the prompt
     # start. A failed move must NOT signal "done" — otherwise an insert could
-    # land at the current cursor instead of prompt start. Capture tmuxctl's stderr
+    # land at the current cursor instead of prompt start. Capture tmuxctld stderr
     # and log a failed move (previously swallowed by `2>&1`, masking half of the
     # cursor-op failures) so a missed prompt-start is diagnosable from the log.
     ( trap '' HUP
@@ -316,7 +339,7 @@ _await_prestart() {
 _ensure_at_prompt_start() {
     _PROMPT_MOVED=1
     (( _PRESTART_OK == 0 )) && return 0
-    # Capture tmuxctl's stderr and log a failed synchronous prompt-start instead of
+    # Capture tmuxctld stderr and log a failed synchronous prompt-start instead of
     # swallowing it — so a cursor op that still fails after batching leaves the real
     # tmux error in the log, not just a silent missed move.
     local _ps_err _ps_rc
@@ -389,7 +412,7 @@ run_action() {
                     else
                         # Compatibility fallback only: keep the daemon as the
                         # canonical kind-aware API and reuse the existing
-                        # tmuxctl invoke-skill path rather than adding another
+                        # tmuxctld invoke-skill path rather than adding another
                         # CLI brick. No shell-side skill leader construction
                         # and no manual Codex Tab.
                         text="$(insert_preplan_skill "$agent" 2>&1)"; rc=$?

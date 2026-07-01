@@ -6,6 +6,12 @@
 # Respawns any dead pane.
 # Generic panes get a 1s delay to prevent tight crash loops.
 
+
+# 410-on-touch shim: this cold CLI/keybind path is retired.  The dead body
+# below is intentionally retained for the separately-gated atomic wipe.
+echo "tmux-pane-respawn: HTTP 410 Gone — pane-died live path is tmuxctld-ping POST /event." >&2
+exit 154  # 410 modulo POSIX shell's 8-bit exit status
+
 set -euo pipefail
 
 PANE_ID="${1:?Usage: tmux-pane-respawn <pane_id>}"
