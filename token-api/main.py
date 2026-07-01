@@ -19738,6 +19738,23 @@ def _ops_instance_staleness(status: str | None, age_seconds: int | None) -> dict
     }
 
 
+def _ops_datetime_as_utc(value: datetime) -> datetime:
+    """Normalize naive/aware datetimes for safe scheduler due comparisons."""
+    try:
+        return value.astimezone(UTC)
+    except Exception:
+        if value.tzinfo is not None:
+            return value.astimezone(UTC)
+        return value.replace(tzinfo=datetime.now().astimezone().tzinfo).astimezone(UTC)
+
+
+def _ops_datetime_due(target: datetime, now: datetime) -> bool:
+    try:
+        return _ops_datetime_as_utc(target) <= _ops_datetime_as_utc(now)
+    except Exception:
+        return target.replace(tzinfo=None) <= now.replace(tzinfo=None)
+
+
 def _ops_instance_attention(
     inst: dict,
     *,
@@ -19779,22 +19796,19 @@ def _ops_instance_attention(
         return {"attention_rank": 3, "attention_reasons": reasons}
 
     if gt_next_fire is not None:
-        try:
-            due = gt_next_fire.replace(tzinfo=None) <= now.replace(tzinfo=None)
-        except Exception:
-            due = False
+        due = _ops_datetime_due(gt_next_fire, now)
         reasons.append("golden_throne_due" if due else "golden_throne_armed")
-        return {"attention_rank": 4, "attention_reasons": reasons}
+        return {"attention_rank": 4 if due else 5, "attention_reasons": reasons}
     if inst.get("golden_throne"):
         reasons.append("golden_throne_bound")
-        return {"attention_rank": 4, "attention_reasons": reasons}
+        return {"attention_rank": 5, "attention_reasons": reasons}
 
     if processing_like:
         reasons.append("processing_or_working")
-        return {"attention_rank": 5, "attention_reasons": reasons}
+        return {"attention_rank": 6, "attention_reasons": reasons}
 
     reasons.append("normal_idle")
-    return {"attention_rank": 6, "attention_reasons": reasons}
+    return {"attention_rank": 7, "attention_reasons": reasons}
 
 
 def _ops_display_name(inst: dict) -> str:
@@ -20696,6 +20710,47 @@ def _ops_build_source_freshness(
     agents_seen = max([generated_at.isoformat(), *instance_times, *event_times])
 
     work_generated_at = getattr(work_state, "generated_at", None) or generated_at
+    timer_errors = source_errors.get("timer_engine", [])
+    if timer_errors:
+        timer_error_evidence = [f"error={err}" for err in timer_errors[:2]]
+        work_state_freshness = _ops_freshness_record(
+            "unknown",
+            age_seconds=None,
+            last_seen=None,
+            stale_after_seconds=120,
+            message="work-state snapshot unavailable from timer/work-state read failure",
+            evidence=timer_error_evidence,
+        )
+        timer_engine_freshness = _ops_freshness_record(
+            "unknown",
+            age_seconds=None,
+            last_seen=None,
+            stale_after_seconds=120,
+            message="timer-engine snapshot unavailable from timer/work-state read failure",
+            evidence=timer_error_evidence,
+        )
+    else:
+        work_state_freshness = _ops_timestamp_freshness(
+            "work-state snapshot",
+            work_generated_at,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"productivity_active={work_state.productivity_active}",
+                f"reason={work_state.reason}",
+            ],
+            missing_status="unknown",
+        )
+        timer_engine_freshness = _ops_timestamp_freshness(
+            "timer-engine snapshot",
+            generated_at,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"mode={timer_engine.current_mode.value}",
+                f"activity={timer_engine.activity.value}",
+            ],
+        )
     freshness = {
         "desktop_attention": _ops_timestamp_freshness(
             "desktop attention",
@@ -20728,27 +20783,8 @@ def _ops_build_source_freshness(
                 f"alert_state={PHONE_HEARTBEAT.get('alert_state') or 'none'}",
             ],
         ),
-        "work_state": _ops_timestamp_freshness(
-            "work-state snapshot",
-            work_generated_at,
-            now=generated_at,
-            stale_after_seconds=120,
-            evidence=[
-                f"productivity_active={work_state.productivity_active}",
-                f"reason={work_state.reason}",
-            ],
-            missing_status="unknown",
-        ),
-        "timer_engine": _ops_timestamp_freshness(
-            "timer-engine snapshot",
-            generated_at,
-            now=generated_at,
-            stale_after_seconds=120,
-            evidence=[
-                f"mode={timer_engine.current_mode.value}",
-                f"activity={timer_engine.activity.value}",
-            ],
-        ),
+        "work_state": work_state_freshness,
+        "timer_engine": timer_engine_freshness,
         "agents_db": _ops_timestamp_freshness(
             "agents database read model",
             None if "agents_db" in source_errors else agents_seen,
