@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import pathlib
 import socket
+import sqlite3
 import sys
 import threading
 import urllib.error
@@ -19,6 +20,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import daemon
+from tmuxctl import service as tmux_service
 
 # Captured before any monkeypatching so the dedicated re-assertion tests can
 # restore the genuine method the autouse guard stubs out.
@@ -1556,3 +1558,224 @@ def test_startup_lifecycle_hook_install_is_best_effort(monkeypatch: pytest.Monke
     assert out["ok"] is False
     assert len(out["results"]) == 2
     assert all(result["returncode"] is None for result in out["results"])
+
+
+# ---------------------------------------------------------------------------
+# Keybind daemon endpoints
+# ---------------------------------------------------------------------------
+
+
+class KeybindAdapter(StubAdapter):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.zoomed = "0"
+        self.capture = ""
+        self.instance_id = "inst-keybind"
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        self.calls.append(tuple(args))
+        if args and args[0] == "resize-pane":
+            self.zoomed = "1" if self.zoomed == "0" else "0"
+            return ""
+        if args == ("display-message", "-p", "#{pane_id}"):
+            return "%42"
+        if args[:3] == ("display-message", "-t", "%42") and "#{@PANE_ID}" in args[-1]:
+            return f"%42\tpalace:N\tmain:1\t{self.zoomed}"
+        if args == ("display-message", "-t", "%42", "-p", "#{pane_id}"):
+            return "%42"
+        if args == ("display-message", "-t", "%42", "-p", "#{session_name}:#{window_index}"):
+            return "main:1"
+        if args == ("display-message", "-t", "main:1", "-p", "#{window_zoomed_flag}"):
+            return self.zoomed
+        if args == ("capture-pane", "-t", "%42", "-p", "-S", "-5"):
+            return self.capture
+        if args == ("display-message", "-p", "-t", "%42", "#{session_name}:#{window_id}"):
+            return "main:@1"
+        return ""
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@INSTANCE_ID":
+            return self.instance_id
+        if option == "@PANE_ID":
+            return "palace:N"
+        return ""
+
+
+def test_grid_expand_endpoint_uses_native_zoom_and_clears_legacy_flags() -> None:
+    rec = KeybindAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/grid-expand", {"pane": "%42", "action": "expand"})
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "ok"
+        assert payload["result"]["action"] == "expand"
+        assert payload["result"]["zoomed_after"] is True
+        assert ("resize-pane", "-Z", "-t", "%42") in rec.calls
+        assert ("set-option", "-w", "-t", "main:1", "@GRID_EXPANDED", "none") in rec.calls
+        assert ("set-option", "-w", "-t", "main:1", "@GRID_STASH", "") in rec.calls
+    finally:
+        server.shutdown()
+
+
+def test_mode_toggle_endpoint_detects_plan_and_sends_one_shift_tab() -> None:
+    rec = KeybindAdapter()
+    rec.capture = "status: plan mode on"
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/mode-toggle", {"pane": "%42", "delay": 0})
+        assert payload["ok"] is True
+        assert payload["result"]["from"] == "plan"
+        assert payload["result"]["to"] == "bypass"
+        assert payload["result"]["presses"] == 1
+        assert ("send-keys", "-t", "%42", "BTab") in rec.calls
+    finally:
+        server.shutdown()
+
+
+def test_open_session_doc_endpoint_posts_token_api_open_by_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, dict | None]] = []
+    monkeypatch.setattr(
+        tmux_service,
+        "_token_api_json",
+        lambda method, path, body=None, **_kw: (
+            calls.append((method, path, body)) or {"title": "Session One"}
+        ),
+    )
+    server, _ = _serve(KeybindAdapter)
+    try:
+        _, payload = _post(server, "/open-session-doc", {"arg": "123"})
+        assert payload["ok"] is True
+        assert payload["result"]["doc_id"] == 123
+        assert payload["result"]["title"] == "Session One"
+        assert calls == [("POST", "/api/session-docs/123/open", None)]
+    finally:
+        server.shutdown()
+
+
+def test_open_session_doc_endpoint_normalizes_pane_before_doc_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tmux_service.TmuxControlPlane,
+        "public_pane_id",
+        lambda _self, target: "palace:N" if target == "physical-pane" else "unresolved",
+    )
+    monkeypatch.setattr(
+        tmux_service,
+        "fetch_session_doc_for_pane_label",
+        lambda pane_label: {"id": 456, "title": "Normalized", "pane_label": pane_label},
+    )
+    calls: list[tuple[str, str, dict | None]] = []
+    monkeypatch.setattr(
+        tmux_service,
+        "_token_api_json",
+        lambda method, path, body=None, **_kw: (
+            calls.append((method, path, body)) or {"title": "Normalized"}
+        ),
+    )
+    server, _ = _serve(KeybindAdapter)
+    try:
+        _, payload = _post(server, "/open-session-doc", {"pane": "physical-pane"})
+        assert payload["ok"] is True
+        assert payload["result"]["doc_id"] == 456
+        assert payload["result"]["pane_label"] == "palace:N"
+        assert calls == [("POST", "/api/session-docs/456/open", None)]
+    finally:
+        server.shutdown()
+
+
+def test_pane_rename_empty_name_sends_interview_nudge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, dict | None]] = []
+    monkeypatch.setattr(
+        tmux_service,
+        "_token_api_json",
+        lambda method, path, body=None, **_kw: (
+            calls.append((method, path, body)) or {"success": True}
+        ),
+    )
+    rec = KeybindAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/pane-rename", {"pane": "%42", "name": ""})
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "nudged"
+        assert calls == [
+            ("POST", "/api/orchestrator/naming_nudge", {"instance_id": "inst-keybind"})
+        ]
+    finally:
+        server.shutdown()
+
+
+def test_pane_rename_explicit_name_is_loud_501() -> None:
+    server, _ = _serve(KeybindAdapter)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(server, "/pane-rename", {"pane": "%42", "name": "new-name"})
+        assert excinfo.value.code == 501
+        payload = json.loads(excinfo.value.read().decode("utf-8"))
+        assert payload["error"]["code"] == "not_implemented"
+        assert payload["error"]["detail"]["path"] == "/pane-rename"
+    finally:
+        server.shutdown()
+
+
+def test_goto_spoken_endpoint_focuses_latest_tts_pane(tmp_path: pathlib.Path) -> None:
+    db = tmp_path / "agents.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE events (
+              id INTEGER PRIMARY KEY,
+              instance_id TEXT,
+              event_type TEXT,
+              created_at TEXT
+            );
+            CREATE TABLE instances (id TEXT PRIMARY KEY, tmux_pane TEXT, name TEXT);
+            INSERT INTO instances (id, tmux_pane, name) VALUES ('inst-tts', '%42', 'Speaker');
+            INSERT INTO instances (id, tmux_pane, name) VALUES ('inst-old', '%43', 'Old');
+            INSERT INTO events (id, instance_id, event_type, created_at)
+              VALUES (1, 'inst-tts', 'tts_playing', datetime('now'));
+            INSERT INTO events (id, instance_id, event_type, created_at)
+              VALUES (2, 'inst-old', 'tts_playing', datetime('now', '-1 hour'));
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rec = KeybindAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/goto-spoken", {"db_path": str(db), "max_age_seconds": 600})
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "focused"
+        assert payload["result"]["instance_id"] == "inst-tts"
+        assert ("select-window", "-t", "main:@1") in rec.calls
+        assert ("select-pane", "-t", "%42") in rec.calls
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "route",
+    ["/shuttle", "/mark-for-close", "/reset", "/ethereal-prompt", "/tts/listen", "/legion-prompt"],
+)
+def test_deferred_keybind_routes_are_loud_501(route: str) -> None:
+    server, _ = _serve(StubAdapter)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(server, route, {})
+        assert excinfo.value.code == 501
+        payload = json.loads(excinfo.value.read().decode("utf-8"))
+        assert payload["error"]["code"] == "not_implemented"
+        assert payload["error"]["detail"]["path"] == route
+    finally:
+        server.shutdown()

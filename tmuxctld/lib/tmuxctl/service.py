@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
+import sqlite3
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
 from .api import (
     RegistryError,
     build_client_attachments,
@@ -54,6 +63,36 @@ from .skill_invoke import (
 from .snapshot import build_window_snapshot, build_workspace_snapshot
 from .tmux_adapter import TmuxAdapter
 from .tombstone import install_tombstone, jump_tombstone
+
+
+def _token_api_url() -> str:
+    return os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+
+
+def _token_api_json(
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    *,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    data = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        _token_api_url() + path,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8")
+            payload = json.loads(text) if text.strip() else {}
+            return payload if isinstance(payload, dict) else {"response": payload}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise ValueError(f"Token-API {method} {path} failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Token-API unavailable at {_token_api_url()}: {exc}") from exc
 
 
 class TmuxControlPlane:
@@ -885,6 +924,213 @@ class TmuxControlPlane:
         from .pane_select import select_pane
 
         return select_pane(self.adapter, mode=mode, direction=direction, client=client)
+
+    # ------------------------------------------------------------------
+    # Human keybind daemon endpoints. These are deliberately thin wrappers over
+    # the tmux primitives the existing keybind scripts already used; interactive
+    # UI choices stay outside the daemon unless a safe, named payload exists.
+    # ------------------------------------------------------------------
+
+    def _keybind_target_pane(self, pane: str = "current", *, client: str = "") -> str:
+        if pane and pane != "current":
+            return pane
+        if client:
+            return self.adapter.run("display-message", "-c", client, "-p", "#{pane_id}").strip()
+        return self.adapter.run("display-message", "-p", "#{pane_id}").strip()
+
+    @staticmethod
+    def detect_mode_from_capture(capture: str) -> str:
+        if "bypass permissions on" in capture:
+            return "bypass"
+        if "plan mode on" in capture:
+            return "plan"
+        if "accept edits on" in capture:
+            return "accept"
+        return "none"
+
+    def mode_toggle(
+        self,
+        *,
+        pane: str = "current",
+        status_only: bool = False,
+        delay_seconds: float = 0.15,
+    ) -> dict:
+        """Toggle Claude/Codex Shift+Tab mode using the existing screen oracle."""
+        target_pane = self._keybind_target_pane(pane)
+        capture = self.adapter.run(
+            "capture-pane", "-t", target_pane, "-p", "-S", "-5", allow_failure=True
+        )
+        before = self.detect_mode_from_capture(capture)
+        if status_only:
+            return {"pane": target_pane, "mode": before, "presses": 0}
+        presses_by_mode = {"plan": 1, "bypass": 3, "accept": 2, "none": 2}
+        expected_by_mode = {
+            "plan": "bypass",
+            "bypass": "plan",
+            "accept": "bypass",
+            "none": "plan",
+        }
+        presses = presses_by_mode[before]
+        for index in range(presses):
+            self.adapter.send_keys(target_pane, "BTab")
+            if delay_seconds > 0 and index + 1 < presses:
+                time.sleep(delay_seconds)
+        return {
+            "pane": target_pane,
+            "from": before,
+            "to": expected_by_mode[before],
+            "presses": presses,
+        }
+
+    def open_session_doc(self, arg: str = "current") -> dict:
+        """Resolve and open a session doc through Token-API's open-by-id endpoint."""
+        value = (arg or "current").strip()
+        if value.isdigit():
+            doc_id = value
+            doc = {"id": int(value)}
+        else:
+            if value == "current":
+                doc = self.session_doc_for_pane("current")
+            else:
+                # Keybind callers commonly know only the physical pane target
+                # tmux expanded at dispatch time. Normalize to the stable public
+                # role before asking Token-API for the session document.
+                pane_label = self.public_pane_id(value)
+                doc = fetch_session_doc_for_pane_label(pane_label)
+            doc_id = str(doc.get("id") or "")
+        if not doc_id.isdigit():
+            raise ValueError("no session doc id resolved")
+        response = _token_api_json("POST", f"/api/session-docs/{doc_id}/open", None)
+        return {
+            "opened": True,
+            "doc_id": int(doc_id),
+            "title": response.get("title") or doc.get("title") or "",
+            "pane_label": doc.get("pane_label") or "",
+            "result": response,
+        }
+
+    def goto_spoken(
+        self,
+        *,
+        db_path: str | None = None,
+        max_age_seconds: int = 600,
+    ) -> dict:
+        """Focus the pane whose instance most recently emitted a TTS event."""
+        path = Path(db_path or os.environ.get("TOKEN_API_DB") or Path.home() / ".claude/agents.db")
+        if not path.exists():
+            self.adapter.run(
+                "display-message",
+                f"goto-spoken: agents.db missing at {path}",
+                allow_failure=True,
+            )
+            return {"status": "missing_db", "db_path": str(path)}
+
+        events = ("tts_playing", "tts_starting", "tts_queued")
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            placeholders = ",".join("?" * len(events))
+            row = conn.execute(
+                f"""
+                SELECT e.instance_id, e.event_type,
+                       CAST(
+                         (julianday('now') - julianday(e.created_at)) * 86400 AS INTEGER
+                       ) AS age_seconds,
+                       ci.tmux_pane, ci.name AS tab_name
+                FROM events e
+                LEFT JOIN instances ci ON ci.id = e.instance_id
+                WHERE e.event_type IN ({placeholders})
+                  AND e.instance_id IS NOT NULL
+                ORDER BY datetime(e.created_at) DESC, e.id DESC
+                LIMIT 1
+                """,
+                events,
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            self.adapter.run(
+                "display-message",
+                "goto-spoken: no TTS events recorded",
+                allow_failure=True,
+            )
+            return {"status": "none"}
+        age = int(row["age_seconds"] or 0)
+        if age > max_age_seconds:
+            self.adapter.run(
+                "display-message",
+                f"goto-spoken: no recent speaker (last was {age // 60}m ago)",
+                allow_failure=True,
+            )
+            return {"status": "stale", "age_seconds": age}
+        pane = str(row["tmux_pane"] or "")
+        if not pane:
+            instance_id = str(row["instance_id"] or "")
+            self.adapter.run(
+                "display-message",
+                f"goto-spoken: speaker has no tmux_pane (instance {instance_id[:8]})",
+                allow_failure=True,
+            )
+            return {"status": "missing_pane", "instance_id": instance_id}
+
+        try:
+            pane = resolve_to_physical(self.adapter, pane)
+        except Exception:
+            # Raw stale DB entries are common; use the stored target as the probe
+            # and let tmux fail closed below.
+            pass
+        probe = self.adapter.run(
+            "display-message", "-p", "-t", pane, "#{session_name}:#{window_id}", allow_failure=True
+        ).strip()
+        if not probe:
+            self.adapter.run(
+                "display-message",
+                "goto-spoken: pane not found (stale registry?)",
+                allow_failure=True,
+            )
+            return {"status": "stale_pane", "instance_id": str(row["instance_id"] or "")}
+
+        from .focus_guard import allow_temporarily
+
+        allow_temporarily(self.adapter, reason="goto-spoken", actor="tmuxctld")
+        self.adapter.run("select-window", "-t", probe)
+        self.adapter.run("select-pane", "-t", pane)
+        role = self._public_or_unresolved(pane)
+        label = str(row["tab_name"] or row["instance_id"] or "")[:80]
+        self.adapter.run("display-message", f"→ {label} ({age}s ago)", allow_failure=True)
+        return {
+            "status": "focused",
+            "instance_id": str(row["instance_id"] or ""),
+            "pane_role": role,
+            "window": probe,
+            "age_seconds": age,
+            "event_type": str(row["event_type"] or ""),
+        }
+
+    def pane_rename(self, pane: str, name: str = "") -> dict:
+        """Interview-nudge the instance in a pane; explicit rename stays CLI-owned."""
+        target_pane = self._keybind_target_pane(pane)
+        instance_id = self.adapter.show_pane_option(target_pane, "@INSTANCE_ID").strip()
+        if not instance_id:
+            raise ValueError(f"pane has no @INSTANCE_ID: {target_pane}")
+        if name.strip():
+            # The existing explicit rename path shells through instance-name and
+            # then sends /rename into the agent. That is not a thin tmuxctl
+            # primitive, so the daemon exposes only the safe empty-name interview
+            # nudge for now.
+            raise NotImplementedError("explicit pane rename is not daemonized")
+        response = _token_api_json(
+            "POST", "/api/orchestrator/naming_nudge", {"instance_id": instance_id}, timeout=2
+        )
+        if response.get("success") is False:
+            raise ValueError(f"naming nudge failed: {json.dumps(response, sort_keys=True)}")
+        self.adapter.run(
+            "display-message",
+            f"interview: asked {instance_id} to name itself",
+            allow_failure=True,
+        )
+        return {"status": "nudged", "instance_id": instance_id, "result": response}
 
     # ------------------------------------------------------------------
     # Instance-id-aware ops. Each resolves ``instance_id -> live pane`` via
