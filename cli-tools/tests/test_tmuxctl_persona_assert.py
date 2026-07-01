@@ -184,6 +184,15 @@ def test_seat_class_keys_persona_by_label_not_type() -> None:
     assert seat_class("council:true-terminal", "council") == ""
 
 
+def test_persona_seat_shim_points_to_tracked_cli_tools_script() -> None:
+    from tmuxctl.assertions import PERSONA_SEAT_SHIM
+
+    shim = pathlib.Path(PERSONA_SEAT_SHIM)
+    assert shim.name == "persona-seat.sh"
+    assert shim.parts[-3:] == ("cli-tools", "scripts", "persona-seat.sh")
+    assert shim.exists()
+
+
 def test_launch_persona_seat_respawns_then_stamps_born() -> None:
     spec = persona_spec("council:custodes")
     adapter = FakeAdapter()

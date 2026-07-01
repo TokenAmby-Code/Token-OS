@@ -30,7 +30,9 @@ CLAUDE_CMD_BIN = "claude-cmd"
 # (which ``exit 73``s on the protected singleton-seat labels): it sets minimal
 # env, folds in the rank+persona staple, and ``exec``s the engine so the agent
 # becomes the pane process (agent-exit == pane-died, no lingering wrapper).
-PERSONA_SEAT_SHIM = str(Path(__file__).resolve().parents[2] / "scripts" / "persona-seat.sh")
+PERSONA_SEAT_SHIM = str(
+    Path(__file__).resolve().parents[3] / "cli-tools" / "scripts" / "persona-seat.sh"
+)
 PERSONA_LABELS = {
     "council:custodes",
     "council:malcador",
