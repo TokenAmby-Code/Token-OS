@@ -23,6 +23,12 @@ GUARD_JSON_OPTION = "@TYPING_GUARD_JSON"
 GUARD_UNTIL_OPTION = "@TYPING_GUARD_UNTIL"
 GUARD_KIND_OPTION = "@TYPING_GUARD_KIND"
 GUARD_MARKER_OPTION = "@TYPING_GUARD_MARKER"
+LEGACY_GUARD_OPTIONS = (
+    "@GUARD",
+    "@TYPING_LOCK_UNTIL",
+    "@TYPING_PENDING_UNTIL",
+    "@TYPING_AGENT_UNTIL",
+)
 
 
 HUMAN = "human"
@@ -106,12 +112,36 @@ def _run_ok(tmux: Tmux, *args: str, timeout: float = 0.5) -> bool:
     return proc is not None and proc.returncode == 0
 
 
+def _any_binding_status(tmux: Tmux) -> dict[str, Any]:
+    proc = tmux.run("list-keys", "-T", "root", "Any", timeout=0.3)
+    raw = "" if proc is None else (proc.stdout or "").strip()
+    present = proc is not None and proc.returncode == 0 and bool(raw)
+    canonical = present and all(
+        needle in raw
+        for needle in (
+            "#{==:#{mouse_x},}",
+            "tmuxctld-ping POST /typing-guard-state cmd=arm",
+            "send-keys",
+        )
+    )
+    return {"present": present, "canonical": canonical, "raw": raw[:500]}
+
+
 def enable_any_binding(tmux: Tmux) -> dict[str, Any]:
     """Enable the root-table ordinary-key hook.
 
     tmux key bindings are global, not per-pane, so this deliberately changes only
     hook topology.  It does not inspect, write, extend, or clear guard state.
     """
+
+    current = _any_binding_status(tmux)
+    if current["canonical"]:
+        return {
+            "topology": "enabled",
+            "any_bound": True,
+            "changed": False,
+            "canonical": True,
+        }
 
     path = ""
     try:
@@ -125,14 +155,24 @@ def enable_any_binding(tmux: Tmux) -> dict[str, Any]:
                 os.unlink(path)
             except OSError:
                 pass
-    return {"topology": "enabled", "any_bound": bool(ok)}
+    return {
+        "topology": "enabled",
+        "any_bound": bool(ok),
+        "changed": bool(ok),
+        "canonical": bool(ok),
+        "previously_bound": bool(current["present"]),
+    }
 
 
 def disable_any_binding(tmux: Tmux) -> dict[str, Any]:
     """Disable the root-table ordinary-key hook without touching guard state."""
 
+    current = _any_binding_status(tmux)
+    if not current["present"]:
+        return {"topology": "disabled", "any_bound": False, "changed": False, "ok": True}
+
     ok = _run_ok(tmux, "unbind-key", "-q", "-n", "Any")
-    return {"topology": "disabled", "any_bound": False, "ok": bool(ok)}
+    return {"topology": "disabled", "any_bound": not bool(ok), "changed": bool(ok), "ok": bool(ok)}
 
 
 def focused_pane(tmux: Tmux) -> str:
@@ -195,6 +235,13 @@ def set_option(tmux: Tmux, pane: str, option: str, value: str) -> None:
 
 def unset_option(tmux: Tmux, pane: str, option: str) -> None:
     tmux.run("set-option", "-pu", "-t", pane, option)
+
+
+def clear_legacy_options(tmux: Tmux, pane: str) -> None:
+    if not pane:
+        return
+    for option in LEGACY_GUARD_OPTIONS:
+        unset_option(tmux, pane, option)
 
 
 def _normalize_record(raw: Any) -> dict[str, Any]:
@@ -274,6 +321,7 @@ def write_record(
     set_option(tmux, pane, GUARD_UNTIL_OPTION, str(normalized["until"] or 0))
     set_option(tmux, pane, GUARD_KIND_OPTION, str(normalized["kind"]))
     set_option(tmux, pane, GUARD_MARKER_OPTION, marker)
+    clear_legacy_options(tmux, pane)
     return status(tmux, pane, now=now)
 
 
@@ -359,6 +407,7 @@ def expire_pane(tmux: Tmux, pane: str, *, now: int | None = None) -> dict[str, A
         set_option(tmux, pane, GUARD_UNTIL_OPTION, str(current["until"] or 0))
         set_option(tmux, pane, GUARD_KIND_OPTION, str(current["kind"]))
         set_option(tmux, pane, GUARD_MARKER_OPTION, str(current["marker"] or ""))
+        clear_legacy_options(tmux, pane)
         return current
     write_record(tmux, pane, kind=OFF, until=None, owner=None, now=now)
     return status(tmux, pane, now=now)

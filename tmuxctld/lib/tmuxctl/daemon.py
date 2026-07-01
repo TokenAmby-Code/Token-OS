@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import logging
@@ -102,6 +103,25 @@ _PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
 _VOICE_LIST_SEP = "__TMUXCTLD_VOICE_FIELD__"
 _VOICE_LOCK_OPTION = "@DISCORD_VOICE_LOCK"
 _VOICE_PROCESSING_OPTION = "@DISCORD_VOICE_PROCESSING"
+
+_CLIENT_DISCONNECT_ERRNOS = frozenset(
+    errno_value
+    for errno_value in (
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ESHUTDOWN", None),
+    )
+    if errno_value is not None
+)
+
+
+def _is_client_disconnect(exc: BaseException) -> bool:
+    """Return True for normal HTTP client disconnects during request/response IO."""
+
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    return isinstance(exc, OSError) and getattr(exc, "errno", None) in _CLIENT_DISCONNECT_ERRNOS
 
 
 def ensure_tmux_lifecycle_hooks() -> dict:
@@ -2512,10 +2532,28 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):  # noqa: N802
-        self._dispatch("GET")
+        self._safe_dispatch("GET")
 
     def do_POST(self):  # noqa: N802
-        self._dispatch("POST")
+        self._safe_dispatch("POST")
+
+    def finish(self) -> None:
+        """Suppress normal client-disconnect noise from stdlib connection cleanup."""
+
+        try:
+            super().finish()
+        except OSError as exc:
+            if _is_client_disconnect(exc):
+                return
+            raise
+
+    def _safe_dispatch(self, method: str) -> None:
+        try:
+            self._dispatch(method)
+        except OSError as exc:
+            if _is_client_disconnect(exc):
+                return
+            raise
 
     def _dispatch(self, method: str) -> None:
         parsed = urlsplit(self.path)
@@ -2606,8 +2644,10 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except BrokenPipeError:
-            pass
+        except OSError as exc:
+            if _is_client_disconnect(exc):
+                return
+            raise
 
     def log_message(self, *_args):
         """Silence stdlib access logging — launchd captures stderr already."""
