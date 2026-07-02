@@ -1,9 +1,8 @@
 // Typed contracts for the ops cockpit.
 //
 // `OpsState` mirrors `GET /api/ui/ops/state` (the cockpit boundary).
-// `TimerHistory` and `OpsGraph` mirror the proposed read-models from
-// docs/ops-cockpit-frontend-design-brief.md. They are consumed by the chart
-// components today via mocked data, and will swap to live endpoints unchanged.
+// `TimerHistory` and `OpsGraph` mirror the live read-models consumed by the
+// chart components, with mock graph data retained only as a degraded fallback.
 
 export type Counts = Record<string, number>;
 

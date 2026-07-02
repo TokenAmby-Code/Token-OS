@@ -244,8 +244,8 @@ export function useSessionDocs(intervalMs = 30000): Feed<SessionDocsFeed> {
 
 /**
  * Graph feed. Brief: do not poll large graph endpoints at the state cadence;
- * refresh on demand / slow. Falls back to mocked OpsGraph until the backend
- * read-model ships.
+ * refresh on demand / slow. Falls back to mocked OpsGraph only if the backend
+ * read-model endpoint is unavailable.
  */
 export function useOpsGraph(graph = 'active', intervalMs = 60000): Feed<OpsGraph> {
   return usesPolling<OpsGraph>(async (signal) => {
