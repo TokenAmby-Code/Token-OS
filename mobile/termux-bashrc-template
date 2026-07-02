@@ -122,12 +122,10 @@ _termux_detach_mac_tmux_client() {
 trap _termux_detach_mac_tmux_client EXIT
 
 _mac_tmux_attach_cmd() {
-    printf '%s\n' \
-        "tag='${TERMUX_MAC_TMUX_CLIENT_TAG}'" \
-        'file="$HOME/.termux-mac-tmux-client-$tag"' \
-        'tty > "$file" 2>/dev/null || true' \
-        'trap '\''rm -f "$file"'\'' EXIT' \
-        'tmux attach -t main 2>/dev/null || exec zsh -il'
+    # Blessed human attach path: phone knows only the daemon-owned ctl verb.
+    # Raw `tmux attach` stays tombstoned by the Mac tmux shim; any required
+    # RAW bypass is internal to tmuxctld-ctl attach.
+    printf '%s\n' "zsh -il -c 'exec tmuxctld-ctl attach'"
 }
 
 # TMUX — local session + remote attach
@@ -349,9 +347,9 @@ _mac_reconnect_plan() {
 }
 
 # mac: SSH to Mac. Assertively attach tmux by default, even from tx panes.
-# Portable monitor → main session (full workspace).
-# Phone → canonical main tmux attach (session persists server-side).
-# SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
+# Portable monitor and phone both enter through the sanctioned daemon-owned
+# tmuxctld-ctl attach surface. Raw `tmux attach` remains tombstoned on the Mac.
+# SSH connects first; tmuxctld-ctl owns the human attach.
 mac() {
     local insist_tmux=true
     _mac_insist_tmux_enabled || insist_tmux=false
@@ -366,21 +364,12 @@ mac() {
     fi
 
     if [[ -n "$TMUX" ]]; then
-        # Session selection even from tx pane — respects portable monitor flag.
-        if is_portable_monitor; then
-            ssh -t mac "zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
-        else
-            ssh -t mac "$(_mac_tmux_attach_cmd)"
-        fi
+        ssh -t mac "$(_mac_tmux_attach_cmd)"
         return
     fi
 
     local _mac_attach
-    if is_portable_monitor; then
-        _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
-    else
-        _mac_attach="$(_mac_tmux_attach_cmd)"
-    fi
+    _mac_attach="$(_mac_tmux_attach_cmd)"
 
     # Bare Termux: stay glued to the Mac tmux workspace. A dropped SSH (screen
     # lock, network blip, Wi-Fi↔LTE roam) lands back here and reconnects forever
@@ -449,11 +438,7 @@ mac() {
             # a wedged/blackholed socket is abandoned in ~4s, retry immediately.
             echo "  ...deeper restart (fresh attach)..."
             _mac_set_insist_tmux
-            if is_portable_monitor; then
-                _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
-            else
-                _mac_attach="$(_mac_tmux_attach_cmd)"
-            fi
+            _mac_attach="$(_mac_tmux_attach_cmd)"
             _mac_ssh_opts=("${_mac_ssh_opts_tight[@]}")
             deep_done=true
         fi
