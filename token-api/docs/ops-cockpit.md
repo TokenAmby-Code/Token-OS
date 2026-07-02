@@ -80,7 +80,9 @@ The cockpit exposes state assertions near the top because the operator should ne
 
 `GET /api/ui/ops/timer/history` is live. It reconstructs a bucketed line from `timer_shifts` plus the current `TimerEngine` snapshot and returns exact mode segments/annotations where persisted shifts exist. `useTimerHistory` has no mock fallback; fake timer data is worse than an explicit degraded state.
 
-`GET /api/ui/ops/graph/active-fleet` is live, with `/api/ui/ops/graph/active` as an alias. It returns the current active fleet topology: host devices, active instances, session-doc bindings, live pane bindings when tmux metadata is available, and canonical chapter-command edges. `useOpsGraph` falls back to `mock.ts` only on endpoint failure. Proposed future graph shapes and the full graph spec live in `docs/ops-cockpit-frontend-design-brief.md`.
+`GET /api/ui/ops/graph/active-fleet` is live, with `/api/ui/ops/graph/active` as an alias. It returns the current active fleet topology: host devices, active instances, session-doc bindings, live pane bindings when tmux metadata is available, and canonical chapter-command edges.
+
+`GET /api/ui/ops/graph/golden-throne` is live, with `/api/ui/ops/graph/gt` as an alias. It returns read-only Golden Throne topology: GT-bound instances, their session docs, marker/timer state, recent `golden_throne_*` events, and Golden-Throne-sourced expected acknowledgements. `useOpsGraph` stays generic and falls back to `mock.ts` only on endpoint failure. Proposed future graph shapes and the full graph spec live in `docs/ops-cockpit-frontend-design-brief.md`.
 
 ## Aggregate state contract
 
@@ -130,7 +132,7 @@ open http://localhost:7777/ui/ops
 
 ## Current limitations
 
-- **Relationship graph scope is narrow.** The graph panel has a live `active-fleet` backend only; Golden Throne, enforcement causality, and broader lineage graphs are not built yet.
+- **Relationship graph scope is narrow.** The graph panel has live `active-fleet` and read-only `golden-throne` backends; broader enforcement causality and lineage graphs are still deferred.
 - **Day-start hardcoded to 07:20.** Pending morning-session / Hatch alarm-clock integration that lets the server publish an authoritative day-start to read from state.
 - Read-only surface; operational mutations should remain Token-API/CLI mutations invoked from tmux keybindings until deliberately designed.
 - Built frontend assets are committed for this pilot to keep LaunchAgent runtime Python-only. No CSS framework — design system is hand-rolled CSS variables in `styles.css`.
