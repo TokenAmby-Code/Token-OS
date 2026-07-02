@@ -3,7 +3,8 @@
 # TAGS: tmux, daemon
 # AUDIENCE: human, agent
 #
-# Usage: tmuxctld-ctl <status|health|logs>          # read-only inspection
+# Usage: tmuxctld-ctl attach [session]              # blessed human tmux attach
+#        tmuxctld-ctl <status|health|logs>          # read-only inspection
 #        tmuxctld-ctl <start|restart|stop>          # delegate to launchd
 #        tmuxctld-ctl install                       # sync plist + (re)bootstrap
 #
@@ -28,6 +29,21 @@ STDERR_LOG="${HOME}/.claude/tmuxctld-stderr.log"
 DOMAIN="gui/$(id -u)"
 
 die() { echo "Error: $*" >&2; exit 1; }
+
+cmd_attach() {
+  local session="${1:-main}"
+  shift || true
+  [[ $# -eq 0 ]] || die "attach accepts at most one session"
+  [[ -n "$session" && "$session" != -* ]] || die "invalid session: ${session}"
+
+  # This is the sanctioned human-attach path. The public tmux shim deliberately
+  # routes raw human attach/new invocations into the tx tombstone. Keep that
+  # guard intact: only this daemon-owned control surface performs the raw attach
+  # on the operator's behalf.
+  env IMPERIUM_TMUX_RAW=1 tmux has-session -t "$session" \
+    || die "tmux session not found: ${session}"
+  exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$session"
+}
 
 cmd_start() {
   echo "Kickstarting ${LABEL} (launchd; starts if down, restarts if up)..."
@@ -101,11 +117,12 @@ cmd_logs() {
 }
 
 [[ $# -eq 0 ]] && {
-  echo "Usage: tmuxctld-ctl <status|health|logs|start|restart|stop|install>"
+  echo "Usage: tmuxctld-ctl <attach|status|health|logs|start|restart|stop|install>"
   exit 1
 }
 
 case "$1" in
+  attach)  shift; cmd_attach "$@" ;;
   start)   cmd_start ;;
   restart) cmd_restart ;;
   stop)    cmd_stop ;;
@@ -114,7 +131,8 @@ case "$1" in
   status)  cmd_status ;;
   logs)    shift; cmd_logs "$@" ;;
   -h|--help)
-    echo "Usage: tmuxctld-ctl <status|health|logs|start|restart|stop|install>"
+    echo "Usage: tmuxctld-ctl <attach|status|health|logs|start|restart|stop|install>"
+    echo "  attach [session]       blessed human attach (default: main)"
     echo "  status, health, logs   read-only inspection"
     echo "  start, restart         -> launchctl kickstart -k (launchd, authoritative)"
     echo "  stop                   -> launchctl bootout (disables KeepAlive)"
