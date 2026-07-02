@@ -339,8 +339,11 @@ _mac_reconnect_plan() {
     else
         # Exponential backoff past the burst + deeper restart: 2, 4, 8, cap 8.
         local n=$(( attempt - burst_max - 1 ))   # 1, 2, 3, ...
-        delay=$(( 1 << n ))
-        (( delay > 8 )) && delay=8
+        if (( n >= 3 )); then
+            delay=8
+        else
+            delay=$(( 1 << n ))
+        fi
     fi
     printf '%s %s %s\n' "$delay" "$do_print" "$do_deep"
 }

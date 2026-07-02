@@ -44,17 +44,17 @@ def _plan(attempt: int, burst_max: int = BURST_MAX, deep_done: int = 0):
     return r.stdout.split()
 
 
-def test_attempt1_is_instant_and_silent():
+def test_attempt1_is_instant_and_silent() -> None:
     # First drop: re-tap immediately, print nothing.
     assert _plan(1) == ["0", "0", "0"]
 
 
-def test_attempt2_waits_one_second_and_prints():
+def test_attempt2_waits_one_second_and_prints() -> None:
     # Only the second attempt surfaces the reconnect message.
     assert _plan(2) == ["1", "1", "0"]
 
 
-def test_burst_is_five_one_second_cycles_and_prints_once():
+def test_burst_is_five_one_second_cycles_and_prints_once() -> None:
     # attempts 2..6 are all 1s (five cycles); only attempt 2 prints.
     assert _plan(2)[0] == "1"
     for a in (3, 4, 5, 6):
@@ -64,12 +64,12 @@ def test_burst_is_five_one_second_cycles_and_prints_once():
         assert do_deep == "0", f"attempt {a} must not deep-restart yet"
 
 
-def test_deeper_restart_fires_once_after_burst():
+def test_deeper_restart_fires_once_after_burst() -> None:
     # Right after the burst: zero-delay deeper restart (the fresh-`mac` reset).
     assert _plan(BURST_MAX + 1) == ["0", "0", "1"]
 
 
-def test_backoff_is_exponential_and_capped_after_deep_restart():
+def test_backoff_is_exponential_and_capped_after_deep_restart() -> None:
     # Once the deeper restart has fired, fall into exponential backoff, cap 8s.
     assert _plan(8, deep_done=1) == ["2", "0", "0"]
     assert _plan(9, deep_done=1) == ["4", "0", "0"]
