@@ -70,7 +70,6 @@ class PaneOccupancy:
     window_name: str
     pane_pid: int | None
     instance_id: str
-    clean: bool
     live_agent: bool
     recently_born: bool = False
 
@@ -89,7 +88,11 @@ class PaneOccupancy:
 
     @property
     def dispatch_available(self) -> bool:
-        return self.clean and not self.occupied
+        # A pane is dispatch-available iff it is not occupied. Occupancy is derived
+        # purely from the daemon ledger signals (instance stamp, live agent,
+        # singleton label, boot grace) — the retired @PANE_CLEAN "clean" stamp is
+        # no longer consulted.
+        return not self.occupied
 
 
 def _parse_pid(raw: str) -> int | None:
@@ -123,7 +126,6 @@ def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
         "\t".join(
             [
                 "#{pane_id}",
-                "#{@PANE_CLEAN}",
                 "#{@INSTANCE_ID}",
                 "#{@PANE_ID}",
                 "#{window_name}",
@@ -136,12 +138,12 @@ def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
     ledger: list[PaneOccupancy] = []
     for line in raw.splitlines():
         parts = line.split("\t")
-        # 7 columns from live tmux; tolerate the 6-column legacy form (and unit
+        # 6 columns from live tmux; tolerate the 5-column legacy form (and unit
         # fakes) by defaulting an absent @PANE_BORN to empty (no boot grace).
-        if len(parts) not in (6, 7):
+        if len(parts) not in (5, 6):
             continue
-        pane_id, clean, instance_id, pane_role, window_name, pane_pid_raw = parts[:6]
-        born_raw = parts[6] if len(parts) == 7 else ""
+        pane_id, instance_id, pane_role, window_name, pane_pid_raw = parts[:5]
+        born_raw = parts[5] if len(parts) == 6 else ""
         role = canonical_singleton_label(pane_role.strip()) if pane_role.strip() else ""
         pane_pid = _parse_pid(pane_pid_raw)
         ledger.append(
@@ -151,7 +153,6 @@ def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
                 window_name=window_name.strip(),
                 pane_pid=pane_pid,
                 instance_id=instance_id.strip(),
-                clean=clean.strip() == "1",
                 live_agent=_active_agent(pane_pid),
                 recently_born=_recently_born(born_raw),
             )
@@ -173,7 +174,6 @@ def occupancy_for_pane(adapter: TmuxAdapter, pane: str) -> PaneOccupancy | None:
         "\t".join(
             [
                 "#{pane_id}",
-                "#{@PANE_CLEAN}",
                 "#{@INSTANCE_ID}",
                 "#{@PANE_ID}",
                 "#{window_name}",
@@ -186,12 +186,12 @@ def occupancy_for_pane(adapter: TmuxAdapter, pane: str) -> PaneOccupancy | None:
     if not raw:
         return None
     parts = raw.split("\t")
-    # 7 columns from live tmux; tolerate the 6-column legacy form (and unit fakes)
+    # 6 columns from live tmux; tolerate the 5-column legacy form (and unit fakes)
     # by defaulting an absent @PANE_BORN to empty (no boot grace).
-    if len(parts) not in (6, 7):
+    if len(parts) not in (5, 6):
         return None
-    pane_id, clean, instance_id, pane_role, window_name, pane_pid_raw = parts[:6]
-    born_raw = parts[6] if len(parts) == 7 else ""
+    pane_id, instance_id, pane_role, window_name, pane_pid_raw = parts[:5]
+    born_raw = parts[5] if len(parts) == 6 else ""
     pane_pid = _parse_pid(pane_pid_raw)
     return PaneOccupancy(
         pane_id=pane_id,
@@ -199,7 +199,6 @@ def occupancy_for_pane(adapter: TmuxAdapter, pane: str) -> PaneOccupancy | None:
         window_name=window_name.strip(),
         pane_pid=pane_pid,
         instance_id=instance_id.strip(),
-        clean=clean.strip() == "1",
         live_agent=_active_agent(pane_pid),
         recently_born=_recently_born(born_raw),
     )

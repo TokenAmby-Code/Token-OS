@@ -18,11 +18,11 @@ source() {
 
 autoload -Uz add-zsh-hook
 
-# --- Agent exit cleanup + clean-pane stamp lifecycle ------------------------
-# Agent exit hooks stage /tmp/agent-resume-${TMUX_PANE}. The clean stamp
-# (@PANE_CLEAN) is set by clear() (shell-aliases.sh) and dropped here on the
-# first command or ^C. The two concerns share a single consume primitive so the
-# late-landing resume sentinel can NEVER wipe a command the user has already run.
+# --- Agent exit cleanup: resume-sentinel lifecycle --------------------------
+# Agent exit hooks stage /tmp/agent-resume-${TMUX_PANE}. The sentinel is consumed
+# here on the first command or ^C so the late-landing resume sentinel can NEVER
+# wipe a command the user has already run. (The old @PANE_CLEAN clean-pane stamp
+# that used to ride this same path was tombstoned — nothing read it.)
 
 # A sentinel is only trusted when it is a regular, non-symlinked file owned by us.
 # The path lives in shared /tmp, so a symlink or another user's file at the same
@@ -77,13 +77,12 @@ _agent_resume_precmd() {
 }
 add-zsh-hook precmd _agent_resume_precmd
 
-# Drop the clean stamp AND cancel any pending post-agent auto-reset. Called from
-# preexec (first command) and the ^C widget (first interrupt). Consuming the
-# sentinel here means the late `cd ~; clear` can never wipe what the user just
-# did — `cd o` lands in the vault with `ls` visible. The resume command is still
-# recorded in history so up-arrow still resumes.
+# Cancel any pending post-agent auto-reset. Called from preexec (first command)
+# and the ^C widget (first interrupt). Consuming the sentinel here means the late
+# `cd ~; clear` can never wipe what the user just did — `cd o` lands in the vault
+# with `ls` visible. The resume command is still recorded in history so up-arrow
+# still resumes.
 _agent_pane_dirty() {
-    _pane_drop_clean
     local cmd
     cmd="$(_agent_resume_consume)" || return
     [[ -z "$cmd" ]] && return

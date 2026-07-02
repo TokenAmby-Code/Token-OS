@@ -43,7 +43,7 @@ class _DisplayAdapter:
         raise AssertionError(args)
 
 
-def test_pin_current_occupancy_empty_clean_non_singleton_worker_is_dispatch_available(monkeypatch):
+def test_pin_current_occupancy_empty_non_singleton_worker_is_dispatch_available(monkeypatch):
     """Current behavior: no stamp/process/singleton signal means dispatch-available.
 
     Future bounty counterpart: a persisted daemon ledger SHIPPED/OPEN row should
@@ -51,7 +51,7 @@ def test_pin_current_occupancy_empty_clean_non_singleton_worker_is_dispatch_avai
     """
 
     monkeypatch.setattr(occupancy, "_active_agent", lambda _pid: False)
-    adapter = _DisplayAdapter("%80\t1\t\tmechanicus:8\tmechanicus\t1000")
+    adapter = _DisplayAdapter("%80\t\tmechanicus:8\tmechanicus\t1000")
 
     result = assert_dispatch_target_available(adapter, "%80")
 
@@ -170,7 +170,7 @@ def test_pin_current_empty_stamp_singleton_is_refused_by_label_guard(monkeypatch
     """Current behavior: singleton labels are protected even when @INSTANCE_ID is empty."""
 
     monkeypatch.setattr(occupancy, "_active_agent", lambda _pid: False)
-    adapter = _DisplayAdapter("%85\t1\t\tlegion:custodes\tlegion\t1000")
+    adapter = _DisplayAdapter("%85\t\tlegion:custodes\tlegion\t1000")
 
     with pytest.raises(ValueError, match="protected singleton"):
         assert_dispatch_target_available(adapter, "%85")

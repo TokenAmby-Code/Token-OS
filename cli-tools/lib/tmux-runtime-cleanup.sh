@@ -21,7 +21,6 @@ tmux_runtime_cleanup_pane() {
         @CWD \
         @CC_STATE \
         @PANE_LABEL \
-        @PANE_CLEAN \
         @PANE_BORN \
         @ACTIVE_TITLE \
         @PROGRESS_TITLE \

@@ -14,11 +14,13 @@ from tmuxctl.service import TmuxControlPlane
 class FakeAdapter:
     """Minimal adapter stub: serves a canned `list-panes -a` scan.
 
-    `rows` is a list of (pane_id, @PANE_CLEAN, @INSTANCE_ID, @PANE_ID,
-    window_name, pane_pid) tuples mirroring the freelist format string.
+    `rows` is a list of (pane_id, @INSTANCE_ID, @PANE_ID, window_name, pane_pid)
+    tuples mirroring the freelist format string. Availability is derived from the
+    occupancy ledger (instance/agent/singleton/boot-grace) — the retired
+    @PANE_CLEAN stamp is no longer a column.
     """
 
-    def __init__(self, rows: list[tuple[str, str, str, str, str, str]]):
+    def __init__(self, rows: list[tuple[str, str, str, str, str]]):
         self._rows = rows
         self.calls: list[tuple[str, ...]] = []
 
@@ -30,26 +32,22 @@ class FakeAdapter:
 
 
 LIVE = [
-    # clean + no agent → FREE
-    ("%24", "1", "", "palace:N", "palace", "100"),
-    # clean but a live agent owns it → NOT free
-    ("%25", "1", "uuid-agent", "palace:E", "palace", "101"),
-    # dirty shell (no stamp) → NOT free
-    ("%29", "", "", "somnium:NE", "somnium", "102"),
-    # clean + no agent + no cardinal role → FREE, role None
-    ("%43", "1", "", "", "scratch", "103"),
-    # explicit non-1 stamp value → NOT free
-    ("%50", "0", "", "mechanicus:1", "mechanicus", "104"),
+    # no instance + no agent + non-singleton → FREE
+    ("%24", "", "palace:N", "palace", "100"),
+    # a live instance owns it → NOT free
+    ("%25", "uuid-agent", "palace:E", "palace", "101"),
+    # no instance + no agent + no cardinal role → FREE, role None
+    ("%43", "", "", "scratch", "103"),
 ]
 
 
-def test_list_free_panes_returns_clean_agent_free_only():
+def test_list_free_panes_returns_unoccupied_agent_free_only():
     free = list_free_panes(FakeAdapter(LIVE))
     ids = [p.pane_id for p in free]
     assert ids == ["%24", "%43"]
 
 
-def test_list_free_panes_excludes_agent_owned_clean_pane():
+def test_list_free_panes_excludes_instance_owned_pane():
     free = list_free_panes(FakeAdapter(LIVE))
     assert all(p.pane_id != "%25" for p in free)
 
@@ -62,8 +60,8 @@ def test_list_free_panes_excludes_live_agent_even_when_instance_stamp_missing(mo
 
     monkeypatch.setattr(occupancy, "_active_agent", fake_active)
     rows = [
-        ("%occupied", "1", "", "mechanicus:1", "mechanicus", "999"),
-        ("%worker", "1", "", "mechanicus:2", "mechanicus", "1000"),
+        ("%occupied", "", "mechanicus:1", "mechanicus", "999"),
+        ("%worker", "", "mechanicus:2", "mechanicus", "1000"),
     ]
 
     free = list_free_panes(FakeAdapter(rows))
@@ -78,8 +76,8 @@ def test_list_free_panes_role_canonicalized_and_optional():
     assert free["%43"].window_name == "scratch"
 
 
-def test_list_free_panes_empty_when_none_clean():
-    free = list_free_panes(FakeAdapter([("%1", "", "", "x:N", "w", "100")]))
+def test_list_free_panes_empty_when_all_occupied():
+    free = list_free_panes(FakeAdapter([("%1", "live-inst", "x:N", "w", "100")]))
     assert free == []
 
 
@@ -101,10 +99,10 @@ def test_service_freelist_shape():
 
 def test_list_free_panes_hard_excludes_singleton_label_even_without_stamp_or_agent():
     rows = [
-        ("%custodes", "1", "", "legion:custodes", "legion", "999"),
-        ("%fg", "1", "", "mechanicus:fabricator-general", "mechanicus", "1000"),
-        ("%admin", "1", "", "mechanicus:admin", "mechanicus", "1001"),
-        ("%worker", "1", "", "mechanicus:1", "mechanicus", "1002"),
+        ("%custodes", "", "legion:custodes", "legion", "999"),
+        ("%fg", "", "mechanicus:fabricator-general", "mechanicus", "1000"),
+        ("%admin", "", "mechanicus:admin", "mechanicus", "1001"),
+        ("%worker", "", "mechanicus:1", "mechanicus", "1002"),
     ]
 
     free = list_free_panes(FakeAdapter(rows))
