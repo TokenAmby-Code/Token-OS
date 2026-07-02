@@ -29,6 +29,7 @@ import time
 from collections.abc import Iterable
 
 from .api import fetch_instance_rows_raw, rebind_instance_pane
+from .labels import canonical_pane_role
 from .tmux_adapter import TmuxAdapter, TmuxError
 
 # Instance statuses that denote a live, drive-able runtime worth rebinding.
@@ -100,10 +101,70 @@ def _create_spill_window(adapter: TmuxAdapter, session: str, name: str, cwd: str
     return adapter.run("display-message", "-t", f"{session}:{name}", "-p", "#{pane_id}").strip()
 
 
-def _tag_worker(adapter: TmuxAdapter, pane_id: str, base: str) -> None:
-    """Tag a freshly added stack worker pane for downstream tools."""
+def _base_worker_ordinal(role: str, base: str) -> int | None:
+    """Parse a ``{base}:{n}`` worker label to its positive ordinal, else ``None``."""
+    prefix, _, suffix = canonical_pane_role(role).partition(":")
+    if prefix == base and suffix.isdigit():
+        value = int(suffix)
+        return value if value > 0 else None
+    return None
+
+
+def _used_worker_ordinals(
+    adapter: TmuxAdapter, session: str, base: str, *, exclude_pane: str = ""
+) -> set[int]:
+    """Ordinals already assigned to live workers across ``base``'s spill windows.
+
+    Read purely from the live ``@PANE_ID`` labels of every pane in the base's
+    windows — the daemon's single occupancy truth, no parallel source. The pane
+    being tagged is excluded (it is a fresh, still-unlabeled split).
+    """
+    used: set[int] = set()
+    for win in _list_spill_windows(adapter, session, base):
+        rows = adapter.run(
+            "list-panes",
+            "-t",
+            f"{session}:{win}",
+            "-F",
+            "#{pane_id}\t#{@PANE_ID}",
+            allow_failure=True,
+        ).splitlines()
+        for line in rows:
+            if "\t" not in line:
+                continue
+            pane, role = line.split("\t", 1)
+            if pane == exclude_pane:
+                continue
+            ordinal = _base_worker_ordinal(role, base)
+            if ordinal is not None:
+                used.add(ordinal)
+    return used
+
+
+def _next_worker_ordinal(used: set[int]) -> int:
+    """Lowest positive ordinal not already assigned to a live worker."""
+    ordinal = 1
+    while ordinal in used:
+        ordinal += 1
+    return ordinal
+
+
+def _tag_worker(adapter: TmuxAdapter, session: str, pane_id: str, base: str) -> None:
+    """Tag a freshly added stack worker pane with a UNIQUE canonical id.
+
+    ``:new`` is a stateless launch alias — never a stored id. Each spawned worker
+    mints a distinct ``{base}:{ordinal}`` (the lowest free ordinal across the
+    base's live panes), so two ``:new`` dispatches can never collide on a shared
+    ``{base}:worker`` default label and ``talk``/``brief`` resolve each pane
+    unambiguously by its real id.
+    """
+    ordinal = _next_worker_ordinal(
+        _used_worker_ordinals(adapter, session, base, exclude_pane=pane_id)
+    )
     adapter.run("set-option", "-p", "-t", pane_id, "@PANE_TYPE", "stack-worker", allow_failure=True)
-    adapter.run("set-option", "-p", "-t", pane_id, "@PANE_ID", f"{base}:worker", allow_failure=True)
+    adapter.run(
+        "set-option", "-p", "-t", pane_id, "@PANE_ID", f"{base}:{ordinal}", allow_failure=True
+    )
     # Birth stamp: gives the persona-sweep boot-grace a clock when the worker has
     # no registry row yet (the ~1.5s agent-boot race), so a newborn pane is not
     # pruned before its agent process becomes observable.
@@ -147,7 +208,7 @@ def add_stack_pane(
     if not existing:
         # No canonical window yet — create it as the first stack window.
         pane = _create_spill_window(adapter, session, base, cwd)
-        _tag_worker(adapter, pane, base)
+        _tag_worker(adapter, session, pane, base)
         return pane
 
     # Try each existing spill window in order; use the first that accepts a split.
@@ -155,14 +216,14 @@ def add_stack_pane(
         target = f"{session}:{win}"
         pane = _try_split(adapter, target, cwd)
         if pane:
-            _tag_worker(adapter, pane, base)
+            _tag_worker(adapter, session, pane, base)
             return pane
 
     # All existing spill windows are geometrically full. Create the next one.
     next_n = _spill_index(existing[-1]) + 1
     new_name = _spill_name(base, next_n)
     pane = _create_spill_window(adapter, session, new_name, cwd)
-    _tag_worker(adapter, pane, base)
+    _tag_worker(adapter, session, pane, base)
     return pane
 
 

@@ -166,7 +166,10 @@ def test_tag_worker_stamps_pane_born() -> None:
     from tmuxctl.stack import _tag_worker
 
     adapter = FakeAdapter()
-    _tag_worker(adapter, "%W", "legion")
+    _tag_worker(adapter, "main", "%W", "legion")
 
     assert "@PANE_BORN" in adapter.options
     assert int(adapter.options["@PANE_BORN"]) > 0
+    # A stateless launch alias never becomes the stored id: the worker mints a
+    # unique numeric ordinal, never the shared {base}:worker default label.
+    assert adapter.options["@PANE_ID"] == "legion:1"
