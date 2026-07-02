@@ -312,6 +312,42 @@ not-mac() {
     echo "Mac tmux auto-attach disabled for the next 'mac'. Run 'mac' to re-enable."
 }
 
+# _mac_reconnect_plan ATTEMPT BURST_MAX DEEP_DONE
+# Pure decision helper for the sticky reconnect ladder — no sleeping, no ssh, so
+# it is unit-testable in isolation (see tests/test_mac_reconnect_ladder.py).
+# Given the current 1-based consecutive-failure ATTEMPT, the last attempt of the
+# 1s aggressive burst (BURST_MAX), and whether the deeper restart already fired
+# this outage (DEEP_DONE=0|1), it prints three space-separated tokens:
+#     <next_delay_secs> <do_print:0|1> <do_deep_restart:0|1>
+# Schedule:
+#     attempt 1               -> 0 0 0   instant, silent re-tap
+#     attempt 2               -> 1 1 0   1s wait, print the reconnect line once
+#     attempts 3..BURST_MAX   -> 1 0 0   aggressive 1s burst continues
+#     attempt BURST_MAX+1     -> 0 0 1   deeper restart (once), zero delay
+#     thereafter              -> exponential backoff 2,4,8 capped at 8s
+_mac_reconnect_plan() {
+    local attempt="$1" burst_max="$2" deep_done="$3"
+    local delay=0 do_print=0 do_deep=0
+    if (( attempt <= 1 )); then
+        delay=0
+    elif (( attempt <= burst_max )); then
+        delay=1
+        (( attempt == 2 )) && do_print=1
+    elif (( deep_done == 0 )); then
+        delay=0
+        do_deep=1
+    else
+        # Exponential backoff past the burst + deeper restart: 2, 4, 8, cap 8.
+        local n=$(( attempt - burst_max - 1 ))   # 1, 2, 3, ...
+        if (( n >= 3 )); then
+            delay=8
+        else
+            delay=$(( 1 << n ))
+        fi
+    fi
+    printf '%s %s %s\n' "$delay" "$do_print" "$do_deep"
+}
+
 # mac: SSH to Mac. Assertively attach tmux by default, even from tx panes.
 # Portable monitor → main session (full workspace).
 # Phone → grouped session 'phone' on main:warp with keyboard auto-zoom hook.
@@ -332,7 +368,7 @@ mac() {
     if [[ -n "$TMUX" ]]; then
         # Session selection even from tx pane — respects portable monitor flag.
         if is_portable_monitor; then
-            ssh -t mac "zsh -il -c 'tmux attach -t main 2>/dev/null || tx start --mac'"
+            ssh -t mac "zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
         else
             ssh -t mac "$(_mac_phone_tmux_attach_cmd)"
         fi
@@ -341,7 +377,7 @@ mac() {
 
     local _mac_attach
     if is_portable_monitor; then
-        _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || tx start --mac'"
+        _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
     else
         _mac_attach="$(_mac_phone_tmux_attach_cmd)"
     fi
@@ -351,25 +387,78 @@ mac() {
     # instead of dumping to the local Termux shell. Two deliberate ways out:
     #   * Clean tmux detach (prefix + d → exit 0) — you meant to leave.
     #   * Ctrl-C while it's waiting to reconnect — aborts the loop to the shell.
-    # Backoff grows 1→2→4→8s and caps at 8s so a long outage doesn't hammer SSH.
+    #
+    # Retry ladder (see _mac_reconnect_plan for the schedule). The old loop
+    # climbed an exponential backoff and *never* reset it: because a reconnect
+    # was never registered at the wrapper, every drop after the first started
+    # deep in the ladder and ate multi-second waits — torment mid-thought. The
+    # rework:
+    #   1. attempt 1 re-taps instantly and silently (most drops are momentary);
+    #   2. attempt 2 waits 1s and prints once;
+    #   3. attempts 3..6 keep hammering at 1s (the aggressive burst);
+    #   4. after the burst, one "deeper restart" — the exact reset a fresh `mac`
+    #      invocation does by hand (rebuild the attach env + a zero-delay ssh
+    #      with a tight ConnectTimeout). This is why Ctrl-C then re-typing `mac`
+    #      reconnects when the in-loop retry looks wedged: the fresh call resets
+    #      the ladder and drops the stalled attempt; nothing in the old loop did;
+    #   5. only then fall into exponential backoff (2→4→8s, capped) so a genuine
+    #      long outage doesn't hammer SSH while still reconnecting forever.
+    # Success is registered by timing each ssh: a session that lasted a real
+    # interval connected and only now dropped, so the ladder resets to attempt 1.
     # Each attempt is bounded so a half-open / blackholed TCP can't wedge the
     # loop: ConnectTimeout caps the handshake, and ServerAlive* tears a silently
-    # dead session down within ~15s and returns non-zero → falls through to the
-    # backoff instead of hanging the shell.
-    local _mac_ssh_opts=(-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
-    local delay=1 attempt=0
+    # dead session down and returns non-zero → falls through to the ladder.
+    local _mac_ssh_opts_relaxed=(-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+    local _mac_ssh_opts_tight=(-o ConnectTimeout=4 -o ServerAliveInterval=3 -o ServerAliveCountMax=2)
+    local _mac_ssh_opts=("${_mac_ssh_opts_relaxed[@]}")
+    local _burst_max=6       # attempts 1..6 = the 0s + five 1s aggressive burst
+    local _connect_ok=15     # an ssh lasting >= this counts as a real attach
+    local attempt=0 printed=false deep_done=false
     while true; do
+        local _t0=$SECONDS
         ssh "${_mac_ssh_opts[@]}" -t mac "$_mac_attach"
         local exit_code=$?
+        local _elapsed=$(( SECONDS - _t0 ))
 
         # Exit code 0 = clean detach / clean remote logout. You asked to leave.
         [[ $exit_code -eq 0 ]] && break
 
-        # Non-zero = dropped/failed connection. Reconnect indefinitely.
+        # A session that lasted a real interval connected successfully and only
+        # now dropped. Register that success the old wrapper never did: reset the
+        # whole ladder so this drop is treated as attempt 1 (instant, silent),
+        # not a continuation of a stale backoff. (Connect *failures* return well
+        # under _connect_ok, so they don't trip this.)
+        if (( _elapsed >= _connect_ok )); then
+            attempt=0; printed=false; deep_done=false
+            _mac_ssh_opts=("${_mac_ssh_opts_relaxed[@]}")
+        fi
+
         ((attempt++))
-        echo "Connection dropped (exit $exit_code) — reconnecting in ${delay}s (attempt ${attempt}, Ctrl-C to stop)..."
-        sleep "$delay"
-        (( delay = delay < 8 ? delay * 2 : 8 ))
+        local _plan _delay _do_print _do_deep
+        _plan=$(_mac_reconnect_plan "$attempt" "$_burst_max" "$([[ $deep_done == true ]] && echo 1 || echo 0)")
+        read -r _delay _do_print _do_deep <<< "$_plan"
+
+        if (( _do_print )) && [[ "$printed" != true ]]; then
+            echo "Connection dropped — reconnecting (Ctrl-C to stop)..."
+            printed=true
+        fi
+
+        if (( _do_deep )); then
+            # Deeper restart: replicate a fresh `mac` invocation without dropping
+            # the wrapper — rebuild the attach env, tighten the ssh handshake so
+            # a wedged/blackholed socket is abandoned in ~4s, retry immediately.
+            echo "  ...deeper restart (fresh attach)..."
+            _mac_set_insist_tmux
+            if is_portable_monitor; then
+                _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
+            else
+                _mac_attach="$(_mac_phone_tmux_attach_cmd)"
+            fi
+            _mac_ssh_opts=("${_mac_ssh_opts_tight[@]}")
+            deep_done=true
+        fi
+
+        (( _delay > 0 )) && sleep "$_delay"
     done
 }
 
@@ -381,7 +470,7 @@ wsl() {
     if [[ -n "$TMUX" ]]; then
         ssh wsl
     elif is_portable_monitor; then
-        ssh -t wsl "bash -ic 'tmux attach -t main 2>/dev/null || tx start'"
+        ssh -t wsl "bash -ic 'tmux attach -t main 2>/dev/null || exec bash -il'"
     else
         ssh -t wsl "tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \\; select-window -t warp 2>/dev/null || exec bash -il"
     fi
