@@ -835,3 +835,18 @@ def test_submit_transaction_override_can_pierce_agent_only_hold(
     assert result["suppressed"] is False
     assert result["override"] == "tmuxctl-submit-transaction"
     assert result["ignored_override"] is None
+
+
+def test_direct_user_override_cannot_pierce_human_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_quiet(monkeypatch, False)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: target == "%44")
+
+    with send_gate.thread_local_override("tmuxctld-direct-user"):
+        result = send_gate.evaluate(("send-keys", "-t", "%44", "-l", "operator text"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["suppressed"] is True
+    assert result["override"] is None
+    assert result["ignored_override"] == "tmuxctld-direct-user"

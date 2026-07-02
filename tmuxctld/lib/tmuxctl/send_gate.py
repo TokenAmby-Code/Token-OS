@@ -82,6 +82,9 @@ _AGENT_OWNER_OVERRIDES = frozenset(
         # Adapter-local text+submit transaction inherits the outer request's
         # owner token; without that token it must queue behind the guard.
         "tmuxctl-submit-transaction",
+        # Discord/operator append may pierce daemon AGENT holds and quiet-hours,
+        # but never a real keystroke/pending human lock on the target pane.
+        "tmuxctld-direct-user",
     }
 )
 

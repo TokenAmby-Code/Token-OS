@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import hashlib
 import io
 import json
 import logging
@@ -763,10 +764,11 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
     """Resolve ``pane`` and fail closed on a live HUMAN keystroke/pending lock.
 
     The send gate honors a process-global ``TMUX_SEND_GATE_ALLOW`` sanctioned
-    override and yields it back to a human lock for ONLY the daemon's own two
-    thread-local holder reasons (``tmuxctld-send-holder`` /
-    ``tmuxctl-submit-transaction``). Every OTHER override reason — including the
-    process-global env override an enforce-action sets (e.g. token-api's
+    override and yields it back to a human lock for ONLY the daemon's own
+    thread-local transaction reasons (``tmuxctld-send-holder`` /
+    ``tmuxctl-submit-transaction`` / ``tmuxctld-direct-user``). Every OTHER
+    override reason — including the process-global env override an enforce-action
+    sets (e.g. token-api's
     ``custodes_enforcement_deferred_timeout`` deferred-timeout Custodes nag) —
     sails past the typing guard and pierces the Emperor's live keystroke lock at
     this send-path chokepoint.
@@ -933,6 +935,219 @@ def _parse_pre_submit_keys(raw) -> tuple[str, ...]:
     return ()
 
 
+def _send_operation_fingerprint(
+    kind: str,
+    *,
+    text: str = "",
+    effects: dict | None = None,
+) -> str:
+    """Hash the full local-send effect for operation-id reuse checks.
+
+    ``payload_hash`` in API results intentionally remains the prompt/text hash
+    that callers already know. The idempotency cache needs a stricter identity:
+    same operation id + same visible payload but different effects (submit vs
+    insert, clear prompt, sink keys, keypress count, etc.) is a different
+    operation and must be rejected instead of replayed.
+    """
+
+    return hashlib.sha256(
+        json.dumps(
+            {"kind": kind, "text": text, "effects": effects or {}},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _capture_pane_text(control, phys_pane: str, *, lines: int = 20) -> str:
+    if hasattr(control.adapter, "capture_pane"):
+        return control.adapter.capture_pane(phys_pane, lines=lines)
+    return control.adapter.run(
+        "capture-pane", "-t", phys_pane, "-p", "-S", str(-lines), allow_failure=True
+    )
+
+
+def _wait_for_insert_confirmation(
+    control,
+    *,
+    phys_pane: str,
+    text: str,
+    timeout: float,
+) -> tuple[bool, str]:
+    """Read back the visible draft and confirm that inserted bytes landed.
+
+    This is the insert-only "belt". It is deliberately a read-back of the pane,
+    not a debounce or after-the-fact duplicate suppressor. A missing read-back is
+    surfaced as unverified, but still cached under an explicit operation id so a
+    retry cannot blindly duplicate bytes that may already be in the live draft.
+    """
+
+    needle = normalize_prompt_payload(text).strip()
+    if not needle:
+        return True, ""
+    deadline = time.monotonic() + max(0.0, timeout)
+    last_capture = ""
+    while True:
+        try:
+            last_capture = _capture_pane_text(control, phys_pane, lines=20)
+        except Exception as exc:
+            log.debug("tmuxctld: insert confirmation capture failed pane=%s: %s", phys_pane, exc)
+            last_capture = ""
+        # The needle is newline-collapsed (normalize_prompt_payload turns
+        # [\r\n]+ into a single space), but call sites send the raw, un-collapsed
+        # bytes, so capture-pane returns embedded newlines for any multi-line
+        # payload (e.g. forwarded Discord messages). Collapse the read-back the
+        # SAME way before matching so a genuine multi-line insert is not
+        # spuriously reported "unverified" — which would push callers to retry
+        # and risk duplicate inserts.
+        haystack = re.sub(r"[\r\n]+", " ", last_capture)
+        if needle in haystack:
+            return True, last_capture
+        if time.monotonic() >= deadline:
+            return False, last_capture
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _hold_agent_guard(phys_pane: str, *, seconds: int) -> str | None:
+    """Acquire an AGENT guard and return the owner token (or ``None``).
+
+    The owner token MUST be threaded through ``thread_local_override(owner=...)``
+    and back into ``_release_agent_guard(owner=...)`` so ``send_gate.evaluate``'s
+    agent-kind pierce branch (which requires ``thread_owner == pane_owner``) can
+    pierce the guard we just installed, and so ``release`` can actually clear the
+    AGENT record it wrote. Dropping the token silently breaks self-pierce and
+    leaves the guard lingering until TTL expiry.
+    """
+    try:
+        return typing_guard_state.hold(
+            typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+            phys_pane,
+            seconds=seconds,
+            now=typing_guard_state.now_epoch(),
+        )
+    except Exception as exc:  # tmux unreachable / no live server (e.g. unit tests)
+        log.debug("tmuxctld: agent-guard hold skipped pane=%s: %s", phys_pane, exc)
+        return None
+
+
+def _release_agent_guard(phys_pane: str, *, owner: str | None = None) -> None:
+    try:
+        typing_guard_state.release(
+            typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+            phys_pane,
+            now=typing_guard_state.now_epoch(),
+            owner=owner,
+        )
+    except Exception as exc:
+        log.warning("tmuxctld: agent-guard release failed pane=%s: %s", phys_pane, exc)
+
+
+def _insert_without_submit_pipeline(
+    control,
+    *,
+    pane: str,
+    text: str,
+    action: Callable[[], dict | None],
+    operation_id: str = "",
+    verify_timeout: float = 1.0,
+    direct_user: bool = False,
+    effects: dict | None = None,
+) -> dict:
+    """Shared insert-only send primitive with gate, idempotency, and read-back."""
+
+    phys_pane = _resolve_physical_pane_or_gate(control, pane)
+    normalized_payload = normalize_prompt_payload(text)
+    visible_payload_hash = prompt_payload_hash(normalized_payload)
+    idempotency_hash = _send_operation_fingerprint(
+        "insert-without-submit",
+        text=normalized_payload,
+        effects={**(effects or {}), "direct_user": bool(direct_user)},
+    )
+    idempotent = _SEND_IDEMPOTENCY.begin(
+        operation_id, pane=phys_pane, payload_hash=idempotency_hash
+    )
+    if idempotent is not None:
+        return idempotent
+
+    _raise_if_human_locked(phys_pane)
+    if not direct_user:
+        pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
+        if pre_gate is not None and pre_gate.get("suppressed"):
+            _SEND_IDEMPOTENCY.abort(operation_id)
+            raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
+
+    dispatch_id = str(uuid.uuid4())
+    instance_id = ""
+    try:
+        instance_id = str(control.instance_id_for_pane(pane).get("instance_id") or "").strip()
+    except Exception:
+        instance_id = ""
+
+    hold_seconds = max(8, int(max(0.0, verify_timeout)) + 3)
+    owner_token = _hold_agent_guard(phys_pane, seconds=hold_seconds)
+    held = bool(owner_token)
+    override_reason = "tmuxctld-direct-user" if direct_user else "tmuxctld-send-holder"
+    # Thread the owner token so send_gate can pierce our OWN AGENT guard. Without
+    # owner=, sanctioned_agent_owner() never matches the pane owner installed by
+    # hold(), and every literal send inside action() would be suppressed.
+    override_ctx = (
+        thread_local_override(override_reason, owner=owner_token)
+        if held
+        else contextlib.nullcontext()
+    )
+    action_result: dict = {}
+    send_exception: BaseException | None = None
+    try:
+        with override_ctx:
+            maybe_result = action()
+            if isinstance(maybe_result, dict):
+                action_result = dict(maybe_result)
+        gate = getattr(control.adapter, "last_send_gate_result", None)
+        if gate and gate.get("suppressed"):
+            raise TmuxSendGated(gate)
+    except BaseException as exc:
+        send_exception = exc
+        raise
+    finally:
+        if held:
+            _release_agent_guard(phys_pane, owner=owner_token)
+        if send_exception is not None:
+            _SEND_IDEMPOTENCY.abort(operation_id)
+
+    confirmed, capture = _wait_for_insert_confirmation(
+        control, phys_pane=phys_pane, text=normalized_payload, timeout=verify_timeout
+    )
+    failures = []
+    if not confirmed:
+        failures.append(
+            {
+                "type": "insert_unverified",
+                "detail": "inserted bytes were not found in capture-pane read-back",
+            }
+        )
+    result = {
+        **action_result,
+        "status": "inserted" if confirmed else "unverified",
+        "pane": pane,
+        "instance_id": action_result.get("instance_id") or instance_id,
+        "dispatch_id": dispatch_id,
+        "operation_id": operation_id or None,
+        "payload_hash": visible_payload_hash,
+        "verification_status": "inserted" if confirmed else "unverified",
+        "verified_by": "capture-pane" if confirmed else None,
+        "idempotent_replay": False,
+        "guard_held": held,
+        "submitted": False,
+        "insert_confirmed": confirmed,
+        "capture_excerpt": capture[-500:] if capture and not confirmed else "",
+        "failures": failures,
+    }
+    _SEND_IDEMPOTENCY.finish(
+        operation_id, pane=phys_pane, payload_hash=idempotency_hash, result=result
+    )
+    return result
+
+
 def _send_text_pipeline(
     control,
     *,
@@ -970,13 +1185,17 @@ def _send_text_pipeline(
     from .occupancy import assert_dispatch_target_available, looks_like_dispatch_launcher_payload
 
     if not submit:
-        _raise_if_human_locked(phys_pane)
         if looks_like_dispatch_launcher_payload(normalized_payload):
             assert_dispatch_target_available(control.adapter, phys_pane)
-        pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
-        if pre_gate is not None and pre_gate.get("suppressed"):
-            raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
-        return control.send_text(phys_pane, text, clear_prompt=clear_prompt, submit=False)
+        return _insert_without_submit_pipeline(
+            control,
+            pane=pane,
+            text=normalized_payload,
+            action=lambda: control.send_text(pane, text, clear_prompt=clear_prompt, submit=False),
+            operation_id=operation_id,
+            verify_timeout=verify_timeout,
+            effects={"route": "send-text", "submit": False, "clear_prompt": bool(clear_prompt)},
+        )
 
     # Hash the NORMALIZED payload that is actually injected (newlines collapsed,
     # rstripped) — not the raw text. The UserPromptSubmit ack hashes the prompt
@@ -986,7 +1205,19 @@ def _send_text_pipeline(
     # mutable gates so a safe retry reports the prior result instead of being
     # reclassified by current human-lock state.
     payload_hash = prompt_payload_hash(normalized_payload)
-    idempotent = _SEND_IDEMPOTENCY.begin(operation_id, pane=phys_pane, payload_hash=payload_hash)
+    idempotency_hash = _send_operation_fingerprint(
+        "send-text",
+        text=normalized_payload,
+        effects={
+            "submit": True,
+            "clear_prompt": bool(clear_prompt),
+            "pre_submit_keys": list(pre_submit_keys),
+            "post_submit_actions": list(post_submit_actions),
+        },
+    )
+    idempotent = _SEND_IDEMPOTENCY.begin(
+        operation_id, pane=phys_pane, payload_hash=idempotency_hash
+    )
     if idempotent is not None:
         return idempotent
 
@@ -1224,7 +1455,9 @@ def _send_text_pipeline(
         "recovery_attempts": recovery_attempts,
         "failures": failures,
     }
-    _SEND_IDEMPOTENCY.finish(operation_id, pane=phys_pane, payload_hash=payload_hash, result=result)
+    _SEND_IDEMPOTENCY.finish(
+        operation_id, pane=phys_pane, payload_hash=idempotency_hash, result=result
+    )
     return result
 
 
@@ -1246,9 +1479,16 @@ def _h_send_text(control, params):
 
 def _h_insert_text(control, params):
     pane = _s(params, "pane")
-    with _agent_guard_transaction(control, pane):
-        control.insert_text(pane, _s(params, "text"))
-    return {"pane": pane, "status": "inserted"}
+    text = _s(params, "text")
+    return _insert_without_submit_pipeline(
+        control,
+        pane=pane,
+        text=text,
+        action=lambda: control.insert_text(pane, text) or {"pane": pane},
+        operation_id=_s(params, "operation_id"),
+        verify_timeout=_f(params, "verify_timeout", 1.0),
+        effects={"route": "insert-text"},
+    )
 
 
 def _h_prompt_start(control, params):
@@ -1308,8 +1548,18 @@ def _h_invoke_skill(control, params):
             "agent": resolved_agent,
             "rendered": rendered,
         }
-    with _agent_guard_transaction(control, pane):
-        result = control.insert_invocation(pane, skill, agent=agent, kind=kind, arguments=arguments)
+    result = _h_insert_invocation(
+        control,
+        {
+            "pane": pane,
+            "name": skill,
+            "agent": agent,
+            "kind": kind,
+            "arguments": arguments or "",
+            "operation_id": _s(params, "operation_id"),
+            "verify_timeout": _s(params, "verify_timeout", "1.0"),
+        },
+    )
     return {"submitted": False, **result}
 
 
@@ -1370,19 +1620,20 @@ def _h_append_user_text(control, params):
     text = _s(params, "text")
     if not text:
         raise ValueError("direct-user text is empty")
-    # Human ON/PENDING lock remains inviolable; the sanctioned direct-user
-    # override is only to bypass a green AGENT hold/quiet-hours for operator
-    # keyboard input arriving through Discord.
-    _refuse_send_into_human_lock(control, pane)
-    with thread_local_override("tmuxctld-direct-user"):
-        control.adapter.run("send-keys", "-t", pane, "-l", text)
-    gate = getattr(control.adapter, "last_send_gate_result", None)
-    if gate and gate.get("suppressed"):
-        raise TmuxSendGated(gate)
+    result = _insert_without_submit_pipeline(
+        control,
+        pane=pane,
+        text=text,
+        action=lambda: control.adapter.run("send-keys", "-t", pane, "-l", text)
+        or {"pane": pane},
+        operation_id=_s(params, "operation_id"),
+        verify_timeout=_f(params, "verify_timeout", 1.0),
+        direct_user=True,
+        effects={"route": "append-user-text"},
+    )
     return {
-        "status": "inserted",
-        "pane": pane,
-        "instance_id": instance_id,
+        **result,
+        "instance_id": result.get("instance_id") or instance_id,
         "direct_user": True,
         "submitted": False,
         "clear_prompt": False,
@@ -1402,9 +1653,39 @@ def _h_insert_invocation(control, params):
     agent = _s(params, "agent", "auto")
     kind = _s(params, "kind", "skill")
     arguments = _s(params, "arguments") or None
-    with _agent_guard_transaction(control, pane):
-        result = control.insert_invocation(pane, name, agent=agent, kind=kind, arguments=arguments)
-    return {"status": "inserted", **result}
+    resolved_kind = normalize_invocation_kind(kind)
+    if resolved_kind == "command":
+        resolved_agent = "auto"
+    else:
+        resolved_agent = resolve_agent_for_pane(control.adapter, pane, agent)
+    rendered = invocation_text(
+        name,
+        resolved_agent,
+        kind=resolved_kind,
+        arguments=arguments,
+    )
+
+    def _action() -> dict:
+        return control.insert_invocation(
+            pane, name, agent=resolved_agent, kind=resolved_kind, arguments=arguments
+        )
+
+    result = _insert_without_submit_pipeline(
+        control,
+        pane=pane,
+        text=rendered,
+        action=_action,
+        operation_id=_s(params, "operation_id"),
+        verify_timeout=_f(params, "verify_timeout", 1.0),
+        effects={
+            "route": "insert-invocation",
+            "kind": resolved_kind,
+            "agent": resolved_agent,
+            "arguments": arguments or "",
+            "sink_keys": list(invocation_sink_keys(resolved_agent, kind=resolved_kind)),
+        },
+    )
+    return {"status": result.get("status", "inserted"), **result}
 
 
 def _h_assert_instance(control, params):
@@ -1870,11 +2151,101 @@ def _h_grid_expand(control, params):
 
 
 def _h_mode_toggle(control, params):
-    return control.mode_toggle(
-        pane=_s(params, "pane", "current"),
-        status_only=_b(params, "status"),
-        delay_seconds=_f(params, "delay", 0.15),
+    pane = _s(params, "pane", "current")
+    target_pane = control._keybind_target_pane(pane, client=_s(params, "client"))
+    phys_pane = _resolve_physical_pane_or_gate(control, target_pane)
+    capture = control.adapter.run(
+        "capture-pane", "-t", target_pane, "-p", "-S", "-5", allow_failure=True
     )
+    before = control.detect_mode_from_capture(capture)
+    if _b(params, "status"):
+        return {"pane": target_pane, "mode": before, "presses": 0}
+
+    presses_by_mode = {"plan": 1, "bypass": 3, "accept": 2, "none": 2}
+    expected_by_mode = {
+        "plan": "bypass",
+        "bypass": "plan",
+        "accept": "bypass",
+        "none": "plan",
+    }
+    presses = presses_by_mode[before]
+    expected = expected_by_mode[before]
+    idempotency_hash = _send_operation_fingerprint(
+        "keypress",
+        text="BTab",
+        effects={"route": "mode-toggle", "from": before, "to": expected, "presses": presses},
+    )
+    operation_id = _s(params, "operation_id")
+    idempotent = _SEND_IDEMPOTENCY.begin(
+        operation_id, pane=phys_pane, payload_hash=idempotency_hash
+    )
+    if idempotent is not None:
+        return idempotent
+
+    _raise_if_human_locked(phys_pane)
+    pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "BTab"))
+    if pre_gate is not None and pre_gate.get("suppressed"):
+        _SEND_IDEMPOTENCY.abort(operation_id)
+        raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
+
+    owner_token = _hold_agent_guard(phys_pane, seconds=8)
+    held = bool(owner_token)
+    override_ctx = (
+        thread_local_override("tmuxctld-send-holder", owner=owner_token)
+        if held
+        else contextlib.nullcontext()
+    )
+    send_exception: BaseException | None = None
+    try:
+        with override_ctx:
+            delay_seconds = _f(params, "delay", 0.15)
+            for index in range(presses):
+                control.adapter.send_keys(target_pane, "BTab")
+                if delay_seconds > 0 and index + 1 < presses:
+                    time.sleep(delay_seconds)
+        gate = getattr(control.adapter, "last_send_gate_result", None)
+        if gate and gate.get("suppressed"):
+            raise TmuxSendGated(gate)
+    except BaseException as exc:
+        send_exception = exc
+        raise
+    finally:
+        if held:
+            _release_agent_guard(phys_pane, owner=owner_token)
+        if send_exception is not None:
+            _SEND_IDEMPOTENCY.abort(operation_id)
+
+    after_capture = control.adapter.run(
+        "capture-pane", "-t", target_pane, "-p", "-S", "-5", allow_failure=True
+    )
+    after = control.detect_mode_from_capture(after_capture)
+    confirmed = after == expected
+    result = {
+        "pane": target_pane,
+        "from": before,
+        "to": expected,
+        "observed": after,
+        "presses": presses,
+        "status": "toggled" if confirmed else "unverified",
+        "verification_status": "toggled" if confirmed else "unverified",
+        "verified_by": "capture-pane" if confirmed else None,
+        "operation_id": operation_id or None,
+        "payload_hash": idempotency_hash,
+        "idempotent_replay": False,
+        "guard_held": held,
+        "failures": []
+        if confirmed
+        else [
+            {
+                "type": "keypress_unverified",
+                "detail": f"mode capture did not change to expected {expected!r}",
+            }
+        ],
+    }
+    _SEND_IDEMPOTENCY.finish(
+        operation_id, pane=phys_pane, payload_hash=idempotency_hash, result=result
+    )
+    return result
 
 
 def _h_open_session_doc(control, params):
@@ -2325,14 +2696,32 @@ def _h_voice_append(control, params):
     if not text:
         return {"inserted": False, "reason": "empty", "target_role": session.target_role}
     segment = f" {text}" if session.utterances else text
+    result: dict = {}
     try:
         _voice_set_option_best_effort(control, session.target_role, _VOICE_PROCESSING_OPTION, "1")
-        control.send_text(session.target_role, segment, submit=False)
+        result = _insert_without_submit_pipeline(
+            control,
+            pane=session.target_role,
+            text=segment,
+            action=lambda: control.send_text(session.target_role, segment, submit=False),
+            operation_id=_s(params, "operation_id"),
+            verify_timeout=_f(params, "verify_timeout", 1.0),
+            effects={
+                "route": "voice-session-append",
+                "voice_session_id": session.voice_session_id,
+                "utterance_index": session.utterances,
+            },
+        )
     finally:
         _voice_set_option_best_effort(control, session.target_role, _VOICE_PROCESSING_OPTION, "0")
     session.utterances += 1
     VOICE_SESSIONS.update(session)
-    return {"inserted": True, "target_role": session.target_role, "utterances": session.utterances}
+    return {
+        **result,
+        "inserted": result.get("insert_confirmed", False),
+        "target_role": session.target_role,
+        "utterances": session.utterances,
+    }
 
 
 def _h_voice_ship(control, params):

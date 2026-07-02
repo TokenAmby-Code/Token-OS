@@ -4,10 +4,10 @@ Regression for the typing-guard-hold-pierce P0: an enforce-action that sets a
 process-global ``TMUX_SEND_GATE_ALLOW`` sanctioned override (e.g. a
 deferred-timeout Custodes nag, main.py ``custodes_enforcement_deferred_timeout``)
 pierced the Emperor's live keystroke lock. The send gate only yields a sanctioned
-override back to a human lock for the daemon's OWN two thread-local holder reasons
-(``tmuxctld-send-holder`` / ``tmuxctl-submit-transaction``); ANY other override
-reason — including every enforce-action env override — sailed straight through the
-typing guard and clobbered active typing.
+override back to a human lock for the daemon's OWN thread-local transaction reasons
+(``tmuxctld-send-holder`` / ``tmuxctl-submit-transaction`` / direct-user append);
+ANY other override reason — including every enforce-action env override — sailed
+straight through the typing guard and clobbered active typing.
 
 These tests pin the daemon chokepoint contract with NO live tmux: the pane's
 human ON/PENDING lock is mocked via the send_gate option primitives, and the
