@@ -2070,7 +2070,17 @@ def _h_hook_wrapperstart(control, params):
 
 
 def _h_close_pane(control, params):
-    return control.close_pane(_s(params, "pane"), timeout=_f(params, "timeout", 3.0))
+    # Resolve a canonical id (e.g. ``mechanicus:1``) to its physical ``%NN`` FIRST,
+    # exactly as _h_pane_live does. close_pane's tmux probes only understand real
+    # pane handles; handed a canonical id, ``display-message -t mechanicus:1`` misses
+    # and close_pane reports a bogus ``already_closed`` while the pane is still alive
+    # (the #314-class stale-handle failure, liveness.py). A caller — including the
+    # husk reaper — trusting that ``already_closed`` would believe a pane was reaped
+    # when it was not. ``current`` is left for close_pane's own resolution.
+    pane = _s(params, "pane")
+    if pane and pane != "current":
+        pane = _resolve_physical_pane_or_gate(control, pane)
+    return control.close_pane(pane, timeout=_f(params, "timeout", 3.0))
 
 
 def _h_close(control, params):

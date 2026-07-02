@@ -774,22 +774,21 @@ class TmuxControlPlane:
                 "pane_label": pane_label,
             }
 
-        if policy is None:
-            # No standing-seat policy: a pre-allocated palace/somnium SLOT or a
-            # dynamically-created WORKER. Hand to the unified pane-class teardown
-            # router — the same dispatcher WrapperEnd uses — so a slot is cleared
-            # IN PLACE (preserved, returned to the freelist) and only a worker is
-            # culled. This is the crash/death entry half of that one decision.
-            return self.teardown_pane(pane_id, pane_label=pane_label, source="pane-died")
-
-        # FILL_IF_ROW (stack worker): reconciled by the stack sweep / the bash
-        # mechanicus pane-died branch, never here.
-        return {
-            "ok": True,
-            "action": "ignored",
-            "reason": f"not_must_fill:{pane_label or pane_type or 'unknown'}",
-            "pane_label": pane_label,
-        }
+        # Not a must-fill seat. Three sub-cases, ONE decision — all hand to the
+        # unified pane-class teardown router (the SAME dispatcher WrapperEnd uses):
+        #   * policy is None       — a pre-allocated palace/somnium SLOT or a
+        #     dynamically-created WORKER.
+        #   * FILL_IF_ROW          — a mechanicus stack worker whose pane just died.
+        # A dying stack worker is a dead HUSK, not a seat to hold open: leaving it
+        # behind is the "Pane is dead" graveyard this pane-died event exists to
+        # prevent (it accumulates until a human cull and risks a tmux geometry
+        # allocation failure). The router culls a dead WORKER/stack-worker husk,
+        # clears a palace/somnium SLOT in place (PRESERVED — returned to the
+        # freelist, never culled), and preserves a PERPETUAL singleton for the
+        # caller to revive. ``reap_dead_husk`` only kills a pane tmux confirms
+        # dead, so a still-live pane is never a collateral kill and a singleton is
+        # protected by ``classify_pane`` (PERPETUAL) even if it slips through here.
+        return self.teardown_pane(pane_id, pane_label=pane_label, source="pane-died")
 
     def teardown_pane(
         self,

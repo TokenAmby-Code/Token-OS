@@ -100,20 +100,51 @@ def test_handle_event_persona_seat_reseats_via_assert_instance() -> None:
     assert out["pane_label"] == "council:custodes"
 
 
-def test_handle_event_fill_if_row_stack_worker_is_ignored() -> None:
-    # A FILL_IF_ROW stack worker is reconciled by the stack sweep / the bash
-    # mechanicus pane-died branch — handle_event no-ops it (never reaches router).
-    control = _control({"@PANE_ID": "mechanicus:3", "@PANE_TYPE": "stack-worker"})
+def test_handle_event_stack_worker_husk_is_culled() -> None:
+    # A dispatched mechanicus worker carries @PANE_TYPE=stack-worker (FILL_IF_ROW).
+    # When its pane dies (remain-on-exit husk), the pane-died event MUST cull the
+    # husk — not leave it for a manual cull. This is the dead-pane reaping gap:
+    # the husk graveyard accumulated because handle_event used to no-op stack
+    # workers. It now routes them through the unified teardown router (WORKER cull).
+    adapter = RouterAdapter(
+        window_name="mechanicus",
+        pane_dead=True,
+        options={"@PANE_ID": "mechanicus:3", "@PANE_TYPE": "stack-worker"},
+    )
+    control = TmuxControlPlane(adapter=adapter)
 
-    def fake_resolve(adapter, target, session_name=None):
+    def fake_resolve(a, target, session_name=None):
         return SimpleNamespace(pane_id="%4", pane_role="mechanicus:3")
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(service, "resolve_pane", fake_resolve)
         out = control.handle_event("pane-died", pane="mechanicus:3")
 
-    assert out["action"] == "ignored"
-    assert "not_must_fill" in out["reason"]
+    assert out["action"] == "culled"
+    assert out["pane_class"] == "worker"
+    assert adapter.killed is True
+
+
+def test_handle_event_live_stack_worker_is_not_killed() -> None:
+    # Defense-in-depth: reap_dead_husk only kills a pane tmux confirms dead. A
+    # stack worker whose pane is still LIVE (pane-died misfire / race) must never
+    # be a collateral kill.
+    adapter = RouterAdapter(
+        window_name="mechanicus",
+        pane_dead=False,
+        options={"@PANE_ID": "mechanicus:3", "@PANE_TYPE": "stack-worker"},
+    )
+    control = TmuxControlPlane(adapter=adapter)
+
+    def fake_resolve(a, target, session_name=None):
+        return SimpleNamespace(pane_id="%4", pane_role="mechanicus:3")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(service, "resolve_pane", fake_resolve)
+        out = control.handle_event("pane-died", pane="mechanicus:3")
+
+    assert out["pane_class"] == "worker"
+    assert adapter.killed is False  # live pane preserved
 
 
 class RouterAdapter(FakeAdapter):
@@ -273,3 +304,110 @@ def test_reconcile_route_returns_results_envelope() -> None:
         assert len(payload["result"]["results"]) == len(assertions.PERSONA_LABELS)
     finally:
         server.shutdown()
+
+
+# -- /reconcile husk-safety (wrapper ledger) ---------------------------------
+
+from tmuxctl.wrapper_ledger import _SCAN_SEP, WrapperLedger  # noqa: E402
+
+
+class _LedgerScanAdapter:
+    """Adapter stub whose list-panes scan returns crafted 9-field ledger lines."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def run(self, *args, allow_failure: bool = False) -> str:
+        if args[:2] == ("list-panes", "-a"):
+            return "\n".join(self._lines)
+        return ""
+
+
+def _scan_line(*, wrapper_id: str, instance_id: str, pane_id: str, pane_dead: bool) -> str:
+    # wrapper_id, legacy_wrapper_id, instance_id, persona, pane_positional_id,
+    # engine, working_dir, born_epoch, pane_dead
+    return _SCAN_SEP.join(
+        [wrapper_id, "", instance_id, "", pane_id, "claude", "/tmp", "0", "1" if pane_dead else "0"]
+    )
+
+
+def test_reconcile_skips_dead_husk_and_never_reopens_hollow_row(tmp_path) -> None:
+    # A dead remain-on-exit husk is still listed by `list-panes -a` and may still
+    # carry a stale @TOKEN_API_WRAPPER_ID while its @INSTANCE_ID was scrubbed.
+    # /reconcile must NOT re-derive an OPEN row for it (the split-brain the reaper
+    # closes) — only the genuinely live wrapper survives as OPEN.
+    ledger = WrapperLedger(path=tmp_path / "ledger.json")
+    adapter = _LedgerScanAdapter(
+        [
+            _scan_line(
+                wrapper_id="w-live", instance_id="i-live", pane_id="mechanicus:1", pane_dead=False
+            ),
+            _scan_line(wrapper_id="w-husk", instance_id="", pane_id="mechanicus:2", pane_dead=True),
+        ]
+    )
+    out = ledger.reconcile_from_tmux(adapter)
+
+    open_wrappers = {row.wrapper_id for row in ledger.rows(include_closed=False)}
+    assert "w-live" in open_wrappers
+    assert "w-husk" not in open_wrappers  # dead husk never becomes a hollow OPEN row
+    assert out["open_rows"] == 1
+
+
+def test_reconcile_prunes_prior_open_row_when_pane_is_now_a_dead_husk(tmp_path) -> None:
+    # A wrapper that was OPEN and whose pane has since died to a husk must be pruned,
+    # not re-opened, on the next reconcile.
+    ledger = WrapperLedger(path=tmp_path / "ledger.json")
+    ledger.reconcile_from_tmux(
+        _LedgerScanAdapter(
+            [_scan_line(wrapper_id="w1", instance_id="i1", pane_id="mechanicus:5", pane_dead=False)]
+        )
+    )
+    assert "w1" in {r.wrapper_id for r in ledger.rows(include_closed=False)}
+    out = ledger.reconcile_from_tmux(
+        _LedgerScanAdapter(
+            [_scan_line(wrapper_id="w1", instance_id="", pane_id="mechanicus:5", pane_dead=True)]
+        )
+    )
+    assert "w1" not in {r.wrapper_id for r in ledger.rows(include_closed=False)}
+    assert out["open_rows"] == 0
+
+
+# -- close-pane canonical-id resolution (#314-class stale handle) -------------
+
+
+def test_h_close_pane_resolves_canonical_id_before_close() -> None:
+    # _h_close_pane must resolve a canonical id (mechanicus:1) to its physical %NN
+    # before calling close_pane, so tmux gets a matching handle and `already_closed`
+    # is truthful — the reaper must not believe a still-live pane was reaped.
+    seen = {}
+
+    class _Ctrl:
+        adapter = object()
+
+        def close_pane(self, pane, *, timeout=3.0):
+            seen["pane"] = pane
+            seen["timeout"] = timeout
+            return {"status": "closed", "pane": pane}
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(daemon, "resolve_to_physical", lambda adapter, pane: "%42")
+        out = daemon._h_close_pane(_Ctrl(), {"pane": "mechanicus:1", "timeout": "2.5"})
+
+    assert seen["pane"] == "%42"  # resolved, not the raw canonical id
+    assert seen["timeout"] == 2.5
+    assert out["status"] == "closed"
+
+
+def test_h_close_pane_passes_physical_id_through_untouched() -> None:
+    seen = {}
+
+    class _Ctrl:
+        adapter = object()
+
+        def close_pane(self, pane, *, timeout=3.0):
+            seen["pane"] = pane
+            return {"status": "closed", "pane": pane}
+
+    # A raw %NN needs no resolution and must not be gated.
+    daemon._h_close_pane(_Ctrl(), {"pane": "%7"})
+    assert seen["pane"] == "%7"
