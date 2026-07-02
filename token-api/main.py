@@ -20421,6 +20421,229 @@ async def _ops_read_instances(now: datetime) -> dict:
     }
 
 
+def _ops_graph_add_node(nodes: dict[str, dict], node: dict) -> None:
+    nodes.setdefault(node["id"], node)
+
+
+def _ops_graph_add_edge(edges: dict[str, dict], edge: dict) -> None:
+    edges.setdefault(edge["id"], edge)
+
+
+async def _ops_read_active_fleet_graph(graph_name: str) -> dict:
+    """Read model for the ops cockpit's first live relationship graph.
+
+    Scope is intentionally narrow: active fleet topology only. The frontend still
+    owns rendering/filtering; this endpoint replaces the mocked graph with the
+    current backend facts for instances, host devices, session-doc bindings, live
+    pane bindings, and canonical chapter-command relationships.
+    """
+
+    normalized = (graph_name or "").strip().lower().replace("_", "-")
+    if normalized not in {"active", "active-fleet"}:
+        raise HTTPException(status_code=404, detail=f"Unknown ops graph: {graph_name}")
+
+    now = datetime.now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.*,
+                   COALESCE(p.slug, 'astartes') AS persona_slug,
+                   p.display_name AS persona_display_name,
+                   sd.title AS session_doc_title,
+                   sd.file_path AS session_doc_path,
+                   sd.status AS session_doc_status,
+                   sd.project AS session_doc_project
+            FROM instances ci
+            LEFT JOIN personas p ON p.id = ci.persona_id
+            LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+            WHERE ci.status NOT IN ('stopped', 'archived')
+            ORDER BY ci.device_id ASC, ci.last_activity DESC
+            LIMIT 240
+            """
+        )
+        instance_rows = [dict(row) for row in await cursor.fetchall()]
+
+        device_cursor = await db.execute("SELECT * FROM devices")
+        device_rows = {row["id"]: dict(row) for row in await device_cursor.fetchall()}
+
+    live_panes = {p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]}
+    active_instance_ids = {str(row.get("id")) for row in instance_rows if row.get("id")}
+
+    nodes: dict[str, dict] = {}
+    edges: dict[str, dict] = {}
+
+    for inst in instance_rows:
+        instance_id = str(inst.get("id"))
+        instance_node_id = f"instance:{instance_id}"
+        device_id = inst.get("device_id")
+        session_doc_id = inst.get("session_doc_id")
+        pane = live_panes.get(instance_id)
+        status = inst.get("status") or "unknown"
+        age_seconds = _ops_seconds_since(
+            inst.get("last_activity") or inst.get("created_at"), now=now
+        )
+
+        if device_id:
+            device = device_rows.get(device_id, {})
+            device_node_id = f"device:{device_id}"
+            _ops_graph_add_node(
+                nodes,
+                {
+                    "id": device_node_id,
+                    "type": "device",
+                    "label": device.get("name") or device_id,
+                    "subtitle": device.get("type") or device_id,
+                    "status": "active",
+                    "group": "fleet",
+                    "data": {
+                        "device_id": device_id,
+                        "tailscale_ip": device.get("tailscale_ip"),
+                        "notification_method": device.get("notification_method"),
+                        "tts_engine": device.get("tts_engine"),
+                    },
+                },
+            )
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"hosts:{device_id}:{instance_id}",
+                    "source": device_node_id,
+                    "target": instance_node_id,
+                    "type": "hosts",
+                    "directed": True,
+                    "label": "hosts",
+                    "status": status,
+                },
+            )
+
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": instance_node_id,
+                "type": "instance",
+                "label": _ops_display_name(inst),
+                "subtitle": " · ".join(
+                    part
+                    for part in (
+                        inst.get("persona_slug") or inst.get("engine"),
+                        inst.get("rank"),
+                        inst.get("device_id"),
+                    )
+                    if part
+                ),
+                "status": status,
+                "group": inst.get("persona_slug") or "unassigned",
+                "weight": inst.get("zealotry") or 4,
+                "data": {
+                    "instance_id": instance_id,
+                    "engine": inst.get("engine"),
+                    "working_dir": inst.get("working_dir"),
+                    "created_at": inst.get("created_at"),
+                    "last_activity": inst.get("last_activity"),
+                    "age_seconds": age_seconds,
+                    "commander_type": inst.get("commander_type"),
+                    "commander_id": inst.get("commander_id"),
+                    "is_subagent": bool(inst.get("is_subagent") or 0),
+                    "workflow_state": inst.get("workflow_state"),
+                    "next_required_action": inst.get("next_required_action"),
+                },
+            },
+        )
+
+        if session_doc_id is not None:
+            doc_node_id = f"session_doc:{session_doc_id}"
+            doc_path = inst.get("session_doc_path")
+            _ops_graph_add_node(
+                nodes,
+                {
+                    "id": doc_node_id,
+                    "type": "session_doc",
+                    "label": inst.get("session_doc_title")
+                    or (Path(str(doc_path)).stem if doc_path else f"session-doc-{session_doc_id}"),
+                    "subtitle": doc_path,
+                    "status": inst.get("session_doc_status") or "unknown",
+                    "group": inst.get("session_doc_project"),
+                    "data": {
+                        "session_doc_id": session_doc_id,
+                        "path": doc_path,
+                        "project": inst.get("session_doc_project"),
+                    },
+                },
+            )
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"bound_to:{instance_id}:{session_doc_id}",
+                    "source": instance_node_id,
+                    "target": doc_node_id,
+                    "type": "bound_to",
+                    "directed": True,
+                    "label": "bound",
+                    "status": inst.get("session_doc_status") or status,
+                    "data": {"binding_source": inst.get("continuity_binding_source")},
+                },
+            )
+
+        if pane:
+            pane_id = pane.get("pane_id")
+            if pane_id:
+                pane_node_id = f"pane:{pane_id}"
+                _ops_graph_add_node(
+                    nodes,
+                    {
+                        "id": pane_node_id,
+                        "type": "live_pane",
+                        "label": pane.get("pane_label") or pane.get("pane_role") or pane_id,
+                        "subtitle": pane_id,
+                        "status": "live",
+                        "group": inst.get("device_id"),
+                        "data": {
+                            "pane_id": pane_id,
+                            "pane_label": pane.get("pane_label"),
+                            "pane_role": pane.get("pane_role"),
+                            "current_command": pane.get("current_command"),
+                        },
+                    },
+                )
+                _ops_graph_add_edge(
+                    edges,
+                    {
+                        "id": f"runs_on:{instance_id}:{pane_id}",
+                        "source": instance_node_id,
+                        "target": pane_node_id,
+                        "type": "runs_on",
+                        "directed": True,
+                        "label": "runs on",
+                        "status": "live",
+                    },
+                )
+
+        if inst.get("commander_type") == "chapter":
+            commander_id = str(inst.get("commander_id") or "")
+            if commander_id and commander_id in active_instance_ids and commander_id != instance_id:
+                _ops_graph_add_edge(
+                    edges,
+                    {
+                        "id": f"commands:{commander_id}:{instance_id}",
+                        "source": f"instance:{commander_id}",
+                        "target": instance_node_id,
+                        "type": "commands",
+                        "directed": True,
+                        "label": "commands",
+                        "status": status,
+                    },
+                )
+
+    return {
+        "graph": "active-fleet",
+        "generated_at": now.isoformat(),
+        "layout_hint": "dagre",
+        "nodes": list(nodes.values()),
+        "edges": list(edges.values()),
+    }
+
+
 async def _ops_read_events() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -21636,6 +21859,12 @@ async def ops_ui_asset(asset_path: str):
 async def get_ops_timer_history(window: str = "6h", bucket: str = "60s"):
     """Live timer history for the ops cockpit graph."""
     return await _ops_read_timer_history(window=window, bucket=bucket)
+
+
+@app.get("/api/ui/ops/graph/{graph_name}")
+async def get_ops_graph(graph_name: str):
+    """Typed node/edge read model for ops cockpit relationship graphs."""
+    return await _ops_read_active_fleet_graph(graph_name)
 
 
 @app.get("/api/ui/ops/state")

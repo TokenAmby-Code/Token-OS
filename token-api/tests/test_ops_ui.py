@@ -142,6 +142,67 @@ def test_ops_status_returns_expected_top_level_keys(client, app_env) -> None:
     }
 
 
+def test_ops_active_fleet_graph_returns_live_relationships(client, app_env, monkeypatch) -> None:
+    instance_id = str(uuid.uuid4())
+    conn = sqlite3.connect(app_env.db_path)
+    doc_id = conn.execute(
+        """INSERT INTO session_documents
+           (title, file_path, project, status, created_at, updated_at)
+           VALUES ('Ops Graph Doc', 'Sessions/ops-graph-doc.md', 'ops', 'active',
+                   '2026-05-25T10:00:00', '2026-05-25T10:00:00')"""
+    ).lastrowid
+    conn.execute(
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id,
+            status, engine, created_at, last_activity, session_doc_id)
+           VALUES (?, 'ops-graph-instance', '/tmp/ops', 'local', 'Mac-Mini',
+                   'working', 'codex',
+                   '2026-05-25T10:00:00', '2026-05-25T10:01:00', ?)""",
+        (instance_id, doc_id),
+    )
+    conn.commit()
+    conn.close()
+
+    async def _live_agent_panes():
+        return [
+            {
+                "instance_id": instance_id,
+                "pane_id": "%42",
+                "pane_label": "ops-pane",
+                "pane_role": "codex",
+                "current_command": "codex",
+            }
+        ]
+
+    monkeypatch.setattr(app_env.main, "_live_agent_panes", _live_agent_panes)
+
+    resp = client.get("/api/ui/ops/graph/active-fleet")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["graph"] == "active-fleet"
+    assert body["generated_at"]
+    assert body["layout_hint"] == "dagre"
+
+    node_ids = {node["id"] for node in body["nodes"]}
+    assert f"instance:{instance_id}" in node_ids
+    assert "device:Mac-Mini" in node_ids
+    assert f"session_doc:{doc_id}" in node_ids
+    assert "pane:%42" in node_ids
+
+    edges = {(edge["source"], edge["target"], edge["type"]) for edge in body["edges"]}
+    assert ("device:Mac-Mini", f"instance:{instance_id}", "hosts") in edges
+    assert (f"instance:{instance_id}", f"session_doc:{doc_id}", "bound_to") in edges
+    assert (f"instance:{instance_id}", "pane:%42", "runs_on") in edges
+
+    alias = client.get("/api/ui/ops/graph/active")
+    assert alias.status_code == 200, alias.text
+    alias_body = alias.json()
+    assert alias_body["graph"] == "active-fleet"
+    assert {node["id"] for node in alias_body["nodes"]} == node_ids
+    assert {edge["id"] for edge in alias_body["edges"]} == {edge["id"] for edge in body["edges"]}
+
+
 def test_ops_source_freshness_marks_stale_phone_heartbeat(client, app_env, monkeypatch) -> None:
     monkeypatch.setitem(
         app_env.main.PHONE_HEARTBEAT,
