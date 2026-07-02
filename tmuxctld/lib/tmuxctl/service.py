@@ -336,6 +336,22 @@ class TmuxControlPlane:
                 "live_agent": bool(row.engine),
                 "ledger": row.as_dict(),
             }
+        try:
+            from .resolver import resolve_instance as resolve_instance_from_tmux
+
+            resolved = resolve_instance_from_tmux(self.adapter, instance_id)
+            if resolved.found:
+                pane_role = canonical_pane_role(resolved.pane_role or "")
+                return {
+                    "instance_id": instance_id,
+                    "pane_id": pane_role,
+                    "pane_role": pane_role,
+                    "found": True,
+                    "agent": "auto",
+                    "live_agent": False,
+                }
+        except Exception:
+            pass
         return {
             "instance_id": instance_id,
             "pane_id": "",
@@ -369,6 +385,13 @@ class TmuxControlPlane:
                 "found": bool(row.instance_id),
                 "ledger": row.as_dict(),
             }
+        try:
+            target = self._resolve_current(pane)
+            instance_id = self.adapter.show_pane_option(target, "@INSTANCE_ID").strip()
+            if instance_id:
+                return {"pane": target, "instance_id": instance_id, "found": True}
+        except Exception:
+            pass
         return {"pane": pane_positional_id, "instance_id": "", "found": False}
 
     def ledger_upsert(
@@ -862,13 +885,14 @@ class TmuxControlPlane:
             looks_like_dispatch_launcher_payload,
         )
 
+        physical_pane = pane if pane.startswith("%") else resolve_to_physical(self.adapter, pane)
         if looks_like_dispatch_launcher_payload(text):
-            assert_dispatch_target_available(self.adapter, pane)
+            assert_dispatch_target_available(self.adapter, physical_pane)
         if not submit:
-            self.insert_text(pane, text)
-            return {"status": "inserted", "pane": pane}
-        self.adapter.send_text_then_submit(pane, text, clear_prompt=clear_prompt)
-        return {"status": "submitted", "pane": pane}
+            self.insert_text(physical_pane, text)
+            return {"status": "inserted", "pane": pane, "physical_pane": physical_pane}
+        self.adapter.send_text_then_submit(physical_pane, text, clear_prompt=clear_prompt)
+        return {"status": "submitted", "pane": pane, "physical_pane": physical_pane}
 
     def stack_add(
         self, base: str, *, cwd: str | None = None, session: str = "main", focus: bool = True

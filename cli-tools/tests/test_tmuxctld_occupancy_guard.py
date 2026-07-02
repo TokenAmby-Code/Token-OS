@@ -13,18 +13,44 @@ from tmuxctl import daemon
 
 
 class SingletonAdapter:
+    pane_id = "%3"
+    pane_role = "legion:custodes"
+    window_name = "legion"
+
     def __init__(self) -> None:
         self.sends: list[tuple[str, ...]] = []
 
     def list_sessions(self) -> list:
         return []
 
-    def _resolve_pane_target_arg(self, pane: str) -> str:
-        return "%3"
+    def current_session_name(self) -> str:
+        return "main"
+
+    def list_windows(self, session_name: str) -> list[dict[str, str]]:
+        return [{"window_index": "1"}]
+
+    def list_panes(self, target: str) -> list[dict[str, str]]:
+        return [
+            {
+                "pane_id": self.pane_id,
+                "session_name": "main",
+                "window_index": "1",
+                "window_name": self.window_name,
+                "pane_index": "0",
+                "width": "80",
+                "height": "24",
+                "current_command": "zsh",
+                "tty": "/dev/ttys000",
+                "active": "1",
+            }
+        ]
+
+    def show_window_option(self, target: str, option: str) -> str:
+        return ""
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[0] == "display-message":
-            return "%3\t1\t\tlegion:custodes\tlegion\t999"
+            return f"{self.pane_id}\t1\t\t{self.pane_role}\t{self.window_name}\t999"
         if args[0] == "send-keys":
             self.sends.append(tuple(args))
             return ""
@@ -34,13 +60,19 @@ class SingletonAdapter:
         self.sends.append(("send-keys", "-t", target, *keys))
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@PANE_ID":
+            return self.pane_role
         return ""
 
 
 class EmptyWorkerAdapter(SingletonAdapter):
+    pane_id = "%9"
+    pane_role = "mechanicus:1"
+    window_name = "mechanicus"
+
     def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[0] == "display-message":
-            return "%9\t1\t\tmechanicus:1\tmechanicus\t1000"
+            return f"{self.pane_id}\t1\t\t{self.pane_role}\t{self.window_name}\t1000"
         return super().run(*args, allow_failure=allow_failure)
 
 

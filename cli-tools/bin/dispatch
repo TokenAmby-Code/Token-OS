@@ -1540,6 +1540,70 @@ if [[ -n "$RESUME_ID" ]]; then
   fi
 fi
 
+tmuxctld_result() {
+  # Return the tmuxctld {ok:true,result:...} payload as a shell scalar/JSON.
+  # This is dispatch's daemon-native replacement for cold `tmuxctl` subprocesses
+  # on the launch path. tmuxctld-ping owns transport; dispatch only unwraps the
+  # standard envelope so it can learn the newly allocated canonical pane id.
+  local response
+  if ! command -v tmuxctld-ping >/dev/null 2>&1; then
+    return 127
+  fi
+  response="$(TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-60}" tmuxctld-ping "$@")" || return $?
+  TMUXCTLD_RESPONSE="$response" python3 - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("TMUXCTLD_RESPONSE", "")
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError:
+    # Test fakes may return the bare scalar. Production tmuxctld always returns
+    # the standard envelope.
+    sys.stdout.write(raw)
+    raise SystemExit(0)
+
+if not isinstance(payload, dict) or not payload.get("ok"):
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    message = err.get("message") or raw
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+result = payload.get("result", "")
+if isinstance(result, (dict, list)):
+    sys.stdout.write(json.dumps(result, separators=(",", ":")))
+elif result is None:
+    sys.stdout.write("")
+else:
+    sys.stdout.write(str(result))
+PY
+}
+
+tmuxctld_stack_dispatch() {
+  local base="$1" session="$2" cwd="$3" command_text="$4"
+  tmuxctld_result POST /stack/dispatch \
+    base="$base" \
+    session="$session" \
+    cwd="$cwd" \
+    focus=false \
+    command="$command_text"
+}
+
+tmuxctld_pane_live() {
+  local pane="$1" result
+  result="$(tmuxctld_result POST /pane-live pane="$pane")" || return 2
+  TMUXCTLD_RESULT="$result" python3 - <<'PY'
+import json
+import os
+
+try:
+    payload = json.loads(os.environ.get("TMUXCTLD_RESULT", ""))
+except json.JSONDecodeError:
+    raise SystemExit(2)
+raise SystemExit(0 if payload.get("live") else 1)
+PY
+}
+
 # Materialize a physical %NNN from a canonical page:index id immediately before a
 # raw `tmux ... -t` syscall — the only place a physical id is allowed to exist.
 # Everything above this line speaks canonical; this is the irreducible floor where
@@ -1549,10 +1613,8 @@ fi
 materialize_physical_pane() {
   local target="$1" resolved
   [[ -n "$target" ]] || return 0
-  if command -v tmuxctl >/dev/null 2>&1; then
-    resolved="$(tmuxctl resolve-pane --format physical "$target" 2>/dev/null || true)"
-    [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
-  fi
+  resolved="$(tmuxctld_result GET /resolve-pane target="$target" format=physical 2>/dev/null || true)"
+  [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
   printf '%s' "$target"
 }
 
@@ -1998,19 +2060,17 @@ dispatch_pane_agent_live() {
   # THE success criterion: is a live Claude/Codex agent process running in the
   # pane right now? Engine-agnostic and faction-agnostic — read from the process
   # tree, NOT a DB stamp (which lags, and for codex may never land). Routed
-  # through `tmuxctl pane-live` so it reuses the same battle-tested walk that
-  # gates close-lifecycle reaps, and so it is cleanly mockable in tests. Falls
-  # back to an in-process ps walk only when tmuxctl is unavailable.
-  local pane="$1"
+  # through tmuxctld so it reuses the same battle-tested walk that gates
+  # close-lifecycle reaps without shelling the retired cold tmuxctl CLI. Falls
+  # back to an in-process ps walk only when daemon transport is unavailable.
+  local pane="$1" live_rc pane_pid
   [[ -n "$pane" ]] || return 1
-  if command -v tmuxctl >/dev/null 2>&1; then
-    # tmuxctl's exit code IS the verdict (0 live / non-0 not-live). Trust it
-    # outright: do NOT fall back to ps on a not-live answer, or a coincidental
-    # match would mask a genuinely dead pane.
-    tmuxctl pane-live "$pane" >/dev/null 2>&1
-    return $?
-  fi
-  local pane_pid
+  tmuxctld_pane_live "$pane" >/dev/null 2>&1
+  live_rc=$?
+  case "$live_rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
   pane_pid="$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null || true)"
   pane_has_active_agent_process "$pane_pid"
 }
@@ -2091,14 +2151,7 @@ refuse_if_worktree_has_live_agent() {
   # enumerates the operator's LIVE tmux server. Default (unset) = enabled.
   [[ "${DISPATCH_WORKTREE_DUP_CHECK:-1}" == "0" ]] && return 0
   [[ "${TOKEN_API_DISPATCH_FORCE_OCCUPIED:-}" == "1" ]] && return 0
-  if ! command -v tmuxctl >/dev/null 2>&1; then
-    # Fail open, but VISIBLY: without tmuxctl we cannot verify the worktree is
-    # free, so the duplicate-corruption protection is off — say so rather than
-    # silently allowing a possible second agent into one worktree.
-    warn "dup-guard skipped: tmuxctl unavailable, cannot verify $dir is free of a live agent"
-    return 0
-  fi
-  matches="$(tmuxctl live-agents --dir "$dir" ${self_pane:+--exclude-pane "$self_pane"} 2>/dev/null || true)"
+  matches="$(tmuxctld_result POST /live-agents dir="$dir" ${self_pane:+exclude_pane="$self_pane"} 2>/dev/null || true)"
   [[ -n "$matches" ]] || return 0
   err "refusing to dispatch: a live agent is already running in the target worktree $dir:"
   while IFS= read -r line; do
@@ -2183,8 +2236,8 @@ if [[ "$WORKTREE_FRESHLY_CREATED" != true ]]; then
 fi
 
 if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
-  if ! command -v tmuxctl >/dev/null 2>&1; then
-    err "tmuxctl is required for target $TARGET"
+  if ! command -v tmuxctld-ping >/dev/null 2>&1; then
+    err "tmuxctld-ping is required for target $TARGET"
     exit 69
   fi
   session="main"
@@ -2198,7 +2251,7 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   # and the agent never launches.
   # Automated dispatch should not steal the operator's camera/focus. The new pane
   # is still addressable by @PANE_ID/Token-API metadata and can be focused explicitly.
-  pane_id="$(IMPERIUM_TMUX_AUTOMATION=1 tmuxctl stack dispatch "$stack" --session "$session" --cwd "$WORK_DIR" --no-focus --command "clear")"
+  pane_id="$(tmuxctld_stack_dispatch "$stack" "$session" "$WORK_DIR" "clear")"
   # The tmuxctl canonical-id campaign made `stack dispatch` print the canonical
   # page:index id (e.g. mechanicus:2). That id is the working identity from here
   # on — carried through env injection, stamping, and the launch send — and only

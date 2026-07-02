@@ -41,6 +41,32 @@ WRAPPER_ID="${TOKEN_API_WRAPPER_ID:-${TOKEN_API_WRAPPER_LAUNCH_ID:-$(token_wrapp
 WRAPPER_CHILD_PID=""
 WRAPPER_CLEANUP_DONE=0
 
+tmuxctld_result() {
+  local response
+  response="$(TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-60}" "${SCRIPT_DIR}/../bin/tmuxctld-ping" "$@")" || return $?
+  TMUXCTLD_RESPONSE="$response" python3 - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("TMUXCTLD_RESPONSE", "")
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError:
+    print(raw, file=sys.stderr)
+    sys.exit(1)
+if not payload.get("ok"):
+    err = payload.get("error", {})
+    print(err.get("message") or raw, file=sys.stderr)
+    sys.exit(1)
+result = payload.get("result", "")
+if isinstance(result, (dict, list)):
+    sys.stdout.write(json.dumps(result, separators=(",", ":")))
+elif result is not None:
+    sys.stdout.write(str(result))
+PY
+}
+
 wrapper_mode_cleanup() {
   :
 }
@@ -204,7 +230,7 @@ run_claude() {
       cmd+=" $(printf '%q' "$arg")"
     done
 
-    local dispatch_session="main" dispatch_base="$DISPATCH_TARGET_WINDOW" tmuxctl_bin pane_id
+    local dispatch_session="main" dispatch_base="$DISPATCH_TARGET_WINDOW" pane_id
     if [[ "$dispatch_base" == *:* ]]; then
       dispatch_session="${dispatch_base%%:*}"
       dispatch_base="${dispatch_base#*:}"
@@ -218,13 +244,13 @@ run_claude() {
         ;;
     esac
 
-    tmuxctl_bin="$(cd "${SCRIPT_DIR}/../bin" && pwd)/tmuxctl"
     pane_id="$(
-      IMPERIUM_TMUX_AUTOMATION=1 "$tmuxctl_bin" stack dispatch "$dispatch_base" \
-        --session "$dispatch_session" \
-        --cwd "$WORKING_DIR" \
-        --no-focus \
-        --command "$cmd" 2>/dev/null
+      tmuxctld_result POST /stack/dispatch \
+        base="$dispatch_base" \
+        session="$dispatch_session" \
+        cwd="$WORKING_DIR" \
+        focus=false \
+        command="$cmd" 2>/dev/null
     )" || {
       echo "failed to dispatch print-mode agent to $DISPATCH_TARGET_WINDOW" >&2
       exit 1

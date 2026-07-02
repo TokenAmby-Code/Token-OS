@@ -106,15 +106,30 @@ if $DRY_RUN; then
     log "session: $SESSION"
     log "window:  $WINDOW"
     log "command: $LAUNCH_CMD"
-    log "layout:  tmuxctl stack dispatch mechanicus"
+    log "layout:  tmuxctld /stack/dispatch mechanicus"
     exit 0
 fi
 
+PANE_RESPONSE="$(
+    TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-60}" "${SCRIPT_DIR}/tmuxctld-ping" \
+        POST /stack/dispatch \
+        base=mechanicus \
+        session="$SESSION" \
+        cwd="$HOME" \
+        command="$LAUNCH_CMD"
+)"
 PANE_ID="$(
-    PYTHONPATH="${TMUXCTLD_LIB}:${CLI_LIB}${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m tmuxctl.cli stack dispatch mechanicus \
-            --session "$SESSION" \
-            --cwd "$HOME" \
-            --command "$LAUNCH_CMD"
+    TMUXCTLD_RESPONSE="$PANE_RESPONSE" python3 - <<'PY'
+import json
+import os
+import sys
+
+payload = json.loads(os.environ.get("TMUXCTLD_RESPONSE", ""))
+if not payload.get("ok"):
+    err = payload.get("error", {})
+    print(err.get("message") or "tmuxctld stack dispatch failed", file=sys.stderr)
+    raise SystemExit(1)
+sys.stdout.write(str(payload.get("result") or ""))
+PY
 )"
 tmux display-message "Mechanicus dispatch prompt launched in ${PANE_ID}"

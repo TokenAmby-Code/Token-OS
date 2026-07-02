@@ -1044,6 +1044,8 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     env["TMUXCTL_LOG"] = str(tmuxctl_log)
     env["TMUX_LOG"] = str(tmux_log)
     env["TMUXCTLD_PING_LOG"] = str(ping_log)
+    env["TMUXCTLD_PING_STACK_DISPATCH_RESULT"] = "mechanicus:1"
+    env["TMUXCTLD_PING_RESOLVE_PHYSICAL"] = "%83"
     result = subprocess.run(
         [
             str(DISPATCH),
@@ -1093,15 +1095,13 @@ def test_dispatch_aspirant_dispatch_complete_metadata_enters_trials(tmp_path):
     assert "--session-doc" in result.stdout
     assert "--system-prompt-file" in result.stdout
     assert "--prompt-file" in result.stdout
-    launched = tmuxctl_log.read_text(encoding="utf-8", errors="replace")
-    assert "stack dispatch mechanicus --session main" in launched
-    # tmuxctl still spawns the pane with a throwaway `clear` warmup; the real
-    # `bash <staged>` launch is sent through tmuxctld using the canonical pane id.
-    assert "--command clear" in launched
-    assert "%83" not in launched
     tmux_text = tmux_log.read_text(encoding="utf-8", errors="replace")
     assert "send-keys" not in tmux_text
     ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    # tmuxctld spawns the pane with a throwaway `clear` warmup; the real
+    # `bash <staged>` launch is also sent through tmuxctld using the canonical pane id.
+    assert "POST /stack/dispatch base=mechanicus session=main" in ping_text
+    assert "command=clear" in ping_text
     assert "POST /send-text pane=mechanicus:1 text=bash " in ping_text
     assert "%83" not in ping_text
     staged_path = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1])
@@ -1196,6 +1196,8 @@ def test_dispatch_codex_aspirant_launch_respects_engine_without_claude_system_pr
     env["TMUXCTL_LOG"] = str(tmuxctl_log)
     env["TMUX_LOG"] = str(tmux_log)
     env["TMUXCTLD_PING_LOG"] = str(ping_log)
+    env["TMUXCTLD_PING_STACK_DISPATCH_RESULT"] = "mechanicus:3"
+    env["TMUXCTLD_PING_RESOLVE_PHYSICAL"] = "%84"
 
     result = subprocess.run(
         [
@@ -1524,7 +1526,8 @@ def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     assert "%77" in calls, f"physical pane option cleanup did not target %77; calls={calls}"
     ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
     assert "POST /send-text pane=mechanicus:2 text=bash " in ping_text
-    assert "%77" not in ping_text
+    send_lines = "\n".join(line for line in ping_text.splitlines() if "POST /send-text" in line)
+    assert "%77" not in send_lines
     staged_path = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1])
     content = staged_path.read_text(encoding="utf-8")
 
@@ -1573,6 +1576,8 @@ def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path: Path) -> Non
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env["TMUXCTLD_PING_LOG"] = str(ping_log)
+    env["TMUXCTLD_PING_STACK_DISPATCH_RESULT"] = "mechanicus:6"
+    env["TMUXCTLD_PING_RESOLVE_PHYSICAL"] = "%77"
 
     result = subprocess.run(
         [
@@ -1600,7 +1605,8 @@ def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path: Path) -> Non
     assert "-t" in calls and "%77" in calls, calls
     ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
     assert "POST /send-text pane=mechanicus:6 text=bash " in ping_text
-    assert "%77" not in ping_text
+    send_lines = "\n".join(line for line in ping_text.splitlines() if "POST /send-text" in line)
+    assert "%77" not in send_lines
     content = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1]).read_text(
         encoding="utf-8"
     )
@@ -1885,7 +1891,8 @@ def test_dispatch_stack_new_resolves_canonical_id_to_physical_pane(tmp_path: Pat
     )
     ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
     assert "POST /send-text pane=mechanicus:2 text=bash " in ping_text
-    assert "%77" not in ping_text
+    send_lines = "\n".join(line for line in ping_text.splitlines() if "POST /send-text" in line)
+    assert "%77" not in send_lines
     staged_path = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1])
     content = staged_path.read_text(encoding="utf-8")
 
@@ -1925,6 +1932,7 @@ def test_dispatch_stack_new_rejects_non_canonical_id(tmp_path: Path) -> None:
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["TMUXCTLD_PING_STACK_DISPATCH_RESULT"] = "%77"
 
     result = subprocess.run(
         [
@@ -2043,6 +2051,7 @@ def test_dispatch_stack_new_empty_tmuxctl_output_fails_with_clear_error(tmp_path
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["TMUXCTLD_PING_STACK_DISPATCH_RESULT"] = ""
 
     result = subprocess.run(
         [
@@ -2110,6 +2119,7 @@ def test_dispatch_stack_new_launch_failure_when_no_live_agent(tmp_path: Path) ->
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+    env["TMUXCTLD_PING_PANE_LIVE"] = "false"
 
     result = subprocess.run(
         [
@@ -2958,7 +2968,8 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
     assert "%77" in calls, f"physical pane option cleanup did not target %77; calls={calls}"
     ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
     assert "POST /send-text pane=mechanicus:2 text=bash " in ping_text
-    assert "%77" not in ping_text
+    send_lines = "\n".join(line for line in ping_text.splitlines() if "POST /send-text" in line)
+    assert "%77" not in send_lines
     staged = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1]).read_text(
         encoding="utf-8", errors="replace"
     )
@@ -3015,6 +3026,7 @@ def test_dispatch_refuses_to_stack_second_agent_into_live_worktree(tmp_path: Pat
     # holding work_dir so the dir counts as a worktree and the guard fires.
     # Include a trailing slash to pin normalization before the prefix check.
     env["IMPERIUM_WORKTREES_ROOT"] = f"{tmp_path}/"
+    env["TMUXCTLD_PING_LIVE_AGENTS"] = f"mechanicus:3\t%91\tcodex\t{work_dir}"
 
     result = subprocess.run(
         [
