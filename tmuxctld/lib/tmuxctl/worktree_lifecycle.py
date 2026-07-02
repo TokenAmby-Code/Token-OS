@@ -49,7 +49,14 @@ def cleanup_worktree_on_wrapper_end(
         return {**result, "reason": "detached_head"}
     result["branch"] = branch
 
-    dirty = _meaningful_dirty_entries(_git(path, "status", "--porcelain=v1"))
+    status_proc = _run_git(path, "status", "--porcelain=v1")
+    if status_proc.returncode != 0:
+        return {
+            **result,
+            "reason": "status_failed",
+            "stderr": status_proc.stderr.strip(),
+        }
+    dirty = _meaningful_dirty_entries(status_proc.stdout.strip())
     if dirty:
         return {**result, "reason": "dirty_worktree"}
 
