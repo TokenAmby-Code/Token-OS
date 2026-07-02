@@ -993,34 +993,50 @@ def _wait_for_insert_confirmation(
         except Exception as exc:
             log.debug("tmuxctld: insert confirmation capture failed pane=%s: %s", phys_pane, exc)
             last_capture = ""
-        if needle in last_capture:
+        # The needle is newline-collapsed (normalize_prompt_payload turns
+        # [\r\n]+ into a single space), but call sites send the raw, un-collapsed
+        # bytes, so capture-pane returns embedded newlines for any multi-line
+        # payload (e.g. forwarded Discord messages). Collapse the read-back the
+        # SAME way before matching so a genuine multi-line insert is not
+        # spuriously reported "unverified" — which would push callers to retry
+        # and risk duplicate inserts.
+        haystack = re.sub(r"[\r\n]+", " ", last_capture)
+        if needle in haystack:
             return True, last_capture
         if time.monotonic() >= deadline:
             return False, last_capture
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _hold_agent_guard(phys_pane: str, *, seconds: int) -> bool:
+def _hold_agent_guard(phys_pane: str, *, seconds: int) -> str | None:
+    """Acquire an AGENT guard and return the owner token (or ``None``).
+
+    The owner token MUST be threaded through ``thread_local_override(owner=...)``
+    and back into ``_release_agent_guard(owner=...)`` so ``send_gate.evaluate``'s
+    agent-kind pierce branch (which requires ``thread_owner == pane_owner``) can
+    pierce the guard we just installed, and so ``release`` can actually clear the
+    AGENT record it wrote. Dropping the token silently breaks self-pierce and
+    leaves the guard lingering until TTL expiry.
+    """
     try:
-        return bool(
-            typing_guard_state.hold(
-                typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
-                phys_pane,
-                seconds=seconds,
-                now=typing_guard_state.now_epoch(),
-            )
+        return typing_guard_state.hold(
+            typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+            phys_pane,
+            seconds=seconds,
+            now=typing_guard_state.now_epoch(),
         )
     except Exception as exc:  # tmux unreachable / no live server (e.g. unit tests)
         log.debug("tmuxctld: agent-guard hold skipped pane=%s: %s", phys_pane, exc)
-        return False
+        return None
 
 
-def _release_agent_guard(phys_pane: str) -> None:
+def _release_agent_guard(phys_pane: str, *, owner: str | None = None) -> None:
     try:
         typing_guard_state.release(
             typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
             phys_pane,
             now=typing_guard_state.now_epoch(),
+            owner=owner,
         )
     except Exception as exc:
         log.warning("tmuxctld: agent-guard release failed pane=%s: %s", phys_pane, exc)
@@ -1068,12 +1084,21 @@ def _insert_without_submit_pipeline(
         instance_id = ""
 
     hold_seconds = max(8, int(max(0.0, verify_timeout)) + 3)
-    held = _hold_agent_guard(phys_pane, seconds=hold_seconds)
+    owner_token = _hold_agent_guard(phys_pane, seconds=hold_seconds)
+    held = bool(owner_token)
     override_reason = "tmuxctld-direct-user" if direct_user else "tmuxctld-send-holder"
+    # Thread the owner token so send_gate can pierce our OWN AGENT guard. Without
+    # owner=, sanctioned_agent_owner() never matches the pane owner installed by
+    # hold(), and every literal send inside action() would be suppressed.
+    override_ctx = (
+        thread_local_override(override_reason, owner=owner_token)
+        if held
+        else contextlib.nullcontext()
+    )
     action_result: dict = {}
     send_exception: BaseException | None = None
     try:
-        with thread_local_override(override_reason):
+        with override_ctx:
             maybe_result = action()
             if isinstance(maybe_result, dict):
                 action_result = dict(maybe_result)
@@ -1085,7 +1110,7 @@ def _insert_without_submit_pipeline(
         raise
     finally:
         if held:
-            _release_agent_guard(phys_pane)
+            _release_agent_guard(phys_pane, owner=owner_token)
         if send_exception is not None:
             _SEND_IDEMPOTENCY.abort(operation_id)
 
@@ -2114,10 +2139,16 @@ def _h_mode_toggle(control, params):
         _SEND_IDEMPOTENCY.abort(operation_id)
         raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
 
-    held = _hold_agent_guard(phys_pane, seconds=8)
+    owner_token = _hold_agent_guard(phys_pane, seconds=8)
+    held = bool(owner_token)
+    override_ctx = (
+        thread_local_override("tmuxctld-send-holder", owner=owner_token)
+        if held
+        else contextlib.nullcontext()
+    )
     send_exception: BaseException | None = None
     try:
-        with thread_local_override("tmuxctld-send-holder"):
+        with override_ctx:
             delay_seconds = _f(params, "delay", 0.15)
             for index in range(presses):
                 control.adapter.send_keys(target_pane, "BTab")
@@ -2131,7 +2162,7 @@ def _h_mode_toggle(control, params):
         raise
     finally:
         if held:
-            _release_agent_guard(phys_pane)
+            _release_agent_guard(phys_pane, owner=owner_token)
         if send_exception is not None:
             _SEND_IDEMPOTENCY.abort(operation_id)
 
