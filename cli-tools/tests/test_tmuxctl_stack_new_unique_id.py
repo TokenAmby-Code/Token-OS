@@ -1,0 +1,219 @@
+"""Regression suite for the stack ``:new`` duplicate-canonical-id fault (Fault C).
+
+Emperor ruling (2026-07-02): ``new`` is a stateless launch alias, never a stored
+id. Two ``:new`` dispatches at a non-orchestrator stack page (reservists/mars/
+kreig) must each mint a *distinct* real ``{page}:{id}`` — never the shared
+``{base}:worker`` default label, never ``new`` itself — so ``talk``/``brief``
+resolve each worker unambiguously.
+
+Daemon/labeling tests never touch live tmux: fake pane ids + modeled window state.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+
+from tmuxctl.enums import GridState, PaneKind, WindowArchetype
+from tmuxctl.models import PaneSnapshot, WindowSnapshot, WorkspaceSnapshot
+from tmuxctl.resolver import resolve_pane_in_snapshot
+from tmuxctl.stack import add_stack_pane
+
+
+class FakeStackAdapter:
+    """Minimal multi-window tmux fake for the non-orchestrator stack path.
+
+    Models the base's spill windows and each window's panes (``pane_id`` +
+    ``@PANE_ID`` role) so the allocator's live-ledger scan can mint a unique
+    ordinal. Only the tmux verbs ``add_stack_pane`` touches are implemented.
+    """
+
+    def __init__(self, *, session: str = "main") -> None:
+        self.session = session
+        # window_name -> list of [pane_id, pane_role]
+        self.windows: dict[str, list[list[str]]] = {}
+        self.commands: list[tuple[str, ...]] = []
+        self._next_pane = 100
+
+    def _alloc_pane(self) -> str:
+        self._next_pane += 1
+        return f"%{self._next_pane}"
+
+    @staticmethod
+    def _win_of(target: str) -> str:
+        return target.split(":", 1)[1] if ":" in target else target
+
+    def role_of(self, pane_id: str) -> str:
+        for rows in self.windows.values():
+            for pane, role in rows:
+                if pane == pane_id:
+                    return role
+        return ""
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        self.commands.append(args)
+        cmd = args[0]
+        if cmd == "list-windows":
+            if args[-1] == "#{window_name}":
+                return "\n".join(self.windows.keys())
+            return ""
+        if cmd == "new-window":
+            name = args[args.index("-n") + 1]
+            pane = self._alloc_pane()
+            self.windows[name] = [[pane, ""]]
+            return ""
+        if cmd == "display-message":
+            fmt = args[-1]
+            target = args[args.index("-t") + 1] if "-t" in args else ""
+            if fmt == "#{pane_id}":
+                win = self._win_of(target)
+                rows = self.windows.get(win)
+                return f"{rows[0][0]}\n" if rows else "\n"
+            if fmt == "#{session_name}:#{window_name}":
+                return f"{self.session}:{self._win_of(target)}\n"
+            return ""
+        if cmd == "split-window":
+            target = args[args.index("-t") + 1]
+            win = self._win_of(target)
+            pane = self._alloc_pane()
+            self.windows.setdefault(win, []).append([pane, ""])
+            return f"{pane}\n"
+        if cmd == "list-panes":
+            target = args[args.index("-t") + 1]
+            win = self._win_of(target)
+            if args[-1] == "#{pane_id}\t#{@PANE_ID}":
+                return "\n".join(f"{p}\t{r}" for p, r in self.windows.get(win, []))
+            return ""
+        if cmd == "set-option" and "-p" in args:
+            target = args[args.index("-t") + 1]
+            option, value = args[-2], args[-1]
+            if option == "@PANE_ID":
+                for rows in self.windows.values():
+                    for row in rows:
+                        if row[0] == target:
+                            row[1] = value
+        return ""
+
+
+def _pane_id_assignments(adapter: FakeStackAdapter) -> list[str]:
+    """Every value written to a pane's ``@PANE_ID`` across the run."""
+    return [
+        cmd[-1]
+        for cmd in adapter.commands
+        if cmd[0] == "set-option" and "-p" in cmd and "@PANE_ID" in cmd
+    ]
+
+
+def test_two_reservists_new_dispatches_get_distinct_canonical_ids():
+    adapter = FakeStackAdapter()
+
+    p1 = add_stack_pane(adapter, "main", "reservists", cwd="/tmp", focus=False)  # type: ignore[arg-type]
+    p2 = add_stack_pane(adapter, "main", "reservists", cwd="/tmp", focus=False)  # type: ignore[arg-type]
+
+    role1 = adapter.role_of(p1)
+    role2 = adapter.role_of(p2)
+
+    assert role1 == "reservists:1"
+    assert role2 == "reservists:2"
+    assert role1 != role2
+    # Neither pane is stored under the shared default label or the launch alias.
+    for role in (role1, role2):
+        assert role != "reservists:worker"
+        assert not role.endswith(":worker")
+        assert "new" not in role
+
+
+def test_new_and_default_label_never_persisted_as_pane_id():
+    adapter = FakeStackAdapter()
+
+    add_stack_pane(adapter, "main", "reservists", cwd="/tmp", focus=False)  # type: ignore[arg-type]
+    add_stack_pane(adapter, "main", "reservists", cwd="/tmp", focus=False)  # type: ignore[arg-type]
+
+    assigned = _pane_id_assignments(adapter)
+    assert "reservists:worker" not in assigned
+    assert "reservists:new" not in assigned
+    assert "new" not in assigned
+    # Exactly the two distinct real ids were minted.
+    assert set(assigned) == {"reservists:1", "reservists:2"}
+
+
+def test_third_dispatch_reuses_lowest_free_ordinal_after_teardown():
+    adapter = FakeStackAdapter()
+
+    p1 = add_stack_pane(adapter, "main", "reservists", cwd="/tmp", focus=False)  # type: ignore[arg-type]
+    add_stack_pane(adapter, "main", "reservists", cwd="/tmp", focus=False)  # type: ignore[arg-type]
+
+    # Worker 1 exits: drop its pane from the modeled window state.
+    for rows in adapter.windows.values():
+        rows[:] = [row for row in rows if row[0] != p1]
+
+    p3 = add_stack_pane(adapter, "main", "reservists", cwd="/tmp", focus=False)  # type: ignore[arg-type]
+
+    # The freed ordinal is reclaimed rather than colliding with the live worker 2.
+    assert adapter.role_of(p3) == "reservists:1"
+
+
+def _reservists_pane(pane_id: str, role: str, pane_index: int) -> PaneSnapshot:
+    return PaneSnapshot(
+        pane_id=pane_id,
+        session_name="main",
+        window_index=7,
+        window_name="reservists",
+        pane_index=pane_index,
+        width=80,
+        height=20,
+        current_command="claude",
+        tty="/dev/ttys00",
+        pane_role=role,
+        grid_state=GridState.UNKNOWN,
+        pane_kind=PaneKind.UNKNOWN,
+        reserved=False,
+        active=pane_index == 0,
+    )
+
+
+def _reservists_workspace(role_a: str, role_b: str) -> WorkspaceSnapshot:
+    window = WindowSnapshot(
+        session_name="main",
+        window_index=7,
+        window_name="reservists",
+        archetype=WindowArchetype.UNKNOWN,
+        focused=True,
+        grid_expanded="",
+        grid_stash="",
+        side_expanded="",
+        panes=(
+            _reservists_pane("%87", role_a, 0),
+            _reservists_pane("%88", role_b, 1),
+        ),
+    )
+    return WorkspaceSnapshot(session_name="main", windows=(window,))
+
+
+def test_talk_brief_resolution_disambiguates_unique_worker_ids():
+    workspace = _reservists_workspace("reservists:1", "reservists:2")
+
+    r1 = resolve_pane_in_snapshot(workspace, "reservists:1")
+    r2 = resolve_pane_in_snapshot(workspace, "reservists:2")
+
+    assert r1.pane_id == "%87"
+    assert r2.pane_id == "%88"
+    assert r1.pane_id != r2.pane_id
+
+
+def test_duplicate_worker_label_is_the_ambiguity_unique_ids_prevent():
+    # The pre-fix symptom: both panes share reservists:worker, so the second pane
+    # is unreachable by canonical addressing (first-writer-wins in the index).
+    workspace = _reservists_workspace("reservists:worker", "reservists:worker")
+
+    resolved = resolve_pane_in_snapshot(workspace, "reservists:worker")
+
+    # Only one of the two live panes is addressable — that is the fault. Unique
+    # ids (asserted above) are what make both workers independently routable.
+    assert resolved.pane_id in {"%87", "%88"}
