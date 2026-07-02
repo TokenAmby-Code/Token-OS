@@ -6,7 +6,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl.resolver import resolve_instance
+from tmuxctl.resolver import instance_id_for_pane, resolve_instance
 from tmuxctl.service import TmuxControlPlane
 
 
@@ -73,9 +73,12 @@ def test_resolve_instance_canonicalizes_role():
 def test_service_resolve_instance_shape_found():
     plane = TmuxControlPlane(adapter=FakeAdapter(LIVE))
     out = plane.resolve_instance("uuid-somnium-ne")
+    # The service shape is canonical-role-first (the ledger-identity crusade): the
+    # tmux stamp fallback reports the canonical role as both pane_id and pane_role,
+    # never a raw %NN.
     assert out == {
         "instance_id": "uuid-somnium-ne",
-        "pane_id": "%29",
+        "pane_id": "somnium:NE",
         "pane_role": "somnium:NE",
         "found": True,
         "agent": "auto",
@@ -102,3 +105,52 @@ def test_resolve_instance_single_scan():
     resolve_instance(adapter, "uuid-palace-e")
     list_panes_calls = [c for c in adapter.calls if c[:2] == ("list-panes", "-a")]
     assert len(list_panes_calls) == 1
+
+
+# ── Reverse: pane -> live @INSTANCE_ID (the ack-verification key) ──────────────
+# Regression: a pane carrying a live stamp but absent from / unbound in the
+# wrapper ledger must still resolve to its instance_id. An empty result makes the
+# daemon ack sniffer return immediately and reports every delivered send as a
+# false ``unverified`` (the brief submit-ack false-negative).
+
+
+def test_instance_id_for_pane_resolves_public_role():
+    # A public page:id (never a valid `show-pane-option -t` target) resolves via
+    # the canonical-role match — the exact codex-worker case that returned "".
+    assert instance_id_for_pane(FakeAdapter(LIVE), "palace:N") == "uuid-palace-n"
+
+
+def test_instance_id_for_pane_resolves_physical_pane_id():
+    assert instance_id_for_pane(FakeAdapter(LIVE), "%29") == "uuid-somnium-ne"
+
+
+def test_instance_id_for_pane_unstamped_pane_is_empty():
+    # %43 is live but carries no @INSTANCE_ID — fail closed, never guess.
+    assert instance_id_for_pane(FakeAdapter([("%43", "", "palace:S")]), "palace:S") == ""
+
+
+def test_instance_id_for_pane_absent_pane_is_empty():
+    assert instance_id_for_pane(FakeAdapter(LIVE), "reservists:W") == ""
+
+
+def test_instance_id_for_pane_single_scan():
+    adapter = FakeAdapter(LIVE)
+    instance_id_for_pane(adapter, "palace:E")
+    list_panes_calls = [c for c in adapter.calls if c[:2] == ("list-panes", "-a")]
+    assert len(list_panes_calls) == 1
+
+
+def test_service_instance_id_for_pane_falls_back_to_stamp():
+    # Ledger miss (empty test ledger) must NOT strand a stamped pane at "".
+    plane = TmuxControlPlane(adapter=FakeAdapter(LIVE))
+    out = plane.instance_id_for_pane("palace:E")
+    assert out["found"] is True
+    assert out["instance_id"] == "uuid-palace-e"
+    assert out["pane"] == "palace:E"
+
+
+def test_service_instance_id_for_pane_unresolved_fails_closed():
+    plane = TmuxControlPlane(adapter=FakeAdapter(LIVE))
+    out = plane.instance_id_for_pane("reservists:SW")
+    assert out["found"] is False
+    assert out["instance_id"] == ""
