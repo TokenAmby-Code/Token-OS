@@ -220,12 +220,33 @@ mark_pr_flag() {
         "${api%/}/api/instances/${iid}/pr" >/dev/null 2>&1 || true
 }
 
-inject_plan_after_stop() {
-    local pane api body
+arm_pr_plan_followup() {
+    local stage="$1" pr="$2" url="${3:-}" summary="${4:-}" pane api iid prompt body
+    iid="${TOKEN_API_INSTANCE_ID:-}"
+    [[ -n "$iid" ]] || return 0
     pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
     [[ -n "$pane" ]] || return 0
+
+    case "$stage" in
+        review)
+            [[ -n "$summary" ]] || summary="plan fixes or next review action."
+            prompt="/plan PR #${pr} review returned"
+            [[ -n "$url" ]] && prompt+=" (${url})"
+            prompt+="; ${summary}"
+            ;;
+        merge)
+            [[ -n "$summary" ]] || summary="summarize closure and update context."
+            prompt="/plan PR #${pr} merged"
+            [[ -n "$url" ]] && prompt+=" (${url})"
+            prompt+="; ${summary}"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
     api="${TOKEN_API_URL:-http://localhost:7777}"
-    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_step_plan\",\"payload\":\"/plan \" ,\"oneshot\":true}"
+    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_step_plan\",\"payload\":$(json_escape "$prompt"),\"oneshot\":true}"
     curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
         "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
 }
@@ -570,16 +591,6 @@ pr_set_instance_status() {
         "${api%/}/api/instances/${iid}/status" >/dev/null 2>&1 || true
 }
 
-pr_inject_plan_after_stop() {
-    local pane api body
-    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
-    [[ -n "$pane" ]] || return 0
-    api="${TOKEN_API_URL:-http://localhost:7777}"
-    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_lifecycle_plan\",\"payload\":\"/plan \",\"oneshot\":true}"
-    curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
-        "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
-}
-
 pr_set_instance_pr_state() {
     local url="$1" state="$2" api iid body
     iid="${TOKEN_API_INSTANCE_ID:-}"
@@ -844,13 +855,11 @@ assert_pr_capable_remote
 
 # Handle --merge mode
 if [[ "$MERGE_MODE" == "true" ]]; then
-    pr_inject_plan_after_stop
     do_merge
     pr_set_instance_status victorious
     exit 0
 fi
 
-pr_inject_plan_after_stop
 pr_set_instance_status reviewing
 
 # Get repo info
@@ -1560,16 +1569,6 @@ pr_set_instance_status() {
         "${api%/}/api/instances/${iid}/status" >/dev/null 2>&1 || true
 }
 
-pr_inject_plan_after_stop() {
-    local pane api body
-    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
-    [[ -n "$pane" ]] || return 0
-    api="${TOKEN_API_URL:-http://localhost:7777}"
-    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_lifecycle_plan\",\"payload\":\"/plan \",\"oneshot\":true}"
-    curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
-        "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
-}
-
 pr_set_instance_pr_state() {
     local url="$1" state="$2" api iid body
     iid="${TOKEN_API_INSTANCE_ID:-}"
@@ -1602,8 +1601,6 @@ info() { echo -e "${CYAN}   $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}[pr-merge]${NC} $1" >&2; }
 error() { echo -e "${RED}[pr-merge]${NC} $1" >&2; }
 success() { echo -e "${GREEN}[pr-merge]${NC} $1" >&2; }
-
-pr_inject_plan_after_stop
 
 # Defaults
 MERGE_METHOD="squash"
@@ -2106,7 +2103,6 @@ main() {
     fi
 
     assert_repo
-    inject_plan_after_stop
     mark_instance_status reviewing
 
     local pr msg pr_url committed=false
@@ -2119,6 +2115,8 @@ main() {
         push_branch
         pr="$(create_pr_normal | tail -1)"
         read_review_normal "$pr" || true
+        pr_url="$(current_pr_url "$pr")"
+        arm_pr_plan_followup review "$pr" "$pr_url" "plan fixes or next review action."
     else
         pr_url="$(current_pr_url "$pr")"
         [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" open
@@ -2129,6 +2127,8 @@ main() {
             success "Current PR head is already green; skipping re-review request."
         else
             review_pr_normal "$pr" "${msg:-Updated branch; request deterministic full review of latest head.}" || true
+            pr_url="$(current_pr_url "$pr")"
+            arm_pr_plan_followup review "$pr" "$pr_url" "plan fixes or next review action."
         fi
     fi
 
@@ -2140,6 +2140,7 @@ main() {
         pr_url="$(current_pr_url "$pr")"
         [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
         mark_instance_status victorious
+        arm_pr_plan_followup merge "$pr" "$pr_url" "summarize closure and update context."
     else
         if [[ "$AUTO_MERGE" != "true" ]]; then
             log "Auto-merge disabled (--no-merge); leaving PR #$pr open."
