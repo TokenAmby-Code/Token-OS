@@ -20644,6 +20644,335 @@ async def _ops_read_active_fleet_graph(graph_name: str) -> dict:
     }
 
 
+def _ops_gt_job_fire_at(instance_id: str) -> datetime | None:
+    job = scheduler.get_job(f"golden-throne-{instance_id}")
+    return job.next_run_time if job and job.next_run_time else None
+
+
+def _ops_gt_timer_status(next_fire: datetime | None, now: datetime) -> str:
+    if next_fire is None:
+        return "bound"
+    return "due" if _ops_datetime_due(next_fire, now) else "scheduled"
+
+
+def _ops_gt_event_edge_type(event_type: str | None) -> str | None:
+    event = (event_type or "").lower()
+    if "resume" in event or event == "golden_throne_dispatch_validated":
+        return "resumed"
+    if "scheduled" in event or "deferred" in event or "suppressed" in event:
+        return "scheduled"
+    return None
+
+
+async def _ops_read_golden_throne_graph() -> dict:
+    """Read-only Golden Throne topology for the ops cockpit graph viewer.
+
+    V1 stays deliberately small: Golden-Throne-bound instances, their linked
+    session docs, marker/timer state, recent golden_throne_* events, and
+    expected acknowledgements issued by Golden Throne enforcement.
+    """
+
+    now = datetime.now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.*,
+                   COALESCE(p.slug, 'astartes') AS persona_slug,
+                   p.display_name AS persona_display_name,
+                   sd.title AS session_doc_title,
+                   sd.file_path AS session_doc_path,
+                   sd.status AS session_doc_status,
+                   sd.project AS session_doc_project,
+                   gt.id AS gt_id,
+                   gt.zealotry AS gt_zealotry,
+                   gt.resume_count AS gt_row_resume_count,
+                   gt.resume_window_started_at AS gt_row_resume_window_started_at,
+                   gt.last_resume_at AS gt_row_last_resume_at,
+                   gt.follow_up_sop AS gt_row_follow_up_sop,
+                   gt.stop_allowed AS gt_row_stop_allowed,
+                   gt.created_at AS gt_created_at,
+                   gt.updated_at AS gt_updated_at
+            FROM instances ci
+            LEFT JOIN personas p ON p.id = ci.persona_id
+            LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+            LEFT JOIN golden_throne gt ON CAST(gt.id AS TEXT) = ci.golden_throne
+            WHERE ci.golden_throne IS NOT NULL
+              AND ci.golden_throne != 'sync'
+              AND ci.status != 'archived'
+              AND ci.rank != 'retired'
+            ORDER BY ci.last_activity DESC
+            LIMIT 160
+            """
+        )
+        instance_rows = [dict(row) for row in await cursor.fetchall()]
+
+        instance_ids = [str(row["id"]) for row in instance_rows if row.get("id")]
+        event_rows: list[dict] = []
+        ack_rows: list[dict] = []
+        if instance_ids:
+            placeholders = ",".join("?" for _ in instance_ids)
+            event_cursor = await db.execute(
+                f"""
+                SELECT id, event_type, instance_id, device_id, details, created_at
+                FROM events
+                WHERE event_type LIKE 'golden_throne_%'
+                  AND instance_id IN ({placeholders})
+                ORDER BY created_at DESC
+                LIMIT 80
+                """,
+                instance_ids,
+            )
+            event_rows = [dict(row) for row in await event_cursor.fetchall()]
+
+            ack_cursor = await db.execute(
+                f"""
+                SELECT *
+                FROM expected_acknowledgements
+                WHERE source = 'golden_throne'
+                  AND instance_id IN ({placeholders})
+                  AND (
+                      status = 'pending'
+                      OR acknowledged_at IS NOT NULL
+                      OR bailout_reason IS NOT NULL
+                  )
+                ORDER BY status = 'pending' DESC, created_at DESC
+                LIMIT 80
+                """,
+                instance_ids,
+            )
+            ack_rows = [dict(row) for row in await ack_cursor.fetchall()]
+
+    nodes: dict[str, dict] = {}
+    edges: dict[str, dict] = {}
+
+    for inst in instance_rows:
+        instance_id = str(inst.get("id"))
+        marker = str(inst.get("golden_throne"))
+        gt_node_id = f"golden_throne:{marker}"
+        instance_node_id = f"instance:{instance_id}"
+        next_fire = _ops_gt_job_fire_at(instance_id)
+        gt_status = _ops_gt_timer_status(next_fire, now)
+        status = inst.get("status") or "unknown"
+
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": gt_node_id,
+                "type": "golden_throne",
+                "label": f"Golden Throne #{marker}",
+                "subtitle": f"zealotry {inst.get('gt_zealotry') or inst.get('zealotry') or 4}",
+                "status": gt_status,
+                "group": "golden-throne",
+                "weight": inst.get("gt_zealotry") or inst.get("zealotry") or 4,
+                "data": {
+                    "golden_throne": marker,
+                    "row_id": inst.get("gt_id"),
+                    "next_fire": next_fire.isoformat() if next_fire else None,
+                    "zealotry": inst.get("gt_zealotry") or inst.get("zealotry") or 4,
+                    "resume_count": inst.get("gt_row_resume_count")
+                    if inst.get("gt_row_resume_count") is not None
+                    else inst.get("gt_resume_count"),
+                    "resume_window_started_at": inst.get("gt_row_resume_window_started_at")
+                    or inst.get("gt_resume_window_started_at"),
+                    "last_resume_at": inst.get("gt_row_last_resume_at")
+                    or inst.get("gt_last_resume_at"),
+                    "follow_up_sop": inst.get("gt_row_follow_up_sop") or inst.get("follow_up_sop"),
+                    "stop_allowed": bool(inst.get("gt_row_stop_allowed"))
+                    if inst.get("gt_row_stop_allowed") is not None
+                    else bool(inst.get("stop_allowed")),
+                    "created_at": inst.get("gt_created_at"),
+                    "updated_at": inst.get("gt_updated_at"),
+                },
+            },
+        )
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": instance_node_id,
+                "type": "instance",
+                "label": _ops_display_name(inst),
+                "subtitle": " · ".join(
+                    part
+                    for part in (
+                        inst.get("persona_slug") or inst.get("engine"),
+                        inst.get("rank"),
+                        inst.get("device_id"),
+                    )
+                    if part
+                ),
+                "status": status,
+                "group": inst.get("persona_slug") or "golden-throne",
+                "weight": inst.get("zealotry") or 4,
+                "data": {
+                    "instance_id": instance_id,
+                    "golden_throne": marker,
+                    "engine": inst.get("engine"),
+                    "working_dir": inst.get("working_dir"),
+                    "created_at": inst.get("created_at"),
+                    "last_activity": inst.get("last_activity"),
+                    "gt_resume_count": inst.get("gt_resume_count") or 0,
+                    "gt_last_resume_at": inst.get("gt_last_resume_at"),
+                    "victory_at": inst.get("victory_at"),
+                    "victory_reason": inst.get("victory_reason"),
+                },
+            },
+        )
+        _ops_graph_add_edge(
+            edges,
+            {
+                "id": f"scheduled:{marker}:{instance_id}",
+                "source": gt_node_id,
+                "target": instance_node_id,
+                "type": "scheduled",
+                "directed": True,
+                "label": "scheduled",
+                "status": gt_status,
+                "data": {"next_fire": next_fire.isoformat() if next_fire else None},
+            },
+        )
+
+        session_doc_id = inst.get("session_doc_id")
+        if session_doc_id is not None:
+            doc_node_id = f"session_doc:{session_doc_id}"
+            doc_path = inst.get("session_doc_path")
+            _ops_graph_add_node(
+                nodes,
+                {
+                    "id": doc_node_id,
+                    "type": "session_doc",
+                    "label": inst.get("session_doc_title")
+                    or (Path(str(doc_path)).stem if doc_path else f"session-doc-{session_doc_id}"),
+                    "subtitle": doc_path,
+                    "status": inst.get("session_doc_status") or "unknown",
+                    "group": inst.get("session_doc_project"),
+                    "data": {
+                        "session_doc_id": session_doc_id,
+                        "path": doc_path,
+                        "project": inst.get("session_doc_project"),
+                    },
+                },
+            )
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"bound_to:{instance_id}:{session_doc_id}",
+                    "source": instance_node_id,
+                    "target": doc_node_id,
+                    "type": "bound_to",
+                    "directed": True,
+                    "label": "bound",
+                    "status": inst.get("session_doc_status") or status,
+                    "data": {"binding_source": inst.get("continuity_binding_source")},
+                },
+            )
+
+    for event in event_rows:
+        event_id = event.get("id")
+        instance_id = event.get("instance_id")
+        if not event_id or not instance_id:
+            continue
+        event_node_id = f"event:{event_id}"
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": event_node_id,
+                "type": "event",
+                "label": event.get("event_type") or "golden_throne_event",
+                "subtitle": event.get("created_at"),
+                "status": "completed",
+                "group": "golden-throne",
+                "data": {
+                    "event_id": event_id,
+                    "event_type": event.get("event_type"),
+                    "instance_id": instance_id,
+                    "device_id": event.get("device_id"),
+                    "created_at": event.get("created_at"),
+                    "details": _ops_parse_event_details(event.get("details")),
+                },
+            },
+        )
+        edge_type = _ops_gt_event_edge_type(event.get("event_type"))
+        if edge_type:
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"{edge_type}:{event_id}:{instance_id}",
+                    "source": event_node_id,
+                    "target": f"instance:{instance_id}",
+                    "type": edge_type,
+                    "directed": True,
+                    "label": "event",
+                    "status": "completed",
+                },
+            )
+
+    for ack_row in ack_rows:
+        ack = _expected_ack_row_to_dict(ack_row)
+        ack_node_id = f"ack:{ack['id']}"
+        instance_id = ack.get("instance_id")
+        ack_status = ack.get("status") or "unknown"
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": ack_node_id,
+                "type": "expected_ack",
+                "label": ack.get("reason") or "Golden Throne ack",
+                "subtitle": ack.get("ack_due_at"),
+                "status": ack_status,
+                "group": "golden-throne",
+                "data": ack,
+            },
+        )
+        if instance_id:
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"ack_required:{instance_id}:{ack['id']}",
+                    "source": f"instance:{instance_id}",
+                    "target": ack_node_id,
+                    "type": "ack_required",
+                    "directed": True,
+                    "label": "ack",
+                    "status": "active" if ack_status == "pending" else "completed",
+                },
+            )
+            if ack_status != "pending":
+                _ops_graph_add_edge(
+                    edges,
+                    {
+                        "id": f"resolved_by:{ack['id']}:{instance_id}",
+                        "source": ack_node_id,
+                        "target": f"instance:{instance_id}",
+                        "type": "resolved_by",
+                        "directed": True,
+                        "label": "resolved",
+                        "status": "completed",
+                        "data": {
+                            "acknowledged_at": ack.get("acknowledged_at"),
+                            "bailout_reason": ack.get("bailout_reason"),
+                        },
+                    },
+                )
+
+    return {
+        "graph": "golden-throne",
+        "generated_at": now.isoformat(),
+        "layout_hint": "dagre",
+        "nodes": list(nodes.values()),
+        "edges": list(edges.values()),
+    }
+
+
+async def _ops_read_graph(graph_name: str) -> dict:
+    normalized = (graph_name or "").strip().lower().replace("_", "-")
+    if normalized in {"active", "active-fleet"}:
+        return await _ops_read_active_fleet_graph(graph_name)
+    if normalized in {"golden-throne", "gt"}:
+        return await _ops_read_golden_throne_graph()
+    raise HTTPException(status_code=404, detail=f"Unknown ops graph: {graph_name}")
+
+
 async def _ops_read_events() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -21864,7 +22193,7 @@ async def get_ops_timer_history(window: str = "6h", bucket: str = "60s"):
 @app.get("/api/ui/ops/graph/{graph_name}")
 async def get_ops_graph(graph_name: str):
     """Typed node/edge read model for ops cockpit relationship graphs."""
-    return await _ops_read_active_fleet_graph(graph_name)
+    return await _ops_read_graph(graph_name)
 
 
 @app.get("/api/ui/ops/state")

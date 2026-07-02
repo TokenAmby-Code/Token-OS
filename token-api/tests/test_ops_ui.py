@@ -203,6 +203,113 @@ def test_ops_active_fleet_graph_returns_live_relationships(client, app_env, monk
     assert {edge["id"] for edge in alias_body["edges"]} == {edge["id"] for edge in body["edges"]}
 
 
+def _insert_gt_graph_instance(app_env, *, session_doc: bool = False) -> tuple[str, str, int | None]:
+    instance_id = str(uuid.uuid4())
+    conn = sqlite3.connect(app_env.db_path)
+    marker = str(conn.execute("INSERT INTO golden_throne DEFAULT VALUES").lastrowid)
+    doc_id = None
+    if session_doc:
+        doc_id = conn.execute(
+            """INSERT INTO session_documents
+               (title, file_path, project, status, created_at, updated_at)
+               VALUES ('GT Graph Doc', 'Sessions/gt-graph-doc.md', 'ops', 'active',
+                       '2026-05-25T10:00:00', '2026-05-25T10:00:00')"""
+        ).lastrowid
+    conn.execute(
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id,
+            status, engine, created_at, last_activity, golden_throne, session_doc_id)
+           VALUES (?, 'gt-graph-instance', '/tmp/ops', 'local', 'Mac-Mini',
+                   'idle', 'codex',
+                   '2026-05-25T10:00:00', '2026-05-25T10:01:00', ?, ?)""",
+        (instance_id, marker, doc_id),
+    )
+    conn.commit()
+    conn.close()
+    return instance_id, marker, doc_id
+
+
+def test_ops_golden_throne_graph_returns_valid_ops_graph(client, app_env) -> None:
+    resp = client.get("/api/ui/ops/graph/golden-throne")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["graph"] == "golden-throne"
+    assert body["generated_at"]
+    assert body["layout_hint"] == "dagre"
+    assert isinstance(body["nodes"], list)
+    assert isinstance(body["edges"], list)
+
+
+def test_ops_golden_throne_graph_gt_alias(client, app_env) -> None:
+    _insert_gt_graph_instance(app_env)
+
+    resp = client.get("/api/ui/ops/graph/gt")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["graph"] == "golden-throne"
+
+
+def test_ops_golden_throne_graph_bound_instances_have_schedule_edges(client, app_env) -> None:
+    instance_id, marker, _ = _insert_gt_graph_instance(app_env)
+
+    resp = client.get("/api/ui/ops/graph/golden-throne")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    node_ids = {node["id"] for node in body["nodes"]}
+    assert f"instance:{instance_id}" in node_ids
+    assert f"golden_throne:{marker}" in node_ids
+    edges = {(edge["source"], edge["target"], edge["type"]) for edge in body["edges"]}
+    assert (f"golden_throne:{marker}", f"instance:{instance_id}", "scheduled") in edges
+
+
+def test_ops_golden_throne_graph_session_doc_binding(client, app_env) -> None:
+    instance_id, _, doc_id = _insert_gt_graph_instance(app_env, session_doc=True)
+
+    resp = client.get("/api/ui/ops/graph/golden-throne")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    node_ids = {node["id"] for node in body["nodes"]}
+    assert f"session_doc:{doc_id}" in node_ids
+    edges = {(edge["source"], edge["target"], edge["type"]) for edge in body["edges"]}
+    assert (f"instance:{instance_id}", f"session_doc:{doc_id}", "bound_to") in edges
+
+
+def test_ops_golden_throne_graph_pending_acknowledgements(client, app_env) -> None:
+    instance_id, _, _ = _insert_gt_graph_instance(app_env)
+    ack_id = str(uuid.uuid4())
+    now = datetime.now()
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO expected_acknowledgements
+           (id, source, instance_id, reason, status, created_at,
+            ack_due_at, level2_due_at, pavlok_due_at, fired_levels_json, details_json)
+           VALUES (?, 'golden_throne', ?, 'confirm GT resume', 'pending', ?, ?, ?, ?, '[]', '{}')""",
+        (
+            ack_id,
+            instance_id,
+            now.isoformat(),
+            (now - timedelta(seconds=1)).isoformat(),
+            (now + timedelta(minutes=1)).isoformat(),
+            (now + timedelta(minutes=2)).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ui/ops/graph/golden-throne")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    node_ids = {node["id"] for node in body["nodes"]}
+    assert f"ack:{ack_id}" in node_ids
+    edges = {(edge["source"], edge["target"], edge["type"]) for edge in body["edges"]}
+    assert (f"instance:{instance_id}", f"ack:{ack_id}", "ack_required") in edges
+
+
 def test_ops_source_freshness_marks_stale_phone_heartbeat(client, app_env, monkeypatch) -> None:
     monkeypatch.setitem(
         app_env.main.PHONE_HEARTBEAT,
