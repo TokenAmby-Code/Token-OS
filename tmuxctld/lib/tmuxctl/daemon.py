@@ -1937,6 +1937,54 @@ def _find_pane_by_wrapper_id(control: TmuxControlPlane, wrapper_launch_id: str) 
     return ""
 
 
+def _fetch_instance_for_wrapperend(instance_id: str) -> dict:
+    """Best-effort Token-API read for PR/worktree state.
+
+    Token-API owns instance registry truth.  WrapperEnd uses it only to decide
+    whether deferred worktree teardown is safe; any fetch failure preserves.
+    """
+    if not instance_id:
+        return {}
+    base = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+    request = urllib.request.Request(f"{base}/api/instances/{instance_id}", method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=2.0) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+            return payload if isinstance(payload, dict) else {}
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+        log.warning(
+            "tmuxctld wrapperend instance fetch failed instance=%s: %s",
+            instance_id,
+            exc,
+        )
+        return {}
+
+
+def _wrapperend_worktree_path(
+    params: dict,
+    env: dict,
+    *,
+    instance: dict,
+    ledger_row: dict | None,
+    pane_cwd: str,
+) -> str:
+    """Resolve the candidate worktree path; caller preserves if this is wrong."""
+
+    for value in (
+        instance.get("working_dir") if isinstance(instance, dict) else "",
+        pane_cwd,
+        (ledger_row or {}).get("working_dir"),
+        _s(params, "cwd"),
+        _s(params, "working_dir"),
+        _s(env, "TOKEN_API_TARGET_WORKING_DIR"),
+        _s(env, "TOKEN_API_CWD"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _h_hook_wrapperend(control, params):
     """Authoritative wrapper-owned visual/runtime cleanup for tmux panes.
 
@@ -1944,6 +1992,11 @@ def _h_hook_wrapperend(control, params):
     state, so WrapperEnd clears only the pane whose @TOKEN_API_WRAPPER_LAUNCH_ID
     matches the exiting wrapper. Missing/already-cleared panes are successful
     no-ops; a pane owned by a different wrapper is surfaced as an error.
+
+    WrapperEnd also owns deferred worktree teardown.  A worktree cleanup is a
+    shutdown request, so merge commands must never run it from inside their own
+    cwd.  Here the wrapped process is already gone; even so, the cleanup removes
+    only the linked worktree and preserves unmerged or dirty state.
     """
     env = params.get("env") if isinstance(params.get("env"), dict) else {}
     wrapper_launch_id = _wrapper_id_from_params(params)
@@ -1982,7 +2035,32 @@ def _h_hook_wrapperend(control, params):
         }
 
     pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
+    instance_id = _adapter_show_pane_option(control, pane, "@INSTANCE_ID")
+    pane_cwd = _adapter_show_pane_option(control, pane, "@TOKEN_API_CWD")
     ledger_close = control.ledger_close(wrapper_launch_id)
+    ledger_row = ledger_close.get("row") if isinstance(ledger_close, dict) else None
+    if not instance_id and isinstance(ledger_row, dict):
+        instance_id = str(ledger_row.get("instance_id") or "").strip()
+    instance = _fetch_instance_for_wrapperend(instance_id)
+    worktree_path = _wrapperend_worktree_path(
+        params,
+        env,
+        instance=instance,
+        ledger_row=ledger_row if isinstance(ledger_row, dict) else None,
+        pane_cwd=pane_cwd,
+    )
+    try:
+        from .worktree_lifecycle import cleanup_worktree_on_wrapper_end
+
+        worktree_cleanup = cleanup_worktree_on_wrapper_end(worktree_path, instance=instance)
+    except Exception as exc:  # preserve worktree; WrapperEnd pane cleanup still proceeds
+        log.exception("tmuxctld wrapperend worktree cleanup failed path=%s", worktree_path)
+        worktree_cleanup = {
+            "status": "preserved",
+            "reason": "exception",
+            "worktree": worktree_path,
+            "error": str(exc),
+        }
     window_name = control.adapter.run(
         "display-message", "-t", pane, "-p", "#{window_name}", allow_failure=True
     ).strip()
@@ -1999,7 +2077,9 @@ def _h_hook_wrapperend(control, params):
         "wrapper_launch_id": wrapper_launch_id,
         "pane": (reap or {}).get("pane", pane),
         "pane_label": pane_label,
+        "instance_id": instance_id,
         "ledger": ledger_close,
+        "worktree_cleanup": worktree_cleanup,
         "reap": reap,
         "teardown": teardown,
     }
