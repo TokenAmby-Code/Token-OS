@@ -223,9 +223,68 @@ parse_args() {
 
 json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
+pr_step_ledger_resolve_field() {
+    local query_key="$1" query_value="$2" field="$3" base url json
+    [[ -n "$query_key" && -n "$query_value" && -n "$field" ]] || return 0
+    base="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+    url="$(QUERY_KEY="$query_key" QUERY_VALUE="$query_value" BASE="$base" python3 - <<'PYURL'
+import os, urllib.parse
+base = os.environ.get("BASE", "http://127.0.0.1:7778").rstrip("/")
+print(f"{base}/ledger/resolve?{urllib.parse.urlencode({os.environ.get('QUERY_KEY', ''): os.environ.get('QUERY_VALUE', '')})}")
+PYURL
+)"
+    json="$(curl -fsS -m 1 "$url" 2>/dev/null || true)"
+    [[ -n "$json" ]] || return 0
+    LEDGER_JSON="$json" LEDGER_FIELD="$field" python3 - <<'PYLEDGER'
+import json, os, sys
+try:
+    data = json.loads(os.environ.get("LEDGER_JSON", ""))
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+# tmuxctld returns {ok:true,result:{found:true,row:{...}}}; tolerate older
+# direct shapes only while still consuming the canonical /ledger/resolve surface.
+result = data.get("result") if isinstance(data.get("result"), dict) else data
+if not isinstance(result, dict) or not result.get("found"):
+    sys.exit(0)
+row = result.get("row") if isinstance(result.get("row"), dict) else {}
+field = os.environ.get("LEDGER_FIELD", "")
+value = row.get(field) or result.get(field) or ""
+if value:
+    print(str(value), end="")
+PYLEDGER
+}
+
+pr_step_wrapper_id() {
+    printf '%s' "${TOKEN_API_WRAPPER_ID:-${TOKEN_API_WRAPPER_LAUNCH_ID:-}}"
+}
+
+pr_step_resolve_instance_id() {
+    local wrapper pane value
+    wrapper="$(pr_step_wrapper_id)"
+    value="$(pr_step_ledger_resolve_field wrapper_id "$wrapper" instance_id || true)"
+    [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
+    value="$(pr_step_ledger_resolve_field pane_id "$pane" instance_id || true)"
+    [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    return 0
+}
+
+pr_step_resolve_pane() {
+    local wrapper pane value
+    wrapper="$(pr_step_wrapper_id)"
+    value="$(pr_step_ledger_resolve_field wrapper_id "$wrapper" pane_positional_id || true)"
+    [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
+    value="$(pr_step_ledger_resolve_field pane_id "$pane" pane_positional_id || true)"
+    [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    [[ -n "$pane" ]] && printf '%s' "$pane"
+}
+
 mark_instance_status() {
     local status="$1" api iid body
-    iid="${TOKEN_API_INSTANCE_ID:-}"
+    iid="$(pr_step_resolve_instance_id)"
     [[ -n "$iid" ]] || return 0
     api="${TOKEN_API_URL:-http://localhost:7777}"
     case "$status" in
@@ -244,7 +303,7 @@ mark_instance_status() {
 
 mark_pr_flag() {
     local pr_url="$1" pr_state="${2:-open}" api iid body
-    iid="${TOKEN_API_INSTANCE_ID:-}"
+    iid="$(pr_step_resolve_instance_id)"
     [[ -n "$iid" ]] || return 0
     api="${TOKEN_API_URL:-http://localhost:7777}"
     body="{\"pr_url\":$(json_escape "$pr_url"),\"pr_state\":$(json_escape "$pr_state") }"
@@ -252,12 +311,31 @@ mark_pr_flag() {
         "${api%/}/api/instances/${iid}/pr" >/dev/null 2>&1 || true
 }
 
-inject_plan_after_stop() {
-    local pane api body
-    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
+arm_pr_plan_followup() {
+    local stage="$1" pr="$2" url="${3:-}" summary="${4:-}" pane api prompt body
+    pane="$(pr_step_resolve_pane)"
     [[ -n "$pane" ]] || return 0
+
+    case "$stage" in
+        review)
+            [[ -n "$summary" ]] || summary="plan fixes or next review action."
+            prompt="/plan PR #${pr} review returned"
+            [[ -n "$url" ]] && prompt+=" (${url})"
+            prompt+="; ${summary}"
+            ;;
+        merge)
+            [[ -n "$summary" ]] || summary="summarize closure and update context."
+            prompt="/plan PR #${pr} merged"
+            [[ -n "$url" ]] && prompt+=" (${url})"
+            prompt+="; ${summary}"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
     api="${TOKEN_API_URL:-http://localhost:7777}"
-    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_step_plan\",\"payload\":\"/plan \" ,\"oneshot\":true}"
+    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_step_plan\",\"payload\":$(json_escape "$prompt"),\"oneshot\":true}"
     curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
         "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
 }
@@ -584,7 +662,7 @@ json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1
 
 pr_set_instance_status() {
     local status="$1" api iid body
-    iid="${TOKEN_API_INSTANCE_ID:-}"
+    iid="$(pr_step_resolve_instance_id)"
     [[ -n "$iid" ]] || return 0
     api="${TOKEN_API_URL:-http://localhost:7777}"
     case "$status" in
@@ -602,19 +680,9 @@ pr_set_instance_status() {
         "${api%/}/api/instances/${iid}/status" >/dev/null 2>&1 || true
 }
 
-pr_inject_plan_after_stop() {
-    local pane api body
-    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
-    [[ -n "$pane" ]] || return 0
-    api="${TOKEN_API_URL:-http://localhost:7777}"
-    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_lifecycle_plan\",\"payload\":\"/plan \",\"oneshot\":true}"
-    curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
-        "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
-}
-
 pr_set_instance_pr_state() {
     local url="$1" state="$2" api iid body
-    iid="${TOKEN_API_INSTANCE_ID:-}"
+    iid="$(pr_step_resolve_instance_id)"
     [[ -n "$iid" ]] || return 0
     api="${TOKEN_API_URL:-http://localhost:7777}"
     body="{\"pr_url\":$(json_escape "$url"),\"pr_state\":$(json_escape "$state")}"
@@ -880,13 +948,11 @@ assert_pr_capable_remote
 
 # Handle --merge mode
 if [[ "$MERGE_MODE" == "true" ]]; then
-    pr_inject_plan_after_stop
     do_merge
     pr_set_instance_status victorious
     exit 0
 fi
 
-pr_inject_plan_after_stop
 pr_set_instance_status reviewing
 
 # Get repo info
@@ -931,16 +997,9 @@ if [[ -x "$SCRIPT_DIR/rubric-flip" ]]; then
 fi
 
 # Instance DB flag: mark the originating instance as "has PR open" so /ui/ops can
-# badge it (Phase 1). Same instance→token-api path rubric-flip uses ($TOKEN_API_INSTANCE_ID
-# → :7777). Additive to the session-doc rubric write above, not a replacement.
-# Best-effort: never fail `pr create` if token-api is down or the instance is unknown.
-if [[ -n "${TOKEN_API_INSTANCE_ID:-}" ]]; then
-    _pr_api="${TOKEN_API_URL:-http://localhost:7777}"
-    curl -fsS -m 5 -X PATCH \
-        -H "Content-Type: application/json" \
-        -d "$(printf '{"pr_url":"%s","pr_state":"open"}' "$PR_URL")" \
-        "${_pr_api}/api/instances/${TOKEN_API_INSTANCE_ID}/pr" >/dev/null 2>&1 || true
-fi
+# badge it. Identity is resolved through tmuxctld's wrapper ledger oracle, not
+# TOKEN_API_INSTANCE_ID, so this survives plan-mode/env strip-downs.
+pr_set_instance_pr_state "$PR_URL" open
 pr_set_instance_status reviewing
 
 if [[ "$NO_WAIT" == "true" ]]; then
@@ -1435,7 +1494,7 @@ while true; do
         CR_STATE=$(gh_api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
             jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
             '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
-        if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" ]]; then
+        if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" || "$CR_STATE" == "error" ]]; then
             FOUND_OVERVIEW=true
             log "CodeRabbit commit status reached terminal state: $CR_STATE"
             break
@@ -1516,7 +1575,7 @@ if [[ "$LATEST_REVIEW_STATE" == "CHANGES_REQUESTED" ]]; then
 elif [[ "$LATEST_REVIEW_STATE" == "APPROVED" ]] || [[ "$CR_COMMIT_STATE" == "success" ]]; then
     REVIEW_STATE="APPROVED"
     REVIEW_STATUS_ICON="✅"
-elif [[ "$CR_COMMIT_STATE" == "failure" ]]; then
+elif [[ "$CR_COMMIT_STATE" == "failure" || "$CR_COMMIT_STATE" == "error" ]]; then
     REVIEW_STATE="FAILURE"
     REVIEW_STATUS_ICON="❌"
 elif [[ -n "$LATEST_REVIEW_STATE" ]]; then
@@ -1617,7 +1676,7 @@ json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1
 
 pr_set_instance_status() {
     local status="$1" api iid body
-    iid="${TOKEN_API_INSTANCE_ID:-}"
+    iid="$(pr_step_resolve_instance_id)"
     [[ -n "$iid" ]] || return 0
     api="${TOKEN_API_URL:-http://localhost:7777}"
     case "$status" in
@@ -1635,19 +1694,9 @@ pr_set_instance_status() {
         "${api%/}/api/instances/${iid}/status" >/dev/null 2>&1 || true
 }
 
-pr_inject_plan_after_stop() {
-    local pane api body
-    pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
-    [[ -n "$pane" ]] || return 0
-    api="${TOKEN_API_URL:-http://localhost:7777}"
-    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_lifecycle_plan\",\"payload\":\"/plan \",\"oneshot\":true}"
-    curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
-        "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
-}
-
 pr_set_instance_pr_state() {
     local url="$1" state="$2" api iid body
-    iid="${TOKEN_API_INSTANCE_ID:-}"
+    iid="$(pr_step_resolve_instance_id)"
     [[ -n "$iid" ]] || return 0
     api="${TOKEN_API_URL:-http://localhost:7777}"
     body="{\"pr_url\":$(json_escape "$url"),\"pr_state\":$(json_escape "$state")}"
@@ -1677,8 +1726,6 @@ info() { echo -e "${CYAN}   $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}[pr-merge]${NC} $1" >&2; }
 error() { echo -e "${RED}[pr-merge]${NC} $1" >&2; }
 success() { echo -e "${GREEN}[pr-merge]${NC} $1" >&2; }
-
-pr_inject_plan_after_stop
 
 # Defaults
 MERGE_METHOD="squash"
@@ -2190,7 +2237,6 @@ main() {
     fi
 
     assert_repo
-    inject_plan_after_stop
     mark_instance_status reviewing
 
     local pr msg pr_url committed=false
@@ -2203,6 +2249,8 @@ main() {
         push_branch
         pr="$(create_pr_normal | tail -1)"
         read_review_normal "$pr" || true
+        pr_url="$(current_pr_url "$pr")"
+        arm_pr_plan_followup review "$pr" "$pr_url" "plan fixes or next review action."
     else
         pr_url="$(current_pr_url "$pr")"
         [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" open
@@ -2213,6 +2261,8 @@ main() {
             success "Current PR head is already green; skipping re-review request."
         else
             review_pr_normal "$pr" "${msg:-Updated branch; request deterministic full review of latest head.}" || true
+            pr_url="$(current_pr_url "$pr")"
+            arm_pr_plan_followup review "$pr" "$pr_url" "plan fixes or next review action."
         fi
     fi
 
@@ -2224,6 +2274,7 @@ main() {
         pr_url="$(current_pr_url "$pr")"
         [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
         mark_instance_status victorious
+        arm_pr_plan_followup merge "$pr" "$pr_url" "summarize closure and update context."
     else
         if [[ "$AUTO_MERGE" != "true" ]]; then
             log "Auto-merge disabled (--no-merge); leaving PR #$pr open."
