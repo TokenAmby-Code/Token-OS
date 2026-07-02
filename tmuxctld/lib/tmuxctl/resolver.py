@@ -329,6 +329,49 @@ def resolve_instance(adapter: TmuxAdapter, instance_id: str) -> InstanceResoluti
     )
 
 
+def instance_id_for_pane(adapter: TmuxAdapter, pane: str) -> str:
+    """Reverse of :func:`resolve_instance`: a pane target -> its live @INSTANCE_ID.
+
+    The mirror of the forward stamp scan. A single global ``list-panes`` read is
+    matched against the requested pane by physical ``%NN`` id, raw ``@PANE_ID``
+    stamp, or canonical role, so a public ``page:id``, a bare ``%NN``, or an
+    already-canonical role all resolve to the same live instance. Fails closed:
+    returns ``""`` when no live pane both matches AND carries a stamp.
+
+    This exists because the ledger reverse-lookup can miss (codex workers never
+    entered in the wrapper ledger) or return a row whose ``instance_id`` is not
+    yet bound. Those panes still self-identify via their live ``@INSTANCE_ID``
+    stamp; without this fallback the caller gets ``""`` and every delivered send
+    to the pane is reported ``unverified`` (the ack sniffer keys on instance_id).
+    """
+    want = (pane or "").strip()
+    if not want:
+        return ""
+    want_canonical = want if want.startswith("%") else canonical_pane_role(want)
+    raw = adapter.run(
+        "list-panes",
+        "-a",
+        "-F",
+        "\t".join(["#{pane_id}", "#{@INSTANCE_ID}", "#{@PANE_ID}"]),
+        allow_failure=True,
+    )
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        pane_id, instance_id, pane_role = (part.strip() for part in parts)
+        if not instance_id:
+            continue
+        role_canonical = canonical_pane_role(pane_role) if pane_role else ""
+        if (
+            want == pane_id
+            or want == pane_role
+            or (want_canonical and want_canonical == role_canonical)
+        ):
+            return instance_id
+    return ""
+
+
 @dataclass(frozen=True)
 class FreePane:
     """An unoccupied, agent-free pane — a candidate for split-alias-style routing.

@@ -1362,6 +1362,76 @@ def test_send_text_reports_unverified_without_prompt_submit_ack() -> None:
         server.shutdown()
 
 
+class LedgerlessStampAdapter(SendAckAdapter):
+    """A codex-style worker pane: it carries a live @INSTANCE_ID + @PANE_ID stamp
+    but is absent from the wrapper ledger. Reverse resolution must fall back to the
+    live stamp scan; before the fix the ledger miss + a public-id show-option read
+    stranded it at instance_id="" — guaranteeing a false ``unverified`` on every
+    delivered send (the brief submit-ack false-negative)."""
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        type(self).calls.append(tuple(args))
+        if args[:2] == ("list-panes", "-a"):
+            # Physical %42 stamped with a live instance id and canonical role,
+            # exactly as `resolver._instance_pane_index` reads it.
+            return "%42\tinst-stamp-only\tmechanicus:9\n"
+        if args[:1] == ("send-keys",) and "-l" in args and type(self).literal_sent is not None:
+            type(self).literal_sent.set()
+        return ""
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        return "mechanicus:9" if option == "@PANE_ID" else ""
+
+
+def test_send_text_ledgerless_stamped_pane_verifies_ack() -> None:
+    """Regression (brief submit-ack false-negative): a stamped pane with NO wrapper
+    ledger row still resolves its instance_id from the live stamp, so a real
+    UserPromptSubmit ack matches and the send verifies ``submitted`` — not a false
+    ``unverified``. The isolated ledger is empty, so this exercises the fallback."""
+    LedgerlessStampAdapter.calls = []
+    LedgerlessStampAdapter.literal_sent = threading.Event()
+    server, _ = _serve(LedgerlessStampAdapter)
+    try:
+        result_box: dict = {}
+
+        def send() -> None:
+            result_box["status"], result_box["payload"] = _post_timeout(
+                server,
+                "/send-text",
+                {
+                    "pane": "%42",
+                    "text": "do the thing",
+                    "verify": True,
+                    "verify_timeout": 2,
+                    "submit_settle_seconds": 0.01,
+                },
+                timeout=5,
+            )
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        assert LedgerlessStampAdapter.literal_sent is not None
+        assert LedgerlessStampAdapter.literal_sent.wait(timeout=2)
+        # The agent's live UserPromptSubmit echo carries its session/instance id;
+        # the daemon must have resolved the SAME id from the stamp for this to match.
+        _, ack = _post(
+            server,
+            "/hooks/user-prompt-submit",
+            {"session_id": "inst-stamp-only"},
+        )
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert ack["ok"] is True
+        payload = result_box["payload"]
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["verification_status"] == "submitted"
+        assert result["verified_by"] == "UserPromptSubmit"
+        assert result["instance_id"] == "inst-stamp-only"
+    finally:
+        server.shutdown()
+
+
 class RecoveryClearsDraftAdapter(SendAckAdapter):
     """First verify sees a stuck draft; recovery C-m clears it."""
 

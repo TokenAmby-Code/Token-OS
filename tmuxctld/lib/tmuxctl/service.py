@@ -378,6 +378,38 @@ class TmuxControlPlane:
             except Exception:
                 pane_positional_id = pane
         row = LEDGER.resolve(pane_positional_id=pane_positional_id)
+        if row is not None and row.instance_id:
+            return {
+                "pane": row.pane_positional_id,
+                "instance_id": row.instance_id,
+                "found": True,
+                "ledger": row.as_dict(),
+            }
+        # Ledger miss, OR a ledger row whose instance_id is not yet bound. Fall
+        # back to the live @INSTANCE_ID stamp — the same fail-closed tmux truth the
+        # forward resolver uses, in reverse. Codex workers are never entered in the
+        # wrapper ledger and an OPEN wrapper row can precede instance binding; both
+        # still self-identify via their pane stamp. The old fallback passed an
+        # unresolved public page:id straight to show-pane-option (only "current"/%NN
+        # were resolved), so a public id read nothing and returned "" — and an
+        # unbound-but-present ledger row short-circuited before the stamp read
+        # entirely. Either way the pane resolved to "", which forces a false
+        # ``unverified`` on every delivered send, since the ack sniffer keys on
+        # instance_id (an empty id makes the wait return immediately).
+        try:
+            from .resolver import instance_id_for_pane as instance_id_for_pane_from_tmux
+
+            stamp_instance_id = instance_id_for_pane_from_tmux(self.adapter, pane_positional_id)
+            if stamp_instance_id:
+                return {
+                    "pane": pane_positional_id,
+                    "instance_id": stamp_instance_id,
+                    "found": True,
+                }
+        except Exception:
+            pass
+        # No live stamp. Preserve any ledger row metadata (unbound instance_id)
+        # rather than dropping it, so callers still see the wrapper row.
         if row is not None:
             return {
                 "pane": row.pane_positional_id,
@@ -385,13 +417,6 @@ class TmuxControlPlane:
                 "found": bool(row.instance_id),
                 "ledger": row.as_dict(),
             }
-        try:
-            target = self._resolve_current(pane)
-            instance_id = self.adapter.show_pane_option(target, "@INSTANCE_ID").strip()
-            if instance_id:
-                return {"pane": target, "instance_id": instance_id, "found": True}
-        except Exception:
-            pass
         return {"pane": pane_positional_id, "instance_id": "", "found": False}
 
     def ledger_upsert(
