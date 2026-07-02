@@ -591,6 +591,9 @@ async def send_prompt_to_pane(
         "gated": False,
         "verification_status": result.get("verification_status") or "unverified",
         "verified_by": result.get("verified_by"),
+        "delivery": result.get("delivery"),
+        "advisory": result.get("advisory"),
+        "capture_excerpt": result.get("capture_excerpt"),
         "guard_held": bool(result.get("guard_held")),
         "swallowed_submit_detected": bool(result.get("swallowed_submit_detected")),
         "recovery_attempts": int(result.get("recovery_attempts") or 0),
@@ -5650,9 +5653,7 @@ PANE_WRITE_CANCELLED = "cancelled"
 PANE_WRITE_DEFERRED = "deferred"
 
 
-def _pane_send_terminal_status(
-    send_result: dict, *, accept_issued_as_sent: bool = False
-) -> tuple[str, str | None]:
+def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     """Map low-level pane-send truth to durable queue/front-end status.
 
     The send path distinguishes bytes-issued from submit/turn consumption. A
@@ -5661,21 +5662,17 @@ def _pane_send_terminal_status(
     ``unverified`` is terminal and loud, not retryable pending, because bytes may
     have reached the composer and a blind retry would duplicate.
 
-    ``accept_issued_as_sent`` relaxes that exclusively for fire-and-forget direct
-    delivery to rowless/codex panes. Those fire ``UserPromptSubmit`` late or never,
-    so a non-gated ``returncode=0`` send that merely lacks an ack is a verification
-    false-negative, not a miss — the bytes demonstrably issued. With the flag set,
-    issued bytes report ``SENT``. Two-way callers (talk) leave it False so an
-    unconsumed turn still surfaces, and rowed/claude panes are never affected.
+    ``likely`` is accepted only when the lower tmuxctld classifier produced an
+    engine-specific ingestion signal (currently Codex transcript/user-message
+    capture). Plain bytes-issued/unacked remains ``UNVERIFIED`` to avoid flipping
+    false-negatives into blind false-positives.
     """
     verification = str(send_result.get("verification_status") or "").lower()
     if verification == "gated" or send_result.get("gated"):
         return PANE_WRITE_PENDING, f"send_gated:{send_result.get('gate_reason') or 'gated'}"
     if send_result.get("returncode") != 0:
         return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
-    if verification == "submitted":
-        return PANE_WRITE_SENT, None
-    if accept_issued_as_sent:
+    if verification in {"submitted", "likely"}:
         return PANE_WRITE_SENT, None
     return (
         PANE_WRITE_UNVERIFIED,
@@ -12956,7 +12953,6 @@ async def _direct_tmux_pane_delivery(
     purpose: str,
     clear_prompt: bool = False,
     operation_id: str | None = None,
-    accept_issued_as_sent: bool = False,
 ) -> dict:
     """Deliver directly to a live pane when no registry row exists.
 
@@ -12965,12 +12961,10 @@ async def _direct_tmux_pane_delivery(
     to resolve, so route them through the lower-level tmuxctl primitive after a
     live agent-process check.
 
-    ``accept_issued_as_sent`` is for fire-and-forget callers (brief): a non-gated
-    ``returncode=0`` send reports ``SENT`` even without a ``UserPromptSubmit`` ack.
-    It is honored ONLY for a live ``codex`` engine — codex panes ack late or never,
-    so a missing ack there is a false-negative. Rowless ``claude`` panes ack
-    reliably, so they keep strict verification even under this flag, and two-way
-    callers (talk) leave it False so an unconsumed turn still fails loudly.
+    Rowless/direct sends still require a real submit signal: ``submitted`` from a
+    hook ack or ``likely`` from tmuxctld's engine-specific capture proof. A plain
+    rc0/unacked Codex send is not promoted to sent; bytes-issued alone is not
+    delivery proof.
     """
     pane = await shared.resolve_tmux_pane_id(tmux_pane)
     engine = await _pane_live_agent_engine(pane)
@@ -13017,12 +13011,7 @@ async def _direct_tmux_pane_delivery(
             **send_result,
             **result,
         }
-    # Honor the fire-and-forget relaxation only for codex: claude panes ack
-    # reliably, so an unverified send there is a real signal, not a false-negative.
-    accept_issued = accept_issued_as_sent and engine == "codex"
-    terminal_status, terminal_error = _pane_send_terminal_status(
-        send_result, accept_issued_as_sent=accept_issued
-    )
+    terminal_status, terminal_error = _pane_send_terminal_status(send_result)
     result = {
         **base,
         "status": terminal_status,
@@ -13271,7 +13260,6 @@ async def brief_send(request: BriefSendRequest):
                         purpose="brief_send",
                         clear_prompt=True,
                         operation_id=operation_id,
-                        accept_issued_as_sent=True,
                     )
                 else:
                     queued = await enqueue_pane_write(

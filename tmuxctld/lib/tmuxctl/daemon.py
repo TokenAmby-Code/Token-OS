@@ -1049,13 +1049,38 @@ def _wait_for_insert_confirmation(
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
+def _detect_codex_user_message(capture: str, payload: str) -> bool:
+    """Return True when capture shows Codex accepted ``payload`` as a user turn.
+
+    Codex renders submitted user messages in the transcript with a leading ``›``
+    marker. The live composer can also contain the payload, but it sits inside
+    bordered chrome (for example ``│ › draft``), so require the marker at the
+    start of a captured line after whitespace. This is deliberately narrower than
+    "payload appears anywhere"; absence of this signal is unverified, not success.
+    """
+
+    if not capture or not payload:
+        return False
+    needle = normalize_prompt_payload(payload).strip()[:_SWALLOW_NEEDLE_LEN]
+    if not needle:
+        return False
+    for line in capture.splitlines():
+        stripped = line.lstrip()
+        if not stripped.startswith("›"):
+            continue
+        haystack = re.sub(r"[\r\n]+", " ", stripped)
+        if needle in haystack:
+            return True
+    return False
+
+
 def _classify_submit_delivery(
     control,
     *,
     phys_pane: str,
     text: str,
     ack: dict | None,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str | None]:
     """Advisory pane-scrape for a SUBMITTED prompt that carries no ack.
 
     #516's insert belt (``_wait_for_insert_confirmation``) is a PRE-submit
@@ -1070,35 +1095,54 @@ def _classify_submit_delivery(
     Pane-scrape is unreliable for precise matching, so this NEVER hard-asserts
     delivery — it returns an ADVISORY the caller can weigh, not a verdict.
 
-    Returns ``(delivery, advisory, capture_excerpt)`` where ``delivery`` is:
+    Returns ``(delivery, advisory, capture_excerpt, verified_by)`` where
+    ``delivery`` is:
       * ``"confirmed"`` — an ack is present (no scrape needed);
       * ``"failed"``    — the draft is still stuck in the composer with a
         swallowed Enter (the submit did NOT clear the input);
-      * ``"likely"``    — the composer cleared (prompt accepted); the message
-        was almost certainly delivered and is likely queued behind a running
-        tool call. Advisory only — confirm from the scrape.
+      * ``"likely"``    — an engine-specific capture signal shows the target TUI
+        accepted the prompt even though no hook ack arrived;
+      * ``"unverified"`` — bytes may have been issued, but neither ack nor
+        engine-specific ingestion proof appeared.
     """
     if ack:
-        return "confirmed", "", ""
+        return "confirmed", "", "", "UserPromptSubmit"
     capture = ""
     try:
         capture = _capture_pane_text(control, phys_pane, lines=20)
     except Exception as exc:
         log.debug("tmuxctld: submit-advisory capture failed pane=%s: %s", phys_pane, exc)
         capture = ""
+    agent = "auto"
+    try:
+        agent = resolve_agent_for_pane(control.adapter, phys_pane, "auto", default="auto")
+    except Exception as exc:
+        log.debug("tmuxctld: submit-advisory agent resolution failed pane=%s: %s", phys_pane, exc)
+        agent = "auto"
+
+    if agent == "codex" and _detect_codex_user_message(capture, text):
+        return (
+            "likely",
+            "codex prompt appears in the transcript as an accepted user message, "
+            "but no UserPromptSubmit ack arrived",
+            capture[-500:],
+            "capture-pane:codex-user-message",
+        )
+
     if _detect_swallowed_submit(capture, text):
         return (
             "failed",
             "submit did not clear the composer — the draft is still present with a "
             "swallowed Enter; the message was NOT delivered",
             capture[-500:],
+            None,
         )
     return (
-        "likely",
-        "send likely delivered but not confirmed — suspected queued behind a running "
-        "tool call in the target agent; review the pane scrape and continue if it "
-        "looks received",
+        "unverified",
+        "send issued but not confirmed — no UserPromptSubmit ack or engine-specific "
+        "ingestion signal was observed; do not blind-retry",
         capture[-500:],
+        None,
     )
 
 
@@ -1527,18 +1571,21 @@ def _send_text_pipeline(
         if send_exception is not None:
             _SEND_IDEMPOTENCY.abort(operation_id)
 
-    verification_status = "submitted" if ack else ("unverified" if verify else "not_requested")
     # When verification was never requested, a completed send is "submitted", not
     # "unverified" — only a requested-but-unacked send is genuinely unverified.
+    verification_status = "submitted" if ack else ("unverified" if verify else "not_requested")
     status = "submitted" if ack or not verify else "unverified"
     # Advisory delivery classification for the no-ack case: an unacked submit is
     # ambiguous (queued behind a tool call vs. genuinely stuck). Scrape the pane
     # and hand the caller a soft verdict + the raw scrape instead of forcing it
     # to infer failure from a bare `unverified`. Never raises; ack present is a
     # no-op ("confirmed").
-    delivery, advisory, capture_excerpt = _classify_submit_delivery(
+    delivery, advisory, capture_excerpt, delivery_verified_by = _classify_submit_delivery(
         control, phys_pane=phys_pane, text=text, ack=ack
     )
+    if verify and not ack and delivery == "likely" and delivery_verified_by:
+        verification_status = "likely"
+        status = "likely"
     if delivery == "failed":
         failures.append({"type": "submit_not_cleared", "detail": advisory})
     result = {
@@ -1549,7 +1596,7 @@ def _send_text_pipeline(
         "operation_id": operation_id or None,
         "payload_hash": payload_hash,
         "verification_status": verification_status,
-        "verified_by": "UserPromptSubmit" if ack else None,
+        "verified_by": "UserPromptSubmit" if ack else delivery_verified_by,
         "ack": ack,
         "delivery": delivery,
         "advisory": advisory or None,

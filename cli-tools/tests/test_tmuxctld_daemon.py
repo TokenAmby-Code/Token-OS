@@ -1362,6 +1362,124 @@ def test_send_text_reports_unverified_without_prompt_submit_ack() -> None:
         server.shutdown()
 
 
+class CodexQueuedUserMessageAdapter(SendAckAdapter):
+    """Codex pane with no hook ack but transcript shows accepted user turn."""
+
+    def capture_pane(self, pane_id: str, *, lines: int = 10) -> str:
+        return "› do the thing\n\n• queued behind current turn\n╭──────────╮\n│ ›        │\n╰──────────╯\n"
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@TOKEN_API_ENGINE":
+            return "codex"
+        return ""
+
+
+def test_codex_user_message_capture_marks_unacked_submit_likely() -> None:
+    CodexQueuedUserMessageAdapter.calls = []
+    server, _ = _serve(CodexQueuedUserMessageAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "ack_submit_retries": 0,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["delivery"] == "likely"
+        assert result["verification_status"] == "likely"
+        assert result["verified_by"] == "capture-pane:codex-user-message"
+        assert not result["failures"]
+    finally:
+        server.shutdown()
+
+
+class CodexNoIngestionAdapter(SendAckAdapter):
+    """Codex pane with bytes issued but no ack and no transcript marker."""
+
+    def capture_pane(self, pane_id: str, *, lines: int = 10) -> str:
+        return "Ready\n╭──────────╮\n│ ›        │\n╰──────────╯\n"
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@TOKEN_API_ENGINE":
+            return "codex"
+        return ""
+
+
+def test_codex_without_ack_or_ingestion_stays_unverified() -> None:
+    CodexNoIngestionAdapter.calls = []
+    server, _ = _serve(CodexNoIngestionAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "ack_submit_retries": 0,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+        assert result["delivery"] == "unverified"
+        assert result["verification_status"] == "unverified"
+        assert result["verified_by"] is None
+    finally:
+        server.shutdown()
+
+
+class CodexStuckComposerAdapter(SendAckAdapter):
+    """Codex pane whose payload remains in bordered composer chrome."""
+
+    def capture_pane(self, pane_id: str, *, lines: int = 10) -> str:
+        return "╭────────────────────╮\n│ › do the thing      │\n│                     │\n╰────────────────────╯\n"
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@TOKEN_API_ENGINE":
+            return "codex"
+        return ""
+
+
+def test_codex_stuck_composer_still_fails_not_likely(monkeypatch: pytest.MonkeyPatch) -> None:
+    CodexStuckComposerAdapter.calls = []
+    monkeypatch.setattr(daemon, "_notify_swallowed_submit", lambda **_kwargs: None)
+    server, _ = _serve(CodexStuckComposerAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "ack_submit_retries": 0,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+        assert result["delivery"] == "failed"
+        assert result["verification_status"] == "unverified"
+        assert result["verified_by"] is None
+        assert any(f["type"] == "submit_not_cleared" for f in result["failures"])
+    finally:
+        server.shutdown()
+
+
 class LedgerlessStampAdapter(SendAckAdapter):
     """A codex-style worker pane: it carries a live @INSTANCE_ID + @PANE_ID stamp
     but is absent from the wrapper ledger. Reverse resolution must fall back to the

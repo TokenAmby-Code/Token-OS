@@ -3436,3 +3436,155 @@ def test_guard_excludes_real_agent_in_self_lineage(tmp_path: Path) -> None:
         "SELF=$self\n"  # the codex agent is a child of $self -> excluded by lineage
     )
     assert _run_guard_scenario(scenario, tmp_path) == 1
+
+
+def _write_codex_dispatch_probe_fakes(
+    tmp_path: Path, *, live: bool, send_ok: bool = True
+) -> tuple[Path, Path]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ping_log = tmp_path / "tmuxctld-ping.log"
+
+    send_response = (
+        '{"ok":true,"result":{"delivery":"failed",'
+        '"advisory":"submit did not clear composer",'
+        '"capture_excerpt":"draft still visible"}}'
+        if send_ok
+        else '{"ok":false,"error":{"message":"send suppressed before bytes"}}'
+    )
+    live_json = "true" if live else "false"
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf '%s\\n' \"$*\" >> {ping_log}\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"; shift 2 || true\n'
+        'case "$method $path" in\n'
+        '  "GET /freelist") printf \'%s\' \'[{"pane_id":"palace:N","pane_role":"palace:N","window_name":"palace"}]\' | python3 -c \'import json,sys; print(json.dumps({"ok": True, "result": json.loads(sys.stdin.read())}))\' ;;\n'
+        '  "GET /resolve-pane"|"POST /resolve-pane") printf \'{"ok":true,"result":"%%88"}\' ;;\n'
+        f"  \"POST /send-text\") printf '{send_response}' ;;\n"
+        f'  "POST /pane-live") printf \'{{"ok":true,"result":{{"live":{live_json}}}}}\' ;;\n'
+        '  "POST /live-agents") printf \'{"ok":true,"result":""}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${1:-}" == "display-message" ]]; then printf \'bash||palace:N|999|\\n\'; exit 0; fi\n'
+        'if [[ "${1:-}" == "show-options" ]]; then printf \'palace:N\\n\'; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+    return fake_bin, ping_log
+
+
+def test_codex_dispatch_argv_launch_uses_liveness_not_composer_failure(tmp_path: Path) -> None:
+    fake_bin, ping_log = _write_codex_dispatch_probe_fakes(tmp_path, live=True)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_WORKTREE_DUP_CHECK"] = "0"
+
+    prompt = "argv delivery probe marker"
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--engine",
+            "codex",
+            "--target",
+            "palace:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            prompt,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "codex launch delivery will be verified by argv launch + live process" in result.stderr
+    staged = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1]).read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "agent-wrapper.sh' codex" in staged or "agent-wrapper.sh codex" in staged
+    assert "argv\\ delivery\\ probe\\ marker" in staged
+
+
+def test_codex_dispatch_argv_launch_still_fails_when_process_never_starts(tmp_path: Path) -> None:
+    fake_bin, _ping_log = _write_codex_dispatch_probe_fakes(tmp_path, live=False)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_WORKTREE_DUP_CHECK"] = "0"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--engine",
+            "codex",
+            "--target",
+            "palace:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "argv negative probe",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "no live codex agent appeared" in result.stderr
+
+
+def test_codex_dispatch_still_fails_when_daemon_reports_no_bytes_written(tmp_path: Path) -> None:
+    fake_bin, _ping_log = _write_codex_dispatch_probe_fakes(tmp_path, live=True, send_ok=False)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_WORKTREE_DUP_CHECK"] = "0"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--engine",
+            "codex",
+            "--target",
+            "palace:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "argv send failure probe",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "send suppressed before bytes" in result.stderr
