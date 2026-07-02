@@ -1589,16 +1589,21 @@ tmuxctld_stack_dispatch() {
     command="$command_text"
 }
 
+dispatch_tmuxctld_python() {
+  local lib_dir
+  lib_dir="$(cd "${SCRIPT_DIR}/../../tmuxctld/lib" 2>/dev/null && pwd || true)"
+  [[ -n "$lib_dir" ]] || return 2
+  PYTHONPATH="$lib_dir${PYTHONPATH:+:$PYTHONPATH}" python3 "$@"
+}
+
 dispatch_prealloc_page_probe() {
   # Exit 0 when the page is a fixed pre-allocated SLOT page (palace/somnium).
   # Source the page class from tmuxctld's teardown/window config, not from a
   # shell-maintained duplicate list.  Fail open as "not prealloc" if the helper
   # cannot be imported, preserving stack behavior for managed stack pages.
-  local page="$1" lib_dir
+  local page="$1"
   [[ -n "$page" ]] || return 1
-  lib_dir="$(cd "${SCRIPT_DIR}/../../tmuxctld/lib" 2>/dev/null && pwd || true)"
-  [[ -n "$lib_dir" ]] || return 1
-  PYTHONPATH="$lib_dir${PYTHONPATH:+:$PYTHONPATH}" PAGE="$page" python3 - <<'PY'
+  PAGE="$page" dispatch_tmuxctld_python - <<'PY'
 import os
 import sys
 
@@ -1615,12 +1620,10 @@ dispatch_first_free_prealloc_pane() {
   # Print the configured first free role for a pre-allocated page, using the
   # daemon's ledger-derived freelist for occupancy.  No DB rows, @PANE_CLEAN, or
   # shell process heuristics participate.
-  local page="$1" freelist_json lib_dir
+  local page="$1" freelist_json
   [[ -n "$page" ]] || return 2
   freelist_json="$(tmuxctld_result GET /freelist)" || return $?
-  lib_dir="$(cd "${SCRIPT_DIR}/../../tmuxctld/lib" 2>/dev/null && pwd || true)"
-  [[ -n "$lib_dir" ]] || return 2
-  PYTHONPATH="$lib_dir${PYTHONPATH:+:$PYTHONPATH}" PAGE="$page" FREELIST_JSON="$freelist_json" python3 - <<'PY'
+  PAGE="$page" FREELIST_JSON="$freelist_json" dispatch_tmuxctld_python - <<'PY'
 import json
 import os
 import sys
