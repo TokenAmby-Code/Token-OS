@@ -290,6 +290,7 @@ class WrapperLedger:
                 "#{@TOKEN_API_ENGINE}",
                 "#{@TOKEN_API_CWD}",
                 "#{@PANE_BORN}",
+                "#{pane_dead}",
             ]
         )
         raw = adapter.run("list-panes", "-a", "-F", fields, allow_failure=True)
@@ -297,9 +298,13 @@ class WrapperLedger:
         for line in raw.splitlines():
             parts = line.split(_SCAN_SEP)
             if len(parts) == 7:
-                # Backward compatibility for older scan formats.
-                parts = ["", *parts]
-            if len(parts) != 8:
+                # Backward compatibility for the oldest scan format (no wrapper_id,
+                # no pane_dead).
+                parts = ["", *parts, "0"]
+            elif len(parts) == 8:
+                # Prior scan format without the trailing pane_dead flag.
+                parts = [*parts, "0"]
+            if len(parts) != 9:
                 continue
             (
                 wrapper_id,
@@ -310,9 +315,19 @@ class WrapperLedger:
                 engine,
                 working_dir,
                 born_epoch,
+                pane_dead,
             ) = parts
             wrapper_id = _s(wrapper_id) or _s(legacy_wrapper_id)
             if not wrapper_id:
+                continue
+            # HUSK-SAFE: a remain-on-exit dead pane is still listed by `list-panes
+            # -a`, and it may still carry a stale @TOKEN_API_WRAPPER_ID while its
+            # @INSTANCE_ID has been scrubbed. Re-deriving an OPEN row from such a
+            # husk resurrects a hollow (often empty-instance_id) row and worsens the
+            # split-brain the reaper exists to close. The physical pane truth is
+            # "this wrapper is dead", so it must NOT become a live OPEN row; the
+            # prior active row is pruned below (dead husk absent from live_rows).
+            if _s(pane_dead) in {"1", "true", "yes"}:
                 continue
             row = WrapperLedgerRow.from_mapping(
                 {
