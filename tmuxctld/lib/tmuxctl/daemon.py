@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -103,6 +104,25 @@ _PUBLIC_PANE_ID_RX = re.compile(r"^[^:%\s]+:[^:%\s]+$")
 _VOICE_LIST_SEP = "__TMUXCTLD_VOICE_FIELD__"
 _VOICE_LOCK_OPTION = "@DISCORD_VOICE_LOCK"
 _VOICE_PROCESSING_OPTION = "@DISCORD_VOICE_PROCESSING"
+
+_CLIENT_DISCONNECT_ERRNOS = frozenset(
+    errno_value
+    for errno_value in (
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ESHUTDOWN", None),
+    )
+    if errno_value is not None
+)
+
+
+def _is_client_disconnect(exc: BaseException) -> bool:
+    """Return True for normal HTTP client disconnects during request/response IO."""
+
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    return isinstance(exc, OSError) and getattr(exc, "errno", None) in _CLIENT_DISCONNECT_ERRNOS
 
 
 def ensure_tmux_lifecycle_hooks() -> dict:
@@ -554,6 +574,42 @@ def _h_instance_id_for_pane(control, params):
 
 def _h_resolve_pane(control, params):
     target = _s(params, "target")
+    ledger_row = control.ledger_resolve(
+        target,
+        wrapper_id=_s(params, "wrapper_id"),
+        instance_id=_s(params, "instance_id"),
+        pane_positional_id=_s(params, "pane_positional_id") or _s(params, "pane_label"),
+    )
+    if ledger_row.get("found"):
+        row = ledger_row["row"]
+        if _s(params, "format", "full") == "json":
+            return {
+                "requested": target
+                or _s(params, "wrapper_id")
+                or _s(params, "instance_id")
+                or _s(params, "pane_positional_id")
+                or _s(params, "pane_label"),
+                "pane_id": row["pane_positional_id"],
+                "role": row["pane_positional_id"],
+                "kind": "ledger",
+                "agent": row["engine"] or "auto",
+                "live_agent": bool(row["engine"]),
+                "ledger": row,
+            }
+        if _s(params, "format", "full") == "id":
+            return row["pane_positional_id"]
+        return "\n".join(
+            [
+                f"requested: {target or row['wrapper_id']}",
+                f"pane_id: {row['pane_positional_id'] or '(unset)'}",
+                f"role: {row['pane_positional_id'] or '(unset)'}",
+                "kind: ledger",
+                f"agent: {row['engine'] or 'auto'}",
+                f"live_agent: {str(bool(row['engine'])).lower()}",
+                f"wrapper_id: {row['wrapper_id']}",
+                f"instance_id: {row['instance_id']}",
+            ]
+        )
     fmt = _s(params, "format", "full")
     if fmt == "id":
         return control.public_pane_id(target)
@@ -725,7 +781,7 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
     re-queueable) when locked; returns the resolved physical pane id otherwise.
 
     The human lock is keyed on the PHYSICAL ``%NN`` (the tmux any-key binding
-    stamps ``@TYPING_LOCK_UNTIL`` per physical pane). A canonical caller id
+    reads daemon-owned JSON guard state per physical pane). A canonical caller id
     (``council:custodes``, ``mechanicus:N``, …) must therefore be resolved before
     the lock read, or the read keys off a non-physical target tmux does not
     understand, the lock reads as unset, and the send pierces. So resolution is
@@ -791,6 +847,43 @@ def _detect_swallowed_submit(capture: str, payload: str) -> bool:
     if not needle or needle not in capture:
         return False
     return capture.endswith("\n")
+
+
+@contextlib.contextmanager
+def _agent_guard_transaction(control, pane: str, *, seconds: int = 8):
+    """Own a multi-part daemon pane-write transaction with a JSON AGENT guard."""
+    phys_pane = _resolve_physical_pane_or_gate(control, pane)
+    _raise_if_human_locked(phys_pane)
+    owner = None
+    try:
+        owner = typing_guard_state.hold(
+            typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+            phys_pane,
+            seconds=seconds,
+            now=typing_guard_state.now_epoch(),
+        )
+    except Exception as exc:
+        log.debug("tmuxctld: agent-guard transaction hold skipped pane=%s: %s", phys_pane, exc)
+        owner = None
+    ctx = (
+        thread_local_override("tmuxctld-send-holder", owner=owner)
+        if owner
+        else contextlib.nullcontext()
+    )
+    try:
+        with ctx:
+            yield owner
+    finally:
+        if owner:
+            try:
+                typing_guard_state.release(
+                    typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+                    phys_pane,
+                    now=typing_guard_state.now_epoch(),
+                    owner=owner,
+                )
+            except Exception as exc:
+                log.warning("tmuxctld: agent-guard transaction release failed pane=%s: %s", phys_pane, exc)
 
 
 def _notify_swallowed_submit(*, pane_public: str, instance_id: str, payload_hash: str) -> None:
@@ -1125,18 +1218,19 @@ def _send_text_pipeline(
         int(verify_timeout * (max(0, ack_submit_retries) + 1) + submit_settle_seconds * 4) + 2,
     )
     held = False
+    guard_owner = None
     try:
-        held = bool(
-            typing_guard_state.hold(
-                typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
-                phys_pane,
-                seconds=hold_seconds,
-                now=typing_guard_state.now_epoch(),
-            )
+        guard_owner = typing_guard_state.hold(
+            typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+            phys_pane,
+            seconds=hold_seconds,
+            now=typing_guard_state.now_epoch(),
         )
+        held = bool(guard_owner)
     except Exception as exc:  # tmux unreachable / no live server (e.g. unit tests)
         log.debug("tmuxctld: agent-guard hold skipped pane=%s: %s", phys_pane, exc)
         held = False
+        guard_owner = None
 
     # When we hold, pierce our OWN agent lock so the send we just guarded is not
     # delayed by the green state we set — thread-locally, so a concurrent send to
@@ -1145,7 +1239,9 @@ def _send_text_pipeline(
     # on/pending lock), we do NOT pierce: the send routes through the normal gate
     # and delays behind the human, never stomping the Emperor's keystrokes.
     override_ctx = (
-        thread_local_override("tmuxctld-send-holder") if held else contextlib.nullcontext()
+        thread_local_override("tmuxctld-send-holder", owner=guard_owner)
+        if held
+        else contextlib.nullcontext()
     )
 
     def _send_submit_key() -> None:
@@ -1297,15 +1393,15 @@ def _send_text_pipeline(
         send_exception = exc
         raise
     finally:
-        # The guard must never leak green past the handshake. Release only what
-        # we acquired (release clears @TYPING_AGENT_UNTIL only and re-projects a
-        # human lock that may have arrived mid-hold via expire_pane semantics).
+        # The guard must never leak green past the handshake. Release only the
+        # owner token this request acquired; never clear a concurrent guard.
         if held:
             try:
                 typing_guard_state.release(
                     typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
                     phys_pane,
                     now=typing_guard_state.now_epoch(),
+                    owner=guard_owner,
                 )
             except Exception as exc:
                 log.warning("tmuxctld: agent-guard release failed pane=%s: %s", phys_pane, exc)
@@ -1329,6 +1425,7 @@ def _send_text_pipeline(
         "recovery_submit_credited": recovery_submit_credited,
         "idempotent_replay": False,
         "guard_held": held,
+        "guard_owner": guard_owner,
         "swallowed_submit_detected": swallowed_submit_detected,
         "recovery_attempts": recovery_attempts,
         "failures": failures,
@@ -1370,13 +1467,17 @@ def _h_insert_text(control, params):
 
 
 def _h_prompt_start(control, params):
-    control.move_to_prompt_start(_s(params, "pane"), page_ups=_i(params, "page_ups", 50))
-    return {"pane": _s(params, "pane"), "status": "prompt-start"}
+    pane = _s(params, "pane")
+    with _agent_guard_transaction(control, pane):
+        control.move_to_prompt_start(pane, page_ups=_i(params, "page_ups", 50))
+    return {"pane": pane, "status": "prompt-start"}
 
 
 def _h_prompt_end(control, params):
-    control.move_to_prompt_end(_s(params, "pane"), page_downs=_i(params, "page_downs", 50))
-    return {"pane": _s(params, "pane"), "status": "prompt-end"}
+    pane = _s(params, "pane")
+    with _agent_guard_transaction(control, pane):
+        control.move_to_prompt_end(pane, page_downs=_i(params, "page_downs", 50))
+    return {"pane": pane, "status": "prompt-end"}
 
 
 def _h_invoke_skill(control, params):
@@ -1568,10 +1669,24 @@ def _h_assert_instance(control, params):
 
 def _h_reconcile(control, params):
     # The detached daemon has no ambient tmux session; the fleet lives in `main`.
-    return {"results": control.reconcile_personas(session=_s(params, "session", "main"))}
+    return {
+        "ledger": control.ledger_reconcile(),
+        "results": control.reconcile_personas(session=_s(params, "session", "main")),
+    }
 
 
 def _h_event(control, params):
+    if (_s(params, "event").strip().lower().replace("_", "-") == "pane-died") and _s(
+        params, "pane"
+    ):
+        try:
+            pane_label = _adapter_show_pane_option(control, _s(params, "pane"), "@PANE_ID")
+            if pane_label:
+                row = control.ledger_resolve(pane_positional_id=pane_label).get("row")
+                if row and row.get("wrapper_id"):
+                    control.ledger_close(row["wrapper_id"])
+        except Exception:
+            log.exception("tmuxctld ledger close on pane-died failed")
     return control.handle_event(
         _s(params, "event"), pane=_s(params, "pane"), session=_s(params, "session", "main")
     )
@@ -1594,7 +1709,61 @@ def _h_clear_runtime(control, params):
     return control.clear_runtime(_s(params, "pane"))
 
 
+def _h_ledger_upsert(control, params):
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
+    return control.ledger_upsert(
+        wrapper_id=_s(params, "wrapper_id")
+        or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
+        or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID"),
+        instance_id=_s(params, "instance_id"),
+        persona=_s(params, "persona"),
+        pane_positional_id=_s(params, "pane_positional_id")
+        or _s(params, "pane_label")
+        or _s(params, "pane_id"),
+        engine=_s(params, "engine"),
+        working_dir=_s(params, "working_dir") or _s(params, "cwd"),
+        born_epoch=params.get("born_epoch"),
+        state=_s(params, "state", "OPEN"),
+    )
+
+
+def _h_ledger_resolve(control, params):
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
+    return control.ledger_resolve(
+        _s(params, "id") or _s(params, "value"),
+        wrapper_id=_s(params, "wrapper_id")
+        or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
+        or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID"),
+        instance_id=_s(params, "instance_id"),
+        pane_positional_id=_s(params, "pane_positional_id")
+        or _s(params, "pane_label")
+        or _s(params, "pane_id"),
+        include_closed=_b(params, "include_closed"),
+    )
+
+
+def _h_ledger_rows(control, params):
+    from .wrapper_ledger import LEDGER
+
+    return {
+        "path": str(LEDGER.path),
+        "rows": control.ledger_rows(include_closed=_b(params, "include_closed", True)),
+    }
+
+
 _WRAPPEREND_LIST_SEP = "__TMUXCTLD_WRAPPEREND_FIELD__"
+
+
+def _wrapper_id_from_params(params: dict) -> str:
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
+    return (
+        _s(params, "wrapper_id")
+        or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
+        or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    )
 
 
 def _adapter_show_pane_option(control: TmuxControlPlane, pane: str, option: str) -> str:
@@ -1622,14 +1791,16 @@ def _find_pane_by_wrapper_id(control: TmuxControlPlane, wrapper_launch_id: str) 
         "list-panes",
         "-a",
         "-F",
-        _WRAPPEREND_LIST_SEP.join(["#{pane_id}", "#{@TOKEN_API_WRAPPER_LAUNCH_ID}"]),
+        _WRAPPEREND_LIST_SEP.join(
+            ["#{pane_id}", "#{@TOKEN_API_WRAPPER_ID}", "#{@TOKEN_API_WRAPPER_LAUNCH_ID}"]
+        ),
         allow_failure=True,
     )
     for line in raw.splitlines():
         if not line:
             continue
-        pane_id, owner = (line.split(_WRAPPEREND_LIST_SEP, 1) + [""])[:2]
-        if owner.strip() == wrapper_launch_id and pane_id.strip():
+        pane_id, owner, legacy_owner = (line.split(_WRAPPEREND_LIST_SEP, 2) + ["", ""])[:3]
+        if wrapper_launch_id in {owner.strip(), legacy_owner.strip()} and pane_id.strip():
             return pane_id.strip()
     return ""
 
@@ -1643,7 +1814,7 @@ def _h_hook_wrapperend(control, params):
     no-ops; a pane owned by a different wrapper is surfaced as an error.
     """
     env = params.get("env") if isinstance(params.get("env"), dict) else {}
-    wrapper_launch_id = _s(params, "wrapper_launch_id") or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    wrapper_launch_id = _wrapper_id_from_params(params)
     pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
     if not wrapper_launch_id:
         log.error("tmuxctld wrapperend missing wrapper_launch_id pane=%s", pane)
@@ -1660,7 +1831,9 @@ def _h_hook_wrapperend(control, params):
             "pane": "",
         }
 
-    owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_ID")
+    legacy_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    owner = owner or legacy_owner
     if owner and owner != wrapper_launch_id:
         log.error(
             "tmuxctld wrapperend ownership mismatch pane=%s payload_wrapper=%s pane_wrapper=%s",
@@ -1677,6 +1850,7 @@ def _h_hook_wrapperend(control, params):
         }
 
     pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
+    ledger_close = control.ledger_close(wrapper_launch_id)
     window_name = control.adapter.run(
         "display-message", "-t", pane, "-p", "#{window_name}", allow_failure=True
     ).strip()
@@ -1693,6 +1867,7 @@ def _h_hook_wrapperend(control, params):
         "wrapper_launch_id": wrapper_launch_id,
         "pane": (reap or {}).get("pane", pane),
         "pane_label": pane_label,
+        "ledger": ledger_close,
         "reap": reap,
         "teardown": teardown,
     }
@@ -1720,7 +1895,7 @@ def _h_hook_wrapperstart(control, params):
     from . import assertions
 
     env = params.get("env") if isinstance(params.get("env"), dict) else {}
-    wrapper_launch_id = _s(params, "wrapper_launch_id") or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    wrapper_launch_id = _wrapper_id_from_params(params)
     pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
     if not wrapper_launch_id:
         log.error("tmuxctld wrapperstart missing wrapper_launch_id pane=%s", pane)
@@ -1738,8 +1913,12 @@ def _h_hook_wrapperstart(control, params):
             "tint": "",
         }
 
-    current_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    current_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_ID")
+    legacy_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    current_owner = current_owner or legacy_owner
     if current_owner != wrapper_launch_id:
+        if current_owner:
+            control.ledger_close(current_owner)
         # Reuse path: the next wrapper must never inherit statusline/persona/guard
         # stamps from the prior occupant.  This is the same daemon-owned runtime
         # cleanup pathway WrapperEnd uses; wrapperstart then stamps the new owner.
@@ -1753,6 +1932,17 @@ def _h_hook_wrapperstart(control, params):
         "-p",
         "-t",
         pane,
+        "@TOKEN_API_WRAPPER_ID",
+        wrapper_launch_id,
+        allow_failure=True,
+    )
+    # Keep the legacy pane option populated until every consumer has moved to
+    # TOKEN_API_WRAPPER_ID. Reconcile and old wrapper cleanup paths still accept it.
+    control.adapter.run(
+        "set-option",
+        "-p",
+        "-t",
+        pane,
         "@TOKEN_API_WRAPPER_LAUNCH_ID",
         wrapper_launch_id,
         allow_failure=True,
@@ -1760,6 +1950,18 @@ def _h_hook_wrapperstart(control, params):
 
     # (2) Persona tint from the durable pane label (no @INSTANCE_ID dependency).
     pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
+    engine = _s(params, "engine") or _s(env, "TOKEN_API_ENGINE")
+    working_dir = _s(params, "cwd") or _s(params, "working_dir") or _s(env, "TOKEN_API_CWD")
+    persona = _s(params, "persona") or _s(env, "TOKEN_API_PERSONA") or pane_label
+    ledger_row = control.ledger_upsert(
+        wrapper_id=wrapper_launch_id,
+        persona=persona,
+        pane_positional_id=pane_label,
+        engine=engine,
+        working_dir=working_dir,
+        born_epoch=time.time(),
+        state="OPEN",
+    )
     tint = ""
     try:
         tint = assertions.apply_persona_pane_tint(control.adapter, pane, pane_label) or ""
@@ -1771,6 +1973,7 @@ def _h_hook_wrapperstart(control, params):
         "wrapper_launch_id": wrapper_launch_id,
         "pane": pane,
         "pane_label": pane_label,
+        "ledger": ledger_row,
         "tint": tint,
     }
 
@@ -1979,14 +2182,84 @@ def _h_goto_spoken(control, params):
 def _h_typing_guard_state(control, params):
     del control
     cmd = _s(params, "cmd", _s(params, "action"))
-    if cmd not in {"arm", "pending", "hold", "release", "expire-pane"}:
-        raise ValueError("typing guard state cmd must be arm, pending, hold, release, or expire-pane")
+    if cmd not in {"arm", "pending", "hold", "release", "expire-pane", "status"}:
+        raise ValueError(
+            "typing guard state cmd must be arm, pending, hold, release, expire-pane, or status"
+        )
     argv = [cmd]
-    for key in ("pane", "seconds", "now", "client", "term", "pid", "session"):
+    for key in ("pane", "seconds", "now", "client", "term", "pid", "session", "owner"):
         value = _opt(params, key)
         if value is not None and value != "":
             argv.extend([f"--{key}", str(value)])
-    return {"returncode": typing_guard_state.main(argv)}
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        rc = typing_guard_state.main(argv)
+    text = stdout.getvalue().strip()
+    payload = {"returncode": int(rc or 0)}
+    if text:
+        try:
+            payload.update(json.loads(text))
+        except json.JSONDecodeError:
+            payload["stdout"] = text
+    elif _s(params, "pane"):
+        payload.update(
+            typing_guard_state.status(
+                typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+                _s(params, "pane"),
+            )
+        )
+    if cmd == "arm":
+        _schedule_typing_guard_expiry_rehydrate(payload)
+    return payload
+
+
+def _schedule_typing_guard_expiry_rehydrate(payload: dict) -> None:
+    """One-shot topology repair after a HUMAN guard's deadline.
+
+    The timer must not clear/extend state.  It only re-reads the currently
+    focused pane's existing guard projections and enables root ``Any`` if no
+    active HUMAN guard remains there.
+    """
+
+    if str(payload.get("kind") or "").lower() != typing_guard_state.HUMAN:
+        return
+    if not payload.get("active"):
+        return
+    try:
+        until = int(float(payload.get("until")))
+    except (TypeError, ValueError):
+        return
+
+    def _fire() -> None:
+        delay = max(0.0, until - time.time())
+        if delay:
+            time.sleep(delay)
+        try:
+            typing_guard_state.rehydrate_any_binding(
+                typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
+                now=typing_guard_state.now_epoch(),
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_fire, name="typing-guard-expiry-rehydrate", daemon=True).start()
+
+
+def _h_typing_guard_topology(control, params):
+    del control
+    cmd = _s(params, "cmd", _s(params, "action", "rehydrate"))
+    tmux = typing_guard_state.Tmux(typing_guard_state.tmux_binary())
+    if cmd == "rehydrate":
+        return typing_guard_state.rehydrate_any_binding(
+            tmux,
+            _s(params, "pane"),
+            now=typing_guard_state.now_epoch(_opt(params, "now")),
+        )
+    if cmd == "enable":
+        return typing_guard_state.enable_any_binding(tmux)
+    if cmd == "disable":
+        return typing_guard_state.disable_any_binding(tmux)
+    raise ValueError("typing guard topology cmd must be rehydrate, enable, or disable")
 
 
 def _h_client_lease(control, params):
@@ -2448,6 +2721,10 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("GET", "/tmux/resolve-instance"): _h_resolve_instance,
     ("GET", "/tmux/instance-id-for-pane"): _h_instance_id_for_pane,
     ("GET", "/resolve-pane"): _h_resolve_pane,
+    ("GET", "/ledger/resolve"): _h_ledger_resolve,
+    ("POST", "/ledger/resolve"): _h_ledger_resolve,
+    ("GET", "/ledger/rows"): _h_ledger_rows,
+    ("POST", "/ledger/upsert"): _h_ledger_upsert,
     ("GET", "/resolve-agent"): _h_resolve_agent,
     ("GET", "/freelist"): _h_freelist,
     ("GET", "/session-doc"): _h_session_doc,
@@ -2499,6 +2776,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/open-session-doc"): _h_open_session_doc,
     ("POST", "/goto-spoken"): _h_goto_spoken,
     ("POST", "/typing-guard-state"): _h_typing_guard_state,
+    ("POST", "/typing-guard-topology"): _h_typing_guard_topology,
     ("POST", "/client-lease"): _h_client_lease,
     ("POST", "/pane-rename"): _h_pane_rename,
     ("POST", "/shuttle"): _keybind_anchor(
@@ -2591,6 +2869,12 @@ class TmuxctldServer(ThreadingHTTPServer):
         self.sha = sha
         self.advertised_port = advertised_port or server_address[1]
         self.ready = threading.Event()
+        try:
+            from .wrapper_ledger import LEDGER
+
+            LEDGER.load()
+        except Exception:
+            log.exception("tmuxctld wrapper ledger load failed")
         # Throttle state for the /health-driven lifecycle-hook re-assertion. A
         # 0.0 deadline forces the re-install on the first health check after boot.
         self._hook_reassert_lock = threading.Lock()
@@ -2641,10 +2925,28 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):  # noqa: N802
-        self._dispatch("GET")
+        self._safe_dispatch("GET")
 
     def do_POST(self):  # noqa: N802
-        self._dispatch("POST")
+        self._safe_dispatch("POST")
+
+    def finish(self) -> None:
+        """Suppress normal client-disconnect noise from stdlib connection cleanup."""
+
+        try:
+            super().finish()
+        except OSError as exc:
+            if _is_client_disconnect(exc):
+                return
+            raise
+
+    def _safe_dispatch(self, method: str) -> None:
+        try:
+            self._dispatch(method)
+        except OSError as exc:
+            if _is_client_disconnect(exc):
+                return
+            raise
 
     def _dispatch(self, method: str) -> None:
         parsed = urlsplit(self.path)
@@ -2735,8 +3037,10 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except BrokenPipeError:
-            pass
+        except OSError as exc:
+            if _is_client_disconnect(exc):
+                return
+            raise
 
     def log_message(self, *_args):
         """Silence stdlib access logging — launchd captures stderr already."""

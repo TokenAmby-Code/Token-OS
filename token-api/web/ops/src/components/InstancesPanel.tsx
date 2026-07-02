@@ -68,6 +68,14 @@ function StatusPill({ status }: { status: string }) {
   return <span className={`pill pill--${statusTone(status)}`}>{status}</span>;
 }
 
+function AttentionMeta({ inst }: { inst: OpsInstance }) {
+  return (
+    <span className="subline">
+      rank {inst.attention_rank} · {(inst.attention_reasons ?? []).join(', ') || 'no reasons'}
+    </span>
+  );
+}
+
 // 40k persona identity, tinted by its canonical hex shade. The persona
 // name implies the voice (persona<->voice is 1:1), so this replaces any raw voice
 // surface. null (e.g. a legacy pre-rename profile_name) renders a muted dash.
@@ -146,6 +154,7 @@ function ExpandedInstance({
         {inst.engine} · {inst.device_id ?? '—'} · {inst.persona?.slug ?? 'no persona'}
         {inst.is_subagent ? ' · subagent' : ''}
       </span>
+      <AttentionMeta inst={inst} />
 
       {isTalking && current ? (
         <div className="xi__speaking">
@@ -234,6 +243,7 @@ export function InstancesPanel({
               <th>Session doc</th>
               <th>Golden Throne</th>
               <th>Next action</th>
+              <th>Rank</th>
             </tr>
           </thead>
           <tbody>
@@ -262,6 +272,10 @@ export function InstancesPanel({
                 <td><SessionDocCell inst={inst} /></td>
                 <td><GtCell inst={inst} /></td>
                 <td className="action">{inst.next_required_action ?? inst.workflow_state ?? '—'}</td>
+                <td className="action">
+                  {inst.attention_rank}
+                  <AttentionMeta inst={inst} />
+                </td>
               </tr>
             ))}
           </tbody>
@@ -281,6 +295,7 @@ export function InstancesPanel({
               <StatusPill status={inst.status} />
             </header>
             <span className="subline">{inst.engine} · {inst.device_id ?? '—'} · {inst.persona?.slug ?? 'no persona'}</span>
+            <AttentionMeta inst={inst} />
             <div className="fcard__grid">
               <div><span className="k">persona</span><ChapterChip inst={inst} /></div>
               <div><span className="k">age</span>{formatAge(inst.age_seconds)}{inst.stale.is_stale ? ' · stale' : ''}</div>

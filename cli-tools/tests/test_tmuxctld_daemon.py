@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -19,7 +20,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl import daemon
+from tmuxctl import daemon, wrapper_ledger
 from tmuxctl import service as tmux_service
 
 # Captured before any monkeypatching so the dedicated re-assertion tests can
@@ -28,7 +29,7 @@ _REAL_MAYBE_REASSERT = daemon.TmuxctldServer.maybe_reassert_lifecycle_hooks
 
 
 @pytest.fixture(autouse=True)
-def _no_live_tmux_guard(monkeypatch):
+def _no_live_tmux_guard(monkeypatch, tmp_path):
     """No daemon test may touch a live tmux server (hook-tests-no-live-tmux).
 
     ``_h_send_text`` now acquires/releases the typing-guard AGENT hold, which
@@ -39,6 +40,10 @@ def _no_live_tmux_guard(monkeypatch):
     monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: False)
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
     monkeypatch.setattr(daemon.send_gate, "evaluate", lambda *a, **k: None)
+    monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
+    wrapper_ledger.LEDGER._rows = {}
+    wrapper_ledger.LEDGER._loaded = False
+    wrapper_ledger.LEDGER.load(force=True)
     # /health now re-asserts the tmux lifecycle hooks (which shells real tmux).
     # Neutralise the heartbeat-driven re-assertion module-wide so no /health test
     # touches live tmux; the dedicated re-assertion tests restore the real method.
@@ -140,6 +145,303 @@ def test_health_shape() -> None:
         server.shutdown()
 
 
+@pytest.mark.parametrize(
+    "disconnect",
+    [
+        ConnectionResetError("reset"),
+        BrokenPipeError("pipe"),
+        ConnectionAbortedError("aborted"),
+        OSError(daemon.errno.EPIPE, "pipe"),
+    ],
+)
+def test_response_write_client_disconnect_is_benign(disconnect, caplog) -> None:
+    class FailingWfile:
+        def write(self, _body):
+            raise disconnect
+
+    handler = object.__new__(daemon.TmuxctldHandler)
+    handler.send_response = lambda _status: None
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
+    handler.wfile = FailingWfile()
+
+    daemon.TmuxctldHandler._write(handler, 200, {"ok": True})
+
+    assert not [
+        record for record in caplog.records if "unhandled error dispatching" in record.message
+    ]
+
+
+def test_typing_guard_state_endpoint_routes_supported_json_commands(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        cmd = argv[0]
+        print(
+            json.dumps(
+                {
+                    "kind": "agent" if cmd == "hold" else cmd,
+                    "active": cmd != "release",
+                    "owner": "req-1" if cmd == "hold" else None,
+                }
+            )
+        )
+        return 0
+
+    monkeypatch.setattr(daemon.typing_guard_state, "main", fake_main)
+    server, _ = _serve(StubAdapter)
+    try:
+        for cmd in ("arm", "pending", "hold", "release", "expire-pane", "status"):
+            status, payload = _post(
+                server,
+                "/typing-guard-state",
+                {"cmd": cmd, "pane": "%42", "seconds": 8, "owner": "req-1"},
+            )
+            assert status == 200
+            assert payload["ok"] is True
+            assert payload["result"]["returncode"] == 0
+        assert [call[0] for call in calls] == [
+            "arm",
+            "pending",
+            "hold",
+            "release",
+            "expire-pane",
+            "status",
+        ]
+        assert all("--pane" in call and "%42" in call for call in calls)
+    finally:
+        server.shutdown()
+
+
+def test_typing_guard_state_endpoint_rejects_unknown_command() -> None:
+    server, _ = _serve(StubAdapter)
+    try:
+        status, payload = _post(server, "/typing-guard-state", {"cmd": "legacy", "pane": "%42"})
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+    finally:
+        server.shutdown()
+
+
+def test_typing_guard_arm_disables_any_and_pending_reenables_any() -> None:
+    state: dict[str, str] = {}
+    calls: list[tuple[str, ...]] = []
+
+    class FakeTmux:
+        any_bound = True
+
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "show-options":
+                proc.stdout = state.get(args[-1], "")
+            elif args and args[0] == "list-keys":
+                proc.returncode = 0 if self.any_bound else 1
+                proc.stdout = (
+                    "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+                    "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=arm\"; send-keys'"
+                    if self.any_bound
+                    else ""
+                )
+            elif args[:2] == ("set-option", "-p"):
+                state[args[-2]] = args[-1]
+            elif args[:4] == ("unbind-key", "-q", "-n", "Any"):
+                self.any_bound = False
+            elif args and args[0] == "source-file":
+                self.any_bound = True
+            return proc
+
+    fake = FakeTmux()
+    daemon.typing_guard_state.arm(fake, "%42", seconds=300, now=100)
+    assert json.loads(state[daemon.typing_guard_state.GUARD_JSON_OPTION])["kind"] == "human"
+    assert ("unbind-key", "-q", "-n", "Any") in calls
+
+    calls.clear()
+    daemon.typing_guard_state.pending(fake, "%42", seconds=15, now=110)
+    assert json.loads(state[daemon.typing_guard_state.GUARD_JSON_OPTION])["kind"] == "pending"
+    assert any(call[0] == "source-file" for call in calls), "pending must re-enable root Any"
+    assert not any(call[:4] == ("unbind-key", "-q", "-n", "Any") for call in calls)
+
+
+def test_typing_guard_rehydrate_reads_projections_without_mutating_state() -> None:
+    calls: list[tuple[str, ...]] = []
+    projections = {
+        daemon.typing_guard_state.GUARD_KIND_OPTION: "human",
+        daemon.typing_guard_state.GUARD_UNTIL_OPTION: "999",
+    }
+
+    class FakeTmux:
+        def __init__(self, *, any_bound: bool) -> None:
+            self.any_bound = any_bound
+
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "show-options":
+                proc.stdout = projections.get(args[-1], "")
+            elif args and args[0] == "list-keys":
+                proc.returncode = 0 if self.any_bound else 1
+                proc.stdout = (
+                    "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+                    "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=arm\"; send-keys'"
+                    if self.any_bound
+                    else ""
+                )
+            elif args[:4] == ("unbind-key", "-q", "-n", "Any"):
+                self.any_bound = False
+            elif args and args[0] == "source-file":
+                self.any_bound = True
+            return proc
+
+    result = daemon.typing_guard_state.rehydrate_any_binding(
+        FakeTmux(any_bound=True), "%42", now=100
+    )
+    assert result["topology"] == "disabled"
+    assert ("unbind-key", "-q", "-n", "Any") in calls
+    assert not any(call and call[0] == "set-option" for call in calls)
+    assert not any(daemon.typing_guard_state.GUARD_JSON_OPTION in call for call in calls)
+
+    calls.clear()
+    projections[daemon.typing_guard_state.GUARD_KIND_OPTION] = "pending"
+    result = daemon.typing_guard_state.rehydrate_any_binding(
+        FakeTmux(any_bound=False), "%42", now=100
+    )
+    assert result["topology"] == "enabled"
+    assert any(call and call[0] == "source-file" for call in calls)
+    assert not any(call and call[0] == "set-option" for call in calls)
+
+
+def test_typing_guard_enable_any_is_idempotent_when_canonical_binding_present() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "list-keys":
+                proc.stdout = (
+                    "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+                    "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=arm\"; send-keys'"
+                )
+            return proc
+
+    result = daemon.typing_guard_state.enable_any_binding(FakeTmux())
+
+    assert result["changed"] is False
+    assert result["any_bound"] is True
+    assert not any(call and call[0] == "source-file" for call in calls)
+
+
+def test_typing_guard_disable_any_is_idempotent_when_binding_absent() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 1
+                stdout = ""
+
+            return Proc()
+
+    result = daemon.typing_guard_state.disable_any_binding(FakeTmux())
+
+    assert result["changed"] is False
+    assert result["any_bound"] is False
+    assert not any(call[:4] == ("unbind-key", "-q", "-n", "Any") for call in calls)
+
+
+def test_typing_guard_expired_off_transition_clears_legacy_guard_options() -> None:
+    tg = daemon.typing_guard_state
+    state = {
+        tg.GUARD_JSON_OPTION: json.dumps(
+            {"kind": tg.HUMAN, "until": 100, "owner": None, "source": tg.SOURCE}
+        ),
+        tg.GUARD_UNTIL_OPTION: "100",
+        tg.GUARD_KIND_OPTION: tg.HUMAN,
+        tg.GUARD_MARKER_OPTION: tg.ON_MARKER,
+        **{option: "stale" for option in tg.LEGACY_GUARD_OPTIONS},
+    }
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "show-options":
+                proc.stdout = state.get(args[-1], "")
+            elif args[:2] == ("set-option", "-p"):
+                state[args[-2]] = args[-1]
+            elif args[:2] == ("set-option", "-pu"):
+                state.pop(args[-1], None)
+            return proc
+
+    result = tg.expire_pane(FakeTmux(), "%42", now=200)
+
+    assert result["kind"] == tg.OFF
+    assert state[tg.GUARD_KIND_OPTION] == tg.OFF
+    assert state[tg.GUARD_UNTIL_OPTION] == "0"
+    assert state[tg.GUARD_MARKER_OPTION] == ""
+    assert all(option not in state for option in tg.LEGACY_GUARD_OPTIONS)
+
+
+def test_typing_guard_topology_endpoint_rehydrates_without_state_command(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_rehydrate(tmux, pane="", *, now=None):  # noqa: ARG001
+        calls.append((pane, str(now)))
+        return {"topology": "enabled", "pane": pane}
+
+    monkeypatch.setattr(daemon.typing_guard_state, "rehydrate_any_binding", fake_rehydrate)
+    server, _ = _serve(StubAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/typing-guard-topology",
+            {"cmd": "rehydrate", "pane": "%42", "now": "123"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["result"]["topology"] == "enabled"
+        assert calls == [("%42", "123")]
+    finally:
+        server.shutdown()
+
+
+def test_typing_guard_arm_schedules_expiry_rehydrate(monkeypatch) -> None:
+    fired = threading.Event()
+
+    def fake_rehydrate(*args, **kwargs):  # noqa: ANN002, ANN003
+        fired.set()
+        return {"topology": "enabled"}
+
+    monkeypatch.setattr(daemon.typing_guard_state, "rehydrate_any_binding", fake_rehydrate)
+    daemon._schedule_typing_guard_expiry_rehydrate(
+        {"kind": "human", "active": True, "until": time.time() - 1}
+    )
+    assert fired.wait(timeout=1)
+
+
 def test_resolve_instance_fail_closed_envelope() -> None:
     server, _ = _serve(StubAdapter)
     try:
@@ -157,7 +459,7 @@ def test_resolve_instance_fail_closed_envelope() -> None:
 
 
 class FoundInstanceAdapter:
-    """tmux reachable; one live pane carries @INSTANCE_ID=my-uuid @PANE_ID=mechanicus:1."""
+    """tmux reachable; instance resolution comes from the wrapper ledger."""
 
     def list_sessions(self) -> list:
         return []
@@ -169,6 +471,13 @@ class FoundInstanceAdapter:
 
 
 def test_resolve_instance_returns_canonical_role_never_physical() -> None:
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="wrap-resolve",
+        instance_id="my-uuid",
+        pane_positional_id="mechanicus:1",
+        engine="codex",
+        state="OPEN",
+    )
     server, _ = _serve(FoundInstanceAdapter)
     try:
         _, payload = _get(server, "/tmux/resolve-instance?instance_id=my-uuid")
@@ -183,7 +492,7 @@ def test_resolve_instance_returns_canonical_role_never_physical() -> None:
 
 
 class StampedPaneAdapter:
-    """current pane resolves to %7 and carries @INSTANCE_ID=stamped-uuid."""
+    """current pane resolves to %7 and carries @PANE_ID=mechanicus:1."""
 
     def list_sessions(self) -> list:
         return []
@@ -191,8 +500,8 @@ class StampedPaneAdapter:
     def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[:2] == ("display-message", "-p"):
             return "%7"
-        if args[0] == "show-options" and args[-1] == "@INSTANCE_ID":
-            return "stamped-uuid"
+        if args[0] == "show-options" and args[-1] == "@PANE_ID":
+            return "mechanicus:1"
         return ""
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
@@ -200,6 +509,13 @@ class StampedPaneAdapter:
 
 
 def test_instance_id_for_pane_reads_stamp() -> None:
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="wrap-pane",
+        instance_id="stamped-uuid",
+        pane_positional_id="mechanicus:1",
+        engine="codex",
+        state="OPEN",
+    )
     server, _ = _serve(StampedPaneAdapter)
     try:
         status, payload = _get(server, "/tmux/instance-id-for-pane?pane=current")
@@ -207,7 +523,7 @@ def test_instance_id_for_pane_reads_stamp() -> None:
         result = payload["result"]
         assert result["found"] is True
         assert result["instance_id"] == "stamped-uuid"
-        assert result["pane"] == "%7"
+        assert result["pane"] == "mechanicus:1"
     finally:
         server.shutdown()
 
@@ -336,10 +652,10 @@ class ComprehensiveWrapperEndAdapter(WrapperEndAdapter):
             "@PANE_CLEAN": "1",
             "@PANE_BORN": "123",
             "@CC_STATE": "idle",
-            "@TYPING_LOCK_UNTIL": "9999999999",
-            "@TYPING_PENDING_UNTIL": "9999999999",
-            "@TYPING_AGENT_UNTIL": "9999999999",
-            "@GUARD": "#[fg=green]⌨",
+            "@TYPING_GUARD_JSON": '{"kind":"agent","owner":"wrap-1","source":"tmuxctld","until":9999999999}',
+            "@TYPING_GUARD_UNTIL": "9999999999",
+            "@TYPING_GUARD_KIND": "agent",
+            "@TYPING_GUARD_MARKER": "#[fg=green]⌨",
             "@GT_FIRE": "123",
             "@DISCORD_VOICE_LOCK": "1",
             "@TOKEN_API_CWD": "/old",
@@ -394,10 +710,10 @@ def test_wrapperend_comprehensively_scrubs_identity_status_guard_and_reaps_dead_
             "@PANE_CLEAN",
             "@PANE_BORN",
             "@CC_STATE",
-            "@TYPING_LOCK_UNTIL",
-            "@TYPING_PENDING_UNTIL",
-            "@TYPING_AGENT_UNTIL",
-            "@GUARD",
+            "@TYPING_GUARD_JSON",
+            "@TYPING_GUARD_UNTIL",
+            "@TYPING_GUARD_KIND",
+            "@TYPING_GUARD_MARKER",
             "@SESSION_DOC",
             "@CWD",
             "@GT_FIRE",
@@ -709,6 +1025,97 @@ def test_wrapperstart_requires_wrapper_launch_id() -> None:
         server.shutdown()
 
 
+def test_wrapper_ledger_upsert_resolves_triple_id_and_reloads_json(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "ledger.json"
+    monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(path))
+    wrapper_ledger.LEDGER.load(force=True)
+
+    server, _ = _serve(StubAdapter)
+    try:
+        _, upserted = _post(
+            server,
+            "/ledger/upsert",
+            {
+                "wrapper_id": "wrap-core",
+                "instance_id": "inst-core",
+                "persona": "custodes",
+                "pane_positional_id": "council:custodes",
+                "engine": "codex",
+                "working_dir": "/tmp/core",
+                "state": "OPEN",
+            },
+        )
+        assert upserted["ok"] is True
+        assert path.exists()
+
+        resolved = []
+        for query in (
+            "/ledger/resolve?wrapper_id=wrap-core",
+            "/ledger/resolve?instance_id=inst-core",
+            "/ledger/resolve?pane_positional_id=council:custodes",
+        ):
+            _, payload = _get(server, query)
+            assert payload["ok"] is True
+            assert payload["result"]["found"] is True
+            resolved.append(payload["result"]["row"])
+        assert resolved[0] == resolved[1] == resolved[2]
+    finally:
+        server.shutdown()
+
+    # Simulate daemon boot: a fresh load reconstructs the in-memory indexes from
+    # the write-behind JSON, before any live tmux reconcile scan runs.
+    wrapper_ledger.LEDGER._rows = {}
+    wrapper_ledger.LEDGER._loaded = False
+    wrapper_ledger.LEDGER.load(force=True)
+    assert wrapper_ledger.LEDGER.resolve(instance_id="inst-core").pane_positional_id == (
+        "council:custodes"
+    )
+
+
+class ReconcileLedgerAdapter(StubAdapter):
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("list-panes", "-a", "-F"):
+            sep = wrapper_ledger._SCAN_SEP
+            return sep.join(
+                [
+                    "wrap-live",
+                    "inst-live",
+                    "fabricator-general",
+                    "mechanicus:fabricator-general",
+                    "codex",
+                    "/tmp/live",
+                    "123.5",
+                ]
+            )
+        return ""
+
+
+def test_reconcile_rebuilds_wrapper_ledger_from_tmux_scan(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "ledger.json"
+    monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(path))
+    wrapper_ledger.LEDGER.load(force=True)
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="stale-open",
+        instance_id="stale-inst",
+        pane_positional_id="palace:W",
+        state="OPEN",
+    )
+
+    server, _ = _serve(ReconcileLedgerAdapter)
+    try:
+        _, payload = _post(server, "/reconcile", {})
+        assert payload["ok"] is True
+        assert payload["result"]["ledger"]["open_rows"] == 1
+        assert payload["result"]["ledger"]["pruned_open_rows"] == 1
+        _, resolved = _get(server, "/ledger/resolve?instance_id=inst-live")
+        assert resolved["result"]["row"]["wrapper_id"] == "wrap-live"
+        assert resolved["result"]["row"]["pane_positional_id"] == "mechanicus:fabricator-general"
+        _, stale = _get(server, "/ledger/resolve?instance_id=stale-inst")
+        assert stale["result"]["found"] is False
+    finally:
+        server.shutdown()
+
+
 class RecordingFocusAdapter:
     """Resolves focus-uuid -> palace:1 and records every run() call."""
 
@@ -731,6 +1138,13 @@ class RecordingFocusAdapter:
 
 
 def test_instance_focus_honors_explicit_client() -> None:
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="wrap-focus",
+        instance_id="focus-uuid",
+        pane_positional_id="palace:1",
+        engine="codex",
+        state="OPEN",
+    )
     rec = RecordingFocusAdapter()
     server, _ = _serve(lambda: rec)
     try:
@@ -815,12 +1229,19 @@ class SendAckAdapter:
         self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
-        return "inst-ack" if option == "@INSTANCE_ID" else ""
+        return "ack-pane" if option == "@PANE_ID" else ""
 
 
 def test_send_text_waits_for_user_prompt_submit_ack() -> None:
     SendAckAdapter.calls = []
     SendAckAdapter.literal_sent = threading.Event()
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="wrap-ack",
+        instance_id="inst-ack",
+        pane_positional_id="ack-pane",
+        engine="codex",
+        state="OPEN",
+    )
     server, _ = _serve(SendAckAdapter)
     try:
         result_box: dict = {}
@@ -1201,7 +1622,7 @@ def test_agent_guard_hold_acquired_and_released_even_when_verify_times_out(monke
     SendAckAdapter.calls = []
     events: list[str] = []
     monkeypatch.setattr(
-        daemon.typing_guard_state, "hold", lambda *a, **k: events.append("hold") or True
+        daemon.typing_guard_state, "hold", lambda *a, **k: events.append("hold") or "req-1"
     )
     monkeypatch.setattr(
         daemon.typing_guard_state, "release", lambda *a, **k: events.append("release")
@@ -1275,7 +1696,7 @@ def test_send_text_returns_gated_without_waiting_or_writing_under_typing_guard(m
         },
     )
     monkeypatch.setattr(
-        daemon.typing_guard_state, "hold", lambda *a, **k: hold_calls.append("hold") or True
+        daemon.typing_guard_state, "hold", lambda *a, **k: hold_calls.append("hold") or "req-1"
     )
     server, _ = _serve(SendAckAdapter)
     try:
@@ -1357,7 +1778,7 @@ def test_swallowed_submit_fires_recovery_and_surfaces_loudly(monkeypatch) -> Non
     # never silently eat it.
     StuckDraftAdapter.calls = []
     notified: list[dict] = []
-    monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: True)
+    monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: "req-1")
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_notify_swallowed_submit", lambda **kw: notified.append(kw))
     server, _ = _serve(StuckDraftAdapter)

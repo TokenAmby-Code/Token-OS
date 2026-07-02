@@ -33,7 +33,7 @@ source {str(CLI_TOOLS / "lib" / "agent-wrapper-common.sh")!r}
 API_URL=http://example.invalid
 LAUNCHER=unit-launcher
 ENGINE=codex
-WRAPPER_LAUNCH_ID=wrapper-123
+WRAPPER_ID=wrapper-123
 WORKING_DIR=/tmp/work
 TMUX_PANE_VALUE=%42
 TOKEN_API_DISPATCH_RESOLVED_PANE=%42
@@ -44,7 +44,7 @@ printf '%s' "$payload"
     result = subprocess.run(["bash", "-c", script], check=True, text=True, capture_output=True)
     payload = json.loads(result.stdout)
     assert payload["action"] == "WrapperEnd"
-    assert payload["wrapper_launch_id"] == "wrapper-123"
+    assert payload["wrapper_id"] == "wrapper-123"
     assert payload["engine"] == "codex"
     assert payload["tmux_pane"] == "%42"
     assert payload["exit_code"] == 7
@@ -80,7 +80,7 @@ def _wrapper_env(tmp_path: Path, target: Path, *, fake_curl: bool = True) -> tup
             "CLAUDE_BIN": str(target),
             "TOKEN_API_URL": "http://token-api.invalid",
             "TMUXCTLD_URL": "http://tmuxctld.invalid",
-            "TOKEN_API_WRAPPER_LAUNCH_ID": "wrapper-test-id",
+            "TOKEN_API_WRAPPER_ID": "wrapper-test-id",
             "TOKEN_WRAPPER_SYNC_SHARED_SKILLS": "0",
         }
     )
@@ -366,7 +366,7 @@ def test_claude_command_resolves_agent_wrapper_through_symlink(tmp_path: Path) -
     target = fakebin / "claude-target"
     _write_executable(
         target,
-        f'#!/usr/bin/env bash\nprintf \'id=%s args=%s\\n\' "$TOKEN_API_WRAPPER_LAUNCH_ID" "$*" > {str(called)!r}\n',
+        f'#!/usr/bin/env bash\nprintf \'id=%s args=%s\\n\' "$TOKEN_API_WRAPPER_ID" "$*" > {str(called)!r}\n',
     )
     _write_executable(fakebin / "curl", f'#!/usr/bin/env bash\necho "$*" >> {str(hooks)!r}\n')
     link = tmp_path / "claude"
@@ -378,7 +378,7 @@ def test_claude_command_resolves_agent_wrapper_through_symlink(tmp_path: Path) -
             "PATH": f"{fakebin}:{env.get('PATH', '')}",
             "CLAUDE_BIN": str(target),
             "TOKEN_API_URL": "http://token-api.invalid",
-            "TOKEN_API_WRAPPER_LAUNCH_ID": "fixed-wrapper-id",
+            "TOKEN_API_WRAPPER_ID": "fixed-wrapper-id",
         }
     )
     env.pop("TMUX_PANE", None)
@@ -419,7 +419,7 @@ bash -c "$cmd"
     codex_target = fakebin / "codex-target"
     _write_executable(
         codex_target,
-        f'#!/usr/bin/env bash\nprintf \'id=%s args=%s\\n\' "$TOKEN_API_WRAPPER_LAUNCH_ID" "$*" > {str(codex_called)!r}\nexit 3\n',
+        f'#!/usr/bin/env bash\nprintf \'id=%s args=%s\\n\' "$TOKEN_API_WRAPPER_ID" "$*" > {str(codex_called)!r}\nexit 3\n',
     )
     link = tmp_path / "codex"
     link.symlink_to(CLI_TOOLS / "bin" / "codex")
@@ -429,7 +429,7 @@ bash -c "$cmd"
         {
             "PATH": f"{fakebin}:{env.get('PATH', '')}",
             "TOKEN_API_URL": "http://token-api.invalid",
-            "TOKEN_API_WRAPPER_LAUNCH_ID": "codex-launch-id",
+            "TOKEN_API_WRAPPER_ID": "codex-launch-id",
             "TOKEN_API_DISPATCH_RESOLVED_PANE": "%99",
         }
     )
@@ -564,7 +564,7 @@ def test_command_shims_route_through_wrappers_and_bypass_to_real(tmp_path: Path)
             "CLAUDE_BIN": str(fakebin / "claude-real"),
             "CODEX_BIN": str(fakebin / "codex-real"),
             "TOKEN_API_URL": "http://token-api.invalid",
-            "TOKEN_API_WRAPPER_LAUNCH_ID": "shim-wrapper-id",
+            "TOKEN_API_WRAPPER_ID": "shim-wrapper-id",
         }
     )
     env.pop("TMUX_PANE", None)

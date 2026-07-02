@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -41,6 +42,64 @@ source {str(PR_STEP)!r}
     return run(["bash", "-c", script], cwd, env=env)
 
 
+def install_fake_curl(tmp_path: Path) -> tuple[Path, Path]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "curl.calls.jsonl"
+    curl = fake_bin / "curl"
+    curl.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+python3 - "$CURL_LOG" "$@" <<'PY'
+import json, os, sys
+args = sys.argv[2:]
+with open(sys.argv[1], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(args) + "\\n")
+url = args[-1] if args else ""
+if "/ledger/resolve" in url and os.environ.get("CURL_LEDGER_JSON"):
+    print(os.environ["CURL_LEDGER_JSON"], end="")
+PY
+"""
+    )
+    curl.chmod(0o755)
+    return fake_bin, log
+
+
+def curl_calls(log: Path) -> list[list[str]]:
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
+
+def curl_json_bodies(log: Path, endpoint: str | None = None) -> list[dict[str, object]]:
+    bodies: list[dict[str, object]] = []
+    for args in curl_calls(log):
+        if endpoint is not None and not any(endpoint in arg for arg in args):
+            continue
+        if "-d" not in args:
+            continue
+        body = args[args.index("-d") + 1]
+        bodies.append(json.loads(body))
+    return bodies
+
+
+def ledger_json(instance_id: str = "inst-123", pane: str = "%20") -> str:
+    return json.dumps(
+        {
+            "ok": True,
+            "result": {
+                "found": True,
+                "row": {
+                    "wrapper_id": "wrap-123",
+                    "instance_id": instance_id,
+                    "pane_positional_id": pane,
+                    "state": "OPEN",
+                },
+            },
+        }
+    )
+
+
 def test_commit_step_excludes_staged_worktree_env(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     (repo / ".worktree.env").write_text("# Do not commit\nPORT=9999\n")
@@ -79,6 +138,255 @@ def test_coderabbit_heartbeat_writes_visible_status(tmp_path: Path) -> None:
     )
 
     assert "CodeRabbit poll: still waiting" in heartbeat.read_text()
+
+
+def test_coderabbit_wait_is_unbounded_by_default(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+parse_args
+printf 'timeout=<%s> seconds=%s timed_out=' "$TIMEOUT_MINS" "$(timeout_mins_to_seconds "$TIMEOUT_MINS")"
+if wait_timed_out 999999 "$(timeout_mins_to_seconds "$TIMEOUT_MINS")"; then
+  printf 'yes\\n'
+else
+  printf 'no\\n'
+fi
+""",
+        repo,
+    )
+
+    assert "timeout=<> seconds=0 timed_out=no" in result.stdout
+
+
+def test_explicit_timeout_remains_available_as_operator_cap(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+parse_args --timeout 2
+printf 'timeout=<%s> seconds=%s timed_out=' "$TIMEOUT_MINS" "$(timeout_mins_to_seconds "$TIMEOUT_MINS")"
+if wait_timed_out 120 "$(timeout_mins_to_seconds "$TIMEOUT_MINS")"; then
+  printf 'yes\\n'
+else
+  printf 'no\\n'
+fi
+""",
+        repo,
+    )
+
+    assert "timeout=<2> seconds=120 timed_out=yes" in result.stdout
+
+
+def test_normal_review_does_not_inject_empty_timeout(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    arg_log = tmp_path / "args.log"
+
+    bash_with_pr_step(
+        f"""
+run_internal_capture() {{
+  shift 2
+  printf '%s\\n' "$@" > {str(arg_log)!r}
+}}
+review_pr_normal 7 "check latest head"
+""",
+        repo,
+    )
+
+    args = arg_log.read_text().splitlines()
+    assert args == ["pr_review_main", "7", "--message", "check latest head"]
+    assert "--timeout" not in args
+
+
+def test_normal_create_does_not_inject_empty_timeout(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    arg_log = tmp_path / "args.log"
+
+    bash_with_pr_step(
+        f"""
+run_internal_capture() {{
+  shift 2
+  printf '%s\\n' "$@" > {str(arg_log)!r}
+}}
+current_pr_number() {{ echo 7; }}
+current_pr_url() {{ echo https://example.invalid/pr/7; }}
+mark_pr_flag() {{ :; }}
+create_pr_normal >/dev/null
+""",
+        repo,
+    )
+
+    args = arg_log.read_text().splitlines()
+    assert "--wait" in args
+    assert "--timeout" not in args
+
+
+def test_mark_instance_status_reviewing_sends_workflow_payload(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        "mark_instance_status reviewing",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "CURL_LEDGER_JSON": ledger_json("inst-ledger", "%20"),
+            "TOKEN_API_WRAPPER_ID": "wrap-123",
+            "TOKEN_API_URL": "http://token-api.test",
+        },
+    )
+
+    calls = curl_calls(curl_log)
+    assert any("/ledger/resolve?wrapper_id=wrap-123" in call[-1] for call in calls)
+    status_calls = [call for call in calls if "/api/instances/" in call[-1]]
+    assert len(status_calls) == 1
+    assert "PATCH" in status_calls[0]
+    assert status_calls[0][-1] == "http://token-api.test/api/instances/inst-ledger/status"
+    body = curl_json_bodies(curl_log, "/api/instances/")[0]
+    assert body == {
+        "status": "reviewing",
+        "workflow_state": "review_mode",
+        "next_required_action": "review",
+        "next_action_owner": "human",
+    }
+
+
+def test_pr_step_does_not_arm_generic_plan_hook_at_startup(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        """
+assert_repo() { :; }
+current_pr_number() { echo 22; }
+current_pr_url() { echo https://github.com/owner/repo/pull/22; }
+mark_pr_flag() { :; }
+commit_if_needed() { return 1; }
+push_branch() { :; }
+checks_green() { return 0; }
+summarize_pr() { :; }
+main --no-merge
+""",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "TMUX_PANE": "%20",
+        },
+    )
+
+    hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
+    assert hooks == []
+
+
+def test_review_completion_arms_contextual_plan_followup(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        """
+assert_repo() { :; }
+current_pr_number() { echo 17; }
+current_pr_url() { echo https://github.com/owner/repo/pull/17; }
+mark_instance_status() { :; }
+mark_pr_flag() { :; }
+commit_if_needed() { return 1; }
+push_branch() { :; }
+checks_green() { return 1; }
+review_pr_normal() { return 1; }
+summarize_pr() { :; }
+main --no-merge
+""",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "CURL_LEDGER_JSON": ledger_json("inst-123", "%ledger"),
+            "TOKEN_API_WRAPPER_ID": "wrap-123",
+        },
+    )
+
+    hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
+    assert len(hooks) == 1
+    assert hooks[0]["purpose"] == "pr_step_plan"
+    assert hooks[0]["event"] == "stop"
+    assert hooks[0]["delivery"] == "prompt"
+    assert hooks[0]["oneshot"] is True
+    assert hooks[0]["target_pane"] == "%ledger"
+    assert hooks[0]["subscriber_pane"] == "%ledger"
+    assert hooks[0]["payload"] == (
+        "/plan PR #17 review returned "
+        "(https://github.com/owner/repo/pull/17); plan fixes or next review action."
+    )
+
+
+def test_merge_completion_overwrites_with_contextual_merge_followup(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        """
+assert_repo() { :; }
+current_pr_number() { echo 17; }
+current_pr_url() { echo https://github.com/owner/repo/pull/17; }
+mark_instance_status() { :; }
+mark_pr_flag() { :; }
+commit_if_needed() { return 1; }
+push_branch() { :; }
+_checks_green_calls=0
+checks_green() {
+    _checks_green_calls=$((_checks_green_calls + 1))
+    [[ $_checks_green_calls -ge 2 ]]
+}
+review_pr_normal() { return 0; }
+summarize_pr() { :; }
+merge_pr_normal() { return 0; }
+main
+""",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "CURL_LEDGER_JSON": ledger_json("inst-123", "%ledger"),
+            "TOKEN_API_WRAPPER_ID": "wrap-123",
+        },
+    )
+
+    hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
+    assert [hook["purpose"] for hook in hooks] == ["pr_step_plan", "pr_step_plan"]
+    assert "review returned" in str(hooks[0]["payload"])
+    assert hooks[-1]["payload"] == (
+        "/plan PR #17 merged "
+        "(https://github.com/owner/repo/pull/17); summarize closure and update context."
+    )
+
+
+def test_plan_followup_resolves_pane_from_ledger_without_instance_env(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        """
+unset TOKEN_API_INSTANCE_ID TMUX_PANE TOKEN_API_DISPATCH_RESOLVED_PANE
+export TOKEN_API_WRAPPER_ID=wrap-123
+arm_pr_plan_followup review 17 https://github.com/owner/repo/pull/17 "plan fixes or next review action."
+""",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "CURL_LEDGER_JSON": ledger_json("inst-123", "%ledger"),
+        },
+    )
+
+    hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
+    assert len(hooks) == 1
+    assert hooks[0]["target_pane"] == "%ledger"
+    assert hooks[0]["payload"] == (
+        "/plan PR #17 review returned "
+        "(https://github.com/owner/repo/pull/17); plan fixes or next review action."
+    )
 
 
 def test_findings_summary_filters_to_current_head_and_marks_historical(tmp_path: Path) -> None:

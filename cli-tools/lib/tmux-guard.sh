@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# tmux-guard.sh — compatibility wrapper for the canonical tmux typing guard
+# tmux-guard.sh — shell reader for the canonical tmux typing guard
 # TAGS: tmux, guard, send-keys, safety
 #
-# The guard state has one source of truth: tmuxctl.send_gate.typing_guard_active,
-# backed by per-pane tmux options @TYPING_LOCK_UNTIL, @TYPING_PENDING_UNTIL, and
-# @TYPING_AGENT_UNTIL (the daemon-send hold).
-# This shell library intentionally does not inspect pane contents or maintain
-# sidecar files. Legacy callers may still source it, but the reader and waiter
-# below are thin wrappers over the canonical predicate.
+# The guard state has one source of truth: the tmuxctld /typing-guard-state
+# endpoint backed by @TYPING_GUARD_JSON. This shell library intentionally does
+# not inspect pane contents, maintain sidecar files, or import cold tmuxctl state
+# logic.
 
 _tmux_guard_tmux() {
     local bin="${TMUX_GUARD_REAL_TMUX:-}"
@@ -70,20 +68,21 @@ tmux_guard_emit_blocked() {
 tmux_typing_guard_active() {
     local pane="${1:-${TMUX_PANE:-}}"
     [[ -n "$pane" ]] || return 1
-    local shell_lib_dir token_os_root lib_dir cli_lib_dir rc=0
-    shell_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || return 1
-    token_os_root="${TOKEN_OS:-$(cd "${shell_lib_dir}/../.." && pwd)}"
-    lib_dir="${TMUXCTLD_LIB:-${token_os_root}/tmuxctld/lib}"
-    cli_lib_dir="${token_os_root}/cli-tools/lib"
-    [[ -d "$lib_dir" ]] || return 1
-    PYTHONPATH="${lib_dir}:${cli_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
-        IMPERIUM_TMUX_BIN="${TMUX_GUARD_REAL_TMUX:-${IMPERIUM_TMUX_BIN:-}}" \
-        "${TMUXCTL_PYTHON:-${TMUX_GUARD_PYTHON:-python3}}" -m tmuxctl.send_gate typing "$pane" >/dev/null 2>&1 || rc=$?
-    [[ "$rc" -eq 0 ]]
+    local url body
+    url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+    body="$(python3 - "$pane" <<'PY'
+import json, sys
+print(json.dumps({"cmd": "status", "pane": sys.argv[1]}, separators=(",", ":")))
+PY
+)" || return 1
+    curl -fsS --connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "${TMUXCTLD_MAX_TIME:-3}" \
+        -H 'Content-Type: application/json' \
+        -d "$body" \
+        "${url%/}/typing-guard-state" 2>/dev/null |
+        python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("active") else 1)' 2>/dev/null
 }
 
-# Backward-compatible name: historically meant "prompt has pending input".
-# Now it means exactly "canonical typing guard active".
+# Historical shell name retained inside this library; it delegates to daemon state.
 tmux_pane_has_input() {
     tmux_typing_guard_active "${1:-}"
 }

@@ -225,7 +225,7 @@ def _runtime_has_instance(adapter: TmuxAdapter, pane_id: str) -> bool:
 # Identity env vars scrubbed off the inherited tmux-server environment before a
 # seat respawn, so a stale singleton identity carried in the server's launch env
 # can never bleed into the fresh seat (the dispatch-persona-leak failure mode).
-# The seat's own identity (PERSONA / WRAPPER_LAUNCH_ID / …) is set explicitly
+# The seat's own identity (PERSONA / WRAPPER_ID / …) is set explicitly
 # below. TMUX_PANE is deliberately NOT scrubbed: tmux provides the correct pane id
 # to the respawned process and SessionStart needs it.
 _PERSONA_SEAT_ENV_SCRUB = (
@@ -259,7 +259,7 @@ def persona_seat_command(
     env: list[tuple[str, str]] = [
         ("TOKEN_API_LAUNCHER", "persona-seat"),
         ("TOKEN_API_ENGINE", spec.engine or "claude"),
-        ("TOKEN_API_WRAPPER_LAUNCH_ID", wrapper_launch_id),
+        ("TOKEN_API_WRAPPER_ID", wrapper_launch_id),
         ("TOKEN_API_PERSONA", spec.persona),
         ("TOKEN_API_INSTANCE_TYPE", spec.instance_type),
         ("TOKEN_API_DISPATCH_SESSION_DOC_PATH", spec.session_doc),
@@ -408,10 +408,10 @@ PANE_CLOSE_TRANSIENT_OPTIONS = (
     "@GT_FIRE",
     "@PLANNING_STATE",
     "@PLANNING_AGENT",
-    "@TYPING_LOCK_UNTIL",
-    "@TYPING_PENDING_UNTIL",
-    "@TYPING_AGENT_UNTIL",
-    "@GUARD",
+    "@TYPING_GUARD_JSON",
+    "@TYPING_GUARD_UNTIL",
+    "@TYPING_GUARD_KIND",
+    "@TYPING_GUARD_MARKER",
     "@DISCORD_VOICE_LOCK",
     "@DISCORD_VOICE_PROCESSING",
     "@TOKEN_API_WRAPPER_LAUNCH_ID",

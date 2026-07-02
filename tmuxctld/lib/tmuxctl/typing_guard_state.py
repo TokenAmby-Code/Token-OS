@@ -1,40 +1,55 @@
-"""Canonical tmux typing-guard state transitions.
+"""Daemon-owned tmux typing-guard state transitions.
 
-The guard has one state machine per pane:
-
-    off -> on -> pending -> off          (ordinary human keystroke lifecycle)
-    off -> pending -> off                (submit/edit/interrupt key without ON)
-    off -> agent -> off                  (daemon send holds the pane)
-
-State is represented only by tmux pane options:
-
-* @TYPING_LOCK_UNTIL=<epoch> for ON
-* @TYPING_PENDING_UNTIL=<epoch> for PENDING
-* @TYPING_AGENT_UNTIL=<epoch> for AGENT (a daemon send holding the pane)
-* @GUARD as the visual projection (yellow keyboard for ON, red keyboard for
-  PENDING, green keyboard for AGENT)
-
-A live human on/pending hold always wins: an ``agent`` hold may only be acquired
-when the pane is OFF, so a daemon send never silently stomps the Emperor's
-in-progress keystrokes. No prompt scraping, focus/click heuristics, or stamp
-files live here.
+Canonical state is one pane option, ``@TYPING_GUARD_JSON``.  tmux-facing
+projection options (``@TYPING_GUARD_UNTIL``, ``@TYPING_GUARD_KIND``, and
+``@TYPING_GUARD_MARKER``) are derived from that JSON record for zero-fork
+border/key-binding fast paths.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
+from typing import Any
 
-LOCK_OPTION = "@TYPING_LOCK_UNTIL"
-PENDING_OPTION = "@TYPING_PENDING_UNTIL"
-AGENT_OPTION = "@TYPING_AGENT_UNTIL"
-GUARD_OPTION = "@GUARD"
+GUARD_JSON_OPTION = "@TYPING_GUARD_JSON"
+GUARD_UNTIL_OPTION = "@TYPING_GUARD_UNTIL"
+GUARD_KIND_OPTION = "@TYPING_GUARD_KIND"
+GUARD_MARKER_OPTION = "@TYPING_GUARD_MARKER"
+LEGACY_GUARD_OPTIONS = (
+    "@GUARD",
+    "@TYPING_LOCK_UNTIL",
+    "@TYPING_PENDING_UNTIL",
+    "@TYPING_AGENT_UNTIL",
+)
+
+
+HUMAN = "human"
+PENDING = "pending"
+AGENT = "agent"
+OFF = "off"
+SOURCE = "tmuxctld"
+
 ON_MARKER = "#[fg=colour214,bold]⌨#[default]"
 PENDING_MARKER = "#[fg=red,bold]⌨#[default]"
 AGENT_MARKER = "#[fg=green,bold]⌨#[default]"
+
+ANY_BINDING = """\
+bind -n Any {
+  if -F '#{==:#{mouse_x},}' {
+    run-shell -b "tmuxctld-ping POST /typing-guard-state cmd=arm pane=#{q:pane_id} seconds=300 now=#{client_activity} client=#{q:client_tty} term=#{q:client_termname} pid=#{q:client_pid} session=#{q:session_name} >/dev/null || env IMPERIUM_TMUX_RAW=1 tmux display-message tmuxctld-ping-/typing-guard-state-failed"
+    send-keys
+  } {
+  }
+}
+"""
 
 
 @dataclass(frozen=True)
@@ -73,43 +88,145 @@ def now_epoch(value: str | None = None) -> int:
     return int(time.time())
 
 
-def option_epoch(tmux: Tmux, pane: str, option: str) -> int | None:
-    if not pane:
-        return None
-    proc = tmux.run("show-options", "-pqv", "-t", pane, option, timeout=0.3)
-    if proc is None or proc.returncode != 0:
-        return None
-    raw = proc.stdout.strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-def live_state(tmux: Tmux, pane: str, *, now: int | None = None) -> str:
-    current = now_epoch() if now is None else now
-    lock_until = option_epoch(tmux, pane, LOCK_OPTION)
-    if lock_until is not None and current < lock_until:
-        return "on"
-    pending_until = option_epoch(tmux, pane, PENDING_OPTION)
-    if pending_until is not None and current < pending_until:
-        return "pending"
-    agent_until = option_epoch(tmux, pane, AGENT_OPTION)
-    if agent_until is not None and current < agent_until:
-        return "agent"
-    return "off"
-
-
-def marker_for(state: str) -> str:
-    if state == "on":
+def marker_for(kind: str) -> str:
+    if kind in {HUMAN, "on"}:
         return ON_MARKER
-    if state == "pending":
+    if kind == PENDING:
         return PENDING_MARKER
-    if state == "agent":
+    if kind == AGENT:
         return AGENT_MARKER
     return ""
+
+
+def _read_option(tmux: Tmux, pane: str, option: str) -> str:
+    if not pane:
+        return ""
+    proc = tmux.run("show-options", "-pqv", "-t", pane, option, timeout=0.3)
+    if proc is None or proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def _run_ok(tmux: Tmux, *args: str, timeout: float = 0.5) -> bool:
+    proc = tmux.run(*args, timeout=timeout)
+    return proc is not None and proc.returncode == 0
+
+
+def _any_binding_status(tmux: Tmux) -> dict[str, Any]:
+    proc = tmux.run("list-keys", "-T", "root", "Any", timeout=0.3)
+    raw = "" if proc is None else (proc.stdout or "").strip()
+    present = proc is not None and proc.returncode == 0 and bool(raw)
+    canonical = present and all(
+        needle in raw
+        for needle in (
+            "#{==:#{mouse_x},}",
+            "tmuxctld-ping POST /typing-guard-state cmd=arm",
+            "send-keys",
+        )
+    )
+    return {"present": present, "canonical": canonical, "raw": raw[:500]}
+
+
+def enable_any_binding(tmux: Tmux) -> dict[str, Any]:
+    """Enable the root-table ordinary-key hook.
+
+    tmux key bindings are global, not per-pane, so this deliberately changes only
+    hook topology.  It does not inspect, write, extend, or clear guard state.
+    """
+
+    current = _any_binding_status(tmux)
+    if current["canonical"]:
+        return {
+            "topology": "enabled",
+            "any_bound": True,
+            "changed": False,
+            "canonical": True,
+        }
+
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write(ANY_BINDING)
+            path = handle.name
+        ok = _run_ok(tmux, "source-file", path, timeout=1.0)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return {
+        "topology": "enabled",
+        "any_bound": bool(ok),
+        "changed": bool(ok),
+        "canonical": bool(ok),
+        "previously_bound": bool(current["present"]),
+    }
+
+
+def disable_any_binding(tmux: Tmux) -> dict[str, Any]:
+    """Disable the root-table ordinary-key hook without touching guard state."""
+
+    current = _any_binding_status(tmux)
+    if not current["present"]:
+        return {"topology": "disabled", "any_bound": False, "changed": False, "ok": True}
+
+    ok = _run_ok(tmux, "unbind-key", "-q", "-n", "Any")
+    return {"topology": "disabled", "any_bound": not bool(ok), "changed": bool(ok), "ok": bool(ok)}
+
+
+def focused_pane(tmux: Tmux) -> str:
+    proc = tmux.run("display-message", "-p", "#{pane_id}", timeout=0.3)
+    if proc is None or proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def projection_status(tmux: Tmux, pane: str, *, now: int | None = None) -> dict[str, Any]:
+    """Read only tmux-facing projection options for focus/topology decisions."""
+
+    current = now_epoch() if now is None else now
+    kind = (_read_option(tmux, pane, GUARD_KIND_OPTION) or OFF).strip().lower()
+    if kind == "on":
+        kind = HUMAN
+    if kind not in {HUMAN, PENDING, AGENT, OFF}:
+        kind = OFF
+    until_raw = _read_option(tmux, pane, GUARD_UNTIL_OPTION)
+    try:
+        until = int(float(until_raw)) if until_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        until = None
+    active = kind in {HUMAN, PENDING, AGENT} and until is not None and current < int(until)
+    if not active:
+        kind = OFF
+        until = None
+    return {"kind": kind, "until": until, "active": active, "pane": pane}
+
+
+def rehydrate_any_binding(
+    tmux: Tmux, pane: str = "", *, now: int | None = None
+) -> dict[str, Any]:
+    """Rebuild ordinary-key hook topology from existing focused-pane projections.
+
+    Focus changes must not mutate typing-guard state.  This function only reads
+    ``@TYPING_GUARD_KIND``/``@TYPING_GUARD_UNTIL`` and toggles the global root
+    ``Any`` binding: active HUMAN guard => disabled; anything else => enabled.
+    """
+
+    target = pane or focused_pane(tmux)
+    projected = projection_status(tmux, target, now=now) if target else {
+        "kind": OFF,
+        "until": None,
+        "active": False,
+        "pane": "",
+    }
+    topology = (
+        disable_any_binding(tmux)
+        if projected["kind"] == HUMAN and projected["active"]
+        else enable_any_binding(tmux)
+    )
+    return {"pane": target, "projection": projected, **topology}
+
 
 
 def set_option(tmux: Tmux, pane: str, option: str, value: str) -> None:
@@ -120,21 +237,92 @@ def unset_option(tmux: Tmux, pane: str, option: str) -> None:
     tmux.run("set-option", "-pu", "-t", pane, option)
 
 
-def publish(tmux: Tmux, pane: str, state: str) -> None:
-    set_option(tmux, pane, GUARD_OPTION, marker_for(state))
+def clear_legacy_options(tmux: Tmux, pane: str) -> None:
+    if not pane:
+        return
+    for option in LEGACY_GUARD_OPTIONS:
+        unset_option(tmux, pane, option)
 
 
-def schedule_expiry(tmux: Tmux, pane: str, seconds: int) -> None:
-    """Deliberately do not spawn a delayed shell for guard expiry.
+def _normalize_record(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"kind": OFF, "until": None, "owner": None, "source": SOURCE}
+    kind = str(raw.get("kind") or OFF).strip().lower()
+    if kind == "on":
+        kind = HUMAN
+    if kind not in {HUMAN, PENDING, AGENT, OFF}:
+        kind = OFF
+    until_raw = raw.get("until")
+    try:
+        until = int(float(until_raw)) if until_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        until = None
+    owner = raw.get("owner")
+    if owner is not None:
+        owner = str(owner).strip() or None
+    source = str(raw.get("source") or SOURCE)
+    return {"kind": kind, "until": until, "owner": owner, "source": source}
 
-    The previous implementation used ``tmux run-shell -b "sleep N; ..."`` for
-    every human key/submit/agent hold. Under active use, that created hundreds of
-    ``sh``+``sleep`` processes. The authoritative state already lives in absolute
-    tmux option deadlines and all gate checks evaluate those deadlines lazily, so
-    expiry does not need a background timer. Markers are refreshed by the next
-    guard state transition or explicit ``expire-pane`` call.
-    """
-    return None
+
+def read_record(tmux: Tmux, pane: str) -> dict[str, Any]:
+    raw = _read_option(tmux, pane, GUARD_JSON_OPTION)
+    if not raw:
+        return {"kind": OFF, "until": None, "owner": None, "source": SOURCE}
+    try:
+        return _normalize_record(json.loads(raw))
+    except json.JSONDecodeError:
+        return {"kind": OFF, "until": None, "owner": None, "source": SOURCE}
+
+
+def _active_record(tmux: Tmux, pane: str, *, now: int | None = None) -> dict[str, Any]:
+    current = now_epoch() if now is None else now
+    record = read_record(tmux, pane)
+    until = record.get("until")
+    if record.get("kind") in {HUMAN, PENDING, AGENT} and until is not None and current < int(until):
+        return record
+    return {"kind": OFF, "until": None, "owner": None, "source": SOURCE}
+
+
+def status(tmux: Tmux, pane: str, *, now: int | None = None) -> dict[str, Any]:
+    record = _active_record(tmux, pane, now=now)
+    kind = str(record.get("kind") or OFF)
+    until = record.get("until")
+    marker = marker_for(kind)
+    return {
+        "kind": kind,
+        "until": until,
+        "owner": record.get("owner"),
+        "active": kind != OFF and until is not None,
+        "marker": marker,
+    }
+
+
+
+def write_record(
+    tmux: Tmux,
+    pane: str,
+    *,
+    kind: str,
+    until: int | None,
+    owner: str | None = None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    normalized = _normalize_record({"kind": kind, "until": until, "owner": owner, "source": SOURCE})
+    if normalized["kind"] == OFF:
+        normalized["until"] = None
+        normalized["owner"] = None
+    marker = marker_for(str(normalized["kind"]))
+    set_option(
+        tmux,
+        pane,
+        GUARD_JSON_OPTION,
+        json.dumps(normalized, separators=(",", ":"), sort_keys=True),
+    )
+    set_option(tmux, pane, GUARD_UNTIL_OPTION, str(normalized["until"] or 0))
+    set_option(tmux, pane, GUARD_KIND_OPTION, str(normalized["kind"]))
+    set_option(tmux, pane, GUARD_MARKER_OPTION, marker)
+    clear_legacy_options(tmux, pane)
+    return status(tmux, pane, now=now)
 
 
 def mark_client_activity(
@@ -142,13 +330,7 @@ def mark_client_activity(
 ) -> None:
     if not client:
         return
-    args = [
-        "activity",
-        "--client",
-        client,
-        "--reason",
-        "key",
-    ]
+    args = ["activity", "--client", client, "--reason", "key"]
     if term:
         args.extend(["--term", term])
     if pid:
@@ -173,102 +355,73 @@ def arm(
     term: str | None = None,
     pid: str | None = None,
     session: str | None = None,
-) -> None:
-    """Move OFF -> ON for a genuine human keystroke.
-
-    Existing human ON state is preserved, not refreshed.  PENDING is different:
-    it is a short post-submit/backspace/interruption hold, not permission to
-    wedge future composition.  If a real follow-up keystroke arrives while
-    PENDING is live, the keystroke wins immediately and re-arms ON by clearing
-    the stale pending hold and stamping the real keystroke lock.  AGENT is also
-    cleared on a human keystroke; it is only a daemon serialization marker, not
-    permission to ignore later typing.  This prevents both stale PENDING and the
-    daemon's thread-local "I own my green hold" override from turning into a
-    blanket license to clobber or wedge active typing.
-    """
-    state = live_state(tmux, pane, now=now)
-    if state == "on":
-        publish(tmux, pane, state)
-        return
+) -> dict[str, Any]:
+    current = status(tmux, pane, now=now)
+    if current["kind"] == HUMAN and current["active"]:
+        disable_any_binding(tmux)
+        return current
     mark_client_activity(client=client, term=term, pid=pid, session=session)
-    unset_option(tmux, pane, PENDING_OPTION)
-    unset_option(tmux, pane, AGENT_OPTION)
-    set_option(tmux, pane, LOCK_OPTION, str(now + int(seconds)))
-    publish(tmux, pane, "on")
-    schedule_expiry(tmux, pane, int(seconds))
+    result = write_record(tmux, pane, kind=HUMAN, until=now + int(seconds), owner=None, now=now)
+    disable_any_binding(tmux)
+    return result
 
 
-def pending(tmux: Tmux, pane: str, *, seconds: int, now: int) -> None:
-    """Move ON -> PENDING (also safe for submit keys when already OFF)."""
-    set_option(tmux, pane, PENDING_OPTION, str(now + int(seconds)))
-    unset_option(tmux, pane, LOCK_OPTION)
-    publish(tmux, pane, "pending")
-    schedule_expiry(tmux, pane, int(seconds))
+def pending(tmux: Tmux, pane: str, *, seconds: int, now: int) -> dict[str, Any]:
+    result = write_record(tmux, pane, kind=PENDING, until=now + int(seconds), owner=None, now=now)
+    enable_any_binding(tmux)
+    return result
 
 
-def hold(tmux: Tmux, pane: str, *, seconds: int, now: int) -> bool:
-    """Move OFF -> AGENT. Returns True on acquire, False (no-op) if non-off.
+def hold(
+    tmux: Tmux,
+    pane: str,
+    *,
+    seconds: int,
+    now: int,
+    owner: str | None = None,
+) -> str | None:
+    current = status(tmux, pane, now=now)
+    if current["active"]:
+        return None
+    token = (owner or str(uuid.uuid4())).strip()
+    write_record(tmux, pane, kind=AGENT, until=now + int(seconds), owner=token, now=now)
+    return token
 
-    A daemon send acquires this hold to render the pane green and make the gate
-    treat it as active (state-blind) so concurrent sends to the same pane delay.
-    A live human ON/PENDING hold takes precedence and is NOT overwritten — the
-    OFF-guard mirrors ``arm()``; a denied caller falls through to the existing
-    send-gate delay path so it queues behind the human instead of stomping it.
-    """
-    state = live_state(tmux, pane, now=now)
-    if state != "off":
+
+def release(tmux: Tmux, pane: str, *, now: int | None = None, owner: str | None = None) -> bool:
+    current = status(tmux, pane, now=now)
+    if current["kind"] != AGENT or not current["active"]:
+        expire_pane(tmux, pane, now=now)
         return False
-    set_option(tmux, pane, AGENT_OPTION, str(now + int(seconds)))
-    publish(tmux, pane, "agent")
-    schedule_expiry(tmux, pane, int(seconds))
+    current_owner = current.get("owner")
+    if current_owner and (not owner or str(owner).strip() != current_owner):
+        return False
+    write_record(tmux, pane, kind=OFF, until=None, owner=None, now=now)
     return True
 
 
-def release(tmux: Tmux, pane: str, *, now: int | None = None) -> None:
-    """Clear the AGENT hold and re-publish via expire_pane semantics.
-
-    Only ``@TYPING_AGENT_UNTIL`` is cleared; if a human lock arrived during the
-    hold, ``expire_pane`` re-projects it rather than blanking the marker.
-    """
-    unset_option(tmux, pane, AGENT_OPTION)
-    expire_pane(tmux, pane, now=now)
-
-
-def expire_pane(tmux: Tmux, pane: str, *, now: int | None = None) -> None:
-    current = now_epoch() if now is None else now
-    lock_until = option_epoch(tmux, pane, LOCK_OPTION)
-    pending_until = option_epoch(tmux, pane, PENDING_OPTION)
-    agent_until = option_epoch(tmux, pane, AGENT_OPTION)
-
-    if lock_until is not None and current >= lock_until:
-        unset_option(tmux, pane, LOCK_OPTION)
-        lock_until = None
-    if pending_until is not None and current >= pending_until:
-        unset_option(tmux, pane, PENDING_OPTION)
-        pending_until = None
-    if agent_until is not None and current >= agent_until:
-        unset_option(tmux, pane, AGENT_OPTION)
-        agent_until = None
-
-    if lock_until is not None and current < lock_until:
-        publish(tmux, pane, "on")
-    elif pending_until is not None and current < pending_until:
-        publish(tmux, pane, "pending")
-    elif agent_until is not None and current < agent_until:
-        publish(tmux, pane, "agent")
-    else:
-        publish(tmux, pane, "off")
+def expire_pane(tmux: Tmux, pane: str, *, now: int | None = None) -> dict[str, Any]:
+    current = status(tmux, pane, now=now)
+    if current["active"]:
+        # Re-project from canonical JSON.
+        set_option(tmux, pane, GUARD_UNTIL_OPTION, str(current["until"] or 0))
+        set_option(tmux, pane, GUARD_KIND_OPTION, str(current["kind"]))
+        set_option(tmux, pane, GUARD_MARKER_OPTION, str(current["marker"] or ""))
+        clear_legacy_options(tmux, pane)
+        return current
+    write_record(tmux, pane, kind=OFF, until=None, owner=None, now=now)
+    return status(tmux, pane, now=now)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Canonical tmux typing-guard state helper")
+    parser = argparse.ArgumentParser(description="Daemon-owned tmux typing-guard state helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     def add_common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--pane", default="", help="target pane id (default: $TMUX_PANE)")
         p.add_argument("--now", default=None, help="epoch to use as now (default: wall clock)")
 
-    p_arm = sub.add_parser("arm", help="move OFF -> ON")
+    p_arm = sub.add_parser("arm", help="set HUMAN guard")
     add_common(p_arm)
     p_arm.add_argument("--seconds", type=int, default=300)
     p_arm.add_argument("--client", default=None)
@@ -276,21 +429,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_arm.add_argument("--pid", default=None)
     p_arm.add_argument("--session", default=None)
 
-    p_pending = sub.add_parser("pending", help="move ON -> PENDING")
+    p_pending = sub.add_parser("pending", help="set PENDING guard")
     add_common(p_pending)
     p_pending.add_argument("--seconds", type=int, required=True)
 
-    p_hold = sub.add_parser("hold", help="move OFF -> AGENT (daemon send hold)")
+    p_hold = sub.add_parser("hold", help="set AGENT guard and create/record owner token")
     add_common(p_hold)
     p_hold.add_argument("--seconds", type=int, default=8)
+    p_hold.add_argument("--owner", default=None)
 
-    p_release = sub.add_parser("release", help="clear an AGENT hold")
+    p_release = sub.add_parser("release", help="clear an AGENT guard if owner matches")
     add_common(p_release)
+    p_release.add_argument("--owner", default=None)
 
-    p_expire = sub.add_parser(
-        "expire-pane", help="clear stale ON/PENDING/AGENT projection for one pane"
-    )
+    p_expire = sub.add_parser("expire-pane", help="clear stale guard projection for one pane")
     add_common(p_expire)
+
+    p_status = sub.add_parser("status", help="print structured guard status")
+    add_common(p_status)
+
+    p_rehydrate = sub.add_parser("rehydrate", help="rehydrate root Any hook from projections")
+    add_common(p_rehydrate)
+
+    sub.add_parser("enable-any", help="enable root Any ordinary-key hook")
+    sub.add_parser("disable-any", help="disable root Any ordinary-key hook")
 
     return parser
 
@@ -298,14 +460,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    pane = args.pane or __import__("os").environ.get("TMUX_PANE", "")
-    if not pane:
+    pane = args.pane or os.environ.get("TMUX_PANE", "")
+    pane_optional_commands = {"enable-any", "disable-any", "rehydrate"}
+    if not pane and args.cmd not in pane_optional_commands:
+        if args.cmd == "status":
+            sys.stdout.write(json.dumps(status(Tmux(tmux_binary()), pane)))
         return 0
     tmux = Tmux(tmux_binary())
     current = now_epoch(args.now)
     try:
+        result: Any = None
         if args.cmd == "arm":
-            arm(
+            result = arm(
                 tmux,
                 pane,
                 seconds=args.seconds,
@@ -316,13 +482,29 @@ def main(argv: list[str] | None = None) -> int:
                 session=args.session,
             )
         elif args.cmd == "pending":
-            pending(tmux, pane, seconds=args.seconds, now=current)
+            result = pending(tmux, pane, seconds=args.seconds, now=current)
         elif args.cmd == "hold":
-            hold(tmux, pane, seconds=args.seconds, now=current)
+            owner = hold(tmux, pane, seconds=args.seconds, now=current, owner=args.owner)
+            result = status(tmux, pane, now=current)
+            result["acquired"] = bool(owner)
+            if owner:
+                result["owner"] = owner
         elif args.cmd == "release":
-            release(tmux, pane, now=current)
+            released = release(tmux, pane, now=current, owner=args.owner)
+            result = status(tmux, pane, now=current)
+            result["released"] = released
         elif args.cmd == "expire-pane":
-            expire_pane(tmux, pane, now=current)
+            result = expire_pane(tmux, pane, now=current)
+        elif args.cmd == "status":
+            result = expire_pane(tmux, pane, now=current)
+        elif args.cmd == "rehydrate":
+            result = rehydrate_any_binding(tmux, pane, now=current)
+        elif args.cmd == "enable-any":
+            result = enable_any_binding(tmux)
+        elif args.cmd == "disable-any":
+            result = disable_any_binding(tmux)
+        if result is not None:
+            sys.stdout.write(json.dumps(result, separators=(",", ":"), sort_keys=True))
     except Exception:
         return 0  # fail-open: state projection must never break typing
     return 0

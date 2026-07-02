@@ -74,7 +74,7 @@ if command -v jq >/dev/null 2>&1; then
              | .env.SSH_CLIENT = $ssh_client
              | .env.TOKEN_API_SESSION_ID = $token_session
              | .env.TOKEN_API_CODEX_BRIDGE_ID = $bridge_id
-             | .env.TOKEN_API_WRAPPER_LAUNCH_ID = $bridge_id
+             | .env.TOKEN_API_WRAPPER_ID = $bridge_id
              | .env.TOKEN_API_LAUNCHER = $token_launcher
              | .env.TOKEN_API_ENGINE = $token_engine
              | .env.TOKEN_API_DISPATCH_TARGET = $token_dispatch_target

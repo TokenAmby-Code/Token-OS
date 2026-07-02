@@ -74,14 +74,13 @@ _SEND_GATE_ALLOW_ENV = "TMUX_SEND_GATE_ALLOW"
 _SEND_GATE_POLICY_ENV = "TMUX_SEND_GATE_POLICY"
 _SEND_GATE_POLICIES = frozenset({"delay", "cancel", "pierce"})
 _SEND_GATE_DELAY_TIMEOUT_ENV = "TMUX_SEND_GATE_DELAY_TIMEOUT"  # unset/0 = no timeout
-_HUMAN_LOCK_YIELDING_OVERRIDES = frozenset(
+_AGENT_OWNER_OVERRIDES = frozenset(
     {
-        # tmuxctld may pierce only its own green AGENT hold.
+        # tmuxctld may pierce only the green AGENT hold whose JSON owner token is
+        # installed in this same request thread.
         "tmuxctld-send-holder",
-        # Adapter-local text+submit transaction may pierce only non-human holds
-        # (normally that same AGENT hold).  If the Emperor typed or pended the
-        # pane after text landed, submit/recovery keys must queue behind the
-        # human lock instead of clobbering it.
+        # Adapter-local text+submit transaction inherits the outer request's
+        # owner token; without that token it must queue behind the guard.
         "tmuxctl-submit-transaction",
         # Discord/operator append may pierce daemon AGENT holds and quiet-hours,
         # but never a real keystroke/pending human lock on the target pane.
@@ -89,22 +88,12 @@ _HUMAN_LOCK_YIELDING_OVERRIDES = frozenset(
     }
 )
 
-# Per-pane keystroke-anchored typing lock. The tmux root-table any-key binding
-# (cli-tools/tmux/tmux-base.conf) stamps this pane option with an ABSOLUTE expiry
-# epoch the moment the Emperor first types into a pane (first keystroke + the
-# 5-min window, in the same unix-epoch timebase as ``time.time()``), and an Enter
-# keystroke into that pane clears it. The gate reads this option as the SOLE
-# typing signal: a pane the Emperor typed into is locked until the timer expires
-# or an Enter clears it — held even after focus leaves the pane, and never armed
-# by focus/click or by the fleet's own ``send-keys`` (those bypass the key
-# table). This replaces the old focus-coupled ``#{client_activity}`` shadow.
-_TYPING_LOCK_OPTION = "@TYPING_LOCK_UNTIL"
-_TYPING_PENDING_OPTION = "@TYPING_PENDING_UNTIL"
-# Set by tmuxctld while a daemon send holds a pane (the green ⌨ AGENT state). The
-# gate treats it as just another active (non-off) hold — state-blind: it never
-# inspects WHICH state is live, only that one is. So every existing delay/pierce
-# policy applies unchanged, and concurrent sends to a held pane queue behind it.
-_TYPING_AGENT_OPTION = "@TYPING_AGENT_UNTIL"
+# Per-pane typing guard. The canonical option is JSON and is owned by tmuxctld;
+# the other options are display/key-binding projections only.
+_TYPING_GUARD_JSON_OPTION = "@TYPING_GUARD_JSON"
+_TYPING_GUARD_UNTIL_OPTION = "@TYPING_GUARD_UNTIL"
+_TYPING_GUARD_KIND_OPTION = "@TYPING_GUARD_KIND"
+_TYPING_GUARD_MARKER_OPTION = "@TYPING_GUARD_MARKER"
 
 # Poll cap (seconds) while a send is delayed behind a typing lock. The lock has a
 # concrete absolute expiry, so the delay sleeps toward it; the cap bounds the
@@ -326,125 +315,73 @@ def _real_tmux_binary() -> str:
         return "tmux"
 
 
-def _pane_lock_until(target: str) -> int | None:
-    """Absolute expiry epoch of ``target``'s keystroke lock, or None.
+def _pane_guard_status(target: str | None) -> dict:
+    """Return daemon-owned JSON typing-guard status for ``target``.
 
-    Reads the per-pane ``@TYPING_LOCK_UNTIL`` option the tmux any-key binding
-    stamps. ``show-options -pqv`` prints the value for a set option and an empty
-    line (exit 0) for an unset one. Fail-open: any tmux error / unset / unparsable
-    value yields None (no lock), so a transient fault never wedges pane writes.
+    Fail-open: any tmux/import/read failure returns an inactive status, so a
+    transient tmux fault never bricks all pane writes.
     """
     if not target:
-        return None
+        return {"kind": "off", "until": None, "owner": None, "active": False, "marker": ""}
     try:
-        proc = subprocess.run(
-            [_real_tmux_binary(), "show-options", "-pqv", "-t", target, _TYPING_LOCK_OPTION],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.3,
+        from . import typing_guard_state
+
+        return typing_guard_state.status(
+            typing_guard_state.Tmux(_real_tmux_binary()),
+            target,
+            now=int(time.time()),
         )
     except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    raw = proc.stdout.strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+        return {"kind": "off", "until": None, "owner": None, "active": False, "marker": ""}
+
+
+def _pane_lock_until(target: str) -> int | None:
+    status = _pane_guard_status(target)
+    if status.get("kind") == "human" and status.get("active"):
+        return int(status["until"])
+    return None
 
 
 def _pane_pending_until(target: str) -> int | None:
     """Return the pane's post-submit pending hold epoch, if any."""
-    if not target:
-        return None
-    try:
-        proc = subprocess.run(
-            [_real_tmux_binary(), "show-options", "-pqv", "-t", target, _TYPING_PENDING_OPTION],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.3,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    raw = proc.stdout.strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+    status = _pane_guard_status(target)
+    if status.get("kind") == "pending" and status.get("active"):
+        return int(status["until"])
+    return None
 
 
 def _pane_agent_until(target: str) -> int | None:
     """Return the pane's daemon-send (AGENT) hold epoch, if any.
 
-    tmuxctld stamps ``@TYPING_AGENT_UNTIL`` while it works a pane (the green ⌨
-    state). The gate reads it identically to the keystroke lock — state-blind —
-    so a concurrent send to a held pane delays exactly as it would behind a human
-    lock. Fail-open on any tmux error / unset / unparsable value (no hold).
+    tmuxctld records an ``agent`` JSON guard while it works a pane (the green ⌨
+    state). The gate reads it from @TYPING_GUARD_JSON; concurrent sends to a
+    held pane delay unless this request owns the matching token.
     """
-    if not target:
-        return None
-    try:
-        proc = subprocess.run(
-            [_real_tmux_binary(), "show-options", "-pqv", "-t", target, _TYPING_AGENT_OPTION],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.3,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    raw = proc.stdout.strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+    status = _pane_guard_status(target)
+    if status.get("kind") == "agent" and status.get("active"):
+        return int(status["until"])
+    return None
 
 
 def _pane_hold_until(target: str) -> int | None:
-    """Return the latest active typing/pending/agent hold epoch for ``target``."""
-    deadlines = [
-        v
-        for v in (
-            _pane_lock_until(target),
-            _pane_pending_until(target),
-            _pane_agent_until(target),
-        )
-        if v is not None
-    ]
-    if not deadlines:
-        return None
-    return max(deadlines)
+    """Return the active typing/pending/agent hold epoch for ``target``."""
+    status = _pane_guard_status(target)
+    if status.get("active") and status.get("kind") in {"human", "pending", "agent"}:
+        return int(status["until"])
+    return None
 
 
 def _pane_human_hold_until(target: str) -> int | None:
-    """Return latest active human ON/PENDING hold epoch for ``target``.
+    """Return active human/pending hold epoch for ``target``.
 
     Excludes the daemon AGENT hold.  tmuxctld's thread-local override may pierce
     only its own AGENT marker; it must never pierce a human keystroke/pending
     lock that appeared before or during the send transaction.
     """
-    deadlines = [
-        v for v in (_pane_lock_until(target), _pane_pending_until(target)) if v is not None
-    ]
-    if not deadlines:
-        return None
-    return max(deadlines)
+    status = _pane_guard_status(target)
+    if status.get("active") and status.get("kind") in {"human", "pending"}:
+        return int(status["until"])
+    return None
 
 
 def _pane_human_locked(target: str) -> bool:
@@ -455,21 +392,14 @@ def _pane_human_locked(target: str) -> bool:
 def _pane_keystroke_locked(target: str) -> bool:
     """True iff ``target`` carries a live typing, pending, or agent hold.
 
-    The ON lock is keystroke-anchored and focus-decoupled. Enter moves the pane
-    into a short PENDING hold (``@TYPING_PENDING_UNTIL``), which remains
-    send-blocking so automation cannot race the human's submitted prompt. A
-    daemon send sets the AGENT hold (``@TYPING_AGENT_UNTIL``); the gate counts it
-    the same way (state-blind) so concurrent sends to that pane delay behind it.
+    The HUMAN lock is keystroke-anchored and focus-decoupled. Enter moves the pane
+    into a short PENDING guard, which remains send-blocking so automation cannot
+    race the human's submitted prompt. A daemon send sets an owner-token AGENT
+    guard so concurrent sends to that pane delay behind it.
     """
     now = time.time()
-    lock_until = _pane_lock_until(target)
-    if lock_until is not None and now < lock_until:
-        return True
-    pending_until = _pane_pending_until(target)
-    if pending_until is not None and now < pending_until:
-        return True
-    agent_until = _pane_agent_until(target)
-    return agent_until is not None and now < agent_until
+    hold_until = _pane_hold_until(target)
+    return hold_until is not None and now < hold_until
 
 
 def _live_pane_ids() -> list[str] | None:
@@ -504,9 +434,8 @@ def any_typing_guard_active() -> bool:
 def typing_guard_active(*, target: str | None = None) -> bool:
     """Canonical typing-guard predicate — the keystroke-anchored per-pane lock.
 
-    With ``target`` set, the guard holds iff that pane carries a live keystroke
-    lock (``@TYPING_LOCK_UNTIL``) or a post-submit pending hold
-    (``@TYPING_PENDING_UNTIL``). This is the single, honest, focus-DECOUPLED
+    With ``target`` set, the guard holds iff that pane carries a live HUMAN,
+    PENDING, or AGENT guard in @TYPING_GUARD_JSON. This is the single, honest, focus-DECOUPLED
     signal both surfaces consume — the event-updated ⌨ pane-border diagnostic and
     the universal send-hold.
     Focus/click never set, move, or clear it; the fleet's own ``send-keys`` never
@@ -560,8 +489,15 @@ def sanctioned_override() -> str | None:
     return reason or None
 
 
+def sanctioned_agent_owner() -> str | None:
+    owner = getattr(_thread_override, "owner", None)
+    if owner:
+        return str(owner).strip() or None
+    return None
+
+
 @contextlib.contextmanager
-def thread_local_override(reason: str) -> Iterator[None]:
+def thread_local_override(reason: str, *, owner: str | None = None) -> Iterator[None]:
     """Set a THREAD-LOCAL sanctioned override for the duration of the block.
 
     Thread-local — not ``os.environ`` — because the daemon is threaded: a global
@@ -569,11 +505,17 @@ def thread_local_override(reason: str) -> Iterator[None]:
     lock there. Restores the prior thread-local value on exit (nestable).
     """
     prev = getattr(_thread_override, "reason", None)
+    prev_owner = getattr(_thread_override, "owner", None)
     _thread_override.reason = str(reason).strip()
+    # Nested adapter submit transactions inherit the outer daemon transaction's
+    # owner token unless an explicit owner is provided.
+    if owner is not None:
+        _thread_override.owner = str(owner).strip()
     try:
         yield
     finally:
         _thread_override.reason = prev
+        _thread_override.owner = prev_owner
 
 
 def send_gate_policy(*, override: str | None = None, reason: str | None = None) -> str:
@@ -696,21 +638,26 @@ def evaluate(
         return None
 
     reason = "quiet_hours" if quiet else "typing_guard"
-    # tmuxctld/adapter set these overrides only around their own non-human
-    # transaction holds so the bytes they deliberately serialized are not
-    # blocked by the state-blind AGENT gate.  If a real human ON/PENDING lock is
-    # present, ignore those overrides: human typing beats the daemon hold.  This
-    # closes the mid-transaction clobber where a later C-m pierced through a
-    # human keystroke/pending lock because the request thread still carried a
-    # send-holder, submit-transaction, or direct-user override.
+    # tmuxctld/adapter overrides may pierce only their OWN AGENT transaction
+    # guard.  Human/pending guards are inviolable.  An AGENT guard is pierceable
+    # only when this request thread carries the JSON owner token installed on the
+    # pane; an ambient TMUX_SEND_GATE_ALLOW or stale nested override is ignored.
+    guard_status = {"kind": "off", "until": None, "owner": None, "active": False, "marker": ""}
     effective_override = override
-    if (
-        reason == "typing_guard"
-        and override in _HUMAN_LOCK_YIELDING_OVERRIDES
-        and target
-        and _pane_human_locked(target)
-    ):
-        effective_override = None
+    ignored_owner = None
+    if reason == "typing_guard" and target and override:
+        kind = "off"
+        if override in _AGENT_OWNER_OVERRIDES or override == os.environ.get(_SEND_GATE_ALLOW_ENV, "").strip():
+            guard_status = _pane_guard_status(target)
+            kind = str(guard_status.get("kind") or "off")
+        if kind in {"human", "pending"} or _pane_human_locked(target):
+            effective_override = None
+        elif kind == "agent":
+            pane_owner = str(guard_status.get("owner") or "").strip()
+            thread_owner = sanctioned_agent_owner()
+            if override not in _AGENT_OWNER_OVERRIDES or not pane_owner or thread_owner != pane_owner:
+                ignored_owner = thread_owner
+                effective_override = None
     policy = send_gate_policy(override=override, reason=reason)
     if effective_override != override:
         policy = send_gate_policy(override=effective_override, reason=reason)
@@ -725,6 +672,9 @@ def evaluate(
         "quiet_context": quiet_ctx,
         "override": effective_override,
         "ignored_override": override if effective_override != override else None,
+        "agent_owner": sanctioned_agent_owner(),
+        "ignored_agent_owner": ignored_owner,
+        "guard_status": guard_status,
     }
     return result
 
@@ -831,7 +781,7 @@ def register_automated_send(
 
 
 def _cli(argv: list[str]) -> int:
-    """CLI for the shell readers (bin/tmux shim, tmux-guard.sh, status segment).
+    """CLI for shell readers (bin/tmux shim and tmux-guard.sh).
 
     Subcommands:
       * ``check <verb> [args...]`` — gate a tmux command. Exit 0 allow after any delay / 100 cancel.

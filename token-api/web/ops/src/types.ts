@@ -1,9 +1,8 @@
 // Typed contracts for the ops cockpit.
 //
 // `OpsState` mirrors `GET /api/ui/ops/state` (the cockpit boundary).
-// `TimerHistory` and `OpsGraph` mirror the proposed read-models from
-// docs/ops-cockpit-frontend-design-brief.md. They are consumed by the chart
-// components today via mocked data, and will swap to live endpoints unchanged.
+// `TimerHistory` and `OpsGraph` mirror the live read-models consumed by the
+// chart components, with mock graph data retained only as a degraded fallback.
 
 export type Counts = Record<string, number>;
 
@@ -51,6 +50,8 @@ export type OpsInstance = {
   stop_allowed: boolean | null;
   session_doc: SessionDoc;
   stale: { is_stale: boolean; threshold_seconds: number | null; reason: string | null };
+  attention_rank: number;
+  attention_reasons: string[];
   zealotry: number;
   gt: {
     next_fire: string | null;
@@ -118,6 +119,48 @@ export type StateAssertion = {
   details: Record<string, unknown>;
 };
 
+export type OpsHealthStatus = 'ok' | 'warn' | 'bad' | 'unknown';
+
+export type OpsSourceHealth = {
+  status: OpsHealthStatus;
+  available: boolean | null;
+  message: string | null;
+  details: Record<string, unknown>;
+};
+
+export type OpsSourceFreshnessStatus = 'fresh' | 'stale' | 'missing' | 'unknown';
+
+export type OpsSourceFreshness = {
+  status: OpsSourceFreshnessStatus;
+  age_seconds: number | null;
+  last_seen: string | null;
+  stale_after_seconds: number | null;
+  message: string;
+  evidence: string[];
+};
+
+export type OpsSourceFreshnessMap = {
+  desktop_attention: OpsSourceFreshness;
+  phone_activity: OpsSourceFreshness;
+  phone_heartbeat: OpsSourceFreshness;
+  work_state: OpsSourceFreshness;
+  timer_engine: OpsSourceFreshness;
+  agents_db: OpsSourceFreshness;
+  tmuxctld: OpsSourceFreshness;
+  cron: OpsSourceFreshness;
+  enforcement: OpsSourceFreshness;
+  tts: OpsSourceFreshness;
+};
+
+export type OpsRecommendedAction = {
+  id: string;
+  source_assertion_id: string;
+  severity: 'warn' | 'bad';
+  label: string;
+  action: string;
+  evidence: string[];
+};
+
 export type InstanceCounts = {
   active: number;
   stale: number;
@@ -153,6 +196,7 @@ export type OpsState = {
     };
   };
   assertions: StateAssertion[];
+  source_freshness: OpsSourceFreshnessMap;
   attention: {
     desktop: {
       mode: string;
@@ -228,6 +272,69 @@ export type OpsState = {
     source: string | null;
   };
   work_actions?: WorkActionSummary;
+};
+
+// Concise agent/script read model (GET /api/ops/status).
+export type OpsStatus = {
+  surface: 'ops-status';
+  generated_at: string;
+  status: OpsHealthStatus;
+  summary: string;
+  sources: {
+    token_api: OpsSourceHealth;
+    agents_db: OpsSourceHealth;
+    timer_engine: OpsSourceHealth;
+    tmuxctld: OpsSourceHealth;
+    cron: OpsSourceHealth;
+    enforcement: OpsSourceHealth;
+    tts: OpsSourceHealth;
+  };
+  source_freshness: OpsSourceFreshnessMap;
+  timer: {
+    mode: string;
+    activity: string;
+    productivity_active: boolean;
+    break_balance_ms: number;
+    break_available_ms: number;
+    break_backlog_ms: number;
+    is_in_backlog: boolean;
+  };
+  attention: {
+    desktop_mode: string;
+    desktop_work_mode: string;
+    phone_app: string | null;
+    phone_distracted: boolean;
+    phone_heartbeat_age_seconds: number | null;
+  };
+  fleet: {
+    active: number;
+    stale: number;
+    by_status: Counts;
+    by_engine: Counts;
+    by_persona: Counts;
+  };
+  tmux: {
+    reachable: boolean | null;
+    tmux_reachable: boolean | null;
+    version: string | null;
+    sha: string | null;
+    live_instance_panes: number | null;
+    projection_drift: number | null;
+  };
+  tts: {
+    current: string | null;
+    queue_length: number;
+    hot_queue_length: number;
+    pause_queue_length: number;
+    satellite_available: boolean | null;
+    global_mode: string | null;
+  };
+  enforcement: {
+    pending_count: number;
+    pavlok_enabled: boolean | null;
+  };
+  assertions: StateAssertion[];
+  recommended_actions: OpsRecommendedAction[];
 };
 
 // One explicit work-action press: timeline tick + dial input.

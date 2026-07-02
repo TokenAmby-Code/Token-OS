@@ -12345,18 +12345,39 @@ async def list_instances(
 
 
 @app.get("/api/instances/resolve")
-async def resolve_instance(pid: int | None = None, cwd: str | None = None):
+async def resolve_instance(
+    pid: int | None = None,
+    cwd: str | None = None,
+    wrapper_id: str | None = None,
+    wrapper_launch_id: str | None = None,
+):
     """Resolve the calling agent's instance using PID and/or CWD fallback.
 
     Returns instance + session doc info in a single call.
-    Resolution order: PID match → CWD match (prefer processing over idle).
+    Resolution order: wrapper_id → CWD match (prefer processing over idle).
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         instance = None
 
-        # Method 1 used to match a persisted PID. PID is archive-only after the
-        # instance-table cutover; callers should pass cwd or use tmux @INSTANCE_ID.
+        wrapper_key = (wrapper_id or wrapper_launch_id or "").strip()
+        if wrapper_key:
+            cursor = await db.execute(
+                """SELECT i.*,
+                          p.slug AS persona_slug,
+                          p.display_name AS persona_display_name,
+                          p.pane_tint AS persona_pane_tint,
+                          p.chip_color AS persona_chip_color,
+                          p.tts_voice AS persona_tts_voice,
+                          p.tts_rate AS persona_tts_rate,
+                          p.notification_sound AS persona_notification_sound
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE i.wrapper_launch_id = ? AND i.rank != 'retired'
+                   ORDER BY i.last_activity DESC LIMIT 1""",
+                (wrapper_key,),
+            )
+            instance = await cursor.fetchone()
 
         # Method 2: CWD match (prefer processing)
         if not instance and cwd:
@@ -19745,6 +19766,79 @@ def _ops_instance_staleness(status: str | None, age_seconds: int | None) -> dict
     }
 
 
+def _ops_datetime_as_utc(value: datetime) -> datetime:
+    """Normalize naive/aware datetimes for safe scheduler due comparisons."""
+    try:
+        return value.astimezone(UTC)
+    except Exception:
+        if value.tzinfo is not None:
+            return value.astimezone(UTC)
+        return value.replace(tzinfo=datetime.now().astimezone().tzinfo).astimezone(UTC)
+
+
+def _ops_datetime_due(target: datetime, now: datetime) -> bool:
+    try:
+        return _ops_datetime_as_utc(target) <= _ops_datetime_as_utc(now)
+    except Exception:
+        return target.replace(tzinfo=None) <= now.replace(tzinfo=None)
+
+
+def _ops_instance_attention(
+    inst: dict,
+    *,
+    staleness: dict,
+    gt_next_fire: datetime | None,
+    now: datetime,
+) -> dict:
+    """Backend-derived urgency for active fleet ordering.
+
+    Lower rank means the operator should look sooner. This is intentionally a
+    small additive read-model field; it does not mutate workflow state.
+    """
+    status = str(inst.get("status") or "unknown").lower()
+    workflow_state = str(inst.get("workflow_state") or "").lower()
+    processing_like = status in {"processing", "working"} or workflow_state in {
+        "processing",
+        "working",
+        "running",
+        "in_progress",
+        "active",
+    }
+    reasons: list[str] = []
+
+    if staleness.get("is_stale") and processing_like:
+        reasons.append("stale_processing")
+        return {"attention_rank": 0, "attention_reasons": reasons}
+
+    if staleness.get("is_stale"):
+        reasons.append(str(staleness.get("reason") or "stale_activity"))
+        return {"attention_rank": 1, "attention_reasons": reasons}
+
+    next_required_action = inst.get("next_required_action")
+    if next_required_action:
+        reasons.append(f"next_required_action:{next_required_action}")
+        return {"attention_rank": 2, "attention_reasons": reasons}
+
+    if inst.get("pr_state") == "open":
+        reasons.append("pr_open")
+        return {"attention_rank": 3, "attention_reasons": reasons}
+
+    if gt_next_fire is not None:
+        due = _ops_datetime_due(gt_next_fire, now)
+        reasons.append("golden_throne_due" if due else "golden_throne_armed")
+        return {"attention_rank": 4 if due else 5, "attention_reasons": reasons}
+    if inst.get("golden_throne"):
+        reasons.append("golden_throne_bound")
+        return {"attention_rank": 5, "attention_reasons": reasons}
+
+    if processing_like:
+        reasons.append("processing_or_working")
+        return {"attention_rank": 6, "attention_reasons": reasons}
+
+    reasons.append("normal_idle")
+    return {"attention_rank": 7, "attention_reasons": reasons}
+
+
 def _ops_display_name(inst: dict) -> str:
     return (
         inst.get("name")
@@ -20268,6 +20362,13 @@ async def _ops_read_instances(now: datetime) -> dict:
         if staleness["is_stale"]:
             stale_count += 1
         gt_job = scheduler.get_job(f"golden-throne-{inst.get('id')}")
+        gt_next_fire = gt_job.next_run_time if gt_job and gt_job.next_run_time else None
+        attention = _ops_instance_attention(
+            inst,
+            staleness=staleness,
+            gt_next_fire=gt_next_fire,
+            now=now,
+        )
         active.append(
             {
                 "id": inst.get("id"),
@@ -20319,11 +20420,11 @@ async def _ops_read_instances(now: datetime) -> dict:
                     "cron_job_id": inst.get("session_doc_cron_job_id"),
                 },
                 "stale": staleness,
+                "attention_rank": attention["attention_rank"],
+                "attention_reasons": attention["attention_reasons"],
                 "zealotry": inst.get("zealotry") or 4,
                 "gt": {
-                    "next_fire": gt_job.next_run_time.isoformat()
-                    if gt_job and gt_job.next_run_time
-                    else None,
+                    "next_fire": gt_next_fire.isoformat() if gt_next_fire else None,
                     "resume_count": inst.get("gt_resume_count") or 0,
                     "resume_window_started_at": inst.get("gt_resume_window_started_at"),
                     "last_resume_at": inst.get("gt_last_resume_at"),
@@ -20332,6 +20433,8 @@ async def _ops_read_instances(now: datetime) -> dict:
                 },
             }
         )
+
+    active.sort(key=lambda item: item.get("attention_rank", 99))
 
     return {
         "active": active,
@@ -20344,6 +20447,558 @@ async def _ops_read_instances(now: datetime) -> dict:
             "by_work_class": work_class_counts,
         },
     }
+
+
+def _ops_graph_add_node(nodes: dict[str, dict], node: dict) -> None:
+    nodes.setdefault(node["id"], node)
+
+
+def _ops_graph_add_edge(edges: dict[str, dict], edge: dict) -> None:
+    edges.setdefault(edge["id"], edge)
+
+
+async def _ops_read_active_fleet_graph(graph_name: str) -> dict:
+    """Read model for the ops cockpit's first live relationship graph.
+
+    Scope is intentionally narrow: active fleet topology only. The frontend still
+    owns rendering/filtering; this endpoint replaces the mocked graph with the
+    current backend facts for instances, host devices, session-doc bindings, live
+    pane bindings, and canonical chapter-command relationships.
+    """
+
+    normalized = (graph_name or "").strip().lower().replace("_", "-")
+    if normalized not in {"active", "active-fleet"}:
+        raise HTTPException(status_code=404, detail=f"Unknown ops graph: {graph_name}")
+
+    now = datetime.now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.*,
+                   COALESCE(p.slug, 'astartes') AS persona_slug,
+                   p.display_name AS persona_display_name,
+                   sd.title AS session_doc_title,
+                   sd.file_path AS session_doc_path,
+                   sd.status AS session_doc_status,
+                   sd.project AS session_doc_project
+            FROM instances ci
+            LEFT JOIN personas p ON p.id = ci.persona_id
+            LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+            WHERE ci.status NOT IN ('stopped', 'archived')
+            ORDER BY ci.device_id ASC, ci.last_activity DESC
+            LIMIT 240
+            """
+        )
+        instance_rows = [dict(row) for row in await cursor.fetchall()]
+
+        device_cursor = await db.execute("SELECT * FROM devices")
+        device_rows = {row["id"]: dict(row) for row in await device_cursor.fetchall()}
+
+    live_panes = {p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]}
+    active_instance_ids = {str(row.get("id")) for row in instance_rows if row.get("id")}
+
+    nodes: dict[str, dict] = {}
+    edges: dict[str, dict] = {}
+
+    for inst in instance_rows:
+        instance_id = str(inst.get("id"))
+        instance_node_id = f"instance:{instance_id}"
+        device_id = inst.get("device_id")
+        session_doc_id = inst.get("session_doc_id")
+        pane = live_panes.get(instance_id)
+        status = inst.get("status") or "unknown"
+        age_seconds = _ops_seconds_since(
+            inst.get("last_activity") or inst.get("created_at"), now=now
+        )
+
+        if device_id:
+            device = device_rows.get(device_id, {})
+            device_node_id = f"device:{device_id}"
+            _ops_graph_add_node(
+                nodes,
+                {
+                    "id": device_node_id,
+                    "type": "device",
+                    "label": device.get("name") or device_id,
+                    "subtitle": device.get("type") or device_id,
+                    "status": "active",
+                    "group": "fleet",
+                    "data": {
+                        "device_id": device_id,
+                        "tailscale_ip": device.get("tailscale_ip"),
+                        "notification_method": device.get("notification_method"),
+                        "tts_engine": device.get("tts_engine"),
+                    },
+                },
+            )
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"hosts:{device_id}:{instance_id}",
+                    "source": device_node_id,
+                    "target": instance_node_id,
+                    "type": "hosts",
+                    "directed": True,
+                    "label": "hosts",
+                    "status": status,
+                },
+            )
+
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": instance_node_id,
+                "type": "instance",
+                "label": _ops_display_name(inst),
+                "subtitle": " · ".join(
+                    part
+                    for part in (
+                        inst.get("persona_slug") or inst.get("engine"),
+                        inst.get("rank"),
+                        inst.get("device_id"),
+                    )
+                    if part
+                ),
+                "status": status,
+                "group": inst.get("persona_slug") or "unassigned",
+                "weight": inst.get("zealotry") or 4,
+                "data": {
+                    "instance_id": instance_id,
+                    "engine": inst.get("engine"),
+                    "working_dir": inst.get("working_dir"),
+                    "created_at": inst.get("created_at"),
+                    "last_activity": inst.get("last_activity"),
+                    "age_seconds": age_seconds,
+                    "commander_type": inst.get("commander_type"),
+                    "commander_id": inst.get("commander_id"),
+                    "is_subagent": bool(inst.get("is_subagent") or 0),
+                    "workflow_state": inst.get("workflow_state"),
+                    "next_required_action": inst.get("next_required_action"),
+                },
+            },
+        )
+
+        if session_doc_id is not None:
+            doc_node_id = f"session_doc:{session_doc_id}"
+            doc_path = inst.get("session_doc_path")
+            _ops_graph_add_node(
+                nodes,
+                {
+                    "id": doc_node_id,
+                    "type": "session_doc",
+                    "label": inst.get("session_doc_title")
+                    or (Path(str(doc_path)).stem if doc_path else f"session-doc-{session_doc_id}"),
+                    "subtitle": doc_path,
+                    "status": inst.get("session_doc_status") or "unknown",
+                    "group": inst.get("session_doc_project"),
+                    "data": {
+                        "session_doc_id": session_doc_id,
+                        "path": doc_path,
+                        "project": inst.get("session_doc_project"),
+                    },
+                },
+            )
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"bound_to:{instance_id}:{session_doc_id}",
+                    "source": instance_node_id,
+                    "target": doc_node_id,
+                    "type": "bound_to",
+                    "directed": True,
+                    "label": "bound",
+                    "status": inst.get("session_doc_status") or status,
+                    "data": {"binding_source": inst.get("continuity_binding_source")},
+                },
+            )
+
+        if pane:
+            pane_id = pane.get("pane_id")
+            if pane_id:
+                pane_node_id = f"pane:{pane_id}"
+                _ops_graph_add_node(
+                    nodes,
+                    {
+                        "id": pane_node_id,
+                        "type": "live_pane",
+                        "label": pane.get("pane_label") or pane.get("pane_role") or pane_id,
+                        "subtitle": pane_id,
+                        "status": "live",
+                        "group": inst.get("device_id"),
+                        "data": {
+                            "pane_id": pane_id,
+                            "pane_label": pane.get("pane_label"),
+                            "pane_role": pane.get("pane_role"),
+                            "current_command": pane.get("current_command"),
+                        },
+                    },
+                )
+                _ops_graph_add_edge(
+                    edges,
+                    {
+                        "id": f"runs_on:{instance_id}:{pane_id}",
+                        "source": instance_node_id,
+                        "target": pane_node_id,
+                        "type": "runs_on",
+                        "directed": True,
+                        "label": "runs on",
+                        "status": "live",
+                    },
+                )
+
+        if inst.get("commander_type") == "chapter":
+            commander_id = str(inst.get("commander_id") or "")
+            if commander_id and commander_id in active_instance_ids and commander_id != instance_id:
+                _ops_graph_add_edge(
+                    edges,
+                    {
+                        "id": f"commands:{commander_id}:{instance_id}",
+                        "source": f"instance:{commander_id}",
+                        "target": instance_node_id,
+                        "type": "commands",
+                        "directed": True,
+                        "label": "commands",
+                        "status": status,
+                    },
+                )
+
+    return {
+        "graph": "active-fleet",
+        "generated_at": now.isoformat(),
+        "layout_hint": "dagre",
+        "nodes": list(nodes.values()),
+        "edges": list(edges.values()),
+    }
+
+
+def _ops_gt_job_fire_at(instance_id: str) -> datetime | None:
+    job = scheduler.get_job(f"golden-throne-{instance_id}")
+    return job.next_run_time if job and job.next_run_time else None
+
+
+def _ops_gt_timer_status(next_fire: datetime | None, now: datetime) -> str:
+    if next_fire is None:
+        return "bound"
+    return "due" if _ops_datetime_due(next_fire, now) else "scheduled"
+
+
+def _ops_gt_event_edge_type(event_type: str | None) -> str | None:
+    event = (event_type or "").lower()
+    if "resume" in event or event == "golden_throne_dispatch_validated":
+        return "resumed"
+    if "scheduled" in event or "deferred" in event or "suppressed" in event:
+        return "scheduled"
+    return None
+
+
+async def _ops_read_golden_throne_graph() -> dict:
+    """Read-only Golden Throne topology for the ops cockpit graph viewer.
+
+    V1 stays deliberately small: Golden-Throne-bound instances, their linked
+    session docs, marker/timer state, recent golden_throne_* events, and
+    expected acknowledgements issued by Golden Throne enforcement.
+    """
+
+    now = datetime.now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ci.*,
+                   COALESCE(p.slug, 'astartes') AS persona_slug,
+                   p.display_name AS persona_display_name,
+                   sd.title AS session_doc_title,
+                   sd.file_path AS session_doc_path,
+                   sd.status AS session_doc_status,
+                   sd.project AS session_doc_project,
+                   gt.id AS gt_id,
+                   gt.zealotry AS gt_zealotry,
+                   gt.resume_count AS gt_row_resume_count,
+                   gt.resume_window_started_at AS gt_row_resume_window_started_at,
+                   gt.last_resume_at AS gt_row_last_resume_at,
+                   gt.follow_up_sop AS gt_row_follow_up_sop,
+                   gt.stop_allowed AS gt_row_stop_allowed,
+                   gt.created_at AS gt_created_at,
+                   gt.updated_at AS gt_updated_at
+            FROM instances ci
+            LEFT JOIN personas p ON p.id = ci.persona_id
+            LEFT JOIN session_documents sd ON sd.id = ci.session_doc_id
+            LEFT JOIN golden_throne gt ON CAST(gt.id AS TEXT) = ci.golden_throne
+            WHERE ci.golden_throne IS NOT NULL
+              AND ci.golden_throne != 'sync'
+              AND ci.status != 'archived'
+              AND ci.rank != 'retired'
+            ORDER BY ci.last_activity DESC
+            LIMIT 160
+            """
+        )
+        instance_rows = [dict(row) for row in await cursor.fetchall()]
+
+        instance_ids = [str(row["id"]) for row in instance_rows if row.get("id")]
+        event_rows: list[dict] = []
+        ack_rows: list[dict] = []
+        if instance_ids:
+            placeholders = ",".join("?" for _ in instance_ids)
+            event_cursor = await db.execute(
+                f"""
+                SELECT id, event_type, instance_id, device_id, details, created_at
+                FROM events
+                WHERE event_type LIKE 'golden_throne_%'
+                  AND instance_id IN ({placeholders})
+                ORDER BY created_at DESC
+                LIMIT 80
+                """,
+                instance_ids,
+            )
+            event_rows = [dict(row) for row in await event_cursor.fetchall()]
+
+            ack_cursor = await db.execute(
+                f"""
+                SELECT *
+                FROM expected_acknowledgements
+                WHERE source = 'golden_throne'
+                  AND instance_id IN ({placeholders})
+                  AND (
+                      status = 'pending'
+                      OR acknowledged_at IS NOT NULL
+                      OR bailout_reason IS NOT NULL
+                  )
+                ORDER BY status = 'pending' DESC, created_at DESC
+                LIMIT 80
+                """,
+                instance_ids,
+            )
+            ack_rows = [dict(row) for row in await ack_cursor.fetchall()]
+
+    nodes: dict[str, dict] = {}
+    edges: dict[str, dict] = {}
+
+    for inst in instance_rows:
+        instance_id = str(inst.get("id"))
+        marker = str(inst.get("golden_throne"))
+        gt_node_id = f"golden_throne:{marker}"
+        instance_node_id = f"instance:{instance_id}"
+        next_fire = _ops_gt_job_fire_at(instance_id)
+        gt_status = _ops_gt_timer_status(next_fire, now)
+        status = inst.get("status") or "unknown"
+
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": gt_node_id,
+                "type": "golden_throne",
+                "label": f"Golden Throne #{marker}",
+                "subtitle": f"zealotry {inst.get('gt_zealotry') or inst.get('zealotry') or 4}",
+                "status": gt_status,
+                "group": "golden-throne",
+                "weight": inst.get("gt_zealotry") or inst.get("zealotry") or 4,
+                "data": {
+                    "golden_throne": marker,
+                    "row_id": inst.get("gt_id"),
+                    "next_fire": next_fire.isoformat() if next_fire else None,
+                    "zealotry": inst.get("gt_zealotry") or inst.get("zealotry") or 4,
+                    "resume_count": inst.get("gt_row_resume_count")
+                    if inst.get("gt_row_resume_count") is not None
+                    else inst.get("gt_resume_count"),
+                    "resume_window_started_at": inst.get("gt_row_resume_window_started_at")
+                    or inst.get("gt_resume_window_started_at"),
+                    "last_resume_at": inst.get("gt_row_last_resume_at")
+                    or inst.get("gt_last_resume_at"),
+                    "follow_up_sop": inst.get("gt_row_follow_up_sop") or inst.get("follow_up_sop"),
+                    "stop_allowed": bool(inst.get("gt_row_stop_allowed"))
+                    if inst.get("gt_row_stop_allowed") is not None
+                    else bool(inst.get("stop_allowed")),
+                    "created_at": inst.get("gt_created_at"),
+                    "updated_at": inst.get("gt_updated_at"),
+                },
+            },
+        )
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": instance_node_id,
+                "type": "instance",
+                "label": _ops_display_name(inst),
+                "subtitle": " · ".join(
+                    part
+                    for part in (
+                        inst.get("persona_slug") or inst.get("engine"),
+                        inst.get("rank"),
+                        inst.get("device_id"),
+                    )
+                    if part
+                ),
+                "status": status,
+                "group": inst.get("persona_slug") or "golden-throne",
+                "weight": inst.get("zealotry") or 4,
+                "data": {
+                    "instance_id": instance_id,
+                    "golden_throne": marker,
+                    "engine": inst.get("engine"),
+                    "working_dir": inst.get("working_dir"),
+                    "created_at": inst.get("created_at"),
+                    "last_activity": inst.get("last_activity"),
+                    "gt_resume_count": inst.get("gt_resume_count") or 0,
+                    "gt_last_resume_at": inst.get("gt_last_resume_at"),
+                    "victory_at": inst.get("victory_at"),
+                    "victory_reason": inst.get("victory_reason"),
+                },
+            },
+        )
+        _ops_graph_add_edge(
+            edges,
+            {
+                "id": f"scheduled:{marker}:{instance_id}",
+                "source": gt_node_id,
+                "target": instance_node_id,
+                "type": "scheduled",
+                "directed": True,
+                "label": "scheduled",
+                "status": gt_status,
+                "data": {"next_fire": next_fire.isoformat() if next_fire else None},
+            },
+        )
+
+        session_doc_id = inst.get("session_doc_id")
+        if session_doc_id is not None:
+            doc_node_id = f"session_doc:{session_doc_id}"
+            doc_path = inst.get("session_doc_path")
+            _ops_graph_add_node(
+                nodes,
+                {
+                    "id": doc_node_id,
+                    "type": "session_doc",
+                    "label": inst.get("session_doc_title")
+                    or (Path(str(doc_path)).stem if doc_path else f"session-doc-{session_doc_id}"),
+                    "subtitle": doc_path,
+                    "status": inst.get("session_doc_status") or "unknown",
+                    "group": inst.get("session_doc_project"),
+                    "data": {
+                        "session_doc_id": session_doc_id,
+                        "path": doc_path,
+                        "project": inst.get("session_doc_project"),
+                    },
+                },
+            )
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"bound_to:{instance_id}:{session_doc_id}",
+                    "source": instance_node_id,
+                    "target": doc_node_id,
+                    "type": "bound_to",
+                    "directed": True,
+                    "label": "bound",
+                    "status": inst.get("session_doc_status") or status,
+                    "data": {"binding_source": inst.get("continuity_binding_source")},
+                },
+            )
+
+    for event in event_rows:
+        event_id = event.get("id")
+        instance_id = event.get("instance_id")
+        if not event_id or not instance_id:
+            continue
+        event_node_id = f"event:{event_id}"
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": event_node_id,
+                "type": "event",
+                "label": event.get("event_type") or "golden_throne_event",
+                "subtitle": event.get("created_at"),
+                "status": "completed",
+                "group": "golden-throne",
+                "data": {
+                    "event_id": event_id,
+                    "event_type": event.get("event_type"),
+                    "instance_id": instance_id,
+                    "device_id": event.get("device_id"),
+                    "created_at": event.get("created_at"),
+                    "details": _ops_parse_event_details(event.get("details")),
+                },
+            },
+        )
+        edge_type = _ops_gt_event_edge_type(event.get("event_type"))
+        if edge_type:
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"{edge_type}:{event_id}:{instance_id}",
+                    "source": event_node_id,
+                    "target": f"instance:{instance_id}",
+                    "type": edge_type,
+                    "directed": True,
+                    "label": "event",
+                    "status": "completed",
+                },
+            )
+
+    for ack_row in ack_rows:
+        ack = _expected_ack_row_to_dict(ack_row)
+        ack_node_id = f"ack:{ack['id']}"
+        instance_id = ack.get("instance_id")
+        ack_status = ack.get("status") or "unknown"
+        _ops_graph_add_node(
+            nodes,
+            {
+                "id": ack_node_id,
+                "type": "expected_ack",
+                "label": ack.get("reason") or "Golden Throne ack",
+                "subtitle": ack.get("ack_due_at"),
+                "status": ack_status,
+                "group": "golden-throne",
+                "data": ack,
+            },
+        )
+        if instance_id:
+            _ops_graph_add_edge(
+                edges,
+                {
+                    "id": f"ack_required:{instance_id}:{ack['id']}",
+                    "source": f"instance:{instance_id}",
+                    "target": ack_node_id,
+                    "type": "ack_required",
+                    "directed": True,
+                    "label": "ack",
+                    "status": "active" if ack_status == "pending" else "completed",
+                },
+            )
+            if ack_status != "pending":
+                _ops_graph_add_edge(
+                    edges,
+                    {
+                        "id": f"resolved_by:{ack['id']}:{instance_id}",
+                        "source": ack_node_id,
+                        "target": f"instance:{instance_id}",
+                        "type": "resolved_by",
+                        "directed": True,
+                        "label": "resolved",
+                        "status": "completed",
+                        "data": {
+                            "acknowledged_at": ack.get("acknowledged_at"),
+                            "bailout_reason": ack.get("bailout_reason"),
+                        },
+                    },
+                )
+
+    return {
+        "graph": "golden-throne",
+        "generated_at": now.isoformat(),
+        "layout_hint": "dagre",
+        "nodes": list(nodes.values()),
+        "edges": list(edges.values()),
+    }
+
+
+async def _ops_read_graph(graph_name: str) -> dict:
+    normalized = (graph_name or "").strip().lower().replace("_", "-")
+    if normalized in {"active", "active-fleet"}:
+        return await _ops_read_active_fleet_graph(graph_name)
+    if normalized in {"golden-throne", "gt"}:
+        return await _ops_read_golden_throne_graph()
+    raise HTTPException(status_code=404, detail=f"Unknown ops graph: {graph_name}")
 
 
 async def _ops_read_events() -> list[dict]:
@@ -20518,6 +21173,759 @@ def _ops_timer_idle_status(work_state: WorkStateResponse, now_mono_ms: int) -> d
         "label": None,
         "reason": "mode_not_work_or_idle",
         "remaining_seconds": None,
+    }
+
+
+def _ops_source_health(
+    status: str,
+    *,
+    available: bool | None = None,
+    message: str | None = None,
+    details: dict | None = None,
+) -> dict:
+    normalized = status if status in {"ok", "warn", "bad", "unknown"} else "unknown"
+    return {
+        "status": normalized,
+        "available": available,
+        "message": message,
+        "details": details or {},
+    }
+
+
+def _ops_freshness_timestamp(value: str | datetime | None) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value:
+        return str(value)
+    return None
+
+
+def _ops_freshness_record(
+    status: str,
+    *,
+    age_seconds: int | None,
+    last_seen: str | datetime | None,
+    stale_after_seconds: int | None,
+    message: str,
+    evidence: list[str] | None = None,
+) -> dict:
+    normalized = status if status in {"fresh", "stale", "missing", "unknown"} else "unknown"
+    return {
+        "status": normalized,
+        "age_seconds": age_seconds,
+        "last_seen": _ops_freshness_timestamp(last_seen),
+        "stale_after_seconds": stale_after_seconds,
+        "message": message,
+        "evidence": evidence or [],
+    }
+
+
+def _ops_timestamp_freshness(
+    label: str,
+    last_seen: str | datetime | None,
+    *,
+    now: datetime,
+    stale_after_seconds: int | None,
+    evidence: list[str] | None = None,
+    missing_status: str = "missing",
+) -> dict:
+    if not last_seen:
+        return _ops_freshness_record(
+            missing_status,
+            age_seconds=None,
+            last_seen=None,
+            stale_after_seconds=stale_after_seconds,
+            message=f"{label} has no timestamp",
+            evidence=evidence,
+        )
+    age_seconds = _ops_seconds_since(last_seen, now=now)
+    if age_seconds is None:
+        return _ops_freshness_record(
+            "unknown",
+            age_seconds=None,
+            last_seen=last_seen,
+            stale_after_seconds=stale_after_seconds,
+            message=f"{label} timestamp could not be interpreted",
+            evidence=evidence,
+        )
+    if stale_after_seconds is not None and age_seconds >= stale_after_seconds:
+        return _ops_freshness_record(
+            "stale",
+            age_seconds=age_seconds,
+            last_seen=last_seen,
+            stale_after_seconds=stale_after_seconds,
+            message=f"{label} is stale ({age_seconds}s old)",
+            evidence=evidence,
+        )
+    return _ops_freshness_record(
+        "fresh",
+        age_seconds=age_seconds,
+        last_seen=last_seen,
+        stale_after_seconds=stale_after_seconds,
+        message=f"{label} is fresh ({age_seconds}s old)",
+        evidence=evidence,
+    )
+
+
+def _ops_build_source_freshness(
+    *,
+    generated_at: datetime,
+    source_errors: dict[str, list[str]],
+    work_state: WorkStateResponse,
+    instances: dict,
+    events: list[dict],
+    cron_summary: dict,
+    enforcement_summary: dict,
+    tts_summary: dict,
+    tmux_health: dict,
+) -> dict:
+    active_instances = instances.get("active") or []
+    instance_times = [
+        value
+        for item in active_instances
+        for value in (item.get("last_activity"), item.get("created_at"))
+        if value
+    ]
+    event_times = [event.get("created_at") for event in events if event.get("created_at")]
+    agents_seen = max([generated_at.isoformat(), *instance_times, *event_times])
+
+    work_generated_at = getattr(work_state, "generated_at", None) or generated_at
+    timer_errors = source_errors.get("timer_engine", [])
+    if timer_errors:
+        timer_error_evidence = [f"error={err}" for err in timer_errors[:2]]
+        work_state_freshness = _ops_freshness_record(
+            "unknown",
+            age_seconds=None,
+            last_seen=None,
+            stale_after_seconds=120,
+            message="work-state snapshot unavailable from timer/work-state read failure",
+            evidence=timer_error_evidence,
+        )
+        timer_engine_freshness = _ops_freshness_record(
+            "unknown",
+            age_seconds=None,
+            last_seen=None,
+            stale_after_seconds=120,
+            message="timer-engine snapshot unavailable from timer/work-state read failure",
+            evidence=timer_error_evidence,
+        )
+    else:
+        work_state_freshness = _ops_timestamp_freshness(
+            "work-state snapshot",
+            work_generated_at,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"productivity_active={work_state.productivity_active}",
+                f"reason={work_state.reason}",
+            ],
+            missing_status="unknown",
+        )
+        timer_engine_freshness = _ops_timestamp_freshness(
+            "timer-engine snapshot",
+            generated_at,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"mode={timer_engine.current_mode.value}",
+                f"activity={timer_engine.activity.value}",
+            ],
+        )
+    freshness = {
+        "desktop_attention": _ops_timestamp_freshness(
+            "desktop attention",
+            DESKTOP_STATE.get("last_detection"),
+            now=generated_at,
+            stale_after_seconds=300,
+            evidence=[
+                f"mode={DESKTOP_STATE.get('current_mode', 'silence')}",
+                f"work_mode={DESKTOP_STATE.get('work_mode', 'clocked_in')}",
+                f"ahk_reachable={DESKTOP_STATE.get('ahk_reachable')}",
+            ],
+        ),
+        "phone_activity": _ops_timestamp_freshness(
+            "phone activity",
+            PHONE_STATE.get("last_activity"),
+            now=generated_at,
+            stale_after_seconds=180,
+            evidence=[
+                f"app={PHONE_STATE.get('current_app') or 'none'}",
+                f"is_distracted={PHONE_STATE.get('is_distracted', False)}",
+            ],
+        ),
+        "phone_heartbeat": _ops_timestamp_freshness(
+            "phone heartbeat",
+            PHONE_HEARTBEAT.get("last_seen"),
+            now=generated_at,
+            stale_after_seconds=600,
+            evidence=[
+                f"device_id={PHONE_HEARTBEAT.get('device_id') or 'unknown'}",
+                f"alert_state={PHONE_HEARTBEAT.get('alert_state') or 'none'}",
+            ],
+        ),
+        "work_state": work_state_freshness,
+        "timer_engine": timer_engine_freshness,
+        "agents_db": _ops_timestamp_freshness(
+            "agents database read model",
+            None if "agents_db" in source_errors else agents_seen,
+            now=generated_at,
+            stale_after_seconds=300,
+            evidence=[
+                f"active_instances={(instances.get('counts') or {}).get('active', 0)}",
+                f"events={len(events)}",
+                *(f"error={err}" for err in source_errors.get("agents_db", [])[:2]),
+            ],
+            missing_status="unknown",
+        ),
+        "tmuxctld": _ops_timestamp_freshness(
+            "tmuxctld health",
+            generated_at if tmux_health.get("reachable") else None,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"reachable={tmux_health.get('reachable')}",
+                f"tmux_reachable={tmux_health.get('tmux_reachable')}",
+            ],
+            missing_status="missing",
+        ),
+        "cron": _ops_timestamp_freshness(
+            "cron summary",
+            generated_at if cron_summary.get("available") else None,
+            now=generated_at,
+            stale_after_seconds=300,
+            evidence=[
+                f"available={cron_summary.get('available')}",
+                f"running={cron_summary.get('running', 0)}",
+                f"runs_last_24h={cron_summary.get('runs_last_24h', 0)}",
+            ],
+            missing_status="unknown",
+        ),
+        "enforcement": _ops_timestamp_freshness(
+            "enforcement summary",
+            generated_at if enforcement_summary.get("available") else None,
+            now=generated_at,
+            stale_after_seconds=300,
+            evidence=[
+                f"available={enforcement_summary.get('available')}",
+                f"pending_count={enforcement_summary.get('pending_count', 0)}",
+            ],
+            missing_status="unknown",
+        ),
+        "tts": _ops_timestamp_freshness(
+            "TTS queue snapshot",
+            None if "tts" in source_errors else generated_at,
+            now=generated_at,
+            stale_after_seconds=120,
+            evidence=[
+                f"queue_length={tts_summary.get('queue_length', 0)}",
+                f"satellite_available={tts_summary.get('satellite_available')}",
+                *(f"error={err}" for err in source_errors.get("tts", [])[:2]),
+            ],
+            missing_status="unknown",
+        ),
+    }
+    return freshness
+
+
+def _ops_empty_work_state(generated_at: datetime, reason: str) -> WorkStateResponse:
+    return WorkStateResponse(
+        productivity_active=False,
+        reason=reason,
+        active_instance_count=0,
+        processing_recent_count=0,
+        observed_agent_count=0,
+        billable_active_count=0,
+        personal_active_count=0,
+        unknown_active_count=0,
+        active_instances=[],
+        observed_agents=[],
+        activity_icons=[],
+        timer_mode=timer_engine.current_mode.value,
+        activity=timer_engine.activity.value,
+        desktop_mode=DESKTOP_STATE.get("current_mode", "silence"),
+        phone_app=PHONE_STATE.get("current_app"),
+        productivity_hold="none",
+        idle_timeout_exempt=timer_engine.idle_timeout_exempt,
+        human_anchored_instance_count=0,
+        within_human_work_action_window=False,
+        work_action_source=None,
+        work_action_note=None,
+        work_action_age_seconds=None,
+        work_action_buffer_remaining_seconds=None,
+        typing_active=False,
+        generated_at=generated_at.isoformat(),
+    )
+
+
+def _ops_empty_instances() -> dict:
+    return {
+        "active": [],
+        "counts": {
+            "active": 0,
+            "stale": 0,
+            "by_status": {},
+            "by_engine": {},
+            "by_persona": {},
+            "by_work_class": {},
+        },
+    }
+
+
+def _ops_empty_work_actions() -> dict:
+    return {
+        "count": 0,
+        "ticks": [],
+        "last_at": None,
+        "score": 0,
+        "stale_fade_minutes": WORK_ACTION_STALE_FADE_MINUTES,
+    }
+
+
+async def _ops_read_tmuxctld_health() -> dict:
+    """Read loopback-only tmuxctld health without failing the ops endpoint."""
+    try:
+        base = shared._tmuxctld_url(default_loopback=True)
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": f"tmuxctld loopback URL invalid: {exc}",
+        }
+    if not base:
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": "tmuxctld loopback URL disabled or invalid",
+        }
+
+    def _read_health_payload() -> dict:
+        with shared._TMUXCTLD_OPENER.open(f"{base}/health", timeout=0.75) as resp:
+            return json.loads(resp.read().decode(errors="ignore") or "{}")
+
+    try:
+        payload = await asyncio.to_thread(_read_health_payload)
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": str(exc),
+        }
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": "tmuxctld health returned non-ok payload",
+            "payload": payload if isinstance(payload, dict) else None,
+        }
+    return {
+        "reachable": True,
+        "tmux_reachable": payload.get("tmux_reachable"),
+        "version": payload.get("version"),
+        "sha": payload.get("sha"),
+        "error": None,
+    }
+
+
+async def _ops_collect_facts(now: datetime) -> dict:
+    """Collect the shared facts backing both ops cockpit state and ops status."""
+    sources: dict[str, dict] = {
+        "token_api": _ops_source_health(
+            "ok",
+            available=True,
+            message="Token-API request handler is running",
+            details={"git_sha": LAUNCHED_GIT_SHA},
+        )
+    }
+    source_errors: dict[str, list[str]] = {}
+
+    def record_error(source: str, exc: Exception | str) -> None:
+        source_errors.setdefault(source, []).append(str(exc))
+
+    try:
+        work_state = await get_cached_work_state()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading work state: %s", exc)
+        record_error("timer_engine", exc)
+        work_state = _ops_empty_work_state(now, "work_state_unavailable")
+
+    try:
+        instances = await _ops_read_instances(now)
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading instances: %s", exc)
+        record_error("agents_db", exc)
+        instances = _ops_empty_instances()
+
+    try:
+        events = await _ops_read_events()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading events: %s", exc)
+        record_error("agents_db", exc)
+        events = []
+
+    try:
+        cron_summary = await _ops_read_cron_summary()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading cron: %s", exc)
+        record_error("cron", exc)
+        cron_summary = {
+            "available": False,
+            "error": str(exc),
+            "total_jobs": 0,
+            "enabled": 0,
+            "running": 0,
+            "runs_last_24h": 0,
+            "jobs": [],
+        }
+
+    try:
+        enforcement_summary = await _ops_read_enforcement_summary()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading enforcement: %s", exc)
+        record_error("enforcement", exc)
+        enforcement_summary = {
+            "available": False,
+            "error": str(exc),
+            "pending_count": 0,
+            "pending": [],
+            "pavlok": {"enabled": PAVLOK_CONFIG.get("enabled")},
+        }
+
+    try:
+        tts_summary = get_tts_queue_status()
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading TTS status: %s", exc)
+        record_error("tts", exc)
+        tts_summary = {
+            "current": None,
+            "hot_queue": [],
+            "pause_queue": [],
+            "hot_queue_length": 0,
+            "pause_queue_length": 0,
+            "queue_length": 0,
+            "backend": None,
+            "satellite_available": None,
+            "global_mode": None,
+            "routing": None,
+        }
+
+    try:
+        work_actions = await _ops_read_work_actions(now=now)
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading work actions: %s", exc)
+        record_error("agents_db", exc)
+        work_actions = _ops_empty_work_actions()
+
+    tmux_health = await _ops_read_tmuxctld_health()
+
+    if "agents_db" in source_errors:
+        sources["agents_db"] = _ops_source_health(
+            "bad",
+            available=False,
+            message="agents database read failed",
+            details={"errors": source_errors["agents_db"]},
+        )
+    else:
+        sources["agents_db"] = _ops_source_health(
+            "ok",
+            available=True,
+            message="agents database reads succeeded",
+            details={"active_instances": (instances.get("counts") or {}).get("active", 0)},
+        )
+
+    if "timer_engine" in source_errors:
+        sources["timer_engine"] = _ops_source_health(
+            "bad",
+            available=False,
+            message="timer/work-state read failed",
+            details={"errors": source_errors["timer_engine"]},
+        )
+    else:
+        sources["timer_engine"] = _ops_source_health(
+            "ok",
+            available=True,
+            message="timer engine snapshot available",
+            details={"mode": timer_engine.current_mode.value},
+        )
+
+    sources["tmuxctld"] = _ops_source_health(
+        "ok" if tmux_health.get("reachable") else "warn",
+        available=bool(tmux_health.get("reachable")),
+        message="tmuxctld health available"
+        if tmux_health.get("reachable")
+        else "tmuxctld health unavailable",
+        details=tmux_health,
+    )
+
+    sources["cron"] = _ops_source_health(
+        "ok" if cron_summary.get("available") else "warn",
+        available=bool(cron_summary.get("available")),
+        message="cron summary available"
+        if cron_summary.get("available")
+        else "cron summary unavailable",
+        details={"error": cron_summary.get("error")} if cron_summary.get("error") else {},
+    )
+
+    sources["enforcement"] = _ops_source_health(
+        "ok" if enforcement_summary.get("available") else "warn",
+        available=bool(enforcement_summary.get("available")),
+        message="enforcement summary available"
+        if enforcement_summary.get("available")
+        else "enforcement summary unavailable",
+        details={"error": enforcement_summary.get("error")}
+        if enforcement_summary.get("error")
+        else {},
+    )
+
+    tts_available = "tts" not in source_errors
+    satellite_available = tts_summary.get("satellite_available")
+    sources["tts"] = _ops_source_health(
+        "bad"
+        if not tts_available
+        else "warn"
+        if satellite_available is False
+        else "unknown"
+        if satellite_available is None
+        else "ok",
+        available=tts_available,
+        message="TTS queue unavailable"
+        if not tts_available
+        else "TTS satellite unavailable"
+        if satellite_available is False
+        else "TTS satellite health unknown"
+        if satellite_available is None
+        else "TTS queue available",
+        details={
+            "backend": tts_summary.get("backend"),
+            "satellite_available": satellite_available,
+            "errors": source_errors.get("tts", []),
+        },
+    )
+
+    assertions = _ops_build_state_assertions(
+        generated_at=now,
+        work_state=work_state,
+        instances=instances,
+        events=events,
+        enforcement_summary=enforcement_summary,
+        tts_summary=tts_summary,
+    )
+
+    break_balance_ms = int(timer_engine.break_balance_ms)
+    timer_snapshot = {
+        "mode": timer_engine.current_mode.value,
+        "activity": timer_engine.activity.value,
+        "productivity_active": work_state.productivity_active,
+        "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
+        "manual_mode_lock": timer_engine.manual_mode_lock,
+        "manual_trigger": timer_engine.manual_trigger,
+        "focus_active": timer_engine.focus_active,
+        "break_balance_ms": break_balance_ms,
+        "break_available_ms": max(0, break_balance_ms),
+        "break_backlog_ms": abs(min(0, break_balance_ms)),
+        "is_in_backlog": break_balance_ms < 0,
+        "total_work_time_ms": timer_engine.total_work_time_ms,
+        "total_break_time_ms": timer_engine.total_break_time_ms,
+        "daily_start_date": timer_engine.daily_start_date,
+        "idle_timer": _ops_timer_idle_status(work_state, int(time.monotonic() * 1000)),
+    }
+    attention_snapshot = {
+        "desktop": {
+            "mode": DESKTOP_STATE.get("current_mode", "silence"),
+            "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
+            "last_detection": DESKTOP_STATE.get("last_detection"),
+            "location_zone": DESKTOP_STATE.get("location_zone"),
+            "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
+            "steam_app_id": DESKTOP_STATE.get("steam_app_id"),
+            "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
+            "steam_exe": DESKTOP_STATE.get("steam_exe"),
+            "in_meeting": DESKTOP_STATE.get("in_meeting", False),
+        },
+        "phone": {
+            "app": PHONE_STATE.get("current_app"),
+            "is_distracted": PHONE_STATE.get("is_distracted", False),
+            "last_activity": PHONE_STATE.get("last_activity"),
+            "app_opened_at": PHONE_STATE.get("app_opened_at"),
+            "heartbeat_age_seconds": _ops_seconds_since(PHONE_HEARTBEAT.get("last_seen")),
+        },
+    }
+    source_freshness = _ops_build_source_freshness(
+        generated_at=now,
+        source_errors=source_errors,
+        work_state=work_state,
+        instances=instances,
+        events=events,
+        cron_summary=cron_summary,
+        enforcement_summary=enforcement_summary,
+        tts_summary=tts_summary,
+        tmux_health=tmux_health,
+    )
+
+    return {
+        "generated_at": now,
+        "sources": sources,
+        "source_freshness": source_freshness,
+        "work_state": work_state,
+        "instances": instances,
+        "events": events,
+        "cron": cron_summary,
+        "enforcement": enforcement_summary,
+        "tts": tts_summary,
+        "work_actions": work_actions,
+        "assertions": assertions,
+        "timer": timer_snapshot,
+        "attention": attention_snapshot,
+        "tmux": tmux_health,
+    }
+
+
+def _ops_build_ui_state(facts: dict) -> dict:
+    tts_summary = facts["tts"]
+    return {
+        "surface": "ops",
+        "ui_build_id": _ops_ui_build_id(),
+        "generated_at": facts["generated_at"].isoformat(),
+        "timer": facts["timer"],
+        "billable": _ops_billable_summary(facts["work_state"]),
+        "assertions": facts["assertions"],
+        "source_freshness": facts["source_freshness"],
+        "attention": facts["attention"],
+        "work_state": facts["work_state"].model_dump(),
+        "instances": facts["instances"],
+        "events": facts["events"],
+        "cron": facts["cron"],
+        "tts": {
+            "current": tts_summary.get("current"),
+            "hot_queue": tts_summary.get("hot_queue", []),
+            "pause_queue": tts_summary.get("pause_queue", []),
+            "hot_queue_length": tts_summary.get("hot_queue_length", 0),
+            "pause_queue_length": tts_summary.get("pause_queue_length", 0),
+            "queue_length": tts_summary.get("queue_length", 0),
+            "backend": tts_summary.get("backend"),
+            "satellite_available": tts_summary.get("satellite_available"),
+            "global_mode": tts_summary.get("global_mode"),
+            "routing": tts_summary.get("routing"),
+        },
+        "voice_drafts": [
+            _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
+        ],
+        "enforcement": facts["enforcement"],
+        "work_actions": facts["work_actions"],
+    }
+
+
+def _ops_build_status(facts: dict) -> dict:
+    assertions = facts["assertions"]
+    source_statuses = [source.get("status", "unknown") for source in facts["sources"].values()]
+    bad_assertions = [item for item in assertions if item.get("status") == "bad"]
+    warn_assertions = [item for item in assertions if item.get("status") == "warn"]
+    if bad_assertions or "bad" in source_statuses:
+        aggregate_status = "bad"
+    elif warn_assertions or "warn" in source_statuses:
+        aggregate_status = "warn"
+    elif "unknown" in source_statuses or not assertions:
+        aggregate_status = "unknown"
+    else:
+        aggregate_status = "ok"
+
+    degraded_sources = [
+        name
+        for name, source in facts["sources"].items()
+        if source.get("status") in {"warn", "bad", "unknown"}
+    ]
+    if bad_assertions or warn_assertions:
+        summary = (
+            f"{len(bad_assertions)} bad assertion(s), {len(warn_assertions)} warn assertion(s)"
+        )
+    elif degraded_sources:
+        summary = f"{len(degraded_sources)} degraded source(s): {', '.join(degraded_sources)}"
+    elif aggregate_status == "unknown":
+        summary = "Ops status unknown"
+    else:
+        summary = "Ops nominal"
+
+    counts = facts["instances"].get("counts") or {}
+    tts_summary = facts["tts"]
+    enforcement_summary = facts["enforcement"]
+    tmux_health = facts["tmux"]
+    current_tts = tts_summary.get("current")
+    current_tts_label = (
+        str(current_tts.get("name") or current_tts.get("message"))
+        if isinstance(current_tts, dict)
+        else current_tts
+    )
+    recommended_actions = [
+        {
+            "id": f"action-{item.get('id')}",
+            "source_assertion_id": item.get("id"),
+            "severity": item.get("status"),
+            "label": item.get("label"),
+            "action": item.get("correction_hint"),
+            "evidence": (item.get("evidence") or [])[:3],
+        }
+        for item in assertions
+        if item.get("status") in {"bad", "warn"} and item.get("correction_hint")
+    ]
+
+    return {
+        "surface": "ops-status",
+        "generated_at": facts["generated_at"].isoformat(),
+        "status": aggregate_status,
+        "summary": summary,
+        "sources": facts["sources"],
+        "source_freshness": facts["source_freshness"],
+        "timer": {
+            "mode": facts["timer"]["mode"],
+            "activity": facts["timer"]["activity"],
+            "productivity_active": facts["timer"]["productivity_active"],
+            "break_balance_ms": facts["timer"]["break_balance_ms"],
+            "break_available_ms": facts["timer"]["break_available_ms"],
+            "break_backlog_ms": facts["timer"]["break_backlog_ms"],
+            "is_in_backlog": facts["timer"]["is_in_backlog"],
+        },
+        "attention": {
+            "desktop_mode": facts["attention"]["desktop"]["mode"],
+            "desktop_work_mode": facts["attention"]["desktop"]["work_mode"],
+            "phone_app": facts["attention"]["phone"]["app"],
+            "phone_distracted": facts["attention"]["phone"]["is_distracted"],
+            "phone_heartbeat_age_seconds": facts["attention"]["phone"]["heartbeat_age_seconds"],
+        },
+        "fleet": {
+            "active": int(counts.get("active") or 0),
+            "stale": int(counts.get("stale") or 0),
+            "by_status": counts.get("by_status") or {},
+            "by_engine": counts.get("by_engine") or {},
+            "by_persona": counts.get("by_persona") or {},
+        },
+        "tmux": {
+            "reachable": tmux_health.get("reachable"),
+            "tmux_reachable": tmux_health.get("tmux_reachable"),
+            "version": tmux_health.get("version"),
+            "sha": tmux_health.get("sha"),
+            "live_instance_panes": None,
+            "projection_drift": None,
+        },
+        "tts": {
+            "current": current_tts_label,
+            "queue_length": int(tts_summary.get("queue_length") or 0),
+            "hot_queue_length": int(tts_summary.get("hot_queue_length") or 0),
+            "pause_queue_length": int(tts_summary.get("pause_queue_length") or 0),
+            "satellite_available": tts_summary.get("satellite_available"),
+            "global_mode": tts_summary.get("global_mode"),
+        },
+        "enforcement": {
+            "pending_count": int(enforcement_summary.get("pending_count") or 0),
+            "pavlok_enabled": (enforcement_summary.get("pavlok") or {}).get("enabled"),
+        },
+        "assertions": assertions,
+        "recommended_actions": recommended_actions,
     }
 
 
@@ -20810,92 +22218,24 @@ async def get_ops_timer_history(window: str = "6h", bucket: str = "60s"):
     return await _ops_read_timer_history(window=window, bucket=bucket)
 
 
+@app.get("/api/ui/ops/graph/{graph_name}")
+async def get_ops_graph(graph_name: str):
+    """Typed node/edge read model for ops cockpit relationship graphs."""
+    return await _ops_read_graph(graph_name)
+
+
 @app.get("/api/ui/ops/state")
 async def get_ops_display_state():
     """Aggregate read model for the Terminus ops cockpit."""
     now = datetime.now()
-    work_state = await get_cached_work_state()
-    instances = await _ops_read_instances(now)
-    events = await _ops_read_events()
-    cron_summary = await _ops_read_cron_summary()
-    enforcement_summary = await _ops_read_enforcement_summary()
-    tts_summary = get_tts_queue_status()
-    work_actions = await _ops_read_work_actions(now=now)
-    assertions = _ops_build_state_assertions(
-        generated_at=now,
-        work_state=work_state,
-        instances=instances,
-        events=events,
-        enforcement_summary=enforcement_summary,
-        tts_summary=tts_summary,
-    )
+    return _ops_build_ui_state(await _ops_collect_facts(now))
 
-    break_balance_ms = timer_engine.break_balance_ms
-    return {
-        "surface": "ops",
-        "ui_build_id": _ops_ui_build_id(),
-        "generated_at": now.isoformat(),
-        "timer": {
-            "mode": timer_engine.current_mode.value,
-            "activity": timer_engine.activity.value,
-            "productivity_active": work_state.productivity_active,
-            "manual_mode": timer_engine.manual_mode.value if timer_engine.manual_mode else None,
-            "manual_mode_lock": timer_engine.manual_mode_lock,
-            "manual_trigger": timer_engine.manual_trigger,
-            "focus_active": timer_engine.focus_active,
-            "break_balance_ms": break_balance_ms,
-            "break_available_ms": max(0, break_balance_ms),
-            "break_backlog_ms": abs(min(0, break_balance_ms)),
-            "is_in_backlog": break_balance_ms < 0,
-            "total_work_time_ms": timer_engine.total_work_time_ms,
-            "total_break_time_ms": timer_engine.total_break_time_ms,
-            "daily_start_date": timer_engine.daily_start_date,
-            "idle_timer": _ops_timer_idle_status(work_state, int(time.monotonic() * 1000)),
-        },
-        "billable": _ops_billable_summary(work_state),
-        "assertions": assertions,
-        "attention": {
-            "desktop": {
-                "mode": DESKTOP_STATE.get("current_mode", "silence"),
-                "work_mode": DESKTOP_STATE.get("work_mode", "clocked_in"),
-                "last_detection": DESKTOP_STATE.get("last_detection"),
-                "location_zone": DESKTOP_STATE.get("location_zone"),
-                "ahk_reachable": DESKTOP_STATE.get("ahk_reachable"),
-                "steam_app_id": DESKTOP_STATE.get("steam_app_id"),
-                "steam_app_name": DESKTOP_STATE.get("steam_app_name"),
-                "steam_exe": DESKTOP_STATE.get("steam_exe"),
-                "in_meeting": DESKTOP_STATE.get("in_meeting", False),
-            },
-            "phone": {
-                "app": PHONE_STATE.get("current_app"),
-                "is_distracted": PHONE_STATE.get("is_distracted", False),
-                "last_activity": PHONE_STATE.get("last_activity"),
-                "app_opened_at": PHONE_STATE.get("app_opened_at"),
-                "heartbeat_age_seconds": _ops_seconds_since(PHONE_HEARTBEAT.get("last_seen")),
-            },
-        },
-        "work_state": work_state.model_dump(),
-        "instances": instances,
-        "events": events,
-        "cron": cron_summary,
-        "tts": {
-            "current": tts_summary.get("current"),
-            "hot_queue": tts_summary.get("hot_queue", []),
-            "pause_queue": tts_summary.get("pause_queue", []),
-            "hot_queue_length": tts_summary.get("hot_queue_length", 0),
-            "pause_queue_length": tts_summary.get("pause_queue_length", 0),
-            "queue_length": tts_summary.get("queue_length", 0),
-            "backend": tts_summary.get("backend"),
-            "satellite_available": tts_summary.get("satellite_available"),
-            "global_mode": tts_summary.get("global_mode"),
-            "routing": tts_summary.get("routing"),
-        },
-        "voice_drafts": [
-            _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
-        ],
-        "enforcement": enforcement_summary,
-        "work_actions": work_actions,
-    }
+
+@app.get("/api/ops/status")
+async def get_ops_status() -> dict:
+    """Concise shared ops status read model for agents and scripts."""
+    now = datetime.now()
+    return _ops_build_status(await _ops_collect_facts(now))
 
 
 @app.post("/api/ui/ops/phone/clear")

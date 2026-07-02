@@ -138,6 +138,108 @@ async def _echo_prompt_submit_to_tmuxctld(payload: dict) -> None:
         return
 
 
+def _post_tmuxctld_ledger_upsert_sync(body: dict) -> None:
+    base = _tmuxctld_loopback_url()
+    if not base:
+        return
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/ledger/upsert",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # This is the belt leg from SessionStart into the daemon ledger. Do not make
+    # agent registration depend on tmuxctld being up; wrapperstart/reconcile can
+    # rebuild it. Keep the timeout tighter than the hook client budget.
+    with shared._TMUXCTLD_OPENER.open(req, timeout=0.35) as resp:
+        resp.read(512)
+
+
+async def _upsert_tmuxctld_ledger_from_agents_db(payload: dict, result: dict) -> None:
+    instance_id = _normalize_text(result.get("instance_id") or payload.get("session_id") or "")
+    if not instance_id:
+        return
+    env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
+    pane_label = _normalize_text(payload.get("pane_label") or env.get("TOKEN_API_PANE_LABEL") or "")
+    tmux_pane = _normalize_text(
+        payload.get("tmux_pane")
+        or env.get("TMUX_PANE")
+        or env.get("TOKEN_API_DISPATCH_RESOLVED_PANE")
+        or ""
+    )
+    if not pane_label and tmux_pane:
+        try:
+            pane_label = await _tmux_pane_label(tmux_pane)
+        except Exception:
+            pane_label = ""
+
+    try:
+        async with shared.hook_db() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT i.id, i.wrapper_launch_id, i.working_dir, i.engine, i.status,
+                          (SELECT slug FROM personas WHERE id = i.persona_id) AS persona_slug
+                   FROM instances i
+                   WHERE i.id = ?""",
+                (instance_id,),
+            )
+            row = await cursor.fetchone()
+    except Exception as exc:
+        logger.warning(
+            "SessionStart: tmuxctld ledger agents.db read failed for %s: %s", instance_id[:12], exc
+        )
+        return
+    if row is None:
+        return
+
+    wrapper_id = _normalize_text(
+        row["wrapper_launch_id"]
+        or payload.get("wrapper_launch_id")
+        or payload.get("wrapper_id")
+        or env.get("TOKEN_API_WRAPPER_ID")
+        or env.get("TOKEN_API_WRAPPER_LAUNCH_ID")
+        or ""
+    )
+    if not wrapper_id:
+        return
+    result_persona = result.get("persona") if isinstance(result.get("persona"), dict) else {}
+    body = {
+        "wrapper_id": wrapper_id,
+        "instance_id": row["id"],
+        "persona": _normalize_text(row["persona_slug"] or result_persona.get("slug") or ""),
+        "pane_positional_id": pane_label,
+        "engine": _normalize_text(
+            row["engine"] or env.get("TOKEN_API_ENGINE") or payload.get("engine") or ""
+        ),
+        "working_dir": _normalize_text(row["working_dir"] or payload.get("cwd") or ""),
+        "state": "OPEN" if _normalize_text(row["status"]) != "stopped" else "CLOSED",
+    }
+    try:
+        await asyncio.to_thread(_post_tmuxctld_ledger_upsert_sync, body)
+    except Exception as exc:
+        logger.warning(
+            "SessionStart: tmuxctld ledger upsert failed for %s wrapper=%s: %s",
+            instance_id[:12],
+            wrapper_id[:12],
+            exc,
+        )
+
+
+def _schedule_tmuxctld_ledger_upsert(payload: dict, result: dict) -> None:
+    """Queue best-effort tmuxctld ledger hydration off the hook response path."""
+
+    task = asyncio.create_task(_upsert_tmuxctld_ledger_from_agents_db(dict(payload), dict(result)))
+
+    def _log_task_failure(done: asyncio.Task[None]) -> None:
+        try:
+            done.result()
+        except Exception as exc:
+            logger.warning("SessionStart: tmuxctld ledger hydration task failed: %s", exc)
+
+    task.add_done_callback(_log_task_failure)
+
+
 # Bounded in-band retry for transient WAL "database is locked" (SQLITE_BUSY) on
 # hook DB writes. Total added latency on full exhaustion is
 # 0.15*(1+2+3+4) = 1.5s — well under the client hook's --max-time/--retry-max-time
@@ -566,15 +668,19 @@ async def _stamp_instance_id(
     tmux_pane: str | None,
     session_id: str | None,
     display_name: str | None = None,
+    *,
+    db=None,
+    wrapper_id: str | None = None,
+    engine: str | None = None,
+    working_dir: str | None = None,
+    persona: str | None = None,
 ) -> None:
-    """Stamp ``@INSTANCE_ID=<session_id>`` (and optionally ``@PANE_LABEL``) on the pane.
+    """Bind the canonical Token-API instance id to the wrapper ledger.
 
-    tmux becomes the source of truth for ``instance_id -> pane`` resolution; the
-    stamp lives and dies with the pane. Done in the same critical section as the
-    row upsert so no reader ever sees a registered row whose pane is unstamped.
-    Best-effort: a failed stamp is logged, not raised — the row write must not be
-    blocked by tmux being unavailable (e.g. remote/satellite-hosted panes whose
-    ``%N`` is not addressable from this host).
+    The live engine's ``TOKEN_API_SESSION_ID`` may churn across plan/compact
+    cycles. The ledger must receive the canonical Token-API row id selected by
+    the SessionStart upsert/adoption path, resolved here from ``wrapper_id`` when
+    possible, not blindly from hook env.
 
     ``display_name`` is the instance's ``tab_name`` (NOT the persona ``pane_label``
     column). When provided, it hydrates ``@PANE_LABEL`` so the border shows the name
@@ -583,8 +689,42 @@ async def _stamp_instance_id(
     """
     if not tmux_pane or not session_id:
         return
+    canonical_instance_id = session_id
+    if db is not None and wrapper_id:
+        try:
+            cursor = await db.execute(
+                """SELECT id FROM instances
+                   WHERE wrapper_launch_id = ?
+                     AND rank != 'retired'
+                   ORDER BY last_activity DESC, created_at DESC
+                   LIMIT 1""",
+                (wrapper_id,),
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                canonical_instance_id = str(row[0])
+        except Exception as exc:
+            logger.debug("Hook: canonical wrapper instance lookup failed: %s", exc)
+
+    if wrapper_id:
+        await asyncio.to_thread(
+            shared._tmuxctld_post_json,
+            "/ledger/upsert",
+            {
+                "wrapper_id": wrapper_id,
+                "instance_id": canonical_instance_id,
+                "pane_positional_id": await _tmux_pane_label(tmux_pane) or "",
+                "engine": engine or "",
+                "working_dir": working_dir or "",
+                "persona": persona or "",
+                "state": "OPEN",
+            },
+            timeout=1.0,
+            default_loopback=True,
+        )
+
     stamped = await shared.tmuxctld_run_tmux(
-        ("set-option", "-p", "-t", tmux_pane, "@INSTANCE_ID", session_id),
+        ("set-option", "-p", "-t", tmux_pane, "@INSTANCE_ID", canonical_instance_id),
         timeout=2,
     )
     if stamped is None:
@@ -2578,7 +2718,9 @@ async def _apply_instance_workflow_state(
 async def handle_wrapper_start(payload: dict) -> dict:
     """Handle wrapper-level launch telemetry without creating an instance row."""
     wrapper_launch_id = _normalize_text(
-        payload.get("wrapper_launch_id")
+        payload.get("wrapper_id")
+        or payload.get("wrapper_launch_id")
+        or payload.get("env", {}).get("TOKEN_API_WRAPPER_ID", "")
         or payload.get("env", {}).get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
     )
     details = {
@@ -2613,7 +2755,9 @@ async def handle_wrapper_end(payload: dict) -> dict:
     idempotent: already archived/retired rows are left alone.
     """
     wrapper_launch_id = _normalize_text(
-        payload.get("wrapper_launch_id")
+        payload.get("wrapper_id")
+        or payload.get("wrapper_launch_id")
+        or payload.get("env", {}).get("TOKEN_API_WRAPPER_ID", "")
         or payload.get("env", {}).get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
     )
     tmux_pane = _normalize_text(
@@ -2809,7 +2953,10 @@ async def handle_session_start(payload: dict) -> dict:
         payload.get("launch_mode") or env.get("TOKEN_API_LAUNCH_MODE", "")
     )
     wrapper_launch_id = _normalize_text(
-        payload.get("wrapper_launch_id") or env.get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
+        payload.get("wrapper_id")
+        or payload.get("wrapper_launch_id")
+        or env.get("TOKEN_API_WRAPPER_ID", "")
+        or env.get("TOKEN_API_WRAPPER_LAUNCH_ID", "")
     )
     parent_instance_id = _normalize_text(
         payload.get("parent_instance_id") or env.get("TOKEN_API_PARENT_INSTANCE_ID", "")
@@ -3242,6 +3389,11 @@ async def handle_session_start(payload: dict) -> dict:
                     target_pane,
                     session_id,
                     display_name=persona_display_name or transplant_updates["name"],
+                    db=db,
+                    wrapper_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                    engine=engine or existing_row["engine"],
+                    working_dir=working_dir,
+                    persona=primarch_name or dispatch_legion,
                 )
                 # Only vacate the old pane when a NEW addressable pane was actually
                 # stamped. A blank `tmux_pane` (in-wrapper re-fire arriving with no
@@ -3409,6 +3561,11 @@ async def handle_session_start(payload: dict) -> dict:
                     tmux_pane or prior_pane,
                     session_id,
                     display_name=persona_display_name or updates["name"],
+                    db=db,
+                    wrapper_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                    engine=engine or existing_row["engine"],
+                    working_dir=working_dir,
+                    persona=primarch_name or dispatch_legion,
                 )
                 if tmux_pane and prior_pane and tmux_pane != prior_pane:
                     await _unstamp_instance_id(prior_pane, session_id)
@@ -3604,6 +3761,11 @@ async def handle_session_start(payload: dict) -> dict:
                     target_tmux_pane,
                     session_id,
                     display_name=persona_display_name or supplant_updates["name"],
+                    db=db,
+                    wrapper_id=wrapper_launch_id or old_inst["wrapper_launch_id"],
+                    engine=engine or old_inst["engine"],
+                    working_dir=working_dir,
+                    persona=primarch_name or dispatch_legion,
                 )
                 # If the agent moved panes, vacate the old pane's @INSTANCE_ID so the
                 # oracle never reports the supplanted (now-defunct) id there.
@@ -3927,7 +4089,14 @@ async def handle_session_start(payload: dict) -> dict:
             db, instance_id=session_id, persona_identity=persona_identity
         )
         await _stamp_instance_id(
-            tmux_pane, session_id, display_name=persona_display_name or tab_name
+            tmux_pane,
+            session_id,
+            display_name=persona_display_name or tab_name,
+            db=db,
+            wrapper_id=wrapper_launch_id,
+            engine=engine,
+            working_dir=working_dir,
+            persona=primarch_name or dispatch_legion,
         )
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
@@ -7384,7 +7553,10 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
     # write boundary inside each handler that needs it (see handle_session_start's
     # registration INSERT); this dispatcher only swallows-or-surfaces the outcome.
     try:
-        return await handler(payload)
+        result = await handler(payload)
+        if normalized_action_type == "SessionStart" and isinstance(result, dict):
+            _schedule_tmuxctld_ledger_upsert(payload, result)
+        return result
     except Exception as e:
         logger.error(f"Hook handler error ({normalized_action_type}): {e}")
 

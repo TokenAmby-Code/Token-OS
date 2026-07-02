@@ -37,7 +37,7 @@ ENGINE="${TOKEN_API_ENGINE:-$ENGINE_ARG}"
 WORKING_DIR="$(pwd)"
 TMUX_PANE_VALUE="${TOKEN_API_DISPATCH_RESOLVED_PANE:-${TMUX_PANE:-}}"
 DISPATCH_TARGET_WINDOW="${TOKEN_API_PRINT_REDIRECT_WINDOW:-main:mechanicus}"
-WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-$(token_wrapper_uuid)}"
+WRAPPER_ID="${TOKEN_API_WRAPPER_ID:-${TOKEN_API_WRAPPER_LAUNCH_ID:-$(token_wrapper_uuid)}}"
 WRAPPER_CHILD_PID=""
 WRAPPER_CLEANUP_DONE=0
 
@@ -195,11 +195,11 @@ run_claude() {
     quoted_workdir="$(printf '%q' "$WORKING_DIR")"
     quoted_launcher="$(printf '%q' "$LAUNCHER")"
     quoted_engine="$(printf '%q' "$ENGINE")"
-    quoted_wrapper_id="$(printf '%q' "$WRAPPER_LAUNCH_ID")"
+    quoted_wrapper_id="$(printf '%q' "$WRAPPER_ID")"
     quoted_discord_hosted="$(printf '%q' "${TOKEN_API_DISCORD_HOSTED:-}")"
     quoted_discord_channel="$(printf '%q' "${TOKEN_API_DISCORD_CHANNEL:-}")"
     quoted_discord_bot="$(printf '%q' "${TOKEN_API_DISCORD_BOT:-}")"
-    cmd="cd $quoted_workdir && TOKEN_API_LAUNCHER=$quoted_launcher TOKEN_API_ENGINE=$quoted_engine TOKEN_API_WRAPPER_LAUNCH_ID=$quoted_wrapper_id TOKEN_API_DISCORD_HOSTED=$quoted_discord_hosted TOKEN_API_DISCORD_CHANNEL=$quoted_discord_channel TOKEN_API_DISCORD_BOT=$quoted_discord_bot $quoted_agent_wrapper claude --dangerously-skip-permissions"
+    cmd="cd $quoted_workdir && TOKEN_API_LAUNCHER=$quoted_launcher TOKEN_API_ENGINE=$quoted_engine TOKEN_API_WRAPPER_ID=$quoted_wrapper_id TOKEN_API_DISCORD_HOSTED=$quoted_discord_hosted TOKEN_API_DISCORD_CHANNEL=$quoted_discord_channel TOKEN_API_DISCORD_BOT=$quoted_discord_bot $quoted_agent_wrapper claude --dangerously-skip-permissions"
     for arg in "${redirect_args[@]}"; do
       cmd+=" $(printf '%q' "$arg")"
     done
@@ -239,7 +239,7 @@ run_claude() {
   trap 'wrapper_forward_signal HUP' HUP
   sync_shared_skills
   token_wrapper_start
-  export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
+  export TOKEN_API_WRAPPER_ID="$WRAPPER_ID"
 
   # Bake the rank+persona system-doc staple into claude's system prompt. This is
   # the single injection point for every Claude launch surface (workers +
@@ -345,7 +345,7 @@ run_codex_legacy_subagent() {
   trap 'wrapper_forward_signal TERM' TERM
   trap 'wrapper_forward_signal HUP' HUP
   token_wrapper_start
-  export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
+  export TOKEN_API_WRAPPER_ID="$WRAPPER_ID"
 
   set +e
   wrapper_run_child env TOKEN_API_AGENT_WRAPPER_BYPASS=1 script -a -f -e -c "$codex_path $(printf '%q' "$command_str")" "$temp_log"
@@ -396,7 +396,7 @@ run_codex() {
   local session_id bridge_id bridge_dir working_dir prompt resume_id bypass_flag output_file status=0
   local -a codex_args
   session_id="${TOKEN_API_SESSION_ID:-$(token_wrapper_uuid)}"
-  bridge_id="${TOKEN_API_CODEX_BRIDGE_ID:-$WRAPPER_LAUNCH_ID}"
+  bridge_id="${TOKEN_API_CODEX_BRIDGE_ID:-$WRAPPER_ID}"
   bridge_dir="${HOME}/.codex/session-bridges"
   working_dir="${TOKEN_API_TARGET_WORKING_DIR:-$WORKING_DIR}"
   prompt="$*"
@@ -407,7 +407,7 @@ run_codex() {
 
   export TOKEN_API_SESSION_ID="$session_id"
   export TOKEN_API_CODEX_BRIDGE_ID="$bridge_id"
-  export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
+  export TOKEN_API_WRAPPER_ID="$WRAPPER_ID"
   export TOKEN_API_LAUNCHER="$LAUNCHER"
   export TOKEN_API_ENGINE="codex"
 

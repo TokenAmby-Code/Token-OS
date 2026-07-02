@@ -160,21 +160,18 @@ def test_typing_guard_indicator_is_per_pane_not_global_taskbar() -> None:
     reconciler; pane-border liveness must come from live deadline math.
     """
     status_right = _line_starting("set -g status-right ")
-    assert "tmux-typing-guard-status" not in status_right
     assert "#(" not in status_right, "typing guard status rendering must be zero-fork"
-    # The per-pane border is the sole guard surface now, but it must compute
-    # liveness from deadlines instead of trusting stored @GUARD projection.
+    # The per-pane border is the sole guard surface now, reading only daemon-derived
+    # JSON projections.
     border = _line_starting("set -g pane-border-format ")
-    assert "@TYPING_LOCK_UNTIL" in border
-    assert "@TYPING_PENDING_UNTIL" in border
-    assert "@GUARD" not in border, "stored @GUARD must not drive live marker rendering"
+    assert "@TYPING_GUARD_UNTIL" in border
+    assert "@TYPING_GUARD_MARKER" in border
 
 
 def test_typing_guard_marker_is_live_deadline_computed() -> None:
     border = _line_starting("set -g pane-border-format ")
-    assert "#{?#{e|>=:#{@TYPING_PENDING_UNTIL},%s}, #[fg=red]#[bold]⌨#[default] ," in border
-    assert "#{?#{e|>=:#{@TYPING_LOCK_UNTIL},%s}, #[fg=colour214]#[bold]⌨#[default] ,}" in border
-    assert "#{?@GUARD," not in border
+    assert "#{?#{e|>=:#{@TYPING_GUARD_UNTIL},%s}, #{@TYPING_GUARD_MARKER} ,}" in border
+    assert "@TYPING_GUARD_JSON" not in border
 
 
 def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None:
@@ -185,7 +182,7 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
 
     border = _line_starting("set -g pane-border-format ")
     start = border.index("#{?@PANE_LABEL,")
-    end = border.index("}#{?#{e|>=:#{@TYPING_PENDING_UNTIL},%s}", start) + 1
+    end = border.index("}#{?#{e|>=:#{@TYPING_GUARD_UNTIL},%s}", start) + 1
     blue_nametag = border[start:end]
 
     assert "#[bg=colour31]" in blue_nametag
@@ -204,8 +201,8 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
     assert "pane_title" not in border
     assert "@PANE_TITLE_SUPPRESS" not in border
     for expected in (
-        "@TYPING_LOCK_UNTIL",
-        "@TYPING_PENDING_UNTIL",
+        "@TYPING_GUARD_UNTIL",
+        "@TYPING_GUARD_MARKER",
         "@OPS_SELECTED",
         "@GT_FIRE",
         "@DISCORD_VOICE_PROCESSING",
@@ -220,19 +217,17 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
 
 def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> None:
     """The root-table any-key binding only calls the state helper when the pane is
-    not ON. Live ON is preserved; PENDING is re-armed by the helper and the real
-    key is replayed."""
+    reachable by the root Any topology. Live HUMAN disables that topology;
+    PENDING re-enables it so the next ordinary key is re-armed by the helper and
+    the real key is replayed."""
     conf = CONF.read_text(encoding="utf-8")
     assert "bind -n Any {" in conf
-    assert "tmux-typing-guard-state arm --pane #{q:pane_id} --seconds 300" in conf
-    assert "--now #{client_activity}" in conf
-    assert "@TYPING_PENDING_UNTIL" in conf
-    assert "@TYPING_LOCK_UNTIL" in conf
-    assert "tmux-typing-guard-status --expire-pane" not in conf
-    assert "tmux-typing-guard-status --scan" not in conf
-    assert "set -p @GUARD" not in conf, "@GUARD writes must be centralized in the helper"
-    assert "set -Fp @TYPING_PENDING_UNTIL" not in conf
-    assert "set -Fp @TYPING_LOCK_UNTIL" not in conf
+    assert "tmuxctld-ping POST /typing-guard-state cmd=arm pane=#{q:pane_id} seconds=300" in conf
+    assert "now=#{client_activity}" in conf
+    assert "@TYPING_GUARD_KIND" in conf
+    assert "@TYPING_GUARD_UNTIL" in conf
+    assert "tmux-typing-guard-" not in conf
+    assert "set -Fp @TYPING_GUARD" not in conf
 
     # Root-table Any is the catch-all backstop for EVERY mouse event lacking a
     # more specific binding (border clicks, status clicks, double/triple/second
@@ -259,10 +254,12 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     assert "send-keys -M" not in any_binding
     # Arming lives ONLY on the keystroke side; the mouse (else) branch is empty —
     # nothing after the keystroke branch's final send-keys but closing braces.
-    assert "tmux-typing-guard-state arm" in any_binding
-    assert "@TYPING_PENDING_UNTIL" not in any_binding, (
-        "Any must not depend directly on PENDING; a follow-up keystroke after "
-        "Backspace/Ctrl+C pending must run the arm helper and convert PENDING to ON"
+    assert "tmuxctld-ping POST /typing-guard-state cmd=arm" in any_binding
+    assert "@TYPING_GUARD_KIND" not in any_binding
+    assert "@TYPING_GUARD_UNTIL" not in any_binding
+    assert "@TYPING_GUARD_KIND},pending" not in any_binding, (
+        "Any must not depend directly on pending; a follow-up keystroke after "
+        "Backspace/Ctrl+C pending must run the arm endpoint and convert pending to human"
     )
     mouse_else_branch = any_binding.rsplit("send-keys", 1)[1]
     assert mouse_else_branch.strip(" \n\t{}") == "", (
@@ -271,6 +268,57 @@ def test_typing_guard_any_key_routes_first_arm_through_canonical_helper() -> Non
     )
     assert "bind -n FocusIn" not in conf
     assert "bind -n FocusOut" not in conf
+
+
+def test_typing_guard_focus_hooks_only_rehydrate_topology() -> None:
+    conf = CONF.read_text(encoding="utf-8")
+    for prefix in (
+        "set-hook -g client-attached[20] ",
+        "set-hook -g after-select-pane[20] ",
+        "set-hook -g after-select-window[20] ",
+    ):
+        line = _line_starting(prefix)
+        assert "tmuxctld-ping POST /typing-guard-topology" in line
+        assert "cmd=rehydrate" in line
+        assert "/typing-guard-state" not in line
+        for forbidden in ("cmd=arm", "cmd=pending", "cmd=hold", "cmd=release", "cmd=expire-pane"):
+            assert forbidden not in line
+    focus_hook_lines = [
+        line
+        for line in conf.splitlines()
+        if line.startswith("set-hook -g after-select")
+        or line.startswith("set-hook -g client-attached[20]")
+    ]
+    assert focus_hook_lines
+    assert all("@TYPING_GUARD" not in line for line in focus_hook_lines)
+
+
+def test_typing_guard_pending_keys_are_permanently_bound() -> None:
+    """Hard infra lock: topology may toggle root Any only.
+
+    Pending/control keys must stay permanently bound so Backspace/C-h/C-c/Enter
+    cannot fall through to root Any and be misclassified as ordinary typing.
+    """
+    conf = CONF.read_text(encoding="utf-8")
+    any_index = conf.index("bind -n Any {")
+    for key, seconds in {
+        "Enter": "5",
+        "C-m": "5",
+        "BSpace": "15",
+        "C-h": "15",
+        "C-c": "15",
+    }.items():
+        line = _line_starting(f"bind -n {key} ")
+        assert conf.index(line) > any_index
+        assert "tmuxctld-ping POST /typing-guard-state cmd=pending" in line
+        assert f"seconds={seconds}" in line
+        assert "send-keys" in line
+
+    assert "unbind-key -n Enter" not in conf
+    assert "unbind-key -n C-m" not in conf
+    assert "unbind-key -n BSpace" not in conf
+    assert "unbind-key -n C-h" not in conf
+    assert "unbind-key -n C-c" not in conf
 
 
 def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
@@ -288,29 +336,23 @@ def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
         "WheelDownPane",
     ):
         line = _line_starting(f"bind -n {key} ")
-        assert "tmux-typing-guard-state arm" not in line
-        assert "tmux-typing-guard-state pending" not in line
-        assert "@TYPING_LOCK_UNTIL" not in line
-        assert "@TYPING_PENDING_UNTIL" not in line
+        assert "tmuxctld-ping POST /typing-guard-state" not in line
+        assert "@TYPING_GUARD" not in line
     assert "send-keys -M" not in _line_starting("bind -n MouseDown1Pane ")
 
 
 def test_mouse_bindings_never_reach_the_green_agent_guard_state() -> None:
-    """The green `agent` typing-guard state (@TYPING_AGENT_UNTIL) is set ONLY by
-    the daemon around a verified send — it must be unreachable from any mouse
-    event. A regression here would re-open the softlock class fixed by 13789e5
-    (a mouse branch arming/holding the guard, then `send-keys -M` with no mouse
-    target). Asserts every mouse binding is keyboard/data-free of the guard."""
+    """The green agent typing-guard state is set ONLY by the daemon around a
+    verified send — it must be unreachable from any mouse event. A regression
+    here would re-open the softlock class fixed by 13789e5. Asserts every mouse
+    binding is keyboard/data-free of the guard."""
     conf = CONF.read_text(encoding="utf-8")
 
     # The whole conf must never bind the agent hold from a key/mouse table; it is
     # a daemon-only option (lib/tmuxctl/typing_guard_state.py + send_gate.py).
     for line in conf.splitlines():
         if line.lstrip().startswith("bind"):
-            assert "@TYPING_AGENT_UNTIL" not in line, (
-                "no key/mouse binding may set or read the green agent hold; "
-                "@TYPING_AGENT_UNTIL is daemon-only"
-            )
+            assert "cmd=hold" not in line, "no key/mouse binding may acquire the agent hold"
 
     mouse_keys = (
         "MouseDown1Status",
@@ -327,14 +369,10 @@ def test_mouse_bindings_never_reach_the_green_agent_guard_state() -> None:
     )
     for key in mouse_keys:
         line = _line_starting(f"bind -n {key} ")
-        # Never touches any typing-guard option (human OR agent) ...
-        assert "@TYPING_AGENT_UNTIL" not in line
-        assert "@TYPING_LOCK_UNTIL" not in line
-        assert "@TYPING_PENDING_UNTIL" not in line
+        # Never touches any typing-guard projection ...
+        assert "@TYPING_GUARD" not in line
         # ... never arms/holds/pends the guard ...
-        assert "tmux-typing-guard-state arm" not in line
-        assert "tmux-typing-guard-state pending" not in line
-        assert "tmux-typing-guard-state hold" not in line
+        assert "tmuxctld-ping POST /typing-guard-state" not in line
         # ... and never replays via the stale mouse-target path that softlocked.
         assert "send-keys -M" not in line
         assert "mouse_x" not in line
@@ -345,25 +383,28 @@ def test_mouse_bindings_never_reach_the_green_agent_guard_state() -> None:
 
 
 def test_typing_guard_submit_backspace_and_ctrl_c_use_one_pending_helper() -> None:
-    """Enter/C-m/Backspace/Ctrl+C variants use the same pending transition
-    helper; only the timeout differs. No @GUARD value may contain literal
-    PENDING text."""
+    """Enter/C-m/Backspace/Ctrl+C variants use the same pending endpoint; only
+    the timeout differs."""
     conf = CONF.read_text(encoding="utf-8")
     assert "⌨ PENDING" not in conf
     for key in ("Enter", "C-m"):
         line = _line_starting(f"bind -n {key} ")
-        assert "tmux-typing-guard-state pending --pane #{q:pane_id} --seconds 5" in line
+        assert (
+            "tmuxctld-ping POST /typing-guard-state cmd=pending pane=#{q:pane_id} seconds=5" in line
+        )
         assert "send-keys" in line
     for key in ("BSpace", "C-h", "C-c"):
         line = _line_starting(f"bind -n {key} ")
-        pending_helper = "tmux-typing-guard-state pending --pane #{q:pane_id} --seconds 15"
-        assert line.count(pending_helper) == 2
-        assert "tmux-typing-guard-state arm" not in line
-        assert "@TYPING_PENDING_UNTIL" in line
-        assert "@TYPING_LOCK_UNTIL" in line
-        # Repeated Backspace/Ctrl+C while pending is the first branch and contains no helper call.
+        pending_helper = (
+            "tmuxctld-ping POST /typing-guard-state cmd=pending pane=#{q:pane_id} seconds=15"
+        )
+        assert line.count(pending_helper) == 1
+        assert "cmd=arm" not in line
+        assert "@TYPING_GUARD_KIND" in line
+        assert "@TYPING_GUARD_UNTIL" in line
+        # Repeated Backspace/Ctrl+C while pending is the first branch and contains no endpoint call.
         pending_branch = line.split("} {")[0]
-        assert "tmux-typing-guard-state" not in pending_branch
+        assert "tmuxctld-ping POST /typing-guard-state" not in pending_branch
 
 
 def test_pane_border_identity_is_blank_by_default() -> None:
@@ -387,7 +428,7 @@ def test_pane_border_identity_is_blank_by_default() -> None:
     assert "@PANE_TITLE_SUPPRESS" not in border, "retired suppress flag must be gone"
     # Structural proof of blank-by-default: the @PANE_LABEL conditional closes with
     # an empty false-branch (`,}`) directly into the live typing-guard deadline segment.
-    assert "#{@PANE_LABEL} #[default],}#{?#{e|>=:#{@TYPING_PENDING_UNTIL},%s}," in border
+    assert "#{@PANE_LABEL} #[default],}#{?#{e|>=:#{@TYPING_GUARD_UNTIL},%s}," in border
 
 
 def test_pane_title_suppress_concept_is_fully_retired() -> None:
@@ -402,7 +443,6 @@ def test_portable_status_guard_indicator_is_also_per_pane() -> None:
     status_right = next(
         line for line in portable.splitlines() if line.startswith("set status-right ")
     )
-    assert "tmux-typing-guard-status" not in status_right
     assert "#(" not in status_right
 
 
