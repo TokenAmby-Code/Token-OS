@@ -168,7 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     freelist_parser = subparsers.add_parser(
         "freelist",
-        help="List clean, agent-free panes (derived live from @PANE_CLEAN stamps).",
+        help="List unoccupied, agent-free panes (derived from the daemon occupancy ledger).",
     )
     freelist_parser.add_argument("--format", choices=["text", "json", "ids"], default="text")
     freelist_parser.add_argument(

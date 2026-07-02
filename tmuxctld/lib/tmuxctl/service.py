@@ -461,9 +461,9 @@ class TmuxControlPlane:
         return LEDGER.reconcile_from_tmux(self.adapter)
 
     def freelist(self) -> list[dict]:
-        """List the clean, agent-free panes (the freelist).
+        """List the unoccupied, agent-free panes (the freelist).
 
-        Purely derived from the live ``@PANE_CLEAN`` stamps — no stored state.
+        Purely derived from the live daemon occupancy ledger — no stored state.
         Each entry is ``{pane_id, pane_role, window_name}``.
         """
         return [

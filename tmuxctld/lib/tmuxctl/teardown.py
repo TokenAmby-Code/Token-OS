@@ -72,11 +72,10 @@ def clear_slot_in_place(
 ) -> dict[str, Any]:
     """Scrub a pre-allocated slot's runtime IN PLACE — never kill the pane.
 
-    ``clear_runtime_state`` drops the runtime stamps + ``@PANE_CLEAN`` and the
-    statusline chrome while preserving the durable slot identity (``@PANE_ID`` /
-    ``@PANE_TYPE``). If the slot husk is dead (remain-on-exit), its shell is
-    revived in place so the slot is once again a live, clean, dispatch-ready
-    freelist pane. ``respawn-pane`` runs WITHOUT ``-k``: the pane is already dead,
+    ``clear_runtime_state`` drops the runtime stamps and the statusline chrome
+    while preserving the durable slot identity (``@PANE_ID`` / ``@PANE_TYPE``). If
+    the slot husk is dead (remain-on-exit), its shell is revived in place so the
+    slot is once again a live, dispatch-ready freelist pane. ``respawn-pane`` runs WITHOUT ``-k``: the pane is already dead,
     and the adapter's respawn pre-flight re-scrubs the runtime so the revived
     shell never inherits the prior occupant's stamps.
     """

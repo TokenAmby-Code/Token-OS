@@ -331,12 +331,13 @@ def resolve_instance(adapter: TmuxAdapter, instance_id: str) -> InstanceResoluti
 
 @dataclass(frozen=True)
 class FreePane:
-    """A clean, agent-free pane — a candidate for split-alias-style routing.
+    """An unoccupied, agent-free pane — a candidate for split-alias-style routing.
 
-    Derived purely from the live ``@PANE_CLEAN`` stamp (set by the shell's
-    ``clear`` wrapper, dropped on the first command or ^C). A pane is *free* when
-    it is stamped clean AND carries no live ``@INSTANCE_ID``. There is no stored
-    registry: the stamps are the single source of truth and this is a live view.
+    Derived purely from the live daemon occupancy ledger: a pane is *free* when it
+    carries no live ``@INSTANCE_ID``, has no live Claude/Codex TUI, is not a
+    protected singleton label, and is past its boot grace. There is no stored
+    registry — this is a live view over one tmux scan. (The retired
+    ``@PANE_CLEAN`` clean-pane stamp is no longer consulted.)
     """
 
     pane_id: str
@@ -345,13 +346,13 @@ class FreePane:
 
 
 def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
-    """Single global tmux scan → the clean, dispatch-available panes.
+    """Single global tmux scan → the dispatch-available panes.
 
     Availability is read from the daemon-native occupancy ledger: a pane is free
-    only when it is clean, has no instance stamp, has no live Claude/Codex TUI,
-    and is not a protected singleton label.  The singleton exclusion is
-    unconditional so a corrupted/missing ``@INSTANCE_ID`` cannot expose Custodes,
-    Fabricator-General, Administratum/Admin, etc. as a worker target.
+    only when it has no instance stamp, has no live Claude/Codex TUI, is past its
+    boot grace, and is not a protected singleton label.  The singleton exclusion
+    is unconditional so a corrupted/missing ``@INSTANCE_ID`` cannot expose
+    Custodes, Fabricator-General, Administratum/Admin, etc. as a worker target.
     """
     from .occupancy import scan_pane_occupancy
 

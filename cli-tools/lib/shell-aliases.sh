@@ -185,35 +185,12 @@ _resolve_dispatch_bin() {
     return 1
 }
 
-# =============================================================================
-# Clean-pane stamp (@PANE_CLEAN)
-# =============================================================================
-# @PANE_CLEAN=1 is a pure *descriptive* per-pane tmux option meaning "this pane
-# is a clean, idle shell". It is set by clear() and dropped on the first command
-# or ^C (see shell-aliases-{zsh,bash}.sh). It NEVER intercepts a command — it is
-# semantics only, never control flow. The stamps ARE the source of truth;
-# `tmuxctl freelist` derives a live view over them (no second registry).
-#
-# The stamp does NOT drive pane-border rendering — hostname nametags are killed
-# globally in tmux-base.conf regardless of clean state.
-_pane_stamp_clean() {
-    [[ -n "${TMUX_PANE:-}" ]] || return 0
-    command -v tmux >/dev/null 2>&1 || return 0
-    tmux set-option -p -t "${TMUX_PANE}" @PANE_CLEAN 1 2>/dev/null || true
-}
-
-_pane_drop_clean() {
-    [[ -n "${TMUX_PANE:-}" ]] || return 0
-    command -v tmux >/dev/null 2>&1 || return 0
-    tmux set-option -p -u -t "${TMUX_PANE}" @PANE_CLEAN 2>/dev/null || true
-}
-
-# Wrap `clear` so every clear stamps the pane clean. `command clear` runs the
-# real binary; the stamp follows. c() calls this, so it inherits the stamp.
-clear() {
-    command clear "$@"
-    _pane_stamp_clean
-}
+# NOTE: The @PANE_CLEAN "clean-pane" stamp was tombstoned. It was built for a
+# retired `c` command that branched on whether a pane was clean/dirty. After the
+# pivot to `d` (always-launcher) and `c` (plain clear) it had no live consumer:
+# its only reader was the `tmuxctl freelist` view, which now derives availability
+# from the daemon occupancy ledger (instance/agent/singleton/boot-grace), not the
+# stamp. `clear` is therefore left as the real binary — no wrapper, no stamp.
 
 _dispatch_has_flag() {
     local flag="$1"
@@ -297,6 +274,9 @@ _dispatch_human_surface() {
 # This matters when reloading an existing shell after c/cc namespace changes.
 unalias c cc d 2>/dev/null || true
 unset -f cc d 2>/dev/null || true
+# Drop the retired clean-pane `clear` wrapper if an older sourced version defined
+# it, so `clear` resolves back to the real binary after a reload.
+unset -f clear 2>/dev/null || true
 
 # cdc — cd + clear + direct dispatch selector; bypasses directory selection
 cdc() {

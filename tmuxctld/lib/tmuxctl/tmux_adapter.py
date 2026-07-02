@@ -65,7 +65,6 @@ RUNTIME_PANE_OPTIONS = (
     "@CC_STATE",
     "@PANE_LABEL",
     "@PANE_PROGRESS",
-    "@PANE_CLEAN",
     "@PANE_BORN",
     "@ACTIVE_TITLE",
     "@PROGRESS_TITLE",

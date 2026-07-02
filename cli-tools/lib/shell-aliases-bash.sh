@@ -15,12 +15,11 @@ bind '"\e[B": history-search-forward' 2>/dev/null
 alias reload='builtin source ~/.bashrc'
 
 
-# --- Agent exit cleanup + clean-pane stamp lifecycle (bash parity) ----------
-# Mirrors shell-aliases-zsh.sh: the resume sentinel and the @PANE_CLEAN stamp
-# share one consume primitive so the late-landing sentinel can never wipe a
-# command the user has already run. @PANE_CLEAN is set by clear()
-# (shell-aliases.sh) and dropped on the first command (DEBUG trap) or ^C
-# (INT trap).
+# --- Agent exit cleanup: resume-sentinel lifecycle (bash parity) ------------
+# Mirrors shell-aliases-zsh.sh: the resume sentinel is consumed on the first
+# command (DEBUG trap) or ^C (INT trap) so the late-landing sentinel can never
+# wipe a command the user has already run. (The old @PANE_CLEAN clean-pane stamp
+# that rode this same path was tombstoned — nothing read it.)
 
 # A sentinel is only trusted when it is a regular, non-symlinked file owned by us
 # — the path lives in shared /tmp, so a symlink or another user's file at the same
@@ -58,11 +57,10 @@ _agent_resume_consume() {
     return 0
 }
 
-# Drop the clean stamp AND cancel any pending post-agent auto-reset. Cancelling
-# means the late `cd ~; clear` can never wipe the user's first command; the
-# resume command is still recorded in history.
+# Cancel any pending post-agent auto-reset. Cancelling means the late
+# `cd ~; clear` can never wipe the user's first command; the resume command is
+# still recorded in history.
 _agent_pane_dirty() {
-    _pane_drop_clean
     local cmd
     cmd="$(_agent_resume_consume)" || return
     [[ -z "$cmd" ]] && return
