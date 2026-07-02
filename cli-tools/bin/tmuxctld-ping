@@ -86,8 +86,22 @@ PY
     URL="${URL}?${QUERY}"
 fi
 
+MAX_TIME="${TMUXCTLD_MAX_TIME:-3}"
+if [[ "$METHOD" == "POST" && "$PATH_PART" == "/typing-guard-state" ]]; then
+    for item in "$@"; do
+        if [[ "$item" == "cmd=arm" || "$item" == "action=arm" ]]; then
+            # The Any-key typing-guard arm is a critical control-plane write.
+            # Keep it off the generic hook/scrape ping budget so transient tmux
+            # command-socket contention from longer send-text requests does not
+            # fail-open by timing out before the daemon can arm the guard.
+            MAX_TIME="${TMUXCTLD_ARM_MAX_TIME:-10}"
+            break
+        fi
+    done
+fi
+
 if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" == "1" ]]; then
-    curl_args=(--connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "${TMUXCTLD_MAX_TIME:-3}" -X "$METHOD")
+    curl_args=(--connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "$MAX_TIME" -X "$METHOD")
     if [[ "$METHOD" != "GET" ]]; then
         curl_args+=(-H 'Content-Type: application/json' -d "$PAYLOAD")
     fi
@@ -100,7 +114,7 @@ if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" == "1" ]]; then
     fi
 fi
 
-curl_args=(--connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "${TMUXCTLD_MAX_TIME:-3}" -X "$METHOD")
+curl_args=(--connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "$MAX_TIME" -X "$METHOD")
 if [[ "$METHOD" != "GET" ]]; then
     curl_args+=(-H 'Content-Type: application/json' -d "$PAYLOAD")
 fi
