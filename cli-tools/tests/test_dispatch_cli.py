@@ -1457,6 +1457,92 @@ def test_dispatch_target_dry_run_carries_canonical_without_physical(tmp_path):
     assert "%22" not in result.stdout
 
 
+def test_dispatch_prealloc_new_uses_greedy_first_free_without_stack_spawn(tmp_path: Path) -> None:
+    """palace:new is a pre-alloc freelist allocation, not stack spawn.
+
+    Red-first regression for the live failure: the old dispatch path sent every
+    :new target through /stack/dispatch, which makes palace:new fail with
+    ``not a stack window: palace``.  The fixed path must query the ledger-derived
+    freelist, choose the first free pane in the page's configured prealloc order,
+    and inject via tmux_target semantics without spawning or tearing down panes.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ping_log = tmp_path / "tmuxctld-ping.log"
+    tmux_log = tmp_path / "tmux.log"
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf '%s\\n' \"$*\" >> {ping_log}\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"; shift 2 || true\n'
+        'target=""\n'
+        'for arg in "$@"; do case "$arg" in target=*) target="${arg#target=}" ;; esac; done\n'
+        'case "$method $path" in\n'
+        '  "GET /freelist") printf \'%s\' \'[{"pane_id":"palace:S","pane_role":"palace:S","window_name":"palace"},{"pane_id":"palace:N","pane_role":"palace:N","window_name":"palace"},{"pane_id":"somnium:W","pane_role":"somnium:W","window_name":"somnium"}]\' | python3 -c \'import json,sys; print(json.dumps({"ok": True, "result": json.loads(sys.stdin.read())}))\' ;;\n'
+        '  "POST /stack/dispatch") printf \'%s\' \'{"ok":false,"error":{"message":"not a stack window: palace"}}\' ;;\n'
+        '  "GET /resolve-pane"|"POST /resolve-pane") printf \'{"ok":true,"result":"%%88"}\' ;;\n'
+        '  "POST /send-text") printf \'{"ok":true,"result":{"delivery":"confirmed"}}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {tmux_log}\n"
+        'if [[ "$1" == "display-message" ]]; then printf \'bash||palace:N|999|\\n\'; exit 0; fi\n'
+        'if [[ "$1" == "show-options" ]]; then printf \'palace:N\\n\'; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "palace:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "not a stack window: palace" not in result.stderr
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "GET /freelist" in ping_text
+    assert "POST /stack/dispatch" not in ping_text
+    assert "POST /send-text pane=palace:N text=bash " in ping_text
+    assert "POST /send-text pane=palace:S" not in ping_text
+    staged = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1]).read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "TOKEN_API_LAUNCH_MODE=tmux_target" in staged
+    assert "TOKEN_API_DISPATCH_TARGET=palace:new" in staged
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=%88" in staged
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=palace:new" not in staged
+
+
 def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     """A :new stack launch must register the concrete pane the agent lands in.
 

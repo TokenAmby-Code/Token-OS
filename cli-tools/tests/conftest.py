@@ -52,6 +52,7 @@ def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
         '  case "$method $path" in\n'
         '    "POST /stack/dispatch") printf \'{"ok":true,"result":"%s"}\' "${TMUXCTLD_PING_STACK_DISPATCH_RESULT-mechanicus:2}" ;;\n'
         '    "POST /stack/add") printf \'{"ok":true,"result":"%s"}\' "${TMUXCTLD_PING_STACK_ADD_RESULT-mechanicus:2}" ;;\n'
+        '    "GET /freelist") if [[ -n "${TMUXCTLD_PING_FREELIST_JSON:-}" ]]; then printf \'{"ok":true,"result":%s}\' "$TMUXCTLD_PING_FREELIST_JSON"; else printf \'{"ok":true,"result":[{"pane_id":"palace:W","pane_role":"palace:W","window_name":"palace"},{"pane_id":"somnium:W","pane_role":"somnium:W","window_name":"somnium"}]}\'; fi ;;\n'
         '    "POST /resolve-pane"|"GET /resolve-pane") printf \'{"ok":true,"result":"%s"}\' "${TMUXCTLD_PING_RESOLVE_PHYSICAL-%77}" ;;\n'
         '    "POST /pane-live") printf \'{"ok":true,"result":{"pane_id":"%s","pane_pid":777,"agent_pid":%s,"agent_command":"claude","live":%s}}\' "${target:-%77}" "${TMUXCTLD_PING_AGENT_PID:-7777}" "${TMUXCTLD_PING_PANE_LIVE:-true}" ;;\n'
         '    "POST /live-agents") printf \'{"ok":true,"result":"%s"}\' "${TMUXCTLD_PING_LIVE_AGENTS:-}" ;;\n'
