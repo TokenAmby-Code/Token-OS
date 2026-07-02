@@ -9,7 +9,7 @@
 #
 # with the seat's identity supplied in the environment by the respawn command
 # (TOKEN_API_PERSONA / …CLAUDE_MODEL / …DISPATCH_SESSION_DOC_PATH /
-# …TARGET_WORKING_DIR / …WRAPPER_LAUNCH_ID / …INSTANCE_TYPE).
+# …TARGET_WORKING_DIR / …WRAPPER_ID / …INSTANCE_TYPE).
 #
 # What it does, and deliberately does NOT do:
 #   1. Compose the rank+persona doctrine staple — ONE source of truth, the shared
@@ -55,7 +55,7 @@ LAUNCHER="${TOKEN_API_LAUNCHER:-persona-seat}"
 ENGINE_LABEL="${TOKEN_API_ENGINE:-$ENGINE}"
 WORKING_DIR="${TOKEN_API_TARGET_WORKING_DIR:-$(pwd)}"
 TMUX_PANE_VALUE="${TMUX_PANE:-}"
-WRAPPER_LAUNCH_ID="${TOKEN_API_WRAPPER_LAUNCH_ID:-}"
+WRAPPER_ID="${TOKEN_API_WRAPPER_ID:-${TOKEN_API_WRAPPER_LAUNCH_ID:-}}"
 CLAUDE_MODEL="${TOKEN_API_CLAUDE_MODEL:-}"
 PERSONA="${TOKEN_API_PERSONA:-}"
 
@@ -71,13 +71,13 @@ persona_seat_log() {
   printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" \
     >> "$PERSONA_SEAT_LOG" 2>/dev/null || true
 }
-persona_seat_log "launch persona=${PERSONA:-?} engine=${ENGINE} pane=${TMUX_PANE_VALUE:-?} wrapper_launch_id=${WRAPPER_LAUNCH_ID:-?}"
+persona_seat_log "launch persona=${PERSONA:-?} engine=${ENGINE} pane=${TMUX_PANE_VALUE:-?} wrapper_id=${WRAPPER_ID:-?}"
 
 # --- async, fire-and-forget audit ping (no retry belt on the hot path) ---------
 persona_seat_audit_ping() {
   local payload http_code
-  payload="$(printf '{"persona":"%s","engine":"%s","wrapper_launch_id":"%s","tmux_pane":"%s","launcher":"persona-seat"}' \
-    "$PERSONA" "$ENGINE" "$WRAPPER_LAUNCH_ID" "$TMUX_PANE_VALUE")"
+  payload="$(printf '{"persona":"%s","engine":"%s","wrapper_id":"%s","tmux_pane":"%s","launcher":"persona-seat"}' \
+    "$PERSONA" "$ENGINE" "$WRAPPER_ID" "$TMUX_PANE_VALUE")"
   http_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 3 \
     -X POST "${API_URL}/api/hooks/PersonaSeatLaunch" \
     -H 'Content-Type: application/json' -d "$payload" 2>/dev/null) || true
@@ -132,11 +132,11 @@ if [[ -z "$ENGINE_BIN" || ! -x "$ENGINE_BIN" ]]; then
 fi
 
 export TOKEN_API_AGENT_WRAPPER_BYPASS=1
-export TOKEN_API_WRAPPER_LAUNCH_ID="$WRAPPER_LAUNCH_ID"
+export TOKEN_API_WRAPPER_ID="$WRAPPER_ID"
 export TOKEN_API_ENGINE="$ENGINE"
 export TOKEN_API_LAUNCHER="$LAUNCHER"
 if declare -F tmux_runtime_stamp_wrapper >/dev/null 2>&1; then
-  tmux_runtime_stamp_wrapper "$TMUX_PANE_VALUE" "$WRAPPER_LAUNCH_ID" "$ENGINE" "$LAUNCHER" "$WORKING_DIR"
+  tmux_runtime_stamp_wrapper "$TMUX_PANE_VALUE" "$WRAPPER_ID" "$ENGINE" "$LAUNCHER" "$WORKING_DIR"
 fi
 
 if [[ "$ENGINE" == "codex" ]]; then

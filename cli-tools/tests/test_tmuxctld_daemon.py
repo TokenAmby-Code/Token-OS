@@ -454,7 +454,7 @@ def test_resolve_instance_fail_closed_envelope() -> None:
 
 
 class FoundInstanceAdapter:
-    """tmux reachable; one live pane carries @INSTANCE_ID=my-uuid @PANE_ID=mechanicus:1."""
+    """tmux reachable; instance resolution comes from the wrapper ledger."""
 
     def list_sessions(self) -> list:
         return []
@@ -466,6 +466,13 @@ class FoundInstanceAdapter:
 
 
 def test_resolve_instance_returns_canonical_role_never_physical() -> None:
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="wrap-resolve",
+        instance_id="my-uuid",
+        pane_positional_id="mechanicus:1",
+        engine="codex",
+        state="OPEN",
+    )
     server, _ = _serve(FoundInstanceAdapter)
     try:
         _, payload = _get(server, "/tmux/resolve-instance?instance_id=my-uuid")
@@ -480,7 +487,7 @@ def test_resolve_instance_returns_canonical_role_never_physical() -> None:
 
 
 class StampedPaneAdapter:
-    """current pane resolves to %7 and carries @INSTANCE_ID=stamped-uuid."""
+    """current pane resolves to %7 and carries @PANE_ID=mechanicus:1."""
 
     def list_sessions(self) -> list:
         return []
@@ -488,8 +495,8 @@ class StampedPaneAdapter:
     def run(self, *args: str, allow_failure: bool = False) -> str:
         if args[:2] == ("display-message", "-p"):
             return "%7"
-        if args[0] == "show-options" and args[-1] == "@INSTANCE_ID":
-            return "stamped-uuid"
+        if args[0] == "show-options" and args[-1] == "@PANE_ID":
+            return "mechanicus:1"
         return ""
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
@@ -497,6 +504,13 @@ class StampedPaneAdapter:
 
 
 def test_instance_id_for_pane_reads_stamp() -> None:
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="wrap-pane",
+        instance_id="stamped-uuid",
+        pane_positional_id="mechanicus:1",
+        engine="codex",
+        state="OPEN",
+    )
     server, _ = _serve(StampedPaneAdapter)
     try:
         status, payload = _get(server, "/tmux/instance-id-for-pane?pane=current")
@@ -504,7 +518,7 @@ def test_instance_id_for_pane_reads_stamp() -> None:
         result = payload["result"]
         assert result["found"] is True
         assert result["instance_id"] == "stamped-uuid"
-        assert result["pane"] == "%7"
+        assert result["pane"] == "mechanicus:1"
     finally:
         server.shutdown()
 
@@ -1119,6 +1133,13 @@ class RecordingFocusAdapter:
 
 
 def test_instance_focus_honors_explicit_client() -> None:
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="wrap-focus",
+        instance_id="focus-uuid",
+        pane_positional_id="palace:1",
+        engine="codex",
+        state="OPEN",
+    )
     rec = RecordingFocusAdapter()
     server, _ = _serve(lambda: rec)
     try:
@@ -1203,12 +1224,19 @@ class SendAckAdapter:
         self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
 
     def show_pane_option(self, pane_id: str, option: str) -> str:
-        return "inst-ack" if option == "@INSTANCE_ID" else ""
+        return "ack-pane" if option == "@PANE_ID" else ""
 
 
 def test_send_text_waits_for_user_prompt_submit_ack() -> None:
     SendAckAdapter.calls = []
     SendAckAdapter.literal_sent = threading.Event()
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id="wrap-ack",
+        instance_id="inst-ack",
+        pane_positional_id="ack-pane",
+        engine="codex",
+        state="OPEN",
+    )
     server, _ = _serve(SendAckAdapter)
     try:
         result_box: dict = {}

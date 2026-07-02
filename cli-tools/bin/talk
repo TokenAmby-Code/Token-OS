@@ -30,11 +30,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 
 DEFAULT_TIMEOUT_TOTAL = 600.0
 DEFAULT_SERVER_POLL = 30.0
 
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+TMUXCTLD_URL = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:8765")
 
 
 def _err(msg: str) -> None:
@@ -54,6 +56,13 @@ def _post(path: str, body: dict, timeout: float = 60.0) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _ledger_get(path: str, timeout: float = 2.0) -> dict:
+    url = f"{TMUXCTLD_URL}{path}"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def _get(path: str, timeout: float = 60.0) -> dict:
     url = f"{TOKEN_API_URL}{path}"
     req = urllib.request.Request(url, method="GET")
@@ -64,8 +73,24 @@ def _get(path: str, timeout: float = 60.0) -> dict:
 def _resolve_caller(explicit: str | None) -> str:
     if explicit:
         return explicit
+    wrapper_id = os.environ.get("TOKEN_API_WRAPPER_ID") or os.environ.get("TOKEN_API_WRAPPER_LAUNCH_ID")
+    if wrapper_id:
+        try:
+            data = _ledger_get(f"/ledger/resolve?wrapper_id={urllib.parse.quote(wrapper_id)}")
+            pane = data.get("pane_id") or data.get("pane") or data.get("pane_label")
+            if data.get("found") and pane:
+                return str(pane)
+        except Exception:
+            pass
     env_pane = os.environ.get("TMUX_PANE")
     if env_pane:
+        try:
+            data = _ledger_get(f"/ledger/resolve?pane={urllib.parse.quote(env_pane)}")
+            pane = data.get("pane_id") or data.get("pane") or data.get("pane_label")
+            if data.get("found") and pane:
+                return str(pane)
+        except Exception:
+            pass
         return env_pane
     _err(
         "could not detect caller pane (no --caller and $TMUX_PANE unset). "

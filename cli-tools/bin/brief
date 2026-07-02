@@ -32,12 +32,21 @@ import os
 import sys
 import urllib.error
 import urllib.request
+import urllib.parse
 
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+TMUXCTLD_URL = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:8765")
 
 
 def _err(msg: str) -> None:
     print(f"brief: {msg}", file=sys.stderr)
+
+
+def _ledger_get(path: str, timeout: float = 2.0) -> dict:
+    url = f"{TMUXCTLD_URL}{path}"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def _post(path: str, body: dict, timeout: float = 60.0) -> dict:
@@ -52,6 +61,31 @@ def _post(path: str, body: dict, timeout: float = 60.0) -> dict:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+
+
+def _resolve_caller(explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    wrapper_id = os.environ.get("TOKEN_API_WRAPPER_ID") or os.environ.get("TOKEN_API_WRAPPER_LAUNCH_ID")
+    if wrapper_id:
+        try:
+            data = _ledger_get(f"/ledger/resolve?wrapper_id={urllib.parse.quote(wrapper_id)}")
+            pane = data.get("pane_id") or data.get("pane") or data.get("pane_label")
+            if data.get("found") and pane:
+                return str(pane)
+        except Exception:
+            pass
+    env_pane = os.environ.get("TMUX_PANE")
+    if env_pane:
+        try:
+            data = _ledger_get(f"/ledger/resolve?pane={urllib.parse.quote(env_pane)}")
+            pane = data.get("pane_id") or data.get("pane") or data.get("pane_label")
+            if data.get("found") and pane:
+                return str(pane)
+        except Exception:
+            pass
+        return env_pane
+    return None
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
@@ -99,7 +133,7 @@ def main(argv: list[str]) -> int:
         parser.error("at least one --pane or --page is required")
 
     body = {
-        "caller_pane": args.caller or os.environ.get("TMUX_PANE"),
+        "caller_pane": _resolve_caller(args.caller),
         "panes": args.pane,
         "pages": args.page,
         "payload": args.message,

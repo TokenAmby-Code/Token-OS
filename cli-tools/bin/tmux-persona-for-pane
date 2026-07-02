@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Print the statusline persona for a pane via tmuxctld's wrapper ledger."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+
+def _tmux_persona(pane: str) -> str:
+    try:
+        out = subprocess.check_output(
+            ["tmux", "show-options", "-pv", "-t", pane, "@PERSONA"],
+            stderr=subprocess.DEVNULL,
+            timeout=0.4,
+            text=True,
+        )
+        return out.strip()
+    except Exception:
+        return ""
+
+
+def main(argv: list[str]) -> int:
+    pane = (argv[0] if argv else os.environ.get("TMUX_PANE", "")).strip()
+    if not pane:
+        return 0
+    base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:8765").rstrip("/")
+    try:
+        url = f"{base}/ledger/resolve?{urllib.parse.urlencode({'pane': pane})}"
+        with urllib.request.urlopen(url, timeout=0.4) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        persona = ""
+        if isinstance(data, dict) and data.get("found"):
+            persona = str(data.get("persona") or data.get("pane_label") or "").strip()
+        if persona:
+            print(f"#[fg=colour75] {persona} ", end="")
+            return 0
+    except Exception:
+        pass
+    fallback = _tmux_persona(pane)
+    if fallback:
+        print(f"#[fg=colour75] {fallback} ", end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

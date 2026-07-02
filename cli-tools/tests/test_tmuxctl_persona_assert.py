@@ -129,7 +129,7 @@ def test_persona_seat_command_carries_persona_model_and_session_doc() -> None:
     assert "TOKEN_API_CLAUDE_MODEL=sonnet" in cmd
     assert "TOKEN_API_DISPATCH_SESSION_DOC_PATH=/tmp/admin.md" in cmd
     assert "TOKEN_API_INSTANCE_TYPE=hook_driven" in cmd
-    assert "TOKEN_API_WRAPPER_LAUNCH_ID=wl-123" in cmd
+    assert "TOKEN_API_WRAPPER_ID=wl-123" in cmd
     assert "TOKEN_API_LAUNCHER=persona-seat" in cmd
     # The thin shim, then the engine as argv[1].
     assert cmd.rstrip().endswith("/x/persona-seat.sh claude")

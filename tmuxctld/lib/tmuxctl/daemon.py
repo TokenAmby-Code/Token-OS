@@ -1454,8 +1454,12 @@ def _h_clear_runtime(control, params):
 
 
 def _h_ledger_upsert(control, params):
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
     return control.ledger_upsert(
-        wrapper_id=_s(params, "wrapper_id") or _s(params, "wrapper_launch_id"),
+        wrapper_id=_s(params, "wrapper_id")
+        or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
+        or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID"),
         instance_id=_s(params, "instance_id"),
         persona=_s(params, "persona"),
         pane_positional_id=_s(params, "pane_positional_id")
@@ -1469,9 +1473,13 @@ def _h_ledger_upsert(control, params):
 
 
 def _h_ledger_resolve(control, params):
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
     return control.ledger_resolve(
         _s(params, "id") or _s(params, "value"),
-        wrapper_id=_s(params, "wrapper_id") or _s(params, "wrapper_launch_id"),
+        wrapper_id=_s(params, "wrapper_id")
+        or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
+        or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID"),
         instance_id=_s(params, "instance_id"),
         pane_positional_id=_s(params, "pane_positional_id")
         or _s(params, "pane_label")
@@ -1490,6 +1498,16 @@ def _h_ledger_rows(control, params):
 
 
 _WRAPPEREND_LIST_SEP = "__TMUXCTLD_WRAPPEREND_FIELD__"
+
+
+def _wrapper_id_from_params(params: dict) -> str:
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
+    return (
+        _s(params, "wrapper_id")
+        or _s(params, "wrapper_launch_id")
+        or _s(env, "TOKEN_API_WRAPPER_ID")
+        or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    )
 
 
 def _adapter_show_pane_option(control: TmuxControlPlane, pane: str, option: str) -> str:
@@ -1517,14 +1535,16 @@ def _find_pane_by_wrapper_id(control: TmuxControlPlane, wrapper_launch_id: str) 
         "list-panes",
         "-a",
         "-F",
-        _WRAPPEREND_LIST_SEP.join(["#{pane_id}", "#{@TOKEN_API_WRAPPER_LAUNCH_ID}"]),
+        _WRAPPEREND_LIST_SEP.join(
+            ["#{pane_id}", "#{@TOKEN_API_WRAPPER_ID}", "#{@TOKEN_API_WRAPPER_LAUNCH_ID}"]
+        ),
         allow_failure=True,
     )
     for line in raw.splitlines():
         if not line:
             continue
-        pane_id, owner = (line.split(_WRAPPEREND_LIST_SEP, 1) + [""])[:2]
-        if owner.strip() == wrapper_launch_id and pane_id.strip():
+        pane_id, owner, legacy_owner = (line.split(_WRAPPEREND_LIST_SEP, 2) + ["", ""])[:3]
+        if wrapper_launch_id in {owner.strip(), legacy_owner.strip()} and pane_id.strip():
             return pane_id.strip()
     return ""
 
@@ -1538,7 +1558,7 @@ def _h_hook_wrapperend(control, params):
     no-ops; a pane owned by a different wrapper is surfaced as an error.
     """
     env = params.get("env") if isinstance(params.get("env"), dict) else {}
-    wrapper_launch_id = _s(params, "wrapper_launch_id") or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    wrapper_launch_id = _wrapper_id_from_params(params)
     pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
     if not wrapper_launch_id:
         log.error("tmuxctld wrapperend missing wrapper_launch_id pane=%s", pane)
@@ -1555,7 +1575,9 @@ def _h_hook_wrapperend(control, params):
             "pane": "",
         }
 
-    owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_ID")
+    legacy_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    owner = owner or legacy_owner
     if owner and owner != wrapper_launch_id:
         log.error(
             "tmuxctld wrapperend ownership mismatch pane=%s payload_wrapper=%s pane_wrapper=%s",
@@ -1617,7 +1639,7 @@ def _h_hook_wrapperstart(control, params):
     from . import assertions
 
     env = params.get("env") if isinstance(params.get("env"), dict) else {}
-    wrapper_launch_id = _s(params, "wrapper_launch_id") or _s(env, "TOKEN_API_WRAPPER_LAUNCH_ID")
+    wrapper_launch_id = _wrapper_id_from_params(params)
     pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
     if not wrapper_launch_id:
         log.error("tmuxctld wrapperstart missing wrapper_launch_id pane=%s", pane)
@@ -1635,7 +1657,9 @@ def _h_hook_wrapperstart(control, params):
             "tint": "",
         }
 
-    current_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    current_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_ID")
+    legacy_owner = _adapter_show_pane_option(control, pane, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    current_owner = current_owner or legacy_owner
     if current_owner != wrapper_launch_id:
         if current_owner:
             control.ledger_close(current_owner)
@@ -1647,6 +1671,17 @@ def _h_hook_wrapperstart(control, params):
         control.clear_runtime(pane)
 
     # (1) Daemon-authoritative wrapper-ownership stamp (idempotent).
+    control.adapter.run(
+        "set-option",
+        "-p",
+        "-t",
+        pane,
+        "@TOKEN_API_WRAPPER_ID",
+        wrapper_launch_id,
+        allow_failure=True,
+    )
+    # Keep the legacy pane option populated until every consumer has moved to
+    # TOKEN_API_WRAPPER_ID. Reconcile and old wrapper cleanup paths still accept it.
     control.adapter.run(
         "set-option",
         "-p",

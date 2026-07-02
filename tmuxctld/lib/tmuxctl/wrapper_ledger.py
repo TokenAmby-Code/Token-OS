@@ -282,6 +282,7 @@ class WrapperLedger:
         """
         fields = _SCAN_SEP.join(
             [
+                "#{@TOKEN_API_WRAPPER_ID}",
                 "#{@TOKEN_API_WRAPPER_LAUNCH_ID}",
                 "#{@INSTANCE_ID}",
                 "#{@PERSONA}",
@@ -295,10 +296,14 @@ class WrapperLedger:
         live_rows: dict[str, WrapperLedgerRow] = {}
         for line in raw.splitlines():
             parts = line.split(_SCAN_SEP)
-            if len(parts) != 7:
+            if len(parts) == 7:
+                # Backward compatibility for older scan formats.
+                parts = ["", *parts]
+            if len(parts) != 8:
                 continue
             (
                 wrapper_id,
+                legacy_wrapper_id,
                 instance_id,
                 persona,
                 pane_positional_id,
@@ -306,7 +311,8 @@ class WrapperLedger:
                 working_dir,
                 born_epoch,
             ) = parts
-            if not _s(wrapper_id):
+            wrapper_id = _s(wrapper_id) or _s(legacy_wrapper_id)
+            if not wrapper_id:
                 continue
             row = WrapperLedgerRow.from_mapping(
                 {

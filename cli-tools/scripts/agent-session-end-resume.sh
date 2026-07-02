@@ -69,6 +69,7 @@ SESSION_ID="$(_json '.session_id')"
 [[ -z "$SESSION_ID" ]] && SESSION_ID="$(_json '.conversation_id')"
 TOKEN_SESSION_ID="$(_json '.env.TOKEN_API_SESSION_ID')"
 BRIDGE_ID="$(_json '.env.TOKEN_API_CODEX_BRIDGE_ID')"
+[[ -z "$BRIDGE_ID" ]] && BRIDGE_ID="$(_json '.env.TOKEN_API_WRAPPER_ID')"
 [[ -z "$BRIDGE_ID" ]] && BRIDGE_ID="$(_json '.env.TOKEN_API_WRAPPER_LAUNCH_ID')"
 
 PANE_LABEL=""

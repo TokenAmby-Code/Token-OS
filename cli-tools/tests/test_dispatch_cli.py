@@ -2615,14 +2615,14 @@ def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) 
     assert "aspirant-only metadata" not in result.stderr
 
 
-def test_dispatch_mints_fresh_wrapper_launch_id_not_inheriting_dispatcher():
-    """A dispatched worker must mint its OWN wrapper_launch_id, never inherit the
+def test_dispatch_mints_fresh_wrapper_id_not_inheriting_dispatcher():
+    """A dispatched worker must mint its OWN wrapper_id, never inherit the
     dispatching agent's.
 
-    token-api SessionStart treats ``wrapper_launch_id`` as unique per wrapper
+    token-api SessionStart treats ``wrapper_id`` as unique per wrapper
     launch and adopts (re-keys) the most-recent row carrying it (routes/hooks.py
     branch 5). When ``dispatch`` runs from inside an agent it used to inherit that
-    agent's ``TOKEN_API_WRAPPER_LAUNCH_ID`` and inject it into the worker, so the
+    agent's ``TOKEN_API_WRAPPER_ID`` and inject it into the worker, so the
     worker supplanted the dispatcher's registry row and clobbered its (singleton)
     persona — the systemic fleet-wide singleton-decapitation channel. The id must
     be freshly minted, and the inherited value must also be scrubbed from the
@@ -2630,7 +2630,7 @@ def test_dispatch_mints_fresh_wrapper_launch_id_not_inheriting_dispatcher():
     """
     sentinel = "operator-wrapper-sentinel-0000"
     env = os.environ.copy()
-    env["TOKEN_API_WRAPPER_LAUNCH_ID"] = sentinel
+    env["TOKEN_API_WRAPPER_ID"] = sentinel
 
     result = subprocess.run(
         [
@@ -2654,14 +2654,14 @@ def test_dispatch_mints_fresh_wrapper_launch_id_not_inheriting_dispatcher():
 
     assert result.returncode == 0, result.stderr
     # The worker's injected wrapper id must NOT be the dispatcher's.
-    assert f"TOKEN_API_WRAPPER_LAUNCH_ID={sentinel}" not in result.stdout, (
-        "worker inherited the dispatcher's wrapper_launch_id"
+    assert f"TOKEN_API_WRAPPER_ID={sentinel}" not in result.stdout, (
+        "worker inherited the dispatcher's wrapper_id"
     )
     # A fresh id is still injected (the field is present, just not the sentinel).
-    assert "TOKEN_API_WRAPPER_LAUNCH_ID=" in result.stdout
+    assert "TOKEN_API_WRAPPER_ID=" in result.stdout
     # Defense in depth: the inherited env value is scrubbed before the child runs.
-    assert "-u TOKEN_API_WRAPPER_LAUNCH_ID" in result.stdout, (
-        "dispatch must scrub an inherited TOKEN_API_WRAPPER_LAUNCH_ID from the child env"
+    assert "-u TOKEN_API_WRAPPER_ID" in result.stdout, (
+        "dispatch must scrub an inherited TOKEN_API_WRAPPER_ID from the child env"
     )
 
 
