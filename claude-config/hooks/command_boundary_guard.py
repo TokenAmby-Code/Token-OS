@@ -170,9 +170,16 @@ def command_position_match(command: str, matcher: dict[str, Any]) -> str | None:
         segments = split_segments(shell_words(command))
     except Exception:
         return None
+    allow_subs = matcher.get("allow_subcommands")
+    allow_set = set(allow_subs) if isinstance(allow_subs, list) else None
     for raw in segments:
         seg, _ = strip_common_prefixes(raw)
         if len(seg) >= len(prefix) and seg[: len(prefix)] == prefix:
+            # Read-only allowlist: if the token right after the argv prefix
+            # (e.g. the verb after `gh pr`) is explicitly allowed, this segment
+            # is read-only — skip it. A later mutating segment still denies.
+            if allow_set is not None and len(seg) > len(prefix) and seg[len(prefix)] in allow_set:
+                continue
             return "command-position-" + "-".join(prefix)
     return None
 

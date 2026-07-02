@@ -16,7 +16,14 @@
           "pr"
         ],
         "allow_assignment_prefix": true,
-        "allow_env_prefix": true
+        "allow_env_prefix": true,
+        "allow_subcommands": [
+          "view",
+          "list",
+          "status",
+          "checks",
+          "diff"
+        ]
       },
       "deny": {
         "reason": "The user has set a PR lifecycle boundary: direct `gh pr ...` is not an agent workflow.",
