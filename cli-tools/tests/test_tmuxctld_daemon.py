@@ -1817,6 +1817,30 @@ def test_insert_only_send_text_is_also_gated_under_typing_guard(monkeypatch) -> 
         ("", "do the thing", False),  # empty composer → clean submit
         ("unrelated shell output\n", "do the thing", False),  # payload absent
         ("do the thing\n", "", False),  # empty payload never matches
+        # Bare-zsh command that EXECUTED: its echo scrolls up with real output and
+        # a fresh prompt BELOW it. Both legacy signals (head present + trailing
+        # newline) fire, but substantive content sits after the draft — delivered,
+        # NOT swallowed. This is the false positive that broke every `:new`
+        # dispatch onto a parked bare-shell pre-alloc pane.
+        (
+            "tokenclaw@mac ~ % echo fg-probe-1\nfg-probe-1\ntokenclaw@mac ~ % \n",
+            "echo fg-probe-1",
+            False,
+        ),
+        # Agent-TUI submit that LANDED: the prompt scrolled up into the transcript
+        # region with the assistant's reply below it; the composer is emptied.
+        (
+            "› do the thing\n\n● Thinking…\n╭──────────╮\n│ ›        │\n╰──────────╯\n",
+            "do the thing",
+            False,
+        ),
+        # Genuine stuck draft in a BORDERED composer: only chrome (box-drawing
+        # borders, blank padding) sits below the draft — still swallowed.
+        (
+            "╭────────────────────╮\n│ › do the thing      │\n│                     │\n╰────────────────────╯\n",
+            "do the thing",
+            True,
+        ),
     ],
 )
 def test_detect_swallowed_submit(capture: str, payload: str, expected: bool) -> None:
@@ -1858,6 +1882,82 @@ def test_swallowed_submit_fires_recovery_and_surfaces_loudly(monkeypatch) -> Non
         assert notified, "swallowed submit must be surfaced via notify"
     finally:
         server.shutdown()
+
+
+class BareShellEchoAdapter(SendAckAdapter):
+    """Verify never acks; capture-pane returns a bare-shell command that RAN.
+
+    The composer heuristic must NOT read the executed command's own echo (which
+    the shell prints into scrollback, followed by output and a fresh prompt) as
+    a stuck draft. This is the exact `dispatch --target somnium:new` failure: the
+    first send's echo false-failed the classifier before the agent command was
+    ever staged.
+    """
+
+    def capture_pane(self, pane_id: str, *, lines: int = 10) -> str:
+        return "tokenclaw@mac ~ % echo fg-probe-1\nfg-probe-1\ntokenclaw@mac ~ % \n"
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        return "inst-bare" if option == "@INSTANCE_ID" else ""
+
+
+def test_bare_shell_echo_is_not_classified_as_failed_delivery(monkeypatch) -> None:
+    # Regression: a SUCCESSFUL bare-shell send (verify=false, dispatch's launch
+    # path) whose command echoed into scrollback must never be reported
+    # `delivery=="failed"` — that verdict hard-fails dispatch's three-outcome
+    # contract and aborts the staged agent command.
+    BareShellEchoAdapter.calls = []
+    monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: "req-1")
+    monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
+    server, _ = _serve(BareShellEchoAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "echo fg-probe-1",
+                "verify": False,
+                "submit_settle_seconds": 0,
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+        assert result["delivery"] != "failed", result["advisory"]
+        assert not any(f["type"] == "submit_not_cleared" for f in result["failures"])
+    finally:
+        server.shutdown()
+
+
+def test_notify_swallowed_submit_payload_matches_notify_contract(monkeypatch) -> None:
+    # Regression: the recovery notice POSTed to token-api `/api/notify` was
+    # rejected 422 because `vibe` was the string "alert" — the endpoint's
+    # NotifyRequest declares `vibe: int | None`. Assert the wire payload is
+    # well-typed so recoveries actually reach the human router.
+    captured: dict = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse()
+
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", _fake_urlopen)
+    daemon._notify_swallowed_submit(
+        pane_public="somnium:W", instance_id="inst-1", payload_hash="abc123"
+    )
+    assert captured["url"].endswith("/api/notify")
+    body = captured["body"]
+    assert isinstance(body["vibe"], int)
+    assert body["message"]
+    assert body["instance_id"] == "inst-1"
 
 
 # ---------------------------------------------------------------------------

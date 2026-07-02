@@ -825,28 +825,64 @@ def _h_send_keys(control, params):
 # to confirm the bytes landed in the composer.
 _SWALLOW_NEEDLE_LEN = 48
 
+# Characters that may legitimately sit BELOW a stuck draft without meaning the
+# input was consumed: blank padding and TUI box-drawing borders (the composer's
+# own frame). A line made of only these is composer chrome, not fresh output.
+_COMPOSER_CHROME_CHARS = frozenset(
+    " \t "
+    "│┃┆┇┊┋"
+    "─━┄┅┈┉╌╍"
+    "╭╮╰╯┌┐└┘├┤┬┴┼"
+    "╔╗╚╝╠╣╦╩╬║═"
+    "▏▎▍▌▋▊▉▐▔▕░▒▓"
+)
+
+
+def _is_composer_chrome_line(line: str) -> bool:
+    """True when a line is only blank padding / box-drawing (composer border)."""
+    return all(ch in _COMPOSER_CHROME_CHARS for ch in line)
+
 
 def _detect_swallowed_submit(capture: str, payload: str) -> bool:
     """Heuristic: did the TUI swallow the Enter into the prompt body?
 
     The white-whale failure (live Codex/Claude repro) is: the literal payload
     bytes land in the composer, but the C-m that should submit is ingested as a
-    newline *inside* the draft instead. The capture signature is therefore (a) a
-    representative head of the submitted payload still sitting in the composer
-    AND (b) the captured composer region ending in a trailing newline (the
-    swallowed Enter left the cursor on a fresh line rather than submitting).
+    newline *inside* the draft instead. The capture signature is (a) a
+    representative head of the submitted payload still sitting in the composer,
+    (b) the captured region ending in a trailing newline (the swallowed Enter
+    left the cursor on a fresh line rather than submitting), AND (c) the draft
+    is still at the BOTTOM of the pane — only composer chrome (blank lines,
+    box-drawing borders) sits below it.
+
+    Condition (c) is what distinguishes a genuinely stuck draft from an
+    ALREADY-DELIVERED send whose payload merely appears in scrollback: a
+    bare-zsh command echoes itself, then prints output and a fresh shell prompt
+    BELOW the echo; an agent-TUI submit scrolls the prompt up into the
+    transcript above an emptied composer. In both, substantive (non-chrome)
+    text follows the needle, so the send landed and this returns False. Without
+    (c), the bare-shell echo tripped both legacy signals and false-failed every
+    `:new` dispatch onto a parked pre-alloc pane — the bug this guards against.
 
     A clean submit leaves an empty composer (needle absent) — returns False, so
     the recovery C-m is fired only when there is real evidence of a stuck draft.
-    Tuning the exact composer fingerprint against each TUI is a follow-on; the
-    behavioral contract this guards is: detect → still recover → surface loudly.
     """
     if not capture or not payload:
         return False
     needle = normalize_prompt_payload(payload).strip()[:_SWALLOW_NEEDLE_LEN]
     if not needle or needle not in capture:
         return False
-    return capture.endswith("\n")
+    if not capture.endswith("\n"):
+        return False
+    # The needle has no newlines (normalize collapses them), so every occurrence
+    # lies within a single splitlines() segment. If any line after the LAST such
+    # occurrence carries substantive text, the input was consumed → delivered.
+    lines = capture.splitlines()
+    last_idx = max(i for i, line in enumerate(lines) if needle in line)
+    for trailing in lines[last_idx + 1 :]:
+        if not _is_composer_chrome_line(trailing):
+            return False
+    return True
 
 
 @contextlib.contextmanager
@@ -903,10 +939,15 @@ def _notify_swallowed_submit(*, pane_public: str, instance_id: str, payload_hash
         f"{f' (instance {instance_id})' if instance_id else ''} — "
         "Enter was ingested as a prompt newline; recovery C-m fired."
     )
+    # `/api/notify` (NotifyRequest) declares `vibe: int | None` — the phone/Pavlok
+    # tactile intensity. The prior string "alert" was rejected 422, so recoveries
+    # never reached the human router. 30 matches the fleet's standard attention
+    # vibe (see token-api dispatch_notify call sites).
     body = json.dumps(
         {
             "message": message,
-            "vibe": "alert",
+            "tts": True,
+            "vibe": 30,
             "instance_id": instance_id or None,
         }
     ).encode("utf-8")
