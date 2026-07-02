@@ -65,13 +65,46 @@ PY
 )" || exit 64
 
 URL="${DAEMON_URL}${PATH_PART}"
-if curl -fsS --connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" \
-        --max-time "${TMUXCTLD_MAX_TIME:-3}" \
-        -X "$METHOD" \
-        -H 'Content-Type: application/json' \
-        -d "$PAYLOAD" \
-        -o /dev/null \
-        "$URL"; then
+if [[ "$METHOD" == "GET" && $# -gt 0 ]]; then
+    QUERY="$(
+python3 - "$@" <<'PY'
+import sys
+from urllib.parse import urlencode
+
+pairs = []
+for item in sys.argv[1:]:
+    if "=" not in item:
+        raise SystemExit(f"tmuxctld-ping: payload argument must be key=value: {item}")
+    key, value = item.split("=", 1)
+    key = key.strip()
+    if not key:
+        raise SystemExit("tmuxctld-ping: payload key must not be empty")
+    pairs.append((key, value))
+sys.stdout.write(urlencode(pairs))
+PY
+)" || exit 64
+    URL="${URL}?${QUERY}"
+fi
+
+if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" == "1" ]]; then
+    curl_args=(--connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "${TMUXCTLD_MAX_TIME:-3}" -X "$METHOD")
+    if [[ "$METHOD" != "GET" ]]; then
+        curl_args+=(-H 'Content-Type: application/json' -d "$PAYLOAD")
+    fi
+    if curl -fsS "${curl_args[@]}" "$URL"; then
+        exit 0
+    else
+        rc=$?
+        echo "tmuxctld-ping: ${METHOD} ${PATH_PART} failed via ${DAEMON_URL} (curl rc=${rc})" >&2
+        exit "$rc"
+    fi
+fi
+
+curl_args=(--connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "${TMUXCTLD_MAX_TIME:-3}" -X "$METHOD")
+if [[ "$METHOD" != "GET" ]]; then
+    curl_args+=(-H 'Content-Type: application/json' -d "$PAYLOAD")
+fi
+if curl -fsS "${curl_args[@]}" -o /dev/null "$URL"; then
     exit 0
 else
     rc=$?

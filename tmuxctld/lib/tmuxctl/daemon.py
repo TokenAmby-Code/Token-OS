@@ -49,6 +49,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import send_gate, typing_guard_state
 from .api import RegistryError
+from .resolver import resolve_to_physical
 from .send_gate import thread_local_override
 from .service import TmuxControlPlane
 from .skill_invoke import (
@@ -597,6 +598,8 @@ def _h_resolve_pane(control, params):
             }
         if _s(params, "format", "full") == "id":
             return row["pane_positional_id"]
+        if _s(params, "format", "full") == "physical":
+            return control.physical_pane_id(row["pane_positional_id"])
         return "\n".join(
             [
                 f"requested: {target or row['wrapper_id']}",
@@ -718,13 +721,10 @@ def _h_instance_show_option(control, params):
 
 def _resolve_physical_pane_or_gate(control, pane: str) -> str:
     """Resolve ``pane`` to the physical tmux ``%NN`` or fail closed."""
-    try:
-        return control.adapter._resolve_pane_target_arg(pane)
-    except AttributeError:
-        # Adapter has no resolver (fail-open shim / test double); the caller id is
-        # used as-is. A real daemon's TmuxAdapter always provides the resolver, and
-        # a raw %NN is already physical, so this branch never masks a canonical id.
+    if pane.startswith("%"):
         return pane
+    try:
+        return resolve_to_physical(control.adapter, pane)
     except Exception as exc:
         # Resolution genuinely failed: we cannot key the lock read on the physical
         # %NN, and falling back to the canonical id would silently miss the lock and
@@ -976,7 +976,7 @@ def _send_text_pipeline(
         pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
         if pre_gate is not None and pre_gate.get("suppressed"):
             raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
-        return control.send_text(pane, text, clear_prompt=clear_prompt, submit=False)
+        return control.send_text(phys_pane, text, clear_prompt=clear_prompt, submit=False)
 
     # Hash the NORMALIZED payload that is actually injected (newlines collapsed,
     # rstripped) — not the raw text. The UserPromptSubmit ack hashes the prompt
@@ -1040,18 +1040,18 @@ def _send_text_pipeline(
 
     def _send_submit_key() -> None:
         if hasattr(control.adapter, "send_keys"):
-            control.adapter.send_keys(pane, "C-m")
+            control.adapter.send_keys(phys_pane, "C-m")
         else:
-            control.adapter.run("send-keys", "-t", pane, "C-m")
+            control.adapter.run("send-keys", "-t", phys_pane, "C-m")
 
     def _send_literal(value: str) -> None:
-        control.adapter.run("send-keys", "-t", pane, "-l", value)
+        control.adapter.run("send-keys", "-t", phys_pane, "-l", value)
 
     def _send_key(value: str) -> None:
         if hasattr(control.adapter, "send_keys"):
-            control.adapter.send_keys(pane, value)
+            control.adapter.send_keys(phys_pane, value)
         else:
-            control.adapter.run("send-keys", "-t", pane, value)
+            control.adapter.run("send-keys", "-t", phys_pane, value)
 
     def _run_post_submit_actions() -> None:
         for action in post_submit_actions:
@@ -1078,7 +1078,7 @@ def _send_text_pipeline(
         with override_ctx:
             if hasattr(control.adapter, "send_text_then_submit"):
                 control.adapter.send_text_then_submit(
-                    pane,
+                    phys_pane,
                     text,
                     clear_prompt=clear_prompt,
                     pre_submit_keys=pre_submit_keys,
@@ -1087,8 +1087,8 @@ def _send_text_pipeline(
             else:
                 normalized = normalized_payload
                 if clear_prompt:
-                    control.adapter.send_keys(pane, "C-u")
-                control.adapter.run("send-keys", "-t", pane, "-l", normalized)
+                    control.adapter.send_keys(phys_pane, "C-u")
+                control.adapter.run("send-keys", "-t", phys_pane, "-l", normalized)
                 gate = getattr(control.adapter, "last_send_gate_result", None)
                 if gate and gate.get("suppressed"):
                     raise TmuxSendGated(gate)
@@ -1098,13 +1098,13 @@ def _send_text_pipeline(
                 if submit_settle_seconds > 0:
                     time.sleep(submit_settle_seconds)
                 for key in pre_submit_keys:
-                    control.adapter.send_keys(pane, key)
+                    control.adapter.send_keys(phys_pane, key)
                 if pre_submit_keys and submit_settle_seconds > 0:
                     time.sleep(submit_settle_seconds)
-                control.adapter.send_keys(pane, "C-m")
+                control.adapter.send_keys(phys_pane, "C-m")
                 if submit_settle_seconds > 0:
                     time.sleep(submit_settle_seconds)
-                control.adapter.send_keys(pane, "C-m")
+                control.adapter.send_keys(phys_pane, "C-m")
 
             if post_submit_actions:
                 _run_post_submit_actions()
@@ -1702,6 +1702,55 @@ def _h_close(control, params):
 
 
 # -- Workspace + stack (POST) ----------------------------------------------
+
+
+def _h_pane_live(control, params):
+    from .liveness import detect_pane_tui
+
+    requested_pane = _s(params, "pane", "current")
+    pane = requested_pane
+    if pane == "current":
+        pane = control.adapter.run("display-message", "-p", "#{pane_id}").strip()
+    physical_pane = _resolve_physical_pane_or_gate(control, pane)
+    tui = detect_pane_tui(control.adapter, physical_pane)
+    try:
+        public_pane = control.public_pane_id(physical_pane)
+    except Exception:
+        public_pane = requested_pane if not requested_pane.startswith("%") else physical_pane
+    return {
+        "pane_id": public_pane,
+        "physical_pane_id": physical_pane,
+        "pane_pid": tui.pane_pid,
+        "agent_pid": tui.agent_pid,
+        "agent_command": tui.agent_command,
+        "live": tui.live,
+    }
+
+
+def _h_live_agents(control, params):
+    from .dispatch_liveness import live_agents_in_dir
+
+    matches = live_agents_in_dir(
+        control.adapter,
+        _s(params, "dir"),
+        exclude_pane=_s(params, "exclude_pane") or None,
+    )
+    if _s(params, "format", "text") == "json":
+        return [
+            {
+                "pane_id": control.public_pane_id(m.pane_id),
+                "physical_pane_id": m.pane_id,
+                "pane_pid": m.pane_pid,
+                "agent_pid": m.agent_pid,
+                "agent_command": m.agent_command,
+                "cwd": m.cwd,
+            }
+            for m in matches
+        ]
+    return "\n".join(
+        f"{control.public_pane_id(m.pane_id)}\t{m.pane_id}\t{m.agent_command or '?'}\t{m.cwd}"
+        for m in matches
+    )
 
 
 def _h_stack_add(control, params):
@@ -2328,6 +2377,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("GET", "/tmux/resolve-instance"): _h_resolve_instance,
     ("GET", "/tmux/instance-id-for-pane"): _h_instance_id_for_pane,
     ("GET", "/resolve-pane"): _h_resolve_pane,
+    ("POST", "/resolve-pane"): _h_resolve_pane,
     ("GET", "/ledger/resolve"): _h_ledger_resolve,
     ("POST", "/ledger/resolve"): _h_ledger_resolve,
     ("GET", "/ledger/rows"): _h_ledger_rows,
@@ -2348,6 +2398,8 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     # Send + act (POST)
     ("POST", "/tmux/send-keys"): _h_send_keys,
     ("POST", "/send-text"): _h_send_text,
+    ("POST", "/pane-live"): _h_pane_live,
+    ("POST", "/live-agents"): _h_live_agents,
     ("POST", "/insert-text"): _h_insert_text,
     ("POST", "/prompt-start"): _h_prompt_start,
     ("POST", "/prompt-end"): _h_prompt_end,

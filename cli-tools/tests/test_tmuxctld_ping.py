@@ -31,6 +31,21 @@ class RecordingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
 
+    def do_GET(self):  # noqa: N802
+        self.__class__.calls.append(
+            {
+                "method": "GET",
+                "path": self.path,
+                "body": None,
+                "content_type": self.headers.get("Content-Type"),
+            }
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "11")
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
     def log_message(self, *_args):
         return
 
@@ -63,6 +78,32 @@ def test_tmuxctld_ping_posts_key_value_payload_to_configured_daemon_url() -> Non
                 "path": "/event",
                 "body": {"event": "pane-died", "pane": "%42"},
                 "content_type": "application/json",
+            }
+        ]
+    finally:
+        server.shutdown()
+
+
+def test_tmuxctld_ping_get_encodes_key_values_as_query() -> None:
+    server = _serve()
+    try:
+        env = os.environ.copy()
+        env["TMUXCTLD_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+        proc = subprocess.run(
+            [str(PING), "GET", "/resolve-pane", "target=mechanicus:2", "format=physical"],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == ""
+        assert RecordingHandler.calls == [
+            {
+                "method": "GET",
+                "path": "/resolve-pane?target=mechanicus%3A2&format=physical",
+                "body": None,
+                "content_type": None,
             }
         ]
     finally:
