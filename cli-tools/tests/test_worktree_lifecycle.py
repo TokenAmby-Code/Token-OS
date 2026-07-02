@@ -388,3 +388,146 @@ def test_delete_handles_orphaned_dir(project: Project) -> None:
     assert done.returncode == 0, done.stderr
     assert not wt.exists(), "orphaned dir must be removed"
     assert _git("--git-dir", str(project.bare), "branch", "--list", "orphan", env=project.env) == ""
+
+
+# ── WrapperEnd deferred cleanup ───────────────────────────────────────────────
+
+
+def test_wrapperend_deletes_merged_worktree(project: Project) -> None:
+    """WrapperEnd owns deferred worktree teardown: a PR-marked-merged
+    linked worktree is removed only after the agent wrapper has ended."""
+    from tmuxctl.worktree_lifecycle import cleanup_worktree_on_wrapper_end
+
+    res = project.setup("wrapper-merged")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-wrapper-merged"
+
+    result = cleanup_worktree_on_wrapper_end(
+        wt,
+        instance={"id": "inst-merged", "pr_state": "merged", "working_dir": str(wt)},
+    )
+
+    assert result["status"] == "removed"
+    assert not wt.exists(), "merged branch worktree must be removed at WrapperEnd"
+
+
+def test_wrapperend_preserves_merged_but_dirty_worktree(project: Project) -> None:
+    """Even a merged PR marker never overrides local uncommitted/untracked work."""
+    from tmuxctl.worktree_lifecycle import cleanup_worktree_on_wrapper_end
+
+    res = project.setup("wrapper-dirty")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-wrapper-dirty"
+    (wt / "untracked-user-work.txt").write_text("do not delete\n", encoding="utf-8")
+
+    result = cleanup_worktree_on_wrapper_end(
+        wt,
+        instance={"id": "inst-dirty", "pr_state": "merged", "working_dir": str(wt)},
+    )
+
+    assert result["status"] == "preserved"
+    assert result["reason"] == "dirty_worktree"
+    assert wt.exists()
+
+
+def test_wrapperend_preserves_unmerged_worktree(project: Project) -> None:
+    """WrapperEnd must preserve unmerged worktrees; shutdown is not data loss."""
+    from tmuxctl.worktree_lifecycle import cleanup_worktree_on_wrapper_end
+
+    res = project.setup("wrapper-open")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-wrapper-open"
+    (wt / "wip.txt").write_text("still open\n", encoding="utf-8")
+    _git("add", "-A", cwd=wt, env=project.env)
+    _git("commit", "-m", "still-open", cwd=wt, env=project.env)
+
+    result = cleanup_worktree_on_wrapper_end(
+        wt,
+        instance={"id": "inst-open", "pr_state": "open", "working_dir": str(wt)},
+    )
+
+    assert result["status"] == "preserved"
+    assert result["reason"] == "branch_not_merged"
+    assert wt.exists(), "unmerged worktree must survive WrapperEnd"
+
+
+def test_wrapperend_handler_removes_worktree_without_pane_kill(
+    project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tmuxctld WrapperEnd hook wires deferred worktree cleanup without adding
+    lifecycle pane-kill side effects."""
+    from tmuxctl import daemon
+
+    res = project.setup("wrapper-hook-merged")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-wrapper-hook-merged"
+
+    class FakeAdapter:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, ...]] = []
+
+        def run(self, *args: str, allow_failure: bool = False) -> str:
+            del allow_failure
+            self.commands.append(tuple(args))
+            if args[:1] == ("display-message",) and "#{pane_id}" in args:
+                return "%99\n"
+            if args[:1] == ("display-message",) and "#{window_name}" in args:
+                return "palace\n"
+            return ""
+
+        def show_pane_option(self, pane: str, option: str) -> str:
+            assert pane == "%99"
+            return {
+                "@TOKEN_API_WRAPPER_ID": "wrap-99",
+                "@TOKEN_API_WRAPPER_LAUNCH_ID": "",
+                "@PANE_ID": "palace:N",
+                "@INSTANCE_ID": "inst-99",
+                "@TOKEN_API_CWD": str(wt),
+            }.get(option, "")
+
+    class FakeControl:
+        def __init__(self) -> None:
+            self.adapter = FakeAdapter()
+
+        def ledger_close(self, wrapper_id: str) -> dict:
+            assert wrapper_id == "wrap-99"
+            return {"closed": True, "row": {"instance_id": "inst-99", "working_dir": str(wt)}}
+
+        def teardown_pane(
+            self,
+            pane: str,
+            *,
+            pane_label: str = "",
+            window_name: str | None = None,
+            source: str = "",
+        ) -> dict:
+            assert pane == "%99"
+            assert pane_label == "palace:N"
+            assert window_name == "palace"
+            assert source == "wrapperend"
+            return {"ok": True, "result": {"status": "cleared_in_place", "pane": pane}}
+
+    monkeypatch.setattr(
+        daemon,
+        "_fetch_instance_for_wrapperend",
+        lambda instance_id: {"id": instance_id, "pr_state": "merged", "working_dir": str(wt)},
+    )
+    control = FakeControl()
+
+    result = daemon._h_hook_wrapperend(
+        control,
+        {"wrapper_id": "wrap-99", "tmux_pane": "%99", "cwd": str(wt), "env": {}},
+    )
+
+    assert result["worktree_cleanup"]["status"] == "removed"
+    assert not wt.exists()
+    assert all("kill-pane" not in command for command in control.adapter.commands)
+
+
+def test_pr_step_and_pr_merge_do_not_remove_worktrees() -> None:
+    """Regression: pr-step/pr-merge may merge, but worktree removal is not in
+    their execution path; WrapperEnd is the only owner of teardown."""
+    for script in (ROOT / "cli-tools" / "bin" / "pr-step", ROOT / "cli-tools" / "bin" / "pr-merge"):
+        text = script.read_text(encoding="utf-8")
+        assert "git worktree remove" not in text
+        assert "worktree remove" not in text

@@ -4,7 +4,8 @@
 # AUDIENCE: agent
 #
 # Canonical PR lifecycle command. Handles commit, PR create/update,
-# CodeRabbit review readback, and merge/cleanup when green.
+# CodeRabbit review readback, and merge when green. Worktree teardown is
+# deferred to tmuxctld WrapperEnd.
 
 set -euo pipefail
 
@@ -144,13 +145,13 @@ Normal options:
 Force escape hatches:
   --force create         Create PR path, equivalent to the old pr-create behavior.
   --force review         Review/read path, equivalent to the old pr-review-loop behavior.
-  --force merge          Merge/cleanup path, equivalent to the old pr-merge behavior.
+  --force merge          Merge path, equivalent to the old pr-merge entrypoint.
 
 Behavior:
   No PR: commit pending changes, push, create PR, summarize review/check state.
   PR:    commit pending changes, push, skip re-review if current head is already green;
          otherwise request CodeRabbit re-review and summarize actionable findings.
-  Green: auto-merge and cleanup unless --no-merge is set.
+  Green: auto-merge unless --no-merge is set; worktree cleanup is deferred to WrapperEnd.
 USAGE
 }
 
@@ -908,7 +909,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Worktree-safe merge+cleanup
+# Worktree-safe merge; worktree cleanup is deferred to WrapperEnd
 do_merge() {
     local branch
     branch=$(git branch --show-current)
@@ -1001,27 +1002,9 @@ do_merge() {
 
     success "Merged and pushed '$base'"
 
-    # Delete remote branch
-    log "Deleting remote branch '$branch'..."
-    git push "$GIT_GITHUB_REMOTE" --delete "$branch" 2>/dev/null && \
-        success "Deleted remote branch '$branch'" || \
-        warn "Could not delete remote branch '$branch' (may already be deleted)"
-
-    if [[ "$is_worktree" == "true" ]]; then
-        # Prune from main worktree — do NOT remove current directory
-        git -C "$main_worktree" worktree prune
-        echo ""
-        success "Done! The worktree for '$branch' is now dangling."
-        echo ""
-        echo "  >>> Exit this shell session now. <<<"
-        echo "  The worktree directory will be cleaned up on prune."
-        echo ""
-    else
-        # Not a worktree, just delete the local branch
-        git branch -D "$branch" 2>/dev/null && \
-            success "Deleted local branch '$branch'" || \
-            warn "Could not delete local branch (you may be on it)"
-    fi
+    echo ""
+    success "Done! Merge complete. Worktree teardown is deferred to tmuxctld WrapperEnd."
+    echo ""
 }
 
 # Verify we're in a git repo
@@ -1731,12 +1714,12 @@ esac
 
 
 pr_merge_main() (
-# PR Merge with Complete Cleanup
+# PR Merge (worktree cleanup deferred to WrapperEnd)
 # TAGS: git, pr
 # AUDIENCE: human, agent
 #
-# Merges a PR and cleans up the remote branch, local branch, worktree,
-# and bash aliases. The final step after a PR is approved.
+# Merges a PR. Worktree teardown is a WrapperEnd lifecycle event,
+# never a side effect of the merge command.
 #
 # Usage: pr-merge [PR_NUMBER] [options]
 #
@@ -1821,10 +1804,9 @@ PR_NUMBER=""
 
 usage() {
     cat << 'EOF'
-PR Merge with Complete Cleanup
+PR Merge
 
-Merges a PR and cleans up everything - remote branch, local branch, worktree,
-and bash aliases.
+Merges a PR. Worktree teardown is deferred to tmuxctld WrapperEnd.
 
 Usage: pr-merge [PR_NUMBER] [options]
 
@@ -1835,7 +1817,7 @@ Options:
   --squash            Squash and merge (default)
   --merge             Create a merge commit
   --rebase            Rebase and merge
-  --no-cleanup        Merge only, skip local cleanup
+  --no-cleanup        Accepted for compatibility; cleanup is always deferred
   -y, --yes           Skip confirmation prompt
   --dry-run           Show what would happen without doing anything
   -h, --help          Show this help
@@ -1844,17 +1826,14 @@ Examples:
   pr-merge                    # Auto-detect and merge current branch's PR
   pr-merge 42                 # Merge PR #42
   pr-merge --merge            # Use merge commit instead of squash
-  pr-merge --no-cleanup       # Just merge, don't clean up locally
+  pr-merge --no-cleanup       # Compatibility no-op; just merge
   pr-merge --dry-run          # Preview the actions
 
 Description:
   1. Detects PR number from current branch if not provided
   2. Shows PR info and asks for confirmation
   3. Merges the PR (squash by default)
-  4. Removes the worktree (if in one)
-  5. Deletes the local branch
-  6. Pulls latest main
-  7. Cleans up bash aliases pointing to the worktree
+  4. Stops. Worktree teardown happens later in tmuxctld WrapperEnd
 
 EOF
     exit 0
@@ -1954,36 +1933,18 @@ if [[ "$PR_MERGEABLE" == "CONFLICTING" ]]; then
     exit 1
 fi
 
-# Resolve the worktree to remove from the PR's *head branch*, never from the
-# current working directory. Deriving it from cwd (the original
-# `WORKTREE_PATH="$REPO_ROOT"`) meant running `pr-merge <N>` from an unrelated
-# worktree merged the right branch but removed the WRONG worktree — the caller's
-# — orphaning the PR's real worktree.
+# Resolve the PR head worktree for display only. Worktree teardown is deferred
+# to tmuxctld WrapperEnd so merge commands never remove their own cwd.
 IN_WORKTREE=false
 WORKTREE_PATH=""
 PR_WORKTREE_PATH="$(resolve_worktree_for_branch "$BRANCH_NAME")"
 MAIN_WORKTREE_PATH=$(git worktree list --porcelain | awk 'found == 0 && /^worktree / { sub(/^worktree /, ""); print; found = 1 }')
 
 if [[ -n "$PR_WORKTREE_PATH" && -f "$PR_WORKTREE_PATH/.git" ]]; then
-    # The PR's head branch is checked out in a *linked* worktree (its .git is a
-    # file) → that, and only that, is what we remove during cleanup. A regular
-    # checkout or the bare repo's own entry (.git is a directory / bare) is not a
-    # removable worktree and falls through to the checkout-main cleanup path.
+    # The PR's head branch is checked out in a linked worktree. Display it,
+    # but do not clean it up here.
     IN_WORKTREE=true
     WORKTREE_PATH="$PR_WORKTREE_PATH"
-fi
-
-# Footgun guard: if the caller is sitting in a *different* linked worktree than
-# the PR's, refuse rather than silently operating across worktrees. The old code
-# would have removed this cwd worktree by mistake; stop and point the user at the
-# PR's own worktree instead.
-if [[ -f "$REPO_ROOT/.git" && -n "$WORKTREE_PATH" && "$REPO_ROOT" != "$WORKTREE_PATH" ]]; then
-    error "Refusing to merge PR #${PR_NUMBER} from a different worktree."
-    error "  Current worktree:            ${REPO_ROOT}"
-    error "  PR branch '${BRANCH_NAME}' worktree: ${WORKTREE_PATH}"
-    error "Run pr-merge from the PR's own worktree so cleanup removes the right one:"
-    error "  cd \"${WORKTREE_PATH}\" && pr-merge ${PR_NUMBER}"
-    exit 1
 fi
 
 # Show plan
@@ -2007,32 +1968,11 @@ fi
 
 echo ""
 
-if [[ "$NO_CLEANUP" == "false" ]]; then
-    echo "  Actions:"
-    echo "    1. Merge PR #${PR_NUMBER} (${MERGE_METHOD})"
-
-    if [[ "$IN_WORKTREE" == "true" ]]; then
-        echo "    2. Remove worktree: ${WORKTREE_PATH}"
-        echo "    3. Delete remote branch: ${BRANCH_NAME}"
-        echo "    4. Delete local branch: ${BRANCH_NAME}"
-    else
-        echo "    2. Delete remote branch: ${BRANCH_NAME}"
-        echo "    3. Checkout main"
-        echo "    4. Delete local branch: ${BRANCH_NAME}"
-    fi
-
-    echo "    5. Fast-forward main (guarded; no checkout in a worktree)"
-    echo "    6. Clean up bash aliases"
-else
-    echo "  Actions:"
-    echo "    1. Merge PR #${PR_NUMBER} (${MERGE_METHOD})"
-
-    if [[ "$IN_WORKTREE" == "true" ]]; then
-        echo "    (Local cleanup skipped - remote branch NOT deleted)"
-    else
-        echo "    2. Delete remote branch: ${BRANCH_NAME}"
-        echo "    (Local cleanup skipped)"
-    fi
+echo "  Actions:"
+echo "    1. Merge PR #${PR_NUMBER} (${MERGE_METHOD})"
+echo "    2. Stop; worktree teardown is deferred to tmuxctld WrapperEnd"
+if [[ "$NO_CLEANUP" == "true" ]]; then
+    echo "    (--no-cleanup is accepted for compatibility; cleanup is always deferred)"
 fi
 
 echo ""
@@ -2058,19 +1998,12 @@ fi
 echo ""
 log "${MERGE} Merging PR #${PR_NUMBER} (${MERGE_METHOD})..."
 
-# Only use --delete-branch in regular checkout (not worktree)
-# In worktree context, gh tries to checkout main which fails
-if [[ "$IN_WORKTREE" == "true" ]]; then
-    MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" "--${MERGE_METHOD}" 2>&1) || {
-        error "Failed to merge PR: $MERGE_OUTPUT"
-        exit 1
-    }
-else
-    MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" "--${MERGE_METHOD}" --delete-branch 2>&1) || {
-        error "Failed to merge PR: $MERGE_OUTPUT"
-        exit 1
-    }
-fi
+# Merge only. Branch/worktree teardown is a WrapperEnd lifecycle concern; doing
+# it from pr-step/pr-merge can delete the cwd of the still-running agent.
+MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" "--${MERGE_METHOD}" 2>&1) || {
+    error "Failed to merge PR: $MERGE_OUTPUT"
+    exit 1
+}
 
 success "${SUCCESS} PR merged successfully"
 echo ""
@@ -2080,163 +2013,10 @@ if [[ -n "$PR_URL_AFTER_MERGE" ]]; then
 fi
 pr_set_instance_status victorious
 
-# Exit if no cleanup requested
-if [[ "$NO_CLEANUP" == "true" ]]; then
-    success "Done! (cleanup skipped)"
-    exit 0
-fi
+success "Done! Merge complete. Worktree teardown is deferred to tmuxctld WrapperEnd."
+exit 0
 
-# Cleanup phase
-log "${CLEANUP} Cleaning up..."
-echo ""
 
-# Check for uncommitted changes in worktree
-if [[ "$IN_WORKTREE" == "true" ]]; then
-    cd "$WORKTREE_PATH"
-    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
-        warn "${WARNING} Worktree has uncommitted changes. Cleanup aborted."
-        warn "Commit or stash your changes first, then run cleanup manually:"
-        warn "  cd \"${MAIN_WORKTREE_PATH}\""
-        warn "  git worktree remove \"${WORKTREE_PATH}\""
-        warn "  git branch -d ${BRANCH_NAME}"
-        exit 1
-    fi
-fi
-
-# Switch context to main worktree if we're in a worktree
-if [[ "$IN_WORKTREE" == "true" ]]; then
-    cd "$MAIN_WORKTREE_PATH"
-
-    # Remove worktree
-    info "Removing worktree: ${WORKTREE_PATH}"
-    git worktree remove "$WORKTREE_PATH" 2>/dev/null || {
-        warn "Could not remove worktree automatically. Remove manually:"
-        warn "  git worktree remove \"${WORKTREE_PATH}\""
-    }
-
-    # Delete remote branch (since we didn't use --delete-branch in worktree context)
-    info "Deleting remote branch: ${BRANCH_NAME}"
-    git push "$GIT_GITHUB_REMOTE" --delete "$BRANCH_NAME" 2>/dev/null || {
-        warn "Could not delete remote branch ${BRANCH_NAME} (may already be deleted)"
-    }
-
-    # Delete local branch
-    info "Deleting local branch: ${BRANCH_NAME}"
-    git branch -D "$BRANCH_NAME" 2>/dev/null || {
-        warn "Could not delete branch ${BRANCH_NAME} (may already be deleted)"
-    }
-else
-    # Regular checkout - switch to main first
-    info "Checking out main..."
-    git checkout main 2>/dev/null || git checkout master 2>/dev/null || {
-        error "Could not checkout main/master branch"
-        exit 1
-    }
-
-    # Delete local branch
-    info "Deleting local branch: ${BRANCH_NAME}"
-    git branch -d "$BRANCH_NAME" 2>/dev/null || {
-        warn "Could not delete branch ${BRANCH_NAME} (may already be deleted)"
-    }
-fi
-
-echo ""
-
-# Update main as a separate, guarded fast-forward.
-#
-# In the NAS bare-repo + worktree layout there is no `main` working tree to
-# pull into: MAIN_WORKTREE_PATH is the bare repo and `main` is held by the
-# bare repo's HEAD (which is exactly why any local `main` checkout — including
-# `gh pr merge --delete-branch` — errors with "already checked out"). A plain
-# `git pull` here fails with "must be run in a work tree" and would abort
-# cleanup *after* the remote merge already landed. So fan out by context and
-# never let this step be fatal:
-#   - bare repo / no main work tree: fast-forward the local `main` ref only,
-#     without a checkout, tolerating refusal.
-#   - real `main` working tree: guarded `--ff-only` pull.
-MAIN_BRANCH_REF="$(git symbolic-ref "refs/remotes/${GIT_GITHUB_REMOTE}/HEAD" 2>/dev/null || true)"
-MAIN_BRANCH="${MAIN_BRANCH_REF#refs/remotes/${GIT_GITHUB_REMOTE}/}"
-[[ "$MAIN_BRANCH" == "$MAIN_BRANCH_REF" ]] && MAIN_BRANCH=""
-[[ -z "$MAIN_BRANCH" ]] && MAIN_BRANCH="main"
-log "${PULL} Updating ${MAIN_BRANCH}..."
-
-if [[ "$(git rev-parse --is-bare-repository 2>/dev/null)" == "true" ]]; then
-    # Reconciler park-sweep (incident 2026-06-22): a worktree left checked out on
-    # main pins the ref and makes the fast-forward below refuse ("refusing to fetch
-    # into branch 'refs/heads/main' checked out at <wt>"). Park any such worktree
-    # off main first (detach in place, edits preserved) so the FF can land.
-    if declare -f park_worktrees_off_main >/dev/null 2>&1; then
-        _parked="$(park_worktrees_off_main "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null || true)"
-        [[ -n "$_parked" ]] && printf '%s\n' "$_parked" | sed 's/^/   /'
-    fi
-    # No working tree: fast-forward the local ref directly (no checkout). The
-    # refspec without a leading '+' only allows fast-forwards, so it is safe
-    # even though `main` is the bare repo's HEAD branch.
-    if git fetch "$GIT_GITHUB_REMOTE" "${MAIN_BRANCH}:${MAIN_BRANCH}" 2>&1 | sed 's/^/   /'; then
-        info "${MAIN_BRANCH} synced (bare repo, no checkout)"
-    else
-        info "${MAIN_BRANCH} left as-is (not a fast-forward — diverged?)"
-    fi
-else
-    # Real working tree on ${MAIN_BRANCH}: guarded fast-forward only.
-    git pull --ff-only "$GIT_GITHUB_REMOTE" "$MAIN_BRANCH" 2>&1 | sed 's/^/   /' \
-        || warn "Could not fast-forward ${MAIN_BRANCH} (diverged?); update it manually."
-fi
-
-echo ""
-
-# Clean up bash aliases
-ALIASES_FILE="$HOME/.bash_aliases"
-
-if [[ -f "$ALIASES_FILE" ]]; then
-    # Expected worktree directory patterns (check both old and new layout)
-    REPO_NAME=$(basename "$REPO_ROOT")
-    PARENT_DIR=$(dirname "$REPO_ROOT")
-    OLD_WORKTREE_DIR_PATTERN="${PARENT_DIR}/${REPO_NAME}-${BRANCH_NAME}"
-    NEW_WORKTREE_DIR_PATTERN="${HOME}/worktrees/askCivic/wt-${BRANCH_NAME}"
-    WORKTREE_DIR_PATTERN="${NEW_WORKTREE_DIR_PATTERN}"
-    # Also check old pattern for backward compat during migration
-    if ! grep -q "$WORKTREE_DIR_PATTERN" "$ALIASES_FILE" 2>/dev/null; then
-        if grep -q "$OLD_WORKTREE_DIR_PATTERN" "$ALIASES_FILE" 2>/dev/null; then
-            WORKTREE_DIR_PATTERN="$OLD_WORKTREE_DIR_PATTERN"
-        fi
-    fi
-
-    # Check if alias exists
-    if grep -q "$WORKTREE_DIR_PATTERN" "$ALIASES_FILE" 2>/dev/null; then
-        # Find matching alias lines
-        MATCHING_ALIASES=$(grep "$WORKTREE_DIR_PATTERN" "$ALIASES_FILE")
-
-        # Remove matching alias lines
-        sed -i "\|${WORKTREE_DIR_PATTERN}|d" "$ALIASES_FILE"
-
-        # Also check for ~/.cd_quick_aliases (used by worktree-setup)
-        CD_ALIASES_FILE="$HOME/.cd_quick_aliases"
-        if [[ -f "$CD_ALIASES_FILE" ]]; then
-            if grep -q "^${BRANCH_NAME}=" "$CD_ALIASES_FILE" 2>/dev/null; then
-                sed -i "/^${BRANCH_NAME}=/d" "$CD_ALIASES_FILE"
-                info "Removed cd alias: ${BRANCH_NAME}"
-            fi
-        fi
-
-        log "Removed bash alias(es):"
-        echo "$MATCHING_ALIASES" | sed 's/^/   /'
-
-        # Note to user
-        echo ""
-        warn "Alias removed. Run 'source ~/.bash_aliases' or restart your shell."
-    fi
-fi
-
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-if [[ "$IN_WORKTREE" == "true" ]]; then
-    success "${SUCCESS} Done! Merged, cleaned up, and ${MAIN_BRANCH} refreshed."
-else
-    success "${SUCCESS} Done! Back on ${MAIN_BRANCH}."
-fi
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
 )
 
 
