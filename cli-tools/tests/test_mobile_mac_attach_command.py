@@ -7,6 +7,7 @@ that the phone would run.
 """
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -49,7 +50,7 @@ MAC_INSIST_TMUX_FILE="$HOME/.mac-insist-tmux"
 MAC_NOT_MAC_FILE="$HOME/.not-mac"
 {funcs}
 is_portable_monitor() {{ return 1; }}
-ssh() {{ printf '%s\\0' "$@" > {str(ssh_log)!r}; return 0; }}
+ssh() {{ printf '%s\\0' "$@" > {shlex.quote(str(ssh_log))}; return 0; }}
 unset SSH_CONNECTION
 {"export TMUX=/tmp/local-tmux" if inside_tmux else "unset TMUX"}
 mac
