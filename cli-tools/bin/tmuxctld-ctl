@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# tmuxctld-ctl — PATH entrypoint for the canonical tmuxctld control CLI.
+#
+# The implementation lives under tmuxctld/bin with the daemon package. This
+# same-name entrypoint exists so login shells whose PATH includes cli-tools/bin
+# can resolve the canonical verb without inventing an alias or alternate surface.
+set -euo pipefail
+_THIS="$(readlink -f "$0")"
+_REPO_ROOT="$(cd "$(dirname "$_THIS")/../.." && pwd)"
+exec "${_REPO_ROOT}/tmuxctld/bin/tmuxctld-ctl" "$@"
