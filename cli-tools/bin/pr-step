@@ -463,6 +463,85 @@ latest_coderabbit_review_state() {
     ' 2>/dev/null || true
 }
 
+# --- CodeRabbit rate-limit / shelved-review handling -------------------------
+# When CodeRabbit hits its own usage/rate limit it does NOT run a review: it
+# posts a "review skipped / rate limit exceeded" deferral and never comes back
+# on its own. That deferral must never be mistaken for a completed review — the
+# gate is only satisfied by a genuine review. pr-step detects the deferral,
+# re-requests deliberately, and keeps waiting (reusing the unbounded wait) until
+# a real review lands.
+CR_RATELIMIT_REGEX='rate limit exceeded|exceeded the (rate )?limit|before requesting another review|review skipped|reached (your|the) [^.]*limit|usage limits?|please wait [0-9]'
+CR_BACKOFF_BASE="${CR_BACKOFF_BASE:-60}"
+CR_BACKOFF_CAP="${CR_BACKOFF_CAP:-1800}"
+
+# Pure predicate (testable): is this CodeRabbit comment body a rate-limit/shelved
+# deferral rather than a genuine review? A real summary is never a deferral.
+coderabbit_body_is_ratelimit() {
+    local body="$1"
+    [[ -n "$body" ]] || return 1
+    grep -qiE '^[[:space:]]*#{1,3}[[:space:]]*Summary by CodeRabbit' <<<"$body" && return 1
+    grep -qiE "$CR_RATELIMIT_REGEX" <<<"$body"
+}
+
+# Pure parser (testable): seconds CodeRabbit asked us to wait before re-review.
+# Reads "wait N minutes and M seconds" style hints; echoes 0 when absent.
+coderabbit_ratelimit_wait_seconds() {
+    python3 - "$1" <<'PY'
+import re, sys
+b = sys.argv[1]
+mins = re.search(r'(\d+)\s*minute', b, re.I)
+secs = re.search(r'(\d+)\s*second', b, re.I)
+total = (int(mins.group(1)) * 60 if mins else 0) + (int(secs.group(1)) if secs else 0)
+print(total)
+PY
+}
+
+# Fetch the body of CodeRabbit's most recent issue (general) comment on a PR.
+coderabbit_latest_issue_comment_body() {
+    local pr="$1" repo
+    repo="$(repo_slug)"
+    [[ -n "$repo" ]] || return 1
+    gh api "repos/${repo}/issues/${pr}/comments" 2>/dev/null | jq -r '
+        [.[] | select((.user.login // "" | ascii_downcase) as $u
+            | $u == "coderabbitai[bot]" or $u == "coderabbitai" or $u == "coderabbit")]
+        | sort_by(.created_at) | .[-1].body // ""' 2>/dev/null || true
+}
+
+# True when CodeRabbit's most recent activity on the PR is a rate-limit/shelved
+# deferral (i.e. no genuine review has landed for the current request).
+coderabbit_review_is_deferred() {
+    local pr="$1" body
+    body="$(coderabbit_latest_issue_comment_body "$pr")"
+    coderabbit_body_is_ratelimit "$body"
+}
+
+# Compute how long to wait before re-requesting a CodeRabbit review. Prefers the
+# cooldown CodeRabbit explicitly stated; otherwise exponential backoff capped so
+# we neither hammer the bot nor stall forever. $2 is the previous backoff value.
+coderabbit_backoff_seconds() {
+    local pr="$1" prev="${2:-0}" asked padded next
+    asked="$(coderabbit_ratelimit_wait_seconds "$(coderabbit_latest_issue_comment_body "$pr")")"
+    if [[ "$asked" =~ ^[0-9]+$ ]] && (( asked > 0 )); then
+        padded=$(( asked + 15 ))
+        (( padded > CR_BACKOFF_CAP )) && padded=$CR_BACKOFF_CAP
+        echo "$padded"
+        return 0
+    fi
+    if (( prev <= 0 )); then next=$CR_BACKOFF_BASE; else next=$(( prev * 2 )); fi
+    (( next > CR_BACKOFF_CAP )) && next=$CR_BACKOFF_CAP
+    echo "$next"
+}
+
+# Deliberately re-request a full CodeRabbit review (used to escape a rate-limit
+# deferral). Posts the canonical trigger command as a PR comment.
+coderabbit_rerequest_review() {
+    local pr="$1"
+    local reason="${2:-CodeRabbit review was rate-limited/shelved; re-requesting a full review.}"
+    gh pr comment "$pr" --body "$reason
+
+@coderabbitai full review" >/dev/null 2>&1
+}
+
 changes_requested_count() {
     local pr="$1" repo
     repo="$(repo_slug)"
@@ -509,6 +588,12 @@ checks_green() {
     [[ "$mergeable" != "CONFLICTING" ]] || return 1
     cr_state="$(coderabbit_state_for_head "$head")"
     [[ "$cr_state" == "success" ]] || return 1
+    # A rate-limit/shelved deferral is not a completed review even if the commit
+    # status flipped to success. Never let a skipped review satisfy the gate —
+    # this is the path that otherwise voids the Golden Throne victory condition.
+    if coderabbit_review_is_deferred "$pr"; then
+        return 1
+    fi
     changes="$(changes_requested_count "$pr")"
     [[ "$changes" == "0" ]] || return 1
     checks_tmp="$(mktemp -t pr-step-checks.XXXXXX)"
