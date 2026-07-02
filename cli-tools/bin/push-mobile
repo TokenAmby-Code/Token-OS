@@ -16,10 +16,13 @@
 set -euo pipefail
 
 # Source machine identity for NAS paths
-_LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
+_SCRIPT_PATH="$(readlink -f "$0")"
+_SCRIPT_DIR="$(dirname "$_SCRIPT_PATH")"
+_REPO_ROOT="$(cd "${_SCRIPT_DIR}/../.." && pwd)"
+_LIB_DIR="${_SCRIPT_DIR}/../lib"
 # shellcheck source=../lib/nas-path.sh
 source "${_LIB_DIR}/nas-path.sh"
-MOBILE_DIR="${TOKEN_OS}/mobile"
+MOBILE_DIR="${PUSH_MOBILE_ROOT:-${_REPO_ROOT}}/mobile"
 SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes"
 
 PUSH_BASHRC=false

@@ -121,13 +121,13 @@ _termux_detach_mac_tmux_client() {
 }
 trap _termux_detach_mac_tmux_client EXIT
 
-_mac_phone_tmux_attach_cmd() {
+_mac_tmux_attach_cmd() {
     printf '%s\n' \
         "tag='${TERMUX_MAC_TMUX_CLIENT_TAG}'" \
         'file="$HOME/.termux-mac-tmux-client-$tag"' \
         'tty > "$file" 2>/dev/null || true' \
         'trap '\''rm -f "$file"'\'' EXIT' \
-        'tmux attach -t phone 2>/dev/null || tmux new-session -t main -s phone \; select-window -t warp 2>/dev/null || exec zsh -il'
+        'tmux attach -t main 2>/dev/null || exec zsh -il'
 }
 
 # TMUX — local session + remote attach
@@ -350,7 +350,7 @@ _mac_reconnect_plan() {
 
 # mac: SSH to Mac. Assertively attach tmux by default, even from tx panes.
 # Portable monitor → main session (full workspace).
-# Phone → grouped session 'phone' on main:warp with keyboard auto-zoom hook.
+# Phone → canonical main tmux attach (session persists server-side).
 # SSH connects first; tmux is best-effort (fails gracefully to interactive shell).
 mac() {
     local insist_tmux=true
@@ -370,7 +370,7 @@ mac() {
         if is_portable_monitor; then
             ssh -t mac "zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
         else
-            ssh -t mac "$(_mac_phone_tmux_attach_cmd)"
+            ssh -t mac "$(_mac_tmux_attach_cmd)"
         fi
         return
     fi
@@ -379,7 +379,7 @@ mac() {
     if is_portable_monitor; then
         _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
     else
-        _mac_attach="$(_mac_phone_tmux_attach_cmd)"
+        _mac_attach="$(_mac_tmux_attach_cmd)"
     fi
 
     # Bare Termux: stay glued to the Mac tmux workspace. A dropped SSH (screen
@@ -452,7 +452,7 @@ mac() {
             if is_portable_monitor; then
                 _mac_attach="zsh -il -c 'tmux attach -t main 2>/dev/null || exec zsh -il'"
             else
-                _mac_attach="$(_mac_phone_tmux_attach_cmd)"
+                _mac_attach="$(_mac_tmux_attach_cmd)"
             fi
             _mac_ssh_opts=("${_mac_ssh_opts_tight[@]}")
             deep_done=true
