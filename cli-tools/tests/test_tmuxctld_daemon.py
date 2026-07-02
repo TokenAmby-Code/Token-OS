@@ -69,12 +69,42 @@ class RecordingVoiceAdapter(StubAdapter):
         self.calls = []
         self.buffer = ""
 
+    def current_session_name(self) -> str:
+        return "main"
+
+    def list_windows(self, session_name: str) -> list[dict[str, str]]:
+        return [{"window_index": "1"}]
+
+    def list_panes(self, target: str) -> list[dict[str, str]]:
+        return [
+            {
+                "pane_id": "%42",
+                "session_name": "main",
+                "window_index": "1",
+                "window_name": "palace",
+                "pane_index": "0",
+                "width": "80",
+                "height": "24",
+                "current_command": "zsh",
+                "tty": "/dev/ttys000",
+                "active": "1",
+            }
+        ]
+
+    def show_window_option(self, target: str, option: str) -> str:
+        return ""
+
     def run(self, *args: str, allow_failure: bool = False) -> str:
         self.calls.append(args)
         if args[:1] == ("send-keys",) and "-l" in args:
             self.buffer += str(args[args.index("-l") + 1])
         if args[:1] == ("capture-pane",):
             return self.buffer
+        return ""
+
+    def show_pane_option(self, pane_id: str, option: str) -> str:
+        if option == "@PANE_ID":
+            return "palace:E"
         return ""
 
     def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
@@ -1205,6 +1235,29 @@ def test_bad_json_body_is_400() -> None:
         server.shutdown()
 
 
+def test_send_text_resolves_public_pane_before_bytes() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        status, payload = _post(
+            server,
+            "/send-text",
+            {
+                "pane": "palace:E",
+                "text": "echo daemon-send",
+                "verify": False,
+                "submit_settle_seconds": 0,
+            },
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert ("send-keys", "-t", "%42", "-l", "echo daemon-send") in rec.calls
+        assert ("send-keys-helper", "%42", "C-m") in rec.calls
+        assert not any(call[:4] == ("send-keys", "-t", "palace:E", "-l") for call in rec.calls)
+    finally:
+        server.shutdown()
+
+
 class SendAckAdapter:
     """Pane carries an instance stamp; send-keys calls are recorded."""
 
@@ -1863,8 +1916,8 @@ def test_voice_append_ship_scratch_clear_mutate_public_role(
             server, "/voice/session/append", {"voice_session_id": sid, "text": "draft"}
         )
         assert appended["result"]["inserted"] is True
-        assert ("send-keys", "-t", "palace:E", "-l", " ") in rec.calls
-        assert ("send-keys", "-t", "palace:E", "-l", "draft") in rec.calls
+        assert ("send-keys", "-t", "%42", "-l", " ") in rec.calls
+        assert ("send-keys", "-t", "%42", "-l", "draft") in rec.calls
 
         _, shipped = _post(
             server, "/voice/session/ship", {"voice_session_id": sid, "text": "final"}

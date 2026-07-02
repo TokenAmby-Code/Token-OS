@@ -45,6 +45,19 @@ def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         'if [[ -n "${TMUXCTLD_PING_LOG:-}" ]]; then printf \'%s\\n\' "$*" >> "$TMUXCTLD_PING_LOG"; fi\n'
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" == "1" ]]; then\n'
+        '  method="${1:-}"; path="${2:-}"; shift 2 || true\n'
+        '  target=""\n'
+        '  for arg in "$@"; do case "$arg" in target=*) target="${arg#target=}" ;; esac; done\n'
+        '  case "$method $path" in\n'
+        '    "POST /stack/dispatch") printf \'{"ok":true,"result":"%s"}\' "${TMUXCTLD_PING_STACK_DISPATCH_RESULT-mechanicus:2}" ;;\n'
+        '    "POST /stack/add") printf \'{"ok":true,"result":"%s"}\' "${TMUXCTLD_PING_STACK_ADD_RESULT-mechanicus:2}" ;;\n'
+        '    "POST /resolve-pane"|"GET /resolve-pane") printf \'{"ok":true,"result":"%s"}\' "${TMUXCTLD_PING_RESOLVE_PHYSICAL-%77}" ;;\n'
+        '    "POST /pane-live") printf \'{"ok":true,"result":{"pane_id":"%s","pane_pid":777,"agent_pid":%s,"agent_command":"claude","live":%s}}\' "${target:-%77}" "${TMUXCTLD_PING_AGENT_PID:-7777}" "${TMUXCTLD_PING_PANE_LIVE:-true}" ;;\n'
+        '    "POST /live-agents") printf \'{"ok":true,"result":"%s"}\' "${TMUXCTLD_PING_LIVE_AGENTS:-}" ;;\n'
+        '    *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "  esac\n"
+        "fi\n"
         "exit 0\n",
         encoding="utf-8",
     )

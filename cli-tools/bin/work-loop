@@ -10,7 +10,7 @@
 #   work-loop complete [options]                   # Wrap up: merge, cleanup, exit
 #   work-loop status                               # Show active work-loop panes
 #
-# Dispatch creates a managed mechanicus worker pane through tmuxctl, launches Claude
+# Dispatch creates a managed mechanicus worker pane through tmuxctld, launches Claude
 # in the vault, and briefs it to create a worktree, transplant, and work
 # autonomously. Callable from any instance, voice injection, or directly.
 #
@@ -53,17 +53,52 @@ log_dry()     { echo -e "${CYAN}~${NC} $1" >&2; }
 # --- Vault path ---
 VAULT_DIR="${IMPERIUM}/Imperium-ENV"
 
+tmuxctld_result() {
+    local response
+    response="$(TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-60}" "${_LIB_DIR}/../bin/tmuxctld-ping" "$@")" || return $?
+    TMUXCTLD_RESPONSE="$response" python3 - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("TMUXCTLD_RESPONSE", "")
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError:
+    sys.exit(1)
+if not payload.get("ok"):
+    err = payload.get("error", {})
+    print(err.get("message") or raw, file=sys.stderr)
+    sys.exit(1)
+result = payload.get("result", "")
+if isinstance(result, (dict, list)):
+    sys.stdout.write(json.dumps(result, separators=(",", ":")))
+elif result is not None:
+    sys.stdout.write(str(result))
+PY
+}
+
+tmuxctld_physical_pane() {
+    tmuxctld_result GET /resolve-pane target="$1" format=physical
+}
+
+tmuxctld_send_text() {
+    local pane="$1" text="$2"
+    tmuxctld_result POST /send-text pane="$pane" text="$text" submit=true >/dev/null
+}
+
 # --- Managed mechanicus worker pane allocation ---
 # Create a new managed mechanicus worker pane. Returns the new pane ID.
 create_workloop_pane() {
     local session="${1:-main}"
-    local new_pane
-    new_pane=$("${_LIB_DIR}/../bin/tmuxctl" stack add mechanicus --session "$session" --cwd "$HOME" 2>/dev/null || true)
+    local new_pane physical_pane
+    new_pane="$(tmuxctld_result POST /stack/add base=mechanicus session="$session" cwd="$HOME" focus=true 2>/dev/null || true)"
     if [[ -z "$new_pane" ]]; then
         log_error "Could not allocate managed mechanicus worker pane"
         return 1
     fi
-    tmux set-option -p -t "$new_pane" @WORK_LOOP "true" 2>/dev/null || true
+    physical_pane="$(tmuxctld_physical_pane "$new_pane" 2>/dev/null || true)"
+    tmux set-option -p -t "${physical_pane:-$new_pane}" @WORK_LOOP "true" 2>/dev/null || true
     echo "$new_pane"
 }
 
@@ -218,6 +253,7 @@ do_dispatch() {
     tmux_session=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "main")
 
     # --- Resolve pane ---
+    local target_pane_physical=""
     if [[ -z "$target_pane" ]]; then
         target_pane=$(create_workloop_pane "$tmux_session")
         if [[ -z "$target_pane" ]]; then
@@ -227,11 +263,21 @@ do_dispatch() {
         created_managed_pane=true
         log_success "Created managed mechanicus worker pane: $target_pane"
     else
-        if ! tmux display-message -t "$target_pane" -p '#{pane_id}' &>/dev/null; then
+        target_pane_physical="$(tmuxctld_physical_pane "$target_pane" 2>/dev/null || true)"
+        if [[ -z "$target_pane_physical" ]] && ! tmux display-message -t "$target_pane" -p '#{pane_id}' &>/dev/null; then
             log_error "Pane not found: $target_pane"
             exit 1
         fi
         log_success "Using specified pane: $target_pane"
+    fi
+    [[ -n "$target_pane_physical" ]] || target_pane_physical="$(tmuxctld_physical_pane "$target_pane" 2>/dev/null || true)"
+    if [[ -z "$target_pane_physical" ]]; then
+        if tmux display-message -t "$target_pane" -p '#{pane_id}' &>/dev/null; then
+            target_pane_physical="$target_pane"
+        else
+            log_error "Could not resolve pane through tmuxctld: $target_pane"
+            exit 1
+        fi
     fi
 
     # --- Build dispatch prompt ---
@@ -243,10 +289,10 @@ do_dispatch() {
     claude_bin="${_LIB_DIR}/../bin/claude"
 
     # --- Store metadata on the pane for status/tracking ---
-    tmux set-option -p -t "$target_pane" @WORKLOOP_SESSION_DOC "$session_doc" 2>/dev/null || true
-    tmux set-option -p -t "$target_pane" @WORKLOOP_BRANCH "$branch_name" 2>/dev/null || true
-    tmux set-option -p -t "$target_pane" @WORKLOOP_PROJECT "$project" 2>/dev/null || true
-    tmux set-option -p -t "$target_pane" @WORKLOOP_DISPATCHED "$(date -Iseconds)" 2>/dev/null || true
+    tmux set-option -p -t "$target_pane_physical" @WORKLOOP_SESSION_DOC "$session_doc" 2>/dev/null || true
+    tmux set-option -p -t "$target_pane_physical" @WORKLOOP_BRANCH "$branch_name" 2>/dev/null || true
+    tmux set-option -p -t "$target_pane_physical" @WORKLOOP_PROJECT "$project" 2>/dev/null || true
+    tmux set-option -p -t "$target_pane_physical" @WORKLOOP_DISPATCHED "$(date -Iseconds)" 2>/dev/null || true
 
     # --- Display summary ---
     echo ""
@@ -276,7 +322,7 @@ do_dispatch() {
         echo -e "${NC}"
         # Kill the pane we created for this dry run.
         if [[ "$created_managed_pane" == "true" ]]; then
-            tmux kill-pane -t "$target_pane" 2>/dev/null || true
+            tmux kill-pane -t "$target_pane_physical" 2>/dev/null || true
         fi
         exit 0
     fi
@@ -289,19 +335,20 @@ do_dispatch() {
     echo "$dispatch_prompt" > "$prompt_file"
 
     # Clear the pane
-    tmux send-keys -t "$target_pane" "clear" Enter
+    tmuxctld_send_text "$target_pane" "clear"
     sleep 0.3
 
     # Build and send the launch command — dispatch is the sole launch engine.
-    local vault_q prompt_file_q persona_q
+    local vault_q prompt_file_q persona_q launch_cmd
     vault_q="$(shell_quote "$VAULT_DIR")"
     prompt_file_q="$(shell_quote "$prompt_file")"
     if [[ -n "$primarch_name" ]]; then
         persona_q="$(shell_quote "$primarch_name")"
-        tmux send-keys -t "$target_pane" "dispatch --direct --dir ${vault_q} --persona ${persona_q} --prompt \"\$(cat ${prompt_file_q})\" ; rm -f ${prompt_file_q}" Enter
+        launch_cmd="dispatch --direct --dir ${vault_q} --persona ${persona_q} --prompt \"\$(cat ${prompt_file_q})\" ; rm -f ${prompt_file_q}"
     else
-        tmux send-keys -t "$target_pane" "dispatch --direct --dir ${vault_q} --prompt \"\$(cat ${prompt_file_q})\" ; rm -f ${prompt_file_q}" Enter
+        launch_cmd="dispatch --direct --dir ${vault_q} --prompt \"\$(cat ${prompt_file_q})\" ; rm -f ${prompt_file_q}"
     fi
+    tmuxctld_send_text "$target_pane" "$launch_cmd"
 
     log_success "Agent launched via dispatch"
 
