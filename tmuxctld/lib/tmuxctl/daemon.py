@@ -1008,6 +1008,59 @@ def _wait_for_insert_confirmation(
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
+def _classify_submit_delivery(
+    control,
+    *,
+    phys_pane: str,
+    text: str,
+    ack: dict | None,
+) -> tuple[str, str, str]:
+    """Advisory pane-scrape for a SUBMITTED prompt that carries no ack.
+
+    #516's insert belt (``_wait_for_insert_confirmation``) is a PRE-submit
+    read-back: it confirms the draft LANDED in the composer. This is its
+    POST-submit sibling. A prompt was submitted but no ``UserPromptSubmit`` ack
+    came back — either the send was fired with ``verify=false`` (dispatch's
+    launch path), or the ack timed out because the message is queued behind a
+    running tool call in the target agent (a wide grep, or ``pr-step`` running
+    for minutes). Fast-failing there is the bug: the send genuinely succeeded,
+    it is just not confirmed yet.
+
+    Pane-scrape is unreliable for precise matching, so this NEVER hard-asserts
+    delivery — it returns an ADVISORY the caller can weigh, not a verdict.
+
+    Returns ``(delivery, advisory, capture_excerpt)`` where ``delivery`` is:
+      * ``"confirmed"`` — an ack is present (no scrape needed);
+      * ``"failed"``    — the draft is still stuck in the composer with a
+        swallowed Enter (the submit did NOT clear the input);
+      * ``"likely"``    — the composer cleared (prompt accepted); the message
+        was almost certainly delivered and is likely queued behind a running
+        tool call. Advisory only — confirm from the scrape.
+    """
+    if ack:
+        return "confirmed", "", ""
+    capture = ""
+    try:
+        capture = _capture_pane_text(control, phys_pane, lines=20)
+    except Exception as exc:
+        log.debug("tmuxctld: submit-advisory capture failed pane=%s: %s", phys_pane, exc)
+        capture = ""
+    if _detect_swallowed_submit(capture, text):
+        return (
+            "failed",
+            "submit did not clear the composer — the draft is still present with a "
+            "swallowed Enter; the message was NOT delivered",
+            capture[-500:],
+        )
+    return (
+        "likely",
+        "send likely delivered but not confirmed — suspected queued behind a running "
+        "tool call in the target agent; review the pane scrape and continue if it "
+        "looks received",
+        capture[-500:],
+    )
+
+
 def _hold_agent_guard(phys_pane: str, *, seconds: int) -> str | None:
     """Acquire an AGENT guard and return the owner token (or ``None``).
 
@@ -1437,6 +1490,16 @@ def _send_text_pipeline(
     # When verification was never requested, a completed send is "submitted", not
     # "unverified" — only a requested-but-unacked send is genuinely unverified.
     status = "submitted" if ack or not verify else "unverified"
+    # Advisory delivery classification for the no-ack case: an unacked submit is
+    # ambiguous (queued behind a tool call vs. genuinely stuck). Scrape the pane
+    # and hand the caller a soft verdict + the raw scrape instead of forcing it
+    # to infer failure from a bare `unverified`. Never raises; ack present is a
+    # no-op ("confirmed").
+    delivery, advisory, capture_excerpt = _classify_submit_delivery(
+        control, phys_pane=phys_pane, text=text, ack=ack
+    )
+    if delivery == "failed":
+        failures.append({"type": "submit_not_cleared", "detail": advisory})
     result = {
         "status": status,
         "pane": pane,
@@ -1447,6 +1510,9 @@ def _send_text_pipeline(
         "verification_status": verification_status,
         "verified_by": "UserPromptSubmit" if ack else None,
         "ack": ack,
+        "delivery": delivery,
+        "advisory": advisory or None,
+        "capture_excerpt": capture_excerpt,
         "recovery_submit_credited": recovery_submit_credited,
         "idempotent_replay": False,
         "guard_held": held,

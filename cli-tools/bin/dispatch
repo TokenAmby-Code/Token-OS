@@ -1953,15 +1953,76 @@ dispatch_send_text_via_tmuxctld() {
     err "tmuxctld-ping is required to send dispatch launch commands to $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
     return 69
   fi
-  if ! tmuxctld-ping POST /send-text \
+  # Route through tmuxctld_result (60s ceiling + envelope unwrap), NOT raw
+  # tmuxctld-ping with its 3s --max-time default. A launch/prompt send can
+  # legitimately take tens of seconds (daemon resolver + occupancy + guard hold +
+  # tmux round-trips), or minutes when the target agent is mid-tool-call. The old
+  # 3s fast-fail returned curl rc28 and printed "tmuxctld send failed" on a
+  # SUCCESSFUL birth — a false negative that made operators/workflows believe
+  # nothing seated (Phase B trace). We now trust the daemon's own delivery
+  # verdict and only hard-fail (rc70) on a genuine failure.
+  local pane_display response rc=0 classify_rc=0
+  pane_display="$(printf '%s' "$pane" | redact_tmux_panes_for_display)"
+  if response="$(tmuxctld_result POST /send-text \
       pane="$pane" \
       text="$text" \
       submit=true \
       verify=false \
-      submit_settle_seconds="$settle"; then
-    err "tmuxctld send failed for dispatch target $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
+      submit_settle_seconds="$settle")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    # ok:false (gated / human-lock / dead pane) or a transport failure —
+    # tmuxctld_result already surfaced the daemon error message. Genuine failure.
+    err "tmuxctld send failed for dispatch target ${pane_display} (rc=${rc})"
     return 70
   fi
+  # Envelope unwrapped to the send-text result JSON. Interpret the advisory
+  # delivery classification (three-outcome contract):
+  #   confirmed / likely -> delivered (rc0); `likely` prints the scrape advisory
+  #                          but is NOT a failure (pane-scrape is unreliable, so
+  #                          we do not hard-assert against it).
+  #   failed             -> the draft is stuck in the composer (submit swallowed);
+  #                          the message was NOT delivered -> rc70.
+  DISPATCH_SEND_RESPONSE="$response" python3 - "$pane_display" <<'PY' || classify_rc=$?
+import json
+import os
+import sys
+
+pane_display = sys.argv[1] if len(sys.argv) > 1 else "<pane>"
+raw = os.environ.get("DISPATCH_SEND_RESPONSE", "")
+try:
+    result = json.loads(raw)
+except (json.JSONDecodeError, TypeError):
+    # Test fakes / bare scalar: nothing to classify, treat as delivered.
+    raise SystemExit(0)
+if not isinstance(result, dict):
+    raise SystemExit(0)
+delivery = str(result.get("delivery") or "").strip()
+advisory = str(result.get("advisory") or "").strip()
+excerpt = str(result.get("capture_excerpt") or "").strip()
+
+
+def _emit(prefix: str) -> None:
+    print(f"tmuxctld send to {pane_display}: {prefix}", file=sys.stderr)
+    if excerpt:
+        print("--- pane scrape ---", file=sys.stderr)
+        print(excerpt, file=sys.stderr)
+
+
+if delivery == "failed":
+    _emit(advisory or "submit did not clear the composer; message NOT delivered")
+    raise SystemExit(70)
+if delivery == "likely" and advisory:
+    _emit(advisory)
+raise SystemExit(0)
+PY
+  if [[ "$classify_rc" -ne 0 ]]; then
+    return 70
+  fi
+  return 0
 }
 
 stamp_resume_instance_id() {
