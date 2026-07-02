@@ -2086,7 +2086,7 @@ dispatch_send_text_via_tmuxctld() {
   #                          we do not hard-assert against it).
   #   failed             -> the draft is stuck in the composer (submit swallowed);
   #                          the message was NOT delivered -> rc70.
-  DISPATCH_SEND_RESPONSE="$response" python3 - "$pane_display" <<'PY' || classify_rc=$?
+  DISPATCH_SEND_RESPONSE="$response" DISPATCH_ENGINE="$ENGINE" python3 - "$pane_display" <<'PY' || classify_rc=$?
 import json
 import os
 import sys
@@ -2113,6 +2113,20 @@ def _emit(prefix: str) -> None:
 
 
 if delivery == "failed":
+    engine = os.environ.get("DISPATCH_ENGINE", "")
+    # Codex dispatch delivers the initial task prompt via argv inside the staged
+    # launcher, not by submitting into an already-running TUI composer. A composer
+    # scrape can therefore be the wrong probe for codex launch success. Do not
+    # suppress verification: return success here only so the caller's launch
+    # observer can verify the right signal (argv launch actually produced a live
+    # codex process). If that process never appears, confirm_dispatch_launch_live()
+    # still fails the dispatch.
+    if engine == "codex":
+        _emit(
+            (advisory or "composer scrape reported submit failure")
+            + "; codex launch delivery will be verified by argv launch + live process"
+        )
+        raise SystemExit(0)
     _emit(advisory or "submit did not clear the composer; message NOT delivered")
     raise SystemExit(70)
 if delivery == "likely" and advisory:

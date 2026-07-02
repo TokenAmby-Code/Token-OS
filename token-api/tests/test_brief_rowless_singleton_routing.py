@@ -257,14 +257,14 @@ async def test_brief_explicit_idempotency_key_reuses_queue_id(
 
 
 @pytest.mark.asyncio
-async def test_brief_rowless_unverified_issued_bytes_reports_sent(
+async def test_brief_rowless_unverified_issued_bytes_stays_unverified(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Non-gated rc=0 rowless/codex brief send reports SENT even without an ack.
+    """Non-gated rc=0 rowless/codex brief is not enough without submit proof.
 
-    Codex/rowless panes fire UserPromptSubmit late or never, so a successful send
-    that merely lacks the ack is a verification false-negative, not a miss. Brief
-    is fire-and-forget, so issued bytes must surface as SENT (not UNVERIFIED).
+    Codex can miss UserPromptSubmit, but bytes-issued alone is still not delivery
+    proof. The daemon must provide ``submitted`` or engine-specific ``likely``;
+    otherwise brief reports UNVERIFIED so callers do not blind-retry.
     """
     main = app_env.main
     target = {
@@ -321,8 +321,8 @@ async def test_brief_rowless_unverified_issued_bytes_reports_sent(
     )
 
     # The keyless brief still drives a deterministic auto operation_id through the
-    # rowless/codex direct path so a blind retry would dedupe (FIX 2), and the
-    # unverified-but-issued codex send reports SENT (FIX 1).
+    # rowless/codex direct path so a blind retry would dedupe, but unverified bytes
+    # are not promoted to delivered.
     expected_operation_id = main._scoped_send_operation_id(
         "brief",
         f"auto:%44:{main._prompt_payload_hash('codex probe')}",
@@ -330,22 +330,88 @@ async def test_brief_rowless_unverified_issued_bytes_reports_sent(
         "codex probe",
     )
     assert expected_operation_id is not None
-    assert result["status"] == "ok"
-    assert result["delivered"] == 1
+    assert result["status"] == "unverified"
+    assert result["delivered"] == 0
     assert sent == [("%44", "codex probe", True, expected_operation_id)]
     receipt = result["resolved"][0]
-    assert receipt["status"] == main.PANE_WRITE_SENT
+    assert receipt["status"] == main.PANE_WRITE_UNVERIFIED
     assert receipt["fallback"] == "tmuxctl_send_text_no_registry_row"
+    assert "submit_unverified" in receipt["reason"]
+
+
+@pytest.mark.asyncio
+async def test_brief_rowless_codex_likely_capture_reports_sent(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex rowless brief may report SENT when tmuxctld proves ingestion."""
+    main = app_env.main
+    target = {
+        "pane_id": "%45",
+        "position_id": "council:pax",
+        "source": "pane",
+        "spec": "council:pax",
+    }
+
+    async def _targets(**_kwargs):
+        return [target], []
+
+    async def _no_row(_pane):
+        return None
+
+    async def _resolve_live(pane):
+        return "%45" if pane == "%45" else None
+
+    async def _codex_engine(_pane):
+        return "codex"
+
+    async def _sender_is_custodes(_pane):
+        return True
+
+    async def _send(pane, payload, *, clear_prompt=False, operation_id=None, **_kwargs):
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "operation": "tmuxctld.send_text",
+            "gated": False,
+            "verification_status": "likely",
+            "verified_by": "capture-pane:codex-user-message",
+            "delivery": "likely",
+            "operation_id": operation_id,
+        }
+
+    monkeypatch.setattr(main.talk_service, "resolve_brief_targets", _targets)
+    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _no_row)
+    monkeypatch.setattr(main, "_pane_sender_is_custodes", _sender_is_custodes)
+    monkeypatch.setattr(main.shared, "resolve_tmux_pane_id", _resolve_live)
+    monkeypatch.setattr(main, "_pane_live_agent_engine", _codex_engine)
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
+
+    result = await main.brief_send(
+        main.BriefSendRequest(
+            caller_pane="council:custodes",
+            panes=["council:pax"],
+            payload="codex likely probe",
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["delivered"] == 1
+    receipt = result["resolved"][0]
+    assert receipt["status"] == main.PANE_WRITE_SENT
+    assert receipt["verification_status"] == "likely"
+    assert receipt["verified_by"] == "capture-pane:codex-user-message"
 
 
 @pytest.mark.asyncio
 async def test_brief_rowless_claude_unverified_is_not_marked_sent(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The SENT-on-issued relaxation is codex-only: a rowless claude pane that
+    """A rowless claude pane that issues bytes without an ack is unverified.
 
-    issues bytes without an ack must NOT be reported SENT — claude panes ack
-    reliably, so unverified there is a real failure, not a false-negative.
+    The transport may have issued bytes, but without submit proof it must not be
+    reported SENT. The top-level brief status stays UNVERIFIED so callers get the
+    do-not-blind-retry state rather than a generic failure.
     """
     main = app_env.main
     target = {
@@ -397,7 +463,7 @@ async def test_brief_rowless_claude_unverified_is_not_marked_sent(
         )
     )
 
-    assert result["status"] == "failed"
+    assert result["status"] == "unverified"
     assert result["delivered"] == 0
     receipt = result["resolved"][0]
     assert receipt["status"] == main.PANE_WRITE_UNVERIFIED
@@ -543,6 +609,64 @@ async def test_talk_rowless_live_codex_singleton_requires_verified_submit(
     assert excinfo.value.status_code == 502
     assert "submit_unverified" in str(excinfo.value.detail)
     assert sent == [("%44", "talk probe", False)]
+
+
+@pytest.mark.asyncio
+async def test_talk_rowless_live_codex_accepts_likely_ingestion(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """talk into rowless Codex opens when tmuxctld proves real ingestion."""
+    main = app_env.main
+
+    async def _resolve(spec):
+        return {"council:custodes": "%10", "mechanicus:fabricator-general": "%44"}.get(spec)
+
+    async def _no_return(**_kwargs):
+        return None
+
+    async def _no_row(_pane):
+        return None
+
+    async def _sender_is_custodes(_pane):
+        return True
+
+    async def _resolve_live(pane):
+        return pane if pane in {"%10", "%44"} else None
+
+    async def _pane_rows():
+        return [("%44", "codex", "/tmp/project", "mechanicus", "/dev/ttys044")]
+
+    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False, **_kwargs):
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "operation": "tmuxctld.send_text",
+            "gated": False,
+            "verification_status": "likely",
+            "verified_by": "capture-pane:codex-user-message",
+            "delivery": "likely",
+        }
+
+    monkeypatch.setattr(main.talk_service, "resolve_pane", _resolve)
+    monkeypatch.setattr(main.talk_service, "return_talk", _no_return)
+    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _no_row)
+    monkeypatch.setattr(main, "_pane_sender_is_custodes", _sender_is_custodes)
+    monkeypatch.setattr(main.shared, "resolve_tmux_pane_id", _resolve_live)
+    monkeypatch.setattr(main, "_tmux_pane_rows", _pane_rows)
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
+
+    result = await main.talk_send(
+        main.TalkSendRequest(
+            caller_pane="council:custodes",
+            target_pane="mechanicus:fabricator-general",
+            payload="talk likely probe",
+        )
+    )
+
+    assert result["status"] == "open"
+    assert result["delivery"]["status"] == main.PANE_WRITE_SENT
+    assert result["delivery"]["verification_status"] == "likely"
 
 
 @pytest.mark.asyncio
