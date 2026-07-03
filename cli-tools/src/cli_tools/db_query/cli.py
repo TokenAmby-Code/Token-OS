@@ -30,10 +30,10 @@ from .query_runner import (
     format_results_json,
     format_results_table,
     get_env_config,
-    get_password,
     is_write_query,
     list_tables,
     normalize_env,
+    resolve_password,
     start_proxy,
     validate_query,
 )
@@ -58,7 +58,7 @@ def _print_result(result: QueryResult, format_type: str = "table") -> None:
 def cmd_tables(args: argparse.Namespace) -> int:
     """List all tables in the database."""
     env_config = _get_config_with_overrides(args)
-    password = _get_password_or_exit(args)
+    password = _get_password_or_exit(env_config)
 
     env_name = normalize_env(args.env)
     print(f"Listing tables in {env_name} ({env_config['database']})...\n")
@@ -72,7 +72,7 @@ def cmd_tables(args: argparse.Namespace) -> int:
 def cmd_describe(args: argparse.Namespace) -> int:
     """Describe a table's structure."""
     env_config = _get_config_with_overrides(args)
-    password = _get_password_or_exit(args)
+    password = _get_password_or_exit(env_config)
 
     env_name = normalize_env(args.env)
     print(f"Describing table '{args.table}' in {env_name}...\n")
@@ -86,7 +86,7 @@ def cmd_describe(args: argparse.Namespace) -> int:
 def cmd_query(args: argparse.Namespace) -> int:
     """Execute a SQL query."""
     env_config = _get_config_with_overrides(args)
-    password = _get_password_or_exit(args)
+    password = _get_password_or_exit(env_config)
 
     # Validate query
     is_valid, error = validate_query(args.sql, env_config)
@@ -164,6 +164,16 @@ def _get_config_with_overrides(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "port", None):
         env_config["port"] = args.port
 
+    # Override database name if specified
+    if getattr(args, "db", None):
+        env_config["database"] = args.db
+
+    # Override Cloud SQL instance connection name if specified
+    if getattr(args, "instance", None):
+        env_config["instance"] = args.instance
+        if ":" in args.instance:
+            env_config["project_id"] = args.instance.split(":", 1)[0]
+
     # Override host if specified
     if getattr(args, "host", None):
         env_config["host"] = args.host
@@ -171,17 +181,22 @@ def _get_config_with_overrides(args: argparse.Namespace) -> dict[str, Any]:
     return env_config
 
 
-def _get_password_or_exit(args: argparse.Namespace) -> str | None:
-    """Get password from environment, or exit if required but missing."""
-    password = get_password()
-
-    # For direct connections or custom host, password is required
-    if (getattr(args, "direct", False) or getattr(args, "host", None)) and not password:
-        print("Error: DB_PASSWORD environment variable required for direct connections.")
-        print("Set it with: export DB_PASSWORD='your-password'")
+def _get_password_or_exit(env_config: dict[str, Any]) -> str:
+    """Resolve password or exit loudly; never attempt passwordless auth."""
+    result = resolve_password(env_config)
+    if not result.password:
+        print("Error: Database password required.")
+        if result.error:
+            print(result.error)
+        print(
+            "Resolution order: DB_PASSWORD, .env DB_PASSWORD, then GCP Secret Manager db-password."
+        )
+        print(
+            "For Secret Manager, authenticate gcloud and ensure secretAccessor on the target project."
+        )
         sys.exit(1)
 
-    return password
+    return result.password
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -195,12 +210,27 @@ Examples:
   db-query --env dev tables
   db-query --env dev describe users
   db-query --env dev --direct query "SELECT * FROM users LIMIT 5"
+  db-query --env prod --db pax-sql query "SELECT 1"
+  db-query --env prod --instance pax-prod-467920:us-central1:pax-sql query "SELECT 1"
   db-query --env production query "SELECT COUNT(*) FROM tickets"
   db-query --env dev proxy status
   db-query --env dev proxy start
 
+Defaults:
+  dev         pax-dev-469018:us-central1:pax-sql      database pax-sql
+  staging     pax-staging-008732:us-central1:pax-sql  database pax-db-staging
+  production  pax-prod-467920:us-central1:pax-sql     database pax-sql (read-only)
+
+Deploy YAMLs, when present, override these defaults. --db and --instance can
+override the final target explicitly.
+
 Environment Variables:
   DB_PASSWORD     Database password (loaded from .env if not set)
+
+Password Resolution:
+  DB_PASSWORD → .env DB_PASSWORD → GCP Secret Manager db-password in the target
+  project (derived from INSTANCE_CONNECTION_NAME/--instance). If none resolves,
+  db-query exits before connecting; it never silently attempts passwordless auth.
         """,
     )
 
@@ -229,6 +259,16 @@ Environment Variables:
         "-p",
         type=int,
         help="Override proxy port (default: 5432)",
+    )
+    parser.add_argument(
+        "--db",
+        type=str,
+        help="Override database name (default: pax-sql for dev/prod, pax-db-staging for staging)",
+    )
+    parser.add_argument(
+        "--instance",
+        type=str,
+        help="Override Cloud SQL instance connection name (project:region:instance)",
     )
     parser.add_argument(
         "--host",

@@ -4,4 +4,4 @@
 # AUDIENCE: human, agent
 set -euo pipefail
 CLI_TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec uv run --directory "$CLI_TOOLS_DIR" python -m cli_tools.db_query.cli "$@"
+exec uv run --no-sync --directory "$CLI_TOOLS_DIR" python -m cli_tools.db_query.cli "$@"

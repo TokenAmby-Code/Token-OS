@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,41 @@ def _get_gcloud_credentials() -> Any:
     if not token or result.returncode != 0:
         raise RuntimeError(f"Failed to get gcloud access token: {result.stderr.strip()}")
     return google.oauth2.credentials.Credentials(token=token)
+
+
+# Defaults used when the askCivic deploy YAML checkout is not present on this
+# machine. Keep these aligned with the deployed Cloud SQL instances/databases.
+DEFAULT_ENV_CONFIGS: dict[str, dict[str, Any]] = {
+    "development": {
+        "instance": "pax-dev-469018:us-central1:pax-sql",
+        "database": "pax-sql",
+        "user": "postgres",
+        "host": "localhost",
+        "public_ip": "34.60.168.98",
+        "port": 5432,
+        "read_only": False,
+    },
+    "staging": {
+        "instance": "pax-staging-008732:us-central1:pax-sql",
+        "database": "pax-db-staging",
+        "user": "postgres",
+        "host": "localhost",
+        "public_ip": None,
+        "port": 5432,
+        "read_only": False,
+    },
+    "production": {
+        "instance": "pax-prod-467920:us-central1:pax-sql",
+        "database": "pax-sql",
+        "user": "postgres",
+        "host": "localhost",
+        "public_ip": None,
+        "port": 5432,
+        "read_only": True,
+    },
+}
+
+DEFAULT_SECRET_NAME = "db-password"
 
 
 # Deploy YAML directory — search known locations
@@ -109,7 +145,10 @@ def _load_environments() -> dict[str, dict[str, Any]]:
     """Load environment configurations from deploy YAML files.
 
     Reads PROJECT_ID, INSTANCE_CONNECTION_NAME, DB_NAME, DB_USER from
-    the pax-*.yaml files in ~/ProcAgentDir/ProcurementAgentAI/deploy/
+    the pax-*.yaml files in the askCivic deploy directory, when present.
+    If that checkout is absent, uses built-in production-safe defaults that
+    target the pax-sql Cloud SQL instance/database instead of the retired
+    pax-db name.
 
     DB_HOST (public IP for dev) comes from .env file.
     """
@@ -131,14 +170,22 @@ def _load_environments() -> dict[str, dict[str, Any]]:
         yaml_path = DEPLOY_DIR / yaml_file
         env_vars = _parse_yaml_env_vars(yaml_path)
 
+        defaults = DEFAULT_ENV_CONFIGS[env_name]
+        instance = env_vars.get("INSTANCE_CONNECTION_NAME", defaults["instance"])
+        project_id = env_vars.get("PROJECT_ID") or (
+            instance.split(":", 1)[0] if ":" in instance else defaults["instance"].split(":", 1)[0]
+        )
         environments[env_name] = {
-            "instance": env_vars.get("INSTANCE_CONNECTION_NAME", ""),
-            "database": env_vars.get("DB_NAME", "pax-db"),
-            "user": env_vars.get("DB_USER", "postgres"),
-            "host": "localhost",
-            "public_ip": public_ip if env_name == "development" else None,
-            "port": int(env_vars.get("DB_PORT", "5432")),
-            "read_only": env_name == "production",
+            "project_id": project_id,
+            "instance": instance,
+            "database": env_vars.get("DB_NAME", defaults["database"]),
+            "user": env_vars.get("DB_USER", defaults["user"]),
+            "host": env_vars.get("DB_HOST", defaults["host"]),
+            "public_ip": (public_ip or defaults["public_ip"])
+            if env_name == "development"
+            else defaults["public_ip"],
+            "port": int(env_vars.get("DB_PORT", str(defaults["port"]))),
+            "read_only": defaults["read_only"],
         }
 
     return environments
@@ -187,6 +234,15 @@ class QueryResult:
     columns: list[str] | None = None
     rows: list[tuple[Any, ...]] | None = None
     row_count: int = 0
+    error: str | None = None
+
+
+@dataclass
+class PasswordResolutionResult:
+    """Result of database password lookup."""
+
+    password: str | None
+    source: str | None = None
     error: str | None = None
 
 
@@ -305,40 +361,130 @@ def format_results_json(columns: list[str], rows: list[tuple[Any, ...]]) -> str:
     return json.dumps(results, indent=2, default=str)
 
 
-def get_password() -> str | None:
-    """Get database password from environment.
+def _project_id_from_config(env_config: dict[str, Any] | None) -> str | None:
+    if not env_config:
+        return None
+
+    project_id = env_config.get("project_id")
+    if isinstance(project_id, str) and project_id:
+        return project_id
+
+    instance = env_config.get("instance")
+    if isinstance(instance, str) and ":" in instance:
+        return instance.split(":", 1)[0]
+
+    return None
+
+
+def _access_secret_manager(secret_name: str, project_id: str) -> str:
+    """Fetch a secret value from GCP Secret Manager with gcloud."""
+    gcloud = shutil.which("gcloud") or "/snap/bin/gcloud"
+    if not Path(gcloud).exists() and shutil.which("gcloud") is None:
+        raise RuntimeError("gcloud not found on PATH")
+
+    result = subprocess.run(
+        [
+            gcloud,
+            "secrets",
+            "versions",
+            "access",
+            "latest",
+            "--secret",
+            secret_name,
+            "--project",
+            project_id,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise RuntimeError(stderr)
+
+    secret = result.stdout.strip()
+    if not secret:
+        raise RuntimeError("Secret Manager returned an empty payload")
+
+    return secret
+
+
+def resolve_password(
+    env_config: dict[str, Any] | None = None,
+    *,
+    secret_name: str = DEFAULT_SECRET_NAME,
+) -> PasswordResolutionResult:
+    """Resolve the database password without silent passwordless fallback.
 
     Checks in order:
     1. DB_PASSWORD environment variable
     2. .env file in current working directory
-    3. .env file in ProcurementAgentAI project root
+    3. .env file next to the discovered deploy directory
+    4. .env file in the legacy ProcurementAgentAI project root
+    5. GCP Secret Manager secret `db-password` in the target project
     """
     # First check environment variable
     password = os.environ.get("DB_PASSWORD")
     if password:
-        return password
+        return PasswordResolutionResult(password=password, source="DB_PASSWORD")
 
     # Try to load from .env files
     try:
         from dotenv import dotenv_values
     except ImportError:
-        return None
+        dotenv_values = None  # type: ignore[assignment]
 
-    # Try current directory
-    cwd_env = Path.cwd() / ".env"
-    if cwd_env.exists():
-        values = dotenv_values(cwd_env)
-        if values.get("DB_PASSWORD"):
-            return values["DB_PASSWORD"]
+    if dotenv_values is not None:
+        env_files = [
+            Path.cwd() / ".env",
+            DEPLOY_DIR.parent / ".env",
+            Path.home() / "ProcAgentDir" / "ProcurementAgentAI" / ".env",
+        ]
+        seen: set[Path] = set()
+        for env_file in env_files:
+            if env_file in seen:
+                continue
+            seen.add(env_file)
+            if env_file.exists():
+                values = dotenv_values(env_file)
+                if values.get("DB_PASSWORD"):
+                    return PasswordResolutionResult(
+                        password=values["DB_PASSWORD"],
+                        source=str(env_file),
+                    )
 
-    # Try ProcurementAgentAI project root
-    project_root = Path.home() / "ProcAgentDir" / "ProcurementAgentAI" / ".env"
-    if project_root.exists():
-        values = dotenv_values(project_root)
-        if values.get("DB_PASSWORD"):
-            return values["DB_PASSWORD"]
+    project_id = _project_id_from_config(env_config)
+    if not project_id:
+        return PasswordResolutionResult(
+            password=None,
+            error=(
+                "DB_PASSWORD was not set, no .env DB_PASSWORD was found, and no "
+                "target project/instance is configured for Secret Manager lookup."
+            ),
+        )
 
-    return None
+    try:
+        return PasswordResolutionResult(
+            password=_access_secret_manager(secret_name, project_id),
+            source=f"Secret Manager {project_id}/{secret_name}",
+        )
+    except Exception as e:
+        return PasswordResolutionResult(
+            password=None,
+            error=(
+                "DB_PASSWORD was not set and no .env DB_PASSWORD was found. "
+                f"Secret Manager lookup failed for {project_id}/{secret_name}: {e}"
+            ),
+        )
+
+
+def get_password(env_config: dict[str, Any] | None = None) -> str | None:
+    """Get database password from env/.env/Secret Manager.
+
+    Prefer resolve_password(...) in CLI paths so failures can be reported
+    explicitly instead of accidentally attempting passwordless auth.
+    """
+    return resolve_password(env_config).password
 
 
 async def execute_query_with_connector(

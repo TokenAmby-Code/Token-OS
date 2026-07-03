@@ -1,6 +1,5 @@
 """Database query utilities for Cloud SQL access."""
 
-from .cli import main
 from .query_runner import (
     ENV_ALIASES,
     ENVIRONMENTS,
@@ -11,8 +10,17 @@ from .query_runner import (
     get_password,
     list_tables,
     normalize_env,
+    resolve_password,
     validate_query,
 )
+
+
+def main(*args, **kwargs):
+    """Run the db-query CLI entry point without eager-importing the CLI module."""
+    from .cli import main as _main
+
+    return _main(*args, **kwargs)
+
 
 __all__ = [
     "ENVIRONMENTS",
@@ -25,5 +33,6 @@ __all__ = [
     "list_tables",
     "main",
     "normalize_env",
+    "resolve_password",
     "validate_query",
 ]
