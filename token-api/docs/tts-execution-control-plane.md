@@ -2,7 +2,7 @@
 
 Authoritative contract as of 2026-07-03:
 
-- Token-API owns TTS session, queue, current/next chunk, playback id, control state, ack/error state.
+- Token-API owns TTS session, queue, current/next/backfill chunk, playback id, control state, ack/error state.
 - Backends are execution-only: `phone`, `wsl`, later `linux`.
 - Mac `say` is removed as a TTS backend. If the active backend fails, Token-API records/returns an error; it does not fall back to Mac.
 - Order remains: `sanitize -> chunk -> enqueue -> dispatch chunk to backend`.
@@ -48,10 +48,19 @@ Token-OS dispatches to the phone local endpoint:
 Invariants:
 
 - `current_chunk` and `next_chunk` are already sanitized.
-- Phone may hold exactly one write-ahead chunk: current + next.
-- Phone must not loop ahead, reconstruct the queue, or mutate playback state before Token-OS control acknowledgement.
+- Phone starts with current + next and may use MacroDroid TTS queue only for the already-authorized next/backfill chunk.
+- After chunk `n` is consumed, phone requests backfill `n+2` from `POST /api/tts/chunk-next`.
+- Phone must not reconstruct the full queue or mutate playback state before Token-OS control acknowledgement.
 
 Token-OS also includes compatibility metadata fields such as `chunk_id`, `current_chunk_hash`, `next_chunk_hash`, and `chunk_count` for integrity/observability.
+
+Backfill request:
+
+```text
+POST /api/tts/chunk-next
+```
+
+Body includes `session_id`, `playback_id`, `last_consumed_index`, optional `utterance_id`, and `backend`. Response returns `next_chunk` metadata or `done: true`; `paused` and `skipped` are explicit control-state responses.
 
 ## Phone events and errors
 

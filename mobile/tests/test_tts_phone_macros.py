@@ -114,7 +114,7 @@ def test_local_control_echo_is_private_consumed_endpoint_not_authority() -> None
     assert "mac say" not in lowered
 
 
-def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
+def test_chunk_player_streams_with_scalar_speak_text_and_backfill() -> None:
     macro = load("tts-phone-chunk-player.macro")
     assert (
         token_os_global("tts-phone-chunk-player.macro")["m_stringValue"]
@@ -123,34 +123,47 @@ def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
     assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
     speak_actions = actions(macro, "SpeakTextAction")
     assert [a["m_textToSay"] for a in speak_actions] == [
-        "{http_param=current_chunk}",
-        "{http_param=next_chunk}",
+        "{lv=current_chunk_text}",
+        "{lv=next_chunk_text}",
+        "{lv=backfill_next_chunk}",
     ]
-    assert all(a["m_waitToFinish"] is True for a in speak_actions)
-    assert all(a["m_queue"] is False for a in speak_actions)
+    assert [a["m_queue"] for a in speak_actions] == [False, True, True]
+    assert speak_actions[0]["m_waitToFinish"] is True
+    assert speak_actions[1]["m_waitToFinish"] is False
 
     serialized = json.dumps(macro)
-    # The phone is an executor, not a queue owner.
-    assert "LoopAction" not in serialized
-    assert "IterateDictionaryAction" not in serialized
+    # Only scalar locals are fed to SpeakTextAction; request/backfill dictionaries
+    # are dereferenced outside TTS so MacroDroid does not speak literal variables.
+    assert "{http_param=current_chunk}" not in serialized
+    assert "{http_param=next_chunk}" not in serialized
+    assert "{lv=request[" not in serialized
+    assert "request[" not in serialized
+    assert "IterateDictionaryAction" in serialized
+    assert "SetVariableAction" in serialized
+    assert "LoopAction" in serialized
     assert "ForceMacroRunAction" not in serialized
-    assert "SetVariableAction" not in serialized
-    assert "queue" not in macro["m_description"].lower().replace("no local queue", "")
-    assert "current_plus_next" in serialized
+    assert "streaming_current_plus_next" in serialized
 
     urls = request_urls(macro)
     assert urls == [
         f"{TOKEN_OS_BASE}/api/tts/chunk-event",
+        f"{TOKEN_OS_BASE}/api/tts/chunk-next",
+        f"{TOKEN_OS_BASE}/api/tts/chunk-event",
         f"{TOKEN_OS_BASE}/api/tts/chunk-event",
     ]
-    assert "current_complete_next_starting" in request_bodies(macro)[0]
-    assert "buffer_drained" in request_bodies(macro)[1]
+    bodies = request_bodies(macro)
+    assert "current_complete_next_starting" in bodies[0]
+    assert "last_consumed_index" in bodies[1]
+    assert "buffer_drained" in bodies[2]
+    assert "buffer_drained" in bodies[3]
     assert (
         actions(macro, "HttpRequestAction")[0]["requestConfig"]["blockNextAction"]
         is False
     )
-    assert "{lv=request[" not in serialized
-    assert "request[" not in serialized
+    assert (
+        actions(macro, "HttpRequestAction")[1]["requestConfig"]["responseVariableName"]
+        == "backfill_raw"
+    )
 
 
 def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:

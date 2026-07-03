@@ -209,13 +209,155 @@ def test_phone_short_utterance_sends_empty_next_chunk() -> None:
     chunks = tts.build_tts_chunk_handoff("short line")
 
     phone_chunks = tts.build_phone_tts_chunk_handoff(chunks)
-    payload = tts._backend_chunk_payload(phone_chunks[0], phone_chunks[1])
+    payload = tts._backend_chunk_payload(phone_chunks[0], None)
 
     assert payload["current_index"] == 0
-    assert payload["next_index"] == 1
+    assert payload["next_index"] is None
     assert payload["current_chunk"] == "short line"
     assert payload["next_chunk"] == ""
     assert payload["playback_id"] == phone_chunks[0]["playback_id"]
+
+
+def test_phone_streaming_backfill_returns_n_plus_two_and_done() -> None:
+    tts = _load_tts()
+    chunks = tts.build_tts_chunk_handoff("one. two. three.", max_chars=10)
+    phone_chunks = tts.build_phone_tts_chunk_handoff(chunks)
+    session_id = "sess-stream"
+    playback_id = phone_chunks[0]["playback_id"]
+    tts._update_tts_authoritative_state(
+        control={
+            "state": "playing",
+            "last_action": None,
+            "speed": 1.0,
+            "source": None,
+            "updated_at": None,
+        }
+    )
+    tts._register_phone_tts_stream(
+        session_id=session_id,
+        playback_id=playback_id,
+        utterance_id=phone_chunks[0]["utterance_id"],
+        chunks=phone_chunks,
+    )
+    try:
+        payload = tts._backend_chunk_payload(phone_chunks[0], phone_chunks[1])
+        assert payload["current_chunk"] == "one."
+        assert payload["next_chunk"] == "two."
+
+        backfill = asyncio.run(
+            tts.api_tts_chunk_next(
+                tts.TTSChunkNextRequest(
+                    session_id=session_id,
+                    playback_id=playback_id,
+                    last_consumed_index=0,
+                )
+            )
+        )
+        assert backfill["success"] is True
+        assert backfill["done"] is False
+        assert backfill["next_index"] == 2
+        assert backfill["next_chunk"] == "three."
+
+        done = asyncio.run(
+            tts.api_tts_chunk_next(
+                tts.TTSChunkNextRequest(
+                    session_id=session_id,
+                    playback_id=playback_id,
+                    last_consumed_index=1,
+                )
+            )
+        )
+        assert done["success"] is True
+        assert done["done"] is True
+        assert done["reason"] == "stream_exhausted"
+        assert done["next_chunk"] == ""
+    finally:
+        tts.TTS_PHONE_STREAMS.pop((session_id, playback_id), None)
+
+
+def test_phone_backfill_obeys_pause_resume_skip_state() -> None:
+    tts = _load_tts()
+    chunks = tts.build_tts_chunk_handoff("one. two. three.", max_chars=10)
+    phone_chunks = tts.build_phone_tts_chunk_handoff(chunks)
+    session_id = "sess-control"
+    playback_id = phone_chunks[0]["playback_id"]
+    tts._register_phone_tts_stream(
+        session_id=session_id,
+        playback_id=playback_id,
+        utterance_id=phone_chunks[0]["utterance_id"],
+        chunks=phone_chunks,
+    )
+    waiter = tts.threading.Event()
+    tts.pending_phone_playbacks[playback_id] = waiter
+    try:
+        tts._update_tts_authoritative_state(
+            control={
+                "state": "paused",
+                "last_action": "pause",
+                "speed": 1.0,
+                "source": "unit",
+                "updated_at": None,
+            }
+        )
+        paused = asyncio.run(
+            tts.api_tts_chunk_next(
+                tts.TTSChunkNextRequest(
+                    session_id=session_id,
+                    playback_id=playback_id,
+                    last_consumed_index=0,
+                )
+            )
+        )
+        assert paused["paused"] is True
+        assert paused["done"] is False
+        assert waiter.is_set() is False
+
+        tts._update_tts_authoritative_state(
+            control={
+                "state": "playing",
+                "last_action": "resume",
+                "speed": 1.0,
+                "source": "unit",
+                "updated_at": None,
+            }
+        )
+        resumed = asyncio.run(
+            tts.api_tts_chunk_next(
+                tts.TTSChunkNextRequest(
+                    session_id=session_id,
+                    playback_id=playback_id,
+                    last_consumed_index=0,
+                )
+            )
+        )
+        assert resumed["next_index"] == 2
+        assert resumed["next_chunk"] == "three."
+
+        tts._update_tts_authoritative_state(
+            control={
+                "state": "skipping",
+                "last_action": "skip",
+                "speed": 1.0,
+                "source": "unit",
+                "updated_at": None,
+            }
+        )
+        skipped = asyncio.run(
+            tts.api_tts_chunk_next(
+                tts.TTSChunkNextRequest(
+                    session_id=session_id,
+                    playback_id=playback_id,
+                    last_consumed_index=1,
+                )
+            )
+        )
+        assert skipped["skipped"] is True
+        assert skipped["done"] is True
+        assert waiter.is_set() is True
+        assert (session_id, playback_id) not in tts.TTS_PHONE_STREAMS
+    finally:
+        tts.pending_phone_playbacks.pop(playback_id, None)
+        tts.TTS_PHONE_STREAMS.pop((session_id, playback_id), None)
 
 
 def test_speak_tts_sanitizes_then_chunks_then_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
