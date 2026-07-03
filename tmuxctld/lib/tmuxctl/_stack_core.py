@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from .labels import canonical_pane_role
 from .singleton_labels import is_persona_singleton_label
@@ -26,6 +27,10 @@ LEGACY_FOCUS_GUARD_OPTION = "@LEGION_FOCUS_GUARD"
 LEGACY_FOCUSED_PANE_OPTION = "@LEGION_FOCUSED_PANE"
 PANE_SELECT_ZOOM_RESTORE_PENDING_OPTION = "@PANE_SELECT_ZOOM_RESTORE_PENDING"
 SHELL_COMMANDS = {"bash", "zsh", "sh", "fish"}
+PINNED_ROLE_OPTIONS = {
+    "reservists:civic": "@CIVIC_RESERVIST",
+    "reservists:token-os": "@TOKEN_OS_RESERVIST",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -232,10 +237,9 @@ def _tag_persona(adapter: TmuxAdapter, pane: str, persona: PersonaPaneSpec) -> N
 
 def _tag_pinned_role(adapter: TmuxAdapter, pane: str, persona: PersonaPaneSpec) -> None:
     _tag_persona(adapter, pane, persona)
-    if persona.role == "reservists:civic":
-        _set_pane_option(adapter, pane, "@CIVIC_RESERVIST", "1")
-    elif persona.role == "reservists:token-os":
-        _set_pane_option(adapter, pane, "@TOKEN_OS_RESERVIST", "1")
+    option = PINNED_ROLE_OPTIONS.get(persona.role)
+    if option:
+        _set_pane_option(adapter, pane, option, "1")
 
 
 def _log_retag(pane: str, old_role: str, new_role: str, reason: str) -> None:
@@ -430,7 +434,7 @@ def _ensure_pinned_role_panes(
             _tag_pinned_role(adapter, pane.pane_id, persona)
             target_pane = pane.pane_id
             continue
-        if not existing and target_pane:
+        if not existing and len(panes) == 1 and target_pane:
             logger.info(
                 "stack pane identity retag pane=%s old_role=%s new_role=%s reason=pinned_adopt_first",
                 target_pane,
@@ -446,9 +450,7 @@ def _ensure_pinned_role_panes(
             # If the left civic seat is the missing one, create it before the
             # surviving row sibling instead of to its right.
             split_args.append("-b")
-        split_args.extend(
-            ["-t", target_pane, "-d", "-P", "-F", "#{pane_id}", "-l", "50%"]
-        )
+        split_args.extend(["-t", target_pane, "-d", "-P", "-F", "#{pane_id}", "-l", "50%"])
         created = adapter.run(*split_args, allow_failure=True).strip()
         if not created:
             continue
@@ -481,6 +483,8 @@ def _enforce_pinned_top_row_layout(
     admit: bool = False,
     kill_pending_clear: bool = False,
 ) -> str:
+    if not spec.pinned_roles:
+        raise ValueError(f"{spec.base} pinned-top-row spec has no pinned roles")
     panes = _ensure_pinned_role_panes(adapter, target, panes, spec)
     pinned = _pinned_panes_by_role(panes, spec)
     missing = [persona.role for persona in spec.pinned_roles if persona.role not in pinned]
@@ -581,9 +585,7 @@ def _enforce_pinned_top_row_layout(
                     first_pinned.pane_id,
                     allow_failure=True,
                 )
-            adapter.run(
-                "resize-pane", "-t", worker.pane_id, "-x", str(win_w), allow_failure=True
-            )
+            adapter.run("resize-pane", "-t", worker.pane_id, "-x", str(win_w), allow_failure=True)
         if focus and focused_pane in worker_ids:
             _set_window_option(adapter, target, STACK_FOCUSED_PANE_OPTION, focused_pane)
     finally:
@@ -962,9 +964,11 @@ def add_pinned_stack_pane(
     spec = STACK_PAGE_SPECS.get(base)
     if spec is None or spec.layout_mode != "pinned-top-row":
         raise ValueError(f"not a pinned stack: {base}")
+    if not spec.pinned_roles:
+        raise ValueError(f"{base} pinned stack has no pinned roles")
     if adopt_pane is not None:
         raise ValueError(f"stack adopt is not supported for pinned stacks: {base!r}")
-    cwd = cwd or os.path.expanduser("~")
+    cwd = cwd or str(Path.home())
     target = f"{session}:{base}"
     names = [
         name.split("(", 1)[0]

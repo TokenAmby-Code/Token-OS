@@ -993,6 +993,29 @@ def test_reservists_workers_renumber_after_removal_without_retagging_pinned_seat
     )
 
 
+def test_reservists_rebuilds_missing_seats_without_stealing_live_workers():
+    adapter = FakeReservistsAdapter(
+        rows=[
+            ["%A", "reservists:1", "stack-worker", "1", "0", "22", "200", "3", "codex", "false"],
+            ["%B", "reservists:2", "stack-worker", "0", "0", "26", "200", "3", "codex", "false"],
+        ]
+    )
+
+    enforce_stack_layout(adapter, "main:7")  # type: ignore[arg-type]
+
+    roles = {row[1] for row in adapter.rows}
+    assert {"reservists:civic", "reservists:token-os", "reservists:1", "reservists:2"} <= roles
+    assert ("set-option", "-p", "-t", "%A", "@PANE_ID", "reservists:civic") not in adapter.commands
+    assert (
+        "set-option",
+        "-p",
+        "-t",
+        "%A",
+        "@PANE_ID",
+        "reservists:token-os",
+    ) not in adapter.commands
+
+
 def test_reservists_add_rejects_adopt():
     adapter = FakeReservistsAdapter()
 
