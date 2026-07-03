@@ -106,7 +106,7 @@ try:
 except ValueError:
     PHONE_AUDIO_PROXY_HEARTBEAT_TTL_SECONDS = 120
 # Which senders bypass the pause queue is now data, not a hardcoded slug: it is
-# carried by ``personas.tts_policy`` ('hot' → immediate playback). See queue_tts.
+# carried by ``personas.advisor`` and resolved by JOIN at queue time. See queue_tts.
 
 
 def init_deps(
@@ -1116,7 +1116,7 @@ _last_pause_queue_expiry_sweep = 0.0
 # Synthetic, always-resolved sender for system/enforcement pings that carry no
 # live persona instance (e.g. "distraction logged", "break exhausted", an
 # AskUserQuestion with no wired instance). Voiced as Custodes (Microsoft George,
-# hot policy): per the Emperor's two-part contract these terse pings ARE "the
+# hot/system policy): per the Emperor's two-part contract these terse pings ARE "the
 # Custodes are impending." It is the ONE recognized synthetic id — it holds the
 # single-queue invariant (still enqueues to the same worker, no parallel speak
 # path) and can never fall to ``persona_unresolved``. This supersedes the earlier
@@ -1129,8 +1129,9 @@ _SYSTEM_TTS_ROW: dict[str, object] = {
     "notification_sound": "chimes.wav",
     "tts_mode": "verbose",
     "persona_slug": "system",
-    "tts_policy": "hot",  # jump ahead of the pause queue, but the worker still
+    "advisor": True,  # jump ahead of the pause queue, but the worker still
     # serializes — a system ping waits out whatever is currently audible.
+    "tts_policy": "hot",
 }
 
 # Phone playback completion (real audio-finish, not accept). The device echoes
@@ -1713,7 +1714,8 @@ async def queue_tts(
                 """SELECT i.name, p.tts_voice, p.notification_sound,
                           CASE WHEN i.interaction_mode = 'voice_chat'
                                THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
-                          p.slug AS persona_slug, p.tts_policy AS tts_policy
+                          p.slug AS persona_slug, p.tts_policy AS tts_policy,
+                          COALESCE(p.advisor, 0) AS advisor
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
                    WHERE i.id = ?""",
@@ -1780,12 +1782,12 @@ async def queue_tts(
         instance_mode = "verbose"
         queue_target = "hot"
 
-    # Policy-driven queue target (replaces the hardcoded custodes-slug bypass).
-    # ``hot`` → immediate playback (Custodes/enforcement: enforcement TTS only ever
-    # originates from Custodes, so keying on the policy subsumes "enforcement
-    # bypass" and keeps the queue free of any opinion about message type).
-    # ``pause`` → respect the caller's queue_target (the default; no-op here).
-    if tts_policy == "hot":
+    # Advisor-driven queue target (replaces the hardcoded custodes-slug bypass).
+    # Advisor is a persona capability resolved by JOIN at read time, never copied
+    # onto instances. Custodes, Pax, and Malcador therefore get queue-bypass
+    # parity without making "advisor" a rank or an instance-row projection.
+    # Non-advisors respect the caller's queue_target (the default; no-op here).
+    if bool(row["advisor"]):
         queue_target = "hot"
     global_mode = TTS_GLOBAL_MODE["mode"]
     # Restrictiveness order: silent > muted > verbose

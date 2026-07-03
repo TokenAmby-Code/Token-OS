@@ -46,6 +46,10 @@ class PersonaSeed:
     # (voiced Astartes). Trailing + defaulted so positional seeds need no change;
     # the startup UPSERT backfills this onto existing rows authoritatively.
     tts_policy: str = "silent"
+    # Cross-cutting advisory capability, orthogonal to rank/write scope. This is
+    # the single source of truth for "advisor" behavior; it is intentionally NOT
+    # copied onto instances.
+    advisor: bool = False
 
     @property
     def id(self) -> str:
@@ -227,6 +231,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         "chimes.wav",
         default_session_doc="daily_note",
         tts_policy="hot",
+        advisor=True,
     ),
     PersonaSeed(
         "fabricator-general",
@@ -269,6 +274,8 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         None,
         None,  # tts_voice, tts_rate, notification_sound (silent seat)
         default_session_doc="daily_note",  # bind today's Pax-ENV daily note
+        tts_policy="pause",
+        advisor=True,
     ),
     PersonaSeed(
         "orchestrator",
@@ -305,7 +312,18 @@ PRIMARCH_PERSONAS: tuple[PersonaSeed, ...] = (
         "mechanicus", "Mechanicus", "primarch", None, None, "#1f1b18", "#8b1a1a", None, None, None
     ),
     PersonaSeed(
-        "malcador", "Malcador", "primarch", None, None, "#302810", "#8a7a4a", None, None, None
+        "malcador",
+        "Malcador",
+        "primarch",
+        None,
+        None,
+        "#302810",
+        "#8a7a4a",
+        None,
+        None,
+        None,
+        tts_policy="pause",
+        advisor=True,
     ),
 )
 
@@ -382,6 +400,7 @@ def persona_schema_sql() -> str:
             default_session_doc TEXT,
             tts_policy TEXT NOT NULL DEFAULT 'silent'
                 CHECK (tts_policy IN ('silent', 'hot', 'pause')),
+            advisor INTEGER NOT NULL DEFAULT 0 CHECK (advisor IN (0, 1)),
             CHECK (default_rank = 'astartes' OR assignment_pool IS NULL)
         )
     """
@@ -402,6 +421,7 @@ def seed_params(seed: PersonaSeed) -> tuple:
         seed.notification_sound,
         seed.default_session_doc,
         seed.tts_policy,
+        1 if seed.advisor else 0,
     )
 
 
@@ -409,8 +429,8 @@ UPSERT_SQL = """
     INSERT INTO personas (
         id, slug, display_name, default_rank, assignment_pool, assignment_order,
         pane_tint, chip_color, tts_voice, tts_rate, notification_sound,
-        default_session_doc, tts_policy
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        default_session_doc, tts_policy, advisor
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
         slug=excluded.slug,
         display_name=excluded.display_name,
@@ -423,7 +443,8 @@ UPSERT_SQL = """
         tts_rate=excluded.tts_rate,
         notification_sound=excluded.notification_sound,
         default_session_doc=excluded.default_session_doc,
-        tts_policy=excluded.tts_policy
+        tts_policy=excluded.tts_policy,
+        advisor=excluded.advisor
 """
 
 
@@ -439,6 +460,11 @@ _PERSONA_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         "tts_policy",
         "ALTER TABLE personas ADD COLUMN tts_policy TEXT NOT NULL DEFAULT 'silent' "
         "CHECK (tts_policy IN ('silent', 'hot', 'pause'))",
+    ),
+    (
+        "advisor",
+        "ALTER TABLE personas ADD COLUMN advisor INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (advisor IN (0, 1))",
     ),
 )
 
@@ -514,8 +540,11 @@ def _row_to_dict(row) -> dict | None:
             "tts_rate",
             "notification_sound",
             "default_session_doc",
+            "tts_policy",
+            "advisor",
         )
         data = dict(zip(keys, row, strict=False))
+    data["advisor"] = bool(data.get("advisor"))
     data["silent"] = data.get("tts_voice") is None
     return data
 
@@ -536,6 +565,43 @@ async def resolve_persona(db: aiosqlite.Connection, persona_id_or_slug: str) -> 
         "SELECT * FROM personas WHERE id = ? OR slug = ?", (persona_id_or_slug, persona_id_or_slug)
     )
     return _row_to_dict(await cursor.fetchone())
+
+
+async def is_advisor_instance(db: aiosqlite.Connection, instance_id: str | None) -> bool:
+    """Return whether an instance's persona carries the advisor capability.
+
+    Advisor is resolved by joining ``instances.persona_id`` to ``personas.id`` at
+    read time. It is never stamped onto the instance row.
+    """
+    if not instance_id:
+        return False
+    cursor = await db.execute(
+        """
+        SELECT COALESCE(p.advisor, 0)
+        FROM instances i
+        LEFT JOIN personas p ON p.id = i.persona_id
+        WHERE i.id = ?
+        """,
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    return bool(row and row[0])
+
+
+def is_advisor_instance_sync(conn: sqlite3.Connection, instance_id: str | None) -> bool:
+    """Synchronous variant of :func:`is_advisor_instance`."""
+    if not instance_id:
+        return False
+    row = conn.execute(
+        """
+        SELECT COALESCE(p.advisor, 0)
+        FROM instances i
+        LEFT JOIN personas p ON p.id = i.persona_id
+        WHERE i.id = ?
+        """,
+        (instance_id,),
+    ).fetchone()
+    return bool(row and row[0])
 
 
 async def resolve_live_persona_instance(db: aiosqlite.Connection, slug: str) -> dict | None:
@@ -773,6 +839,7 @@ def persona_to_profile(persona: dict) -> dict:
         "pane_tint": persona.get("pane_tint"),
         "tts_voice": wsl_voice,
         "tts_rate": persona.get("tts_rate"),
+        "advisor": bool(persona.get("advisor")),
         "silent": wsl_voice is None,
     }
 
@@ -791,6 +858,7 @@ def seed_profile(seed: PersonaSeed) -> dict:
             "tts_voice": seed.tts_voice,
             "tts_rate": seed.tts_rate,
             "notification_sound": seed.notification_sound,
+            "advisor": seed.advisor,
         }
     )
 

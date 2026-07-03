@@ -1,4 +1,4 @@
-"""Custodes-sender pause-queue bypass.
+"""Advisor sender pause-queue bypass.
 
 Decree (Emperor, 2026-06-25): Custodes-originated TTS bypasses the pause queue
 innately and plays immediately. The bypass is a property of the SENDER
@@ -10,6 +10,11 @@ persona, nothing about the message.
 So `queue_tts(<custodes-instance>, msg, queue_target="pause")` must land the item
 on the HOT queue (immediate playback), while a non-Custodes sender's "pause"
 request is untouched.
+
+Emperor directive (2026-07-03): the capability is generic advisor parity, not a
+Custodes special case. The advisor set is Custodes, Pax, and Malcador; the
+bypass keys on personas.advisor via an instance->persona JOIN and does not
+change each persona's voice/routing.
 """
 
 from __future__ import annotations
@@ -66,6 +71,34 @@ def _insert_voiced_instance(db_path: Path, *, persona_slug: str | None) -> str:
     return iid
 
 
+def _set_persona_voice(
+    db_path: Path,
+    *,
+    persona_slug: str,
+    tts_voice: str = "Microsoft Zira",
+    notification_sound: str = "notify.wav",
+    tts_policy: str | None = None,
+) -> None:
+    """Give a seeded persona a test voice without changing its queue policy."""
+    conn = sqlite3.connect(db_path)
+    if tts_policy is None:
+        conn.execute(
+            "UPDATE personas SET tts_voice = ?, notification_sound = ? WHERE slug = ?",
+            (tts_voice, notification_sound, persona_slug),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE personas
+            SET tts_voice = ?, notification_sound = ?, tts_policy = ?
+            WHERE slug = ?
+            """,
+            (tts_voice, notification_sound, tts_policy, persona_slug),
+        )
+    conn.commit()
+    conn.close()
+
+
 def _quiet_world(tts, monkeypatch):
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
     monkeypatch.setattr(tts, "play_sound", lambda *a, **k: {"success": True})
@@ -83,8 +116,8 @@ def _quiet_world(tts, monkeypatch):
     tts.hot_queue.clear()
 
 
-def test_custodes_sender_bypasses_pause_queue(app_env, monkeypatch) -> None:
-    """A Custodes-persona sender's 'pause' request is forced onto the hot queue."""
+def test_custodes_advisor_sender_bypasses_pause_queue(app_env, monkeypatch) -> None:
+    """A Custodes advisor sender's 'pause' request is forced onto the hot queue."""
     tts = _load_tts()
     _quiet_world(tts, monkeypatch)
     iid = _insert_voiced_instance(app_env.db_path, persona_slug="custodes")
@@ -97,8 +130,52 @@ def test_custodes_sender_bypasses_pause_queue(app_env, monkeypatch) -> None:
     assert len(tts.pause_queue) == 0
 
 
+def test_pax_advisor_sender_bypasses_pause_queue_with_own_voice(app_env, monkeypatch) -> None:
+    """A council:pax sender's pause request is forced hot, preserving Pax voice."""
+    tts = _load_tts()
+    _quiet_world(tts, monkeypatch)
+    # Set Pax to a non-hot speech policy so this proves advisor, not tts_policy,
+    # owns the queue bypass.
+    _set_persona_voice(
+        app_env.db_path,
+        persona_slug="pax",
+        tts_voice="Microsoft Zira",
+        tts_policy="pause",
+    )
+    iid = _insert_voiced_instance(app_env.db_path, persona_slug="pax")
+
+    result = asyncio.run(tts.queue_tts(iid, "civic update now", queue_target="pause"))
+
+    assert result["queued"] is True
+    assert result["queue"] == "hot"
+    assert len(tts.hot_queue) == 1
+    assert len(tts.pause_queue) == 0
+    assert tts.hot_queue[0].voice == "Microsoft Zira"
+
+
+def test_malcador_advisor_sender_bypasses_pause_queue_when_voiced(app_env, monkeypatch) -> None:
+    """Malcador is an advisor too; if given a voice, it bypasses generically."""
+    tts = _load_tts()
+    _quiet_world(tts, monkeypatch)
+    _set_persona_voice(
+        app_env.db_path,
+        persona_slug="malcador",
+        tts_voice="Microsoft David",
+        tts_policy="pause",
+    )
+    iid = _insert_voiced_instance(app_env.db_path, persona_slug="malcador")
+
+    result = asyncio.run(tts.queue_tts(iid, "advisory update now", queue_target="pause"))
+
+    assert result["queued"] is True
+    assert result["queue"] == "hot"
+    assert len(tts.hot_queue) == 1
+    assert len(tts.pause_queue) == 0
+    assert tts.hot_queue[0].voice == "Microsoft David"
+
+
 def test_non_custodes_sender_still_pauses(app_env, monkeypatch) -> None:
-    """A non-Custodes voiced sender's 'pause' request is untouched — still the pause
+    """A normal non-advisor sender's 'pause' request is untouched — still the pause
     queue. Blood Angels carries the ``pause`` policy (respects the caller's target).
     """
     tts = _load_tts()
@@ -113,7 +190,7 @@ def test_non_custodes_sender_still_pauses(app_env, monkeypatch) -> None:
     assert len(tts.hot_queue) == 0
 
 
-def test_bypass_is_sender_keyed_not_message_keyed(app_env, monkeypatch) -> None:
+def test_advisor_bypass_is_sender_keyed_not_message_keyed(app_env, monkeypatch) -> None:
     """The same innocuous message bypasses from Custodes but pauses from a normal
     sender — proving the bypass keys on the SENDER, never the message text."""
     tts = _load_tts()
