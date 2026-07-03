@@ -321,6 +321,23 @@ def test_typing_guard_pending_keys_are_permanently_bound() -> None:
     assert "unbind-key -n C-c" not in conf
 
 
+def test_pending_binding_templates_match_conf_byte_for_byte() -> None:
+    """Deploy-coherence invariant: the daemon's canonical PENDING_BINDINGS templates
+    (what ``reconcile_pending_bindings`` re-sources onto a running server after a
+    deploy) must match the conf lines exactly. If the conf changes but the Python
+    template doesn't, the reconcile would re-source a STALE form — this guard keeps
+    the re-source truthful. Mirrors the same in-sync contract ANY_BINDING carries."""
+    import sys
+
+    sys.path.insert(0, str(ROOT.parent / "tmuxctld" / "lib"))
+    from tmuxctl import typing_guard_state as tg
+
+    for key, text, _is_edit in tg.PENDING_BINDINGS:
+        assert _line_starting(f"bind -n {key} ") == text, (
+            f"{key} binding drifted between tmux-base.conf and PENDING_BINDINGS"
+        )
+
+
 def test_mouse_scroll_status_and_focus_bindings_never_arm_or_pending() -> None:
     for key in (
         "MouseDown1Status",

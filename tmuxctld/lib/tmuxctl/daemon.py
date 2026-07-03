@@ -97,6 +97,17 @@ _PANE_DIED_HOOK = (
 # self-heals within one interval of any clear.
 _HOOK_REASSERT_INTERVAL_SECONDS = 60.0
 
+# The permanent typing-guard PENDING-branch root keys (Enter/C-m/BSpace/C-h/C-c) are
+# bound once at tmux-server start and — unlike ``Any`` — have no focus/rehydrate
+# re-source path, so a deploy that advances the daemon SHA leaves the LIVE key-table
+# on the OLD (flashing) form until an explicit ``source-file``.  This is the CD
+# deploy-coherence gap.  ``typing_guard_state.reconcile_pending_bindings`` closes it
+# by re-sourcing only those keys when the live form drifts; it rides the /health
+# heartbeat on this cadence (idempotent, throttled, non-fatal — same doctrine as the
+# pane-died hook re-assertion) so a running server self-heals within one interval of
+# any deploy WITHOUT a new poller or a destructive restart/kickstart.
+_BINDING_RECONCILE_INTERVAL_SECONDS = 60.0
+
 # The daemon is unauthenticated and does powerful tmux ops — it binds loopback
 # ONLY. serve() refuses any other --host (fail-closed).
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -2975,7 +2986,14 @@ def _h_typing_guard_topology(control, params):
         return typing_guard_state.enable_any_binding(tmux)
     if cmd == "disable":
         return typing_guard_state.disable_any_binding(tmux)
-    raise ValueError("typing guard topology cmd must be rehydrate, enable, or disable")
+    if cmd == "reconcile":
+        # Explicit deploy-coherence re-source of the permanent PENDING-branch keys
+        # (Enter/C-m/BSpace/C-h/C-c). The same repair rides /health automatically;
+        # this route lets a deploy step / operator force it on demand.
+        return typing_guard_state.reconcile_pending_bindings(tmux)
+    raise ValueError(
+        "typing guard topology cmd must be rehydrate, enable, disable, or reconcile"
+    )
 
 
 def _h_client_lease(control, params):
@@ -3686,6 +3704,12 @@ class TmuxctldServer(ThreadingHTTPServer):
         # 0.0 deadline forces the re-install on the first health check after boot.
         self._hook_reassert_lock = threading.Lock()
         self._hook_reassert_deadline = 0.0
+        # Throttle state for the /health-driven guard-binding deploy-coherence
+        # reconcile (see _BINDING_RECONCILE_INTERVAL_SECONDS). A 0.0 deadline forces
+        # the reconcile on the first health check after boot — so a daemon bounced by
+        # a deploy re-sources the live key-table on its very first heartbeat.
+        self._binding_reconcile_lock = threading.Lock()
+        self._binding_reconcile_deadline = 0.0
 
     def maybe_reassert_lifecycle_hooks(self) -> bool:
         """Re-install the tmux lifecycle hooks if the throttle interval has elapsed.
@@ -3704,6 +3728,31 @@ class TmuxctldServer(ThreadingHTTPServer):
             ensure_tmux_lifecycle_hooks()
         except Exception:  # never let a hook re-install break the health contract
             log.exception("tmux lifecycle hook re-assertion failed")
+        return True
+
+    def maybe_reconcile_guard_bindings(self) -> bool:
+        """Re-source the permanent guard PENDING-branch keys if the live table drifted.
+
+        The deploy-coherence backstop: after a deploy advances the daemon SHA, the
+        permanently-bound Enter/C-m/BSpace/C-h/C-c keys keep their OLD form until an
+        explicit source-file (they never focus-toggle like ``Any``). Riding the
+        /health heartbeat re-sources them onto the running tmux server within one
+        throttle interval — no new poller, no restart/kickstart.
+        ``reconcile_pending_bindings`` is idempotent (no-op when canonical) and
+        fail-open (no-op when tmux is unreachable); any failure is swallowed so
+        /health never breaks. Returns True when the reconcile ran this call.
+        """
+        now = time.monotonic()
+        with self._binding_reconcile_lock:
+            if now < self._binding_reconcile_deadline:
+                return False
+            self._binding_reconcile_deadline = now + _BINDING_RECONCILE_INTERVAL_SECONDS
+        try:
+            typing_guard_state.reconcile_pending_bindings(
+                typing_guard_state.Tmux(typing_guard_state.tmux_binary())
+            )
+        except Exception:  # never let a binding reconcile break the health contract
+            log.exception("typing-guard binding reconcile failed")
         return True
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
@@ -3784,6 +3833,10 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             # Durably keep the global pane-died hook installed by riding this
             # heartbeat (throttled; idempotent) — no dedicated reconcile poller.
             self.server.maybe_reassert_lifecycle_hooks()
+            # Close the CD deploy-coherence gap the same way: re-source the permanent
+            # guard PENDING-branch keys onto the running server if they drifted from
+            # canonical after a deploy (throttled; idempotent; fail-open).
+            self.server.maybe_reconcile_guard_bindings()
             self._write(200, self._health_payload())
             return
 
