@@ -119,11 +119,17 @@ def persona_spec(label: str) -> PersonaSpec:
             working_dir=_persona_working_dir(),
         )
     if label == "mechanicus:fabricator-general":
+        # The personal FG orchestrator runs codex by default (Emperor ruling
+        # 2026-07-02: codex auto-compacts better; a claude FG overran the 250k hook
+        # to ~300k). FG-scoped ONLY — set here, not on the PersonaSpec.engine default
+        # (assertions.py:60), so no other singleton flips. The civic Orchestrator
+        # redub (mechanicus:orchestrator) is deliberately left on claude.
         return PersonaSpec(
             label,
             "fabricator-general",
             "hook_driven",
             str(_vault_root() / "Mars" / "Sessions" / "fabricator-general.md"),
+            engine="codex",
             working_dir=_persona_working_dir(),
         )
     if label == "council:administratum":
