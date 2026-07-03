@@ -57,17 +57,30 @@ spec so the rollout lands consistently.
 - `cli-tools/lib/imperium_config.py`: matching `_REGISTRY` entries.
 - NAS mount path on the boxes: expected `/mnt/imperium` (Linux convention, same as WSL) —
   confirm at provisioning.
-- Token-API: boxes initially point at the Mac-hosted instance via config (never a hardcoded
-  IP); whether a box later hosts its own Token-API is a migration-spec decision, not
-  assumed here.
+- Token-API: boxes point at the Mac-hosted instance via config (never a hardcoded IP)
+  during provisioning. **Long-term home is the personal K12** — Token-API and its coupled
+  systems (enforcement, TTS routing, timers) move together; they are Token-API systems,
+  not mac systems.
+
+### Mac Mini End-State (DECIDED 2026-07-03: full retirement, clean jump)
+
+The mini is not demoted to a specialist role — it retires outright at the end of the
+migration: **off power, non-volatile state preserved intact as the emergency-backpedal
+option**, repurposed (gift or future experiment box) only after a defined backpedal window
+closes. Its macOS-bound surfaces (GUI-manip daemon, computer-use, desktop observation,
+`say` as TTS fallback of last resort) must be retired or rehomed as migration work — do
+not build anything new against them. TTS note: the routing chain is
+`discord → wsl → phone → mac-say-last-resort`; the mac leg gets deleted, so the `else`
+fallback needs a new terminal before power-off.
 
 ### Open Decisions (resolve in the migration spec before provisioning)
 
 - Machine role names for the two boxes (config keys, SSH aliases, tmux page names).
 - Distro choice and provisioning order.
-- Domain-cutover sequence for peeling work/personal off the mac mini, and the mac mini's
-  end-state role.
+- Domain-cutover sequencing details for peeling work/personal off the mac mini (end-state
+  itself is decided — see above).
 - Whether the second 2.5G NIC gets a dedicated use (KVM link, box-to-box, LAN vs tailnet split).
+- Disposition inventory for the macOS-bound surfaces and the new TTS `else` terminal.
 
 ## Shared Roots
 
