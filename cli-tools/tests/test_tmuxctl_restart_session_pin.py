@@ -199,7 +199,7 @@ def test_persistent_panes_seat_personas_via_daemon_reconcile():
     assert captured["timeout"] == 20
     assert json.loads(str(captured["body"])) == {"session": "main"}
     # Reservists stay in-process (the daemon has no reservist launcher yet).
-    assert {target for target, _ in reservists} == {"reservists:civic", "reservists:slot"}
+    assert {target for target, _ in reservists} == {"reservists:civic", "reservists:token-os"}
     assert all(session == "main" for _, session in reservists)
 
 

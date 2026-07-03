@@ -543,7 +543,7 @@ done
             ),
             (
                 "Token-OS reservist",
-                "reservists:slot",
+                "reservists:token-os",
                 self._token_os_dir(),
                 "Stand by as the Token-OS reservist runtime. Do not start new work. "
                 "Wait for operator or orchestration instructions.",
