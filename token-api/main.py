@@ -11168,6 +11168,123 @@ def _is_live_instance_status(status: str | None) -> bool:
     return (status or "").lower() not in {"", "stopped", "archived"}
 
 
+def _cascade_teardown_request(
+    *,
+    path: str | None,
+    branch: str,
+    matching_instances: list[dict],
+) -> dict:
+    """Build the tmuxctld teardown request for a victory-cascade worktree."""
+
+    request: dict = {"worktree": path, "branch": branch, "delete_remote": True}
+    # Preserve token-api as merge-proof authority while tmuxctld stays executor:
+    # pass the best linked instance identity/state into the daemon route.  Merged
+    # wins (remote deletion can be gated safe); otherwise pass open/closed when
+    # known so the daemon's universal gate preserves rather than guessing.
+    chosen = None
+    for state in ("merged", "open", "closed"):
+        chosen = next(
+            (inst for inst in matching_instances if (inst.get("pr_state") or "") == state),
+            None,
+        )
+        if chosen:
+            break
+    if not chosen and matching_instances:
+        chosen = matching_instances[0]
+    if chosen:
+        if chosen.get("id"):
+            request["instance_id"] = chosen["id"]
+        if chosen.get("pr_state"):
+            request["pr_state"] = chosen["pr_state"]
+    return request
+
+
+def _cascade_peripherals(
+    *,
+    path: str | None,
+    branch: str,
+    doc_path: Path | None,
+) -> list[dict]:
+    """Peripheral cleanup steps gated on tmuxctld result.status == removed."""
+
+    port_script = SCRIPTS_DIR / "cli-tools" / "lib" / "worktree-ports.sh"
+    return [
+        {"name": "ghost-kill", "kind": "internal", "path": path},
+        {
+            "name": "port-free",
+            "kind": "command",
+            "path": path,
+            "command": [
+                "bash",
+                "-lc",
+                (
+                    'source "$1"; '
+                    'stop_port_process "$2" >/dev/null 2>&1 || true; '
+                    'free_port "$2" >/dev/null 2>&1 || true; '
+                    "prune_ports >/dev/null 2>&1 || true"
+                ),
+                "victory-cascade-port-free",
+                str(port_script),
+                str(path or ""),
+            ],
+        },
+        {
+            "name": "session-doc-archive",
+            "kind": "session_doc_worktree_archive",
+            "doc_path": str(doc_path) if doc_path else None,
+            "path": path,
+        },
+        {"name": "cd-alias-drop", "kind": "cd_alias", "branch": branch},
+    ]
+
+
+def _remove_cd_quick_alias(branch: str | None) -> bool:
+    """Remove one literal cd quick alias. Returns True when a line was removed."""
+
+    if not branch:
+        return False
+    aliases = Path.home() / ".cd_quick_aliases"
+    if not aliases.exists():
+        return False
+    prefix = f"{branch}="
+    try:
+        lines = aliases.read_text(encoding="utf-8").splitlines(keepends=True)
+        kept = [line for line in lines if not line.startswith(prefix)]
+        if len(kept) == len(lines):
+            return False
+        aliases.write_text("".join(kept), encoding="utf-8")
+        return True
+    except Exception:
+        logger.warning("victory-cascade: failed to remove cd alias for %s", branch, exc_info=True)
+        return False
+
+
+def _kill_ghost_claude_for_worktree(path: str | None) -> list[int]:
+    """Best-effort ghost cleanup for a worktree path after daemon removal."""
+
+    if not path:
+        return []
+    target = str(Path(path).expanduser()).rstrip("/")
+    killed: list[int] = []
+    proc_root = Path("/proc")
+    if proc_root.exists():
+        for entry in proc_root.glob("[0-9]*"):
+            try:
+                pid = int(entry.name)
+                comm = (entry / "comm").read_text(encoding="utf-8").strip()
+                if comm != "claude":
+                    continue
+                cwd = os.readlink(entry / "cwd").removesuffix(" (deleted)").rstrip("/")
+                if cwd != target:
+                    continue
+                os.kill(pid, signal.SIGINT)
+                killed.append(pid)
+            except Exception:
+                continue
+        return killed
+    return killed
+
+
 async def _build_victory_cascade_plan(
     *,
     doc_id: int,
@@ -11215,49 +11332,27 @@ async def _build_victory_cascade_plan(
         matching_instances = [
             inst for inst in linked_instances if _same_worktree_path(inst.get("working_dir"), path)
         ]
-        open_pr_instances = [inst for inst in matching_instances if inst.get("pr_state") == "open"]
-        if open_pr_instances:
-            msg = f"linked instance has open PR; skipping branch {branch}: " + ", ".join(
-                inst["id"] for inst in open_pr_instances
-            )
-            warnings.append(msg)
-            skipped.append(
-                {
-                    "reason": "open_pr",
-                    "worktree": wt,
-                    "instances": open_pr_instances,
-                    "warning": msg,
-                }
-            )
-            continue
-
-        # worktree-delete targets ghost Claude processes by CWD; never let cascade
-        # delete the worktree currently hosting this API/operator session.
+        # Never let cascade request deletion of the worktree currently hosting
+        # this API/operator session.  Other merge/dirty/open-PR decisions belong
+        # to tmuxctld's universal gate; cascade only requests teardown.
         if _same_worktree_path(path, server_cwd):
             skipped.append({"reason": "self_guard", "worktree": wt, "server_cwd": server_cwd})
             continue
 
+        teardown_request = _cascade_teardown_request(
+            path=path, branch=branch, matching_instances=matching_instances
+        )
         action = {
             "path": path,
             "branch": branch,
             "port": port,
             "status": wt.get("status"),
             "instances": matching_instances,
+            "daemon_route": "/worktree/teardown",
+            "daemon_request": teardown_request,
             "commands": [],
+            "peripherals": _cascade_peripherals(path=path, branch=branch, doc_path=doc_path),
         }
-        if path:
-            action["commands"].append(
-                [str(SCRIPTS_DIR / "cli-tools" / "bin" / "dev-server-stop"), str(path)]
-            )
-        action["commands"].append(
-            [
-                str(SCRIPTS_DIR / "cli-tools" / "bin" / "worktree-delete"),
-                str(branch),
-                "-b",
-                "-f",
-                "--delete-remote",
-            ]
-        )
         actions.append(action)
 
     return {
@@ -11274,10 +11369,112 @@ async def _build_victory_cascade_plan(
 
 
 async def _execute_victory_cascade_plan(plan: dict) -> list[dict]:
-    """Run the cleanup commands in the exact plan order."""
+    """Request tmuxctld teardown, then run peripherals only on removal."""
     executed: list[dict] = []
     for action in plan.get("actions", []):
-        for command in action.get("commands", []):
+        route = action.get("daemon_route") or "/worktree/teardown"
+        request = action.get("daemon_request") or {
+            "worktree": action.get("path"),
+            "branch": action.get("branch"),
+            "delete_remote": True,
+        }
+        daemon_payload = await asyncio.to_thread(
+            shared._tmuxctld_post_json,
+            route,
+            request,
+            timeout=120,
+            default_loopback=_tmuxctld_default_loopback(),
+        )
+        teardown_result = (
+            daemon_payload.get("result")
+            if isinstance(daemon_payload, dict) and isinstance(daemon_payload.get("result"), dict)
+            else {}
+        )
+        teardown_record = {
+            "type": "daemon_teardown",
+            "route": route,
+            "request": request,
+            "returncode": 0 if isinstance(daemon_payload, dict) and daemon_payload.get("ok") else 1,
+            "daemon_payload": daemon_payload,
+            "result": teardown_result,
+            "branch": action.get("branch"),
+            "path": action.get("path"),
+            "port": action.get("port"),
+        }
+        executed.append(teardown_record)
+        if not isinstance(daemon_payload, dict) or not daemon_payload.get("ok"):
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "cascade_teardown_failed",
+                    "failed": teardown_record,
+                    "executed": executed,
+                },
+            )
+        if teardown_result.get("status") != "removed":
+            # Preserve is a successful fail-closed outcome.  No port/doc/alias
+            # side effects are allowed unless the daemon actually removed.
+            continue
+
+        for peripheral in action.get("peripherals", []):
+            kind = peripheral.get("kind")
+            if kind == "internal" and peripheral.get("name") == "ghost-kill":
+                killed = await asyncio.to_thread(
+                    _kill_ghost_claude_for_worktree, peripheral.get("path")
+                )
+                executed.append(
+                    {
+                        "type": "peripheral",
+                        "name": peripheral.get("name"),
+                        "returncode": 0,
+                        "killed": killed,
+                        "branch": action.get("branch"),
+                        "path": action.get("path"),
+                        "port": action.get("port"),
+                    }
+                )
+                continue
+            if kind == "session_doc_worktree_archive":
+                doc_path_raw = peripheral.get("doc_path")
+                archived = False
+                if doc_path_raw and peripheral.get("path"):
+                    async with _worktree_registry_lock:
+                        await asyncio.to_thread(
+                            update_session_doc_worktrees,
+                            Path(doc_path_raw),
+                            action="archive",
+                            path=peripheral.get("path"),
+                        )
+                    archived = True
+                executed.append(
+                    {
+                        "type": "peripheral",
+                        "name": peripheral.get("name"),
+                        "returncode": 0,
+                        "archived": archived,
+                        "branch": action.get("branch"),
+                        "path": action.get("path"),
+                        "port": action.get("port"),
+                    }
+                )
+                continue
+            if kind == "cd_alias":
+                removed = await asyncio.to_thread(_remove_cd_quick_alias, peripheral.get("branch"))
+                executed.append(
+                    {
+                        "type": "peripheral",
+                        "name": peripheral.get("name"),
+                        "returncode": 0,
+                        "removed": removed,
+                        "branch": action.get("branch"),
+                        "path": action.get("path"),
+                        "port": action.get("port"),
+                    }
+                )
+                continue
+            command = peripheral.get("command")
+            if not command:
+                continue
             try:
                 proc = await _run_subprocess_offloop(
                     command,
@@ -11288,6 +11485,8 @@ async def _execute_victory_cascade_plan(plan: dict) -> list[dict]:
                 )
             except subprocess.TimeoutExpired as exc:
                 record = {
+                    "type": "peripheral",
+                    "name": peripheral.get("name"),
                     "command": command,
                     "returncode": None,
                     "stdout": exc.stdout,
@@ -11301,12 +11500,14 @@ async def _execute_victory_cascade_plan(plan: dict) -> list[dict]:
                 raise HTTPException(
                     status_code=500,
                     detail={
-                        "error": "cascade_cleanup_failed",
+                        "error": "cascade_peripheral_failed",
                         "failed": record,
                         "executed": executed,
                     },
                 ) from exc
             record = {
+                "type": "peripheral",
+                "name": peripheral.get("name"),
                 "command": command,
                 "returncode": proc.returncode,
                 "stdout": proc.stdout,
@@ -11320,7 +11521,7 @@ async def _execute_victory_cascade_plan(plan: dict) -> list[dict]:
                 raise HTTPException(
                     status_code=500,
                     detail={
-                        "error": "cascade_cleanup_failed",
+                        "error": "cascade_peripheral_failed",
                         "failed": record,
                         "executed": executed,
                     },
