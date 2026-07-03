@@ -21,8 +21,10 @@ so nothing touches the real NAS, ~/.config, or live worktrees.
 import json
 import os
 import subprocess
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -73,6 +75,8 @@ def project(tmp_path: Path) -> Project:
             "GIT_COMMITTER_EMAIL": "t@t",
             # Force the portable lock path so macOS behavior is what CI proves.
             "WORKTREE_PORTS_NO_FLOCK": "1",
+            "TOKEN_API_URL": "disabled",
+            "TMUXCTLD_URL": "disabled",
         }
     )
 
@@ -126,6 +130,82 @@ def _registry(project: Project) -> dict[str, int]:
     return json.loads(reg.read_text(encoding="utf-8"))
 
 
+def _lease_dirs(project: Project) -> set[str]:
+    lease_dir = project.home / ".local" / "state" / "imperium" / "worktree-port-leases"
+    dirs: set[str] = set()
+    for lease in lease_dir.glob("*.lease"):
+        values: dict[str, str] = {}
+        for line in lease.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value.strip().strip("'\"")
+        if values.get("dir"):
+            dirs.add(values["dir"])
+    return dirs
+
+
+class _FakeTeardownDaemon:
+    def __init__(
+        self, *, instance_by_branch: dict[str, dict] | None = None, result: dict | None = None
+    ):
+        self.instance_by_branch = instance_by_branch or {}
+        self.static_result = result
+        self.requests: list[dict] = []
+        self.server: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.url = ""
+
+    def __enter__(self):
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                outer.requests.append(body)
+                if self.path != "/worktree/teardown":
+                    payload = {"ok": False, "error": {"message": "bad path"}}
+                elif outer.static_result is not None:
+                    payload = {"ok": True, "result": dict(outer.static_result)}
+                else:
+                    from tmuxctl.worktree_lifecycle import teardown_worktree
+
+                    branch = body.get("branch") or Path(
+                        str(body.get("worktree"))
+                    ).name.removeprefix("wt-")
+                    instance = outer.instance_by_branch.get(branch, {})
+                    payload = {
+                        "ok": True,
+                        "result": teardown_worktree(
+                            body.get("worktree"),
+                            instance=instance,
+                            delete_remote=bool(body.get("delete_remote", True)),
+                        ),
+                    }
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *_args):
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        assert self.server is not None
+        self.server.shutdown()
+        self.server.server_close()
+        if self.thread:
+            self.thread.join(timeout=5)
+
+
 # ── delete: the P0 silent mid-teardown abort ─────────────────────────────────
 
 
@@ -139,7 +219,7 @@ def test_delete_completes_without_session_doc_id(project: Project) -> None:
     assert env_file.exists()
     assert "SESSION_DOC_ID" not in env_file.read_text(encoding="utf-8")
 
-    res = project.delete("alpha", "-b")
+    res = project.delete("alpha", "-b", "--force")
     assert res.returncode == 0, res.stderr
     assert not wt.exists(), "worktree dir must be removed"
     assert (
@@ -268,11 +348,20 @@ def test_delete_branch_refuses_unmerged_without_force(project: Project) -> None:
     _git("add", "-A", cwd=wt, env=project.env)
     _git("commit", "-m", "unmerged", cwd=wt, env=project.env)
 
-    refused = project.delete("risky", "-b")
-    assert refused.returncode == 65
-    assert "not merged" in refused.stderr
-    # Branch must survive the refusal.
+    with _FakeTeardownDaemon(
+        result={"status": "preserved", "reason": "branch_not_merged", "worktree": str(wt)}
+    ) as daemon:
+        project.env["TMUXCTLD_URL"] = daemon.url
+        refused = project.delete("risky", "-b")
+
+    assert refused.returncode == 0
+    assert daemon.requests == [{"worktree": str(wt), "branch": "risky", "delete_remote": True}]
+    assert "preserved worktree" in refused.stderr
+    # Worktree/branch/peripherals must survive the daemon gate refusal.
+    assert wt.exists()
     assert _git("--git-dir", str(project.bare), "branch", "--list", "risky", env=project.env) != ""
+    aliases = (project.home / ".cd_quick_aliases").read_text(encoding="utf-8")
+    assert "risky=" in aliases, "cd alias must be kept on preserve"
 
     forced = project.delete("risky", "-b", "--force")
     assert forced.returncode == 0, forced.stderr
@@ -286,11 +375,61 @@ def test_delete_remote_branch(project: Project) -> None:
     _git("--git-dir", str(project.bare), "push", "origin", "remote-gone", env=project.env)
     assert _git("branch", "--list", "remote-gone", cwd=project.src, env=project.env) != ""
 
-    done = project.delete("remote-gone", "-b", "--delete-remote")
+    done = project.delete("remote-gone", "-b", "--delete-remote", "--force")
     assert done.returncode == 0, done.stderr
     assert _git("branch", "--list", "remote-gone", cwd=project.src, env=project.env) == "", (
         "remote branch must be deleted on origin"
     )
+
+
+def test_default_delete_routes_through_daemon_and_removes_merged(project: Project) -> None:
+    res = project.setup("route-cli-merged")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-route-cli-merged"
+    _git("--git-dir", str(project.bare), "push", "origin", "route-cli-merged", env=project.env)
+    assert _git("branch", "--list", "route-cli-merged", cwd=project.src, env=project.env) != ""
+
+    with _FakeTeardownDaemon(
+        instance_by_branch={
+            "route-cli-merged": {
+                "id": "inst-cli-merged",
+                "pr_state": "merged",
+                "working_dir": str(wt),
+            }
+        }
+    ) as daemon:
+        project.env["TMUXCTLD_URL"] = daemon.url
+        done = project.delete("route-cli-merged")
+
+    assert done.returncode == 0, done.stderr
+    assert daemon.requests == [
+        {"worktree": str(wt), "branch": "route-cli-merged", "delete_remote": True}
+    ]
+    assert not wt.exists(), "daemon route removed the worktree"
+    assert (
+        _git(
+            "--git-dir", str(project.bare), "branch", "--list", "route-cli-merged", env=project.env
+        )
+        == ""
+    )
+    assert _git("branch", "--list", "route-cli-merged", cwd=project.src, env=project.env) == ""
+    assert str(wt) not in _registry(project), "post-remove peripheral freed the port"
+
+
+def test_default_delete_daemon_down_fails_closed_no_local_fallback(project: Project) -> None:
+    res = project.setup("route-down")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-route-down"
+    project.env["TMUXCTLD_URL"] = "http://127.0.0.1:9"
+
+    failed = project.delete("route-down")
+
+    assert failed.returncode == 70
+    assert "no local fallback" in failed.stderr
+    assert wt.exists(), "daemon-down default path must preserve the worktree"
+    assert _git("--git-dir", str(project.bare), "branch", "--list", "route-down", env=project.env)
+    aliases = (project.home / ".cd_quick_aliases").read_text(encoding="utf-8")
+    assert "route-down=" in aliases, "peripherals must not fire on route error"
 
 
 # ── ports: macOS-path locking + stale-entry pruning ──────────────────────────
@@ -316,13 +455,13 @@ def test_delete_prunes_stale_port_entries(project: Project) -> None:
     import shutil
 
     shutil.rmtree(ghost_dir)
-    assert str(ghost_dir) in _registry(project)
+    assert str(ghost_dir) in _lease_dirs(project)
 
-    res = project.delete("stays", "-b")
+    res = project.delete("stays", "-b", "--force")
     assert res.returncode == 0, res.stderr
-    reg = _registry(project)
-    assert str(ghost_dir) not in reg, "stale entry must be pruned"
-    assert str(project.parent / "wt-stays") not in reg
+    leases = _lease_dirs(project)
+    assert str(ghost_dir) not in leases, "stale lease must be pruned"
+    assert str(project.parent / "wt-stays") not in leases
 
 
 # ── edge cases proven during the 2026-06-10 backlog sweep ────────────────────
@@ -337,7 +476,7 @@ def test_slash_branch_full_lifecycle(project: Project) -> None:
     aliases_file = project.home / ".cd_quick_aliases"
     assert "feat/slashy=" in aliases_file.read_text(encoding="utf-8")
 
-    done = project.delete("feat/slashy", "-b")
+    done = project.delete("feat/slashy", "-b", "--force")
     assert done.returncode == 0, done.stderr
     assert "feat/slashy=" not in aliases_file.read_text(encoding="utf-8")
     assert "sed:" not in done.stderr, "no sed errors on slash branches"
@@ -360,7 +499,7 @@ def test_delete_resolves_renamed_worktree_dir(project: Project) -> None:
         env=project.env,
     )
 
-    done = project.delete("real-branch", "-b")
+    done = project.delete("real-branch", "-b", "--force")
     assert done.returncode == 0, done.stderr
     assert not custom_dir.exists(), "the registered (renamed) dir must be removed"
     assert (
@@ -384,7 +523,7 @@ def test_delete_handles_orphaned_dir(project: Project) -> None:
     _git("--git-dir", str(project.bare), "worktree", "prune", env=project.env)
     shutil.move(str(stash), str(wt))
 
-    done = project.delete("orphan", "-b")
+    done = project.delete("orphan", "-b", "--force")
     assert done.returncode == 0, done.stderr
     assert not wt.exists(), "orphaned dir must be removed"
     assert _git("--git-dir", str(project.bare), "branch", "--list", "orphan", env=project.env) == ""
