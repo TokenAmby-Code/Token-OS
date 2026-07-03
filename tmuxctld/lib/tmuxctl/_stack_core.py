@@ -44,6 +44,9 @@ class StackPageSpec:
     worker_type: str = "stack-worker"
     orchestrator_ratio: int = STACK_ORCHESTRATOR_RATIO
     secondary_personas: tuple[PersonaPaneSpec, ...] = ()
+    layout_mode: str = "main-vertical"
+    pinned_roles: tuple[PersonaPaneSpec, ...] = ()
+    pinned_row_ratio: int = 45
 
 
 # Mechanicus is the single shared flat worker stack (the per-fleet legion and civic stacks retired).
@@ -56,6 +59,17 @@ STACK_PAGE_SPECS: dict[str, StackPageSpec] = {
         orchestrator_type="mechanicus",
         worker_role="mechanicus:worker",
         secondary_personas=(PersonaPaneSpec(MECHANICUS_ORCHESTRATOR_ROLE, "mechanicus"),),
+    ),
+    "reservists": StackPageSpec(
+        base="reservists",
+        orchestrator_role="",
+        orchestrator_type="",
+        worker_role="reservists:worker",
+        layout_mode="pinned-top-row",
+        pinned_roles=(
+            PersonaPaneSpec("reservists:civic", "reservists"),
+            PersonaPaneSpec("reservists:token-os", "reservists"),
+        ),
     ),
 }
 
@@ -216,6 +230,14 @@ def _tag_persona(adapter: TmuxAdapter, pane: str, persona: PersonaPaneSpec) -> N
     _set_pane_option(adapter, pane, "@GRID_STATE", "small")
 
 
+def _tag_pinned_role(adapter: TmuxAdapter, pane: str, persona: PersonaPaneSpec) -> None:
+    _tag_persona(adapter, pane, persona)
+    if persona.role == "reservists:civic":
+        _set_pane_option(adapter, pane, "@CIVIC_RESERVIST", "1")
+    elif persona.role == "reservists:token-os":
+        _set_pane_option(adapter, pane, "@TOKEN_OS_RESERVIST", "1")
+
+
 def _log_retag(pane: str, old_role: str, new_role: str, reason: str) -> None:
     if old_role == new_role:
         return
@@ -232,10 +254,15 @@ def _is_secondary_persona_role(role: str, spec: StackPageSpec) -> bool:
     return any(persona.role == role for persona in spec.secondary_personas)
 
 
+def _is_pinned_role(role: str, spec: StackPageSpec) -> bool:
+    return any(persona.role == role for persona in spec.pinned_roles)
+
+
 def _is_protected_persona_role(role: str, spec: StackPageSpec) -> bool:
     return bool(role) and (
         role == spec.orchestrator_role
         or _is_secondary_persona_role(role, spec)
+        or _is_pinned_role(role, spec)
         or is_persona_singleton_label(role)
     )
 
@@ -382,6 +409,193 @@ def _clear_pending(adapter: TmuxAdapter, pane: str) -> None:
     adapter.run("set-option", "-pu", "-t", pane, "@STACK_PENDING", allow_failure=True)
 
 
+def _pinned_panes_by_role(panes: list[StackPane], spec: StackPageSpec) -> dict[str, StackPane]:
+    return {pane.role: pane for pane in panes if _is_pinned_role(pane.role, spec)}
+
+
+def _ensure_pinned_role_panes(
+    adapter: TmuxAdapter,
+    target: str,
+    panes: list[StackPane],
+    spec: StackPageSpec,
+) -> list[StackPane]:
+    """Ensure spec-pinned panes exist, mirroring the reservists builder tags."""
+    if not spec.pinned_roles:
+        return panes
+    existing = _pinned_panes_by_role(panes, spec)
+    target_pane = next((pane.pane_id for pane in existing.values()), panes[0].pane_id)
+    for persona in spec.pinned_roles:
+        pane = existing.get(persona.role)
+        if pane is not None:
+            _tag_pinned_role(adapter, pane.pane_id, persona)
+            target_pane = pane.pane_id
+            continue
+        if not existing and target_pane:
+            logger.info(
+                "stack pane identity retag pane=%s old_role=%s new_role=%s reason=pinned_adopt_first",
+                target_pane,
+                panes[0].role or "(empty)",
+                persona.role,
+            )
+            _tag_pinned_role(adapter, target_pane, persona)
+            panes = _stack_panes(adapter, target)
+            existing = _pinned_panes_by_role(panes, spec)
+            continue
+        split_args = ["split-window", "-h"]
+        if persona == spec.pinned_roles[0] and existing:
+            # If the left civic seat is the missing one, create it before the
+            # surviving row sibling instead of to its right.
+            split_args.append("-b")
+        split_args.extend(
+            ["-t", target_pane, "-d", "-P", "-F", "#{pane_id}", "-l", "50%"]
+        )
+        created = adapter.run(*split_args, allow_failure=True).strip()
+        if not created:
+            continue
+        logger.info(
+            "stack pane identity retag pane=%s old_role=(empty) new_role=%s reason=pinned_birth",
+            created,
+            persona.role,
+        )
+        _tag_pinned_role(adapter, created, persona)
+        target_pane = created
+        panes = _stack_panes(adapter, target)
+        existing = _pinned_panes_by_role(panes, spec)
+    return _stack_panes(adapter, target)
+
+
+def _pinned_workers(panes: list[StackPane], spec: StackPageSpec) -> list[StackPane]:
+    workers = [pane for pane in panes if not _is_protected_persona_role(pane.role, spec)]
+    workers.sort(key=lambda pane: (pane.top, pane.left, pane.pane_id))
+    return workers
+
+
+def _enforce_pinned_top_row_layout(
+    adapter: TmuxAdapter,
+    target: str,
+    spec: StackPageSpec,
+    panes: list[StackPane],
+    *,
+    focused_pane: str = "",
+    focus: bool = False,
+    admit: bool = False,
+    kill_pending_clear: bool = False,
+) -> str:
+    panes = _ensure_pinned_role_panes(adapter, target, panes, spec)
+    pinned = _pinned_panes_by_role(panes, spec)
+    missing = [persona.role for persona in spec.pinned_roles if persona.role not in pinned]
+    if missing:
+        raise ValueError(f"{spec.base} window missing pinned pane(s): {', '.join(missing)}")
+
+    for persona in spec.pinned_roles:
+        _tag_pinned_role(adapter, pinned[persona.role].pane_id, persona)
+
+    workers = _pinned_workers(panes, spec)
+    for ordinal, worker in enumerate(workers, start=1):
+        desired_role = _worker_role(spec, ordinal)
+        if worker.role != desired_role:
+            _tag_worker(
+                adapter,
+                worker.pane_id,
+                spec,
+                ordinal,
+                old_role=worker.role,
+                reason="pinned_worker_identity",
+            )
+            worker = StackPane(
+                worker.pane_id,
+                desired_role,
+                spec.worker_type,
+                worker.active,
+                worker.left,
+                worker.top,
+                worker.width,
+                worker.height,
+                worker.command,
+                worker.pending,
+            )
+        elif worker.pane_type != spec.worker_type:
+            _refresh_worker_metadata(adapter, worker.pane_id, spec)
+        if admit and worker.clear:
+            _set_pane_option(adapter, worker.pane_id, "@STACK_PENDING", "true")
+            worker = StackPane(
+                worker.pane_id,
+                worker.role,
+                spec.worker_type,
+                worker.active,
+                worker.left,
+                worker.top,
+                worker.width,
+                worker.height,
+                worker.command,
+                True,
+            )
+        if worker.clear and not (worker.pending and not kill_pending_clear):
+            try:
+                from .assertions import assert_instance
+
+                assert_instance(adapter, worker.pane_id, prune=True)
+            except Exception:
+                adapter.run("kill-pane", "-t", worker.pane_id, allow_failure=True)
+        elif not worker.clear and worker.pending:
+            _clear_pending(adapter, worker.pane_id)
+
+    panes = _stack_panes(adapter, target)
+    pinned = _pinned_panes_by_role(panes, spec)
+    workers = _pinned_workers(panes, spec)
+    first_pinned = pinned[spec.pinned_roles[0].role]
+    second_pinned = pinned[spec.pinned_roles[1].role] if len(spec.pinned_roles) > 1 else None
+    win_w = int(_show(adapter, target, "#{window_width}") or "0")
+    win_h = int(_show(adapter, target, "#{window_height}") or "0")
+    band_h = max(STACK_COLLAPSED_HEIGHT + 1, (win_h * spec.pinned_row_ratio) // 100)
+    left_w = max(1, win_w // 2) if win_w else 1
+
+    worker_ids = {pane.pane_id for pane in workers}
+    _set_window_option(adapter, target, STACK_FOCUS_GUARD_OPTION, "true")
+    try:
+        adapter.run(
+            "resize-pane", "-t", first_pinned.pane_id, "-x", str(left_w), allow_failure=True
+        )
+        adapter.run(
+            "resize-pane", "-t", first_pinned.pane_id, "-y", str(band_h), allow_failure=True
+        )
+        if second_pinned is not None:
+            adapter.run(
+                "resize-pane",
+                "-t",
+                second_pinned.pane_id,
+                "-y",
+                str(band_h),
+                allow_failure=True,
+            )
+        for worker in workers:
+            if worker.left != 0 or worker.width != win_w or worker.top < band_h:
+                adapter.run(
+                    "join-pane",
+                    "-v",
+                    "-f",
+                    "-d",
+                    "-s",
+                    worker.pane_id,
+                    "-t",
+                    first_pinned.pane_id,
+                    allow_failure=True,
+                )
+            adapter.run(
+                "resize-pane", "-t", worker.pane_id, "-x", str(win_w), allow_failure=True
+            )
+        if focus and focused_pane in worker_ids:
+            _set_window_option(adapter, target, STACK_FOCUSED_PANE_OPTION, focused_pane)
+    finally:
+        _set_window_option(adapter, target, STACK_FOCUS_GUARD_OPTION, "false")
+
+    if focus and focused_pane in worker_ids:
+        return f"focused pinned stack {focused_pane} in {target}"
+    if not workers:
+        return f"normalized pinned stack layout {target}: pinned only"
+    return f"normalized pinned stack layout {target}"
+
+
 def focus_selected(adapter: TmuxAdapter, pane: str) -> str:
     """Make the selected worker the only expanded right-side pane in its stack.
 
@@ -483,6 +697,18 @@ def _enforce_stack_layout_impl(
         return f"noop stack layout {target}: window zoomed"
     if _stack_window_option(adapter, target, PANE_SELECT_ZOOM_RESTORE_PENDING_OPTION) == "true":
         return f"noop stack layout {target}: pane-select zoom restore pending"
+
+    if spec.layout_mode == "pinned-top-row":
+        return _enforce_pinned_top_row_layout(
+            adapter,
+            target,
+            spec,
+            panes,
+            focused_pane=focused_pane,
+            focus=focus,
+            admit=admit,
+            kill_pending_clear=kill_pending_clear,
+        )
 
     orchestrator, workers = _orchestrator_and_workers(panes, spec)
     if orchestrator is None:
@@ -720,6 +946,105 @@ def _enforce_stack_layout_impl(
     if focus and focused_pane in worker_ids:
         return f"focused stack {focused_pane} in {target}"
     return f"normalized stack layout {target}"
+
+
+def add_pinned_stack_pane(
+    adapter: TmuxAdapter,
+    session: str,
+    base: str,
+    *,
+    cwd: str | None = None,
+    focus: bool = True,
+    adopt_pane: str | None = None,
+) -> str:
+    from .focus_guard import preserve_focus
+
+    spec = STACK_PAGE_SPECS.get(base)
+    if spec is None or spec.layout_mode != "pinned-top-row":
+        raise ValueError(f"not a pinned stack: {base}")
+    if adopt_pane is not None:
+        raise ValueError(f"stack adopt is not supported for pinned stacks: {base!r}")
+    cwd = cwd or os.path.expanduser("~")
+    target = f"{session}:{base}"
+    names = [
+        name.split("(", 1)[0]
+        for name in adapter.run(
+            "list-windows", "-t", session, "-F", "#{window_name}", allow_failure=True
+        ).splitlines()
+    ]
+    if base not in names:
+        adapter.run("new-window", "-t", session, "-n", base, "-d", "-c", cwd)
+
+    with preserve_focus(
+        adapter,
+        source="tmuxctl pinned stack add",
+        attempted_target=target,
+        enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
+    ):
+        panes = _stack_panes(adapter, target)
+        if not panes:
+            raise ValueError(f"{base} window has no panes: {target}")
+        panes = _ensure_pinned_role_panes(adapter, target, panes, spec)
+        pinned = _pinned_panes_by_role(panes, spec)
+        anchor = pinned.get(spec.pinned_roles[0].role)
+        if anchor is None:
+            raise ValueError(f"{base} window missing pinned pane: {spec.pinned_roles[0].role}")
+        workers = _pinned_workers(panes, spec)
+        _set_window_option(adapter, target, STACK_FOCUS_GUARD_OPTION, "true")
+        try:
+            if not workers:
+                pane = adapter.run(
+                    "split-window",
+                    "-v",
+                    "-f",
+                    "-t",
+                    anchor.pane_id,
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-l",
+                    str(STACK_COLLAPSED_HEIGHT),
+                    "-c",
+                    cwd,
+                ).strip()
+            else:
+                worker_ids = {worker.pane_id for worker in workers}
+                stored_focus = _stack_window_option(adapter, target, STACK_FOCUSED_PANE_OPTION)
+                split_target = stored_focus if stored_focus in worker_ids else workers[0].pane_id
+                pane = adapter.run(
+                    "split-window",
+                    "-v",
+                    "-t",
+                    split_target,
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-l",
+                    str(STACK_COLLAPSED_HEIGHT),
+                    "-c",
+                    cwd,
+                ).strip()
+        finally:
+            _set_window_option(adapter, target, STACK_FOCUS_GUARD_OPTION, "false")
+
+        try:
+            _tag_worker(
+                adapter,
+                pane,
+                spec,
+                _lowest_available_worker_ordinal(workers, spec),
+                reason="worker_birth",
+            )
+            _set_pane_option(adapter, pane, "@STACK_PENDING", "true")
+            adapter.run("select-pane", "-T", "regiment", "-t", pane, allow_failure=True)
+            enforce_stack_layout(adapter, target, focused_pane=pane, focus=focus)
+            return pane
+        except Exception:
+            if pane:
+                adapter.run("kill-pane", "-t", pane, allow_failure=True)
+            raise
 
 
 def add_orchestrator_stack_pane(

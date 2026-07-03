@@ -753,3 +753,365 @@ def test_stack_enforce_defers_while_pane_select_zoom_restore_pending():
         command[0] in {"select-layout", "resize-pane", "join-pane", "split-window"}
         for command in adapter.commands
     )
+
+
+def test_reservists_pinned_roles_are_spec_scoped_not_global_singletons():
+    from tmuxctl._stack_core import STACK_PAGE_SPECS, _is_pinned_role
+    from tmuxctl.singleton_labels import is_persona_singleton_label
+
+    spec = STACK_PAGE_SPECS["reservists"]
+
+    assert _is_pinned_role("reservists:civic", spec)
+    assert _is_pinned_role("reservists:token-os", spec)
+    assert not is_persona_singleton_label("reservists:civic")
+    assert not is_persona_singleton_label("reservists:token-os")
+
+
+class FakeReservistsAdapter:
+    def __init__(self, rows: list[list[str]] | None = None) -> None:
+        self.rows = rows or [
+            ["%C", "reservists:civic", "reservists", "1", "0", "0", "100", "50", "claude", "false"],
+            [
+                "%T",
+                "reservists:token-os",
+                "reservists",
+                "0",
+                "100",
+                "0",
+                "100",
+                "50",
+                "claude",
+                "false",
+            ],
+        ]
+        self.commands: list[tuple[str, ...]] = []
+        self.window_options: dict[str, str] = {}
+        self._next_pane = 200
+        self.band_h = 22
+
+    def show_window_option(self, target: str, option: str) -> str:
+        return self.window_options.get(option, "")
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+    def _alloc(self) -> str:
+        self._next_pane += 1
+        return f"%{self._next_pane}"
+
+    def _row(self, pane: str) -> list[str] | None:
+        return next((row for row in self.rows if row[0] == pane), None)
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        self.commands.append(args)
+        if args[0] == "display-message":
+            target = args[args.index("-t") + 1] if "-t" in args else ""
+            fmt = args[-1]
+            if fmt == "#{session_name}\t#{window_index}\t#{window_name}":
+                return "main\t7\treservists\n"
+            if fmt == "#{window_width}":
+                return "200\n"
+            if fmt == "#{window_height}":
+                return "50\n"
+            if fmt == "#{window_name}":
+                return "reservists\n"
+            if fmt == "#{window_zoomed_flag}":
+                return "0\n"
+            if fmt == "#{session_name}:#{window_index}":
+                return "main:7\n"
+            if fmt == "#{session_name}:#{window_name}":
+                return "main:reservists\n"
+            if fmt == "#{pane_id}":
+                return f"{target}\n" if target else "%C\n"
+            return ""
+        if args[0] == "list-windows":
+            if args[-1] == "#{window_index}\t#{window_name}":
+                return "7\treservists\n8\tmars\n"
+            if args[-1] == "#{window_name}":
+                return "reservists\nmars\n"
+        if args[0] == "list-panes":
+            return "\n".join("\t".join(row) for row in self.rows)
+        if args[0] == "set-option" and "-w" in args:
+            self.window_options[args[-2]] = args[-1]
+        if args[0] == "set-option" and "-p" in args:
+            target = args[args.index("-t") + 1]
+            row = self._row(target)
+            if row:
+                option = args[-2]
+                value = args[-1]
+                if option == "@PANE_ID":
+                    row[1] = value
+                elif option == "@PANE_TYPE":
+                    row[2] = value
+                elif option == "@STACK_PENDING":
+                    row[9] = value
+        if args[0] == "split-window":
+            pane = self._alloc()
+            if "-h" in args:
+                self.rows.append([pane, "", "", "0", "100", "0", "100", "50", "zsh", "false"])
+            elif "-f" in args:
+                self.rows.append(
+                    [pane, "", "", "0", "0", str(self.band_h), "200", "3", "zsh", "false"]
+                )
+            else:
+                self.rows.append(
+                    [pane, "", "", "0", "0", str(self.band_h + 4), "200", "3", "zsh", "false"]
+                )
+            return f"{pane}\n"
+        if args[0] == "join-pane":
+            src = args[args.index("-s") + 1]
+            row = self._row(src)
+            if row:
+                row[4], row[5], row[6] = "0", str(self.band_h), "200"
+        if args[0] == "resize-pane":
+            target = args[args.index("-t") + 1]
+            row = self._row(target)
+            if row:
+                if "-x" in args:
+                    row[6] = args[args.index("-x") + 1]
+                if "-y" in args:
+                    row[7] = args[args.index("-y") + 1]
+                    if row[1] == "reservists:civic":
+                        token = next((r for r in self.rows if r[1] == "reservists:token-os"), None)
+                        if token:
+                            token[4], token[5], token[6], token[7] = (
+                                row[6],
+                                "0",
+                                str(200 - int(row[6])),
+                                row[7],
+                            )
+        if args[0] == "kill-pane":
+            target = args[args.index("-t") + 1]
+            self.rows = [row for row in self.rows if row[0] != target]
+        return ""
+
+
+def test_reservists_enforce_pins_top_row_and_full_width_workers():
+    adapter = FakeReservistsAdapter(
+        rows=[
+            ["%C", "reservists:civic", "reservists", "1", "0", "0", "100", "50", "claude", "false"],
+            [
+                "%T",
+                "reservists:token-os",
+                "reservists",
+                "0",
+                "100",
+                "0",
+                "100",
+                "50",
+                "claude",
+                "false",
+            ],
+            ["%W", "reservists:9", "stack-worker", "0", "100", "0", "100", "20", "codex", "false"],
+        ]
+    )
+
+    result = enforce_stack_layout(adapter, "main:7")  # type: ignore[arg-type]
+
+    assert result == "normalized pinned stack layout main:7"
+    by_role = {row[1]: row for row in adapter.rows}
+    assert by_role["reservists:civic"][4:8] == ["0", "0", "100", "22"]
+    assert by_role["reservists:token-os"][4:8] == ["100", "0", "100", "22"]
+    worker = by_role["reservists:1"]
+    assert worker[4] == "0"
+    assert int(worker[5]) >= 22
+    assert worker[6] == "200"
+    assert ("join-pane", "-v", "-f", "-d", "-s", "%W", "-t", "%C") in adapter.commands
+    assert not any(command[0] == "select-layout" for command in adapter.commands)
+
+
+def test_reservists_enforce_recreates_missing_pinned_seat_and_retains_workers():
+    adapter = FakeReservistsAdapter(
+        rows=[
+            ["%C", "reservists:civic", "reservists", "1", "0", "0", "200", "50", "claude", "false"],
+            ["%W", "reservists:1", "stack-worker", "0", "0", "25", "200", "10", "codex", "false"],
+        ]
+    )
+
+    enforce_stack_layout(adapter, "main:7")  # type: ignore[arg-type]
+
+    roles = [row[1] for row in adapter.rows]
+    assert "reservists:civic" in roles
+    assert "reservists:token-os" in roles
+    assert "reservists:1" in roles
+    assert any(command[0] == "split-window" and "-h" in command for command in adapter.commands)
+    token_pane = next(row[0] for row in adapter.rows if row[1] == "reservists:token-os")
+    assert ("set-option", "-p", "-t", token_pane, "@TOKEN_OS_RESERVIST", "1") in adapter.commands
+
+
+def test_reservists_first_add_uses_full_window_bottom_band_without_carving_seats():
+    adapter = FakeReservistsAdapter()
+
+    pane = add_stack_pane(adapter, "main", "reservists", cwd="/tmp", focus=False)  # type: ignore[arg-type]
+
+    assert pane.startswith("%")
+    assert any(
+        command[:5] == ("split-window", "-v", "-f", "-t", "%C")
+        and command[command.index("-l") + 1] == str(STACK_COLLAPSED_HEIGHT)
+        for command in adapter.commands
+    )
+    assert "reservists:civic" in [row[1] for row in adapter.rows]
+    assert "reservists:token-os" in [row[1] for row in adapter.rows]
+    assert ("set-option", "-p", "-t", pane, "@PANE_ID", "reservists:1") in adapter.commands
+
+
+def test_reservists_workers_renumber_after_removal_without_retagging_pinned_seats():
+    adapter = FakeReservistsAdapter(
+        rows=[
+            ["%C", "reservists:civic", "reservists", "1", "0", "0", "100", "22", "claude", "false"],
+            [
+                "%T",
+                "reservists:token-os",
+                "reservists",
+                "0",
+                "100",
+                "0",
+                "100",
+                "22",
+                "claude",
+                "false",
+            ],
+            ["%A", "reservists:1", "stack-worker", "0", "0", "22", "200", "3", "codex", "false"],
+            ["%B", "reservists:3", "stack-worker", "0", "0", "26", "200", "3", "codex", "false"],
+        ]
+    )
+
+    enforce_stack_layout(adapter, "main:7")  # type: ignore[arg-type]
+
+    assert ("set-option", "-p", "-t", "%B", "@PANE_ID", "reservists:2") in adapter.commands
+    assert not any(
+        command[:5] == ("set-option", "-p", "-t", "%C", "@PANE_ID")
+        and command[-1].startswith("reservists:")
+        and command[-1][-1:].isdigit()
+        for command in adapter.commands
+    )
+    assert not any(
+        command[:5] == ("set-option", "-p", "-t", "%T", "@PANE_ID")
+        and command[-1].startswith("reservists:")
+        and command[-1][-1:].isdigit()
+        for command in adapter.commands
+    )
+
+
+def test_reservists_add_rejects_adopt():
+    adapter = FakeReservistsAdapter()
+
+    with pytest.raises(ValueError):
+        add_stack_pane(  # type: ignore[arg-type]
+            adapter,
+            "main",
+            "reservists",
+            cwd="/tmp",
+            focus=False,
+            adopt_pane="%live",
+        )
+
+
+def test_dispatch_reflow_routes_by_stack_page_spec_not_orchestrator_set(monkeypatch):
+    import tmuxctl.stack as stackmod
+
+    class TinyAdapter:
+        def __init__(self, window_name: str) -> None:
+            self.window_name = window_name
+            self.commands: list[tuple[str, ...]] = []
+
+        def run(self, *args: str, allow_failure: bool = False) -> str:
+            self.commands.append(args)
+            if args[0] == "display-message" and args[-1] == "#{session_name}:#{window_name}":
+                return f"main:{self.window_name}\n"
+            if args[0] == "display-message" and args[-1] == "#{session_name}:#{window_index}":
+                return "main:7\n"
+            if args[0] == "display-message" and args[-1] in {
+                "#{session_name}:#{window_index}\t#{pane_id}\t#{window_zoomed_flag}\t#{client_activity}",
+                "#{session_name}:#{window_index}\t#{pane_id}",
+            }:
+                return "main:7\t%X\n"
+            if args[0] == "display-message" and args[-1] == "#{pane_id}":
+                return "%X\n"
+            return ""
+
+        def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+            self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(stackmod, "add_stack_pane", lambda adapter, session, base, **kw: "%NEW")
+    monkeypatch.setattr(
+        stackmod,
+        "enforce_stack_layout",
+        lambda adapter, target, **kw: calls.append((adapter.window_name, target)) or "ok",
+    )
+
+    stackmod.dispatch_stack_command(
+        TinyAdapter("reservists"), "main", "reservists", "echo r", settle_seconds=0
+    )
+    stackmod.dispatch_stack_command(TinyAdapter("mars"), "main", "mars", "echo m", settle_seconds=0)
+
+    assert calls == [("reservists", "main:7")]
+
+
+def test_mechanicus_enforce_transcript_stays_byte_identical():
+    adapter = FakeLegionAdapter(
+        window_name="mechanicus",
+        rows=[
+            "%F\tmechanicus:fabricator-general\tmechanicus\t0\t0\t0\t80\t50\tclaude\tfalse",
+            "%O\tmechanicus:orchestrator\tmechanicus\t0\t0\t26\t80\t24\tclaude\tfalse",
+            "%W\tmechanicus:worker\tstack-worker\t1\t81\t0\t80\t42\tcodex\tfalse",
+        ],
+    )
+
+    result = enforce_stack_layout(adapter, "main:5")  # type: ignore[arg-type]
+
+    assert result == "normalized stack layout main:5"
+    assert adapter.commands == [
+        (
+            "display-message",
+            "-p",
+            "#{session_name}:#{window_index}\t#{pane_id}\t#{window_zoomed_flag}\t#{client_activity}",
+        ),
+        ("display-message", "-p", "#{session_name}:#{window_index}\t#{pane_id}"),
+        ("display-message", "-p", "#{session_name}:#{window_index}"),
+        ("display-message", "-p", "#{pane_id}"),
+        ("display-message", "-t", "main:5", "-p", "#{window_name}"),
+        (
+            "list-panes",
+            "-t",
+            "main:5",
+            "-F",
+            "#{pane_id}\t#{@PANE_ID}\t#{@PANE_TYPE}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{@STACK_PENDING}",
+        ),
+        ("display-message", "-t", "main:5", "-p", "#{window_zoomed_flag}"),
+        ("display-message", "-t", "main:5", "-p", "#{window_height}"),
+        ("set-option", "-p", "-t", "%W", "@PANE_ID", "mechanicus:1"),
+        ("set-option", "-p", "-t", "%W", "@PANE_TYPE", "stack-worker"),
+        ("set-option", "-p", "-t", "%W", "@GRID_STATE", "small"),
+        (
+            "list-panes",
+            "-t",
+            "main:5",
+            "-F",
+            "#{pane_id}\t#{@PANE_ID}\t#{@PANE_TYPE}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{@STACK_PENDING}",
+        ),
+        ("display-message", "-t", "main:5", "-p", "#{window_width}"),
+        ("display-message", "-t", "main:5", "-p", "#{window_height}"),
+        ("set-option", "-w", "-t", "main:5", "@STACK_FOCUS_GUARD", "true"),
+        ("set-option", "-p", "-t", "%F", "@PANE_ID", "mechanicus:fabricator-general"),
+        ("set-option", "-p", "-t", "%F", "@PANE_TYPE", "mechanicus"),
+        ("set-option", "-p", "-t", "%F", "@GRID_STATE", "small"),
+        ("set-option", "-p", "-t", "%W", "@PANE_TYPE", "stack-worker"),
+        ("set-option", "-p", "-t", "%W", "@GRID_STATE", "small"),
+        ("set-window-option", "-t", "main:5", "main-pane-width", "80"),
+        ("select-layout", "-t", "main:5", "main-vertical"),
+        ("resize-pane", "-t", "%F", "-x", "80"),
+        (
+            "list-panes",
+            "-t",
+            "main:5",
+            "-F",
+            "#{pane_id}\t#{@PANE_ID}\t#{@PANE_TYPE}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{@STACK_PENDING}",
+        ),
+        ("display-message", "-t", "main:5", "-p", "#{window_height}"),
+        ("resize-pane", "-t", "%F", "-x", "80"),
+        ("resize-pane", "-t", "%F", "-y", "24"),
+        ("resize-pane", "-t", "%O", "-x", "80"),
+        ("set-option", "-w", "-t", "main:5", "@STACK_FOCUS_GUARD", "false"),
+    ]
