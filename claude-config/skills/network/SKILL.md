@@ -1,11 +1,16 @@
 ---
 name: network
-description: Imperium and askCivic machine topology and config routing. Use for Tailscale, SSH aliases, NAS paths, Token-API reachability, Mac/WSL/phone roles, MacroDroid phone routing, future CIVIC_MACHINE handling, Deskflow/remote operator paths, or replacing hardcoded machine values.
+description: Imperium and askCivic machine topology and config routing. Use for Tailscale, SSH aliases, NAS paths, Token-API reachability, Mac/WSL/phone roles, MacroDroid phone routing, future CIVIC_MACHINE handling, Deskflow/remote operator paths, replacing hardcoded machine values, or the incoming headless Linux boxes (GMKtec K12 pair + Comet Pro network KVMs, mac mini migration).
 ---
 
 # Network
 
 Imperium network values are centralized in machine config. For topology detail, read `references/topology.md`.
+
+Two headless Linux boxes (GMKtec K12) with dedicated network KVMs (GL.iNet Comet Pro) are
+incoming (July 2026) — one personal/Imperium, one work/civic — to take over from the mac
+mini. That expansion is PLANNED, not live; see "Incoming Expansion" in `references/topology.md`
+before touching machine-identity config for them.
 
 ## Surfaces
 
