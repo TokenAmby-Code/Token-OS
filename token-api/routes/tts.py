@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
@@ -195,14 +196,90 @@ def play_sound(sound_file: str = None) -> dict:
         return {"success": False, "error": str(e)}
 
 
+@dataclass(frozen=True)
+class TTSSanitizationRule:
+    """A deterministic, ordered token transform for spoken TTS text."""
+
+    name: str
+    transform_token: Callable[[str], str]
+
+
+_TTS_TOKEN_RE = re.compile(r"\S+|\s+")
+_TTS_TOKEN_EDGE_RE = re.compile(
+    r"^(?P<prefix>[\"'“‘([{<]*)(?P<body>.*?)(?P<suffix>[\"'”’)\]}>.,!;:?]*)$"
+)
+_TTS_SEPARATOR_RE = re.compile(r"(?<=\w)[-_](?=\w)")
+_TTS_SHA_RE = re.compile(r"(?=.*\d)[0-9a-f]{7,40}\Z")
+_TTS_EXTENSION_RE = re.compile(r"(?<!^)\.[^.\s/]+$")
+
+
+def _sanitize_tts_path_token(token: str) -> str:
+    """Speak path-like tokens as the final segment only, without extension."""
+    if "/" not in token:
+        return token
+
+    segments = [segment for segment in token.split("/") if segment]
+    if len(segments) < 2:
+        return token
+
+    final_segment = segments[-1]
+    return _TTS_EXTENSION_RE.sub("", final_segment) or final_segment
+
+
+def _collapse_tts_separators(token: str) -> str:
+    """Collapse word-internal kebab/snake separators into spoken spaces."""
+    return _TTS_SEPARATOR_RE.sub(" ", token)
+
+
+def _elide_tts_sha_token(token: str) -> str:
+    """Replace obvious git commit hashes with a short spoken label."""
+    if _TTS_SHA_RE.fullmatch(token):
+        return "commit"
+    return token
+
+
+TTS_SANITIZATION_RULES: tuple[TTSSanitizationRule, ...] = (
+    TTSSanitizationRule("paths", _sanitize_tts_path_token),
+    TTSSanitizationRule("separator_collapse", _collapse_tts_separators),
+    TTSSanitizationRule("sha_commit_elision", _elide_tts_sha_token),
+)
+
+
+def _sanitize_tts_token(token: str) -> str:
+    edge = _TTS_TOKEN_EDGE_RE.fullmatch(token)
+    if not edge:
+        body = token
+        prefix = suffix = ""
+    else:
+        prefix = edge.group("prefix")
+        body = edge.group("body")
+        suffix = edge.group("suffix")
+
+    for rule in TTS_SANITIZATION_RULES:
+        body = rule.transform_token(body)
+    return f"{prefix}{body}{suffix}"
+
+
+def sanitize_tts_for_speech(text: str | None) -> str:
+    """Apply deterministic speech-only sanitizers before backend fan-out.
+
+    This is intentionally token-local and ordered so URL/UUID/number rules can
+    be added to ``TTS_SANITIZATION_RULES`` without changing the TTS router.
+    """
+    if not text:
+        return ""
+    return "".join(
+        part if part.isspace() else _sanitize_tts_token(part)
+        for part in _TTS_TOKEN_RE.findall(str(text))
+    )
+
+
 def clean_markdown_for_tts(text: str) -> str:
     """Clean markdown syntax for natural TTS output.
 
     Removes/transforms markdown that sounds bad when spoken aloud,
     like table separators ("pipe dash dash dash") or headers ("hash hash").
     """
-    # TODO(tts-sanitize): strip SHAs/commit-ids/formatting — this is already the
-    # single TTS chokepoint (called in speak_tts), so the future home is here.
     # Unicode arrows/symbols that TTS mispronounces
     text = text.replace("\u2192", " to ")
     text = text.replace("\u2190", " from ")
@@ -687,8 +764,9 @@ def speak_tts(
     if not message:
         return {"success": False, "error": "No message provided"}
 
-    # Clean markdown syntax for natural TTS output and fail-closed on raw tmux ids.
-    message = _sanitize_public_text(clean_markdown_for_tts(message))
+    # Clean markdown/public text, then apply speech-only sanitization once at
+    # the single backend fan-out chokepoint.
+    message = sanitize_tts_for_speech(_sanitize_public_text(clean_markdown_for_tts(message)))
 
     routing = resolve_tts_device(instance_id=instance_id, wsl_voice=wsl_voice)
     device = routing.get("device")
