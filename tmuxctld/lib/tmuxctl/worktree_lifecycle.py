@@ -81,13 +81,37 @@ def cleanup_worktree_on_wrapper_end(
             "stderr": remove.stderr.strip(),
         }
     prune = _run_git_gitdir(common, "worktree", "prune")
+    # The worktree removal proved the branch merged (via `merged_reason`); prune
+    # its now-merged branch ref too so refs don't accumulate in the bare after
+    # teardown.  Gated on the same merged ground truth — only reachable here —
+    # and never on the fail-safe preserve paths above.
+    branch_prune = _prune_merged_branch_ref(common, branch)
     return {
         **result,
         "status": "removed",
         "reason": "merged",
         "prune_rc": prune.returncode,
         "prune_stderr": prune.stderr.strip(),
+        **branch_prune,
     }
+
+
+def _prune_merged_branch_ref(common: Path, branch: str) -> dict[str, Any]:
+    """Delete a proven-merged worktree's branch ref from the bare.
+
+    Best effort: a failed prune never turns a successful worktree removal into a
+    failure.  Refuses to delete a default branch (main/master) defensively — a
+    merged feature branch is never one of those, and the removal proof authorizes
+    force-deletion (`-D`) regardless of local ancestry, which is exactly what a
+    squash-merge needs.
+    """
+
+    if not branch or branch in {"main", "master"}:
+        return {"branch_prune": "skipped"}
+    proc = _run_git_gitdir(common, "branch", "-D", branch)
+    if proc.returncode != 0:
+        return {"branch_prune": "failed", "branch_prune_stderr": proc.stderr.strip()}
+    return {"branch_prune": "pruned"}
 
 
 def _branch_is_merged(path: Path, *, instance: dict[str, Any] | None) -> tuple[bool, str]:

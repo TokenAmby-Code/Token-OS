@@ -1002,6 +1002,17 @@ do_merge() {
 
     success "Merged and pushed '$base'"
 
+    # Durable merge marker so WrapperEnd can prove the (squash) merge without
+    # git ancestry — a squash rewrites the SHA, so pr_state=merged is the only
+    # ground truth for deferred worktree teardown. Best-effort like the other
+    # merge paths; mark_pr_flag stamps pr_url+pr_state together, so a missing
+    # 'open' flag doesn't block it.
+    local merged_pr_url=""
+    if [[ -n "$repo_slug" ]]; then
+        merged_pr_url=$(gh pr view "$branch" --repo "$repo_slug" --json url -q '.url' 2>/dev/null || true)
+    fi
+    [[ -n "$merged_pr_url" ]] && mark_pr_flag "$merged_pr_url" merged
+
     echo ""
     success "Done! Merge complete. Worktree teardown is deferred to tmuxctld WrapperEnd."
     echo ""
