@@ -518,8 +518,11 @@ async def _tmuxctl_send_text_fallback(
         "dispatch_id": str(uuid.uuid4()),
         "payload_hash": _prompt_payload_hash(prompt),
         "gated": False,
-        "verification_status": "unverified",
+        "verification_status": "pending",
         "verified_by": None,
+        "delivered": True,
+        "submitted": False,
+        "turn": "pending",
         "guard_held": False,
         "swallowed_submit_detected": False,
         "recovery_attempts": 0,
@@ -537,6 +540,8 @@ async def send_prompt_to_pane(
     submit: bool = True,
     verify: bool = True,
     operation_id: str | None = None,
+    hook_echo_pane: str | None = None,
+    correlation_id: str | None = None,
 ) -> dict:
     """Token-API pane prompt facade: tmuxctld is the only local byte boundary."""
     daemon_payload = await asyncio.to_thread(
@@ -548,8 +553,14 @@ async def send_prompt_to_pane(
             "clear_prompt": clear_prompt,
             "submit": submit,
             "verify": verify,
-            "verify_timeout": 6.0,
+            # Two-level delivery contract: wait one initial 30-60s window for
+            # the level-2 UserPromptSubmit hook, but level-1 bytes-delivered is
+            # already success if the daemon send returns rc0.
+            "verify_timeout": 35.0,
+            "ack_submit_retries": 0,
             "operation_id": operation_id or "",
+            "hook_echo_pane": hook_echo_pane or "",
+            "correlation_id": correlation_id or operation_id or "",
         },
         # A verified tmuxctld send can legitimately take longer than the
         # low-teens when the target swallows Enter and tmuxctld performs its
@@ -591,7 +602,13 @@ async def send_prompt_to_pane(
         "gated": False,
         "verification_status": result.get("verification_status") or "unverified",
         "verified_by": result.get("verified_by"),
+        "delivered": bool(result.get("delivered", True)),
+        "submitted": bool(result.get("submitted")),
+        "turn": result.get("turn"),
+        "correlation_id": result.get("correlation_id") or correlation_id or operation_id,
+        "hook_echo": result.get("hook_echo"),
         "delivery": result.get("delivery"),
+        "submit_delivery": result.get("submit_delivery"),
         "advisory": result.get("advisory"),
         "capture_excerpt": result.get("capture_excerpt"),
         "guard_held": bool(result.get("guard_held")),
@@ -5656,27 +5673,29 @@ PANE_WRITE_DEFERRED = "deferred"
 def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     """Map low-level pane-send truth to durable queue/front-end status.
 
-    The send path distinguishes bytes-issued from submit/turn consumption. A
-    zero returncode is NOT enough: only ``verification_status=submitted`` means
-    the target agent observed a submitted prompt (UserPromptSubmit/composer proof).
-    ``unverified`` is terminal and loud, not retryable pending, because bytes may
-    have reached the composer and a blind retry would duplicate.
+    Two-level delivery contract:
+    * level 1: bytes reached the target pane/composer => ``sent`` and callers
+      must not retry;
+    * level 2: ``UserPromptSubmit`` hook => ``turn=submitted`` when present,
+      otherwise ``turn=pending`` with a late hook-echo callback.
 
-    ``likely`` is accepted only when the lower tmuxctld classifier produced an
-    engine-specific ingestion signal (currently Codex transcript/user-message
-    capture). Plain bytes-issued/unacked remains ``UNVERIFIED`` to avoid flipping
-    false-negatives into blind false-positives.
+    A zero returncode from tmuxctld is therefore delivery success unless the
+    daemon explicitly says bytes were gated/suppressed or the process failed.
     """
     verification = str(send_result.get("verification_status") or "").lower()
     if verification == "gated" or send_result.get("gated"):
         return PANE_WRITE_PENDING, f"send_gated:{send_result.get('gate_reason') or 'gated'}"
     if send_result.get("returncode") != 0:
         return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
-    if verification in {"submitted", "likely"}:
+    if send_result.get("delivered") is False:
+        return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get(
+            "error"
+        ) or "not_delivered"
+    if verification in {"submitted", "pending", "not_requested", "likely", "unverified"}:
         return PANE_WRITE_SENT, None
     return (
-        PANE_WRITE_UNVERIFIED,
-        "submit_unverified:no_UserPromptSubmit_ack; bytes_may_have_been_issued_do_not_blind_retry",
+        PANE_WRITE_SENT,
+        None,
     )
 
 
@@ -5772,6 +5791,8 @@ async def enqueue_pane_write(
     payload: str,
     hook_driven: bool = False,
     operation_id: str | None = None,
+    hook_echo_pane: str | None = None,
+    correlation_id: str | None = None,
 ) -> dict:
     if not (tmux_pane or "").strip():
         raise ValueError("pane write requires a concrete tmux pane target")
@@ -5801,7 +5822,11 @@ async def enqueue_pane_write(
                             "type": "pane_prompt_submit",
                             "text": payload,
                             "submit": True,
-                            "effects": {"hook_driven": bool(hook_driven)},
+                            "effects": {
+                                "hook_driven": bool(hook_driven),
+                                "hook_echo_pane": hook_echo_pane or "",
+                                "correlation_id": correlation_id or queue_id,
+                            },
                         },
                         sort_keys=True,
                     ),
@@ -5829,6 +5854,9 @@ async def enqueue_pane_write(
                 or existing.get("tmux_pane") != tmux_pane
                 or existing.get("payload") != payload
                 or bool(existing_effects.get("hook_driven")) != bool(hook_driven)
+                or str(existing_effects.get("hook_echo_pane") or "") != str(hook_echo_pane or "")
+                or str(existing_effects.get("correlation_id") or queue_id)
+                != str(correlation_id or queue_id)
             ):
                 raise ValueError(
                     "pane write operation_id reused for different target/payload/effects"
@@ -5923,6 +5951,8 @@ async def _tmux_send_payload_then_submit(
     clear_prompt: bool = False,
     enable_skill_sink: bool = False,
     operation_id: str | None = None,
+    hook_echo_pane: str | None = None,
+    correlation_id: str | None = None,
 ) -> dict:
     """Backward-compatible prompt send wrapper; local delivery is tmuxctld only.
 
@@ -5931,7 +5961,12 @@ async def _tmux_send_payload_then_submit(
     ``send_skill_to_pane`` / ``send_command_to_pane``.
     """
     return await send_prompt_to_pane(
-        tmux_pane, payload, clear_prompt=clear_prompt, operation_id=operation_id
+        tmux_pane,
+        payload,
+        clear_prompt=clear_prompt,
+        operation_id=operation_id,
+        hook_echo_pane=hook_echo_pane,
+        correlation_id=correlation_id,
     )
 
 
@@ -6018,6 +6053,15 @@ async def process_pane_write_queue_once(
         structured_ethereal = purpose == "ethereal"
         clear_replace_source = item["source"] in {"brief", NAMING_NUDGE_QUEUE_SOURCE}
         try:
+            event_payload = json.loads(item.get("event_payload_json") or "{}")
+        except Exception:  # noqa: BLE001
+            event_payload = {}
+        effects = event_payload.get("effects") if isinstance(event_payload, dict) else {}
+        if not isinstance(effects, dict):
+            effects = {}
+        hook_echo_pane = str(effects.get("hook_echo_pane") or "")
+        correlation_id = str(effects.get("correlation_id") or item["id"])
+        try:
             # Some system prompts clear/replace a stale composer rather than
             # deferring forever. Live symptom: leftover Codex/Claude drafts kept
             # additive deferral returning pending, so critical brief/name nudges
@@ -6054,11 +6098,20 @@ async def process_pane_write_queue_once(
                 )
             elif clear_replace_source:
                 send_result = await _tmux_send_payload_then_submit(
-                    pane, item["payload"], clear_prompt=True, operation_id=item["id"]
+                    pane,
+                    item["payload"],
+                    clear_prompt=True,
+                    operation_id=item["id"],
+                    hook_echo_pane=hook_echo_pane,
+                    correlation_id=correlation_id,
                 )
             else:
                 send_result = await _tmux_send_payload_then_submit(
-                    pane, item["payload"], operation_id=item["id"]
+                    pane,
+                    item["payload"],
+                    operation_id=item["id"],
+                    hook_echo_pane=hook_echo_pane,
+                    correlation_id=correlation_id,
                 )
             if send_result.get("gated"):
                 # Gate suppressed the send (no bytes issued). Keep the item
@@ -6086,11 +6139,6 @@ async def process_pane_write_queue_once(
             # its side effects stay deferred until a real send goes out.
             hook_effect_error = None
             if terminal_status in {PANE_WRITE_SENT, PANE_WRITE_UNVERIFIED}:
-                try:
-                    event_payload = json.loads(item.get("event_payload_json") or "{}")
-                except Exception:  # noqa: BLE001
-                    event_payload = {}
-                effects = event_payload.get("effects") if isinstance(event_payload, dict) else {}
                 if isinstance(effects, dict) and effects.get("hook_driven"):
                     try:
                         await _flag_hook_driven(
@@ -12953,6 +13001,8 @@ async def _direct_tmux_pane_delivery(
     purpose: str,
     clear_prompt: bool = False,
     operation_id: str | None = None,
+    hook_echo_pane: str | None = None,
+    correlation_id: str | None = None,
 ) -> dict:
     """Deliver directly to a live pane when no registry row exists.
 
@@ -12986,6 +13036,8 @@ async def _direct_tmux_pane_delivery(
         payload,
         clear_prompt=clear_prompt,
         operation_id=operation_id,
+        hook_echo_pane=hook_echo_pane,
+        correlation_id=correlation_id,
     )
     if send_result.get("gated"):
         # Direct rowless sends have no registry row, but they still must not
@@ -13001,6 +13053,8 @@ async def _direct_tmux_pane_delivery(
             purpose=purpose,
             payload=payload,
             operation_id=operation_id,
+            hook_echo_pane=hook_echo_pane,
+            correlation_id=correlation_id,
         )
         drained = await process_pane_write_queue_once(queued["id"])
         result = drained[0] if drained else queued
@@ -13022,7 +13076,14 @@ async def _direct_tmux_pane_delivery(
     return result
 
 
-async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: bool = False) -> dict:
+async def _talk_send_payload(
+    target_pane: str,
+    payload: str,
+    *,
+    hook_driven: bool = False,
+    hook_echo_pane: str | None = None,
+    correlation_id: str | None = None,
+) -> dict:
     """Inject `payload` into ``target_pane`` via the existing pane-write queue.
 
     Drained synchronously so a CLI long-poll sees an actual delivery state.
@@ -13034,6 +13095,8 @@ async def _talk_send_payload(target_pane: str, payload: str, *, hook_driven: boo
         purpose="talk_send",
         payload=payload,
         hook_driven=hook_driven,
+        hook_echo_pane=hook_echo_pane,
+        correlation_id=correlation_id,
     )
     drained = await process_pane_write_queue_once(queued["id"])
     return drained[0] if drained else queued
@@ -13089,7 +13152,11 @@ async def talk_send(request: TalkSendRequest):
         # listener actually sees the response in its input stream.
         try:
             send_result = await _talk_send_payload(
-                target_pane, request.payload, hook_driven=talk_hook_driven
+                target_pane,
+                request.payload,
+                hook_driven=talk_hook_driven,
+                hook_echo_pane=caller_pane,
+                correlation_id=returned["talk_id"],
             )
             if send_result.get("status") != PANE_WRITE_SENT:
                 raise RuntimeError(
@@ -13137,6 +13204,9 @@ async def talk_send(request: TalkSendRequest):
                 source="talk",
                 purpose="talk_send",
                 clear_prompt=False,
+                operation_id=record["talk_id"],
+                hook_echo_pane=caller_pane,
+                correlation_id=record["talk_id"],
             )
             if send_result.get("status") != PANE_WRITE_SENT:
                 raise RuntimeError(
@@ -13146,7 +13216,11 @@ async def talk_send(request: TalkSendRequest):
                 )
         else:
             send_result = await _talk_send_payload(
-                target_pane, request.payload, hook_driven=talk_hook_driven
+                target_pane,
+                request.payload,
+                hook_driven=talk_hook_driven,
+                hook_echo_pane=caller_pane,
+                correlation_id=record["talk_id"],
             )
             if send_result.get("status") != PANE_WRITE_SENT:
                 raise RuntimeError(
@@ -13260,6 +13334,8 @@ async def brief_send(request: BriefSendRequest):
                         purpose="brief_send",
                         clear_prompt=True,
                         operation_id=operation_id,
+                        hook_echo_pane=caller_resolved,
+                        correlation_id=operation_id,
                     )
                 else:
                     queued = await enqueue_pane_write(
@@ -13270,6 +13346,8 @@ async def brief_send(request: BriefSendRequest):
                         payload=request.payload,
                         hook_driven=brief_hook_driven,
                         operation_id=operation_id,
+                        hook_echo_pane=caller_resolved,
+                        correlation_id=operation_id,
                     )
                     drained = await process_pane_write_queue_once(queued["id"])
                     receipt = drained[0] if drained else queued

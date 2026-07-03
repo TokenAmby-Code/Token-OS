@@ -158,7 +158,7 @@ async def test_released_event_replays_like_fresh_arrival_with_submit_and_effects
 
 
 @pytest.mark.asyncio
-async def test_unverified_submit_is_not_delivered_false_positive(
+async def test_pending_submit_is_level_one_delivered(
     app_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     main = app_env.main
@@ -173,7 +173,7 @@ async def test_unverified_submit_is_not_delivered_false_positive(
             "stdout": "",
             "stderr": "",
             "gated": False,
-            "verification_status": "unverified",
+            "verification_status": "pending",
             "verified_by": None,
         }
 
@@ -188,9 +188,9 @@ async def test_unverified_submit_is_not_delivered_false_positive(
     )
     result = (await main.process_pane_write_queue_once(queued["id"]))[0]
 
-    assert result["status"] == main.PANE_WRITE_UNVERIFIED
-    assert result["verification_status"] == "unverified"
-    assert _queue_row(app_env.db_path, queued["id"])[0] == "unverified"
+    assert result["status"] == main.PANE_WRITE_SENT
+    assert result["verification_status"] == "pending"
+    assert _queue_row(app_env.db_path, queued["id"])[0] == "sent"
 
 
 @pytest.mark.asyncio

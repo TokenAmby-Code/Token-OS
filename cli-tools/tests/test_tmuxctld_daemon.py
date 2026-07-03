@@ -1283,6 +1283,42 @@ class SendAckAdapter:
         return "ack-pane" if option == "@PANE_ID" else ""
 
 
+class SendBytesFailAdapter(SendAckAdapter):
+    """Literal byte injection raises before bytes reach the pane."""
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:1] == ("send-keys",) and "-l" in args:
+            raise RuntimeError("tmux send failed: no such pane")
+        return super().run(*args, allow_failure=allow_failure)
+
+
+def test_send_text_genuine_non_delivery_fails_cleanly() -> None:
+    server, _ = _serve(SendBytesFailAdapter)
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/send-text"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(
+                {
+                    "pane": "%42",
+                    "text": "do the thing",
+                    "verify": True,
+                    "verify_timeout": 0.01,
+                    "ack_submit_retries": 0,
+                    "submit_settle_seconds": 0,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["ok"] is False
+        assert body["error"]["code"] == "internal"
+    finally:
+        server.shutdown()
+
+
 def test_send_text_waits_for_user_prompt_submit_ack() -> None:
     SendAckAdapter.calls = []
     SendAckAdapter.literal_sent = threading.Event()
@@ -1330,6 +1366,9 @@ def test_send_text_waits_for_user_prompt_submit_ack() -> None:
         result = payload["result"]
         assert result["verification_status"] == "submitted"
         assert result["verified_by"] == "UserPromptSubmit"
+        assert result["delivered"] is True
+        assert result["submitted"] is True
+        assert result["turn"] == "submitted"
         assert result["instance_id"] == "inst-ack"
         assert ("send-keys", "-t", "%42", "-l", "do the thing") in SendAckAdapter.calls
         assert ("send-keys", "-t", "%42", "C-m") in SendAckAdapter.calls
@@ -1337,7 +1376,7 @@ def test_send_text_waits_for_user_prompt_submit_ack() -> None:
         server.shutdown()
 
 
-def test_send_text_reports_unverified_without_prompt_submit_ack() -> None:
+def test_send_text_reports_delivered_pending_without_prompt_submit_ack() -> None:
     SendAckAdapter.calls = []
     server, _ = _serve(SendAckAdapter)
     try:
@@ -1356,8 +1395,67 @@ def test_send_text_reports_unverified_without_prompt_submit_ack() -> None:
         assert status == 200
         assert payload["ok"] is True
         result = payload["result"]
-        assert result["verification_status"] == "unverified"
+        assert result["verification_status"] == "pending"
+        assert result["delivered"] is True
+        assert result["submitted"] is False
+        assert result["turn"] == "pending"
         assert result["verified_by"] is None
+    finally:
+        server.shutdown()
+
+
+def test_send_text_pending_turn_registers_one_late_hook_echo() -> None:
+    SendAckAdapter.calls = []
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "ack_submit_retries": 0,
+                "submit_settle_seconds": 0,
+                "hook_echo_pane": "%99",
+                "correlation_id": "corr-two-level",
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+        assert result["delivered"] is True
+        assert result["turn"] == "pending"
+        assert result["hook_echo"]["correlation_id"] == "corr-two-level"
+
+        _, ack = _post(
+            server,
+            "/hooks/user-prompt-submit",
+            {"pane": "%42", "prompt_hash": result["payload_hash"]},
+        )
+        assert ack["ok"] is True
+        assert len(ack["result"]["hook_echoes"]) == 1
+        assert ack["result"]["hook_echoes"][0]["correlation_id"] == "corr-two-level"
+        echo_literal_calls = [
+            c
+            for c in SendAckAdapter.calls
+            if c[:4] == ("send-keys", "-t", "%99", "-l") and "correlation_id=corr-two-level" in c[4]
+        ]
+        assert len(echo_literal_calls) == 1
+
+        _, second_ack = _post(
+            server,
+            "/hooks/user-prompt-submit",
+            {"pane": "%42", "prompt_hash": result["payload_hash"]},
+        )
+        assert second_ack["result"]["hook_echoes"] == []
+        echo_literal_calls = [
+            c
+            for c in SendAckAdapter.calls
+            if c[:4] == ("send-keys", "-t", "%99", "-l") and "correlation_id=corr-two-level" in c[4]
+        ]
+        assert len(echo_literal_calls) == 1
     finally:
         server.shutdown()
 
@@ -1374,7 +1472,7 @@ class CodexQueuedUserMessageAdapter(SendAckAdapter):
         return ""
 
 
-def test_codex_user_message_capture_marks_unacked_submit_likely() -> None:
+def test_codex_user_message_capture_keeps_delivery_success_with_pending_hook() -> None:
     CodexQueuedUserMessageAdapter.calls = []
     server, _ = _serve(CodexQueuedUserMessageAdapter)
     try:
@@ -1394,8 +1492,11 @@ def test_codex_user_message_capture_marks_unacked_submit_likely() -> None:
         assert status == 200
         assert payload["ok"] is True
         result = payload["result"]
-        assert result["delivery"] == "likely"
-        assert result["verification_status"] == "likely"
+        assert result["delivery"] == "delivered"
+        assert result["submit_delivery"] == "likely"
+        assert result["verification_status"] == "pending"
+        assert result["delivered"] is True
+        assert result["turn"] == "pending"
         assert result["verified_by"] == "capture-pane:codex-user-message"
         assert not result["failures"]
     finally:
@@ -1414,7 +1515,7 @@ class CodexNoIngestionAdapter(SendAckAdapter):
         return ""
 
 
-def test_codex_without_ack_or_ingestion_stays_unverified() -> None:
+def test_codex_without_ack_or_ingestion_is_delivered_pending() -> None:
     CodexNoIngestionAdapter.calls = []
     server, _ = _serve(CodexNoIngestionAdapter)
     try:
@@ -1433,8 +1534,11 @@ def test_codex_without_ack_or_ingestion_stays_unverified() -> None:
         )
         assert status == 200
         result = payload["result"]
-        assert result["delivery"] == "unverified"
-        assert result["verification_status"] == "unverified"
+        assert result["delivery"] == "delivered"
+        assert result["submit_delivery"] == "unverified"
+        assert result["verification_status"] == "pending"
+        assert result["delivered"] is True
+        assert result["turn"] == "pending"
         assert result["verified_by"] is None
     finally:
         server.shutdown()
@@ -1472,8 +1576,11 @@ def test_codex_stuck_composer_still_fails_not_likely(monkeypatch: pytest.MonkeyP
         )
         assert status == 200
         result = payload["result"]
-        assert result["delivery"] == "failed"
-        assert result["verification_status"] == "unverified"
+        assert result["delivery"] == "delivered"
+        assert result["submit_delivery"] == "failed"
+        assert result["verification_status"] == "pending"
+        assert result["delivered"] is True
+        assert result["turn"] == "pending"
         assert result["verified_by"] is None
         assert any(f["type"] == "submit_not_cleared" for f in result["failures"])
     finally:
@@ -1610,7 +1717,7 @@ class CountingSendAdapter(SendAckAdapter):
         return super().run(*args, allow_failure=allow_failure)
 
 
-def test_send_text_operation_id_is_idempotent_after_unverified_result() -> None:
+def test_send_text_operation_id_is_idempotent_after_pending_turn_result() -> None:
     """Retrying the same per-id operation must not issue bytes twice."""
     CountingSendAdapter.calls = []
     CountingSendAdapter.literal_count = 0
@@ -1627,8 +1734,9 @@ def test_send_text_operation_id_is_idempotent_after_unverified_result() -> None:
         first_status, first_payload = _post_timeout(server, "/send-text", body, timeout=5)
         second_status, second_payload = _post_timeout(server, "/send-text", body, timeout=5)
         assert first_status == second_status == 200
-        assert first_payload["result"]["verification_status"] == "unverified"
-        assert second_payload["result"]["verification_status"] == "unverified"
+        assert first_payload["result"]["verification_status"] == "pending"
+        assert first_payload["result"]["delivered"] is True
+        assert second_payload["result"]["verification_status"] == "pending"
         assert second_payload["result"]["idempotent_replay"] is True
         assert CountingSendAdapter.literal_count == 1
     finally:
@@ -1883,7 +1991,8 @@ def test_agent_guard_hold_acquired_and_released_even_when_verify_times_out(monke
         assert status == 200
         result = payload["result"]
         assert result["guard_held"] is True
-        assert result["verification_status"] == "unverified"
+        assert result["verification_status"] == "pending"
+        assert result["delivered"] is True
         assert events == ["hold", "release"], "hold acquired, then released in finally"
     finally:
         server.shutdown()

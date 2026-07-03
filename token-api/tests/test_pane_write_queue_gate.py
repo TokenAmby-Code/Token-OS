@@ -4,7 +4,7 @@ Pins the corrected contract for automated pane writes:
 
   * ``_tmux_send_payload_then_submit`` translates a ``TmuxSendGated`` into a
     structured ``gated`` result (NOT ``sent``); a successful byte-issue is
-    reported ``unverified`` (delivery not yet proven), never a default ``sent``.
+    reported ``pending`` for level-2 turn state while level-1 delivery is ``sent``.
   * ``process_pane_write_queue_once`` keeps a gated item ``pending`` so the
     periodic worker re-drains it — the typing guard queues, it does not bounce.
   * Once the gate clears, the very same pending item flushes to ``sent``.
@@ -66,8 +66,10 @@ def _stub_tmuxctld_send(main, monkeypatch, *, gated: bool = False) -> list[dict]
             "result": {
                 "dispatch_id": "dispatch-test",
                 "payload_hash": "hash-test",
-                "verification_status": "unverified",
+                "verification_status": "pending",
                 "verified_by": None,
+                "delivered": True,
+                "turn": "pending",
                 "pane": body.get("pane"),
             },
         }
@@ -100,14 +102,18 @@ async def test_send_payload_translates_gate_to_gated_result(app_env: Any, monkey
     assert result["returncode"] != 0
 
 
-async def test_send_payload_success_is_unverified_not_sent(app_env: Any, monkeypatch: Any) -> None:
+async def test_send_payload_success_is_delivered_with_pending_turn(
+    app_env: Any, monkeypatch: Any
+) -> None:
     main = app_env.main
     calls = _stub_tmuxctld_send(main, monkeypatch)
 
     result = await main._tmux_send_payload_then_submit("%9", "hello FG")
 
     assert result["returncode"] == 0
-    assert result["verification_status"] == "unverified", "bytes issued != proven delivery"
+    assert result["verification_status"] == "pending"
+    assert result["delivered"] is True
+    assert result["turn"] == "pending"
     assert result["verified_by"] is None
     assert not result.get("gated")
     assert calls[0]["path"] == "/send-text"
@@ -451,7 +457,7 @@ async def test_clear_prompt_confirms_submission_when_composer_clears(
     result = await main._tmux_send_payload_then_submit("%9", "hello FG", clear_prompt=True)
 
     assert result["returncode"] == 0
-    assert result["verification_status"] == "unverified"
+    assert result["verification_status"] == "pending"
     assert result["verified_by"] is None
     assert calls[0]["body"]["clear_prompt"] is True
 
@@ -466,7 +472,7 @@ async def test_clear_prompt_stays_unverified_when_composer_not_cleared(
     result = await main._tmux_send_payload_then_submit("%9", "hello FG", clear_prompt=True)
 
     assert result["returncode"] == 0
-    assert result["verification_status"] == "unverified"
+    assert result["verification_status"] == "pending"
     assert result["verified_by"] is None
 
 
@@ -539,7 +545,7 @@ async def test_dequeue_fails_closed_when_pane_unresolved(app_env: Any, monkeypat
             "stdout": "",
             "stderr": "",
             "gated": False,
-            "verification_status": "unverified",
+            "verification_status": "pending",
             "verified_by": None,
         }
 
@@ -591,7 +597,7 @@ async def test_brief_raw_pane_falls_back_to_live_at_pane_id(app_env: Any, monkey
             "stdout": "",
             "stderr": "",
             "gated": False,
-            "verification_status": "unverified",
+            "verification_status": "pending",
             "verified_by": None,
         }
 

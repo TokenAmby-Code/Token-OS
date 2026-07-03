@@ -1055,7 +1055,9 @@ def test_gated_preplan_oneshot_consumes_sub_but_requeues_plan_for_redrain(
             "stdout": "",
             "stderr": "",
             "gated": False,
-            "verification_status": "unverified",
+            "verification_status": "pending",
+            "delivered": True,
+            "turn": "pending",
             "verified_by": None,
         }
 
@@ -1066,13 +1068,13 @@ def test_gated_preplan_oneshot_consumes_sub_but_requeues_plan_for_redrain(
     drained = asyncio.run(main.process_pane_write_queue_once(queue_id))
 
     assert sent == [("%90", "/plan create the plan")]
-    assert drained[0]["status"] == main.PANE_WRITE_UNVERIFIED
+    assert drained[0]["status"] == main.PANE_WRITE_SENT
     conn = sqlite3.connect(app_env.db_path)
     final_status = conn.execute(
         "SELECT status FROM pane_write_queue WHERE id = ?", (queue_id,)
     ).fetchone()[0]
     conn.close()
-    assert final_status == "unverified"
+    assert final_status == "sent"
 
 
 def test_mark_for_close_stop_subscription_retires_after_closing_pane(

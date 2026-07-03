@@ -300,7 +300,7 @@ async def test_brief_rowless_unverified_issued_bytes_stays_unverified(
             "operation": "tmuxctl.send_text_then_submit",
             "gated": False,
             # Codex pane: bytes issued, but no UserPromptSubmit ack in the window.
-            "verification_status": "unverified",
+            "verification_status": "pending",
             "verified_by": None,
             "operation_id": operation_id,
         }
@@ -321,8 +321,7 @@ async def test_brief_rowless_unverified_issued_bytes_stays_unverified(
     )
 
     # The keyless brief still drives a deterministic auto operation_id through the
-    # rowless/codex direct path so a blind retry would dedupe, but unverified bytes
-    # are not promoted to delivered.
+    # rowless/codex direct path; pending UserPromptSubmit is level-2, not delivery failure.
     expected_operation_id = main._scoped_send_operation_id(
         "brief",
         f"auto:%44:{main._prompt_payload_hash('codex probe')}",
@@ -330,13 +329,12 @@ async def test_brief_rowless_unverified_issued_bytes_stays_unverified(
         "codex probe",
     )
     assert expected_operation_id is not None
-    assert result["status"] == "unverified"
-    assert result["delivered"] == 0
+    assert result["status"] == "ok"
+    assert result["delivered"] == 1
     assert sent == [("%44", "codex probe", True, expected_operation_id)]
     receipt = result["resolved"][0]
-    assert receipt["status"] == main.PANE_WRITE_UNVERIFIED
+    assert receipt["status"] == main.PANE_WRITE_SENT
     assert receipt["fallback"] == "tmuxctl_send_text_no_registry_row"
-    assert "submit_unverified" in receipt["reason"]
 
 
 @pytest.mark.asyncio
@@ -443,7 +441,7 @@ async def test_brief_rowless_claude_unverified_is_not_marked_sent(
             "stderr": "",
             "operation": "tmuxctl.send_text_then_submit",
             "gated": False,
-            "verification_status": "unverified",
+            "verification_status": "pending",
             "verified_by": None,
             "operation_id": operation_id,
         }
@@ -463,10 +461,10 @@ async def test_brief_rowless_claude_unverified_is_not_marked_sent(
         )
     )
 
-    assert result["status"] == "unverified"
-    assert result["delivered"] == 0
+    assert result["status"] == "ok"
+    assert result["delivered"] == 1
     receipt = result["resolved"][0]
-    assert receipt["status"] == main.PANE_WRITE_UNVERIFIED
+    assert receipt["status"] == main.PANE_WRITE_SENT
 
 
 @pytest.mark.asyncio
@@ -585,7 +583,7 @@ async def test_talk_rowless_live_codex_singleton_requires_verified_submit(
             "stderr": "",
             "operation": "tmuxctl.send_text_then_submit",
             "gated": False,
-            "verification_status": "unverified",
+            "verification_status": "pending",
             "verified_by": None,
         }
 
@@ -597,17 +595,16 @@ async def test_talk_rowless_live_codex_singleton_requires_verified_submit(
     monkeypatch.setattr(main, "_tmux_pane_rows", _pane_rows)
     monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
 
-    with pytest.raises(main.HTTPException) as excinfo:
-        await main.talk_send(
-            main.TalkSendRequest(
-                caller_pane="council:custodes",
-                target_pane="mechanicus:fabricator-general",
-                payload="talk probe",
-            )
+    result = await main.talk_send(
+        main.TalkSendRequest(
+            caller_pane="council:custodes",
+            target_pane="mechanicus:fabricator-general",
+            payload="talk probe",
         )
+    )
 
-    assert excinfo.value.status_code == 502
-    assert "submit_unverified" in str(excinfo.value.detail)
+    assert result["status"] == "open"
+    assert result["delivery"]["status"] == main.PANE_WRITE_SENT
     assert sent == [("%44", "talk probe", False)]
 
 
