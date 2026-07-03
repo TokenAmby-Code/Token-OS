@@ -76,7 +76,7 @@ class FakeCloseAdapter:
         return ""
 
 
-def test_close_pane_slot_clears_in_place_and_never_kills():
+def test_close_pane_slot_clears_in_place_and_never_kills() -> None:
     adapter = FakeCloseAdapter(role="somnium:S", window_name="somnium", pane_dead=True)
 
     result = close_pane(adapter, "%9", timeout=0)
@@ -89,7 +89,7 @@ def test_close_pane_slot_clears_in_place_and_never_kills():
     assert not any(command[:1] == ("kill-pane",) for command in adapter.commands)
 
 
-def test_close_pane_worker_preserves_graceful_then_kill_contract():
+def test_close_pane_worker_preserves_graceful_then_kill_contract() -> None:
     adapter = FakeCloseAdapter(role="mechanicus:worker", window_name="mechanicus", exists_count=99)
 
     result = close_pane(adapter, "%9", timeout=0)
@@ -101,7 +101,7 @@ def test_close_pane_worker_preserves_graceful_then_kill_contract():
     assert result["method"] == "kill-pane"
 
 
-def test_close_pane_perpetual_label_refused_by_class_router():
+def test_close_pane_perpetual_label_refused_by_class_router() -> None:
     adapter = FakeCloseAdapter(role="council:malcador", window_name="somnium")
 
     result = close_pane(adapter, "%9", timeout=0)
@@ -113,7 +113,7 @@ def test_close_pane_perpetual_label_refused_by_class_router():
     assert not any(command[:1] == ("kill-pane",) for command in adapter.commands)
 
 
-def test_close_instance_now_on_slot_retires_and_preserves_pane(monkeypatch):
+def test_close_instance_now_on_slot_retires_and_preserves_pane(monkeypatch) -> None:
     adapter = FakeCloseAdapter(role="somnium:SE", window_name="somnium", pane_dead=True)
     calls = []
 

@@ -1732,6 +1732,41 @@ def test_send_keys_targets_resolved_physical_pane_for_public_ids() -> None:
         server.shutdown()
 
 
+def test_send_keys_rejects_empty_key_alias() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post_timeout(
+            server,
+            "/tmux/send-keys",
+            {"pane": "%42", "keys": [None]},
+            timeout=5,
+        )
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+        assert "command/key required" in payload["error"]["message"]
+        assert not any(call[:1] == ("send-keys-helper",) for call in rec.calls)
+    finally:
+        server.shutdown()
+
+
+def test_send_keys_no_escape_sends_literal_control_text() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post_timeout(
+            server,
+            "/tmux/send-keys",
+            {"pane": "%42", "key": "C-c", "no_escape": True},
+            timeout=5,
+        )
+        assert payload["ok"] is True
+        assert ("send-keys", "-t", "%42", "-l", "C-c") in rec.calls
+        assert ("send-keys-helper", "%42", "C-c") not in rec.calls
+    finally:
+        server.shutdown()
+
+
 def test_send_ethereal_renders_claude_btw_and_closes_side_channel() -> None:
     rec = RecordingVoiceAdapter()
     server, _ = _serve(lambda: rec)

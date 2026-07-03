@@ -797,11 +797,12 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
 
 def _h_send_keys(control, params):
     pane = _s(params, "pane")
-    command = _s(params, "command") or _s(params, "key")
+    command = _opt(params, "command") or _opt(params, "key") or ""
     if not command:
         raw_keys = params.get("keys")
         if isinstance(raw_keys, list) and len(raw_keys) == 1:
-            command = str(raw_keys[0])
+            key = raw_keys[0]
+            command = "" if key is None else str(key)
     if not command:
         raise ValueError("command/key required")
     from .occupancy import assert_dispatch_target_available, looks_like_dispatch_launcher_payload
@@ -834,14 +835,7 @@ _SWALLOW_NEEDLE_LEN = 48
 # Characters that may legitimately sit BELOW a stuck draft without meaning the
 # input was consumed: blank padding and TUI box-drawing borders (the composer's
 # own frame). A line made of only these is composer chrome, not fresh output.
-_COMPOSER_CHROME_CHARS = frozenset(
-    " \t "
-    "│┃┆┇┊┋"
-    "─━┄┅┈┉╌╍"
-    "╭╮╰╯┌┐└┘├┤┬┴┼"
-    "╔╗╚╝╠╣╦╩╬║═"
-    "▏▎▍▌▋▊▉▐▔▕░▒▓"
-)
+_COMPOSER_CHROME_CHARS = frozenset(" \t │┃┆┇┊┋─━┄┅┈┉╌╍╭╮╰╯┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬║═▏▎▍▌▋▊▉▐▔▕░▒▓")
 
 
 def _is_composer_chrome_line(line: str) -> bool:
@@ -925,7 +919,9 @@ def _agent_guard_transaction(control, pane: str, *, seconds: int = 8):
                     owner=owner,
                 )
             except Exception as exc:
-                log.warning("tmuxctld: agent-guard transaction release failed pane=%s: %s", phys_pane, exc)
+                log.warning(
+                    "tmuxctld: agent-guard transaction release failed pane=%s: %s", phys_pane, exc
+                )
 
 
 def _notify_swallowed_submit(*, pane_public: str, instance_id: str, payload_hash: str) -> None:
@@ -1784,8 +1780,7 @@ def _h_append_user_text(control, params):
         control,
         pane=pane,
         text=text,
-        action=lambda: control.adapter.run("send-keys", "-t", pane, "-l", text)
-        or {"pane": pane},
+        action=lambda: control.adapter.run("send-keys", "-t", pane, "-l", text) or {"pane": pane},
         operation_id=_s(params, "operation_id"),
         verify_timeout=_f(params, "verify_timeout", 1.0),
         direct_user=True,
@@ -2596,7 +2591,9 @@ def _h_client_lease(control, params):
     del control
     cmd = _s(params, "cmd", _s(params, "action"))
     if cmd not in {"attach", "activity", "detach", "away", "protect", "status"}:
-        raise ValueError("client lease cmd must be attach, activity, detach, away, protect, or status")
+        raise ValueError(
+            "client lease cmd must be attach, activity, detach, away, protect, or status"
+        )
     argv = [cmd]
     if cmd == "protect":
         argv.extend([_s(params, "role"), str(_i(params, "minutes", 0))])
