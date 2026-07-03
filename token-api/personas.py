@@ -267,9 +267,8 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         "#3a6ea5",  # chip_color — civic blue
         None,
         None,
-        None,  # tts_voice, tts_rate, notification_sound (voiceless seat)
+        None,  # tts_voice, tts_rate, notification_sound (silent seat)
         default_session_doc="daily_note",  # bind today's Pax-ENV daily note
-        tts_policy="hot",
     ),
     PersonaSeed(
         "orchestrator",
