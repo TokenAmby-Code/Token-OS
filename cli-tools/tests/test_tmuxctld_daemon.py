@@ -345,7 +345,10 @@ def test_typing_guard_rehydrate_reads_projections_without_mutating_state() -> No
     )
     assert result["topology"] == "disabled"
     assert ("unbind-key", "-q", "-n", "Any") in calls
-    assert not any(call and call[0] == "set-option" for call in calls)
+    # Rehydrate must not mutate PER-PANE guard state (no `set-option -p`). It MAY
+    # project the GLOBAL @ANY_HOOKS topology marker (`set-option -g`), since
+    # rehydrate is itself a topology operation.
+    assert not any(call[:2] == ("set-option", "-p") for call in calls)
     assert not any(daemon.typing_guard_state.GUARD_JSON_OPTION in call for call in calls)
 
     calls.clear()
@@ -355,7 +358,8 @@ def test_typing_guard_rehydrate_reads_projections_without_mutating_state() -> No
     )
     assert result["topology"] == "enabled"
     assert any(call and call[0] == "source-file" for call in calls)
-    assert not any(call and call[0] == "set-option" for call in calls)
+    # Same rule: no per-pane guard mutation; the global @ANY_HOOKS marker is fine.
+    assert not any(call[:2] == ("set-option", "-p") for call in calls)
 
 
 def test_typing_guard_enable_any_is_idempotent_when_canonical_binding_present() -> None:
@@ -371,11 +375,12 @@ def test_typing_guard_enable_any_is_idempotent_when_canonical_binding_present() 
 
             proc = Proc()
             if args and args[0] == "list-keys":
-                # Canonical form self-unbinds and is display-message-free.
+                # Canonical form self-unbinds, is display-message-free, and
+                # swallows the ping's nonzero exit with `|| true`.
                 proc.stdout = (
                     "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
                     "'unbind-key -n Any ; run-shell -b \"tmuxctld-ping POST "
-                    "/typing-guard-state cmd=arm\" ; send-keys'"
+                    "/typing-guard-state cmd=arm >/dev/null 2>&1 || true\" ; send-keys'"
                 )
             return proc
 
@@ -451,6 +456,10 @@ def test_any_binding_template_self_unbinds_and_never_flashes_display_message() -
         "tmuxctld-ping POST /typing-guard-state cmd=arm"
     )
     assert ">/dev/null 2>&1" in tmpl
+    # The exit-swallow is load-bearing: `>/dev/null 2>&1` silences only the ping's
+    # own streams, but a nonzero exit still makes tmux's run-shell flash
+    # `'<cmd>' returned <N>`. `|| true` forces exit 0 so nothing surfaces.
+    assert ">/dev/null 2>&1 || true" in tmpl
     assert "display-message" not in tmpl
     assert "tmuxctld-ping-/typing-guard-state-failed" not in tmpl
 
@@ -466,10 +475,20 @@ def test_any_binding_status_treats_display_message_binding_as_noncanonical() -> 
         "|| env IMPERIUM_TMUX_RAW=1 tmux display-message "
         "tmuxctld-ping-/typing-guard-state-failed\" ; send-keys'"
     )
+    # The #559 form: self-unbinds and is display-message-free, but silences the
+    # ping with a bare `>/dev/null 2>&1` (no exit-swallow). tmux still flashes
+    # `'<cmd>' returned <N>` on a nonzero ping, so this must be treated as
+    # NON-canonical too — that is what re-sources the `|| true` form onto an
+    # already-running tmux server at the next focus/rehydrate.
+    stale_no_swallow = (
+        "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+        "'unbind-key -n Any ; run-shell -b \"tmuxctld-ping POST "
+        "/typing-guard-state cmd=arm pane=%1 >/dev/null 2>&1\" ; send-keys'"
+    )
     fresh = (
         "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
         "'unbind-key -n Any ; run-shell -b \"tmuxctld-ping POST "
-        "/typing-guard-state cmd=arm pane=%1\" ; send-keys'"
+        "/typing-guard-state cmd=arm pane=%1 >/dev/null 2>&1 || true\" ; send-keys'"
     )
 
     class FakeTmux:
@@ -490,9 +509,126 @@ def test_any_binding_status_treats_display_message_binding_as_noncanonical() -> 
     assert stale_status["present"] is True
     assert stale_status["canonical"] is False
 
+    stale_no_swallow_status = tg._any_binding_status(FakeTmux(stale_no_swallow))
+    assert stale_no_swallow_status["present"] is True
+    assert stale_no_swallow_status["canonical"] is False
+
     fresh_status = tg._any_binding_status(FakeTmux(fresh))
     assert fresh_status["present"] is True
     assert fresh_status["canonical"] is True
+
+
+def _guard_state_fake_tmux(state: dict, globals_: dict):
+    """A dict-backed FakeTmux that round-trips per-pane guard options, the global
+    @ANY_HOOKS marker, and the root Any binding (canonical live form)."""
+
+    class FakeTmux:
+        any_bound = True
+
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "show-options":
+                proc.stdout = state.get(args[-1], "")
+            elif args[:2] == ("set-option", "-g"):
+                globals_[args[-2]] = args[-1]
+            elif args[:2] == ("set-option", "-pu"):
+                state.pop(args[-1], None)
+            elif args[:2] == ("set-option", "-p"):
+                state[args[-2]] = args[-1]
+            elif args and args[0] == "list-keys":
+                proc.returncode = 0 if self.any_bound else 1
+                proc.stdout = (
+                    "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+                    "'unbind-key -n Any ; run-shell -b \"tmuxctld-ping POST "
+                    "/typing-guard-state cmd=arm >/dev/null 2>&1 || true\" ; send-keys'"
+                    if self.any_bound
+                    else ""
+                )
+            elif args[:4] == ("unbind-key", "-q", "-n", "Any"):
+                self.any_bound = False
+            elif args and args[0] == "source-file":
+                self.any_bound = True
+            return proc
+
+    return FakeTmux()
+
+
+def test_typing_guard_arm_yields_to_fresher_pending_submit() -> None:
+    """The `clear` alias burst ``c<Enter>`` races an arm (from ``c``) against a
+    pending submit (from Enter) on the single tmux command socket. A late-landing
+    arm must NOT clobber the fresher PENDING back to HUMAN(300s) — else the pane
+    is stranded guarded for five minutes (the 2026-07-03 "clear re-arms the guard"
+    report). arm yields when a live PENDING was written at or after this keystroke,
+    and converges to PENDING regardless of which write lands last."""
+    tg = daemon.typing_guard_state
+    state: dict[str, str] = {}
+    globals_: dict[str, str] = {}
+    fake = _guard_state_fake_tmux(state, globals_)
+
+    # Enter submit lands first: PENDING stamped at epoch 100.
+    tg.pending(fake, "%42", seconds=5, now=100)
+    assert json.loads(state[tg.GUARD_JSON_OPTION])["kind"] == "pending"
+
+    # The `c` keystroke's arm lands LAST, at the SAME epoch. It must yield.
+    tg.arm(fake, "%42", seconds=300, now=100)
+    assert json.loads(state[tg.GUARD_JSON_OPTION])["kind"] == "pending", (
+        "a same-burst arm must not resurrect HUMAN over the submit's PENDING"
+    )
+    # It re-enables root Any so a genuinely later keystroke can still convert.
+    assert fake.any_bound is True
+
+    # A genuinely LATER keystroke (after the submit epoch) DOES convert to HUMAN.
+    tg.arm(fake, "%42", seconds=300, now=101)
+    assert json.loads(state[tg.GUARD_JSON_OPTION])["kind"] == "human"
+    # ...and the HUMAN arm drops Any + flips the global marker off.
+    assert fake.any_bound is False
+    assert globals_.get(tg.ANY_HOOKS_OPTION) == "off"
+
+
+def test_typing_guard_arm_reverse_order_also_converges_to_pending() -> None:
+    """The opposite race — arm lands first, pending lands last — is already safe
+    because pending() writes unconditionally. Both orderings end at PENDING."""
+    tg = daemon.typing_guard_state
+    state: dict[str, str] = {}
+    globals_: dict[str, str] = {}
+    fake = _guard_state_fake_tmux(state, globals_)
+
+    tg.arm(fake, "%42", seconds=300, now=100)
+    assert json.loads(state[tg.GUARD_JSON_OPTION])["kind"] == "human"
+    tg.pending(fake, "%42", seconds=5, now=100)
+    assert json.loads(state[tg.GUARD_JSON_OPTION])["kind"] == "pending"
+
+
+def test_any_hooks_marker_projected_by_enable_and_disable() -> None:
+    """The GLOBAL @ANY_HOOKS statusline marker tracks Any topology: ``on`` while
+    the root ordinary-key hook is bound, ``off`` while a live HUMAN guard has
+    dropped it. This is the operator's at-a-glance guard-ON == hooks-dropped
+    proof, set only by the canonical topology togglers."""
+    tg = daemon.typing_guard_state
+    globals_: dict[str, str] = {}
+    state: dict[str, str] = {}
+
+    fake_off = _guard_state_fake_tmux(state, globals_)
+    fake_off.any_bound = False
+    tg.enable_any_binding(fake_off)
+    assert globals_.get(tg.ANY_HOOKS_OPTION) == "on"
+
+    globals_.clear()
+    fake_on = _guard_state_fake_tmux(state, globals_)
+    fake_on.any_bound = True
+    tg.disable_any_binding(fake_on)
+    assert globals_.get(tg.ANY_HOOKS_OPTION) == "off"
+
+    # Idempotent disable (Any already absent) still asserts the off marker.
+    globals_.clear()
+    fake_absent = _guard_state_fake_tmux(state, globals_)
+    fake_absent.any_bound = False
+    tg.disable_any_binding(fake_absent)
+    assert globals_.get(tg.ANY_HOOKS_OPTION) == "off"
 
 
 def test_typing_guard_topology_endpoint_rehydrates_without_state_command(monkeypatch) -> None:

@@ -407,6 +407,58 @@ def test_typing_guard_submit_backspace_and_ctrl_c_use_one_pending_helper() -> No
         assert "tmuxctld-ping POST /typing-guard-state" not in pending_branch
 
 
+def test_typing_guard_bindings_swallow_nonzero_exit_so_tmux_never_flashes() -> None:
+    """Every keystroke-guard ping must end with ``|| true``.
+
+    ``>/dev/null 2>&1`` silences only the ping's OWN streams; a nonzero exit
+    (daemon slow / mid-restart / curl fail) still makes tmux's own ``run-shell``
+    flash ``'<cmd>' returned <N>`` onto the Emperor's status line. That is the
+    2026-07-03 mid-typing flash — a regression of #559, which removed the
+    ``|| … display-message …`` clause that had ALSO been forcing exit 0. The
+    trailing ``|| true`` forces the shell command to exit 0 so nothing surfaces.
+    """
+    conf = CONF.read_text(encoding="utf-8")
+    # The Any arm binding.
+    any_binding = conf.split("bind -n Any {", 1)[1].split("}\nbind -n Enter", 1)[0]
+    assert ">/dev/null 2>&1 || true" in any_binding, (
+        "the Any arm ping must swallow its nonzero exit with || true"
+    )
+    # The permanently-bound submit/edit keys.
+    for key in ("Enter", "C-m", "BSpace", "C-h", "C-c"):
+        line = _line_starting(f"bind -n {key} ")
+        assert "tmuxctld-ping POST /typing-guard-state" in line
+        # Each ping in the line is exit-swallowed; no ping ends in a bare redirect.
+        assert ">/dev/null 2>&1 || true" in line, (
+            f"{key} guard ping must end with || true so a nonzero ping never flashes"
+        )
+        assert ">/dev/null 2>&1 ;" not in line and '>/dev/null 2>&1"' not in line, (
+            f"{key} must not leave a ping silenced by redirect alone (still flashes)"
+        )
+    # The rogue token must not survive in any BINDING (a historical comment
+    # documenting the removed form is fine, so scope this to bind lines).
+    for line in conf.splitlines():
+        if line.lstrip().startswith("bind"):
+            assert "tmuxctld-ping-/typing-guard-state-failed" not in line
+
+
+def test_status_right_renders_any_hooks_marker_zero_fork() -> None:
+    """The GLOBAL statusline exposes the daemon-pushed @ANY_HOOKS topology marker
+    so the guard-ON == all-keystroke-hooks-dropped state is visible at a glance.
+    It reads a pushed @-var (ZERO fork) and must never shell out."""
+    status_right = _line_starting("set -g status-right ")
+    assert "@ANY_HOOKS" in status_right
+    # Both states render: the salient dropped-hooks state and the normal state.
+    assert "Any:off" in status_right
+    assert "Any:on" in status_right
+    # Zero-fork: no #() shell-out, no display-message, no guard scan.
+    assert "#(" not in status_right, "status-right must not shell out"
+    assert "display-message" not in status_right
+    # It gates on the @ANY_HOOKS value, not a per-pane guard projection.
+    assert "#{==:#{@ANY_HOOKS},off}" in status_right
+    # The timer segment is preserved alongside the new marker.
+    assert "#{@TIMER_SEG}" in status_right
+
+
 def test_pane_border_identity_is_blank_by_default() -> None:
     """A clean pane (no agent) shows NO nametag.
 

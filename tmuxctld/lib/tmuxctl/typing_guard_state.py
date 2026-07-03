@@ -23,6 +23,13 @@ GUARD_JSON_OPTION = "@TYPING_GUARD_JSON"
 GUARD_UNTIL_OPTION = "@TYPING_GUARD_UNTIL"
 GUARD_KIND_OPTION = "@TYPING_GUARD_KIND"
 GUARD_MARKER_OPTION = "@TYPING_GUARD_MARKER"
+#: GLOBAL (not per-pane) marker projecting whether the root ``Any`` ordinary-key
+#: hook is currently enabled.  ``on`` while Any is bound (typing arms the guard),
+#: ``off`` while a live HUMAN guard has dropped it — i.e. guard-ON == hooks-OFF.
+#: The generic statusline renders this so the "all keystroke hooks dropped" state
+#: is visible at a glance.  Toggled only by ``enable_any_binding`` /
+#: ``disable_any_binding``, the canonical topology togglers.
+ANY_HOOKS_OPTION = "@ANY_HOOKS"
 LEGACY_GUARD_OPTIONS = (
     "@GUARD",
     "@TYPING_LOCK_UNTIL",
@@ -44,14 +51,19 @@ AGENT_MARKER = "#[fg=green,bold]⌨#[default]"
 #: The keystroke branch drops the Any hook synchronously (``unbind-key -n Any``)
 #: before firing the arm, so one keystroke arms once and later keystrokes pass
 #: through with no per-keystroke ping storm.  Arm failure is silent
-#: (``>/dev/null 2>&1``) — a best-effort background control-plane write must
-#: never flash ``display-message`` at the Emperor's client.  Must stay in sync
-#: with the ``bind -n Any`` block in ``cli-tools/tmux/tmux-base.conf``.
+#: (``>/dev/null 2>&1 || true``) — a best-effort background control-plane write
+#: must never flash at the Emperor's client.  The trailing ``|| true`` is load
+#: bearing: ``>/dev/null 2>&1`` only silences the ping's OWN streams, but a
+#: nonzero exit (daemon slow / mid-restart / curl fail) still makes tmux's own
+#: ``run-shell`` flash ``'<cmd>' returned <N>`` onto the status line — the exact
+#: mid-typing flash the Emperor saw 2026-07-03.  Forcing the shell command to
+#: exit 0 is what actually suppresses it.  Must stay in sync with the
+#: ``bind -n Any`` block in ``cli-tools/tmux/tmux-base.conf``.
 ANY_BINDING = """\
 bind -n Any {
   if -F '#{==:#{mouse_x},}' {
     unbind-key -n Any
-    run-shell -b "tmuxctld-ping POST /typing-guard-state cmd=arm pane=#{q:pane_id} seconds=300 now=#{client_activity} client=#{q:client_tty} term=#{q:client_termname} pid=#{q:client_pid} session=#{q:session_name} >/dev/null 2>&1"
+    run-shell -b "tmuxctld-ping POST /typing-guard-state cmd=arm pane=#{q:pane_id} seconds=300 now=#{client_activity} client=#{q:client_tty} term=#{q:client_termname} pid=#{q:client_pid} session=#{q:session_name} >/dev/null 2>&1 || true"
     send-keys
   } {
   }
@@ -129,10 +141,28 @@ def _any_binding_status(tmux: Tmux) -> dict[str, Any]:
             "#{==:#{mouse_x},}",
             "unbind-key -n Any",
             "tmuxctld-ping POST /typing-guard-state cmd=arm",
+            # The exit-swallow must be present: a binding that only redirects
+            # streams (``>/dev/null 2>&1`` without ``|| true``) still lets tmux
+            # flash ``'<cmd>' returned <N>`` on a nonzero ping.  Treating that
+            # form as non-canonical re-sources the silent one onto an
+            # already-running tmux server at the next focus/rehydrate.
+            "|| true",
             "send-keys",
         )
     ) and "display-message" not in raw
     return {"present": present, "canonical": canonical, "raw": raw[:500]}
+
+
+def _set_any_hooks_marker(tmux: Tmux, *, enabled: bool) -> None:
+    """Project the GLOBAL Any-hooks statusline marker (best-effort).
+
+    ``on`` while the root ``Any`` ordinary-key hook is bound, ``off`` while a live
+    HUMAN guard has dropped it.  This is the operator's at-a-glance proof of the
+    guard-ON == hooks-dropped state.  Never raises — a projection failure must
+    never break topology changes.
+    """
+
+    tmux.run("set-option", "-g", ANY_HOOKS_OPTION, "on" if enabled else "off", timeout=0.3)
 
 
 def enable_any_binding(tmux: Tmux) -> dict[str, Any]:
@@ -144,6 +174,7 @@ def enable_any_binding(tmux: Tmux) -> dict[str, Any]:
 
     current = _any_binding_status(tmux)
     if current["canonical"]:
+        _set_any_hooks_marker(tmux, enabled=True)
         return {
             "topology": "enabled",
             "any_bound": True,
@@ -163,6 +194,8 @@ def enable_any_binding(tmux: Tmux) -> dict[str, Any]:
                 os.unlink(path)
             except OSError:
                 pass
+    if ok:
+        _set_any_hooks_marker(tmux, enabled=True)
     return {
         "topology": "enabled",
         "any_bound": bool(ok),
@@ -177,9 +210,12 @@ def disable_any_binding(tmux: Tmux) -> dict[str, Any]:
 
     current = _any_binding_status(tmux)
     if not current["present"]:
+        _set_any_hooks_marker(tmux, enabled=False)
         return {"topology": "disabled", "any_bound": False, "changed": False, "ok": True}
 
     ok = _run_ok(tmux, "unbind-key", "-q", "-n", "Any")
+    if ok:
+        _set_any_hooks_marker(tmux, enabled=False)
     return {"topology": "disabled", "any_bound": not bool(ok), "changed": bool(ok), "ok": bool(ok)}
 
 
@@ -252,24 +288,31 @@ def clear_legacy_options(tmux: Tmux, pane: str) -> None:
         unset_option(tmux, pane, option)
 
 
+def _coerce_epoch(value: Any) -> int | None:
+    try:
+        return int(float(value)) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_record(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        return {"kind": OFF, "until": None, "owner": None, "source": SOURCE}
+        return {"kind": OFF, "until": None, "owner": None, "source": SOURCE, "at": None}
     kind = str(raw.get("kind") or OFF).strip().lower()
     if kind == "on":
         kind = HUMAN
     if kind not in {HUMAN, PENDING, AGENT, OFF}:
         kind = OFF
-    until_raw = raw.get("until")
-    try:
-        until = int(float(until_raw)) if until_raw not in (None, "") else None
-    except (TypeError, ValueError):
-        until = None
+    until = _coerce_epoch(raw.get("until"))
     owner = raw.get("owner")
     if owner is not None:
         owner = str(owner).strip() or None
     source = str(raw.get("source") or SOURCE)
-    return {"kind": kind, "until": until, "owner": owner, "source": source}
+    # ``at`` = the epoch the record was written.  It is the tie-breaker that lets
+    # a submit (Enter -> PENDING) win a same-burst race against the ordinary
+    # keystroke that preceded it (see ``arm``); older records simply lack it.
+    at = _coerce_epoch(raw.get("at"))
+    return {"kind": kind, "until": until, "owner": owner, "source": source, "at": at}
 
 
 def read_record(tmux: Tmux, pane: str) -> dict[str, Any]:
@@ -315,7 +358,10 @@ def write_record(
     owner: str | None = None,
     now: int | None = None,
 ) -> dict[str, Any]:
-    normalized = _normalize_record({"kind": kind, "until": until, "owner": owner, "source": SOURCE})
+    write_at = now_epoch() if now is None else now
+    normalized = _normalize_record(
+        {"kind": kind, "until": until, "owner": owner, "source": SOURCE, "at": write_at}
+    )
     if normalized["kind"] == OFF:
         normalized["until"] = None
         normalized["owner"] = None
@@ -364,10 +410,24 @@ def arm(
     pid: str | None = None,
     session: str | None = None,
 ) -> dict[str, Any]:
-    current = status(tmux, pane, now=now)
-    if current["kind"] == HUMAN and current["active"]:
+    record = _active_record(tmux, pane, now=now)
+    if record["kind"] == HUMAN:
         disable_any_binding(tmux)
-        return current
+        return status(tmux, pane, now=now)
+    if record["kind"] == PENDING:
+        pending_at = record.get("at")
+        if pending_at is not None and int(pending_at) >= now:
+            # A submit (Enter/C-m -> PENDING) written at or after this keystroke
+            # supersedes it.  This keystroke PRECEDED the submit — the classic
+            # `clear` alias burst ``c<Enter>``, whose arm and pending writes race
+            # on the single tmux command socket.  A late-landing arm must NOT
+            # resurrect HUMAN(300s) over the fresher PENDING and strand the pane
+            # guarded for five minutes (the 2026-07-03 "clear re-arms the guard"
+            # report).  Yield: leave PENDING intact and re-enable root Any so a
+            # genuinely LATER keystroke still converts PENDING -> HUMAN.  Safety
+            # holds meanwhile: PENDING is itself send-blocking.
+            enable_any_binding(tmux)
+            return status(tmux, pane, now=now)
     mark_client_activity(client=client, term=term, pid=pid, session=session)
     result = write_record(tmux, pane, kind=HUMAN, until=now + int(seconds), owner=None, now=now)
     disable_any_binding(tmux)
