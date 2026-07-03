@@ -2,6 +2,12 @@
 // Pure Node.js HTTP server (no Express/Fastify dependency needed)
 
 import { createServer } from 'http';
+import {
+  DISCORD_MESSAGE_CONTENT_LIMIT,
+  isDiscordContentLengthValidationError,
+  sendChunkedDiscordContent,
+  splitDiscordMessageContent,
+} from './outbound-message.js';
 
 export function createHttpServer(
   botClients,
@@ -37,6 +43,34 @@ export function createHttpServer(
       if (cid === id) return name;
     }
     return id;
+  }
+
+  function logOutboundResult(kind, target, result, content) {
+    const chunks = splitDiscordMessageContent(content || '');
+    const meta = {
+      event: 'discord_outbound_send',
+      kind,
+      target,
+      chunked: chunks.length > 1,
+      chunk_count: chunks.length,
+      total_length: (content || '').length,
+      max_chunk_length: chunks.length ? Math.max(...chunks.map(c => c.length)) : 0,
+      message_id: result?.message_id || null,
+      message_ids: result?.message_ids || (result?.message_id ? [result.message_id] : []),
+    };
+    logger.info(`discord_outbound_send ${JSON.stringify(meta)}`);
+  }
+
+  async function sendViaClient(discord, channelId, content, options = {}) {
+    return sendChunkedDiscordContent(
+      content,
+      async (chunk, meta) => {
+        if (typeof chunk === 'string' && chunk.length > DISCORD_MESSAGE_CONTENT_LIMIT) {
+          throw new Error(`Refusing Discord send chunk over ${DISCORD_MESSAGE_CONTENT_LIMIT} characters`);
+        }
+        return discord.sendMessage(channelId, chunk, meta.is_first ? options : {});
+      },
+    );
   }
 
   // Parse JSON body
@@ -136,25 +170,29 @@ export function createHttpServer(
         const pendingId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         messageStore.persist(pendingId, { channel: body.channel, channelId, content: body.content });
 
-        // If thread_id is provided, send to that thread instead
         let result;
-        if (body.thread_id) {
-          const thread = await resolveClient(body.bot).client.channels.fetch(body.thread_id);
-          const msg = await thread.send({ content: body.content, embeds: body.embeds });
-          result = {
-            message_id: msg.id,
-            channel_id: msg.channelId,
-            timestamp: msg.createdAt.toISOString(),
-          };
-        } else {
-          result = await resolveClient(body.bot).sendMessage(channelId, body.content, {
-            embeds: body.embeds,
-            reply_to: body.reply_to,
-          });
+        try {
+          // If thread_id is provided, send to that thread instead
+          if (body.thread_id) {
+            result = await sendViaClient(resolveClient(body.bot), body.thread_id, body.content, {
+              embeds: body.embeds,
+            });
+          } else {
+            result = await sendViaClient(resolveClient(body.bot), channelId, body.content, {
+              embeds: body.embeds,
+              reply_to: body.reply_to,
+            });
+          }
+        } catch (err) {
+          if (isDiscordContentLengthValidationError(err)) {
+            messageStore.remove(pendingId);
+            err.terminal_discord_validation = true;
+          }
+          throw err;
         }
 
         messageStore.remove(pendingId);
-        logger.info(`Sent to ${channelName(channelId)}: ${(body.content || '').slice(0, 60)}`);
+        logOutboundResult('channel', body.thread_id || channelName(channelId), result, body.content || '');
         return json(res, result);
       }
 
@@ -255,7 +293,7 @@ export function createHttpServer(
         const body = await parseBody(req);
         if (!body.content) return json(res, { error: 'content required' }, 400);
         const result = await resolveClient(body.bot).sendDM(body.content);
-        logger.info(`DM sent: ${body.content.slice(0, 60)}`);
+        logOutboundResult('dm', 'operator', result, body.content || '');
         return json(res, result);
       }
 
@@ -359,14 +397,9 @@ export function createHttpServer(
         if (!body.thread_id) return json(res, { error: 'thread_id required' }, 400);
         if (!body.content) return json(res, { error: 'content required' }, 400);
 
-        const thread = await resolveClient(body.bot).client.channels.fetch(body.thread_id);
-        const msg = await thread.send({ content: body.content });
-        logger.info(`Sent to thread ${body.thread_id}: ${body.content.slice(0, 60)}`);
-        return json(res, {
-          message_id: msg.id,
-          channel_id: msg.channelId,
-          timestamp: msg.createdAt.toISOString(),
-        });
+        const result = await sendViaClient(resolveClient(body.bot), body.thread_id, body.content);
+        logOutboundResult('thread', body.thread_id, result, body.content || '');
+        return json(res, result);
       }
 
       // POST /thread/archive — Archive a thread (removes from active UI)
@@ -533,6 +566,9 @@ export function createHttpServer(
         subscribeListeners.clear();
         server.close(resolve);
       });
+    },
+    address() {
+      return server.address();
     },
   };
 }
