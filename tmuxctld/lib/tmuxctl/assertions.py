@@ -291,17 +291,43 @@ def _runtime_has_instance(adapter: TmuxAdapter, pane_id: str) -> bool:
 # seat respawn, so a stale singleton identity carried in the server's launch env
 # can never bleed into the fresh seat (the dispatch-persona-leak failure mode).
 # The seat's own identity (PERSONA / WRAPPER_ID / …) is set explicitly
-# below. TMUX_PANE is deliberately NOT scrubbed: tmux provides the correct pane id
-# to the respawned process and SessionStart needs it.
+# below. Name/session-doc aliases are included because pane-scoped helpers use
+# them as identity plumbing. TMUX_PANE is deliberately NOT scrubbed: tmux provides
+# the correct pane id to the respawned process and SessionStart needs it.
 _PERSONA_SEAT_ENV_SCRUB = (
     "TOKEN_API_INSTANCE_ID",
+    "INSTANCE_ID",
     "TOKEN_API_PARENT_INSTANCE_ID",
+    "PARENT_INSTANCE_ID",
     "TOKEN_API_LEGION",
+    "LEGION",
+    "TOKEN_API_PERSONA",
+    "PERSONA",
     "TOKEN_API_PERSONA_SLUG",
+    "PERSONA_SLUG",
     "TOKEN_API_PERSONA_ID",
+    "PERSONA_ID",
     "TOKEN_API_DISPLAY_NAME",
+    "DISPLAY_NAME",
+    "TOKEN_API_INSTANCE_NAME",
+    "INSTANCE_NAME",
+    "TOKEN_API_TAB_NAME",
+    "TAB_NAME",
+    "TOKEN_API_NAME",
+    "TOKEN_API_INSTANCE_NAME_PREFIX",
+    "INSTANCE_NAME_PREFIX",
     "TOKEN_API_VAULT_DOMAIN",
+    "VAULT_DOMAIN",
     "TOKEN_API_SESSION_DOC_ID",
+    "SESSION_DOC_ID",
+    "TOKEN_API_SESSION_DOC",
+    "SESSION_DOC",
+    "TOKEN_API_SESSION_DOC_PATH",
+    "SESSION_DOC_PATH",
+    "TOKEN_API_WRAPPER_ID",
+    "WRAPPER_ID",
+    "TOKEN_API_WRAPPER_LAUNCH_ID",
+    "WRAPPER_LAUNCH_ID",
 )
 
 

@@ -1843,6 +1843,11 @@ def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Pa
             "TOKEN_API_PERSONA": "fabricator-general",
             "TOKEN_API_PARENT_INSTANCE_ID": "fabricator-general-live-id",
             "TOKEN_API_LEGION": "mechanicus",
+            "TOKEN_API_SESSION_DOC_ID": "2058",
+            "SESSION_DOC_ID": "2058",
+            "TOKEN_API_INSTANCE_NAME": "fabricator-general",
+            "INSTANCE_NAME": "fabricator-general",
+            "TOKEN_API_DISPLAY_NAME": "Fabricator-General",
         }
     )
 
@@ -1869,10 +1874,18 @@ def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Pa
     assert "TOKEN_API_PARENT_INSTANCE_ID=fabricator-general-live-id" not in result.stdout
     assert "TOKEN_API_PERSONA=fabricator-general" not in result.stdout
     assert "TOKEN_API_LEGION=mechanicus" not in result.stdout
+    assert "TOKEN_API_SESSION_DOC_ID=2058" not in result.stdout
+    assert "SESSION_DOC_ID=2058" not in result.stdout
+    assert "TOKEN_API_INSTANCE_NAME=fabricator-general" not in result.stdout
+    assert "INSTANCE_NAME=fabricator-general" not in result.stdout
     assert "-u TMUX_PANE" in result.stdout
     assert "-u TOKEN_API_INSTANCE_ID" in result.stdout
     assert "-u TOKEN_API_PARENT_INSTANCE_ID" in result.stdout
     assert "-u TOKEN_API_PERSONA" in result.stdout
+    assert "-u TOKEN_API_SESSION_DOC_ID" in result.stdout
+    assert "-u SESSION_DOC_ID" in result.stdout
+    assert "-u TOKEN_API_INSTANCE_NAME" in result.stdout
+    assert "-u INSTANCE_NAME" in result.stdout
     assert "-u TOKEN_API_LEGION" in result.stdout
 
 
