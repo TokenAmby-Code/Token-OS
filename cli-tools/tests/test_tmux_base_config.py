@@ -72,7 +72,11 @@ def test_pane_select_enter_expands_without_status_flash() -> None:
     assert "#{client_tty}" in line
     assert "tmux-run" not in line
     assert "tmux-grid-expand" not in line
-    assert "display-message tmuxctld-ping-/grid-expand-failed" in line
+    # A transport/handler failure surfaces a concise human message, never a raw
+    # `tmuxctld-ping-/…` transport slug.
+    assert "tmuxctld-ping-/grid-expand-failed" not in line
+    assert "IMPERIUM_TMUX_RAW" not in line
+    assert "display-message 'expand failed'" in line
 
 
 def test_pane_select_table_arrows_are_bound_to_relative_routing() -> None:
@@ -527,9 +531,14 @@ def test_pane_died_hook_routes_to_tmuxctld_event_not_raw_respawn() -> None:
     assert "tmuxctld-ping POST /event" in line
     assert "event=pane-died" in line
     assert "pane=#{pane_id}" in line
-    assert ">/dev/null" in line
-    assert "display-message" in line
     assert "tmux-pane-respawn" not in line
+    # Background control-plane hook: a failed ping must never flash a raw
+    # diagnostic to the human status line. It silences both streams and forces
+    # exit 0 so tmux's own run-shell never surfaces `'<cmd>' returned <N>` either.
+    assert ">/dev/null 2>&1 || true" in line
+    assert "display-message" not in line
+    assert "tmuxctld-ping-/" not in line
+    assert "IMPERIUM_TMUX_RAW" not in line
 
 
 def test_first_slice_keybinds_route_to_tmuxctld_ping_not_tmux_run() -> None:
@@ -553,30 +562,64 @@ def test_first_slice_keybinds_route_to_tmuxctld_ping_not_tmux_run() -> None:
         assert "tmux-run" not in line
 
 
-def test_prefix_n_hybrid_uses_daemon_for_empty_name_and_legacy_for_explicit_name() -> None:
+def test_prefix_n_rename_routes_to_daemon_without_raw_slug() -> None:
+    """prefix+n rename routes to the implemented daemon /pane-rename handler and
+    passes the typed name (empty = interview). A ping failure is swallowed
+    silently — it must never flash a raw `tmuxctld-ping-/pane-rename-failed`
+    transport slug at the human.
+
+    (The earlier draft of this guard asserted a not-yet-built explicit-name
+    hybrid that shelled out to tmux-pane-rename AND kept the raw slug; that
+    design was never implemented and its raw-slug requirement conflicts with the
+    no-raw-status-line contract, so the guard now encodes the shipped daemon path.)
+    """
     line = _line_starting("bind n ")
     assert "command-prompt" in line
-    assert 'if [ -z \\"%%\\" ]' in line
     assert "tmuxctld-ping POST /pane-rename" in line
     assert 'pane=\\"#{pane_id}\\"' in line
-    assert 'name=\\"\\"' in line
-    assert "tmuxctld-ping-/pane-rename-failed" in line
-    assert "tmux-run tmux-pane-rename" in line
-    assert '\\"%%\\"' in line
+    assert 'name=\\"%%\\"' in line
+    assert ">/dev/null 2>&1 || true" in line
+    assert "tmuxctld-ping-/pane-rename-failed" not in line
+    assert "IMPERIUM_TMUX_RAW" not in line
 
 
 def test_missing_daemon_endpoint_keybinds_remain_on_legacy_paths() -> None:
-    expected = {
-        "bind d ": "tmux-shuttle",
-        "bind P ": "tmux-tts-listen",
-        "bind B ": "ethereal-prompt",
-        "bind R ": "tmux-reset",
+    """501-anchor keybinds must not route through tmuxctld-ping.
+
+    The daemon /shuttle, /reset, /tts/listen routes are intentional 501 anchors
+    and their legacy scripts are 410-on-touch shims (or, for tts-listen, absent),
+    so there is no working handler to bind. Rather than flash a raw
+    `tmuxctld-ping-/…-failed` transport slug (or a shim's `returned 154`), those
+    keys are DISABLED with a concise, non-raw human message. prefix+B is the one
+    genuinely-working legacy path — it binds directly to the real ethereal-prompt
+    script — and Space/Q remain on their working script launchers.
+    """
+    # Disabled 501-anchor keys: concise human message, no daemon ping, no slug.
+    for prefix, label in {
+        "bind d ": "shuttle",
+        "bind R ": "reset",
+        "bind P ": "tts-listen",
+    }.items():
+        line = _line_starting(prefix)
+        assert "display-message" in line
+        assert label in line
+        assert "tmuxctld-ping" not in line
+        assert "tmuxctld-ping-/" not in line
+        assert "IMPERIUM_TMUX_RAW" not in line
+
+    # prefix+B: restored to the real, working ethereal-prompt script (not the
+    # 501 daemon anchor). A script failure shows a concise non-raw message.
+    bind_b = _line_starting("bind B ")
+    assert "ethereal-prompt" in bind_b
+    assert "tmuxctld-ping POST" not in bind_b
+    assert "tmuxctld-ping-/" not in bind_b
+    assert "IMPERIUM_TMUX_RAW" not in bind_b
+
+    # Working script launchers stay off the daemon path.
+    for prefix, command in {
         "bind Space ": "tmux-legion-prompt-popup",
         "bind Q ": "tmux-mark-for-close",
-        "bind W ": "tmux-run tx start",
-    }
-
-    for prefix, command in expected.items():
+    }.items():
         line = _line_starting(prefix)
         assert command in line
         assert "tmuxctld-ping POST" not in line
@@ -593,6 +636,68 @@ def test_501_anchor_paths_are_not_bound_through_tmuxctld_ping() -> None:
         "/legion-prompt",
     ):
         assert f"tmuxctld-ping POST {route}" not in conf
+
+
+def test_no_raw_transport_slug_flashes_to_status_line() -> None:
+    """Anti-regression sweep: no live binding or hook may leak a raw
+    `tmuxctld-ping-/…-failed` transport slug (or its IMPERIUM_TMUX_RAW marker)
+    onto the human tmux status line. Comments documenting the removed pattern are
+    allowed; only executable (non-comment) lines are checked.
+
+    This is the core contract for the 2026-07-03 status-line-flash bug: 501-anchor
+    keys are disabled with concise messages, background hooks fail silently, and
+    implemented-route failures use concise human messages — none surface the raw
+    internal transport token.
+    """
+    conf = CONF.read_text(encoding="utf-8")
+    offenders = []
+    for line in conf.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        if "tmuxctld-ping-/" in line or "IMPERIUM_TMUX_RAW" in line:
+            offenders.append(line)
+    assert not offenders, "raw transport slug leaks to status line:\n" + "\n".join(offenders)
+
+
+def test_lifecycle_hooks_fail_silently_without_raw_tokens() -> None:
+    """pane-died / client-attached / client-detached are best-effort background
+    control-plane notifications: a failed ping must silence both streams and
+    force exit 0 (`>/dev/null 2>&1 || true`) so neither a raw slug nor tmux's own
+    `'<cmd>' returned <N>` ever flashes at the human."""
+    for prefix in (
+        "set-hook -g pane-died[90] ",
+        "set-hook -g client-attached[10] ",
+        "set-hook -g client-detached ",
+    ):
+        line = _line_starting(prefix)
+        assert "tmuxctld-ping POST" in line
+        assert ">/dev/null 2>&1 || true" in line
+        assert "display-message" not in line
+        assert "tmuxctld-ping-/" not in line
+        assert "IMPERIUM_TMUX_RAW" not in line
+
+
+def test_implemented_route_keybinds_use_concise_message_not_raw_slug() -> None:
+    """User-invoked implemented daemon routes still ping the daemon, but a
+    transport/handler failure surfaces a concise human message — never a raw
+    `tmuxctld-ping-/…` transport slug."""
+    expected = {
+        "bind F ": ("/focus", "focus failed"),
+        "bind e ": ("/grid-expand", "expand failed"),
+        "bind E ": ("/persona-engine", "persona swap failed"),
+        "bind M ": ("/mode-toggle", "mode toggle failed"),
+        "bind S ": ("/open-session-doc", "session doc unavailable"),
+        "bind g ": ("/goto-spoken", "goto-spoken failed"),
+    }
+    for prefix, (route, message) in expected.items():
+        line = _line_starting(prefix)
+        assert f"tmuxctld-ping POST {route}" in line
+        assert f"display-message '{message}'" in line
+        assert "tmuxctld-ping-/" not in line
+        assert "IMPERIUM_TMUX_RAW" not in line
+        # Failure path exits 0 (via the display-message) so tmux never flashes
+        # `'<cmd>' returned <N>` either; both ping streams are silenced first.
+        assert ">/dev/null 2>&1 ||" in line
 
 
 def test_workspace_launcher_remains_on_tmux_run_and_is_documented() -> None:
