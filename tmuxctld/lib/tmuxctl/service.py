@@ -6,6 +6,7 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -1169,9 +1170,8 @@ class TmuxControlPlane:
             return {"status": "missing_db", "db_path": str(path)}
 
         events = ("tts_playing", "tts_starting", "tts_queued")
-        conn = sqlite3.connect(path)
-        conn.row_factory = sqlite3.Row
-        try:
+        with closing(sqlite3.connect(path)) as conn:
+            conn.row_factory = sqlite3.Row
             placeholders = ",".join("?" * len(events))
             row = conn.execute(
                 f"""
@@ -1189,8 +1189,6 @@ class TmuxControlPlane:
                 """,
                 events,
             ).fetchone()
-        finally:
-            conn.close()
 
         if row is None:
             self.adapter.run(

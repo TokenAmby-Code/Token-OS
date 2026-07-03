@@ -16,6 +16,7 @@ unclosed connections never reach ``close``), GREEN after.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import sqlite3
 import sys
@@ -95,4 +96,48 @@ def test_send_gate_helpers_close_every_connection(db, monkeypatch):
     assert not leaked, (
         f"{len(opened)} connections opened, {len(closed_ids)} closed — "
         f"{len(leaked)} leaked (missing contextlib.closing)"
+    )
+
+
+def test_daemon_sqlite_connects_are_wrapped_in_closing() -> None:
+    """Long-lived daemon modules must not rely on ``with sqlite3.connect`` alone."""
+    repo_root = ROOT.parent
+    checked = [
+        repo_root / "tmuxctld" / "lib" / "tmuxctl" / "send_gate.py",
+        repo_root / "tmuxctld" / "lib" / "tmuxctl" / "service.py",
+    ]
+    for path in checked:
+        tree = ast.parse(path.read_text())
+        parents: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not _is_sqlite_connect_call(node):
+                continue
+            parent = parents.get(node)
+            assert isinstance(parent, ast.Call) and _is_closing_call(parent), (
+                f"{path}:{node.lineno} must wrap sqlite3.connect in contextlib.closing"
+            )
+
+
+def _is_sqlite_connect_call(node: ast.Call) -> bool:
+    func = node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "connect"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "sqlite3"
+    )
+
+
+def _is_closing_call(node: ast.Call) -> bool:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "closing"
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "closing"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "contextlib"
     )

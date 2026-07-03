@@ -196,6 +196,150 @@ def test_health_shape() -> None:
         server.shutdown()
 
 
+class HangingStackAdapter(StubAdapter):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def list_sessions(self) -> list:
+        return ["main"]
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("list-windows", "-t", "main"):
+            return "mars\n"
+        if args[:1] == ("split-window",):
+            return "%991\n"
+        if args[:3] == ("list-panes", "-t", "main:mars"):
+            return ""
+        if args[:1] == ("set-option",):
+            return ""
+        if args[:1] == ("send-keys",):
+            type(self).entered.set()
+            assert type(self).release.wait(timeout=5), "test did not release hanging send"
+            return ""
+        return ""
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+
+def test_health_reports_degraded_when_stack_operation_is_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/health must not stay blindly green while a stack op is wedged.
+
+    This reproduces the incident shape without live tmux: one /stack/dispatch
+    worker blocks below the daemon route while /health remains reachable.  The
+    health payload must expose the stuck operation before callers hit their 60s
+    ceiling.
+    """
+    HangingStackAdapter.entered.clear()
+    HangingStackAdapter.release.clear()
+    monkeypatch.setenv("IMPERIUM_ALLOW_TMUX_FOCUS", "1")
+    monkeypatch.setenv("TMUXCTLD_DEGRADED_OPERATION_SECONDS", "0.01")
+    server, _ = _serve(HangingStackAdapter)
+    result_box: dict = {}
+
+    def send() -> None:
+        result_box["status"], result_box["payload"] = _post_timeout(
+            server,
+            "/stack/dispatch",
+            {
+                "base": "mars",
+                "command": "echo launched",
+                "session": "main",
+                "focus": False,
+                "settle": 0,
+            },
+            timeout=5,
+        )
+
+    thread = threading.Thread(target=send)
+    thread.start()
+    try:
+        assert HangingStackAdapter.entered.wait(timeout=2), "stack dispatch did not enter send"
+        time.sleep(0.03)
+        status, payload = _get(server, "/health")
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["operation_degraded"] is True
+        stuck = payload["stuck_operations"]
+        assert stuck and stuck[0]["path"] == "/stack/dispatch"
+        assert stuck[0]["age_seconds"] >= 0.01
+    finally:
+        HangingStackAdapter.release.set()
+        thread.join(timeout=5)
+        server.shutdown()
+    assert not thread.is_alive()
+    assert result_box["payload"]["ok"] is True
+
+
+class FastStackAdapter(StubAdapter):
+    _lock = threading.Lock()
+    _next = 0
+
+    def __init__(self) -> None:
+        with type(self)._lock:
+            type(self)._next += 1
+            self.n = type(self)._next
+
+    def list_sessions(self) -> list:
+        return ["main"]
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("list-windows", "-t", "main"):
+            return "mars\n"
+        if args[:1] == ("split-window",):
+            return f"%{1000 + self.n}\n"
+        if args[:3] == ("list-panes", "-t", "main:mars"):
+            return ""
+        if args[:1] == ("set-option",):
+            return ""
+        if args[:1] == ("send-keys",):
+            return ""
+        return ""
+
+    def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+        self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
+
+
+def test_concurrent_stack_dispatch_requests_are_stateless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent dispatch load uses a fresh adapter/control plane per request."""
+    import concurrent.futures
+
+    FastStackAdapter._next = 0
+    monkeypatch.setenv("IMPERIUM_ALLOW_TMUX_FOCUS", "1")
+    server, _ = _serve(FastStackAdapter)
+
+    def post_one(index: int) -> str:
+        _status, payload = _post_timeout(
+            server,
+            "/stack/dispatch",
+            {
+                "base": "mars",
+                "command": f"echo {index}",
+                "session": "main",
+                "focus": False,
+                "settle": 0,
+            },
+            timeout=5,
+        )
+        assert payload["ok"] is True
+        return payload["result"]
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            panes = list(pool.map(post_one, range(8)))
+        assert len(panes) == 8
+        assert FastStackAdapter._next >= 8
+        _status, health = _get(server, "/health")
+        assert health["active_operations"] == 0
+        assert health["operation_degraded"] is False
+    finally:
+        server.shutdown()
+
+
 @pytest.mark.parametrize(
     "disconnect",
     [

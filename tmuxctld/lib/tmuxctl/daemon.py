@@ -136,6 +136,106 @@ _CLIENT_DISCONNECT_ERRNOS = frozenset(
 )
 
 
+def _operation_degraded_seconds_from_env() -> float:
+    raw = os.environ.get("TMUXCTLD_DEGRADED_OPERATION_SECONDS")
+    try:
+        value = float(raw) if raw is not None else 30.0
+    except (TypeError, ValueError):
+        value = 30.0
+    return max(0.001, value)
+
+
+@dataclass(frozen=True)
+class _ActiveOperation:
+    op_id: str
+    method: str
+    path: str
+    started: float
+    thread_name: str
+
+
+class OperationMonitor:
+    """In-process request monitor for detecting wedged non-health operation paths.
+
+    The daemon is intentionally stateless for tmux work: every request gets a
+    fresh control plane/adapter. If operations progressively ossify while
+    ``/health`` still answers, the watchdog needs a cheap heartbeat-visible
+    signal that a data route is stuck. This monitor stores only bounded timing
+    metadata and removes active records in a ``finally`` block, so completed
+    requests leave no residue.
+    """
+
+    def __init__(self, *, max_recent_slow: int = 20) -> None:
+        self._lock = threading.RLock()
+        self._active: dict[str, _ActiveOperation] = {}
+        self._recent_slow: deque[dict] = deque(maxlen=max_recent_slow)
+        self._completed = 0
+        self._failed = 0
+
+    def begin(self, method: str, path: str) -> str:
+        op_id = str(uuid.uuid4())
+        record = _ActiveOperation(
+            op_id=op_id,
+            method=method.upper(),
+            path=path,
+            started=time.monotonic(),
+            thread_name=threading.current_thread().name,
+        )
+        with self._lock:
+            self._active[op_id] = record
+        return op_id
+
+    def finish(self, op_id: str, *, ok: bool) -> None:
+        now = time.monotonic()
+        threshold = _operation_degraded_seconds_from_env()
+        with self._lock:
+            record = self._active.pop(op_id, None)
+            if record is None:
+                return
+            self._completed += 1
+            if not ok:
+                self._failed += 1
+            duration = max(0.0, now - record.started)
+            if duration >= threshold:
+                self._recent_slow.append(
+                    {
+                        "method": record.method,
+                        "path": record.path,
+                        "duration_seconds": round(duration, 3),
+                        "ok": bool(ok),
+                        "finished_epoch": time.time(),
+                    }
+                )
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        threshold = _operation_degraded_seconds_from_env()
+        with self._lock:
+            active = list(self._active.values())
+            recent_slow = list(self._recent_slow)
+            completed = self._completed
+            failed = self._failed
+        active_payload = [
+            {
+                "method": op.method,
+                "path": op.path,
+                "age_seconds": round(max(0.0, now - op.started), 3),
+                "thread": op.thread_name,
+            }
+            for op in active
+        ]
+        stuck = [op for op in active_payload if op["age_seconds"] >= threshold]
+        return {
+            "operation_degraded": bool(stuck),
+            "operation_slow_threshold_seconds": threshold,
+            "active_operations": len(active_payload),
+            "stuck_operations": stuck,
+            "recent_slow_operations": recent_slow,
+            "completed_operations": completed,
+            "failed_operations": failed,
+        }
+
+
 def _is_client_disconnect(exc: BaseException) -> bool:
     """Return True for normal HTTP client disconnects during request/response IO."""
 
@@ -4188,6 +4288,7 @@ class TmuxctldServer(ThreadingHTTPServer):
         self.sha = sha
         self.advertised_port = advertised_port or server_address[1]
         self.ready = threading.Event()
+        self.operation_monitor = OperationMonitor()
         try:
             from .wrapper_ledger import LEDGER
 
@@ -4355,10 +4456,13 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             self._write(404, self._error("not_found", f"no route for {method} {path}"))
             return
 
+        op_id = self.server.operation_monitor.begin(method, path)
+        op_ok = False
         try:
             control = TmuxControlPlane(self.server.adapter_factory())
             result = handler(control, params)
             self._write(200, {"ok": True, "result": result})
+            op_ok = True
         except TmuxctldNotImplementedAnchor as exc:
             # Forward tombstone: the daemon route is intentionally named but not
             # built. This is an actual HTTP 501 so transport shims / API callers
@@ -4392,6 +4496,8 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             # detail must never leak into the HTTP JSON response.
             log.exception("unhandled error dispatching %s %s", method, path)
             self._write(200, self._error("internal", "internal error"))
+        finally:
+            self.server.operation_monitor.finish(op_id, ok=op_ok)
 
     def _health_payload(self) -> dict:
         return {
@@ -4400,6 +4506,7 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             "version": self.server.version,
             "sha": self.server.sha,
             "port": self.server.advertised_port,
+            **self.server.operation_monitor.snapshot(),
         }
 
     @staticmethod
