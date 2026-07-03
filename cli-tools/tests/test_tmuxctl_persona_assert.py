@@ -179,6 +179,7 @@ def test_persona_seat_command_scrubs_inherited_identity_env() -> None:
     assert "-u TOKEN_API_INSTANCE_NAME" in cmd
     assert "-u INSTANCE_NAME" in cmd
     assert "-u TOKEN_API_DISPLAY_NAME" in cmd
+    assert "-u DISPLAY_NAME" in cmd
     # TMUX_PANE is NOT scrubbed — tmux provides it and SessionStart needs it.
     assert "-u TMUX_PANE" not in cmd
 

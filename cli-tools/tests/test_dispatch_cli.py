@@ -1878,10 +1878,13 @@ def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Pa
     assert "SESSION_DOC_ID=2058" not in result.stdout
     assert "TOKEN_API_INSTANCE_NAME=fabricator-general" not in result.stdout
     assert "INSTANCE_NAME=fabricator-general" not in result.stdout
+    assert "TOKEN_API_DISPLAY_NAME=Fabricator-General" not in result.stdout
     assert "-u TMUX_PANE" in result.stdout
     assert "-u TOKEN_API_INSTANCE_ID" in result.stdout
     assert "-u TOKEN_API_PARENT_INSTANCE_ID" in result.stdout
     assert "-u TOKEN_API_PERSONA" in result.stdout
+    assert "-u TOKEN_API_DISPLAY_NAME" in result.stdout
+    assert "-u DISPLAY_NAME" in result.stdout
     assert "-u TOKEN_API_SESSION_DOC_ID" in result.stdout
     assert "-u SESSION_DOC_ID" in result.stdout
     assert "-u TOKEN_API_INSTANCE_NAME" in result.stdout

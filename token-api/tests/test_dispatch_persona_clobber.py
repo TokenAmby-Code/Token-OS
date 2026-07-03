@@ -63,7 +63,7 @@ def _identity_row(conn: sqlite3.Connection, instance_id: str) -> sqlite3.Row:
     return row
 
 
-def test_chapter_insert_preserves_explicit_worker_persona_and_singleton(app_env):
+def test_chapter_insert_preserves_explicit_worker_persona_and_singleton(app_env) -> None:
     from instance_mutation import insert_instance
 
     conn = _conn(app_env.db_path)
@@ -74,7 +74,7 @@ def test_chapter_insert_preserves_explicit_worker_persona_and_singleton(app_env)
 
     now = datetime.now().isoformat()
 
-    async def insert_worker():
+    async def insert_worker() -> None:
         async with aiosqlite.connect(app_env.db_path) as db:
             await insert_instance(
                 db,
@@ -155,7 +155,7 @@ def test_chapter_insert_falls_back_to_commander_persona_when_worker_has_none(app
     assert fg["status"] == "working"
 
 
-def test_session_start_parent_binding_preserves_token_api_persona(app_env, monkeypatch):
+def test_session_start_parent_binding_preserves_token_api_persona(app_env, monkeypatch) -> None:
     """Full hook path: fake pane/stamp only; never touch the live tmux session."""
 
     hooks = sys.modules["routes.hooks"]
@@ -209,7 +209,9 @@ def test_session_start_parent_binding_preserves_token_api_persona(app_env, monke
     assert fg["status"] == "working"
 
 
-def test_fg_dispatched_worker_identity_fields_do_not_clobber_singleton_row(app_env, monkeypatch):
+def test_fg_dispatched_worker_identity_fields_do_not_clobber_singleton_row(
+    app_env, monkeypatch
+) -> None:
     """Full hook path, no live tmux: worker name/doc land on worker row only.
 
     This reproduces the #567 failure shape defensively: a Fabricator-General row
@@ -282,7 +284,7 @@ def test_fg_dispatched_worker_identity_fields_do_not_clobber_singleton_row(app_e
     monkeypatch.setattr(hooks.shared, "apply_instance_pane_tint", no_async_write)
     monkeypatch.setattr(hooks.shared, "push_agnostic_pane_vars", no_async_write)
 
-    async def run_start_and_worker_rename():
+    async def run_start_and_worker_rename() -> None:
         result = await hooks.handle_session_start(
             {
                 "session_id": "fg-dispatched-worker",

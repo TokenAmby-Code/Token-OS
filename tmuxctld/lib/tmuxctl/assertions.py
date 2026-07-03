@@ -1205,9 +1205,7 @@ def _assert_instance_impl(
             result.update({"ok": False, "action": "boot_grace", "reason": "persona_boot_grace"})
             return result
         ok, reason = launch_persona_seat(adapter, pane_id, spec, session=session)
-        result.update(
-            {"ok": ok, "action": "launched" if ok else "launch_failed", "reason": reason}
-        )
+        result.update({"ok": ok, "action": "launched" if ok else "launch_failed", "reason": reason})
         return result
 
     runtime_ok = _runtime_has_instance(adapter, pane_id)
