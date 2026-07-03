@@ -15,12 +15,49 @@ function safeCutIndex(text, index) {
   return isHighSurrogate(text.charCodeAt(index - 1)) ? index - 1 : index;
 }
 
+function trimSafeCutIndex(text, rawCut, limit) {
+  let cut = Math.min(rawCut, limit, text.length);
+
+  // Discord strips leading/trailing whitespace from message content. A split
+  // exactly on a newline/space boundary therefore silently drops that boundary
+  // whitespace after delivery. Bias a preferred boundary forward until the
+  // whitespace is internal to the chunk and the chunk ends on a non-whitespace
+  // character. This may move one character of the next word/line into the
+  // previous chunk, but preserves the original payload bytes across messages.
+  while (cut < text.length && cut < limit && /\s/.test(text[cut - 1] || '')) {
+    cut += 1;
+  }
+
+  // Hard cuts can also leave the next chunk starting with whitespace; include
+  // that whitespace plus one following non-whitespace character when it fits.
+  if (cut < text.length && /\s/.test(text[cut] || '') && cut < limit) {
+    while (cut < text.length && cut < limit && /\s/.test(text[cut] || '')) {
+      cut += 1;
+    }
+    if (cut < text.length && cut < limit) cut += 1;
+  }
+
+  return safeCutIndex(text, cut);
+}
+
 function findBestCut(text, limit) {
   let inFence = false;
   let lastNewlineOutside = -1;
   let lastWhitespaceOutside = -1;
   let lastNewlineAnywhere = -1;
   let lastWhitespaceAnywhere = -1;
+
+  function remember(kind, rawCut) {
+    const cut = trimSafeCutIndex(text, rawCut, limit);
+    if (cut <= 0 || cut > limit) return;
+    if (kind === 'newline') {
+      lastNewlineAnywhere = cut;
+      if (!inFence) lastNewlineOutside = cut;
+    } else {
+      lastWhitespaceAnywhere = cut;
+      if (!inFence) lastWhitespaceOutside = cut;
+    }
+  }
 
   for (let i = 0; i < limit; i += 1) {
     if (text.startsWith('```', i)) {
@@ -32,11 +69,9 @@ function findBestCut(text, limit) {
     const ch = text[i];
     const next = i + 1;
     if (ch === '\n') {
-      lastNewlineAnywhere = next;
-      if (!inFence) lastNewlineOutside = next;
+      remember('newline', next);
     } else if (/\s/.test(ch)) {
-      lastWhitespaceAnywhere = next;
-      if (!inFence) lastWhitespaceOutside = next;
+      remember('whitespace', next);
     }
   }
 
@@ -48,8 +83,8 @@ function findBestCut(text, limit) {
       : lastWhitespaceOutside > 0 ? lastWhitespaceOutside
         : lastNewlineAnywhere > 0 ? lastNewlineAnywhere
           : lastWhitespaceAnywhere > 0 ? lastWhitespaceAnywhere
-            : limit;
-  return safeCutIndex(text, cut) || safeCutIndex(text, limit);
+            : trimSafeCutIndex(text, limit, limit);
+  return cut || safeCutIndex(text, limit);
 }
 
 export function splitDiscordMessageContent(content, limit = DISCORD_MESSAGE_CONTENT_LIMIT) {

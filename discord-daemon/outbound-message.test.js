@@ -51,15 +51,15 @@ test('content over Discord limit chunks in order without truncation', async () =
 test('splitter prefers newline boundary before word boundary before hard limit', () => {
   const newlineContent = `${'a'.repeat(90)}\n${'b'.repeat(90)}`;
   assert.deepEqual(splitDiscordMessageContent(newlineContent, 100), [
-    `${'a'.repeat(90)}\n`,
-    'b'.repeat(90),
+    `${'a'.repeat(90)}\nb`,
+    'b'.repeat(89),
   ]);
 
   const wordContent = `${'a'.repeat(60)} ${'b'.repeat(30)} ${'c'.repeat(30)}`;
   const wordChunks = splitDiscordMessageContent(wordContent, 100);
   assert.deepEqual(wordChunks, [
-    `${'a'.repeat(60)} ${'b'.repeat(30)} `,
-    'c'.repeat(30),
+    `${'a'.repeat(60)} ${'b'.repeat(30)} c`,
+    'c'.repeat(29),
   ]);
 
   const hardContent = 'x'.repeat(205);
@@ -81,7 +81,20 @@ test('splitter avoids splitting inside code fences when an outside boundary exis
 
   assert.equal(chunks.join(''), content);
   assert.ok(chunks.every(c => c.length <= 35));
-  assert.equal(chunks[0], 'before\n```text\ninside code\n```\n');
+  assert.equal(chunks[0], 'before\n```text\ninside code\n```\na');
+});
+
+test('splitter avoids trim-risk leading/trailing whitespace at chunk boundaries', () => {
+  const content = Array.from(
+    { length: 20 },
+    (_, i) => `line-${String(i).padStart(2, '0')} ${'word '.repeat(20)}tail`
+  ).join('\n');
+  const chunks = splitDiscordMessageContent(content, 200);
+
+  assert.equal(chunks.join(''), content);
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every(c => c.length <= 200));
+  assert.ok(chunks.every(c => !/^\s|\s$/.test(c)));
 });
 
 test('send metadata never allows a chunk above provider limit', async () => {
