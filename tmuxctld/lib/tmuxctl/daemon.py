@@ -2276,6 +2276,39 @@ def _h_hook_wrapperend(control, params):
     }
 
 
+def _h_worktree_teardown(control, params):
+    """On-demand worktree teardown — the tmuxctld single-executor route.
+
+    The SAME universal sanitization gate + gated remote deletion the WrapperEnd
+    path runs, exposed as an on-demand route so the manual CLI and the
+    Golden-Throne victory cascade route through one executor instead of their own
+    divergent `worktree-delete -f`.  token-api stays the merge-proof authority: an
+    ``instance_id`` fetches ``pr_state`` (as WrapperEnd does), or ``pr_state`` is
+    passed directly.  Teardown is pure worktree lifecycle — this touches no tmux.
+    """
+    del control  # teardown is worktree-only; no tmux side effects
+    env = params.get("env") if isinstance(params.get("env"), dict) else {}
+    worktree = (
+        _s(params, "worktree")
+        or _s(params, "cwd")
+        or _s(params, "working_dir")
+        or _s(env, "TOKEN_API_TARGET_WORKING_DIR")
+        or _s(env, "TOKEN_API_CWD")
+    )
+    if not worktree:
+        raise ValueError("worktree path required")
+    instance_id = _s(params, "instance_id")
+    instance = _fetch_instance_for_wrapperend(instance_id) if instance_id else {}
+    pr_state = _s(params, "pr_state")
+    if pr_state and not str((instance or {}).get("pr_state") or "").strip():
+        instance = {**(instance or {}), "pr_state": pr_state}
+    delete_remote = _s(params, "delete_remote", "1").strip().lower() not in {"0", "false", "no"}
+
+    from .worktree_lifecycle import teardown_worktree
+
+    return teardown_worktree(worktree, instance=instance or None, delete_remote=delete_remote)
+
+
 def _h_hook_wrapperstart(control, params):
     """Authoritative tmux-side wrapper registration at agent birth.
 
@@ -3225,6 +3258,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/hooks/user-prompt-submit"): _h_hook_user_prompt_submit,
     ("POST", "/hooks/wrapperstart"): _h_hook_wrapperstart,
     ("POST", "/hooks/wrapperend"): _h_hook_wrapperend,
+    ("POST", "/worktree/teardown"): _h_worktree_teardown,
     # Event-driven persona reconcile (replaces the retired 2-min assert-personas
     # poll). /reconcile re-seats all must-fill seats; /event ingests a single tmux
     # lifecycle event (a persona pane-died self-heal). Nothing polls these.

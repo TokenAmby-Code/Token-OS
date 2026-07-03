@@ -317,6 +317,18 @@ if [[ -d "$WORKTREE_DIR" ]]; then
         # directory survived. Only ever rm a path inside WORKTREE_PARENT.
         case "$WORKTREE_DIR" in
             "$WORKTREE_PARENT"/*)
+                # cwd-equality guard (P1 getcwd family): never rm -rf the
+                # directory the caller still stands in — pulling the cwd out from
+                # under a live process turns teardown into a getcwd(ENOENT) crash.
+                # The confinement-to-$WORKTREE_PARENT case above is not enough:
+                # a human (or agent) running this from inside the target is in it.
+                _CALLER_CWD="$(pwd -P 2>/dev/null || true)"
+                _TARGET_REAL="$(cd "$WORKTREE_DIR" 2>/dev/null && pwd -P || echo "$WORKTREE_DIR")"
+                if [[ -n "$_CALLER_CWD" && ( "$_CALLER_CWD" == "$_TARGET_REAL" || "$_CALLER_CWD" == "$_TARGET_REAL"/* ) ]]; then
+                    log_error "Refusing rm -rf $WORKTREE_DIR: caller cwd is inside it (would self-purge)"
+                    log_error "cd out of the worktree and retry, or let the tmuxctld post-death teardown own it"
+                    exit 1
+                fi
                 rm -rf "$WORKTREE_DIR"
                 git --git-dir="$BARE_REPO" worktree prune 2>/dev/null || true
                 log_success "Removed orphaned worktree dir (registration was already gone): $WORKTREE_DIR"

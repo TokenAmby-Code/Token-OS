@@ -634,3 +634,151 @@ def test_pr_step_and_pr_merge_do_not_remove_worktrees() -> None:
         text = script.read_text(encoding="utf-8")
         assert "git worktree remove" not in text
         assert "worktree remove" not in text
+
+
+# ── universal gate: gated remote-ref deletion ─────────────────────────────────
+
+
+def _src_branch_exists(project: Project, branch: str) -> bool:
+    """The origin (fixture ``src`` repo) still carries ``branch``."""
+    return _git("branch", "--list", branch, cwd=project.src, env=project.env) != ""
+
+
+def _publish_to_origin(project: Project, branch: str) -> None:
+    """Push a worktree branch up to origin so remote-deletion has a target."""
+    _git("--git-dir", str(project.bare), "push", "origin", branch, env=project.env)
+    assert _src_branch_exists(project, branch), "precondition: branch published to origin"
+
+
+def test_teardown_deletes_local_and_remote_ref_when_merged(project: Project) -> None:
+    """The universal gate's complete teardown: a merged worktree loses its local
+    worktree, its local branch ref, AND its remote branch ref (drains the pileup
+    the audit flagged — WrapperEnd previously pruned only the local ref)."""
+    from tmuxctl.worktree_lifecycle import teardown_worktree
+
+    assert project.setup("merged-full").returncode == 0
+    wt = project.parent / "wt-merged-full"
+    _publish_to_origin(project, "merged-full")
+
+    result = teardown_worktree(
+        wt, instance={"id": "inst-mf", "pr_state": "merged", "working_dir": str(wt)}
+    )
+
+    assert result["status"] == "removed"
+    assert result["remote_prune"] == "deleted"
+    assert not wt.exists(), "local worktree removed"
+    assert not _bare_branch_exists(project, "merged-full"), "local branch ref pruned"
+    assert not _src_branch_exists(project, "merged-full"), "remote branch ref deleted"
+
+
+def test_teardown_preserves_local_and_remote_when_unmerged(project: Project) -> None:
+    """Unmerged/dirty → EVERYTHING preserved (local worktree, local ref, remote
+    ref) on the shared entrypoint. Shutdown is never data loss."""
+    from tmuxctl.worktree_lifecycle import teardown_worktree
+
+    assert project.setup("unmerged-full").returncode == 0
+    wt = project.parent / "wt-unmerged-full"
+    _publish_to_origin(project, "unmerged-full")
+    _commit_divergent(project, wt, "unmerged-body")
+
+    result = teardown_worktree(
+        wt, instance={"id": "inst-uf", "pr_state": "open", "working_dir": str(wt)}
+    )
+
+    assert result["status"] == "preserved"
+    assert result["reason"] == "branch_not_merged"
+    assert "remote_prune" not in result, "preserve path never reaches remote deletion"
+    assert wt.exists(), "unmerged worktree preserved"
+    assert _bare_branch_exists(project, "unmerged-full"), "local ref preserved"
+    assert _src_branch_exists(project, "unmerged-full"), "remote ref preserved"
+
+
+def test_teardown_never_remote_deletes_open_pr_head(project: Project) -> None:
+    """PR-orphan guard: a branch whose PR is open (pr_state=open) is never
+    remote-deleted — deleting an open PR's head branch orphans/closes it. The
+    merge gate blocks first, so the remote ref is untouched even on a clean tree."""
+    from tmuxctl.worktree_lifecycle import teardown_worktree
+
+    assert project.setup("open-pr-head").returncode == 0
+    wt = project.parent / "wt-open-pr-head"
+    _publish_to_origin(project, "open-pr-head")  # clean worktree, but PR is open
+
+    result = teardown_worktree(
+        wt, instance={"id": "inst-op", "pr_state": "open", "working_dir": str(wt)}
+    )
+
+    assert result["status"] == "preserved"
+    assert result["merge_reason"] == "instance_pr_state_open"
+    assert _src_branch_exists(project, "open-pr-head"), "open-PR head ref must survive"
+
+
+def test_teardown_preserves_remote_on_ancestor_only_merge(project: Project) -> None:
+    """Merge proven only by local ancestry (no authoritative pr_state) removes the
+    local worktree+ref but PRESERVES the remote ref: without pr_state we cannot
+    rule out an open PR, so the remote is the conservative side of the gate."""
+    from tmuxctl.worktree_lifecycle import teardown_worktree
+
+    # A branch whose tip IS an ancestor of main (fast-forward-shaped): setup cuts
+    # it from origin/main and we add no commits, so is-ancestor proves the merge.
+    assert project.setup("ff-merged").returncode == 0
+    wt = project.parent / "wt-ff-merged"
+    _publish_to_origin(project, "ff-merged")
+
+    result = teardown_worktree(wt, instance={"id": "inst-ff", "working_dir": str(wt)})
+
+    assert result["status"] == "removed"
+    assert result["merge_reason"].startswith("head_ancestor_of_")
+    assert result["remote_prune"] == "preserved"
+    assert result["remote_prune_reason"] == "no_open_pr_unconfirmed"
+    assert not wt.exists(), "locally-proven-merged worktree removed"
+    assert not _bare_branch_exists(project, "ff-merged"), "local ref pruned"
+    assert _src_branch_exists(project, "ff-merged"), "remote ref preserved (open PR unconfirmed)"
+
+
+def test_teardown_refuses_to_purge_cwd(project: Project, monkeypatch: pytest.MonkeyPatch) -> None:
+    """getcwd immunity on every entrypoint: teardown never removes the directory
+    the calling process still stands in, even when merge+cleanliness would allow."""
+    from tmuxctl.worktree_lifecycle import teardown_worktree
+
+    assert project.setup("cwd-self").returncode == 0
+    wt = project.parent / "wt-cwd-self"
+    monkeypatch.chdir(wt)  # pytest restores cwd on teardown
+
+    result = teardown_worktree(
+        wt, instance={"id": "inst-cwd", "pr_state": "merged", "working_dir": str(wt)}
+    )
+
+    assert result["status"] == "preserved"
+    assert result["reason"] == "would_remove_cwd"
+    assert wt.exists(), "must not self-purge the caller's cwd"
+
+
+# ── on-demand daemon route: same executor, same gate ─────────────────────────
+
+
+def test_worktree_teardown_route_removes_merged(project: Project) -> None:
+    """The tmuxctld /worktree/teardown route runs the SAME gate + remote deletion
+    as WrapperEnd, driven by a passed pr_state (no token-api fetch needed)."""
+    from tmuxctl import daemon
+
+    assert project.setup("route-merged").returncode == 0
+    wt = project.parent / "wt-route-merged"
+    _publish_to_origin(project, "route-merged")
+
+    # control is unused by the route (teardown is worktree-only, no tmux).
+    result = daemon._h_worktree_teardown(
+        None, {"worktree": str(wt), "branch": "route-merged", "pr_state": "merged"}
+    )
+
+    assert result["status"] == "removed"
+    assert result["remote_prune"] == "deleted"
+    assert not wt.exists()
+    assert not _src_branch_exists(project, "route-merged")
+
+
+def test_worktree_teardown_route_requires_worktree() -> None:
+    """The route rejects a missing worktree path loudly rather than guessing."""
+    from tmuxctl import daemon
+
+    with pytest.raises(ValueError):
+        daemon._h_worktree_teardown(None, {"branch": "whatever"})
