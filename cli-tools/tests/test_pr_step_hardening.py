@@ -178,6 +178,33 @@ fi
     assert "timeout=<2> seconds=120 timed_out=yes" in result.stdout
 
 
+def test_rate_limit_reset_parser_uses_real_signal_not_magic_sleep(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+date() { if [[ "${1:-}" == "+%s" ]]; then echo 1000; else command date "$@"; fi; }
+printf 'retry_after=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'HTTP 403
+Retry-After: 9')"
+printf 'retry_after_http_date=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'Retry-After: Thu, 01 Jan 1970 00:16:49 GMT')"
+printf 'inline_retry_after=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'CodeRabbit rate limit exceeded. Retry-After: 9')"
+printf 'reset_header=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'x-ratelimit-reset: 1700001017')"
+printf 'prose_wait=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'Please wait 2 minutes and 3 seconds before requesting another review.')"
+printf 'absent=<%s>\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'rate limit exceeded' || true)"
+printf 'seconds=%s\\n' "$(coderabbit_ratelimit_wait_seconds 'Retry-After: 9')"
+""",
+        repo,
+    )
+
+    assert "retry_after=1009" in result.stdout
+    assert "retry_after_http_date=1009" in result.stdout
+    assert "inline_retry_after=1009" in result.stdout
+    assert "reset_header=1700001017" in result.stdout
+    assert "prose_wait=1123" in result.stdout
+    assert "absent=<>" in result.stdout
+    assert "seconds=9" in result.stdout
+
+
 def test_normal_review_does_not_inject_empty_timeout(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     arg_log = tmp_path / "args.log"
@@ -219,6 +246,162 @@ create_pr_normal >/dev/null
     args = arg_log.read_text().splitlines()
     assert "--wait" in args
     assert "--timeout" not in args
+
+
+def test_review_loop_waits_for_coderabbit_rate_limit_reset_then_returns_review(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    state = tmp_path / "state"
+    state.write_text("initial")
+    calls = tmp_path / "gh.calls"
+    sleeps = tmp_path / "sleep.calls"
+    gh = fake_bin / "gh"
+    gh.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> {str(calls)!r}
+state="$(cat {str(state)!r})"
+if [[ "$1" == "repo" && "$2" == "view" ]]; then
+  echo owner/repo
+  exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "comment" ]]; then
+  if [[ "$state" == "initial" ]]; then
+    echo rate_limited > {str(state)!r}
+  elif [[ "$state" == "rate_limited" ]]; then
+    echo reviewed > {str(state)!r}
+  fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7" ]]; then
+  if [[ "${{@: -2:1}}" == "--jq" ]]; then echo headsha; else echo '{{"head":{{"sha":"headsha"}}}}'; fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/comments" ]]; then
+  echo '[]'
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then
+  if [[ "$state" == "rate_limited" ]]; then
+    cat <<'JSON'
+[
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"2026-07-03T19:00:00Z","updated_at":"2026-07-03T19:00:00Z","body":"CodeRabbit rate limit exceeded. Retry-After: 9"}}
+]
+JSON
+  elif [[ "$state" == "reviewed" ]]; then
+    cat <<'JSON'
+[
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"2026-07-03T19:00:00Z","updated_at":"2026-07-03T19:00:00Z","body":"CodeRabbit rate limit exceeded. Retry-After: 9"}},
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"2026-07-03T19:00:10Z","updated_at":"2026-07-03T19:00:10Z","body":"## Summary by CodeRabbit\\nAll clear."}}
+]
+JSON
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/commits/headsha/statuses" ]]; then
+  if [[ "$state" == "reviewed" ]]; then
+    echo '[{{"context":"coderabbit","state":"success","updated_at":"2026-07-03T19:00:10Z"}}]'
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/reviews" ]]; then
+  if [[ "$state" == "reviewed" ]]; then
+    echo '[{{"user":{{"login":"coderabbitai[bot]"}},"state":"APPROVED","submitted_at":"2026-07-03T19:00:11Z"}}]'
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
+echo "unexpected gh call: $*" >&2
+exit 1
+"""
+    )
+    gh.chmod(0o755)
+
+    result = bash_with_pr_step(
+        f"""
+_FAKE_NOW=1000
+date() {{ if [[ "${{1:-}}" == "+%s" ]]; then echo "$_FAKE_NOW"; else command date "$@"; fi; }}
+sleep() {{ printf '%s\\n' "$1" >> {str(sleeps)!r}; printf 'sleep %s\\n' "$1" >> {str(calls)!r}; _FAKE_NOW=$((_FAKE_NOW + $1)); }}
+pr_review_main 7 --message "fix" --no-push
+""",
+        repo,
+        {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert "Review State:    APPROVED" in result.stdout
+    assert "## Summary by CodeRabbit" in result.stdout
+    sleep_values = sleeps.read_text().splitlines()
+    assert "9" in sleep_values
+    assert "60" not in sleep_values
+    assert "120" not in sleep_values
+    assert "150" not in sleep_values
+    call_lines = calls.read_text().splitlines()
+    comment_indexes = [i for i, line in enumerate(call_lines) if line.startswith("pr comment 7")]
+    assert len(comment_indexes) == 2
+    sleep_index = call_lines.index("sleep 9")
+    # No blind duplicate re-request: the second CodeRabbit command happens only
+    # after pr-step sleeps to the reset carried by the rate-limit response.
+    assert comment_indexes[0] < sleep_index < comment_indexes[1]
+
+
+def test_review_loop_plain_timeout_path_does_not_rate_limit_rerequest(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "gh.calls"
+    sleeps = tmp_path / "sleep.calls"
+    gh = fake_bin / "gh"
+    gh.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> {str(calls)!r}
+if [[ "$1" == "repo" && "$2" == "view" ]]; then echo owner/repo; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "comment" ]]; then exit 0; fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7" ]]; then
+  if [[ "${{@: -2:1}}" == "--jq" ]]; then echo headsha; else echo '{{"head":{{"sha":"headsha"}}}}'; fi
+  exit 0
+fi
+case "$2" in
+  repos/owner/repo/pulls/7/comments|repos/owner/repo/issues/7/comments|repos/owner/repo/pulls/7/reviews)
+    echo '[]'; exit 0 ;;
+  repos/owner/repo/commits/headsha/statuses)
+    echo '[]'; exit 0 ;;
+esac
+echo "unexpected gh call: $*" >&2
+exit 1
+"""
+    )
+    gh.chmod(0o755)
+
+    result = bash_with_pr_step(
+        f"""
+_FAKE_NOW=1000
+date() {{ if [[ "${{1:-}}" == "+%s" ]]; then echo "$_FAKE_NOW"; else command date "$@"; fi; }}
+sleep() {{ printf '%s\\n' "$1" >> {str(sleeps)!r}; _FAKE_NOW=$((_FAKE_NOW + $1)); }}
+set +e
+pr_review_main 7 --message "fix" --no-push --timeout 1
+rc=$?
+set -e
+printf 'rc=%s\\n' "$rc"
+""",
+        repo,
+        {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert "rc=1" in result.stdout
+    assert "No new review comments found before the explicit timeout." in result.stderr
+    call_lines = calls.read_text().splitlines()
+    assert sum(1 for line in call_lines if line.startswith("pr comment 7")) == 1
 
 
 def test_mark_instance_status_reviewing_sends_workflow_payload(tmp_path: Path) -> None:
