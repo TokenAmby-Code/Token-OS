@@ -797,19 +797,25 @@ def _refuse_send_into_human_lock(control, pane: str) -> str:
 
 def _h_send_keys(control, params):
     pane = _s(params, "pane")
-    command = _s(params, "command")
+    command = _s(params, "command") or _s(params, "key")
+    if not command:
+        raw_keys = params.get("keys")
+        if isinstance(raw_keys, list) and len(raw_keys) == 1:
+            command = str(raw_keys[0])
+    if not command:
+        raise ValueError("command/key required")
     from .occupancy import assert_dispatch_target_available, looks_like_dispatch_launcher_payload
 
     # Inviolable human-lock fail-closed before any byte-bearing send: an ambient
     # TMUX_SEND_GATE_ALLOW override (enforce-action / quiet-hours pierce) must
     # never clobber active typing at this chokepoint.
-    _refuse_send_into_human_lock(control, pane)
+    phys_pane = _refuse_send_into_human_lock(control, pane)
     if looks_like_dispatch_launcher_payload(command):
-        assert_dispatch_target_available(control.adapter, pane)
+        assert_dispatch_target_available(control.adapter, phys_pane)
     if _b(params, "no_escape"):
-        control.adapter.run("send-keys", "-t", pane, "-l", command)
+        control.adapter.run("send-keys", "-t", phys_pane, "-l", command)
     else:
-        control.adapter.send_keys(pane, command)
+        control.adapter.send_keys(phys_pane, command)
     # adapter.run() suppresses a gated send SILENTLY (sets last_send_gate_result,
     # returns ""), so — like send_text_then_submit — surface the structured gate
     # instead of falsely reporting sent:True. Dispatch turns this into the
@@ -817,7 +823,7 @@ def _h_send_keys(control, params):
     gate = getattr(control.adapter, "last_send_gate_result", None)
     if gate:
         raise TmuxSendGated(gate)
-    return {"pane": pane, "sent": True}
+    return {"pane": pane, "physical_pane": phys_pane, "command": command, "sent": True}
 
 
 # The captured composer slice we fingerprint for the white-whale "submit

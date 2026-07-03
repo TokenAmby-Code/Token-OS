@@ -1697,6 +1697,41 @@ def test_invoke_command_submit_never_gets_skill_tab() -> None:
         server.shutdown()
 
 
+def test_send_keys_accepts_key_alias_for_control_keys() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post_timeout(
+            server,
+            "/tmux/send-keys",
+            {"pane": "%42", "key": "C-c"},
+            timeout=5,
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["command"] == "C-c"
+        assert ("send-keys-helper", "%42", "C-c") in rec.calls
+    finally:
+        server.shutdown()
+
+
+def test_send_keys_targets_resolved_physical_pane_for_public_ids() -> None:
+    rec = RecordingVoiceAdapter()
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post_timeout(
+            server,
+            "/tmux/send-keys",
+            {"pane": "palace:E", "key": "C-c"},
+            timeout=5,
+        )
+        assert payload["ok"] is True
+        assert payload["result"]["physical_pane"] == "%42"
+        assert ("send-keys-helper", "%42", "C-c") in rec.calls
+        assert ("send-keys-helper", "palace:E", "C-c") not in rec.calls
+    finally:
+        server.shutdown()
+
+
 def test_send_ethereal_renders_claude_btw_and_closes_side_channel() -> None:
     rec = RecordingVoiceAdapter()
     server, _ = _serve(lambda: rec)
