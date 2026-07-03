@@ -12456,6 +12456,7 @@ DEAD_INSTANCE_RESPONSE_FIELDS = {
     "pane_tint",
     "chip_color",
     "color",
+    "advisor",
     # Launch/tmux/transplant provenance is not canonical instance shape.
     "dispatch_target",
     "dispatch_window",

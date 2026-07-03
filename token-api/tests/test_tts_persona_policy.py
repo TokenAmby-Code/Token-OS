@@ -6,8 +6,8 @@ TTS submission is gated on a RESOLVED persona's explicit ``personas.tts_policy``
   * unresolved persona (needs-name / unregistered → NULL slug+policy) → DENIED,
     SILENT, and a registration WARNING is logged (a visible failure, never a leak);
   * ``silent`` policy → not queued;
-  * ``hot`` policy → forced onto the hot queue (Custodes/enforcement);
-  * ``pause`` policy → respects the caller's queue_target.
+  * ``hot``/``pause`` policy → may speak; advisor capability, not policy, forces
+    the hot queue;
 
 This is the structural fix for the needs-name Fabricator-General that leaked to
 audio: silence is no longer inferred only from ``tts_voice IS NULL`` (which only
@@ -63,8 +63,6 @@ def _insert_instance(db_path: Path, *, persona_slug: str | None, voiced: bool) -
     # readability but never writes an instance column.
     if persona_slug is not None:
         updates["persona_id"] = persona_id_for_slug(persona_slug)
-    elif voiced:
-        updates["persona_id"] = persona_id_for_slug("blood-angels")
     if updates:
         update_instance_sync(
             conn,
@@ -126,8 +124,8 @@ def test_silent_policy_persona_is_denied(app_env, monkeypatch) -> None:
     assert len(tts.pause_queue) == 0
 
 
-def test_hot_policy_forces_hot_queue(app_env, monkeypatch) -> None:
-    """Custodes carries the ``hot`` policy → a 'pause' request plays immediately."""
+def test_advisor_capability_forces_hot_queue(app_env, monkeypatch) -> None:
+    """Custodes carries advisor=True → a 'pause' request plays immediately."""
     tts = _load_tts()
     _quiet_world(tts, monkeypatch)
     iid = _insert_instance(app_env.db_path, persona_slug="custodes", voiced=True)
@@ -159,13 +157,13 @@ def test_system_instance_enqueues_hot_custodes_voiced(
     app_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The synthetic ``system`` sender short-circuits the DB lookup to a fixed,
-    always-resolved profile: Custodes-voiced (Microsoft George), hot policy. It
+    always-resolved profile: Custodes-voiced (Microsoft George), advisor-hot. It
     enqueues to the hot queue WITHOUT any instance row — instance-less system pings
     SPEAK through the single gate, never go silent and never need a registration."""
     tts = _load_tts()
     _quiet_world(tts, monkeypatch)
 
-    # A 'pause' request: the hot policy on the synthetic row must force it hot.
+    # A 'pause' request: advisor=True on the synthetic row must force it hot.
     result = asyncio.run(
         tts.queue_tts(tts.SYSTEM_INSTANCE_ID, "distraction logged", queue_target="pause")
     )
@@ -200,7 +198,7 @@ def test_cockpit_status_never_null_while_item_playing() -> None:
         message="the Emperor must hear this",
         voice="Microsoft George",
         sound="chimes.wav",
-        tab_name="Custodes",
+        name="Custodes",
         started_at="2026-06-28T10:00:00",
     )
     prev = tts.tts_current

@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import uuid
 from pathlib import Path
@@ -30,11 +31,66 @@ async def test_personas_seed_and_schema_constraints(app_env):
             )
 
 
+def test_personas_advisor_column_migrates_and_seeds(tmp_path: Path) -> None:
+    """Advisor is an additive personas-table migration and seeds only advisors."""
+    import personas
+
+    db_path = tmp_path / "legacy-personas.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE personas (
+                id TEXT PRIMARY KEY,
+                slug TEXT UNIQUE NOT NULL,
+                display_name TEXT NOT NULL,
+                default_rank TEXT NOT NULL CHECK (default_rank IN ('astartes','primarch','overseer')),
+                assignment_pool TEXT CHECK (assignment_pool IN ('primary','backup') OR assignment_pool IS NULL),
+                assignment_order INTEGER,
+                pane_tint TEXT,
+                chip_color TEXT,
+                tts_voice TEXT,
+                tts_rate TEXT,
+                notification_sound TEXT,
+                default_session_doc TEXT,
+                tts_policy TEXT NOT NULL DEFAULT 'silent'
+                    CHECK (tts_policy IN ('silent', 'hot', 'pause')),
+                CHECK (default_rank = 'astartes' OR assignment_pool IS NULL)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO personas
+              (id, slug, display_name, default_rank, tts_policy)
+            VALUES (?, 'custodes', 'Old Custodes', 'overseer', 'silent')
+            """,
+            (personas.persona_id_for_slug("custodes"),),
+        )
+        conn.commit()
+
+    personas.ensure_personas_table_sync(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(personas)").fetchall()}
+        assert "advisor" in cols
+        rows = {
+            slug: advisor
+            for slug, advisor in conn.execute(
+                "SELECT slug, advisor FROM personas WHERE advisor = 1 ORDER BY slug"
+            ).fetchall()
+        }
+
+    assert rows == {"custodes": 1, "malcador": 1, "pax": 1}
+
+
 @pytest.mark.asyncio
 async def test_tts_policy_seeded_per_persona_deny_by_default(app_env: Any) -> None:
-    """``personas.tts_policy`` is seeded with deny-by-default semantics: Custodes is
-    ``hot``, voiced Astartes are ``pause``, and every voiceless persona (FG,
-    mechanicus, mechanicus-worker, primarchs, civic seats) is ``silent``."""
+    """``personas.tts_policy`` is seeded with deny-by-default semantics.
+
+    ``advisor`` owns queue bypass; advisor seats that have no current voice still
+    carry ``pause`` so a future persona voice/routing can speak without adding a
+    second bypass flag.
+    """
     expected = {
         "custodes": "hot",
         "blood-angels": "pause",
@@ -51,9 +107,10 @@ async def test_tts_policy_seeded_per_persona_deny_by_default(app_env: Any) -> No
         "inquisitor": "silent",
         "mechanicus": "silent",
         "mechanicus-worker": "silent",
-        "pax": "silent",
+        "pax": "pause",
         "orchestrator": "silent",
         "agentic-worker": "silent",
+        "malcador": "pause",
     }
     with sqlite3.connect(app_env.db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -65,6 +122,61 @@ async def test_tts_policy_seeded_per_persona_deny_by_default(app_env: Any) -> No
         assert rows.get(slug) == policy, f"{slug} expected {policy}, got {rows.get(slug)!r}"
     # Deny-by-default: no seeded persona may carry a NULL/unknown policy.
     assert all(policy in ("silent", "hot", "pause") for policy in rows.values())
+
+
+def test_advisor_resolver_joins_personas_and_instances_schema_stays_clean(app_env: Any) -> None:
+    """Advisor is resolved by JOIN, not copied onto the instance row."""
+    import personas
+    from instance_mutation import insert_instance_sync, update_instance_sync
+
+    def insert(slug: str) -> str:
+        iid = f"advisor-test-{slug}"
+        with sqlite3.connect(app_env.db_path) as conn:
+            insert_instance_sync(
+                conn,
+                values={
+                    "id": iid,
+                    "working_dir": "/tmp/test",
+                    "origin_type": "local",
+                    "device_id": "Mac-Mini",
+                    "status": "idle",
+                },
+                mutation_type="instance_registered",
+                write_source="test",
+                actor="test",
+            )
+            update_instance_sync(
+                conn,
+                instance_id=iid,
+                updates={"persona_id": personas.persona_id_for_slug(slug)},
+                mutation_type="instance_test_persona_update",
+                write_source="test",
+                actor="test",
+            )
+            conn.commit()
+        return iid
+
+    ids = {slug: insert(slug) for slug in ("custodes", "pax", "malcador", "blood-angels")}
+
+    with sqlite3.connect(app_env.db_path) as conn:
+        instance_cols = {row[1] for row in conn.execute("PRAGMA table_info(instances)").fetchall()}
+        assert "advisor" not in instance_cols
+
+        assert personas.is_advisor_instance_sync(conn, ids["custodes"]) is True
+        assert personas.is_advisor_instance_sync(conn, ids["pax"]) is True
+        assert personas.is_advisor_instance_sync(conn, ids["malcador"]) is True
+        assert personas.is_advisor_instance_sync(conn, ids["blood-angels"]) is False
+
+    async def resolve_all() -> dict[str, bool]:
+        async with aiosqlite.connect(app_env.db_path) as db:
+            return {slug: await personas.is_advisor_instance(db, iid) for slug, iid in ids.items()}
+
+    assert asyncio.run(resolve_all()) == {
+        "custodes": True,
+        "pax": True,
+        "malcador": True,
+        "blood-angels": False,
+    }
 
 
 @pytest.mark.asyncio
