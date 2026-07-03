@@ -14,9 +14,18 @@ from tmuxctl.tmux_adapter import TmuxAdapter
 
 
 class FakeCloseAdapter:
-    def __init__(self, *, role: str = "mechanicus:worker", exists_count: int = 99) -> None:
+    def __init__(
+        self,
+        *,
+        role: str = "mechanicus:worker",
+        window_name: str = "council",
+        exists_count: int = 99,
+        pane_dead: bool = False,
+    ) -> None:
         self.role = role
+        self.window_name = window_name
         self.exists_count = exists_count
+        self.pane_dead = pane_dead
         self.commands: list[tuple[str, ...]] = []
         self.raw_commands: list[tuple[str, ...]] = []
         self.focus_mutation_count = 0
@@ -44,22 +53,85 @@ class FakeCloseAdapter:
             args[0] == "display-message"
             and args[-1] == "#{session_name}:#{window_index}\t#{window_name}"
         ):
-            return "main:3\tcouncil\n"
+            return f"main:3\t{self.window_name}\n"
         if args[0] == "display-message" and args[-1] == "#{window_index}":
             return "3\n"
         if args[0] == "display-message" and args[-1] == "#{window_name}":
-            return "council\n"
+            return f"{self.window_name}\n"
         if args[0] == "display-message" and args[-1] == "#{window_width}":
             return "120\n"
         if args[0] == "display-message" and args[-1] == "#{window_height}":
             return "40\n"
         if args[0] == "display-message" and args[-1] == "#{window_zoomed_flag}":
             return "0\n"
+        if args[0] == "display-message" and args[-1] == "#{pane_dead}":
+            return "1\n" if self.pane_dead else "0\n"
+        if args[:2] == ("respawn-pane", "-t"):
+            self.pane_dead = False
+            return ""
         if args[0] == "display-message" and args[-1] == "#{session_name}:#{window_name}":
-            return "main:council\n"
+            return f"main:{self.window_name}\n"
         if args[0] == "list-panes":
             return "%C\tcouncil:custodes\tcouncil\t0\t0\t0\t80\t40\tclaude\tfalse\n"
         return ""
+
+
+def test_close_pane_slot_clears_in_place_and_never_kills() -> None:
+    adapter = FakeCloseAdapter(role="somnium:S", window_name="somnium", pane_dead=True)
+
+    result = close_pane(adapter, "%9", timeout=0)
+
+    assert result["status"] == "cleared_in_place"
+    assert result["pane_class"] == "slot"
+    assert result["pane"] == "%9"
+    assert ("clear_runtime_state", "%9") in adapter.commands
+    assert ("respawn-pane", "-t", "%9") in adapter.commands
+    assert not any(command[:1] == ("kill-pane",) for command in adapter.commands)
+
+
+def test_close_pane_worker_preserves_graceful_then_kill_contract() -> None:
+    adapter = FakeCloseAdapter(role="mechanicus:worker", window_name="mechanicus", exists_count=99)
+
+    result = close_pane(adapter, "%9", timeout=0)
+
+    assert result["status"] == "failed"  # fake still reports pane present after kill
+    assert result["pane_class"] == "worker"
+    assert adapter.commands.count(("send-keys", "-t", "%9", "C-c")) == 3
+    assert ("kill-pane", "-t", "%9") in adapter.commands
+    assert result["method"] == "kill-pane"
+
+
+def test_close_pane_perpetual_label_refused_by_class_router() -> None:
+    adapter = FakeCloseAdapter(role="council:malcador", window_name="somnium")
+
+    result = close_pane(adapter, "%9", timeout=0)
+
+    assert result["status"] == "refused"
+    assert result["reason"] == "perpetual_pane"
+    assert result["pane_class"] == "perpetual"
+    assert not any(command[0] == "send-keys" for command in adapter.commands)
+    assert not any(command[:1] == ("kill-pane",) for command in adapter.commands)
+
+
+def test_close_instance_now_on_slot_retires_and_preserves_pane(monkeypatch) -> None:
+    adapter = FakeCloseAdapter(role="somnium:SE", window_name="somnium", pane_dead=True)
+    calls = []
+
+    monkeypatch.setattr(
+        "tmuxctl.close._http_json",
+        lambda method, path, body=None: calls.append((method, path, body)) or {"ok": True},
+    )
+    monkeypatch.setattr(close_mod, "instance_live_tui", lambda *a, **k: None)
+    monkeypatch.setattr(close_mod, "detect_pane_tui", lambda *a, **k: _dead_tui())
+
+    result = close_instance(adapter, "iid-slot", mode="now", pane="%9", timeout=0)
+
+    assert result["lifecycle_result"] == {"ok": True}
+    assert calls == [("PATCH", "/api/instances/iid-slot/retire", None)]
+    assert result["close"]["status"] == "cleared_in_place"
+    assert result["close"]["pane_class"] == "slot"
+    assert ("respawn-pane", "-t", "%9") in adapter.commands
+    assert not any(command[:1] == ("kill-pane",) for command in adapter.commands)
 
 
 def test_close_pane_refuses_protected_static_persona_panes():

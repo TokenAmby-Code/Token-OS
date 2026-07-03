@@ -9,9 +9,11 @@ import urllib.request
 from contextlib import contextmanager
 from typing import Any
 
+from .enums import PaneClass
 from .focus_guard import preserve_focus
 from .liveness import detect_pane_tui, instance_live_tui
 from .stack import stack_base_of
+from .teardown import apply_teardown, classify_pane
 from .tmux_adapter import TmuxAdapter
 
 PROTECTED_STATIC_PERSONA_PANES = frozenset(
@@ -195,18 +197,26 @@ def _close_pane_unshielded(
 ) -> dict[str, Any]:
     pane = _resolve_current(adapter, pane)
     role = _pane_role(adapter, pane)
-    if role in PROTECTED_STATIC_PERSONA_PANES:
+
+    window_target, window_name = _pane_window(adapter, pane)
+    pane_class = classify_pane(role, window_name)
+    if pane_class is PaneClass.PERPETUAL or role in PROTECTED_STATIC_PERSONA_PANES:
         return {
             "status": "refused",
-            "reason": "static_persona_pane",
+            "reason": "perpetual_pane",
             "pane": pane,
             "pane_role": role,
+            "pane_class": PaneClass.PERPETUAL.value,
         }
 
     if not _pane_exists(adapter, pane):
-        return {"status": "already_closed", "pane": pane, "pane_role": role}
+        return {
+            "status": "already_closed",
+            "pane": pane,
+            "pane_role": role,
+            "pane_class": pane_class.value,
+        }
 
-    window_target, window_name = _pane_window(adapter, pane)
     method = "graceful"
     with preserve_focus(
         adapter,
@@ -214,7 +224,8 @@ def _close_pane_unshielded(
         attempted_target=pane,
         enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
     ):
-        adapter.clear_runtime_state(pane)
+        if pane_class is PaneClass.WORKER:
+            adapter.clear_runtime_state(pane)
         for _ in range(3):
             adapter.send_keys(pane, "C-c", allow_failure=True)
             time.sleep(0.2)
@@ -227,10 +238,45 @@ def _close_pane_unshielded(
                     "status": "closed",
                     "pane": pane,
                     "pane_role": role,
+                    "pane_class": pane_class.value,
                     "method": method,
                     "stack_enforcement": stack,
                 }
             time.sleep(0.25)
+
+        if pane_class is PaneClass.SLOT:
+            if not _pane_exists(adapter, pane):
+                stack = _enforce_stack(adapter, window_target, window_name)
+                return {
+                    "status": "closed",
+                    "pane": pane,
+                    "pane_role": role,
+                    "pane_class": pane_class.value,
+                    "method": method,
+                    "stack_enforcement": stack,
+                }
+            post = detect_pane_tui(adapter, pane)
+            if post.live:
+                return {
+                    "status": "refused",
+                    "reason": "live_tui_survived_graceful",
+                    "guard": "slot-never-kill-live-tui",
+                    "pane": pane,
+                    "pane_role": role,
+                    "pane_class": pane_class.value,
+                    "pane_pid": post.pane_pid,
+                    "agent_pid": post.agent_pid,
+                    "agent_command": post.agent_command,
+                    "method": method,
+                }
+            result = apply_teardown(adapter, pane, pane_class, pane_role=role)
+            stack = _enforce_stack(adapter, window_target, window_name)
+            return {
+                **result,
+                "method": "graceful-clear-in-place",
+                "graceful_timeout": max(timeout, 0.0),
+                "stack_enforcement": stack,
+            }
 
         method = "kill-pane"
         adapter.run("kill-pane", "-t", pane, allow_failure=True)
@@ -240,6 +286,7 @@ def _close_pane_unshielded(
         "status": "closed" if not _pane_exists(adapter, pane) else "failed",
         "pane": pane,
         "pane_role": role,
+        "pane_class": pane_class.value,
         "method": method,
         "stack_enforcement": stack,
     }
@@ -320,6 +367,14 @@ def close_instance(
         close_result: dict[str, Any] | None = None
         if target_pane:
             close_result = _close_pane_unshielded(adapter, target_pane, timeout=timeout)
+            if close_result.get("status") == "refused":
+                return {
+                    "status": "refused",
+                    "reason": close_result.get("reason") or "pane_close_refused",
+                    "instance_id": instance_id,
+                    "lifecycle": lifecycle,
+                    "close": close_result,
+                }
             # Re-verify the pane we acted on: a kill that failed to clear the TUI
             # must not be papered over by retiring the row.
             post = detect_pane_tui(adapter, target_pane)
@@ -358,7 +413,7 @@ def close_instance(
             }
         return {
             "status": "closed"
-            if close_result.get("status") in {"closed", "already_closed"}
+            if close_result.get("status") in {"closed", "already_closed", "cleared_in_place"}
             else close_result.get("status"),
             "instance_id": instance_id,
             "lifecycle": lifecycle,
