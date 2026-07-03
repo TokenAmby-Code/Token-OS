@@ -313,6 +313,8 @@ main --no-merge
     assert hooks[0]["event"] == "stop"
     assert hooks[0]["delivery"] == "prompt"
     assert hooks[0]["oneshot"] is True
+    assert hooks[0]["target_instance_id"] == "inst-123"
+    assert hooks[0]["subscriber_instance_id"] == "inst-123"
     assert hooks[0]["target_pane"] == "%ledger"
     assert hooks[0]["subscriber_pane"] == "%ledger"
     assert hooks[0]["payload"] == (
@@ -321,7 +323,7 @@ main --no-merge
     )
 
 
-def test_merge_completion_overwrites_with_contextual_merge_followup(tmp_path: Path) -> None:
+def test_merge_completion_does_not_arm_terminal_plan_followup(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     fake_bin, curl_log = install_fake_curl(tmp_path)
 
@@ -354,12 +356,85 @@ main
     )
 
     hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
-    assert [hook["purpose"] for hook in hooks] == ["pr_step_plan", "pr_step_plan"]
-    assert "review returned" in str(hooks[0]["payload"])
-    assert hooks[-1]["payload"] == (
-        "/plan PR #17 merged "
-        "(https://github.com/owner/repo/pull/17); summarize closure and update context."
+    assert hooks == []
+
+
+def test_marker_strand_repro_requires_rearm_to_reuse_merge_instance_id(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        """
+mark_pr_flag https://github.com/owner/repo/pull/17 merged
+arm_pr_plan_followup review 17 https://github.com/owner/repo/pull/17 "plan fixes or next review action."
+""",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "CURL_LEDGER_JSON": ledger_json("inst-merge-marker", "%ledger"),
+            "TOKEN_API_WRAPPER_ID": "wrap-123",
+        },
     )
+
+    pr_calls = [call for call in curl_calls(curl_log) if "/api/instances/" in call[-1]]
+    assert any(call[-1].endswith("/api/instances/inst-merge-marker/pr") for call in pr_calls)
+    pr_body = curl_json_bodies(curl_log, "/api/instances/inst-merge-marker/pr")[0]
+    assert pr_body["pr_state"] == "merged"
+
+    hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
+    assert len(hooks) == 1
+    assert hooks[0]["target_instance_id"] == "inst-merge-marker"
+    assert hooks[0]["subscriber_instance_id"] == "inst-merge-marker"
+    assert hooks[0]["target_pane"] == "%ledger"
+
+
+def test_merged_clean_pr_does_not_arm_terminal_plan_followup(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+assert_repo() { :; }
+current_pr_number() { echo 17; }
+current_pr_state() { echo MERGED; }
+current_pr_url() { echo https://github.com/owner/repo/pull/17; }
+mark_instance_status() { printf 'status:%s\\n' "$1"; }
+commit_if_needed() { echo "unexpected commit" >&2; return 99; }
+push_branch() { echo "unexpected push" >&2; return 99; }
+review_pr_normal() { echo "unexpected review" >&2; return 99; }
+summarize_pr() { printf 'summarized:%s\\n' "$1"; }
+main --no-merge
+""",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "CURL_LEDGER_JSON": ledger_json("inst-terminal", "%ledger"),
+            "TOKEN_API_WRAPPER_ID": "wrap-123",
+        },
+    )
+
+    assert "summarized:17" in result.stdout
+    hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
+    assert hooks == []
+    pr_body = curl_json_bodies(curl_log, "/api/instances/inst-terminal/pr")[0]
+    assert pr_body["pr_state"] == "merged"
+
+
+def test_force_review_with_empty_args_does_not_trip_nounset(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+parse_args --force review
+pr_review_main() { printf 'argc=%s\\n' "$#"; }
+run_force_mode
+""",
+        repo,
+    )
+
+    assert "argc=0" in result.stdout
 
 
 def test_plan_followup_resolves_pane_from_ledger_without_instance_env(tmp_path: Path) -> None:

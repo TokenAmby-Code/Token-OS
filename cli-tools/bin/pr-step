@@ -313,9 +313,10 @@ mark_pr_flag() {
 }
 
 arm_pr_plan_followup() {
-    local stage="$1" pr="$2" url="${3:-}" summary="${4:-}" pane api prompt body
+    local stage="$1" pr="$2" url="${3:-}" summary="${4:-}" pane iid api prompt body
     pane="$(pr_step_resolve_pane)"
     [[ -n "$pane" ]] || return 0
+    iid="$(pr_step_resolve_instance_id || true)"
 
     case "$stage" in
         review)
@@ -336,7 +337,11 @@ arm_pr_plan_followup() {
     esac
 
     api="${TOKEN_API_URL:-http://localhost:7777}"
-    body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_step_plan\",\"payload\":$(json_escape "$prompt"),\"oneshot\":true}"
+    if [[ -n "$iid" ]]; then
+        body="{\"target_instance_id\":$(json_escape "$iid"),\"target_pane\":$(json_escape "$pane"),\"subscriber_instance_id\":$(json_escape "$iid"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_step_plan\",\"payload\":$(json_escape "$prompt"),\"oneshot\":true}"
+    else
+        body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"delivery\":\"prompt\",\"purpose\":\"pr_step_plan\",\"payload\":$(json_escape "$prompt"),\"oneshot\":true}"
+    fi
     curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
         "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
 }
@@ -421,6 +426,11 @@ current_pr_number() {
 current_pr_url() {
     local pr="$1"
     gh pr view "$pr" --json url -q '.url' 2>/dev/null || true
+}
+
+current_pr_state() {
+    local pr="$1"
+    gh pr view "$pr" --json state -q '.state' 2>/dev/null || true
 }
 
 default_body() {
@@ -2090,17 +2100,17 @@ run_force_mode() {
         create)
             if [[ "${FORCE_ARGS[0]:-}" == "--help" || "${FORCE_ARGS[0]:-}" == "-h" ]]; then usage_force_create; exit 0; fi
             warn "Compatibility path: prefer plain 'pr-step'. Running forced create."
-            pr_create_main "${FORCE_ARGS[@]}"
+            pr_create_main ${FORCE_ARGS[@]+"${FORCE_ARGS[@]}"}
             ;;
         review)
             if [[ "${FORCE_ARGS[0]:-}" == "--help" || "${FORCE_ARGS[0]:-}" == "-h" ]]; then usage_force_review; exit 0; fi
             warn "Compatibility path: prefer plain 'pr-step'. Running forced review."
-            pr_review_main "${FORCE_ARGS[@]}"
+            pr_review_main ${FORCE_ARGS[@]+"${FORCE_ARGS[@]}"}
             ;;
         merge)
             if [[ "${FORCE_ARGS[0]:-}" == "--help" || "${FORCE_ARGS[0]:-}" == "-h" ]]; then usage_force_merge; exit 0; fi
             warn "Compatibility path: prefer plain 'pr-step'. Running forced merge."
-            pr_merge_main "${FORCE_ARGS[@]}"
+            pr_merge_main ${FORCE_ARGS[@]+"${FORCE_ARGS[@]}"}
             ;;
     esac
 }
@@ -2115,7 +2125,7 @@ main() {
     assert_repo
     mark_instance_status reviewing
 
-    local pr msg pr_url committed=false
+    local pr msg pr_url pr_state committed=false arm_review_followup=false
     pr="$(current_pr_number)"
     msg="${MESSAGE:-}"
 
@@ -2126,9 +2136,17 @@ main() {
         pr="$(create_pr_normal | tail -1)"
         read_review_normal "$pr" || true
         pr_url="$(current_pr_url "$pr")"
-        arm_pr_plan_followup review "$pr" "$pr_url" "plan fixes or next review action."
+        arm_review_followup=true
     else
         pr_url="$(current_pr_url "$pr")"
+        pr_state="$(current_pr_state "$pr")"
+        if [[ "$pr_state" == "MERGED" ]]; then
+            [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
+            mark_instance_status victorious
+            log "PR #$pr is already merged; terminal state, no plan re-arm."
+            summarize_pr "$pr"
+            return 0
+        fi
         [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" open
         log "PR #$pr found."
         if commit_if_needed "$msg"; then committed=true; fi
@@ -2138,7 +2156,7 @@ main() {
         else
             review_pr_normal "$pr" "${msg:-Updated branch; request deterministic full review of latest head.}" || true
             pr_url="$(current_pr_url "$pr")"
-            arm_pr_plan_followup review "$pr" "$pr_url" "plan fixes or next review action."
+            arm_review_followup=true
         fi
     fi
 
@@ -2150,12 +2168,15 @@ main() {
         pr_url="$(current_pr_url "$pr")"
         [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
         mark_instance_status victorious
-        arm_pr_plan_followup merge "$pr" "$pr_url" "summarize closure and update context."
     else
         if [[ "$AUTO_MERGE" != "true" ]]; then
             log "Auto-merge disabled (--no-merge); leaving PR #$pr open."
         else
             log "PR #$pr is not green yet; leaving it open."
+        fi
+        if [[ "$arm_review_followup" == "true" ]]; then
+            pr_url="$(current_pr_url "$pr")"
+            arm_pr_plan_followup review "$pr" "$pr_url" "plan fixes or next review action."
         fi
     fi
 }
