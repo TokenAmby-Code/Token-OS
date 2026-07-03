@@ -499,7 +499,7 @@ latest_coderabbit_review_state() {
 # gate is only satisfied by a genuine review. pr-step detects the deferral,
 # re-requests deliberately, and keeps waiting (reusing the unbounded wait) until
 # a real review lands.
-CR_RATELIMIT_REGEX='rate limit exceeded|exceeded the (rate )?limit|before requesting another review|review skipped|reached (your|the) [^.]*limit|usage limits?|please wait [0-9]|retry-after|x-ratelimit-reset|x-rate-limit-reset|ratelimit-reset|rate-limit-reset'
+CR_RATELIMIT_REGEX='rate limit exceeded|rate limited|review limit reached|exceeded the (rate )?limit|before requesting another review|review skipped|reached (your|the) [^.]*limit|usage limits?|next review (will be )?available|please wait [0-9]|retry-after|x-ratelimit-reset|x-rate-limit-reset|ratelimit-reset|rate-limit-reset'
 
 rate_limit_reset_epoch_from_text() {
     local now="${1:-}"
@@ -519,10 +519,12 @@ except Exception:
     now = int(datetime.now(timezone.utc).timestamp())
 
 text = os.environ.get("RATE_LIMIT_TEXT", "")
+plain = re.sub(r"(?i)<br\s*/?>", "\n", text)
+plain = re.sub(r"[*_`]", "", plain)
 
 
 def emit(epoch: int | None) -> None:
-    if epoch is not None and epoch > now:
+    if epoch is not None:
         print(epoch)
         raise SystemExit(0)
 
@@ -581,13 +583,13 @@ if reset:
 
 # CodeRabbit comment bodies sometimes express the documented window in prose.
 duration = re.search(
-    r"(?:retry after|please wait|wait)\s+"
+    r"(?:retry after|please wait|wait|next review (?:will be )?available in|review available in|available in:?)\s+"
     r"(?:(\d+)\s*(?:hours?|hrs?|h)\s*)?"
     r"(?:and\s*)?"
     r"(?:(\d+)\s*(?:minutes?|mins?|m)\s*)?"
     r"(?:and\s*)?"
     r"(?:(\d+)\s*(?:seconds?|secs?|s))?",
-    text,
+    plain,
     re.I,
 )
 if duration and any(duration.groups()):
@@ -596,7 +598,7 @@ if duration and any(duration.groups()):
     seconds = int(duration.group(3) or 0)
     emit(now + hours * 3600 + minutes * 60 + seconds)
 
-at = re.search(r"(?:resets?|try again)\s+(?:at|after)\s+([^\r\n.]+)", text, re.I)
+at = re.search(r"(?:resets?|try again)\s+(?:at|after)\s+([^\r\n.]+)", plain, re.I)
 if at:
     emit(parse_http_or_iso(at.group(1).strip()))
 PY
@@ -651,6 +653,33 @@ coderabbit_ratelimit_reset_epoch() {
     rate_limit_reset_epoch_from_text "$now" <<<"$body" || true
 }
 
+iso_timestamp_epoch() {
+    local stamp="$1"
+    [[ -n "$stamp" ]] || return 1
+    TIMESTAMP_TEXT="$stamp" python3 - <<'PY_EPOCH'
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import os
+
+stamp = os.environ.get("TIMESTAMP_TEXT", "").strip()
+try:
+    parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    print(int(parsed.timestamp()))
+except Exception:
+    raise SystemExit(1)
+PY_EPOCH
+}
+
+coderabbit_ratelimit_reset_epoch_at() {
+    local body="$1" stamp="${2:-}" base
+    base="$(iso_timestamp_epoch "$stamp" 2>/dev/null || true)"
+    [[ "$base" =~ ^[0-9]+$ ]] || base="$(date +%s)"
+    rate_limit_reset_epoch_from_text "$base" <<<"$body" || true
+}
+
 # Fetch the body of CodeRabbit's most recent issue (general) comment on a PR.
 coderabbit_latest_issue_comment_body() {
     local pr="$1" repo
@@ -687,6 +716,31 @@ coderabbit_rerequest_review() {
     gh pr comment "$pr" --body "$reason
 
 @coderabbitai full review" >/dev/null 2>&1
+}
+
+coderabbit_handle_ratelimit_comment() {
+    local pr="$1" body="${2:-}" stamp="${3:-}" signature reset
+    coderabbit_body_is_ratelimit "$body" || return 1
+    signature="$(printf '%s' "${stamp}:${body}" | cksum | awk '{print $1 ":" $2}')"
+    [[ "$signature" != "${LAST_RATELIMIT_SIGNATURE:-}" ]] || return 1
+    LAST_RATELIMIT_SIGNATURE="$signature"
+
+    reset="$(coderabbit_ratelimit_reset_epoch_at "$body" "$stamp")"
+    if [[ "$reset" =~ ^[0-9]+$ ]]; then
+        warn "CodeRabbit rate-limited the review request; waiting for reset signal before re-requesting."
+        sleep_until_rate_limit_reset "$reset" "CodeRabbit rate limit"
+        if rate_limit_reset_reached "$reset"; then
+            coderabbit_rerequest_review "$pr" "CodeRabbit rate limit reset reached; re-requesting the full review." || {
+                error "Failed to re-request CodeRabbit review after rate-limit reset"
+                exit 1
+            }
+            log "Re-requested CodeRabbit review after rate-limit reset."
+            return 0
+        fi
+    else
+        warn "CodeRabbit rate-limit response did not include a reset signal; continuing the normal gate wait without a blind retry."
+    fi
+    return 1
 }
 
 changes_requested_count() {
@@ -1687,26 +1741,8 @@ while true; do
         LATEST_ISSUE_COMMENT=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
             jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '.[] | select(.user.login == $bot or .user.login == $user) | .body' | tail -1)
 
-        if coderabbit_body_is_ratelimit "$LATEST_ISSUE_COMMENT"; then
-            RATELIMIT_SIGNATURE="$(printf '%s' "${CURRENT_OVERVIEW_TIMESTAMP}:${LATEST_ISSUE_COMMENT}" | cksum | awk '{print $1 ":" $2}')"
-            if [[ "$RATELIMIT_SIGNATURE" != "$LAST_RATELIMIT_SIGNATURE" ]]; then
-                LAST_RATELIMIT_SIGNATURE="$RATELIMIT_SIGNATURE"
-                RATELIMIT_RESET="$(coderabbit_ratelimit_reset_epoch "$LATEST_ISSUE_COMMENT")"
-                if [[ "$RATELIMIT_RESET" =~ ^[0-9]+$ ]]; then
-                    warn "CodeRabbit rate-limited the review request; waiting for reset signal before re-requesting."
-                    sleep_until_rate_limit_reset "$RATELIMIT_RESET" "CodeRabbit rate limit"
-                    if rate_limit_reset_reached "$RATELIMIT_RESET"; then
-                        coderabbit_rerequest_review "$PR_NUMBER" "CodeRabbit rate limit reset reached; re-requesting the full review." || {
-                            error "Failed to re-request CodeRabbit review after rate-limit reset"
-                            exit 1
-                        }
-                        log "Re-requested CodeRabbit review after rate-limit reset."
-                        continue
-                    fi
-                else
-                    warn "CodeRabbit rate-limit response did not include a reset signal; continuing the normal gate wait without a blind retry."
-                fi
-            fi
+        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
+            continue
         fi
 
         if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
@@ -1719,26 +1755,8 @@ while true; do
         LATEST_ISSUE_COMMENT=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
             jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].body')
 
-        if coderabbit_body_is_ratelimit "$LATEST_ISSUE_COMMENT"; then
-            RATELIMIT_SIGNATURE="$(printf '%s' "${CURRENT_OVERVIEW_TIMESTAMP}:${LATEST_ISSUE_COMMENT}" | cksum | awk '{print $1 ":" $2}')"
-            if [[ "$RATELIMIT_SIGNATURE" != "$LAST_RATELIMIT_SIGNATURE" ]]; then
-                LAST_RATELIMIT_SIGNATURE="$RATELIMIT_SIGNATURE"
-                RATELIMIT_RESET="$(coderabbit_ratelimit_reset_epoch "$LATEST_ISSUE_COMMENT")"
-                if [[ "$RATELIMIT_RESET" =~ ^[0-9]+$ ]]; then
-                    warn "CodeRabbit rate-limited the review request; waiting for reset signal before re-requesting."
-                    sleep_until_rate_limit_reset "$RATELIMIT_RESET" "CodeRabbit rate limit"
-                    if rate_limit_reset_reached "$RATELIMIT_RESET"; then
-                        coderabbit_rerequest_review "$PR_NUMBER" "CodeRabbit rate limit reset reached; re-requesting the full review." || {
-                            error "Failed to re-request CodeRabbit review after rate-limit reset"
-                            exit 1
-                        }
-                        log "Re-requested CodeRabbit review after rate-limit reset."
-                        continue
-                    fi
-                else
-                    warn "CodeRabbit rate-limit response did not include a reset signal; continuing the normal gate wait without a blind retry."
-                fi
-            fi
+        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
+            continue
         fi
 
         if echo "$LATEST_ISSUE_COMMENT" | grep -qE "$SUMMARY_MARKER"; then
@@ -1756,6 +1774,10 @@ while true; do
             '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
         if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" || "$CR_STATE" == "error" ]]; then
             if coderabbit_review_is_deferred "$PR_NUMBER"; then
+                LATEST_ISSUE_COMMENT="$(coderabbit_latest_issue_comment_body "$PR_NUMBER")"
+                if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
+                    continue
+                fi
                 log "CodeRabbit commit status is terminal ($CR_STATE), but latest CodeRabbit comment is a rate-limit deferral; keeping the review gate open."
             else
                 FOUND_OVERVIEW=true

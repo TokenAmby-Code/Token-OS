@@ -190,6 +190,8 @@ printf 'retry_after_http_date=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<
 printf 'inline_retry_after=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'CodeRabbit rate limit exceeded. Retry-After: 9')"
 printf 'reset_header=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'x-ratelimit-reset: 1700001017')"
 printf 'prose_wait=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'Please wait 2 minutes and 3 seconds before requesting another review.')"
+printf 'coderabbit_available=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'**Next review available in:** **9 seconds**')"
+printf 'coderabbit_reply_available=%s\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'Your next review will be available in 4 minutes.')"
 printf 'absent=<%s>\\n' "$(rate_limit_reset_epoch_from_text 1000 <<<'rate limit exceeded' || true)"
 printf 'seconds=%s\\n' "$(coderabbit_ratelimit_wait_seconds 'Retry-After: 9')"
 """,
@@ -201,6 +203,8 @@ printf 'seconds=%s\\n' "$(coderabbit_ratelimit_wait_seconds 'Retry-After: 9')"
     assert "inline_retry_after=1009" in result.stdout
     assert "reset_header=1700001017" in result.stdout
     assert "prose_wait=1123" in result.stdout
+    assert "coderabbit_available=1009" in result.stdout
+    assert "coderabbit_reply_available=1240" in result.stdout
     assert "absent=<>" in result.stdout
     assert "seconds=9" in result.stdout
 
@@ -288,14 +292,14 @@ if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then
   if [[ "$state" == "rate_limited" ]]; then
     cat <<'JSON'
 [
-  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"2026-07-03T19:00:00Z","updated_at":"2026-07-03T19:00:00Z","body":"CodeRabbit rate limit exceeded. Retry-After: 9"}}
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"1970-01-01T00:16:40Z","updated_at":"1970-01-01T00:16:40Z","body":"CodeRabbit rate limit exceeded. Retry-After: 9"}}
 ]
 JSON
   elif [[ "$state" == "reviewed" ]]; then
     cat <<'JSON'
 [
-  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"2026-07-03T19:00:00Z","updated_at":"2026-07-03T19:00:00Z","body":"CodeRabbit rate limit exceeded. Retry-After: 9"}},
-  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"2026-07-03T19:00:10Z","updated_at":"2026-07-03T19:00:10Z","body":"## Summary by CodeRabbit\\nAll clear."}}
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"1970-01-01T00:16:40Z","updated_at":"1970-01-01T00:16:40Z","body":"CodeRabbit rate limit exceeded. Retry-After: 9"}},
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"1970-01-01T00:16:50Z","updated_at":"1970-01-01T00:16:50Z","body":"## Summary by CodeRabbit\\nAll clear."}}
 ]
 JSON
   else
@@ -305,7 +309,7 @@ JSON
 fi
 if [[ "$1" == "api" && "$2" == "repos/owner/repo/commits/headsha/statuses" ]]; then
   if [[ "$state" == "reviewed" ]]; then
-    echo '[{{"context":"coderabbit","state":"success","updated_at":"2026-07-03T19:00:10Z"}}]'
+    echo '[{{"context":"coderabbit","state":"success","updated_at":"1970-01-01T00:16:50Z"}}]'
   else
     echo '[]'
   fi
@@ -313,7 +317,7 @@ if [[ "$1" == "api" && "$2" == "repos/owner/repo/commits/headsha/statuses" ]]; t
 fi
 if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/reviews" ]]; then
   if [[ "$state" == "reviewed" ]]; then
-    echo '[{{"user":{{"login":"coderabbitai[bot]"}},"state":"APPROVED","submitted_at":"2026-07-03T19:00:11Z"}}]'
+    echo '[{{"user":{{"login":"coderabbitai[bot]"}},"state":"APPROVED","submitted_at":"1970-01-01T00:16:51Z"}}]'
   else
     echo '[]'
   fi
@@ -350,6 +354,96 @@ pr_review_main 7 --message "fix" --no-push
     # No blind duplicate re-request: the second CodeRabbit command happens only
     # after pr-step sleeps to the reset carried by the rate-limit response.
     assert comment_indexes[0] < sleep_index < comment_indexes[1]
+
+
+def test_review_loop_handles_preexisting_rate_limit_deferral_after_reset(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    state = tmp_path / "state"
+    state.write_text("rate_limited")
+    requests = tmp_path / "requests"
+    requests.write_text("0")
+    calls = tmp_path / "gh.calls"
+    sleeps = tmp_path / "sleep.calls"
+    gh = fake_bin / "gh"
+    gh.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> {str(calls)!r}
+state="$(cat {str(state)!r})"
+if [[ "$1" == "repo" && "$2" == "view" ]]; then echo owner/repo; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "comment" ]]; then
+  n="$(cat {str(requests)!r})"
+  n=$((n + 1))
+  echo "$n" > {str(requests)!r}
+  if [[ "$n" -ge 2 ]]; then echo reviewed > {str(state)!r}; fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7" ]]; then
+  if [[ "${{@: -2:1}}" == "--jq" ]]; then echo headsha; else echo '{{"head":{{"sha":"headsha"}}}}'; fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/comments" ]]; then echo '[]'; exit 0; fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then
+  if [[ "$state" == "reviewed" ]]; then
+    cat <<'JSON'
+[
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"1970-01-01T00:16:40Z","updated_at":"1970-01-01T00:16:40Z","body":"You're currently rate limited. Your next review will be available in 9 seconds."}},
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"1970-01-01T00:16:50Z","updated_at":"1970-01-01T00:16:50Z","body":"## Summary by CodeRabbit\\nAll clear."}}
+]
+JSON
+  else
+    cat <<'JSON'
+[
+  {{"user":{{"login":"coderabbitai[bot]"}},"created_at":"1970-01-01T00:16:40Z","updated_at":"1970-01-01T00:16:40Z","body":"You're currently rate limited. Your next review will be available in 9 seconds."}}
+]
+JSON
+  fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/commits/headsha/statuses" ]]; then
+  echo '[{{"context":"coderabbit","state":"success","updated_at":"1970-01-01T00:16:40Z"}}]'
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/reviews" ]]; then
+  if [[ "$state" == "reviewed" ]]; then
+    echo '[{{"user":{{"login":"coderabbitai[bot]"}},"state":"APPROVED","submitted_at":"1970-01-01T00:16:51Z"}}]'
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
+echo "unexpected gh call: $*" >&2
+exit 1
+"""
+    )
+    gh.chmod(0o755)
+
+    result = bash_with_pr_step(
+        f"""
+_FAKE_NOW=1000
+date() {{ if [[ "${{1:-}}" == "+%s" ]]; then echo "$_FAKE_NOW"; else command date "$@"; fi; }}
+sleep() {{ printf '%s\\n' "$1" >> {str(sleeps)!r}; printf 'sleep %s\\n' "$1" >> {str(calls)!r}; _FAKE_NOW=$((_FAKE_NOW + $1)); }}
+pr_review_main 7 --message "fix" --no-push
+""",
+        repo,
+        {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert "Review State:    APPROVED" in result.stdout
+    assert "## Summary by CodeRabbit" in result.stdout
+    sleep_values = sleeps.read_text().splitlines()
+    assert sleep_values[0] == "9"
+    assert "60" not in sleep_values
+    assert "120" not in sleep_values
+    assert "150" not in sleep_values
+    call_lines = calls.read_text().splitlines()
+    comment_indexes = [i for i, line in enumerate(call_lines) if line.startswith("pr comment 7")]
+    assert len(comment_indexes) == 2
+    assert comment_indexes[0] < call_lines.index("sleep 9") < comment_indexes[1]
 
 
 def test_review_loop_plain_timeout_path_does_not_rate_limit_rerequest(
