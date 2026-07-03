@@ -2299,8 +2299,10 @@ def _h_worktree_teardown(control, params):
         raise ValueError("worktree path required")
     instance_id = _s(params, "instance_id")
     instance = _fetch_instance_for_wrapperend(instance_id) if instance_id else {}
+    # An explicitly-supplied pr_state is the caller's assertion of current truth
+    # and wins over a (possibly staler) fetched row when both are present.
     pr_state = _s(params, "pr_state")
-    if pr_state and not str((instance or {}).get("pr_state") or "").strip():
+    if pr_state:
         instance = {**(instance or {}), "pr_state": pr_state}
     delete_remote = _s(params, "delete_remote", "1").strip().lower() not in {"0", "false", "no"}
 

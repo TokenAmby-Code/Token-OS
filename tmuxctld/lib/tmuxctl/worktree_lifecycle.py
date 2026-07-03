@@ -300,24 +300,51 @@ def _meaningful_dirty_entries(status: str) -> list[str]:
     return meaningful
 
 
+# Teardown runs unattended (WrapperEnd, daemon route, cron cascade): git must
+# never block on a credential/SSH prompt, and a hung remote `push` must not wedge
+# the caller.  Force non-interactive auth and bound every invocation.
+_GIT_ENV = {
+    **os.environ,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh -oBatchMode=yes"),
+}
+_GIT_TIMEOUT = 60.0
+
+
 def _git(path: Path, *args: str) -> str:
     proc = _run_git(path, *args)
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def _run_git(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(path), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    return _run(["git", "-C", str(path), *args])
 
 
 def _run_git_gitdir(git_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "--git-dir", str(git_dir), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    return _run(["git", "--git-dir", str(git_dir), *args])
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a git command non-interactively and time-bounded.
+
+    A timeout surfaces as a non-zero ``CompletedProcess`` (rc 124) so every
+    existing ``returncode != 0`` check treats a wedged network op as a preserve /
+    best-effort failure rather than hanging teardown.
+    """
+
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_GIT_ENV,
+            timeout=_GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            cmd,
+            124,
+            exc.stdout or "",
+            (exc.stderr or "") + f"\ngit timed out after {_GIT_TIMEOUT:g}s",
+        )
