@@ -62,6 +62,7 @@ def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally(
     assert '"command":"{lv=request[command]}"' in body
     assert '"source":"phone_overlay"' in body
     assert '"backend":"phone"' in body
+    assert '"speed":"{lv=request[speed]}"' in body
     serialized = json.dumps(macro)
     forbidden_local_mutations = [
         "SpeakTextAction",

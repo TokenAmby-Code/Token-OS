@@ -71,7 +71,7 @@
           "contentBodyFolderDisplayName": "",
           "contentBodyFolderUri": "",
           "contentBodySource": 0,
-          "contentBodyText": "{\"command\":\"{lv=request[command]}\",\"source\":\"phone_overlay\",\"backend\":\"phone\",\"session_id\":\"{lv=request[session_id]}\",\"playback_id\":\"{lv=request[playback_id]}\"}",
+          "contentBodyText": "{\"command\":\"{lv=request[command]}\",\"source\":\"phone_overlay\",\"backend\":\"phone\",\"session_id\":\"{lv=request[session_id]}\",\"playback_id\":\"{lv=request[playback_id]}\",\"speed\":\"{lv=request[speed]}\"}",
           "contentType": "application/json",
           "followRedirects": true,
           "headerParams": [],
