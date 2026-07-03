@@ -1,6 +1,6 @@
 ---
 name: network
-description: Imperium and askCivic machine topology and config routing. Use for Tailscale, SSH aliases, NAS paths, Token-API reachability, Mac/WSL/phone roles, MacroDroid phone routing, future CIVIC_MACHINE handling, Deskflow/remote operator paths, replacing hardcoded machine values, or the incoming headless Linux boxes (GMKtec K12 pair + Comet Pro network KVMs, mac mini migration).
+description: Imperium and askCivic machine topology and config routing. Use for Tailscale, SSH aliases, NAS paths and the NAS-to-local storage doctrine, Token-API reachability, Mac/WSL/phone roles, MacroDroid phone routing, future CIVIC_MACHINE handling, Deskflow/remote operator paths, replacing hardcoded machine values, or the incoming headless Linux boxes (GMKtec K12 pair + Comet Pro network KVMs, mac mini migration).
 ---
 
 # Network
