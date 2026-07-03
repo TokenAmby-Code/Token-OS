@@ -105,6 +105,36 @@ def test_persona_specs_pin_model_defaults() -> None:
     assert persona_spec("mechanicus:orchestrator").model == "sonnet"
 
 
+def test_fabricator_general_defaults_to_codex_engine() -> None:
+    # Emperor ruling (2026-07-02): the personal FG orchestrator seat runs codex by
+    # default (better auto-compaction). This is the seat's OWN engine, decided at the
+    # one chokepoint every revive/reconcile/pane-died relaunch funnels through.
+    assert persona_spec("mechanicus:fabricator-general").engine == "codex"
+
+
+def test_codex_default_is_fg_scoped_other_singletons_stay_claude() -> None:
+    # FG-scoped ONLY: Custodes stays claude, and no other singleton flips. The civic
+    # Orchestrator redub (mechanicus:orchestrator) is deliberately untouched here.
+    assert persona_spec("council:custodes").engine == "claude"
+    assert persona_spec("council:malcador").engine == "claude"
+    assert persona_spec("council:administratum").engine == "claude"
+    assert persona_spec("council:pax").engine == "claude"
+    assert persona_spec("mechanicus:orchestrator").engine == "claude"
+
+
+def test_fg_seat_command_launches_codex() -> None:
+    # The engine flows all the way to the seat respawn: codex rides as
+    # TOKEN_API_ENGINE and as the shim's argv[1], so every daemon-owned FG relaunch
+    # (pane-died respawn, reconcile re-seat, dead-pane relaunch) comes up codex.
+    cmd = persona_seat_command(
+        persona_spec("mechanicus:fabricator-general"),
+        wrapper_launch_id="wl-fg",
+        shim_path="/x/persona-seat.sh",
+    )
+    assert "TOKEN_API_ENGINE=codex" in cmd
+    assert cmd.rstrip().endswith("/x/persona-seat.sh codex")
+
+
 def test_malcador_spec_is_not_sync() -> None:
     spec = persona_spec("council:malcador")
     assert spec.sync is False
