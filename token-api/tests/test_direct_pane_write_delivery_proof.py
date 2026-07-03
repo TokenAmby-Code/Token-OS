@@ -10,9 +10,8 @@ and reports the truth:
 
   * gated      -> never "sent"; the durable pane_write_queue row stays
                   ``pending`` so the periodic worker re-drains it.
-  * unverified -> bytes issued but unproven; never "sent" (the proof belt
-                  upgrades it asynchronously). The queue row is terminal
-                  ``sent`` to avoid a double send.
+  * pending    -> bytes issued; this is level-1 delivery and therefore
+                  ``sent``. Missing UserPromptSubmit is only level-2 pending.
   * submitted  -> verified delivery -> "sent".
   * error      -> "failed".
 """
@@ -47,20 +46,25 @@ async def test_direct_pane_write_gated_is_never_sent(app_env: Any, monkeypatch: 
     assert result["gate_reason"] == "typing_guard"
 
 
-async def test_direct_pane_write_bytes_issued_unproven_is_unverified(
+async def test_direct_pane_write_bytes_issued_pending_is_sent(
     app_env: Any, monkeypatch: Any
 ) -> None:
     hooks = sys.modules["routes.hooks"]
 
     async def _unverified(pane, payload):
-        return {"returncode": 0, "gated": False, "verification_status": "unverified"}
+        return {
+            "returncode": 0,
+            "gated": False,
+            "verification_status": "pending",
+            "delivered": True,
+            "turn": "pending",
+        }
 
     monkeypatch.setattr(hooks, "_tmux_send_payload_then_submit", _unverified)
 
     result = await hooks._direct_pane_write("%9", "hello")
 
-    assert result["status"] == "unverified", "bytes issued != proven delivery"
-    assert result["status"] != "sent"
+    assert result["status"] == "sent", "bytes issued is level-1 delivery"
 
 
 async def test_direct_pane_write_verified_submission_is_sent(
@@ -207,17 +211,22 @@ def test_gated_delivery_stays_pending_for_requeue(app_env, monkeypatch):
     assert delivery["status"] == "gated"
 
 
-def test_unverified_delivery_is_terminal_but_not_sent(app_env, monkeypatch):
-    """Bytes issued without proof: recorded 'unverified', queue terminal (no double-send)."""
+def test_pending_turn_delivery_is_sent(app_env, monkeypatch):
+    """Bytes issued without a hook: recorded sent with pending turn (no double-send)."""
 
     async def _unverified(pane, payload):
-        return {"returncode": 0, "gated": False, "verification_status": "unverified"}
+        return {
+            "returncode": 0,
+            "gated": False,
+            "verification_status": "pending",
+            "delivered": True,
+            "turn": "pending",
+        }
 
     result = _drive_stop_delivery(app_env, monkeypatch, _unverified)
     sub = result["stop_subscriptions"][0]
 
-    assert sub["status"] == "unverified"
-    assert sub["status"] != "sent"
+    assert sub["status"] == "sent"
     # Queue row is terminal 'sent' (bytes left the building) so the periodic
     # worker does NOT re-send; the proof belt owns the async upgrade.
     queue_row = _row(
@@ -229,7 +238,7 @@ def test_unverified_delivery_is_terminal_but_not_sent(app_env, monkeypatch):
         "SELECT status FROM stop_hook_deliveries WHERE id = ?",
         (sub["delivery_id"],),
     )
-    assert delivery["status"] == "unverified"
+    assert delivery["status"] == "sent"
 
 
 def test_verified_delivery_is_sent(app_env, monkeypatch):

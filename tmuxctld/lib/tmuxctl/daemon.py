@@ -204,6 +204,7 @@ class PromptSubmitSniffer:
     def __init__(self, *, max_events: int = 2048) -> None:
         self._cond = threading.Condition()
         self._events: deque[dict] = deque(maxlen=max_events)
+        self._callbacks: dict[str, dict] = {}
 
     def record(self, payload: dict) -> dict:
         instance_id = str(
@@ -228,12 +229,15 @@ class PromptSubmitSniffer:
         event: dict,
         *,
         instance_id: str,
+        pane: str = "",
         payload_hash: str,
         since: float,
     ) -> bool:
         if event.get("at", 0) < since:
             return False
         if instance_id and event.get("instance_id") != instance_id:
+            return False
+        if not instance_id and pane and event.get("pane") != pane:
             return False
         event_hash = str(event.get("prompt_hash") or "").strip()
         # Prefer exact hash matching when the hook surface supplies it. Some
@@ -260,6 +264,7 @@ class PromptSubmitSniffer:
                     if self._matches(
                         event,
                         instance_id=instance_id,
+                        pane="",
                         payload_hash=payload_hash,
                         since=since,
                     ):
@@ -269,8 +274,116 @@ class PromptSubmitSniffer:
                     return None
                 self._cond.wait(timeout=remaining)
 
+    def register_callback(
+        self,
+        *,
+        correlation_id: str,
+        caller_pane: str,
+        target_pane: str,
+        instance_id: str,
+        payload_hash: str,
+        since: float,
+        target_label: str = "",
+    ) -> dict | None:
+        correlation_id = str(correlation_id or "").strip()
+        caller_pane = str(caller_pane or "").strip()
+        if not correlation_id or not caller_pane:
+            return None
+        callback = {
+            "correlation_id": correlation_id,
+            "caller_pane": caller_pane,
+            "target_pane": str(target_pane or "").strip(),
+            "target_label": str(target_label or "").strip(),
+            "instance_id": str(instance_id or "").strip(),
+            "payload_hash": str(payload_hash or "").strip(),
+            "since": since,
+            "registered_at": time.monotonic(),
+            "fired": False,
+        }
+        with self._cond:
+            # Idempotent operation replays must not create duplicate late echoes.
+            self._callbacks.setdefault(correlation_id, callback)
+            return dict(self._callbacks[correlation_id])
+
+    def pop_matching_callbacks(self, event: dict) -> list[dict]:
+        matched: list[dict] = []
+        with self._cond:
+            for correlation_id, callback in list(self._callbacks.items()):
+                if callback.get("fired"):
+                    continue
+                if not self._matches(
+                    event,
+                    instance_id=str(callback.get("instance_id") or ""),
+                    pane=str(callback.get("target_pane") or ""),
+                    payload_hash=str(callback.get("payload_hash") or ""),
+                    since=float(callback.get("since") or 0),
+                ):
+                    continue
+                callback["fired"] = True
+                matched.append(dict(callback))
+                self._callbacks.pop(correlation_id, None)
+        return matched
+
 
 _PROMPT_SUBMIT_SNIFFER = PromptSubmitSniffer()
+
+
+def _emit_prompt_submit_callback(control, callback: dict, event: dict) -> dict:
+    """Best-effort late level-2 echo to the original caller pane.
+
+    The callback is deliberately a one-shot side effect keyed by correlation id.
+    It is not a delivery verdict; level-1 was already returned to the caller when
+    bytes reached the target pane.
+    """
+
+    correlation_id = str(callback.get("correlation_id") or "").strip()
+    caller_pane = str(callback.get("caller_pane") or "").strip()
+    target = _safe_public_role(str(callback.get("target_label") or "")) or _safe_public_role(
+        str(callback.get("target_pane") or "")
+    )
+    text = (
+        "[tmuxctld:hook-echo] "
+        f"correlation_id={correlation_id} delivered=1 turn=submitted target={target}"
+    )
+    try:
+        if hasattr(control.adapter, "send_text_then_submit"):
+            control.adapter.send_text_then_submit(
+                caller_pane,
+                text,
+                clear_prompt=False,
+                pre_submit_keys=(),
+                submit_settle_seconds=0,
+            )
+        else:
+            control.adapter.run("send-keys", "-t", caller_pane, "-l", text)
+            if hasattr(control.adapter, "send_keys"):
+                control.adapter.send_keys(caller_pane, "C-m")
+            else:
+                control.adapter.run("send-keys", "-t", caller_pane, "C-m")
+        return {
+            "correlation_id": correlation_id,
+            "caller_pane": caller_pane,
+            "target_pane": callback.get("target_pane"),
+            "target_label": callback.get("target_label"),
+            "status": "sent",
+            "event": event,
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "tmuxctld: prompt-submit hook echo failed correlation_id=%s caller=%s: %s",
+            correlation_id,
+            _safe_public_role(caller_pane),
+            exc,
+        )
+        return {
+            "correlation_id": correlation_id,
+            "caller_pane": caller_pane,
+            "target_pane": callback.get("target_pane"),
+            "target_label": callback.get("target_label"),
+            "status": "failed",
+            "error": str(exc),
+            "event": event,
+        }
 
 
 class SendOperationIdempotency:
@@ -1300,6 +1413,8 @@ def _send_text_pipeline(
     operation_id: str = "",
     pre_submit_keys: tuple[str, ...] = (),
     post_submit_actions: tuple[dict, ...] = (),
+    hook_echo_pane: str = "",
+    correlation_id: str = "",
 ) -> dict:
     if verify is None:
         verify = submit
@@ -1571,23 +1686,38 @@ def _send_text_pipeline(
         if send_exception is not None:
             _SEND_IDEMPOTENCY.abort(operation_id)
 
-    # When verification was never requested, a completed send is "submitted", not
-    # "unverified" — only a requested-but-unacked send is genuinely unverified.
-    verification_status = "submitted" if ack else ("unverified" if verify else "not_requested")
-    status = "submitted" if ack or not verify else "unverified"
-    # Advisory delivery classification for the no-ack case: an unacked submit is
-    # ambiguous (queued behind a tool call vs. genuinely stuck). Scrape the pane
-    # and hand the caller a soft verdict + the raw scrape instead of forcing it
-    # to infer failure from a bare `unverified`. Never raises; ack present is a
-    # no-op ("confirmed").
-    delivery, advisory, capture_excerpt, delivery_verified_by = _classify_submit_delivery(
+    # Level-1 delivery contract: if tmuxctld reached this point without a gate or
+    # send exception, bytes were issued to the target pane. That is delivery
+    # success for the send call. UserPromptSubmit is only the level-2 "the target
+    # took a turn" fact; lack of that hook is pending, not non-delivery.
+    verification_status = "submitted" if ack else ("pending" if verify else "not_requested")
+    status = "submitted" if ack else "delivered"
+    turn = "submitted" if ack else ("pending" if verify else "not_requested")
+    # Advisory submit classification for the no-ack case. The classifier may
+    # find a stuck composer or engine-specific ingestion signal, but it must not
+    # demote level-1 byte delivery to failure.
+    submit_delivery, advisory, capture_excerpt, delivery_verified_by = _classify_submit_delivery(
         control, phys_pane=phys_pane, text=text, ack=ack
     )
-    if verify and not ack and delivery == "likely" and delivery_verified_by:
-        verification_status = "likely"
-        status = "likely"
-    if delivery == "failed":
+    if submit_delivery == "failed":
         failures.append({"type": "submit_not_cleared", "detail": advisory})
+    hook_echo = None
+    if verify and not ack:
+        callback_pane = str(hook_echo_pane or "").strip()
+        if callback_pane:
+            try:
+                callback_pane = _resolve_physical_pane_or_gate(control, callback_pane)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("tmuxctld: hook-echo caller resolution skipped: %s", exc)
+        hook_echo = _PROMPT_SUBMIT_SNIFFER.register_callback(
+            correlation_id=correlation_id or operation_id or dispatch_id,
+            caller_pane=callback_pane,
+            target_pane=phys_pane,
+            target_label=pane,
+            instance_id=instance_id,
+            payload_hash=payload_hash,
+            since=started,
+        )
     result = {
         "status": status,
         "pane": pane,
@@ -1598,9 +1728,15 @@ def _send_text_pipeline(
         "verification_status": verification_status,
         "verified_by": "UserPromptSubmit" if ack else delivery_verified_by,
         "ack": ack,
-        "delivery": delivery,
+        "delivered": True,
+        "submitted": bool(ack),
+        "turn": turn,
+        "delivery": "confirmed" if ack else "delivered",
+        "submit_delivery": submit_delivery,
         "advisory": advisory or None,
         "capture_excerpt": capture_excerpt,
+        "correlation_id": correlation_id or operation_id or dispatch_id,
+        "hook_echo": hook_echo,
         "recovery_submit_credited": recovery_submit_credited,
         "idempotent_replay": False,
         "guard_held": held,
@@ -1628,6 +1764,8 @@ def _h_send_text(control, params):
         ack_submit_retries=_i(params, "ack_submit_retries", 2),
         operation_id=_s(params, "operation_id"),
         pre_submit_keys=_parse_pre_submit_keys(params.get("pre_submit_keys", ())),
+        hook_echo_pane=_s(params, "hook_echo_pane") or _s(params, "caller_pane"),
+        correlation_id=_s(params, "correlation_id"),
     )
 
 
@@ -1880,8 +2018,13 @@ def _h_persona_engine(control, params):
     )
 
 
-def _h_hook_user_prompt_submit(_control, params):
-    return _PROMPT_SUBMIT_SNIFFER.record(params)
+def _h_hook_user_prompt_submit(control, params):
+    event = _PROMPT_SUBMIT_SNIFFER.record(params)
+    echoes = [
+        _emit_prompt_submit_callback(control, callback, event)
+        for callback in _PROMPT_SUBMIT_SNIFFER.pop_matching_callbacks(event)
+    ]
+    return {**event, "hook_echoes": echoes}
 
 
 def _h_clear_runtime(control, params):

@@ -165,9 +165,9 @@ def main(argv: list[str]) -> int:
         _err("no targets resolved" + (f" (unresolved: {unresolved})" if unresolved else ""))
         return 1
 
-    # Report the TRUE send result: only a confirmed "sent" counts as delivered.
-    # Pending/gated is queued-but-not-submitted, and unverified means bytes may
-    # have been issued but no target turn was proven; neither is a delivery.
+    # Two-level delivery contract: "sent" means bytes reached the target pane and
+    # is delivery success. A missing UserPromptSubmit hook is only a pending
+    # level-2 turn, not non-delivery.
     def _is_blocked(row: dict) -> bool:
         status_text = str(row.get("status") or "").lower()
         reason_text = str(row.get("reason") or row.get("error") or "").lower()
@@ -182,6 +182,9 @@ def main(argv: list[str]) -> int:
     blocked = sum(1 for r in resolved if _is_blocked(r))
     pending = sum(1 for r in resolved if r.get("status") == "pending" and not _is_blocked(r))
     unverified = sum(1 for r in resolved if r.get("status") == "unverified")
+    turn_pending = sum(
+        1 for r in resolved if r.get("status") == "sent" and r.get("turn") == "pending"
+    )
 
     targets = ", ".join(
         f"{r.get('position_id') or r.get('pane_id')}"
@@ -195,6 +198,8 @@ def main(argv: list[str]) -> int:
         suffix_parts.append(f"{blocked} blocked — not delivered")
     if unverified:
         suffix_parts.append(f"{unverified} unverified — bytes may have issued, no target turn proven")
+    if turn_pending:
+        suffix_parts.append(f"{turn_pending} turn pending — hook echo will follow on ack")
     suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
     print(f"[brief{eph}] delivered={sent}/{len(resolved)}{suffix} → {targets}")
     for r in resolved:

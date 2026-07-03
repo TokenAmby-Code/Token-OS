@@ -1969,10 +1969,9 @@ async def _direct_pane_write(tmux_pane: str, payload: str) -> dict:
 
     Reports the truth instead:
 
-      * ``sent``       — submission verified (the composer cleared after submit)
-      * ``unverified`` — bytes were issued but delivery is not yet proven; the
-                          proof belt (UserPromptSubmit correlation) confirms it
-                          asynchronously
+      * ``sent``       — bytes reached the pane (level-1 delivery). A missing
+                          UserPromptSubmit hook is ``turn=pending``, not
+                          non-delivery.
       * ``gated``      — the universal send gate suppressed the write (NO bytes
                           reached the pane); never reported as delivered
       * ``failed``     — the send errored
@@ -1993,12 +1992,8 @@ async def _direct_pane_write(tmux_pane: str, payload: str) -> dict:
             "send": result,
         }
     if result.get("returncode") == 0:
-        # Bytes issued. Only a confirmed submission (composer cleared) is
-        # "sent"; otherwise it is honestly "unverified" until the proof belt
-        # correlates a UserPromptSubmit. Never default bytes-issued to "sent".
-        verified = result.get("verification_status") == "submitted"
         return {
-            "status": "sent" if verified else "unverified",
+            "status": "sent",
             "verification_status": result.get("verification_status"),
             "operation": result.get("operation"),
             "send": result,
