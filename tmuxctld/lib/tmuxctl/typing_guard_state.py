@@ -70,6 +70,41 @@ bind -n Any {
 }
 """
 
+#: The submit keys (Enter/C-m) and edit keys (BSpace/C-h/C-c) that drive the guard's
+#: PENDING branch.  Unlike ``Any`` — which is focus-toggled (unbound during a live
+#: HUMAN guard, re-sourced by :func:`enable_any_binding` on the next focus) — these
+#: are PERMANENTLY bound and have NO focus/rehydrate re-source path.  A deploy that
+#: changes their definition in ``cli-tools/tmux/tmux-base.conf`` therefore leaves the
+#: LIVE root key-table stale until an explicit ``tmux source-file`` — the CD
+#: deploy-coherence gap: ``/health`` can report the new daemon SHA while the running
+#: tmux server still flashes the OLD form.  :func:`reconcile_pending_bindings` closes
+#: that gap by re-sourcing them (least-destructive; never a restart/kickstart) when
+#: the live form drifts from canonical.  These MUST stay byte-for-byte in sync with
+#: the ``bind -n {Enter,C-m,BSpace,C-h,C-c}`` block in ``tmux-base.conf``; the
+#: ``|| true`` exit-swallow is load-bearing for the same reason it is in ``ANY_BINDING``.
+_PENDING_SUBMIT_BINDING = (
+    'bind -n {key} {{ run-shell -b "tmuxctld-ping POST /typing-guard-state '
+    "cmd=pending pane=#{{q:pane_id}} seconds=5 now=#{{client_activity}} "
+    '>/dev/null 2>&1 || true" ; send-keys }}'
+)
+_PENDING_EDIT_BINDING = (
+    "bind -n {key} {{ if -F '#{{&&:#{{||:#{{==:#{{@TYPING_GUARD_KIND}},pending}},"
+    "#{{==:#{{@TYPING_GUARD_KIND}},human}}}},#{{e|>=:#{{@TYPING_GUARD_UNTIL}},"
+    "#{{client_activity}}}}}}' {{ send-keys }} {{ run-shell -b \"tmuxctld-ping POST "
+    "/typing-guard-state cmd=pending pane=#{{q:pane_id}} seconds=15 now=#{{client_activity}} "
+    '>/dev/null 2>&1 || true" ; send-keys }} }}'
+)
+#: (key, canonical binding text, is_edit_key) for the five permanent PENDING-branch
+#: keys, in source order.  Edit keys short-circuit to a bare ``send-keys`` while a
+#: PENDING/HUMAN guard is live (#559); submit keys always pend.
+PENDING_BINDINGS = (
+    ("Enter", _PENDING_SUBMIT_BINDING.format(key="Enter"), False),
+    ("C-m", _PENDING_SUBMIT_BINDING.format(key="C-m"), False),
+    ("BSpace", _PENDING_EDIT_BINDING.format(key="BSpace"), True),
+    ("C-h", _PENDING_EDIT_BINDING.format(key="C-h"), True),
+    ("C-c", _PENDING_EDIT_BINDING.format(key="C-c"), True),
+)
+
 
 @dataclass(frozen=True)
 class Tmux:
@@ -151,6 +186,82 @@ def _any_binding_status(tmux: Tmux) -> dict[str, Any]:
         )
     ) and "display-message" not in raw
     return {"present": present, "canonical": canonical, "raw": raw[:500]}
+
+
+def _pending_binding_status(tmux: Tmux, key: str, *, is_edit: bool) -> dict[str, Any]:
+    """Canonicality of one permanent PENDING-branch root binding on the LIVE server.
+
+    Canonical == present, drives the daemon pending ping, carries the ``|| true``
+    exit-swallow, and does NOT flash ``display-message``.  Edit keys additionally
+    must carry the ``@TYPING_GUARD_KIND`` short-circuit (#559) so a reverted
+    always-ping form is caught.  A binding that only redirects streams
+    (``>/dev/null 2>&1`` without ``|| true``, the #559 form #564 corrected) is
+    NON-canonical — tmux still flashes ``'<cmd>' returned <N>`` on a nonzero ping.
+    """
+
+    proc = tmux.run("list-keys", "-T", "root", key, timeout=0.3)
+    raw = "" if proc is None else (proc.stdout or "").strip()
+    present = proc is not None and proc.returncode == 0 and bool(raw)
+    needles = [
+        "tmuxctld-ping POST /typing-guard-state",
+        "cmd=pending",
+        "|| true",
+        "send-keys",
+    ]
+    if is_edit:
+        needles.append("@TYPING_GUARD_KIND")
+    canonical = present and all(n in raw for n in needles) and "display-message" not in raw
+    return {"present": present, "canonical": canonical, "raw": raw[:500]}
+
+
+def reconcile_pending_bindings(tmux: Tmux) -> dict[str, Any]:
+    """Re-source the permanent PENDING-branch root bindings if the LIVE table drifted.
+
+    The deploy-coherence backstop for ``Enter``/``C-m``/``BSpace``/``C-h``/``C-c``
+    (see :data:`PENDING_BINDINGS`): these are permanently bound and never re-source
+    on focus/rehydrate, so after a deploy advances the daemon SHA the running tmux
+    server can keep the OLD flashing form.  This checks each against canonical and,
+    if any reachable key drifted, re-sources ALL five from their canonical templates
+    via a single ``source-file`` — the least-destructive repair (never a
+    restart/kickstart).  Idempotent: a fully-canonical table is a no-op.  Fail-open:
+    if tmux is unreachable (no key resolvable) nothing is sourced.
+    """
+
+    checked: dict[str, dict[str, Any]] = {}
+    for key, _text, is_edit in PENDING_BINDINGS:
+        checked[key] = _pending_binding_status(tmux, key, is_edit=is_edit)
+    # Reachability is inferred from the key table itself: if not a single binding
+    # resolves, tmux is (mid-restart / unreachable) and we must not source into it.
+    any_present = any(status["present"] for status in checked.values())
+    drifted = [
+        key
+        for key, status in checked.items()
+        if (status["present"] and not status["canonical"])
+        or (any_present and not status["present"])
+    ]
+    if not drifted:
+        return {"reconciled": False, "changed": False, "drifted": [], "checked": checked}
+
+    source_text = "\n".join(text for _key, text, _is_edit in PENDING_BINDINGS) + "\n"
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write(source_text)
+            path = handle.name
+        ok = _run_ok(tmux, "source-file", path, timeout=1.0)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return {
+        "reconciled": True,
+        "changed": bool(ok),
+        "ok": bool(ok),
+        "drifted": drifted,
+        "checked": checked,
+    }
 
 
 def _set_any_hooks_marker(tmux: Tmux, *, enabled: bool) -> None:
@@ -521,6 +632,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("enable-any", help="enable root Any ordinary-key hook")
     sub.add_parser("disable-any", help="disable root Any ordinary-key hook")
+    sub.add_parser(
+        "reconcile-bindings",
+        help="re-source the permanent PENDING-branch root keys if the live table drifted",
+    )
 
     return parser
 
@@ -529,7 +644,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     pane = args.pane or os.environ.get("TMUX_PANE", "")
-    pane_optional_commands = {"enable-any", "disable-any", "rehydrate"}
+    pane_optional_commands = {"enable-any", "disable-any", "rehydrate", "reconcile-bindings"}
     if not pane and args.cmd not in pane_optional_commands:
         if args.cmd == "status":
             sys.stdout.write(json.dumps(status(Tmux(tmux_binary()), pane)))
@@ -571,6 +686,8 @@ def main(argv: list[str] | None = None) -> int:
             result = enable_any_binding(tmux)
         elif args.cmd == "disable-any":
             result = disable_any_binding(tmux)
+        elif args.cmd == "reconcile-bindings":
+            result = reconcile_pending_bindings(tmux)
         if result is not None:
             sys.stdout.write(json.dumps(result, separators=(",", ":"), sort_keys=True))
     except Exception:

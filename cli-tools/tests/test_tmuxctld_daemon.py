@@ -27,8 +27,10 @@ from tmuxctl import daemon, wrapper_ledger
 from tmuxctl import service as tmux_service
 
 # Captured before any monkeypatching so the dedicated re-assertion tests can
-# restore the genuine method the autouse guard stubs out.
+# restore the genuine methods the autouse guard stubs out.
 _REAL_MAYBE_REASSERT = daemon.TmuxctldServer.maybe_reassert_lifecycle_hooks
+_REAL_MAYBE_RECONCILE_BINDINGS = daemon.TmuxctldServer.maybe_reconcile_guard_bindings
+_REAL_RECONCILE_PENDING_BINDINGS = daemon.typing_guard_state.reconcile_pending_bindings
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +59,17 @@ def _no_live_tmux_guard(monkeypatch, tmp_path):
     # touches live tmux; the dedicated re-assertion tests restore the real method.
     # (ensure_tmux_lifecycle_hooks itself is left intact for the startup tests.)
     monkeypatch.setattr(daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", lambda self: False)
+    # /health also reconciles the permanent guard bindings (shells real tmux).
+    # Neutralise BOTH the heartbeat entry point AND the underlying reconcile
+    # module-wide, so no test can shell real tmux through this path even if it drives
+    # the reconcile directly. The dedicated reconcile tests restore the real
+    # callables (via _REAL_MAYBE_RECONCILE_BINDINGS / _REAL_RECONCILE_PENDING_BINDINGS).
+    monkeypatch.setattr(daemon.TmuxctldServer, "maybe_reconcile_guard_bindings", lambda self: False)
+    monkeypatch.setattr(
+        daemon.typing_guard_state,
+        "reconcile_pending_bindings",
+        lambda *a, **k: {"reconciled": False, "changed": False, "drifted": [], "checked": {}},
+    )
 
 
 class StubAdapter:
@@ -1035,6 +1048,256 @@ def test_health_endpoint_rides_heartbeat_to_reassert_hooks(monkeypatch) -> None:
         assert status == 200
         assert payload["ok"] is True
         assert calls, "/health did not re-assert the lifecycle hooks"
+    finally:
+        server.shutdown()
+
+
+# --- Deploy-coherence: permanent guard PENDING-branch key reconcile -------------
+
+
+_PENDING_CANONICAL = {
+    "Enter": (
+        'bind-key -T root Enter run-shell -b "tmuxctld-ping POST '
+        "/typing-guard-state cmd=pending pane=%1 seconds=5 now=0 "
+        '>/dev/null 2>&1 || true" ; send-keys'
+    ),
+    "C-m": (
+        'bind-key -T root C-m run-shell -b "tmuxctld-ping POST '
+        "/typing-guard-state cmd=pending pane=%1 seconds=5 now=0 "
+        '>/dev/null 2>&1 || true" ; send-keys'
+    ),
+    "BSpace": (
+        "bind-key -T root BSpace if-shell -F "
+        "'#{&&:#{||:#{==:#{@TYPING_GUARD_KIND},pending},#{==:#{@TYPING_GUARD_KIND},human}},"
+        "#{e|>=:#{@TYPING_GUARD_UNTIL},#{client_activity}}}' 'send-keys' "
+        "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=pending pane=%1 "
+        "seconds=15 now=0 >/dev/null 2>&1 || true\" ; send-keys'"
+    ),
+    "C-h": (
+        "bind-key -T root C-h if-shell -F "
+        "'#{&&:#{||:#{==:#{@TYPING_GUARD_KIND},pending},#{==:#{@TYPING_GUARD_KIND},human}},"
+        "#{e|>=:#{@TYPING_GUARD_UNTIL},#{client_activity}}}' 'send-keys' "
+        "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=pending pane=%1 "
+        "seconds=15 now=0 >/dev/null 2>&1 || true\" ; send-keys'"
+    ),
+    "C-c": (
+        "bind-key -T root C-c if-shell -F "
+        "'#{&&:#{||:#{==:#{@TYPING_GUARD_KIND},pending},#{==:#{@TYPING_GUARD_KIND},human}},"
+        "#{e|>=:#{@TYPING_GUARD_UNTIL},#{client_activity}}}' 'send-keys' "
+        "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=pending pane=%1 "
+        "seconds=15 now=0 >/dev/null 2>&1 || true\" ; send-keys'"
+    ),
+}
+
+# The pre-#559 form: fails LOUDLY with a raw display-message on a nonzero ping.
+_ENTER_STALE_DISPLAY_MESSAGE = (
+    'bind-key -T root Enter run-shell -b "tmuxctld-ping POST '
+    "/typing-guard-state cmd=pending pane=%1 seconds=5 now=0 "
+    "|| env IMPERIUM_TMUX_RAW=1 tmux display-message "
+    'tmuxctld-ping-/typing-guard-state-failed" ; send-keys'
+)
+# The #559 form #564 corrected: only redirects streams, no `|| true` exit-swallow,
+# so tmux still flashes `'<cmd>' returned <N>` on a nonzero ping.
+_ENTER_STALE_BARE_REDIRECT = (
+    'bind-key -T root Enter run-shell -b "tmuxctld-ping POST '
+    "/typing-guard-state cmd=pending pane=%1 seconds=5 now=0 "
+    '>/dev/null 2>&1" ; send-keys'
+)
+
+
+def _pending_bindings_fake_tmux(live: dict):
+    """Dict-backed FakeTmux over the root key-table: ``list-keys -T root <key>``
+    returns ``live[key]`` (missing key => nonzero rc), and ``source-file`` snaps the
+    whole PENDING-branch table to its canonical live form (as a real re-source would).
+    Records every command so tests can assert exactly one source-file on a stale
+    table and none on a canonical one."""
+
+    calls: list[tuple[str, ...]] = []
+
+    class FakeTmux:
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            calls.append(tuple(args))
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args[:3] == ("list-keys", "-T", "root"):
+                key = args[3]
+                if key in live:
+                    proc.returncode = 0
+                    proc.stdout = live[key]
+                else:
+                    proc.returncode = 1
+                    proc.stdout = ""
+            elif args and args[0] == "source-file":
+                live.update(_PENDING_CANONICAL)
+            return proc
+
+    return FakeTmux(), calls
+
+
+def test_reconcile_pending_bindings_resources_stale_display_message_table(monkeypatch) -> None:
+    """DEPLOY-COHERENCE (red-first): a live root table can carry the OLD flashing
+    Enter form while the daemon SHA is already advanced — SHA-green health does NOT
+    imply a canonical key-table. reconcile detects the drift and re-sources (one
+    source-file), and a second pass is a no-op (idempotent) once canonical."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
+    tg = daemon.typing_guard_state
+    live = dict(_PENDING_CANONICAL)
+    live["Enter"] = _ENTER_STALE_DISPLAY_MESSAGE
+    fake, calls = _pending_bindings_fake_tmux(live)
+
+    result = tg.reconcile_pending_bindings(fake)
+    assert result["reconciled"] is True
+    assert result["changed"] is True
+    assert "Enter" in result["drifted"]
+    assert sum(1 for c in calls if c and c[0] == "source-file") == 1
+
+    # Idempotent: the re-source made the table canonical, so a second reconcile is a
+    # no-op — the /health heartbeat can fire every interval without churning tmux.
+    calls.clear()
+    again = tg.reconcile_pending_bindings(fake)
+    assert again["reconciled"] is False
+    assert again["drifted"] == []
+    assert not any(c and c[0] == "source-file" for c in calls)
+
+
+def test_reconcile_pending_bindings_resources_bare_redirect_form(monkeypatch) -> None:
+    """The #559 bare-`>/dev/null 2>&1` form (no `|| true`) is stale too — tmux still
+    flashes `'<cmd>' returned <N>` on a nonzero ping — so it must re-source."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
+    tg = daemon.typing_guard_state
+    live = dict(_PENDING_CANONICAL)
+    live["Enter"] = _ENTER_STALE_BARE_REDIRECT
+    fake, calls = _pending_bindings_fake_tmux(live)
+
+    result = tg.reconcile_pending_bindings(fake)
+    assert result["reconciled"] is True
+    assert "Enter" in result["drifted"]
+    assert sum(1 for c in calls if c and c[0] == "source-file") == 1
+
+
+def test_reconcile_pending_bindings_noop_when_canonical(monkeypatch) -> None:
+    """A fully-canonical live table is a no-op: no source-file, reconciled=False."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
+    tg = daemon.typing_guard_state
+    fake, calls = _pending_bindings_fake_tmux(dict(_PENDING_CANONICAL))
+
+    result = tg.reconcile_pending_bindings(fake)
+    assert result["reconciled"] is False
+    assert result["drifted"] == []
+    assert not any(c and c[0] == "source-file" for c in calls)
+
+
+def test_reconcile_pending_bindings_failopen_when_tmux_unreachable(monkeypatch) -> None:
+    """No key resolvable (tmux mid-restart / unreachable) => fail-open: never source
+    into a server whose state we cannot read."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
+    tg = daemon.typing_guard_state
+    fake, calls = _pending_bindings_fake_tmux({})  # every list-keys returns rc=1
+
+    result = tg.reconcile_pending_bindings(fake)
+    assert result["reconciled"] is False
+    assert result["drifted"] == []
+    assert not any(c and c[0] == "source-file" for c in calls)
+
+
+def test_reconcile_pending_bindings_resources_edit_key_missing_short_circuit(monkeypatch) -> None:
+    """An edit key reverted to an always-ping form (no @TYPING_GUARD_KIND
+    short-circuit) is non-canonical and re-sources."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
+    tg = daemon.typing_guard_state
+    live = dict(_PENDING_CANONICAL)
+    live["C-c"] = (
+        'bind-key -T root C-c run-shell -b "tmuxctld-ping POST '
+        "/typing-guard-state cmd=pending pane=%1 seconds=15 now=0 "
+        '>/dev/null 2>&1 || true" ; send-keys'
+    )
+    fake, calls = _pending_bindings_fake_tmux(live)
+
+    result = tg.reconcile_pending_bindings(fake)
+    assert result["reconciled"] is True
+    assert "C-c" in result["drifted"]
+    assert sum(1 for c in calls if c and c[0] == "source-file") == 1
+
+
+def test_health_reconciles_guard_bindings_throttled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        daemon.TmuxctldServer,
+        "maybe_reconcile_guard_bindings",
+        _REAL_MAYBE_RECONCILE_BINDINGS,
+    )
+    server, _ = _serve(StubAdapter)
+    try:
+        calls = []
+        monkeypatch.setattr(
+            daemon.typing_guard_state,
+            "reconcile_pending_bindings",
+            lambda tmux: calls.append(1) or {"reconciled": False},
+        )
+        # Boot deadline is 0.0 -> first call reconciles; an immediate second is throttled.
+        assert server.maybe_reconcile_guard_bindings() is True
+        assert server.maybe_reconcile_guard_bindings() is False
+        assert len(calls) == 1
+        # After the throttle window passes it reconciles again, so a deploy bounce
+        # self-heals the live key-table within one interval.
+        server._binding_reconcile_deadline = 0.0
+        assert server.maybe_reconcile_guard_bindings() is True
+        assert len(calls) == 2
+    finally:
+        server.shutdown()
+
+
+def test_health_endpoint_rides_heartbeat_to_reconcile_bindings(monkeypatch) -> None:
+    monkeypatch.setattr(
+        daemon.TmuxctldServer,
+        "maybe_reconcile_guard_bindings",
+        _REAL_MAYBE_RECONCILE_BINDINGS,
+    )
+    server, _ = _serve(StubAdapter)
+    try:
+        calls = []
+        monkeypatch.setattr(
+            daemon.typing_guard_state,
+            "reconcile_pending_bindings",
+            lambda tmux: calls.append(1) or {"reconciled": False},
+        )
+        status, payload = _get(server, "/health")
+        assert status == 200
+        assert payload["ok"] is True
+        assert calls, "/health did not reconcile the permanent guard bindings"
+    finally:
+        server.shutdown()
+
+
+def test_typing_guard_topology_reconcile_cmd_resources_bindings(monkeypatch) -> None:
+    """The topology route exposes an explicit deploy-coherence re-source so a deploy
+    step / operator can force it on demand (the same repair /health rides)."""
+    calls = []
+    monkeypatch.setattr(
+        daemon.typing_guard_state,
+        "reconcile_pending_bindings",
+        lambda tmux: calls.append(1) or {"reconciled": True, "drifted": ["Enter"]},
+    )
+    server, _ = _serve(StubAdapter)
+    try:
+        status, payload = _post(server, "/typing-guard-topology", {"cmd": "reconcile"})
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["result"]["reconciled"] is True
+        assert calls, "topology cmd=reconcile did not reconcile the bindings"
     finally:
         server.shutdown()
 
