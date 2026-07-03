@@ -84,6 +84,7 @@ import temp_message as temp_message_service
 from billable import accrual_weight, classify_work_class, trickle_numerator
 from context_governor import (
     ContextSweepRequest,
+    record_context_governor_progress,
     sweep_context_governor,
 )
 from context_governor import (
@@ -28955,12 +28956,35 @@ Return the complete updated document."""
             except Exception as exc:
                 logger.debug(f"merge: bump session_doc_up_to_date failed: {exc}")
 
+        merge_updated_at = datetime.now().isoformat()
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE session_documents SET updated_at = ? WHERE id = ?",
-                (datetime.now().isoformat(), doc_id),
+                (merge_updated_at, doc_id),
             )
+            cursor = await db.execute(
+                """SELECT id FROM instances
+                   WHERE session_doc_id = ?
+                     AND status NOT IN ('stopped', 'archived')""",
+                (doc_id,),
+            )
+            linked_instance_ids = [row[0] for row in await cursor.fetchall()]
             await db.commit()
+
+        for linked_instance_id in linked_instance_ids:
+            try:
+                await record_context_governor_progress(
+                    linked_instance_id,
+                    "session_doc_checkpoint",
+                    source="session_doc_merge",
+                    details={"doc_id": doc_id, "merge_updated_at": merge_updated_at},
+                )
+            except Exception as exc:
+                logger.debug(
+                    "merge: context governor checkpoint record failed for %s: %s",
+                    linked_instance_id,
+                    exc,
+                )
 
         await log_event(
             "session_doc_merged",

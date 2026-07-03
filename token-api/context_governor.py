@@ -28,6 +28,15 @@ SOFT_MIN_TOKENS = 130_000
 HARD_MIN_TOKENS = 160_000
 DEFAULT_NO_PROGRESS_TTL_SECONDS = 15 * 60
 CONTEXT_STOP_PURPOSE = "context_governor_stop"
+CHECKPOINT_EVENT_TYPES = frozenset(
+    {"session_doc_checkpoint", "session_doc_merged", "checkpoint_completed"}
+)
+PRESSURE_STAGE_RANK = {
+    "telemetry": 0,
+    "soft_stop": 1,
+    "hard_injection": 2,
+    "no_progress_stop": 2,
+}
 
 router = APIRouter()
 
@@ -137,7 +146,12 @@ def classify_context_scope(row: dict | None) -> tuple[bool, str]:
     commanded = commander_type in {"persona", "chapter"}
 
     scoped = automated or hook_driven or is_subagent or headless_origin or commanded
-    if persona in {"custodes", "emperor"} and not scoped:
+    # Custodes(Opus) is a human-facing singleton seat. It is intentionally out
+    # of the autonomous 130k/160k context-governor hook path even though the
+    # singleton is technically hook-driven/perpetual in the registry.
+    if persona == "custodes":
+        return False, "custodes_opus_context_hook_exempt"
+    if persona == "emperor" and not scoped:
         return False, "interactive_persona_exempt"
     if not scoped:
         return False, "interactive_exempt"
@@ -152,6 +166,79 @@ def _stage_for_used_tokens(used_tokens: int | None) -> str:
     if SOFT_MIN_TOKENS <= used_tokens <= HARD_MIN_TOKENS:
         return "soft_stop"
     return "telemetry"
+
+
+def _stage_rank(stage: str | None) -> int:
+    return PRESSURE_STAGE_RANK.get(str(stage or "telemetry"), 0)
+
+
+def _latest_dt(*values: str | None) -> datetime | None:
+    parsed = [dt for dt in (_parse_dt(value) for value in values) if dt is not None]
+    return max(parsed) if parsed else None
+
+
+async def _session_doc_updated_at(db: aiosqlite.Connection, row: dict | None) -> str | None:
+    doc_id = (row or {}).get("session_doc_id")
+    if not doc_id:
+        return None
+    cursor = await db.execute("SELECT updated_at FROM session_documents WHERE id = ?", (doc_id,))
+    doc_row = await cursor.fetchone()
+    if not doc_row:
+        return None
+    try:
+        return doc_row["updated_at"]
+    except Exception:
+        return doc_row[0]
+
+
+async def _context_pressure_gate(
+    db: aiosqlite.Connection,
+    *,
+    instance_row: dict | None,
+    existing_state: dict | None,
+    session_id: str | None,
+    stage: str,
+) -> tuple[bool, str]:
+    """Return (allowed, reason) for pressure directive actuation.
+
+    This is an event gate, not a time debounce: a pressure band crossing fires
+    once, then re-arms only for a higher band or real work/progress observed
+    after the last completed checkpoint and after the last directive.
+    """
+
+    if not existing_state or not existing_state.get("injected_at"):
+        return True, "threshold_cross"
+    if existing_state.get("session_id") != session_id:
+        return True, "new_session"
+
+    previous_rank = _stage_rank(existing_state.get("stage"))
+    current_rank = _stage_rank(stage)
+    if current_rank > previous_rank:
+        return True, "higher_context_band"
+    if previous_rank == 0 and current_rank > 0:
+        return True, "threshold_cross"
+
+    checkpoint_at = _parse_dt(existing_state.get("checkpoint_completed_at"))
+    injected_at = _parse_dt(existing_state.get("injected_at"))
+    if checkpoint_at and injected_at:
+        doc_updated_at = await _session_doc_updated_at(db, instance_row)
+        latest_activity = _latest_dt(existing_state.get("last_progress_at"), doc_updated_at)
+        current_activity = str((instance_row or {}).get("last_activity") or "")
+        checkpoint_activity = str(existing_state.get("checkpoint_activity_at") or "")
+        directive_activity = str(existing_state.get("last_directive_activity_at") or "")
+        activity_changed = (
+            checkpoint_activity
+            and current_activity
+            and current_activity != checkpoint_activity
+            and current_activity != directive_activity
+        )
+        if (
+            latest_activity and latest_activity > checkpoint_at and latest_activity > injected_at
+        ) or activity_changed:
+            return True, "meaningful_activity_after_checkpoint"
+        return False, "checkpoint_current"
+
+    return False, "already_fired"
 
 
 def _planning_state(row: dict | None) -> str | None:
@@ -285,13 +372,16 @@ async def _upsert_state(
     armed_subscription_id: int | None = None,
     injected_at: str | None = None,
     no_progress_deadline_at: str | None = None,
+    checkpoint_completed_at: str | None = None,
+    last_directive_activity_at: str | None = None,
 ) -> None:
     await db.execute(
         """INSERT INTO context_governor_state
            (instance_id, session_id, engine, pane, used_tokens, context_window_tokens,
             planning_state, scoped, scope_reason, stage, policy_state,
-            armed_subscription_id, injected_at, no_progress_deadline_at, last_telemetry_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            armed_subscription_id, injected_at, no_progress_deadline_at, checkpoint_completed_at,
+            last_directive_activity_at, last_telemetry_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
            ON CONFLICT(instance_id) DO UPDATE SET
              session_id = excluded.session_id,
              engine = COALESCE(excluded.engine, context_governor_state.engine),
@@ -306,6 +396,8 @@ async def _upsert_state(
              armed_subscription_id = COALESCE(excluded.armed_subscription_id, context_governor_state.armed_subscription_id),
              injected_at = COALESCE(excluded.injected_at, context_governor_state.injected_at),
              no_progress_deadline_at = COALESCE(excluded.no_progress_deadline_at, context_governor_state.no_progress_deadline_at),
+             checkpoint_completed_at = COALESCE(excluded.checkpoint_completed_at, context_governor_state.checkpoint_completed_at),
+             last_directive_activity_at = COALESCE(excluded.last_directive_activity_at, context_governor_state.last_directive_activity_at),
              last_telemetry_at = CURRENT_TIMESTAMP""",
         (
             instance_id,
@@ -322,6 +414,8 @@ async def _upsert_state(
             armed_subscription_id,
             injected_at,
             no_progress_deadline_at,
+            checkpoint_completed_at,
+            last_directive_activity_at,
         ),
     )
 
@@ -397,8 +491,49 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
             }
 
         existing_state = await _current_state(db, instance_id)
+        gate_allowed, gate_reason = await _context_pressure_gate(
+            db,
+            instance_row=row,
+            existing_state=existing_state,
+            session_id=session_id,
+            stage=stage,
+        )
+        if not gate_allowed:
+            await _upsert_state(
+                db,
+                instance_id=instance_id,
+                session_id=session_id,
+                engine=engine,
+                pane=pane,
+                used_tokens=used_tokens,
+                context_window_tokens=request.context_window_tokens,
+                planning_state=planning_state,
+                scoped=True,
+                scope_reason=scope_reason,
+                stage=stage,
+                policy_state=(existing_state or {}).get("policy_state") or "event_gate_suppressed",
+            )
+            await _audit(
+                db,
+                instance_id=instance_id,
+                session_id=session_id,
+                stage=stage,
+                action="event_gate_suppressed",
+                details={"used_tokens": used_tokens, "gate_reason": gate_reason},
+            )
+            await db.commit()
+            return {
+                "success": True,
+                "action": "event_gate_suppressed",
+                "scoped": True,
+                "stage": stage,
+                "used_tokens": used_tokens,
+                "gate_reason": gate_reason,
+            }
+
         if stage == "soft_stop":
             payload = _message(stage, planning_state)
+            injected_at = _now()
             sub_id = await _arm_stop_subscription(
                 db, instance_id=instance_id, pane=pane, payload=payload
             )
@@ -416,6 +551,8 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
                 stage=stage,
                 policy_state="armed_stop_subscription",
                 armed_subscription_id=sub_id,
+                injected_at=injected_at,
+                last_directive_activity_at=(row or {}).get("last_activity"),
             )
             await _audit(
                 db,
@@ -423,7 +560,11 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
                 session_id=session_id,
                 stage=stage,
                 action="armed_stop_subscription",
-                details={"subscription_id": sub_id, "used_tokens": used_tokens},
+                details={
+                    "subscription_id": sub_id,
+                    "used_tokens": used_tokens,
+                    "gate_reason": gate_reason,
+                },
             )
             await db.commit()
             return {
@@ -433,40 +574,8 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
                 "stage": stage,
                 "subscription_id": sub_id,
                 "used_tokens": used_tokens,
+                "gate_reason": gate_reason,
             }
-
-        # Hard threshold: immediate forced injection, debounced by instance/session.
-        if (
-            existing_state
-            and existing_state.get("session_id") == session_id
-            and existing_state.get("injected_at")
-            and existing_state.get("policy_state")
-            in {"forced_injection", "context_exhausted", "stop_requested"}
-        ):
-            await _upsert_state(
-                db,
-                instance_id=instance_id,
-                session_id=session_id,
-                engine=engine,
-                pane=pane,
-                used_tokens=used_tokens,
-                context_window_tokens=request.context_window_tokens,
-                planning_state=planning_state,
-                scoped=True,
-                scope_reason=scope_reason,
-                stage=stage,
-                policy_state="forced_injection",
-            )
-            await _audit(
-                db,
-                instance_id=instance_id,
-                session_id=session_id,
-                stage=stage,
-                action="debounced",
-                details={"used_tokens": used_tokens},
-            )
-            await db.commit()
-            return {"success": True, "action": "debounced", "scoped": True, "stage": stage}
 
         text = _message(stage, planning_state)
         injected_at = _now()
@@ -494,6 +603,7 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
             policy_state="forced_injection",
             injected_at=injected_at,
             no_progress_deadline_at=deadline,
+            last_directive_activity_at=(row or {}).get("last_activity"),
         )
         await _audit(
             db,
@@ -501,7 +611,12 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
             session_id=session_id,
             stage=stage,
             action="forced_injection",
-            details={"used_tokens": used_tokens, "pane": pane, "actuation": actuation},
+            details={
+                "used_tokens": used_tokens,
+                "pane": pane,
+                "actuation": actuation,
+                "gate_reason": gate_reason,
+            },
         )
         await db.commit()
         return {
@@ -511,26 +626,43 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
             "stage": stage,
             "used_tokens": used_tokens,
             "actuation": actuation,
+            "gate_reason": gate_reason,
         }
 
 
 @router.post("/api/context-governor/progress")
 async def record_context_progress(request: ContextProgressRequest) -> dict:
     now = _now()
+    is_checkpoint = request.event_type in CHECKPOINT_EVENT_TYPES
+    policy_state = "checkpoint_observed" if is_checkpoint else "progress_observed"
     async with aiosqlite.connect(shared.DB_PATH, timeout=5.0) as db:
-        await db.execute(
-            """UPDATE context_governor_state
-               SET last_progress_at = ?, policy_state = 'progress_observed'
-               WHERE instance_id = ?""",
-            (now, request.instance_id),
-        )
+        if is_checkpoint:
+            await db.execute(
+                """UPDATE context_governor_state
+                   SET checkpoint_completed_at = ?,
+                       checkpoint_activity_at = (SELECT last_activity FROM instances WHERE id = ?),
+                       policy_state = ?
+                   WHERE instance_id = ?""",
+                (now, request.instance_id, policy_state, request.instance_id),
+            )
+        else:
+            await db.execute(
+                """UPDATE context_governor_state
+                   SET last_progress_at = ?, policy_state = ?
+                   WHERE instance_id = ?""",
+                (now, policy_state, request.instance_id),
+            )
         await _audit(
             db,
             instance_id=request.instance_id,
             session_id=None,
             stage="progress",
             action=request.event_type,
-            details={"source": request.source, **(request.details or {})},
+            details={
+                "source": request.source,
+                "checkpoint": is_checkpoint,
+                **(request.details or {}),
+            },
         )
         await db.commit()
     await shared.log_event(
@@ -570,13 +702,16 @@ async def sweep_context_governor(request: ContextSweepRequest | None = None) -> 
         for row in rows:
             deadline = _parse_dt(row.get("no_progress_deadline_at"))
             progress = _parse_dt(row.get("last_progress_at"))
+            checkpoint = _parse_dt(row.get("checkpoint_completed_at"))
             if not deadline or deadline > now:
                 continue
             injected = _parse_dt(row.get("injected_at"))
             # Only progress observed after the forced injection clears this
             # sweep cycle. Historical compaction before the injection must not
             # mask the no-progress stage.
-            if progress and injected and progress >= injected:
+            if injected and (
+                (progress and progress >= injected) or (checkpoint and checkpoint >= injected)
+            ):
                 continue
             instance_id = row["instance_id"]
             pane = row.get("pane")

@@ -1173,11 +1173,27 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 injected_at TIMESTAMP,
                 no_progress_deadline_at TIMESTAMP,
                 last_progress_at TIMESTAMP,
+                checkpoint_completed_at TIMESTAMP,
+                checkpoint_activity_at TIMESTAMP,
+                last_directive_activity_at TIMESTAMP,
                 exhausted_at TIMESTAMP,
                 last_telemetry_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        context_governor_columns = await _table_columns(db, "context_governor_state")
+        if "checkpoint_completed_at" not in context_governor_columns:
+            await db.execute(
+                "ALTER TABLE context_governor_state ADD COLUMN checkpoint_completed_at TIMESTAMP"
+            )
+        if "checkpoint_activity_at" not in context_governor_columns:
+            await db.execute(
+                "ALTER TABLE context_governor_state ADD COLUMN checkpoint_activity_at TIMESTAMP"
+            )
+        if "last_directive_activity_at" not in context_governor_columns:
+            await db.execute(
+                "ALTER TABLE context_governor_state ADD COLUMN last_directive_activity_at TIMESTAMP"
+            )
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_context_governor_state_policy
             ON context_governor_state(policy_state, no_progress_deadline_at)
