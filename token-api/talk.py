@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 import uuid
@@ -40,6 +41,7 @@ _PAIR_INDEX: dict[tuple[str, str], str] = {}
 # target_pane -> list of talk_ids waiting on this pane's natural stop
 _TARGET_INDEX: dict[str, list[str]] = {}
 _LOCK = asyncio.Lock()
+log = logging.getLogger(__name__)
 
 TALK_OPEN = "open"
 TALK_RETURNED = "returned"
@@ -284,6 +286,7 @@ async def resolve_pane(identifier: str) -> str | None:
     try:
         fallback = await shared.resolve_tmux_pane_id(raw)
     except Exception:
+        log.warning("tmuxctl fallback pane resolution failed for %s", raw, exc_info=True)
         fallback = None
     if fallback and fallback.startswith("%"):
         return fallback

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import pathlib
 import sys
 
@@ -71,3 +72,36 @@ def test_resolve_pane_falls_back_to_tmuxctl_resolver_when_scan_misses(
     monkeypatch.setattr(talk.shared, "resolve_tmux_pane_id", tmuxctl_resolve)
 
     assert asyncio.run(talk.resolve_pane("council:custodes")) == "%78"
+
+
+def test_resolve_pane_does_not_accept_non_physical_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def empty_scan() -> list[dict[str, str]]:
+        return []
+
+    async def tmuxctl_resolve(_target: str | None) -> str | None:
+        return "council:custodes"
+
+    monkeypatch.setattr(talk, "_tmux_list_panes", empty_scan)
+    monkeypatch.setattr(talk.shared, "resolve_tmux_pane_id", tmuxctl_resolve)
+
+    assert asyncio.run(talk.resolve_pane("council:custodes")) is None
+
+
+def test_resolve_pane_logs_tmuxctl_resolver_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def empty_scan() -> list[dict[str, str]]:
+        return []
+
+    async def tmuxctl_resolve(_target: str | None) -> str | None:
+        raise RuntimeError("resolver unavailable")
+
+    monkeypatch.setattr(talk, "_tmux_list_panes", empty_scan)
+    monkeypatch.setattr(talk.shared, "resolve_tmux_pane_id", tmuxctl_resolve)
+
+    with caplog.at_level(logging.WARNING, logger=talk.log.name):
+        assert asyncio.run(talk.resolve_pane("council:custodes")) is None
+    assert "tmuxctl fallback pane resolution failed" in caplog.text

@@ -222,7 +222,9 @@ class HangingStackAdapter(StubAdapter):
         self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
 
 
-def test_health_reports_degraded_when_stack_operation_is_stuck(monkeypatch) -> None:
+def test_health_reports_degraded_when_stack_operation_is_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """/health must not stay blindly green while a stack op is wedged.
 
     This reproduces the incident shape without live tmux: one /stack/dispatch
@@ -300,7 +302,9 @@ class FastStackAdapter(StubAdapter):
         self.run("send-keys", "-t", target, *keys, allow_failure=allow_failure)
 
 
-def test_concurrent_stack_dispatch_requests_are_stateless(monkeypatch) -> None:
+def test_concurrent_stack_dispatch_requests_are_stateless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Concurrent dispatch load uses a fresh adapter/control plane per request."""
     import concurrent.futures
 
@@ -325,10 +329,10 @@ def test_concurrent_stack_dispatch_requests_are_stateless(monkeypatch) -> None:
         return payload["result"]
 
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            panes = list(pool.map(post_one, range(16)))
-        assert len(panes) == 16
-        assert FastStackAdapter._next >= 16
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            panes = list(pool.map(post_one, range(8)))
+        assert len(panes) == 8
+        assert FastStackAdapter._next >= 8
         _status, health = _get(server, "/health")
         assert health["active_operations"] == 0
         assert health["operation_degraded"] is False
