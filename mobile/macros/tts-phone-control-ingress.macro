@@ -93,7 +93,7 @@
           "saveResponseUseAllFilesAccess": false,
           "saveReturnCodeToVariable": true,
           "saveReturnHeadersToVariable": false,
-          "urlToOpen": "http://100.95.109.23:7777/api/tts/control",
+          "urlToOpen": "{v=token_os_base_url}/api/tts/control",
           "useAllFilesAccess": false,
           "useLocalFileUri": false,
           "useStaticContentBodyFile": true
@@ -115,7 +115,15 @@
     ],
     "m_constraintList": []
   },
-  "globalVariables": [],
+  "globalVariables": [
+    {
+      "m_name": "token_os_base_url",
+      "m_type": 2,
+      "m_stringValue": "http://100.95.109.23:7777",
+      "isLocalVar": false,
+      "isSecure": false
+    }
+  ],
   "userIcons": null,
   "aiFeedback": "Generated from official MacroDroid schema for Token-OS phone TTS execution architecture."
 }

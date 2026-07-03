@@ -83,7 +83,7 @@
           "proxyPort": 8080,
           "proxyType": 0,
           "queryParams": [],
-          "requestTimeOutSeconds": 5,
+          "requestTimeOutSeconds": 12,
           "requestType": 0,
           "returnCodeVariableName": "response-code",
           "saveResponseAllFilesAccessPath": "",

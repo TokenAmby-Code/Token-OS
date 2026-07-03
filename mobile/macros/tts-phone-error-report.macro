@@ -41,10 +41,21 @@
         "m_isOrCondition": false,
         "blockNextAction": true,
         "m_nonRoot": true,
-        "m_script": "echo \"$(date +%H:%M:%S) [TTS_ERROR] session={lv=request[session_id]} playback={lv=request[playback_id]} code={lv=request[error_code]}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_ERROR] received -> token-os\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
         "timeoutSeconds": 30,
         "useHelper": false,
         "useShizuku": false
+      },
+      {
+        "m_classType": "JsonOutputAction",
+        "m_SIGUID": -989999999999861418,
+        "disableLogging": false,
+        "m_comment": "Serialize /tts-error request dictionary before posting so quotes/newlines cannot corrupt JSON.",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "stringVarName": "tts_error_request_json",
+        "dictionaryVarName": "request"
       },
       {
         "m_classType": "HttpRequestAction",
@@ -71,7 +82,7 @@
           "contentBodyFolderDisplayName": "",
           "contentBodyFolderUri": "",
           "contentBodySource": 0,
-          "contentBodyText": "{\"backend\":\"phone\",\"session_id\":\"{lv=request[session_id]}\",\"playback_id\":\"{lv=request[playback_id]}\",\"error_code\":\"{lv=request[error_code]}\",\"error_detail\":\"{lv=request[error_detail]}\"}",
+          "contentBodyText": "{\"backend\":\"phone\",\"request\":{lv=tts_error_request_json}}",
           "contentType": "application/json",
           "followRedirects": true,
           "headerParams": [],
@@ -93,7 +104,7 @@
           "saveResponseUseAllFilesAccess": false,
           "saveReturnCodeToVariable": true,
           "saveReturnHeadersToVariable": false,
-          "urlToOpen": "http://100.95.109.23:7777/api/tts/backend-error",
+          "urlToOpen": "{v=token_os_base_url}/api/tts/backend-error",
           "useAllFilesAccess": false,
           "useLocalFileUri": false,
           "useStaticContentBodyFile": true
@@ -113,9 +124,26 @@
         "text": "{\"status\":\"error_reported_to_token_os\",\"token_os_status\":\"{lv=response-code}\"}"
       }
     ],
-    "m_constraintList": []
+    "m_constraintList": [],
+    "localVariables": [
+      {
+        "m_name": "tts_error_request_json",
+        "m_type": 2,
+        "m_stringValue": "{}",
+        "isLocalVar": true,
+        "isSecure": false
+      }
+    ]
   },
-  "globalVariables": [],
+  "globalVariables": [
+    {
+      "m_name": "token_os_base_url",
+      "m_type": 2,
+      "m_stringValue": "http://100.95.109.23:7777",
+      "isLocalVar": false,
+      "isSecure": false
+    }
+  ],
   "userIcons": null,
   "aiFeedback": "Generated from official MacroDroid schema for Token-OS phone TTS execution architecture."
 }

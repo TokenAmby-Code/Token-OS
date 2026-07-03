@@ -159,6 +159,7 @@ Staged macros:
 Validation:
 
 ```bash
+set -e
 for f in mobile/macros/tts-*.macro; do macrodroid-validate "$f"; done
 pytest -q mobile/tests/test_tts_phone_macros.py
 ```

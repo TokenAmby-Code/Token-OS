@@ -3,7 +3,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MACROS = ROOT / "macros"
-TOKEN_OS_CONTROL = "http://100.95.109.23:7777/api/tts/control"
+TOKEN_OS_BASE_VAR = "token_os_base_url"
+TOKEN_OS_BASE = "{v=token_os_base_url}"
+TOKEN_OS_CONTROL = f"{TOKEN_OS_BASE}/api/tts/control"
 
 
 def load(name: str) -> dict:
@@ -31,6 +33,20 @@ def request_bodies(macro: dict) -> list[str]:
     ]
 
 
+def load_wrapper(name: str) -> dict:
+    return json.loads((MACROS / name).read_text())
+
+
+def token_os_global(name: str) -> dict:
+    wrapper = load_wrapper(name)
+    matches = [
+        v for v in wrapper.get("globalVariables", [])
+        if v.get("m_name") == TOKEN_OS_BASE_VAR
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def test_overlay_buttons_call_local_ingress_not_token_os_or_local_control() -> None:
     expected = {
         "tts-overlay-pause.macro": "pause",
@@ -47,6 +63,7 @@ def test_overlay_buttons_call_local_ingress_not_token_os_or_local_control() -> N
         assert request_urls(macro) == [
             f"http://127.0.0.1:7777/tts-control?command={command}&source=overlay"
         ]
+        assert actions(macro, "HttpRequestAction")[0]["requestConfig"]["requestTimeOutSeconds"] == 12
         serialized = json.dumps(macro)
         assert "/tts-local-control" not in serialized
         assert "/api/tts/control" not in serialized
@@ -56,6 +73,7 @@ def test_overlay_buttons_call_local_ingress_not_token_os_or_local_control() -> N
 
 def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally() -> None:
     macro = load("tts-phone-control-ingress.macro")
+    assert token_os_global("tts-phone-control-ingress.macro")["m_stringValue"] == "http://100.95.109.23:7777"
     assert macro["m_triggerList"][0]["identifier"] == "tts-control"
     assert request_urls(macro) == [TOKEN_OS_CONTROL]
     body = request_bodies(macro)[0]
@@ -88,6 +106,7 @@ def test_local_control_echo_is_private_consumed_endpoint_not_authority() -> None
 
 def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
     macro = load("tts-phone-chunk-player.macro")
+    assert token_os_global("tts-phone-chunk-player.macro")["m_stringValue"] == "http://100.95.109.23:7777"
     assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
     speak_actions = actions(macro, "SpeakTextAction")
     assert [a["m_textToSay"] for a in speak_actions] == [
@@ -108,8 +127,8 @@ def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
 
     urls = request_urls(macro)
     assert urls == [
-        "http://100.95.109.23:7777/api/tts/chunk-event",
-        "http://100.95.109.23:7777/api/tts/chunk-event",
+        f"{TOKEN_OS_BASE}/api/tts/chunk-event",
+        f"{TOKEN_OS_BASE}/api/tts/chunk-event",
     ]
     assert "current_complete_next_starting" in request_bodies(macro)[0]
     assert "buffer_drained" in request_bodies(macro)[1]
@@ -117,11 +136,14 @@ def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
 
 def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:
     macro = load("tts-phone-error-report.macro")
+    assert token_os_global("tts-phone-error-report.macro")["m_stringValue"] == "http://100.95.109.23:7777"
     assert macro["m_triggerList"][0]["identifier"] == "tts-error"
-    assert request_urls(macro) == ["http://100.95.109.23:7777/api/tts/backend-error"]
+    assert request_urls(macro) == [f"{TOKEN_OS_BASE}/api/tts/backend-error"]
     body = request_bodies(macro)[0]
-    assert '"backend":"phone"' in body
-    assert '"error_code":"{lv=request[error_code]}"' in body
+    assert body == '{"backend":"phone","request":{lv=tts_error_request_json}}'
+    assert actions(macro, "JsonOutputAction")[0]["dictionaryVarName"] == "request"
+    assert actions(macro, "JsonOutputAction")[0]["stringVarName"] == "tts_error_request_json"
+    assert "{lv=request[error_code]}" not in body
     serialized = json.dumps(macro).lower()
     assert "macos" not in serialized
     assert "mac say" not in serialized
