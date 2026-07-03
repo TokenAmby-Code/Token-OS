@@ -2711,6 +2711,18 @@ def _h_typing_guard_state(control, params):
                 _s(params, "pane"),
             )
         )
+    if cmd in {"arm", "pending"}:
+        # Telemetry for the keystroke-driven guard writes lives here, in the
+        # daemon log — never in a client-facing display-message (Emperor ruling
+        # 2026-07-02: the arm/pending hooks must fail silently at the pane).
+        log.debug(
+            "tmuxctld: typing-guard %s pane=%s kind=%s until=%s rc=%s",
+            cmd,
+            _s(params, "pane"),
+            payload.get("kind"),
+            payload.get("until"),
+            payload.get("returncode"),
+        )
     if cmd == "arm":
         _schedule_typing_guard_expiry_rehydrate(payload)
     return payload
