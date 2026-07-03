@@ -74,6 +74,7 @@ _SEND_GATE_ALLOW_ENV = "TMUX_SEND_GATE_ALLOW"
 _SEND_GATE_POLICY_ENV = "TMUX_SEND_GATE_POLICY"
 _SEND_GATE_POLICIES = frozenset({"delay", "cancel", "pierce"})
 _SEND_GATE_DELAY_TIMEOUT_ENV = "TMUX_SEND_GATE_DELAY_TIMEOUT"  # unset/0 = no timeout
+_SEND_GATE_DROP_REASON_ENV = "TMUX_SEND_GATE_DROP_REASON"
 _AGENT_OWNER_OVERRIDES = frozenset(
     {
         # tmuxctld may pierce only the green AGENT hold whose JSON owner token is
@@ -518,7 +519,12 @@ def thread_local_override(reason: str, *, owner: str | None = None) -> Iterator[
         _thread_override.owner = prev_owner
 
 
-def send_gate_policy(*, override: str | None = None, reason: str | None = None) -> str:
+def send_gate_policy(
+    *,
+    override: str | None = None,
+    reason: str | None = None,
+    drop_reason: str | None = None,
+) -> str:
     """Return the delay/cancel/pierce disposition for a positive gate signal.
 
     Default policy is intentionally asymmetric: quiet-hours automation cancels
@@ -527,7 +533,13 @@ def send_gate_policy(*, override: str | None = None, reason: str | None = None) 
     direct-input sends pierce.
     """
     explicit = os.environ.get(_SEND_GATE_POLICY_ENV, "").strip().lower()
+    explicit_drop_reason = (drop_reason or os.environ.get(_SEND_GATE_DROP_REASON_ENV, "")).strip()
     if explicit in _SEND_GATE_POLICIES:
+        # Emperor ruling 2026-07-03: typing-guard cancellation is not an ambient
+        # disposition anymore.  The type-level default is enqueue/defer; a drop
+        # is valid only when the caller names a stale/no-payload reason.
+        if reason == "typing_guard" and explicit == "cancel" and not explicit_drop_reason:
+            return "delay"
         return explicit
     if override:
         return "pierce"
@@ -617,6 +629,7 @@ def evaluate(
     *,
     db_path: Path | None = None,
     now: datetime | None = None,
+    drop_reason: str | None = None,
 ) -> dict | None:
     """Evaluate the gate for a tmux command.
 
@@ -658,9 +671,11 @@ def evaluate(
             if override not in _AGENT_OWNER_OVERRIDES or not pane_owner or thread_owner != pane_owner:
                 ignored_owner = thread_owner
                 effective_override = None
-    policy = send_gate_policy(override=override, reason=reason)
+    policy = send_gate_policy(override=override, reason=reason, drop_reason=drop_reason)
     if effective_override != override:
-        policy = send_gate_policy(override=effective_override, reason=reason)
+        policy = send_gate_policy(
+            override=effective_override, reason=reason, drop_reason=drop_reason
+        )
     result = {
         "suppressed": policy != "pierce",
         "policy": policy,
@@ -675,6 +690,8 @@ def evaluate(
         "agent_owner": sanctioned_agent_owner(),
         "ignored_agent_owner": ignored_owner,
         "guard_status": guard_status,
+        "drop_reason": (drop_reason or os.environ.get(_SEND_GATE_DROP_REASON_ENV, "")).strip()
+        or None,
     }
     return result
 

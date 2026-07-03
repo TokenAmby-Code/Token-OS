@@ -66,6 +66,7 @@ def test_send_text_then_submit_raises_when_gate_suppresses(monkeypatch, captured
     _force_typing(monkeypatch, True)
     _no_override(monkeypatch)
     monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")
+    monkeypatch.setenv("TMUX_SEND_GATE_DROP_REASON", "stale_on_drain")
     monkeypatch.setattr(tmux_adapter.time, "sleep", lambda _: None)
 
     adapter = TmuxAdapter(tmux_binary="tmux")
@@ -129,7 +130,7 @@ def test_send_text_then_submit_keeps_enter_in_same_transaction(
     monkeypatch.setattr(
         send_gate,
         "send_gate_policy",
-        lambda *, override=None, reason=None: "pierce" if override else "cancel",
+        lambda *, override=None, reason=None, **_kw: "pierce" if override else "cancel",
     )
     monkeypatch.setattr(tmux_adapter.time, "sleep", lambda _: None)
 

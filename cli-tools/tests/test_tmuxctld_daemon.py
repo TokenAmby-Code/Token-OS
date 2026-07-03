@@ -45,7 +45,10 @@ def _no_live_tmux_guard(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon.send_gate, "evaluate", lambda *a, **k: None)
     monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
     monkeypatch.setenv("TMUXCTLD_CALLBACKS_PATH", str(tmp_path / "callbacks.json"))
+    monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
     monkeypatch.setattr(daemon, "_PROMPT_SUBMIT_SNIFFER", daemon.PromptSubmitSniffer())
+    monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
+    monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
     wrapper_ledger.LEDGER._rows = {}
     wrapper_ledger.LEDGER._loaded = False
     wrapper_ledger.LEDGER.load(force=True)
@@ -2397,7 +2400,7 @@ def test_agent_guard_hold_denied_does_not_release_and_send_still_routes(monkeypa
         server.shutdown()
 
 
-def test_send_text_returns_gated_without_waiting_or_writing_under_typing_guard(monkeypatch) -> None:
+def test_send_text_enqueues_without_waiting_or_writing_under_typing_guard(monkeypatch) -> None:
     SendAckAdapter.calls = []
     hold_calls: list[str] = []
     monkeypatch.setattr(
@@ -2428,17 +2431,19 @@ def test_send_text_returns_gated_without_waiting_or_writing_under_typing_guard(m
             timeout=1,
         )
         assert status == 200
-        assert payload["ok"] is False
-        assert payload["error"]["code"] == "gated"
-        assert payload["error"]["detail"]["reason"] == "typing_guard"
-        assert payload["error"]["detail"]["deferred"] is True
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["status"] == "queued"
+        assert result["queued"] is True
+        assert result["delivered"] is False
+        assert result["reason"] == "typing_guard"
         assert hold_calls == [], "do not acquire agent hold behind a live human guard"
         assert SendAckAdapter.calls == [], "zero bytes issued while human guard is active"
     finally:
         server.shutdown()
 
 
-def test_insert_only_send_text_is_also_gated_under_typing_guard(monkeypatch) -> None:
+def test_insert_only_send_text_is_also_enqueued_under_typing_guard(monkeypatch) -> None:
     SendAckAdapter.calls = []
     monkeypatch.setattr(
         daemon.send_gate,
@@ -2465,9 +2470,139 @@ def test_insert_only_send_text_is_also_gated_under_typing_guard(monkeypatch) -> 
             timeout=1,
         )
         assert status == 200
-        assert payload["ok"] is False
-        assert payload["error"]["code"] == "gated"
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "queued"
+        assert payload["result"]["queued"] is True
         assert SendAckAdapter.calls == []
+    finally:
+        server.shutdown()
+
+
+def test_typing_guard_drop_requires_explicit_reason(monkeypatch) -> None:
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
+    server, _ = _serve(SendAckAdapter)
+    try:
+        SendAckAdapter.calls = []
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "stale hook payload",
+                "verify": False,
+                "typing_guard_policy": "drop",
+            },
+            timeout=1,
+        )
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+        assert "typing_guard_drop_reason" in payload["error"]["message"]
+        assert SendAckAdapter.calls == []
+        assert daemon._DEFERRED_SEND_QUEUE.size() == 0
+    finally:
+        server.shutdown()
+
+
+def test_typing_guard_explicit_drop_records_reason_and_does_not_enqueue(monkeypatch) -> None:
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
+    server, _ = _serve(SendAckAdapter)
+    try:
+        SendAckAdapter.calls = []
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "stale hook payload",
+                "verify": False,
+                "typing_guard_policy": "drop",
+                "typing_guard_drop_reason": "stale_on_drain",
+            },
+            timeout=1,
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["status"] == "dropped"
+        assert result["drop_reason"] == "stale_on_drain"
+        assert result["queued"] is False
+        assert SendAckAdapter.calls == []
+        assert daemon._DEFERRED_SEND_QUEUE.size() == 0
+    finally:
+        server.shutdown()
+
+
+def test_ambient_cancel_policy_still_enqueues_typing_guard_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {"pane": "%42", "text": "do the thing", "verify": False},
+            timeout=1,
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "queued"
+        assert daemon._DEFERRED_SEND_QUEUE.size() == 1
+    finally:
+        server.shutdown()
+
+
+def test_deferred_send_drains_fifo_after_guard_drops(monkeypatch) -> None:
+    locked = {"value": True}
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: locked["value"])
+    server, _ = _serve(SendAckAdapter)
+    try:
+        for text in ("first", "second"):
+            status, payload = _post_timeout(
+                server,
+                "/send-text",
+                {"pane": "%42", "text": text, "verify": False, "submit_settle_seconds": 0},
+                timeout=1,
+            )
+            assert status == 200
+            assert payload["result"]["status"] == "queued"
+
+        SendAckAdapter.calls = []
+        monkeypatch.setattr(daemon, "TmuxAdapter", SendAckAdapter)
+        locked["value"] = False
+        drained = daemon._drain_deferred_sends_for_pane("%42")
+
+        assert drained["drained"] == 2
+        literal_sends = [
+            call for call in SendAckAdapter.calls if call[:4] == ("send-keys", "-t", "%42", "-l")
+        ]
+        assert [call[4] for call in literal_sends] == ["first", "second"]
+        assert daemon._DEFERRED_SEND_QUEUE.size() == 0
+    finally:
+        server.shutdown()
+
+
+def test_deferred_send_queue_survives_queue_reload(monkeypatch) -> None:
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {"pane": "%42", "text": "persist me", "verify": False},
+            timeout=1,
+        )
+        assert status == 200
+        assert payload["result"]["status"] == "queued"
+
+        fresh = daemon.DeferredSendQueue()
+        loaded = fresh.load(force=True)
+        assert loaded["queued"] == 1
+        assert fresh.size() == 1
+        path_payload = json.loads(
+            pathlib.Path(os.environ["TMUXCTLD_DEFERRED_SENDS_PATH"]).read_text()
+        )
+        assert path_payload["items"][0]["params"]["text"] == "persist me"
     finally:
         server.shutdown()
 
@@ -2904,6 +3039,35 @@ def test_mode_toggle_endpoint_detects_plan_and_sends_one_shift_tab() -> None:
         server.shutdown()
 
 
+def test_mode_toggle_enqueues_under_typing_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = KeybindAdapter()
+    rec.capture = "status: plan mode on"
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/mode-toggle", {"pane": "%42", "delay": 0})
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "queued"
+        assert payload["result"]["reason"] == "typing_guard"
+        assert ("send-keys", "-t", "%42", "BTab") not in rec.calls
+    finally:
+        server.shutdown()
+
+
+def test_prompt_navigation_enqueues_under_typing_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = KeybindAdapter()
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
+    server, _ = _serve(lambda: rec)
+    try:
+        _, payload = _post(server, "/prompt-start", {"pane": "%42"})
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "queued"
+        assert payload["result"]["reason"] == "typing_guard"
+        assert not any(call[0] == "send-keys" for call in rec.calls)
+    finally:
+        server.shutdown()
+
+
 def test_open_session_doc_endpoint_posts_token_api_open_by_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3073,7 +3237,7 @@ def test_context_governor_inject_uses_daemon_send_path() -> None:
         server.shutdown()
 
 
-def test_context_governor_inject_reports_gated_without_writing(monkeypatch) -> None:
+def test_context_governor_inject_enqueues_without_writing(monkeypatch) -> None:
     monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
     server, _ = _serve(RecordingVoiceAdapter)
     try:
@@ -3083,9 +3247,10 @@ def test_context_governor_inject_reports_gated_without_writing(monkeypatch) -> N
             {"pane": "%42", "instance_id": "ctx-inst", "text": "do not send", "verify": False},
         )
         assert status == 200
-        assert payload["ok"] is False
-        assert payload["error"]["code"] == "gated"
-        assert payload["error"]["detail"]["deferred"] is True
+        assert payload["ok"] is True
+        assert payload["result"]["status"] == "queued"
+        assert payload["result"]["deferred"] is True
+        assert payload["result"]["delivered"] is False
     finally:
         server.shutdown()
 
