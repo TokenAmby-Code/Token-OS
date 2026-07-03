@@ -6,6 +6,10 @@ import { readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import {
+  DISCORD_MESSAGE_CONTENT_LIMIT,
+  sendChunkedDiscordContent,
+} from './outbound-message.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, '..', 'config.json');
@@ -296,17 +300,25 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
     async sendMessage(channelId, content, options = {}) {
       const channel = await client.channels.fetch(channelId);
       if (!channel) throw new Error(`Channel ${channelId} not found`);
-      const sendOpts = { content };
-      if (options.embeds) sendOpts.embeds = options.embeds;
-      if (options.reply_to) {
-        sendOpts.reply = { messageReference: options.reply_to };
-      }
-      const msg = await channel.send(sendOpts);
-      return {
-        message_id: msg.id,
-        channel_id: msg.channelId,
-        timestamp: msg.createdAt.toISOString(),
-      };
+      return sendChunkedDiscordContent(
+        content,
+        async (chunk, meta) => {
+          if (typeof chunk === 'string' && chunk.length > DISCORD_MESSAGE_CONTENT_LIMIT) {
+            throw new Error(`Refusing Discord send chunk over ${DISCORD_MESSAGE_CONTENT_LIMIT} characters`);
+          }
+          const sendOpts = { content: chunk };
+          if (meta.is_first && options.embeds) sendOpts.embeds = options.embeds;
+          if (meta.is_first && options.reply_to) {
+            sendOpts.reply = { messageReference: options.reply_to };
+          }
+          const msg = await channel.send(sendOpts);
+          return {
+            message_id: msg.id,
+            channel_id: msg.channelId,
+            timestamp: msg.createdAt.toISOString(),
+          };
+        },
+      );
     },
 
     async readMessages(channelId, limit = 25, before = null) {
@@ -378,12 +390,17 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
     async sendDM(content) {
       const user = await client.users.fetch(config.operator_user_id);
       const dm = await user.createDM();
-      const msg = await dm.send({ content });
-      return {
-        message_id: msg.id,
-        channel_id: msg.channelId,
-        timestamp: msg.createdAt.toISOString(),
-      };
+      return sendChunkedDiscordContent(content, async (chunk) => {
+        if (chunk.length > DISCORD_MESSAGE_CONTENT_LIMIT) {
+          throw new Error(`Refusing Discord DM chunk over ${DISCORD_MESSAGE_CONTENT_LIMIT} characters`);
+        }
+        const msg = await dm.send({ content: chunk });
+        return {
+          message_id: msg.id,
+          channel_id: msg.channelId,
+          timestamp: msg.createdAt.toISOString(),
+        };
+      });
     },
 
     getStatus() {

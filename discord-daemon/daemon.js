@@ -15,6 +15,7 @@ import { isBenignFixerError } from './fixer-classify.js';
 import { createVoiceTranscriptRouter } from './voice-transcript-router.js';
 import { routeVoiceTranscriptWithRetry } from './voice-route-retry.js';
 import { tmuxctldClient } from './tmuxctld-client.js';
+import { splitDiscordMessageContent } from './outbound-message.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -423,8 +424,17 @@ async function main() {
     try {
       const channelId = config.channels[msg.channel] || msg.channelId;
       if (channelId && msg.content && SNOWFLAKE_RE.test(channelId)) {
-        await discordClient.sendMessage(channelId, msg.content);
-        logger.info(`Recovered pending message to ${msg.channel}`);
+        const result = await discordClient.sendMessage(channelId, msg.content);
+        const chunks = splitDiscordMessageContent(msg.content);
+        logger.info(`Recovered pending Discord message ${JSON.stringify({
+          event: 'discord_outbound_recovery',
+          channel: msg.channel,
+          chunked: chunks.length > 1,
+          chunk_count: chunks.length,
+          total_length: msg.content.length,
+          message_id: result?.message_id || null,
+          message_ids: result?.message_ids || (result?.message_id ? [result.message_id] : []),
+        })}`);
       } else if (channelId && !SNOWFLAKE_RE.test(channelId)) {
         logger.warn(`Dropping stale pending message: invalid channel ID "${channelId}" (${msg.channel})`);
       }
