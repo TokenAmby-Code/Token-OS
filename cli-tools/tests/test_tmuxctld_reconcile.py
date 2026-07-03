@@ -3,8 +3,8 @@
 `TmuxControlPlane.handle_event` / `.reconcile_personas` are the engine behind the
 daemon `/event` and `/reconcile` routes that replaced the retired 2-min
 assert-personas poll. These drive the routing logic directly (a persona pane-died
-must re-seat; a non-must-fill pane no-ops; a reservist is noted) plus a daemon
-HTTP smoke test for the wiring.
+must re-seat; a non-must-fill pane no-ops; a reservist pane-died re-seats its
+standby agent) plus a daemon HTTP smoke test for the wiring.
 """
 
 from __future__ import annotations
@@ -229,35 +229,76 @@ def test_handle_event_dynamic_worker_is_culled() -> None:
     assert adapter.killed is True
 
 
-def test_handle_event_reservist_is_noted_not_acted() -> None:
+def test_handle_event_reservist_pane_died_reseats_standby_agent() -> None:
+    # F3: a reservist seat is must-fill — its pane-died now RESEATS the standby
+    # agent via assert_reservist_seat (was a `reservist_refill_followon` no-op).
     control = _control({"@PANE_ID": "reservists:civic", "@PANE_TYPE": "reservists"})
+    calls = {}
 
     def fake_resolve(adapter, target, session_name=None):
         return SimpleNamespace(pane_id="%3", pane_role="reservists:civic")
 
+    def fake_assert(adapter, target, *, session=None):
+        calls["target"] = target
+        calls["session"] = session
+        return {"ok": True, "action": "launched", "reason": "launched"}
+
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(service, "resolve_pane", fake_resolve)
-        out = control.handle_event("pane-died", pane="reservists:civic")
+        mp.setattr(assertions, "assert_reservist_seat", fake_assert)
+        out = control.handle_event("pane-died", pane="reservists:civic", session="main")
 
+    assert calls["target"] == "reservists:civic"
+    assert calls["session"] == "main"
     assert out["ok"] is True
-    assert out["action"] == "noted"
-    assert out["reason"] == "reservist_refill_followon"
+    assert out["action"] == "launched"
+    assert out["pane_label"] == "reservists:civic"
 
 
-def test_reconcile_personas_sweeps_all_must_fill_labels() -> None:
-    seen = []
+def test_handle_event_reservist_never_returns_refill_followon() -> None:
+    # The retired no-op reason must be gone entirely — the pane-died reservist
+    # branch now acts, so `reservist_refill_followon` may never surface again.
+    control = _control({"@PANE_ID": "reservists:token-os", "@PANE_TYPE": "reservists"})
 
-    def fake_sweep(adapter, *, session=None):
-        seen.append(session)
+    def fake_resolve(adapter, target, session_name=None):
+        return SimpleNamespace(pane_id="%4", pane_role="reservists:token-os")
+
+    def fake_assert(adapter, target, *, session=None):
+        return {"ok": True, "action": "launched", "reason": "launched"}
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(service, "resolve_pane", fake_resolve)
+        mp.setattr(assertions, "assert_reservist_seat", fake_assert)
+        out = control.handle_event("pane-died", pane="reservists:token-os")
+
+    assert out["reason"] != "reservist_refill_followon"
+
+
+def test_reconcile_personas_sweeps_personas_and_reservists() -> None:
+    # F3: reconcile now returns the persona sweep PLUS the reservist sweep
+    # (fill-on-absence = "keep the pulse") — 6 personas + 2 reservists.
+    seen = {"persona": [], "reservist": []}
+
+    def fake_persona_sweep(adapter, *, session=None):
+        seen["persona"].append(session)
         return [{"ok": True, "pane_label": label} for label in assertions.PERSONA_LABELS]
+
+    def fake_reservist_sweep(adapter, *, session=None):
+        seen["reservist"].append(session)
+        return [{"ok": True, "pane_label": label} for label in assertions.RESERVIST_LABELS]
 
     control = _control()
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(assertions, "sweep_persona_panes", fake_sweep)
+        mp.setattr(assertions, "sweep_persona_panes", fake_persona_sweep)
+        mp.setattr(assertions, "sweep_reservist_panes", fake_reservist_sweep)
         results = control.reconcile_personas(session="main")
 
-    assert seen == ["main"]
-    assert len(results) == len(assertions.PERSONA_LABELS)
+    assert seen["persona"] == ["main"]
+    assert seen["reservist"] == ["main"]
+    assert len(results) == len(assertions.PERSONA_LABELS) + len(assertions.RESERVIST_LABELS)
+    labels = {r["pane_label"] for r in results}
+    assert "reservists:civic" in labels
+    assert "reservists:token-os" in labels
 
 
 # -- daemon HTTP wiring smoke -------------------------------------------------
@@ -294,14 +335,17 @@ def test_event_route_envelope_for_unhandled_event() -> None:
 
 
 def test_reconcile_route_returns_results_envelope() -> None:
-    # With a stub adapter no persona pane resolves, so each label errors and is
-    # captured per-label (the sweep never aborts) — a results list of all six.
+    # With a stub adapter no seat resolves, so each label errors and is captured
+    # per-label (the sweep never aborts) — a results list of all six personas PLUS
+    # the two reservist heartbeat seats (F3 fill-on-absence).
     server = _serve(FakeAdapter)
     try:
         status, payload = _post(server, "/reconcile", {})
         assert status == 200
         assert payload["ok"] is True
-        assert len(payload["result"]["results"]) == len(assertions.PERSONA_LABELS)
+        assert len(payload["result"]["results"]) == len(assertions.PERSONA_LABELS) + len(
+            assertions.RESERVIST_LABELS
+        )
     finally:
         server.shutdown()
 
