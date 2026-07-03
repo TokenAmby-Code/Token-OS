@@ -76,6 +76,8 @@ DEFAULT_PORT = 7778
 CALLBACKS_VERSION = 1
 DEFAULT_CALLBACKS_PATH = Path("~/.claude/tmuxctld-callbacks.json").expanduser()
 DEFAULT_CALLBACK_TTL_SECONDS = 30 * 60
+DEFERRED_SENDS_VERSION = 1
+DEFAULT_DEFERRED_SENDS_PATH = Path("~/.claude/tmuxctld-deferred-sends.json").expanduser()
 
 # tmux owns pane-death detection. tmuxctld owns persona re-seating. The global
 # hook is therefore daemon-critical: if tmux.conf was not sourced (or hooks were
@@ -208,6 +210,12 @@ def _callback_ttl_from_env() -> float:
     except ValueError:
         ttl = DEFAULT_CALLBACK_TTL_SECONDS
     return max(1.0, ttl)
+
+
+def _deferred_sends_path_from_env() -> Path:
+    return Path(
+        os.environ.get("TMUXCTLD_DEFERRED_SENDS_PATH") or DEFAULT_DEFERRED_SENDS_PATH
+    ).expanduser()
 
 
 class PromptSubmitSniffer:
@@ -489,6 +497,398 @@ class PromptSubmitSniffer:
 
 
 _PROMPT_SUBMIT_SNIFFER = PromptSubmitSniffer()
+
+
+class DeferredSendQueue:
+    """Durable FIFO queue for typing-guard-held directed sends.
+
+    Queue entries are persisted before the HTTP caller receives a queued
+    receipt.  Drain removes an entry before replaying it: this favors the
+    no-duplicate-delivery invariant over retrying an ambiguous in-flight send
+    after a daemon crash.
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self._path = Path(path).expanduser() if path else None
+        self._lock = threading.RLock()
+        self._items: list[dict] = []
+        self._seq = 0
+
+    @property
+    def path(self) -> Path:
+        return self._path or _deferred_sends_path_from_env()
+
+    def _write_locked(self) -> None:
+        path = self.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": DEFERRED_SENDS_VERSION,
+            "updated_epoch": time.time(),
+            "items": self._items,
+            "seq": self._seq,
+        }
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
+                fh.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _item_from_mapping(item: object) -> dict | None:
+        if not isinstance(item, dict):
+            return None
+        item_id = str(item.get("id") or "").strip()
+        route = str(item.get("route") or "").strip()
+        pane = str(item.get("pane") or "").strip()
+        phys_pane = str(item.get("phys_pane") or "").strip()
+        params = item.get("params")
+        if not item_id or not route or not phys_pane or not isinstance(params, dict):
+            return None
+        try:
+            seq = int(item.get("seq") or 0)
+            queued_at = float(item.get("queued_at") or 0)
+        except (TypeError, ValueError):
+            return None
+        ttl_raw = item.get("ttl_seconds")
+        ttl_seconds = None
+        if ttl_raw not in (None, ""):
+            try:
+                ttl_seconds = float(ttl_raw)
+            except (TypeError, ValueError):
+                ttl_seconds = None
+        return {
+            "id": item_id,
+            "seq": seq,
+            "route": route,
+            "pane": pane,
+            "phys_pane": phys_pane,
+            "params": dict(params),
+            "queued_at": queued_at,
+            "ttl_seconds": ttl_seconds,
+            "gate": dict(item.get("gate") or {}),
+        }
+
+    def load(self, *, force: bool = False) -> dict:
+        with self._lock:
+            if self._items and not force:
+                return {"loaded": False, "path": str(self.path), "queued": len(self._items)}
+            try:
+                with self.path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except FileNotFoundError:
+                self._items = []
+                self._seq = 0
+                return {"loaded": True, "path": str(self.path), "queued": 0, "dropped": 0}
+            raw_items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(raw_items, list):
+                raw_items = []
+            loaded: list[dict] = []
+            dropped = 0
+            now = time.time()
+            for raw in raw_items:
+                item = self._item_from_mapping(raw)
+                if item is None or self._is_expired(item, now=now):
+                    dropped += 1
+                    continue
+                loaded.append(item)
+            loaded.sort(key=lambda it: (int(it.get("seq") or 0), str(it.get("id") or "")))
+            self._items = loaded
+            try:
+                stored_seq = int(payload.get("seq") or 0) if isinstance(payload, dict) else 0
+            except (TypeError, ValueError):
+                stored_seq = 0
+            self._seq = max(stored_seq, *(int(it["seq"]) for it in loaded), 0)
+            if dropped:
+                self._write_locked()
+            return {
+                "loaded": True,
+                "path": str(self.path),
+                "queued": len(self._items),
+                "dropped": dropped,
+            }
+
+    @staticmethod
+    def _is_expired(item: dict, *, now: float | None = None) -> bool:
+        ttl = item.get("ttl_seconds")
+        if ttl is None:
+            return False
+        try:
+            ttl_f = float(ttl)
+            queued_at = float(item.get("queued_at") or 0)
+        except (TypeError, ValueError):
+            return True
+        return ttl_f > 0 and (now if now is not None else time.time()) - queued_at > ttl_f
+
+    def enqueue(
+        self,
+        *,
+        route: str,
+        params: dict,
+        pane: str,
+        phys_pane: str,
+        gate: dict,
+        ttl_seconds: float | None = None,
+    ) -> dict:
+        with self._lock:
+            self._seq += 1
+            item_id = str(uuid.uuid4())
+            stored_params = {
+                str(k): v
+                for k, v in params.items()
+                if not str(k).startswith("_typing_guard_deferred_")
+            }
+            item = {
+                "id": item_id,
+                "seq": self._seq,
+                "route": route,
+                "pane": pane,
+                "phys_pane": phys_pane,
+                "params": stored_params,
+                "queued_at": time.time(),
+                "ttl_seconds": ttl_seconds,
+                "gate": dict(gate),
+            }
+            self._items.append(item)
+            self._write_locked()
+            return dict(item)
+
+    def pop_ready_for_pane(self, phys_pane: str) -> dict | None:
+        with self._lock:
+            now = time.time()
+            changed = False
+            kept: list[dict] = []
+            expired = 0
+            for item in self._items:
+                if self._is_expired(item, now=now):
+                    expired += 1
+                    changed = True
+                    continue
+                kept.append(item)
+            self._items = kept
+            for idx, item in enumerate(self._items):
+                if str(item.get("phys_pane") or "") == phys_pane:
+                    popped = self._items.pop(idx)
+                    self._write_locked()
+                    return popped
+            if changed:
+                log.warning("tmuxctld: dropped %d expired deferred send(s)", expired)
+                self._write_locked()
+            return None
+
+    def requeue_front(self, item: dict) -> None:
+        with self._lock:
+            self._items = [dict(item)] + [it for it in self._items if it.get("id") != item.get("id")]
+            self._write_locked()
+
+    def by_pane(self) -> dict[str, int]:
+        with self._lock:
+            counts: dict[str, int] = {}
+            for item in self._items:
+                pane = str(item.get("phys_pane") or "")
+                counts[pane] = counts.get(pane, 0) + 1
+            return counts
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
+_DEFERRED_SEND_QUEUE = DeferredSendQueue()
+_DEFERRED_DRAINING: set[str] = set()
+_DEFERRED_DRAIN_LOCK = threading.Lock()
+
+
+def _typing_guard_policy(params: dict) -> tuple[str, str | None]:
+    policy = str(params.get("typing_guard_policy") or params.get("send_gate_policy") or "enqueue")
+    policy = policy.strip().lower()
+    if policy in {"", "defer", "queue", "queued"}:
+        policy = "enqueue"
+    reason = str(
+        params.get("typing_guard_drop_reason") or params.get("send_gate_drop_reason") or ""
+    ).strip()
+    if policy not in {"enqueue", "drop"}:
+        raise ValueError("typing_guard_policy must be enqueue or drop")
+    if policy == "drop" and not reason:
+        raise ValueError("typing_guard_policy=drop requires typing_guard_drop_reason")
+    return policy, reason or None
+
+
+def _typing_guard_ttl(params: dict) -> float | None:
+    raw = params.get("typing_guard_ttl_seconds") or params.get("defer_ttl_seconds")
+    if raw in (None, ""):
+        return None
+    try:
+        ttl = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return ttl if ttl > 0 else None
+
+
+def _typing_gate_detail(phys_pane: str, *, gate: dict | None = None) -> dict:
+    detail = {
+        "suppressed": True,
+        "reason": "typing_guard",
+        "gate": "human_lock",
+        "policy": "enqueue",
+        "target": phys_pane,
+        "deferred": True,
+    }
+    if gate:
+        detail.update(gate)
+        detail["reason"] = "typing_guard"
+        detail["target"] = gate.get("target") or phys_pane
+    return detail
+
+
+def _deferred_receipt(item: dict, *, gate: dict) -> dict:
+    return {
+        "status": "queued",
+        "queued": True,
+        "deferred": True,
+        "delivered": False,
+        "submitted": False,
+        "queue_id": item["id"],
+        "queue_seq": item["seq"],
+        "pane": item.get("pane") or item.get("phys_pane"),
+        "physical_pane": item.get("phys_pane"),
+        "target": item.get("phys_pane"),
+        "reason": "typing_guard",
+        "gate": gate,
+        "queue_path": str(_DEFERRED_SEND_QUEUE.path),
+    }
+
+
+def _drop_receipt(*, pane: str, phys_pane: str, reason: str, gate: dict) -> dict:
+    return {
+        "status": "dropped",
+        "dropped": True,
+        "queued": False,
+        "deferred": False,
+        "delivered": False,
+        "submitted": False,
+        "pane": pane,
+        "physical_pane": phys_pane,
+        "reason": "typing_guard",
+        "drop_reason": reason,
+        "gate": {**gate, "policy": "drop", "drop_reason": reason},
+    }
+
+
+def _defer_or_drop_typing_guard(
+    *,
+    route: str,
+    params: dict,
+    pane: str,
+    phys_pane: str,
+    gate: dict | None = None,
+) -> dict | None:
+    """Return a queued/dropped receipt when the typing guard blocks this send."""
+
+    active_gate = gate if gate and gate.get("reason") == "typing_guard" else None
+    if active_gate is None and send_gate._pane_human_locked(phys_pane):
+        active_gate = _typing_gate_detail(phys_pane)
+    if active_gate is None or not active_gate.get("suppressed", True):
+        return None
+
+    policy, drop_reason = _typing_guard_policy(params)
+    active_gate = _typing_gate_detail(phys_pane, gate=active_gate)
+    if policy == "drop":
+        return _drop_receipt(
+            pane=pane,
+            phys_pane=phys_pane,
+            reason=drop_reason or "unspecified",
+            gate=active_gate,
+        )
+    if _b(params, "_typing_guard_deferred_drain"):
+        raise TmuxSendGated({**active_gate, "drain_reblocked": True})
+    item = _DEFERRED_SEND_QUEUE.enqueue(
+        route=route,
+        params=params,
+        pane=pane,
+        phys_pane=phys_pane,
+        gate=active_gate,
+        ttl_seconds=_typing_guard_ttl(params),
+    )
+    _schedule_deferred_drain(phys_pane)
+    log.warning(
+        "tmuxctld: queued deferred send route=%s pane=%s queue_id=%s",
+        route,
+        _safe_public_role(pane),
+        item["id"],
+    )
+    return _deferred_receipt(item, gate=active_gate)
+
+
+def _execute_deferred_send(item: dict) -> dict:
+    route = str(item.get("route") or "")
+    handler = _DEFERRED_ROUTE_HANDLERS.get(route)
+    if handler is None:
+        raise ValueError(f"deferred send route is not replayable: {route}")
+    params = dict(item.get("params") or {})
+    params["_typing_guard_deferred_drain"] = True
+    params["_typing_guard_deferred_id"] = item.get("id")
+    if not str(params.get("operation_id") or "").strip():
+        params["operation_id"] = f"deferred:{item.get('id')}"
+    control = TmuxControlPlane(TmuxAdapter())
+    return handler(control, params)
+
+
+def _drain_deferred_sends_for_pane(phys_pane: str) -> dict:
+    drained = 0
+    reblocked = False
+    failures: list[dict] = []
+    while not send_gate._pane_human_locked(phys_pane):
+        item = _DEFERRED_SEND_QUEUE.pop_ready_for_pane(phys_pane)
+        if item is None:
+            break
+        try:
+            _execute_deferred_send(item)
+            drained += 1
+        except TmuxSendGated as exc:
+            if exc.gate.get("reason") == "typing_guard":
+                _DEFERRED_SEND_QUEUE.requeue_front(item)
+                reblocked = True
+                break
+            failures.append({"queue_id": item.get("id"), "error": "gated", "detail": exc.gate})
+        except Exception as exc:  # noqa: BLE001 - preserve daemon loop, log server-side.
+            log.exception("tmuxctld: deferred send failed queue_id=%s", item.get("id"))
+            failures.append({"queue_id": item.get("id"), "error": type(exc).__name__})
+    return {"pane": phys_pane, "drained": drained, "reblocked": reblocked, "failures": failures}
+
+
+def _schedule_deferred_drain(phys_pane: str) -> None:
+    if not phys_pane:
+        return
+    with _DEFERRED_DRAIN_LOCK:
+        if phys_pane in _DEFERRED_DRAINING:
+            return
+        _DEFERRED_DRAINING.add(phys_pane)
+
+    def _worker() -> None:
+        try:
+            while send_gate._pane_human_locked(phys_pane):
+                time.sleep(send_gate._typing_delay_sleep(phys_pane))
+            _drain_deferred_sends_for_pane(phys_pane)
+        finally:
+            with _DEFERRED_DRAIN_LOCK:
+                _DEFERRED_DRAINING.discard(phys_pane)
+
+    threading.Thread(
+        target=_worker, name=f"typing-guard-drain-{phys_pane}", daemon=True
+    ).start()
+
+
+def _schedule_all_deferred_drains() -> None:
+    for phys_pane in _DEFERRED_SEND_QUEUE.by_pane():
+        _schedule_deferred_drain(phys_pane)
 
 
 def _listen_fd_from_env() -> int | None:
@@ -1124,7 +1524,12 @@ def _h_send_keys(control, params):
     # Inviolable human-lock fail-closed before any byte-bearing send: an ambient
     # TMUX_SEND_GATE_ALLOW override (enforce-action / quiet-hours pierce) must
     # never clobber active typing at this chokepoint.
-    phys_pane = _refuse_send_into_human_lock(control, pane)
+    phys_pane = _resolve_physical_pane_or_gate(control, pane)
+    deferred = _defer_or_drop_typing_guard(
+        route="/send-keys", params=params, pane=pane, phys_pane=phys_pane
+    )
+    if deferred is not None:
+        return {**deferred, "command": command, "sent": False}
     if looks_like_dispatch_launcher_payload(command):
         assert_dispatch_target_available(control.adapter, phys_pane)
     if _b(params, "no_escape"):
@@ -1502,6 +1907,8 @@ def _insert_without_submit_pipeline(
     pane: str,
     text: str,
     action: Callable[[], dict | None],
+    route: str = "/insert-text",
+    request_params: dict | None = None,
     operation_id: str = "",
     verify_timeout: float = 1.0,
     direct_user: bool = False,
@@ -1523,11 +1930,29 @@ def _insert_without_submit_pipeline(
     if idempotent is not None:
         return idempotent
 
-    _raise_if_human_locked(phys_pane)
+    queue_params = dict(request_params or {"pane": pane, "text": text, "operation_id": operation_id})
+    deferred = _defer_or_drop_typing_guard(
+        route=route, params=queue_params, pane=pane, phys_pane=phys_pane
+    )
+    if deferred is not None:
+        _SEND_IDEMPOTENCY.abort(operation_id)
+        return deferred
     if not direct_user:
-        pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
+        pre_gate = send_gate.evaluate(
+            ("send-keys", "-t", phys_pane, "-l", normalized_payload),
+            drop_reason=None,
+        )
         if pre_gate is not None and pre_gate.get("suppressed"):
+            deferred = _defer_or_drop_typing_guard(
+                route=route,
+                params=queue_params,
+                pane=pane,
+                phys_pane=phys_pane,
+                gate=pre_gate,
+            )
             _SEND_IDEMPOTENCY.abort(operation_id)
+            if deferred is not None:
+                return deferred
             raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
 
     dispatch_id = str(uuid.uuid4())
@@ -1607,6 +2032,8 @@ def _send_text_pipeline(
     *,
     pane: str,
     text: str,
+    route: str = "/send-text",
+    request_params: dict | None = None,
     submit: bool = True,
     clear_prompt: bool = False,
     verify: bool | None = None,
@@ -1648,6 +2075,8 @@ def _send_text_pipeline(
             pane=pane,
             text=normalized_payload,
             action=lambda: control.send_text(pane, text, clear_prompt=clear_prompt, submit=False),
+            route=route,
+            request_params=request_params,
             operation_id=operation_id,
             verify_timeout=verify_timeout,
             effects={"route": "send-text", "submit": False, "clear_prompt": bool(clear_prompt)},
@@ -1677,12 +2106,23 @@ def _send_text_pipeline(
     if idempotent is not None:
         return idempotent
 
-    _raise_if_human_locked(phys_pane)
+    queue_params = dict(request_params or {"pane": pane, "text": text, "operation_id": operation_id})
+    deferred = _defer_or_drop_typing_guard(
+        route=route, params=queue_params, pane=pane, phys_pane=phys_pane
+    )
+    if deferred is not None:
+        _SEND_IDEMPOTENCY.abort(operation_id)
+        return deferred
     if looks_like_dispatch_launcher_payload(normalized_payload):
         assert_dispatch_target_available(control.adapter, phys_pane)
     pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
     if pre_gate is not None and pre_gate.get("suppressed"):
         _SEND_IDEMPOTENCY.abort(operation_id)
+        deferred = _defer_or_drop_typing_guard(
+            route=route, params=queue_params, pane=pane, phys_pane=phys_pane, gate=pre_gate
+        )
+        if deferred is not None:
+            return deferred
         raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
     dispatch_id = str(uuid.uuid4())
     instance_id = ""
@@ -1959,6 +2399,8 @@ def _h_send_text(control, params):
         control,
         pane=_s(params, "pane"),
         text=_s(params, "text"),
+        route="/send-text",
+        request_params=params,
         submit=_b(params, "submit", True),
         clear_prompt=_b(params, "clear_prompt"),
         verify=_b(params, "verify", _b(params, "submit", True)),
@@ -1980,6 +2422,8 @@ def _h_insert_text(control, params):
         pane=pane,
         text=text,
         action=lambda: control.insert_text(pane, text) or {"pane": pane},
+        route="/insert-text",
+        request_params=params,
         operation_id=_s(params, "operation_id"),
         verify_timeout=_f(params, "verify_timeout", 1.0),
         effects={"route": "insert-text"},
@@ -1988,6 +2432,12 @@ def _h_insert_text(control, params):
 
 def _h_prompt_start(control, params):
     pane = _s(params, "pane")
+    phys_pane = _resolve_physical_pane_or_gate(control, pane)
+    deferred = _defer_or_drop_typing_guard(
+        route="/prompt-start", params=params, pane=pane, phys_pane=phys_pane
+    )
+    if deferred is not None:
+        return deferred
     with _agent_guard_transaction(control, pane):
         control.move_to_prompt_start(pane, page_ups=_i(params, "page_ups", 50))
     return {"pane": pane, "status": "prompt-start"}
@@ -1995,6 +2445,12 @@ def _h_prompt_start(control, params):
 
 def _h_prompt_end(control, params):
     pane = _s(params, "pane")
+    phys_pane = _resolve_physical_pane_or_gate(control, pane)
+    deferred = _defer_or_drop_typing_guard(
+        route="/prompt-end", params=params, pane=pane, phys_pane=phys_pane
+    )
+    if deferred is not None:
+        return deferred
     with _agent_guard_transaction(control, pane):
         control.move_to_prompt_end(pane, page_downs=_i(params, "page_downs", 50))
     return {"pane": pane, "status": "prompt-end"}
@@ -2028,6 +2484,8 @@ def _h_invoke_skill(control, params):
             control,
             pane=pane,
             text=rendered,
+            route="/invoke-skill",
+            request_params=params,
             submit=True,
             clear_prompt=_b(params, "clear_prompt"),
             verify=_b(params, "verify", True),
@@ -2038,7 +2496,7 @@ def _h_invoke_skill(control, params):
         )
         return {
             **result,
-            "submitted": True,
+            "submitted": False if result.get("queued") or result.get("dropped") else True,
             "kind": resolved_kind,
             "agent": resolved_agent,
             "rendered": rendered,
@@ -2091,6 +2549,8 @@ def _h_send_ethereal(control, params):
         control,
         pane=pane,
         text=rendered,
+        route="/send-ethereal",
+        request_params=params,
         submit=True,
         clear_prompt=_b(params, "clear_prompt"),
         verify=_b(params, "verify", True),
@@ -2101,7 +2561,7 @@ def _h_send_ethereal(control, params):
     )
     return {
         **result,
-        "submitted": True,
+        "submitted": False if result.get("queued") or result.get("dropped") else True,
         "kind": "ethereal",
         "agent": resolved_agent,
         "rendered": rendered,
@@ -2120,6 +2580,8 @@ def _h_append_user_text(control, params):
         pane=pane,
         text=text,
         action=lambda: control.adapter.run("send-keys", "-t", pane, "-l", text) or {"pane": pane},
+        route="/append-user-text",
+        request_params=params,
         operation_id=_s(params, "operation_id"),
         verify_timeout=_f(params, "verify_timeout", 1.0),
         direct_user=True,
@@ -2169,6 +2631,8 @@ def _h_insert_invocation(control, params):
         pane=pane,
         text=rendered,
         action=_action,
+        route="/insert-invocation",
+        request_params=params,
         operation_id=_s(params, "operation_id"),
         verify_timeout=_f(params, "verify_timeout", 1.0),
         effects={
@@ -2778,6 +3242,12 @@ def _h_mode_toggle(control, params):
     pane = _s(params, "pane", "current")
     target_pane = control._keybind_target_pane(pane, client=_s(params, "client"))
     phys_pane = _resolve_physical_pane_or_gate(control, target_pane)
+    if not _b(params, "status"):
+        deferred = _defer_or_drop_typing_guard(
+            route="/mode-toggle", params=params, pane=target_pane, phys_pane=phys_pane
+        )
+        if deferred is not None:
+            return {**deferred, "sent": False}
     capture = control.adapter.run(
         "capture-pane", "-t", target_pane, "-p", "-S", "-5", allow_failure=True
     )
@@ -2806,10 +3276,18 @@ def _h_mode_toggle(control, params):
     if idempotent is not None:
         return idempotent
 
-    _raise_if_human_locked(phys_pane)
     pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "BTab"))
     if pre_gate is not None and pre_gate.get("suppressed"):
         _SEND_IDEMPOTENCY.abort(operation_id)
+        deferred = _defer_or_drop_typing_guard(
+            route="/mode-toggle",
+            params=params,
+            pane=target_pane,
+            phys_pane=phys_pane,
+            gate=pre_gate,
+        )
+        if deferred is not None:
+            return {**deferred, "sent": False}
         raise TmuxSendGated({**pre_gate, "policy": "cancel", "deferred": True})
 
     owner_token = _hold_agent_guard(phys_pane, seconds=8)
@@ -2912,6 +3390,8 @@ def _h_typing_guard_state(control, params):
                 _s(params, "pane"),
             )
         )
+    if _s(params, "pane"):
+        payload.setdefault("pane", _s(params, "pane"))
     if cmd in {"arm", "pending"}:
         # Telemetry for the keystroke-driven guard writes lives here, in the
         # daemon log — never in a client-facing display-message (Emperor ruling
@@ -2926,6 +3406,9 @@ def _h_typing_guard_state(control, params):
         )
     if cmd == "arm":
         _schedule_typing_guard_expiry_rehydrate(payload)
+    pane = _s(params, "pane")
+    if pane and str(payload.get("kind") or "").lower() == typing_guard_state.OFF:
+        _schedule_deferred_drain(pane)
     return payload
 
 
@@ -2955,6 +3438,9 @@ def _schedule_typing_guard_expiry_rehydrate(payload: dict) -> None:
                 typing_guard_state.Tmux(typing_guard_state.tmux_binary()),
                 now=typing_guard_state.now_epoch(),
             )
+            pane = str(payload.get("pane") or "")
+            if pane:
+                _schedule_deferred_drain(pane)
         except Exception:
             pass
 
@@ -3140,6 +3626,8 @@ def _h_context_governor_inject(control, params):
         control,
         pane=target,
         text=text,
+        route="/context-governor/inject",
+        request_params={**params, "pane": target},
         submit=_b(params, "submit", True),
         clear_prompt=_b(params, "clear_prompt", False),
         verify=_b(params, "verify", True),
@@ -3181,13 +3669,6 @@ def _h_context_governor_stop(control, params):
 
 def _h_instance_send_text(control, params):
     instance_id = _s(params, "instance_id")
-    if not _b(params, "submit", True):
-        return control.instance_send_text(
-            instance_id,
-            _s(params, "text"),
-            clear_prompt=_b(params, "clear_prompt"),
-            submit=False,
-        )
     resolved = control.resolve_instance(instance_id)
     if not resolved["found"]:
         return {"instance_id": instance_id, "found": False}
@@ -3398,6 +3879,8 @@ def _h_voice_append(control, params):
             pane=session.target_role,
             text=segment,
             action=lambda: control.send_text(session.target_role, segment, submit=False),
+            route="/send-text",
+            request_params={**params, "pane": session.target_role, "text": segment, "submit": False},
             operation_id=_s(params, "operation_id"),
             verify_timeout=_f(params, "verify_timeout", 1.0),
             effects={
@@ -3489,6 +3972,21 @@ def _h_voice_target(control, params):
 
 
 RouteHandler = Callable[["TmuxControlPlane", dict], object]
+
+_DEFERRED_ROUTE_HANDLERS: dict[str, RouteHandler] = {
+    "/tmux/send-keys": _h_send_keys,
+    "/send-keys": _h_send_keys,
+    "/send-text": _h_send_text,
+    "/insert-text": _h_insert_text,
+    "/prompt-start": _h_prompt_start,
+    "/prompt-end": _h_prompt_end,
+    "/mode-toggle": _h_mode_toggle,
+    "/invoke-skill": _h_invoke_skill,
+    "/send-ethereal": _h_send_ethereal,
+    "/append-user-text": _h_append_user_text,
+    "/insert-invocation": _h_insert_invocation,
+    "/context-governor/inject": _h_context_governor_inject,
+}
 
 ROUTES: dict[tuple[str, str], RouteHandler] = {
     # Resolution (GET)
@@ -3682,6 +4180,11 @@ class TmuxctldServer(ThreadingHTTPServer):
             _PROMPT_SUBMIT_SNIFFER.load_callbacks()
         except Exception:
             log.exception("tmuxctld prompt-submit callback load failed")
+        try:
+            _DEFERRED_SEND_QUEUE.load()
+            _schedule_all_deferred_drains()
+        except Exception:
+            log.exception("tmuxctld deferred-send queue load failed")
         # Throttle state for the /health-driven lifecycle-hook re-assertion. A
         # 0.0 deadline forces the re-install on the first health check after boot.
         self._hook_reassert_lock = threading.Lock()

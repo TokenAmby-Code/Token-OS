@@ -192,19 +192,35 @@ def test_run_delays_send_keys_during_typing_guard_then_sends(
     assert recorded_suppressions[-1]["policy"] == "delay"
 
 
-def test_run_can_cancel_send_keys_during_typing_guard_by_policy(
+def test_run_can_cancel_send_keys_during_typing_guard_with_explicit_drop_reason(
     monkeypatch, captured_subprocess, recorded_suppressions
 ):
     _force_quiet(monkeypatch, False)
     _force_typing(monkeypatch, True)
     _no_override(monkeypatch)
     monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")
+    monkeypatch.setenv("TMUX_SEND_GATE_DROP_REASON", "stale_on_drain")
 
     adapter = TmuxAdapter(tmux_binary="tmux")
     adapter.run("send-keys", "-t", "%9", "C-m")
 
     assert captured_subprocess == []
     assert recorded_suppressions and recorded_suppressions[-1]["policy"] == "cancel"
+    assert recorded_suppressions[-1]["drop_reason"] == "stale_on_drain"
+
+
+def test_ambient_cancel_policy_does_not_drop_typing_guard_without_reason(monkeypatch):
+    _force_quiet(monkeypatch, False)
+    _force_typing(monkeypatch, True)
+    _no_override(monkeypatch)
+    monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")
+
+    result = send_gate.evaluate(("send-keys", "-t", "%9", "hi"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "delay"
+    assert result["suppressed"] is True
 
 
 def test_run_does_not_gate_read_commands_during_quiet_hours(
@@ -682,7 +698,8 @@ def test_run_resolves_canonical_target_to_physical_before_gating(
     """
     _force_quiet(monkeypatch, False)
     _no_override(monkeypatch)
-    monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")  # avoid the delay/retry loop
+    monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "cancel")  # explicit stale drop avoids wait loop
+    monkeypatch.setenv("TMUX_SEND_GATE_DROP_REASON", "stale_on_drain")
 
     seen_targets: list[str | None] = []
 

@@ -11,11 +11,20 @@ import sys
 import threading
 import urllib.request
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import daemon
 from tmuxctl.tmux_adapter import TmuxError, TmuxSendGated
+
+
+@pytest.fixture(autouse=True)
+def _isolated_deferred_queue(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
+    monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
+    monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
 
 
 class DeadTmuxAdapter:
@@ -121,8 +130,10 @@ def test_resolve_instance_fail_closed_when_tmux_dead() -> None:
     try:
         status, payload = _get(server, "/tmux/resolve-instance?instance_id=x")
         assert status == 200
-        # Resolution errors are still enveloped at 200, never a 500.
-        assert payload["ok"] is False
+        # Resolution fails closed as a negative lookup, never a guessed pane or 500.
+        assert payload["ok"] is True
+        assert payload["result"]["found"] is False
+        assert payload["result"]["pane_id"] == ""
     finally:
         server.shutdown()
 

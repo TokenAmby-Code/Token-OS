@@ -12,8 +12,8 @@ straight through the typing guard and clobbered active typing.
 These tests pin the daemon chokepoint contract with NO live tmux: the pane's
 human ON/PENDING lock is mocked via the send_gate option primitives, and the
 fake adapter records whether a byte-bearing send was issued. A live human lock
-must gate the send (``ok:false`` / ``code:gated``) and the adapter must NOT be
-called, regardless of any ambient ``TMUX_SEND_GATE_ALLOW`` override.
+must queue the send (``ok:true`` / ``status:queued``) and the adapter must NOT be
+called until the typing guard drops, regardless of any ambient ``TMUX_SEND_GATE_ALLOW`` override.
 """
 
 from __future__ import annotations
@@ -31,6 +31,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import daemon, send_gate, typing_guard_state
+
+
+@pytest.fixture(autouse=True)
+def _isolated_deferred_queue(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
+    monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
+    monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
 
 
 class _RecordingAdapter:
@@ -108,6 +115,7 @@ def _mock_human_lock(monkeypatch: pytest.MonkeyPatch, *, pending: bool = False) 
     monkeypatch.setattr(send_gate, "_pane_lock_until", lambda target: lock)
     monkeypatch.setattr(send_gate, "_pane_pending_until", lambda target: pend)
     monkeypatch.setattr(send_gate, "_pane_agent_until", lambda target: None)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: True)
     monkeypatch.setattr(send_gate, "quiet_hours_active", lambda **_kw: (False, {}))
     # The daemon must never reach (or succeed at) acquiring its own AGENT hold over
     # a human-locked pane; with no live tmux, force the realistic denied result.
@@ -134,8 +142,9 @@ def test_enforce_override_cannot_pierce_human_keystroke_lock(
         server.shutdown()
 
     assert status == 200
-    assert payload["ok"] is False, f"human lock was pierced: {payload}"
-    assert payload["error"]["code"] == "gated"
+    assert payload["ok"] is True, payload
+    assert payload["result"]["status"] == "queued"
+    assert payload["result"]["reason"] == "typing_guard"
     assert _RecordingAdapter.sends == [], "bytes reached the pane over a live human lock"
 
 
@@ -155,8 +164,9 @@ def test_enforce_override_cannot_pierce_human_pending_lock(monkeypatch: pytest.M
         server.shutdown()
 
     assert status == 200
-    assert payload["ok"] is False, f"human pending lock was pierced: {payload}"
-    assert payload["error"]["code"] == "gated"
+    assert payload["ok"] is True, payload
+    assert payload["result"]["status"] == "queued"
+    assert payload["result"]["reason"] == "typing_guard"
     assert _RecordingAdapter.sends == []
 
 
@@ -179,8 +189,9 @@ def test_enforce_override_cannot_pierce_human_lock_via_send_keys(
         server.shutdown()
 
     assert status == 200
-    assert payload["ok"] is False, f"human lock was pierced via send-keys: {payload}"
-    assert payload["error"]["code"] == "gated"
+    assert payload["ok"] is True, payload
+    assert payload["result"]["status"] == "queued"
+    assert payload["result"]["reason"] == "typing_guard"
     assert _RecordingAdapter.sends == [], "keys reached the pane over a live human lock"
 
 
@@ -220,6 +231,7 @@ def test_unlocked_pane_still_sends_under_enforce_override(monkeypatch: pytest.Mo
     monkeypatch.setattr(send_gate, "_pane_lock_until", lambda target: None)
     monkeypatch.setattr(send_gate, "_pane_pending_until", lambda target: None)
     monkeypatch.setattr(send_gate, "_pane_agent_until", lambda target: None)
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: False)
     monkeypatch.setattr(send_gate, "quiet_hours_active", lambda **_kw: (False, {}))
     monkeypatch.setattr(typing_guard_state, "hold", lambda *a, **k: False)
     monkeypatch.setenv("TMUX_SEND_GATE_ALLOW", "custodes_enforcement_deferred_timeout")
