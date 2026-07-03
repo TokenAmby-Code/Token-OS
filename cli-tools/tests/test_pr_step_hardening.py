@@ -357,6 +357,11 @@ main
 
     hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
     assert hooks == []
+    unsubs = curl_json_bodies(curl_log, "/api/hooks/unsubscribe")
+    assert len(unsubs) == 1
+    assert unsubs[0]["target_instance_id"] == "inst-123"
+    assert unsubs[0]["subscriber_instance_id"] == "inst-123"
+    assert unsubs[0]["purpose"] == "pr_step_plan"
 
 
 def test_marker_strand_repro_requires_rearm_to_reuse_merge_instance_id(tmp_path: Path) -> None:
@@ -418,6 +423,11 @@ main --no-merge
     assert "summarized:17" in result.stdout
     hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
     assert hooks == []
+    unsubs = curl_json_bodies(curl_log, "/api/hooks/unsubscribe")
+    assert len(unsubs) == 1
+    assert unsubs[0]["target_instance_id"] == "inst-terminal"
+    assert unsubs[0]["subscriber_instance_id"] == "inst-terminal"
+    assert unsubs[0]["purpose"] == "pr_step_plan"
     pr_body = curl_json_bodies(curl_log, "/api/instances/inst-terminal/pr")[0]
     assert pr_body["pr_state"] == "merged"
 

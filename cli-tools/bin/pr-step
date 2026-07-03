@@ -346,6 +346,24 @@ arm_pr_plan_followup() {
         "${api%/}/api/hooks/subscribe" >/dev/null 2>&1 || true
 }
 
+
+disarm_pr_plan_followup() {
+    local pane iid api body
+    pane="$(pr_step_resolve_pane)"
+    iid="$(pr_step_resolve_instance_id || true)"
+    [[ -n "$pane" || -n "$iid" ]] || return 0
+    api="${TOKEN_API_URL:-http://localhost:7777}"
+    if [[ -n "$iid" && -n "$pane" ]]; then
+        body="{\"target_instance_id\":$(json_escape "$iid"),\"target_pane\":$(json_escape "$pane"),\"subscriber_instance_id\":$(json_escape "$iid"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"purpose\":\"pr_step_plan\"}"
+    elif [[ -n "$iid" ]]; then
+        body="{\"target_instance_id\":$(json_escape "$iid"),\"subscriber_instance_id\":$(json_escape "$iid"),\"event\":\"stop\",\"purpose\":\"pr_step_plan\"}"
+    else
+        body="{\"target_pane\":$(json_escape "$pane"),\"subscriber_pane\":$(json_escape "$pane"),\"event\":\"stop\",\"purpose\":\"pr_step_plan\"}"
+    fi
+    curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d "$body" \
+        "${api%/}/api/hooks/unsubscribe" >/dev/null 2>&1 || true
+}
+
 assert_pr_capable_remote() {
     local top origin
     top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -2143,6 +2161,7 @@ main() {
         if [[ "$pr_state" == "MERGED" ]]; then
             [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
             mark_instance_status victorious
+            disarm_pr_plan_followup
             log "PR #$pr is already merged; terminal state, no plan re-arm."
             summarize_pr "$pr"
             return 0
@@ -2168,6 +2187,7 @@ main() {
         pr_url="$(current_pr_url "$pr")"
         [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
         mark_instance_status victorious
+        disarm_pr_plan_followup
     else
         if [[ "$AUTO_MERGE" != "true" ]]; then
             log "Auto-merge disabled (--no-merge); leaving PR #$pr open."
