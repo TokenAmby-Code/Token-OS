@@ -1742,6 +1742,7 @@ while true; do
             jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '.[] | select(.user.login == $bot or .user.login == $user) | .body' | tail -1)
 
         if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
+            START_TIME=$(date +%s)
             continue
         fi
 
@@ -1756,6 +1757,7 @@ while true; do
             jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].body')
 
         if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
+            START_TIME=$(date +%s)
             continue
         fi
 
@@ -1776,6 +1778,7 @@ while true; do
             if coderabbit_review_is_deferred "$PR_NUMBER"; then
                 LATEST_ISSUE_COMMENT="$(coderabbit_latest_issue_comment_body "$PR_NUMBER")"
                 if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
+                    START_TIME=$(date +%s)
                     continue
                 fi
                 log "CodeRabbit commit status is terminal ($CR_STATE), but latest CodeRabbit comment is a rate-limit deferral; keeping the review gate open."
