@@ -151,6 +151,36 @@ def test_wrapper_repairs_shared_skill_roots_before_codex_launch(tmp_path: Path) 
     assert not (tmp_path / "home" / ".claude" / "commands" / "preplan.md").exists()
 
 
+def test_headless_codex_launch_sets_native_auto_compact_limit(tmp_path: Path) -> None:
+    codex_target = tmp_path / "codex-target"
+    argv_log = tmp_path / "codex-argv.txt"
+    _write_executable(
+        codex_target,
+        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {str(argv_log)!r}\nexit 0\n",
+    )
+
+    env, _hooks = _wrapper_env(tmp_path, codex_target)
+    env["CODEX_BIN"] = str(codex_target)
+    env["CODEX_HEADLESS"] = "1"
+    env["HOME"] = str(tmp_path / "home")
+    env["TOKEN_WRAPPER_SYNC_SHARED_SKILLS"] = "0"
+    env.pop("CLAUDE_BIN", None)
+
+    result = subprocess.run(
+        [str(CLI_TOOLS / "scripts" / "agent-wrapper.sh"), "codex", "mission"],
+        env=env,
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    args = argv_log.read_text(encoding="utf-8").splitlines()
+    assert args[0] == "exec"
+    pairs = list(zip(args, args[1:]))
+    assert ("-c", "model_auto_compact_token_limit=160000") in pairs
+
+
 def test_wrapperend_emits_on_normal_child_exit_and_preserves_zero(tmp_path: Path) -> None:
     result, hook_text = _run_wrapper(tmp_path, "#!/usr/bin/env bash\nexit 0\n")
 

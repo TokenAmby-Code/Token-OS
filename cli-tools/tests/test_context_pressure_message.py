@@ -34,8 +34,7 @@ def test_plan_mode_message_does_not_tell_the_agent_to_enter_plan_or_compact() ->
         assert "/compact" not in msg
         assert "switch to plan mode" not in msg
         # It tells the agent to pose the plan without gathering context.
-        assert "Do NOT gather" in msg
-        assert "plan mode" in msg
+        assert msg == "Context full. Pose the plan without gathering context."
 
 
 def test_is_plan_active_classification() -> None:
@@ -81,9 +80,62 @@ def test_tmux_context_check_pre_compact_threads_planning_state_into_message(
     module.check_pre_compact("%42", 90, 300_000, planning_state="planning")
     assert sent, "a nudge should have been injected"
     assert "/compact" not in sent[-1]
-    assert "Do NOT gather" in sent[-1]
+    assert sent[-1] == "Context full. Pose the plan without gathering context."
 
     sent.clear()
     module.check_pre_compact("%42", 90, 300_000, planning_state="none")
     assert sent
     assert "switch to plan mode OR run /compact" in sent[-1]
+
+
+def test_tmux_context_main_reports_telemetry_without_legacy_nudge(monkeypatch, capsys):
+    module = _load_tmux_context()
+    posted = []
+    popens = []
+
+    monkeypatch.setenv("TMUX_PANE", "%77")
+    monkeypatch.delenv("TMUX_CONTEXT_LEGACY_NUDGE", raising=False)
+    monkeypatch.setattr(
+        module,
+        "read_input",
+        lambda: {
+            "session_id": "sess",
+            "cwd": "/tmp/work",
+            "context_window": {
+                "used_percentage": 90,
+                "context_window_size": 200000,
+                "total_input_tokens": 10,
+                "total_output_tokens": 20,
+            },
+            "model": {"display_name": "Claude"},
+            "cost": {"total_cost_usd": 1.0},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "get_instance_by_pane",
+        lambda pane: {
+            "id": "inst",
+            "engine": "claude",
+            "planning_state": "none",
+            "chapter": "",
+            "session_doc_id": None,
+        },
+    )
+    monkeypatch.setattr(module, "update_pane_option", lambda *a, **k: None)
+    monkeypatch.setattr(module, "write_state", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module,
+        "api_post",
+        lambda path, data, timeout=1.0: posted.append((path, data)) or {"ok": True},
+    )
+
+    class FakePopen:
+        def __init__(self, *a, **k):
+            popens.append(a)
+
+    monkeypatch.setattr(module.subprocess, "Popen", FakePopen)
+    module.main()
+    assert posted and posted[0][0] == "/api/context-governor/telemetry"
+    assert posted[0][1]["used_tokens"] == 180000
+    assert popens == []

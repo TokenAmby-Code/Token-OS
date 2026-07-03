@@ -1157,6 +1157,48 @@ async def init_database_async(db_path: Path | None = None) -> None:
         """)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS context_governor_state (
+                instance_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                engine TEXT,
+                pane TEXT,
+                used_tokens INTEGER,
+                context_window_tokens INTEGER,
+                planning_state TEXT,
+                scoped INTEGER NOT NULL DEFAULT 0,
+                scope_reason TEXT,
+                stage TEXT NOT NULL DEFAULT 'telemetry',
+                policy_state TEXT NOT NULL DEFAULT 'telemetry_only',
+                armed_subscription_id INTEGER,
+                injected_at TIMESTAMP,
+                no_progress_deadline_at TIMESTAMP,
+                last_progress_at TIMESTAMP,
+                exhausted_at TIMESTAMP,
+                last_telemetry_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_context_governor_state_policy
+            ON context_governor_state(policy_state, no_progress_deadline_at)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS context_governor_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT,
+                session_id TEXT,
+                stage TEXT NOT NULL,
+                action TEXT NOT NULL,
+                details_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_context_governor_audit_instance
+            ON context_governor_audit(instance_id, created_at DESC)
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS stop_hook_subscriptions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target_instance_id TEXT NOT NULL,

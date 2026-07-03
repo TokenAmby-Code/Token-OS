@@ -18,6 +18,8 @@ import urllib.request
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+REPO_ROOT = ROOT.parent
+sys.path.insert(0, str(REPO_ROOT / "tmuxctld" / "lib"))
 sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import daemon, wrapper_ledger
@@ -2804,5 +2806,67 @@ def test_deferred_keybind_routes_are_loud_501(route: str) -> None:
         payload = json.loads(excinfo.value.read().decode("utf-8"))
         assert payload["error"]["code"] == "not_implemented"
         assert payload["error"]["detail"]["path"] == route
+    finally:
+        server.shutdown()
+
+
+def test_context_governor_inject_uses_daemon_send_path() -> None:
+    server, _ = _serve(RecordingVoiceAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/context-governor/inject",
+            {
+                "pane": "%42",
+                "instance_id": "ctx-inst",
+                "text": "Context full. Pose the plan without gathering context.",
+                "verify": False,
+            },
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["actuator"] == "context-governor"
+        assert result["instance_id"] == "ctx-inst"
+        assert result["delivered"] is True
+    finally:
+        server.shutdown()
+
+
+def test_context_governor_inject_reports_gated_without_writing(monkeypatch) -> None:
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
+    server, _ = _serve(RecordingVoiceAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/context-governor/inject",
+            {"pane": "%42", "instance_id": "ctx-inst", "text": "do not send", "verify": False},
+        )
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "gated"
+        assert payload["error"]["detail"]["deferred"] is True
+    finally:
+        server.shutdown()
+
+
+def test_context_governor_stop_is_conservative_prompt_actuation() -> None:
+    server, _ = _serve(RecordingVoiceAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/context-governor/stop",
+            {
+                "pane": "%42",
+                "instance_id": "ctx-inst",
+                "reason": "no_progress_after_context_injection",
+                "verify": False,
+            },
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["status"] == "stopped_autonomous_input"
+        assert result["actuator"] == "context-governor"
     finally:
         server.shutdown()

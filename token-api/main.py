@@ -82,6 +82,9 @@ import shared
 import talk as talk_service
 import temp_message as temp_message_service
 from billable import accrual_weight, classify_work_class, trickle_numerator
+from context_governor import (
+    router as context_governor_router,
+)
 from cron_engine import CronEngine
 from custodes_state_policy import (
     CustodesIntervention,
@@ -2464,6 +2467,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start tmux↔DB reconciler worker
     asyncio.create_task(tmux_db_reconciler_worker())
     print("tmux↔DB reconciler worker started")
+    # Start autonomous context-governor no-progress sweep
+    asyncio.create_task(context_governor_sweep_worker())
+    print("Context governor sweep worker started")
     await run_overdue_tasks()
     yield
 
@@ -2523,6 +2529,7 @@ app.include_router(schedule_router)
 app.include_router(tts_router)
 app.include_router(voice_router)
 app.include_router(hooks_router)
+app.include_router(context_governor_router)
 app.include_router(day_start_router)
 app.include_router(ask_router)
 
@@ -23850,6 +23857,19 @@ async def tmux_db_reconciler_worker():
             raise
         except Exception as e:
             logger.error(f"tmux_db_reconciler_worker error: {e}")
+
+
+async def context_governor_sweep_worker():
+    """Periodic no-progress sweep for autonomous context-governor injections."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await sweep_context_governor(ContextSweepRequest(limit=100))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"context_governor_sweep_worker error: {e}")
+        await asyncio.sleep(60)
 
 
 async def session_doc_sync_worker():
