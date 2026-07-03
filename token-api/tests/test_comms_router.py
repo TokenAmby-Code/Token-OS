@@ -228,7 +228,7 @@ def test_phone_direct_tts_only_occurs_inside_the_router(monkeypatch):
     tts = _load("routes.tts")
     sent = []
 
-    # The phone leg now BLOCKS on the playback-complete callback (real audio-finish)
+    # The phone leg now BLOCKS on the buffer_drained callback (real audio-finish)
     # up to PHONE_PLAYBACK_WATCHDOG_S. No callback fires in this structural test, so
     # shrink the watchdog to keep it fast — a missed callback is still a success
     # (playback_confirmed=False), which is exactly what this guard asserts.
@@ -258,7 +258,7 @@ def test_phone_tts_targets_chunk_endpoint_with_playback_id(monkeypatch: Any) -> 
 
     The phone exposes a single keystone TTS atom at
     ``GET /tts-chunk?current_chunk=…&next_chunk=…&playback_id=…`` (m_waitToFinish:true) that fast-acks,
-    speaks locally, then POSTs ``/api/tts/playback-complete`` at true speech end.
+    speaks locally, then POSTs ``/api/tts/chunk-event`` with ``buffer_drained`` at true speech end.
     The phone exposes NO ``/notify`` HTTP macro, so a ``/notify`` send never
     triggers speech and every line would silently fall to the watchdog. This guard
     pins the endpoint + the per-utterance opaque ``playback_id`` so the serialization
@@ -302,7 +302,7 @@ def test_discord_fallthrough_respects_geofence_phone_only(monkeypatch: Any) -> N
     tts = _load("routes.tts")
     sent = []
 
-    # Phone leg blocks on the playback-complete callback; shrink the watchdog so a
+    # Phone leg blocks on the buffer_drained callback; shrink the watchdog so a
     # missed callback in this structural test advances fast (see note above).
     monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.05)
     monkeypatch.setitem(tts.DESKTOP_STATE, "location_zone", "gym")
@@ -447,13 +447,13 @@ def test_phone_watchdog_advances_on_missed_callback(monkeypatch: Any, caplog: An
     assert result.get("playback_confirmed") is False
     # The phone was handed a playback_id to echo back.
     assert any(p.get("playback_id") for _e, p in sent)
-    assert any("playback-complete callback missed" in rec.getMessage() for rec in caplog.records)
+    assert any("buffer_drained callback missed" in rec.getMessage() for rec in caplog.records)
     # The waiter id is always cleaned up (finally pop).
     assert tts.pending_phone_playbacks == {}
 
 
-def test_phone_playback_confirmed_when_callback_arrives(monkeypatch: Any) -> None:
-    """When the device POSTs playback-complete, the blocked worker advances with
+def test_phone_playback_confirmed_when_buffer_drained_arrives(monkeypatch: Any) -> None:
+    """When the device POSTs buffer_drained, the blocked worker advances with
     playback_confirmed=True — real audio-finish drives serialization, no estimate."""
     tts = _load("routes.tts")
     # Generous watchdog: the callback (not the watchdog) must be what releases it.
@@ -489,7 +489,11 @@ def test_phone_playback_confirmed_when_callback_arrives(monkeypatch: Any) -> Non
         assert sent_ids, "phone never received a playback_id"
         pid = sent_ids[0]
 
-        asyncio.run(tts.tts_playback_complete(tts.PlaybackCompleteRequest(playback_id=pid)))
+        asyncio.run(
+            tts.api_tts_chunk_event(
+                tts.TTSChunkEventRequest(event="buffer_drained", backend="phone", playback_id=pid)
+            )
+        )
         worker.join(timeout=5)
 
         assert worker.is_alive() is False
