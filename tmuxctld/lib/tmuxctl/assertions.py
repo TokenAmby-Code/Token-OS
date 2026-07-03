@@ -161,6 +161,65 @@ def persona_spec(label: str) -> PersonaSpec:
     raise ValueError(f"unknown persona pane: {label}")
 
 
+# The two standing reservist heartbeat seats. A tuple (stable order) so the sweep /
+# restart R2 verify iterate deterministically; the single source of truth for
+# "which panes are reservists", consumed by both the daemon (reconcile/pane-died)
+# and the restart executor (read-only R2 verify).
+RESERVIST_LABELS = ("reservists:civic", "reservists:token-os")
+
+
+@dataclass(frozen=True)
+class ReservistSpec:
+    """Standby-runtime spec for a reservist heartbeat seat.
+
+    The reservist analogue of :class:`PersonaSpec`, but a reservist carries a
+    ``standby_prompt`` (the "keep the pulse" instruction the fresh agent boots
+    with) instead of a session doc, and launches with ``persona=""``. The
+    dirs/prompts are lifted VERBATIM from the retired executor tuples so the
+    daemon-seated reservist is byte-for-byte the runtime the old dispatch writer
+    produced.
+    """
+
+    pane_label: str
+    working_dir: str
+    standby_prompt: str
+    model: str = "sonnet"
+    engine: str = "claude"
+    instance_type: str = "hook_driven"
+
+
+def _civic_reservist_dir() -> str:
+    # Verbatim from executor: ``Path(os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic"))``.
+    return os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic")
+
+
+def _token_os_reservist_dir() -> str:
+    # Verbatim from executor._token_os_dir: $IMPERIUM/runtimes/token-os/live, else
+    # the runtime checkout root (parents[3] of this module — same depth as executor.py).
+    imperium = os.environ.get("IMPERIUM")
+    if imperium:
+        return str(Path(imperium) / "runtimes" / "token-os" / "live")
+    return str(Path(__file__).resolve().parents[3])
+
+
+def reservist_spec(label: str) -> ReservistSpec:
+    if label == "reservists:civic":
+        return ReservistSpec(
+            label,
+            _civic_reservist_dir(),
+            "Stand by as the civic reservist runtime. Do not start new work. "
+            "Wait for civic-thread fallthrough or operator instructions.",
+        )
+    if label == "reservists:token-os":
+        return ReservistSpec(
+            label,
+            _token_os_reservist_dir(),
+            "Stand by as the Token-OS reservist runtime. Do not start new work. "
+            "Wait for operator or orchestration instructions.",
+        )
+    raise ValueError(f"unknown reservist pane: {label}")
+
+
 def _pane_label(adapter: TmuxAdapter, pane_id: str, resolved_role: str = "") -> str:
     return resolved_role or adapter.show_pane_option(pane_id, "@PANE_ID")
 
@@ -245,6 +304,7 @@ def persona_seat_command(
     *,
     wrapper_launch_id: str,
     shim_path: str = PERSONA_SEAT_SHIM,
+    initial_prompt: str = "",
 ) -> str:
     """Pure builder for the shell command a seat respawn runs.
 
@@ -254,6 +314,11 @@ def persona_seat_command(
     ``persona-seat.sh`` shim instead of the heavy agent wrapper. Engine-agnostic:
     the shim takes the engine as ``argv[1]``. No third-party imports — stdlib
     ``shlex`` only — so a unit test can assert the string without a live tmux.
+
+    ``initial_prompt`` is the reservist standby prompt: when set it rides as
+    ``TOKEN_API_SEAT_INITIAL_PROMPT`` and the shim's claude branch forwards it as
+    the engine's first message. Persona seats never pass it (they carry a session
+    doc instead), so the funnel stays byte-identical for personas.
     """
     working_dir = spec.working_dir or os.environ.get("HOME", "")
     env: list[tuple[str, str]] = [
@@ -268,6 +333,8 @@ def persona_seat_command(
         env.append(("TOKEN_API_TARGET_WORKING_DIR", working_dir))
     if spec.model:
         env.append(("TOKEN_API_CLAUDE_MODEL", spec.model))
+    if initial_prompt:
+        env.append(("TOKEN_API_SEAT_INITIAL_PROMPT", initial_prompt))
     # GT (golden-throne) posture rides as a flag the shim forwards; sync seats
     # (Custodes/Pax) opt in, the rest default to no-GT.
     env.append(("TOKEN_API_PERSONA_SEAT_SYNC", "1" if spec.sync else "0"))
@@ -282,14 +349,8 @@ def persona_seat_command(
     return invocation
 
 
-def launch_persona_seat(
-    adapter: TmuxAdapter,
-    pane_id: str,
-    spec: PersonaSpec,
-    *,
-    session: str | None = None,
-) -> tuple[bool, str]:
-    """Seat a persona by respawning the thin shim into its (vacated) pane.
+def _launch_seat(adapter: TmuxAdapter, pane_id: str, command: str) -> tuple[bool, str]:
+    """Respawn a prebuilt seat command into a vacated pane through the gated funnel.
 
     The daemon-native replacement for shelling ``dispatch`` (which ``exit 73``s on
     the protected singleton-seat labels): a tmux ``respawn-pane -k`` issued through
@@ -299,10 +360,10 @@ def launch_persona_seat(
 
     ``@PANE_BORN`` is stamped AFTER the respawn (the respawn preflight clears
     runtime state, which would wipe a pre-stamp) so a reconcile event firing
-    mid-boot reads the seat as occupied (the double-seat guard).
+    mid-boot reads the seat as occupied (the double-seat guard). Shared verbatim by
+    ``launch_persona_seat`` and ``launch_reservist_seat`` — the only difference is
+    the ``command`` each builds.
     """
-    wrapper_launch_id = uuid.uuid4().hex
-    command = persona_seat_command(spec, wrapper_launch_id=wrapper_launch_id)
     try:
         adapter.run("respawn-pane", "-k", "-t", pane_id, command)
     except TmuxError as exc:
@@ -322,6 +383,54 @@ def launch_persona_seat(
         allow_failure=True,
     )
     return True, "launched"
+
+
+def launch_persona_seat(
+    adapter: TmuxAdapter,
+    pane_id: str,
+    spec: PersonaSpec,
+    *,
+    session: str | None = None,
+) -> tuple[bool, str]:
+    """Seat a persona by respawning the thin shim into its (vacated) pane."""
+    wrapper_launch_id = uuid.uuid4().hex
+    command = persona_seat_command(spec, wrapper_launch_id=wrapper_launch_id)
+    return _launch_seat(adapter, pane_id, command)
+
+
+def launch_reservist_seat(
+    adapter: TmuxAdapter,
+    pane_id: str,
+    spec: ReservistSpec,
+    *,
+    session: str | None = None,
+) -> tuple[bool, str]:
+    """Seat a reservist standby agent by respawning the thin shim into its pane.
+
+    Same daemon-native funnel as :func:`launch_persona_seat`, but with the
+    ``persona=""`` fast path (the shim skips persona-profile overlays) and the
+    domain standby prompt carried as ``initial_prompt`` so the fresh agent boots
+    already holding its "keep the pulse" instruction. The working dir falls back to
+    ``$HOME`` when the domain vault is not mounted — matching the retired executor
+    writer's ``is_dir`` guard so an unmounted Civic share never cd's into nothing.
+    """
+    working_dir = spec.working_dir
+    if not working_dir or not Path(working_dir).is_dir():
+        working_dir = os.environ.get("HOME", "")
+    seat_spec = PersonaSpec(
+        pane_label=spec.pane_label,
+        persona="",
+        instance_type=spec.instance_type,
+        session_doc="",
+        engine=spec.engine,
+        model=spec.model,
+        working_dir=working_dir,
+    )
+    wrapper_launch_id = uuid.uuid4().hex
+    command = persona_seat_command(
+        seat_spec, wrapper_launch_id=wrapper_launch_id, initial_prompt=spec.standby_prompt
+    )
+    return _launch_seat(adapter, pane_id, command)
 
 
 def _upsert_prompt(pane_id: str, prompt: str) -> tuple[bool, str]:
@@ -1283,6 +1392,93 @@ def sweep_persona_panes(
                     "action": "error",
                     "reason": str(exc),
                 }
+            )
+    return results
+
+
+def assert_reservist_seat(
+    adapter: TmuxAdapter, target: str, *, session: str | None = None
+) -> dict[str, Any]:
+    """Fill a vacant reservist heartbeat seat with a standby agent (idempotent).
+
+    "Keep the pulse": when the reservist pane hosts a live agent this no-ops; when
+    the pane is present but agent-less it respawns the standby agent through the
+    daemon-native reservist launcher. Boot-grace is respected (a seat still booting
+    reads as occupied — the double-seat guard). A pane that no longer resolves
+    returns ``pane_missing`` and is NOT a launch: recreating a fully-killed pinned
+    pane is F2's layout job (``_enforce_pinned_top_row_layout``), the clean F2/F3
+    seam. A fully-killed seat heals in two stages across one reconcile — F2
+    re-splits the pane, this sweep seats the agent.
+    """
+    from .focus_guard import preserve_focus
+
+    reservist_spec(target)  # validate the label before touching tmux
+    with preserve_focus(adapter, source="tmuxctl assert-reservist", attempted_target=target):
+        return _assert_reservist_seat_impl(adapter, target, session=session)
+
+
+def _assert_reservist_seat_impl(
+    adapter: TmuxAdapter, target: str, *, session: str | None = None
+) -> dict[str, Any]:
+    spec = reservist_spec(target)
+    try:
+        resolved = resolve_pane(adapter, target, session_name=session)
+    except Exception as exc:  # noqa: BLE001 — an absent pinned pane is F2's job to heal
+        return {
+            "ok": False,
+            "pane": "",
+            "pane_label": target,
+            "pane_type": "reservists",
+            "instance_id": "",
+            "action": "pane_missing",
+            "reason": f"pane_missing:{exc}",
+        }
+
+    pane_id = resolved.pane_id
+    pane_label = resolved.pane_role or target
+    pane_type = _pane_type(adapter, pane_id)
+    result = _base_result(pane_id, pane_label, pane_type, None)
+
+    if _runtime_has_instance(adapter, pane_id):
+        result.update({"ok": True, "action": "none", "reason": "live"})
+        return result
+
+    # Vacant seat. Guard the boot-grace first: a seat younger than the grace is a
+    # booting agent (its respawn fired, the engine is not yet observable), NOT a
+    # dead pane — reading it as occupied is the double-seat guard.
+    instance_stamp = adapter.show_pane_option(pane_id, "@INSTANCE_ID")
+    try:
+        rows = _registry_entries(pane_id, pane_label, instance_stamp=instance_stamp)
+    except Exception:  # noqa: BLE001 — registry hiccup must not block the heartbeat heal
+        rows = []
+    if _persona_within_boot_grace(adapter, pane_id, rows):
+        result.update({"ok": False, "action": "boot_grace", "reason": "reservist_boot_grace"})
+        return result
+    if rows:
+        _stop_rows(rows, pane_id=pane_id, pane_label=pane_label, reason="reservist_runtime_dead")
+    ok, reason = launch_reservist_seat(adapter, pane_id, spec, session=session)
+    result.update({"ok": ok, "action": "launched" if ok else "launch_failed", "reason": reason})
+    return result
+
+
+def sweep_reservist_panes(
+    adapter: TmuxAdapter, *, session: str | None = None
+) -> list[dict[str, Any]]:
+    """Fill-on-absence sweep over every reservist heartbeat seat.
+
+    The reservist analogue of :func:`sweep_persona_panes`, run by the daemon
+    reconcile (restart ``/reconcile`` AND on-demand). ``assert_reservist_seat`` is
+    idempotent — it no-ops a live seat and only seats a vacant one — so a repeated
+    reconcile never double-seats. One absent/erroring pane never aborts the rest of
+    the sweep.
+    """
+    results: list[dict[str, Any]] = []
+    for label in RESERVIST_LABELS:
+        try:
+            results.append(assert_reservist_seat(adapter, label, session=session))
+        except Exception as exc:  # noqa: BLE001 — one bad pane must not stop the sweep
+            results.append(
+                {"ok": False, "pane_label": label, "action": "error", "reason": str(exc)}
             )
     return results
 

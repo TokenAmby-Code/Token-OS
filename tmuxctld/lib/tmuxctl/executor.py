@@ -8,7 +8,6 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
-from pathlib import Path
 
 from .builder import build_workspace
 from .custodes import _pane_pid, pane_has_active_agent
@@ -478,18 +477,15 @@ done
     def _assert_persistent_runtime_panes(self, session_name: str) -> list[str]:
         """Best-effort post-rebuild repair for panes that should host daemons.
 
-        Persona seating is routed through the tmuxctld daemon (`POST /reconcile`),
-        the *sole* persona launcher — this process never seats personas in-process.
-        If the daemon is down, persona seating fails loudly rather than silently
+        Persona AND reservist seating are routed through the tmuxctld daemon
+        (`POST /reconcile`), the *sole* launcher — this process never seats either
+        in-process. If the daemon is down, seating fails loudly rather than silently
         falling back to a cold path. A read-only R2 liveness check still verifies
-        each seat actually hosts a live agent (tmux reads = observability; the
-        daemon owns every write/respawn).
-
-        The civic reservist pane stays in-process (the daemon has no reservist
-        launcher yet): `civic-thread fallthrough` injects through tmux-resume,
-        which requires an already-running agent TUI. If the reservist pane is only
-        a shell, seed a low-cost idle Claude in the Civic working dir; the
-        invariant can then deliver its activation prompt.
+        each persona and reservist seat actually hosts a live agent (tmux reads =
+        observability; the daemon owns every write/respawn). The reservist seats
+        converged onto the daemon reconcile with F3 — the old in-process
+        `dispatch --direct` writer was deleted because it raced the daemon respawn
+        and double-seated.
         """
         violations: list[str] = []
 
@@ -518,10 +514,14 @@ done
                     f"{result.get('action') or 'none'} {result.get('reason') or ''}".strip()
                 )
 
-        # R2 (read-only, observability — NOT seating): a persona seat counts only
-        # when its pane actually hosts a live agent. If the daemon launched any
-        # seat, allow a one-shot boot grace before checking liveness.
-        from .assertions import PERSONA_LABELS
+        # R2 (read-only, observability — NOT seating): a persona OR reservist seat
+        # counts only when its pane actually hosts a live agent. The daemon
+        # ``/reconcile`` above now seats BOTH (persona sweep + reservist sweep), so
+        # this process writes nothing — it only verifies. If the daemon launched any
+        # seat, allow a one-shot boot grace before checking liveness. Converged with
+        # the persona path: the retired ``dispatch --direct`` reservist writer would
+        # race the daemon respawn and double-seat.
+        from .assertions import PERSONA_LABELS, RESERVIST_LABELS
 
         if any(r.get("action") == "launched" for r in results):
             time.sleep(1.0)
@@ -533,87 +533,18 @@ done
             if not self._pane_has_agent_runtime(pane_id):
                 violations.append(f"persona pane has no live agent after assertion: {pane_label}")
 
-        for label, target, cwd, prompt in (
-            (
-                "civic reservist",
-                "reservists:civic",
-                Path(os.environ.get("CIVIC_THREAD_PATH", "/Volumes/Civic")),
-                "Stand by as the civic reservist runtime. Do not start new work. "
-                "Wait for civic-thread fallthrough or operator instructions.",
-            ),
-            (
-                "Token-OS reservist",
-                "reservists:token-os",
-                self._token_os_dir(),
-                "Stand by as the Token-OS reservist runtime. Do not start new work. "
-                "Wait for operator or orchestration instructions.",
-            ),
-        ):
-            try:
-                violation = self._ensure_reservist_runtime(label, target, cwd, prompt, session_name)
-                if violation:
-                    violations.append(violation)
-            except Exception as exc:
-                violations.append(f"{label} assertion failed: {exc}")
+        for pane_label in RESERVIST_LABELS:
+            pane_id = self._resolve_optional_pane(pane_label, session_name)
+            if not pane_id:
+                violations.append(f"reservist pane missing after assertion: {pane_label}")
+                continue
+            if not self._pane_has_agent_runtime(pane_id):
+                violations.append(f"reservist pane has no live agent after assertion: {pane_label}")
 
         return violations
 
-    def _ensure_reservist_runtime(
-        self,
-        label: str,
-        target: str,
-        working_dir: Path,
-        prompt: str,
-        session_name: str | None = None,
-    ) -> str:
-        pane_id = self._resolve_optional_pane(target, session_name)
-        if not pane_id:
-            return f"{label} pane missing after rebuild"
-        if self._pane_has_agent_runtime(pane_id):
-            return ""
-
-        if not working_dir.is_dir():
-            working_dir = Path.home()
-        dispatch_bin = self._dispatch_binary()
-        proc = subprocess.run(
-            [
-                dispatch_bin,
-                "--direct",
-                "--engine",
-                "claude",
-                "--model",
-                "sonnet",
-                "--pane",
-                pane_id,
-                "--dir",
-                str(working_dir),
-                "--instance-type",
-                "hook_driven",
-                "--no-gt",
-                "--prompt",
-                prompt,
-            ],
-            text=True,
-            capture_output=True,
-            timeout=45,
-            check=False,
-        )
-        if proc.returncode != 0:
-            stderr = proc.stderr.strip()[:160]
-            return f"{label} dispatch failed rc={proc.returncode}: {stderr}"
-        time.sleep(1.0)
-        if not self._pane_has_agent_runtime(pane_id):
-            return f"{label} launch did not appear to start"
-        return ""
-
     def _pane_has_agent_runtime(self, pane_id: str) -> bool:
         return pane_has_active_agent(_pane_pid(self.adapter, pane_id))
-
-    def _token_os_dir(self) -> Path:
-        imperium = os.environ.get("IMPERIUM")
-        if imperium:
-            return Path(imperium) / "runtimes" / "token-os" / "live"
-        return Path(__file__).resolve().parents[3]
 
     def _resolve_optional_pane(self, target: str, session_name: str | None = None) -> str:
         try:
@@ -622,17 +553,6 @@ done
             return resolve_pane(self.adapter, target, session_name=session_name).pane_id
         except Exception:
             return ""
-
-    def _dispatch_binary(self) -> str:
-        candidate = subprocess.run(
-            ["bash", "-lc", "command -v dispatch"],
-            text=True,
-            capture_output=True,
-            check=False,
-        ).stdout.strip()
-        if candidate:
-            return candidate
-        return str(Path(__file__).resolve().parents[2] / "bin" / "dispatch")
 
     def _localize_path(self, path: str) -> str:
         imperium = subprocess.run(

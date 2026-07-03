@@ -730,17 +730,23 @@ class TmuxControlPlane:
         return assert_instance(self.adapter, pane)
 
     def reconcile_personas(self, session: str | None = None) -> list[dict]:
-        """Re-seat every must-fill singleton persona seat against the live session.
+        """Re-seat every must-fill singleton persona AND reservist seat.
 
         The event-driven replacement for the retired 2-min ``assert-personas``
         poll: loops ``PERSONA_LABELS`` and asserts each — ``assert_instance``
         respawns the thin shim into any seat whose runtime is dead and no-ops a
-        healthy one (idempotent). Nothing polls this; the daemon reconciles only
-        when asked (restart completion, a persona ``pane-died`` event).
+        healthy one (idempotent). It then sweeps the two reservist heartbeat seats
+        the same way (fill-on-absence = "keep the pulse"), so restart ``/reconcile``
+        and any on-demand reconcile seat reservists too — the daemon is now the sole
+        reservist launcher, replacing the retired executor ``dispatch --direct``
+        writer. Nothing polls this; the daemon reconciles only when asked (restart
+        completion, a persona/reservist ``pane-died`` event).
         """
-        from .assertions import sweep_persona_panes
+        from .assertions import sweep_persona_panes, sweep_reservist_panes
 
-        return sweep_persona_panes(self.adapter, session=session)
+        return sweep_persona_panes(self.adapter, session=session) + sweep_reservist_panes(
+            self.adapter, session=session
+        )
 
     def assert_personas(self) -> list[dict]:
         """Deprecated alias for :meth:`reconcile_personas` (ambient session)."""
@@ -753,12 +759,14 @@ class TmuxControlPlane:
         persona singleton lost its agent → re-seat it (respawn the shim through
         ``assert_instance``). Stack-worker deaths are fill-if-row and handled by
         the existing stack reconcile, so they no-op here. Reservist deaths are
-        must-fill but have no persona launcher yet (follow-on), so they are noted,
-        not acted on. Never raises on an unknown/benign event.
+        must-fill and now re-seated too (respawn the standby agent through
+        ``assert_reservist_seat``; a fully-killed pane defers to F2's layout heal).
+        Never raises on an unknown/benign event.
         """
         from .assertions import (
             PERSONA_LABELS,
             assert_instance,
+            assert_reservist_seat,
             seat_vacancy_policy,
         )
         from .enums import SeatVacancyPolicy
@@ -790,12 +798,16 @@ class TmuxControlPlane:
                     "pane_label": pane_label,
                 }
 
-            # Reservist seat: must-fill, but no persona launcher exists yet. The
-            # restart executor seats reservists; mid-session refill is a follow-on.
+            # Reservist seat: must-fill heartbeat — REVIVE it on the low-latency
+            # death path (respawn the standby agent through the daemon-native
+            # reservist launcher; idempotent, boot-grace dedups). If the pane itself
+            # was fully killed, ``assert_reservist_seat`` returns ``pane_missing``
+            # and defers to F2's layout heal — this branch never recreates the pane.
+            result = assert_reservist_seat(self.adapter, pane_label, session=session)
             return {
-                "ok": True,
-                "action": "noted",
-                "reason": "reservist_refill_followon",
+                "ok": bool(result.get("ok")),
+                "action": result.get("action") or "none",
+                "reason": result.get("reason") or "",
                 "pane_label": pane_label,
             }
 

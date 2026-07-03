@@ -187,4 +187,9 @@ fi
 
 [[ -n "$STAPLE" ]] && claude_argv+=(--append-system-prompt "$STAPLE")
 
+# Reservist standby prompt (the "keep the pulse" instruction) rides as the engine's
+# first message. Set only for reservist seats; persona seats never pass it, so this
+# is a no-op on the persona path (regression-safe).
+[[ -n "${TOKEN_API_SEAT_INITIAL_PROMPT:-}" ]] && claude_argv+=("$TOKEN_API_SEAT_INITIAL_PROMPT")
+
 exec "$ENGINE_BIN" "${claude_argv[@]}"
