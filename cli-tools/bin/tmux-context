@@ -6,7 +6,7 @@
 1. Displays context % in Claude Code's status line
 2. Sets @CONTEXT_INFO pane option for tmux pane border display
 3. Writes per-pane state to /tmp/claude-panes/pane-{id}.json
-4. Nudges agent to plan mode at 250k token threshold (non-blocking)
+4. Reports context telemetry to Token-API's autonomous context governor
 
 Enriches display with Token-API instance data (chapter, session doc).
 
@@ -23,7 +23,6 @@ Configuration (settings.json):
 import json
 import os
 import subprocess
-import subprocess
 import sys
 import time
 import urllib.request
@@ -34,7 +33,7 @@ from context_pressure_message import context_full_message  # noqa: E402
 
 # --- Config ---
 STATE_DIR = "/tmp/claude-panes"
-FLUSH_TOKEN_THRESHOLD = 250_000  # used context tokens — nudge agent to plan mode for refocus
+FLUSH_TOKEN_THRESHOLD = 250_000  # legacy emergency rollback nudge threshold
 FLUSH_COOLDOWN = 86400  # seconds — once per context window (24h effectively permanent, reset on SessionStart)
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
@@ -98,6 +97,18 @@ def api_patch(path, data, timeout=1.5):
     try:
         body = json.dumps(data).encode()
         req = urllib.request.Request(f"{API_URL}{path}", data=body, method="PATCH")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def api_post(path, data, timeout=1.0):
+    """POST telemetry to Token-API. Best-effort; statusLine must never block."""
+    try:
+        body = json.dumps(data).encode()
+        req = urllib.request.Request(f"{API_URL}{path}", data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
@@ -245,6 +256,24 @@ def write_state(pane_id, data, pct, model_name, session_id, instance):
         pass
 
 
+def report_context_telemetry(pane_id, session_id, instance, pct, total_tokens, used_tokens, model_name):
+    """StatusLine is telemetry-only: report context pressure to Token-API policy."""
+    instance_id = (instance or {}).get("id") or session_id
+    if not instance_id:
+        return None
+    return api_post("/api/context-governor/telemetry", {
+        "instance_id": instance_id,
+        "session_id": session_id,
+        "pane": pane_id,
+        "engine": (instance or {}).get("engine") or "claude",
+        "used_tokens": used_tokens,
+        "used_percentage": pct,
+        "context_window_tokens": total_tokens,
+        "source": "claude-statusline",
+        "model": model_name,
+    })
+
+
 def check_pre_compact(pane_id, pct, total_tokens, planning_state=None):
     """If context crosses token threshold, nudge agent to plan mode for refocus. Non-blocking.
     Uses pct * total to derive actual context-window usage (not cumulative session tokens).
@@ -306,7 +335,10 @@ def main():
     total_tokens = ctx.get("context_window_size")
     input_tokens = ctx.get("total_input_tokens") or 0
     output_tokens = ctx.get("total_output_tokens") or 0
-    used_tokens = input_tokens + output_tokens
+    if pct is not None and total_tokens:
+        used_tokens = int(float(pct) * int(total_tokens) / 100.0)
+    else:
+        used_tokens = input_tokens + output_tokens
 
     cost = data.get("cost", {})
     cost_usd = cost.get("total_cost_usd")
@@ -351,9 +383,15 @@ def main():
     # --- 2. Write state file ---
     write_state(pane_id, data, pct, model_name, session_id, instance)
 
-    # --- 3. Check pre-compact threshold ---
-    planning_state = instance.get("planning_state") if instance else None
-    check_pre_compact(pane_id, pct, total_tokens, planning_state)
+    # --- 3. Report context telemetry to Token-API governor ---
+    report_context_telemetry(pane_id, session_id, instance, pct, total_tokens, used_tokens, model_name)
+
+    # Legacy advisory injection is intentionally disabled by default. Context
+    # enforcement now lives in Token-API policy + tmuxctld actuation; statusLine is
+    # telemetry-only. Set TMUX_CONTEXT_LEGACY_NUDGE=1 only for emergency rollback.
+    if os.environ.get("TMUX_CONTEXT_LEGACY_NUDGE") == "1":
+        planning_state = instance.get("planning_state") if instance else None
+        check_pre_compact(pane_id, pct, total_tokens, planning_state)
 
     # --- 4. Output status line for Claude Code ---
     color = context_color(pct)

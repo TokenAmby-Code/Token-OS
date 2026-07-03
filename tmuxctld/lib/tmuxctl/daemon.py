@@ -2922,6 +2922,62 @@ def _h_instance_unset_option(control, params):
     return control.instance_unset_option(_s(params, "instance_id"), _s(params, "option"))
 
 
+def _h_context_governor_inject(control, params):
+    """Daemon-owned actuation for Token-API context governor forced prompts."""
+    text = _s(params, "text")
+    pane = _s(params, "pane")
+    instance_id = _s(params, "instance_id")
+    target = pane
+    found = True
+    if not target and instance_id:
+        resolved = control.resolve_instance(instance_id)
+        found = bool(resolved.get("found"))
+        target = resolved.get("pane_id") or ""
+    if not target:
+        return {"instance_id": instance_id, "found": False, "status": "unresolved"}
+    result = _send_text_pipeline(
+        control,
+        pane=target,
+        text=text,
+        submit=_b(params, "submit", True),
+        clear_prompt=_b(params, "clear_prompt", False),
+        verify=_b(params, "verify", True),
+        operation_id=(
+            _s(params, "operation_id")
+            or (
+                f"context-governor:{instance_id}:{_s(params, 'stage')}:"
+                f"{hashlib.sha256(text.encode()).hexdigest()[:12]}"
+            )
+        ),
+        correlation_id=_s(params, "correlation_id"),
+    )
+    return {**result, "instance_id": instance_id, "found": found, "actuator": "context-governor"}
+
+
+def _h_context_governor_stop(control, params):
+    """No-progress stage: stop further autonomous input via daemon-owned actuation.
+
+    For singleton/orchestrator panes this is intentionally conservative: insert a
+    visible hard-stop handoff prompt rather than killing a pane. Worker lifecycle
+    closure remains available through /close when policy class support is expanded.
+    """
+    reason = _s(params, "reason") or "context_exhausted"
+    text = (
+        "Context governor hard stop: no compaction, handoff, plan submission, or "
+        "session-doc checkpoint was observed after the forced context warning. "
+        "Stop autonomous work now, preserve handoff state, and wait for supervisor routing. "
+        f"Reason: {reason}."
+    )
+    injected = _h_context_governor_inject(
+        control, {**params, "text": text, "stage": "no_progress_stop"}
+    )
+    if not injected.get("found", True) or injected.get("status") == "unresolved":
+        return {**injected, "status": "unresolved", "reason": reason}
+    if injected.get("ok") is False or injected.get("error"):
+        return {**injected, "reason": reason}
+    return {**injected, "status": "stopped_autonomous_input", "reason": reason}
+
+
 def _h_instance_send_text(control, params):
     instance_id = _s(params, "instance_id")
     if not _b(params, "submit", True):
@@ -3342,6 +3398,8 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     # Instance-id ops (POST)
     ("POST", "/instance/set-option"): _h_instance_set_option,
     ("POST", "/instance/unset-option"): _h_instance_unset_option,
+    ("POST", "/context-governor/inject"): _h_context_governor_inject,
+    ("POST", "/context-governor/stop"): _h_context_governor_stop,
     ("POST", "/instance/send-text"): _h_instance_send_text,
     ("POST", "/instance/tint"): _h_instance_tint,
     ("POST", "/instance/clear-tint"): _h_instance_clear_tint,

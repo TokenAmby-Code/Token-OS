@@ -15,6 +15,7 @@ _MODULES_TO_RELOAD = [
     "routes.voice",
     "routes.tts",
     "routes.day_start",
+    "context_governor",
     "routes.hooks",
     "stop_hook",
     "init_db",

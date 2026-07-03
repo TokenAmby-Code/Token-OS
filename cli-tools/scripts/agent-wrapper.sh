@@ -412,6 +412,13 @@ sync_shared_skills() {
   return 0
 }
 
+codex_native_auto_compact_args() {
+  [[ "${TOKEN_API_CODEX_NATIVE_AUTO_COMPACT:-1}" == "1" ]] || return 0
+  printf '%s\n' \
+    "-c" \
+    "model_auto_compact_token_limit=${TOKEN_API_CODEX_AUTO_COMPACT_TOKEN_LIMIT:-160000}"
+}
+
 run_codex() {
   if codex_legacy_subagent_mode "$@"; then
     run_codex_legacy_subagent "$@"
@@ -419,8 +426,8 @@ run_codex() {
 
   sync_shared_skills
 
-  local session_id bridge_id bridge_dir working_dir prompt resume_id bypass_flag output_file status=0
-  local -a codex_args
+  local session_id bridge_id bridge_dir working_dir prompt resume_id bypass_flag output_file status=0 _arg
+  local -a codex_args native_compact_args
   session_id="${TOKEN_API_SESSION_ID:-$(token_wrapper_uuid)}"
   bridge_id="${TOKEN_API_CODEX_BRIDGE_ID:-$WRAPPER_ID}"
   bridge_dir="${HOME}/.codex/session-bridges"
@@ -467,17 +474,23 @@ run_codex() {
     bypass_flag="--full-auto"
   fi
 
+  while IFS= read -r _arg; do
+    native_compact_args+=("$_arg")
+  done < <(codex_native_auto_compact_args)
+
   set +e
   if [[ "${CODEX_HEADLESS:-0}" == "1" ]]; then
     output_file="/tmp/codex-${session_id}.md"
     codex_args=(exec)
     [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_args+=(--profile "$TOKEN_API_CODEX_PROFILE")
+    codex_args+=("${native_compact_args[@]}")
     codex_args+=("$augmented_prompt" -C "$working_dir" "$bypass_flag" --json -o "$output_file")
     run_engine_binary codex "${codex_args[@]}"
     status=$?
   elif [[ -n "$resume_id" ]]; then
     codex_args=(resume -C "$working_dir" "$bypass_flag")
     [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_args+=(--profile "$TOKEN_API_CODEX_PROFILE")
+    codex_args+=("${native_compact_args[@]}")
     codex_args+=("$resume_id")
     [[ -n "$prompt" ]] && codex_args+=("$prompt")
     run_engine_binary codex "${codex_args[@]}"
@@ -485,6 +498,7 @@ run_codex() {
   elif [[ "${TOKEN_API_INTERNAL_DISPATCH:-0}" == "1" || "$LAUNCHER" == "dispatch" ]]; then
     codex_args=()
     [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_args+=(--profile "$TOKEN_API_CODEX_PROFILE")
+    codex_args+=("${native_compact_args[@]}")
     [[ -n "$augmented_prompt" ]] && codex_args+=("$augmented_prompt")
     codex_args+=(-C "$working_dir" "$bypass_flag")
     run_engine_binary codex "${codex_args[@]}"

@@ -35,6 +35,7 @@ from pydantic import BaseModel
 import ask_service
 import shared
 import talk as talk_service
+from context_governor import record_context_governor_progress
 from enforcement_service import close_distraction_windows
 from golden_throne_noop import (
     NO_OP_THRESHOLD,
@@ -4409,6 +4410,20 @@ async def handle_session_end(payload: dict) -> dict:
         # The wrapper is still alive: leave the row + stamp intact and let the
         # re-fire adopt it (clean stamp path; Layer 2 is the backstop).
         if end_reason in NON_TERMINAL_SESSION_END_REASONS:
+            if end_reason == "compact":
+                try:
+                    await record_context_governor_progress(
+                        session_id,
+                        "compaction_observed",
+                        source="SessionEnd",
+                        details={"reason": end_reason},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Context governor progress record failed for compact SessionEnd %s: %s",
+                        session_id,
+                        exc,
+                    )
             await log_event(
                 "instance_session_end_skipped",
                 instance_id=session_id,
