@@ -3741,6 +3741,13 @@ class TmuxctldServer(ThreadingHTTPServer):
         ``reconcile_pending_bindings`` is idempotent (no-op when canonical) and
         fail-open (no-op when tmux is unreachable); any failure is swallowed so
         /health never breaks. Returns True when the reconcile ran this call.
+
+        The reconcile runs synchronously on the health request but adds latency to
+        at most ONE /health per throttle interval (60s), and even then only bounded
+        cost: five 0.3s-capped ``list-keys`` reads plus, only on genuine drift, one
+        1.0s-capped ``source-file``. This is the same bounded/throttled profile as
+        the sibling pane-died ``maybe_reassert_lifecycle_hooks`` above — deliberately
+        on the heartbeat (no new poller; the daemon reconcile-poll ban stands).
         """
         now = time.monotonic()
         with self._binding_reconcile_lock:

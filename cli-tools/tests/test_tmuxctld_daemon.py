@@ -30,6 +30,7 @@ from tmuxctl import service as tmux_service
 # restore the genuine methods the autouse guard stubs out.
 _REAL_MAYBE_REASSERT = daemon.TmuxctldServer.maybe_reassert_lifecycle_hooks
 _REAL_MAYBE_RECONCILE_BINDINGS = daemon.TmuxctldServer.maybe_reconcile_guard_bindings
+_REAL_RECONCILE_PENDING_BINDINGS = daemon.typing_guard_state.reconcile_pending_bindings
 
 
 @pytest.fixture(autouse=True)
@@ -56,9 +57,16 @@ def _no_live_tmux_guard(monkeypatch, tmp_path):
     # (ensure_tmux_lifecycle_hooks itself is left intact for the startup tests.)
     monkeypatch.setattr(daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", lambda self: False)
     # /health also reconciles the permanent guard bindings (shells real tmux).
-    # Neutralise it module-wide too; the dedicated reconcile tests restore the real
-    # method. (reconcile_pending_bindings itself is left intact for its unit tests.)
+    # Neutralise BOTH the heartbeat entry point AND the underlying reconcile
+    # module-wide, so no test can shell real tmux through this path even if it drives
+    # the reconcile directly. The dedicated reconcile tests restore the real
+    # callables (via _REAL_MAYBE_RECONCILE_BINDINGS / _REAL_RECONCILE_PENDING_BINDINGS).
     monkeypatch.setattr(daemon.TmuxctldServer, "maybe_reconcile_guard_bindings", lambda self: False)
+    monkeypatch.setattr(
+        daemon.typing_guard_state,
+        "reconcile_pending_bindings",
+        lambda *a, **k: {"reconciled": False, "changed": False, "drifted": [], "checked": {}},
+    )
 
 
 class StubAdapter:
@@ -1127,11 +1135,14 @@ def _pending_bindings_fake_tmux(live: dict):
     return FakeTmux(), calls
 
 
-def test_reconcile_pending_bindings_resources_stale_display_message_table() -> None:
+def test_reconcile_pending_bindings_resources_stale_display_message_table(monkeypatch) -> None:
     """DEPLOY-COHERENCE (red-first): a live root table can carry the OLD flashing
     Enter form while the daemon SHA is already advanced — SHA-green health does NOT
     imply a canonical key-table. reconcile detects the drift and re-sources (one
     source-file), and a second pass is a no-op (idempotent) once canonical."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
     tg = daemon.typing_guard_state
     live = dict(_PENDING_CANONICAL)
     live["Enter"] = _ENTER_STALE_DISPLAY_MESSAGE
@@ -1152,9 +1163,12 @@ def test_reconcile_pending_bindings_resources_stale_display_message_table() -> N
     assert not any(c and c[0] == "source-file" for c in calls)
 
 
-def test_reconcile_pending_bindings_resources_bare_redirect_form() -> None:
+def test_reconcile_pending_bindings_resources_bare_redirect_form(monkeypatch) -> None:
     """The #559 bare-`>/dev/null 2>&1` form (no `|| true`) is stale too — tmux still
     flashes `'<cmd>' returned <N>` on a nonzero ping — so it must re-source."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
     tg = daemon.typing_guard_state
     live = dict(_PENDING_CANONICAL)
     live["Enter"] = _ENTER_STALE_BARE_REDIRECT
@@ -1166,8 +1180,11 @@ def test_reconcile_pending_bindings_resources_bare_redirect_form() -> None:
     assert sum(1 for c in calls if c and c[0] == "source-file") == 1
 
 
-def test_reconcile_pending_bindings_noop_when_canonical() -> None:
+def test_reconcile_pending_bindings_noop_when_canonical(monkeypatch) -> None:
     """A fully-canonical live table is a no-op: no source-file, reconciled=False."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
     tg = daemon.typing_guard_state
     fake, calls = _pending_bindings_fake_tmux(dict(_PENDING_CANONICAL))
 
@@ -1177,9 +1194,12 @@ def test_reconcile_pending_bindings_noop_when_canonical() -> None:
     assert not any(c and c[0] == "source-file" for c in calls)
 
 
-def test_reconcile_pending_bindings_failopen_when_tmux_unreachable() -> None:
+def test_reconcile_pending_bindings_failopen_when_tmux_unreachable(monkeypatch) -> None:
     """No key resolvable (tmux mid-restart / unreachable) => fail-open: never source
     into a server whose state we cannot read."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
     tg = daemon.typing_guard_state
     fake, calls = _pending_bindings_fake_tmux({})  # every list-keys returns rc=1
 
@@ -1189,9 +1209,12 @@ def test_reconcile_pending_bindings_failopen_when_tmux_unreachable() -> None:
     assert not any(c and c[0] == "source-file" for c in calls)
 
 
-def test_reconcile_pending_bindings_resources_edit_key_missing_short_circuit() -> None:
+def test_reconcile_pending_bindings_resources_edit_key_missing_short_circuit(monkeypatch) -> None:
     """An edit key reverted to an always-ping form (no @TYPING_GUARD_KIND
     short-circuit) is non-canonical and re-sources."""
+    monkeypatch.setattr(
+        daemon.typing_guard_state, "reconcile_pending_bindings", _REAL_RECONCILE_PENDING_BINDINGS
+    )
     tg = daemon.typing_guard_state
     live = dict(_PENDING_CANONICAL)
     live["C-c"] = (
