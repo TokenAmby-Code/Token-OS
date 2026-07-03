@@ -150,7 +150,8 @@ def test_hard_threshold_injects_once_and_debounces_storms(app_env, monkeypatch):
     second = asyncio.run(cg.ingest_context_telemetry(req))
 
     assert first["action"] == "forced_injection"
-    assert second["action"] == "debounced"
+    assert second["action"] == "event_gate_suppressed"
+    assert second["gate_reason"] == "already_fired"
     assert len(calls) == 1
     assert calls[0]["instance_id"] == "worker-hard"
     assert calls[0]["pane"] == "%102"
@@ -350,3 +351,186 @@ def test_no_progress_sweep_ignores_historical_progress_before_injection(app_env,
     sweep = asyncio.run(cg.sweep_context_governor())
     assert sweep["exhausted_count"] == 1
     assert stops and stops[0]["instance_id"] == "worker-old-progress"
+
+
+def test_soft_checkpoint_directive_suppresses_after_checkpoint_without_new_work(
+    app_env, monkeypatch
+):
+    cg = sys.modules["context_governor"]
+    shared = sys.modules["shared"]
+    _insert_instance(app_env.db_path, "worker-soft-gate", automated=1, origin_type="dispatch")
+    _patch_panes(monkeypatch, shared, {"worker-soft-gate": "%109"})
+
+    req = cg.ContextTelemetryRequest(
+        instance_id="worker-soft-gate",
+        session_id="sess-soft-gate",
+        pane="%109",
+        engine="claude",
+        used_tokens=140_000,
+        context_window_tokens=200_000,
+        source="unit",
+    )
+    first = asyncio.run(cg.ingest_context_telemetry(req))
+    assert first["action"] == "armed_stop_subscription"
+
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        "UPDATE stop_hook_subscriptions SET status = 'delivered' "
+        "WHERE target_instance_id = 'worker-soft-gate' AND purpose = 'context_governor_stop'"
+    )
+    conn.commit()
+    conn.close()
+
+    asyncio.run(cg.record_context_governor_progress("worker-soft-gate", "session_doc_checkpoint"))
+    second = asyncio.run(cg.ingest_context_telemetry(req))
+
+    assert second["action"] == "event_gate_suppressed"
+    assert second["gate_reason"] == "checkpoint_current"
+    conn = sqlite3.connect(app_env.db_path)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM stop_hook_subscriptions "
+        "WHERE target_instance_id = 'worker-soft-gate' AND purpose = 'context_governor_stop'"
+    ).fetchone()[0]
+    conn.close()
+    assert count == 1
+
+
+def test_hard_checkpoint_injection_suppresses_after_checkpoint_without_new_work(
+    app_env, monkeypatch
+):
+    cg = sys.modules["context_governor"]
+    shared = sys.modules["shared"]
+    _insert_instance(app_env.db_path, "worker-hard-gate", automated=1, origin_type="dispatch")
+    _patch_panes(monkeypatch, shared, {"worker-hard-gate": "%110"})
+    calls: list[dict[str, Any]] = []
+
+    async def fake_actuate(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "result": {"status": "sent"}}
+
+    monkeypatch.setattr(cg, "_tmuxctld_context_governor_inject", fake_actuate)
+
+    req = cg.ContextTelemetryRequest(
+        instance_id="worker-hard-gate",
+        session_id="sess-hard-gate",
+        pane="%110",
+        engine="claude",
+        used_tokens=170_000,
+        context_window_tokens=200_000,
+        source="unit",
+        no_progress_ttl_seconds=0,
+    )
+    first = asyncio.run(cg.ingest_context_telemetry(req))
+    asyncio.run(cg.record_context_governor_progress("worker-hard-gate", "session_doc_checkpoint"))
+    second = asyncio.run(cg.ingest_context_telemetry(req))
+
+    assert first["action"] == "forced_injection"
+    assert second["action"] == "event_gate_suppressed"
+    assert second["gate_reason"] == "checkpoint_current"
+    assert len(calls) == 1
+
+
+def test_context_gate_rearms_after_meaningful_activity_after_checkpoint(app_env, monkeypatch):
+    cg = sys.modules["context_governor"]
+    shared = sys.modules["shared"]
+    _insert_instance(app_env.db_path, "worker-rearm-activity", automated=1, origin_type="dispatch")
+    _patch_panes(monkeypatch, shared, {"worker-rearm-activity": "%111"})
+    calls: list[dict[str, Any]] = []
+
+    async def fake_actuate(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "result": {"status": "sent"}}
+
+    monkeypatch.setattr(cg, "_tmuxctld_context_governor_inject", fake_actuate)
+    req = cg.ContextTelemetryRequest(
+        instance_id="worker-rearm-activity",
+        session_id="sess-rearm-activity",
+        pane="%111",
+        used_tokens=170_000,
+    )
+    asyncio.run(cg.ingest_context_telemetry(req))
+    asyncio.run(
+        cg.record_context_governor_progress("worker-rearm-activity", "session_doc_checkpoint")
+    )
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        "UPDATE instances SET last_activity = '2999-01-01T00:00:00' "
+        "WHERE id = 'worker-rearm-activity'"
+    )
+    conn.commit()
+    conn.close()
+
+    second = asyncio.run(cg.ingest_context_telemetry(req))
+    third = asyncio.run(cg.ingest_context_telemetry(req))
+
+    assert second["action"] == "forced_injection"
+    assert second["gate_reason"] == "meaningful_activity_after_checkpoint"
+    assert third["action"] == "event_gate_suppressed"
+    assert third["gate_reason"] == "checkpoint_current"
+    assert len(calls) == 2
+
+
+def test_context_gate_rearms_on_higher_context_band_without_new_work(app_env, monkeypatch):
+    cg = sys.modules["context_governor"]
+    shared = sys.modules["shared"]
+    _insert_instance(app_env.db_path, "worker-rearm-band", automated=1, origin_type="dispatch")
+    _patch_panes(monkeypatch, shared, {"worker-rearm-band": "%112"})
+    calls: list[dict[str, Any]] = []
+
+    async def fake_actuate(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "result": {"status": "sent"}}
+
+    monkeypatch.setattr(cg, "_tmuxctld_context_governor_inject", fake_actuate)
+    soft = cg.ContextTelemetryRequest(
+        instance_id="worker-rearm-band",
+        session_id="sess-rearm-band",
+        pane="%112",
+        used_tokens=140_000,
+    )
+    hard = cg.ContextTelemetryRequest(
+        instance_id="worker-rearm-band",
+        session_id="sess-rearm-band",
+        pane="%112",
+        used_tokens=170_000,
+    )
+    first = asyncio.run(cg.ingest_context_telemetry(soft))
+    asyncio.run(cg.record_context_governor_progress("worker-rearm-band", "session_doc_checkpoint"))
+    second = asyncio.run(cg.ingest_context_telemetry(hard))
+
+    assert first["action"] == "armed_stop_subscription"
+    assert second["action"] == "forced_injection"
+    assert second["gate_reason"] == "higher_context_band"
+    assert len(calls) == 1
+
+
+def test_custodes_opus_is_excluded_from_context_governor_hooks(app_env, monkeypatch):
+    cg = sys.modules["context_governor"]
+    shared = sys.modules["shared"]
+    _insert_instance(
+        app_env.db_path,
+        "custodes-opus",
+        automated=1,
+        hook_driven=1,
+        origin_type="perpetual",
+        persona_slug="custodes",
+    )
+    _patch_panes(monkeypatch, shared, {"custodes-opus": "%113"})
+
+    async def boom(**kwargs):
+        raise AssertionError("Custodes(Opus) must be excluded from context-governor actuation")
+
+    monkeypatch.setattr(cg, "_tmuxctld_context_governor_inject", boom)
+    result = asyncio.run(
+        cg.ingest_context_telemetry(
+            cg.ContextTelemetryRequest(
+                instance_id="custodes-opus",
+                pane="%113",
+                used_tokens=200_000,
+            )
+        )
+    )
+
+    assert result["action"] == "telemetry_only"
+    assert result["scoped"] is False
+    assert result["scope_reason"] == "custodes_opus_context_hook_exempt"
