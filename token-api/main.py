@@ -18741,10 +18741,19 @@ def _cd_spawn_detached(cmd: list[str], *, log_name: str) -> None:
 
 
 async def _cd_flip_pr_merged(pr_url: str) -> int:
-    """Flip pr_state→merged for instances whose pr_url matches the merged PR."""
+    """Flip pr_state→merged for instances whose pr_url matches the merged PR.
+
+    Covers a NULL pr_state as well as 'open': a merged mark stamps pr_url and
+    pr_state together, so a row can carry pr_url while its earlier 'open' mark
+    never landed.  Restricting to pr_state='open' silently stranded those rows
+    as pr_state=NULL, defeating the durable merge signal WrapperEnd relies on to
+    tear down a squash-merged worktree (a squash rewrites the SHA, so git
+    ancestry can never prove the merge).  Idempotent: never re-flips
+    merged/closed.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id FROM instances WHERE pr_url = ? AND pr_state = 'open'",
+            "SELECT id FROM instances WHERE pr_url = ? AND (pr_state IS NULL OR pr_state = 'open')",
             (pr_url,),
         )
         ids = [r[0] for r in await cursor.fetchall()]

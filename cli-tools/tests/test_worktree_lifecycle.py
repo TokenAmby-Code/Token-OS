@@ -524,6 +524,109 @@ def test_wrapperend_handler_removes_worktree_without_pane_kill(
     assert all("kill-pane" not in command for command in control.adapter.commands)
 
 
+def _bare_branch_exists(project: Project, branch: str) -> bool:
+    return _git("--git-dir", str(project.bare), "branch", "--list", branch, env=project.env) != ""
+
+
+def _commit_divergent(project: Project, wt: Path, text: str) -> None:
+    """Commit on the worktree branch so its tip is NOT an ancestor of main.
+
+    This is the squash-merge shape: the branch carries commits that a squash
+    rewrote into a new SHA on main, so ``git merge-base --is-ancestor`` can
+    never prove the merge — only a durable ``pr_state=merged`` marker can.
+    """
+    (wt / "squashed-work.txt").write_text(text, encoding="utf-8")
+    _git("add", "-A", cwd=wt, env=project.env)
+    _git("commit", "-m", text, cwd=wt, env=project.env)
+
+
+def test_wrapperend_prunes_branch_ref_on_merged_removal(project: Project) -> None:
+    """Removing a provably-merged worktree also prunes its (now-merged) branch
+    ref from the bare — refs must not accumulate after teardown."""
+    from tmuxctl.worktree_lifecycle import cleanup_worktree_on_wrapper_end
+
+    res = project.setup("ref-merged")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-ref-merged"
+    assert _bare_branch_exists(project, "ref-merged")
+
+    result = cleanup_worktree_on_wrapper_end(
+        wt,
+        instance={"id": "inst-refmerged", "pr_state": "merged", "working_dir": str(wt)},
+    )
+
+    assert result["status"] == "removed"
+    assert not wt.exists()
+    assert not _bare_branch_exists(project, "ref-merged"), (
+        "merged branch ref must be pruned alongside the worktree"
+    )
+
+
+def test_wrapperend_deletes_squash_merged_via_pr_state(project: Project) -> None:
+    """The #543 cleanup fires for a squash-merged branch: git can't prove the
+    merge (tip is not an ancestor of main), but pr_state=merged is ground truth
+    → worktree removed and branch ref pruned."""
+    from tmuxctl.worktree_lifecycle import cleanup_worktree_on_wrapper_end
+
+    res = project.setup("squash-yes")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-squash-yes"
+    _commit_divergent(project, wt, "squash-yes-body")
+
+    result = cleanup_worktree_on_wrapper_end(
+        wt,
+        instance={"id": "inst-sqyes", "pr_state": "merged", "working_dir": str(wt)},
+    )
+
+    assert result["status"] == "removed"
+    assert result["merge_reason"] == "instance_pr_state_merged"
+    assert not wt.exists()
+    assert not _bare_branch_exists(project, "squash-yes")
+
+
+def test_wrapperend_preserves_squash_merged_without_pr_state(project: Project) -> None:
+    """The exact #538 fail-safe: a squash-merged branch whose instance row has
+    NO pr_state can't be proven merged → preserved, branch ref survives."""
+    from tmuxctl.worktree_lifecycle import cleanup_worktree_on_wrapper_end
+
+    res = project.setup("squash-no")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-squash-no"
+    _commit_divergent(project, wt, "squash-no-body")
+
+    result = cleanup_worktree_on_wrapper_end(
+        wt,
+        instance={"id": "inst-sqno", "working_dir": str(wt)},
+    )
+
+    assert result["status"] == "preserved"
+    assert result["reason"] == "branch_not_merged"
+    assert result["merge_reason"] == "unproven"
+    assert wt.exists(), "unprovable squash-merge must be preserved (fail-safe)"
+    assert _bare_branch_exists(project, "squash-no"), "preserved branch ref must survive"
+
+
+def test_wrapperend_preserves_closed_pr_state(project: Project) -> None:
+    """pr_state=closed never authorizes removal, even on a clean worktree."""
+    from tmuxctl.worktree_lifecycle import cleanup_worktree_on_wrapper_end
+
+    res = project.setup("pr-closed")
+    assert res.returncode == 0, res.stderr
+    wt = project.parent / "wt-pr-closed"
+    _commit_divergent(project, wt, "closed-body")
+
+    result = cleanup_worktree_on_wrapper_end(
+        wt,
+        instance={"id": "inst-closed", "pr_state": "closed", "working_dir": str(wt)},
+    )
+
+    assert result["status"] == "preserved"
+    assert result["reason"] == "branch_not_merged"
+    assert result["merge_reason"] == "instance_pr_state_closed"
+    assert wt.exists()
+    assert _bare_branch_exists(project, "pr-closed")
+
+
 def test_pr_step_and_pr_merge_do_not_remove_worktrees() -> None:
     """Regression: pr-step/pr-merge may merge, but worktree removal is not in
     their execution path; WrapperEnd is the only owner of teardown."""
