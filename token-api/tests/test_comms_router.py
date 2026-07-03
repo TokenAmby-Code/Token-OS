@@ -247,17 +247,17 @@ def test_phone_direct_tts_only_occurs_inside_the_router(monkeypatch):
 
     result = tts.speak_tts("away from home")
 
-    assert any(p.get("tts_text") == "away from home" for _e, p in sent)
+    assert any(p.get("current_chunk") == "away from home" for _e, p in sent)
     assert result.get("success") is True
     assert result.get("method") == "phone"
     assert result.get("route") == "phone"
 
 
-def test_phone_tts_targets_speak_endpoint_with_playback_id(monkeypatch: Any) -> None:
-    """The phone utterance MUST go to the device's ``/speak`` macro, not ``/notify``.
+def test_phone_tts_targets_chunk_endpoint_with_playback_id(monkeypatch: Any) -> None:
+    """The phone utterance MUST go to the device's ``/tts-chunk`` executor, not ``/notify``.
 
     The phone exposes a single keystone TTS atom at
-    ``GET /speak?tts_text=…&playback_id=…`` (m_waitToFinish:true) that fast-acks,
+    ``GET /tts-chunk?current_chunk=…&next_chunk=…&playback_id=…`` (m_waitToFinish:true) that fast-acks,
     speaks locally, then POSTs ``/api/tts/playback-complete`` at true speech end.
     The phone exposes NO ``/notify`` HTTP macro, so a ``/notify`` send never
     triggers speech and every line would silently fall to the watchdog. This guard
@@ -282,11 +282,12 @@ def test_phone_tts_targets_speak_endpoint_with_playback_id(monkeypatch: Any) -> 
 
     result = tts.speak_tts("contract line")
 
-    speak_calls = [(e, p) for e, p in sent if e == "/speak"]
-    assert speak_calls, f"expected a /speak send, got endpoints {[e for e, _ in sent]}"
+    chunk_calls = [(e, p) for e, p in sent if e == "/tts-chunk"]
+    assert chunk_calls, f"expected a /tts-chunk send, got endpoints {[e for e, _ in sent]}"
     assert not any(e == "/notify" for e, _ in sent), "TTS must not use the dead /notify path"
-    endpoint, params = speak_calls[0]
-    assert params.get("tts_text") == "contract line"
+    assert not any(e == "/speak" for e, _ in sent), "TTS must not use the retired /speak path"
+    endpoint, params = chunk_calls[0]
+    assert params.get("current_chunk") == "contract line"
     pid = params.get("playback_id")
     assert isinstance(pid, str) and pid, "a per-utterance opaque playback_id is required"
     assert result.get("route") == "phone"
@@ -344,19 +345,13 @@ def test_discord_fallthrough_respects_geofence_phone_only(monkeypatch: Any) -> N
 
     result = tts.speak_tts("away discord fallback")
 
-    assert result.get("success") is True
-    assert result.get("method") == "phone"
-    assert result.get("route") == "phone"
-    assert any(p.get("tts_text") == "away discord fallback" for _e, p in sent)
+    assert result.get("success") is False
+    assert result.get("route") is None
+    assert sent == []
 
 
-def test_retired_wsl_route_fails_closed_not_false_success(monkeypatch: Any) -> None:
-    """A stale WSL routing decision must not claim successful phone delivery.
-
-    Phone-first retired WSL from the live cascade. If a monkeypatched/stale route
-    still names WSL, the router fails closed with no method/route instead of
-    recreating the old false-success shape.
-    """
+def test_wsl_route_attempts_wsl_not_phone_or_mac_false_success(monkeypatch: Any) -> None:
+    """A WSL route is first-class but must not silently fall to phone or Mac."""
     tts = _load("routes.tts")
     sent = []
 
@@ -374,13 +369,18 @@ def test_retired_wsl_route_fails_closed_not_false_success(monkeypatch: Any) -> N
     monkeypatch.setattr(tts, "_phone_tts_available", lambda: True)
     monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
 
+    def fake_post(*args, **kwargs):
+        raise tts.requests.ConnectionError("offline")
+
+    monkeypatch.setattr(tts.requests, "post", fake_post)
+
     result = tts.speak_tts("wsl fallback")
 
     assert result.get("success") is False
     assert result.get("requested_device") == "wsl"
-    assert result.get("method") is None
+    assert result.get("method") == "wsl_sapi_chunk"
     assert result.get("route") is None
-    assert result.get("reason") == "unknown_playback_backend"
+    assert result.get("reason") == "satellite_unreachable"
     assert sent == []
 
 

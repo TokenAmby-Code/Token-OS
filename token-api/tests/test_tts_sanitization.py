@@ -68,14 +68,14 @@ def test_speak_tts_sanitizes_once_before_backend_fanout(monkeypatch) -> None:
     monkeypatch.setattr(
         tts,
         "resolve_tts_device",
-        lambda *a, **k: {"device": "mac", "reason": "unit test", "discord_bot": None},
+        lambda *a, **k: {"device": "wsl", "reason": "unit test", "discord_bot": None},
     )
 
-    def fake_mac(message: str, voice: str | None = None, rate: int = 0) -> dict:
-        spoken.append(message)
-        return {"success": True, "method": "macos_say", "message": message[:50]}
+    def fake_dispatch(backend: str, chunks: list[dict], **kwargs) -> dict:
+        spoken.extend(chunk["text"] for chunk in chunks)
+        return {"success": True, "method": backend, "chunks": len(chunks)}
 
-    monkeypatch.setattr(tts, "speak_tts_mac", fake_mac)
+    monkeypatch.setattr(tts, "dispatch_tts_chunks_to_backend", fake_dispatch)
 
     result = tts.speak_tts(
         "Ship /Volumes/Imperium/Mars/Bugs/tmux-foo-bar.md after c68a314ef4394bb9dc73dae2e2b5d50857a7b625"

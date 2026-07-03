@@ -1979,10 +1979,28 @@ class TTSSynthesizeRequest(BaseModel):
 
 class TTSControlRequest(BaseModel):
     command: str  # pause, resume, stop, toggle, restart
+    speed: float | None = None
 
 
 class TTSSynthAndPlayRequest(BaseModel):
     message: str
+    voice: str = "Microsoft David"
+    rate: int = 0
+
+
+class TTSChunkRequest(BaseModel):
+    session_id: str | None = None
+    playback_id: str
+    utterance_id: str | None = None
+    chunk_id: str
+    current_index: int | None = None
+    current_chunk: str | None = None
+    current_chunk_text: str | None = None
+    next_index: int | None = None
+    next_chunk: str | None = None
+    next_chunk_text: str | None = None
+    speed: float | None = None
+    message: str | None = None
     voice: str = "Microsoft David"
     rate: int = 0
 
@@ -2002,6 +2020,38 @@ async def tts_control(request: TTSControlRequest):
     """Transport control for SAPI speech (pause/resume/stop). Non-blocking."""
     logger.info(f"TTS control: {request.command}")
     return tts_engine.play_control(request.command)
+
+
+@app.post("/tts/chunk")
+def tts_chunk(request: TTSChunkRequest):
+    """Uniform Token-OS chunk-dispatch surface for the WSL backend."""
+    message = request.current_chunk or request.current_chunk_text or request.message or ""
+    if not message:
+        return {"success": False, "error": "empty_chunk", "chunk_id": request.chunk_id}
+    if tts_engine.is_speaking or tts_engine._playing:
+        raise HTTPException(status_code=409, detail="TTS engine is busy")
+    logger.info(
+        f"TTS chunk: {request.chunk_id} index={request.current_index} chars={len(message)} voice={request.voice}"
+    )
+    result = tts_engine.synth_and_speak(message, request.voice, request.rate)
+    method = "skipped" if result.get("skipped") else "wsl_sapi_chunk"
+    return {
+        "success": result.get("success", False),
+        "skipped": result.get("skipped", False),
+        "method": method,
+        "voice": request.voice,
+        "session_id": request.session_id,
+        "playback_id": request.playback_id,
+        "chunk_id": request.chunk_id,
+        "current_index": request.current_index,
+        "next_index": request.next_index,
+        "file_id": result.get("file_id"),
+        "transport": result.get("transport"),
+        "message_chars": len(message),
+        "rendered_chars": result.get("rendered_chars"),
+        "rendered_hash": result.get("rendered_hash"),
+        "message_preview": message[:50],
+    }
 
 
 @app.post("/tts/synth-and-play")

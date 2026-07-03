@@ -18,7 +18,7 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 ```
 
 - Mac proxies to WSL via `DESKTOP_CONFIG` for enforcement and `/satellite/restart`
-- **TTS routing**: WSL-first (Windows SAPI voices) with Mac `say` fallback. Satellite availability cached with 30s TTL health probes. Mobile sessions use webhook notifications instead (no TTS queue).
+- **TTS routing**: Token-API owns authoritative TTS state/queue/control. Execution backends are `{phone, WSL, later Linux}`; Mac `say` is not a TTS backend and must not be used as fallback. Phone-first is situational (away/mobile); WSL remains first-class at the desk. Sanitization happens server-side at `speak_tts`, then chunking/enqueue/backend dispatch.
 - `token-restart` orchestrates Mac restart → WSL restart
 - Android/browser clients can reach the Mac API over Tailscale. New rich visualization work should target the local TypeScript web cockpit at `/ui/ops`.
 - 15s startup grace period ignores silence detections after server restart (AHK restart race)
@@ -223,6 +223,7 @@ GET    /health                          # Heartbeat (includes tts_engine + kvm_w
 POST   /enforce                         # Close Windows process by alias
 GET    /processes                       # List distraction-relevant processes
 POST   /tts/speak                       # Speak via Windows SAPI (blocking, persistent PS engine)
+POST   /tts/chunk                       # Token-OS chunk-dispatch contract (current + one next chunk)
 POST   /tts/skip                        # Skip current TTS playback
 GET    /kvm/status                      # DeskFlow watchdog state (state, mac_reachable, deskflow_running)
 POST   /kvm/control                     # Manual DeskFlow control (action: start|reload|stop|hold, hold_minutes: 30)
