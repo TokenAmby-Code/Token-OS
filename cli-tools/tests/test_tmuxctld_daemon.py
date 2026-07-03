@@ -6,6 +6,7 @@ representative endpoint, and 404 on an unknown route."""
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import socket
 import sqlite3
@@ -43,6 +44,8 @@ def _no_live_tmux_guard(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
     monkeypatch.setattr(daemon.send_gate, "evaluate", lambda *a, **k: None)
     monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
+    monkeypatch.setenv("TMUXCTLD_CALLBACKS_PATH", str(tmp_path / "callbacks.json"))
+    monkeypatch.setattr(daemon, "_PROMPT_SUBMIT_SNIFFER", daemon.PromptSubmitSniffer())
     wrapper_ledger.LEDGER._rows = {}
     wrapper_ledger.LEDGER._loaded = False
     wrapper_ledger.LEDGER.load(force=True)
@@ -1515,6 +1518,107 @@ def test_send_text_pending_turn_registers_one_late_hook_echo() -> None:
         assert len(echo_literal_calls) == 1
     finally:
         server.shutdown()
+
+
+def test_pending_hook_echo_survives_sniffer_rehydrate_and_server_restart(
+    tmp_path, monkeypatch
+) -> None:
+    callbacks_path = tmp_path / "callbacks.json"
+    SendAckAdapter.calls = []
+    first = daemon.PromptSubmitSniffer(
+        callbacks_path=callbacks_path,
+        callback_ttl_seconds=60,
+    )
+    callback = first.register_callback(
+        correlation_id="corr-restart",
+        caller_pane="%99",
+        target_pane="%42",
+        target_label="target-label",
+        instance_id="",
+        payload_hash="hash-restart",
+        since=time.monotonic() - 1,
+    )
+    assert callback is not None
+    assert callbacks_path.exists()
+
+    second = daemon.PromptSubmitSniffer(
+        callbacks_path=callbacks_path,
+        callback_ttl_seconds=60,
+    )
+    monkeypatch.setattr(daemon, "_PROMPT_SUBMIT_SNIFFER", second)
+    server, _ = _serve(SendAckAdapter)
+    try:
+        _, ack = _post(
+            server,
+            "/hooks/user-prompt-submit",
+            {"pane": "%42", "prompt_hash": "hash-restart"},
+        )
+        assert ack["ok"] is True
+        assert len(ack["result"]["hook_echoes"]) == 1
+        assert ack["result"]["hook_echoes"][0]["correlation_id"] == "corr-restart"
+        echo_literal_calls = [
+            c
+            for c in SendAckAdapter.calls
+            if c[:4] == ("send-keys", "-t", "%99", "-l") and "correlation_id=corr-restart" in c[4]
+        ]
+        assert len(echo_literal_calls) == 1
+    finally:
+        server.shutdown()
+
+
+def test_pending_hook_echo_past_ttl_is_discarded_and_not_fired(tmp_path, monkeypatch) -> None:
+    callbacks_path = tmp_path / "callbacks.json"
+    now = {"value": 1000.0}
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: now["value"])
+    sniffer = daemon.PromptSubmitSniffer(
+        callbacks_path=callbacks_path,
+        callback_ttl_seconds=10,
+    )
+    assert sniffer.register_callback(
+        correlation_id="corr-stale",
+        caller_pane="%99",
+        target_pane="%42",
+        target_label="target-label",
+        instance_id="",
+        payload_hash="hash-stale",
+        since=999.0,
+    )
+
+    now["value"] = 1011.0
+    event = {"pane": "%42", "prompt_hash": "hash-stale", "at": 1011.0}
+    assert sniffer.pop_matching_callbacks(event) == []
+    assert json.loads(callbacks_path.read_text())["callbacks"] == []
+
+
+def test_tmuxctld_server_adopts_activated_listen_fd(monkeypatch) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    activated_fd = os.dup(listener.fileno())
+    monkeypatch.setattr(daemon, "_activated_listen_fd", lambda: (activated_fd, "test-listen-fd"))
+    server = daemon.TmuxctldServer(
+        ("127.0.0.1", port),
+        adapter_factory=StubAdapter,
+        version="9.9.9",
+        sha="deadbee",
+        advertised_port=port,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert server.socket_activation_source == "test-listen-fd"
+        assert server.server_address[1] == port
+        assert server.ready.wait(timeout=5), "server thread never signalled ready"
+        status, payload = _get(server, "/health")
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["port"] == port
+    finally:
+        server.shutdown()
+        server.server_close()
+        listener.close()
 
 
 class CodexQueuedUserMessageAdapter(SendAckAdapter):

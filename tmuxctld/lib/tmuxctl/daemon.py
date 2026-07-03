@@ -34,8 +34,10 @@ import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -71,6 +73,9 @@ from .tmux_adapter import (
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7778
+CALLBACKS_VERSION = 1
+DEFAULT_CALLBACKS_PATH = Path("~/.claude/tmuxctld-callbacks.json").expanduser()
+DEFAULT_CALLBACK_TTL_SECONDS = 30 * 60
 
 # tmux owns pane-death detection. tmuxctld owns persona re-seating. The global
 # hook is therefore daemon-critical: if tmux.conf was not sourced (or hooks were
@@ -192,19 +197,167 @@ def not_implemented_anchor(method: str, path: str, *, detail: str = "") -> objec
     raise TmuxctldNotImplementedAnchor(method, path, detail=detail)
 
 
+def _callback_path_from_env() -> Path:
+    return Path(os.environ.get("TMUXCTLD_CALLBACKS_PATH") or DEFAULT_CALLBACKS_PATH).expanduser()
+
+
+def _callback_ttl_from_env() -> float:
+    raw = os.environ.get("TMUXCTLD_CALLBACK_TTL_SECONDS")
+    try:
+        ttl = float(raw) if raw is not None else DEFAULT_CALLBACK_TTL_SECONDS
+    except ValueError:
+        ttl = DEFAULT_CALLBACK_TTL_SECONDS
+    return max(1.0, ttl)
+
+
 class PromptSubmitSniffer:
-    """In-memory UserPromptSubmit acknowledgement bus for daemon send transactions.
+    """UserPromptSubmit acknowledgement bus for daemon send transactions.
 
     The daemon is the only process that can know "I issued this prompt send" at
     the exact time the bytes hit tmux. Token-API owns the agent hook receiver.
     The hook handler echoes UserPromptSubmit facts back here; the daemon waits
     on that echo before reporting a prompt send as verified.
+
+    Recent pending callbacks are persisted so a daemon restart does not erase
+    the caller's level-2 hook echo. The event deque remains intentionally
+    volatile: only "send happened, echo caller when target submits" callbacks
+    are durable.
     """
 
-    def __init__(self, *, max_events: int = 2048) -> None:
+    def __init__(
+        self,
+        *,
+        max_events: int = 2048,
+        callbacks_path: str | Path | None = None,
+        callback_ttl_seconds: float | None = None,
+    ) -> None:
         self._cond = threading.Condition()
         self._events: deque[dict] = deque(maxlen=max_events)
         self._callbacks: dict[str, dict] = {}
+        self._callbacks_path = Path(callbacks_path).expanduser() if callbacks_path else None
+        self._callback_ttl_seconds = callback_ttl_seconds
+
+    @property
+    def callbacks_path(self) -> Path:
+        return self._callbacks_path or _callback_path_from_env()
+
+    @property
+    def callback_ttl_seconds(self) -> float:
+        if self._callback_ttl_seconds is not None:
+            return max(1.0, float(self._callback_ttl_seconds))
+        return _callback_ttl_from_env()
+
+    def _is_stale(self, callback: dict, *, now: float | None = None) -> bool:
+        try:
+            registered_at = float(callback.get("registered_at") or 0)
+        except (TypeError, ValueError):
+            return True
+        if registered_at <= 0:
+            return True
+        now = time.monotonic() if now is None else now
+        # time.monotonic() is system-boot relative on macOS, so it survives a
+        # daemon restart. If the host rebooted and the stored value is now in the
+        # future, the callback is from a prior boot and cannot be safely matched.
+        age = now - registered_at
+        return age < 0 or age > self.callback_ttl_seconds
+
+    def _prune_stale_locked(self, *, now: float | None = None) -> int:
+        stale = [
+            correlation_id
+            for correlation_id, callback in self._callbacks.items()
+            if self._is_stale(callback, now=now)
+        ]
+        for correlation_id in stale:
+            self._callbacks.pop(correlation_id, None)
+        return len(stale)
+
+    def _write_locked(self) -> None:
+        path = self.callbacks_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        callbacks = [
+            dict(callback)
+            for _, callback in sorted(self._callbacks.items(), key=lambda item: str(item[0]))
+        ]
+        payload = {
+            "version": CALLBACKS_VERSION,
+            "updated_epoch": time.time(),
+            "callbacks": callbacks,
+        }
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
+                fh.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _callback_from_mapping(item: object) -> dict | None:
+        if not isinstance(item, dict):
+            return None
+        correlation_id = str(item.get("correlation_id") or "").strip()
+        caller_pane = str(item.get("caller_pane") or "").strip()
+        if not correlation_id or not caller_pane:
+            return None
+        try:
+            since = float(item.get("since") or 0)
+            registered_at = float(item.get("registered_at") or 0)
+        except (TypeError, ValueError):
+            return None
+        callback = {
+            "correlation_id": correlation_id,
+            "caller_pane": caller_pane,
+            "target_pane": str(item.get("target_pane") or "").strip(),
+            "target_label": str(item.get("target_label") or "").strip(),
+            "instance_id": str(item.get("instance_id") or "").strip(),
+            "payload_hash": str(item.get("payload_hash") or "").strip(),
+            "since": since,
+            "registered_at": registered_at,
+            "fired": bool(item.get("fired")),
+        }
+        return callback
+
+    def load_callbacks(self, *, force: bool = False) -> dict:
+        """Load persisted pending callbacks, dropping entries past the turn TTL."""
+        path = self.callbacks_path
+        with self._cond:
+            if self._callbacks and not force:
+                return {"loaded": False, "path": str(path), "callbacks": len(self._callbacks)}
+            loaded = 0
+            dropped = 0
+            callbacks: dict[str, dict] = {}
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except FileNotFoundError:
+                self._callbacks = {}
+                return {"loaded": True, "path": str(path), "callbacks": 0, "dropped": 0}
+            raw_callbacks = payload.get("callbacks") if isinstance(payload, dict) else None
+            if not isinstance(raw_callbacks, list):
+                raw_callbacks = []
+            now = time.monotonic()
+            for item in raw_callbacks:
+                callback = self._callback_from_mapping(item)
+                if callback is None or callback.get("fired") or self._is_stale(callback, now=now):
+                    dropped += 1
+                    continue
+                callbacks[str(callback["correlation_id"])] = callback
+                loaded += 1
+            self._callbacks = callbacks
+            if dropped:
+                self._write_locked()
+            return {
+                "loaded": True,
+                "path": str(path),
+                "callbacks": loaded,
+                "dropped": dropped,
+            }
 
     def record(self, payload: dict) -> dict:
         instance_id = str(
@@ -301,15 +454,22 @@ class PromptSubmitSniffer:
             "fired": False,
         }
         with self._cond:
+            self._prune_stale_locked()
             # Idempotent operation replays must not create duplicate late echoes.
             self._callbacks.setdefault(correlation_id, callback)
+            self._write_locked()
             return dict(self._callbacks[correlation_id])
 
     def pop_matching_callbacks(self, event: dict) -> list[dict]:
         matched: list[dict] = []
         with self._cond:
+            changed = bool(self._prune_stale_locked())
             for correlation_id, callback in list(self._callbacks.items()):
                 if callback.get("fired"):
+                    continue
+                if self._is_stale(callback):
+                    self._callbacks.pop(correlation_id, None)
+                    changed = True
                     continue
                 if not self._matches(
                     event,
@@ -322,10 +482,51 @@ class PromptSubmitSniffer:
                 callback["fired"] = True
                 matched.append(dict(callback))
                 self._callbacks.pop(correlation_id, None)
+                changed = True
+            if changed:
+                self._write_locked()
         return matched
 
 
 _PROMPT_SUBMIT_SNIFFER = PromptSubmitSniffer()
+
+
+def _listen_fd_from_env() -> int | None:
+    """Return the first systemd-style inherited listen fd, if LISTEN_FDS says one exists."""
+    raw = os.environ.get("LISTEN_FDS")
+    if not raw:
+        return None
+    try:
+        listen_fds = int(raw)
+    except ValueError:
+        return None
+    if listen_fds <= 0:
+        return None
+    listen_pid = os.environ.get("LISTEN_PID")
+    if listen_pid:
+        try:
+            if int(listen_pid) != os.getpid():
+                return None
+        except ValueError:
+            return None
+    return 3
+
+
+def _activated_listen_fd() -> tuple[int, str] | None:
+    """Return an inherited listening fd plus source label, or None for self-bind."""
+    fd = _listen_fd_from_env()
+    if fd is not None:
+        return fd, "LISTEN_FDS"
+    try:
+        from .launchd_socket import activated_fd
+
+        fd = activated_fd("Listeners")
+    except Exception:  # noqa: BLE001
+        log.exception("tmuxctld launchd socket activation check failed")
+        fd = None
+    if fd is not None:
+        return fd, "launchd"
+    return None
 
 
 def _emit_prompt_submit_callback(control, callback: dict, event: dict) -> dict:
@@ -3442,7 +3643,30 @@ class TmuxctldServer(ThreadingHTTPServer):
         sha: str = "",
         advertised_port: int | None = None,
     ) -> None:
-        super().__init__(server_address, TmuxctldHandler)
+        activated = _activated_listen_fd()
+        self.socket_activation_source = ""
+        if activated is None:
+            super().__init__(server_address, TmuxctldHandler)
+        else:
+            fd, source = activated
+            super().__init__(server_address, TmuxctldHandler, bind_and_activate=False)
+            self.socket.close()
+            self.socket = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self.server_address = self.socket.getsockname()
+            host, port = self.server_address[:2]
+            self.server_name = socket.getfqdn(host)
+            self.server_port = port
+            self.socket_activation_source = source
+            log.info(
+                "tmuxctld adopted activated listener source=%s fd=%d address=%s",
+                source,
+                fd,
+                self.server_address,
+            )
         self.adapter_factory: Callable[[], TmuxAdapter] = adapter_factory or (lambda: TmuxAdapter())
         self.version = version
         self.sha = sha
@@ -3454,6 +3678,10 @@ class TmuxctldServer(ThreadingHTTPServer):
             LEDGER.load()
         except Exception:
             log.exception("tmuxctld wrapper ledger load failed")
+        try:
+            _PROMPT_SUBMIT_SNIFFER.load_callbacks()
+        except Exception:
+            log.exception("tmuxctld prompt-submit callback load failed")
         # Throttle state for the /health-driven lifecycle-hook re-assertion. A
         # 0.0 deadline forces the re-install on the first health check after boot.
         self._hook_reassert_lock = threading.Lock()
