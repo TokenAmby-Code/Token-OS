@@ -8,7 +8,23 @@
 - `IMPERIUM_MACHINE=linux`: generic Linux fallback; do not assume Mac or WSL paths.
 - Future `CIVIC_MACHINE`: keep askCivic-specific machine branching separate from Imperium branching when introduced.
 
-## Incoming Expansion — Headless Linux Boxes (PLANNED, hardware arrives 2026-07-06/07)
+## NAS
+
+The NAS is a first-class network node, not just a path prefix. It hosts two volumes forming
+a domain boundary: **Imperium** (personal, `/Volumes/Imperium` on mac, `/mnt/imperium` on
+Linux/WSL) and **Civic** (work). Known operational constraints: SMB is fragile under load
+(no tree-grep against live runtime, sandboxed writes, wedge/lag spikes under small-file
+churn), remounts detach Obsidian vaults, and TCC forces launchd scripts to live locally.
+
+**Storage doctrine (direction of travel):** the NAS is being demoted from
+everything-store to bulk/cold/backup tier. Live working sets (repos, worktrees, runtimes,
+DBs, vaults) move to machine-local disk; the NAS receives pushed snapshots and holds
+media/archives. Once the incoming boxes give computer-level domain separation, the machine
+— not the NAS volume split — is the work/personal boundary. Cross-mounting across that
+boundary (work box mounting Imperium, or vice versa) is prohibited. Full rationale and
+migration plan: `Aspirants/Network Expansion First Principles.md` in the Imperium vault.
+
+## Incoming Expansion — Headless Linux Boxes (PLANNED, hardware arrives 2026-07-10)
 
 Status: **none of this is live yet.** Do not add registry entries, SSH aliases, or Tailscale
 assumptions for these nodes until the hardware is provisioned. This section is the forward
