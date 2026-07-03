@@ -1964,6 +1964,49 @@ if [[ -n "$RESUME_DISCORD_CHANNEL" && -z "$DISCORD_CHANNEL" ]]; then
   )
 fi
 
+# Identity-bearing values from the dispatcher process must never survive into a
+# child launch. The child gets only the explicit COMMON_ENV values above. This is
+# broader than the persona scrub: pane-scoped helpers (`instance-name`,
+# `session-doc-name`) and wrapper/session plumbing also key off name/session-doc
+# aliases, so scrub both TOKEN_API_* and legacy/unprefixed spellings before
+# setting the worker's own env.
+DISPATCH_INHERITED_ENV_SCRUB=(
+  TMUX_PANE
+  TOKEN_API_INSTANCE_ID
+  INSTANCE_ID
+  TOKEN_API_PERSONA
+  PERSONA
+  TOKEN_API_PARENT_INSTANCE_ID
+  PARENT_INSTANCE_ID
+  TOKEN_API_LEGION
+  LEGION
+  TOKEN_API_PERSONA_SLUG
+  PERSONA_SLUG
+  TOKEN_API_PERSONA_ID
+  PERSONA_ID
+  TOKEN_API_DISPLAY_NAME
+  DISPLAY_NAME
+  TOKEN_API_INSTANCE_NAME
+  INSTANCE_NAME
+  TOKEN_API_TAB_NAME
+  TAB_NAME
+  TOKEN_API_NAME
+  TOKEN_API_INSTANCE_NAME_PREFIX
+  INSTANCE_NAME_PREFIX
+  TOKEN_API_WRAPPER_ID
+  WRAPPER_ID
+  TOKEN_API_WRAPPER_LAUNCH_ID
+  WRAPPER_LAUNCH_ID
+  TOKEN_API_VAULT_DOMAIN
+  VAULT_DOMAIN
+  TOKEN_API_SESSION_DOC_ID
+  SESSION_DOC_ID
+  TOKEN_API_SESSION_DOC
+  SESSION_DOC
+  TOKEN_API_SESSION_DOC_PATH
+  SESSION_DOC_PATH
+)
+
 build_agent_command() {
   local -a cmd envs
   envs=("${COMMON_ENV[@]}")
@@ -2027,7 +2070,12 @@ build_agent_command() {
     fi
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
-  printf 'cd %q && env -u TMUX_PANE -u TOKEN_API_INSTANCE_ID -u TOKEN_API_PERSONA -u TOKEN_API_PARENT_INSTANCE_ID -u TOKEN_API_LEGION -u TOKEN_API_PERSONA_SLUG -u TOKEN_API_PERSONA_ID -u TOKEN_API_DISPLAY_NAME -u TOKEN_API_WRAPPER_ID -u TOKEN_API_WRAPPER_LAUNCH_ID -u TOKEN_API_VAULT_DOMAIN -u TOKEN_API_SESSION_DOC_ID TOKEN_API_INTERNAL_DISPATCH=1' "$WORK_DIR"
+  printf 'cd %q && env' "$WORK_DIR"
+  local scrub_var
+  for scrub_var in "${DISPATCH_INHERITED_ENV_SCRUB[@]}"; do
+    printf ' -u %q' "$scrub_var"
+  done
+  printf ' TOKEN_API_INTERNAL_DISPATCH=1'
   local e
   for e in "${envs[@]}"; do printf ' %q' "$e"; done
   local a
