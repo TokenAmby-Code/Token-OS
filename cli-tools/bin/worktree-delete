@@ -240,12 +240,19 @@ resolve_instance_payload_fields() {
     # instance_id; when token-api is not explicitly configured here, do not touch
     # a live default by accident.  Cascade callers pass pr_state directly.
     local api="${TOKEN_API_URL:-}"
-    [[ -n "$api" ]] || return 0
+    if [[ -z "$api" ]]; then
+        git_verified_no_open_pr_fields
+        return 0
+    fi
     _api_lower="$(printf '%s' "$api" | tr '[:upper:]' '[:lower:]')"
     case "$_api_lower" in
-        0|false|off|disabled) return 0 ;;
+        0|false|off|disabled)
+            git_verified_no_open_pr_fields
+            return 0
+            ;;
     esac
-    python3 - "$api" "$WORKTREE_DIR" <<'PY' || true
+    local fields
+    fields="$(python3 - "$api" "$WORKTREE_DIR" <<'PY' || true
 import json, sys, urllib.parse, urllib.request
 
 api = sys.argv[1].rstrip("/")
@@ -266,6 +273,38 @@ if data.get("pr_state"):
 if fields:
     print("," + ",".join(fields))
 PY
+)"
+    if [[ "$fields" == *'"pr_state"'* ]]; then
+        printf '%s\n' "$fields"
+        return 0
+    fi
+    printf '%s%s\n' "$fields" "$(git_verified_no_open_pr_fields)"
+}
+
+_repo_slug_from_origin() {
+    local origin
+    origin="$(git --git-dir="$BARE_REPO" remote get-url origin 2>/dev/null || true)"
+    case "$origin" in
+        git@github.com:*) printf '%s\n' "${origin#git@github.com:}" | sed -E 's#\\.git$##' ;;
+        https://github.com/*) printf '%s\n' "${origin#https://github.com/}" | sed -E 's#\\.git$##' ;;
+        *) return 1 ;;
+    esac
+}
+
+git_verified_no_open_pr_fields() {
+    # When token-api has no linked instance/pr_state for a manual CLI teardown,
+    # the daemon can still delete the remote ref if the CLI can prove both:
+    # branch tip is already on the default branch AND GitHub reports no open PR
+    # for this head.  If either proof is unavailable, pass nothing so tmuxctld's
+    # remote-ref gate preserves.
+    local default_branch repo open_count
+    default_branch="$(git --git-dir="$BARE_REPO" symbolic-ref --short HEAD 2>/dev/null || echo main)"
+    git --git-dir="$BARE_REPO" merge-base --is-ancestor "$BRANCH_NAME" "$default_branch" 2>/dev/null || return 0
+    command -v gh >/dev/null 2>&1 || return 0
+    repo="$(_repo_slug_from_origin)" || return 0
+    open_count="$(gh pr list --repo "$repo" --head "$BRANCH_NAME" --state open --json number --jq 'length' 2>/dev/null || true)"
+    [[ "$open_count" == "0" ]] || return 0
+    printf ',"pr_state":"merged"'
 }
 
 post_daemon_teardown() {
