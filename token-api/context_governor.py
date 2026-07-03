@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 import shared
@@ -197,8 +197,9 @@ async def _arm_stop_subscription(
     pane: str | None,
     payload: str,
 ) -> int:
+    target_pane = pane or ""
     existing = await _existing_context_stop_subscription(
-        db, target_instance_id=instance_id, target_pane=pane
+        db, target_instance_id=instance_id, target_pane=target_pane
     )
     if existing:
         await db.execute(
@@ -208,13 +209,27 @@ async def _arm_stop_subscription(
             (payload, existing),
         )
         return existing
-    cursor = await db.execute(
-        """INSERT INTO stop_hook_subscriptions
-           (target_instance_id, target_pane, subscriber_instance_id, subscriber_pane,
-            event, delivery, status, purpose, payload, oneshot)
-           VALUES (?, ?, NULL, ?, 'stop', 'prompt', 'active', ?, ?, 1)""",
-        (instance_id, pane, pane or instance_id, CONTEXT_STOP_PURPOSE, payload),
-    )
+    try:
+        cursor = await db.execute(
+            """INSERT INTO stop_hook_subscriptions
+               (target_instance_id, target_pane, subscriber_instance_id, subscriber_pane,
+                event, delivery, status, purpose, payload, oneshot)
+               VALUES (?, ?, NULL, ?, 'stop', 'prompt', 'active', ?, ?, 1)""",
+            (instance_id, target_pane, pane or instance_id, CONTEXT_STOP_PURPOSE, payload),
+        )
+    except aiosqlite.IntegrityError:
+        existing = await _existing_context_stop_subscription(
+            db, target_instance_id=instance_id, target_pane=target_pane
+        )
+        if existing:
+            await db.execute(
+                """UPDATE stop_hook_subscriptions
+                   SET payload = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (payload, existing),
+            )
+            return existing
+        raise
     return int(cursor.lastrowid)
 
 
@@ -557,12 +572,11 @@ async def sweep_context_governor(request: ContextSweepRequest | None = None) -> 
             progress = _parse_dt(row.get("last_progress_at"))
             if not deadline or deadline > now:
                 continue
-            # Any observed compaction/handoff/session-doc progress after the
-            # forced injection clears this sweep cycle; a later telemetry event
-            # can re-escalate if the same autonomous instance still reports
-            # over-limit usage. The no-progress stage is only for rows with no
-            # progress at all inside the TTL window.
-            if progress:
+            injected = _parse_dt(row.get("injected_at"))
+            # Only progress observed after the forced injection clears this
+            # sweep cycle. Historical compaction before the injection must not
+            # mask the no-progress stage.
+            if progress and injected and progress >= injected:
                 continue
             instance_id = row["instance_id"]
             pane = row.get("pane")
@@ -603,7 +617,9 @@ async def sweep_context_governor(request: ContextSweepRequest | None = None) -> 
 
 
 @router.get("/api/context-governor/state")
-async def get_context_governor_state(instance_id: str | None = None, limit: int = 50) -> dict:
+async def get_context_governor_state(
+    instance_id: str | None = None, limit: int = Query(default=50, ge=1, le=500)
+) -> dict:
     clauses: list[str] = []
     params: list[Any] = []
     if instance_id:

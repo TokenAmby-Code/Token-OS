@@ -2870,3 +2870,38 @@ def test_context_governor_stop_is_conservative_prompt_actuation() -> None:
         assert result["actuator"] == "context-governor"
     finally:
         server.shutdown()
+
+
+def test_context_governor_inject_reports_unresolved_instance_without_pane() -> None:
+    server, _ = _serve(RecordingVoiceAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/context-governor/inject",
+            {"instance_id": "missing-instance", "text": "do not send", "verify": False},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["found"] is False
+        assert result["status"] == "unresolved"
+    finally:
+        server.shutdown()
+
+
+def test_context_governor_stop_reports_unresolved_without_success() -> None:
+    server, _ = _serve(RecordingVoiceAdapter)
+    try:
+        status, payload = _post(
+            server,
+            "/context-governor/stop",
+            {"instance_id": "missing-instance", "reason": "no_progress", "verify": False},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["found"] is False
+        assert result["status"] == "unresolved"
+        assert result["reason"] == "no_progress"
+    finally:
+        server.shutdown()

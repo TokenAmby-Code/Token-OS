@@ -2971,6 +2971,10 @@ def _h_context_governor_stop(control, params):
     injected = _h_context_governor_inject(
         control, {**params, "text": text, "stage": "no_progress_stop"}
     )
+    if not injected.get("found", True) or injected.get("status") == "unresolved":
+        return {**injected, "status": "unresolved", "reason": reason}
+    if injected.get("ok") is False or injected.get("error"):
+        return {**injected, "reason": reason}
     return {**injected, "status": "stopped_autonomous_input", "reason": reason}
 
 

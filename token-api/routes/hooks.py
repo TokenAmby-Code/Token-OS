@@ -4411,12 +4411,19 @@ async def handle_session_end(payload: dict) -> dict:
         # re-fire adopt it (clean stamp path; Layer 2 is the backstop).
         if end_reason in NON_TERMINAL_SESSION_END_REASONS:
             if end_reason == "compact":
-                await record_context_governor_progress(
-                    session_id,
-                    "compaction_observed",
-                    source="SessionEnd",
-                    details={"reason": end_reason},
-                )
+                try:
+                    await record_context_governor_progress(
+                        session_id,
+                        "compaction_observed",
+                        source="SessionEnd",
+                        details={"reason": end_reason},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Context governor progress record failed for compact SessionEnd %s: %s",
+                        session_id,
+                        exc,
+                    )
             await log_event(
                 "instance_session_end_skipped",
                 instance_id=session_id,

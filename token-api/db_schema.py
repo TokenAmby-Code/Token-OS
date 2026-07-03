@@ -1243,6 +1243,13 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ON stop_hook_subscriptions(purpose, status)
         """)
         await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_context_governor_active_stop_subscription
+            ON stop_hook_subscriptions(target_instance_id, target_pane, purpose, event)
+            WHERE purpose = 'context_governor_stop'
+              AND event = 'stop'
+              AND status = 'active'
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS stop_hook_deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 subscription_id INTEGER NOT NULL,

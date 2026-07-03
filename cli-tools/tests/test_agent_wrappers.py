@@ -177,7 +177,7 @@ def test_headless_codex_launch_sets_native_auto_compact_limit(tmp_path: Path) ->
     assert result.returncode == 0, result.stderr
     args = argv_log.read_text(encoding="utf-8").splitlines()
     assert args[0] == "exec"
-    pairs = list(zip(args, args[1:]))
+    pairs = list(zip(args, args[1:], strict=False))
     assert ("-c", "model_auto_compact_token_limit=160000") in pairs
 
 

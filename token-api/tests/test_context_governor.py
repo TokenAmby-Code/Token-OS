@@ -309,3 +309,44 @@ def test_no_progress_sweep_skips_when_progress_was_observed(app_env, monkeypatch
     asyncio.run(cg.record_context_governor_progress("worker-progress", "session_doc_checkpoint"))
     sweep = asyncio.run(cg.sweep_context_governor())
     assert sweep["exhausted_count"] == 0
+
+
+def test_no_progress_sweep_ignores_historical_progress_before_injection(app_env, monkeypatch):
+    cg = sys.modules["context_governor"]
+    shared = sys.modules["shared"]
+    _insert_instance(app_env.db_path, "worker-old-progress", automated=1, origin_type="dispatch")
+    _patch_panes(monkeypatch, shared, {"worker-old-progress": "%108"})
+    stops: list[dict[str, Any]] = []
+
+    async def fake_inject(**kwargs):
+        return {"ok": True, "result": {"status": "sent"}}
+
+    async def fake_stop(**kwargs):
+        stops.append(kwargs)
+        return {"ok": True, "result": {"status": "stopped_autonomous_input"}}
+
+    monkeypatch.setattr(cg, "_tmuxctld_context_governor_inject", fake_inject)
+    monkeypatch.setattr(cg, "_tmuxctld_context_governor_stop", fake_stop)
+
+    asyncio.run(cg.record_context_governor_progress("worker-old-progress", "previous_compaction"))
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        "UPDATE context_governor_state SET last_progress_at = '2000-01-01T00:00:00' "
+        "WHERE instance_id = 'worker-old-progress'"
+    )
+    conn.commit()
+    conn.close()
+    asyncio.run(
+        cg.ingest_context_telemetry(
+            cg.ContextTelemetryRequest(
+                instance_id="worker-old-progress",
+                session_id="sess-old-progress",
+                pane="%108",
+                used_tokens=170_000,
+                no_progress_ttl_seconds=0,
+            )
+        )
+    )
+    sweep = asyncio.run(cg.sweep_context_governor())
+    assert sweep["exhausted_count"] == 1
+    assert stops and stops[0]["instance_id"] == "worker-old-progress"
