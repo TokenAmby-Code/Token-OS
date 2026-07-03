@@ -32,12 +32,9 @@ async def test_personas_seed_and_schema_constraints(app_env):
 
 @pytest.mark.asyncio
 async def test_tts_policy_seeded_per_persona_deny_by_default(app_env: Any) -> None:
-    """``personas.tts_policy`` is seeded with deny-by-default semantics.
-
-    Custodes and Pax are ``hot`` council identities, voiced Astartes are
-    ``pause``, and every other voiceless persona (FG, mechanicus,
-    mechanicus-worker, primarchs, non-Pax civic seats) is ``silent``.
-    """
+    """``personas.tts_policy`` is seeded with deny-by-default semantics: Custodes is
+    ``hot``, voiced Astartes are ``pause``, and every voiceless persona (FG,
+    mechanicus, mechanicus-worker, primarchs, civic seats) is ``silent``."""
     expected = {
         "custodes": "hot",
         "blood-angels": "pause",
@@ -54,7 +51,7 @@ async def test_tts_policy_seeded_per_persona_deny_by_default(app_env: Any) -> No
         "inquisitor": "silent",
         "mechanicus": "silent",
         "mechanicus-worker": "silent",
-        "pax": "hot",
+        "pax": "silent",
         "orchestrator": "silent",
         "agentic-worker": "silent",
     }
@@ -76,7 +73,7 @@ async def test_pax_overseer_seed_resolves_silent_civic_seat(app_env):
     # singleton (the combined Custodes+Administratum interaction/record-keeper).
     # resolve_persona must surface it as an overseer (so the rank-stamp trigger
     # promotes its instance row off the astartes default) with the civic slate/
-    # blue identity and no voice/sound (a voiceless seat).
+    # blue identity and no voice/sound (a silent seat).
     import personas
 
     async with aiosqlite.connect(app_env.db_path) as db:
