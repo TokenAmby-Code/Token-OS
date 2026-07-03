@@ -120,17 +120,19 @@ def test_chunk_dispatch_payload_has_current_next_handoff_and_ack_error_reports(
 
     monkeypatch.setattr(tts, "_send_to_phone", fake_send)
     monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.01)
+    monkeypatch.setattr(tts, "TTS_CHUNK_MAX_CHARS", 20)
     chunks = tts.build_tts_chunk_handoff("first sentence. second sentence.", max_chars=20)
 
     result = tts.dispatch_tts_chunks_to_backend("phone", chunks, rate=2)
 
     assert result["success"] is True
-    assert len(sent) == 2
+    assert len(sent) == 1
     first = sent[0][1]
-    second = sent[1][1]
     assert first["current_chunk_text"] == "first sentence."
     assert first["next_chunk_text"] == "second sentence."
-    assert first["next_chunk_id"] == second["chunk_id"]
+    assert first["current_index"] == 0
+    assert first["next_index"] == 1
+    assert first["playback_id"]
     assert "next_next" not in first
 
     ack = asyncio.run(
@@ -165,8 +167,8 @@ def test_chunk_dispatch_payload_has_current_next_handoff_and_ack_error_reports(
     error = asyncio.run(
         tts.api_tts_backend_error(
             tts.TTSBackendErrorRequest(
-                playback_id=second["playback_id"],
-                chunk_id=second["chunk_id"],
+                playback_id=first["playback_id"],
+                chunk_id=first["chunk_id"],
                 backend="phone",
                 error="macro failed",
             )
@@ -175,6 +177,45 @@ def test_chunk_dispatch_payload_has_current_next_handoff_and_ack_error_reports(
     assert error["success"] is True
     assert error["state"]["last_error"]["error"] == "macro failed"
     assert error["state"]["control"]["state"] == "error"
+
+
+def test_buffer_drained_chunk_event_completes_pending_phone_playback() -> None:
+    tts = _load_tts()
+    waiter = tts.threading.Event()
+    tts.pending_phone_playbacks["phone-play-1"] = waiter
+    try:
+        result = asyncio.run(
+            tts.api_tts_chunk_event(
+                tts.TTSChunkEventRequest(
+                    event="buffer_drained",
+                    backend="phone",
+                    playback_id="phone-play-1",
+                    session_id="sess-1",
+                    current_index=0,
+                    next_index=1,
+                )
+            )
+        )
+        assert result["success"] is True
+        assert result["matched_playback"] is True
+        assert waiter.is_set()
+        assert result["state"]["last_backend_ack"]["matched_playback"] is True
+    finally:
+        tts.pending_phone_playbacks.pop("phone-play-1", None)
+
+
+def test_phone_short_utterance_sends_empty_next_chunk() -> None:
+    tts = _load_tts()
+    chunks = tts.build_tts_chunk_handoff("short line")
+
+    phone_chunks = tts.build_phone_tts_chunk_handoff(chunks)
+    payload = tts._backend_chunk_payload(phone_chunks[0], phone_chunks[1])
+
+    assert payload["current_index"] == 0
+    assert payload["next_index"] == 1
+    assert payload["current_chunk"] == "short line"
+    assert payload["next_chunk"] == ""
+    assert payload["playback_id"] == phone_chunks[0]["playback_id"]
 
 
 def test_speak_tts_sanitizes_then_chunks_then_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:

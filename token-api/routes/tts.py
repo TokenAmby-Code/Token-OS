@@ -1259,6 +1259,63 @@ def _chunk_public_payload(chunk: dict | None) -> dict | None:
     }
 
 
+def _split_phone_utterance_text(text: str, *, max_chars: int | None = None) -> tuple[str, str]:
+    """Split a phone utterance into MacroDroid's v1 current/next buffer.
+
+    Phone v1 executes exactly one HTTP handoff containing ``current_chunk`` and
+    ``next_chunk``. Short lines use an empty next chunk; long lines split near
+    the midpoint on whitespace so the phone never has to reconstruct a queue.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return "", ""
+    max_chars = max_chars or TTS_CHUNK_MAX_CHARS
+    if len(cleaned) <= max_chars:
+        return cleaned, ""
+
+    midpoint = len(cleaned) // 2
+    left = cleaned.rfind(" ", 0, midpoint + 1)
+    right = cleaned.find(" ", midpoint)
+    candidates = [idx for idx in (left, right) if idx > 0]
+    split_at = min(candidates, key=lambda idx: abs(idx - midpoint)) if candidates else midpoint
+    current = cleaned[:split_at].strip()
+    next_text = cleaned[split_at:].strip()
+    if not current:
+        return cleaned, ""
+    return current, next_text
+
+
+def build_phone_tts_chunk_handoff(
+    chunks: list[dict], *, max_chars: int | None = None
+) -> list[dict]:
+    """Build the phone v1 two-slot handoff from sanitized speech chunks.
+
+    The phone receives one playback_id for the utterance, ``current_index=0``,
+    and ``next_index=1``. ``next_chunk`` is present but empty for short lines.
+    """
+    cleaned = " ".join(str(chunk.get("text") or "").strip() for chunk in chunks).strip()
+    if not cleaned:
+        return []
+    current_text, next_text = _split_phone_utterance_text(cleaned, max_chars=max_chars)
+    utterance_id = uuid.uuid4().hex
+    playback_id = utterance_id
+    total = 2
+    result = []
+    for index, chunk_text in enumerate((current_text, next_text)):
+        result.append(
+            {
+                "playback_id": playback_id,
+                "utterance_id": utterance_id,
+                "chunk_id": f"{utterance_id}:{index + 1}/{total}",
+                "index": index,
+                "total": total,
+                "text": chunk_text,
+                "text_hash": hashlib.sha256(chunk_text.encode("utf-8")).hexdigest(),
+            }
+        )
+    return result
+
+
 def _backend_chunk_payload(
     current_chunk: dict, next_chunk: dict | None, *, rate: int | float = 0
 ) -> dict:
@@ -1322,7 +1379,7 @@ def _send_phone_tts_chunk(payload: dict) -> dict:
         confirmed = event.wait(timeout=PHONE_PLAYBACK_WATCHDOG_S)
         if not confirmed:
             logger.warning(
-                "TTS phone: playback-complete callback missed for %s after %ss; advancing",
+                "TTS phone: buffer_drained callback missed for %s after %ss; advancing",
                 playback_id,
                 PHONE_PLAYBACK_WATCHDOG_S,
             )
@@ -1393,13 +1450,61 @@ def dispatch_tts_chunks_to_backend(
 
     Token-OS records the current/next handoff before every backend call. A
     backend failure records an authoritative error and stops; there is no Mac
-    fallback.
+    fallback. Phone v1 is a single two-slot MacroDroid handoff, not a server-side
+    loop over every prepared sentence chunk.
     """
     if backend not in TTS_EXECUTION_BACKENDS:
         _record_tts_backend_active(None)
         return {"success": False, "error": "unknown_playback_backend", "method": None}
     if not chunks:
         return {"success": False, "error": "empty_audio_payload", "method": None}
+
+    if backend == "phone":
+        phone_chunks = build_phone_tts_chunk_handoff(chunks)
+        if not phone_chunks:
+            return {"success": False, "error": "empty_audio_payload", "method": None}
+        current_chunk = phone_chunks[0]
+        next_chunk = phone_chunks[1]
+        _record_tts_backend_active(
+            backend,
+            playback_id=current_chunk["playback_id"],
+            current=_chunk_public_payload(current_chunk),
+            next_chunk=_chunk_public_payload(next_chunk),
+        )
+        payload = _backend_chunk_payload(current_chunk, next_chunk, rate=rate)
+        result = dict(_send_phone_tts_chunk(payload) or {})
+        result.setdefault("chunk_id", current_chunk["chunk_id"])
+        real_chunks = 1 + int(bool(next_chunk.get("text")))
+        if not result.get("success"):
+            error = result.get("error") or "phone_backend_error"
+            _update_tts_authoritative_state(
+                last_error={
+                    "backend": backend,
+                    "playback_id": current_chunk["playback_id"],
+                    "chunk_id": current_chunk["chunk_id"],
+                    "error": error,
+                    "reported_at": _now_iso(),
+                }
+            )
+            return {
+                "success": False,
+                "error": error,
+                "method": result.get("method") or backend,
+                "chunks": real_chunks,
+                "completed_chunks": 0,
+                "results": [result],
+                "reason": result.get("reason") or error,
+            }
+        return {
+            "success": True,
+            "method": result.get("method") or backend,
+            "backend": backend,
+            "chunks": real_chunks,
+            "completed_chunks": real_chunks,
+            "playback_id": result.get("playback_id"),
+            "playback_confirmed": result.get("playback_confirmed"),
+            "results": [result],
+        }
 
     results = []
     for index, chunk in enumerate(chunks):
@@ -2769,9 +2874,28 @@ async def api_tts_chunk_event(request: TTSChunkEventRequest) -> dict:
         "detail": request.detail or {},
         "reported_at": _now_iso(),
     }
+    matched_playback = False
+    if request.event == "buffer_drained" and request.playback_id:
+        waiter = pending_phone_playbacks.get(request.playback_id)
+        if waiter is not None:
+            waiter.set()
+            matched_playback = True
+            logger.info(
+                "tts chunk-event buffer_drained: playback_id=%s confirmed", request.playback_id
+            )
+        else:
+            logger.warning(
+                "tts chunk-event buffer_drained: unknown/expired playback_id=%s (no waiter); ignoring",
+                request.playback_id,
+            )
+    event["matched_playback"] = matched_playback
     _update_tts_authoritative_state(last_backend_ack=event)
     await log_event("tts_chunk_event", device_id=request.backend, details=event)
-    return {"success": True, "state": get_tts_authoritative_state()}
+    return {
+        "success": True,
+        "matched_playback": matched_playback,
+        "state": get_tts_authoritative_state(),
+    }
 
 
 @router.post("/api/tts/backend-error")
