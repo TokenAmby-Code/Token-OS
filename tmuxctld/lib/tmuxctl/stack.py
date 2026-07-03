@@ -194,12 +194,16 @@ def add_stack_pane(
         raise ValueError(f"not a stack window: {base}")
     cwd = cwd or os.path.expanduser("~")
 
-    if base in ORCHESTRATOR_STACK_BASES:
-        from .stack import add_orchestrator_stack_pane
-
-        return add_orchestrator_stack_pane(
-            adapter, session, base, cwd=cwd, focus=focus, adopt_pane=adopt_pane
-        )
+    spec = STACK_PAGE_SPECS.get(base)
+    if spec is not None:
+        if spec.layout_mode == "pinned-top-row":
+            return add_pinned_stack_pane(
+                adapter, session, base, cwd=cwd, focus=focus, adopt_pane=adopt_pane
+            )
+        if base in ORCHESTRATOR_STACK_BASES:
+            return add_orchestrator_stack_pane(
+                adapter, session, base, cwd=cwd, focus=focus, adopt_pane=adopt_pane
+            )
 
     if adopt_pane is not None:
         raise ValueError(f"stack adopt is only supported for orchestrator stacks, not {base!r}")
@@ -265,7 +269,7 @@ def dispatch_stack_command(
             if window_target:
                 adapter.run("select-window", "-t", window_target, allow_failure=True)
             adapter.run("select-pane", "-t", pane, allow_failure=True)
-            if base in ORCHESTRATOR_STACK_BASES:
+            if STACK_PAGE_SPECS.get(base) is not None:
                 target = adapter.run(
                     "display-message",
                     "-t",
@@ -483,6 +487,7 @@ from ._stack_core import (  # noqa: E402,F401
     StackPageSpec,
     StackPane,
     add_orchestrator_stack_pane,
+    add_pinned_stack_pane,
     add_stack_worker_pane,
     enforce_stack_layout,
     enforce_stack_page_layout,

@@ -429,9 +429,8 @@ def build_reservists_window(adapter: TmuxAdapter, session: str) -> None:
     token-os mirror of the civic reservist, marked ``@TOKEN_OS_RESERVIST 1`` so a
     future token-os-thread resolver can find it the same way.
 
-    Like mars/kreig, ``reservists`` is a recognized stack base with no
-    StackPageSpec, so stack reconcile leaves these two perpetual panes alone while
-    still allowing dispatch to add reservist workers later.
+    Reconcile now pins and protects these two seats as the top row while still
+    allowing dispatch to add reservist workers in a full-width band below them.
     """
     target = f"{session}:{RESERVISTS_WINDOW}"
     adapter.run(
