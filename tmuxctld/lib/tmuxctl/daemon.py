@@ -4361,8 +4361,15 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             self._write(200, {"ok": True, "result": result})
         except TmuxctldNotImplementedAnchor as exc:
             # Forward tombstone: the daemon route is intentionally named but not
-            # built. This must be an actual HTTP 501 so transport shims fail
-            # loudly and tmux hooks can surface the crater via display-message.
+            # built. This is an actual HTTP 501 so transport shims / API callers
+            # fail loudly. NOTE (2026-07-03): "fail loudly" is a caller/API-side
+            # contract only — 501 anchors must NOT be wired into human-facing,
+            # status-line-flashing keybindings. A keybind bound through
+            # tmuxctld-ping to a 501 anchor makes curl exit nonzero and the tmux
+            # `||` fallback flash a raw `tmuxctld-ping-/…-failed` token at the
+            # Emperor (the bug fixed in tmux-base.conf: such keys are now disabled
+            # with a concise non-raw message until a real handler exists). Keep
+            # anchor routes off human keymaps; surface the crater to logs/API.
             self._write(
                 501,
                 self._error(
