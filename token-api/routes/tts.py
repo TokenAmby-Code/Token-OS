@@ -2,7 +2,7 @@
 TTS/Notification route module — extracted from main.py.
 
 Owns:
-- TTS speech functions (Mac + WSL satellite routing)
+- TTS speech functions (Token-OS control plane + phone/WSL/Linux execution backends)
 - TTS queue system (sequential playback, skip, mute)
 - Notification endpoints (/api/notify/*, /api/tts/*)
 - Webhook sender
@@ -165,11 +165,65 @@ class PlaybackCompleteRequest(BaseModel):
     playback_id: str  # echoed back by the phone when it finishes speaking a line
 
 
+class TTSControlRequest(BaseModel):
+    """Authoritative TTS control request.
+
+    Overlay/backend controls must enter Token-OS here first. Token-OS records
+    the control state, then echoes to the active execution backend.
+    """
+
+    command: str | None = None  # Track B phone field: pause, resume, skip, speed
+    action: str | None = None  # Back-compat alias accepted during rollout
+    speed: float | None = None
+    playback_id: str | None = None
+    session_id: str | None = None
+    backend: str | None = None
+    source: str | None = None
+
+
+class TTSBackendAckRequest(BaseModel):
+    """Backend acknowledgement for a dispatched chunk."""
+
+    session_id: str | None = None
+    playback_id: str
+    chunk_id: str | None = None
+    backend: str
+    status: str = "ack"
+    detail: dict | None = None
+
+
+class TTSBackendErrorRequest(BaseModel):
+    """Backend error report for a dispatched chunk/current playback."""
+
+    session_id: str | None = None
+    playback_id: str | None = None
+    chunk_id: str | None = None
+    backend: str
+    error: str
+    retryable: bool = False
+    detail: dict | None = None
+
+
+class TTSChunkEventRequest(BaseModel):
+    """Phone/backend chunk lifecycle event."""
+
+    event: str
+    session_id: str | None = None
+    playback_id: str | None = None
+    chunk_id: str | None = None
+    backend: str = "phone"
+    current_index: int | None = None
+    next_index: int | None = None
+    detail: dict | None = None
+
+
 # ============ TTS/Notification System ============
 
 # Platform detection
 IS_MACOS = sys.platform == "darwin"
 DEFAULT_SOUND = "chimes.wav"
+TTS_EXECUTION_BACKENDS = {"phone", "wsl", "linux"}
+TTS_PHONE_PREFERRED_ZONES = {"away", "gym", "campus", "mobile", "travel"}
 
 
 SOUND_MAP = {
@@ -346,8 +400,8 @@ def clean_markdown_for_tts(text: str) -> str:
 
 
 def _mac_tts_available() -> bool:
-    """True only when a local `say` backend can plausibly render audible speech."""
-    return IS_MACOS and shutil.which("say") is not None
+    """Mac is no longer a TTS execution backend."""
+    return False
 
 
 def _mac_sound_available() -> bool:
@@ -442,10 +496,11 @@ def get_phone_audio_proxy_health() -> dict:
 def _phone_tts_available() -> bool:
     """Phone TTS is reachable when the MacroDroid HTTP server is up.
 
-    The /speak transport speaks locally on the device and proves delivery via the
-    playback-complete callback (watchdog-capped), so availability gates on coarse
-    MacroDroid reachability — NOT the audio-proxy receiver heartbeat (#423), which
-    governs a different transport and is surfaced only as a diagnostic.
+    The phone chunk transport speaks locally on the device and proves delivery
+    via playback-complete/chunk events (watchdog-capped), so availability gates
+    on coarse MacroDroid reachability — NOT the audio-proxy receiver heartbeat
+    (#423), which governs a different transport and is surfaced only as a
+    diagnostic.
     """
     return _send_to_phone is not None and is_phone_reachable()
 
@@ -467,54 +522,13 @@ def _no_playback_backend(reason: str = "no_playback_backend") -> dict:
 
 
 def speak_tts_mac(message: str, voice: str = None, rate: int = 0) -> dict:
-    """Speak a message using macOS `say` command.
+    """Retired compatibility shim.
 
-    Uses Popen instead of run() to allow process termination via skip_tts().
+    Mac was removed from the TTS execution backend set on 2026-07-03. This
+    function intentionally does not call macOS ``say``; callers must use phone,
+    WSL, or later Linux through the authoritative control plane.
     """
-    global tts_current_process, tts_skip_requested
-
-    if not _mac_tts_available():
-        return _no_playback_backend("mac_tts_unavailable")
-
-    voice = voice or "Daniel"
-    TTS_BACKEND["current"] = "mac"
-
-    # Map SAPI rate scale (-10..10) to say WPM via the shared base tunable.
-    wpm = _wpm_for_rate(rate)
-
-    try:
-        process = subprocess.Popen(
-            ["say", "-v", voice, "-r", str(wpm), message],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        tts_current_process = process
-        process.wait(timeout=300)
-        tts_current_process = None
-        TTS_BACKEND["current"] = None
-
-        if process.returncode == 0:
-            return {"success": True, "method": "macos_say", "voice": voice, "message": message[:50]}
-        if tts_skip_requested:
-            tts_skip_requested = False
-            return {
-                "success": False,
-                "skipped": True,
-                "method": "skipped",
-                "reason": "skipped",
-                "message": message[:50],
-            }
-        return {"success": False, "error": f"say failed with code {process.returncode}"}
-    except subprocess.TimeoutExpired:
-        if tts_current_process:
-            tts_current_process.kill()
-            tts_current_process = None
-        TTS_BACKEND["current"] = None
-        return {"success": False, "error": "TTS timed out"}
-    except Exception as e:
-        tts_current_process = None
-        TTS_BACKEND["current"] = None
-        return {"success": False, "error": str(e)}
+    return _no_playback_backend("mac_tts_backend_removed")
 
 
 def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bool = False) -> dict:
@@ -675,23 +689,20 @@ def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int 
 def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
     """Determine which device should receive TTS output.
 
-    Phone-first doctrine (Emperor decree, 2026-06-25): the phone is first-contact
-    for ALL TTS, regardless of geofence. Mac `say` (local speakers) is a deep
-    fallback ONLY — reached when phone delivery is unreachable. This supersedes
-    the old geofence(away) → WSL-satellite → phone → Mac ordering; the WSL
-    satellite era is over and geofence no longer gates device selection.
+    Authoritative execution backends are phone, WSL, and later Linux. Mac is
+    removed as a TTS backend: routing never returns ``mac`` and failures never
+    demote to macOS ``say``. Phone-first is situational (away/mobile zones);
+    at the desk, WSL remains a first-class backend.
 
     Priority cascade:
     1. Discord voice — if the operator is actively in a voice channel, audio goes
        there (a deliberate live conversation surface, not ambient routing).
-    2. Phone — first-contact whenever reachable.
-    3. Mac — deep fallback, only when the phone is unreachable.
-
-    The WSL satellite is intentionally NOT in this cascade. ``wsl_voice`` is kept
-    in the signature for caller compatibility but no longer influences routing.
+    2. Phone — when the operator is in a mobile/away zone and MacroDroid is reachable.
+    3. WSL — first-class desk/default backend when satellite TTS is available.
+    4. Phone — fallback execution backend if WSL is unavailable but phone is reachable.
 
     Returns:
-        {"device": "discord"|"phone"|"mac"|None, "reason": str, "discord_bot": str|None}
+        {"device": "discord"|"phone"|"wsl"|None, "reason": str, "discord_bot": str|None}
     """
     # 1. Discord voice channel — operator in VC means audio goes there.
     discord_bot = _get_discord_voice_bot()
@@ -702,35 +713,38 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
             "discord_bot": discord_bot,
         }
 
-    # 2. Phone — first-contact for all TTS, regardless of geofence zone. The
-    # /speak transport speaks LOCALLY on the device (Android TTS, m_waitToFinish)
-    # and proves delivery via the playback-complete callback (watchdog-capped), so
-    # selection gates on coarse MacroDroid HTTP reachability — NOT the audio-proxy
-    # *receiver* heartbeat (#423), which governed a different (receiver-based)
-    # transport and is surfaced here only as a diagnostic. Emperor decree
-    # 2026-06-28: route to the phone whenever its MacroDroid server is up; a
-    # genuinely unreachable phone fails this probe (or the send) and demotes to Mac.
+    # Phone routeability gates on coarse MacroDroid reachability. Audio-proxy
+    # receiver health remains diagnostic, not a route predicate for /tts-chunk.
     phone_health = get_phone_audio_proxy_health()
-    if _send_to_phone is not None and is_phone_reachable():
+    phone_reachable = _send_to_phone is not None and is_phone_reachable()
+    location_zone = DESKTOP_STATE.get("location_zone")
+    if location_zone in TTS_PHONE_PREFERRED_ZONES and phone_reachable:
         return {
             "device": "phone",
-            "reason": "phone-first: MacroDroid reachable (/speak + playback-complete)",
+            "reason": f"phone situational: {location_zone} zone with MacroDroid reachable",
             "discord_bot": None,
             "phone_audio_proxy": phone_health,
         }
 
-    # 3. Mac — deep fallback, only when phone delivery is unreachable.
-    if _mac_tts_available():
+    if is_satellite_tts_available():
         return {
-            "device": "mac",
-            "reason": f"deep fallback: phone unavailable ({_phone_tts_unavailable_reason()})",
+            "device": "wsl",
+            "reason": "wsl satellite available",
+            "discord_bot": None,
+            "phone_audio_proxy": phone_health,
+        }
+
+    if phone_reachable:
+        return {
+            "device": "phone",
+            "reason": "wsl unavailable; phone MacroDroid reachable",
             "discord_bot": None,
             "phone_audio_proxy": phone_health,
         }
 
     return {
         "device": None,
-        "reason": "no playback backend",
+        "reason": "no execution backend available",
         "discord_bot": None,
         "phone_audio_proxy": phone_health,
     }
@@ -747,15 +761,16 @@ def speak_tts(
 ) -> dict:
     """Route TTS to the best available device via resolve_tts_device().
 
-    Dispatches to Discord voice, phone TTS, or Mac local speech based on the
-    resolved device. WSL args remain accepted for caller compatibility but are no
-    longer part of the phone-first routing cascade. Falls through on failed live
-    delivery, and never reports success without a concrete playback method.
+    Dispatches to Discord voice or the selected execution backend
+    (phone/WSL/later Linux). WSL args remain accepted for caller compatibility
+    and are used by the WSL chunk dispatcher. It does not fall through to Mac
+    on failed live delivery, and never reports success without a concrete
+    playback method.
 
     Args:
         message: Text to speak
-        voice: macOS voice name (for Mac fallback / Discord TTS voice)
-        rate: Rate for Mac TTS
+        voice: compatibility voice hint for Discord/WSL mapping
+        rate: Compatibility rate hint
         instance_id: Optional instance ID for logging
         wsl_voice: Deprecated Windows SAPI voice name (ignored for routing)
         wsl_rate: Deprecated WSL TTS rate (ignored for routing)
@@ -789,91 +804,34 @@ def speak_tts(
             result.setdefault("reason", result.get("error") or "tts_delivery_failed")
         return result
 
-    def _send_phone_tts() -> dict:
-        """Send spoken text to the phone and BLOCK until real audio-finish.
-
-        Phone can be the selected device or a Discord fallthrough. The device's
-        ``GET /speak?tts_text=…&playback_id=…`` macro (the "Notify : Speak"
-        keystone TTS atom) speaks LOCALLY with ``m_waitToFinish:true`` and returns
-        only a FAST ACK — accept is not delivery. The device echoes the
-        ``playback_id`` to ``POST /api/tts/playback-complete`` at true speech end,
-        which sets the Event we block on here. ``speak_tts`` runs in
-        ``run_in_executor`` (a thread), so a ``threading.Event`` is the correct
-        primitive — it parks the worker thread, never the event loop. The watchdog
-        is a logged safety cap for a *missed* callback, not a duration estimate.
-        Always pop the id.
-
-        NB: the utterance goes to ``/speak``, NOT ``/notify`` — the phone exposes
-        no ``/notify`` HTTP macro, so a ``/notify`` send never triggers speech and
-        every line would fall to the watchdog.
-        """
-        if _send_to_phone is None:
-            return _no_playback_backend("phone_transport_unavailable")
-        playback_id = uuid.uuid4().hex
-        event = threading.Event()
-        pending_phone_playbacks[playback_id] = event
-        try:
-            try:
-                result = dict(
-                    _send_to_phone("/speak", {"tts_text": message, "playback_id": playback_id})
-                    or {}
-                )
-            except Exception as exc:
-                logger.warning("TTS: Phone send failed (%s), will fall through", exc)
-                return {"success": False, "error": "phone_send_failed", "reason": str(exc)}
-            if not result.get("success"):
-                # Accept failed — nothing will ever speak, so don't block.
-                return result
-            result.setdefault("method", "phone")
-            # Block until the device reports playback finished (real audio-finish),
-            # or the watchdog caps a missed callback.
-            confirmed = event.wait(timeout=PHONE_PLAYBACK_WATCHDOG_S)
-            if not confirmed:
-                logger.warning(
-                    "TTS phone: playback-complete callback missed for %s after %ss; "
-                    "advancing (watchdog) — a missed callback stays visible",
-                    playback_id,
-                    PHONE_PLAYBACK_WATCHDOG_S,
-                )
-            result["playback_id"] = playback_id
-            result["playback_confirmed"] = confirmed
-            return result
-        finally:
-            pending_phone_playbacks.pop(playback_id, None)
-
     if device is None:
         result = _no_playback_backend("no_playback_backend")
         result["route_reason"] = routing.get("reason")
         return _finish(result)
 
-    # Dispatch with fallthrough on failure. Phone-first: every non-Discord path
-    # starts at the phone when reachable and demotes only to a real Mac backend.
+    chunks = build_tts_chunk_handoff(message)
+
+    # Dispatch without Mac fallthrough. The selected active backend either plays
+    # or Token-OS records/returns an error state.
     if device == "discord":
         result = speak_tts_discord(message, routing["discord_bot"], voice, rate)
         if result.get("success"):
             return _finish(result)
-        logger.info(f"TTS: Discord failed ({result.get('error')}), falling through to phone/Mac")
-        if _phone_tts_available():
-            result = _send_phone_tts()
-            if result.get("success"):
-                return _finish(result)
-        if _mac_tts_available():
-            return _finish(speak_tts_mac(message, voice, rate))
-        return _finish(_no_playback_backend("no_fallthrough_playback_backend"))
+        logger.info("TTS: Discord failed (%s); no Mac fallback", result.get("error"))
+        return _finish(result)
 
-    if device == "phone":
-        # Reaching this branch means the router selected phone. The router may be
-        # monkeypatched in invariant tests; do not re-probe reachability here.
-        result = _send_phone_tts()
-        if result.get("success"):
-            return _finish(result)
-        logger.info(f"TTS: Phone failed ({result.get('error')})")
-        if _mac_tts_available():
-            return _finish(speak_tts_mac(message, voice, rate))
-        return _finish(_no_playback_backend("phone_failed_no_fallthrough_backend"))
-
-    if device == "mac":
-        return _finish(speak_tts_mac(message, voice, rate))
+    if device in TTS_EXECUTION_BACKENDS:
+        result = dispatch_tts_chunks_to_backend(
+            device,
+            chunks,
+            voice=voice,
+            rate=rate,
+            wsl_voice=wsl_voice,
+            wsl_rate=wsl_rate if wsl_rate is not None else rate,
+        )
+        if not result.get("success"):
+            logger.info("TTS: %s backend failed (%s); no Mac fallback", device, result.get("error"))
+        return _finish(result)
 
     return _finish(_no_playback_backend("unknown_playback_backend"))
 
@@ -893,7 +851,7 @@ async def dispatch_notify(
 
     Feature code calls this in-process to notify the Emperor. One call carries
     the whole intent (message + optional tactile/banner); the router owns:
-      * geofence-first TTS routing (Discord VC → WSL/phone-by-geofence → Mac)
+      * authoritative TTS routing (Discord VC → situational phone/WSL/later Linux)
         via speak_tts()/resolve_tts_device();
       * tactile (vibe/beep) + banner delivery as the phone attention signal;
       * quiet-hours gating across the whole notification.
@@ -1037,7 +995,8 @@ class TTSQueueItem:
     message: str
     voice: str
     sound: str
-    name: str
+    name: str = ""
+    tab_name: str | None = None  # compatibility alias for older queue tests/callers
     queue_target: str = "pause"  # "hot" or "pause"
     queued_at: datetime = field(default_factory=datetime.now)
     status: str = "queued"  # queued, playing, completed
@@ -1050,6 +1009,10 @@ class TTSQueueItem:
     # (dispatch_notify) awaits it for truthful delivery; agent-TTS enqueues leave
     # it None. Excluded from equality/repr so a pending Future never trips them.
     completion: "asyncio.Future | None" = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.name and self.tab_name:
+            self.name = self.tab_name
 
 
 # Global TTS queue state — two-queue model
@@ -1103,6 +1066,9 @@ def _positive_int_env(name: str, default: int, *, minimum: int = 1) -> int:
     return value
 
 
+TTS_CHUNK_MAX_CHARS = _positive_int_env("TOKEN_API_TTS_CHUNK_MAX_CHARS", 360, minimum=80)
+
+
 # Passive held-message drain policy.  Pause queue entries older than this are no
 # longer actionable as speech; they are deliberately expired and logged when the
 # authoritative languishing snapshot is read.  This is a source drain, not an
@@ -1142,6 +1108,361 @@ _SYSTEM_TTS_ROW: dict[str, object] = {
 # duration estimate. Tune generously; phone TTS lines are short.
 PHONE_PLAYBACK_WATCHDOG_S = _positive_int_env("TOKEN_API_PHONE_PLAYBACK_WATCHDOG_S", 30)
 pending_phone_playbacks: dict[str, "threading.Event"] = {}
+_tts_authoritative_state_lock = threading.RLock()
+TTS_AUTHORITATIVE_STATE: dict[str, object] = {
+    "session_id": uuid.uuid4().hex,
+    "queue": {"hot": 0, "pause": 0},
+    "current": None,
+    "next": None,
+    "playback_id": None,
+    "backend": None,
+    "control": {
+        "state": "idle",
+        "last_action": None,
+        "speed": 1.0,
+        "source": None,
+        "updated_at": None,
+    },
+    "last_backend_ack": None,
+    "last_error": None,
+    "updated_at": None,
+}
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def get_tts_authoritative_state() -> dict:
+    """Return a snapshot of Token-OS authoritative TTS state."""
+    with _tts_authoritative_state_lock:
+        return json.loads(json.dumps(TTS_AUTHORITATIVE_STATE))
+
+
+def _update_tts_authoritative_state(**updates) -> dict:
+    with _tts_authoritative_state_lock:
+        TTS_AUTHORITATIVE_STATE.update(updates)
+        TTS_AUTHORITATIVE_STATE["queue"] = {"hot": len(hot_queue), "pause": len(pause_queue)}
+        TTS_AUTHORITATIVE_STATE["updated_at"] = _now_iso()
+        return get_tts_authoritative_state()
+
+
+def _record_tts_backend_active(
+    backend: str | None,
+    *,
+    playback_id: str | None = None,
+    current: dict | None = None,
+    next_chunk: dict | None = None,
+) -> dict:
+    """Record the active execution backend/chunk before dispatching to it."""
+    if backend not in TTS_EXECUTION_BACKENDS:
+        backend = None
+    return _update_tts_authoritative_state(
+        backend=backend,
+        playback_id=playback_id,
+        current=current,
+        next=next_chunk,
+        last_error=None,
+    )
+
+
+def _record_tts_control_state(request: TTSControlRequest, backend: str | None) -> dict:
+    action = (request.command or request.action or "").strip().lower()
+    with _tts_authoritative_state_lock:
+        control = dict(TTS_AUTHORITATIVE_STATE.get("control") or {})
+        control["last_action"] = action
+        control["source"] = request.source
+        control["updated_at"] = _now_iso()
+        if action == "pause":
+            control["state"] = "paused"
+        elif action == "resume":
+            control["state"] = "playing"
+        elif action == "skip":
+            control["state"] = "skipping"
+        elif action == "speed":
+            control["state"] = "playing"
+            control["speed"] = request.speed
+        TTS_AUTHORITATIVE_STATE["control"] = control
+        if backend in TTS_EXECUTION_BACKENDS:
+            TTS_AUTHORITATIVE_STATE["backend"] = backend
+        if request.playback_id:
+            TTS_AUTHORITATIVE_STATE["playback_id"] = request.playback_id
+        TTS_AUTHORITATIVE_STATE["queue"] = {"hot": len(hot_queue), "pause": len(pause_queue)}
+        TTS_AUTHORITATIVE_STATE["updated_at"] = _now_iso()
+        return get_tts_authoritative_state()
+
+
+_TTS_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def build_tts_chunk_handoff(text: str, *, max_chars: int | None = None) -> list[dict]:
+    """Build the backend chunk contract from already-sanitized speech text.
+
+    Each chunk is a dict with ``playback_id``, ``chunk_id``, ``index``, ``total``,
+    ``text``, and ``text_hash``. Dispatch payloads include exactly the current
+    chunk plus one optional ``next`` chunk; backends must not run further ahead.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return []
+    max_chars = max_chars or TTS_CHUNK_MAX_CHARS
+    parts: list[str] = []
+    for sentence in _TTS_SENTENCE_SPLIT_RE.split(cleaned):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) <= max_chars:
+            parts.append(sentence)
+            continue
+        words = sentence.split()
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if current and len(candidate) > max_chars:
+                parts.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            parts.append(current)
+
+    utterance_id = uuid.uuid4().hex
+    total = len(parts)
+    chunks = []
+    for index, chunk_text in enumerate(parts):
+        playback_id = f"{utterance_id}-{index + 1}"
+        chunk_id = f"{utterance_id}:{index + 1}/{total}"
+        chunks.append(
+            {
+                "playback_id": playback_id,
+                "utterance_id": utterance_id,
+                "chunk_id": chunk_id,
+                "index": index,
+                "total": total,
+                "text": chunk_text,
+                "text_hash": hashlib.sha256(chunk_text.encode("utf-8")).hexdigest(),
+            }
+        )
+    return chunks
+
+
+def _chunk_public_payload(chunk: dict | None) -> dict | None:
+    if not chunk:
+        return None
+    return {
+        "playback_id": chunk.get("playback_id"),
+        "chunk_id": chunk.get("chunk_id"),
+        "index": chunk.get("index"),
+        "total": chunk.get("total"),
+        "text": chunk.get("text"),
+        "text_hash": chunk.get("text_hash"),
+    }
+
+
+def _backend_chunk_payload(
+    current_chunk: dict, next_chunk: dict | None, *, rate: int | float = 0
+) -> dict:
+    current_public = _chunk_public_payload(current_chunk) or {}
+    next_public = _chunk_public_payload(next_chunk)
+    payload = {
+        "session_id": TTS_AUTHORITATIVE_STATE["session_id"],
+        "playback_id": current_chunk["playback_id"],
+        "utterance_id": current_chunk["utterance_id"],
+        "chunk_id": current_chunk["chunk_id"],
+        "chunk_index": current_chunk["index"],
+        "chunk_count": current_chunk["total"],
+        "current_index": current_chunk["index"],
+        "next_index": next_chunk["index"] if next_chunk else None,
+        "tts_text": current_chunk["text"],  # backward-compatible MacroDroid key
+        "current_chunk": current_chunk["text"],  # Track B phone field
+        "current_chunk_text": current_chunk["text"],
+        "current_chunk_hash": current_chunk["text_hash"],
+        "current_chunk_meta": json.dumps(current_public, ensure_ascii=False),
+        "speed": rate,
+        "rate": rate,
+    }
+    if next_public:
+        payload.update(
+            {
+                "next_chunk_id": next_chunk["chunk_id"],
+                "next_chunk": next_chunk["text"],  # Track B phone field
+                "next_chunk_text": next_chunk["text"],
+                "next_chunk_hash": next_chunk["text_hash"],
+                "next_chunk_meta": json.dumps(next_public, ensure_ascii=False),
+            }
+        )
+    else:
+        payload.update(
+            {
+                "next_chunk_id": None,
+                "next_chunk": None,
+                "next_chunk_text": None,
+                "next_chunk_hash": None,
+                "next_chunk_meta": None,
+            }
+        )
+    return payload
+
+
+def _send_phone_tts_chunk(payload: dict) -> dict:
+    if _send_to_phone is None:
+        return _no_playback_backend("phone_transport_unavailable")
+    playback_id = str(payload["playback_id"])
+    event = threading.Event()
+    pending_phone_playbacks[playback_id] = event
+    try:
+        try:
+            result = dict(_send_to_phone("/tts-chunk", payload) or {})
+        except Exception as exc:
+            logger.warning("TTS: Phone chunk send failed (%s)", exc)
+            return {"success": False, "error": "phone_send_failed", "reason": str(exc)}
+        if not result.get("success"):
+            return result
+        result.setdefault("method", "phone")
+        confirmed = event.wait(timeout=PHONE_PLAYBACK_WATCHDOG_S)
+        if not confirmed:
+            logger.warning(
+                "TTS phone: playback-complete callback missed for %s after %ss; advancing",
+                playback_id,
+                PHONE_PLAYBACK_WATCHDOG_S,
+            )
+        result["playback_id"] = playback_id
+        result["chunk_id"] = payload.get("chunk_id")
+        result["playback_confirmed"] = confirmed
+        return result
+    finally:
+        pending_phone_playbacks.pop(playback_id, None)
+
+
+def _post_wsl_chunk(payload: dict, *, voice: str | None, rate: int = 0) -> dict:
+    host = DESKTOP_CONFIG["host"]
+    port = DESKTOP_CONFIG["port"]
+    TTS_BACKEND["current"] = "wsl"
+    body = {
+        **payload,
+        "message": payload["current_chunk_text"],
+        "voice": voice or "Microsoft David",
+        "rate": max(-10, min(10, int(rate or 0) + TTS_WSL_RATE_BIAS)),
+    }
+    try:
+        resp = requests.post(f"http://{host}:{port}/tts/chunk", json=body, timeout=300)
+    except (requests.ConnectionError, requests.Timeout):
+        TTS_BACKEND["current"] = None
+        TTS_BACKEND["satellite_available"] = False
+        TTS_BACKEND["last_health_check"] = time.time()
+        return {"success": False, "error": "satellite_unreachable", "method": "wsl_sapi_chunk"}
+    except Exception as exc:
+        TTS_BACKEND["current"] = None
+        return {"success": False, "error": str(exc), "method": "wsl_sapi_chunk"}
+    finally:
+        if TTS_BACKEND.get("current") == "wsl":
+            TTS_BACKEND["current"] = None
+
+    if resp.status_code == 200:
+        data = dict(resp.json())
+        data.setdefault("method", "wsl_sapi_chunk")
+        if data.get("success") and data.get("rendered_hash"):
+            expected_hash = payload["current_chunk_hash"]
+            if data["rendered_hash"] != expected_hash:
+                return {
+                    "success": False,
+                    "error": "satellite_text_integrity_check_failed",
+                    "method": data.get("method"),
+                    "chunk_id": payload.get("chunk_id"),
+                }
+        return data
+    if resp.status_code == 409:
+        return {"success": False, "error": "satellite_busy", "method": "wsl_sapi_chunk"}
+    return {
+        "success": False,
+        "error": f"satellite returned {resp.status_code}",
+        "method": "wsl_sapi_chunk",
+    }
+
+
+def dispatch_tts_chunks_to_backend(
+    backend: str,
+    chunks: list[dict],
+    *,
+    voice: str | None = None,
+    rate: int = 0,
+    wsl_voice: str | None = None,
+    wsl_rate: int | None = None,
+) -> dict:
+    """Dispatch sanitized chunks to the selected execution backend.
+
+    Token-OS records the current/next handoff before every backend call. A
+    backend failure records an authoritative error and stops; there is no Mac
+    fallback.
+    """
+    if backend not in TTS_EXECUTION_BACKENDS:
+        _record_tts_backend_active(None)
+        return {"success": False, "error": "unknown_playback_backend", "method": None}
+    if not chunks:
+        return {"success": False, "error": "empty_audio_payload", "method": None}
+
+    results = []
+    for index, chunk in enumerate(chunks):
+        next_chunk = chunks[index + 1] if index + 1 < len(chunks) else None
+        _record_tts_backend_active(
+            backend,
+            playback_id=chunk["playback_id"],
+            current=_chunk_public_payload(chunk),
+            next_chunk=_chunk_public_payload(next_chunk),
+        )
+        payload = _backend_chunk_payload(chunk, next_chunk, rate=rate)
+        if backend == "phone":
+            result = _send_phone_tts_chunk(payload)
+        elif backend == "wsl":
+            result = _post_wsl_chunk(payload, voice=wsl_voice or voice, rate=wsl_rate or rate)
+        else:
+            result = {"success": False, "error": "linux_backend_not_configured", "method": "linux"}
+
+        result = dict(result or {})
+        result.setdefault("chunk_id", chunk["chunk_id"])
+        results.append(result)
+        if result.get("skipped"):
+            return {
+                "success": False,
+                "skipped": True,
+                "method": result.get("method") or backend,
+                "chunks": len(chunks),
+                "completed_chunks": index,
+                "results": results,
+                "reason": "skipped",
+            }
+        if not result.get("success"):
+            error = result.get("error") or "backend_chunk_failed"
+            _update_tts_authoritative_state(
+                last_error={
+                    "backend": backend,
+                    "playback_id": chunk["playback_id"],
+                    "chunk_id": chunk["chunk_id"],
+                    "error": error,
+                    "reported_at": _now_iso(),
+                }
+            )
+            return {
+                "success": False,
+                "error": error,
+                "method": result.get("method") or backend,
+                "chunks": len(chunks),
+                "completed_chunks": index,
+                "results": results,
+                "reason": result.get("reason") or error,
+            }
+
+    return {
+        "success": True,
+        "method": results[-1].get("method") or backend,
+        "backend": backend,
+        "chunks": len(chunks),
+        "completed_chunks": len(chunks),
+        "playback_id": results[-1].get("playback_id"),
+        "playback_confirmed": results[-1].get("playback_confirmed"),
+        "results": results,
+    }
+
 
 # How long the awaited front door (``dispatch_notify`` / ``POST /api/notify``)
 # waits for the worker to finish playing the line it enqueued before reporting
@@ -1163,7 +1484,7 @@ TTS_RATE_BASE_WPM = _positive_int_env("TOKEN_API_TTS_RATE_BASE_WPM", 210, minimu
 # lines don't false-timeout (was a hardcoded 60s).
 TTS_DISCORD_HTTP_TIMEOUT_S = _positive_int_env("TOKEN_API_TTS_DISCORD_HTTP_TIMEOUT_S", 180)
 
-# Small positive SAPI rate bias for the (retired) WSL satellite path, from the
+# Small positive SAPI rate bias for the WSL satellite path, from the
 # same tunable family, so when it is reached speech is a touch snappier. Clamped
 # into the SAPI -10..10 scale at the callsite.
 TTS_WSL_RATE_BIAS = _positive_int_env("TOKEN_API_TTS_WSL_RATE_BIAS", 1, minimum=0)
@@ -2207,7 +2528,8 @@ def get_tts_queue_status() -> dict:
 async def skip_tts(clear_queue: bool = False) -> dict:
     """Skip current TTS and optionally clear the queue.
 
-    Routes skip to the correct backend: WSL satellite or local Mac process.
+    Routes skip to the active execution backend through the same control plane.
+    Mac is not a TTS backend and is never targeted.
 
     Args:
         clear_queue: If True, also clear all pending items in the queue.
@@ -2217,43 +2539,17 @@ async def skip_tts(clear_queue: bool = False) -> dict:
     """
     global tts_current_process, tts_current, tts_skip_requested
 
-    result = {"skipped": False, "cleared": 0, "backend": TTS_BACKEND["current"]}
-    current_backend = TTS_BACKEND["current"]
-
-    if current_backend == "wsl":
-        # Skip on WSL satellite — try both file playback stop and direct speak skip
-        host = DESKTOP_CONFIG["host"]
-        port = DESKTOP_CONFIG["port"]
-        try:
-            # First try stopping file playback (WMP)
-            resp = requests.post(
-                f"http://{host}:{port}/tts/control", json={"command": "stop"}, timeout=3
-            )
-            if resp.status_code == 200:
-                result["skipped"] = True
-                logger.info("TTS skip routed to WSL satellite (file playback stop)")
-            else:
-                # Fall back to direct speak skip
-                resp = requests.post(f"http://{host}:{port}/tts/skip", timeout=3)
-                result["skipped"] = resp.status_code == 200
-                logger.info(f"TTS skip routed to WSL satellite (direct): {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"TTS skip to WSL satellite failed (non-fatal): {e}")
-
-    elif current_backend == "mac":
-        # Kill local Mac `say` process
-        if tts_current_process and tts_current_process.poll() is None:
-            tts_skip_requested = True
-            try:
-                tts_current_process.kill()
-                tts_current_process.wait(timeout=1.0)
-                result["skipped"] = True
-                logger.info("TTS process killed via skip (Mac)")
-            except Exception as e:
-                logger.warning(f"Error killing TTS process: {e}")
-            tts_current_process = None
-
-    # else: nothing playing, no-op
+    backend = _active_tts_backend()
+    echo = await asyncio.to_thread(
+        _echo_tts_control_to_backend,
+        backend,
+        {
+            "action": "skip",
+            "playback_id": TTS_AUTHORITATIVE_STATE.get("playback_id"),
+            "source": "skip_tts",
+        },
+    )
+    result = {"skipped": bool(echo.get("success")), "cleared": 0, "backend": backend, "echo": echo}
 
     # Clear both queues if requested
     if clear_queue:
@@ -2319,6 +2615,189 @@ def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
 # ============ TTS Endpoints ============
 
 
+def _active_tts_backend(requested: str | None = None) -> str | None:
+    if requested in TTS_EXECUTION_BACKENDS:
+        return requested
+    state_backend = TTS_AUTHORITATIVE_STATE.get("backend")
+    if state_backend in TTS_EXECUTION_BACKENDS:
+        return str(state_backend)
+    current_backend = TTS_BACKEND.get("current")
+    if current_backend in TTS_EXECUTION_BACKENDS:
+        return str(current_backend)
+    if tts_current and tts_current.playback_target in TTS_EXECUTION_BACKENDS:
+        return tts_current.playback_target
+    return None
+
+
+def _echo_tts_control_to_backend(backend: str | None, payload: dict) -> dict:
+    """Echo an already-recorded control to the active execution backend."""
+    if backend not in TTS_EXECUTION_BACKENDS:
+        return {"success": False, "backend": backend, "error": "no_active_tts_backend"}
+
+    action = payload["action"]
+    if backend == "phone":
+        if _send_to_phone is None:
+            return {"success": False, "backend": backend, "error": "phone_transport_unavailable"}
+        params = {
+            "command": action,
+            "session_id": payload.get("session_id") or TTS_AUTHORITATIVE_STATE.get("session_id"),
+            "playback_id": payload.get("playback_id"),
+            "speed": payload.get("speed"),
+        }
+        try:
+            result = dict(_send_to_phone("/tts-local-control", params) or {})
+        except Exception as exc:
+            return {"success": False, "backend": backend, "error": str(exc)}
+        result.setdefault("backend", backend)
+        return result
+
+    if backend == "wsl":
+        command = "stop" if action == "skip" else action
+        body = {"command": command}
+        if payload.get("speed") is not None:
+            body["speed"] = payload.get("speed")
+        try:
+            resp = requests.post(
+                f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/tts/control",
+                json=body,
+                timeout=3,
+            )
+        except Exception as exc:
+            return {"success": False, "backend": backend, "error": str(exc)}
+        if resp.status_code == 200:
+            result = dict(resp.json())
+            result.setdefault("success", True)
+            result.setdefault("backend", backend)
+            return result
+        return {"success": False, "backend": backend, "error": f"wsl returned {resp.status_code}"}
+
+    return {"success": False, "backend": backend, "error": "linux_backend_not_configured"}
+
+
+@router.post("/api/tts/control")
+async def api_tts_control(request: TTSControlRequest) -> dict:
+    """Single authoritative TTS control ingress.
+
+    Contract for overlays/backends:
+    1. POST here with ``action`` = pause|resume|skip|speed.
+    2. Token-OS records authoritative state first.
+    3. Token-OS echoes the same control to the active backend's local-control
+       endpoint/mechanism and returns that echo/error without falling back to Mac.
+    """
+    action = (request.command or request.action or "").strip().lower()
+    if action not in {"pause", "resume", "skip", "speed"}:
+        raise HTTPException(status_code=400, detail="command must be pause, resume, skip, or speed")
+    if action == "speed" and request.speed is None:
+        raise HTTPException(status_code=400, detail="speed action requires speed")
+
+    backend = _active_tts_backend(request.backend)
+    recorded = _record_tts_control_state(request, backend)
+    echo_payload = {
+        "action": action,
+        "command": action,
+        "speed": request.speed,
+        "playback_id": request.playback_id or recorded.get("playback_id"),
+        "session_id": request.session_id or recorded.get("session_id"),
+        "source": request.source,
+    }
+    backend_echo = await asyncio.to_thread(_echo_tts_control_to_backend, backend, echo_payload)
+    success = bool(backend_echo.get("success"))
+    if not success:
+        _update_tts_authoritative_state(
+            last_error={
+                "backend": backend,
+                "playback_id": echo_payload.get("playback_id"),
+                "error": backend_echo.get("error") or "backend_control_failed",
+                "reported_at": _now_iso(),
+            }
+        )
+    await log_event(
+        "tts_control",
+        device_id="tts_control",
+        details={
+            "action": action,
+            "speed": request.speed,
+            "backend": backend,
+            "success": success,
+            "backend_echo": backend_echo,
+        },
+    )
+    return {
+        "success": success,
+        "state": get_tts_authoritative_state(),
+        "backend_echo": backend_echo,
+    }
+
+
+@router.post("/api/tts/backend/ack")
+async def api_tts_backend_ack(request: TTSBackendAckRequest) -> dict:
+    """Execution backend acknowledgement for current/next chunk dispatch."""
+    ack = {
+        "backend": request.backend,
+        "session_id": request.session_id,
+        "playback_id": request.playback_id,
+        "chunk_id": request.chunk_id,
+        "status": request.status,
+        "detail": request.detail or {},
+        "reported_at": _now_iso(),
+    }
+    _update_tts_authoritative_state(last_backend_ack=ack)
+    await log_event("tts_backend_ack", device_id=request.backend, details=ack)
+    return {"success": True, "state": get_tts_authoritative_state()}
+
+
+@router.post("/api/tts/chunk-event")
+async def api_tts_chunk_event(request: TTSChunkEventRequest) -> dict:
+    """Phone chunk lifecycle event ingress.
+
+    Accepted Track B events:
+    - ``current_complete_next_starting`` — phone finished current and is
+      starting its one buffered next chunk.
+    - ``buffer_drained`` — phone consumed its one-chunk write-ahead and needs
+      Token-OS to dispatch the next handoff.
+    """
+    if request.event not in {"current_complete_next_starting", "buffer_drained"}:
+        raise HTTPException(status_code=400, detail="unknown chunk event")
+    event = {
+        "event": request.event,
+        "backend": request.backend,
+        "session_id": request.session_id,
+        "playback_id": request.playback_id,
+        "chunk_id": request.chunk_id,
+        "current_index": request.current_index,
+        "next_index": request.next_index,
+        "detail": request.detail or {},
+        "reported_at": _now_iso(),
+    }
+    _update_tts_authoritative_state(last_backend_ack=event)
+    await log_event("tts_chunk_event", device_id=request.backend, details=event)
+    return {"success": True, "state": get_tts_authoritative_state()}
+
+
+@router.post("/api/tts/backend-error")
+@router.post("/api/tts/backend/error")
+async def api_tts_backend_error(request: TTSBackendErrorRequest) -> dict:
+    """Execution backend error report. Token-OS records the error; no Mac fallback."""
+    error = {
+        "backend": request.backend,
+        "session_id": request.session_id,
+        "playback_id": request.playback_id,
+        "chunk_id": request.chunk_id,
+        "error": request.error,
+        "retryable": request.retryable,
+        "detail": request.detail or {},
+        "reported_at": _now_iso(),
+    }
+    state = get_tts_authoritative_state()
+    control = dict(state.get("control") or {})
+    control["state"] = "error"
+    control["last_action"] = "backend_error"
+    control["updated_at"] = _now_iso()
+    _update_tts_authoritative_state(last_error=error, control=control)
+    await log_event("tts_backend_error", device_id=request.backend, details=error)
+    return {"success": True, "state": get_tts_authoritative_state()}
+
+
 @router.get("/api/tts/routing")
 async def get_tts_routing():
     """Return the current TTS routing target and reasoning.
@@ -2338,8 +2817,8 @@ async def get_tts_routing():
             "in_meeting": in_meeting,
             "global_mode": global_mode,
             "satellite_available": is_satellite_tts_available(),
-            # Diagnostic only: coarse HTTP reachability is not a TTS routing
-            # predicate. `phone_audio_proxy.available` is the actual audio gate.
+            # Diagnostic only: phone chunk routing gates on MacroDroid reachability;
+            # phone_audio_proxy describes a separate receiver transport.
             "phone_server_reachable": is_phone_reachable(),
             "phone_audio_proxy": get_phone_audio_proxy_health(),
             "discord_vc_active": routing["device"] == "discord",
@@ -2353,7 +2832,7 @@ async def send_notification(request: NotifyRequest):
 
     Thin wrapper over the in-process `dispatch_notify` router core. Callers
     express intent (message + optional tactile/banner); the router owns
-    geofence-first TTS routing, quiet-hours gating, and device fanout. There is
+    authoritative TTS routing, quiet-hours gating, and device fanout. There is
     no caller-picks-a-device knob and no TTS-only sibling endpoint — speech
     always goes through the same routing brain.
     """
@@ -2503,8 +2982,8 @@ async def play_pane(request: PlayPaneRequest) -> dict:
 async def tts_playback_complete(request: PlaybackCompleteRequest) -> dict:
     """Phone audio-finish callback — the real serialization signal.
 
-    The device POSTs the ``playback_id`` it was handed (in the ``/speak``
-    ``tts_text`` query) once it has finished speaking that line. We set the
+    The device POSTs the ``playback_id`` it was handed (via ``/tts-chunk``)
+    once it has finished speaking that chunk. We set the
     matching Event so the blocked worker thread advances to the next queued item.
     No server-side duration estimation: the phone alone decides when "done."
 
