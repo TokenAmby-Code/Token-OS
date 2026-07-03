@@ -96,3 +96,20 @@ def test_send_gate_helpers_close_every_connection(db, monkeypatch):
         f"{len(opened)} connections opened, {len(closed_ids)} closed — "
         f"{len(leaked)} leaked (missing contextlib.closing)"
     )
+
+
+def test_daemon_sqlite_connects_are_wrapped_in_closing():
+    """Long-lived daemon modules must not rely on ``with sqlite3.connect`` alone."""
+    repo_root = ROOT.parent
+    checked = [
+        repo_root / "tmuxctld" / "lib" / "tmuxctl" / "send_gate.py",
+        repo_root / "tmuxctld" / "lib" / "tmuxctl" / "service.py",
+    ]
+    for path in checked:
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            if "sqlite3.connect" not in line:
+                continue
+            wrapped = (
+                "closing(sqlite3.connect" in line or "contextlib.closing(sqlite3.connect" in line
+            )
+            assert wrapped, f"{path}:{lineno} must wrap sqlite3.connect in contextlib.closing"
