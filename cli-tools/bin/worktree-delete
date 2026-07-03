@@ -285,8 +285,8 @@ _repo_slug_from_origin() {
     local origin
     origin="$(git --git-dir="$BARE_REPO" remote get-url origin 2>/dev/null || true)"
     case "$origin" in
-        git@github.com:*) printf '%s\n' "${origin#git@github.com:}" | sed -E 's#\\.git$##' ;;
-        https://github.com/*) printf '%s\n' "${origin#https://github.com/}" | sed -E 's#\\.git$##' ;;
+        git@github.com:*) printf '%s\n' "${origin#git@github.com:}" | sed -E 's#\.git$##' ;;
+        https://github.com/*) printf '%s\n' "${origin#https://github.com/}" | sed -E 's#\.git$##' ;;
         *) return 1 ;;
     esac
 }
