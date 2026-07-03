@@ -366,9 +366,11 @@ def test_typing_guard_enable_any_is_idempotent_when_canonical_binding_present() 
 
             proc = Proc()
             if args and args[0] == "list-keys":
+                # Canonical form self-unbinds and is display-message-free.
                 proc.stdout = (
                     "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
-                    "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=arm\"; send-keys'"
+                    "'unbind-key -n Any ; run-shell -b \"tmuxctld-ping POST "
+                    "/typing-guard-state cmd=arm\" ; send-keys'"
                 )
             return proc
 
@@ -433,6 +435,59 @@ def test_typing_guard_expired_off_transition_clears_legacy_guard_options() -> No
     assert state[tg.GUARD_UNTIL_OPTION] == "0"
     assert state[tg.GUARD_MARKER_OPTION] == ""
     assert all(option not in state for option in tg.LEGACY_GUARD_OPTIONS)
+
+
+def test_any_binding_template_self_unbinds_and_never_flashes_display_message() -> None:
+    """The daemon-sourced Any template must match the base-conf binding: it drops
+    the hook synchronously and fails silently (Emperor ruling 2026-07-02)."""
+    tmpl = daemon.typing_guard_state.ANY_BINDING
+    assert "unbind-key -n Any" in tmpl
+    assert tmpl.index("unbind-key -n Any") < tmpl.index(
+        "tmuxctld-ping POST /typing-guard-state cmd=arm"
+    )
+    assert ">/dev/null 2>&1" in tmpl
+    assert "display-message" not in tmpl
+    assert "tmuxctld-ping-/typing-guard-state-failed" not in tmpl
+
+
+def test_any_binding_status_treats_display_message_binding_as_noncanonical() -> None:
+    """A stale live Any binding (old display-message form, no self-unbind) must be
+    non-canonical so enable/rehydrate re-sources the silent self-unbinding one —
+    this rolls the fix onto an already-running tmux server on the next focus."""
+    tg = daemon.typing_guard_state
+    stale = (
+        "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+        "'run-shell -b \"tmuxctld-ping POST /typing-guard-state cmd=arm pane=%1 "
+        "|| env IMPERIUM_TMUX_RAW=1 tmux display-message "
+        "tmuxctld-ping-/typing-guard-state-failed\" ; send-keys'"
+    )
+    fresh = (
+        "bind-key -T root Any if-shell -F '#{==:#{mouse_x},}' "
+        "'unbind-key -n Any ; run-shell -b \"tmuxctld-ping POST "
+        "/typing-guard-state cmd=arm pane=%1\" ; send-keys'"
+    )
+
+    class FakeTmux:
+        def __init__(self, raw: str) -> None:
+            self.raw = raw
+
+        def run(self, *args: str, timeout: float = 0.5):  # noqa: ARG002
+            class Proc:
+                returncode = 0
+                stdout = ""
+
+            proc = Proc()
+            if args and args[0] == "list-keys":
+                proc.stdout = self.raw
+            return proc
+
+    stale_status = tg._any_binding_status(FakeTmux(stale))
+    assert stale_status["present"] is True
+    assert stale_status["canonical"] is False
+
+    fresh_status = tg._any_binding_status(FakeTmux(fresh))
+    assert fresh_status["present"] is True
+    assert fresh_status["canonical"] is True
 
 
 def test_typing_guard_topology_endpoint_rehydrates_without_state_command(monkeypatch) -> None:

@@ -41,10 +41,17 @@ ON_MARKER = "#[fg=colour214,bold]⌨#[default]"
 PENDING_MARKER = "#[fg=red,bold]⌨#[default]"
 AGENT_MARKER = "#[fg=green,bold]⌨#[default]"
 
+#: The keystroke branch drops the Any hook synchronously (``unbind-key -n Any``)
+#: before firing the arm, so one keystroke arms once and later keystrokes pass
+#: through with no per-keystroke ping storm.  Arm failure is silent
+#: (``>/dev/null 2>&1``) — a best-effort background control-plane write must
+#: never flash ``display-message`` at the Emperor's client.  Must stay in sync
+#: with the ``bind -n Any`` block in ``cli-tools/tmux/tmux-base.conf``.
 ANY_BINDING = """\
 bind -n Any {
   if -F '#{==:#{mouse_x},}' {
-    run-shell -b "tmuxctld-ping POST /typing-guard-state cmd=arm pane=#{q:pane_id} seconds=300 now=#{client_activity} client=#{q:client_tty} term=#{q:client_termname} pid=#{q:client_pid} session=#{q:session_name} >/dev/null || env IMPERIUM_TMUX_RAW=1 tmux display-message tmuxctld-ping-/typing-guard-state-failed"
+    unbind-key -n Any
+    run-shell -b "tmuxctld-ping POST /typing-guard-state cmd=arm pane=#{q:pane_id} seconds=300 now=#{client_activity} client=#{q:client_tty} term=#{q:client_termname} pid=#{q:client_pid} session=#{q:session_name} >/dev/null 2>&1"
     send-keys
   } {
   }
@@ -120,10 +127,11 @@ def _any_binding_status(tmux: Tmux) -> dict[str, Any]:
         needle in raw
         for needle in (
             "#{==:#{mouse_x},}",
+            "unbind-key -n Any",
             "tmuxctld-ping POST /typing-guard-state cmd=arm",
             "send-keys",
         )
-    )
+    ) and "display-message" not in raw
     return {"present": present, "canonical": canonical, "raw": raw[:500]}
 
 

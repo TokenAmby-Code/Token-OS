@@ -534,3 +534,55 @@ def test_workspace_launcher_remains_on_tmux_run_and_is_documented() -> None:
     assert line == 'bind W run-shell "tmux-run tx start"'
     assert "# Workspace launcher. Deliberately left as the shell CLI" in conf
     assert "out of scope for daemon keybind rebinding" in conf
+
+
+def _any_binding_block() -> str:
+    conf = CONF.read_text(encoding="utf-8")
+    return conf.split("bind -n Any {", 1)[1].split("}\nbind -n Enter", 1)[0]
+
+
+def test_typing_guard_keystroke_bindings_never_flash_display_message() -> None:
+    """Emperor ruling 2026-07-02: the typing-guard keystroke hooks must fail
+    SILENTLY. A best-effort background arm/pending write must never surface the
+    `tmuxctld-ping-/typing-guard-state-failed` status flash into the Emperor's
+    client while he is typing (the rogue-error symptom)."""
+    any_binding = _any_binding_block()
+    assert "display-message" not in any_binding
+    assert "tmuxctld-ping-/typing-guard-state-failed" not in any_binding
+    for key in ("Enter", "C-m", "BSpace", "C-h", "C-c"):
+        line = _line_starting(f"bind -n {key} ")
+        assert "display-message" not in line, f"{key} must not flash a status message"
+        assert "tmuxctld-ping-/typing-guard-state-failed" not in line
+        # Silent redirect, not the noisy `|| tmux display-message` fallback.
+        assert ">/dev/null 2>&1" in line
+        assert "|| env IMPERIUM_TMUX_RAW=1 tmux display-message" not in line
+
+
+def test_typing_guard_any_key_self_unbinds_before_arming() -> None:
+    """The Any keystroke branch DROPS the hook synchronously (`unbind-key -n Any`)
+    before firing the arm, so a single keystroke arms once and every later
+    keystroke of the same message passes straight through — no per-keystroke ping
+    storm even when the daemon is slow/unreachable."""
+    any_binding = _any_binding_block()
+    assert "unbind-key -n Any" in any_binding
+    # Drop the hook FIRST, then arm.
+    assert any_binding.index("unbind-key -n Any") < any_binding.index(
+        "tmuxctld-ping POST /typing-guard-state cmd=arm"
+    )
+    # Arm failure is silent — no `||` display-message fallback survives.
+    assert ">/dev/null 2>&1" in any_binding
+    assert "display-message" not in any_binding
+
+
+def test_typing_guard_edit_keys_pass_through_while_human_guard_is_live() -> None:
+    """BSpace/C-h/C-c must NOT ping the daemon while a HUMAN (or PENDING) guard is
+    already live — zero keystroke hook execution during active typing. The
+    guard-live branch is a bare send-keys with no endpoint call."""
+    for key in ("BSpace", "C-h", "C-c"):
+        line = _line_starting(f"bind -n {key} ")
+        # The short-circuit condition covers human as well as pending now.
+        assert "#{==:#{@TYPING_GUARD_KIND},human}" in line
+        assert "#{==:#{@TYPING_GUARD_KIND},pending}" in line
+        guard_live_branch = line.split("} {")[0]
+        assert "tmuxctld-ping" not in guard_live_branch
+        assert "send-keys" in guard_live_branch
