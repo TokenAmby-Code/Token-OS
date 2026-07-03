@@ -55,7 +55,9 @@ def _load_tmux_context():
     return module
 
 
-def test_tmux_context_check_pre_compact_threads_planning_state_into_message(monkeypatch) -> None:
+def test_tmux_context_check_pre_compact_threads_planning_state_into_message(
+    monkeypatch, tmp_path
+) -> None:
     """The status hook must pass planning_state through so the injected nudge is
     plan-aware — an in-plan-mode instance gets the no-gather-context message."""
     module = _load_tmux_context()
@@ -69,8 +71,10 @@ def test_tmux_context_check_pre_compact_threads_planning_state_into_message(monk
 
     monkeypatch.setattr(module.subprocess, "Popen", FakePopen)
     monkeypatch.setattr(module, "tmux_pane_has_input", lambda _pane: False)
+    # Keep the test hermetic: cooldown marker writes go to a tmp dir, never real
+    # /tmp, and the exists() stub keeps both calls past the cooldown gate.
+    monkeypatch.setattr(module, "STATE_DIR", str(tmp_path))
     monkeypatch.setattr(module.os.path, "exists", lambda _p: False)
-    monkeypatch.setattr(module.os, "makedirs", lambda *a, **k: None)
     monkeypatch.setenv("TMUX", "1")
 
     # Well over the 250k flush threshold (pct * total / 100).
