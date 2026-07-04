@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Civic Initiatives "ci" monogram — flat vector recreation of the brand-book
+       mark (orange lowercase c + white lowercase i), transparent background.
+       Colours: brand orange #E8843A, white. -->
+  <path d="M300 388 A132 132 0 1 1 300 184" fill="none" stroke="#E8843A" stroke-width="64" stroke-linecap="round"/>
+  <circle cx="374" cy="150" r="35" fill="#ffffff"/>
+  <rect x="351" y="206" width="46" height="230" rx="21" fill="#ffffff"/>
+</svg>

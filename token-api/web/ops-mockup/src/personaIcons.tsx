@@ -13,6 +13,11 @@
 // persona, and all 13 Astartes chapter locks — not just the senders on screen.
 // ─────────────────────────────────────────────────────────────────────────
 import type { ReactNode } from 'react';
+// Full-colour brand assets for the image personas (see PERSONA_IMAGE below).
+// Vite resolves each import to a served URL string.
+import paxAvatar from './assets/pax-bot-pfp.png';
+import ciMonogram from './assets/ci-logo.svg';
+import malcadorPortrait from './assets/malcador-photoroom.png';
 
 // The raw single-path SVG source for every icon, keyed by module path. ONE Vite
 // glob keeps src/icons/*.svg as the single source of truth — those files are
@@ -28,6 +33,30 @@ function rawIcon(name: string): string | undefined {
   return rawByFile[`./icons/${name}.svg`];
 }
 
+// ── Image personas ──────────────────────────────────────────────────────────
+// A few personas are represented by a FULL-COLOUR brand asset rather than a
+// single-path currentColor glyph — the Pax agent's avatar, the Civic
+// Initiatives "ci" monogram, and Malcador's portrait. These can't ride the
+// currentColor tint (they carry their own colours), so they resolve through a
+// SEPARATE registry and callers render them as an <image>/<img> rather than
+// inline SVG path markup. The asset URLs are imported at the top of this module
+// (Vite resolves each to a URL). Image personas still keep a glyph entry in
+// PERSONA_ICON below (their currentColor fallback for non-image surfaces such as
+// the TTS rings and worker chips); the image only takes over on the lemon.
+//
+// persona key → image asset URL. Keys are lower-kebab like PERSONA_ICON.
+export const PERSONA_IMAGE = {
+  pax: paxAvatar,
+  ci: ciMonogram,
+  malcador: malcadorPortrait,
+} satisfies Record<string, string>;
+
+// Resolve a persona to a full-colour image asset URL, or undefined if the
+// persona is a glyph persona (→ use personaIcon/personaIconInner instead).
+export function personaImage(persona: string): string | undefined {
+  return (PERSONA_IMAGE as Record<string, string>)[normalize(persona)];
+}
+
 // persona / chapter key → icon file basename. Keys are lower-kebab so they line
 // up with vault slugs (chapter locks, civic persona slugs) and DB persona names.
 // `satisfies` keeps the literal keys for PersonaKey while type-checking the map.
@@ -37,7 +66,7 @@ export const PERSONA_ICON = {
   administratum: 'scroll-quill',
   'fabricator-general': 'gears',
   mechanicus: 'cog',
-  malcador: 'wizard-staff',
+  malcador: 'malcador-sigil',
   inquisitor: 'magnifying-glass',
   vulkan: 'anvil-impact',
   guilliman: 'open-book',
@@ -86,6 +115,14 @@ export const PERSONA_ICON = {
   novamarines: 'beveled-star',
   minotaurs: 'minotaur',
   exorcists: 'daemon-skull',
+  'doom-eagles': 'eagle-emblem',
+  'celestial-lions': 'lion',
+  'death-spectres': 'ghost',
+  'storm-wardens': 'crossed-swords',
+  'sons-of-medusa': 'medusa-head',
+  lamenters: 'tear-tracks',
+  'hawk-lords': 'hawk-emblem',
+  'black-consuls': 'eagle-head',
 } satisfies Record<string, string>;
 
 // The union of every persona key the registry knows — lets callers (e.g. the

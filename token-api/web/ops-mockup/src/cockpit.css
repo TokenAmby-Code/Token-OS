@@ -57,6 +57,10 @@
   --phosphor-dim: #5e8a39;
   --hazard: #ff5b3d;
   --hazard-deep: #b8341d;
+  /* ERROR red — a hotter, purer red than the amber-leaning --hazard/--bad status
+     tone, reserved for hard data-integrity breaches (e.g. a duplicate persona in a
+     singleton queue) so an error never reads as ordinary severity. */
+  --error: #ff2740;
   --sel: #c77dff;
 
   --m-working: #93d94f;
@@ -433,6 +437,23 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 .ring--bad { --tone: var(--bad); }
 .ring--neutral { --tone: var(--muted); }
 .ring--idle { --tone: var(--idle); }
+
+/* ── Mutual-exclusion breach (see MockOpsCockpit duplicatePersonaKeys) ──────────
+   A persona has appeared more than once in one queue — an invariant the DB is
+   meant to prevent. The UI does NOT hide it: the offending dial is forced to the
+   pure ERROR red (overriding its status tone — this rule sits AFTER the tone rules
+   so it wins the --tone cascade) and pulses so the breach is impossible to miss. */
+.ring--dup { --tone: var(--error); border-color: var(--error); animation: dup-pulse 1.15s ease-in-out infinite; }
+/* worker chips carry their tone inline on `color`, so the override needs !important
+   to recolour the icon + glow; the brass border is a plain class override. */
+.worker-chip__disc--dup { color: var(--error) !important; border-color: var(--error); animation: dup-pulse 1.15s ease-in-out infinite; }
+@keyframes dup-pulse {
+  0%, 100% { box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.5), 0 0 6px 1px var(--error), 0 0 10px 2px color-mix(in srgb, var(--error) 55%, transparent); }
+  50%      { box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.5), 0 0 13px 3px var(--error), 0 0 24px 7px color-mix(in srgb, var(--error) 75%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ring--dup, .worker-chip__disc--dup { animation: none; box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.5), 0 0 12px 3px var(--error); }
+}
 
 /* soft hover glow — every dial, not just the interactive few */
 .ring:hover { box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.55), inset 0 0 6px -2px var(--tone), 0 0 8px -1px var(--tone), 0 0 6px 2px var(--tone); }

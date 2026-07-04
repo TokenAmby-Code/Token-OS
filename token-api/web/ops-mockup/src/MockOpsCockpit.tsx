@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { personaIcon, personaIconInner } from './personaIcons';
+import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   DAY_END,
   DAY_START,
@@ -858,6 +858,35 @@ function ttsItemToDial(item: MockTtsItem): MockDial {
   };
 }
 
+// ── Mutual-exclusion display (the DB owns the invariant) ─────────────────────
+// Each persona is a SINGLETON: it must appear at most once in any one queue (the
+// TTS queue, a worker queue). That uniqueness is enforced UPSTREAM in the DB, not
+// here — so the cockpit deliberately does NOT dedupe, reorder, or hide anything to
+// make a breach disappear. It renders the queue EXACTLY as the data says and, when
+// the data is broken (a persona repeats), marks every 2nd-or-later occurrence —
+// walked in queue order — so the operator sees the breach LOUDLY (a bright-red
+// error glow) instead of a silently-corrected display. Broken data reads AS broken.
+//
+// Returns the set of entry keys that are duplicate occurrences (the first stays
+// clean; the rest are flagged).
+function duplicatePersonaKeys<T>(
+  items: readonly T[],
+  order: (t: T) => number,
+  persona: (t: T) => string,
+  key: (t: T) => string,
+): Set<string> {
+  const seen = new Set<string>();
+  const dup = new Set<string>();
+  [...items]
+    .sort((a, b) => order(a) - order(b))
+    .forEach((t) => {
+      const p = persona(t);
+      if (seen.has(p)) dup.add(key(t));
+      else seen.add(p);
+    });
+  return dup;
+}
+
 // The play gesture turns the stack from a static display into a small state
 // machine over a stateful ordered list. Each live entry carries a stable key (so
 // React identity survives the reorders + removals), the projected queue item, a
@@ -986,6 +1015,10 @@ function TtsStack({ depth, onOpenDrawer, uiScale }: { depth: number; onOpenDrawe
     });
   }
 
+  // Flag any persona that repeats in the queue (2nd+ occurrence, by slot order) —
+  // a DB-invariant breach the stack surfaces rather than hides (see the helper).
+  const dupKeys = duplicatePersonaKeys(entries, (e) => e.slot, (e) => e.item.persona, (e) => e.key);
+
   return (
     <div
       className="tts-stack"
@@ -999,7 +1032,7 @@ function TtsStack({ depth, onOpenDrawer, uiScale }: { depth: number; onOpenDrawe
           key={e.key}
           dial={{ ...ttsItemToDial(e.item), id: e.key }}
           icon={personaIcon(e.item.persona)}
-          className={TTS_PHASE_CLASS[e.phase]}
+          className={`${TTS_PHASE_CLASS[e.phase]}${dupKeys.has(e.key) ? ' ring--dup' : ''}`}
           style={{
             width: TTS_DIAL_PX * uiScale,
             height: TTS_DIAL_PX * uiScale,
@@ -1704,12 +1737,18 @@ function ArcLayer({ uiScale }: {
   // single persona icon centred in it and a full divider line — spanning between the
   // top arc and the bottom lemon arc — at every interior boundary. COLOUR lives ONLY
   // in the icons (per-section tone below); both arcs and the dividers stay brass
-  // (--instrument). Icon set + order + exact persona→tone mapping are curated later —
-  // this is the placeholder six on hand from the TTS queue plus Mechanicus, and a
-  // distinct tunable palette drawn from the existing tone vars.
-  const SECTION_PERSONAS = ['custodes', 'dorn', 'corax', 'vulkan', 'sanguinius', 'mechanicus'];
+  // (--instrument). The roster is the six standing command personas. Sections build
+  // left→right along the arc, so k=0 is the MOST-LEFT tip and k=5 the FAR-RIGHT:
+  //   Malcador · Fabricator-General · CI · Pax · Custodes · Administratum.
+  // (Custodes sits 2nd-from-right — the slot Sanguinius held before this roster.)
+  // Three of them (Malcador, Pax, CI) are FULL-COLOUR brand images (personaImage), not tintable
+  // glyphs — the render branches on that below. The tone palette still lights each
+  // section's glow (curated later); it just no longer recolours the image personas.
+  const SECTION_PERSONAS = ['malcador', 'fabricator-general', 'ci', 'pax', 'custodes', 'administratum'];
   const SECTION_TONES = ['var(--good)', 'var(--warn)', 'var(--bad)', 'var(--neutral)', 'var(--idle)', 'var(--brass-bright)'];
   const ICON_PX = 40 * uiScale; // rendered icon box (the glyph's 512 viewBox scaled to this)
+  const IMG_PX = 52 * uiScale; // image-persona box — brand art carries its own padding,
+  //                              so it rides a touch larger to match the glyphs' weight.
   // Small fixed downward nudge off the lemon midline — icons read best a hair below
   // dead-centre between the two arcs (dialed in by eye; no longer a live knob).
   const ICON_NUDGE = 2 * uiScale;
@@ -1731,7 +1770,7 @@ function ArcLayer({ uiScale }: {
   // top arc between the tips is divided into six icon sections; both boundaries + the
   // section dividers stay brass, colour lives only in the icons.
   const { xL, xR, hasSpan, wy } = geo;
-  const sections: { cx: number; cy: number; inner: string; tone: string; region: string; gr: number; glow: boolean }[] = [];
+  const sections: { cx: number; cy: number; inner: string; img?: string | undefined; tone: string; region: string; gr: number; glow: boolean }[] = [];
   const dividers: { x1: number; y1: number; x2: number; y2: number }[] = [];
   const caps: string[] = []; // the two tapered tip regions, filled solid gold
   let lemonArcD = '';
@@ -1770,9 +1809,13 @@ function ArcLayer({ uiScale }: {
     for (let k = 0; k < PERSONA_COUNT; k++) {
       const xm = arc.xAtLength(sIn0 + inSpan * ((k + 0.5) / PERSONA_COUNT));
       const cy = (arc.f(xm) + wy(xm)) / 2 + ICON_NUDGE;
+      // Image personas (Pax, CI) resolve to a brand-asset URL; glyph personas to a
+      // single-path currentColor SVG. `img` wins in the render (the <image> branch).
+      const img = personaImage(SECTION_PERSONAS[k]);
       sections.push({
         cx: xm, cy,
-        inner: personaIconInner(SECTION_PERSONAS[k]) ?? '',
+        inner: img ? '' : personaIconInner(SECTION_PERSONAS[k]) ?? '',
+        img,
         tone: SECTION_TONES[k],
         region: regionPath(bxs[k], bxs[k + 1]),
         gr: (bxs[k + 1] - bxs[k]) * 0.62,
@@ -1833,13 +1876,23 @@ function ArcLayer({ uiScale }: {
             <line key={`dv${k}`} className="section-divider"
               x1={t.x1.toFixed(1)} y1={t.y1.toFixed(1)} x2={t.x2.toFixed(1)} y2={t.y2.toFixed(1)} />
           ))}
-          {/* per-section icons, natively embedded and tinted to the section tone. The
-              icon's 512 viewBox is scaled to ICON_PX and re-centred on its own origin. */}
-          {sections.map((sc, k) => (
-            <g key={`sec${k}`} className="section-icon" style={{ color: sc.tone }}
-              transform={`translate(${sc.cx.toFixed(1)} ${sc.cy.toFixed(1)}) scale(${(ICON_PX / 512).toFixed(4)}) translate(-256 -256)`}
-              dangerouslySetInnerHTML={{ __html: sc.inner }} />
-          ))}
+          {/* per-section icons. GLYPH personas are natively embedded (their 512 viewBox
+              scaled to ICON_PX, re-centred on the origin) and tinted to the section tone.
+              IMAGE personas (Malcador portrait, Pax avatar, CI monogram) render as a full-colour <image>,
+              centred on the same point at a slightly larger box (brand art carries its
+              own padding), and are NOT tinted — they keep their own colours. */}
+          {sections.map((sc, k) =>
+            sc.img ? (
+              <image key={`sec${k}`} className="section-image" href={sc.img}
+                x={(sc.cx - IMG_PX / 2).toFixed(1)} y={(sc.cy - IMG_PX / 2).toFixed(1)}
+                width={IMG_PX.toFixed(1)} height={IMG_PX.toFixed(1)}
+                preserveAspectRatio="xMidYMid meet" />
+            ) : (
+              <g key={`sec${k}`} className="section-icon" style={{ color: sc.tone }}
+                transform={`translate(${sc.cx.toFixed(1)} ${sc.cy.toFixed(1)}) scale(${(ICON_PX / 512).toFixed(4)}) translate(-256 -256)`}
+                dangerouslySetInnerHTML={{ __html: sc.inner }} />
+            ),
+          )}
         </g>
         {/* full curve, clipped a hair INSIDE the wheel disc — the arc's round cap
             overlaps onto the rim so it reads as one line forking off the circle;
@@ -1944,9 +1997,15 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
   const path = useMemo(() => makeQueuePath(side, geo, uiScale, gap, inset), [side, geo, uiScale, gap, inset]);
   const chip = WORKER_CHIP_PX * uiScale;
 
+  // A persona must be unique within this queue — the DB's invariant. When the data
+  // breaks it (WORKER_PERSONAS cycles once count exceeds the roster), the repeats
+  // are surfaced with a red error glow, not silently collapsed (see the helper).
+  const dupKeys = duplicatePersonaKeys(entries, (e) => e.slot, (e) => e.persona, (e) => e.key);
+
   return (
     <>
       {entries.map((e) => {
+        const isDup = dupKeys.has(e.key);
         // slot 0 sits `split` out from the stem (centre clearance); each further slot
         // marches one `pitch` outward along the arm.
         const p = path.pointAt((split + e.slot * pitch) * uiScale);
@@ -1955,7 +2014,7 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
             key={e.key}
             type="button"
             className="worker-chip"
-            aria-label={`Worker ${e.persona} — dismiss`}
+            aria-label={`Worker ${e.persona}${isDup ? ' — DUPLICATE (singleton breach)' : ''} — dismiss`}
             style={{
               width: chip,
               height: chip,
@@ -1965,7 +2024,7 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
             onClick={() => remove(e.key)}
           >
             <span
-              className={`worker-chip__disc${e.phase === 'dismissing' ? ' worker-chip__disc--out' : ''}`}
+              className={`worker-chip__disc${e.phase === 'dismissing' ? ' worker-chip__disc--out' : ''}${isDup ? ' worker-chip__disc--dup' : ''}`}
               style={{ color: e.tone }}
             >
               {personaIcon(e.persona)}
