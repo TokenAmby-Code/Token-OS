@@ -9,7 +9,12 @@ from typing import Any
 
 import pytest
 
-from custodes_state_policy import StateEvent, classify_trigger, evaluate_state_event
+from custodes_state_policy import (
+    StateEvent,
+    classify_trigger,
+    evaluate_state_event,
+    is_internal_only,
+)
 
 
 def _load_tts():
@@ -202,6 +207,15 @@ def test_queue_tts_accepts_phone_via_speak_when_macrodroid_reachable(
 
 
 def test_tts_queue_languishing_is_internal_state_trigger() -> None:
+    """Outright freeze: the label is recognized-internal and yields NO intervention.
+
+    D2 freeze made ``tts_queue_languishing`` internal-only. Previously the policy
+    still *minted* an enforcement-shaped ``CustodesIntervention`` and relied solely
+    on the router's early-return to avoid paging. The directive is to detach the
+    label from the firing/paging path OUTRIGHT: the policy layer — the single
+    source of truth for what may escalate — must never produce a dispatchable
+    intervention for it, regardless of caller or routing.
+    """
     event = StateEvent(
         event_type="tts_queue_languishing",
         source="tts_queue",
@@ -209,12 +223,35 @@ def test_tts_queue_languishing_is_internal_state_trigger() -> None:
         payload={"app": "tts_queue", "pause_queue_length": 6, "threshold": 5},
     )
 
-    intervention = evaluate_state_event(event, {})
-
-    assert intervention is not None
-    assert intervention.event_type == "tts_queue_languishing"
+    # No intervention object exists → nothing can ever be dispatched/paged from it.
+    assert evaluate_state_event(event, {}) is None
+    # Still recognized as an internal diagnostic label (not "unknown"), and never
+    # classified as enforcement.
+    assert is_internal_only("tts_queue_languishing") is True
     assert classify_trigger("tts_queue_languishing") == "state"
-    assert "internal diagnostics only" in intervention.behavioral_prompt
+
+
+def test_internal_only_label_never_yields_intervention() -> None:
+    """Every internal-only label is structurally barred from producing interventions.
+
+    This is the belt-and-suspenders guarantee behind the router freeze: even a
+    caller that runs the policy directly and dispatches its result cannot page,
+    because internal-only labels resolve to ``None`` at the policy source.
+    """
+    from custodes_state_policy import INTERNAL_ONLY_TRIGGERS
+
+    assert INTERNAL_ONLY_TRIGGERS  # non-empty guard
+    for label in INTERNAL_ONLY_TRIGGERS:
+        event = StateEvent(
+            event_type=label,
+            source="tts_queue",
+            severity=4,
+            payload={"app": "tts_queue", "pause_queue_length": 99, "threshold": 5},
+        )
+        assert evaluate_state_event(event, {}) is None
+        assert is_internal_only(label) is True
+        # Internal ≠ enforcement: it must never route to the escalation tier.
+        assert classify_trigger(label) == "state"
 
 
 def test_tts_languishing_emit_reads_live_pause_queue(monkeypatch) -> None:
