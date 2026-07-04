@@ -11,6 +11,8 @@
 // stay defined for the later rebuild, but the mock data arrays are gone.
 // ─────────────────────────────────────────────────────────────────────────
 
+import { FACTION_PERSONAS } from './personaIcons';
+
 export type MockTimerMode = 'working' | 'multitasking' | 'distracted' | 'break' | 'idle';
 
 export type MockTimerPoint = {
@@ -196,16 +198,26 @@ export type MockTtsItem = {
 
 // Head-first: index 0 is on the wire, the rest wait their turn, tail already
 // delivered. Order-driven so a later pass can animate reorders/drains in place.
-// Each sender maps to a DISTINCT persona (→ distinct icon; see personaIcons):
-// Custodes (the shield), Dorn (enforcement/security fist), Corax (the watcher),
-// Vulkan (the timer core/infra), Sanguinius (the morning herald).
-export const ttsQueue: MockTtsItem[] = [
-  { id: 'tts-0', text: 'Break debt at thirty-eight minutes — return to work.', route: 'phone · Custodes', senderTmuxId: '1:C', senderName: 'custodes-vigil', persona: 'custodes', status: 'speaking', posInQueue: 0 },
-  { id: 'tts-1', text: 'Enforcement armed on the live thread.', route: 'mac · Enforce', senderTmuxId: '2:E', senderName: 'enforce-warden', persona: 'dorn', status: 'queued', posInQueue: 1 },
-  { id: 'tts-2', text: 'Phone distraction cleared — YouTube dismissed.', route: 'phone · Phone', senderTmuxId: '3:P', senderName: 'phone-watch', persona: 'corax', status: 'queued', posInQueue: 2 },
-  { id: 'tts-3', text: 'Focus streak restored. Good.', route: 'phone · Timer', senderTmuxId: '2:T', senderName: 'timer-core', persona: 'vulkan', status: 'queued', posInQueue: 3 },
-  { id: 'tts-4', text: 'Morning voiceline delivered.', route: 'phone · Morning', senderTmuxId: '1:M', senderName: 'morning-herald', persona: 'sanguinius', status: 'done', posInQueue: 4 },
-];
+// Generated across the full Astartes faction set (FACTION_PERSONAS) so the queue
+// exercises the whole heraldry registry — each sender maps to a DISTINCT persona
+// (→ distinct icon; see personaIcons). Head speaks, the next few queue, the tail
+// reads as already delivered. Sweep the depth slider to surface the legion /
+// chapter glyphs. Static input → still fully deterministic (no Date/random).
+export const ttsQueue: MockTtsItem[] = FACTION_PERSONAS.map((persona, i) => {
+  // "blood-angels" → "Blood Angels" for the human-facing route / sender name.
+  const label = persona.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  const status: MockTtsStatus = i === 0 ? 'speaking' : i <= 4 ? 'queued' : 'done';
+  return {
+    id: `tts-${i}`,
+    text: `Voiceline from ${label} on the wire.`,
+    route: `phone · ${label}`,
+    senderTmuxId: `${(i % 6) + 1}:${persona.charAt(0).toUpperCase()}`,
+    senderName: `${persona}-vox`,
+    persona,
+    status,
+    posInQueue: i,
+  };
+});
 
 // The queue-languishing threshold — a GENERIC concept that lives in the data
 // layer alongside the other enforcement events (once more than this many
@@ -221,8 +233,8 @@ export const ttsLanguishThreshold = 8;
 // Past the static queue length the stack cycles it (same as the status fan), so
 // the study can watch the queue grow past the threshold and languish below the
 // arc. Default sits a couple past the threshold so the marker reads at a glance.
-export const MAX_TTS_DEPTH = 16;
-export const initialTtsDepth = 10;
+export const MAX_TTS_DEPTH = FACTION_PERSONAS.length; // the full faction set is reachable
+export const initialTtsDepth = 12;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Below-timer surfaces — OUT this round. Types kept for the later rebuild; the

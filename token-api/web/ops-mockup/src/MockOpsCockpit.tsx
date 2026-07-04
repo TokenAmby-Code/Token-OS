@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { personaIcon, personaIconInner, personaImage } from './personaIcons';
+import { personaIcon, personaIconInner, personaImage, FACTION_PERSONAS } from './personaIcons';
 import {
   DAY_END,
   DAY_START,
@@ -1739,12 +1739,13 @@ function ArcLayer({ uiScale }: {
   // in the icons (per-section tone below); both arcs and the dividers stay brass
   // (--instrument). The roster is the six standing command personas. Sections build
   // left→right along the arc, so k=0 is the MOST-LEFT tip and k=5 the FAR-RIGHT:
-  //   Malcador · Fabricator-General · CI · Pax · Custodes · Administratum.
-  // (Custodes sits 2nd-from-right — the slot Sanguinius held before this roster.)
+  //   Malcador · Fabricator-General · Custodes · CI · Pax · Administratum.
+  // (Custodes — the custodian-helmet glyph — sits center-left at k=2; CI and Pax
+  // follow at k=3/k=4.)
   // Three of them (Malcador, Pax, CI) are FULL-COLOUR brand images (personaImage), not tintable
   // glyphs — the render branches on that below. The tone palette still lights each
   // section's glow (curated later); it just no longer recolours the image personas.
-  const SECTION_PERSONAS = ['malcador', 'fabricator-general', 'ci', 'pax', 'custodes', 'administratum'];
+  const SECTION_PERSONAS = ['malcador', 'fabricator-general', 'custodes', 'ci', 'pax', 'administratum'];
   const SECTION_TONES = ['var(--good)', 'var(--warn)', 'var(--bad)', 'var(--neutral)', 'var(--idle)', 'var(--brass-bright)'];
   const ICON_PX = 40 * uiScale; // rendered icon box (the glyph's 512 viewBox scaled to this)
   const IMG_PX = 52 * uiScale; // image-persona box — brand art carries its own padding,
@@ -1912,9 +1913,11 @@ function ArcLayer({ uiScale }: {
 // change animates for free — the exact reflow model TtsStack uses (see its note).
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Placeholder worker roster — persona (→ icon) + tint cycled per chip. Exact
-// roster + colours are curated later, same deferral as the lemon sections.
-const WORKER_PERSONAS = ['mechanicus', 'custodes', 'dorn', 'corax', 'vulkan', 'sanguinius'];
+// Placeholder worker roster — persona (→ icon) + tint cycled per chip. Sourced
+// from the full Astartes faction set so the worker row exercises the whole
+// heraldry registry as the count grows (i % length cycles it below). Colours
+// keep their own independent 6-tone cycle (WORKER_TONES), curated later.
+const WORKER_PERSONAS = FACTION_PERSONAS;
 const WORKER_TONES = ['var(--brass-bright)', 'var(--good)', 'var(--warn)', 'var(--bad)', 'var(--neutral)', 'var(--idle)'];
 const WORKER_CHIP_PX = 90; // chip diameter, px @1440 (× uiScale) — big worker dials (75% of the first 120px pass)
 const WORKER_BAR_MARGIN = 30; // gap between the chip-row bottom and the gold crossbar below
