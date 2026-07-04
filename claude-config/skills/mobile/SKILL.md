@@ -22,7 +22,7 @@ For broader mobile context, read `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/mobi
 - Official `.macro` JSON wrapper files only.
 - `macrodroid-llm-schema.yaml` is the class/field source of truth.
 - Validate before push: `macrodroid-validate <file.macro>`.
-- Push with the sanctioned tool only: `macrodroid-push <file.macro>`.
+- Import with the sanctioned tool only: `MACRODROID_AUTO_IMPORT=1 macrodroid-import <file.macro>`. `macrodroid-push` is retired.
 - After phone import or live changes, pull/export and treat deployed MacroDroid JSON as canonical truth.
 - Do not revive Shizuku, ADB/root flows, retired custom macro DSLs or trigger/action builder compilers.
 
@@ -47,10 +47,13 @@ curl -sf "http://$(imperium_cfg tailscale_ip phone):7777/server-heartbeat"
    ```bash
    macrodroid-validate /tmp/name.macro
    ```
-4. Push only after validation:
+4. Import only after validation:
+
    ```bash
-   macrodroid-push /tmp/name.macro
+   MACRODROID_AUTO_IMPORT=1 macrodroid-import /tmp/name.macro
    ```
+
+   Approve the MacroDroid import prompt on the phone.
 5. Verify by pull/export, logs, endpoint response, or live phone behavior.
 
 ## Do Not
@@ -58,4 +61,5 @@ curl -sf "http://$(imperium_cfg tailscale_ip phone):7777/server-heartbeat"
 - Do not author YAML macro specs or invoke retired spec-to-macro builders.
 - Do not add custom class builders to `macrodroid-gen`; use official JSON.
 - Do not assume phone reachability; resolve IP through `imperium_cfg`.
-- Do not push unvalidated macros to the phone.
+- Do not import unvalidated macros to the phone.
+- Do not use `macrodroid-push`; it is retired in favor of verified `macrodroid-import`.

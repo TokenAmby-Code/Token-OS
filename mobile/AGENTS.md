@@ -182,8 +182,8 @@ Structural rules from the official schema:
 |---------|-------------|
 | `macrodroid-gen` | Official JSON skeleton/normalizer only. No YAML support. |
 | `macrodroid-validate` | Strict official `.macro` wrapper validator. |
-| `macrodroid-push` | Validates and pushes `.macro` files to the phone via SSH. |
-| `macrodroid-import` | Gated experimental import launcher: validates, stages to shared storage, opens MacroDroid's `.macro` file handler, then pulls state to verify. |
+| `macrodroid-import` | Primary import launcher: validates, stages to shared storage, opens MacroDroid's `.macro` file handler, then pulls state to verify. |
+| `macrodroid-push` | Retired staging-only path; exits nonzero and points to `macrodroid-import`. |
 | `macrodroid-pull` | Pull files from phone via SSH. |
 | `macrodroid-read` | Inspect `.mdr` exports and extract official `.macro` wrappers. |
 | `macrodroid-state` | Trigger/pull current phone export and display it. |
@@ -195,7 +195,7 @@ Generate a manual skeleton:
 ```bash
 macrodroid-gen --empty "My Manual Macro" --category Automation --pretty > my-manual.macro
 macrodroid-validate my-manual.macro
-macrodroid-push my-manual.macro
+MACRODROID_AUTO_IMPORT=1 macrodroid-import my-manual.macro
 ```
 
 Generate a simple HTTP endpoint:
@@ -209,7 +209,7 @@ macrodroid-gen \
   --pretty > heartbeat.macro
 
 macrodroid-validate heartbeat.macro
-macrodroid-push heartbeat.macro
+MACRODROID_AUTO_IMPORT=1 macrodroid-import heartbeat.macro
 ```
 
 For real macros, author the official JSON directly using `macrodroid-llm-schema.yaml` for class fields and enum values.
@@ -260,28 +260,27 @@ macrodroid-read EXPORT.mdr --http-config
    macrodroid-validate macro-name.macro
    ```
 
-5. Push:
+5. Import with the gated launcher:
    ```bash
-   macrodroid-push macro-name.macro
+   MACRODROID_AUTO_IMPORT=1 macrodroid-import macro-name.macro
    ```
 
-6. Import on phone manually, or try the gated experimental launcher:
-   - MacroDroid → Settings → Import/Export → Import
-   - Select from `~/macros/`
-   - Experimental no-picker launcher:
+   This opens MacroDroid's import prompt directly, without the file picker. Approve the prompt on the phone. The command returns nonzero unless the verification pull confirms macro count did not decrease, exactly one new macro was added, and the target macro name exists.
 
-     ```bash
-     MACRODROID_AUTO_IMPORT=1 macrodroid-import macro-name.macro
-     ```
+   For clean replacement attempts, use:
 
-     This returns nonzero unless the verification pull confirms macro count did not decrease, exactly one new macro was added, and the target macro name exists.
+   ```bash
+   MACRODROID_AUTO_IMPORT=1 macrodroid-import --replace macro-name.macro
+   ```
 
-7. Export/pull again and verify:
+   `--replace` fails if duplicate same-name macros remain after import.
+
+6. Export/pull again and verify:
    ```bash
    macrodroid-state --detail
    ```
 
-8. Delete staged `.macro` files after import. The `.mdr` export/deployed macro is the canonical source of truth.
+7. Delete staged `.macro` files after import. The `.mdr` export/deployed macro is the canonical source of truth.
 
 ### File Locations
 

@@ -91,3 +91,54 @@ Behavior:
    `~/.cache/macrodroid-import/import.log`.
 
 Expected current limitation: without a proven non-UI confirmation path, the command may return nonzero with `not_confirmed` after successfully launching MacroDroid's review/import UI.
+
+## Confirmed import behavior after live prompt test
+
+A second probe with one harmless `LogAction` imported successfully after the operator approved MacroDroid's prompt:
+
+- macro: `Auto Import Probe Log`
+- result: verified by `macrodroid-state --pull`
+- macro count: `40 -> 41`
+
+Re-importing the same macro with duplicate permission added another same-name macro instead of cleanly replacing it:
+
+- macro count: `41 -> 42`
+- two disabled `Auto Import Probe Log` records remained
+
+Therefore replacement cannot be assumed. The safe tool semantics are:
+
+- default: refuse if same-name macros already exist
+- `--allow-existing`: legacy duplicate-test mode only
+- `--replace`: explicit clean replacement attempt; succeeds only if exactly one target macro remains after verification pull
+
+If duplicates remain, the agent can report the exact macro names/categories/GUIDs that the operator should delete in MacroDroid. There is no proven exported MacroDroid intent/API that lets an agent delete a macro directly. MacroDroid's schema does include `DisableMacroAction`, so an agent can generate a cleanup macro to disable an old macro by name, but disabling is not deletion and should not be treated as clean replacement.
+
+## Agent-facing deletion suggestion
+
+Current supported agent behavior is advisory, not destructive:
+
+1. Pull state.
+2. Detect same-name or retired macros.
+3. Print a deletion plan with name, category, enabled state, and GUID.
+4. Ask the operator to delete those records in MacroDroid.
+5. Pull state again and verify deletion before importing the replacement.
+
+Do not use full `.mdr` restore as a deletion mechanism unless a separate, explicit high-risk restore procedure is written and validated. Whole-state restore can wipe unrelated live macros.
+
+## MacroDroid agent harness direction
+
+The existing export path is the `List Exports API` macro:
+
+- HTTP trigger: `/list-exports`
+- action: `ExportMacrosAction`
+- output path: Termux `~/macros/EXPORT.mdr`
+- desktop pull: `macrodroid-state --pull` via SSH/SCP
+
+This works, but it predates the current agent interface. The cleaner future harness is a single MacroDroid agent endpoint, for example `/macrodroid-agent`, with structured actions:
+
+- `action=export` — run `ExportMacrosAction`, respond with JSON status/path/timestamp
+- `action=health` — respond with MacroDroid harness version and enabled state
+- `action=import-ready` — report import staging directory and current duplicate matches if provided a macro name
+- `action=log` — append structured debug entries
+
+The desktop side should keep SSH/SCP for file transfer unless MacroDroid gains a safe first-class file-return API. The agent endpoint should replace legacy ad-hoc endpoints like `/list-exports` over time, but keep the same export-then-pull verification invariant.
