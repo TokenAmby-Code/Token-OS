@@ -2457,6 +2457,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start Custodes enforcement defer flusher (L2 hold-and-queue under typing guard)
     asyncio.create_task(_custodes_enforcement_defer_worker())
     print("Custodes enforcement defer flusher started")
+    # Start physical phone-enforcement guard queue flusher. This is deliberately
+    # separate from pane/comms queues: it re-checks the live enforcement
+    # condition before any Pavlok/redirect transaction fires.
+    asyncio.create_task(_phone_enforcement_guard_queue_worker())
+    print("Phone enforcement guard queue flusher started")
     # Mac-side Deskflow lifecycle is event-driven: the WSL satellite invites this
     # Mac via POST /api/kvm/start when its log follower sees the server come up.
     # No Mac-side probe/supervisor (it spammed the server with secure-socket errors).
@@ -15726,34 +15731,102 @@ def _enforcement_state_payload(
     return payload
 
 
-def start_enforcement_cascade(app_name: str) -> None:
-    """Fire a single atomic enforce for a distraction app.
+# Physical phone-enforcement guard queue. This is intentionally separate from
+# pane/comms delivery queues: pane writes keep normal enqueue-and-drain semantics,
+# while phone enforcement drains by re-checking the live condition before any
+# Pavlok/redirect transaction fires.
+_phone_enforcement_guard_queue: list[dict] = []
+_PHONE_ENFORCEMENT_GUARD_DRAIN_SECONDS = float(
+    os.environ.get("TOKEN_API_PHONE_ENFORCEMENT_GUARD_DRAIN_SECONDS", "1")
+)
 
-    Replaces the legacy 5-level cascade. Golden Throne owns any repetition.
-    Distraction-source is set to "phone" so the notification is never routed
-    back to the device the user is being asked to put down.
 
-    Phone enforcement is a pure action (no-warnings-enforcement-decree): the
-    enforce fires with notify=False (no focus-stealing banner that would blip an
-    immersive game's fullscreen and self-sustain a close→reopen loop) plus a
-    no-ADB eject that foregrounds+plays Spotify to evict the app. A per-app
-    cooldown (PHONE_ENFORCE_MIN_GAP_SECONDS) suppresses tight re-fire loops, and
-    the intensity ramps min(30 + 10*rep, 100) across repeats.
-    """
-    if is_quiet_hours():
-        print(f"ENFORCE: quiet hours suppressed for {app_name}")
-        try:
-            asyncio.ensure_future(
-                log_quiet_hours_suppressed(
-                    source="phone",
-                    event_type="phone_distraction_enforce",
-                    app=app_name,
-                )
-            )
-        except RuntimeError:
-            pass
+def _schedule_or_run(coro) -> None:
+    """Run ``coro`` on the current loop, or synchronously when no loop exists."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(coro)
         return
+    loop.create_task(coro)
 
+
+def _phone_enforcement_guard_reason() -> str | None:
+    """Return the active guard reason that must hold physical enforcement.
+
+    The typing guard is global (tmux client activity, not a target pane), so this
+    waits on *any* active composer. Dictation is kept in the same physical lane
+    because the existing Pavlok chokepoint treats live dictation as a defer-only
+    work signal; redirect must not bypass that either.
+    """
+    if _typing_guard_active():
+        return "typing_guard"
+    if _dictation_active():
+        return "dictation"
+    return None
+
+
+async def _phone_enforcement_condition_still_warranted(app_name: str) -> tuple[bool, str]:
+    """Live re-check for a held phone enforcement transaction.
+
+    This is deliberately enforcement-only. Comms/pane queues do not call this and
+    do not gain void semantics.
+    """
+    app_key = app_name.lower()
+    current = (PHONE_STATE.get("current_app") or "").lower()
+    if not PHONE_STATE.get("is_distracted", False):
+        return False, "phone_distraction_cleared"
+    if current != app_key:
+        return False, "phone_distraction_replaced"
+    if is_quiet_hours():
+        return False, "quiet_hours"
+    if timer_engine.break_balance_ms > 0:
+        return False, "break_time_available"
+    # Re-query the live productivity condition instead of trusting the original
+    # hook decision. Human activity while the guard held can satisfy the no-work
+    # side of the enforcement condition even if the distracting app remains open.
+    if timer_engine.productivity_active:
+        return False, "productivity_active"
+    return True, "warranted"
+
+
+def _enqueue_phone_enforcement_guard(app_name: str, *, guard_reason: str) -> dict:
+    app_key = app_name.lower()
+    for existing in _phone_enforcement_guard_queue:
+        if (existing.get("app") or "").lower() == app_key:
+            existing["guard_reason"] = guard_reason
+            existing["last_guard_seen_at"] = time.time()
+            return existing
+
+    item = {
+        "id": uuid.uuid4().hex,
+        "app": app_name,
+        "guard_reason": guard_reason,
+        "enqueued_at": time.time(),
+        "attempts": 0,
+    }
+    _phone_enforcement_guard_queue.append(item)
+    _schedule_or_run(
+        log_event(
+            "phone_enforcement_guard_deferred",
+            details={
+                "app": app_name,
+                "guard_reason": guard_reason,
+                "queue_depth": len(_phone_enforcement_guard_queue),
+            },
+        )
+    )
+    return item
+
+
+async def _execute_phone_enforcement_transaction(app_name: str) -> dict:
+    """Execute one atomic phone enforcement transaction.
+
+    The transaction is `{live-condition already checked by caller when queued} ->
+    Custodes label -> Pavlok enforce -> redirect`. Redirect only fires after the
+    Pavlok chokepoint reports `fired=True`; if a guard reappears during the race,
+    the transaction is re-queued instead of letting redirect bypass the guard.
+    """
     key = app_name.lower()
     now_mono = time.monotonic()
     state = _PHONE_ENFORCE_STATE.get(key)
@@ -15767,54 +15840,52 @@ def start_enforcement_cascade(app_name: str) -> None:
             f"ENFORCE: cooldown holds for {app_name} "
             f"({elapsed:.1f}s < {PHONE_ENFORCE_MIN_GAP_SECONDS}s)"
         )
-        try:
-            asyncio.ensure_future(
-                log_event(
-                    "phone_enforce_cooldown_skipped",
-                    details={
-                        "app": app_name,
-                        "since_last_fire_seconds": round(elapsed, 1),
-                        "min_gap_seconds": PHONE_ENFORCE_MIN_GAP_SECONDS,
-                        "rep": state.get("rep") if state else None,
-                    },
-                )
-            )
-        except RuntimeError:
-            pass
-        return
+        await log_event(
+            "phone_enforce_cooldown_skipped",
+            details={
+                "app": app_name,
+                "since_last_fire_seconds": round(elapsed, 1),
+                "min_gap_seconds": PHONE_ENFORCE_MIN_GAP_SECONDS,
+                "rep": state.get("rep") if state else None,
+            },
+        )
+        return {"fired": False, "reason": "cooldown"}
 
-    # Ramp: increment the per-app rep and commit the fire timestamp. A flap that
-    # kept prior state (see _maybe_reset_phone_enforce_state) climbs from there
-    # instead of restarting at rep 1.
     rep = (state.get("rep", 0) if state else 0) + 1
-    _PHONE_ENFORCE_STATE[key] = {"rep": rep, "last_fired_mono": now_mono}
     intensity = min(30 + 10 * rep, 100)
 
     print(f"ENFORCE: phone distraction app={app_name} rep={rep} intensity={intensity}")
     try:
-        asyncio.ensure_future(
-            handle_custodes_state_event(
-                "phone_distraction_enforce",
-                "phone",
-                severity=4,
-                payload=_enforcement_state_payload(source="phone", app=app_name),
-            )
+        await handle_custodes_state_event(
+            "phone_distraction_enforce",
+            "phone",
+            severity=4,
+            payload=_enforcement_state_payload(source="phone", app=app_name),
         )
-    except RuntimeError:
-        pass
-    try:
-        asyncio.ensure_future(
-            enforce(
-                EnforceRequest(
-                    message=f"Close {app_name}",
-                    intensity=intensity,
-                    source=f"phone_distraction_{app_name}",
-                    notify=False,
-                )
-            )
+    except Exception:
+        logger.exception("ENFORCE: custodes state event failed for %s", app_name)
+
+    enforce_result = await enforce(
+        EnforceRequest(
+            message=f"Close {app_name}",
+            intensity=intensity,
+            source=f"phone_distraction_{app_name}",
+            notify=False,
         )
-    except RuntimeError:
-        pass
+    )
+    if enforce_result.get("blocked_by") in {"typing_guard", "dictation"}:
+        _enqueue_phone_enforcement_guard(app_name, guard_reason=enforce_result["blocked_by"])
+        return {
+            "fired": False,
+            "reason": "guard_reappeared",
+            "guard_reason": enforce_result["blocked_by"],
+        }
+    if not enforce_result.get("fired"):
+        return {"fired": False, "reason": enforce_result.get("blocked_by") or "enforce_blocked"}
+
+    # Commit ramp/cooldown only after the physical Pavlok path actually fires.
+    _PHONE_ENFORCE_STATE[key] = {"rep": rep, "last_fired_mono": now_mono}
+
     # No-ADB eject: foreground + play Spotify to evict the immersive app. A pure
     # action by decree — no banner/TTS. method hardcoded for now.
     # TODO: route by audio source / yt_bg — Spotify-snub vs direct Termux park
@@ -15822,6 +15893,101 @@ def start_enforcement_cascade(app_name: str) -> None:
         _send_eject_to_phone("redirect")
     except Exception:
         logger.exception("ENFORCE: eject dispatch failed for %s", app_name)
+        return {"fired": True, "redirect": False, "enforce": enforce_result}
+    return {"fired": True, "redirect": True, "enforce": enforce_result}
+
+
+async def _phone_enforcement_guard_queue_flush_once() -> list[dict]:
+    """Drain held phone enforcement after the guard drops, with live re-check."""
+    results: list[dict] = []
+    guard_reason = await asyncio.to_thread(_phone_enforcement_guard_reason)
+    if guard_reason:
+        return results
+
+    for item in list(_phone_enforcement_guard_queue):
+        app_name = item["app"]
+        age = time.time() - item["enqueued_at"]
+        warranted, reason = await _phone_enforcement_condition_still_warranted(app_name)
+        if not warranted:
+            _phone_enforcement_guard_queue.remove(item)
+            # Silent no-op to the user: no shock, no redirect, no Custodes send.
+            await log_event(
+                "phone_enforcement_guard_voided",
+                details={
+                    "app": app_name,
+                    "reason": reason,
+                    "held_seconds": round(age, 1),
+                    "guard_reason": item.get("guard_reason"),
+                },
+            )
+            results.append(
+                {
+                    "queue": "phone_enforcement",
+                    "fired": False,
+                    "reason": "voided",
+                    "stale_reason": reason,
+                }
+            )
+            continue
+
+        _phone_enforcement_guard_queue.remove(item)
+        item["attempts"] = item.get("attempts", 0) + 1
+        fired = await _execute_phone_enforcement_transaction(app_name)
+        results.append(
+            {
+                "queue": "phone_enforcement",
+                "fired": bool(fired.get("fired")),
+                "reason": "flushed_after_guard_drop" if fired.get("fired") else fired.get("reason"),
+                "held_seconds": round(age, 1),
+            }
+        )
+    return results
+
+
+async def _phone_enforcement_guard_queue_worker() -> None:
+    """Periodic drain of physical enforcement held by typing/dictation guards."""
+    while True:
+        try:
+            await asyncio.sleep(_PHONE_ENFORCEMENT_GUARD_DRAIN_SECONDS)
+            if _phone_enforcement_guard_queue:
+                await _phone_enforcement_guard_queue_flush_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("phone enforcement guard queue flush failed")
+
+
+def start_enforcement_cascade(app_name: str) -> None:
+    """Fire a single atomic enforce for a distraction app.
+
+    Replaces the legacy 5-level cascade. Golden Throne owns any repetition.
+    Distraction-source is set to "phone" so the notification is never routed
+    back to the device the user is being asked to put down.
+
+    Phone enforcement is a pure action (no-warnings-enforcement-decree): the
+    enforce fires with notify=False (no focus-stealing banner that would blip an
+    immersive game's fullscreen and self-sustain a close→reopen loop) plus a
+    no-ADB eject that foregrounds+plays Spotify to evict the app. The whole
+    physical transaction waits behind the global typing guard and re-checks the
+    live phone-distraction condition on guard drop before firing.
+    """
+    if is_quiet_hours():
+        print(f"ENFORCE: quiet hours suppressed for {app_name}")
+        _schedule_or_run(
+            log_quiet_hours_suppressed(
+                source="phone",
+                event_type="phone_distraction_enforce",
+                app=app_name,
+            )
+        )
+        return
+
+    guard_reason = _phone_enforcement_guard_reason()
+    if guard_reason:
+        _enqueue_phone_enforcement_guard(app_name, guard_reason=guard_reason)
+        return
+
+    _schedule_or_run(_execute_phone_enforcement_transaction(app_name))
 
 
 # Pending deferred phone enforcement tasks, keyed by lowercased app key. The
