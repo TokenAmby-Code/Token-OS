@@ -47,9 +47,13 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env) -> None:
     body = resp.json()
     assert body["surface"] == "ops"
     for key in (
+        "contract_version",
         "generated_at",
+        "health",
+        "sources",
         "timer",
         "assertions",
+        "recommended_actions",
         "source_freshness",
         "attention",
         "work_state",
@@ -58,8 +62,24 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env) -> None:
         "cron",
         "tts",
         "enforcement",
+        "tmux",
     ):
         assert key in body
+    assert body["contract_version"] == "ops-state.v1"
+    assert body["health"]["status"] in {"ok", "warn", "bad", "unknown"}
+    assert isinstance(body["health"]["summary"], str)
+    assert isinstance(body["health"]["degraded_sources"], list)
+    assert body["recommended_actions"] == body["health"]["recommended_actions"]
+    assert set(body["sources"]) == {
+        "token_api",
+        "agents_db",
+        "timer_engine",
+        "tmuxctld",
+        "cron",
+        "enforcement",
+        "tts",
+    }
+    assert "reachable" in body["tmux"]
     assert body["instances"]["counts"]["active"] == 1
     assert "by_persona" in body["instances"]["counts"]
     assert isinstance(body["instances"]["counts"]["by_persona"], dict)
@@ -90,6 +110,59 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env) -> None:
         "message",
         "evidence",
     }
+
+
+def test_ops_state_health_includes_typed_tmuxctld_status(client, app_env, monkeypatch) -> None:
+    async def _fake_tmuxctld_health():
+        return {
+            "reachable": True,
+            "tmux_reachable": True,
+            "version": "pytest-tmuxctld",
+            "sha": "abc1234",
+            "error": None,
+        }
+
+    monkeypatch.setattr(app_env.main, "_ops_read_tmuxctld_health", _fake_tmuxctld_health)
+
+    resp = client.get("/api/ui/ops/state")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["tmux"]["reachable"] is True
+    assert body["tmux"]["tmux_reachable"] is True
+    assert body["tmux"]["version"] == "pytest-tmuxctld"
+    assert body["sources"]["tmuxctld"]["status"] == "ok"
+    assert body["source_freshness"]["tmuxctld"]["status"] == "fresh"
+
+
+def test_ops_state_health_recommends_actions_for_bad_assertions(client, app_env) -> None:
+    app_env.main.timer_engine._break_balance_ms = -60_000
+    now = datetime.now()
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO expected_acknowledgements
+           (id, source, instance_id, reason, status, created_at,
+            ack_due_at, level2_due_at, pavlok_due_at, fired_levels_json, details_json)
+           VALUES (?, 'pytest', NULL, 'confirm test', 'pending', ?, ?, ?, ?, '[]', '{}')""",
+        (
+            str(uuid.uuid4()),
+            now.isoformat(),
+            (now - timedelta(seconds=1)).isoformat(),
+            (now + timedelta(minutes=1)).isoformat(),
+            (now + timedelta(minutes=2)).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ui/ops/state")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["health"]["status"] == "bad"
+    assert body["health"]["bad_assertion_count"] >= 2
+    action_ids = {action["source_assertion_id"] for action in body["health"]["recommended_actions"]}
+    assert {"break_balance", "enforcement"}.issubset(action_ids)
 
 
 def test_ops_status_returns_expected_top_level_keys(client, app_env) -> None:

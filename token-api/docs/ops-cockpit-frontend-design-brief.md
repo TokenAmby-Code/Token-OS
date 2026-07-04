@@ -39,7 +39,12 @@ This is a dashboard first, control surface second. Mutations should remain Token
 
 `/api/ui/ops/state` top-level keys:
 
+- `health`
+- `sources`
 - `timer`
+- `billable`
+- `assertions`
+- `recommended_actions`
 - `attention`
 - `work_state`
 - `instances`
@@ -47,6 +52,8 @@ This is a dashboard first, control surface second. Mutations should remain Token
 - `cron`
 - `tts`
 - `enforcement`
+- `tmux`
+- `work_actions`
 
 See `docs/ops-cockpit.md` for the full contract summary.
 
