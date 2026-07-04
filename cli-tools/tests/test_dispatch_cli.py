@@ -122,7 +122,14 @@ def test_dispatch_claude_model_dry_run_forwards_to_wrapper():
 
 
 def test_dispatch_legion_shorthand_maps_to_target(tmp_path):
-    for keyword in ("legion", "mechanicus", "civic", "palace", "somnium"):
+    expected_targets = {
+        "legion": "mechanicus:new",
+        "mechanicus": "mechanicus:new",
+        "civic": "civic:new",
+        "palace": "palace:new",
+        "somnium": "somnium:new",
+    }
+    for keyword, expected_target in expected_targets.items():
         result = subprocess.run(
             [str(DISPATCH), keyword, "--dry-run", "--direct", "--dir", str(ROOT), "work"],
             capture_output=True,
@@ -131,7 +138,7 @@ def test_dispatch_legion_shorthand_maps_to_target(tmp_path):
             cwd=str(ROOT),
         )
         assert result.returncode == 0, result.stderr
-        assert f"target:          {keyword}:new" in result.stdout
+        assert f"target:          {expected_target}" in result.stdout
 
 
 def test_dispatch_legion_shorthand_only_consumes_leading_token():
@@ -1475,6 +1482,7 @@ def test_dispatch_palace_shorthand_detaches_and_carries_commander_not_persona() 
 def test_dispatch_self_is_explicit_transplant_boundary() -> None:
     env = os.environ.copy()
     env["TOKEN_API_INSTANCE_ID"] = "caller-instance-id"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "old-parent-instance-id"
 
     result = subprocess.run(
         [
@@ -1499,6 +1507,8 @@ def test_dispatch_self_is_explicit_transplant_boundary() -> None:
     assert "--self" in result.stdout
     assert "TOKEN_API_TRANSPLANT_EXPECTED=true" in result.stdout
     assert "TOKEN_API_PARENT_INSTANCE_ID=caller-instance-id" not in result.stdout
+    assert "TOKEN_API_PARENT_INSTANCE_ID=old-parent-instance-id" not in result.stdout
+    assert "-u TOKEN_API_PARENT_INSTANCE_ID" in result.stdout
 
 
 def test_dispatch_target_dry_run_carries_canonical_without_physical(tmp_path):

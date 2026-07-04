@@ -115,7 +115,7 @@ def test_chapter_insert_preserves_explicit_worker_persona_and_singleton(app_env)
     assert fg["status"] == "working"
 
 
-def test_chapter_insert_never_clones_commander_persona_when_worker_has_none(app_env):
+def test_chapter_insert_never_clones_commander_persona_when_worker_has_none(app_env) -> None:
     from instance_mutation import insert_instance_sync
 
     conn = _conn(app_env.db_path)

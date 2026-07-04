@@ -167,7 +167,11 @@ DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
 # leading token is consumed so a prompt word like "legion" is never swallowed.
 # An explicit --target later still wins.
 case "${1:-}" in
-  legion|mechanicus|civic|palace|somnium)
+  legion|mechanicus)
+    TARGET="mechanicus:new"
+    shift
+    ;;
+  civic|palace|somnium)
     TARGET="$1:new"
     shift
     ;;
@@ -2104,18 +2108,19 @@ build_agent_command() {
   printf 'cd %q && env' "$WORK_DIR"
   local scrub_var alt_scrub_var
   for scrub_var in "${DISPATCH_INHERITED_ENV_SCRUB[@]}"; do
+    alt_scrub_var=""
+    case "$scrub_var" in
+      TOKEN_API_*) alt_scrub_var="${scrub_var#TOKEN_API_}" ;;
+      *) alt_scrub_var="TOKEN_API_${scrub_var}" ;;
+    esac
     # Keep launch commands readable while still scrubbing real inherited state.
     # If either TOKEN_API_* or its legacy alias is present, unset both spellings
     # so a wrapper/helper cannot fall through to the surviving alias.
     if [[ -z "${!scrub_var+x}" ]]; then
-      alt_scrub_var=""
-      case "$scrub_var" in
-        TOKEN_API_*) alt_scrub_var="${scrub_var#TOKEN_API_}" ;;
-        *) alt_scrub_var="TOKEN_API_${scrub_var}" ;;
-      esac
       [[ -n "$alt_scrub_var" && -n "${!alt_scrub_var+x}" ]] || continue
     fi
     printf ' -u %q' "$scrub_var"
+    [[ -n "$alt_scrub_var" ]] && printf ' -u %q' "$alt_scrub_var"
   done
   printf ' TOKEN_API_INTERNAL_DISPATCH=1'
   local e
