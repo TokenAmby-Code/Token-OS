@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+# macrodroid-import - gated MacroDroid .macro import launcher with verification
+# TAGS: mobile, macrodroid
+# AUDIENCE: human, agent
+"""
+Validate, stage, and launch a MacroDroid .macro file import via Android's
+first-class file VIEW intent. This intentionally does not use Shizuku/root/ADB.
+
+The tool is fail-closed: it requires MACRODROID_AUTO_IMPORT=1 before touching the
+phone, refuses duplicate macro names by default, and returns non-zero unless a
+fresh macrodroid-state pull confirms the macro exists after the launch.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+SSH_HOST = os.environ.get("MACRODROID_SSH_HOST", "phone")
+REMOTE_STAGE_DIR = os.environ.get(
+    "MACRODROID_IMPORT_STAGE", "~/storage/downloads/MacroDroid/auto-import"
+)
+STATE_SCRATCHPAD = Path(os.environ.get("SCRATCHPAD", "/tmp/macrodroid-state"))
+EXPORT_PATH = Path(os.environ.get("MACRODROID_STATE_EXPORT", str(STATE_SCRATCHPAD / "EXPORT.mdr")))
+LOG_PATH = Path(
+    os.environ.get(
+        "MACRODROID_IMPORT_LOG",
+        str(Path.home() / ".cache" / "macrodroid-import" / "import.log"),
+    )
+)
+MACRODROID_COMPONENT = "com.arlosoft.macrodroid/.filehandler.FileHandlerProxy"
+DEFAULT_MIME = "application/octet-stream"
+
+
+def run(
+    cmd: list[str],
+    *,
+    input_text: str | None = None,
+    timeout: int | None = None,
+    check: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        proc = subprocess.run(cmd, input=input_text, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode(errors="replace")
+        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr or f"timed out after {timeout}s")
+    except OSError as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({proc.returncode}): {' '.join(shlex.quote(c) for c in cmd)}\n"
+            f"stdout: {proc.stdout.strip()}\nstderr: {proc.stderr.strip()}"
+        )
+    return proc
+
+
+def log_event(event: dict[str, Any]) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    event = {"ts": dt.datetime.now(dt.UTC).isoformat(), **event}
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def macro_name(macro_file: Path) -> tuple[str, dict[str, Any]]:
+    try:
+        data = json.loads(macro_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"ERROR: invalid JSON: {exc}") from exc
+    macro = data.get("macro") if isinstance(data, dict) else None
+    if not isinstance(macro, dict):
+        raise SystemExit("ERROR: .macro wrapper has no macro object")
+    name = macro.get("m_name")
+    if not isinstance(name, str) or not name.strip():
+        raise SystemExit("ERROR: macro.m_name missing or empty")
+    return name.strip(), data
+
+
+def safe_remote_name(local: Path) -> str:
+    base = local.name or "import.macro"
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip(".-") or "import.macro"
+    if not base.lower().endswith(".macro"):
+        base += ".macro"
+    digest = hashlib.sha256(local.read_bytes()).hexdigest()[:12]
+    stem = base[:-6]
+    return f"{stem}-{digest}.macro"
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate(local: Path) -> None:
+    proc = run(["macrodroid-validate", "--quiet", str(local)], timeout=30)
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    if proc.returncode != 0:
+        raise SystemExit("ERROR: validation failed; refusing phone interaction")
+
+
+def pull_state() -> tuple[dict[str, Any], Path]:
+    proc = run(["macrodroid-state", "--pull"], timeout=45)
+    if proc.returncode != 0:
+        raise RuntimeError(f"macrodroid-state --pull failed\nstdout: {proc.stdout}\nstderr: {proc.stderr}")
+
+    path = EXPORT_PATH
+    if not path.exists():
+        candidate = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+        if candidate and Path(candidate).exists():
+            path = Path(candidate)
+        else:
+            raise RuntimeError(f"pulled export not found at {EXPORT_PATH}")
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or not isinstance(data.get("macroList"), list):
+        raise RuntimeError(f"not a MacroDroid export: {path}")
+    return data, path
+
+
+def macros_named(state: dict[str, Any], name: str) -> list[dict[str, Any]]:
+    needle = name.casefold()
+    return [
+        m
+        for m in state.get("macroList", [])
+        if isinstance(m, dict) and str(m.get("m_name", "")).casefold() == needle
+    ]
+
+
+def stage_file(local: Path, remote_name: str) -> str:
+    if REMOTE_STAGE_DIR == "~":
+        qdir = "$HOME"
+    elif REMOTE_STAGE_DIR.startswith("~/"):
+        qdir = "$HOME/" + shlex.quote(REMOTE_STAGE_DIR[2:])
+    else:
+        qdir = shlex.quote(REMOTE_STAGE_DIR)
+    proc = run(["ssh", SSH_HOST, f"mkdir -p {qdir} && cd -P {qdir} && pwd"], timeout=20, check=True)
+    remote_dir = proc.stdout.strip().splitlines()[-1]
+    remote_path = f"{remote_dir.rstrip('/')}/{remote_name}"
+    run(["scp", "-q", str(local), f"{SSH_HOST}:{remote_path}"], timeout=45, check=True)
+    return remote_path
+
+
+def launch_view_intent(remote_path: str, mime: str, wait: bool) -> subprocess.CompletedProcess[str]:
+    # Use Termux's `am` wrapper, not /system/bin/am. /system/bin/am runs as an
+    # app uid but claims com.android.shell on recent Android and is rejected.
+    cmd = (
+        "am start "
+        + ("-W " if wait else "")
+        + "--user 0 "
+        + f"-n {shlex.quote(MACRODROID_COMPONENT)} "
+        + "-a android.intent.action.VIEW "
+        + f"-d {shlex.quote('file://' + remote_path)} "
+        + f"-t {shlex.quote(mime)}"
+    )
+    return run(["ssh", SSH_HOST, cmd], timeout=30)
+
+
+def summarize_state(state: dict[str, Any], export_path: Path) -> tuple[int, str]:
+    digest = sha256(export_path) if export_path.exists() else ""
+    return len(state.get("macroList", [])), digest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate, stage, launch, and verify a MacroDroid .macro import. "
+            "Requires MACRODROID_AUTO_IMPORT=1."
+        )
+    )
+    parser.add_argument("macro_file", help="official MacroDroid .macro wrapper JSON")
+    parser.add_argument(
+        "--allow-existing",
+        action="store_true",
+        help="do not fail before launch if a macro with the same name already exists",
+    )
+    parser.add_argument("--mime", default=DEFAULT_MIME, help=f"VIEW intent MIME type (default: {DEFAULT_MIME})")
+    parser.add_argument("--wait-seconds", type=float, default=8.0, help="seconds to wait before verification pull")
+    parser.add_argument("--no-launch-wait", action="store_true", help="do not pass -W to am start")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="only run local validation and duplicate/name parsing; no phone interaction",
+    )
+    args = parser.parse_args()
+
+    local = Path(args.macro_file).expanduser().resolve()
+    if not local.exists():
+        print(f"ERROR: file not found: {local}", file=sys.stderr)
+        return 2
+
+    validate(local)
+    name, data = macro_name(local)
+    digest = sha256(local)
+
+    if args.validate_only:
+        print(f"OK: {name} sha256={digest}")
+        return 0
+
+    if os.environ.get("MACRODROID_AUTO_IMPORT") != "1":
+        log_event({"result": "refused_env", "file": str(local), "macro": name, "sha256": digest})
+        print(
+            "ERROR: refusing phone interaction; set MACRODROID_AUTO_IMPORT=1 to enable gated import attempts",
+            file=sys.stderr,
+        )
+        return 3
+
+    try:
+        before, before_path = pull_state()
+    except RuntimeError as exc:
+        log_event({"result": "state_pull_failed", "file": str(local), "macro": name, "sha256": digest, "error": str(exc)})
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 8
+    before_count, before_hash = summarize_state(before, before_path)
+    before_matches = macros_named(before, name)
+    if before_matches and not args.allow_existing:
+        log_event(
+            {
+                "result": "refused_duplicate",
+                "file": str(local),
+                "macro": name,
+                "sha256": digest,
+                "before_count": before_count,
+                "before_hash": before_hash,
+                "existing_matches": len(before_matches),
+            }
+        )
+        print(f"ERROR: macro already exists on phone: {name!r}; refusing duplicate import", file=sys.stderr)
+        print("Use --allow-existing only after deciding replace/update semantics are safe.", file=sys.stderr)
+        return 4
+
+    remote_name = safe_remote_name(local)
+    try:
+        remote_path = stage_file(local, remote_name)
+    except RuntimeError as exc:
+        log_event(
+            {
+                "result": "stage_failed",
+                "file": str(local),
+                "macro": name,
+                "sha256": digest,
+                "before_count": before_count,
+                "before_hash": before_hash,
+                "error": str(exc),
+            }
+        )
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 8
+    print(f"Staged {name!r} to {remote_path}")
+
+    launched = launch_view_intent(remote_path, args.mime, wait=not args.no_launch_wait)
+    if launched.stdout:
+        print(launched.stdout, end="")
+    if launched.stderr:
+        print(launched.stderr, end="", file=sys.stderr)
+    if launched.returncode != 0:
+        log_event(
+            {
+                "result": "launch_failed",
+                "file": str(local),
+                "remote_path": remote_path,
+                "macro": name,
+                "sha256": digest,
+                "before_count": before_count,
+                "before_hash": before_hash,
+                "am_returncode": launched.returncode,
+                "am_stdout": launched.stdout[-1000:],
+                "am_stderr": launched.stderr[-1000:],
+            }
+        )
+        print("ERROR: MacroDroid file VIEW intent launch failed", file=sys.stderr)
+        return 5
+
+    if args.wait_seconds > 0:
+        time.sleep(args.wait_seconds)
+
+    try:
+        after, after_path = pull_state()
+    except RuntimeError as exc:
+        log_event(
+            {
+                "result": "verify_pull_failed",
+                "file": str(local),
+                "remote_path": remote_path,
+                "macro": name,
+                "sha256": digest,
+                "before_count": before_count,
+                "before_hash": before_hash,
+                "error": str(exc),
+            }
+        )
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 8
+    after_count, after_hash = summarize_state(after, after_path)
+    after_matches = macros_named(after, name)
+    wiped = after_count < before_count
+    success = (
+        not wiped
+        and after_count == before_count + 1
+        and len(after_matches) > len(before_matches)
+    )
+
+    event = {
+        "result": "success" if success else "not_confirmed",
+        "file": str(local),
+        "remote_path": remote_path,
+        "macro": name,
+        "category": (data.get("macro") or {}).get("m_category"),
+        "sha256": digest,
+        "before_count": before_count,
+        "after_count": after_count,
+        "before_hash": before_hash,
+        "after_hash": after_hash,
+        "matches_after": len(after_matches),
+        "mime": args.mime,
+    }
+    log_event(event)
+
+    if wiped:
+        print(f"ERROR: macro count decreased ({before_count} -> {after_count}); investigate before retrying", file=sys.stderr)
+        return 6
+    if success:
+        print(f"OK: verified imported macro {name!r} ({before_count} -> {after_count})")
+        return 0
+
+    print(
+        "ERROR: import not verified after launching MacroDroid file handler. "
+        "This likely means MacroDroid is waiting on its review/Add UI; no human picker was used, "
+        "but no non-UI confirmation path has been proven.",
+        file=sys.stderr,
+    )
+    print(
+        f"State: before_count={before_count} after_count={after_count} matches_after={len(after_matches)}",
+        file=sys.stderr,
+    )
+    print(f"Log: {LOG_PATH}", file=sys.stderr)
+    return 7
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
