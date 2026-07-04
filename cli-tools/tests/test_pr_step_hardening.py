@@ -343,14 +343,15 @@ pr_review_main 7 --message "fix" --no-push
     assert "Review State:    APPROVED" in result.stdout
     assert "## Summary by CodeRabbit" in result.stdout
     sleep_values = sleeps.read_text().splitlines()
-    assert "9" in sleep_values
+    assert "69" in sleep_values
+    assert "9" not in sleep_values
     assert "60" not in sleep_values
     assert "120" not in sleep_values
     assert "150" not in sleep_values
     call_lines = calls.read_text().splitlines()
     comment_indexes = [i for i, line in enumerate(call_lines) if line.startswith("pr comment 7")]
     assert len(comment_indexes) == 2
-    sleep_index = call_lines.index("sleep 9")
+    sleep_index = call_lines.index("sleep 69")
     # No blind duplicate re-request: the second CodeRabbit command happens only
     # after pr-step sleeps to the reset carried by the rate-limit response.
     assert comment_indexes[0] < sleep_index < comment_indexes[1]
@@ -436,14 +437,148 @@ pr_review_main 7 --message "fix" --no-push
     assert "Review State:    APPROVED" in result.stdout
     assert "## Summary by CodeRabbit" in result.stdout
     sleep_values = sleeps.read_text().splitlines()
-    assert sleep_values[0] == "9"
+    assert sleep_values[0] == "69"
+    assert "9" not in sleep_values
     assert "60" not in sleep_values
     assert "120" not in sleep_values
     assert "150" not in sleep_values
     call_lines = calls.read_text().splitlines()
     comment_indexes = [i for i, line in enumerate(call_lines) if line.startswith("pr comment 7")]
     assert len(comment_indexes) == 2
-    assert comment_indexes[0] < call_lines.index("sleep 9") < comment_indexes[1]
+    assert comment_indexes[0] < call_lines.index("sleep 69") < comment_indexes[1]
+
+
+def test_review_loop_blocks_until_pending_review_lands(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    state = tmp_path / "state"
+    state.write_text("pending")
+    sleeps = tmp_path / "sleep.calls"
+    gh = fake_bin / "gh"
+    gh.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+state="$(cat {str(state)!r})"
+if [[ "$1" == "repo" && "$2" == "view" ]]; then echo owner/repo; exit 0; fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7" ]]; then
+  if [[ "${{@: -2:1}}" == "--jq" ]]; then echo headsha; else echo '{{"head":{{"sha":"headsha"}}}}'; fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/comments" ]]; then echo '[]'; exit 0; fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then
+  echo '[]'
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/commits/headsha/statuses" ]]; then
+  echo '[]'
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/reviews" ]]; then
+  if [[ "$state" == "reviewed" ]]; then echo '[{{"user":{{"login":"coderabbitai[bot]"}},"state":"APPROVED","submitted_at":"1970-01-01T00:01:01Z","body":"review body all clear"}}]'; else echo '[]'; fi
+  exit 0
+fi
+exit 1
+"""
+    )
+    gh.chmod(0o755)
+
+    result = bash_with_pr_step(
+        f"""
+_sleeps=0
+sleep() {{
+  printf '%s\\n' "$1" >> {str(sleeps)!r}
+  _sleeps=$((_sleeps + 1))
+  if [[ "$_sleeps" -ge 2 ]]; then echo reviewed > {str(state)!r}; fi
+}}
+pr_review_main 7 --read
+""",
+        repo,
+        {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert sleeps.read_text().splitlines()[:2] == ["30", "30"]
+    assert "No new review comments found before the explicit timeout" not in result.stderr
+    assert "Review State:    APPROVED" in result.stdout
+    assert "review body all clear" in result.stdout
+
+
+def test_review_loop_returns_findings_review_body_and_failed_check_logs_inline(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    state = tmp_path / "state"
+    state.write_text("initial")
+    gh = fake_bin / "gh"
+    gh.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+state="$(cat {str(state)!r})"
+if [[ "$1" == "repo" && "$2" == "view" ]]; then echo owner/repo; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "comment" ]]; then echo reviewed > {str(state)!r}; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "checks" ]]; then
+  cat <<'JSON'
+[
+  {{"name":"quality","workflow":"CI","state":"failure","bucket":"fail","link":"https://github.com/owner/repo/actions/runs/123/job/456","description":"quality gate failed"}}
+]
+JSON
+  exit 0
+fi
+if [[ "$1" == "run" && "$2" == "view" && "$3" == "123" ]]; then
+  echo 'quality failed line from log'
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7" ]]; then
+  if [[ "${{@: -2:1}}" == "--jq" ]]; then echo headsha; else echo '{{"head":{{"sha":"headsha"}}}}'; fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/comments" ]]; then
+  if [[ "$state" == "reviewed" ]]; then
+    cat <<'JSON'
+[
+  {{"user":{{"login":"coderabbitai[bot]"}},"path":"cli-tools/bin/pr-step","line":42,"commit_id":"headsha","body":"specific inline finding body"}}
+]
+JSON
+  else echo '[]'; fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then
+  if [[ "$state" == "reviewed" ]]; then
+    echo '[{{"user":{{"login":"coderabbitai[bot]"}},"created_at":"1970-01-01T00:01:00Z","updated_at":"1970-01-01T00:01:00Z","body":"## Summary by CodeRabbit\\nPlease fix the finding."}}]'
+  else echo '[]'; fi
+  exit 0
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/commits/headsha/statuses" ]]; then echo '[{{"context":"coderabbit","state":"failure"}}]'; exit 0; fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/pulls/7/reviews" ]]; then
+  if [[ "$state" == "reviewed" ]]; then echo '[{{"user":{{"login":"coderabbitai[bot]"}},"state":"CHANGES_REQUESTED","submitted_at":"1970-01-01T00:01:01Z","body":"review body says change this"}}]'; else echo '[]'; fi
+  exit 0
+fi
+exit 1
+"""
+    )
+    gh.chmod(0o755)
+
+    result = bash_with_pr_step(
+        """
+set +e
+pr_review_main 7 --message "fix" --no-push
+rc=$?
+set -e
+printf 'rc=%s\n' "$rc"
+""",
+        repo,
+        {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert "rc=1" in result.stdout
+    assert "Review State:    CHANGES_REQUESTED" in result.stdout
+    assert "## Summary by CodeRabbit" in result.stdout
+    assert "specific inline finding body" in result.stdout
+    assert "review body says change this" in result.stdout
+    assert "quality gate failed" in result.stdout
+    assert "quality failed line from log" in result.stdout
 
 
 def test_review_loop_plain_timeout_path_does_not_rate_limit_rerequest(
