@@ -15,6 +15,7 @@ from tmuxctl.assertions import (
     PERSONA_GUARD_OPTION,
     PERSONA_LABELS,
     PersonaSpec,
+    _assert_persona_color,
     _clear_pane_overlay,
     _guarded_note_mismatched,
     _guarded_note_unregistered,
@@ -23,6 +24,7 @@ from tmuxctl.assertions import (
     _persona_within_boot_grace,
     _persona_working_dir,
     _row_matches_persona,
+    apply_persona_pane_tint,
     launch_persona_seat,
     persona_seat_command,
     persona_spec,
@@ -120,6 +122,35 @@ def test_codex_default_is_fg_scoped_other_singletons_stay_claude() -> None:
     assert persona_spec("council:administratum").engine == "claude"
     assert persona_spec("council:pax").engine == "claude"
     assert persona_spec("mechanicus:orchestrator").engine == "claude"
+
+
+def test_persona_tint_reassert_ignores_stale_voice_lock() -> None:
+    adapter = FakeAdapter()
+    adapter.options["@DISCORD_VOICE_LOCK"] = "1"
+    original_run = adapter.run
+
+    def run(*args, allow_failure: bool = False) -> str:
+        if args[:5] == ("display-message", "-t", "%25", "-p", "#{pane_id}"):
+            return "%25"
+        return original_run(*args, allow_failure=allow_failure)
+
+    adapter.run = run  # type: ignore[method-assign]
+
+    _assert_persona_color(adapter, "%25", _custodes_spec())
+
+    assert adapter.options["window-style"] == "bg=#302800"
+    assert adapter.options["window-active-style"] == "bg=#302800"
+
+
+def test_wrapperstart_persona_tint_ignores_stale_voice_lock() -> None:
+    adapter = FakeAdapter()
+    adapter.options["@DISCORD_VOICE_LOCK"] = "1"
+
+    tint = apply_persona_pane_tint(adapter, "%25", "council:custodes")
+
+    assert tint == "#302800"
+    assert adapter.options["window-style"] == "bg=#302800"
+    assert adapter.options["window-active-style"] == "bg=#302800"
 
 
 def test_fg_seat_command_launches_codex() -> None:

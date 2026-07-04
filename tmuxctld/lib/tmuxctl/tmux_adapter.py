@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from . import send_gate
+from .singleton_labels import is_persona_singleton_label
 
 
 class TmuxError(RuntimeError):
@@ -434,6 +435,16 @@ class TmuxAdapter:
         for option in PANE_STYLE_OPTIONS:
             self._run_raw_tmux(["set-option", "-p", "-t", target, option, style])
 
+    def _target_is_persona_singleton(self, target: str) -> bool:
+        """Return whether target's durable pane identity is a persona singleton."""
+        if not target:
+            return False
+        pane_label = self._run_raw_tmux(
+            ["show-options", "-pqv", "-t", target, "@PANE_ID"],
+            allow_failure=True,
+        ).strip()
+        return is_persona_singleton_label(pane_label)
+
     def clear_runtime_state(self, target: str) -> None:
         """Clear runtime stamps and pane close/assertion chrome together."""
         if not target:
@@ -469,7 +480,7 @@ class TmuxAdapter:
         option = resolved_args[-1] if resolved_args else ""
         if option == "@INSTANCE_ID":
             target = self._target_for_invariant(resolved_args)
-            if target:
+            if target and not self._target_is_persona_singleton(target):
                 self.clear_pane_style(target)
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
