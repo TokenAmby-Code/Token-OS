@@ -82,3 +82,10 @@ POST /api/tts/backend-error
 ```
 
 Body includes `backend`, optional `session_id`, `playback_id`, `chunk_id`, `error`, optional `retryable`, and optional `detail`.
+
+
+## Phone MacroDroid implementation notes
+
+The current phone macro set is numbered `01-*` through `06-*`, plus disabled `90-*` overlay retirement stubs. The control notification uses MacroDroid 5.65 direct notification-button action fields (`actionClassType`, `actionName`, `actionJson`) to run a single local `HttpRequestAction` per button. It deliberately avoids the older `NotificationButtonTrigger`/macro-reference shape that imported as invalidly configured.
+
+Backfill parsing deliberately avoids `IterateDictionaryAction`; the helper parses `/api/tts/chunk-next` with `JsonParseAction` and assigns known fields directly. Validate by MacroDroid import/export and pulled `.mdr` shape, not by `macrodroid-validate` alone.

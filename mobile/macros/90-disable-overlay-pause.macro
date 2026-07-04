@@ -1,0 +1,162 @@
+{
+  "macroExportVersion": 1,
+  "macro": {
+    "m_name": "90 Disable Overlay Pause",
+    "m_enabled": false,
+    "m_completed": true,
+    "m_GUID": 0,
+    "m_category": "TTS",
+    "aiGenerated": 1,
+    "m_description": "Retired floating overlay button disabled; notification controls are canonical.",
+    "m_triggerList": [
+      {
+        "m_classType": "FloatingButtonTrigger",
+        "m_SIGUID": -989999999997427066,
+        "disableLogging": false,
+        "m_comment": "Retired; replaced by TTS Phone Control Notification.",
+        "m_constraintList": [],
+        "m_isDisabled": true,
+        "m_isOrCondition": false,
+        "identifier": "tts-pause",
+        "iconType": 1,
+        "iconText": "PA",
+        "m_alpha": 1,
+        "m_size": 1,
+        "m_padding": 8,
+        "fixedLocation": true,
+        "forceLocation": false,
+        "usePercentForLocation": true,
+        "xLocation": 0,
+        "yLocation": 0,
+        "disableTriggerOnRemove": false
+      }
+    ],
+    "m_actionList": [
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": -989999999997419147,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "blockNextAction": true,
+        "m_nonRoot": true,
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_OVERLAY_RETIRED] pause\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "timeoutSeconds": 30,
+        "useHelper": false,
+        "useShizuku": false
+      }
+    ],
+    "m_constraintList": []
+  },
+  "globalVariables": [
+    {
+      "m_name": "token_os_base_url",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "http://100.95.109.23:7777"
+    },
+    {
+      "m_name": "tts_session_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_playback_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_utterance_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_current_chunk_text",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_next_chunk_text",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_current_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_next_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_last_consumed_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_status",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "idle"
+    },
+    {
+      "m_name": "tts_backfill_next_chunk",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_next_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_done",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_control_state",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "idle"
+    },
+    {
+      "m_name": "tts_speed",
+      "m_type": 3,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_decimalValue": 1.0
+    }
+  ],
+  "userIcons": null,
+  "aiFeedback": "Generated from official MacroDroid schema."
+}
