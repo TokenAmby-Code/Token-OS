@@ -1,0 +1,917 @@
+/* ───────────────────────────────────────────────────────────────────────
+   Ops Cockpit — static design study · iteration 2 "paint on the metal"
+   The website's dark metal background IS the surface. No cards, no panels, no
+   wrappers: the timer graph paints straight onto the body, one full-width
+   divider splits it from an empty fleet region, and the state dials float as a
+   radial fan pinned to the top-right corner. Know No Fear.
+   Display: Chakra Petch · Data: IBM Plex Mono · Body: IBM Plex Sans.
+   Tokens mirror the live token-api/web/ops styles.css.
+   ─────────────────────────────────────────────────────────────────────── */
+
+@import './fonts/fonts.css';
+
+:root {
+  color-scheme: dark;
+
+  --bg-deep: #07060a;
+  --bg: #0b0a10;
+  --surface: #14121b;
+  --surface-2: #1b1825;
+  --surface-3: #221e2d;
+  --line: #2c2738;
+  --line-bright: #443c58;
+
+  --text: #ece6f2;
+  --muted: #9b91ac;
+  --faint: #6c6479;
+
+  --brass: #d6a23f;
+  --brass-bright: #f2c463;
+  --brass-deep: #8c6a22;
+
+  /* ── THE INSTRUMENT-LINE TOKEN ────────────────────────────────────────────
+     The single source of truth for every structural instrument STROKE — the
+     dial border, the connecting arc, the graph horizon, and any future
+     instrument line all load their colour from here so the cockpit reads as one
+     brass instrument. FULL-OPACITY brass-bright: the strokes carry no innate
+     shading, so where two of them meet (arc↔rim, horizon↔rim) the overlap is the
+     SAME solid colour and can't alpha-stack into a bright seam. The merge is done
+     by Z-ORDER instead — the arc + horizon sit BEHIND the dial (.break-hub z:4 >
+     .arc-layer z:3 > .timerfield), so the rim border caps each junction and the
+     lines emerge from under it as one three-way node, no overlap, no dark gap.
+     Route new instrument lines through this token, never a fresh inline colour.
+     Full opacity ALWAYS (alpha is never a knob). Hue is locked to brass (41°);
+     saturation + brightness are the two HSL knobs. This is the DEFAULT (settled
+     deep brass, s68/l30) — .page overrides --instrument inline from the demobar
+     Line-saturation / Line-brightness sliders, and every consumer (rim, arc,
+     horizon) follows in one move.
+     --instrument-w is the shared STROKE WEIGHT so all three render identical. */
+  --instrument: hsl(41 68% 30%);
+  /* integer px on purpose: a CSS border-width rounds to whole device pixels, so
+     a fractional value would render the dial border thinner than the SVG arc +
+     horizon strokes. 2px keeps all three identical + crisp. */
+  --instrument-w: 2px;
+
+  --cyan: #56c2d6;
+  --phosphor: #93d94f;
+  --phosphor-dim: #5e8a39;
+  --hazard: #ff5b3d;
+  --hazard-deep: #b8341d;
+  --sel: #c77dff;
+
+  --m-working: #93d94f;
+  --m-multi: #56c2d6;
+  --m-distracted: #ff5b3d;
+  --m-break: #e8a13c;
+  --m-idle: #7e7790;
+
+  --good: #93d94f;
+  --warn: #e8a13c;
+  --bad: #ff5b3d;
+  --neutral: #9b91ac;
+  --idle: #7e7790;
+
+  --radius: 12px;
+  --radius-sm: 7px;
+
+  font-family: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px;
+  background: var(--bg-deep);
+  color: var(--text);
+}
+
+* { box-sizing: border-box; }
+
+/* The metal. This radial-gradient graphite IS the sky the graph paints on. */
+body {
+  margin: 0;
+  min-width: 340px;
+  background:
+    radial-gradient(120% 80% at 12% -10%, rgba(214, 162, 63, 0.10), transparent 60%),
+    radial-gradient(90% 70% at 100% 0%, rgba(139, 120, 214, 0.08), transparent 55%),
+    var(--bg-deep);
+}
+
+.mono, time, .num { font-family: 'IBM Plex Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
+
+/* ── page: no column, no max-width card — the graph runs full-bleed ─────── */
+.page {
+  position: relative;
+  min-height: 100vh;
+  padding: 0 0 40px;
+  overflow-x: clip; /* contain the break hub's off-corner overflow — no h-scroll */
+}
+
+/* ══ BREAK HUB ═══════════════════════════════════════════════════════════════
+   A large circle in the true upper-right of the PAGE. position:absolute (NOT
+   fixed) so it scrolls WITH the content — centred on the top-right corner, only
+   its lower-left quadrant shows. At scroll-top the fixed dials nest into its
+   rim; scroll down and the hub is left behind while the dials keep floating.
+   Sits above the timer (z:1) but below the dials (z:60).
+   NOTE: this becomes the break-time display — a real ACTION element — later;
+   for now it only settles the size and placement. */
+.break-hub {
+  /* --hub-r / --hub-shift are published (already × uiScale) on .page and inherited
+     here — the hub sizes off them, so it shrinks with the one scale factor for free.
+     --hub-shift is the vertical nudge that keeps the hub CONCENTRIC with the dial
+     orbit (the dials' centre sits Y_SHIFT above the corner from their nudge-up). */
+  position: absolute;
+  top: calc(-1 * var(--hub-r) - var(--hub-shift));
+  right: calc(-1 * var(--hub-r));
+  width: calc(2 * var(--hub-r));
+  height: calc(2 * var(--hub-r));
+  /* ABOVE .arc-layer (z:3): the rim border must paint OVER the arc + horizon so
+     each junction reads as one three-way node — the lines tuck UNDER the border
+     (they already sit behind the opaque disc face), no bright overlap, no dark
+     sliver. Still far below the lap marker / dials (z:60+), which stay on top. */
+  z-index: 4;
+  /* the opaque disc intercepts the pointer (border-radius clips the hit area to
+     the circle) so the timer's hover zone goes dead behind the dial too — same
+     "no hover on what the clip covers" rule as .arc-fill. */
+  pointer-events: auto;
+  border-radius: 50%;
+  /* the dial border IS the instrument-line reference tone — routed through the
+     shared colour + weight tokens so it matches the arc + horizon exactly. The
+     --gold/--red state variants below keep their own border-color: those are
+     status signals, not the base instrument tone. */
+  border: var(--instrument-w) solid var(--instrument);
+  /* Base is OPAQUE out to the rim (--bg-deep page-metal) so the disc fully
+     occludes the timer graph + arc behind it — the arc tucks cleanly under the
+     solid dial with no floating rim endpoint. Brass sheen + rim border stay. */
+  background: radial-gradient(circle at 66% 34%, rgba(214, 162, 63, 0.12), rgba(20, 18, 27, 0.5) 52%, var(--bg-deep) 72%);
+  box-shadow: inset 0 0 90px rgba(0, 0, 0, 0.5);
+  transition: border-color 300ms ease, box-shadow 300ms ease, background 300ms ease;
+}
+/* spillover past ±2h: the timer overflows, the whole rim glows, laps + ball
+   retire, and the circle itself is the readout. Gold for credit (over +2h),
+   red for debt (under −2h). Dip back inside ±2h and the leading lap resumes. */
+.break-hub--gold {
+  border-color: var(--brass-bright);
+  background: radial-gradient(circle at 66% 34%, rgba(242, 196, 99, 0.20), rgba(20, 18, 27, 0.5) 52%, var(--bg-deep) 72%);
+  box-shadow: inset 0 0 90px rgba(0, 0, 0, 0.5), 0 0 44px 0 color-mix(in srgb, var(--brass-bright) 45%, transparent);
+}
+.break-hub--red {
+  border-color: var(--hazard);
+  background: radial-gradient(circle at 66% 34%, rgba(255, 91, 61, 0.20), rgba(20, 18, 27, 0.5) 52%, var(--bg-deep) 72%);
+  box-shadow: inset 0 0 90px rgba(0, 0, 0, 0.5), 0 0 44px 0 color-mix(in srgb, var(--hazard) 45%, transparent);
+}
+/* break-trail — the green wake the marker paints along the rim. ABSOLUTE (like
+   the hub), NOT fixed: the trail is a component OF the upper-right circle, so it
+   scrolls WITH the hub and stays put on its rim rather than following the fixed
+   dial cluster. The break trail is a DISPLAY item — by type it draws OVER the
+   structural background (the connecting arc z:3, the rim/disc z:4), never under
+   it — so z:5, above every background instrument but still under the marker/dials
+   (z:60+) that cap and nest on it. The traversed arc is a thicker green stroke;
+   drop-shadow gives it the phosphor glow. */
+.break-trail {
+  position: absolute;
+  top: calc(-1 * var(--hub-r) - var(--hub-shift));
+  right: calc(-1 * var(--hub-r));
+  width: calc(2 * var(--hub-r));
+  height: calc(2 * var(--hub-r));
+  z-index: 5;
+  pointer-events: none;
+  overflow: visible;
+}
+/* one arc per lap; stroke tone, width + glow are set inline from the model
+   (green/teal for credit, dark/bright red for debt; each pass draws heavier). */
+.break-trail path {
+  fill: none;
+  stroke-linecap: round;
+}
+
+/* break-time marker — a small glowing dot that rides the hub rim as the head of
+   the active lap's trail. ABSOLUTE + corner-anchored like the hub/trail (z:61,
+   above the trail, hub, and dial cluster) so it scrolls WITH the circle and stays
+   welded to its rim, covering the trail's leading seam. Position comes from inline
+   right/top; `--ball` tracks the lap colour (phosphor lap 1 → cyan lap 2). No
+   border/black-ring — just a bright core so it reads as the leading tip of the
+   trail. `--ball` is set inline from the model to the active lap's tone. */
+.break-marker {
+  --ball: var(--phosphor);
+  position: absolute;
+  /* scaled off the one factor so the marker's rendered size matches its scaled rim
+     offset (rimOffset centres on BREAK_MARKER_PX × uiScale). */
+  width: calc(10px * var(--ui-scale, 1));
+  height: calc(10px * var(--ui-scale, 1));
+  border-radius: 50%;
+  z-index: 61;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 35%, #fff, var(--ball) 70%);
+  box-shadow: 0 0 10px 1px var(--ball);
+}
+
+.page__grain {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.5;
+  background-image: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.013) 0 1px, transparent 1px 3px);
+  mix-blend-mode: overlay;
+}
+
+/* ── full-bleed timer graph: the background IS the timer ────────────────────
+   No header, no card — the graph is the first element and sits flush to the
+   top/left/right edges. The wrapper owns the full-bleed footprint (100% width,
+   tall band); the SVG fills it at REAL pixels (measured via ResizeObserver) so
+   nothing stretches. width:100% (not 100vw) avoids scrollbar overflow so the
+   right edge stays flush. The wrapper is the positioning context for the tip. */
+.timerfield {
+  position: relative;
+  /* locked to the operator's guide rectangle: right edge at --graph-w, bottom
+     edge at --graph-h (top-left box that clears the top-right dial cluster). */
+  width: var(--graph-w);
+  height: var(--graph-h);
+
+  /* ══ INVARIANT — DO NOT unstaple the graph from the page top. ═══════════════
+     The timer field is deliberately the FIRST in-flow element, flush at y=0 with
+     NO top offset, margin, or wrapper. This is LOAD-BEARING, not cosmetic: the
+     ArcLayer and the timer's background-dressing extents (bgBottomPx) both map
+     VIEWPORT-top px straight into their local SVG coords, which only holds while
+     this box's local y=0 == page y=0. Add a header/offset above the graph and
+     the arc contacts + band bleed silently drift. Keep it stapled to the top. */
+}
+.timerfield__svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* the functional plot stays inside the box, but the background dressing (last
+     mode band + dashed gridlines) is drawn PAST the box to fill the dead space —
+     let it paint outside the viewBox. .page's overflow-x:clip trims the right
+     bleed at the viewport edge; the opaque hub + arc-fill occlude the rest. */
+  overflow: visible;
+}
+
+/* hover crosshair + cursor dot — the sole graph readout (ported from live) */
+.crosshair { stroke: var(--brass-bright); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0.7; }
+.cursor-dot { fill: var(--brass-bright); stroke: var(--bg-deep); stroke-width: 2; }
+
+/* shared tooltip card — the dark panel look reused by the timer crosshair
+   readout (.chart-tip) and the dial hover tooltip (.dial-tip). Positioning is
+   per-class (timer: inline cursor-following left/top; dial: CSS-anchored to its
+   ring); only the visual card lives here so both instruments read identically. */
+.tip-card {
+  background: rgba(10, 9, 14, 0.95); border: 1px solid var(--line-bright);
+  border-radius: var(--radius-sm); padding: 8px 11px;
+  font-size: 12px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  font-family: 'IBM Plex Mono', monospace; color: var(--text);
+}
+
+/* floating readout card — HTML, so it never distorts with the SVG. Positioned
+   by inline `left`/`top` so it follows the cursor; both are clamped in-bounds so
+   it never overflows the right or bottom edge. */
+.chart-tip {
+  position: absolute; pointer-events: none; min-width: 150px;
+  /* the tip is the ONE readout allowed to pierce the occluders: it flows down
+     into the dead-space where the opaque arc-fill (z:3) / hub would otherwise
+     paint over it. .timerfield sets no stacking context, so this z-index competes
+     at the root — above the arc, hub, dials and corner-dial. Tip shows over all. */
+  z-index: 200;
+}
+.chart-tip__time { color: var(--brass-bright); font-size: 11px; margin-bottom: 4px; }
+.chart-tip__row { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.chart-tip__row strong { color: var(--text); font-weight: 600; }
+.dot-sm { width: 8px; height: 8px; border-radius: 999px; display: inline-block; }
+
+/* ══ FLOATING RADIAL DIALS ══════════════════════════════════════════════════
+   Live invariant, mirrored: position:fixed / z-index:60 / pointer-events:none
+   so the cluster pins to the viewport and never intercepts clicks. The layer
+   spans the full viewport; children are offset from the top-right corner. */
+.dials {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+}
+
+/* ══ LEFT-SIDE TTS-QUEUE STACK ═══════════════════════════════════════════════
+   The second dial cluster — a plain vertical column down the left edge (queue
+   order, head at top). Same fixed / full-viewport / click-through layer as
+   .dials (children restore pointer-events via .ring) and the same .ring chrome +
+   .dial-tip; only the layout (a simple column via ttsOffset, not the radial fan)
+   and the queue model underneath differ. */
+.tts-stack {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+}
+/* the shared .dial-tip opens BELOW the ring, anchored right:0 — fine for the
+   top-RIGHT status fan. On the left column it instead opens to the RIGHT of the
+   dial, vertically CENTRED on it (the column has open interior to the right and
+   no room below before the next queued dial). The card + reveal fade stay shared;
+   only the anchor + the centring transform change. */
+.tts-stack .dial-tip {
+  right: auto;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translate(-4px, -50%); /* hidden: nudged left, vertically centred */
+}
+.tts-stack .ring:hover .dial-tip,
+.tts-stack .ring:focus-visible .dial-tip {
+  transform: translate(0, -50%); /* shown: slides right into place, stays centred */
+}
+
+/* ── TTS PLAY GESTURE — promote → speak → dismiss ────────────────────────────
+   Slot position is TRANSFORM-only: every TTS dial is anchored at the column
+   origin (left/top inline) and translated down by slot × one UNIT. So any slot
+   reassignment — the shift-down on promote, the shuffle-up on drain — animates
+   for free via this transition. --tts-unit (set on .tts-stack) is the single
+   geometry source, shared with the promote keyframe below. */
+.tts-stack .ring {
+  transition: box-shadow 120ms ease, transform 320ms ease;
+  z-index: 2;
+  /* opaque backing (over the page metal, --bg-deep) so a shockwave expanding from
+     a speaking sibling never shows THROUGH this dial's translucent centre. Paired
+     with the stacking below (speaking sits at z:1, under these z:2 idle dials), the
+     opaque disc occludes the reverb wherever the ring crosses another dial. */
+  background:
+    radial-gradient(circle at 50% 32%, rgba(255, 255, 255, 0.05), var(--surface) 74%),
+    var(--bg-deep);
+}
+
+/* PROMOTE — the L-path. Start at slot n → right 1 unit → up to row 0 → left 1
+   unit into slot 0. Parameterized by --n (the click-time slot). A running CSS
+   animation overrides the inline transform, and this keyframe ENDS at
+   translate(0,0) — exactly the dial's new slot-0 base transform — so dropping the
+   class on completion is jump-free. */
+/* scoped under .tts-stack AND qualified with .ring so this z-index is 0,3,0 —
+   it outranks both the base `.tts-stack .ring` z:2 AND the shared `.ring:hover`
+   (0,2,0), so the promoting dial travels the L-path ON TOP of the whole column
+   even while hovered. */
+.tts-stack .ring.tts-dial--promoting {
+  animation: tts-promote 820ms ease-in-out;
+  z-index: 3;
+}
+@keyframes tts-promote {
+  0%   { transform: translate(0,               calc(var(--n) * var(--tts-unit))); } /* slot n */
+  30%  { transform: translate(var(--tts-unit), calc(var(--n) * var(--tts-unit))); } /* right 1 */
+  70%  { transform: translate(var(--tts-unit), 0); }                                /* up n    */
+  100% { transform: translate(0,               0); }                                /* left 1 → slot 0 */
+}
+
+/* SPEAKING — reverberation, applied only once the dial has LANDED at the head
+   (the promoting phase deliberately withholds --speaking; see TTS_PHASE_CLASS).
+   Expanding radar-ping rings via ::before/::after (staggered a half-cycle apart
+   for a continuous throb) plus a subtle core-glow pulse. The static box-shadow
+   stays as the reduced-motion marker. */
+.tts-dial--speaking {
+  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.55), 0 0 18px 0 var(--tone);
+}
+.tts-stack .ring.tts-dial--speaking {
+  animation: tts-glow 1.6s ease-in-out infinite;
+  /* the landed speaker sits BELOW its idle siblings (z:2) so its shockwave rings +
+     glow are occluded by any dial they expand across — only the run over open metal
+     shows. Qualified with .ring → specificity 0,3,0, so this z:1 beats BOTH the base
+     `.tts-stack .ring` z:2 AND the shared `.ring:hover` (0,2,0): the speaker stays
+     tucked behind its siblings even while hovered (its reverb never rides over them).
+     The right-opening tooltip still shows — it opens into open metal with no TTS
+     sibling to occlude it, so the lowered ring stacking doesn't hide it. */
+  z-index: 1;
+}
+.tts-dial--speaking::before,
+.tts-dial--speaking::after {
+  content: '';
+  position: absolute;
+  inset: -1.5px;
+  border-radius: 50%;
+  border: 2px solid var(--tone);
+  pointer-events: none;
+  animation: tts-ping 1.6s ease-out infinite;
+}
+.tts-dial--speaking::after { animation-delay: 0.8s; }
+@keyframes tts-ping {
+  0%   { transform: scale(1);   opacity: 0.65; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+@keyframes tts-glow {
+  0%, 100% { box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.55), 0 0 14px 0 var(--tone); }
+  50%      { box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.55), 0 0 26px 2px var(--tone); }
+}
+
+/* DISMISS — collapse + fade; the row is then removed from the list and the rest
+   shuffle up. `forwards` holds the collapsed state until the JS removal lands. */
+.tts-stack .ring.tts-dial--dismissing {
+  animation: tts-dismiss 300ms ease-in forwards;
+  z-index: 3; /* 0,3,0 — over the column and hover-proof, like --promoting */
+}
+@keyframes tts-dismiss {
+  to { transform: translateY(0) scale(0); opacity: 0; }
+}
+
+/* one dial ring — a compact, ICON-ONLY circular gauge floated onto an arc by
+   inline right/top. Just the glyph; the value + subtitle live in the hover
+   tooltip and the drawer. EVERY ring is interactive: pointer-events restored
+   here (the .dials layer stays click-through), a soft hover glow, and a
+   keyboard focus ring. */
+.ring {
+  --tone: var(--neutral);
+  position: absolute;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--tone) 90%, transparent);
+  background: radial-gradient(circle at 50% 32%, rgba(255, 255, 255, 0.05), var(--surface) 74%);
+  /* The tone ring is beveled into the glow: the crisp border (at 90% opacity) is
+     flanked by a full-tone bleed on BOTH sides (inset ridge + tight outer halo)
+     so its hard edge dissolves, then a tight back glow (4px blur / +1 spread)
+     blooms onto the metal. Tuned live on a phone, then locked in here. */
+  box-shadow:
+    inset 0 0 12px rgba(0, 0, 0, 0.55),
+    inset 0 0 6px -2px var(--tone),
+    0 0 6px -1px var(--tone),
+    0 0 4px 1px var(--tone);
+  color: var(--tone);
+  pointer-events: auto;
+  cursor: pointer;
+  transition: box-shadow 120ms ease;
+}
+.ring--good { --tone: var(--good); }
+.ring--warn { --tone: var(--warn); }
+.ring--bad { --tone: var(--bad); }
+.ring--neutral { --tone: var(--muted); }
+.ring--idle { --tone: var(--idle); }
+
+/* soft hover glow — every dial, not just the interactive few */
+.ring:hover { box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.55), inset 0 0 6px -2px var(--tone), 0 0 8px -1px var(--tone), 0 0 6px 2px var(--tone); }
+.ring:focus-visible { outline: 2px solid var(--brass-bright); outline-offset: 3px; }
+
+.ring__glyph { font-size: calc(19px * var(--ui-scale, 1)); line-height: 1; color: var(--tone); }
+
+/* persona SVG icon — the inline single-path game-icons glyph (src/icons/*.svg,
+   fill="currentColor") swapped in for the unicode glyph on the TTS sender dials.
+   It lives INSIDE .ring__glyph, so currentColor inherits that element's
+   color: var(--tone) and the icon tints with the dial. Sized to read like the
+   unicode glyph it replaces; the inner <svg> fills the box. */
+.persona-icon { display: inline-flex; width: calc(20px * var(--ui-scale, 1)); height: calc(20px * var(--ui-scale, 1)); }
+.persona-icon svg { display: block; width: 100%; height: 100%; }
+
+/* dial hover tooltip — same card as the timer's, revealed purely on :hover (no
+   React state). Anchored to the ring and opening toward the screen interior
+   (down + left) so it never runs off the top-right corner the cluster hugs. The
+   ring raises its z-index on hover so the tip sits above sibling rings. */
+.dial-tip {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: max-content;
+  max-width: 230px;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-4px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  pointer-events: none;
+  z-index: 1;
+}
+.ring:hover, .ring:focus-visible { z-index: 2; }
+.ring:hover .dial-tip, .ring:focus-visible .dial-tip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+/* tip header row — the sender's tmuxctl id chip + the instance-name label. */
+.dial-tip__head { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.dial-tip__id {
+  flex: none;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--brass-bright);
+  background: var(--surface-3);
+  border: 1px solid var(--line-bright);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.dial-tip__label { color: var(--text); font-weight: 600; }
+.dial-tip__sub { color: var(--muted); font-size: 11px; line-height: 1.35; white-space: normal; }
+
+/* ══ BIG CORNER DIAL ═════════════════════════════════════════════════════════
+   The fraction gauge in the reserved top-right nook. --tone is set inline (a
+   ratio-derived rgb): grey at 0/0 → teal as focus leads → red as distraction
+   climbs. Colour/border/glow all track --tone and animate as the numbers step. */
+.corner-dial {
+  position: fixed;
+  /* same ~6.7px buffer the outer dials use against the top/right edges, so the
+     big dial tucks into the corner instead of kissing the inner dial row. */
+  top: 7px;
+  right: 7px;
+  z-index: 61;
+  /* diameter comes from the single JS source (CORNER_DIAL_PX), published to
+     --corner-dial-d on .page. The arc-riding .agent-dial uses the same number so
+     the two resize together; the 104px fallback keeps this standalone-safe. */
+  width: var(--corner-dial-d, 104px);
+  height: var(--corner-dial-d, 104px);
+  display: grid;
+  place-items: center;
+  align-content: center;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--tone) 90%, transparent);
+  color: var(--tone);
+  background: radial-gradient(circle at 50% 30%, rgba(255, 255, 255, 0.06), var(--surface) 72%);
+  box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.55), inset 0 0 8px -2px var(--tone), 0 0 8px -1px var(--tone), 0 0 7px 2px var(--tone);
+  pointer-events: none;
+  font-family: 'IBM Plex Mono', monospace;
+  transition: color 220ms ease, border-color 220ms ease, box-shadow 220ms ease;
+}
+.corner-dial__num {
+  font-size: calc(28px * var(--ui-scale, 1)); line-height: 1; font-weight: 600; color: var(--tone);
+  font-variant-numeric: tabular-nums;
+}
+.corner-dial__bar { width: calc(46px * var(--ui-scale, 1)); height: 2px; margin: 3px 0; background: var(--tone); border-radius: 2px; opacity: 0.9; }
+
+/* ══ DIALS DRAWER (minimal stub) ════════════════════════════════════════════
+   Where the default dial click lands: a panel that slides in from the right and
+   lists every dial with its subtitle line. Backdrop click / Escape / ✕ close. */
+.drawer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(3, 2, 6, 0.55);
+  backdrop-filter: blur(2px);
+  display: flex;
+  justify-content: flex-end;
+}
+.drawer {
+  width: min(380px, 90vw);
+  height: 100%;
+  overflow-y: auto;
+  background: var(--bg);
+  border-left: 1px solid var(--line-bright);
+  box-shadow: -18px 0 48px rgba(0, 0, 0, 0.55);
+  animation: drawer-in 160ms ease;
+}
+@keyframes drawer-in { from { transform: translateX(24px); opacity: 0.4; } to { transform: translateX(0); opacity: 1; } }
+.drawer__head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+  position: sticky; top: 0;
+  background: var(--bg);
+}
+.drawer__title { margin: 0; font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text); }
+.drawer__close {
+  border: 1px solid var(--line-bright); background: var(--surface); color: var(--muted);
+  border-radius: var(--radius-sm); width: 28px; height: 28px; cursor: pointer; font-size: 13px;
+}
+.drawer__close:hover { color: var(--text); border-color: var(--brass); }
+.drawer__list { list-style: none; margin: 0; padding: 8px 0; }
+.drawer__row {
+  display: flex; gap: 12px; align-items: flex-start;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.drawer__row--focus { background: color-mix(in srgb, var(--brass) 9%, transparent); }
+/* zero-specificity default so the row's `ring--<tone>` class wins and the dial
+   colour carries into the drawer (good=green, bad=red, …) for quick ID. */
+:where(.drawer__glyph, .drawer__value) { --tone: var(--muted); }
+.drawer__glyph {
+  flex: 0 0 auto; width: 34px; height: 34px; display: grid; place-items: center;
+  border-radius: 50%; border: 1.5px solid var(--tone); color: var(--tone);
+  background: radial-gradient(circle at 50% 32%, rgba(255, 255, 255, 0.05), var(--surface) 74%);
+  box-shadow: 0 0 10px -4px var(--tone);
+  font-size: 16px;
+}
+.drawer__body { flex: 1 1 auto; min-width: 0; }
+.drawer__rowhead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.drawer__label { font-weight: 600; color: var(--text); }
+.drawer__value {
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--tone); white-space: nowrap;
+}
+.drawer__sub { margin-top: 3px; font-size: 12px; line-height: 1.4; color: var(--muted); }
+
+/* ══ demo control (mockup only) — pinned so it's reachable while scrolling ══ */
+.demobar {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 70;
+  max-width: min(880px, 60vw); /* the sole demo bar now the arc panel is retired */
+  display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+  padding: 9px 14px;
+  border: 1px dashed var(--line-bright); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-deep) 82%, transparent);
+  backdrop-filter: blur(4px);
+}
+/* the actual controls — a wrapped row. On wide screens this always shows (the
+   toggle is hidden); under the narrow breakpoint it collapses (see the RESPONSIVE
+   OVERRIDES block) unless .demobar--open. */
+.demobar__body { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+/* collapse toggle — hidden on wide screens (only the override block reveals it). */
+.demobar__toggle {
+  display: none;
+  border: 1px solid var(--line-bright); background: var(--surface); color: var(--brass);
+  border-radius: var(--radius-sm); padding: 4px 10px; cursor: pointer;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em;
+}
+.demobar__toggle:hover { color: var(--text); border-color: var(--brass); }
+/* live uiScale readout — pairs with the Scale-floor knob for tuning by eye. */
+.demobar__scale { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--brass-bright); white-space: nowrap; }
+.demobar__tag { font-family: 'IBM Plex Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: var(--brass); }
+.demobar__slider { display: inline-flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
+.demobar__slider input[type='range'] { accent-color: var(--brass); width: 160px; }
+.demobar__slider b { color: var(--text); min-width: 20px; }
+/* Click-to-edit number band: reads like the <b> band but signals it's editable,
+   and swaps for a compact numeric field while typing an exact value. */
+.demobar__num { color: var(--text); min-width: 20px; cursor: text; border-bottom: 1px dotted color-mix(in srgb, var(--brass) 55%, transparent); }
+.demobar__num:hover, .demobar__num:focus-visible { color: var(--brass-bright); outline: none; }
+.demobar__num-edit { width: 52px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--text); background: color-mix(in srgb, var(--brass) 12%, transparent); border: 1px solid var(--brass); border-radius: 3px; padding: 1px 4px; }
+.demobar__num-edit:focus { outline: none; border-color: var(--brass-bright); }
+
+/* ══ connecting arc + opaque content layer ═══════════════════════════════════
+   Spans the WHOLE page (inset:0), position:absolute so it scrolls with the hub it
+   springs from. The arc is drawn in the top band (its contact y's are measured
+   against HUB_BOTTOM in JS, not this full height), and the opaque .arc-fill drops
+   from the curve to the bottom of the screen — the second layer over the timer
+   background. z:3 reads over the timer graph; the wheel-disc clip (in JS) hides
+   the run inside the break wheel, so the panel's top border becomes the bottom of
+   the dial there (arc-or-dial-bottom, whichever is lower). */
+.arc-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 3;
+  overflow: visible;
+}
+/* opaque mask UNDER the arc: solid page metal so the timer graph is hidden below
+   the curve and reads only above the line. Matches the body's base --bg-deep;
+   the wheel-disc clip (shared with .arc-line) keeps the break hub punched out. */
+.arc-fill {
+  fill: var(--bg-deep);
+  stroke: none;
+  /* the opaque panel intercepts the pointer (the arc-layer itself is
+     pointer-events:none) so the timer's hover zone beneath it goes DEAD wherever
+     the graph is covered by the arc — no hover on what you can't see. */
+  pointer-events: auto;
+}
+/* thin, non-luminous instrument line — the same restrained stroke as the break
+   spoke/rim, NO glow filter, no end dots. Reads the shared --instrument token
+   (was inline var(--brass)) and rides a touch thinner at 1.25. */
+.arc-line {
+  fill: none;
+  stroke: var(--instrument);
+  stroke-width: var(--instrument-w);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* agent dials — a row of placeholder fleet rings that ride the arc. They live
+   as SVG siblings BETWEEN .arc-fill and .arc-line in the arc SVG, so paint order
+   alone gives the z the plan asks for: over the opaque fill (visible on the page
+   metal), under the arc stroke (the curve threads over their top edge). Same
+   restrained instrument stroke as the arc/rim/horizon — no new palette. A hair
+   of translucent surface fills the disc so it reads as an instrument, not a hole.
+   Sized off --corner-dial-d (r set in JS from CORNER_DIAL_PX) — lockstep with the
+   corner dial. Placeholder only: no pointer-events, decorative. */
+.agent-dials { pointer-events: none; }
+/* section dividers — full lines spanning between the top arc and the lemon arc at
+   each of the five interior boundaries, cutting the lens into six segments. Same
+   restrained instrument stroke as the arcs; COLOUR never lives here (only the icons). */
+.section-divider {
+  stroke: var(--instrument);
+  stroke-width: var(--instrument-w);
+  stroke-linecap: round;
+}
+/* per-section persona icon — natively embedded single-path SVG, tinted to the section
+   tone set inline (color: var(--tone…)). fill="currentColor" in the glyph inherits it,
+   so the icon carries the ONLY colour in the roster; the arc + ticks stay brass. */
+.section-icon path { fill: currentColor; }
+/* ══ WORKER QUEUES ═══════════════════════════════════════════════════════════
+   Two icon-chip stacks BELOW the lemon that grow outward from centre then trail
+   down the two edges (a soft "M"). Full-bleed click-through layer (chips restore
+   the pointer); z:6 clears the opaque .arc-fill (z:3) + .break-trail (z:5) so the
+   chips read on the page metal, and sits well below the dials/TTS (z:60) and the
+   demobar (z:70). Each chip is positioned PURELY by an inline transform (the JS
+   slot → path point); the transition below animates every slot change (the scoot). */
+.worker-queues {
+  /* absolute (anchored to .page), NOT fixed — the lemon/arc it hangs from is
+     position:absolute and scrolls with the page, so the worker layer must scroll in
+     lockstep or the T detaches and appears to follow the viewport on scroll. */
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+}
+/* the ⊥ rail — a structural instrument line under the chips: a stem dropping from the
+   lemon centre to a flat, mirror-symmetric crossbar (the table's top edge) just below
+   the chip row. Same restrained brass stroke as the lemon dividers / arc; decorative,
+   so pointer-events:none lets clicks reach the chips + page. overflow visible so the
+   round caps never clip at the SVG box edge. */
+.worker-rail {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.worker-rail__line {
+  fill: none;
+  stroke: var(--instrument);
+  stroke-width: var(--instrument-w);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.worker-chip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: transform 320ms ease;
+}
+/* the visible round dial — same instrument chrome as the old worker rings
+   (translucent surface fill + brass border). The per-chip tone lives on `color`
+   (inline), tinting ONLY the currentColor icon + the hover glow; the border stays
+   brass. Collapse/fade on dismiss rides the inner disc so the outer transform
+   (slot position) is never disturbed. */
+.worker-chip__disc {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
+  border: var(--instrument-w) solid var(--instrument);
+  transition: box-shadow 120ms ease;
+}
+.worker-chip:hover .worker-chip__disc {
+  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.55), 0 0 8px -1px currentColor, 0 0 6px 2px color-mix(in srgb, currentColor 45%, transparent);
+}
+.worker-chip:focus-visible { outline: none; }
+.worker-chip:focus-visible .worker-chip__disc { outline: 2px solid var(--brass-bright); outline-offset: 3px; }
+/* DISMISS — collapse + fade; the row is then removed from the list and the rest
+   scoot up. `forwards` holds the collapsed state until the JS removal lands. */
+.worker-chip__disc--out { animation: worker-dismiss 300ms ease-in forwards; }
+@keyframes worker-dismiss {
+  to { transform: scale(0); opacity: 0; }
+}
+/* gold tip caps — a gold rim glow that hugs the tapered end and fades toward a dark
+   centre. A blurred stroke (width set inline) clipped to the cap region, so only the
+   inner half survives → an interior rim glow, no solid fill. */
+.lemon-cap-rim {
+  fill: none;
+  stroke: var(--brass-bright);
+  mix-blend-mode: screen;
+  /* brighter than the section rims — the two tapered corners read as hot gold
+     tips. Screen-blended, so the bump pushes the glow well up the metal. */
+  opacity: 0.95;
+}
+/* per-section rim glow — same border-in treatment in the segment's tone (currentColor,
+   set on the group). Brightest along the borders, fading inward. */
+.section-rim {
+  fill: none;
+  stroke: currentColor;
+  mix-blend-mode: screen;
+  opacity: 0.55;
+}
+/* per-section central core — a small, gentle radial in the tone (gradient set inline),
+   the weaker second glow source at the segment centre. */
+.section-core {
+  stroke: none;
+  mix-blend-mode: screen;
+}
+/* lower lemon boundary — the inverted arc that mirrors the connecting arc. A SOLID
+   gold instrument line, identical weight/colour to .arc-line, so the two close into
+   one clean lens (was a faint dashed worker guide). */
+.lemon-arc {
+  fill: none;
+  stroke: var(--instrument);
+  stroke-width: var(--instrument-w);
+  stroke-linecap: round;
+}
+
+/* ══ coordinate-capture placement layer (authoring tool, mockup only) ═════════
+   Full-bleed overlay ABOVE the timer graph + arc + fan (z:65) but BELOW the
+   demobar (z:70). Inert by default (pointer-events:none) so the cockpit reads and
+   interacts straight through it; flipping Place mode ON takes the pointer (a
+   crosshair) so each click drops a capture dial. The captured dials render either
+   way (persisted) — the hand-authored layout stays visible across a toggle. */
+.place-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 65;
+  pointer-events: none;
+}
+.place-layer--active { pointer-events: auto; cursor: crosshair; }
+
+/* faint dashed connector threading the drops in placement order — cosmetic, so
+   the captured sequence reads as a queue/path. Never intercepts the pointer. */
+.place-layer__svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.place-connector {
+  fill: none;
+  stroke: var(--instrument);
+  stroke-width: var(--instrument-w);
+  stroke-dasharray: 3 5;
+  opacity: 0.7;
+}
+
+/* one capture dial — sized to the TTS queue dial (36px), same instrument-ring
+   chrome as the worker chips (translucent surface fill + --instrument border), but
+   a DOM ring (absolute, left/top from the capture) rather than an SVG circle.
+   Centred on its (x, y) via the −50% translate. */
+.place-dial {
+  position: absolute;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
+  border: var(--instrument-w) solid var(--instrument);
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+.place-dial__idx {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: calc(13px * var(--ui-scale, 1));
+  font-weight: 600;
+  color: var(--instrument);
+  opacity: 0.85;
+}
+
+/* placement readout + controls inside the demobar */
+.demobar__check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
+.demobar__check input { accent-color: var(--brass); }
+.demobar__place { display: inline-flex; align-items: center; gap: 8px; }
+.demobar__placecount { font-size: 11px; color: var(--brass); font-family: 'IBM Plex Mono', monospace; white-space: nowrap; }
+.demobar__placeout {
+  width: 180px; height: 46px; resize: none;
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px; line-height: 1.3;
+  color: var(--text); background: var(--surface); border: 1px solid var(--line-bright);
+  border-radius: 4px; padding: 4px 6px;
+}
+.demobar__placebtns { display: inline-flex; gap: 4px; }
+.demobar__placebtn {
+  border: 1px solid var(--line-bright); background: var(--surface); color: var(--muted);
+  border-radius: 4px; padding: 3px 7px; cursor: pointer;
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px; line-height: 1;
+}
+.demobar__placebtn:hover:not(:disabled) { color: var(--text); border-color: var(--brass); }
+.demobar__placebtn:disabled { opacity: 0.4; cursor: default; }
+
+/* the graph horizon (break-even line) — a structural instrument line, so it
+   loads the SAME colour + weight tokens as the dial border + arc (all three
+   render at one identical thickness). Alpha lives in the token, so no per-element
+   opacity here (that would compound it). linecap/linejoin MATCH the arc's round
+   join+cap (was butt/miter): a cap/join mismatch reads as a seam where the three
+   instrument lines meet, and the horizon's right end tucks under the hub rim, so
+   its cap must round like the arc's for the fork to read as one continuous line. */
+.horizon {
+  stroke: var(--instrument);
+  stroke-width: var(--instrument-w);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+
+/* up/down steppers — drive the big corner dial's fraction (Focus / Distract) */
+.stepper { display: inline-flex; align-items: center; gap: 8px; font-family: 'IBM Plex Mono', monospace; }
+.stepper__label { text-transform: uppercase; letter-spacing: 0.1em; font-size: 10px; color: var(--brass); }
+.stepper__val { color: var(--text); min-width: 18px; text-align: center; font-size: 13px; }
+.stepper__arrows { display: inline-flex; flex-direction: column; gap: 2px; }
+.stepper__btn {
+  border: 1px solid var(--line-bright); background: var(--surface); color: var(--muted);
+  border-radius: 4px; width: 20px; height: 13px; padding: 0; cursor: pointer;
+  font-size: 8px; line-height: 1; display: grid; place-items: center;
+}
+.stepper__btn:hover { color: var(--text); border-color: var(--brass); }
+
+:where(input):focus-visible { outline: 2px solid var(--brass-bright); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; }
+  /* TTS play gesture: the global rule above already kills the L-path + shockwaves
+     + glow; also drop the slot transition so the reorder/drain land INSTANTLY.
+     The 5 s → dismiss → remove logic still runs (JS timers), and the static
+     .tts-dial--speaking box-shadow remains as the "speaking" marker. */
+  .tts-stack .ring { transition: none; }
+  /* worker queues: drop the slot-scoot transition (reflow lands INSTANTLY); the
+     global rule above already kills the dismiss keyframe. The click → remove →
+     slot-decrement logic still runs (JS), so the queue still reflows. */
+  .worker-chip { transition: none; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RESPONSIVE OVERRIDES — the ONLY place per-size rules live.
+   ---------------------------------------------------------------------------
+   Generic resilience is handled by uiScale (the --ui-scale factor + the scaled
+   --hub-* / --corner-dial-d bridges): the whole instrument assembly shrinks off
+   ONE factor at every width, welded, with NO per-size numbers. This block is the
+   isolated home for the few things that generic scaling can't express — kept
+   deliberately minimal. Today that is ONLY the demo-bar collapse. Future
+   portrait reflows / data-driven per-size tweaks belong HERE, nowhere else.
+   Breakpoint: --bp-narrow = 720px (media queries take the literal below).
+   ═══════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 720px) {
+  /* demo bar (mockup chrome) collapses to its toggle; the controls hide until
+     .demobar--open. The instrument cluster itself already shrank via uiScale, so
+     the old `.dials { scale(0.82) }` one-off is retired. */
+  .demobar__toggle { display: inline-block; }
+  .demobar__body { display: none; }
+  .demobar--open .demobar__body { display: flex; }
+}
