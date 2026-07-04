@@ -903,27 +903,11 @@ PERSONA_TINTS = {
 }
 
 
-def _voice_locked(adapter: TmuxAdapter, pane_id: str) -> bool:
-    return (
-        adapter.run(
-            "show-options",
-            "-pqv",
-            "-t",
-            pane_id,
-            "@DISCORD_VOICE_LOCK",
-            allow_failure=True,
-        ).strip()
-        == "1"
-    )
-
-
 def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec) -> None:
     current = adapter.run(
         "display-message", "-t", pane_id, "-p", "#{pane_id}", allow_failure=True
     ).strip()
     if current != pane_id:
-        return
-    if _voice_locked(adapter, pane_id):
         return
     bg = PERSONA_TINTS.get(spec.persona)
     if bg:
@@ -941,7 +925,7 @@ def apply_persona_pane_tint(
     derives from the stable pane label, NOT from ``@INSTANCE_ID`` — so a seat is
     tinted at wrapper birth even before its instance registers (the empty-stamp →
     no-tint root). Returns the applied background, or ``None`` when the label is
-    not a tinted persona seat or the pane is Discord-voice-locked.
+    not a tinted persona seat.
     """
     label = (pane_label or "").strip()
     if label not in PERSONA_LABELS:
@@ -952,8 +936,6 @@ def apply_persona_pane_tint(
         return None
     bg = PERSONA_TINTS.get(spec.persona)
     if not bg:
-        return None
-    if _voice_locked(adapter, pane_id):
         return None
     _set_pane_tint(adapter, pane_id, bg)
     return bg

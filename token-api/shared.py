@@ -595,13 +595,6 @@ def apply_pane_tint(
         return
     bg = pane_tint or "default"
     try:
-        voice = _tmuxctld_run_tmux(
-            ("show-options", "-pqv", "-t", tmux_pane, "@DISCORD_VOICE_LOCK"),
-            timeout=2,
-        )
-        voice_locked = str((voice or {}).get("stdout") or "").strip()
-        if voice_locked == "1":
-            return
         style_args: list[tuple[str, ...]]
         if not bg or bg == "default":
             style_args = [

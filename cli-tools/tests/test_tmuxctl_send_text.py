@@ -155,6 +155,42 @@ def test_clear_pane_tint_unsets_pane_style_options(monkeypatch: pytest.MonkeyPat
     ]
 
 
+def test_instance_unstamp_preserves_persona_pane_tint(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if cmd[1:] == ["show-options", "-pqv", "-t", "%42", "@PANE_ID"]:
+            return subprocess.CompletedProcess(cmd, 0, "council:custodes\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    adapter.run("set-option", "-pu", "-t", "%42", "@INSTANCE_ID")
+
+    assert ["tmux", "set-option", "-pu", "-t", "%42", "window-style"] not in calls
+    assert ["tmux", "set-option", "-pu", "-t", "%42", "window-active-style"] not in calls
+
+
+def test_instance_unstamp_clears_nonpersona_pane_tint(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = TmuxAdapter(tmux_binary="tmux")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if cmd[1:] == ["show-options", "-pqv", "-t", "%42", "@PANE_ID"]:
+            return subprocess.CompletedProcess(cmd, 0, "mechanicus:1\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(tmux_adapter.subprocess, "run", fake_run)
+
+    adapter.run("set-option", "-pu", "-t", "%42", "@INSTANCE_ID")
+
+    assert ["tmux", "set-option", "-pu", "-t", "%42", "window-style"] in calls
+    assert ["tmux", "set-option", "-pu", "-t", "%42", "window-active-style"] in calls
+
+
 def test_automation_focus_guard_blocks_non_mechanicus_select_pane(monkeypatch):
     adapter = TmuxAdapter(tmux_binary="tmux")
     calls: list[list[str]] = []
