@@ -383,3 +383,118 @@ def test_speak_tts_sanitizes_then_chunks_then_dispatches(monkeypatch: pytest.Mon
     assert "tmux foo bar" in seen["chunks"][0]["text"]
     assert "566b697" not in seen["chunks"][0]["text"]
     assert "commit" in seen["chunks"][0]["text"]
+
+
+def test_tts_control_accepts_notification_commands_and_rejects_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    tts = _load_tts()
+    echoed = []
+
+    def fake_echo(backend, payload):
+        echoed.append(dict(payload))
+        return {"success": True, "backend": backend, "echoed": payload["action"]}
+
+    monkeypatch.setattr(tts, "_echo_tts_control_to_backend", fake_echo)
+    tts._record_tts_backend_active("phone", playback_id="play-control")
+
+    for command in ["pause", "resume", "skip", "stop", "faster", "slower", "speed"]:
+        req = tts.TTSControlRequest(command=command, backend="phone", speed=1.25 if command == "speed" else None)
+        result = asyncio.run(tts.api_tts_control(req))
+        assert result["success"] is True
+
+    state = tts.get_tts_authoritative_state()
+    assert state["control"]["last_action"] == "speed"
+    assert state["control"]["speed"] == 1.25
+    assert {payload["action"] for payload in echoed} >= {
+        "pause",
+        "resume",
+        "skip",
+        "stop",
+        "faster",
+        "slower",
+        "speed",
+    }
+
+    with pytest.raises(tts.HTTPException):
+        asyncio.run(tts.api_tts_control(tts.TTSControlRequest(command="bogus", backend="phone")))
+
+
+def test_stop_control_completes_active_phone_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    tts = _load_tts()
+    chunks = tts.build_tts_chunk_handoff("one. two.", max_chars=10)
+    phone_chunks = tts.build_phone_tts_chunk_handoff(chunks)
+    session_id = "sess-stop"
+    playback_id = phone_chunks[0]["playback_id"]
+    tts._register_phone_tts_stream(
+        session_id=session_id,
+        playback_id=playback_id,
+        utterance_id=phone_chunks[0]["utterance_id"],
+        chunks=phone_chunks,
+    )
+    waiter = tts.threading.Event()
+    tts.pending_phone_playbacks[playback_id] = waiter
+    monkeypatch.setattr(
+        tts,
+        "_echo_tts_control_to_backend",
+        lambda backend, payload: {"success": True, "backend": backend, "echoed": payload["action"]},
+    )
+    try:
+        result = asyncio.run(
+            tts.api_tts_control(
+                tts.TTSControlRequest(
+                    command="stop",
+                    backend="phone",
+                    session_id=session_id,
+                    playback_id=playback_id,
+                )
+            )
+        )
+        assert result["success"] is True
+        assert waiter.is_set() is True
+        assert (session_id, playback_id) not in tts.TTS_PHONE_STREAMS
+        assert result["state"]["control"]["state"] == "stopped"
+    finally:
+        tts.pending_phone_playbacks.pop(playback_id, None)
+        tts.TTS_PHONE_STREAMS.pop((session_id, playback_id), None)
+
+
+def test_phone_backfill_stop_state_completes_stream() -> None:
+    tts = _load_tts()
+    chunks = tts.build_tts_chunk_handoff("one. two. three.", max_chars=10)
+    phone_chunks = tts.build_phone_tts_chunk_handoff(chunks)
+    session_id = "sess-backfill-stop"
+    playback_id = phone_chunks[0]["playback_id"]
+    tts._register_phone_tts_stream(
+        session_id=session_id,
+        playback_id=playback_id,
+        utterance_id=phone_chunks[0]["utterance_id"],
+        chunks=phone_chunks,
+    )
+    waiter = tts.threading.Event()
+    tts.pending_phone_playbacks[playback_id] = waiter
+    try:
+        tts._update_tts_authoritative_state(
+            control={
+                "state": "stopped",
+                "last_action": "stop",
+                "speed": 1.0,
+                "source": "unit",
+                "updated_at": None,
+            }
+        )
+        stopped = asyncio.run(
+            tts.api_tts_chunk_next(
+                tts.TTSChunkNextRequest(
+                    session_id=session_id,
+                    playback_id=playback_id,
+                    last_consumed_index=0,
+                )
+            )
+        )
+        assert stopped["stopped"] is True
+        assert stopped["done"] is True
+        assert stopped["reason"] == "stopped"
+        assert waiter.is_set() is True
+        assert (session_id, playback_id) not in tts.TTS_PHONE_STREAMS
+    finally:
+        tts.pending_phone_playbacks.pop(playback_id, None)
+        tts.TTS_PHONE_STREAMS.pop((session_id, playback_id), None)

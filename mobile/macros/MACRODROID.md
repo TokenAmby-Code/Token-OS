@@ -138,23 +138,22 @@ Track B phone-side artifacts for [[/Volumes/Imperium/Imperium-ENV/Mars/Tasks/tts
 Phone-side contract:
 
 - Token-OS owns TTS session, queue, current chunk, `playback_id`, and control state.
-- Phone is execution-only and holds at most the active speech plus one queued/backfill chunk; Token-OS remains authoritative for order and control state.
-- Overlay controls do not mutate local playback directly. They hit local `/tts-control`, which forwards to Token-OS `/api/tts/control`; only a later `/tts-local-control` echo is local execution authority.
+- Phone is execution-only and holds the active speech plus one authorized next chunk/backfill slot; Token-OS remains authoritative for order and control state.
+- Controls live in one persistent MacroDroid notification. Notification buttons hit local `/tts-control`, which forwards to Token-OS `/api/tts/control`; only a later `/tts-local-control` echo may mutate local execution.
+- `TTS Phone Backfill Fetcher` is invoked asynchronously by `TTS Phone Chunk Player` so chunk `n+2` is fetched while chunk `n` is speaking.
 - Phone has no Mac fallback. Failures go up to Token-OS via `/tts-error` → `/api/tts/backend-error`.
 
 Staged macros:
 
 | File | Macro | Endpoint / Trigger | Purpose |
 |---|---|---|---|
-| `tts-phone-control-ingress.macro` | TTS Phone Control Ingress | `/tts-control` | Public phone control ingress; forwards overlay commands to Token-OS first. |
-| `tts-phone-local-control.macro` | TTS Phone Local Control | `/tts-local-control` | Private Token-OS echo consumer; local-control hook point. |
-| `tts-phone-chunk-player.macro` | TTS Phone Chunk Player | `/tts-chunk` | Streaming write-ahead executor: scalarizes `current_chunk`/`next_chunk`, speaks current, queues next with MacroDroid TTS queue, and calls Token-OS `/api/tts/chunk-next` for one backfill at a time. |
+| `tts-phone-control-notification.macro` | TTS Phone Control Notification | `/tts-control-surface` + notification buttons | Posts/refreshes the persistent TTS notification and maps buttons to local `/tts-control?command=...&source=notification`. Also disables retired floating buttons. |
+| `tts-phone-control-ingress.macro` | TTS Phone Control Ingress | `/tts-control` | Public phone control ingress; forwards notification commands to Token-OS first. |
+| `tts-phone-local-control.macro` | TTS Phone Local Control | `/tts-local-control` | Private Token-OS echo consumer; updates local pause/resume/speed state and cancels the active chunk player on skip/stop. |
+| `tts-phone-backfill-fetcher.macro` | TTS Phone Backfill Fetcher | async manual macro | Calls Token-OS `/api/tts/chunk-next` and writes global backfill handoff state for the chunk player. |
+| `tts-phone-chunk-player.macro` | TTS Phone Chunk Player | `/tts-chunk` | Streaming executor: scalarizes `current_chunk`/`next_chunk`, starts the async backfill helper, speaks at chunk boundaries, promotes backfill, and posts lifecycle events. |
 | `tts-phone-error-report.macro` | TTS Phone Error Report | `/tts-error` | Reports phone executor failure to Token-OS. |
-| `tts-overlay-pause.macro` | TTS Overlay Pause | floating `tts-pause` | Calls local `/tts-control?command=pause`. |
-| `tts-overlay-resume.macro` | TTS Overlay Resume | floating `tts-resume` | Calls local `/tts-control?command=resume`. |
-| `tts-overlay-skip.macro` | TTS Overlay Skip | floating `tts-skip` | Calls local `/tts-control?command=skip`. |
-| `tts-overlay-faster.macro` | TTS Overlay Faster | floating `tts-faster` | Calls local `/tts-control?command=faster`. |
-| `tts-overlay-stop.macro` | TTS Overlay Stop | floating `tts-stop` | Calls local `/tts-control?command=stop`. |
+| `tts-overlay-pause/resume/skip/faster/stop.macro` | retired overlay stubs | disabled floating triggers | Kept only to deactivate/import over the old floating buttons; notification controls are canonical. |
 
 Validation:
 

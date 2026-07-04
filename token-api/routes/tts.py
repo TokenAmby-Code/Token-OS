@@ -174,7 +174,7 @@ class TTSControlRequest(BaseModel):
 
     command: str | None = None  # Track B phone field: pause, resume, skip, speed
     action: str | None = None  # Back-compat alias accepted during rollout
-    speed: float | None = None
+    speed: float | str | None = None
     playback_id: str | None = None
     session_id: str | None = None
     backend: str | None = None
@@ -1186,10 +1186,35 @@ def _record_tts_backend_active(
     return _update_tts_authoritative_state(**updates)
 
 
+
+
+def _coerce_tts_speed(value: float | str | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 def _record_tts_control_state(request: TTSControlRequest, backend: str | None) -> dict:
     action = (request.command or request.action or "").strip().lower()
     with _tts_authoritative_state_lock:
         control = dict(TTS_AUTHORITATIVE_STATE.get("control") or {})
+        current_speed = control.get("speed")
+        try:
+            current_speed = float(current_speed)
+        except (TypeError, ValueError):
+            current_speed = 1.0
+        requested_speed = _coerce_tts_speed(request.speed)
+        if action == "faster":
+            requested_speed = min(2.0, round(current_speed + 0.1, 2))
+        elif action == "slower":
+            requested_speed = max(0.5, round(current_speed - 0.1, 2))
+
         control["last_action"] = action
         control["source"] = request.source
         control["updated_at"] = _now_iso()
@@ -1199,9 +1224,11 @@ def _record_tts_control_state(request: TTSControlRequest, backend: str | None) -
             control["state"] = "playing"
         elif action == "skip":
             control["state"] = "skipping"
-        elif action == "speed":
+        elif action == "stop":
+            control["state"] = "stopped"
+        elif action in {"speed", "faster", "slower"}:
             control["state"] = "playing"
-            control["speed"] = request.speed
+            control["speed"] = requested_speed
         TTS_AUTHORITATIVE_STATE["control"] = control
         if backend in TTS_EXECUTION_BACKENDS:
             TTS_AUTHORITATIVE_STATE["backend"] = backend
@@ -1426,6 +1453,19 @@ def _complete_phone_tts_stream(session_id: str | None, playback_id: str | None) 
     waiter = pending_phone_playbacks.get(str(playback_id))
     if waiter is not None:
         waiter.set()
+
+
+def _complete_active_phone_tts_stream(session_id: str | None, playback_id: str | None) -> None:
+    """Complete a specific or current phone stream after skip/stop control."""
+    session_id = session_id or TTS_AUTHORITATIVE_STATE.get("session_id")
+    playback_id = playback_id or TTS_AUTHORITATIVE_STATE.get("playback_id")
+    if session_id and playback_id:
+        _complete_phone_tts_stream(str(session_id), str(playback_id))
+        return
+    with _tts_phone_streams_lock:
+        keys = list(TTS_PHONE_STREAMS.keys())
+    for key_session, key_playback in keys:
+        _complete_phone_tts_stream(key_session, key_playback)
 
 
 def _chunk_next_payload(
@@ -2852,8 +2892,11 @@ def _echo_tts_control_to_backend(backend: str | None, payload: dict) -> dict:
         return result
 
     if backend == "wsl":
-        command = "stop" if action == "skip" else action
+        command = "stop" if action in {"skip", "stop"} else action
         body = {"command": command}
+        if action in {"faster", "slower"}:
+            command = "speed"
+            body["command"] = command
         if payload.get("speed") is not None:
             body["speed"] = payload.get("speed")
         try:
@@ -2885,17 +2928,29 @@ async def api_tts_control(request: TTSControlRequest) -> dict:
        endpoint/mechanism and returns that echo/error without falling back to Mac.
     """
     action = (request.command or request.action or "").strip().lower()
-    if action not in {"pause", "resume", "skip", "speed"}:
-        raise HTTPException(status_code=400, detail="command must be pause, resume, skip, or speed")
-    if action == "speed" and request.speed is None:
+    allowed_actions = {"pause", "resume", "skip", "stop", "faster", "slower", "speed"}
+    if action not in allowed_actions:
+        raise HTTPException(
+            status_code=400,
+            detail="command must be pause, resume, skip, stop, faster, slower, or speed",
+        )
+    speed_value = _coerce_tts_speed(request.speed)
+    if action == "speed" and speed_value is None:
         raise HTTPException(status_code=400, detail="speed action requires speed")
 
     backend = _active_tts_backend(request.backend)
     recorded = _record_tts_control_state(request, backend)
+    if action in {"skip", "stop"}:
+        _complete_active_phone_tts_stream(
+            request.session_id or recorded.get("session_id"),
+            request.playback_id or recorded.get("playback_id"),
+        )
     echo_payload = {
         "action": action,
         "command": action,
-        "speed": request.speed,
+        "speed": (recorded.get("control") or {}).get("speed")
+        if action in {"faster", "slower"}
+        else speed_value,
         "playback_id": request.playback_id or recorded.get("playback_id"),
         "session_id": request.session_id or recorded.get("session_id"),
         "source": request.source,
@@ -2916,7 +2971,7 @@ async def api_tts_control(request: TTSControlRequest) -> dict:
         device_id="tts_control",
         details={
             "action": action,
-            "speed": request.speed,
+            "speed": speed_value,
             "backend": backend,
             "success": success,
             "backend_echo": backend_echo,
@@ -2980,11 +3035,17 @@ async def api_tts_chunk_next(request: TTSChunkNextRequest) -> dict:
             details={**payload, "last_consumed_index": request.last_consumed_index},
         )
         return payload
-    if control_state == "skipping":
+    if control_state in {"skipping", "stopped"}:
         _complete_phone_tts_stream(request.session_id, request.playback_id)
-        payload = _chunk_next_payload(None, done=True, reason="skipped")
+        reason = "skipped" if control_state == "skipping" else "stopped"
+        payload = _chunk_next_payload(None, done=True, reason=reason)
         payload.update(
-            {"skipped": True, "session_id": request.session_id, "playback_id": request.playback_id}
+            {
+                "skipped": control_state == "skipping",
+                "stopped": control_state == "stopped",
+                "session_id": request.session_id,
+                "playback_id": request.playback_id,
+            }
         )
         await log_event(
             "tts_chunk_next",

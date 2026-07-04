@@ -5,9 +5,9 @@
     "m_enabled": true,
     "m_completed": true,
     "m_GUID": 0,
-    "m_category": "Notify",
+    "m_category": "TTS",
     "aiGenerated": 1,
-    "m_description": "Public phone endpoint /tts-control. Overlay buttons call this endpoint; it forwards the command to Token-OS /api/tts/control before any local state mutation. This preserves Token-OS as the TTS authority.",
+    "m_description": "Local /tts-control ingress that forwards notification/control commands to Token-OS first.",
     "m_triggerList": [
       {
         "identifier": "tts-control",
@@ -22,7 +22,7 @@
         "variableWhiteList": [],
         "variableWhiteListEnabled": false,
         "m_classType": "HttpServerTrigger",
-        "m_SIGUID": -989999999999992081,
+        "m_SIGUID": -989999999997680474,
         "disableLogging": false,
         "m_comment": "",
         "m_constraintList": [],
@@ -33,7 +33,7 @@
     "m_actionList": [
       {
         "m_classType": "ShellScriptAction",
-        "m_SIGUID": -989999999999984162,
+        "m_SIGUID": -989999999997704231,
         "disableLogging": false,
         "m_comment": "",
         "m_constraintList": [],
@@ -41,67 +41,41 @@
         "m_isOrCondition": false,
         "blockNextAction": true,
         "m_nonRoot": true,
-        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CONTROL_INGRESS] command={http_param=command} session={http_param=session_id} playback={http_param=playback_id} -> token-os-first\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CONTROL_INGRESS] command={http_param=command} source={http_param=source} -> token-os-first\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
         "timeoutSeconds": 30,
         "useHelper": false,
         "useShizuku": false
       },
       {
         "m_classType": "HttpRequestAction",
-        "m_SIGUID": -989999999999976243,
+        "m_SIGUID": -989999999997696312,
         "disableLogging": false,
         "m_comment": "",
         "m_constraintList": [],
         "m_isDisabled": false,
         "m_isOrCondition": false,
         "requestConfig": {
-          "allFilesAccessPath": "",
-          "allowAnyCertificate": false,
-          "basicAuthEnabled": false,
-          "basicAuthPassword": "",
-          "basicAuthUsername": "",
-          "blockNextAction": true,
-          "clientCertEnabled": false,
-          "clientCertKeyStoreDisplayName": "",
-          "clientCertKeyStoreUri": "",
-          "clientCertPassword": "",
-          "contentBodyDynamicFileName": "",
-          "contentBodyFileDisplayName": "",
-          "contentBodyFileUri": "",
-          "contentBodyFolderDisplayName": "",
-          "contentBodyFolderUri": "",
-          "contentBodySource": 0,
-          "contentBodyText": "{\"command\":\"{http_param=command}\",\"source\":\"phone_overlay\",\"backend\":\"phone\",\"session_id\":\"{http_param=session_id}\",\"playback_id\":\"{http_param=playback_id}\",\"speed\":\"{http_param=speed}\"}",
-          "contentType": "application/json",
-          "followRedirects": true,
-          "headerParams": [],
-          "localFileUri": "",
-          "prettifyJson": false,
-          "proxyEnabled": false,
-          "proxyHost": "",
-          "proxyPort": 8080,
-          "proxyType": 0,
-          "queryParams": [],
-          "requestTimeOutSeconds": 10,
           "requestType": 1,
-          "returnCodeVariableName": "response-code",
-          "saveResponseAllFilesAccessPath": "",
-          "saveResponseFileName": "",
-          "saveResponseFolderPathDisplayName": "",
-          "saveResponseFolderPathUri": "",
-          "saveResponseType": 0,
-          "saveResponseUseAllFilesAccess": false,
-          "saveReturnCodeToVariable": true,
-          "saveReturnHeadersToVariable": false,
           "urlToOpen": "{v=token_os_base_url}/api/tts/control",
-          "useAllFilesAccess": false,
-          "useLocalFileUri": false,
-          "useStaticContentBodyFile": true
+          "requestTimeOutSeconds": 12,
+          "contentType": "application/json",
+          "contentBodySource": 0,
+          "contentBodyText": "{\"command\":\"{http_param=command}\",\"source\":\"phone_notification\",\"backend\":\"phone\",\"session_id\":\"{http_param=session_id}\",\"playback_id\":\"{http_param=playback_id}\",\"speed\":\"{http_param=speed}\"}",
+          "blockNextAction": true,
+          "saveReturnCodeToVariable": true,
+          "returnCodeVariableName": "response-code",
+          "returnCodeDictionaryKeys": {
+            "keys": []
+          },
+          "saveReturnHeadersToVariable": false,
+          "saveResponseType": 0,
+          "followRedirects": true,
+          "allowAnyCertificate": false
         }
       },
       {
         "m_classType": "HttpServerResponseAction",
-        "m_SIGUID": -989999999999968324,
+        "m_SIGUID": -989999999997688393,
         "disableLogging": false,
         "m_comment": "",
         "m_constraintList": [],
@@ -119,11 +93,109 @@
     {
       "m_name": "token_os_base_url",
       "m_type": 2,
-      "m_stringValue": "http://100.95.109.23:7777",
       "isLocalVar": false,
-      "isSecure": false
+      "isSecure": false,
+      "m_stringValue": "http://100.95.109.23:7777"
+    },
+    {
+      "m_name": "tts_session_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_playback_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_utterance_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_current_chunk_text",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_next_chunk_text",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_current_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_next_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_last_consumed_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_status",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "idle"
+    },
+    {
+      "m_name": "tts_backfill_next_chunk",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_next_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_done",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_control_state",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "idle"
+    },
+    {
+      "m_name": "tts_speed",
+      "m_type": 3,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_decimalValue": 1.0
     }
   ],
   "userIcons": null,
-  "aiFeedback": "Generated from official MacroDroid schema for Token-OS phone TTS execution architecture."
+  "aiFeedback": "Generated from official MacroDroid schema."
 }

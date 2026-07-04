@@ -47,7 +47,7 @@ def token_os_global(name: str) -> dict:
     return matches[0]
 
 
-def test_overlay_buttons_call_local_ingress_not_token_os_or_local_control() -> None:
+def test_retired_overlay_buttons_are_disabled_stubs() -> None:
     expected = {
         "tts-overlay-pause.macro": "pause",
         "tts-overlay-resume.macro": "resume",
@@ -57,28 +57,44 @@ def test_overlay_buttons_call_local_ingress_not_token_os_or_local_control() -> N
     }
     for filename, command in expected.items():
         macro = load(filename)
+        assert macro["m_enabled"] is False
         triggers = macro["m_triggerList"]
         assert [t["m_classType"] for t in triggers] == ["FloatingButtonTrigger"]
         assert triggers[0]["identifier"] == f"tts-{command}"
-        assert request_urls(macro) == [
-            f"http://127.0.0.1:7777/tts-control?command={command}&source=overlay"
-        ]
-        assert (
-            actions(macro, "HttpRequestAction")[0]["requestConfig"][
-                "requestTimeOutSeconds"
-            ]
-            == 12
-        )
+        assert triggers[0]["m_isDisabled"] is True
         serialized = json.dumps(macro)
-        assert "/tts-local-control" not in serialized
         assert "/api/tts/control" not in serialized
-        assert "SetVariableAction" not in serialized
-        assert "CancelActiveMacroAction" not in serialized
+        assert "/tts-local-control" not in serialized
 
 
-def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally() -> (
-    None
-):
+def test_notification_control_surface_replaces_floating_buttons() -> None:
+    macro = load("tts-phone-control-notification.macro")
+    trigger_types = [t["m_classType"] for t in macro["m_triggerList"]]
+    assert trigger_types == ["HttpServerTrigger"] + ["NotificationButtonTrigger"] * 5
+    assert macro["m_triggerList"][0]["identifier"] == "tts-control-surface"
+
+    notification = actions(macro, "NotificationAction")[0]
+    assert notification["notificationIdString"] == "token-os-tts-controls"
+    assert notification["liveNotification"] is True
+    assert notification["preventRemovalByBin"] is True
+    assert [b["label"] for b in notification["notificationActionButtons"]] == [
+        "Pause",
+        "Resume",
+        "Skip",
+        "Faster",
+        "Stop",
+    ]
+
+    urls = request_urls(macro)
+    assert "http://127.0.0.1:7777/tts-control?command=pause&source=notification" in urls
+    assert "http://127.0.0.1:7777/tts-control?command=resume&source=notification" in urls
+    assert "http://127.0.0.1:7777/tts-control?command=skip&source=notification" in urls
+    assert "http://127.0.0.1:7777/tts-control?command=faster&source=notification" in urls
+    assert "http://127.0.0.1:7777/tts-control?command=stop&source=notification" in urls
+    assert len(actions(macro, "FloatingButtonConfigureAction")) == 5
+
+
+def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally() -> None:
     macro = load("tts-phone-control-ingress.macro")
     assert (
         token_os_global("tts-phone-control-ingress.macro")["m_stringValue"]
@@ -88,7 +104,7 @@ def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally(
     assert request_urls(macro) == [TOKEN_OS_CONTROL]
     body = request_bodies(macro)[0]
     assert '"command":"{http_param=command}"' in body
-    assert '"source":"phone_overlay"' in body
+    assert '"source":"phone_notification"' in body
     assert '"backend":"phone"' in body
     assert '"speed":"{http_param=speed}"' in body
     serialized = json.dumps(macro)
@@ -103,18 +119,34 @@ def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally(
         assert class_type not in serialized
 
 
-def test_local_control_echo_is_private_consumed_endpoint_not_authority() -> None:
+def test_local_control_echo_is_private_and_may_mutate_local_execution() -> None:
     macro = load("tts-phone-local-control.macro")
     assert macro["m_triggerList"][0]["identifier"] == "tts-local-control"
     assert request_urls(macro) == []
     serialized = json.dumps(macro)
     assert "local_control_consumed" in serialized
+    assert "tts_control_state" in serialized
+    assert "CancelActiveMacroAction" in serialized
     lowered = serialized.lower()
     assert "macos_say" not in lowered
     assert "mac say" not in lowered
 
 
-def test_chunk_player_streams_with_scalar_speak_text_and_backfill() -> None:
+def test_backfill_helper_calls_chunk_next_and_writes_global_handoff_state() -> None:
+    macro = load("tts-phone-backfill-fetcher.macro")
+    assert macro["m_triggerList"][0]["m_classType"] == "EmptyTrigger"
+    assert request_urls(macro) == [f"{TOKEN_OS_BASE}/api/tts/chunk-next"]
+    body = request_bodies(macro)[0]
+    assert '"last_consumed_index":{v=tts_last_consumed_index}' in body
+    assert '"session_id":"{v=tts_session_id}"' in body
+    assert actions(macro, "JsonParseAction")[0]["dictionaryVarName"] == "tts_backfill_response"
+    serialized = json.dumps(macro)
+    assert "tts_backfill_status" in serialized
+    assert "tts_backfill_next_chunk" in serialized
+    assert "tts_backfill_next_index" in serialized
+
+
+def test_chunk_player_streams_with_async_backfill_helper_and_boundary_promotion() -> None:
     macro = load("tts-phone-chunk-player.macro")
     assert (
         token_os_global("tts-phone-chunk-player.macro")["m_stringValue"]
@@ -122,48 +154,27 @@ def test_chunk_player_streams_with_scalar_speak_text_and_backfill() -> None:
     )
     assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
     speak_actions = actions(macro, "SpeakTextAction")
-    assert [a["m_textToSay"] for a in speak_actions] == [
-        "{lv=current_chunk_text}",
-        "{lv=next_chunk_text}",
-        "{lv=backfill_next_chunk}",
-    ]
-    assert [a["m_queue"] for a in speak_actions] == [False, True, True]
+    assert [a["m_textToSay"] for a in speak_actions] == ["{v=tts_current_chunk_text}"]
     assert speak_actions[0]["m_waitToFinish"] is True
-    assert speak_actions[1]["m_waitToFinish"] is False
+    assert speak_actions[0]["m_queue"] is False
+
+    force_runs = actions(macro, "ForceMacroRunAction")
+    assert any(a["m_macroName"] == "TTS Phone Backfill Fetcher" and a["m_waitToComplete"] is False for a in force_runs)
+    assert any(a["m_macroName"] == "TTS Phone Control Notification" for a in force_runs)
 
     serialized = json.dumps(macro)
-    # Only scalar locals are fed to SpeakTextAction; request/backfill dictionaries
-    # are dereferenced outside TTS so MacroDroid does not speak literal variables.
-    assert "{http_param=current_chunk}" not in serialized
-    assert "{http_param=next_chunk}" not in serialized
-    assert "{lv=request[" not in serialized
-    assert "request[" not in serialized
-    assert "IterateDictionaryAction" in serialized
-    assert "SetVariableAction" in serialized
+    assert "{http_param=current_chunk}" in serialized
+    assert "{http_param=next_chunk}" in serialized
+    assert "m_textToSay\": \"{http_param" not in serialized
     assert "LoopAction" in serialized
-    assert "ForceMacroRunAction" not in serialized
-    assert "streaming_current_plus_next" in serialized
+    assert "tts_backfill_status" in serialized
+    assert "current_complete_next_starting" in serialized
+    assert "buffer_drained" in serialized
+    assert len(actions(macro, "FloatingButtonConfigureAction")) == 5
 
     urls = request_urls(macro)
-    assert urls == [
-        f"{TOKEN_OS_BASE}/api/tts/chunk-event",
-        f"{TOKEN_OS_BASE}/api/tts/chunk-next",
-        f"{TOKEN_OS_BASE}/api/tts/chunk-event",
-        f"{TOKEN_OS_BASE}/api/tts/chunk-event",
-    ]
-    bodies = request_bodies(macro)
-    assert "current_complete_next_starting" in bodies[0]
-    assert "last_consumed_index" in bodies[1]
-    assert "buffer_drained" in bodies[2]
-    assert "buffer_drained" in bodies[3]
-    assert (
-        actions(macro, "HttpRequestAction")[0]["requestConfig"]["blockNextAction"]
-        is False
-    )
-    assert (
-        actions(macro, "HttpRequestAction")[1]["requestConfig"]["responseVariableName"]
-        == "backfill_raw"
-    )
+    assert f"{TOKEN_OS_BASE}/api/tts/chunk-event" in urls
+    assert f"{TOKEN_OS_BASE}/api/tts/chunk-next" not in urls
 
 
 def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:

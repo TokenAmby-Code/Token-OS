@@ -1,0 +1,740 @@
+{
+  "macroExportVersion": 1,
+  "macro": {
+    "m_name": "TTS Phone Control Notification",
+    "m_enabled": true,
+    "m_completed": true,
+    "m_GUID": 0,
+    "m_category": "TTS",
+    "aiGenerated": 1,
+    "m_description": "Posts persistent TTS notification controls and maps notification buttons to local /tts-control.",
+    "m_triggerList": [
+      {
+        "identifier": "tts-control-surface",
+        "ipAddressWhiteList": [],
+        "queryParamsDictionaryName": "request",
+        "responseCode": "OK",
+        "responseText": "OK",
+        "saveBodyToFile": false,
+        "saveBodyToFileDirectory": "/storage/emulated/0/Notifications",
+        "saveBodyToFileFilename": "tts",
+        "sendResponse": true,
+        "variableWhiteList": [],
+        "variableWhiteListEnabled": false,
+        "m_classType": "HttpServerTrigger",
+        "m_SIGUID": -989999999998551564,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false
+      },
+      {
+        "m_classType": "NotificationButtonTrigger",
+        "m_SIGUID": -989999999998543645,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "m_id": 1,
+        "m_collapseNotification": false
+      },
+      {
+        "m_classType": "NotificationButtonTrigger",
+        "m_SIGUID": -989999999998535726,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "m_id": 2,
+        "m_collapseNotification": false
+      },
+      {
+        "m_classType": "NotificationButtonTrigger",
+        "m_SIGUID": -989999999998527807,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "m_id": 3,
+        "m_collapseNotification": false
+      },
+      {
+        "m_classType": "NotificationButtonTrigger",
+        "m_SIGUID": -989999999998519888,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "m_id": 4,
+        "m_collapseNotification": false
+      },
+      {
+        "m_classType": "NotificationButtonTrigger",
+        "m_SIGUID": -989999999998511969,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "m_id": 5,
+        "m_collapseNotification": false
+      }
+    ],
+    "m_actionList": [
+      {
+        "m_classType": "HttpServerResponseAction",
+        "m_SIGUID": -989999999998504050,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "htmlText": "",
+        "option": 0,
+        "responseCode": "OK",
+        "text": "{\"status\":\"tts_control_notification_refreshed\"}"
+      },
+      {
+        "m_classType": "NotificationAction",
+        "m_SIGUID": -989999999998496131,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "m_notificationText": "Pause/resume applies at chunk boundaries. Skip/stop cancel the active phone stream.",
+        "m_overwriteExisting": true,
+        "m_notificationSubject": "Token-OS TTS Controls",
+        "m_runMacroWhenPressed": false,
+        "m_macroGUIDToRun": 0,
+        "macroNameToRun": "",
+        "m_imageResourceId": 0,
+        "m_iconBgColor": -16776961,
+        "m_ringtoneName": "",
+        "m_ringtoneIndex": 0,
+        "m_priority": 1,
+        "m_notificationChannelType": 1,
+        "notificationChannelName": "Token-OS TTS",
+        "notificationActionButtons": [
+          {
+            "label": "Pause",
+            "macroGuid": 0,
+            "macroName": "TTS Phone Control Notification"
+          },
+          {
+            "label": "Resume",
+            "macroGuid": 0,
+            "macroName": "TTS Phone Control Notification"
+          },
+          {
+            "label": "Skip",
+            "macroGuid": 0,
+            "macroName": "TTS Phone Control Notification"
+          },
+          {
+            "label": "Faster",
+            "macroGuid": 0,
+            "macroName": "TTS Phone Control Notification"
+          },
+          {
+            "label": "Stop",
+            "macroGuid": 0,
+            "macroName": "TTS Phone Control Notification"
+          }
+        ],
+        "iconType": 1,
+        "iconText": "TTS",
+        "disableHtml": true,
+        "m_backgroundColor": -16777216,
+        "m_textColor": -1,
+        "autoExpand": false,
+        "showAsOverlayOption": 0,
+        "notificatonId": 777702,
+        "notificationIdString": "token-os-tts-controls",
+        "group": "token-os",
+        "liveNotification": true,
+        "preventRemovalByBin": true
+      },
+      {
+        "m_classType": "FloatingButtonConfigureAction",
+        "m_SIGUID": -989999999998488212,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "enableOption": 2,
+        "triggerGuid": 0,
+        "macroGuid": 0,
+        "macroName": "TTS Overlay Pause",
+        "identifier": "tts-pause",
+        "updateLocation": false,
+        "padding": 8,
+        "iconType": 0,
+        "iconText": "",
+        "isInitialised": true
+      },
+      {
+        "m_classType": "FloatingButtonConfigureAction",
+        "m_SIGUID": -989999999998480293,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "enableOption": 2,
+        "triggerGuid": 0,
+        "macroGuid": 0,
+        "macroName": "TTS Overlay Resume",
+        "identifier": "tts-resume",
+        "updateLocation": false,
+        "padding": 8,
+        "iconType": 0,
+        "iconText": "",
+        "isInitialised": true
+      },
+      {
+        "m_classType": "FloatingButtonConfigureAction",
+        "m_SIGUID": -989999999998472374,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "enableOption": 2,
+        "triggerGuid": 0,
+        "macroGuid": 0,
+        "macroName": "TTS Overlay Skip",
+        "identifier": "tts-skip",
+        "updateLocation": false,
+        "padding": 8,
+        "iconType": 0,
+        "iconText": "",
+        "isInitialised": true
+      },
+      {
+        "m_classType": "FloatingButtonConfigureAction",
+        "m_SIGUID": -989999999998464455,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "enableOption": 2,
+        "triggerGuid": 0,
+        "macroGuid": 0,
+        "macroName": "TTS Overlay Faster",
+        "identifier": "tts-faster",
+        "updateLocation": false,
+        "padding": 8,
+        "iconType": 0,
+        "iconText": "",
+        "isInitialised": true
+      },
+      {
+        "m_classType": "FloatingButtonConfigureAction",
+        "m_SIGUID": -989999999998456536,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "enableOption": 2,
+        "triggerGuid": 0,
+        "macroGuid": 0,
+        "macroName": "TTS Overlay Stop",
+        "identifier": "tts-stop",
+        "updateLocation": false,
+        "padding": 8,
+        "iconType": 0,
+        "iconText": "",
+        "isInitialised": true
+      },
+      {
+        "m_classType": "IfConditionAction",
+        "m_SIGUID": -989999999998440698,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [
+          {
+            "m_classType": "TriggerThatInvokedConstraint",
+            "m_SIGUID": -989999999998448617,
+            "disableLogging": false,
+            "m_constraintList": [],
+            "m_isDisabled": false,
+            "m_isOrCondition": false,
+            "m_siGuidThatInvoked": -989999999998543645,
+            "m_triggerName": "Notification Button 1",
+            "m_not": false
+          }
+        ],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "childrenCollapsed": false,
+        "dontLogIfConditionIsFalse": true
+      },
+      {
+        "m_classType": "HttpRequestAction",
+        "m_SIGUID": -989999999998432779,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "requestConfig": {
+          "requestType": 0,
+          "urlToOpen": "http://127.0.0.1:7777/tts-control?command=pause&source=notification",
+          "requestTimeOutSeconds": 12,
+          "contentType": "",
+          "contentBodySource": 0,
+          "contentBodyText": "",
+          "blockNextAction": true,
+          "saveReturnCodeToVariable": true,
+          "returnCodeVariableName": "response-code",
+          "returnCodeDictionaryKeys": {
+            "keys": []
+          },
+          "saveReturnHeadersToVariable": false,
+          "saveResponseType": 0,
+          "followRedirects": true,
+          "allowAnyCertificate": false
+        }
+      },
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": -989999999998424860,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "blockNextAction": true,
+        "m_nonRoot": true,
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_NOTIFICATION] pause sent status={lv=response-code}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "timeoutSeconds": 30,
+        "useHelper": false,
+        "useShizuku": false
+      },
+      {
+        "m_classType": "EndIfAction",
+        "m_SIGUID": -989999999998416941,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false
+      },
+      {
+        "m_classType": "IfConditionAction",
+        "m_SIGUID": -989999999998401103,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [
+          {
+            "m_classType": "TriggerThatInvokedConstraint",
+            "m_SIGUID": -989999999998409022,
+            "disableLogging": false,
+            "m_constraintList": [],
+            "m_isDisabled": false,
+            "m_isOrCondition": false,
+            "m_siGuidThatInvoked": -989999999998535726,
+            "m_triggerName": "Notification Button 2",
+            "m_not": false
+          }
+        ],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "childrenCollapsed": false,
+        "dontLogIfConditionIsFalse": true
+      },
+      {
+        "m_classType": "HttpRequestAction",
+        "m_SIGUID": -989999999998393184,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "requestConfig": {
+          "requestType": 0,
+          "urlToOpen": "http://127.0.0.1:7777/tts-control?command=resume&source=notification",
+          "requestTimeOutSeconds": 12,
+          "contentType": "",
+          "contentBodySource": 0,
+          "contentBodyText": "",
+          "blockNextAction": true,
+          "saveReturnCodeToVariable": true,
+          "returnCodeVariableName": "response-code",
+          "returnCodeDictionaryKeys": {
+            "keys": []
+          },
+          "saveReturnHeadersToVariable": false,
+          "saveResponseType": 0,
+          "followRedirects": true,
+          "allowAnyCertificate": false
+        }
+      },
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": -989999999998385265,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "blockNextAction": true,
+        "m_nonRoot": true,
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_NOTIFICATION] resume sent status={lv=response-code}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "timeoutSeconds": 30,
+        "useHelper": false,
+        "useShizuku": false
+      },
+      {
+        "m_classType": "EndIfAction",
+        "m_SIGUID": -989999999998377346,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false
+      },
+      {
+        "m_classType": "IfConditionAction",
+        "m_SIGUID": -989999999998361508,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [
+          {
+            "m_classType": "TriggerThatInvokedConstraint",
+            "m_SIGUID": -989999999998369427,
+            "disableLogging": false,
+            "m_constraintList": [],
+            "m_isDisabled": false,
+            "m_isOrCondition": false,
+            "m_siGuidThatInvoked": -989999999998527807,
+            "m_triggerName": "Notification Button 3",
+            "m_not": false
+          }
+        ],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "childrenCollapsed": false,
+        "dontLogIfConditionIsFalse": true
+      },
+      {
+        "m_classType": "HttpRequestAction",
+        "m_SIGUID": -989999999998353589,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "requestConfig": {
+          "requestType": 0,
+          "urlToOpen": "http://127.0.0.1:7777/tts-control?command=skip&source=notification",
+          "requestTimeOutSeconds": 12,
+          "contentType": "",
+          "contentBodySource": 0,
+          "contentBodyText": "",
+          "blockNextAction": true,
+          "saveReturnCodeToVariable": true,
+          "returnCodeVariableName": "response-code",
+          "returnCodeDictionaryKeys": {
+            "keys": []
+          },
+          "saveReturnHeadersToVariable": false,
+          "saveResponseType": 0,
+          "followRedirects": true,
+          "allowAnyCertificate": false
+        }
+      },
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": -989999999998345670,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "blockNextAction": true,
+        "m_nonRoot": true,
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_NOTIFICATION] skip sent status={lv=response-code}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "timeoutSeconds": 30,
+        "useHelper": false,
+        "useShizuku": false
+      },
+      {
+        "m_classType": "EndIfAction",
+        "m_SIGUID": -989999999998337751,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false
+      },
+      {
+        "m_classType": "IfConditionAction",
+        "m_SIGUID": -989999999998321913,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [
+          {
+            "m_classType": "TriggerThatInvokedConstraint",
+            "m_SIGUID": -989999999998329832,
+            "disableLogging": false,
+            "m_constraintList": [],
+            "m_isDisabled": false,
+            "m_isOrCondition": false,
+            "m_siGuidThatInvoked": -989999999998519888,
+            "m_triggerName": "Notification Button 4",
+            "m_not": false
+          }
+        ],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "childrenCollapsed": false,
+        "dontLogIfConditionIsFalse": true
+      },
+      {
+        "m_classType": "HttpRequestAction",
+        "m_SIGUID": -989999999998313994,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "requestConfig": {
+          "requestType": 0,
+          "urlToOpen": "http://127.0.0.1:7777/tts-control?command=faster&source=notification",
+          "requestTimeOutSeconds": 12,
+          "contentType": "",
+          "contentBodySource": 0,
+          "contentBodyText": "",
+          "blockNextAction": true,
+          "saveReturnCodeToVariable": true,
+          "returnCodeVariableName": "response-code",
+          "returnCodeDictionaryKeys": {
+            "keys": []
+          },
+          "saveReturnHeadersToVariable": false,
+          "saveResponseType": 0,
+          "followRedirects": true,
+          "allowAnyCertificate": false
+        }
+      },
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": -989999999998306075,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "blockNextAction": true,
+        "m_nonRoot": true,
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_NOTIFICATION] faster sent status={lv=response-code}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "timeoutSeconds": 30,
+        "useHelper": false,
+        "useShizuku": false
+      },
+      {
+        "m_classType": "EndIfAction",
+        "m_SIGUID": -989999999998298156,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false
+      },
+      {
+        "m_classType": "IfConditionAction",
+        "m_SIGUID": -989999999998282318,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [
+          {
+            "m_classType": "TriggerThatInvokedConstraint",
+            "m_SIGUID": -989999999998290237,
+            "disableLogging": false,
+            "m_constraintList": [],
+            "m_isDisabled": false,
+            "m_isOrCondition": false,
+            "m_siGuidThatInvoked": -989999999998511969,
+            "m_triggerName": "Notification Button 5",
+            "m_not": false
+          }
+        ],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "childrenCollapsed": false,
+        "dontLogIfConditionIsFalse": true
+      },
+      {
+        "m_classType": "HttpRequestAction",
+        "m_SIGUID": -989999999998274399,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "requestConfig": {
+          "requestType": 0,
+          "urlToOpen": "http://127.0.0.1:7777/tts-control?command=stop&source=notification",
+          "requestTimeOutSeconds": 12,
+          "contentType": "",
+          "contentBodySource": 0,
+          "contentBodyText": "",
+          "blockNextAction": true,
+          "saveReturnCodeToVariable": true,
+          "returnCodeVariableName": "response-code",
+          "returnCodeDictionaryKeys": {
+            "keys": []
+          },
+          "saveReturnHeadersToVariable": false,
+          "saveResponseType": 0,
+          "followRedirects": true,
+          "allowAnyCertificate": false
+        }
+      },
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": -989999999998266480,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false,
+        "blockNextAction": true,
+        "m_nonRoot": true,
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_NOTIFICATION] stop sent status={lv=response-code}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "timeoutSeconds": 30,
+        "useHelper": false,
+        "useShizuku": false
+      },
+      {
+        "m_classType": "EndIfAction",
+        "m_SIGUID": -989999999998258561,
+        "disableLogging": false,
+        "m_comment": "",
+        "m_constraintList": [],
+        "m_isDisabled": false,
+        "m_isOrCondition": false
+      }
+    ],
+    "m_constraintList": []
+  },
+  "globalVariables": [
+    {
+      "m_name": "token_os_base_url",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "http://100.95.109.23:7777"
+    },
+    {
+      "m_name": "tts_session_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_playback_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_utterance_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_current_chunk_text",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_next_chunk_text",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_current_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_next_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_last_consumed_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_status",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "idle"
+    },
+    {
+      "m_name": "tts_backfill_next_chunk",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_next_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_done",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_control_state",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "idle"
+    },
+    {
+      "m_name": "tts_speed",
+      "m_type": 3,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_decimalValue": 1.0
+    }
+  ],
+  "userIcons": null,
+  "aiFeedback": "Generated from official MacroDroid schema."
+}

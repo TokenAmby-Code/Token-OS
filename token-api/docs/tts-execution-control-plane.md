@@ -16,8 +16,8 @@ Body accepted by Token-OS:
 
 ```json
 {
-  "command": "pause|resume|skip|speed",
-  "source": "phone_overlay",
+  "command": "pause|resume|skip|stop|faster|slower|speed",
+  "source": "phone_notification",
   "backend": "phone",
   "session_id": "opaque-session-id",
   "playback_id": "opaque-playback-id",
@@ -25,9 +25,9 @@ Body accepted by Token-OS:
 }
 ```
 
-`action` is accepted as a temporary alias for `command`, but phone overlay wiring should use `command`.
+`action` is accepted as a temporary alias for `command`, but phone notification wiring should use `command`. `faster` and `slower` adjust the authoritative speed scalar for the next chunk boundary; they do not require mid-utterance mutation.
 
-Processing rule: Token-OS records authoritative state first, then echoes to the active backend.
+Processing rule: Token-OS records authoritative state first, then echoes to the active backend. `skip` and `stop` complete the active phone stream and release its pending playback waiter.
 
 Phone echo endpoint used by Token-OS:
 
@@ -48,9 +48,9 @@ Token-OS dispatches to the phone local endpoint:
 Invariants:
 
 - `current_chunk` and `next_chunk` are already sanitized.
-- Phone starts with current + next and may use MacroDroid TTS queue only for the already-authorized next/backfill chunk.
-- After chunk `n` is consumed, phone requests backfill `n+2` from `POST /api/tts/chunk-next`.
-- Phone must not reconstruct the full queue or mutate playback state before Token-OS control acknowledgement.
+- Phone starts with current + next and invokes `TTS Phone Backfill Fetcher` asynchronously to request chunk `n+2` while chunk `n` is speaking.
+- After chunk `n` is consumed, phone promotes the authorized next chunk, consumes helper backfill if available, and requests the next backfill from `POST /api/tts/chunk-next`.
+- Phone must not reconstruct the full queue or mutate playback state before Token-OS control acknowledgement. Local `/tts-local-control` is allowed to pause/resume at chunk boundaries or cancel skip/stop because it is Token-OS echo authority.
 
 Token-OS also includes compatibility metadata fields such as `chunk_id`, `current_chunk_hash`, `next_chunk_hash`, and `chunk_count` for integrity/observability.
 
@@ -60,7 +60,7 @@ Backfill request:
 POST /api/tts/chunk-next
 ```
 
-Body includes `session_id`, `playback_id`, `last_consumed_index`, optional `utterance_id`, and `backend`. Response returns `next_chunk` metadata or `done: true`; `paused` and `skipped` are explicit control-state responses.
+Body includes `session_id`, `playback_id`, `last_consumed_index`, optional `utterance_id`, and `backend`. Response returns `next_chunk` metadata or `done: true`; `paused`, `skipped`, and `stopped` are explicit control-state responses.
 
 ## Phone events and errors
 

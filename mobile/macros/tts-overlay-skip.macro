@@ -2,107 +2,39 @@
   "macroExportVersion": 1,
   "macro": {
     "m_name": "TTS Overlay Skip",
-    "m_enabled": true,
+    "m_enabled": false,
     "m_completed": true,
     "m_GUID": 0,
-    "m_category": "Notify",
+    "m_category": "TTS",
     "aiGenerated": 1,
-    "m_description": "Floating TTS skip control. The button calls /tts-control locally; /tts-control forwards to Token-OS before any local-control echo executes.",
+    "m_description": "Retired floating overlay button disabled; notification controls are canonical.",
     "m_triggerList": [
       {
-        "identifier": "tts-skip",
-        "m_iconBgColor": -141259,
-        "m_alpha": 92,
-        "m_size": 1,
-        "m_padding": 6,
-        "m_showOnLockScreen": false,
-        "m_transparentBackground": false,
-        "fixedLocation": false,
-        "forceLocation": true,
-        "usePercentForLocation": true,
-        "xLocation": 87,
-        "yLocation": 58,
-        "iconType": 1,
-        "iconText": "⏭",
-        "iconTextColor": -1,
-        "iconTintEnabled": false,
-        "iconTintColor": -1,
-        "vibrateOnClick": true,
-        "preventRemoveByDrag": false,
-        "drawOverSystemApps": true,
-        "showPositionOnMove": false,
-        "disableTriggerOnRemove": false,
-        "longPressEnabled": false,
-        "overridenAlpha": 0,
-        "overridenBgColor": 0,
-        "overridenSize": 0,
-        "overridenTransparentBackground": false,
         "m_classType": "FloatingButtonTrigger",
-        "m_SIGUID": -989999999999794106,
+        "m_SIGUID": -989999999997395390,
         "disableLogging": false,
-        "m_comment": "",
+        "m_comment": "Retired; replaced by TTS Phone Control Notification.",
         "m_constraintList": [],
-        "m_isDisabled": false,
-        "m_isOrCondition": false
+        "m_isDisabled": true,
+        "m_isOrCondition": false,
+        "identifier": "tts-skip",
+        "iconType": 1,
+        "iconText": "SK",
+        "m_alpha": 1,
+        "m_size": 1,
+        "m_padding": 8,
+        "fixedLocation": true,
+        "forceLocation": false,
+        "usePercentForLocation": true,
+        "xLocation": 0,
+        "yLocation": 0,
+        "disableTriggerOnRemove": false
       }
     ],
     "m_actionList": [
       {
-        "m_classType": "HttpRequestAction",
-        "m_SIGUID": -989999999999786187,
-        "disableLogging": false,
-        "m_comment": "",
-        "m_constraintList": [],
-        "m_isDisabled": false,
-        "m_isOrCondition": false,
-        "requestConfig": {
-          "allFilesAccessPath": "",
-          "allowAnyCertificate": false,
-          "basicAuthEnabled": false,
-          "basicAuthPassword": "",
-          "basicAuthUsername": "",
-          "blockNextAction": true,
-          "clientCertEnabled": false,
-          "clientCertKeyStoreDisplayName": "",
-          "clientCertKeyStoreUri": "",
-          "clientCertPassword": "",
-          "contentBodyDynamicFileName": "",
-          "contentBodyFileDisplayName": "",
-          "contentBodyFileUri": "",
-          "contentBodyFolderDisplayName": "",
-          "contentBodyFolderUri": "",
-          "contentBodySource": 0,
-          "contentBodyText": "",
-          "contentType": "",
-          "followRedirects": true,
-          "headerParams": [],
-          "localFileUri": "",
-          "prettifyJson": false,
-          "proxyEnabled": false,
-          "proxyHost": "",
-          "proxyPort": 8080,
-          "proxyType": 0,
-          "queryParams": [],
-          "requestTimeOutSeconds": 12,
-          "requestType": 0,
-          "returnCodeVariableName": "response-code",
-          "saveResponseAllFilesAccessPath": "",
-          "saveResponseFileName": "",
-          "saveResponseFolderPathDisplayName": "",
-          "saveResponseFolderPathUri": "",
-          "saveResponseType": 0,
-          "saveResponseUseAllFilesAccess": false,
-          "saveReturnCodeToVariable": true,
-          "saveReturnHeadersToVariable": false,
-          "urlToOpen": "http://127.0.0.1:7777/tts-control?command=skip&source=overlay",
-          "useAllFilesAccess": false,
-          "useLocalFileUri": false,
-          "useStaticContentBodyFile": true
-        }
-      },
-      {
         "m_classType": "ShellScriptAction",
-        "m_SIGUID": -989999999999778268,
+        "m_SIGUID": -989999999997387471,
         "disableLogging": false,
         "m_comment": "",
         "m_constraintList": [],
@@ -110,7 +42,7 @@
         "m_isOrCondition": false,
         "blockNextAction": true,
         "m_nonRoot": true,
-        "m_script": "echo \"$(date +%H:%M:%S) [TTS_OVERLAY] skip sent to /tts-control token-os-first status={lv=response-code}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_OVERLAY_RETIRED] skip\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
         "timeoutSeconds": 30,
         "useHelper": false,
         "useShizuku": false
@@ -118,7 +50,113 @@
     ],
     "m_constraintList": []
   },
-  "globalVariables": [],
+  "globalVariables": [
+    {
+      "m_name": "token_os_base_url",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "http://100.95.109.23:7777"
+    },
+    {
+      "m_name": "tts_session_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_playback_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_utterance_id",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_current_chunk_text",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_next_chunk_text",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_current_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_next_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_last_consumed_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_status",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "idle"
+    },
+    {
+      "m_name": "tts_backfill_next_chunk",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_next_index",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_backfill_done",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": ""
+    },
+    {
+      "m_name": "tts_control_state",
+      "m_type": 2,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_stringValue": "idle"
+    },
+    {
+      "m_name": "tts_speed",
+      "m_type": 3,
+      "isLocalVar": false,
+      "isSecure": false,
+      "m_decimalValue": 1.0
+    }
+  ],
   "userIcons": null,
-  "aiFeedback": "Generated from official MacroDroid schema for Token-OS phone TTS execution architecture."
+  "aiFeedback": "Generated from official MacroDroid schema."
 }
