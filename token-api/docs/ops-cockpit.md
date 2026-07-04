@@ -31,7 +31,7 @@ The frontend polls `/api/ui/ops/state` every 2 seconds. Live acceptance confirme
 
 ## Frontend architecture
 
-Data access is centralized and typed; deeply-nested components never call endpoints directly.
+Data access is centralized and typed; deeply-nested components never call endpoints directly. `api.ts` is the only network/fetch boundary. The current main/live source does not yet contain `layoutModel.ts`; Lane B should add it as a selector/presentation bridge before components wire predicates over raw `OpsState`.
 
 ```
 web/ops/src/
@@ -39,10 +39,11 @@ web/ops/src/
   App.tsx                   # cockpit shell, panel composition, conn/loading/error states
   styles.css                # "cogitator console" design system (tokens + chrome)
   types.ts                  # OpsState, TimerHistory, OpsGraph contracts
-  api.ts                    # typed polling hooks: useOpsState / useTimerHistory / useOpsGraph
+  api.ts                    # only fetch boundary; typed polling hooks and Token-API actions
+  layoutModel.ts            # planned selector/presentation bridge before UI predicate wiring
   format.ts                 # display-only formatting helpers
   modes.ts                  # visual language: mode/status/edge/node -> color + label
-  mock.ts                   # mocked OpsGraph only; timer history is live
+  mock.ts                   # degraded OpsGraph fallback only; timer history is live
   fonts/                    # self-hosted woff2 + generated fonts.css
   components/
     TopStrip.tsx            # glanceable persistent strip
@@ -93,6 +94,7 @@ Current top-level keys:
 - `surface`, `contract_version`, `ui_build_id`, `generated_at`
 - `health` — aggregate dashboard health summary: status, human summary, degraded source names, bad/warn assertion counts, and recommended actions derived from assertions.
 - `sources` — typed source health for Token-API, agents DB, timer engine, tmuxctld, cron, enforcement, and TTS.
+- `source_freshness` — top-level freshness map for desktop attention, phone activity/heartbeat, work-state, timer engine, agents DB, tmuxctld, cron, enforcement, and TTS.
 - `timer` — effective mode, activity layer, productivity signal, manual/focus flags, break balance/backlog, total work/break counters.
 - `billable` — descriptive billable/personal work-class summary for the current work-state.
 - `assertions` — plain-language state assertions: what Token-API believes is true, status/tone, confidence, evidence, source freshness, and correction hint.
@@ -103,6 +105,7 @@ Current top-level keys:
 - `events` — recent event log entries with parsed JSON details when possible.
 - `cron` — cron availability, job counts, running count, last-24h runs, and a small job sample.
 - `tts` — current item, queue lengths, backend, satellite availability, global mode.
+- `voice_drafts` — top-level Discord voice-draft summaries awaiting operator review.
 - `enforcement` — pending acknowledgement count/sample and Pavlok summary.
 - `tmux` — direct tmuxctld health snapshot surfaced in the aggregate state; the UI should not scrape tmuxctld or legacy health routes independently.
 - `work_actions` — explicit work-action ticks and daily counts for the HUD work dial.
