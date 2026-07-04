@@ -25,13 +25,24 @@ V1_TRIGGERS = {
     "enforcement_cascade_escalate",
     "expected_ack_escalated",
     # Internal/diagnostic only: recognized so it can be recorded, but it must
-    # never attach to the Custodes enforcement/paging path.
+    # never attach to the Custodes enforcement/paging path. Enforced structurally
+    # by INTERNAL_ONLY_TRIGGERS below (evaluate_state_event returns None for these).
     "tts_queue_languishing",
     # Workflow/audit events. These are pure state records for the Administratum
     # stream: they must be captured durably, but never page Custodes.
     "worktree_created",
     "pr_merged",
 }
+
+# Recognized-but-internal labels: they stay in V1_TRIGGERS so they are known
+# (dedupe keys, membership checks, the internal record in the router), but they
+# are FROZEN OUT of the intervention pipeline. `evaluate_state_event` returns
+# None for them, so the policy — the single source of truth for what may
+# escalate — can never mint a dispatchable/paging intervention for such a label,
+# regardless of caller or routing. This is the "outright" detachment behind the
+# D2 languishing freeze (2026-06-27): the router already routes it internal-only,
+# and this guarantees no other caller can re-attach it to the firing path.
+INTERNAL_ONLY_TRIGGERS = frozenset({"tts_queue_languishing"})
 
 # Hooks that carry a physical enforcement action (Pavlok / window-close / ack
 # ladder). These remain Custodes' surface (the escalation tier) — everything
@@ -55,6 +66,16 @@ def classify_trigger(event_type: str) -> str:
     (escalator), with a record-keeping copy to Administratum.
     """
     return "enforcement" if event_type in ENFORCEMENT_TRIGGERS else "state"
+
+
+def is_internal_only(event_type: str) -> bool:
+    """Return whether a label is recognized but frozen out of the intervention path.
+
+    Internal-only labels are recorded for diagnostics but never produce a
+    Custodes intervention (`evaluate_state_event` returns None), so they cannot
+    page or enforce.
+    """
+    return event_type in INTERNAL_ONLY_TRIGGERS
 
 
 @dataclass(frozen=True)
@@ -252,6 +273,13 @@ def evaluate_state_event(
     if event.event_type not in V1_TRIGGERS:
         return None
 
+    # Recognized-but-internal labels (e.g. tts_queue_languishing) are frozen out
+    # of the intervention pipeline outright: they are recorded elsewhere but must
+    # never mint a dispatchable/paging intervention. Returning None here makes the
+    # detachment structural — no caller of this policy can page from such a label.
+    if event.event_type in INTERNAL_ONLY_TRIGGERS:
+        return None
+
     payload = event.payload or {}
     snapshot = snapshot or {}
     severity = normalize_severity(event.severity)
@@ -268,7 +296,8 @@ def evaluate_state_event(
         "enforcement_cascade_started": "Intervene because enforcement has escalated; get explicit closure from the Emperor.",
         "enforcement_cascade_escalate": "Intervene about active escalation; the loop is escalating — get explicit closure now.",
         "expected_ack_escalated": "Intervene about the missed acknowledgement ladder; mirror the Discord-channel cascade and pull the Emperor back to the work surface.",
-        "tts_queue_languishing": "Record that the TTS pause queue is languishing for internal diagnostics only; do not page or enforce from this label.",
+        # tts_queue_languishing is intentionally absent: it returns None above
+        # (INTERNAL_ONLY_TRIGGERS) and never reaches this direction lookup.
         "worktree_created": "Record that a worktree was claimed for a session document.",
         "pr_merged": "Record that a pull request merged and entered the CD restart path.",
     }[event.event_type]
