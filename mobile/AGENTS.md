@@ -183,6 +183,7 @@ Structural rules from the official schema:
 | `macrodroid-gen` | Official JSON skeleton/normalizer only. No YAML support. |
 | `macrodroid-validate` | Strict official `.macro` wrapper validator. |
 | `macrodroid-push` | Validates and pushes `.macro` files to the phone via SSH. |
+| `macrodroid-import` | Gated experimental import launcher: validates, stages to shared storage, opens MacroDroid's `.macro` file handler, then pulls state to verify. |
 | `macrodroid-pull` | Pull files from phone via SSH. |
 | `macrodroid-read` | Inspect `.mdr` exports and extract official `.macro` wrappers. |
 | `macrodroid-state` | Trigger/pull current phone export and display it. |
@@ -264,9 +265,16 @@ macrodroid-read EXPORT.mdr --http-config
    macrodroid-push macro-name.macro
    ```
 
-6. Import on phone:
+6. Import on phone manually, or try the gated experimental launcher:
    - MacroDroid → Settings → Import/Export → Import
    - Select from `~/macros/`
+   - Experimental no-picker launcher:
+
+     ```bash
+     MACRODROID_AUTO_IMPORT=1 macrodroid-import macro-name.macro
+     ```
+
+     This returns nonzero unless the verification pull confirms macro count did not decrease, exactly one new macro was added, and the target macro name exists.
 
 7. Export/pull again and verify:
    ```bash

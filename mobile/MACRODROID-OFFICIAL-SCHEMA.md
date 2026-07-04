@@ -96,6 +96,20 @@ macrodroid-push heartbeat.macro
 
 `macrodroid-push` runs strict validation first and refuses malformed files.
 
+### Experimental no-picker import launcher
+
+```bash
+MACRODROID_AUTO_IMPORT=1 macrodroid-import heartbeat.macro
+```
+
+`macrodroid-import` validates first, refuses phone interaction without the
+`MACRODROID_AUTO_IMPORT=1` guard, stages the file in shared storage, opens
+MacroDroid's exported `.macro` file handler directly, then pulls state with
+`macrodroid-state --pull`. It returns nonzero unless the pulled export confirms
+macro count did not decrease, exactly one new macro was added, and the target
+macro name exists. See `mobile/MACRODROID-AUTO-IMPORT.md` for current discovery
+status and limitations.
+
 ## Editing Workflow
 
 1. Pull the current phone export:
