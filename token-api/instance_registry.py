@@ -97,6 +97,7 @@ FORBIDDEN_RUNTIME_INSTANCE_FIELDS = {
     "color",
     "chip_color",
     "advisor",
+    "operator_proxy",
     # launch geometry/provenance is event/input context, not instance identity
     "dispatch_target",
     "dispatch_window",

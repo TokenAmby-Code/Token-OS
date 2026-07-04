@@ -31,8 +31,8 @@ async def test_personas_seed_and_schema_constraints(app_env):
             )
 
 
-def test_personas_advisor_column_migrates_and_seeds(tmp_path: Path) -> None:
-    """Advisor is an additive personas-table migration and seeds only advisors."""
+def test_personas_advisor_and_operator_proxy_columns_migrate_and_seed(tmp_path: Path) -> None:
+    """Persona capabilities are additive migrations and seed exact capability sets."""
     import personas
 
     db_path = tmp_path / "legacy-personas.db"
@@ -73,14 +73,23 @@ def test_personas_advisor_column_migrates_and_seeds(tmp_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(personas)").fetchall()}
         assert "advisor" in cols
-        rows = {
+        assert "operator_proxy" in cols
+        advisors = {
             slug: advisor
             for slug, advisor in conn.execute(
                 "SELECT slug, advisor FROM personas WHERE advisor = 1 ORDER BY slug"
             ).fetchall()
         }
+        operator_proxies = {
+            slug: operator_proxy
+            for slug, operator_proxy in conn.execute(
+                """SELECT slug, operator_proxy
+                   FROM personas WHERE operator_proxy = 1 ORDER BY slug"""
+            ).fetchall()
+        }
 
-    assert rows == {"custodes": 1, "malcador": 1, "pax": 1}
+    assert advisors == {"custodes": 1, "malcador": 1, "pax": 1}
+    assert operator_proxies == {"custodes": 1, "pax": 1}
 
 
 @pytest.mark.asyncio
@@ -124,8 +133,10 @@ async def test_tts_policy_seeded_per_persona_deny_by_default(app_env: Any) -> No
     assert all(policy in ("silent", "hot", "pause") for policy in rows.values())
 
 
-def test_advisor_resolver_joins_personas_and_instances_schema_stays_clean(app_env: Any) -> None:
-    """Advisor is resolved by JOIN, not copied onto the instance row."""
+def test_capability_resolvers_join_personas_and_instances_schema_stays_clean(
+    app_env: Any,
+) -> None:
+    """Persona capabilities are resolved by JOIN, not copied onto the instance row."""
     import personas
     from instance_mutation import insert_instance_sync, update_instance_sync
 
@@ -161,22 +172,58 @@ def test_advisor_resolver_joins_personas_and_instances_schema_stays_clean(app_en
     with sqlite3.connect(app_env.db_path) as conn:
         instance_cols = {row[1] for row in conn.execute("PRAGMA table_info(instances)").fetchall()}
         assert "advisor" not in instance_cols
+        assert "operator_proxy" not in instance_cols
 
         assert personas.is_advisor_instance_sync(conn, ids["custodes"]) is True
         assert personas.is_advisor_instance_sync(conn, ids["pax"]) is True
         assert personas.is_advisor_instance_sync(conn, ids["malcador"]) is True
         assert personas.is_advisor_instance_sync(conn, ids["blood-angels"]) is False
 
-    async def resolve_all() -> dict[str, bool]:
+        assert personas.is_operator_proxy_instance_sync(conn, ids["custodes"]) is True
+        assert personas.is_operator_proxy_instance_sync(conn, ids["pax"]) is True
+        assert personas.is_operator_proxy_instance_sync(conn, ids["malcador"]) is False
+        assert personas.is_operator_proxy_instance_sync(conn, ids["blood-angels"]) is False
+
+    async def resolve_all() -> dict[str, tuple[bool, bool]]:
         async with aiosqlite.connect(app_env.db_path) as db:
-            return {slug: await personas.is_advisor_instance(db, iid) for slug, iid in ids.items()}
+            return {
+                slug: (
+                    await personas.is_advisor_instance(db, iid),
+                    await personas.is_operator_proxy_instance(db, iid),
+                )
+                for slug, iid in ids.items()
+            }
 
     assert asyncio.run(resolve_all()) == {
-        "custodes": True,
-        "pax": True,
-        "malcador": True,
-        "blood-angels": False,
+        "custodes": (True, True),
+        "pax": (True, True),
+        "malcador": (True, False),
+        "blood-angels": (False, False),
     }
+
+
+def test_operator_proxy_rejected_as_instance_projection(app_env: Any) -> None:
+    """operator_proxy is persona-table truth, never a writable instance field."""
+    from instance_mutation import insert_instance_sync
+    from instance_registry import FORBIDDEN_RUNTIME_INSTANCE_FIELDS
+
+    assert "operator_proxy" in FORBIDDEN_RUNTIME_INSTANCE_FIELDS
+    with sqlite3.connect(app_env.db_path) as conn:
+        with pytest.raises(ValueError, match="operator_proxy"):
+            insert_instance_sync(
+                conn,
+                values={
+                    "id": "bad-operator-proxy-stamp",
+                    "working_dir": "/tmp/test",
+                    "origin_type": "local",
+                    "device_id": "Mac-Mini",
+                    "status": "idle",
+                    "operator_proxy": 1,
+                },
+                mutation_type="instance_registered",
+                write_source="test",
+                actor="test",
+            )
 
 
 @pytest.mark.asyncio

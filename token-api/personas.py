@@ -50,6 +50,11 @@ class PersonaSeed:
     # the single source of truth for "advisor" behavior; it is intentionally NOT
     # copied onto instances.
     advisor: bool = False
+    # Operator-proxy dispatch capability: workers launched by these personas are
+    # classified as Emperor-proxied, not autonomous. Kept separate from advisor so
+    # Malcador can advise without becoming an operator proxy. Never copied onto
+    # instances.
+    operator_proxy: bool = False
 
     @property
     def id(self) -> str:
@@ -232,6 +237,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         default_session_doc="daily_note",
         tts_policy="hot",
         advisor=True,
+        operator_proxy=True,
     ),
     PersonaSeed(
         "fabricator-general",
@@ -276,6 +282,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         default_session_doc="daily_note",  # bind today's Pax-ENV daily note
         tts_policy="pause",
         advisor=True,
+        operator_proxy=True,
     ),
     PersonaSeed(
         "orchestrator",
@@ -401,6 +408,7 @@ def persona_schema_sql() -> str:
             tts_policy TEXT NOT NULL DEFAULT 'silent'
                 CHECK (tts_policy IN ('silent', 'hot', 'pause')),
             advisor INTEGER NOT NULL DEFAULT 0 CHECK (advisor IN (0, 1)),
+            operator_proxy INTEGER NOT NULL DEFAULT 0 CHECK (operator_proxy IN (0, 1)),
             CHECK (default_rank = 'astartes' OR assignment_pool IS NULL)
         )
     """
@@ -422,6 +430,7 @@ def seed_params(seed: PersonaSeed) -> tuple:
         seed.default_session_doc,
         seed.tts_policy,
         1 if seed.advisor else 0,
+        1 if seed.operator_proxy else 0,
     )
 
 
@@ -429,8 +438,8 @@ UPSERT_SQL = """
     INSERT INTO personas (
         id, slug, display_name, default_rank, assignment_pool, assignment_order,
         pane_tint, chip_color, tts_voice, tts_rate, notification_sound,
-        default_session_doc, tts_policy, advisor
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        default_session_doc, tts_policy, advisor, operator_proxy
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
         slug=excluded.slug,
         display_name=excluded.display_name,
@@ -444,7 +453,8 @@ UPSERT_SQL = """
         notification_sound=excluded.notification_sound,
         default_session_doc=excluded.default_session_doc,
         tts_policy=excluded.tts_policy,
-        advisor=excluded.advisor
+        advisor=excluded.advisor,
+        operator_proxy=excluded.operator_proxy
 """
 
 
@@ -465,6 +475,11 @@ _PERSONA_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         "advisor",
         "ALTER TABLE personas ADD COLUMN advisor INTEGER NOT NULL DEFAULT 0 "
         "CHECK (advisor IN (0, 1))",
+    ),
+    (
+        "operator_proxy",
+        "ALTER TABLE personas ADD COLUMN operator_proxy INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (operator_proxy IN (0, 1))",
     ),
 )
 
@@ -542,9 +557,11 @@ def _row_to_dict(row) -> dict | None:
             "default_session_doc",
             "tts_policy",
             "advisor",
+            "operator_proxy",
         )
         data = dict(zip(keys, row, strict=False))
     data["advisor"] = bool(data.get("advisor"))
+    data["operator_proxy"] = bool(data.get("operator_proxy"))
     data["silent"] = data.get("tts_voice") is None
     return data
 
@@ -595,6 +612,43 @@ def is_advisor_instance_sync(conn: sqlite3.Connection, instance_id: str | None) 
     row = conn.execute(
         """
         SELECT COALESCE(p.advisor, 0)
+        FROM instances i
+        LEFT JOIN personas p ON p.id = i.persona_id
+        WHERE i.id = ?
+        """,
+        (instance_id,),
+    ).fetchone()
+    return bool(row and row[0])
+
+
+async def is_operator_proxy_instance(db: aiosqlite.Connection, instance_id: str | None) -> bool:
+    """Return whether an instance's persona carries the operator-proxy capability.
+
+    Operator proxy is resolved by joining ``instances.persona_id`` to
+    ``personas.id`` at read time. It is never stamped onto the instance row.
+    """
+    if not instance_id:
+        return False
+    cursor = await db.execute(
+        """
+        SELECT COALESCE(p.operator_proxy, 0)
+        FROM instances i
+        LEFT JOIN personas p ON p.id = i.persona_id
+        WHERE i.id = ?
+        """,
+        (instance_id,),
+    )
+    row = await cursor.fetchone()
+    return bool(row and row[0])
+
+
+def is_operator_proxy_instance_sync(conn: sqlite3.Connection, instance_id: str | None) -> bool:
+    """Synchronous variant of :func:`is_operator_proxy_instance`."""
+    if not instance_id:
+        return False
+    row = conn.execute(
+        """
+        SELECT COALESCE(p.operator_proxy, 0)
         FROM instances i
         LEFT JOIN personas p ON p.id = i.persona_id
         WHERE i.id = ?

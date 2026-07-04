@@ -56,7 +56,7 @@ from instance_mutation import (
 )
 from instance_registry import DEFAULT_INSTANCE_NAME, LEGACY_PERSONA_ALIASES
 from pane_surface import human_pane_surface, is_placeholder_tab_name
-from personas import assign_astartes_persona, persona_to_profile
+from personas import assign_astartes_persona, is_operator_proxy_instance, persona_to_profile
 from phone_service import _send_to_phone
 from questions_gate import trials_clear
 from routes.tts import dispatch_notify, play_sound, queue_tts
@@ -3958,21 +3958,17 @@ async def handle_session_start(payload: dict) -> dict:
         session_doc_policy = _prior_session_doc_policy
 
         # Dispatch → worker classification (hook_driven column, distinct from the
-        # legacy instance_type='hook_driven' enum). A worker dispatched by a
-        # non-Custodes agent (e.g. Fabricator General) is driven autonomously →
-        # hook_driven=1; a Custodes-dispatched worker is Emperor-proxied → 0; a
-        # direct-Emperor launch has no agent parent → 0. parent_instance_id is
-        # the resolved dispatcher. Cleared on the worker's first Stop.
+        # legacy instance_type='hook_driven' enum). A worker dispatched by an
+        # operator-proxy persona (Custodes/Pax) is Emperor-proxied → 0; a worker
+        # dispatched by a non-proxy agent (e.g. Fabricator General or Malcador) is
+        # driven autonomously → hook_driven=1; a direct-Emperor launch has no
+        # agent parent → 0. parent_instance_id is the resolved dispatcher. Cleared
+        # on the worker's first Stop.
         launch_hook_driven = 0
         if parent_instance_id and not is_subagent:
-            cursor = await db.execute(
-                """SELECT (SELECT slug FROM personas WHERE id = i.persona_id)
-                   FROM instances i WHERE i.id = ? LIMIT 1""",
-                (parent_instance_id,),
+            launch_hook_driven = (
+                0 if await is_operator_proxy_instance(db, parent_instance_id) else 1
             )
-            _parent_row = await cursor.fetchone()
-            if _parent_row and (_parent_row[0] or "").lower() != "custodes":
-                launch_hook_driven = 1
 
         # Insert instance. The instance id is the session uuid; launch/context
         # fields are translated before this canonical write boundary.

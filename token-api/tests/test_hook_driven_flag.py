@@ -7,7 +7,7 @@ These pin the redesign that moved productivity to a read-time calculus
   * handle_prompt_submit / handle_post_tool_use no longer call set_productivity
   * handle_stop / handle_session_end clear hook_driven=0
   * dispatch → worker registration flags the worker hook_driven=1 iff the
-    dispatcher (parent) is a non-Custodes agent (FG); Custodes/direct-Emperor → 0
+    dispatcher (parent) is not an operator-proxy persona; Custodes/Pax/direct-Emperor → 0
   * stop-subscription delivery flags the subscriber hook_driven=1
 """
 
@@ -21,23 +21,27 @@ import sys
 def _insert_instance(
     db_path, instance_id, *, parent=None, legion="astartes", status="idle", hook_driven=0
 ):
+    from instance_mutation import insert_instance_sync
+
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status,
-            parent_instance_id, legion, hook_driven)
-           VALUES (?, ?, ?, ?, 'local', 'Mac-Mini', 'p', 'v', 's', ?, ?, ?, ?)""",
-        (
-            instance_id,
-            f"{instance_id}-session",
-            instance_id,
-            "/tmp",
-            status,
-            parent,
-            legion,
-            hook_driven,
-        ),
+    persona_row = conn.execute("SELECT id FROM personas WHERE slug = ?", (legion,)).fetchone()
+    insert_instance_sync(
+        conn,
+        values={
+            "id": instance_id,
+            "name": instance_id,
+            "working_dir": "/tmp",
+            "origin_type": "local",
+            "device_id": "Mac-Mini",
+            "commander_type": "chapter" if parent else "emperor",
+            "commander_id": parent,
+            "persona_id": persona_row[0] if persona_row else None,
+            "status": status,
+            "hook_driven": hook_driven,
+        },
+        mutation_type="instance_registered",
+        write_source="test",
+        actor="test",
     )
     conn.commit()
     conn.close()
@@ -45,18 +49,14 @@ def _insert_instance(
 
 def _hook_driven(db_path, instance_id) -> int:
     conn = sqlite3.connect(db_path)
-    row = conn.execute(
-        "SELECT hook_driven FROM legacy_instances WHERE id = ?", (instance_id,)
-    ).fetchone()
+    row = conn.execute("SELECT hook_driven FROM instances WHERE id = ?", (instance_id,)).fetchone()
     conn.close()
     return row[0] if row else None
 
 
 def _input_lock(db_path, instance_id):
     conn = sqlite3.connect(db_path)
-    row = conn.execute(
-        "SELECT input_lock FROM legacy_instances WHERE id = ?", (instance_id,)
-    ).fetchone()
+    row = conn.execute("SELECT input_lock FROM instances WHERE id = ?", (instance_id,)).fetchone()
     conn.close()
     return row[0] if row else None
 
@@ -92,7 +92,7 @@ def test_session_end_clears_input_lock(app_env, monkeypatch):
     _insert_instance(app_env.db_path, "locked-1")
     with sqlite3.connect(app_env.db_path) as conn:
         conn.execute(
-            "UPDATE legacy_instances SET input_lock = ? WHERE id = ?",
+            "UPDATE instances SET input_lock = ? WHERE id = ?",
             ("claude-cmd", "locked-1"),
         )
         conn.commit()
@@ -181,7 +181,7 @@ def _register_child(app_env, monkeypatch, child_id, child_pane, parent_id):
 
 
 def test_fg_dispatched_worker_is_hook_driven(app_env, monkeypatch):
-    _insert_instance(app_env.db_path, "fg-1", legion="fabricator")
+    _insert_instance(app_env.db_path, "fg-1", legion="fabricator-general")
     _register_child(app_env, monkeypatch, "worker-1", "%51", "fg-1")
     assert _hook_driven(app_env.db_path, "worker-1") == 1
 
@@ -190,6 +190,18 @@ def test_custodes_dispatched_worker_is_not_hook_driven(app_env, monkeypatch):
     _insert_instance(app_env.db_path, "cust-1", legion="custodes")
     _register_child(app_env, monkeypatch, "worker-2", "%53", "cust-1")
     assert _hook_driven(app_env.db_path, "worker-2") == 0
+
+
+def test_pax_dispatched_worker_is_not_hook_driven(app_env, monkeypatch):
+    _insert_instance(app_env.db_path, "pax-1", legion="pax")
+    _register_child(app_env, monkeypatch, "worker-pax", "%55", "pax-1")
+    assert _hook_driven(app_env.db_path, "worker-pax") == 0
+
+
+def test_malcador_dispatched_worker_is_hook_driven(app_env, monkeypatch):
+    _insert_instance(app_env.db_path, "malcador-1", legion="malcador")
+    _register_child(app_env, monkeypatch, "worker-malcador", "%56", "malcador-1")
+    assert _hook_driven(app_env.db_path, "worker-malcador") == 1
 
 
 def test_direct_emperor_launch_is_not_hook_driven(app_env, monkeypatch):
