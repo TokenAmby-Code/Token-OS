@@ -180,6 +180,17 @@ export type OpsHealthSummary = {
   recommended_actions: OpsRecommendedAction[];
 };
 
+export type OpsBillableSummary = {
+  on_the_clock: boolean;
+  active_counts: { billable: number; personal: number; unknown: number };
+  work_seconds: Partial<Record<'billable' | 'personal' | 'unknown', number>> & Counts;
+  break_seconds: Partial<Record<'billable' | 'personal' | 'unknown', number>> & Counts;
+  x_work_instances: number;
+  y_distraction: number;
+  accrual_weight: number;
+  trickle_numerator: number;
+};
+
 export type InstanceCounts = {
   active: number;
   stale: number;
@@ -217,6 +228,7 @@ export type OpsState = {
       timeout_seconds?: number;
     };
   };
+  billable: OpsBillableSummary;
   assertions: StateAssertion[];
   recommended_actions: OpsRecommendedAction[];
   source_freshness: OpsSourceFreshnessMap;
