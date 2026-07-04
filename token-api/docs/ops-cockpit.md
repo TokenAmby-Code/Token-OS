@@ -31,24 +31,25 @@ The frontend polls `/api/ui/ops/state` every 2 seconds. Live acceptance confirme
 
 ## Frontend architecture
 
-Data access is centralized and typed; deeply-nested components never call endpoints directly.
+Data access is centralized and typed; deeply-nested components never call endpoints directly. `api.ts` is the only network/fetch boundary. `layoutModel.ts` is the selector/presentation bridge for health, source freshness, correction queue, noteworthy dials, and compact assertion cards; components render those model outputs instead of wiring predicates over raw `OpsState`.
 
-```
+```text
 web/ops/src/
   main.tsx                  # root render
   App.tsx                   # cockpit shell, panel composition, conn/loading/error states
   styles.css                # "cogitator console" design system (tokens + chrome)
   types.ts                  # OpsState, TimerHistory, OpsGraph contracts
-  api.ts                    # typed polling hooks: useOpsState / useTimerHistory / useOpsGraph
+  api.ts                    # only fetch boundary; typed polling hooks and Token-API actions
+  layoutModel.ts            # selector/presentation bridge before UI predicate wiring
   format.ts                 # display-only formatting helpers
   modes.ts                  # visual language: mode/status/edge/node -> color + label
-  mock.ts                   # mocked OpsGraph only; timer history is live
+  mock.ts                   # degraded OpsGraph fallback only; timer history is live
   fonts/                    # self-hosted woff2 + generated fonts.css
   components/
     TopStrip.tsx            # glanceable persistent strip
     TimerGraph.tsx          # bespoke SVG balance chart (segmented bands, tape X axis)
     InstancesPanel.tsx      # fleet table (desktop) + card stack (mobile)
-    SidePanels.tsx          # attention evidence, event stream, subsystem status cards
+    SidePanels.tsx          # health/corrections, compact assertions, attention, events, subsystem status
     OpsGraph.tsx            # bespoke SVG layered directed graph
 ```
 
@@ -64,9 +65,9 @@ The graph components are bespoke SVG (no chart/graph library) to keep the commit
 
 `modes.ts` is the single source of truth for state → color. Timer modes map to `--m-working` (phosphor green), `--m-multi` (cyan), `--m-distracted` (hazard red), `--m-break` (amber), `--m-idle` (gray), `--m-sleep` (violet). Break balance reads green above the zero line, hazard-red below. Stale instances, blocked edges, and down subsystems use the hazard tone; victory/completed use brass/gold. Components must read colors from these helpers, not hardcode them.
 
-### State assertions
+### Health, corrections, and state assertions
 
-The cockpit exposes state assertions near the top because the operator should never infer what the system believes from raw fields. Each assertion has `id`, `label`, `value`, `status`, `confidence`, `evidence[]`, `freshness_seconds`, `correction_hint`, and `details`. The first set covers timer mode, break balance, productivity, desktop attention, phone attention, fleet, enforcement, and TTS.
+The cockpit exposes aggregate health and backend-recommended corrections near the top through `layoutModel.ts` presentation selectors. Source freshness is rendered as operator-facing source-health buckets and rail summaries, not as a raw freshness dump. Assertions remain compact supporting facts so the operator can inspect what Token-API believes without making assertions the dominant first block. Each assertion has `id`, `label`, `value`, `status`, `confidence`, `evidence[]`, `freshness_seconds`, `correction_hint`, and `details`.
 
 ### Timer graph specifics
 
@@ -93,6 +94,7 @@ Current top-level keys:
 - `surface`, `contract_version`, `ui_build_id`, `generated_at`
 - `health` — aggregate dashboard health summary: status, human summary, degraded source names, bad/warn assertion counts, and recommended actions derived from assertions.
 - `sources` — typed source health for Token-API, agents DB, timer engine, tmuxctld, cron, enforcement, and TTS.
+- `source_freshness` — top-level freshness map for desktop attention, phone activity/heartbeat, work-state, timer engine, agents DB, tmuxctld, cron, enforcement, and TTS.
 - `timer` — effective mode, activity layer, productivity signal, manual/focus flags, break balance/backlog, total work/break counters.
 - `billable` — descriptive billable/personal work-class summary for the current work-state.
 - `assertions` — plain-language state assertions: what Token-API believes is true, status/tone, confidence, evidence, source freshness, and correction hint.
@@ -103,6 +105,7 @@ Current top-level keys:
 - `events` — recent event log entries with parsed JSON details when possible.
 - `cron` — cron availability, job counts, running count, last-24h runs, and a small job sample.
 - `tts` — current item, queue lengths, backend, satellite availability, global mode.
+- `voice_drafts` — top-level Discord voice-draft summaries awaiting operator review.
 - `enforcement` — pending acknowledgement count/sample and Pavlok summary.
 - `tmux` — direct tmuxctld health snapshot surfaced in the aggregate state; the UI should not scrape tmuxctld or legacy health routes independently.
 - `work_actions` — explicit work-action ticks and daily counts for the HUD work dial.

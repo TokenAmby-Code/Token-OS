@@ -525,6 +525,199 @@ table.fleet { width: 100%; border-collapse: collapse; }
 .pill--bad { color: var(--hazard); border-color: var(--hazard-deep); }
 .pill--neutral { color: var(--muted); }
 
+.tone--good { --tone: var(--phosphor); --tone-soft: rgba(147, 217, 79, 0.10); }
+.tone--warn { --tone: var(--brass-bright); --tone-soft: rgba(242, 196, 99, 0.12); }
+.tone--bad { --tone: var(--hazard); --tone-soft: rgba(255, 91, 61, 0.12); }
+.tone--neutral { --tone: var(--muted); --tone-soft: rgba(155, 145, 172, 0.10); }
+
+/* ── authoritative health / correction read model ───────────────────── */
+
+.opshealth { display: flex; flex-direction: column; gap: 16px; }
+.opshealth h3 {
+  margin: 0 0 9px;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+.opshealth__banner {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--tone) 45%, var(--line));
+  border-left: 4px solid var(--tone);
+  background: linear-gradient(135deg, var(--tone-soft), var(--surface-2));
+}
+.opshealth__banner strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--tone);
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: 28px;
+  letter-spacing: 0.05em;
+}
+.opshealth__banner p { margin: 4px 0 0; color: var(--text); }
+.opshealth__banner dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(86px, 1fr));
+  gap: 8px;
+  margin: 0;
+  min-width: min(420px, 100%);
+}
+.opshealth__banner dl > div {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.16);
+}
+.opshealth__banner dt,
+.opshealth__banner dd {
+  margin: 0;
+  font-family: 'IBM Plex Mono', monospace;
+}
+.opshealth__banner dt { color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; }
+.opshealth__banner dd { color: var(--text); font-size: 19px; }
+.opshealth__grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 1.1fr) minmax(240px, 0.9fr);
+  gap: 14px;
+}
+.notedials {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 8px;
+}
+.notedial {
+  min-height: 92px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--tone) 45%, var(--line));
+  border-radius: var(--radius-sm);
+  background: var(--tone-soft);
+}
+.notedial span,
+.notedial small {
+  display: block;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.notedial strong {
+  display: block;
+  margin: 6px 0 5px;
+  color: var(--tone);
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: 24px;
+}
+.notedial small { color: var(--faint); text-transform: none; letter-spacing: 0; }
+.corrections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 9px;
+}
+.correction {
+  padding: 11px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--hazard) 35%, var(--line));
+  border-left: 4px solid var(--hazard);
+  background: rgba(255, 91, 61, 0.08);
+}
+.correction--warn {
+  border-color: color-mix(in srgb, var(--brass-bright) 40%, var(--line));
+  border-left-color: var(--brass-bright);
+  background: rgba(242, 196, 99, 0.08);
+}
+.correction header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: var(--faint);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.correction strong { display: block; color: var(--text); }
+.correction p { margin: 5px 0 7px; color: var(--muted); font-size: 13px; }
+.correction ul { margin: 0; padding-left: 16px; color: var(--faint); font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; }
+.railgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+.railcard {
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--tone) 35%, var(--line));
+  background: var(--tone-soft);
+}
+.railcard header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.railcard header strong { color: var(--tone); }
+.railcard p { margin: 6px 0 0; font-size: 12.5px; color: var(--text); }
+.sourcehealth {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 9px;
+}
+.sourcehealth details {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.sourcehealth summary {
+  cursor: pointer;
+  padding: 9px 10px;
+  border-left: 4px solid var(--tone);
+  color: var(--tone);
+  font-family: 'IBM Plex Mono', monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 10.5px;
+}
+.sourcehealth summary span { float: right; color: var(--text); }
+.sourcehealth__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sourcehealth__row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(120px, 1fr);
+  gap: 8px;
+  padding: 9px 10px;
+  border-top: 1px solid var(--line);
+}
+.sourcehealth__row strong { color: var(--text); }
+.sourcehealth__msg {
+  color: var(--tone);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+}
+.sourcehealth__evidence {
+  grid-column: 1 / -1;
+  color: var(--faint);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10.5px;
+}
+
 .tag { margin-left: 7px; font-size: 9.5px; padding: 1px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
 .tag--stale { color: var(--hazard); border: 1px solid var(--hazard-deep); background: rgba(255, 91, 61, 0.08); }
 /* "Agent has PR open" badge (Phase 1) */

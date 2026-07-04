@@ -19,6 +19,14 @@ The `/ui/ops` cockpit should answer operational questions, not mirror database t
 6. **How are things related?**
    - Instance/session-doc/cron/event graphs with directional edges and provenance.
 
+
+## Current contract status — 2026-07-04
+
+- `GET /api/ui/ops/state` is the aggregate cockpit boundary and currently exposes `contract_version`, `health`, `sources`, top-level `recommended_actions`, top-level `source_freshness`, top-level `voice_drafts`, and direct `tmux` health.
+- `GET /api/ops/status` exists for concise agent/script reads and shares the same fact/assertion/recommended-action builders as the browser state.
+- `GET /api/ui/ops/graph/active-fleet` and `GET /api/ui/ops/graph/golden-throne` are live read models, with `/active` and `/gt` aliases. Enforcement causality and broader lineage graphs remain deferred.
+- Frontend data fetching stays centralized in `api.ts`; `layoutModel.ts` is the selector/presentation bridge for production UI health, source freshness, correction queue, and assertion-card rendering.
+
 ## Display hierarchy
 
 ### 1. Command strip — always visible
@@ -257,10 +265,10 @@ Use arrowheads for all directed edges. Use edge color/status for active, stale, 
 ## Backend/read-model priorities
 
 1. Done: `GET /api/ui/ops/timer/history` for high-fidelity timer graph. Next improvement: persist richer source freshness/gap metadata.
-2. Add `source_freshness` to `/api/ui/ops/state` so stale sensors are visually obvious.
-3. Add per-instance `attention_rank` / `attention_reasons` to simplify urgency sorting.
-4. Add graph endpoint for `active-fleet` first.
-5. Add graph endpoint for `golden-throne` or `enforcement-causality` second.
+2. Done: top-level `source_freshness` on `/api/ui/ops/state` so stale sensors are visually obvious.
+3. Done: per-instance `attention_rank` / `attention_reasons` to simplify urgency sorting.
+4. Done: live graph endpoint for `active-fleet` (`/api/ui/ops/graph/active-fleet`, alias `/active`).
+5. Done: live graph endpoint for `golden-throne` (`/api/ui/ops/graph/golden-throne`, alias `/gt`). Enforcement causality remains deferred.
 
 ## Frontend display priorities
 

@@ -32,7 +32,7 @@ This is a dashboard first, control surface second. Mutations should remain Token
 - **Dense but calm:** this is an operations cockpit, not a marketing app. Use hierarchy, spacing, and muted color rather than animation noise.
 - **Mobile readable:** Android over Tailscale is a supported viewing frame. Tables need responsive alternatives/cards.
 - **State provenance visible:** show why Token-API thinks a state is true, not just the derived conclusion.
-- **Avoid semantic inference in frontend:** consume `/api/ui/ops/state`; request backend fields if needed.
+- **Avoid semantic inference in frontend:** consume `/api/ui/ops/state`; request backend fields if needed. Keep `api.ts` as the only fetch boundary; add/use `layoutModel.ts` as the selector/presentation bridge before components hand-roll predicates over raw `OpsState`.
 - **Graph components should accept normalized typed data:** nodes/edges/time-series arrays, not raw backend rows.
 
 ## Current state contract highlights
@@ -45,12 +45,14 @@ This is a dashboard first, control surface second. Mutations should remain Token
 - `billable`
 - `assertions`
 - `recommended_actions`
+- `source_freshness`
 - `attention`
 - `work_state`
 - `instances`
 - `events`
 - `cron`
 - `tts`
+- `voice_drafts`
 - `enforcement`
 - `tmux`
 - `work_actions`
@@ -77,7 +79,7 @@ Persistent, single-row when desktop width allows:
 3. **Attention evidence** — compact desktop/phone/work-state facts.
 4. **Events timeline** — recent event stream.
 5. **Cron/GT/enforcement summary** — compact status cards.
-6. **Graph workspace** — node/edge graph view once backend provides graph read models.
+6. **Graph workspace** — node/edge graph view backed by the live `active-fleet` and `golden-throne` read models; broader graphs can be added later.
 
 ## Timer graph concept
 
@@ -89,7 +91,7 @@ Show timer posture over time, making it obvious when the operator earned break, 
 
 ### Data needed
 
-Current `/api/ui/ops/state` is a snapshot. For a real graph, add a backend history endpoint/read-model, for example:
+`/api/ui/ops/state` is the current snapshot. The live timer history read model is:
 
 ```http
 GET /api/ui/ops/timer/history?window=6h&bucket=60s
@@ -180,7 +182,7 @@ Desired visualization: arbitrary directed graphs with optional undirected edges,
 
 ### Backend read-model shape
 
-Add graph-specific aggregate endpoints rather than making frontend infer relationships from instance/event tables.
+Use graph-specific aggregate endpoints rather than making frontend infer relationships from instance/event tables. `active-fleet` and `golden-throne` are live; additional graph families should follow the same shape.
 
 ```http
 GET /api/ui/ops/graph/{graph_name}
@@ -273,8 +275,8 @@ Recommendation: start with React Flow for cockpit graph panels. Use ELK/Dagre la
 2. Improve active instance table/card design for desktop and mobile.
 3. Add empty/loading/error states that are operationally useful.
 4. Define visual language for timer modes, stale states, GT state, enforcement state.
-5. Produce a timer graph component API with mocked history data while backend history endpoint is built.
-6. Produce a graph component API with mocked `OpsGraph` data and directional edges.
+5. Maintain the timer graph component against the live history endpoint.
+6. Maintain the graph component against the live `active-fleet` / `golden-throne` `OpsGraph` endpoints; mocked data is degraded fallback only.
 7. Keep all data fetching centralized and typed; avoid ad-hoc endpoint calls from deeply nested components.
 
 ## Implementation status (2026-05-25)
@@ -287,8 +289,8 @@ All seven immediate tasks delivered. The cockpit is live at `/ui/ops`.
 - **States (3):** boot/loading bar, no-state error, per-feed empties; connection indicator distinguishes nominal / retrying / signal-lost.
 - **Visual language (4):** centralized in `modes.ts` + CSS `--m-*` tokens (see `docs/ops-cockpit.md` → Design language).
 - **Timer graph (5):** bespoke SVG (`TimerGraph.tsx`) consuming the live `TimerHistory` contract. Segmented mode bands, threshold-colored balance line (green/hazard split at zero), quarter-hour-quantized Y axis, tape-measure X axis from day-start, hover crosshair. Band text and legend were removed to avoid overlap during rapid mode swaps; mode is conveyed by color bands + hover tooltip.
-- **Graph (6):** bespoke SVG layered directed graph (`OpsGraph.tsx`) consuming the `OpsGraph` contract via mocked data. Arrowheads, status-styled edges (solid/dashed/dotted + color), click-to-inspect, type filters, neighborhood focus.
-- **Data layer (7):** `api.ts` typed polling hooks (`useOpsState`/`useTimerHistory`/`useOpsGraph`); `types.ts` holds all three contracts. Timer history is live with no mock fallback. Graph still falls back transparently and shows a `· mock` tag until the graph endpoint exists.
+- **Graph (6):** bespoke SVG layered directed graph (`OpsGraph.tsx`) consuming the live `OpsGraph` contract for `active-fleet` and `golden-throne`, with mock data only as degraded fallback. Arrowheads, status-styled edges (solid/dashed/dotted + color), click-to-inspect, type filters, neighborhood focus.
+- **Data layer (7):** `api.ts` typed polling hooks (`useOpsState`/`useTimerHistory`/`useOpsGraph`); `types.ts` holds all three contracts. Timer history is live with no mock fallback. Active-fleet and Golden Throne graph endpoints are live; `mock.ts` remains only a degraded fallback if an endpoint request fails.
 
 ### Library deviation
 
@@ -296,5 +298,5 @@ The brief recommends React Flow (graph) and uPlot/visx (timer). Both were implem
 
 ### Deferred / blocked
 
-- `GET /api/ui/ops/timer/history` backend is built and live. `GET /api/ui/ops/graph/{name}` still needs a backend; the component contract is final and mock-swappable.
+- `GET /api/ui/ops/timer/history` is built and live. `GET /api/ui/ops/graph/active-fleet` and `GET /api/ui/ops/graph/golden-throne` are built and live, with `/active` and `/gt` aliases; other graph families remain future work.
 - **Day-start** is hardcoded to `DAY_START_HOUR = 7 / DAY_START_MINUTE = 20` in `api.ts`. It should be read from the state payload once morning-session + Hatch alarm-clock integration publishes an authoritative day-start. It currently lines up with the 7 AM timer daily reset; the graph display now starts at 07:20.

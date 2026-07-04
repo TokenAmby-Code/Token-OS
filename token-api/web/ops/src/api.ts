@@ -139,6 +139,7 @@ export type PromoteResult = { success: boolean; promoted: number };
 export type GlobalModeResult = { status: string; mode: TtsGlobalMode; old_mode: string };
 export type FocusResult = { snapped: boolean; reason: string | null };
 export type MorningEndResult = { status: string; changed: boolean; morning_status: string };
+export type AlarmAckResult = { ok?: boolean; status?: string };
 
 /** Skip current TTS; optionally clear the whole queue. */
 export function skipTts(clearQueue = false): Promise<SkipResult> {
@@ -168,6 +169,11 @@ export function focusPane(instanceId: string): Promise<FocusResult> {
 /** Officially end the first-class morning-session timer mode. */
 export function endMorningSession(): Promise<MorningEndResult> {
   return postJson<MorningEndResult>('/api/morning/end');
+}
+
+/** Acknowledge the morning alarm from the HUD dial. */
+export function ackAlarm(): Promise<AlarmAckResult> {
+  return postJson<AlarmAckResult>('/api/alarm/ack');
 }
 
 export type OpenDocResult = {
