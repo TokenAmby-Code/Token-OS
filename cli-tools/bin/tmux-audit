@@ -28,16 +28,24 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 TMUXCTL_LIB="${REPO_ROOT}/tmuxctld/lib"
 PROTECTED_SINGLETON_LABELS=""
+PROTECTED_SINGLETON_LABELS_LOAD_FAILED=false
 
 load_protected_singleton_labels() {
     [[ -n "$PROTECTED_SINGLETON_LABELS" ]] && return 0
-    PROTECTED_SINGLETON_LABELS="$(
-    PYTHONPATH="${TMUXCTL_LIB}${PYTHONPATH:+:${PYTHONPATH}}" python3 - <<'PY'
+    local labels
+    if labels="$(
+        PYTHONPATH="${TMUXCTL_LIB}${PYTHONPATH:+:${PYTHONPATH}}" python3 - <<'PY'
 from tmuxctl.singleton_labels import PERSONA_SINGLETON_LABELS
 
 print("\n".join(sorted(PERSONA_SINGLETON_LABELS)))
 PY
-)"
+    )"; then
+        PROTECTED_SINGLETON_LABELS="$labels"
+        return 0
+    fi
+    PROTECTED_SINGLETON_LABELS_LOAD_FAILED=true
+    echo "tmux-audit: failed to load canonical singleton labels; skipping idle cull" >&2
+    return 0
 }
 
 # --- Args ---
@@ -106,6 +114,7 @@ assert_backburner() {
         case "$ptype" in
             mechanicus|council|tombstone) return 0 ;;
         esac
+        [[ "$PROTECTED_SINGLETON_LABELS_LOAD_FAILED" == "true" ]] && return 0
         grep -Fxq -- "$label" <<< "$PROTECTED_SINGLETON_LABELS" && return 0
         return 1
     }

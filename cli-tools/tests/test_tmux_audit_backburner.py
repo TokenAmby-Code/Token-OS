@@ -9,7 +9,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPO_ROOT = ROOT.parent
 sys.path.insert(0, str(REPO_ROOT / "tmuxctld" / "lib"))
 
-from tmuxctl.singleton_labels import PERSONA_SINGLETON_LABELS
+from tmuxctl.singleton_labels import PERSONA_SINGLETON_LABELS  # noqa: E402
 
 AUDIT = ROOT / "bin" / "tmux-audit"
 

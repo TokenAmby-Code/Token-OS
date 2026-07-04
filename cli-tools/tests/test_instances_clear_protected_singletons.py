@@ -64,7 +64,7 @@ def _seed_db(path: pathlib.Path) -> None:
                 (id, name, status, created_at, stopped_at, persona_id, pane_label)
             VALUES (?, ?, 'stopped', '2026-07-03T00:00:00', '2026-07-03T00:01:00', ?, ?)
             """,
-            (f"protected-slug-{slug}", slug, persona_id, f"mechanicus:slug-{index}"),
+            (f"protected-slug-{slug}", slug, persona_id, None),
         )
     conn.execute(
         """
@@ -102,4 +102,4 @@ def test_instances_clear_preserves_all_canonical_singletons_and_deletes_ordinary
     for label in PERSONA_SINGLETON_LABELS:
         assert rows[f"protected-label-{label}"] == label
     for slug in {label.rsplit(":", 1)[-1] for label in PERSONA_SINGLETON_LABELS}:
-        assert rows[f"protected-slug-{slug}"].startswith("mechanicus:slug-")
+        assert rows[f"protected-slug-{slug}"] is None
