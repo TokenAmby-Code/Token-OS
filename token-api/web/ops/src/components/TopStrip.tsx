@@ -8,7 +8,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { OpsState } from '../types';
 import { modeVisual, desktopGlyph, phoneGlyph } from '../modes';
 import { formatSignedClock, formatClock } from '../format';
-import { clearPhoneAttention, endMorningSession } from '../api';
+import { ackAlarm, clearPhoneAttention, endMorningSession } from '../api';
 import type { CockpitLayoutModel, CockpitTone } from '../layoutModel';
 import { Ring } from './Ring';
 
@@ -173,7 +173,7 @@ export function HudRings({ state, layout }: { state: OpsState; layout?: CockpitL
         color={alarmAcked ? 'var(--phosphor)' : 'var(--muted)'}
         tone={alarmAcked ? 'good' : 'neutral'}
         title="Alarm ack — tap to simulate"
-        onClick={alarmAcked ? undefined : () => { fetch('/api/alarm/ack', { method: 'POST' }); }}
+        onClick={alarmAcked ? undefined : () => { ackAlarm().catch((err) => console.error('alarm ack failed', err)); }}
       />
       {wa ? (
         <Ring
