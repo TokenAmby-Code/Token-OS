@@ -116,6 +116,9 @@ def test_chunk_dispatch_payload_has_current_next_handoff_and_ack_error_reports(
 
     def fake_send(endpoint, params):
         sent.append((endpoint, dict(params)))
+        waiter = tts.pending_phone_playbacks.get(str(params["playback_id"]))
+        assert waiter is not None
+        waiter.set()
         return {"success": True}
 
     monkeypatch.setattr(tts, "_send_to_phone", fake_send)
