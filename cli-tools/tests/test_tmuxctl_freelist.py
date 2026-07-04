@@ -11,13 +11,24 @@ from tmuxctl.resolver import list_free_panes
 from tmuxctl.service import TmuxControlPlane
 
 
+def _seed_wrapper_ledger(role: str, *, instance_id: str = "ledger-instance") -> None:
+    from tmuxctl import wrapper_ledger
+
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id=f"wrap-{role}",
+        instance_id=instance_id,
+        pane_positional_id=role,
+        engine="codex",
+        state="OPEN",
+    )
+
+
 class FakeAdapter:
     """Minimal adapter stub: serves a canned `list-panes -a` scan.
 
-    `rows` is a list of (pane_id, @INSTANCE_ID, @PANE_ID, window_name, pane_pid)
-    tuples mirroring the freelist format string. Availability is derived from the
-    occupancy ledger (instance/agent/singleton/boot-grace) — the retired
-    @PANE_CLEAN stamp is no longer a column.
+    `rows` are legacy-compatible 5-tuples accepted by the parser. Availability
+    is derived from wrapper-ledger occupancy plus singleton/boot-grace guards;
+    the allocator walk must not ps-sniff candidate panes.
     """
 
     def __init__(self, rows: list[tuple[str, str, str, str, str]]):
@@ -34,7 +45,7 @@ class FakeAdapter:
 LIVE = [
     # no instance + no agent + non-singleton → FREE
     ("%24", "", "palace:N", "palace", "100"),
-    # a live instance owns it → NOT free
+    # wrapper ledger owns it in tests that seed palace:E → NOT free
     ("%25", "uuid-agent", "palace:E", "palace", "101"),
     # no instance + no agent + no cardinal role → FREE, role None
     ("%43", "", "", "scratch", "103"),
@@ -42,23 +53,27 @@ LIVE = [
 
 
 def test_list_free_panes_returns_unoccupied_agent_free_only():
+    _seed_wrapper_ledger("palace:E", instance_id="uuid-agent")
     free = list_free_panes(FakeAdapter(LIVE))
     ids = [p.pane_id for p in free]
     assert ids == ["%24", "%43"]
 
 
 def test_list_free_panes_excludes_instance_owned_pane():
+    _seed_wrapper_ledger("palace:E", instance_id="uuid-agent")
     free = list_free_panes(FakeAdapter(LIVE))
     assert all(p.pane_id != "%25" for p in free)
 
 
-def test_list_free_panes_excludes_live_agent_even_when_instance_stamp_missing(monkeypatch):
-    """Stale/missing @INSTANCE_ID must not expose a live singleton pane as free."""
+def test_list_free_panes_excludes_ledger_owned_pane_without_sniffing(monkeypatch):
+    """Allocator walk uses wrapper-ledger occupancy and does not ps-sniff candidates."""
 
-    def fake_active(pid: int | None) -> bool:
-        return pid == 999
-
-    monkeypatch.setattr(occupancy, "_active_agent", fake_active)
+    monkeypatch.setattr(
+        occupancy,
+        "_active_agent",
+        lambda pane_pid: (_ for _ in ()).throw(AssertionError("sniffed")),
+    )
+    _seed_wrapper_ledger("mechanicus:1", instance_id="owned")
     rows = [
         ("%occupied", "", "mechanicus:1", "mechanicus", "999"),
         ("%worker", "", "mechanicus:2", "mechanicus", "1000"),
@@ -70,6 +85,7 @@ def test_list_free_panes_excludes_live_agent_even_when_instance_stamp_missing(mo
 
 
 def test_list_free_panes_role_canonicalized_and_optional():
+    _seed_wrapper_ledger("palace:E", instance_id="uuid-agent")
     free = {p.pane_id: p for p in list_free_panes(FakeAdapter(LIVE))}
     assert free["%24"].pane_role == "palace:N"
     assert free["%43"].pane_role is None
@@ -77,6 +93,7 @@ def test_list_free_panes_role_canonicalized_and_optional():
 
 
 def test_list_free_panes_empty_when_all_occupied():
+    _seed_wrapper_ledger("x:N", instance_id="live-inst")
     free = list_free_panes(FakeAdapter([("%1", "live-inst", "x:N", "w", "100")]))
     assert free == []
 
@@ -89,6 +106,7 @@ def test_list_free_panes_single_scan():
 
 
 def test_service_freelist_shape():
+    _seed_wrapper_ledger("palace:E", instance_id="uuid-agent")
     plane = TmuxControlPlane(adapter=FakeAdapter(LIVE))
     out = plane.freelist()
     assert out == [

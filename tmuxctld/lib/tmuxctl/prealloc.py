@@ -10,12 +10,15 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
-from .labels import PALACE_ROLES, SOMNIUM_ROLES, canonical_pane_role
+from .labels import canonical_pane_role
 from .teardown import SLOT_WINDOWS, window_base
 
 PREALLOC_PAGE_ROLES: dict[str, tuple[str, ...]] = {
-    "palace": PALACE_ROLES,
-    "somnium": SOMNIUM_ROLES,
+    # Dispatch allocation order is intentionally not the layout/declaration
+    # order.  The public ``:new`` allocator must be deterministic and stable:
+    # palace: N -> S -> E -> W; somnium: N -> NE -> SE -> S -> W.
+    "palace": ("palace:N", "palace:S", "palace:E", "palace:W"),
+    "somnium": ("somnium:N", "somnium:NE", "somnium:SE", "somnium:S", "somnium:W"),
 }
 
 

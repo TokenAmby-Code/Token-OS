@@ -376,11 +376,11 @@ def instance_id_for_pane(adapter: TmuxAdapter, pane: str) -> str:
 class FreePane:
     """An unoccupied, agent-free pane — a candidate for split-alias-style routing.
 
-    Derived purely from the live daemon occupancy ledger: a pane is *free* when it
-    carries no live ``@INSTANCE_ID``, has no live Claude/Codex TUI, is not a
-    protected singleton label, and is past its boot grace. There is no stored
-    registry — this is a live view over one tmux scan. (The retired
-    ``@PANE_CLEAN`` clean-pane stamp is no longer consulted.)
+    Derived from current tmux structure plus the wrapper→pane ledger: a pane is
+    *free* when it has no active wrapper row, is not a protected singleton label,
+    and is past its boot grace. The allocator walk does not sniff process trees;
+    the selected candidate is cross-checked once immediately before dispatch
+    bytes. (The retired ``@PANE_CLEAN`` clean-pane stamp is no longer consulted.)
     """
 
     pane_id: str
@@ -391,13 +391,14 @@ class FreePane:
 def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
     """Single global tmux scan → the dispatch-available panes.
 
-    Availability is read from the daemon-native occupancy ledger: a pane is free
-    only when it has no instance stamp, has no live Claude/Codex TUI, is past its
-    boot grace, and is not a protected singleton label.  The singleton exclusion
-    is unconditional so a corrupted/missing ``@INSTANCE_ID`` cannot expose
+    Availability is read from the wrapper→pane ledger: a pane is free only when
+    it has no active wrapper row, is past its boot grace, and is not a protected
+    singleton label. This walk intentionally performs no process-tree sniff. The
+    selected candidate is sniffed once in the dispatch send gate. The singleton
+    exclusion is unconditional so a corrupted/missing ledger row cannot expose
     Custodes, Fabricator-General, Administratum/Admin, etc. as a worker target.
     """
-    from .occupancy import scan_pane_occupancy
+    from .occupancy import scan_ledger_dispatch_availability
 
     return [
         FreePane(
@@ -405,6 +406,6 @@ def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
             pane_role=entry.pane_role or None,
             window_name=entry.window_name,
         )
-        for entry in scan_pane_occupancy(adapter)
+        for entry in scan_ledger_dispatch_availability(adapter)
         if entry.dispatch_available
     ]

@@ -22,6 +22,18 @@ def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
         "IMPERIUM_MECHANICUS_FOCUS_LOG", str(tmp_path / "mechanicus-focus-guard.log")
     )
     monkeypatch.setenv("TOKEN_API_DB", str(tmp_path / "agents.db"))
+    monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
+    try:
+        from tmuxctl import wrapper_ledger
+
+        wrapper_ledger.LEDGER._rows = {}
+        wrapper_ledger.LEDGER._loaded = False
+        wrapper_ledger.LEDGER.load(force=True)
+    except Exception:
+        # Not every cli-tools test imports tmuxctl.  If import-time dependencies
+        # are unavailable for a narrow subprocess-style test, the environment
+        # redirect above still prevents live ledger writes.
+        pass
     # token-restart's plist reconcilers (ensure_plist_resource_limits /
     # ensure_plist_socket_activation) edit the LaunchAgent IN PLACE. Point them at
     # a throwaway path so a subprocess token-restart can never mutate the live

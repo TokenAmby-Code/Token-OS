@@ -23,7 +23,7 @@ REPO_ROOT = ROOT.parent
 sys.path.insert(0, str(REPO_ROOT / "tmuxctld" / "lib"))
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl import daemon, wrapper_ledger
+from tmuxctl import daemon, occupancy, wrapper_ledger
 from tmuxctl import service as tmux_service
 
 # Captured before any monkeypatching so the dedicated re-assertion tests can
@@ -45,6 +45,7 @@ def _no_live_tmux_guard(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon.typing_guard_state, "hold", lambda *a, **k: False)
     monkeypatch.setattr(daemon.typing_guard_state, "release", lambda *a, **k: None)
     monkeypatch.setattr(daemon.send_gate, "evaluate", lambda *a, **k: None)
+    monkeypatch.setattr(occupancy, "_active_agent", lambda pane_pid: pane_pid is not None)
     monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
     monkeypatch.setenv("TMUXCTLD_CALLBACKS_PATH", str(tmp_path / "callbacks.json"))
     monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
@@ -117,6 +118,8 @@ class RecordingVoiceAdapter(StubAdapter):
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         self.calls.append(args)
+        if args[:3] == ("display-message", "-t", "%42") and "#{@PANE_ID}" in args[-1]:
+            return "%42\tpalace:E\tpalace\t999\t"
         if args[:1] == ("send-keys",) and "-l" in args:
             self.buffer += str(args[args.index("-l") + 1])
         if args[:1] == ("capture-pane",):
@@ -132,7 +135,21 @@ class RecordingVoiceAdapter(StubAdapter):
         self.calls.append(("send-keys-helper", target, *keys))
 
 
-def _serve(adapter_factory):
+def _serve(adapter_factory, *, seed_delivery_roles: bool = True):
+    # Most daemon send-path tests predate the wrapper-ledger delivery gate and
+    # exercise transport/verification behavior rather than blank-pane refusal.
+    # Seed the common fake occupied pane roles they use so those sends represent
+    # a managed agent, not a blank pane. Tests that need ledger absence use a
+    # distinct role and assert the new P0/refusal behavior explicitly.
+    if seed_delivery_roles:
+        for role, instance_id in (("palace:E", "inst-palace-E"), ("ack-pane", "inst-ack")):
+            wrapper_ledger.LEDGER.upsert(
+                wrapper_id=f"test-{role}",
+                instance_id=instance_id,
+                pane_positional_id=role,
+                engine="codex",
+                state="OPEN",
+            )
     server = daemon.TmuxctldServer(
         ("127.0.0.1", 0),
         adapter_factory=adapter_factory,
@@ -970,7 +987,7 @@ class WrapperEndAdapter:
 
 def test_wrapperend_clears_owned_runtime_state_immediately_and_idempotently() -> None:
     rec = WrapperEndAdapter()
-    server, _ = _serve(lambda: rec)
+    server, _ = _serve(lambda: rec, seed_delivery_roles=False)
     try:
         _, payload = _post(
             server,
@@ -995,7 +1012,7 @@ def test_wrapperend_clears_owned_runtime_state_immediately_and_idempotently() ->
 
 def test_wrapperend_resolves_pane_by_wrapper_id_when_payload_pane_missing() -> None:
     rec = WrapperEndAdapter()
-    server, _ = _serve(lambda: rec)
+    server, _ = _serve(lambda: rec, seed_delivery_roles=False)
     try:
         _, payload = _post(server, "/hooks/wrapperend", {"wrapper_launch_id": "wrap-1"})
         assert payload["ok"] is True
@@ -1634,7 +1651,7 @@ def test_wrapperstart_skips_tint_for_non_persona_pane() -> None:
 def test_wrapperstart_honors_discord_voice_lock() -> None:
     rec = WrapperStartAdapter()
     rec.voice_lock = "1"
-    server, _ = _serve(lambda: rec)
+    server, _ = _serve(lambda: rec, seed_delivery_roles=False)
     try:
         _, payload = _post(
             server,
@@ -1735,7 +1752,7 @@ def test_reconcile_rebuilds_wrapper_ledger_from_tmux_scan(tmp_path, monkeypatch)
         state="OPEN",
     )
 
-    server, _ = _serve(ReconcileLedgerAdapter)
+    server, _ = _serve(ReconcileLedgerAdapter, seed_delivery_roles=False)
     try:
         _, payload = _post(server, "/reconcile", {})
         assert payload["ok"] is True
@@ -1878,6 +1895,8 @@ class SendAckAdapter:
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         type(self).calls.append(tuple(args))
+        if args[:3] == ("display-message", "-t", "%42") and "#{@PANE_ID}" in args[-1]:
+            return "%42\tack-pane\ttest\t999\t"
         if args[:1] == ("send-keys",) and "-l" in args and type(self).literal_sent is not None:
             type(self).literal_sent.set()
         return ""
@@ -2303,6 +2322,8 @@ class LedgerlessStampAdapter(SendAckAdapter):
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         type(self).calls.append(tuple(args))
+        if args[:3] == ("display-message", "-t", "%42") and "#{@PANE_ID}" in args[-1]:
+            return "%42\tmechanicus:9\tmechanicus\t999\t"
         if args[:2] == ("list-panes", "-a"):
             # Physical %42 stamped with a live instance id and canonical role,
             # exactly as `resolver._instance_pane_index` reads it.
@@ -2315,51 +2336,34 @@ class LedgerlessStampAdapter(SendAckAdapter):
         return "mechanicus:9" if option == "@PANE_ID" else ""
 
 
-def test_send_text_ledgerless_stamped_pane_verifies_ack() -> None:
-    """Regression (brief submit-ack false-negative): a stamped pane with NO wrapper
-    ledger row still resolves its instance_id from the live stamp, so a real
-    UserPromptSubmit ack matches and the send verifies ``submitted`` — not a false
-    ``unverified``. The isolated ledger is empty, so this exercises the fallback."""
+def test_send_text_ledgerless_stamped_pane_is_loud_p0_not_fallback() -> None:
+    """A live/stamped pane absent from the wrapper ledger must not be a fallback.
+
+    The all-comms delivery gate treats wrapper-ledger/sniff disagreement as P0
+    and issues no bytes, even if the retired live ``@INSTANCE_ID`` stamp would
+    previously have let submit-ack verification proceed.
+    """
     LedgerlessStampAdapter.calls = []
     LedgerlessStampAdapter.literal_sent = threading.Event()
     server, _ = _serve(LedgerlessStampAdapter)
     try:
-        result_box: dict = {}
-
-        def send() -> None:
-            result_box["status"], result_box["payload"] = _post_timeout(
-                server,
-                "/send-text",
-                {
-                    "pane": "%42",
-                    "text": "do the thing",
-                    "verify": True,
-                    "verify_timeout": 2,
-                    "submit_settle_seconds": 0.01,
-                },
-                timeout=5,
-            )
-
-        thread = threading.Thread(target=send)
-        thread.start()
-        assert LedgerlessStampAdapter.literal_sent is not None
-        assert LedgerlessStampAdapter.literal_sent.wait(timeout=2)
-        # The agent's live UserPromptSubmit echo carries its session/instance id;
-        # the daemon must have resolved the SAME id from the stamp for this to match.
-        _, ack = _post(
+        status, payload = _post_timeout(
             server,
-            "/hooks/user-prompt-submit",
-            {"session_id": "inst-stamp-only"},
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 2,
+                "submit_settle_seconds": 0.01,
+            },
+            timeout=5,
         )
-        thread.join(timeout=5)
-        assert not thread.is_alive()
-        assert ack["ok"] is True
-        payload = result_box["payload"]
-        assert payload["ok"] is True
-        result = payload["result"]
-        assert result["verification_status"] == "submitted"
-        assert result["verified_by"] == "UserPromptSubmit"
-        assert result["instance_id"] == "inst-stamp-only"
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+        assert "P0_LEDGER_SNIFF_INCONGRUENCY" in payload["error"]["message"]
+        assert not LedgerlessStampAdapter.literal_sent.is_set()
     finally:
         server.shutdown()
 
@@ -2728,6 +2732,8 @@ class StuckDraftAdapter:
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
         type(self).calls.append(tuple(args))
+        if args[:3] == ("display-message", "-t", "%42") and "#{@PANE_ID}" in args[-1]:
+            return "%42\tack-pane\ttest\t999\t"
         return ""
 
     def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
@@ -2845,7 +2851,9 @@ def test_send_text_enqueues_without_waiting_or_writing_under_typing_guard(monkey
         assert result["delivered"] is False
         assert result["reason"] == "typing_guard"
         assert hold_calls == [], "do not acquire agent hold behind a live human guard"
-        assert SendAckAdapter.calls == [], "zero bytes issued while human guard is active"
+        assert not [call for call in SendAckAdapter.calls if call[:1] == ("send-keys",)], (
+            "zero bytes issued while human guard is active"
+        )
     finally:
         server.shutdown()
 
@@ -2880,7 +2888,9 @@ def test_insert_only_send_text_is_also_enqueued_under_typing_guard(monkeypatch) 
         assert payload["ok"] is True
         assert payload["result"]["status"] == "queued"
         assert payload["result"]["queued"] is True
-        assert SendAckAdapter.calls == []
+        assert not [call for call in SendAckAdapter.calls if call[:1] == ("send-keys",)], (
+            "zero bytes issued while human guard is active"
+        )
     finally:
         server.shutdown()
 
@@ -2905,7 +2915,9 @@ def test_typing_guard_drop_requires_explicit_reason(monkeypatch) -> None:
         assert payload["ok"] is False
         assert payload["error"]["code"] == "ValueError"
         assert "typing_guard_drop_reason" in payload["error"]["message"]
-        assert SendAckAdapter.calls == []
+        assert not [call for call in SendAckAdapter.calls if call[:1] == ("send-keys",)], (
+            "zero bytes issued while human guard is active"
+        )
         assert daemon._DEFERRED_SEND_QUEUE.size() == 0
     finally:
         server.shutdown()
@@ -2934,7 +2946,9 @@ def test_typing_guard_explicit_drop_records_reason_and_does_not_enqueue(monkeypa
         assert result["status"] == "dropped"
         assert result["drop_reason"] == "stale_on_drain"
         assert result["queued"] is False
-        assert SendAckAdapter.calls == []
+        assert not [call for call in SendAckAdapter.calls if call[:1] == ("send-keys",)], (
+            "zero bytes issued while human guard is active"
+        )
         assert daemon._DEFERRED_SEND_QUEUE.size() == 0
     finally:
         server.shutdown()

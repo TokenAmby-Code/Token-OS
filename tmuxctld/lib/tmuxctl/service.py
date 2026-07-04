@@ -914,10 +914,12 @@ class TmuxControlPlane:
         ``submit=False`` routes through the insert-only primitive (draft mode —
         never issues C-m), mirroring ``tmuxctl send-text --no-submit``.
         Dispatch launcher payloads (``clear`` warmups and staged
-        ``dispatch-agent`` commands) are additionally checked against the live
-        occupancy ledger before any byte-bearing send.
+        ``dispatch-agent`` commands) require a ledger-free pane; all other
+        comms require a wrapper-ledger-occupied managed agent before any
+        byte-bearing send.
         """
         from .occupancy import (
+            assert_comms_delivery_target_occupied,
             assert_dispatch_target_available,
             looks_like_dispatch_launcher_payload,
         )
@@ -925,6 +927,8 @@ class TmuxControlPlane:
         physical_pane = pane if pane.startswith("%") else resolve_to_physical(self.adapter, pane)
         if looks_like_dispatch_launcher_payload(text):
             assert_dispatch_target_available(self.adapter, physical_pane)
+        else:
+            assert_comms_delivery_target_occupied(self.adapter, physical_pane)
         if not submit:
             self.insert_text(physical_pane, text)
             return {"status": "inserted", "pane": pane, "physical_pane": physical_pane}
@@ -1320,9 +1324,12 @@ class TmuxControlPlane:
         self, instance_id: str, text: str, *, clear_prompt: bool = False, submit: bool = True
     ) -> dict:
         """Deliver text to an instance's live pane; fails closed if unresolved."""
+        from .occupancy import assert_comms_delivery_target_occupied
+
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False}
+        assert_comms_delivery_target_occupied(self.adapter, resolved["pane_id"])
         if not submit:
             self.insert_text(resolved["pane_id"], text)
             return {"instance_id": instance_id, "found": True, "status": "inserted"}
