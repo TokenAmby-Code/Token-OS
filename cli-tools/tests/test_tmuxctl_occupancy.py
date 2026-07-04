@@ -17,6 +17,18 @@ from tmuxctl.occupancy import (
 )
 
 
+def _seed_wrapper_ledger(role: str, *, instance_id: str = "ledger-instance") -> None:
+    from tmuxctl import wrapper_ledger
+
+    wrapper_ledger.LEDGER.upsert(
+        wrapper_id=f"wrap-{role}",
+        instance_id=instance_id,
+        pane_positional_id=role,
+        engine="codex",
+        state="OPEN",
+    )
+
+
 class OccupancyAdapter:
     def __init__(self, row: str):
         self.row = row
@@ -105,10 +117,14 @@ def test_occupancy_for_pane_falls_back_to_original_target_when_resolution_fails(
 
 
 def test_dispatch_target_guard_refuses_instance_stamp(monkeypatch):
-    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
+    _seed_wrapper_ledger("mechanicus:1", instance_id="live-instance")
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: pane_pid == 1000)
     adapter = ResolvingOccupancyAdapter({"%9": "%9\tlive-instance\tmechanicus:1\tmechanicus\t1000"})
 
-    with pytest.raises(ValueError, match="dispatch target is occupied: @INSTANCE_ID=live-instance"):
+    with pytest.raises(
+        ValueError,
+        match="dispatch target is occupied in wrapper ledger: ledger instance_id=live-instance",
+    ):
         assert_dispatch_target_available(adapter, "%9")
 
 
@@ -117,7 +133,8 @@ def test_dispatch_target_guard_refuses_live_agent(monkeypatch):
     adapter = ResolvingOccupancyAdapter({"%9": "%9\t\tmechanicus:1\tmechanicus\t1000"})
 
     with pytest.raises(
-        ValueError, match="dispatch target has live Claude/Codex agent: pane_pid=1000"
+        ValueError,
+        match="P0_LEDGER_SNIFF_INCONGRUENCY .*ledger_occupied=false sniff_live_agent=true",
     ):
         assert_dispatch_target_available(adapter, "%9")
 

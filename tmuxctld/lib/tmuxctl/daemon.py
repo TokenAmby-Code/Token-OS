@@ -507,9 +507,20 @@ class PromptSubmitSniffer:
     ) -> bool:
         if event.get("at", 0) < since:
             return False
-        if instance_id and event.get("instance_id") != instance_id:
-            return False
-        if not instance_id and pane and event.get("pane") != pane:
+        event_instance_id = str(event.get("instance_id") or "").strip()
+        if instance_id:
+            if event_instance_id:
+                if event_instance_id != instance_id:
+                    return False
+            elif pane and event.get("pane") != pane:
+                # Some UserPromptSubmit hooks are pane+hash-only. When the send
+                # callback has an authoritative ledger instance_id but the hook
+                # omitted it, allow an exact target pane match to carry the
+                # event through to the payload-hash check below.
+                return False
+            elif not pane:
+                return False
+        elif pane and event.get("pane") != pane:
             return False
         event_hash = str(event.get("prompt_hash") or "").strip()
         # Prefer exact hash matching when the hook surface supplies it. Some
@@ -2024,11 +2035,26 @@ def _insert_without_submit_pipeline(
     verify_timeout: float = 1.0,
     direct_user: bool = False,
     effects: dict | None = None,
+    occupancy_checked: bool = False,
 ) -> dict:
     """Shared insert-only send primitive with gate, idempotency, and read-back."""
 
     phys_pane = _resolve_physical_pane_or_gate(control, pane)
     normalized_payload = normalize_prompt_payload(text)
+    from .occupancy import (
+        assert_comms_delivery_target_occupied,
+        assert_dispatch_target_available,
+        looks_like_dispatch_launcher_payload,
+    )
+
+    # Occupancy gate is independent of the typing gate and idempotency cache:
+    # every byte-bearing insert must re-prove the target is either a free
+    # dispatch allocation pane or an occupied managed-agent comms target.
+    if not occupancy_checked:
+        if looks_like_dispatch_launcher_payload(normalized_payload):
+            assert_dispatch_target_available(control.adapter, phys_pane)
+        else:
+            assert_comms_delivery_target_occupied(control.adapter, phys_pane)
     visible_payload_hash = prompt_payload_hash(normalized_payload)
     idempotency_hash = _send_operation_fingerprint(
         "insert-without-submit",
@@ -2176,21 +2202,34 @@ def _send_text_pipeline(
     # gated result instead; Token-API can queue/retry, but tmuxctld issues zero
     # bytes now.
     normalized_payload = normalize_prompt_payload(text)
-    from .occupancy import assert_dispatch_target_available, looks_like_dispatch_launcher_payload
+    from .occupancy import (
+        assert_comms_delivery_target_occupied,
+        assert_dispatch_target_available,
+        looks_like_dispatch_launcher_payload,
+    )
+
+    # Ledger-first occupancy gate before idempotency, queues, typing guard, or
+    # any byte-bearing send. Dispatch launcher bytes require a ledger-free pane;
+    # all other comms require an occupied managed-agent pane. In both cases the
+    # selected pane gets exactly one live-process sniff and disagreement is P0.
+    if looks_like_dispatch_launcher_payload(normalized_payload):
+        assert_dispatch_target_available(control.adapter, phys_pane)
+    else:
+        assert_comms_delivery_target_occupied(control.adapter, phys_pane)
 
     if not submit:
-        if looks_like_dispatch_launcher_payload(normalized_payload):
-            assert_dispatch_target_available(control.adapter, phys_pane)
         return _insert_without_submit_pipeline(
             control,
             pane=pane,
             text=normalized_payload,
-            action=lambda: control.send_text(pane, text, clear_prompt=clear_prompt, submit=False),
+            action=lambda: control.insert_text(phys_pane, normalized_payload)
+            or {"pane": pane, "physical_pane": phys_pane},
             route=route,
             request_params=request_params,
             operation_id=operation_id,
             verify_timeout=verify_timeout,
             effects={"route": "send-text", "submit": False, "clear_prompt": bool(clear_prompt)},
+            occupancy_checked=True,
         )
 
     # Hash the NORMALIZED payload that is actually injected (newlines collapsed,
@@ -2224,8 +2263,6 @@ def _send_text_pipeline(
     if deferred is not None:
         _SEND_IDEMPOTENCY.abort(operation_id)
         return deferred
-    if looks_like_dispatch_launcher_payload(normalized_payload):
-        assert_dispatch_target_available(control.adapter, phys_pane)
     pre_gate = send_gate.evaluate(("send-keys", "-t", phys_pane, "-l", normalized_payload))
     if pre_gate is not None and pre_gate.get("suppressed"):
         _SEND_IDEMPOTENCY.abort(operation_id)
@@ -3177,10 +3214,12 @@ def _h_hook_wrapperstart(control, params):
         state="OPEN",
     )
     tint = ""
-    try:
-        tint = assertions.apply_persona_pane_tint(control.adapter, pane, pane_label) or ""
-    except Exception as exc:  # never let a tint failure break wrapper registration
-        log.warning("tmuxctld wrapperstart tint failed pane=%s label=%s: %s", pane, pane_label, exc)
+    voice_lock = _adapter_show_pane_option(control, pane, _VOICE_LOCK_OPTION)
+    if not voice_lock:
+        try:
+            tint = assertions.apply_persona_pane_tint(control.adapter, pane, pane_label) or ""
+        except Exception as exc:  # never let a tint failure break wrapper registration
+            log.warning("tmuxctld wrapperstart tint failed pane=%s label=%s: %s", pane, pane_label, exc)
 
     return {
         "status": "stamped",

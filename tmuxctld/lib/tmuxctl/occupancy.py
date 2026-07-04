@@ -1,10 +1,11 @@
-"""Daemon-native pane occupancy/liveness ledger.
+"""Daemon-native pane occupancy/liveness gates.
 
-This module is the single tmuxctl source of truth for dispatch seat availability:
-occupancy is derived from live tmux pane state plus the process-tree liveness
-oracle, never from Token-API registry rows.  It is deliberately small and
-stdlib-only so both the tmuxctld daemon handlers and the in-process service paths
-consume the same ledger instead of growing split-brain guards.
+This module is the single tmuxctl source of truth for dispatch seat availability
+and comms delivery safety. Allocation walks live tmux pane identities plus the
+wrapper→pane ledger first and does not sniff process trees until one candidate is
+selected. Delivery gates then cross-check that selected pane with one process
+sniff; any wrapper-ledger/sniff disagreement is a loud P0, never a fallback.
+Token-API registry rows do not participate.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from .singleton_labels import canonical_singleton_label, is_persona_singleton_label
 from .tmux_adapter import TmuxAdapter
@@ -105,12 +107,166 @@ def _parse_pid(raw: str) -> int | None:
         return None
 
 
+def _parse_ledger_identity_parts(parts: list[str]) -> tuple[str, str, str, int | None, str] | None:
+    """Parse a pane identity row without instance-stamp authority.
+
+    Live callers request the 5-column row
+    ``pane_id, @PANE_ID, window_name, pane_pid, @PANE_BORN``.  Some older unit
+    fakes still return the retired occupancy shape
+    ``pane_id, @INSTANCE_ID, @PANE_ID, window_name, pane_pid[, @PANE_BORN]``.
+    Tolerate those fakes, but return only the positional role and tmux pid; the
+    legacy instance stamp is intentionally discarded.
+    """
+
+    if len(parts) == 4:
+        pane_id, pane_role, window_name, pane_pid_raw = parts
+        born_raw = ""
+    elif len(parts) == 5:
+        if _parse_pid(parts[3]) is not None or parts[3].strip() == "":
+            pane_id, pane_role, window_name, pane_pid_raw, born_raw = parts
+        else:
+            pane_id, _instance_id, pane_role, window_name, pane_pid_raw = parts
+            born_raw = ""
+    elif len(parts) == 6:
+        pane_id, _instance_id, pane_role, window_name, pane_pid_raw, born_raw = parts
+    else:
+        return None
+    role = canonical_singleton_label(pane_role.strip()) if pane_role.strip() else ""
+    return pane_id, role, window_name.strip(), _parse_pid(pane_pid_raw), born_raw
+
+
 def _active_agent(pane_pid: int | None) -> bool:
     # Lazy import avoids the historical custodes.py -> stack.py -> _stack_core.py
     # cycle while still using the shared process-tree oracle.
     from .custodes import active_agent_in_pane
 
     return active_agent_in_pane(pane_pid) is not None
+
+
+def _active_wrapper_row_for_role(pane_role: str) -> dict[str, Any] | None:
+    """Return the active wrapper-ledger row occupying ``pane_role``, if any.
+
+    The wrapper→pane ledger is the delivery/occupancy authority for managed
+    agents.  Tmux process sniffing is deliberately kept out of this lookup so
+    allocation can walk ledger occupancy first and sniff only the selected pane.
+    """
+
+    role = canonical_singleton_label(pane_role.strip()) if pane_role.strip() else ""
+    if not role:
+        return None
+    try:
+        from .wrapper_ledger import LEDGER
+
+        row = LEDGER.resolve(pane_positional_id=role)
+    except Exception as exc:
+        raise ValueError(f"wrapper ledger occupancy lookup failed for {role}") from exc
+    return row.as_dict() if row is not None else None
+
+
+def _pane_row(
+    adapter: TmuxAdapter,
+    pane: str,
+    *,
+    resolve: bool = True,
+) -> tuple[str, str, str, int | None, str] | None:
+    """Read one pane's identity row without process sniffing."""
+
+    target = pane
+    if resolve:
+        try:
+            target = adapter._resolve_pane_target_arg(pane)
+        except Exception:
+            target = pane
+    raw = adapter.run(
+        "display-message",
+        "-t",
+        target,
+        "-p",
+        "\t".join(
+            [
+                "#{pane_id}",
+                "#{@PANE_ID}",
+                "#{window_name}",
+                "#{pane_pid}",
+                "#{@PANE_BORN}",
+            ]
+        ),
+        allow_failure=True,
+    ).strip()
+    if not raw:
+        return None
+    return _parse_ledger_identity_parts(raw.split("\t"))
+
+
+@dataclass(frozen=True)
+class LedgerPaneOccupancy:
+    pane_id: str
+    pane_role: str
+    window_name: str
+    pane_pid: int | None
+    ledger_row: dict[str, Any] | None
+    sniff_live_agent: bool
+    recently_born: bool = False
+
+    @property
+    def singleton(self) -> bool:
+        return is_persona_singleton_label(self.pane_role)
+
+    @property
+    def ledger_occupied(self) -> bool:
+        return self.ledger_row is not None
+
+
+def ledger_occupancy_for_pane(adapter: TmuxAdapter, pane: str) -> LedgerPaneOccupancy | None:
+    """Ledger-first occupancy for exactly one pane, then one process sniff.
+
+    This is the belt-and-suspenders check: first resolve the pane's positional
+    identity and consult the wrapper→pane ledger, then perform a single live
+    process-tree sniff for that same selected pane.  Callers must treat any
+    disagreement as a P0 infrastructure failure, never as a fallback signal.
+    """
+
+    row = _pane_row(adapter, pane)
+    if row is None:
+        return None
+    pane_id, pane_role, window_name, pane_pid, born_raw = row
+    return LedgerPaneOccupancy(
+        pane_id=pane_id,
+        pane_role=pane_role,
+        window_name=window_name,
+        pane_pid=pane_pid,
+        ledger_row=_active_wrapper_row_for_role(pane_role),
+        sniff_live_agent=_active_agent(pane_pid),
+        recently_born=_recently_born(born_raw),
+    )
+
+
+def _p0_incongruency(occ: LedgerPaneOccupancy, *, purpose: str) -> ValueError:
+    return ValueError(
+        "P0_LEDGER_SNIFF_INCONGRUENCY "
+        f"purpose={purpose} pane={occ.pane_role or occ.pane_id} "
+        f"ledger_occupied={str(occ.ledger_occupied).lower()} "
+        f"sniff_live_agent={str(occ.sniff_live_agent).lower()}"
+    )
+
+
+def assert_comms_delivery_target_occupied(
+    adapter: TmuxAdapter,
+    pane: str,
+) -> LedgerPaneOccupancy:
+    """Fail closed unless ``pane`` is an occupied managed-agent delivery target."""
+
+    occ = ledger_occupancy_for_pane(adapter, pane)
+    if occ is None:
+        raise ValueError(f"pane target not found: {pane}")
+    if occ.ledger_occupied != occ.sniff_live_agent:
+        raise _p0_incongruency(occ, purpose="comms_delivery")
+    if not occ.ledger_occupied:
+        raise ValueError(
+            "ledger_unoccupied: refusing non-delivery into blank/unoccupied pane "
+            f"{occ.pane_role or occ.pane_id}"
+        )
+    return occ
 
 
 def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
@@ -154,6 +310,51 @@ def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
                 pane_pid=pane_pid,
                 instance_id=instance_id.strip(),
                 live_agent=_active_agent(pane_pid),
+                recently_born=_recently_born(born_raw),
+            )
+        )
+    return ledger
+
+
+def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupancy]:
+    """Return dispatch availability from the wrapper ledger without ps sniffing.
+
+    This is the allocator's first pass.  It walks every live pane once, consults
+    only the wrapper→pane ledger (plus singleton/boot-grace structural guards),
+    and intentionally does not call :func:`_active_agent`.  The selected free
+    candidate is later cross-checked by :func:`assert_dispatch_target_available`.
+    """
+
+    raw = adapter.run(
+        "list-panes",
+        "-a",
+        "-F",
+        "\t".join(
+            [
+                "#{pane_id}",
+                "#{@PANE_ID}",
+                "#{window_name}",
+                "#{pane_pid}",
+                "#{@PANE_BORN}",
+            ]
+        ),
+        allow_failure=True,
+    )
+    ledger: list[PaneOccupancy] = []
+    for line in raw.splitlines():
+        parsed = _parse_ledger_identity_parts(line.split("\t"))
+        if parsed is None:
+            continue
+        pane_id, role, window_name, pane_pid, born_raw = parsed
+        ledger_row = _active_wrapper_row_for_role(role)
+        ledger.append(
+            PaneOccupancy(
+                pane_id=pane_id,
+                pane_role=role,
+                window_name=window_name.strip(),
+                pane_pid=pane_pid,
+                instance_id=str((ledger_row or {}).get("instance_id") or ""),
+                live_agent=False,
                 recently_born=_recently_born(born_raw),
             )
         )
@@ -205,21 +406,37 @@ def occupancy_for_pane(adapter: TmuxAdapter, pane: str) -> PaneOccupancy | None:
 
 
 def assert_dispatch_target_available(adapter: TmuxAdapter, pane: str) -> PaneOccupancy:
-    """Fail closed unless pane is safe for dispatch launcher bytes."""
-    occupancy = occupancy_for_pane(adapter, pane)
-    if occupancy is None:
+    """Fail closed unless pane is safe for dispatch launcher bytes.
+
+    Availability is ledger-first: a dispatch target must be unoccupied in the
+    wrapper→pane ledger, then a single process sniff of that selected pane must
+    agree it is empty.  Any ledger/sniff disagreement is a loud P0 failure.
+    """
+
+    ledger_occ = ledger_occupancy_for_pane(adapter, pane)
+    if ledger_occ is None:
         raise ValueError(f"pane target not found: {pane}")
-    if occupancy.singleton:
+    if ledger_occ.singleton:
         raise ValueError(
-            f"dispatch target is protected singleton seat: {occupancy.pane_role or occupancy.pane_id}"
+            f"dispatch target is protected singleton seat: {ledger_occ.pane_role or ledger_occ.pane_id}"
         )
-    if occupancy.instance_id:
-        raise ValueError(f"dispatch target is occupied: @INSTANCE_ID={occupancy.instance_id}")
-    if occupancy.live_agent:
+    if ledger_occ.ledger_occupied != ledger_occ.sniff_live_agent:
+        raise _p0_incongruency(ledger_occ, purpose="dispatch_allocation")
+    if ledger_occ.ledger_occupied:
+        instance_id = str((ledger_occ.ledger_row or {}).get("instance_id") or "")
+        detail = f": ledger instance_id={instance_id}" if instance_id else ""
         raise ValueError(
-            f"dispatch target has live Claude/Codex agent: pane_pid={occupancy.pane_pid}"
+            f"dispatch target is occupied in wrapper ledger{detail}"
         )
-    return occupancy
+    return PaneOccupancy(
+        pane_id=ledger_occ.pane_id,
+        pane_role=ledger_occ.pane_role,
+        window_name=ledger_occ.window_name,
+        pane_pid=ledger_occ.pane_pid,
+        instance_id="",
+        live_agent=False,
+        recently_born=ledger_occ.recently_born,
+    )
 
 
 def looks_like_dispatch_launcher_payload(text: str) -> bool:
