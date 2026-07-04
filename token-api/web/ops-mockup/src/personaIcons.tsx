@@ -133,6 +133,26 @@ export const PERSONA_ICON = {
   'black-consuls': 'eagle-head',
 } satisfies Record<string, string>;
 
+// Ordered Astartes chapter/legion heraldry keys — the faction glyphs (excludes
+// overseers, civic personas, rank bases). Every key from the chapter/legion
+// blocks of PERSONA_ICON above (ultramarines → black-consuls). Hand-listed
+// (stable, reviewable) rather than a runtime slice of the map. Consumed by the
+// mock worker + TTS rosters so the full heraldry set gets exercised on screen.
+export const FACTION_PERSONAS = [
+  // First Founding loyalists
+  'ultramarines', 'blood-angels', 'dark-angels', 'space-wolves', 'imperial-fists',
+  'salamanders', 'raven-guard', 'white-scars', 'emperors-children', 'alpha-legion',
+  // traitor legions
+  'iron-warriors', 'night-lords', 'world-eaters', 'death-guard', 'thousand-sons',
+  'sons-of-horus', 'word-bearers', 'deathwatch', 'legion-of-the-damned', 'soul-drinkers',
+  // successor / additional loyalist chapters
+  'iron-hands', 'black-templars', 'crimson-fists', 'grey-knights', 'iron-snakes',
+  'flesh-tearers', 'blood-ravens', 'howling-griffons', 'silver-skulls', 'carcharodons',
+  'red-scorpions', 'mortifactors', 'scythes-of-the-emperor', 'novamarines', 'minotaurs',
+  'exorcists', 'doom-eagles', 'celestial-lions', 'death-spectres', 'storm-wardens',
+  'sons-of-medusa', 'lamenters', 'hawk-lords', 'black-consuls',
+] as const;
+
 // The union of every persona key the registry knows — lets callers (e.g. the
 // instance table) reference personas with compile-time checking if they want.
 export type PersonaKey = keyof typeof PERSONA_ICON;

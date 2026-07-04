@@ -766,7 +766,23 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   border-radius: 50%;
   background: color-mix(in srgb, var(--surface) 55%, transparent);
   border: var(--instrument-w) solid var(--instrument);
+  /* always-on tone edge glow — mirrors the TTS .ring base halo (currentColor
+     here, since the chip's tone rides `color` inline), so every worker disc
+     carries the same beveled tone bleed the TTS dials do. The richer :hover
+     glow below still wins on hover. */
+  box-shadow:
+    inset 0 0 12px rgba(0, 0, 0, 0.55),
+    inset 0 0 6px -2px currentColor,
+    0 0 6px -1px currentColor,
+    0 0 4px 1px currentColor;
   transition: box-shadow 120ms ease;
+}
+/* worker glyph rides much larger than the 20px TTS icon — ~53% of the 90px disc,
+   matching the TTS glyph-in-disc proportion. Worker-scoped so the global
+   .persona-icon (TTS, 20px) is untouched. */
+.worker-chip__disc .persona-icon {
+  width: calc(48px * var(--ui-scale, 1));
+  height: calc(48px * var(--ui-scale, 1));
 }
 .worker-chip:hover .worker-chip__disc {
   box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.55), 0 0 8px -1px currentColor, 0 0 6px 2px color-mix(in srgb, currentColor 45%, transparent);
