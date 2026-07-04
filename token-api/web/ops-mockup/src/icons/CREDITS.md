@@ -49,7 +49,7 @@ No other modification was made to the path geometry.
 | `beveled-star.svg` | [Lorc](https://lorcblog.blogspot.com/) | [beveled-star](https://game-icons.net/1x1/lorc/beveled-star.html) | Novamarines |
 | `bloody-sword.svg` | [Lorc](https://lorcblog.blogspot.com/) | [bloody-sword](https://game-icons.net/1x1/lorc/bloody-sword.html) | Flesh Tearers |
 | `book-aura.svg` | [Lorc](https://lorcblog.blogspot.com/) | [book-aura](https://game-icons.net/1x1/lorc/book-aura.html) | Blood Ravens |
-| `book-cover.svg` | [Delapouite](https://delapouite.com/) | [book-cover](https://game-icons.net/1x1/delapouite/book-cover.html) | Administratum (ledger/book) - available |
+| `book-cover.svg` | [Delapouite](https://delapouite.com/) | [book-cover](https://game-icons.net/1x1/delapouite/book-cover.html) | Word Bearers |
 | `bookmark.svg` | [Lorc](https://lorcblog.blogspot.com/) | [bookmark](https://game-icons.net/1x1/lorc/bookmark.html) | Administratum (bookmark) - available |
 | `burning-eye.svg` | [Lorc](https://lorcblog.blogspot.com/) | [burning-eye](https://game-icons.net/1x1/lorc/burning-eye.html) | Inquisition (burning eye) - available |
 | `centurion-helmet.svg` | [Delapouite](https://delapouite.com/) | [centurion-helmet](https://game-icons.net/1x1/delapouite/centurion-helmet.html) | Custodes (golden guard helm) - available |
@@ -61,7 +61,7 @@ No other modification was made to the path geometry.
 | `cyborg-face.svg` | [Delapouite](https://delapouite.com/) | [cyborg-face](https://game-icons.net/1x1/delapouite/cyborg-face.html) | Mechanicus (tech-priest) - available |
 | `daemon-skull.svg` | [Lorc](https://lorcblog.blogspot.com/) | [daemon-skull](https://game-icons.net/1x1/lorc/daemon-skull.html) | Exorcists |
 | `dead-eye.svg` | [Lorc](https://lorcblog.blogspot.com/) | [dead-eye](https://game-icons.net/1x1/lorc/dead-eye.html) | Inquisition (dead eye) - available |
-| `eye-of-horus.svg` | [Delapouite](https://delapouite.com/) | [eye-of-horus](https://game-icons.net/1x1/delapouite/eye-of-horus.html) | Inquisition (eye) - available |
+| `eye-of-horus.svg` | [Delapouite](https://delapouite.com/) | [eye-of-horus](https://game-icons.net/1x1/delapouite/eye-of-horus.html) | Sons of Horus |
 | `eye-shield.svg` | [Lorc](https://lorcblog.blogspot.com/) | [eye-shield](https://game-icons.net/1x1/lorc/eye-shield.html) | Inquisition (warding eye) - available |
 | `gauntlet.svg` | [Delapouite](https://delapouite.com/) | [gauntlet](https://game-icons.net/1x1/delapouite/gauntlet.html) | Iron Hands |
 | `gladius.svg` | [Skoll](https://game-icons.net/) | [gladius](https://game-icons.net/1x1/skoll/gladius.html) | Custodes (blade) - available |
@@ -75,7 +75,7 @@ No other modification was made to the path geometry.
 | `mechanical-arm.svg` | [Lorc](https://lorcblog.blogspot.com/) | [mechanical-arm](https://game-icons.net/1x1/lorc/mechanical-arm.html) | Mechanicus (servo-arm) - available |
 | `medal.svg` | [Lorc](https://lorcblog.blogspot.com/) | [medal](https://game-icons.net/1x1/lorc/medal.html) | Inquisition (rosette/seal) - available |
 | `minotaur.svg` | [Lorc](https://lorcblog.blogspot.com/) | [minotaur](https://game-icons.net/1x1/lorc/minotaur.html) | Minotaurs |
-| `pointy-sword.svg` | [Lorc](https://lorcblog.blogspot.com/) | [pointy-sword](https://game-icons.net/1x1/lorc/pointy-sword.html) | Grey Knights |
+| `pointy-sword.svg` | [Lorc](https://lorcblog.blogspot.com/) | [pointy-sword](https://game-icons.net/1x1/lorc/pointy-sword.html) | Grey Knights (retired → `winged-sword.svg`) - available |
 | `processor.svg` | [Lorc](https://lorcblog.blogspot.com/) | [processor](https://game-icons.net/1x1/lorc/processor.html) | Mechanicus (processor) - available |
 | `quill.svg` | [Lorc](https://lorcblog.blogspot.com/) | [quill](https://game-icons.net/1x1/lorc/quill.html) | Administratum (quill) - available |
 | `quill-ink.svg` | [Lorc](https://lorcblog.blogspot.com/) | [quill-ink](https://game-icons.net/1x1/lorc/quill-ink.html) | Administratum (quill and ink) - available |
@@ -99,6 +99,12 @@ No other modification was made to the path geometry.
 | `tear-tracks.svg` | [Lorc](https://lorcblog.blogspot.com/) | [tear-tracks](https://game-icons.net/1x1/lorc/tear-tracks.html) | Lamenters |
 | `hawk-emblem.svg` | [Lorc](https://lorcblog.blogspot.com/) | [hawk-emblem](https://game-icons.net/1x1/lorc/hawk-emblem.html) | Hawk Lords |
 | `eagle-head.svg` | [Delapouite](https://delapouite.com/) | [eagle-head](https://game-icons.net/1x1/delapouite/eagle-head.html) | Black Consuls |
+| `hazard-sign.svg` | [Lorc](https://lorcblog.blogspot.com/) | [hazard-sign](https://game-icons.net/1x1/lorc/hazard-sign.html) | Iron Warriors |
+| `bat.svg` | [Delapouite](https://delapouite.com/) | [bat](https://game-icons.net/1x1/delapouite/bat.html) | Night Lords |
+| `battle-axe.svg` | [Lorc](https://lorcblog.blogspot.com/) | [battle-axe](https://game-icons.net/1x1/lorc/battle-axe.html) | World Eaters |
+| `poison-cloud.svg` | [Sbed](https://game-icons.net/) | [poison-cloud](https://game-icons.net/1x1/sbed/poison-cloud.html) | Death Guard |
+| `sun.svg` | [Lorc](https://lorcblog.blogspot.com/) | [sun](https://game-icons.net/1x1/lorc/sun.html) | Thousand Sons |
+| `winged-sword.svg` | [Lorc](https://lorcblog.blogspot.com/) | [winged-sword](https://game-icons.net/1x1/lorc/winged-sword.html) | Grey Knights |
 
 ## Non-game-icons assets
 
@@ -117,6 +123,7 @@ CC BY 3.0 attribution above. They are documented here for completeness.
 - **Cathelineau** — https://game-icons.net/
 - **Delapouite** — https://delapouite.com/
 - **Lorc** — https://lorcblog.blogspot.com/
+- **Sbed** — https://game-icons.net/
 - **Skoll** — https://game-icons.net/
 
 Attribution requirement (CC BY 3.0): you must give appropriate credit
