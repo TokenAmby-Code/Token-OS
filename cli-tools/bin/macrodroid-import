@@ -203,6 +203,40 @@ def summarize_state(state: dict[str, Any], export_path: Path) -> tuple[int, str]
     return len(state.get("macroList", [])), digest
 
 
+def evaluate_import_result(
+    *,
+    replace: bool,
+    allow_existing: bool,
+    before_count: int,
+    before_match_count: int,
+    before_hash: str,
+    after_count: int,
+    after_match_count: int,
+    after_hash: str,
+) -> tuple[bool, bool]:
+    """Return (success, wiped) for post-launch MacroDroid import verification."""
+    if replace:
+        expected_count = before_count - before_match_count + 1
+        wiped = after_count < expected_count
+        success = (
+            not wiped
+            and after_match_count == 1
+            and after_count == expected_count
+            and after_hash != before_hash
+        )
+    elif allow_existing:
+        wiped = after_count < before_count
+        success = (
+            not wiped
+            and after_count == before_count + 1
+            and after_match_count == before_match_count + 1
+        )
+    else:
+        wiped = after_count < before_count
+        success = not wiped and after_count == before_count + 1 and after_match_count == 1
+    return success, wiped
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -361,23 +395,16 @@ def main() -> int:
         return 8
     after_count, after_hash = summarize_state(after, after_path)
     after_matches = macros_named(after, name)
-    if args.replace:
-        expected_count = before_count - len(before_matches) + 1
-        wiped = after_count < expected_count
-        success = (
-            not wiped
-            and len(after_matches) == 1
-            and after_count == expected_count
-            and after_hash != before_hash
-        )
-    elif args.allow_existing:
-        success = (
-            not wiped
-            and after_count == before_count + 1
-            and len(after_matches) == len(before_matches) + 1
-        )
-    else:
-        success = not wiped and after_count == before_count + 1 and len(after_matches) == 1
+    success, wiped = evaluate_import_result(
+        replace=args.replace,
+        allow_existing=args.allow_existing,
+        before_count=before_count,
+        before_match_count=len(before_matches),
+        before_hash=before_hash,
+        after_count=after_count,
+        after_match_count=len(after_matches),
+        after_hash=after_hash,
+    )
 
     event = {
         "result": "success" if success else "not_confirmed",
