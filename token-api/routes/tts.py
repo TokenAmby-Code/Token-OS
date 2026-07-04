@@ -929,6 +929,8 @@ async def dispatch_notify(
                     "success": bool(outcome.get("success")),
                     "route": outcome.get("route"),
                     "audio_delivered": bool(outcome.get("audio_delivered")),
+                    "reason": outcome.get("reason"),
+                    "error": outcome.get("error"),
                 }
         else:
             # Not queued = truthful non-delivery (persona_silent / no backend /
@@ -1039,7 +1041,13 @@ tts_worker_task: asyncio.Task | None = None
 
 
 def _resolve_completion(
-    item: "TTSQueueItem", *, success: bool, route: str | None, audio_delivered: bool
+    item: "TTSQueueItem",
+    *,
+    success: bool,
+    route: str | None,
+    audio_delivered: bool,
+    reason: str | None = None,
+    error: str | None = None,
 ) -> None:
     """Resolve a queue item's completion future, if one is attached and pending.
 
@@ -1054,9 +1062,12 @@ def _resolve_completion(
     if completion is None or completion.done():
         return
     try:
-        completion.set_result(
-            {"success": success, "route": route, "audio_delivered": audio_delivered}
-        )
+        result = {"success": success, "route": route, "audio_delivered": audio_delivered}
+        if reason:
+            result["reason"] = reason
+        if error:
+            result["error"] = error
+        completion.set_result(result)
     except asyncio.InvalidStateError:  # raced to done between the guard and set
         pass
 
@@ -1418,14 +1429,14 @@ def _get_phone_tts_stream(session_id: str | None, playback_id: str | None) -> di
 
 
 def _complete_phone_tts_stream(session_id: str | None, playback_id: str | None) -> None:
+    waiter = pending_phone_playbacks.get(str(playback_id))
+    if waiter is not None:
+        waiter.set()
     key = _phone_stream_key(session_id, playback_id)
     if key is None:
         return
     with _tts_phone_streams_lock:
         TTS_PHONE_STREAMS.pop(key, None)
-    waiter = pending_phone_playbacks.get(str(playback_id))
-    if waiter is not None:
-        waiter.set()
 
 
 def _chunk_next_payload(
@@ -1465,13 +1476,18 @@ def _send_phone_tts_chunk(payload: dict) -> dict:
         confirmed = event.wait(timeout=PHONE_PLAYBACK_WATCHDOG_S)
         if not confirmed:
             logger.warning(
-                "TTS phone: buffer_drained callback missed for %s after %ss; advancing",
+                "TTS phone: buffer_drained callback missed for %s after %ss; delivery unconfirmed",
                 playback_id,
                 PHONE_PLAYBACK_WATCHDOG_S,
             )
         result["playback_id"] = playback_id
         result["chunk_id"] = payload.get("chunk_id")
         result["playback_confirmed"] = confirmed
+        if not confirmed:
+            result["transport_success"] = bool(result.get("success"))
+            result["success"] = False
+            result["error"] = "phone_playback_unconfirmed"
+            result["reason"] = "phone_playback_unconfirmed"
         return result
     finally:
         pending_phone_playbacks.pop(playback_id, None)
@@ -1586,6 +1602,8 @@ def dispatch_tts_chunks_to_backend(
                 "method": result.get("method") or backend,
                 "chunks": real_chunks,
                 "completed_chunks": 0,
+                "playback_id": result.get("playback_id"),
+                "playback_confirmed": result.get("playback_confirmed"),
                 "results": [result],
                 "reason": result.get("reason") or error,
             }
@@ -2068,6 +2086,7 @@ async def tts_queue_worker() -> None:
                             success=False,
                             route=tts_result.get("route"),
                             audio_delivered=False,  # a skip is not delivery
+                            reason="skipped",
                         )
                     elif tts_result.get("success"):
                         await log_event(
@@ -2095,7 +2114,16 @@ async def tts_queue_worker() -> None:
                                 "sound_result": sound_result,
                             },
                         )
-                        _resolve_completion(item, success=False, route=None, audio_delivered=False)
+                        _resolve_completion(
+                            item,
+                            success=False,
+                            route=None,
+                            audio_delivered=False,
+                            reason=tts_result.get("reason")
+                            or tts_result.get("error")
+                            or "tts_failed",
+                            error=tts_result.get("error"),
+                        )
                 else:
                     logger.info(f"TTS worker: muted mode, sound only for {item.instance_id}")
                     # Muted (sound-only): no spoken audio delivered. Resolve on the
@@ -2105,6 +2133,7 @@ async def tts_queue_worker() -> None:
                         success=bool(sound_result and sound_result.get("success")),
                         route="sound" if sound_result and sound_result.get("success") else None,
                         audio_delivered=False,
+                        reason="muted_sound_only",
                     )
 
                 # Clear @TTS_STATE on source pane
@@ -2129,7 +2158,14 @@ async def tts_queue_worker() -> None:
                 pass
             # Unblock any awaiting front door so an exception can't wedge it.
             if item is not None:
-                _resolve_completion(item, success=False, route=None, audio_delivered=False)
+                _resolve_completion(
+                    item,
+                    success=False,
+                    route=None,
+                    audio_delivered=False,
+                    reason="tts_worker_exception",
+                    error=str(e),
+                )
             async with tts_queue_lock:
                 tts_current = None
             await asyncio.sleep(1)
