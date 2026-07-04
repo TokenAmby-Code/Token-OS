@@ -55,12 +55,14 @@ usage() {
 dispatch — canonical launcher for new or resumed agent sessions
 
 Usage:
-  dispatch [legion|mechanicus|civic] [options]
+  dispatch [legion|mechanicus|civic|palace|somnium] [options]
 
   The optional leading word is target shorthand:
     dispatch legion ...       ≡  dispatch --target mechanicus:new ...
     dispatch mechanicus ...   ≡  dispatch --target mechanicus:new ...
     dispatch civic ...        ≡  dispatch --target civic:new ...
+    dispatch palace ...       ≡  dispatch --target palace:new ...
+    dispatch somnium ...      ≡  dispatch --target somnium:new ...
 
 Options:
   --engine claude|codex        Agent engine (default: claude)
@@ -86,8 +88,9 @@ Options:
   --prompt-file <path>         Read initial prompt from file
   --system-prompt <text>       Append a Claude system prompt
   --system-prompt-file <path>  Read appended Claude system prompt from file
-  --target <target>            mechanicus:new, mechanicus:new, or a tmux pane id
+  --target <target>            mechanicus:new, palace:new, or a tmux pane id
   --pane <target|self>         Alias for --target; with --id, pane to resume into
+  --self                       Explicit same-pane self handoff/transplant launch
   --gt | --no-gt               Golden Throne lane toggle (default: --no-gt)
   --zealotry <1-10>            Zealotry (default: 5 with --gt, 3 with --no-gt)
   --sync                       Sync-session lane
@@ -155,14 +158,20 @@ NO_WORKTREE=false
 WORKTREE_BRANCH=""
 DRY_RUN=false
 INTERACTIVE=false
+DISPATCH_SELF=false
 DISPATCH_AUTO_EXPANDED_PANE=""
 DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
 
 # Positional target shorthand: `dispatch legion ...` ≡ `dispatch --target mechanicus:new ...`
-# (same for mechanicus, civic). Only the leading token is consumed so a prompt word
-# like "legion" is never swallowed. An explicit --target later still wins.
+# (same for mechanicus/civic and fixed prealloc pages palace/somnium). Only the
+# leading token is consumed so a prompt word like "legion" is never swallowed.
+# An explicit --target later still wins.
 case "${1:-}" in
-  legion|mechanicus|civic)
+  legion|mechanicus)
+    TARGET="mechanicus:new"
+    shift
+    ;;
+  civic|palace|somnium)
     TARGET="$1:new"
     shift
     ;;
@@ -201,6 +210,7 @@ while [[ $# -gt 0 ]]; do
     --system-prompt) SYSTEM_PROMPT="${2:-}"; SYSTEM_PROMPT_INLINE_USED=true; shift 2 ;;
     --system-prompt-file) SYSTEM_PROMPT_FILE="${2:-}"; shift 2 ;;
     --target|--pane) TARGET="${2:-}"; shift 2 ;;
+    --self) DISPATCH_SELF=true; TARGET="self"; shift ;;
     --gt) GT_MODE=true; shift ;;
     --no-gt) GT_MODE=false; shift ;;
     --zealotry) ZEALOTRY="${2:-}"; shift 2 ;;
@@ -353,6 +363,11 @@ resolve_caller_instance_id() {
   # tmuxctld ledger is the runtime oracle. Prefer wrapper_id because plan-cycle
   # re-execs churn engine session ids while the wrapper process persists.
   row="$(ledger_resolve_field wrapper_id "${TOKEN_API_WRAPPER_ID:-${TOKEN_API_WRAPPER_LAUNCH_ID:-}}" instance_id || true)"
+  [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
+  # TOKEN_API_INSTANCE_ID identifies the dispatcher. It is never forwarded as the
+  # child's own instance id, but it is valid commander-edge input when no ledger
+  # lookup is available (for example hermetic tests or hooks with stripped tmux).
+  row="${TOKEN_API_INSTANCE_ID:-${INSTANCE_ID:-}}"
   [[ -n "$row" ]] && { printf '%s' "$row"; return 0; }
   if [[ -n "${TMUX_PANE:-}" ]]; then
     row="$(pane_instance_id "$TMUX_PANE" || true)"
@@ -1896,10 +1911,14 @@ if [[ ${#MCP_REQUESTS[@]} -gt 0 ]]; then
 fi
 
 AUTO_PARENT_INSTANCE_ID=""
-# Caller-pane identity is intentionally NOT auto-resolved here. A singleton pane
-# launching a worker must not leak its instance/persona through TMUX_PANE,
-# TOKEN_API_INSTANCE_ID, TOKEN_API_PARENT_INSTANCE_ID, or TOKEN_API_PERSONA.
-# Add a dispatch CLI flag later if trusted orchestrators need explicit parentage.
+# Resolve the dispatcher only as a commander edge. This is control/parentage,
+# not identity inheritance: the child still receives a fresh wrapper id and the
+# inherited identity/persona env is scrubbed below. Never trust an inherited
+# TOKEN_API_PARENT_INSTANCE_ID here; that names the caller's commander, not the
+# caller.
+if ! $DISPATCH_SELF; then
+  AUTO_PARENT_INSTANCE_ID="$(resolve_caller_instance_id || true)"
+fi
 
 # A dispatched worker is always a NEW wrapper launch, so it must mint its OWN
 # wrapper_id — never inherit the dispatching agent's. token-api SessionStart
@@ -1929,6 +1948,9 @@ COMMON_ENV=(
   "TOKEN_API_DISPATCH_WITH_DESKTOP=${WITH_DESKTOP}"
   "TOKEN_API_DISPATCH_MCP_LIST=${WITH_MCP}"
 )
+if $DISPATCH_SELF; then
+  COMMON_ENV+=("TOKEN_API_TRANSPLANT_EXPECTED=true")
+fi
 [[ -n "$CODEX_PROFILE" ]] && COMMON_ENV+=("TOKEN_API_CODEX_PROFILE=${CODEX_PROFILE}")
 [[ -n "$CLAUDE_MODEL" ]] && COMMON_ENV+=("TOKEN_API_CLAUDE_MODEL=${CLAUDE_MODEL}")
 # ``--persona mechanicus`` is the worker prompt/behavior coat for the mechanicus
@@ -2084,9 +2106,21 @@ build_agent_command() {
     [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
   printf 'cd %q && env' "$WORK_DIR"
-  local scrub_var
+  local scrub_var alt_scrub_var
   for scrub_var in "${DISPATCH_INHERITED_ENV_SCRUB[@]}"; do
+    alt_scrub_var=""
+    case "$scrub_var" in
+      TOKEN_API_*) alt_scrub_var="${scrub_var#TOKEN_API_}" ;;
+      *) alt_scrub_var="TOKEN_API_${scrub_var}" ;;
+    esac
+    # Keep launch commands readable while still scrubbing real inherited state.
+    # If either TOKEN_API_* or its legacy alias is present, unset both spellings
+    # so a wrapper/helper cannot fall through to the surviving alias.
+    if [[ -z "${!scrub_var+x}" ]]; then
+      [[ -n "$alt_scrub_var" && -n "${!alt_scrub_var+x}" ]] || continue
+    fi
     printf ' -u %q' "$scrub_var"
+    [[ -n "$alt_scrub_var" ]] && printf ' -u %q' "$alt_scrub_var"
   done
   printf ' TOKEN_API_INTERNAL_DISPATCH=1'
   local e
@@ -2414,7 +2448,7 @@ build_dispatch_command() {
   [[ -n "$WORKTREE_BRANCH" ]] && args+=(--worktree "$WORKTREE_BRANCH")
   if [[ -z "$RESUME_ID" ]]; then
     [[ -n "$SESSION_DOC" ]] && args+=(--session-doc "$SESSION_DOC")
-    [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
+    if $DISPATCH_SELF; then args+=(--self); elif [[ -n "$TARGET" ]]; then args+=(--target "$TARGET"); fi
   fi
   if [[ -n "$INSTANCE_TYPE_OVERRIDE" ]]; then args+=(--instance-type "$INSTANCE_TYPE_OVERRIDE"); elif $SYNC; then args+=(--sync); elif $GT_MODE; then args+=(--gt); else args+=(--no-gt); fi
   args+=(--zealotry "$ZEALOTRY")

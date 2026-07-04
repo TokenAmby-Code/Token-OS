@@ -769,20 +769,13 @@ async def _apply_commander_binding(
         )
         parent = await cursor.fetchone()
         if parent:
-            cursor = await db.execute(
-                "SELECT persona_id FROM instances WHERE id = ?",
-                (instance_id,),
-            )
-            child = await cursor.fetchone()
             updates = {
                 "commander_type": "chapter",
                 "commander_id": parent[0],
             }
-            # Parent binding is control, not identity.  Do not overwrite a persona
-            # already resolved from the launch env / dispatch context; inherit the
-            # parent's persona only for truly persona-less rows.
-            if child is not None and child[0] is None:
-                updates["persona_id"] = parent[1]
+            # Parent binding is control, not identity. Default dispatch must never
+            # copy the dispatcher's persona onto a worker; a persona-less child
+            # remains persona-less rather than becoming a commander clone.
             await update_instance_record(
                 db,
                 instance_id=instance_id,
@@ -4175,6 +4168,7 @@ async def handle_session_start(payload: dict) -> dict:
         # (primarch=pax/orchestrator).
         if auto_legion:
             legion_updates = {}
+            auto_persona_row = None
             if auto_legion != "civic":
                 # Persona panes bind persona_id by primarch, not legion: a seat in
                 # a shared legion (Malcador in astartes, Administratum in
