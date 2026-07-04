@@ -27,13 +27,18 @@ SESSION="main"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 TMUXCTL_LIB="${REPO_ROOT}/tmuxctld/lib"
-PROTECTED_SINGLETON_LABELS="$(
+PROTECTED_SINGLETON_LABELS=""
+
+load_protected_singleton_labels() {
+    [[ -n "$PROTECTED_SINGLETON_LABELS" ]] && return 0
+    PROTECTED_SINGLETON_LABELS="$(
     PYTHONPATH="${TMUXCTL_LIB}${PYTHONPATH:+:${PYTHONPATH}}" python3 - <<'PY'
 from tmuxctl.singleton_labels import PERSONA_SINGLETON_LABELS
 
 print("\n".join(sorted(PERSONA_SINGLETON_LABELS)))
 PY
 )"
+}
 
 # --- Args ---
 FORCE=false
@@ -82,6 +87,7 @@ fi
 # ============================================================
 assert_backburner() {
     local IDLE_SHELLS="bash zsh sh fish"
+    load_protected_singleton_labels
 
     is_idle_shell() {
         local cmd="$1"
