@@ -28,6 +28,7 @@ import re
 import time
 from collections.abc import Iterable
 
+from . import send_gate
 from .api import fetch_instance_rows_raw, rebind_instance_pane
 from .labels import canonical_pane_role
 from .tmux_adapter import TmuxAdapter, TmuxError
@@ -282,8 +283,19 @@ def dispatch_stack_command(
                     enforce_stack_layout(adapter, target, focused_pane=pane, focus=True)
         if settle_seconds > 0:
             time.sleep(settle_seconds)
-        # Gated send: send_keys routes through TmuxAdapter.run()'s universal gate.
-        adapter.send_keys(pane, command, "Enter")
+        # The pane was just born by this dispatch transaction.  Do not let the
+        # generic send gate delay this bootstrap write behind unrelated human
+        # locks: if the HTTP caller gives up first, tmuxctld can later release a
+        # stale warmup/launcher into a now-orphaned bare shell.  A newborn stack
+        # pane has no human draft to protect, so this infrastructure bootstrap
+        # send uses a scoped daemon-local override and cleans up the pane on any
+        # send failure instead of leaving a blank worker behind.
+        try:
+            with send_gate.thread_local_override("tmuxctl-stack-dispatch-newborn"):
+                adapter.send_keys(pane, command, "Enter")
+        except Exception:
+            adapter.run("kill-pane", "-t", pane, allow_failure=True)
+            raise
         return pane
 
 

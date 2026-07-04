@@ -1543,6 +1543,75 @@ def test_dispatch_prealloc_new_uses_greedy_first_free_without_stack_spawn(tmp_pa
     assert "TOKEN_API_DISPATCH_RESOLVED_PANE=palace:new" not in staged
 
 
+def test_dispatch_stack_dispatch_has_no_hard_60s_transport_ceiling(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ping_log = tmp_path / "tmuxctld-ping.log"
+    tmux_log = tmp_path / "tmux.log"
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'method="${1:-}"; path="${2:-}"; shift 2 || true\n'
+        f'printf \'%s %s max=%s\\n\' "$method" "$path" "${{TMUXCTLD_MAX_TIME:-unset}}" >> {ping_log}\n'
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "GET /resolve-pane"|"POST /resolve-pane") printf \'{"ok":true,"result":"%%77"}\' ;;\n'
+        '  "POST /send-text") printf \'{"ok":true,"result":{"delivery":"confirmed"}}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /live-agents") printf \'{"ok":true,"result":""}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {tmux_log}\n"
+        'if [[ "$1" == "display-message" ]]; then printf "%%77\\n"; exit 0; fi\n'
+        'if [[ "$1" == "show-options" ]]; then printf "mechanicus:2\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env.pop("TMUXCTLD_MAX_TIME", None)
+    env.pop("TMUXCTLD_STACK_DISPATCH_MAX_TIME", None)
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log = ping_log.read_text(encoding="utf-8")
+    assert "POST /stack/dispatch max=0" in log
+    assert "POST /stack/dispatch max=60" not in log
+    assert "POST /send-text max=60" in log
+
+
 def test_dispatch_stack_new_bakes_concrete_pane_into_launch_env(tmp_path):
     """A :new stack launch must register the concrete pane the agent lands in.
 

@@ -1540,16 +1540,29 @@ if [[ -n "$RESUME_ID" ]]; then
   fi
 fi
 
+tmuxctld_result_max_time() {
+  # curl max-time is a transport budget, not the dispatch protocol bound.  The
+  # stack allocator must be allowed to return its real daemon verdict: aborting
+  # POST /stack/dispatch at an arbitrary 60s client ceiling leaves the daemon
+  # thread free to finish later, after the caller has abandoned the pane.  Other
+  # routes keep the legacy 60s transport budget unless explicitly overridden.
+  case "${1:-} ${2:-}" in
+    "POST /stack/dispatch") printf '%s' "${TMUXCTLD_STACK_DISPATCH_MAX_TIME:-0}" ;;
+    *) printf '%s' "${TMUXCTLD_MAX_TIME:-60}" ;;
+  esac
+}
+
 tmuxctld_result() {
   # Return the tmuxctld {ok:true,result:...} payload as a shell scalar/JSON.
   # This is dispatch's daemon-native replacement for cold `tmuxctl` subprocesses
   # on the launch path. tmuxctld-ping owns transport; dispatch only unwraps the
   # standard envelope so it can learn the newly allocated canonical pane id.
-  local response
+  local response max_time
   if ! command -v tmuxctld-ping >/dev/null 2>&1; then
     return 127
   fi
-  response="$(TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-60}" tmuxctld-ping "$@")" || return $?
+  max_time="$(tmuxctld_result_max_time "$@")"
+  response="$(TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="$max_time" tmuxctld-ping "$@")" || return $?
   TMUXCTLD_RESPONSE="$response" python3 - <<'PY'
 import json
 import os
@@ -2101,8 +2114,8 @@ dispatch_send_text_via_tmuxctld() {
     err "tmuxctld-ping is required to send dispatch launch commands to $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
     return 69
   fi
-  # Route through tmuxctld_result (60s ceiling + envelope unwrap), NOT raw
-  # tmuxctld-ping with its 3s --max-time default. A launch/prompt send can
+  # Route through tmuxctld_result (envelope unwrap + route-specific transport
+  # budget), NOT raw tmuxctld-ping with its 3s --max-time default. A launch/prompt send can
   # legitimately take tens of seconds (daemon resolver + occupancy + guard hold +
   # tmux round-trips), or minutes when the target agent is mid-tool-call. The old
   # 3s fast-fail returned curl rc28 and printed "tmuxctld send failed" on a

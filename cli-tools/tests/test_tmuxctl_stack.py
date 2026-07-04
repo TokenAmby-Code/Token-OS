@@ -285,6 +285,73 @@ def test_stack_dispatch_creates_managed_worker_and_launches_command():
     assert ("send-keys", "-t", "%N", "echo hello", "Enter") in adapter.commands
 
 
+def test_stack_dispatch_newborn_send_uses_scoped_override(monkeypatch):
+    import tmuxctl.stack as stackmod
+
+    adapter = FakeLegionAdapter(
+        rows=[
+            "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ]
+    )
+    reasons: list[str] = []
+
+    class Override:
+        def __init__(self, reason: str) -> None:
+            self.reason = reason
+
+        def __enter__(self):
+            reasons.append(self.reason)
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        stackmod.send_gate,
+        "thread_local_override",
+        lambda reason: Override(reason),
+    )
+
+    dispatch_stack_command(  # type: ignore[arg-type]
+        adapter,
+        "main",
+        "mechanicus",
+        "clear",
+        cwd="/tmp",
+        focus=False,
+        settle_seconds=0,
+    )
+
+    assert reasons == ["tmuxctl-stack-dispatch-newborn"]
+    assert ("send-keys", "-t", "%N", "clear", "Enter") in adapter.commands
+
+
+def test_stack_dispatch_kills_newborn_pane_when_bootstrap_send_fails():
+    class FailingSendAdapter(FakeLegionAdapter):
+        def send_keys(self, target: str, *keys: str, allow_failure: bool = False) -> None:
+            self.commands.append(("send-keys", "-t", target, *keys))
+            raise RuntimeError("send gate failed")
+
+    adapter = FailingSendAdapter(
+        rows=[
+            "%C\tmechanicus:fabricator-general\tmechanicus\t1\t0\t0\t80\t50\tclaude\tfalse",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="send gate failed"):
+        dispatch_stack_command(  # type: ignore[arg-type]
+            adapter,
+            "main",
+            "mechanicus",
+            "clear",
+            cwd="/tmp",
+            focus=False,
+            settle_seconds=0,
+        )
+
+    assert ("kill-pane", "-t", "%N") in adapter.commands
+    assert not any(row.startswith("%N\t") for row in adapter.rows or [])
+
+
 def test_stack_enforce_preserves_existing_numeric_worker_ids_with_gap():
     adapter = FakeLegionAdapter(
         rows=[
