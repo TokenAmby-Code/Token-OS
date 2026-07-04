@@ -24,6 +24,29 @@ set -eo pipefail
 STAMP_FILE="${TMUX_AUDIT_STAMP_FILE:-/tmp/.tmux-audit-last-run}"
 DEBOUNCE_SECONDS=5
 SESSION="main"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+TMUXCTL_LIB="${REPO_ROOT}/tmuxctld/lib"
+PROTECTED_SINGLETON_LABELS=""
+PROTECTED_SINGLETON_LABELS_LOAD_FAILED=false
+
+load_protected_singleton_labels() {
+    [[ -n "$PROTECTED_SINGLETON_LABELS" ]] && return 0
+    local labels
+    if labels="$(
+        PYTHONPATH="${TMUXCTL_LIB}${PYTHONPATH:+:${PYTHONPATH}}" python3 - <<'PY'
+from tmuxctl.singleton_labels import PERSONA_SINGLETON_LABELS
+
+print("\n".join(sorted(PERSONA_SINGLETON_LABELS)))
+PY
+    )"; then
+        PROTECTED_SINGLETON_LABELS="$labels"
+        return 0
+    fi
+    PROTECTED_SINGLETON_LABELS_LOAD_FAILED=true
+    echo "tmux-audit: failed to load canonical singleton labels; skipping idle cull" >&2
+    return 0
+}
 
 # --- Args ---
 FORCE=false
@@ -72,6 +95,7 @@ fi
 # ============================================================
 assert_backburner() {
     local IDLE_SHELLS="bash zsh sh fish"
+    load_protected_singleton_labels
 
     is_idle_shell() {
         local cmd="$1"
@@ -83,15 +107,15 @@ assert_backburner() {
 
     # Static persona/orchestrator slots that must NEVER be culled, regardless of
     # whether they happen to be sitting at an idle shell prompt (Custodes and the
-    # Fabricator-General routinely do).
+    # Fabricator-General routinely do). Protected labels come from the canonical
+    # tmuxctl singleton list; do not derive this from advisor semantics.
     is_protected_slot() {
         local ptype="$1" label="$2"
         case "$ptype" in
             mechanicus|council|tombstone) return 0 ;;
         esac
-        case "$label" in
-            council:custodes|mechanicus:fabricator-general|mechanicus:orchestrator) return 0 ;;
-        esac
+        [[ "$PROTECTED_SINGLETON_LABELS_LOAD_FAILED" == "true" ]] && return 0
+        grep -Fxq -- "$label" <<< "$PROTECTED_SINGLETON_LABELS" && return 0
         return 1
     }
 

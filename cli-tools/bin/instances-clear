@@ -16,11 +16,20 @@ Examples:
 """
 
 import os
-import sys
-import json
 import sqlite3
-from pathlib import Path
+import sys
 from datetime import datetime
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TMUXCTL_LIB = REPO_ROOT / "tmuxctld" / "lib"
+if str(TMUXCTL_LIB) not in sys.path:
+    sys.path.insert(0, str(TMUXCTL_LIB))
+
+from tmuxctl.singleton_labels import (  # noqa: E402
+    PERSONA_SINGLETON_LABELS,
+    is_persona_singleton_label,
+)
 
 LEGACY_AGENTS_DB = (Path.home() / ".claude" / "agents.db").resolve()
 
@@ -40,8 +49,8 @@ DB_PATH = Path(
 ).expanduser()
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
-# Persona singleton rows are the canonical DB identity of the orchestrator panes
-# (custodes / Fabricator-General / Administratum). They are resolved by the
+# Persona singleton rows are the canonical DB identity of the protected singleton
+# panes. They are resolved by the
 # state-hook dispatcher (e.g. `_resolve_administratum_instance` keys on
 # `persona_id/slug='administratum'`) and reactivated in-place by the tmuxctl persona
 # watchdog when their pane goes idle. Hard-deleting a *stopped* persona row
@@ -49,18 +58,13 @@ API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 # could no longer reactivate it, fell back to re-injecting `/persona <name>`
 # (a no-op for singleton panes), and span that correction every ~5 min forever.
 # So: never auto-clear a persona row — preserve it for reactivation.
-PERSONA_SLUGS = {"custodes", "fabricator-general", "administratum"}
-PERSONA_PANE_LABELS = {
-    "council:custodes",
-    "mechanicus:fabricator-general",
-    "council:administratum",
-}
+PERSONA_SLUGS = {label.rsplit(":", 1)[-1] for label in PERSONA_SINGLETON_LABELS}
 
 def _is_persona_row(inst: dict) -> bool:
     """True when the row is an orchestrator-persona singleton (never auto-clear)."""
     return (
         (inst.get("persona_slug") or "") in PERSONA_SLUGS
-        or (inst.get("pane_label") or "") in PERSONA_PANE_LABELS
+        or is_persona_singleton_label(inst.get("pane_label"))
     )
 
 def get_instances(include_active: bool = False) -> tuple[list[dict[str, object]], int]:
@@ -114,7 +118,7 @@ def format_instance(inst: dict) -> str:
         try:
             dt = datetime.fromisoformat(stopped_at.replace("Z", "+00:00"))
             time_str = f" (stopped {dt.strftime('%m/%d %H:%M')})"
-        except:
+        except Exception:
             pass
 
     status_icon = "\033[0;31m●\033[0m" if status == "stopped" else "\033[0;32m●\033[0m"

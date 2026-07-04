@@ -3,8 +3,14 @@ from __future__ import annotations
 import os
 import pathlib
 import subprocess
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+REPO_ROOT = ROOT.parent
+sys.path.insert(0, str(REPO_ROOT / "tmuxctld" / "lib"))
+
+from tmuxctl.singleton_labels import PERSONA_SINGLETON_LABELS  # noqa: E402
+
 AUDIT = ROOT / "bin" / "tmux-audit"
 
 # list-panes -F is "#{pane_id}\t#{pane_current_command}\t#{@PANE_TYPE}\t#{@PANE_ID}"
@@ -37,7 +43,7 @@ esac
 """
 
 
-def _run_backburner(tmp_path: pathlib.Path) -> list[str]:
+def _run_backburner(tmp_path: pathlib.Path, stack_rows: str = STACK_ROWS) -> list[str]:
     fake_dir = tmp_path / "bin"
     fake_dir.mkdir()
     fake_tmux = fake_dir / "tmux"
@@ -49,7 +55,7 @@ def _run_backburner(tmp_path: pathlib.Path) -> list[str]:
 
     env = dict(os.environ)
     env["PATH"] = f"{fake_dir}:{env['PATH']}"
-    env["STACK_ROWS"] = STACK_ROWS
+    env["STACK_ROWS"] = stack_rows
     env["KILL_LOG"] = str(kill_log)
     # Keep the audit's debounce stamp out of the shared /tmp location.
     env["TMUX_AUDIT_STAMP_FILE"] = str(stamp)
@@ -79,3 +85,22 @@ def test_backburner_still_reaps_blank_pending_stack_workers(tmp_path):
     killed = _run_backburner(tmp_path)
 
     assert "%idle" in killed
+
+
+def test_backburner_preserves_all_canonical_singleton_labels_and_reaps_ordinary(tmp_path):
+    protected_rows = [
+        f"%protected{i}\tzsh\tstack-worker\t{label}"
+        for i, label in enumerate(sorted(PERSONA_SINGLETON_LABELS), start=1)
+    ]
+    stack_rows = "\n".join(
+        [
+            *protected_rows,
+            "%ordinary\tzsh\tstack-worker\tmechanicus:42",
+        ]
+    )
+
+    killed = _run_backburner(tmp_path, stack_rows=stack_rows)
+
+    assert "%ordinary" in killed
+    for i, _label in enumerate(sorted(PERSONA_SINGLETON_LABELS), start=1):
+        assert f"%protected{i}" not in killed
