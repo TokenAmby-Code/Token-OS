@@ -86,6 +86,14 @@ export const PERSONA_ICON = {
   novamarines: 'beveled-star',
   minotaurs: 'minotaur',
   exorcists: 'daemon-skull',
+  'doom-eagles': 'eagle-emblem',
+  'celestial-lions': 'lion',
+  'death-spectres': 'ghost',
+  'storm-wardens': 'crossed-swords',
+  'sons-of-medusa': 'medusa-head',
+  lamenters: 'tear-tracks',
+  'hawk-lords': 'hawk-emblem',
+  'black-consuls': 'eagle-head',
 } satisfies Record<string, string>;
 
 // The union of every persona key the registry knows — lets callers (e.g. the

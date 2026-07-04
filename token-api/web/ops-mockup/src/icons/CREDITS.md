@@ -91,9 +91,18 @@ No other modification was made to the path geometry.
 | `stamper.svg` | [Delapouite](https://delapouite.com/) | [stamper](https://game-icons.net/1x1/delapouite/stamper.html) | Administratum (stamp) - available |
 | `tied-scroll.svg` | [Lorc](https://lorcblog.blogspot.com/) | [tied-scroll](https://game-icons.net/1x1/lorc/tied-scroll.html) | Administratum (sealed scroll) - available |
 | `wax-seal.svg` | [Lorc](https://lorcblog.blogspot.com/) | [wax-seal](https://game-icons.net/1x1/lorc/wax-seal.html) | Administratum (wax seal) - available |
+| `eagle-emblem.svg` | [Lorc](https://lorcblog.blogspot.com/) | [eagle-emblem](https://game-icons.net/1x1/lorc/eagle-emblem.html) | Doom Eagles |
+| `lion.svg` | [Lorc](https://lorcblog.blogspot.com/) | [lion](https://game-icons.net/1x1/lorc/lion.html) | Celestial Lions |
+| `ghost.svg` | [Lorc](https://lorcblog.blogspot.com/) | [ghost](https://game-icons.net/1x1/lorc/ghost.html) | Death Spectres |
+| `crossed-swords.svg` | [Lorc](https://lorcblog.blogspot.com/) | [crossed-swords](https://game-icons.net/1x1/lorc/crossed-swords.html) | Storm Wardens |
+| `medusa-head.svg` | [Cathelineau](https://game-icons.net/) | [medusa-head](https://game-icons.net/1x1/cathelineau/medusa-head.html) | Sons of Medusa |
+| `tear-tracks.svg` | [Lorc](https://lorcblog.blogspot.com/) | [tear-tracks](https://game-icons.net/1x1/lorc/tear-tracks.html) | Lamenters |
+| `hawk-emblem.svg` | [Lorc](https://lorcblog.blogspot.com/) | [hawk-emblem](https://game-icons.net/1x1/lorc/hawk-emblem.html) | Hawk Lords |
+| `eagle-head.svg` | [Delapouite](https://delapouite.com/) | [eagle-head](https://game-icons.net/1x1/delapouite/eagle-head.html) | Black Consuls |
 
 ## Authors
 
+- **Cathelineau** — https://game-icons.net/
 - **Delapouite** — https://delapouite.com/
 - **Lorc** — https://lorcblog.blogspot.com/
 - **Skoll** — https://game-icons.net/
