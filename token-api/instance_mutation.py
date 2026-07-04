@@ -119,20 +119,18 @@ async def _prepare_chapter_commander(db, values: dict) -> dict:
     if values.get("commander_type") != "chapter" or not values.get("commander_id"):
         return values
     commander_id = values["commander_id"]
-    cursor = await db.execute("SELECT persona_id FROM instances WHERE id = ?", (commander_id,))
+    cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (commander_id,))
     commander = await cursor.fetchone()
     if commander:
-        # A chapter edge conveys control, not identity.  Preserve an already
-        # resolved worker persona (from TOKEN_API_PERSONA / TOKEN_API_LEGION /
-        # dispatch context); inherit the commander's persona only as the legacy
-        # fallback for rows that arrived with no persona at all.
-        if values.get("persona_id") is None:
-            values["persona_id"] = commander[0]
-    else:
-        # A chapter edge must point at a live commander row in `instances`
-        # (the legacy legacy instance table fallback died with the extraction).
-        values["commander_type"] = "emperor"
-        values["commander_id"] = None
+        # A chapter edge conveys control, not identity. Default dispatch must
+        # never mint a worker as a clone of the dispatching/caller persona; even
+        # persona-less rows remain persona-less for the normal worker allocator /
+        # later reconciliation to handle.
+        return values
+    # A chapter edge must point at a live commander row in `instances`
+    # (the legacy legacy instance table fallback died with the extraction).
+    values["commander_type"] = "emperor"
+    values["commander_id"] = None
     return values
 
 
@@ -140,18 +138,13 @@ def _prepare_chapter_commander_sync(db, values: dict) -> dict:
     if values.get("commander_type") != "chapter" or not values.get("commander_id"):
         return values
     commander_id = values["commander_id"]
-    commander = db.execute(
-        "SELECT persona_id FROM instances WHERE id = ?", (commander_id,)
-    ).fetchone()
+    commander = db.execute("SELECT id FROM instances WHERE id = ?", (commander_id,)).fetchone()
     if commander:
-        # A chapter edge conveys control, not identity.  Preserve an already
-        # resolved worker persona; inherit the commander's persona only as the
-        # fallback for rows that arrived with no persona at all.
-        if values.get("persona_id") is None:
-            values["persona_id"] = commander[0]
-    else:
-        values["commander_type"] = "emperor"
-        values["commander_id"] = None
+        # A chapter edge conveys control, not identity. Default dispatch must
+        # never mint a worker as a clone of the dispatching/caller persona.
+        return values
+    values["commander_type"] = "emperor"
+    values["commander_id"] = None
     return values
 
 

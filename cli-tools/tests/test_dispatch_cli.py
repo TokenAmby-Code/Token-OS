@@ -122,7 +122,7 @@ def test_dispatch_claude_model_dry_run_forwards_to_wrapper():
 
 
 def test_dispatch_legion_shorthand_maps_to_target(tmp_path):
-    for keyword in ("legion", "mechanicus", "civic"):
+    for keyword in ("legion", "mechanicus", "civic", "palace", "somnium"):
         result = subprocess.run(
             [str(DISPATCH), keyword, "--dry-run", "--direct", "--dir", str(ROOT), "work"],
             capture_output=True,
@@ -1422,6 +1422,85 @@ def test_dispatch_does_not_inherit_dispatcher_legion_into_worker() -> None:
     assert "TOKEN_API_PERSONA=custodes" not in result.stdout, result.stdout
 
 
+def test_dispatch_palace_shorthand_detaches_and_carries_commander_not_persona() -> None:
+    """Custodes-style `dispatch palace ...` must mean palace:new, not inline self.
+
+    The parent instance id is allowed through only as a commander edge. Persona,
+    legion, session, and own-instance identity from the caller remain scrubbed so
+    the child cannot become a Custodes clone.
+    """
+    env = os.environ.copy()
+    env.update(
+        {
+            "TOKEN_API_INSTANCE_ID": "custodes-live-id",
+            "TOKEN_API_PARENT_INSTANCE_ID": "emperor-or-old-parent",
+            "TOKEN_API_LEGION": "custodes",
+            "TOKEN_API_PERSONA": "custodes",
+            "TOKEN_API_SESSION_DOC_ID": "custodes-doc",
+            "TOKEN_API_INSTANCE_NAME": "custodes",
+            "TOKEN_API_WRAPPER_ID": "",
+            "TOKEN_API_WRAPPER_LAUNCH_ID": "",
+            "TMUX_PANE": "",
+        }
+    )
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "palace",
+            "--dry-run",
+            "--direct",
+            "--dir",
+            str(ROOT),
+            "--prompt",
+            "worker task",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "target:          palace:new" in result.stdout
+    assert "launch_mode:     " not in result.stdout
+    assert "TOKEN_API_DISPATCH_TARGET=palace:new" in result.stdout
+    assert "TOKEN_API_PARENT_INSTANCE_ID=custodes-live-id" in result.stdout
+    assert "TOKEN_API_PARENT_INSTANCE_ID=emperor-or-old-parent" not in result.stdout
+    assert "TOKEN_API_PERSONA=custodes" not in result.stdout
+    assert "TOKEN_API_LEGION=custodes" not in result.stdout
+    assert "-u TOKEN_API_INSTANCE_ID" in result.stdout
+    assert "-u TOKEN_API_PERSONA" in result.stdout
+
+
+def test_dispatch_self_is_explicit_transplant_boundary() -> None:
+    env = os.environ.copy()
+    env["TOKEN_API_INSTANCE_ID"] = "caller-instance-id"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--dry-run",
+            "--direct",
+            "--self",
+            "--dir",
+            str(ROOT),
+            "--prompt",
+            "continue here",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "target:          self" in result.stdout
+    assert "--self" in result.stdout
+    assert "TOKEN_API_TRANSPLANT_EXPECTED=true" in result.stdout
+    assert "TOKEN_API_PARENT_INSTANCE_ID=caller-instance-id" not in result.stdout
+
+
 def test_dispatch_target_dry_run_carries_canonical_without_physical(tmp_path):
     """The dry-run carries the canonical working id verbatim and never leaks physical.
 
@@ -1917,6 +1996,8 @@ def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Pa
             "TOKEN_API_INSTANCE_NAME": "fabricator-general",
             "INSTANCE_NAME": "fabricator-general",
             "TOKEN_API_DISPLAY_NAME": "Fabricator-General",
+            "TOKEN_API_WRAPPER_ID": "",
+            "TOKEN_API_WRAPPER_LAUNCH_ID": "",
         }
     )
 
@@ -1940,7 +2021,9 @@ def test_dispatch_singleton_caller_identity_not_grafted_onto_worker(tmp_path: Pa
     )
 
     assert result.returncode == 0, result.stderr
-    assert "TOKEN_API_PARENT_INSTANCE_ID=fabricator-general-live-id" not in result.stdout
+    # The caller instance may be forwarded only as a commander edge. It must not
+    # carry the caller's own persona/legion/session/name into the child.
+    assert "TOKEN_API_PARENT_INSTANCE_ID=fabricator-general-live-id" in result.stdout
     assert "TOKEN_API_PERSONA=fabricator-general" not in result.stdout
     assert "TOKEN_API_LEGION=mechanicus" not in result.stdout
     assert "TOKEN_API_SESSION_DOC_ID=2058" not in result.stdout

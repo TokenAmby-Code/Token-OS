@@ -7,6 +7,7 @@ explicit worker persona and turn a worker into a singleton identity shadow.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import sys
@@ -114,7 +115,7 @@ def test_chapter_insert_preserves_explicit_worker_persona_and_singleton(app_env)
     assert fg["status"] == "working"
 
 
-def test_chapter_insert_falls_back_to_commander_persona_when_worker_has_none(app_env):
+def test_chapter_insert_never_clones_commander_persona_when_worker_has_none(app_env):
     from instance_mutation import insert_instance_sync
 
     conn = _conn(app_env.db_path)
@@ -149,10 +150,163 @@ def test_chapter_insert_falls_back_to_commander_persona_when_worker_has_none(app
     fg = _identity_row(conn, "fg-overseer")
     conn.close()
 
-    assert worker["persona_slug"] == "fabricator-general"
+    assert worker["persona_slug"] is None
     assert (worker["commander_type"], worker["commander_id"]) == ("chapter", "fg-overseer")
     assert fg["rank"] == "overseer"
     assert fg["status"] == "working"
+
+
+def test_session_start_parent_binding_does_not_clone_custodes_without_explicit_persona(
+    app_env, monkeypatch
+) -> None:
+    """Full hook path: parent edge is commander control, never persona inheritance."""
+
+    hooks = sys.modules["routes.hooks"]
+
+    conn = _conn(app_env.db_path)
+    _seed_instance(conn, "custodes-commander", persona_slug="custodes", rank="overseer")
+    conn.commit()
+    conn.close()
+
+    async def no_label(_pane):
+        return None
+
+    async def no_stamp(*_args, **_kwargs):
+        return None
+
+    async def no_pane_occupant(_pane):
+        return None
+
+    monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
+    monkeypatch.setattr(hooks, "_stamp_instance_id", no_stamp)
+    monkeypatch.setattr(hooks.shared, "instance_id_for_pane", no_pane_occupant)
+
+    async def run():
+        return await hooks.handle_session_start(
+            {
+                "session_id": "palace-worker",
+                "cwd": "/tmp",
+                "env": {
+                    "TMUX_PANE": "%dispatch-test",
+                    "TOKEN_API_ENGINE": "claude",
+                    "TOKEN_API_LAUNCHER": "dispatch",
+                    "TOKEN_API_DISPATCH_TARGET": "palace:new",
+                    "TOKEN_API_PARENT_INSTANCE_ID": "custodes-commander",
+                },
+            }
+        )
+
+    result = asyncio.run(run())
+    assert result["success"] is True
+
+    conn = _conn(app_env.db_path)
+    worker = _identity_row(conn, "palace-worker")
+    custodes = _identity_row(conn, "custodes-commander")
+    conn.close()
+
+    assert worker["persona_slug"] != "custodes"
+    assert (worker["commander_type"], worker["commander_id"]) == (
+        "chapter",
+        "custodes-commander",
+    )
+    assert custodes["persona_slug"] == "custodes"
+    assert custodes["status"] == "working"
+
+
+def test_custodes_commanded_palace_worker_stop_echoes_without_persona_clone(
+    app_env, monkeypatch
+) -> None:
+    """Start + Stop hook path: distinct palace worker echoes to Custodes commander."""
+
+    hooks = sys.modules["routes.hooks"]
+
+    conn = _conn(app_env.db_path)
+    _seed_instance(conn, "custodes-commander", persona_slug="custodes", rank="overseer")
+    conn.commit()
+    conn.close()
+
+    async def no_label(_pane):
+        return None
+
+    async def no_stamp(*_args, **_kwargs):
+        return None
+
+    async def no_pane_occupant(_pane):
+        return None
+
+    async def fake_resolve_instance_pane(instance_id):
+        mapping = {
+            "custodes-commander": ("%custodes-pane", "council:custodes"),
+            "palace-worker": ("%palace-worker", "palace:W"),
+        }
+        return mapping.get(instance_id, (None, None))
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_write(pane, payload):
+        sent.append((pane, payload))
+        return {"status": "sent", "operation": "fake"}
+
+    monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
+    monkeypatch.setattr(hooks, "_stamp_instance_id", no_stamp)
+    monkeypatch.setattr(hooks.shared, "instance_id_for_pane", no_pane_occupant)
+    monkeypatch.setattr(hooks.shared, "resolve_instance_pane", fake_resolve_instance_pane)
+    monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
+
+    tail = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "PALACE_WORKER_STOP_ECHO_OK"},
+                ],
+            },
+        },
+        separators=(",", ":"),
+    )
+
+    async def run():
+        started = await hooks.handle_session_start(
+            {
+                "session_id": "palace-worker",
+                "cwd": "/tmp",
+                "env": {
+                    "TMUX_PANE": "%palace-worker",
+                    "TOKEN_API_ENGINE": "claude",
+                    "TOKEN_API_LAUNCHER": "dispatch",
+                    "TOKEN_API_DISPATCH_TARGET": "palace:new",
+                    "TOKEN_API_PARENT_INSTANCE_ID": "custodes-commander",
+                },
+            }
+        )
+        stopped = await hooks.handle_stop({"session_id": "palace-worker", "transcript_tail": tail})
+        return started, stopped
+
+    started, stopped = asyncio.run(run())
+
+    assert started["success"] is True
+    assert started["stop_subscription"]["subscriber_instance_id"] == "custodes-commander"
+    assert started["stop_subscription"]["subscriber_pane"] == "%custodes-pane"
+    assert stopped["stop_subscriptions"][0]["status"] == "sent"
+    assert len(sent) == 1
+    assert sent[0][0] == "%custodes-pane"
+    assert "PALACE_WORKER_STOP_ECHO_OK" in sent[0][1]
+
+    conn = _conn(app_env.db_path)
+    worker = _identity_row(conn, "palace-worker")
+    sub = conn.execute(
+        """SELECT target_instance_id, subscriber_instance_id, subscriber_pane, status
+             FROM stop_hook_subscriptions"""
+    ).fetchone()
+    conn.close()
+
+    assert worker["persona_slug"] != "custodes"
+    assert (worker["commander_type"], worker["commander_id"]) == (
+        "chapter",
+        "custodes-commander",
+    )
+    assert tuple(sub) == ("palace-worker", "custodes-commander", "%custodes-pane", "active")
 
 
 def test_session_start_parent_binding_preserves_token_api_persona(app_env, monkeypatch) -> None:
