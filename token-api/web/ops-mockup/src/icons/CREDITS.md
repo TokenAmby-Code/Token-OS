@@ -41,7 +41,7 @@ No other modification was made to the path geometry.
 | `skull-crossed-bones.svg` | [Lorc](https://lorcblog.blogspot.com/) | [skull-crossed-bones](https://game-icons.net/1x1/lorc/skull-crossed-bones.html) | Deathwatch |
 | `sonic-screech.svg` | [Lorc](https://lorcblog.blogspot.com/) | [sonic-screech](https://game-icons.net/1x1/lorc/sonic-screech.html) | Emperor's Children |
 | `spartan-helmet.svg` | [Delapouite](https://delapouite.com/) | [spartan-helmet](https://game-icons.net/1x1/delapouite/spartan-helmet.html) | Astartes (rank) |
-| `wizard-staff.svg` | [Lorc](https://lorcblog.blogspot.com/) | [wizard-staff](https://game-icons.net/1x1/lorc/wizard-staff.html) | Malcador |
+| `wizard-staff.svg` | [Lorc](https://lorcblog.blogspot.com/) | [wizard-staff](https://game-icons.net/1x1/lorc/wizard-staff.html) | Malcador (retired → `malcador-sigil.svg`) - available |
 | `wolf-head.svg` | [Lorc](https://lorcblog.blogspot.com/) | [wolf-head](https://game-icons.net/1x1/lorc/wolf-head.html) | Space Wolves |
 | `all-seeing-eye.svg` | [Delapouite](https://delapouite.com/) | [all-seeing-eye](https://game-icons.net/1x1/delapouite/all-seeing-eye.html) | Inquisition (all-seeing eye) - available |
 | `armor-punch.svg` | [Delapouite](https://delapouite.com/) | [armor-punch](https://game-icons.net/1x1/delapouite/armor-punch.html) | Crimson Fists |
@@ -99,6 +99,18 @@ No other modification was made to the path geometry.
 | `tear-tracks.svg` | [Lorc](https://lorcblog.blogspot.com/) | [tear-tracks](https://game-icons.net/1x1/lorc/tear-tracks.html) | Lamenters |
 | `hawk-emblem.svg` | [Lorc](https://lorcblog.blogspot.com/) | [hawk-emblem](https://game-icons.net/1x1/lorc/hawk-emblem.html) | Hawk Lords |
 | `eagle-head.svg` | [Delapouite](https://delapouite.com/) | [eagle-head](https://game-icons.net/1x1/delapouite/eagle-head.html) | Black Consuls |
+
+## Non-game-icons assets
+
+These persona assets are NOT sourced from game-icons.net and are exempt from the
+CC BY 3.0 attribution above. They are documented here for completeness.
+
+| file | source | used for |
+|------|--------|----------|
+| `malcador-sigil.svg` | Original hand-authored glyph (single-path `currentColor`, this repo) — a flat vector rendition of Malcador the Sigillite's sigil for the ops-mockup. | Malcador (glyph fallback — TTS rings / worker chips) |
+| `../assets/malcador-photoroom.png` | Malcador portrait (background removed via Photoroom), used as the lemon image persona for Malcador. | Malcador (lemon image persona) |
+| `../assets/pax-bot-pfp.png` | Civic Initiatives / askCivic internal brand asset (the "Pax" agent avatar), used with permission of the project owner. Not for external redistribution. | Pax (lemon image persona) |
+| `../assets/ci-logo.svg` | Original flat vector recreation of the Civic Initiatives "ci" brand monogram (orange `c` + white `i`), authored for this mockup from the brand book. Brand mark © Civic Initiatives. | CI (lemon image persona) |
 
 ## Authors
 
