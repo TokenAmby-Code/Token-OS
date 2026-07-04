@@ -90,9 +90,13 @@ The cockpit exposes state assertions near the top because the operator should ne
 
 Current top-level keys:
 
-- `surface`, `generated_at`
+- `surface`, `contract_version`, `ui_build_id`, `generated_at`
+- `health` — aggregate dashboard health summary: status, human summary, degraded source names, bad/warn assertion counts, and recommended actions derived from assertions.
+- `sources` — typed source health for Token-API, agents DB, timer engine, tmuxctld, cron, enforcement, and TTS.
 - `timer` — effective mode, activity layer, productivity signal, manual/focus flags, break balance/backlog, total work/break counters.
+- `billable` — descriptive billable/personal work-class summary for the current work-state.
 - `assertions` — plain-language state assertions: what Token-API believes is true, status/tone, confidence, evidence, source freshness, and correction hint.
+- `recommended_actions` — same action list as `health.recommended_actions` for simple top-level dashboard consumption.
 - `attention` — desktop mode/work mode/AHK/geofence/Steam fields and phone app/distraction/heartbeat fields.
 - `work_state` — cached work-state evidence from Token-API (`get_cached_work_state`).
 - `instances` — active instance list, status/engine/legion counts, age/stale indicators, pane/session-doc metadata, workflow fields, zealotry, and Golden Throne next-fire/resume/victory fields.
@@ -100,6 +104,8 @@ Current top-level keys:
 - `cron` — cron availability, job counts, running count, last-24h runs, and a small job sample.
 - `tts` — current item, queue lengths, backend, satellite availability, global mode.
 - `enforcement` — pending acknowledgement count/sample and Pavlok summary.
+- `tmux` — direct tmuxctld health snapshot surfaced in the aggregate state; the UI should not scrape tmuxctld or legacy health routes independently.
+- `work_actions` — explicit work-action ticks and daily counts for the HUD work dial.
 
 ## Development workflow
 

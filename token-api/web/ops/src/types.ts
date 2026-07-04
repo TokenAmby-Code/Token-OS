@@ -161,6 +161,25 @@ export type OpsRecommendedAction = {
   evidence: string[];
 };
 
+export type OpsSourceMap = {
+  token_api: OpsSourceHealth;
+  agents_db: OpsSourceHealth;
+  timer_engine: OpsSourceHealth;
+  tmuxctld: OpsSourceHealth;
+  cron: OpsSourceHealth;
+  enforcement: OpsSourceHealth;
+  tts: OpsSourceHealth;
+};
+
+export type OpsHealthSummary = {
+  status: OpsHealthStatus;
+  summary: string;
+  degraded_sources: string[];
+  bad_assertion_count: number;
+  warn_assertion_count: number;
+  recommended_actions: OpsRecommendedAction[];
+};
+
 export type InstanceCounts = {
   active: number;
   stale: number;
@@ -172,8 +191,11 @@ export type InstanceCounts = {
 
 export type OpsState = {
   surface: 'ops';
+  contract_version: 'ops-state.v1' | string;
   ui_build_id: string | null;
   generated_at: string;
+  health: OpsHealthSummary;
+  sources: OpsSourceMap;
   timer: {
     mode: TimerMode;
     activity: string;
@@ -196,6 +218,7 @@ export type OpsState = {
     };
   };
   assertions: StateAssertion[];
+  recommended_actions: OpsRecommendedAction[];
   source_freshness: OpsSourceFreshnessMap;
   attention: {
     desktop: {
@@ -266,6 +289,14 @@ export type OpsState = {
     pavlok: Record<string, unknown>;
     error?: string;
   };
+  tmux: {
+    reachable: boolean | null;
+    tmux_reachable: boolean | null;
+    version: string | null;
+    sha: string | null;
+    error?: string | null;
+    payload?: unknown;
+  };
   alarm?: {
     acked: boolean;
     day_started_at: string | null;
@@ -280,15 +311,7 @@ export type OpsStatus = {
   generated_at: string;
   status: OpsHealthStatus;
   summary: string;
-  sources: {
-    token_api: OpsSourceHealth;
-    agents_db: OpsSourceHealth;
-    timer_engine: OpsSourceHealth;
-    tmuxctld: OpsSourceHealth;
-    cron: OpsSourceHealth;
-    enforcement: OpsSourceHealth;
-    tts: OpsSourceHealth;
-  };
+  sources: OpsSourceMap;
   source_freshness: OpsSourceFreshnessMap;
   timer: {
     mode: string;

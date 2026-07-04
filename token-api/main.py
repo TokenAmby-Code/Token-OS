@@ -22075,42 +22075,22 @@ async def _ops_collect_facts(now: datetime) -> dict:
     }
 
 
-def _ops_build_ui_state(facts: dict) -> dict:
-    tts_summary = facts["tts"]
-    return {
-        "surface": "ops",
-        "ui_build_id": _ops_ui_build_id(),
-        "generated_at": facts["generated_at"].isoformat(),
-        "timer": facts["timer"],
-        "billable": _ops_billable_summary(facts["work_state"]),
-        "assertions": facts["assertions"],
-        "source_freshness": facts["source_freshness"],
-        "attention": facts["attention"],
-        "work_state": facts["work_state"].model_dump(),
-        "instances": facts["instances"],
-        "events": facts["events"],
-        "cron": facts["cron"],
-        "tts": {
-            "current": tts_summary.get("current"),
-            "hot_queue": tts_summary.get("hot_queue", []),
-            "pause_queue": tts_summary.get("pause_queue", []),
-            "hot_queue_length": tts_summary.get("hot_queue_length", 0),
-            "pause_queue_length": tts_summary.get("pause_queue_length", 0),
-            "queue_length": tts_summary.get("queue_length", 0),
-            "backend": tts_summary.get("backend"),
-            "satellite_available": tts_summary.get("satellite_available"),
-            "global_mode": tts_summary.get("global_mode"),
-            "routing": tts_summary.get("routing"),
-        },
-        "voice_drafts": [
-            _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
-        ],
-        "enforcement": facts["enforcement"],
-        "work_actions": facts["work_actions"],
-    }
+def _ops_recommended_actions(assertions: list[dict]) -> list[dict]:
+    return [
+        {
+            "id": f"action-{item.get('id')}",
+            "source_assertion_id": item.get("id"),
+            "severity": item.get("status"),
+            "label": item.get("label"),
+            "action": item.get("correction_hint"),
+            "evidence": (item.get("evidence") or [])[:3],
+        }
+        for item in assertions
+        if item.get("status") in {"bad", "warn"} and item.get("correction_hint")
+    ]
 
 
-def _ops_build_status(facts: dict) -> dict:
+def _ops_build_health_summary(facts: dict) -> dict:
     assertions = facts["assertions"]
     source_statuses = [source.get("status", "unknown") for source in facts["sources"].values()]
     bad_assertions = [item for item in assertions if item.get("status") == "bad"]
@@ -22140,6 +22120,60 @@ def _ops_build_status(facts: dict) -> dict:
     else:
         summary = "Ops nominal"
 
+    return {
+        "status": aggregate_status,
+        "summary": summary,
+        "degraded_sources": degraded_sources,
+        "bad_assertion_count": len(bad_assertions),
+        "warn_assertion_count": len(warn_assertions),
+        "recommended_actions": _ops_recommended_actions(assertions),
+    }
+
+
+def _ops_build_ui_state(facts: dict) -> dict:
+    tts_summary = facts["tts"]
+    health = _ops_build_health_summary(facts)
+    return {
+        "surface": "ops",
+        "contract_version": "ops-state.v1",
+        "ui_build_id": _ops_ui_build_id(),
+        "generated_at": facts["generated_at"].isoformat(),
+        "health": health,
+        "sources": facts["sources"],
+        "timer": facts["timer"],
+        "billable": _ops_billable_summary(facts["work_state"]),
+        "assertions": facts["assertions"],
+        "recommended_actions": health["recommended_actions"],
+        "source_freshness": facts["source_freshness"],
+        "attention": facts["attention"],
+        "work_state": facts["work_state"].model_dump(),
+        "instances": facts["instances"],
+        "events": facts["events"],
+        "cron": facts["cron"],
+        "tts": {
+            "current": tts_summary.get("current"),
+            "hot_queue": tts_summary.get("hot_queue", []),
+            "pause_queue": tts_summary.get("pause_queue", []),
+            "hot_queue_length": tts_summary.get("hot_queue_length", 0),
+            "pause_queue_length": tts_summary.get("pause_queue_length", 0),
+            "queue_length": tts_summary.get("queue_length", 0),
+            "backend": tts_summary.get("backend"),
+            "satellite_available": tts_summary.get("satellite_available"),
+            "global_mode": tts_summary.get("global_mode"),
+            "routing": tts_summary.get("routing"),
+        },
+        "voice_drafts": [
+            _discord_voice_draft_summary(key, state) for key, state in _discord_voice_drafts.items()
+        ],
+        "enforcement": facts["enforcement"],
+        "tmux": facts["tmux"],
+        "work_actions": facts["work_actions"],
+    }
+
+
+def _ops_build_status(facts: dict) -> dict:
+    health = _ops_build_health_summary(facts)
+    assertions = facts["assertions"]
     counts = facts["instances"].get("counts") or {}
     tts_summary = facts["tts"]
     enforcement_summary = facts["enforcement"]
@@ -22150,24 +22184,12 @@ def _ops_build_status(facts: dict) -> dict:
         if isinstance(current_tts, dict)
         else current_tts
     )
-    recommended_actions = [
-        {
-            "id": f"action-{item.get('id')}",
-            "source_assertion_id": item.get("id"),
-            "severity": item.get("status"),
-            "label": item.get("label"),
-            "action": item.get("correction_hint"),
-            "evidence": (item.get("evidence") or [])[:3],
-        }
-        for item in assertions
-        if item.get("status") in {"bad", "warn"} and item.get("correction_hint")
-    ]
 
     return {
         "surface": "ops-status",
         "generated_at": facts["generated_at"].isoformat(),
-        "status": aggregate_status,
-        "summary": summary,
+        "status": health["status"],
+        "summary": health["summary"],
         "sources": facts["sources"],
         "source_freshness": facts["source_freshness"],
         "timer": {
@@ -22214,7 +22236,7 @@ def _ops_build_status(facts: dict) -> dict:
             "pavlok_enabled": (enforcement_summary.get("pavlok") or {}).get("enabled"),
         },
         "assertions": assertions,
-        "recommended_actions": recommended_actions,
+        "recommended_actions": health["recommended_actions"],
     }
 
 
