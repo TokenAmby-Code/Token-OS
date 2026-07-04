@@ -50,11 +50,23 @@ def run(
     check: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        proc = subprocess.run(cmd, input=input_text, text=True, capture_output=True, timeout=timeout)
+        proc = subprocess.run(
+            cmd, input=input_text, text=True, capture_output=True, timeout=timeout
+        )
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode(errors="replace")
-        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
-        return subprocess.CompletedProcess(cmd, 124, stdout, stderr or f"timed out after {timeout}s")
+        stdout = (
+            exc.stdout
+            if isinstance(exc.stdout, str)
+            else (exc.stdout or b"").decode(errors="replace")
+        )
+        stderr = (
+            exc.stderr
+            if isinstance(exc.stderr, str)
+            else (exc.stderr or b"").decode(errors="replace")
+        )
+        return subprocess.CompletedProcess(
+            cmd, 124, stdout, stderr or f"timed out after {timeout}s"
+        )
     except OSError as exc:
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
     if check and proc.returncode != 0:
@@ -117,7 +129,9 @@ def validate(local: Path) -> None:
 def pull_state() -> tuple[dict[str, Any], Path]:
     proc = run(["macrodroid-state", "--pull"], timeout=45)
     if proc.returncode != 0:
-        raise RuntimeError(f"macrodroid-state --pull failed\nstdout: {proc.stdout}\nstderr: {proc.stderr}")
+        raise RuntimeError(
+            f"macrodroid-state --pull failed\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
 
     path = EXPORT_PATH
     if not path.exists():
@@ -141,6 +155,18 @@ def macros_named(state: dict[str, Any], name: str) -> list[dict[str, Any]]:
         for m in state.get("macroList", [])
         if isinstance(m, dict) and str(m.get("m_name", "")).casefold() == needle
     ]
+
+
+def describe_matches(matches: list[dict[str, Any]]) -> str:
+    lines = []
+    for i, macro in enumerate(matches, 1):
+        lines.append(
+            f"  {i}. name={macro.get('m_name')!r} "
+            f"category={macro.get('m_category', 'Uncategorized')!r} "
+            f"enabled={bool(macro.get('m_enabled'))} "
+            f"guid={macro.get('m_GUID')}"
+        )
+    return "\n".join(lines)
 
 
 def stage_file(local: Path, remote_name: str) -> str:
@@ -188,10 +214,19 @@ def main() -> int:
     parser.add_argument(
         "--allow-existing",
         action="store_true",
-        help="do not fail before launch if a macro with the same name already exists",
+        help="legacy duplicate test mode: allow same-name macros and accept an added duplicate as success",
     )
-    parser.add_argument("--mime", default=DEFAULT_MIME, help=f"VIEW intent MIME type (default: {DEFAULT_MIME})")
-    parser.add_argument("--wait-seconds", type=float, default=8.0, help="seconds to wait before verification pull")
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="clean replacement mode: allow existing same-name macros, but succeed only if exactly one target macro remains",
+    )
+    parser.add_argument(
+        "--mime", default=DEFAULT_MIME, help=f"VIEW intent MIME type (default: {DEFAULT_MIME})"
+    )
+    parser.add_argument(
+        "--wait-seconds", type=float, default=8.0, help="seconds to wait before verification pull"
+    )
     parser.add_argument("--no-launch-wait", action="store_true", help="do not pass -W to am start")
     parser.add_argument(
         "--validate-only",
@@ -199,6 +234,8 @@ def main() -> int:
         help="only run local validation and duplicate/name parsing; no phone interaction",
     )
     args = parser.parse_args()
+    if args.allow_existing and args.replace:
+        parser.error("--allow-existing and --replace are mutually exclusive")
 
     local = Path(args.macro_file).expanduser().resolve()
     if not local.exists():
@@ -224,12 +261,20 @@ def main() -> int:
     try:
         before, before_path = pull_state()
     except RuntimeError as exc:
-        log_event({"result": "state_pull_failed", "file": str(local), "macro": name, "sha256": digest, "error": str(exc)})
+        log_event(
+            {
+                "result": "state_pull_failed",
+                "file": str(local),
+                "macro": name,
+                "sha256": digest,
+                "error": str(exc),
+            }
+        )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 8
     before_count, before_hash = summarize_state(before, before_path)
     before_matches = macros_named(before, name)
-    if before_matches and not args.allow_existing:
+    if before_matches and not (args.allow_existing or args.replace):
         log_event(
             {
                 "result": "refused_duplicate",
@@ -241,8 +286,15 @@ def main() -> int:
                 "existing_matches": len(before_matches),
             }
         )
-        print(f"ERROR: macro already exists on phone: {name!r}; refusing duplicate import", file=sys.stderr)
-        print("Use --allow-existing only after deciding replace/update semantics are safe.", file=sys.stderr)
+        print(
+            f"ERROR: macro already exists on phone: {name!r}; refusing duplicate import",
+            file=sys.stderr,
+        )
+        print(describe_matches(before_matches), file=sys.stderr)
+        print(
+            "Delete/replace the existing macro in MacroDroid, or use --replace for an explicit clean replacement attempt.",
+            file=sys.stderr,
+        )
         return 4
 
     remote_name = safe_remote_name(local)
@@ -309,12 +361,23 @@ def main() -> int:
         return 8
     after_count, after_hash = summarize_state(after, after_path)
     after_matches = macros_named(after, name)
-    wiped = after_count < before_count
-    success = (
-        not wiped
-        and after_count == before_count + 1
-        and len(after_matches) > len(before_matches)
-    )
+    if args.replace:
+        expected_count = before_count - len(before_matches) + 1
+        wiped = after_count < expected_count
+        success = (
+            not wiped
+            and len(after_matches) == 1
+            and after_count == expected_count
+            and after_hash != before_hash
+        )
+    elif args.allow_existing:
+        success = (
+            not wiped
+            and after_count == before_count + 1
+            and len(after_matches) == len(before_matches) + 1
+        )
+    else:
+        success = not wiped and after_count == before_count + 1 and len(after_matches) == 1
 
     event = {
         "result": "success" if success else "not_confirmed",
@@ -327,17 +390,31 @@ def main() -> int:
         "after_count": after_count,
         "before_hash": before_hash,
         "after_hash": after_hash,
+        "matches_before": len(before_matches),
         "matches_after": len(after_matches),
+        "replace": args.replace,
+        "allow_existing": args.allow_existing,
         "mime": args.mime,
     }
     log_event(event)
 
     if wiped:
-        print(f"ERROR: macro count decreased ({before_count} -> {after_count}); investigate before retrying", file=sys.stderr)
+        print(
+            f"ERROR: macro count decreased ({before_count} -> {after_count}); investigate before retrying",
+            file=sys.stderr,
+        )
         return 6
     if success:
         print(f"OK: verified imported macro {name!r} ({before_count} -> {after_count})")
         return 0
+    if args.replace and len(after_matches) > 1:
+        print(
+            f"ERROR: replacement left {len(after_matches)} same-name macros; delete duplicates in MacroDroid.",
+            file=sys.stderr,
+        )
+        print(describe_matches(after_matches), file=sys.stderr)
+        print(f"Log: {LOG_PATH}", file=sys.stderr)
+        return 9
 
     print(
         "ERROR: import not verified after launching MacroDroid file handler. "

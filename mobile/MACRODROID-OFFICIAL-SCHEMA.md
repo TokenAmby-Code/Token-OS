@@ -88,15 +88,23 @@ macrodroid-read EXPORT.mdr --macro "Heartbeat" --export-macro > heartbeat.macro
 macrodroid-validate heartbeat.macro
 ```
 
-### Push
+### Import
 
 ```bash
-macrodroid-push heartbeat.macro
+MACRODROID_AUTO_IMPORT=1 macrodroid-import heartbeat.macro
 ```
 
-`macrodroid-push` runs strict validation first and refuses malformed files.
+`macrodroid-push` is retired. The clean path is the no-picker MacroDroid file-handler import launcher.
 
-### Experimental no-picker import launcher
+### Replacement attempts
+
+```bash
+MACRODROID_AUTO_IMPORT=1 macrodroid-import --replace heartbeat.macro
+```
+
+`--replace` permits same-name macros before launch but succeeds only if exactly one target macro remains after the verification pull. If MacroDroid duplicates instead of replacing, the command fails and prints the duplicate macro records to delete manually.
+
+### Import launcher semantics
 
 ```bash
 MACRODROID_AUTO_IMPORT=1 macrodroid-import heartbeat.macro
@@ -129,9 +137,10 @@ status and limitations.
    macrodroid-validate macro-name.macro
    ```
 
-5. Push and import on phone:
+5. Import on phone via direct MacroDroid file-handler prompt:
+
    ```bash
-   macrodroid-push macro-name.macro
+   MACRODROID_AUTO_IMPORT=1 macrodroid-import macro-name.macro
    ```
 
 6. Export/pull again and verify:

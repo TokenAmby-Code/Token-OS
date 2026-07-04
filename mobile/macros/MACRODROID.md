@@ -108,9 +108,9 @@ request.
    macrodroid-validate macro-name.macro
    ```
 
-5. Push/import:
+5. Import via direct MacroDroid file-handler prompt:
    ```bash
-   macrodroid-push macro-name.macro
+   MACRODROID_AUTO_IMPORT=1 macrodroid-import macro-name.macro
    ```
 
 6. Export/pull again and verify.

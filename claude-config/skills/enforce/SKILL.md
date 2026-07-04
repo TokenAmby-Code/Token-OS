@@ -174,7 +174,7 @@ When `/enforce --build` is invoked, read these files before starting implementat
 5. **CLI tools** (all in `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/bin/`):
    - `macrodroid-read` — parse .mdr backups
    - `macrodroid-gen` — generate .macro from YAML
-   - `macrodroid-push` — push .macro to phone
+   - `macrodroid-import` — with `MACRODROID_AUTO_IMPORT=1`, import .macro through MacroDroid file-handler prompt and verify by state pull
    - `macrodroid-pull` — pull files from phone
    - `macrodroid-state` — fetch live state
    - `notify` — desktop notification CLI
