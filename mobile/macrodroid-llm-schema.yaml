@@ -3498,12 +3498,16 @@ actions:
         preventAndroid16Grouping?: [bool, "no auto group"]
 
       NotificationActionButton:
-        note: "Button that appears on notification. Can invoke macro or action block when pressed."
+        note: "Button that appears on notification. MacroDroid 5.65+ can invoke a macro, an action block, or one direct action when pressed. Direct-action support is exported as actionClassType/actionName/actionJson plus clearOnPress."
         fields:
           label: [str, "Button label text"]
           macroGuid?: [long, "Macro GUID to run when pressed"]
           macroName?: [str, "Macro name (for display)"]
           actionBlockData?: [ActionBlockData, "see ActionBlockData schema"]
+          clearOnPress?: [bool, "Clear notification when this button is pressed"]
+          actionClassType?: [str, "Direct action classType to run when pressed, e.g. HttpRequestAction"]
+          actionName?: [str, "Direct action display name"]
+          actionJson?: [str, "JSON string containing the direct action object to run when pressed"]
 
     NotificationInteractionAction:
      description: Interact with notifications
