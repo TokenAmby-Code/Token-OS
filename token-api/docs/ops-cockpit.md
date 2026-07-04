@@ -49,7 +49,7 @@ web/ops/src/
     TopStrip.tsx            # glanceable persistent strip
     TimerGraph.tsx          # bespoke SVG balance chart (segmented bands, tape X axis)
     InstancesPanel.tsx      # fleet table (desktop) + card stack (mobile)
-    SidePanels.tsx          # attention evidence, event stream, subsystem status cards
+    SidePanels.tsx          # health/corrections, compact assertions, attention, events, subsystem status
     OpsGraph.tsx            # bespoke SVG layered directed graph
 ```
 
@@ -65,9 +65,9 @@ The graph components are bespoke SVG (no chart/graph library) to keep the commit
 
 `modes.ts` is the single source of truth for state → color. Timer modes map to `--m-working` (phosphor green), `--m-multi` (cyan), `--m-distracted` (hazard red), `--m-break` (amber), `--m-idle` (gray), `--m-sleep` (violet). Break balance reads green above the zero line, hazard-red below. Stale instances, blocked edges, and down subsystems use the hazard tone; victory/completed use brass/gold. Components must read colors from these helpers, not hardcode them.
 
-### State assertions
+### Health, corrections, and state assertions
 
-The cockpit exposes state assertions near the top because the operator should never infer what the system believes from raw fields. Each assertion has `id`, `label`, `value`, `status`, `confidence`, `evidence[]`, `freshness_seconds`, `correction_hint`, and `details`. The first set covers timer mode, break balance, productivity, desktop attention, phone attention, fleet, enforcement, and TTS.
+The cockpit exposes aggregate health and backend-recommended corrections near the top through `layoutModel.ts` presentation selectors. Source freshness is rendered as operator-facing source-health buckets and rail summaries, not as a raw freshness dump. Assertions remain compact supporting facts so the operator can inspect what Token-API believes without making assertions the dominant first block. Each assertion has `id`, `label`, `value`, `status`, `confidence`, `evidence[]`, `freshness_seconds`, `correction_hint`, and `details`.
 
 ### Timer graph specifics
 

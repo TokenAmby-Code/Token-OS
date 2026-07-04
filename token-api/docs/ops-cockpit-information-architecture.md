@@ -25,7 +25,7 @@ The `/ui/ops` cockpit should answer operational questions, not mirror database t
 - `GET /api/ui/ops/state` is the aggregate cockpit boundary and currently exposes `contract_version`, `health`, `sources`, top-level `recommended_actions`, top-level `source_freshness`, top-level `voice_drafts`, and direct `tmux` health.
 - `GET /api/ops/status` exists for concise agent/script reads and shares the same fact/assertion/recommended-action builders as the browser state.
 - `GET /api/ui/ops/graph/active-fleet` and `GET /api/ui/ops/graph/golden-throne` are live read models, with `/active` and `/gt` aliases. Enforcement causality and broader lineage graphs remain deferred.
-- Frontend data fetching should stay centralized in `api.ts`; a `layoutModel.ts` selector/presentation bridge should be added before production UI components wire predicates over raw `OpsState` health/freshness fields.
+- Frontend data fetching stays centralized in `api.ts`; `layoutModel.ts` is the selector/presentation bridge for production UI health, source freshness, correction queue, and assertion-card rendering.
 
 ## Display hierarchy
 

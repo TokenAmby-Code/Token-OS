@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { focusPane, useOpsState, useTimerHistory, useOpsGraph, useSessionDocs } from './api';
-import type { OpsState, TtsCurrent } from './types';
+import type { TtsCurrent } from './types';
+import { buildCockpitLayoutModel } from './layoutModel';
 import { formatClock } from './format';
 import { HudRings } from './components/TopStrip';
 import { TimerGraph } from './components/TimerGraph';
 import { InstancesPanel, type Selection } from './components/InstancesPanel';
-import { AssertionsPanel, AttentionPanel, EventsPanel, StatusCards } from './components/SidePanels';
+import { AssertionsPanel, AttentionPanel, EventsPanel, HealthCorrectionsPanel, StatusCards } from './components/SidePanels';
 import { VoiceQueuePanel } from './components/VoiceQueuePanel';
 import { TtsStrip } from './components/TtsStrip';
 import { PipelinePanel } from './components/PipelinePanel';
@@ -30,30 +31,6 @@ function Panel({
       </header>
       {children}
     </section>
-  );
-}
-
-function FreshnessDebug({ state }: { state: OpsState }) {
-  return (
-    <div className="freshness-debug">
-      <ul>
-        {Object.entries(state.source_freshness).map(([name, item]) => (
-          <li key={name}>
-            <code>{name}</code>: <strong>{item.status}</strong>
-            {' · age '}
-            {item.age_seconds ?? 'n/a'}s
-            {' · last '}
-            {item.last_seen ?? 'n/a'}
-            {' · stale_after '}
-            {item.stale_after_seconds ?? 'n/a'}s
-            <span className="subline">
-              {item.message}
-              {item.evidence?.length ? ` · ${item.evidence.join(' · ')}` : ''}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </div>
   );
 }
 
@@ -138,6 +115,7 @@ export function App() {
   const docs = useSessionDocs();
 
   const state = ops.data;
+  const layout = useMemo(() => (state ? buildCockpitLayoutModel(state) : null), [state]);
   const selection = useInstanceSelection(
     state?.tts.current ?? null,
     state ? state.instances.active.map((i) => i.id) : [],
@@ -167,7 +145,7 @@ export function App() {
           content, scroll-independent. Not a banner — just the gauges. */}
       {state ? (
         <div className="dials" aria-hidden>
-          <HudRings state={state} />
+          <HudRings state={state} layout={layout ?? undefined} />
         </div>
       ) : null}
 
@@ -213,17 +191,17 @@ export function App() {
       ) : (
         <>
           <Panel
-            title="Freshness"
-            meta={<span className="panel__meta-note">debug read-model contract</span>}
+            title="Health & corrections"
+            meta={<span className="panel__meta-note">layout model · {layout?.contractVersion}</span>}
           >
-            <FreshnessDebug state={state} />
+            {layout ? <HealthCorrectionsPanel model={layout} /> : null}
           </Panel>
 
           <Panel
             title="State assertions"
-            meta={<span className="panel__meta-note">what Token-API believes is true</span>}
+            meta={<span className="panel__meta-note">compact supporting facts</span>}
           >
-            <AssertionsPanel state={state} />
+            {layout ? <AssertionsPanel assertions={layout.assertionCards} /> : null}
           </Panel>
 
           <Panel

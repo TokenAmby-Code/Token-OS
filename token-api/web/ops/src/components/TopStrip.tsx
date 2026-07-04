@@ -9,6 +9,7 @@ import type { OpsState } from '../types';
 import { modeVisual, desktopGlyph, phoneGlyph } from '../modes';
 import { formatSignedClock, formatClock } from '../format';
 import { clearPhoneAttention, endMorningSession } from '../api';
+import type { CockpitLayoutModel, CockpitTone } from '../layoutModel';
 import { Ring } from './Ring';
 
 // One banked hour of break fills the ring; debt fills it in hazard.
@@ -39,7 +40,14 @@ function waAgo(minutes: number): string {
   return `${h}h ${Math.round(minutes % 60).toString().padStart(2, '0')}m`;
 }
 
-export function HudRings({ state }: { state: OpsState }) {
+function toneColor(tone: CockpitTone): string {
+  if (tone === 'bad') return 'var(--hazard)';
+  if (tone === 'warn') return 'var(--brass-bright)';
+  if (tone === 'good') return 'var(--phosphor)';
+  return 'var(--muted)';
+}
+
+export function HudRings({ state, layout }: { state: OpsState; layout?: CockpitLayoutModel }) {
   const mv = modeVisual(state.timer.mode);
   const bal = state.timer.break_balance_ms;
   const debt = state.timer.is_in_backlog;
@@ -192,6 +200,18 @@ export function HudRings({ state }: { state: OpsState }) {
           title="Aggregate work signals today (non-load-bearing)"
         />
       ) : null}
+      {layout?.noteworthyDials.map((dial) => (
+        <Ring
+          key={dial.id}
+          label={dial.label}
+          value={dial.value}
+          detail={dial.detail}
+          color={toneColor(dial.tone)}
+          tone={dial.tone}
+          pulse={dial.tone === 'bad'}
+          title={dial.title}
+        />
+      ))}
     </div>
   );
 }
