@@ -1,10 +1,8 @@
 # Ops Cockpit Mockup — Active State
 
 **Last updated:** 2026-07-03
-**Location:** `~/dev/ops-cockpit-mockup` (moved out of the session scratchpad so it
-survives scratchpad cycles; now git-tracked here).
-**Origin:** was authored in a Claude Code session scratchpad
-(`.../ops-cockpit-mockup`), live on Vite `:5199`.
+**Location:** `token-api/web/ops-mockup` — a self-contained Vite app, sister to the
+real cockpit at `token-api/web/ops`. Inert design study; not wired into deploy/build.
 
 A **static design study** for the Token-OS ops cockpit (`/ui/ops` target) — no live
 data wired. Vite + React + TypeScript. `noUnusedLocals` / `noUnusedParameters` are on.
@@ -12,7 +10,7 @@ data wired. Vite + React + TypeScript. `noUnusedLocals` / `noUnusedParameters` a
 ## Run it
 
 ```bash
-cd ~/dev/ops-cockpit-mockup
+cd token-api/web/ops-mockup
 npm run dev        # Vite dev server (default :5199 per vite.config.ts)
 npm run typecheck  # tsc -b --noEmit  (must be clean)
 npm run build      # tsc -b && vite build
@@ -28,6 +26,7 @@ npm run build      # tsc -b && vite build
 ## What's live in the current build
 
 ### Generic screen-size resilience — `uiScale` (NEW, this checkpoint)
+
 The cluster was authored entirely at a **1440px design width** (`DESIGN_W`). One
 viewport-derived factor now shrinks the whole instrument assembly coherently at any
 narrower width:
@@ -66,6 +65,7 @@ OVERRIDES block) — NOT a change to the `uiScale` pipeline, which is settled. D
 must stay pixel-identical.
 
 ### Persona dials on the arc (fixed roster — NOT a demo knob)
+
 - `PERSONA_COUNT = 6`. Slots march LEFT off the pocket anchor: `1` (rightmost,
   Custodes) … `6` (leftmost, newest).
 - Size classes (`PERSONA_SIZES`, k=0→"1" … k=5→"6"):
@@ -81,11 +81,13 @@ must stay pixel-identical.
   move right, check which constraint is binding in `ringClears()` first.
 
 ### Worker dials (flat row below the arc)
+
 - `WORKER_R = 34` (~20% down from the old 42). Right-anchored, fill right→left, wrap
   into further right-anchored rows trailing down the RHS. Live knobs in the demobar:
   Worker count / Worker row X / Worker row Y.
 
 ### Coordinate-capture placement tool (authoring aid) — `PlaceLayer`
+
 - Demobar **"Place mode"** checkbox. ON → a full-bleed `.place-layer`
   (`pointer-events:auto`, crosshair, z:65 — above the fan/arc, below the demobar)
   captures clicks; OFF → `pointer-events:none`, clicks pass through to the cockpit.
@@ -135,6 +137,7 @@ must stay pixel-identical.
 3. No drag-to-adjust of existing drops yet (click-to-drop + Undo only).
 
 ## Verify checklist (last run: clean)
+
 - `npm run typecheck` + `npm run build` clean.
 - **`uiScale`:** clientWidth ≥ 1440 ⇒ `uiScale === 1`, `--hub-r` 260px /
   `--corner-dial-d` 104px (desktop pixel-identical, never upscales); ~477px ⇒ floored

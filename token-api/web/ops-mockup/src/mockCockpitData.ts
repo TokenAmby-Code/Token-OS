@@ -86,7 +86,10 @@ const interpBalance = (min: number): number => {
 
 const modeAt = (min: number): MockTimerMode => {
   for (const s of timerSegments) {
-    if (min >= toMin(s.start) && min < toMin(s.end)) return s.mode;
+    // Last segment's end is inclusive so the DAY_END sample (nowPoint) resolves
+    // to its real mode instead of falling through to the 'idle' default.
+    const isLast = s === timerSegments[timerSegments.length - 1];
+    if (min >= toMin(s.start) && (isLast ? min <= toMin(s.end) : min < toMin(s.end))) return s.mode;
   }
   return 'idle';
 };
