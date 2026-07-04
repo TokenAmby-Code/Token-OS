@@ -31,16 +31,16 @@ The frontend polls `/api/ui/ops/state` every 2 seconds. Live acceptance confirme
 
 ## Frontend architecture
 
-Data access is centralized and typed; deeply-nested components never call endpoints directly. `api.ts` is the only network/fetch boundary. The current main/live source does not yet contain `layoutModel.ts`; Lane B should add it as a selector/presentation bridge before components wire predicates over raw `OpsState`.
+Data access is centralized and typed; deeply-nested components never call endpoints directly. `api.ts` is the only network/fetch boundary. `layoutModel.ts` is the selector/presentation bridge for health, source freshness, correction queue, noteworthy dials, and compact assertion cards; components render those model outputs instead of wiring predicates over raw `OpsState`.
 
-```
+```text
 web/ops/src/
   main.tsx                  # root render
   App.tsx                   # cockpit shell, panel composition, conn/loading/error states
   styles.css                # "cogitator console" design system (tokens + chrome)
   types.ts                  # OpsState, TimerHistory, OpsGraph contracts
   api.ts                    # only fetch boundary; typed polling hooks and Token-API actions
-  layoutModel.ts            # planned selector/presentation bridge before UI predicate wiring
+  layoutModel.ts            # selector/presentation bridge before UI predicate wiring
   format.ts                 # display-only formatting helpers
   modes.ts                  # visual language: mode/status/edge/node -> color + label
   mock.ts                   # degraded OpsGraph fallback only; timer history is live

@@ -1,6 +1,7 @@
 // Compact secondary panels: attention evidence, events timeline, and the
 // cron / Golden Throne / enforcement status cards.
 
+import type { ReactElement } from 'react';
 import type { OpsState } from '../types';
 import type {
   AssertionCard,
@@ -80,7 +81,7 @@ function RailSummary({ summary }: { summary: DrawerRailSummary }) {
   );
 }
 
-export function HealthCorrectionsPanel({ model }: { model: CockpitLayoutModel }) {
+export function HealthCorrectionsPanel({ model }: { model: CockpitLayoutModel }): ReactElement {
   const sourceBuckets = model.sourceHealthSummary.buckets;
   const sourceSummaries = model.drawerSummaries.filter((summary) => summary.kind === 'sources');
   const correctionSummaries = model.drawerSummaries.filter((summary) => summary.kind === 'corrections');
@@ -136,7 +137,7 @@ export function HealthCorrectionsPanel({ model }: { model: CockpitLayoutModel })
         <div className="sourcehealth">
           {(['bad', 'missing', 'warn', 'stale', 'unknown', 'fresh'] as SourceHealthBucket[]).map((bucket) => (
             <details key={bucket} open={bucket !== 'fresh' && sourceBuckets[bucket].length > 0}>
-              <summary className={toneClass(sourceBuckets[bucket][0]?.tone ?? (bucket === 'fresh' ? 'good' : 'warn'))}>
+              <summary className={toneClass(sourceBuckets[bucket][0]?.tone ?? 'good')}>
                 {bucketLabel(bucket)} <span>{sourceBuckets[bucket].length}</span>
               </summary>
               <SourceHealthRows items={sourceBuckets[bucket]} />
@@ -148,7 +149,7 @@ export function HealthCorrectionsPanel({ model }: { model: CockpitLayoutModel })
   );
 }
 
-export function AssertionsPanel({ assertions }: { assertions: AssertionCard[] }) {
+export function AssertionsPanel({ assertions }: { assertions: AssertionCard[] }): ReactElement {
   if (!assertions.length) return <p className="empty">No state assertions reported.</p>;
   return (
     <div className="assertions">

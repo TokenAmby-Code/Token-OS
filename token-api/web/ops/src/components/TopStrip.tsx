@@ -4,7 +4,7 @@
 // Magnitudes become arcs; enum/bool states become center glyphs (per the rule
 // that app *names* — free text — get a short label, everything else a gauge).
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactElement } from 'react';
 import type { OpsState } from '../types';
 import { modeVisual, desktopGlyph, phoneGlyph } from '../modes';
 import { formatSignedClock, formatClock } from '../format';
@@ -47,7 +47,7 @@ function toneColor(tone: CockpitTone): string {
   return 'var(--muted)';
 }
 
-export function HudRings({ state, layout }: { state: OpsState; layout?: CockpitLayoutModel }) {
+export function HudRings({ state, layout }: { state: OpsState; layout?: CockpitLayoutModel }): ReactElement {
   const mv = modeVisual(state.timer.mode);
   const bal = state.timer.break_balance_ms;
   const debt = state.timer.is_in_backlog;
