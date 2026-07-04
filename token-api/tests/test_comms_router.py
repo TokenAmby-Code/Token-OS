@@ -230,8 +230,8 @@ def test_phone_direct_tts_only_occurs_inside_the_router(monkeypatch):
 
     # The phone leg now BLOCKS on the buffer_drained callback (real audio-finish)
     # up to PHONE_PLAYBACK_WATCHDOG_S. No callback fires in this structural test, so
-    # shrink the watchdog to keep it fast — a missed callback is still a success
-    # (playback_confirmed=False), which is exactly what this guard asserts.
+    # shrink the watchdog to keep it fast. A missed callback is a delivery failure:
+    # Token-OS may not claim audible success without the backend ack.
     monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.05)
 
     def fake_send_to_phone(endpoint, params):
@@ -248,9 +248,10 @@ def test_phone_direct_tts_only_occurs_inside_the_router(monkeypatch):
     result = tts.speak_tts("away from home")
 
     assert any(p.get("current_chunk") == "away from home" for _e, p in sent)
-    assert result.get("success") is True
+    assert result.get("success") is False
     assert result.get("method") == "phone"
-    assert result.get("route") == "phone"
+    assert result.get("route") is None
+    assert result.get("reason") == "phone_playback_unconfirmed"
 
 
 def test_phone_tts_targets_chunk_endpoint_with_playback_id(monkeypatch: Any) -> None:
@@ -290,7 +291,9 @@ def test_phone_tts_targets_chunk_endpoint_with_playback_id(monkeypatch: Any) -> 
     assert params.get("current_chunk") == "contract line"
     pid = params.get("playback_id")
     assert isinstance(pid, str) and pid, "a per-utterance opaque playback_id is required"
-    assert result.get("route") == "phone"
+    assert result.get("success") is False
+    assert result.get("route") is None
+    assert result.get("reason") == "phone_playback_unconfirmed"
 
 
 def test_discord_fallthrough_respects_geofence_phone_only(monkeypatch: Any) -> None:
@@ -423,7 +426,7 @@ def test_playback_complete_unknown_id_is_tolerated_and_warned(caplog: Any) -> No
 
 def test_phone_watchdog_advances_on_missed_callback(monkeypatch: Any, caplog: Any) -> None:
     """A missed playback-complete callback must not wedge the worker: the watchdog
-    fires, logs, and advances with playback_confirmed=False (still a delivery)."""
+    fires, logs, and advances with playback_confirmed=False (a delivery failure)."""
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.05)
     monkeypatch.setattr(
@@ -442,12 +445,13 @@ def test_phone_watchdog_advances_on_missed_callback(monkeypatch: Any, caplog: An
     with caplog.at_level(logging.WARNING):
         result = tts.speak_tts("missed callback line")
 
-    assert result.get("success") is True
-    assert result.get("route") == "phone"
+    assert result.get("success") is False
+    assert result.get("route") is None
+    assert result.get("reason") == "phone_playback_unconfirmed"
     assert result.get("playback_confirmed") is False
     # The phone was handed a playback_id to echo back.
     assert any(p.get("playback_id") for _e, p in sent)
-    assert any("buffer_drained callback missed" in rec.getMessage() for rec in caplog.records)
+    assert any("delivery unconfirmed" in rec.getMessage() for rec in caplog.records)
     # The waiter id is always cleaned up (finally pop).
     assert tts.pending_phone_playbacks == {}
 
