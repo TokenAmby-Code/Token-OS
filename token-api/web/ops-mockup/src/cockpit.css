@@ -736,6 +736,12 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   stroke-linecap: round;
   stroke-linejoin: round;
 }
+/* Table-lip interior — the ribbon between the dial-hugging top edge and the
+   symmetric bottom bar. Flat brass wash; opacity from the frozen bandFill constant. */
+.worker-rail__band {
+  fill: var(--instrument);
+  stroke: none;
+}
 .worker-chip {
   position: absolute;
   top: 0;

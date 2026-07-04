@@ -2036,15 +2036,13 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
   );
 }
 
-// ── DEV-TUNING: Rail shape knobs ────────────────────────────────────────────
-// The 9 by-eye shape constants for the worker-rail crossbar + centre hourglass,
-// bundled so the demo bar can drive them live (see the "Rail shape" group). This
-// is a TEMPORARY dev-tuning group matching the retire-after-dialing pattern the
-// lemon/layout knobs already went through (LEMON_WIDTH_INSET etc.): once the
-// operator settles the shape, freeze these back into constants inside the `rail`
-// memo and remove the sliders + this `shape` prop. Two unit families: the px@1440
-// fields (hgLift/nestClear/hgFoot) are base numbers multiplied by `s` at use; the
-// rest are unitless ratios/fractions.
+// ── LOCKED: Rail shape constants ────────────────────────────────────────────
+// The by-eye shape constants for the worker-rail crossbar + centre hourglass, now
+// FROZEN at the operator's settled values (the demo-bar sliders + `shape` prop have
+// been retired, matching the lemon/layout knobs before them — LEMON_WIDTH_INSET etc.).
+// WorkerQueues reads RAIL_SHAPE_DEFAULTS directly. Two unit families: the px@1440
+// fields (hgLift/nestClear/hgFoot/capInset) are base numbers multiplied by `s` at
+// use; the rest are unitless ratios/fractions.
 interface RailShape {
   barExag: number;      // BAR_EXAG — bar bow (ratio)
   hgLift: number;       // HG_LIFT — centre lift (px@1440)
@@ -2055,24 +2053,39 @@ interface RailShape {
   nestClear: number;    // nestClear — worker hug (px@1440)
   hgFoot: number;       // HG_FOOT — foot width (px@1440)
   hgCf: number;         // HG_CF — wall verticality (frac)
+  // ── Table-edge BAND (the crossbar as a closed ribbon, not a single line) ──
+  // The bottom edge stays the symmetric `crossY` (the hourglass plants on it,
+  // unchanged); a NEW top edge hugs the worker dials, and the two enclose a filled
+  // table-lip. topFollow blends the top edge from symmetric (0) to dial-hugging (1).
+  topHug: number;       // gap from the chip bottoms to the band's TOP edge (px@1440)
+  topFollow: number;    // 0 = symmetric top edge, 1 = follows the worker dials (frac)
+  bandFill: number;     // ribbon interior fill opacity (0 = hollow outline)
+  capInset: number;     // pull each lobe's OUTER terminus (line-stop + cap) in from the ditch (px@1440)
 }
 const RAIL_SHAPE_DEFAULTS: RailShape = {
-  barExag: 1.75,
-  hgLift: 26,
-  hgLiftSpan: 0.55,
-  endRiseMult: 1.0,
-  hgEndSpan: 0.42,
-  hgTipFrac: 0.63,  // mouth width — dialed in
+  barExag: 1.05,
+  hgLift: 24,
+  hgLiftSpan: 0.68,
+  endRiseMult: 1.1,
+  hgEndSpan: 0.72,
+  hgTipFrac: 0.68,  // mouth width — dialed in
   nestClear: 16,    // worker hug — dialed in
-  hgFoot: 8,
-  hgCf: 0.4,
+  hgFoot: 0,
+  hgCf: 0.36,
+  topHug: 13,       // band top tucks just under the dials
+  topFollow: 1.0,   // top edge follows the dials
+  bandFill: 0.14,   // faint brass table surface
+  capInset: 55,     // RIGHT cap pulled in 55px to clear the drain; left stays at its terminus
 };
 // The reservist hourglass (centre glow cells + I-walls) is LOCKED temporarily at the
 // operator's settled shape — leave its geometry as-is; ongoing tuning is the crossbar.
 
-function WorkerQueues({ count, uiScale, gap, pitch, inset, split, shape }: {
-  count: number; uiScale: number; gap: number; pitch: number; inset: number; split: number; shape: RailShape;
+function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
+  count: number; uiScale: number; gap: number; pitch: number; inset: number; split: number;
 }) {
+  // Crossbar + hourglass shape is LOCKED — read straight from the frozen constants.
+  // The by-eye dev-tuning sliders and the `shape` prop have been retired.
+  const shape = RAIL_SHAPE_DEFAULTS;
   // Self-measure W (like ArcLayer) — the layer is inset:0 full-viewport, so the
   // floor envelope + T-rail geometry are read straight off the real width.
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -2155,16 +2168,147 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, shape }: {
       return yDeep - centreLift - endRise;
     };
 
-    // Sample the arc end-to-end. The right end mirrors to xCtr + half, clamped a chip-clear
-    // inside the right ditch (it usually falls short — the accepted pull-away from the right).
+    // The right end mirrors to xCtr + half, clamped a chip-clear inside the right ditch
+    // (it usually falls short — the accepted pull-away from the right). N samples span the
+    // whole arc for lobe detection; the visible bottom line `barD` is trimmed to the lobe
+    // cap-starts (built AFTER the loop) so the bottom never pokes out past a cap.
     const xBarR = Math.min(xCtr + half, xDitchR - ditchClear);
     const N = 96;
-    const pts: string[] = [];
-    for (let i = 0; i <= N; i++) {
-      const x = xBarL + (xBarR - xBarL) * (i / N);
-      pts.push(`${i === 0 ? 'M' : 'L'}${f(x)},${f(crossY(x))}`);
+
+    // ── Table-edge BAND top edge — hugs just under the worker dials, so the crossbar
+    // reads as a solid lip (top follows the dials, bottom `crossY` stays symmetric).
+    // chipBottomY = the underside of the chip row at x (floor envelope + drop + radius);
+    // topFollow blends the true (asymmetric) dial hug against its own left/right AVERAGE
+    // (a symmetric top) so the operator can dial how hard the top tracks the dials.
+    const chipBottomY = (x: number): number => workerFloorY(x, geo, s) + gap * s + chipR;
+    const topHugPx = shape.topHug * s;
+    const topFollow = Math.min(1, Math.max(0, shape.topFollow));
+    const topEdgeY = (x: number): number => {
+      const d = x - xCtr;
+      const follow = chipBottomY(x);
+      const sym = 0.5 * (chipBottomY(xCtr + d) + chipBottomY(xCtr - d));
+      return sym + (follow - sym) * topFollow + topHugPx;
+    };
+    // The band exists only where the top edge sits ABOVE the bottom bar (positive
+    // thickness). The centre lift and the rounded ends raise the bottom bar past the
+    // top edge (the hourglass notch; the terminals) — those stretches are CLIPPED so
+    // the top line never crosses below the bar. Each surviving stretch is one closed
+    // lobe: top L→R, a straight END CAP down to the bar, the bar R→L, a cap back up.
+    // Lobes are cut where the gap thins to CAP_MIN, leaving a small flat cap rather
+    // than a sharp sliver at each terminus.
+    const CAP_MIN = 4 * s; // band thinner than this is clipped; also the cap height there
+    const gapAt = (x: number): number => crossY(x) - topEdgeY(x); // >0 ⇒ top above bar
+    const step = (xBarR - xBarL) / N;
+    // Bisect for the x where gapAt(x) === CAP_MIN between a bracketing pair (one side
+    // above CAP_MIN, the other below) so lobe ends land on a clean constant thickness.
+    const edgeX = (xa: number, xb: number): number => {
+      let lo = xa, hi = xb;
+      for (let k = 0; k < 22; k++) {
+        const m = (lo + hi) / 2;
+        if ((gapAt(m) >= CAP_MIN) === (gapAt(lo) >= CAP_MIN)) lo = m; else hi = m;
+      }
+      return (lo + hi) / 2;
+    };
+    const runs: Array<{ xa: number; xb: number }> = [];
+    let prevX = xBarL, prevOn = gapAt(xBarL) >= CAP_MIN;
+    let startX: number | null = prevOn ? xBarL : null;
+    for (let i = 1; i <= N; i++) {
+      const x = xBarL + step * i;
+      const on = gapAt(x) >= CAP_MIN;
+      if (on && !prevOn) startX = edgeX(prevX, x);
+      if (!on && prevOn && startX !== null) { runs.push({ xa: startX, xb: edgeX(prevX, x) }); startX = null; }
+      prevX = x; prevOn = on;
     }
-    const barD = pts.join(' ');
+    if (prevOn && startX !== null) runs.push({ xa: startX, xb: xBarR });
+
+    // Solve gapAt(x) === target between a straddling pair (p, q) — the generalised
+    // sibling of edgeX. Used to run the inner end to the TRUE crossing (target 0).
+    const solveGap = (p: number, q: number, target: number): number => {
+      let lo = p, hi = q;
+      const loBelow = gapAt(lo) - target < 0;
+      for (let k = 0; k < 30; k++) {
+        const m = (lo + hi) / 2;
+        if ((gapAt(m) - target < 0) === loBelow) lo = m; else hi = m;
+      }
+      return (lo + hi) / 2;
+    };
+    // Each lobe gets TWO distinct end treatments: the OUTER end (toward the ditch)
+    // rounds off with an elliptical-arc cap; the INNER end (toward the hourglass)
+    // runs to the true top∩bottom crossing and blends the junction with a cubic that
+    // follows each edge's local slope — a rounded taper pointing at the hourglass,
+    // not a 90° riser. The full-width `barD` draws the bottom bar, so the per-lobe
+    // stroke covers only the top edge + inner taper + outer cap (no double line).
+    const bandSegs: string[] = [];
+    const edgeSegs: string[] = [];
+    const capStarts: number[] = []; // each lobe's outer terminus — where the cap begins
+    for (const { xa, xb } of runs) {
+      const innerIsB = Math.abs(xb - xCtr) < Math.abs(xa - xCtr);
+      let xOuter = innerIsB ? xa : xb;
+      const xInner0 = innerIsB ? xb : xa;
+      const dirIn = Math.sign(xInner0 - xOuter) || 1; // outer → inner along x
+      // Inner end → the true crossing where the top edge meets the bottom bar.
+      const xInner = solveGap(xInner0, xCtr, 0);
+      // Pull the outer terminus IN from the ditch by the cap-inset knob — this is
+      // where the crossbar lines stop and the cap begins (the cap's roundness still
+      // derives from the gap at whatever point it lands). Only the RIGHT lobe insets
+      // (the left already sits a chip-clear inside its ditch). Clamped to keep a lobe.
+      const insetHere = xOuter > xCtr ? shape.capInset : 0;
+      const insetPx = Math.max(0, Math.min(insetHere * s, Math.abs(xInner - xOuter) - 6 * s));
+      xOuter += dirIn * insetPx;
+      capStarts.push(xOuter);
+      // Back the nose off that tip so the merge is a rounded taper, not a cusp.
+      const tb = Math.min(8 * s, Math.abs(xInner - xOuter) * 0.25);
+      const xTip = xInner - dirIn * tb;
+      // Inner merge cubic — controls extend along each edge's tangent toward the
+      // crossing, so top → bottom is curvature-smooth (a nose bulging at the centre).
+      const ds = Math.max(0.5, tb * 0.5);
+      const tanTx = dirIn * ds, tanTy = topEdgeY(xTip + tanTx) - topEdgeY(xTip);
+      const tanBx = dirIn * ds, tanBy = crossY(xTip + tanBx) - crossY(xTip);
+      const lT = Math.hypot(tanTx, tanTy) || 1;
+      const lB = Math.hypot(tanBx, tanBy) || 1;
+      const c1x = xTip + tb * tanTx / lT, c1y = topEdgeY(xTip) + tb * tanTy / lT;
+      const c2x = xTip + tb * tanBx / lB, c2y = crossY(xTip) + tb * tanBy / lB;
+      const cubic = `C${f(c1x)},${f(c1y)} ${f(c2x)},${f(c2y)} ${f(xTip)},${f(crossY(xTip))}`;
+      // Outer end → elliptical-arc cap, radius = half the residual gap, bulging AWAY
+      // from centre (sweep flipped per side). A CAP_MIN gap gives it a radius to work with.
+      const r = Math.max(0.5, (crossY(xOuter) - topEdgeY(xOuter)) / 2);
+      const sweep = xOuter < xCtr ? 1 : 0; // bottom→top, bulge outward
+      const outBotY = crossY(xOuter);
+      // Top-edge polyline (outer → tip) and bottom-bar polyline (tip → outer).
+      const nSeg = Math.max(2, Math.round(Math.abs(xTip - xOuter) / step));
+      const topC: string[] = [], botC: string[] = [];
+      for (let i = 0; i <= nSeg; i++) {
+        const t = i / nSeg;
+        const xt = xOuter + (xTip - xOuter) * t;
+        topC.push(`${f(xt)},${f(topEdgeY(xt))}`);
+        const xb2 = xTip + (xOuter - xTip) * t;
+        botC.push(`${f(xb2)},${f(crossY(xb2))}`);
+      }
+      const arc = `A${f(r)},${f(r)} 0 0 ${sweep}`;
+      // Fill: top(outer→tip) → inner nose → bottom(tip→outer) → outer cap arc → Z.
+      bandSegs.push(
+        `M${topC[0]} ${topC.slice(1).map((c) => `L${c}`).join(' ')} ${cubic} ` +
+        `${botC.slice(1).map((c) => `L${c}`).join(' ')} ${arc} ${topC[0]} Z`,
+      );
+      // Stroke: outer cap arc → top edge → inner nose (bottom bar stays with barD).
+      edgeSegs.push(
+        `M${f(xOuter)},${f(outBotY)} ${arc} ${topC[0]} ` +
+        `${topC.slice(1).map((c) => `L${c}`).join(' ')} ${cubic}`,
+      );
+    }
+    const bandD = bandSegs.join(' ');
+    const edgeD = edgeSegs.join(' ');
+    // The visible bottom line runs ONLY between the outermost cap-starts (the caps
+    // close each end), so it never pokes out past a cap. "Go until touching the cap"
+    // is symmetric — the left/right asymmetry lives entirely in the per-side inset.
+    const barLo = capStarts.length ? Math.min(...capStarts) : xBarL;
+    const barHi = capStarts.length ? Math.max(...capStarts) : xBarR;
+    const barPts: string[] = [];
+    for (let i = 0; i <= N; i++) {
+      const x = barLo + (barHi - barLo) * (i / N);
+      barPts.push(`${i === 0 ? 'M' : 'L'}${f(x)},${f(crossY(x))}`);
+    }
+    const barD = barPts.join(' ');
 
     // Hourglass centre — the central cell is bounded by the LEMON BOTTOM (top) and the
     // CROSSBAR (bottom); the centre stem splits it. Each outer wall runs lemon→crossbar
@@ -2218,6 +2362,8 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, shape }: {
 
     return {
       barD,
+      edgeD,
+      bandD,
       hourD,
       sections,
       // Central dividing line — the lemon's centre divider down to the (lifted) crossbar.
@@ -2235,11 +2381,15 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, shape }: {
           the chips (drawn first); pointer-events:none so clicks fall through. */}
       {rail && (
         <svg className="worker-rail" width={W} height="100%" aria-hidden>
+          {/* Table-lip fill — the ribbon interior between the dial-hugging top edge and
+              the symmetric bottom bar. Drawn first (behind glow + strokes). */}
+          <path className="worker-rail__band" d={rail.bandD} style={{ fillOpacity: shape.bandFill }} />
           {/* reservist glow — behind the gold lines so the strokes read on top. Same
               Segment renderer the lemon persona sections use. */}
           <SegmentGlowLayer segments={rail.sections} idPrefix="hour" blur={9 * uiScale} rimW={11 * uiScale} />
           <path className="worker-rail__line" d={rail.stemD} />
           <path className="worker-rail__line" d={rail.barD} />
+          <path className="worker-rail__line" d={rail.edgeD} />
           <path className="worker-rail__line" d={rail.hourD} />
         </svg>
       )}
@@ -2445,38 +2595,6 @@ export function MockOpsCockpit() {
   // Demo bar collapses to a toggle under the narrow breakpoint (mockup chrome only).
   const [demoOpen, setDemoOpen] = useState(false);
 
-  // ── DEV-TUNING: Rail shape knobs (see RailShape / the "Rail shape" demo group) ──
-  // One persisted knob per worker-rail shape constant so the crossbar/hourglass can
-  // be shaped by eye with no agent round-trip. Base numbers — the px@1440 ones
-  // (hgLift/nestClear/hgFoot) are NOT pre-multiplied by uiScale; WorkerQueues applies
-  // `* s` at use. TEMPORARY: freeze back into constants + drop the group once settled.
-  const [barExag, setBarExag] = usePersistedNumber('rail.barExag', RAIL_SHAPE_DEFAULTS.barExag);
-  const [hgLift, setHgLift] = usePersistedNumber('rail.hgLift', RAIL_SHAPE_DEFAULTS.hgLift);
-  const [hgLiftSpan, setHgLiftSpan] = usePersistedNumber('rail.hgLiftSpan', RAIL_SHAPE_DEFAULTS.hgLiftSpan);
-  const [endRiseMult, setEndRiseMult] = usePersistedNumber('rail.endRiseMult', RAIL_SHAPE_DEFAULTS.endRiseMult);
-  const [hgEndSpan, setHgEndSpan] = usePersistedNumber('rail.hgEndSpan', RAIL_SHAPE_DEFAULTS.hgEndSpan);
-  const [hgTipFrac, setHgTipFrac] = usePersistedNumber('rail.hgTipFrac', RAIL_SHAPE_DEFAULTS.hgTipFrac);
-  const [nestClear, setNestClear] = usePersistedNumber('rail.nestClear', RAIL_SHAPE_DEFAULTS.nestClear);
-  const [hgFoot, setHgFoot] = usePersistedNumber('rail.hgFoot', RAIL_SHAPE_DEFAULTS.hgFoot);
-  const [hgCf, setHgCf] = usePersistedNumber('rail.hgCf', RAIL_SHAPE_DEFAULTS.hgCf);
-  // Bundle into one stable object so WorkerQueues' `rail` memo only recomputes when a
-  // knob actually changes (a fresh literal each render would bust the memo every time).
-  const railShape: RailShape = useMemo(
-    () => ({ barExag, hgLift, hgLiftSpan, endRiseMult, hgEndSpan, hgTipFrac, nestClear, hgFoot, hgCf }),
-    [barExag, hgLift, hgLiftSpan, endRiseMult, hgEndSpan, hgTipFrac, nestClear, hgFoot, hgCf],
-  );
-  const resetRailShape = () => {
-    setBarExag(RAIL_SHAPE_DEFAULTS.barExag);
-    setHgLift(RAIL_SHAPE_DEFAULTS.hgLift);
-    setHgLiftSpan(RAIL_SHAPE_DEFAULTS.hgLiftSpan);
-    setEndRiseMult(RAIL_SHAPE_DEFAULTS.endRiseMult);
-    setHgEndSpan(RAIL_SHAPE_DEFAULTS.hgEndSpan);
-    setHgTipFrac(RAIL_SHAPE_DEFAULTS.hgTipFrac);
-    setNestClear(RAIL_SHAPE_DEFAULTS.nestClear);
-    setHgFoot(RAIL_SHAPE_DEFAULTS.hgFoot);
-    setHgCf(RAIL_SHAPE_DEFAULTS.hgCf);
-  };
-
   // ── Coordinate-capture placement system (authoring tool) ────────────────────
   // Place mode is an ephemeral toggle (not persisted — a session gesture), while
   // the captured drops persist so a hand-authored layout survives a reload. The
@@ -2618,7 +2736,7 @@ export function MockOpsCockpit() {
       {/* worker queues — two icon-chip stacks below the lemon that grow outward
           from centre then trail down the two edges (a soft "M"). Fed by the
           Workers slider; click a chip to pop it and reflow the rest up-path. */}
-      <WorkerQueues count={workerCount} uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX} shape={railShape} />
+      <WorkerQueues count={workerCount} uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX} />
 
       {/* dials drawer — where the default dial click lands (minimal stub) */}
       <DialsDrawer open={drawerOpen} focusedId={focusedDial} onClose={() => setDrawerOpen(false)} />
@@ -2681,68 +2799,6 @@ export function MockOpsCockpit() {
         </label>
         <Stepper label="Focus" value={fracTop} onChange={setFracTop} />
         <Stepper label="Distract" value={fracBot} onChange={setFracBot} />
-
-        {/* ── DEV-TUNING: Rail shape group ── shape the gold T / hourglass by eye,
-            one slider per constant in WorkerQueues' `rail` memo. TEMPORARY: freeze
-            the dialed-in values back into constants + remove this group + the
-            `shape` prop once the operator settles the shape (matches the retired
-            lemon/layout knobs). */}
-        <span className="demobar__tag">Rail shape · dev-tuning</span>
-        <label className="demobar__slider">
-          Bar bow
-          <input type="range" min={1.0} max={2.5} step={0.05} value={barExag}
-            onChange={(e) => setBarExag(Number(e.target.value))} />
-          <EditableNum value={barExag} display={barExag.toFixed(2)} step={0.05} onCommit={setBarExag} />
-        </label>
-        <label className="demobar__slider">
-          Centre lift
-          <input type="range" min={0} max={60} step={1} value={hgLift}
-            onChange={(e) => setHgLift(Number(e.target.value))} />
-          <EditableNum value={hgLift} step={1} onCommit={setHgLift} />
-        </label>
-        <label className="demobar__slider">
-          Lift spread
-          <input type="range" min={0.1} max={1.0} step={0.01} value={hgLiftSpan}
-            onChange={(e) => setHgLiftSpan(Number(e.target.value))} />
-          <EditableNum value={hgLiftSpan} display={hgLiftSpan.toFixed(2)} step={0.01} onCommit={setHgLiftSpan} />
-        </label>
-        <label className="demobar__slider">
-          End round amount
-          <input type="range" min={0} max={1.5} step={0.05} value={endRiseMult}
-            onChange={(e) => setEndRiseMult(Number(e.target.value))} />
-          <EditableNum value={endRiseMult} display={endRiseMult.toFixed(2)} step={0.05} onCommit={setEndRiseMult} />
-        </label>
-        <label className="demobar__slider">
-          End round span
-          <input type="range" min={0.1} max={0.8} step={0.01} value={hgEndSpan}
-            onChange={(e) => setHgEndSpan(Number(e.target.value))} />
-          <EditableNum value={hgEndSpan} display={hgEndSpan.toFixed(2)} step={0.01} onCommit={setHgEndSpan} />
-        </label>
-        <label className="demobar__slider">
-          Mouth width
-          <input type="range" min={0.3} max={1.0} step={0.01} value={hgTipFrac}
-            onChange={(e) => setHgTipFrac(Number(e.target.value))} />
-          <EditableNum value={hgTipFrac} display={hgTipFrac.toFixed(2)} step={0.01} onCommit={setHgTipFrac} />
-        </label>
-        <label className="demobar__slider">
-          Worker hug
-          <input type="range" min={0} max={30} step={1} value={nestClear}
-            onChange={(e) => setNestClear(Number(e.target.value))} />
-          <EditableNum value={nestClear} step={1} onCommit={setNestClear} />
-        </label>
-        <label className="demobar__slider">
-          Foot width
-          <input type="range" min={0} max={24} step={1} value={hgFoot}
-            onChange={(e) => setHgFoot(Number(e.target.value))} />
-          <EditableNum value={hgFoot} step={1} onCommit={setHgFoot} />
-        </label>
-        <label className="demobar__slider">
-          Wall verticality
-          <input type="range" min={0.0} max={0.6} step={0.02} value={hgCf}
-            onChange={(e) => setHgCf(Number(e.target.value))} />
-          <EditableNum value={hgCf} display={hgCf.toFixed(2)} step={0.02} onCommit={setHgCf} />
-        </label>
-        <button className="demobar__placebtn" onClick={resetRailShape}>Reset shape</button>
 
         {/* ── coordinate-capture placement system (authoring tool) ── */}
         <label className="demobar__check">
