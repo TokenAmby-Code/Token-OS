@@ -25,6 +25,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import urlopen
 
 SSH_HOST = os.environ.get("MACRODROID_SSH_HOST", "phone")
 REMOTE_STAGE_DIR = os.environ.get(
@@ -40,6 +42,26 @@ LOG_PATH = Path(
 )
 MACRODROID_COMPONENT = "com.arlosoft.macrodroid/.filehandler.FileHandlerProxy"
 DEFAULT_MIME = "application/octet-stream"
+AUTO_ACCEPT_TTL_SECONDS = 30 * 60
+AUTO_ACCEPT_DELAY_SECONDS = 2.0
+
+
+def phone_http_base() -> str:
+    explicit = os.environ.get("MACRODROID_PHONE_HTTP_BASE")
+    if explicit:
+        return explicit.rstrip("/")
+    phone_ip = os.environ.get("PHONE_TAILSCALE_IP")
+    if not phone_ip:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+            from imperium_config import cfg  # type: ignore
+
+            phone_ip = cfg("tailscale_ip", "phone")
+        except Exception:
+            phone_ip = ""
+    if not phone_ip:
+        phone_ip = "100.102.92.24"
+    return f"http://{phone_ip}:7777"
 
 
 def run(
@@ -114,6 +136,119 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+VOLATILE_SEMANTIC_KEYS = {
+    "m_GUID",
+    "m_SIGUID",
+    "lastEditedTimestamp",
+    "disabledTimestamp",
+    "forceEvenIfNotEnabledTimestamp",
+    "breakpoints",
+    "exportedActionBlocks",
+    "m_excludeLog",
+    "m_headingColor",
+    "m_descriptionOpen",
+    "isFavourite",
+    "isExtra",
+    "isActionBlock",
+    "localVarsAlphabetical",
+}
+
+
+def stable_macro_guid(macro: dict[str, Any]) -> Any:
+    guid = macro.get("m_GUID")
+    return guid if guid not in (None, 0, "0", "") else None
+
+
+MACRODROID_VARIABLE_CURRENT_VALUE_KEYS = {
+    "m_booleanValue",
+    "m_intValue",
+    "m_stringValue",
+    "m_decimalValue",
+}
+
+
+def is_macrodroid_variable_object(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("m_name"), str)
+        and isinstance(value.get("m_type"), int)
+        and (
+            "isLocalVar" in value
+            or "isLocalVariable" in value
+            or "supportsInput" in value
+            or "supportsOutput" in value
+        )
+    )
+
+
+def semantic_projection(value: Any, template: Any) -> Any:
+    """Project a live macro onto the candidate-provided semantic shape.
+
+    MacroDroid adds GUIDs, timestamps, UI/editor defaults, variable current
+    values, and sometimes fields absent from importable .macro JSON.
+    Verification should compare the trigger/action/constraint structure and the
+    values the candidate actually supplied, not whole-export noise.
+    """
+    if isinstance(template, dict):
+        if not isinstance(value, dict):
+            return {"__type_mismatch__": type(value).__name__}
+        projected: dict[str, Any] = {}
+        template_is_variable = is_macrodroid_variable_object(template)
+        for key in sorted(template):
+            if key in VOLATILE_SEMANTIC_KEYS:
+                continue
+            if template_is_variable and key in MACRODROID_VARIABLE_CURRENT_VALUE_KEYS:
+                continue
+            projected[key] = semantic_projection(value.get(key), template[key])
+        return projected
+    if isinstance(template, list):
+        if not isinstance(value, list):
+            return {"__type_mismatch__": type(value).__name__}
+        return {
+            "__len__": len(value),
+            "items": [
+                semantic_projection(value[i], item_template)
+                if i < len(value)
+                else {"__missing__": True}
+                for i, item_template in enumerate(template)
+            ],
+        }
+    return value
+
+
+def macro_semantic_fingerprint(
+    macro: dict[str, Any], template: dict[str, Any] | None = None
+) -> str:
+    tmpl = template if template is not None else macro
+    projection = semantic_projection(macro, tmpl)
+    return hashlib.sha256(
+        json.dumps(projection, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def semantic_matches(candidate_macro: dict[str, Any], live_macro: dict[str, Any]) -> bool:
+    return macro_semantic_fingerprint(candidate_macro) == macro_semantic_fingerprint(
+        live_macro, candidate_macro
+    )
+
+
+def semantic_macros_named(
+    state: dict[str, Any], name: str, candidate_macro: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return [m for m in macros_named(state, name) if semantic_matches(candidate_macro, m)]
+
+
+def newly_added_semantic_matches(
+    before_matches: list[dict[str, Any]], after_matches: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    before_guids = {
+        stable_macro_guid(m) for m in before_matches if stable_macro_guid(m) is not None
+    }
+    if before_guids:
+        return [m for m in after_matches if stable_macro_guid(m) not in before_guids]
+    return after_matches[len(before_matches) :]
 
 
 def validate(local: Path) -> None:
@@ -207,34 +342,62 @@ def evaluate_import_result(
     *,
     replace: bool,
     allow_existing: bool,
+    candidate_macro: dict[str, Any],
+    before_state: dict[str, Any],
+    after_state: dict[str, Any],
     before_count: int,
-    before_match_count: int,
-    before_hash: str,
     after_count: int,
-    after_match_count: int,
-    after_hash: str,
-) -> tuple[bool, bool]:
-    """Return (success, wiped) for post-launch MacroDroid import verification."""
+) -> tuple[bool, bool, dict[str, Any]]:
+    """Return (success, wiped, diagnostics) for semantic import verification."""
+    name = str(candidate_macro.get("m_name", ""))
+    before_same_name = macros_named(before_state, name)
+    after_same_name = macros_named(after_state, name)
+    before_semantic = [m for m in before_same_name if semantic_matches(candidate_macro, m)]
+    after_semantic = [m for m in after_same_name if semantic_matches(candidate_macro, m)]
+    new_semantic = newly_added_semantic_matches(before_semantic, after_semantic)
+    wiped = after_count < before_count and not replace
+
+    diagnostics = {
+        "before_same_name": len(before_same_name),
+        "after_same_name": len(after_same_name),
+        "before_semantic": len(before_semantic),
+        "after_semantic": len(after_semantic),
+        "new_semantic": len(new_semantic),
+    }
+
     if replace:
-        expected_count = before_count - before_match_count + 1
-        wiped = after_count < expected_count
-        success = (
-            not wiped
-            and after_match_count == 1
-            and after_count == expected_count
-            and after_hash != before_hash
-        )
+        stable_noop = False
+        if len(before_same_name) == 1 and len(after_same_name) == 1:
+            before_guid = stable_macro_guid(before_same_name[0])
+            after_guid = stable_macro_guid(after_same_name[0])
+            stable_noop = (
+                before_guid is not None
+                and before_guid == after_guid
+                and semantic_matches(candidate_macro, before_same_name[0])
+                and semantic_matches(candidate_macro, after_same_name[0])
+            )
+        success = len(after_same_name) == 1 and len(after_semantic) == 1 and not stable_noop
     elif allow_existing:
-        wiped = after_count < before_count
-        success = (
-            not wiped
-            and after_count == before_count + 1
-            and after_match_count == before_match_count + 1
-        )
+        success = after_count == before_count + 1 and len(new_semantic) == 1
     else:
-        wiped = after_count < before_count
-        success = not wiped and after_count == before_count + 1 and after_match_count == 1
-    return success, wiped
+        success = (
+            after_count == before_count + 1 and len(after_semantic) == 1 and len(new_semantic) == 1
+        )
+    return success, wiped, diagnostics
+
+
+def auto_accept_request(endpoint: str, *, timeout: int = 5) -> tuple[bool, int | None, str]:
+    url = f"{phone_http_base()}/{endpoint.lstrip('/')}"
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            return True, response.status, body
+    except TimeoutError:
+        return True, None, "timed out waiting for MacroDroid HTTP response"
+    except (URLError, OSError) as exc:
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            return True, None, "timed out waiting for MacroDroid HTTP response"
+        return False, None, str(exc)
 
 
 def main() -> int:
@@ -244,7 +407,7 @@ def main() -> int:
             "Requires MACRODROID_AUTO_IMPORT=1."
         )
     )
-    parser.add_argument("macro_file", help="official MacroDroid .macro wrapper JSON")
+    parser.add_argument("macro_file", nargs="?", help="official MacroDroid .macro wrapper JSON")
     parser.add_argument(
         "--allow-existing",
         action="store_true",
@@ -267,9 +430,42 @@ def main() -> int:
         action="store_true",
         help="only run local validation and duplicate/name parsing; no phone interaction",
     )
+    parser.add_argument(
+        "--auto-accept",
+        action="store_true",
+        help="arm the on-phone MacroDroid import harness, launch import UI, then call /macrodroid-import-accept",
+    )
+    parser.add_argument(
+        "--auto-accept-delay",
+        type=float,
+        default=AUTO_ACCEPT_DELAY_SECONDS,
+        help=f"seconds between import UI launch and accept endpoint call (default: {AUTO_ACCEPT_DELAY_SECONDS})",
+    )
+    parser.add_argument(
+        "--disarm-auto-accept",
+        action="store_true",
+        help="call /macrodroid-import-disarm and exit; macro_file is not required",
+    )
+    parser.add_argument(
+        "--before-export",
+        help="use this existing MacroDroid export as the pre-import state instead of pulling",
+    )
+    parser.add_argument(
+        "--write-after-export",
+        help="write the verified post-import export JSON to this path for batch chaining",
+    )
     args = parser.parse_args()
     if args.allow_existing and args.replace:
         parser.error("--allow-existing and --replace are mutually exclusive")
+
+    if args.disarm_auto_accept:
+        ok, status, body = auto_accept_request("macrodroid-import-disarm")
+        log_event({"result": "auto_accept_disarm", "ok": ok, "status": status, "body": body[-500:]})
+        print(body.strip() if body else f"auto-accept disarm status={status} ok={ok}")
+        return 0 if ok else 10
+
+    if not args.macro_file:
+        parser.error("macro_file is required unless --disarm-auto-accept is used")
 
     local = Path(args.macro_file).expanduser().resolve()
     if not local.exists():
@@ -278,6 +474,7 @@ def main() -> int:
 
     validate(local)
     name, data = macro_name(local)
+    candidate_macro = data["macro"]
     digest = sha256(local)
 
     if args.validate_only:
@@ -293,7 +490,14 @@ def main() -> int:
         return 3
 
     try:
-        before, before_path = pull_state()
+        if args.before_export:
+            before_path = Path(args.before_export).expanduser().resolve()
+            with before_path.open("r", encoding="utf-8") as f:
+                before = json.load(f)
+            if not isinstance(before, dict) or not isinstance(before.get("macroList"), list):
+                raise RuntimeError(f"not a MacroDroid export: {before_path}")
+        else:
+            before, before_path = pull_state()
     except RuntimeError as exc:
         log_event(
             {
@@ -350,6 +554,24 @@ def main() -> int:
         return 8
     print(f"Staged {name!r} to {remote_path}")
 
+    if args.auto_accept:
+        ok, status, body = auto_accept_request("macrodroid-import-arm")
+        log_event(
+            {
+                "result": "auto_accept_arm",
+                "ok": ok,
+                "status": status,
+                "body": body[-500:],
+                "macro": name,
+            }
+        )
+        if not ok:
+            print(f"ERROR: failed to arm MacroDroid import harness: {body}", file=sys.stderr)
+            return 10
+        print(
+            f"Armed MacroDroid import auto-accept TTL ({AUTO_ACCEPT_TTL_SECONDS // 60} min): {body.strip()}"
+        )
+
     launched = launch_view_intent(remote_path, args.mime, wait=not args.no_launch_wait)
     if launched.stdout:
         print(launched.stdout, end="")
@@ -373,7 +595,25 @@ def main() -> int:
         print("ERROR: MacroDroid file VIEW intent launch failed", file=sys.stderr)
         return 5
 
-    if args.wait_seconds > 0:
+    if args.auto_accept:
+        if args.auto_accept_delay > 0:
+            time.sleep(args.auto_accept_delay)
+        ok, status, body = auto_accept_request("macrodroid-import-accept")
+        log_event(
+            {
+                "result": "auto_accept_click",
+                "ok": ok,
+                "status": status,
+                "body": body[-500:],
+                "macro": name,
+            }
+        )
+        print(body.strip() if body else f"auto-accept click status={status} ok={ok}")
+        # Only the pre-click delay is intentional: it lets MacroDroid render the
+        # import prompt before the harness click.  Do not add a blind post-click
+        # sleep here; verification below triggers a fresh export and observes the
+        # resulting state.
+    elif args.wait_seconds > 0:
         time.sleep(args.wait_seconds)
 
     try:
@@ -394,16 +634,19 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 8
     after_count, after_hash = summarize_state(after, after_path)
+    if args.write_after_export:
+        Path(args.write_after_export).expanduser().write_text(
+            json.dumps(after, sort_keys=True), encoding="utf-8"
+        )
     after_matches = macros_named(after, name)
-    success, wiped = evaluate_import_result(
+    success, wiped, diagnostics = evaluate_import_result(
         replace=args.replace,
         allow_existing=args.allow_existing,
+        candidate_macro=candidate_macro,
+        before_state=before,
+        after_state=after,
         before_count=before_count,
-        before_match_count=len(before_matches),
-        before_hash=before_hash,
         after_count=after_count,
-        after_match_count=len(after_matches),
-        after_hash=after_hash,
     )
 
     event = {
@@ -419,6 +662,8 @@ def main() -> int:
         "after_hash": after_hash,
         "matches_before": len(before_matches),
         "matches_after": len(after_matches),
+        "semantic_diagnostics": diagnostics,
+        "candidate_fingerprint": macro_semantic_fingerprint(candidate_macro),
         "replace": args.replace,
         "allow_existing": args.allow_existing,
         "mime": args.mime,
@@ -450,7 +695,7 @@ def main() -> int:
         file=sys.stderr,
     )
     print(
-        f"State: before_count={before_count} after_count={after_count} matches_after={len(after_matches)}",
+        f"State: before_count={before_count} after_count={after_count} matches_after={len(after_matches)} semantic={diagnostics}",
         file=sys.stderr,
     )
     print(f"Log: {LOG_PATH}", file=sys.stderr)

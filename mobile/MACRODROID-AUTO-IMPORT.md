@@ -1,6 +1,6 @@
 # MacroDroid Auto-Import Discovery
 
-Status: experimental, fail-closed.
+Status: gated, fail-closed. Direct file-handler launch is supported; optional MacroDroid accessibility auto-accept is available only through the explicit harness gate.
 
 ## Baseline from discovery
 
@@ -85,12 +85,52 @@ Behavior:
    `~/storage/downloads/MacroDroid/auto-import/` on Termux, resolved to the
    shared Android downloads path before launch.
 6. Launches MacroDroid's explicit `.macro` VIEW handler.
-7. Pulls state again and returns success only if macro count did not decrease,
-   exactly one new macro was added, and the target macro name exists.
-8. Logs file, macro name, SHA256, counts, export hashes, timestamp, and result to:
+7. Pulls state again and returns success only after semantic verification:
+   - default mode: exactly one newly added same-name macro semantically matches the candidate
+   - `--replace`: exactly one same-name macro remains and it semantically matches the candidate
+   - `--allow-existing`: legacy duplicate-test mode; one newly added semantic duplicate is required
+8. Logs file, macro name, SHA256, counts, export hashes, candidate semantic fingerprint, timestamp, and result to:
    `~/.cache/macrodroid-import/import.log`.
 
-Expected current limitation: without a proven non-UI confirmation path, the command may return nonzero with `not_confirmed` after successfully launching MacroDroid's review/import UI.
+Verification does not trust export-hash movement by itself. MacroDroid can mutate export state or add duplicates while rejecting or ignoring the intended candidate; import success requires the live export to contain the intended trigger/action/constraint structure and candidate-provided values.
+
+Without the on-phone harness, the command may return nonzero with `not_confirmed` after successfully launching MacroDroid's review/import UI because MacroDroid still requires a final Add/Import prompt.
+
+
+## Gated auto-accept harness
+
+`mobile/macros/macrodroid-import-harness.macro` provides the sanctioned accessibility clicker for dev sessions. Import it manually once through the official MacroDroid path, then leave it enabled only if the endpoint gate behavior has been verified.
+
+Endpoints on the phone MacroDroid HTTP server:
+
+- `/macrodroid-import-arm` — sets global `md_import_auto_accept_enabled=true` and resets/starts stopwatch `macrodroid_import_auto_accept_ttl`.
+- `/macrodroid-import-disarm` — sets the global gate false and resets the stopwatch.
+- `/macrodroid-import-accept` — clicks the MacroDroid import prompt only while the global gate is true and the stopwatch is running under 30 minutes.
+
+The click currently uses UI Interaction XY percentages at `88%,93%` near the bottom-right prompt button. This is the fragile part of the harness. It can work when the phone is awake and MacroDroid renders the expected import prompt, but it can miss when the phone is off/locked, when a prior prompt is still foregrounded, or when the prompt layout shifts. If this misses on the live phone, do **not** paper over it with a long blind sleep. The next harness revision should prefer a UI Interaction click by text/content description/view target for MacroDroid's actual Add/Import button, with XY only as a fallback.
+
+Desktop usage:
+
+```bash
+MACRODROID_AUTO_IMPORT=1 macrodroid-import --auto-accept path/to/macro.macro
+MACRODROID_AUTO_IMPORT=1 macrodroid-import --disarm-auto-accept
+```
+
+`--auto-accept` arms/refreshes the 30-minute TTL, launches MacroDroid's first-party file handler, waits only for the prompt-render gap before calling `/macrodroid-import-accept`, then verifies from a fresh live export. A short pre-click UI-load delay is legitimate; a post-click magic-number delay is not. It still fails closed if the exported macro does not semantically match the candidate.
+
+For several back-to-back imports, use the batch wrapper. It validates every file before touching the phone, pulls one initial export, imports sequentially with per-file auto-accept, chains each verified post-import export as the next file's pre-state, stops on first failure, and disarms at the end by default:
+
+```bash
+MACRODROID_AUTO_IMPORT=1 macrodroid-import-batch macro-a.macro macro-b.macro macro-c.macro
+MACRODROID_AUTO_IMPORT=1 macrodroid-import-batch --replace macro-a.macro macro-b.macro
+```
+
+Batch timing notes from live tests:
+
+- With the phone off/locked, auto-accept can arm and log clicks without completing the import; keep the phone awake/unlocked for live batch tests until the harness is changed to target the actual button.
+- A two-probe batch succeeded once the phone was awake, verifying both imports by fresh exports.
+- Reducing the pre-click UI-render delay too far (`0`/`0.5s`) races MacroDroid's prompt and misses. `1.5s`/`2.0s` were still flaky in later prompt states with the XY clicker. Treat the UI-targeting bug, not sleeps, as the remaining speed/reliability gate.
+- The batch wrapper no longer needs a blind post-click sleep; verification export is the event/state observation boundary.
 
 ## Confirmed import behavior after live prompt test
 

@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# macrodroid-import-batch - sequential gated MacroDroid .macro imports
+# TAGS: mobile, macrodroid
+# AUDIENCE: human, agent
+"""Import several MacroDroid .macro files sequentially with per-file verification.
+
+The batch path pre-validates every candidate before phone interaction, pulls the
+phone export once, then chains each successful import's post-export into the next
+import as its pre-state.  This preserves semantic verification without doing an
+extra pre-pull for every file.  The only intentional timing gap is the UI render
+wait before the auto-accept click.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+IMPORT_CMD = str(Path(__file__).resolve().with_name("macrodroid-import"))
+STATE_CMD = str(Path(__file__).resolve().with_name("macrodroid-state"))
+
+
+def run(cmd: list[str], *, env: dict[str, str] | None = None) -> int:
+    print("+ " + " ".join(cmd), flush=True)
+    proc = subprocess.run(cmd, env=env)
+    return proc.returncode
+
+
+def run_capture(cmd: list[str], *, env: dict[str, str] | None = None) -> tuple[int, str]:
+    print("+ " + " ".join(cmd), flush=True)
+    proc = subprocess.run(cmd, env=env, text=True, capture_output=True)
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    return proc.returncode, proc.stdout
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Sequential gated MacroDroid batch importer")
+    parser.add_argument(
+        "macro_files", nargs="+", help="official .macro JSON files to import in order"
+    )
+    parser.add_argument("--replace", action="store_true", help="pass --replace for each import")
+    parser.add_argument(
+        "--allow-existing", action="store_true", help="pass --allow-existing for each import"
+    )
+    parser.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=0.0,
+        help="legacy non-auto-accept verification wait; auto-accept batch uses export verification instead",
+    )
+    parser.add_argument(
+        "--auto-accept-delay",
+        type=float,
+        default=2.0,
+        help="UI render wait before each accept click (default: 2.0)",
+    )
+    parser.add_argument(
+        "--keep-armed", action="store_true", help="do not disarm auto-accept after the batch"
+    )
+    args = parser.parse_args()
+
+    if args.replace and args.allow_existing:
+        parser.error("--replace and --allow-existing are mutually exclusive")
+
+    files = [Path(p).expanduser().resolve() for p in args.macro_files]
+    missing = [str(p) for p in files if not p.exists()]
+    if missing:
+        print("ERROR: missing file(s): " + ", ".join(missing), file=sys.stderr)
+        return 2
+
+    print(f"Pre-validating {len(files)} MacroDroid macro(s)...")
+    for path in files:
+        rc = run([IMPORT_CMD, "--validate-only", str(path)])
+        if rc != 0:
+            print(f"ERROR: validation failed before phone interaction: {path}", file=sys.stderr)
+            return rc
+
+    if os.environ.get("MACRODROID_AUTO_IMPORT") != "1":
+        print(
+            "ERROR: set MACRODROID_AUTO_IMPORT=1 to enable batch phone interaction", file=sys.stderr
+        )
+        return 3
+
+    env = os.environ.copy()
+    env["MACRODROID_AUTO_IMPORT"] = "1"
+    completed = 0
+    with tempfile.TemporaryDirectory(prefix="macrodroid-import-batch-") as tmpdir:
+        tmp = Path(tmpdir)
+        rc, stdout = run_capture([STATE_CMD, "--pull"], env=env)
+        if rc != 0:
+            return rc
+        pulled = Path(stdout.strip().splitlines()[-1]).expanduser().resolve()
+        current_export = tmp / "before-0.mdr"
+        shutil.copyfile(pulled, current_export)
+
+        try:
+            for index, path in enumerate(files, 1):
+                print(f"\n=== MacroDroid batch import {index}/{len(files)}: {path.name} ===")
+                next_export = tmp / f"after-{index}.mdr"
+                cmd = [
+                    IMPORT_CMD,
+                    "--auto-accept",
+                    "--before-export",
+                    str(current_export),
+                    "--write-after-export",
+                    str(next_export),
+                    "--wait-seconds",
+                    str(args.wait_seconds),
+                    "--auto-accept-delay",
+                    str(args.auto_accept_delay),
+                ]
+                if args.replace:
+                    cmd.append("--replace")
+                if args.allow_existing:
+                    cmd.append("--allow-existing")
+                cmd.append(str(path))
+                rc = run(cmd, env=env)
+                if rc != 0:
+                    print(
+                        f"ERROR: batch stopped at {path} (rc={rc}); later files were not imported",
+                        file=sys.stderr,
+                    )
+                    return rc
+                current_export = next_export
+                completed += 1
+            print(f"\nOK: imported {completed}/{len(files)} macro(s)")
+            return 0
+        finally:
+            if not args.keep_armed:
+                print("\nDisarming MacroDroid import auto-accept harness...")
+                run([IMPORT_CMD, "--disarm-auto-accept"], env=env)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

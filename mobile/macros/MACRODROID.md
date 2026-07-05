@@ -163,3 +163,17 @@ set -e
 for f in mobile/macros/tts-*.macro; do macrodroid-validate "$f"; done
 ./token-api/.venv/bin/python -m pytest -q mobile/tests/test_tts_phone_macros.py
 ```
+
+
+## Import Harness
+
+| File | Macro | Endpoint(s) | Purpose |
+|------|-------|-------------|---------|
+| `macrodroid-import-harness.macro` | MacroDroid Import Harness | `/macrodroid-import-arm`, `/macrodroid-import-disarm`, `/macrodroid-import-accept` | Gated 30-minute auto-accept helper for sanctioned `macrodroid-import --auto-accept` and `macrodroid-import-batch` sessions. |
+
+Operational notes:
+
+- The harness is explicitly gated: arm before a launch, accept only inside the 30-minute TTL, disarm after batch completion.
+- The current accept action is an XY percentage click (`88%,93%`) on the expected bottom-right MacroDroid import button. Keep the phone awake/unlocked for live tests. If the click misses, prefer replacing this with a text/content/view-targeted UI Interaction click; do not add long magic-number sleeps.
+- Batch imports should use one initial export plus per-file post-import export verification. A short pre-click UI-render delay is acceptable; post-click blind sleeping is not the synchronization primitive.
+- Live cleanup still requires manual MacroDroid deletion of test probes such as `Harness Auto Accept Probe ...` and any `Harness * Probe ...` batch probes. Do not use whole `.mdr` restore as a cleanup shortcut.
