@@ -3,7 +3,8 @@
 # TAGS: tmux, daemon
 # AUDIENCE: human, agent
 #
-# Usage: tmuxctld-ctl attach [session]              # blessed human tmux attach
+# Usage: tmuxctld-ctl attach [session]              # self-heal workspace + attach
+#        tmuxctld-ctl workspace [session]           # self-heal workspace, no attach
 #        tmuxctld-ctl <status|health|logs>          # read-only inspection
 #        tmuxctld-ctl <start|restart|stop>          # delegate to launchd
 #        tmuxctld-ctl install                       # sync plist + (re)bootstrap
@@ -27,8 +28,162 @@ DST_PLIST="${HOME}/Library/LaunchAgents/${PLIST_NAME}"
 STDOUT_LOG="${HOME}/.claude/tmuxctld-stdout.log"
 STDERR_LOG="${HOME}/.claude/tmuxctld-stderr.log"
 DOMAIN="gui/$(id -u)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+TMUXCTLD_PING_BIN="${TMUXCTLD_PING_BIN:-${REPO_ROOT}/cli-tools/bin/tmuxctld-ping}"
+NAS_PATH_LIB="${REPO_ROOT}/cli-tools/lib/nas-path.sh"
+TOKEN_API_NAS_MOUNT="${REPO_ROOT}/token-api/nas_mount.py"
+WORKSPACE_TIMEOUT="${TMUXCTLD_WORKSPACE_MAX_TIME:-180}"
+NAS_WAIT_TIMEOUT="${TMUXCTLD_CTL_NAS_WAIT_TIMEOUT:-120}"
+NAS_WAIT_INTERVAL="${TMUXCTLD_CTL_NAS_WAIT_INTERVAL:-2}"
+DAEMON_WAIT_TIMEOUT="${TMUXCTLD_CTL_DAEMON_WAIT_TIMEOUT:-20}"
 
 die() { echo "Error: $*" >&2; exit 1; }
+warn() { echo "Warning: $*" >&2; }
+
+raw_tmux() {
+  env IMPERIUM_TMUX_RAW=1 tmux "$@"
+}
+
+vault_mounted() {
+  local vault="${1:-}"
+  [[ -n "$vault" && -d "$vault" && -d "$vault/Personas" && -d "$vault/Terra" ]]
+}
+
+ensure_imperium_mounted() {
+  [[ "${TMUXCTLD_CTL_NAS_WAIT_DISABLE:-}" == "1" ]] && return 0
+
+  local imperium="/Volumes/Imperium" vault waited=0
+  if [[ -f "$NAS_PATH_LIB" ]]; then
+    # shellcheck source=/dev/null
+    source "$NAS_PATH_LIB" >/dev/null 2>&1 || true
+    imperium="${IMPERIUM:-$imperium}"
+  fi
+  vault="${imperium%/}/Imperium-ENV"
+  vault_mounted "$vault" && return 0
+
+  warn "Imperium vault is not mounted at ${vault}; attempting NAS recovery before tmux workspace startup."
+
+  if [[ -f "$TOKEN_API_NAS_MOUNT" ]]; then
+    PYTHONPATH="${REPO_ROOT}/token-api${PYTHONPATH:+:$PYTHONPATH}" python3 - "$imperium" <<'PY' || true
+import sys
+import nas_mount
+
+ok, msg = nas_mount.ensure_mounted(sys.argv[1])
+if ok:
+    print(f"NAS: {sys.argv[1]} mounted")
+elif msg:
+    print(f"NAS: {msg}", file=sys.stderr)
+PY
+  fi
+
+  vault_mounted "$vault" && return 0
+
+  [[ "$NAS_WAIT_TIMEOUT" =~ ^[0-9]+$ ]] || die "TMUXCTLD_CTL_NAS_WAIT_TIMEOUT must be an integer"
+  [[ "$NAS_WAIT_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "TMUXCTLD_CTL_NAS_WAIT_INTERVAL must be a positive integer"
+  while [[ "$waited" -lt "$NAS_WAIT_TIMEOUT" ]]; do
+    sleep "$NAS_WAIT_INTERVAL" 2>/dev/null || sleep 2
+    waited=$((waited + NAS_WAIT_INTERVAL))
+    vault_mounted "$vault" && return 0
+  done
+
+  die "Imperium vault is still unavailable at ${vault}; refusing to build a ghost tmux workspace. Set TMUXCTLD_CTL_NAS_WAIT_DISABLE=1 only for an intentional degraded shell-only start."
+}
+
+session_exists() {
+  local session="$1"
+  raw_tmux has-session -t "$session" >/dev/null 2>&1
+}
+
+workspace_needs_rebuild() {
+  local session="$1" panes
+  session_exists "$session" || return 0
+  panes="$(raw_tmux list-panes -a -F '#{session_name} #{@PANE_ID} #{pane_current_command} #{pane_current_path}' 2>/dev/null || true)"
+  for label in \
+    "council:custodes" \
+    "council:malcador" \
+    "council:administratum" \
+    "mechanicus:fabricator-general" \
+    "reservists:token-os"
+  do
+    grep -Eq "^${session}[[:space:]]+${label}[[:space:]]+" <<<"$panes" || return 0
+  done
+  return 1
+}
+
+main_has_clients() {
+  local session="$1"
+  [[ -n "$(raw_tmux list-clients -t "$session" -F '#{client_tty}' 2>/dev/null || true)" ]]
+}
+
+tmuxctld_http_healthy() {
+  curl -sf "${DAEMON_URL}/health" >/dev/null 2>&1
+}
+
+ensure_tmuxctld_http() {
+  [[ "${TMUXCTLD_CTL_SKIP_DAEMON_HEALTH:-}" == "1" ]] && return 0
+  tmuxctld_http_healthy && return 0
+
+  warn "tmuxctld is not responding on ${DAEMON_URL}; kickstarting launchd service before workspace recovery."
+  cmd_start >&2
+
+  local waited=0
+  [[ "$DAEMON_WAIT_TIMEOUT" =~ ^[0-9]+$ ]] || die "TMUXCTLD_CTL_DAEMON_WAIT_TIMEOUT must be an integer"
+  while [[ "$waited" -lt "$DAEMON_WAIT_TIMEOUT" ]]; do
+    sleep 1
+    waited=$((waited + 1))
+    tmuxctld_http_healthy && return 0
+  done
+
+  die "tmuxctld health endpoint still not responding on ${DAEMON_URL} after kickstart"
+}
+
+post_tmuxctld() {
+  local path="$1"; shift
+  [[ -x "$TMUXCTLD_PING_BIN" ]] || die "tmuxctld-ping not found/executable: $TMUXCTLD_PING_BIN"
+  ensure_tmuxctld_http
+  TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="$WORKSPACE_TIMEOUT" \
+    "$TMUXCTLD_PING_BIN" POST "$path" "$@"
+  echo
+}
+
+cmd_workspace() {
+  local session="main" attach=false rebuild=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --attach) attach=true; shift ;;
+      --rebuild|--restart) rebuild=true; shift ;;
+      --) shift; break ;;
+      -*) die "unknown workspace option: $1" ;;
+      *) session="$1"; shift ;;
+    esac
+  done
+  [[ $# -eq 0 ]] || die "workspace accepts at most one session"
+  [[ -n "$session" && "$session" != -* ]] || die "invalid session: ${session}"
+
+  ensure_imperium_mounted
+
+  if ! session_exists "$session"; then
+    echo "Creating tmux workspace '${session}' through tmuxctld..."
+    post_tmuxctld /create "session=${session}"
+  elif [[ "$rebuild" == true ]]; then
+    echo "Rebuilding tmux workspace '${session}' through tmuxctld..."
+    post_tmuxctld /restart "session=${session}" "dry_run=false"
+  elif workspace_needs_rebuild "$session"; then
+    if main_has_clients "$session"; then
+      warn "Workspace '${session}' looks incomplete but has attached clients; not auto-rebuilding. Run: tmuxctld-ctl workspace ${session} --rebuild"
+    else
+      echo "Workspace '${session}' looks incomplete; rebuilding through tmuxctld..."
+      post_tmuxctld /restart "session=${session}" "dry_run=false"
+    fi
+  else
+    echo "Workspace '${session}' is ready."
+  fi
+
+  session_exists "$session" || die "tmux session not found after recovery: ${session}"
+  if [[ "$attach" == true ]]; then
+    exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$session"
+  fi
+}
 
 cmd_attach() {
   local session="${1:-main}"
@@ -36,13 +191,10 @@ cmd_attach() {
   [[ $# -eq 0 ]] || die "attach accepts at most one session"
   [[ -n "$session" && "$session" != -* ]] || die "invalid session: ${session}"
 
-  # This is the sanctioned human-attach path. The public tmux shim deliberately
-  # routes raw human attach/new invocations into the tx tombstone. Keep that
-  # guard intact: only this daemon-owned control surface performs the raw attach
-  # on the operator's behalf.
-  env IMPERIUM_TMUX_RAW=1 tmux has-session -t "$session" \
-    || die "tmux session not found: ${session}"
-  exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$session"
+  # This is the sanctioned human-attach path. It owns startup recovery: wait for
+  # the Imperium vault, create a missing workspace through tmuxctld, repair
+  # obvious incomplete starts, then perform the raw attach.
+  cmd_workspace "$session" --attach
 }
 
 cmd_start() {
@@ -117,12 +269,13 @@ cmd_logs() {
 }
 
 [[ $# -eq 0 ]] && {
-  echo "Usage: tmuxctld-ctl <attach|status|health|logs|start|restart|stop|install>"
+  echo "Usage: tmuxctld-ctl <attach|workspace|status|health|logs|start|restart|stop|install>"
   exit 1
 }
 
 case "$1" in
   attach)  shift; cmd_attach "$@" ;;
+  workspace) shift; cmd_workspace "$@" ;;
   start)   cmd_start ;;
   restart) cmd_restart ;;
   stop)    cmd_stop ;;
@@ -131,8 +284,10 @@ case "$1" in
   status)  cmd_status ;;
   logs)    shift; cmd_logs "$@" ;;
   -h|--help)
-    echo "Usage: tmuxctld-ctl <attach|status|health|logs|start|restart|stop|install>"
-    echo "  attach [session]       blessed human attach (default: main)"
+    echo "Usage: tmuxctld-ctl <attach|workspace|status|health|logs|start|restart|stop|install>"
+    echo "  attach [session]       self-heal workspace + blessed human attach (default: main)"
+    echo "  workspace [session]    self-heal workspace without attaching"
+    echo "    --rebuild            force tmuxctld restart/rebuild of the workspace"
     echo "  status, health, logs   read-only inspection"
     echo "  start, restart         -> launchctl kickstart -k (launchd, authoritative)"
     echo "  stop                   -> launchctl bootout (disables KeepAlive)"

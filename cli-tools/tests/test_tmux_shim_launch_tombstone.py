@@ -1,4 +1,4 @@
-"""Regression pins for the tmux launch-command tombstone."""
+"""Regression pins for tmux launch-command routing."""
 
 from __future__ import annotations
 
@@ -17,9 +17,14 @@ def _fake_real_tmux(tmp_path: pathlib.Path) -> pathlib.Path:
     return fake
 
 
-def test_raw_human_attach_still_routes_to_tx_tombstone(tmp_path: pathlib.Path) -> None:
+def test_raw_human_attach_routes_to_tmuxctld_attach(tmp_path: pathlib.Path) -> None:
+    ctl_log = tmp_path / "ctl.argv0"
+    fake_ctl = tmp_path / "tmuxctld-ctl"
+    fake_ctl.write_text(f"#!/usr/bin/env bash\nprintf '%s\\0' \"$@\" > {ctl_log!s}\nexit 0\n")
+    fake_ctl.chmod(0o755)
     env = os.environ.copy()
     env["IMPERIUM_TMUX_BIN"] = str(_fake_real_tmux(tmp_path))
+    env["TMUXCTLD_CTL_BIN"] = str(fake_ctl)
     env.pop("IMPERIUM_TMUX_RAW", None)
 
     proc = subprocess.run(
@@ -29,8 +34,9 @@ def test_raw_human_attach_still_routes_to_tx_tombstone(tmp_path: pathlib.Path) -
         capture_output=True,
     )
 
-    assert proc.returncode == 1
-    assert "410 GONE: cli-tools/bin/tx" in proc.stderr
+    assert proc.returncode == 0
+    argv = [part.decode() for part in ctl_log.read_bytes().split(b"\0") if part]
+    assert argv == ["attach", "main"]
 
 
 def test_raw_env_remains_internal_escape_hatch(tmp_path: pathlib.Path) -> None:

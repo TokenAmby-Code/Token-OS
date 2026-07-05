@@ -14,7 +14,7 @@ _BIN_DIR="$(dirname "$_THIS")"
 _REPO_ROOT="${TOKEN_OS:-$(cd "${_BIN_DIR}/../.." && pwd)}"
 _TMUXCTLD_LIB_DIR="${TMUXCTLD_LIB:-${_REPO_ROOT}/tmuxctld/lib}"
 _CLI_LIB_DIR="${_REPO_ROOT}/cli-tools/lib"
-_TX_BIN="${_BIN_DIR}/tx"
+_TMUXCTLD_CTL_BIN="${TMUXCTLD_CTL_BIN:-${_REPO_ROOT}/tmuxctld/bin/tmuxctld-ctl}"
 
 # Hard recursion fuse — belt-and-suspenders, independent of resolution
 # correctness. If the shim ever re-enters itself (a poisoned
@@ -103,6 +103,24 @@ is_launch_command() {
             return 0 ;;
         *)
             return 1 ;;
+    esac
+}
+
+launch_session_name() {
+    local cmd="${1:-}" arg next=0
+    shift 2>/dev/null || true
+    for arg in "$@"; do
+        if [[ "$next" == 1 ]]; then
+            printf '%s\n' "$arg"
+            return 0
+        fi
+        case "$arg" in
+            -t|-s) next=1 ;;
+            -t*|-s*) printf '%s\n' "${arg:2}"; return 0 ;;
+        esac
+    done
+    case "$cmd" in
+        attach|attach-session|new|new-session) printf 'main\n' ;;
     esac
 }
 
@@ -313,7 +331,7 @@ runtime_invariant_preflight() {
 }
 
 if [[ "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_launch_command "$@"; then
-    exec "$_TX_BIN" start
+    exec "$_TMUXCTLD_CTL_BIN" attach "$(launch_session_name "$@")"
 fi
 
 if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" == "1" ]]; then

@@ -700,12 +700,12 @@ def test_implemented_route_keybinds_use_concise_message_not_raw_slug() -> None:
         assert ">/dev/null 2>&1 ||" in line
 
 
-def test_workspace_launcher_remains_on_tmux_run_and_is_documented() -> None:
+def test_workspace_launcher_uses_self_healing_tmuxctld_attach() -> None:
     conf = CONF.read_text(encoding="utf-8")
     line = _line_starting("bind W ")
-    assert line == 'bind W run-shell "tmux-run tx start"'
-    assert "# Workspace launcher. Deliberately left as the shell CLI" in conf
-    assert "out of scope for daemon keybind rebinding" in conf
+    assert line == 'bind W run-shell "tmuxctld-ctl attach"'
+    assert "# Workspace launcher. This is the single self-healing startup path" in conf
+    assert "creates/repairs the workspace through tmuxctld" in conf
 
 
 def _any_binding_block() -> str:
