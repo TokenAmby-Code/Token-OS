@@ -1,12 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { focusPane, useOpsState, useTimerHistory, useOpsGraph, useSessionDocs } from './api';
 import type { TtsCurrent } from './types';
 import { formatClock } from './format';
+import { buildCockpitLayoutModel, type CockpitLayoutModel } from './layoutModel';
 import { HudRings } from './components/TopStrip';
 import { TimerGraph } from './components/TimerGraph';
 import { InstancesPanel, type Selection } from './components/InstancesPanel';
 import { AssertionsPanel, AttentionPanel, EventsPanel, StatusCards } from './components/SidePanels';
-import { VoiceQueuePanel } from './components/VoiceQueuePanel';
 import { TtsStrip } from './components/TtsStrip';
 import { PipelinePanel } from './components/PipelinePanel';
 import { OpsGraph } from './components/OpsGraph';
@@ -30,6 +30,26 @@ function Panel({
       </header>
       {children}
     </section>
+  );
+}
+
+function DrawerRails({ layout }: { layout: CockpitLayoutModel }) {
+  return (
+    <>
+      {layout.drawerSummaries.map((rail) => (
+        <aside
+          key={rail.side}
+          className={`drawer-rail drawer-rail--${rail.side} drawer-rail--${rail.tone}`}
+          aria-label={`${rail.label}: ${rail.count}`}
+          title={`${rail.label}: ${rail.reason}`}
+        >
+          <span className="drawer-rail__tab">
+            <span className="drawer-rail__label">{rail.label}</span>
+            <span className="drawer-rail__count">{rail.count}</span>
+          </span>
+        </aside>
+      ))}
+    </>
   );
 }
 
@@ -114,6 +134,7 @@ export function App() {
   const docs = useSessionDocs();
 
   const state = ops.data;
+  const layout = useMemo(() => (state ? buildCockpitLayoutModel(state) : null), [state]);
   const selection = useInstanceSelection(
     state?.tts.current ?? null,
     state ? state.instances.active.map((i) => i.id) : [],
@@ -140,12 +161,14 @@ export function App() {
       <div className="cockpit__grain" aria-hidden />
 
       {/* Free-floating, corner-aligned dials. Fixed to the viewport, overlays
-          content, scroll-independent. Not a banner — just the gauges. */}
-      {state ? (
-        <div className="dials" aria-hidden>
-          <HudRings state={state} />
+          content, scroll-independent. Only noteworthy dials render here; the
+          expected/normal dial catalog is summarized on the right rail. */}
+      {state && layout ? (
+        <div className="dials" aria-label="Noteworthy cockpit dials">
+          <HudRings state={state} layout={layout} />
         </div>
       ) : null}
+      {layout ? <DrawerRails layout={layout} /> : null}
 
       {/* Identity + connection scroll with the page — deliberately NOT part of
           the persistent overlay. */}
@@ -172,10 +195,6 @@ export function App() {
         </div>
       </header>
 
-      {/* Slim, TTS-specific control strip — in flow after the masthead, pins to
-          the top on scroll (sticky). Not a banner; below the floating dials. */}
-      {state ? <TtsStrip state={state} refresh={ops.refresh} /> : null}
-
       {ops.loading && !state ? (
         <div className="boot">
           <div className="boot__bar"><span /></div>
@@ -189,15 +208,8 @@ export function App() {
       ) : (
         <>
           <Panel
-            title="State assertions"
-            meta={<span className="panel__meta-note">what Token-API believes is true</span>}
-          >
-            <AssertionsPanel state={state} />
-          </Panel>
-
-          <Panel
-            title="Timer posture"
-            className="panel--timerGraph"
+            title="Timer field"
+            className="panel--timerGraph timer-field"
             meta={
               <span className="panel__meta-note">
                 {timer.data
@@ -210,8 +222,11 @@ export function App() {
             {timer.data ? <TimerGraph history={timer.data} /> : <div className="chart-empty">Loading history…</div>}
           </Panel>
 
+          {layout ? <TtsStrip state={state} layout={layout} refresh={ops.refresh} /> : null}
+
           <Panel
             title="Active fleet"
+            className="panel--fleet"
             meta={
               <div className="chips">
                 {Object.entries(state.instances.counts.by_status).map(([k, v]) => (
@@ -234,6 +249,19 @@ export function App() {
             />
           </Panel>
 
+          <div className="row row--split row--supporting">
+            <Panel title="Attention evidence">
+              <AttentionPanel state={state} />
+            </Panel>
+            <Panel
+              title="State assertions"
+              className="panel--assertionsCompact"
+              meta={<span className="panel__meta-note">noteworthy only · full set on rail</span>}
+            >
+              <AssertionsPanel state={state} assertions={layout?.supportingAssertions} compact />
+            </Panel>
+          </div>
+
           <Panel
             title="Session pipeline"
             meta={
@@ -252,29 +280,13 @@ export function App() {
           </Panel>
 
           <div className="row row--split">
-            <Panel title="Attention evidence">
-              <AttentionPanel state={state} />
-            </Panel>
             <Panel title="Event stream">
               <EventsPanel events={state.events} />
             </Panel>
+            <Panel title="Subsystems">
+              <StatusCards state={state} />
+            </Panel>
           </div>
-
-          <Panel title="Subsystems">
-            <StatusCards state={state} />
-          </Panel>
-
-          <Panel
-            title="Voice / TTS queue"
-            meta={
-              <span className="panel__meta-note">
-                hot {state.tts.hot_queue_length} · pause {state.tts.pause_queue_length} · drafts{' '}
-                {state.voice_drafts?.length ?? 0}
-              </span>
-            }
-          >
-            <VoiceQueuePanel state={state} refresh={ops.refresh} />
-          </Panel>
 
           <Panel
             title="Relationship graph"

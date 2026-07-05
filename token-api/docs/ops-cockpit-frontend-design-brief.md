@@ -50,6 +50,44 @@ This is a dashboard first, control surface second. Mutations should remain Token
 
 See `docs/ops-cockpit.md` for the full contract summary.
 
+
+## Layout-model V1 update (2026-07-01)
+
+The first overhaul pass intentionally stopped short of the full circular/drawer visual system. It established the TypeScript-facing layout concepts first:
+
+- `CockpitLayoutModel` in `web/ops/src/layoutModel.ts` derives from `OpsState`.
+- `noteworthyDials` are the only dials in the floating HUD. Normal/expected dials are suppressed.
+- `hiddenDialCatalog` preserves the full dial set for a right-edge drawer/rail concept.
+- `activeTtsWaiters` keeps current speaker / non-empty queues visible, while idle TTS disappears from the main surface.
+- `drawerSummaries` provides left/right placeholder rail counts only; no functional drawer exists yet.
+
+The current production-ish V1 layout order is:
+
+1. Timer field as top anchor.
+2. Active TTS strip only when active waiters exist.
+3. Active fleet.
+4. Attention evidence + compact noteworthy assertions.
+5. Session pipeline, events, subsystems, graph as lower-priority supporting sections.
+
+For the next visual exploration, use `docs/ops-cockpit-static-mockup-brief.md` rather than adding fake behavior to the live cockpit.
+
+
+## Planned state-dial interaction invariant
+
+After the static mockup pass, the cockpit dial model should assume universal hover and click behavior.
+
+- Floating HUD state dials are icon-only. Remove visible subheaders/detail text from the floating stacks.
+- Dial text remains in the data/type model as `subtitle` / `tooltip` / `aria_label`.
+- Hover reveals the dial's text information in a tooltip.
+- Click is always defined:
+  - default: open/focus the relevant side drawer entry;
+  - TTS dial override: play/promote that TTS item;
+  - productivity/distraction override: open a sources modal showing production and distraction contributors.
+- Expanded drawer rendering shows the subtitle/detail text for every dial, similar to current ring captions.
+- Accessibility is not optional: icon-only dials still require keyboard activation and screen-reader labels.
+
+The mockup agent may demonstrate this visually, but production coding should wait until the static mockup direction lands.
+
 ## Recommended layout v2
 
 ### Top strip

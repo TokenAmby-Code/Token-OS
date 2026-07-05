@@ -1,15 +1,23 @@
 // Compact secondary panels: attention evidence, events timeline, and the
 // cron / Golden Throne / enforcement status cards.
 
-import type { OpsState } from '../types';
+import type { OpsState, StateAssertion } from '../types';
 import { formatAge, formatTime, summarizeDetails } from '../format';
 
-export function AssertionsPanel({ state }: { state: OpsState }) {
-  const assertions = state.assertions ?? [];
-  if (!assertions.length) return <p className="empty">No state assertions reported.</p>;
+export function AssertionsPanel({
+  state,
+  assertions,
+  compact = false,
+}: {
+  state: OpsState;
+  assertions?: StateAssertion[];
+  compact?: boolean;
+}) {
+  const items = assertions ?? state.assertions ?? [];
+  if (!items.length) return <p className="empty">No noteworthy state assertions.</p>;
   return (
-    <div className="assertions">
-      {assertions.map((item) => (
+    <div className={`assertions ${compact ? 'assertions--compact' : ''}`}>
+      {items.map((item) => (
         <article
           key={item.id}
           className={`assertion assertion--${item.status} assertion--conf-${item.confidence}`}

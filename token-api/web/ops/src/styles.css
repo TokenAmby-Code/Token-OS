@@ -132,6 +132,60 @@ h1, h2, h3, .eyebrow, .strip__modename, .panel__title {
   z-index: 60;
   pointer-events: none;
 }
+
+/* ── placeholder drawer rails ─────────────────────────────────────────
+   Visual affordances only. V1 does not open a drawer or persist state; the
+   rails simply prove the hidden catalog/voice-lock zones exist. */
+.drawer-rail {
+  position: fixed;
+  top: 96px;
+  bottom: 38px;
+  z-index: 45;
+  width: 25px;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.drawer-rail--left { left: 0; }
+.drawer-rail--right { right: 0; }
+.drawer-rail::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, transparent, color-mix(in srgb, var(--line-bright) 42%, transparent), transparent),
+    color-mix(in srgb, var(--surface-2) 72%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line-bright) 68%, transparent);
+  opacity: 0.82;
+}
+.drawer-rail--left::before { border-left: 0; border-radius: 0 10px 10px 0; }
+.drawer-rail--right::before { border-right: 0; border-radius: 10px 0 0 10px; }
+.drawer-rail--warn::before { border-color: color-mix(in srgb, var(--brass) 70%, transparent); }
+.drawer-rail--bad::before { border-color: color-mix(in srgb, var(--hazard) 72%, transparent); }
+.drawer-rail__tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transform: rotate(-90deg);
+  white-space: nowrap;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+.drawer-rail__count {
+  min-width: 22px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  border: 1px solid var(--line-bright);
+  color: var(--brass-bright);
+  text-align: center;
+  letter-spacing: 0;
+}
 h1 {
   margin: 0;
   font-size: clamp(26px, 3.4vw, 40px);
@@ -307,6 +361,24 @@ h1 {
 .panel--timerGraph .panel__head {
   padding: 0 2px;
 }
+.timer-field {
+  margin: 4px 0 22px;
+  padding: 10px 0 20px;
+  min-height: 310px;
+  border-bottom: 1px solid color-mix(in srgb, var(--brass-deep) 40%, transparent);
+  background:
+    radial-gradient(100% 140% at 50% -35%, rgba(86, 194, 214, 0.08), transparent 58%),
+    linear-gradient(180deg, rgba(214, 162, 63, 0.045), transparent 72%);
+}
+.timer-field .panel__head {
+  margin-bottom: 6px;
+}
+.timer-field h2 {
+  color: color-mix(in srgb, var(--text) 72%, var(--brass-bright));
+}
+.panel--fleet {
+  margin-top: 4px;
+}
 /* Relationship graph: same borderless treatment. The node canvas is one
    object — no panel chrome wrapping an inner stage frame. */
 .panel--graph {
@@ -430,6 +502,10 @@ h1 {
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
   gap: 10px;
 }
+.assertions--compact {
+  grid-template-columns: 1fr;
+  gap: 7px;
+}
 
 .assertion {
   position: relative;
@@ -439,6 +515,20 @@ h1 {
   background: var(--surface-2);
   border: 1px solid var(--line);
   min-height: 146px;
+}
+.assertions--compact .assertion {
+  min-height: 0;
+  padding: 9px 10px;
+}
+.assertions--compact .assertion__value {
+  margin: 4px 0 3px;
+  font-size: 17px;
+}
+.assertions--compact .assertion ul {
+  display: none;
+}
+.assertions--compact .assertion footer {
+  margin-top: 4px;
 }
 
 .assertion::before {
@@ -835,6 +925,42 @@ a.tag--pr { text-decoration: none; cursor: pointer; }
   font-size: 12px;
 }
 .ttsstrip__now { display: inline-flex; align-items: center; gap: 8px; min-width: 0; max-width: 46ch; }
+.ttsstrip__label {
+  color: var(--brass);
+  font-family: 'Chakra Petch', sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-size: 11px;
+}
+.ttsstrip__waiters {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 160px;
+  overflow: hidden;
+}
+.ttsstrip__waiter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 34ch;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+}
+.ttsstrip__waiter--speaking {
+  border-color: var(--phosphor-dim);
+  background: color-mix(in srgb, var(--phosphor) 8%, var(--surface));
+}
+.ttsstrip__waiter--hot {
+  border-color: var(--brass-deep);
+}
+.ttsstrip__waiter--pause {
+  opacity: 0.78;
+}
 .ttsstrip__led { width: 7px; height: 7px; border-radius: 50%; background: var(--phosphor); box-shadow: 0 0 7px var(--phosphor); animation: pulse 1.8s ease-in-out infinite; flex: none; }
 .ttsstrip__tab { color: var(--brass); letter-spacing: 0; white-space: nowrap; }
 .ttsstrip__msg { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -1114,6 +1240,9 @@ a.pcard:hover .pcard__open,
     font-size: 11px;
   }
   .ttsstrip__now { max-width: 28ch; }
+  .ttsstrip__waiters { max-width: 42vw; min-width: 0; }
+  .ttsstrip__waiter { max-width: 24ch; }
+  .ttsstrip__label { font-size: 10px; letter-spacing: 0.1em; }
   .ttsstrip__stat { letter-spacing: 0.06em; }
   .ttsstrip__route,
   .ttsstrip__div,

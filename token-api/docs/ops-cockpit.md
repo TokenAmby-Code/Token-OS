@@ -43,6 +43,7 @@ web/ops/src/
   format.ts                 # display-only formatting helpers
   modes.ts                  # visual language: mode/status/edge/node -> color + label
   mock.ts                   # mocked OpsGraph only; timer history is live
+  layoutModel.ts            # frontend-only derived layout contracts/selectors
   fonts/                    # self-hosted woff2 + generated fonts.css
   components/
     TopStrip.tsx            # glanceable persistent strip
@@ -64,9 +65,62 @@ The graph components are bespoke SVG (no chart/graph library) to keep the commit
 
 `modes.ts` is the single source of truth for state → color. Timer modes map to `--m-working` (phosphor green), `--m-multi` (cyan), `--m-distracted` (hazard red), `--m-break` (amber), `--m-idle` (gray), `--m-sleep` (violet). Break balance reads green above the zero line, hazard-red below. Stale instances, blocked edges, and down subsystems use the hazard tone; victory/completed use brass/gold. Components must read colors from these helpers, not hardcode them.
 
+### Layout model V1
+
+The cockpit now has a frontend-only layout/view-model layer in `web/ops/src/layoutModel.ts`. It derives presentation concepts from the existing `OpsState` payload without changing the `/api/ui/ops/state` wire shape. Components should consume these centralized selectors instead of hand-rolling notable/unexpected predicates.
+
+Current derived concepts:
+
+- `noteworthyDials` — only unexpected/actionable HUD dials shown in the floating ring cluster.
+- `hiddenDialCatalog` — expected/normal dials suppressed from the HUD but still counted for the right rail.
+- `activeTtsWaiters` — current speaker plus non-empty hot/pause queue items; empty/idle TTS does not render in the main surface.
+- `drawerSummaries` — visual-only left/right rail labels and counts.
+- `supportingAssertions` — compact noteworthy state assertions (`warn`, `bad`, or low confidence).
+
+`api.ts` remains the fetch/mutation boundary; `layoutModel.ts` must not fetch.
+
+
+### Dial interaction invariant — planned next visual pass
+
+All state dials should be treated as interactive objects in the TypeScript model, even when their first implementation is a placeholder.
+
+Planned invariant:
+
+- Every dial has hover text.
+- Every dial has a click behavior.
+- Default click behavior opens or focuses the relevant side drawer entry.
+- TTS dials may override click to play/promote that TTS item.
+- Productivity/distraction dials may override click to open a modal showing contributing production and distraction sources.
+- Main HUD dials are icon-only: no visible subtitle/subheader text in the floating stack.
+- The subtitle/detail text remains in the dial type, but is hidden until tooltip hover or expanded drawer rendering.
+- Drawer-expanded dials may show subtitle/detail text as current rings do now.
+
+This means the eventual dial type should not model click/hover as optional decoration. It should model them as expected behavior:
+
+```ts
+type DialInteractionKind = 'open-drawer' | 'play-tts' | 'open-sources-modal' | 'custom';
+
+type StateDial = {
+  id: string;
+  icon: string;
+  label: string;
+  subtitle: string;
+  tooltip: string;
+  tone: 'good' | 'warn' | 'bad' | 'neutral';
+  priority: number;
+  interaction: {
+    kind: DialInteractionKind;
+    target: string;
+    aria_label: string;
+  };
+};
+```
+
+Production implementation should preserve accessibility: icon-only visual rendering still needs `aria-label`, keyboard activation, and tooltip/drawer text access.
+
 ### State assertions
 
-The cockpit exposes state assertions near the top because the operator should never infer what the system believes from raw fields. Each assertion has `id`, `label`, `value`, `status`, `confidence`, `evidence[]`, `freshness_seconds`, `correction_hint`, and `details`. The first set covers timer mode, break balance, productivity, desktop attention, phone attention, fleet, enforcement, and TTS.
+State assertions remain part of the aggregate contract because the operator should not infer what the system believes from raw fields. In the V1 reshuffle, assertions are compact/supporting: noteworthy assertions render near evidence panels, while normal assertions are available through the hidden state/dial catalog concept rather than dominating the first viewport. Each assertion has `id`, `label`, `value`, `status`, `confidence`, `evidence[]`, `freshness_seconds`, `correction_hint`, and `details`.
 
 ### Timer graph specifics
 
@@ -127,6 +181,14 @@ Restart the live service after changing backend or committed frontend build asse
 token-restart --from /Volumes/Imperium/runtimes/token-os/live/token-api
 open http://localhost:7777/ui/ops
 ```
+
+## Authoritative status read model
+
+Forward status-plane direction is documented in `docs/ops-authoritative-status-read-model.md`: Token-API should expose a concise `GET /api/ops/status` read model for agents/CLI while `/api/ui/ops/state` remains the browser cockpit projection. Both should share internal builders so agents stop stitching old status commands, SQLite reads, and tmux probes.
+
+## Static mockup prompt
+
+A prompt handoff for a separate static TypeScript-ready mockup bot lives at `docs/ops-cockpit-static-mockup-brief.md`. It asks for a frozen timer-field mockup with several mode shifts/backlog and slider-driven placeholder stacks for `TTS queue` and `State dials`.
 
 ## Current limitations
 

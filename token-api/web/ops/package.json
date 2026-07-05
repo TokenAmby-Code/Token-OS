@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:layout": "rm -rf /tmp/ops-layout-test && tsc --noEmit false --module commonjs --moduleResolution node --target ES2020 --skipLibCheck --esModuleInterop --outDir /tmp/ops-layout-test src/layoutModel.ts src/layoutModel.test.ts && node /tmp/ops-layout-test/layoutModel.test.js"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.0.0",

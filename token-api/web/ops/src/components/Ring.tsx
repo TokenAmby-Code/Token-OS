@@ -24,12 +24,26 @@ export function Ring({ label, value, glyph, detail, color, ratio, tone, pulse, t
   const accent = color ?? 'var(--brass)';
   const clamped = ratio == null ? null : Math.max(0, Math.min(1, ratio));
   const dash = clamped == null ? null : `${clamped * C} ${C}`;
+  const interactive = Boolean(onClick);
   return (
     <div
-      className={`ring ${tone ? `ring--${tone}` : ''} ${pulse ? 'ring--pulse' : ''} ${onClick ? 'ring--clickable' : ''}`}
+      className={`ring ${tone ? `ring--${tone}` : ''} ${pulse ? 'ring--pulse' : ''} ${interactive ? 'ring--clickable' : ''}`}
       title={title}
       style={{ '--ring-c': accent } as React.CSSProperties}
       onClick={onClick}
+      role={interactive ? 'button' : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      aria-label={interactive ? title ?? label : undefined}
+      onKeyDown={
+        interactive
+          ? (event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                onClick?.();
+              }
+            }
+          : undefined
+      }
     >
       <div className="ring__dial">
         <svg viewBox="0 0 96 96" className="ring__svg" aria-hidden>

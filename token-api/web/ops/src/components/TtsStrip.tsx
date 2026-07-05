@@ -5,11 +5,9 @@
 // routing device, and the two hottest controls: global-mode toggle + skip.
 
 import { useState } from 'react';
-import type { OpsState, TtsGlobalMode } from '../types';
-import { skipTts, setGlobalMode } from '../api';
-
-const MODES: TtsGlobalMode[] = ['verbose', 'muted', 'silent'];
-const TTS_LANGUISHING_THRESHOLD = 5;
+import type { OpsState } from '../types';
+import type { CockpitLayoutModel } from '../layoutModel';
+import { skipTts } from '../api';
 
 /** Clamp a message to a single short glance-line for the strip. */
 function clamp(msg: string | null | undefined, n = 64): string {
@@ -18,12 +16,10 @@ function clamp(msg: string | null | undefined, n = 64): string {
   return t.length > n ? `${t.slice(0, n - 1)}…` : t;
 }
 
-export function TtsStrip({ state, refresh }: { state: OpsState; refresh: () => void }) {
+export function TtsStrip({ state, layout, refresh }: { state: OpsState; layout: CockpitLayoutModel; refresh: () => void }) {
   const tts = state.tts;
-  const current = tts.current;
   const routing = tts.routing ?? null;
-  const mode = (tts.global_mode ?? 'verbose') as TtsGlobalMode;
-  const pauseLanguishing = tts.pause_queue_length > TTS_LANGUISHING_THRESHOLD;
+  const waiters = layout.activeTtsWaiters.slice(0, 4);
 
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -43,27 +39,25 @@ export function TtsStrip({ state, refresh }: { state: OpsState; refresh: () => v
     }
   }
 
-  return (
-    <div className="ttsstrip" role="region" aria-label="TTS control strip">
-      <span className="ttsstrip__now">
-        {current ? (
-          <>
-            <span className="ttsstrip__led" aria-hidden />
-            <b className="ttsstrip__tab">{current.name || current.instance_id.slice(0, 8)}</b>
-            <span className="ttsstrip__msg" title={current.message}>
-              {clamp(current.message)}
-            </span>
-          </>
-        ) : (
-          <span className="ttsstrip__idle">idle</span>
-        )}
-      </span>
+  if (!waiters.length) return null;
 
+  return (
+    <div className="ttsstrip ttsstrip--active" role="region" aria-label="Active TTS waiters">
+      <span className="ttsstrip__label">voice waiters</span>
+      <span className="ttsstrip__waiters">
+        {waiters.map((waiter) => (
+          <span key={waiter.id} className={`ttsstrip__waiter ttsstrip__waiter--${waiter.kind}`}>
+            {waiter.kind === 'speaking' ? <span className="ttsstrip__led" aria-hidden /> : null}
+            <b className="ttsstrip__tab">{waiter.label}</b>
+            <span className="ttsstrip__msg" title={waiter.message}>{clamp(waiter.message, 54)}</span>
+          </span>
+        ))}
+      </span>
       <span className="ttsstrip__stat">
         hot <b className={tts.hot_queue_length ? 'ok' : 'muted'}>{tts.hot_queue_length}</b>
       </span>
       <span className="ttsstrip__stat">
-        pause <b className={pauseLanguishing ? 'bad' : 'muted'}>{tts.pause_queue_length}</b>
+        pause <b className={tts.pause_queue_length > 5 ? 'bad' : 'muted'}>{tts.pause_queue_length}</b>
       </span>
 
       {routing ? (
@@ -74,24 +68,10 @@ export function TtsStrip({ state, refresh }: { state: OpsState; refresh: () => v
 
       <span className="ttsstrip__div" aria-hidden />
 
-      <span className="ttsstrip__modes" role="group" aria-label="Global TTS mode">
-        {MODES.map((m) => (
-          <button
-            key={m}
-            type="button"
-            className={`ttsstrip__mode ${m === mode ? 'is-active' : ''} mode--${m}`}
-            disabled={busy || m === mode}
-            onClick={() => run(() => setGlobalMode(m))}
-          >
-            {m}
-          </button>
-        ))}
-      </span>
-
       <button
         type="button"
         className="ttsstrip__skip"
-        disabled={busy || !current}
+        disabled={busy || !tts.current}
         onClick={() => run(() => skipTts(false))}
       >
         skip
