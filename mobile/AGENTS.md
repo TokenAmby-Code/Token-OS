@@ -8,9 +8,26 @@ Tools and configuration for phone automation via Termux and MacroDroid.
 Use event-driven patterns: MacroDroid notification triggers, HTTP webhooks, LaunchAgent intervals.
 If polling is truly unavoidable, staple it to the existing single poll macro in MacroDroid.
 
-## Shizuku (ARCHIVED 2026-03-10)
+## Shizuku Bootstrap Exception (2026-07-04)
 
-Shizuku is no longer used. v2+ enforcement uses stock Android + MacroDroid (no root/ADB). Archive at `macros/archive/pre-v2-shizuku-era-2026-03-10.mdr`. CLI tools (`shizuku-connect`) still exist but are inactive.
+Shizuku is still **not** a MacroDroid delivery mechanism. Do not revive desktop ADB, `shizuku-connect` keepalives, direct `am` launch/file-picker hacks, or `.mdr` restore flows for MacroDroid delivery/deletion. Macro delivery remains official `.macro` JSON only: validate with `macrodroid-validate`, import with `MACRODROID_AUTO_IMPORT=1 macrodroid-import`, then pull/export and treat deployed state as canonical.
+
+Scoped exception: MacroDroid may use `SystemSettingAction` and `UIInteractionAction` inside the enabled `Shizuku Bootstrap` macro to start Shizuku on the phone. This exists only to bootstrap phone-side Shizuku for later work; it does not authorize Shizuku/ADB for delivering or deleting macros.
+
+Current deployed bootstrap macro:
+
+- Snapshot: `macros/shizuku-bootstrap.macro`
+- Macro: `Shizuku Bootstrap` in `Device Configuration`
+- Triggers: HTTP `/shizuku-bootstrap` plus floating button `shizuku-bootstrap` (`SZK`)
+- First actions disable legacy macros by name; after 2026-07-04 cleanup only `Shizuku Bootstrap` remains in the Shizuku/ADB lane.
+- Wireless debugging action: `SystemSettingAction(tableOption=2, settingString=adb_wifi_enabled, valueString=1, useHelper=true)`
+- Shizuku launch package: `moe.shizuku.privileged.api`
+- Current sniffed UI target: MacroDroid Identify-in-app captured `clickOption=3`, exact text `Start`, `viewId=android:id/button1`, and fallback point `(243,1394)`. The previous hand-authored `id:android:id/button1` target was wrong for the Shizuku screen.
+- Result logging goes to `/storage/emulated/0/MacroDroid/logs/debug.log` with `[SHIZUKU_BOOTSTRAP]` checkpoints and `ShizukuStateConstraint option=3` success/failure branch.
+
+Harness caveat from phone TTS MacroDroid work: `macrodroid-import --replace` can false-success when the live MacroDroid app rejects or duplicates an import, and `macrodroid-validate` can miss UI-level rejections for some action shapes. Known rejected shapes include `SpeakTextAction` values using dictionary/global magic text directly instead of scalar locals, plus HTTP/dictionary variable forms that MacroDroid accepts in text fields but not TTS speak fields. Always pull/export after import and treat the live phone export as canonical.
+
+Historical archive: `macros/archive/pre-v2-shizuku-era-2026-03-10.mdr`.
 
 ## Overview
 

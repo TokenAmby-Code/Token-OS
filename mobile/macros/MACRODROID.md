@@ -89,6 +89,27 @@ Server-driven endpoints on the phone use the MacroDroid HTTP server:
 exactly one `SendIntentAction` so Pavlok stimuli cannot be bundled in one phone
 request.
 
+## Shizuku Bootstrap — 2026-07-04
+
+Current Shizuku/ADB-lane inventory after cleanup: only `Shizuku Bootstrap` remains active on the phone. `Shizuku Auto Start` and `Automatically activates wireless ADB` were deleted from the active inventory after the new macro imported successfully.
+
+`Shizuku Bootstrap` is an explicit scoped exception: it may use MacroDroid `SystemSettingAction` and `UIInteractionAction` to start Shizuku on-device, but Shizuku/ADB is still not authorized for MacroDroid macro delivery, replacement, or deletion. Use only official `.macro` wrappers and `macrodroid-import`.
+
+Deployed snapshot:
+
+- File: `shizuku-bootstrap.macro`
+- Macro: `Shizuku Bootstrap`
+- Category: `Device Configuration`
+- Triggers: HTTP `/shizuku-bootstrap`; floating button `shizuku-bootstrap` (`SZK`)
+- Debug log tag: `[SHIZUKU_BOOTSTRAP]` in `/storage/emulated/0/MacroDroid/logs/debug.log`
+- Shizuku running check: `ShizukuStateConstraint option=3`
+
+Important UI-interaction finding: MacroDroid Identify-in-app captured the Shizuku start click as `clickOption=3`, exact `textContent=Start`, `viewId=android:id/button1`, with `xyPoint={x:243,y:1394}`. The earlier manual ViewId string `id:android:id/button1` was not the right target for the Shizuku screen.
+
+Validation checkpoint: `macrodroid-validate mobile/macros/shizuku-bootstrap.macro` passes, import was verified by a post-import export, and the current phone export lists 32 macros with `✓ Shizuku Bootstrap` as the only Shizuku/ADB-lane macro. Operator reported the sniffed action appears to click the Shizuku button; full Shizuku-running verification remains next.
+
+Harness warning: `macrodroid-import --replace` can false-success if the live MacroDroid app rejects or duplicates an import; `macrodroid-validate` can miss UI-level rejections. Known rejected TTS shapes include `SpeakTextAction` fields reading dictionary/global magic text directly instead of scalar locals and HTTP/dictionary variables that work in text fields but not speak fields. Always pull/export and inspect the live deployed macro after import.
+
 ## Official Edit Workflow
 
 1. Pull/export current state:
@@ -113,7 +134,7 @@ request.
    MACRODROID_AUTO_IMPORT=1 macrodroid-import macro-name.macro
    ```
 
-6. Export/pull again and verify.
+6. Export/pull again and verify. Do not trust CLI success alone: the current harness can false-success on live MacroDroid rejection or duplicate creation, and the validator does not catch every UI-level shape rejection.
 
 ## Debug Logs
 
