@@ -41,7 +41,7 @@
         "m_isOrCondition": false,
         "blockNextAction": true,
         "m_nonRoot": true,
-        "m_script": "echo \"$(date +%H:%M:%S) [TTS_LOCAL_CONTROL] echo command={lv=request[command]} session={lv=request[session_id]} playback={lv=request[playback_id]} speed={lv=request[speed]}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_LOCAL_CONTROL] echo command={lv=request}[command] session={lv=request}[session_id] playback={lv=request}[playback_id] speed={lv=request}[speed]\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
         "timeoutSeconds": 30,
         "useHelper": false,
         "useShizuku": false
@@ -57,7 +57,7 @@
         "htmlText": "",
         "option": 0,
         "responseCode": "OK",
-        "text": "{\"status\":\"local_control_consumed\",\"command\":\"{lv=request[command]}\"}"
+        "text": "{\"status\":\"local_control_consumed\",\"command\":\"{lv=request}[command]\"}"
       }
     ],
     "m_constraintList": []

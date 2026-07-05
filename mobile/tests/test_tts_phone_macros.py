@@ -77,10 +77,10 @@ def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally(
     assert macro["m_triggerList"][0]["identifier"] == "tts-control"
     assert request_urls(macro) == [TOKEN_OS_CONTROL]
     body = request_bodies(macro)[0]
-    assert '"command":"{lv=request[command]}"' in body
+    assert '"command":"{lv=request}[command]"' in body
     assert '"source":"phone_overlay"' in body
     assert '"backend":"phone"' in body
-    assert '"speed":"{lv=request[speed]}"' in body
+    assert '"speed":"{lv=request}[speed]"' in body
     serialized = json.dumps(macro)
     forbidden_local_mutations = [
         "SpeakTextAction",
@@ -110,8 +110,8 @@ def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
     assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
     speak_actions = actions(macro, "SpeakTextAction")
     assert [a["m_textToSay"] for a in speak_actions] == [
-        "{lv=request[current_chunk]}",
-        "{lv=request[next_chunk]}",
+        "{lv=request}[current_chunk]",
+        "{lv=request}[next_chunk]",
     ]
     assert all(a["m_waitToFinish"] is True for a in speak_actions)
     assert all(a["m_queue"] is False for a in speak_actions)
@@ -131,6 +131,8 @@ def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
         f"{TOKEN_OS_BASE}/api/tts/chunk-event",
     ]
     assert "current_complete_next_starting" in request_bodies(macro)[0]
+    http_actions = actions(macro, "HttpRequestAction")
+    assert http_actions[0]["requestConfig"]["blockNextAction"] is False
     assert "buffer_drained" in request_bodies(macro)[1]
 
 

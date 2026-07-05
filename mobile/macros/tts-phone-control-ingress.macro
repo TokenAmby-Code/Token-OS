@@ -41,7 +41,7 @@
         "m_isOrCondition": false,
         "blockNextAction": true,
         "m_nonRoot": true,
-        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CONTROL_INGRESS] command={lv=request[command]} session={lv=request[session_id]} playback={lv=request[playback_id]} -> token-os-first\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CONTROL_INGRESS] command={lv=request}[command] session={lv=request}[session_id] playback={lv=request}[playback_id] -> token-os-first\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
         "timeoutSeconds": 30,
         "useHelper": false,
         "useShizuku": false
@@ -71,7 +71,7 @@
           "contentBodyFolderDisplayName": "",
           "contentBodyFolderUri": "",
           "contentBodySource": 0,
-          "contentBodyText": "{\"command\":\"{lv=request[command]}\",\"source\":\"phone_overlay\",\"backend\":\"phone\",\"session_id\":\"{lv=request[session_id]}\",\"playback_id\":\"{lv=request[playback_id]}\",\"speed\":\"{lv=request[speed]}\"}",
+          "contentBodyText": "{\"command\":\"{lv=request}[command]\",\"source\":\"phone_overlay\",\"backend\":\"phone\",\"session_id\":\"{lv=request}[session_id]\",\"playback_id\":\"{lv=request}[playback_id]\",\"speed\":\"{lv=request}[speed]\"}",
           "contentType": "application/json",
           "followRedirects": true,
           "headerParams": [],
@@ -110,7 +110,7 @@
         "htmlText": "",
         "option": 0,
         "responseCode": "OK",
-        "text": "{\"status\":\"forwarded_to_token_os\",\"command\":\"{lv=request[command]}\",\"token_os_status\":\"{lv=response-code}\"}"
+        "text": "{\"status\":\"forwarded_to_token_os\",\"command\":\"{lv=request}[command]\",\"token_os_status\":\"{lv=response-code}\"}"
       }
     ],
     "m_constraintList": []

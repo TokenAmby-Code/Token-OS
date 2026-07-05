@@ -42,7 +42,7 @@
         "htmlText": "",
         "option": 0,
         "responseCode": "OK",
-        "text": "{\"status\":\"accepted\",\"session_id\":\"{lv=request[session_id]}\",\"playback_id\":\"{lv=request[playback_id]}\",\"buffer\":\"current_plus_next\"}"
+        "text": "{\"status\":\"accepted\",\"session_id\":\"{lv=request}[session_id]\",\"playback_id\":\"{lv=request}[playback_id]\",\"buffer\":\"current_plus_next\"}"
       },
       {
         "m_classType": "ShellScriptAction",
@@ -54,7 +54,7 @@
         "m_isOrCondition": false,
         "blockNextAction": true,
         "m_nonRoot": true,
-        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CHUNK] accepted session={lv=request[session_id]} playback={lv=request[playback_id]} current={lv=request[current_index]} next={lv=request[next_index]}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CHUNK] accepted session={lv=request}[session_id] playback={lv=request}[playback_id] current={lv=request}[current_index] next={lv=request}[next_index]\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
         "timeoutSeconds": 30,
         "useHelper": false,
         "useShizuku": false
@@ -74,14 +74,14 @@
         "m_skipEmojis": true,
         "m_specifyAudioStream": true,
         "m_speed": 1.0,
-        "m_textToSay": "{lv=request[current_chunk]}",
+        "m_textToSay": "{lv=request}[current_chunk]",
         "m_waitToFinish": true
       },
       {
         "m_classType": "HttpRequestAction",
         "m_SIGUID": -989999999999904972,
         "disableLogging": false,
-        "m_comment": "",
+        "m_comment": "Non-blocking boundary telemetry; do not let Token-OS round-trip create an audible gap before next_chunk.",
         "m_constraintList": [],
         "m_isDisabled": false,
         "m_isOrCondition": false,
@@ -91,7 +91,7 @@
           "basicAuthEnabled": false,
           "basicAuthPassword": "",
           "basicAuthUsername": "",
-          "blockNextAction": true,
+          "blockNextAction": false,
           "clientCertEnabled": false,
           "clientCertKeyStoreDisplayName": "",
           "clientCertKeyStoreUri": "",
@@ -102,7 +102,7 @@
           "contentBodyFolderDisplayName": "",
           "contentBodyFolderUri": "",
           "contentBodySource": 0,
-          "contentBodyText": "{\"event\":\"current_complete_next_starting\",\"backend\":\"phone\",\"session_id\":\"{lv=request[session_id]}\",\"playback_id\":\"{lv=request[playback_id]}\",\"current_index\":\"{lv=request[current_index]}\",\"next_index\":\"{lv=request[next_index]}\"}",
+          "contentBodyText": "{\"event\":\"current_complete_next_starting\",\"backend\":\"phone\",\"session_id\":\"{lv=request}[session_id]\",\"playback_id\":\"{lv=request}[playback_id]\",\"current_index\":\"{lv=request}[current_index]\",\"next_index\":\"{lv=request}[next_index]\"}",
           "contentType": "application/json",
           "followRedirects": true,
           "headerParams": [],
@@ -145,7 +145,7 @@
         "m_skipEmojis": true,
         "m_specifyAudioStream": true,
         "m_speed": 1.0,
-        "m_textToSay": "{lv=request[next_chunk]}",
+        "m_textToSay": "{lv=request}[next_chunk]",
         "m_waitToFinish": true
       },
       {
@@ -173,7 +173,7 @@
           "contentBodyFolderDisplayName": "",
           "contentBodyFolderUri": "",
           "contentBodySource": 0,
-          "contentBodyText": "{\"event\":\"buffer_drained\",\"backend\":\"phone\",\"session_id\":\"{lv=request[session_id]}\",\"playback_id\":\"{lv=request[playback_id]}\",\"last_index\":\"{lv=request[next_index]}\"}",
+          "contentBodyText": "{\"event\":\"buffer_drained\",\"backend\":\"phone\",\"session_id\":\"{lv=request}[session_id]\",\"playback_id\":\"{lv=request}[playback_id]\",\"last_index\":\"{lv=request}[next_index]\"}",
           "contentType": "application/json",
           "followRedirects": true,
           "headerParams": [],
@@ -211,7 +211,7 @@
         "m_isOrCondition": false,
         "blockNextAction": true,
         "m_nonRoot": true,
-        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CHUNK] buffer_drained session={lv=request[session_id]} playback={lv=request[playback_id]}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CHUNK] buffer_drained session={lv=request}[session_id] playback={lv=request}[playback_id]\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
         "timeoutSeconds": 30,
         "useHelper": false,
         "useShizuku": false
