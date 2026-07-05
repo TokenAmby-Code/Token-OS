@@ -1,7 +1,16 @@
 import json
 import sqlite3
+from datetime import datetime
 
 import pytest
+
+from instance_mutation import insert_instance_sync
+
+
+@pytest.fixture(autouse=True)
+def _enable_naming_nudge_interviews_for_existing_tests(app_env, monkeypatch):
+    """Keep legacy behavior assertions explicit while production is gated off."""
+    monkeypatch.setattr(app_env.main, "ENABLE_NAMING_NUDGE_INTERVIEWS", True)
 
 
 def _insert_instance(
@@ -47,21 +56,26 @@ def _insert_instance(
             ),
         )
     else:
-        conn.execute(
-            """
-            INSERT INTO legacy_instances (
-                id, session_id, tab_name, origin_type, device_id, status,
-                session_doc_id, workflow_blocked_reason
-            ) VALUES (?, ?, ?, 'hook', 'Mac-Mini', 'processing', ?, ?)
-            """,
-            (
-                instance_id,
-                f"session-{instance_id}",
-                tab_name,
-                session_doc_id,
-                workflow_blocked_reason,
-            ),
+        now = datetime.now().isoformat()
+        insert_instance_sync(
+            conn,
+            values={
+                "id": instance_id,
+                "name": "needs-name",
+                "origin_type": "api",
+                "device_id": "Mac-Mini",
+                "status": "working",
+                "session_doc_id": session_doc_id,
+                "workflow_blocked_reason": workflow_blocked_reason,
+                "created_at": now,
+                "last_activity": now,
+            },
+            mutation_type="instance_registered",
+            write_source="test",
+            actor="test",
         )
+        if tab_name != "needs-name":
+            conn.execute("UPDATE instances SET name = ? WHERE id = ?", (tab_name, instance_id))
     conn.commit()
     conn.close()
 
@@ -85,6 +99,41 @@ def _fetchone(db_path, query, params=()):
     row = conn.execute(query, params).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+@pytest.mark.asyncio
+async def test_naming_nudge_interview_gate_silences_delivery(app_env, monkeypatch):
+    _insert_instance(app_env.db_path)
+    monkeypatch.setattr(app_env.main, "ENABLE_NAMING_NUDGE_INTERVIEWS", False)
+
+    async def fail_enqueue(**_kwargs):
+        raise AssertionError("disabled naming interviews must not enqueue pane writes")
+
+    monkeypatch.setattr(app_env.main, "enqueue_pane_write", fail_enqueue)
+
+    result = await app_env.main.orchestrator_naming_nudge(
+        app_env.main.NamingNudgeRequest(session_id="inst-naming")
+    )
+
+    assert result["action"] == "disabled"
+    assert result["reason"] == "temporary_session_doc_binding_registration_gate"
+    assert result["instance_id"] == "inst-naming"
+    assert (
+        _fetchone(
+            app_env.db_path,
+            "SELECT event_type FROM events WHERE instance_id = 'inst-naming' "
+            "AND event_type = 'naming_nudge_sent'",
+        )
+        is None
+    )
+    assert (
+        _fetchone(
+            app_env.db_path,
+            "SELECT id FROM pane_write_queue WHERE instance_id = 'inst-naming' "
+            "AND source = 'naming_nudge'",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -119,7 +168,7 @@ async def test_naming_nudge_sends_for_placeholder_and_derives_slug(app_env, monk
 
     row = _fetchone(
         app_env.db_path,
-        "SELECT workflow_blocked_reason FROM legacy_instances WHERE id = 'inst-naming'",
+        "SELECT workflow_blocked_reason FROM instances WHERE id = 'inst-naming'",
     )
     assert row["workflow_blocked_reason"] == "tab_name_placeholder"
 
@@ -201,7 +250,7 @@ async def test_naming_nudge_caps_at_three_and_marks_refused(app_env, monkeypatch
     assert result["workflow_blocked_reason"] == "naming_refused"
     row = _fetchone(
         app_env.db_path,
-        "SELECT workflow_blocked_reason FROM legacy_instances WHERE id = 'inst-naming'",
+        "SELECT workflow_blocked_reason FROM instances WHERE id = 'inst-naming'",
     )
     assert row["workflow_blocked_reason"] == "naming_refused"
 
@@ -292,7 +341,7 @@ async def test_naming_nudge_doc_less_instance_uses_instance_name_message(
 
     row = _fetchone(
         app_env.db_path,
-        "SELECT workflow_blocked_reason FROM legacy_instances WHERE id = 'inst-naming'",
+        "SELECT workflow_blocked_reason FROM instances WHERE id = 'inst-naming'",
     )
     assert row["workflow_blocked_reason"] == "tab_name_placeholder"
 
@@ -307,7 +356,7 @@ async def test_naming_nudge_doc_less_instance_uses_instance_name_message(
 async def test_naming_nudge_noops_for_null_doc_instance(app_env, monkeypatch):
     """An automated launch left with NULL session_doc_id and no placeholder tab
     name must not be infinitely nudged — the gate keys on tab_name."""
-    _insert_instance(app_env.db_path, tab_name=None, session_doc_id=None)
+    _insert_instance(app_env.db_path, tab_name="active-docless-instance", session_doc_id=None)
 
     async def fail_enqueue(**_kwargs):
         raise AssertionError("NULL-doc instance must not be nudged")

@@ -2548,6 +2548,11 @@ NAMING_NUDGE_MAX_PER_INSTANCE = 3
 NAMING_NUDGE_EVENT_TYPE = "naming_nudge_sent"
 NAMING_NUDGE_QUEUE_SOURCE = "naming_nudge"
 NAMING_NUDGE_QUEUE_PURPOSE = "name_missing"
+# TEMPORARY 2026-07-05: disable unsolicited rename/session-doc naming
+# interviews while session-doc binding + instance registration are unreliable.
+# Re-enable only after binding/registration are reliable again. Manual
+# `session-doc-name "Title"` and explicit instance rename paths are unaffected.
+ENABLE_NAMING_NUDGE_INTERVIEWS = False
 
 
 async def _count_naming_nudges(db, instance_id: str) -> int:
@@ -2640,6 +2645,14 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
     manual/legacy callers. Durable writes go through sanctioned mutation helpers;
     the nudge count is derived from the append-only events table.
     """
+    if not ENABLE_NAMING_NUDGE_INTERVIEWS:
+        return {
+            "success": True,
+            "action": "disabled",
+            "reason": "temporary_session_doc_binding_registration_gate",
+            "instance_id": instance_id,
+        }
+
     if not instance_id:
         return {"success": False, "action": "missing_instance_id"}
 
