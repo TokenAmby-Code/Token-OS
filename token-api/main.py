@@ -13339,7 +13339,8 @@ async def talk_send(request: TalkSendRequest):
             status_code=400,
             detail=(
                 f"caller_pane unresolved: {caller_raw}. Use a public pane id like "
-                "council:pax / mechanicus:fabricator-general, a unique pane-label suffix, "
+                "council:pax / mechanicus:fabricator-general, a persona or instance name "
+                "that resolves to exactly one live pane, an exact instance_id, "
                 "or a raw tmux %pane."
             ),
         )
@@ -13348,7 +13349,8 @@ async def talk_send(request: TalkSendRequest):
             status_code=400,
             detail=(
                 f"target_pane unresolved: {target_raw}. Use a public pane id like "
-                "council:pax / mechanicus:fabricator-general, a unique pane-label suffix, "
+                "council:pax / mechanicus:fabricator-general, a persona or instance name "
+                "that resolves to exactly one live pane, an exact instance_id, "
                 "or a raw tmux %pane."
             ),
         )

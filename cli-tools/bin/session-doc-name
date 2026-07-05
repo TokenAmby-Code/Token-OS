@@ -10,13 +10,13 @@ source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || $# -lt 1 ]]; then
-  cat >&2 <<'EOF'
+  cat >&2 <<'EOF_HELP'
 Usage: session-doc-name "Descriptive Session Title"
 
 Names the session document attached to the current tmux pane. Use a descriptive
 3-6 word title. Do not use dates, timestamps, UUIDs, pane IDs, model names, or
 generic project roots.
-EOF
+EOF_HELP
   exit $([[ $# -lt 1 ]] && echo 2 || echo 0)
 fi
 
@@ -37,10 +37,26 @@ if [[ "$PANE_TARGET" == %* ]]; then
 fi
 [[ -n "$PANE_TARGET" ]] || PANE_TARGET="current"
 
-DOC=$("$(dirname "$0")/tmuxctl" session-doc --pane "$PANE_TARGET" --format json 2>/dev/null || true)
+TMUXCTL_ERR=$(mktemp)
+DOC=$("$(dirname "$0")/tmuxctl" session-doc --pane "$PANE_TARGET" --format json 2>"$TMUXCTL_ERR" || true)
+TMUXCTL_STATUS=$?
+ERR_TEXT=$(cat "$TMUXCTL_ERR" 2>/dev/null || true)
+rm -f "$TMUXCTL_ERR"
 DOC_ID=$(echo "$DOC" | jq -r '.id // .doc_id // empty' 2>/dev/null || true)
 if [[ -z "$DOC_ID" ]]; then
-  echo "Error: could not resolve session doc for pane ${PANE_TARGET}" >&2
+  if grep -q 'no_doc_bound' <<<"$ERR_TEXT"; then
+    echo "No session doc is bound to this pane yet; nothing renamed. If this is a brand-new worker, submit the first prompt and retry." >&2
+    exit 0
+  fi
+  if grep -q 'pane_mismatch\|no live instance\|no active instance\|no live instance stamp' <<<"$ERR_TEXT"; then
+    echo "Error: pane mismatch: this pane does not currently resolve to a live instance (${PANE_TARGET})." >&2
+    exit 1
+  fi
+  if grep -q 'failed to fetch' <<<"$ERR_TEXT"; then
+    echo "Error: Token-API is unreachable or returned invalid data while resolving the session doc." >&2
+    exit 1
+  fi
+  echo "Error: could not resolve session doc for pane ${PANE_TARGET}${ERR_TEXT:+: $ERR_TEXT}" >&2
   exit 1
 fi
 

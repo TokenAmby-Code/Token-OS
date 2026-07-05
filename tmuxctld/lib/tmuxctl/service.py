@@ -14,7 +14,7 @@ from .api import (
     RegistryError,
     build_client_attachments,
     fetch_instance_registry,
-    fetch_session_doc_for_pane_label,
+    fetch_session_doc_for_instance_id,
 )
 from .audience import audience_return, audience_toggle
 from .builder import (
@@ -524,9 +524,11 @@ class TmuxControlPlane:
         return resolve_to_public(self.adapter, target)
 
     def session_doc_for_pane(self, target: str) -> dict:
-        """Fetch the session doc associated with a target pane's cardinal label."""
-        pane_label = self.cardinal_pane_label(target)
-        return fetch_session_doc_for_pane_label(pane_label)
+        """Fetch a target pane's session doc through pane -> instance -> FK."""
+        resolved = self.instance_id_for_pane(target)
+        instance_id = str(resolved.get("instance_id") or "")
+        pane_label = str(resolved.get("pane") or "")
+        return fetch_session_doc_for_instance_id(instance_id, pane_label=pane_label)
 
     def invoke_skill(
         self,
@@ -1143,8 +1145,7 @@ class TmuxControlPlane:
                 # Keybind callers commonly know only the physical pane target
                 # tmux expanded at dispatch time. Normalize to the stable public
                 # role before asking Token-API for the session document.
-                pane_label = self.public_pane_id(value)
-                doc = fetch_session_doc_for_pane_label(pane_label)
+                doc = self.session_doc_for_pane(value)
             doc_id = str(doc.get("id") or "")
         if not doc_id.isdigit():
             raise ValueError("no session doc id resolved")

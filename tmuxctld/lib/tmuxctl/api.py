@@ -7,6 +7,7 @@ import sys
 import textwrap
 import urllib.error
 import urllib.request
+import urllib.parse
 
 from .enums import AttachmentClass
 from .models import ClientAttachment, GroupedSessionSnapshot, InstanceRegistrySnapshot
@@ -15,6 +16,19 @@ from .registry import build_registry_snapshot
 
 class RegistryError(RuntimeError):
     """Raised when the instance registry cannot be fetched."""
+
+
+class SessionDocResolutionError(RegistryError):
+    """Raised when pane -> instance -> session-doc resolution fails.
+
+    ``reason`` is intentionally machine-stable so thin shell wrappers can
+    distinguish API outages from benign unbound-doc cases without parsing
+    tmux internals.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        self.reason = reason
+        super().__init__(f"{reason}: {message}")
 
 
 _DEVICE_NAMES = {
@@ -167,38 +181,57 @@ def rebind_instance_pane(instance_id: str, pane_id: str) -> None:
     )
 
 
-def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
-    """Resolve a cardinal pane label to its linked session document.
+def fetch_session_doc_for_instance_id(instance_id: str, *, pane_label: str = "") -> dict:
+    """Resolve an instance id to its linked session document via the durable FK.
 
-    This intentionally keys on stable @PANE_ID/pane_label values such as
-    ``palace:N`` or ``council:custodes``. It does not accept or require raw tmux
-    ``%pane`` ids.
+    The pane leg is resolved before this function by tmuxctl's live
+    ``@INSTANCE_ID`` stamp oracle. This function deliberately never joins on
+    ``pane_label``/``tmux_pane`` registry fields; those are presentation-only and
+    may be absent for codex/undercount panes.
     """
-    instances = _api_get_json("/api/instances?status=processing&sort=recent_activity")
-    if not isinstance(instances, list):
-        instances = []
-    candidates = [row for row in instances if row.get("pane_label") == pane_label]
-    if not candidates:
-        all_instances = _api_get_json("/api/instances?sort=recent_activity")
-        if isinstance(all_instances, list):
-            candidates = [
-                row
-                for row in all_instances
-                if row.get("pane_label") == pane_label and row.get("status") != "stopped"
-            ]
-    if not candidates:
-        all_instances = _api_get_json("/api/instances?sort=recent_activity")
-        diagnostics = _session_doc_resolution_diagnostics(pane_label, all_instances)
-        raise RegistryError(f"no live instance for pane label {pane_label}\n{diagnostics}".rstrip())
-    doc_id = candidates[0].get("session_doc_id")
+    iid = (instance_id or "").strip()
+    if not iid:
+        raise SessionDocResolutionError("pane_mismatch", "no live instance stamp for pane")
+
+    row = _api_get_json(f"/api/instances/{iid}")
+    if not isinstance(row, dict) or not row.get("id"):
+        raise SessionDocResolutionError("pane_mismatch", f"no active instance row for {iid}")
+    if str(row.get("status") or "") in {"stopped", "archived"}:
+        raise SessionDocResolutionError(
+            "pane_mismatch",
+            f"instance {iid} is not live (status={row.get('status')})",
+        )
+
+    doc_id = row.get("session_doc_id")
     if not doc_id:
-        raise RegistryError(f"instance for pane label {pane_label} has no session doc")
-    doc = _api_get_json(f"/api/session-docs/{int(doc_id)}")
+        raise SessionDocResolutionError("no_doc_bound", f"instance {iid} has no session doc bound")
+
+    try:
+        doc = _api_get_json(f"/api/session-docs/{int(doc_id)}")
+    except (TypeError, ValueError) as exc:
+        raise SessionDocResolutionError("no_doc_bound", f"invalid session_doc_id {doc_id!r}") from exc
     if not isinstance(doc, dict):
         raise RegistryError(f"malformed session-doc response for {doc_id}")
-    doc["instance_id"] = candidates[0].get("id")
-    doc["pane_label"] = pane_label
+    doc["instance_id"] = iid
+    if pane_label:
+        doc["pane_label"] = pane_label
     return doc
+
+
+def fetch_session_doc_for_pane_label(pane_label: str) -> dict:
+    """Resolve a pane label to its session document through pane -> instance -> FK.
+
+    Deprecated compatibility wrapper for callers that only have a public pane
+    label. It uses Token-API's pane stamp resolver endpoint; it does not scan
+    ``/api/instances`` by ``pane_label``.
+    """
+    pane = (pane_label or "").strip()
+    if not pane:
+        raise SessionDocResolutionError("pane_mismatch", "pane label is required")
+    result = _api_get_json(f"/api/panes/{urllib.parse.quote(pane, safe='')}/instance")
+    if not isinstance(result, dict) or not result.get("id"):
+        raise SessionDocResolutionError("pane_mismatch", f"no live instance for pane {pane}")
+    return fetch_session_doc_for_instance_id(str(result["id"]), pane_label=pane)
 
 
 def _session_doc_resolution_diagnostics(pane_label: str, rows: dict | list) -> str:

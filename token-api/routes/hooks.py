@@ -4851,10 +4851,8 @@ def _row_is_genuine_interactive(
 
     Mirrors the SessionStart precedence in ``resolve_session_doc_for_start``: not
     a subagent, not cron/dispatch, no dispatch session-doc policy, no persona/legion,
-    emperor-commanded, not automated, no golden-throne binding. Gates both the
-    deferred-doc lazy mint (first prompt) and the never-acted reap (SessionEnd),
-    so a dispatched worker whose doc legitimately resolved to NULL
-    (``unresolved_dispatch``) is never mistaken for an un-named human pane.
+    emperor-commanded, not automated, no golden-throne binding. Gates the
+    never-acted reap (SessionEnd) and one branch of deferred-doc lazy minting.
     """
     return (
         (origin_type or "local") not in ("cron", "dispatch")
@@ -4865,6 +4863,45 @@ def _row_is_genuine_interactive(
         and not automated
         and not golden_throne
     )
+
+
+def _row_should_lazy_mint_session_doc(
+    *,
+    origin_type,
+    commander_type,
+    persona_id,
+    is_subagent,
+    session_doc_policy,
+    automated,
+    golden_throne,
+    rank,
+) -> bool:
+    """Return true when first UserPromptSubmit should mint this row's doc.
+
+    Top-level human panes and dispatched/child workers both defer doc creation
+    until the first real prompt. Cron/golden-throne/persona singleton seats do
+    not: their continuity binding is owned elsewhere. The caller updates only
+    the current ``session_id`` row, which is the child-scoped binding guard.
+    """
+    if _row_is_genuine_interactive(
+        origin_type=origin_type,
+        commander_type=commander_type,
+        persona_id=persona_id,
+        is_subagent=is_subagent,
+        session_doc_policy=session_doc_policy,
+        automated=automated,
+        golden_throne=golden_throne,
+    ):
+        return True
+    if (origin_type or "local") == "cron" or golden_throne:
+        return False
+    rank_value = str(rank or "astartes").lower()
+    if rank_value not in {"", "astartes"} and not rank_value.startswith("aspirant:"):
+        return False
+    policy = str(session_doc_policy or "").lower()
+    if policy in {"daily_note", "daily_note_custodes", "manual_assigned", "manual_created"}:
+        return False
+    return bool(is_subagent or (commander_type or "") == "chapter" or origin_type == "dispatch")
 
 
 async def handle_prompt_submit(payload: dict) -> dict:
@@ -4907,7 +4944,8 @@ async def handle_prompt_submit(payload: dict) -> dict:
         if not existing:
             return {"success": False, "action": "not_found"}
         existing_dict = dict(existing)
-        should_schedule_naming_nudge = is_placeholder_tab_name(existing_dict.get("name"))
+        should_schedule_naming_nudge = False
+        placeholder_tab_name = is_placeholder_tab_name(existing_dict.get("name"))
         if await _stop_if_dead_pane(db, session_id, existing_dict, "PromptSubmit"):
             return {
                 "success": True,
@@ -4971,20 +5009,18 @@ async def handle_prompt_submit(payload: dict) -> dict:
                 actor="PromptSubmit",
             )
 
-        # Deferred interactive session doc: the first real prompt is what proves
-        # the pane is a genuine working session, so mint the placeholder doc now
-        # (SessionStart left it deferred — resolve_session_doc_for_start returned
-        # "interactive_deferred"). Pragma-once via the `session_doc_id IS NULL`
-        # gate; a dispatched worker with a legitimately-NULL doc (unresolved_dispatch)
-        # is excluded by _row_is_genuine_interactive, so it never gets an
-        # interactive placeholder.
+        # Deferred session doc: the first real prompt is what proves a pane is a
+        # genuine working session/worker, so mint the placeholder doc now.
+        # Pragma-once via the `session_doc_id IS NULL` gate. The update below is
+        # child-scoped by construction: it writes only this hook's session_id row,
+        # never the dispatcher's/commander's row.
         status_updates = {
             "status": "working",
             "last_activity": now,
             "stopped_at": None,
         }
         minted_session_doc_id = None
-        if existing_dict.get("session_doc_id") is None and _row_is_genuine_interactive(
+        if existing_dict.get("session_doc_id") is None and _row_should_lazy_mint_session_doc(
             origin_type=existing_dict.get("origin_type"),
             commander_type=existing_dict.get("commander_type"),
             persona_id=existing_dict.get("persona_id"),
@@ -4992,9 +5028,13 @@ async def handle_prompt_submit(payload: dict) -> dict:
             session_doc_policy=existing_dict.get("session_doc_policy"),
             automated=existing_dict.get("automated"),
             golden_throne=existing_dict.get("golden_throne"),
+            rank=existing_dict.get("rank"),
         ):
             minted_session_doc_id = await create_deferred_interactive_session_doc(db)
             status_updates["session_doc_id"] = minted_session_doc_id
+
+        effective_session_doc_id = existing_dict.get("session_doc_id") or minted_session_doc_id
+        should_schedule_naming_nudge = bool(placeholder_tab_name and effective_session_doc_id)
 
         # Also resurrect stopped instances - activity means they're active.
         # (pid died with legacy instance table; nothing to backfill.)

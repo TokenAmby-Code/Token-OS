@@ -26,6 +26,7 @@ def _insert_instance(
     *,
     origin_type="local",
     commander_type="emperor",
+    commander_id=None,
     persona_id=None,
     is_subagent=0,
     automated=0,
@@ -37,8 +38,8 @@ def _insert_instance(
     conn = sqlite3.connect(db_path)
     conn.execute(
         """INSERT INTO instances
-           (id, name, device_id, origin_type, commander_type, persona_id,
-            is_subagent, automated, golden_throne, dispatch_session_doc_path,
+           (id, name, device_id, origin_type, commander_type, commander_id, persona_id,
+            is_subagent, automated, golden_throne,
             session_doc_id, status, rank)
            VALUES (?, ?, 'Mac-Mini', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'astartes')""",
         (
@@ -46,11 +47,11 @@ def _insert_instance(
             instance_id,
             origin_type,
             commander_type,
+            commander_id,
             persona_id,
             is_subagent,
             automated,
             golden_throne,
-            dispatch_session_doc_path,
             session_doc_id,
             status,
         ),
@@ -156,21 +157,31 @@ def test_first_prompt_mints_doc_once(app_env, monkeypatch) -> None:
     assert _doc_count(app_env.db_path) == 1
 
 
-def test_dispatched_null_doc_not_minted_on_prompt(app_env, monkeypatch) -> None:
-    """A dispatched worker with a legitimately-NULL doc must never get an
-    interactive placeholder on its first prompt."""
+def test_dispatched_null_doc_minted_on_first_prompt(app_env, monkeypatch) -> None:
+    """A dispatched worker starts NULL-doc, then mints/binds its own doc on
+    first prompt (child-scoped, never the dispatcher's row)."""
     hooks = sys.modules["routes.hooks"]
     monkeypatch.setattr(hooks, "_stop_if_dead_pane", _never_dead)
-    _insert_instance(app_env.db_path, "disp-1", origin_type="dispatch", session_doc_id=None)
+    _insert_instance(app_env.db_path, "parent-1", session_doc_id=777, status="working")
+    _insert_instance(
+        app_env.db_path,
+        "disp-1",
+        origin_type="dispatch",
+        commander_type="chapter",
+        commander_id="parent-1",
+        session_doc_id=None,
+    )
 
     async def run():
         return await hooks.handle_prompt_submit({"session_id": "disp-1"})
 
     asyncio.run(run())
     row = _row(app_env.db_path, "disp-1")
+    parent = _row(app_env.db_path, "parent-1")
     assert row["status"] == "working"
-    assert row["session_doc_id"] is None
-    assert _doc_count(app_env.db_path) == 0
+    assert row["session_doc_id"] is not None
+    assert parent["session_doc_id"] == 777
+    assert _doc_count(app_env.db_path) == 1
 
 
 # ── SessionEnd reaps the never-acted interactive pane ──────────────────────────

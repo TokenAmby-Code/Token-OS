@@ -59,15 +59,22 @@ async def test_prompt_submit_on_placeholder_row_schedules_naming_nudge(
     hooks = sys.modules["routes.hooks"]
     _insert_wrapper_instance(app_env.db_path, instance_id="prompt-unnamed", wrapper_id="wrap-p")
 
-    scheduled: list[tuple[str | None, str]] = []
-    monkeypatch.setattr(
-        hooks, "_schedule_naming_nudge", lambda iid, source: scheduled.append((iid, source))
-    )
+    scheduled: list[tuple[str | None, str, int | None]] = []
+
+    def fake_schedule(iid, source):
+        with sqlite3.connect(app_env.db_path) as conn:
+            doc_id = conn.execute(
+                "SELECT session_doc_id FROM instances WHERE id = ?", (iid,)
+            ).fetchone()[0]
+        scheduled.append((iid, source, doc_id))
+
+    monkeypatch.setattr(hooks, "_schedule_naming_nudge", fake_schedule)
 
     result = await hooks.handle_prompt_submit({"session_id": "prompt-unnamed"})
 
     assert result["action"] == "processing"
-    assert scheduled == [("prompt-unnamed", "UserPromptSubmit")]
+    assert scheduled[0][0:2] == ("prompt-unnamed", "UserPromptSubmit")
+    assert scheduled[0][2] is not None
     with sqlite3.connect(app_env.db_path) as conn:
         assert conn.execute(
             """

@@ -121,6 +121,56 @@ def _canonical_position_for_page(page: str, position: str) -> str:
     return raw
 
 
+def _name_key(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", _normalize_pane(value).lower()).strip("-")
+
+
+async def _resolve_live_instance_name_or_id(identifier: str) -> str | None:
+    """Resolve instance_id/persona-name/instance-name to a live raw tmux pane.
+
+    This is the comms side of the same fail-closed oracle used by
+    ``session-doc-name``: human name -> durable instance row -> live
+    ``resolve_instance_pane``. Ambiguous names deliberately return ``None``.
+    """
+    raw = _normalize_pane(identifier)
+    if not raw or raw.startswith("%") or ":" in raw:
+        return None
+    wanted = _name_key(raw)
+    matches: list[str] = []
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT i.id, i.name AS instance_name, p.slug AS persona_slug,
+                          p.display_name AS persona_display_name
+                   FROM instances i
+                   LEFT JOIN personas p ON p.id = i.persona_id
+                   WHERE COALESCE(i.status, '') NOT IN ('stopped', 'archived')
+                   ORDER BY datetime(i.last_activity) DESC
+                   LIMIT 300"""
+            )
+            rows = await cursor.fetchall()
+    except Exception:
+        log.debug("instance/name pane resolver DB lookup failed", exc_info=True)
+        return None
+    for row in rows:
+        candidates = {
+            _normalize_pane(row["id"]),
+            _name_key(row["instance_name"]),
+            _name_key(row["persona_slug"]),
+            _name_key(row["persona_display_name"]),
+        }
+        # Exact instance ids are accepted; short prefixes are intentionally not —
+        # they are too easy to collide in a live fleet. Human names/slugs compare
+        # through the same hyphen-normalized key operators type at the CLI.
+        if raw == row["id"] or (wanted and wanted in candidates):
+            pane, _role = await shared.resolve_instance_pane(row["id"])
+            if pane:
+                matches.append(pane)
+    unique = sorted(set(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
 def _pane_position_matches(pane: dict[str, str], window_ref: str, position: str) -> bool:
     """Return true when a live tmux pane matches ``<window-ref>:<position>``.
 
@@ -240,6 +290,11 @@ async def resolve_pane(identifier: str) -> str | None:
         return None
     if raw.startswith("%"):
         return raw
+
+    by_instance = await _resolve_live_instance_name_or_id(raw)
+    if by_instance:
+        return by_instance
+
     panes = await _tmux_list_panes()
 
     # main:2:SE -> match by session+window_index+position.
