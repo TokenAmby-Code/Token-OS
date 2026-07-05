@@ -3234,6 +3234,7 @@ actions:
 
     IterateDictionaryAction:
      description: Iterate over dictionary or array entries
+     note: Requires matching EndLoopAction. Actions between IterateDictionaryAction and EndLoopAction run once per entry with iterator_dictionary_key and iterator_value magic text available.
      params:
      variableName?: [str, "Name of dictionary/array variable to iterate"]
      dictionaryKeys?: [dictkeys, "Dictionary keys for nested variable path"]

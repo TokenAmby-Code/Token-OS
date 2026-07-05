@@ -16,7 +16,7 @@ DEFAULT_SCHEMA = Path(os.environ.get('TOKEN_OS', str(Path.home() / 'runtimes' / 
 def load_json(path):
     if path == '-':
         return json.load(sys.stdin)
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, encoding='utf-8') as f:
         return json.load(f)
 
 
@@ -142,17 +142,17 @@ def validate(data, classes, allow_unknown=False, allow_mdr_guids=False):
             if if_depth < 0:
                 errors.append(f'm_actionList[{i}] EndIfAction without matching IfConditionAction')
                 if_depth = 0
-        elif ct == 'LoopAction':
+        elif ct in ('LoopAction', 'IterateDictionaryAction'):
             loop_depth += 1
         elif ct == 'EndLoopAction':
             loop_depth -= 1
             if loop_depth < 0:
-                errors.append(f'm_actionList[{i}] EndLoopAction without matching LoopAction')
+                errors.append(f'm_actionList[{i}] EndLoopAction without matching LoopAction/IterateDictionaryAction')
                 loop_depth = 0
     if if_depth:
         errors.append(f'm_actionList has {if_depth} unterminated IfConditionAction block(s)')
     if loop_depth:
-        errors.append(f'm_actionList has {loop_depth} unterminated LoopAction block(s)')
+        errors.append(f'm_actionList has {loop_depth} unterminated LoopAction/IterateDictionaryAction block(s)')
 
     return errors, warnings
 

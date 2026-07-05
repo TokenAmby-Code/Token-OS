@@ -108,20 +108,54 @@ def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
     macro = load("tts-phone-chunk-player.macro")
     assert token_os_global("tts-phone-chunk-player.macro")["m_stringValue"] == "http://100.95.109.23:7777"
     assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
+
+    local_vars = {v["m_name"]: v for v in macro["localVariables"]}
+    for name in [
+        "request",
+        "tts_session_id",
+        "tts_playback_id",
+        "tts_current_index",
+        "tts_next_index",
+        "tts_current_chunk",
+        "tts_next_chunk",
+    ]:
+        assert name in local_vars
+
+    # MacroDroid has proven reliable with iterator_value scalars; direct dictionary
+    # subscripts in SpeakTextAction can be spoken literally after import.
+    assert [a["variableName"] for a in actions(macro, "IterateDictionaryAction")] == ["request"]
+    extracted_by_key = {
+        a["m_constraintList"][0]["value2"]: a["m_variable"]["m_name"]
+        for a in actions(macro, "SetVariableAction")
+        if a.get("m_constraintList")
+    }
+    assert extracted_by_key == {
+        "session_id": "tts_session_id",
+        "playback_id": "tts_playback_id",
+        "current_index": "tts_current_index",
+        "next_index": "tts_next_index",
+        "current_chunk": "tts_current_chunk",
+        "next_chunk": "tts_next_chunk",
+    }
+    assert all(
+        a["m_newStringValue"] == "{iterator_value}"
+        for a in actions(macro, "SetVariableAction")
+        if a.get("m_constraintList")
+    )
+
     speak_actions = actions(macro, "SpeakTextAction")
     assert [a["m_textToSay"] for a in speak_actions] == [
-        "{lv=request[current_chunk]}",
-        "{lv=request[next_chunk]}",
+        "{lv=tts_current_chunk}",
+        "{lv=tts_next_chunk}",
     ]
     assert all(a["m_waitToFinish"] is True for a in speak_actions)
     assert all(a["m_queue"] is False for a in speak_actions)
 
     serialized = json.dumps(macro)
-    # The phone is an executor, not a queue owner.
-    assert "LoopAction" not in serialized
-    assert "IterateDictionaryAction" not in serialized
+    # The phone is an executor, not a queue owner. The only loop is the bounded
+    # request-dictionary extraction loop, not a playback queue/retry loop.
     assert "ForceMacroRunAction" not in serialized
-    assert "SetVariableAction" not in serialized
+    assert "{lv=request[" not in serialized
     assert "queue" not in macro["m_description"].lower().replace("no local queue", "")
     assert "current_plus_next" in serialized
 
@@ -130,8 +164,10 @@ def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
         f"{TOKEN_OS_BASE}/api/tts/chunk-event",
         f"{TOKEN_OS_BASE}/api/tts/chunk-event",
     ]
-    assert "current_complete_next_starting" in request_bodies(macro)[0]
-    assert "buffer_drained" in request_bodies(macro)[1]
+    bodies = request_bodies(macro)
+    assert "current_complete_next_starting" in bodies[0]
+    assert "buffer_drained" in bodies[1]
+    assert all("{lv=tts_" in body for body in bodies)
 
 
 def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:
