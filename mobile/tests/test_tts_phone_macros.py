@@ -12,6 +12,10 @@ def load(name: str) -> dict:
     return json.loads((MACROS / name).read_text())["macro"]
 
 
+def load_wrapper(name: str) -> dict:
+    return json.loads((MACROS / name).read_text())
+
+
 def actions(macro: dict, class_type: str | None = None) -> list[dict]:
     items = macro["m_actionList"]
     if class_type:
@@ -32,10 +36,6 @@ def request_bodies(macro: dict) -> list[str]:
     ]
 
 
-def load_wrapper(name: str) -> dict:
-    return json.loads((MACROS / name).read_text())
-
-
 def token_os_global(name: str) -> dict:
     wrapper = load_wrapper(name)
     matches = [
@@ -47,48 +47,59 @@ def token_os_global(name: str) -> dict:
     return matches[0]
 
 
-def test_overlay_buttons_call_local_ingress_not_token_os_or_local_control() -> None:
-    expected = {
-        "tts-overlay-pause.macro": "pause",
-        "tts-overlay-resume.macro": "resume",
-        "tts-overlay-skip.macro": "skip",
-        "tts-overlay-faster.macro": "faster",
-        "tts-overlay-stop.macro": "stop",
-    }
-    for filename, command in expected.items():
-        macro = load(filename)
-        triggers = macro["m_triggerList"]
-        assert [t["m_classType"] for t in triggers] == ["FloatingButtonTrigger"]
-        assert triggers[0]["identifier"] == f"tts-{command}"
-        assert request_urls(macro) == [
-            f"http://127.0.0.1:7777/tts-control?command={command}&source=overlay"
-        ]
-        assert (
-            actions(macro, "HttpRequestAction")[0]["requestConfig"][
-                "requestTimeOutSeconds"
-            ]
-            == 12
+def test_controls_notification_uses_direct_button_actions_not_button_triggers() -> None:
+    macro = load("01-controls-notification.macro")
+    assert macro["m_name"] == "01 TTS Controls Notification"
+    assert [t["m_classType"] for t in macro["m_triggerList"]] == [
+        "HttpServerTrigger"
+    ]
+    assert macro["m_triggerList"][0]["identifier"] == "tts-control-surface"
+
+    notification = actions(macro, "NotificationAction")[0]
+    buttons = notification["notificationActionButtons"]
+    assert [b["label"] for b in buttons] == [
+        "Pause",
+        "Resume",
+        "Skip",
+        "Faster",
+        "Stop",
+    ]
+    for button in buttons:
+        assert button["macroGuid"] == 0
+        assert button["macroName"] == ""
+        assert button["actionBlockData"] is None
+        assert button["clearOnPress"] is False
+        assert button["actionClassType"] == "HttpRequestAction"
+        action = json.loads(button["actionJson"])
+        assert action["m_classType"] == "HttpRequestAction"
+        url = action["requestConfig"]["urlToOpen"]
+        command = button["label"].lower()
+        assert url == (
+            f"http://127.0.0.1:7777/tts-control?command={command}"
+            "&source=notification"
         )
-        serialized = json.dumps(macro)
-        assert "/tts-local-control" not in serialized
-        assert "/api/tts/control" not in serialized
-        assert "SetVariableAction" not in serialized
-        assert "CancelActiveMacroAction" not in serialized
+        assert action["requestConfig"]["requestType"] == 0
+
+    serialized = json.dumps(macro)
+    assert "NotificationButtonTrigger" not in serialized
+    assert "TriggerThatInvokedConstraint" not in serialized
+    assert "/api/tts/control" not in serialized
+    assert "/tts-local-control" not in serialized
 
 
 def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally() -> (
     None
 ):
-    macro = load("tts-phone-control-ingress.macro")
+    macro = load("02-control-ingress.macro")
     assert (
-        token_os_global("tts-phone-control-ingress.macro")["m_stringValue"]
+        token_os_global("02-control-ingress.macro")["m_stringValue"]
         == "http://100.95.109.23:7777"
     )
     assert macro["m_triggerList"][0]["identifier"] == "tts-control"
     assert request_urls(macro) == [TOKEN_OS_CONTROL]
     body = request_bodies(macro)[0]
     assert '"command":"{http_param=command}"' in body
-    assert '"source":"phone_overlay"' in body
+    assert '"source":"phone_notification"' in body
     assert '"backend":"phone"' in body
     assert '"speed":"{http_param=speed}"' in body
     serialized = json.dumps(macro)
@@ -103,60 +114,103 @@ def test_control_ingress_forwards_to_token_os_first_and_does_not_mutate_locally(
         assert class_type not in serialized
 
 
-def test_local_control_echo_is_private_consumed_endpoint_not_authority() -> None:
-    macro = load("tts-phone-local-control.macro")
+def test_local_control_echo_is_private_execution_authority() -> None:
+    macro = load("03-local-echo-control.macro")
     assert macro["m_triggerList"][0]["identifier"] == "tts-local-control"
     assert request_urls(macro) == []
     serialized = json.dumps(macro)
     assert "local_control_consumed" in serialized
+    assert "tts_control_state" in serialized
+    assert "CancelActiveMacroAction" in serialized
     lowered = serialized.lower()
     assert "macos_say" not in lowered
     assert "mac say" not in lowered
 
 
-def test_chunk_player_is_exactly_one_chunk_write_ahead_no_local_queue() -> None:
-    macro = load("tts-phone-chunk-player.macro")
+def test_numbered_tts_set_is_the_only_active_source() -> None:
+    active = sorted(p.name for p in MACROS.glob("*.macro"))
+    assert active == [
+        "01-controls-notification.macro",
+        "02-control-ingress.macro",
+        "03-local-echo-control.macro",
+        "04-chunk-player.macro",
+        "05-backfill-fetcher.macro",
+        "06-error-report.macro",
+        "pause.macro",
+        "zappa-single-lane.macro",
+    ]
+    retired_prefixes = ("tts-phone-", "tts-overlay-", "90-", "91-", "92-", "93-", "94-")
+    assert not any(name.startswith(retired_prefixes) for name in active)
+
+
+def test_chunk_player_uses_request_dictionary_deref_scalar_speak_and_inloop_backfill() -> None:
+    macro = load("04-chunk-player.macro")
     assert (
-        token_os_global("tts-phone-chunk-player.macro")["m_stringValue"]
+        token_os_global("04-chunk-player.macro")["m_stringValue"]
         == "http://100.95.109.23:7777"
     )
-    assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
-    speak_actions = actions(macro, "SpeakTextAction")
-    assert [a["m_textToSay"] for a in speak_actions] == [
-        "{http_param=current_chunk}",
-        "{http_param=next_chunk}",
-    ]
-    assert all(a["m_waitToFinish"] is True for a in speak_actions)
-    assert all(a["m_queue"] is False for a in speak_actions)
+    trigger = macro["m_triggerList"][0]
+    assert trigger["identifier"] == "tts-chunk"
+    assert trigger["queryParamsDictionaryName"] == "request"
 
     serialized = json.dumps(macro)
-    # The phone is an executor, not a queue owner.
-    assert "LoopAction" not in serialized
+    assert "{lv=request[current_chunk]}" in serialized
+    assert "{lv=request[next_chunk]}" in serialized
+    assert "{lv=request[current_index]}" in serialized
+    assert "{lv=backfill[next_chunk]}" in serialized
+    assert "{lv=backfill[next_index]}" in serialized
+    assert "{lv=backfill[control_state]}" in serialized
+
+    speak_actions = actions(macro, "SpeakTextAction")
+    assert [a["m_textToSay"] for a in speak_actions] == [
+        "{lv=current_chunk_text}",
+        "{lv=next_chunk_text}",
+        "{lv=backfill_next_chunk}",
+    ]
+    assert [a["m_queue"] for a in speak_actions] == [False, True, True]
+    assert speak_actions[0]["m_waitToFinish"] is True
+    assert speak_actions[1]["m_waitToFinish"] is False
+    assert speak_actions[2]["m_waitToFinish"] is True
+    for speak in speak_actions:
+        assert "{http_param=" not in speak["m_textToSay"]
+        assert "{v=tts_" not in speak["m_textToSay"]
+        assert speak["m_textToSay"].startswith("{lv=")
+
+    assert "{http_param=current_chunk}" not in serialized
+    assert "{http_param=next_chunk}" not in serialized
     assert "IterateDictionaryAction" not in serialized
-    assert "ForceMacroRunAction" not in serialized
-    assert "SetVariableAction" not in serialized
-    assert "queue" not in macro["m_description"].lower().replace("no local queue", "")
-    assert "current_plus_next" in serialized
+    assert "JsonParseAction" in serialized
+    assert "LoopAction" in serialized
+    assert "05 TTS Backfill Fetcher" not in json.dumps(actions(macro, "ForceMacroRunAction"))
 
     urls = request_urls(macro)
-    assert urls == [
-        f"{TOKEN_OS_BASE}/api/tts/chunk-event",
-        f"{TOKEN_OS_BASE}/api/tts/chunk-event",
-    ]
-    assert "current_complete_next_starting" in request_bodies(macro)[0]
-    assert "buffer_drained" in request_bodies(macro)[1]
-    assert (
-        actions(macro, "HttpRequestAction")[0]["requestConfig"]["blockNextAction"]
-        is False
-    )
-    assert "{lv=request[" not in serialized
-    assert "request[" not in serialized
+    assert urls.count(f"{TOKEN_OS_BASE}/api/tts/chunk-next") == 1
+    assert urls.count(f"{TOKEN_OS_BASE}/api/tts/chunk-event") == 4
+    bodies = request_bodies(macro)
+    assert any("current_complete_next_starting" in body for body in bodies)
+    assert any("buffer_drained" in body and "control_stop" in body for body in bodies)
+    assert any("buffer_drained" in body for body in bodies)
+    chunk_next = actions(macro, "HttpRequestAction")[1]
+    assert chunk_next["requestConfig"]["responseVariableName"] == "backfill_raw"
+    assert "last_consumed_index" in chunk_next["requestConfig"]["contentBodyText"]
+
+
+def test_backfill_fetcher_uses_direct_json_parse_not_dictionary_iteration() -> None:
+    macro = load("05-backfill-fetcher.macro")
+    assert request_urls(macro) == [f"{TOKEN_OS_BASE}/api/tts/chunk-next"]
+    body = request_bodies(macro)[0]
+    assert "last_consumed_index" in body
+    serialized = json.dumps(macro)
+    assert "JsonParseAction" in serialized
+    assert "IterateDictionaryAction" not in [a.get("m_classType") for a in actions(macro)]
+    assert "tts_backfill_response[next_chunk]" in serialized
+    assert "tts_backfill_response[next_index]" in serialized
 
 
 def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:
-    macro = load("tts-phone-error-report.macro")
+    macro = load("06-error-report.macro")
     assert (
-        token_os_global("tts-phone-error-report.macro")["m_stringValue"]
+        token_os_global("06-error-report.macro")["m_stringValue"]
         == "http://100.95.109.23:7777"
     )
     assert macro["m_triggerList"][0]["identifier"] == "tts-error"
@@ -168,7 +222,6 @@ def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:
         actions(macro, "JsonOutputAction")[0]["stringVarName"]
         == "tts_error_request_json"
     )
-    assert "{lv=request[error_code]}" not in body
     serialized = json.dumps(macro).lower()
     assert "macos" not in serialized
     assert "mac say" not in serialized

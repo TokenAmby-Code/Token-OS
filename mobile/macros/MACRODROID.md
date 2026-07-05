@@ -1,6 +1,7 @@
 # MacroDroid Macro Inventory
 
-Current state of macros deployed to the phone. Last updated 2026-05-09 after official-schema cleanup.
+Current source inventory for MacroDroid phone automation. Last updated for the
+numbered Token-OS TTS phone executor set.
 
 ## Source of Truth
 
@@ -108,12 +109,14 @@ request.
    macrodroid-validate macro-name.macro
    ```
 
-5. Push/import:
+5. Import:
    ```bash
-   macrodroid-push macro-name.macro
+   MACRODROID_AUTO_IMPORT=1 macrodroid-import macro-name.macro
    ```
 
-6. Export/pull again and verify.
+6. Export/pull again and verify. The import launcher can time out or report a
+   false success when MacroDroid's UI rejects a shape, so the deployed export is
+   the final truth.
 
 ## Debug Logs
 
@@ -131,35 +134,129 @@ ssh-phone "tail -f /storage/emulated/0/MacroDroid/logs/debug.log"
 
 Use shell actions that append timestamped checkpoints before/after HTTP requests, variable parsing, dictionary iteration, Pavlok calls, and branch points.
 
-## Staged TTS execution macros — 2026-07-03
+## Canonical TTS execution macros
 
-Track B phone-side artifacts for [[/Volumes/Imperium/Imperium-ENV/Mars/Tasks/tts-execution-architecture-tokenos-authoritative-phone-wsl-linux.md]]. These are official `.macro` wrappers staged in this directory and validated with `macrodroid-validate`; do not push or live-import them until Track A accepts the endpoint/field names or sends corrections through Fabricator-General.
+These official `.macro` wrappers are the canonical phone-side Token-OS TTS set. They supersede the earlier `tts-phone-*`, `tts-overlay-*`, and `90`-`94` retirement-stub files. Macro names and filenames are numbered so the distinctive part is visible in the Android import picker.
 
 Phone-side contract:
 
 - Token-OS owns TTS session, queue, current chunk, `playback_id`, and control state.
-- Phone is execution-only and holds at most `current_chunk + next_chunk`.
-- Overlay controls do not mutate local playback directly. They hit local `/tts-control`, which forwards to Token-OS `/api/tts/control`; only a later `/tts-local-control` echo is local execution authority.
+- Phone is execution-only and holds `current + next/backfill` only; Token-OS remains authoritative for order and controls.
+- Notification controls do not mutate local playback directly. Button actions call local `/tts-control`, which forwards to Token-OS `/api/tts/control`; only a later `/tts-local-control` echo is local execution authority.
 - Phone has no Mac fallback. Failures go up to Token-OS via `/tts-error` → `/api/tts/backend-error`.
+- `IterateDictionaryAction` is intentionally absent from the active TTS macro set after import-control-flow failures. Chunk ingress uses the `request` dictionary with direct local dereferences such as `{lv=request[current_chunk]}`; backfill uses `JsonParseAction` plus direct parsed-field assignments such as `{lv=backfill[next_chunk]}`.
+- `04 TTS Chunk Player` speaks only scalar local variables (`{lv=current_chunk_text}`, `{lv=next_chunk_text}`, `{lv=backfill_next_chunk}`), never literal HTTP params or `tts_*` globals.
 
-Staged macros:
+Canonical macros:
 
 | File | Macro | Endpoint / Trigger | Purpose |
 |---|---|---|---|
-| `tts-phone-control-ingress.macro` | TTS Phone Control Ingress | `/tts-control` | Public phone control ingress; forwards overlay commands to Token-OS first. |
-| `tts-phone-local-control.macro` | TTS Phone Local Control | `/tts-local-control` | Private Token-OS echo consumer; local-control hook point. |
-| `tts-phone-chunk-player.macro` | TTS Phone Chunk Player | `/tts-chunk` | One-chunk write-ahead executor: speaks `current_chunk`, then `next_chunk`, with no loop/local queue. |
-| `tts-phone-error-report.macro` | TTS Phone Error Report | `/tts-error` | Reports phone executor failure to Token-OS. |
-| `tts-overlay-pause.macro` | TTS Overlay Pause | floating `tts-pause` | Calls local `/tts-control?command=pause`. |
-| `tts-overlay-resume.macro` | TTS Overlay Resume | floating `tts-resume` | Calls local `/tts-control?command=resume`. |
-| `tts-overlay-skip.macro` | TTS Overlay Skip | floating `tts-skip` | Calls local `/tts-control?command=skip`. |
-| `tts-overlay-faster.macro` | TTS Overlay Faster | floating `tts-faster` | Calls local `/tts-control?command=faster`. |
-| `tts-overlay-stop.macro` | TTS Overlay Stop | floating `tts-stop` | Calls local `/tts-control?command=stop`. |
+| `01-controls-notification.macro` | 01 TTS Controls Notification | `/tts-control-surface` | Posts the persistent Token-OS TTS control notification. Buttons use MacroDroid 5.65 direct `actionClassType`/`actionJson` notification action fields to run local HTTP requests. |
+| `02-control-ingress.macro` | 02 TTS Control Ingress | `/tts-control` | Public phone control ingress; forwards notification commands to Token-OS first. |
+| `03-local-echo-control.macro` | 03 TTS Local Echo Control | `/tts-local-control` | Private Token-OS echo consumer; updates local control state and cancels active chunk/backfill macros for skip/stop. |
+| `04-chunk-player.macro` | 04 TTS Chunk Player | `/tts-chunk` | Direct-deref full executor: accepts current+next, speaks scalar local chunks, calls `/api/tts/chunk-next` in-loop, parses backfill by direct dictionary deref, and reports progress plus `buffer_drained`. |
+| `05-backfill-fetcher.macro` | 05 TTS Backfill Fetcher | manual helper | Numbered diagnostic/manual helper retained in the canonical set; `04` now performs normal backfill itself. |
+| `06-error-report.macro` | 06 TTS Error Report | `/tts-error` | Reports phone executor failure to Token-OS. |
+
+Retired sources:
+
+- `tts-phone-*` files are removed from active source.
+- `tts-overlay-*` files are removed from active source.
+- `90`-`94` overlay retirement stubs are not part of the active set and should
+  not be restored for normal TTS testing.
+
+### `04 TTS Chunk Player` execution flow
+
+`04` is the live playback worker. It should be the only macro that performs
+normal chunk backfill during playback.
+
+1. `/tts-chunk` receives query params into local dictionary `request`.
+2. It immediately responds accepted and posts/refreshes `01 TTS Controls Notification`.
+3. It scalarizes inbound fields from `request`:
+   - `{lv=request[current_chunk]}` -> `{lv=current_chunk_text}`
+   - `{lv=request[next_chunk]}` -> `{lv=next_chunk_text}`
+   - `{lv=request[current_index]}` -> `{lv=current_index}`
+   - `{lv=request[next_index]}` -> `{lv=next_index}`
+   - `{lv=request[session_id]}`, `{lv=request[playback_id]}`,
+     `{lv=request[utterance_id]}` -> scalar local metadata.
+4. It speaks `{lv=current_chunk_text}` with `m_waitToFinish: true`.
+5. If `{lv=next_chunk_text}` is present, it queues it, emits
+   `current_complete_next_starting`, and enters the backfill loop.
+6. Each loop iteration calls `POST /api/tts/chunk-next`, stores the raw response
+   in `{lv=backfill_raw}`, parses it into dictionary `backfill`, and dereferences:
+   - `{lv=backfill[next_chunk]}` -> `{lv=backfill_next_chunk}`
+   - `{lv=backfill[next_index]}` -> `{lv=backfill_next_index}`
+   - `{lv=backfill[done]}` -> `{lv=backfill_done}`
+   - `{lv=backfill[control_state]}` -> `{lv=control_state}`
+7. If `control_state` is `stop`, it emits `buffer_drained` with
+   `detail=control_stop` and breaks.
+8. If a backfill chunk exists, it speaks `{lv=backfill_next_chunk}`, advances
+   indexes, and loops.
+9. If no backfill chunk exists, it emits final `buffer_drained` and exits.
+
+Speak-field invariant:
+
+```text
+SpeakTextAction.m_textToSay must be exactly one of:
+  {lv=current_chunk_text}
+  {lv=next_chunk_text}
+  {lv=backfill_next_chunk}
+```
+
+Do not put `{http_param=...}`, `{lv=request[...]}`, `{lv=backfill[...]}`, or
+`{v=tts_*}` directly in `SpeakTextAction.m_textToSay`. MacroDroid has accepted
+some of those shapes in import/validation while the live TTS engine speaks them
+literally.
 
 Validation:
 
 ```bash
 set -e
-for f in mobile/macros/tts-*.macro; do macrodroid-validate "$f"; done
-pytest -q mobile/tests/test_tts_phone_macros.py
+for f in mobile/macros/[0-9][0-9]-*.macro; do macrodroid-validate "$f"; done
+python -m pytest -q mobile/tests/test_tts_phone_macros.py
 ```
+
+Import/export gate:
+
+`macrodroid-validate` is not sufficient. Import only `mobile/macros/01`–`06`; do not import retired `tts-phone-*`, `tts-overlay-*`, or `90`–`94` files. After import, export/pull with `macrodroid-state --pull` and verify the deployed `.mdr` contains the numbered macro names, direct notification button fields (`actionClassType`, `actionName`, `actionJson`), request-dictionary derefs in `04`, and no literal HTTP/global variable text in TTS speak fields before treating the phone executor as live.
+
+Import order:
+
+```bash
+cd /Users/tokenclaw/worktrees/Token-OS/wt-fix-phone-tts-chunk-playback
+for f in mobile/macros/0[1-6]-*.macro; do
+  MACRODROID_AUTO_IMPORT=1 macrodroid-import "$f"
+done
+```
+
+Known import-tool caveats:
+
+- `macrodroid-import --replace` can false-success or fail verification after
+  MacroDroid UI rejection. Watch the phone UI.
+- `macrodroid-validate` does not catch every MacroDroid UI/TTS-engine rejection.
+- `01 TTS Controls Notification` can take long enough that verification may
+  time out; confirm on the phone and then pull/export.
+
+Post-import verification:
+
+```bash
+macrodroid-state --pull
+macrodroid-read /tmp/macrodroid-state/EXPORT.mdr --list | grep -E '^(01|02|03|04|05|06) TTS'
+macrodroid-read /tmp/macrodroid-state/EXPORT.mdr --macro "04 TTS Chunk Player" --export-macro > /tmp/live-04.macro
+macrodroid-validate /tmp/live-04.macro
+```
+
+Live smoke:
+
+1. Send a 3+ chunk utterance through the normal Token-OS phone TTS route.
+2. Tail phone logs:
+   ```bash
+   ssh-phone "tail -f /storage/emulated/0/MacroDroid/logs/debug.log"
+   ```
+3. Pass criteria:
+   - phone speaks all chunks as natural text;
+   - no literal `{lv=...}`, `{http_param=...}`, or `{v=tts_*}` text is spoken;
+   - Token-OS receives `current_complete_next_starting`;
+   - Token-OS receives final `buffer_drained`;
+   - pause/stop/skip commands route through `/tts-control` -> Token-OS ->
+     `/tts-local-control`.
