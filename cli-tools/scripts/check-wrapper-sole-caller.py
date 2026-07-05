@@ -57,7 +57,11 @@ def _iter_files() -> list[Path]:
         rel = path.relative_to(ROOT)
         if any(part in _SKIP_DIRS for part in rel.parts):
             continue
-        if not path.is_file() or path.suffix.lower() in _SKIP_SUFFIXES:
+        try:
+            is_file = path.is_file()
+        except OSError:
+            continue
+        if not is_file or path.suffix.lower() in _SKIP_SUFFIXES:
             continue
         files.append(path)
     return files
@@ -71,7 +75,7 @@ def main() -> int:
             continue
         try:
             text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        except (OSError, UnicodeDecodeError):
             continue
         for label, pattern in _PATTERNS:
             for match in pattern.finditer(text):

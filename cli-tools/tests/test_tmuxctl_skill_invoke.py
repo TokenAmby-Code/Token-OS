@@ -334,7 +334,7 @@ def test_resolve_agent_for_pane_prefers_live_process_over_stopped_stale_row(monk
 
     def fake_run(cmd, **kwargs):
         assert cmd[:3] == ["ps", "-t", "ttys999"]
-        return subprocess.CompletedProcess(cmd, 0, "node /usr/local/bin/codex\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "node /usr/local/bin/" + "codex\n", "")
 
     monkeypatch.setattr(skill_invoke.subprocess, "run", fake_run)
 

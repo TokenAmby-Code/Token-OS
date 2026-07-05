@@ -623,7 +623,7 @@ env "$bypass_name=1" codex raw-beta
     codex_lines = codex_called.read_text(encoding="utf-8").splitlines()
     assert len(codex_lines) == 2
     assert codex_lines[0].startswith("codex bypass=1 args=")
-    assert " beta " in codex_lines[0]
+    assert "beta" in codex_lines[0].split()
     assert codex_lines[1] == "codex bypass= args=raw-beta"
 
 
