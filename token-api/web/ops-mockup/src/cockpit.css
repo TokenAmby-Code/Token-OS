@@ -63,6 +63,11 @@
   --error: #ff2740;
   --sel: #c77dff;
 
+  /* Compass rim-star glow hues — red / blue / purple gems around the dial. */
+  --star-red: #ff4d63;
+  --star-blue: #6ba5ff;
+  --star-purple: #d996ff;
+
   --m-working: #93d94f;
   --m-multi: #56c2d6;
   --m-distracted: #ff5b3d;
@@ -739,6 +744,26 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 /* Table-lip interior — the ribbon between the dial-hugging top edge and the
    symmetric bottom bar. Flat brass wash; opacity from the frozen bandFill constant. */
 .worker-rail__band {
+  fill: var(--instrument);
+  stroke: none;
+}
+/* Compass dial inscribed in the crossbar's RHS cap bulge — brass instrument lines
+   like the rest of the rail. Cardinal ticks at full weight, ordinal ticks lighter. */
+.worker-compass__rim {
+  fill: none;
+  stroke: var(--instrument);
+  stroke-width: var(--instrument-w);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.worker-compass__tick {
+  fill: none;
+  stroke: var(--instrument);
+  stroke-linecap: round;
+}
+.worker-compass__tick--card { stroke-width: var(--instrument-w); }
+/* Brass hub crowning the needle intersection. */
+.worker-compass__hub {
   fill: var(--instrument);
   stroke: none;
 }

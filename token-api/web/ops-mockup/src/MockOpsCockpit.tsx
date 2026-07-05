@@ -18,6 +18,13 @@ import {
   type MockTtsItem,
   type MockTtsStatus,
 } from './mockCockpitData';
+import {
+  DIR_DEGREES,
+  resolveCompass,
+  type CompassStar,
+  type ResolvedCompass,
+  type StarColor,
+} from './compass';
 
 // Mode → hex, mirroring the live styles.css --m-* tokens so SVG gradients and
 // DOM chips read as one instrument.
@@ -2080,6 +2087,172 @@ const RAIL_SHAPE_DEFAULTS: RailShape = {
 // The reservist hourglass (centre glow cells + I-walls) is LOCKED temporarily at the
 // operator's settled shape — leave its geometry as-is; ongoing tuning is the crossbar.
 
+// ── Compass dial (RHS cap bulge) ───────────────────────────────────────────
+// A compass rose inscribed in the crossbar's right-hand cap: a rim circle carrying
+// interior radial ticks — four LONG cardinal ticks (N/E/S/W) and four SHORT ordinal
+// ticks (NE/SE/SW/NW) pointing inward from the rim — a two-sided N/S needle (red
+// north, white south) on the pivot hub, and a tiny GLOWING star at each of the eight
+// rim ticks. By-eye fractions of the cap radius; tune these to seat the dial.
+const COMPASS_R_FRAC = 1.0;       // rim radius = the cap radius — the compass IS the endcap circle
+const COMPASS_CARD_FRAC = 0.11;   // cardinal tick length as a fraction of the rim radius (small nub)
+const COMPASS_ORD_FRAC = 0.07;    // ordinal tick length as a fraction of the rim radius (smaller nub)
+const COMPASS_POINTER_FRAC = 1.9;  // outer pointer size as a fraction of the rim radius (its 100-box scale)
+const COMPASS_POINTER_NEST = 0.6;  // inner (smaller, on-top) pointer size as a fraction of the outer
+const COMPASS_HUB_FRAC = 0.028;    // brass hub radius on the intersection, fraction of the outer pointer size
+const COMPASS_SPIN_SEC = 120;      // seconds per full needle revolution (0 = static) — 2 min, 30s per cardinal
+// Rim stars are no longer authored as raw positions — they're the canonical
+// output of the star-reduction algebra (see compass.ts). Each rendered star's
+// glow hue maps from its resolved colour to the matching CSS var.
+const STAR_FILL: Record<StarColor, string> = {
+  red: 'var(--star-red)',
+  blue: 'var(--star-blue)',
+  purple: 'var(--star-purple)',
+};
+// Authored demo spec — exercises the rules by eye on :5199. NW red + NE blue +
+// SE red is the contested-ordinal case: NE hydrates BOTH N and E (rule 4), so
+// N and E render purple and all three ordinals vanish. S red is a plain lone
+// cardinal for contrast.
+const DEMO_COMPASS_STARS: CompassStar[] = [
+  { dir: 'NW', color: 'red' },
+  { dir: 'NE', color: 'blue' },
+  { dir: 'SE', color: 'red' },
+  { dir: 'S', color: 'red' },
+];
+function CompassDial({ cx, cy, capR, rimD, uiScale, stars }: { cx: number; cy: number; capR: number; rimD: string; uiScale: number; stars: readonly CompassStar[] }) {
+  const R = capR * COMPASS_R_FRAC;
+  const cardL = R * COMPASS_CARD_FRAC;
+  const ordL = R * COMPASS_ORD_FRAC;
+  const f = (n: number) => n.toFixed(1);
+  const rad = (deg: number) => ((deg - 90) * Math.PI) / 180; // deg 0 = North (up), clockwise
+  // Tick runs inward from the rim by `len`.
+  const tick = (deg: number, len: number): string => {
+    const a = rad(deg);
+    const ox = cx + R * Math.cos(a), oy = cy + R * Math.sin(a);
+    const ix = cx + (R - len) * Math.cos(a), iy = cy + (R - len) * Math.sin(a);
+    return `M${f(ox)},${f(oy)} L${f(ix)},${f(iy)}`;
+  };
+  const cardinals = [0, 90, 180, 270].map((d) => tick(d, cardL)).join(' ');
+  // Stars are the payload; the dial is just chrome. Size them to read as the
+  // primary information — a broad colour halo, a fat same-colour core, and a
+  // white-hot pinpoint so each gem reads bright rather than tinted.
+  const haloR = Math.max(6.8, 12.0 * uiScale);
+  const coreR = Math.max(3.8, 6.4 * uiScale);
+  const hotR = Math.max(1.4, 2.4 * uiScale);
+  // The dial only ever renders the REDUCED star set — resolveCompass mints the
+  // branded ResolvedCompass, positions come from DIR_DEGREES.
+  const resolved: ResolvedCompass = useMemo(() => resolveCompass(stars), [stars]);
+  const renderStars = resolved.map((st) => {
+    const a = rad(DIR_DEGREES[st.dir]);
+    // Seat each star ON its interior tick — a touch inside the rim, centred on the
+    // tick's midpoint (cardinals sit deeper since their tick is longer).
+    const isCard = st.dir.length === 1;
+    const rr = R - (isCard ? cardL : ordL) / 2;
+    return { x: cx + rr * Math.cos(a), y: cy + rr * Math.sin(a), color: STAR_FILL[st.color] };
+  });
+  return (
+    <g className="worker-compass" aria-hidden>
+      <defs>
+        <filter id="compass-star-glow" x="-400%" y="-400%" width="900%" height="900%">
+          <feGaussianBlur stdDeviation={Math.max(1.8, 3.2 * uiScale)} />
+        </filter>
+      </defs>
+      {/* West half of the rim — the endcap's east semicircle already draws the rest,
+          so together they close the circle (cut on the NNW where the top line bites). */}
+      <path className="worker-compass__rim" d={rimD} />
+      <path className="worker-compass__tick worker-compass__tick--card" d={cardinals} />
+      {/* glowing rim stars — a blurred colour halo under a crisp same-colour core. */}
+      {renderStars.map((st, i) => (
+        <g key={i}>
+          <circle cx={st.x} cy={st.y} r={haloR} fill={st.color} filter="url(#compass-star-glow)" opacity={1} />
+          <circle cx={st.x} cy={st.y} r={coreR} fill={st.color} />
+          <circle cx={st.x} cy={st.y} r={hotR} fill="#fff" opacity={0.85} />
+        </g>
+      ))}
+      {/* bespoke compass pointer over the ticks — two concentric red-north /
+          white-south diamonds (a larger outline with a smaller one nested on
+          top), spinning as one around the pivot; a single flat brass hub crowns
+          the intersection and stays put as the pivot. */}
+      <g>
+        <CompassPointer cx={cx} cy={cy} size={R * COMPASS_POINTER_FRAC} uid="outer" />
+        <CompassPointer cx={cx} cy={cy} size={R * COMPASS_POINTER_FRAC * COMPASS_POINTER_NEST} uid="inner" />
+        {COMPASS_SPIN_SEC > 0 && (
+          <animateTransform attributeName="transform" type="rotate"
+            from={`0 ${cx} ${cy}`} to={`360 ${cx} ${cy}`}
+            dur={`${COMPASS_SPIN_SEC}s`} repeatCount="indefinite" />
+        )}
+      </g>
+      <circle className="worker-compass__hub" cx={cx} cy={cy} r={R * COMPASS_POINTER_FRAC * COMPASS_HUB_FRAC} fill="var(--instrument)" />
+    </g>
+  );
+}
+
+// ── Compass pointer element ─────────────────────────────────────────────────
+// A bespoke compass diamond drawn in a fixed 100×100 space (viewBox), dropped as
+// a nested <svg> centred on the dial pivot at any pixel size via cx/cy/size. Each
+// half is a FULL diamond: the original triangle (long, outer N or S tip) mirrored
+// across its waist into a shorter inverted copy pointing back at the centre. The
+// two short inner tips touch at the centre. North diamond red, south diamond
+// white, edges bowing INWARD toward the centre. Thin gold outlines with an
+// interior glow supplying the colour, and a flat brass hub on the intersection.
+const PTR_OUTER_FRAC = 0.62; // waist → outer (N/S) tip, fraction of half-extent (50)
+const PTR_INNER_FRAC = 0.28; // waist → inner tip (the shorter, inverted copy); centre = this off 0
+const PTR_EW_FRAC = 0.17;    // half-width at the waist, fraction of half-extent
+const PTR_BOW = 0.3;         // how far each edge is pulled toward centre (0 = straight)
+const PTR_STROKE = 1.0;      // thin traced outline, in the 100-box
+const PTR_GLOW = 3.4;        // inner-glow blur radius, in the 100-box
+const PTR_GLOW_W = 9;        // inner-glow band width — a fat stroke clipped to the interior
+const PTR_GLOW_OP = 0.72;    // inner-glow opacity — layering keeps it bright, more inter-layer contrast
+function CompassPointer({ cx, cy, size, uid, north = 'var(--error)', south = '#f4f1ea' }: { cx: number; cy: number; size: number; uid: string; north?: string; south?: string }) {
+  const c = 50;                          // centre of the 100-box
+  const outer = 50 * PTR_OUTER_FRAC, inner = 50 * PTR_INNER_FRAC, ew = 50 * PTR_EW_FRAC;
+  // The inner (inverted) tip sits `inner` off the waist toward centre; the waist
+  // itself is `inner` off centre, so the inner tip lands exactly on the centre —
+  // red's and white's inner tips meet there.
+  const f = (n: number) => n.toFixed(2);
+  // A concave edge P→Q: a quadratic whose control point is the P·Q midpoint
+  // pulled toward the centre by PTR_BOW, so the edge caves inward.
+  const seg = (P: [number, number], Q: [number, number]): string => {
+    const mx = (P[0] + Q[0]) / 2, my = (P[1] + Q[1]) / 2;
+    const kx = mx + PTR_BOW * (c - mx), ky = my + PTR_BOW * (c - my);
+    return `Q${f(kx)},${f(ky)} ${f(Q[0])},${f(Q[1])}`;
+  };
+  // A full diamond for `sign` = -1 (north/up) or +1 (south/down): outer tip,
+  // E waist, inner tip (at centre), W waist — closed, concave edges.
+  const diamond = (sign: number): string => {
+    const waistY = c + sign * inner;
+    const outerTip: [number, number] = [c, waistY + sign * outer];
+    const eWaist: [number, number] = [c + ew, waistY];
+    const innerTip: [number, number] = [c, c];
+    const wWaist: [number, number] = [c - ew, waistY];
+    return `M${f(outerTip[0])},${f(outerTip[1])} ${seg(outerTip, eWaist)} ${seg(eWaist, innerTip)} ${seg(innerTip, wWaist)} ${seg(wWaist, outerTip)} Z`;
+  };
+  const dN = diamond(-1), dS = diamond(1);
+  const gid = `ptr-glow-${uid}`, cnid = `ptr-clip-n-${uid}`, csid = `ptr-clip-s-${uid}`;
+  return (
+    <svg x={cx - size / 2} y={cy - size / 2} width={size} height={size} viewBox="0 0 100 100" style={{ overflow: 'visible' }} aria-hidden>
+      <defs>
+        <filter id={gid} x="-60%" y="-60%" width="220%" height="220%">
+          <feGaussianBlur stdDeviation={PTR_GLOW} />
+        </filter>
+        <clipPath id={cnid}><path d={dN} /></clipPath>
+        <clipPath id={csid}><path d={dS} /></clipPath>
+      </defs>
+      {/* interior glow — a fat blurred colour stroke clipped to each diamond's
+          interior, so it lights the borders and fades inward. This IS the colour
+          of each diamond; the outlines are gold. */}
+      <g clipPath={`url(#${cnid})`}>
+        <path d={dN} fill="none" stroke={north} strokeWidth={PTR_GLOW_W} opacity={PTR_GLOW_OP} filter={`url(#${gid})`} />
+      </g>
+      <g clipPath={`url(#${csid})`}>
+        <path d={dS} fill="none" stroke={south} strokeWidth={PTR_GLOW_W} opacity={PTR_GLOW_OP} filter={`url(#${gid})`} />
+      </g>
+      {/* thin gold outlines on both diamonds — same brass as the arc */}
+      <path d={dN} fill="none" stroke="var(--instrument)" strokeWidth={PTR_STROKE} strokeLinejoin="round" strokeLinecap="round" />
+      <path d={dS} fill="none" stroke="var(--instrument)" strokeWidth={PTR_STROKE} strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
   count: number; uiScale: number; gap: number; pitch: number; inset: number; split: number;
 }) {
@@ -2241,6 +2414,10 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
     const bandSegs: string[] = [];
     const edgeSegs: string[] = [];
     const capStarts: number[] = []; // each lobe's outer terminus — where the cap begins
+    // The RHS cap bulge (right lobe's rounded outer end) hosts the compass dial: a
+    // semicircle of radius r whose centre of curvature is (xOuter, midY). Captured in
+    // the loop below and handed out so a compass can be inscribed centred in it.
+    let compass: { cx: number; cy: number; capR: number; rimD: string } | null = null;
     for (const { xa, xb } of runs) {
       const innerIsB = Math.abs(xb - xCtr) < Math.abs(xa - xCtr);
       let xOuter = innerIsB ? xa : xb;
@@ -2272,6 +2449,24 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
       // Outer end → elliptical-arc cap, radius = half the residual gap, bulging AWAY
       // from centre (sweep flipped per side). A CAP_MIN gap gives it a radius to work with.
       const r = Math.max(0.5, (crossY(xOuter) - topEdgeY(xOuter)) / 2);
+      // Right lobe → its cap is the RHS bulge. Centre of the cap semicircle is
+      // (xOuter, midY); midY = crossY − r = ½(top+bottom). Rightmost run wins.
+      if (xOuter > xCtr && (!compass || xOuter > compass.cx)) {
+        // The cap's east semicircle IS the compass rim's east half. Complete the
+        // circle by tracing the WEST half (bottom → west → north), stopping if the
+        // arc climbs back above the crossbar top line — the accepted NNW cutoff, so
+        // the rim reads as one big endcap circle rather than a separate inscribed dial.
+        const Cx = xOuter, Cy = crossY(xOuter) - r;
+        const rimPts: string[] = [];
+        for (let a = 180; a <= 360; a += 2) {
+          const rad = (a * Math.PI) / 180;
+          const px = Cx + r * Math.sin(rad);
+          const py = Cy - r * Math.cos(rad);
+          if (a > 182 && py < topEdgeY(px) - 0.5) break; // climbed past the top line → cut here
+          rimPts.push(`${f(px)},${f(py)}`);
+        }
+        compass = { cx: Cx, cy: Cy, capR: r, rimD: `M${rimPts.join(' L')}` };
+      }
       const sweep = xOuter < xCtr ? 1 : 0; // bottom→top, bulge outward
       const outBotY = crossY(xOuter);
       // Top-edge polyline (outer → tip) and bottom-bar polyline (tip → outer).
@@ -2366,6 +2561,7 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
       bandD,
       hourD,
       sections,
+      compass,
       // Central dividing line — the lemon's centre divider down to the (lifted) crossbar.
       stemD: `M${f(xCtr)},${f(geo.wy(xCtr))} L${f(xCtr)},${f(crossY(xCtr))}`,
     };
@@ -2391,6 +2587,10 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
           <path className="worker-rail__line" d={rail.barD} />
           <path className="worker-rail__line" d={rail.edgeD} />
           <path className="worker-rail__line" d={rail.hourD} />
+          {/* Compass dial inscribed in the RHS cap bulge — on top of the rail lines. */}
+          {rail.compass && (
+            <CompassDial cx={rail.compass.cx} cy={rail.compass.cy} capR={rail.compass.capR} rimD={rail.compass.rimD} uiScale={uiScale} stars={DEMO_COMPASS_STARS} />
+          )}
         </svg>
       )}
       <WorkerColumn side={-1} count={leftCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} />
