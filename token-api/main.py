@@ -350,13 +350,16 @@ def _tmuxctld_gate_result(
     if err.get("code") != "gated":
         return None
     gate = err.get("detail") if isinstance(err.get("detail"), dict) else {}
+    message = str(err.get("message") or "send suppressed by gate")
+    reason = gate.get("reason") or message
     return {
         "returncode": 1,
         "stdout": "",
-        "stderr": "",
+        "stderr": message,
+        "error": message,
         "operation": operation,
         "gated": True,
-        "gate_reason": gate.get("reason"),
+        "gate_reason": reason,
         "gate": gate,
         "verification_status": "gated",
         "verified_by": None,

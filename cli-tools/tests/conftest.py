@@ -93,7 +93,7 @@ def _isolate_live_observability(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
     # Do NOT override IMPERIUM here — it also drives runtime-path resolution
     # (imperium config) which is unrelated to the vault.
     monkeypatch.setenv("IMPERIUM_ENV", str(tmp_path / "Imperium-ENV"))
-    # A live dev-shell exports TOKEN_API_AGENT_WRAPPER_BYPASS=1 so interactive
+    # A live dev-shell exports TOKEN_API_AGENT_WRAPPER_BYPASS set so interactive
     # agents skip the launch wrappers. Inherited into pytest, it flips dispatch
     # codepaths that the suite asserts against and produces local-only flakes
     # (absent on CI, where it is never set). Scrub it so the suite is hermetic

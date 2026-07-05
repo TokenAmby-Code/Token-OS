@@ -97,6 +97,8 @@ async def test_send_payload_translates_gate_to_gated_result(app_env: Any, monkey
 
     assert result["gated"] is True
     assert result["gate_reason"] == "typing_guard"
+    assert result["stderr"] == "send suppressed by gate: typing_guard"
+    assert result["error"] == "send suppressed by gate: typing_guard"
     assert result["verification_status"] == "gated"
     assert result["verified_by"] is None
     assert result["returncode"] != 0

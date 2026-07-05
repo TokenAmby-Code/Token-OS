@@ -12,19 +12,16 @@
 # …TARGET_WORKING_DIR / …WRAPPER_ID / …INSTANCE_TYPE).
 #
 # What it does, and deliberately does NOT do:
-#   1. Compose the rank+persona doctrine staple — ONE source of truth, the shared
-#      agent-wrapper-common.sh:token_wrapper_compose_system_text.
-#   2. Fire an async, fire-and-forget audit ping (no blocking POST / no retry belt
-#      on the hot path — the blocking 12s close-POST in the heavy wrapper is the
-#      pane-reap-slowness cause this shim is built to avoid).
-#   3. `exec` the engine so the AGENT becomes the pane process. Agent-exit then
-#      surfaces as `pane-died` immediately → the daemon reaps async. No cleanup
-#      trap, no token_wrapper_end, no lingering wrapper parent.
+#   1. Assemble persona-seat-specific argv/env (profile overlays, model, standby
+#      prompt) for the tracked agent wrapper front-door.
+#   2. Fire an async, fire-and-forget audit ping for seat-launch observability.
+#   3. `exec` the tracked agent wrapper, never a raw engine binary. Emperor ruling
+#      2026-07-05: the wrapper is the sole caller of claude/codex engine binaries
+#      and the sole wrapper-ledger producer.
 #
-# Registration is NOT done here: the agent's own SessionStart hook
-# (POST /api/hooks/SessionStart) creates/reactivates the registry row, keyed on
-# the stable pane label. token-api owns the single sqlite writer; this shim never
-# touches agents.db.
+# Registration is NOT done here: the wrapper and the agent's own SessionStart hook
+# create/reactivate ledger and registry rows. token-api owns the sqlite writer;
+# this shim never touches agents.db.
 
 set -euo pipefail
 
@@ -91,78 +88,29 @@ persona_seat_audit_ping() {
 }
 persona_seat_audit_ping & disown
 
-# --- resolve the REAL engine binary (bypass the front-door launch wrapper) ------
-# Mirrors agent-wrapper.sh:resolve_engine_binary — prefer the *.token-os-real
-# binary, never re-enter a wrapper shim (which would stall the pane reap again).
-resolve_real_engine() {
-  local engine="$1" candidate found
-  case "$engine" in
-    claude)
-      set -- "${CLAUDE_BIN:-}" \
-        "${HOME}/.local/bin/claude.token-os-real"
-      ;;
-    codex)
-      set -- "${CODEX_BIN:-}" \
-        "/opt/homebrew/bin/co""dex.token-os-real"
-      ;;
-    *)
-      set --
-      ;;
-  esac
-  for candidate in "$@"; do
-    [[ -n "$candidate" && -x "$candidate" ]] || continue
-    if [[ "$candidate" != *.token-os-real ]] \
-        && grep -q 'agent-wrapper.sh' "$candidate" 2>/dev/null; then
-      continue
-    fi
-    printf '%s' "$candidate"
-    return 0
-  done
-  found="$(command -v "$engine" 2>/dev/null || true)"
-  [[ -n "$found" && -x "$found" ]] && printf '%s' "$found"
-}
-
-# `|| true` so a no-match return doesn't trip `set -e` before the debug-shell fallback.
-ENGINE_BIN="$(resolve_real_engine "$ENGINE" || true)"
-if [[ -z "$ENGINE_BIN" || ! -x "$ENGINE_BIN" ]]; then
-  echo "persona-seat: $ENGINE binary not found (looked for *.token-os-real and PATH)" >&2
-  # Park an interactive shell so the pane is debuggable rather than churn-respawning
-  # against a genuinely-missing engine; an operator will see the seat is empty.
+# --- enter the tracked agent wrapper front-door ------------------------------
+# Emperor ruling (2026-07-05): persona-seat may assemble seat-specific argv, but
+# it must never invoke raw claude/codex binaries. The tracked agent wrapper is the
+# sole caller of engine binaries and the authoritative wrapper-ledger producer.
+AGENT_WRAPPER="${SCRIPT_DIR}/agent-wrapper.sh"
+if [[ ! -x "$AGENT_WRAPPER" ]]; then
+  echo "persona-seat: agent wrapper not executable: $AGENT_WRAPPER" >&2
   exec "${SHELL:-/bin/bash}" -l
 fi
 
-export TOKEN_API_AGENT_WRAPPER_BYPASS=1
 export TOKEN_API_WRAPPER_ID="$WRAPPER_ID"
 export TOKEN_API_ENGINE="$ENGINE"
 export TOKEN_API_LAUNCHER="$LAUNCHER"
-if declare -F tmux_runtime_stamp_wrapper >/dev/null 2>&1; then
-  tmux_runtime_stamp_wrapper "$TMUX_PANE_VALUE" "$WRAPPER_ID" "$ENGINE" "$LAUNCHER" "$WORKING_DIR"
-fi
+# Force codex through the managed-launch branch in agent-wrapper.sh even though
+# the launcher is persona-seat, not dispatch. That branch adds cwd/bypass flags
+# and injects the wrapper-owned system preamble exactly once.
+export TOKEN_API_INTERNAL_DISPATCH=1
 
 if [[ "$ENGINE" == "codex" ]]; then
-  PREAMBLE=""
-  if declare -F token_wrapper_codex_system_preamble >/dev/null 2>&1; then
-    PREAMBLE="$(token_wrapper_codex_system_preamble 2>/dev/null || true)"
-  fi
-  bypass_flag="--dangerously-bypass-approvals-and-sandbox"
-  [[ "${CODEX_DANGEROUS_BYPASS:-1}" == "1" ]] || bypass_flag="--full-auto"
-  codex_argv=()
-  [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_argv+=(--profile "$TOKEN_API_CODEX_PROFILE")
-  codex_argv+=("$bypass_flag")
-  [[ -n "$PREAMBLE" ]] && codex_argv+=("$PREAMBLE")
-  exec "$ENGINE_BIN" "${codex_argv[@]}"
+  exec "$AGENT_WRAPPER" codex
 fi
 
 # --- claude ---------------------------------------------------------------------
-# Compose the rank+persona staple (ONE source of truth) only on the claude path —
-# the codex branch above builds its own preamble via token_wrapper_codex_system_preamble.
-# Synchronous on purpose: identity must be in hand before exec. Fail-open — an empty
-# staple launches the agent without the doctrine layer rather than bricking the seat.
-STAPLE=""
-if declare -F token_wrapper_compose_system_text >/dev/null 2>&1; then
-  STAPLE="$(token_wrapper_compose_system_text 2>/dev/null || true)"
-fi
-
 claude_argv=(--dangerously-skip-permissions)
 [[ -n "$CLAUDE_MODEL" ]] && claude_argv+=(--model "$CLAUDE_MODEL")
 
@@ -185,11 +133,9 @@ if [[ -n "$PERSONA" ]]; then
   fi
 fi
 
-[[ -n "$STAPLE" ]] && claude_argv+=(--append-system-prompt "$STAPLE")
-
 # Reservist standby prompt (the "keep the pulse" instruction) rides as the engine's
 # first message. Set only for reservist seats; persona seats never pass it, so this
 # is a no-op on the persona path (regression-safe).
 [[ -n "${TOKEN_API_SEAT_INITIAL_PROMPT:-}" ]] && claude_argv+=("$TOKEN_API_SEAT_INITIAL_PROMPT")
 
-exec "$ENGINE_BIN" "${claude_argv[@]}"
+exec "$AGENT_WRAPPER" claude "${claude_argv[@]}"

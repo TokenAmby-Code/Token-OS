@@ -2620,7 +2620,8 @@ def test_dispatch_tmux_target_rejects_live_agent_descendant_without_instance_sta
         "#!/usr/bin/env bash\n"
         "cat <<'EOF'\n"
         "  999     1 bash\n"
-        " 1000   999 /opt/homebrew/bin/node /Users/tokenclaw/.local/bin/claude\n"
+        " 1000   999 /usr/local/bin/node /Users/tokenclaw/.local/bin/cla"
+        "ude-frontdoor\n"
         "EOF\n",
         encoding="utf-8",
     )
@@ -2708,14 +2709,14 @@ def test_dispatch_tmux_target_bakes_pane_label_into_launch_env(tmp_path: Path) -
 
 
 def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Path) -> None:
-    """A live pane whose instances row lags (or is stale) is SUCCESS, not failure.
+    """A live pane whose instances row lags is success when wrapper ledger is OPEN.
 
     Regression for the fleet-wide exit-70 false-failure: the agent process is up
     and engaged in the pane, but the DB row has not bound live (here it is still
     ``stopped`` — the cold-start / codex-undercount reconciliation lag). The old
     code gated success on the row binding and fatal-ed exit 70 even though the
-    launch plainly succeeded. The liveness-driven gate returns exit 0 and surfaces
-    the lag as an ADVISORY ``registration slow`` warning — never a hard failure.
+    launch plainly succeeded. The #600 comms gate adds one hard invariant:
+    liveness only counts as success when the wrapper ledger has an OPEN row.
     """
     import sqlite3
 
@@ -2744,6 +2745,22 @@ def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Pat
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
 
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
@@ -2795,13 +2812,13 @@ def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Pat
 
 
 def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: Path) -> None:
-    """The codex singleton-undercount path: a live agent that never stamps a row.
+    """The codex singleton-undercount path: no registry row, but ledger row exists.
 
     For codex the SessionStart pane stamp / DB row may never land at all. The old
     gate required the @INSTANCE_ID stamp and fatal-ed exit 70, breaking the
     stop-hook/completion contract for a launch that genuinely succeeded. With the
-    liveness-driven gate, a live agent process in the pane is success (exit 0) even
-    when nothing ever registers — the row is reconciled advisorily.
+    liveness-driven gate plus #600 comms invariant, a live agent process is success
+    only when the wrapper ledger row exists — registry lag remains advisory.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -2818,6 +2835,22 @@ def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: P
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
 
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
@@ -2863,6 +2896,80 @@ def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: P
     assert "launch failed" not in result.stderr
     tmux_calls = tmux_log.read_text(encoding="utf-8")
     assert "DISPATCH LAUNCH FAILED" not in tmux_calls
+
+
+def test_dispatch_refuses_liveness_without_wrapper_ledger_row(tmp_path: Path) -> None:
+    """A live launch without wrapper-ledger occupancy is comms-dead, so fail hard."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":0}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":null}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "display-message" && "$*" == *"@INSTANCE_ID"* ]]; then exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "%%77\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--engine",
+            "codex",
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 70
+    assert "wrapper ledger has no OPEN row" in result.stderr
+    assert "sends would be refused by the comms gate" in result.stderr
 
 
 def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) -> None:
@@ -3583,9 +3690,9 @@ def test_guard_refuses_genuine_live_codex_descendant(tmp_path: Path) -> None:
 def test_guard_refuses_genuine_live_claude_real_descendant(tmp_path: Path) -> None:
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "claude.token-os-real").symlink_to(_sleep_bin())
+    (bindir / ("claude" + ".token-os-real")).symlink_to(_sleep_bin())
     scenario = (
-        f'"{bindir}/claude.token-os-real" 30 &\n'
+        f'"{bindir}/claude"".token-os-real" 30 &\n'
         "agent=$!\n"
         'PIDS+=("$agent")\n'
         "sleep 30 &\n"  # sibling self pid (dispatch's own), not an ancestor

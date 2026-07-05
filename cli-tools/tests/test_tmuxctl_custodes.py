@@ -68,9 +68,9 @@ def test_detector_walks_bash_wrapper_to_claude():
         # pane_pid's OWN command. Parametrizing locks claude/codex to the SAME
         # detector — neither can drift to an engine-specific code path later.
         # The claude case mirrors the live council:custodes seat: pane_pid=25905
-        # command `/Users/tokenclaw/.local/bin/claude.token-os-real …`, zero kids.
-        ("/Users/tokenclaw/.local/bin/claude.token-os-real --model opus", True),
-        ("/opt/homebrew/bin/node /opt/homebrew/bin/codex", False),
+        # command `/Users/tokenclaw/.local/bin/claude …`, zero kids.
+        ("/Users/tokenclaw/.local/bin/claude --model opus", True),
+        ("/usr/local/bin/node /usr/local/bin/codex", False),
     ],
 )
 def test_detector_matches_execd_agent_as_pane_pid_with_no_children(
@@ -110,7 +110,7 @@ def test_detector_finds_claude_via_node_argv():
     children, commands = _tree(
         parent_pid=100,
         descendants={
-            200: (100, "/usr/local/bin/node /Users/x/.claude/bin/claude.js"),
+            200: (100, "/usr/local/bin/node /Users/x/.agent/bin/claude.js"),
         },
     )
     with patch.object(custodes, "_process_tree", return_value=(children, commands)):
@@ -121,7 +121,7 @@ def test_agent_detector_finds_codex_runtime():
     children, commands = _tree(
         parent_pid=100,
         descendants={
-            200: (100, "/opt/homebrew/bin/node /opt/homebrew/bin/codex"),
+            200: (100, "/usr/local/bin/node /usr/local/bin/codex"),
         },
     )
     with patch.object(custodes, "_process_tree", return_value=(children, commands)):
@@ -133,7 +133,7 @@ def test_agent_detector_finds_claude_runtime():
     children, commands = _tree(
         parent_pid=100,
         descendants={
-            200: (100, "/usr/local/bin/node /Users/x/.claude/bin/claude.js"),
+            200: (100, "/usr/local/bin/node /Users/x/.agent/bin/claude.js"),
         },
     )
     with patch.object(custodes, "_process_tree", return_value=(children, commands)):

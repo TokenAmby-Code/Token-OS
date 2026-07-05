@@ -184,7 +184,7 @@ def _three_pane_table() -> dict[int, tuple[int, str]]:
         101: (100, "bash /live/cli-tools/scripts/agent-wrapper.sh claude"),
         102: (101, "/Users/x/.local/bin/claude --resume"),
         200: (1, "zsh"),
-        201: (200, "/opt/homebrew/bin/codex"),
+        201: (200, "/usr/local/bin/codex"),
         300: (1, "zsh"),
     }
 

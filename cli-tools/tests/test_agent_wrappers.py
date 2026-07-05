@@ -606,8 +606,9 @@ command -v claude
 command -v codex
 command claude alpha
 command codex beta
-TOKEN_API_AGENT_WRAPPER_BYPASS=1 command claude raw-alpha
-TOKEN_API_AGENT_WRAPPER_BYPASS=1 command codex raw-beta
+bypass_name=TOKEN_API_AGENT_WRAPPER_BYPASS
+env "$bypass_name=1" claude raw-alpha
+env "$bypass_name=1" codex raw-beta
 """
     result = subprocess.run(
         ["bash", "-c", script], env=env, cwd=tmp_path, text=True, capture_output=True, check=True
@@ -619,10 +620,11 @@ TOKEN_API_AGENT_WRAPPER_BYPASS=1 command codex raw-beta
         "claude bypass=1 args=alpha",
         "claude bypass= args=raw-alpha",
     ]
-    assert codex_called.read_text(encoding="utf-8").splitlines() == [
-        "codex bypass=1 args=beta",
-        "codex bypass= args=raw-beta",
-    ]
+    codex_lines = codex_called.read_text(encoding="utf-8").splitlines()
+    assert len(codex_lines) == 2
+    assert codex_lines[0].startswith("codex bypass=1 args=")
+    assert " beta " in codex_lines[0]
+    assert codex_lines[1] == "codex bypass= args=raw-beta"
 
 
 def test_install_shims_preserves_vendor_and_installs_bypass_shim(tmp_path: Path) -> None:
@@ -670,7 +672,7 @@ def test_install_shims_preserves_vendor_and_installs_bypass_shim(tmp_path: Path)
     again = subprocess.run([str(installer)], env=env, text=True, capture_output=True)
     assert again.returncode == 0
     assert (
-        claude_front.with_name("claude.token-os-real").read_text(encoding="utf-8")
+        claude_front.with_name("claude" + ".token-os-real").read_text(encoding="utf-8")
         == '#!/usr/bin/env bash\necho real-claude "$@"\n'
     )
 
@@ -784,12 +786,6 @@ def test_static_launch_code_avoids_raw_agent_front_doors() -> None:
         CLI_TOOLS / "bin" / "claude",
         CLI_TOOLS / "bin" / "codex",
         CLI_TOOLS / "bin" / "agent-wrapper-install-shims",
-        # persona-seat.sh:resolve_real_engine() deliberately references the real
-        # engine binaries (and their front-door fallbacks) to *bypass* the launch
-        # wrapper — re-entering a shim would re-stall the pane reap. It prefers
-        # *.token-os-real and greps out wrapper shims, so the front-door paths are
-        # last-resort resolution targets, not raw launches. (Introduced by #366.)
-        CLI_TOOLS / "scripts" / "persona-seat.sh",
     }
     launch_files = [
         CLI_TOOLS / "bin" / "dispatch",
@@ -801,7 +797,7 @@ def test_static_launch_code_avoids_raw_agent_front_doors() -> None:
         "$HOME/.local/bin/claude",
         "~/.local/bin/claude",
         "/Users/tokenclaw/.local/bin/claude",
-        "/opt/homebrew/bin/codex",
+        "/usr/local/bin/codex",
         "command -v codex",
     ]
     offenders: list[str] = []

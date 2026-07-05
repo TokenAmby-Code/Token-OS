@@ -2373,6 +2373,27 @@ reconcile_dispatch_registry_bind() {
   return 0
 }
 
+ensure_dispatch_wrapper_ledger() {
+  # The #600 comms gate makes a missing wrapper-ledger row a communications
+  # blackout. Dispatch therefore no longer treats the tmuxctld ledger producer as
+  # passive "eventual reconciliation": after the engine is live, force one
+  # daemon reconcile from pane stamps and verify an OPEN row for the target label.
+  local pane="$1" target_display="$2" pane_label row_state
+  [[ "${DISPATCH_LEDGER_PRODUCER_CHECK:-1}" == "1" ]] || return 0
+  pane_label="$(resolve_pane_label_for_env "$pane")"
+  [[ -n "$pane_label" ]] || pane_label="$pane"
+  tmuxctld_result POST /reconcile session=main >/dev/null 2>&1 || {
+    err "launch failed: ${ENGINE} agent is live at ${target_display}, but tmuxctld ledger reconcile failed; refusing to report a comms-dead launch"
+    return 1
+  }
+  row_state="$(tmuxctld_result GET /ledger/resolve pane_positional_id="$pane_label" 2>/dev/null | python3 -c 'import json,sys; data=json.load(sys.stdin); print(str((data.get("row") or {}).get("state") or ""))' 2>/dev/null || true)"
+  if [[ "$row_state" != "OPEN" && "$row_state" != "SHIPPED" ]]; then
+    err "launch failed: ${ENGINE} agent is live at ${target_display}, but wrapper ledger has no OPEN row for ${pane_label}; sends would be refused by the comms gate"
+    return 1
+  fi
+  return 0
+}
+
 confirm_dispatch_launch_live() {
   # Liveness-driven launch confirmation. Success = the pane is up AND a live agent
   # process is running in it. The DB-row bind is decoupled into an advisory
@@ -2387,6 +2408,7 @@ confirm_dispatch_launch_live() {
   while (( SECONDS <= deadline )); do
     if dispatch_pane_agent_live "$pane"; then
       reconcile_dispatch_registry_bind "$pane" "$target_display"
+      ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
       return 0
     fi
     if ! dispatch_pane_exists "$pane"; then
