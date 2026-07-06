@@ -670,7 +670,7 @@ def evaluate(
     ignored_owner = None
     human_locked = False
     explicit_policy = os.environ.get(_SEND_GATE_POLICY_ENV, "").strip().lower()
-    if reason == "typing_guard" and target and override:
+    if typing and target and override:
         kind = "off"
         if override in _AGENT_OWNER_OVERRIDES or override == os.environ.get(_SEND_GATE_ALLOW_ENV, "").strip():
             guard_status = _pane_guard_status(target)
@@ -684,7 +684,7 @@ def evaluate(
             if override not in _AGENT_OWNER_OVERRIDES or not pane_owner or thread_owner != pane_owner:
                 ignored_owner = thread_owner
                 effective_override = None
-    elif reason == "typing_guard" and target and explicit_policy == "pierce":
+    elif typing and target and explicit_policy == "pierce":
         # Explicit policy pierce is rare, but still cannot override a HUMAN or
         # PENDING lock. Avoid this extra tmux read for ordinary delay/cancel
         # decisions; typing_guard_active() already proved the positive signal.
@@ -693,6 +693,8 @@ def evaluate(
             "human",
             "pending",
         } or _pane_human_locked(target)
+    if typing and human_locked:
+        reason = "typing_guard"
     policy = send_gate_policy(
         override=override,
         reason=reason,
