@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -5721,6 +5722,55 @@ PANE_WRITE_FAILED = "failed"
 PANE_WRITE_UNVERIFIED = "unverified"
 PANE_WRITE_CANCELLED = "cancelled"
 PANE_WRITE_DEFERRED = "deferred"
+# queue_id -> last truthful delivered result whose DB status update hit a
+# transient lock.  Suppresses in-process duplicate sends while retrying only the
+# bookkeeping UPDATE on subsequent drains/replays.
+_PANE_WRITE_DELIVERED_BOOKKEEPING_PENDING: dict[str, dict] = {}
+
+
+def _is_sqlite_locked_exception(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
+
+
+async def _mark_pane_write_best_effort(
+    queue_id: str,
+    *,
+    status: str,
+    result: dict,
+    error: str | None = None,
+    delivered: bool = False,
+) -> dict:
+    """Persist pane-write bookkeeping without demoting proven delivery.
+
+    SQLite bookkeeping is secondary to the tmux delivery verdict.  If the
+    post-send UPDATE hits a transient agents.db writer lock, callers must still
+    see the truthful delivery result so they do not blind-retry and double-send.
+    Pre-send/gated states also preserve their real state and carry the
+    bookkeeping error explicitly.
+    """
+    try:
+        await _mark_pane_write(queue_id, status=status, result=result, error=error)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_sqlite_locked_exception(exc):
+            raise
+        logger.warning(
+            "pane_write_queue bookkeeping locked queue_id=%s status=%s delivered=%s: %s",
+            queue_id,
+            status,
+            delivered,
+            exc,
+        )
+        result = {
+            **result,
+            "bookkeeping_status": "failed",
+            "bookkeeping_error": str(exc),
+        }
+        if delivered:
+            _PANE_WRITE_DELIVERED_BOOKKEEPING_PENDING[queue_id] = result
+    else:
+        if delivered:
+            _PANE_WRITE_DELIVERED_BOOKKEEPING_PENDING.pop(queue_id, None)
+    return result
 
 
 def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
@@ -6059,6 +6109,21 @@ async def process_pane_write_queue_once(
     results: list[dict] = []
     for row in rows:
         item = dict(row)
+        delivered_pending = _PANE_WRITE_DELIVERED_BOOKKEEPING_PENDING.get(item["id"])
+        if delivered_pending is not None:
+            retry_result = {
+                **delivered_pending,
+                "bookkeeping_retry": "delivery_already_issued_no_resend",
+            }
+            retry_result = await _mark_pane_write_best_effort(
+                item["id"],
+                status=str(delivered_pending.get("status") or PANE_WRITE_SENT),
+                result=retry_result,
+                error=delivered_pending.get("reason") or delivered_pending.get("error"),
+                delivered=True,
+            )
+            results.append(retry_result)
+            continue
         instance_id = item["instance_id"]
         stored_pane = item["tmux_pane"]
         # tmuxctl owns instance_id -> pane. Resolve the LIVE pane at dequeue rather
@@ -6123,7 +6188,7 @@ async def process_pane_write_queue_once(
             # does not clobber live human input.
             if not clear_replace_source and await _tmux_pane_has_pending_input(pane):
                 result = {**base, "status": PANE_WRITE_PENDING, "reason": "dispatch_deferred"}
-                await _mark_pane_write(
+                result = await _mark_pane_write_best_effort(
                     item["id"],
                     status=PANE_WRITE_PENDING,
                     result=result,
@@ -6177,7 +6242,7 @@ async def process_pane_write_queue_once(
                     "reason": f"send_gated:{gate_reason}",
                     **send_result,
                 }
-                await _mark_pane_write(
+                result = await _mark_pane_write_best_effort(
                     item["id"],
                     status=PANE_WRITE_PENDING,
                     result=result,
@@ -6210,21 +6275,29 @@ async def process_pane_write_queue_once(
                 result["reason"] = terminal_error
             if hook_effect_error:
                 result["hook_effect_error"] = hook_effect_error
-            await _mark_pane_write(
+            result = await _mark_pane_write_best_effort(
                 item["id"],
                 status=terminal_status,
                 result=result,
                 error=terminal_error,
+                delivered=terminal_status in {PANE_WRITE_SENT, PANE_WRITE_UNVERIFIED},
             )
             results.append(result)
         except Exception as exc:
             result = {**base, "status": PANE_WRITE_FAILED, "error": str(exc)}
-            await _mark_pane_write(
-                item["id"],
-                status=PANE_WRITE_FAILED,
-                result=result,
-                error=str(exc),
-            )
+            try:
+                result = await _mark_pane_write_best_effort(
+                    item["id"],
+                    status=PANE_WRITE_FAILED,
+                    result=result,
+                    error=str(exc),
+                )
+            except Exception as mark_exc:  # noqa: BLE001
+                result = {
+                    **result,
+                    "bookkeeping_status": "failed",
+                    "bookkeeping_error": str(mark_exc),
+                }
             results.append(result)
     return results
 
@@ -13609,6 +13682,47 @@ async def brief_send(request: BriefSendRequest):
                 receipt = {**receipt, **target}
             delivered.append(receipt)
         except Exception as exc:  # noqa: BLE001
+            if not request.ephemeral and _is_sqlite_locked_exception(exc):
+                logger.warning(
+                    "brief pane-write bookkeeping locked; attempting direct delivery pane=%s op=%s: %s",
+                    pane_id,
+                    operation_id,
+                    exc,
+                )
+                try:
+                    if brief_hook_driven:
+                        await _flag_hook_driven(
+                            pane_id, tmux_pane=pane_id, actor="brief:lock-fallback"
+                        )
+                    receipt = await _direct_tmux_pane_delivery(
+                        pane_id,
+                        request.payload,
+                        source="brief",
+                        purpose="brief_send",
+                        clear_prompt=True,
+                        operation_id=operation_id,
+                        hook_echo_pane=caller_resolved,
+                        correlation_id=operation_id,
+                    )
+                    receipt = {
+                        **receipt,
+                        "bookkeeping_status": "failed",
+                        "bookkeeping_error": str(exc),
+                        "bookkeeping_fallback": "direct_after_pane_write_queue_lock",
+                        **target,
+                    }
+                    delivered.append(receipt)
+                    continue
+                except Exception as fallback_exc:  # noqa: BLE001
+                    delivered.append(
+                        {
+                            **target,
+                            "status": "failed",
+                            "error": str(fallback_exc),
+                            "bookkeeping_error": str(exc),
+                        }
+                    )
+                    continue
             delivered.append({**target, "status": "failed", "error": str(exc)})
     verified_count = len([r for r in delivered if r.get("status") == PANE_WRITE_SENT])
     unresolved_count = len(unresolved)

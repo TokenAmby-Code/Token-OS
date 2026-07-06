@@ -230,6 +230,8 @@ async def test_brief_registry_row_path_still_uses_queue(
             "payload": "row path",
             "hook_driven": True,
             "operation_id": expected_operation_id,
+            "hook_echo_pane": None,
+            "correlation_id": expected_operation_id,
         }
     ]
     assert "fallback" not in result["resolved"][0]
@@ -751,3 +753,134 @@ async def test_talk_resolve_pane_accepts_unique_label_suffix(
 
     assert await talk.resolve_pane("pax") == "%10"
     assert await talk.resolve_pane("orchestrator") == "%44"
+
+
+@pytest.mark.asyncio
+async def test_brief_reports_sent_when_post_send_bookkeeping_update_locks(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A locked pane_write_queue UPDATE after tmux delivery is not non-delivery."""
+    main = app_env.main
+    target = {
+        "pane_id": "%52",
+        "position_id": "mechanicus:2",
+        "source": "pane",
+        "spec": "mechanicus:2",
+    }
+
+    async def _targets(**_kwargs):
+        return [target], []
+
+    async def _row(_pane):
+        return {"id": "late-bound-row", "engine": "codex"}
+
+    async def _resolve_instance_pane(_instance_id):
+        return None, ""
+
+    async def _resolve_tmux_pane_id(pane):
+        return "%52" if pane == "%52" else None
+
+    async def _no_pending(_pane):
+        return False
+
+    sends: list[str] = []
+
+    async def _send(pane, payload, *, operation_id=None, **_kwargs):
+        sends.append(operation_id or "")
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "gated": False,
+            "delivered": True,
+            "verification_status": "submitted",
+            "verified_by": "UserPromptSubmit",
+            "operation_id": operation_id,
+        }
+
+    async def _locked_mark(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    async def _sender_is_custodes(_pane):
+        return True
+
+    monkeypatch.setattr(main.talk_service, "resolve_brief_targets", _targets)
+    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _row)
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_instance_pane)
+    monkeypatch.setattr(main.shared, "resolve_tmux_pane_id", _resolve_tmux_pane_id)
+    monkeypatch.setattr(main, "_tmux_pane_has_pending_input", _no_pending)
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
+    monkeypatch.setattr(main, "_mark_pane_write", _locked_mark)
+    monkeypatch.setattr(main, "_pane_sender_is_custodes", _sender_is_custodes)
+    main._PANE_WRITE_DELIVERED_BOOKKEEPING_PENDING.clear()
+
+    result = await main.brief_send(main.BriefSendRequest(panes=["mechanicus:2"], payload="probe"))
+
+    assert result["status"] == "ok"
+    assert result["delivered"] == 1
+    assert len(sends) == 1
+    receipt = result["resolved"][0]
+    assert receipt["status"] == main.PANE_WRITE_SENT
+    assert receipt["bookkeeping_status"] == "failed"
+    assert "database is locked" in receipt["bookkeeping_error"]
+
+    replay = await main.process_pane_write_queue_once(receipt["queue_id"])
+    assert len(sends) == 1, "bookkeeping replay must not re-send delivered bytes"
+    assert replay[0]["bookkeeping_retry"] == "delivery_already_issued_no_resend"
+
+
+@pytest.mark.asyncio
+async def test_brief_falls_back_to_direct_delivery_when_enqueue_bookkeeping_locks(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the pre-send queue INSERT is locked, brief still attempts one direct send."""
+    main = app_env.main
+    target = {
+        "pane_id": "%53",
+        "position_id": "mechanicus:3",
+        "source": "pane",
+        "spec": "mechanicus:3",
+    }
+
+    async def _targets(**_kwargs):
+        return [target], []
+
+    async def _row(_pane):
+        return {"id": "late-bound-row", "engine": "codex"}
+
+    async def _locked_enqueue(**_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    direct_calls: list[tuple[str, str, str | None]] = []
+
+    async def _direct(pane, payload, *, operation_id=None, **_kwargs):
+        direct_calls.append((pane, payload, operation_id))
+        return {
+            "instance_id": pane,
+            "tmux_pane": pane,
+            "source": "brief",
+            "purpose": "brief_send",
+            "status": main.PANE_WRITE_SENT,
+            "returncode": 0,
+            "delivered": True,
+            "verification_status": "submitted",
+        }
+
+    async def _sender_is_custodes(_pane):
+        return True
+
+    monkeypatch.setattr(main.talk_service, "resolve_brief_targets", _targets)
+    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _row)
+    monkeypatch.setattr(main, "enqueue_pane_write", _locked_enqueue)
+    monkeypatch.setattr(main, "_direct_tmux_pane_delivery", _direct)
+    monkeypatch.setattr(main, "_pane_sender_is_custodes", _sender_is_custodes)
+
+    result = await main.brief_send(main.BriefSendRequest(panes=["mechanicus:3"], payload="probe"))
+
+    assert result["status"] == "ok"
+    assert result["delivered"] == 1
+    assert len(direct_calls) == 1
+    receipt = result["resolved"][0]
+    assert receipt["status"] == main.PANE_WRITE_SENT
+    assert receipt["bookkeeping_fallback"] == "direct_after_pane_write_queue_lock"
+    assert "database is locked" in receipt["bookkeeping_error"]
