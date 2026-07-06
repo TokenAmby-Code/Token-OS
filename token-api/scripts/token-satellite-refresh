@@ -34,6 +34,17 @@ flock 9
 
 echo "[$(date -Is)] refresh start sha=${sha:0:9} manifest=$manifest"
 
+protect_runtime="${TOKEN_OS_PROTECT_RUNTIME:-true}"
+make_runtime_writable() {
+  [[ -e "$live" ]] || return 0
+  chmod -R u+w "$live" 2>/dev/null || true
+}
+make_runtime_readonly() {
+  [[ "$protect_runtime" == "false" || ! -e "$live" ]] && return 0
+  chmod -R a-w "$live" 2>/dev/null || true
+}
+trap make_runtime_readonly EXIT
+
 if [[ ! -d "$bare" ]]; then
   echo "creating bare cache: $bare"
   git clone --bare "$git_url" "$bare"
@@ -60,6 +71,7 @@ if [[ ! -e "$live" ]]; then
   echo "creating runtime checkout: $live"
   git clone "$bare" "$live"
 fi
+make_runtime_writable
 if [[ -n "$(git -C "$live" status --porcelain 2>/dev/null)" ]]; then
   echo "runtime checkout dirty; refusing to overwrite: $live" >&2
   git -C "$live" status --short >&2 || true
@@ -159,6 +171,9 @@ if is_windows_ahk_available; then
 else
   echo "Windows AHK cache unavailable; skipping Windows-only AHK artifact refresh"
 fi
+
+make_runtime_readonly
+trap - EXIT
 
 echo "restarting token-satellite.service"
 systemctl --user restart --no-block token-satellite.service
