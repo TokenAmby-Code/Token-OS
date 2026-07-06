@@ -496,6 +496,10 @@ const PERSONA_COUNT = 6;
 // anchored rows below (trailing down the RHS) rather than capping, so this is just
 // how far the demo slider travels, not a layout limit.
 const MAX_WORKER_COUNT = 30;
+// Idle-worker-queue ceiling — far past the crossbar band so the chips climb well up
+// the two edge ditches and overflow (clobber) the region above; the overflow IS the
+// "too many idle instances" error visual, so this is intentionally generous.
+const MAX_IDLE_COUNT = 40;
 const THETA_MIN = (12 * Math.PI) / 180;
 const THETA_MAX = (82 * Math.PI) / 180;
 const OUTER_MAX = 5; // outer ring capacity — fills first
@@ -2256,8 +2260,159 @@ function CompassPointer({ cx, cy, size, uid, north = 'var(--error)', south = '#f
   );
 }
 
-function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
+// ── Clock instrument (idle-worker-queue) ────────────────────────────────────
+// The whimsical clock is a fork of the compass: same rim / tick / hub chrome, but
+// the 8 rim stars become 6 Roman numerals on a regular hexagon, and the single
+// spinning needle becomes an hour + minute hand pair. Numerals I..N render gold
+// where N = the idle-worker-queue depth, the rest grey — so the FACE encodes the
+// data (colour), while the hands are purely decorative (they do NOT tell real
+// time). Roman numerals on a hexagon, 60° apart: I at top (0°), IV at bottom.
+const CLOCK_NUMERALS = ['I', 'II', 'III', 'IV', 'V', 'VI'] as const;
+const CLOCK_HEX_DEGREES = [0, 60, 120, 180, 240, 300]; // I top, IV bottom, cw
+const CLOCK_NUM_FRAC = 0.72;       // numeral-ring radius as a fraction of the rim radius
+const CLOCK_NUM_SIZE_FRAC = 0.3;   // numeral font-size as a fraction of the rim radius
+const CLOCK_TICK_FRAC = 0.1;       // hexagon tick-nub length as a fraction of the rim radius
+const CLOCK_MIN_FRAC = 1.6;        // minute (long) hand size as a fraction of the rim radius (100-box)
+const CLOCK_HOUR_FRAC = 1.05;      // hour (short) hand size as a fraction of the rim radius
+// Shared waist half-width for BOTH hands, as an absolute fraction of R — so width
+// is decoupled from length and the longer minute hand renders the SAME pixel width
+// as the hour hand (only longer). Set to the hour hand's current px half-width
+// (50·PTR_EW_FRAC · CLOCK_HOUR_FRAC/100 ≈ 0.089·R) so the hour hand is unchanged.
+const CLOCK_HAND_HALFWIDTH_FRAC = 0.089;
+const CLOCK_HUB_FRAC = 0.06;       // brass hub radius as a fraction of the rim radius
+const CLOCK_MIN_SEC = 60;          // minute hand — 60s per revolution
+const CLOCK_HOUR_SEC = 300;        // hour hand — 300s per revolution
+
+// Respect the OS reduced-motion preference — the clock hands (SMIL) are the only
+// motion this section adds, so pause them when the user asks for stillness.
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(false);
+  useEffect(() => {
+    if (typeof matchMedia === 'undefined') return;
+    const mq = matchMedia('(prefers-reduced-motion: reduce)');
+    const read = () => setReduced(mq.matches);
+    read();
+    mq.addEventListener('change', read);
+    return () => mq.removeEventListener('change', read);
+  }, []);
+  return reduced;
+}
+
+// ── Clock hand ──────────────────────────────────────────────────────────────
+// A single-sided fork of CompassPointer: only the outward (north) diamond, drawn
+// gold instead of the compass's red/white pair — same 100-box, gold outline +
+// interior glow. Dropped at the hub and spun by its own <animateTransform>; the
+// hour + minute hands share this shape at different sizes / durations.
+function ClockHand({ cx, cy, size, halfWidthPx, uid, durSec, animate }: {
+  cx: number; cy: number; size: number; halfWidthPx: number; uid: string; durSec: number; animate: boolean;
+}) {
+  const c = 50;
+  // Length (reach) still scales with `size`; width does NOT. The box maps `size` px
+  // → 100 units, so a shared absolute px half-width becomes `halfWidthPx·100/size`
+  // in box units — the longer hand ends up thinner, both hands the same pixel width.
+  const outer = 50 * PTR_OUTER_FRAC, inner = 50 * PTR_INNER_FRAC, ew = halfWidthPx * 100 / size;
+  const f = (n: number) => n.toFixed(2);
+  const seg = (P: [number, number], Q: [number, number]): string => {
+    const mx = (P[0] + Q[0]) / 2, my = (P[1] + Q[1]) / 2;
+    const kx = mx + PTR_BOW * (c - mx), ky = my + PTR_BOW * (c - my);
+    return `Q${f(kx)},${f(ky)} ${f(Q[0])},${f(Q[1])}`;
+  };
+  // The single outward diamond (sign = -1, pointing up out of the hub at centre).
+  const waistY = c - inner;
+  const outerTip: [number, number] = [c, waistY - outer];
+  const eWaist: [number, number] = [c + ew, waistY];
+  const innerTip: [number, number] = [c, c];
+  const wWaist: [number, number] = [c - ew, waistY];
+  const d = `M${f(outerTip[0])},${f(outerTip[1])} ${seg(outerTip, eWaist)} ${seg(eWaist, innerTip)} ${seg(innerTip, wWaist)} ${seg(wWaist, outerTip)} Z`;
+  const gid = `clk-glow-${uid}`, cid = `clk-clip-${uid}`;
+  return (
+    <svg x={cx - size / 2} y={cy - size / 2} width={size} height={size} viewBox="0 0 100 100" style={{ overflow: 'visible' }} aria-hidden>
+      <defs>
+        <filter id={gid} x="-60%" y="-60%" width="220%" height="220%">
+          <feGaussianBlur stdDeviation={PTR_GLOW} />
+        </filter>
+        <clipPath id={cid}><path d={d} /></clipPath>
+      </defs>
+      {/* the whole hand spins about the 100-box centre (= the hub) */}
+      <g>
+        <g clipPath={`url(#${cid})`}>
+          <path d={d} fill="none" stroke="var(--brass-bright)" strokeWidth={PTR_GLOW_W} opacity={PTR_GLOW_OP} filter={`url(#${gid})`} />
+        </g>
+        <path d={d} fill="none" stroke="var(--instrument)" strokeWidth={PTR_STROKE} strokeLinejoin="round" strokeLinecap="round" />
+        {animate && (
+          <animateTransform attributeName="transform" type="rotate"
+            from="0 50 50" to="360 50 50" dur={`${durSec}s`} repeatCount="indefinite" />
+        )}
+      </g>
+    </svg>
+  );
+}
+
+// ── Clock face ──────────────────────────────────────────────────────────────
+// A fork of CompassDial: the rim + tick + hub scaffolding is kept, but the eight
+// reduced compass stars give way to six upright Roman numerals on a hexagon and
+// the spinning needle to an hour + minute hand pair. `queueValue` numerals light
+// gold, the rest grey. `flip` counter-rotates the whole face 180° so it stays
+// upright when the host crossbar assembly is flipped into a bottom rail.
+function ClockDial({ cx, cy, capR, rimD, uiScale, queueValue, flip, animate }: {
+  cx: number; cy: number; capR: number; rimD: string; uiScale: number;
+  queueValue: number; flip: boolean; animate: boolean;
+}) {
+  void uiScale;
+  const R = capR * COMPASS_R_FRAC;
+  const tickL = R * CLOCK_TICK_FRAC;
+  const f = (n: number) => n.toFixed(1);
+  const rad = (deg: number) => ((deg - 90) * Math.PI) / 180; // deg 0 = up (I), clockwise
+  // Tick nub running inward from the rim at each hexagon vertex.
+  const tick = (deg: number): string => {
+    const a = rad(deg);
+    const ox = cx + R * Math.cos(a), oy = cy + R * Math.sin(a);
+    const ix = cx + (R - tickL) * Math.cos(a), iy = cy + (R - tickL) * Math.sin(a);
+    return `M${f(ox)},${f(oy)} L${f(ix)},${f(iy)}`;
+  };
+  const ticks = CLOCK_HEX_DEGREES.map(tick).join(' ');
+  const numR = R * CLOCK_NUM_FRAC;
+  const fontPx = Math.max(9, R * CLOCK_NUM_SIZE_FRAC);
+  const numerals = CLOCK_HEX_DEGREES.map((deg, i) => {
+    const a = rad(deg);
+    return { x: cx + numR * Math.cos(a), y: cy + numR * Math.sin(a), label: CLOCK_NUMERALS[i], on: i < queueValue };
+  });
+  const hubR = Math.max(2, R * CLOCK_HUB_FRAC);
+  // Shared absolute waist half-width (px) handed to both hands so they render the
+  // same width regardless of length (see CLOCK_HAND_HALFWIDTH_FRAC).
+  const halfWidthPx = R * CLOCK_HAND_HALFWIDTH_FRAC;
+  return (
+    <g className="worker-clock" aria-hidden>
+      {/* Rim stays OUTSIDE the counter-rotation. rimD is the endcap circle's WEST
+          half (the rail cap edge draws the EAST half); both live in the rail frame
+          and are only CSS-flipped, so together they close the circle exactly like the
+          compass. Counter-rotating it (as the numerals need) would swing this half
+          onto the rail cap's side, leaving the interior boundary bare — the bug. */}
+      <path className="worker-compass__rim" d={rimD} />
+      {/* Everything the flip would leave UPSIDE-DOWN counter-rotates to stay upright.
+          (Ticks are 180°-symmetric and the hands merely spin, but they ride the same
+          group harmlessly — only the numeral glyphs strictly require it.) */}
+      <g transform={flip ? `rotate(180 ${f(cx)} ${f(cy)})` : undefined}>
+        <path className="worker-compass__tick worker-compass__tick--card" d={ticks} />
+        {/* Roman numerals — gold up to the queue depth, grey beyond. Upright. */}
+        {numerals.map((n, i) => (
+          <text key={i} className="worker-clock__numeral"
+            x={f(n.x)} y={f(n.y)} fontSize={fontPx.toFixed(1)}
+            textAnchor="middle" dominantBaseline="central"
+            fill={n.on ? 'var(--brass-bright)' : 'var(--faint)'}>{n.label}</text>
+        ))}
+        {/* hour (short) under minute (long) — both spin about the shared hub */}
+        <ClockHand cx={cx} cy={cy} size={R * CLOCK_HOUR_FRAC} halfWidthPx={halfWidthPx} uid="hour" durSec={CLOCK_HOUR_SEC} animate={animate} />
+        <ClockHand cx={cx} cy={cy} size={R * CLOCK_MIN_FRAC} halfWidthPx={halfWidthPx} uid="min" durSec={CLOCK_MIN_SEC} animate={animate} />
+        <circle className="worker-compass__hub" cx={f(cx)} cy={f(cy)} r={hubR.toFixed(1)} />
+      </g>
+    </g>
+  );
+}
+
+function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true }: {
   count: number; uiScale: number; gap: number; pitch: number; inset: number; split: number;
+  variant?: 'compass' | 'clock'; queueValue?: number; flip?: boolean; animate?: boolean;
 }) {
   // Crossbar + hourglass shape is LOCKED — read straight from the frozen constants.
   // The by-eye dev-tuning sliders and the `shape` prop have been retired.
@@ -2575,7 +2730,8 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
   const rightCount = Math.floor(count / 2);
 
   return (
-    <div className="worker-queues" ref={wrapRef} aria-label={`Worker queue · ${count}`}>
+    <div className={`worker-queues${flip ? ' worker-queues--flip' : ''}`} ref={wrapRef}
+      aria-label={variant === 'clock' ? `Idle worker queue · ${count}` : `Worker queue · ${count}`}>
       {/* ⊥ rail — flat crossbar + centre stem, stroked like the lemon dividers. Below
           the chips (drawn first); pointer-events:none so clicks fall through. */}
       {rail && (
@@ -2590,15 +2746,39 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split }: {
           <path className="worker-rail__line" d={rail.barD} />
           <path className="worker-rail__line" d={rail.edgeD} />
           <path className="worker-rail__line" d={rail.hourD} />
-          {/* Compass dial inscribed in the RHS cap bulge — on top of the rail lines. */}
+          {/* Instrument inscribed in the RHS cap bulge — on top of the rail lines.
+              The compass (mid-page status read) or the clock (idle-worker-queue). */}
           {rail.compass && (
-            <CompassDial cx={rail.compass.cx} cy={rail.compass.cy} capR={rail.compass.capR} rimD={rail.compass.rimD} uiScale={uiScale} stars={DEMO_COMPASS_STARS} />
+            variant === 'clock'
+              ? <ClockDial cx={rail.compass.cx} cy={rail.compass.cy} capR={rail.compass.capR} rimD={rail.compass.rimD} uiScale={uiScale} queueValue={queueValue} flip={flip} animate={animate} />
+              : <CompassDial cx={rail.compass.cx} cy={rail.compass.cy} capR={rail.compass.capR} rimD={rail.compass.rimD} uiScale={uiScale} stars={DEMO_COMPASS_STARS} />
           )}
         </svg>
       )}
       <WorkerColumn side={-1} count={leftCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} />
       <WorkerColumn side={1} count={rightCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} />
     </div>
+  );
+}
+
+// ── Idle worker queue — the flipped bottom rail hosting the clock ────────────
+// A standalone bottom section: the SAME crossbar assembly (rail + hourglass + cap
+// + chips) reused from WorkerQueues, but flipped 180° so it reads as a bottom rail
+// (cap swings LEFT, chips hang BELOW the bar), with the clock inscribed in the cap
+// instead of the compass. The clock face counter-rotates to stay upright. Chips
+// The clock face (numeral fill) is DECOUPLED from the chip count: `clockValue`
+// (0–6, its own placeholder demo source) drives the numerals, `idleCount` drives
+// the chips (unbounded — grows up the ditches and is meant to clobber above).
+function IdleWorkerQueue({ clockValue, idleCount, uiScale, animate }: {
+  clockValue: number; idleCount: number; uiScale: number; animate: boolean;
+}) {
+  return (
+    <section className="idle-worker-queue"
+      aria-label={`Idle worker queue — ${idleCount} idle worker${idleCount === 1 ? '' : 's'}`}>
+      <WorkerQueues count={idleCount} uiScale={uiScale}
+        gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
+        variant="clock" queueValue={clockValue} flip animate={animate} />
+    </section>
   );
 }
 
@@ -2784,6 +2964,12 @@ export function MockOpsCockpit() {
   // 6 persona icons in the lemon are a fixed roster, not a knob). The old lemon
   // width/depth knobs are retired: the lemon is locked (see LEMON_WIDTH_INSET / DEPTH).
   const [workerCount, setWorkerCount] = usePersistedNumber('workerCount', 8);
+  // Idle-worker-queue — TWO decoupled demo sources now that the clock is only a
+  // placeholder test fixture: `clockValue` (0–6) drives the clock numeral fill, and
+  // `idleCount` (0–MAX_IDLE_COUNT) drives the chips that climb up the edge ditches.
+  const [clockValue, setClockValue] = usePersistedNumber('clockValue', 4);
+  const [idleCount, setIdleCount] = usePersistedNumber('idleCount', 4);
+  const reducedMotion = usePrefersReducedMotion();
   // Worker-queue positioning is locked (W_DROP_PX / W_SPACE_PX / W_INSET_PX / W_SPLIT_PX)
   // and fed straight to WorkerQueues — the by-eye tuning sliders are retired.
   // Instrument-line colour — hue locked to brass; saturation + HSL lightness settled
@@ -2941,6 +3127,10 @@ export function MockOpsCockpit() {
           Workers slider; click a chip to pop it and reflow the rest up-path. */}
       <WorkerQueues count={workerCount} uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX} />
 
+      {/* idle worker queue — the flipped bottom rail whose clock encodes idle-queue
+          depth by numeral colour (design study; below the first-screen composition) */}
+      <IdleWorkerQueue clockValue={clockValue} idleCount={idleCount} uiScale={uiScale} animate={!reducedMotion} />
+
       {/* dials drawer — where the default dial click lands (minimal stub) */}
       <DialsDrawer open={drawerOpen} focusedId={focusedDial} onClose={() => setDrawerOpen(false)} />
 
@@ -2993,6 +3183,18 @@ export function MockOpsCockpit() {
           <input type="range" min={0} max={MAX_WORKER_COUNT} value={workerCount}
             onChange={(e) => setWorkerCount(Number(e.target.value))} />
           <EditableNum value={workerCount} onCommit={setWorkerCount} />
+        </label>
+        <label className="demobar__slider">
+          Idle workers
+          <input type="range" min={0} max={MAX_IDLE_COUNT} value={idleCount}
+            onChange={(e) => setIdleCount(Number(e.target.value))} />
+          <EditableNum value={idleCount} onCommit={setIdleCount} />
+        </label>
+        <label className="demobar__slider">
+          Clock value
+          <input type="range" min={0} max={6} value={clockValue}
+            onChange={(e) => setClockValue(Number(e.target.value))} />
+          <EditableNum value={clockValue} onCommit={setClockValue} />
         </label>
         <label className="demobar__slider">
           Break time

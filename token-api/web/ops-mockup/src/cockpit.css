@@ -621,13 +621,13 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   background: color-mix(in srgb, var(--bg-deep) 82%, transparent);
   backdrop-filter: blur(4px);
 }
-/* the actual controls — a wrapped row. On wide screens this always shows (the
-   toggle is hidden); under the narrow breakpoint it collapses (see the RESPONSIVE
-   OVERRIDES block) unless .demobar--open. */
-.demobar__body { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
-/* collapse toggle — hidden on wide screens (only the override block reveals it). */
+/* the actual controls — a wrapped row. Collapsed by default at EVERY width (the
+   study panel otherwise obscures the idle-queue crossbar); the toggle reveals it. */
+.demobar__body { display: none; align-items: center; gap: 18px; flex-wrap: wrap; }
+.demobar--open .demobar__body { display: flex; }
+/* collapse toggle — always shown so the panel can be dismissed at any width. */
 .demobar__toggle {
-  display: none;
+  display: inline-block;
   border: 1px solid var(--line-bright); background: var(--surface); color: var(--brass);
   border-radius: var(--radius-sm); padding: 4px 10px; cursor: pointer;
   font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em;
@@ -766,6 +766,49 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 .worker-compass__hub {
   fill: var(--instrument);
   stroke: none;
+}
+
+/* ── Idle worker queue — the flipped bottom-rail clock section ────────────────
+   A standalone section dropped BELOW the first-screen composition; the reused
+   crossbar assembly (.worker-queues, inset:0) fills it and is flipped 180° so it
+   reads as a bottom rail (cap → left, chips → below the bar). */
+.idle-worker-queue {
+  /* Fixed in the FIRST viewport at ~80vh so both crossbars (the mid-page worker
+     crossbar and this idle crossbar) are visible at once, with clear space between
+     them for the future kanban board. Position is INDEPENDENT of queue depth. */
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 80vh;
+  /* Just tall enough to frame the flipped rail band (see the flip origin below),
+     scaled with the cluster so it stays snug on phones; the small fixed addend
+     keeps the chips clear of the bottom edge at the smallest uiScale. */
+  min-height: calc(210px * var(--ui-scale, 1) + 16px);
+  /* Above the composition layers so the idle chips visibly overlap/clobber the
+     region above when the queue grows large (the intended "too many idle" visual). */
+  z-index: 62;
+  /* Let the queue climb arbitrarily UP the edge ditches and overflow past the band
+     — the clobber IS the error signifier, so nothing is clipped or height-managed. */
+  overflow: visible;
+}
+/* Flip the whole crossbar assembly 180° (vertical + horizontal) so the cap swings
+   LEFT and the chips hang BELOW the bar. The reused rail draws at FIXED local y
+   (inherited from the full-page arc geometry, ~246px·uiScale centre), so we pivot
+   about THAT point — not the section centre — to keep the band framed regardless
+   of the section height. The ClockDial counter-rotates in SVG to stay upright. */
+.worker-queues--flip {
+  transform: rotate(180deg);
+  transform-origin: 50% calc(246px * var(--ui-scale, 1));
+}
+/* Persona chips ride the flipped assembly — counter-rotate the inner disc so the
+   glyphs stay upright (the outer .worker-chip keeps its slot-position transform). */
+.worker-queues--flip .worker-chip__disc { transform: rotate(180deg); }
+/* Roman numerals ringing the clock hexagon — the display face, upright. Colour is
+   set inline per-numeral (gold ≤ queue depth, grey beyond). */
+.worker-clock__numeral {
+  font-family: 'Chakra Petch', sans-serif;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 .worker-chip {
   position: absolute;
@@ -971,15 +1014,8 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
    --hub-* / --corner-dial-d bridges): the whole instrument assembly shrinks off
    ONE factor at every width, welded, with NO per-size numbers. This block is the
    isolated home for the few things that generic scaling can't express — kept
-   deliberately minimal. Today that is ONLY the demo-bar collapse. Future
-   portrait reflows / data-driven per-size tweaks belong HERE, nowhere else.
+   deliberately minimal. The demo-bar collapse is now width-independent (see the
+   base .demobar__body / .demobar__toggle rules), so nothing lives here today.
+   Future portrait reflows / data-driven per-size tweaks belong HERE, nowhere else.
    Breakpoint: --bp-narrow = 720px (media queries take the literal below).
    ═══════════════════════════════════════════════════════════════════════════ */
-@media (max-width: 720px) {
-  /* demo bar (mockup chrome) collapses to its toggle; the controls hide until
-     .demobar--open. The instrument cluster itself already shrank via uiScale, so
-     the old `.dials { scale(0.82) }` one-off is retired. */
-  .demobar__toggle { display: inline-block; }
-  .demobar__body { display: none; }
-  .demobar--open .demobar__body { display: flex; }
-}
