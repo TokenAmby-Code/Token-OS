@@ -175,7 +175,6 @@ token_wrapper_post_tmuxctld_wrapperstart() {
     --connect-timeout "${TOKEN_WRAPPER_TMUXCTLD_CONNECT_TIMEOUT:-0.50}" \
     --max-time "${TOKEN_WRAPPER_TMUXCTLD_MAX_TIME:-2.00}" \
     --retry "${TOKEN_WRAPPER_TMUXCTLD_RETRY:-2}" --retry-connrefused --retry-delay 0 \
-    --retry-max-time "${TOKEN_WRAPPER_TMUXCTLD_RETRY_MAX_TIME:-2}" \
     -X POST "${tmuxctld_url%/}/hooks/wrapperstart" \
     -H "Content-Type: application/json" \
     -d "$payload" 2>/dev/null) && rc=0 || rc=$?

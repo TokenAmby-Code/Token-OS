@@ -57,7 +57,7 @@ def test_common_cleanup_prefers_tmuxctl_clear_runtime() -> None:
     # The helper resolves ../bin/tmuxctl relative to the real checked-out lib.
     # Assert textually instead of replacing that file in-place.
     common = (CLI_TOOLS / "lib" / "agent-wrapper-common.sh").read_text(encoding="utf-8")
-    assert "clear-runtime --pane" in common
+    assert "POST /clear-runtime pane=" in common
     assert "tmux_runtime_cleanup_pane" in common
     assert tmuxctl.exists()
 
@@ -338,7 +338,7 @@ class _SlowWrapperHookHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)
-        if self.path.endswith("/WrapperStart"):
+        if self.path.endswith("/WrapperStart") or self.path.lower().endswith("/wrapperstart"):
             self.send_response(200)
             self.send_header("Content-Length", "2")
             self.end_headers()
@@ -561,6 +561,15 @@ def test_wrapperstart_dual_pings_token_api_and_tmuxctld() -> None:
     )
     # The daemon sender targets the /hooks/wrapperstart endpoint.
     assert "/hooks/wrapperstart" in common
+
+
+def test_wrapperstart_curl_retries_are_bounded_without_retry_max_time() -> None:
+    common = (CLI_TOOLS / "lib" / "agent-wrapper-common.sh").read_text(encoding="utf-8")
+    body = common.split("token_wrapper_post_tmuxctld_wrapperstart() {", 1)[1].split("\n}\n", 1)[0]
+    assert '--retry "${TOKEN_WRAPPER_TMUXCTLD_RETRY:-2}"' in body
+    assert '--max-time "${TOKEN_WRAPPER_TMUXCTLD_MAX_TIME:-2.00}"' in body
+    assert "--retry-connrefused" in body
+    assert "--retry-max-time" not in body
 
 
 def test_stack_enforcement_helper_remains_available() -> None:

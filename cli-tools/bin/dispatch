@@ -2307,6 +2307,38 @@ if value:
 PYINSTANCE
 }
 
+pane_tmux_option() {
+  local pane="$1" option="$2" value=""
+  [[ -n "$pane" && -n "$option" ]] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  value="$(tmux show-options -pv -t "$pane" "$option" 2>/dev/null || true)"
+  [[ -n "$value" ]] && printf '%s' "$value"
+}
+
+pane_wrapper_launch_id() {
+  local pane="$1" value=""
+  for value in \
+    "${TOKEN_API_WRAPPER_ID:-}" \
+    "${WRAPPER_ID:-}" \
+    "${TOKEN_API_WRAPPER_LAUNCH_ID:-}" \
+    "${WRAPPER_LAUNCH_ID:-}" \
+    "$(pane_tmux_option "$pane" @TOKEN_API_WRAPPER_ID)" \
+    "$(pane_tmux_option "$pane" @TOKEN_API_WRAPPER_LAUNCH_ID)"; do
+    [[ -n "$value" ]] || continue
+    printf '%s' "$value"
+    return 0
+  done
+  return 0
+}
+
+pane_stamped_instance_id() {
+  local pane="$1" value=""
+  value="$(pane_instance_id "$pane" || true)"
+  [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+  value="$(pane_tmux_option "$pane" @INSTANCE_ID)"
+  [[ -n "$value" ]] && printf '%s' "$value"
+}
+
 clear_pane_wrapper_launch_id() {
   local pane="$1"
   command -v tmux >/dev/null 2>&1 || return 0
@@ -2373,25 +2405,109 @@ reconcile_dispatch_registry_bind() {
   return 0
 }
 
+dispatch_ledger_check_attempts() {
+  local value="${DISPATCH_LEDGER_PRODUCER_CHECK_ATTEMPTS:-8}"
+  if [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "8"
+  fi
+}
+
+dispatch_ledger_check_sleep() {
+  local value="${DISPATCH_LEDGER_PRODUCER_CHECK_SLEEP:-0.25}"
+  if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "0.25"
+  fi
+}
+
+dispatch_ledger_note_attempted_id() {
+  local name="$1" value="$2" item existing
+  [[ -n "$name" && -n "$value" ]] || return 0
+  item="${name}=${value}"
+  for existing in "${DISPATCH_LEDGER_ATTEMPTED_IDS[@]:-}"; do
+    [[ "$existing" == "$item" ]] && return 0
+  done
+  DISPATCH_LEDGER_ATTEMPTED_IDS+=("$item")
+}
+
+dispatch_ledger_resolve_state() {
+  local key="$1" value="$2" resolved
+  [[ -n "$key" && -n "$value" ]] || return 1
+  resolved="$(tmuxctld_result GET /ledger/resolve "$key=$value" 2>/dev/null || true)"
+  [[ -n "$resolved" ]] || return 1
+  LEDGER_RESOLVE_JSON="$resolved" python3 - <<'PYLEDGERSTATE'
+import json
+import os
+import sys
+
+try:
+    data = json.loads(os.environ.get("LEDGER_RESOLVE_JSON", ""))
+except json.JSONDecodeError:
+    sys.exit(1)
+row = data.get("row") if isinstance(data, dict) else None
+if not isinstance(row, dict):
+    sys.exit(1)
+state = str(row.get("state") or "")
+if state in {"OPEN", "SHIPPED"}:
+    print(state, end="")
+    sys.exit(0)
+sys.exit(1)
+PYLEDGERSTATE
+}
+
 ensure_dispatch_wrapper_ledger() {
   # The #600 comms gate makes a missing wrapper-ledger row a communications
   # blackout. Dispatch therefore no longer treats the tmuxctld ledger producer as
-  # passive "eventual reconciliation": after the engine is live, force one
-  # daemon reconcile from pane stamps and verify an OPEN row for the target label.
-  local pane="$1" target_display="$2" pane_label row_state
+  # passive "eventual reconciliation": after the engine is live, force daemon
+  # reconcile from pane stamps and verify an OPEN/SHIPPED row. Wrapperstart and
+  # pane stamping can race this check, so retry briefly and resolve by every
+  # identity that can be known at this point, not just the pane's public label.
+  local pane="$1" target_display="$2"
+  local attempts sleep_seconds attempt pane_label wrapper_id instance_id row_state
+  local attempted_display attempted_id
   [[ "${DISPATCH_LEDGER_PRODUCER_CHECK:-1}" == "1" ]] || return 0
-  pane_label="$(resolve_pane_label_for_env "$pane")"
-  [[ -n "$pane_label" ]] || pane_label="$pane"
-  tmuxctld_result POST /reconcile session=main >/dev/null 2>&1 || {
-    err "launch failed: ${ENGINE} agent is live at ${target_display}, but tmuxctld ledger reconcile failed; refusing to report a comms-dead launch"
-    return 1
-  }
-  row_state="$(tmuxctld_result GET /ledger/resolve pane_positional_id="$pane_label" 2>/dev/null | python3 -c 'import json,sys; data=json.load(sys.stdin); print(str((data.get("row") or {}).get("state") or ""))' 2>/dev/null || true)"
-  if [[ "$row_state" != "OPEN" && "$row_state" != "SHIPPED" ]]; then
-    err "launch failed: ${ENGINE} agent is live at ${target_display}, but wrapper ledger has no OPEN row for ${pane_label}; sends would be refused by the comms gate"
-    return 1
+  attempts="$(dispatch_ledger_check_attempts)"
+  sleep_seconds="$(dispatch_ledger_check_sleep)"
+  DISPATCH_LEDGER_ATTEMPTED_IDS=()
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    tmuxctld_result POST /reconcile session=main >/dev/null 2>&1 || {
+      err "launch failed: ${ENGINE} agent is live at ${target_display}, but tmuxctld ledger reconcile failed; refusing to report a comms-dead launch"
+      return 1
+    }
+
+    pane_label="$(resolve_pane_label_for_env "$pane")"
+    [[ -n "$pane_label" ]] || pane_label="$pane"
+    dispatch_ledger_note_attempted_id pane_positional_id "$pane_label"
+    row_state="$(dispatch_ledger_resolve_state pane_positional_id "$pane_label" || true)"
+    [[ "$row_state" == "OPEN" || "$row_state" == "SHIPPED" ]] && return 0
+
+    wrapper_id="$(pane_wrapper_launch_id "$pane" || true)"
+    dispatch_ledger_note_attempted_id wrapper_id "$wrapper_id"
+    row_state="$(dispatch_ledger_resolve_state wrapper_id "$wrapper_id" || true)"
+    [[ "$row_state" == "OPEN" || "$row_state" == "SHIPPED" ]] && return 0
+
+    instance_id="$(pane_stamped_instance_id "$pane" || true)"
+    dispatch_ledger_note_attempted_id instance_id "$instance_id"
+    row_state="$(dispatch_ledger_resolve_state instance_id "$instance_id" || true)"
+    [[ "$row_state" == "OPEN" || "$row_state" == "SHIPPED" ]] && return 0
+
+    (( attempt < attempts )) && sleep "$sleep_seconds"
+  done
+
+  if ((${#DISPATCH_LEDGER_ATTEMPTED_IDS[@]})); then
+    attempted_display="${DISPATCH_LEDGER_ATTEMPTED_IDS[0]}"
+    for attempted_id in "${DISPATCH_LEDGER_ATTEMPTED_IDS[@]:1}"; do
+      attempted_display+=", ${attempted_id}"
+    done
+  else
+    attempted_display="none"
   fi
-  return 0
+  err "launch failed: ${ENGINE} agent is live at ${target_display}, but wrapper ledger has no OPEN/SHIPPED row after ${attempts} attempts (${attempted_display}); sends would be refused by the comms gate"
+  return 1
 }
 
 confirm_dispatch_launch_live() {
