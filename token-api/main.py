@@ -115,6 +115,7 @@ from db_connections import (
     set_sqlite_endpoint,
 )
 from db_schema import (
+    init_context_telemetry_database_async,
     init_database_async,
     init_timer_database_async,
 )
@@ -232,6 +233,7 @@ from shared import (
     SERVER_PORT,
     STASH_DIR,
     STASH_MAX_AGE_HOURS,
+    TELEMETRY_DB_PATH,
     TIMER_DB_PATH,
     TTS_BACKEND,
     TTS_GLOBAL_MODE,
