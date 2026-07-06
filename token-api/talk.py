@@ -780,16 +780,19 @@ async def resolve_open_talks_for_target(target_pane: str) -> list[dict[str, Any]
     normalized = _normalize_pane(target_pane)
     if normalized:
         lookup_keys.append(normalized)
-        try:
-            resolved = await resolve_pane(normalized)
-        except Exception:  # noqa: BLE001 - resolver failure should fail closed to direct key lookup
-            log.warning(
-                "talk: Stop-hook pane normalization failed for %s", normalized, exc_info=True
-            )
-            resolved = None
-        resolved = _normalize_pane(resolved)
-        if resolved and resolved not in lookup_keys:
-            lookup_keys.append(resolved)
+        async with _LOCK:
+            direct_hit = bool(_TARGET_INDEX.get(normalized))
+        if not direct_hit:
+            try:
+                resolved = await resolve_pane(normalized)
+            except Exception:  # noqa: BLE001 - resolver failure should fail closed to direct key lookup
+                log.warning(
+                    "talk: Stop-hook pane normalization failed for %s", normalized, exc_info=True
+                )
+                resolved = None
+            resolved = _normalize_pane(resolved)
+            if resolved and resolved not in lookup_keys:
+                lookup_keys.append(resolved)
 
     async with _LOCK:
         ids: list[str] = []
