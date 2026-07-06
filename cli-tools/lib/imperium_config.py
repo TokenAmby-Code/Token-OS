@@ -176,6 +176,16 @@ TOKEN_API_TIMER_DB = os.path.expanduser(
     or _legacy_token_api_db_unless_live()
     or os.path.join(RUNTIME_DATABASE_DIR, "timer.db")
 )
+_LEGACY_TOKEN_API_DB = _legacy_token_api_db_unless_live()
+TOKEN_API_TELEMETRY_DB = os.path.expanduser(
+    os.environ.get("TOKEN_API_TELEMETRY_DB")
+    or (
+        os.path.join(os.path.dirname(_LEGACY_TOKEN_API_DB), "telemetry.db")
+        if _LEGACY_TOKEN_API_DB
+        else ""
+    )
+    or os.path.join(RUNTIME_DATABASE_DIR, "telemetry.db")
+)
 
 # All Tailscale IPs for device resolution (replaces DEVICE_IPS in main.py)
 DEVICE_IPS: dict[str, str] = {}

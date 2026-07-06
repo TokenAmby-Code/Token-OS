@@ -18,6 +18,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 import shared
+from db_connections import connect_agents_db, connect_telemetry_db
 
 _CLI_LIB = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
 if str(_CLI_LIB) not in sys.path:
@@ -37,6 +38,8 @@ PRESSURE_STAGE_RANK = {
     "hard_injection": 2,
     "no_progress_stop": 2,
 }
+TELEMETRY_DEBOUNCE_SECONDS = 15.0
+_TELEMETRY_DEBOUNCE_CACHE: dict[str, tuple[tuple[Any, ...], float]] = {}
 
 router = APIRouter()
 
@@ -192,7 +195,7 @@ async def _session_doc_updated_at(db: aiosqlite.Connection, row: dict | None) ->
 
 
 async def _context_pressure_gate(
-    db: aiosqlite.Connection,
+    agents_db: aiosqlite.Connection,
     *,
     instance_row: dict | None,
     existing_state: dict | None,
@@ -221,7 +224,7 @@ async def _context_pressure_gate(
     checkpoint_at = _parse_dt(existing_state.get("checkpoint_completed_at"))
     injected_at = _parse_dt(existing_state.get("injected_at"))
     if checkpoint_at and injected_at:
-        doc_updated_at = await _session_doc_updated_at(db, instance_row)
+        doc_updated_at = await _session_doc_updated_at(agents_db, instance_row)
         latest_activity = _latest_dt(existing_state.get("last_progress_at"), doc_updated_at)
         current_activity = str((instance_row or {}).get("last_activity") or "")
         checkpoint_activity = str(existing_state.get("checkpoint_activity_at") or "")
@@ -247,6 +250,45 @@ def _planning_state(row: dict | None) -> str | None:
 
 def _message(stage: str, planning_state: str | None) -> str:
     return context_governor_message(stage=stage, planning_state=planning_state)
+
+
+def _telemetry_signature(
+    *,
+    session_id: str | None,
+    engine: str | None,
+    pane: str | None,
+    used_tokens: int | None,
+    context_window_tokens: int | None,
+    planning_state: str | None,
+    scoped: bool,
+    scope_reason: str,
+    stage: str,
+    policy_state: str,
+) -> tuple[Any, ...]:
+    return (
+        session_id,
+        engine,
+        pane,
+        used_tokens,
+        context_window_tokens,
+        planning_state,
+        bool(scoped),
+        scope_reason,
+        stage,
+        policy_state,
+    )
+
+
+def _telemetry_debounced(instance_id: str, signature: tuple[Any, ...]) -> bool:
+    now = asyncio.get_running_loop().time()
+    stale_cutoff = now - (TELEMETRY_DEBOUNCE_SECONDS * 4)
+    for key in [key for key, (_, ts) in _TELEMETRY_DEBOUNCE_CACHE.items() if ts < stale_cutoff]:
+        _TELEMETRY_DEBOUNCE_CACHE.pop(key, None)
+    previous = _TELEMETRY_DEBOUNCE_CACHE.get(instance_id)
+    if previous and previous[0] == signature and (now - previous[1]) < TELEMETRY_DEBOUNCE_SECONDS:
+        return True
+    _TELEMETRY_DEBOUNCE_CACHE[instance_id] = (signature, now)
+    return False
 
 
 async def _existing_context_stop_subscription(
@@ -432,20 +474,21 @@ async def _current_state(db: aiosqlite.Connection, instance_id: str) -> dict | N
 @router.post("/api/context-governor/telemetry")
 async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
     used_tokens = _normalize_used_tokens(request)
-    async with aiosqlite.connect(shared.DB_PATH, timeout=5.0) as db:
-        db.row_factory = aiosqlite.Row
-        row = await _resolve_instance(db, request)
+    async with connect_agents_db(shared.DB_PATH, timeout=5.0) as agents_db:
+        agents_db.row_factory = aiosqlite.Row
+        row = await _resolve_instance(agents_db, request)
         instance_id = (row or {}).get("id") or request.instance_id or request.session_id
         if not instance_id:
-            await _audit(
-                db,
-                instance_id=None,
-                session_id=request.session_id,
-                stage="telemetry",
-                action="unresolved",
-                details=request.model_dump(),
-            )
-            await db.commit()
+            async with connect_telemetry_db(shared.TELEMETRY_DB_PATH, timeout=5.0) as telemetry_db:
+                await _audit(
+                    telemetry_db,
+                    instance_id=None,
+                    session_id=request.session_id,
+                    stage="telemetry",
+                    action="unresolved",
+                    details=request.model_dump(),
+                )
+                await telemetry_db.commit()
             return {"success": False, "action": "instance_unresolved", "scoped": False}
 
         pane = (request.pane or "").strip() or None
@@ -457,85 +500,163 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
         engine = request.engine or (row or {}).get("engine")
         session_id = request.session_id or instance_id
 
-        if not scoped or stage == "telemetry":
-            await _upsert_state(
-                db,
-                instance_id=instance_id,
-                session_id=session_id,
-                engine=engine,
-                pane=pane,
-                used_tokens=used_tokens,
-                context_window_tokens=request.context_window_tokens,
-                planning_state=planning_state,
-                scoped=scoped,
-                scope_reason=scope_reason,
-                stage=stage,
-                policy_state="telemetry_only",
-            )
-            await _audit(
-                db,
-                instance_id=instance_id,
-                session_id=session_id,
-                stage=stage,
-                action="telemetry_only",
-                details={"used_tokens": used_tokens, "scope_reason": scope_reason},
-            )
-            await db.commit()
-            return {
-                "success": True,
-                "action": "telemetry_only",
-                "scoped": scoped,
-                "scope_reason": scope_reason,
-                "stage": stage,
-                "used_tokens": used_tokens,
-            }
+        async with connect_telemetry_db(shared.TELEMETRY_DB_PATH, timeout=5.0) as db:
+            db.row_factory = aiosqlite.Row
 
-        existing_state = await _current_state(db, instance_id)
-        gate_allowed, gate_reason = await _context_pressure_gate(
-            db,
-            instance_row=row,
-            existing_state=existing_state,
-            session_id=session_id,
-            stage=stage,
-        )
-        if not gate_allowed:
-            await _upsert_state(
-                db,
-                instance_id=instance_id,
-                session_id=session_id,
-                engine=engine,
-                pane=pane,
-                used_tokens=used_tokens,
-                context_window_tokens=request.context_window_tokens,
-                planning_state=planning_state,
-                scoped=True,
-                scope_reason=scope_reason,
-                stage=stage,
-                policy_state=(existing_state or {}).get("policy_state") or "event_gate_suppressed",
-            )
-            await _audit(
-                db,
-                instance_id=instance_id,
-                session_id=session_id,
-                stage=stage,
-                action="event_gate_suppressed",
-                details={"used_tokens": used_tokens, "gate_reason": gate_reason},
-            )
-            await db.commit()
-            return {
-                "success": True,
-                "action": "event_gate_suppressed",
-                "scoped": True,
-                "stage": stage,
-                "used_tokens": used_tokens,
-                "gate_reason": gate_reason,
-            }
+            if not scoped or stage == "telemetry":
+                signature = _telemetry_signature(
+                    session_id=session_id,
+                    engine=engine,
+                    pane=pane,
+                    used_tokens=used_tokens,
+                    context_window_tokens=request.context_window_tokens,
+                    planning_state=planning_state,
+                    scoped=scoped,
+                    scope_reason=scope_reason,
+                    stage=stage,
+                    policy_state="telemetry_only",
+                )
+                if _telemetry_debounced(instance_id, signature):
+                    return {
+                        "success": True,
+                        "action": "telemetry_debounced",
+                        "scoped": scoped,
+                        "scope_reason": scope_reason,
+                        "stage": stage,
+                        "used_tokens": used_tokens,
+                        "debounce_seconds": TELEMETRY_DEBOUNCE_SECONDS,
+                    }
+                await _upsert_state(
+                    db,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    engine=engine,
+                    pane=pane,
+                    used_tokens=used_tokens,
+                    context_window_tokens=request.context_window_tokens,
+                    planning_state=planning_state,
+                    scoped=scoped,
+                    scope_reason=scope_reason,
+                    stage=stage,
+                    policy_state="telemetry_only",
+                )
+                await _audit(
+                    db,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    stage=stage,
+                    action="telemetry_only",
+                    details={"used_tokens": used_tokens, "scope_reason": scope_reason},
+                )
+                await db.commit()
+                return {
+                    "success": True,
+                    "action": "telemetry_only",
+                    "scoped": scoped,
+                    "scope_reason": scope_reason,
+                    "stage": stage,
+                    "used_tokens": used_tokens,
+                }
 
-        if stage == "soft_stop":
-            payload = _message(stage, planning_state)
+            existing_state = await _current_state(db, instance_id)
+            gate_allowed, gate_reason = await _context_pressure_gate(
+                agents_db,
+                instance_row=row,
+                existing_state=existing_state,
+                session_id=session_id,
+                stage=stage,
+            )
+            if not gate_allowed:
+                await _upsert_state(
+                    db,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    engine=engine,
+                    pane=pane,
+                    used_tokens=used_tokens,
+                    context_window_tokens=request.context_window_tokens,
+                    planning_state=planning_state,
+                    scoped=True,
+                    scope_reason=scope_reason,
+                    stage=stage,
+                    policy_state=(existing_state or {}).get("policy_state")
+                    or "event_gate_suppressed",
+                )
+                await _audit(
+                    db,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    stage=stage,
+                    action="event_gate_suppressed",
+                    details={"used_tokens": used_tokens, "gate_reason": gate_reason},
+                )
+                await db.commit()
+                return {
+                    "success": True,
+                    "action": "event_gate_suppressed",
+                    "scoped": True,
+                    "stage": stage,
+                    "used_tokens": used_tokens,
+                    "gate_reason": gate_reason,
+                }
+
+            if stage == "soft_stop":
+                payload = _message(stage, planning_state)
+                injected_at = _now()
+                sub_id = await _arm_stop_subscription(
+                    agents_db, instance_id=instance_id, pane=pane, payload=payload
+                )
+                await agents_db.commit()
+                await _upsert_state(
+                    db,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    engine=engine,
+                    pane=pane,
+                    used_tokens=used_tokens,
+                    context_window_tokens=request.context_window_tokens,
+                    planning_state=planning_state,
+                    scoped=True,
+                    scope_reason=scope_reason,
+                    stage=stage,
+                    policy_state="armed_stop_subscription",
+                    armed_subscription_id=sub_id,
+                    injected_at=injected_at,
+                    last_directive_activity_at=(row or {}).get("last_activity"),
+                )
+                await _audit(
+                    db,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    stage=stage,
+                    action="armed_stop_subscription",
+                    details={
+                        "subscription_id": sub_id,
+                        "used_tokens": used_tokens,
+                        "gate_reason": gate_reason,
+                    },
+                )
+                await db.commit()
+                return {
+                    "success": True,
+                    "action": "armed_stop_subscription",
+                    "scoped": True,
+                    "stage": stage,
+                    "subscription_id": sub_id,
+                    "used_tokens": used_tokens,
+                    "gate_reason": gate_reason,
+                }
+
+            text = _message(stage, planning_state)
             injected_at = _now()
-            sub_id = await _arm_stop_subscription(
-                db, instance_id=instance_id, pane=pane, payload=payload
+            ttl = (
+                request.no_progress_ttl_seconds
+                if request.no_progress_ttl_seconds is not None
+                else DEFAULT_NO_PROGRESS_TTL_SECONDS
+            )
+            deadline = (datetime.fromisoformat(injected_at) + timedelta(seconds=ttl)).isoformat()
+            actuation = await _tmuxctld_context_governor_inject(
+                instance_id=instance_id, pane=pane, text=text, stage=stage
             )
             await _upsert_state(
                 db,
@@ -549,9 +670,9 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
                 scoped=True,
                 scope_reason=scope_reason,
                 stage=stage,
-                policy_state="armed_stop_subscription",
-                armed_subscription_id=sub_id,
+                policy_state="forced_injection",
                 injected_at=injected_at,
+                no_progress_deadline_at=deadline,
                 last_directive_activity_at=(row or {}).get("last_activity"),
             )
             await _audit(
@@ -559,75 +680,24 @@ async def ingest_context_telemetry(request: ContextTelemetryRequest) -> dict:
                 instance_id=instance_id,
                 session_id=session_id,
                 stage=stage,
-                action="armed_stop_subscription",
+                action="forced_injection",
                 details={
-                    "subscription_id": sub_id,
                     "used_tokens": used_tokens,
+                    "pane": pane,
+                    "actuation": actuation,
                     "gate_reason": gate_reason,
                 },
             )
             await db.commit()
             return {
                 "success": True,
-                "action": "armed_stop_subscription",
+                "action": "forced_injection",
                 "scoped": True,
                 "stage": stage,
-                "subscription_id": sub_id,
                 "used_tokens": used_tokens,
-                "gate_reason": gate_reason,
-            }
-
-        text = _message(stage, planning_state)
-        injected_at = _now()
-        ttl = (
-            request.no_progress_ttl_seconds
-            if request.no_progress_ttl_seconds is not None
-            else DEFAULT_NO_PROGRESS_TTL_SECONDS
-        )
-        deadline = (datetime.fromisoformat(injected_at) + timedelta(seconds=ttl)).isoformat()
-        actuation = await _tmuxctld_context_governor_inject(
-            instance_id=instance_id, pane=pane, text=text, stage=stage
-        )
-        await _upsert_state(
-            db,
-            instance_id=instance_id,
-            session_id=session_id,
-            engine=engine,
-            pane=pane,
-            used_tokens=used_tokens,
-            context_window_tokens=request.context_window_tokens,
-            planning_state=planning_state,
-            scoped=True,
-            scope_reason=scope_reason,
-            stage=stage,
-            policy_state="forced_injection",
-            injected_at=injected_at,
-            no_progress_deadline_at=deadline,
-            last_directive_activity_at=(row or {}).get("last_activity"),
-        )
-        await _audit(
-            db,
-            instance_id=instance_id,
-            session_id=session_id,
-            stage=stage,
-            action="forced_injection",
-            details={
-                "used_tokens": used_tokens,
-                "pane": pane,
                 "actuation": actuation,
                 "gate_reason": gate_reason,
-            },
-        )
-        await db.commit()
-        return {
-            "success": True,
-            "action": "forced_injection",
-            "scoped": True,
-            "stage": stage,
-            "used_tokens": used_tokens,
-            "actuation": actuation,
-            "gate_reason": gate_reason,
-        }
+            }
 
 
 @router.post("/api/context-governor/progress")
@@ -635,15 +705,23 @@ async def record_context_progress(request: ContextProgressRequest) -> dict:
     now = _now()
     is_checkpoint = request.event_type in CHECKPOINT_EVENT_TYPES
     policy_state = "checkpoint_observed" if is_checkpoint else "progress_observed"
-    async with aiosqlite.connect(shared.DB_PATH, timeout=5.0) as db:
+    checkpoint_activity_at = None
+    if is_checkpoint:
+        async with connect_agents_db(shared.DB_PATH, timeout=5.0) as agents_db:
+            cursor = await agents_db.execute(
+                "SELECT last_activity FROM instances WHERE id = ?", (request.instance_id,)
+            )
+            row = await cursor.fetchone()
+            checkpoint_activity_at = row[0] if row else None
+    async with connect_telemetry_db(shared.TELEMETRY_DB_PATH, timeout=5.0) as db:
         if is_checkpoint:
             await db.execute(
                 """UPDATE context_governor_state
                    SET checkpoint_completed_at = ?,
-                       checkpoint_activity_at = (SELECT last_activity FROM instances WHERE id = ?),
+                       checkpoint_activity_at = ?,
                        policy_state = ?
                    WHERE instance_id = ?""",
-                (now, request.instance_id, policy_state, request.instance_id),
+                (now, checkpoint_activity_at, policy_state, request.instance_id),
             )
         else:
             await db.execute(
@@ -688,7 +766,7 @@ async def sweep_context_governor(request: ContextSweepRequest | None = None) -> 
     limit = request.limit if request else 50
     now = datetime.now()
     exhausted: list[dict[str, Any]] = []
-    async with aiosqlite.connect(shared.DB_PATH, timeout=5.0) as db:
+    async with connect_telemetry_db(shared.TELEMETRY_DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT * FROM context_governor_state
@@ -761,7 +839,7 @@ async def get_context_governor_state(
         clauses.append("instance_id = ?")
         params.append(instance_id)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    async with aiosqlite.connect(shared.DB_PATH, timeout=5.0) as db:
+    async with connect_telemetry_db(shared.TELEMETRY_DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""SELECT * FROM context_governor_state

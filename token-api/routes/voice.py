@@ -21,6 +21,7 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from db_connections import connect_agents_db
 from instance_mutation import update_instance
 from personas import (
     assign_astartes_persona,
@@ -92,7 +93,7 @@ def _persona_response(profile: dict) -> dict:
 @router.get("/api/voices")
 async def list_voices():
     """List manually selectable persona-backed Astartes voices."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         personas = await selectable_astartes_personas(db)
 
@@ -134,7 +135,7 @@ async def change_instance_voice(instance_id: str, request: VoiceChangeRequest):
     together. Collisions are rejected; this route never moves another instance.
     """
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         target_persona = await astartes_persona_by_tts_voice(db, request.voice)
         selectable = await selectable_astartes_personas(db)
@@ -245,7 +246,7 @@ async def set_instance_tts_mode(instance_id: str, request: Request):
             detail=f"Invalid mode: {mode}. Must be verbose, muted, silent, or voice-chat",
         )
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -359,7 +360,7 @@ async def toggle_voice_chat(instance_id: str, active: bool = True, pane_id: str 
         "notification_mode": "verbose",
         "interaction_mode": "voice_chat" if active else "text",
     }
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await update_instance(
             db,
             instance_id=instance_id,

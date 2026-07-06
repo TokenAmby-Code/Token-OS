@@ -36,6 +36,7 @@ import ask_service
 import shared
 import talk as talk_service
 from context_governor import record_context_governor_progress
+from db_connections import connect_agents_db
 from enforcement_service import close_distraction_windows
 from golden_throne_noop import (
     NO_OP_THRESHOLD,
@@ -1163,7 +1164,7 @@ async def _enqueue_child_stop_fanout(instance: dict, payload: dict) -> dict | No
 
     child_instance_id = instance["id"]
     child_session_doc_path = None
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         if instance.get("session_doc_id"):
             cursor = await db.execute(
@@ -2514,7 +2515,7 @@ async def _fanout_stop_subscriptions(
     # subscription row carries its own subscriber_pane for delivery, so a pane
     # match is sufficient to deliver without a live instances row.
     pane = _normalize_text(instance.get("tmux_pane"))
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         if pane:
             cursor = await db.execute(
@@ -2769,7 +2770,7 @@ async def handle_wrapper_end(payload: dict) -> dict:
     stopped_instance_id = None
     if wrapper_launch_id:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """SELECT id, status, rank
@@ -4360,7 +4361,7 @@ async def handle_session_end(payload: dict) -> dict:
 
     now = datetime.now().isoformat()
 
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         cursor = await db.execute(
             """SELECT id, device_id, COALESCE(is_subagent, 0), session_doc_id,
                       (SELECT slug FROM personas WHERE id = instances.persona_id) AS legion,
@@ -4900,7 +4901,7 @@ async def handle_prompt_submit(payload: dict) -> dict:
     consumed_injections: list[dict] = []
     should_schedule_naming_nudge = False
 
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (session_id,))
         existing = await cursor.fetchone()
@@ -5117,7 +5118,7 @@ async def handle_post_tool_use(payload: dict) -> dict:
     # no-op); `tool_name in MUTATING_TOOLS` short-circuits first so the common
     # non-mutating path adds zero cost.
     if tool_name in MUTATING_TOOLS:
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             db.row_factory = aiosqlite.Row
             ev = await _set_planning_state(
                 db,
@@ -5143,7 +5144,7 @@ async def handle_post_tool_use(payload: dict) -> dict:
     # Also resurrect stopped instances - activity means they're active
     # Backfill PID if payload contains one and DB value is NULL
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         existing = await _fetch_instance_row(db, session_id)
         if not existing:
             return {"success": False, "action": "not_found", "instance_id": session_id}
@@ -5260,7 +5261,7 @@ async def _record_gt_response_classification(
         }
         if current_fingerprint is not None:
             updates["gt_last_dispatch_fingerprint"] = current_fingerprint
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             await update_instance(
                 db,
                 instance_id=instance_id,
@@ -5308,7 +5309,7 @@ async def _record_gt_response_classification(
             }
         )
 
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         await update_instance(
             db,
             instance_id=instance_id,
@@ -5381,7 +5382,7 @@ async def handle_stop(payload: dict) -> dict:
         return {"success": True, "action": "skipped_recursive"}
 
     # Get instance info
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT i.*, p.notification_sound AS persona_notification_sound
@@ -5475,7 +5476,7 @@ async def handle_stop(payload: dict) -> dict:
         not is_subagent_instance_quick and not has_pending_background and not is_sync_instance
     )
 
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         # Stop clears hook_driven=0 — the autonomous wake that flagged this instance
         # has run its course. Idempotent (clearing an already-0 row is a no-op), so
         # this is a safe generic clear on every Stop regardless of how it was woken.
@@ -5547,7 +5548,7 @@ async def handle_stop(payload: dict) -> dict:
                 }
                 result["action"] = "stop_processed_gt_review_mode"
                 return result
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             await update_instance(
                 db,
                 instance_id=session_id,
@@ -5658,7 +5659,7 @@ async def handle_stop(payload: dict) -> dict:
         "effective_pane_label": instance.get("pane_label"),
     }
     if _normalize_text(commander_probe.get("commander_type")) == "persona":
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             commander_stop_reconcile = await _reconcile_commander_stop_subscriptions(
                 db, source_instance_id=session_id
             )
@@ -5667,7 +5668,7 @@ async def handle_stop(payload: dict) -> dict:
             ):
                 await db.commit()
     elif _is_mechanicus_worker_row(commander_probe):
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             commander_stop_reconcile = await _reconcile_mechanicus_stop_subscriptions(
                 db, source_instance_id=session_id
             )
@@ -6565,7 +6566,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     # Also resurrect stopped instances - activity means they're active
     if session_id:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             await update_instance(
                 db,
                 instance_id=session_id,
@@ -6594,7 +6595,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     # Fetch instance row once for ladder eligibility (voice-chat OR golden_throne).
     askq_instance_row: dict | None = None
     if tool_name == "AskUserQuestion" and session_id:
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """SELECT i.golden_throne, i.name AS tab_name, p.slug AS legion,
@@ -6652,7 +6653,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
     # Discord-hosted: post AskUserQuestion to Discord channel and notify phone
     _ask_handled_by_discord = False
     if tool_name == "AskUserQuestion" and session_id:
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             cursor = await db.execute(
                 "SELECT discord_hosted, discord_channel, "
                 "(SELECT slug FROM personas WHERE id = instances.persona_id) AS legion "
@@ -6753,7 +6754,7 @@ async def handle_notification(payload: dict) -> dict:
     sound_file = "chimes.wav"  # default
 
     if session_id:
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """SELECT p.notification_sound
@@ -6796,7 +6797,7 @@ async def handle_stop_validate(payload: dict) -> dict:
     if session_id in _self_eval_pending:
         issued_at = _self_eval_pending.pop(session_id)
         elapsed = now - issued_at
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             await update_instance(
                 db,
                 instance_id=session_id,
@@ -6827,7 +6828,7 @@ async def handle_stop_validate(payload: dict) -> dict:
         del _self_eval_pending[sid]
 
     # ── Look up instance ──
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, golden_throne, is_subagent, victory_at, workflow_state, "
@@ -6865,7 +6866,7 @@ async def handle_stop_validate(payload: dict) -> dict:
     # ── Questions gate: session docs with non-closed questions block once ──
     if instance_type in ("golden_throne",) and instance.get("session_doc_id"):
         session_doc_path = None
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             cursor = await db.execute(
                 "SELECT file_path FROM session_documents WHERE id = ?",
                 (instance.get("session_doc_id"),),
@@ -6902,7 +6903,7 @@ async def handle_stop_validate(payload: dict) -> dict:
                     "Your session doc has non-closed questions. Resolve or explicitly waive blockers before stopping.\n\n"
                     "Top blockers:\n" + "\n".join(blocker_lines)
                 )
-                async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+                async with connect_agents_db(DB_PATH, timeout=5.0) as db:
                     await update_instance(
                         db,
                         instance_id=session_id,
@@ -6972,7 +6973,7 @@ async def handle_stop_validate(payload: dict) -> dict:
     if instance_type in ("golden_throne",):
         _self_eval_pending[session_id] = now
         blocked_at = datetime.now().isoformat()
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             await update_instance(
                 db,
                 instance_id=session_id,
@@ -7034,7 +7035,7 @@ async def mark_instance_for_close(instance_id: str, request: MarkForCloseRequest
     if lifecycle not in {"retire", "archive-session-doc", "banish"}:
         return {"success": False, "action": "unsupported_lifecycle", "lifecycle": raw_lifecycle}
 
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         armed = await _mark_for_close_subscription(
             db,
             instance_id=instance_id,
@@ -7092,7 +7093,7 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
         return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
     if request.delivery not in {"prompt", "ephemeral"}:
         return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         # Resolve each distinct pane at most once per request. The plan-menu
         # preplan subscribe sends target_pane == subscriber_pane == the same %id,
         # and _resolve_instance_for_pane is the expensive leg (a tmux show-options
@@ -7252,7 +7253,7 @@ async def _set_planning_state(
 
 @router.get("/api/planning/state")
 async def get_planning_state(instance_id: str | None = None, tmux_pane: str | None = None) -> dict:
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         instance = await _resolve_instance_by_id(db, instance_id)
         if not instance or not instance.get("id"):
@@ -7292,7 +7293,7 @@ async def get_planning_state(instance_id: str | None = None, tmux_pane: str | No
 @router.post("/api/planning/state")
 async def set_planning_state(request: PlanningStateRequest) -> dict:
     source = _normalize_text(request.source) or "api"
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         instance = await _resolve_instance_by_id(db, request.instance_id)
         if not instance or not instance.get("id"):
@@ -7347,7 +7348,7 @@ async def set_planning_state(request: PlanningStateRequest) -> dict:
 
 @router.post("/api/hooks/unsubscribe")
 async def unsubscribe_hook(request: HookUnsubscribeRequest) -> dict:
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         target = await _resolve_instance_by_id(db, request.target_instance_id)
         if not target or not target.get("id"):
             target = await _resolve_instance_for_pane(db, request.target_pane)
@@ -7439,7 +7440,7 @@ async def list_hook_subscriptions(
     if purpose:
         clauses.append("purpose = ?")
         params.append(purpose)
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""SELECT * FROM stop_hook_subscriptions
@@ -7456,7 +7457,7 @@ async def reconcile_hook_subscriptions(request: HookReconcileRequest) -> dict:
     page = (request.page or "mechanicus").strip().lower()
     if page != "mechanicus":
         return {"success": False, "action": "unsupported_page", "page": request.page}
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         result = await _reconcile_mechanicus_stop_subscriptions(db)
         if result.get("created") or result.get("existing"):
             await db.commit()
@@ -7466,7 +7467,7 @@ async def reconcile_hook_subscriptions(request: HookReconcileRequest) -> dict:
 @router.post("/api/hooks/prune")
 async def prune_hook_subscriptions(request: HookPruneRequest) -> dict:
     """Garbage-collect active subscriptions with dead watched/notify instances."""
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         return await _prune_dangling_stop_subscriptions(
             db, confirm=request.confirm, event=request.event
         )

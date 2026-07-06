@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     import aiosqlite
+from db_connections import connect_agents_db, connect_agents_db_sync, resolve_telemetry_db_path
 
 logger = logging.getLogger("token_api")
 _LOG_EVENT_WRITE_LOCK = threading.Lock()
@@ -37,6 +38,7 @@ RUNTIME_DATABASE_DIR = Path(
 ).expanduser()
 DEFAULT_AGENTS_DB_PATH = RUNTIME_DATABASE_DIR / "agents.db"
 DEFAULT_TIMER_DB_PATH = RUNTIME_DATABASE_DIR / "timer.db"
+DEFAULT_TELEMETRY_DB_PATH = RUNTIME_DATABASE_DIR / "telemetry.db"
 
 
 def _configured_agents_db_path() -> Path:
@@ -73,9 +75,20 @@ def _configured_timer_db_path() -> Path:
     return DEFAULT_TIMER_DB_PATH
 
 
+def _configured_telemetry_db_path() -> Path:
+    """Resolve the high-frequency telemetry database path.
+
+    Production stores telemetry beside agents.db/timer.db.  Test/dev worktrees
+    that still set TOKEN_API_DB get a sibling telemetry.db so the telemetry
+    split remains true without touching live state.
+    """
+    return resolve_telemetry_db_path()
+
+
 DB_PATH = _configured_agents_db_path()
 AGENTS_DB_PATH = DB_PATH
 TIMER_DB_PATH = _configured_timer_db_path()
+TELEMETRY_DB_PATH = _configured_telemetry_db_path()
 LEGACY_AGENTS_DB_PATH = Path.home() / ".claude" / "agents.db"
 LEGACY_TIMER_DB_PATH = Path.home() / ".claude" / "timer.db"
 
@@ -89,12 +102,10 @@ async def hook_db():
     Autocommit commits each statement immediately so write locks are not held
     across non-DB awaits; explicit commits remain harmless no-ops.
     """
-    import aiosqlite
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(DB_PATH, timeout=5.0, isolation_level=None)
+    db = await connect_agents_db(DB_PATH, timeout=5.0, isolation_level=None)
     try:
-        await db.execute("PRAGMA busy_timeout=5000")
         yield db
     finally:
         await db.close()
@@ -1259,8 +1270,7 @@ def _log_event_sync_insert(
     with _LOG_EVENT_WRITE_LOCK:
         for attempt in range(3):
             try:
-                with contextlib.closing(sqlite3.connect(DB_PATH, timeout=5.0)) as conn, conn:
-                    conn.execute("PRAGMA busy_timeout=5000")
+                with connect_agents_db_sync(DB_PATH, timeout=5.0, site="shared.log_event") as conn:
                     conn.execute(
                         """INSERT INTO events (event_type, instance_id, device_id, details)
                            VALUES (?, ?, ?, ?)""",

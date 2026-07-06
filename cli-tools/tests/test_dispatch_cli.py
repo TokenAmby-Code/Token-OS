@@ -2726,15 +2726,12 @@ def test_dispatch_tmux_target_bakes_pane_label_into_launch_env(tmp_path: Path) -
     assert "TOKEN_API_PANE_LABEL=palace:E" in result.stdout
 
 
-def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Path) -> None:
-    """A live pane whose instances row lags is success when wrapper ledger is OPEN.
+def test_dispatch_fails_loud_when_registry_row_lags(tmp_path: Path) -> None:
+    """A live pane whose instances row does not bind is a loud failure.
 
-    Regression for the fleet-wide exit-70 false-failure: the agent process is up
-    and engaged in the pane, but the DB row has not bound live (here it is still
-    ``stopped`` — the cold-start / codex-undercount reconciliation lag). The old
-    code gated success on the row binding and fatal-ed exit 70 even though the
-    launch plainly succeeded. The #600 comms gate adds one hard invariant:
-    liveness only counts as success when the wrapper ledger has an OPEN row.
+    The agent process is up and engaged in the pane, but the DB row has not
+    bound live (here it is still ``stopped``). Liveness and wrapper ledger are
+    not enough: registry binding is required before dispatch reports success.
     """
     import sqlite3
 
@@ -2821,26 +2818,29 @@ def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Pat
         env=env,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "dispatched claude to palace:E" in result.stdout
-    # The row lag is advisory only — surfaced as a warning, never a failure.
-    assert "registration slow" in result.stderr
-    assert "instance row did not bind live" not in result.stderr
-    assert "launch failed" not in result.stderr
+    assert result.returncode != 0
+    assert "instances row did not bind within the observation window" in result.stderr
+    assert "registration slow" not in result.stderr
 
 
-def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: Path) -> None:
-    """The codex singleton-undercount path: no registry row, but ledger row exists.
+def test_dispatch_fails_loud_when_instance_never_registers(tmp_path: Path) -> None:
+    """No registry row after the observation window is a loud failure.
 
-    For codex the SessionStart pane stamp / DB row may never land at all. The old
-    gate required the @INSTANCE_ID stamp and fatal-ed exit 70, breaking the
-    stop-hook/completion contract for a launch that genuinely succeeded. With the
-    liveness-driven gate plus #600 comms invariant, a live agent process is success
-    only when the wrapper ledger row exists — registry lag remains advisory.
+    Liveness and a wrapper ledger row are not enough: sends and rename require a
+    bound instances row. The old path printed registration-slow reassurance and
+    returned success; the current path fails loudly.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     tmux_log = tmp_path / "tmux.log"
+    db = tmp_path / "agents.db"
+
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, status TEXT, working_dir TEXT, pane_label TEXT)"
+        )
 
     fake_tmuxctl = fake_bin / "tmuxctl"
     fake_tmuxctl.write_text(
@@ -2884,6 +2884,7 @@ def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: P
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_DB"] = str(db)
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
@@ -2909,9 +2910,9 @@ def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: P
         env=env,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "dispatched codex to mechanicus:new" in result.stdout
-    assert "launch failed" not in result.stderr
+    assert result.returncode != 0
+    assert "instances row did not bind within the observation window" in result.stderr
+    assert "registration slow" not in result.stderr
     tmux_calls = tmux_log.read_text(encoding="utf-8")
     assert "DISPATCH LAUNCH FAILED" not in tmux_calls
 
@@ -3439,14 +3440,13 @@ def test_dispatch_resume_api_rejects_incomplete_metadata(tmp_path: Path) -> None
     assert "pass explicit --engine and --dir" not in result.stderr
 
 
-def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path) -> None:
-    """The core repro: row lags but the pane is live → exit 0 AND naming runs.
+def test_dispatch_liveness_fails_loud_when_row_lags_after_send(tmp_path: Path) -> None:
+    """A live pane with no bound registry row fails after launch delivery.
 
-    A false exit-70 before the naming step is exactly why agents land needs-name
-    and untracked. With the liveness-driven gate the launch reaches exit 0, so the
-    launched agent is neither reaped nor retried. Naming is no longer delivered
-    by dispatch-derived prefixes; it happens only through the naming interview
-    / instance-name boundary.
+    The staged command still reaches the pane, but dispatch must not report
+    success until the instances row binds. Naming remains outside dispatch-
+    derived prefixes and happens through the naming interview / instance-name
+    boundary after a valid registration.
     """
     db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
     env = _persona_env(tmp_path, db)
@@ -3529,13 +3529,12 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
         timeout=60,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "dispatched claude to mechanicus:new" in result.stdout
-    assert "registration slow" in result.stderr
-    assert "launch failed" not in result.stderr
+    assert result.returncode != 0
+    assert "instances row did not bind within the observation window" in result.stderr
+    assert "registration slow" not in result.stderr
 
-    # Proof the success path reaches the pane without smuggling a dispatch-derived
-    # naming prefix into the staged launch command.
+    # Proof the launch text still reaches the pane without smuggling a
+    # dispatch-derived naming prefix into the staged launch command.
     calls = [c for c in rec.read_bytes().decode("utf-8", "replace").split("\0") if c]
     assert "%77" in calls, f"physical pane option cleanup did not target %77; calls={calls}"
     ping_text = ping_log.read_text(encoding="utf-8", errors="replace")

@@ -39,6 +39,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 import shared
+from db_connections import connect_agents_db
 from human_render import sanitize_human_render_text, sanitize_human_render_text_sync
 from instance_mutation import update_instance
 from personas import (
@@ -1863,7 +1864,7 @@ async def _snap_focus_to_speaker(item: "TTSQueueItem") -> dict:
 
         # Look up the live instance identity at playback time (handles the
         # "instance died between queue and playback" case naturally).
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """SELECT device_id,
@@ -1925,7 +1926,7 @@ async def select_instance_pane(instance_id: str) -> dict:
         if not instance_id:
             return {"snapped": False, "reason": "no_instance"}
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT device_id FROM instances WHERE id = ?",
@@ -2253,7 +2254,7 @@ async def queue_tts(
         row = _SYSTEM_TTS_ROW
     else:
         # Look up instance and resolve audio settings from its persona.
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """SELECT i.name, p.tts_voice, p.notification_sound,
@@ -3378,7 +3379,7 @@ async def set_global_tts_mode(request: Request, mode: str | None = None) -> dict
 
     # Update only the global override field on active instances. Do not
     # mutate per-instance persona voice/sound or interaction state here.
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id FROM instances WHERE status NOT IN ('stopped', 'archived') AND is_subagent = 0"
         )

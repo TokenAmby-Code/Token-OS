@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 _MODULES_TO_RELOAD = [
+    "db_connections",
     "personas",
     "shared",
     "db_schema",

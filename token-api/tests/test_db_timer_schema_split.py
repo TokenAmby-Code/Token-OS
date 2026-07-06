@@ -12,6 +12,10 @@ TIMER_TABLES = {
     "timer_shifts",
     "timer_samples",
 }
+CONTEXT_TELEMETRY_TABLES = {
+    "context_governor_state",
+    "context_governor_audit",
+}
 
 
 def _table_names(db_path: Path) -> set[str]:
@@ -41,3 +45,14 @@ def test_fresh_timer_db_init_creates_timer_tables(tmp_path: Path) -> None:
     db_schema.init_timer_database_sync(timer_db)
 
     assert TIMER_TABLES <= _table_names(timer_db)
+
+
+def test_context_governor_tables_live_in_telemetry_db_not_agents_db(tmp_path: Path) -> None:
+    agents_db = tmp_path / "agents.db"
+    telemetry_db = tmp_path / "telemetry.db"
+
+    db_schema.init_database_sync(agents_db)
+    db_schema.init_context_telemetry_database_sync(telemetry_db)
+
+    assert _table_names(agents_db).isdisjoint(CONTEXT_TELEMETRY_TABLES)
+    assert CONTEXT_TELEMETRY_TABLES <= _table_names(telemetry_db)

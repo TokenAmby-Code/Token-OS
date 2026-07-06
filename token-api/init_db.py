@@ -4,7 +4,12 @@
 import os
 from pathlib import Path
 
-from db_schema import init_database_sync, init_timer_database_sync
+from db_connections import resolve_telemetry_db_path
+from db_schema import (
+    init_context_telemetry_database_sync,
+    init_database_sync,
+    init_timer_database_sync,
+)
 
 RUNTIME_DATABASE_DIR = Path(
     os.environ.get("TOKEN_API_DATABASE_DIR", Path.home() / "runtimes" / "database")
@@ -32,12 +37,14 @@ TIMER_DB_PATH = Path(
     or _legacy_token_api_db_unless_live()
     or RUNTIME_DATABASE_DIR / "timer.db"
 ).expanduser()
+TELEMETRY_DB_PATH = resolve_telemetry_db_path()
 
 
-def init_database():
+def init_database() -> None:
     """Initialize SQLite database with required tables."""
     init_database_sync(DB_PATH)
     init_timer_database_sync(TIMER_DB_PATH)
+    init_context_telemetry_database_sync(TELEMETRY_DB_PATH)
 
 
 if __name__ == "__main__":

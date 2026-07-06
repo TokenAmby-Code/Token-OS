@@ -21,6 +21,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from db_connections import connect_agents_db
 from nas_mount import ensure_command_mounts
 
 # Timezone handling
@@ -208,7 +209,7 @@ class CronEngine:
         Without this, stuck records accumulate and the FG detects false positives.
         """
         now = _now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM cron_runs WHERE status = 'running'")
             count = (await cursor.fetchone())[0]
             if count:
@@ -270,7 +271,7 @@ class CronEngine:
         or schedule truly changes; the next fresh-DB boot will pick it up.
         """
         now = _now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             for job_def in self._PERMANENT_JOBS:
                 schedule = job_def["schedule"]
                 quiet = job_def.get("quiet_hours")
@@ -316,7 +317,7 @@ class CronEngine:
 
     async def _register_all(self):
         """Register all enabled jobs with APScheduler."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM cron_jobs WHERE enabled = 1")
             jobs = await cursor.fetchall()
@@ -368,7 +369,7 @@ class CronEngine:
     async def _run_wrapper(self, job_id: str, bypass_enabled: bool = False):
         """Entry point called by APScheduler. Checks guards, then executes.
         If bypass_enabled=True, skip the disabled check (used by manual trigger)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM cron_jobs WHERE id = ?", (job_id,))
             job = await cursor.fetchone()
@@ -429,7 +430,7 @@ class CronEngine:
         window_hours = job.get("run_window_hours", 5)
         cutoff = (datetime.now() - timedelta(hours=window_hours)).isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             cursor = await db.execute(
                 """
                 SELECT COUNT(*) FROM cron_runs
@@ -480,7 +481,7 @@ class CronEngine:
         if needs_new_session:
             new_session_id = str(uuid.uuid4())
             # Store the session ID and date in the DB before spawning
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_agents_db(self.db_path) as db:
                 await db.execute(
                     "UPDATE cron_jobs SET active_session_id = ?, session_started_date = ?, updated_at = ? WHERE id = ?",
                     (new_session_id, today, _now_iso(), job["id"]),
@@ -502,7 +503,7 @@ class CronEngine:
         run_id = None
 
         # Insert running record
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             cursor = await db.execute(
                 """
                 INSERT INTO cron_runs (job_id, started_at, status, created_at)
@@ -624,7 +625,7 @@ class CronEngine:
             victory_reason = victory_match.group(1).strip() if victory_match else None
 
             try:
-                async with aiosqlite.connect(self.db_path) as db:
+                async with connect_agents_db(self.db_path) as db:
                     await db.execute(
                         """
                         UPDATE cron_runs SET
@@ -730,7 +731,7 @@ class CronEngine:
         If a previous run's instance is still alive (status != 'stopped'), skip this
         run to avoid pileup.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT COUNT(*) FROM instances ci
                    JOIN session_documents sd ON ci.session_doc_id = sd.id
@@ -748,7 +749,7 @@ class CronEngine:
     async def _log_skip(self, job_id: str, reason: str):
         """Record a skipped run."""
         now = _now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             await db.execute(
                 """
                 INSERT INTO cron_runs (job_id, started_at, finished_at, status, skip_reason, duration_seconds, created_at)
@@ -763,7 +764,7 @@ class CronEngine:
 
     async def get_jobs(self) -> list[dict]:
         """Get all cron jobs with next run time."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM cron_jobs ORDER BY name")
             jobs = [dict(row) for row in await cursor.fetchall()]
@@ -787,7 +788,7 @@ class CronEngine:
         return jobs
 
     async def get_job(self, job_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM cron_jobs WHERE id = ?", (job_id,))
             row = await cursor.fetchone()
@@ -832,7 +833,7 @@ class CronEngine:
             if not name:
                 continue
             # Find existing job by name
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_agents_db(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute("SELECT id FROM cron_jobs WHERE name = ?", (name,))
                 row = await cursor.fetchone()
@@ -868,7 +869,7 @@ class CronEngine:
             raise ValueError("Either 'command' or both 'model' and 'prompt_path' are required")
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_agents_db(self.db_path) as db:
                 await db.execute(
                     """
                     INSERT INTO cron_jobs (
@@ -981,7 +982,7 @@ class CronEngine:
         params.append(_now_iso())
         params.append(job_id)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             await db.execute(
                 f"UPDATE cron_jobs SET {', '.join(set_clauses)} WHERE id = ?",
                 params,
@@ -1009,7 +1010,7 @@ class CronEngine:
         except Exception:
             pass
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             await db.execute("DELETE FROM cron_runs WHERE job_id = ?", (job_id,))
             cursor = await db.execute("DELETE FROM cron_jobs WHERE id = ?", (job_id,))
             await db.commit()
@@ -1078,7 +1079,7 @@ class CronEngine:
         output = "\n".join(details)
 
         # Log as a dry_run in the audit trail
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             await db.execute(
                 """
                 INSERT INTO cron_runs (job_id, started_at, finished_at, status, skip_reason, duration_seconds, output_summary, created_at)
@@ -1099,7 +1100,7 @@ class CronEngine:
 
     async def get_runs(self, job_id: str, limit: int = 20) -> list[dict]:
         """Get recent run history for a job."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
@@ -1118,7 +1119,7 @@ class CronEngine:
         enabled = [j for j in jobs if j["enabled"]]
         running = [j for j in jobs if j.get("is_running")]
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM cron_runs WHERE started_at > ?",
                 ((datetime.now() - timedelta(hours=24)).isoformat(),),
@@ -1145,7 +1146,7 @@ class CronEngine:
             Dict with paused job names and count.
         """
         now = _now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             if commanders:
                 placeholders = ",".join("?" for _ in commanders)
                 cursor = await db.execute(
@@ -1202,7 +1203,7 @@ class CronEngine:
             Dict with unpaused job names and count.
         """
         now = _now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_agents_db(self.db_path) as db:
             # Check if pause state exists
             try:
                 cursor = await db.execute("SELECT job_id FROM fleet_pause_state")
