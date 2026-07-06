@@ -1506,6 +1506,16 @@ def _post_wsl_chunk(payload: dict, *, voice: str | None, rate: int = 0) -> dict:
     if result.get("success") and result.get("rendered_hash"):
         expected_hash = payload["current_chunk_hash"]
         if result["rendered_hash"] != expected_hash:
+            logger.error(
+                "TTS WSL chunk integrity mismatch: chunk_id=%s playback_id=%s "
+                "session_id=%s method=%s expected_hash=%s rendered_hash=%s",
+                chunk_id,
+                playback_id,
+                session_id,
+                result.get("method"),
+                expected_hash,
+                result.get("rendered_hash"),
+            )
             return {
                 "success": False,
                 "error": "satellite_text_integrity_check_failed",

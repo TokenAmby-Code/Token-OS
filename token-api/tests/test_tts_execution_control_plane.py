@@ -259,6 +259,35 @@ def test_wsl_chunk_dispatch_uses_satellite_speak_text_file_transport(
     assert result["results"][0]["transport"] == "wsl_sapi_text_file"
 
 
+def test_wsl_chunk_dispatch_stops_on_text_integrity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tts = _load_tts()
+    chunks = tts.build_tts_chunk_handoff("first sentence. second sentence.", max_chars=20)
+    calls = []
+
+    def fake_speak_tts_wsl(message: str, voice: str, rate: int = 0, **_kwargs):
+        calls.append(message)
+        return {
+            "success": True,
+            "method": "wsl_sapi",
+            "transport": "wsl_sapi_text_file",
+            "rendered_hash": "0" * 64,
+            "rendered_chars": len(message),
+        }
+
+    monkeypatch.setattr(tts, "speak_tts_wsl", fake_speak_tts_wsl)
+
+    result = tts.dispatch_tts_chunks_to_backend("wsl", chunks, voice="Microsoft David", rate=1)
+
+    assert result["success"] is False
+    assert result["error"] == "satellite_text_integrity_check_failed"
+    assert result["completed_chunks"] == 0
+    assert calls == ["first sentence."]
+    assert len(result["results"]) == 1
+    assert result["results"][0]["chunk_id"] == chunks[0]["chunk_id"]
+
+
 def test_phone_streaming_backfill_returns_n_plus_two_and_done() -> None:
     tts = _load_tts()
     chunks = tts.build_tts_chunk_handoff("one. two. three.", max_chars=10)
