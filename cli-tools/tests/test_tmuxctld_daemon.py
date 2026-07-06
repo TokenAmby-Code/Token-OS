@@ -1588,6 +1588,9 @@ def test_wrapperstart_stamps_wrapper_owner_and_paints_persona_tint() -> None:
         assert payload["ok"] is True
         assert payload["result"]["status"] == "stamped"
         assert payload["result"]["pane"] == "%42"
+        assert payload["result"]["ledger"]["wrapper_id"] == "wrap-7"
+        assert payload["result"]["ledger"]["pane_positional_id"] == "council:custodes"
+        assert payload["result"]["ledger"]["state"] == "OPEN"
         # (1) Daemon-authoritative wrapper-ownership stamp landed.
         assert rec.wrapper_owner == "wrap-7"
         # (2) Custodes persona tint painted from the @PANE_ID label, with NO

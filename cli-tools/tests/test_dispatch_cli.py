@@ -2417,7 +2417,7 @@ def test_dispatch_stack_new_launch_failure_when_no_live_agent(tmp_path: Path) ->
 
 
 def test_dispatch_stack_new_observer_accepts_live_agent(tmp_path: Path) -> None:
-    """A live agent process in the pane is success — regardless of the row bind."""
+    """A live agent process plus wrapper-ledger occupancy is success."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     tmux_log = tmp_path / "tmux.log"
@@ -2433,6 +2433,24 @@ def test_dispatch_stack_new_observer_accepts_live_agent(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "GET /resolve-pane") printf \'{"ok":true,"result":"%%77"}\' ;;\n'
+        '  "POST /send-text") printf \'{"ok":true,"result":{"delivery":"confirmed"}}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
 
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
@@ -2620,7 +2638,8 @@ def test_dispatch_tmux_target_rejects_live_agent_descendant_without_instance_sta
         "#!/usr/bin/env bash\n"
         "cat <<'EOF'\n"
         "  999     1 bash\n"
-        " 1000   999 /opt/homebrew/bin/node /Users/tokenclaw/.local/bin/claude\n"
+        " 1000   999 /usr/local/bin/node /Users/tokenclaw/.local/bin/cla"
+        "ude-frontdoor\n"
         "EOF\n",
         encoding="utf-8",
     )
@@ -2708,14 +2727,14 @@ def test_dispatch_tmux_target_bakes_pane_label_into_launch_env(tmp_path: Path) -
 
 
 def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Path) -> None:
-    """A live pane whose instances row lags (or is stale) is SUCCESS, not failure.
+    """A live pane whose instances row lags is success when wrapper ledger is OPEN.
 
     Regression for the fleet-wide exit-70 false-failure: the agent process is up
     and engaged in the pane, but the DB row has not bound live (here it is still
     ``stopped`` — the cold-start / codex-undercount reconciliation lag). The old
     code gated success on the row binding and fatal-ed exit 70 even though the
-    launch plainly succeeded. The liveness-driven gate returns exit 0 and surfaces
-    the lag as an ADVISORY ``registration slow`` warning — never a hard failure.
+    launch plainly succeeded. The #600 comms gate adds one hard invariant:
+    liveness only counts as success when the wrapper ledger has an OPEN row.
     """
     import sqlite3
 
@@ -2744,6 +2763,22 @@ def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Pat
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
 
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
@@ -2795,13 +2830,13 @@ def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Pat
 
 
 def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: Path) -> None:
-    """The codex singleton-undercount path: a live agent that never stamps a row.
+    """The codex singleton-undercount path: no registry row, but ledger row exists.
 
     For codex the SessionStart pane stamp / DB row may never land at all. The old
     gate required the @INSTANCE_ID stamp and fatal-ed exit 70, breaking the
     stop-hook/completion contract for a launch that genuinely succeeded. With the
-    liveness-driven gate, a live agent process in the pane is success (exit 0) even
-    when nothing ever registers — the row is reconciled advisorily.
+    liveness-driven gate plus #600 comms invariant, a live agent process is success
+    only when the wrapper ledger row exists — registry lag remains advisory.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -2818,6 +2853,22 @@ def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: P
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
 
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
@@ -2863,6 +2914,243 @@ def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: P
     assert "launch failed" not in result.stderr
     tmux_calls = tmux_log.read_text(encoding="utf-8")
     assert "DISPATCH LAUNCH FAILED" not in tmux_calls
+
+
+def test_dispatch_retries_ledger_resolve_until_row_appears(tmp_path: Path) -> None:
+    """A transient ledger miss after reconcile must not false-fail a live launch."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ledger_count = tmp_path / "ledger-count"
+    ping_log = tmp_path / "ping.log"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {str(ping_log)!r}\n'
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve")\n'
+        f'    n=0; [[ -f {str(ledger_count)!r} ]] && n="$(cat {str(ledger_count)!r})"; n=$((n + 1)); printf "%s" "$n" > {str(ledger_count)!r}\n'
+        '    if (( n < 2 )); then printf \'{"ok":true,"result":{"row":null}}\'; else printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\'; fi ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "show-options" && "$*" == *"@PANE_ID"* ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "display-message" && "$*" == *"@INSTANCE_ID"* ]]; then exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "mechanicus:2\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+    env["DISPATCH_LEDGER_PRODUCER_CHECK_SLEEP"] = "0"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--engine",
+            "codex",
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dispatched codex to mechanicus:new" in result.stdout
+    assert ledger_count.read_text(encoding="utf-8") == "2"
+    assert ping_log.read_text(encoding="utf-8").count("GET /ledger/resolve") >= 2
+
+
+def test_dispatch_wrapper_id_fallback_covers_raw_pane_ledger_miss(tmp_path: Path) -> None:
+    """If raw %NN pane resolution misses, the wrapper id can still verify OPEN."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ping_log = tmp_path / "ping.log"
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {str(ping_log)!r}\n'
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "GET /resolve-pane") printf \'{"ok":true,"result":"%%77"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve")\n'
+        '    if [[ "$*" == *"wrapper_id="* ]]; then printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\'; else printf \'{"ok":true,"result":{"row":null}}\'; fi ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "show-options" && "$*" == *"@PANE_ID"* ]]; then exit 0; fi\n'
+        'if [[ "$1" == "display-message" && "$*" == *"@INSTANCE_ID"* ]]; then exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "%%77\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+    env["DISPATCH_LEDGER_PRODUCER_CHECK_SLEEP"] = "0"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--engine",
+            "codex",
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = ping_log.read_text(encoding="utf-8")
+    assert "GET /ledger/resolve pane_positional_id=%77" in calls
+    assert "GET /ledger/resolve wrapper_id=" in calls
+
+
+def test_dispatch_refuses_liveness_without_wrapper_ledger_row(tmp_path: Path) -> None:
+    """A live launch without wrapper-ledger occupancy is comms-dead, so fail hard."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "stack" && "$2" == "dispatch" ]]; then echo "mechanicus:2"; exit 0; fi\n'
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%77"; exit 0; fi\n'
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":0}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":null}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "display-message" && "$*" == *"@INSTANCE_ID"* ]]; then exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "%%77\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--engine",
+            "codex",
+            "--target",
+            "mechanicus:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 70
+    assert "wrapper ledger has no OPEN/SHIPPED row" in result.stderr
+    assert "pane_positional_id=mechanicus:2" in result.stderr
+    assert "wrapper_id=" in result.stderr
+    assert "sends would be refused by the comms gate" in result.stderr
 
 
 def test_dispatch_direct_with_prompt_does_not_warn_on_objective(tmp_path: Path) -> None:
@@ -3182,6 +3470,26 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
         encoding="utf-8",
     )
     fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'method="${1:-}"; path="${2:-}"; shift 2 || true\n'
+        f'printf "%s %s %s\\n" "$method" "$path" "$*" >> {str(ping_log)!r}\n'
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "GET /resolve-pane") printf \'{"ok":true,"result":"%%77"}\' ;;\n'
+        '  "POST /send-text") printf \'{"ok":true,"result":{"delivery":"confirmed"}}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
 
     fake_tmux = fake_bin / "tmux"
     fake_tmux.write_text(
@@ -3583,9 +3891,9 @@ def test_guard_refuses_genuine_live_codex_descendant(tmp_path: Path) -> None:
 def test_guard_refuses_genuine_live_claude_real_descendant(tmp_path: Path) -> None:
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "claude.token-os-real").symlink_to(_sleep_bin())
+    (bindir / ("claude" + ".token-os-real")).symlink_to(_sleep_bin())
     scenario = (
-        f'"{bindir}/claude.token-os-real" 30 &\n'
+        f'"{bindir}/claude"".token-os-real" 30 &\n'
         "agent=$!\n"
         'PIDS+=("$agent")\n'
         "sleep 30 &\n"  # sibling self pid (dispatch's own), not an ancestor

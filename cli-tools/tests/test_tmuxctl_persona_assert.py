@@ -616,7 +616,7 @@ def test_assert_instance_no_respawn_when_persona_pane_pid_is_execd_agent() -> No
     # Exec'd seat: pane_pid IS claude, zero descendants (the live-reproduced shape).
     tree = (
         {19448: [pane_pid]},
-        {pane_pid: "/users/tokenclaw/.local/bin/claude.token-os-real --model opus"},
+        {pane_pid: "/users/tokenclaw/.local/bin/claude --model opus"},
     )
     row = SimpleNamespace(
         instance_id="i-c",

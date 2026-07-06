@@ -74,6 +74,9 @@ jobs:
         working-directory: token-api
         run: uv sync --python 3.11 --all-groups
 
+      - name: Wrapper sole-caller guard
+        run: python3 cli-tools/scripts/check-wrapper-sole-caller.py
+
       - name: Format check (ruff)
         run: |
           if [ -f cli-tools/pyproject.toml ]; then

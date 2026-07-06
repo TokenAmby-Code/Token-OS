@@ -416,6 +416,30 @@ def test_reconcile_prunes_prior_open_row_when_pane_is_now_a_dead_husk(tmp_path) 
     assert out["open_rows"] == 0
 
 
+def test_reconcile_scan_failure_preserves_existing_open_rows(tmp_path) -> None:
+    """A transient tmux scan failure must not rewrite the active ledger empty."""
+    ledger = WrapperLedger(path=tmp_path / "ledger.json")
+    ledger.upsert(
+        wrapper_id="w-live",
+        instance_id="i-live",
+        pane_positional_id="mechanicus:5",
+        engine="codex",
+        working_dir="/tmp",
+    )
+
+    class FailingAdapter:
+        def run(self, *args, allow_failure: bool = False) -> str:  # noqa: ARG002
+            raise RuntimeError("tmux unavailable")
+
+    with pytest.raises(RuntimeError, match="tmux unavailable"):
+        ledger.reconcile_from_tmux(FailingAdapter())
+
+    row = ledger.resolve(pane_positional_id="mechanicus:5")
+    assert row is not None
+    assert row.wrapper_id == "w-live"
+    assert row.state == "OPEN"
+
+
 # -- close-pane canonical-id resolution (#314-class stale handle) -------------
 
 

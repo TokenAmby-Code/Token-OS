@@ -293,7 +293,10 @@ class WrapperLedger:
                 "#{pane_dead}",
             ]
         )
-        raw = adapter.run("list-panes", "-a", "-F", fields, allow_failure=True)
+        # Do not collapse a tmux scan failure into "no panes": replacing the
+        # ledger on a transient tmux outage would prune every active row and
+        # create a communications blackout. Let callers catch/report the failure.
+        raw = adapter.run("list-panes", "-a", "-F", fields, allow_failure=False)
         live_rows: dict[str, WrapperLedgerRow] = {}
         for line in raw.splitlines():
             parts = line.split(_SCAN_SEP)

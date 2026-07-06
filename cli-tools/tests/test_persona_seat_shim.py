@@ -37,21 +37,20 @@ def _code_lines() -> str:
     )
 
 
-def test_shim_execs_the_engine_and_never_runs_the_blocking_close() -> None:
+def test_shim_execs_the_tracked_wrapper_front_door() -> None:
     code = _code_lines()
-    # It hands the pane to the engine via exec (the reap-stall fix).
-    assert 'exec "$ENGINE_BIN"' in code
-    # It must NOT run the heavy wrapper's blocking close-POST or its cleanup trap —
-    # those are exactly what made the pane reap slow.
+    assert 'AGENT_WRAPPER="${SCRIPT_DIR}/agent-wrapper.sh"' in code
+    assert 'exec "$AGENT_WRAPPER" codex' in code
+    assert 'exec "$AGENT_WRAPPER" claude' in code
     assert "token_wrapper_end" not in code
     assert "token_wrapper_cleanup_pane" not in code
     assert "trap " not in code
 
 
-def test_shim_reuses_the_single_staple_source() -> None:
+def test_shim_reuses_wrapper_context_but_not_staple_injection() -> None:
     body = SHIM.read_text(encoding="utf-8")
     assert "agent-wrapper-common.sh" in body
-    assert "token_wrapper_compose_system_text" in body
+    assert "token_wrapper_compose_system_text" not in body
 
 
 def test_shim_audit_ping_is_async_fire_and_forget() -> None:
@@ -61,15 +60,14 @@ def test_shim_audit_ping_is_async_fire_and_forget() -> None:
     assert "--retry-connrefused" not in body
 
 
-def test_shim_bypasses_the_front_door_wrapper() -> None:
+def test_shim_does_not_bypass_the_front_door_wrapper() -> None:
     body = SHIM.read_text(encoding="utf-8")
-    assert "TOKEN_API_AGENT_WRAPPER_BYPASS=1" in body
-    # Prefers the real engine binary, never re-enters a wrapper shim.
-    assert ".token-os-real" in body
+    assert "TOKEN_API_AGENT_WRAPPER_BYPASS" not in body
+    assert ".token-os-real" not in body
 
 
-def test_shim_stamps_runtime_options_before_exec() -> None:
+def test_shim_lets_wrapper_stamp_runtime_options() -> None:
     body = SHIM.read_text(encoding="utf-8")
     assert "tmux-runtime-cleanup.sh" in body
-    assert "tmux_runtime_stamp_wrapper" in body
-    assert body.index("tmux_runtime_stamp_wrapper") < body.index('exec "$ENGINE_BIN"')
+    assert "tmux_runtime_stamp_wrapper" not in body
+    assert body.index("AGENT_WRAPPER=") < body.index('exec "$AGENT_WRAPPER"')

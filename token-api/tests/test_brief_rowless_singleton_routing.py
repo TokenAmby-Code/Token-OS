@@ -7,6 +7,62 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_brief_surfaces_tmuxctld_refusal_verbatim(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main = app_env.main
+    target = {
+        "pane_id": "%44",
+        "position_id": "mechanicus:fabricator-general",
+        "source": "pane",
+        "spec": "mechanicus:fabricator-general",
+    }
+
+    async def _targets(**_kwargs):
+        return [target], []
+
+    async def _no_row(_pane):
+        return None
+
+    async def _resolve_live(pane):
+        return "%44" if pane == "%44" else None
+
+    async def _pane_rows():
+        return [("%44", "codex", "/tmp/project", "mechanicus", "/dev/ttys044")]
+
+    refusal = (
+        "P0_LEDGER_SNIFF_INCONGRUENCY purpose=comms_delivery "
+        "pane=mechanicus:fabricator-general ledger_occupied=false sniff_live_agent=true"
+    )
+
+    async def _send(pane, payload, *, clear_prompt=False, enable_skill_sink=False, **_kwargs):
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": refusal,
+            "operation": "tmuxctld.send_text",
+            "gated": False,
+            "verification_status": "failed",
+        }
+
+    monkeypatch.setattr(main.talk_service, "resolve_brief_targets", _targets)
+    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _no_row)
+    monkeypatch.setattr(main.shared, "resolve_tmux_pane_id", _resolve_live)
+    monkeypatch.setattr(main, "_tmux_pane_rows", _pane_rows)
+    monkeypatch.setattr(main, "_tmux_send_payload_then_submit", _send)
+
+    result = await main.brief_send(
+        main.BriefSendRequest(panes=["mechanicus:fabricator-general"], payload="probe")
+    )
+
+    assert result["status"] == "failed"
+    assert result["delivered"] == 0
+    receipt = result["resolved"][0]
+    assert receipt["status"] == main.PANE_WRITE_FAILED
+    assert receipt["reason"] == refusal
+
+
+@pytest.mark.asyncio
 async def test_brief_rowless_live_codex_singleton_uses_tmuxctl_fallback(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -217,7 +217,8 @@ def main(argv: list[str]) -> int:
                 "bytes may have issued; do not blind-retry"
             )
         else:
-            _err(f"  {label}: status={st} error={r.get('error') or ''}")
+            detail = r.get("reason") or r.get("error") or r.get("stderr") or ""
+            _err(f"  {label}: status={st} error={detail}")
     if unresolved:
         for u in unresolved:
             _err(f"  unresolved {u.get('source')}={u.get('spec')} ({u.get('reason')})")

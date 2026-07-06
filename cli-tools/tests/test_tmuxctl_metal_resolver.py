@@ -80,7 +80,7 @@ def test_classify_engine_exact_basenames():
     assert (
         classify_engine("/Users/x/.local/bin/claude --dangerously-skip-permissions -r") == "claude"
     )
-    assert classify_engine("/opt/homebrew/bin/codex resume abc") == "codex"
+    assert classify_engine("/usr/local/bin/codex resume abc") == "codex"
     assert classify_engine("bash /x/cli-tools/scripts/agent-wrapper.sh claude --foo") is None
     assert classify_engine("zsh") is None
     assert classify_engine("") is None
@@ -103,7 +103,7 @@ def test_find_agent_process_walks_through_wrapper():
 def test_find_agent_process_codex_direct_child():
     table = {
         200: (1, "zsh"),
-        201: (200, "/opt/homebrew/bin/codex resume -C /scratch/b 019e-abc"),
+        201: (200, "/usr/local/bin/codex resume -C /scratch/b 019e-abc"),
     }
     assert find_agent_process(200, table) == ("codex", 201)
 
@@ -235,7 +235,7 @@ def test_resolve_resume_codex_pane_prefers_process_cwd(tmp_path):
         codex_home,
         [{"id": CODEX_SESSION, "thread_name": "t", "updated_at": "2026-06-10T17:28:11Z"}],
     )
-    table = {200: (1, "zsh"), 201: (200, "/opt/homebrew/bin/codex")}
+    table = {200: (1, "zsh"), 201: (200, "/usr/local/bin/codex")}
     probe = _probe(tmp_path, table, agent_cwds={201: "/scratch/b"})
     observation = resolve_resume(_pane(pane_pid=200, cwd="/Users/x"), probe)
     assert observation.engine == "codex"

@@ -172,8 +172,9 @@ token_wrapper_post_tmuxctld_wrapperstart() {
   local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
   local http_code rc
   http_code=$(curl -s -o /dev/null -w '%{http_code}' \
-    --connect-timeout "${TOKEN_WRAPPER_TMUXCTLD_CONNECT_TIMEOUT:-0.20}" \
-    --max-time "${TOKEN_WRAPPER_TMUXCTLD_MAX_TIME:-0.60}" \
+    --connect-timeout "${TOKEN_WRAPPER_TMUXCTLD_CONNECT_TIMEOUT:-0.50}" \
+    --max-time "${TOKEN_WRAPPER_TMUXCTLD_MAX_TIME:-2.00}" \
+    --retry "${TOKEN_WRAPPER_TMUXCTLD_RETRY:-2}" --retry-connrefused --retry-delay 0 \
     -X POST "${tmuxctld_url%/}/hooks/wrapperstart" \
     -H "Content-Type: application/json" \
     -d "$payload" 2>/dev/null) && rc=0 || rc=$?

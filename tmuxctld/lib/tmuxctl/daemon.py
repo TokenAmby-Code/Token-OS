@@ -807,7 +807,9 @@ class DeferredSendQueue:
 
     def requeue_front(self, item: dict) -> None:
         with self._lock:
-            self._items = [dict(item)] + [it for it in self._items if it.get("id") != item.get("id")]
+            self._items = [dict(item)] + [
+                it for it in self._items if it.get("id") != item.get("id")
+            ]
             self._write_locked()
 
     def by_pane(self) -> dict[str, int]:
@@ -1003,9 +1005,7 @@ def _schedule_deferred_drain(phys_pane: str) -> None:
             with _DEFERRED_DRAIN_LOCK:
                 _DEFERRED_DRAINING.discard(phys_pane)
 
-    threading.Thread(
-        target=_worker, name=f"typing-guard-drain-{phys_pane}", daemon=True
-    ).start()
+    threading.Thread(target=_worker, name=f"typing-guard-drain-{phys_pane}", daemon=True).start()
 
 
 def _schedule_all_deferred_drains() -> None:
@@ -2067,7 +2067,9 @@ def _insert_without_submit_pipeline(
     if idempotent is not None:
         return idempotent
 
-    queue_params = dict(request_params or {"pane": pane, "text": text, "operation_id": operation_id})
+    queue_params = dict(
+        request_params or {"pane": pane, "text": text, "operation_id": operation_id}
+    )
     deferred = _defer_or_drop_typing_guard(
         route=route, params=queue_params, pane=pane, phys_pane=phys_pane
     )
@@ -2222,8 +2224,10 @@ def _send_text_pipeline(
             control,
             pane=pane,
             text=normalized_payload,
-            action=lambda: control.insert_text(phys_pane, normalized_payload)
-            or {"pane": pane, "physical_pane": phys_pane},
+            action=lambda: (
+                control.insert_text(phys_pane, normalized_payload)
+                or {"pane": pane, "physical_pane": phys_pane}
+            ),
             route=route,
             request_params=request_params,
             operation_id=operation_id,
@@ -2256,7 +2260,9 @@ def _send_text_pipeline(
     if idempotent is not None:
         return idempotent
 
-    queue_params = dict(request_params or {"pane": pane, "text": text, "operation_id": operation_id})
+    queue_params = dict(
+        request_params or {"pane": pane, "text": text, "operation_id": operation_id}
+    )
     deferred = _defer_or_drop_typing_guard(
         route=route, params=queue_params, pane=pane, phys_pane=phys_pane
     )
@@ -3219,7 +3225,9 @@ def _h_hook_wrapperstart(control, params):
         try:
             tint = assertions.apply_persona_pane_tint(control.adapter, pane, pane_label) or ""
         except Exception as exc:  # never let a tint failure break wrapper registration
-            log.warning("tmuxctld wrapperstart tint failed pane=%s label=%s: %s", pane, pane_label, exc)
+            log.warning(
+                "tmuxctld wrapperstart tint failed pane=%s label=%s: %s", pane, pane_label, exc
+            )
 
     return {
         "status": "stamped",
@@ -3616,9 +3624,7 @@ def _h_typing_guard_topology(control, params):
         # (Enter/C-m/BSpace/C-h/C-c). The same repair rides /health automatically;
         # this route lets a deploy step / operator force it on demand.
         return typing_guard_state.reconcile_pending_bindings(tmux)
-    raise ValueError(
-        "typing guard topology cmd must be rehydrate, enable, disable, or reconcile"
-    )
+    raise ValueError("typing guard topology cmd must be rehydrate, enable, disable, or reconcile")
 
 
 def _h_client_lease(control, params):
@@ -4037,7 +4043,12 @@ def _h_voice_append(control, params):
             text=segment,
             action=lambda: control.send_text(session.target_role, segment, submit=False),
             route="/send-text",
-            request_params={**params, "pane": session.target_role, "text": segment, "submit": False},
+            request_params={
+                **params,
+                "pane": session.target_role,
+                "text": segment,
+                "submit": False,
+            },
             operation_id=_s(params, "operation_id"),
             verify_timeout=_f(params, "verify_timeout", 1.0),
             effects={
@@ -4332,8 +4343,14 @@ class TmuxctldServer(ThreadingHTTPServer):
             from .wrapper_ledger import LEDGER
 
             LEDGER.load()
+            # Producer reliability backstop: wrapperstart posts are intentionally
+            # best-effort, but the wrapper's local fast-path stamp is durable in
+            # tmux pane options. On daemon restart, immediately rebuild active
+            # rows from those stamps so a missed POST does not become a comms
+            # blackout until some later manual /reconcile.
+            LEDGER.reconcile_from_tmux(self.adapter_factory())
         except Exception:
-            log.exception("tmuxctld wrapper ledger load failed")
+            log.exception("tmuxctld wrapper ledger load/reconcile failed")
         try:
             _PROMPT_SUBMIT_SNIFFER.load_callbacks()
         except Exception:
