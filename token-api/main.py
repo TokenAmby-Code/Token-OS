@@ -1640,9 +1640,7 @@ class NamingNudgeRequest(BaseModel):
 # Database helper: connect with busy_timeout to prevent indefinite blocking
 async def get_db():
     """Get a database connection with busy_timeout configured."""
-    db = await connect_agents_db(DB_PATH)
-    await db.execute("PRAGMA busy_timeout=5000")
-    return db
+    return await connect_agents_db(DB_PATH)
 
 
 TOKEN_API_HEARTBEAT_PATH = Path.home() / ".claude" / "token-api-heartbeat.json"

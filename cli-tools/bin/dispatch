@@ -2381,7 +2381,7 @@ reconcile_dispatch_registry_bind() {
   # Registration binding is control-plane truth, not an advisory. Liveness proves
   # the engine came up, but after the observation window a missing/stopped row is
   # a loud failure because downstream sends/renames depend on registry binding.
-  local pane="$1" target_display="$2" instance_id row status row_workdir row_label expected_label
+  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label expected_label
   command -v sqlite3 >/dev/null 2>&1 || return 0
   [[ -f "$DB_PATH" ]] || return 0
   instance_id="$(pane_instance_id "$pane")"
@@ -2399,7 +2399,9 @@ reconcile_dispatch_registry_bind() {
       fi
     fi
   fi
-  err "launch failed: ${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration is broken and reconciliation did not catch up"
+  if [[ "$emit_error" == "1" ]]; then
+    err "launch failed: ${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration is broken and reconciliation did not catch up"
+  fi
   return 1
 }
 
@@ -2512,7 +2514,7 @@ confirm_dispatch_launch_live() {
   # Liveness-driven launch confirmation. Success = the pane is up AND a live agent
   # process is running in it AND the registry row binds by the end of the
   # observation window. A row lag with a live pane is a control-plane failure.
-  local pane="$1" target_display="$2" timeout deadline
+  local pane="$1" target_display="$2" timeout deadline saw_live=0
   timeout="$(dispatch_launch_observe_timeout)"
   # Observer disabled (0): trust the send and return immediately. Used by the
   # bulk of the hermetic CLI tests and available as a production opt-out.
@@ -2520,9 +2522,11 @@ confirm_dispatch_launch_live() {
   deadline=$((SECONDS + timeout))
   while (( SECONDS <= deadline )); do
     if dispatch_pane_agent_live "$pane"; then
-      reconcile_dispatch_registry_bind "$pane" "$target_display" || return 1
-      ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
-      return 0
+      saw_live=1
+      if reconcile_dispatch_registry_bind "$pane" "$target_display" 0; then
+        ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
+        return 0
+      fi
     fi
     if ! dispatch_pane_exists "$pane"; then
       err "launch failed: the pane for ${ENGINE} launch to ${target_display} vanished before an agent came up; the staged command died on start"
@@ -2530,6 +2534,13 @@ confirm_dispatch_launch_live() {
     fi
     sleep 0.3
   done
+  if [[ "$saw_live" == "1" ]]; then
+    if reconcile_dispatch_registry_bind "$pane" "$target_display" 1; then
+      ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
+      return 0
+    fi
+    return 1
+  fi
   err "launch failed: no live ${ENGINE} agent appeared in the pane within ${timeout}s for ${target_display}; the pane is up but the staged command never started the agent (raise DISPATCH_LAUNCH_OBSERVE_TIMEOUT if cold start is slow)"
   return 1
 }

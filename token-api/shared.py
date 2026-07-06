@@ -26,8 +26,7 @@ from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     import aiosqlite
-from db_connections import TELEMETRY_DB_PATH as _HELPER_TELEMETRY_DB_PATH
-from db_connections import connect_agents_db, connect_agents_db_sync
+from db_connections import connect_agents_db, connect_agents_db_sync, resolve_telemetry_db_path
 
 logger = logging.getLogger("token_api")
 _LOG_EVENT_WRITE_LOCK = threading.Lock()
@@ -83,15 +82,7 @@ def _configured_telemetry_db_path() -> Path:
     that still set TOKEN_API_DB get a sibling telemetry.db so the telemetry
     split remains true without touching live state.
     """
-    value = os.environ.get("TOKEN_API_TELEMETRY_DB")
-    if value:
-        return Path(value).expanduser()
-    legacy = os.environ.get("TOKEN_API_DB")
-    if legacy:
-        legacy_path = Path(legacy).expanduser()
-        if legacy_path.resolve() != (Path.home() / ".claude" / "agents.db").resolve():
-            return legacy_path.with_name("telemetry.db")
-    return _HELPER_TELEMETRY_DB_PATH or DEFAULT_TELEMETRY_DB_PATH
+    return resolve_telemetry_db_path()
 
 
 DB_PATH = _configured_agents_db_path()
@@ -115,7 +106,6 @@ async def hook_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = await connect_agents_db(DB_PATH, timeout=5.0, isolation_level=None)
     try:
-        await db.execute("PRAGMA busy_timeout=5000")
         yield db
     finally:
         await db.close()

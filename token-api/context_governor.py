@@ -281,6 +281,9 @@ def _telemetry_signature(
 
 def _telemetry_debounced(instance_id: str, signature: tuple[Any, ...]) -> bool:
     now = asyncio.get_running_loop().time()
+    stale_cutoff = now - (TELEMETRY_DEBOUNCE_SECONDS * 4)
+    for key in [key for key, (_, ts) in _TELEMETRY_DEBOUNCE_CACHE.items() if ts < stale_cutoff]:
+        _TELEMETRY_DEBOUNCE_CACHE.pop(key, None)
     previous = _TELEMETRY_DEBOUNCE_CACHE.get(instance_id)
     if previous and previous[0] == signature and (now - previous[1]) < TELEMETRY_DEBOUNCE_SECONDS:
         return True

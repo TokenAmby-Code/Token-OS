@@ -15,7 +15,12 @@ from pathlib import Path
 import aiosqlite
 
 from cron_engine import CronEngine
-from db_connections import connect_agents_db, connect_telemetry_db, connect_timer_db
+from db_connections import (
+    connect_agents_db,
+    connect_telemetry_db,
+    connect_timer_db,
+    resolve_telemetry_db_path,
+)
 from instance_registry import (
     DEFAULT_INSTANCE_NAME,
     INSTANCE_COLUMNS,
@@ -62,15 +67,7 @@ DEFAULT_TIMER_PATH = Path(
     or _legacy_token_api_db_unless_live()
     or DEFAULT_TIMER_DB_PATH
 ).expanduser()
-DEFAULT_TELEMETRY_PATH = Path(
-    os.environ.get("TOKEN_API_TELEMETRY_DB")
-    or (
-        Path(_legacy_token_api_db_unless_live()).expanduser().with_name("telemetry.db")
-        if _legacy_token_api_db_unless_live()
-        else None
-    )
-    or DEFAULT_TELEMETRY_DB_PATH
-).expanduser()
+DEFAULT_TELEMETRY_PATH = Path(resolve_telemetry_db_path()).expanduser()
 
 
 _TIMER_SCHEMA_SQL = """

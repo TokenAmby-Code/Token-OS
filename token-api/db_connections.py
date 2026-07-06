@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import inspect
 import logging
 import os
 import sqlite3
+import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -56,20 +57,25 @@ def _split_db_path(env_name: str, filename: str) -> Path:
     return RUNTIME_DATABASE_DIR / filename
 
 
+def resolve_telemetry_db_path() -> Path:
+    """Resolve the split high-frequency telemetry store path."""
+    return _split_db_path("TOKEN_API_TELEMETRY_DB", "telemetry.db")
+
+
 AGENTS_DB_PATH = Path(
     os.environ.get("TOKEN_API_AGENTS_DB")
     or _legacy_token_api_db_unless_live()
     or RUNTIME_DATABASE_DIR / "agents.db"
 ).expanduser()
 TIMER_DB_PATH = _split_db_path("TOKEN_API_TIMER_DB", "timer.db")
-TELEMETRY_DB_PATH = _split_db_path("TOKEN_API_TELEMETRY_DB", "telemetry.db")
+TELEMETRY_DB_PATH = resolve_telemetry_db_path()
 
 _CURRENT_ENDPOINT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "token_api_sqlite_endpoint", default=None
 )
 
 
-def set_sqlite_endpoint(endpoint: str | None):
+def set_sqlite_endpoint(endpoint: str | None) -> contextvars.Token[str | None]:
     return _CURRENT_ENDPOINT.set(endpoint)
 
 
@@ -78,10 +84,10 @@ def reset_sqlite_endpoint(token) -> None:
 
 
 def _default_site() -> str:
-    frame = inspect.currentframe()
-    if not frame:
+    try:
+        frame = sys._getframe(2)
+    except ValueError:
         return "unknown"
-    frame = frame.f_back
     while frame:
         filename = frame.f_code.co_filename
         if not filename.endswith("db_connections.py"):
@@ -218,7 +224,8 @@ class _AsyncConnectionFactory:
 
 
 def connect_sqlite(db_path: Path | str, **kwargs: Any) -> _AsyncConnectionFactory:
-    kwargs.setdefault("site", _default_site())
+    if "site" not in kwargs:
+        kwargs["site"] = _default_site()
     return _AsyncConnectionFactory(db_path, **kwargs)
 
 
@@ -244,13 +251,17 @@ def connect_sqlite_sync(
     endpoint: str | None = None,
     timeout: float | None = None,
     wal: bool = True,
-):
+) -> Iterator[sqlite3.Connection]:
     path = Path(db_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     open_site = site or _default_site()
     current_endpoint = endpoint if endpoint is not None else _CURRENT_ENDPOINT.get()
-    conn = sqlite3.connect(path, timeout=timeout if timeout is not None else BUSY_TIMEOUT_SECONDS)
+    start = time.monotonic()
+    conn: sqlite3.Connection | None = None
     try:
+        conn = sqlite3.connect(
+            path, timeout=timeout if timeout is not None else BUSY_TIMEOUT_SECONDS
+        )
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys=ON")
         if wal:
@@ -263,13 +274,16 @@ def connect_sqlite_sync(
                 site=open_site,
                 endpoint=current_endpoint,
                 operation="SYNC",
-                elapsed_ms=BUSY_TIMEOUT_MS,
+                elapsed_ms=(time.monotonic() - start) * 1000.0,
                 db_path=path,
             )
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
-def connect_agents_db_sync(db_path: Path | str | None = None, **kwargs: Any):
+def connect_agents_db_sync(
+    db_path: Path | str | None = None, **kwargs: Any
+) -> contextlib.AbstractContextManager[sqlite3.Connection]:
     return connect_sqlite_sync(db_path or AGENTS_DB_PATH, **kwargs)
