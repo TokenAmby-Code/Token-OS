@@ -12,6 +12,17 @@ def _load_satellite_module():
     return module
 
 
+def test_satellite_health_reports_runtime_git_sha(monkeypatch):
+    satellite = _load_satellite_module()
+    monkeypatch.setattr(satellite, "_runtime_git_sha", lambda: "abc123")
+
+    import asyncio
+
+    payload = asyncio.run(satellite.health())
+    assert payload["git_sha"] == "abc123"
+    assert payload["runtime_path"] == str(satellite.REPO_ROOT)
+
+
 def test_satellite_tmux_send_payload_then_submit_separates_enter(monkeypatch):
     satellite = _load_satellite_module()
     calls = []

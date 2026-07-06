@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# validate-windows-ahk-startup-drift — read-only validator for Windows AHK deploy artifacts.
+# Fails loudly on cache/startup hash drift or retired NAS-runtime startup references.
+set -euo pipefail
+
+live="${TOKEN_OS_RUNTIME_CHECKOUT:-${TOKEN_OS_LIVE:-$HOME/runtimes/token-os/live}}"
+ahk_src="${TOKEN_OS_AHK_SOURCE_DIR:-$live/ahk}"
+ahk_cache="${TOKEN_OS_AHK_DIR:-/mnt/c/TokenOS/ahk}"
+windows_user="${TOKEN_OS_WINDOWS_USER:-colby}"
+user_profile="${TOKEN_OS_WINDOWS_USER_PROFILE:-/mnt/c/Users/$windows_user}"
+startup_root="${TOKEN_OS_STARTUP_ROOT:-$user_profile/Imperium-Startup}"
+check_tasks="${TOKEN_OS_VALIDATE_SCHEDULED_TASKS:-auto}"
+
+failures=0
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; failures=$((failures + 1)); }
+ok() { printf 'OK: %s\n' "$*"; }
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+compare_file() {
+  local src="$1" dst="$2" label="$3"
+  if [[ ! -f "$src" ]]; then
+    fail "$label source missing: $src"
+    return
+  fi
+  if [[ ! -f "$dst" ]]; then
+    fail "$label destination missing: $dst"
+    return
+  fi
+  local s d
+  s="$(sha256_file "$src")"
+  d="$(sha256_file "$dst")"
+  if [[ "$s" != "$d" ]]; then
+    fail "$label hash drift: $dst sha256=$d source=$s"
+  else
+    ok "$label hash matches ($d)"
+  fi
+}
+
+contains_retired_runtime_ref() {
+  local file="$1"
+  grep -E -q '(\\\\Token-NAS\\Imperium\\runtimes\\token-os\\live|//Token-NAS/Imperium/runtimes/token-os/live|/Volumes/Imperium/runtimes/token-os/live|/mnt/imperium/runtimes/token-os/live)' "$file" 2>/dev/null
+}
+
+if [[ ! -d "$ahk_src" ]]; then
+  fail "AHK source directory missing: $ahk_src"
+elif [[ ! -d "$ahk_cache" ]]; then
+  fail "Windows AHK cache missing: $ahk_cache"
+else
+  while IFS= read -r -d '' src; do
+    rel="${src#$ahk_src/}"
+    compare_file "$src" "$ahk_cache/$rel" "cache:$rel"
+  done < <(find "$ahk_src" -type f -print0 | sort -z)
+fi
+
+# Startup placement policy. script-compiler.ahk is still launched from C:\TokenOS\ahk;
+# the Imperium-Startup copy is maintained as an explicit local diagnostic/on-demand copy
+# so stale hand-copied files cannot linger silently.
+declare -a startup_pairs=(
+  "startup.ahk|$ahk_src/startup.ahk|$user_profile/startup.ahk"
+  "ahk-nas-wait.bat|$ahk_src/ahk-nas-wait.bat|$user_profile/ahk-nas-wait.bat"
+  "ring-remap.ahk|$ahk_src/ring-remap.ahk|$startup_root/ring-remap.ahk"
+  "script-compiler.ahk|$ahk_src/script-compiler.ahk|$startup_root/script-compiler.ahk"
+)
+
+for entry in "${startup_pairs[@]}"; do
+  IFS='|' read -r label src dst <<< "$entry"
+  compare_file "$src" "$dst" "startup:$label"
+done
+
+# Retired runtime path scan is deliberately narrow: startup-owned Windows artifacts only.
+declare -a scan_roots=("$user_profile/ahk-nas-wait.bat" "$user_profile/startup.ahk" "$startup_root")
+for root in "${scan_roots[@]}"; do
+  if [[ -f "$root" ]]; then
+    if contains_retired_runtime_ref "$root"; then
+      fail "retired NAS runtime reference found in $root"
+    fi
+  elif [[ -d "$root" ]]; then
+    while IFS= read -r -d '' file; do
+      if contains_retired_runtime_ref "$file"; then
+        fail "retired NAS runtime reference found in $file"
+      fi
+    done < <(find "$root" -type f \( -name '*.ahk' -o -name '*.bat' -o -name '*.ps1' -o -name '*.cmd' \) -print0 | sort -z)
+  fi
+done
+
+if [[ "$check_tasks" != "false" ]]; then
+  ps_exe="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+  if [[ -x "$ps_exe" ]]; then
+    task_out="$("$ps_exe" -NoProfile -ExecutionPolicy Bypass -Command '
+$ErrorActionPreference = "Stop"
+$names = @("ahk_boot", "ahk_init", "ahk_admin")
+foreach ($name in $names) {
+  $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+  if (-not $task) { Write-Output ("MISSING`t" + $name); continue }
+  foreach ($action in $task.Actions) {
+    Write-Output ($name + "`t" + $action.Execute + " " + $action.Arguments)
+  }
+}
+' 2>/dev/null | tr -d '\r' || true)"
+    printf '%s\n' "$task_out" | sed '/^$/d;s/^/TASK: /'
+    if printf '%s\n' "$task_out" | grep -q '^MISSING'; then
+      fail "one or more managed AHK scheduled tasks are missing"
+    fi
+    if printf '%s\n' "$task_out" | grep -E -q '(\\\\Token-NAS\\Imperium\\runtimes\\token-os\\live|//Token-NAS/Imperium/runtimes/token-os/live|/Volumes/Imperium/runtimes/token-os/live|/mnt/imperium/runtimes/token-os/live)'; then
+      fail "retired NAS runtime reference found in scheduled task action"
+    fi
+    if ! printf '%s\n' "$task_out" | grep -q $'ahk_init\t.*ahk-nas-wait.bat script-compiler'; then
+      fail "ahk_init does not run ahk-nas-wait.bat script-compiler"
+    fi
+    if ! printf '%s\n' "$task_out" | grep -q $'ahk_admin\t.*ahk-nas-wait.bat ring-remap'; then
+      fail "ahk_admin does not run ahk-nas-wait.bat ring-remap"
+    fi
+  elif [[ "$check_tasks" == "true" ]]; then
+    fail "PowerShell not available for scheduled-task validation: $ps_exe"
+  else
+    warn "PowerShell not available; skipped scheduled-task validation"
+  fi
+fi
+
+if (( failures > 0 )); then
+  printf 'Windows AHK startup drift validation failed (%d issue(s))\n' "$failures" >&2
+  exit 1
+fi
+
+ok "Windows AHK startup drift validation passed"

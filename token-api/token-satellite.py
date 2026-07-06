@@ -64,6 +64,25 @@ RUNTIME_REFRESH_HELPER = Path(
     or (Path.home() / ".local" / "bin" / "token-satellite-refresh")
 )
 
+
+def _runtime_git_sha() -> str | None:
+    """Return the checked-out satellite runtime SHA, if this file is in Git."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "-q", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = proc.stdout.strip()
+    return sha or None
+
+
 # PowerShell script for persistent TTS engine.
 # Uses SpeakAsync so the main loop stays responsive to skip/poll/pause/resume commands.
 # Also supports file-based synthesis (SetOutputToWaveFile) for replay/persistence.
@@ -1849,6 +1868,8 @@ async def health():
         "status": "ok",
         "service": "token-satellite",
         "timestamp": datetime.now().isoformat(),
+        "git_sha": _runtime_git_sha(),
+        "runtime_path": str(REPO_ROOT),
         "tts_engine": "running"
         if tts_engine._process and tts_engine._process.poll() is None
         else "stopped",
@@ -2560,12 +2581,12 @@ async def runtime_refresh(req: RuntimeRefreshRequest, request: Request):
 
 @app.post("/restart")
 async def restart_satellite(pull: bool = False) -> dict[str, object]:
-    """Exit for systemd restart, reloading code from the shared NAS checkout.
+    """Exit for systemd restart, reloading code from the WSL-local runtime.
 
-    The satellite runs from the NAS checkout (``WorkingDirectory`` ==
-    ``Path(__file__).resolve().parents[1]``), the single source of truth that the
-    Mac (token-restart / CI restart-on-merge) fast-forwards. A plain restart
-    therefore reloads new code with no pull, so ``pull`` defaults to **False**.
+    The satellite runs from the local runtime checkout (``WorkingDirectory`` ==
+    ``Path(__file__).resolve().parents[1]``). CI/CD updates that checkout through
+    the authenticated ``/runtime/refresh`` path; a plain restart reloads the
+    already-synced local code with no pull, so ``pull`` defaults to **False**.
 
     Historically this pulled ``~/Scripts`` — the dead pre-rename Token-OS
     namespace, a path that no longer exists on this host, so the pull silently
@@ -2579,8 +2600,8 @@ async def restart_satellite(pull: bool = False) -> dict[str, object]:
     result = {"pull": None, "browser_gui": "frontend_auto_reload", "restarting": True}
     _send_lifecycle_event("restart_requested", {"pull": pull})
 
-    # 1. Git pull (opt-in). Target the repo this process runs from — the shared
-    # NAS checkout — not the retired ~/Scripts namespace.
+    # 1. Git pull (opt-in). Target the repo this process runs from — the local
+    # runtime checkout — not the retired ~/Scripts namespace.
     if pull:
         try:
             proc = subprocess.run(

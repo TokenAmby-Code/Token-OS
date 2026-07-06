@@ -338,7 +338,9 @@ def test_tmuxctld_daemon_code_change_restarts_tmuxctld(tmp_path: Path) -> None:
     assert RESTART_TOKENAPI in calls
     assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
-    assert "/runtime/refresh" not in calls
+    # Every advanced merge now refreshes/verifies the WSL satellite runtime SHA,
+    # even if the changed service is Mac-local.
+    assert "/runtime/refresh" in calls
     # The daemon bounce must NOT shell out to the tmux/tmuxctl/tx fleet tooling.
     _assert_no_fleet_wipe(calls)
 
@@ -355,7 +357,7 @@ def test_tmuxctld_entrypoint_change_restarts_tmuxctld_and_verifies_token_api(
     assert RESTART_TOKENAPI in calls
     assert "deploy verified: /health git_sha=NEW111" in proc.stdout
     assert KICK_DISCORD not in calls
-    assert "/runtime/refresh" not in calls
+    assert "/runtime/refresh" in calls
     _assert_no_fleet_wipe(calls)
 
 

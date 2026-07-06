@@ -90,12 +90,13 @@ These have no triggers — invoked manually via `schtasks /Run /TN "<name>"` or 
 
 ## AHK Script Architecture
 
-Source-of-truth AHK scripts live in this repo at `Token-OS/ahk/`. The WSL runtime source is `/home/token/runtimes/token-os/live`, and `token-satellite-refresh` mirrors changed `ahk/*` files into the Windows-local cache at `C:\TokenOS\ahk` (`TOKEN_OS_AHK_DIR=/mnt/c/TokenOS/ahk`). Windows startup must read AHK entry points from that local cache, not from the NAS runtime.
+Source-of-truth AHK scripts live in this repo at `Token-OS/ahk/`. The WSL runtime source is `/home/token/runtimes/token-os/live`, and every satellite runtime refresh verifies the WSL `/health.git_sha` against the Mac deploy target. `token-satellite-refresh` mirrors the repo AHK tree into the Windows-local cache at `C:\TokenOS\ahk` (`TOKEN_OS_AHK_DIR=/mnt/c/TokenOS/ahk`) and refreshes the startup-owned copies under `%USERPROFILE%` / `%USERPROFILE%\Imperium-Startup`. Windows startup must read AHK entry points from local Windows/WSL storage, not from the retired NAS runtime.
 
 `Setup-StartupTasks.ps1` still copies the boot-critical launcher files into `%USERPROFILE%` / `%USERPROFILE%\Imperium-Startup` for Task Scheduler compatibility. `ahk-nas-wait.bat` keeps its historical name, but its default resolution is now local-cache-first:
 
 - Bare script names such as `script-compiler` resolve to `C:\TokenOS\ahk\<script>.ahk`.
 - `ring-remap` uses `%USERPROFILE%\Imperium-Startup\ring-remap.ahk` when that local elevated-task copy exists, otherwise it falls back to the local cache.
+- `script-compiler.ahk` is launched from `C:\TokenOS\ahk`; the `Imperium-Startup\script-compiler.ahk` copy is maintained only as an explicit diagnostic/on-demand copy so manual placement cannot drift silently.
 - Explicit drive-letter paths and UNC paths are used as-is.
 - NAS-relative paths such as `Civic\foo.ahk` remain supported for intentional manual use, but the NAS runtime must not be a Windows startup dependency.
 
@@ -108,6 +109,7 @@ script-compiler.ahk          <- ahk_init task (main entry point)
   #Include hotkeys.ahk           Global hotkeys
 
 ring-remap.ahk               <- ahk_admin task (standalone, needs admin)
+Imperium-Startup\script-compiler.ahk <- maintained diagnostic/on-demand copy; not ahk_init's launch path
 startup-launcher.ahk          <- historical standalone startup hotkeys (folded into startup.ahk)
 monitor-launcher.ahk          <- historical standalone monitor launcher (folded into startup.ahk)
 ```
@@ -200,6 +202,8 @@ Follow-ups:
 - WSL runtime: `/home/token/runtimes/token-os/live`.
 - Windows AHK startup cache: `C:\TokenOS\ahk`.
 - WSL view of that cache: `/mnt/c/TokenOS/ahk`.
+- `%USERPROFILE%\startup.ahk`, `%USERPROFILE%\ahk-nas-wait.bat`, and `%USERPROFILE%\Imperium-Startup\{ring-remap.ahk,script-compiler.ahk}` are deploy-refreshed startup artifacts.
+- `token-api/scripts/validate-windows-ahk-startup-drift` is the read-only drift validator. It fails on cache/startup hash drift, scheduled-task drift, or retired NAS runtime references; it does not self-heal.
 - The retired NAS runtime mount is not a startup dependency and must not be used by Windows logon tasks or AHK hotkeys that recover local WSL services.
 
 ## Restart Test Preflight
