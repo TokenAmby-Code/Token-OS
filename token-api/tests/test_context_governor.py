@@ -75,6 +75,10 @@ def _patch_panes(monkeypatch, shared, mapping: dict[str, str]):
     monkeypatch.setattr(shared, "instance_id_for_pane", instance_id_for_pane)
 
 
+def _telemetry_db_path(app_env):
+    return app_env.shared.TELEMETRY_DB_PATH
+
+
 def test_soft_threshold_arms_one_shot_stop_subscription_without_clobbering_existing(
     app_env, monkeypatch
 ):
@@ -239,6 +243,31 @@ def test_interactive_custodes_and_human_anchored_sessions_are_telemetry_only(app
     assert r2["scoped"] is False and r2["action"] == "telemetry_only"
 
 
+def test_context_telemetry_only_repeats_are_debounced(app_env, monkeypatch):
+    cg = sys.modules["context_governor"]
+    shared = sys.modules["shared"]
+    _insert_instance(app_env.db_path, "worker-telemetry-debounce", automated=1)
+    _patch_panes(monkeypatch, shared, {"worker-telemetry-debounce": "%114"})
+    req = cg.ContextTelemetryRequest(
+        instance_id="worker-telemetry-debounce",
+        pane="%114",
+        used_tokens=10_000,
+        context_window_tokens=200_000,
+    )
+
+    first = asyncio.run(cg.ingest_context_telemetry(req))
+    second = asyncio.run(cg.ingest_context_telemetry(req))
+
+    assert first["action"] == "telemetry_only"
+    assert second["action"] == "telemetry_debounced"
+    conn = sqlite3.connect(_telemetry_db_path(app_env))
+    count = conn.execute(
+        "SELECT COUNT(*) FROM context_governor_audit WHERE instance_id = 'worker-telemetry-debounce'"
+    ).fetchone()[0]
+    conn.close()
+    assert count == 1
+
+
 def test_no_progress_sweep_marks_exhausted_and_routes_tmuxctld_stop(app_env, monkeypatch):
     cg = sys.modules["context_governor"]
     shared = sys.modules["shared"]
@@ -273,7 +302,7 @@ def test_no_progress_sweep_marks_exhausted_and_routes_tmuxctld_stop(app_env, mon
     assert sweep["exhausted_count"] == 1
     assert stops and stops[0]["instance_id"] == "worker-stale"
 
-    conn = sqlite3.connect(app_env.db_path)
+    conn = sqlite3.connect(_telemetry_db_path(app_env))
     row = conn.execute(
         "SELECT policy_state, stage FROM context_governor_state WHERE instance_id = 'worker-stale'"
     ).fetchone()
@@ -330,7 +359,7 @@ def test_no_progress_sweep_ignores_historical_progress_before_injection(app_env,
     monkeypatch.setattr(cg, "_tmuxctld_context_governor_stop", fake_stop)
 
     asyncio.run(cg.record_context_governor_progress("worker-old-progress", "previous_compaction"))
-    conn = sqlite3.connect(app_env.db_path)
+    conn = sqlite3.connect(_telemetry_db_path(app_env))
     conn.execute(
         "UPDATE context_governor_state SET last_progress_at = '2000-01-01T00:00:00' "
         "WHERE instance_id = 'worker-old-progress'"

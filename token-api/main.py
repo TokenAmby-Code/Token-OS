@@ -108,7 +108,16 @@ from dailynote_callout import (
     CalloutError,
     apply_callout,
 )
-from db_schema import init_database_async, init_timer_database_async
+from db_connections import (
+    connect_agents_db,
+    connect_timer_db,
+    reset_sqlite_endpoint,
+    set_sqlite_endpoint,
+)
+from db_schema import (
+    init_database_async,
+    init_timer_database_async,
+)
 from instance_lifecycle import apply_instance_lifecycle
 from instance_mutation import (
     RECONCILIATION_SUSPICIOUS,
@@ -1629,7 +1638,7 @@ class NamingNudgeRequest(BaseModel):
 # Database helper: connect with busy_timeout to prevent indefinite blocking
 async def get_db():
     """Get a database connection with busy_timeout configured."""
-    db = await aiosqlite.connect(DB_PATH)
+    db = await connect_agents_db(DB_PATH)
     await db.execute("PRAGMA busy_timeout=5000")
     return db
 
@@ -1683,7 +1692,7 @@ def parse_interval_schedule(schedule: str) -> dict:
 async def acquire_task_lock(task_id: str) -> bool:
     """Try to acquire a lock for a task. Returns True if lock acquired."""
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         try:
             await db.execute(
                 "INSERT INTO task_locks (task_id, locked_at, locked_by) VALUES (?, ?, ?)",
@@ -1712,7 +1721,7 @@ async def acquire_task_lock(task_id: str) -> bool:
 
 async def release_task_lock(task_id: str):
     """Release a task lock."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await db.execute("DELETE FROM task_locks WHERE task_id = ?", (task_id,))
         await db.commit()
 
@@ -1720,7 +1729,7 @@ async def release_task_lock(task_id: str):
 async def log_task_start(task_id: str) -> int:
     """Log task execution start and return execution_id."""
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO task_executions (task_id, status, started_at)
                VALUES (?, 'running', ?)""",
@@ -1733,7 +1742,7 @@ async def log_task_start(task_id: str) -> int:
 async def log_task_complete(execution_id: int, duration_ms: int, result: dict):
     """Log successful task completion."""
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await db.execute(
             """UPDATE task_executions
                SET status = 'completed', completed_at = ?, duration_ms = ?, result = ?
@@ -1746,7 +1755,7 @@ async def log_task_complete(execution_id: int, duration_ms: int, result: dict):
 async def log_task_failed(execution_id: int, error: str):
     """Log task failure."""
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await db.execute(
             """UPDATE task_executions
                SET status = 'failed', completed_at = ?, result = ?
@@ -1911,7 +1920,7 @@ async def cleanup_stale_instances() -> dict:
     cutoff = (datetime.now() - timedelta(hours=3)).isoformat()
     live_ids = await _live_agent_instance_ids()
     protected = 0
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """SELECT id
                FROM instances
@@ -1990,7 +1999,7 @@ async def reconcile_live_panes() -> dict:
     reactivated = 0
     unmatched = 0
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         tint_repaints: list[tuple[str, str]] = []
         for pane in panes:
@@ -2046,7 +2055,7 @@ async def reconcile_live_panes() -> dict:
 async def purge_old_events() -> dict:
     """Delete events older than 30 days."""
     cutoff = (datetime.now() - timedelta(days=30)).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("DELETE FROM events WHERE created_at < ?", (cutoff,))
         deleted = cursor.rowcount
         await db.commit()
@@ -2107,7 +2116,7 @@ async def execute_task(task_id: str):
 
 async def load_tasks_from_db():
     """Load enabled tasks from database and register with scheduler."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, task_type, schedule FROM scheduled_tasks WHERE enabled = 1"
@@ -2234,7 +2243,7 @@ def restore_restart_state() -> None:
 
 async def run_overdue_tasks():
     """Check for tasks that haven't run recently and execute them on startup."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         # Get all enabled tasks
@@ -2343,6 +2352,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     migrate_runtime_databases_if_needed()
     await init_database_async(DB_PATH)
     await init_timer_database_async(TIMER_DB_PATH)
+    await init_context_telemetry_database_async(TELEMETRY_DB_PATH)
     await load_tasks_from_db()
     timer_load_from_db()
     load_zap_count_from_daily_note()
@@ -2537,6 +2547,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def sqlite_endpoint_context_middleware(request: Request, call_next):
+    token = set_sqlite_endpoint(f"{request.method} {request.url.path}")
+    try:
+        return await call_next(request)
+    finally:
+        reset_sqlite_endpoint(token)
+
+
 # Slaanesh scheduling routes (Black Ships booking portal)
 app.include_router(schedule_router)
 app.include_router(tts_router)
@@ -2659,7 +2679,7 @@ async def _maybe_naming_nudge(instance_id: str | None) -> dict:
     if not instance_id:
         return {"success": False, "action": "missing_instance_id"}
 
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -2806,7 +2826,7 @@ async def register_instance(request: InstanceRegisterRequest):
     if not device_id:
         device_id = "Mac-Mini"  # Default for local sessions on Mac Mini
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         # Idempotent re-register: a known id is the same instance checking in
@@ -2889,7 +2909,7 @@ async def register_instance(request: InstanceRegisterRequest):
     )
 
     # Push updated instance count to phone widget
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
         )
@@ -2915,7 +2935,7 @@ async def delete_all_instances():
     """Delete all instances from the database (clear all)."""
     now = datetime.now().isoformat()
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         # Get all instances before deleting
         cursor = await db.execute("SELECT id, device_id, status FROM instances")
         all_instances = await cursor.fetchall()
@@ -2957,7 +2977,7 @@ async def stop_instance(instance_id: str):
     """Mark an instance as stopped."""
     logger.info(f"Stopping instance: {instance_id[:12]}...")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         lifecycle_result = await apply_instance_lifecycle(
             db,
             instance_id,
@@ -3075,7 +3095,7 @@ async def kill_instance(instance_id: str):
     now = datetime.now().isoformat()
 
     # Look up instance
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT i.*, i.name AS tab_name FROM instances i WHERE i.id = ?",
@@ -3100,7 +3120,7 @@ async def kill_instance(instance_id: str):
                 logger.info(f"Kill: discovered PID {pid} via /proc scan for {working_dir}")
             else:
                 # Mark stopped in DB anyway (cleanup)
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with connect_agents_db(DB_PATH) as db:
                     await update_instance(
                         db,
                         instance_id=instance_id,
@@ -3126,7 +3146,7 @@ async def kill_instance(instance_id: str):
                 )
         else:
             # Can't scan /proc on remote device
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 await update_instance(
                     db,
                     instance_id=instance_id,
@@ -3156,7 +3176,7 @@ async def kill_instance(instance_id: str):
         # Validate PID still belongs to claude
         if not is_pid_claude(pid):
             # Process already exited or PID reused by another process
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 await update_instance(
                     db,
                     instance_id=instance_id,
@@ -3185,7 +3205,7 @@ async def kill_instance(instance_id: str):
             logger.info(f"Kill: sent first SIGINT to PID {pid}")
         except ProcessLookupError:
             # Already dead
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 await update_instance(
                     db,
                     instance_id=instance_id,
@@ -3283,7 +3303,7 @@ async def kill_instance(instance_id: str):
             raise HTTPException(status_code=500, detail=f"SSH kill failed: {str(e)}")
 
     # Mark stopped in DB
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await update_instance(
             db,
             instance_id=instance_id,
@@ -3324,7 +3344,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
     logger.info(f"Unstick request for instance: {instance_id[:12]}...")
 
     # Look up instance
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
@@ -3415,7 +3435,7 @@ async def unstick_instance(instance_id: str, level: int = 1):
     # Wait and check for activity change
     await asyncio.sleep(4)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT last_activity FROM instances WHERE id = ?", (instance_id,)
@@ -3596,7 +3616,7 @@ async def diagnose_instance(instance_id: str):
     what syscall it's waiting on, child processes, file descriptors, etc.
     """
     # Look up instance
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
@@ -3762,7 +3782,7 @@ async def rename_instance(instance_id: str, request: RenameInstanceRequest):
         )
     request.name = clean
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, name AS tab_name, session_doc_id, session_doc_policy FROM instances WHERE id = ?",
             (instance_id,),
@@ -3825,7 +3845,7 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
     if not pane_instance_id:
         raise HTTPException(status_code=404, detail="No active instance found for tmux pane")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT id, name AS tab_name
@@ -3886,7 +3906,7 @@ async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
     Prevents concurrent tmux send-keys from interleaving in the PTY buffer.
     Uses atomic UPDATE with WHERE to ensure only one caller wins.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
@@ -3911,7 +3931,7 @@ async def acquire_input_lock(instance_id: str, locker: str = "claude-cmd"):
 @app.delete("/api/instances/{instance_id}/input-lock")
 async def release_input_lock(instance_id: str, locker: str = "claude-cmd"):
     """Release input lock for an instance's tmux pane."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT input_lock FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
@@ -3961,7 +3981,7 @@ async def update_instance_activity(instance_id: str, request: ActivityRequest):
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {request.action}")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT i.*,
@@ -4041,7 +4061,7 @@ async def set_instance_status(
     if status not in ("stopped", "archived"):
         updates["stopped_at"] = None
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
@@ -4292,7 +4312,7 @@ async def _golden_throne_mark_quiet_edge_handled(
     }
     if extra_updates:
         updates.update(extra_updates)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await update_instance(
             db,
             instance_id=instance_id,
@@ -4348,7 +4368,7 @@ async def record_golden_throne_resume(instance: dict) -> dict:
         "gt_resume_window_started_at": window_started.isoformat(),
         "gt_last_resume_at": now.isoformat(),
     }
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await update_instance(
             db,
             instance_id=session_id,
@@ -4437,7 +4457,7 @@ async def golden_throne_user_activity(instance_id: str, source: str = "prompt_su
         pass
     await _gt_clear_fire(instance_id)
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await update_instance(
             db,
             instance_id=instance_id,
@@ -4482,7 +4502,7 @@ async def _load_instance_session_doc(instance: dict) -> dict:
     doc_id = instance.get("session_doc_id")
     if not doc_id:
         return {}
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, file_path, status FROM session_documents WHERE id = ?",
             (doc_id,),
@@ -4569,7 +4589,7 @@ async def clear_invalid_golden_throne_binding(
     await _gt_clear_fire(instance_id)
     now = datetime.now().isoformat()
     deleted_rows = 0
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if previous_marker is None:
             cursor = await db.execute(
@@ -5022,7 +5042,7 @@ async def _coderabbit_sync_once(instance_id: str) -> dict:
     doc, coderabbit_passed already true, doc acknowledged, or PR merged/closed.
     A missing pr_url or a soft fetch error keeps the job armed and no-ops the round.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
@@ -5106,7 +5126,7 @@ async def _coderabbit_sync_once(instance_id: str) -> dict:
 
 async def _arm_coderabbit_sync_for_doc(doc_id: int) -> list[str]:
     """Arm the CodeRabbit poller for local, live instances linked to a doc."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, device_id FROM instances "
@@ -5130,7 +5150,7 @@ async def recover_coderabbit_sync_jobs() -> list[str]:
     pr_opened set and coderabbit_passed not yet true / not acknowledged.
     """
     armed: list[str] = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -5773,7 +5793,7 @@ async def _flag_hook_driven(
     if not (instance_id or "").strip() and not (tmux_pane or "").strip():
         return
     try:
-        async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+        async with connect_agents_db(DB_PATH, timeout=5.0) as db:
             db.row_factory = aiosqlite.Row
             target_id: str | None = None
             if (instance_id or "").strip():
@@ -5831,7 +5851,7 @@ async def enqueue_pane_write(
         raise ValueError("pane write requires a concrete tmux pane target")
     queue_id = operation_id or str(uuid.uuid4())
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         try:
             await db.execute(
@@ -5930,7 +5950,7 @@ async def cancel_pending_pane_writes(
         clauses.append("purpose = ?")
         params.append(purpose)
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             f"""
             UPDATE pane_write_queue
@@ -5960,7 +5980,7 @@ async def _mark_pane_write(
 ) -> None:
     now = datetime.now().isoformat()
     sent_at = now if status == PANE_WRITE_SENT else None
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await db.execute(
             """
             UPDATE pane_write_queue
@@ -6004,7 +6024,7 @@ async def _tmux_send_payload_then_submit(
 
 
 async def _pane_write_instance_engine(instance_id: str) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT engine FROM instances WHERE id = ?",
             (instance_id,),
@@ -6017,7 +6037,7 @@ async def process_pane_write_queue_once(
     queue_id: str | None = None, *, limit: int = 10
 ) -> list[dict]:
     """Drain pending automated pane writes that are safe to deliver."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if queue_id:
             cursor = await db.execute(
@@ -6565,7 +6585,7 @@ async def compute_work_state() -> WorkStateResponse:
         p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]
     }
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -7017,7 +7037,7 @@ async def recover_expected_ack_jobs() -> int:
     """Re-arm pending acknowledgement ladders after a Token-API restart."""
     now = datetime.now()
     immediate = now + timedelta(seconds=1)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM expected_acknowledgements WHERE status = 'pending'"
@@ -7058,7 +7078,7 @@ async def create_expected_ack(
     pavlok_delay: timedelta = EXPECTED_ACK_DEFAULT_PAVLOK_DELAY,
 ) -> dict:
     """Persist an expected acknowledgement and schedule its escalation ladder."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if dedupe_pending and instance_id:
             cursor = await db.execute(
@@ -7165,7 +7185,7 @@ def _expected_ack_row_to_dict(row) -> dict:
 
 
 async def _update_expected_ack_details(ack_id: str, details: dict) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await db.execute(
             """
             UPDATE expected_acknowledgements
@@ -7180,7 +7200,7 @@ async def _update_expected_ack_details(ack_id: str, details: dict) -> None:
 async def _find_expected_ack(
     ack_id: str | None, source: str | None, instance_id: str | None
 ) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if ack_id:
             cursor = await db.execute(
@@ -7203,7 +7223,7 @@ async def _find_expected_ack(
 
 async def _has_pending_acks() -> bool:
     """True if any enforcement sequence is currently pending."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT 1 FROM expected_acknowledgements WHERE status = 'pending' LIMIT 1"
         )
@@ -7226,7 +7246,7 @@ async def _resolve_expected_ack(
         return {"updated": False, "ack": ack}
 
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         if status == "acknowledged":
             await db.execute(
                 """
@@ -7262,7 +7282,7 @@ async def _resolve_expected_ack(
 async def acknowledge_pending_acks_for_instance(
     instance_id: str, source: str | None = None, resolved_by: str | None = None
 ) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if source:
             cursor = await db.execute(
@@ -7298,7 +7318,7 @@ async def acknowledge_pending_acks_for_instance(
 
 async def acknowledge_pending_work_action_acks(resolved_by: str | None = None) -> int:
     placeholders = ", ".join("?" for _ in WORK_SIGNAL_SATISFY_SOURCES)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""
@@ -7325,7 +7345,7 @@ async def acknowledge_pending_work_action_acks(resolved_by: str | None = None) -
 
 
 async def acknowledge_backlog_surface_acks(surface: str, resolved_by: str | None = None) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -7489,7 +7509,7 @@ async def _terminal_backlog_ack_for_active_span(
     except Exception:
         return None
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -7519,7 +7539,7 @@ async def _terminal_backlog_ack_for_active_span(
 
 
 async def _mark_expected_ack_level_fired(ack: dict, level: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute(
@@ -7679,7 +7699,7 @@ async def _expected_ack_escalate(ack_id: str, level: int) -> dict:
             True,
         )
         status = "blocked_by_guardrail" if pavlok_result.get("blocked_by_guardrail") else "expired"
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             await db.execute(
                 "UPDATE expected_acknowledgements SET status = ? WHERE id = ? AND status = 'pending'",
                 (status, ack_id),
@@ -8338,7 +8358,7 @@ async def _golden_throne_handle_instance_gone(session_id: str, engine: str) -> N
     stops re-firing at a vanished pane.
     """
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await update_instance(
             db,
             instance_id=session_id,
@@ -8403,7 +8423,7 @@ async def _resolve_remote_instance_pane(
 
 async def golden_throne_followup(session_id: str):
     """APScheduler callback: wake up an idle Claude instance with SOP prompt."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT i.*, i.name AS tab_name,
@@ -8572,7 +8592,7 @@ async def golden_throne_followup(session_id: str):
     dispatch_fingerprint = await asyncio.to_thread(worktree_fingerprint, working_dir)
     if dispatch_fingerprint:
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 await update_instance(
                     db,
                     instance_id=session_id,
@@ -9003,7 +9023,7 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
     Reuses golden throne satellite infra but fires immediately instead of on a timer.
     Cancels any pending golden throne timer for this instance.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         instance = await cursor.fetchone()
@@ -9169,7 +9189,7 @@ async def _custodes_state_snapshot() -> dict:
     active_threads_count = 0
     active_threads_names: list[str] = []
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM events "
                 "WHERE created_at > date('now', 'start of day') "
@@ -9246,7 +9266,7 @@ async def _custodes_state_dedupe_decision(dedupe_key: str, severity: int) -> tup
         if severity <= cached.get("severity", 1):
             return True, "memory_debounce"
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """SELECT details
                FROM events
@@ -9392,7 +9412,7 @@ async def _cascade_instance_status(instance_id: str | None) -> str | None:
     if not instance_id:
         return None
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             row = await (
                 await db.execute("SELECT status FROM instances WHERE id = ?", (instance_id,))
@@ -9884,7 +9904,7 @@ async def _dispatch_custodes_intervention(
         canceled = await cancel_check("pre_dispatch_lookup")
         if canceled:
             return canceled
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         row = await resolve_live_persona_instance(db, "custodes")
 
     # The tmux marker is the pane source of truth — instances carries no pane.
@@ -10035,7 +10055,7 @@ async def _resolve_administratum_instance() -> dict | None:
     the registry fault remains visible via persona_unregistered_live_runtime.
     """
     rows: list[dict] = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT i.id, i.device_id
@@ -10919,7 +10939,7 @@ async def set_zealotry(instance_id: str, request: Request):
     if not isinstance(zealotry, int) or zealotry < 1 or zealotry > 10:
         raise HTTPException(status_code=400, detail="zealotry must be integer 1-10")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -10971,7 +10991,7 @@ async def set_instance_persona(instance_id: str, request: Request):
     if not persona_slug:
         raise HTTPException(status_code=400, detail="persona_slug is required")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
@@ -10992,12 +11012,12 @@ async def set_instance_persona(instance_id: str, request: Request):
 
     pane_id, _pane_role = await shared.resolve_instance_pane(instance_id)
     if pane_id:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             await shared.apply_instance_pane_tint(db, instance_id, pane_id, source="set-persona")
             await shared.push_agnostic_pane_vars(db, instance_id)
             await db.commit()
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             await shared.push_agnostic_pane_vars(db, instance_id)
             await db.commit()
 
@@ -11060,7 +11080,7 @@ async def set_instance_pr(instance_id: str, request: Request):
     if not updates:
         raise HTTPException(status_code=400, detail="no pr fields provided (pr_url, pr_state)")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         row = await cursor.fetchone()
         if not row:
@@ -11086,7 +11106,7 @@ async def set_instance_discord(instance_id: str, request: Request):
     discord_hosted = body.get("discord_hosted")
     discord_channel = body.get("discord_channel")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -11139,7 +11159,7 @@ async def get_synced_session(legion: str) -> dict:
         )
 
     if legion == "custodes":
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             row = await resolve_live_persona_instance(db, "custodes")
         if not row:
             return {"legion": legion, "synced_session": None}
@@ -11159,7 +11179,7 @@ async def get_synced_session(legion: str) -> dict:
             },
         }
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT i.id, i.name AS tab_name, i.device_id,
@@ -11565,7 +11585,7 @@ async def _execute_victory_cascade_plan(plan: dict) -> list[dict]:
 @app.get("/api/instances/{instance_id}/zealotry")
 async def get_zealotry(instance_id: str):
     """Get zealotry level and timer status for an instance."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT zealotry, victory_at, victory_reason FROM instances WHERE id = ?",
@@ -11611,7 +11631,7 @@ async def _victory_ack_core(
     if dry_run is None:
         dry_run = bool(cascade)
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, file_path, title, status FROM session_documents WHERE id = ?",
@@ -11848,7 +11868,7 @@ async def session_doc_rubric_flip(doc_id: int, request: Request):
     if not isinstance(extra, dict):
         raise HTTPException(status_code=400, detail="extra must be an object")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
         row = await cursor.fetchone()
     if not row or not row[0]:
@@ -11917,7 +11937,7 @@ async def session_doc_worktrees(doc_id: int, request: Request):
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
         row = await cursor.fetchone()
     if not row or not row[0]:
@@ -12023,7 +12043,7 @@ async def declare_victory(instance_id: str, request: Request):
         raise HTTPException(status_code=400, detail="reason is required")
     deliverables = body.get("deliverables", []) or []
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, name AS tab_name, session_doc_id FROM instances WHERE id = ?",
@@ -12049,7 +12069,7 @@ async def declare_victory(instance_id: str, request: Request):
 
     # No linked doc — legacy bare-instance path.
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await update_instance(
             db,
             instance_id=instance_id,
@@ -12137,7 +12157,7 @@ async def set_instance_golden_throne(instance_id: str, request: Request):
     if mode not in {"off", "sync", "follow_up"}:
         raise HTTPException(status_code=400, detail="mode must be off|sync|follow_up")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM instances WHERE id = ?", (instance_id,))
         instance = await cursor.fetchone()
@@ -12255,7 +12275,7 @@ async def set_instance_type(instance_id: str, request: Request):
 @app.patch("/api/instances/{instance_id}/retire")
 async def retire_instance(instance_id: str):
     """Retire an instance row without archiving its session document."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         result = await apply_instance_lifecycle(
             db,
             instance_id,
@@ -12272,7 +12292,7 @@ async def retire_instance(instance_id: str):
 @app.patch("/api/instances/{instance_id}/archive-session-doc")
 async def archive_instance_session_doc(instance_id: str):
     """Archive the session document attached to an instance, and retire the instance."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         result = await apply_instance_lifecycle(
             db,
             instance_id,
@@ -12303,7 +12323,7 @@ async def archive_instance_session_doc(instance_id: str):
 @app.patch("/api/instances/{instance_id}/banish")
 async def banish_instance(instance_id: str):
     """Close an instance without retiring/archiving; chapter children move to Black Shields."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         result = await apply_instance_lifecycle(
             db,
             instance_id,
@@ -12325,7 +12345,7 @@ async def banish_instance(instance_id: str):
 @app.patch("/api/instances/{instance_id}/archive")
 async def archive_instance(instance_id: str):
     """Archive an instance — manual user action only."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -12354,7 +12374,7 @@ async def archive_instance(instance_id: str):
 @app.patch("/api/instances/{instance_id}/unarchive")
 async def unarchive_instance(instance_id: str):
     """Unarchive an instance — returns to one_off."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT id FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -12556,7 +12576,7 @@ async def list_instances(
         if cache_hit and now_mono - cache_hit[0] <= _INSTANCES_READ_CACHE_TTL_SECONDS:
             return cache_hit[1]
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             base_sql = """
                 SELECT i.*,
@@ -12636,7 +12656,7 @@ async def resolve_instance(
     Returns instance + session doc info in a single call.
     Resolution order: wrapper_id → CWD match (prefer processing over idle).
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         instance = None
 
@@ -12716,7 +12736,7 @@ async def resolve_instance(
 @app.get("/api/instances/{instance_id}", response_model=dict)
 async def get_instance(instance_id: str):
     """Get details of a specific instance."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT i.*,
@@ -12746,7 +12766,7 @@ async def get_instance_workflow_events(instance_id: str, limit: int = 20):
     """Return recent workflow events for a specific instance."""
     limit = max(1, min(limit, 100))
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT 1 FROM instances WHERE id = ?",
@@ -12778,7 +12798,7 @@ async def get_instance_workflow_events(instance_id: str, limit: int = 20):
 async def get_instance_provenance(instance_id: str, limit: int = 20):
     """Return recent sanctioned mutation history for a specific instance."""
     limit = max(1, min(limit, 100))
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM instances WHERE id = ?", (instance_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -12796,7 +12816,7 @@ async def get_instance_provenance(instance_id: str, limit: int = 20):
 @app.get("/api/instances/{instance_id}/reconciliation", response_model=dict)
 async def get_instance_reconciliation(instance_id: str):
     """Return reconciliation status for one instance against sanctioned writes and pane projection."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         result = await reconcile_instance(db, instance_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Instance not found")
@@ -12822,7 +12842,7 @@ async def list_instance_reconciliation(limit: int = 50, suspicious_only: bool = 
     """Return recent reconciliation findings across instances."""
     limit = max(1, min(limit, 200))
     results = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT id
@@ -12886,7 +12906,7 @@ async def pane_session_doc(tmux_pane: str):
     instance_id = await shared.instance_id_for_pane(tmux_pane)
     if not instance_id:
         raise HTTPException(404, f"No instance for pane {tmux_pane}")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT ci.id AS instance_id, sd.id AS doc_id, sd.file_path,
@@ -12924,7 +12944,7 @@ async def pane_instance(tmux_pane: str):
     instance_id = await shared.instance_id_for_pane(tmux_pane)
     if not instance_id:
         raise HTTPException(404, f"No active instance for pane {tmux_pane}")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT *
@@ -12973,7 +12993,7 @@ async def orchestrator_pane_truth() -> list[dict]:
         live_filter = f" OR ci.id IN ({','.join('?' for _ in live_instance_ids)})"
         params.extend(live_instance_ids)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""SELECT ci.id AS instance_id, ci.name AS tab_name,
@@ -13186,7 +13206,7 @@ async def _pane_sender_is_custodes(caller_pane: str | None) -> bool:
         caller_instance_id = await shared.instance_id_for_pane(caller_pane)
         if not caller_instance_id:
             return False
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT COALESCE(p.slug, 'astartes') AS legion
@@ -13649,7 +13669,7 @@ async def orchestrator_temp_message(request: TempMessageRequest):
 @app.get("/api/dashboard", response_model=DashboardResponse)
 async def get_dashboard():
     """Get dashboard data including instances, productivity status, and events."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute(
@@ -13948,7 +13968,7 @@ async def trigger_checkin(checkin_type: str) -> dict:
     prompted_at = datetime.now().isoformat()
 
     # Log the prompt in the database
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await db.execute(
             """
             INSERT OR IGNORE INTO checkins (checkin_type, date, prompted_at)
@@ -14588,7 +14608,7 @@ async def acknowledge_phone_acks(app_name: str) -> int:
 
 async def recover_recent_phone_distraction_state() -> bool:
     """Restore an open phone distraction after restart when no close event followed it."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -14620,7 +14640,7 @@ async def recover_recent_phone_distraction_state() -> bool:
         )
         if not candidate_app or not candidate_mode:
             continue
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             close_cursor = await db.execute(
                 """
                 SELECT 1
@@ -17830,7 +17850,7 @@ async def get_timer_shifts():
         reset_today -= timedelta(days=1)
     cutoff = reset_today.isoformat()
 
-    async with aiosqlite.connect(TIMER_DB_PATH) as db:
+    async with connect_timer_db(TIMER_DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM timer_shifts WHERE timestamp >= ? ORDER BY id",
@@ -18129,7 +18149,7 @@ async def _resolve_work_action_attribution(
     if not session_id:
         return (None, False)
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT status, COALESCE(hook_driven, 0) AS hook_driven "
@@ -18247,7 +18267,7 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
     # the work-action path.
     if instance_id and should_bump_activity:
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 updates = {"last_activity": datetime.now().isoformat()}
                 if request.source == "ask_user_question_answered":
                     updates.update(
@@ -18277,7 +18297,7 @@ async def _work_action(request: WorkActionRequest, *, explicit: bool) -> dict:
         # this source; this defensive arm preserves the anchor if a future
         # discount branch changes the heartbeat decision.
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 await update_instance(
                     db,
                     instance_id=instance_id,
@@ -18676,7 +18696,7 @@ async def submit_checkin(request: CheckinSubmit):
     now = datetime.now().isoformat()
 
     # Upsert the check-in response
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         # Check if a prompt row exists (created by trigger_checkin)
         cursor = await db.execute(
             "SELECT id, prompted_at FROM checkins WHERE checkin_type = ? AND date = ?",
@@ -18749,7 +18769,7 @@ async def get_today_checkins():
     """Return all check-ins for today with completion status."""
     today = datetime.now().strftime("%Y-%m-%d")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM checkins WHERE date = ? ORDER BY prompted_at", (today,)
@@ -18782,7 +18802,7 @@ async def get_checkin_status():
     today = datetime.now().strftime("%Y-%m-%d")
     now = datetime.now()
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT checkin_type, responded_at FROM checkins WHERE date = ?", (today,)
@@ -18848,7 +18868,7 @@ async def log_debug_event(request: LogEventRequest):
 async def get_recent_events(limit: int = 10):
     """Get recent events with instance name data (LEFT JOIN)."""
     limit = min(limit, 100)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -18878,7 +18898,7 @@ async def get_recent_events(limit: int = 10):
 @app.get("/api/devices")
 async def list_devices():
     """List all known devices."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM devices")
         rows = await cursor.fetchall()
@@ -19225,7 +19245,7 @@ async def _cd_flip_pr_merged(pr_url: str) -> int:
     ancestry can never prove the merge).  Idempotent: never re-flips
     merged/closed.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id FROM instances WHERE pr_url = ? AND (pr_state IS NULL OR pr_state = 'open')",
             (pr_url,),
@@ -19622,7 +19642,7 @@ async def kvm_status() -> dict[str, object]:
 @app.get("/api/tasks", response_model=list[TaskResponse])
 async def list_tasks():
     """List all scheduled tasks with their status."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM scheduled_tasks ORDER BY id")
         tasks = await cursor.fetchall()
@@ -19676,7 +19696,7 @@ async def list_tasks():
 @app.get("/api/tasks/{task_id}", response_model=TaskResponse)
 async def get_task(task_id: str):
     """Get details of a specific task."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,))
         task = await cursor.fetchone()
@@ -19726,7 +19746,7 @@ async def get_task(task_id: str):
 @app.patch("/api/tasks/{task_id}", response_model=TaskResponse)
 async def update_task(task_id: str, request: TaskUpdateRequest):
     """Update a task's schedule or enabled status."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         # Check task exists
@@ -19809,7 +19829,7 @@ async def update_task(task_id: str, request: TaskUpdateRequest):
 @app.post("/api/tasks/{task_id}/trigger")
 async def trigger_task(task_id: str):
     """Manually trigger a task to run immediately."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute("SELECT id FROM scheduled_tasks WHERE id = ?", (task_id,))
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="Task not found")
@@ -19826,7 +19846,7 @@ async def trigger_task(task_id: str):
 @app.get("/api/tasks/{task_id}/history", response_model=list[TaskExecutionResponse])
 async def get_task_history(task_id: str, limit: int = 20):
     """Get execution history for a task."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
         # Check task exists
@@ -19966,7 +19986,7 @@ async def declare_cron_victory(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Job not found")
 
     # Persist victory_reason to the specified run (or most recent run)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         if run_id:
             await db.execute(
                 "UPDATE cron_runs SET victory_reason = ? WHERE id = ?", (reason, run_id)
@@ -20424,7 +20444,7 @@ async def _ops_read_work_actions(
     utc_floor = local_midnight.astimezone(UTC).replace(tzinfo=None)
     floor_iso = utc_floor.isoformat(sep=" ")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -20490,7 +20510,7 @@ async def _ops_read_timer_history(window: str | int = "6h", bucket: str | int = 
     samples: list[dict] = []
     shift_rows: list[dict] = []
     samples_available = True
-    async with aiosqlite.connect(TIMER_DB_PATH) as db:
+    async with connect_timer_db(TIMER_DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         try:
             cursor = await db.execute(
@@ -20681,7 +20701,7 @@ async def _ops_read_cron_summary() -> dict:
             logger.warning(f"Ops cron summary via cron_engine failed: {exc}")
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             counts = await db.execute(
                 """
@@ -20729,7 +20749,7 @@ async def _ops_read_cron_summary() -> dict:
 async def _ops_read_enforcement_summary() -> dict:
     now = datetime.now()
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
@@ -20773,7 +20793,7 @@ async def _ops_read_enforcement_summary() -> dict:
 
 
 async def _ops_read_instances(now: datetime) -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -20942,7 +20962,7 @@ async def _ops_read_active_fleet_graph(graph_name: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Unknown ops graph: {graph_name}")
 
     now = datetime.now()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -21172,7 +21192,7 @@ async def _ops_read_golden_throne_graph() -> dict:
     """
 
     now = datetime.now()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -21473,7 +21493,7 @@ async def _ops_read_graph(graph_name: str) -> dict:
 
 
 async def _ops_read_events() -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -22873,7 +22893,7 @@ async def get_ops_session_docs(
     vault_name = vault_root.name
     now = datetime.now()
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         query = (
             "SELECT id, file_path, title, project, primarch_name, cron_job_id, "
@@ -23360,7 +23380,7 @@ async def timer_worker():
                         timer_engine.current_mode.value, today
                     )
                     _session_start_ms = now_ms
-                    async with aiosqlite.connect(DB_PATH) as _wdb:
+                    async with connect_agents_db(DB_PATH) as _wdb:
                         _cur = await _wdb.execute(
                             "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived') AND COALESCE(is_subagent, 0) = 0"
                         )
@@ -23581,7 +23601,7 @@ async def process_pane_state_queue_once() -> list[dict]:
     only and never drives a close-down assertion (PHASE B sever: token-api makes
     zero tmux kill decisions). Returns one result dict per drained row.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, instance_id, variable, value FROM pane_state_queue ORDER BY id"
@@ -23865,7 +23885,7 @@ async def _run_tmux_db_reconcile_cycle() -> dict:
     now = datetime.now()
     deferred_events: list[tuple[str, str, dict]] = []  # (event_type, instance_id, details)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         # Wait up to 5s for other writers before raising "database is locked".
         await db.execute("PRAGMA busy_timeout = 5000")
         db.row_factory = aiosqlite.Row
@@ -24091,7 +24111,7 @@ async def session_doc_sync_worker():
     """
     while True:
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute(
                     "SELECT id, doc_id, reason FROM session_doc_sync_queue ORDER BY id"
@@ -24141,7 +24161,7 @@ async def clear_stale_processing_flags() -> None:
             # cleanup below is time-based and runs regardless.
             panes = await _read_tmux_panes()
             live_ids = None if panes is None else await _live_agent_instance_ids()
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 stopped_dead_panes = []
                 if live_ids is not None:
@@ -24255,7 +24275,7 @@ async def detect_stuck_instances():
 
     while True:
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute("""
                     SELECT id, name AS tab_name, working_dir, status, device_id, last_activity
@@ -24586,7 +24606,7 @@ async def enforcement_stand_down(request: EnforcementStandDownRequest):
 async def enforcement_status():
     """Return pending acknowledgements plus current escalation and Pavlok guardrail state."""
     now = datetime.now()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -24655,7 +24675,7 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None) -> 
     today = request.date if request and request.date else datetime.now().strftime("%Y-%m-%d")
 
     # Resolve alive Custodes singleton
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT i.id, i.device_id
@@ -25205,7 +25225,7 @@ async def _resolve_discord_fixer_target(redirect: str | None = None) -> dict:
     # (instances.tmux_pane / pane_label are gone); only pane-resident instances
     # are routing targets, so we keep DB rows that have a live pane.
     live_panes = {p["instance_id"]: p for p in await _live_agent_panes() if p["instance_id"]}
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT id, name AS tab_name,
@@ -25357,7 +25377,7 @@ async def _discord_voice_error(legion: str, transcript: str):
     No silent failures — if voice input can't route, the operator gets immediate audio feedback.
     """
     # Determine why injection failed
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """SELECT i.id, i.status
                FROM instances i
@@ -25483,7 +25503,7 @@ async def _try_discord_injection(legion: str, message, *, require_synced: bool =
             formatted, message.channel_name, message.message_id
         )
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         if require_synced:
             cursor = await db.execute(
                 """SELECT i.id, i.device_id
@@ -25724,7 +25744,7 @@ async def _resolve_discord_voice_target(bot: str, message: DiscordMessageRequest
         return None
 
     require_synced = bot == "mechanicus"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         if require_synced:
             cursor = await db.execute(
                 """SELECT i.id
@@ -26600,7 +26620,7 @@ async def _create_aspirant_session_doc(
     session_doc_path = unique_human_path(sessions_dir, f"Aspirant - {title}", fallback="Aspirant")
 
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
                VALUES (?, ?, ?, 'active', ?, ?)""",
@@ -28286,7 +28306,7 @@ async def _gather_evaluator_context(
     # Fetch session doc if linked
     if session_doc_id:
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_agents_db(DB_PATH) as db:
                 cursor = await db.execute(
                     "SELECT file_path FROM session_documents WHERE id = ?", (session_doc_id,)
                 )
@@ -28421,7 +28441,7 @@ async def _run_stop_evaluators(
         (Path.home() / ".claude" / "tui-signals" / f"evaluating-{instance_id}").unlink(
             missing_ok=True
         )
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             try:
                 await update_instance(
                     db,
@@ -28566,7 +28586,7 @@ async def _handle_orphan_doc(doc_id: int) -> None:
     - completed / deployment → leave alone (Administratum handles)
     - processed → archive
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM instances WHERE session_doc_id = ?", (doc_id,)
         )
@@ -28639,7 +28659,7 @@ async def create_session_doc(request: SessionDocCreateRequest):
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
 
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, primarch_name, status, created_at, updated_at)
                VALUES (?, ?, ?, ?, 'active', ?, ?)""",
@@ -28686,7 +28706,7 @@ async def create_session_doc(request: SessionDocCreateRequest):
 @app.get("/api/session-docs")
 async def list_session_docs(status: str | None = None, project: str | None = None):
     """List session documents with optional filters."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         query = "SELECT * FROM session_documents WHERE 1=1"
         params = []
@@ -28718,7 +28738,7 @@ async def list_session_docs(status: str | None = None, project: str | None = Non
 @app.get("/api/session-docs/deployment-queue")
 async def get_deployment_queue():
     """List session docs ready for Administratum processing."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM session_documents WHERE status = 'deployment' ORDER BY updated_at ASC"
@@ -28730,7 +28750,7 @@ async def get_deployment_queue():
 @app.get("/api/session-docs/{doc_id}")
 async def get_session_doc(doc_id: int):
     """Get session document metadata and linked instances."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM session_documents WHERE id = ?", (doc_id,))
         row = await cursor.fetchone()
@@ -28753,7 +28773,7 @@ async def get_session_doc(doc_id: int):
 @app.get("/api/session-docs/{doc_id}/content")
 async def get_session_doc_content(doc_id: int):
     """Read the actual markdown file content of a session document."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,)
         )
@@ -28779,7 +28799,7 @@ async def open_session_doc(doc_id: int):
     path, and invokes the ``obsidian`` CLI server-side — on the Mac, where
     Obsidian and Token-API live — to focus/open the note.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,)
         )
@@ -28851,7 +28871,7 @@ async def get_session_doc_rubric(doc_id: int):
     the file mtime so a "stale read?" hunch can be confirmed or dismissed at a
     glance. Read-only; never mutates.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, file_path, title, status FROM session_documents WHERE id = ?",
@@ -28906,7 +28926,7 @@ async def get_golden_throne_timers():
     is auditable from outside the thread. Read-only; GT has no recovery sweep.
     """
     now = datetime.now()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -28976,7 +28996,7 @@ async def get_golden_throne_timers():
 @app.patch("/api/session-docs/{doc_id}")
 async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
     """Update session document metadata."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, status, file_path FROM session_documents WHERE id = ?", (doc_id,)
         )
@@ -29042,7 +29062,7 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
 @app.delete("/api/session-docs/{doc_id}")
 async def delete_session_doc(doc_id: int, hard: bool = False):
     """Delete a session document. Default is soft delete (archive). Use ?hard=true for hard delete."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,)
         )
@@ -29098,7 +29118,7 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
 @app.post("/api/session-docs/{doc_id}/merge")
 async def merge_into_session_doc(doc_id: int, request: SessionDocMergeRequest):
     """Intelligently merge content into a session document using LLM."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT file_path, title FROM session_documents WHERE id = ?", (doc_id,)
         )
@@ -29162,7 +29182,7 @@ Return the complete updated document."""
                 logger.debug(f"merge: bump session_doc_up_to_date failed: {exc}")
 
         merge_updated_at = datetime.now().isoformat()
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
             await db.execute(
                 "UPDATE session_documents SET updated_at = ? WHERE id = ?",
                 (merge_updated_at, doc_id),
@@ -29214,7 +29234,7 @@ Return the complete updated document."""
 @app.post("/api/instances/{instance_id}/assign-doc")
 async def assign_doc_to_instance(instance_id: str, doc_id: int):
     """Assign an existing session document to an instance."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         # Verify instance exists
         cursor = await db.execute(
             "SELECT id, session_doc_id, workflow_state FROM instances WHERE id = ?",
@@ -29282,7 +29302,7 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
 @app.post("/api/instances/{instance_id}/create-doc")
 async def create_doc_for_instance(instance_id: str, request: SessionDocCreateRequest):
     """Create a new session document and assign it to the instance."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         # Verify instance exists
         cursor = await db.execute(
             "SELECT id, session_doc_id, workflow_state FROM instances WHERE id = ?",
@@ -29305,7 +29325,7 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
     if fp.exists():
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
                VALUES (?, ?, ?, 'active', ?, ?)""",
@@ -29386,7 +29406,7 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
 @app.delete("/api/instances/{instance_id}/unassign-doc")
 async def unassign_doc_from_instance(instance_id: str):
     """Unlink a session document from an instance."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, session_doc_id, workflow_state FROM instances WHERE id = ?",
             (instance_id,),
@@ -29444,7 +29464,7 @@ async def unassign_doc_from_instance(instance_id: str):
 @app.get("/api/instances/{instance_id}/session-doc")
 async def get_instance_session_doc(instance_id: str):
     """Get the session document linked to this instance."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT session_doc_id FROM instances WHERE id = ?", (instance_id,)
         )
@@ -29469,7 +29489,7 @@ async def get_instance_session_doc(instance_id: str):
 async def list_primarchs():
     """List all primarchs from DB with their active session doc."""
     result = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         primarchs = await get_all_primarchs_from_db(db)
         for p in primarchs:
             # Get active doc link
@@ -29508,7 +29528,7 @@ async def list_primarchs():
 @app.get("/api/primarchs/{name}")
 async def get_primarch(name: str):
     """Get a single primarch by name or alias."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         p = await get_primarch_from_db(db, name)
         if not p:
             raise HTTPException(404, f"Unknown primarch: {name}")
@@ -29535,7 +29555,7 @@ async def get_primarch(name: str):
 @app.get("/api/primarchs/{name}/active-doc")
 async def get_primarch_active_doc(name: str):
     """Get the currently linked session doc for a primarch, or null."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         # Resolve alias to canonical name
         p = await get_primarch_from_db(db, name)
         if p:
@@ -29568,7 +29588,7 @@ async def link_primarch_doc(
     """Link a primarch to a session doc. If doc_id query param given, link existing. If body has title, create new + link."""
     now = datetime.now().isoformat()
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         if doc_id:
             # Link to existing doc
             cursor = await db.execute("SELECT id FROM session_documents WHERE id = ?", (doc_id,))
@@ -29616,7 +29636,7 @@ async def link_primarch_doc(
 async def unlink_primarch_doc(name: str):
     """Unlink the current session doc from a primarch."""
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = ? AND unlinked_at IS NULL",
             (name,),
@@ -29647,7 +29667,7 @@ async def unlink_primarch_doc(name: str):
 @app.post("/api/session-docs/{doc_id}/deploy")
 async def deploy_session_doc(doc_id: int):
     """Transition a completed session doc to deployment status."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, status, title FROM session_documents WHERE id = ?", (doc_id,)
         )
@@ -29672,7 +29692,7 @@ async def deploy_session_doc(doc_id: int):
 @app.post("/api/session-docs/{doc_id}/mark-processed")
 async def mark_session_doc_processed(doc_id: int):
     """Mark a deployment doc as processed by Administratum. Unlinks primarch if linked."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT id, status, title, primarch_name FROM session_documents WHERE id = ?", (doc_id,)
         )
@@ -29752,7 +29772,7 @@ async def _ensure_agent_state_table(db: aiosqlite.Connection):
 @app.get("/api/fleet/state")
 async def get_fleet_state():
     """Return current fleet state. Seeds from legacy file on first access."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await _ensure_agent_state_table(db)
         state = await _get_fleet_state_row(db)
         if state is None:
@@ -29777,7 +29797,7 @@ async def get_fleet_state():
 async def patch_fleet_state(request: Request):
     """Merge-patch update: only provided keys are updated, others preserved."""
     updates = await request.json()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await _ensure_agent_state_table(db)
         state = await _get_fleet_state_row(db)
         if state is None:
@@ -29796,7 +29816,7 @@ async def patch_fleet_state(request: Request):
 async def put_fleet_state(request: Request):
     """Full replacement of fleet state."""
     new_state = await request.json()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await _ensure_agent_state_table(db)
         now = datetime.now().isoformat()
         await db.execute(
@@ -29811,7 +29831,7 @@ async def put_fleet_state(request: Request):
 async def reset_fleet_state():
     """Reset fleet state to defaults."""
     state = dict(_FLEET_STATE_DEFAULTS)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         await _ensure_agent_state_table(db)
         now = datetime.now().isoformat()
         await db.execute(
@@ -29828,7 +29848,7 @@ async def reset_fleet_state():
 @app.get("/api/habits/definitions")
 async def get_habit_definitions():
     """Return all active habit definitions with their windows."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, name, category, window_start_hour, window_end_hour, notes FROM habits WHERE active = 1 ORDER BY window_start_hour, category, id"
@@ -29841,7 +29861,7 @@ async def get_habit_definitions():
 async def get_habits_today():
     """Return today's habit completion state: definitions + which are checked off."""
     today = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -29889,7 +29909,7 @@ async def mark_habit_today(habit_id: str, body: dict = None):
     notes = body.get("notes")
     today = datetime.now().strftime("%Y-%m-%d")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         # Verify habit exists
         cursor = await db.execute(
             "SELECT id, name FROM habits WHERE id = ? AND active = 1", (habit_id,)
@@ -30163,7 +30183,7 @@ async def get_state():
     timer_mode = timer_engine.current_mode.value
 
     # Instances
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM instances WHERE status NOT IN ('stopped', 'archived')"
         )

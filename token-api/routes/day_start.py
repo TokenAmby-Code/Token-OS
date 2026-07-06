@@ -15,6 +15,7 @@ import aiosqlite
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from db_connections import connect_agents_db
 from shared import (
     DB_PATH,
     get_day_state,
@@ -99,7 +100,7 @@ async def _consumer_custodes_doc_rebind() -> dict:
 
     rebound: list[dict] = []
     skipped: list[dict] = []
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         today_id = await resolve_or_create_today_daily_note_session_doc(db)
 
@@ -177,7 +178,7 @@ async def _consumer_daily_note_creation() -> dict:
     note_path = daily_notes_dir() / f"{date_str}.md"
     already_existed = note_path.exists()
 
-    async with aiosqlite.connect(DB_PATH, timeout=5.0) as db:
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         db.row_factory = aiosqlite.Row
         doc_id = await resolve_or_create_today_daily_note_session_doc(db)
         await db.commit()

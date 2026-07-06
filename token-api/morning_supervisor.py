@@ -41,6 +41,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 import morning_session
 import shared
+from db_connections import connect_agents_db
 from shared import (
     DB_PATH,
     OFFICIAL_MORNING_SOURCES,
@@ -92,7 +93,7 @@ async def derive_expected_wake(
     now_local = now_local or quiet_hours_local_now()
     want_weekend = _is_weekend(now_local)
 
-    async with aiosqlite.connect(db_path or DB_PATH) as db:
+    async with connect_agents_db(db_path or DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """

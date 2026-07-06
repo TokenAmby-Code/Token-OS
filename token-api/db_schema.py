@@ -15,6 +15,7 @@ from pathlib import Path
 import aiosqlite
 
 from cron_engine import CronEngine
+from db_connections import connect_agents_db, connect_telemetry_db, connect_timer_db
 from instance_registry import (
     DEFAULT_INSTANCE_NAME,
     INSTANCE_COLUMNS,
@@ -37,6 +38,7 @@ RUNTIME_DATABASE_DIR = Path(
 ).expanduser()
 DEFAULT_AGENTS_DB_PATH = RUNTIME_DATABASE_DIR / "agents.db"
 DEFAULT_TIMER_DB_PATH = RUNTIME_DATABASE_DIR / "timer.db"
+DEFAULT_TELEMETRY_DB_PATH = RUNTIME_DATABASE_DIR / "telemetry.db"
 LEGACY_AGENTS_DB_PATH = Path.home() / ".claude" / "agents.db"
 
 
@@ -59,6 +61,15 @@ DEFAULT_TIMER_PATH = Path(
     os.environ.get("TOKEN_API_TIMER_DB")
     or _legacy_token_api_db_unless_live()
     or DEFAULT_TIMER_DB_PATH
+).expanduser()
+DEFAULT_TELEMETRY_PATH = Path(
+    os.environ.get("TOKEN_API_TELEMETRY_DB")
+    or (
+        Path(_legacy_token_api_db_unless_live()).expanduser().with_name("telemetry.db")
+        if _legacy_token_api_db_unless_live()
+        else None
+    )
+    or DEFAULT_TELEMETRY_DB_PATH
 ).expanduser()
 
 
@@ -141,6 +152,49 @@ CREATE TABLE IF NOT EXISTS timer_samples (
 );
 
 CREATE INDEX IF NOT EXISTS idx_timer_samples_timestamp ON timer_samples(timestamp);
+"""
+
+
+_CONTEXT_TELEMETRY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS context_governor_state (
+    instance_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    engine TEXT,
+    pane TEXT,
+    used_tokens INTEGER,
+    context_window_tokens INTEGER,
+    planning_state TEXT,
+    scoped INTEGER NOT NULL DEFAULT 0,
+    scope_reason TEXT,
+    stage TEXT NOT NULL DEFAULT 'telemetry',
+    policy_state TEXT NOT NULL DEFAULT 'telemetry_only',
+    armed_subscription_id INTEGER,
+    injected_at TIMESTAMP,
+    no_progress_deadline_at TIMESTAMP,
+    last_progress_at TIMESTAMP,
+    checkpoint_completed_at TIMESTAMP,
+    checkpoint_activity_at TIMESTAMP,
+    last_directive_activity_at TIMESTAMP,
+    exhausted_at TIMESTAMP,
+    last_telemetry_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_governor_state_policy
+ON context_governor_state(policy_state, no_progress_deadline_at);
+
+CREATE TABLE IF NOT EXISTS context_governor_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT,
+    session_id TEXT,
+    stage TEXT NOT NULL,
+    action TEXT NOT NULL,
+    details_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_governor_audit_instance
+ON context_governor_audit(instance_id, created_at DESC);
 """
 
 
@@ -1078,7 +1132,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
     db_path = db_path or DEFAULT_DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    async with aiosqlite.connect(db_path) as db:
+    async with connect_agents_db(db_path) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA busy_timeout=5000")
         await ensure_personas_table(db)
@@ -1156,63 +1210,13 @@ async def init_database_async(db_path: Path | None = None) -> None:
             ON state_injections(audience_instance_id, status, created_at)
         """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS context_governor_state (
-                instance_id TEXT PRIMARY KEY,
-                session_id TEXT,
-                engine TEXT,
-                pane TEXT,
-                used_tokens INTEGER,
-                context_window_tokens INTEGER,
-                planning_state TEXT,
-                scoped INTEGER NOT NULL DEFAULT 0,
-                scope_reason TEXT,
-                stage TEXT NOT NULL DEFAULT 'telemetry',
-                policy_state TEXT NOT NULL DEFAULT 'telemetry_only',
-                armed_subscription_id INTEGER,
-                injected_at TIMESTAMP,
-                no_progress_deadline_at TIMESTAMP,
-                last_progress_at TIMESTAMP,
-                checkpoint_completed_at TIMESTAMP,
-                checkpoint_activity_at TIMESTAMP,
-                last_directive_activity_at TIMESTAMP,
-                exhausted_at TIMESTAMP,
-                last_telemetry_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        context_governor_columns = await _table_columns(db, "context_governor_state")
-        if "checkpoint_completed_at" not in context_governor_columns:
-            await db.execute(
-                "ALTER TABLE context_governor_state ADD COLUMN checkpoint_completed_at TIMESTAMP"
-            )
-        if "checkpoint_activity_at" not in context_governor_columns:
-            await db.execute(
-                "ALTER TABLE context_governor_state ADD COLUMN checkpoint_activity_at TIMESTAMP"
-            )
-        if "last_directive_activity_at" not in context_governor_columns:
-            await db.execute(
-                "ALTER TABLE context_governor_state ADD COLUMN last_directive_activity_at TIMESTAMP"
-            )
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_context_governor_state_policy
-            ON context_governor_state(policy_state, no_progress_deadline_at)
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS context_governor_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                instance_id TEXT,
-                session_id TEXT,
-                stage TEXT NOT NULL,
-                action TEXT NOT NULL,
-                details_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_context_governor_audit_instance
-            ON context_governor_audit(instance_id, created_at DESC)
-        """)
+        # Context-governor state/audit live in the telemetry DB; agents.db keeps
+        # only registry truth plus stop_hook_subscriptions used for actuation.
+        # Existing rows are deliberately dropped instead of migrated: they are
+        # blink-state telemetry, not registry truth, and preserving stale pressure
+        # state is less important than removing the hot tables from agents.db.
+        await db.execute("DROP TABLE IF EXISTS context_governor_state")
+        await db.execute("DROP TABLE IF EXISTS context_governor_audit")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS stop_hook_subscriptions (
@@ -2109,7 +2113,7 @@ async def init_timer_database_async(db_path: Path | None = None) -> None:
     """Initialize the separate timer SQLite database."""
     path = db_path or DEFAULT_TIMER_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(path) as db:
+    async with connect_timer_db(path) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA busy_timeout=5000")
         await db.executescript(_TIMER_SCHEMA_SQL)
@@ -2120,3 +2124,20 @@ async def init_timer_database_async(db_path: Path | None = None) -> None:
 def init_timer_database_sync(db_path: Path | None = None) -> None:
     """Synchronous wrapper for timer DB initialization."""
     asyncio.run(init_timer_database_async(db_path))
+
+
+async def init_context_telemetry_database_async(db_path: Path | None = None) -> None:
+    """Initialize the separate high-frequency context-governor telemetry DB."""
+    path = db_path or DEFAULT_TELEMETRY_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    async with connect_telemetry_db(path) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
+        await db.executescript(_CONTEXT_TELEMETRY_SCHEMA_SQL)
+        await db.commit()
+        print(f"Telemetry database initialized at {path}")
+
+
+def init_context_telemetry_database_sync(db_path: Path | None = None) -> None:
+    """Synchronous wrapper for context telemetry DB initialization."""
+    asyncio.run(init_context_telemetry_database_async(db_path))

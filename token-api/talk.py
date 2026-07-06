@@ -29,6 +29,7 @@ from typing import Any
 import aiosqlite
 
 import shared
+from db_connections import connect_agents_db
 from pane_surface import RAW_TMUX_PANE_RX
 from shared import DB_PATH, instance_id_for_pane
 
@@ -297,7 +298,7 @@ async def lookup_instance_for_pane(pane_id: str) -> dict[str, Any] | None:
     instance_id = await instance_id_for_pane(pane_id)
     if not instance_id:
         return await _rowless_live_instance_for_pane(pane_id)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from db_connections import connect_agents_db
 from db_schema import DEFAULT_DB_PATH
 
 DB_PATH = DEFAULT_DB_PATH
@@ -34,7 +35,7 @@ async def get_instance(
 
     if db is not None:
         return await _query(db)
-    async with aiosqlite.connect(db_path) as conn:
+    async with connect_agents_db(db_path) as conn:
         return await _query(conn)
 
 
@@ -61,7 +62,7 @@ async def count_active_instances(
 
     if db is not None:
         return await _query(db)
-    async with aiosqlite.connect(db_path) as conn:
+    async with connect_agents_db(db_path) as conn:
         return await _query(conn)
 
 
@@ -83,5 +84,5 @@ async def count_instances_for_doc(
 
     if db is not None:
         return await _query(db)
-    async with aiosqlite.connect(db_path) as conn:
+    async with connect_agents_db(db_path) as conn:
         return await _query(conn)

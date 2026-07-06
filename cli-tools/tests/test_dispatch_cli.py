@@ -2726,8 +2726,8 @@ def test_dispatch_tmux_target_bakes_pane_label_into_launch_env(tmp_path: Path) -
     assert "TOKEN_API_PANE_LABEL=palace:E" in result.stdout
 
 
-def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Path) -> None:
-    """A live pane whose instances row lags is success when wrapper ledger is OPEN.
+def test_dispatch_fails_loud_when_registry_row_lags(tmp_path: Path) -> None:
+    """A live pane whose instances row does not bind is a loud failure.
 
     Regression for the fleet-wide exit-70 false-failure: the agent process is up
     and engaged in the pane, but the DB row has not bound live (here it is still
@@ -2821,22 +2821,17 @@ def test_dispatch_succeeds_on_liveness_even_when_registry_row_lags(tmp_path: Pat
         env=env,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "dispatched claude to palace:E" in result.stdout
-    # The row lag is advisory only — surfaced as a warning, never a failure.
-    assert "registration slow" in result.stderr
-    assert "instance row did not bind live" not in result.stderr
-    assert "launch failed" not in result.stderr
+    assert result.returncode != 0
+    assert "instances row did not bind within the observation window" in result.stderr
+    assert "registration slow" not in result.stderr
 
 
-def test_dispatch_succeeds_on_liveness_when_instance_never_registers(tmp_path: Path) -> None:
-    """The codex singleton-undercount path: no registry row, but ledger row exists.
+def test_dispatch_fails_loud_when_instance_never_registers(tmp_path: Path) -> None:
+    """No registry row after the observation window is a loud failure.
 
-    For codex the SessionStart pane stamp / DB row may never land at all. The old
-    gate required the @INSTANCE_ID stamp and fatal-ed exit 70, breaking the
-    stop-hook/completion contract for a launch that genuinely succeeded. With the
-    liveness-driven gate plus #600 comms invariant, a live agent process is success
-    only when the wrapper ledger row exists — registry lag remains advisory.
+    Liveness and a wrapper ledger row are not enough: sends and rename require a
+    bound instances row. The old path printed registration-slow reassurance and
+    returned success; the current path fails loudly.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -3529,10 +3524,9 @@ def test_dispatch_liveness_success_runs_naming_step_when_row_lags(tmp_path: Path
         timeout=60,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "dispatched claude to mechanicus:new" in result.stdout
-    assert "registration slow" in result.stderr
-    assert "launch failed" not in result.stderr
+    assert result.returncode != 0
+    assert "instances row did not bind within the observation window" in result.stderr
+    assert "registration slow" not in result.stderr
 
     # Proof the success path reaches the pane without smuggling a dispatch-derived
     # naming prefix into the staged launch command.

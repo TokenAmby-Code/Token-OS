@@ -13,6 +13,7 @@ from typing import Any
 import aiosqlite
 
 import shared
+from db_connections import connect_agents_db
 from shared import DB_PATH
 
 TEMP_MESSAGE_SOURCE = "temp_message"
@@ -197,7 +198,7 @@ async def _read_tmux_panes() -> dict[str, dict[str, str]]:
 async def _candidate_rows(
     db_path: Path, tmux_panes: dict[str, dict[str, str]]
 ) -> list[dict[str, Any]]:
-    async with aiosqlite.connect(db_path) as db:
+    async with connect_agents_db(db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -287,7 +288,7 @@ async def record_pending_poll(
 ) -> None:
     now = datetime.now()
     expires_at = now + timedelta(minutes=ttl_minutes)
-    async with aiosqlite.connect(db_path) as db:
+    async with connect_agents_db(db_path) as db:
         await db.execute(
             """
             INSERT OR REPLACE INTO pending_polls (
