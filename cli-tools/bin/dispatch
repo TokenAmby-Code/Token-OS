@@ -2382,8 +2382,14 @@ reconcile_dispatch_registry_bind() {
   # the engine came up, but after the observation window a missing/stopped row is
   # a loud failure because downstream sends/renames depend on registry binding.
   local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label expected_label
-  command -v sqlite3 >/dev/null 2>&1 || return 0
-  [[ -f "$DB_PATH" ]] || return 0
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because sqlite3 is unavailable"
+    return 1
+  fi
+  if [[ ! -f "$DB_PATH" ]]; then
+    [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because agents DB is missing at $DB_PATH"
+    return 1
+  fi
   instance_id="$(pane_instance_id "$pane")"
   if [[ -n "$instance_id" ]]; then
     row="$(sqlite3 -separator $'\t' "$DB_PATH" \
@@ -2535,6 +2541,10 @@ confirm_dispatch_launch_live() {
     sleep 0.3
   done
   if [[ "$saw_live" == "1" ]]; then
+    if ! dispatch_pane_agent_live "$pane"; then
+      err "launch failed: the ${ENGINE} agent appeared in ${target_display} but exited before registry binding completed"
+      return 1
+    fi
     if reconcile_dispatch_registry_bind "$pane" "$target_display" 1; then
       ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
       return 0

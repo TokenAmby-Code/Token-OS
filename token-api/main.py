@@ -1638,7 +1638,7 @@ class NamingNudgeRequest(BaseModel):
 
 
 # Database helper: connect with busy_timeout to prevent indefinite blocking
-async def get_db():
+async def get_db() -> aiosqlite.Connection:
     """Get a database connection with busy_timeout configured."""
     return await connect_agents_db(DB_PATH)
 

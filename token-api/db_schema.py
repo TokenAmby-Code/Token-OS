@@ -8,6 +8,7 @@ All bootstrap paths should go through this module:
 """
 
 import asyncio
+import logging
 import os
 import sqlite3
 from pathlib import Path
@@ -37,6 +38,8 @@ from personas import (
     singleton_persona_slug_for_runtime,
     validate_mechanicus_invariant,
 )
+
+logger = logging.getLogger(__name__)
 
 RUNTIME_DATABASE_DIR = Path(
     os.environ.get("TOKEN_API_DATABASE_DIR", Path.home() / "runtimes" / "database")
@@ -2132,7 +2135,7 @@ async def init_context_telemetry_database_async(db_path: Path | None = None) -> 
         await db.execute("PRAGMA busy_timeout=5000")
         await db.executescript(_CONTEXT_TELEMETRY_SCHEMA_SQL)
         await db.commit()
-        print(f"Telemetry database initialized at {path}")
+        logger.info("Telemetry database initialized at %s", path)
 
 
 def init_context_telemetry_database_sync(db_path: Path | None = None) -> None:
