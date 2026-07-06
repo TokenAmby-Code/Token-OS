@@ -234,7 +234,6 @@ class TTSChunkNextRequest(BaseModel):
 IS_MACOS = sys.platform == "darwin"
 DEFAULT_SOUND = "chimes.wav"
 TTS_EXECUTION_BACKENDS = {"phone", "wsl", "linux"}
-TTS_PHONE_PREFERRED_ZONES = {"away", "gym", "campus", "mobile", "travel"}
 
 
 SOUND_MAP = {
@@ -700,20 +699,18 @@ def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int 
 def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
     """Determine which device should receive TTS output.
 
-    Authoritative execution backends are phone, WSL, and later Linux. Mac is
+    Authoritative execution backends are WSL, phone, and later Linux. Mac is
     removed as a TTS backend: routing never returns ``mac`` and failures never
-    demote to macOS ``say``. Phone-first is situational (away/mobile zones);
-    at the desk, WSL remains a first-class backend.
+    demote to macOS ``say``. WSL is the desk/default backend again.
 
     Priority cascade:
     1. Discord voice — if the operator is actively in a voice channel, audio goes
        there (a deliberate live conversation surface, not ambient routing).
-    2. Phone — when the operator is in a mobile/away zone and MacroDroid is reachable.
-    3. WSL — first-class desk/default backend when satellite TTS is available.
-    4. Phone — fallback execution backend if WSL is unavailable but phone is reachable.
+    2. WSL — first-class desk/default backend when satellite TTS is available.
+    3. Phone — fallback execution backend if WSL is unavailable but phone is reachable.
 
     Returns:
-        {"device": "discord"|"phone"|"wsl"|None, "reason": str, "discord_bot": str|None}
+        {"device": "discord"|"wsl"|"phone"|None, "reason": str, "discord_bot": str|None}
     """
     # 1. Discord voice channel — operator in VC means audio goes there.
     discord_bot = _get_discord_voice_bot()
@@ -726,16 +723,10 @@ def resolve_tts_device(instance_id: str = None, wsl_voice: str = None) -> dict:
 
     # Phone routeability gates on coarse MacroDroid reachability. Audio-proxy
     # receiver health remains diagnostic, not a route predicate for /tts-chunk.
+    # The canonical playback chain is Discord → WSL → phone; geofence/away state
+    # no longer lets a reachable phone preempt a healthy WSL satellite.
     phone_health = get_phone_audio_proxy_health()
     phone_reachable = _send_to_phone is not None and is_phone_reachable()
-    location_zone = DESKTOP_STATE.get("location_zone")
-    if location_zone in TTS_PHONE_PREFERRED_ZONES and phone_reachable:
-        return {
-            "device": "phone",
-            "reason": f"phone situational: {location_zone} zone with MacroDroid reachable",
-            "discord_bot": None,
-            "phone_audio_proxy": phone_health,
-        }
 
     if is_satellite_tts_available():
         return {

@@ -3,7 +3,7 @@
 Authoritative contract as of 2026-07-03:
 
 - Token-API owns TTS session, queue, current/next/backfill chunk, playback id, control state, ack/error state.
-- Backends are execution-only: `phone`, `wsl`, later `linux`.
+- Backends are execution-only: `wsl`, `phone`, later `linux`; routing order is Discord voice → WSL → phone.
 - Mac `say` is removed as a TTS backend. If the active backend fails, Token-API records/returns an error; it does not fall back to Mac.
 - Order remains: `sanitize -> chunk -> enqueue -> dispatch chunk to backend`.
 - Advisor bypass remains a Token-OS queue policy; backends receive already-sanitized chunks only.

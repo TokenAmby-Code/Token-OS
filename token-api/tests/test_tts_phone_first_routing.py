@@ -1,6 +1,6 @@
-"""TTS execution routing invariants after 2026-07-03 correction.
+"""TTS execution routing invariants after WSL restoration.
 
-WSL is first-class, phone-first is situational, and Mac is not a TTS backend.
+Canonical playback chain is Discord → WSL → phone. Mac is not a TTS backend.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def test_wsl_first_class_at_home_when_satellite_healthy(monkeypatch: pytest.Monk
     assert routing["device"] == "wsl"
 
 
-def test_phone_first_is_situational_when_away(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wsl_preempts_phone_even_when_away_zone(monkeypatch: pytest.MonkeyPatch) -> None:
     tts = _load_tts()
     _patch_world(
         tts, monkeypatch, phone_reachable=True, satellite_healthy=True, location_zone="gym"
@@ -69,7 +69,7 @@ def test_phone_first_is_situational_when_away(monkeypatch: pytest.MonkeyPatch) -
 
     routing = tts.resolve_tts_device()
 
-    assert routing["device"] == "phone"
+    assert routing["device"] == "wsl"
 
 
 def test_mac_is_never_selected_even_when_monkeypatched_available(
@@ -87,14 +87,14 @@ def test_mac_is_never_selected_even_when_monkeypatched_available(
     assert routing["device"] != "mac"
 
 
-def test_phone_macrodroid_reachability_not_audio_proxy_when_phone_zone(
+def test_phone_fallback_uses_macrodroid_reachability_not_audio_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tts = _load_tts()
     monkeypatch.setitem(tts.DESKTOP_STATE, "location_zone", "gym")
     monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: True)
     monkeypatch.setattr(tts, "_send_to_phone", lambda *a, **k: {"success": True})
-    monkeypatch.setattr(tts, "is_satellite_tts_available", lambda *a, **k: True)
+    monkeypatch.setattr(tts, "is_satellite_tts_available", lambda *a, **k: False)
     monkeypatch.setattr(tts, "_get_discord_voice_bot", lambda *a, **k: None)
     monkeypatch.setattr(
         tts,
