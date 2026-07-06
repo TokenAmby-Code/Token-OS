@@ -31,6 +31,8 @@ Observed deployed state and logs showed the macro repeatedly starting after Shiz
 
 This proves the MacroDroid trigger/recovery loop works, but it does not prove Shizuku is reliable. The practical failure remains below the macro layer: Wireless debugging is not merely a launch-time dependency in this stack. When Android disables it seconds later, Shizuku goes down with it and the `ShizukuStoppedTrigger` restarts the cycle.
 
+Follow-up burst: `rish` became usable during the brief Shizuku-up window. From `rish`, direct `settings` commands work and confirmed shell UID access. `settings put global cw_disable_wifimediator 1` succeeded and persisted (`cw_disable_wifimediator=1`, `adb_wifi_enabled=1`, `adb_allowed_connection_time=0`). That did not prove stability: the deployed bootstrap macro continued to fire repeatedly and restart Shizuku. Current suspicion is that keeping `ShizukuStoppedTrigger` in the same bootstrap macro may be self-inducing churn because `start.sh` kills the old Shizuku process before starting a new one, which can retrigger the stopped trigger. A test variant has been staged locally by removing `ShizukuStoppedTrigger`; the next useful experiment is to import that replacement and test whether manual/HTTP bootstrap plus `cw_disable_wifimediator=1` stays up without the self-loop.
+
 ## Rish / ADB Notes From Recheck
 
 Do not confuse these execution contexts:
