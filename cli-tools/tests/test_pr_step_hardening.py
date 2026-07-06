@@ -252,6 +252,111 @@ create_pr_normal >/dev/null
     assert "--timeout" not in args
 
 
+def prepare_dual_remote_upstream_repo(tmp_path: Path) -> Path:
+    repo = init_repo(tmp_path)
+    bare = tmp_path / "upstream.git"
+    run(["git", "init", "--bare", str(bare)], repo)
+    run(["git", "remote", "add", "origin", str(bare)], repo)
+    run(["git", "push", "-u", "origin", "misleading-branch"], repo)
+    run(["git", "remote", "set-url", "origin", "git@github.com:TokenAmby-Code/Token-OS.git"], repo)
+    run(["git", "remote", "add", "github", "git@github.com:TokenAmby-Code/Token-OS.git"], repo)
+    return repo
+
+
+def install_fake_gh_for_create(tmp_path: Path) -> tuple[Path, Path]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    arg_log = tmp_path / "gh-pr-create.args0"
+    gh = fake_bin / "gh"
+    gh.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "repo" && "$2" == "view" ]]; then
+  echo owner/repo
+  exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "create" ]]; then
+  printf '%s\n' "$@" > {str(arg_log)!r}
+  echo https://github.com/owner/repo/pull/123
+  exit 0
+fi
+echo "unexpected gh call: $*" >&2
+exit 1
+"""
+    )
+    gh.chmod(0o755)
+    return fake_bin, arg_log
+
+
+def read_logged_args(path: Path) -> list[str]:
+    return path.read_text().splitlines()
+
+
+def test_pr_create_main_injects_current_branch_head_for_dual_remote_create(
+    tmp_path: Path,
+) -> None:
+    repo = prepare_dual_remote_upstream_repo(tmp_path)
+    fake_bin, arg_log = install_fake_gh_for_create(tmp_path)
+
+    bash_with_pr_step(
+        'pr_create_main --title "test title" --body "test body" --no-wait',
+        repo,
+        {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    args = read_logged_args(arg_log)
+    assert args[:2] == ["pr", "create"]
+    assert "--head" in args
+    assert args[args.index("--head") + 1] == "misleading-branch"
+
+
+def test_pr_create_main_preserves_explicit_head(tmp_path: Path) -> None:
+    repo = prepare_dual_remote_upstream_repo(tmp_path)
+    fake_bin, arg_log = install_fake_gh_for_create(tmp_path)
+
+    bash_with_pr_step(
+        'pr_create_main --title "test title" --body "test body" --head explicit-head --no-wait',
+        repo,
+        {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    args = read_logged_args(arg_log)
+    assert args.count("--head") == 1
+    assert args[args.index("--head") + 1] == "explicit-head"
+
+
+def test_plain_pr_step_create_failure_reemits_captured_create_error(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+set +e
+assert_repo() { :; }
+mark_instance_status() { :; }
+current_pr_number() { :; }
+commit_if_needed() { return 1; }
+push_branch() { :; }
+create_pr_normal() {
+  printf '%s\n' 'captured create output before failure'
+  printf '%s\n' '[pr-create] Failed to create PR: you must first push the current branch to a remote, or use the --head flag'
+  return 42
+}
+main --no-merge
+rc=$?
+set -e
+printf 'rc=%s\n' "$rc"
+exit 0
+""",
+        repo,
+    )
+
+    assert "rc=42" in result.stdout
+    assert "you must first push the current branch" in result.stderr
+    assert "Could not determine created PR number" not in result.stderr
+
+
 def test_review_loop_waits_for_coderabbit_rate_limit_reset_then_returns_review(
     tmp_path: Path,
 ) -> None:

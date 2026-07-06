@@ -1211,6 +1211,18 @@ TIMEOUT_MINS=""
 BASE_BRANCH=""
 GH_ARGS=()
 
+gh_args_have_head() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --head|-H|--head=*)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-wait)
@@ -1386,6 +1398,15 @@ if ! git rev-parse --abbrev-ref '@{upstream}' &>/dev/null; then
         exit 1
     }
     success "Pushed '$CURRENT_BRANCH' to $GIT_GITHUB_REMOTE"
+fi
+
+CURRENT_BRANCH=$(git branch --show-current)
+if [[ -z "$CURRENT_BRANCH" ]]; then
+    error "Cannot determine current branch (detached HEAD?)"
+    exit 1
+fi
+if ! gh_args_have_head "${GH_ARGS[@]}"; then
+    GH_ARGS+=(--head "$CURRENT_BRANCH")
 fi
 
 # Create the PR and capture URL
@@ -2554,7 +2575,13 @@ main() {
         log "No PR found for current branch."
         if commit_if_needed "$msg"; then committed=true; fi
         push_branch
-        pr="$(create_pr_normal | tail -1)"
+        local create_out create_rc
+        create_out="$(create_pr_normal)" || {
+            create_rc=$?
+            [[ -n "$create_out" ]] && printf '%s\n' "$create_out" >&2
+            return "$create_rc"
+        }
+        pr="$(printf '%s\n' "$create_out" | tail -n 1)"
         read_review_normal "$pr" || true
         pr_url="$(current_pr_url "$pr")"
         arm_review_followup=true
