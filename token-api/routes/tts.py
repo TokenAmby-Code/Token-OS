@@ -1485,49 +1485,36 @@ def _send_phone_tts_chunk(payload: dict) -> dict:
 
 
 def _post_wsl_chunk(payload: dict, *, voice: str | None, rate: int = 0) -> dict:
-    host = DESKTOP_CONFIG["host"]
-    port = DESKTOP_CONFIG["port"]
-    TTS_BACKEND["current"] = "wsl"
-    body = {
-        **payload,
-        "message": payload["current_chunk_text"],
-        "voice": voice or "Microsoft David",
-        "rate": max(-10, min(10, int(rate or 0) + TTS_WSL_RATE_BIAS)),
-    }
-    try:
-        resp = requests.post(f"http://{host}:{port}/tts/chunk", json=body, timeout=300)
-    except (requests.ConnectionError, requests.Timeout):
-        TTS_BACKEND["current"] = None
-        TTS_BACKEND["satellite_available"] = False
-        TTS_BACKEND["last_health_check"] = time.time()
-        return {"success": False, "error": "satellite_unreachable", "method": "wsl_sapi_chunk"}
-    except Exception as exc:
-        TTS_BACKEND["current"] = None
-        return {"success": False, "error": str(exc), "method": "wsl_sapi_chunk"}
-    finally:
-        if TTS_BACKEND.get("current") == "wsl":
-            TTS_BACKEND["current"] = None
+    """Send one queued Token-API chunk through the WSL satellite's SAPI transport.
 
-    if resp.status_code == 200:
-        data = dict(resp.json())
-        data.setdefault("method", "wsl_sapi_chunk")
-        if data.get("success") and data.get("rendered_hash"):
-            expected_hash = payload["current_chunk_hash"]
-            if data["rendered_hash"] != expected_hash:
-                return {
-                    "success": False,
-                    "error": "satellite_text_integrity_check_failed",
-                    "method": data.get("method"),
-                    "chunk_id": payload.get("chunk_id"),
-                }
-        return data
-    if resp.status_code == 409:
-        return {"success": False, "error": "satellite_busy", "method": "wsl_sapi_chunk"}
-    return {
-        "success": False,
-        "error": f"satellite returned {resp.status_code}",
-        "method": "wsl_sapi_chunk",
-    }
+    The live satellite's real playback surface is /tts/speak; it writes the text
+    to a temp file on the WSL side and returns rendered_chars/rendered_hash as an
+    integrity ack. Keep Token-API's current/next chunk state here, but do not
+    require a separate satellite /tts/chunk endpoint.
+    """
+    chunk_id = payload.get("chunk_id")
+    playback_id = payload.get("playback_id")
+    session_id = payload.get("session_id")
+    message = payload["current_chunk_text"]
+    result = speak_tts_wsl(message, voice or "Microsoft David", rate=rate)
+    result = dict(result or {})
+    result.setdefault("method", "wsl_sapi_chunk")
+    result["chunk_id"] = chunk_id
+    result["playback_id"] = playback_id
+    result["session_id"] = session_id
+
+    if result.get("success") and result.get("rendered_hash"):
+        expected_hash = payload["current_chunk_hash"]
+        if result["rendered_hash"] != expected_hash:
+            return {
+                "success": False,
+                "error": "satellite_text_integrity_check_failed",
+                "method": result.get("method"),
+                "chunk_id": chunk_id,
+                "playback_id": playback_id,
+                "session_id": session_id,
+            }
+    return result
 
 
 def dispatch_tts_chunks_to_backend(

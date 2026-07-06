@@ -6,6 +6,7 @@ Authoritative contract as of 2026-07-03:
 - Backends are execution-only: `wsl`, `phone`, later `linux`; routing order is Discord voice → WSL → phone.
 - Mac `say` is removed as a TTS backend. If the active backend fails, Token-API records/returns an error; it does not fall back to Mac.
 - Order remains: `sanitize -> chunk -> enqueue -> dispatch chunk to backend`.
+- WSL dispatch keeps Token-API's chunk/current-state contract, but the satellite playback call is the real SAPI text-file `/tts/speak` transport; that path returns `rendered_hash`/`rendered_chars` to guard against SAPI text truncation.
 - Advisor bypass remains a Token-OS queue policy; backends receive already-sanitized chunks only.
 
 ## Control ingress
