@@ -82,7 +82,7 @@ ExitApp
 
 From WSL, execute:
 ```bash
-"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" //Token-NAS/Imperium/runtimes/token-os/live/ahk/voice-select-other.ahk
+"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "C:\\TokenOS\\ahk\\voice-select-other.ahk"
 ```
 Expected: Sends keystrokes to the focused window. No errors.
 

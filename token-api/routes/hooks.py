@@ -6646,7 +6646,7 @@ async def handle_pre_tool_use(payload: dict) -> dict:
         return {
             "success": True,
             "action": "allowed",
-            "local_exec": f'"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "//Token-NAS/Imperium/runtimes/token-os/live/ahk/voice-send-keys.ahk"{pane_arg} --navigate',
+            "local_exec": f'"/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe" "C:\\TokenOS\\ahk\\voice-send-keys.ahk"{pane_arg} --navigate',
         }
 
     # Discord-hosted: post AskUserQuestion to Discord channel and notify phone

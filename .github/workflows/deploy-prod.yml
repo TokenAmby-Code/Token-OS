@@ -9,9 +9,11 @@ name: Deploy (prod)
 # DUMB: it does NOT figure out what changed. A GH-hosted runner cannot reach the
 # Mac directly, so it joins the Emperor's tailnet (ephemeral node) and POSTs to
 # token-api's /api/cd/restart webhook. The webhook spawns a single git-aware
-# `token-restart --sync`, which ff-only syncs /Volumes/Imperium/token-os.git main,
-# checks out the requested SHA detached in the runtime checkout, and restarts ONLY
-# the services whose files the merge changed (see
+# `token-restart --sync`, which ff-only syncs the Mac-local CD bare cache
+# (`~/runtimes/Token-OS/token-os.git`) from GitHub main, checks out the requested
+# SHA detached in the deploy-owned runtime checkout, refreshes/verifies the WSL
+# satellite runtime to the same SHA, and restarts ONLY the additional services
+# whose files the merge changed (see
 # map_changed_to_services in cli-tools/bin/token-restart). All the "what changed →
 # what restarts" intelligence lives there, in one git-aware place — not split
 # across this workflow and the webhook. The endpoint is ACK-FIRST: it returns 200

@@ -138,7 +138,7 @@ Smart-deploy flow (default):
          token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
          token-api/{ui,web}/ops/**                  → token-api + reload ops tabs
          discord-daemon/**                          → Discord daemon (launchd)
-         WSL runtime paths (satellite/AHK/cli-tools/refresh helper) → WSL /runtime/refresh
+         every advanced deploy                         → WSL /runtime/refresh + /health.git_sha verify
          mobile/**                                    → push-mobile -a (phone)
     2. If the pull was a no-op (already current) or --no-sync: full restart of
        the standard set (Mac token-api → Discord → WSL), preserving the human
@@ -150,7 +150,8 @@ Notes:
       A dirty runtime NEVER blocks deploy: stray WIP is auto-committed to a
       timestamped wip/live-dirty-<ts> branch and pushed to the bare cache, then
       the tree is reset onto the target SHA. The WIP is recoverable from there.
-    - WSL restart is fire-and-forget if unreachable
+    - WSL runtime refresh in smart deploy is blocking and verified by /health.git_sha
+    - Manual non-refresh WSL restarts remain backgrounded when appropriate
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
     - Discord daemon managed by launchd (ai.tokenclaw.discord) — this is the
@@ -1276,6 +1277,32 @@ check_wsl_health() {
     curl -sf --connect-timeout 2 "http://${WSL_HOST}:${WSL_PORT}/health" > /dev/null 2>&1
 }
 
+wsl_running_git_sha() {
+    curl -sf --connect-timeout 2 "http://${WSL_HOST}:${WSL_PORT}/health" 2>/dev/null \
+        | sed -n 's/.*"git_sha"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+verify_wsl_git_sha() {
+    local expected="${1:-${SYNC_TARGET_SHA:-${TOKEN_RESTART_TARGET_SHA:-}}}"
+    [[ -n "$expected" ]] || return 0
+
+    local attempts=0
+    local max_attempts="${TOKEN_RESTART_WSL_VERIFY_ATTEMPTS:-45}"
+    local got=""
+    while [[ $attempts -lt $max_attempts ]]; do
+        got="$(wsl_running_git_sha || true)"
+        if [[ "$got" == "$expected" ]]; then
+            echo -e "  ${GREEN}✓${NC} WSL deploy verified: /health git_sha=$got"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 2
+    done
+
+    echo -e "  ${RED}✗${NC} WSL DEPLOY VERIFY ALARM: /health git_sha='${got:-unreachable-or-empty}' != target '$expected'" >&2
+    return 1
+}
+
 get_wsl_status() {
     echo -e "${BOLD}WSL satellite${NC} (${WSL_HOST}:${WSL_PORT})"
 
@@ -1358,12 +1385,8 @@ refresh_wsl_runtime() {
         return 0
     fi
     if [[ -z "$TOKEN_SATELLITE_REFRESH_SECRET" ]]; then
-        echo -e "  ${YELLOW}⚠${NC} TOKEN_SATELLITE_REFRESH_SECRET unset; falling back to /restart"
-        local old_refresh="$REFRESH_WSL"
-        REFRESH_WSL=false
-        restart_wsl
-        REFRESH_WSL="$old_refresh"
-        return 0
+        echo -e "  ${RED}✗${NC} TOKEN_SATELLITE_REFRESH_SECRET unset; cannot verify WSL runtime refresh" >&2
+        return 1
     fi
 
     echo -e "${BLUE}→${NC} Refreshing WSL local runtime → ${sha:0:9}..."
@@ -1383,13 +1406,12 @@ PY
         --data "$payload" 2>/tmp/token-wsl-refresh.err || echo "000")
     if [[ "$http_code" =~ ^2 ]]; then
         echo -e "  ${GREEN}✓${NC} WSL runtime refresh scheduled"
+        verify_wsl_git_sha "$sha"
     else
-        echo -e "  ${YELLOW}⚠${NC} WSL refresh failed (HTTP ${http_code}); falling back to /restart"
+        echo -e "  ${RED}✗${NC} WSL refresh failed (HTTP ${http_code}); runtime SHA not updated" >&2
         [[ -s /tmp/token-wsl-refresh.err ]] && sed 's/^/    /' /tmp/token-wsl-refresh.err >&2 || true
-        local old_refresh="$REFRESH_WSL"
-        REFRESH_WSL=false
-        restart_wsl
-        REFRESH_WSL="$old_refresh"
+        [[ -s /tmp/token-wsl-refresh.out ]] && sed 's/^/    /' /tmp/token-wsl-refresh.out >&2 || true
+        return 1
     fi
 }
 
@@ -1778,6 +1800,8 @@ full_restart() {
         map_changed_to_services
         source_tmux_config_if_changed || return 1
         RESTART_TOKENAPI=true
+        RESTART_WSL=true
+        REFRESH_WSL=true
         if [[ "$RESTART_TOKENAPI" != true && "$RESTART_DISCORD" != true \
             && "$RESTART_WSL" != true && "$RESTART_MOBILE" != true \
             && "$RESTART_TMUXCTLD" != true ]]; then
@@ -1842,12 +1866,17 @@ full_restart() {
         echo ""
     fi
 
-    # 4. WSL satellite (background; never blocks the deploy)
+    # 4. WSL satellite. Runtime refreshes are verified by /health.git_sha, so they
+    #    are synchronous and fail loudly instead of silently leaving WSL stale.
     abort_deploy_if_superseded "before WSL refresh" && return 0
     local wsl_pid=""
     if [[ "$RESTART_WSL" == true ]]; then
-        restart_wsl &
-        wsl_pid=$!
+        if [[ "$REFRESH_WSL" == true ]]; then
+            restart_wsl || return 1
+        else
+            restart_wsl &
+            wsl_pid=$!
+        fi
     fi
 
     # 5. Mobile (phone push)

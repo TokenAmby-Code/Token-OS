@@ -28,6 +28,13 @@ $CopyMap = @(
         Target = Join-Path $StartupRoot "ring-remap.ahk"
     },
     @{
+        # ahk_init launches script-compiler from C:\TokenOS\ahk via ahk-nas-wait.
+        # Keep this startup copy fresh as an explicit diagnostic/on-demand copy so
+        # manual copies cannot drift silently.
+        Source = Join-Path $AhkDir "script-compiler.ahk"
+        Target = Join-Path $StartupRoot "script-compiler.ahk"
+    },
+    @{
         Source = Join-Path $PSScriptRoot "Invoke-DeskflowBoot.ps1"
         Target = Join-Path $StartupRoot "Invoke-DeskflowBoot.ps1"
     },
