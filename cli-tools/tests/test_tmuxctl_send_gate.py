@@ -798,6 +798,25 @@ def test_submit_transaction_override_cannot_pierce_human_lock(
     assert result["ignored_override"] == "tmuxctl-submit-transaction"
 
 
+@pytest.mark.parametrize("guard_kind", ["human", "pending"])
+def test_send_gate_policy_rejects_submit_override_for_human_lock(guard_kind: str) -> None:
+    """Policy-level invariant: no submit override pierces HUMAN/PENDING.
+
+    D5 regression: the trailing Enter used ``tmuxctl-submit-transaction`` and
+    policy collapsed any override to ``pierce``.  Even if a caller forgets to
+    scrub the override before asking for policy, a human/pending lock must win.
+    """
+
+    assert (
+        send_gate.send_gate_policy(
+            override="tmuxctl-submit-transaction",
+            reason="typing_guard",
+            guard_kind=guard_kind,
+        )
+        == "delay"
+    )
+
+
 def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> None:
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)

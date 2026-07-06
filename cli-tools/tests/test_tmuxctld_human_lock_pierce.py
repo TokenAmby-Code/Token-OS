@@ -30,7 +30,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
-from tmuxctl import daemon, send_gate, typing_guard_state
+from tmuxctl import daemon, occupancy, send_gate, typing_guard_state
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +38,11 @@ def _isolated_deferred_queue(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.
     monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
     monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
     monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
+    # These tests isolate the typing-guard pierce invariant.  Occupancy/ledger
+    # safety has its own coverage; the fake panes here deliberately use raw
+    # ``%9`` ids and no live tmux.
+    monkeypatch.setattr(occupancy, "assert_comms_delivery_target_occupied", lambda *a, **k: None)
+    monkeypatch.setattr(occupancy, "assert_dispatch_target_available", lambda *a, **k: None)
 
 
 class _RecordingAdapter:

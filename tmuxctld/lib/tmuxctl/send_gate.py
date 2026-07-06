@@ -524,6 +524,8 @@ def send_gate_policy(
     override: str | None = None,
     reason: str | None = None,
     drop_reason: str | None = None,
+    guard_kind: str | None = None,
+    human_locked: bool = False,
 ) -> str:
     """Return the delay/cancel/pierce disposition for a positive gate signal.
 
@@ -532,6 +534,14 @@ def send_gate_policy(
     (never drop a prompt merely because the Emperor was typing), and sanctioned
     direct-input sends pierce.
     """
+    normalized_kind = str(guard_kind or "").strip().lower()
+    if reason == "typing_guard" and (human_locked or normalized_kind in {"human", "pending"}):
+        # D5 invariant: no override is allowed to pierce a real keystroke or
+        # pending-submit lock.  Transaction overrides exist only to pierce the
+        # daemon's own AGENT hold; HUMAN/PENDING precedence lives at policy level
+        # so callers cannot accidentally turn a trailing Enter into a blanket
+        # pierce by passing an override reason.
+        return "delay"
     explicit = os.environ.get(_SEND_GATE_POLICY_ENV, "").strip().lower()
     explicit_drop_reason = (drop_reason or os.environ.get(_SEND_GATE_DROP_REASON_ENV, "")).strip()
     if explicit in _SEND_GATE_POLICIES:
@@ -658,12 +668,15 @@ def evaluate(
     guard_status = {"kind": "off", "until": None, "owner": None, "active": False, "marker": ""}
     effective_override = override
     ignored_owner = None
+    human_locked = False
+    explicit_policy = os.environ.get(_SEND_GATE_POLICY_ENV, "").strip().lower()
     if reason == "typing_guard" and target and override:
         kind = "off"
         if override in _AGENT_OWNER_OVERRIDES or override == os.environ.get(_SEND_GATE_ALLOW_ENV, "").strip():
             guard_status = _pane_guard_status(target)
             kind = str(guard_status.get("kind") or "off")
-        if kind in {"human", "pending"} or _pane_human_locked(target):
+        human_locked = kind in {"human", "pending"} or _pane_human_locked(target)
+        if kind in {"human", "pending"} or human_locked:
             effective_override = None
         elif kind == "agent":
             pane_owner = str(guard_status.get("owner") or "").strip()
@@ -671,10 +684,29 @@ def evaluate(
             if override not in _AGENT_OWNER_OVERRIDES or not pane_owner or thread_owner != pane_owner:
                 ignored_owner = thread_owner
                 effective_override = None
-    policy = send_gate_policy(override=override, reason=reason, drop_reason=drop_reason)
+    elif reason == "typing_guard" and target and explicit_policy == "pierce":
+        # Explicit policy pierce is rare, but still cannot override a HUMAN or
+        # PENDING lock. Avoid this extra tmux read for ordinary delay/cancel
+        # decisions; typing_guard_active() already proved the positive signal.
+        guard_status = _pane_guard_status(target)
+        human_locked = str(guard_status.get("kind") or "").lower() in {
+            "human",
+            "pending",
+        } or _pane_human_locked(target)
+    policy = send_gate_policy(
+        override=override,
+        reason=reason,
+        drop_reason=drop_reason,
+        guard_kind=guard_status.get("kind"),
+        human_locked=human_locked,
+    )
     if effective_override != override:
         policy = send_gate_policy(
-            override=effective_override, reason=reason, drop_reason=drop_reason
+            override=effective_override,
+            reason=reason,
+            drop_reason=drop_reason,
+            guard_kind=guard_status.get("kind"),
+            human_locked=human_locked,
         )
     result = {
         "suppressed": policy != "pierce",
