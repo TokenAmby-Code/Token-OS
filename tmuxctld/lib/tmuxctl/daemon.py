@@ -3772,6 +3772,14 @@ def _h_instance_unset_option(control, params):
     return control.instance_unset_option(_s(params, "instance_id"), _s(params, "option"))
 
 
+def _h_instance_rename(control, params):
+    return control.instance_rename(
+        _s(params, "name"),
+        instance_id=_s(params, "instance_id"),
+        pane=_s(params, "pane"),
+    )
+
+
 def _h_context_governor_inject(control, params):
     """Daemon-owned actuation for Token-API context governor forced prompts."""
     text = _s(params, "text")
@@ -4265,6 +4273,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     # Instance-id ops (POST)
     ("POST", "/instance/set-option"): _h_instance_set_option,
     ("POST", "/instance/unset-option"): _h_instance_unset_option,
+    ("POST", "/instance/rename"): _h_instance_rename,
     ("POST", "/context-governor/inject"): _h_context_governor_inject,
     ("POST", "/context-governor/stop"): _h_context_governor_stop,
     ("POST", "/instance/send-text"): _h_instance_send_text,

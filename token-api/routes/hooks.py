@@ -1996,56 +1996,6 @@ def _spawn_stack_enforce(window_target: str | None) -> None:
         logger.warning("mark-for-close stack enforce spawn failed for %s: %s", window_target, exc)
 
 
-async def _cleanup_tmux_pane_cosmetic(pane: str) -> None:
-    commands: list[tuple[str, ...]] = [
-        ("select-pane", "-t", pane, "-T", ""),
-        ("set-option", "-pu", "-t", pane, "window-style"),
-        ("set-option", "-pu", "-t", pane, "window-active-style"),
-    ]
-    for cmd in commands:
-        try:
-            await shared.tmuxctld_run_tmux(cmd, timeout=2)
-        except Exception:  # noqa: BLE001 - cleanup is best-effort
-            pass
-
-
-async def _cleanup_tmux_pane_runtime_stamps(pane: str) -> None:
-    commands: list[tuple[str, ...]] = []
-    for opt in (
-        "@INSTANCE_ID",
-        "@CC_STATE",
-        "@PANE_LABEL",
-        "@ACTIVE_TITLE",
-        "@PROGRESS_TITLE",
-        "@PANE_PROGRESS",
-        "@TTS_STATE",
-        "@CONTEXT_INFO",
-        "@STACK_PENDING",
-        "@GT_FIRE",
-        "@PLANNING_STATE",
-        "@PLANNING_AGENT",
-        "@DISCORD_VOICE_LOCK",
-        "@DISCORD_VOICE_PROCESSING",
-        "@TOKEN_API_WRAPPER_LAUNCH_ID",
-        "@TOKEN_API_ENGINE",
-        "@TOKEN_API_LAUNCHER",
-        "@TOKEN_API_CWD",
-        "@TOKEN_API_SESSION_ID",
-        "@TOKEN_API_DISPATCH_TARGET",
-        "@TOKEN_API_DISPATCH_WINDOW",
-        "@TOKEN_API_DISPATCH_MODE",
-        "@TOKEN_API_DISPATCH_SLOT",
-        "@TOKEN_API_LAUNCH_MODE",
-        "@TOKEN_API_TARGET_WORKING_DIR",
-    ):
-        commands.append(("set-option", "-pu", "-t", pane, opt))
-    for cmd in commands:
-        try:
-            await shared.tmuxctld_run_tmux(cmd, timeout=2)
-        except Exception:  # noqa: BLE001 - cleanup is best-effort
-            pass
-
-
 async def _close_tmux_pane_for_mark(pane: str | None) -> dict:
     # Boundary doctrine (PHASE B sever): token-api makes ZERO tmux kill
     # decisions. The mark-for-close stop-subscription still drives the DB

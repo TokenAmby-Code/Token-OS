@@ -23747,19 +23747,28 @@ async def process_pane_state_queue_once() -> list[dict]:
                 continue
             status = "applied"
             try:
-                result = await shared.tmuxctld_run_tmux(
-                    (
-                        "set-option",
-                        "-p",
-                        "-t",
-                        pane,
-                        row["variable"],
-                        row["value"],
-                    ),
-                    timeout=5,
-                )
-                if result is None:
-                    status = "failed"
+                if row["variable"] == "@PANE_LABEL":
+                    # Semantic rename: tmuxctld owns BOTH the @PANE_LABEL border
+                    # nametag AND the native pane title. token-api no longer authors
+                    # a raw set-option @PANE_LABEL. Pass the already-resolved pane;
+                    # the daemon fails closed on an unresolved target.
+                    envelope = await shared.tmuxctld_rename_pane(pane=pane, name=row["value"])
+                    if not (isinstance(envelope, dict) and envelope.get("ok")):
+                        status = "failed"
+                else:
+                    result = await shared.tmuxctld_run_tmux(
+                        (
+                            "set-option",
+                            "-p",
+                            "-t",
+                            pane,
+                            row["variable"],
+                            row["value"],
+                        ),
+                        timeout=5,
+                    )
+                    if result is None:
+                        status = "failed"
                 logger.info(
                     f"Pane state: {row['instance_id'][:12]} {row['variable']}={row['value']} (pane={pane})"
                 )

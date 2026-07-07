@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import urllib.request
+from types import SimpleNamespace
 
 # The daemon package lives in root tmuxctld; add its lib to the path so
 # the in-process server can be imported here (stdlib-only — no venv needed).
@@ -152,6 +153,142 @@ def test_tmuxctld_url_rejects_non_loopback(app_env, monkeypatch) -> None:
     # Loopback http -> honoured.
     monkeypatch.setenv("TMUXCTLD_URL", "http://127.0.0.1:7778")
     assert shared._tmuxctld_url() == "http://127.0.0.1:7778"
+
+
+# ---------------------------------------------------------------------------
+# instance_rename: tmuxctld owns BOTH the @PANE_LABEL border nametag AND the
+# native pane title. Resolution precedence is pane -> instance_id; an unresolved
+# target FAILS CLOSED with zero tmux mutation (mirrors instance_set_option).
+# ---------------------------------------------------------------------------
+
+
+class RecordingAdapter:
+    """Records every ``run`` argv; ``resolve_pane`` is stubbed at module scope."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def list_sessions(self) -> list:
+        return []
+
+    def run(self, *args: str, allow_failure: bool = False) -> str:
+        self.calls.append(tuple(args))
+        return ""
+
+
+def test_instance_rename_by_pane_issues_both_writes(app_env, monkeypatch) -> None:
+    from tmuxctl import service as svc
+
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(
+        svc, "resolve_pane", lambda a, target: SimpleNamespace(pane_id="%42", pane_role="mars:E")
+    )
+    control = svc.TmuxControlPlane(adapter)
+
+    result = control.instance_rename("auth-refactor", pane="mars:E")
+
+    assert result == {
+        "found": True,
+        "target": "%42",
+        "pane_role": "mars:E",
+        "name": "auth-refactor",
+    }
+    # BOTH the border nametag (@PANE_LABEL) and the native pane title (-T) are set,
+    # and nothing else — select-pane -T is the title-only, camera-neutral form.
+    assert adapter.calls == [
+        ("set-option", "-p", "-t", "%42", "@PANE_LABEL", "auth-refactor"),
+        ("select-pane", "-t", "%42", "-T", "auth-refactor"),
+    ]
+
+
+def test_instance_rename_by_instance_id_issues_both_writes(app_env, monkeypatch) -> None:
+    from tmuxctl import service as svc
+
+    adapter = RecordingAdapter()
+    control = svc.TmuxControlPlane(adapter)
+    monkeypatch.setattr(
+        control,
+        "resolve_instance",
+        lambda iid: {"found": True, "pane_id": "council:1", "pane_role": "council:1"},
+    )
+
+    result = control.instance_rename("mars-worker", instance_id="uuid-1")
+
+    assert result["found"] is True
+    assert result["target"] == "council:1"
+    assert result["pane_role"] == "council:1"
+    assert adapter.calls == [
+        ("set-option", "-p", "-t", "council:1", "@PANE_LABEL", "mars-worker"),
+        ("select-pane", "-t", "council:1", "-T", "mars-worker"),
+    ]
+
+
+def test_instance_rename_fail_closed_on_unresolved_pane(app_env, monkeypatch) -> None:
+    from tmuxctl import service as svc
+
+    adapter = RecordingAdapter()
+
+    def _boom(a, target):
+        raise ValueError("pane target not found")
+
+    monkeypatch.setattr(svc, "resolve_pane", _boom)
+    control = svc.TmuxControlPlane(adapter)
+
+    result = control.instance_rename("x", pane="ghost:9")
+
+    assert result["found"] is False
+    assert adapter.calls == [], "an unresolved pane must yield ZERO tmux mutation"
+
+
+def test_instance_rename_fail_closed_on_unresolved_instance(app_env, monkeypatch) -> None:
+    from tmuxctl import service as svc
+
+    adapter = RecordingAdapter()
+    control = svc.TmuxControlPlane(adapter)
+    monkeypatch.setattr(
+        control, "resolve_instance", lambda iid: {"found": False, "pane_id": "", "pane_role": ""}
+    )
+
+    result = control.instance_rename("x", instance_id="dead-uuid")
+
+    assert result["found"] is False
+    assert adapter.calls == [], "an unresolved instance must yield ZERO tmux mutation"
+
+
+def test_shared_tmuxctld_rename_pane_e2e(app_env, monkeypatch) -> None:
+    """End-to-end: ``shared.tmuxctld_rename_pane`` -> live daemon -> both tmux writes."""
+    shared = sys.modules["shared"]
+    from tmuxctl import service as svc
+
+    recorded: list[tuple[str, ...]] = []
+
+    class E2EAdapter:
+        def list_sessions(self) -> list:
+            return []
+
+        def run(self, *args: str, allow_failure: bool = False) -> str:
+            recorded.append(tuple(args))
+            return ""
+
+    monkeypatch.setattr(
+        svc, "resolve_pane", lambda a, target: SimpleNamespace(pane_id="%7", pane_role="palace:1")
+    )
+    server = _serve_daemon(lambda: E2EAdapter())
+    try:
+        monkeypatch.setenv("TMUXCTLD_URL", _url_for(server))
+        envelope = asyncio.run(shared.tmuxctld_rename_pane(pane="palace:1", name="deploy-fix"))
+
+        assert envelope is not None and envelope.get("ok") is True
+        assert envelope["result"] == {
+            "found": True,
+            "target": "%7",
+            "pane_role": "palace:1",
+            "name": "deploy-fix",
+        }
+        assert ("set-option", "-p", "-t", "%7", "@PANE_LABEL", "deploy-fix") in recorded
+        assert ("select-pane", "-t", "%7", "-T", "deploy-fix") in recorded
+    finally:
+        server.shutdown()
 
 
 def test_loopback_client_bypasses_env_proxy(app_env, monkeypatch) -> None:

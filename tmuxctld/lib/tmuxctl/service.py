@@ -1312,6 +1312,39 @@ class TmuxControlPlane:
             "pane_role": resolved["pane_role"],
         }
 
+    def instance_rename(self, name: str, *, instance_id: str = "", pane: str = "") -> dict:
+        """Own a pane's identity: the ``@PANE_LABEL`` border nametag AND native title.
+
+        Semantic replacement for token-api authoring a raw ``set-option @PANE_LABEL``
+        through ``/tmux/run`` — the daemon is the sole writer of pane identity.
+        Resolution precedence: an explicit ``pane`` (already live-resolved by the
+        caller) wins; otherwise ``instance_id`` resolves to its live pane via the
+        wrapper ledger. FAILS CLOSED — an unresolved target means ``{found: False}``
+        and zero tmux mutation, never a rename against the wrong (or a dead) pane.
+        """
+        if pane:
+            try:
+                resolved = resolve_pane(self.adapter, pane)
+            except Exception:  # noqa: BLE001 — a missing/dead pane is a fail-closed no-op
+                return {"found": False, "target": pane, "pane_role": "", "name": name}
+            target = resolved.pane_id
+            pane_role = resolved.pane_role
+        else:
+            resolved = self.resolve_instance(instance_id)
+            if not resolved["found"]:
+                return {"found": False, "target": instance_id, "pane_role": "", "name": name}
+            target = resolved["pane_id"]
+            pane_role = resolved["pane_role"]
+        # Border nametag: pane-border-format reads ONLY @PANE_LABEL (zero fork per
+        # redraw). adapter.run auto-resolves a canonical role target to its physical
+        # %id, so an instance-role and a physical pane target both land correctly.
+        self.adapter.run("set-option", "-p", "-t", target, "@PANE_LABEL", name)
+        # Native pane title. select-pane -T is the TITLE-ONLY form (not rename-pane):
+        # camera-neutral per tmux_adapter._select_pane_title_only, so a rename never
+        # snaps the operator's focus onto the renamed pane.
+        self.adapter.run("select-pane", "-t", target, "-T", name)
+        return {"found": True, "target": target, "pane_role": pane_role, "name": name}
+
     def instance_unset_option(self, instance_id: str, option: str) -> dict:
         """Unset a pane option on an instance's live pane; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)

@@ -54,13 +54,13 @@ def test_instance_name_endpoint_renames_active_pane(client, app_env):
 
     resp = client.post(
         "/api/instance/rename",
-        json={"tmux_pane": "%77", "tab_name": "anti-archaeology-cli"},
+        json={"pane_id": "%77", "name": "anti-archaeology-cli"},
     )
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["instance_id"] == instance_id
-    assert body["tab_name"] == "anti-archaeology-cli"
+    assert body["name"] == "anti-archaeology-cli"
 
     conn = _db(app_env)
     row = conn.execute(
@@ -78,6 +78,27 @@ def test_instance_name_endpoint_renames_active_pane(client, app_env):
     assert "name" in mutation["field_names_json"]
 
 
+def test_rename_enqueues_exactly_one_pane_label_row(client, app_env):
+    """The rename route commits ``instances.name``, firing ``trg_tab_name_pane_state``
+    into exactly one ``@PANE_LABEL`` queue row. The trigger is the single writer of the
+    border-nametag intent; the semantic-rename cutover left it untouched."""
+    instance_id = _insert_instance(app_env)
+
+    resp = client.post(
+        "/api/instance/rename",
+        json={"pane_id": "%77", "name": "border-nametag-name"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    conn = _db(app_env)
+    rows = conn.execute(
+        "SELECT instance_id, variable, value FROM pane_state_queue WHERE variable = '@PANE_LABEL'",
+    ).fetchall()
+    conn.close()
+
+    assert [tuple(r) for r in rows] == [(instance_id, "@PANE_LABEL", "border-nametag-name")]
+
+
 @pytest.mark.parametrize(
     "tab_name,detail",
     [
@@ -93,7 +114,7 @@ def test_instance_name_endpoint_rejects_invalid_names(client, app_env, tab_name,
 
     resp = client.post(
         "/api/instance/rename",
-        json={"tmux_pane": "%77", "tab_name": tab_name},
+        json={"pane_id": "%77", "name": tab_name},
     )
 
     assert resp.status_code == 400
@@ -105,17 +126,17 @@ def test_instance_name_endpoint_requires_matching_active_pane(client, app_env):
 
     resp = client.post(
         "/api/instance/rename",
-        json={"tmux_pane": "%stopped", "tab_name": "valid-name"},
+        json={"pane_id": "%stopped", "name": "valid-name"},
     )
 
     assert resp.status_code == 404
 
 
-def test_instance_name_endpoint_requires_tmux_pane(client):
+def test_instance_name_endpoint_requires_pane_id(client):
     resp = client.post(
         "/api/instance/rename",
-        json={"tmux_pane": "", "tab_name": "valid-name"},
+        json={"pane_id": "", "name": "valid-name"},
     )
 
     assert resp.status_code == 400
-    assert "tmux_pane" in resp.json()["detail"]
+    assert "pane_id" in resp.json()["detail"]
