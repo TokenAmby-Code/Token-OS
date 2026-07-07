@@ -10,8 +10,8 @@ write lock for LONGER than the busy_timeout.
 Root cause: ``handle_session_start`` opened its connection in the default
 *deferred* isolation level, so the registration INSERT took the WAL write lock
 and the handler then held it across slow tmux/SMB side effects
-(``_stamp_instance_id`` → tmux subprocess, ``resolve_session_doc_for_start`` →
-vault/SMB I/O, pane tint, frontmatter writes) before its first commit. While the
+(``resolve_session_doc_for_start`` → vault/SMB I/O, pane tint,
+frontmatter writes) before its first commit. While the
 lock was held for those multi-second awaits, every other writer — the timer
 sampler, ``log_event``, and *other* concurrent SessionStart handlers — was
 starved and eventually errored ``database is locked``.
@@ -62,9 +62,9 @@ def test_sessionstart_releases_write_lock_during_slow_side_effects(
 ) -> None:
     """SessionStart must not hold the write lock across its slow side effects.
 
-    We park the handler inside ``_stamp_instance_id`` — which on the new-instance
-    path runs AFTER the registration INSERT — and, from another thread, fire a
-    concurrent writer with a short (250 ms) busy_timeout. On the buggy deferred
+    We park the handler inside ``resolve_session_doc_for_start`` — which on the
+    new-instance path runs AFTER the registration INSERT — and, from another
+    thread, fire a concurrent writer with a short (250 ms) busy_timeout. On the buggy deferred
     path the handler still holds the write lock from the INSERT, so the probe is
     starved and raises ``database is locked``. With the autocommit fix the INSERT
     has already committed, the lock is free, and the probe succeeds.
@@ -75,14 +75,14 @@ def test_sessionstart_releases_write_lock_during_slow_side_effects(
     entered = threading.Event()
     probe_done = threading.Event()
 
-    async def slow_stamp(*_a: object, **_k: object) -> None:
+    async def slow_resolve_session_doc(*_a: object, **_k: object) -> tuple[None, str]:
         # Mid-handler, after the durable INSERT. Hold the window open so the
         # concurrent probe can observe whether the write lock is still held.
         entered.set()
         await asyncio.get_event_loop().run_in_executor(None, probe_done.wait, 5.0)
-        return None
+        return None, "interactive_deferred"
 
-    monkeypatch.setattr(hooks, "_stamp_instance_id", slow_stamp)
+    monkeypatch.setattr(hooks, "resolve_session_doc_for_start", slow_resolve_session_doc)
 
     result: dict[str, object] = {}
 

@@ -970,8 +970,8 @@ async def instance_id_for_pane(pane: str | None) -> str | None:
     """Reverse of :func:`resolve_instance_pane`: read a pane's live ``@INSTANCE_ID``
     stamp (``pane -> instance_id``).
 
-    tmuxctl and the agent wrapper own the stamp — set at register, cleared on agent
-    death — so the pane itself is the authoritative reverse bridge. token-api keeps
+    tmuxctld and the agent wrapper own the stamp lifecycle, so the pane itself is
+    the authoritative reverse bridge. token-api keeps
     no tmux-pane perspective; this is the only reverse lookup, replacing every
     legacy stored-pane query. Fails closed: any
     miss, error, or unstamped/dead pane returns ``None`` so callers never act on a

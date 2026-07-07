@@ -1530,7 +1530,7 @@ _TOKEN_API_TMUX_RUN_COMMANDS = frozenset(
 
 
 def _h_tmux_run(control, params):
-    """Small allowlisted tmux adapter bridge for legacy Token-API reads/stamps.
+    """Small allowlisted tmux adapter bridge for legacy Token-API reads.
 
     This is not a shell escape hatch: callers supply argv tokens, ``send-keys``
     is deliberately excluded in favour of the existing send-text/send-keys
@@ -3134,8 +3134,8 @@ def _h_hook_wrapperstart(control, params):
     """Authoritative tmux-side wrapper registration at agent birth.
 
     The symmetric front-half of :func:`_h_hook_wrapperend`. Token-API owns the
-    instance (DB row + ``@INSTANCE_ID``, stamped from SessionStart); tmuxctld owns
-    the wrapper's pane-local identity. So at wrapper start the daemon:
+    instance registry/session state; tmuxctld owns the wrapper's pane-local
+    identity and ledger reconciliation. So at wrapper start the daemon:
 
     1. Stamps the wrapper-ownership id (``@TOKEN_API_WRAPPER_LAUNCH_ID``) so the
        later WrapperEnd can always find + clear its own pane, even if the wrapper's
@@ -3144,7 +3144,7 @@ def _h_hook_wrapperstart(control, params):
        its tint immediately. This binds from the LABEL, not from ``@INSTANCE_ID``,
        so a singleton seat (Custodes / Fabricator-General) is never left tint-less
        in the window between WrapperEnd clearing the pane and the next
-       SessionStart/reconcile landing — the empty-stamp → no-tint root.
+       wrapper/reconcile landing — the empty-stamp → no-tint root.
 
     Fail-open and idempotent: a missing pane is a successful no-op (the wrapper
     fires this best-effort; it must never block a launch).

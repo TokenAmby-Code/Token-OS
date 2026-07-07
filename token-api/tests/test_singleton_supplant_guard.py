@@ -73,8 +73,6 @@ def _blind_tmuxctl(hooks, monkeypatch):
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", _none)
     monkeypatch.setattr(hooks.shared, "instance_id_for_pane", _none)
-    monkeypatch.setattr(hooks, "_stamp_instance_id", _astamp)
-    monkeypatch.setattr(hooks, "_unstamp_instance_id", _astamp)
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", _sync_noop)
     monkeypatch.setattr(hooks.shared, "apply_instance_pane_tint", _astamp)
 
