@@ -49,6 +49,7 @@ def test_skills_sync_install_preserves_system_and_links_shared_skills(tmp_path):
     skill = _write_skill(canonical, "preplan")
     _write_openai_yaml(skill, allow_implicit=True)
     postplan = _write_skill(canonical, "postplan")
+    _write_openai_yaml(postplan, allow_implicit=True)
     aux = _write_skill(canonical, "aux")
     commands = tmp_path / "home" / ".claude" / "commands"
     commands.mkdir(parents=True)
@@ -123,6 +124,17 @@ def test_skills_sync_check_requires_preplan_openai_visibility_policy(tmp_path):
     assert result.returncode == 1
     data = json.loads(result.stdout)
     assert any(f["code"] == "preplan_not_model_visible" for f in data["findings"])
+
+
+def test_skills_sync_check_requires_postplan_openai_visibility_policy(tmp_path):
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    _write_skill(canonical, "postplan")
+
+    result = _run(tmp_path, canonical, "--check", "--json")
+    assert result.returncode == 1
+    data = json.loads(result.stdout)
+    assert any(f["code"] == "postplan_not_model_visible" for f in data["findings"])
 
 
 def test_skills_sync_skip_commands_repairs_all_skill_roots_without_command_shims(tmp_path):

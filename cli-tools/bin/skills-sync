@@ -232,14 +232,14 @@ def inspect(*, skip_claude: bool = False, skip_commands: bool = False) -> dict[s
         names.setdefault(name, []).append(str(skill))
 
         visibility: dict[str, str] = {}
-        if name == "preplan":
+        if name in CLAUDE_COMMAND_SKILLS:
             if _openai_allow_implicit(skill) is not True:
                 findings.append(
                     Finding(
                         "error",
-                        "preplan_not_model_visible",
+                        f"{name}_not_model_visible",
                         str(skill / "agents" / "openai.yaml"),
-                        "preplan must remain model-visible because Shift+Tab inserts literal $preplan text in Codex",
+                        f"{name} must remain model-visible because literal ${name} invocation in Codex depends on skill visibility",
                     )
                 )
         if name in CLAUDE_COMMAND_SKILLS and not skip_commands:
