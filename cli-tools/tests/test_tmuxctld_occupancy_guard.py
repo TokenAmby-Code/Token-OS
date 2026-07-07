@@ -146,11 +146,14 @@ def test_daemon_send_text_allows_dispatch_clear_into_empty_worker(monkeypatch):
 
 
 class LedgerGateAdapter:
-    def __init__(self, *, role="palace:N", pane="%90", pid=1900) -> None:
+    def __init__(
+        self, *, role="palace:N", pane="%90", pid=1900, expose_wrapper_stamp: bool = False
+    ) -> None:
         self.pane_id = pane
         self.pane_role = role
         self.window_name = role.split(":", 1)[0]
         self.pane_pid = pid
+        self.expose_wrapper_stamp = expose_wrapper_stamp
         self.sends: list[tuple[str, ...]] = []
         self.buffer = ""
 
@@ -186,6 +189,23 @@ class LedgerGateAdapter:
         return f"{self.pane_id}	{self.pane_role}	{self.window_name}	{self.pane_pid}	0"
 
     def run(self, *args: str, allow_failure: bool = False) -> str:
+        if args[:3] == ("list-panes", "-a", "-F") and self.expose_wrapper_stamp:
+            from tmuxctl import wrapper_ledger
+
+            sep = wrapper_ledger._SCAN_SEP
+            return sep.join(
+                [
+                    f"wrap-{self.pane_role}",
+                    "",
+                    f"inst-{self.pane_role}",
+                    "worker",
+                    self.pane_role,
+                    "codex",
+                    "/tmp/fake-agent",
+                    "123.5",
+                    "0",
+                ]
+            )
         if args[0] == "display-message":
             fmt = args[-1]
             if fmt == "#{pane_pid}":
@@ -230,7 +250,7 @@ def test_comms_send_proceeds_when_ledger_and_sniff_occupied(monkeypatch):
 
     monkeypatch.setattr(occupancy, "_active_agent", lambda pane_pid: pane_pid == 1900)
     _seed_ledger("palace:N")
-    adapter = LedgerGateAdapter(role="palace:N", pid=1900)
+    adapter = LedgerGateAdapter(role="palace:N", pid=1900, expose_wrapper_stamp=True)
     server = _serve(adapter)
     try:
         payload = _post(server, "/send-text", {"pane": "%90", "text": "hello", "submit": False})
@@ -262,7 +282,7 @@ def test_comms_send_refuses_blank_ledger_unoccupied_pane(monkeypatch):
 def test_comms_send_loud_p0_when_ledger_and_sniff_disagree(monkeypatch):
     from tmuxctl import occupancy, wrapper_ledger
 
-    adapter = LedgerGateAdapter(role="palace:E", pid=1902)
+    adapter = LedgerGateAdapter(role="palace:E", pid=1902, expose_wrapper_stamp=True)
 
     _seed_ledger("palace:E")
     monkeypatch.setattr(occupancy, "_active_agent", lambda pane_pid: False)

@@ -2,9 +2,8 @@
 
 Falsified #198 (2026-06-13, %19/palace:S): driving a live claude through
 ``/plan`` enter→accept produced — under ONE wrapper launch — a fresh row + a
-new ``needs-name`` session doc, retired the prior row, and left the pane's
-``@INSTANCE_ID`` stamp empty. That is the exact continuity break #198's
-stamp-reuse was meant to close.
+new ``needs-name`` session doc, retired the prior row, and left no pane-local identity for tmuxctld to reconcile. That is the
+continuity break the wrapper_launch_id backstop closes.
 
 Root cause is a race, not a wrong handler. Plan-accept fires ``SessionEnd``
 then ``SessionStart`` in the SAME wrapper:
@@ -23,14 +22,14 @@ then ``SessionStart`` in the SAME wrapper:
 Two layers under test:
 
   * **Layer 1** — a non-terminal ``SessionEnd`` (``reason`` in {clear, compact})
-    short-circuits BEFORE the stop, so the live row + stamp survive and the
-    clean #198 stamp path re-keys with no further change. As a boundary guard it
-    also confirms no tmuxctl pane-control is invoked.
+    short-circuits BEFORE the stop, so the live row survives for the paired
+    SessionStart. As a boundary guard it also confirms no tmuxctl pane-control is
+    invoked. Pane-local stamp continuity is tmuxctld/wrapper-owned.
   * **Layer 2** — a stamp-independent backstop: a ``SessionStart`` carrying a
     known ``wrapper_launch_id`` adopts the existing row keyed on that id
     (re-key, one row, no zombie) even if the stamp is lost for any reason.
 
-Companion to ``test_session_start_stamp_reuse.py`` (the #198 stamp path).
+Companion to the read-only pane-stamp adoption tests.
 """
 
 from __future__ import annotations
@@ -49,19 +48,15 @@ _FAKE_PANE = "%999019"
 def _insert(db_path, instance_id, *, pane=None, status="idle", wrapper_launch_id=None):
     # Pane liveness is no longer a stored column; ``pane`` is vestigial test data.
     conn = sqlite3.connect(db_path)
+    persona_id = conn.execute("SELECT id FROM personas WHERE slug='blood-angels'").fetchone()[0]
     conn.execute(
-        """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status)
-           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'p', 'v', 's', ?)""",
-        (instance_id, f"{instance_id}-session", instance_id, status),
+        """INSERT INTO instances
+             (id, name, working_dir, origin_type, device_id, persona_id, rank,
+              status, wrapper_launch_id, last_activity)
+           VALUES (?, ?, '/tmp', 'local', 'Mac-Mini', ?, 'astartes', ?, ?,
+                   '2026-07-01T00:00:00')""",
+        (instance_id, instance_id, persona_id, status, wrapper_launch_id),
     )
-    if wrapper_launch_id is not None:
-        # wrapper_launch_id lives on the real instances table, not the legacy view.
-        conn.execute(
-            "UPDATE instances SET wrapper_launch_id = ? WHERE id = ?",
-            (wrapper_launch_id, instance_id),
-        )
     conn.commit()
     conn.close()
 
@@ -81,7 +76,7 @@ def _status(db_path, instance_id):
 
 
 def _blind_tmuxctl(hooks, monkeypatch):
-    """The race aftermath: no live pane resolution, no surviving stamp."""
+    """The race aftermath: no live pane resolution, no payload stamp."""
 
     async def no_label(_pane):
         return None
@@ -95,14 +90,7 @@ def _blind_tmuxctl(hooks, monkeypatch):
 
 
 def _mute_tmux_writes(hooks, monkeypatch):
-    """Neutralize every tmux-WRITE side effect the hooks perform.
-
-    ``_stamp_instance_id`` / ``_unstamp_instance_id`` shell out to
-    ``tmux set-option`` and the tint helpers recolor the live pane. Unmocked +
-    a real pane id, the suite would clobber the live pane's ``@INSTANCE_ID`` /
-    ``@PANE_LABEL`` / tint (it did, once — see PANE constant below). These tests
-    assert on DB rows only, so the writes are pure noise: stub them all.
-    """
+    """Neutralize tint writes; these tests assert on DB rows only."""
 
     async def _astamp(*_args, **_kwargs):
         return None
@@ -110,8 +98,6 @@ def _mute_tmux_writes(hooks, monkeypatch):
     def _sync_noop(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(hooks, "_stamp_instance_id", _astamp)
-    monkeypatch.setattr(hooks, "_unstamp_instance_id", _astamp)
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", _sync_noop)
     monkeypatch.setattr(hooks.shared, "apply_instance_pane_tint", _astamp)
 
@@ -152,7 +138,7 @@ def _end(hooks, payload):
 
 
 def test_wrapper_launch_id_adopts_prior_row_when_stamp_lost(app_env, monkeypatch):
-    """No stamp, no pane_instance_id — but the same wrapper_launch_id survives.
+    """No pane stamp payload — but the same wrapper_launch_id survives.
 
     The SessionStart must adopt (re-key) the prior row, not mint a duplicate.
     RED today: with the stamp gone the handler falls through to the mint.
@@ -174,7 +160,7 @@ def test_wrapper_launch_id_adopts_prior_row_when_stamp_lost(app_env, monkeypatch
             "cwd": "/tmp",
             "pid": 4242,
             "wrapper_launch_id": "LAUNCH-abc123",
-            # no pane_instance_id — the stamp was torn down by the race
+            # no pane-stamp payload — the stamp was torn down by the race
             "env": {"TMUX_PANE": _FAKE_PANE, "TOKEN_API_ENGINE": "claude"},
         },
     )
@@ -239,7 +225,7 @@ def test_wrapper_launch_id_blank_does_not_adopt(app_env, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Layer 1 — non-terminal SessionEnd preserves the row + stamp                  #
+# Layer 1 — non-terminal SessionEnd preserves the row                          #
 # --------------------------------------------------------------------------- #
 
 
@@ -256,7 +242,7 @@ def test_clear_session_end_preserves_row_and_skips_tmuxctl(
     _end(hooks, {"session_id": "clr", "reason": "clear"})
 
     assert _status(app_env.db_path, "clr") != "stopped", (
-        "non-terminal clear must not stop the row (stamp/continuity must survive)"
+        "non-terminal clear must not stop the row (continuity must survive)"
     )
     assert calls == [], f"non-terminal clear must not invoke tmuxctl: {calls}"
 

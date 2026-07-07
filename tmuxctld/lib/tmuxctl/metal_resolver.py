@@ -2,8 +2,8 @@
 
 The DB-anchored restart path (planner.py / executor.py) resumes from
 ``/api/instances`` and is only as good as the registry — which is churned out
-from under us (``_unstamp_instance_id``, post-Slice-B ``pane_label`` loss,
-stale status) and structurally blind to codex (own store under ``~/.codex``).
+from under us (legacy pane-stamp churn, post-Slice-B ``pane_label`` loss, stale
+status) and structurally blind to codex (own store under ``~/.codex``).
 
 This module is the parallel, DB-free observation layer: the literal live panes
 are the source of truth. Per pane we read only tmux (``pane_pid``,

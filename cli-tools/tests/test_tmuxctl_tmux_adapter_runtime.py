@@ -59,6 +59,21 @@ def test_respawn_pane_clears_runtime_options_and_style_before_respawn(
     assert ("select-pane", "-t", "%9", "-T", "") in before_respawn
     for option in RUNTIME_PANE_OPTIONS:
         assert ("set-option", "-pu", "-t", "%9", option) in before_respawn
+    assert ("set-option", "-pu", "-t", "%9", "@TOKEN_API_WRAPPER_ID") in before_respawn
+    assert ("set-option", "-pu", "-t", "%9", "@TOKEN_API_WRAPPER_LAUNCH_ID") in before_respawn
+
+
+def test_clear_runtime_state_clears_both_wrapper_id_stamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeTmux()
+    fake.patch(monkeypatch)
+    adapter = TmuxAdapter(tmux_binary="tmux")
+
+    adapter.clear_runtime_state("%9")
+
+    assert ("set-option", "-pu", "-t", "%9", "@TOKEN_API_WRAPPER_ID") in fake.calls
+    assert ("set-option", "-pu", "-t", "%9", "@TOKEN_API_WRAPPER_LAUNCH_ID") in fake.calls
 
 
 def test_unsetting_instance_id_clears_pane_style_before_unset(

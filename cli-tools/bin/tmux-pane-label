@@ -4,11 +4,11 @@
 # AUDIENCE: human, agent
 #
 # RETIRED FROM THE HOT PATH (Phase 1 Part A). The pane border no longer shells out
-# to this script every status-interval; it reads the in-memory @PANE_LABEL pushed by
-# Token-API (SessionStart hydration + trg_tab_name_pane_state → pane_state_worker).
+# to this script every status-interval; it reads the in-memory @PANE_LABEL owned by
+# tmuxctld/wrapper lifecycle plus legacy pane_state_worker backfills.
 #
 # This survives only as a deploy-time backfill: seed @PANE_LABEL on panes that were
-# already alive before Phase 1 shipped (they never got a SessionStart hydration and
+# already alive before Phase 1 shipped (they never got wrapper/tmuxctld hydration and
 # won't until they rename). Run once after reloading the tmux config:
 #
 #     tmux-pane-label --backfill

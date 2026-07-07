@@ -70,20 +70,17 @@ def test_dropped_sessionstart_ping_has_no_row_until_outbox_replay_then_identity_
 ) -> None:
     """Confirm W2 diagnosis and recovery without mutating the live registry.
 
-    A Token-API-down SessionStart POST cannot create a row/tmux stamp/tint. The
+    A Token-API-down SessionStart POST cannot create a registry row or tint. The
     generic durable outbox preserves that exact hook intent; replaying it after
-    recovery creates the row and runs the same SessionStart stamp/tint path.
+    recovery creates the row and runs the same SessionStart registry/tint path.
     """
 
     hooks = sys.modules["routes.hooks"]
     shared = sys.modules["shared"]
-    stamped: list[tuple[str, str]] = []
     tinted: list[tuple[str, str, str]] = []
 
     async def fake_subprocess(args, *, timeout=None, stdout=None, stderr=None, env=None):
         arglist = tuple(args)
-        if arglist[:4] == ("tmux", "set-option", "-p", "-t") and "@INSTANCE_ID" in arglist:
-            stamped.append((arglist[4], arglist[-1]))
         return subprocess.CompletedProcess(args=arglist, returncode=0, stdout=b"", stderr=b"")
 
     async def fake_tint(db, instance_id: str, pane: str, *, source: str):
@@ -99,7 +96,7 @@ def test_dropped_sessionstart_ping_has_no_row_until_outbox_replay_then_identity_
         "env": {"TOKEN_API_ENGINE": "claude"},
     }
 
-    # Token-API down / dropped ping: no handler ran, therefore no row, stamp, or tint.
+    # Token-API down / dropped ping: no handler ran, therefore no row or tint.
     enq = _outbox(
         tmp_path,
         "enqueue",
@@ -117,11 +114,10 @@ def test_dropped_sessionstart_ping_has_no_row_until_outbox_replay_then_identity_
         is None
     )
     conn.close()
-    assert stamped == []
     assert tinted == []
 
     # Recovery: replay the same hook intent through Token-API. Identity lands via
-    # hook-owned registration; no agent self-registration/PATCH is involved.
+    # hook-owned registry/session state; pane-local stamps remain tmuxctld-owned.
     bridge = _TokenApiBridge(TestClient(app_env.main.app))
     try:
         # Rewrite the queued URL from the deliberately-dead proof endpoint to the
@@ -143,10 +139,12 @@ def test_dropped_sessionstart_ping_has_no_row_until_outbox_replay_then_identity_
 
     conn = sqlite3.connect(app_env.db_path)
     row = conn.execute(
-        "SELECT profile_name, legion FROM legacy_instances WHERE id = ?",
+        """SELECT p.slug, i.rank
+             FROM instances i
+             LEFT JOIN personas p ON p.id = i.persona_id
+             WHERE i.id = ?""",
         (payload["session_id"],),
     ).fetchone()
     conn.close()
     assert row == ("blood-angels", "astartes")
-    assert ("%outbox", payload["session_id"]) in stamped
     assert (payload["session_id"], "%outbox", "SessionStart") in tinted

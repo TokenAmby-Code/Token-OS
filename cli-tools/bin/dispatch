@@ -1644,6 +1644,36 @@ raise SystemExit(0 if is_prealloc_page(os.environ.get("PAGE", "")) else 1)
 PY
 }
 
+dispatch_window_name_for_index() {
+  # Numeric public targets such as `2:N` are valid positional aliases.  `2:new`
+  # must be classified by the live window's page name before stack-vs-prealloc
+  # allocation, otherwise dispatch treats base="2" as a spawnable stack and
+  # calls /stack/dispatch, which fails with "not a stack window: 2" after the
+  # worktree half has already run.
+  local index="$1" name=""
+  [[ "$index" =~ ^[0-9]+$ ]] || return 1
+  if command -v tmux >/dev/null 2>&1; then
+    name="$(tmux display-message -t "main:${index}" -p "#{window_name}" 2>/dev/null || true)"
+  fi
+  [[ -n "$name" ]] || return 1
+  printf '%s' "$name"
+}
+
+dispatch_prealloc_page_base() {
+  # Print the fixed SLOT page base for a launch page.  Accept both named pages
+  # (`somnium:new`) and numeric window aliases (`2:new` when main:2 is somnium).
+  local page="$1" resolved_page
+  [[ -n "$page" ]] || return 1
+  if dispatch_prealloc_page_probe "$page"; then
+    printf '%s' "$page"
+    return 0
+  fi
+  resolved_page="$(dispatch_window_name_for_index "$page" || true)"
+  [[ -n "$resolved_page" ]] || return 1
+  dispatch_prealloc_page_probe "$resolved_page" || return 1
+  printf '%s' "$resolved_page"
+}
+
 dispatch_first_free_prealloc_pane() {
   # Print the configured first free role for a pre-allocated page, using the
   # daemon's ledger-derived freelist for occupancy.  No DB rows, @PANE_CLEAN, or
@@ -1693,25 +1723,30 @@ maybe_resolve_prealloc_new_target() {
   #   * managed stack pages stay on tmux_stack_new exactly as before;
   #   * pre-allocated pages resolve greedily to a concrete free SLOT and use the
   #     normal tmux_target send path (no spawn, no teardown).
+  # Numeric positional aliases (`2:new`) are normalized to their live window base
+  # before this decision so fixed pages cannot fall through to /stack/dispatch.
   [[ "$LAUNCH_MODE" == "tmux_stack_new" && "$DISPATCH_SLOT" == "new" && -n "$DISPATCH_WINDOW" ]] || return 0
-  dispatch_prealloc_page_probe "$DISPATCH_WINDOW" || return 0
+  local prealloc_page
+  prealloc_page="$(dispatch_prealloc_page_base "$DISPATCH_WINDOW" || true)"
+  [[ -n "$prealloc_page" ]] || return 0
   if ! command -v tmuxctld-ping >/dev/null 2>&1; then
     err "tmuxctld-ping is required to allocate ${DISPATCH_WINDOW}:new"
     exit 69
   fi
   local free_pane rc
-  if free_pane="$(dispatch_first_free_prealloc_pane "$DISPATCH_WINDOW")"; then
+  if free_pane="$(dispatch_first_free_prealloc_pane "$prealloc_page")"; then
     rc=0
   else
     rc=$?
   fi
   if [[ "$rc" -ne 0 ]]; then
     case "$rc" in
-      3) err "no free pre-allocated panes on ${DISPATCH_WINDOW} for ${TARGET}" ;;
+      3) err "no free pre-allocated panes on ${prealloc_page} for ${TARGET}" ;;
       *) err "failed to resolve ${TARGET} from tmuxctld freelist" ;;
     esac
     exit 73
   fi
+  DISPATCH_WINDOW="$prealloc_page"
   RESOLVED_TARGET="$free_pane"
   LAUNCH_MODE="tmux_target"
 }

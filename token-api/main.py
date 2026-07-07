@@ -3842,8 +3842,8 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
     # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID stamp rather
     # than querying the stored tmux_pane column. The CLI passes the agent's own live
     # $TMUX_PANE, so the stamp is authoritative and current.
-    pane_instance_id = await shared.instance_id_for_pane(pane_id)
-    if not pane_instance_id:
+    occupant_instance_id = await shared.instance_id_for_pane(pane_id)
+    if not occupant_instance_id:
         raise HTTPException(status_code=404, detail="No active instance found for tmux pane")
 
     async with connect_agents_db(DB_PATH) as db:
@@ -3854,7 +3854,7 @@ async def rename_instance_by_pane(request: PaneRenameRequest):
                WHERE id = ?
                  AND COALESCE(status, '') NOT IN ('stopped', 'archived')
                LIMIT 1""",
-            (pane_instance_id,),
+            (occupant_instance_id,),
         )
         row = await cursor.fetchone()
         if not row:
@@ -5854,11 +5854,11 @@ async def _flag_hook_driven(
             if target_id is None and (tmux_pane or "").strip():
                 # tmuxctl owns pane -> instance: read the pane's live @INSTANCE_ID
                 # stamp, then confirm the row by id (never query the stored column).
-                pane_instance_id = await shared.instance_id_for_pane(tmux_pane)
-                if pane_instance_id:
+                occupant_instance_id = await shared.instance_id_for_pane(tmux_pane)
+                if occupant_instance_id:
                     cur = await db.execute(
                         "SELECT id FROM instances WHERE id = ? AND status NOT IN ('stopped', 'archived')",
-                        (pane_instance_id,),
+                        (occupant_instance_id,),
                     )
                     row = await cur.fetchone()
                     if row:

@@ -6,7 +6,7 @@ stamp:
 
   * ``resolver.resolve_instance`` / ``shared.instance_id_for_pane`` (the *lenient
     armer*'s reverse bridge) read the pane's live ``@INSTANCE_ID`` stamp — that
-    stamp IS the source of truth, set by ``_stamp_instance_id`` at register.
+    stamp IS the tmux-side source of truth, produced by tmuxctld/wrapper lifecycle.
   * ``assert_instance`` (the *strict refuser*) ignored the stamp entirely and
     matched the registry row only by the stored ``tmux_pane`` column. Post-
     extraction that column drifts/empties, so a pane that ``resolve_instance``

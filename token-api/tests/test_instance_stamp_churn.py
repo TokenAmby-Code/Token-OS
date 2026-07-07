@@ -1,27 +1,7 @@
-"""SessionStart stamp/unstamp churn must not zero a still-live pane's @INSTANCE_ID.
+"""SessionStart no longer churns pane-local @INSTANCE_ID stamps.
 
-Item #4 (sibling of PR #249). The same-ID ``--continue`` transplant branch of
-``handle_session_start`` stamps the new pane then unstamps the old one:
-
-    await _stamp_instance_id(tmux_pane, session_id, ...)
-    if old_tmux_pane and old_tmux_pane != tmux_pane:
-        await _unstamp_instance_id(old_tmux_pane, session_id)
-
-The unstamp guard only checked ``old != new`` — NOT that ``tmux_pane`` is a real,
-addressable pane. When an in-wrapper SessionStart re-fire arrives with no live
-``TMUX_PANE`` (Claude Code strips it; a stall/SMB miss leaves it blank), the
-stamp call no-ops (blank pane) while the unstamp still fires on ``old_tmux_pane``
-— the pane the instance is STILL living on. ``_unstamp_instance_id`` sees the
-stamp == this session_id (same instance!) and wipes it. The pane's @INSTANCE_ID
-goes to zero even though nothing moved: the churn that drops resolve-instance to
-0 and makes a leniently-armed pane fail strict assertion.
-
-Fix: only unstamp the old pane when a NEW addressable pane was actually stamped
-(``tmux_pane`` truthy and different) — mirroring the already-correct guard in the
-sibling re-registration branch.
-
-Hook-test doctrine: a FAKE pane id, mocked tmux writes, ``_unstamp_instance_id``
-spied (never shelled). No live tmux is touched.
+Token-API may read the tmuxctld/tmux oracle to preserve registry continuity, but
+pane stamp set/unset ownership belongs to tmuxctld/wrapper lifecycle.
 """
 
 from __future__ import annotations
@@ -29,110 +9,100 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
-# A pane id that exists on NO live tmux server.
-_LIVE_PANE = "%900917"
-_NEW_PANE = "%900918"
+import pytest
+
+_LIVE_PANE = "%churn"
 
 
-def _insert(db_path, instance_id, *, pane=None, status="working"):
-    # Pane liveness is no longer a stored column; ``pane`` only documents the
-    # live pane the test drives via TMUX_PANE / the unstamp spy.
+def _seed_instance(db_path: Path, session_id: str, *, wrapper_id: str = "wrap-churn") -> None:
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            profile_name, tts_voice, notification_sound, status)
-           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'p', 'v', 's', ?)""",
-        (instance_id, f"{instance_id}-session", instance_id, status),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        persona_id = conn.execute("SELECT id FROM personas WHERE slug='blood-angels'").fetchone()[0]
+        conn.execute(
+            """INSERT INTO instances
+                   (id, device_id, persona_id, rank, status, wrapper_launch_id, last_activity)
+               VALUES (?, 'Mac-Mini', ?, 'astartes', 'idle', ?, '2026-07-01T00:00:00')""",
+            (session_id, persona_id, wrapper_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _spy_stamp_writes(hooks, monkeypatch):
-    """Mute every tmux WRITE; record (pane, session_id) the unstamp targets."""
-    unstamped: list[tuple] = []
+    writes: list[tuple[str, ...]] = []
 
-    async def _astamp(*_args, **_kwargs):
+    async def _no_pane_instance(_pane):
         return None
 
-    async def _aunstamp(pane, session_id, *_a, **_k):
-        unstamped.append((pane, session_id))
+    async def _resolve_instance(instance_id):
+        return (_LIVE_PANE, "palace:N") if instance_id else (None, None)
 
-    def _sync_noop(*_args, **_kwargs):
+    async def _fake_tmux_run(args, **_kwargs):
+        writes.append(tuple(args))
+        return {"stdout": ""}
+
+    def _fake_sync_tmux(args, **_kwargs):
+        writes.append(tuple(args))
+        return {"stdout": ""}
+
+    async def _no_tint(*_args, **_kwargs):
         return None
 
-    async def _no_label(_pane):
-        return None
-
-    async def _no_stamp(_pane):
-        return None
-
-    # The oracle owns the prior pane now (no stored tmux_pane column): the live
-    # instance resolves to the pane it still occupies so the unstamp guard has a
-    # real old pane to (not) vacate.
-    async def _resolve_pane(_instance_id):
-        return (_LIVE_PANE, "main")
-
-    monkeypatch.setattr(hooks, "_stamp_instance_id", _astamp)
-    monkeypatch.setattr(hooks, "_unstamp_instance_id", _aunstamp)
-    monkeypatch.setattr(hooks, "_tmux_pane_label", _no_label)
-    monkeypatch.setattr(hooks.shared, "instance_id_for_pane", _no_stamp)
-    monkeypatch.setattr(hooks.shared, "resolve_instance_pane", _resolve_pane)
-    monkeypatch.setattr(hooks.shared, "clear_pane_tint", _sync_noop)
-    monkeypatch.setattr(hooks.shared, "apply_instance_pane_tint", _astamp)
-    return unstamped
+    monkeypatch.setattr(hooks.shared, "instance_id_for_pane", _no_pane_instance)
+    monkeypatch.setattr(hooks.shared, "resolve_instance_pane", _resolve_instance)
+    monkeypatch.setattr(hooks.shared, "tmuxctld_run_tmux", _fake_tmux_run)
+    monkeypatch.setattr(hooks.shared, "_tmuxctld_run_tmux", _fake_sync_tmux)
+    monkeypatch.setattr(hooks.shared, "apply_instance_pane_tint", _no_tint)
+    return writes
 
 
-def _start(hooks, payload):
-    return asyncio.run(hooks.handle_session_start(payload))
+def _stamp_mutations(writes: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    return [w for w in writes if "set-option" in w and ("@INSTANCE_ID" in w or "@PANE_LABEL" in w)]
 
 
-def test_blank_pane_refire_does_not_unstamp_live_pane(app_env, monkeypatch):
-    """In-wrapper re-fire with no live TMUX_PANE must NOT wipe the live stamp.
-
-    RED today: the unstamp fires on the still-occupied old pane (old != blank),
-    zeroing @INSTANCE_ID on a pane that never moved.
-    """
+def test_blank_pane_refire_does_not_mutate_pane_stamps(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     hooks = sys.modules["routes.hooks"]
-    _insert(app_env.db_path, "churn-1", pane=_LIVE_PANE)
-    unstamped = _spy_stamp_writes(hooks, monkeypatch)
+    _seed_instance(app_env.db_path, "churn-1", wrapper_id="wrap-churn-1")
+    writes = _spy_stamp_writes(hooks, monkeypatch)
 
-    _start(
-        hooks,
-        {
-            "session_id": "churn-1",
-            "cwd": "/tmp",
-            "pid": 4242,
-            # No TMUX_PANE — the re-fire arrives with no addressable pane.
-            "env": {"TOKEN_API_ENGINE": "claude"},
-        },
+    result = asyncio.run(
+        hooks.handle_session_start(
+            {
+                "session_id": "churn-1",
+                "cwd": "/tmp/churn",
+                "pid": 999,
+                "env": {"TOKEN_API_WRAPPER_ID": "wrap-churn-1"},
+            }
+        )
     )
 
-    assert unstamped == [], (
-        f"a blank-pane re-fire must not unstamp the still-live pane: {unstamped}"
-    )
+    assert result["success"] is True
+    assert _stamp_mutations(writes) == []
 
 
-def test_genuine_pane_move_still_unstamps_old_pane(app_env, monkeypatch):
-    """Guard against over-correction: a real move to a NEW pane still vacates the
-    old one's stamp so two panes never resolve to one UUID.
-    """
+def test_genuine_pane_move_still_does_not_mutate_pane_stamps(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     hooks = sys.modules["routes.hooks"]
-    _insert(app_env.db_path, "move-1", pane=_LIVE_PANE)
-    unstamped = _spy_stamp_writes(hooks, monkeypatch)
+    _seed_instance(app_env.db_path, "move-1", wrapper_id="wrap-move-1")
+    writes = _spy_stamp_writes(hooks, monkeypatch)
 
-    _start(
-        hooks,
-        {
-            "session_id": "move-1",
-            "cwd": "/tmp",
-            "pid": 4242,
-            "env": {"TMUX_PANE": _NEW_PANE, "TOKEN_API_ENGINE": "claude"},
-        },
+    result = asyncio.run(
+        hooks.handle_session_start(
+            {
+                "session_id": "move-1",
+                "cwd": "/tmp/churn",
+                "pid": 1000,
+                "env": {"TMUX_PANE": "%new", "TOKEN_API_WRAPPER_ID": "wrap-move-1"},
+            }
+        )
     )
 
-    assert (_LIVE_PANE, "move-1") in unstamped, (
-        f"a genuine pane move must still unstamp the vacated pane: {unstamped}"
-    )
+    assert result["success"] is True
+    assert _stamp_mutations(writes) == []

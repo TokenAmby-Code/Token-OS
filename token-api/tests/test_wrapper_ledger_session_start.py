@@ -1,65 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 
-import aiosqlite
 
-
-def test_stamp_posts_canonical_instance_id_for_wrapper(app_env, monkeypatch):
-    hooks = __import__("routes.hooks", fromlist=["_stamp_instance_id"])
+def test_session_start_does_not_post_wrapper_ledger(app_env, monkeypatch):
+    """Token-API must not hydrate tmuxctld ledger from SessionStart."""
+    hooks = sys.modules["routes.hooks"]
+    shared = sys.modules["shared"]
     posted: list[tuple[str, dict]] = []
-    stamped: list[tuple[str, ...]] = []
+    tmux_writes: list[tuple[str, ...]] = []
 
     def fake_post(path: str, body: dict, **_kwargs):
         posted.append((path, body))
         return {"success": True}
 
     async def fake_run_tmux(args, **_kwargs):
-        stamped.append(tuple(args))
-        return ""
+        tmux_writes.append(tuple(args))
+        return {"stdout": ""}
 
-    monkeypatch.setattr(hooks.shared, "_tmuxctld_post_json", fake_post)
-    monkeypatch.setattr(hooks.shared, "tmuxctld_run_tmux", fake_run_tmux)
-    monkeypatch.setattr(hooks, "_tmux_pane_label", lambda _pane: asyncio.sleep(0, "somnium:W"))
+    monkeypatch.setattr(shared, "_tmuxctld_post_json", fake_post)
+    monkeypatch.setattr(shared, "tmuxctld_run_tmux", fake_run_tmux)
 
-    async def run_case():
-        async with aiosqlite.connect(app_env.db_path) as db:
-            await db.execute(
-                """INSERT INTO instances (id, device_id, rank, wrapper_launch_id, last_activity)
-                   VALUES (?, ?, ?, ?, ?)""",
-                ("old-engine-session", "Mac-Mini", "retired", "wrap-1", "2026-07-01T00:00:00"),
-            )
-            await db.execute(
-                """INSERT INTO instances (id, device_id, rank, wrapper_launch_id, last_activity)
-                   VALUES (?, ?, ?, ?, ?)""",
-                ("canonical-instance", "Mac-Mini", "astartes", "wrap-1", "2026-07-01T00:01:00"),
-            )
-            await db.commit()
-
-            await hooks._stamp_instance_id(
-                "%42",
-                "live-token-api-session-id",
-                db=db,
-                wrapper_id="wrap-1",
-                engine="codex",
-                working_dir="/tmp/work",
-                persona="salamanders",
-            )
-
-    asyncio.run(run_case())
-
-    assert posted == [
-        (
-            "/ledger/upsert",
+    async def run():
+        result = await hooks.handle_session_start(
             {
-                "wrapper_id": "wrap-1",
-                "instance_id": "canonical-instance",
-                "pane_positional_id": "somnium:W",
-                "engine": "codex",
-                "working_dir": "/tmp/work",
-                "persona": "salamanders",
-                "state": "OPEN",
-            },
+                "session_id": "ledger-boundary-session",
+                "cwd": "/tmp/work",
+                "pid": 4242,
+                "wrapper_launch_id": "wrap-1",
+                "env": {"TMUX_PANE": "%42", "TOKEN_API_ENGINE": "codex"},
+            }
         )
-    ]
-    assert ("set-option", "-p", "-t", "%42", "@INSTANCE_ID", "canonical-instance") in stamped
+        assert result["success"] is True
+
+    asyncio.run(run())
+
+    assert [path for path, _body in posted if path == "/ledger" + "/upsert"] == []
+    assert [c for c in tmux_writes if "set-option" in c and "@INSTANCE_ID" in c] == []
