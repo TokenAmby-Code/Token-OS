@@ -1562,7 +1562,10 @@ function workerFloorY(x: number, geo: LemonGeometry, uiScale: number): number {
 type QueuePt = { x: number; y: number };
 interface QueuePath {
   pointAt(s: number): QueuePt; // s = arc-length from the stem base
-  totalLen: number; // arm length (the straight-down tail continues past it)
+  totalLen: number; // arm + corner-fillet length (the straight-down tail continues past it)
+  armLen: number; // arc-length to the corner ENTRY (end of the straight arm, before the fillet)
+  endX: number; // corner-entry x — the idle-baseline lift anchor (clock/tip elbow)
+  endFloorY: number; // corner-entry floor y — the idle-baseline lift anchor
 }
 
 // Locked worker-queue layout — px authored at DESIGN_W (1440), × uiScale at consumption.
@@ -1571,6 +1574,19 @@ const W_DROP_PX = 53; // chip-row drop below the header floor — dials clear of
 const W_SPACE_PX = 99; // queue spacing: chip centre-to-centre so the 90px dials never overlap
 const W_INSET_PX = 50; // drains hug the very edges — columns sit flush at the sides
 const W_SPLIT_PX = 93; // slot-0 gap from centre stem (centre clearance for the fat chips)
+// Arm→ditch corner radius. The arm ends a quarter-ellipse of THIS radius short of the
+// ditch, then rounds down into the vertical drain instead of turning on a hard 90°
+// elbow. Baked into the sampled queue path so pointAt() yields evenly-spaced points
+// around the curve — chips "hug" the corner for free (no per-chip special case). The
+// tip pitch is W_SPACE_PX (99), so R must be a real fraction of it to read. Tune live.
+const DITCH_CORNER_R_PX = 72; // px@1440 (× uiScale) — arm→ditch corner radius
+// Idle-variant only: chip row hangs a constant drop BELOW the main crossbar (crossY)
+// instead of following the tapered infill floor. crossY sits below the chips in local
+// coords, so after the 180° host flip this reads as chips a fixed drop under the bar on
+// screen. By-eye against :5199 so the row keeps its current centre height but stays
+// parallel to the bar (outer chips lift to match rather than dipping into the taper).
+const IDLE_CHIP_DROP_PX = 40; // px @1440 (× uiScale) — chip clearance below the crossbar
+const IDLE_TIP_EXTRA_DROP_PX = 14; // px@1440 — RHS/tip idle column hangs this much lower
 
 function makeQueuePath(side: number, geo: LemonGeometry, uiScale: number, gap: number, inset: number): QueuePath {
   const s = uiScale;
@@ -1580,20 +1596,46 @@ function makeQueuePath(side: number, geo: LemonGeometry, uiScale: number, gap: n
   // fan symmetrically from geo.xCtr so stem, fan, and bar axis stay coherent.
   const xStart = geo.xCtr;
   const xEnd = side < 0 ? inset * s : geo.Rx - inset * s;
+  const R = DITCH_CORNER_R_PX * s; // arm→ditch fillet radius
+  const outX = Math.sign(xEnd - xStart) || 1; // outward x direction (−1 left, +1 right)
+  // The straight arm now stops a corner-radius SHORT of the ditch (xArmEnd), so the
+  // fillet below can round INTO the vertical drain at xEnd without bulging past the
+  // screen edge (an inner fillet, tangent to the arm and to the x=xEnd drain line).
+  const xArmEnd = xEnd - outX * R;
   const N = 96;
   const pts: QueuePt[] = [];
   const seg: number[] = [0];
   for (let i = 0; i <= N; i++) {
-    const x = xStart + (xEnd - xStart) * (i / N);
+    const x = xStart + (xArmEnd - xStart) * (i / N);
     pts.push({ x, y: workerFloorY(x, geo, uiScale) + gapPx });
   }
   for (let i = 1; i < pts.length; i++) seg.push(seg[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  // Corner ENTRY — the last arm sample. It anchors the idle-baseline lift so the clock/
+  // tip elbow joins its rail seamlessly (see WorkerColumn), and marks where the arm ends
+  // and the rounded fillet begins.
+  const cornerEntry = pts[pts.length - 1];
+  const endX = cornerEntry.x;
+  const endFloorY = cornerEntry.y;
+  const armLen = seg[seg.length - 1];
+  // ── Fillet: a quarter turn from the (≈horizontal) arm end down to the vertical drain,
+  // radius R. Centre sits R below the corner entry; the arc sweeps outward-and-down to
+  // (xEnd, endFloorY + R) where the tangent is straight down. Baked into the SAME pts/seg
+  // table, so pointAt returns evenly-spaced points around the curve.
+  const K = 16;
+  for (let k = 1; k <= K; k++) {
+    const th = (Math.PI / 2) * (k / K);
+    const x = endX + outX * R * Math.sin(th);
+    const y = endFloorY + R * (1 - Math.cos(th));
+    const prev = pts[pts.length - 1];
+    pts.push({ x, y });
+    seg.push(seg[seg.length - 1] + Math.hypot(x - prev.x, y - prev.y));
+  }
   const totalLen = seg[seg.length - 1];
-  const end = pts[pts.length - 1];
+  const end = pts[pts.length - 1]; // fillet foot — (xEnd, endFloorY + R), tangent vertical
   const pointAt = (sq: number): QueuePt => {
     if (sq <= 0) return pts[0];
-    // Past the arm end the tail drops STRAIGHT DOWN so the queue drains down the edge
-    // without crossing it (the floor line's slope isn't extended outward).
+    // Past the fillet foot the tail drops STRAIGHT DOWN (x already at the ditch, tangent
+    // vertical → no corner) so the queue drains down the edge without crossing it.
     if (sq >= totalLen) return { x: end.x, y: end.y + (sq - totalLen) };
     let i = 1;
     while (i < seg.length && seg[i] < sq) i++;
@@ -1604,7 +1646,7 @@ function makeQueuePath(side: number, geo: LemonGeometry, uiScale: number, gap: n
       y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * frac,
     };
   };
-  return { pointAt, totalLen };
+  return { pointAt, totalLen, armLen, endX, endFloorY };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1949,10 +1991,11 @@ interface WorkerEntry {
 // One side of the "M": a self-contained reflowing queue riding `path`. Mirrors
 // TtsStack — stable-order array, monotonic keys, slot-only positioning — minus the
 // promote/speak gesture (a click is a plain remove).
-function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split, onRemove }: {
+function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split, onRemove, baseline }: {
   side: number; count: number; geo: LemonGeometry; uiScale: number;
   gap: number; pitch: number; inset: number; split: number;
   onRemove?: (() => void) | undefined; // fired once, post-dismiss, so the parent's per-side count settles WITH entries.length
+  baseline?: ((x: number, floorY: number) => number) | undefined; // override the chip Y (idle: ride the crossbar, but wrap the clock); gets x + the path's own floor y; default = floorY
 }) {
   const seqRef = useRef(0);
   const [entries, setEntries] = useState<WorkerEntry[]>(() =>
@@ -2045,7 +2088,28 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split, onR
         const isDup = dupKeys.has(e.key);
         // slot 0 sits `split` out from the stem (centre clearance); each further slot
         // marches one `pitch` outward along the arm.
-        const p = path.pointAt((split + e.slot * pitch) * uiScale);
+        const sArc = (split + e.slot * pitch) * uiScale;
+        const p = path.pointAt(sArc);
+        // x is ALWAYS p.x — on the arm it preserves the horizontal column fan; past the
+        // corner it follows the path's rounded fillet (curving inward) then the vertical
+        // ditch. Only Y changes per variant.
+        let y: number;
+        if (!baseline) {
+          // Compass (non-idle): ride the path directly — the baked fillet rounds the
+          // arm→ditch corner and drains down-screen for free (no special case).
+          y = p.y;
+        } else if (sArc > path.armLen) {
+          // Idle chip PAST the corner: ride the path's rounded elbow + vertical drain,
+          // lifted RIGIDLY to the baseline by the offset measured at the corner entry —
+          // so the clock/tip corner rounds identically to the compass. At the entry the
+          // clock wrap makes baseline≈endFloorY ⇒ shift≈0 (seamless); the tip bow lifts
+          // the elbow to crossY−DROP−extra, continuous with the on-arm bow.
+          const shift = baseline(path.endX, path.endFloorY) - path.endFloorY;
+          y = p.y + shift;
+        } else {
+          // Idle chip ON the arm: hang from the crossbar-parallel baseline.
+          y = baseline(p.x, p.y);
+        }
         return (
           <button
             key={e.key}
@@ -2056,7 +2120,7 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split, onR
               width: chip,
               height: chip,
               // slot expressed PURELY as a transform → any slot change animates for free.
-              transform: `translate(${p.x.toFixed(1)}px, ${p.y.toFixed(1)}px) translate(-50%, -50%)`,
+              transform: `translate(${p.x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -50%)`,
             }}
             onClick={() => remove(e.key)}
           >
@@ -2603,6 +2667,10 @@ function WorkerQueues({ leftCount, rightCount, uiScale, gap, pitch, inset, split
     // OTHER side of the crossbar (the mockup's pink outline) and drop the original.
     const edgeSegsRight: string[] = []; // right lobe only (clock/compass cap side)
     const edgeSegsLeftMirror: string[] = []; // left-lobe edge, mirrored across the bar
+    // Same right/left-mirror split for the translucent band FILL, so the idle variant's
+    // filled leaf follows its mirrored gold line above the bar instead of hanging below.
+    const bandSegsRight: string[] = []; // right lobe fill only (clock/compass cap side)
+    const bandSegsLeftMirror: string[] = []; // left-lobe fill, mirrored across the bar
     const capStarts: number[] = []; // each lobe's outer terminus — where the cap begins
     // The RHS cap bulge (right lobe's rounded outer end) hosts the compass dial: a
     // semicircle of radius r whose centre of curvature is (xOuter, midY). Captured in
@@ -2693,11 +2761,19 @@ function WorkerQueues({ leftCount, rightCount, uiScale, gap, pitch, inset, split
           `M${f(xOuter)},${f(outBotY)} ${mArc} ${mTopC[0]} ` +
           `${mTopC.slice(1).map((c) => `L${c}`).join(' ')} ${mCubic}`,
         );
+        // Fill mirrored the same way: reflected top edge above, the bottom bar (on
+        // crossY, so it reflects onto itself) below, closed by the sweep-flipped cap.
+        bandSegsLeftMirror.push(
+          `M${mTopC[0]} ${mTopC.slice(1).map((c) => `L${c}`).join(' ')} ${mCubic} ` +
+          `${botC.slice(1).map((c) => `L${c}`).join(' ')} ${mArc} ${mTopC[0]} Z`,
+        );
       } else {
         edgeSegsRight.push(edgeSegs[edgeSegs.length - 1]);
+        bandSegsRight.push(bandSegs[bandSegs.length - 1]);
       }
     }
     const bandD = bandSegs.join(' ');
+    const bandIdleD = [...bandSegsRight, ...bandSegsLeftMirror].join(' '); // idle: right fill + mirrored tip fill
     const edgeD = edgeSegs.join(' ');
     const edgeRightD = edgeSegsRight.join(' '); // idle: everything but the mirrored tip
     const edgeLeftMirrorD = edgeSegsLeftMirror.join(' '); // idle: the tip mirrored up
@@ -2769,6 +2845,8 @@ function WorkerQueues({ leftCount, rightCount, uiScale, gap, pitch, inset, split
       edgeRightD,
       edgeLeftMirrorD,
       bandD,
+      bandIdleD,
+      crossY, // idle chips hang parallel to the crossbar (baseline), not the taper floor
       hourD,
       sections,
       compass,
@@ -2781,6 +2859,26 @@ function WorkerQueues({ leftCount, rightCount, uiScale, gap, pitch, inset, split
   // ceil/floor split of a shared total). They still share the rail + column geometry.
   const count = leftCount + rightCount;
 
+  // Idle chip baseline — split per column because only ONE side has a clock to wrap.
+  // Everything (rail + chips) shares one pre-flip SVG space that then rotates 180°, so
+  // lower-on-screen == the SMALLER pre-flip y → Math.min picks the lower line.
+  //
+  // Clock column (side=+1, SVG-right lobe xOuter>xCtr → reads screen-LEFT): follow
+  // whichever line is lower between the crossbar-parallel drop and the chip's own floor.
+  // In the centre the crossbar drop wins (clean parallel hang below the bar); out toward
+  // the clock cap the floor dips lower and wins, so the dials wrap the OUTSIDE of the
+  // clock — the operator-approved look.
+  const idleBaselineClock = rail
+    ? (x: number, floorY: number): number => Math.min(rail.crossY(x) - IDLE_CHIP_DROP_PX * uiScale, floorY)
+    : undefined;
+  // Tip column (side=−1, mirrored tip, screen-RIGHT): NO clock here, so the floor term
+  // would only drag chips down the taper (a phantom "divot"). Pure crossbar-parallel bow,
+  // no floorY — plus a static extra drop so the tip column hangs a touch lower on screen
+  // than the clock column (IDLE_TIP_EXTRA_DROP_PX; more subtraction ⇒ lower on screen).
+  const idleBaselineTip = rail
+    ? (x: number): number => rail.crossY(x) - (IDLE_CHIP_DROP_PX + IDLE_TIP_EXTRA_DROP_PX) * uiScale
+    : undefined;
+
   return (
     <div className={`worker-queues${flip ? ' worker-queues--flip' : ''}`} ref={wrapRef}
       aria-label={variant === 'clock' ? `Idle worker queue · ${count}` : `Worker queue · ${count}`}>
@@ -2790,7 +2888,7 @@ function WorkerQueues({ leftCount, rightCount, uiScale, gap, pitch, inset, split
         <svg className="worker-rail" width={W} height="100%" aria-hidden>
           {/* Table-lip fill — the ribbon interior between the dial-hugging top edge and
               the symmetric bottom bar. Drawn first (behind glow + strokes). */}
-          <path className="worker-rail__band" d={rail.bandD} style={{ fillOpacity: shape.bandFill }} />
+          <path className="worker-rail__band" d={variant === 'clock' ? rail.bandIdleD : rail.bandD} style={{ fillOpacity: shape.bandFill }} />
           {/* reservist glow — behind the gold lines so the strokes read on top. Same
               Segment renderer the lemon persona sections use. */}
           <SegmentGlowLayer segments={rail.sections} idPrefix="hour" blur={9 * uiScale} rimW={11 * uiScale} />
@@ -2817,8 +2915,10 @@ function WorkerQueues({ leftCount, rightCount, uiScale, gap, pitch, inset, split
           )}
         </svg>
       )}
-      <WorkerColumn side={-1} count={leftCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} onRemove={onRemoveLeft} />
-      <WorkerColumn side={1} count={rightCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} onRemove={onRemoveRight} />
+      <WorkerColumn side={-1} count={leftCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} onRemove={onRemoveLeft}
+        baseline={variant === 'clock' && rail ? idleBaselineTip : undefined} />
+      <WorkerColumn side={1} count={rightCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} onRemove={onRemoveRight}
+        baseline={variant === 'clock' && rail ? idleBaselineClock : undefined} />
     </div>
   );
 }
