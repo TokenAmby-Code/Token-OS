@@ -36,6 +36,8 @@ STATE_DIR = "/tmp/claude-panes"
 FLUSH_TOKEN_THRESHOLD = 250_000  # legacy emergency rollback nudge threshold
 FLUSH_COOLDOWN = 86400  # seconds — once per context window (24h effectively permanent, reset on SessionStart)
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
+WARNING_CONTEXT_TOKEN_THRESHOLD = 100_000
+CRITICAL_CONTEXT_TOKEN_THRESHOLD = 150_000
 
 # ANSI colors for status line output
 RED = "\033[31m"
@@ -55,7 +57,7 @@ def tmux_pane_has_input(pane_id):
             stderr=subprocess.DEVNULL, text=True
         )
         # Get last non-empty line
-        lines = [l for l in output.splitlines() if l.strip()]
+        lines = [line for line in output.splitlines() if line.strip()]
         if not lines:
             return False
         last = lines[-1]
@@ -170,8 +172,26 @@ def format_tokens(tokens):
     return str(tokens)
 
 
-def context_color(pct):
-    """Pick ANSI color based on context usage."""
+def context_color(used_tokens, pct=None):
+    """Pick ANSI color based on context-window token usage.
+
+    Claude models have different context window sizes, so pct alone can hide a
+    large absolute context. Make the footer yellow at 100k used tokens and red
+    at 150k used tokens.
+    """
+    if used_tokens is not None:
+        try:
+            used = int(used_tokens)
+        except (TypeError, ValueError):
+            used = None
+        if used is not None:
+            if used >= CRITICAL_CONTEXT_TOKEN_THRESHOLD:
+                return RED
+            if used >= WARNING_CONTEXT_TOKEN_THRESHOLD:
+                return YELLOW
+            return GREEN
+
+    # Fallback for malformed/older statusLine payloads that only have pct.
     if pct is None:
         return DIM
     if pct >= 70:
@@ -179,6 +199,34 @@ def context_color(pct):
     if pct >= 50:
         return YELLOW
     return GREEN
+
+
+def context_is_warning(used_tokens):
+    """Return true when the footer should stop dimming context token counts."""
+    if used_tokens is None:
+        return False
+    try:
+        return int(used_tokens) >= WARNING_CONTEXT_TOKEN_THRESHOLD
+    except (TypeError, ValueError):
+        return False
+
+
+def ansi_fg_from_hex(color):
+    """Convert #RRGGBB to an ANSI true-color foreground escape."""
+    if not color:
+        return ""
+    value = str(color).strip()
+    if value.startswith("#"):
+        value = value[1:]
+    if len(value) != 6:
+        return ""
+    try:
+        r = int(value[0:2], 16)
+        g = int(value[2:4], 16)
+        b = int(value[4:6], 16)
+    except ValueError:
+        return ""
+    return f"\033[38;2;{r};{g};{b}m"
 
 
 def short_cwd(cwd):
@@ -394,13 +442,17 @@ def main():
         check_pre_compact(pane_id, pct, total_tokens, planning_state)
 
     # --- 4. Output status line for Claude Code ---
-    color = context_color(pct)
+    color = context_color(used_tokens, pct=pct)
+    pressure = context_is_warning(used_tokens)
+    context_style = f"{BOLD}{color}" if pressure else color
+    token_style = context_style if pressure else DIM
     pct_display = f"{pct}%" if pct is not None else "..."
     cost_str = f" ${cost_usd:.2f}" if cost_usd is not None else ""
-    chapter_str = f" {CC_ANSI.get(cc, '')}{chapter}{RESET}" if chapter else ""
+    chapter_color = ansi_fg_from_hex(chip_color)
+    chapter_str = f" {chapter_color}{chapter}{RESET}" if chapter else ""
     doc_str = f" {CYAN}{session_doc}{RESET}" if session_doc else ""
 
-    print(f"{color}{pct_display}{RESET} {DIM}{used_str}/{total_str}{RESET}{cost_str}{chapter_str}{doc_str}")
+    print(f"{context_style}{pct_display}{RESET} {token_style}{used_str}/{total_str}{RESET}{cost_str}{chapter_str}{doc_str}")
 
 
 if __name__ == "__main__":

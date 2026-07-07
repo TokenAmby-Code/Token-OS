@@ -88,6 +88,61 @@ def test_tmux_context_check_pre_compact_threads_planning_state_into_message(
     assert "switch to plan mode OR run /compact" in sent[-1]
 
 
+def test_tmux_context_color_uses_absolute_used_token_thresholds() -> None:
+    module = _load_tmux_context()
+
+    assert module.context_color(99_999) == module.GREEN
+    assert module.context_color(100_000) == module.YELLOW
+    assert module.context_color(149_999) == module.YELLOW
+    assert module.context_color(150_000) == module.RED
+    assert module.context_color(None, pct=70) == module.RED
+
+
+def test_tmux_context_main_colors_footer_by_used_tokens_not_percentage(monkeypatch, capsys):
+    module = _load_tmux_context()
+
+    monkeypatch.setenv("TMUX_PANE", "%77")
+    monkeypatch.delenv("TMUX_CONTEXT_LEGACY_NUDGE", raising=False)
+    monkeypatch.setattr(
+        module,
+        "read_input",
+        lambda: {
+            "session_id": "sess",
+            "cwd": "/tmp/work",
+            "context_window": {
+                "used_percentage": 40,
+                "context_window_size": 400000,
+                "total_input_tokens": 10,
+                "total_output_tokens": 20,
+            },
+            "model": {"display_name": "Claude"},
+            "cost": {"total_cost_usd": 1.0},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "get_instance_by_pane",
+        lambda pane: {
+            "id": "inst",
+            "engine": "claude",
+            "planning_state": "none",
+            "chapter": "Test Chapter",
+            "chip_color": "#ff0000",
+            "session_doc_id": None,
+        },
+    )
+    monkeypatch.setattr(module, "update_pane_option", lambda *a, **k: None)
+    monkeypatch.setattr(module, "write_state", lambda *a, **k: None)
+    monkeypatch.setattr(module, "api_post", lambda *a, **k: {"ok": True})
+
+    module.main()
+
+    out = capsys.readouterr().out
+    assert out.startswith(f"{module.BOLD}{module.RED}40%{module.RESET}")
+    assert f"{module.BOLD}{module.RED}160k/400k{module.RESET}" in out
+    assert "\033[38;2;255;0;0mTest Chapter" in out
+
+
 def test_tmux_context_main_reports_telemetry_without_legacy_nudge(monkeypatch, capsys):
     module = _load_tmux_context()
     posted = []
