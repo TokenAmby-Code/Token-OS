@@ -863,6 +863,14 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 @keyframes worker-dismiss {
   to { transform: scale(0); opacity: 0; }
 }
+/* ENTER — a fresh chip emerges from the centre hourglass: scale/fade up in place
+   (slot 0 already sits at the hourglass mouth), mirroring the dismiss collapse. The
+   outer .worker-chip carries the slot transform, so this inner scale never fights it. */
+.worker-chip__disc--in { animation: worker-enter 320ms cubic-bezier(0.34, 1.4, 0.64, 1) both; }
+@keyframes worker-enter {
+  from { transform: scale(0); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
 /* gold tip caps — a gold rim glow that hugs the tapered end and fades toward a dark
    centre. A blurred stroke (width set inline) clipped to the cap region, so only the
    inner half survives → an interior rim glow, no solid fill. */
@@ -964,6 +972,19 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 }
 .demobar__placebtn:hover:not(:disabled) { color: var(--text); border-color: var(--brass); }
 .demobar__placebtn:disabled { opacity: 0.4; cursor: default; }
+
+/* per-side ADD controls (workers / idle) — a label + two buttons that grow one side
+   of the queue. Shares the demobar__placebtn chrome; removal stays click-a-chip. */
+.demobar__adds { display: inline-flex; align-items: center; gap: 6px; }
+.demobar__addlabel { font-size: 12px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; white-space: nowrap; }
+.demobar__addlabel b { color: var(--brass-bright); }
+.demobar__addbtn {
+  border: 1px solid var(--line-bright); background: var(--surface); color: var(--muted);
+  border-radius: 4px; padding: 3px 8px; cursor: pointer;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; line-height: 1;
+}
+.demobar__addbtn:hover:not(:disabled) { color: var(--text); border-color: var(--brass); }
+.demobar__addbtn:disabled { opacity: 0.4; cursor: default; }
 
 /* the graph horizon (break-even line) — a structural instrument line, so it
    loads the SAME colour + weight tokens as the dial border + arc (all three

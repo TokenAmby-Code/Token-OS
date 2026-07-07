@@ -1933,8 +1933,11 @@ const WORKER_TONES = ['var(--brass-bright)', 'var(--good)', 'var(--warn)', 'var(
 const WORKER_CHIP_PX = 90; // chip diameter, px @1440 (× uiScale) — big worker dials (75% of the first 120px pass)
 const WORKER_BAR_MARGIN = 30; // gap between the chip-row bottom and the gold crossbar below
 const WORKER_DISMISS_MS = 300; // matches the worker-dismiss keyframe
+const WORKER_ENTER_MS = 320; // matches the worker-enter keyframe — how long a fresh chip emerges from the hourglass
 
-type WorkerPhase = 'idle' | 'dismissing';
+// 'entering' = freshly head-inserted at slot 0 (born at the centre hourglass); it wears
+// the worker-enter keyframe until WORKER_ENTER_MS elapses, then settles to 'idle'.
+type WorkerPhase = 'idle' | 'dismissing' | 'entering';
 interface WorkerEntry {
   key: string;
   persona: string;
@@ -1946,9 +1949,10 @@ interface WorkerEntry {
 // One side of the "M": a self-contained reflowing queue riding `path`. Mirrors
 // TtsStack — stable-order array, monotonic keys, slot-only positioning — minus the
 // promote/speak gesture (a click is a plain remove).
-function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
+function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split, onRemove }: {
   side: number; count: number; geo: LemonGeometry; uiScale: number;
   gap: number; pitch: number; inset: number; split: number;
+  onRemove?: (() => void) | undefined; // fired once, post-dismiss, so the parent's per-side count settles WITH entries.length
 }) {
   const seqRef = useRef(0);
   const [entries, setEntries] = useState<WorkerEntry[]>(() =>
@@ -1968,25 +1972,40 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
     timers.current.push(window.setTimeout(fn, ms));
   };
 
-  // Depth slider = grow/shrink the TAIL only, keyed off SLOT (see TtsStack). Fresh
-  // cycled entries append on grow; the deepest slots drop on shrink.
+  // Count reconcile — grow inserts at the CENTRE (slot 0, nearest the hourglass) and
+  // shoves the existing stack outward by the number added; shrink still drops the
+  // deepest rows. New chips are born at the centre and push the rest out one index —
+  // positions are pure transforms, so the shove animates for free (see the render).
   useEffect(() => {
     setEntries((prev) => {
       const n = prev.length;
       if (count === n) return prev;
       if (count < n) return prev.filter((e) => e.slot < count); // drop deepest rows
+      const nAdd = count - n;
       const add: WorkerEntry[] = [];
-      for (let i = n; i < count; i++) {
+      for (let i = 0; i < nAdd; i++) {
+        const arrival = n + i; // preserve the roster cycling of the old tail-append
         add.push({
           key: `w${seqRef.current++}`,
-          persona: WORKER_PERSONAS[i % WORKER_PERSONAS.length],
-          tone: WORKER_TONES[i % WORKER_TONES.length],
-          slot: i,
-          phase: 'idle',
+          persona: WORKER_PERSONAS[arrival % WORKER_PERSONAS.length],
+          tone: WORKER_TONES[arrival % WORKER_TONES.length],
+          slot: i, // innermost slots — freshly emerged from the hourglass
+          phase: 'entering',
         });
       }
-      return [...prev, ...add];
+      // Bump every existing entry outward by the number inserted at the centre.
+      const bumped = prev.map((e) => ({ ...e, slot: e.slot + nAdd }));
+      return [...add, ...bumped];
     });
+    // Settle the fresh chips out of their emerge keyframe so it can't replay.
+    after(WORKER_ENTER_MS, () =>
+      setEntries((prev) =>
+        prev.some((e) => e.phase === 'entering')
+          ? prev.map((e) => (e.phase === 'entering' ? { ...e, phase: 'idle' as WorkerPhase } : e))
+          : prev,
+      ),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [count]);
 
   // Click-to-remove (ANY element): mark dismissing (scale→0 + fade keyframe), then
@@ -1997,15 +2016,19 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
     const target = entries.find((e) => e.key === key);
     if (!target || target.phase === 'dismissing') return;
     setEntries((prev) => prev.map((e) => (e.key === key ? { ...e, phase: 'dismissing' as WorkerPhase } : e)));
-    after(WORKER_DISMISS_MS, () =>
+    after(WORKER_DISMISS_MS, () => {
       setEntries((prev) => {
         const gone = prev.find((e) => e.key === key);
         if (!gone) return prev;
         return prev
           .filter((e) => e.key !== key)
           .map((e) => (e.slot > gone.slot ? { ...e, slot: e.slot - 1 } : e));
-      }),
-    );
+      });
+      // Decrement the owning side's parent count in the SAME batch as the entry drop,
+      // so `count` and `entries.length` settle together and the reconcile effect above
+      // sees count === n afterward (a no-op — no double-drop mid-animation).
+      onRemove?.();
+    });
   }
 
   const path = useMemo(() => makeQueuePath(side, geo, uiScale, gap, inset), [side, geo, uiScale, gap, inset]);
@@ -2038,7 +2061,7 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
             onClick={() => remove(e.key)}
           >
             <span
-              className={`worker-chip__disc${e.phase === 'dismissing' ? ' worker-chip__disc--out' : ''}${isDup ? ' worker-chip__disc--dup' : ''}`}
+              className={`worker-chip__disc${e.phase === 'dismissing' ? ' worker-chip__disc--out' : ''}${e.phase === 'entering' ? ' worker-chip__disc--in' : ''}${isDup ? ' worker-chip__disc--dup' : ''}`}
               style={{ color: e.tone }}
             >
               {personaIcon(e.persona)}
@@ -2410,9 +2433,10 @@ function ClockDial({ cx, cy, capR, rimD, uiScale, queueValue, flip, animate }: {
   );
 }
 
-function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true }: {
-  count: number; uiScale: number; gap: number; pitch: number; inset: number; split: number;
+function WorkerQueues({ leftCount, rightCount, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true, onRemoveLeft, onRemoveRight }: {
+  leftCount: number; rightCount: number; uiScale: number; gap: number; pitch: number; inset: number; split: number;
   variant?: 'compass' | 'clock'; queueValue?: number; flip?: boolean; animate?: boolean;
+  onRemoveLeft?: (() => void) | undefined; onRemoveRight?: (() => void) | undefined;
 }) {
   // Crossbar + hourglass shape is LOCKED — read straight from the frozen constants.
   // The by-eye dev-tuning sliders and the `shape` prop have been retired.
@@ -2571,6 +2595,14 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
     // stroke covers only the top edge + inner taper + outer cap (no double line).
     const bandSegs: string[] = [];
     const edgeSegs: string[] = [];
+    // Idle-variant (clock/flip) transplant of the footer's RIGHT-side gold tip. In SVG
+    // space the right tip is this LEFT lobe (the 180° host flip swings it right); its
+    // gold edge sits ABOVE the crossbar here and so hangs BELOW the bar once flipped.
+    // We keep the right lobe (the clock cap) verbatim and, separately, a copy of the
+    // left-lobe edge reflected across the bar so the idle variant can render it on the
+    // OTHER side of the crossbar (the mockup's pink outline) and drop the original.
+    const edgeSegsRight: string[] = []; // right lobe only (clock/compass cap side)
+    const edgeSegsLeftMirror: string[] = []; // left-lobe edge, mirrored across the bar
     const capStarts: number[] = []; // each lobe's outer terminus — where the cap begins
     // The RHS cap bulge (right lobe's rounded outer end) hosts the compass dial: a
     // semicircle of radius r whose centre of curvature is (xOuter, midY). Captured in
@@ -2629,11 +2661,12 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
       const outBotY = crossY(xOuter);
       // Top-edge polyline (outer → tip) and bottom-bar polyline (tip → outer).
       const nSeg = Math.max(2, Math.round(Math.abs(xTip - xOuter) / step));
-      const topC: string[] = [], botC: string[] = [];
+      const topC: string[] = [], botC: string[] = [], mTopC: string[] = [];
       for (let i = 0; i <= nSeg; i++) {
         const t = i / nSeg;
         const xt = xOuter + (xTip - xOuter) * t;
         topC.push(`${f(xt)},${f(topEdgeY(xt))}`);
+        mTopC.push(`${f(xt)},${f(2 * crossY(xt) - topEdgeY(xt))}`); // reflected across the bar
         const xb2 = xTip + (xOuter - xTip) * t;
         botC.push(`${f(xb2)},${f(crossY(xb2))}`);
       }
@@ -2648,9 +2681,26 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
         `M${f(xOuter)},${f(outBotY)} ${arc} ${topC[0]} ` +
         `${topC.slice(1).map((c) => `L${c}`).join(' ')} ${cubic}`,
       );
+      // Split per lobe for the idle variant: the RIGHT lobe (clock cap) is kept as-is;
+      // the LEFT lobe (footer's right tip) gets a copy reflected across the crossbar —
+      // same arc/edge/nose, y → 2·crossY(x) − y, so it lands on the pink outline above
+      // the bar. The reflection flips the cap arc's sweep and the outer point sits on
+      // the bar (outBotY === crossY(xOuter)) so it stays the mirror's anchor.
+      if (xOuter < xCtr) {
+        const mArc = `A${f(r)},${f(r)} 0 0 ${1 - sweep}`;
+        const mCubic = `C${f(c1x)},${f(2 * crossY(c1x) - c1y)} ${f(c2x)},${f(2 * crossY(c2x) - c2y)} ${f(xTip)},${f(crossY(xTip))}`;
+        edgeSegsLeftMirror.push(
+          `M${f(xOuter)},${f(outBotY)} ${mArc} ${mTopC[0]} ` +
+          `${mTopC.slice(1).map((c) => `L${c}`).join(' ')} ${mCubic}`,
+        );
+      } else {
+        edgeSegsRight.push(edgeSegs[edgeSegs.length - 1]);
+      }
     }
     const bandD = bandSegs.join(' ');
     const edgeD = edgeSegs.join(' ');
+    const edgeRightD = edgeSegsRight.join(' '); // idle: everything but the mirrored tip
+    const edgeLeftMirrorD = edgeSegsLeftMirror.join(' '); // idle: the tip mirrored up
     // The visible bottom line runs ONLY between the outermost cap-starts (the caps
     // close each end), so it never pokes out past a cap. "Go until touching the cap"
     // is symmetric — the left/right asymmetry lives entirely in the per-side inset.
@@ -2716,6 +2766,8 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
     return {
       barD,
       edgeD,
+      edgeRightD,
+      edgeLeftMirrorD,
       bandD,
       hourD,
       sections,
@@ -2725,9 +2777,9 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
     };
   }, [geo, uiScale, gap, inset, split, shape]);
 
-  // Split the depth half/half — left queue takes the odd chip.
-  const leftCount = Math.ceil(count / 2);
-  const rightCount = Math.floor(count / 2);
+  // Left and right are now INDEPENDENT — each side carries its own count (no more
+  // ceil/floor split of a shared total). They still share the rail + column geometry.
+  const count = leftCount + rightCount;
 
   return (
     <div className={`worker-queues${flip ? ' worker-queues--flip' : ''}`} ref={wrapRef}
@@ -2744,7 +2796,17 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
           <SegmentGlowLayer segments={rail.sections} idPrefix="hour" blur={9 * uiScale} rimW={11 * uiScale} />
           <path className="worker-rail__line" d={rail.stemD} />
           <path className="worker-rail__line" d={rail.barD} />
-          <path className="worker-rail__line" d={rail.edgeD} />
+          {/* Worker band: the full edge (both lobes) verbatim. Idle band: the right
+              lobe (clock cap) plus the LEFT-lobe tip mirrored ABOVE the bar — the
+              original below-bar tip is dropped (see the rail memo's mirror split). */}
+          {variant === 'clock' ? (
+            <>
+              <path className="worker-rail__line" d={rail.edgeRightD} />
+              <path className="worker-rail__line" d={rail.edgeLeftMirrorD} />
+            </>
+          ) : (
+            <path className="worker-rail__line" d={rail.edgeD} />
+          )}
           <path className="worker-rail__line" d={rail.hourD} />
           {/* Instrument inscribed in the RHS cap bulge — on top of the rail lines.
               The compass (mid-page status read) or the clock (idle-worker-queue). */}
@@ -2755,8 +2817,8 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
           )}
         </svg>
       )}
-      <WorkerColumn side={-1} count={leftCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} />
-      <WorkerColumn side={1} count={rightCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} />
+      <WorkerColumn side={-1} count={leftCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} onRemove={onRemoveLeft} />
+      <WorkerColumn side={1} count={rightCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} onRemove={onRemoveRight} />
     </div>
   );
 }
@@ -2767,17 +2829,20 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
 // (cap swings LEFT, chips hang BELOW the bar), with the clock inscribed in the cap
 // instead of the compass. The clock face counter-rotates to stay upright. Chips
 // The clock face (numeral fill) is DECOUPLED from the chip count: `clockValue`
-// (0–6, its own placeholder demo source) drives the numerals, `idleCount` drives
-// the chips (unbounded — grows up the ditches and is meant to clobber above).
-function IdleWorkerQueue({ clockValue, idleCount, uiScale, animate }: {
-  clockValue: number; idleCount: number; uiScale: number; animate: boolean;
+// (0–6, its own placeholder demo source) drives the numerals, `idleLeft`/`idleRight`
+// drive the per-side chips (each grows up its ditch, independent of the other side).
+function IdleWorkerQueue({ clockValue, idleLeft, idleRight, uiScale, animate, onRemoveLeft, onRemoveRight }: {
+  clockValue: number; idleLeft: number; idleRight: number; uiScale: number; animate: boolean;
+  onRemoveLeft?: (() => void) | undefined; onRemoveRight?: (() => void) | undefined;
 }) {
+  const total = idleLeft + idleRight;
   return (
     <section className="idle-worker-queue"
-      aria-label={`Idle worker queue — ${idleCount} idle worker${idleCount === 1 ? '' : 's'}`}>
-      <WorkerQueues count={idleCount} uiScale={uiScale}
+      aria-label={`Idle worker queue — ${total} idle worker${total === 1 ? '' : 's'}`}>
+      <WorkerQueues leftCount={idleLeft} rightCount={idleRight} uiScale={uiScale}
         gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
-        variant="clock" queueValue={clockValue} flip animate={animate} />
+        variant="clock" queueValue={clockValue} flip animate={animate}
+        onRemoveLeft={onRemoveLeft} onRemoveRight={onRemoveRight} />
     </section>
   );
 }
@@ -2842,7 +2907,7 @@ const LEMON_DEPTH = 108;
 // only convenience for the shape-finding knobs — the dialed-in values reload
 // instead of snapping back to defaults. Removed with the rest of the debug infra
 // when the layout is frozen. SSR/blocked-storage safe (falls back to `initial`).
-function usePersistedNumber(key: string, initial: number): [number, (v: number) => void] {
+function usePersistedNumber(key: string, initial: number): [number, React.Dispatch<React.SetStateAction<number>>] {
   const [v, setV] = useState<number>(() => {
     try {
       const raw = localStorage.getItem(`ops-mock:${key}`);
@@ -2963,12 +3028,18 @@ export function MockOpsCockpit() {
   // Worker-queue depth — total chips across the two "M" stacks below the lemon (the
   // 6 persona icons in the lemon are a fixed roster, not a knob). The old lemon
   // width/depth knobs are retired: the lemon is locked (see LEMON_WIDTH_INSET / DEPTH).
-  const [workerCount, setWorkerCount] = usePersistedNumber('workerCount', 8);
-  // Idle-worker-queue — TWO decoupled demo sources now that the clock is only a
+  // Worker queue — the two arms are now INDEPENDENT demo sources (left ≠ right):
+  // each rides the same rail/column geometry but carries its own count, so an add on
+  // one side never touches the other. MAX_WORKER_COUNT is a per-side ceiling.
+  const [workerLeft, setWorkerLeft] = usePersistedNumber('workerLeft', 4);
+  const [workerRight, setWorkerRight] = usePersistedNumber('workerRight', 4);
+  // Idle-worker-queue — THREE decoupled demo sources now that the clock is only a
   // placeholder test fixture: `clockValue` (0–6) drives the clock numeral fill, and
-  // `idleCount` (0–MAX_IDLE_COUNT) drives the chips that climb up the edge ditches.
+  // `idleLeft`/`idleRight` (each 0–MAX_IDLE_COUNT) drive the per-side chips that climb
+  // up the edge ditches — same left≠right independence as the worker arms.
   const [clockValue, setClockValue] = usePersistedNumber('clockValue', 4);
-  const [idleCount, setIdleCount] = usePersistedNumber('idleCount', 4);
+  const [idleLeft, setIdleLeft] = usePersistedNumber('idleLeft', 2);
+  const [idleRight, setIdleRight] = usePersistedNumber('idleRight', 2);
   const reducedMotion = usePrefersReducedMotion();
   // Worker-queue positioning is locked (W_DROP_PX / W_SPACE_PX / W_INSET_PX / W_SPLIT_PX)
   // and fed straight to WorkerQueues — the by-eye tuning sliders are retired.
@@ -3125,11 +3196,13 @@ export function MockOpsCockpit() {
       {/* worker queues — two icon-chip stacks below the lemon that grow outward
           from centre then trail down the two edges (a soft "M"). Fed by the
           Workers slider; click a chip to pop it and reflow the rest up-path. */}
-      <WorkerQueues count={workerCount} uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX} />
+      <WorkerQueues leftCount={workerLeft} rightCount={workerRight} uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
+        onRemoveLeft={() => setWorkerLeft((n) => Math.max(0, n - 1))} onRemoveRight={() => setWorkerRight((n) => Math.max(0, n - 1))} />
 
       {/* idle worker queue — the flipped bottom rail whose clock encodes idle-queue
           depth by numeral colour (design study; below the first-screen composition) */}
-      <IdleWorkerQueue clockValue={clockValue} idleCount={idleCount} uiScale={uiScale} animate={!reducedMotion} />
+      <IdleWorkerQueue clockValue={clockValue} idleLeft={idleLeft} idleRight={idleRight} uiScale={uiScale} animate={!reducedMotion}
+        onRemoveLeft={() => setIdleLeft((n) => Math.max(0, n - 1))} onRemoveRight={() => setIdleRight((n) => Math.max(0, n - 1))} />
 
       {/* dials drawer — where the default dial click lands (minimal stub) */}
       <DialsDrawer open={drawerOpen} focusedId={focusedDial} onClose={() => setDrawerOpen(false)} />
@@ -3178,18 +3251,18 @@ export function MockOpsCockpit() {
             onChange={(e) => setTtsDepth(Number(e.target.value))} />
           <EditableNum value={ttsDepth} onCommit={setTtsDepth} />
         </label>
-        <label className="demobar__slider">
-          Workers
-          <input type="range" min={0} max={MAX_WORKER_COUNT} value={workerCount}
-            onChange={(e) => setWorkerCount(Number(e.target.value))} />
-          <EditableNum value={workerCount} onCommit={setWorkerCount} />
-        </label>
-        <label className="demobar__slider">
-          Idle workers
-          <input type="range" min={0} max={MAX_IDLE_COUNT} value={idleCount}
-            onChange={(e) => setIdleCount(Number(e.target.value))} />
-          <EditableNum value={idleCount} onCommit={setIdleCount} />
-        </label>
+        {/* Workers + idle workers now ADD via per-side buttons (left ≠ right); removal
+            is click-a-chip, which decrements the owning side. Counts shown for reference. */}
+        <span className="demobar__adds" aria-label={`Workers left ${workerLeft}, right ${workerRight}`}>
+          <span className="demobar__addlabel">Workers <b>{workerLeft}·{workerRight}</b></span>
+          <button className="demobar__addbtn" onClick={() => setWorkerLeft((n) => Math.min(n + 1, MAX_WORKER_COUNT))} disabled={workerLeft >= MAX_WORKER_COUNT}>+ left</button>
+          <button className="demobar__addbtn" onClick={() => setWorkerRight((n) => Math.min(n + 1, MAX_WORKER_COUNT))} disabled={workerRight >= MAX_WORKER_COUNT}>+ right</button>
+        </span>
+        <span className="demobar__adds" aria-label={`Idle workers left ${idleLeft}, right ${idleRight}`}>
+          <span className="demobar__addlabel">Idle <b>{idleLeft}·{idleRight}</b></span>
+          <button className="demobar__addbtn" onClick={() => setIdleLeft((n) => Math.min(n + 1, MAX_IDLE_COUNT))} disabled={idleLeft >= MAX_IDLE_COUNT}>+ left</button>
+          <button className="demobar__addbtn" onClick={() => setIdleRight((n) => Math.min(n + 1, MAX_IDLE_COUNT))} disabled={idleRight >= MAX_IDLE_COUNT}>+ right</button>
+        </span>
         <label className="demobar__slider">
           Clock value
           <input type="range" min={0} max={6} value={clockValue}
