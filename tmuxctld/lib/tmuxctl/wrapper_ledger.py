@@ -91,6 +91,18 @@ class WrapperLedgerRow:
         return data
 
 
+def _is_hollow_active_row(row: WrapperLedgerRow) -> bool:
+    """True for stale wrapper-stamp shells that must not occupy a pane.
+
+    A real live wrapper row has at least one runtime fact beyond wrapper id and
+    pane label: SessionStart instance id, wrapperstart persona, engine, or cwd.
+    Fixed palace/somnium slots can retain only @TOKEN_API_WRAPPER_ID after their
+    runtime was scrubbed; reconstructing those as OPEN rows creates false births.
+    """
+
+    return row.active and not (row.instance_id or row.persona or row.engine or row.working_dir)
+
+
 class WrapperLedger:
     """Thread-safe wrapper_id keyed runtime oracle."""
 
@@ -128,7 +140,7 @@ class WrapperLedger:
                     if not isinstance(item, dict):
                         continue
                     row = WrapperLedgerRow.from_mapping(item)
-                    if row.wrapper_id:
+                    if row.wrapper_id and not _is_hollow_active_row(row):
                         rows[row.wrapper_id] = row
             self._rows = rows
             self._reindex_locked()
@@ -143,7 +155,7 @@ class WrapperLedger:
         self._by_instance = {}
         self._by_pane_positional = {}
         for wrapper_id, row in self._rows.items():
-            if not row.active:
+            if not row.active or _is_hollow_active_row(row):
                 continue
             if row.instance_id:
                 self._by_instance[row.instance_id] = wrapper_id
@@ -192,6 +204,8 @@ class WrapperLedger:
                 )
             else:
                 row = existing.merge(**{**fields, "wrapper_id": wrapper_id})
+            if _is_hollow_active_row(row):
+                raise ValueError("refusing hollow active wrapper ledger row")
             self._rows[wrapper_id] = row
             self._reindex_locked()
             self._write_locked()
@@ -344,6 +358,8 @@ class WrapperLedger:
                     "state": "OPEN",
                 }
             )
+            if _is_hollow_active_row(row):
+                continue
             live_rows[row.wrapper_id] = row
 
         with self._lock:

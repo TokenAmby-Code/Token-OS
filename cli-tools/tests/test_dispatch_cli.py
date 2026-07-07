@@ -1594,6 +1594,8 @@ def test_dispatch_prealloc_new_uses_greedy_first_free_without_stack_spawn(tmp_pa
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["HOME"] = str(tmp_path / "home")
+    Path(env["HOME"]).mkdir()
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
 
@@ -1630,6 +1632,93 @@ def test_dispatch_prealloc_new_uses_greedy_first_free_without_stack_spawn(tmp_pa
     assert "TOKEN_API_DISPATCH_TARGET=palace:new" in staged
     assert "TOKEN_API_DISPATCH_RESOLVED_PANE=%88" in staged
     assert "TOKEN_API_DISPATCH_RESOLVED_PANE=palace:new" not in staged
+
+
+def test_dispatch_numeric_new_on_prealloc_window_uses_freelist_not_stack(tmp_path: Path) -> None:
+    """2:new resolves live window 2 -> somnium before allocator selection.
+
+    Regression for the false-birth path: numeric window aliases were parsed as
+    stack base "2", so dispatch called /stack/dispatch base=2 and failed with
+    "not a stack window: 2" after doing setup work. Fixed behavior classifies
+    the live window name first and allocates a fixed somnium slot from /freelist.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ping_log = tmp_path / "tmuxctld-ping.log"
+    tmux_log = tmp_path / "tmux.log"
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf '%s\\n' \"$*\" >> {ping_log}\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"; shift 2 || true\n'
+        'case "$method $path" in\n'
+        '  "GET /freelist") printf \'%s\' \'[{"pane_id":"somnium:NE","pane_role":"somnium:NE","window_name":"somnium"},{"pane_id":"somnium:N","pane_role":"somnium:N","window_name":"somnium"},{"pane_id":"palace:N","pane_role":"palace:N","window_name":"palace"}]\' | python3 -c \'import json,sys; print(json.dumps({"ok": True, "result": json.loads(sys.stdin.read())}))\' ;;\n'
+        '  "POST /stack/dispatch") printf \'%s\' \'{"ok":false,"error":{"message":"not a stack window: 2"}}\' ; exit 0 ;;\n'
+        '  "GET /resolve-pane"|"POST /resolve-pane") printf \'{"ok":true,"result":"%%88"}\' ;;\n'
+        '  "POST /send-text") printf \'{"ok":true,"result":{"delivery":"confirmed"}}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {tmux_log}\n"
+        'if [[ "$1" == "display-message" && "$*" == *"#{window_name}"* ]]; then printf \'somnium\\n\'; exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf \'bash||somnium:N|999|\\n\'; exit 0; fi\n'
+        'if [[ "$1" == "show-options" ]]; then printf \'somnium:N\\n\'; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["HOME"] = str(tmp_path / "home")
+    Path(env["HOME"]).mkdir()
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "2:new",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "not a stack window: 2" not in result.stderr
+    ping_text = ping_log.read_text(encoding="utf-8", errors="replace")
+    assert "GET /freelist" in ping_text
+    assert "POST /stack/dispatch" not in ping_text
+    assert "POST /send-text pane=somnium:N text=bash " in ping_text
+    staged = Path(_staged_command_from_tmuxctld_log(ping_log).split(" ", 1)[1]).read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "TOKEN_API_LAUNCH_MODE=tmux_target" in staged
+    assert "TOKEN_API_DISPATCH_TARGET=2:new" in staged
+    assert "TOKEN_API_DISPATCH_WINDOW=somnium" in staged
+    assert "TOKEN_API_DISPATCH_RESOLVED_PANE=%88" in staged
 
 
 def test_dispatch_stack_dispatch_has_no_hard_60s_transport_ceiling(tmp_path: Path) -> None:
@@ -1670,6 +1759,7 @@ def test_dispatch_stack_dispatch_has_no_hard_60s_transport_ceiling(tmp_path: Pat
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_DB"] = str(db)
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env.pop("TMUXCTLD_MAX_TIME", None)
@@ -1817,6 +1907,7 @@ def test_dispatch_stack_new_accepts_public_pane_id_return(tmp_path: Path) -> Non
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_DB"] = str(db)
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env["TMUXCTLD_PING_LOG"] = str(ping_log)
@@ -2194,6 +2285,7 @@ def test_dispatch_stack_new_rejects_non_canonical_id(tmp_path: Path) -> None:
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_DB"] = str(db)
     env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
     env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
     env["TMUXCTLD_PING_STACK_DISPATCH_RESULT"] = "%77"

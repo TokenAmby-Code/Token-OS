@@ -217,15 +217,8 @@ def test_persona_tmux_target_registration_stores_public_alias_not_raw_pane(
     # the tmuxctld/@PANE_ID alias instead, and the alias-backed persona must not
     # enter needs-name/tab_name_placeholder drift.
     hooks = sys.modules["routes.hooks"]
-    stamps: list[tuple[str | None, str | None, str | None]] = []
-
     monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("mechanicus:orchestrator"))
     _no_pane_occupant(monkeypatch, hooks)
-
-    async def stamp(pane, session_id, *, display_name=None):
-        stamps.append((pane, session_id, display_name))
-
-    monkeypatch.setattr(hooks, "_stamp_instance_id", stamp)
 
     result = _start_session(
         hooks,
@@ -244,7 +237,6 @@ def test_persona_tmux_target_registration_stores_public_alias_not_raw_pane(
     assert row["name"] == "Orchestrator"
     assert row["workflow_blocked_reason"] is None
     assert row["hook_driven"] == 0
-    assert ("%pp", "orch-raw-pane", "Orchestrator") in stamps
 
 
 def test_persona_tmux_target_codex_flip_refresh_keeps_alias_registration(
@@ -252,17 +244,11 @@ def test_persona_tmux_target_codex_flip_refresh_keeps_alias_registration(
 ) -> None:
     # Engine flip claude→codex reuses the same SessionStart registration flow. A
     # flip payload that again carries raw $TMUX_PANE as dispatch_target must refresh
-    # the row to the public alias, with persona/name/stamp intact.
+    # the row to the public alias, with persona/name intact.
     hooks = sys.modules["routes.hooks"]
-    stamps: list[tuple[str | None, str | None, str | None]] = []
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", _label_resolver("council:pax"))
     _no_pane_occupant(monkeypatch, hooks)
-
-    async def stamp(pane, session_id, *, display_name=None):
-        stamps.append((pane, session_id, display_name))
-
-    monkeypatch.setattr(hooks, "_stamp_instance_id", stamp)
 
     first = _start_session(
         hooks,
@@ -294,7 +280,6 @@ def test_persona_tmux_target_codex_flip_refresh_keeps_alias_registration(
     assert row["name"] == "Pax"
     assert row["workflow_blocked_reason"] is None
     assert row["hook_driven"] == 0
-    assert ("%pp", "pax-flip", "Pax") in stamps
 
 
 def test_pax_pane_off_council_page_falls_back_to_astartes(
@@ -375,29 +360,24 @@ def test_custodes_relaunch_over_zombie_predecessor_absorbs_it(
     assert live == 1
 
 
-def test_custodes_paneless_start_resolves_label_for_stamp_and_gold_tint(
+def test_custodes_paneless_start_resolves_label_for_gold_tint(
     app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Custodes SessionStart can arrive with no TMUX_PANE while still carrying
     # pane_label=council:custodes. The hook must resolve that stable label through
-    # the live pane oracle and use the effective pane for both @INSTANCE_ID stamp
-    # and personas.pane_tint application.
+    # the live pane oracle and use the effective pane for personas.pane_tint
+    # application. Pane-local stamps remain tmuxctld/wrapper-owned.
     hooks = sys.modules["routes.hooks"]
-    stamps: list[tuple[str | None, str | None]] = []
     tint_calls: list[tuple[str | None, str | None]] = []
 
     async def resolve_label(target):
         return "%custodes" if target == "council:custodes" else None
-
-    async def stamp(pane, session_id, **_kwargs):
-        stamps.append((pane, session_id))
 
     def apply_pane_tint(pane, tint, **_kwargs):
         tint_calls.append((pane, tint))
 
     _no_pane_occupant(monkeypatch, hooks)
     monkeypatch.setattr(hooks.shared, "resolve_tmux_pane_id", resolve_label)
-    monkeypatch.setattr(hooks, "_stamp_instance_id", stamp)
     monkeypatch.setattr(hooks.shared, "apply_pane_tint", apply_pane_tint)
 
     result = asyncio.run(
@@ -414,8 +394,7 @@ def test_custodes_paneless_start_resolves_label_for_stamp_and_gold_tint(
     row = _row(app_env.db_path, "cust-paneless")
     assert row["persona_slug"] == "custodes"
     assert row["rank"] == "overseer"
-    assert result["pane_tint"] == "#302800"
-    assert ("%custodes", "cust-paneless") in stamps
+    assert result["success"] is True
     assert ("%custodes", "#302800") in tint_calls
     assert all(tint != "default" for _pane, tint in tint_calls)
 

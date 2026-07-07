@@ -140,108 +140,6 @@ async def _echo_prompt_submit_to_tmuxctld(payload: dict) -> None:
         return
 
 
-def _post_tmuxctld_ledger_upsert_sync(body: dict) -> None:
-    base = _tmuxctld_loopback_url()
-    if not base:
-        return
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base}/ledger/upsert",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    # This is the belt leg from SessionStart into the daemon ledger. Do not make
-    # agent registration depend on tmuxctld being up; wrapperstart/reconcile can
-    # rebuild it. Keep the timeout tighter than the hook client budget.
-    with shared._TMUXCTLD_OPENER.open(req, timeout=0.35) as resp:
-        resp.read(512)
-
-
-async def _upsert_tmuxctld_ledger_from_agents_db(payload: dict, result: dict) -> None:
-    instance_id = _normalize_text(result.get("instance_id") or payload.get("session_id") or "")
-    if not instance_id:
-        return
-    env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
-    pane_label = _normalize_text(payload.get("pane_label") or env.get("TOKEN_API_PANE_LABEL") or "")
-    tmux_pane = _normalize_text(
-        payload.get("tmux_pane")
-        or env.get("TMUX_PANE")
-        or env.get("TOKEN_API_DISPATCH_RESOLVED_PANE")
-        or ""
-    )
-    if not pane_label and tmux_pane:
-        try:
-            pane_label = await _tmux_pane_label(tmux_pane)
-        except Exception:
-            pane_label = ""
-
-    try:
-        async with shared.hook_db() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                """SELECT i.id, i.wrapper_launch_id, i.working_dir, i.engine, i.status,
-                          (SELECT slug FROM personas WHERE id = i.persona_id) AS persona_slug
-                   FROM instances i
-                   WHERE i.id = ?""",
-                (instance_id,),
-            )
-            row = await cursor.fetchone()
-    except Exception as exc:
-        logger.warning(
-            "SessionStart: tmuxctld ledger agents.db read failed for %s: %s", instance_id[:12], exc
-        )
-        return
-    if row is None:
-        return
-
-    wrapper_id = _normalize_text(
-        row["wrapper_launch_id"]
-        or payload.get("wrapper_launch_id")
-        or payload.get("wrapper_id")
-        or env.get("TOKEN_API_WRAPPER_ID")
-        or env.get("TOKEN_API_WRAPPER_LAUNCH_ID")
-        or ""
-    )
-    if not wrapper_id:
-        return
-    result_persona = result.get("persona") if isinstance(result.get("persona"), dict) else {}
-    body = {
-        "wrapper_id": wrapper_id,
-        "instance_id": row["id"],
-        "persona": _normalize_text(row["persona_slug"] or result_persona.get("slug") or ""),
-        "pane_positional_id": pane_label,
-        "engine": _normalize_text(
-            row["engine"] or env.get("TOKEN_API_ENGINE") or payload.get("engine") or ""
-        ),
-        "working_dir": _normalize_text(row["working_dir"] or payload.get("cwd") or ""),
-        "state": "OPEN" if _normalize_text(row["status"]) != "stopped" else "CLOSED",
-    }
-    try:
-        await asyncio.to_thread(_post_tmuxctld_ledger_upsert_sync, body)
-    except Exception as exc:
-        logger.warning(
-            "SessionStart: tmuxctld ledger upsert failed for %s wrapper=%s: %s",
-            instance_id[:12],
-            wrapper_id[:12],
-            exc,
-        )
-
-
-def _schedule_tmuxctld_ledger_upsert(payload: dict, result: dict) -> None:
-    """Queue best-effort tmuxctld ledger hydration off the hook response path."""
-
-    task = asyncio.create_task(_upsert_tmuxctld_ledger_from_agents_db(dict(payload), dict(result)))
-
-    def _log_task_failure(done: asyncio.Task[None]) -> None:
-        try:
-            done.result()
-        except Exception as exc:
-            logger.warning("SessionStart: tmuxctld ledger hydration task failed: %s", exc)
-
-    task.add_done_callback(_log_task_failure)
-
-
 # Bounded in-band retry for transient WAL "database is locked" (SQLITE_BUSY) on
 # hook DB writes. Total added latency on full exhaustion is
 # 0.15*(1+2+3+4) = 1.5s — well under the client hook's --max-time/--retry-max-time
@@ -666,81 +564,6 @@ async def _tmux_pane_label(tmux_pane: str | None) -> str | None:
     return (stdout or "").strip() or None
 
 
-async def _stamp_instance_id(
-    tmux_pane: str | None,
-    session_id: str | None,
-    display_name: str | None = None,
-    *,
-    db=None,
-    wrapper_id: str | None = None,
-    engine: str | None = None,
-    working_dir: str | None = None,
-    persona: str | None = None,
-) -> None:
-    """Bind the canonical Token-API instance id to the wrapper ledger.
-
-    The live engine's ``TOKEN_API_SESSION_ID`` may churn across plan/compact
-    cycles. The ledger must receive the canonical Token-API row id selected by
-    the SessionStart upsert/adoption path, resolved here from ``wrapper_id`` when
-    possible, not blindly from hook env.
-
-    ``display_name`` is the instance's ``tab_name`` (NOT the persona ``pane_label``
-    column). When provided, it hydrates ``@PANE_LABEL`` so the border shows the name
-    *before* the first rename — a fresh register INSERTs, so ``trg_tab_name_pane_state``
-    (AFTER UPDATE) never fires for it. Renames thereafter flow through the trigger.
-    """
-    if not tmux_pane or not session_id:
-        return
-    canonical_instance_id = session_id
-    if db is not None and wrapper_id:
-        try:
-            cursor = await db.execute(
-                """SELECT id FROM instances
-                   WHERE wrapper_launch_id = ?
-                     AND rank != 'retired'
-                   ORDER BY last_activity DESC, created_at DESC
-                   LIMIT 1""",
-                (wrapper_id,),
-            )
-            row = await cursor.fetchone()
-            if row and row[0]:
-                canonical_instance_id = str(row[0])
-        except Exception as exc:
-            logger.debug("Hook: canonical wrapper instance lookup failed: %s", exc)
-
-    if wrapper_id:
-        await asyncio.to_thread(
-            shared._tmuxctld_post_json,
-            "/ledger/upsert",
-            {
-                "wrapper_id": wrapper_id,
-                "instance_id": canonical_instance_id,
-                "pane_positional_id": await _tmux_pane_label(tmux_pane) or "",
-                "engine": engine or "",
-                "working_dir": working_dir or "",
-                "persona": persona or "",
-                "state": "OPEN",
-            },
-            timeout=1.0,
-            default_loopback=True,
-        )
-
-    stamped = await shared.tmuxctld_run_tmux(
-        ("set-option", "-p", "-t", tmux_pane, "@INSTANCE_ID", canonical_instance_id),
-        timeout=2,
-    )
-    if stamped is None:
-        logger.debug(f"Hook: @INSTANCE_ID stamp failed for {tmux_pane} ({session_id})")
-
-    label = (display_name or "").strip()
-    if not label:
-        return
-    await shared.tmuxctld_run_tmux(
-        ("set-option", "-p", "-t", tmux_pane, "@PANE_LABEL", label),
-        timeout=2,
-    )
-
-
 async def _persona_id_by_slug(db, slug: str) -> str | None:
     cursor = await db.execute("SELECT id FROM personas WHERE slug = ?", (slug,))
     row = await cursor.fetchone()
@@ -905,12 +728,13 @@ async def _session_start_effective_pane(
     tmux_pane: str | None,
     pane_label: str | None,
 ) -> str | None:
-    """Return an addressable pane for SessionStart side effects.
+    """Return an addressable pane for SessionStart registry-adjacent effects.
 
     Hook payloads sometimes arrive without ``TMUX_PANE`` even though the pane's
     stable label (for example ``council:custodes``) is present. Pane geometry is
-    still not persisted: this resolves the transient label through tmuxctl's live
-    pane oracle so SessionStart can stamp and tint the actual pane on this event.
+    still not persisted: this resolves the transient label through tmuxctl's
+    live pane oracle so SessionStart can target tint/subscription behavior on
+    this event. Token-API does not stamp pane-local identity.
     """
     if tmux_pane:
         return tmux_pane
@@ -922,35 +746,6 @@ async def _session_start_effective_pane(
     except Exception as exc:
         logger.warning("Hook: SessionStart pane label resolve failed for %s: %s", label, exc)
         return None
-
-
-async def _unstamp_instance_id(tmux_pane: str | None, session_id: str | None) -> None:
-    """Clear ``@INSTANCE_ID`` on a pane an instance is moving *off* of.
-
-    When an instance moves panes (transplant / re-register onto a new ``%N``) the
-    new pane is stamped, but the old pane would otherwise keep this instance's
-    stamp — leaving two live panes resolving to the same UUID until teardown. We
-    clear it here so ``resolve-instance`` never sees a duplicate.
-
-    Guarded: only unset when the pane *still* carries this instance's id, so a
-    pane already reused by a different agent (which re-stamped with its own id) is
-    never clobbered. Best-effort; never raises.
-    """
-    if not tmux_pane or not session_id:
-        return
-    try:
-        current = await shared.tmuxctld_stdout(
-            ("show-options", "-pqv", "-t", tmux_pane, "@INSTANCE_ID"),
-            timeout=2,
-        )
-        if (current or "").strip() != session_id:
-            return  # pane gone or already owned by a different instance
-        await shared.tmuxctld_run_tmux(
-            ("set-option", "-p", "-u", "-t", tmux_pane, "@INSTANCE_ID"),
-            timeout=2,
-        )
-    except Exception as exc:
-        logger.debug(f"Hook: @INSTANCE_ID unstamp errored for {tmux_pane}: {exc}")
 
 
 async def _stop_if_dead_pane(db, session_id: str, existing: dict, actor: str) -> bool:
@@ -2394,7 +2189,7 @@ async def _mark_for_close_subscription(
             "success": False,
             "action": "pane_instance_mismatch",
             "instance_id": instance_id,
-            "pane_instance_id": resolved_id,
+            "resolved_instance_id": resolved_id,
             "pane": target_pane,
         }
     if pane and not resolved_id:
@@ -2873,9 +2668,8 @@ async def handle_session_start(payload: dict) -> dict:
         origin_type = "ssh"
         source_ip = env["SSH_CLIENT"].split()[0]
 
-    # Get working directory and tab name
+    # Get working directory
     working_dir = payload.get("cwd") or os.getcwd()
-    tab_name = DEFAULT_INSTANCE_NAME
 
     # Detect subagent from env var
     subagent_env = payload.get("env", {}).get("TOKEN_API_SUBAGENT", "")
@@ -2894,19 +2688,10 @@ async def handle_session_start(payload: dict) -> dict:
         pane_label = await _tmux_pane_label(tmux_pane)
     # Effective pane for this SessionStart event. If Claude/hook env stripped
     # TMUX_PANE but the stable role label survived (notably council:custodes),
-    # live-resolve that label so the row is stamped and tinted immediately.
-    # This is transient pane addressing only; nothing is written to instances.
+    # live-resolve that label for registry-adjacent effects such as tint and
+    # subscriptions. This is transient pane addressing only; nothing is written
+    # to instances or tmux pane-local stamps.
     tmux_pane = await _session_start_effective_pane(tmux_pane, pane_label)
-
-    # The pane's @INSTANCE_ID stamp as read by the hook itself, atomically with
-    # the event. The live tmuxctl lookup stays preferred (fresher), but when it
-    # misses (latency, SMB stall, racing the stamp) this is the only surviving
-    # occupancy signal — without it a plan-approval context-clear INSERTs a
-    # duplicate row and strands the prior row's persona/rank identity.
-    pane_stamp_instance_id = _normalize_text(payload.get("pane_instance_id") or "") or None
-    if pane_stamp_instance_id == session_id:
-        # Own stamp: same instance re-registering, not a supplant source.
-        pane_stamp_instance_id = None
 
     # Resolve device_id from HTTP client IP (where the instance actually runs)
     # SSH_CLIENT gives the SSH origin (Mac), not the instance's machine (WSL)
@@ -3119,10 +2904,8 @@ async def handle_session_start(payload: dict) -> dict:
             persona_primarchs = sorted(
                 {v["primarch"] for v in PERSONA_PANE_IDENTITY.values() if v.get("primarch")}
             )
-            live_pane_instance_id = (
-                await shared.instance_id_for_pane(tmux_pane) or pane_stamp_instance_id
-            )
-            if live_pane_instance_id and live_pane_instance_id != session_id:
+            live_occupant_instance_id = await shared.instance_id_for_pane(tmux_pane)
+            if live_occupant_instance_id and live_occupant_instance_id != session_id:
                 placeholders = ",".join("?" for _ in persona_primarchs)
                 cursor = await db.execute(
                     f"""SELECT i.id FROM instances i
@@ -3130,7 +2913,7 @@ async def handle_session_start(payload: dict) -> dict:
                         WHERE i.id = ?
                           AND p.slug IN ({placeholders})
                         ORDER BY i.created_at DESC LIMIT 1""",
-                    (live_pane_instance_id, *persona_primarchs),
+                    (live_occupant_instance_id, *persona_primarchs),
                 )
                 row = await cursor.fetchone()
                 if row:
@@ -3148,16 +2931,14 @@ async def handle_session_start(payload: dict) -> dict:
         if not supplant_id:
             payload_pid = payload.get("pid")
             if payload_pid and tmux_pane:
-                live_pane_instance_id = (
-                    await shared.instance_id_for_pane(tmux_pane) or pane_stamp_instance_id
-                )
-                if live_pane_instance_id:
+                live_occupant_instance_id = await shared.instance_id_for_pane(tmux_pane)
+                if live_occupant_instance_id:
                     cursor = await db.execute(
                         """SELECT id FROM instances
                            WHERE id = ?
                              AND status NOT IN ('stopped', 'archived')
                            ORDER BY created_at DESC LIMIT 1""",
-                        (live_pane_instance_id,),
+                        (live_occupant_instance_id,),
                     )
                     row = await cursor.fetchone()
                     if row:
@@ -3293,14 +3074,13 @@ async def handle_session_start(payload: dict) -> dict:
                     target_working_dir=target_working_dir,
                 )
 
-                # The oracle is the sole source of the prior pane: resolve where
-                # this instance's @INSTANCE_ID currently lives BEFORE re-stamping,
-                # so the vacate/unstamp targets the real old pane.
+                # Read-only oracle: resolve where this instance's @INSTANCE_ID
+                # currently lives for transient tint/subscription targeting.
                 old_tmux_pane, _ = await shared.resolve_instance_pane(session_id)
                 # Effective pane: a paneless re-fire (no live TMUX_PANE in the
                 # payload) means nothing moved — the instance is still on
-                # `old_tmux_pane`, so stamp/tint operate on it rather than zeroing a
-                # valid live stamp/tint. Mirrors the supplant branch's target pane.
+                # `old_tmux_pane`, so tint/subscription behavior still targets it.
+                # Token-API does not mutate pane-local stamps.
                 target_pane = tmux_pane or old_tmux_pane
 
                 # Same-ID transplant (--continue): update the existing row in-place.
@@ -3372,27 +3152,9 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_mode=dispatch_mode,
                     dispatch_legion=dispatch_legion,
                 )
-                persona_display_name = await _apply_persona_seat_name(
+                await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
                 )
-                await _stamp_instance_id(
-                    target_pane,
-                    session_id,
-                    display_name=persona_display_name or transplant_updates["name"],
-                    db=db,
-                    wrapper_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
-                    engine=engine or existing_row["engine"],
-                    working_dir=working_dir,
-                    persona=primarch_name or dispatch_legion,
-                )
-                # Only vacate the old pane when a NEW addressable pane was actually
-                # stamped. A blank `tmux_pane` (in-wrapper re-fire arriving with no
-                # live TMUX_PANE) means nothing moved — the instance is still on
-                # `old_tmux_pane`, so unstamping it would zero a valid live stamp
-                # (the churn that drops resolve-instance to 0). Mirrors the guarded
-                # sibling branch below.
-                if tmux_pane and old_tmux_pane and old_tmux_pane != tmux_pane:
-                    await _unstamp_instance_id(old_tmux_pane, session_id)
                 await _apply_instance_workflow_state(
                     db,
                     instance_id=session_id,
@@ -3481,8 +3243,8 @@ async def handle_session_start(payload: dict) -> dict:
                 # Normal re-registration / Codex resume. Refresh transport fields so
                 # a live pane cannot remain represented by a stale stopped row.
                 now = datetime.now().isoformat()
-                # The oracle is the sole source of the prior pane: resolve where
-                # this instance's @INSTANCE_ID currently lives BEFORE re-stamping.
+                # Read-only oracle: resolve where this instance's @INSTANCE_ID
+                # currently lives for transient tint/subscription targeting.
                 prior_pane, _ = await shared.resolve_instance_pane(session_id)
                 # pid died with legacy instance table; the commander edge (legacy
                 # parent_instance_id) is applied by _apply_commander_binding
@@ -3544,21 +3306,9 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_mode=dispatch_mode,
                     dispatch_legion=dispatch_legion,
                 )
-                persona_display_name = await _apply_persona_seat_name(
+                await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
                 )
-                await _stamp_instance_id(
-                    tmux_pane or prior_pane,
-                    session_id,
-                    display_name=persona_display_name or updates["name"],
-                    db=db,
-                    wrapper_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
-                    engine=engine or existing_row["engine"],
-                    working_dir=working_dir,
-                    persona=primarch_name or dispatch_legion,
-                )
-                if tmux_pane and prior_pane and tmux_pane != prior_pane:
-                    await _unstamp_instance_id(prior_pane, session_id)
                 await db.commit()
                 auto_subscription = await _auto_subscribe_parent_on_start(
                     db,
@@ -3670,10 +3420,9 @@ async def handle_session_start(payload: dict) -> dict:
                     target_working_dir=target_working_dir,
                 )
 
-                # The oracle is the sole source of the supplanted pane: resolve
-                # where the old instance's @INSTANCE_ID currently lives. When the
-                # SessionStart payload omits a pane, the live supplanted pane is the
-                # target to restamp so it never keeps the old id (a stale oracle bridge).
+                # Read-only oracle: resolve where the old instance's @INSTANCE_ID
+                # currently lives. When the SessionStart payload omits a pane, the
+                # live supplanted pane remains the transient tint/subscription target.
                 old_tmux_pane, _ = await shared.resolve_instance_pane(supplant_id)
                 target_tmux_pane = tmux_pane or old_tmux_pane
 
@@ -3744,23 +3493,9 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_mode=dispatch_mode,
                     dispatch_legion=dispatch_legion,
                 )
-                persona_display_name = await _apply_persona_seat_name(
+                await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
                 )
-                await _stamp_instance_id(
-                    target_tmux_pane,
-                    session_id,
-                    display_name=persona_display_name or supplant_updates["name"],
-                    db=db,
-                    wrapper_id=wrapper_launch_id or old_inst["wrapper_launch_id"],
-                    engine=engine or old_inst["engine"],
-                    working_dir=working_dir,
-                    persona=primarch_name or dispatch_legion,
-                )
-                # If the agent moved panes, vacate the old pane's @INSTANCE_ID so the
-                # oracle never reports the supplanted (now-defunct) id there.
-                if tmux_pane and old_tmux_pane and old_tmux_pane != tmux_pane:
-                    await _unstamp_instance_id(old_tmux_pane, supplant_id)
 
                 await _apply_commander_binding(
                     db,
@@ -3999,7 +3734,7 @@ async def handle_session_start(payload: dict) -> dict:
             # The registration INSERT is the first durable write and the dominant
             # "database is locked" (SQLITE_BUSY) victim under fleet WAL contention.
             # Retry it here — at the narrow, side-effect-free boundary, before any
-            # commit/stamp/tint — so a transient writer-lock loss self-heals
+            # commit/tint/session-doc work — so a transient writer-lock loss self-heals
             # in-band without replaying durable work (the prior whole-handler retry
             # was unsafe for exactly that reason). On exhaustion the error
             # propagates to dispatch_hook, which fails the SessionStart loud (503).
@@ -4071,18 +3806,8 @@ async def handle_session_start(payload: dict) -> dict:
             dispatch_mode=dispatch_mode,
             dispatch_legion=dispatch_legion,
         )
-        persona_display_name = await _apply_persona_seat_name(
+        await _apply_persona_seat_name(
             db, instance_id=session_id, persona_identity=persona_identity
-        )
-        await _stamp_instance_id(
-            tmux_pane,
-            session_id,
-            display_name=persona_display_name or tab_name,
-            db=db,
-            wrapper_id=wrapper_launch_id,
-            engine=engine,
-            working_dir=working_dir,
-            persona=primarch_name or dispatch_legion,
         )
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
@@ -4354,7 +4079,7 @@ async def handle_session_end(payload: dict) -> dict:
     # Claude Code forwards the SessionEnd `reason` (clear / compact / logout /
     # prompt_input_exit / ...) via generic-hook.sh. A non-terminal boundary is
     # the wrapper still alive about to re-fire SessionStart — never tear the row
-    # or stamp down for those (see Layer 1 short-circuit below).
+    # down for those (see Layer 1 short-circuit below).
     end_reason = _normalize_text(payload.get("reason") or "") or None
 
     _pending_background_tasks.pop(session_id, None)
@@ -4398,8 +4123,8 @@ async def handle_session_end(payload: dict) -> dict:
         # the SAME wrapper. The default teardown below marks the row `stopped`,
         # which races the paired SessionStart re-key and drops the row out of
         # active state mid-session — so the re-fire mints a new id + orphan doc.
-        # The wrapper is still alive: leave the row + stamp intact and let the
-        # re-fire adopt it (clean stamp path; Layer 2 is the backstop).
+        # The wrapper is still alive: leave the row intact and let the re-fire
+        # adopt it. Pane-local stamp continuity is tmuxctld/wrapper-owned.
         if end_reason in NON_TERMINAL_SESSION_END_REASONS:
             if end_reason == "compact":
                 try:
@@ -7548,16 +7273,13 @@ async def dispatch_hook(action_type: str, payload: dict, request: Request) -> di
     payload["_hook_action_type_raw"] = action_type
 
     # NB: do NOT blanket-retry the handler here. Handlers commit mid-flight and
-    # perform durable side effects (tmux stamping/tint, frontmatter writes), so a
+    # perform durable side effects (tint, frontmatter writes), so a
     # replay on a late lock error would double-apply already-committed work. The
     # transient "database is locked" retry lives at the narrow, side-effect-free
     # write boundary inside each handler that needs it (see handle_session_start's
     # registration INSERT); this dispatcher only swallows-or-surfaces the outcome.
     try:
-        result = await handler(payload)
-        if normalized_action_type == "SessionStart" and isinstance(result, dict):
-            _schedule_tmuxctld_ledger_upsert(payload, result)
-        return result
+        return await handler(payload)
     except Exception as e:
         logger.error(f"Hook handler error ({normalized_action_type}): {e}")
 

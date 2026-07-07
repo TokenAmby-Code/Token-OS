@@ -104,7 +104,7 @@ async def test_prompt_submit_on_named_row_does_not_schedule_naming_nudge(
 
 @pytest.mark.asyncio
 async def test_session_start_does_not_schedule_naming_nudge(app_env, monkeypatch) -> None:
-    """SessionStart only registers/stamps; naming waits for the first real prompt."""
+    """SessionStart only registers; naming waits for the first real prompt."""
     hooks = sys.modules["routes.hooks"]
     monkeypatch.setattr(
         hooks,

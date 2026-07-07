@@ -397,6 +397,86 @@ def test_reconcile_skips_dead_husk_and_never_reopens_hollow_row(tmp_path) -> Non
     assert out["open_rows"] == 1
 
 
+def _raw_scan_line(
+    *,
+    wrapper_id: str,
+    instance_id: str = "",
+    persona: str = "",
+    pane_id: str,
+    engine: str = "",
+    working_dir: str = "",
+    pane_dead: bool = False,
+) -> str:
+    return _SCAN_SEP.join(
+        [
+            wrapper_id,
+            "",
+            instance_id,
+            persona,
+            pane_id,
+            engine,
+            working_dir,
+            "0",
+            "1" if pane_dead else "0",
+        ]
+    )
+
+
+def test_reconcile_skips_live_hollow_wrapper_stamp_false_birth(tmp_path) -> None:
+    """A stale wrapper id alone must not reconstruct an OPEN occupancy row.
+
+    Palace/somnium fixed slots can retain @TOKEN_API_WRAPPER_ID after runtime
+    scrub while all actual runtime fields are empty. Reconcile used to interpret
+    that as a live OPEN row and block dispatch with ledger/sniff disagreement.
+    """
+    ledger = WrapperLedger(path=tmp_path / "ledger.json")
+    out = ledger.reconcile_from_tmux(
+        _LedgerScanAdapter(
+            [
+                _raw_scan_line(wrapper_id="w-hollow", pane_id="somnium:N"),
+                _raw_scan_line(
+                    wrapper_id="w-live",
+                    instance_id="i-live",
+                    persona="worker",
+                    pane_id="mechanicus:1",
+                    engine="codex",
+                    working_dir="/tmp/live",
+                ),
+            ]
+        )
+    )
+
+    open_rows = {row.wrapper_id: row for row in ledger.rows(include_closed=False)}
+    assert "w-live" in open_rows
+    assert "w-hollow" not in open_rows
+    assert out["open_rows"] == 1
+
+
+def test_wrapper_ledger_rejects_hollow_active_upsert_and_prunes_on_load(tmp_path) -> None:
+    ledger = WrapperLedger(path=tmp_path / "ledger.json")
+    with pytest.raises(ValueError, match="hollow active"):
+        ledger.upsert(wrapper_id="w-hollow", pane_positional_id="somnium:N", state="OPEN")
+
+    # Existing write-behind files may already contain hollow active rows. Loading
+    # them must not re-index them as occupancy.
+    path = tmp_path / "ledger.json"
+    path.write_text(
+        '{"version":1,"rows":[{"wrapper_id":"w-hollow","instance_id":"",'
+        '"persona":"","pane_positional_id":"somnium:N","engine":"",'
+        '"working_dir":"","born_epoch":1,"state":"OPEN"},'
+        '{"wrapper_id":"w-live","instance_id":"i-live","persona":"",'
+        '"pane_positional_id":"mechanicus:1","engine":"codex",'
+        '"working_dir":"","born_epoch":1,"state":"OPEN"}]}\n',
+        encoding="utf-8",
+    )
+    loaded = WrapperLedger(path=path)
+    loaded.load(force=True)
+
+    assert loaded.resolve(wrapper_id="w-hollow") is None
+    assert loaded.resolve(pane_positional_id="somnium:N") is None
+    assert loaded.resolve(wrapper_id="w-live") is not None
+
+
 def test_reconcile_prunes_prior_open_row_when_pane_is_now_a_dead_husk(tmp_path) -> None:
     # A wrapper that was OPEN and whose pane has since died to a husk must be pruned,
     # not re-opened, on the next reconcile.

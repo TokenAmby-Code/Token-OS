@@ -139,8 +139,15 @@ def _serve(adapter_factory, *, seed_delivery_roles: bool = True):
     # Most daemon send-path tests predate the wrapper-ledger delivery gate and
     # exercise transport/verification behavior rather than blank-pane refusal.
     # Seed the common fake occupied pane roles they use so those sends represent
-    # a managed agent, not a blank pane. Tests that need ledger absence use a
-    # distinct role and assert the new P0/refusal behavior explicitly.
+    # a managed agent, not a blank pane. Seed after server construction because
+    # construction runs startup reconcile against each fake adapter's tmux scan;
+    # tests that need startup reconcile semantics expose wrapper stamps directly.
+    server = daemon.TmuxctldServer(
+        ("127.0.0.1", 0),
+        adapter_factory=adapter_factory,
+        version="9.9.9",
+        sha="deadbee",
+    )
     if seed_delivery_roles:
         for role, instance_id in (("palace:E", "inst-palace-E"), ("ack-pane", "inst-ack")):
             wrapper_ledger.LEDGER.upsert(
@@ -150,12 +157,6 @@ def _serve(adapter_factory, *, seed_delivery_roles: bool = True):
                 engine="codex",
                 state="OPEN",
             )
-    server = daemon.TmuxctldServer(
-        ("127.0.0.1", 0),
-        adapter_factory=adapter_factory,
-        version="9.9.9",
-        sha="deadbee",
-    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     # Gate on the real ready event (set once the accept loop owns the socket) —
@@ -912,6 +913,7 @@ class StampedPaneAdapter:
 
 
 def test_instance_id_for_pane_reads_stamp() -> None:
+    server, _ = _serve(StampedPaneAdapter)
     wrapper_ledger.LEDGER.upsert(
         wrapper_id="wrap-pane",
         instance_id="stamped-uuid",
@@ -919,7 +921,6 @@ def test_instance_id_for_pane_reads_stamp() -> None:
         engine="codex",
         state="OPEN",
     )
-    server, _ = _serve(StampedPaneAdapter)
     try:
         status, payload = _get(server, "/tmux/instance-id-for-pane?pane=current")
         assert status == 200
@@ -1748,14 +1749,13 @@ def test_reconcile_rebuilds_wrapper_ledger_from_tmux_scan(tmp_path, monkeypatch)
     path = tmp_path / "ledger.json"
     monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(path))
     wrapper_ledger.LEDGER.load(force=True)
+    server, _ = _serve(ReconcileLedgerAdapter, seed_delivery_roles=False)
     wrapper_ledger.LEDGER.upsert(
         wrapper_id="stale-open",
         instance_id="stale-inst",
         pane_positional_id="palace:W",
         state="OPEN",
     )
-
-    server, _ = _serve(ReconcileLedgerAdapter, seed_delivery_roles=False)
     try:
         _, payload = _post(server, "/reconcile", {})
         assert payload["ok"] is True

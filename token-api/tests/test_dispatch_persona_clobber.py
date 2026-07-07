@@ -178,7 +178,6 @@ def test_session_start_parent_binding_does_not_clone_custodes_without_explicit_p
         return None
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
-    monkeypatch.setattr(hooks, "_stamp_instance_id", no_stamp)
     monkeypatch.setattr(hooks.shared, "instance_id_for_pane", no_pane_occupant)
 
     async def run():
@@ -248,7 +247,6 @@ def test_custodes_commanded_palace_worker_stop_echoes_without_persona_clone(
         return {"status": "sent", "operation": "fake"}
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
-    monkeypatch.setattr(hooks, "_stamp_instance_id", no_stamp)
     monkeypatch.setattr(hooks.shared, "instance_id_for_pane", no_pane_occupant)
     monkeypatch.setattr(hooks.shared, "resolve_instance_pane", fake_resolve_instance_pane)
     monkeypatch.setattr(hooks, "_direct_pane_write", fake_write)
@@ -329,7 +327,6 @@ def test_session_start_parent_binding_preserves_token_api_persona(app_env, monke
         return None
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
-    monkeypatch.setattr(hooks, "_stamp_instance_id", no_stamp)
     monkeypatch.setattr(hooks.shared, "instance_id_for_pane", no_pane_occupant)
 
     async def run():
@@ -430,8 +427,6 @@ def test_fg_dispatched_worker_identity_fields_do_not_clobber_singleton_row(
         return None
 
     monkeypatch.setattr(hooks, "_tmux_pane_label", no_label)
-    monkeypatch.setattr(hooks, "_stamp_instance_id", no_async_write)
-    monkeypatch.setattr(hooks, "_unstamp_instance_id", no_async_write)
     monkeypatch.setattr(hooks.shared, "instance_id_for_pane", no_pane_occupant)
     monkeypatch.setattr(hooks.shared, "resolve_instance_pane", no_resolve_instance_pane)
     monkeypatch.setattr(hooks.shared, "clear_pane_tint", no_sync_write)
