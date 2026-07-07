@@ -17,6 +17,7 @@ from typing import Any
 SCRIPT = Path(__file__).resolve()
 TOKEN_OS = SCRIPT.parents[2]
 DEFAULT_CANONICAL = TOKEN_OS / "claude-config" / "skills"
+CLAUDE_COMMAND_SKILLS = {"preplan", "postplan"}
 
 
 @dataclass
@@ -241,11 +242,11 @@ def inspect(*, skip_claude: bool = False, skip_commands: bool = False) -> dict[s
                         "preplan must remain model-visible because Shift+Tab inserts literal $preplan text in Codex",
                     )
                 )
-            if not skip_commands:
-                command_path = claude_commands / "preplan.md"
-                _check_link(command_path, md, findings, "claude_preplan_command")
-                canonical_command_path = canonical_commands / "preplan.md"
-                _check_link(canonical_command_path, md, findings, "canonical_preplan_command")
+        if name in CLAUDE_COMMAND_SKILLS and not skip_commands:
+            command_path = claude_commands / f"{name}.md"
+            _check_link(command_path, md, findings, f"claude_{name}_command")
+            canonical_command_path = canonical_commands / f"{name}.md"
+            _check_link(canonical_command_path, md, findings, f"canonical_{name}_command")
         if not skip_claude:
             claude_path = claude_root / skill.name
             _check_link(claude_path, skill, findings, "claude_skill")
@@ -314,6 +315,28 @@ def _safe_link(src: Path, dst: Path, findings: list[Finding]) -> bool:
     return True
 
 
+def _prune_broken_visible_symlinks(root: Path) -> None:
+    """Remove stale direct-child symlinks from managed visible skill roots.
+
+    Canonical skill removals leave dangling symlinks under Codex-visible roots.
+    Launch-time `--install --skip-commands` should repair that state instead of
+    warning forever before every agent launch. Do not descend, do not touch
+    `.system`, and do not remove real files/directories.
+    """
+    try:
+        children = list(root.iterdir())
+    except FileNotFoundError:
+        return
+    for child in children:
+        if child.name == ".system":
+            continue
+        if child.is_symlink() and not child.exists():
+            try:
+                child.unlink()
+            except OSError:
+                pass
+
+
 def install(*, skip_claude: bool = False, skip_commands: bool = False) -> dict[str, Any]:
     home = _home()
     canonical = _canonical()
@@ -331,6 +354,7 @@ def install(*, skip_claude: bool = False, skip_commands: bool = False) -> dict[s
     canonical_commands = _canonical_commands_root(canonical)
     for root in _codex_roots(home):
         root.mkdir(parents=True, exist_ok=True)
+        _prune_broken_visible_symlinks(root)
 
     for skill in _skill_dirs(canonical):
         if skill.is_symlink() and not skill.exists():
@@ -349,9 +373,9 @@ def install(*, skip_claude: bool = False, skip_commands: bool = False) -> dict[s
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", link_name):
             findings.append(Finding("error", "skill_name_invalid", str(skill), f"invalid skill name {link_name!r}"))
             continue
-        if not skip_commands and link_name == "preplan" and md.exists():
-            _safe_link(md, canonical_commands / "preplan.md", findings)
-            _safe_link(md, claude_commands / "preplan.md", findings)
+        if not skip_commands and link_name in CLAUDE_COMMAND_SKILLS and md.exists():
+            _safe_link(md, canonical_commands / f"{link_name}.md", findings)
+            _safe_link(md, claude_commands / f"{link_name}.md", findings)
         for root in _codex_roots(home):
             _safe_link(skill, root / link_name, findings)
 
