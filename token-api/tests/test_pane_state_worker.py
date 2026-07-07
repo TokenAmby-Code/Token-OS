@@ -145,6 +145,31 @@ async def test_pane_label_rename_failure_marks_row_failed(
     assert _queue_count(app_env.db_path) == 0
 
 
+async def test_pane_label_rename_fail_closed_found_false_marks_row_failed(
+    app_env: Any, monkeypatch: Any, _seams: SimpleNamespace
+) -> None:
+    """The daemon fails closed for a vanished pane with ``ok=True`` but
+    ``result.found=False`` — the HTTP call succeeded, yet NO rename happened. The
+    worker must NOT record that as applied (else a dead pane looks renamed); it marks
+    the row failed. The row still drains."""
+    main = app_env.main
+
+    async def _resolve_live(_instance_id):
+        return ("%12", "palace:N")
+
+    async def _rename_fail_closed(*, instance_id=None, pane=None, name):
+        return {"ok": True, "result": {"found": False, "target": pane, "name": name}}
+
+    monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve_live)
+    monkeypatch.setattr(main.shared, "tmuxctld_rename_pane", _rename_fail_closed)
+
+    _enqueue_pane_state(app_env.db_path, "inst-named", "@PANE_LABEL", "auth-refactor")
+    results = await main.process_pane_state_queue_once()
+
+    assert results[0]["status"] == "failed", "ok=True but found=False must not be 'applied'"
+    assert _queue_count(app_env.db_path) == 0
+
+
 # ---- @CC_STATE / @PLANNING_STATE keep the generic set-option path -----------
 
 
