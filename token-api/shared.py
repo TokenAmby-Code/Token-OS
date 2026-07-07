@@ -993,6 +993,30 @@ async def instance_id_for_pane(pane: str | None) -> str | None:
     return None
 
 
+async def tmuxctld_rename_pane(
+    *, instance_id: str | None = None, pane: str | None = None, name: str
+) -> dict | None:
+    """Semantic rename of a pane's identity via tmuxctld ``POST /instance/rename``.
+
+    tmuxctld is the sole writer of pane identity: it owns BOTH the ``@PANE_LABEL``
+    border nametag and the native pane title. token-api no longer authors a raw
+    ``set-option @PANE_LABEL`` through ``/tmux/run``. Pass either an already
+    live-resolved ``pane`` or an ``instance_id`` for the daemon to resolve; the
+    daemon fails closed (``result.found = False``) on an unresolved target.
+
+    Returns the full daemon envelope (``{ok, result}``), or None for a transport
+    error / absent daemon config.
+    """
+    body: dict[str, str] = {"name": name}
+    if pane:
+        body["pane"] = pane
+    if instance_id:
+        body["instance_id"] = instance_id
+    return await asyncio.to_thread(
+        _tmuxctld_post_json, "/instance/rename", body, default_loopback=True
+    )
+
+
 # Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
 PHONE_TTS_CONFIG = {
     "host": "100.102.92.24",
