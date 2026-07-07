@@ -798,6 +798,84 @@ def test_submit_transaction_override_cannot_pierce_human_lock(
     assert result["ignored_override"] == "tmuxctl-submit-transaction"
 
 
+@pytest.mark.parametrize("guard_kind", ["human", "pending"])
+def test_send_gate_policy_rejects_submit_override_for_human_lock(guard_kind: str) -> None:
+    """Policy-level invariant: no submit override pierces HUMAN/PENDING.
+
+    D5 regression: the trailing Enter used ``tmuxctl-submit-transaction`` and
+    policy collapsed any override to ``pierce``.  Even if a caller forgets to
+    scrub the override before asking for policy, a human/pending lock must win.
+    """
+
+    assert (
+        send_gate.send_gate_policy(
+            override="tmuxctl-submit-transaction",
+            reason="typing_guard",
+            guard_kind=guard_kind,
+        )
+        == "delay"
+    )
+
+
+def test_submit_override_cannot_pierce_human_lock_when_quiet_hours_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quiet-hours precedence must not hide a simultaneous human lock."""
+
+    _force_quiet(monkeypatch, True)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(
+        send_gate,
+        "_pane_guard_status",
+        lambda target: {
+            "kind": "human",
+            "until": 1300,
+            "owner": None,
+            "active": True,
+            "marker": "",
+        },
+    )
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: target == "%44")
+
+    with send_gate.thread_local_override("tmuxctl-submit-transaction", owner="req-1"):
+        result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "delay"
+    assert result["suppressed"] is True
+    assert result["override"] is None
+    assert result["ignored_override"] == "tmuxctl-submit-transaction"
+
+
+def test_explicit_pierce_cannot_pierce_human_lock_when_quiet_hours_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_quiet(monkeypatch, True)
+    monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
+    monkeypatch.setattr(
+        send_gate,
+        "_pane_guard_status",
+        lambda target: {
+            "kind": "pending",
+            "until": 1300,
+            "owner": None,
+            "active": True,
+            "marker": "",
+        },
+    )
+    monkeypatch.setattr(send_gate, "_pane_human_locked", lambda target: target == "%44")
+    monkeypatch.setenv("TMUX_SEND_GATE_POLICY", "pierce")
+
+    result = send_gate.evaluate(("send-keys", "-t", "%44", "C-m"))
+
+    assert result is not None
+    assert result["reason"] == "typing_guard"
+    assert result["policy"] == "delay"
+    assert result["suppressed"] is True
+    assert result["override"] is None
+
+
 def test_tmuxctld_holder_override_can_pierce_agent_only_hold(monkeypatch) -> None:
     _force_quiet(monkeypatch, False)
     monkeypatch.setattr(send_gate, "typing_guard_active", lambda *, target=None: True)
