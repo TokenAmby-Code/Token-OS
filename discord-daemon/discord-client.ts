@@ -321,6 +321,21 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
       );
     },
 
+    async editMessage(channelId, messageId, content) {
+      if (typeof content === 'string' && content.length > DISCORD_MESSAGE_CONTENT_LIMIT) {
+        throw new Error(`Refusing Discord edit over ${DISCORD_MESSAGE_CONTENT_LIMIT} characters`);
+      }
+      const channel = await client.channels.fetch(channelId);
+      if (!channel) throw new Error(`Channel ${channelId} not found`);
+      const message = await channel.messages.fetch(messageId);
+      const edited = await message.edit({ content });
+      return {
+        message_id: edited.id,
+        channel_id: edited.channelId,
+        timestamp: (edited.editedAt || edited.createdAt).toISOString(),
+      };
+    },
+
     async readMessages(channelId, limit = 25, before = null) {
       const channel = await client.channels.fetch(channelId);
       if (!channel) throw new Error(`Channel ${channelId} not found`);
