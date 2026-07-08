@@ -16,6 +16,7 @@ Does NOT own:
 import asyncio
 import functools
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -87,6 +88,35 @@ async def _sanitize_public_text_async(value: str | None) -> str:
     if not value:
         return ""
     return await sanitize_human_render_text(str(value)) or ""
+
+
+def _require_privileged_tts_probe_request(request: Request | None) -> None:
+    """Allow the phone TTS probe only from local/operator-controlled callers.
+
+    Unit tests call the route function directly with ``request=None``. Live use is
+    via localhost after deploy; an optional bearer token can authorize non-local
+    operator tooling without making the debug playback endpoint public.
+    """
+    if request is None:
+        return
+    host = request.client.host if request.client else ""
+    if host in {"127.0.0.1", "::1", "localhost"}:
+        return
+    configured = os.environ.get("TOKEN_API_PRIVILEGED_ROUTE_TOKEN", "").strip()
+    auth = request.headers.get("Authorization", "")
+    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if configured and presented and hmac.compare_digest(presented, configured):
+        return
+    raise HTTPException(status_code=403, detail="privileged route required")
+
+
+def _phone_test_probe_conflicts_with_active_tts(state: dict) -> bool:
+    control = dict(state.get("control") or {})
+    if control.get("state") != "playing":
+        return False
+    if control.get("source") == "phone_test":
+        return False
+    return bool(state.get("current") or state.get("playback_id"))
 
 
 router = APIRouter()
@@ -227,6 +257,18 @@ class TTSChunkNextRequest(BaseModel):
     backend: str = "phone"
     last_consumed_index: int
     detail: dict | None = None
+
+
+class TTSPhoneTestRequest(BaseModel):
+    """Explicit phone-stream test request.
+
+    This bypasses normal router device selection so WSL availability does not
+    affect phone MacroDroid validation.
+    """
+
+    message: str
+    rate: int = 0
+    max_chars: int | None = None
 
 
 # ============ TTS/Notification System ============
@@ -3139,6 +3181,93 @@ async def api_tts_chunk_event(request: TTSChunkEventRequest) -> dict:
         "matched_playback": matched_playback,
         "state": get_tts_authoritative_state(),
     }
+
+
+async def api_tts_phone_test(
+    request: TTSPhoneTestRequest, http_request: Request | None = None
+) -> dict:
+    """Run a real phone-only streaming TTS probe.
+
+    This endpoint is intentionally not part of the normal notification router:
+    it exists to validate the phone MacroDroid chunk player while WSL remains
+    healthy and independently available.
+    """
+    _require_privileged_tts_probe_request(http_request)
+    state = get_tts_authoritative_state()
+    if _phone_test_probe_conflicts_with_active_tts(state):
+        raise HTTPException(status_code=409, detail="active TTS playback in progress")
+
+    message = sanitize_tts_for_speech(
+        _sanitize_public_text(clean_markdown_for_tts(request.message))
+    )
+    if not message.strip():
+        raise HTTPException(status_code=400, detail="message required")
+
+    session_id = f"phone-test-{uuid.uuid4().hex}"
+    _update_tts_authoritative_state(
+        session_id=session_id,
+        control={
+            "state": "playing",
+            "last_action": None,
+            "speed": 1.0,
+            "source": "phone_test",
+            "updated_at": _now_iso(),
+        },
+    )
+    chunks = build_tts_chunk_handoff(message, max_chars=request.max_chars)
+    result: dict = {}
+    try:
+        result = await asyncio.to_thread(
+            dispatch_tts_chunks_to_backend,
+            "phone",
+            chunks,
+            rate=request.rate,
+        )
+        result = dict(result or {})
+    except Exception:
+        _update_tts_authoritative_state(
+            control={
+                "state": "error",
+                "last_action": "phone_test",
+                "speed": 1.0,
+                "source": "phone_test",
+                "updated_at": _now_iso(),
+            }
+        )
+        raise
+    terminal_state = "idle" if result.get("success") else "error"
+    _update_tts_authoritative_state(
+        control={
+            "state": terminal_state,
+            "last_action": "phone_test",
+            "speed": 1.0,
+            "source": "phone_test",
+            "updated_at": _now_iso(),
+        }
+    )
+    result["session_id"] = session_id
+    result["requested_backend"] = "phone"
+    result["router_bypassed"] = True
+    result["input_chunks"] = len(chunks)
+    await log_event(
+        "tts_phone_test",
+        device_id="phone",
+        details={
+            "success": bool(result.get("success")),
+            "playback_id": result.get("playback_id"),
+            "chunks": result.get("chunks"),
+            "input_chunks": len(chunks),
+            "playback_confirmed": result.get("playback_confirmed"),
+            "error": result.get("error"),
+            "reason": result.get("reason"),
+        },
+    )
+    return result
+
+
+@router.post("/api/tts/phone-test")
+async def api_tts_phone_test_route(request: TTSPhoneTestRequest, http_request: Request) -> dict:
+    return await api_tts_phone_test(request, http_request)
 
 
 @router.post("/api/tts/backend-error")

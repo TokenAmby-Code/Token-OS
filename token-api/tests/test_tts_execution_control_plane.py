@@ -113,6 +113,9 @@ def test_chunk_dispatch_payload_has_current_next_handoff_and_ack_error_reports(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tts = _load_tts()
+    tts.TTS_AUTHORITATIVE_STATE["control"] = {"state": "idle", "source": None, "updated_at": None}
+    tts.TTS_AUTHORITATIVE_STATE["current"] = None
+    tts.TTS_AUTHORITATIVE_STATE["playback_id"] = None
     sent = []
 
     def fake_send(endpoint, params):
@@ -343,6 +346,77 @@ def test_phone_streaming_backfill_returns_n_plus_two_and_done() -> None:
         assert done["next_chunk"] == ""
     finally:
         tts.TTS_PHONE_STREAMS.pop((session_id, playback_id), None)
+
+
+def test_phone_test_endpoint_bypasses_router_and_registers_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tts = _load_tts()
+    tts.TTS_AUTHORITATIVE_STATE["control"] = {"state": "idle", "source": None, "updated_at": None}
+    tts.TTS_AUTHORITATIVE_STATE["current"] = None
+    tts.TTS_AUTHORITATIVE_STATE["playback_id"] = None
+    sent = []
+
+    async def noop_log(*_args, **_kwargs):
+        return None
+
+    def fail_router(**_kwargs):
+        raise AssertionError("phone-test must bypass normal WSL/phone router")
+
+    def fake_send(endpoint, params):
+        sent.append((endpoint, dict(params)))
+        waiter = tts.pending_phone_playbacks.get(str(params["playback_id"]))
+        assert waiter is not None
+        waiter.set()
+        return {"success": True, "method": "phone"}
+
+    monkeypatch.setattr(tts, "log_event", noop_log)
+    monkeypatch.setattr(tts, "resolve_tts_device", fail_router)
+    monkeypatch.setattr(tts, "_send_to_phone", fake_send)
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.01)
+
+    result = asyncio.run(
+        tts.api_tts_phone_test(tts.TTSPhoneTestRequest(message="one. two. three.", max_chars=10))
+    )
+
+    assert result["success"] is True
+    assert result["requested_backend"] == "phone"
+    assert result["router_bypassed"] is True
+    assert result["playback_confirmed"] is True
+    assert result["input_chunks"] == 3
+    assert result["chunks"] == 3
+    assert len(sent) == 1
+    endpoint, payload = sent[0]
+    assert endpoint == "/tts-chunk"
+    assert payload["session_id"] == result["session_id"]
+    assert payload["current_chunk"] == "one."
+    assert payload["next_chunk"] == "two."
+    assert payload["current_index"] == 0
+    assert payload["next_index"] == 1
+
+
+def test_phone_test_endpoint_refuses_to_clobber_active_playback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tts = _load_tts()
+    tts.TTS_AUTHORITATIVE_STATE["control"] = {
+        "state": "playing",
+        "source": "queue",
+        "updated_at": "2026-07-08T00:00:00",
+    }
+    tts.TTS_AUTHORITATIVE_STATE["current"] = {"text": "operator speech"}
+    tts.TTS_AUTHORITATIVE_STATE["playback_id"] = "active-playback"
+
+    def fail_dispatch(*_args, **_kwargs):
+        raise AssertionError("phone-test must not dispatch over active TTS")
+
+    monkeypatch.setattr(tts, "dispatch_tts_chunks_to_backend", fail_dispatch)
+
+    with pytest.raises(tts.HTTPException) as exc:
+        asyncio.run(tts.api_tts_phone_test(tts.TTSPhoneTestRequest(message="probe", max_chars=10)))
+
+    assert exc.value.status_code == 409
+    assert tts.TTS_AUTHORITATIVE_STATE["control"]["source"] == "queue"
 
 
 def test_phone_backfill_obeys_pause_resume_skip_state() -> None:
