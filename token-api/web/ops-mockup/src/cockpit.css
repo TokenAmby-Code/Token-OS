@@ -410,6 +410,14 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   to { transform: translateY(0) scale(0); opacity: 0; }
 }
 
+/* ARRIVING — a worker-born dial inserted at the deepest slot but INVISIBLE until its
+   flight lands (rendered so the orchestrator can measure its rect, then revealed by
+   dropping it from pendingIds). 0,3,0 to beat the base `.tts-stack .ring` z:2. */
+.tts-stack .ring.tts-dial--arriving {
+  opacity: 0;
+  pointer-events: none;
+}
+
 /* one dial ring — a compact, ICON-ONLY circular gauge floated onto an arc by
    inline right/top. Just the glyph; the value + subtitle live in the hover
    tooltip and the drawer. EVERY ring is interactive: pointer-events restored
@@ -871,6 +879,11 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   from { transform: scale(0); opacity: 0; }
   to { transform: scale(1); opacity: 1; }
 }
+/* ARRIVING — an idle-bound chip inserted at the deepest slot but INVISIBLE until its
+   flight lands (rendered so the orchestrator can measure its flip-correct rect, then
+   revealed → 'entering' → 'idle'). The flip-context rotate on .worker-chip__disc is
+   preserved (this only zeroes opacity). */
+.worker-chip__disc--arriving { opacity: 0; }
 /* gold tip caps — a gold rim glow that hugs the tapered end and fades toward a dark
    centre. A blurred stroke (width set inline) clipped to the cap region, so only the
    inner half survives → an interior rim glow, no solid fill. */
@@ -952,6 +965,36 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   color: var(--instrument);
   opacity: 0.85;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FLIGHT OVERLAY — carries an agent between queues (worker → TTS → idle). Fixed
+   inset:0 so its frame is viewport px (the SVG `d` needs no offset math). Above
+   idle (62) / place (65), below the demobar (70). */
+.flight-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 66;
+  overflow: visible;
+}
+/* one in-flight chip — reuses the .worker-chip__disc chrome so it reads identically
+   to a chip at any size. offset-path (set inline) rides the chip's centre along the
+   arm polyline / straight pop; offset-rotate:0 keeps it upright. The Web Animations
+   API (see FlightChip) drives offset-distance 0%→100% + the size shrink/grow in
+   lockstep — a CSS transition on offset-distance/path() proved unreliable. */
+.flight-chip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  place-items: center;
+  offset-rotate: 0deg;
+  will-change: offset-distance, width, height;
+}
+.flight-chip .worker-chip__disc { width: 100%; height: 100%; }
+/* Icon scales with the chip (53% ≈ 48/90 worker ≈ 20/36 TTS) so it stays proportional
+   across the whole shrink/grow, rather than the fixed worker-disc 48px. */
+.flight-chip .persona-icon { width: 53%; height: 53%; }
 
 /* placement readout + controls inside the demobar */
 .demobar__check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
