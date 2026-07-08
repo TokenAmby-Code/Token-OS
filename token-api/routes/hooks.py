@@ -724,6 +724,42 @@ async def _apply_persona_seat_name(
     return display_name
 
 
+async def _bind_instance_stamp(
+    *,
+    tmux_pane: str | None,
+    session_id: str | None,
+    wrapper_launch_id: str | None = None,
+    engine: str | None = None,
+    working_dir: str | None = None,
+    persona: str | None = None,
+    vacate_pane: str | None = None,
+) -> None:
+    """Hand the canonical instance id to tmuxctld to stamp on the pane (single-writer).
+
+    tmuxctld owns the durable ``@INSTANCE_ID`` write; SessionStart is the only place
+    the canonical ``instances`` row id is known, so token-api resolves it and delegates
+    the write through :func:`shared.tmuxctld_stamp_instance`. token-api NEVER authors a
+    raw ``set-option @INSTANCE_ID``. Best-effort: a down daemon must not fail
+    registration — wrapperstart/reconcile rebuild the ledger and the stamp lands on the
+    next fire. ``session_id`` is already the canonical row id at every SessionStart site
+    (fresh INSERT mints it; re-register/transplant reuse it; supplant re-keys onto it).
+    """
+    if not tmux_pane or not (session_id or "").strip():
+        return
+    try:
+        await shared.tmuxctld_stamp_instance(
+            instance_id=session_id,
+            pane=tmux_pane,
+            wrapper_id=wrapper_launch_id or None,
+            engine=engine or None,
+            working_dir=working_dir or None,
+            persona=persona or None,
+            vacate_pane=vacate_pane or None,
+        )
+    except Exception as exc:  # pragma: no cover - never fail registration on the stamp
+        logger.debug("Hook: @INSTANCE_ID stamp delegation failed for %s: %s", tmux_pane, exc)
+
+
 async def _session_start_effective_pane(
     tmux_pane: str | None,
     pane_label: str | None,
@@ -3105,6 +3141,18 @@ async def handle_session_start(payload: dict) -> dict:
                 await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
                 )
+                # Single-writer identity stamp: hand the canonical row id to tmuxctld
+                # to stamp @INSTANCE_ID on the effective pane (guarded vacate of the
+                # old pane on a genuine move). token-api never writes the stamp itself.
+                await _bind_instance_stamp(
+                    tmux_pane=target_pane,
+                    session_id=session_id,
+                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                    engine=engine or existing_row["engine"],
+                    working_dir=working_dir,
+                    persona=primarch_name or dispatch_legion,
+                    vacate_pane=old_tmux_pane,
+                )
                 await _apply_instance_workflow_state(
                     db,
                     instance_id=session_id,
@@ -3258,6 +3306,17 @@ async def handle_session_start(payload: dict) -> dict:
                 )
                 await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
+                )
+                # Single-writer identity stamp (re-register / Codex resume): tmuxctld
+                # stamps @INSTANCE_ID on the effective pane, guarded-vacates the prior.
+                await _bind_instance_stamp(
+                    tmux_pane=tmux_pane or prior_pane,
+                    session_id=session_id,
+                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
+                    engine=engine or existing_row["engine"],
+                    working_dir=working_dir,
+                    persona=primarch_name or dispatch_legion,
+                    vacate_pane=prior_pane,
                 )
                 await db.commit()
                 auto_subscription = await _auto_subscribe_parent_on_start(
@@ -3445,6 +3504,18 @@ async def handle_session_start(payload: dict) -> dict:
                 )
                 await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
+                )
+                # Single-writer identity stamp (supplant): the new session_id is
+                # stamped on the supplanted pane; the old id is guarded-vacated so the
+                # oracle never reports the defunct id on a moved-off pane.
+                await _bind_instance_stamp(
+                    tmux_pane=target_tmux_pane,
+                    session_id=session_id,
+                    wrapper_launch_id=wrapper_launch_id or old_inst["wrapper_launch_id"],
+                    engine=engine or old_inst["engine"],
+                    working_dir=working_dir,
+                    persona=primarch_name or dispatch_legion,
+                    vacate_pane=old_tmux_pane,
                 )
 
                 await _apply_commander_binding(
@@ -3758,6 +3829,16 @@ async def handle_session_start(payload: dict) -> dict:
         )
         await _apply_persona_seat_name(
             db, instance_id=session_id, persona_identity=persona_identity
+        )
+        # Single-writer identity stamp (fresh register): tmuxctld stamps @INSTANCE_ID
+        # on the freshly-minted row's pane. No prior pane to vacate.
+        await _bind_instance_stamp(
+            tmux_pane=tmux_pane,
+            session_id=session_id,
+            wrapper_launch_id=wrapper_launch_id,
+            engine=engine,
+            working_dir=working_dir,
+            persona=primarch_name or dispatch_legion,
         )
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(

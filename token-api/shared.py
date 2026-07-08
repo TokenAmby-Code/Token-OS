@@ -1017,6 +1017,52 @@ async def tmuxctld_rename_pane(
     )
 
 
+async def tmuxctld_stamp_instance(
+    *,
+    instance_id: str,
+    pane: str | None = None,
+    wrapper_id: str | None = None,
+    persona: str | None = None,
+    engine: str | None = None,
+    working_dir: str | None = None,
+    vacate_pane: str | None = None,
+) -> dict | None:
+    """Bind the canonical instance id to a pane via tmuxctld ``POST /instance/stamp``.
+
+    tmuxctld is the SOLE writer of the durable ``@INSTANCE_ID`` pane stamp — the
+    single-writer counterpart of :func:`tmuxctld_rename_pane` for ``@PANE_LABEL``.
+    token-api resolves the canonical ``instances`` row id at SessionStart and hands
+    it here; it NEVER authors a raw ``set-option @INSTANCE_ID`` (through ``/tmux/run``
+    or otherwise). ``@INSTANCE_ID`` is the bootstrap identity pane resolution depends
+    on, so it is stamped onto an EXPLICIT ``pane`` (the SessionStart-resolved live
+    pane); ``wrapper_id`` is a ledger-resolved fallback. The daemon fails closed
+    (``stamped = False``) on an unresolved target — never a stamp against a wrong or
+    dead pane. ``vacate_pane`` guarded-clears a prior pane on a genuine pane move.
+
+    Returns the daemon envelope (``{ok, result}``), or None for a transport error /
+    absent daemon config. Best-effort: registration must not depend on tmuxctld being
+    up (wrapperstart/reconcile rebuild the ledger; the stamp lands on the next fire).
+    """
+    if not (instance_id or "").strip():
+        return None
+    body: dict[str, str] = {"instance_id": instance_id}
+    if pane:
+        body["pane"] = pane
+    if wrapper_id:
+        body["wrapper_id"] = wrapper_id
+    if persona:
+        body["persona"] = persona
+    if engine:
+        body["engine"] = engine
+    if working_dir:
+        body["working_dir"] = working_dir
+    if vacate_pane:
+        body["vacate_pane"] = vacate_pane
+    return await asyncio.to_thread(
+        _tmuxctld_post_json, "/instance/stamp", body, default_loopback=True
+    )
+
+
 # Phone TTS routing config (MacroDroid HTTP server on phone via Tailscale)
 PHONE_TTS_CONFIG = {
     "host": "100.102.92.24",
