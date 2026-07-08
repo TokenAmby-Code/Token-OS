@@ -113,6 +113,9 @@ def test_chunk_dispatch_payload_has_current_next_handoff_and_ack_error_reports(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tts = _load_tts()
+    tts.TTS_AUTHORITATIVE_STATE["control"] = {"state": "idle", "source": None, "updated_at": None}
+    tts.TTS_AUTHORITATIVE_STATE["current"] = None
+    tts.TTS_AUTHORITATIVE_STATE["playback_id"] = None
     sent = []
 
     def fake_send(endpoint, params):
@@ -349,6 +352,9 @@ def test_phone_test_endpoint_bypasses_router_and_registers_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tts = _load_tts()
+    tts.TTS_AUTHORITATIVE_STATE["control"] = {"state": "idle", "source": None, "updated_at": None}
+    tts.TTS_AUTHORITATIVE_STATE["current"] = None
+    tts.TTS_AUTHORITATIVE_STATE["playback_id"] = None
     sent = []
 
     async def noop_log(*_args, **_kwargs):
@@ -387,6 +393,30 @@ def test_phone_test_endpoint_bypasses_router_and_registers_stream(
     assert payload["next_chunk"] == "two."
     assert payload["current_index"] == 0
     assert payload["next_index"] == 1
+
+
+def test_phone_test_endpoint_refuses_to_clobber_active_playback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tts = _load_tts()
+    tts.TTS_AUTHORITATIVE_STATE["control"] = {
+        "state": "playing",
+        "source": "queue",
+        "updated_at": "2026-07-08T00:00:00",
+    }
+    tts.TTS_AUTHORITATIVE_STATE["current"] = {"text": "operator speech"}
+    tts.TTS_AUTHORITATIVE_STATE["playback_id"] = "active-playback"
+
+    def fail_dispatch(*_args, **_kwargs):
+        raise AssertionError("phone-test must not dispatch over active TTS")
+
+    monkeypatch.setattr(tts, "dispatch_tts_chunks_to_backend", fail_dispatch)
+
+    with pytest.raises(tts.HTTPException) as exc:
+        asyncio.run(tts.api_tts_phone_test(tts.TTSPhoneTestRequest(message="probe", max_chars=10)))
+
+    assert exc.value.status_code == 409
+    assert tts.TTS_AUTHORITATIVE_STATE["control"]["source"] == "queue"
 
 
 def test_phone_backfill_obeys_pause_resume_skip_state() -> None:
