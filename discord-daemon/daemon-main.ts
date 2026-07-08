@@ -15,6 +15,7 @@ import { createVoiceTranscriptRouter } from './voice-transcript-router.ts';
 import { routeVoiceTranscriptWithRetry } from './voice-route-retry.ts';
 import { tmuxctldClient } from './tmuxctld-client.ts';
 import { splitDiscordMessageContent } from './outbound-message.ts';
+import { createFleetStatusPublisher } from './fleet-status-publisher.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -449,12 +450,23 @@ async function main() {
   // Start HTTP server
   await httpServer.start();
 
+  // #fleet-status read-model surface (feature-flagged, default off)
+  const fleetStatusPublisher = createFleetStatusPublisher({
+    client: discordClient,
+    config,
+    logger,
+  });
+  if (fleetStatusPublisher.start()) {
+    logger.info('fleet-status publisher started');
+  }
+
   logger.info('Daemon ready.');
 
   // --- Graceful shutdown ---
   async function shutdown(signal) {
     logger.info(`Received ${signal}, shutting down...`);
     try {
+      fleetStatusPublisher.stop();
       await httpServer.stop();
       for (const client of Object.values(botClients)) {
         await client.stop();

@@ -196,6 +196,23 @@ export function createHttpServer(
         return json(res, result);
       }
 
+      // POST /notify — notification fabric leg: token-api's dispatch_notify
+      // POSTs {message, level}; the daemon routes it to the notifications
+      // channel. Level maps to a visual prefix only — routing policy (quiet
+      // hours etc.) is token-api's job and never re-decided here.
+      if (method === 'POST' && path === '/notify') {
+        const body = await parseBody(req);
+        if (!body.message) return json(res, { error: 'message required' }, 400);
+        const channelId = resolveChannel('notifications');
+        if (!channelId) return json(res, { error: 'notifications channel not configured' }, 500);
+        const level = typeof body.level === 'string' ? body.level : 'info';
+        const prefix = { info: 'ℹ️', warn: '⚠️', error: '🔴' }[level] || 'ℹ️';
+        const content = `${prefix} ${body.message}`;
+        const result = await sendViaClient(resolveClient(body.bot), channelId, content, {});
+        logOutboundResult('notify', channelName(channelId), result, content);
+        return json(res, { ...result, level });
+      }
+
       // GET /read — Read recent messages
       if (method === 'GET' && path === '/read') {
         const query = parseQuery(req.url);

@@ -839,6 +839,22 @@ def speak_tts(
     return _finish(_no_playback_backend("unknown_playback_backend"))
 
 
+def send_discord_notification(message: str, level: str = "info") -> dict:
+    """The one daemon HTTP hop for the Discord notification leg.
+
+    POSTs to the daemon's /notify endpoint, which routes to the notifications
+    channel. Callers never talk to the daemon directly — the router owns the
+    transport (same contract as _send_to_phone for the tactile leg).
+    """
+    resp = requests.post(
+        f"{DISCORD_DAEMON_URL}/notify",
+        json={"message": message, "level": level},
+        timeout=5,
+    )
+    resp.raise_for_status()
+    return {"success": True, **resp.json()}
+
+
 async def dispatch_notify(
     message: str,
     *,
@@ -849,6 +865,7 @@ async def dispatch_notify(
     voice: str | None = None,
     instance_id: str | None = None,
     context: dict | None = None,
+    discord: bool = False,
 ) -> dict:
     """Authoritative comms entry — the single front door to the router.
 
@@ -954,6 +971,20 @@ async def dispatch_notify(
             functools.partial(_send_to_phone, "/notify", phone_params),
         )
 
+    # Discord leg: device-agnostic notification channel via the daemon. Sits
+    # AFTER the quiet-hours early-return (suppressed notifies never reach the
+    # daemon) and is try/except-isolated so a dead daemon can never mask the
+    # TTS/tactile legs.
+    discord_result = None
+    if discord and message:
+        try:
+            discord_result = await loop.run_in_executor(
+                None, functools.partial(send_discord_notification, message)
+            )
+        except Exception as e:
+            logger.warning(f"notify: discord leg failed (isolated): {e}")
+            discord_result = {"success": False, "error": str(e)}
+
     tactile_delivered = bool(
         tactile_result and (tactile_result.get("success") or tactile_result.get("overall_success"))
     )
@@ -968,6 +999,7 @@ async def dispatch_notify(
         "route": route,
         "tts": tts_result,
         "tactile": tactile_result,
+        "discord": discord_result,
     }
     await log_event(
         "notify",
@@ -982,6 +1014,7 @@ async def dispatch_notify(
             "delivered": delivered,
             "audio_delivered": audio_delivered,
             "tactile_delivered": tactile_delivered,
+            "discord_delivered": bool(discord_result and discord_result.get("success")),
             "context": context,
         },
     )
