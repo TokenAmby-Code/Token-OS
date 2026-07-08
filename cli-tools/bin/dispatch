@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
 CALLER_IMPERIUM="${IMPERIUM:-}"
 source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
+source "${LIB_DIR}/tmuxctld-timeouts.sh" 2>/dev/null || true
 source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
 source "${LIB_DIR}/agent-wrapper-common.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
@@ -1591,6 +1592,7 @@ tmuxctld_result_max_time() {
   # routes keep the legacy 60s transport budget unless explicitly overridden.
   case "${1:-} ${2:-}" in
     "POST /stack/dispatch") printf '%s' "${TMUXCTLD_STACK_DISPATCH_MAX_TIME:-0}" ;;
+    "POST /send-text"|"POST /reconcile"|"POST /close-pane") printf '%s' "${TMUXCTLD_MAX_TIME:-$(tmuxctld_lifecycle_client_timeout)}" ;;
     *) printf '%s' "${TMUXCTLD_MAX_TIME:-60}" ;;
   esac
 }

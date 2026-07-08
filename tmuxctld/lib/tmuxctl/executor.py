@@ -7,6 +7,10 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+
+_LIFECYCLE_HOLD_CEILING_SECONDS = 60.0
+_CLIENT_TIMEOUT_MARGIN_SECONDS = 15.0
+_LIFECYCLE_CLIENT_TIMEOUT_SECONDS = _LIFECYCLE_HOLD_CEILING_SECONDS + _CLIENT_TIMEOUT_MARGIN_SECONDS
 from dataclasses import replace
 
 from .builder import build_workspace
@@ -445,8 +449,8 @@ done
         seat against the rebuilt session (the same per-seat ``assert_instance``
         sweep the retired in-process loop ran, but executed *inside* the daemon
         so the daemon owns every persona respawn). Uses stdlib ``urllib`` (same
-        idiom as ``api.py``/``close.py``); ``timeout=20`` because respawns return
-        fast while agent boot is async. Raises on transport failure or an
+        idiom as ``api.py``/``close.py``); transport timeout is ceiling+margin because /reconcile can legitimately
+        hold while tmuxctld seats personas; the client must outwait the daemon ceiling. Raises on transport failure or an
         ``ok=false`` envelope so the caller can fail loudly — if the daemon is
         down, restart seating MUST NOT silently succeed.
         """
@@ -460,7 +464,7 @@ done
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=_LIFECYCLE_CLIENT_TIMEOUT_SECONDS) as resp:
                 text = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")

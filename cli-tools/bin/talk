@@ -32,6 +32,11 @@ import urllib.error
 import urllib.request
 import urllib.parse
 
+_LIB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "lib"))
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+from tmuxctld_timeouts import SEND_CLIENT_TIMEOUT_SECONDS, SEND_HOLD_CEILING_SECONDS
+
 DEFAULT_TIMEOUT_TOTAL = 600.0
 DEFAULT_SERVER_POLL = 30.0
 
@@ -43,7 +48,7 @@ def _err(msg: str) -> None:
     print(f"talk: {msg}", file=sys.stderr)
 
 
-def _post(path: str, body: dict, timeout: float = 60.0) -> dict:
+def _post(path: str, body: dict, timeout: float = SEND_CLIENT_TIMEOUT_SECONDS) -> dict:
     url = f"{TOKEN_API_URL}{path}"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -63,7 +68,7 @@ def _ledger_get(path: str, timeout: float = 2.0) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _get(path: str, timeout: float = 60.0) -> dict:
+def _get(path: str, timeout: float = SEND_CLIENT_TIMEOUT_SECONDS) -> dict:
     url = f"{TOKEN_API_URL}{path}"
     req = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -162,7 +167,7 @@ def main(argv: list[str]) -> int:
         "payload": args.prompt,
     }
     try:
-        send = _post("/api/talk/send", body, timeout=60.0)
+        send = _post("/api/talk/send", body, timeout=SEND_CLIENT_TIMEOUT_SECONDS)
     except urllib.error.HTTPError as exc:
         try:
             detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))

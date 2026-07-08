@@ -38,6 +38,8 @@ esac
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${_SCRIPT_DIR}/../lib/nas-path.sh" >/dev/null 2>&1 || true
+# shellcheck source=/dev/null
+source "${_SCRIPT_DIR}/../lib/tmuxctld-timeouts.sh" >/dev/null 2>&1 || true
 
 DAEMON_URL="${TMUXCTLD_URL:-}"
 if [[ -z "$DAEMON_URL" ]] && type imperium_cfg >/dev/null 2>&1; then
@@ -86,7 +88,14 @@ PY
     URL="${URL}?${QUERY}"
 fi
 
-MAX_TIME="${TMUXCTLD_MAX_TIME:-3}"
+case "${METHOD} ${PATH_PART}" in
+    "POST /send-text"|"POST /reconcile"|"POST /close-pane")
+        MAX_TIME="${TMUXCTLD_MAX_TIME:-$(tmuxctld_lifecycle_client_timeout)}"
+        ;;
+    *)
+        MAX_TIME="${TMUXCTLD_MAX_TIME:-3}"
+        ;;
+esac
 if [[ "$METHOD" == "POST" && "$PATH_PART" == "/typing-guard-state" ]]; then
     for item in "$@"; do
         if [[ "$item" == "cmd=arm" || "$item" == "action=arm" ]]; then

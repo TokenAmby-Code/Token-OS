@@ -21,15 +21,21 @@ import re
 import shlex
 import signal
 import sqlite3
+import sys
 import time
 import uuid
+from pathlib import Path
+
+_CLI_LIB = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
+if str(_CLI_LIB) not in sys.path:
+    sys.path.insert(0, str(_CLI_LIB))
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+from tmuxctld_timeouts import SEND_CLIENT_TIMEOUT_SECONDS
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -590,7 +596,7 @@ async def send_prompt_to_pane(
         # recovery/ack handshake.  Do not time out early and fall back to a
         # second send path; that creates the exact "bytes landed, receipt says
         # failed" behavior brief is meant to eliminate.
-        timeout=45,
+        timeout=SEND_CLIENT_TIMEOUT_SECONDS,
         default_loopback=_tmuxctld_default_loopback(),
     )
     if daemon_payload is None:

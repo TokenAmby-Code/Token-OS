@@ -4,7 +4,10 @@
 // mutation, submit/scratch/clear, and target resolution are tmuxctld-owned.
 
 const DEFAULT_TMUXCTLD_URL = 'http://127.0.0.1:7778';
-const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+export const SERVER_HOLD_CEILING_MS = 60_000;
+export const CLIENT_TIMEOUT_MARGIN_MS = 15_000;
+export const LONG_HOLD_TIMEOUT_MS = SERVER_HOLD_CEILING_MS + CLIENT_TIMEOUT_MARGIN_MS;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 
 function baseUrl() {
   return (process.env.TMUXCTLD_URL || DEFAULT_TMUXCTLD_URL).replace(/\/+$/, '');
@@ -14,12 +17,13 @@ function normalizeBotName(botName) {
   return String(botName || 'voice').trim().toLowerCase().replaceAll('-', '_');
 }
 
-async function request(method, path, body = null) {
+async function request(method, path, body = null, { timeoutMs: routeTimeoutMs = null } = {}) {
   const url = `${baseUrl()}${path}`;
-  const configuredTimeoutMs = Number(process.env.TMUXCTLD_REQUEST_TIMEOUT_MS || DEFAULT_REQUEST_TIMEOUT_MS);
+  const defaultTimeoutMs = routeTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const configuredTimeoutMs = Number(process.env.TMUXCTLD_REQUEST_TIMEOUT_MS || defaultTimeoutMs);
   const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
-    ? configuredTimeoutMs
-    : DEFAULT_REQUEST_TIMEOUT_MS;
+    ? Math.max(configuredTimeoutMs, defaultTimeoutMs)
+    : defaultTimeoutMs;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const opts = {
@@ -83,31 +87,31 @@ export function createTmuxctldClient() {
         user_id: String(userId || ''),
         channel_id: String(channelId || ''),
         route_epoch: String(routeEpoch ?? ''),
-      });
+      }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
     },
     appendVoiceSession({ voiceSessionId, text }) {
       return request('POST', '/voice/session/append', {
         voice_session_id: voiceSessionId,
         text: String(text || ''),
-      });
+      }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
     },
     shipVoiceSession({ voiceSessionId, text = '' }) {
       return request('POST', '/voice/session/ship', {
         voice_session_id: voiceSessionId,
         text: String(text || ''),
-      });
+      }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
     },
     scratchVoiceSession({ voiceSessionId }) {
       return request('POST', '/voice/session/scratch', {
         voice_session_id: voiceSessionId,
-      });
+      }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
     },
     clearVoiceSession({ voiceSessionId = '', botName = '', userId = '' } = {}) {
       return request('POST', '/voice/session/clear', {
         voice_session_id: voiceSessionId,
         bot_name: botName ? normalizeBotName(botName) : '',
         user_id: userId ? String(userId) : '',
-      });
+      }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
     },
     sendText({ target, text, submit = true, clearPrompt = false }) {
       return request('POST', '/send-text', {
@@ -115,7 +119,7 @@ export function createTmuxctldClient() {
         text: String(text || ''),
         submit: !!submit,
         clear_prompt: !!clearPrompt,
-      });
+      }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
     },
     voiceTarget(botName) {
       const query = new URLSearchParams({ bot_name: normalizeBotName(botName) });
