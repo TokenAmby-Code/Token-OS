@@ -1,16 +1,20 @@
-# Ops Cockpit Mockup — Active State
+# Ops Cockpit — Active State
 
-**Last updated:** 2026-07-03
-**Location:** `token-api/web/ops-mockup` — a self-contained Vite app, sister to the
-real cockpit at `token-api/web/ops`. Inert design study; not wired into deploy/build.
+**Last updated:** 2026-07-08
+**Location:** `token-api/web/ops` — THE live cockpit, served at `/ui/ops` from the
+committed build in `token-api/ui/ops`. Promoted from the `ops-mockup` design study.
 
-A **static design study** for the Token-OS ops cockpit (`/ui/ops` target) — no live
-data wired. Vite + React + TypeScript. `noUnusedLocals` / `noUnusedParameters` are on.
+**Status: LIVE, phase 1.** Timer graph + timer/balance/phone/desktop/cron/tts dials
++ TTS stack are wired to `GET /api/ui/ops/state` (2s) and
+`GET /api/ui/ops/timer/history` (30s) through `src/api.ts` → `src/cockpitData.ts`
+adapters → one `CockpitData` context. Fleet/worker surfaces, enforce/gt dials, and
+the drawer catalog stay unwired (phase 2) and render honest placeholders/demo knobs.
+Vite + React + TypeScript. `noUnusedLocals` / `noUnusedParameters` are on.
 
 ## Run it
 
 ```bash
-cd token-api/web/ops-mockup
+cd token-api/web/ops
 npm run dev        # Vite dev server (default :5199 per vite.config.ts)
 npm run typecheck  # tsc -b --noEmit  (must be clean)
 npm run build      # tsc -b && vite build
@@ -18,10 +22,12 @@ npm run build      # tsc -b && vite build
 
 ## Critical files
 
-- `src/MockOpsCockpit.tsx` — the whole cockpit (timer field, break hub + arc,
+- `src/OpsCockpit.tsx` — the whole cockpit (timer field, break hub + arc,
   persona/worker dials, TTS stack, corner dial, demobar, placement tool).
 - `src/cockpit.css` — all styling.
-- `src/mockCockpitData.ts` — static mock data.
+- `src/cockpitData.ts` — cockpit render-model types + pure live-contract adapters.
+- `src/api.ts` / `src/types.ts` — Token-API polling hooks + typed contracts
+  (transplanted from the retired old cockpit app).
 
 ## What's live in the current build
 

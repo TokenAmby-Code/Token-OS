@@ -1,27 +1,27 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ES2021",
     "useDefineForClassFields": true,
-    "lib": [
-      "DOM",
-      "DOM.Iterable",
-      "ES2020"
-    ],
-    "allowJs": false,
-    "skipLibCheck": true,
-    "esModuleInterop": true,
-    "allowSyntheticDefaultImports": true,
-    "strict": true,
-    "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2021", "DOM", "DOM.Iterable"],
     "module": "ESNext",
-    "moduleResolution": "Bundler",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "allowImportingTsExtensions": true
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true
   },
-  "include": [
-    "src"
-  ]
+  // NOTE: noUncheckedIndexedAccess is deliberately NOT enabled. It buys real
+  // safety but costs ~43 fixes here, almost all in ArcLayer's 3×3 Cramer solve
+  // (det3's m[i][j] matrix indexing) and the tuple destructures in
+  // mockCockpitData (balanceKeyframes[i], hhmm.split(':')). Enabling it would
+  // mean tuple-typing det3 and guarding every keyframe read — churn well past a
+  // hygiene pass. Revisit when the arc/data math is refactored against real data.
+  "include": ["src"]
 }

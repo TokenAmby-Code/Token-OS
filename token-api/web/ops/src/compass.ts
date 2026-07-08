@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 // Compass object spec — the star-reduction algebra, baked into the type system.
 //
-// Pure and deterministic (mirrors mockCockpitData.ts: no Date.now(), no I/O).
+// Pure and deterministic (mirrors cockpitData.ts: no Date.now(), no I/O).
 // The dial's eight rim stars are NOT authored directly — an operator authors a
 // list of red/blue stars (a `CompassStar[]`), and `resolveCompass` reduces it to
 // a canonical `ResolvedCompass` that the render consumes. The reduction rules:

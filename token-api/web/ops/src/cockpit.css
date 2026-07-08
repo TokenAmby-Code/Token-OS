@@ -451,7 +451,7 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 .ring--neutral { --tone: var(--muted); }
 .ring--idle { --tone: var(--idle); }
 
-/* ── Mutual-exclusion breach (see MockOpsCockpit duplicatePersonaKeys) ──────────
+/* ── Mutual-exclusion breach (see OpsCockpit duplicatePersonaKeys) ──────────
    A persona has appeared more than once in one queue — an invariant the DB is
    meant to prevent. The UI does NOT hide it: the offending dial is forced to the
    pure ERROR red (overriding its status tone — this rule sits AFTER the tone rules
@@ -615,6 +615,29 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--tone); white-space: nowrap;
 }
 .drawer__sub { margin-top: 3px; font-size: 12px; line-height: 1.4; color: var(--muted); }
+
+/* ══ degraded-state banner — the explicit "data spine unhealthy" chip ════════
+   Shown while a live feed is loading or erroring. A fixed top-centre mono chip
+   in the hazard tone; z above the tooltip layer (200) so the degradation is
+   never occluded by an instrument. Pointer-transparent — purely a readout. */
+.degraded-chip {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 210;
+  padding: 5px 14px;
+  border: 1px solid var(--hazard);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-deep) 84%, transparent);
+  color: var(--hazard);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  pointer-events: none;
+}
 
 /* ══ demo control (mockup only) — pinned so it's reachable while scrolling ══ */
 .demobar {
