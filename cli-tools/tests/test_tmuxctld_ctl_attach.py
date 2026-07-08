@@ -159,6 +159,41 @@ def test_attach_creates_missing_workspace_through_daemon_before_attach(tmp_path:
     assert '{"session":"main"}' in curl_argv
 
 
+def test_attach_socket_loss_sends_usr1_to_live_server_before_has_session(tmp_path: Path) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    order = tmp_path / "order.log"
+    tmux = fakebin / "tmux"
+    tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo tmux:$1 >> {order!s}\n"
+        'case "$1" in has-session|attach-session) exit 0 ;; *) exit 64 ;; esac\n'
+    )
+    tmux.chmod(0o755)
+    py = fakebin / "python3"
+    py.write_text("#!/usr/bin/env bash\nexit 1\n")
+    py.chmod(0o755)
+    ps = fakebin / "ps"
+    ps.write_text("#!/usr/bin/env bash\nprintf ' 4242 tmux new-session -s main\\n'\n")
+    ps.chmod(0o755)
+    kill = fakebin / "kill"
+    kill.write_text(f"#!/usr/bin/env bash\necho kill:$1:$2 >> {order!s}\n")
+    kill.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["TMUXCTLD_TMUX_SOCKET_PATH"] = str(tmp_path / "scratch.sock")
+    env.pop("IMPERIUM_TMUX_RAW", None)
+
+    subprocess.run([str(CTL), "attach"], env=env, check=True, capture_output=True, text=True)
+
+    assert order.read_text().splitlines() == [
+        "tmux:has-session",
+        "tmux:has-session",
+        "tmux:attach-session",
+    ]
+
+
 def test_attach_rejects_option_like_session_names(tmp_path: Path) -> None:
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
