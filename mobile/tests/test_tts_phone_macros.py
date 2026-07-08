@@ -32,6 +32,13 @@ def request_bodies(macro: dict) -> list[str]:
     ]
 
 
+def set_variable_assignments(macro: dict) -> list[tuple[str, str]]:
+    return [
+        (a["m_variable"]["m_name"], a.get("m_newStringValue", ""))
+        for a in actions(macro, "SetVariableAction")
+    ]
+
+
 def load_wrapper(name: str) -> dict:
     return json.loads((MACROS / name).read_text())
 
@@ -138,10 +145,10 @@ def test_chunk_player_streams_with_scalar_speak_text_and_backfill() -> None:
     assert all("http_param=" not in a["m_textToSay"] for a in speak_actions)
     assert all("request[" not in a["m_textToSay"] for a in speak_actions)
     assert all("backfill[" not in a["m_textToSay"] for a in speak_actions)
-    assert ("current_chunk_text", "{lv=request[current_chunk]}") in [
-        (a["m_variable"]["m_name"], a.get("m_newStringValue", ""))
-        for a in actions(macro, "SetVariableAction")
-    ]
+    assert (
+        "current_chunk_text",
+        "{lv=request[current_chunk]}",
+    ) in set_variable_assignments(macro)
     assert "SetVariableAction" in serialized
     assert "LoopAction" in serialized
     assert "PauseAction" not in serialized
@@ -166,11 +173,7 @@ def test_chunk_player_streams_with_scalar_speak_text_and_backfill() -> None:
         == "backfill_raw"
     )
 
-    set_actions = actions(macro, "SetVariableAction")
-    assignments = [
-        (a["m_variable"]["m_name"], a.get("m_newStringValue", ""))
-        for a in set_actions
-    ]
+    assignments = set_variable_assignments(macro)
     assert ("current_index", "{lv=next_index}") in assignments
     assert ("next_index", "{lv=backfill_next_index}") in assignments
     assert ("backfill_done", "{lv=backfill[done]}") in assignments

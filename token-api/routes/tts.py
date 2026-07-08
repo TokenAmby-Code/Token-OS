@@ -3215,13 +3215,36 @@ async def api_tts_phone_test(
         },
     )
     chunks = build_tts_chunk_handoff(message, max_chars=request.max_chars)
-    result = await asyncio.to_thread(
-        dispatch_tts_chunks_to_backend,
-        "phone",
-        chunks,
-        rate=request.rate,
+    result: dict = {}
+    try:
+        result = await asyncio.to_thread(
+            dispatch_tts_chunks_to_backend,
+            "phone",
+            chunks,
+            rate=request.rate,
+        )
+        result = dict(result or {})
+    except Exception:
+        _update_tts_authoritative_state(
+            control={
+                "state": "error",
+                "last_action": "phone_test",
+                "speed": 1.0,
+                "source": "phone_test",
+                "updated_at": _now_iso(),
+            }
+        )
+        raise
+    terminal_state = "idle" if result.get("success") else "error"
+    _update_tts_authoritative_state(
+        control={
+            "state": terminal_state,
+            "last_action": "phone_test",
+            "speed": 1.0,
+            "source": "phone_test",
+            "updated_at": _now_iso(),
+        }
     )
-    result = dict(result or {})
     result["session_id"] = session_id
     result["requested_backend"] = "phone"
     result["router_bypassed"] = True
