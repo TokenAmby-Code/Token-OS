@@ -2331,9 +2331,9 @@ dispatch_launch_observe_timeout() {
   # Generous, configurable ceiling for how long to wait for the agent process to
   # come up before declaring a GENUINE failure (pane created but no agent ever
   # appeared). This is the real-event bound, not a row-bind clock: it only gates
-  # exit 70 when liveness never confirms. Raised from the old 20s — under fleet
+  # exit 70 when liveness never confirms. Raised to cover engine-boot-bound bind latency; under fleet
   # load (2-4 panes, MCP init, worktree first-shell hooks) cold start routinely
-  # exceeded 20s. Override with DISPATCH_LAUNCH_OBSERVE_TIMEOUT; 0 disables the
+  # exceeds the old shorter windows. Override with DISPATCH_LAUNCH_OBSERVE_TIMEOUT; 0 disables the
   # observer entirely (the dispatcher trusts the send and returns immediately).
   local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-120}"
   if [[ "$value" =~ ^[0-9]+$ ]]; then
@@ -2414,10 +2414,10 @@ dispatch_pane_agent_live() {
 }
 
 registry_bind_ok_for_wrapper_launch_id() {
-  local wrapper_id="$1" expected_workdir="$2" expected_label="$3"
+  local wrapper_id="$1" expected_workdir="$2"
   [[ -n "$wrapper_id" ]] || return 1
   local api_url="${TOKEN_API_URL:-http://localhost:7777}"
-  TOKEN_API_URL="$api_url" WRAPPER_LAUNCH_ID="$wrapper_id" EXPECTED_WORKDIR="$expected_workdir" EXPECTED_LABEL="$expected_label" RESUME_ID_VALUE="$RESUME_ID" python3 - <<'PYREGBIND'
+  TOKEN_API_URL="$api_url" WRAPPER_LAUNCH_ID="$wrapper_id" EXPECTED_WORKDIR="$expected_workdir" RESUME_ID_VALUE="$RESUME_ID" python3 - <<'PYREGBIND'
 import json
 import os
 import sys
@@ -2494,7 +2494,7 @@ reconcile_dispatch_registry_bind() {
   # Registration binding is control-plane truth, not an advisory. Liveness proves
   # the engine came up, but after the observation window a missing/stopped row is
   # a loud failure because downstream sends/renames depend on registry binding.
-  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label expected_label wrapper_id
+  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label wrapper_id
   if ! command -v sqlite3 >/dev/null 2>&1; then
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because sqlite3 is unavailable"
     return 1
@@ -2503,9 +2503,8 @@ reconcile_dispatch_registry_bind() {
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because agents DB is missing at $DB_PATH"
     return 1
   fi
-  expected_label="$(resolve_pane_label_for_env "$pane")"
   wrapper_id="$(pane_wrapper_launch_id "$pane" || true)"
-  if registry_bind_ok_for_wrapper_launch_id "$wrapper_id" "$WORK_DIR" "$expected_label"; then
+  if registry_bind_ok_for_wrapper_launch_id "$wrapper_id" "$WORK_DIR"; then
     return 0
   fi
   instance_id="$(pane_registry_instance_id "$pane" || true)"
