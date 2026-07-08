@@ -5,13 +5,11 @@ import {
   DAY_START,
   dials,
   initialDialCount,
-  initialTtsDepth,
   MAX_DIAL_COUNT,
-  MAX_TTS_DEPTH,
   timerPoints,
   timerSegments,
   ttsLanguishThreshold,
-  ttsQueue,
+  workerPersonaToTtsItem,
   type DialTone,
   type MockDial,
   type MockTimerMode,
@@ -496,10 +494,6 @@ const PERSONA_COUNT = 6;
 // anchored rows below (trailing down the RHS) rather than capping, so this is just
 // how far the demo slider travels, not a layout limit.
 const MAX_WORKER_COUNT = 30;
-// Idle-worker-queue ceiling — far past the crossbar band so the chips climb well up
-// the two edge ditches and overflow (clobber) the region above; the overflow IS the
-// "too many idle instances" error visual, so this is intentionally generous.
-const MAX_IDLE_COUNT = 40;
 const THETA_MIN = (12 * Math.PI) / 180;
 const THETA_MAX = (82 * Math.PI) / 180;
 const OUTER_MAX = 5; // outer ring capacity — fills first
@@ -733,6 +727,7 @@ function Dial({
   onActivate,
   className,
   icon,
+  agentId,
 }: {
   dial: MockDial;
   style: React.CSSProperties;
@@ -741,6 +736,8 @@ function Dial({
   className?: string; // extra classes (TTS phase modifiers: promoting/speaking/…)
   icon?: ReactNode; // optional glyph override — the TTS senders pass a persona SVG
   //                   in place of the unicode glyph; the status fan omits it.
+  agentId?: string; // lifecycle id — tags the node with data-agent-id so the flight
+  //                   orchestrator can measure its rect (render-then-measure).
 }) {
   function activate() {
     if (onActivate) {
@@ -783,6 +780,7 @@ function Dial({
       role="button"
       tabIndex={0}
       aria-label={`${dial.label}: ${dial.value}`}
+      data-agent-id={agentId}
       onClick={activate}
       onKeyDown={onKeyDown}
     >
@@ -898,6 +896,79 @@ function duplicatePersonaKeys<T>(
   return dup;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// LIFECYCLE IDENTITY — one object woven through all three queues (worker → TTS →
+// idle). Minted once at worker birth and carried UNCHANGED across every handoff:
+// its `id` is the single React key in every queue (so no persona ever briefly
+// exists in two lists), its `originSide` rides through TTS so the idle return
+// lands on the side the worker was born on, and its `item` (synthesized once) is
+// what the TTS stack renders. The three queues went from count/depth-driven to
+// ROSTER-driven (keyed Agent[]) — each component keeps its own slot/phase reconcile
+// + CSS-transition machinery; only the reconcile INPUT changed from a number to a
+// keyed list (diff by id, not length).
+// ═══════════════════════════════════════════════════════════════════════════
+type OriginSide = -1 | 1; // -1 = left column, +1 = right column
+interface Agent {
+  id: string; // session-global monotonic id — the React key in every queue
+  persona: string;
+  tone: string;
+  originSide: OriginSide; // set at worker birth; rides worker → TTS → idle unchanged
+  item: MockTtsItem; // synthesized once at birth; TtsStack renders from this
+}
+
+// A single in-flight chip riding the flight overlay (see FlightLayer). `d` is an
+// SVG path string in VIEWPORT px (the overlay is fixed inset:0, so its frame IS
+// the viewport → getBoundingClientRect coords drop straight in). `destId` is the
+// invisible destination agent revealed on landing.
+interface Flight {
+  id: string;
+  destId: string; // agent id to reveal (drop from pending) on land
+  persona: string;
+  tone: string;
+  d: string; // offset-path polyline, viewport px
+  sizeFrom: number; // px — chip diameter at spawn
+  sizeTo: number; // px — chip diameter at land
+  durationMs: number;
+}
+
+// A worker "finishing" (clicked): the agent leaving the worker rail, plus the arm
+// polyline (in VIEWPORT px, sampled from the filleted queue path) the flight rides
+// down to the arm→ditch corner before popping straight to the TTS stack bottom.
+interface WorkerFinishSpec {
+  agent: Agent;
+  side: OriginSide;
+  armPolylineVp: { x: number; y: number }[]; // corner-entry-terminated arm, viewport px
+}
+
+// Flight timings/easing — settled by eye on :5199 (see the tuning stage).
+const FLIGHT_WORKER_TTS_MS = 520; // worker → TTS: shrink + ride the arm to the corner + pop
+const FLIGHT_TTS_IDLE_MS = 560; // TTS → idle: straight, grow back
+const FLIGHT_EASE = 'cubic-bezier(0.4, 0, 0.2, 1)';
+// Right-side worker→TTS routing: 'own' = each side rides its OWN arm to its OWN
+// arm→ditch corner, then straight to the single top-left TTS bottom (left = short
+// hop; right = flies across). 'left' would route the right side to the left corner
+// first if "flies across" reads poorly — a future by-eye toggle, not wired yet.
+const TTS_FEED_CORNER: 'own' | 'left' = 'own';
+
+// Read the viewport-px CENTRE of a live queue node tagged `data-agent-id={id}`.
+// The destination is always MEASURED from a real (invisible) rendered node rather
+// than computed — flip-correct for the 180°-rotated idle rail for free. Returns null
+// if the node isn't committed yet (the caller polls a few frames).
+//
+// `scopeSel` restricts the match to one queue's container: during a handoff the SAME
+// id briefly tags TWO nodes (the source still dismissing + the destination arriving),
+// so an unscoped querySelector could return the wrong one (DOM order). Scope to the
+// DESTINATION container (`.tts-stack` / `.idle-worker-queue`) to always read the target.
+function agentNodeCenter(id: string, scopeSel?: string): { x: number; y: number } | null {
+  if (typeof document === 'undefined') return null;
+  const sel = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(id) : id;
+  const q = scopeSel ? `${scopeSel} [data-agent-id="${sel}"]` : `[data-agent-id="${sel}"]`;
+  const el = document.querySelector(q);
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+
 // The play gesture turns the stack from a static display into a small state
 // machine over a stateful ordered list. Each live entry carries a stable key (so
 // React identity survives the reorders + removals), the projected queue item, a
@@ -909,10 +980,13 @@ function duplicatePersonaKeys<T>(
 // node in the DOM resets its CSS transition baseline in Chrome, which made the
 // shift-down teleport when slot == array index. Decoupling slot from DOM order
 // lets every slot change (shift-down, shuffle-up) transition smoothly.
-type TtsPhase = 'idle' | 'promoting' | 'speaking' | 'dismissing';
+// 'arriving' = inserted (deepest slot) but INVISIBLE (opacity:0): a worker-born dial
+// awaiting its flight to land. The controller reveals it (arriving → idle) by dropping
+// its id from pendingIds once the flight resolves.
+type TtsPhase = 'arriving' | 'idle' | 'promoting' | 'speaking' | 'dismissing';
 interface TtsEntry {
-  key: string;
-  item: MockTtsItem;
+  key: string; // = agent.id — the session-global React key
+  agent: Agent; // the woven identity; item = agent.item, originSide rides to idle
   phase: TtsPhase;
   slot: number; // visual row (0 = head); the sole position driver
   promoteN?: number; // click-time slot n — feeds the L-path keyframe's --n
@@ -925,26 +999,31 @@ interface TtsEntry {
 // behind them. The start-lag is faithful anyway — real playback waits on token-api,
 // a MacroDroid ping for mobile, or WSL inter-device comms before the voice begins.
 const TTS_PHASE_CLASS: Record<TtsPhase, string> = {
+  arriving: 'tts-dial tts-dial--arriving', // rendered but opacity:0 until the flight lands
   idle: 'tts-dial',
   promoting: 'tts-dial tts-dial--promoting',
   speaking: 'tts-dial tts-dial--speaking',
   dismissing: 'tts-dial tts-dial--dismissing',
 };
 
-function TtsStack({ depth, onOpenDrawer, uiScale }: { depth: number; onOpenDrawer: (id: string) => void; uiScale: number }) {
-  // Stateful ORDERED queue (slot = array index) with stable per-entry keys.
-  // Seeded from ttsQueue cycled to depth. Keys are MONOTONIC via seqRef: a drain
-  // removes an entry for good, so index-derived keys would collide when the tail
-  // later regrows — the counter guarantees uniqueness across the whole session.
-  const seqRef = useRef(0);
+function TtsStack({ agents, pendingIds, onOpenDrawer, onTtsFinish, uiScale }: {
+  agents: Agent[]; // roster — the SOLE membership source; slot/phase are internal
+  pendingIds: ReadonlySet<string>; // agents inserted but INVISIBLE until their flight lands
+  onOpenDrawer: (id: string) => void;
+  onTtsFinish: (agent: Agent, headRectVp: { x: number; y: number } | null) => void; // terminal → controller
+  uiScale: number;
+}) {
+  // Stateful ORDERED queue (slot = array index-ish) with stable per-entry keys.
+  // Keys ARE the agents' session-global ids, so identity survives every reorder +
+  // removal. Membership is roster-driven (see the reconcile below); only slot/phase
+  // live here. Seeded from the initial roster (empty at first paint).
   const [entries, setEntries] = useState<TtsEntry[]>(() =>
-    Array.from({ length: depth }, (_, i) => ({
-      key: `t${i}`,
-      item: ttsQueue[i % ttsQueue.length],
-      phase: 'idle' as TtsPhase,
-      slot: i,
-    })),
+    agents.map((a, i) => ({ key: a.id, agent: a, phase: 'idle' as TtsPhase, slot: i })),
   );
+  // Mirror entries into a ref so the roster reconcile (deps [agents, pendingIds])
+  // and the async timers read the FRESH list without re-subscribing every change.
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
 
   // Stage timers (promote-land → speak window → dismiss → remove). Tracked so an
   // unmount / hot-reload can't leave a setState firing on a dead component.
@@ -954,49 +1033,77 @@ function TtsStack({ depth, onOpenDrawer, uiScale }: { depth: number; onOpenDrawe
     timers.current.push(window.setTimeout(fn, ms));
   };
 
-  // Depth slider = source-of-truth resize: grow/shrink the TAIL only (append fresh
-  // cycled entries / trim the deepest slots), leaving any in-flight animation —
-  // always at/near the head — untouched. Trim + grow key off SLOT, not array
-  // index, since the two are decoupled; slots stay contiguous 0…count−1 either way.
+  // ROSTER RECONCILE — the membership source. Diffs the incoming Agent[] against the
+  // live entries BY ID: new ids append at the deepest slot (INVISIBLE 'arriving' while
+  // their flight is pending, else straight to 'idle'); dropped ids fade out then
+  // shuffle the deeper slots up; an 'arriving' entry whose id leaves pendingIds is
+  // revealed. Membership is NEVER mutated by the play gesture — it only ever changes
+  // here, so the roster and the stack can't diverge.
   useEffect(() => {
-    setEntries((prev) => {
-      const count = prev.length;
-      if (depth === count) return prev;
-      if (depth < count) return prev.filter((e) => e.slot < depth); // drop deepest rows
-      const add: TtsEntry[] = [];
-      for (let i = count; i < depth; i++) {
-        add.push({ key: `a${seqRef.current++}`, item: ttsQueue[i % ttsQueue.length], phase: 'idle', slot: i });
-      }
-      return [...prev, ...add];
-    });
-  }, [depth]);
+    const prev = entriesRef.current;
+    const prevIds = new Set(prev.map((e) => e.key));
+    const rosterIds = new Set(agents.map((a) => a.id));
+    const added = agents.filter((a) => !prevIds.has(a.id));
+    const removed = prev.filter((e) => !rosterIds.has(e.key) && e.phase !== 'dismissing');
+    const toReveal = prev.filter((e) => e.phase === 'arriving' && !pendingIds.has(e.key));
+    if (!added.length && !removed.length && !toReveal.length) return;
 
-  // Stage 3: after the speak window, collapse + REMOVE the entry, then decrement
-  // every deeper slot — so their translateY transitions animate them UP one row
-  // (the shuffle-up). The queue drains: depth drops by one (the slider rebuilds it).
-  function scheduleSpeak(key: string, durationMs: number) {
-    after(durationMs, () => {
-      setEntries((prev) => prev.map((e) => (e.key === key ? { ...e, phase: 'dismissing' as TtsPhase } : e)));
+    setEntries((cur) => {
+      let next = cur.map((e) =>
+        toReveal.some((r) => r.key === e.key) ? { ...e, phase: 'idle' as TtsPhase } : e,
+      );
+      // Removals fade in place; the actual drop + shuffle-up lands after DISMISS_MS.
+      if (removed.length) {
+        const gone = new Set(removed.map((r) => r.key));
+        next = next.map((e) => (gone.has(e.key) ? { ...e, phase: 'dismissing' as TtsPhase } : e));
+      }
+      // Additions append at the deepest slot (max+1…), preserving existing rows.
+      if (added.length) {
+        let slot = next.reduce((m, e) => Math.max(m, e.slot), -1) + 1;
+        for (const a of added) {
+          next = [...next, { key: a.id, agent: a, phase: pendingIds.has(a.id) ? 'arriving' : 'idle', slot }];
+          slot++;
+        }
+      }
+      return next;
+    });
+
+    // Schedule each removal's real drop + shuffle-up one DISMISS_MS out.
+    removed.forEach((r) => {
       after(DISMISS_MS, () =>
-        setEntries((prev) => {
-          const gone = prev.find((e) => e.key === key);
-          if (!gone) return prev;
-          return prev
-            .filter((e) => e.key !== key)
+        setEntries((cur) => {
+          const gone = cur.find((e) => e.key === r.key);
+          if (!gone) return cur;
+          return cur
+            .filter((e) => e.key !== r.key)
             .map((e) => (e.slot > gone.slot ? { ...e, slot: e.slot - 1 } : e));
         }),
       );
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agents, pendingIds]);
+
+  // Stage 3: after the speak window, hand the terminal dial to the controller (which
+  // drops it from the roster → the reconcile above fades + shuffles). We measure the
+  // head node's rect FIRST so the controller can fly it out to the idle rail.
+  function scheduleSpeak(key: string, durationMs: number) {
+    after(durationMs, () => {
+      const done = entriesRef.current.find((e) => e.key === key);
+      if (!done) return;
+      onTtsFinish(done.agent, agentNodeCenter(key, '.tts-stack'));
+    });
   }
 
-  // The play gesture. ONE active speaker: while anything is mid-flight, new promote
-  // clicks are ignored — matches the live single serialized speak_tts queue.
+  // The play gesture. ONE active speaker: while a dial is mid play-gesture, new
+  // promote clicks are ignored — matches the live single serialized speak_tts queue.
+  // (An 'arriving' dial is NOT in the play gesture, so a worker landing doesn't
+  // freeze the queue.)
   function promote(key: string) {
-    if (entries.some((e) => e.phase !== 'idle')) return;
+    if (entries.some((e) => e.phase === 'promoting' || e.phase === 'speaking' || e.phase === 'dismissing')) return;
     const clicked = entries.find((e) => e.key === key);
-    if (!clicked) return;
+    if (!clicked || clicked.phase !== 'idle') return;
     const n = clicked.slot;
-    const durationMs = clicked.item.durationMs ?? SPEAK_MS;
+    const durationMs = clicked.agent.item.durationMs ?? SPEAK_MS;
 
     if (n === 0) {
       // Base case: the head plays IN PLACE — no movement, just reverberate + speak.
@@ -1028,7 +1135,7 @@ function TtsStack({ depth, onOpenDrawer, uiScale }: { depth: number; onOpenDrawe
 
   // Flag any persona that repeats in the queue (2nd+ occurrence, by slot order) —
   // a DB-invariant breach the stack surfaces rather than hides (see the helper).
-  const dupKeys = duplicatePersonaKeys(entries, (e) => e.slot, (e) => e.item.persona, (e) => e.key);
+  const dupKeys = duplicatePersonaKeys(entries, (e) => e.slot, (e) => e.agent.persona, (e) => e.key);
 
   return (
     <div
@@ -1041,8 +1148,9 @@ function TtsStack({ depth, onOpenDrawer, uiScale }: { depth: number; onOpenDrawe
       {entries.map((e) => (
         <Dial
           key={e.key}
-          dial={{ ...ttsItemToDial(e.item), id: e.key }}
-          icon={personaIcon(e.item.persona)}
+          agentId={e.key}
+          dial={{ ...ttsItemToDial(e.agent.item), id: e.key }}
+          icon={personaIcon(e.agent.persona)}
           className={`${TTS_PHASE_CLASS[e.phase]}${dupKeys.has(e.key) ? ' ring--dup' : ''}`}
           style={{
             width: TTS_DIAL_PX * uiScale,
@@ -1562,7 +1670,10 @@ function workerFloorY(x: number, geo: LemonGeometry, uiScale: number): number {
 type QueuePt = { x: number; y: number };
 interface QueuePath {
   pointAt(s: number): QueuePt; // s = arc-length from the stem base
-  totalLen: number; // arm length (the straight-down tail continues past it)
+  totalLen: number; // arm + corner-fillet length (the straight-down tail continues past it)
+  armLen: number; // arc-length to the corner ENTRY (end of the straight arm, before the fillet)
+  endX: number; // corner-entry x — the idle-baseline lift anchor (clock/tip elbow)
+  endFloorY: number; // corner-entry floor y — the idle-baseline lift anchor
 }
 
 // Locked worker-queue layout — px authored at DESIGN_W (1440), × uiScale at consumption.
@@ -1571,6 +1682,19 @@ const W_DROP_PX = 53; // chip-row drop below the header floor — dials clear of
 const W_SPACE_PX = 99; // queue spacing: chip centre-to-centre so the 90px dials never overlap
 const W_INSET_PX = 50; // drains hug the very edges — columns sit flush at the sides
 const W_SPLIT_PX = 93; // slot-0 gap from centre stem (centre clearance for the fat chips)
+// Arm→ditch corner radius. The arm ends a quarter-ellipse of THIS radius short of the
+// ditch, then rounds down into the vertical drain instead of turning on a hard 90°
+// elbow. Baked into the sampled queue path so pointAt() yields evenly-spaced points
+// around the curve — chips "hug" the corner for free (no per-chip special case). The
+// tip pitch is W_SPACE_PX (99), so R must be a real fraction of it to read. Tune live.
+const DITCH_CORNER_R_PX = 72; // px@1440 (× uiScale) — arm→ditch corner radius
+// Idle-variant only: chip row hangs a constant drop BELOW the main crossbar (crossY)
+// instead of following the tapered infill floor. crossY sits below the chips in local
+// coords, so after the 180° host flip this reads as chips a fixed drop under the bar on
+// screen. By-eye against :5199 so the row keeps its current centre height but stays
+// parallel to the bar (outer chips lift to match rather than dipping into the taper).
+const IDLE_CHIP_DROP_PX = 40; // px @1440 (× uiScale) — chip clearance below the crossbar
+const IDLE_TIP_EXTRA_DROP_PX = 14; // px@1440 — RHS/tip idle column hangs this much lower
 
 function makeQueuePath(side: number, geo: LemonGeometry, uiScale: number, gap: number, inset: number): QueuePath {
   const s = uiScale;
@@ -1580,20 +1704,46 @@ function makeQueuePath(side: number, geo: LemonGeometry, uiScale: number, gap: n
   // fan symmetrically from geo.xCtr so stem, fan, and bar axis stay coherent.
   const xStart = geo.xCtr;
   const xEnd = side < 0 ? inset * s : geo.Rx - inset * s;
+  const R = DITCH_CORNER_R_PX * s; // arm→ditch fillet radius
+  const outX = Math.sign(xEnd - xStart) || 1; // outward x direction (−1 left, +1 right)
+  // The straight arm now stops a corner-radius SHORT of the ditch (xArmEnd), so the
+  // fillet below can round INTO the vertical drain at xEnd without bulging past the
+  // screen edge (an inner fillet, tangent to the arm and to the x=xEnd drain line).
+  const xArmEnd = xEnd - outX * R;
   const N = 96;
   const pts: QueuePt[] = [];
   const seg: number[] = [0];
   for (let i = 0; i <= N; i++) {
-    const x = xStart + (xEnd - xStart) * (i / N);
+    const x = xStart + (xArmEnd - xStart) * (i / N);
     pts.push({ x, y: workerFloorY(x, geo, uiScale) + gapPx });
   }
   for (let i = 1; i < pts.length; i++) seg.push(seg[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  // Corner ENTRY — the last arm sample. It anchors the idle-baseline lift so the clock/
+  // tip elbow joins its rail seamlessly (see WorkerColumn), and marks where the arm ends
+  // and the rounded fillet begins.
+  const cornerEntry = pts[pts.length - 1];
+  const endX = cornerEntry.x;
+  const endFloorY = cornerEntry.y;
+  const armLen = seg[seg.length - 1];
+  // ── Fillet: a quarter turn from the (≈horizontal) arm end down to the vertical drain,
+  // radius R. Centre sits R below the corner entry; the arc sweeps outward-and-down to
+  // (xEnd, endFloorY + R) where the tangent is straight down. Baked into the SAME pts/seg
+  // table, so pointAt returns evenly-spaced points around the curve.
+  const K = 16;
+  for (let k = 1; k <= K; k++) {
+    const th = (Math.PI / 2) * (k / K);
+    const x = endX + outX * R * Math.sin(th);
+    const y = endFloorY + R * (1 - Math.cos(th));
+    const prev = pts[pts.length - 1];
+    pts.push({ x, y });
+    seg.push(seg[seg.length - 1] + Math.hypot(x - prev.x, y - prev.y));
+  }
   const totalLen = seg[seg.length - 1];
-  const end = pts[pts.length - 1];
+  const end = pts[pts.length - 1]; // fillet foot — (xEnd, endFloorY + R), tangent vertical
   const pointAt = (sq: number): QueuePt => {
     if (sq <= 0) return pts[0];
-    // Past the arm end the tail drops STRAIGHT DOWN so the queue drains down the edge
-    // without crossing it (the floor line's slope isn't extended outward).
+    // Past the fillet foot the tail drops STRAIGHT DOWN (x already at the ditch, tangent
+    // vertical → no corner) so the queue drains down the edge without crossing it.
     if (sq >= totalLen) return { x: end.x, y: end.y + (sq - totalLen) };
     let i = 1;
     while (i < seg.length && seg[i] < sq) i++;
@@ -1604,7 +1754,7 @@ function makeQueuePath(side: number, geo: LemonGeometry, uiScale: number, gap: n
       y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * frac,
     };
   };
-  return { pointAt, totalLen };
+  return { pointAt, totalLen, armLen, endX, endFloorY };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1932,34 +2082,40 @@ const WORKER_PERSONAS = FACTION_PERSONAS;
 const WORKER_TONES = ['var(--brass-bright)', 'var(--good)', 'var(--warn)', 'var(--bad)', 'var(--neutral)', 'var(--idle)'];
 const WORKER_CHIP_PX = 90; // chip diameter, px @1440 (× uiScale) — big worker dials (75% of the first 120px pass)
 const WORKER_BAR_MARGIN = 30; // gap between the chip-row bottom and the gold crossbar below
-const WORKER_DISMISS_MS = 300; // matches the worker-dismiss keyframe
+const WORKER_ENTER_MS = 320; // matches the worker-enter keyframe — how long a fresh chip emerges from the hourglass
 
-type WorkerPhase = 'idle' | 'dismissing';
+// 'entering' = freshly head-inserted at slot 0 (born at the centre hourglass); it wears
+// the worker-enter keyframe until WORKER_ENTER_MS elapses, then settles to 'idle'.
+// 'arriving' = inserted (deepest slot) but INVISIBLE (opacity:0): an idle-bound chip
+// awaiting its flight to land. Revealed (→ 'entering' → 'idle') when the controller
+// drops its id from pendingIds.
+type WorkerPhase = 'idle' | 'dismissing' | 'entering' | 'arriving';
 interface WorkerEntry {
-  key: string;
-  persona: string;
-  tone: string;
+  key: string; // = agent.id — the session-global React key
+  agent: Agent; // the woven identity (persona/tone/originSide/item)
   slot: number; // visual row (0 = head, nearest centre); the sole position driver
   phase: WorkerPhase;
 }
 
 // One side of the "M": a self-contained reflowing queue riding `path`. Mirrors
-// TtsStack — stable-order array, monotonic keys, slot-only positioning — minus the
-// promote/speak gesture (a click is a plain remove).
-function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
-  side: number; count: number; geo: LemonGeometry; uiScale: number;
+// TtsStack — roster-driven membership (diff by id), slot-only positioning. A worker
+// click FINISHES it (measure + hand the controller the arm polyline for the flight);
+// the idle variant has no finish (idle is terminal this pass) so its clicks are inert.
+function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inset, split, insertMode, onFinish, baseline }: {
+  side: number; roster: Agent[]; pendingIds: ReadonlySet<string>;
+  geo: LemonGeometry; uiScale: number;
   gap: number; pitch: number; inset: number; split: number;
+  insertMode: 'center' | 'tail'; // worker births emerge at the CENTRE; idle arrivals append at the DEEPEST slot
+  onFinish?: ((spec: WorkerFinishSpec) => void) | undefined; // worker → controller; absent (idle) ⇒ clicks inert
+  baseline?: ((x: number, floorY: number) => number) | undefined; // override the chip Y (idle: ride the crossbar, but wrap the clock); gets x + the path's own floor y; default = floorY
 }) {
-  const seqRef = useRef(0);
   const [entries, setEntries] = useState<WorkerEntry[]>(() =>
-    Array.from({ length: count }, (_, i) => ({
-      key: `w${seqRef.current++}`,
-      persona: WORKER_PERSONAS[i % WORKER_PERSONAS.length],
-      tone: WORKER_TONES[i % WORKER_TONES.length],
-      slot: i,
-      phase: 'idle' as WorkerPhase,
-    })),
+    roster.map((a, i) => ({ key: a.id, agent: a, slot: i, phase: 'idle' as WorkerPhase })),
   );
+  // Mirror entries into a ref so the roster reconcile (deps [roster, pendingIds])
+  // reads the FRESH list without re-subscribing on every internal slot/phase change.
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
 
   // Timers tracked so an unmount / hot-reload can't fire setState on a dead node.
   const timers = useRef<number[]>([]);
@@ -1968,53 +2124,109 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
     timers.current.push(window.setTimeout(fn, ms));
   };
 
-  // Depth slider = grow/shrink the TAIL only, keyed off SLOT (see TtsStack). Fresh
-  // cycled entries append on grow; the deepest slots drop on shrink.
+  // ROSTER RECONCILE — the membership source. Diffs the incoming Agent[] against the
+  // live entries BY ID:
+  //   • added (center): born at the CENTRE (slot 0…), 'entering' (emerge keyframe),
+  //     shoving the existing stack outward — the worker-birth motion.
+  //   • added (tail): appended at the DEEPEST slot, INVISIBLE 'arriving' while its
+  //     flight is pending (else 'entering') — the idle-arrival slot.
+  //   • removed: INSTANT drop + shuffle-up (NO dismiss fade — the flight already
+  //     carried the identity away, so a fade here would double it).
+  //   • reveal: an 'arriving' entry whose id left pendingIds → 'entering' → 'idle'.
   useEffect(() => {
-    setEntries((prev) => {
-      const n = prev.length;
-      if (count === n) return prev;
-      if (count < n) return prev.filter((e) => e.slot < count); // drop deepest rows
-      const add: WorkerEntry[] = [];
-      for (let i = n; i < count; i++) {
-        add.push({
-          key: `w${seqRef.current++}`,
-          persona: WORKER_PERSONAS[i % WORKER_PERSONAS.length],
-          tone: WORKER_TONES[i % WORKER_TONES.length],
-          slot: i,
-          phase: 'idle',
-        });
-      }
-      return [...prev, ...add];
-    });
-  }, [count]);
+    const prev = entriesRef.current;
+    const prevIds = new Set(prev.map((e) => e.key));
+    const rosterIds = new Set(roster.map((a) => a.id));
+    const added = roster.filter((a) => !prevIds.has(a.id));
+    const removed = prev.filter((e) => !rosterIds.has(e.key));
+    const toReveal = prev.filter((e) => e.phase === 'arriving' && !pendingIds.has(e.key));
+    if (!added.length && !removed.length && !toReveal.length) return;
 
-  // Click-to-remove (ANY element): mark dismissing (scale→0 + fade keyframe), then
-  // after the exit filter the entry out AND decrement every deeper slot — that one
-  // step is the whole reflow, and it works for any position. The survivors animate
-  // up-path via the transform transition.
-  function remove(key: string) {
-    const target = entries.find((e) => e.key === key);
-    if (!target || target.phase === 'dismissing') return;
-    setEntries((prev) => prev.map((e) => (e.key === key ? { ...e, phase: 'dismissing' as WorkerPhase } : e)));
-    after(WORKER_DISMISS_MS, () =>
-      setEntries((prev) => {
-        const gone = prev.find((e) => e.key === key);
-        if (!gone) return prev;
-        return prev
-          .filter((e) => e.key !== key)
+    setEntries((cur) => {
+      let next = cur;
+      // Reveal landed arrivals: arriving → entering (settled to idle below).
+      if (toReveal.length) {
+        const rev = new Set(toReveal.map((r) => r.key));
+        next = next.map((e) => (rev.has(e.key) ? { ...e, phase: 'entering' as WorkerPhase } : e));
+      }
+      // Removals: instant filter + decrement every deeper slot (survivors reflow via
+      // the transform transition).
+      for (const r of removed) {
+        const gone = next.find((e) => e.key === r.key);
+        if (!gone) continue;
+        next = next
+          .filter((e) => e.key !== r.key)
           .map((e) => (e.slot > gone.slot ? { ...e, slot: e.slot - 1 } : e));
-      }),
-    );
-  }
+      }
+      // Additions.
+      if (added.length) {
+        if (insertMode === 'center') {
+          const nAdd = added.length;
+          next = next.map((e) => ({ ...e, slot: e.slot + nAdd }));
+          added.forEach((a, i) => {
+            next = [{ key: a.id, agent: a, slot: i, phase: 'entering' as WorkerPhase }, ...next];
+          });
+        } else {
+          let slot = next.reduce((m, e) => Math.max(m, e.slot), -1) + 1;
+          for (const a of added) {
+            next = [...next, { key: a.id, agent: a, slot, phase: pendingIds.has(a.id) ? 'arriving' : 'entering' }];
+            slot++;
+          }
+        }
+      }
+      return next;
+    });
+
+    // Settle any freshly-'entering' chips (births + revealed arrivals) out of the
+    // emerge keyframe so it can't replay. Deepest-slot 'arriving' chips (still in
+    // flight) are untouched — they only enter once revealed.
+    if (added.length || toReveal.length) {
+      after(WORKER_ENTER_MS, () =>
+        setEntries((prev) =>
+          prev.some((e) => e.phase === 'entering')
+            ? prev.map((e) => (e.phase === 'entering' ? { ...e, phase: 'idle' as WorkerPhase } : e))
+            : prev,
+        ),
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roster, pendingIds]);
 
   const path = useMemo(() => makeQueuePath(side, geo, uiScale, gap, inset), [side, geo, uiScale, gap, inset]);
   const chip = WORKER_CHIP_PX * uiScale;
 
+  // Click FINISHES a worker: measure the clicked button's viewport rect, build the arm
+  // polyline (sampled from the filleted path, converted local→viewport by a pure
+  // translation — valid because the compass rail is un-flipped), and hand it to the
+  // controller. The controller drops the agent from this roster (→ instant reconcile
+  // removal) and flies it to the TTS bottom. NO local dismiss — the flight IS the exit.
+  function finish(entry: WorkerEntry, buttonEl: HTMLElement) {
+    if (!onFinish) return; // idle variant — clicks inert (idle is terminal this pass)
+    const sArc = (split + entry.slot * pitch) * uiScale;
+    const localStart = path.pointAt(sArc);
+    const r = buttonEl.getBoundingClientRect();
+    const center = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    const dx = center.x - localStart.x;
+    const dy = center.y - localStart.y;
+    const armPolylineVp: { x: number; y: number }[] = [];
+    if (path.armLen <= sArc) {
+      // Chip already at/past the corner entry — fly straight from where it sits.
+      armPolylineVp.push(center);
+    } else {
+      const STEPS = 10;
+      for (let i = 0; i <= STEPS; i++) {
+        const s = sArc + (path.armLen - sArc) * (i / STEPS);
+        const p = path.pointAt(s);
+        armPolylineVp.push({ x: p.x + dx, y: p.y + dy });
+      }
+    }
+    onFinish({ agent: entry.agent, side: side as OriginSide, armPolylineVp });
+  }
+
   // A persona must be unique within this queue — the DB's invariant. When the data
-  // breaks it (WORKER_PERSONAS cycles once count exceeds the roster), the repeats
-  // are surfaced with a red error glow, not silently collapsed (see the helper).
-  const dupKeys = duplicatePersonaKeys(entries, (e) => e.slot, (e) => e.persona, (e) => e.key);
+  // breaks it (personas cycle once the roster exceeds the registry), the repeats are
+  // surfaced with a red error glow, not silently collapsed (see the helper).
+  const dupKeys = duplicatePersonaKeys(entries, (e) => e.slot, (e) => e.agent.persona, (e) => e.key);
 
   return (
     <>
@@ -2022,26 +2234,48 @@ function WorkerColumn({ side, count, geo, uiScale, gap, pitch, inset, split }: {
         const isDup = dupKeys.has(e.key);
         // slot 0 sits `split` out from the stem (centre clearance); each further slot
         // marches one `pitch` outward along the arm.
-        const p = path.pointAt((split + e.slot * pitch) * uiScale);
+        const sArc = (split + e.slot * pitch) * uiScale;
+        const p = path.pointAt(sArc);
+        // x is ALWAYS p.x — on the arm it preserves the horizontal column fan; past the
+        // corner it follows the path's rounded fillet (curving inward) then the vertical
+        // ditch. Only Y changes per variant.
+        let y: number;
+        if (!baseline) {
+          // Compass (non-idle): ride the path directly — the baked fillet rounds the
+          // arm→ditch corner and drains down-screen for free (no special case).
+          y = p.y;
+        } else if (sArc > path.armLen) {
+          // Idle chip PAST the corner: ride the path's rounded elbow + vertical drain,
+          // lifted RIGIDLY to the baseline by the offset measured at the corner entry —
+          // so the clock/tip corner rounds identically to the compass. At the entry the
+          // clock wrap makes baseline≈endFloorY ⇒ shift≈0 (seamless); the tip bow lifts
+          // the elbow to crossY−DROP−extra, continuous with the on-arm bow.
+          const shift = baseline(path.endX, path.endFloorY) - path.endFloorY;
+          y = p.y + shift;
+        } else {
+          // Idle chip ON the arm: hang from the crossbar-parallel baseline.
+          y = baseline(p.x, p.y);
+        }
         return (
           <button
             key={e.key}
             type="button"
             className="worker-chip"
-            aria-label={`Worker ${e.persona}${isDup ? ' — DUPLICATE (singleton breach)' : ''} — dismiss`}
+            data-agent-id={e.key}
+            aria-label={`Worker ${e.agent.persona}${isDup ? ' — DUPLICATE (singleton breach)' : ''}${onFinish ? ' — finish' : ''}`}
             style={{
               width: chip,
               height: chip,
               // slot expressed PURELY as a transform → any slot change animates for free.
-              transform: `translate(${p.x.toFixed(1)}px, ${p.y.toFixed(1)}px) translate(-50%, -50%)`,
+              transform: `translate(${p.x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -50%)`,
             }}
-            onClick={() => remove(e.key)}
+            onClick={onFinish ? (ev) => finish(e, ev.currentTarget) : undefined}
           >
             <span
-              className={`worker-chip__disc${e.phase === 'dismissing' ? ' worker-chip__disc--out' : ''}${isDup ? ' worker-chip__disc--dup' : ''}`}
-              style={{ color: e.tone }}
+              className={`worker-chip__disc${e.phase === 'dismissing' ? ' worker-chip__disc--out' : ''}${e.phase === 'entering' ? ' worker-chip__disc--in' : ''}${e.phase === 'arriving' ? ' worker-chip__disc--arriving' : ''}${isDup ? ' worker-chip__disc--dup' : ''}`}
+              style={{ color: e.agent.tone }}
             >
-              {personaIcon(e.persona)}
+              {personaIcon(e.agent.persona)}
             </span>
           </button>
         );
@@ -2410,9 +2644,11 @@ function ClockDial({ cx, cy, capR, rimD, uiScale, queueValue, flip, animate }: {
   );
 }
 
-function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true }: {
-  count: number; uiScale: number; gap: number; pitch: number; inset: number; split: number;
+function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true, onFinishLeft, onFinishRight }: {
+  leftRoster: Agent[]; rightRoster: Agent[]; pendingIds: ReadonlySet<string>;
+  uiScale: number; gap: number; pitch: number; inset: number; split: number;
   variant?: 'compass' | 'clock'; queueValue?: number; flip?: boolean; animate?: boolean;
+  onFinishLeft?: ((spec: WorkerFinishSpec) => void) | undefined; onFinishRight?: ((spec: WorkerFinishSpec) => void) | undefined;
 }) {
   // Crossbar + hourglass shape is LOCKED — read straight from the frozen constants.
   // The by-eye dev-tuning sliders and the `shape` prop have been retired.
@@ -2571,6 +2807,18 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
     // stroke covers only the top edge + inner taper + outer cap (no double line).
     const bandSegs: string[] = [];
     const edgeSegs: string[] = [];
+    // Idle-variant (clock/flip) transplant of the footer's RIGHT-side gold tip. In SVG
+    // space the right tip is this LEFT lobe (the 180° host flip swings it right); its
+    // gold edge sits ABOVE the crossbar here and so hangs BELOW the bar once flipped.
+    // We keep the right lobe (the clock cap) verbatim and, separately, a copy of the
+    // left-lobe edge reflected across the bar so the idle variant can render it on the
+    // OTHER side of the crossbar (the mockup's pink outline) and drop the original.
+    const edgeSegsRight: string[] = []; // right lobe only (clock/compass cap side)
+    const edgeSegsLeftMirror: string[] = []; // left-lobe edge, mirrored across the bar
+    // Same right/left-mirror split for the translucent band FILL, so the idle variant's
+    // filled leaf follows its mirrored gold line above the bar instead of hanging below.
+    const bandSegsRight: string[] = []; // right lobe fill only (clock/compass cap side)
+    const bandSegsLeftMirror: string[] = []; // left-lobe fill, mirrored across the bar
     const capStarts: number[] = []; // each lobe's outer terminus — where the cap begins
     // The RHS cap bulge (right lobe's rounded outer end) hosts the compass dial: a
     // semicircle of radius r whose centre of curvature is (xOuter, midY). Captured in
@@ -2629,11 +2877,12 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
       const outBotY = crossY(xOuter);
       // Top-edge polyline (outer → tip) and bottom-bar polyline (tip → outer).
       const nSeg = Math.max(2, Math.round(Math.abs(xTip - xOuter) / step));
-      const topC: string[] = [], botC: string[] = [];
+      const topC: string[] = [], botC: string[] = [], mTopC: string[] = [];
       for (let i = 0; i <= nSeg; i++) {
         const t = i / nSeg;
         const xt = xOuter + (xTip - xOuter) * t;
         topC.push(`${f(xt)},${f(topEdgeY(xt))}`);
+        mTopC.push(`${f(xt)},${f(2 * crossY(xt) - topEdgeY(xt))}`); // reflected across the bar
         const xb2 = xTip + (xOuter - xTip) * t;
         botC.push(`${f(xb2)},${f(crossY(xb2))}`);
       }
@@ -2648,9 +2897,34 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
         `M${f(xOuter)},${f(outBotY)} ${arc} ${topC[0]} ` +
         `${topC.slice(1).map((c) => `L${c}`).join(' ')} ${cubic}`,
       );
+      // Split per lobe for the idle variant: the RIGHT lobe (clock cap) is kept as-is;
+      // the LEFT lobe (footer's right tip) gets a copy reflected across the crossbar —
+      // same arc/edge/nose, y → 2·crossY(x) − y, so it lands on the pink outline above
+      // the bar. The reflection flips the cap arc's sweep and the outer point sits on
+      // the bar (outBotY === crossY(xOuter)) so it stays the mirror's anchor.
+      if (xOuter < xCtr) {
+        const mArc = `A${f(r)},${f(r)} 0 0 ${1 - sweep}`;
+        const mCubic = `C${f(c1x)},${f(2 * crossY(c1x) - c1y)} ${f(c2x)},${f(2 * crossY(c2x) - c2y)} ${f(xTip)},${f(crossY(xTip))}`;
+        edgeSegsLeftMirror.push(
+          `M${f(xOuter)},${f(outBotY)} ${mArc} ${mTopC[0]} ` +
+          `${mTopC.slice(1).map((c) => `L${c}`).join(' ')} ${mCubic}`,
+        );
+        // Fill mirrored the same way: reflected top edge above, the bottom bar (on
+        // crossY, so it reflects onto itself) below, closed by the sweep-flipped cap.
+        bandSegsLeftMirror.push(
+          `M${mTopC[0]} ${mTopC.slice(1).map((c) => `L${c}`).join(' ')} ${mCubic} ` +
+          `${botC.slice(1).map((c) => `L${c}`).join(' ')} ${mArc} ${mTopC[0]} Z`,
+        );
+      } else {
+        edgeSegsRight.push(edgeSegs[edgeSegs.length - 1]);
+        bandSegsRight.push(bandSegs[bandSegs.length - 1]);
+      }
     }
     const bandD = bandSegs.join(' ');
+    const bandIdleD = [...bandSegsRight, ...bandSegsLeftMirror].join(' '); // idle: right fill + mirrored tip fill
     const edgeD = edgeSegs.join(' ');
+    const edgeRightD = edgeSegsRight.join(' '); // idle: everything but the mirrored tip
+    const edgeLeftMirrorD = edgeSegsLeftMirror.join(' '); // idle: the tip mirrored up
     // The visible bottom line runs ONLY between the outermost cap-starts (the caps
     // close each end), so it never pokes out past a cap. "Go until touching the cap"
     // is symmetric — the left/right asymmetry lives entirely in the per-side inset.
@@ -2716,7 +2990,11 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
     return {
       barD,
       edgeD,
+      edgeRightD,
+      edgeLeftMirrorD,
       bandD,
+      bandIdleD,
+      crossY, // idle chips hang parallel to the crossbar (baseline), not the taper floor
       hourD,
       sections,
       compass,
@@ -2725,9 +3003,31 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
     };
   }, [geo, uiScale, gap, inset, split, shape]);
 
-  // Split the depth half/half — left queue takes the odd chip.
-  const leftCount = Math.ceil(count / 2);
-  const rightCount = Math.floor(count / 2);
+  // Left and right are now INDEPENDENT — each side carries its own count (no more
+  // ceil/floor split of a shared total). They still share the rail + column geometry.
+  const count = leftRoster.length + rightRoster.length;
+  // Idle arrivals append at the deepest slot; worker births emerge at the centre.
+  const insertMode: 'center' | 'tail' = variant === 'clock' ? 'tail' : 'center';
+
+  // Idle chip baseline — split per column because only ONE side has a clock to wrap.
+  // Everything (rail + chips) shares one pre-flip SVG space that then rotates 180°, so
+  // lower-on-screen == the SMALLER pre-flip y → Math.min picks the lower line.
+  //
+  // Clock column (side=+1, SVG-right lobe xOuter>xCtr → reads screen-LEFT): follow
+  // whichever line is lower between the crossbar-parallel drop and the chip's own floor.
+  // In the centre the crossbar drop wins (clean parallel hang below the bar); out toward
+  // the clock cap the floor dips lower and wins, so the dials wrap the OUTSIDE of the
+  // clock — the operator-approved look.
+  const idleBaselineClock = rail
+    ? (x: number, floorY: number): number => Math.min(rail.crossY(x) - IDLE_CHIP_DROP_PX * uiScale, floorY)
+    : undefined;
+  // Tip column (side=−1, mirrored tip, screen-RIGHT): NO clock here, so the floor term
+  // would only drag chips down the taper (a phantom "divot"). Pure crossbar-parallel bow,
+  // no floorY — plus a static extra drop so the tip column hangs a touch lower on screen
+  // than the clock column (IDLE_TIP_EXTRA_DROP_PX; more subtraction ⇒ lower on screen).
+  const idleBaselineTip = rail
+    ? (x: number): number => rail.crossY(x) - (IDLE_CHIP_DROP_PX + IDLE_TIP_EXTRA_DROP_PX) * uiScale
+    : undefined;
 
   return (
     <div className={`worker-queues${flip ? ' worker-queues--flip' : ''}`} ref={wrapRef}
@@ -2738,13 +3038,23 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
         <svg className="worker-rail" width={W} height="100%" aria-hidden>
           {/* Table-lip fill — the ribbon interior between the dial-hugging top edge and
               the symmetric bottom bar. Drawn first (behind glow + strokes). */}
-          <path className="worker-rail__band" d={rail.bandD} style={{ fillOpacity: shape.bandFill }} />
+          <path className="worker-rail__band" d={variant === 'clock' ? rail.bandIdleD : rail.bandD} style={{ fillOpacity: shape.bandFill }} />
           {/* reservist glow — behind the gold lines so the strokes read on top. Same
               Segment renderer the lemon persona sections use. */}
           <SegmentGlowLayer segments={rail.sections} idPrefix="hour" blur={9 * uiScale} rimW={11 * uiScale} />
           <path className="worker-rail__line" d={rail.stemD} />
           <path className="worker-rail__line" d={rail.barD} />
-          <path className="worker-rail__line" d={rail.edgeD} />
+          {/* Worker band: the full edge (both lobes) verbatim. Idle band: the right
+              lobe (clock cap) plus the LEFT-lobe tip mirrored ABOVE the bar — the
+              original below-bar tip is dropped (see the rail memo's mirror split). */}
+          {variant === 'clock' ? (
+            <>
+              <path className="worker-rail__line" d={rail.edgeRightD} />
+              <path className="worker-rail__line" d={rail.edgeLeftMirrorD} />
+            </>
+          ) : (
+            <path className="worker-rail__line" d={rail.edgeD} />
+          )}
           <path className="worker-rail__line" d={rail.hourD} />
           {/* Instrument inscribed in the RHS cap bulge — on top of the rail lines.
               The compass (mid-page status read) or the clock (idle-worker-queue). */}
@@ -2755,8 +3065,10 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
           )}
         </svg>
       )}
-      <WorkerColumn side={-1} count={leftCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} />
-      <WorkerColumn side={1} count={rightCount} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} />
+      <WorkerColumn side={-1} roster={leftRoster} pendingIds={pendingIds} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} insertMode={insertMode} onFinish={onFinishLeft}
+        baseline={variant === 'clock' && rail ? idleBaselineTip : undefined} />
+      <WorkerColumn side={1} roster={rightRoster} pendingIds={pendingIds} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} insertMode={insertMode} onFinish={onFinishRight}
+        baseline={variant === 'clock' && rail ? idleBaselineClock : undefined} />
     </div>
   );
 }
@@ -2767,15 +3079,18 @@ function WorkerQueues({ count, uiScale, gap, pitch, inset, split, variant = 'com
 // (cap swings LEFT, chips hang BELOW the bar), with the clock inscribed in the cap
 // instead of the compass. The clock face counter-rotates to stay upright. Chips
 // The clock face (numeral fill) is DECOUPLED from the chip count: `clockValue`
-// (0–6, its own placeholder demo source) drives the numerals, `idleCount` drives
-// the chips (unbounded — grows up the ditches and is meant to clobber above).
-function IdleWorkerQueue({ clockValue, idleCount, uiScale, animate }: {
-  clockValue: number; idleCount: number; uiScale: number; animate: boolean;
+// (0–6, its own placeholder demo source) drives the numerals, `idleLeft`/`idleRight`
+// drive the per-side chips (each grows up its ditch, independent of the other side).
+function IdleWorkerQueue({ clockValue, idleLeft, idleRight, pendingIds, uiScale, animate }: {
+  clockValue: number; idleLeft: Agent[]; idleRight: Agent[]; pendingIds: ReadonlySet<string>;
+  uiScale: number; animate: boolean;
 }) {
+  const total = idleLeft.length + idleRight.length;
   return (
     <section className="idle-worker-queue"
-      aria-label={`Idle worker queue — ${idleCount} idle worker${idleCount === 1 ? '' : 's'}`}>
-      <WorkerQueues count={idleCount} uiScale={uiScale}
+      aria-label={`Idle worker queue — ${total} idle worker${total === 1 ? '' : 's'}`}>
+      {/* Idle is TERMINAL this pass (no idle→worker edge), so no onFinish — clicks inert. */}
+      <WorkerQueues leftRoster={idleLeft} rightRoster={idleRight} pendingIds={pendingIds} uiScale={uiScale}
         gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
         variant="clock" queueValue={clockValue} flip animate={animate} />
     </section>
@@ -2842,7 +3157,7 @@ const LEMON_DEPTH = 108;
 // only convenience for the shape-finding knobs — the dialed-in values reload
 // instead of snapping back to defaults. Removed with the rest of the debug infra
 // when the layout is frozen. SSR/blocked-storage safe (falls back to `initial`).
-function usePersistedNumber(key: string, initial: number): [number, (v: number) => void] {
+function usePersistedNumber(key: string, initial: number): [number, React.Dispatch<React.SetStateAction<number>>] {
   const [v, setV] = useState<number>(() => {
     try {
       const raw = localStorage.getItem(`ops-mock:${key}`);
@@ -2950,6 +3265,247 @@ function PlaceLayer({
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// FLIGHT OVERLAY — one full-bleed layer above the queues that carries an agent's
+// identity between them. Mirrors PlaceLayer's fixed inset:0 pattern, so its frame is
+// viewport px (== the frame getBoundingClientRect returns) → the SVG path `d` needs
+// no offset math. Each in-flight chip reuses the .worker-chip__disc chrome so it
+// reads identically to a chip at any size along the shrink/grow.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// One self-managing flight, driven by the Web Animations API. offset-path is set
+// statically (inline); the WAAPI animates offset-distance 0%→100% + the size shrink/
+// grow in lockstep. WAAPI is used over a CSS transition because transitioning
+// `offset-distance` on a `path()` is unreliable (no start-value baseline unless the 0%
+// frame is painted first — which StrictMode's mount/rAF interleaving defeats). It
+// resolves EXACTLY once, on `finish`, with a timeout fallback; StrictMode's double
+// mount cancels the first animation and the re-run drives the real one.
+function FlightChip({ flight, onLand }: { flight: Flight; onLand: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const landed = useRef(false);
+  useEffect(() => {
+    const el = ref.current;
+    const land = () => {
+      if (landed.current) return;
+      landed.current = true;
+      onLand();
+    };
+    if (!el || typeof el.animate !== 'function') {
+      land();
+      return;
+    }
+    const anim = el.animate(
+      [
+        { offsetDistance: '0%', width: `${flight.sizeFrom}px`, height: `${flight.sizeFrom}px` },
+        { offsetDistance: '100%', width: `${flight.sizeTo}px`, height: `${flight.sizeTo}px` },
+      ],
+      { duration: flight.durationMs, easing: FLIGHT_EASE, fill: 'forwards' },
+    );
+    anim.onfinish = land;
+    const t = window.setTimeout(land, flight.durationMs + 60); // belt-and-suspenders
+    return () => {
+      clearTimeout(t);
+      anim.cancel();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return (
+    <div
+      ref={ref}
+      className="flight-chip"
+      style={{
+        width: flight.sizeFrom,
+        height: flight.sizeFrom,
+        offsetPath: `path("${flight.d}")`,
+        offsetDistance: '0%',
+        color: flight.tone,
+      } as React.CSSProperties}
+    >
+      <span className="worker-chip__disc">{personaIcon(flight.persona)}</span>
+    </div>
+  );
+}
+
+function FlightLayer({ flights, onLand }: { flights: Flight[]; onLand: (f: Flight) => void }) {
+  return (
+    <div className="flight-layer" aria-hidden>
+      {flights.map((f) => (
+        <FlightChip key={f.id} flight={f} onLand={() => onLand(f)} />
+      ))}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LIFECYCLE CONTROLLER — the single owner of the five rosters + the flight overlay.
+// Replaces the six per-queue count knobs. Mints an Agent once at worker birth and
+// weaves it worker → TTS → idle; each edge does source-removal + destination-insert
+// (INVISIBLE 'arriving' while pending) + a rendered-then-measured flight. Under
+// reduced motion it short-circuits to synchronous handoffs (no flight, immediate
+// reveal). Rosters are NOT persisted (a design-study reload resets to the seed —
+// avoids stale-identity reload bugs).
+// ═══════════════════════════════════════════════════════════════════════════
+function useLifecycle(uiScale: number, reducedMotion: boolean) {
+  const seqRef = useRef(0);
+  const mint = (side: OriginSide): Agent => {
+    const n = seqRef.current++;
+    const persona = WORKER_PERSONAS[n % WORKER_PERSONAS.length];
+    const tone = WORKER_TONES[n % WORKER_TONES.length];
+    return { id: `ag-${n}`, persona, tone, originSide: side, item: workerPersonaToTtsItem(persona) };
+  };
+
+  // Seed: 4·4 workers, empty TTS/idle. (mint() runs left-then-right at init.)
+  const [workerLeft, setWorkerLeft] = useState<Agent[]>(() => Array.from({ length: 4 }, () => mint(-1)));
+  const [workerRight, setWorkerRight] = useState<Agent[]>(() => Array.from({ length: 4 }, () => mint(1)));
+  const [ttsAgents, setTtsAgents] = useState<Agent[]>([]);
+  const [idleLeft, setIdleLeft] = useState<Agent[]>([]);
+  const [idleRight, setIdleRight] = useState<Agent[]>([]);
+  const [flights, setFlights] = useState<Flight[]>([]);
+  const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set<string>());
+
+  // Fresh reads for async closures (measurement fires a frame after the click).
+  const uiScaleRef = useRef(uiScale);
+  uiScaleRef.current = uiScale;
+  const reducedRef = useRef(reducedMotion);
+  reducedRef.current = reducedMotion;
+
+  // rAF + timeout ids tracked for unmount/HMR cleanup (mirrors the queue components).
+  const rafs = useRef<number[]>([]);
+  const timers = useRef<number[]>([]);
+  useEffect(() => () => {
+    rafs.current.forEach((id) => cancelAnimationFrame(id));
+    timers.current.forEach((id) => clearTimeout(id));
+  }, []);
+  const raf = (fn: FrameRequestCallback) => {
+    const id = requestAnimationFrame(fn);
+    rafs.current.push(id);
+    return id;
+  };
+
+  const addPending = (id: string) =>
+    setPendingIds((prev) => {
+      const n = new Set(prev);
+      n.add(id);
+      return n;
+    });
+  const removePending = (id: string) =>
+    setPendingIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const n = new Set(prev);
+      n.delete(id);
+      return n;
+    });
+
+  // Land a flight: reveal its (invisible) destination agent and drop the flight in
+  // the SAME commit → the real chip snaps in at its current slot in ≤1 frame.
+  const landFlight = (f: Flight) => {
+    removePending(f.destId);
+    setFlights((prev) => prev.filter((x) => x.id !== f.id));
+  };
+
+  // Render-then-measure: after the 'arriving' insert commits, read the invisible
+  // destination node's rect (flip-correct for idle) and build the flight. The insert
+  // lands via a passive effect (after paint), so we POLL a few frames for the node
+  // rather than assuming one; give up (reveal in place, no flight) if it never appears.
+  const spawnFlightToAgent = (
+    destId: string,
+    scopeSel: string,
+    build: (destVp: { x: number; y: number }) => void,
+    attempt = 0,
+  ) => {
+    raf(() => {
+      const c = agentNodeCenter(destId, scopeSel);
+      if (c) {
+        build(c);
+        return;
+      }
+      if (attempt >= 5) {
+        removePending(destId); // never measured — reveal without a flight
+        return;
+      }
+      spawnFlightToAgent(destId, scopeSel, build, attempt + 1);
+    });
+  };
+
+  const pushFlight = (f: Flight) => setFlights((prev) => [...prev, f]);
+
+  // ── worker births ──────────────────────────────────────────────────────────
+  const addWorker = (side: OriginSide) => {
+    const cur = side < 0 ? workerLeft : workerRight;
+    if (cur.length >= MAX_WORKER_COUNT) return;
+    const a = mint(side);
+    (side < 0 ? setWorkerLeft : setWorkerRight)((prev) => [...prev, a]);
+  };
+
+  // ── edge A: worker → TTS ─────────────────────────────────────────────────────
+  const finishWorker = (spec: WorkerFinishSpec) => {
+    const { agent, side, armPolylineVp } = spec;
+    // Source removal (instant — no dismiss fade; the flight is the exit).
+    (side < 0 ? setWorkerLeft : setWorkerRight)((prev) => prev.filter((a) => a.id !== agent.id));
+    // Destination insert (deepest TTS slot).
+    setTtsAgents((prev) => [...prev, agent]);
+    if (reducedRef.current) return; // synchronous handoff — appears at its TTS slot at once
+    addPending(agent.id); // render it INVISIBLE until the flight lands
+    // Right-side routing hook: 'own' rides its own arm to its own corner (default);
+    // 'left' collapses the right side to a straight pop from the click point (a stand-in
+    // until real "route to the left corner first" geometry is wired). Left always rides
+    // its own short arm.
+    const useOwnArm = TTS_FEED_CORNER === 'own' || side < 0;
+    const armVp = useOwnArm ? armPolylineVp : [armPolylineVp[0]];
+    spawnFlightToAgent(agent.id, '.tts-stack', (destVp) => {
+      pushFlight({
+        id: `fl-${agent.id}-a`,
+        destId: agent.id,
+        persona: agent.persona,
+        tone: agent.tone,
+        d: pointsToPath([...armVp, destVp]),
+        sizeFrom: WORKER_CHIP_PX * uiScaleRef.current,
+        sizeTo: TTS_DIAL_PX * uiScaleRef.current,
+        durationMs: FLIGHT_WORKER_TTS_MS,
+      });
+    });
+  };
+
+  // ── edge B: TTS → idle ───────────────────────────────────────────────────────
+  const finishTts = (agent: Agent, headRectVp: { x: number; y: number } | null) => {
+    // Source removal (roster drop → TtsStack fades + shuffles up).
+    setTtsAgents((prev) => prev.filter((a) => a.id !== agent.id));
+    // Destination insert on the ORIGIN side (same-side return, guaranteed by originSide).
+    (agent.originSide < 0 ? setIdleLeft : setIdleRight)((prev) => [...prev, agent]);
+    if (reducedRef.current) return; // synchronous handoff
+    addPending(agent.id);
+    spawnFlightToAgent(agent.id, '.idle-worker-queue', (destVp) => {
+      const head = headRectVp ?? destVp;
+      pushFlight({
+        id: `fl-${agent.id}-b`,
+        destId: agent.id,
+        persona: agent.persona,
+        tone: agent.tone,
+        d: pointsToPath([head, destVp]),
+        sizeFrom: TTS_DIAL_PX * uiScaleRef.current,
+        sizeTo: WORKER_CHIP_PX * uiScaleRef.current,
+        durationMs: FLIGHT_TTS_IDLE_MS,
+      });
+    });
+  };
+
+  // Derived: clock numerals track idle depth (0–6), no longer a manual knob.
+  const clockValue = Math.min(6, idleLeft.length + idleRight.length);
+
+  return {
+    workerLeft, workerRight, ttsAgents, idleLeft, idleRight, flights, pendingIds, clockValue,
+    addWorker, finishWorker, finishTts, landFlight,
+  };
+}
+
+// Join viewport-px points into an SVG path `d` string (M … L … L …).
+function pointsToPath(pts: { x: number; y: number }[]): string {
+  if (!pts.length) return '';
+  let d = `M${pts[0].x.toFixed(1)},${pts[0].y.toFixed(1)}`;
+  for (let i = 1; i < pts.length; i++) d += ` L${pts[i].x.toFixed(1)},${pts[i].y.toFixed(1)}`;
+  return d;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 export function MockOpsCockpit() {
   const [dialCount, setDialCount] = usePersistedNumber('dialCount', initialDialCount);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -2957,18 +3513,10 @@ export function MockOpsCockpit() {
   const [fracTop, setFracTop] = usePersistedNumber('fracTop', 4); // big-dial numerator (focus)
   const [fracBot, setFracBot] = usePersistedNumber('fracBot', 1); // big-dial denominator (distraction)
   const [breakMin, setBreakMin] = usePersistedNumber('breakMin', 0); // break-timer elapsed minutes
-  // TTS-queue depth — mirrors "State-dial density": drives how many of the left
-  // stack's queue dials render, so the study can show the queue growing/shrinking.
-  const [ttsDepth, setTtsDepth] = usePersistedNumber('ttsDepth', initialTtsDepth);
-  // Worker-queue depth — total chips across the two "M" stacks below the lemon (the
-  // 6 persona icons in the lemon are a fixed roster, not a knob). The old lemon
-  // width/depth knobs are retired: the lemon is locked (see LEMON_WIDTH_INSET / DEPTH).
-  const [workerCount, setWorkerCount] = usePersistedNumber('workerCount', 8);
-  // Idle-worker-queue — TWO decoupled demo sources now that the clock is only a
-  // placeholder test fixture: `clockValue` (0–6) drives the clock numeral fill, and
-  // `idleCount` (0–MAX_IDLE_COUNT) drives the chips that climb up the edge ditches.
-  const [clockValue, setClockValue] = usePersistedNumber('clockValue', 4);
-  const [idleCount, setIdleCount] = usePersistedNumber('idleCount', 4);
+  // The three queues are now ONE woven lifecycle, owned by useLifecycle (instantiated
+  // after uiScale below): workers finishing feed TTS; TTS dials finishing feed idle.
+  // TTS depth, idle depth, and the clock value are all DERIVED — the only manual knob
+  // left is "add worker left/right". Rosters are not persisted (reset to seed on reload).
   const reducedMotion = usePrefersReducedMotion();
   // Worker-queue positioning is locked (W_DROP_PX / W_SPACE_PX / W_INSET_PX / W_SPLIT_PX)
   // and fed straight to WorkerQueues — the by-eye tuning sliders are retired.
@@ -3019,6 +3567,9 @@ export function MockOpsCockpit() {
   // instrument length downstream multiplies by this; published raw as --ui-scale so
   // CSS text/insets scale generically too.
   const uiScale = clamp(scaleMin, vp.w / DESIGN_W, 1);
+  // The woven worker → TTS → idle lifecycle. Instantiated here so it can read the
+  // derived uiScale (flight sizes) + reduced-motion preference.
+  const life = useLifecycle(uiScale, reducedMotion);
   // The timer band tracks the cluster: same coherent factor as everything else,
   // optionally softened via GRAPH_SHRINK. uiScale === 1 ⇒ graphScale === 1, so
   // desktop stays pixel-identical. This is the ONE tuning point for the midline.
@@ -3118,18 +3669,23 @@ export function MockOpsCockpit() {
       {/* floating radial dials — fixed to the viewport corner, follow scroll */}
       <Dials count={dialCount} onOpenDrawer={openDrawer} uiScale={uiScale} />
 
-      {/* left-side TTS-queue stack — the top-left mirror of the status fan,
-          sharing the Dial/.ring chrome + geometry core, fed a queue model */}
-      <TtsStack depth={ttsDepth} onOpenDrawer={openDrawer} uiScale={uiScale} />
+      {/* left-side TTS-queue stack — roster-driven, fed by workers finishing. Click a
+          dial to play it; at its terminal it flies out to the idle rail (edge B). */}
+      <TtsStack agents={life.ttsAgents} pendingIds={life.pendingIds} onOpenDrawer={openDrawer}
+        onTtsFinish={life.finishTts} uiScale={uiScale} />
 
-      {/* worker queues — two icon-chip stacks below the lemon that grow outward
-          from centre then trail down the two edges (a soft "M"). Fed by the
-          Workers slider; click a chip to pop it and reflow the rest up-path. */}
-      <WorkerQueues count={workerCount} uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX} />
+      {/* worker queues — two icon-chip stacks below the lemon that grow outward from
+          centre then trail down the two edges (a soft "M"). Add via the demobar; click a
+          chip to FINISH it — it shrinks + rides its rail to the ditch corner + pops to
+          the TTS stack bottom (edge A). */}
+      <WorkerQueues leftRoster={life.workerLeft} rightRoster={life.workerRight} pendingIds={life.pendingIds}
+        uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
+        onFinishLeft={life.finishWorker} onFinishRight={life.finishWorker} />
 
-      {/* idle worker queue — the flipped bottom rail whose clock encodes idle-queue
-          depth by numeral colour (design study; below the first-screen composition) */}
-      <IdleWorkerQueue clockValue={clockValue} idleCount={idleCount} uiScale={uiScale} animate={!reducedMotion} />
+      {/* idle worker queue — the flipped bottom rail. Fed by TTS dials finishing (edge B);
+          the clock numerals now DERIVE from idle depth. Terminal this pass (clicks inert). */}
+      <IdleWorkerQueue clockValue={life.clockValue} idleLeft={life.idleLeft} idleRight={life.idleRight}
+        pendingIds={life.pendingIds} uiScale={uiScale} animate={!reducedMotion} />
 
       {/* dials drawer — where the default dial click lands (minimal stub) */}
       <DialsDrawer open={drawerOpen} focusedId={focusedDial} onClose={() => setDrawerOpen(false)} />
@@ -3149,6 +3705,10 @@ export function MockOpsCockpit() {
           timer/arc, below the demobar. Inert unless Place mode is on, at which
           point clicks drop TTS-sized numbered rings whose (x, y) are captured. */}
       <PlaceLayer active={placeMode} placed={placed} onDrop={dropDial} />
+
+      {/* flight overlay — carries an agent's identity between queues (worker → TTS →
+          idle). Fixed inset:0, above idle/place, below the demobar. */}
+      <FlightLayer flights={life.flights} onLand={life.landFlight} />
 
       {/* demo control (mockup only) — pinned so it stays reachable while scrolling.
           Collapses to a toggle under the narrow breakpoint (see the RESPONSIVE
@@ -3172,30 +3732,14 @@ export function MockOpsCockpit() {
             onChange={(e) => setDialCount(Number(e.target.value))} />
           <EditableNum value={dialCount} onCommit={setDialCount} />
         </label>
-        <label className="demobar__slider">
-          TTS queue depth
-          <input type="range" min={0} max={MAX_TTS_DEPTH} value={ttsDepth}
-            onChange={(e) => setTtsDepth(Number(e.target.value))} />
-          <EditableNum value={ttsDepth} onCommit={setTtsDepth} />
-        </label>
-        <label className="demobar__slider">
-          Workers
-          <input type="range" min={0} max={MAX_WORKER_COUNT} value={workerCount}
-            onChange={(e) => setWorkerCount(Number(e.target.value))} />
-          <EditableNum value={workerCount} onCommit={setWorkerCount} />
-        </label>
-        <label className="demobar__slider">
-          Idle workers
-          <input type="range" min={0} max={MAX_IDLE_COUNT} value={idleCount}
-            onChange={(e) => setIdleCount(Number(e.target.value))} />
-          <EditableNum value={idleCount} onCommit={setIdleCount} />
-        </label>
-        <label className="demobar__slider">
-          Clock value
-          <input type="range" min={0} max={6} value={clockValue}
-            onChange={(e) => setClockValue(Number(e.target.value))} />
-          <EditableNum value={clockValue} onCommit={setClockValue} />
-        </label>
+        {/* ONLY manual queue knob left: add a worker on either side. TTS depth is fed by
+            workers finishing (click a worker chip); idle depth is fed by TTS dials
+            finishing (click a dial); the clock numerals derive from idle depth. */}
+        <span className="demobar__adds" aria-label={`Workers left ${life.workerLeft.length}, right ${life.workerRight.length} · TTS ${life.ttsAgents.length} · idle ${life.idleLeft.length}·${life.idleRight.length}`}>
+          <span className="demobar__addlabel">Workers <b>{life.workerLeft.length}·{life.workerRight.length}</b> → TTS <b>{life.ttsAgents.length}</b> → Idle <b>{life.idleLeft.length}·{life.idleRight.length}</b></span>
+          <button className="demobar__addbtn" onClick={() => life.addWorker(-1)} disabled={life.workerLeft.length >= MAX_WORKER_COUNT}>+ worker left</button>
+          <button className="demobar__addbtn" onClick={() => life.addWorker(1)} disabled={life.workerRight.length >= MAX_WORKER_COUNT}>+ worker right</button>
+        </span>
         <label className="demobar__slider">
           Break time
           <input type="range" min={-BREAK_MAX_MIN} max={BREAK_MAX_MIN} step={1} value={breakMin}

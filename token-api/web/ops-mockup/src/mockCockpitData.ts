@@ -219,6 +219,27 @@ export const ttsQueue: MockTtsItem[] = FACTION_PERSONAS.map((persona, i) => {
   };
 });
 
+// Synthesize a TTS-queue item from a bare worker persona — the one place the
+// lifecycle controller mints the utterance a finished worker carries into the TTS
+// stack. Mirrors the `ttsQueue` map above (same text/route/senderName derivation)
+// so a worker-born dial is indistinguishable from a seeded one. `status: 'queued'`
+// (it enters the tail, waiting its turn); order/position are driven by the roster,
+// so `posInQueue` is a stable 0 placeholder. The agent's session-global id becomes
+// the React key upstream, so `id` here need only be persona-stable.
+export function workerPersonaToTtsItem(persona: string): MockTtsItem {
+  const label = persona.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  return {
+    id: `wtts-${persona}`,
+    text: `Voiceline from ${label} on the wire.`,
+    route: `phone · ${label}`,
+    senderTmuxId: `1:${persona.charAt(0).toUpperCase()}`,
+    senderName: `${persona}-vox`,
+    persona,
+    status: 'queued',
+    posInQueue: 0,
+  };
+}
+
 // The queue-languishing threshold — a GENERIC concept that lives in the data
 // layer alongside the other enforcement events (once more than this many
 // utterances back up, the queue is "languishing"). The left stack borrows it as
