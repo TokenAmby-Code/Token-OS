@@ -572,8 +572,14 @@ async def send_prompt_to_pane(
     operation_id: str | None = None,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
+    expected_role: str | None = None,
 ) -> dict:
-    """Token-API pane prompt facade: tmuxctld is the only local byte boundary."""
+    """Token-API pane prompt facade: tmuxctld is the only local byte boundary.
+
+    ``expected_role`` carries the REQUESTED semantic address (e.g.
+    ``council:custodes``) alongside the resolved pane so the daemon can enforce
+    its byte-time singleton addressee identity gate.
+    """
     daemon_payload = await asyncio.to_thread(
         shared._tmuxctld_post_json,
         "/send-text",
@@ -583,6 +589,7 @@ async def send_prompt_to_pane(
             "clear_prompt": clear_prompt,
             "submit": submit,
             "verify": verify,
+            "expected_role": expected_role or "",
             # Two-level delivery contract: wait one initial 30-60s window for
             # the level-2 UserPromptSubmit hook, but level-1 bytes-delivered is
             # already success if the daemon send returns rc0.
@@ -5916,6 +5923,7 @@ async def enqueue_pane_write(
     operation_id: str | None = None,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
+    expected_role: str | None = None,
 ) -> dict:
     if not (tmux_pane or "").strip():
         raise ValueError("pane write requires a concrete tmux pane target")
@@ -5949,6 +5957,7 @@ async def enqueue_pane_write(
                                 "hook_driven": bool(hook_driven),
                                 "hook_echo_pane": hook_echo_pane or "",
                                 "correlation_id": correlation_id or queue_id,
+                                "expected_role": expected_role or "",
                             },
                         },
                         sort_keys=True,
@@ -5980,6 +5989,7 @@ async def enqueue_pane_write(
                 or str(existing_effects.get("hook_echo_pane") or "") != str(hook_echo_pane or "")
                 or str(existing_effects.get("correlation_id") or queue_id)
                 != str(correlation_id or queue_id)
+                or str(existing_effects.get("expected_role") or "") != str(expected_role or "")
             ):
                 raise ValueError(
                     "pane write operation_id reused for different target/payload/effects"
@@ -6076,6 +6086,7 @@ async def _tmux_send_payload_then_submit(
     operation_id: str | None = None,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
+    expected_role: str | None = None,
 ) -> dict:
     """Backward-compatible prompt send wrapper; local delivery is tmuxctld only.
 
@@ -6090,6 +6101,7 @@ async def _tmux_send_payload_then_submit(
         operation_id=operation_id,
         hook_echo_pane=hook_echo_pane,
         correlation_id=correlation_id,
+        expected_role=expected_role,
     )
 
 
@@ -6199,6 +6211,7 @@ async def process_pane_write_queue_once(
             effects = {}
         hook_echo_pane = str(effects.get("hook_echo_pane") or "")
         correlation_id = str(effects.get("correlation_id") or item["id"])
+        expected_role = str(effects.get("expected_role") or "")
         try:
             # Some system prompts clear/replace a stale composer rather than
             # deferring forever. Live symptom: leftover Codex/Claude drafts kept
@@ -6242,6 +6255,7 @@ async def process_pane_write_queue_once(
                     operation_id=item["id"],
                     hook_echo_pane=hook_echo_pane,
                     correlation_id=correlation_id,
+                    expected_role=expected_role,
                 )
             else:
                 send_result = await _tmux_send_payload_then_submit(
@@ -6250,6 +6264,7 @@ async def process_pane_write_queue_once(
                     operation_id=item["id"],
                     hook_echo_pane=hook_echo_pane,
                     correlation_id=correlation_id,
+                    expected_role=expected_role,
                 )
             if send_result.get("gated"):
                 # Gate suppressed the send (no bytes issued). Keep the item
@@ -13367,6 +13382,7 @@ async def _direct_tmux_pane_delivery(
     operation_id: str | None = None,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
+    expected_role: str | None = None,
 ) -> dict:
     """Deliver directly to a live pane when no registry row exists.
 
@@ -13402,6 +13418,7 @@ async def _direct_tmux_pane_delivery(
         operation_id=operation_id,
         hook_echo_pane=hook_echo_pane,
         correlation_id=correlation_id,
+        expected_role=expected_role,
     )
     if send_result.get("gated"):
         # Direct rowless sends have no registry row, but they still must not
@@ -13419,6 +13436,7 @@ async def _direct_tmux_pane_delivery(
             operation_id=operation_id,
             hook_echo_pane=hook_echo_pane,
             correlation_id=correlation_id,
+            expected_role=expected_role,
         )
         drained = await process_pane_write_queue_once(queued["id"])
         result = drained[0] if drained else queued
@@ -13447,6 +13465,7 @@ async def _talk_send_payload(
     hook_driven: bool = False,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
+    expected_role: str | None = None,
 ) -> dict:
     """Inject `payload` into ``target_pane`` via the existing pane-write queue.
 
@@ -13461,6 +13480,7 @@ async def _talk_send_payload(
         hook_driven=hook_driven,
         hook_echo_pane=hook_echo_pane,
         correlation_id=correlation_id,
+        expected_role=expected_role,
     )
     drained = await process_pane_write_queue_once(queued["id"])
     return drained[0] if drained else queued
@@ -13477,8 +13497,12 @@ async def talk_send(request: TalkSendRequest):
     """
     caller_raw = request.caller_pane.strip()
     target_raw = request.target_pane.strip()
-    caller_pane = await talk_service.resolve_pane(caller_raw)
-    target_pane = await talk_service.resolve_pane(target_raw)
+    try:
+        caller_pane = await talk_service.resolve_pane(caller_raw)
+        target_pane = await talk_service.resolve_pane(target_raw)
+    except talk_service.AmbiguousPaneTarget as exc:
+        # Loud non-delivery: an ambiguous semantic address reaches ZERO panes.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not caller_pane:
         raise HTTPException(
             status_code=400,
@@ -13521,6 +13545,7 @@ async def talk_send(request: TalkSendRequest):
                 hook_driven=talk_hook_driven,
                 hook_echo_pane=caller_pane,
                 correlation_id=returned["talk_id"],
+                expected_role=target_raw,
             )
             if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
@@ -13571,6 +13596,7 @@ async def talk_send(request: TalkSendRequest):
                 operation_id=record["talk_id"],
                 hook_echo_pane=caller_pane,
                 correlation_id=record["talk_id"],
+                expected_role=target_raw,
             )
             if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
@@ -13585,6 +13611,7 @@ async def talk_send(request: TalkSendRequest):
                 hook_driven=talk_hook_driven,
                 hook_echo_pane=caller_pane,
                 correlation_id=record["talk_id"],
+                expected_role=target_raw,
             )
             if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
@@ -13636,9 +13663,14 @@ async def brief_send(request: BriefSendRequest):
     # hook_driven classification: flag each target unless the SENDER is Custodes
     # (Emperor-proxied → no flag). An absent/unknown caller is not Custodes →
     # flag (agent-to-agent / system default; typing-guard still overrides).
-    caller_resolved = (
-        await talk_service.resolve_pane(request.caller_pane) if request.caller_pane else None
-    )
+    try:
+        caller_resolved = (
+            await talk_service.resolve_pane(request.caller_pane) if request.caller_pane else None
+        )
+    except talk_service.AmbiguousPaneTarget:
+        # Ambiguous CALLER identity must not block the send; fail toward the
+        # stricter hook_driven classification (unknown sender is not Custodes).
+        caller_resolved = None
     brief_hook_driven = not await _pane_sender_is_custodes(caller_resolved)
 
     resolved, unresolved = await talk_service.resolve_brief_targets(
@@ -13657,16 +13689,34 @@ async def brief_send(request: BriefSendRequest):
     delivered: list[dict] = []
     for target in resolved:
         pane_id = target["pane_id"]
+        # Scope idempotency to the REQUESTED address, not the resolved %pane: a
+        # blind retry of the same logical send whose resolution drifted to a
+        # different physical pane must reuse the same operation id, so the
+        # daemon idempotency layer collapses it (or loudly refuses the reuse)
+        # instead of double-delivering — the redelivery-storm amplifier in the
+        # custodes→malcador misroute. Page fan-outs stay unique per seat via
+        # the live position id.
+        if target.get("source") == "pane":
+            target_scope = target["spec"]
+        else:
+            target_scope = f"{target.get('spec')}:{target.get('position_id') or pane_id}"
         idempotency_key = request.idempotency_key
         if not (idempotency_key or "").strip():
             # Idempotency-by-default (issue #480 double-send): a keyless brief
-            # derives a DETERMINISTIC key from (pane, payload) so blind transport
-            # or tool retries of the same logical send collapse onto one
-            # operation_id and dedupe (tmuxctld idempotency cache on the rowless
-            # path, pane_write_queue id on the registry path). An explicit
-            # caller-provided key stays authoritative.
-            idempotency_key = f"auto:{pane_id}:{_prompt_payload_hash(request.payload)}"
-        operation_id = _scoped_send_operation_id("brief", idempotency_key, pane_id, request.payload)
+            # derives a DETERMINISTIC key from (requested target, payload) so
+            # blind transport or tool retries of the same logical send collapse
+            # onto one operation_id and dedupe (tmuxctld idempotency cache on
+            # the rowless path, pane_write_queue id on the registry path). An
+            # explicit caller-provided key stays authoritative.
+            idempotency_key = f"auto:{target_scope}:{_prompt_payload_hash(request.payload)}"
+        operation_id = _scoped_send_operation_id(
+            "brief", idempotency_key, target_scope, request.payload
+        )
+        # For --pane sends the requested spec IS the addressee; the daemon's
+        # byte-time singleton identity gate keys on it (no-op for non-singleton
+        # specs and raw %NN). Page fan-outs are addressed to the page, not a
+        # singleton seat, so they carry no expected role.
+        expected_role = target["spec"] if target.get("source") == "pane" else None
         try:
             if request.ephemeral:
                 # Reuse the temp_message semantic side-channel infra. The
@@ -13700,6 +13750,7 @@ async def brief_send(request: BriefSendRequest):
                         operation_id=operation_id,
                         hook_echo_pane=caller_resolved,
                         correlation_id=operation_id,
+                        expected_role=expected_role,
                     )
                 else:
                     queued = await enqueue_pane_write(
@@ -13712,6 +13763,7 @@ async def brief_send(request: BriefSendRequest):
                         operation_id=operation_id,
                         hook_echo_pane=caller_resolved,
                         correlation_id=operation_id,
+                        expected_role=expected_role,
                     )
                     drained = await process_pane_write_queue_once(queued["id"])
                     receipt = drained[0] if drained else queued
@@ -13739,6 +13791,7 @@ async def brief_send(request: BriefSendRequest):
                         operation_id=operation_id,
                         hook_echo_pane=caller_resolved,
                         correlation_id=operation_id,
+                        expected_role=expected_role,
                     )
                     receipt = {
                         **receipt,

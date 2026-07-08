@@ -2306,6 +2306,7 @@ def _send_text_pipeline(
     post_submit_actions: tuple[dict, ...] = (),
     hook_echo_pane: str = "",
     correlation_id: str = "",
+    expected_role: str = "",
 ) -> dict:
     if verify is None:
         verify = submit
@@ -2329,6 +2330,7 @@ def _send_text_pipeline(
     from .occupancy import (
         assert_comms_delivery_target_occupied,
         assert_dispatch_target_available,
+        assert_singleton_addressee,
         looks_like_dispatch_launcher_payload,
     )
 
@@ -2340,6 +2342,12 @@ def _send_text_pipeline(
         assert_dispatch_target_available(control.adapter, phys_pane)
     else:
         assert_comms_delivery_target_occupied(control.adapter, phys_pane)
+        # Addressee identity gate: when this send is ADDRESSED to a persona
+        # singleton (label target, or %NN pre-resolved by a caller that passes
+        # the requested label as expected_role), the pane receiving bytes must
+        # be the unique live holder of that label RIGHT NOW — resolution-time
+        # truth is not delivery-time truth (custodes→malcador misroute).
+        assert_singleton_addressee(control.adapter, expected_role or pane, phys_pane)
 
     if not submit:
         return _insert_without_submit_pipeline(
@@ -2687,6 +2695,7 @@ def _h_send_text(control, params):
         pre_submit_keys=_parse_pre_submit_keys(params.get("pre_submit_keys", ())),
         hook_echo_pane=_s(params, "hook_echo_pane") or _s(params, "caller_pane"),
         correlation_id=_s(params, "correlation_id"),
+        expected_role=_s(params, "expected_role"),
     )
 
 
@@ -4590,6 +4599,24 @@ class TmuxctldServer(ThreadingHTTPServer):
         self._binding_reconcile_lock = threading.Lock()
         self._binding_reconcile_deadline = 0.0
 
+    def maybe_warm_wrapper_ledger(self) -> bool:
+        """Retry the boot-failed tmux ledger reconcile on the /health heartbeat.
+
+        Idempotent and cheap once warmed (a single flag read). While cold the
+        ledger already fails closed (file-loaded rows are quarantined from
+        resolution), so this is purely self-healing, never correctness-bearing.
+        Returns True when a reconcile ran and warmed the ledger this call.
+        """
+        try:
+            from .wrapper_ledger import LEDGER
+
+            if LEDGER.warmed:
+                return False
+            LEDGER.reconcile_from_tmux(self.adapter_factory())
+            return LEDGER.warmed
+        except Exception:  # never let warm-up break the health contract
+            return False
+
     def maybe_reassert_lifecycle_hooks(self) -> bool:
         """Re-install the tmux lifecycle hooks if the throttle interval has elapsed.
 
@@ -4739,6 +4766,11 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             # guard PENDING-branch keys onto the running server if they drifted from
             # canonical after a deploy (throttled; idempotent; fail-open).
             self.server.maybe_reconcile_guard_bindings()
+            # A ledger left cold by a failed boot reconcile (tmux briefly away)
+            # quarantines its file-loaded rows fail-closed; ride the heartbeat to
+            # re-attempt the live scan so the daemon self-heals instead of staying
+            # resolution-degraded until a manual /reconcile. No-op once warmed.
+            self.server.maybe_warm_wrapper_ledger()
             self._write(200, self._health_payload())
             return
 
