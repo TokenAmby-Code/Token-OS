@@ -17,7 +17,9 @@ def _fake_real_tmux(tmp_path: pathlib.Path) -> pathlib.Path:
     return fake
 
 
-def test_raw_human_attach_still_routes_to_tx_tombstone(tmp_path: pathlib.Path) -> None:
+def test_raw_human_attach_still_routes_noninteractive_to_tx_tombstone(
+    tmp_path: pathlib.Path,
+) -> None:
     env = os.environ.copy()
     env["IMPERIUM_TMUX_BIN"] = str(_fake_real_tmux(tmp_path))
     env.pop("IMPERIUM_TMUX_RAW", None)
@@ -31,6 +33,7 @@ def test_raw_human_attach_still_routes_to_tx_tombstone(tmp_path: pathlib.Path) -
 
     assert proc.returncode == 1
     assert "410 GONE: cli-tools/bin/tx" in proc.stderr
+    assert "Human attach alias restored" in proc.stderr
 
 
 def test_raw_env_remains_internal_escape_hatch(tmp_path: pathlib.Path) -> None:

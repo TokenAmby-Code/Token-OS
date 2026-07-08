@@ -1,10 +1,28 @@
 #!/usr/bin/env bash
+_tx_attach_alias() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        return 1
+    fi
+    exec tmuxctld-ctl attach "$@"
+}
+
+case "${1:-}" in
+    "")
+        _tx_attach_alias
+        ;;
+    attach|start)
+        shift
+        _tx_attach_alias "$@"
+        ;;
+esac
+
 # 410 GONE tombstone: tmux CLI exterminatus 2026-06-30.
 {
     cat >&2 <<'__TMUX_410_TOMBSTONE__'
 410 GONE: cli-tools/bin/tx (tx) is tombstoned by the 2026-06-30 tmux CLI exterminatus.
 This cold tmux workspace/control wrapper must not be used as an active runtime/control path.
-Daemon-native replacement: tmuxctld-owned workspace/session/focus endpoints.
+Human attach alias restored: interactive `tx` and `tx start|attach [session]` route to `tmuxctld-ctl attach`.
+Daemon-native replacement for all other workspace/control operations: tmuxctld-owned workspace/session/focus endpoints.
 Original body is retained below this early-return as the emergency restore lever; lift only this tombstone block to prove an active blocker, build/cut over the daemon-native replacement, then restore the 410.
 __TMUX_410_TOMBSTONE__
 }
