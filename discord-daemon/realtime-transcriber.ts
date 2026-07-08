@@ -2,7 +2,7 @@
 // Streams Discord PCM frames into a persistent Realtime transcription session.
 
 import WebSocket from 'ws';
-import { isBenignFixerError } from './fixer-classify.js';
+import { isBenignFixerError } from './fixer-classify.ts';
 
 const DEFAULT_REALTIME_MODEL = 'gpt-realtime';
 const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe';

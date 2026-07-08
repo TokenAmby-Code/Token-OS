@@ -1,11 +1,12 @@
-// Bounty: the daemon consumes the shared TS contracts package.
+// The daemon consumes the shared TS contracts package.
 //
 // `@token-os/contracts` (token-api/web/contracts/) exports Zod schemas for the
 // ops read-model — the same contracts the ops cockpit compiles against. The
-// daemon gets the dep with the TS conversion (Terminus Stage 2 PR C).
+// daemon gained the dep with the TS conversion (Terminus Stage 2 PR C);
+// graduated from the bounty lane in that PR.
 
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bounty } from './bounty.js';
 
 // Minimal ops-state.v1 payload — schemas are permissive (passthrough,
 // optional-friendly), so a skeletal state must parse.
@@ -23,7 +24,7 @@ const OPS_STATE_FIXTURE = {
   },
 };
 
-bounty('@token-os/contracts exposes OpsStateSchema (Zod) that parses ops-state.v1', async () => {
+test('@token-os/contracts exposes OpsStateSchema (Zod) that parses ops-state.v1', async () => {
   const contracts = await import('@token-os/contracts');
   assert.equal(contracts.CONTRACT_VERSION, 'ops-state.v1');
   const parsed = contracts.OpsStateSchema.parse(OPS_STATE_FIXTURE);

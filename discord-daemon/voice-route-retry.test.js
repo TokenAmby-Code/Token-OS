@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   isRetryableVoiceRouteFailure,
   routeVoiceTranscriptWithRetry,
-} from './voice-route-retry.js';
+} from './voice-route-retry.ts';
 
 test('retry predicate recognizes voice route failures', () => {
   assert.equal(isRetryableVoiceRouteFailure({ routed: false, reason: 'no_target' }), true);

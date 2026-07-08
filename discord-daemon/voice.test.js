@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createVoiceManager } from './voice.js';
+import { createVoiceManager } from './voice.ts';
 
 test('voice manager status exposes Discord-only routing state', () => {
   const voiceManager = createVoiceManager(

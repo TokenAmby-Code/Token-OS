@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isBenignFixerError } from './fixer-classify.js';
+import { isBenignFixerError } from './fixer-classify.ts';
 
 test('session_expired error code is benign regardless of message', () => {
   assert.equal(isBenignFixerError('session_expired', 'anything'), true);

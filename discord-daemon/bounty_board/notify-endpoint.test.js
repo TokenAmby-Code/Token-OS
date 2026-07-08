@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { bounty } from './bounty.js';
-import { createHttpServer } from '../http-server.js';
+import { createHttpServer } from '../http-server.ts';
 
 function logger() {
   return { debug() {}, info() {}, warn() {}, error() {} };

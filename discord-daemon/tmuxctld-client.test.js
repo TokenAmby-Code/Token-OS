@@ -5,7 +5,7 @@ import {
   LONG_HOLD_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
   createTmuxctldClient,
-} from './tmuxctld-client.js';
+} from './tmuxctld-client.ts';
 
 function installFetchAndTimerRecorder() {
   const calls = [];
