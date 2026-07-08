@@ -1,7 +1,7 @@
 // transcribe.js — Audio transcription pipeline
 // Supports only the OpenAI Realtime transcription path.
 
-import { createRealtimeTranscriber } from './realtime-transcriber.js';
+import { createRealtimeTranscriber } from './realtime-transcriber.ts';
 
 /**
  * Create a transcription handler for the voice manager

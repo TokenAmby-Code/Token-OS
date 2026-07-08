@@ -7,7 +7,7 @@ import {
   isDiscordContentLengthValidationError,
   sendChunkedDiscordContent,
   splitDiscordMessageContent,
-} from './outbound-message.js';
+} from './outbound-message.ts';
 
 export function createHttpServer(
   botClients,

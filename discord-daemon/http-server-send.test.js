@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createHttpServer } from './http-server.js';
-import { DISCORD_MESSAGE_CONTENT_LIMIT } from './outbound-message.js';
+import { createHttpServer } from './http-server.ts';
+import { DISCORD_MESSAGE_CONTENT_LIMIT } from './outbound-message.ts';
 
 function logger(logs = []) {
   return {

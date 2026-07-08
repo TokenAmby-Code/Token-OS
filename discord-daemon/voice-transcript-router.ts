@@ -3,7 +3,7 @@
 // Discord remains Discord transport only. tmuxctld owns semantic target policy,
 // voice locks, draft mutation, scratch/clear, and prompt submission.
 
-import { tmuxctldClient } from './tmuxctld-client.js';
+import { tmuxctldClient } from './tmuxctld-client.ts';
 
 function normalizeBot(botName) {
   return String(botName || 'unknown').trim().toLowerCase().replaceAll('-', '_');

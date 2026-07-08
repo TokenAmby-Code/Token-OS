@@ -18,7 +18,7 @@ import { Transform } from 'stream';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { Events } from 'discord.js';
-import { tmuxctldClient } from './tmuxctld-client.js';
+import { tmuxctldClient } from './tmuxctld-client.ts';
 import prism from 'prism-media';
 
 const execFileAsync = promisify(execFile);

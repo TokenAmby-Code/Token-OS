@@ -746,6 +746,54 @@ refresh_ops_bundle_unlocked() {
     return 1
 }
 
+discord_deps_refresh_needed_for_paths() {
+    local changed_paths="$1" path
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        case "$path" in
+            # Dependency manifests only — daemon code changes don't need an
+            # install. Contracts changes count: the daemon consumes
+            # @token-os/contracts via a file: dep and resolves zod through the
+            # contracts package's real path.
+            discord-daemon/package.json | discord-daemon/package-lock.json | token-api/web/contracts/*) return 0 ;;
+        esac
+    done <<< "$changed_paths"
+    return 1
+}
+
+refresh_discord_daemon_deps_unlocked() {
+    # The daemon's node_modules was hand-managed historically; with the daemon
+    # on @token-os/contracts (+ zod) a dependency change that lands WITHOUT an
+    # install is a guaranteed crash-loop on stale deps. Fail the deploy loudly
+    # instead — a dead deploy is recoverable, a crash-looping daemon is not.
+    local dir="$1" daemon_dir="${dir}/discord-daemon"
+    if ! command -v npm >/dev/null 2>&1; then
+        echo -e "  ${RED}✗${NC} CD-sync: discord-daemon deps refresh required but npm is not available"
+        return 1
+    fi
+    [[ -d "$daemon_dir" ]] || return 0
+
+    # The daemon resolves zod through the contracts package's real path, so the
+    # contracts install must exist even when the ops refresh didn't run this
+    # deploy (idempotent if it did).
+    local contracts_dir="${dir}/token-api/web/contracts"
+    if [[ -d "$contracts_dir" ]]; then
+        echo -e "${BLUE}→${NC} CD-sync: installing shared contracts deps (daemon consumer)..."
+        if ! (cd "$contracts_dir" && npm ci --no-audit --no-fund); then
+            echo -e "  ${RED}✗${NC} CD-sync: contracts npm ci failed; aborting before Discord daemon restart"
+            return 1
+        fi
+    fi
+
+    echo -e "${BLUE}→${NC} CD-sync: installing discord-daemon deps..."
+    if (cd "$daemon_dir" && npm ci --no-audit --no-fund); then
+        echo -e "  ${GREEN}✓${NC} CD-sync: discord-daemon deps installed"
+        return 0
+    fi
+    echo -e "  ${RED}✗${NC} CD-sync: discord-daemon npm ci failed; aborting before Discord daemon restart"
+    return 1
+}
+
 sync_bare_main() {
     # Reconciler park-sweep (incident 2026-06-22): any agent worktree left checked
     # out *on* main/master pins the branch ref and jams the bare-main fast-forward
@@ -956,6 +1004,10 @@ _sync_live_checkout_unlocked() {
     if [[ "$ops_bundle_dirt" == true ]] || ops_refresh_needed_for_paths "$changed_paths"; then
         SYNC_OPS_REFRESH_REQUIRED=true
         refresh_ops_bundle_unlocked "$dir" || return 1
+    fi
+
+    if discord_deps_refresh_needed_for_paths "$changed_paths"; then
+        refresh_discord_daemon_deps_unlocked "$dir" || return 1
     fi
 
     SYNC_DID_ADVANCE=true

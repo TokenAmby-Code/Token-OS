@@ -9,7 +9,7 @@ import { fileURLToPath } from 'url';
 import {
   DISCORD_MESSAGE_CONTENT_LIMIT,
   sendChunkedDiscordContent,
-} from './outbound-message.js';
+} from './outbound-message.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, '..', 'config.json');
