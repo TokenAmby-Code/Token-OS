@@ -2493,9 +2493,9 @@ pane_registry_instance_id() {
 }
 
 reconcile_dispatch_registry_bind() {
-  # Registration binding is control-plane truth, not an advisory. Liveness proves
-  # the engine came up, but after the observation window a missing/stopped row is
-  # a loud failure because downstream sends/renames depend on registry binding.
+  # Registry binding is a control-plane signal, but pane liveness is the launch
+  # oracle. This helper answers only whether the row is already bound; callers
+  # must not convert a live-pane row lag into launch failure.
   local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label wrapper_id
   if ! command -v sqlite3 >/dev/null 2>&1; then
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because sqlite3 is unavailable"
@@ -2525,7 +2525,7 @@ reconcile_dispatch_registry_bind() {
     fi
   fi
   if [[ "$emit_error" == "1" ]]; then
-    err "launch failed: ${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration is broken and reconciliation did not catch up"
+    warn "${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration slow/reconciliation lag; treating live pane as successful launch"
   fi
   return 1
 }
@@ -2648,8 +2648,8 @@ dispatch_observe_finalize_on_signal() {
   # caller can misread as "launch failed" and blindly respawn, which is exactly
   # how the duplicate-FG corruption was born (see refuse_if_worktree_has_live_agent).
   # So collapse the interrupt into dispatch's OWN contract: one final synchronous
-  # confirmation using the identical success criteria (live agent + registry bind
-  # + wrapper ledger). Confirmed-good at this instant => exit 0 (truthful: the
+  # confirmation using the identical success criteria (live agent + wrapper
+  # ledger; registry bind is warning-only). Confirmed-good at this instant => exit 0 (truthful: the
   # launch DID land; the caller just gave up at the wrong moment). Not yet
   # confirmed => exit 70 (dispatch's defined "unconfirmed" code, fail-closed) —
   # never a raw 143. The ledger sub-check is capped short here so the handler
@@ -2663,7 +2663,6 @@ dispatch_observe_finalize_on_signal() {
   trap - TERM INT
   if [[ -n "${OBSERVE_PANE:-}" ]] \
     && dispatch_pane_agent_live "$OBSERVE_PANE" \
-    && reconcile_dispatch_registry_bind "$OBSERVE_PANE" "${OBSERVE_DISPLAY:-}" 0 \
     && DISPATCH_LEDGER_PRODUCER_CHECK_ATTEMPTS=2 \
        ensure_dispatch_wrapper_ledger "$OBSERVE_PANE" "${OBSERVE_DISPLAY:-}"; then
     printf '%s\n' "dispatched $ENGINE to ${OBSERVE_DISPLAY:-target} (confirmed live on caller interrupt SIG${sig})" >&6
@@ -2688,9 +2687,9 @@ dispatch_observe_disarm_signal_finalizer() {
 
 dispatch_observe_wait_for_launch() {
   # Blocking observation loop. Success = the pane is up AND a live agent process
-  # is running in it AND the registry row binds by the end of the observation
-  # window. A row lag with a live pane is a control-plane failure. Returns 0 on a
-  # confirmed launch, 1 on any failure. Runs under the caller-lifetime salvage
+  # is running in it. Registry bind is reconciled opportunistically; a row lag
+  # with a live pane is warning-only to avoid duplicate-worker retries. Returns 0
+  # on a confirmed-live launch, 1 on true launch failure. Runs under the caller-lifetime salvage
   # armed by confirm_dispatch_launch_live.
   local pane="$1" target_display="$2" timeout="$3" deadline saw_live=0
   deadline=$((SECONDS + timeout))
@@ -2713,11 +2712,11 @@ dispatch_observe_wait_for_launch() {
       err "launch failed: the ${ENGINE} agent appeared in ${target_display} but exited before registry binding completed"
       return 1
     fi
-    if reconcile_dispatch_registry_bind "$pane" "$target_display" 1; then
-      ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
-      return 0
+    if ! reconcile_dispatch_registry_bind "$pane" "$target_display" 1; then
+      : # live pane wins; warning already emitted
     fi
-    return 1
+    ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
+    return 0
   fi
   err "launch failed: no live ${ENGINE} agent appeared in the pane within ${timeout}s for ${target_display}; the pane is up but the staged command never started the agent (raise DISPATCH_LAUNCH_OBSERVE_TIMEOUT if cold start is slow)"
   return 1
@@ -2903,8 +2902,8 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   dispatch_send_text_via_tmuxctld "$pane_id" "$STAGED_COMMAND" || exit $?
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
-  # Success = pane up + live agent process + registry bind inside the observation
-  # window. Missing bind is a loud failure, not eventual-reconciliation comfort.
+  # Success = pane up + live agent process. Missing bind is a warning so the
+  # caller does not retry into a duplicate worker.
   if ! confirm_dispatch_launch_live "$phys_pane" "$stack_display"; then
     exit 70
   fi
