@@ -362,6 +362,13 @@ def close_instance(
 
             resolved = resolve_instance(adapter, instance_id)
             resolved_pane = resolved.pane_id or ""
+        # Pin the physical pane handle once for the whole immediate close transaction.
+        # A preceding slot clear may erase role stamps; never re-resolve a role later
+        # and risk acting on a different live pane.
+        if resolved_pane and not resolved_pane.startswith("%"):
+            from .resolver import resolve_to_physical
+
+            resolved_pane = resolve_to_physical(adapter, resolved_pane)
 
         if mode == "after-stop":
             body = {"mode": "after-stop", "lifecycle": lifecycle}
@@ -410,6 +417,17 @@ def close_instance(
         close_result: dict[str, Any] | None = None
         if target_pane:
             close_result = _close_pane_unshielded(adapter, target_pane, timeout=timeout)
+            if close_result.get("status") == "cleared_in_place":
+                return {
+                    "status": "cleared_in_place",
+                    "reason": "slot_clear_completed_no_retire_required",
+                    "instance_id": instance_id,
+                    "lifecycle": lifecycle,
+                    "pane": target_pane,
+                    "retire_required": False,
+                    "close_transaction_complete": True,
+                    "close": close_result,
+                }
             if close_result.get("status") == "refused":
                 return {
                     "status": "refused",
