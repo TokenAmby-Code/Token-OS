@@ -229,6 +229,18 @@ class TTSChunkNextRequest(BaseModel):
     detail: dict | None = None
 
 
+class TTSPhoneTestRequest(BaseModel):
+    """Explicit phone-stream test request.
+
+    This bypasses normal router device selection so WSL availability does not
+    affect phone MacroDroid validation.
+    """
+
+    message: str
+    rate: int = 0
+    max_chars: int | None = None
+
+
 # ============ TTS/Notification System ============
 
 # Platform detection
@@ -3139,6 +3151,59 @@ async def api_tts_chunk_event(request: TTSChunkEventRequest) -> dict:
         "matched_playback": matched_playback,
         "state": get_tts_authoritative_state(),
     }
+
+
+@router.post("/api/tts/phone-test")
+async def api_tts_phone_test(request: TTSPhoneTestRequest) -> dict:
+    """Run a real phone-only streaming TTS probe.
+
+    This endpoint is intentionally not part of the normal notification router:
+    it exists to validate the phone MacroDroid chunk player while WSL remains
+    healthy and independently available.
+    """
+    message = sanitize_tts_for_speech(
+        _sanitize_public_text(clean_markdown_for_tts(request.message))
+    )
+    if not message.strip():
+        raise HTTPException(status_code=400, detail="message required")
+
+    session_id = f"phone-test-{uuid.uuid4().hex}"
+    _update_tts_authoritative_state(
+        session_id=session_id,
+        control={
+            "state": "playing",
+            "last_action": None,
+            "speed": 1.0,
+            "source": "phone_test",
+            "updated_at": _now_iso(),
+        },
+    )
+    chunks = build_tts_chunk_handoff(message, max_chars=request.max_chars)
+    result = await asyncio.to_thread(
+        dispatch_tts_chunks_to_backend,
+        "phone",
+        chunks,
+        rate=request.rate,
+    )
+    result = dict(result or {})
+    result["session_id"] = session_id
+    result["requested_backend"] = "phone"
+    result["router_bypassed"] = True
+    result["input_chunks"] = len(chunks)
+    await log_event(
+        "tts_phone_test",
+        device_id="phone",
+        details={
+            "success": bool(result.get("success")),
+            "playback_id": result.get("playback_id"),
+            "chunks": result.get("chunks"),
+            "input_chunks": len(chunks),
+            "playback_confirmed": result.get("playback_confirmed"),
+            "error": result.get("error"),
+            "reason": result.get("reason"),
+        },
+    )
+    return result
 
 
 @router.post("/api/tts/backend-error")

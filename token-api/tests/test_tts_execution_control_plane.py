@@ -345,6 +345,50 @@ def test_phone_streaming_backfill_returns_n_plus_two_and_done() -> None:
         tts.TTS_PHONE_STREAMS.pop((session_id, playback_id), None)
 
 
+def test_phone_test_endpoint_bypasses_router_and_registers_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tts = _load_tts()
+    sent = []
+
+    async def noop_log(*_args, **_kwargs):
+        return None
+
+    def fail_router(**_kwargs):
+        raise AssertionError("phone-test must bypass normal WSL/phone router")
+
+    def fake_send(endpoint, params):
+        sent.append((endpoint, dict(params)))
+        waiter = tts.pending_phone_playbacks.get(str(params["playback_id"]))
+        assert waiter is not None
+        waiter.set()
+        return {"success": True, "method": "phone"}
+
+    monkeypatch.setattr(tts, "log_event", noop_log)
+    monkeypatch.setattr(tts, "resolve_tts_device", fail_router)
+    monkeypatch.setattr(tts, "_send_to_phone", fake_send)
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.01)
+
+    result = asyncio.run(
+        tts.api_tts_phone_test(tts.TTSPhoneTestRequest(message="one. two. three.", max_chars=10))
+    )
+
+    assert result["success"] is True
+    assert result["requested_backend"] == "phone"
+    assert result["router_bypassed"] is True
+    assert result["playback_confirmed"] is True
+    assert result["input_chunks"] == 3
+    assert result["chunks"] == 3
+    assert len(sent) == 1
+    endpoint, payload = sent[0]
+    assert endpoint == "/tts-chunk"
+    assert payload["session_id"] == result["session_id"]
+    assert payload["current_chunk"] == "one."
+    assert payload["next_chunk"] == "two."
+    assert payload["current_index"] == 0
+    assert payload["next_index"] == 1
+
+
 def test_phone_backfill_obeys_pause_resume_skip_state() -> None:
     tts = _load_tts()
     chunks = tts.build_tts_chunk_handoff("one. two. three.", max_chars=10)
