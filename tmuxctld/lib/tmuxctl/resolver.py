@@ -376,11 +376,10 @@ def instance_id_for_pane(adapter: TmuxAdapter, pane: str) -> str:
 class FreePane:
     """An unoccupied, agent-free pane — a candidate for split-alias-style routing.
 
-    Derived from current tmux structure plus the wrapper→pane ledger: a pane is
-    *free* when it has no active wrapper row, is not a protected singleton label,
-    and is past its boot grace. The allocator walk does not sniff process trees;
-    the selected candidate is cross-checked once immediately before dispatch
-    bytes. (The retired ``@PANE_CLEAN`` clean-pane stamp is no longer consulted.)
+    Derived from current tmux structure plus the wrapper→pane ledger and live
+    process liveness: a pane is *free* when it has no active wrapper row, no live
+    agent process, is not a protected singleton label, and is past its boot
+    grace. (The retired ``@PANE_CLEAN`` clean-pane stamp is no longer consulted.)
     """
 
     pane_id: str
@@ -391,10 +390,10 @@ class FreePane:
 def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
     """Single global tmux scan → the dispatch-available panes.
 
-    Availability is read from the wrapper→pane ledger: a pane is free only when
-    it has no active wrapper row, is past its boot grace, and is not a protected
-    singleton label. This walk intentionally performs no process-tree sniff. The
-    selected candidate is sniffed once in the dispatch send gate. The singleton
+    Availability is read from the wrapper→pane ledger and current process tree:
+    a pane is free only when it has no active wrapper row, no live agent process,
+    is past its boot grace, and is not a protected singleton label. The selected
+    candidate is still sniffed again in the dispatch send gate. The singleton
     exclusion is unconditional so a corrupted/missing ledger row cannot expose
     Custodes, Fabricator-General, Administratum/Admin, etc. as a worker target.
     """
