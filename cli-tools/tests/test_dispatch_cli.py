@@ -8,7 +8,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
@@ -4360,7 +4360,12 @@ def _launch_and_interrupt_in_observe(
         time.sleep(0.05)
     assert entered, "observe loop never issued its first POST /pane-live probe"
     proc.send_signal(signal.SIGTERM)
-    out, err = proc.communicate(timeout=15)
+    try:
+        out, err = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
@@ -4416,7 +4421,9 @@ def _run_resolve_api_server(bound_working_dir: str) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path == "/api/instances/resolve":
+            if parsed.path == "/api/instances/resolve" and parse_qs(parsed.query).get(
+                "wrapper_launch_id"
+            ) == ["wid-test"]:
                 body = json.dumps({"id": "iid-test", "working_dir": bound_working_dir}).encode(
                     "utf-8"
                 )

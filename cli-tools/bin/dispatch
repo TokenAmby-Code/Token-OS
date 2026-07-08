@@ -2671,27 +2671,26 @@ dispatch_observe_finalize_on_signal() {
   exit 70
 }
 
-confirm_dispatch_launch_live() {
-  # Liveness-driven launch confirmation. Success = the pane is up AND a live agent
-  # process is running in it AND the registry row binds by the end of the
-  # observation window. A row lag with a live pane is a control-plane failure.
-  local pane="$1" target_display="$2" timeout deadline saw_live=0
-  timeout="$(dispatch_launch_observe_timeout)"
-  # Observer disabled (0): trust the send and return immediately. Used by the
-  # bulk of the hermetic CLI tests and available as a production opt-out.
-  [[ "$timeout" -gt 0 ]] || return 0
-  # Arm the caller-lifetime salvage for the blocking wait. A SIGTERM/SIGINT from
-  # the caller's ceiling now runs one final confirmation and exits with dispatch's
-  # own 0/70 contract rather than dying 143. OBSERVE_* carry the pane/display into
-  # the trap handler (bash traps see enclosing-scope state, not positional args).
-  OBSERVE_PANE="$pane"
-  OBSERVE_DISPLAY="$target_display"
-  # Snapshot the real stdout/stderr NOW, before any observe-loop command
-  # substitution can redirect fd1, so the signal handler can emit its verdict to
-  # them unconditionally (see dispatch_observe_finalize_on_signal).
-  exec 6>&1 7>&2
-  trap 'dispatch_observe_finalize_on_signal TERM' TERM
-  trap 'dispatch_observe_finalize_on_signal INT' INT
+dispatch_observe_disarm_signal_finalizer() {
+  # Undo the arm block from confirm_dispatch_launch_live on NORMAL (non-signal)
+  # completion. The signal path (dispatch_observe_finalize_on_signal) exit()s the
+  # process, so it never reaches here — this runs ONLY when the observe wait
+  # returns normally. Clearing the shell-global TERM/INT traps, the saved verdict
+  # fds 6/7, and OBSERVE_* means a later interrupt on an unrelated path cannot
+  # refire the finalizer against stale pane/display state.
+  trap - TERM INT
+  exec 6>&- 7>&-
+  OBSERVE_PANE=""
+  OBSERVE_DISPLAY=""
+}
+
+dispatch_observe_wait_for_launch() {
+  # Blocking observation loop. Success = the pane is up AND a live agent process
+  # is running in it AND the registry row binds by the end of the observation
+  # window. A row lag with a live pane is a control-plane failure. Returns 0 on a
+  # confirmed launch, 1 on any failure. Runs under the caller-lifetime salvage
+  # armed by confirm_dispatch_launch_live.
+  local pane="$1" target_display="$2" timeout="$3" deadline saw_live=0
   deadline=$((SECONDS + timeout))
   while (( SECONDS <= deadline )); do
     if dispatch_pane_agent_live "$pane"; then
@@ -2720,6 +2719,34 @@ confirm_dispatch_launch_live() {
   fi
   err "launch failed: no live ${ENGINE} agent appeared in the pane within ${timeout}s for ${target_display}; the pane is up but the staged command never started the agent (raise DISPATCH_LAUNCH_OBSERVE_TIMEOUT if cold start is slow)"
   return 1
+}
+
+confirm_dispatch_launch_live() {
+  # Liveness-driven launch confirmation. Resolve the observe window, then run the
+  # blocking wait under the caller-lifetime signal salvage, disarming that salvage
+  # on normal completion so the finalizer can only fire during the wait itself.
+  local pane="$1" target_display="$2" timeout rc
+  timeout="$(dispatch_launch_observe_timeout)"
+  # Observer disabled (0): trust the send and return immediately, BEFORE arming —
+  # nothing to disarm. Used by the bulk of the hermetic CLI tests and available
+  # as a production opt-out.
+  [[ "$timeout" -gt 0 ]] || return 0
+  # Arm the caller-lifetime salvage for the blocking wait. A SIGTERM/SIGINT from
+  # the caller's ceiling now runs one final confirmation and exits with dispatch's
+  # own 0/70 contract rather than dying 143. OBSERVE_* carry the pane/display into
+  # the trap handler (bash traps see enclosing-scope state, not positional args).
+  OBSERVE_PANE="$pane"
+  OBSERVE_DISPLAY="$target_display"
+  # Snapshot the real stdout/stderr NOW, before any observe-loop command
+  # substitution can redirect fd1, so the signal handler can emit its verdict to
+  # them unconditionally (see dispatch_observe_finalize_on_signal).
+  exec 6>&1 7>&2
+  trap 'dispatch_observe_finalize_on_signal TERM' TERM
+  trap 'dispatch_observe_finalize_on_signal INT' INT
+  dispatch_observe_wait_for_launch "$pane" "$target_display" "$timeout"
+  rc=$?
+  dispatch_observe_disarm_signal_finalizer
+  return "$rc"
 }
 
 refuse_if_worktree_has_live_agent() {
