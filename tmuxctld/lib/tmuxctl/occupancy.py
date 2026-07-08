@@ -317,12 +317,13 @@ def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
 
 
 def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupancy]:
-    """Return dispatch availability from the wrapper ledger without ps sniffing.
+    """Return dispatch availability from wrapper ledger plus live-process sniffing.
 
-    This is the allocator's first pass.  It walks every live pane once, consults
-    only the wrapper→pane ledger (plus singleton/boot-grace structural guards),
-    and intentionally does not call :func:`_active_agent`.  The selected free
-    candidate is later cross-checked by :func:`assert_dispatch_target_available`.
+    This is the allocator's first pass. It walks every live pane once, consults
+    the wrapper→pane ledger, and also sniffs the pane process tree. The sniff is
+    required for pre-deploy/stale panes that host a live agent but have neither
+    a current wrapper-ledger row nor an ``@INSTANCE_ID`` bind stamp; otherwise
+    they enter the freelist and are only refused later by the bind guard.
     """
 
     raw = adapter.run(
@@ -354,7 +355,7 @@ def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupanc
                 window_name=window_name.strip(),
                 pane_pid=pane_pid,
                 instance_id=str((ledger_row or {}).get("instance_id") or ""),
-                live_agent=False,
+                live_agent=_active_agent(pane_pid),
                 recently_born=_recently_born(born_raw),
             )
         )

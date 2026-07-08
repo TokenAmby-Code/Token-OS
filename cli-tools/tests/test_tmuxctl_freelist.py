@@ -65,14 +65,16 @@ def test_list_free_panes_excludes_instance_owned_pane():
     assert all(p.pane_id != "%25" for p in free)
 
 
-def test_list_free_panes_excludes_ledger_owned_pane_without_sniffing(monkeypatch):
-    """Allocator walk uses wrapper-ledger occupancy and does not ps-sniff candidates."""
+def test_list_free_panes_excludes_ledger_owned_and_live_unbound_panes(monkeypatch):
+    """Allocator walk excludes wrapper-ledger occupancy and stale live unbound panes."""
 
-    monkeypatch.setattr(
-        occupancy,
-        "_active_agent",
-        lambda pane_pid: (_ for _ in ()).throw(AssertionError("sniffed")),
-    )
+    sniffed: list[int | None] = []
+
+    def fake_active(pane_pid):
+        sniffed.append(pane_pid)
+        return pane_pid == 1000
+
+    monkeypatch.setattr(occupancy, "_active_agent", fake_active)
     _seed_wrapper_ledger("mechanicus:1", instance_id="owned")
     rows = [
         ("%occupied", "", "mechanicus:1", "mechanicus", "999"),
@@ -81,7 +83,8 @@ def test_list_free_panes_excludes_ledger_owned_pane_without_sniffing(monkeypatch
 
     free = list_free_panes(FakeAdapter(rows))
 
-    assert [p.pane_id for p in free] == ["%worker"]
+    assert [p.pane_id for p in free] == []
+    assert sniffed == [999, 1000]
 
 
 def test_list_free_panes_role_canonicalized_and_optional():

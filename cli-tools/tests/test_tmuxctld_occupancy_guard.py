@@ -347,7 +347,7 @@ def test_prealloc_new_order_is_palace_and_somnium_specific():
     )
 
 
-def test_prealloc_freelist_does_not_sniff_every_candidate_then_sniffs_selected_once(monkeypatch):
+def test_prealloc_freelist_excludes_stale_unbound_live_agent_before_selection(monkeypatch):
     from tmuxctl import occupancy, wrapper_ledger
     from tmuxctl.occupancy import assert_dispatch_target_available
     from tmuxctl.resolver import list_free_panes
@@ -374,14 +374,14 @@ def test_prealloc_freelist_does_not_sniff_every_candidate_then_sniffs_selected_o
 
     def fake_active(pane_pid):
         sniffed.append(pane_pid)
-        return False
+        return pane_pid == 2001
 
     monkeypatch.setattr(occupancy, "_active_agent", fake_active)
     adapter = MultiAdapter()
 
     free = list_free_panes(adapter)
     assert [p.pane_role for p in free] == ["palace:S", "palace:E"]
-    assert sniffed == []
+    assert sniffed == [2001, 2002, 2003]
 
     assert_dispatch_target_available(adapter, "%S")
-    assert sniffed == [2002]
+    assert sniffed == [2001, 2002, 2003, 2002]
