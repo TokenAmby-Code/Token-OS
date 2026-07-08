@@ -1196,6 +1196,56 @@ def test_health_reasserts_lifecycle_hooks_throttled(monkeypatch) -> None:
         server.shutdown()
 
 
+def test_reassert_failure_shortens_retry_backoff(monkeypatch) -> None:
+    """A FAILED hook install must not hold the full throttle interval.
+
+    On a wedged/slow tmux server (the 2026-07-07 outage condition) ``set-hook``
+    times out and ``ensure_tmux_lifecycle_hooks`` returns ``{"ok": False}``. The
+    old code advanced the 60s throttle deadline BEFORE the attempt and ignored the
+    result, so a failed install stranded the global ``pane-died`` hook uninstalled
+    for a full minute — nothing self-heals in that window. A failed attempt must
+    instead pull the deadline in to the short retry window so the daemon retries on
+    its next heartbeat and re-installs the moment tmux recovers.
+    """
+    monkeypatch.setattr(
+        daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", _REAL_MAYBE_REASSERT
+    )
+    server, _ = _serve(StubAdapter)
+    try:
+        outcome = {"ok": False}
+        calls = []
+        monkeypatch.setattr(
+            daemon, "ensure_tmux_lifecycle_hooks", lambda: calls.append(1) or outcome
+        )
+        # First heartbeat attempts the install; it FAILS (wedged tmux).
+        now = time.monotonic()
+        assert server.maybe_reassert_lifecycle_hooks() is True
+        assert len(calls) == 1
+        # The deadline was pulled in to the retry window, NOT the full interval.
+        remaining = server._hook_reassert_deadline - now
+        assert remaining <= daemon._HOOK_REASSERT_RETRY_SECONDS + 0.5
+        assert remaining < daemon._HOOK_REASSERT_INTERVAL_SECONDS
+    finally:
+        server.shutdown()
+
+
+def test_reassert_success_holds_full_interval(monkeypatch) -> None:
+    """A SUCCESSFUL install keeps the full throttle — no needless re-install churn."""
+    monkeypatch.setattr(
+        daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", _REAL_MAYBE_REASSERT
+    )
+    server, _ = _serve(StubAdapter)
+    try:
+        monkeypatch.setattr(daemon, "ensure_tmux_lifecycle_hooks", lambda: {"ok": True})
+        now = time.monotonic()
+        assert server.maybe_reassert_lifecycle_hooks() is True
+        remaining = server._hook_reassert_deadline - now
+        # Held the full interval (well beyond the short retry window).
+        assert remaining > daemon._HOOK_REASSERT_RETRY_SECONDS
+    finally:
+        server.shutdown()
+
+
 def test_health_endpoint_rides_heartbeat_to_reassert_hooks(monkeypatch) -> None:
     monkeypatch.setattr(
         daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", _REAL_MAYBE_REASSERT

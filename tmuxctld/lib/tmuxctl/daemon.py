@@ -99,6 +99,16 @@ _PANE_DIED_HOOK = (
 # self-heals within one interval of any clear.
 _HOOK_REASSERT_INTERVAL_SECONDS = 60.0
 
+# When a re-assertion FAILS (``set-hook`` timed out against a wedged/slow tmux —
+# the 2026-07-07 outage condition), holding the full interval strands the global
+# pane-died hook uninstalled for a whole minute: nothing self-heals in that window
+# (twice-bitten). A failed attempt therefore pulls the throttle deadline in to this
+# short retry window so the very next /health heartbeat retries and re-installs the
+# instant tmux recovers. The retry cadence is still bounded by the heartbeat itself
+# (no new poller) and each attempt is one 5s-capped ``set-hook`` — matching the
+# install timeout, so this never busy-loops faster than the daemon can act.
+_HOOK_REASSERT_RETRY_SECONDS = 5.0
+
 # The permanent typing-guard PENDING-branch root keys (Enter/C-m/BSpace/C-h/C-c) are
 # bound once at tmux-server start and — unlike ``Any`` — have no focus/rehydrate
 # re-source path, so a deploy that advances the daemon SHA leaves the LIVE key-table
@@ -4401,16 +4411,32 @@ class TmuxctldServer(ThreadingHTTPServer):
         when a re-assertion was performed this call (so it ran), False when the
         throttle suppressed it. ``ensure_tmux_lifecycle_hooks`` is idempotent and
         non-fatal, and any failure is swallowed so /health never breaks.
+
+        A re-assertion that does not actually land (``ensure_tmux_lifecycle_hooks``
+        reports ``ok=False`` because ``set-hook`` timed out on a wedged tmux, or it
+        raised) pulls the throttle deadline in to ``_HOOK_REASSERT_RETRY_SECONDS`` so
+        the hook self-heals on the next heartbeat rather than staying uninstalled for
+        a full interval.
         """
         now = time.monotonic()
         with self._hook_reassert_lock:
             if now < self._hook_reassert_deadline:
                 return False
             self._hook_reassert_deadline = now + _HOOK_REASSERT_INTERVAL_SECONDS
+        installed = False
         try:
-            ensure_tmux_lifecycle_hooks()
+            result = ensure_tmux_lifecycle_hooks()
+            installed = bool(result and result.get("ok"))
         except Exception:  # never let a hook re-install break the health contract
             log.exception("tmux lifecycle hook re-assertion failed")
+        if not installed:
+            # The install did not land — retry soon instead of holding the full
+            # interval, so a wedged tmux self-heals the moment it recovers. Only ever
+            # pull the deadline EARLIER; never push a concurrent success later.
+            retry_deadline = now + _HOOK_REASSERT_RETRY_SECONDS
+            with self._hook_reassert_lock:
+                if retry_deadline < self._hook_reassert_deadline:
+                    self._hook_reassert_deadline = retry_deadline
         return True
 
     def maybe_reconcile_guard_bindings(self) -> bool:
