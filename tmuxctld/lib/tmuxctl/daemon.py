@@ -1339,7 +1339,7 @@ def tmux_socket_path() -> Path:
     configured = os.environ.get("TMUXCTLD_TMUX_SOCKET_PATH", "").strip()
     if configured:
         return Path(configured)
-    return Path(tempfile.gettempdir()) / f"tmux-{os.getuid()}" / "default"
+    return Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / "default"
 
 
 def tmux_socket_connectable(path: Path | None = None) -> bool:

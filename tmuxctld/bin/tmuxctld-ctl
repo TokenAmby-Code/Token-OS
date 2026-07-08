@@ -34,7 +34,7 @@ tmux_socket_path() {
   if [[ -n "${TMUXCTLD_TMUX_SOCKET_PATH:-}" ]]; then
     printf '%s\n' "$TMUXCTLD_TMUX_SOCKET_PATH"
   else
-    printf '%s/tmux-%s/default\n' "${TMPDIR:-/tmp}" "$(id -u)"
+    printf '%s/tmux-%s/default\n' "${TMUX_TMPDIR:-/tmp}" "$(id -u)"
   fi
 }
 
