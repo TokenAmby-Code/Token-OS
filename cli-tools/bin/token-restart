@@ -708,7 +708,7 @@ ops_refresh_needed_for_paths() {
     while IFS= read -r path; do
         [[ -n "$path" ]] || continue
         case "$path" in
-            token-api/web/ops/* | token-api/ui/ops/*) return 0 ;;
+            token-api/web/ops/* | token-api/web/contracts/* | token-api/ui/ops/*) return 0 ;;
         esac
     done <<< "$changed_paths"
     return 1
@@ -723,6 +723,18 @@ refresh_ops_bundle_unlocked() {
     if [[ ! -d "$web_dir" ]]; then
         echo -e "  ${RED}✗${NC} CD-sync: ops cockpit source directory missing: $web_dir"
         return 1
+    fi
+
+    # The shared contracts package is a TS-source file: dep — Vite resolves its
+    # imports (zod) from the package's REAL path, so its node_modules must be
+    # populated before the ops build or the bundle refresh fails.
+    local contracts_dir="${dir}/token-api/web/contracts"
+    if [[ -d "$contracts_dir" ]]; then
+        echo -e "${BLUE}→${NC} CD-sync: installing shared contracts deps..."
+        if ! (cd "$contracts_dir" && npm ci --no-audit --no-fund); then
+            echo -e "  ${RED}✗${NC} CD-sync: contracts npm ci failed; aborting before Token-API restart"
+            return 1
+        fi
     fi
 
     echo -e "${BLUE}→${NC} CD-sync: refreshing ops cockpit bundle..."
@@ -1729,6 +1741,15 @@ map_changed_to_services() {
                 RESTART_TOKENAPI=true
                 ;;
             discord-daemon/*)
+                RESTART_DISCORD=true
+                ;;
+            token-api/web/contracts/*)
+                # Shared contracts feed the ops bundle (rebuilt above — restart
+                # token-api/ops so the build-id bump reloads browsers) and, from
+                # PR C, the discord daemon — bounce it so a contract change never
+                # leaves a stale in-memory schema.
+                RESTART_OPS=true
+                RESTART_TOKENAPI=true
                 RESTART_DISCORD=true
                 ;;
             mobile/*)
