@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node daemon.js",
-    "test": "node --test --experimental-test-module-mocks"
+    "test": "node --test --experimental-test-module-mocks *.test.js",
+    "test:bounty": "node --test --experimental-test-module-mocks bounty_board/*.test.js"
   },
   "engines": {
     "node": ">=22"
