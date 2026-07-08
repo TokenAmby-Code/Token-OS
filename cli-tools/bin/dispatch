@@ -2633,15 +2633,64 @@ ensure_dispatch_wrapper_ledger() {
   return 1
 }
 
-confirm_dispatch_launch_live() {
-  # Liveness-driven launch confirmation. Success = the pane is up AND a live agent
-  # process is running in it AND the registry row binds by the end of the
-  # observation window. A row lag with a live pane is a control-plane failure.
-  local pane="$1" target_display="$2" timeout deadline saw_live=0
-  timeout="$(dispatch_launch_observe_timeout)"
-  # Observer disabled (0): trust the send and return immediately. Used by the
-  # bulk of the hermetic CLI tests and available as a production opt-out.
-  [[ "$timeout" -gt 0 ]] || return 0
+dispatch_observe_finalize_on_signal() {
+  # Caller-lifetime salvage. The observe loop below blocks the caller for up to
+  # DISPATCH_LAUNCH_OBSERVE_TIMEOUT seconds. That window is generous ON PURPOSE
+  # (codex cold start + MCP init + worktree first-shell hooks routinely run tens
+  # of seconds), but it is >= every caller ceiling that runs dispatch — the
+  # Claude Code Bash tool default (120000ms), the agent-to-agent send-text 60s
+  # ceiling, talk/brief's 60s POST. When the caller's own ceiling elapses first
+  # it sends SIGTERM (or SIGINT), and an untrapped dispatch simply dies 143/130.
+  #
+  # 143 is NOT dispatch's verdict — it is an undefined signal-death a retrying
+  # caller can misread as "launch failed" and blindly respawn, which is exactly
+  # how the duplicate-FG corruption was born (see refuse_if_worktree_has_live_agent).
+  # So collapse the interrupt into dispatch's OWN contract: one final synchronous
+  # confirmation using the identical success criteria (live agent + registry bind
+  # + wrapper ledger). Confirmed-good at this instant => exit 0 (truthful: the
+  # launch DID land; the caller just gave up at the wrong moment). Not yet
+  # confirmed => exit 70 (dispatch's defined "unconfirmed" code, fail-closed) —
+  # never a raw 143. The ledger sub-check is capped short here so the handler
+  # finishes inside the SIGTERM->SIGKILL grace.
+  # The interrupt almost always lands while a liveness/bind/ledger probe is mid
+  # command-substitution ($(...)), whose pipe has captured fd1. Write the verdict
+  # to the real stdout/stderr saved as fds 6/7 at loop entry so the operator (and
+  # a capturing caller) actually see it, instead of it being swallowed by the
+  # discarded substitution. bash 3.2 has no {var}>&1 auto-fd, hence fixed numbers.
+  local sig="${1:-TERM}"
+  trap - TERM INT
+  if [[ -n "${OBSERVE_PANE:-}" ]] \
+    && dispatch_pane_agent_live "$OBSERVE_PANE" \
+    && reconcile_dispatch_registry_bind "$OBSERVE_PANE" "${OBSERVE_DISPLAY:-}" 0 \
+    && DISPATCH_LEDGER_PRODUCER_CHECK_ATTEMPTS=2 \
+       ensure_dispatch_wrapper_ledger "$OBSERVE_PANE" "${OBSERVE_DISPLAY:-}"; then
+    printf '%s\n' "dispatched $ENGINE to ${OBSERVE_DISPLAY:-target} (confirmed live on caller interrupt SIG${sig})" >&6
+    exit 0
+  fi
+  echo "dispatch: launch observation interrupted by SIG${sig} before ${ENGINE} launch to ${OBSERVE_DISPLAY:-target} confirmed; reporting unconfirmed (exit 70) instead of signal-death so a retrying caller fails closed and the worktree dup-guard prevents a duplicate spawn" >&7
+  exit 70
+}
+
+dispatch_observe_disarm_signal_finalizer() {
+  # Undo the arm block from confirm_dispatch_launch_live on NORMAL (non-signal)
+  # completion. The signal path (dispatch_observe_finalize_on_signal) exit()s the
+  # process, so it never reaches here — this runs ONLY when the observe wait
+  # returns normally. Clearing the shell-global TERM/INT traps, the saved verdict
+  # fds 6/7, and OBSERVE_* means a later interrupt on an unrelated path cannot
+  # refire the finalizer against stale pane/display state.
+  trap - TERM INT
+  exec 6>&- 7>&-
+  OBSERVE_PANE=""
+  OBSERVE_DISPLAY=""
+}
+
+dispatch_observe_wait_for_launch() {
+  # Blocking observation loop. Success = the pane is up AND a live agent process
+  # is running in it AND the registry row binds by the end of the observation
+  # window. A row lag with a live pane is a control-plane failure. Returns 0 on a
+  # confirmed launch, 1 on any failure. Runs under the caller-lifetime salvage
+  # armed by confirm_dispatch_launch_live.
+  local pane="$1" target_display="$2" timeout="$3" deadline saw_live=0
   deadline=$((SECONDS + timeout))
   while (( SECONDS <= deadline )); do
     if dispatch_pane_agent_live "$pane"; then
@@ -2670,6 +2719,34 @@ confirm_dispatch_launch_live() {
   fi
   err "launch failed: no live ${ENGINE} agent appeared in the pane within ${timeout}s for ${target_display}; the pane is up but the staged command never started the agent (raise DISPATCH_LAUNCH_OBSERVE_TIMEOUT if cold start is slow)"
   return 1
+}
+
+confirm_dispatch_launch_live() {
+  # Liveness-driven launch confirmation. Resolve the observe window, then run the
+  # blocking wait under the caller-lifetime signal salvage, disarming that salvage
+  # on normal completion so the finalizer can only fire during the wait itself.
+  local pane="$1" target_display="$2" timeout rc
+  timeout="$(dispatch_launch_observe_timeout)"
+  # Observer disabled (0): trust the send and return immediately, BEFORE arming —
+  # nothing to disarm. Used by the bulk of the hermetic CLI tests and available
+  # as a production opt-out.
+  [[ "$timeout" -gt 0 ]] || return 0
+  # Arm the caller-lifetime salvage for the blocking wait. A SIGTERM/SIGINT from
+  # the caller's ceiling now runs one final confirmation and exits with dispatch's
+  # own 0/70 contract rather than dying 143. OBSERVE_* carry the pane/display into
+  # the trap handler (bash traps see enclosing-scope state, not positional args).
+  OBSERVE_PANE="$pane"
+  OBSERVE_DISPLAY="$target_display"
+  # Snapshot the real stdout/stderr NOW, before any observe-loop command
+  # substitution can redirect fd1, so the signal handler can emit its verdict to
+  # them unconditionally (see dispatch_observe_finalize_on_signal).
+  exec 6>&1 7>&2
+  trap 'dispatch_observe_finalize_on_signal TERM' TERM
+  trap 'dispatch_observe_finalize_on_signal INT' INT
+  dispatch_observe_wait_for_launch "$pane" "$target_display" "$timeout"
+  rc=$?
+  dispatch_observe_disarm_signal_finalizer
+  return "$rc"
 }
 
 refuse_if_worktree_has_live_agent() {
