@@ -2,15 +2,8 @@
 // components never call endpoints ad-hoc. Each hook owns one read-model.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Counts, OpsState, TimerHistory, OpsGraph, SessionDocsFeed, TtsGlobalMode } from './types';
-import {
-  CONTRACT_VERSION,
-  OpsStateSchema,
-  TimerHistorySchema,
-  SessionDocsFeedSchema,
-  OpsGraphSchema,
-} from '@token-os/contracts';
-import { mockOpsGraph } from './mock';
+import type { Counts, OpsState, TimerHistory, TtsGlobalMode } from './contracts';
+import { CONTRACT_VERSION, OpsStateSchema, TimerHistorySchema } from './contracts';
 
 export type Feed<T> = {
   data: T | null;
@@ -157,8 +150,9 @@ async function postJson<T = unknown>(url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
     cache: 'no-store',
-    headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    ...(body !== undefined
+      ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+      : {}),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json().catch(() => ({}))) as T;
@@ -266,42 +260,5 @@ export function useTimerHistory(bucketSec = 60, intervalMs = 30000): Feed<TimerH
         signal,
       ),
     );
-  }, intervalMs);
-}
-
-/**
- * Session-doc pipeline feed. Read-only board grouped by frontmatter `status`.
- * Reads the same YAML Obsidian does; surfaces only a one-line head per doc and
- * deep-links into Obsidian for the full document. Polled slowly — pipeline
- * state changes on human timescales, not telemetry timescales.
- */
-export function useSessionDocs(intervalMs = 30000): Feed<SessionDocsFeed> {
-  return usesPolling<SessionDocsFeed>(
-    async (signal) =>
-      boundaryValidate(
-        'session-docs',
-        SessionDocsFeedSchema,
-        await getJson<SessionDocsFeed>('/api/ui/ops/session-docs', signal),
-      ),
-    intervalMs,
-  );
-}
-
-/**
- * Graph feed. Brief: do not poll large graph endpoints at the state cadence;
- * refresh on demand / slow. Falls back to mocked OpsGraph only if the backend
- * read-model endpoint is unavailable.
- */
-export function useOpsGraph(graph = 'active', intervalMs = 60000): Feed<OpsGraph> {
-  return usesPolling<OpsGraph>(async (signal) => {
-    try {
-      return boundaryValidate(
-        'ops-graph',
-        OpsGraphSchema,
-        await getJson<OpsGraph>(`/api/ui/ops/graph/${encodeURIComponent(graph)}`, signal),
-      );
-    } catch {
-      return mockOpsGraph(graph);
-    }
   }, intervalMs);
 }
