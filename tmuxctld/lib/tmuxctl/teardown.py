@@ -68,7 +68,11 @@ def classify_pane(pane_label: str, window_name: str) -> PaneClass:
 
 
 def clear_slot_in_place(
-    adapter: TmuxAdapter, pane_id: str, *, pane_role: str = ""
+    adapter: TmuxAdapter,
+    pane_id: str,
+    *,
+    pane_role: str = "",
+    runtime_already_cleared: bool = False,
 ) -> dict[str, Any]:
     """Scrub a pre-allocated slot's runtime IN PLACE — never kill the pane.
 
@@ -79,7 +83,8 @@ def clear_slot_in_place(
     and the adapter's respawn pre-flight re-scrubs the runtime so the revived
     shell never inherits the prior occupant's stamps.
     """
-    adapter.clear_runtime_state(pane_id)
+    if not runtime_already_cleared:
+        adapter.clear_runtime_state(pane_id)
     revived = False
     if _pane_dead(adapter, pane_id):
         adapter.run("respawn-pane", "-t", pane_id, allow_failure=True)
@@ -93,7 +98,13 @@ def clear_slot_in_place(
     }
 
 
-def cull_worker(adapter: TmuxAdapter, pane_id: str, *, pane_role: str = "") -> dict[str, Any]:
+def cull_worker(
+    adapter: TmuxAdapter,
+    pane_id: str,
+    *,
+    pane_role: str = "",
+    runtime_already_cleared: bool = False,
+) -> dict[str, Any]:
     """Cull a dynamically-created worker pane via the dead-husk kill path.
 
     The runtime is scrubbed, then the dead husk is reaped. ``reap_dead_husk`` is
@@ -103,7 +114,8 @@ def cull_worker(adapter: TmuxAdapter, pane_id: str, *, pane_role: str = "") -> d
     """
     from .close import reap_dead_husk
 
-    adapter.clear_runtime_state(pane_id)
+    if not runtime_already_cleared:
+        adapter.clear_runtime_state(pane_id)
     # The pure reap_dead_husk contract is returned verbatim (the pane CLASS rides
     # the teardown_pane envelope, not this dict, to keep the reap shape stable).
     return reap_dead_husk(adapter, pane_id, pane_role=pane_role)
@@ -115,12 +127,17 @@ def apply_teardown(
     pane_class: PaneClass,
     *,
     pane_role: str = "",
+    runtime_already_cleared: bool = False,
 ) -> dict[str, Any]:
     """Run the action for ``pane_class``. PERPETUAL is preserved (caller revives)."""
     if pane_class is PaneClass.SLOT:
-        return clear_slot_in_place(adapter, pane_id, pane_role=pane_role)
+        return clear_slot_in_place(
+            adapter, pane_id, pane_role=pane_role, runtime_already_cleared=runtime_already_cleared
+        )
     if pane_class is PaneClass.WORKER:
-        return cull_worker(adapter, pane_id, pane_role=pane_role)
+        return cull_worker(
+            adapter, pane_id, pane_role=pane_role, runtime_already_cleared=runtime_already_cleared
+        )
     return {
         "status": "preserved",
         "pane_class": PaneClass.PERPETUAL.value,
