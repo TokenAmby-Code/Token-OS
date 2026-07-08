@@ -2824,12 +2824,11 @@ def test_dispatch_tmux_target_bakes_pane_label_into_launch_env(tmp_path: Path) -
     assert "TOKEN_API_PANE_LABEL=palace:E" in result.stdout
 
 
-def test_dispatch_fails_loud_when_registry_row_lags(tmp_path: Path) -> None:
-    """A live pane whose instances row does not bind is a loud failure.
+def test_dispatch_warns_success_when_registry_row_lags(tmp_path: Path) -> None:
+    """A live pane whose instances row lags is success with a warning.
 
-    The agent process is up and engaged in the pane, but the DB row has not
-    bound live (here it is still ``stopped``). Liveness and wrapper ledger are
-    not enough: registry binding is required before dispatch reports success.
+    Liveness is the launch oracle. A stale DB row must not make dispatch report
+    failure because operators will retry and duplicate the live worker.
     """
     import sqlite3
 
@@ -2916,9 +2915,9 @@ def test_dispatch_fails_loud_when_registry_row_lags(tmp_path: Path) -> None:
         env=env,
     )
 
-    assert result.returncode != 0
-    assert "instances row did not bind within the observation window" in result.stderr
-    assert "registration slow" not in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "registration slow" in result.stderr
+    assert "launch failed" not in result.stderr
 
 
 def test_dispatch_registry_bind_reads_wrapper_launch_id_without_instance_stamp(
@@ -3012,12 +3011,11 @@ def test_dispatch_registry_bind_reads_wrapper_launch_id_without_instance_stamp(
     assert "pane_instance_id: command not found" not in result.stderr
 
 
-def test_dispatch_fails_loud_when_instance_never_registers(tmp_path: Path) -> None:
-    """No registry row after the observation window is a loud failure.
+def test_dispatch_warns_success_when_instance_never_registers(tmp_path: Path) -> None:
+    """No registry row after the observation window is success with warning.
 
-    Liveness and a wrapper ledger row are not enough: sends and rename require a
-    bound instances row. The old path printed registration-slow reassurance and
-    returned success; the current path fails loudly.
+    For codex undercount/lifecycle lag, a live pane must not be reported as a
+    launch failure. The row may bind after the synchronous observation window.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -3099,9 +3097,9 @@ def test_dispatch_fails_loud_when_instance_never_registers(tmp_path: Path) -> No
         env=env,
     )
 
-    assert result.returncode != 0
-    assert "instances row did not bind within the observation window" in result.stderr
-    assert "registration slow" not in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "registration slow" in result.stderr
+    assert "launch failed" not in result.stderr
     tmux_calls = tmux_log.read_text(encoding="utf-8")
     assert "DISPATCH LAUNCH FAILED" not in tmux_calls
 
@@ -3629,13 +3627,12 @@ def test_dispatch_resume_api_rejects_incomplete_metadata(tmp_path: Path) -> None
     assert "pass explicit --engine and --dir" not in result.stderr
 
 
-def test_dispatch_liveness_fails_loud_when_row_lags_after_send(tmp_path: Path) -> None:
-    """A live pane with no bound registry row fails after launch delivery.
+def test_dispatch_liveness_success_with_warning_when_row_lags_after_send(tmp_path: Path) -> None:
+    """A live pane with no bound registry row succeeds after launch delivery.
 
-    The staged command still reaches the pane, but dispatch must not report
-    success until the instances row binds. Naming remains outside dispatch-
-    derived prefixes and happens through the naming interview / instance-name
-    boundary after a valid registration.
+    The staged command still reaches the pane. Dispatch must return success so
+    the already-live agent continues to the naming interview instead of being
+    retried into a duplicate worker.
     """
     db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
     env = _persona_env(tmp_path, db)
@@ -3718,9 +3715,9 @@ def test_dispatch_liveness_fails_loud_when_row_lags_after_send(tmp_path: Path) -
         timeout=60,
     )
 
-    assert result.returncode != 0
-    assert "instances row did not bind within the observation window" in result.stderr
-    assert "registration slow" not in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "registration slow" in result.stderr
+    assert "launch failed" not in result.stderr
 
     # Proof the launch text still reaches the pane without smuggling a
     # dispatch-derived naming prefix into the staged launch command.
