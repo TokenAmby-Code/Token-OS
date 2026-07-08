@@ -2918,6 +2918,97 @@ def test_dispatch_fails_loud_when_registry_row_lags(tmp_path: Path) -> None:
     assert "registration slow" not in result.stderr
 
 
+def test_dispatch_registry_bind_reads_wrapper_launch_id_without_instance_stamp(
+    tmp_path: Path,
+) -> None:
+    """Bind observation succeeds from registry wrapper_launch_id, not tmux @INSTANCE_ID."""
+    import sqlite3
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    db = tmp_path / "agents.db"
+    instance_id = "registry-bound-by-wrapper"
+    wrapper_id = "wrap-bind-123"
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, status TEXT, working_dir TEXT, pane_label TEXT, wrapper_launch_id TEXT, rank TEXT, last_activity TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO instances VALUES (?, 'processing', ?, 'palace:E', ?, 'worker', '2026-07-07T22:00:00')",
+            (instance_id, str(ROOT), wrapper_id),
+        )
+
+    fake_tmuxctl = fake_bin / "tmuxctl"
+    fake_tmuxctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%44"; exit 0; fi\n'
+        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmuxctl.chmod(0o755)
+
+    fake_ping = fake_bin / "tmuxctld-ping"
+    fake_ping.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
+        'method="${1:-}"; path="${2:-}"\n'
+        'case "$method $path" in\n'
+        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
+        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
+        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
+        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
+        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_ping.chmod(0o755)
+
+    fake_tmux = fake_bin / "tmux"
+    fake_tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "show-options" && "$*" == *"@TOKEN_API_WRAPPER_ID"* ]]; then echo "wrap-bind-123"; exit 0; fi\n'
+        'if [[ "$1" == "show-options" ]]; then echo "palace:E"; exit 0; fi\n'
+        # No instance stamp exists; the old bind reader would fail here.
+        'if [[ "$1" == "display-message" && "$*" == *"@INSTANCE_ID"* ]]; then exit 0; fi\n'
+        'if [[ "$1" == "display-message" ]]; then printf "bash||palace:E|999|\\n"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["TOKEN_API_DB"] = str(db)
+    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
+    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
+    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
+    env["TOKEN_API_WRAPPER_ID"] = wrapper_id
+
+    result = subprocess.run(
+        [
+            str(DISPATCH),
+            "--target",
+            "palace:E",
+            "--dir",
+            str(ROOT),
+            "--no-worktree",
+            "--no-gt",
+            "--prompt",
+            "noop",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "pane_instance_id: command not found" not in result.stderr
+
+
 def test_dispatch_fails_loud_when_instance_never_registers(tmp_path: Path) -> None:
     """No registry row after the observation window is a loud failure.
 

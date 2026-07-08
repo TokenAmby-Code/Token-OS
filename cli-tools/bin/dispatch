@@ -358,6 +358,34 @@ if value:
 PYLEDGER
 }
 
+pane_instance_id() {
+  local pane="$1"
+  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+  TMUXCTLD_URL="$tmuxctld_url" PANE="$pane" python3 - <<'PYINSTANCE'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:7778").rstrip("/")
+pane = os.environ.get("PANE", "")
+if not pane:
+    sys.exit(0)
+url = f"{base}/tmux/instance-id-for-pane?{urllib.parse.urlencode({'pane': pane})}"
+try:
+    with urllib.request.urlopen(url, timeout=1) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+except Exception:
+    sys.exit(0)
+result = data.get("result") if isinstance(data, dict) else {}
+value = result.get("instance_id") if isinstance(result, dict) else ""
+if value:
+    print(str(value), end="")
+PYINSTANCE
+}
+
+
 resolve_caller_instance_id() {
   local row
   # tmuxctld ledger is the runtime oracle. Prefer wrapper_id because plan-cycle
@@ -2303,43 +2331,16 @@ dispatch_launch_observe_timeout() {
   # Generous, configurable ceiling for how long to wait for the agent process to
   # come up before declaring a GENUINE failure (pane created but no agent ever
   # appeared). This is the real-event bound, not a row-bind clock: it only gates
-  # exit 70 when liveness never confirms. Raised from the old 20s — under fleet
+  # exit 70 when liveness never confirms. Raised to cover engine-boot-bound bind latency; under fleet
   # load (2-4 panes, MCP init, worktree first-shell hooks) cold start routinely
-  # exceeded 20s. Override with DISPATCH_LAUNCH_OBSERVE_TIMEOUT; 0 disables the
+  # exceeds the old shorter windows. Override with DISPATCH_LAUNCH_OBSERVE_TIMEOUT; 0 disables the
   # observer entirely (the dispatcher trusts the send and returns immediately).
-  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-45}"
+  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-120}"
   if [[ "$value" =~ ^[0-9]+$ ]]; then
     printf '%s' "$value"
   else
-    printf '%s' "45"
+    printf '%s' "120"
   fi
-}
-
-pane_instance_id() {
-  local pane="$1"
-  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
-  TMUXCTLD_URL="$tmuxctld_url" PANE="$pane" python3 - <<'PYINSTANCE'
-import json
-import os
-import sys
-import urllib.parse
-import urllib.request
-
-base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:7778").rstrip("/")
-pane = os.environ.get("PANE", "")
-if not pane:
-    sys.exit(0)
-url = f"{base}/tmux/instance-id-for-pane?{urllib.parse.urlencode({'pane': pane})}"
-try:
-    with urllib.request.urlopen(url, timeout=1) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-except Exception:
-    sys.exit(0)
-result = data.get("result") if isinstance(data, dict) else {}
-value = result.get("instance_id") if isinstance(result, dict) else ""
-if value:
-    print(str(value), end="")
-PYINSTANCE
 }
 
 pane_tmux_option() {
@@ -2412,11 +2413,88 @@ dispatch_pane_agent_live() {
   pane_has_active_agent_process "$pane_pid"
 }
 
+registry_bind_ok_for_wrapper_launch_id() {
+  local wrapper_id="$1" expected_workdir="$2"
+  [[ -n "$wrapper_id" ]] || return 1
+  local api_url="${TOKEN_API_URL:-http://localhost:7777}"
+  TOKEN_API_URL="$api_url" WRAPPER_LAUNCH_ID="$wrapper_id" EXPECTED_WORKDIR="$expected_workdir" RESUME_ID_VALUE="$RESUME_ID" python3 - <<'PYREGBIND'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+api = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+wrapper = os.environ.get("WRAPPER_LAUNCH_ID", "")
+if not wrapper:
+    sys.exit(1)
+url = f"{api}/api/instances/resolve?{urllib.parse.urlencode({'wrapper_launch_id': wrapper})}"
+try:
+    with urllib.request.urlopen(url, timeout=1) as resp:
+        row = json.loads(resp.read().decode("utf-8"))
+except Exception:
+    sys.exit(1)
+if not isinstance(row, dict) or not (row.get("id") or row.get("instance_id")):
+    sys.exit(1)
+expected_workdir = os.environ.get("EXPECTED_WORKDIR", "")
+if not os.environ.get("RESUME_ID_VALUE") and expected_workdir and row.get("working_dir") != expected_workdir:
+    sys.exit(1)
+sys.exit(0)
+PYREGBIND
+}
+
+registry_instance_id_for_wrapper_launch_id() {
+  local wrapper_id="$1"
+  [[ -n "$wrapper_id" ]] || return 0
+  local api_url="${TOKEN_API_URL:-http://localhost:7777}"
+  TOKEN_API_URL="$api_url" WRAPPER_LAUNCH_ID="$wrapper_id" python3 - <<'PYREGAPI'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+api = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+wrapper = os.environ.get("WRAPPER_LAUNCH_ID", "")
+if not wrapper:
+    sys.exit(0)
+url = f"{api}/api/instances/resolve?{urllib.parse.urlencode({'wrapper_launch_id': wrapper})}"
+try:
+    with urllib.request.urlopen(url, timeout=1) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+value = data.get("id") or data.get("instance_id") or ""
+if value:
+    print(str(value), end="")
+PYREGAPI
+}
+
+registry_instance_id_for_wrapper_launch_id_sqlite() {
+  local wrapper_id="$1"
+  [[ -n "$wrapper_id" && -f "$DB_PATH" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  sqlite3 -readonly "$DB_PATH" \
+    "SELECT id FROM instances WHERE wrapper_launch_id = '$(sql_literal "$wrapper_id")' AND COALESCE(rank,'') != 'retired' ORDER BY last_activity DESC LIMIT 1;" \
+    2>/dev/null || true
+}
+
+pane_registry_instance_id() {
+  local pane="$1" wrapper_id="" instance_id=""
+  wrapper_id="$(pane_wrapper_launch_id "$pane" || true)"
+  [[ -n "$wrapper_id" ]] || return 0
+  instance_id="$(registry_instance_id_for_wrapper_launch_id "$wrapper_id" || true)"
+  [[ -n "$instance_id" ]] || instance_id="$(registry_instance_id_for_wrapper_launch_id_sqlite "$wrapper_id" || true)"
+  [[ -n "$instance_id" ]] && printf '%s' "$instance_id"
+}
+
 reconcile_dispatch_registry_bind() {
   # Registration binding is control-plane truth, not an advisory. Liveness proves
   # the engine came up, but after the observation window a missing/stopped row is
   # a loud failure because downstream sends/renames depend on registry binding.
-  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label expected_label
+  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label wrapper_id
   if ! command -v sqlite3 >/dev/null 2>&1; then
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because sqlite3 is unavailable"
     return 1
@@ -2425,17 +2503,21 @@ reconcile_dispatch_registry_bind() {
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because agents DB is missing at $DB_PATH"
     return 1
   fi
-  instance_id="$(pane_instance_id "$pane")"
+  wrapper_id="$(pane_wrapper_launch_id "$pane" || true)"
+  if registry_bind_ok_for_wrapper_launch_id "$wrapper_id" "$WORK_DIR"; then
+    return 0
+  fi
+  instance_id="$(pane_registry_instance_id "$pane" || true)"
+  [[ -n "$instance_id" ]] || instance_id="$(pane_instance_id "$pane")"
   if [[ -n "$instance_id" ]]; then
     row="$(sqlite3 -separator $'\t' "$DB_PATH" \
       "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
       2>/dev/null || true)"
     if [[ -n "$row" ]]; then
       IFS=$'\t' read -r status row_workdir row_label <<< "$row"
-      expected_label="$(resolve_pane_label_for_env "$pane")"
       if [[ "$status" != "stopped" && "$status" != "archived" ]] \
         && { [[ -n "$RESUME_ID" ]] || [[ "$row_workdir" == "$WORK_DIR" ]]; } \
-        && { [[ -z "$expected_label" ]] || [[ -n "$row_label" ]]; }; then
+        ; then
         return 0
       fi
     fi
