@@ -3772,6 +3772,19 @@ def _h_instance_unset_option(control, params):
     return control.instance_unset_option(_s(params, "instance_id"), _s(params, "option"))
 
 
+def _h_instance_stamp(control, params):
+    return control.instance_stamp(
+        instance_id=_s(params, "instance_id"),
+        pane=_s(params, "pane"),
+        wrapper_id=_s(params, "wrapper_id") or _s(params, "wrapper_launch_id"),
+        pane_positional_id=_s(params, "pane_positional_id"),
+        persona=_s(params, "persona"),
+        engine=_s(params, "engine"),
+        working_dir=_s(params, "working_dir"),
+        vacate_pane=_s(params, "vacate_pane"),
+    )
+
+
 def _h_instance_rename(control, params):
     return control.instance_rename(
         _s(params, "name"),
@@ -4274,6 +4287,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/instance/set-option"): _h_instance_set_option,
     ("POST", "/instance/unset-option"): _h_instance_unset_option,
     ("POST", "/instance/rename"): _h_instance_rename,
+    ("POST", "/instance/stamp"): _h_instance_stamp,
     ("POST", "/context-governor/inject"): _h_context_governor_inject,
     ("POST", "/context-governor/stop"): _h_context_governor_stop,
     ("POST", "/instance/send-text"): _h_instance_send_text,

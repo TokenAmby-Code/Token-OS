@@ -12728,6 +12728,14 @@ async def resolve_instance(
 
     Returns instance + session doc info in a single call.
     Resolution order: wrapper_id → CWD match (prefer processing over idle).
+
+    FAIL CLOSED on the CWD fallback: a singleton persona seat (Custodes,
+    Fabricator-General, Administratum, Pax — any ``personas.default_rank !=
+    'astartes'``) is NEVER returned by a working_dir match. Workers and singletons
+    routinely share a cwd (the vault, the main repo), so a cwd fallback that could
+    land on a singleton row is identity theft: a worker whose wrapper_id lookup
+    missed would resolve AS the singleton. Singletons resolve by wrapper_id only;
+    an unmatched worker 404s rather than adopt a singleton identity.
     """
     async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -12766,6 +12774,10 @@ async def resolve_instance(
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
                    WHERE i.working_dir = ? AND i.status = 'working'
+                     AND COALESCE(
+                           (SELECT default_rank FROM personas WHERE id = i.persona_id),
+                           'astartes'
+                         ) = 'astartes'
                    ORDER BY i.last_activity DESC LIMIT 1""",
                 (cwd,),
             )
@@ -12783,6 +12795,10 @@ async def resolve_instance(
                        FROM instances i
                        LEFT JOIN personas p ON p.id = i.persona_id
                        WHERE i.working_dir = ? AND i.status = 'idle'
+                         AND COALESCE(
+                               (SELECT default_rank FROM personas WHERE id = i.persona_id),
+                               'astartes'
+                             ) = 'astartes'
                        ORDER BY i.last_activity DESC LIMIT 1""",
                     (cwd,),
                 )

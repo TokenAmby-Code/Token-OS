@@ -1345,6 +1345,122 @@ class TmuxControlPlane:
         self.adapter.run("select-pane", "-t", target, "-T", name)
         return {"found": True, "target": target, "pane_role": pane_role, "name": name}
 
+    def _pane_for_wrapper_id(self, wrapper_id: str) -> str:
+        """Resolve the live physical pane for a wrapper id via the ledger, or ""."""
+        if not wrapper_id:
+            return ""
+        from .wrapper_ledger import LEDGER
+
+        row = LEDGER.resolve(wrapper_id=wrapper_id)
+        if row and row.pane_positional_id:
+            try:
+                return resolve_pane(self.adapter, row.pane_positional_id).pane_id
+            except Exception:  # noqa: BLE001 — a dead/missing pane fails closed
+                return ""
+        return ""
+
+    def instance_stamp(
+        self,
+        *,
+        instance_id: str,
+        pane: str = "",
+        wrapper_id: str = "",
+        pane_positional_id: str = "",
+        persona: str = "",
+        engine: str = "",
+        working_dir: str = "",
+        vacate_pane: str = "",
+    ) -> dict:
+        """Sole writer of the durable ``@INSTANCE_ID`` pane stamp + ledger binding.
+
+        The semantic replacement for token-api authoring a raw ``set-option
+        @INSTANCE_ID`` through ``/tmux/run`` — tmuxctld is the single writer of the
+        pane's identity stamp, exactly as :meth:`instance_rename` is for
+        ``@PANE_LABEL``. token-api resolves the canonical instance row id at
+        SessionStart and hands it here; the daemon owns the write.
+
+        ``@INSTANCE_ID`` is the BOOTSTRAP identity that pane resolution itself
+        depends on, so it is stamped onto an EXPLICIT ``pane`` (resolved by the
+        caller at SessionStart) — never re-derived by-instance_id (chicken/egg).
+        A ``wrapper_id`` fallback resolves the pane through the ledger. FAILS
+        CLOSED: an unresolved target means ``{found: False, stamped: False}`` and
+        zero tmux mutation, never a stamp against the wrong (or a dead) pane.
+
+        Also binds the wrapper-ledger row's ``instance_id`` (so the reverse oracle
+        prefers the ledger over a stamp scan) and, when ``vacate_pane`` is given,
+        GUARDED-clears a prior pane's stamp — only when it still carries THIS
+        instance's id, so a pane already reused by another agent is never clobbered.
+        """
+        instance_id = (instance_id or "").strip()
+        if not instance_id:
+            return {"found": False, "stamped": False, "reason": "no_instance_id",
+                    "instance_id": "", "pane": ""}
+
+        target = ""
+        pane_role = ""
+        if pane:
+            try:
+                resolved = resolve_pane(self.adapter, pane)
+                target = resolved.pane_id
+                pane_role = resolved.pane_role
+            except Exception:  # noqa: BLE001 — a missing/dead pane is a fail-closed no-op
+                target = ""
+        if not target and wrapper_id:
+            target = self._pane_for_wrapper_id(wrapper_id)
+        if not target:
+            return {"found": False, "stamped": False, "reason": "unresolved_pane",
+                    "instance_id": instance_id, "pane": ""}
+
+        # tmuxctld is the sole writer of the @INSTANCE_ID identity stamp.
+        self.adapter.run("set-option", "-p", "-t", target, "@INSTANCE_ID", instance_id)
+
+        # Bind the wrapper-ledger occupancy row so the reverse oracle resolves this
+        # pane -> instance_id from the ledger (preferred) and the tmux stamp scan
+        # (fallback) agree. Keyed by wrapper_id; codex workers with no wrapper row
+        # are served by the stamp alone.
+        ledger = None
+        label = pane_positional_id or str(
+            self.adapter.show_pane_option(target, "@PANE_ID") or ""
+        ).strip()
+        if wrapper_id:
+            from .wrapper_ledger import LEDGER
+
+            ledger = LEDGER.upsert(
+                wrapper_id=wrapper_id,
+                instance_id=instance_id,
+                persona=persona,
+                pane_positional_id=label,
+                engine=engine,
+                working_dir=working_dir,
+                state="OPEN",
+            ).as_dict()
+
+        # Guarded vacate: an instance that moved panes must not leave its id on the
+        # old pane (a stale duplicate the oracle would resolve). Clear ONLY when the
+        # old pane still carries this instance's id.
+        vacated = ""
+        if vacate_pane:
+            try:
+                old = resolve_pane(self.adapter, vacate_pane).pane_id
+            except Exception:  # noqa: BLE001 — old pane gone: nothing to vacate
+                old = ""
+            if old and old != target:
+                current = str(self.adapter.show_pane_option(old, "@INSTANCE_ID") or "").strip()
+                if current == instance_id:
+                    self.adapter.run("set-option", "-pu", "-t", old, "@INSTANCE_ID")
+                    vacated = old
+
+        return {
+            "found": True,
+            "stamped": True,
+            "instance_id": instance_id,
+            "pane": target,
+            "pane_role": pane_role,
+            "pane_positional_id": label,
+            "ledger": ledger,
+            "vacated": vacated,
+        }
+
     def instance_unset_option(self, instance_id: str, option: str) -> dict:
         """Unset a pane option on an instance's live pane; fails closed if unresolved."""
         resolved = self.resolve_instance(instance_id)

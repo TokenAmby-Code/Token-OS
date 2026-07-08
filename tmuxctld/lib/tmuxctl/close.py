@@ -292,9 +292,52 @@ def _close_pane_unshielded(
     }
 
 
+def _pane_wrapper_id(adapter: TmuxAdapter, pane: str) -> str:
+    """Read a pane's wrapper-ownership id BEFORE runtime clear wipes it."""
+    try:
+        resolved = _resolve_current(adapter, pane)
+    except Exception:  # noqa: BLE001 — a gone pane has no wrapper id to release
+        return ""
+    if not resolved:
+        return ""
+    owner = str(adapter.show_pane_option(resolved, "@TOKEN_API_WRAPPER_ID") or "").strip()
+    if not owner:
+        owner = str(
+            adapter.show_pane_option(resolved, "@TOKEN_API_WRAPPER_LAUNCH_ID") or ""
+        ).strip()
+    return owner
+
+
+def _release_ledger_occupancy(wrapper_id: str, result: dict[str, Any]) -> None:
+    """Close the wrapper-ledger occupancy row when a pane is closed.
+
+    ``/close-pane`` clears the pane runtime and kills the pane but — unlike the
+    WrapperEnd path — never released the ledger's OPEN occupancy row, so a canonical
+    close left ``ledger_occupied=true`` and jammed the next ``:new`` allocation until a
+    ``/reconcile`` pruned the stale row. Release it here, keyed by the wrapper id read
+    before the runtime scrub, on any terminal close outcome.
+    """
+    if not wrapper_id:
+        return
+    if result.get("status") not in {"closed", "already_closed"}:
+        return
+    try:
+        from .wrapper_ledger import LEDGER
+
+        row = LEDGER.close(wrapper_id)
+        result["ledger_released"] = bool(row)
+    except Exception:  # noqa: BLE001 — ledger release is best-effort, never fail the close
+        pass
+
+
 def close_pane(adapter: TmuxAdapter, pane: str, *, timeout: float = 3.0) -> dict[str, Any]:
     with close_contract_signal_shield():
-        return _close_pane_unshielded(adapter, pane, timeout=timeout)
+        # Read wrapper ownership BEFORE the close clears the pane runtime (which
+        # unsets @TOKEN_API_WRAPPER_ID), so we can release the ledger occupancy row.
+        wrapper_id = _pane_wrapper_id(adapter, pane)
+        result = _close_pane_unshielded(adapter, pane, timeout=timeout)
+        _release_ledger_occupancy(wrapper_id, result)
+        return result
 
 
 def close_instance(
