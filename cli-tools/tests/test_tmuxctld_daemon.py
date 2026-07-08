@@ -201,6 +201,14 @@ def test_server_signals_ready_event() -> None:
         server.shutdown()
 
 
+def test_default_tmux_socket_path_ignores_macos_tmpdir(monkeypatch) -> None:
+    monkeypatch.delenv("TMUXCTLD_TMUX_SOCKET_PATH", raising=False)
+    monkeypatch.delenv("TMUX_TMPDIR", raising=False)
+    monkeypatch.setenv("TMPDIR", "/var/folders/not-tmux")
+
+    assert str(daemon.tmux_socket_path()) == f"/tmp/tmux-{os.getuid()}/default"
+
+
 def test_health_reports_socket_failure_before_adapter_probe(monkeypatch) -> None:
     calls = {"list_sessions": 0}
 
