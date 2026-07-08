@@ -448,11 +448,11 @@ def close_instance(
                     "agent_command": post.agent_command,
                     "close": close_result,
                 }
-            if close_result.get("status") == "failed":
-                # Pane stubbornly persists (no agent, but kill-pane could not
-                # remove it). Fail closed rather than retire a still-present pane.
+            if close_result.get("status") in {"failed", "partial_teardown"}:
+                # Pane teardown did not complete (for example chrome scrubbed but
+                # kill/free failed). Fail closed rather than retire a half-applied pane.
                 return {
-                    "status": "failed",
+                    "status": close_result.get("status"),
                     "reason": "pane_close_failed",
                     "instance_id": instance_id,
                     "lifecycle": lifecycle,
