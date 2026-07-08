@@ -280,8 +280,10 @@ function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: numb
   // day horizontally, so the balance line's slopes flatten out; nudge the vertical
   // swing back up to keep them legible. Pivots around the horizon (the y=0 baseline
   // stays put, so the midline↔rim seam is untouched) and is CAPPED so the tallest
-  // peak / deepest trough never clip the plot box — the data already fills most of
-  // the [Y_MIN, Y_MAX] range, so the headroom, not the width, is the real limit.
+  // peak / deepest trough never clip the plot box. The cap may compress BELOW 1:
+  // a balance past the fixed [Y_MIN, Y_MAX] domain (e.g. deep overflow, 150m+)
+  // rescales so the max datum renders AT the top/bottom margin instead of
+  // escaping the box — the overflow signal itself stays on the dial's gold glow.
   const AMP_BASE_W = 1440; // at/below this width the tuned amplitude is left as-is
   const AMP_GAIN = 0.5; // how hard extra width pushes amplitude (before the cap)
   const AMP_MARGIN = 6; // px kept clear of the top (y=0) and the box floor
@@ -290,10 +292,10 @@ function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: numb
   // instead of the ±Infinity a spread over an empty array would produce.
   const devUp = baseYs.length ? horizonY - Math.min(...baseYs) : 0; // peak rise above the horizon
   const devDown = baseYs.length ? Math.max(...baseYs) - horizonY : 0; // trough drop below it
-  const ampCap = Math.max(1, Math.min(
+  const ampCap = Math.min(
     devUp > 0.5 ? (horizonY - AMP_MARGIN) / devUp : Infinity,
     devDown > 0.5 ? (h - AMP_MARGIN - horizonY) / devDown : Infinity,
-  ));
+  );
   const ampScale = Math.min(1 + Math.max(0, viewportW / AMP_BASE_W - 1) * AMP_GAIN, ampCap);
   const ampY = (v: number) => horizonY + (Y(v) - horizonY) * ampScale;
 
