@@ -785,6 +785,16 @@ refresh_discord_daemon_deps_unlocked() {
         fi
     fi
 
+    # The daemon's node_modules is git-excluded, so the deploy's git-aware
+    # write-unlock never touches it — historical hand-managed installs sit
+    # there write-protected and npm ci dies on EACCES rmdir (2026-07-08
+    # incident: PR #640's deploy aborted mid-restart and crash-looped the
+    # daemon). Unlock the tree explicitly before npm replaces it.
+    if [[ -d "${daemon_dir}/node_modules" ]]; then
+        chflags -R nouchg "${daemon_dir}/node_modules" 2>/dev/null || true
+        chmod -R u+w "${daemon_dir}/node_modules" 2>/dev/null || true
+    fi
+
     echo -e "${BLUE}→${NC} CD-sync: installing discord-daemon deps..."
     if (cd "$daemon_dir" && npm ci --no-audit --no-fund); then
         echo -e "  ${GREEN}✓${NC} CD-sync: discord-daemon deps installed"
