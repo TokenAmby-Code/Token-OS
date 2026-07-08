@@ -18,7 +18,16 @@ def test_rules_json_schema_minimums():
     assert data["version"] == 1
     assert isinstance(data["rules"], list)
     assert {rule["id"] for rule in data["rules"]} == {
-        "direct-gh-pr",
+        "direct-gh-pr-create",
+        "direct-gh-pr-merge",
+        "direct-gh-pr-close",
+        "direct-gh-pr-edit",
+        "direct-gh-pr-ready",
+        "direct-gh-pr-reopen",
+        "direct-gh-pr-comment",
+        "direct-gh-pr-review",
+        "direct-gh-pr-lock",
+        "direct-gh-pr-unlock",
         "runtime-unlock",
         "broad-nas-search",
         "raw-tmux-mutation",
@@ -32,7 +41,7 @@ def test_rules_json_schema_minimums():
 
 
 def test_deny_json_shape_matches_pretooluse():
-    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "gh pr view"}})
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "gh pr create"}})
     proc = subprocess.run(
         ["bash", str(HOOK)], input=payload, capture_output=True, text=True, timeout=15
     )
