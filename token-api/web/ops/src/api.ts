@@ -3,6 +3,13 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Counts, OpsState, TimerHistory, OpsGraph, SessionDocsFeed, TtsGlobalMode } from './types';
+import {
+  CONTRACT_VERSION,
+  OpsStateSchema,
+  TimerHistorySchema,
+  SessionDocsFeedSchema,
+  OpsGraphSchema,
+} from '@token-os/contracts';
 import { mockOpsGraph } from './mock';
 
 export type Feed<T> = {
@@ -70,6 +77,26 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   return (await res.json()) as T;
 }
 
+/**
+ * Advisory runtime validation at the poll boundary. A schema miss logs loudly
+ * with the Zod issue list but ALWAYS returns the raw payload — a contract gap
+ * must never blank the live operator surface.
+ */
+function boundaryValidate<T>(
+  label: string,
+  schema: { safeParse: (data: unknown) => { success: boolean; error?: { issues: unknown[] } } },
+  payload: T,
+): T {
+  const result = schema.safeParse(payload);
+  if (!result.success) {
+    console.error(
+      `[contracts] ${label} failed ${CONTRACT_VERSION} validation — rendering raw payload anyway`,
+      result.error?.issues,
+    );
+  }
+  return payload;
+}
+
 function countMap(value: unknown): Counts {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(
@@ -114,7 +141,10 @@ function normalizeOpsState(payload: OpsState): OpsState {
 /** Live cockpit state — polled fast (brief: every 2s). */
 export function useOpsState(intervalMs = 2000): Feed<OpsState> {
   return usesPolling<OpsState>(
-    async (signal) => normalizeOpsState(await getJson<OpsState>('/api/ui/ops/state', signal)),
+    async (signal) =>
+      normalizeOpsState(
+        boundaryValidate('ops-state', OpsStateSchema, await getJson<OpsState>('/api/ui/ops/state', signal)),
+      ),
     intervalMs,
   );
 }
@@ -228,9 +258,13 @@ function secondsSinceDayStart(): number {
 export function useTimerHistory(bucketSec = 60, intervalMs = 30000): Feed<TimerHistory> {
   return usesPolling<TimerHistory>(async (signal) => {
     const windowSec = secondsSinceDayStart();
-    return getJson<TimerHistory>(
-      `/api/ui/ops/timer/history?window=${windowSec}s&bucket=${bucketSec}s`,
-      signal,
+    return boundaryValidate(
+      'timer-history',
+      TimerHistorySchema,
+      await getJson<TimerHistory>(
+        `/api/ui/ops/timer/history?window=${windowSec}s&bucket=${bucketSec}s`,
+        signal,
+      ),
     );
   }, intervalMs);
 }
@@ -243,7 +277,12 @@ export function useTimerHistory(bucketSec = 60, intervalMs = 30000): Feed<TimerH
  */
 export function useSessionDocs(intervalMs = 30000): Feed<SessionDocsFeed> {
   return usesPolling<SessionDocsFeed>(
-    (signal) => getJson<SessionDocsFeed>('/api/ui/ops/session-docs', signal),
+    async (signal) =>
+      boundaryValidate(
+        'session-docs',
+        SessionDocsFeedSchema,
+        await getJson<SessionDocsFeed>('/api/ui/ops/session-docs', signal),
+      ),
     intervalMs,
   );
 }
@@ -256,7 +295,11 @@ export function useSessionDocs(intervalMs = 30000): Feed<SessionDocsFeed> {
 export function useOpsGraph(graph = 'active', intervalMs = 60000): Feed<OpsGraph> {
   return usesPolling<OpsGraph>(async (signal) => {
     try {
-      return await getJson<OpsGraph>(`/api/ui/ops/graph/${encodeURIComponent(graph)}`, signal);
+      return boundaryValidate(
+        'ops-graph',
+        OpsGraphSchema,
+        await getJson<OpsGraph>(`/api/ui/ops/graph/${encodeURIComponent(graph)}`, signal),
+      );
     } catch {
       return mockOpsGraph(graph);
     }
