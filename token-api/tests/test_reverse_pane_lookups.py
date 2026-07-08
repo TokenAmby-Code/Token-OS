@@ -345,18 +345,18 @@ async def test_inject_custodes_singleton_resolves_id_via_stamp(
 
 
 # ============================================================================
-# Site: stop_instance tint-clear (forward resolve, not stored column)
+# Site: stop_instance does not own tmux pane chrome teardown
 # ============================================================================
 
 
-async def test_stop_instance_clears_tint_on_live_resolved_pane(
+async def test_stop_instance_does_not_stamp_gate_or_clear_pane_tint(
     app_env: Any, monkeypatch: Any
 ) -> None:
     main = app_env.main
     _insert_instance(app_env.db_path, "inst-F", legion="custodes")
 
-    async def _resolve(instance_id):
-        return ("%LIVE", "council:custodes") if instance_id == "inst-F" else (None, None)
+    async def _resolve(_instance_id):
+        raise AssertionError("stop_instance must not key chrome clear on @INSTANCE_ID")
 
     monkeypatch.setattr(main.shared, "resolve_instance_pane", _resolve)
 
@@ -371,7 +371,7 @@ async def test_stop_instance_clears_tint_on_live_resolved_pane(
     await main.stop_instance("inst-F")
 
     assert _fetch(app_env.db_path, "inst-F", "status") == "stopped"
-    assert cleared == ["%LIVE"], "tint must clear on the live-resolved pane, not the stored one"
+    assert cleared == [], "tmuxctld atomic teardown owns pane chrome clear"
 
 
 async def test_stop_instance_no_tint_clear_when_pane_gone(app_env: Any, monkeypatch: Any) -> None:

@@ -224,8 +224,8 @@ def _close_pane_unshielded(
         attempted_target=pane,
         enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
     ):
-        if pane_class is PaneClass.WORKER:
-            adapter.clear_runtime_state(pane)
+        adapter.clear_runtime_state(pane)
+        runtime_cleared = True
         for _ in range(3):
             adapter.send_keys(pane, "C-c", allow_failure=True)
             time.sleep(0.2)
@@ -258,9 +258,11 @@ def _close_pane_unshielded(
             post = detect_pane_tui(adapter, pane)
             if post.live:
                 return {
-                    "status": "refused",
+                    "status": "partial_teardown",
                     "reason": "live_tui_survived_graceful",
                     "guard": "slot-never-kill-live-tui",
+                    "chrome_cleared": runtime_cleared,
+                    "pane_freed": False,
                     "pane": pane,
                     "pane_role": role,
                     "pane_class": pane_class.value,
@@ -269,10 +271,14 @@ def _close_pane_unshielded(
                     "agent_command": post.agent_command,
                     "method": method,
                 }
-            result = apply_teardown(adapter, pane, pane_class, pane_role=role)
+            result = apply_teardown(
+                adapter, pane, pane_class, pane_role=role, runtime_already_cleared=True
+            )
             stack = _enforce_stack(adapter, window_target, window_name)
             return {
                 **result,
+                "chrome_cleared": runtime_cleared,
+                "pane_freed": True,
                 "method": "graceful-clear-in-place",
                 "graceful_timeout": max(timeout, 0.0),
                 "stack_enforcement": stack,
@@ -282,8 +288,12 @@ def _close_pane_unshielded(
         adapter.run("kill-pane", "-t", pane, allow_failure=True)
 
     stack = _enforce_stack(adapter, window_target, window_name)
+    pane_freed = not _pane_exists(adapter, pane)
     return {
-        "status": "closed" if not _pane_exists(adapter, pane) else "failed",
+        "status": "closed" if pane_freed else "partial_teardown",
+        "reason": None if pane_freed else "kill_pane_failed_after_runtime_clear",
+        "chrome_cleared": runtime_cleared,
+        "pane_freed": pane_freed,
         "pane": pane,
         "pane_role": role,
         "pane_class": pane_class.value,
@@ -319,7 +329,12 @@ def _release_ledger_occupancy(wrapper_id: str, result: dict[str, Any]) -> None:
     """
     if not wrapper_id:
         return
-    if result.get("status") not in {"closed", "already_closed"}:
+    if result.get("status") not in {
+        "closed",
+        "already_closed",
+        "cleared_in_place",
+        "partial_teardown",
+    }:
         return
     try:
         from .wrapper_ledger import LEDGER
