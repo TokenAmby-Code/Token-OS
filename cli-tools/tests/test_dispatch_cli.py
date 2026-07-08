@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -4294,9 +4295,10 @@ def _stack_new_observe_fakes(tmp_path: Path, *, pane_live_body: str) -> Path:
     fake_tmux.chmod(0o755)
 
     fake_ping = fake_bin / "tmuxctld-ping"
+    call_log_arg = shlex.quote(str(call_log))
     fake_ping.write_text(
         "#!/usr/bin/env bash\n"
-        f'printf "%s %s\\n" "${{1:-}}" "${{2:-}}" >> {call_log}\n'
+        f'printf "%s %s\\n" "${{1:-}}" "${{2:-}}" >> {call_log_arg}\n'
         'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
         'case "${1:-} ${2:-}" in\n'
         '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
@@ -4358,7 +4360,13 @@ def _launch_and_interrupt_in_observe(
             entered = True
             break
         time.sleep(0.05)
-    assert entered, "observe loop never issued its first POST /pane-live probe"
+    if not entered:
+        if proc.poll() is None:
+            proc.kill()
+        out, err = proc.communicate(timeout=5)
+        raise AssertionError(
+            f"observe loop never issued its first POST /pane-live probe\nstdout={out}\nstderr={err}"
+        )
     proc.send_signal(signal.SIGTERM)
     try:
         out, err = proc.communicate(timeout=15)
@@ -4391,9 +4399,9 @@ def test_dispatch_observe_interrupt_salvages_confirmed_launch(tmp_path: Path) ->
     slow so the loop is still inside observation when the interrupt lands; the
     trap's final synchronous check then confirms and exits 0."""
     server = _run_resolve_api_server(bound_working_dir=str(ROOT))
+    plc_path = shlex.quote(str(tmp_path / "plc"))
     slow_first = (
-        'c="'
-        f'{tmp_path}/plc"; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n+1)) > "$c"; '
+        f'c={plc_path}; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n+1)) > "$c"; '
         'if [[ "$n" == "0" ]]; then sleep 2; fi; '
         'printf \'{"ok":true,"result":{"live":true}}\''
     )
