@@ -1141,3 +1141,26 @@ def test_session_docs_spine_fields_unchanged(client, app_env) -> None:
     assert doc["session_date"] == "2026-05-25T10:00:00"
     assert doc["session_date_source"] == "db:created_at"
     assert doc["obsidian_uri"] is not None
+
+
+def test_ops_state_embeds_session_docs_feed(client, app_env) -> None:
+    # CR-recorded contract from #671: the kanban board consumes useOpsState —
+    # the session-docs feed rides inside the OpsState payload, never a second
+    # board-side poller. Same feed builder as /api/ui/ops/session-docs.
+    rel = _write_session_doc(app_env, "state-embed", "victory:\n  a: false\n")
+    doc_id = _insert_session_doc(app_env, rel, title="State Embed", status="active")
+
+    resp = client.get("/api/ui/ops/state")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "session_docs" in body
+    feed = body["session_docs"]
+    for key in ("docs", "lane_totals", "limit_per_lane", "generated_at"):
+        assert key in feed
+    assert feed["lane_totals"] == {"active": 1}
+    doc = feed["docs"][0]
+    assert doc["id"] == doc_id
+    assert doc["title"] == "State Embed"
+    assert doc["status"] == "active"
+    assert doc["rubric"]["present"] is True

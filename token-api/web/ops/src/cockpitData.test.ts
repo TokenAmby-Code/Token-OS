@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { enforcementDial, goldenThroneDial, toTtsQueue, toWorkerQueue, ttsDial, type WorkerItem } from './cockpitData';
+import { enforcementDial, goldenThroneDial, laneForStatus, toMusterBoard, toTtsQueue, toWorkerQueue, ttsDial, type WorkerItem } from './cockpitData';
 import type { OpsState } from './contracts';
 
 type TestInstance = {
@@ -206,5 +206,187 @@ describe('dial builders', () => {
     } as unknown as OpsState);
 
     expect(dial).toMatchObject({ id: 'gt', value: 'due 1', tone: 'bad', noteworthy: true });
+  });
+});
+
+// ── Muster Ledger projection ────────────────────────────────────────────────
+
+describe('laneForStatus', () => {
+  it('implements the Session Lifecycle Decree absorption table', () => {
+    // one representative per absorption group + the canonical slugs themselves
+    expect(laneForStatus('stub')).toBe('aspirant');
+    expect(laneForStatus('dispatched')).toBe('aspirant');
+    expect(laneForStatus('aspirant')).toBe('aspirant');
+    expect(laneForStatus('active')).toBe('astartes');
+    expect(laneForStatus('in-progress')).toBe('astartes');
+    expect(laneForStatus('in-review')).toBe('arbites');
+    expect(laneForStatus('parked-ready-to-merge')).toBe('arbites');
+    expect(laneForStatus('merged')).toBe('inquisitor');
+    expect(laneForStatus('merged-deployed-live-verified')).toBe('inquisitor');
+    expect(laneForStatus('complete')).toBe('victorious');
+    expect(laneForStatus('consolidated')).toBe('victorious');
+  });
+
+  it('hides the terminal statuses (archived is not a lane)', () => {
+    expect(laneForStatus('archived')).toBeNull();
+    expect(laneForStatus('reference')).toBeNull();
+    expect(laneForStatus('captured')).toBeNull();
+  });
+
+  it('projects unknown/prose dialects to the working default', () => {
+    expect(laneForStatus('doing the thing')).toBe('astartes');
+    expect(laneForStatus('  Active ')).toBe('astartes');
+  });
+});
+
+describe('toMusterBoard', () => {
+  const NOW = new Date(2026, 6, 9, 15, 0, 0); // local 2026-07-09 15:00
+
+  type TestDoc = {
+    id?: number | null;
+    status?: string;
+    title?: string | null;
+    path?: string | null;
+    head?: string | null;
+    created_at?: string | null;
+    session_date?: string | null;
+    age_seconds?: number | null;
+    linked_instances?: number;
+    rubric?: Record<string, unknown> | null;
+  };
+
+  function boardState(docs: TestDoc[], laneTotals: Record<string, number> = {}, instances: unknown[] = []): OpsState {
+    return {
+      instances: { active: instances },
+      session_docs: {
+        generated_at: '2026-07-09T15:00:00',
+        lane_totals: laneTotals,
+        limit_per_lane: 4,
+        docs: docs.map((d) => ({
+          id: d.id ?? 1,
+          status: d.status ?? 'active',
+          title: d.title ?? null,
+          path: d.path ?? null,
+          head: d.head ?? null,
+          created_at: d.created_at ?? '2026-07-09 10:00:00',
+          session_date: d.session_date ?? null,
+          age_seconds: d.age_seconds ?? null,
+          linked_instances: d.linked_instances ?? 0,
+          rubric: d.rubric ?? null,
+        })),
+      },
+    } as unknown as OpsState;
+  }
+
+  it('returns no lanes when the feed is absent (older API)', () => {
+    expect(toMusterBoard({ instances: { active: [] } } as unknown as OpsState, NOW)).toEqual({});
+  });
+
+  it('projects raw statuses onto canonical lanes and keeps only today', () => {
+    const board = toMusterBoard(
+      boardState([
+        { id: 1, status: 'active', title: 'Today Doc', created_at: '2026-07-09 09:00:00' },
+        { id: 2, status: 'active', title: 'Yesterday Doc', created_at: '2026-07-08T23:59:00' },
+        { id: 3, status: 'merged', title: 'Deploying', created_at: '2026-07-09T12:00:00' },
+      ]),
+      NOW,
+    );
+
+    expect(board.astartes.cards.map((c) => c.title)).toEqual(['Today Doc']);
+    expect(board.inquisitor.cards.map((c) => c.title)).toEqual(['Deploying']);
+  });
+
+  it('prefers session_date over created_at for the today gate', () => {
+    const board = toMusterBoard(
+      boardState([
+        // frontmatter says today even though the DB row is older — kept
+        { id: 1, session_date: '2026-07-09', created_at: '2026-07-01 08:00:00', title: 'FM Today' },
+        // frontmatter says yesterday — dropped even though DB created today
+        { id: 2, session_date: '2026-07-08', created_at: '2026-07-09 08:00:00', title: 'FM Yesterday' },
+      ]),
+      NOW,
+    );
+
+    expect(board.astartes.cards.map((c) => c.title)).toEqual(['FM Today']);
+  });
+
+  it('falls back to the path basename for untitled docs', () => {
+    const board = toMusterBoard(
+      boardState([{ id: 1, title: null, path: 'Sessions/kanban-docs-wiring.md' }]),
+      NOW,
+    );
+
+    expect(board.astartes.cards[0].title).toBe('kanban-docs-wiring');
+  });
+
+  it('raises the GT accusation only for a present incomplete rubric', () => {
+    const board = toMusterBoard(
+      boardState([
+        {
+          id: 1,
+          title: 'Accused',
+          head: 'head line',
+          rubric: { present: true, complete: false, met: 1, total: 3, skipped: 1, first_unmet: 'needs tests passing' },
+        },
+        {
+          id: 2,
+          title: 'Complete',
+          head: 'victory head',
+          rubric: { present: true, complete: true, met: 2, total: 2, skipped: 0, first_unmet: null },
+        },
+        { id: 3, title: 'No Rubric', head: 'plain head', rubric: { present: false, complete: false, met: 0, total: 0, skipped: 0, first_unmet: null } },
+      ]),
+      NOW,
+    );
+
+    const [accused, complete, plain] = board.astartes.cards;
+    expect(accused.awaiting).toBe('needs tests passing');
+    expect(accused.rubric).toEqual({ met: 1, total: 3, skipped: 1 });
+    expect(complete.awaiting).toBeNull();
+    expect(complete.rubric).toEqual({ met: 2, total: 2, skipped: 0 });
+    expect(plain.awaiting).toBeNull();
+    expect(plain.rubric).toBeNull(); // never render a victory state for a rubric-less doc
+  });
+
+  it('lights the filament and joins the persona tint from the bound ACTIVE instance', () => {
+    const board = toMusterBoard(
+      boardState(
+        [
+          { id: 7, title: 'Live Doc', linked_instances: 2 },
+          { id: 8, title: 'Dormant Doc', linked_instances: 0 },
+        ],
+        {},
+        [
+          { id: 'worker-1', session_doc: { id: 7 }, persona: { slug: 'blood-angels', chip_color: '#b1191e' } },
+          { id: 'worker-2', session_doc: { id: null }, persona: { slug: 'ultramarines', chip_color: '#243cff' } },
+        ],
+      ),
+      NOW,
+    );
+
+    const [live, dormant] = board.astartes.cards;
+    expect(live).toMatchObject({ live: true, tint: '#b1191e' });
+    expect(dormant).toMatchObject({ live: false, tint: null });
+  });
+
+  it('stamps the raw status via laneKey mismatch and reports honesty overflow', () => {
+    const board = toMusterBoard(
+      boardState(
+        [{ id: 1, status: 'active', title: 'Shown' }],
+        // lane_totals: raw-keyed, pre-cap, all days — active + in-progress both
+        // project to astartes; in-review opens an otherwise-empty arbites lane.
+        { active: 40, 'in-progress': 2, 'in-review': 3, archived: 500 },
+      ),
+      NOW,
+    );
+
+    const card = board.astartes.cards[0];
+    expect(card.rawStatus).toBe('active');
+    expect(card.laneKey).toBe('astartes');
+    expect(board.astartes.overflow).toBe(41); // 42 truly in-lane, 1 shown
+    expect(board.arbites).toEqual({ cards: [], overflow: 3 });
+    expect(board.victorious).toBeUndefined(); // empty lane renders empty
+    // archived is a hidden terminal — it must never open a lane or count
+    expect(Object.values(board).reduce((n, l) => n + l.overflow, 0)).toBe(44);
   });
 });

@@ -341,6 +341,12 @@ export type OpsState = {
     source: string | null;
   };
   work_actions?: WorkActionSummary;
+  /**
+   * Muster Ledger feed embedded per the #671 contract: the kanban board
+   * consumes useOpsState — one poller, one feed (same builder as
+   * GET /api/ui/ops/session-docs, capped tighter for the board).
+   */
+  session_docs?: SessionDocsFeed;
 };
 
 // Concise agent/script read model (GET /api/ops/status).

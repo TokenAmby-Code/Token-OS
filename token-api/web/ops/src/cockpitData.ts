@@ -12,7 +12,7 @@
 // mesh) render an explicit '—' placeholder dial — never a frozen fake value.
 // ─────────────────────────────────────────────────────────────────────────
 
-import type { OpsSourceHealth, OpsState, TimerHistory, TimerMode } from './contracts';
+import type { OpsSourceHealth, OpsState, PipelineDoc, TimerHistory, TimerMode } from './contracts';
 
 export type CockpitMode = 'working' | 'multitasking' | 'distracted' | 'break' | 'idle';
 
@@ -400,6 +400,155 @@ export function toWorkerQueue(s: OpsState): WorkerItem[] {
       tint: i.persona?.chip_color ?? null,
       chapterChild: i.commander_type === 'chapter',
     }));
+}
+
+// ── Muster Ledger (the kanban board between the crossbars) ──────────────────
+// The board renders the session-doc pipeline embedded in OpsState (the
+// `session_docs` feed — ONE poller, per the #671 contract; never a bespoke
+// board-side fetch). Lane membership is a PROJECTION: raw frontmatter `status:`
+// (dialect-rich, Obsidian-authored) → the five canonical lifecycle lanes. The
+// raw stamp stays the truth — a card whose raw status ≠ its lane's slug wears
+// it as a mono chip.
+
+/**
+ * Raw frontmatter `status:` → canonical lane slug, per the absorption table in
+ * the vault decree "Ultramar/Session Lifecycle Decree" (2026-07-09). Change
+ * the decree, change this map (and the KANBAN_COLUMNS lane set with it).
+ * `null` = hidden terminal — never rendered (victory-ack archives; the board
+ * has no archived lane). Unknown/prose dialects project to 'astartes' (the
+ * working default) with the raw stamp visible on the card. The projection
+ * lives board-side until the writer-retarget PR lands canonical statuses.
+ */
+export function laneForStatus(status: string): string | null {
+  switch (status.trim().toLowerCase()) {
+    case 'stub':
+    case 'ready':
+    case 'planning':
+    case 'dispatched':
+    case 'aspirant':
+      return 'aspirant';
+    case 'in-review':
+    case 'fix-landed-pre-merge':
+    case 'parked-ready-to-merge':
+    case 'arbites':
+      return 'arbites';
+    case 'merged':
+    case 'deployment':
+    case 'merged-deployed-live-verified':
+    case 'inquisitor':
+      return 'inquisitor';
+    case 'complete':
+    case 'completed':
+    case 'done':
+    case 'consolidated':
+    case 'victorious':
+      return 'victorious';
+    case 'archived':
+    case 'reference':
+    case 'captured':
+      return null; // hidden terminal — not a lane
+    default:
+      // active / in-progress / astartes, plus every unmapped dialect: the
+      // decree's nearest-lane default is the working lane.
+      return 'astartes';
+  }
+}
+
+/** Local YYYY-MM-DD — the today-filter's date key, from the VIEWER's clock.
+ *  The old kanban's hardcoded America/Denver is deliberately not reproduced. */
+const localYmd = (now: Date): string =>
+  `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+/**
+ * Today-only gate (Emperor's ruling: the Muster Ledger is a runtime-demo
+ * board, not an index). Doc timestamps are local-naive ('YYYY-MM-DD HH:MM:SS'
+ * or ISO-T), so a date-prefix compare IS the local-midnight test — a bare
+ * `new Date('YYYY-MM-DD')` would parse as UTC midnight and misfile evening
+ * docs, which is exactly the timezone landmine this avoids. Docs with no
+ * usable timestamp fall back to age-since-creation vs. local midnight; a doc
+ * with neither is dropped (the honesty counter still reports it).
+ */
+function isFromToday(doc: PipelineDoc, now: Date): boolean {
+  const stamp = doc.session_date ?? doc.created_at;
+  if (stamp) return String(stamp).slice(0, 10) === localYmd(now);
+  if (doc.age_seconds != null) {
+    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    return doc.age_seconds * 1000 <= now.getTime() - midnight.getTime();
+  }
+  return false;
+}
+
+const docBasename = (p: string | null): string | null => {
+  if (!p) return null;
+  const stem = (p.split('/').pop() ?? '').replace(/\.md$/i, '');
+  return stem || null;
+};
+
+export type KanbanCardModel = {
+  key: string; // stable render key — the doc id, falling back to path
+  laneKey: string; // canonical lane slug (the projection of rawStatus)
+  title: string; // doc title, falling back to the path basename
+  rawStatus: string; // frontmatter truth — stamped on the card when ≠ laneKey
+  awaiting: string | null; // GT accusation: first unmet criterion of an incomplete rubric
+  head: string | null; // one-line body excerpt — line 2 when there is no accusation
+  rubric: { met: number; total: number; skipped: number } | null; // present rubrics only
+  live: boolean; // ≥1 instance bound to this doc — lights the filament
+  tint: string | null; // bound ACTIVE instance's persona chip colour (filament tint)
+};
+
+export type KanbanLane = {
+  cards: KanbanCardModel[];
+  /** Honesty counter — docs truly in this lane (per the feed's pre-cap
+   *  lane_totals) beyond the cards shown. The per-lane cap and the today
+   *  filter both drop docs; the board reports the drop, never hides it. */
+  overflow: number;
+};
+
+/**
+ * OpsState → the Muster Ledger lanes, keyed by canonical lane slug. Pure
+ * projection of the embedded session_docs feed: decree lane mapping, the
+ * today-only gate, and the live-filament join (first ACTIVE instance whose
+ * session_doc.id matches supplies the persona tint — the same chip_color the
+ * worker rails wear). `now` is injectable for tests; lanes the feed doesn't
+ * populate are simply absent (an empty lane renders empty).
+ */
+export function toMusterBoard(s: OpsState, now: Date = new Date()): Record<string, KanbanLane> {
+  const lanes: Record<string, KanbanLane> = {};
+  const feed = s.session_docs;
+  if (!feed) return lanes;
+  const laneOf = (key: string): KanbanLane => (lanes[key] ??= { cards: [], overflow: 0 });
+  for (const doc of feed.docs) {
+    const laneKey = laneForStatus(doc.status);
+    if (!laneKey || !isFromToday(doc, now)) continue;
+    const bound = s.instances.active.find(
+      (i) => i.session_doc?.id != null && i.session_doc.id === doc.id,
+    );
+    laneOf(laneKey).cards.push({
+      key: doc.id != null ? `doc:${doc.id}` : `path:${doc.path ?? doc.title ?? 'unknown'}`,
+      laneKey,
+      title: doc.title ?? docBasename(doc.path) ?? 'untitled',
+      rawStatus: doc.status,
+      awaiting:
+        doc.rubric?.present && !doc.rubric.complete ? (doc.rubric.first_unmet ?? null) : null,
+      head: doc.head,
+      rubric: doc.rubric?.present
+        ? { met: doc.rubric.met, total: doc.rubric.total, skipped: doc.rubric.skipped }
+        : null,
+      live: doc.linked_instances > 0,
+      tint: bound?.persona?.chip_color ?? null,
+    });
+  }
+  // lane_totals is keyed by RAW status and counts every non-archived doc
+  // (pre-cap, all days) — project each raw total onto its lane, then subtract
+  // what the board actually shows.
+  for (const [raw, total] of Object.entries(feed.lane_totals ?? {})) {
+    const laneKey = laneForStatus(raw);
+    if (laneKey) laneOf(laneKey).overflow += total;
+  }
+  for (const lane of Object.values(lanes)) {
+    lane.overflow = Math.max(0, lane.overflow - lane.cards.length);
+  }
+  return lanes;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
