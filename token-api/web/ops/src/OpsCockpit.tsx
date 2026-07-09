@@ -2413,6 +2413,55 @@ const RAIL_SHAPE_DEFAULTS: RailShape = {
 // The reservist hourglass (centre glow cells + I-walls) is LOCKED temporarily at the
 // operator's settled shape — leave its geometry as-is; ongoing tuning is the crossbar.
 
+// One source of truth for the crossbar's bottom curve + horizontal extent.
+// WorkerQueues' rail AND the kanban board both read this — they can never drift.
+// Reads RAIL_SHAPE_DEFAULTS + the locked worker-row constants internally; no
+// roster/chip data involved, so it's pure geometry of (W, uiScale).
+function railCrossbar(geo: LemonGeometry, s: number): { crossY: (x: number) => number; xBarL: number; xBarR: number } {
+  const shape = RAIL_SHAPE_DEFAULTS;
+  const chipR = (WORKER_CHIP_PX * s) / 2;
+  const ditchClear = chipR + WORKER_BAR_MARGIN * s;
+  const xCtr = geo.xCtr;
+  // Raw bar height at x — parallels the left dials, one margin below their bottom edge.
+  const barYraw = (x: number): number => workerFloorY(x, geo, s) + W_DROP_PX * s + chipR + WORKER_BAR_MARGIN * s;
+  // Ditches = the drain columns (= each makeQueuePath xEnd). Stop a chip-clear inside.
+  const xDitchL = W_INSET_PX * s;
+  const xDitchR = geo.Rx - W_INSET_PX * s;
+  const xBarL = xDitchL + ditchClear;
+  // Exaggerate the bow about the outer end (deepest at centre) so the curve reads.
+  const BAR_EXAG = shape.barExag;
+  const yEnd = barYraw(xBarL);
+  const baseBarY = (x: number): number => yEnd + (barYraw(x) - yEnd) * BAR_EXAG;
+
+  // Our OWN crossbar arc — no longer the left lemon underside mirrored across centre.
+  // One symmetric curve of x: deepest under the centre (clearing the lemon apex), its
+  // CENTRE pulled up into the divider peak that flows OUT across the span (not a local
+  // bump), and its ENDS rounding back up to the outer clearance with a horizontal tangent
+  // at the terminus — so the T's extremities round off instead of ending on a corner.
+  const half = xCtr - xBarL; // left reaches a chip-clear inside its ditch; the arc mirrors
+  const yDeep = baseBarY(xCtr); // deepest clearance, under the lemon apex
+  const yEndClear = baseBarY(xBarL); // clearance at the outer end
+  const HG_LIFT = shape.hgLift * s; // centre pull-up — the divider peak
+  const HG_LIFT_SPAN = shape.hgLiftSpan; // how far out the lift flows (fraction of the half-span)
+  // Auto rise anchors the ends to the outer clearance; HG_END_RISE_MULT scales it so
+  // the ends round up more/less/none by eye without losing that clearance anchor.
+  const HG_END_RISE = (yDeep - yEndClear) * shape.endRiseMult; // ends rise back up to the outer clearance
+  const HG_END_SPAN = shape.hgEndSpan; // outer fraction over which the ends round up
+  const crossY = (x: number): number => {
+    const u = Math.min(1, Math.abs(x - xCtr) / half); // 0 centre → 1 end
+    const liftT = Math.min(1, u / HG_LIFT_SPAN);
+    const centreLift = HG_LIFT * 0.5 * (1 + Math.cos(Math.PI * liftT)); // peak centre → 0
+    const et = Math.min(1, Math.max(0, (u - (1 - HG_END_SPAN)) / HG_END_SPAN));
+    const endRise = HG_END_RISE * 0.5 * (1 - Math.cos(Math.PI * et)); // 0 → rounded top
+    return yDeep - centreLift - endRise;
+  };
+
+  // The right end mirrors to xCtr + half, clamped a chip-clear inside the right ditch
+  // (it usually falls short — the accepted pull-away from the right).
+  const xBarR = Math.min(xCtr + half, xDitchR - ditchClear);
+  return { crossY, xBarL, xBarR };
+}
+
 // ── Compass dial (RHS cap bulge) ───────────────────────────────────────────
 // A compass rose inscribed in the crossbar's right-hand cap: a rim circle carrying
 // interior radial ticks — four LONG cardinal ticks (N/E/S/W) and four SHORT ordinal
@@ -2763,18 +2812,10 @@ function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch
     const s = uiScale;
     const f = (n: number) => n.toFixed(1);
     const chipR = (WORKER_CHIP_PX * s) / 2;
-    const ditchClear = chipR + WORKER_BAR_MARGIN * s;
     const xCtr = geo.xCtr;
-    // Raw bar height at x — parallels the left dials, one margin below their bottom edge.
-    const barYraw = (x: number): number => workerFloorY(x, geo, s) + W_DROP_PX * s + chipR + WORKER_BAR_MARGIN * s;
-    // Ditches = the drain columns (= each makeQueuePath xEnd). Stop a chip-clear inside.
-    const xDitchL = W_INSET_PX * s;
-    const xDitchR = geo.Rx - W_INSET_PX * s;
-    const xBarL = xDitchL + ditchClear;
-    // Exaggerate the bow about the outer end (deepest at centre) so the curve reads.
-    const BAR_EXAG = shape.barExag;
-    const yEnd = barYraw(xBarL);
-    const baseBarY = (x: number): number => yEnd + (barYraw(x) - yEnd) * BAR_EXAG;
+    // The crossbar's bottom curve + span come from the SHARED helper (railCrossbar)
+    // — the kanban board reads the same one, so board and rail can never drift.
+    const { crossY, xBarL, xBarR } = railCrossbar(geo, s);
 
     // Measure the REAL first-worker point off the left queue path so the hourglass nests
     // it accurately (and so the centre lift knows where the feet plant).
@@ -2789,34 +2830,9 @@ function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch
     const tipX = dx0 * HG_TIP_FRAC;
     const bellyOff = dx0 - chipR - nestClear; // belly x-offset — nests the worker rim
 
-    // Our OWN crossbar arc — no longer the left lemon underside mirrored across centre.
-    // One symmetric curve of x: deepest under the centre (clearing the lemon apex), its
-    // CENTRE pulled up into the divider peak that flows OUT across the span (not a local
-    // bump), and its ENDS rounding back up to the outer clearance with a horizontal tangent
-    // at the terminus — so the T's extremities round off instead of ending on a corner.
-    const half = xCtr - xBarL; // left reaches a chip-clear inside its ditch; the arc mirrors
-    const yDeep = baseBarY(xCtr); // deepest clearance, under the lemon apex
-    const yEndClear = baseBarY(xBarL); // clearance at the outer end
-    const HG_LIFT = shape.hgLift * s; // centre pull-up — the divider peak
-    const HG_LIFT_SPAN = shape.hgLiftSpan; // how far out the lift flows (fraction of the half-span)
-    // Auto rise anchors the ends to the outer clearance; HG_END_RISE_MULT scales it so
-    // the ends round up more/less/none by eye without losing that clearance anchor.
-    const HG_END_RISE = (yDeep - yEndClear) * shape.endRiseMult; // ends rise back up to the outer clearance
-    const HG_END_SPAN = shape.hgEndSpan; // outer fraction over which the ends round up
-    const crossY = (x: number): number => {
-      const u = Math.min(1, Math.abs(x - xCtr) / half); // 0 centre → 1 end
-      const liftT = Math.min(1, u / HG_LIFT_SPAN);
-      const centreLift = HG_LIFT * 0.5 * (1 + Math.cos(Math.PI * liftT)); // peak centre → 0
-      const et = Math.min(1, Math.max(0, (u - (1 - HG_END_SPAN)) / HG_END_SPAN));
-      const endRise = HG_END_RISE * 0.5 * (1 - Math.cos(Math.PI * et)); // 0 → rounded top
-      return yDeep - centreLift - endRise;
-    };
-
-    // The right end mirrors to xCtr + half, clamped a chip-clear inside the right ditch
-    // (it usually falls short — the accepted pull-away from the right). N samples span the
-    // whole arc for lobe detection; the visible bottom line `barD` is trimmed to the lobe
-    // cap-starts (built AFTER the loop) so the bottom never pokes out past a cap.
-    const xBarR = Math.min(xCtr + half, xDitchR - ditchClear);
+    // N samples span the whole arc for lobe detection; the visible bottom line `barD`
+    // is trimmed to the lobe cap-starts (built AFTER the loop) so the bottom never
+    // pokes out past a cap.
     const N = 96;
 
     // ── Table-edge BAND top edge — hugs just under the worker dials, so the crossbar
@@ -3775,8 +3791,12 @@ function pointsToPath(pts: { x: number; y: number }[]): string {
 //
 // Static placeholder plates this pass: no data wiring, no handlers, nothing
 // focusable — the Emperor judges the metal before the ink. Column count is
-// driven ENTIRELY by KANBAN_COLUMNS (published to CSS as --kanban-cols);
-// nothing else knows how many columns exist.
+// driven ENTIRELY by KANBAN_COLUMNS; nothing else knows how many columns exist.
+// GEOMETRY-BOUND: the board reads railCrossbar — the SAME curve+span the worker
+// rail renders from — so it is horizontally bounded by the crossbar span (never
+// past the handlebar ends, clear of the drain ditches) and vertically stretched
+// between the two crossbars' curves: seams run handlebar-to-handlebar, each end
+// landing on the bar's bow at that x.
 // The board sits at z:40, deliberately UNDER the idle-worker-queue (z:62):
 // a fat idle queue visibly clobbering the board IS the error signifier.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3790,7 +3810,20 @@ const KANBAN_COLUMNS: KanbanColumnConfig[] = [
   { key: 'iv', title: 'IV', cards: 2 },
 ];
 
-// One inert gold plate: solid brass face wearing three engraved placeholder
+// CSS mirrors — the idle rail's page placement lives in cockpit.css; the board
+// needs the same numbers to map the flipped crossbar into page coords. Each is
+// cross-referenced at its CSS source; change one, change the other.
+const KANBAN_IDLE_TOP_VH = 80; // = `.idle-worker-queue { top: 80vh }` (cockpit.css)
+const KANBAN_IDLE_FLIP_PIVOT_PX = 246; // = `.worker-queues--flip` transform-origin y (px@1440, × uiScale)
+// Board fit knobs (px@1440, × uiScale).
+const KANBAN_COL_PAD_X = 14; // card inset from the column's seam-to-seam cell
+const KANBAN_COL_PAD_Y = 18; // vertical clearance off each crossbar's bow
+const KANBAN_SEAM_GAP = 4; // seam ends shy of the 2px bar strokes — dashes kiss, never overlap
+const KANBAN_SEAM_DASH = 14; // dash length — big segments, clearly a seam not a wire
+const KANBAN_SEAM_SPACE = 18; // dash gap — more air than metal
+
+// One inert plate in the rail's own instrument language: official gold outline
+// over the darker band-wash interior (see .kanban-card). Three placeholder
 // strokes. No handlers, no tabindex, hidden from AT — pure metal.
 function KanbanCard() {
   return (
@@ -3802,18 +3835,95 @@ function KanbanCard() {
   );
 }
 
-function KanbanBoard() {
+function KanbanBoard({ uiScale }: { uiScale: number }) {
+  // Self-measure W (same pattern as WorkerQueues) — the board is an inset:0
+  // page layer, so its local x/y ARE page coords for the top rail's geometry.
+  const wrapRef = useRef<HTMLElement>(null);
+  const [W, setW] = useState(1000);
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect;
+      if (r && r.width) setW(Math.floor(r.width));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // The idle rail anchors at 80vh — a viewport length — so the board tracks
+  // innerHeight to place the bottom curve in page px.
+  const [winH, setWinH] = useState(() => window.innerHeight);
+  useEffect(() => {
+    const onResize = () => setWinH(window.innerHeight);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const s = uiScale;
+  const geo = lemonGeometry(W, s);
+  // Degenerate lens (tiny width) → no crossbars → no board. The wrapper still
+  // renders so the ResizeObserver keeps measuring.
+  let seams: Array<{ x: number; y1: number; y2: number }> = [];
+  let columns: Array<KanbanColumnConfig & { left: number; top: number; width: number; height: number }> = [];
+  if (geo.hasSpan) {
+    const { crossY, xBarL, xBarR } = railCrossbar(geo, s);
+    // Top rail: WorkerQueues is itself an inset:0 page layer, so its crossbar
+    // curve is already in page coords.
+    const yTop = (x: number): number => crossY(x);
+    // Idle rail: the SAME assembly inside `.idle-worker-queue` (top: 80vh),
+    // flipped 180° about (50%, 246px·s) by `.worker-queues--flip` — so local
+    // (x, y) lands on page (W − x, idleTop + 2·pivot·s − y). The flipped
+    // crossY is the idle rail's UPPER edge — the board's floor.
+    const idleTopPx = (KANBAN_IDLE_TOP_VH / 100) * winH;
+    const yBot = (x: number): number => idleTopPx + 2 * KANBAN_IDLE_FLIP_PIVOT_PX * s - crossY(W - x);
+    // Horizontal bounds = the INTERSECTION of the two rails' page-x spans (the
+    // one-sided capInset makes them differ under the flip) — this is what keeps
+    // the board off the drain ditches at both edges.
+    const spanL = Math.max(xBarL, W - xBarR);
+    const spanR = Math.min(xBarR, W - xBarL);
+    if (spanR > spanL) {
+      const cols = KANBAN_COLUMNS.length;
+      const colW = (spanR - spanL) / cols;
+      const g = KANBAN_SEAM_GAP * s;
+      // Interior seams only (no seam at the outer edges) — each runs from the
+      // top crossbar's bow down to the idle crossbar's bow AT ITS OWN x, so the
+      // seams flow into the curves instead of stopping at a static band.
+      seams = Array.from({ length: cols - 1 }, (_, i) => {
+        const x = spanL + colW * (i + 1);
+        return { x, y1: yTop(x) + g, y2: yBot(x) - g };
+      });
+      const padX = KANBAN_COL_PAD_X * s;
+      const padY = KANBAN_COL_PAD_Y * s;
+      columns = KANBAN_COLUMNS.map((col, i) => {
+        const xL = spanL + colW * i;
+        const xR = xL + colW;
+        // Sample each curve at the column's edges + centre and take the worst
+        // case (lowest top, highest floor) so cards never cross either bow.
+        const xs = [xL, (xL + xR) / 2, xR];
+        const top = Math.max(...xs.map(yTop)) + padY;
+        const bot = Math.min(...xs.map(yBot)) - padY;
+        return { ...col, left: xL + padX, top, width: colW - 2 * padX, height: Math.max(0, bot - top) };
+      });
+    }
+  }
+
   return (
     // aria-hidden on the whole board (no label): every plate is placeholder
     // metal, so exposing a landmark would announce an empty region. The data
     // wiring pass restores the label alongside real content.
-    <section
-      className="kanban"
-      aria-hidden
-      style={{ '--kanban-cols': KANBAN_COLUMNS.length } as React.CSSProperties}
-    >
-      {KANBAN_COLUMNS.map((col) => (
-        <section className="kanban__col" key={col.key}>
+    <section className="kanban" aria-hidden ref={wrapRef}>
+      {seams.length > 0 && (
+        <svg className="kanban__svg" width={W} height="100%" aria-hidden>
+          {seams.map((sm, i) => (
+            <line key={i} className="kanban__seam"
+              x1={sm.x.toFixed(1)} y1={sm.y1.toFixed(1)} x2={sm.x.toFixed(1)} y2={sm.y2.toFixed(1)}
+              strokeDasharray={`${(KANBAN_SEAM_DASH * s).toFixed(1)} ${(KANBAN_SEAM_SPACE * s).toFixed(1)}`} />
+          ))}
+        </svg>
+      )}
+      {columns.map((col) => (
+        <section className="kanban__col" key={col.key}
+          style={{ left: col.left, top: col.top, width: col.width, height: col.height }}>
           <header className="kanban__col-head">{col.title}</header>
           <div className="kanban__col-body">
             {Array.from({ length: col.cards }, (_, i) => (
@@ -4094,13 +4204,13 @@ export function OpsCockpit() {
         pendingIds={life.pendingIds} uiScale={uiScale} animate={!reducedMotion} />
 
       {/* kanban — the blank gold board filling the band between the worker
-          crossbar (~31vh) and the idle crossbar (80vh). Static placeholder
-          plates this pass; the follow-up data wiring consumes useOpsState
-          (/api/ui/ops/state) like every other cockpit surface — no bespoke
-          endpoint, no direct store reads. z:40 so a fat idle queue (z:62)
-          visibly clobbers it — the clobber IS the error signifier. Never
-          raise the board past 61. */}
-      <KanbanBoard />
+          crossbar and the idle crossbar, geometry-bound to the SAME railCrossbar
+          curve both rails render from. Static placeholder plates this pass; the
+          follow-up data wiring consumes useOpsState (/api/ui/ops/state) like
+          every other cockpit surface — no bespoke endpoint, no direct store
+          reads. z:40 so a fat idle queue (z:62) visibly clobbers it — the
+          clobber IS the error signifier. Never raise the board past 61. */}
+      <KanbanBoard uiScale={uiScale} />
 
       {/* dials drawer — where the default dial click lands (minimal stub) */}
       <DialsDrawer open={drawerOpen} focusedId={focusedDial} onClose={() => setDrawerOpen(false)} />

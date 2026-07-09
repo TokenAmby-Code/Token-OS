@@ -810,7 +810,8 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   /* Fixed in the FIRST viewport at ~80vh so both crossbars (the mid-page worker
      crossbar and this idle crossbar) are visible at once; the kanban board
      (.kanban) fills the band between them. Position is INDEPENDENT of
-     queue depth. */
+     queue depth. Mirrored in OpsCockpit.tsx as KANBAN_IDLE_TOP_VH — the board
+     maps the flipped crossbar into page coords from it; change one, change both. */
   position: absolute;
   left: 0;
   right: 0;
@@ -830,7 +831,9 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
    LEFT and the chips hang BELOW the bar. The reused rail draws at FIXED local y
    (inherited from the full-page arc geometry, ~246px·uiScale centre), so we pivot
    about THAT point — not the section centre — to keep the band framed regardless
-   of the section height. The ClockDial counter-rotates in SVG to stay upright. */
+   of the section height. The ClockDial counter-rotates in SVG to stay upright.
+   The 246px pivot is mirrored in OpsCockpit.tsx as KANBAN_IDLE_FLIP_PIVOT_PX —
+   the kanban board unflips the crossbar with it; change one, change both. */
 .worker-queues--flip {
   transform: rotate(180deg);
   transform-origin: 50% calc(246px * var(--ui-scale, 1));
@@ -947,47 +950,55 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 }
 
 /* ══ KANBAN ═══════════════════════════════════════════════════════════════════
-   The blank gold board filling the band between the worker crossbar (~31vh)
-   and the idle crossbar (80vh). Static placeholder plates this pass — no data,
-   no interaction. absolute (anchored to .page, like the crossbar assemblies)
-   so it scrolls in lockstep with the rails it sits between.
-   NO outer border, NO column chrome: the board is gold plates on the bare
-   metal, seamed only by dashed interior dividers. Column count arrives from
-   the component as --kanban-cols; the config array in OpsCockpit.tsx is the
-   only knob.
+   The blank gold board filling the band between the worker crossbar and the
+   idle crossbar. Static placeholder plates this pass — no data, no interaction.
+   GEOMETRY-BOUND: an inset:0 page layer (like the crossbar assemblies); the
+   component positions every seam and column inline off railCrossbar — the SAME
+   curve+span both rails render from — so the board hugs the bars' bows and
+   never reaches past the handlebar ends into the drain ditches. No static band
+   maths lives here anymore.
+   NO outer border, NO column chrome: gold-outlined plates on the bare metal,
+   seamed only by dashed SVG dividers. Column count is the KANBAN_COLUMNS config
+   array in OpsCockpit.tsx — the only knob.
    Z-ORDER INVARIANT: z:40 — above the composition layers (arc z:3, hub z:4,
    worker rails z:6) but strictly BELOW the idle-worker-queue (z:62): idle chips
    climbing up and clobbering the board is the intended "too many idle" error
    signifier. Never raise this past 61. */
 .kanban {
   position: absolute;
-  left: 24px;
-  right: 24px;
-  top: calc(31vh + 22px);
-  /* band floor = idle crossbar (80vh) − breathing room; fixed height so the
-     board can never push past the idle rail. */
-  height: calc(49vh - 48px);
+  inset: 0;
   z-index: 40;
-  display: grid;
-  grid-template-columns: repeat(var(--kanban-cols, 4), minmax(0, 1fr));
-  overflow: hidden;
+  pointer-events: none;
+}
+.kanban__svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
 }
 
-/* Columns wear no chrome — the only seam is the interior dashed divider, and
-   :last-child drops it so seams never reach the outer edge. Deliberately NOT
-   routed through --instrument: the slight translucency IS the point (the
-   alpha-never-a-knob doctrine governs instrument strokes; these seams are
-   furniture, not instrument). If 1px native dashes render too fine, swap to a
-   ::after strip with repeating-linear-gradient. */
+/* Column seams — dashed SVG verticals running crossbar-to-crossbar, each end
+   landing on the bar's bow (endpoints + dasharray set inline, uiScale-scaled).
+   Deliberately NOT routed through --instrument: the translucency IS the point
+   (the alpha-never-a-knob doctrine governs instrument strokes; these seams are
+   furniture, not instrument). */
+.kanban__seam {
+  fill: none;
+  stroke: var(--brass-deep);
+  stroke-opacity: 0.25;
+  stroke-width: 1;
+}
+
+/* Columns wear no chrome — position/size arrive inline from the component
+   (sampled off the crossbar curves); the seams are the SVG layer's. */
 .kanban__col {
+  position: absolute;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 0 calc(14px * var(--ui-scale, 1));
-  border-right: 1px dashed color-mix(in srgb, var(--brass-deep) 45%, transparent);
 }
-.kanban__col:last-child { border-right: none; }
 
 /* column header — quiet Roman-numeral chrome, no underline */
 .kanban__col-head {
@@ -1009,18 +1020,18 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   gap: calc(10px * var(--ui-scale, 1));
 }
 
-/* The plate. Solid brass face — deep at the base, lit at the crown — seated
-   onto the dark metal by an inset bright top lip, a dark lower inner shade,
-   and a drop shadow. Inert this pass: no hover, no motion, no pointer. */
+/* The plate — same inner/outer language as the handlebars: official instrument
+   gold outline over a darker interior. The background mirrors the rail band's
+   FROZEN bandFill: 0.14 (RAIL_SHAPE_DEFAULTS) — the same faint brass wash over
+   the page metal, so plates and table lip read as one material; keep the 14%
+   in step with bandFill if that ever moves. Inert this pass: no hover, no
+   motion, no pointer. */
 .kanban-card {
   flex: none;
   height: calc(84px * var(--ui-scale, 1));
   border-radius: var(--radius-card);
-  background: linear-gradient(0deg, var(--brass-deep), var(--brass));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--brass-bright) 60%, transparent),
-    inset 0 calc(-3px * var(--ui-scale, 1)) calc(5px * var(--ui-scale, 1)) rgba(7, 6, 10, 0.3),
-    0 calc(3px * var(--ui-scale, 1)) calc(9px * var(--ui-scale, 1)) rgba(7, 6, 10, 0.5);
+  border: var(--instrument-w) solid var(--instrument);
+  background: color-mix(in srgb, var(--instrument) 14%, var(--bg-deep));
   padding: calc(14px * var(--ui-scale, 1)) calc(16px * var(--ui-scale, 1));
   display: flex;
   flex-direction: column;
@@ -1028,16 +1039,13 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   pointer-events: none;
 }
 
-/* engraved placeholder strokes — near-black grooves cut into the brass face,
-   lit from above: dark inner top edge, faint brass-bright lower lip. */
+/* placeholder strokes — flat muted brass bars readable on the dark wash (the
+   engraving shadows belonged to the retired solid-gold face). */
 .kanban-card__line {
   height: calc(7px * var(--ui-scale, 1));
   width: 88%;
   border-radius: calc(3px * var(--ui-scale, 1));
-  background: rgba(7, 6, 10, 0.82);
-  box-shadow:
-    inset 0 1px 1px rgba(7, 6, 10, 0.9),
-    0 1px 0 color-mix(in srgb, var(--brass-bright) 30%, transparent);
+  background: color-mix(in srgb, var(--brass) 30%, transparent);
 }
 .kanban-card__line--title {
   height: calc(10px * var(--ui-scale, 1));
