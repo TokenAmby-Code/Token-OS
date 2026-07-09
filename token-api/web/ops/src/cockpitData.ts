@@ -300,13 +300,13 @@ export function buildDials(s: OpsState): DialModel[] {
  */
 export function toTtsQueue(s: OpsState): TtsItem[] {
   const instanceOf = (instanceId: string) => s.instances.active.find((i) => i.id === instanceId);
+  const shortId = (instanceId: string): string => instanceId.slice(0, 8);
   const personaOf = (item: { instance_id: string; persona_slug?: string | null }): string =>
     item.persona_slug ?? instanceOf(item.instance_id)?.persona?.slug ?? 'astartes';
   const displayNameOf = (item: { instance_id: string; name: string | null; persona_display_name?: string | null }): string =>
     item.name ?? item.persona_display_name ?? instanceOf(item.instance_id)?.display_name ?? shortId(item.instance_id);
   const commanderOf = (item: { instance_id: string; commander_type?: string | null }): string | null =>
     item.commander_type ?? instanceOf(item.instance_id)?.commander_type ?? null;
-  const shortId = (instanceId: string): string => instanceId.slice(0, 8);
 
   const items: TtsItem[] = [];
   const c = s.tts.current;
