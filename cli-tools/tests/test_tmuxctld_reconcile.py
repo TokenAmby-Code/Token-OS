@@ -660,7 +660,7 @@ def test_ledger_reconcile_scrubs_chrome_on_unbound_free_slot(monkeypatch):
 
     out = control.ledger_reconcile()
 
-    assert out["chrome_scrubbed_free_panes"] == ["%22"]
+    assert out["chrome_scrubbed_unbound_panes"] == ["%22"]
     assert adapter.cleared == ["%22"]
 
 
@@ -709,5 +709,44 @@ def test_ledger_reconcile_does_not_scrub_ledger_bound_or_singleton_panes(monkeyp
 
     out = control.ledger_reconcile()
 
-    assert out["chrome_scrubbed_free_panes"] == ["%1"]
+    assert out["chrome_scrubbed_unbound_panes"] == ["%1"]
     assert adapter.cleared == ["%1"]
+
+
+def test_ledger_reconcile_scrubs_unbound_nonfree_hollow_slot(monkeypatch):
+    """Unbound chrome drift is scrubbed even before the pane reaches freelist.
+
+    Live proof exposed a slot with @INSTANCE_ID empty but a hollow wrapper row and
+    a bare shell keeping it out of the freelist. Since chrome derives from bind,
+    reconcile must scrub it on the unbound ledger state, not wait for freelist.
+    """
+
+    class HollowAdapter:
+        def __init__(self):
+            self.cleared = []
+
+        def run(self, *args, allow_failure=False):  # noqa: ARG002
+            if args[:2] == ("list-panes", "-a"):
+                fmt = args[-1]
+                if "TOKEN_API_WRAPPER_ID" in fmt:
+                    return _raw_scan_line(
+                        wrapper_id="w-hollow",
+                        instance_id="",
+                        pane_id="somnium:N",
+                        engine="claude",
+                        working_dir="/tmp/stale",
+                    )
+                return "%22\tsomnium:N\tsomnium\t4242\t0"
+            return ""
+
+        def clear_runtime_state(self, target):
+            self.cleared.append(target)
+
+    adapter = HollowAdapter()
+    control = TmuxControlPlane(adapter=adapter)
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: True)
+
+    out = control.ledger_reconcile()
+
+    assert out["chrome_scrubbed_unbound_panes"] == ["%22"]
+    assert adapter.cleared == ["%22"]
