@@ -1586,13 +1586,14 @@ fi
 
 tmuxctld_result_max_time() {
   # curl max-time is a transport budget, not the dispatch protocol bound.  The
-  # stack allocator must be allowed to return its real daemon verdict: aborting
-  # POST /stack/dispatch at an arbitrary 60s client ceiling leaves the daemon
-  # thread free to finish later, after the caller has abandoned the pane.  Other
-  # routes keep the legacy 60s transport budget unless explicitly overridden.
+  # stack allocator and lifecycle reconcile/close transactions must be allowed
+  # to return their real daemon verdict; aborting them at an arbitrary client
+  # ceiling leaves the daemon thread free to finish after the caller abandoned
+  # the pane.
   case "${1:-} ${2:-}" in
     "POST /stack/dispatch") printf '%s' "${TMUXCTLD_STACK_DISPATCH_MAX_TIME:-0}" ;;
-    "POST /send-text"|"POST /reconcile"|"POST /close-pane") printf '%s' "${TMUXCTLD_MAX_TIME:-$(tmuxctld_lifecycle_client_timeout)}" ;;
+    "POST /reconcile"|"POST /close-pane") printf '%s' "${TMUXCTLD_MAX_TIME:-0}" ;;
+    "POST /send-text") printf '%s' "${TMUXCTLD_MAX_TIME:-$(tmuxctld_send_client_timeout)}" ;;
     *) printf '%s' "${TMUXCTLD_MAX_TIME:-60}" ;;
   esac
 }

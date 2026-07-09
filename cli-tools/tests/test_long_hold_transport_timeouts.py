@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
-import os
-import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,14 +67,10 @@ def test_brief_send_transport_timeout_exceeds_send_ceiling() -> None:
     assert seen["timeout"] > 60.0
 
 
-def test_tmuxctld_ping_long_hold_routes_exceed_sixty_seconds() -> None:
-    env = os.environ.copy()
-    env.update({"TMUXCTLD_PING_PRINT_RESPONSE": "1", "TMUXCTLD_URL": "http://127.0.0.1:9"})
-    cmd = "source cli-tools/lib/tmuxctld-timeouts.sh; tmuxctld_lifecycle_client_timeout"
-    budget = subprocess.check_output(["bash", "-lc", cmd], cwd=ROOT, env=env, text=True).strip()
-    assert float(budget) > 60.0
+def test_tmuxctld_ping_lifecycle_routes_have_no_client_transfer_timeout() -> None:
     text = (ROOT / "cli-tools/bin/tmuxctld-ping").read_text()
-    assert (
-        '"POST /reconcile"' in text and '"POST /close-pane"' in text and '"POST /send-text"' in text
-    )
-    assert "tmuxctld_lifecycle_client_timeout" in text
+    assert '"POST /reconcile"|"POST /close-pane")' in text
+    assert 'MAX_TIME="${TMUXCTLD_MAX_TIME:-0}"' in text
+    assert "tmuxctld_lifecycle_client_timeout" not in text
+    assert '"POST /send-text")' in text
+    assert "tmuxctld_send_client_timeout" in text

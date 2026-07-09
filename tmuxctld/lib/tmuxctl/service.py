@@ -481,10 +481,26 @@ class TmuxControlPlane:
         return [row.as_dict() for row in LEDGER.rows(include_closed=include_closed)]
 
     def ledger_reconcile(self) -> dict:
-        """Rebuild active wrapper-ledger rows from one live tmux scan."""
+        """Rebuild active wrapper-ledger rows and reconcile pane chrome from it.
+
+        Pane chrome is a pure derivative of the wrapper→pane bind ledger.  After
+        the active rows are rebuilt from live tmux, every dispatch-available pane
+        (no active ledger row, no live agent, not a singleton, past boot grace) is
+        scrubbed in the same reconcile pass.  This makes a released bind release
+        tint/title/runtime chrome transactionally instead of relying on post-hoc
+        clear guards or a later close path.
+        """
         from .wrapper_ledger import LEDGER
 
-        return LEDGER.reconcile_from_tmux(self.adapter)
+        out = dict(LEDGER.reconcile_from_tmux(self.adapter))
+        scrubbed: list[str] = []
+        for pane in list_free_panes(self.adapter):
+            target = pane.pane_id
+            self.adapter.clear_runtime_state(target)
+            scrubbed.append(target)
+        out["chrome_scrubbed_free_panes"] = scrubbed
+        out["chrome_scrubbed_free_count"] = len(scrubbed)
+        return out
 
     def freelist(self) -> list[dict]:
         """List the unoccupied, agent-free panes (the freelist).
