@@ -19,8 +19,7 @@ import {
   type TtsItemStatus,
   type WorkerItem,
 } from './cockpitData';
-import { clearPhoneAttention, openSessionDoc, useOpsState, useSessionDocs, useTimerHistory } from './api';
-import type { OpsInstance, PipelineDoc } from './contracts';
+import { clearPhoneAttention, useOpsState, useTimerHistory } from './api';
 import {
   DIR_DEGREES,
   resolveCompass,
@@ -3770,246 +3769,54 @@ function pointsToPath(pts: { x: number; y: number }[]): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MUSTER LEDGER — the today-focused session-doc kanban between the crossbars.
+// KANBAN — the blank gold board filling the band between the crossbars.
 //
-// Read-only: Obsidian is the sole writer of `status:`; a card click routes
-// through the server-side open funnel (openSessionDoc), never mutates. The doc
-// feed polls slowly (30s — docs move on Obsidian-edit cadence); the live
-// filament joins the fast 2s ops-state feed client-side by session_doc.id.
+// Static placeholder plates this pass: no data wiring, no handlers, nothing
+// focusable — the Emperor judges the metal before the ink. Column count is
+// driven ENTIRELY by KANBAN_COLUMNS (published to CSS as --kanban-cols);
+// nothing else knows how many columns exist.
 // The board sits at z:40, deliberately UNDER the idle-worker-queue (z:62):
 // a fat idle queue visibly clobbering the board IS the error signifier.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const LEDGER_LANES = [
-  { key: 'stub', label: 'Stub', statuses: ['stub'] },
-  { key: 'active', label: 'Active', statuses: ['active'] },
-  { key: 'landing', label: 'Landing', statuses: ['fix-landed-pre-merge', 'follow-up'] },
-  { key: 'merged', label: 'Merged', statuses: ['merged', 'consolidated'] },
-] as const;
-type LedgerLaneKey = (typeof LEDGER_LANES)[number]['key'];
+type KanbanColumnConfig = { key: string; title: string; cards: number };
 
-const KNOWN_LEDGER_STATUSES = new Set<string>(LEDGER_LANES.flatMap((l) => [...l.statuses]));
+const KANBAN_COLUMNS: KanbanColumnConfig[] = [
+  { key: 'i', title: 'I', cards: 3 },
+  { key: 'ii', title: 'II', cards: 2 },
+  { key: 'iii', title: 'III', cards: 4 },
+  { key: 'iv', title: 'IV', cards: 2 },
+];
 
-// status → lane. Unknown statuses land in ACTIVE wearing the raw status as a
-// dashed stamp — an unknown state is something to look at, not to hide.
-function ledgerLane(status: string): LedgerLaneKey {
-  for (const lane of LEDGER_LANES) {
-    if ((lane.statuses as readonly string[]).includes(status)) return lane.key;
-  }
-  return 'active';
-}
-
-// Local calendar date, string space only. NEVER toISOString() (UTC rolls to
-// tomorrow every evening here) and NEVER new Date('YYYY-MM-DD') (parses as UTC
-// midnight → yesterday) — the old board's America/Denver mistake, kept dead.
-function ledgerToday(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-const AGE_OLD_S = 2 * 86400; // ≥2d open reads as long-lived (muted brass)
-
-function fmtDocAge(s: number | null | undefined): string {
-  if (s == null) return '—';
-  if (s < 3600) return `${Math.max(1, Math.round(s / 60))}m`;
-  if (s < AGE_OLD_S) return `${Math.round(s / 3600)}h`;
-  return `${Math.round(s / 86400)}d`;
-}
-
-// Compact persona chip text: "Blood Angels" → "B·ANGELS", "Salamanders" → "SALAM".
-function ledgerChipLabel(name: string | null | undefined, slug: string | null | undefined): string | null {
-  const src = (name || slug || '').trim();
-  if (!src) return null;
-  const up = src.toUpperCase();
-  if (up.length <= 9) return up;
-  const words = up.split(/[\s-]+/).filter(Boolean);
-  if (words.length > 1) return `${words[0][0]}·${words[words.length - 1]}`.slice(0, 9);
-  return up.slice(0, 5);
-}
-
-function ledgerPrChip(url: string | null, state: string | null): { label: string; merged: boolean } | null {
-  if (!url) return null;
-  const m = url.match(/\/pull\/(\d+)/);
-  const label = `${m ? `PR#${m[1]}` : 'PR'}${state ? ` ${state}` : ''}`;
-  return { label, merged: state === 'merged' };
-}
-
-// Per-doc join of the fast ops-state feed: live instance count + the first
-// bound instance's PR chip (the doc feed itself carries no PR fields).
-type LedgerLive = { count: number; prUrl: string | null; prState: string | null };
-
-function MusterCard({ doc, live }: { doc: PipelineDoc; live: LedgerLive | undefined }) {
-  const rubric = doc.rubric ?? null;
-  // `present` is the load-bearing gate: legacy docs with no rubric evaluate as
-  // complete:true, so every rubric treatment keys on present && — never
-  // `complete` alone, or every legacy doc reads as a declared victory.
-  const present = Boolean(rubric?.present);
-  const chip = doc.persona?.chip_color ?? null;
-  const chipText = ledgerChipLabel(doc.persona?.display_name, doc.persona?.slug ?? doc.persona_slug);
-  const liveCount = live?.count ?? 0;
-  const pr = ledgerPrChip(live?.prUrl ?? null, live?.prState ?? null);
-  const met = rubric?.met ?? 0;
-  const total = rubric?.total ?? 0;
-  const skipped = rubric?.skipped ?? 0;
-  const unmet = Math.max(0, total - met - skipped);
-  const ageS = doc.age_seconds ?? null;
-
-  let sub: ReactNode = null;
-  if (present && !rubric?.complete) {
-    sub = (
-      <span className="muster-sub muster-sub--accuse">
-        <span className="muster-flag">⚑</span> awaiting {rubric?.first_unmet ?? '…'}
-      </span>
-    );
-  } else if (present && rubric?.complete && !rubric?.acknowledged_at) {
-    sub = <span className="muster-sub muster-sub--victory">✦ victory declared — awaiting ack</span>;
-  } else if (doc.head) {
-    sub = <span className="muster-sub">{doc.head}</span>;
-  }
-
+// One inert gold plate: solid brass face wearing three engraved placeholder
+// strokes. No handlers, no tabindex, hidden from AT — pure metal.
+function KanbanCard() {
   return (
-    <button
-      type="button"
-      className={`muster-card${liveCount > 0 ? ' muster-card--live' : ''}`}
-      style={chip ? ({ '--fil': chip, '--pc': chip } as React.CSSProperties) : undefined}
-      onClick={() => {
-        if (doc.id == null) return; // unregistered doc — nothing to open by id
-        openSessionDoc(doc.id).catch((err) => console.error('[muster] open session doc failed', err));
-      }}
+    <div className="kanban-card" aria-hidden>
+      <span className="kanban-card__line kanban-card__line--title" />
+      <span className="kanban-card__line" />
+      <span className="kanban-card__line kanban-card__line--short" />
+    </div>
+  );
+}
+
+function KanbanBoard() {
+  return (
+    <section
+      className="kanban"
+      aria-label="Kanban board"
+      style={{ '--kanban-cols': KANBAN_COLUMNS.length } as React.CSSProperties}
     >
-      <span className="muster-fil" aria-hidden />
-      <span className="muster-card__body">
-        <span className="muster-card__top">
-          <span className="muster-card__title">{doc.title ?? `doc ${doc.id}`}</span>
-          {chipText ? <span className="muster-persona-chip">{chipText}</span> : null}
-          {!KNOWN_LEDGER_STATUSES.has(doc.status) ? (
-            <span className="muster-status-stamp">{doc.status}</span>
-          ) : null}
-        </span>
-        {sub}
-        <span className="muster-card__meta">
-          <span>{doc.project ?? '—'}</span>
-          {pr ? <span className={`muster-pr${pr.merged ? ' muster-pr--merged' : ''}`}>{pr.label}</span> : null}
-          {liveCount > 0 ? <span className="muster-live">◉ {liveCount}</span> : null}
-          <span className={`muster-age${ageS != null && ageS >= AGE_OLD_S ? ' muster-age--old' : ''}`}>
-            {fmtDocAge(ageS)}
-          </span>
-        </span>
-        {present && total > 0 ? (
-          <span className="muster-rubric" aria-label={`rubric ${met} of ${Math.max(0, total - skipped)} met`}>
-            {Array.from({ length: met }, (_, i) => (
-              <i key={`m${i}`} className="muster-pip--met" />
+      {KANBAN_COLUMNS.map((col) => (
+        <section className="kanban__col" key={col.key}>
+          <header className="kanban__col-head">{col.title}</header>
+          <div className="kanban__col-body">
+            {Array.from({ length: col.cards }, (_, i) => (
+              <KanbanCard key={i} />
             ))}
-            {Array.from({ length: skipped }, (_, i) => (
-              <i key={`s${i}`} className="muster-pip--skip" />
-            ))}
-            {Array.from({ length: unmet }, (_, i) => (
-              <i key={`u${i}`} className="muster-pip--unmet" />
-            ))}
-            <span className={`muster-tally${rubric?.complete ? ' muster-tally--done' : ''}`}>
-              {met}/{Math.max(0, total - skipped)}
-            </span>
-          </span>
-        ) : null}
-      </span>
-      <span className="muster-goto" aria-hidden>↗ obsidian</span>
-    </button>
-  );
-}
-
-function MusterLedger({ instances }: { instances: OpsInstance[] }) {
-  const feed = useSessionDocs(30000);
-  const today = ledgerToday();
-
-  const liveByDoc = useMemo(() => {
-    const m = new Map<number, LedgerLive>();
-    for (const inst of instances) {
-      const docId = inst.session_doc?.id;
-      if (docId == null || !inst.runtime?.live) continue;
-      const cur = m.get(docId) ?? { count: 0, prUrl: null, prState: null };
-      cur.count += 1;
-      if (!cur.prUrl && inst.pr_url) {
-        cur.prUrl = inst.pr_url;
-        cur.prState = inst.pr_state;
-      }
-      m.set(docId, cur);
-    }
-    return m;
-  }, [instances]);
-
-  const docs = feed.data?.docs ?? [];
-  const todayDocs = docs.filter((d) => (d.session_date ?? '').slice(0, 10) === today);
-  const byLane = new Map<LedgerLaneKey, PipelineDoc[]>(LEDGER_LANES.map((l) => [l.key, []]));
-  for (const d of todayDocs) byLane.get(ledgerLane(d.status))!.push(d);
-
-  // All-dates per-lane totals from the server's pre-cap lane_totals, so the
-  // footer reports what the today filter AND the server cap dropped. The
-  // denominator is all-dates — hence the copy says "more", never "more today".
-  const laneTotals = new Map<LedgerLaneKey, number>();
-  for (const [status, n] of Object.entries(feed.data?.lane_totals ?? {})) {
-    const key = ledgerLane(status);
-    laneTotals.set(key, (laneTotals.get(key) ?? 0) + n);
-  }
-
-  const liveTotal = todayDocs.reduce(
-    (n, d) => n + (d.id != null ? (liveByDoc.get(d.id)?.count ?? 0) : 0),
-    0,
-  );
-  const awaitingAck = todayDocs.filter(
-    (d) => d.rubric?.present && d.rubric?.complete && !d.rubric?.acknowledged_at,
-  ).length;
-
-  return (
-    <section className="muster-ledger" aria-label="Muster ledger — today's session documents">
-      <header className="muster-head">
-        <h2>
-          <span className="muster-sig">⌖</span>Muster Ledger
-        </h2>
-        <span className="muster-meta">
-          {today} · {todayDocs.length} {todayDocs.length === 1 ? 'thread' : 'threads'}
-          {liveTotal > 0 ? <> · <b>◉ {liveTotal} live</b></> : null}
-          {awaitingAck > 0 ? <> · <span className="muster-ack">✦ {awaitingAck} awaiting ack</span></> : null}
-        </span>
-      </header>
-      {feed.error && !feed.data ? (
-        <div className="muster-empty">session-docs feed failing — {feed.error}</div>
-      ) : todayDocs.length === 0 ? (
-        <div className="muster-empty">{feed.loading ? 'mustering…' : 'no muster today'}</div>
-      ) : (
-        <div className="muster-lanes">
-          {LEDGER_LANES.map((lane) => {
-            const laneDocs = byLane.get(lane.key)!;
-            const hidden = Math.max(0, (laneTotals.get(lane.key) ?? 0) - laneDocs.length);
-            return (
-              <section
-                className="muster-lane"
-                key={lane.key}
-                style={{ '--lane-c': `var(--lane-${lane.key})` } as React.CSSProperties}
-              >
-                <header className="muster-lane__head">
-                  <span className="muster-lane__dot" aria-hidden />
-                  {lane.label}
-                  <span className="muster-lane__count"><b>{laneDocs.length}</b></span>
-                </header>
-                <div className="muster-lane__body">
-                  {laneDocs.length === 0 ? (
-                    <div className="muster-lane__empty">—</div>
-                  ) : (
-                    laneDocs.map((d, i) => (
-                      <MusterCard
-                        key={d.id ?? `${lane.key}-${i}`}
-                        doc={d}
-                        live={d.id != null ? liveByDoc.get(d.id) : undefined}
-                      />
-                    ))
-                  )}
-                  {hidden > 0 ? <div className="muster-lane__foot">+{hidden} more · obsidian</div> : null}
-                </div>
-              </section>
-            );
-          })}
-        </div>
-      )}
+          </div>
+        </section>
+      ))}
     </section>
   );
 }
@@ -4281,12 +4088,12 @@ export function OpsCockpit() {
       <IdleWorkerQueue clockValue={life.clockValue} idleLeft={life.idleLeft} idleRight={life.idleRight}
         pendingIds={life.pendingIds} uiScale={uiScale} animate={!reducedMotion} />
 
-      {/* muster ledger — the today-focused session-doc kanban filling the band
-          between the worker crossbar (~31vh) and the idle crossbar (80vh).
-          Read-only; card click opens the doc in Obsidian server-side. z:40 so a
-          fat idle queue (z:62) visibly clobbers it — the clobber IS the error
-          signifier. Liveness joins the fast 2s instance feed by session_doc.id. */}
-      <MusterLedger instances={opsState.data?.instances.active ?? []} />
+      {/* kanban — the blank gold board filling the band between the worker
+          crossbar (~31vh) and the idle crossbar (80vh). Static placeholder
+          plates this pass; data wiring is a follow-up. z:40 so a fat idle
+          queue (z:62) visibly clobbers it — the clobber IS the error
+          signifier. Never raise the board past 61. */}
+      <KanbanBoard />
 
       {/* dials drawer — where the default dial click lands (minimal stub) */}
       <DialsDrawer open={drawerOpen} focusedId={focusedDial} onClose={() => setDrawerOpen(false)} />
