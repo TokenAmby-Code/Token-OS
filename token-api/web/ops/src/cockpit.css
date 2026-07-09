@@ -1116,5 +1116,5 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   will-change: transform;
 }
 @keyframes instrument-spin {
-  to { transform: rotate(360deg); }
+  100% { transform: rotate(360deg); }
 }

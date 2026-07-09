@@ -2469,35 +2469,19 @@ async def queue_tts(
         logger.info(f"TTS suppressed (silent mode): {message[:80]}")
         return {"success": True, "queued": False, "reason": "silent"}
 
-    if effective_mode == "muted":
-        # Sound only, no TTS speech
-        item = TTSQueueItem(
-            instance_id=instance_id,
-            message="",  # Empty message = no speech
-            voice=voice,
-            sound=sound,
-            name=name,
-            queue_target=queue_target,
-            focus_on_playback=False,
-            persona_slug=row["persona_slug"],
-            persona_display_name=row["persona_display_name"],
-            commander_type=row["commander_type"],
-            completion=completion,
-        )
-    else:
-        item = TTSQueueItem(
-            instance_id=instance_id,
-            message=message,
-            voice=voice,
-            sound=sound,
-            name=name,
-            queue_target=queue_target,
-            focus_on_playback=False,
-            persona_slug=row["persona_slug"],
-            persona_display_name=row["persona_display_name"],
-            commander_type=row["commander_type"],
-            completion=completion,
-        )
+    item = TTSQueueItem(
+        instance_id=instance_id,
+        message="" if effective_mode == "muted" else message,
+        voice=voice,
+        sound=sound,
+        name=name,
+        queue_target=queue_target,
+        focus_on_playback=False,
+        persona_slug=row["persona_slug"],
+        persona_display_name=row["persona_display_name"],
+        commander_type=row["commander_type"],
+        completion=completion,
+    )
 
     target = _resolve_queue_playback_target(
         message=item.message,
