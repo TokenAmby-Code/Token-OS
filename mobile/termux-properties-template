@@ -39,3 +39,6 @@ enforce-char-based-input = true
 # Restore normal volume button behavior
 # (instead of terminal shortcuts)
 volume-keys = volume
+
+# Allow MacroDroid/Termux RUN_COMMAND integration for phone automation hooks.
+allow-external-apps = true
