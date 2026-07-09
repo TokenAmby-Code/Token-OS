@@ -1408,16 +1408,17 @@ def _split_phone_utterance_text(text: str, *, max_chars: int | None = None) -> t
     return current, next_text
 
 
-def build_phone_tts_chunk_handoff(
+def build_one_utterance_tts_chunk_handoff(
     chunks: list[dict], *, max_chars: int | None = None
 ) -> list[dict]:
-    """Build one full-utterance phone handoff.
+    """Build one full-utterance backend handoff from sanitized chunks.
 
-    Phone v1 no longer streams/backfills intra-message chunks. Token-OS sends
-    exactly one ``/tts-chunk`` payload containing the complete sanitized message;
-    MacroDroid speaks it once and reports ``buffer_drained`` when finished.
+    Phone and WSL execute exactly one full utterance per Token-API TTS
+    message. Token-API may still split text internally for legacy contracts,
+    but backend handoff collapses those prepared chunks into a single ``1/1``
+    chunk with integrity metadata for the full rendered text.
     """
-    del max_chars  # Kept for test/back-compat call sites; phone does not split here.
+    del max_chars  # Kept for test/back-compat call sites; backends do not split here.
     texts = [str(chunk.get("text") or "").strip() for chunk in chunks]
     full_text = " ".join(text for text in texts if text).strip()
     if not full_text:
@@ -1436,6 +1437,17 @@ def build_phone_tts_chunk_handoff(
             "text_hash": hashlib.sha256(full_text.encode("utf-8")).hexdigest(),
         }
     ]
+
+
+def build_phone_tts_chunk_handoff(
+    chunks: list[dict], *, max_chars: int | None = None
+) -> list[dict]:
+    """Build one full-utterance phone handoff.
+
+    Compatibility wrapper for older call sites/tests. Phone v1 no longer
+    streams/backfills intra-message chunks.
+    """
+    return build_one_utterance_tts_chunk_handoff(chunks, max_chars=max_chars)
 
 
 def _backend_chunk_payload(
@@ -1691,6 +1703,69 @@ def dispatch_tts_chunks_to_backend(
             "backend": backend,
             "chunks": real_chunks,
             "completed_chunks": real_chunks,
+            "playback_id": result.get("playback_id"),
+            "playback_confirmed": result.get("playback_confirmed"),
+            "results": [result],
+        }
+
+    if backend == "wsl":
+        wsl_chunks = build_one_utterance_tts_chunk_handoff(chunks)
+        if not wsl_chunks:
+            return {"success": False, "error": "empty_audio_payload", "method": None}
+        chunk = wsl_chunks[0]
+        _record_tts_backend_active(
+            backend,
+            playback_id=chunk["playback_id"],
+            current=_chunk_public_payload(chunk),
+            next_chunk=None,
+        )
+        payload = _backend_chunk_payload(chunk, None, rate=wsl_rate or rate)
+        result = dict(
+            _post_wsl_chunk(payload, voice=wsl_voice or voice, rate=wsl_rate or rate) or {}
+        )
+        result.setdefault("chunk_id", chunk["chunk_id"])
+        result.setdefault("playback_id", chunk["playback_id"])
+        if result.get("skipped"):
+            return {
+                "success": False,
+                "skipped": True,
+                "method": result.get("method") or backend,
+                "chunks": 1,
+                "completed_chunks": 0,
+                "chunk_id": chunk["chunk_id"],
+                "playback_id": result.get("playback_id"),
+                "results": [result],
+                "reason": "skipped",
+            }
+        if not result.get("success"):
+            error = result.get("error") or "backend_chunk_failed"
+            _update_tts_authoritative_state(
+                last_error={
+                    "backend": backend,
+                    "playback_id": chunk["playback_id"],
+                    "chunk_id": chunk["chunk_id"],
+                    "error": error,
+                    "reported_at": _now_iso(),
+                }
+            )
+            return {
+                "success": False,
+                "error": error,
+                "method": result.get("method") or backend,
+                "chunks": 1,
+                "completed_chunks": 0,
+                "chunk_id": chunk["chunk_id"],
+                "playback_id": result.get("playback_id"),
+                "results": [result],
+                "reason": result.get("reason") or error,
+            }
+        return {
+            "success": True,
+            "method": result.get("method") or backend,
+            "backend": backend,
+            "chunks": 1,
+            "completed_chunks": 1,
+            "chunk_id": chunk["chunk_id"],
             "playback_id": result.get("playback_id"),
             "playback_confirmed": result.get("playback_confirmed"),
             "results": [result],
