@@ -3,7 +3,7 @@ from __future__ import annotations
 import pathlib
 import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
@@ -951,3 +951,41 @@ def test_build_snapshot_extracts_persona_slug_and_rank():
     entry = snap.instances[0]
     assert entry.persona_slug == "custodes"
     assert entry.rank == "overseer"
+
+
+def test_live_persona_empty_stamp_stopped_row_reasserts_binding():
+    adapter = FakeAdapter()
+    adapter.options.update(
+        {
+            "@PANE_ID": FG_LABEL,
+            "@PANE_TYPE": "mechanicus",
+            "@TOKEN_API_WRAPPER_ID": "wrap-fg",
+            "@TOKEN_API_ENGINE": "codex",
+            "@TOKEN_API_CWD": "/Volumes/Imperium/Imperium-ENV",
+            "@INSTANCE_ID": "",
+        }
+    )
+    stopped = _row(instance_id="i-fg", status=assertions.InstanceStatus.STOPPED)
+    resolved = SimpleNamespace(pane_id="%fg", pane_role=FG_LABEL)
+
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="mechanicus"),
+        patch.object(assertions, "_pane_dead", return_value=False),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "_registry_entries", side_effect=[[], [stopped]]),
+        patch.object(assertions, "update_instance_activity") as activity,
+        patch.object(assertions, "log_event") as log,
+        patch("tmuxctl.wrapper_ledger.LEDGER.upsert") as upsert,
+    ):
+        upsert.return_value.as_dict.return_value = {"wrapper_id": "wrap-fg", "instance_id": "i-fg"}
+        result = assertions.assert_instance(adapter, FG_LABEL)
+
+    assert result["ok"] is True
+    assert result["action"] == "binding_reasserted"
+    assert adapter.options["@INSTANCE_ID"] == "i-fg"
+    activity.assert_called_once_with("i-fg", "prompt_submit")
+    upsert.assert_called_once()
+    assert upsert.call_args.kwargs["pane_positional_id"] == FG_LABEL
+    assert upsert.call_args.kwargs["instance_id"] == "i-fg"
+    log.assert_any_call("persona_binding_reasserted", instance_id="i-fg", details=ANY)

@@ -848,6 +848,62 @@ def _guarded_note_mismatched(
     return False, "persona_mismatch_live_runtime", "persona_mismatch_noted"
 
 
+def _reassert_live_persona_binding(
+    adapter: TmuxAdapter, pane_id: str, pane_label: str, spec: PersonaSpec, row
+) -> dict[str, Any]:
+    """Atomically re-settle the tmux stamp, wrapper ledger, tint, and active row.
+
+    This is the infrastructure-side self-heal for split-brain singleton panes:
+    the persona label plus live runtime is presence evidence, even when
+    @INSTANCE_ID was churn-cleared and the registry row was marked stopped.
+    Agents must not patch their own identity rows; tmuxctld owns the pane-local
+    bind and Token-API activity endpoint owns row reactivation.
+    """
+    instance_id = getattr(row, "instance_id", "") or ""
+    wrapper_id = adapter.show_pane_option(
+        pane_id, "@TOKEN_API_WRAPPER_ID"
+    ) or adapter.show_pane_option(pane_id, "@TOKEN_API_WRAPPER_LAUNCH_ID")
+    engine = adapter.show_pane_option(pane_id, "@TOKEN_API_ENGINE") or spec.engine
+    working_dir = adapter.show_pane_option(pane_id, "@TOKEN_API_CWD")
+
+    adapter.run("set-option", "-p", "-t", pane_id, "@INSTANCE_ID", instance_id, allow_failure=True)
+    ledger = None
+    if wrapper_id:
+        try:
+            from .wrapper_ledger import LEDGER
+
+            ledger = LEDGER.upsert(
+                wrapper_id=wrapper_id,
+                instance_id=instance_id,
+                persona=spec.persona,
+                pane_positional_id=pane_label,
+                engine=engine,
+                working_dir=working_dir,
+                state="OPEN",
+            ).as_dict()
+        except Exception as exc:  # noqa: BLE001 - row reactivation still matters
+            ledger = {"error": str(exc), "wrapper_id": wrapper_id}
+    update_instance_activity(instance_id, "prompt_submit")
+    if spec.persona == "custodes":
+        patch_instance(instance_id, "synced", {"synced": True})
+        patch_instance(instance_id, "legion", {"legion": "custodes"})
+    _assert_persona_color(adapter, pane_id, spec)
+    _clear_persona_guard(adapter, pane_id)
+    log_event(
+        "persona_binding_reasserted",
+        instance_id=instance_id,
+        details={
+            "pane": pane_id,
+            "pane_label": pane_label,
+            "persona": spec.persona,
+            "wrapper_id": wrapper_id,
+            "ledger": ledger,
+            "repair": "stamp_registry_ledger_tint_reassert",
+        },
+    )
+    return {"instance_id": instance_id, "ledger": ledger, "wrapper_id": wrapper_id}
+
+
 def _stop_rows(rows, *, pane_id: str, pane_label: str, reason: str) -> None:
     for row in rows:
         try:
@@ -1276,21 +1332,16 @@ def _assert_instance_impl(
             )
             if stopped_match is not None:
                 try:
-                    update_instance_activity(stopped_match.instance_id, "prompt_submit")
-                    if spec.persona == "custodes":
-                        # Plan-mode exits can mark the row stopped and synced=0 while
-                        # the live Custodes runtime remains in-pane. Reactivation must
-                        # restore synced=true too; color/state-hook predicates depend on it.
-                        patch_instance(stopped_match.instance_id, "synced", {"synced": True})
-                        patch_instance(stopped_match.instance_id, "legion", {"legion": "custodes"})
-                    _assert_persona_color(adapter, pane_id, spec)
-                    _clear_persona_guard(adapter, pane_id)
+                    reasserted = _reassert_live_persona_binding(
+                        adapter, pane_id, pane_label, spec, stopped_match
+                    )
                     result.update(
                         {
                             "ok": True,
                             "instance_id": stopped_match.instance_id,
-                            "action": "registry_reactivated",
-                            "reason": "live_runtime_stopped_registry_row_reactivated",
+                            "action": "binding_reasserted",
+                            "reason": "live_runtime_stopped_registry_row_rebound",
+                            "reasserted": reasserted,
                         }
                     )
                     return finish(result, clear_failed=False)
