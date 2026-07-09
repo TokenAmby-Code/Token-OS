@@ -1240,12 +1240,17 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
       );
       after(2000, () => revertPromoting(key));
     };
-    playTtsItem(item.itemKey)
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 5000);
+    timers.current.push(timeout);
+    playTtsItem(item.itemKey, controller.signal)
       .then((result) => {
+        window.clearTimeout(timeout);
         if (!result.success) throw new Error(result.reason ?? 'play-item failed');
         after(850, () => revertPromoting(id));
       })
       .catch((err) => {
+        window.clearTimeout(timeout);
         console.error('[tts] play-item failed', err);
         showPromoteError(id);
       });
