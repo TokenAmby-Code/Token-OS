@@ -23276,7 +23276,7 @@ async def _ops_session_docs_feed(
 async def get_ops_session_docs(
     include_archived: bool = False,
     limit_per_lane: int = 12,
-):
+) -> dict:
     """Read-only pipeline-board feed — see _ops_session_docs_feed."""
     return await _ops_session_docs_feed(
         include_archived=include_archived, limit_per_lane=limit_per_lane

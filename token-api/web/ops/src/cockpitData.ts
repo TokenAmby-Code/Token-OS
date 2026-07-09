@@ -492,8 +492,12 @@ export type KanbanCardModel = {
   awaiting: string | null; // GT accusation: first unmet criterion of an incomplete rubric
   head: string | null; // one-line body excerpt — line 2 when there is no accusation
   rubric: { met: number; total: number; skipped: number } | null; // present rubrics only
-  live: boolean; // ≥1 instance bound to this doc — lights the filament
-  tint: string | null; // bound ACTIVE instance's persona chip colour (filament tint)
+  // Filament truth comes from the ACTIVE-instance join, NOT linked_instances:
+  // the feed's count includes stopped/historical rows, and a glowing filament
+  // with no live agent bound would be a false-positive identity surface
+  // (fail-dark decree). Dark unless an active instance is on the doc NOW.
+  live: boolean; // an ACTIVE instance is bound to this doc — lights the filament
+  tint: string | null; // that instance's persona chip colour (filament tint)
 };
 
 export type KanbanLane = {
@@ -520,10 +524,16 @@ export function toMusterBoard(s: OpsState, now: Date = new Date()): Record<strin
   for (const doc of feed.docs) {
     const laneKey = laneForStatus(doc.status);
     if (!laneKey || !isFromToday(doc, now)) continue;
+    const lane = laneOf(laneKey);
+    // Re-cap after projection: the feed caps per RAW status, but several raw
+    // statuses absorb into one lane (active + in-progress → astartes), so the
+    // raw caps can stack past the per-lane limit. Docs arrive created_at DESC,
+    // so the newest survive; the honesty counter reports the rest.
+    if (lane.cards.length >= feed.limit_per_lane) continue;
     const bound = s.instances.active.find(
       (i) => i.session_doc?.id != null && i.session_doc.id === doc.id,
     );
-    laneOf(laneKey).cards.push({
+    lane.cards.push({
       key: doc.id != null ? `doc:${doc.id}` : `path:${doc.path ?? doc.title ?? 'unknown'}`,
       laneKey,
       title: doc.title ?? docBasename(doc.path) ?? 'untitled',
@@ -534,7 +544,7 @@ export function toMusterBoard(s: OpsState, now: Date = new Date()): Record<strin
       rubric: doc.rubric?.present
         ? { met: doc.rubric.met, total: doc.rubric.total, skipped: doc.rubric.skipped }
         : null,
-      live: doc.linked_instances > 0,
+      live: bound != null,
       tint: bound?.persona?.chip_color ?? null,
     });
   }

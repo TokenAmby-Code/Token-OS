@@ -348,12 +348,16 @@ describe('toMusterBoard', () => {
     expect(plain.rubric).toBeNull(); // never render a victory state for a rubric-less doc
   });
 
-  it('lights the filament and joins the persona tint from the bound ACTIVE instance', () => {
+  it('lights the filament ONLY off a bound ACTIVE instance (fail-dark), tinted by its persona', () => {
     const board = toMusterBoard(
       boardState(
         [
           { id: 7, title: 'Live Doc', linked_instances: 2 },
           { id: 8, title: 'Dormant Doc', linked_instances: 0 },
+          // linked_instances counts stopped/historical rows too — with no
+          // ACTIVE instance bound, the filament must stay dark (a glow here
+          // would be a false-positive identity surface).
+          { id: 9, title: 'Historical Doc', linked_instances: 3 },
         ],
         {},
         [
@@ -364,9 +368,31 @@ describe('toMusterBoard', () => {
       NOW,
     );
 
-    const [live, dormant] = board.astartes.cards;
+    const [live, dormant, historical] = board.astartes.cards;
     expect(live).toMatchObject({ live: true, tint: '#b1191e' });
     expect(dormant).toMatchObject({ live: false, tint: null });
+    expect(historical).toMatchObject({ live: false, tint: null });
+  });
+
+  it('re-caps each canonical lane at limit_per_lane after absorbing multiple raw statuses', () => {
+    // The feed caps per RAW status; active + in-progress both absorb into
+    // astartes, so raw caps could stack to 2× the lane limit without a
+    // board-side re-cap. Newest (feed order) survive; overflow stays honest.
+    const state = boardState(
+      [
+        { id: 1, status: 'active', title: 'A1' },
+        { id: 2, status: 'active', title: 'A2' },
+        { id: 3, status: 'in-progress', title: 'P1' },
+        { id: 4, status: 'in-progress', title: 'P2' },
+      ],
+      { active: 2, 'in-progress': 2 },
+    );
+    (state.session_docs as { limit_per_lane: number }).limit_per_lane = 3;
+
+    const board = toMusterBoard(state, NOW);
+
+    expect(board.astartes.cards.map((c) => c.title)).toEqual(['A1', 'A2', 'P1']);
+    expect(board.astartes.overflow).toBe(1); // 4 truly in-lane, 3 shown
   });
 
   it('stamps the raw status via laneKey mismatch and reports honesty overflow', () => {
