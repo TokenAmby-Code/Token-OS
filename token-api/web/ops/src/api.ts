@@ -160,6 +160,7 @@ async function postJson<T = unknown>(url: string, body?: unknown): Promise<T> {
 
 export type SkipResult = { skipped: boolean; cleared: number; backend?: string | null };
 export type PromoteResult = { success: boolean; promoted: number };
+export type PlayItemResult = { success: boolean; promoted: number; item_key: string; reason?: string };
 export type GlobalModeResult = { status: string; mode: TtsGlobalMode; old_mode: string };
 export type FocusResult = { snapped: boolean; reason: string | null };
 export type MorningEndResult = { status: string; changed: boolean; morning_status: string };
@@ -178,6 +179,11 @@ export function promotePause(instanceId?: string): Promise<PromoteResult> {
 /** Promote all of one instance's paused items to the front of the hot queue. */
 export function playPane(instanceId: string): Promise<PromoteResult> {
   return postJson<PromoteResult>('/api/tts/queue/play-pane', { instance_id: instanceId });
+}
+
+/** Promote/play one exact queued TTS item. */
+export function playTtsItem(itemKey: string): Promise<PlayItemResult> {
+  return postJson<PlayItemResult>('/api/tts/queue/play-item', { item_key: itemKey });
 }
 
 /** Set the global TTS mode (verbose | muted | silent). */

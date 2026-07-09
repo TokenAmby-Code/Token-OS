@@ -120,6 +120,7 @@ describe('toTtsQueue', () => {
         hot_queue: [],
         pause_queue: [
           {
+            item_key: 'pause-key-1',
             instance_id: 'sender-instance-1234',
             name: null,
             message: 'queued line',
@@ -134,7 +135,14 @@ describe('toTtsQueue', () => {
     } as unknown as OpsState);
 
     expect(queue[0]).toMatchObject({ commanderType: 'chapter', playbackTarget: 'phone', senderName: 'Ultramarines' });
-    expect(queue[1]).toMatchObject({ commanderType: 'persona', playbackTarget: 'wsl', route: 'pause/wsl · Sender' });
+    expect(queue[1]).toMatchObject({
+      itemKey: 'pause-key-1',
+      queueState: 'pause',
+      promotable: true,
+      commanderType: 'persona',
+      playbackTarget: 'wsl',
+      route: 'pause/wsl · Sender',
+    });
   });
 });
 

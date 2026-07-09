@@ -19,7 +19,7 @@ import {
   type TtsItemStatus,
   type WorkerItem,
 } from './cockpitData';
-import { clearPhoneAttention, useOpsState, useTimerHistory } from './api';
+import { clearPhoneAttention, playTtsItem, useOpsState, useTimerHistory } from './api';
 import {
   DIR_DEGREES,
   resolveCompass,
@@ -1050,17 +1050,19 @@ function agentNodeCenter(id: string, scopeSel?: string): { x: number; y: number 
 // mock's local promoting play-gesture phase is retired: the live queue is the
 // sole driver of order and drain, so the stack never animates a state the data
 // didn't report.
-type TtsPhase = 'arriving' | 'idle' | 'speaking' | 'dismissing';
+type TtsPhase = 'arriving' | 'idle' | 'promoting' | 'speaking' | 'dismissing';
 interface TtsEntry {
   key: string; // = agent.id = the live item id — the React key
   agent: TtsAgent; // the woven identity; item = agent.item, originSide rides to idle
   phase: TtsPhase;
   slot: number; // visual row (0 = head); the sole position driver
+  promoteSlot: number | undefined; // click-time source slot for the CSS L-path
 }
 
 const TTS_PHASE_CLASS: Record<TtsPhase, string> = {
   arriving: 'tts-dial tts-dial--arriving', // rendered but opacity:0 until the flight lands
   idle: 'tts-dial',
+  promoting: 'tts-dial tts-dial--promoting',
   speaking: 'tts-dial tts-dial--speaking',
   dismissing: 'tts-dial tts-dial--dismissing',
 };
@@ -1081,6 +1083,7 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
       agent: a,
       phase: (a.item.status === 'speaking' ? 'speaking' : 'idle') as TtsPhase,
       slot: i,
+      promoteSlot: undefined,
     })),
   );
   // Mirror entries into a ref so the roster reconcile (deps [agents, pendingIds])
@@ -1091,6 +1094,7 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
   // Dismiss timers (fade → drop + shuffle-up). Tracked so an unmount /
   // hot-reload can't leave a setState firing on a dead component.
   const timers = useRef<number[]>([]);
+  const promotingKeys = useRef<Set<string>>(new Set());
   useEffect(() => () => timers.current.forEach((t) => clearTimeout(t)), []);
   const after = (ms: number, fn: () => void) => {
     timers.current.push(window.setTimeout(fn, ms));
@@ -1130,11 +1134,13 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
         // Present: refresh the item + derive the phase from the live status
         // (held at 'arriving' while its handoff flight is still inbound).
         const phase: TtsPhase =
-          e.phase === 'arriving' && pendingIds.has(e.key)
-            ? 'arriving'
-            : live.item.status === 'speaking'
-              ? 'speaking'
-              : 'idle';
+          e.phase === 'promoting' && promotingKeys.current.has(e.key)
+            ? 'promoting'
+            : e.phase === 'arriving' && pendingIds.has(e.key)
+              ? 'arriving'
+              : live.item.status === 'speaking'
+                ? 'speaking'
+                : 'idle';
         if (e.agent === live && e.phase === phase) return e;
         changed = true;
         return { ...e, agent: live, phase };
@@ -1150,7 +1156,7 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
             : a.item.status === 'speaking'
               ? 'speaking'
               : 'idle';
-          next = [...next, { key: a.id, agent: a, phase, slot }];
+          next = [...next, { key: a.id, agent: a, phase, slot, promoteSlot: undefined }];
           slot++;
         }
       }
@@ -1199,6 +1205,47 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
     (e) => e.agent.chapterChild === true,
   );
 
+  function activateTtsItem(id: string) {
+    const entry = entriesRef.current.find((e) => e.key === id);
+    const item = entry?.agent.item;
+    if (!entry || !item?.promotable || !item.itemKey || item.status === 'speaking') {
+      onOpenDrawer(id);
+      return;
+    }
+    if (promotingKeys.current.has(id)) return;
+
+    promotingKeys.current.add(id);
+    const slot = entry.slot;
+    setEntries((cur) =>
+      cur.map((e) => (e.key === id ? { ...e, phase: 'promoting' as TtsPhase, promoteSlot: slot } : e)),
+    );
+    playTtsItem(item.itemKey)
+      .then((result) => {
+        if (!result.success) throw new Error(result.reason ?? 'play-item failed');
+      })
+      .catch((err) => {
+        console.error('[tts] play-item failed', err);
+        promotingKeys.current.delete(id);
+        setEntries((cur) =>
+          cur.map((e) =>
+            e.key === id && e.phase === 'promoting'
+              ? { ...e, phase: e.agent.item.status === 'speaking' ? 'speaking' : 'idle', promoteSlot: undefined }
+              : e,
+          ),
+        );
+      });
+    after(850, () => {
+      promotingKeys.current.delete(id);
+      setEntries((cur) =>
+        cur.map((e) =>
+          e.key === id && e.phase === 'promoting'
+            ? { ...e, phase: e.agent.item.status === 'speaking' ? 'speaking' : 'idle', promoteSlot: undefined }
+            : e,
+        ),
+      );
+    });
+  }
+
   return (
     <div
       className="tts-stack"
@@ -1222,8 +1269,10 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
             // §2 — slot (NOT array index) is expressed PURELY as a transform, so
             // any slot reassignment (live reorder, drain shuffle-up) animates free.
             transform: `translateY(${e.slot * TTS_ROW * uiScale}px)`,
+            '--n': e.phase === 'promoting' ? (e.promoteSlot ?? e.slot) : e.slot,
           } as React.CSSProperties}
           onOpenDrawer={onOpenDrawer}
+          onActivate={activateTtsItem}
         />
       ))}
     </div>

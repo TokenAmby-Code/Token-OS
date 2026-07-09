@@ -194,6 +194,10 @@ class PlayPaneRequest(BaseModel):
     instance_id: str  # Promote all items from this instance to hot queue
 
 
+class PlayQueueItemRequest(BaseModel):
+    item_key: str  # Promote/play one exact queued item
+
+
 class PlaybackCompleteRequest(BaseModel):
     playback_id: str  # echoed back by the phone when it finishes speaking a line
 
@@ -1111,6 +1115,7 @@ class TTSQueueItem:
     persona_slug: str | None = None
     persona_display_name: str | None = None
     commander_type: str | None = None
+    item_key: str = field(default_factory=lambda: uuid.uuid4().hex)
     started_at: str | None = None  # ISO; stamped when the worker begins audible playback
     # Future resolved by the worker when this item reaches a terminal playback
     # state (success/skip/fail/muted/exception). The single front door
@@ -2887,6 +2892,7 @@ async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQue
 def _queue_item_to_dict(item: TTSQueueItem) -> dict:
     """Serialize a TTSQueueItem for API responses."""
     return {
+        "item_key": item.item_key,
         "instance_id": item.instance_id,
         "name": item.name,
         "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
@@ -2914,6 +2920,7 @@ def get_tts_queue_status() -> dict:
     current = None
     if current_item:
         current = {
+            "item_key": current_item.item_key,
             "instance_id": current_item.instance_id,
             "name": current_item.name,
             "message": current_item.message[:50] + "..."
@@ -3513,6 +3520,38 @@ async def promote_from_pause(request: Request, instance_id: str | None = None) -
 
     logger.info(f"Promoted {promoted} item(s) from pause to hot queue")
     return {"success": True, "promoted": promoted}
+
+
+@router.post("/api/tts/queue/play-item")
+async def play_queue_item(request: PlayQueueItemRequest) -> dict:
+    """Promote one exact queued TTS item to hot/front by stable item_key."""
+    item_key = (request.item_key or "").strip()
+    if not item_key:
+        return {
+            "success": False,
+            "promoted": 0,
+            "item_key": request.item_key,
+            "reason": "item_key_required",
+        }
+
+    async with tts_queue_lock:
+        for queue_name, queue in (("hot", hot_queue), ("pause", pause_queue)):
+            for item in list(queue):
+                if item.item_key != item_key:
+                    continue
+                queue.remove(item)
+                item.queue_target = "hot"
+                item.focus_on_playback = True
+                hot_queue.appendleft(item)
+                logger.info("play-item: promoted %s from %s to hot/front", item_key, queue_name)
+                return {
+                    "success": True,
+                    "promoted": 1,
+                    "item_key": item_key,
+                    "from_queue": queue_name,
+                }
+
+    return {"success": False, "promoted": 0, "item_key": item_key, "reason": "item_not_found"}
 
 
 @router.post("/api/tts/queue/play-all")
