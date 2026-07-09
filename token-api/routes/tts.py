@@ -176,6 +176,8 @@ class NotifyRequest(BaseModel):
     banner: str | None = None  # phone banner text (defaults to message head)
     voice: str | None = None  # optional TTS voice override
     instance_id: str | None = None  # instance whose voice profile to use
+    context: dict | None = None  # optional contract metadata, e.g. {"kind":"enforcement"}
+    enforcement: bool = False  # explicit live-enforcement audio: bypass persona_silent or fail loud
 
 
 class SoundRequest(BaseModel):
@@ -908,6 +910,7 @@ async def dispatch_notify(
     instance_id: str | None = None,
     context: dict | None = None,
     discord: bool = False,
+    enforcement: bool = False,
 ) -> dict:
     """Authoritative comms entry — the single front door to the router.
 
@@ -928,7 +931,15 @@ async def dispatch_notify(
     message = await _sanitize_public_text_async(message)
     banner = await _sanitize_public_text_async(banner) if banner is not None else None
 
-    if _is_quiet_hours():
+    context = context or {}
+    enforcement = bool(
+        enforcement
+        or context.get("enforcement")
+        or context.get("kind") == "enforcement"
+        or context.get("type") == "enforcement"
+    )
+
+    if _is_quiet_hours() and not enforcement:
         logger.info(f"Notify suppressed (quiet hours): {(message or banner or '')[:80]}")
         return {
             "delivered": False,
@@ -955,7 +966,11 @@ async def dispatch_notify(
         completion: asyncio.Future = loop.create_future()
         audio_instance_id = instance_id or SYSTEM_INSTANCE_ID
         enqueue = await queue_tts(
-            audio_instance_id, message, queue_target="hot", completion=completion
+            audio_instance_id,
+            message,
+            queue_target="hot",
+            completion=completion,
+            bypass_persona_silent=enforcement,
         )
         if enqueue.get("queued"):
             try:
@@ -2292,6 +2307,7 @@ async def queue_tts(
     message: str,
     queue_target: str = "pause",
     completion: "asyncio.Future | None" = None,
+    bypass_persona_silent: bool = False,
 ) -> dict:
     """Queue a TTS message for an instance, using their profile's voice/sound.
 
@@ -2313,8 +2329,9 @@ async def queue_tts(
     """
     message = await _sanitize_public_text_async(message)
 
-    # Silence TTS during quiet hours (11 PM - 9 AM)
-    if _is_quiet_hours():
+    # Silence TTS during quiet hours (11 PM - 9 AM), except explicit live
+    # enforcement where policy requires audible-or-named-failure semantics.
+    if _is_quiet_hours() and not bypass_persona_silent:
         logger.info(f"TTS suppressed (quiet hours): {message[:80]}")
         return {"success": True, "queued": False, "reason": "quiet_hours"}
 
@@ -2383,13 +2400,30 @@ async def queue_tts(
         return {"success": True, "queued": False, "reason": "persona_unresolved"}
 
     if tts_policy == "silent":
-        logger.info(f"TTS suppressed (persona_silent): {message[:80]}")
-        return {"success": True, "queued": False, "reason": "persona_silent"}
+        if not bypass_persona_silent:
+            logger.info(f"TTS suppressed (persona_silent): {message[:80]}")
+            return {"success": True, "queued": False, "reason": "persona_silent"}
+        logger.warning(
+            "TTS enforcement bypassed persona_silent: instance=%s persona=%r message=%r",
+            instance_id,
+            persona_slug,
+            message[:80],
+        )
+        row = _SYSTEM_TTS_ROW
 
     # Belt-and-suspenders: an independent silence guarantee. A voiced policy
-    # without a resolved persona voice still must not speak.
+    # without a resolved persona voice still must not speak unless this is an
+    # enforcement notification, in which case use the system/Custodes voice.
     if row["tts_voice"] is None:
-        return {"success": True, "queued": False, "reason": "persona_silent"}
+        if not bypass_persona_silent:
+            return {"success": True, "queued": False, "reason": "persona_silent"}
+        logger.warning(
+            "TTS enforcement bypassed missing persona voice: instance=%s persona=%r message=%r",
+            instance_id,
+            persona_slug,
+            message[:80],
+        )
+        row = _SYSTEM_TTS_ROW
 
     voice = row["tts_voice"]
     sound = row["notification_sound"]
@@ -3340,6 +3374,8 @@ async def send_notification(request: NotifyRequest):
         banner=request.banner,
         voice=request.voice,
         instance_id=request.instance_id,
+        context=request.context,
+        enforcement=request.enforcement,
     )
 
 

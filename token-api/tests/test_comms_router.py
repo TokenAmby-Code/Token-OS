@@ -109,7 +109,7 @@ def _recorders(monkeypatch, tts, *, enqueue_result=None, completion_outcome=None
     outcome = completion_outcome or {"success": True, "route": "phone", "audio_delivered": True}
     enqueue_ret = enqueue_result or {"success": True, "queued": True}
 
-    async def fake_queue_tts(instance_id, message, queue_target="pause", completion=None):
+    async def fake_queue_tts(instance_id, message, queue_target="pause", completion=None, **kwargs):
         calls["enqueue"].append((instance_id, message, queue_target))
         if enqueue_ret.get("queued") and completion is not None and not completion.done():
             completion.set_result(outcome)
@@ -194,6 +194,36 @@ def test_dispatch_notify_not_queued_fails_closed(monkeypatch: Any) -> None:
     assert result.get("delivered") is False
     assert result.get("audio_delivered") is False
     assert result.get("tts", {}).get("reason") == "instance_not_found"
+
+
+def test_dispatch_notify_enforcement_bypasses_persona_silent(monkeypatch: Any) -> None:
+    """Live enforcement may not disappear behind persona_silent.
+
+    The notify front door must mark the enqueue as enforcement so queue_tts can
+    use the system/Custodes voice for a silent persona instead of returning the
+    ambiguous /api/notify non-delivery observed in production.
+    """
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    calls = {"kwargs": []}
+
+    async def fake_queue_tts(instance_id, message, queue_target="pause", completion=None, **kwargs):
+        calls["kwargs"].append(kwargs)
+        if completion is not None and not completion.done():
+            completion.set_result({"success": True, "route": "mac", "audio_delivered": True})
+        return {"success": True, "queued": True}
+
+    monkeypatch.setattr(tts, "queue_tts", fake_queue_tts)
+    monkeypatch.setattr(tts, "_send_to_phone", lambda *_a, **_k: {"success": True})
+
+    result = asyncio.run(
+        tts.dispatch_notify(
+            "enforcement line", instance_id="silent-instance", context={"kind": "enforcement"}
+        )
+    )
+
+    assert result["delivered"] is True
+    assert calls["kwargs"][0]["bypass_persona_silent"] is True
 
 
 def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch: Any) -> None:
