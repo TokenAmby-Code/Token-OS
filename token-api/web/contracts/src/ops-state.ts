@@ -50,9 +50,13 @@ export type OpsInstance = {
   working_dir: string | null;
   runtime: { live: boolean; pane_id: string | null; role: string | null; source: string };
   last_activity: string | null;
+  created_at: string | null;
   age_seconds: number | null;
   age_minutes: number | null;
   is_subagent: boolean;
+  // 'emperor' | 'persona' | 'chapter' — chapter children legitimately share a
+  // persona (the DB singleton trigger exempts them; UI breach-marking must too).
+  commander_type: string | null;
   persona: { slug: string | null; display_name: string | null; pane_tint: string | null; chip_color: string | null; tts_voice: string | null; tts_rate?: number | null; notification_sound: string | null } | null;
   golden_throne: string | null;
   pr_url: string | null;

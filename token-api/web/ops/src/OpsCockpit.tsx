@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { personaIcon, personaIconInner, personaImage, FACTION_PERSONAS } from './personaIcons';
+import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   balanceMinutes,
   buildDials,
@@ -8,6 +8,7 @@ import {
   toModeSegments,
   toTimerPoints,
   toTtsQueue,
+  toWorkerQueue,
   ttsLanguishThreshold,
   type CockpitMode,
   type CockpitModeSegment,
@@ -16,6 +17,7 @@ import {
   type DialTone,
   type TtsItem,
   type TtsItemStatus,
+  type WorkerItem,
 } from './cockpitData';
 import { clearPhoneAttention, useOpsState, useTimerHistory } from './api';
 import {
@@ -75,6 +77,7 @@ interface CockpitData {
   nowPoint: CockpitTimerPoint | null; // the live head (also points' last entry)
   dials: DialModel[]; // the floating state-dial cluster models
   ttsQueue: TtsItem[]; // the left-stack TTS queue
+  workerQueue: WorkerItem[]; // the live worker rails — one chip per registered instance
   degraded: string | null; // non-null → render the degraded banner with this text
 }
 
@@ -537,10 +540,6 @@ const CORNER_DIAL_PX = 104;
 // pocket) plus the five standing personas marching left off it. This is a fixed
 // roster, not a demo knob; the count never changes with the viewport or the fleet.
 const PERSONA_COUNT = 6;
-// Worker-count knob ceiling. Generous — the worker row wraps into further right-
-// anchored rows below (trailing down the RHS) rather than capping, so this is just
-// how far the demo slider travels, not a layout limit.
-const MAX_WORKER_COUNT = 30;
 const THETA_MIN = (12 * Math.PI) / 180;
 const THETA_MAX = (82 * Math.PI) / 180;
 const OUTER_MAX = 5; // outer ring capacity — fills first
@@ -921,18 +920,22 @@ function ttsItemToDial(item: TtsItem): DialModel {
 // error glow) instead of a silently-corrected display. Broken data reads AS broken.
 //
 // Returns the set of entry keys that are duplicate occurrences (the first stays
-// clean; the rest are flagged).
+// clean; the rest are flagged). `exempt` mirrors the DB trigger's own scope:
+// chapter children legitimately share a persona, so an exempt entry neither
+// claims a persona nor gets flagged — exactly the invariant the DB enforces.
 function duplicatePersonaKeys<T>(
   items: readonly T[],
   order: (t: T) => number,
   persona: (t: T) => string,
   key: (t: T) => string,
+  exempt?: (t: T) => boolean,
 ): Set<string> {
   const seen = new Set<string>();
   const dup = new Set<string>();
   [...items]
     .sort((a, b) => order(a) - order(b))
     .forEach((t) => {
+      if (exempt?.(t)) return;
       const p = persona(t);
       if (seen.has(p)) dup.add(key(t));
       else seen.add(p);
@@ -949,19 +952,24 @@ function duplicatePersonaKeys<T>(
 // reconcile + CSS-transition machinery; only the reconcile INPUT is a keyed
 // list (diff by id, not length).
 //
-// The MINT is split by honesty. Worker/idle agents are DEMO identities (fleet
-// wiring lands phase 2), minted from the persona catalog by the demobar's
-// add-worker buttons. TTS agents are LIVE: minted 1:1 from the live speak-queue
-// items (id = the live item id), never synthesized — the design study's
-// worker-click-births-an-utterance edge is retired, and the weave's handoff
-// animations are triggered by the live queue's arrivals/drains instead.
+// The MINT is all-live now. Worker agents are minted 1:1 from the registered
+// fleet (id = the instance id, persona = the instance's chapter persona) — a
+// chip on the rail IS the "this instance registered properly" signal, so the
+// rails start EMPTY and only ever carry real registrations. TTS agents are
+// LIVE: minted 1:1 from the live speak-queue items (id = the live item id),
+// never synthesized — the design study's worker-click-births-an-utterance edge
+// is retired, and the weave's handoff animations are triggered by the live
+// queue's arrivals/drains instead. Only the idle chips remain demo-dressed
+// (they park a drained utterance's persona, not a fleet row).
 // ═══════════════════════════════════════════════════════════════════════════
 type OriginSide = -1 | 1; // -1 = left column, +1 = right column
 interface Agent {
-  id: string; // the React key in every queue (live item id for TTS agents)
+  id: string; // the React key in every queue (instance id for workers, live item id for TTS)
   persona: string;
   tone: string;
   originSide: OriginSide; // set at mint; rides worker → TTS → idle unchanged
+  label?: string; // instance display name (live workers) — the chip's hover readout
+  chapterChild?: boolean; // live workers: legitimately shares its persona (see WorkerItem)
 }
 // A TTS-roster agent additionally carries the LIVE queue item it renders.
 interface TtsAgent extends Agent {
@@ -2120,11 +2128,8 @@ function ArcLayer({ uiScale }: {
 // change animates for free — the exact reflow model TtsStack uses (see its note).
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Placeholder worker roster — persona (→ icon) + tint cycled per chip. Sourced
-// from the full Astartes faction set so the worker row exercises the whole
-// heraldry registry as the count grows (i % length cycles it below). Colours
-// keep their own independent 6-tone cycle (WORKER_TONES), curated later.
-const WORKER_PERSONAS = FACTION_PERSONAS;
+// Chip tone fallback — cycled per mint when the live persona carries no chip
+// colour of its own (personas with a chip_color wear it directly).
 const WORKER_TONES = ['var(--brass-bright)', 'var(--good)', 'var(--warn)', 'var(--bad)', 'var(--neutral)', 'var(--idle)'];
 const WORKER_CHIP_PX = 90; // chip diameter, px @1440 (× uiScale) — big worker dials (75% of the first 120px pass)
 const WORKER_BAR_MARGIN = 30; // gap between the chip-row bottom and the gold crossbar below
@@ -2144,12 +2149,12 @@ interface WorkerEntry {
 }
 
 // One side of the "M": a self-contained reflowing queue riding `path`. Mirrors
-// TtsStack — roster-driven membership (diff by id), slot-only positioning. Both
-// variants are DEMO surfaces this phase (fleet wiring lands phase 2), so chip
-// clicks are inert everywhere; a worker FINISH (the edge-A handoff, measure +
-// hand the controller the arm polyline for the flight) fires programmatically
-// via `finishRequest` when the LIVE TTS queue gains an item — never from a
-// click, which would fabricate a queue entry.
+// TtsStack — roster-driven membership (diff by id), slot-only positioning. The
+// compass variant renders the LIVE registered fleet (idle stays demo-dressed);
+// chip clicks are inert everywhere; a worker FINISH (the edge-A handoff,
+// measure + hand the controller the arm polyline for the flight) fires
+// programmatically via `finishRequest` when the LIVE TTS queue gains an item —
+// never from a click, which would fabricate a queue entry.
 function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inset, split, insertMode, onFinish, finishRequest, baseline }: {
   side: number; roster: Agent[]; pendingIds: ReadonlySet<string>;
   geo: LemonGeometry; uiScale: number;
@@ -2288,10 +2293,18 @@ function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inse
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finishRequest]);
 
-  // A persona must be unique within this queue — the DB's invariant. When the data
-  // breaks it (personas cycle once the roster exceeds the registry), the repeats are
-  // surfaced with a red error glow, not silently collapsed (see the helper).
-  const dupKeys = duplicatePersonaKeys(entries, (e) => e.slot, (e) => e.agent.persona, (e) => e.key);
+  // A persona must be unique within this queue — the DB's invariant, at the DB's
+  // own scope: chapter children (e.g. mechanicus workers) legitimately share a
+  // persona and are exempt, exactly like the singleton trigger. When the data
+  // breaks the invariant, the repeats are surfaced with a red error glow, not
+  // silently collapsed (see the helper).
+  const dupKeys = duplicatePersonaKeys(
+    entries,
+    (e) => e.slot,
+    (e) => e.agent.persona,
+    (e) => e.key,
+    (e) => e.agent.chapterChild === true,
+  );
 
   return (
     <>
@@ -2327,8 +2340,8 @@ function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inse
             type="button"
             className="worker-chip"
             data-agent-id={e.key}
-            aria-label={`${insertMode === 'tail' ? 'Idle worker' : 'Worker'} ${e.agent.persona} (demo — fleet wiring lands phase 2)${isDup ? ' — DUPLICATE (singleton breach)' : ''}`}
-            title="demo — fleet wiring lands phase 2"
+            aria-label={`${insertMode === 'tail' ? 'Idle worker' : 'Registered instance'} ${e.agent.label ?? e.agent.persona} (${e.agent.persona})${isDup ? ' — DUPLICATE (singleton breach)' : ''}`}
+            title={e.agent.label ? `${e.agent.label} · ${e.agent.persona}` : e.agent.persona}
             style={{
               width: chip,
               height: chip,
@@ -3417,42 +3430,42 @@ const IDLE_DEMO_CAP = 8;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LIFECYCLE CONTROLLER — the single owner of the five rosters + the flight
-// overlay. The weave is LIVE-DRIVEN at the TTS leg and demo-dressed at the
-// worker/idle legs (fleet wiring lands phase 2):
+// overlay. The weave is LIVE-DRIVEN at the worker and TTS legs; only the idle
+// chips remain demo-dressed (they park a drained utterance's persona):
 //
+//   • worker rosters: minted 1:1 from the registered fleet (`liveWorkers`,
+//     registration order). The rails start EMPTY; a chip appears when an
+//     instance registers (the registration signal) and drops when it stops.
+//     `null` (feed down/warming) FREEZES the rails at last-good.
 //   • TTS roster: minted 1:1 from the live speak queue (`liveTts`, ordered) —
 //     never synthesized, never cycled. `null` (feed down/warming) FREEZES the
 //     weave; the last-good roster holds while the degraded banner shows.
 //   • edge A (worker → TTS): a LIVE arrival (new queue item id) triggers it.
-//     A demo worker chip is drafted as the visual source — it rides its arm to
-//     the ditch corner and pops to the TTS bottom, where the (invisible,
-//     'arriving') LIVE dial is revealed on landing. The flight wears the demo
-//     worker's persona; the landed dial renders the live item's. No demo
-//     workers on the rail ⇒ the live dial simply appears (no flight).
+//     The SENDER's own worker chip is the visual source — a copy rides its arm
+//     to the ditch corner and pops to the TTS bottom, where the (invisible,
+//     'arriving') LIVE dial is revealed on landing. The worker chip STAYS on
+//     its rail (speaking doesn't deregister an instance). Sender not on the
+//     rail ⇒ the live dial simply appears (no flight).
 //   • edge B (TTS → idle): a LIVE drain (item id left the queue) triggers it.
 //     The departing dial flies out to the idle rail and parks a demo idle chip
 //     carrying the drained item's persona, returning to the side the edge-A
 //     source came from (alternating when unknown).
 //
-// Each edge does source-removal + destination-insert (INVISIBLE 'arriving'
-// while pending) + a rendered-then-measured flight. Under reduced motion it
-// short-circuits to synchronous handoffs (no flight, immediate reveal).
-// Demo rosters are NOT persisted (a reload resets workers to the 4·4 seed).
+// Each edge does destination-insert (INVISIBLE 'arriving' while pending) + a
+// rendered-then-measured flight. Under reduced motion it short-circuits to
+// synchronous handoffs (no flight, immediate reveal).
 // ═══════════════════════════════════════════════════════════════════════════
-function useLifecycle(uiScale: number, reducedMotion: boolean, liveTts: TtsItem[] | null) {
+function useLifecycle(
+  uiScale: number,
+  reducedMotion: boolean,
+  liveTts: TtsItem[] | null,
+  liveWorkers: WorkerItem[] | null,
+) {
   const seqRef = useRef(0);
-  // Demo mint — worker/idle identities only (persona catalog dressing). The TTS
-  // roster is NEVER minted here; see mintLiveAgent below.
-  const mint = (side: OriginSide): Agent => {
-    const n = seqRef.current++;
-    const persona = WORKER_PERSONAS[n % WORKER_PERSONAS.length];
-    const tone = WORKER_TONES[n % WORKER_TONES.length];
-    return { id: `ag-${n}`, persona, tone, originSide: side, };
-  };
 
-  // Seed: 4·4 demo workers, empty TTS/idle. (mint() runs left-then-right at init.)
-  const [workerLeft, setWorkerLeft] = useState<Agent[]>(() => Array.from({ length: 4 }, () => mint(-1)));
-  const [workerRight, setWorkerRight] = useState<Agent[]>(() => Array.from({ length: 4 }, () => mint(1)));
+  // The rails start EMPTY — chips only ever come from live registrations.
+  const [workerLeft, setWorkerLeft] = useState<Agent[]>([]);
+  const [workerRight, setWorkerRight] = useState<Agent[]>([]);
   const [ttsAgents, setTtsAgents] = useState<TtsAgent[]>([]);
   const [idleLeft, setIdleLeft] = useState<Agent[]>([]);
   const [idleRight, setIdleRight] = useState<Agent[]>([]);
@@ -3572,6 +3585,52 @@ function useLifecycle(uiScale: number, reducedMotion: boolean, liveTts: TtsItem[
     a.status === b.status && a.text === b.text && a.route === b.route &&
     a.senderName === b.senderName && a.persona === b.persona;
 
+  // ── THE FLEET DRIVER — mirror the registered fleet onto the worker rails ────
+  // Side assignment is sticky per instance (chosen at first sight, shorter rail
+  // wins, ties go left) so a chip never hops rails across polls; a departed
+  // instance's assignment is forgotten, so a re-registration re-balances. The
+  // rosters are rebuilt in snapshot (registration) order per side, preserving
+  // Agent object identity when nothing rendered changed — WorkerColumn's
+  // reconcile then sees arrivals as births (centre-emerge) and departures as
+  // instant drops, exactly the registration/stop signal.
+  const workerSideRef = useRef<Map<string, OriginSide>>(new Map());
+  useEffect(() => {
+    if (!liveWorkers) return; // feed down/warming — freeze the rails, hold last-good
+    const sides = workerSideRef.current;
+    const liveIds = new Set(liveWorkers.map((w) => w.id));
+    for (const id of [...sides.keys()]) if (!liveIds.has(id)) sides.delete(id);
+    let nLeft = 0;
+    let nRight = 0;
+    for (const side of sides.values()) side < 0 ? nLeft++ : nRight++;
+    for (const w of liveWorkers) {
+      if (sides.has(w.id)) continue;
+      const side: OriginSide = nLeft <= nRight ? -1 : 1;
+      side < 0 ? nLeft++ : nRight++;
+      sides.set(w.id, side);
+    }
+    const rebuild = (side: OriginSide) => (prev: Agent[]): Agent[] => {
+      const prevById = new Map(prev.map((a) => [a.id, a]));
+      const next = liveWorkers
+        .filter((w) => sides.get(w.id) === side)
+        .map((w): Agent => {
+          const existing = prevById.get(w.id);
+          const tone = w.tint ?? existing?.tone ?? WORKER_TONES[seqRef.current++ % WORKER_TONES.length];
+          if (
+            existing &&
+            existing.persona === w.persona &&
+            existing.tone === tone &&
+            existing.label === w.name &&
+            existing.chapterChild === w.chapterChild
+          )
+            return existing;
+          return { id: w.id, persona: w.persona, tone, originSide: side, label: w.name, chapterChild: w.chapterChild };
+        });
+      return next.length === prev.length && next.every((a, i) => a === prev[i]) ? prev : next;
+    };
+    setWorkerLeft(rebuild(-1));
+    setWorkerRight(rebuild(1));
+  }, [liveWorkers]);
+
   // ── THE WEAVE DRIVER — diff each healthy live snapshot ─────────────────────
   useEffect(() => {
     if (!liveTts) return; // feed down/warming — freeze the weave, hold last-good
@@ -3638,17 +3697,17 @@ function useLifecycle(uiScale: number, reducedMotion: boolean, liveTts: TtsItem[
         : nextAgents,
     );
 
-    // Edge A: draft a demo worker as the live arrival's visual source. The
-    // fuller side gives up its OLDEST chip (slot 0 — the full arm ride). ONE
-    // handoff per pass (requests within a pass would collapse anyway — the
+    // Edge A: the SENDER's own worker chip is the live arrival's visual source —
+    // the utterance joins to its instance's registration chip by instance id.
+    // ONE handoff per pass (requests within a pass would collapse anyway — the
     // columns act per finishRequest change); a multi-arrival burst flies its
-    // first item and the rest appear in place, exactly like an empty rail.
+    // first item and the rest appear in place, exactly like an absent sender.
     if (!reducedRef.current && addedItems.length) {
-      const wl = workerLeftRef.current;
-      const wr = workerRightRef.current;
-      const source = wl.length >= wr.length ? wl[0] : wr[0];
+      const item = addedItems[0];
+      const source = [...workerLeftRef.current, ...workerRightRef.current].find(
+        (a) => a.id === item.senderInstanceId,
+      );
       if (source) {
-        const item = addedItems[0];
         originSideRef.current.set(item.id, source.originSide);
         handoffRef.current.set(source.id, item.id);
         addPending(item.id); // arriving-invisible until the flight lands
@@ -3658,25 +3717,16 @@ function useLifecycle(uiScale: number, reducedMotion: boolean, liveTts: TtsItem[
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveTts]);
 
-  // ── worker births (the demobar's only queue knob) ───────────────────────────
-  const addWorker = (side: OriginSide) => {
-    const cur = side < 0 ? workerLeft : workerRight;
-    if (cur.length >= MAX_WORKER_COUNT) return;
-    const a = mint(side);
-    (side < 0 ? setWorkerLeft : setWorkerRight)((prev) => [...prev, a]);
-  };
-
-  // ── edge A, second half: the drafted column measured its chip ──────────────
-  // Remove the demo source from its rail (instant reconcile removal — the
-  // flight is the exit) and fly it to the LIVE arrival waiting at the TTS
-  // bottom. The flight wears the demo worker's persona; landing reveals the
-  // live dial (see the weave driver).
+  // ── edge A, second half: the sender's column measured its chip ─────────────
+  // Fly a copy of the sender's chip to the LIVE arrival waiting at the TTS
+  // bottom. The chip itself STAYS on its rail — speaking doesn't deregister an
+  // instance; the rail mirrors registration truth only. The flight wears the
+  // sender's persona; landing reveals the live dial (see the weave driver).
   const finishWorker = (spec: WorkerFinishSpec) => {
     const { agent, side, armPolylineVp } = spec;
     const liveId = handoffRef.current.get(agent.id);
     handoffRef.current.delete(agent.id);
     if (!liveId) return; // no paired live arrival — ignore (stale request)
-    (side < 0 ? setWorkerLeft : setWorkerRight)((prev) => prev.filter((a) => a.id !== agent.id));
     if (reducedRef.current) {
       removePending(liveId);
       return;
@@ -3706,7 +3756,7 @@ function useLifecycle(uiScale: number, reducedMotion: boolean, liveTts: TtsItem[
 
   return {
     workerLeft, workerRight, ttsAgents, idleLeft, idleRight, flights, pendingIds, clockValue,
-    addWorker, finishWorker, finishRequest, landFlight,
+    finishWorker, finishRequest, landFlight,
   };
 }
 
@@ -3729,10 +3779,10 @@ export function OpsCockpit() {
   const [fracTop, setFracTop] = usePersistedNumber('fracTop', 4); // big-dial numerator (focus)
   const [fracBot, setFracBot] = usePersistedNumber('fracBot', 1); // big-dial denominator (distraction)
   // The three queues are ONE woven lifecycle, owned by useLifecycle (instantiated
-  // after uiScale below): live TTS arrivals draft demo worker chips (edge A); live
-  // TTS drains park demo idle chips (edge B). TTS depth, idle depth, and the clock
-  // value are all DERIVED — the only manual knob left is "add worker left/right".
-  // Demo rosters are not persisted (reset to seed on reload).
+  // after uiScale below): the worker rails mirror the registered fleet (a chip =
+  // a live registration), live TTS arrivals fly off the sender's chip (edge A),
+  // live TTS drains park demo idle chips (edge B). Worker depth, TTS depth, idle
+  // depth, and the clock value are all DERIVED — no manual queue knobs remain.
   const reducedMotion = usePrefersReducedMotion();
 
   // Deploy-follow: the always-open cockpit window reloads itself when a new UI
@@ -3841,15 +3891,21 @@ export function OpsCockpit() {
       nowPoint,
       dials: s ? buildDials(s) : [],
       ttsQueue: s ? toTtsQueue(s) : [],
+      workerQueue: s ? toWorkerQueue(s) : [],
       degraded,
     };
   }, [opsState.data, opsState.loading, opsState.error, timerHistory.data, timerHistory.loading, timerHistory.error]);
 
   // The woven worker → TTS → idle lifecycle. Instantiated here so it can read the
   // derived uiScale (flight sizes), the reduced-motion preference, and the LIVE
-  // TTS queue (null while the state feed is down — freezes the weave, see
-  // useLifecycle).
-  const life = useLifecycle(uiScale, reducedMotion, opsState.data ? cockpitData.ttsQueue : null);
+  // TTS + worker queues (null while the state feed is down — freezes the weave
+  // and the rails at last-good, see useLifecycle).
+  const life = useLifecycle(
+    uiScale,
+    reducedMotion,
+    opsState.data ? cockpitData.ttsQueue : null,
+    opsState.data ? cockpitData.workerQueue : null,
+  );
   // The timer band tracks the cluster: same coherent factor as everything else,
   // optionally softened via GRAPH_SHRINK. uiScale === 1 ⇒ graphScale === 1, so
   // desktop stays pixel-identical. This is the ONE tuning point for the midline.
@@ -3963,11 +4019,12 @@ export function OpsCockpit() {
       <TtsStack agents={life.ttsAgents} pendingIds={life.pendingIds} onOpenDrawer={openDrawer}
         uiScale={uiScale} />
 
-      {/* worker queues (demo — fleet wiring lands phase 2) — two icon-chip stacks
-          below the lemon that grow outward from centre then trail down the two
-          edges (a soft "M"). Add via the demobar; a LIVE TTS arrival drafts a
-          chip — it shrinks + rides its rail to the ditch corner + pops to the
-          TTS stack bottom (edge A). */}
+      {/* worker queues — LIVE registered fleet: two icon-chip stacks below the
+          lemon that grow outward from centre then trail down the two edges (a
+          soft "M"). Empty until instances register; each registration births a
+          chip wearing that instance's chapter persona (THE registration
+          signal), and a stop drops it. A LIVE TTS arrival flies a copy off the
+          sender's chip to the TTS stack bottom (edge A). */}
       <WorkerQueues leftRoster={life.workerLeft} rightRoster={life.workerRight} pendingIds={life.pendingIds}
         uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
         onFinishLeft={life.finishWorker} onFinishRight={life.finishWorker} finishRequest={life.finishRequest} />
@@ -4026,13 +4083,13 @@ export function OpsCockpit() {
           <EditableNum value={scaleMin} display={scaleMin.toFixed(2)} step={0.01} onCommit={setScaleMin} />
         </label>
         <span className="demobar__scale" aria-label={`Live UI scale ${uiScale.toFixed(2)}`}>uiScale {uiScale.toFixed(2)}</span>
-        {/* ONLY manual queue knob left: add a DEMO worker on either side (fleet
-            wiring lands phase 2). TTS depth is the LIVE queue; idle chips park on
-            live drains; the clock numerals derive from idle depth. */}
-        <span className="demobar__adds" aria-label={`Demo workers left ${life.workerLeft.length}, right ${life.workerRight.length} · live TTS ${life.ttsAgents.length} · demo idle ${life.idleLeft.length}·${life.idleRight.length}`}>
+        {/* Queue depths readout — ALL live-derived now: workers mirror the
+            registered fleet, TTS depth is the LIVE speak queue, idle chips park
+            on live drains, the clock numerals derive from idle depth. The
+            add-worker demo buttons are retired — a chip can only be born by a
+            real instance registration. */}
+        <span className="demobar__adds" aria-label={`Registered workers left ${life.workerLeft.length}, right ${life.workerRight.length} · live TTS ${life.ttsAgents.length} · idle ${life.idleLeft.length}·${life.idleRight.length}`}>
           <span className="demobar__addlabel">Workers <b>{life.workerLeft.length}·{life.workerRight.length}</b> → TTS <b>{life.ttsAgents.length}</b> → Idle <b>{life.idleLeft.length}·{life.idleRight.length}</b></span>
-          <button className="demobar__addbtn" onClick={() => life.addWorker(-1)} disabled={life.workerLeft.length >= MAX_WORKER_COUNT}>+ worker left</button>
-          <button className="demobar__addbtn" onClick={() => life.addWorker(1)} disabled={life.workerRight.length >= MAX_WORKER_COUNT}>+ worker right</button>
         </span>
         <Stepper label="Focus" value={fracTop} onChange={setFracTop} />
         <Stepper label="Distract" value={fracBot} onChange={setFracBot} />
