@@ -385,3 +385,63 @@ def test_prealloc_freelist_excludes_stale_unbound_live_agent_before_selection(mo
 
     assert_dispatch_target_available(adapter, "%S")
     assert sniffed == [2001, 2002, 2003, 2002]
+
+
+def test_dispatch_incongruency_reconciles_stale_ledger_before_refusal(monkeypatch):
+    from tmuxctl import occupancy
+
+    class Adapter:
+        def __init__(self):
+            self.calls = 0
+
+        def _resolve_pane_target_arg(self, pane):
+            return "%4"
+
+        def run(self, *args, allow_failure=False):
+            self.calls += 1
+            if args[0] == "display-message":
+                return "%4\tmechanicus:4\tmechanicus\t123\t"
+            return ""
+
+    stale = {"instance_id": "old"}
+    states = [stale, None]
+    monkeypatch.setattr(occupancy, "_active_agent", lambda pid: False)
+    monkeypatch.setattr(occupancy, "_active_wrapper_row_for_role", lambda role: states.pop(0))
+
+    class Ledger:
+        def reconcile_from_tmux(self, adapter):
+            return {"open_rows": 0}
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "tmuxctl.wrapper_ledger",
+        type("M", (), {"LEDGER": Ledger()})(),
+    )
+    occ = occupancy.assert_dispatch_target_available(Adapter(), "mechanicus:4")
+    assert occ.pane_role == "mechanicus:4"
+
+
+def test_comms_incongruency_names_repair_when_live_unbound_persists(monkeypatch):
+    from tmuxctl import occupancy
+
+    class Adapter:
+        def _resolve_pane_target_arg(self, pane):
+            return "%N"
+
+        def run(self, *args, allow_failure=False):
+            if args[0] == "display-message":
+                return "%N\tsomnium:N\tsomnium\t123\t"
+            return ""
+
+    monkeypatch.setattr(occupancy, "_active_agent", lambda pid: True)
+    monkeypatch.setattr(occupancy, "_active_wrapper_row_for_role", lambda role: None)
+    monkeypatch.setattr(occupancy, "_reconcile_then_reread", lambda adapter, pane: None)
+
+    try:
+        occupancy.assert_comms_delivery_target_occupied(Adapter(), "somnium:N")
+    except ValueError as exc:
+        msg = str(exc)
+    else:
+        raise AssertionError("expected fail-closed incongruency")
+    assert "direction=ledger_empty_agent_live" in msg
+    assert "repair_op=tmuxctld_assert_instance_or_restart_live_unbound_pane" in msg

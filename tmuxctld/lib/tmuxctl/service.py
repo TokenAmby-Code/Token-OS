@@ -481,10 +481,53 @@ class TmuxControlPlane:
         return [row.as_dict() for row in LEDGER.rows(include_closed=include_closed)]
 
     def ledger_reconcile(self) -> dict:
-        """Rebuild active wrapper-ledger rows from one live tmux scan."""
+        """Rebuild active wrapper-ledger rows and reconcile pane chrome from it.
+
+        Pane chrome is a pure derivative of the wrapper→pane bind ledger when
+        bind truth is trustworthy. After active rows are rebuilt from live tmux,
+        unbound non-singleton panes without a live agent are scrubbed and reported
+        via ``chrome_scrubbed_unbound_panes``/``*_count``. Unbound panes with a
+        live agent are split-brain bind divergences, not free residue; they are
+        excluded from scrubbing and reported via
+        ``chrome_unbound_live_divergences``/``*_count`` with reason
+        ``live_agent_without_bind``. This lets a released bind release
+        tint/title/runtime chrome transactionally without erasing live TUIs whose
+        bind has failed to land.
+        """
         from .wrapper_ledger import LEDGER
 
-        return LEDGER.reconcile_from_tmux(self.adapter)
+        out = dict(LEDGER.reconcile_from_tmux(self.adapter))
+
+        from .occupancy import scan_ledger_dispatch_availability
+
+        scrubbed: list[str] = []
+        live_divergences: list[dict[str, str]] = []
+        for pane in scan_ledger_dispatch_availability(self.adapter):
+            # chrome = f(bind), but only when the bind truth is trustworthy.  A
+            # live TUI with no active bind is split-brain, not free residue; do
+            # not erase operator-visible chrome from a running agent until the
+            # liveness/bind-repair lane can reconcile it.  Report it loudly so
+            # callers can route the divergence instead of mistaking it for a
+            # clean free slot.
+            if pane.singleton or pane.instance_id:
+                continue
+            if pane.live_agent:
+                live_divergences.append(
+                    {
+                        "pane": pane.pane_id,
+                        "pane_label": pane.pane_role or "",
+                        "reason": "live_agent_without_bind",
+                    }
+                )
+                continue
+            target = pane.pane_id
+            self.adapter.clear_runtime_state(target)
+            scrubbed.append(target)
+        out["chrome_scrubbed_unbound_panes"] = scrubbed
+        out["chrome_scrubbed_unbound_count"] = len(scrubbed)
+        out["chrome_unbound_live_divergences"] = live_divergences
+        out["chrome_unbound_live_divergence_count"] = len(live_divergences)
+        return out
 
     def freelist(self) -> list[dict]:
         """List the unoccupied, agent-free panes (the freelist).

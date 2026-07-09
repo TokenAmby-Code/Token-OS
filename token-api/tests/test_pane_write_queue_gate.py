@@ -86,6 +86,24 @@ def _fetch_status(db_path: Any, queue_id: str) -> str | None:
     return row[0] if row else None
 
 
+def test_queued_daemon_receipt_is_pending_not_failed(app_env: Any) -> None:
+    main = app_env.main
+    status, error = main._pane_send_terminal_status(
+        {
+            "returncode": 0,
+            "status": "queued",
+            "queued": True,
+            "deferred": True,
+            "delivered": False,
+            "reason": "typing_guard",
+            "correlation_id": "talk-123",
+        }
+    )
+
+    assert status == main.PANE_WRITE_PENDING
+    assert error == "typing_guard"
+
+
 # ---- translation layer: TmuxSendGated -> structured gated result ------------
 
 

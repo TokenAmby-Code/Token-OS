@@ -109,7 +109,7 @@ def _recorders(monkeypatch, tts, *, enqueue_result=None, completion_outcome=None
     outcome = completion_outcome or {"success": True, "route": "phone", "audio_delivered": True}
     enqueue_ret = enqueue_result or {"success": True, "queued": True}
 
-    async def fake_queue_tts(instance_id, message, queue_target="pause", completion=None):
+    async def fake_queue_tts(instance_id, message, queue_target="pause", completion=None, **kwargs):
         calls["enqueue"].append((instance_id, message, queue_target))
         if enqueue_ret.get("queued") and completion is not None and not completion.done():
             completion.set_result(outcome)
@@ -194,6 +194,122 @@ def test_dispatch_notify_not_queued_fails_closed(monkeypatch: Any) -> None:
     assert result.get("delivered") is False
     assert result.get("audio_delivered") is False
     assert result.get("tts", {}).get("reason") == "instance_not_found"
+
+
+def test_dispatch_notify_enforcement_rewrites_persona_silent_contract_violation(
+    monkeypatch: Any,
+) -> None:
+    """An enforcement-tagged send may never surface persona_silent as the final verdict."""
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    _recorders(
+        monkeypatch,
+        tts,
+        enqueue_result={"success": False, "queued": False, "reason": "persona_silent"},
+    )
+
+    result = asyncio.run(
+        tts.dispatch_notify("enforcement line", enforcement=True, instance_id="silent-instance")
+    )
+
+    assert result["delivered"] is False
+    assert result["audio_delivered"] is False
+    assert result["reason"] == "enforcement_persona_silent_contract_violation"
+    assert result["tts"]["reason"] == "persona_silent"
+
+
+def test_dispatch_notify_enforcement_bypasses_persona_silent(monkeypatch: Any) -> None:
+    """Live enforcement may not disappear behind persona_silent.
+
+    The notify front door must mark the enqueue as enforcement so queue_tts can
+    use the system/Custodes voice for a silent persona instead of returning the
+    ambiguous /api/notify non-delivery observed in production.
+    """
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    calls = {"kwargs": []}
+
+    async def fake_queue_tts(instance_id, message, queue_target="pause", completion=None, **kwargs):
+        calls["kwargs"].append(kwargs)
+        if completion is not None and not completion.done():
+            completion.set_result({"success": True, "route": "mac", "audio_delivered": True})
+        return {"success": True, "queued": True}
+
+    monkeypatch.setattr(tts, "queue_tts", fake_queue_tts)
+    monkeypatch.setattr(tts, "_send_to_phone", lambda *_a, **_k: {"success": True})
+
+    result = asyncio.run(
+        tts.dispatch_notify(
+            "enforcement line", instance_id="silent-instance", context={"kind": "enforcement"}
+        )
+    )
+
+    assert result["delivered"] is True
+    assert calls["kwargs"][0]["bypass_persona_silent"] is True
+
+
+def test_queue_tts_enforcement_bypass_uses_system_voice_for_silent_persona(
+    monkeypatch: Any,
+) -> None:
+    """queue_tts itself must honor the enforcement bypass.
+
+    A silent persona normally returns persona_silent.  With the live-enforcement
+    bypass set, it must enqueue through the system/Custodes voice instead.
+    """
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "DESKTOP_STATE", {"in_meeting": False})
+    monkeypatch.setattr(tts, "TTS_GLOBAL_MODE", {"mode": "verbose"})
+    monkeypatch.setattr(
+        tts,
+        "_resolve_queue_playback_target",
+        lambda **_kwargs: {"success": True, "playback_target": "mac"},
+    )
+
+    async def fake_log_event(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(tts, "log_event", fake_log_event)
+    tts.hot_queue.clear()
+    tts.pause_queue.clear()
+
+    class FakeCursor:
+        async def fetchone(self):
+            return {
+                "name": "Silent Worker",
+                "tts_voice": None,
+                "notification_sound": "quiet.wav",
+                "tts_mode": "verbose",
+                "persona_slug": "silent-worker",
+                "tts_policy": "silent",
+                "advisor": 0,
+            }
+
+    class FakeDb:
+        row_factory = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_args, **_kwargs):
+            return FakeCursor()
+
+    monkeypatch.setattr(tts, "connect_agents_db", lambda *_a, **_k: FakeDb())
+
+    normal = asyncio.run(tts.queue_tts("iid", "line"))
+    assert normal == {"success": True, "queued": False, "reason": "persona_silent"}
+
+    bypass = asyncio.run(tts.queue_tts("iid", "line", bypass_persona_silent=True))
+
+    assert bypass["queued"] is True
+    assert len(tts.hot_queue) == 1
+    item = tts.hot_queue.popleft()
+    assert item.voice == tts._SYSTEM_TTS_ROW["tts_voice"]
+    assert item.sound == tts._SYSTEM_TTS_ROW["notification_sound"]
+    assert item.name == tts._SYSTEM_TTS_ROW["name"]
 
 
 def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch: Any) -> None:

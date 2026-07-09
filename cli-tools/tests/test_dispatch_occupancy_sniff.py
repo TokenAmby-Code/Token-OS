@@ -14,5 +14,17 @@ def _assert_dispatch_target_unoccupied_body() -> str:
 def test_dispatch_occupancy_sniff_does_not_join_freeform_pane_title() -> None:
     body = _assert_dispatch_target_unoccupied_body()
 
-    assert "#{pane_title}" not in body
+    assert (
+        "#{pane_current_command}|#{@PANE_ID}|#{pane_pid}|#{@INSTANCE_ID}|#{pane_title}" not in body
+    )
     assert "#{pane_current_command}|#{@PANE_ID}|#{pane_pid}|#{@INSTANCE_ID}" in body
+
+
+def test_dispatch_occupancy_sniff_title_is_defined_without_joining_metadata() -> None:
+    body = _assert_dispatch_target_unoccupied_body()
+
+    assert "local pane meta cmd pane_label pane_pid instance_id title" in body
+    assert 'title="$(tmux display-message -p -t "$pane" \'#{pane_title}\'' in body
+    assert (
+        "#{pane_current_command}|#{@PANE_ID}|#{pane_pid}|#{@INSTANCE_ID}|#{pane_title}" not in body
+    )

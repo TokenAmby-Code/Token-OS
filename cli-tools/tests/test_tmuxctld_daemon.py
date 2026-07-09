@@ -2187,6 +2187,60 @@ def test_send_text_pending_turn_registers_one_late_hook_echo() -> None:
         server.shutdown()
 
 
+def test_hook_echo_queues_under_typing_guard_instead_of_direct_inject(monkeypatch) -> None:
+    SendAckAdapter.calls = []
+    server, _ = _serve(SendAckAdapter)
+    try:
+        status, payload = _post_timeout(
+            server,
+            "/send-text",
+            {
+                "pane": "%42",
+                "text": "do the thing",
+                "verify": True,
+                "verify_timeout": 0.01,
+                "ack_submit_retries": 0,
+                "submit_settle_seconds": 0,
+                "hook_echo_pane": "%99",
+                "correlation_id": "corr-guarded-echo",
+            },
+            timeout=5,
+        )
+        assert status == 200
+        result = payload["result"]
+
+        monkeypatch.setattr(
+            daemon.send_gate,
+            "evaluate",
+            lambda *a, **k: {
+                "suppressed": True,
+                "policy": "delay",
+                "reason": "typing_guard",
+                "target": "%99",
+            },
+        )
+        monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda pane: pane == "%99")
+        monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
+
+        _, ack = _post(
+            server,
+            "/hooks/user-prompt-submit",
+            {"pane": "%42", "prompt_hash": result["payload_hash"]},
+        )
+        echo = ack["result"]["hook_echoes"][0]
+        assert echo["status"] == "queued"
+        assert echo["delivery"]["queued"] is True
+        assert echo["delivery"]["reason"] == "typing_guard"
+        assert not [
+            c
+            for c in SendAckAdapter.calls
+            if c[:4] == ("send-keys", "-t", "%99", "-l")
+            and "correlation_id=corr-guarded-echo" in c[4]
+        ]
+    finally:
+        server.shutdown()
+
+
 def test_pending_hook_echo_survives_sniffer_rehydrate_and_server_restart(
     tmp_path, monkeypatch
 ) -> None:

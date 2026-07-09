@@ -262,10 +262,19 @@ pr_step_wrapper_id() {
 }
 
 pr_step_resolve_instance_id() {
-    local wrapper pane value
+    local wrapper pane value env_iid
     wrapper="$(pr_step_wrapper_id)"
     value="$(pr_step_ledger_resolve_field wrapper_id "$wrapper" instance_id || true)"
     [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+
+    # Non-Token-OS repos and some revival/wave workers may not have a tmuxctld
+    # wrapper row available to this shell, but the harness still exports the
+    # originating instance id. Prefer that explicit identity before falling back
+    # to pane lookup: pane variables are easier to inherit stale across nested
+    # shells and caused PR flags to land on the wrong row.
+    env_iid="${TOKEN_API_INSTANCE_ID:-}"
+    [[ -n "$env_iid" ]] && { printf '%s' "$env_iid"; return 0; }
+
     pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
     value="$(pr_step_ledger_resolve_field pane_id "$pane" instance_id || true)"
     [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }

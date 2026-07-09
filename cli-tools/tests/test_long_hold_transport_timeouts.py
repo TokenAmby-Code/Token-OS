@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
-import os
-import subprocess
+import io
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,14 +69,35 @@ def test_brief_send_transport_timeout_exceeds_send_ceiling() -> None:
     assert seen["timeout"] > 60.0
 
 
-def test_tmuxctld_ping_long_hold_routes_exceed_sixty_seconds() -> None:
-    env = os.environ.copy()
-    env.update({"TMUXCTLD_PING_PRINT_RESPONSE": "1", "TMUXCTLD_URL": "http://127.0.0.1:9"})
-    cmd = "source cli-tools/lib/tmuxctld-timeouts.sh; tmuxctld_lifecycle_client_timeout"
-    budget = subprocess.check_output(["bash", "-lc", cmd], cwd=ROOT, env=env, text=True).strip()
-    assert float(budget) > 60.0
+def test_brief_main_timeout_surfaces_correlation_handle_not_traceback() -> None:
+    brief = _load("brief_cli_timeout_main", "cli-tools/bin/brief")
+
+    def fake_urlopen(_req, timeout):
+        raise TimeoutError("timed out")
+
+    stdout = io.StringIO()
+    with patch.object(brief.urllib.request, "urlopen", fake_urlopen):
+        with contextlib.redirect_stdout(stdout):
+            rc = brief.main(["--json", "--pane", "mechanicus:fabricator-general", "probe"])
+
+    payload = brief.json.loads(stdout.getvalue())
+    assert rc == 1
+    assert payload["status"] == "send_timeout"
+    assert payload["delivery"]["status"] == "unknown"
+    assert payload["delivery"]["correlation_handle"]["panes"] == ["mechanicus:fabricator-general"]
+
+
+def test_tmuxctld_ping_lifecycle_routes_have_no_client_transfer_timeout() -> None:
     text = (ROOT / "cli-tools/bin/tmuxctld-ping").read_text()
-    assert (
-        '"POST /reconcile"' in text and '"POST /close-pane"' in text and '"POST /send-text"' in text
-    )
-    assert "tmuxctld_lifecycle_client_timeout" in text
+    assert '"POST /reconcile"|"POST /close-pane"|"POST /close"|"POST /stack/add")' in text
+    assert 'MAX_TIME="${TMUXCTLD_MAX_TIME:-0}"' in text
+    assert "tmuxctld_lifecycle_client_timeout" not in text
+    assert '"POST /send-text")' in text
+    assert "tmuxctld_send_client_timeout" in text
+
+
+def test_work_loop_stack_add_uses_lifecycle_transport_budget() -> None:
+    text = (ROOT / "cli-tools/bin/work-loop").read_text()
+    assert "tmuxctld_result_max_time()" in text
+    assert '"POST /reconcile"|"POST /close-pane"|"POST /close"|"POST /stack/add")' in text
+    assert 'TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-$(tmuxctld_send_client_timeout)}"' not in text
