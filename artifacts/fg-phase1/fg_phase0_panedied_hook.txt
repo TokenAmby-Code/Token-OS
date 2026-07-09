@@ -1,0 +1,1 @@
+pane-died[90] run-shell -b "tmuxctld-ping POST /event event=pane-died pane=#{pane_id} >/dev/null || env IMPERIUM_TMUX_RAW=1 tmux display-message tmuxctld-ping-/event-failed"

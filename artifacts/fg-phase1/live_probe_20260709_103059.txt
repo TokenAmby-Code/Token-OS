@@ -1,0 +1,163 @@
+## health
+Thu Jul  9 10:30:59 MST 2026
+{
+  "status": "healthy",
+  "timestamp": "2026-07-09T10:30:59.505158",
+  "tts_backend": {
+    "current": null,
+    "satellite_available": true
+  },
+  "tts_global_mode": "verbose",
+  "in_meeting": false,
+  "git_sha": "ae4c5f450034f091b31264e3e0787782251f0f43"
+}
+## roster mechanicus
+{
+  "pane_id": "%14",
+  "slot": "mechanicus",
+  "cardinal": "fabricator-general",
+  "label": "mechanicus:fabricator-general",
+  "title": "Ready | 019f3f2b-3159-7c73-a1fb-92064...",
+  "window": "mechanicus",
+  "live": true,
+  "dead": false,
+  "stamp": {
+    "instance_id": "019f3f2b-3159-7c73-a1fb-92064bfa5c1e",
+    "wrapper_id": "",
+    "persona": "",
+    "born_epoch": ""
+  },
+  "instance_id": "019f3f2b-3159-7c73-a1fb-92064bfa5c1e",
+  "occupancy": "occupied"
+}
+{
+  "pane_id": "%15",
+  "slot": "mechanicus",
+  "cardinal": "orchestrator",
+  "label": "mechanicus:orchestrator",
+  "title": "✳ Claude Code",
+  "window": "mechanicus",
+  "live": true,
+  "dead": false,
+  "stamp": {
+    "instance_id": "",
+    "wrapper_id": "457e67ba1f344d148df92ff4d50d9ed6",
+    "persona": "",
+    "born_epoch": "1783471205"
+  },
+  "instance_id": "",
+  "occupancy": "occupied"
+}
+{
+  "pane_id": "%53",
+  "slot": "mechanicus",
+  "cardinal": "2",
+  "label": "mechanicus:2",
+  "title": "⠇ Working | 019f47eb-15a9-7330-b15e-dacb5...",
+  "window": "mechanicus",
+  "live": true,
+  "dead": false,
+  "stamp": {
+    "instance_id": "019f47eb-15a9-7330-b15e-dacb5ee72fb8",
+    "wrapper_id": "cb741fee-cf75-4525-8184-dd1220a335f2",
+    "persona": "",
+    "born_epoch": ""
+  },
+  "instance_id": "019f47eb-15a9-7330-b15e-dacb5ee72fb8",
+  "occupancy": "occupied"
+}
+## freelist
+{
+  "ok": true,
+  "result": [
+    {
+      "pane_id": "somnium:S",
+      "pane_role": "somnium:S",
+      "window_name": "somnium"
+    },
+    {
+      "pane_id": "somnium:NE",
+      "pane_role": "somnium:NE",
+      "window_name": "somnium"
+    },
+    {
+      "pane_id": "somnium:SE",
+      "pane_role": "somnium:SE",
+      "window_name": "somnium"
+    },
+    {
+      "pane_id": "council:true-terminal",
+      "pane_role": "council:true-terminal",
+      "window_name": "council"
+    }
+  ]
+}
+## fg assert
+## resolve fg
+{
+  "id": "019f47e1-cfaf-7e92-a73d-80cf7242271b",
+  "name": "needs-name",
+  "engine": "codex",
+  "working_dir": "/Volumes/Imperium/Imperium-ENV",
+  "device_id": "Mac-Mini",
+  "origin_type": "local",
+  "commander_type": "emperor",
+  "commander_id": null,
+  "status": "working",
+  "created_at": "2026-07-09T10:16:58.043250",
+  "last_activity": "2026-07-09T10:31:02.363015",
+  "stopped_at": null,
+  "archived_at": null,
+  "persona_id": "fef6a0b8-8665-51f7-9c2d-2b584fa42b73",
+  "rank": "astartes",
+  "session_doc_id": null,
+  "continuity_binding_source": "auto_created",
+  "wrapper_launch_id": "383fb342-76f1-4da9-9cb3-3f036ba04a85",
+  "automated": 0,
+  "notification_mode": "verbose",
+  "interaction_mode": "text",
+  "golden_throne": null,
+  "human_anchored_at": null,
+  "human_anchor_source": null,
+  "input_lock": null,
+  "discord_hosted": 0,
+  "discord_channel": null,
+  "discord_bot": null,
+  "workflow_state": "review_mode",
+  "workflow_updated_at": null,
+  "workflow_blocked_reason": null,
+  "next_required_action": "review",
+  "next_action_owner": "human",
+  "planning_state": "none",
+  "planning_updated_at": "2026-07-09T10:16:58.043250",
+  "planning_source": "auto-clear:instance-supplanted",
+  "closure_surface": null,
+  "closure_required": 0,
+  "session_doc_policy": "interactive_deferred",
+  "pr_url": "https://github.com/TokenAmby-Code/Token-OS/pull/664",
+  "pr_state": "open",
+  "victory_at": null,
+  "victory_reason": null,
+  "is_subagent": 0,
+  "hook_driven": 0,
+  "zealotry": 4,
+  "gt_resume_count": 0,
+  "gt_resume_window_started_at": null,
+  "gt_last_resume_at": null,
+  "gt_no_op_counter": 0,
+  "gt_no_op_summaries_json": null,
+  "gt_last_dispatch_fingerprint": null,
+  "follow_up_sop": null,
+  "stop_allowed": 1,
+  "persona": {
+    "id": "fef6a0b8-8665-51f7-9c2d-2b584fa42b73",
+    "slug": "imperial-fists",
+    "display_name": "Imperial Fists",
+    "pane_tint": "#3a3000",
+    "chip_color": "#e6b800",
+    "tts_voice": "Microsoft Catherine",
+    "tts_rate": "1",
+    "notification_sound": "ding.wav"
+  },
+  "session_doc": null
+}
