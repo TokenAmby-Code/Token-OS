@@ -16,6 +16,37 @@ export type Feed<T> = {
   refresh: () => void;
 };
 
+// ── THE OPS COCKPIT POLL LEDGER ─────────────────────────────────────────────
+// Every poll this cockpit runs, in ONE strict canonical list. The Emperor
+// detests polling; event-driven transport is the target architecture and will
+// replace these ticks. This monitor is the ONE surface where tick-refresh is
+// tolerated — and only under registration: every `usesPolling` call site MUST
+// have a ledger entry. Adding a poll without registering it here is a
+// review-blocking offense. (A tripwire test in cockpitData.test.ts pins the
+// exact entries.)
+export type OpsCockpitPoll = {
+  route: string; // the endpoint the poll ticks against
+  intervalMs: number; // the default tick interval (the hook's default arg)
+  hook: string; // the usesPolling-backed hook that owns the tick
+  purpose: string; // why this poll is tolerated
+};
+
+export const OPS_COCKPIT_POLLS: readonly OpsCockpitPoll[] = [
+  {
+    route: '/api/ui/ops/state',
+    intervalMs: 2000,
+    hook: 'useOpsState',
+    purpose:
+      'The ONE aggregate read-model spine — dials, TTS stack, worker rails, the kanban session_docs embed, and deploy-follow all ride it; never a second poller per #671.',
+  },
+  {
+    route: '/api/ui/ops/timer/history',
+    intervalMs: 30000,
+    hook: 'useTimerHistory',
+    purpose: 'Balance-line history for the timer graph.',
+  },
+] as const;
+
 function usesPolling<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   intervalMs: number,

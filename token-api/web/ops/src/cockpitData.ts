@@ -406,9 +406,11 @@ export function toWorkerQueue(s: OpsState): WorkerItem[] {
 // The board renders the session-doc pipeline embedded in OpsState (the
 // `session_docs` feed — ONE poller, per the #671 contract; never a bespoke
 // board-side fetch). Lane membership is a PROJECTION: raw frontmatter `status:`
-// (dialect-rich, Obsidian-authored) → the five canonical lifecycle lanes. The
-// raw stamp stays the truth — a card whose raw status ≠ its lane's slug wears
-// it as a mono chip.
+// (dialect-rich, Obsidian-authored) → the five canonical lifecycle lanes.
+// Cards are TITLE-ONLY by Emperor's ruling (2026-07-09): the v4 ink —
+// accusation line, rubric pips, raw-status stamp, live filament — over-carried
+// the old card's dressing. It returns in deliberate later waves, re-cut from
+// git history onto this plate.
 
 /**
  * Raw frontmatter `status:` → canonical lane slug, per the absorption table in
@@ -486,18 +488,8 @@ const docBasename = (p: string | null): string | null => {
 
 export type KanbanCardModel = {
   key: string; // stable render key — the doc id, falling back to path
-  laneKey: string; // canonical lane slug (the projection of rawStatus)
-  title: string; // doc title, falling back to the path basename
-  rawStatus: string; // frontmatter truth — stamped on the card when ≠ laneKey
-  awaiting: string | null; // GT accusation: first unmet criterion of an incomplete rubric
-  head: string | null; // one-line body excerpt — line 2 when there is no accusation
-  rubric: { met: number; total: number; skipped: number } | null; // present rubrics only
-  // Filament truth comes from the ACTIVE-instance join, NOT linked_instances:
-  // the feed's count includes stopped/historical rows, and a glowing filament
-  // with no live agent bound would be a false-positive identity surface
-  // (fail-dark decree). Dark unless an active instance is on the doc NOW.
-  live: boolean; // an ACTIVE instance is bound to this doc — lights the filament
-  tint: string | null; // that instance's persona chip colour (filament tint)
+  laneKey: string; // canonical lane slug (the projection of the raw status)
+  title: string; // doc title, falling back to the path basename — the plate's ONLY ink
 };
 
 export type KanbanLane = {
@@ -510,10 +502,8 @@ export type KanbanLane = {
 
 /**
  * OpsState → the Muster Ledger lanes, keyed by canonical lane slug. Pure
- * projection of the embedded session_docs feed: decree lane mapping, the
- * today-only gate, and the live-filament join (first ACTIVE instance whose
- * session_doc.id matches supplies the persona tint — the same chip_color the
- * worker rails wear). `now` is injectable for tests; lanes the feed doesn't
+ * projection of the embedded session_docs feed: decree lane mapping and the
+ * today-only gate. `now` is injectable for tests; lanes the feed doesn't
  * populate are simply absent (an empty lane renders empty).
  */
 export function toMusterBoard(s: OpsState, now: Date = new Date()): Record<string, KanbanLane> {
@@ -530,22 +520,10 @@ export function toMusterBoard(s: OpsState, now: Date = new Date()): Record<strin
     // raw caps can stack past the per-lane limit. Docs arrive created_at DESC,
     // so the newest survive; the honesty counter reports the rest.
     if (lane.cards.length >= feed.limit_per_lane) continue;
-    const bound = s.instances.active.find(
-      (i) => i.session_doc?.id != null && i.session_doc.id === doc.id,
-    );
     lane.cards.push({
       key: doc.id != null ? `doc:${doc.id}` : `path:${doc.path ?? doc.title ?? 'unknown'}`,
       laneKey,
       title: doc.title ?? docBasename(doc.path) ?? 'untitled',
-      rawStatus: doc.status,
-      awaiting:
-        doc.rubric?.present && !doc.rubric.complete ? (doc.rubric.first_unmet ?? null) : null,
-      head: doc.head,
-      rubric: doc.rubric?.present
-        ? { met: doc.rubric.met, total: doc.rubric.total, skipped: doc.rubric.skipped }
-        : null,
-      live: bound != null,
-      tint: bound?.persona?.chip_color ?? null,
     });
   }
   // lane_totals is keyed by RAW status and counts every non-archived doc
