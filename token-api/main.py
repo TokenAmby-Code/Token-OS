@@ -22331,6 +22331,21 @@ async def _ops_collect_facts(now: datetime) -> dict:
         record_error("agents_db", exc)
         work_actions = _ops_empty_work_actions()
 
+    # Muster Ledger feed for the kanban board (#671 contract: the board consumes
+    # useOpsState — the feed is embedded here, never a second board-side poller).
+    # Capped at 4/lane: the board is a today-only glance surface, not an index.
+    try:
+        session_docs = await _ops_session_docs_feed(limit_per_lane=4)
+    except Exception as exc:
+        logger.warning("Ops fact collection failed reading session docs: %s", exc)
+        session_docs = {
+            "generated_at": now.isoformat(),
+            "lane_totals": {},
+            "limit_per_lane": 4,
+            "docs": [],
+            "error": str(exc),
+        }
+
     tmux_health = await _ops_read_tmuxctld_health()
 
     if "agents_db" in source_errors:
@@ -22487,6 +22502,7 @@ async def _ops_collect_facts(now: datetime) -> dict:
         "enforcement": enforcement_summary,
         "tts": tts_summary,
         "work_actions": work_actions,
+        "session_docs": session_docs,
         "assertions": assertions,
         "timer": timer_snapshot,
         "attention": attention_snapshot,
@@ -22587,6 +22603,7 @@ def _ops_build_ui_state(facts: dict) -> dict:
         "enforcement": facts["enforcement"],
         "tmux": facts["tmux"],
         "work_actions": facts["work_actions"],
+        "session_docs": facts["session_docs"],
     }
 
 
@@ -23082,17 +23099,16 @@ def _ops_session_doc_head(body: str, limit: int = 160) -> str | None:
     return None
 
 
-@app.get("/api/ui/ops/session-docs")
-async def get_ops_session_docs(
+async def _ops_session_docs_feed(
     include_archived: bool = False,
     limit_per_lane: int = 12,
-):
-    """Read-only pipeline-board feed for the ops cockpit.
+) -> dict:
+    """Build the read-only pipeline-board feed for the ops cockpit.
 
     Groups DB-registered session docs into status lanes, each doc carrying a
     one-line *head excerpt* and an `obsidian://` deep-link. The cockpit never
     renders more than the head — the document is authored and read in Obsidian
-    (the single writer of `status:`). This endpoint performs no mutations.
+    (the single writer of `status:`). This builder performs no mutations.
 
     `archived` docs are excluded by default (there are hundreds). Each lane is
     capped at `limit_per_lane` most-recently-*created* docs; `lane_totals`
@@ -23100,6 +23116,9 @@ async def get_ops_session_docs(
     rather than silently truncating. Ordering is by `created_at` because
     `updated_at` is unreliable (bulk-touched), and age-since-creation honestly
     surfaces docs that have been open a long time.
+
+    Shared by GET /api/ui/ops/session-docs and the OpsState embed (the kanban
+    board consumes useOpsState per the #671 contract — one poller, one feed).
     """
     from urllib.parse import quote
 
@@ -23251,6 +23270,17 @@ async def get_ops_session_docs(
         "limit_per_lane": max(1, limit_per_lane),
         "docs": docs,
     }
+
+
+@app.get("/api/ui/ops/session-docs")
+async def get_ops_session_docs(
+    include_archived: bool = False,
+    limit_per_lane: int = 12,
+) -> dict:
+    """Read-only pipeline-board feed — see _ops_session_docs_feed."""
+    return await _ops_session_docs_feed(
+        include_archived=include_archived, limit_per_lane=limit_per_lane
+    )
 
 
 # [MOVED to shared.py / routes/tts.py] — was: # ============ TTS/Notification System ===========

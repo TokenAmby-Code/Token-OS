@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   balanceMinutes,
@@ -6,6 +6,7 @@ import {
   mapMode,
   nowClock,
   toModeSegments,
+  toMusterBoard,
   toTimerPoints,
   toTtsQueue,
   toWorkerQueue,
@@ -15,6 +16,8 @@ import {
   type CockpitTimerPoint,
   type DialModel,
   type DialTone,
+  type KanbanCardModel,
+  type KanbanLane,
   type TtsItem,
   type TtsItemStatus,
   type WorkerItem,
@@ -78,6 +81,7 @@ interface CockpitData {
   dials: DialModel[]; // the floating state-dial cluster models
   ttsQueue: TtsItem[]; // the left-stack TTS queue
   workerQueue: WorkerItem[]; // the live worker rails — one chip per registered instance
+  muster: Record<string, KanbanLane>; // the Muster Ledger lanes, keyed by canonical slug
   degraded: string | null; // non-null → render the degraded banner with this text
 }
 
@@ -3846,11 +3850,15 @@ function pointsToPath(pts: { x: number; y: number }[]): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// KANBAN — the blank gold board filling the band between the crossbars.
+// KANBAN — the Muster Ledger: live session-doc cards on the gold board filling
+// the band between the crossbars.
 //
-// Static placeholder plates this pass: no data wiring, no handlers, nothing
-// focusable — the Emperor judges the metal before the ink. Column count is
-// driven ENTIRELY by KANBAN_COLUMNS; nothing else knows how many columns exist.
+// Data rides the OpsState session_docs embed through the toMusterBoard adapter
+// (one poller — the #671 contract; no bespoke board-side fetch). Today-only,
+// read-only, INERT: Obsidian is the sole writer of `status:`, so the board has
+// no handlers and nothing focusable — the card-open funnel is a later wave.
+// Column count is driven ENTIRELY by KANBAN_COLUMNS; nothing else knows how
+// many columns exist.
 // GEOMETRY-BOUND: the board reads railCrossbar — the SAME curve+span the worker
 // rail renders from — so it is horizontally bounded by the crossbar span (never
 // past the handlebar ends, clear of the drain ditches) and vertically stretched
@@ -3860,7 +3868,7 @@ function pointsToPath(pts: { x: number; y: number }[]): string {
 // a fat idle queue visibly clobbering the board IS the error signifier.
 // ═══════════════════════════════════════════════════════════════════════════
 
-type KanbanColumnConfig = { key: string; title: string; cards: number };
+type KanbanColumnConfig = { key: string; title: string };
 
 // CANONICAL-LIFECYCLE COUPLING: the lane set mirrors the session-doc lifecycle
 // canonized in the vault decree "Ultramar/Session Lifecycle Decree" (2026-07-09)
@@ -3868,15 +3876,15 @@ type KanbanColumnConfig = { key: string; title: string; cards: number };
 // hidden terminal (victory-ack archives; archived docs are never rendered).
 // Frontmatter `status:` is the source of truth; session docs, Golden Throne and
 // this board all consume the same vocabulary. Change the decree, change this
-// array (and the session-doc/GT consumers). `key` = canonical state slug,
-// `title` = the state's name in the small-caps head chrome. Card counts are
-// still demo placeholders — ink lands a later wave.
+// array (and the laneForStatus projection + session-doc/GT consumers). `key` =
+// canonical state slug — the toMusterBoard lane key; `title` = the state's
+// name in the head chrome.
 const KANBAN_COLUMNS: KanbanColumnConfig[] = [
-  { key: 'aspirant', title: 'Aspirant', cards: 3 },
-  { key: 'astartes', title: 'Astartes', cards: 4 },
-  { key: 'arbites', title: 'Arbites', cards: 2 },
-  { key: 'inquisitor', title: 'Inquisitor', cards: 2 },
-  { key: 'victorious', title: 'Victorious', cards: 1 },
+  { key: 'aspirant', title: 'Aspirant' },
+  { key: 'astartes', title: 'Astartes' },
+  { key: 'arbites', title: 'Arbites' },
+  { key: 'inquisitor', title: 'Inquisitor' },
+  { key: 'victorious', title: 'Victorious' },
 ];
 
 // CSS mirrors — the idle rail's page placement lives in cockpit.css; the board
@@ -3891,20 +3899,58 @@ const KANBAN_SEAM_GAP = 4; // seam ends shy of the 2px bar strokes — dashes ki
 const KANBAN_SEAM_DASH = 20; // dash length — big segments, clearly a seam not a wire
 const KANBAN_SEAM_SPACE = 26; // dash gap — more air than metal
 
-// One inert plate in the rail's own instrument language: official gold outline
-// over the darker band-wash interior (see .kanban-card). Three placeholder
-// strokes. No handlers, no tabindex, hidden from AT — pure metal.
-function KanbanCard() {
+// One session-doc plate — real ink on the same gold-outlined plate the metal
+// pass seated (see .kanban-card). Line 1 = the doc title. Line 2 = the Golden
+// Throne accusation (⚑ awaiting <first unmet criterion>) when an incomplete
+// rubric is present, else the head excerpt. A present rubric wears its
+// pip-strip + tally (phosphor = met, hollow = unmet, brass slash = skipped);
+// a doc whose raw frontmatter status ≠ its lane's canonical slug wears the raw
+// stamp (lane = projection, raw stamp = truth). The left edge is the live
+// filament: persona-tinted + lit while instances are bound to the doc, cold
+// when dormant. Still INERT: no handlers, no tabindex — the card-open funnel
+// is a later wave.
+function KanbanCard({ card }: { card: KanbanCardModel }) {
+  const pips: ReactNode[] = [];
+  if (card.rubric) {
+    const { met, total, skipped } = card.rubric;
+    // Counts only — the feed carries no per-criterion order. Cap the strip so a
+    // sprawling rubric never overruns the plate; the tally stays authoritative.
+    for (let i = 0; i < Math.min(total, 12); i++) {
+      const kind = i < met ? 'met' : i < met + skipped ? 'skip' : 'unmet';
+      pips.push(<i key={i} className={`kanban-card__pip kanban-card__pip--${kind}`} />);
+    }
+  }
   return (
-    <div className="kanban-card" aria-hidden>
-      <span className="kanban-card__line kanban-card__line--title" />
-      <span className="kanban-card__line" />
-      <span className="kanban-card__line kanban-card__line--short" />
+    <div
+      className={`kanban-card${card.live ? ' kanban-card--live' : ''}`}
+      style={card.tint ? ({ '--filament': card.tint } as CSSProperties) : undefined}
+    >
+      <span className="kanban-card__toprow">
+        <span className="kanban-card__title">{card.title}</span>
+        {card.rawStatus !== card.laneKey ? (
+          <span className="kanban-card__stamp">{card.rawStatus}</span>
+        ) : null}
+      </span>
+      {card.awaiting != null ? (
+        <span className="kanban-card__second kanban-card__second--accusation">
+          ⚑ awaiting {card.awaiting}
+        </span>
+      ) : (
+        <span className="kanban-card__second">{card.head ?? ''}</span>
+      )}
+      {card.rubric ? (
+        <span className="kanban-card__rubric">
+          {pips}
+          <span className="kanban-card__tally">
+            {card.rubric.met}/{card.rubric.total}
+          </span>
+        </span>
+      ) : null}
     </div>
   );
 }
 
-function KanbanBoard({ uiScale }: { uiScale: number }) {
+function KanbanBoard({ uiScale, board }: { uiScale: number; board: Record<string, KanbanLane> }) {
   // Self-measure W (same pattern as WorkerQueues) — the board is an inset:0
   // page layer, so its local x/y ARE page coords for the top rail's geometry.
   const wrapRef = useRef<HTMLElement>(null);
@@ -3977,10 +4023,10 @@ function KanbanBoard({ uiScale }: { uiScale: number }) {
   }
 
   return (
-    // aria-hidden on the whole board (no label): every plate is placeholder
-    // metal, so exposing a landmark would announce an empty region. The data
-    // wiring pass restores the label alongside real content.
-    <section className="kanban" aria-hidden ref={wrapRef}>
+    // Real content now — the landmark label the placeholder pass withheld is
+    // restored. Still pointer-inert (.kanban is pointer-events:none): a
+    // read-only ledger the AT can read but nothing can click.
+    <section className="kanban" aria-label="Muster Ledger — today's session documents" ref={wrapRef}>
       {seams.length > 0 && (
         <svg className="kanban__svg" width={W} height="100%" aria-hidden>
           {seams.map((sm, i) => (
@@ -3990,17 +4036,26 @@ function KanbanBoard({ uiScale }: { uiScale: number }) {
           ))}
         </svg>
       )}
-      {columns.map((col) => (
-        <section className="kanban__col" key={col.key}
-          style={{ left: col.left, top: col.top, width: col.width, height: col.height }}>
-          <header className="kanban__col-head">{col.title}</header>
-          <div className="kanban__col-body">
-            {Array.from({ length: col.cards }, (_, i) => (
-              <KanbanCard key={i} />
-            ))}
-          </div>
-        </section>
-      ))}
+      {columns.map((col) => {
+        const lane = board[col.key];
+        return (
+          <section className="kanban__col" key={col.key}
+            style={{ left: col.left, top: col.top, width: col.width, height: col.height }}>
+            <header className="kanban__col-head">{col.title}</header>
+            <div className="kanban__col-body">
+              {(lane?.cards ?? []).map((card) => (
+                <KanbanCard key={card.key} card={card} />
+              ))}
+              {/* honesty counter — the lane truly holds more docs than the board
+                  shows (per-lane cap + today filter); report the drop, never
+                  truncate silently. */}
+              {(lane?.overflow ?? 0) > 0 && (
+                <span className="kanban__more">+{lane!.overflow} more</span>
+              )}
+            </div>
+          </section>
+        );
+      })}
     </section>
   );
 }
@@ -4129,6 +4184,7 @@ export function OpsCockpit() {
       dials: s ? buildDials(s) : [],
       ttsQueue: s ? toTtsQueue(s) : [],
       workerQueue: s ? toWorkerQueue(s) : [],
+      muster: s ? toMusterBoard(s) : {},
       degraded,
     };
   }, [opsState.data, opsState.loading, opsState.error, timerHistory.data, timerHistory.loading, timerHistory.error]);
@@ -4272,14 +4328,15 @@ export function OpsCockpit() {
       <IdleWorkerQueue clockValue={life.clockValue} idleLeft={life.idleLeft} idleRight={life.idleRight}
         pendingIds={life.pendingIds} uiScale={uiScale} animate={!reducedMotion} />
 
-      {/* kanban — the blank gold board filling the band between the worker
+      {/* kanban — the Muster Ledger filling the band between the worker
           crossbar and the idle crossbar, geometry-bound to the SAME railCrossbar
-          curve both rails render from. Static placeholder plates this pass; the
-          follow-up data wiring consumes useOpsState (/api/ui/ops/state) like
-          every other cockpit surface — no bespoke endpoint, no direct store
-          reads. z:40 so a fat idle queue (z:62) visibly clobbers it — the
-          clobber IS the error signifier. Never raise the board past 61. */}
-      <KanbanBoard uiScale={uiScale} />
+          curve both rails render from. Live ink: today's session docs projected
+          onto the canonical lanes via toMusterBoard, riding the SAME useOpsState
+          poll as every other cockpit surface (the #671 contract) — no bespoke
+          endpoint, no direct store reads. z:40 so a fat idle queue (z:62)
+          visibly clobbers it — the clobber IS the error signifier. Never raise
+          the board past 61. */}
+      <KanbanBoard uiScale={uiScale} board={cockpitData.muster} />
 
       {/* dials drawer — where the default dial click lands (minimal stub) */}
       <DialsDrawer open={drawerOpen} focusedId={focusedDial} onClose={() => setDrawerOpen(false)} />

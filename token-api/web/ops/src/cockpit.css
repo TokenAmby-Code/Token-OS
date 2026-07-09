@@ -866,11 +866,11 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   pointer-events: auto;
   transition: transform 320ms ease;
 }
-/* the visible round dial — same instrument chrome as the old worker rings
-   (translucent surface fill + brass border). The per-chip tone lives on `color`
-   (inline), tinting ONLY the currentColor icon + the hover glow; the border stays
-   brass. Collapse/fade on dismiss rides the inner disc so the outer transform
-   (slot position) is never disturbed. */
+/* the visible round dial — translucent surface fill, NO brass border: the
+   per-chip tone lives on `color` (inline) and the currentColor glow ring IS the
+   dial's edge — a brass instrument ring underneath it clashed with the glow
+   (Emperor's ruling, kanban-docs-wiring wave). Collapse/fade on dismiss rides
+   the inner disc so the outer transform (slot position) is never disturbed. */
 .worker-chip__disc {
   display: grid;
   place-items: center;
@@ -878,7 +878,7 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   height: 100%;
   border-radius: 50%;
   background: color-mix(in srgb, var(--surface) 55%, transparent);
-  border: var(--instrument-w) solid var(--instrument);
+  border: 0;
   /* always-on tone edge glow — mirrors the TTS .ring base halo (currentColor
      here, since the chip's tone rides `color` inline), so every worker disc
      carries the same beveled tone bleed the TTS dials do. The richer :hover
@@ -957,8 +957,10 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 }
 
 /* ══ KANBAN ═══════════════════════════════════════════════════════════════════
-   The blank gold board filling the band between the worker crossbar and the
-   idle crossbar. Static placeholder plates this pass — no data, no interaction.
+   The Muster Ledger — today's session-doc cards on the gold board filling the
+   band between the worker crossbar and the idle crossbar. Live ink, still
+   INERT: read-only projection of the OpsState session_docs feed (Obsidian is
+   the sole writer of status); pointer-events stay off, no interaction.
    GEOMETRY-BOUND: an inset:0 page layer (like the crossbar assemblies); the
    component positions every seam and column inline off railCrossbar — the SAME
    curve+span both rails render from — so the board hugs the bars' bows and
@@ -1012,8 +1014,9 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   font-family: 'Chakra Petch', sans-serif;
   font-size: calc(11.5px * var(--ui-scale, 1));
   font-weight: 600;
-  font-variant-caps: small-caps;
+  text-transform: uppercase; /* ALL CAPS (Emperor's ruling) — supersedes the small-caps chrome */
   letter-spacing: 0.22em;
+  text-align: center;
   color: var(--muted);
   padding: 0 2px calc(9px * var(--ui-scale, 1));
 }
@@ -1031,34 +1034,135 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
    gold outline over a darker interior. The background mirrors the rail band's
    FROZEN bandFill: 0.14 (RAIL_SHAPE_DEFAULTS) — the same faint brass wash over
    the page metal, so plates and table lip read as one material; keep the 14%
-   in step with bandFill if that ever moves. Inert this pass: no hover, no
-   motion, no pointer. */
+   in step with bandFill if that ever moves. Real session-doc ink now, still
+   inert: no hover, no motion, no pointer. Fixed plate height — the board keeps
+   its rhythm; a doc that overruns clips (overflow:hidden), never grows. */
 .kanban-card {
+  position: relative; /* anchors the filament thread + raw-status stamp */
   flex: none;
   height: calc(84px * var(--ui-scale, 1));
   border-radius: var(--radius-card);
   border: var(--instrument-w) solid var(--instrument);
   background: color-mix(in srgb, var(--instrument) 14%, var(--bg-deep));
-  padding: calc(14px * var(--ui-scale, 1)) calc(16px * var(--ui-scale, 1));
+  padding: calc(11px * var(--ui-scale, 1)) calc(16px * var(--ui-scale, 1))
+    calc(11px * var(--ui-scale, 1)) calc(20px * var(--ui-scale, 1));
   display: flex;
   flex-direction: column;
-  gap: calc(9px * var(--ui-scale, 1));
+  gap: calc(6px * var(--ui-scale, 1));
+  overflow: hidden;
   pointer-events: none;
 }
 
-/* placeholder strokes — flat muted brass bars readable on the dark wash (the
-   engraving shadows belonged to the retired solid-gold face). */
-.kanban-card__line {
-  height: calc(7px * var(--ui-scale, 1));
-  width: 88%;
-  border-radius: calc(3px * var(--ui-scale, 1));
-  background: color-mix(in srgb, var(--brass) 30%, transparent);
+/* The LIVE FILAMENT — the card's left edge is a thread. Dormant docs wear it
+   cold/dim brass; a doc with bound instances lights it in the binding
+   instance's persona tint (--filament, set inline off chip_color — the same
+   tone plumbing the worker chips wear) with a phosphor-class glow. Default
+   tint is phosphor for live docs whose instance carries no chip colour. */
+.kanban-card::before {
+  content: '';
+  position: absolute;
+  left: calc(8px * var(--ui-scale, 1));
+  top: calc(12px * var(--ui-scale, 1));
+  bottom: calc(12px * var(--ui-scale, 1));
+  width: calc(3px * var(--ui-scale, 1));
+  border-radius: calc(2px * var(--ui-scale, 1));
+  background: color-mix(in srgb, var(--brass-deep) 55%, transparent);
 }
-.kanban-card__line--title {
-  height: calc(10px * var(--ui-scale, 1));
-  width: 62%;
+.kanban-card--live::before {
+  background: var(--filament, var(--phosphor));
+  box-shadow: 0 0 calc(9px * var(--ui-scale, 1))
+    color-mix(in srgb, var(--filament, var(--phosphor)) 75%, transparent);
 }
-.kanban-card__line--short { width: 40%; }
+
+/* line 1 — title + raw-status stamp in one row (the stamp is near-universal
+   until the writer-retarget PR lands canonical statuses, so it gets a real
+   flex slot, not an overlay). */
+.kanban-card__toprow {
+  display: flex;
+  align-items: baseline;
+  gap: calc(6px * var(--ui-scale, 1));
+  min-width: 0;
+}
+.kanban-card__title {
+  flex: 1;
+  min-width: 0;
+  font-family: 'Chakra Petch', sans-serif;
+  font-size: calc(12px * var(--ui-scale, 1));
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* line 2 — head excerpt (data face, quiet) or the GT accusation (warn-hot:
+   the Golden Throne is pointing at an unmet criterion, it must read as an
+   accusation, not furniture). */
+.kanban-card__second {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: calc(9.5px * var(--ui-scale, 1));
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kanban-card__second--accusation { color: var(--warn); }
+
+/* rubric pip-strip + tally: phosphor pip = met, hollow = unmet, brass slash =
+   skipped. Counts only — the feed carries no per-criterion order. */
+.kanban-card__rubric {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--ui-scale, 1));
+  min-height: calc(8px * var(--ui-scale, 1));
+}
+.kanban-card__pip {
+  flex: none;
+  width: calc(6px * var(--ui-scale, 1));
+  height: calc(6px * var(--ui-scale, 1));
+  border-radius: 50%;
+}
+.kanban-card__pip--met { background: var(--phosphor); }
+.kanban-card__pip--unmet {
+  border: 1px solid color-mix(in srgb, var(--muted) 70%, transparent);
+}
+.kanban-card__pip--skip {
+  border-radius: 0;
+  background: linear-gradient(135deg, transparent 38%, var(--brass) 38%, var(--brass) 62%, transparent 62%);
+}
+.kanban-card__tally {
+  margin-left: calc(3px * var(--ui-scale, 1));
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: calc(8.5px * var(--ui-scale, 1));
+  color: var(--faint);
+}
+
+/* raw-status stamp — worn only when the doc's raw frontmatter status ≠ its
+   lane's canonical slug: the lane is a projection, the stamp is the truth. */
+.kanban-card__stamp {
+  flex: none;
+  max-width: 45%;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: calc(8px * var(--ui-scale, 1));
+  color: var(--faint);
+  border: 1px solid color-mix(in srgb, var(--brass-deep) 60%, transparent);
+  border-radius: var(--radius-sm);
+  padding: calc(1px * var(--ui-scale, 1)) calc(5px * var(--ui-scale, 1));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* honesty counter — "+N more": the lane truly holds more docs than the board
+   shows (per-lane feed cap + today filter). Quiet mono, never a card. */
+.kanban__more {
+  flex: none;
+  text-align: center;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: calc(9px * var(--ui-scale, 1));
+  color: var(--faint);
+  padding-top: calc(2px * var(--ui-scale, 1));
+}
 
 /* ══ coordinate-capture placement layer (authoring tool, mockup only) ═════════
    Full-bleed overlay ABOVE the timer graph + arc + fan (z:65) but BELOW the
