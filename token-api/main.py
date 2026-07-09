@@ -155,6 +155,7 @@ from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
 from personas import (
+    PROFILE_BY_SLUG,
     assign_astartes_persona,
     persona_to_profile,
     resolve_live_persona_instance,
@@ -23169,6 +23170,46 @@ async def get_ops_session_docs(
             note = note_rel[:-3] if note_rel.endswith(".md") else note_rel
             obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
 
+        # Rubric summary for the kanban card. evaluate_rubric is pure and the
+        # frontmatter is already in hand (read post-cap), so this adds zero I/O.
+        # `present` is the load-bearing flag: a missing rubric evaluates as
+        # complete:true so legacy docs never trip GT, and the cockpit must key
+        # every rubric treatment on `present` — never `complete` alone.
+        # Frontmatter is untrusted operator-authored YAML; any surprise shape
+        # degrades to the present:false fallback rather than failing the feed.
+        try:
+            rubric_status = evaluate_rubric(fm)
+            rubric_total = len(rubric_status.rubric)
+            rubric_summary = {
+                "present": rubric_status.present,
+                "complete": rubric_status.complete,
+                "met": rubric_total - len(rubric_status.missing) - len(rubric_status.skipped),
+                "total": rubric_total,
+                "skipped": len(rubric_status.skipped),
+                "first_unmet": rubric_status.missing[0] if rubric_status.missing else None,
+                "notified_at": rubric_status.notified_at,
+                "acknowledged_at": rubric_status.acknowledged_at,
+            }
+        except Exception:
+            rubric_summary = {
+                "present": False,
+                "complete": False,
+                "met": 0,
+                "total": 0,
+                "skipped": 0,
+                "first_unmet": None,
+                "notified_at": None,
+                "acknowledged_at": None,
+            }
+
+        persona_slug = fm.get("persona_slug") or fm.get("persona") or fm.get("legion")
+        profile = PROFILE_BY_SLUG.get(persona_slug or "")
+        persona_summary = {
+            "slug": persona_slug,
+            "chip_color": (profile or {}).get("chip_color"),
+            "display_name": (profile or {}).get("display_name"),
+        }
+
         created = d.get("created_at")
         session_date, session_date_source = _ops_session_doc_date_basis(fm, created)
         age_seconds = None
@@ -23191,8 +23232,10 @@ async def get_ops_session_docs(
                 "status": status,
                 "project": d.get("project") or fm.get("project"),
                 "primarch": d.get("primarch_name") or fm.get("primarch"),
-                "persona_slug": fm.get("persona_slug") or fm.get("persona") or fm.get("legion"),
+                "persona_slug": persona_slug,
+                "persona": persona_summary,
                 "golden_throne": fm.get("golden_throne") or fm.get("instance_type"),
+                "rubric": rubric_summary,
                 "head": head,
                 "created_at": created,
                 "session_date": session_date,
