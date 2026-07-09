@@ -75,7 +75,6 @@ def _get(path: str, timeout: float = SEND_CLIENT_TIMEOUT_SECONDS) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-
 def _await_failure_record(last_record: dict, send: dict, *, error: str) -> dict:
     """Build a structured await-failure record without losing send delivery state.
 
@@ -94,9 +93,10 @@ def _await_failure_record(last_record: dict, send: dict, *, error: str) -> dict:
             "send": send or {},
         }
     )
-    if "delivery" not in base and isinstance(send, dict) and "delivery" in send:
+    if not base.get("delivery") and isinstance(send, dict) and send.get("delivery"):
         base["delivery"] = send.get("delivery")
     return base
+
 
 def _resolve_caller(explicit: str | None) -> str:
     if explicit:

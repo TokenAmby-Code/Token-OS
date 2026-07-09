@@ -3,6 +3,8 @@ import urllib.error
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TALK = REPO_ROOT / "cli-tools" / "bin" / "talk"
 
@@ -25,7 +27,9 @@ def _send_record():
     }
 
 
-def test_talk_await_http_error_emits_structured_failure_preserving_delivery(monkeypatch, capsys):
+def test_talk_await_http_error_emits_structured_failure_preserving_delivery(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     talk = _load_talk_module()
     send = _send_record()
     monkeypatch.setattr(talk, "_resolve_caller", lambda explicit: explicit or "custodes:test")
@@ -60,7 +64,9 @@ def test_talk_await_http_error_emits_structured_failure_preserving_delivery(monk
     assert "HTTP Error 500: Internal Server Error" in out
 
 
-def test_talk_await_url_error_emits_structured_failure_preserving_delivery(monkeypatch, capsys):
+def test_talk_await_url_error_emits_structured_failure_preserving_delivery(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     talk = _load_talk_module()
     send = _send_record()
     monkeypatch.setattr(talk, "_resolve_caller", lambda explicit: explicit or "custodes:test")
