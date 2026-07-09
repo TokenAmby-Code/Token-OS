@@ -866,11 +866,11 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   pointer-events: auto;
   transition: transform 320ms ease;
 }
-/* the visible round dial — same instrument chrome as the old worker rings
-   (translucent surface fill + brass border). The per-chip tone lives on `color`
-   (inline), tinting ONLY the currentColor icon + the hover glow; the border stays
-   brass. Collapse/fade on dismiss rides the inner disc so the outer transform
-   (slot position) is never disturbed. */
+/* the visible round dial — translucent surface fill, NO brass border: the
+   per-chip tone lives on `color` (inline) and the currentColor glow ring IS the
+   dial's edge — a brass instrument ring underneath it clashed with the glow
+   (Emperor's ruling, kanban-docs-wiring wave). Collapse/fade on dismiss rides
+   the inner disc so the outer transform (slot position) is never disturbed. */
 .worker-chip__disc {
   display: grid;
   place-items: center;
@@ -878,7 +878,7 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   height: 100%;
   border-radius: 50%;
   background: color-mix(in srgb, var(--surface) 55%, transparent);
-  border: var(--instrument-w) solid var(--instrument);
+  border: 0;
   /* always-on tone edge glow — mirrors the TTS .ring base halo (currentColor
      here, since the chip's tone rides `color` inline), so every worker disc
      carries the same beveled tone bleed the TTS dials do. The richer :hover
@@ -1012,8 +1012,9 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   font-family: 'Chakra Petch', sans-serif;
   font-size: calc(11.5px * var(--ui-scale, 1));
   font-weight: 600;
-  font-variant-caps: small-caps;
+  text-transform: uppercase; /* ALL CAPS (Emperor's ruling) — supersedes the small-caps chrome */
   letter-spacing: 0.22em;
+  text-align: center;
   color: var(--muted);
   padding: 0 2px calc(9px * var(--ui-scale, 1));
 }
