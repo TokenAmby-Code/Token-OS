@@ -3530,7 +3530,7 @@ async def play_queue_item(request: PlayQueueItemRequest) -> dict:
         return {
             "success": False,
             "promoted": 0,
-            "item_key": request.item_key,
+            "item_key": item_key,
             "reason": "item_key_required",
         }
 

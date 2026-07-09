@@ -1050,7 +1050,7 @@ function agentNodeCenter(id: string, scopeSel?: string): { x: number; y: number 
 // mock's local promoting play-gesture phase is retired: the live queue is the
 // sole driver of order and drain, so the stack never animates a state the data
 // didn't report.
-type TtsPhase = 'arriving' | 'idle' | 'promoting' | 'speaking' | 'dismissing';
+type TtsPhase = 'arriving' | 'idle' | 'promoting' | 'error' | 'speaking' | 'dismissing';
 interface TtsEntry {
   key: string; // = agent.id = the live item id — the React key
   agent: TtsAgent; // the woven identity; item = agent.item, originSide rides to idle
@@ -1063,6 +1063,7 @@ const TTS_PHASE_CLASS: Record<TtsPhase, string> = {
   arriving: 'tts-dial tts-dial--arriving', // rendered but opacity:0 until the flight lands
   idle: 'tts-dial',
   promoting: 'tts-dial tts-dial--promoting',
+  error: 'tts-dial tts-dial--error',
   speaking: 'tts-dial tts-dial--speaking',
   dismissing: 'tts-dial tts-dial--dismissing',
 };
@@ -1134,8 +1135,8 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
         // Present: refresh the item + derive the phase from the live status
         // (held at 'arriving' while its handoff flight is still inbound).
         const phase: TtsPhase =
-          e.phase === 'promoting' && promotingKeys.current.has(e.key)
-            ? 'promoting'
+          (e.phase === 'promoting' || e.phase === 'error') && promotingKeys.current.has(e.key)
+            ? e.phase
             : e.phase === 'arriving' && pendingIds.has(e.key)
               ? 'arriving'
               : live.item.status === 'speaking'
@@ -1223,21 +1224,31 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
       promotingKeys.current.delete(key);
       setEntries((cur) =>
         cur.map((e) =>
-          e.key === key && e.phase === 'promoting'
+          e.key === key && (e.phase === 'promoting' || e.phase === 'error')
             ? { ...e, phase: e.agent.item.status === 'speaking' ? 'speaking' : 'idle', promoteSlot: undefined }
             : e,
         ),
       );
     };
+    const showPromoteError = (key: string) => {
+      setEntries((cur) =>
+        cur.map((e) =>
+          e.key === key && e.phase === 'promoting'
+            ? { ...e, phase: 'error' as TtsPhase, promoteSlot: undefined }
+            : e,
+        ),
+      );
+      after(2000, () => revertPromoting(key));
+    };
     playTtsItem(item.itemKey)
       .then((result) => {
         if (!result.success) throw new Error(result.reason ?? 'play-item failed');
+        after(850, () => revertPromoting(id));
       })
       .catch((err) => {
         console.error('[tts] play-item failed', err);
-        revertPromoting(id);
+        showPromoteError(id);
       });
-    after(850, () => revertPromoting(id));
   }
 
   return (
