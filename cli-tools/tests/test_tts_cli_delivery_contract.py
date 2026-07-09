@@ -69,3 +69,18 @@ def test_tts_cli_exits_zero_only_on_reported_audio_delivery(tmp_path: Path) -> N
 
     assert proc.returncode == 0
     assert proc.stderr == ""
+
+
+def test_tts_cli_enforcement_marks_notify_payload_and_fails_named(tmp_path: Path) -> None:
+    proc = _run_tts(
+        tmp_path,
+        '{"delivered":false,"audio_delivered":false,"reason":"enforcement_audio_completion_timeout","tts":{"reason":"enforcement_audio_completion_timeout"}}',
+        "--enforcement",
+        "enforcement line",
+    )
+
+    assert proc.returncode != 0
+    assert "enforcement_audio_completion_timeout" in proc.stderr
+    argv = (tmp_path / "curl-argv.txt").read_text()
+    assert '"enforcement":true' in argv
+    assert '"kind":"enforcement"' in argv

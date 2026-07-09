@@ -10,6 +10,7 @@
 #   tts --sync "Your spoken message"     # Default; wait for delivery verdict
 #   tts --async "Your spoken message"    # Fire-and-forget; exit only means request spawned
 #   tts --verbose "Your spoken message"  # Print Token-API JSON response
+#   tts --enforcement "Close the app"     # Mark as live enforcement; bypass persona_silent
 #
 # Routes through /api/notify, the authoritative comms router. Exit 0 means the
 # response reported audible delivery. Transport acceptance, queue acceptance, or
@@ -32,6 +33,7 @@ INSTANCE_ID=""
 SYNC=true
 DIRECT=false
 VERBOSE=false
+ENFORCEMENT=false
 
 usage() {
     awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
@@ -143,6 +145,10 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=true
             shift
             ;;
+        --enforcement)
+            ENFORCEMENT=true
+            shift
+            ;;
         --)
             shift
             break
@@ -178,11 +184,13 @@ if [[ -n "$INSTANCE_ID" ]]; then
     JSON=$(jq -cn \
         --arg msg "$MESSAGE" \
         --arg iid "$INSTANCE_ID" \
-        '{"message": $msg, "instance_id": $iid, "tts": true}')
+        --argjson enforcement "$ENFORCEMENT" \
+        '{"message": $msg, "instance_id": $iid, "tts": true, "enforcement": $enforcement} + (if $enforcement then {"context":{"kind":"enforcement"}} else {} end)')
 else
     JSON=$(jq -cn \
         --arg msg "$MESSAGE" \
-        '{"message": $msg, "tts": true}')
+        --argjson enforcement "$ENFORCEMENT" \
+        '{"message": $msg, "tts": true, "enforcement": $enforcement} + (if $enforcement then {"context":{"kind":"enforcement"}} else {} end)')
 fi
 
 if [[ "$SYNC" == "false" ]]; then
