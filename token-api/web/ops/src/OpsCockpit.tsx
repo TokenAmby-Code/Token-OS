@@ -3802,9 +3802,12 @@ function KanbanCard() {
 
 function KanbanBoard() {
   return (
+    // aria-hidden on the whole board (no label): every plate is placeholder
+    // metal, so exposing a landmark would announce an empty region. The data
+    // wiring pass restores the label alongside real content.
     <section
       className="kanban"
-      aria-label="Kanban board"
+      aria-hidden
       style={{ '--kanban-cols': KANBAN_COLUMNS.length } as React.CSSProperties}
     >
       {KANBAN_COLUMNS.map((col) => (
