@@ -226,14 +226,9 @@ def main(argv: list[str]) -> int:
                     timeout=wait + 15.0,
                 )
             except urllib.error.HTTPError as exc:
-                failure = {
-                    **(last_record or {}),
-                    "status": "await_failed",
-                    "await_status": "failed",
-                    "await_error": f"HTTP Error {exc.code}: {exc.reason}",
-                    "delivery_status": (send or {}).get("delivery_status") or (send or {}).get("status"),
-                    "delivery": (send or {}).get("delivery"),
-                }
+                failure = _await_failure_record(
+                    last_record, send, error=f"HTTP Error {exc.code}: {exc.reason}"
+                )
                 if args.json_out:
                     print(json.dumps(failure, indent=2, sort_keys=True))
                 else:
@@ -243,14 +238,9 @@ def main(argv: list[str]) -> int:
                     )
                 return 1
             except urllib.error.URLError as exc:
-                failure = {
-                    **(last_record or {}),
-                    "status": "await_failed",
-                    "await_status": "failed",
-                    "await_error": f"connection error: {exc.reason}",
-                    "delivery_status": (send or {}).get("delivery_status") or (send or {}).get("status"),
-                    "delivery": (send or {}).get("delivery"),
-                }
+                failure = _await_failure_record(
+                    last_record, send, error=f"connection error: {exc.reason}"
+                )
                 if args.json_out:
                     print(json.dumps(failure, indent=2, sort_keys=True))
                 else:

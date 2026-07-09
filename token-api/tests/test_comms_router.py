@@ -226,6 +226,70 @@ def test_dispatch_notify_enforcement_bypasses_persona_silent(monkeypatch: Any) -
     assert calls["kwargs"][0]["bypass_persona_silent"] is True
 
 
+def test_queue_tts_enforcement_bypass_uses_system_voice_for_silent_persona(
+    monkeypatch: Any,
+) -> None:
+    """queue_tts itself must honor the enforcement bypass.
+
+    A silent persona normally returns persona_silent.  With the live-enforcement
+    bypass set, it must enqueue through the system/Custodes voice instead.
+    """
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(tts, "DESKTOP_STATE", {"in_meeting": False})
+    monkeypatch.setattr(tts, "TTS_GLOBAL_MODE", {"mode": "verbose"})
+    monkeypatch.setattr(
+        tts,
+        "_resolve_queue_playback_target",
+        lambda **_kwargs: {"success": True, "playback_target": "mac"},
+    )
+
+    async def fake_log_event(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(tts, "log_event", fake_log_event)
+    tts.hot_queue.clear()
+    tts.pause_queue.clear()
+
+    class FakeCursor:
+        async def fetchone(self):
+            return {
+                "name": "Silent Worker",
+                "tts_voice": None,
+                "notification_sound": "quiet.wav",
+                "tts_mode": "verbose",
+                "persona_slug": "silent-worker",
+                "tts_policy": "silent",
+                "advisor": 0,
+            }
+
+    class FakeDb:
+        row_factory = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_args, **_kwargs):
+            return FakeCursor()
+
+    monkeypatch.setattr(tts, "connect_agents_db", lambda *_a, **_k: FakeDb())
+
+    normal = asyncio.run(tts.queue_tts("iid", "line"))
+    assert normal == {"success": True, "queued": False, "reason": "persona_silent"}
+
+    bypass = asyncio.run(tts.queue_tts("iid", "line", bypass_persona_silent=True))
+
+    assert bypass["queued"] is True
+    assert len(tts.hot_queue) == 1
+    item = tts.hot_queue.popleft()
+    assert item.voice == tts._SYSTEM_TTS_ROW["tts_voice"]
+    assert item.sound == tts._SYSTEM_TTS_ROW["notification_sound"]
+    assert item.name == tts._SYSTEM_TTS_ROW["name"]
+
+
 def test_dispatch_notify_tactile_only_does_not_speak(monkeypatch: Any) -> None:
     tts = _load("routes.tts")
     monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
