@@ -4448,3 +4448,15 @@ def _run_resolve_api_server(bound_working_dir: str) -> ThreadingHTTPServer:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
+
+
+def test_live_pane_success_warning_is_not_emitted_before_ledger_failure() -> None:
+    text = DISPATCH.read_text(encoding="utf-8")
+    start = text.index("dispatch_observe_wait_for_launch() {")
+    end = text.index("\n}\n\nconfirm_dispatch_launch_live", start)
+    body = text[start:end]
+    assert 'if ! reconcile_dispatch_registry_bind "$pane" "$target_display" 0; then' in body
+    assert body.index(
+        'ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1'
+    ) < body.index("treating live pane as successful launch")
+    assert 'reconcile_dispatch_registry_bind "$pane" "$target_display" 1' not in body
