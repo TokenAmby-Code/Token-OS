@@ -134,6 +134,12 @@ def test_chunk_player_speaks_one_utterance_and_reports_buffer_drained() -> None:
     assert speak_actions[0]["m_queue"] is False
     assert speak_actions[0]["m_waitToFinish"] is True
 
+    assignments = dict(set_variable_assignments(macro))
+    assert assignments["current_index"] == "{lv=request[current_index]}"
+    assert assignments["session_id"] == "{lv=request[session_id]}"
+    assert assignments["playback_id"] == "{lv=request[playback_id]}"
+    assert assignments["utterance_id"] == "{lv=request[utterance_id]}"
+
     serialized = json.dumps(macro)
     assert "LoopAction" not in serialized
     assert "/api/tts/chunk-next" not in serialized
