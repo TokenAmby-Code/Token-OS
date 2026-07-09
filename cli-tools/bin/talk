@@ -226,10 +226,28 @@ def main(argv: list[str]) -> int:
                     timeout=wait + 15.0,
                 )
             except urllib.error.HTTPError as exc:
-                _err(f"await failed: {exc}")
+                failure = _await_failure_record(
+                    last_record, send, error=f"HTTP Error {exc.code}: {exc.reason}"
+                )
+                if args.json_out:
+                    print(json.dumps(failure, indent=2, sort_keys=True))
+                else:
+                    _err(
+                        f"await failed after send status={send.get('status')} "
+                        f"talk_id={talk_id}: HTTP Error {exc.code}: {exc.reason}"
+                    )
                 return 1
             except urllib.error.URLError as exc:
-                _err(f"await connection error: {exc.reason}")
+                failure = _await_failure_record(
+                    last_record, send, error=f"connection error: {exc.reason}"
+                )
+                if args.json_out:
+                    print(json.dumps(failure, indent=2, sort_keys=True))
+                else:
+                    _err(
+                        f"await connection error after send status={send.get('status')} "
+                        f"talk_id={talk_id}: {exc.reason}"
+                    )
                 return 1
             last_record = record
             if record.get("status") and record["status"] != "open":
