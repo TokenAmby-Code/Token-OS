@@ -493,13 +493,23 @@ class TmuxControlPlane:
         from .wrapper_ledger import LEDGER
 
         out = dict(LEDGER.reconcile_from_tmux(self.adapter))
+
+        from .occupancy import scan_ledger_dispatch_availability
+
         scrubbed: list[str] = []
-        for pane in list_free_panes(self.adapter):
+        for pane in scan_ledger_dispatch_availability(self.adapter):
+            # chrome = f(bind): a non-singleton pane with no active instance bind
+            # must not carry tint/title/runtime chrome, even if a bare shell or a
+            # hollow legacy wrapper stamp keeps it out of the freelist for this
+            # pass.  Clearing runtime state here also removes that hollow stamp so
+            # the next ledger reconcile cannot resurrect it as occupancy.
+            if pane.singleton or pane.instance_id:
+                continue
             target = pane.pane_id
             self.adapter.clear_runtime_state(target)
             scrubbed.append(target)
-        out["chrome_scrubbed_free_panes"] = scrubbed
-        out["chrome_scrubbed_free_count"] = len(scrubbed)
+        out["chrome_scrubbed_unbound_panes"] = scrubbed
+        out["chrome_scrubbed_unbound_count"] = len(scrubbed)
         return out
 
     def freelist(self) -> list[dict]:
