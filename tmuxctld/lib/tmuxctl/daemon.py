@@ -883,6 +883,7 @@ def _typing_gate_detail(phys_pane: str, *, gate: dict | None = None) -> dict:
 
 
 def _deferred_receipt(item: dict, *, gate: dict) -> dict:
+    phys_pane = str(item.get("phys_pane") or "")
     return {
         "status": "queued",
         "queued": True,
@@ -891,11 +892,19 @@ def _deferred_receipt(item: dict, *, gate: dict) -> dict:
         "submitted": False,
         "queue_id": item["id"],
         "queue_seq": item["seq"],
-        "pane": item.get("pane") or item.get("phys_pane"),
-        "physical_pane": item.get("phys_pane"),
-        "target": item.get("phys_pane"),
+        "queue_handle": {"id": item["id"], "seq": item["seq"], "pane": phys_pane},
+        "queue_state": {
+            "path": str(_DEFERRED_SEND_QUEUE.path),
+            "queued_total": _DEFERRED_SEND_QUEUE.size(),
+            "queued_for_pane": _DEFERRED_SEND_QUEUE.by_pane().get(phys_pane, 0),
+            "drain_scheduled": phys_pane in _DEFERRED_DRAINING,
+            "drain_guarantee": "scheduled_until_typing_guard_clears",
+        },
+        "pane": item.get("pane") or phys_pane,
+        "physical_pane": phys_pane,
+        "target": phys_pane,
         "reason": "typing_guard",
-        "gate": gate,
+        "gate": {**gate, "policy": "enqueue", "deferred": True},
         "queue_path": str(_DEFERRED_SEND_QUEUE.path),
     }
 
@@ -1665,7 +1674,7 @@ def _resolve_physical_pane_or_gate(control, pane: str) -> str:
                 "suppressed": True,
                 "reason": "typing_guard",
                 "gate": "pane_unresolved",
-                "policy": "cancel",
+                "policy": "enqueue",
                 "target": pane,
                 "deferred": True,
             }
@@ -1679,7 +1688,7 @@ def _raise_if_human_locked(phys: str) -> None:
                 "suppressed": True,
                 "reason": "typing_guard",
                 "gate": "human_lock",
-                "policy": "cancel",
+                "policy": "enqueue",
                 "target": phys,
                 "deferred": True,
             }
@@ -2896,10 +2905,45 @@ def _h_assert_instance(control, params):
 
 def _h_reconcile(control, params):
     # The detached daemon has no ambient tmux session; the fleet lives in `main`.
+    ledger = control.ledger_reconcile()
+    results = control.reconcile_personas(session=_s(params, "session", "main"))
+    errored = [r for r in results if isinstance(r, dict) and (r.get("ok") is False or r.get("error"))]
+    if results and len(errored) == len(results):
+        raise ValueError("reconcile degraded: every target row errored")
     return {
-        "ledger": control.ledger_reconcile(),
-        "results": control.reconcile_personas(session=_s(params, "session", "main")),
+        "status": "degraded" if errored else "ok",
+        "degraded": bool(errored),
+        "ledger": ledger,
+        "results": results,
+        "errors": len(errored),
     }
+
+
+def _h_pane_inventory(control, params):
+    fmt = "\t".join([
+        "#{pane_id}", "#{@PANE_ID}", "#{window_name}", "#{pane_title}",
+        "#{pane_dead}", "#{@INSTANCE_ID}", "#{@TOKEN_API_WRAPPER_ID}",
+        "#{@PERSONA}", "#{@PANE_OCCUPANCY}", "#{@PANE_BORN}",
+    ])
+    try:
+        raw = control.adapter.run("list-panes", "-a", "-F", fmt, allow_failure=False)
+    except Exception as exc:  # noqa: BLE001 - endpoint must fail loud/degraded, not empty-healthy
+        return {"ok": False, "degraded": True, "error": "tmux_unreachable", "message": str(exc), "panes": []}
+    panes = []
+    for line in raw.splitlines():
+        parts = (line.split("\t") + [""] * 10)[:10]
+        phys, label, window, title, dead, instance, wrapper, persona, occupancy, born = parts
+        if label and ":" in label:
+            slot, cardinal = label.split(":", 1)
+        else:
+            slot, cardinal = "", label
+        panes.append({
+            "pane_id": phys, "slot": slot, "cardinal": cardinal, "label": label,
+            "title": title, "window": window, "live": dead != "1", "dead": dead == "1",
+            "stamp": {"instance_id": instance, "wrapper_id": wrapper, "persona": persona, "born_epoch": born},
+            "instance_id": instance, "occupancy": occupancy or ("occupied" if instance or wrapper or persona else "unknown"),
+        })
+    return {"ok": True, "degraded": False, "count": len(panes), "panes": panes}
 
 
 def _h_event(control, params):
@@ -3330,6 +3374,7 @@ def _h_hook_wrapperstart(control, params):
 
 
 def _h_close_pane(control, params):
+    requested_pane = _s(params, "pane")
     # Resolve a canonical id (e.g. ``mechanicus:1``) to its physical ``%NN`` FIRST,
     # exactly as _h_pane_live does. close_pane's tmux probes only understand real
     # pane handles; handed a canonical id, ``display-message -t mechanicus:1`` misses
@@ -3337,10 +3382,29 @@ def _h_close_pane(control, params):
     # (the #314-class stale-handle failure, liveness.py). A caller — including the
     # husk reaper — trusting that ``already_closed`` would believe a pane was reaped
     # when it was not. ``current`` is left for close_pane's own resolution.
-    pane = _s(params, "pane")
+    pane = requested_pane
     if pane and pane != "current":
-        pane = _resolve_physical_pane_or_gate(control, pane)
-    return control.close_pane(pane, timeout=_f(params, "timeout", 3.0))
+        try:
+            pane = _resolve_physical_pane_or_gate(control, pane)
+            deferred = _defer_or_drop_typing_guard(
+                route="/close-pane", params=params, pane=requested_pane, phys_pane=pane
+            )
+        except TmuxSendGated as exc:
+            deferred = _defer_or_drop_typing_guard(
+                route="/close-pane",
+                params=params,
+                pane=requested_pane,
+                phys_pane=str(exc.gate.get("target") or requested_pane),
+                gate=exc.gate,
+            )
+            if deferred is None:
+                raise
+        if deferred is not None:
+            return {**deferred, "operation": "close-pane", "sent": False}
+    result = control.close_pane(pane, timeout=_f(params, "timeout", 3.0))
+    if result.get("status") == "cleared_in_place":
+        result = {**result, "retire_required": False, "close_transaction_complete": True}
+    return result
 
 
 def _h_close(control, params):
@@ -4265,6 +4329,7 @@ _DEFERRED_ROUTE_HANDLERS: dict[str, RouteHandler] = {
     "/append-user-text": _h_append_user_text,
     "/insert-invocation": _h_insert_invocation,
     "/context-governor/inject": _h_context_governor_inject,
+    "/close-pane": _h_close_pane,
 }
 
 ROUTES: dict[tuple[str, str], RouteHandler] = {
@@ -4288,6 +4353,8 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("GET", "/inspect/pane"): _h_inspect_pane,
     ("GET", "/inspect/restart-plan"): _h_inspect_restart_plan,
     ("GET", "/doctor"): _h_doctor,
+    ("GET", "/pane-inventory"): _h_pane_inventory,
+    ("GET", "/roster"): _h_pane_inventory,
     ("GET", "/instance/show-option"): _h_instance_show_option,
     ("POST", "/tmux/run"): _h_tmux_run,
     # Send + act (POST)

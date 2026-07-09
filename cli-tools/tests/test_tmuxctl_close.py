@@ -5,7 +5,7 @@ import signal
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(ROOT.parent / "tmuxctld" / "lib"))
 
 from tmuxctl import close as close_mod
 from tmuxctl.close import close_contract_signal_shield, close_instance, close_pane
@@ -128,7 +128,7 @@ def test_close_pane_perpetual_label_refused_by_class_router() -> None:
     assert not any(command[:1] == ("kill-pane",) for command in adapter.commands)
 
 
-def test_close_instance_now_on_slot_retires_and_preserves_pane(monkeypatch) -> None:
+def test_close_instance_now_on_slot_clears_in_place_without_retire(monkeypatch) -> None:
     adapter = FakeCloseAdapter(role="somnium:SE", window_name="somnium", pane_dead=True)
     calls = []
 
@@ -141,8 +141,10 @@ def test_close_instance_now_on_slot_retires_and_preserves_pane(monkeypatch) -> N
 
     result = close_instance(adapter, "iid-slot", mode="now", pane="%9", timeout=0)
 
-    assert result["lifecycle_result"] == {"ok": True}
-    assert calls == [("PATCH", "/api/instances/iid-slot/retire", None)]
+    assert result["status"] == "cleared_in_place"
+    assert result["retire_required"] is False
+    assert result["close_transaction_complete"] is True
+    assert calls == []
     assert result["close"]["status"] == "cleared_in_place"
     assert result["close"]["pane_class"] == "slot"
     assert ("respawn-pane", "-t", "%9") in adapter.commands

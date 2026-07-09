@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(ROOT.parent / "tmuxctld" / "lib"))
 
 from tmuxctl import assertions, daemon, service
 from tmuxctl.service import TmuxControlPlane
@@ -334,18 +334,16 @@ def test_event_route_envelope_for_unhandled_event() -> None:
         server.shutdown()
 
 
-def test_reconcile_route_returns_results_envelope() -> None:
-    # With a stub adapter no seat resolves, so each label errors and is captured
-    # per-label (the sweep never aborts) — a results list of all six personas PLUS
-    # the two reservist heartbeat seats (F3 fill-on-absence).
+def test_reconcile_route_fails_loud_when_all_targets_error() -> None:
+    # With a stub adapter no seat resolves; every target row errors. The daemon
+    # must not return top-level ok/healthy with an all-error reconcile payload.
     server = _serve(FakeAdapter)
     try:
         status, payload = _post(server, "/reconcile", {})
         assert status == 200
-        assert payload["ok"] is True
-        assert len(payload["result"]["results"]) == len(assertions.PERSONA_LABELS) + len(
-            assertions.RESERVIST_LABELS
-        )
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "ValueError"
+        assert "every target row errored" in payload["error"]["message"]
     finally:
         server.shutdown()
 
@@ -559,3 +557,71 @@ def test_h_close_pane_passes_physical_id_through_untouched() -> None:
     # A raw %NN needs no resolution and must not be gated.
     daemon._h_close_pane(_Ctrl(), {"pane": "%7"})
     assert seen["pane"] == "%7"
+
+
+def test_reconcile_route_fails_loud_when_every_target_errors(monkeypatch) -> None:
+    class _Ctrl:
+        def ledger_reconcile(self):
+            return {"rows": 0}
+
+        def reconcile_personas(self, session="main"):
+            return [
+                {"ok": False, "error": "tmux unavailable"},
+                {"ok": False, "error": "tmux unavailable"},
+            ]
+
+    with pytest.raises(ValueError, match="every target row errored"):
+        daemon._h_reconcile(_Ctrl(), {})
+
+
+def test_h_close_pane_typing_guard_enqueues_close_operation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
+    monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
+    monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
+
+    class _Ctrl:
+        adapter = object()
+
+        def close_pane(self, pane, *, timeout=3.0):
+            raise AssertionError("must not close while typing guard is active")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(daemon, "resolve_to_physical", lambda adapter, pane: "%42")
+        out = daemon._h_close_pane(_Ctrl(), {"pane": "somnium:SE"})
+
+    assert out["status"] == "queued"
+    assert out["operation"] == "close-pane"
+    assert out["gate"]["policy"] == "enqueue"
+    assert "queue_handle" in out
+
+
+def test_h_close_pane_cleared_in_place_marks_no_retire_required(monkeypatch) -> None:
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: False)
+
+    class _Ctrl:
+        adapter = object()
+
+        def close_pane(self, pane, *, timeout=3.0):
+            return {"status": "cleared_in_place", "pane": pane, "pane_class": "slot"}
+
+    out = daemon._h_close_pane(_Ctrl(), {"pane": "%8"})
+    assert out["retire_required"] is False
+    assert out["close_transaction_complete"] is True
+
+
+def test_pane_inventory_reports_roster_without_raw_scrape_by_callers() -> None:
+    class _Adapter:
+        def run(self, *args, allow_failure=False):
+            assert args[:3] == ("list-panes", "-a", "-F")
+            return "%8\tsomnium:SE\tsomnium\tSE title\t0\ti-1\tw-1\tpersona\toccupied\t123"
+
+    class _Ctrl:
+        adapter = _Adapter()
+
+    out = daemon._h_pane_inventory(_Ctrl(), {})
+    assert out["ok"] is True
+    assert out["panes"][0]["label"] == "somnium:SE"
+    assert out["panes"][0]["slot"] == "somnium"
+    assert out["panes"][0]["cardinal"] == "SE"
+    assert out["panes"][0]["live"] is True
