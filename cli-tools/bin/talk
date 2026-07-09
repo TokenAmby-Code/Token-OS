@@ -75,6 +75,29 @@ def _get(path: str, timeout: float = SEND_CLIENT_TIMEOUT_SECONDS) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+
+def _await_failure_record(last_record: dict, send: dict, *, error: str) -> dict:
+    """Build a structured await-failure record without losing send delivery state.
+
+    A failure while polling /api/talk/await is not the same as a send failure.
+    Preserve the original send receipt (including delivery) so callers can tell
+    whether a retry risks a duplicate.
+    """
+    base = dict(last_record or {})
+    base.update(
+        {
+            "status": "await_failed",
+            "await_error": error,
+            "error": error,
+            "send_status": (send or {}).get("status"),
+            "talk_id": base.get("talk_id") or (send or {}).get("talk_id"),
+            "send": send or {},
+        }
+    )
+    if "delivery" not in base and isinstance(send, dict) and "delivery" in send:
+        base["delivery"] = send.get("delivery")
+    return base
+
 def _resolve_caller(explicit: str | None) -> str:
     if explicit:
         return explicit
