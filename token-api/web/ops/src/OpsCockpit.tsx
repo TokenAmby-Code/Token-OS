@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   balanceMinutes,
@@ -1206,7 +1206,7 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
     (e) => e.agent.chapterChild === true,
   );
 
-  function activateTtsItem(id: string) {
+  const activateTtsItem = useCallback((id: string) => {
     const entry = entriesRef.current.find((e) => e.key === id);
     const item = entry?.agent.item;
     if (!entry || !item?.promotable || !item.itemKey || item.status === 'speaking') {
@@ -1249,7 +1249,7 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
         console.error('[tts] play-item failed', err);
         showPromoteError(id);
       });
-  }
+  }, [onOpenDrawer]);
 
   return (
     <div
