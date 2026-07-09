@@ -148,12 +148,12 @@ Staged macros:
 |---|---|---|---|
 | `tts-phone-control-ingress.macro` | TTS Phone Control Ingress | `/tts-control` | Public phone control ingress; forwards overlay commands to Token-OS first. |
 | `tts-phone-local-control.macro` | TTS Phone Local Control | `/tts-local-control` | Private Token-OS echo consumer; local-control hook point. |
-| `tts-phone-chunk-player.macro` | 04 TTS Chunk Player | `/tts-chunk` | Streaming write-ahead executor: scalarizes `current_chunk`/`next_chunk`, speaks current, queues next with MacroDroid TTS queue, and calls Token-OS `/api/tts/chunk-next` for one backfill at a time without a hard inter-chunk pause. |
+| `tts-phone-chunk-player.macro` | 04 TTS Chunk Player | `/tts-chunk` | One-utterance executor: scalarizes `current_chunk`, speaks it once with `m_waitToFinish:true`, then posts Token-OS `/api/tts/chunk-event` `buffer_drained`. No `/api/tts/chunk-next` streaming/backfill. |
 | `tts-phone-error-report.macro` | TTS Phone Error Report | `/tts-error` | Reports phone executor failure to Token-OS. |
 | `tts-overlay-pause.macro` | TTS Overlay Pause | floating `tts-pause` | Calls local `/tts-control?command=pause`. |
 | `tts-overlay-resume.macro` | TTS Overlay Resume | floating `tts-resume` | Calls local `/tts-control?command=resume`. |
 | `tts-overlay-skip.macro` | TTS Overlay Skip | floating `tts-skip` | Calls local `/tts-control?command=skip`. |
-| `tts-overlay-faster.macro` | TTS Overlay Faster | floating `tts-faster` | Calls local `/tts-control?command=faster`. |
+| `tts-overlay-faster.macro` | TTS Overlay Faster | floating `tts-faster` | Retired/disabled for one-chunk v1; Token-OS rejects `faster`/`speed`. |
 | `tts-overlay-stop.macro` | TTS Overlay Stop | floating `tts-stop` | Calls local `/tts-control?command=stop`. |
 
 Validation:

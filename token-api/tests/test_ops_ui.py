@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -956,3 +957,187 @@ def test_ops_state_passes_through_tts_sender_metadata(client, app_env, monkeypat
     assert tts["current"]["playback_target"] == "wsl"
     assert tts["hot_queue"][0]["persona_slug"] == "ultramarines"
     assert tts["hot_queue"][0]["playback_target"] == "phone"
+
+
+# ── /api/ui/ops/session-docs — the Muster Ledger feed ────────────────────────
+# First-ever coverage of the pipeline-board feed, pinned alongside the rubric +
+# persona enrichment the cockpit kanban consumes. Docs are real files under the
+# app_env vault root because the endpoint reads frontmatter from disk.
+
+
+def _write_session_doc(app_env, name: str, frontmatter: str, body: str = "The work.\n") -> str:
+    vault_root = Path(os.environ["IMPERIUM_ENV"])
+    sessions = vault_root / "Sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    doc = sessions / f"{name}.md"
+    doc.write_text(f"---\n{frontmatter}---\n\n{body}", encoding="utf-8")
+    return f"Sessions/{name}.md"
+
+
+def _insert_session_doc(
+    app_env,
+    file_path: str,
+    *,
+    title: str = "Muster Doc",
+    status: str = "active",
+    created_at: str = "2026-05-25T10:00:00",
+) -> int:
+    conn = sqlite3.connect(app_env.db_path)
+    doc_id = conn.execute(
+        """INSERT INTO session_documents
+           (title, file_path, project, status, created_at, updated_at)
+           VALUES (?, ?, 'token-os', ?, ?, ?)""",
+        (title, file_path, status, created_at, created_at),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+    return doc_id
+
+
+def _get_docs(client) -> dict:
+    resp = client.get("/api/ui/ops/session-docs")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_session_docs_rubric_summary_for_dict_rubric(client, app_env) -> None:
+    rel = _write_session_doc(
+        app_env,
+        "rubric-dict",
+        "victory:\n  a: true\n  b: false\n",
+    )
+    _insert_session_doc(app_env, rel)
+
+    body = _get_docs(client)
+
+    doc = body["docs"][0]
+    rubric = doc["rubric"]
+    assert rubric["present"] is True
+    assert rubric["complete"] is False
+    assert rubric["met"] == 1
+    assert rubric["total"] == 2
+    assert rubric["skipped"] == 0
+    assert rubric["first_unmet"] == "b"
+    assert rubric["notified_at"] is None
+    assert rubric["acknowledged_at"] is None
+
+
+def test_session_docs_no_rubric_reports_present_false(client, app_env) -> None:
+    # evaluate_rubric treats a missing rubric as complete:true so legacy docs
+    # never trip GT — the feed summary must still say present:false so the
+    # cockpit never renders a victory state for a doc with no rubric at all.
+    rel = _write_session_doc(app_env, "no-rubric", "project: token-os\n")
+    _insert_session_doc(app_env, rel)
+
+    body = _get_docs(client)
+
+    rubric = body["docs"][0]["rubric"]
+    assert rubric["present"] is False
+
+
+def test_session_docs_legacy_scalar_rubric_is_well_formed(client, app_env) -> None:
+    rel = _write_session_doc(app_env, "legacy-scalar", "victory: declared\n")
+    _insert_session_doc(app_env, rel)
+
+    body = _get_docs(client)
+
+    rubric = body["docs"][0]["rubric"]
+    assert rubric["present"] is True
+    assert rubric["complete"] is True
+    assert rubric["total"] == 1
+    assert rubric["met"] == 1
+    assert rubric["skipped"] == 0
+    assert rubric["first_unmet"] is None
+
+
+def test_session_docs_skip_counts_and_completes(client, app_env) -> None:
+    rel = _write_session_doc(
+        app_env,
+        "rubric-skip",
+        "victory:\n  a: true\n  b: false\nvictory_skip:\n  - b\n",
+    )
+    _insert_session_doc(app_env, rel)
+
+    body = _get_docs(client)
+
+    rubric = body["docs"][0]["rubric"]
+    assert rubric["present"] is True
+    assert rubric["complete"] is True
+    assert rubric["met"] == 1
+    assert rubric["total"] == 2
+    assert rubric["skipped"] == 1
+    assert rubric["first_unmet"] is None
+
+
+def test_session_docs_persona_chip_for_known_slug(client, app_env) -> None:
+    rel = _write_session_doc(app_env, "persona-known", "persona_slug: blood-angels\n")
+    _insert_session_doc(app_env, rel)
+
+    body = _get_docs(client)
+
+    doc = body["docs"][0]
+    assert doc["persona"]["slug"] == "blood-angels"
+    assert doc["persona"]["chip_color"] == "#b1191e"
+    assert doc["persona"]["display_name"] == "Blood Angels"
+    # flat back-compat field stays
+    assert doc["persona_slug"] == "blood-angels"
+
+
+def test_session_docs_persona_unknown_or_absent_is_null_safe(client, app_env) -> None:
+    rel_unknown = _write_session_doc(app_env, "persona-unknown", "persona_slug: not-a-legion\n")
+    _insert_session_doc(app_env, rel_unknown, created_at="2026-05-25T11:00:00")
+    rel_absent = _write_session_doc(app_env, "persona-absent", "project: token-os\n")
+    _insert_session_doc(app_env, rel_absent, created_at="2026-05-25T10:00:00")
+
+    body = _get_docs(client)
+
+    unknown, absent = body["docs"][0], body["docs"][1]
+    assert unknown["persona"]["slug"] == "not-a-legion"
+    assert unknown["persona"]["chip_color"] is None
+    assert absent["persona"]["slug"] is None
+    assert absent["persona"]["chip_color"] is None
+
+
+def test_session_docs_missing_file_falls_back_and_feed_survives(client, app_env) -> None:
+    _insert_session_doc(app_env, "Sessions/never-written.md")
+
+    body = _get_docs(client)
+
+    doc = body["docs"][0]
+    assert doc["rubric"]["present"] is False
+    assert doc["persona"]["chip_color"] is None
+    assert doc["head"] is None
+
+
+def test_session_docs_spine_fields_unchanged(client, app_env) -> None:
+    rel = _write_session_doc(
+        app_env,
+        "spine-doc",
+        "victory:\n  a: true\npersona_slug: blood-angels\n",
+    )
+    doc_id = _insert_session_doc(app_env, rel, title="Spine Doc", status="active")
+    instance_id = str(uuid.uuid4())
+    conn = sqlite3.connect(app_env.db_path)
+    conn.execute(
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id,
+            status, engine, created_at, last_activity, session_doc_id)
+           VALUES (?, 'spine-instance', '/tmp/ops', 'local', 'Mac-Mini',
+                   'working', 'codex', '2026-05-25T10:00:00', '2026-05-25T10:01:00', ?)""",
+        (instance_id, doc_id),
+    )
+    conn.commit()
+    conn.close()
+
+    body = _get_docs(client)
+
+    assert body["lane_totals"] == {"active": 1}
+    assert body["limit_per_lane"] == 12
+    doc = body["docs"][0]
+    assert doc["id"] == doc_id
+    assert doc["title"] == "Spine Doc"
+    assert doc["status"] == "active"
+    assert doc["linked_instances"] == 1
+    assert doc["session_date"] == "2026-05-25T10:00:00"
+    assert doc["session_date_source"] == "db:created_at"
+    assert doc["obsidian_uri"] is not None

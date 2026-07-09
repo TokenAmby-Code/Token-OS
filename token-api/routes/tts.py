@@ -1416,36 +1416,31 @@ def _split_phone_utterance_text(text: str, *, max_chars: int | None = None) -> t
 def build_phone_tts_chunk_handoff(
     chunks: list[dict], *, max_chars: int | None = None
 ) -> list[dict]:
-    """Build the phone streaming handoff from sanitized speech chunks.
+    """Build one full-utterance phone handoff.
 
-    Phone streaming uses the same sentence/word chunks as the generic backend
-    contract, but a single ``playback_id`` identifies the whole phone utterance.
-    The initial /tts-chunk payload carries chunks 0 and 1; later
-    /api/tts/chunk-next calls backfill chunk n+2 after chunk n is consumed.
+    Phone v1 no longer streams/backfills intra-message chunks. Token-OS sends
+    exactly one ``/tts-chunk`` payload containing the complete sanitized message;
+    MacroDroid speaks it once and reports ``buffer_drained`` when finished.
     """
-    del max_chars  # Kept for test/back-compat call sites; phone no longer re-splits here.
-    cleaned_chunks = [chunk for chunk in chunks if str(chunk.get("text") or "").strip()]
-    if not cleaned_chunks:
+    del max_chars  # Kept for test/back-compat call sites; phone does not split here.
+    texts = [str(chunk.get("text") or "").strip() for chunk in chunks]
+    full_text = " ".join(text for text in texts if text).strip()
+    if not full_text:
         return []
 
-    utterance_id = str(cleaned_chunks[0].get("utterance_id") or uuid.uuid4().hex)
+    utterance_id = str((chunks[0] if chunks else {}).get("utterance_id") or uuid.uuid4().hex)
     playback_id = utterance_id
-    total = len(cleaned_chunks)
-    result = []
-    for index, chunk in enumerate(cleaned_chunks):
-        text = str(chunk.get("text") or "").strip()
-        result.append(
-            {
-                "playback_id": playback_id,
-                "utterance_id": utterance_id,
-                "chunk_id": f"{utterance_id}:{index + 1}/{total}",
-                "index": index,
-                "total": total,
-                "text": text,
-                "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            }
-        )
-    return result
+    return [
+        {
+            "playback_id": playback_id,
+            "utterance_id": utterance_id,
+            "chunk_id": f"{utterance_id}:1/1",
+            "index": 0,
+            "total": 1,
+            "text": full_text,
+            "text_hash": hashlib.sha256(full_text.encode("utf-8")).hexdigest(),
+        }
+    ]
 
 
 def _backend_chunk_payload(
@@ -1660,21 +1655,14 @@ def dispatch_tts_chunks_to_backend(
         if not phone_chunks:
             return {"success": False, "error": "empty_audio_payload", "method": None}
         current_chunk = phone_chunks[0]
-        next_chunk = phone_chunks[1] if len(phone_chunks) > 1 else None
         session_id = str(TTS_AUTHORITATIVE_STATE["session_id"])
-        _register_phone_tts_stream(
-            session_id=session_id,
-            playback_id=current_chunk["playback_id"],
-            utterance_id=current_chunk["utterance_id"],
-            chunks=phone_chunks,
-        )
         _record_tts_backend_active(
             backend,
             playback_id=current_chunk["playback_id"],
             current=_chunk_public_payload(current_chunk),
-            next_chunk=_chunk_public_payload(next_chunk),
+            next_chunk=None,
         )
-        payload = _backend_chunk_payload(current_chunk, next_chunk, rate=rate)
+        payload = _backend_chunk_payload(current_chunk, None, rate=rate)
         result = dict(_send_phone_tts_chunk(payload) or {})
         result.setdefault("chunk_id", current_chunk["chunk_id"])
         real_chunks = len(phone_chunks)
@@ -2982,13 +2970,19 @@ def _echo_tts_control_to_backend(backend: str | None, payload: dict) -> dict:
 
     action = payload["action"]
     if backend == "phone":
+        if action in {"pause", "resume"}:
+            return {
+                "success": False,
+                "backend": backend,
+                "error": "phone_pause_unsupported",
+                "reason": "phone_pause_unsupported",
+            }
         if _send_to_phone is None:
             return {"success": False, "backend": backend, "error": "phone_transport_unavailable"}
         params = {
             "command": action,
             "session_id": payload.get("session_id") or TTS_AUTHORITATIVE_STATE.get("session_id"),
             "playback_id": payload.get("playback_id"),
-            "speed": payload.get("speed"),
         }
         try:
             result = dict(_send_to_phone("/tts-local-control", params) or {})
@@ -3031,12 +3025,50 @@ async def api_tts_control(request: TTSControlRequest) -> dict:
        endpoint/mechanism and returns that echo/error without falling back to Mac.
     """
     action = (request.command or request.action or "").strip().lower()
-    if action not in {"pause", "resume", "skip", "speed"}:
-        raise HTTPException(status_code=400, detail="command must be pause, resume, skip, or speed")
-    if action == "speed" and request.speed is None:
-        raise HTTPException(status_code=400, detail="speed action requires speed")
+    if action in {"faster", "speed"}:
+        raise HTTPException(
+            status_code=400, detail="speed controls are retired for phone one-chunk v1"
+        )
+    if action == "stop":
+        action = "skip"
+        request.command = "skip"
+        request.action = "skip"
+    if action not in {"pause", "resume", "skip"}:
+        raise HTTPException(status_code=400, detail="command must be pause, resume, skip, or stop")
 
     backend = _active_tts_backend(request.backend)
+    if backend == "phone" and action in {"pause", "resume"}:
+        backend_echo = {
+            "success": False,
+            "backend": backend,
+            "error": "phone_pause_unsupported",
+            "reason": "phone_pause_unsupported",
+        }
+        _update_tts_authoritative_state(
+            last_error={
+                "backend": backend,
+                "playback_id": request.playback_id or TTS_AUTHORITATIVE_STATE.get("playback_id"),
+                "error": "phone_pause_unsupported",
+                "reported_at": _now_iso(),
+            }
+        )
+        await log_event(
+            "tts_control",
+            device_id="tts_control",
+            details={
+                "action": action,
+                "speed": request.speed,
+                "backend": backend,
+                "success": False,
+                "backend_echo": backend_echo,
+            },
+        )
+        return {
+            "success": False,
+            "state": get_tts_authoritative_state(),
+            "backend_echo": backend_echo,
+        }
+
     recorded = _record_tts_control_state(request, backend)
     echo_payload = {
         "action": action,
@@ -3094,90 +3126,18 @@ async def api_tts_backend_ack(request: TTSBackendAckRequest) -> dict:
 
 @router.post("/api/tts/chunk-next")
 async def api_tts_chunk_next(request: TTSChunkNextRequest) -> dict:
-    """Return the next phone streaming backfill chunk, or explicit done.
-
-    The phone starts with current chunk ``n`` and buffered chunk ``n+1``. After
-    ``n`` is consumed it asks for ``n+2``. Token-OS remains authoritative: pause
-    returns a paused response without advancing, skip completes the active phone
-    stream, and resume allows normal backfill again.
-    """
-    stream = _get_phone_tts_stream(request.session_id, request.playback_id)
-    if stream is None:
-        return {
-            "success": True,
-            "done": True,
-            "reason": "unknown_or_expired_stream",
-            "next_chunk": "",
-            "next_chunk_text": "",
-            "next_index": None,
-            "control_state": (TTS_AUTHORITATIVE_STATE.get("control") or {}).get("state"),
-        }
-
-    control = dict(TTS_AUTHORITATIVE_STATE.get("control") or {})
-    control_state = control.get("state")
-    if control_state == "paused":
-        payload = _chunk_next_payload(None, done=False, reason="paused")
-        payload.update(
-            {"paused": True, "session_id": request.session_id, "playback_id": request.playback_id}
-        )
-        await log_event(
-            "tts_chunk_next",
-            device_id=request.backend,
-            details={**payload, "last_consumed_index": request.last_consumed_index},
-        )
-        return payload
-    if control_state == "skipping":
-        _complete_phone_tts_stream(request.session_id, request.playback_id)
-        payload = _chunk_next_payload(None, done=True, reason="skipped")
-        payload.update(
-            {"skipped": True, "session_id": request.session_id, "playback_id": request.playback_id}
-        )
-        await log_event(
-            "tts_chunk_next",
-            device_id=request.backend,
-            details={**payload, "last_consumed_index": request.last_consumed_index},
-        )
-        return payload
-
-    chunks = list(stream.get("chunks") or [])
-    total = len(chunks)
-    last_consumed = int(request.last_consumed_index)
-    backfill_index = last_consumed + 2
-    if backfill_index < total:
-        chunk = chunks[backfill_index]
-        current = chunks[last_consumed + 1] if last_consumed + 1 < total else None
-        _record_tts_backend_active(
-            "phone",
-            playback_id=request.playback_id,
-            current=current,
-            next_chunk=chunk,
-        )
-        payload = _chunk_next_payload(chunk, done=False)
-        with _tts_phone_streams_lock:
-            key = _phone_stream_key(request.session_id, request.playback_id)
-            if key in TTS_PHONE_STREAMS:
-                TTS_PHONE_STREAMS[key]["updated_at"] = _now_iso()
-                TTS_PHONE_STREAMS[key]["last_backfill_index"] = backfill_index
-    else:
-        current = chunks[last_consumed + 1] if last_consumed + 1 < total else None
-        _record_tts_backend_active(
-            "phone",
-            playback_id=request.playback_id,
-            current=current,
-            next_chunk=None,
-        )
-        payload = _chunk_next_payload(None, done=True, reason="stream_exhausted")
-
-    payload.update(
-        {
-            "session_id": request.session_id,
-            "playback_id": request.playback_id,
-            "utterance_id": stream.get("utterance_id"),
-            "last_consumed_index": last_consumed,
-            "backfill_index": backfill_index,
-            "total": total,
-        }
-    )
+    """Compatibility-only endpoint; phone streaming/backfill is retired."""
+    payload = {
+        "success": True,
+        "done": True,
+        "reason": "streaming_retired",
+        "next_chunk": "",
+        "next_chunk_text": "",
+        "next_index": None,
+        "session_id": request.session_id,
+        "playback_id": request.playback_id,
+        "control_state": (TTS_AUTHORITATIVE_STATE.get("control") or {}).get("state"),
+    }
     await log_event("tts_chunk_next", device_id=request.backend, details=payload)
     return payload
 

@@ -485,6 +485,23 @@ export type TimerHistory = {
 // Read-only board feed. The cockpit groups these into status lanes and never
 // renders more than `head` (one line); the document itself lives in Obsidian.
 
+/**
+ * Golden Throne rubric state as summarized by the session-docs feed. `present`
+ * is the load-bearing flag: legacy docs with no rubric evaluate as
+ * complete:true, so consumers must key every rubric treatment on `present` —
+ * never `complete` alone.
+ */
+export type RubricSummary = {
+  present: boolean;
+  complete: boolean;
+  met: number;
+  total: number;
+  skipped: number;
+  first_unmet: string | null;
+  notified_at: string | null;
+  acknowledged_at: string | null;
+};
+
 export type PipelineDoc = {
   id: number | null;
   title: string | null;
@@ -495,7 +512,10 @@ export type PipelineDoc = {
   project: string | null;
   primarch: string | null;
   persona_slug: string | null;
+  /** seeded persona profile join — chip_color null for unknown/absent slugs */
+  persona: { slug: string | null; chip_color: string | null; display_name: string | null } | null;
   golden_throne: string | null;
+  rubric: RubricSummary | null;
   head: string | null; // one-line excerpt only — never the full document
   created_at: string | null;
   /**
@@ -646,10 +666,57 @@ export const TimerHistorySchema = z.looseObject({
   segments: z.array(z.looseObject({ start: z.string(), end: z.string() })).optional(),
 });
 
+// Golden Throne rubric state as summarized by the session-docs feed. `present`
+// is the load-bearing flag: legacy docs with no rubric evaluate as
+// complete:true, so consumers must key every rubric treatment on `present` —
+// never `complete` alone.
+export const RubricSummarySchema = z.looseObject({
+  present: z.boolean().optional(),
+  complete: z.boolean().optional(),
+  met: z.number().optional(),
+  total: z.number().optional(),
+  skipped: z.number().optional(),
+  first_unmet: z.string().nullable().optional(),
+  notified_at: z.string().nullable().optional(),
+  acknowledged_at: z.string().nullable().optional(),
+});
+
+// One session-doc card on the Muster Ledger. Spine (`id`/`status`) required;
+// everything else optional/nullable — validation is advisory and must never
+// block a render.
+export const PipelineDocSchema = z.looseObject({
+  id: z.number(),
+  status: z.string(),
+  title: z.string().nullable().optional(),
+  path: z.string().nullable().optional(),
+  vault_rel: z.string().nullable().optional(),
+  obsidian_uri: z.string().nullable().optional(),
+  project: z.string().nullable().optional(),
+  primarch: z.string().nullable().optional(),
+  persona_slug: z.string().nullable().optional(),
+  persona: z
+    .looseObject({
+      slug: z.string().nullable().optional(),
+      chip_color: z.string().nullable().optional(),
+      display_name: z.string().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
+  golden_throne: z.string().nullable().optional(),
+  rubric: RubricSummarySchema.nullable().optional(),
+  head: z.string().nullable().optional(),
+  created_at: z.string().nullable().optional(),
+  session_date: z.string().nullable().optional(),
+  session_date_source: z.string().nullable().optional(),
+  age_seconds: z.number().nullable().optional(),
+  linked_instances: z.number().optional(),
+});
+
 export const SessionDocsFeedSchema = z.looseObject({
   generated_at: z.string(),
   lane_totals: z.record(z.string(), z.number()).optional(),
-  docs: z.array(z.looseObject({ status: z.string().optional() })),
+  limit_per_lane: z.number().optional(),
+  docs: z.array(PipelineDocSchema),
 });
 
 export const OpsGraphSchema = z.looseObject({
@@ -665,3 +732,6 @@ export const OpsGraphSchema = z.looseObject({
 export type OpsStateParsed = z.infer<typeof OpsStateSchema>;
 export type OpsStatusParsed = z.infer<typeof OpsStatusSchema>;
 export type OpsInstanceParsed = z.infer<typeof OpsInstanceSchema>;
+export type RubricSummaryParsed = z.infer<typeof RubricSummarySchema>;
+export type PipelineDocParsed = z.infer<typeof PipelineDocSchema>;
+export type SessionDocsFeedParsed = z.infer<typeof SessionDocsFeedSchema>;
