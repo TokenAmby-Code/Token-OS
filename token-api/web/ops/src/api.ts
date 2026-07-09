@@ -160,7 +160,13 @@ async function postJson<T = unknown>(url: string, body?: unknown): Promise<T> {
 
 export type SkipResult = { skipped: boolean; cleared: number; backend?: string | null };
 export type PromoteResult = { success: boolean; promoted: number };
-export type PlayItemResult = { success: boolean; promoted: number; item_key: string; reason?: string };
+export type PlayItemResult = {
+  success: boolean;
+  promoted: number;
+  item_key: string;
+  reason?: string;
+  from_queue?: string;
+};
 export type GlobalModeResult = { status: string; mode: TtsGlobalMode; old_mode: string };
 export type FocusResult = { snapped: boolean; reason: string | null };
 export type MorningEndResult = { status: string; changed: boolean; morning_status: string };
