@@ -1219,31 +1219,25 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
     setEntries((cur) =>
       cur.map((e) => (e.key === id ? { ...e, phase: 'promoting' as TtsPhase, promoteSlot: slot } : e)),
     );
+    const revertPromoting = (key: string) => {
+      promotingKeys.current.delete(key);
+      setEntries((cur) =>
+        cur.map((e) =>
+          e.key === key && e.phase === 'promoting'
+            ? { ...e, phase: e.agent.item.status === 'speaking' ? 'speaking' : 'idle', promoteSlot: undefined }
+            : e,
+        ),
+      );
+    };
     playTtsItem(item.itemKey)
       .then((result) => {
         if (!result.success) throw new Error(result.reason ?? 'play-item failed');
       })
       .catch((err) => {
         console.error('[tts] play-item failed', err);
-        promotingKeys.current.delete(id);
-        setEntries((cur) =>
-          cur.map((e) =>
-            e.key === id && e.phase === 'promoting'
-              ? { ...e, phase: e.agent.item.status === 'speaking' ? 'speaking' : 'idle', promoteSlot: undefined }
-              : e,
-          ),
-        );
+        revertPromoting(id);
       });
-    after(850, () => {
-      promotingKeys.current.delete(id);
-      setEntries((cur) =>
-        cur.map((e) =>
-          e.key === id && e.phase === 'promoting'
-            ? { ...e, phase: e.agent.item.status === 'speaking' ? 'speaking' : 'idle', promoteSlot: undefined }
-            : e,
-        ),
-      );
-    });
+    after(850, () => revertPromoting(id));
   }
 
   return (
