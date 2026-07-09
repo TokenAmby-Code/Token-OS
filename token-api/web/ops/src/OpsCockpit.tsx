@@ -3690,7 +3690,9 @@ function useLifecycle(
     const nextAgents = liveTts.map((item) => {
       const existing = prevAgentsById.get(item.id);
       if (!existing) return mintLiveAgent(item);
-      return sameItemRender(existing.item, item) ? existing : { ...existing, item };
+      return sameItemRender(existing.item, item)
+        ? existing
+        : { ...existing, item, chapterChild: item.commanderType === 'chapter' };
     });
     setTtsAgents((cur) =>
       cur.length === nextAgents.length && cur.every((a, i) => a === nextAgents[i])

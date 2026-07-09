@@ -188,7 +188,7 @@ function healthDial(h: OpsSourceHealth): { value: string; tone: DialTone } {
 }
 
 
-function ttsDial(s: OpsState): DialModel {
+export function ttsDial(s: OpsState): DialModel {
   const h = healthDial(s.sources.tts);
   if (h.tone === 'bad' || h.tone === 'neutral') {
     return { id: 'tts', label: 'TTS', glyph: '♪', value: h.value, tone: h.tone, noteworthy: true, subtitle: `Text-to-speech queue — ${s.sources.tts.message ?? h.value}.` };
@@ -201,7 +201,7 @@ function ttsDial(s: OpsState): DialModel {
   return { id: 'tts', label: 'TTS', glyph: '♪', value, tone, noteworthy: speaking || hot > 0 || pause > 0 || h.tone !== 'good', subtitle: `Text-to-speech queue — hot ${hot}, pause ${pause}, backend ${s.tts.backend ?? 'unknown'}, satellite ${String(s.tts.satellite_available)}.` };
 }
 
-function enforcementDial(s: OpsState): DialModel {
+export function enforcementDial(s: OpsState): DialModel {
   const h = healthDial(s.sources.enforcement);
   const pending = s.enforcement.pending_count ?? 0;
   const pavlok = s.enforcement.pavlok ?? {};
@@ -217,7 +217,7 @@ function enforcementDial(s: OpsState): DialModel {
   };
 }
 
-function goldenThroneDial(s: OpsState): DialModel {
+export function goldenThroneDial(s: OpsState): DialModel {
   const active = s.instances.active.map((i) => i.gt).filter(Boolean);
   const due = active.filter((gt) => gt.next_fire && Date.parse(gt.next_fire) <= Date.now()).length;
   const armed = active.filter((gt) => gt.next_fire).length;
