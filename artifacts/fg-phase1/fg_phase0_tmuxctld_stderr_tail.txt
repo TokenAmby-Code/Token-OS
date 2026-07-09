@@ -1,0 +1,250 @@
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 54] Connection reset by peer
+----------------------------------------
+tmuxctld listening on http://127.0.0.1:7778
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 56071)
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 498, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 464, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 54] Connection reset by peer
+----------------------------------------
+tmuxctld listening on http://127.0.0.1:7778
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate DELAY reason=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%9
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%7
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%7
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%7
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%7
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%7
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%44
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%44
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%44
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%44
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%44
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%3
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%3
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%3
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%3
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%3
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 57906)
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 498, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 464, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 54] Connection reset by peer
+----------------------------------------
+tmuxctld listening on http://127.0.0.1:7778
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%13
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 51247)
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 498, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 464, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 54] Connection reset by peer
+----------------------------------------
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%14
+send_gate OVERRIDE reason=tmuxctld-send-holder policy=pierce gate=typing_guard target=%47
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%47
+send_gate OVERRIDE reason=tmuxctl-submit-transaction policy=pierce gate=typing_guard target=%47
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 61156)
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 498, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 464, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 54] Connection reset by peer
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 61152)
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 498, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 464, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 54] Connection reset by peer
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 61547)
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 498, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 464, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 54] Connection reset by peer
+----------------------------------------
+tmuxctld listening on http://127.0.0.1:7778
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 58195)
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 498, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 464, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 54] Connection reset by peer
+----------------------------------------

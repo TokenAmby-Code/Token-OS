@@ -1087,6 +1087,34 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
     return row.pane_label == spec.pane_label and spec.persona in tab
 
 
+def _stopped_row_matches_persona_identity(row, spec: PersonaSpec) -> bool:
+    """Match a stopped singleton row when its pane binding columns were cleared.
+
+    The normal persona predicate deliberately requires the pane label for legacy
+    rows. Specimen 6 lost both the live @INSTANCE_ID stamp and stored pane
+    columns, leaving only persona identity in the stopped registry row. This
+    helper is used only after live-pane/stamp/pane-label lookup fails, and only
+    for STOPPED rows, so it cannot steal an active row from a different pane.
+    """
+    if row is None:
+        return False
+    if _row_matches_persona(row, spec):
+        return True
+    slug = (getattr(row, "persona_slug", "") or "").strip().lower()
+    if slug:
+        expected_rank = EXPECTED_PERSONA_RANKS.get(spec.persona)
+        rank = (getattr(row, "rank", "") or "").strip().lower()
+        return slug == spec.persona and (not expected_rank or not rank or rank == expected_rank)
+    tab = (getattr(row, "tab_name", "") or "").lower()
+    if spec.persona == "fabricator-general":
+        return getattr(row, "legion", "") == "fabricator" or spec.persona in tab
+    if spec.persona == "custodes":
+        return getattr(row, "legion", "") == "custodes" or spec.persona in tab
+    if spec.persona in {"administratum", "malcador", "pax", "orchestrator"}:
+        return getattr(row, "primarch", "") == spec.persona or spec.persona in tab
+    return spec.persona in tab
+
+
 def _row_age_seconds(created_at: str) -> float | None:
     """Age in seconds of a registry row from its ISO `created_at`, or None.
 
@@ -1320,13 +1348,28 @@ def _assert_instance_impl(
             result.update({"ok": False, "action": action, "reason": reason})
             return finish(result, clear_failed=False)
         if row is None:
+            # A split-brain persona row may have lost both the live pane stamp and
+            # all stored pane-label columns (the exact specimen-6 state: live
+            # persona-labeled pane, empty @INSTANCE_ID, stopped row with no
+            # pane_label/tmux_pane).  In that state _registry_entries cannot
+            # key by stamp/pane, so fall back to persona identity for stopped
+            # singleton rows only. Active rows still require pane/stamp binding
+            # above to avoid stealing a live row from another pane.
             stopped_rows = _registry_entries(pane_id, pane_label, include_stopped=True)
+            if not stopped_rows:
+                stopped_rows = [
+                    candidate
+                    for candidate in fetch_instance_registry().instances
+                    if candidate.status is InstanceStatus.STOPPED
+                    and _stopped_row_matches_persona_identity(candidate, spec)
+                ]
+                stopped_rows.sort(key=lambda r: r.last_activity, reverse=True)
             stopped_match = next(
                 (
                     candidate
                     for candidate in stopped_rows
                     if candidate.status is InstanceStatus.STOPPED
-                    and _row_matches_persona(candidate, spec)
+                    and _stopped_row_matches_persona_identity(candidate, spec)
                 ),
                 None,
             )
