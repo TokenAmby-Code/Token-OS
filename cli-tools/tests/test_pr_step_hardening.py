@@ -769,6 +769,46 @@ def test_mark_instance_status_reviewing_sends_workflow_payload(tmp_path: Path) -
     }
 
 
+def test_pr_flag_uses_explicit_instance_env_when_no_wrapper(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        "mark_pr_flag https://github.com/owner/repo/pull/621 open",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "TOKEN_API_INSTANCE_ID": "inst-env-owner",
+        },
+    )
+
+    pr_calls = [call for call in curl_calls(curl_log) if "/api/instances/" in call[-1]]
+    assert len(pr_calls) == 1
+    assert pr_calls[0][-1].endswith("/api/instances/inst-env-owner/pr")
+
+
+def test_pr_flag_prefers_explicit_instance_env_over_stale_pane(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        "unset TOKEN_API_WRAPPER_ID TOKEN_API_WRAPPER_LAUNCH_ID; mark_pr_flag https://github.com/owner/repo/pull/622 merged",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "CURL_LEDGER_JSON": ledger_json("inst-stale-pane", "%stale"),
+            "TOKEN_API_INSTANCE_ID": "inst-true-owner",
+            "TMUX_PANE": "%stale",
+        },
+    )
+
+    pr_calls = [call for call in curl_calls(curl_log) if "/api/instances/" in call[-1]]
+    assert len(pr_calls) == 1
+    assert pr_calls[0][-1].endswith("/api/instances/inst-true-owner/pr")
+
+
 def test_pr_step_does_not_arm_generic_plan_hook_at_startup(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     fake_bin, curl_log = install_fake_curl(tmp_path)
