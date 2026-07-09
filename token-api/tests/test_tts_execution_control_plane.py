@@ -69,14 +69,14 @@ def test_tts_control_records_state_before_backend_echo(monkeypatch: pytest.Monke
         return {"success": True, "backend": backend, "echoed": payload["action"]}
 
     monkeypatch.setattr(tts, "_echo_tts_control_to_backend", fake_echo)
-    tts._record_tts_backend_active("phone", playback_id="play-1")
+    tts._record_tts_backend_active("wsl", playback_id="play-1")
 
     result = asyncio.run(
         tts.api_tts_control(
             tts.TTSControlRequest(
                 command="pause",
-                source="phone_overlay",
-                backend="phone",
+                source="desktop_control",
+                backend="wsl",
                 session_id="sess-1",
                 playback_id="play-1",
             )
@@ -84,7 +84,7 @@ def test_tts_control_records_state_before_backend_echo(monkeypatch: pytest.Monke
     )
 
     assert result["success"] is True
-    assert observed["backend"] == "phone"
+    assert observed["backend"] == "wsl"
     assert observed["state_before_echo"]["control"]["state"] == "paused"
     assert observed["state_before_echo"]["control"]["last_action"] == "pause"
     assert result["state"]["control"]["state"] == "paused"

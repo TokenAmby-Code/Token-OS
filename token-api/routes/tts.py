@@ -1640,15 +1640,14 @@ def dispatch_tts_chunks_to_backend(
         if not phone_chunks:
             return {"success": False, "error": "empty_audio_payload", "method": None}
         current_chunk = phone_chunks[0]
-        next_chunk = phone_chunks[1] if len(phone_chunks) > 1 else None
         session_id = str(TTS_AUTHORITATIVE_STATE["session_id"])
         _record_tts_backend_active(
             backend,
             playback_id=current_chunk["playback_id"],
             current=_chunk_public_payload(current_chunk),
-            next_chunk=_chunk_public_payload(next_chunk),
+            next_chunk=None,
         )
-        payload = _backend_chunk_payload(current_chunk, next_chunk, rate=rate)
+        payload = _backend_chunk_payload(current_chunk, None, rate=rate)
         result = dict(_send_phone_tts_chunk(payload) or {})
         result.setdefault("chunk_id", current_chunk["chunk_id"])
         real_chunks = len(phone_chunks)
@@ -3026,6 +3025,38 @@ async def api_tts_control(request: TTSControlRequest) -> dict:
         raise HTTPException(status_code=400, detail="command must be pause, resume, skip, or stop")
 
     backend = _active_tts_backend(request.backend)
+    if backend == "phone" and action in {"pause", "resume"}:
+        backend_echo = {
+            "success": False,
+            "backend": backend,
+            "error": "phone_pause_unsupported",
+            "reason": "phone_pause_unsupported",
+        }
+        _update_tts_authoritative_state(
+            last_error={
+                "backend": backend,
+                "playback_id": request.playback_id or TTS_AUTHORITATIVE_STATE.get("playback_id"),
+                "error": "phone_pause_unsupported",
+                "reported_at": _now_iso(),
+            }
+        )
+        await log_event(
+            "tts_control",
+            device_id="tts_control",
+            details={
+                "action": action,
+                "speed": request.speed,
+                "backend": backend,
+                "success": False,
+                "backend_echo": backend_echo,
+            },
+        )
+        return {
+            "success": False,
+            "state": get_tts_authoritative_state(),
+            "backend_echo": backend_echo,
+        }
+
     recorded = _record_tts_control_state(request, backend)
     echo_payload = {
         "action": action,

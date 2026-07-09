@@ -353,7 +353,7 @@
         "htmlText": "",
         "option": 0,
         "responseCode": "OK",
-        "text": "{\"status\":\"accepted\",\"session_id\":\"{http_param=session_id}\",\"playback_id\":\"{http_param=playback_id}\",\"buffer\":\"streaming_current_plus_next\"}",
+        "text": "{\"status\":\"accepted\",\"session_id\":\"{http_param=session_id}\",\"playback_id\":\"{http_param=playback_id}\",\"buffer\":\"one_utterance\"}",
         "disableLogging": false,
         "m_SIGUID": -989999999999936648,
         "m_classType": "HttpServerResponseAction",
@@ -365,7 +365,7 @@
       {
         "blockNextAction": true,
         "m_nonRoot": true,
-        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CHUNK] accepted session={http_param=session_id} playback={http_param=playback_id} current={http_param=current_index} next={http_param=next_index}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
+        "m_script": "echo \"$(date +%H:%M:%S) [TTS_CHUNK] accepted session={http_param=session_id} playback={http_param=playback_id} current={http_param=current_index}\" >> /storage/emulated/0/MacroDroid/logs/debug.log\n",
         "timeoutSeconds": 30,
         "useHelper": false,
         "useShizuku": false,
