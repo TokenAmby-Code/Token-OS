@@ -39,6 +39,18 @@ Phone echo endpoint used by Token-OS:
 
 WSL echo uses its local `/tts/control` endpoint with equivalent command semantics.
 
+## Target architecture: Token-API-owned audio artifacts
+
+The intended end-state is for Token-API to own TTS synthesis, voice selection, and audio artifacts. Playback surfaces should eventually receive only pre-rendered audio artifacts, not text. In that model:
+
+- Token-API applies sanitization, persona voice selection, and synthesis once, producing a durable audio artifact such as WAV.
+- Queue entries can be pre-synthesized at enqueue time so dequeue/playback only has to resolve routing and deliver an already-rendered artifact.
+- WSL, phone, and future Linux playback backends become audio-file players. They should not independently synthesize text or reinterpret persona voice choices.
+- A single Token-API synthesis path gives all playback surfaces the same voice set, the same persona TTS behavior, and the same rendered audio for replay/debugging.
+- Completion semantics move from backend TTS-engine state to audio-artifact playback state: render success proves the whole utterance was synthesized; playback success proves the artifact was played or explicitly stopped/skipped.
+
+This target trades some enqueue-time work and storage cleanup for stronger reliability, consistent voices, replayability, and simpler execution backends. The current WSL hardening step should move WSL toward this model by making text input render to a full WAV and then playing that artifact to completion. Phone can keep its current one-utterance MacroDroid text path until an audio-artifact delivery/player path is built.
+
 ## Current phone and WSL dispatch
 
 Token-OS dispatches one full sanitized utterance to the selected backend. Phone uses the local endpoint:
@@ -50,9 +62,9 @@ Token-OS dispatches one full sanitized utterance to the selected backend. Phone 
 Invariants:
 
 - `current_chunk` is the complete sanitized utterance; `next_chunk` is empty and `next_index` is `null`.
-- WSL receives the same complete utterance through `/tts/speak`; Token-API records `current` as that full utterance and `next` as `null`.
+- WSL receives the same complete utterance through `/tts/synth-and-play`; the satellite synthesizes the full text to a WAV artifact, verifies the rendered text hash, plays that WAV with no playback timeout, and Token-API records `current` as that full utterance and `next` as `null`.
 - Both phone and WSL report chunk-compatible metadata with `chunks=1`, `completed_chunks=1`, one `results[0]`, `chunk_id`, and `playback_id`.
-- WSL integrity checks compare `rendered_hash`/`rendered_chars` against the full utterance, not a sentence chunk.
+- WSL integrity checks compare `rendered_hash`/`rendered_chars` against the full utterance, not a sentence chunk. Current WSL transport is `wsl_sapi_wav_file`; pause/resume/toggle are explicit unsupported-backend errors until a controllable media-player layer replaces `SoundPlayer.PlaySync()`.
 - Backends must not reconstruct a queue or mutate playback state before Token-OS control acknowledgement.
 
 Token-OS also includes compatibility metadata fields such as `chunk_id`, `current_chunk_hash`, `next_chunk_hash`, and `chunk_count` for integrity/observability.

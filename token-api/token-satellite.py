@@ -13,7 +13,7 @@ Endpoints:
     POST /tts/skip         — skip current TTS speech
     POST /tts/synthesize   — synthesize text to WAV file (blocking)
     POST /tts/control      — transport controls: pause/resume/stop (non-blocking)
-    POST /tts/synth-and-play — synthesize to WAV + speak via SAPI (blocking, for queued TTS)
+    POST /tts/synth-and-play — synthesize to WAV + play WAV artifact (blocking, for queued TTS)
     GET  /tts/status       — current TTS engine state
     POST /ahk/execute      — execute a one-shot AHK v2 script
     POST /restart          — restart current service
@@ -224,6 +224,8 @@ class TTSEngine:
         self._current_message: str | None = None
         self._current_voice: str | None = None
         self._current_rate: int = 0
+        self._playback_process: subprocess.Popen | None = None
+        self._playback_windows_pid: int | None = None
 
     def _write_script(self):
         """Write the PS script to a Windows-accessible path."""
@@ -298,12 +300,16 @@ class TTSEngine:
         return self._speaking
 
     def skip(self) -> bool:
-        """Cancel current speech (direct or managed playback). Returns True if was active."""
-        if not (self._speaking or self._playing) or self._process is None:
+        """Cancel current speech (direct SAPI or WAV artifact playback)."""
+        if self._playing and self._playback_process is not None:
+            self._was_skipped = True
+            self._terminate_wav_playback()
+            return True
+        if not self._speaking or self._process is None:
             return False
         with self._io_lock:
             self._send({"action": "skip"})
-            resp = self._readline()
+            self._readline()
         self._was_skipped = True
         return True
 
@@ -323,6 +329,8 @@ class TTSEngine:
 
     TTS_DIR_WSL = "/mnt/c/temp/tts"
     TTS_DIR_WIN = r"C:\temp\tts"
+    PLAY_SCRIPT_DIR_WSL = "/mnt/c/temp"
+    PLAY_SCRIPT_DIR_WIN = r"C:\temp"
 
     @staticmethod
     def _text_hash(message: str) -> str:
@@ -505,41 +513,131 @@ class TTSEngine:
             "rendered_hash": ack["rendered_hash"],
         }
 
-    def synth_and_speak(self, message: str, voice: str, rate: int = 0) -> dict:
-        """Synthesize text to WAV (for replay/persistence) then speak it via SAPI.
+    def _wav_player_script(self, wav_path_win: str) -> str:
+        escaped = wav_path_win.replace("'", "''")
+        return (
+            "Add-Type -AssemblyName System.Windows.Extensions -ErrorAction SilentlyContinue\n"
+            "Add-Type -AssemblyName System\n"
+            f"$player = New-Object System.Media.SoundPlayer '{escaped}'\n"
+            "$player.Load()\n"
+            "$player.PlaySync()\n"
+            "$player.Dispose()\n"
+        )
 
-        Blocks until speech completes or is skipped. Supports pause/resume mid-speech.
-        """
+    def _terminate_wav_playback(self) -> None:
+        proc = self._playback_process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _play_wav_file(self, synth_result: dict) -> dict:
+        """Play a synthesized WAV artifact with SoundPlayer.PlaySync()."""
+        wav_path_win = synth_result["wav_path_win"]
+        wav_path_wsl = synth_result["wav_path_wsl"]
+        if not os.path.exists(wav_path_wsl):
+            return {"success": False, "error": f"WAV file missing: {wav_path_wsl}"}
+
+        os.makedirs(self.PLAY_SCRIPT_DIR_WSL, exist_ok=True)
+        fd, script_path_wsl = tempfile.mkstemp(
+            prefix="token_tts_play_", suffix=".ps1", dir=self.PLAY_SCRIPT_DIR_WSL
+        )
+        os.close(fd)
+        script_path_win = self.PLAY_SCRIPT_DIR_WIN + "\\" + os.path.basename(script_path_wsl)
+        with open(script_path_wsl, "w", encoding="utf-8") as f:
+            f.write(self._wav_player_script(wav_path_win))
+
+        self._was_skipped = False
+        self._playing = True
+        self._current_file = wav_path_wsl
+        try:
+            proc = subprocess.Popen(
+                [
+                    POWERSHELL_EXE,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    script_path_win,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self._playback_process = proc
+            self._playback_windows_pid = proc.pid
+            stdout, stderr = proc.communicate(timeout=None)
+            skipped = self._was_skipped or proc.returncode < 0
+            if proc.returncode not in (0, None) and not skipped:
+                return {
+                    "success": False,
+                    "error": stderr.strip() or f"WAV playback exited {proc.returncode}",
+                }
+            return {
+                "success": not skipped,
+                "skipped": skipped,
+                "transport": "wsl_sapi_wav_file",
+                "file_id": synth_result.get("file_id"),
+                "wav_path_win": wav_path_win,
+                "wav_path_wsl": wav_path_wsl,
+                "playback_pid": self._playback_windows_pid,
+                "rendered_chars": synth_result.get("rendered_chars"),
+                "rendered_hash": synth_result.get("rendered_hash"),
+                "message_chars": synth_result.get("message_chars"),
+            }
+        finally:
+            self._playing = False
+            self._play_paused = False
+            self._current_file = None
+            self._playback_process = None
+            self._playback_windows_pid = None
+            try:
+                os.unlink(script_path_wsl)
+            except OSError:
+                pass
+
+    def synth_and_speak(self, message: str, voice: str, rate: int = 0) -> dict:
+        """Synthesize the full utterance to WAV, then play that WAV artifact."""
         synth_result = self.synthesize(message, voice, rate)
         if not synth_result.get("success"):
             return synth_result
 
-        self._playing = True
-        self._current_file = synth_result.get("wav_path_wsl")
         self._current_message = message
         self._current_voice = voice
         self._current_rate = rate
-        speak_result = self.speak(message, voice, rate)
-        self._playing = False
-        self._play_paused = False
-        self._current_file = None
-        self._current_message = None
-        self._current_voice = None
-        self._current_rate = 0
-
-        return {
-            **speak_result,
-            "file_id": synth_result.get("file_id"),
-            "wav_path_win": synth_result.get("wav_path_win"),
-        }
+        try:
+            return self._play_wav_file(synth_result)
+        finally:
+            self._current_message = None
+            self._current_voice = None
+            self._current_rate = 0
 
     def play_control(self, command: str) -> dict:
-        """Send transport control (pause/resume/stop/toggle/restart) to SAPI. Non-blocking."""
-        # Resolve toggle to pause or resume
+        """Transport controls for direct SAPI; WAV playback only supports stop."""
+        if self._playing and not self._speaking:
+            if command == "stop":
+                stopped = self.skip()
+                return {"success": stopped, "command": command, "skipped": stopped}
+            if command in {"pause", "resume", "toggle", "restart"}:
+                return {
+                    "success": False,
+                    "error": "unsupported_backend_control",
+                    "reason": "wsl_wav_playback_pause_resume_unsupported",
+                    "command": command,
+                    "transport": "wsl_sapi_wav_file",
+                }
+
+        # Resolve toggle to pause or resume for direct SAPI speech
         if command == "toggle":
             if self._play_paused:
                 command = "resume"
-            elif self._speaking or self._playing:
+            elif self._speaking:
                 command = "pause"
             else:
                 return {"success": False, "error": "Not speaking or playing"}
@@ -568,7 +666,7 @@ class TTSEngine:
                 return {"success": False, "error": f"Restart speak failed: {resp}"}
             return {"success": True, "command": "restart"}
 
-        if not (self._speaking or self._playing) and command != "stop":
+        if not self._speaking and command != "stop":
             return {"success": False, "error": "Not speaking or playing"}
         self._ensure_running()
 
@@ -2067,6 +2165,8 @@ def tts_chunk(request: TTSChunkRequest):
         "current_index": request.current_index,
         "next_index": request.next_index,
         "file_id": result.get("file_id"),
+        "wav_path_win": result.get("wav_path_win"),
+        "playback_pid": result.get("playback_pid"),
         "transport": result.get("transport"),
         "message_chars": len(message),
         "rendered_chars": result.get("rendered_chars"),
@@ -2077,7 +2177,7 @@ def tts_chunk(request: TTSChunkRequest):
 
 @app.post("/tts/synth-and-play")
 def tts_synth_and_play(request: TTSSynthAndPlayRequest):
-    """Synthesize text to WAV (for replay) then speak it via SAPI. Blocks until done."""
+    """Synthesize text to WAV, then play that WAV artifact. Blocks until done."""
     if tts_engine.is_speaking or tts_engine._playing:
         raise HTTPException(status_code=409, detail="TTS engine is busy")
 
@@ -2091,6 +2191,8 @@ def tts_synth_and_play(request: TTSSynthAndPlayRequest):
         "method": method,
         "voice": request.voice,
         "file_id": result.get("file_id"),
+        "wav_path_win": result.get("wav_path_win"),
+        "playback_pid": result.get("playback_pid"),
         "transport": result.get("transport"),
         "message_chars": len(request.message),
         "rendered_chars": result.get("rendered_chars"),

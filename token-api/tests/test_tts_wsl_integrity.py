@@ -88,3 +88,37 @@ def test_speak_tts_wsl_accepts_success_with_matching_rendered_hash(monkeypatch):
     assert result["message_chars"] == len(message)
     assert result["rendered_chars"] == len(message)
     assert result["rendered_hash"] == rendered_hash
+
+
+def test_speak_tts_wsl_file_playback_posts_to_synth_and_play_without_timeout(monkeypatch):
+    tts = _load_tts_routes()
+    message = "full wav playback path"
+    rendered_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    observed = {}
+    monkeypatch.setitem(tts.DESKTOP_CONFIG, "host", "wsl.local")
+    monkeypatch.setitem(tts.DESKTOP_CONFIG, "port", 7777)
+
+    def fake_post(url, **kwargs):
+        observed["url"] = url
+        observed.update(kwargs)
+        return FakeResponse(
+            200,
+            {
+                "success": True,
+                "method": "wsl_sapi_file",
+                "transport": "wsl_sapi_wav_file",
+                "rendered_hash": rendered_hash,
+                "rendered_chars": len(message),
+                "file_id": "abc",
+                "wav_path_win": r"C:\temp\tts\abc.wav",
+            },
+        )
+
+    monkeypatch.setattr(tts.requests, "post", fake_post)
+
+    result = tts.speak_tts_wsl(message, "Microsoft David", use_file_playback=True)
+
+    assert observed["url"] == "http://wsl.local:7777/tts/synth-and-play"
+    assert observed["timeout"] is None
+    assert result["success"] is True
+    assert result["transport"] == "wsl_sapi_wav_file"

@@ -228,7 +228,7 @@ def test_phone_short_utterance_sends_empty_next_chunk() -> None:
     assert payload["playback_id"] == phone_chunks[0]["playback_id"]
 
 
-def test_wsl_chunk_dispatch_uses_satellite_speak_text_file_transport(
+def test_wsl_chunk_dispatch_uses_satellite_wav_file_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tts = _load_tts()
@@ -237,14 +237,15 @@ def test_wsl_chunk_dispatch_uses_satellite_speak_text_file_transport(
     )
     observed = {}
 
-    def fake_speak_tts_wsl(message: str, voice: str, rate: int = 0, **_kwargs):
+    def fake_speak_tts_wsl(message: str, voice: str, rate: int = 0, **kwargs):
         observed["message"] = message
         observed["voice"] = voice
         observed["rate"] = rate
+        observed["use_file_playback"] = kwargs.get("use_file_playback")
         return {
             "success": True,
-            "method": "wsl_sapi",
-            "transport": "wsl_sapi_text_file",
+            "method": "wsl_sapi_file",
+            "transport": "wsl_sapi_wav_file",
             "rendered_hash": hashlib.sha256(message.encode("utf-8")).hexdigest(),
             "rendered_chars": len(message),
         }
@@ -258,11 +259,12 @@ def test_wsl_chunk_dispatch_uses_satellite_speak_text_file_transport(
     assert result["chunks"] == 1
     assert result["completed_chunks"] == 1
     assert len(result["results"]) == 1
-    assert result["method"] == "wsl_sapi"
+    assert result["method"] == "wsl_sapi_file"
     assert observed == {
         "message": "First WSL dispatch sentence. Second WSL dispatch sentence.",
         "voice": "Microsoft David",
         "rate": 1,
+        "use_file_playback": True,
     }
     assert result["results"][0]["chunk_id"] == result["chunk_id"]
     assert result["results"][0]["playback_id"] == result["playback_id"]
@@ -271,7 +273,7 @@ def test_wsl_chunk_dispatch_uses_satellite_speak_text_file_transport(
         == "First WSL dispatch sentence. Second WSL dispatch sentence."
     )
     assert tts.TTS_AUTHORITATIVE_STATE["next"] is None
-    assert result["results"][0]["transport"] == "wsl_sapi_text_file"
+    assert result["results"][0]["transport"] == "wsl_sapi_wav_file"
 
 
 def test_wsl_chunk_dispatch_stops_on_text_integrity_mismatch(
@@ -286,7 +288,7 @@ def test_wsl_chunk_dispatch_stops_on_text_integrity_mismatch(
         return {
             "success": True,
             "method": "wsl_sapi",
-            "transport": "wsl_sapi_text_file",
+            "transport": "wsl_sapi_wav_file",
             "rendered_hash": "0" * 64,
             "rendered_chars": len(message),
         }

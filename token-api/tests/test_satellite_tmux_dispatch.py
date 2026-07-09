@@ -318,3 +318,112 @@ def test_runtime_refresh_spawns_helper_with_sha_and_manifest(monkeypatch, tmp_pa
     data = __import__("json").loads(manifest.read_text(encoding="utf-8"))
     assert data["changed_paths"] == ["ahk/foo.ahk", "cli-tools/lib/nas-path.sh"]
     assert kwargs["start_new_session"] is True
+
+
+def test_tts_engine_synth_and_speak_plays_wav_artifact_not_text(monkeypatch, tmp_path):
+    satellite = _load_satellite_module()
+    engine = satellite.TTSEngine()
+    synth_result = {
+        "success": True,
+        "file_id": "fixed-id",
+        "wav_path_win": r"C:\temp\tts\fixed-id.wav",
+        "wav_path_wsl": str(tmp_path / "fixed-id.wav"),
+        "message_chars": 12,
+        "rendered_chars": 12,
+        "rendered_hash": "a" * 64,
+    }
+    Path(synth_result["wav_path_wsl"]).write_bytes(b"RIFF")
+    called = {}
+
+    monkeypatch.setattr(engine, "synthesize", lambda message, voice, rate: synth_result)
+    monkeypatch.setattr(engine, "speak", lambda *_args, **_kwargs: called.setdefault("speak", True))
+    monkeypatch.setattr(
+        engine,
+        "_play_wav_file",
+        lambda result: {**result, "success": True, "transport": "wsl_sapi_wav_file"},
+    )
+
+    result = engine.synth_and_speak("hello world!", "Microsoft David", 0)
+
+    assert result["success"] is True
+    assert result["transport"] == "wsl_sapi_wav_file"
+    assert "speak" not in called
+
+
+def test_tts_engine_wav_playback_returns_artifact_metadata(monkeypatch, tmp_path):
+    satellite = _load_satellite_module()
+    engine = satellite.TTSEngine()
+    wav_path = tmp_path / "fixed-id.wav"
+    wav_path.write_bytes(b"RIFF")
+    script_dir = tmp_path / "scripts"
+    synth_result = {
+        "file_id": "fixed-id",
+        "wav_path_win": r"C:\temp\tts\fixed-id.wav",
+        "wav_path_wsl": str(wav_path),
+        "message_chars": 4,
+        "rendered_chars": 4,
+        "rendered_hash": "b" * 64,
+    }
+    popen_calls = []
+
+    class FakePopen:
+        pid = 4321
+        returncode = 0
+
+        def __init__(self, args, **kwargs):
+            popen_calls.append((args, kwargs))
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(engine, "PLAY_SCRIPT_DIR_WSL", str(script_dir))
+    monkeypatch.setattr(engine, "PLAY_SCRIPT_DIR_WIN", r"C:\temp")
+    monkeypatch.setattr(satellite.subprocess, "Popen", FakePopen)
+
+    result = engine._play_wav_file(synth_result)
+
+    assert result["success"] is True
+    assert result["transport"] == "wsl_sapi_wav_file"
+    assert result["file_id"] == "fixed-id"
+    assert result["wav_path_win"] == r"C:\temp\tts\fixed-id.wav"
+    assert result["playback_pid"] == 4321
+    assert popen_calls[0][0][0] == satellite.POWERSHELL_EXE
+
+
+def test_tts_engine_wav_stop_marks_playback_skipped(monkeypatch):
+    satellite = _load_satellite_module()
+    engine = satellite.TTSEngine()
+    terminated = {}
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            terminated["terminate"] = True
+
+        def wait(self, timeout=None):
+            terminated["wait_timeout"] = timeout
+
+    engine._playing = True
+    engine._playback_process = FakeProc()
+
+    assert engine.skip() is True
+    assert engine._was_skipped is True
+    assert terminated == {"terminate": True, "wait_timeout": 3}
+
+
+def test_tts_engine_wav_pause_resume_returns_unsupported():
+    satellite = _load_satellite_module()
+    engine = satellite.TTSEngine()
+    engine._playing = True
+    engine._speaking = False
+
+    result = engine.play_control("pause")
+
+    assert result["success"] is False
+    assert result["error"] == "unsupported_backend_control"
+    assert result["transport"] == "wsl_sapi_wav_file"

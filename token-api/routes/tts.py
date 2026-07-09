@@ -590,8 +590,8 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
     """Speak a message via WSL satellite TTS (Windows SAPI voices).
 
     Blocks until satellite returns (speech complete or skipped).
-    When use_file_playback=True, uses synthesize-to-file + WMP playback
-    (supports pause/resume/speed). Otherwise uses direct SpeakAsync.
+    When use_file_playback=True, uses synthesize-to-file + WAV artifact playback
+    (stop supported; pause/resume deferred). Otherwise uses direct SpeakAsync.
     """
     host = DESKTOP_CONFIG["host"]
     port = DESKTOP_CONFIG["port"]
@@ -605,7 +605,9 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
         resp = requests.post(
             f"http://{host}:{port}{endpoint}",
             json=payload,
-            timeout=300,  # Long timeout — blocks until speech/playback done
+            timeout=None
+            if use_file_playback
+            else 300,  # WAV artifact playback waits until completion
         )
         TTS_BACKEND["current"] = None
 
@@ -643,6 +645,9 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
                 "rendered_chars": data.get("rendered_chars"),
                 "rendered_hash": rendered_hash,
                 "transport": data.get("transport"),
+                "file_id": data.get("file_id"),
+                "wav_path_win": data.get("wav_path_win"),
+                "playback_pid": data.get("playback_pid"),
                 "reason": "skipped" if skipped else data.get("reason"),
             }
         elif resp.status_code == 409:
@@ -1609,7 +1614,7 @@ def _post_wsl_chunk(payload: dict, *, voice: str | None, rate: int = 0) -> dict:
     playback_id = payload.get("playback_id")
     session_id = payload.get("session_id")
     message = payload["current_chunk_text"]
-    result = speak_tts_wsl(message, voice or "Microsoft David", rate=rate)
+    result = speak_tts_wsl(message, voice or "Microsoft David", rate=rate, use_file_playback=True)
     result = dict(result or {})
     result.setdefault("method", "wsl_sapi_chunk")
     result["chunk_id"] = chunk_id
@@ -2464,10 +2469,16 @@ async def queue_tts(
     # an unknown/NULL policy is SILENT + WARN: a visible registration failure, never
     # a leak (see [[anti-blind-dedup]] — never silently swallow). The voiced
     # Astartes already resolve, so normal speech is unaffected.
-    tts_policy = row["tts_policy"]
-    persona_slug = row["persona_slug"]
-    persona_display_name = row["persona_display_name"]
-    commander_type = row["commander_type"]
+    def _row_get(key: str, default=None):
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return default
+
+    tts_policy = _row_get("tts_policy")
+    persona_slug = _row_get("persona_slug")
+    persona_display_name = _row_get("persona_display_name")
+    commander_type = _row_get("commander_type")
 
     def _system_audio_with_sender_metadata() -> dict[str, object]:
         system_row = dict(_SYSTEM_TTS_ROW)
