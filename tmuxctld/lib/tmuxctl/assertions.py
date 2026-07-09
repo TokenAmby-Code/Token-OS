@@ -1063,13 +1063,9 @@ def apply_persona_pane_tint(
 ) -> str | None:
     """Paint a singleton seat's persona tint from its durable ``@PANE_ID`` label.
 
-    Unlike :func:`_assert_persona_color` (focus-gated, used in the per-tick
-    reconcile loop), this paints the target pane unconditionally so the seat
-    carries its tint whether or not it is the active pane. Crucially the color
-    derives from the stable pane label, NOT from ``@INSTANCE_ID`` — so a seat is
-    tinted at wrapper birth even before its instance registers (the empty-stamp →
-    no-tint root). Returns the applied background, or ``None`` when the label is
-    not a tinted persona seat.
+    Legacy direct painter retained for focused reconcile paths that have already
+    proven persona binding. New registration paths should use
+    :func:`apply_bound_persona_pane_tint` so label-only panes fail dark.
     """
     label = (pane_label or "").strip()
     if label not in PERSONA_LABELS:
@@ -1080,6 +1076,37 @@ def apply_persona_pane_tint(
         return None
     bg = PERSONA_TINTS.get(spec.persona)
     if not bg:
+        return None
+    _set_pane_tint(adapter, pane_id, bg)
+    return bg
+
+
+
+def apply_bound_persona_pane_tint(
+    adapter: TmuxAdapter, pane_id: str, pane_label: str | None, persona: str | None
+) -> str | None:
+    """Paint persona tint only when label and bound persona agree.
+
+    This is the fail-dark counterpart to registration atomicity: a durable label
+    alone is not proof of a bound occupant.  Tint is present iff a real bound
+    persona state was supplied and it matches the singleton label.
+    """
+    label = (pane_label or "").strip()
+    bound = (persona or "").strip().lower()
+    if label not in PERSONA_LABELS or not bound:
+        _set_pane_tint(adapter, pane_id, "default")
+        return None
+    try:
+        spec = persona_spec(label)
+    except ValueError:
+        _set_pane_tint(adapter, pane_id, "default")
+        return None
+    if bound != spec.persona:
+        _set_pane_tint(adapter, pane_id, "default")
+        return None
+    bg = PERSONA_TINTS.get(spec.persona)
+    if not bg:
+        _set_pane_tint(adapter, pane_id, "default")
         return None
     _set_pane_tint(adapter, pane_id, bg)
     return bg

@@ -87,6 +87,7 @@ def test_instance_stamp_writes_pane_option_and_binds_ledger(monkeypatch):
         wrapper_id="wrap-2",
         engine="claude",
         working_dir="/tmp/wt",
+        persona="mechanicus",
     )
 
     assert out["found"] is True
@@ -96,11 +97,52 @@ def test_instance_stamp_writes_pane_option_and_binds_ledger(monkeypatch):
     # tmuxctld wrote the stamp.
     assert ("set-option", "-p", "-t", "%2", "@INSTANCE_ID", "inst-abc") in adapter.runs
     assert adapter.pane_options[("%2", "@INSTANCE_ID")] == "inst-abc"
+    assert adapter.pane_options[("%2", "@PERSONA")] == "mechanicus"
+    assert adapter.pane_options[("%2", "@TOKEN_API_ENGINE")] == "claude"
+    assert adapter.pane_options[("%2", "@TOKEN_API_CWD")] == "/tmp/wt"
+    assert adapter.pane_options[("%2", "@PANE_BORN")]
     # Ledger bind: the reverse oracle now prefers the ledger over a stamp scan.
     row = wrapper_ledger.LEDGER.resolve(wrapper_id="wrap-2")
     assert row is not None
     assert row.instance_id == "inst-abc"
     assert row.pane_positional_id == "mechanicus:2"
+
+
+def test_instance_stamp_tints_only_when_bound_persona_matches_singleton_label(monkeypatch):
+    adapter = StampAdapter({("%fg", "@PANE_ID"): "mechanicus:fabricator-general"})
+    control = TmuxControlPlane(adapter=adapter)
+    _identity_resolve(monkeypatch, {"%fg": "mechanicus:fabricator-general"})
+
+    out = control.instance_stamp(
+        instance_id="inst-fg",
+        pane="%fg",
+        wrapper_id="wrap-fg",
+        persona="fabricator-general",
+    )
+
+    assert out["tint"] == "#300808"
+    assert adapter.pane_options[("%fg", "@PERSONA")] == "fabricator-general"
+    assert [r for r in adapter.runs if "bg=#300808" in r]
+
+
+def test_instance_stamp_clears_tint_when_persona_does_not_match_label(monkeypatch):
+    adapter = StampAdapter({("%fg", "@PANE_ID"): "mechanicus:fabricator-general"})
+    control = TmuxControlPlane(adapter=adapter)
+    _identity_resolve(monkeypatch, {"%fg": "mechanicus:fabricator-general"})
+
+    out = control.instance_stamp(
+        instance_id="inst-worker",
+        pane="%fg",
+        wrapper_id="wrap-worker",
+        persona="mechanicus",
+    )
+
+    assert out["tint"] == ""
+    assert [
+        r
+        for r in adapter.runs
+        if r[:4] == ("set-option", "-pu", "-t", "%fg") and "window-style" in r
+    ]
 
 
 def test_instance_stamp_fails_closed_on_unresolved_pane(monkeypatch):

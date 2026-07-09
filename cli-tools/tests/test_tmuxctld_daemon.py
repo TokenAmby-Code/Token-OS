@@ -1675,7 +1675,7 @@ class WrapperStartAdapter:
         self.wrapper_owner = ""
 
 
-def test_wrapperstart_stamps_wrapper_owner_and_paints_persona_tint() -> None:
+def test_wrapperstart_stamps_wrapper_owner_and_fails_dark_before_persona_bind() -> None:
     rec = WrapperStartAdapter()
     server, _ = _serve(lambda: rec)
     try:
@@ -1693,13 +1693,9 @@ def test_wrapperstart_stamps_wrapper_owner_and_paints_persona_tint() -> None:
         assert payload["result"]["ledger"]["state"] == "OPEN"
         # (1) Daemon-authoritative wrapper-ownership stamp landed.
         assert rec.wrapper_owner == "wrap-7"
-        # (2) Custodes persona tint painted from the @PANE_ID label, with NO
-        #     @INSTANCE_ID present — the empty-stamp-at-birth case.
-        assert payload["result"]["tint"] == "#302800"
-        tint_writes = [
-            opt for opt in rec.set_options if "window-style" in opt and "bg=#302800" in opt
-        ]
-        assert tint_writes, f"expected a custodes tint write, got {rec.set_options}"
+        # (2) Tint fails dark until /instance/stamp supplies bound persona state.
+        assert payload["result"]["tint"] == ""
+        assert not [opt for opt in rec.set_options if "window-style" in opt]
     finally:
         server.shutdown()
 
@@ -1721,11 +1717,8 @@ def test_wrapperstart_resolves_pane_by_wrapper_id_when_payload_pane_missing() ->
         assert payload["result"]["status"] == "stamped"
         assert payload["result"]["pane"] == "%42"  # resolved by wrapper id
         assert rec.wrapper_owner == "wrap-10"  # re-affirmed by the daemon
-        assert payload["result"]["tint"] == "#302800"  # custodes tint still painted
-        tint_writes = [
-            opt for opt in rec.set_options if "window-style" in opt and "bg=#302800" in opt
-        ]
-        assert tint_writes, f"expected a custodes tint write, got {rec.set_options}"
+        assert payload["result"]["tint"] == ""  # still fails dark until persona bind
+        assert not [opt for opt in rec.set_options if "window-style" in opt]
     finally:
         server.shutdown()
 

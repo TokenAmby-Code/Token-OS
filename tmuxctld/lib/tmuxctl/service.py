@@ -1463,8 +1463,20 @@ class TmuxControlPlane:
             return {"found": False, "stamped": False, "reason": "unresolved_pane",
                     "instance_id": instance_id, "pane": ""}
 
-        # tmuxctld is the sole writer of the @INSTANCE_ID identity stamp.
+        # tmuxctld is the sole writer of the bound pane identity stamp. Keep the
+        # visible/binding stamp shape atomic: a pane must not expose an
+        # @INSTANCE_ID while the companion bound-state stamps that distinguish a
+        # live occupant from a bare slot are absent.
         self.adapter.run("set-option", "-p", "-t", target, "@INSTANCE_ID", instance_id)
+        bound_persona = (persona or "").strip()
+        if bound_persona:
+            self.adapter.run("set-option", "-p", "-t", target, "@PERSONA", bound_persona)
+        if engine:
+            self.adapter.run("set-option", "-p", "-t", target, "@TOKEN_API_ENGINE", engine)
+        if working_dir:
+            self.adapter.run("set-option", "-p", "-t", target, "@TOKEN_API_CWD", working_dir)
+        if not str(self.adapter.show_pane_option(target, "@PANE_BORN") or "").strip():
+            self.adapter.run("set-option", "-p", "-t", target, "@PANE_BORN", str(int(time.time())))
 
         # Bind the wrapper-ledger occupancy row so the reverse oracle resolves this
         # pane -> instance_id from the ledger (preferred) and the tmux stamp scan
@@ -1502,6 +1514,12 @@ class TmuxControlPlane:
                     self.adapter.run("set-option", "-pu", "-t", old, "@INSTANCE_ID")
                     vacated = old
 
+        tint = ""
+        if bound_persona:
+            from .assertions import apply_bound_persona_pane_tint
+
+            tint = apply_bound_persona_pane_tint(self.adapter, target, label, bound_persona) or ""
+
         return {
             "found": True,
             "stamped": True,
@@ -1511,6 +1529,7 @@ class TmuxControlPlane:
             "pane_positional_id": label,
             "ledger": ledger,
             "vacated": vacated,
+            "tint": tint,
         }
 
     def instance_unset_option(self, instance_id: str, option: str) -> dict:
