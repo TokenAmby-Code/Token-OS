@@ -2970,13 +2970,6 @@ def _echo_tts_control_to_backend(backend: str | None, payload: dict) -> dict:
 
     action = payload["action"]
     if backend == "phone":
-        if action in {"pause", "resume"}:
-            return {
-                "success": False,
-                "backend": backend,
-                "error": "phone_pause_unsupported",
-                "reason": "phone_pause_unsupported",
-            }
         if _send_to_phone is None:
             return {"success": False, "backend": backend, "error": "phone_transport_unavailable"}
         params = {
