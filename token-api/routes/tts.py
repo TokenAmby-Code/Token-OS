@@ -1050,10 +1050,20 @@ async def dispatch_notify(
     # playback. A phone banner/vibe must not mask a failed/no-backend TTS leg.
     delivered = audio_delivered if audio_requested else tactile_delivered
     route = tts_result.get("route") if tts_result else None
+    reason = None
+    if audio_requested and not audio_delivered:
+        reason = (
+            (tts_result or {}).get("reason")
+            or (tts_result or {}).get("error")
+            or "audio_not_delivered"
+        )
+        if enforcement and reason == "persona_silent":
+            reason = "enforcement_persona_silent_contract_violation"
     result = {
         "delivered": delivered,
         "audio_delivered": audio_delivered,
         "route": route,
+        "reason": reason,
         "tts": tts_result,
         "tactile": tactile_result,
         "discord": discord_result,
