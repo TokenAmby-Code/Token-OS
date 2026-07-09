@@ -59,7 +59,6 @@ def test_overlay_buttons_call_local_ingress_not_token_os_or_local_control() -> N
         "tts-overlay-pause.macro": "pause",
         "tts-overlay-resume.macro": "resume",
         "tts-overlay-skip.macro": "skip",
-        "tts-overlay-faster.macro": "faster",
         "tts-overlay-stop.macro": "stop",
     }
     for filename, command in expected.items():
@@ -121,7 +120,7 @@ def test_local_control_echo_is_private_consumed_endpoint_not_authority() -> None
     assert "mac say" not in lowered
 
 
-def test_chunk_player_streams_with_scalar_speak_text_and_backfill() -> None:
+def test_chunk_player_speaks_one_utterance_and_reports_buffer_drained() -> None:
     macro = load("tts-phone-chunk-player.macro")
     assert macro["m_name"] == "04 TTS Chunk Player"
     assert (
@@ -130,53 +129,23 @@ def test_chunk_player_streams_with_scalar_speak_text_and_backfill() -> None:
     )
     assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
     speak_actions = actions(macro, "SpeakTextAction")
-    assert [a["m_textToSay"] for a in speak_actions] == [
-        "{lv=current_chunk_text}",
-        "{lv=next_chunk_text}",
-        "{lv=backfill_next_chunk}",
-    ]
-    assert [a["m_queue"] for a in speak_actions] == [False, True, True]
+    assert len(speak_actions) == 1
+    assert speak_actions[0]["m_textToSay"] == "{lv=current_chunk_text}"
+    assert speak_actions[0]["m_queue"] is False
     assert speak_actions[0]["m_waitToFinish"] is True
-    assert speak_actions[1]["m_waitToFinish"] is False
 
     serialized = json.dumps(macro)
-    # Only scalar locals are fed to SpeakTextAction; request/backfill dictionaries
-    # are dereferenced outside TTS so MacroDroid does not speak literal variables.
-    assert all("http_param=" not in a["m_textToSay"] for a in speak_actions)
-    assert all("request[" not in a["m_textToSay"] for a in speak_actions)
-    assert all("backfill[" not in a["m_textToSay"] for a in speak_actions)
-    assert (
-        "current_chunk_text",
-        "{lv=request[current_chunk]}",
-    ) in set_variable_assignments(macro)
-    assert "SetVariableAction" in serialized
-    assert "LoopAction" in serialized
-    assert "PauseAction" not in serialized
-    assert "ForceMacroRunAction" not in serialized
-    assert "m_textToSay\": \"{lv=request" not in serialized
-    assert "streaming_current_plus_next" in serialized
-    assert "done={lv=backfill_done}" in serialized
+    assert "LoopAction" not in serialized
+    assert "/api/tts/chunk-next" not in serialized
+    assert "backfill" not in serialized.lower()
+    assert "next_chunk_text" not in [a[0] for a in set_variable_assignments(macro)]
 
     urls = request_urls(macro)
-    assert urls.count(f"{TOKEN_OS_BASE}/api/tts/chunk-event") >= 3
-    assert f"{TOKEN_OS_BASE}/api/tts/chunk-next" in urls
+    assert urls == [f"{TOKEN_OS_BASE}/api/tts/chunk-event"]
     bodies = request_bodies(macro)
-    assert "current_complete_next_starting" in bodies[0]
-    assert '"last_consumed_index":"{lv=current_index}"' in bodies[1]
-    assert sum("buffer_drained" in body for body in bodies) >= 2
-    assert (
-        actions(macro, "HttpRequestAction")[0]["requestConfig"]["blockNextAction"]
-        is False
-    )
-    assert (
-        actions(macro, "HttpRequestAction")[1]["requestConfig"]["responseVariableName"]
-        == "backfill_raw"
-    )
-
-    assignments = set_variable_assignments(macro)
-    assert ("current_index", "{lv=next_index}") in assignments
-    assert ("next_index", "{lv=backfill_next_index}") in assignments
-    assert ("backfill_done", "{lv=backfill[done]}") in assignments
+    assert len(bodies) == 1
+    assert "buffer_drained" in bodies[0]
+    assert "last_index" in bodies[0]
 
 
 def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:
