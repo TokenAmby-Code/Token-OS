@@ -87,6 +87,8 @@ export type TtsItem = {
   id: string;
   text: string; // the utterance — surfaced in the hover tip + drawer
   route: string; // sender / delivery route (e.g. "hot · Custodes")
+  senderInstanceId: string; // sender's FULL instance id — joins the utterance to its
+  //                           live worker chip (the edge-A flight source)
   senderTmuxId: string; // sender's short instance-id form (the contract carries no pane id)
   senderName: string; // sender's instance-name (the live session's descriptive name)
   persona: string; // sender's persona key → its icon (see src/personaIcons.tsx).
@@ -267,6 +269,7 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
       id: `cur:${c.instance_id}:${c.started_at ?? ''}`,
       text: c.message,
       route: `${c.backend ?? 'speaking'} · ${c.name ?? shortId(c.instance_id)}`,
+      senderInstanceId: c.instance_id,
       senderTmuxId: shortId(c.instance_id),
       senderName: c.name ?? shortId(c.instance_id),
       persona: personaOf(c.instance_id),
@@ -279,6 +282,7 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
       id: `${q.queue}:${q.instance_id}:${q.queued_at}`,
       text: q.message,
       route: `${q.queue} · ${q.name ?? shortId(q.instance_id)}`,
+      senderInstanceId: q.instance_id,
       senderTmuxId: shortId(q.instance_id),
       senderName: q.name ?? shortId(q.instance_id),
       persona: personaOf(q.instance_id),
@@ -287,6 +291,53 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
     });
   }
   return items;
+}
+
+// ── Worker queue (the two rails below the lemon) ────────────────────────────
+// The worker rails are the LIVE registration surface: one chip per registered
+// instance, wearing that instance's chapter-persona icon. A chip appearing IS
+// the "this instance registered properly" signal; a chip leaving means the
+// instance stopped/archived. Ordered newest-registration-first: rail births
+// always emerge at the centre hourglass (slot 0), so newest-first here makes
+// the initial load land in the same order incremental registrations produce.
+export type WorkerItem = {
+  id: string; // the instance id — chip identity/React key
+  persona: string; // persona slug → icon (generic 'astartes' = registered but NO persona bound)
+  name: string; // instance display name — the chip's hover/aria readout
+  tint: string | null; // persona chip colour; null falls back to the cycled rail tones
+  chapterChild: boolean; // commander_type === 'chapter' — legitimately shares its
+  //                        persona (the DB singleton trigger exempts chapter
+  //                        children, so the rail's breach glow must too)
+};
+
+/**
+ * OpsState → the live worker rails. One chip per active registered instance
+ * (the backend already excludes stopped/archived). Subagents are excluded —
+ * the rails signal top-level fleet registrations, and a subagent inheriting
+ * its parent's persona would false-trigger the singleton-breach glow.
+ *
+ * Persona falls back to the generic 'astartes' key when the instance has no
+ * persona bound — the chip still appears (the registration was real) but wears
+ * the generic helmet, which is exactly the "registered without a chapter
+ * persona" diagnostic. Duplicate personas are NOT deduped here; the rail marks
+ * them as singleton breaches (see duplicatePersonaKeys in OpsCockpit).
+ */
+export function toWorkerQueue(s: OpsState): WorkerItem[] {
+  // created_at crosses the boundary in BOTH SQLite ('YYYY-MM-DD HH:MM:SS') and
+  // ISO ('YYYY-MM-DDTHH:MM:SS…') spellings; space sorts before 'T', so a raw
+  // lexicographic compare interleaves the two formats. Normalizing the
+  // separator makes the compare chronological across both.
+  const regKey = (created: string | null): string => (created ?? '').replace(' ', 'T');
+  return s.instances.active
+    .filter((i) => !i.is_subagent)
+    .sort((a, b) => regKey(b.created_at).localeCompare(regKey(a.created_at)))
+    .map((i) => ({
+      id: i.id,
+      persona: i.persona?.slug ?? 'astartes',
+      name: i.display_name,
+      tint: i.persona?.chip_color ?? null,
+      chapterChild: i.commander_type === 'chapter',
+    }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

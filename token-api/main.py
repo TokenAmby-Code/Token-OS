@@ -21017,6 +21017,9 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "age_seconds": age_seconds,
                 "age_minutes": None if age_seconds is None else age_seconds // 60,
                 "is_subagent": bool(inst.get("is_subagent") or 0),
+                # Chapter children ('chapter') legitimately share a persona; the DB
+                # singleton trigger exempts them, so UI breach-marking must too.
+                "commander_type": inst.get("commander_type"),
                 "work_class": work_class,
                 "golden_throne": inst.get("golden_throne"),
                 # "Agent has PR open" flag (Phase 1) — /ui/ops renders a badge linking
