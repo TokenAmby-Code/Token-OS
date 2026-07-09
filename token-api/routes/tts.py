@@ -1083,6 +1083,9 @@ class TTSQueueItem:
     tmux_pane: str | None = None  # live-resolved pane id for @TTS_STATE tracking (set at playback)
     focus_on_playback: bool = False  # true only for explicit operator-initiated playback
     playback_target: str | None = None  # resolved non-null audio target at enqueue time
+    persona_slug: str | None = None
+    persona_display_name: str | None = None
+    commander_type: str | None = None
     started_at: str | None = None  # ISO; stamped when the worker begins audible playback
     # Future resolved by the worker when this item reaches a terminal playback
     # state (success/skip/fail/muted/exception). The single front door
@@ -1184,6 +1187,8 @@ _SYSTEM_TTS_ROW: dict[str, object] = {
     "notification_sound": "chimes.wav",
     "tts_mode": "verbose",
     "persona_slug": "system",
+    "persona_display_name": "System",
+    "commander_type": "system",
     "advisor": True,  # jump ahead of the pause queue, but the worker still
     # serializes — a system ping waits out whatever is currently audible.
     "tts_policy": "hot",
@@ -2335,7 +2340,8 @@ async def queue_tts(
                 """SELECT i.name, p.tts_voice, p.notification_sound,
                           CASE WHEN i.interaction_mode = 'voice_chat'
                                THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
-                          p.slug AS persona_slug, p.tts_policy AS tts_policy,
+                          p.slug AS persona_slug, p.display_name AS persona_display_name,
+                          p.tts_policy AS tts_policy, i.commander_type AS commander_type,
                           COALESCE(p.advisor, 0) AS advisor
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
@@ -2429,6 +2435,9 @@ async def queue_tts(
             name=name,
             queue_target=queue_target,
             focus_on_playback=False,
+            persona_slug=row["persona_slug"],
+            persona_display_name=row["persona_display_name"],
+            commander_type=row["commander_type"],
             completion=completion,
         )
     else:
@@ -2440,6 +2449,9 @@ async def queue_tts(
             name=name,
             queue_target=queue_target,
             focus_on_playback=False,
+            persona_slug=row["persona_slug"],
+            persona_display_name=row["persona_display_name"],
+            commander_type=row["commander_type"],
             completion=completion,
         )
 
@@ -2777,6 +2789,9 @@ def _queue_item_to_dict(item: TTSQueueItem) -> dict:
         "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
         "voice": item.voice,
         "playback_target": item.playback_target,
+        "persona_slug": item.persona_slug,
+        "persona_display_name": item.persona_display_name,
+        "commander_type": item.commander_type,
         "queue": item.queue_target,
         "queued_at": item.queued_at.isoformat(),
     }
@@ -2803,6 +2818,9 @@ def get_tts_queue_status() -> dict:
             else current_item.message,
             "voice": current_item.voice,
             "playback_target": current_item.playback_target,
+            "persona_slug": current_item.persona_slug,
+            "persona_display_name": current_item.persona_display_name,
+            "commander_type": current_item.commander_type,
             "started_at": current_item.started_at,
         }
 

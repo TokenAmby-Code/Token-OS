@@ -84,6 +84,10 @@ export type TtsQueueItem = {
   name: string | null;
   message: string; // full text — UI clamps with CSS, expands on click
   voice: string | null;
+  persona_slug?: string | null;
+  persona_display_name?: string | null;
+  commander_type?: string | null;
+  playback_target?: string | null;
   queue: string; // "hot" | "pause"
   status?: string; // queued | playing | completed
   queued_at: string; // ISO timestamp
@@ -95,6 +99,10 @@ export type TtsCurrent = {
   message: string;
   voice: string | null;
   backend?: string | null;
+  persona_slug?: string | null;
+  persona_display_name?: string | null;
+  commander_type?: string | null;
+  playback_target?: string | null;
   started_at?: string | null; // ISO; present when cheaply available
 };
 

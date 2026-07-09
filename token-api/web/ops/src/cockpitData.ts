@@ -93,6 +93,8 @@ export type TtsItem = {
   senderName: string; // sender's instance-name (the live session's descriptive name)
   persona: string; // sender's persona key → its icon (see src/personaIcons.tsx).
   //                   Lower-kebab, matching the registry keys (vault/DB slugs).
+  commanderType?: string | null; // backend sender commander_type; chapter is duplicate-glow exempt.
+  playbackTarget?: string | null;
   status: TtsItemStatus;
   posInQueue: number; // 0-based order key; head (0) is the one speaking
   durationMs?: number; // speak length hint; the live contract doesn't carry one,
@@ -185,6 +187,47 @@ function healthDial(h: OpsSourceHealth): { value: string; tone: DialTone } {
   }
 }
 
+
+function ttsDial(s: OpsState): DialModel {
+  const h = healthDial(s.sources.tts);
+  if (h.tone === 'bad' || h.tone === 'neutral') {
+    return { id: 'tts', label: 'TTS', glyph: '♪', value: h.value, tone: h.tone, noteworthy: true, subtitle: `Text-to-speech queue — ${s.sources.tts.message ?? h.value}.` };
+  }
+  const hot = s.tts.hot_queue_length ?? s.tts.hot_queue?.length ?? 0;
+  const pause = s.tts.pause_queue_length ?? s.tts.pause_queue?.length ?? 0;
+  const speaking = Boolean(s.tts.current);
+  const value = speaking ? 'speaking' : hot ? `hot ${hot}` : pause ? `pause ${pause}` : 'idle';
+  const tone: DialTone = speaking || hot ? 'warn' : pause ? 'neutral' : 'good';
+  return { id: 'tts', label: 'TTS', glyph: '♪', value, tone, noteworthy: speaking || hot > 0 || pause > 0 || h.tone !== 'good', subtitle: `Text-to-speech queue — hot ${hot}, pause ${pause}, backend ${s.tts.backend ?? 'unknown'}, satellite ${String(s.tts.satellite_available)}.` };
+}
+
+function enforcementDial(s: OpsState): DialModel {
+  const h = healthDial(s.sources.enforcement);
+  const pending = s.enforcement.pending_count ?? 0;
+  const pavlok = s.enforcement.pavlok ?? {};
+  const pavlokEnabled = typeof pavlok.enabled === 'boolean' ? `Pavlok ${pavlok.enabled ? 'on' : 'off'}` : 'Pavlok unknown';
+  const sourceBad = h.tone === 'bad' || h.tone === 'neutral';
+  return {
+    id: 'enforce', label: 'Enforce', glyph: '!',
+    value: sourceBad ? h.value : pending ? `pending ${pending}` : 'clear',
+    tone: sourceBad ? h.tone : pending ? 'bad' : 'good',
+    noteworthy: sourceBad || pending > 0,
+    subtitle: `Enforcement queue — ${pavlokEnabled}${s.enforcement.error ? `; ${s.enforcement.error}` : ''}.`,
+    ...(pending > 0 ? { action: { kind: 'ack-enforce' } as DialAction } : {}),
+  };
+}
+
+function goldenThroneDial(s: OpsState): DialModel {
+  const active = s.instances.active.map((i) => i.gt).filter(Boolean);
+  const due = active.filter((gt) => gt.next_fire && Date.parse(gt.next_fire) <= Date.now()).length;
+  const armed = active.filter((gt) => gt.next_fire).length;
+  const resume = active.reduce((n, gt) => n + (gt.resume_count ?? 0), 0);
+  const victory = active.filter((gt) => gt.victory_at).length;
+  const value = due ? `due ${due}` : resume ? `resume ${resume}` : armed ? `armed ${armed}` : victory ? `victory ${victory}` : 'clear';
+  const tone: DialTone = due ? 'bad' : resume || armed ? 'warn' : victory ? 'good' : 'idle';
+  return { id: 'gt', label: 'Gold. Throne', glyph: '♛', value, tone, noteworthy: due > 0 || resume > 0 || armed > 0, subtitle: `Golden Throne rubrics — ${armed} armed, ${resume} resume signal(s), ${victory} victory ack(s).` };
+}
+
 // a placeholder dial for subsystems NOT wired this phase — explicit, never fake.
 function unwiredDial(id: string, label: string, glyph: string, what: string): DialModel {
   return {
@@ -217,7 +260,6 @@ export function buildDials(s: OpsState): DialModel[] {
   const balMs = s.timer.break_balance_ms;
   const phone = s.attention.phone;
   const cron = healthDial(s.sources.cron);
-  const tts = healthDial(s.sources.tts);
   return [
     { id: 'timer', label: 'Timer', glyph: '❚❚', value: mode.toUpperCase(), tone: timerTone, noteworthy: true,
       subtitle: 'Focus timer state — the live timer mode.', action: { kind: 'toggle-timer' } },
@@ -228,13 +270,12 @@ export function buildDials(s: OpsState): DialModel[] {
       action: { kind: 'dismiss-phone' } },
     { id: 'desktop', label: 'Desktop', glyph: '▣', value: s.attention.desktop.mode || '—', tone: 'neutral',
       noteworthy: true, subtitle: 'Desktop presence — inferred from keyboard & focus.' },
-    unwiredDial('enforce', 'Enforce', '!', 'Enforcement queue'),
-    unwiredDial('gt', 'Gold. Throne', '♛', 'Golden Throne armed rubrics'),
+    enforcementDial(s),
+    goldenThroneDial(s),
     // nominal / suppressed subsystems — the tail of the stack
     { id: 'cron', label: 'Cron', glyph: '◷', value: cron.value, tone: cron.tone, noteworthy: false,
       subtitle: 'Scheduled cron routines — subsystem health.' },
-    { id: 'tts', label: 'TTS', glyph: '♪', value: tts.value, tone: tts.tone, noteworthy: false,
-      subtitle: 'Text-to-speech voice queue — subsystem health.' },
+    ttsDial(s),
     unwiredDial('mac', 'Mac', '⌘', 'Mac node reachability'),
     unwiredDial('wsl', 'WSL', '⊞', 'WSL satellite reachability'),
     unwiredDial('mesh', 'Mesh', '⇄', 'Tailscale mesh reachability'),
@@ -258,8 +299,13 @@ export function buildDials(s: OpsState): DialModel[] {
  * useLifecycle in OpsCockpit.tsx).
  */
 export function toTtsQueue(s: OpsState): TtsItem[] {
-  const personaOf = (instanceId: string): string =>
-    s.instances.active.find((i) => i.id === instanceId)?.persona?.slug ?? 'astartes';
+  const instanceOf = (instanceId: string) => s.instances.active.find((i) => i.id === instanceId);
+  const personaOf = (item: { instance_id: string; persona_slug?: string | null }): string =>
+    item.persona_slug ?? instanceOf(item.instance_id)?.persona?.slug ?? 'astartes';
+  const displayNameOf = (item: { instance_id: string; name: string | null; persona_display_name?: string | null }): string =>
+    item.name ?? item.persona_display_name ?? instanceOf(item.instance_id)?.display_name ?? shortId(item.instance_id);
+  const commanderOf = (item: { instance_id: string; commander_type?: string | null }): string | null =>
+    item.commander_type ?? instanceOf(item.instance_id)?.commander_type ?? null;
   const shortId = (instanceId: string): string => instanceId.slice(0, 8);
 
   const items: TtsItem[] = [];
@@ -268,11 +314,13 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
     items.push({
       id: `cur:${c.instance_id}:${c.started_at ?? ''}`,
       text: c.message,
-      route: `${c.backend ?? 'speaking'} · ${c.name ?? shortId(c.instance_id)}`,
+      route: `${c.backend ?? c.playback_target ?? 'speaking'} · ${displayNameOf(c)}`,
       senderInstanceId: c.instance_id,
       senderTmuxId: shortId(c.instance_id),
-      senderName: c.name ?? shortId(c.instance_id),
-      persona: personaOf(c.instance_id),
+      senderName: displayNameOf(c),
+      persona: personaOf(c),
+      commanderType: commanderOf(c),
+      playbackTarget: c.playback_target ?? null,
       status: 'speaking',
       posInQueue: 0,
     });
@@ -281,11 +329,13 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
     items.push({
       id: `${q.queue}:${q.instance_id}:${q.queued_at}`,
       text: q.message,
-      route: `${q.queue} · ${q.name ?? shortId(q.instance_id)}`,
+      route: `${q.queue}${q.playback_target ? `/${q.playback_target}` : ''} · ${displayNameOf(q)}`,
       senderInstanceId: q.instance_id,
       senderTmuxId: shortId(q.instance_id),
-      senderName: q.name ?? shortId(q.instance_id),
-      persona: personaOf(q.instance_id),
+      senderName: displayNameOf(q),
+      persona: personaOf(q),
+      commanderType: commanderOf(q),
+      playbackTarget: q.playback_target ?? null,
       status: 'queued',
       posInQueue: items.length,
     });

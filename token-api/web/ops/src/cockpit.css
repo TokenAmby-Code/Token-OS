@@ -1106,3 +1106,15 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
    Future portrait reflows / data-driven per-size tweaks belong HERE, nowhere else.
    Breakpoint: --bp-narrow = 720px (media queries take the literal below).
    ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Shared instrument spinner primitive. Compass pointer and clock hands both use
+   this CSS animation so local full-motion cockpit instruments do not depend on
+   SVG SMIL support and do not freeze under OS reduced-motion preferences. */
+.instrument-spinner {
+  transform-box: fill-box;
+  animation: instrument-spin var(--instrument-spin-duration, 18s) linear infinite;
+  will-change: transform;
+}
+@keyframes instrument-spin {
+  to { transform: rotate(360deg); }
+}

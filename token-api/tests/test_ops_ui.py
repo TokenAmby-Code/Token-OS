@@ -901,3 +901,58 @@ def test_ops_ui_unknown_asset_returns_404(client) -> None:
     resp = client.get("/ui/ops/assets/does-not-exist.js")
 
     assert resp.status_code == 404
+
+
+def test_ops_state_passes_through_tts_sender_metadata(client, app_env, monkeypatch) -> None:
+    instance_id = _insert_ops_fixture(app_env)
+
+    def _fake_tts_queue_status() -> dict:
+        return {
+            "current": {
+                "instance_id": instance_id,
+                "name": "ops-test",
+                "message": "current line",
+                "voice": "Microsoft David",
+                "backend": "wsl",
+                "playback_target": "wsl",
+                "persona_slug": "ultramarines",
+                "persona_display_name": "Ultramarines",
+                "commander_type": "chapter",
+                "started_at": "2026-07-09T10:00:00",
+            },
+            "hot_queue": [
+                {
+                    "instance_id": instance_id,
+                    "name": "ops-test",
+                    "message": "queued line",
+                    "voice": "Microsoft David",
+                    "playback_target": "phone",
+                    "persona_slug": "ultramarines",
+                    "persona_display_name": "Ultramarines",
+                    "commander_type": "chapter",
+                    "queue": "hot",
+                    "queued_at": "2026-07-09T10:00:01",
+                }
+            ],
+            "pause_queue": [],
+            "hot_queue_length": 1,
+            "pause_queue_length": 0,
+            "queue_length": 1,
+            "backend": "wsl",
+            "satellite_available": True,
+            "global_mode": "verbose",
+            "routing": None,
+        }
+
+    monkeypatch.setattr(app_env.main, "get_tts_queue_status", _fake_tts_queue_status)
+
+    resp = client.get("/api/ui/ops/state")
+
+    assert resp.status_code == 200, resp.text
+    tts = resp.json()["tts"]
+    assert tts["current"]["persona_slug"] == "ultramarines"
+    assert tts["current"]["persona_display_name"] == "Ultramarines"
+    assert tts["current"]["commander_type"] == "chapter"
+    assert tts["current"]["playback_target"] == "wsl"
+    assert tts["hot_queue"][0]["persona_slug"] == "ultramarines"
+    assert tts["hot_queue"][0]["playback_target"] == "phone"
