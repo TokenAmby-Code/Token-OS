@@ -1514,11 +1514,11 @@ class TmuxControlPlane:
                     self.adapter.run("set-option", "-pu", "-t", old, "@INSTANCE_ID")
                     vacated = old
 
+        # Tint is intentionally NOT written here. /instance/stamp is part of the
+        # bind transaction (stamp + ledger). The color source of truth lives in
+        # token-api's personas table, so tint may only be applied by token-api
+        # after the registry commit proves the binding.
         tint = ""
-        if bound_persona:
-            from .assertions import apply_bound_persona_pane_tint
-
-            tint = apply_bound_persona_pane_tint(self.adapter, target, label, bound_persona) or ""
 
         return {
             "found": True,
@@ -1557,13 +1557,22 @@ class TmuxControlPlane:
         return {"instance_id": instance_id, "found": True, "status": "submitted"}
 
     def instance_tint(self, instance_id: str, color: str) -> dict:
-        """Tint an instance's live pane background; fails closed if unresolved."""
+        """Refuse direct tint writes; Token-API must source personas.pane_tint.
+
+        Tint is an identity surface. tmuxctld can clear fail-dark, but it must not
+        invent or accept a color because tmuxctld has no persona-table authority.
+        """
         resolved = self.resolve_instance(instance_id)
         if not resolved["found"]:
             return {"instance_id": instance_id, "found": False}
-        bg = color or "default"
-        self.adapter.set_pane_tint(resolved["pane_id"], bg)
-        return {"instance_id": instance_id, "found": True, "tint": bg}
+        self.adapter.clear_pane_tint(resolved["pane_id"])
+        return {
+            "instance_id": instance_id,
+            "found": True,
+            "tint": "default",
+            "status": "refused",
+            "reason": "persona_table_color_required",
+        }
 
     def instance_clear_tint(self, instance_id: str) -> dict:
         """Clear the tint on an instance's live pane; fails closed if unresolved."""

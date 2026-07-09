@@ -3241,10 +3241,10 @@ async def handle_session_start(payload: dict) -> dict:
                 ):
                     await db.commit()
 
-                # Event-driven tint: the persona moved panes. Clear the vacated
-                # pane and paint the new one from canonical instances.persona_id
-                # → personas.pane_tint (no recolor queue).
-                # Tint is cosmetic — best-effort, never fail registration on it.
+                # Event-driven tint: only after the registry/stamp/ledger bind has
+                # committed. Color comes from canonical instances.persona_id →
+                # personas.pane_tint (no recolor queue). Best-effort after commit.
+                await db.commit()
                 try:
                     if old_tmux_pane and old_tmux_pane != target_pane:
                         await asyncio.to_thread(
@@ -3404,6 +3404,7 @@ async def handle_session_start(payload: dict) -> dict:
                     dispatch_mode=dispatch_mode,
                     dispatch_legion=dispatch_legion,
                 )
+                await db.commit()
                 await db.commit()
                 try:
                     target_pane = tmux_pane or prior_pane
@@ -3639,10 +3640,10 @@ async def handle_session_start(payload: dict) -> dict:
                 ):
                     await db.commit()
 
-                # Event-driven tint: the persona moved panes. Clear the vacated
-                # pane and paint the new one from canonical instances.persona_id
-                # → personas.pane_tint (no recolor queue).
-                # Tint is cosmetic — best-effort, never fail registration on it.
+                # Event-driven tint: only after the registry/stamp/ledger bind has
+                # committed. Color comes from canonical instances.persona_id →
+                # personas.pane_tint (no recolor queue). Best-effort after commit.
+                await db.commit()
                 try:
                     if old_tmux_pane and old_tmux_pane != target_tmux_pane:
                         await asyncio.to_thread(
@@ -4099,6 +4100,9 @@ async def handle_session_start(payload: dict) -> dict:
         ):
             await db.commit()
 
+        # Tint is an identity surface, not assign-time cosmetics: apply only after
+        # the registration row, stamp request, and ledger side effects are committed.
+        await db.commit()
         try:
             if tmux_pane:
                 await shared.apply_instance_pane_tint(

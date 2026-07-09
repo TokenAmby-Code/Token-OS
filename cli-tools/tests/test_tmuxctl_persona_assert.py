@@ -124,7 +124,7 @@ def test_codex_default_is_fg_scoped_other_singletons_stay_claude() -> None:
     assert persona_spec("mechanicus:orchestrator").engine == "claude"
 
 
-def test_persona_tint_reassert_ignores_stale_voice_lock() -> None:
+def test_persona_tint_reassert_fails_dark_without_persona_table_color() -> None:
     adapter = FakeAdapter()
     adapter.options["@DISCORD_VOICE_LOCK"] = "1"
     original_run = adapter.run
@@ -138,19 +138,19 @@ def test_persona_tint_reassert_ignores_stale_voice_lock() -> None:
 
     _assert_persona_color(adapter, "%25", _custodes_spec())
 
-    assert adapter.options["window-style"] == "bg=#302800"
-    assert adapter.options["window-active-style"] == "bg=#302800"
+    assert adapter.options.get("window-style", "") == ""
+    assert adapter.options.get("window-active-style", "") == ""
 
 
-def test_wrapperstart_persona_tint_ignores_stale_voice_lock() -> None:
+def test_wrapperstart_persona_tint_fails_dark_label_only() -> None:
     adapter = FakeAdapter()
     adapter.options["@DISCORD_VOICE_LOCK"] = "1"
 
     tint = apply_persona_pane_tint(adapter, "%25", "council:custodes")
 
-    assert tint == "#302800"
-    assert adapter.options["window-style"] == "bg=#302800"
-    assert adapter.options["window-active-style"] == "bg=#302800"
+    assert tint is None
+    assert adapter.options.get("window-style", "") == ""
+    assert adapter.options.get("window-active-style", "") == ""
 
 
 def test_fg_seat_command_launches_codex() -> None:

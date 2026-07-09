@@ -1036,80 +1036,36 @@ def _set_pane_tint(adapter: TmuxAdapter, pane_id: str, bg: str) -> None:
     adapter.run("set-option", "-p", "-t", pane_id, "window-active-style", style, allow_failure=True)
 
 
-# Persona → pane background tint. Only the two seats with a distinct chrome
-# carry a non-default tint; every other persona seat stays at the tmux default.
-# Shared by the focus-gated reconcile painter (_assert_persona_color) and the
-# birth-time wrapperstart painter (apply_persona_pane_tint) so the colors never
-# drift between the two paths.
-PERSONA_TINTS = {
-    "custodes": "#302800",
-    "fabricator-general": "#300808",
-}
-
-
+# Pane tint belongs to token-api after registry commit because the persona table
+# is the sole color source of truth. tmuxctld assertion/reconcile code must never
+# hardcode or infer colors; if it cannot prove a committed persona-table color, it
+# clears stale tint and leaves the lost-registration-anchor signal loud.
 def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec) -> None:
+    del spec
     current = adapter.run(
         "display-message", "-t", pane_id, "-p", "#{pane_id}", allow_failure=True
     ).strip()
     if current != pane_id:
         return
-    bg = PERSONA_TINTS.get(spec.persona)
-    if bg:
-        _set_pane_tint(adapter, pane_id, bg)
+    _set_pane_tint(adapter, pane_id, "default")
 
 
 def apply_persona_pane_tint(
     adapter: TmuxAdapter, pane_id: str, pane_label: str | None
 ) -> str | None:
-    """Paint a singleton seat's persona tint from its durable ``@PANE_ID`` label.
-
-    Legacy direct painter retained for focused reconcile paths that have already
-    proven persona binding. New registration paths should use
-    :func:`apply_bound_persona_pane_tint` so label-only panes fail dark.
-    """
-    label = (pane_label or "").strip()
-    if label not in PERSONA_LABELS:
-        return None
-    try:
-        spec = persona_spec(label)
-    except ValueError:
-        return None
-    bg = PERSONA_TINTS.get(spec.persona)
-    if not bg:
-        return None
-    _set_pane_tint(adapter, pane_id, bg)
-    return bg
-
+    """Legacy compatibility shim: fail dark; do not tint from label-only state."""
+    del pane_label
+    _set_pane_tint(adapter, pane_id, "default")
+    return None
 
 
 def apply_bound_persona_pane_tint(
     adapter: TmuxAdapter, pane_id: str, pane_label: str | None, persona: str | None
 ) -> str | None:
-    """Paint persona tint only when label and bound persona agree.
-
-    This is the fail-dark counterpart to registration atomicity: a durable label
-    alone is not proof of a bound occupant.  Tint is present iff a real bound
-    persona state was supplied and it matches the singleton label.
-    """
-    label = (pane_label or "").strip()
-    bound = (persona or "").strip().lower()
-    if label not in PERSONA_LABELS or not bound:
-        _set_pane_tint(adapter, pane_id, "default")
-        return None
-    try:
-        spec = persona_spec(label)
-    except ValueError:
-        _set_pane_tint(adapter, pane_id, "default")
-        return None
-    if bound != spec.persona:
-        _set_pane_tint(adapter, pane_id, "default")
-        return None
-    bg = PERSONA_TINTS.get(spec.persona)
-    if not bg:
-        _set_pane_tint(adapter, pane_id, "default")
-        return None
-    _set_pane_tint(adapter, pane_id, bg)
-    return bg
+    """Legacy compatibility shim: fail dark; colors come only from personas table."""
+    del pane_label, persona
+    _set_pane_tint(adapter, pane_id, "default")
+    return None
 
 
 def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:

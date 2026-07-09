@@ -108,7 +108,7 @@ def test_instance_stamp_writes_pane_option_and_binds_ledger(monkeypatch):
     assert row.pane_positional_id == "mechanicus:2"
 
 
-def test_instance_stamp_tints_only_when_bound_persona_matches_singleton_label(monkeypatch):
+def test_instance_stamp_does_not_tint_before_registry_commit(monkeypatch):
     adapter = StampAdapter({("%fg", "@PANE_ID"): "mechanicus:fabricator-general"})
     control = TmuxControlPlane(adapter=adapter)
     _identity_resolve(monkeypatch, {"%fg": "mechanicus:fabricator-general"})
@@ -120,12 +120,12 @@ def test_instance_stamp_tints_only_when_bound_persona_matches_singleton_label(mo
         persona="fabricator-general",
     )
 
-    assert out["tint"] == "#300808"
+    assert out["tint"] == ""
     assert adapter.pane_options[("%fg", "@PERSONA")] == "fabricator-general"
-    assert [r for r in adapter.runs if "bg=#300808" in r]
+    assert not [r for r in adapter.runs if "window-style" in r or "window-active-style" in r]
 
 
-def test_instance_stamp_clears_tint_when_persona_does_not_match_label(monkeypatch):
+def test_instance_stamp_never_tints_or_clears_tint_before_registry_commit(monkeypatch):
     adapter = StampAdapter({("%fg", "@PANE_ID"): "mechanicus:fabricator-general"})
     control = TmuxControlPlane(adapter=adapter)
     _identity_resolve(monkeypatch, {"%fg": "mechanicus:fabricator-general"})
@@ -138,11 +138,7 @@ def test_instance_stamp_clears_tint_when_persona_does_not_match_label(monkeypatc
     )
 
     assert out["tint"] == ""
-    assert [
-        r
-        for r in adapter.runs
-        if r[:4] == ("set-option", "-pu", "-t", "%fg") and "window-style" in r
-    ]
+    assert not [r for r in adapter.runs if "window-style" in r or "window-active-style" in r]
 
 
 def test_instance_stamp_fails_closed_on_unresolved_pane(monkeypatch):

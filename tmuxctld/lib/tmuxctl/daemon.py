@@ -2940,7 +2940,12 @@ def _h_reconcile(control, params):
     ledger = control.ledger_reconcile()
     results = control.reconcile_personas(session=_s(params, "session", "main"))
     errored = [r for r in results if isinstance(r, dict) and (r.get("ok") is False or r.get("error"))]
-    if results and len(errored) == len(results):
+    # `/reconcile` also owns wrapper-ledger recovery. Do not discard a successful
+    # ledger repair just because the persona/reservist sweep is degraded in the
+    # same call; return a loud degraded result instead. If the whole reconcile has
+    # no repaired/open ledger evidence and every persona target errored, preserve
+    # the old fail-loud behavior.
+    if results and len(errored) == len(results) and not ledger.get("open_rows"):
         raise ValueError("reconcile degraded: every target row errored")
     return {
         "status": "degraded" if errored else "ok",
