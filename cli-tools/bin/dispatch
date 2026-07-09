@@ -1590,7 +1590,7 @@ tmuxctld_result_max_time() {
   # the pane.
   case "${1:-} ${2:-}" in
     "POST /stack/dispatch") printf '%s' "${TMUXCTLD_STACK_DISPATCH_MAX_TIME:-0}" ;;
-    "POST /reconcile"|"POST /close-pane") printf '%s' "${TMUXCTLD_MAX_TIME:-0}" ;;
+    "POST /reconcile"|"POST /close-pane"|"POST /close"|"POST /stack/add") printf '%s' "${TMUXCTLD_MAX_TIME:-0}" ;;
     "POST /send-text") printf '%s' "${TMUXCTLD_MAX_TIME:-$(tmuxctld_send_client_timeout)}" ;;
     *) printf '%s' "${TMUXCTLD_MAX_TIME:-60}" ;;
   esac

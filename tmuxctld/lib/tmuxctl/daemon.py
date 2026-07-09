@@ -1088,26 +1088,49 @@ def _emit_prompt_submit_callback(control, callback: dict, event: dict) -> dict:
         f"correlation_id={correlation_id} delivered=1 turn=submitted target={target}"
     )
     try:
-        if hasattr(control.adapter, "send_text_then_submit"):
-            control.adapter.send_text_then_submit(
-                caller_pane,
-                text,
-                clear_prompt=False,
-                pre_submit_keys=(),
-                submit_settle_seconds=0,
-            )
-        else:
-            control.adapter.run("send-keys", "-t", caller_pane, "-l", text)
-            if hasattr(control.adapter, "send_keys"):
-                control.adapter.send_keys(caller_pane, "C-m")
+        # Hook echoes are byte-bearing notifications. They may target a raw
+        # caller pane that is outside normal managed-agent resolution, but they
+        # still must pass the universal typing-guard chokepoint before any
+        # direct adapter injection.
+        params = {
+            "pane": caller_pane,
+            "text": text,
+            "submit": True,
+            "verify": False,
+            "operation_id": f"hook-echo:{correlation_id}",
+            "correlation_id": correlation_id,
+        }
+        gate = send_gate.evaluate(("send-keys", "-t", caller_pane, "-l", text))
+        receipt = _defer_or_drop_typing_guard(
+            route="/send-text",
+            params=params,
+            pane=caller_pane,
+            phys_pane=caller_pane,
+            gate=gate,
+        )
+        if receipt is None:
+            if hasattr(control.adapter, "send_text_then_submit"):
+                control.adapter.send_text_then_submit(
+                    caller_pane,
+                    text,
+                    clear_prompt=False,
+                    pre_submit_keys=(),
+                    submit_settle_seconds=0,
+                )
             else:
-                control.adapter.run("send-keys", "-t", caller_pane, "C-m")
+                control.adapter.run("send-keys", "-t", caller_pane, "-l", text)
+                if hasattr(control.adapter, "send_keys"):
+                    control.adapter.send_keys(caller_pane, "C-m")
+                else:
+                    control.adapter.run("send-keys", "-t", caller_pane, "C-m")
+            receipt = {"status": "sent", "queued": False}
         return {
             "correlation_id": correlation_id,
             "caller_pane": caller_pane,
             "target_pane": callback.get("target_pane"),
             "target_label": callback.get("target_label"),
-            "status": "sent",
+            "status": "queued" if receipt.get("queued") else "sent",
+            "delivery": receipt,
             "event": event,
         }
     except Exception as exc:  # noqa: BLE001

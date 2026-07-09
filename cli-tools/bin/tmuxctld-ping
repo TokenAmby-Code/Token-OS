@@ -89,8 +89,8 @@ PY
 fi
 
 case "${METHOD} ${PATH_PART}" in
-    "POST /reconcile"|"POST /close-pane")
-        # Lifecycle transactions must not be severed by a client-side max-time;
+    "POST /reconcile"|"POST /close-pane"|"POST /close"|"POST /stack/add")
+        # Lifecycle allocation/reconcile/close transactions must not be severed by a client-side max-time;
         # curl --max-time 0 means no transfer timeout after the daemon accepts.
         MAX_TIME="${TMUXCTLD_MAX_TIME:-0}"
         ;;

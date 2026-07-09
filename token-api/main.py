@@ -5784,6 +5784,9 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     daemon explicitly says bytes were gated/suppressed or the process failed.
     """
     verification = str(send_result.get("verification_status") or "").lower()
+    if send_result.get("queued") or send_result.get("deferred"):
+        reason = send_result.get("reason") or send_result.get("gate_reason") or "dispatch_deferred"
+        return PANE_WRITE_PENDING, str(reason)
     if verification == "gated" or send_result.get("gated"):
         return PANE_WRITE_PENDING, f"send_gated:{send_result.get('gate_reason') or 'gated'}"
     if send_result.get("returncode") != 0:
@@ -5798,6 +5801,24 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
         PANE_WRITE_SENT,
         None,
     )
+
+
+def _pane_delivery_is_pending(send_result: dict) -> bool:
+    return str(send_result.get("status") or "").lower() == PANE_WRITE_PENDING or bool(
+        send_result.get("queued") or send_result.get("deferred")
+    )
+
+
+def _pane_delivery_is_accepted_for_await(send_result: dict) -> bool:
+    """True when talk should keep an await open for this send receipt.
+
+    A queued/deferred send has not delivered bytes yet, but it has a durable
+    delivery handle/correlation id.  Treat that as success-pending for talk's
+    caller-visible contract instead of cancelling the pair and forcing a blind
+    retry.
+    """
+
+    return send_result.get("status") == PANE_WRITE_SENT or _pane_delivery_is_pending(send_result)
 
 
 def _pane_input_line_has_text(line: str) -> bool:
@@ -13500,7 +13521,7 @@ async def talk_send(request: TalkSendRequest):
                 hook_echo_pane=caller_pane,
                 correlation_id=returned["talk_id"],
             )
-            if send_result.get("status") != PANE_WRITE_SENT:
+            if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
                     send_result.get("reason")
                     or send_result.get("error")
@@ -13550,7 +13571,7 @@ async def talk_send(request: TalkSendRequest):
                 hook_echo_pane=caller_pane,
                 correlation_id=record["talk_id"],
             )
-            if send_result.get("status") != PANE_WRITE_SENT:
+            if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
                     send_result.get("reason")
                     or send_result.get("error")
@@ -13564,7 +13585,7 @@ async def talk_send(request: TalkSendRequest):
                 hook_echo_pane=caller_pane,
                 correlation_id=record["talk_id"],
             )
-            if send_result.get("status") != PANE_WRITE_SENT:
+            if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
                     send_result.get("reason")
                     or send_result.get("error")
