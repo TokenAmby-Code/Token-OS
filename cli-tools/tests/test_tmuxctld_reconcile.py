@@ -625,3 +625,89 @@ def test_pane_inventory_reports_roster_without_raw_scrape_by_callers() -> None:
     assert out["panes"][0]["slot"] == "somnium"
     assert out["panes"][0]["cardinal"] == "SE"
     assert out["panes"][0]["live"] is True
+
+
+def test_ledger_reconcile_scrubs_chrome_on_unbound_free_slot(monkeypatch):
+    """/reconcile must derive chrome from ledger bind state, including FREE slots.
+
+    A free slot with no active wrapper-ledger row, no live agent, and no boot grace
+    may still carry stale tint/title from a prior bind. Reconcile is the ledger
+    transaction that makes bind state canonical, so it must scrub that chrome in
+    the same pass rather than merely returning ok.
+    """
+
+    class FreeSlotAdapter:
+        def __init__(self):
+            self.cleared = []
+
+        def run(self, *args, allow_failure=False):  # noqa: ARG002
+            if args[:2] == ("list-panes", "-a"):
+                fmt = args[-1]
+                if "TOKEN_API_WRAPPER_ID" in fmt:
+                    return ""
+                return "%22\tsomnium:N\tsomnium\t4242\t0"
+            return ""
+
+        def clear_runtime_state(self, target):
+            self.cleared.append(target)
+
+    adapter = FreeSlotAdapter()
+    control = TmuxControlPlane(adapter=adapter)
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
+    monkeypatch.setattr(
+        "tmuxctl.wrapper_ledger.LEDGER.reconcile_from_tmux", lambda a: {"open_rows": 0}
+    )
+
+    out = control.ledger_reconcile()
+
+    assert out["chrome_scrubbed_free_panes"] == ["%22"]
+    assert adapter.cleared == ["%22"]
+
+
+def test_ledger_reconcile_does_not_scrub_ledger_bound_or_singleton_panes(monkeypatch):
+    class MixedAdapter:
+        def __init__(self):
+            self.cleared = []
+
+        def run(self, *args, allow_failure=False):  # noqa: ARG002
+            if args[:2] == ("list-panes", "-a"):
+                fmt = args[-1]
+                if "TOKEN_API_WRAPPER_ID" in fmt:
+                    return ""
+                return "\n".join(
+                    [
+                        "%1\tsomnium:N\tsomnium\t100\t0",
+                        "%2\tmechanicus:1\tmechanicus\t101\t0",
+                        "%3\tcouncil:custodes\tcouncil\t102\t0",
+                    ]
+                )
+            return ""
+
+        def clear_runtime_state(self, target):
+            self.cleared.append(target)
+
+    adapter = MixedAdapter()
+    control = TmuxControlPlane(adapter=adapter)
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
+
+    class Row:
+        def __init__(self, instance_id):
+            self.instance_id = instance_id
+
+        def as_dict(self):
+            return {"instance_id": self.instance_id}
+
+    def fake_resolve(*, pane_positional_id, **kwargs):  # noqa: ARG001
+        if pane_positional_id == "mechanicus:1":
+            return Row("i-bound")
+        return None
+
+    monkeypatch.setattr("tmuxctl.wrapper_ledger.LEDGER.resolve", fake_resolve)
+    monkeypatch.setattr(
+        "tmuxctl.wrapper_ledger.LEDGER.reconcile_from_tmux", lambda a: {"open_rows": 1}
+    )
+
+    out = control.ledger_reconcile()
+
+    assert out["chrome_scrubbed_free_panes"] == ["%1"]
+    assert adapter.cleared == ["%1"]

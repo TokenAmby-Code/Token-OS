@@ -7,7 +7,6 @@ import os
 # Daemon send endpoints can hold the HTTP response while waiting for the
 # level-2 UserPromptSubmit ack.  Keep caller transport strictly above this.
 SEND_HOLD_CEILING_SECONDS = 60.0
-LIFECYCLE_HOLD_CEILING_SECONDS = 60.0
 CLIENT_TIMEOUT_MARGIN_SECONDS = 15.0
 
 
@@ -28,4 +27,3 @@ def client_timeout_for_ceiling(ceiling: float) -> float:
 
 
 SEND_CLIENT_TIMEOUT_SECONDS = client_timeout_for_ceiling(SEND_HOLD_CEILING_SECONDS)
-LIFECYCLE_CLIENT_TIMEOUT_SECONDS = client_timeout_for_ceiling(LIFECYCLE_HOLD_CEILING_SECONDS)
