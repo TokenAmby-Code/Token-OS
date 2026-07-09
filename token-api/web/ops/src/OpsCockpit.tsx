@@ -3803,11 +3803,21 @@ function pointsToPath(pts: { x: number; y: number }[]): string {
 
 type KanbanColumnConfig = { key: string; title: string; cards: number };
 
+// CANONICAL-LIFECYCLE COUPLING: the lane set mirrors the session-doc lifecycle
+// canonized in the vault decree "Ultramar/Session Lifecycle Decree" (2026-07-09)
+// — aspirant → astartes → arbites → inquisitor → victorious, with `archived` the
+// hidden terminal (victory-ack archives; archived docs are never rendered).
+// Frontmatter `status:` is the source of truth; session docs, Golden Throne and
+// this board all consume the same vocabulary. Change the decree, change this
+// array (and the session-doc/GT consumers). `key` = canonical state slug,
+// `title` = the state's name in the small-caps head chrome. Card counts are
+// still demo placeholders — ink lands a later wave.
 const KANBAN_COLUMNS: KanbanColumnConfig[] = [
-  { key: 'i', title: 'I', cards: 3 },
-  { key: 'ii', title: 'II', cards: 2 },
-  { key: 'iii', title: 'III', cards: 4 },
-  { key: 'iv', title: 'IV', cards: 2 },
+  { key: 'aspirant', title: 'Aspirant', cards: 3 },
+  { key: 'astartes', title: 'Astartes', cards: 4 },
+  { key: 'arbites', title: 'Arbites', cards: 2 },
+  { key: 'inquisitor', title: 'Inquisitor', cards: 2 },
+  { key: 'victorious', title: 'Victorious', cards: 1 },
 ];
 
 // CSS mirrors — the idle rail's page placement lives in cockpit.css; the board
@@ -3819,8 +3829,8 @@ const KANBAN_IDLE_FLIP_PIVOT_PX = 246; // = `.worker-queues--flip` transform-ori
 const KANBAN_COL_PAD_X = 14; // card inset from the column's seam-to-seam cell
 const KANBAN_COL_PAD_Y = 18; // vertical clearance off each crossbar's bow
 const KANBAN_SEAM_GAP = 4; // seam ends shy of the 2px bar strokes — dashes kiss, never overlap
-const KANBAN_SEAM_DASH = 14; // dash length — big segments, clearly a seam not a wire
-const KANBAN_SEAM_SPACE = 18; // dash gap — more air than metal
+const KANBAN_SEAM_DASH = 20; // dash length — big segments, clearly a seam not a wire
+const KANBAN_SEAM_SPACE = 26; // dash gap — more air than metal
 
 // One inert plate in the rail's own instrument language: official gold outline
 // over the darker band-wash interior (see .kanban-card). Three placeholder

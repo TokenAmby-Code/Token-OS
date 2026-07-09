@@ -986,7 +986,7 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 .kanban__seam {
   fill: none;
   stroke: var(--brass-deep);
-  stroke-opacity: 0.25;
+  stroke-opacity: 0.32;
   stroke-width: 1;
 }
 
