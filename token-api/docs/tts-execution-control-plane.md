@@ -62,9 +62,9 @@ Token-OS dispatches one full sanitized utterance to the selected backend. Phone 
 Invariants:
 
 - `current_chunk` is the complete sanitized utterance; `next_chunk` is empty and `next_index` is `null`.
-- WSL receives the same complete utterance through `/tts/synth-and-play`; the satellite synthesizes the full text to a WAV artifact, verifies the rendered text hash, plays that WAV with no playback timeout, and Token-API records `current` as that full utterance and `next` as `null`.
+- WSL receives the same complete utterance through `/tts/synth-and-play`; the satellite synthesizes the full text to a WAV artifact, verifies the rendered text hash, plays that WAV with a 3600s safety timeout, and Token-API records `current` as that full utterance and `next` as `null`.
 - Both phone and WSL report chunk-compatible metadata with `chunks=1`, `completed_chunks=1`, one `results[0]`, `chunk_id`, and `playback_id`.
-- WSL integrity checks compare `rendered_hash`/`rendered_chars` against the full utterance, not a sentence chunk. Current WSL transport is `wsl_sapi_wav_file`; pause/resume/toggle/restart are explicit unsupported-backend errors until a controllable media-player layer replaces `SoundPlayer.PlaySync()`.
+- WSL integrity checks compare `rendered_hash`/`rendered_chars` against the full utterance, not a sentence chunk. Current WSL transport is `wsl_sapi_wav_file`; playback is bounded by `MAX_PLAYBACK_SECONDS` (3600s), after which playback is killed and reported as a timeout error; pause/resume/toggle/restart are explicit unsupported-backend errors until a controllable media-player layer replaces `SoundPlayer.PlaySync()`.
 - Backends must not reconstruct a queue or mutate playback state before Token-OS control acknowledgement.
 
 Token-OS also includes compatibility metadata fields such as `chunk_id`, `current_chunk_hash`, `next_chunk_hash`, and `chunk_count` for integrity/observability.

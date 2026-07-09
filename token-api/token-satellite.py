@@ -602,7 +602,10 @@ class TTSEngine:
             except subprocess.TimeoutExpired:
                 self._was_skipped = True
                 proc.kill()
-                stdout, stderr = proc.communicate()
+                try:
+                    stdout, stderr = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = "", ""
                 return {"success": False, "error": "WAV playback timed out"}
             skipped = self._was_skipped or proc.returncode < 0
             if proc.returncode not in (0, None) and not skipped:

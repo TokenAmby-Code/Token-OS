@@ -127,3 +127,35 @@ def test_speak_tts_wsl_file_playback_posts_to_synth_and_play_with_finite_timeout
     assert observed["timeout"][1] >= 3600
     assert result["success"] is True
     assert result["transport"] == "wsl_sapi_wav_file"
+
+
+def test_speak_tts_wsl_file_playback_timeout_scales_for_long_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tts = _load_tts_routes()
+    message = "x" * 1501
+    rendered_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    observed = {}
+    monkeypatch.setitem(tts.DESKTOP_CONFIG, "host", "wsl.local")
+    monkeypatch.setitem(tts.DESKTOP_CONFIG, "port", 7777)
+
+    def fake_post(url, **kwargs):
+        observed["url"] = url
+        observed.update(kwargs)
+        return FakeResponse(
+            200,
+            {
+                "success": True,
+                "method": "wsl_sapi_file",
+                "transport": "wsl_sapi_wav_file",
+                "rendered_hash": rendered_hash,
+                "rendered_chars": len(message),
+            },
+        )
+
+    monkeypatch.setattr(tts.requests, "post", fake_post)
+
+    result = tts.speak_tts_wsl(message, "Microsoft David", use_file_playback=True)
+
+    assert result["success"] is True
+    assert observed["timeout"] == (5, len(message) * 3)
