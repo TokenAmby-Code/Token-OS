@@ -974,6 +974,7 @@ interface Agent {
 }
 // A TTS-roster agent additionally carries the LIVE queue item it renders.
 interface TtsAgent extends Agent {
+  chapterChild?: boolean;
   item: TtsItem; // the live utterance — refreshed each poll, never synthesized
 }
 
@@ -1191,7 +1192,13 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
 
   // Flag any persona that repeats in the queue (2nd+ occurrence, by slot order) —
   // a DB-invariant breach the stack surfaces rather than hides (see the helper).
-  const dupKeys = duplicatePersonaKeys(entries, (e) => e.slot, (e) => e.agent.persona, (e) => e.key);
+  const dupKeys = duplicatePersonaKeys(
+    entries,
+    (e) => e.slot,
+    (e) => e.agent.persona,
+    (e) => e.key,
+    (e) => e.agent.chapterChild === true,
+  );
 
   return (
     <div
@@ -2492,14 +2499,9 @@ function CompassDial({ cx, cy, capR, rimD, uiScale, stars }: { cx: number; cy: n
           white-south diamonds (a larger outline with a smaller one nested on
           top), spinning as one around the pivot; a single flat brass hub crowns
           the intersection and stays put as the pivot. */}
-      <g>
+      <g className="instrument-spinner" style={{ transformOrigin: `${cx}px ${cy}px`, ['--instrument-spin-duration' as string]: `${COMPASS_SPIN_SEC}s` }}>
         <CompassPointer cx={cx} cy={cy} size={R * COMPASS_POINTER_FRAC} uid="outer" />
         <CompassPointer cx={cx} cy={cy} size={R * COMPASS_POINTER_FRAC * COMPASS_POINTER_NEST} uid="inner" />
-        {COMPASS_SPIN_SEC > 0 && (
-          <animateTransform attributeName="transform" type="rotate"
-            from={`0 ${cx} ${cy}`} to={`360 ${cx} ${cy}`}
-            dur={`${COMPASS_SPIN_SEC}s`} repeatCount="indefinite" />
-        )}
       </g>
       <circle className="worker-compass__hub" cx={cx} cy={cy} r={R * COMPASS_POINTER_FRAC * COMPASS_HUB_FRAC} fill="var(--instrument)" />
     </g>
@@ -2647,15 +2649,11 @@ function ClockHand({ cx, cy, size, halfWidthPx, uid, durSec, animate }: {
         <clipPath id={cid}><path d={d} /></clipPath>
       </defs>
       {/* the whole hand spins about the 100-box centre (= the hub) */}
-      <g>
+      <g className={animate ? "instrument-spinner" : undefined} style={{ transformOrigin: '50% 50%', ['--instrument-spin-duration' as string]: `${durSec}s` }}>
         <g clipPath={`url(#${cid})`}>
           <path d={d} fill="none" stroke="var(--brass-bright)" strokeWidth={PTR_GLOW_W} opacity={PTR_GLOW_OP} filter={`url(#${gid})`} />
         </g>
         <path d={d} fill="none" stroke="var(--instrument)" strokeWidth={PTR_STROKE} strokeLinejoin="round" strokeLinecap="round" />
-        {animate && (
-          <animateTransform attributeName="transform" type="rotate"
-            from="0 50 50" to="360 50 50" dur={`${durSec}s`} repeatCount="indefinite" />
-        )}
       </g>
     </svg>
   );
@@ -3576,6 +3574,7 @@ function useLifecycle(
       persona: item.persona,
       tone: WORKER_TONES[n % WORKER_TONES.length],
       originSide: altSideRef.current,
+      chapterChild: item.commanderType === 'chapter',
       item,
     };
   };
@@ -3584,7 +3583,8 @@ function useLifecycle(
   // the 2s polls (toTtsQueue mints fresh objects every poll, same content).
   const sameItemRender = (a: TtsItem, b: TtsItem): boolean =>
     a.status === b.status && a.text === b.text && a.route === b.route &&
-    a.senderName === b.senderName && a.persona === b.persona;
+    a.senderName === b.senderName && a.persona === b.persona &&
+    a.commanderType === b.commanderType && a.playbackTarget === b.playbackTarget;
 
   // ── THE FLEET DRIVER — mirror the registered fleet onto the worker rails ────
   // Side assignment is sticky per instance (chosen at first sight, shorter rail
@@ -3690,7 +3690,9 @@ function useLifecycle(
     const nextAgents = liveTts.map((item) => {
       const existing = prevAgentsById.get(item.id);
       if (!existing) return mintLiveAgent(item);
-      return sameItemRender(existing.item, item) ? existing : { ...existing, item };
+      return sameItemRender(existing.item, item)
+        ? existing
+        : { ...existing, item, chapterChild: item.commanderType === 'chapter' };
     });
     setTtsAgents((cur) =>
       cur.length === nextAgents.length && cur.every((a, i) => a === nextAgents[i])

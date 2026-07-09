@@ -218,3 +218,20 @@ def test_quiet_hours_win_over_custodes_bypass(app_env, monkeypatch) -> None:
     assert result == {"success": True, "queued": False, "reason": "quiet_hours"}
     assert len(tts.hot_queue) == 0
     assert len(tts.pause_queue) == 0
+
+
+def test_queue_status_includes_sender_persona_metadata(app_env, monkeypatch) -> None:
+    tts = _load_tts()
+    _quiet_world(tts, monkeypatch)
+    iid = _insert_voiced_instance(app_env.db_path, persona_slug="blood-angels")
+
+    result = asyncio.run(tts.queue_tts(iid, "metadata line", queue_target="pause"))
+
+    assert result["queued"] is True
+    status = tts.get_tts_queue_status()
+    item = status["pause_queue"][0]
+    assert item["instance_id"] == iid
+    assert item["persona_slug"] == "blood-angels"
+    assert item["persona_display_name"]
+    assert item["commander_type"]
+    assert item["playback_target"] == "mac"
