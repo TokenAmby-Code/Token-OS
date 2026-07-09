@@ -2,8 +2,8 @@
 // components never call endpoints ad-hoc. Each hook owns one read-model.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Counts, OpsState, SessionDocsFeed, TimerHistory, TtsGlobalMode } from './contracts';
-import { CONTRACT_VERSION, OpsStateSchema, SessionDocsFeedSchema, TimerHistorySchema } from './contracts';
+import type { Counts, OpsState, TimerHistory, TtsGlobalMode } from './contracts';
+import { CONTRACT_VERSION, OpsStateSchema, TimerHistorySchema } from './contracts';
 
 export type Feed<T> = {
   data: T | null;
@@ -137,23 +137,6 @@ export function useOpsState(intervalMs = 2000): Feed<OpsState> {
     async (signal) =>
       normalizeOpsState(
         boundaryValidate('ops-state', OpsStateSchema, await getJson<OpsState>('/api/ui/ops/state', signal)),
-      ),
-    intervalMs,
-  );
-}
-
-/**
- * Session-doc pipeline feed for the Muster Ledger. Docs change on the cadence
- * of Obsidian edits, not agent heartbeats — polled slowly (30s); liveness
- * comes from joining the fast useOpsState feed client-side.
- */
-export function useSessionDocs(intervalMs = 30000): Feed<SessionDocsFeed> {
-  return usesPolling<SessionDocsFeed>(
-    async (signal) =>
-      boundaryValidate(
-        'session-docs',
-        SessionDocsFeedSchema,
-        await getJson<SessionDocsFeed>('/api/ui/ops/session-docs', signal),
       ),
     intervalMs,
   );
