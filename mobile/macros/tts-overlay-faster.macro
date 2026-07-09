@@ -2,12 +2,12 @@
   "macroExportVersion": 1,
   "macro": {
     "m_name": "TTS Overlay Faster",
-    "m_enabled": true,
+    "m_enabled": false,
     "m_completed": true,
     "m_GUID": 0,
     "m_category": "Notify",
     "aiGenerated": 1,
-    "m_description": "Floating TTS faster control. The button calls /tts-control locally; /tts-control forwards to Token-OS before any local-control echo executes.",
+    "m_description": "Retired: speed/faster controls are disabled for one-chunk phone TTS v1.",
     "m_triggerList": [
       {
         "identifier": "tts-faster",
@@ -94,7 +94,7 @@
           "saveResponseUseAllFilesAccess": false,
           "saveReturnCodeToVariable": true,
           "saveReturnHeadersToVariable": false,
-          "urlToOpen": "http://127.0.0.1:7777/tts-control?command=faster&source=overlay",
+          "urlToOpen": "http://127.0.0.1:7777/tts-control?command=speed&source=overlay",
           "useAllFilesAccess": false,
           "useLocalFileUri": false,
           "useStaticContentBodyFile": true
