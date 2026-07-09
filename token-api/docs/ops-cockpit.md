@@ -26,6 +26,7 @@ FastAPI routes:
 - `GET /ui/ops` returns `ui/ops/index.html`.
 - `GET /ui/ops/{asset_path}` returns built assets, guarded against path traversal and arbitrary file exposure.
 - `GET /api/ui/ops/state` returns the aggregate cockpit read model.
+- Data roadmap: `token-api/docs/ops-cockpit-data-roadmap.md` captures the TypeScript-daemon ownership direction, passthrough/no-state doctrine, error propagation requirements, and phased TTS/dial/occupancy/lifecycle work.
 
 The frontend polls `/api/ui/ops/state` every 2 seconds. Live acceptance confirmed that the browser surface updates when desktop/phone attention state changes, including opening a distraction.
 

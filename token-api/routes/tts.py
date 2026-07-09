@@ -1108,6 +1108,9 @@ class TTSQueueItem:
     tmux_pane: str | None = None  # live-resolved pane id for @TTS_STATE tracking (set at playback)
     focus_on_playback: bool = False  # true only for explicit operator-initiated playback
     playback_target: str | None = None  # resolved non-null audio target at enqueue time
+    persona_slug: str | None = None
+    persona_display_name: str | None = None
+    commander_type: str | None = None
     started_at: str | None = None  # ISO; stamped when the worker begins audible playback
     # Future resolved by the worker when this item reaches a terminal playback
     # state (success/skip/fail/muted/exception). The single front door
@@ -1209,6 +1212,8 @@ _SYSTEM_TTS_ROW: dict[str, object] = {
     "notification_sound": "chimes.wav",
     "tts_mode": "verbose",
     "persona_slug": "system",
+    "persona_display_name": "System",
+    "commander_type": "system",
     "advisor": True,  # jump ahead of the pause queue, but the worker still
     # serializes — a system ping waits out whatever is currently audible.
     "tts_policy": "hot",
@@ -1408,16 +1413,17 @@ def _split_phone_utterance_text(text: str, *, max_chars: int | None = None) -> t
     return current, next_text
 
 
-def build_phone_tts_chunk_handoff(
+def build_one_utterance_tts_chunk_handoff(
     chunks: list[dict], *, max_chars: int | None = None
 ) -> list[dict]:
-    """Build one full-utterance phone handoff.
+    """Build one full-utterance backend handoff from sanitized chunks.
 
-    Phone v1 no longer streams/backfills intra-message chunks. Token-OS sends
-    exactly one ``/tts-chunk`` payload containing the complete sanitized message;
-    MacroDroid speaks it once and reports ``buffer_drained`` when finished.
+    Phone and WSL execute exactly one full utterance per Token-API TTS
+    message. Token-API may still split text internally for legacy contracts,
+    but backend handoff collapses those prepared chunks into a single ``1/1``
+    chunk with integrity metadata for the full rendered text.
     """
-    del max_chars  # Kept for test/back-compat call sites; phone does not split here.
+    del max_chars  # Kept for test/back-compat call sites; backends do not split here.
     texts = [str(chunk.get("text") or "").strip() for chunk in chunks]
     full_text = " ".join(text for text in texts if text).strip()
     if not full_text:
@@ -1436,6 +1442,17 @@ def build_phone_tts_chunk_handoff(
             "text_hash": hashlib.sha256(full_text.encode("utf-8")).hexdigest(),
         }
     ]
+
+
+def build_phone_tts_chunk_handoff(
+    chunks: list[dict], *, max_chars: int | None = None
+) -> list[dict]:
+    """Build one full-utterance phone handoff.
+
+    Compatibility wrapper for older call sites/tests. Phone v1 no longer
+    streams/backfills intra-message chunks.
+    """
+    return build_one_utterance_tts_chunk_handoff(chunks, max_chars=max_chars)
 
 
 def _backend_chunk_payload(
@@ -1691,6 +1708,69 @@ def dispatch_tts_chunks_to_backend(
             "backend": backend,
             "chunks": real_chunks,
             "completed_chunks": real_chunks,
+            "playback_id": result.get("playback_id"),
+            "playback_confirmed": result.get("playback_confirmed"),
+            "results": [result],
+        }
+
+    if backend == "wsl":
+        wsl_chunks = build_one_utterance_tts_chunk_handoff(chunks)
+        if not wsl_chunks:
+            return {"success": False, "error": "empty_audio_payload", "method": None}
+        chunk = wsl_chunks[0]
+        _record_tts_backend_active(
+            backend,
+            playback_id=chunk["playback_id"],
+            current=_chunk_public_payload(chunk),
+            next_chunk=None,
+        )
+        payload = _backend_chunk_payload(chunk, None, rate=wsl_rate or rate)
+        result = dict(
+            _post_wsl_chunk(payload, voice=wsl_voice or voice, rate=wsl_rate or rate) or {}
+        )
+        result.setdefault("chunk_id", chunk["chunk_id"])
+        result.setdefault("playback_id", chunk["playback_id"])
+        if result.get("skipped"):
+            return {
+                "success": False,
+                "skipped": True,
+                "method": result.get("method") or backend,
+                "chunks": 1,
+                "completed_chunks": 0,
+                "chunk_id": chunk["chunk_id"],
+                "playback_id": result.get("playback_id"),
+                "results": [result],
+                "reason": "skipped",
+            }
+        if not result.get("success"):
+            error = result.get("error") or "backend_chunk_failed"
+            _update_tts_authoritative_state(
+                last_error={
+                    "backend": backend,
+                    "playback_id": chunk["playback_id"],
+                    "chunk_id": chunk["chunk_id"],
+                    "error": error,
+                    "reported_at": _now_iso(),
+                }
+            )
+            return {
+                "success": False,
+                "error": error,
+                "method": result.get("method") or backend,
+                "chunks": 1,
+                "completed_chunks": 0,
+                "chunk_id": chunk["chunk_id"],
+                "playback_id": result.get("playback_id"),
+                "results": [result],
+                "reason": result.get("reason") or error,
+            }
+        return {
+            "success": True,
+            "method": result.get("method") or backend,
+            "backend": backend,
+            "chunks": 1,
+            "completed_chunks": 1,
+            "chunk_id": chunk["chunk_id"],
             "playback_id": result.get("playback_id"),
             "playback_confirmed": result.get("playback_confirmed"),
             "results": [result],
@@ -2350,7 +2430,8 @@ async def queue_tts(
                 """SELECT i.name, p.tts_voice, p.notification_sound,
                           CASE WHEN i.interaction_mode = 'voice_chat'
                                THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
-                          p.slug AS persona_slug, p.tts_policy AS tts_policy,
+                          p.slug AS persona_slug, p.display_name AS persona_display_name,
+                          p.tts_policy AS tts_policy, i.commander_type AS commander_type,
                           COALESCE(p.advisor, 0) AS advisor
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
@@ -2385,6 +2466,18 @@ async def queue_tts(
     # Astartes already resolve, so normal speech is unaffected.
     tts_policy = row["tts_policy"]
     persona_slug = row["persona_slug"]
+    persona_display_name = row["persona_display_name"]
+    commander_type = row["commander_type"]
+
+    def _system_audio_with_sender_metadata() -> dict[str, object]:
+        system_row = dict(_SYSTEM_TTS_ROW)
+        system_row.update(
+            persona_slug=persona_slug,
+            persona_display_name=persona_display_name,
+            commander_type=commander_type,
+        )
+        return system_row
+
     if tts_policy not in ("silent", "hot", "pause"):
         logger.warning(
             "TTS denied (persona_unresolved): instance=%s persona_slug=%r "
@@ -2407,7 +2500,7 @@ async def queue_tts(
             persona_slug,
             message[:80],
         )
-        row = _SYSTEM_TTS_ROW
+        row = _system_audio_with_sender_metadata()
 
     # Belt-and-suspenders: an independent silence guarantee. A voiced policy
     # without a resolved persona voice still must not speak unless this is an
@@ -2421,7 +2514,7 @@ async def queue_tts(
             persona_slug,
             message[:80],
         )
-        row = _SYSTEM_TTS_ROW
+        row = _system_audio_with_sender_metadata()
 
     voice = row["tts_voice"]
     sound = row["notification_sound"]
@@ -2451,29 +2544,19 @@ async def queue_tts(
         logger.info(f"TTS suppressed (silent mode): {message[:80]}")
         return {"success": True, "queued": False, "reason": "silent"}
 
-    if effective_mode == "muted":
-        # Sound only, no TTS speech
-        item = TTSQueueItem(
-            instance_id=instance_id,
-            message="",  # Empty message = no speech
-            voice=voice,
-            sound=sound,
-            name=name,
-            queue_target=queue_target,
-            focus_on_playback=False,
-            completion=completion,
-        )
-    else:
-        item = TTSQueueItem(
-            instance_id=instance_id,
-            message=message,
-            voice=voice,
-            sound=sound,
-            name=name,
-            queue_target=queue_target,
-            focus_on_playback=False,
-            completion=completion,
-        )
+    item = TTSQueueItem(
+        instance_id=instance_id,
+        message="" if effective_mode == "muted" else message,
+        voice=voice,
+        sound=sound,
+        name=name,
+        queue_target=queue_target,
+        focus_on_playback=False,
+        persona_slug=row["persona_slug"],
+        persona_display_name=row["persona_display_name"],
+        commander_type=row["commander_type"],
+        completion=completion,
+    )
 
     target = _resolve_queue_playback_target(
         message=item.message,
@@ -2809,6 +2892,9 @@ def _queue_item_to_dict(item: TTSQueueItem) -> dict:
         "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
         "voice": item.voice,
         "playback_target": item.playback_target,
+        "persona_slug": item.persona_slug,
+        "persona_display_name": item.persona_display_name,
+        "commander_type": item.commander_type,
         "queue": item.queue_target,
         "queued_at": item.queued_at.isoformat(),
     }
@@ -2835,6 +2921,9 @@ def get_tts_queue_status() -> dict:
             else current_item.message,
             "voice": current_item.voice,
             "playback_target": current_item.playback_target,
+            "persona_slug": current_item.persona_slug,
+            "persona_display_name": current_item.persona_display_name,
+            "commander_type": current_item.commander_type,
             "started_at": current_item.started_at,
         }
 
@@ -2968,13 +3057,6 @@ def _echo_tts_control_to_backend(backend: str | None, payload: dict) -> dict:
 
     action = payload["action"]
     if backend == "phone":
-        if action in {"pause", "resume"}:
-            return {
-                "success": False,
-                "backend": backend,
-                "error": "phone_pause_unsupported",
-                "reason": "phone_pause_unsupported",
-            }
         if _send_to_phone is None:
             return {"success": False, "backend": backend, "error": "phone_transport_unavailable"}
         params = {

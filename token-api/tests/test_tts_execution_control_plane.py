@@ -232,7 +232,9 @@ def test_wsl_chunk_dispatch_uses_satellite_speak_text_file_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tts = _load_tts()
-    chunks = tts.build_tts_chunk_handoff("WSL chunk dispatch integrity line")
+    chunks = tts.build_tts_chunk_handoff(
+        "First WSL dispatch sentence. Second WSL dispatch sentence.", max_chars=35
+    )
     observed = {}
 
     def fake_speak_tts_wsl(message: str, voice: str, rate: int = 0, **_kwargs):
@@ -253,15 +255,22 @@ def test_wsl_chunk_dispatch_uses_satellite_speak_text_file_transport(
 
     assert result["success"] is True
     assert result["backend"] == "wsl"
+    assert result["chunks"] == 1
     assert result["completed_chunks"] == 1
+    assert len(result["results"]) == 1
     assert result["method"] == "wsl_sapi"
     assert observed == {
-        "message": "WSL chunk dispatch integrity line",
+        "message": "First WSL dispatch sentence. Second WSL dispatch sentence.",
         "voice": "Microsoft David",
         "rate": 1,
     }
-    assert result["results"][0]["chunk_id"] == chunks[0]["chunk_id"]
-    assert result["results"][0]["playback_id"] == chunks[0]["playback_id"]
+    assert result["results"][0]["chunk_id"] == result["chunk_id"]
+    assert result["results"][0]["playback_id"] == result["playback_id"]
+    assert (
+        tts.TTS_AUTHORITATIVE_STATE["current"]["text"]
+        == "First WSL dispatch sentence. Second WSL dispatch sentence."
+    )
+    assert tts.TTS_AUTHORITATIVE_STATE["next"] is None
     assert result["results"][0]["transport"] == "wsl_sapi_text_file"
 
 
@@ -289,9 +298,10 @@ def test_wsl_chunk_dispatch_stops_on_text_integrity_mismatch(
     assert result["success"] is False
     assert result["error"] == "satellite_text_integrity_check_failed"
     assert result["completed_chunks"] == 0
-    assert calls == ["first sentence."]
+    assert calls == ["first sentence. second sentence."]
     assert len(result["results"]) == 1
-    assert result["results"][0]["chunk_id"] == chunks[0]["chunk_id"]
+    assert result["results"][0]["chunk_id"] == result["chunk_id"]
+    assert result["results"][0]["playback_id"] == result["playback_id"]
 
 
 def test_phone_chunk_next_is_compatibility_done() -> None:
