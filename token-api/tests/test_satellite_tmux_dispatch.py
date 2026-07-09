@@ -2,6 +2,8 @@ import hashlib
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def _load_satellite_module():
     path = Path(__file__).resolve().parents[1] / "token-satellite.py"
@@ -320,7 +322,9 @@ def test_runtime_refresh_spawns_helper_with_sha_and_manifest(monkeypatch, tmp_pa
     assert kwargs["start_new_session"] is True
 
 
-def test_tts_engine_synth_and_speak_plays_wav_artifact_not_text(monkeypatch, tmp_path):
+def test_tts_engine_synth_and_speak_plays_wav_artifact_not_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     satellite = _load_satellite_module()
     engine = satellite.TTSEngine()
     synth_result = {
@@ -350,7 +354,9 @@ def test_tts_engine_synth_and_speak_plays_wav_artifact_not_text(monkeypatch, tmp
     assert "speak" not in called
 
 
-def test_tts_engine_wav_playback_returns_artifact_metadata(monkeypatch, tmp_path):
+def test_tts_engine_wav_playback_returns_artifact_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     satellite = _load_satellite_module()
     engine = satellite.TTSEngine()
     wav_path = tmp_path / "fixed-id.wav"
@@ -393,7 +399,7 @@ def test_tts_engine_wav_playback_returns_artifact_metadata(monkeypatch, tmp_path
     assert popen_calls[0][0][0] == satellite.POWERSHELL_EXE
 
 
-def test_tts_engine_wav_stop_marks_playback_skipped(monkeypatch):
+def test_tts_engine_wav_stop_marks_playback_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
     satellite = _load_satellite_module()
     engine = satellite.TTSEngine()
     terminated = {}
@@ -416,7 +422,7 @@ def test_tts_engine_wav_stop_marks_playback_skipped(monkeypatch):
     assert terminated == {"terminate": True, "wait_timeout": 3}
 
 
-def test_tts_engine_wav_pause_resume_returns_unsupported():
+def test_tts_engine_wav_pause_resume_returns_unsupported() -> None:
     satellite = _load_satellite_module()
     engine = satellite.TTSEngine()
     engine._playing = True

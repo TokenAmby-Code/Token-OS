@@ -3,6 +3,8 @@ import importlib
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_tts_routes():
     token_api_dir = Path(__file__).resolve().parents[1]
@@ -90,7 +92,9 @@ def test_speak_tts_wsl_accepts_success_with_matching_rendered_hash(monkeypatch):
     assert result["rendered_hash"] == rendered_hash
 
 
-def test_speak_tts_wsl_file_playback_posts_to_synth_and_play_without_timeout(monkeypatch):
+def test_speak_tts_wsl_file_playback_posts_to_synth_and_play_with_finite_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tts = _load_tts_routes()
     message = "full wav playback path"
     rendered_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
@@ -119,6 +123,6 @@ def test_speak_tts_wsl_file_playback_posts_to_synth_and_play_without_timeout(mon
     result = tts.speak_tts_wsl(message, "Microsoft David", use_file_playback=True)
 
     assert observed["url"] == "http://wsl.local:7777/tts/synth-and-play"
-    assert observed["timeout"] is None
+    assert observed["timeout"] >= 3600
     assert result["success"] is True
     assert result["transport"] == "wsl_sapi_wav_file"

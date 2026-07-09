@@ -605,9 +605,9 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
         resp = requests.post(
             f"http://{host}:{port}{endpoint}",
             json=payload,
-            timeout=None
+            timeout=max(3600, len(message) * 3)
             if use_file_playback
-            else 300,  # WAV artifact playback waits until completion
+            else 300,  # Finite guard; sized beyond normal WAV playback
         )
         TTS_BACKEND["current"] = None
 
@@ -1603,12 +1603,13 @@ def _send_phone_tts_chunk(payload: dict) -> dict:
 
 
 def _post_wsl_chunk(payload: dict, *, voice: str | None, rate: int = 0) -> dict:
-    """Send one queued Token-API chunk through the WSL satellite's SAPI transport.
+    """Send one queued Token-API chunk through WSL WAV artifact playback.
 
-    The live satellite's real playback surface is /tts/speak; it writes the text
-    to a temp file on the WSL side and returns rendered_chars/rendered_hash as an
-    integrity ack. Keep Token-API's current/next chunk state here, but do not
-    require a separate satellite /tts/chunk endpoint.
+    The satellite receives the full utterance through /tts/synth-and-play,
+    synthesizes it to a WAV file, plays that artifact, and returns
+    rendered_chars/rendered_hash as the full-text integrity ack. Keep
+    Token-API's current/next chunk state here; do not require a separate
+    satellite /tts/chunk endpoint.
     """
     chunk_id = payload.get("chunk_id")
     playback_id = payload.get("playback_id")
@@ -2563,9 +2564,9 @@ async def queue_tts(
         name=name,
         queue_target=queue_target,
         focus_on_playback=False,
-        persona_slug=row["persona_slug"],
-        persona_display_name=row["persona_display_name"],
-        commander_type=row["commander_type"],
+        persona_slug=persona_slug,
+        persona_display_name=persona_display_name,
+        commander_type=commander_type,
         completion=completion,
     )
 

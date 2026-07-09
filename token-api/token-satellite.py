@@ -226,6 +226,7 @@ class TTSEngine:
         self._current_rate: int = 0
         self._playback_process: subprocess.Popen | None = None
         self._playback_windows_pid: int | None = None
+        self._playback_lock = threading.Lock()
 
     def _write_script(self):
         """Write the PS script to a Windows-accessible path."""
@@ -301,10 +302,27 @@ class TTSEngine:
 
     def skip(self) -> bool:
         """Cancel current speech (direct SAPI or WAV artifact playback)."""
-        if self._playing and self._playback_process is not None:
+        with self._playback_lock:
+            playback_active = self._playing
+            playback_proc = self._playback_process
+        if playback_active and playback_proc is not None:
             self._was_skipped = True
             self._terminate_wav_playback()
             return True
+        if playback_active:
+            # Startup/shutdown edge: avoid silently dropping a stop while the
+            # playback process handle is being published or cleared.
+            for _ in range(10):
+                time.sleep(0.01)
+                with self._playback_lock:
+                    playback_proc = self._playback_process
+                    playback_active = self._playing
+                if playback_proc is not None:
+                    self._was_skipped = True
+                    self._terminate_wav_playback()
+                    return True
+                if not playback_active:
+                    break
         if not self._speaking or self._process is None:
             return False
         with self._io_lock:
@@ -525,7 +543,8 @@ class TTSEngine:
         )
 
     def _terminate_wav_playback(self) -> None:
-        proc = self._playback_process
+        with self._playback_lock:
+            proc = self._playback_process
         if proc is None or proc.poll() is not None:
             return
         try:
@@ -540,22 +559,22 @@ class TTSEngine:
     def _play_wav_file(self, synth_result: dict) -> dict:
         """Play a synthesized WAV artifact with SoundPlayer.PlaySync()."""
         wav_path_win = synth_result["wav_path_win"]
-        wav_path_wsl = synth_result["wav_path_wsl"]
-        if not os.path.exists(wav_path_wsl):
+        wav_path_wsl = Path(synth_result["wav_path_wsl"])
+        if not wav_path_wsl.exists():
             return {"success": False, "error": f"WAV file missing: {wav_path_wsl}"}
 
-        os.makedirs(self.PLAY_SCRIPT_DIR_WSL, exist_ok=True)
-        fd, script_path_wsl = tempfile.mkstemp(
-            prefix="token_tts_play_", suffix=".ps1", dir=self.PLAY_SCRIPT_DIR_WSL
+        play_script_dir_wsl = Path(self.PLAY_SCRIPT_DIR_WSL)
+        play_script_dir_wsl.mkdir(parents=True, exist_ok=True)
+        fd, script_path_raw = tempfile.mkstemp(
+            prefix="token_tts_play_", suffix=".ps1", dir=str(play_script_dir_wsl)
         )
         os.close(fd)
-        script_path_win = self.PLAY_SCRIPT_DIR_WIN + "\\" + os.path.basename(script_path_wsl)
-        with open(script_path_wsl, "w", encoding="utf-8") as f:
-            f.write(self._wav_player_script(wav_path_win))
+        script_path_wsl = Path(script_path_raw)
+        script_path_win = self.PLAY_SCRIPT_DIR_WIN + "\\" + script_path_wsl.name
+        script_path_wsl.write_text(self._wav_player_script(wav_path_win), encoding="utf-8")
 
         self._was_skipped = False
-        self._playing = True
-        self._current_file = wav_path_wsl
+        self._current_file = str(wav_path_wsl)
         try:
             proc = subprocess.Popen(
                 [
@@ -570,8 +589,10 @@ class TTSEngine:
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            self._playback_process = proc
-            self._playback_windows_pid = proc.pid
+            with self._playback_lock:
+                self._playing = True
+                self._playback_process = proc
+                self._playback_windows_pid = proc.pid
             stdout, stderr = proc.communicate(timeout=None)
             skipped = self._was_skipped or proc.returncode < 0
             if proc.returncode not in (0, None) and not skipped:
@@ -585,20 +606,21 @@ class TTSEngine:
                 "transport": "wsl_sapi_wav_file",
                 "file_id": synth_result.get("file_id"),
                 "wav_path_win": wav_path_win,
-                "wav_path_wsl": wav_path_wsl,
+                "wav_path_wsl": str(wav_path_wsl),
                 "playback_pid": self._playback_windows_pid,
                 "rendered_chars": synth_result.get("rendered_chars"),
                 "rendered_hash": synth_result.get("rendered_hash"),
                 "message_chars": synth_result.get("message_chars"),
             }
         finally:
-            self._playing = False
+            with self._playback_lock:
+                self._playing = False
+                self._playback_process = None
+                self._playback_windows_pid = None
             self._play_paused = False
             self._current_file = None
-            self._playback_process = None
-            self._playback_windows_pid = None
             try:
-                os.unlink(script_path_wsl)
+                script_path_wsl.unlink()
             except OSError:
                 pass
 
