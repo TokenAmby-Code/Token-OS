@@ -483,12 +483,16 @@ class TmuxControlPlane:
     def ledger_reconcile(self) -> dict:
         """Rebuild active wrapper-ledger rows and reconcile pane chrome from it.
 
-        Pane chrome is a pure derivative of the wrapper→pane bind ledger.  After
-        the active rows are rebuilt from live tmux, every dispatch-available pane
-        (no active ledger row, no live agent, not a singleton, past boot grace) is
-        scrubbed in the same reconcile pass.  This makes a released bind release
-        tint/title/runtime chrome transactionally instead of relying on post-hoc
-        clear guards or a later close path.
+        Pane chrome is a pure derivative of the wrapper→pane bind ledger when
+        bind truth is trustworthy. After active rows are rebuilt from live tmux,
+        unbound non-singleton panes without a live agent are scrubbed and reported
+        via ``chrome_scrubbed_unbound_panes``/``*_count``. Unbound panes with a
+        live agent are split-brain bind divergences, not free residue; they are
+        excluded from scrubbing and reported via
+        ``chrome_unbound_live_divergences``/``*_count`` with reason
+        ``live_agent_without_bind``. This lets a released bind release
+        tint/title/runtime chrome transactionally without erasing live TUIs whose
+        bind has failed to land.
         """
         from .wrapper_ledger import LEDGER
 
@@ -497,19 +501,32 @@ class TmuxControlPlane:
         from .occupancy import scan_ledger_dispatch_availability
 
         scrubbed: list[str] = []
+        live_divergences: list[dict[str, str]] = []
         for pane in scan_ledger_dispatch_availability(self.adapter):
-            # chrome = f(bind): a non-singleton pane with no active instance bind
-            # must not carry tint/title/runtime chrome, even if a bare shell or a
-            # hollow legacy wrapper stamp keeps it out of the freelist for this
-            # pass.  Clearing runtime state here also removes that hollow stamp so
-            # the next ledger reconcile cannot resurrect it as occupancy.
+            # chrome = f(bind), but only when the bind truth is trustworthy.  A
+            # live TUI with no active bind is split-brain, not free residue; do
+            # not erase operator-visible chrome from a running agent until the
+            # liveness/bind-repair lane can reconcile it.  Report it loudly so
+            # callers can route the divergence instead of mistaking it for a
+            # clean free slot.
             if pane.singleton or pane.instance_id:
+                continue
+            if pane.live_agent:
+                live_divergences.append(
+                    {
+                        "pane": pane.pane_id,
+                        "pane_label": pane.pane_role or "",
+                        "reason": "live_agent_without_bind",
+                    }
+                )
                 continue
             target = pane.pane_id
             self.adapter.clear_runtime_state(target)
             scrubbed.append(target)
         out["chrome_scrubbed_unbound_panes"] = scrubbed
         out["chrome_scrubbed_unbound_count"] = len(scrubbed)
+        out["chrome_unbound_live_divergences"] = live_divergences
+        out["chrome_unbound_live_divergence_count"] = len(live_divergences)
         return out
 
     def freelist(self) -> list[dict]:

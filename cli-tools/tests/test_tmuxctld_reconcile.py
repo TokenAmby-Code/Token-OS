@@ -716,9 +716,8 @@ def test_ledger_reconcile_does_not_scrub_ledger_bound_or_singleton_panes(monkeyp
 def test_ledger_reconcile_scrubs_unbound_nonfree_hollow_slot(monkeypatch):
     """Unbound chrome drift is scrubbed even before the pane reaches freelist.
 
-    Live proof exposed a slot with @INSTANCE_ID empty but a hollow wrapper row and
-    a bare shell keeping it out of the freelist. Since chrome derives from bind,
-    reconcile must scrub it on the unbound ledger state, not wait for freelist.
+    A hollow wrapper row can keep a bare shell out of freelist for one pass. Since
+    chrome derives from bind, reconcile scrubs when no live TUI is present.
     """
 
     class HollowAdapter:
@@ -744,9 +743,48 @@ def test_ledger_reconcile_scrubs_unbound_nonfree_hollow_slot(monkeypatch):
 
     adapter = HollowAdapter()
     control = TmuxControlPlane(adapter=adapter)
-    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: True)
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
 
     out = control.ledger_reconcile()
 
     assert out["chrome_scrubbed_unbound_panes"] == ["%22"]
     assert adapter.cleared == ["%22"]
+
+
+def test_ledger_reconcile_refuses_to_scrub_unbound_live_tui_divergence(monkeypatch):
+    """Live TUI + empty bind is split-brain, not free chrome residue."""
+
+    class LiveTuiAdapter:
+        def __init__(self):
+            self.cleared = []
+
+        def run(self, *args, allow_failure=False):  # noqa: ARG002
+            if args[:2] == ("list-panes", "-a"):
+                fmt = args[-1]
+                if "TOKEN_API_WRAPPER_ID" in fmt:
+                    return ""
+                return "%22\tsomnium:N\tsomnium\t4242\t0"
+            return ""
+
+        def clear_runtime_state(self, target):
+            self.cleared.append(target)
+
+    adapter = LiveTuiAdapter()
+    control = TmuxControlPlane(adapter=adapter)
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: True)
+    monkeypatch.setattr(
+        "tmuxctl.wrapper_ledger.LEDGER.reconcile_from_tmux", lambda a: {"open_rows": 0}
+    )
+
+    out = control.ledger_reconcile()
+
+    assert out["chrome_scrubbed_unbound_panes"] == []
+    assert adapter.cleared == []
+    assert out["chrome_unbound_live_divergences"] == [
+        {
+            "pane": "%22",
+            "pane_label": "somnium:N",
+            "reason": "live_agent_without_bind",
+        }
+    ]
+    assert out["chrome_unbound_live_divergence_count"] == 1
