@@ -68,11 +68,10 @@ def _insert_instance_with_pr(pr_url, pr_state="open"):
     now = datetime.now().isoformat()
     conn = sqlite3.connect(_TEST_DB_PATH)
     conn.execute(
-        """INSERT INTO legacy_instances
-           (id, session_id, tab_name, working_dir, origin_type, device_id,
-            status, registered_at, last_activity, pr_url, pr_state)
-           VALUES (?, ?, ?, '/tmp', 'local', 'Mac-Mini', 'idle', ?, ?, ?, ?)""",
-        (iid, str(uuid.uuid4()), f"t-{iid[:8]}", now, now, pr_url, pr_state),
+        """INSERT INTO instances
+           (id, name, engine, working_dir, origin_type, device_id, status, created_at, last_activity, pr_url, pr_state)
+           VALUES (?, ?, 'codex', '/tmp', 'local', 'Mac-Mini', 'idle', ?, ?, ?, ?)""",
+        (iid, f"t-{iid[:8]}", now, now, pr_url, pr_state),
     )
     conn.commit()
     conn.close()
@@ -81,7 +80,7 @@ def _insert_instance_with_pr(pr_url, pr_state="open"):
 
 def _pr_state(iid):
     conn = sqlite3.connect(_TEST_DB_PATH)
-    row = conn.execute("SELECT pr_state FROM legacy_instances WHERE id = ?", (iid,)).fetchone()
+    row = conn.execute("SELECT pr_state FROM instances WHERE id = ?", (iid,)).fetchone()
     conn.close()
     return row[0] if row else None
 
@@ -219,6 +218,49 @@ def test_distinct_sha_not_coalesced(client, spawned):
     assert first.status_code == 200 and second.status_code == 200
     assert "scheduled" in first.json()["restart"]
     assert "scheduled" in second.json()["restart"]
+    assert len(_self_restarts(spawned)) == 2
+
+
+def test_restart_scheduled_before_administratum_delivery_failure(
+    client, spawned, app_env, monkeypatch
+):
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("malformed frontmatter")
+
+    monkeypatch.setattr(app_env.main, "handle_custodes_state_event", _boom)
+    resp = client.post(
+        "/api/cd/restart",
+        json={"sha": "admfail", "pr_url": "https://github.com/o/r/pull/777"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(_self_restarts(spawned)) == 1
+    body = resp.json()
+    assert "scheduled" in body["restart"]
+    assert body["administratum_delivery"]["degraded"] is True
+    assert "malformed frontmatter" in body["administratum_delivery"]["error"]
+
+
+def test_pr_merged_dedupe_occurs_before_injection(client, spawned, app_env, monkeypatch):
+    deliveries = []
+
+    async def _record(*args, **kwargs):
+        deliveries.append((args, kwargs))
+        return {"delivered": True}
+
+    monkeypatch.setattr(app_env.main, "handle_custodes_state_event", _record)
+    payload = {"sha": "same-sha", "pr_url": "https://github.com/o/r/pull/640"}
+    first = client.post("/api/cd/restart", json=payload, headers=_auth())
+    # Force the restart coalescing window open so this proves injection-layer durable dedupe,
+    # not the older spawn coalescer.
+    monkeypatch.setattr(app_env.main, "_cd_last_restart_spawn", 0.0, raising=False)
+    second = client.post("/api/cd/restart", json=payload, headers=_auth())
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert len(deliveries) == 1
+    assert first.json()["administratum_delivery_claimed"] is True
+    assert second.json()["administratum_delivery_claimed"] is False
+    assert second.json()["administratum_delivery"]["deduped"] is True
     assert len(_self_restarts(spawned)) == 2
 
 

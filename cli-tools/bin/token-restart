@@ -360,6 +360,7 @@ DEPLOY_REDEPLOY_MAX=3
 # no-advance → full-restart fallback (a trailing run that finds nothing new must
 # no-op, not bounce every service).
 DEPLOY_COALESCE_TRAILING=false
+SIDECAR_DEGRADED=()
 
 # PID recorded in the lockdir owner file ("<pid> <sha>"), or empty/unreadable.
 deploy_lock_owner_pid() {
@@ -502,6 +503,7 @@ _reset_deploy_run_state() {
     RESTART_WSL=false
     REFRESH_WSL=false
     RESTART_MOBILE=false
+    SIDECAR_DEGRADED=()
 }
 
 # Serialize full_restart under the deploy mutex with trailing coalescing. If a
@@ -517,7 +519,9 @@ run_coalesced_deploy() {
     [[ -n "$target" ]] || \
         target="$(git --git-dir="$TOKEN_OS_BARE_REPO" rev-parse -q --verify refs/heads/main 2>/dev/null || true)"
 
-    if ! deploy_lock_acquire "$target"; then
+    if [[ "${TOKEN_RESTART_ADOPT_LOCK:-}" == "1" && "$(deploy_lock_owner_pid 2>/dev/null || true)" == "$$" ]]; then
+        DEPLOY_LOCK_HELD=true
+    elif ! deploy_lock_acquire "$target"; then
         return 0
     fi
 
@@ -541,6 +545,13 @@ run_coalesced_deploy() {
     local iter=0
     while true; do
         while [[ -f "$DEPLOY_LOCKDIR/redeploy-pending" && "$iter" -lt "$DEPLOY_REDEPLOY_MAX" ]]; do
+            if [[ "${TOKEN_RESTART_REEXECED_TRAILING:-}" != "1" ]]; then
+                echo ""
+                echo -e "${BLUE}→${NC} deploy: trailing re-sync queued — re-execing current token-restart before adopting newest deploy logic"
+                export TOKEN_RESTART_ADOPT_LOCK=1
+                export TOKEN_RESTART_REEXECED_TRAILING=1
+                exec "$0" --sync
+            fi
             rm -f "$DEPLOY_LOCKDIR/redeploy-pending" 2>/dev/null || true
             iter=$((iter + 1))
             echo ""
@@ -780,7 +791,7 @@ refresh_discord_daemon_deps_unlocked() {
     if [[ -d "$contracts_dir" ]]; then
         echo -e "${BLUE}→${NC} CD-sync: installing shared contracts deps (daemon consumer)..."
         if ! (cd "$contracts_dir" && npm ci --no-audit --no-fund); then
-            echo -e "  ${RED}✗${NC} CD-sync: contracts npm ci failed; aborting before Discord daemon restart"
+            echo -e "  ${RED}✗${NC} CD-sync: contracts npm ci failed"
             return 1
         fi
     fi
@@ -815,7 +826,7 @@ refresh_discord_daemon_deps_unlocked() {
         echo -e "  ${GREEN}✓${NC} CD-sync: discord-daemon deps installed"
         return 0
     fi
-    echo -e "  ${RED}✗${NC} CD-sync: discord-daemon npm ci failed; aborting before Discord daemon restart"
+    echo -e "  ${RED}✗${NC} CD-sync: discord-daemon npm ci failed"
     return 1
 }
 
@@ -1028,11 +1039,17 @@ _sync_live_checkout_unlocked() {
 
     if [[ "$ops_bundle_dirt" == true ]] || ops_refresh_needed_for_paths "$changed_paths"; then
         SYNC_OPS_REFRESH_REQUIRED=true
-        refresh_ops_bundle_unlocked "$dir" || return 1
+        if ! refresh_ops_bundle_unlocked "$dir"; then
+            SIDECAR_DEGRADED+=("ops-cockpit-bundle-refresh")
+            echo -e "  ${YELLOW}⚠${NC} CD-sync: ops cockpit bundle refresh failed; degrading and continuing to Token-API restart"
+        fi
     fi
 
     if discord_deps_refresh_needed_for_paths "$changed_paths"; then
-        refresh_discord_daemon_deps_unlocked "$dir" || return 1
+        if ! refresh_discord_daemon_deps_unlocked "$dir"; then
+            SIDECAR_DEGRADED+=("discord-daemon-deps-refresh")
+            echo -e "  ${YELLOW}⚠${NC} CD-sync: discord-daemon deps refresh failed; degrading and continuing to Token-API restart"
+        fi
     fi
 
     SYNC_DID_ADVANCE=true
@@ -2026,6 +2043,9 @@ full_restart() {
     if [[ "$RESTART_MOBILE" == true ]]; then
         echo -e "  Mobile:  ${GREEN}●${NC} push-mobile dispatched"
     fi
+    if (( ${#SIDECAR_DEGRADED[@]} > 0 )); then
+        echo -e "  Sidecars:${YELLOW}⚠${NC} degraded (${SIDECAR_DEGRADED[*]})"
+    fi
 }
 
 # ============ Parse Arguments ============
@@ -2056,6 +2076,7 @@ TMUXCTLD_PLIST_CHANGED=false
 RESTART_WSL=false
 REFRESH_WSL=false
 RESTART_MOBILE=false
+SIDECAR_DEGRADED=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

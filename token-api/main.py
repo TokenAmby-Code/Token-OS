@@ -19392,6 +19392,43 @@ async def _cd_flip_pr_merged(pr_url: str) -> int:
     return len(ids)
 
 
+async def _cd_claim_pr_merged_delivery(pr_url: str | None, sha: str | None) -> tuple[bool, str]:
+    """Durably claim pr_merged delivery before Administratum injection.
+
+    The CD webhook can be re-entered for one merge (concurrent restart/manual
+    verification). File-append dedupe is too late: delivery/injection has already
+    fired. This table is keyed on stable event identity and INSERTed before any
+    non-critical event delivery so duplicates skip injection across process
+    restarts.
+    """
+    pr_key = (pr_url or "").strip()
+    sha_key = (sha or "").strip()
+    key = f"pr_merged|{pr_key}|{sha_key}"
+    async with connect_agents_db(DB_PATH) as db:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS cd_event_dedupe ("
+            "dedupe_key TEXT PRIMARY KEY, "
+            "event_type TEXT NOT NULL, "
+            "pr_url TEXT, "
+            "sha TEXT, "
+            "claimed_at TEXT NOT NULL DEFAULT (datetime('now'))"
+            ")"
+        )
+        try:
+            await db.execute(
+                "INSERT INTO cd_event_dedupe (dedupe_key, event_type, pr_url, sha) VALUES (?, ?, ?, ?)",
+                (key, "pr_merged", pr_key or None, sha_key or None),
+            )
+            await db.commit()
+            return True, key
+        except Exception as e:
+            if "UNIQUE" in str(e).upper() or "constraint" in str(e).lower():
+                await db.rollback()
+                return False, key
+            await db.rollback()
+            raise
+
+
 @app.post("/api/cd/restart")
 async def cd_restart(request: Request):
     """CD restart-on-merge webhook. Secret-validated, ack-first, restart-detached.
@@ -19438,22 +19475,11 @@ async def cd_restart(request: Request):
             merged_flips = await _cd_flip_pr_merged(pr_url)
         except Exception as e:
             logger.warning("CD: pr_state→merged flip failed for %s: %s", pr_url, e)
+    # Spawn/schedule token-restart BEFORE non-critical Administratum/state-event
+    # delivery. Administratum logging/frontmatter failures must never block deploy.
     administratum_delivery = None
-    if sha or pr_url:
-        administratum_delivery = await handle_custodes_state_event(
-            "pr_merged",
-            "cd_restart",
-            instance_id=None,
-            severity=1,
-            payload={
-                "sha": sha,
-                "pr_url": pr_url,
-                "services": services,
-                "pr_merged_flips": merged_flips,
-            },
-            event_class="state",
-            quiet_hours_exempt=True,
-        )
+    administratum_dedupe_key = None
+    administratum_delivery_claimed = False
 
     # Spawn ONE detached, git-aware token-restart AFTER acking (the child sleeps so
     # this 200 fully flushes before launchd may kick us). `token-restart --sync`
@@ -19492,12 +19518,50 @@ async def cd_restart(request: Request):
         restart = "scheduled (detached, ~2s)"
         logger.info("CD: token-restart scheduled (sha=%s, services=%s)", sha, services)
 
+    if sha or pr_url:
+        try:
+            (
+                administratum_delivery_claimed,
+                administratum_dedupe_key,
+            ) = await _cd_claim_pr_merged_delivery(
+                pr_url if isinstance(pr_url, str) else None,
+                sha if isinstance(sha, str) else None,
+            )
+            if administratum_delivery_claimed:
+                administratum_delivery = await handle_custodes_state_event(
+                    "pr_merged",
+                    "cd_restart",
+                    instance_id=None,
+                    severity=1,
+                    payload={
+                        "sha": sha,
+                        "pr_url": pr_url,
+                        "services": services,
+                        "pr_merged_flips": merged_flips,
+                        "dedupe_key": administratum_dedupe_key,
+                    },
+                    event_class="state",
+                    quiet_hours_exempt=True,
+                )
+            else:
+                administratum_delivery = {"deduped": True, "dedupe_key": administratum_dedupe_key}
+                logger.info(
+                    "CD: pr_merged delivery deduped before injection (%s)", administratum_dedupe_key
+                )
+        except Exception as e:
+            administratum_delivery = {"degraded": True, "error": str(e)}
+            logger.warning(
+                "CD: Administratum pr_merged delivery failed after restart scheduling: %s", e
+            )
+
     return {
         "ok": True,
         "sha": sha,
         "restart": restart,
         "pr_merged_flips": merged_flips,
         "administratum_delivery": administratum_delivery,
+        "administratum_delivery_claimed": administratum_delivery_claimed,
+        "administratum_dedupe_key": administratum_dedupe_key,
     }
 
 
