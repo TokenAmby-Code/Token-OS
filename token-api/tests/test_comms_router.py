@@ -196,6 +196,28 @@ def test_dispatch_notify_not_queued_fails_closed(monkeypatch: Any) -> None:
     assert result.get("tts", {}).get("reason") == "instance_not_found"
 
 
+def test_dispatch_notify_enforcement_rewrites_persona_silent_contract_violation(
+    monkeypatch: Any,
+) -> None:
+    """An enforcement-tagged send may never surface persona_silent as the final verdict."""
+    tts = _load("routes.tts")
+    monkeypatch.setattr(tts, "_is_quiet_hours", lambda *a, **k: False)
+    _recorders(
+        monkeypatch,
+        tts,
+        enqueue_result={"success": False, "queued": False, "reason": "persona_silent"},
+    )
+
+    result = asyncio.run(
+        tts.dispatch_notify("enforcement line", enforcement=True, instance_id="silent-instance")
+    )
+
+    assert result["delivered"] is False
+    assert result["audio_delivered"] is False
+    assert result["reason"] == "enforcement_persona_silent_contract_violation"
+    assert result["tts"]["reason"] == "persona_silent"
+
+
 def test_dispatch_notify_enforcement_bypasses_persona_silent(monkeypatch: Any) -> None:
     """Live enforcement may not disappear behind persona_silent.
 

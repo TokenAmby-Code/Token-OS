@@ -180,18 +180,14 @@ if [[ -z "$INSTANCE_ID" && "$DIRECT" == "false" ]]; then
 fi
 
 ENDPOINT="/api/notify"
-if [[ -n "$INSTANCE_ID" ]]; then
-    JSON=$(jq -cn \
-        --arg msg "$MESSAGE" \
-        --arg iid "$INSTANCE_ID" \
-        --argjson enforcement "$ENFORCEMENT" \
-        '{"message": $msg, "instance_id": $iid, "tts": true, "enforcement": $enforcement} + (if $enforcement then {"context":{"kind":"enforcement"}} else {} end)')
-else
-    JSON=$(jq -cn \
-        --arg msg "$MESSAGE" \
-        --argjson enforcement "$ENFORCEMENT" \
-        '{"message": $msg, "tts": true, "enforcement": $enforcement} + (if $enforcement then {"context":{"kind":"enforcement"}} else {} end)')
-fi
+JSON=$(jq -cn \
+    --arg msg "$MESSAGE" \
+    --arg iid "$INSTANCE_ID" \
+    --argjson enforcement "$ENFORCEMENT" \
+    '{"message": $msg, "tts": true}
+     + (if $iid != "" then {"instance_id": $iid} else {} end)
+     + {"enforcement": $enforcement}
+     + (if $enforcement then {"context":{"kind":"enforcement"}} else {} end)')
 
 if [[ "$SYNC" == "false" ]]; then
     # Explicitly unsafe for delivery truth: this only means the request process was spawned.
