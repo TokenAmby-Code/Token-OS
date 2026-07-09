@@ -120,6 +120,7 @@ describe('toTtsQueue', () => {
         hot_queue: [],
         pause_queue: [
           {
+            item_key: 'pause-key-1',
             instance_id: 'sender-instance-1234',
             name: null,
             message: 'queued line',
@@ -133,8 +134,50 @@ describe('toTtsQueue', () => {
       },
     } as unknown as OpsState);
 
-    expect(queue[0]).toMatchObject({ commanderType: 'chapter', playbackTarget: 'phone', senderName: 'Ultramarines' });
-    expect(queue[1]).toMatchObject({ commanderType: 'persona', playbackTarget: 'wsl', route: 'pause/wsl · Sender' });
+    expect(queue[0]).toMatchObject({
+      id: 'cur:sender-instance-1234:2026-07-09T10:00:01',
+      itemKey: undefined,
+      queueState: 'current',
+      promotable: false,
+      commanderType: 'chapter',
+      playbackTarget: 'phone',
+      senderName: 'Ultramarines',
+    });
+    expect(queue[1]).toMatchObject({
+      itemKey: 'pause-key-1',
+      queueState: 'pause',
+      promotable: true,
+      commanderType: 'persona',
+      playbackTarget: 'wsl',
+      route: 'pause/wsl · Sender',
+    });
+  });
+
+  it('uses item_key in the current TTS item id when present', () => {
+    const queue = toTtsQueue({
+      ...stateWith([]),
+      tts: {
+        current: {
+          item_key: 'current-key-1',
+          instance_id: 'sender-instance-1234',
+          name: 'Current Sender',
+          message: 'current keyed line',
+          voice: 'Microsoft David',
+          backend: 'wsl',
+          playback_target: 'phone',
+          started_at: '2026-07-09T10:00:03',
+        },
+        hot_queue: [],
+        pause_queue: [],
+      },
+    } as unknown as OpsState);
+
+    expect(queue[0]).toMatchObject({
+      id: 'cur:current-key-1:2026-07-09T10:00:03',
+      itemKey: 'current-key-1',
+      queueState: 'current',
+      promotable: false,
+    });
   });
 });
 

@@ -80,6 +80,7 @@ export type OpsInstance = {
 };
 
 export type TtsQueueItem = {
+  item_key?: string;
   instance_id: string;
   name: string | null;
   message: string; // full text — UI clamps with CSS, expands on click
@@ -94,6 +95,7 @@ export type TtsQueueItem = {
 };
 
 export type TtsCurrent = {
+  item_key?: string;
   instance_id: string;
   name: string | null;
   message: string;

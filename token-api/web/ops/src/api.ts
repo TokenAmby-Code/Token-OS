@@ -146,10 +146,11 @@ export function useOpsState(intervalMs = 2000): Feed<OpsState> {
 // Thin POSTs to Token-API (the authority). These are NOT a dual-write: routing
 // the mutation *through* Token-API is exactly the read-only-documents contract.
 
-async function postJson<T = unknown>(url: string, body?: unknown): Promise<T> {
+async function postJson<T = unknown>(url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
     cache: 'no-store',
+    ...(signal ? { signal } : {}),
     ...(body !== undefined
       ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
       : {}),
@@ -160,6 +161,13 @@ async function postJson<T = unknown>(url: string, body?: unknown): Promise<T> {
 
 export type SkipResult = { skipped: boolean; cleared: number; backend?: string | null };
 export type PromoteResult = { success: boolean; promoted: number };
+export type PlayItemResult = {
+  success: boolean;
+  promoted: number;
+  item_key: string;
+  reason?: string;
+  from_queue?: string;
+};
 export type GlobalModeResult = { status: string; mode: TtsGlobalMode; old_mode: string };
 export type FocusResult = { snapped: boolean; reason: string | null };
 export type MorningEndResult = { status: string; changed: boolean; morning_status: string };
@@ -178,6 +186,11 @@ export function promotePause(instanceId?: string): Promise<PromoteResult> {
 /** Promote all of one instance's paused items to the front of the hot queue. */
 export function playPane(instanceId: string): Promise<PromoteResult> {
   return postJson<PromoteResult>('/api/tts/queue/play-pane', { instance_id: instanceId });
+}
+
+/** Promote/play one exact queued TTS item. */
+export function playTtsItem(itemKey: string, signal?: AbortSignal): Promise<PlayItemResult> {
+  return postJson<PlayItemResult>('/api/tts/queue/play-item', { item_key: itemKey }, signal);
 }
 
 /** Set the global TTS mode (verbose | muted | silent). */

@@ -83,8 +83,13 @@ export type DialModel = {
 // as 'done'; the stack simply renders shorter as the queue drains.
 export type TtsItemStatus = 'speaking' | 'queued' | 'done';
 
+export type TtsQueueState = 'current' | 'hot' | 'pause';
+
 export type TtsItem = {
   id: string;
+  itemKey: string | undefined;
+  queueState: TtsQueueState | undefined;
+  promotable: boolean;
   text: string; // the utterance — surfaced in the hover tip + drawer
   route: string; // sender / delivery route (e.g. "hot · Custodes")
   senderInstanceId: string; // sender's FULL instance id — joins the utterance to its
@@ -312,7 +317,10 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
   const c = s.tts.current;
   if (c) {
     items.push({
-      id: `cur:${c.instance_id}:${c.started_at ?? ''}`,
+      id: `cur:${c.item_key ?? c.instance_id}:${c.started_at ?? ''}`,
+      itemKey: c.item_key,
+      queueState: 'current',
+      promotable: false,
       text: c.message,
       route: `${c.backend ?? c.playback_target ?? 'speaking'} · ${displayNameOf(c)}`,
       senderInstanceId: c.instance_id,
@@ -326,8 +334,12 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
     });
   }
   for (const q of [...(s.tts.hot_queue ?? []), ...(s.tts.pause_queue ?? [])]) {
+    const queueState: TtsQueueState | undefined = q.queue === 'hot' || q.queue === 'pause' ? q.queue : undefined;
     items.push({
-      id: `${q.queue}:${q.instance_id}:${q.queued_at}`,
+      id: q.item_key ? `tts:${q.item_key}` : `${q.queue}:${q.instance_id}:${q.queued_at}`,
+      itemKey: q.item_key,
+      queueState,
+      promotable: Boolean(q.item_key),
       text: q.message,
       route: `${q.queue}${q.playback_target ? `/${q.playback_target}` : ''} · ${displayNameOf(q)}`,
       senderInstanceId: q.instance_id,
