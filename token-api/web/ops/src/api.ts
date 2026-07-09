@@ -47,6 +47,14 @@ export const OPS_COCKPIT_POLLS: readonly OpsCockpitPoll[] = [
   },
 ] as const;
 
+// Hook defaults derive FROM the ledger — the manifest is the single source of
+// the tick cadence, so the ledger and the real polling intervals cannot drift.
+function ledgeredInterval(hook: string): number {
+  const poll = OPS_COCKPIT_POLLS.find((p) => p.hook === hook);
+  if (!poll) throw new Error(`unledgered poll hook: ${hook}`);
+  return poll.intervalMs;
+}
+
 function usesPolling<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   intervalMs: number,
@@ -163,7 +171,7 @@ function normalizeOpsState(payload: OpsState): OpsState {
 }
 
 /** Live cockpit state — polled fast (brief: every 2s). */
-export function useOpsState(intervalMs = 2000): Feed<OpsState> {
+export function useOpsState(intervalMs = ledgeredInterval('useOpsState')): Feed<OpsState> {
   return usesPolling<OpsState>(
     async (signal) =>
       normalizeOpsState(
@@ -293,7 +301,7 @@ function secondsSinceDayStart(): number {
  * `GET /api/ui/ops/timer/history`; no mock fallback, because fake timer data is
  * worse than an explicit degraded state. Polled slowly per the brief.
  */
-export function useTimerHistory(bucketSec = 60, intervalMs = 30000): Feed<TimerHistory> {
+export function useTimerHistory(bucketSec = 60, intervalMs = ledgeredInterval('useTimerHistory')): Feed<TimerHistory> {
   return usesPolling<TimerHistory>(async (signal) => {
     const windowSec = secondsSinceDayStart();
     return boundaryValidate(

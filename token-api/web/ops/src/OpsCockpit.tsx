@@ -4024,9 +4024,11 @@ function KanbanBoard({ uiScale, board }: { uiScale: number; board: Record<string
 
 // ═══════════════════════════════════════════════════════════════════════════
 export function OpsCockpit() {
-  // ── The live data spine — the two Token-API read-model feeds ──────────────
-  const opsState = useOpsState(2000);
-  const timerHistory = useTimerHistory(60, 30000);
+  // ── The live data spine — the two Token-API read-model feeds. Tick cadence
+  // comes from the OPS_COCKPIT_POLLS ledger defaults (api.ts) — never a
+  // call-site literal, so the ledger stays the single source. ────────────────
+  const opsState = useOpsState();
+  const timerHistory = useTimerHistory(60);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [focusedDial, setFocusedDial] = useState<string | null>(null);
