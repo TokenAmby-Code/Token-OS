@@ -1129,6 +1129,34 @@ def test_live_persona_empty_stamp_stopped_row_reasserts_binding():
     log.assert_any_call("persona_binding_reasserted", instance_id="i-fg", details=ANY)
 
 
+def test_live_persona_stopped_row_fallback_degrades_on_registry_error():
+    adapter = FakeAdapter()
+    adapter.options.update(
+        {
+            "@PANE_ID": FG_LABEL,
+            "@PANE_TYPE": "mechanicus",
+            "@TOKEN_API_WRAPPER_ID": "wrap-fg",
+            "@TOKEN_API_ENGINE": "codex",
+            "@TOKEN_API_CWD": "/Volumes/Imperium/Imperium-ENV",
+            "@INSTANCE_ID": "",
+        }
+    )
+    resolved = SimpleNamespace(pane_id="%fg", pane_role=FG_LABEL)
+
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="mechanicus"),
+        patch.object(assertions, "_pane_dead", return_value=False),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "_registry_entries", side_effect=[[], RuntimeError("api down")]),
+    ):
+        result = assertions.assert_instance(adapter, FG_LABEL)
+
+    assert result["ok"] is True
+    assert result["action"] == "registry_unavailable"
+    assert result["reason"] == "registry_unavailable:api down"
+
+
 def test_live_persona_empty_stamp_stopped_row_without_pane_columns_reasserts_binding():
     adapter = FakeAdapter()
     adapter.options.update(

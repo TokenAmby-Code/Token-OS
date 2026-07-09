@@ -1190,9 +1190,8 @@ def _stopped_row_matches_persona_identity(row, spec: PersonaSpec) -> bool:
         return True
     slug = (getattr(row, "persona_slug", "") or "").strip().lower()
     if slug:
-        expected_rank = EXPECTED_PERSONA_RANKS.get(spec.persona)
-        rank = (getattr(row, "rank", "") or "").strip().lower()
-        return slug == spec.persona and (not expected_rank or not rank or rank == expected_rank)
+        # Slug identity was already decided by _row_matches_persona above.
+        return False
     tab = (getattr(row, "tab_name", "") or "").lower()
     if spec.persona == "fabricator-general":
         return getattr(row, "legion", "") == "fabricator" or spec.persona in tab
@@ -1496,15 +1495,25 @@ def _assert_instance_impl(
             # key by stamp/pane, so fall back to persona identity for stopped
             # singleton rows only. Active rows still require pane/stamp binding
             # above to avoid stealing a live row from another pane.
-            stopped_rows = _registry_entries(pane_id, pane_label, include_stopped=True)
-            if not stopped_rows:
-                stopped_rows = [
-                    candidate
-                    for candidate in fetch_instance_registry().instances
-                    if candidate.status is InstanceStatus.STOPPED
-                    and _stopped_row_matches_persona_identity(candidate, spec)
-                ]
-                stopped_rows.sort(key=lambda r: r.last_activity, reverse=True)
+            try:
+                stopped_rows = _registry_entries(pane_id, pane_label, include_stopped=True)
+                if not stopped_rows:
+                    stopped_rows = [
+                        candidate
+                        for candidate in fetch_instance_registry().instances
+                        if candidate.status is InstanceStatus.STOPPED
+                        and _stopped_row_matches_persona_identity(candidate, spec)
+                    ]
+                    stopped_rows.sort(key=lambda r: r.last_activity, reverse=True)
+            except Exception as exc:  # noqa: BLE001 — pane-death reconciliation must degrade
+                result.update(
+                    {
+                        "ok": bool(runtime_ok),
+                        "action": "registry_unavailable",
+                        "reason": f"registry_unavailable:{exc}",
+                    }
+                )
+                return finish(result, clear_failed=False)
             stopped_match = next(
                 (
                     candidate
