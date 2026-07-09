@@ -2,25 +2,243 @@
   "version": 1,
   "rules": [
     {
-      "id": "direct-gh-pr",
-      "description": "Boundary: PR lifecycle work must go through the pr skill / pr-step workflow, not raw GitHub CLI PR subcommands.",
+      "id": "direct-gh-pr-create",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr create`.",
       "enabled": true,
       "fast_path_terms": [
         "gh",
-        "pr"
+        "pr",
+        "create"
       ],
       "matcher": {
         "type": "command_position",
         "argv_prefix": [
           "gh",
-          "pr"
+          "pr",
+          "create"
         ],
         "allow_assignment_prefix": true,
         "allow_env_prefix": true
       },
       "deny": {
-        "reason": "The user has set a PR lifecycle boundary: direct `gh pr ...` is not an agent workflow.",
-        "redirect": "Invoke the `pr` skill and use `pr-step`; it owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr create ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-merge",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr merge`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "merge"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "merge"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr merge ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-close",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr close`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "close"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "close"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr close ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-edit",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr edit`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "edit"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "edit"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr edit ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-ready",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr ready`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "ready"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "ready"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr ready ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-reopen",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr reopen`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "reopen"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "reopen"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr reopen ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-comment",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr comment`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "comment"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "comment"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr comment ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-review",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr review`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "review"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "review"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr review ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-lock",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr lock`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "lock"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "lock"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr lock ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
+      }
+    },
+    {
+      "id": "direct-gh-pr-unlock",
+      "description": "Boundary: PR lifecycle write work must go through the pr skill / pr-step workflow, not raw GitHub CLI `gh pr unlock`.",
+      "enabled": true,
+      "fast_path_terms": [
+        "gh",
+        "pr",
+        "unlock"
+      ],
+      "matcher": {
+        "type": "command_position",
+        "argv_prefix": [
+          "gh",
+          "pr",
+          "unlock"
+        ],
+        "allow_assignment_prefix": true,
+        "allow_env_prefix": true
+      },
+      "deny": {
+        "reason": "The user has set a PR lifecycle boundary: direct `gh pr unlock ...` is a PR write action and is not an agent workflow.",
+        "redirect": "Invoke `/pr` or the `pr` skill and use `pr-step`; pr-step is self-sufficient since #598 and owns PR creation, review, checks, CodeRabbit handling, merge, and cleanup."
       }
     },
     {

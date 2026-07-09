@@ -49,6 +49,8 @@ def _no_live_tmux_guard(monkeypatch, tmp_path):
     monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
     monkeypatch.setenv("TMUXCTLD_CALLBACKS_PATH", str(tmp_path / "callbacks.json"))
     monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
+    monkeypatch.setenv("TMUXCTLD_TMUX_SOCKET_PATH", str(tmp_path / "tmux-scratch.sock"))
+    monkeypatch.setattr(daemon, "tmux_socket_connectable", lambda path=None: True)
     monkeypatch.setattr(daemon, "_PROMPT_SUBMIT_SNIFFER", daemon.PromptSubmitSniffer())
     monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
     monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
@@ -195,6 +197,53 @@ def test_server_signals_ready_event() -> None:
     server, _ = _serve(StubAdapter)
     try:
         assert server.ready.is_set()
+    finally:
+        server.shutdown()
+
+
+def test_default_tmux_socket_path_ignores_macos_tmpdir(monkeypatch) -> None:
+    monkeypatch.delenv("TMUXCTLD_TMUX_SOCKET_PATH", raising=False)
+    monkeypatch.delenv("TMUX_TMPDIR", raising=False)
+    monkeypatch.setenv("TMPDIR", "/var/folders/not-tmux")
+
+    assert str(daemon.tmux_socket_path()) == f"/tmp/tmux-{os.getuid()}/default"
+
+
+def test_health_reports_socket_failure_before_adapter_probe(monkeypatch) -> None:
+    calls = {"list_sessions": 0}
+
+    class Adapter(StubAdapter):
+        def list_sessions(self):
+            calls["list_sessions"] += 1
+            return []
+
+    monkeypatch.setattr(daemon, "tmux_socket_connectable", lambda path=None: False)
+    monkeypatch.setattr(daemon, "_live_fleet_tmux_server_pids", lambda session="main": [])
+    server, _ = _serve(Adapter)
+    try:
+        status, payload = _get(server, "/health")
+        assert status == 200
+        assert payload["tmux_reachable"] is False
+        assert payload["tmux_socket_state"] == "socket_missing"
+        assert payload["tmux_socket_recovery"] == "no_live_server_noop"
+        assert calls["list_sessions"] == 0
+    finally:
+        server.shutdown()
+
+
+def test_health_socket_loss_recovers_with_sigusr1_not_second_server(monkeypatch) -> None:
+    sent = []
+    monkeypatch.setattr(daemon, "tmux_socket_connectable", lambda path=None: False)
+    monkeypatch.setattr(daemon, "_live_fleet_tmux_server_pids", lambda session="main": [4242])
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+
+    server, _ = _serve(StubAdapter)
+    try:
+        status, payload = _get(server, "/health")
+        assert status == 200
+        assert payload["tmux_reachable"] is False
+        assert payload["tmux_socket_recovery"] == "sigusr1_rebind"
+        assert sent == [(4242, daemon.signal.SIGUSR1)]
     finally:
         server.shutdown()
 

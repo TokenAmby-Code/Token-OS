@@ -2995,12 +2995,9 @@ async def stop_instance(instance_id: str):
         if lifecycle_result.get("status") == "failed":
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        # Resolve the stopping instance's LIVE pane (tmuxctl owns instance->pane) for
-        # the tint-clear below — never the stored tmux_pane column. resolve-instance
-        # only returns a pane that still carries THIS instance's @INSTANCE_ID stamp,
-        # so a truthy result is unambiguously ours to vacate; a dead, reused, or
-        # taken-over pane resolves to None and we leave the tint to its current owner.
-        stopped_pane, _stopped_role = await shared.resolve_instance_pane(instance_id)
+        # Pane chrome teardown is owned by tmuxctld's atomic clear/free transaction.
+        # Do not run a second stamp-gated, title-blind tint clear here: teardown must
+        # not depend on @INSTANCE_ID still being present after death begins.
         await db.commit()
 
         # Check remaining active instances (all)
@@ -3016,11 +3013,6 @@ async def stop_instance(instance_id: str):
         )
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
-
-    # Event-driven tint: the persona vacated this pane — clear its persona tint
-    # back to default. No queue, no poll.
-    if stopped_pane:
-        await asyncio.to_thread(shared.clear_pane_tint, stopped_pane, source="stop-instance")
 
     # Log event
     await log_event(

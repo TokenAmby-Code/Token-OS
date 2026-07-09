@@ -1343,8 +1343,88 @@ def read_sha() -> str:
 # reintroduce a heartbeat-file poller — prefer /health.
 
 
+def tmux_socket_path() -> Path:
+    """Return the tmux control socket path this daemon depends on."""
+    configured = os.environ.get("TMUXCTLD_TMUX_SOCKET_PATH", "").strip()
+    if configured:
+        return Path(configured)
+    return Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / "default"
+
+
+def tmux_socket_connectable(path: Path | None = None) -> bool:
+    """Fail-closed AF_UNIX connect probe for the tmux socket file."""
+    socket_path = path or tmux_socket_path()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(float(os.environ.get("TMUXCTLD_SOCKET_PROBE_SECONDS", "0.25")))
+            sock.connect(str(socket_path))
+        return True
+    except Exception:
+        return False
+
+
+def _live_fleet_tmux_server_pids(session: str = "main") -> list[int]:
+    """Find live fleet tmux server processes without starting tmux."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_s, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid == os.getpid() or "tmux" not in command or "new-session" not in command:
+            continue
+        if f"-s {session}" in command or f"-s{session}" in command:
+            pids.append(pid)
+    return pids
+
+
+def recover_missing_tmux_socket(session: str = "main") -> dict:
+    """Name and heal socket-file loss by asking the live server to re-bind.
+
+    Never boots tmux. If the socket is absent/unconnectable and exactly one live
+    fleet server process is present, send SIGUSR1; tmux recreates its socket.
+    """
+    path = tmux_socket_path()
+    before = tmux_socket_connectable(path)
+    state = "reachable" if before else ("socket_loss" if path.exists() else "socket_missing")
+    result = {
+        "state": state,
+        "socket_path": str(path),
+        "recovery": "none",
+        "server_pids": [],
+    }
+    if before:
+        return result
+    pids = _live_fleet_tmux_server_pids(session=session)
+    result["server_pids"] = pids
+    if len(pids) == 1:
+        os.kill(pids[0], signal.SIGUSR1)
+        result["recovery"] = "sigusr1_rebind"
+    elif len(pids) > 1:
+        result["recovery"] = "ambiguous_live_servers_noop"
+    else:
+        result["recovery"] = "no_live_server_noop"
+    return result
+
+
 def tmux_reachable(adapter: TmuxAdapter) -> bool:
-    """Cheap fail-closed probe: can we list sessions at all?"""
+    """Fail-closed probe: socket connect must work, then tmux must answer."""
+    if not tmux_socket_connectable():
+        return False
     try:
         adapter.list_sessions()
         return True
@@ -4672,9 +4752,12 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             self.server.operation_monitor.finish(op_id, ok=op_ok)
 
     def _health_payload(self) -> dict:
+        socket_health = recover_missing_tmux_socket()
         return {
             "ok": True,
             "tmux_reachable": tmux_reachable(self.server.adapter_factory()),
+            "tmux_socket_state": socket_health["state"],
+            "tmux_socket_recovery": socket_health["recovery"],
             "version": self.server.version,
             "sha": self.server.sha,
             "port": self.server.advertised_port,

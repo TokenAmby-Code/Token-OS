@@ -813,6 +813,66 @@ def _normalize_text(value: Any) -> str | None:
     return text or None
 
 
+def _session_start_is_resume(payload: dict) -> bool:
+    raw = " ".join(
+        str(v or "")
+        for v in (
+            payload.get("source"),
+            payload.get("reason"),
+            payload.get("hook_event_name"),
+            payload.get("session_start_reason"),
+        )
+    ).lower()
+    return "resume" in raw
+
+
+def _transcript_tail_has_plan_mode_exit_sync(payload: dict, *, max_lines: int = 80) -> bool:
+    """Detect Claude's in-TUI/resume plan approval surface in recent JSONL.
+
+    The normal PermissionRequest/ExitPlanMode path is handled by
+    tmux-plan-approve-clear.  The regression path resumes with transcript records
+    containing ``plan_mode_exit`` and a ``SessionStart`` reason of ``resume``;
+    that path has already accepted the plan without going through the clear
+    approver.  Only inspect the recent tail so an old plan exit in a long resumed
+    transcript cannot arm a later ordinary resume.
+    """
+    inline_tail = _normalize_text(payload.get("transcript_tail"))
+    if inline_tail:
+        lines = inline_tail.splitlines()[-max_lines:]
+    else:
+        transcript_path = _normalize_text(payload.get("transcript_path"))
+        if not transcript_path:
+            return False
+        try:
+            path = Path(transcript_path).expanduser()
+            if not path.exists() or not path.is_file():
+                return False
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
+        except OSError:
+            return False
+
+    for line in reversed(lines):
+        if "SessionStart" in line and "clear" in line:
+            return False
+        if "SessionStart" in line and "resume" in line:
+            continue
+        if "plan_mode_exit" in line:
+            return True
+    return False
+
+
+async def _session_start_needs_plan_resume_clear(payload: dict) -> bool:
+    if not _session_start_is_resume(payload):
+        return False
+    return await asyncio.to_thread(_transcript_tail_has_plan_mode_exit_sync, payload)
+
+
+def _with_plan_resume_clear(response: dict, needs_clear: bool) -> dict:
+    if needs_clear:
+        response["plan_resume_clear_context"] = True
+    return response
+
+
 async def _name_has_official_provenance(
     db: aiosqlite.Connection, instance_id: str, current_name: str | None
 ) -> bool:
@@ -2640,6 +2700,7 @@ def _supplant_would_leak_singleton(
 
 async def handle_session_start(payload: dict) -> dict:
     """Handle SessionStart hook - register new Claude instance."""
+    plan_resume_needs_clear = await _session_start_needs_plan_resume_clear(payload)
     session_id = payload.get("session_id") or payload.get("conversation_id")
     if not session_id:
         session_id = f"claude-{int(time.time())}-{os.getpid()}"
@@ -3377,14 +3438,17 @@ async def handle_session_start(payload: dict) -> dict:
                         "was_status": existing_row["status"],
                     },
                 )
-                return {
-                    "success": True,
-                    "action": "reregistered",
-                    "instance_id": session_id,
-                    "stop_subscription": auto_subscription,
-                    "mechanicus_stop_subscription": mechanicus_subscription,
-                    "commander_stop_subscription": mechanicus_subscription,
-                }
+                return _with_plan_resume_clear(
+                    {
+                        "success": True,
+                        "action": "reregistered",
+                        "instance_id": session_id,
+                        "stop_subscription": auto_subscription,
+                        "mechanicus_stop_subscription": mechanicus_subscription,
+                        "commander_stop_subscription": mechanicus_subscription,
+                    },
+                    plan_resume_needs_clear,
+                )
 
         if supplant_id:
             # Fetch the old instance to preserve its config
@@ -3624,17 +3688,20 @@ async def handle_session_start(payload: dict) -> dict:
                         "source": supplant_source,
                     },
                 )
-                return {
-                    "success": True,
-                    "action": "supplanted",
-                    "instance_id": session_id,
-                    "supplanted_from": supplant_id,
-                    "persona": _persona_response_from_profile(prof, slug=preserved_profile),
-                    "session_doc_id": session_doc_id,
-                    "stop_subscription": auto_subscription,
-                    "mechanicus_stop_subscription": mechanicus_subscription,
-                    "commander_stop_subscription": mechanicus_subscription,
-                }
+                return _with_plan_resume_clear(
+                    {
+                        "success": True,
+                        "action": "supplanted",
+                        "instance_id": session_id,
+                        "supplanted_from": supplant_id,
+                        "persona": _persona_response_from_profile(prof, slug=preserved_profile),
+                        "session_doc_id": session_doc_id,
+                        "stop_subscription": auto_subscription,
+                        "mechanicus_stop_subscription": mechanicus_subscription,
+                        "commander_stop_subscription": mechanicus_subscription,
+                    },
+                    plan_resume_needs_clear,
+                )
 
         if singleton_incumbent_to_retire:
             retire_now = datetime.now().isoformat()
@@ -4076,16 +4143,19 @@ async def handle_session_start(payload: dict) -> dict:
         },
     )
 
-    return {
-        "success": True,
-        "action": "registered",
-        "instance_id": session_id,
-        "persona": _persona_response_from_profile(profile) if not is_subagent else None,
-        "session_doc_id": session_doc_id,
-        "stop_subscription": auto_subscription,
-        "mechanicus_stop_subscription": mechanicus_subscription,
-        "commander_stop_subscription": mechanicus_subscription,
-    }
+    return _with_plan_resume_clear(
+        {
+            "success": True,
+            "action": "registered",
+            "instance_id": session_id,
+            "persona": _persona_response_from_profile(profile) if not is_subagent else None,
+            "session_doc_id": session_doc_id,
+            "stop_subscription": auto_subscription,
+            "mechanicus_stop_subscription": mechanicus_subscription,
+            "commander_stop_subscription": mechanicus_subscription,
+        },
+        plan_resume_needs_clear,
+    )
 
 
 def _persona_response_from_profile(profile: dict | None, *, slug: str | None = None) -> dict | None:

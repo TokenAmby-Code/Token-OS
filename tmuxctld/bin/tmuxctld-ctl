@@ -30,11 +30,51 @@ DOMAIN="gui/$(id -u)"
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+tmux_socket_path() {
+  if [[ -n "${TMUXCTLD_TMUX_SOCKET_PATH:-}" ]]; then
+    printf '%s\n' "$TMUXCTLD_TMUX_SOCKET_PATH"
+  else
+    printf '%s/tmux-%s/default\n' "${TMUX_TMPDIR:-/tmp}" "$(id -u)"
+  fi
+}
+
+tmux_socket_connectable() {
+  local socket_path
+  socket_path="$(tmux_socket_path)"
+  python3 - "$socket_path" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(0.25)
+sock.connect(sys.argv[1])
+sock.close()
+PY
+}
+
+live_fleet_tmux_pids() {
+  ps -axo pid=,command= | awk '/tmux/ && /new-session/ && /-s main/ {print $1}'
+}
+
+ensure_tmux_socket_not_hijacked() {
+  tmux_socket_connectable && return 0
+  local pids=()
+  local pid
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(live_fleet_tmux_pids)
+  if [[ ${#pids[@]} -eq 1 ]]; then
+    kill -USR1 "${pids[0]}" 2>/dev/null || true
+  fi
+}
+
 cmd_attach() {
   local session="${1:-main}"
   shift || true
   [[ $# -eq 0 ]] || die "attach accepts at most one session"
   [[ -n "$session" && "$session" != -* ]] || die "invalid session: ${session}"
+
+  ensure_tmux_socket_not_hijacked
 
   if ! env IMPERIUM_TMUX_RAW=1 tmux has-session -t "$session" 2>/dev/null; then
     if [[ ! -t 0 || ! -t 1 ]]; then

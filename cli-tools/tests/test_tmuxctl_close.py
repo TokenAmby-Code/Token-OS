@@ -89,12 +89,27 @@ def test_close_pane_slot_clears_in_place_and_never_kills() -> None:
     assert not any(command[:1] == ("kill-pane",) for command in adapter.commands)
 
 
-def test_close_pane_worker_preserves_graceful_then_kill_contract() -> None:
+def test_close_pane_slot_scrubs_before_graceful_wait() -> None:
+    adapter = FakeCloseAdapter(role="somnium:N", window_name="somnium", pane_dead=False)
+
+    result = close_pane(adapter, "%9", timeout=0)
+
+    clear_idx = adapter.commands.index(("clear_runtime_state", "%9"))
+    first_interrupt_idx = adapter.commands.index(("send-keys", "-t", "%9", "C-c"))
+    assert clear_idx < first_interrupt_idx
+    assert result["chrome_cleared"] is True
+    assert result["pane_freed"] is True
+
+
+def test_close_pane_worker_reports_partial_when_kill_fails_after_atomic_scrub() -> None:
     adapter = FakeCloseAdapter(role="mechanicus:worker", window_name="mechanicus", exists_count=99)
 
     result = close_pane(adapter, "%9", timeout=0)
 
-    assert result["status"] == "failed"  # fake still reports pane present after kill
+    assert result["status"] == "partial_teardown"
+    assert result["reason"] == "kill_pane_failed_after_runtime_clear"
+    assert result["chrome_cleared"] is True
+    assert result["pane_freed"] is False
     assert result["pane_class"] == "worker"
     assert adapter.commands.count(("send-keys", "-t", "%9", "C-c")) == 3
     assert ("kill-pane", "-t", "%9") in adapter.commands
@@ -150,7 +165,8 @@ def test_close_pane_clears_runtime_interrupts_kills_and_enforces_stack():
 
     result = close_pane(adapter, "%9", timeout=0)
 
-    assert result["status"] == "failed"  # fake still reports pane present after kill
+    assert result["status"] == "partial_teardown"
+    assert result["reason"] == "kill_pane_failed_after_runtime_clear"
     assert ("clear_runtime_state", "%9") in adapter.commands
     assert adapter.commands.count(("send-keys", "-t", "%9", "C-c")) == 3
     assert ("kill-pane", "-t", "%9") in adapter.commands
@@ -318,8 +334,10 @@ def test_unsetting_instance_id_clears_style_first() -> None:
 
     adapter._preflight_runtime_invariants(["set-option", "-pu", "-t", "%9", "@INSTANCE_ID"])
 
-    assert ("set-option", "-pu", "-t", "%9", "window-style") in adapter.raw
-    assert ("set-option", "-pu", "-t", "%9", "window-active-style") in adapter.raw
+    assert adapter.raw[1:3] == [
+        ("set-option", "-pu", "-t", "%9", "window-style"),
+        ("set-option", "-pu", "-t", "%9", "window-active-style"),
+    ]
     assert ("select-pane", "-t", "%9", "-T", "") in adapter.raw
 
 

@@ -785,6 +785,31 @@ refresh_discord_daemon_deps_unlocked() {
         fi
     fi
 
+    # The daemon's node_modules is git-excluded, so the deploy's git-aware
+    # write-unlock never touches it (2026-07-08 incident: PR #640's deploy
+    # aborted mid-restart and crash-looped the daemon). Three sharp edges:
+    #   1. node_modules may be a LEGACY SYMLINK to the external hand-managed
+    #      tree (~/discord-daemon-modules, the Jun-11 NAS-era arrangement);
+    #   2. macOS chflags/chmod -R do NOT follow a symlink operand, so the
+    #      unlock must target the RESOLVED path;
+    #   3. the daemon dir itself is write-guarded, and npm must be able to
+    #      replace the symlink with a real in-place directory.
+    # Unlock all three, then drop the legacy symlink — npm ci owns the tree
+    # from here on.
+    chflags nouchg "$daemon_dir" 2>/dev/null || true
+    chmod u+w "$daemon_dir" 2>/dev/null || true
+    if [[ -e "${daemon_dir}/node_modules" || -L "${daemon_dir}/node_modules" ]]; then
+        local nm_real=""
+        nm_real="$(cd "${daemon_dir}/node_modules" 2>/dev/null && pwd -P)" || nm_real=""
+        if [[ -n "$nm_real" && -d "$nm_real" ]]; then
+            chflags -R nouchg "$nm_real" 2>/dev/null || true
+            chmod -R u+w "$nm_real" 2>/dev/null || true
+        fi
+        if [[ -L "${daemon_dir}/node_modules" ]]; then
+            rm -f "${daemon_dir}/node_modules" 2>/dev/null || true
+        fi
+    fi
+
     echo -e "${BLUE}→${NC} CD-sync: installing discord-daemon deps..."
     if (cd "$daemon_dir" && npm ci --no-audit --no-fund); then
         echo -e "  ${GREEN}✓${NC} CD-sync: discord-daemon deps installed"

@@ -596,7 +596,9 @@ def test_h_close_pane_typing_guard_enqueues_close_operation(monkeypatch, tmp_pat
     assert "queue_handle" in out
 
 
-def test_h_close_pane_cleared_in_place_marks_no_retire_required() -> None:
+def test_h_close_pane_cleared_in_place_marks_no_retire_required(monkeypatch) -> None:
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: False)
+
     class _Ctrl:
         adapter = object()
 

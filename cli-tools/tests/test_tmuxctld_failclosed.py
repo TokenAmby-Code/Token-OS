@@ -23,6 +23,7 @@ from tmuxctl.tmux_adapter import TmuxError, TmuxSendGated
 @pytest.fixture(autouse=True)
 def _isolated_deferred_queue(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
+    monkeypatch.setenv("TMUXCTLD_TMUX_SOCKET_PATH", str(tmp_path / "tmux-scratch.sock"))
     monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
     monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
 

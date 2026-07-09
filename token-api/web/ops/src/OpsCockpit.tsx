@@ -1,21 +1,23 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { personaIcon, personaIconInner, personaImage, FACTION_PERSONAS } from './personaIcons';
 import {
-  DAY_END,
-  DAY_START,
-  dials,
-  initialDialCount,
-  MAX_DIAL_COUNT,
-  timerPoints,
-  timerSegments,
+  balanceMinutes,
+  buildDials,
+  mapMode,
+  nowClock,
+  toModeSegments,
+  toTimerPoints,
+  toTtsQueue,
   ttsLanguishThreshold,
-  workerPersonaToTtsItem,
+  type CockpitMode,
+  type CockpitModeSegment,
+  type CockpitTimerPoint,
+  type DialModel,
   type DialTone,
-  type MockDial,
-  type MockTimerMode,
-  type MockTtsItem,
-  type MockTtsStatus,
-} from './mockCockpitData';
+  type TtsItem,
+  type TtsItemStatus,
+} from './cockpitData';
+import { clearPhoneAttention, useOpsState, useTimerHistory } from './api';
 import {
   DIR_DEGREES,
   resolveCompass,
@@ -26,14 +28,14 @@ import {
 
 // Mode → hex, mirroring the live styles.css --m-* tokens so SVG gradients and
 // DOM chips read as one instrument.
-const MODE_HEX: Record<MockTimerMode, string> = {
+const MODE_HEX: Record<CockpitMode, string> = {
   working: '#93d94f',
   multitasking: '#56c2d6',
   distracted: '#ff5b3d',
   break: '#e8a13c',
   idle: '#7e7790',
 };
-const MODE_LABEL: Record<MockTimerMode, string> = {
+const MODE_LABEL: Record<CockpitMode, string> = {
   working: 'WORKING',
   multitasking: 'MULTITASK',
   distracted: 'DISTRACTED',
@@ -54,16 +56,35 @@ const fmtBalance = (v: number) => {
   return '0m';
 };
 
-// Signed break balance in minutes → `±Xh Ym` (or `±Ym` under an hour; `0m` at
-// zero). Credit reads with +, debt (backlog) with the unicode minus.
-const fmtBreak = (m: number) => {
-  const sign = m > 0 ? '+' : m < 0 ? '−' : '';
-  const a = Math.abs(m);
-  const h = Math.floor(a / 60);
-  const mm = a % 60;
-  const body = h > 0 ? `${h}h ${mm}m` : `${mm}m`;
-  return `${sign}${body}`;
-};
+// ═══════════════════════════════════════════════════════════════════════════
+// THE LIVE DATA SPINE — one context object, every consumer.
+//
+// The root component polls the two live read-models (useOpsState every 2s,
+// useTimerHistory every 30s), projects them through the pure cockpitData
+// adapters, and provides ONE memoized CockpitData here. Every instrument reads
+// it via useCockpitData() — no component fetches, no module-level frozen data.
+// While a feed is loading or erroring, `degraded` carries the banner text and
+// the arrays stay empty/stale-real — the cockpit never renders fabricated
+// numbers to look healthy.
+// ═══════════════════════════════════════════════════════════════════════════
+interface CockpitData {
+  dayStart: string; // "HH:MM" — x-domain left edge (the 07:20 day anchor)
+  dayEnd: string; // "HH:MM" — x-domain right edge (last live point, clamped)
+  points: CockpitTimerPoint[]; // balance samples + the appended live now-point
+  segments: CockpitModeSegment[]; // coalesced mode bands
+  nowPoint: CockpitTimerPoint | null; // the live head (also points' last entry)
+  dials: DialModel[]; // the floating state-dial cluster models
+  ttsQueue: TtsItem[]; // the left-stack TTS queue
+  degraded: string | null; // non-null → render the degraded banner with this text
+}
+
+const CockpitDataContext = createContext<CockpitData | null>(null);
+
+function useCockpitData(): CockpitData {
+  const data = useContext(CockpitDataContext);
+  if (!data) throw new Error('useCockpitData must be used inside <CockpitDataContext.Provider>');
+  return data;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GENERIC SCREEN-SIZE RESILIENCE — one viewport-derived scale factor.
@@ -129,9 +150,11 @@ interface TrueBounds {
 
 // The frozen functional plot. padL/padR/padT/padB are all 0 (flush box), folded
 // straight into X/Y here — the plot maps 1:1 onto its measured px footprint.
-function computeBounds(w: number, h: number): TrueBounds {
-  const t0 = toMin(DAY_START);
-  const t1 = toMin(DAY_END);
+// The x-domain is the LIVE day window (dayStart..dayEnd from CockpitData); the
+// root clamps dayEnd > dayStart so t1 − t0 is never zero.
+function computeBounds(w: number, h: number, dayStart: string, dayEnd: string): TrueBounds {
+  const t0 = toMin(dayStart);
+  const t1 = toMin(dayEnd);
   const plotW = w;
   const plotH = h;
   const X = (min: number) => ((min - t0) / (t1 - t0)) * plotW;
@@ -209,6 +232,11 @@ export interface TooltipContract {
 // non-uniform 1000×300 stretch, so a tiled/narrow window never distorts it.
 // ═══════════════════════════════════════════════════════════════════════════
 function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: number }) {
+  // Live plot data — history points (+ appended now-point), coalesced mode
+  // bands, and the day window, all from the one context spine. May be EMPTY
+  // while the feeds are degraded; every path/hover computation below guards
+  // the 0/1-point cases instead of assuming a full day of samples.
+  const { points: timerPoints, segments: timerSegments, dayStart, dayEnd } = useCockpitData();
   const wrapRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState({ w: 1000, h: 480 });
   const [hover, setHover] = useState<number | null>(null);
@@ -239,7 +267,7 @@ function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: numb
   // ── THE DUAL CORE (see "THE TIMER'S DUAL CORE" above) ──
   // ① the frozen functional plot; ② the extended, occluded dressing. Every render
   // element below reads from exactly one of these two typed contracts.
-  const bounds = computeBounds(w, h);
+  const bounds = computeBounds(w, h, dayStart, dayEnd);
   // bgBottomPx arrives authored at 1440; scale it so the dressing floor tracks the
   // arc's (also-scaled) left contact. The occlusion disc scales via the same factor.
   const facade = computeFacade(bounds, bgBottomPx * uiScale, viewportW, uiScale);
@@ -252,28 +280,38 @@ function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: numb
   // day horizontally, so the balance line's slopes flatten out; nudge the vertical
   // swing back up to keep them legible. Pivots around the horizon (the y=0 baseline
   // stays put, so the midline↔rim seam is untouched) and is CAPPED so the tallest
-  // peak / deepest trough never clip the plot box — the data already fills most of
-  // the [Y_MIN, Y_MAX] range, so the headroom, not the width, is the real limit.
+  // peak / deepest trough never clip the plot box. The cap may compress BELOW 1:
+  // a balance past the fixed [Y_MIN, Y_MAX] domain (e.g. deep overflow, 150m+)
+  // rescales so the max datum renders AT the top/bottom margin instead of
+  // escaping the box — the overflow signal itself stays on the dial's gold glow.
   const AMP_BASE_W = 1440; // at/below this width the tuned amplitude is left as-is
   const AMP_GAIN = 0.5; // how hard extra width pushes amplitude (before the cap)
   const AMP_MARGIN = 6; // px kept clear of the top (y=0) and the box floor
   const baseYs = timerPoints.map((p) => Y(p.breakBalanceMinutes));
-  const devUp = horizonY - Math.min(...baseYs); // peak rise above the horizon
-  const devDown = Math.max(...baseYs) - horizonY; // trough drop below it
-  const ampCap = Math.max(1, Math.min(
+  // Empty live data ⇒ no deviations (0), so the cap math degrades to "no cap"
+  // instead of the ±Infinity a spread over an empty array would produce.
+  const devUp = baseYs.length ? horizonY - Math.min(...baseYs) : 0; // peak rise above the horizon
+  const devDown = baseYs.length ? Math.max(...baseYs) - horizonY : 0; // trough drop below it
+  const ampCap = Math.min(
     devUp > 0.5 ? (horizonY - AMP_MARGIN) / devUp : Infinity,
     devDown > 0.5 ? (h - AMP_MARGIN - horizonY) / devDown : Infinity,
-  ));
+  );
   const ampScale = Math.min(1 + Math.max(0, viewportW / AMP_BASE_W - 1) * AMP_GAIN, ampCap);
   const ampY = (v: number) => horizonY + (Y(v) - horizonY) * ampScale;
 
   const pts = timerPoints.map((p) => ({ x: X(toMin(p.t)), y: ampY(p.breakBalanceMinutes), v: p.breakBalanceMinutes }));
-  const linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  // A line/area needs ≥2 samples; with 0/1 live points (feed still warming up)
+  // both collapse to empty paths and only the now-dot (if any) renders.
+  const hasLine = pts.length >= 2;
+  const linePath = hasLine
+    ? pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')
+    : '';
   // Area from the line down/up to the horizon (closed along the zero baseline).
-  const areaPath =
-    `M${pts[0].x.toFixed(1)},${horizonY.toFixed(1)} ` +
-    pts.map((p) => `L${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') +
-    ` L${pts[pts.length - 1].x.toFixed(1)},${horizonY.toFixed(1)} Z`;
+  const areaPath = hasLine
+    ? `M${pts[0].x.toFixed(1)},${horizonY.toFixed(1)} ` +
+      pts.map((p) => `L${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') +
+      ` L${pts[pts.length - 1].x.toFixed(1)},${horizonY.toFixed(1)} Z`
+    : '';
 
   const hoverP = hover != null ? timerPoints[hover] : null;
   const hoverX = hoverP ? X(toMin(hoverP.t)) : 0;
@@ -303,6 +341,7 @@ function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: numb
   // Map cursor → nearest sample index (clamped). The interaction rect spans the
   // plot area, so its width equals plotW and clientX-left divides straight in.
   function onMove(e: React.MouseEvent<SVGRectElement>) {
+    if (timerPoints.length === 0) return; // degraded feed — nothing to index
     const rect = e.currentTarget.getBoundingClientRect();
     // Index maps against the FROZEN plot width, not the (now wider) hit rect, so
     // the sample mapping is unchanged — the extra width only enlarges the hover
@@ -321,7 +360,7 @@ function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: numb
   return (
     <div className="timerfield" ref={wrapRef}>
       <svg className="timerfield__svg" width={w} height={h} viewBox={`0 0 ${w} ${h}`} role="img"
-        aria-label="Break-balance over the day. Trough −38 minutes at 14:10; recovered to +9 by 16:45.">
+        aria-label="Break-balance over the day — live timer telemetry.">
         <defs>
           <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#93d94f" stopOpacity="0.34" />
@@ -361,11 +400,13 @@ function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: numb
 
         {/* credit sky + debt ground, split at the horizon. The area now runs right
             up to the dial-anchored border, so it's swept under the dial disc too. */}
-        <g clipPath={occludeClip}>
-          <path d={areaPath} fill="url(#sky)" clipPath="url(#above)" />
-          <path d={areaPath} fill="url(#ground)" clipPath="url(#below)" />
-          <path d={areaPath} fill="url(#hazard)" clipPath="url(#below)" />
-        </g>
+        {hasLine ? (
+          <g clipPath={occludeClip}>
+            <path d={areaPath} fill="url(#sky)" clipPath="url(#above)" />
+            <path d={areaPath} fill="url(#ground)" clipPath="url(#below)" />
+            <path d={areaPath} fill="url(#hazard)" clipPath="url(#below)" />
+          </g>
+        ) : null}
 
         {/* y gridlines — lines only, no labels. Extended RIGHT to bgRight so the
             dashed rules carry on past the graph into the gap. FACADE → occludeClip. */}
@@ -389,14 +430,20 @@ function TimerField({ bgBottomPx, uiScale }: { bgBottomPx: number; uiScale: numb
             border and tucks under the dial disc (occludeClip) at the same seam the
             horizon reaches — so the timer's end is obscured by the dial at any width. */}
         <g clipPath={occludeClip}>
-          <path d={linePath} fill="none" stroke="#93d94f" strokeWidth={2.4} clipPath="url(#above)"
-            strokeLinejoin="round" strokeLinecap="round" />
-          <path d={linePath} fill="none" stroke="#ff5b3d" strokeWidth={2.4} clipPath="url(#below)"
-            strokeLinejoin="round" strokeLinecap="round" />
+          {hasLine ? (
+            <>
+              <path d={linePath} fill="none" stroke="#93d94f" strokeWidth={2.4} clipPath="url(#above)"
+                strokeLinejoin="round" strokeLinecap="round" />
+              <path d={linePath} fill="none" stroke="#ff5b3d" strokeWidth={2.4} clipPath="url(#below)"
+                strokeLinejoin="round" strokeLinecap="round" />
+            </>
+          ) : null}
 
-          {/* now marker — just the dot on the balance line; the full-height dashed
-              gold rule is retired (it read as a stray border at the graph's edge). */}
-          <circle cx={pts[pts.length - 1].x} cy={pts[pts.length - 1].y} r={4} fill="#f2c463" stroke="#07060a" strokeWidth={1.5} />
+          {/* now marker — just the dot on the balance line (the live now-point);
+              renders alone even before the history feed fills in. */}
+          {pts.length > 0 ? (
+            <circle cx={pts[pts.length - 1].x} cy={pts[pts.length - 1].y} r={4} fill="#f2c463" stroke="#07060a" strokeWidth={1.5} />
+          ) : null}
         </g>
 
         {/* hover crosshair — the sole readout */}
@@ -481,7 +528,7 @@ const DIAL_PX = 50;
 const RING_R = DIAL_PX / 2;
 
 // The big top-right fraction dial's diameter (the `4/1`). SINGLE SOURCE of truth:
-// MockOpsCockpit publishes it to CSS as --corner-dial-d (so .corner-dial sizes off
+// OpsCockpit publishes it to CSS as --corner-dial-d (so .corner-dial sizes off
 // it) and ArcLayer reads it for the agent-dial radius — so if this number moves,
 // the corner dial AND the agent dials riding the arc resize together, in lockstep.
 const CORNER_DIAL_PX = 104;
@@ -549,7 +596,6 @@ const BREAK_MARKER_PX = 10;
 // pure function that turns the signed minutes into everything the DOM paints.
 const BREAK_LAP_MIN = 60; // one full rim lap = one hour
 const BREAK_SPILL_MIN = 2 * BREAK_LAP_MIN; // beyond two laps → glow, ball retired
-const BREAK_MAX_MIN = 150; // demo slider ceiling (headroom past the spill threshold)
 
 // lap palettes, indexed [lap1, lap2] per polarity (CSS custom-property refs).
 const CREDIT_TONES = ['var(--phosphor)', 'var(--cyan)'] as const;
@@ -684,7 +730,7 @@ function dialOffset(i: number, scale = 1): { right: number; top: number } {
 // The TTS dials get their OWN size + gap (separate from the 50px status dials),
 // packed a bit tighter, so that ~ttsLanguishThreshold of them fit above the
 // connecting arc's left-edge contact — a convenient cosmetic marker (see the
-// threshold's note in mockCockpitData). Both knobs are here and freely tunable.
+// threshold's note in cockpitData). Both knobs are here and freely tunable.
 //
 // This only lines up at scroll-top: the stack is position:fixed while the arc
 // scrolls with the page, so they drift apart on scroll BY DESIGN — the marker is
@@ -695,18 +741,11 @@ const TTS_LEFT = 16; // px inset from the left edge
 const TTS_TOP = 10; // px inset of the head from the top edge
 const TTS_ROW = TTS_DIAL_PX + TTS_GAP; // centre-to-centre vertical step = one UNIT
 
-// Play-gesture timings. SPEAK_MS is the static stand-in for a real utterance's
-// duration (no audio wired this round); PROMOTE_MS / DISMISS_MS match the CSS
-// keyframe durations (tts-promote / tts-dismiss) so the JS state machine and the
-// animations land in lockstep — the promote keyframe ends at translate(0,0),
-// exactly the dial's new slot-0 base transform, so dropping the class is jump-free.
-const SPEAK_MS = 5000;
-const PROMOTE_MS = 820;
+// DISMISS_MS matches the tts-dismiss CSS keyframe duration, so the JS drop +
+// shuffle-up lands exactly as the fade ends. (The mock's promote/speak play
+// gesture and its SPEAK/PROMOTE/SHIFT timings are retired — the live queue is
+// the sole driver of order and drain now.)
 const DISMISS_MS = 300;
-// Hold the shift-down of slots 0…n−1 a beat after the click so the promoted dial
-// clears the column (moves 1 unit RIGHT — the first ~30% of PROMOTE_MS) before the
-// rest collapse into the gap, rather than shifting down while it's still passing.
-const SHIFT_DELAY_MS = 200;
 
 // ── one generic, fully-interactive dial ────────────────────────────────────
 // EVERY dial is a button: soft hover glow (CSS), keyboard-activatable, and a
@@ -716,10 +755,10 @@ const SHIFT_DELAY_MS = 200;
 // the top-right corner the cluster hugs.
 //
 // Click / Enter / Space resolve in priority order: an explicit `onActivate`
-// override (the TTS stack's promote handler) wins outright; otherwise `dial.action`
-// runs its mock handler; otherwise the default opens the drawer. The generic
-// component owns this resolution, so the dial data stays purely declarative — the
-// promote gesture rides `onActivate` rather than a new `tts-promote` action kind.
+// override wins outright (no caller uses it this phase — the seam stays for
+// bespoke per-cluster gestures); otherwise `dial.action` runs its handler;
+// otherwise the default opens the drawer. The generic component owns this
+// resolution, so the dial data stays purely declarative.
 function Dial({
   dial,
   style,
@@ -729,7 +768,7 @@ function Dial({
   icon,
   agentId,
 }: {
-  dial: MockDial;
+  dial: DialModel;
   style: React.CSSProperties;
   onOpenDrawer: (id: string) => void;
   onActivate?: (id: string) => void; // overrides the drawer path entirely when set
@@ -745,19 +784,22 @@ function Dial({
       return;
     }
     switch (dial.action?.kind) {
-      // Override hooks. In the static mock these focus the drawer on the dial
-      // or are labeled no-ops — the point is the seam exists and is trivial to
-      // wire to a real feature later.
+      // Override hooks. dismiss-phone is LIVE; the others still land on the
+      // drawer (no timer/enforce mutation is wired this phase — no fake success).
       case 'toggle-timer':
-        console.log('[dial] toggle-timer — pause/resume the running timer (mock)');
+        console.log('[dial] toggle-timer — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       case 'dismiss-phone':
-        console.log('[dial] dismiss-phone — dismiss the phone-distraction alert (mock)');
-        onOpenDrawer(dial.id);
+        // Live: force-clear stuck phone attention through Token-API. The dial's
+        // state updates from the next 2s state poll — nothing is optimistically
+        // faked here; a failure surfaces in the console instead of a lie.
+        clearPhoneAttention().catch((err) =>
+          console.error('[dial] dismiss-phone — clear failed', err),
+        );
         break;
       case 'ack-enforce':
-        console.log('[dial] ack-enforce — acknowledge the pending enforcement (mock)');
+        console.log('[dial] ack-enforce — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       default:
@@ -801,15 +843,16 @@ function Dial({
   );
 }
 
-function Dials({ count, onOpenDrawer, uiScale }: { count: number; onOpenDrawer: (id: string) => void; uiScale: number }) {
-  // Cycle the catalog if the slider runs past it, so density keeps growing.
-  const shown = Array.from({ length: count }, (_, i) => dials[i % dials.length]);
+function Dials({ onOpenDrawer, uiScale }: { onOpenDrawer: (id: string) => void; uiScale: number }) {
+  // The live dial models — the array length IS the density (the demo cycling
+  // slider is retired; live data drives the count).
+  const { dials } = useCockpitData();
 
   return (
-    <div className="dials" aria-label={`Floating state dials · ${count}`}>
-      {shown.map((dial, i) => (
+    <div className="dials" aria-label={`Floating state dials · ${dials.length}`}>
+      {dials.map((dial, i) => (
         <Dial
-          key={i}
+          key={dial.id}
           dial={dial}
           style={{ width: DIAL_PX * uiScale, height: DIAL_PX * uiScale, ...dialOffset(i, uiScale) }}
           onOpenDrawer={onOpenDrawer}
@@ -828,33 +871,34 @@ function Dials({ count, onOpenDrawer, uiScale }: { count: number; onOpenDrawer: 
 // NOT a radial fan — a queue reads top-to-bottom, so the fan geometry is
 // deliberately not reused here.
 //
-// The model is a live, stateful ORDERED queue (slot = array index). It has a PLAY
-// GESTURE: clicking a queued dial promotes it to the head along an L-shaped path,
-// it reverberates while it "speaks" (a static SPEAK_MS stand-in — no real TTS
-// audio wired), then vanishes and the stack shuffles up. The depth slider is the
-// source-of-truth resize of the tail. Still a static study: the 5 s stands in for
-// a real utterance's duration; nothing is wired to the live speak queue yet.
+// The model is the LIVE serialized speak queue: tts.current at the head (its
+// dial reverberates while the backend reports it on the wire) and the hot +
+// pause queues stacked below it, in order. Order, growth, and drain all come
+// from the live read-model — the stack never invents motion (the mock's local
+// promote/speak play gesture is retired); membership changes still animate via
+// the roster reconcile + transform transitions, and a drain hands the departing
+// dial to the lifecycle controller so it flies out to the idle rail (edge B).
 //
 // Tone + glyph come from a SMALL status map local to the stack (deliberately
 // distinct from the status dials'), then flow through the shared <Dial> as an
-// ordinary MockDial. So the chrome is shared; only the mapping is bespoke.
+// ordinary DialModel. So the chrome is shared; only the mapping is bespoke.
 // ═══════════════════════════════════════════════════════════════════════════
-const TTS_TONE: Record<MockTtsStatus, DialTone> = {
+const TTS_TONE: Record<TtsItemStatus, DialTone> = {
   speaking: 'good', // live on the wire
   queued: 'warn', // waiting its turn
   done: 'idle', // already delivered, draining out of the tail
 };
-const TTS_GLYPH: Record<MockTtsStatus, string> = {
+const TTS_GLYPH: Record<TtsItemStatus, string> = {
   speaking: '▶',
   queued: '☰',
   done: '✓',
 };
 
-// Project a queue item onto the shared MockDial contract the <Dial> ring reads.
-// The hover tip leads with the sender's identity — its tmuxctl id (`tag`, the mono
-// chip) then its instance-name (`label`) — with the utterance as the subtitle.
-// glyph/tone come from the bespoke TTS map above; `value` carries the route.
-function ttsItemToDial(item: MockTtsItem): MockDial {
+// Project a queue item onto the shared DialModel contract the <Dial> ring reads.
+// The hover tip leads with the sender's identity — its short instance id (`tag`,
+// the mono chip) then its instance-name (`label`) — with the utterance as the
+// subtitle. glyph/tone come from the bespoke TTS map above; `value` = the route.
+function ttsItemToDial(item: TtsItem): DialModel {
   return {
     id: item.id,
     label: item.senderName,
@@ -898,22 +942,30 @@ function duplicatePersonaKeys<T>(
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LIFECYCLE IDENTITY — one object woven through all three queues (worker → TTS →
-// idle). Minted once at worker birth and carried UNCHANGED across every handoff:
-// its `id` is the single React key in every queue (so no persona ever briefly
-// exists in two lists), its `originSide` rides through TTS so the idle return
-// lands on the side the worker was born on, and its `item` (synthesized once) is
-// what the TTS stack renders. The three queues went from count/depth-driven to
-// ROSTER-driven (keyed Agent[]) — each component keeps its own slot/phase reconcile
-// + CSS-transition machinery; only the reconcile INPUT changed from a number to a
-// keyed list (diff by id, not length).
+// idle). Its `id` is the single React key in every queue (so no identity ever
+// briefly exists in two lists) and its `originSide` rides through TTS so the
+// idle return lands on the side the handoff came from. The three queues are
+// ROSTER-driven (keyed Agent[]) — each component keeps its own slot/phase
+// reconcile + CSS-transition machinery; only the reconcile INPUT is a keyed
+// list (diff by id, not length).
+//
+// The MINT is split by honesty. Worker/idle agents are DEMO identities (fleet
+// wiring lands phase 2), minted from the persona catalog by the demobar's
+// add-worker buttons. TTS agents are LIVE: minted 1:1 from the live speak-queue
+// items (id = the live item id), never synthesized — the design study's
+// worker-click-births-an-utterance edge is retired, and the weave's handoff
+// animations are triggered by the live queue's arrivals/drains instead.
 // ═══════════════════════════════════════════════════════════════════════════
 type OriginSide = -1 | 1; // -1 = left column, +1 = right column
 interface Agent {
-  id: string; // session-global monotonic id — the React key in every queue
+  id: string; // the React key in every queue (live item id for TTS agents)
   persona: string;
   tone: string;
-  originSide: OriginSide; // set at worker birth; rides worker → TTS → idle unchanged
-  item: MockTtsItem; // synthesized once at birth; TtsStack renders from this
+  originSide: OriginSide; // set at mint; rides worker → TTS → idle unchanged
+}
+// A TTS-roster agent additionally carries the LIVE queue item it renders.
+interface TtsAgent extends Agent {
+  item: TtsItem; // the live utterance — refreshed each poll, never synthesized
 }
 
 // A single in-flight chip riding the flight overlay (see FlightLayer). `d` is an
@@ -969,169 +1021,164 @@ function agentNodeCenter(id: string, scopeSel?: string): { x: number; y: number 
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
 }
 
-// The play gesture turns the stack from a static display into a small state
-// machine over a stateful ordered list. Each live entry carries a stable key (so
-// React identity survives the reorders + removals), the projected queue item, a
-// phase, and an explicit SLOT (visual row; 0 = head).
+// Each live entry carries a stable key (so React identity survives the
+// reorders + removals), the woven agent (whose live item it renders), a phase,
+// and an explicit SLOT (visual row; 0 = head).
 //
 // CRUCIAL: the array's ORDER is stable (insertion order) — it is NEVER reordered.
-// Position is driven ONLY by the `slot` field, so a promote just MUTATES slot
-// numbers in place. That keeps each dial's DOM node fixed in the tree: moving a
-// node in the DOM resets its CSS transition baseline in Chrome, which made the
-// shift-down teleport when slot == array index. Decoupling slot from DOM order
-// lets every slot change (shift-down, shuffle-up) transition smoothly.
-// 'arriving' = inserted (deepest slot) but INVISIBLE (opacity:0): a worker-born dial
-// awaiting its flight to land. The controller reveals it (arriving → idle) by dropping
-// its id from pendingIds once the flight resolves.
-type TtsPhase = 'arriving' | 'idle' | 'promoting' | 'speaking' | 'dismissing';
+// Position is driven ONLY by the `slot` field, expressed as a transform. That
+// keeps each dial's DOM node fixed in the tree: moving a node in the DOM resets
+// its CSS transition baseline in Chrome, which made the shift teleport when
+// slot == array index. Decoupling slot from DOM order lets every slot change
+// (a live reorder, the drain shuffle-up) transition smoothly.
+//
+// Live phases: 'idle' (queued, waiting) and 'speaking' (the backend reports the
+// item on the wire — the dial reverberates), both driven by the live item's
+// status. 'arriving' = inserted (deepest slot) but INVISIBLE (opacity:0): a
+// live arrival whose handoff flight is still inbound; the controller reveals it
+// by dropping its id from pendingIds once the flight lands. 'dismissing' = the
+// live queue no longer contains it — fade out, then drop + shuffle-up. The
+// mock's local promoting play-gesture phase is retired: the live queue is the
+// sole driver of order and drain, so the stack never animates a state the data
+// didn't report.
+type TtsPhase = 'arriving' | 'idle' | 'speaking' | 'dismissing';
 interface TtsEntry {
-  key: string; // = agent.id — the session-global React key
-  agent: Agent; // the woven identity; item = agent.item, originSide rides to idle
+  key: string; // = agent.id = the live item id — the React key
+  agent: TtsAgent; // the woven identity; item = agent.item, originSide rides to idle
   phase: TtsPhase;
   slot: number; // visual row (0 = head); the sole position driver
-  promoteN?: number; // click-time slot n — feeds the L-path keyframe's --n
 }
 
-// Per-phase class set. The reverb (--speaking) is DELAYED until the dial LANDS at
-// the head: during the travel the dial rides on top of the column (z:3), so a
-// reverb there would throw rings over the other dials; holding it until `speaking`
-// (where it sits at z:1, behind its siblings) keeps the shockwaves tucked cleanly
-// behind them. The start-lag is faithful anyway — real playback waits on token-api,
-// a MacroDroid ping for mobile, or WSL inter-device comms before the voice begins.
 const TTS_PHASE_CLASS: Record<TtsPhase, string> = {
   arriving: 'tts-dial tts-dial--arriving', // rendered but opacity:0 until the flight lands
   idle: 'tts-dial',
-  promoting: 'tts-dial tts-dial--promoting',
   speaking: 'tts-dial tts-dial--speaking',
   dismissing: 'tts-dial tts-dial--dismissing',
 };
 
-function TtsStack({ agents, pendingIds, onOpenDrawer, onTtsFinish, uiScale }: {
-  agents: Agent[]; // roster — the SOLE membership source; slot/phase are internal
+function TtsStack({ agents, pendingIds, onOpenDrawer, uiScale }: {
+  agents: TtsAgent[]; // live roster, queue order — the SOLE membership source
   pendingIds: ReadonlySet<string>; // agents inserted but INVISIBLE until their flight lands
   onOpenDrawer: (id: string) => void;
-  onTtsFinish: (agent: Agent, headRectVp: { x: number; y: number } | null) => void; // terminal → controller
   uiScale: number;
 }) {
   // Stateful ORDERED queue (slot = array index-ish) with stable per-entry keys.
-  // Keys ARE the agents' session-global ids, so identity survives every reorder +
-  // removal. Membership is roster-driven (see the reconcile below); only slot/phase
-  // live here. Seeded from the initial roster (empty at first paint).
+  // Keys ARE the live item ids, so identity survives every reorder + removal.
+  // Membership is roster-driven (see the reconcile below); only slot/phase live
+  // here. Seeded from the initial roster (empty at first paint).
   const [entries, setEntries] = useState<TtsEntry[]>(() =>
-    agents.map((a, i) => ({ key: a.id, agent: a, phase: 'idle' as TtsPhase, slot: i })),
+    agents.map((a, i) => ({
+      key: a.id,
+      agent: a,
+      phase: (a.item.status === 'speaking' ? 'speaking' : 'idle') as TtsPhase,
+      slot: i,
+    })),
   );
   // Mirror entries into a ref so the roster reconcile (deps [agents, pendingIds])
   // and the async timers read the FRESH list without re-subscribing every change.
   const entriesRef = useRef(entries);
   entriesRef.current = entries;
 
-  // Stage timers (promote-land → speak window → dismiss → remove). Tracked so an
-  // unmount / hot-reload can't leave a setState firing on a dead component.
+  // Dismiss timers (fade → drop + shuffle-up). Tracked so an unmount /
+  // hot-reload can't leave a setState firing on a dead component.
   const timers = useRef<number[]>([]);
   useEffect(() => () => timers.current.forEach((t) => clearTimeout(t)), []);
   const after = (ms: number, fn: () => void) => {
     timers.current.push(window.setTimeout(fn, ms));
   };
 
-  // ROSTER RECONCILE — the membership source. Diffs the incoming Agent[] against the
-  // live entries BY ID: new ids append at the deepest slot (INVISIBLE 'arriving' while
-  // their flight is pending, else straight to 'idle'); dropped ids fade out then
-  // shuffle the deeper slots up; an 'arriving' entry whose id leaves pendingIds is
-  // revealed. Membership is NEVER mutated by the play gesture — it only ever changes
-  // here, so the roster and the stack can't diverge.
+  // ROSTER RECONCILE — the live queue is the ONLY mutator. Diffs the incoming
+  // TtsAgent[] against the live entries BY ID:
+  //   • added: append at the deepest slot (INVISIBLE 'arriving' while its
+  //     handoff flight is pending, else straight to its live phase);
+  //   • removed (a live drain): fade out ('dismissing'), then drop + shuffle
+  //     the deeper slots up after DISMISS_MS;
+  //   • present: refresh the agent (live item status updates), derive phase
+  //     from the live status ('speaking' reverberates), and reveal an
+  //     'arriving' entry whose id has left pendingIds;
+  //   • slot-sync: non-dismissing slots re-map to the live queue's order, so a
+  //     live reorder animates via the transform transition.
+  // The stack never cycles, repeats, or invents items to fill depth.
   useEffect(() => {
     const prev = entriesRef.current;
     const prevIds = new Set(prev.map((e) => e.key));
     const rosterIds = new Set(agents.map((a) => a.id));
     const added = agents.filter((a) => !prevIds.has(a.id));
     const removed = prev.filter((e) => !rosterIds.has(e.key) && e.phase !== 'dismissing');
-    const toReveal = prev.filter((e) => e.phase === 'arriving' && !pendingIds.has(e.key));
-    if (!added.length && !removed.length && !toReveal.length) return;
 
     setEntries((cur) => {
-      let next = cur.map((e) =>
-        toReveal.some((r) => r.key === e.key) ? { ...e, phase: 'idle' as TtsPhase } : e,
-      );
-      // Removals fade in place; the actual drop + shuffle-up lands after DISMISS_MS.
-      if (removed.length) {
-        const gone = new Set(removed.map((r) => r.key));
-        next = next.map((e) => (gone.has(e.key) ? { ...e, phase: 'dismissing' as TtsPhase } : e));
-      }
+      const byId = new Map(agents.map((a) => [a.id, a]));
+      const gone = new Set(removed.map((r) => r.key));
+      let changed = false;
+      let next = cur.map((e) => {
+        // Removals fade in place; the drop + shuffle-up lands after DISMISS_MS.
+        if (gone.has(e.key)) {
+          changed = true;
+          return { ...e, phase: 'dismissing' as TtsPhase };
+        }
+        const live = byId.get(e.key);
+        if (!live || e.phase === 'dismissing') return e;
+        // Present: refresh the item + derive the phase from the live status
+        // (held at 'arriving' while its handoff flight is still inbound).
+        const phase: TtsPhase =
+          e.phase === 'arriving' && pendingIds.has(e.key)
+            ? 'arriving'
+            : live.item.status === 'speaking'
+              ? 'speaking'
+              : 'idle';
+        if (e.agent === live && e.phase === phase) return e;
+        changed = true;
+        return { ...e, agent: live, phase };
+      });
       // Additions append at the deepest slot (max+1…), preserving existing rows.
-      if (added.length) {
+      const fresh = added.filter((a) => !next.some((e) => e.key === a.id));
+      if (fresh.length) {
+        changed = true;
         let slot = next.reduce((m, e) => Math.max(m, e.slot), -1) + 1;
-        for (const a of added) {
-          next = [...next, { key: a.id, agent: a, phase: pendingIds.has(a.id) ? 'arriving' : 'idle', slot }];
+        for (const a of fresh) {
+          const phase: TtsPhase = pendingIds.has(a.id)
+            ? 'arriving'
+            : a.item.status === 'speaking'
+              ? 'speaking'
+              : 'idle';
+          next = [...next, { key: a.id, agent: a, phase, slot }];
           slot++;
         }
       }
-      return next;
+      // Slot-sync: express the live queue's ORDER through the slots the live
+      // (non-dismissing) entries currently occupy, lowest-first — a reorder
+      // becomes a pure slot swap (array order untouched, see the TtsEntry note).
+      const rosterIndex = new Map(agents.map((a, i) => [a.id, i]));
+      const liveEntries = next.filter((e) => e.phase !== 'dismissing' && rosterIndex.has(e.key));
+      const slotsAsc = liveEntries.map((e) => e.slot).sort((a, b) => a - b);
+      const inQueueOrder = [...liveEntries].sort(
+        (a, b) => (rosterIndex.get(a.key) ?? 0) - (rosterIndex.get(b.key) ?? 0),
+      );
+      const slotFix = new Map<string, number>();
+      inQueueOrder.forEach((e, i) => {
+        if (e.slot !== slotsAsc[i]) slotFix.set(e.key, slotsAsc[i]);
+      });
+      if (slotFix.size) {
+        changed = true;
+        next = next.map((e) => (slotFix.has(e.key) ? { ...e, slot: slotFix.get(e.key)! } : e));
+      }
+      return changed ? next : cur;
     });
 
     // Schedule each removal's real drop + shuffle-up one DISMISS_MS out.
     removed.forEach((r) => {
       after(DISMISS_MS, () =>
         setEntries((cur) => {
-          const gone = cur.find((e) => e.key === r.key);
-          if (!gone) return cur;
+          const goneEntry = cur.find((e) => e.key === r.key);
+          if (!goneEntry) return cur;
           return cur
             .filter((e) => e.key !== r.key)
-            .map((e) => (e.slot > gone.slot ? { ...e, slot: e.slot - 1 } : e));
+            .map((e) => (e.slot > goneEntry.slot ? { ...e, slot: e.slot - 1 } : e));
         }),
       );
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agents, pendingIds]);
-
-  // Stage 3: after the speak window, hand the terminal dial to the controller (which
-  // drops it from the roster → the reconcile above fades + shuffles). We measure the
-  // head node's rect FIRST so the controller can fly it out to the idle rail.
-  function scheduleSpeak(key: string, durationMs: number) {
-    after(durationMs, () => {
-      const done = entriesRef.current.find((e) => e.key === key);
-      if (!done) return;
-      onTtsFinish(done.agent, agentNodeCenter(key, '.tts-stack'));
-    });
-  }
-
-  // The play gesture. ONE active speaker: while a dial is mid play-gesture, new
-  // promote clicks are ignored — matches the live single serialized speak_tts queue.
-  // (An 'arriving' dial is NOT in the play gesture, so a worker landing doesn't
-  // freeze the queue.)
-  function promote(key: string) {
-    if (entries.some((e) => e.phase === 'promoting' || e.phase === 'speaking' || e.phase === 'dismissing')) return;
-    const clicked = entries.find((e) => e.key === key);
-    if (!clicked || clicked.phase !== 'idle') return;
-    const n = clicked.slot;
-    const durationMs = clicked.agent.item.durationMs ?? SPEAK_MS;
-
-    if (n === 0) {
-      // Base case: the head plays IN PLACE — no movement, just reverberate + speak.
-      setEntries((prev) => prev.map((e) => (e.key === key ? { ...e, phase: 'speaking' as TtsPhase } : e)));
-      scheduleSpeak(key, durationMs);
-      return;
-    }
-
-    // n ≥ 1: MUTATE slots in place (array order untouched — see the TtsEntry note).
-    // First, mark the clicked dial promoting + move it to slot 0; it rides the
-    // L-path keyframe (--n = n) so it visually travels right → up → left.
-    setEntries((prev) =>
-      prev.map((e) => (e.key === key ? { ...e, slot: 0, promoteN: n, phase: 'promoting' as TtsPhase } : e)),
-    );
-    // Then, a beat later (once x has cleared right), shift every dial in slots
-    // 0…n−1 down +1 — their translateY transitions animate them straight DOWN one
-    // unit, clearing slot 0 for x's landing. Deeper slots are untouched.
-    after(SHIFT_DELAY_MS, () => {
-      setEntries((prev) => prev.map((e) => (e.key !== key && e.slot < n ? { ...e, slot: e.slot + 1 } : e)));
-    });
-    // When the L-path lands the dial is already at slot 0 (base transform
-    // translate(0,0) == the keyframe's end), so dropping `promoting` for `speaking`
-    // is jump-free; then the speak window opens.
-    after(PROMOTE_MS, () => {
-      setEntries((prev) => prev.map((e) => (e.key === key ? { ...e, phase: 'speaking' as TtsPhase } : e)));
-      scheduleSpeak(key, durationMs);
-    });
-  }
 
   // Flag any persona that repeats in the queue (2nd+ occurrence, by slot order) —
   // a DB-invariant breach the stack surfaces rather than hides (see the helper).
@@ -1158,12 +1205,10 @@ function TtsStack({ agents, pendingIds, onOpenDrawer, onTtsFinish, uiScale }: {
             left: TTS_LEFT * uiScale,
             top: TTS_TOP * uiScale,
             // §2 — slot (NOT array index) is expressed PURELY as a transform, so
-            // any slot reassignment (shift-down, shuffle-up) animates for free.
+            // any slot reassignment (live reorder, drain shuffle-up) animates free.
             transform: `translateY(${e.slot * TTS_ROW * uiScale}px)`,
-            ['--n']: e.promoteN ?? 0,
           } as React.CSSProperties}
           onOpenDrawer={onOpenDrawer}
-          onActivate={promote}
         />
       ))}
     </div>
@@ -1186,6 +1231,7 @@ function DialsDrawer({
   focusedId: string | null;
   onClose: () => void;
 }) {
+  const { dials } = useCockpitData(); // live catalog — same models the fan renders
   useEffect(() => {
     if (!open) return;
     function onKey(e: KeyboardEvent) {
@@ -2098,15 +2144,19 @@ interface WorkerEntry {
 }
 
 // One side of the "M": a self-contained reflowing queue riding `path`. Mirrors
-// TtsStack — roster-driven membership (diff by id), slot-only positioning. A worker
-// click FINISHES it (measure + hand the controller the arm polyline for the flight);
-// the idle variant has no finish (idle is terminal this pass) so its clicks are inert.
-function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inset, split, insertMode, onFinish, baseline }: {
+// TtsStack — roster-driven membership (diff by id), slot-only positioning. Both
+// variants are DEMO surfaces this phase (fleet wiring lands phase 2), so chip
+// clicks are inert everywhere; a worker FINISH (the edge-A handoff, measure +
+// hand the controller the arm polyline for the flight) fires programmatically
+// via `finishRequest` when the LIVE TTS queue gains an item — never from a
+// click, which would fabricate a queue entry.
+function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inset, split, insertMode, onFinish, finishRequest, baseline }: {
   side: number; roster: Agent[]; pendingIds: ReadonlySet<string>;
   geo: LemonGeometry; uiScale: number;
   gap: number; pitch: number; inset: number; split: number;
   insertMode: 'center' | 'tail'; // worker births emerge at the CENTRE; idle arrivals append at the DEEPEST slot
-  onFinish?: ((spec: WorkerFinishSpec) => void) | undefined; // worker → controller; absent (idle) ⇒ clicks inert
+  onFinish?: ((spec: WorkerFinishSpec) => void) | undefined; // worker → controller; absent (idle) ⇒ no handoffs
+  finishRequest?: { agentId: string; nonce: number } | null | undefined; // controller-issued edge-A handoff (see the effect)
   baseline?: ((x: number, floorY: number) => number) | undefined; // override the chip Y (idle: ride the crossbar, but wrap the clock); gets x + the path's own floor y; default = floorY
 }) {
   const [entries, setEntries] = useState<WorkerEntry[]>(() =>
@@ -2195,13 +2245,13 @@ function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inse
   const path = useMemo(() => makeQueuePath(side, geo, uiScale, gap, inset), [side, geo, uiScale, gap, inset]);
   const chip = WORKER_CHIP_PX * uiScale;
 
-  // Click FINISHES a worker: measure the clicked button's viewport rect, build the arm
+  // FINISH a worker (edge A): measure the chip's viewport rect, build the arm
   // polyline (sampled from the filleted path, converted local→viewport by a pure
   // translation — valid because the compass rail is un-flipped), and hand it to the
   // controller. The controller drops the agent from this roster (→ instant reconcile
   // removal) and flies it to the TTS bottom. NO local dismiss — the flight IS the exit.
   function finish(entry: WorkerEntry, buttonEl: HTMLElement) {
-    if (!onFinish) return; // idle variant — clicks inert (idle is terminal this pass)
+    if (!onFinish) return; // idle variant — terminal this pass, no handoffs
     const sArc = (split + entry.slot * pitch) * uiScale;
     const localStart = path.pointAt(sArc);
     const r = buttonEl.getBoundingClientRect();
@@ -2222,6 +2272,21 @@ function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inse
     }
     onFinish({ agent: entry.agent, side: side as OriginSide, armPolylineVp });
   }
+
+  // Programmatic edge-A handoff: the controller (having seen a LIVE TTS arrival)
+  // names one of this column's chips as the visual source. If the id lives here,
+  // measure its rendered node and run the finish. The controller owns the
+  // no-chip-found fallback (it reveals the arrival without a flight), so a miss
+  // here is simply ignored.
+  useEffect(() => {
+    if (!finishRequest || !onFinish) return;
+    const entry = entriesRef.current.find((e) => e.key === finishRequest.agentId);
+    if (!entry) return;
+    const sel = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(entry.key) : entry.key;
+    const el = document.querySelector(`[data-agent-id="${sel}"]`);
+    if (el instanceof HTMLElement) finish(entry, el);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finishRequest]);
 
   // A persona must be unique within this queue — the DB's invariant. When the data
   // breaks it (personas cycle once the roster exceeds the registry), the repeats are
@@ -2262,14 +2327,14 @@ function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inse
             type="button"
             className="worker-chip"
             data-agent-id={e.key}
-            aria-label={`Worker ${e.agent.persona}${isDup ? ' — DUPLICATE (singleton breach)' : ''}${onFinish ? ' — finish' : ''}`}
+            aria-label={`${insertMode === 'tail' ? 'Idle worker' : 'Worker'} ${e.agent.persona} (demo — fleet wiring lands phase 2)${isDup ? ' — DUPLICATE (singleton breach)' : ''}`}
+            title="demo — fleet wiring lands phase 2"
             style={{
               width: chip,
               height: chip,
               // slot expressed PURELY as a transform → any slot change animates for free.
               transform: `translate(${p.x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -50%)`,
             }}
-            onClick={onFinish ? (ev) => finish(e, ev.currentTarget) : undefined}
           >
             <span
               className={`worker-chip__disc${e.phase === 'dismissing' ? ' worker-chip__disc--out' : ''}${e.phase === 'entering' ? ' worker-chip__disc--in' : ''}${e.phase === 'arriving' ? ' worker-chip__disc--arriving' : ''}${isDup ? ' worker-chip__disc--dup' : ''}`}
@@ -2644,11 +2709,12 @@ function ClockDial({ cx, cy, capR, rimD, uiScale, queueValue, flip, animate }: {
   );
 }
 
-function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true, onFinishLeft, onFinishRight }: {
+function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true, onFinishLeft, onFinishRight, finishRequest }: {
   leftRoster: Agent[]; rightRoster: Agent[]; pendingIds: ReadonlySet<string>;
   uiScale: number; gap: number; pitch: number; inset: number; split: number;
   variant?: 'compass' | 'clock'; queueValue?: number; flip?: boolean; animate?: boolean;
   onFinishLeft?: ((spec: WorkerFinishSpec) => void) | undefined; onFinishRight?: ((spec: WorkerFinishSpec) => void) | undefined;
+  finishRequest?: { agentId: string; nonce: number } | null; // edge-A handoff request — handed to BOTH columns; only the one holding the id acts
 }) {
   // Crossbar + hourglass shape is LOCKED — read straight from the frozen constants.
   // The by-eye dev-tuning sliders and the `shape` prop have been retired.
@@ -3066,9 +3132,9 @@ function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch
         </svg>
       )}
       <WorkerColumn side={-1} roster={leftRoster} pendingIds={pendingIds} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} insertMode={insertMode} onFinish={onFinishLeft}
-        baseline={variant === 'clock' && rail ? idleBaselineTip : undefined} />
+        finishRequest={finishRequest} baseline={variant === 'clock' && rail ? idleBaselineTip : undefined} />
       <WorkerColumn side={1} roster={rightRoster} pendingIds={pendingIds} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} insertMode={insertMode} onFinish={onFinishRight}
-        baseline={variant === 'clock' && rail ? idleBaselineClock : undefined} />
+        finishRequest={finishRequest} baseline={variant === 'clock' && rail ? idleBaselineClock : undefined} />
     </div>
   );
 }
@@ -3088,7 +3154,7 @@ function IdleWorkerQueue({ clockValue, idleLeft, idleRight, pendingIds, uiScale,
   const total = idleLeft.length + idleRight.length;
   return (
     <section className="idle-worker-queue"
-      aria-label={`Idle worker queue — ${total} idle worker${total === 1 ? '' : 's'}`}>
+      aria-label={`Idle worker queue (demo — fleet wiring lands phase 2) — ${total} idle worker${total === 1 ? '' : 's'}`}>
       {/* Idle is TERMINAL this pass (no idle→worker edge), so no onFinish — clicks inert. */}
       <WorkerQueues leftRoster={idleLeft} rightRoster={idleRight} pendingIds={pendingIds} uiScale={uiScale}
         gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
@@ -3335,38 +3401,89 @@ function FlightLayer({ flights, onLand }: { flights: Flight[]; onLand: (f: Fligh
   );
 }
 
+// How long a pending (invisible-until-flight-lands) arrival may stay hidden
+// before the controller force-reveals it. A bounded ops wait, not a scheduler:
+// flights resolve in <1.2s (measure ≤6 frames + the longest flight + slack);
+// if the handoff machinery ever drops one (source chip vanished mid-request,
+// WAAPI unavailable), the LIVE dial must still become visible — hiding real
+// queue data behind a lost animation would be the dishonest failure mode.
+const PENDING_REVEAL_FAILSAFE_MS = 2500;
+
+// Idle rail retention, per side. The idle legs are a DEMO surface fed by live
+// TTS drains (every drained utterance parks a chip); without a cap a full day
+// of traffic would flood the rail. FIFO — the oldest chip retires as a new one
+// lands.
+const IDLE_DEMO_CAP = 8;
+
 // ═══════════════════════════════════════════════════════════════════════════
-// LIFECYCLE CONTROLLER — the single owner of the five rosters + the flight overlay.
-// Replaces the six per-queue count knobs. Mints an Agent once at worker birth and
-// weaves it worker → TTS → idle; each edge does source-removal + destination-insert
-// (INVISIBLE 'arriving' while pending) + a rendered-then-measured flight. Under
-// reduced motion it short-circuits to synchronous handoffs (no flight, immediate
-// reveal). Rosters are NOT persisted (a design-study reload resets to the seed —
-// avoids stale-identity reload bugs).
+// LIFECYCLE CONTROLLER — the single owner of the five rosters + the flight
+// overlay. The weave is LIVE-DRIVEN at the TTS leg and demo-dressed at the
+// worker/idle legs (fleet wiring lands phase 2):
+//
+//   • TTS roster: minted 1:1 from the live speak queue (`liveTts`, ordered) —
+//     never synthesized, never cycled. `null` (feed down/warming) FREEZES the
+//     weave; the last-good roster holds while the degraded banner shows.
+//   • edge A (worker → TTS): a LIVE arrival (new queue item id) triggers it.
+//     A demo worker chip is drafted as the visual source — it rides its arm to
+//     the ditch corner and pops to the TTS bottom, where the (invisible,
+//     'arriving') LIVE dial is revealed on landing. The flight wears the demo
+//     worker's persona; the landed dial renders the live item's. No demo
+//     workers on the rail ⇒ the live dial simply appears (no flight).
+//   • edge B (TTS → idle): a LIVE drain (item id left the queue) triggers it.
+//     The departing dial flies out to the idle rail and parks a demo idle chip
+//     carrying the drained item's persona, returning to the side the edge-A
+//     source came from (alternating when unknown).
+//
+// Each edge does source-removal + destination-insert (INVISIBLE 'arriving'
+// while pending) + a rendered-then-measured flight. Under reduced motion it
+// short-circuits to synchronous handoffs (no flight, immediate reveal).
+// Demo rosters are NOT persisted (a reload resets workers to the 4·4 seed).
 // ═══════════════════════════════════════════════════════════════════════════
-function useLifecycle(uiScale: number, reducedMotion: boolean) {
+function useLifecycle(uiScale: number, reducedMotion: boolean, liveTts: TtsItem[] | null) {
   const seqRef = useRef(0);
+  // Demo mint — worker/idle identities only (persona catalog dressing). The TTS
+  // roster is NEVER minted here; see mintLiveAgent below.
   const mint = (side: OriginSide): Agent => {
     const n = seqRef.current++;
     const persona = WORKER_PERSONAS[n % WORKER_PERSONAS.length];
     const tone = WORKER_TONES[n % WORKER_TONES.length];
-    return { id: `ag-${n}`, persona, tone, originSide: side, item: workerPersonaToTtsItem(persona) };
+    return { id: `ag-${n}`, persona, tone, originSide: side, };
   };
 
-  // Seed: 4·4 workers, empty TTS/idle. (mint() runs left-then-right at init.)
+  // Seed: 4·4 demo workers, empty TTS/idle. (mint() runs left-then-right at init.)
   const [workerLeft, setWorkerLeft] = useState<Agent[]>(() => Array.from({ length: 4 }, () => mint(-1)));
   const [workerRight, setWorkerRight] = useState<Agent[]>(() => Array.from({ length: 4 }, () => mint(1)));
-  const [ttsAgents, setTtsAgents] = useState<Agent[]>([]);
+  const [ttsAgents, setTtsAgents] = useState<TtsAgent[]>([]);
   const [idleLeft, setIdleLeft] = useState<Agent[]>([]);
   const [idleRight, setIdleRight] = useState<Agent[]>([]);
   const [flights, setFlights] = useState<Flight[]>([]);
   const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set<string>());
+  // Edge-A handoff request routed to the worker columns (only the column holding
+  // the id acts). Nonce so back-to-back requests for different chips re-fire.
+  const [finishRequest, setFinishRequest] = useState<{ agentId: string; nonce: number } | null>(null);
 
-  // Fresh reads for async closures (measurement fires a frame after the click).
+  // Fresh reads for async closures (measurement fires a frame after the poll).
   const uiScaleRef = useRef(uiScale);
   uiScaleRef.current = uiScale;
   const reducedRef = useRef(reducedMotion);
   reducedRef.current = reducedMotion;
+  const workerLeftRef = useRef(workerLeft);
+  workerLeftRef.current = workerLeft;
+  const workerRightRef = useRef(workerRight);
+  workerRightRef.current = workerRight;
+  const ttsAgentsRef = useRef(ttsAgents);
+  ttsAgentsRef.current = ttsAgents;
+
+  // Weave bookkeeping (refs — none of this is render state):
+  // the last PROCESSED live snapshot (null until the first healthy poll)…
+  const prevItemsRef = useRef<Map<string, TtsItem> | null>(null);
+  // …drafted-source → live-arrival pairs awaiting their WorkerColumn measure…
+  const handoffRef = useRef<Map<string, string>>(new Map());
+  // …live id → the side its edge-A source came from (edge B returns there)…
+  const originSideRef = useRef<Map<string, OriginSide>>(new Map());
+  // …and the alternator for drains whose origin side was never recorded.
+  const altSideRef = useRef<OriginSide>(1);
+  const nonceRef = useRef(0);
 
   // rAF + timeout ids tracked for unmount/HMR cleanup (mirrors the queue components).
   const rafs = useRef<number[]>([]);
@@ -3380,13 +3497,19 @@ function useLifecycle(uiScale: number, reducedMotion: boolean) {
     rafs.current.push(id);
     return id;
   };
+  const after = (ms: number, fn: () => void) => {
+    timers.current.push(window.setTimeout(fn, ms));
+  };
 
-  const addPending = (id: string) =>
+  const addPending = (id: string) => {
     setPendingIds((prev) => {
       const n = new Set(prev);
       n.add(id);
       return n;
     });
+    // Failsafe: never leave a LIVE dial invisible behind a lost flight.
+    after(PENDING_REVEAL_FAILSAFE_MS, () => removePending(id));
+  };
   const removePending = (id: string) =>
     setPendingIds((prev) => {
       if (!prev.has(id)) return prev;
@@ -3428,7 +3551,114 @@ function useLifecycle(uiScale: number, reducedMotion: boolean) {
 
   const pushFlight = (f: Flight) => setFlights((prev) => [...prev, f]);
 
-  // ── worker births ──────────────────────────────────────────────────────────
+  // Live TTS item → woven TtsAgent. id = the live item id (the React key in the
+  // stack AND, after edge B, the idle chip); persona = the live sender's; tone
+  // cycles the demo palette (pure dressing — the dial's own tone comes from the
+  // live status via ttsItemToDial). originSide is patched at edge-A draft time.
+  const mintLiveAgent = (item: TtsItem): TtsAgent => {
+    const n = seqRef.current++;
+    return {
+      id: item.id,
+      persona: item.persona,
+      tone: WORKER_TONES[n % WORKER_TONES.length],
+      originSide: altSideRef.current,
+      item,
+    };
+  };
+
+  // Render-relevant item equality — lets the roster keep object identity across
+  // the 2s polls (toTtsQueue mints fresh objects every poll, same content).
+  const sameItemRender = (a: TtsItem, b: TtsItem): boolean =>
+    a.status === b.status && a.text === b.text && a.route === b.route &&
+    a.senderName === b.senderName && a.persona === b.persona;
+
+  // ── THE WEAVE DRIVER — diff each healthy live snapshot ─────────────────────
+  useEffect(() => {
+    if (!liveTts) return; // feed down/warming — freeze the weave, hold last-good
+    const prev = prevItemsRef.current;
+    prevItemsRef.current = new Map(liveTts.map((i) => [i.id, i]));
+
+    // First healthy snapshot: baseline-populate the roster, no flights (nothing
+    // "arrived" — the queue was simply already there when the cockpit opened).
+    if (prev === null) {
+      setTtsAgents(liveTts.map((item) => mintLiveAgent(item)));
+      return;
+    }
+
+    const curIds = new Set(liveTts.map((i) => i.id));
+    const addedItems = liveTts.filter((i) => !prev.has(i.id));
+    const removedItems = [...prev.values()].filter((i) => !curIds.has(i.id));
+
+    // Edge B FIRST (measure the departing dials while their nodes are still in
+    // the DOM — the roster update below is what triggers their dismissal).
+    for (const item of removedItems) {
+      const fromVp = agentNodeCenter(item.id, '.tts-stack');
+      const side: OriginSide =
+        originSideRef.current.get(item.id) ??
+        (altSideRef.current = (altSideRef.current < 0 ? 1 : -1) as OriginSide);
+      originSideRef.current.delete(item.id);
+      const n = seqRef.current++;
+      const idleAgent: Agent = {
+        id: item.id, // the SAME identity rides TTS → idle (scoped measures disambiguate)
+        persona: item.persona,
+        tone: WORKER_TONES[n % WORKER_TONES.length],
+        originSide: side,
+      };
+      // FIFO retention: the oldest demo chip retires as the new one lands.
+      (side < 0 ? setIdleLeft : setIdleRight)((prevIdle) =>
+        [...prevIdle, idleAgent].slice(-IDLE_DEMO_CAP),
+      );
+      if (reducedRef.current) continue; // synchronous handoff
+      addPending(item.id);
+      spawnFlightToAgent(item.id, '.idle-worker-queue', (destVp) => {
+        pushFlight({
+          id: `fl-${item.id}-b`,
+          destId: item.id,
+          persona: item.persona,
+          tone: idleAgent.tone,
+          d: pointsToPath([fromVp ?? destVp, destVp]),
+          sizeFrom: TTS_DIAL_PX * uiScaleRef.current,
+          sizeTo: WORKER_CHIP_PX * uiScaleRef.current,
+          durationMs: FLIGHT_TTS_IDLE_MS,
+        });
+      });
+    }
+
+    // Rebuild the TTS roster in live-queue order: existing agents keep identity
+    // (item refreshed only when its rendered fields moved), arrivals mint fresh.
+    const prevAgentsById = new Map(ttsAgentsRef.current.map((a) => [a.id, a]));
+    const nextAgents = liveTts.map((item) => {
+      const existing = prevAgentsById.get(item.id);
+      if (!existing) return mintLiveAgent(item);
+      return sameItemRender(existing.item, item) ? existing : { ...existing, item };
+    });
+    setTtsAgents((cur) =>
+      cur.length === nextAgents.length && cur.every((a, i) => a === nextAgents[i])
+        ? cur
+        : nextAgents,
+    );
+
+    // Edge A: draft a demo worker as the live arrival's visual source. The
+    // fuller side gives up its OLDEST chip (slot 0 — the full arm ride). ONE
+    // handoff per pass (requests within a pass would collapse anyway — the
+    // columns act per finishRequest change); a multi-arrival burst flies its
+    // first item and the rest appear in place, exactly like an empty rail.
+    if (!reducedRef.current && addedItems.length) {
+      const wl = workerLeftRef.current;
+      const wr = workerRightRef.current;
+      const source = wl.length >= wr.length ? wl[0] : wr[0];
+      if (source) {
+        const item = addedItems[0];
+        originSideRef.current.set(item.id, source.originSide);
+        handoffRef.current.set(source.id, item.id);
+        addPending(item.id); // arriving-invisible until the flight lands
+        setFinishRequest({ agentId: source.id, nonce: ++nonceRef.current });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveTts]);
+
+  // ── worker births (the demobar's only queue knob) ───────────────────────────
   const addWorker = (side: OriginSide) => {
     const cur = side < 0 ? workerLeft : workerRight;
     if (cur.length >= MAX_WORKER_COUNT) return;
@@ -3436,25 +3666,31 @@ function useLifecycle(uiScale: number, reducedMotion: boolean) {
     (side < 0 ? setWorkerLeft : setWorkerRight)((prev) => [...prev, a]);
   };
 
-  // ── edge A: worker → TTS ─────────────────────────────────────────────────────
+  // ── edge A, second half: the drafted column measured its chip ──────────────
+  // Remove the demo source from its rail (instant reconcile removal — the
+  // flight is the exit) and fly it to the LIVE arrival waiting at the TTS
+  // bottom. The flight wears the demo worker's persona; landing reveals the
+  // live dial (see the weave driver).
   const finishWorker = (spec: WorkerFinishSpec) => {
     const { agent, side, armPolylineVp } = spec;
-    // Source removal (instant — no dismiss fade; the flight is the exit).
+    const liveId = handoffRef.current.get(agent.id);
+    handoffRef.current.delete(agent.id);
+    if (!liveId) return; // no paired live arrival — ignore (stale request)
     (side < 0 ? setWorkerLeft : setWorkerRight)((prev) => prev.filter((a) => a.id !== agent.id));
-    // Destination insert (deepest TTS slot).
-    setTtsAgents((prev) => [...prev, agent]);
-    if (reducedRef.current) return; // synchronous handoff — appears at its TTS slot at once
-    addPending(agent.id); // render it INVISIBLE until the flight lands
+    if (reducedRef.current) {
+      removePending(liveId);
+      return;
+    }
     // Right-side routing hook: 'own' rides its own arm to its own corner (default);
-    // 'left' collapses the right side to a straight pop from the click point (a stand-in
-    // until real "route to the left corner first" geometry is wired). Left always rides
-    // its own short arm.
+    // 'left' collapses the right side to a straight pop from the chip's spot (a
+    // stand-in until real "route to the left corner first" geometry is wired).
+    // Left always rides its own short arm.
     const useOwnArm = TTS_FEED_CORNER === 'own' || side < 0;
     const armVp = useOwnArm ? armPolylineVp : [armPolylineVp[0]];
-    spawnFlightToAgent(agent.id, '.tts-stack', (destVp) => {
+    spawnFlightToAgent(liveId, '.tts-stack', (destVp) => {
       pushFlight({
-        id: `fl-${agent.id}-a`,
-        destId: agent.id,
+        id: `fl-${liveId}-a`,
+        destId: liveId,
         persona: agent.persona,
         tone: agent.tone,
         d: pointsToPath([...armVp, destVp]),
@@ -3465,35 +3701,12 @@ function useLifecycle(uiScale: number, reducedMotion: boolean) {
     });
   };
 
-  // ── edge B: TTS → idle ───────────────────────────────────────────────────────
-  const finishTts = (agent: Agent, headRectVp: { x: number; y: number } | null) => {
-    // Source removal (roster drop → TtsStack fades + shuffles up).
-    setTtsAgents((prev) => prev.filter((a) => a.id !== agent.id));
-    // Destination insert on the ORIGIN side (same-side return, guaranteed by originSide).
-    (agent.originSide < 0 ? setIdleLeft : setIdleRight)((prev) => [...prev, agent]);
-    if (reducedRef.current) return; // synchronous handoff
-    addPending(agent.id);
-    spawnFlightToAgent(agent.id, '.idle-worker-queue', (destVp) => {
-      const head = headRectVp ?? destVp;
-      pushFlight({
-        id: `fl-${agent.id}-b`,
-        destId: agent.id,
-        persona: agent.persona,
-        tone: agent.tone,
-        d: pointsToPath([head, destVp]),
-        sizeFrom: TTS_DIAL_PX * uiScaleRef.current,
-        sizeTo: WORKER_CHIP_PX * uiScaleRef.current,
-        durationMs: FLIGHT_TTS_IDLE_MS,
-      });
-    });
-  };
-
   // Derived: clock numerals track idle depth (0–6), no longer a manual knob.
   const clockValue = Math.min(6, idleLeft.length + idleRight.length);
 
   return {
     workerLeft, workerRight, ttsAgents, idleLeft, idleRight, flights, pendingIds, clockValue,
-    addWorker, finishWorker, finishTts, landFlight,
+    addWorker, finishWorker, finishRequest, landFlight,
   };
 }
 
@@ -3506,18 +3719,39 @@ function pointsToPath(pts: { x: number; y: number }[]): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-export function MockOpsCockpit() {
-  const [dialCount, setDialCount] = usePersistedNumber('dialCount', initialDialCount);
+export function OpsCockpit() {
+  // ── The live data spine — the two Token-API read-model feeds ──────────────
+  const opsState = useOpsState(2000);
+  const timerHistory = useTimerHistory(60, 30000);
+
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [focusedDial, setFocusedDial] = useState<string | null>(null);
   const [fracTop, setFracTop] = usePersistedNumber('fracTop', 4); // big-dial numerator (focus)
   const [fracBot, setFracBot] = usePersistedNumber('fracBot', 1); // big-dial denominator (distraction)
-  const [breakMin, setBreakMin] = usePersistedNumber('breakMin', 0); // break-timer elapsed minutes
-  // The three queues are now ONE woven lifecycle, owned by useLifecycle (instantiated
-  // after uiScale below): workers finishing feed TTS; TTS dials finishing feed idle.
-  // TTS depth, idle depth, and the clock value are all DERIVED — the only manual knob
-  // left is "add worker left/right". Rosters are not persisted (reset to seed on reload).
+  // The three queues are ONE woven lifecycle, owned by useLifecycle (instantiated
+  // after uiScale below): live TTS arrivals draft demo worker chips (edge A); live
+  // TTS drains park demo idle chips (edge B). TTS depth, idle depth, and the clock
+  // value are all DERIVED — the only manual knob left is "add worker left/right".
+  // Demo rosters are not persisted (reset to seed on reload).
   const reducedMotion = usePrefersReducedMotion();
+
+  // Deploy-follow: the always-open cockpit window reloads itself when a new UI
+  // build lands. Remember the first non-null ui_build_id the state feed reports;
+  // when a later poll carries a DIFFERENT non-null id, the served bundle has
+  // changed under us — reload to pick it up. (Same semantics as the old app.)
+  const initialBuildId = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const state = opsState.data;
+    if (!state) return;
+    if (initialBuildId.current === undefined) {
+      initialBuildId.current = state.ui_build_id;
+      return;
+    }
+    if (state.ui_build_id && initialBuildId.current && state.ui_build_id !== initialBuildId.current) {
+      window.location.reload();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [opsState.data?.ui_build_id]);
   // Worker-queue positioning is locked (W_DROP_PX / W_SPACE_PX / W_INSET_PX / W_SPLIT_PX)
   // and fed straight to WorkerQueues — the by-eye tuning sliders are retired.
   // Instrument-line colour — hue locked to brass; saturation + HSL lightness settled
@@ -3567,9 +3801,55 @@ export function MockOpsCockpit() {
   // instrument length downstream multiplies by this; published raw as --ui-scale so
   // CSS text/insets scale generically too.
   const uiScale = clamp(scaleMin, vp.w / DESIGN_W, 1);
+
+  // ── The one CockpitData object (see THE LIVE DATA SPINE) ────────────────────
+  // Projects the two feeds through the pure cockpitData adapters. Recomputed when
+  // either poll lands; the appended now-point keeps the head of the balance line
+  // live between the 30s history polls. While a feed is loading/erroring the
+  // arrays stay empty (or last-good real data) and `degraded` carries the banner
+  // text — no fabricated numbers, ever.
+  const cockpitData = useMemo<CockpitData>(() => {
+    const s = opsState.data;
+    const h = timerHistory.data;
+    const dayStart = '07:20'; // the day-graph anchor — mirrors api.ts secondsSinceDayStart
+    const historyPoints = h ? toTimerPoints(h) : [];
+    const nowPoint: CockpitTimerPoint | null = s
+      ? {
+          t: nowClock(),
+          mode: mapMode(s.timer.mode),
+          breakBalanceMinutes: balanceMinutes(s.timer.break_balance_ms),
+        }
+      : null;
+    const points = nowPoint ? [...historyPoints, nowPoint] : historyPoints;
+    // dayEnd = the last live sample's clock, floored at 08:20 so the x-domain is
+    // never degenerate (and always > dayStart, even before the first poll lands).
+    const lastT = points.length ? points[points.length - 1].t : dayStart;
+    const dayEnd = toMin(lastT) > toMin('08:20') ? lastT : '08:20';
+    const degraded =
+      opsState.loading || timerHistory.loading
+        ? 'connecting to token-api…'
+        : opsState.error
+          ? `state feed failing — ${opsState.error}`
+          : timerHistory.error
+            ? `timer history failing — ${timerHistory.error}`
+            : null;
+    return {
+      dayStart,
+      dayEnd,
+      points,
+      segments: h ? toModeSegments(h) : [],
+      nowPoint,
+      dials: s ? buildDials(s) : [],
+      ttsQueue: s ? toTtsQueue(s) : [],
+      degraded,
+    };
+  }, [opsState.data, opsState.loading, opsState.error, timerHistory.data, timerHistory.loading, timerHistory.error]);
+
   // The woven worker → TTS → idle lifecycle. Instantiated here so it can read the
-  // derived uiScale (flight sizes) + reduced-motion preference.
-  const life = useLifecycle(uiScale, reducedMotion);
+  // derived uiScale (flight sizes), the reduced-motion preference, and the LIVE
+  // TTS queue (null while the state feed is down — freezes the weave, see
+  // useLifecycle).
+  const life = useLifecycle(uiScale, reducedMotion, opsState.data ? cockpitData.ttsQueue : null);
   // The timer band tracks the cluster: same coherent factor as everything else,
   // optionally softened via GRAPH_SHRINK. uiScale === 1 ⇒ graphScale === 1, so
   // desktop stays pixel-identical. This is the ONE tuning point for the midline.
@@ -3599,11 +3879,18 @@ export function MockOpsCockpit() {
     setDrawerOpen(true);
   }
 
-  // The break hub's full visual state, derived from the signed minute balance.
-  // uiScale positions the ball marker on the scaled rim (laps ride the scaled SVG).
-  const hub = breakHubView(breakMin, uiScale);
+  // The break hub's full visual state, derived from the LIVE signed balance —
+  // the same quantity the balance dial reads (timer.break_balance_ms), so the
+  // rim gauge and the dial can never disagree. 0 (the neutral resting head)
+  // while the state feed is degraded. uiScale positions the ball marker on the
+  // scaled rim (laps ride the scaled SVG).
+  const hub = breakHubView(
+    opsState.data ? balanceMinutes(opsState.data.timer.break_balance_ms) : 0,
+    uiScale,
+  );
 
   return (
+    <CockpitDataContext.Provider value={cockpitData}>
     <div className="page" style={{
       // ── SCALED px bridges: the existing JS→CSS published dims × uiScale, so the
       // hub, break-trail and corner dial (all sized off these vars) shrink for free.
@@ -3631,8 +3918,8 @@ export function MockOpsCockpit() {
 
       {/* break hub — large circle in the true upper-right of the PAGE. Unlike the
           fixed dials it scrolls with content, so at scroll-top the dials nest
-          into its rim and on scroll-down it's left behind. Static-looking for
-          now; becomes the break-time action display in a later round. Radius is
+          into its rim and on scroll-down it's left behind. LIVE: its laps/ball/
+          glow render the real signed break balance from the state feed. Radius is
           locked at HUB_R (operator-settled), no longer a demo-bar knob. Past ±2h
           the whole rim glows (gold for credit spillover, red for debt). */}
       <div className={`break-hub${hub.glow ? ` break-hub--${hub.glow}` : ''}`} aria-hidden />
@@ -3666,24 +3953,28 @@ export function MockOpsCockpit() {
       {/* the big fraction dial in the reserved top-right nook */}
       <CornerDial top={fracTop} bottom={fracBot} />
 
-      {/* floating radial dials — fixed to the viewport corner, follow scroll */}
-      <Dials count={dialCount} onOpenDrawer={openDrawer} uiScale={uiScale} />
+      {/* floating radial dials — fixed to the viewport corner, follow scroll.
+          Fed by the live dial models; the array length drives the density. */}
+      <Dials onOpenDrawer={openDrawer} uiScale={uiScale} />
 
-      {/* left-side TTS-queue stack — roster-driven, fed by workers finishing. Click a
-          dial to play it; at its terminal it flies out to the idle rail (edge B). */}
+      {/* left-side TTS-queue stack — the LIVE speak queue (head + hot + pause).
+          A live arrival lands via the edge-A flight; a live drain flies out to
+          the idle rail (edge B). Clicks open the drawer. */}
       <TtsStack agents={life.ttsAgents} pendingIds={life.pendingIds} onOpenDrawer={openDrawer}
-        onTtsFinish={life.finishTts} uiScale={uiScale} />
+        uiScale={uiScale} />
 
-      {/* worker queues — two icon-chip stacks below the lemon that grow outward from
-          centre then trail down the two edges (a soft "M"). Add via the demobar; click a
-          chip to FINISH it — it shrinks + rides its rail to the ditch corner + pops to
-          the TTS stack bottom (edge A). */}
+      {/* worker queues (demo — fleet wiring lands phase 2) — two icon-chip stacks
+          below the lemon that grow outward from centre then trail down the two
+          edges (a soft "M"). Add via the demobar; a LIVE TTS arrival drafts a
+          chip — it shrinks + rides its rail to the ditch corner + pops to the
+          TTS stack bottom (edge A). */}
       <WorkerQueues leftRoster={life.workerLeft} rightRoster={life.workerRight} pendingIds={life.pendingIds}
         uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
-        onFinishLeft={life.finishWorker} onFinishRight={life.finishWorker} />
+        onFinishLeft={life.finishWorker} onFinishRight={life.finishWorker} finishRequest={life.finishRequest} />
 
-      {/* idle worker queue — the flipped bottom rail. Fed by TTS dials finishing (edge B);
-          the clock numerals now DERIVE from idle depth. Terminal this pass (clicks inert). */}
+      {/* idle worker queue (demo) — the flipped bottom rail. Fed by LIVE TTS drains
+          (edge B); the clock numerals DERIVE from idle depth. Terminal this pass
+          (clicks inert). */}
       <IdleWorkerQueue clockValue={life.clockValue} idleLeft={life.idleLeft} idleRight={life.idleRight}
         pendingIds={life.pendingIds} uiScale={uiScale} animate={!reducedMotion} />
 
@@ -3710,15 +4001,24 @@ export function MockOpsCockpit() {
           idle). Fixed inset:0, above idle/place, below the demobar. */}
       <FlightLayer flights={life.flights} onLand={life.landFlight} />
 
-      {/* demo control (mockup only) — pinned so it stays reachable while scrolling.
+      {/* degraded-state banner — the EXPLICIT "the data spine is not healthy"
+          chip. Rendered whenever a feed is loading or erroring; the instruments
+          below it show empty/last-good real data, never fabricated numbers. */}
+      {cockpitData.degraded ? (
+        <div className="degraded-chip" role="status">degraded · {cockpitData.degraded}</div>
+      ) : null}
+
+      {/* demo control — knobs for the still-unwired phase-2 surfaces (demo
+          workers / corner-dial fraction) plus the uiScale floor and the
+          place-mode authoring tool. Pinned so it stays reachable while scrolling.
           Collapses to a toggle under the narrow breakpoint (see the RESPONSIVE
           OVERRIDES block in cockpit.css); the toggle is hidden on wide screens. */}
-      <section className={`demobar${demoOpen ? ' demobar--open' : ''}`} aria-label="Mockup demo controls">
+      <section className={`demobar${demoOpen ? ' demobar--open' : ''}`} aria-label="Cockpit demo controls">
         <button className="demobar__toggle" onClick={() => setDemoOpen((o) => !o)} aria-expanded={demoOpen}>
           {demoOpen ? '▾ controls' : '▸ controls'}
         </button>
         <div className="demobar__body">
-        <span className="demobar__tag">design study · static</span>
+        <span className="demobar__tag">live · phase-2 demo knobs</span>
         <label className="demobar__slider">
           Scale floor
           <input type="range" min={0.2} max={1} step={0.01} value={scaleMin}
@@ -3726,26 +4026,14 @@ export function MockOpsCockpit() {
           <EditableNum value={scaleMin} display={scaleMin.toFixed(2)} step={0.01} onCommit={setScaleMin} />
         </label>
         <span className="demobar__scale" aria-label={`Live UI scale ${uiScale.toFixed(2)}`}>uiScale {uiScale.toFixed(2)}</span>
-        <label className="demobar__slider">
-          State-dial density
-          <input type="range" min={0} max={MAX_DIAL_COUNT} value={dialCount}
-            onChange={(e) => setDialCount(Number(e.target.value))} />
-          <EditableNum value={dialCount} onCommit={setDialCount} />
-        </label>
-        {/* ONLY manual queue knob left: add a worker on either side. TTS depth is fed by
-            workers finishing (click a worker chip); idle depth is fed by TTS dials
-            finishing (click a dial); the clock numerals derive from idle depth. */}
-        <span className="demobar__adds" aria-label={`Workers left ${life.workerLeft.length}, right ${life.workerRight.length} · TTS ${life.ttsAgents.length} · idle ${life.idleLeft.length}·${life.idleRight.length}`}>
+        {/* ONLY manual queue knob left: add a DEMO worker on either side (fleet
+            wiring lands phase 2). TTS depth is the LIVE queue; idle chips park on
+            live drains; the clock numerals derive from idle depth. */}
+        <span className="demobar__adds" aria-label={`Demo workers left ${life.workerLeft.length}, right ${life.workerRight.length} · live TTS ${life.ttsAgents.length} · demo idle ${life.idleLeft.length}·${life.idleRight.length}`}>
           <span className="demobar__addlabel">Workers <b>{life.workerLeft.length}·{life.workerRight.length}</b> → TTS <b>{life.ttsAgents.length}</b> → Idle <b>{life.idleLeft.length}·{life.idleRight.length}</b></span>
           <button className="demobar__addbtn" onClick={() => life.addWorker(-1)} disabled={life.workerLeft.length >= MAX_WORKER_COUNT}>+ worker left</button>
           <button className="demobar__addbtn" onClick={() => life.addWorker(1)} disabled={life.workerRight.length >= MAX_WORKER_COUNT}>+ worker right</button>
         </span>
-        <label className="demobar__slider">
-          Break time
-          <input type="range" min={-BREAK_MAX_MIN} max={BREAK_MAX_MIN} step={1} value={breakMin}
-            onChange={(e) => setBreakMin(Number(e.target.value))} />
-          <EditableNum value={breakMin} display={fmtBreak(breakMin)} onCommit={setBreakMin} />
-        </label>
         <Stepper label="Focus" value={fracTop} onChange={setFracTop} />
         <Stepper label="Distract" value={fracBot} onChange={setFracBot} />
 
@@ -3772,5 +4060,6 @@ export function MockOpsCockpit() {
         </div>
       </section>
     </div>
+    </CockpitDataContext.Provider>
   );
 }
