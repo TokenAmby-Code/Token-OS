@@ -4090,9 +4090,11 @@ export function OpsCockpit() {
 
       {/* kanban — the blank gold board filling the band between the worker
           crossbar (~31vh) and the idle crossbar (80vh). Static placeholder
-          plates this pass; data wiring is a follow-up. z:40 so a fat idle
-          queue (z:62) visibly clobbers it — the clobber IS the error
-          signifier. Never raise the board past 61. */}
+          plates this pass; the follow-up data wiring consumes useOpsState
+          (/api/ui/ops/state) like every other cockpit surface — no bespoke
+          endpoint, no direct store reads. z:40 so a fat idle queue (z:62)
+          visibly clobbers it — the clobber IS the error signifier. Never
+          raise the board past 61. */}
       <KanbanBoard />
 
       {/* dials drawer — where the default dial click lands (minimal stub) */}
