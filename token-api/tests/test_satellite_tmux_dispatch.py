@@ -433,3 +433,72 @@ def test_tts_engine_wav_pause_resume_returns_unsupported() -> None:
     assert result["success"] is False
     assert result["error"] == "unsupported_backend_control"
     assert result["transport"] == "wsl_sapi_wav_file"
+
+
+def test_tts_engine_wav_playback_launch_error_returns_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    satellite = _load_satellite_module()
+    engine = satellite.TTSEngine()
+    wav_path = tmp_path / "fixed-id.wav"
+    wav_path.write_bytes(b"RIFF")
+    script_dir = tmp_path / "scripts"
+    synth_result = {
+        "file_id": "fixed-id",
+        "wav_path_win": r"C:\temp\tts\fixed-id.wav",
+        "wav_path_wsl": str(wav_path),
+    }
+
+    def fail_popen(*_args, **_kwargs):
+        raise OSError("missing powershell")
+
+    monkeypatch.setattr(engine, "PLAY_SCRIPT_DIR_WSL", str(script_dir))
+    monkeypatch.setattr(engine, "PLAY_SCRIPT_DIR_WIN", r"C:\temp")
+    monkeypatch.setattr(satellite.subprocess, "Popen", fail_popen)
+
+    result = engine._play_wav_file(synth_result)
+
+    assert result["success"] is False
+    assert "Failed to start WAV playback" in result["error"]
+
+
+def test_tts_engine_wav_playback_timeout_returns_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    satellite = _load_satellite_module()
+    engine = satellite.TTSEngine()
+    engine.MAX_PLAYBACK_SECONDS = 1
+    wav_path = tmp_path / "fixed-id.wav"
+    wav_path.write_bytes(b"RIFF")
+    script_dir = tmp_path / "scripts"
+    killed = {}
+    synth_result = {
+        "file_id": "fixed-id",
+        "wav_path_win": r"C:\temp\tts\fixed-id.wav",
+        "wav_path_wsl": str(wav_path),
+    }
+
+    class FakePopen:
+        pid = 4321
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise satellite.subprocess.TimeoutExpired(cmd="play", timeout=timeout)
+            return ("", "")
+
+        def kill(self):
+            killed["kill"] = True
+            self.returncode = -9
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(engine, "PLAY_SCRIPT_DIR_WSL", str(script_dir))
+    monkeypatch.setattr(engine, "PLAY_SCRIPT_DIR_WIN", r"C:\temp")
+    monkeypatch.setattr(satellite.subprocess, "Popen", lambda *_args, **_kwargs: FakePopen())
+
+    result = engine._play_wav_file(synth_result)
+
+    assert result == {"success": False, "error": "WAV playback timed out"}
+    assert killed == {"kill": True}

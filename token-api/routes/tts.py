@@ -600,14 +600,13 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
     endpoint = "/tts/synth-and-play" if use_file_playback else "/tts/speak"
     biased_rate = max(-10, min(10, rate + TTS_WSL_RATE_BIAS))
     payload = {"message": message, "voice": voice, "rate": biased_rate}
+    timeout = (5, max(3600, len(message) * 3)) if use_file_playback else (5, 300)
 
     try:
         resp = requests.post(
             f"http://{host}:{port}{endpoint}",
             json=payload,
-            timeout=max(3600, len(message) * 3)
-            if use_file_playback
-            else 300,  # Finite guard; sized beyond normal WAV playback
+            timeout=timeout,  # Bounded connect; long read window for WAV playback
         )
         TTS_BACKEND["current"] = None
 

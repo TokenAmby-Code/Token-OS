@@ -349,6 +349,7 @@ class TTSEngine:
     TTS_DIR_WIN = r"C:\temp\tts"
     PLAY_SCRIPT_DIR_WSL = "/mnt/c/temp"
     PLAY_SCRIPT_DIR_WIN = r"C:\temp"
+    MAX_PLAYBACK_SECONDS = 3600
 
     @staticmethod
     def _text_hash(message: str) -> str:
@@ -576,24 +577,33 @@ class TTSEngine:
         self._was_skipped = False
         self._current_file = str(wav_path_wsl)
         try:
-            proc = subprocess.Popen(
-                [
-                    POWERSHELL_EXE,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    script_path_win,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            try:
+                proc = subprocess.Popen(
+                    [
+                        POWERSHELL_EXE,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        script_path_win,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except OSError as e:
+                return {"success": False, "error": f"Failed to start WAV playback: {e}"}
             with self._playback_lock:
                 self._playing = True
                 self._playback_process = proc
                 self._playback_windows_pid = proc.pid
-            stdout, stderr = proc.communicate(timeout=None)
+            try:
+                stdout, stderr = proc.communicate(timeout=self.MAX_PLAYBACK_SECONDS)
+            except subprocess.TimeoutExpired:
+                self._was_skipped = True
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                return {"success": False, "error": "WAV playback timed out"}
             skipped = self._was_skipped or proc.returncode < 0
             if proc.returncode not in (0, None) and not skipped:
                 return {

@@ -123,6 +123,7 @@ def test_speak_tts_wsl_file_playback_posts_to_synth_and_play_with_finite_timeout
     result = tts.speak_tts_wsl(message, "Microsoft David", use_file_playback=True)
 
     assert observed["url"] == "http://wsl.local:7777/tts/synth-and-play"
-    assert observed["timeout"] >= 3600
+    assert observed["timeout"][0] == 5
+    assert observed["timeout"][1] >= 3600
     assert result["success"] is True
     assert result["transport"] == "wsl_sapi_wav_file"

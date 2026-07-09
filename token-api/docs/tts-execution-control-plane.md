@@ -7,7 +7,7 @@ Authoritative contract as of 2026-07-09:
 - Mac `say` is removed as a TTS backend. If the active backend fails, Token-API records/returns an error; it does not fall back to Mac.
 - Order remains: `sanitize -> compatibility chunking -> enqueue -> dispatch one full utterance to backend`.
 - Phone and WSL both receive exactly one full utterance per message. Token-API may still sanitize/split internally for legacy contracts, but backend handoff collapses prepared chunks into one `1/1` utterance.
-- WSL playback uses the SAPI text-file `/tts/speak` transport and returns `rendered_hash`/`rendered_chars` for the full utterance to guard against SAPI text truncation.
+- WSL playback uses the `/tts/synth-and-play` WAV artifact transport (`wsl_sapi_wav_file`) and returns `rendered_hash`/`rendered_chars` for the full utterance to guard against SAPI text truncation.
 - Advisor bypass remains a Token-OS queue policy; backends receive already-sanitized chunks only.
 
 ## Control ingress
