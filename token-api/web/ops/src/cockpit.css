@@ -1411,6 +1411,7 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
 
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; }
+  .instrument-spinner { animation: instrument-spin var(--instrument-spin-duration, 18s) linear infinite !important; }
   /* TTS play gesture: the global rule above already kills the L-path + shockwaves
      + glow; also drop the slot transition so the reorder/drain land INSTANTLY.
      The 5 s → dismiss → remove logic still runs (JS timers), and the static

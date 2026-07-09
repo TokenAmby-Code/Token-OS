@@ -2391,6 +2391,18 @@ async def queue_tts(
     # Astartes already resolve, so normal speech is unaffected.
     tts_policy = row["tts_policy"]
     persona_slug = row["persona_slug"]
+    persona_display_name = row["persona_display_name"]
+    commander_type = row["commander_type"]
+
+    def _system_audio_with_sender_metadata() -> dict[str, object]:
+        system_row = dict(_SYSTEM_TTS_ROW)
+        system_row.update(
+            persona_slug=persona_slug,
+            persona_display_name=persona_display_name,
+            commander_type=commander_type,
+        )
+        return system_row
+
     if tts_policy not in ("silent", "hot", "pause"):
         logger.warning(
             "TTS denied (persona_unresolved): instance=%s persona_slug=%r "
@@ -2413,7 +2425,7 @@ async def queue_tts(
             persona_slug,
             message[:80],
         )
-        row = _SYSTEM_TTS_ROW
+        row = _system_audio_with_sender_metadata()
 
     # Belt-and-suspenders: an independent silence guarantee. A voiced policy
     # without a resolved persona voice still must not speak unless this is an
@@ -2427,7 +2439,7 @@ async def queue_tts(
             persona_slug,
             message[:80],
         )
-        row = _SYSTEM_TTS_ROW
+        row = _system_audio_with_sender_metadata()
 
     voice = row["tts_voice"]
     sound = row["notification_sound"]
