@@ -209,6 +209,28 @@ printf 'seconds=%s\\n' "$(coderabbit_ratelimit_wait_seconds 'Retry-After: 9')"
     assert "seconds=9" in result.stdout
 
 
+def test_already_reviewed_skip_is_not_rate_limit_deferral(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+if coderabbit_body_is_ratelimit 'Result: Skipped - Already reviewed'; then
+  echo bad
+else
+  echo ok
+fi
+if coderabbit_body_is_ratelimit 'Review limit reached. Next review available in: 12 minutes'; then
+  echo limited
+fi
+""",
+        repo,
+    )
+
+    assert "ok" in result.stdout
+    assert "bad" not in result.stdout
+    assert "limited" in result.stdout
+
+
 def test_normal_review_does_not_inject_empty_timeout(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     arg_log = tmp_path / "args.log"
