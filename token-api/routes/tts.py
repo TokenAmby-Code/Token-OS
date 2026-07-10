@@ -814,81 +814,121 @@ def speak_tts(
     wsl_rate: int = None,
     use_file_playback: bool = False,
 ) -> dict:
-    """Route TTS to the best available device via resolve_tts_device().
+    """Route TTS through the live execution chain: Discord → WSL → phone.
 
-    Dispatches to Discord voice or the selected execution backend
-    (phone/WSL/later Linux). WSL args remain accepted for caller compatibility
-    and are used by the WSL chunk dispatcher. It does not fall through to Mac
-    on failed live delivery, and never reports success without a concrete
-    playback method.
-
-    Args:
-        message: Text to speak
-        voice: compatibility voice hint for Discord/WSL mapping
-        rate: Compatibility rate hint
-        instance_id: Optional instance ID for logging
-        wsl_voice: Deprecated Windows SAPI voice name (ignored for routing)
-        wsl_rate: Deprecated WSL TTS rate (ignored for routing)
-        use_file_playback: Deprecated WSL playback flag (ignored for routing)
+    The initial device is still chosen by ``resolve_tts_device()``, but delivery
+    failures continue down the bounded chain while a later leg is live. This is
+    intentionally narrow: no Mac/terminal fallback and no broader artifact-TTS
+    architecture. If every eligible leg fails, return one loud actionable error
+    with per-leg details.
     """
     if not message:
         return {"success": False, "error": "No message provided"}
 
-    # Clean markdown/public text, then apply speech-only sanitization once at
-    # the single backend fan-out chokepoint.
     message = sanitize_tts_for_speech(_sanitize_public_text(clean_markdown_for_tts(message)))
 
     routing = resolve_tts_device(instance_id=instance_id, wsl_voice=wsl_voice)
-    device = routing.get("device")
-    logger.info(f"TTS: Routing to {device} ({routing['reason']})")
+    initial_device = routing.get("device")
+    logger.info("TTS: Routing starts at %s (%s)", initial_device, routing.get("reason"))
 
-    def _finish(result: dict) -> dict:
-        """Stamp truthful routing telemetry so callers can see where audio
-        actually went (or why it failed) without trusting the requested device.
-        `route` is the device that produced a successful delivery; on failure it
-        is None and `reason` carries an actionable code."""
+    chunks = build_tts_chunk_handoff(message)
+    attempted: list[dict] = []
+
+    def _finish(result: dict, *, requested_device: str | None = initial_device) -> dict:
         result = dict(result or {})
         result.setdefault("success", False)
         result.setdefault("method", None)
-        result["requested_device"] = device
+        result["requested_device"] = requested_device
         if result.get("success"):
-            result["route"] = result.get("method") or device
+            result["route"] = result.get("method") or result.get("backend") or requested_device
             result.setdefault("reason", None)
         else:
             result["route"] = None
             result.setdefault("reason", result.get("error") or "tts_delivery_failed")
         return result
 
-    if device is None:
-        result = _no_playback_backend("no_playback_backend")
+    def _phone_live() -> bool:
+        return _send_to_phone is not None and is_phone_reachable()
+
+    def _append_candidate(candidates: list[str], device: str | None) -> None:
+        if device and device not in candidates:
+            candidates.append(device)
+
+    candidates: list[str] = []
+    _append_candidate(candidates, initial_device)
+    # Required bounded chain. Continue only forward through Discord → WSL → phone.
+    # Add only legs that are plausibly live *now* so an unavailable WSL does not
+    # block phone failover, and a dead phone yields one loud all-dead error.
+    if initial_device in {"discord", None}:
+        if is_satellite_tts_available():
+            _append_candidate(candidates, "wsl")
+        if _phone_live():
+            _append_candidate(candidates, "phone")
+    elif initial_device == "wsl":
+        if _phone_live():
+            _append_candidate(candidates, "phone")
+
+    if not candidates:
+        result = _no_playback_backend(
+            "no_playback_backend: no live TTS legs; check Discord VC, WSL satellite, and phone MacroDroid /server-heartbeat"
+        )
         result["route_reason"] = routing.get("reason")
         return _finish(result)
 
-    chunks = build_tts_chunk_handoff(message)
+    for device in candidates:
+        if device == "discord":
+            result = speak_tts_discord(message, routing.get("discord_bot"), voice, rate)
+        elif device in TTS_EXECUTION_BACKENDS:
+            result = dispatch_tts_chunks_to_backend(
+                device,
+                chunks,
+                voice=voice,
+                rate=rate,
+                wsl_voice=wsl_voice,
+                wsl_rate=wsl_rate if wsl_rate is not None else rate,
+            )
+        else:
+            result = _no_playback_backend("unknown_playback_backend")
 
-    # Dispatch without Mac fallthrough. The selected active backend either plays
-    # or Token-OS records/returns an error state.
-    if device == "discord":
-        result = speak_tts_discord(message, routing["discord_bot"], voice, rate)
-        if result.get("success"):
-            return _finish(result)
-        logger.info("TTS: Discord failed (%s); no Mac fallback", result.get("error"))
-        return _finish(result)
-
-    if device in TTS_EXECUTION_BACKENDS:
-        result = dispatch_tts_chunks_to_backend(
-            device,
-            chunks,
-            voice=voice,
-            rate=rate,
-            wsl_voice=wsl_voice,
-            wsl_rate=wsl_rate if wsl_rate is not None else rate,
+        result = dict(result or {})
+        attempted.append(
+            {
+                "device": device,
+                "success": bool(result.get("success")),
+                "error": result.get("error"),
+                "reason": result.get("reason"),
+                "method": result.get("method"),
+            }
         )
-        if not result.get("success"):
-            logger.info("TTS: %s backend failed (%s); no Mac fallback", device, result.get("error"))
-        return _finish(result)
+        if result.get("success"):
+            if device != initial_device:
+                result["fallback_from"] = initial_device
+                result["fallback_attempts"] = attempted[:-1]
+            return _finish(result)
+        logger.warning(
+            "TTS: %s leg failed (%s); trying next live leg",
+            device,
+            result.get("error") or result.get("reason"),
+        )
 
-    return _finish(_no_playback_backend("unknown_playback_backend"))
+    if len(attempted) == 1:
+        single = dict(result or {})
+        single["attempted_legs"] = attempted
+        return _finish(single)
+
+    error = (
+        "audio_not_delivered: all live TTS legs failed; check attempted legs and "
+        "restart WSL satellite or phone MacroDroid"
+    )
+    return _finish(
+        {
+            "success": False,
+            "error": error,
+            "reason": "all_live_tts_legs_failed",
+            "attempted_legs": attempted,
+            "route_reason": routing.get("reason"),
+        }
+    )
 
 
 def send_discord_notification(message: str, level: str = "info") -> dict:
@@ -1584,6 +1624,10 @@ def _send_phone_tts_chunk(payload: dict) -> dict:
             logger.warning("TTS: Phone chunk send failed (%s)", exc)
             return {"success": False, "error": "phone_send_failed", "reason": str(exc)}
         if not result.get("success"):
+            error = str(result.get("error") or result.get("reason") or "phone_send_failed")
+            if error.lower() in {"readtimeout", "timeout"}:
+                result["error"] = "phone_send_timeout"
+                result["reason"] = "phone_tts_http_timeout"
             return result
         result.setdefault("method", "phone")
         confirmed = event.wait(timeout=PHONE_PLAYBACK_WATCHDOG_S)

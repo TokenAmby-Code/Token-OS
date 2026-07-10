@@ -469,8 +469,8 @@ def test_discord_fallthrough_respects_geofence_phone_only(monkeypatch: Any) -> N
     assert sent == []
 
 
-def test_wsl_route_attempts_wsl_not_phone_or_mac_false_success(monkeypatch: Any) -> None:
-    """A WSL route is first-class but must not silently fall to phone or Mac."""
+def test_wsl_route_falls_to_phone_not_mac_false_success(monkeypatch: Any) -> None:
+    """A failed WSL route falls forward to phone when the phone leg is live."""
     tts = _load("routes.tts")
     sent = []
 
@@ -485,7 +485,9 @@ def test_wsl_route_attempts_wsl_not_phone_or_mac_false_success(monkeypatch: Any)
         return {"success": True}
 
     monkeypatch.setattr(tts, "_send_to_phone", fake_send_to_phone)
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: True)
     monkeypatch.setattr(tts, "_phone_tts_available", lambda: True)
+    monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.01)
     monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
 
     def fake_post(*args, **kwargs):
@@ -497,10 +499,10 @@ def test_wsl_route_attempts_wsl_not_phone_or_mac_false_success(monkeypatch: Any)
 
     assert result.get("success") is False
     assert result.get("requested_device") == "wsl"
-    assert result.get("method") == "wsl_sapi_chunk"
     assert result.get("route") is None
-    assert result.get("reason") == "satellite_unreachable"
-    assert sent == []
+    assert result.get("reason") == "all_live_tts_legs_failed"
+    assert [leg["device"] for leg in result.get("attempted_legs")] == ["wsl", "phone"]
+    assert sent
 
 
 # ---------------- Phone playback-complete (real serialization signal) ----------------
