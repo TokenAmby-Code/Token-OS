@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -1146,9 +1147,10 @@ fi
 
     assert "first=yes done=1 rerequests=1" in result.stdout
     assert "second=no done=1 rerequests=1" in result.stdout
-    assert "timed out with no fresh verdict; re-requesting" in result.stdout
-    assert "Check manually" not in result.stdout
-    assert "Possible reasons" not in result.stdout
+    combined = result.stdout + result.stderr
+    assert "timed out with no fresh verdict; re-requesting" in combined
+    assert "Check manually" not in combined
+    assert "Possible reasons" not in combined
 
 
 def test_timeout_prefers_rate_limit_reset_signal_before_rerequest(tmp_path: Path) -> None:
@@ -1158,19 +1160,20 @@ def test_timeout_prefers_rate_limit_reset_signal_before_rerequest(tmp_path: Path
         """
 slept=0
 rerequested=0
+order=
 coderabbit_latest_issue_comment_body() { echo 'Review limit reached. Your next review will be available in 18 minutes.'; }
 coderabbit_latest_issue_comment_timestamp() { echo '1970-01-01T00:00:00Z'; }
-sleep_until_rate_limit_reset() { slept=$1; return 0; }
+sleep_until_rate_limit_reset() { slept=$1; order="${order}sleep "; return 0; }
 rate_limit_reset_reached() { return 0; }
-coderabbit_rerequest_review() { rerequested=$((rerequested + 1)); return 0; }
+coderabbit_rerequest_review() { rerequested=$((rerequested + 1)); order="${order}rerequest"; return 0; }
 if coderabbit_maybe_wait_rate_limit_on_timeout 17; then
-  printf 'waited=%s rerequested=%s\\n' "$slept" "$rerequested"
+  printf 'waited=%s rerequested=%s order=%s\n' "$slept" "$rerequested" "$order"
 fi
 """,
         repo,
     )
 
-    assert "waited=1140 rerequested=1" in result.stdout
+    assert "waited=1140 rerequested=1 order=sleep rerequest" in result.stdout
 
 
 def test_rate_limit_reset_rerequest_consumes_retry_budget(tmp_path: Path) -> None:
@@ -1199,20 +1202,32 @@ fi
 
 def test_coderabbit_heartbeat_is_opaque_when_requested(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
-    heartbeat = tmp_path / "heartbeat.log"
+    visible_heartbeat = tmp_path / "visible heartbeat.log"
+    opaque_heartbeat = tmp_path / "opaque heartbeat.log"
 
+    visible = bash_with_pr_step(
+        f"""
+PR_STEP_HEARTBEAT_FILE={shlex.quote(str(visible_heartbeat))}
+emit_coderabbit_heartbeat 'CodeRabbit poll: visible'
+echo visible-done
+""",
+        repo,
+    )
     result = bash_with_pr_step(
         f"""
 PR_STEP_OPAQUE_WAIT=true
-PR_STEP_HEARTBEAT_FILE={str(heartbeat)!r}
+PR_STEP_HEARTBEAT_FILE={shlex.quote(str(opaque_heartbeat))}
 emit_coderabbit_heartbeat 'CodeRabbit poll: hidden'
 echo done
 """,
         repo,
     )
 
+    assert "visible-done" in visible.stdout
+    assert visible_heartbeat.exists()
+    assert visible_heartbeat.read_text() != ""
     assert "done" in result.stdout
-    assert not heartbeat.exists() or heartbeat.read_text() == ""
+    assert not opaque_heartbeat.exists() or opaque_heartbeat.read_text() == ""
 
 
 def test_fresh_current_head_verdict_skips_rerequest(tmp_path: Path) -> None:

@@ -27,10 +27,27 @@ if [[ "$args" == *"commits/head-sha/check-runs"* ]]; then
   summary="${FAKE_CR_CHECK_SUMMARY:-No actionable comments were generated.}"
   title="${FAKE_CR_CHECK_TITLE:-CodeRabbit Review Progress}"
   if [[ "${FAKE_CR_CHECK_JSON:-}" == "empty_summary_title" ]]; then
-    printf 'CodeRabbit / Review\tcompleted\t%s\t%s\t%s\n' "$conclusion" "$title" 'https://app.coderabbit.ai/change-stack/test'
-    exit 0
+    summary=""
   fi
-  printf '%s\t%s\t%s\t%s\t%s\n' 'CodeRabbit / Review' 'completed' "$conclusion" "$summary" 'https://app.coderabbit.ai/change-stack/test'
+  json=$(jq -n \
+    --arg conclusion "$conclusion" \
+    --arg summary "$summary" \
+    --arg title "$title" \
+    '{check_runs:[{name:"CodeRabbit / Review",status:"completed",conclusion:$conclusion,html_url:"https://app.coderabbit.ai/change-stack/test",app:{slug:"coderabbitai"},output:{summary:$summary,title:$title}}]}')
+  if [[ "$args" == *"--jq"* ]]; then
+    jq_program=""
+    prev=""
+    for arg in "$@"; do
+      if [[ "$prev" == "--jq" ]]; then
+        jq_program="$arg"
+        break
+      fi
+      prev="$arg"
+    done
+    jq -r "$jq_program" <<<"$json"
+  else
+    printf '%s\n' "$json"
+  fi
   exit 0
 fi
 if [[ "$args" == *"pulls/17/reviews"* ]]; then
