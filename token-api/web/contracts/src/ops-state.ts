@@ -226,6 +226,32 @@ export type InstanceCounts = {
   by_work_class?: Counts;
 };
 
+export type TmuxOccupancyCellState = 'occupied' | 'free' | 'dead' | 'protected' | 'drift' | 'unknown' | string;
+
+export type TmuxOccupancyCell = {
+  pane_positional_id: string | null;
+  instance_id: string | null;
+  persona: string | null;
+  engine: string | null;
+  working_dir: string | null;
+  wrapper_id: string | null;
+  state: TmuxOccupancyCellState;
+  source: string;
+};
+
+export type TmuxOccupancy = {
+  status: OpsHealthStatus | string;
+  generated_at: string;
+  total: number;
+  occupied: number;
+  free: number;
+  dead: number;
+  protected: number;
+  drift: number;
+  errors: string[];
+  cells: TmuxOccupancyCell[];
+};
+
 export type OpsState = {
   surface: 'ops';
   contract_version: 'ops-state.v1' | string;
@@ -334,6 +360,7 @@ export type OpsState = {
     sha: string | null;
     error?: string | null;
     payload?: unknown;
+    occupancy?: TmuxOccupancy;
   };
   alarm?: {
     acked: boolean;
@@ -387,6 +414,7 @@ export type OpsStatus = {
     sha: string | null;
     live_instance_panes: number | null;
     projection_drift: number | null;
+    occupancy?: TmuxOccupancy;
   };
   tts: {
     current: string | null;

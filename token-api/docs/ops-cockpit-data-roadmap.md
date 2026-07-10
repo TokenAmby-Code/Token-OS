@@ -74,14 +74,14 @@ Rules:
 - Placeholder dials are acceptable only when explicitly labeled as not wired or data unavailable.
 - Do not convert errors into neutral UI copy.
 
-### Phase 3 — tmuxctld occupancy read model for compass
+### Phase 3 — tmuxctld occupancy read model for compass (partially implemented)
 
 Goal: expose pane occupancy through Token-API/tmuxctld data surfaces so the cockpit compass can render real pane state.
 
 Planned backend shape:
 
 - Token-API collector reads tmuxctld occupancy/ledger surfaces with short timeouts.
-- `/api/ui/ops/state` exposes a typed `tmux.occupancy` summary.
+- `/api/ui/ops/state` now exposes a typed `tmux.occupancy` summary with counts, cells, errors, and degraded status.
 - `/api/ops/status` exposes concise counts for agent/script reads.
 - The read model distinguishes:
   - reachable/unreachable tmuxctld
@@ -99,7 +99,7 @@ Goal: render pane occupancy as a cockpit/debug surface.
 
 Planned work:
 
-- Add a typed frontend adapter from `OpsState.tmux.occupancy` to compass cells.
+- Added a typed frontend adapter from `OpsState.tmux.occupancy` to compass stars; remaining visual refinement can map exact pane geometry later.
 - Show free/occupied/protected/dead/drift states directly.
 - Surface lower-level errors in the compass, not only global health.
 - Never fetch tmuxctld directly from the browser.

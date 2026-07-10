@@ -1164,3 +1164,83 @@ def test_ops_state_embeds_session_docs_feed(client, app_env) -> None:
     assert doc["title"] == "State Embed"
     assert doc["status"] == "active"
     assert doc["rubric"]["present"] is True
+
+
+def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) -> None:
+    async def _fake_snapshot(generated_at):
+        return {
+            "reachable": True,
+            "tmux_reachable": True,
+            "version": "pytest",
+            "sha": "abc",
+            "error": None,
+            "occupancy": {
+                "status": "warn",
+                "generated_at": generated_at.isoformat(),
+                "total": 3,
+                "occupied": 1,
+                "free": 1,
+                "dead": 0,
+                "protected": 0,
+                "drift": 1,
+                "errors": [],
+                "cells": [
+                    {
+                        "pane_positional_id": "somnium:N",
+                        "instance_id": "i1",
+                        "persona": "p",
+                        "engine": "codex",
+                        "working_dir": "/tmp",
+                        "wrapper_id": "w1",
+                        "state": "occupied",
+                        "source": "tmuxctld:ledger",
+                    },
+                    {
+                        "pane_positional_id": "somnium:S",
+                        "instance_id": None,
+                        "persona": None,
+                        "engine": None,
+                        "working_dir": None,
+                        "wrapper_id": None,
+                        "state": "free",
+                        "source": "tmuxctld:freelist",
+                    },
+                    {
+                        "pane_positional_id": "somnium:E",
+                        "instance_id": None,
+                        "persona": None,
+                        "engine": None,
+                        "working_dir": None,
+                        "wrapper_id": None,
+                        "state": "drift",
+                        "source": "tmuxctld:ledger",
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(app_env.main, "_ops_read_tmuxctld_snapshot", _fake_snapshot)
+    body = client.get("/api/ui/ops/state").json()
+    occ = body["tmux"]["occupancy"]
+    assert occ["occupied"] == 1
+    assert occ["free"] == 1
+    assert occ["drift"] == 1
+    assert occ["cells"][0]["state"] == "occupied"
+
+
+def test_ops_state_tmux_occupancy_unavailable(client, app_env, monkeypatch) -> None:
+    async def _fake_snapshot(generated_at):
+        return {
+            "reachable": False,
+            "tmux_reachable": None,
+            "version": None,
+            "sha": None,
+            "error": "boom",
+            "occupancy": app_env.main._ops_tmuxctld_error_occupancy(generated_at, "boom"),
+        }
+
+    monkeypatch.setattr(app_env.main, "_ops_read_tmuxctld_snapshot", _fake_snapshot)
+    body = client.get("/api/ui/ops/state").json()
+    assert body["tmux"]["occupancy"]["status"] == "bad"
+    assert body["tmux"]["occupancy"]["errors"] == ["boom"]
+    assert body["sources"]["tmuxctld"]["status"] == "warn"
