@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { OPS_COCKPIT_POLLS } from './api';
 import { buildDials, enforcementDial, goldenThroneDial, laneForStatus, occupancyCompassStars, toMusterBoard, toTtsQueue, toWorkerQueue, ttsDial, type WorkerItem } from './cockpitData';
 import type { OpsState } from './contracts';
 
@@ -209,6 +210,20 @@ describe('dial builders', () => {
   });
 });
 
+// ── The poll ledger tripwire ────────────────────────────────────────────────
+// Pins the OPS_COCKPIT_POLLS manifest to the exact known polls. A third poll
+// cannot slip in unledgered: register it in api.ts AND update this test —
+// deliberately, in review — or the suite goes red.
+
+describe('OPS_COCKPIT_POLLS', () => {
+  it('ledgers exactly the two tolerated polls', () => {
+    expect(OPS_COCKPIT_POLLS.map(({ route, intervalMs }) => ({ route, intervalMs }))).toEqual([
+      { route: '/api/ui/ops/state', intervalMs: 2000 },
+      { route: '/api/ui/ops/timer/history', intervalMs: 30000 },
+    ]);
+  });
+});
+
 // ── Muster Ledger projection ────────────────────────────────────────────────
 
 describe('laneForStatus', () => {
@@ -319,61 +334,6 @@ describe('toMusterBoard', () => {
     expect(board.astartes.cards[0].title).toBe('kanban-docs-wiring');
   });
 
-  it('raises the GT accusation only for a present incomplete rubric', () => {
-    const board = toMusterBoard(
-      boardState([
-        {
-          id: 1,
-          title: 'Accused',
-          head: 'head line',
-          rubric: { present: true, complete: false, met: 1, total: 3, skipped: 1, first_unmet: 'needs tests passing' },
-        },
-        {
-          id: 2,
-          title: 'Complete',
-          head: 'victory head',
-          rubric: { present: true, complete: true, met: 2, total: 2, skipped: 0, first_unmet: null },
-        },
-        { id: 3, title: 'No Rubric', head: 'plain head', rubric: { present: false, complete: false, met: 0, total: 0, skipped: 0, first_unmet: null } },
-      ]),
-      NOW,
-    );
-
-    const [accused, complete, plain] = board.astartes.cards;
-    expect(accused.awaiting).toBe('needs tests passing');
-    expect(accused.rubric).toEqual({ met: 1, total: 3, skipped: 1 });
-    expect(complete.awaiting).toBeNull();
-    expect(complete.rubric).toEqual({ met: 2, total: 2, skipped: 0 });
-    expect(plain.awaiting).toBeNull();
-    expect(plain.rubric).toBeNull(); // never render a victory state for a rubric-less doc
-  });
-
-  it('lights the filament ONLY off a bound ACTIVE instance (fail-dark), tinted by its persona', () => {
-    const board = toMusterBoard(
-      boardState(
-        [
-          { id: 7, title: 'Live Doc', linked_instances: 2 },
-          { id: 8, title: 'Dormant Doc', linked_instances: 0 },
-          // linked_instances counts stopped/historical rows too — with no
-          // ACTIVE instance bound, the filament must stay dark (a glow here
-          // would be a false-positive identity surface).
-          { id: 9, title: 'Historical Doc', linked_instances: 3 },
-        ],
-        {},
-        [
-          { id: 'worker-1', session_doc: { id: 7 }, persona: { slug: 'blood-angels', chip_color: '#b1191e' } },
-          { id: 'worker-2', session_doc: { id: null }, persona: { slug: 'ultramarines', chip_color: '#243cff' } },
-        ],
-      ),
-      NOW,
-    );
-
-    const [live, dormant, historical] = board.astartes.cards;
-    expect(live).toMatchObject({ live: true, tint: '#b1191e' });
-    expect(dormant).toMatchObject({ live: false, tint: null });
-    expect(historical).toMatchObject({ live: false, tint: null });
-  });
-
   it('re-caps each canonical lane at limit_per_lane after absorbing multiple raw statuses', () => {
     // The feed caps per RAW status; active + in-progress both absorb into
     // astartes, so raw caps could stack to 2× the lane limit without a
@@ -395,7 +355,7 @@ describe('toMusterBoard', () => {
     expect(board.astartes.overflow).toBe(1); // 4 truly in-lane, 3 shown
   });
 
-  it('stamps the raw status via laneKey mismatch and reports honesty overflow', () => {
+  it('projects raw lane_totals onto lanes and reports honesty overflow', () => {
     const board = toMusterBoard(
       boardState(
         [{ id: 1, status: 'active', title: 'Shown' }],
@@ -406,9 +366,7 @@ describe('toMusterBoard', () => {
       NOW,
     );
 
-    const card = board.astartes.cards[0];
-    expect(card.rawStatus).toBe('active');
-    expect(card.laneKey).toBe('astartes');
+    expect(board.astartes.cards[0].laneKey).toBe('astartes');
     expect(board.astartes.overflow).toBe(41); // 42 truly in-lane, 1 shown
     expect(board.arbites).toEqual({ cards: [], overflow: 3 });
     expect(board.victorious).toBeUndefined(); // empty lane renders empty

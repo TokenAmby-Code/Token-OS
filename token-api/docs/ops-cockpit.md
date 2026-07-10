@@ -58,9 +58,10 @@ The graph components are bespoke SVG (no chart/graph library) to keep the commit
 
 ### Polling cadence
 
+The canonical poll ledger lives in `web/ops/src/api.ts` (`OPS_COCKPIT_POLLS`) — one strict list of every poll the cockpit runs, pinned by a tripwire test. Polling posture: the Emperor detests polling and event-driven transport is the target architecture; the ops cockpit is the ONE surface where tick-refresh is tolerated, and only for polls registered in that ledger — a `usesPolling` call site without a ledger entry is a review-blocking offense.
+
 - `useOpsState` — `/api/ui/ops/state` every **2s** (live posture).
 - `useTimerHistory` — `/api/ui/ops/timer/history` every **30s** (slow; live, no mock fallback).
-- `useOpsGraph` — `/api/ui/ops/graph/{name}` every **60s** (on-demand cadence; falls back to mock only on endpoint failure).
 
 ### Design language (`modes.ts` + `styles.css`)
 
