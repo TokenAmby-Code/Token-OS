@@ -1635,9 +1635,7 @@ while true; do
     # would keep waiting after a comment-free success.
     HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
     if [[ -n "$HEAD_SHA" ]]; then
-        CR_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
-            jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' \
-            2>/dev/null || true)
+        CR_STATE="$(coderabbit_state_for_head "$HEAD_SHA")"
         if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" ]]; then
             if coderabbit_body_is_ratelimit "$LATEST_ISSUE_COMMENT"; then
                 log "CodeRabbit commit status is terminal ($CR_STATE), but latest CodeRabbit comment is a rate-limit deferral; keeping the review gate open."
@@ -2104,9 +2102,7 @@ while true; do
 
     # Also accept terminal coderabbit commit status (success/failure) as a stop signal.
     if [[ -n "$HEAD_SHA" ]]; then
-        CR_STATE=$(gh_api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
-            jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
-            '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
+        CR_STATE="$(coderabbit_state_for_head "$HEAD_SHA")"
         if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" || "$CR_STATE" == "error" ]]; then
             if coderabbit_review_is_deferred "$PR_NUMBER"; then
                 LATEST_ISSUE_COMMENT="$(coderabbit_latest_issue_comment_body "$PR_NUMBER")"
