@@ -22246,6 +22246,166 @@ async def _ops_read_tmuxctld_health() -> dict:
     }
 
 
+def _ops_tmuxctld_error_occupancy(generated_at: datetime, message: str) -> dict:
+    return {
+        "status": "bad",
+        "generated_at": generated_at.isoformat(),
+        "total": 0,
+        "occupied": 0,
+        "free": 0,
+        "dead": 0,
+        "protected": 0,
+        "drift": 0,
+        "unknown": 0,
+        "errors": [message],
+        "cells": [],
+    }
+
+
+def _ops_public_pane_ref(row: dict) -> str:
+    for key in ("pane_positional_id", "pane_role", "role"):
+        value = row.get(key)
+        if value is None:
+            continue
+        text = str(value)
+        if text and ":" in text:
+            return text
+    return ""
+
+
+def _ops_tmux_cell_state(row: dict, free_ids: set[str]) -> str:
+    pane_ref = _ops_public_pane_ref(row)
+    raw_state = str(row.get("state") or row.get("status") or "").lower()
+    if raw_state in {"dead", "protected", "drift", "unknown", "free", "occupied"}:
+        return raw_state
+    if row.get("dead") or row.get("pane_dead"):
+        return "dead"
+    if row.get("protected") or row.get("is_protected"):
+        return "protected"
+    if row.get("drift") or row.get("projection_drift"):
+        return "drift"
+    if row.get("instance_id") or row.get("persona") or row.get("wrapper_id"):
+        return "occupied"
+    if pane_ref and pane_ref in free_ids:
+        return "free"
+    return "unknown" if pane_ref else "drift"
+
+
+def _ops_normalize_tmux_payload(payload, surface: str, errors: list[str]):
+    if isinstance(payload, Exception):
+        errors.append(f"tmuxctld {surface} unavailable: {payload}")
+        return []
+    return payload.get("result", payload) if isinstance(payload, dict) else payload
+
+
+def _ops_build_tmux_occupancy(
+    generated_at: datetime,
+    health: dict,
+    ledger_payload: dict | list | Exception,
+    freelist_payload: dict | list | Exception,
+) -> dict:
+    errors: list[str] = []
+    ledger_rows = _ops_normalize_tmux_payload(ledger_payload, "ledger", errors)
+    freelist = _ops_normalize_tmux_payload(freelist_payload, "freelist", errors)
+    if not isinstance(ledger_rows, list):
+        errors.append("tmuxctld ledger rows malformed")
+        ledger_rows = []
+    if not isinstance(freelist, list):
+        errors.append("tmuxctld freelist malformed")
+        freelist = []
+    free_ids = {
+        _ops_public_pane_ref(item)
+        for item in freelist
+        if isinstance(item, dict) and _ops_public_pane_ref(item)
+    }
+    cells: list[dict] = []
+    seen: set[str] = set()
+    for row in ledger_rows:
+        if not isinstance(row, dict):
+            errors.append("tmuxctld ledger row malformed")
+            continue
+        pane_positional_id = _ops_public_pane_ref(row)
+        state = _ops_tmux_cell_state(row, free_ids)
+        if pane_positional_id:
+            seen.add(pane_positional_id)
+        cells.append(
+            {
+                "pane_positional_id": pane_positional_id or None,
+                "instance_id": row.get("instance_id"),
+                "persona": row.get("persona") or row.get("persona_slug"),
+                "engine": row.get("engine"),
+                "working_dir": row.get("working_dir") or row.get("cwd"),
+                "wrapper_id": row.get("wrapper_id"),
+                "state": state,
+                "source": "tmuxctld:ledger",
+            }
+        )
+    for item in freelist:
+        if not isinstance(item, dict):
+            continue
+        pane_positional_id = _ops_public_pane_ref(item)
+        if pane_positional_id and pane_positional_id not in seen:
+            cells.append(
+                {
+                    "pane_positional_id": pane_positional_id,
+                    "instance_id": None,
+                    "persona": None,
+                    "engine": None,
+                    "working_dir": None,
+                    "wrapper_id": None,
+                    "state": "free",
+                    "source": "tmuxctld:freelist",
+                }
+            )
+            seen.add(pane_positional_id)
+    counts = {
+        key: sum(1 for c in cells if c.get("state") == key)
+        for key in ["occupied", "free", "dead", "protected", "drift", "unknown"]
+    }
+    status = (
+        "bad"
+        if not health.get("reachable")
+        else "warn"
+        if errors or counts["dead"] or counts["drift"] or counts["unknown"]
+        else "ok"
+    )
+    return {
+        "status": status,
+        "generated_at": generated_at.isoformat(),
+        "total": len(cells),
+        **counts,
+        "errors": errors,
+        "cells": cells,
+    }
+
+
+async def _ops_read_tmuxctld_snapshot(generated_at: datetime) -> dict:
+    health = await _ops_read_tmuxctld_health()
+    if not health.get("reachable"):
+        health["occupancy"] = _ops_tmuxctld_error_occupancy(
+            generated_at, health.get("error") or "tmuxctld unreachable"
+        )
+        return health
+    try:
+        base = shared._tmuxctld_url(default_loopback=True)
+
+        def read_json(path: str):
+            with shared._TMUXCTLD_OPENER.open(f"{base}{path}", timeout=0.75) as resp:
+                return json.loads(resp.read().decode(errors="ignore") or "{}")
+
+        ledger_payload, freelist_payload = await asyncio.gather(
+            asyncio.to_thread(read_json, "/ledger/rows"),
+            asyncio.to_thread(read_json, "/freelist"),
+            return_exceptions=True,
+        )
+        health["occupancy"] = _ops_build_tmux_occupancy(
+            generated_at, health, ledger_payload, freelist_payload
+        )
+    except Exception as exc:
+        health["occupancy"] = _ops_tmuxctld_error_occupancy(generated_at, str(exc))
+    return health
+
+
 async def _ops_collect_facts(now: datetime) -> dict:
     """Collect the shared facts backing both ops cockpit state and ops status."""
     sources: dict[str, dict] = {
@@ -22350,7 +22510,7 @@ async def _ops_collect_facts(now: datetime) -> dict:
             "error": str(exc),
         }
 
-    tmux_health = await _ops_read_tmuxctld_health()
+    tmux_health = await _ops_read_tmuxctld_snapshot(now)
 
     if "agents_db" in source_errors:
         sources["agents_db"] = _ops_source_health(
@@ -22382,13 +22542,25 @@ async def _ops_collect_facts(now: datetime) -> dict:
             details={"mode": timer_engine.current_mode.value},
         )
 
+    tmux_occupancy_status = (tmux_health.get("occupancy") or {}).get("status")
     sources["tmuxctld"] = _ops_source_health(
-        "ok" if tmux_health.get("reachable") else "warn",
+        "warn"
+        if tmux_health.get("reachable") and tmux_occupancy_status in {"warn", "bad"}
+        else "ok"
+        if tmux_health.get("reachable")
+        else "warn",
         available=bool(tmux_health.get("reachable")),
-        message="tmuxctld health available"
+        message="tmuxctld occupancy degraded"
+        if tmux_health.get("reachable") and tmux_occupancy_status in {"warn", "bad"}
+        else "tmuxctld health available"
         if tmux_health.get("reachable")
         else "tmuxctld health unavailable",
-        details=tmux_health,
+        details={
+            "error": tmux_health.get("error"),
+            "tmux_reachable": tmux_health.get("tmux_reachable"),
+            "occupancy_status": tmux_occupancy_status,
+            "occupancy_errors": (tmux_health.get("occupancy") or {}).get("errors", []),
+        },
     )
 
     sources["cron"] = _ops_source_health(
@@ -22661,7 +22833,8 @@ def _ops_build_status(facts: dict) -> dict:
             "version": tmux_health.get("version"),
             "sha": tmux_health.get("sha"),
             "live_instance_panes": None,
-            "projection_drift": None,
+            "projection_drift": (tmux_health.get("occupancy") or {}).get("drift"),
+            "occupancy": tmux_health.get("occupancy"),
         },
         "tts": {
             "current": current_tts_label,

@@ -13,6 +13,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 import type { OpsSourceHealth, OpsState, PipelineDoc, TimerHistory, TimerMode } from './contracts';
+import type { CompassStar } from './compass';
 
 export type CockpitMode = 'working' | 'multitasking' | 'distracted' | 'break' | 'idle';
 
@@ -233,15 +234,72 @@ export function goldenThroneDial(s: OpsState): DialModel {
   return { id: 'gt', label: 'Gold. Throne', glyph: '♛', value, tone, noteworthy: due > 0 || resume > 0 || armed > 0, subtitle: `Golden Throne rubrics — ${armed} armed, ${resume} resume signal(s), ${victory} victory ack(s).` };
 }
 
-// a placeholder dial for subsystems NOT wired this phase — explicit, never fake.
-function unwiredDial(id: string, label: string, glyph: string, what: string): DialModel {
+function sourceDial(s: OpsState): DialModel {
+  const degraded = Object.values(s.sources ?? {}).filter((src) => ['warn', 'bad', 'unknown'].includes(src?.status ?? 'unknown')).length;
   return {
-    id, label, glyph,
-    value: '—',
-    tone: 'idle',
-    noteworthy: false,
-    subtitle: `${what} — not wired yet (phase 2).`,
+    id: 'sources', label: 'Sources', glyph: '◇', value: degraded ? `${degraded} degraded` : 'nominal',
+    tone: degraded ? 'warn' : 'good', noteworthy: degraded > 0,
+    subtitle: `Aggregate source health — ${degraded} degraded source(s).`,
   };
+}
+
+function fleetDial(s: OpsState): DialModel {
+  const c = s.instances.counts;
+  const engines = Object.entries(c.by_engine ?? {}).map(([k, v]) => `${k}:${v}`).join(' ') || 'engines unknown';
+  return {
+    id: 'fleet', label: 'Fleet', glyph: '◆', value: `${c.active} active`,
+    tone: c.stale ? 'warn' : c.active ? 'good' : 'idle', noteworthy: c.stale > 0,
+    subtitle: `Instance registry — ${c.active} active, ${c.stale} stale; ${engines}.`,
+  };
+}
+
+function workDial(s: OpsState): DialModel {
+  const w = s.work_state;
+  const typing = w.typing_active ? 'typing' : 'not typing';
+  const hold = w.productivity_hold ? `; hold ${w.productivity_hold}` : '';
+  return {
+    id: 'work', label: 'Work', glyph: '⌁', value: w.productivity_active ? 'active' : 'idle',
+    tone: w.productivity_active ? 'good' : 'neutral', noteworthy: Boolean(w.productivity_hold || w.typing_active),
+    subtitle: `Productivity state — ${w.reason}; ${typing}${hold}.`,
+  };
+}
+
+function tmuxDial(s: OpsState): DialModel {
+  const occ = s.tmux.occupancy;
+  const reachable = s.tmux.reachable === true;
+  const drift = occ?.drift ?? 0;
+  const dead = occ?.dead ?? 0;
+  const value = !reachable ? 'unreachable' : occ ? `${occ.occupied}/${occ.total} used` : 'unknown';
+  const tone: DialTone = !reachable ? 'bad' : occ?.status === 'bad' ? 'bad' : drift || dead || occ?.status === 'warn' ? 'warn' : 'good';
+  return {
+    id: 'tmux', label: 'tmux', glyph: '▦', value, tone, noteworthy: tone !== 'good',
+    subtitle: `tmuxctld occupancy — free ${occ?.free ?? 0}, dead ${dead}, drift ${drift}${occ?.errors?.length ? `; ${occ.errors.join('; ')}` : ''}.`,
+  };
+}
+
+const COMPASS_DIRECTIONS = new Set(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']);
+export const OCCUPANCY_COMPASS_FALLBACK_STARS: CompassStar[] = [{ dir: 'N', color: 'red' }];
+
+function paneCompassStar(cell: { pane_positional_id?: string | null; state?: string | null }): CompassStar | null {
+  // Stable pane roles arrive as palace:N / somnium:NE. Some tmuxctld views can
+  // expose the equivalent numeric window positions, where 1 is palace and 2 is
+  // somnium. The compass reducer already handles coalescing and red+blue=purple;
+  // this adapter only translates occupied slots into authored stars.
+  const raw = String(cell.pane_positional_id ?? '');
+  const [page, pos] = raw.split(':');
+  if (!page || !pos || !COMPASS_DIRECTIONS.has(pos)) return null;
+  const color = page === 'palace' || page === '1' ? 'red' : page === 'somnium' || page === '2' ? 'blue' : null;
+  if (!color) return null;
+  const state = cell.state ?? 'unknown';
+  if (!['occupied', 'protected', 'drift'].includes(state)) return null;
+  return { dir: pos as CompassStar['dir'], color };
+}
+
+export function occupancyCompassStars(s: OpsState): CompassStar[] {
+  const occ = s.tmux?.occupancy;
+  if (!occ || s.tmux?.reachable !== true || occ.status === 'bad') return OCCUPANCY_COMPASS_FALLBACK_STARS;
+  const stars = (occ.cells ?? []).map(paneCompassStar).filter((star): star is CompassStar => star != null);
+  return stars.length ? stars : [{ dir: 'S', color: 'red' }];
 }
 
 // Signed break balance in ms → the balance dial's compact readout ('+9m'/'−12m').
@@ -275,15 +333,16 @@ export function buildDials(s: OpsState): DialModel[] {
       action: { kind: 'dismiss-phone' } },
     { id: 'desktop', label: 'Desktop', glyph: '▣', value: s.attention.desktop.mode || '—', tone: 'neutral',
       noteworthy: true, subtitle: 'Desktop presence — inferred from keyboard & focus.' },
+    tmuxDial(s),
+    fleetDial(s),
+    workDial(s),
+    sourceDial(s),
     enforcementDial(s),
     goldenThroneDial(s),
     // nominal / suppressed subsystems — the tail of the stack
     { id: 'cron', label: 'Cron', glyph: '◷', value: cron.value, tone: cron.tone, noteworthy: false,
       subtitle: 'Scheduled cron routines — subsystem health.' },
     ttsDial(s),
-    unwiredDial('mac', 'Mac', '⌘', 'Mac node reachability'),
-    unwiredDial('wsl', 'WSL', '⊞', 'WSL satellite reachability'),
-    unwiredDial('mesh', 'Mesh', '⇄', 'Tailscale mesh reachability'),
   ];
 }
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { OPS_COCKPIT_POLLS } from './api';
-import { enforcementDial, goldenThroneDial, laneForStatus, toFleetQueues, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
+import { buildDials, enforcementDial, goldenThroneDial, laneForStatus, occupancyCompassStars, toFleetQueues, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
 import type { OpsState } from './contracts';
 
 type TestInstance = {
@@ -427,5 +427,61 @@ describe('toMusterBoard', () => {
     expect(board.victorious).toBeUndefined(); // empty lane renders empty
     // archived is a hidden terminal — it must never open a lane or count
     expect(Object.values(board).reduce((n, l) => n + l.overflow, 0)).toBe(44);
+  });
+});
+
+describe('tmux occupancy adapters', () => {
+  it('buildDials exposes real tmux/fleet/work/source dials and no mac/wsl/mesh placeholders', () => {
+    const dials = buildDials({
+      timer: { mode: 'working', break_balance_ms: 60000 },
+      attention: { phone: { app: null, is_distracted: false }, desktop: { mode: 'silence' } },
+      sources: { cron: { status: 'ok' }, tts: { status: 'ok' }, enforcement: { status: 'ok' }, token_api: { status: 'ok' }, agents_db: { status: 'ok' }, timer_engine: { status: 'ok' }, tmuxctld: { status: 'ok' } },
+      tts: { hot_queue_length: 0, pause_queue_length: 0, hot_queue: [], pause_queue: [], current: null, backend: 'wsl', satellite_available: true },
+      enforcement: { pending_count: 0, pavlok: {} },
+      instances: { active: [], counts: { active: 2, stale: 1, by_engine: { codex: 2 }, by_status: {}, by_persona: {} } },
+      work_state: { productivity_active: true, reason: 'recent activity', typing_active: true },
+      tmux: { reachable: true, occupancy: { status: 'warn', total: 4, occupied: 2, free: 1, dead: 0, protected: 0, drift: 1, unknown: 0, errors: [], cells: [], generated_at: 'x' } },
+    } as unknown as OpsState);
+    const ids = dials.map((d) => d.id);
+    expect(ids).toEqual(expect.arrayContaining(['tmux', 'fleet', 'work', 'sources']));
+    expect(ids).not.toEqual(expect.arrayContaining(['mac', 'wsl', 'mesh']));
+  });
+
+
+  it('keeps tmux dial bad when bad occupancy also reports drift or dead panes', () => {
+    const dials = buildDials({
+      sources: { cron: { status: 'ok' }, tts: { status: 'ok' }, enforcement: { status: 'ok' }, token_api: { status: 'ok' }, agents_db: { status: 'ok' }, timer_engine: { status: 'ok' }, tmuxctld: { status: 'warn' } },
+      timer: { mode: 'working', break_balance_ms: 0 },
+      attention: { phone: {}, desktop: {} },
+      tts: { hot_queue_length: 0, pause_queue_length: 0, hot_queue: [], pause_queue: [], current: null, backend: 'wsl', satellite_available: true },
+      enforcement: { pending_count: 0, pavlok: {} },
+      instances: { active: [], counts: { active: 0, stale: 0, by_engine: {}, by_status: {}, by_persona: {} } },
+      work_state: { productivity_active: false, reason: 'idle', typing_active: false },
+      tmux: { reachable: true, occupancy: { status: 'bad', total: 2, occupied: 0, free: 0, dead: 1, protected: 0, drift: 1, unknown: 0, errors: ['partial failure'], cells: [], generated_at: 'x' } },
+    } as unknown as OpsState);
+
+    expect(dials.find((d) => d.id === 'tmux')).toMatchObject({ tone: 'bad', noteworthy: true });
+  });
+
+  it('maps occupied palace/somnium pane slots to compass star colors', () => {
+    const stars = occupancyCompassStars({
+      tmux: {
+        reachable: true,
+        occupancy: {
+          status: 'ok', total: 4, occupied: 3, free: 1, dead: 0, protected: 0, drift: 0, unknown: 0, errors: [], generated_at: 'x',
+          cells: [
+            { pane_positional_id: 'palace:N', state: 'occupied' },
+            { pane_positional_id: '2:NE', state: 'occupied' },
+            { pane_positional_id: 'somnium:S', state: 'free' },
+            { pane_positional_id: '1:E', state: 'drift' },
+          ],
+        },
+      },
+    } as unknown as OpsState);
+    expect(stars).toEqual([
+      { dir: 'N', color: 'red' },
+      { dir: 'NE', color: 'blue' },
+      { dir: 'E', color: 'red' },
+    ]);
   });
 });

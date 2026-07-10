@@ -3,6 +3,8 @@ import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   balanceMinutes,
   buildDials,
+  OCCUPANCY_COMPASS_FALLBACK_STARS,
+  occupancyCompassStars,
   mapMode,
   nowClock,
   toFleetQueues,
@@ -80,6 +82,7 @@ interface CockpitData {
   segments: CockpitModeSegment[]; // coalesced mode bands
   nowPoint: CockpitTimerPoint | null; // the live head (also points' last entry)
   dials: DialModel[]; // the floating state-dial cluster models
+  compassStars: CompassStar[]; // tmux occupancy payload for the RHS compass
   ttsQueue: TtsItem[]; // the left-stack TTS queue
   fleetQueues: FleetQueues; // the four live worker rails — LEFT system = Token-OS
   //                           (working + idle), RIGHT system = askCivic; one chip
@@ -2541,16 +2544,7 @@ const STAR_FILL: Record<StarColor, string> = {
   blue: 'var(--star-blue)',
   purple: 'var(--star-purple)',
 };
-// Authored demo spec — exercises the rules by eye on :5199. NW red + NE blue +
-// SE red is the contested-ordinal case: NE hydrates BOTH N and E (rule 4), so
-// N and E render purple and all three ordinals vanish. S red is a plain lone
-// cardinal for contrast.
-const DEMO_COMPASS_STARS: CompassStar[] = [
-  { dir: 'NW', color: 'red' },
-  { dir: 'NE', color: 'blue' },
-  { dir: 'SE', color: 'red' },
-  { dir: 'S', color: 'red' },
-];
+// Compass stars come from OpsState.tmux.occupancy via occupancyCompassStars.
 function CompassDial({ cx, cy, capR, rimD, uiScale, stars }: { cx: number; cy: number; capR: number; rimD: string; uiScale: number; stars: readonly CompassStar[] }) {
   const R = capR * COMPASS_R_FRAC;
   const cardL = R * COMPASS_CARD_FRAC;
@@ -2835,6 +2829,7 @@ function WorkerQueues({ leftRoster, rightRoster, pendingIds, dupKeys, uiScale, g
   onFinishLeft?: ((spec: WorkerFinishSpec) => void) | undefined; onFinishRight?: ((spec: WorkerFinishSpec) => void) | undefined;
   finishRequest?: { agentId: string; nonce: number } | null; // edge-A handoff request — handed to BOTH columns; only the one holding the id acts
 }) {
+  const { compassStars } = useCockpitData();
   // Crossbar + hourglass shape is LOCKED — read straight from the frozen constants.
   // The by-eye dev-tuning sliders and the `shape` prop have been retired.
   const shape = RAIL_SHAPE_DEFAULTS;
@@ -3213,7 +3208,7 @@ function WorkerQueues({ leftRoster, rightRoster, pendingIds, dupKeys, uiScale, g
           {rail.compass && (
             variant === 'clock'
               ? <ClockDial cx={rail.compass.cx} cy={rail.compass.cy} capR={rail.compass.capR} rimD={rail.compass.rimD} uiScale={uiScale} queueValue={queueValue} flip={flip} animate={animate} />
-              : <CompassDial cx={rail.compass.cx} cy={rail.compass.cy} capR={rail.compass.capR} rimD={rail.compass.rimD} uiScale={uiScale} stars={DEMO_COMPASS_STARS} />
+              : <CompassDial cx={rail.compass.cx} cy={rail.compass.cy} capR={rail.compass.capR} rimD={rail.compass.rimD} uiScale={uiScale} stars={compassStars} />
           )}
         </svg>
       )}
@@ -4144,6 +4139,7 @@ export function OpsCockpit() {
       segments: h ? toModeSegments(h) : [],
       nowPoint,
       dials: s ? buildDials(s) : [],
+      compassStars: s ? occupancyCompassStars(s) : OCCUPANCY_COMPASS_FALLBACK_STARS,
       ttsQueue: s ? toTtsQueue(s) : [],
       fleetQueues: s
         ? toFleetQueues(s)

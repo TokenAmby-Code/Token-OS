@@ -109,7 +109,7 @@ Current top-level keys:
 - `tts` — current item, queue lengths, backend, satellite availability, global mode.
 - `voice_drafts` — top-level Discord voice-draft summaries awaiting operator review.
 - `enforcement` — pending acknowledgement count/sample and Pavlok summary.
-- `tmux` — direct tmuxctld health snapshot surfaced in the aggregate state; the UI should not scrape tmuxctld or legacy health routes independently.
+- `tmux` — direct tmuxctld health plus `tmux.occupancy` summary brokered from tmuxctld `/health`, `/ledger/rows`, and `/freelist`; the UI should not scrape tmuxctld or legacy health routes independently.
 - `work_actions` — explicit work-action ticks and daily counts for the HUD work dial.
 
 ## Development workflow
