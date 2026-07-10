@@ -413,7 +413,7 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
   return items;
 }
 
-// ── Worker queue (the two rails below the lemon) ────────────────────────────
+// ── Fleet queues (two systems × two rails) ──────────────────────────────────
 // The worker rails are the LIVE registration surface: one chip per registered
 // instance, wearing that instance's chapter-persona icon. A chip appearing IS
 // the "this instance registered properly" signal; a chip leaving means the
@@ -430,34 +430,69 @@ export type WorkerItem = {
   //                        children, so the rail's breach glow must too)
 };
 
+// One worker SYSTEM: the top (actively processing a prompt) rail + the bottom
+// (idle) rail. A worker sits in exactly one of the two — the status flip
+// between polls IS the inter-queue movement.
+export type DomainQueues = {
+  working: WorkerItem[]; // status === 'working' — the top rail
+  idle: WorkerItem[]; // every other alive status — the bottom rail
+};
+
+// The two systems (Emperor's ruling, 2026-07-09): LEFT = Token-OS workers,
+// RIGHT = askCivic workers. They never touch — no shared arrays, no crossover.
+export type FleetQueues = {
+  tokenOs: DomainQueues;
+  askCivic: DomainQueues;
+};
+
 /**
- * OpsState → the live worker rails. One chip per active registered instance
- * (the backend already excludes stopped/archived). Subagents are excluded —
- * the rails signal top-level fleet registrations, and a subagent inheriting
- * its parent's persona would false-trigger the singleton-breach glow.
+ * OpsState → the four fleet rails. ONE partition pass: each active top-level
+ * instance lands in exactly one of the four buckets — `domain` picks the side
+ * (server-side cwd classification; the browser never sees a raw path decide),
+ * `status === 'working'` picks top vs bottom. The one-queue-at-a-time
+ * invariant is STRUCTURAL: a single `push` per instance, so no id can ever
+ * occupy two buckets — there is nothing to filter after the fact.
+ *
+ * Old-payload honesty: a missing `domain` files under token-os (the home
+ * fleet is the default left system), a missing `status` files as idle (never
+ * fake "processing"). Subagents are excluded — the rails signal top-level
+ * fleet registrations, and a subagent inheriting its parent's persona would
+ * false-trigger the singleton-breach glow.
  *
  * Persona falls back to the generic 'astartes' key when the instance has no
  * persona bound — the chip still appears (the registration was real) but wears
  * the generic helmet, which is exactly the "registered without a chapter
- * persona" diagnostic. Duplicate personas are NOT deduped here; the rail marks
+ * persona" diagnostic. Duplicate personas are NOT deduped here; the rails mark
  * them as singleton breaches (see duplicatePersonaKeys in OpsCockpit).
  */
-export function toWorkerQueue(s: OpsState): WorkerItem[] {
+export function toFleetQueues(s: OpsState): FleetQueues {
   // created_at crosses the boundary in BOTH SQLite ('YYYY-MM-DD HH:MM:SS') and
   // ISO ('YYYY-MM-DDTHH:MM:SS…') spellings; space sorts before 'T', so a raw
   // lexicographic compare interleaves the two formats. Normalizing the
   // separator makes the compare chronological across both.
   const regKey = (created: string | null): string => (created ?? '').replace(' ', 'T');
-  return s.instances.active
+  const queues: FleetQueues = {
+    tokenOs: { working: [], idle: [] },
+    askCivic: { working: [], idle: [] },
+  };
+  const sorted = s.instances.active
     .filter((i) => !i.is_subagent)
-    .sort((a, b) => regKey(b.created_at).localeCompare(regKey(a.created_at)))
-    .map((i) => ({
+    .sort((a, b) => regKey(b.created_at).localeCompare(regKey(a.created_at)));
+  for (const i of sorted) {
+    const system = i.domain === 'askcivic' ? queues.askCivic : queues.tokenOs;
+    const bucket = i.status === 'working' ? system.working : system.idle;
+    // Identity fields are IDENTICAL whichever bucket the instance lands in —
+    // the chip is the same dial wherever it sits (same React key on both
+    // rails, so a status flip moves the chip instead of reminting it).
+    bucket.push({
       id: i.id,
       persona: i.persona?.slug ?? 'astartes',
       name: i.display_name,
       tint: i.persona?.chip_color ?? null,
       chapterChild: i.commander_type === 'chapter',
-    }));
+    });
+  }
+  return queues;
 }
 
 // ── Muster Ledger (the kanban board between the crossbars) ──────────────────

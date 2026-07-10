@@ -6,17 +6,18 @@ import {
   occupancyCompassStars,
   mapMode,
   nowClock,
+  toFleetQueues,
   toModeSegments,
   toMusterBoard,
   toTimerPoints,
   toTtsQueue,
-  toWorkerQueue,
   ttsLanguishThreshold,
   type CockpitMode,
   type CockpitModeSegment,
   type CockpitTimerPoint,
   type DialModel,
   type DialTone,
+  type FleetQueues,
   type KanbanCardModel,
   type KanbanLane,
   type TtsItem,
@@ -82,7 +83,9 @@ interface CockpitData {
   dials: DialModel[]; // the floating state-dial cluster models
   compassStars: CompassStar[]; // tmux occupancy payload for the RHS compass
   ttsQueue: TtsItem[]; // the left-stack TTS queue
-  workerQueue: WorkerItem[]; // the live worker rails — one chip per registered instance
+  fleetQueues: FleetQueues; // the four live worker rails — LEFT system = Token-OS
+  //                           (working + idle), RIGHT system = askCivic; one chip
+  //                           per registered instance, in exactly one queue
   muster: Record<string, KanbanLane>; // the Muster Ledger lanes, keyed by canonical slug
   degraded: string | null; // non-null → render the degraded banner with this text
 }
@@ -881,8 +884,8 @@ function Dials({ onOpenDrawer, uiScale }: { onOpenDrawer: (id: string) => void; 
 // pause queues stacked below it, in order. Order, growth, and drain all come
 // from the live read-model — the stack never invents motion (the mock's local
 // promote/speak play gesture is retired); membership changes still animate via
-// the roster reconcile + transform transitions, and a drain hands the departing
-// dial to the lifecycle controller so it flies out to the idle rail (edge B).
+// the roster reconcile + transform transitions, and a drained dial simply
+// leaves the stack (the idle rails are live fleet truth, not TTS dressing).
 //
 // Tone + glyph come from a SMALL status map local to the stack (deliberately
 // distinct from the status dials'), then flow through the shared <Dial> as an
@@ -950,30 +953,28 @@ function duplicatePersonaKeys<T>(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// LIFECYCLE IDENTITY — one object woven through all three queues (worker → TTS →
-// idle). Its `id` is the single React key in every queue (so no identity ever
-// briefly exists in two lists) and its `originSide` rides through TTS so the
-// idle return lands on the side the handoff came from. The three queues are
-// ROSTER-driven (keyed Agent[]) — each component keeps its own slot/phase
-// reconcile + CSS-transition machinery; only the reconcile INPUT is a keyed
-// list (diff by id, not length).
+// LIFECYCLE IDENTITY — one object woven through the queues. Its `id` is the
+// single React key in every queue (so no identity ever briefly exists in two
+// lists). The queues are ROSTER-driven (keyed Agent[]) — each component keeps
+// its own slot/phase reconcile + CSS-transition machinery; only the reconcile
+// INPUT is a keyed list (diff by id, not length).
 //
-// The MINT is all-live now. Worker agents are minted 1:1 from the registered
-// fleet (id = the instance id, persona = the instance's chapter persona) — a
-// chip on the rail IS the "this instance registered properly" signal, so the
-// rails start EMPTY and only ever carry real registrations. TTS agents are
-// LIVE: minted 1:1 from the live speak-queue items (id = the live item id),
-// never synthesized — the design study's worker-click-births-an-utterance edge
-// is retired, and the weave's handoff animations are triggered by the live
-// queue's arrivals/drains instead. Only the idle chips remain demo-dressed
-// (they park a drained utterance's persona, not a fleet row).
+// The MINT is all-live. Fleet agents (top AND idle rails) are minted 1:1 from
+// the pre-partitioned fleet queues (id = the instance id, persona = the
+// instance's chapter persona) — a chip on a rail IS the "this instance
+// registered properly" signal, so the rails start EMPTY and only ever carry
+// real registrations; which of the side's two rails it sits on is the live
+// status (working = top, everything else = idle). TTS agents are LIVE: minted
+// 1:1 from the live speak-queue items (id = the live item id), never
+// synthesized — the weave's handoff animation triggers on the live queue's
+// arrivals; drains simply leave (the demo idle parking is excised).
 // ═══════════════════════════════════════════════════════════════════════════
-type OriginSide = -1 | 1; // -1 = left column, +1 = right column
+type OriginSide = -1 | 1; // -1 = left column (Token-OS), +1 = right column (askCivic)
 interface Agent {
   id: string; // the React key in every queue (instance id for workers, live item id for TTS)
   persona: string;
   tone: string;
-  originSide: OriginSide; // set at mint; rides worker → TTS → idle unchanged
+  originSide: OriginSide; // fleet chips: the SYSTEM side (domain), fixed at partition
   label?: string; // instance display name (live workers) — the chip's hover readout
   chapterChild?: boolean; // live workers: legitimately shares its persona (see WorkerItem)
 }
@@ -1009,7 +1010,6 @@ interface WorkerFinishSpec {
 
 // Flight timings/easing — settled by eye on :5199 (see the tuning stage).
 const FLIGHT_WORKER_TTS_MS = 520; // worker → TTS: shrink + ride the arm to the corner + pop
-const FLIGHT_TTS_IDLE_MS = 560; // TTS → idle: straight, grow back
 const FLIGHT_EASE = 'cubic-bezier(0.4, 0, 0.2, 1)';
 // Right-side worker→TTS routing: 'own' = each side rides its OWN arm to its OWN
 // arm→ditch corner, then straight to the single top-left TTS bottom (left = short
@@ -1059,7 +1059,7 @@ function agentNodeCenter(id: string, scopeSel?: string): { x: number; y: number 
 type TtsPhase = 'arriving' | 'idle' | 'promoting' | 'error' | 'speaking' | 'dismissing';
 interface TtsEntry {
   key: string; // = agent.id = the live item id — the React key
-  agent: TtsAgent; // the woven identity; item = agent.item, originSide rides to idle
+  agent: TtsAgent; // the woven identity; item = agent.item
   phase: TtsPhase;
   slot: number; // visual row (0 = head); the sole position driver
   promoteSlot: number | undefined; // click-time source slot for the CSS L-path
@@ -2221,14 +2221,15 @@ interface WorkerEntry {
 }
 
 // One side of the "M": a self-contained reflowing queue riding `path`. Mirrors
-// TtsStack — roster-driven membership (diff by id), slot-only positioning. The
-// compass variant renders the LIVE registered fleet (idle stays demo-dressed);
-// chip clicks are inert everywhere; a worker FINISH (the edge-A handoff,
+// TtsStack — roster-driven membership (diff by id), slot-only positioning. Both
+// variants render LIVE fleet queues (compass = the processing rails, clock =
+// the idle rails); chip clicks are inert everywhere; a worker FINISH (the edge-A handoff,
 // measure + hand the controller the arm polyline for the flight) fires
 // programmatically via `finishRequest` when the LIVE TTS queue gains an item —
 // never from a click, which would fabricate a queue entry.
-function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inset, split, insertMode, onFinish, finishRequest, baseline }: {
+function WorkerColumn({ side, roster, pendingIds, dupKeys, geo, uiScale, gap, pitch, inset, split, insertMode, onFinish, finishRequest, baseline }: {
   side: number; roster: Agent[]; pendingIds: ReadonlySet<string>;
+  dupKeys?: ReadonlySet<string> | undefined; // FLEET-WIDE singleton-breach keys (see fleetDupKeys) — absent ⇒ no breach glow
   geo: LemonGeometry; uiScale: number;
   gap: number; pitch: number; inset: number; split: number;
   insertMode: 'center' | 'tail'; // worker births emerge at the CENTRE; idle arrivals append at the DEEPEST slot
@@ -2365,23 +2366,17 @@ function WorkerColumn({ side, roster, pendingIds, geo, uiScale, gap, pitch, inse
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finishRequest]);
 
-  // A persona must be unique within this queue — the DB's invariant, at the DB's
-  // own scope: chapter children (e.g. mechanicus workers) legitimately share a
-  // persona and are exempt, exactly like the singleton trigger. When the data
-  // breaks the invariant, the repeats are surfaced with a red error glow, not
-  // silently collapsed (see the helper).
-  const dupKeys = duplicatePersonaKeys(
-    entries,
-    (e) => e.slot,
-    (e) => e.agent.persona,
-    (e) => e.key,
-    (e) => e.agent.chapterChild === true,
-  );
-
+  // A persona must be unique across the WHOLE fleet — the DB's invariant, at
+  // the DB's own scope (chapter children legitimately share a persona and are
+  // exempt, exactly like the singleton trigger). The breach set is computed
+  // ONCE over all four rails (see fleetDupKeys in the root) and handed down,
+  // so a persona split across two queues still glows. When the data breaks
+  // the invariant, the repeats are surfaced with a red error glow, not
+  // silently collapsed.
   return (
     <>
       {entries.map((e) => {
-        const isDup = dupKeys.has(e.key);
+        const isDup = dupKeys?.has(e.key) ?? false;
         // slot 0 sits `split` out from the stem (centre clearance); each further slot
         // marches one `pitch` outward along the arm.
         const sArc = (split + e.slot * pitch) * uiScale;
@@ -2825,8 +2820,9 @@ function ClockDial({ cx, cy, capR, rimD, uiScale, queueValue, flip, animate }: {
   );
 }
 
-function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true, onFinishLeft, onFinishRight, finishRequest }: {
+function WorkerQueues({ leftRoster, rightRoster, pendingIds, dupKeys, uiScale, gap, pitch, inset, split, variant = 'compass', queueValue = 0, flip = false, animate = true, onFinishLeft, onFinishRight, finishRequest }: {
   leftRoster: Agent[]; rightRoster: Agent[]; pendingIds: ReadonlySet<string>;
+  dupKeys?: ReadonlySet<string> | undefined; // fleet-wide singleton-breach keys, forwarded to both columns
   uiScale: number; gap: number; pitch: number; inset: number; split: number;
   variant?: 'compass' | 'clock'; queueValue?: number; flip?: boolean; animate?: boolean;
   onFinishLeft?: ((spec: WorkerFinishSpec) => void) | undefined; onFinishRight?: ((spec: WorkerFinishSpec) => void) | undefined;
@@ -3215,9 +3211,9 @@ function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch
           )}
         </svg>
       )}
-      <WorkerColumn side={-1} roster={leftRoster} pendingIds={pendingIds} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} insertMode={insertMode} onFinish={onFinishLeft}
+      <WorkerColumn side={-1} roster={leftRoster} pendingIds={pendingIds} dupKeys={dupKeys} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} insertMode={insertMode} onFinish={onFinishLeft}
         finishRequest={finishRequest} baseline={variant === 'clock' && rail ? idleBaselineTip : undefined} />
-      <WorkerColumn side={1} roster={rightRoster} pendingIds={pendingIds} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} insertMode={insertMode} onFinish={onFinishRight}
+      <WorkerColumn side={1} roster={rightRoster} pendingIds={pendingIds} dupKeys={dupKeys} geo={geo} uiScale={uiScale} gap={gap} pitch={pitch} inset={inset} split={split} insertMode={insertMode} onFinish={onFinishRight}
         finishRequest={finishRequest} baseline={variant === 'clock' && rail ? idleBaselineClock : undefined} />
     </div>
   );
@@ -3227,20 +3223,25 @@ function WorkerQueues({ leftRoster, rightRoster, pendingIds, uiScale, gap, pitch
 // A standalone bottom section: the SAME crossbar assembly (rail + hourglass + cap
 // + chips) reused from WorkerQueues, but flipped 180° so it reads as a bottom rail
 // (cap swings LEFT, chips hang BELOW the bar), with the clock inscribed in the cap
-// instead of the compass. The clock face counter-rotates to stay upright. Chips
-// The clock face (numeral fill) is DECOUPLED from the chip count: `clockValue`
-// (0–6, its own placeholder demo source) drives the numerals, `idleLeft`/`idleRight`
-// drive the per-side chips (each grows up its ditch, independent of the other side).
-function IdleWorkerQueue({ clockValue, idleLeft, idleRight, pendingIds, uiScale, animate }: {
+// instead of the compass. The clock face counter-rotates to stay upright.
+// LIVE: `idleLeft`/`idleRight` are the fleet's idle queues (left Token-OS, right
+// askCivic — same sides as the top rails, so a status flip moves a chip straight
+// down its own system). `clockValue` derives from total idle depth (0–6).
+function IdleWorkerQueue({ clockValue, idleLeft, idleRight, pendingIds, dupKeys, uiScale, animate }: {
   clockValue: number; idleLeft: Agent[]; idleRight: Agent[]; pendingIds: ReadonlySet<string>;
-  uiScale: number; animate: boolean;
+  dupKeys?: ReadonlySet<string> | undefined; uiScale: number; animate: boolean;
 }) {
   const total = idleLeft.length + idleRight.length;
   return (
     <section className="idle-worker-queue"
-      aria-label={`Idle worker queue (demo — fleet wiring lands phase 2) — ${total} idle worker${total === 1 ? '' : 's'}`}>
-      {/* Idle is TERMINAL this pass (no idle→worker edge), so no onFinish — clicks inert. */}
-      <WorkerQueues leftRoster={idleLeft} rightRoster={idleRight} pendingIds={pendingIds} uiScale={uiScale}
+      aria-label={`Idle worker queue — ${total} idle worker${total === 1 ? '' : 's'} (left Token-OS, right askCivic)`}>
+      {/* Idle chips fire no arm handoffs (the controller measures them directly
+          for edge A), so no onFinish — clicks inert.
+          Roster→column swap: the 180° flip mirrors the assembly HORIZONTALLY too,
+          so the side=+1 (clock) column reads screen-LEFT and side=−1 reads
+          screen-RIGHT. Token-OS idle therefore rides rightRoster (+1) to sit
+          under the Token-OS top rail; askCivic rides leftRoster (−1). */}
+      <WorkerQueues leftRoster={idleRight} rightRoster={idleLeft} pendingIds={pendingIds} dupKeys={dupKeys} uiScale={uiScale}
         gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
         variant="clock" queueValue={clockValue} flip animate={animate} />
     </section>
@@ -3493,36 +3494,33 @@ function FlightLayer({ flights, onLand }: { flights: Flight[]; onLand: (f: Fligh
 // queue data behind a lost animation would be the dishonest failure mode.
 const PENDING_REVEAL_FAILSAFE_MS = 2500;
 
-// Idle rail retention, per side. The idle legs are a DEMO surface fed by live
-// TTS drains (every drained utterance parks a chip); without a cap a full day
-// of traffic would flood the rail. FIFO — the oldest chip retires as a new one
-// lands.
-const IDLE_DEMO_CAP = 8;
-
 // ═══════════════════════════════════════════════════════════════════════════
 // LIFECYCLE CONTROLLER — the single owner of the five rosters + the flight
-// overlay. The weave is LIVE-DRIVEN at the worker and TTS legs; only the idle
-// chips remain demo-dressed (they park a drained utterance's persona):
+// overlay. ALL rosters are LIVE-driven now (the edge-B demo idle parking is
+// excised — the idle rails are feed truth, not drained-utterance dressing):
 //
-//   • worker rosters: minted 1:1 from the registered fleet (`liveWorkers`,
-//     registration order). The rails start EMPTY; a chip appears when an
-//     instance registers (the registration signal) and drops when it stops.
-//     `null` (feed down/warming) FREEZES the rails at last-good.
+//   • fleet rosters (four rails, two systems that never touch): minted 1:1
+//     from the pre-partitioned fleet queues (`liveFleet`, registration order).
+//     LEFT system = Token-OS (top working rail + bottom idle rail), RIGHT
+//     system = askCivic. A worker actively processing a prompt sits in the top
+//     rail; every other alive status sits in the bottom rail of the SAME side.
+//     The status flip between polls IS the inter-queue movement — the same
+//     chip id leaves one roster and appears in the other in one commit, so an
+//     instance never renders in two queues. `null` (feed down/warming)
+//     FREEZES all four rails at last-good.
 //   • TTS roster: minted 1:1 from the live speak queue (`liveTts`, ordered) —
 //     never synthesized, never cycled. `null` (feed down/warming) FREEZES the
 //     weave; the last-good roster holds while the degraded banner shows.
 //   • edge A (worker → TTS): a LIVE arrival (new queue item id) triggers it.
-//     The SENDER's own worker chip is the visual source — a copy rides its arm
-//     to the ditch corner and pops to the TTS bottom, where the (invisible,
-//     'arriving') LIVE dial is revealed on landing. The worker chip STAYS on
-//     its rail (speaking doesn't deregister an instance). Sender not on the
-//     rail ⇒ the live dial simply appears (no flight).
-//   • edge B (TTS → idle): a LIVE drain (item id left the queue) triggers it.
-//     The departing dial flies out to the idle rail and parks a demo idle chip
-//     carrying the drained item's persona, returning to the side the edge-A
-//     source came from (alternating when unknown).
+//     The SENDER's own chip is the visual source, wherever it currently sits —
+//     a top-rail chip rides its arm to the ditch corner and pops to the TTS
+//     bottom; an idle-rail chip flies straight from its measured spot. The
+//     chip STAYS on its rail (speaking doesn't move a worker between queues).
+//     Sender on no rail ⇒ the live dial simply appears (no flight).
+//   • a TTS drain simply leaves — the dial drops from the roster with no
+//     outbound flight (the old edge B parked a demo idle chip here).
 //
-// Each edge does destination-insert (INVISIBLE 'arriving' while pending) + a
+// Edge A does destination-insert (INVISIBLE 'arriving' while pending) + a
 // rendered-then-measured flight. Under reduced motion it short-circuits to
 // synchronous handoffs (no flight, immediate reveal).
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3530,11 +3528,13 @@ function useLifecycle(
   uiScale: number,
   reducedMotion: boolean,
   liveTts: TtsItem[] | null,
-  liveWorkers: WorkerItem[] | null,
+  liveFleet: FleetQueues | null,
 ) {
   const seqRef = useRef(0);
 
   // The rails start EMPTY — chips only ever come from live registrations.
+  // worker* = the top (processing) rails; idle* = the bottom rails. Left is
+  // the Token-OS system, right is the askCivic system.
   const [workerLeft, setWorkerLeft] = useState<Agent[]>([]);
   const [workerRight, setWorkerRight] = useState<Agent[]>([]);
   const [ttsAgents, setTtsAgents] = useState<TtsAgent[]>([]);
@@ -3555,18 +3555,18 @@ function useLifecycle(
   workerLeftRef.current = workerLeft;
   const workerRightRef = useRef(workerRight);
   workerRightRef.current = workerRight;
+  const idleLeftRef = useRef(idleLeft);
+  idleLeftRef.current = idleLeft;
+  const idleRightRef = useRef(idleRight);
+  idleRightRef.current = idleRight;
   const ttsAgentsRef = useRef(ttsAgents);
   ttsAgentsRef.current = ttsAgents;
 
   // Weave bookkeeping (refs — none of this is render state):
   // the last PROCESSED live snapshot (null until the first healthy poll)…
   const prevItemsRef = useRef<Map<string, TtsItem> | null>(null);
-  // …drafted-source → live-arrival pairs awaiting their WorkerColumn measure…
+  // …and drafted-source → live-arrival pairs awaiting their WorkerColumn measure.
   const handoffRef = useRef<Map<string, string>>(new Map());
-  // …live id → the side its edge-A source came from (edge B returns there)…
-  const originSideRef = useRef<Map<string, OriginSide>>(new Map());
-  // …and the alternator for drains whose origin side was never recorded.
-  const altSideRef = useRef<OriginSide>(1);
   const nonceRef = useRef(0);
 
   // rAF + timeout ids tracked for unmount/HMR cleanup (mirrors the queue components).
@@ -3635,17 +3635,18 @@ function useLifecycle(
 
   const pushFlight = (f: Flight) => setFlights((prev) => [...prev, f]);
 
-  // Live TTS item → woven TtsAgent. id = the live item id (the React key in the
-  // stack AND, after edge B, the idle chip); persona = the live sender's; tone
-  // cycles the demo palette (pure dressing — the dial's own tone comes from the
-  // live status via ttsItemToDial). originSide is patched at edge-A draft time.
+  // Live TTS item → woven TtsAgent. id = the live item id (the React key in
+  // the stack); persona = the live sender's; tone cycles the demo palette
+  // (pure dressing — the dial's own tone comes from the live status via
+  // ttsItemToDial). originSide is vestigial for TTS agents (nothing returns to
+  // a rail on drain any more) — pinned left.
   const mintLiveAgent = (item: TtsItem): TtsAgent => {
     const n = seqRef.current++;
     return {
       id: item.id,
       persona: item.persona,
       tone: WORKER_TONES[n % WORKER_TONES.length],
-      originSide: altSideRef.current,
+      originSide: -1,
       chapterChild: item.commanderType === 'chapter',
       item,
     };
@@ -3658,51 +3659,55 @@ function useLifecycle(
     a.senderName === b.senderName && a.persona === b.persona &&
     a.commanderType === b.commanderType && a.playbackTarget === b.playbackTarget;
 
-  // ── THE FLEET DRIVER — mirror the registered fleet onto the worker rails ────
-  // Side assignment is sticky per instance (chosen at first sight, shorter rail
-  // wins, ties go left) so a chip never hops rails across polls; a departed
-  // instance's assignment is forgotten, so a re-registration re-balances. The
-  // rosters are rebuilt in snapshot (registration) order per side, preserving
-  // Agent object identity when nothing rendered changed — WorkerColumn's
-  // reconcile then sees arrivals as births (centre-emerge) and departures as
-  // instant drops, exactly the registration/stop signal.
-  const workerSideRef = useRef<Map<string, OriginSide>>(new Map());
+  // ── THE FLEET DRIVER — mirror the four live queues onto the four rails ─────
+  // No side assignment here any more: the queues arrive PRE-PARTITIONED
+  // (toFleetQueues — domain picks the side, status picks top vs bottom;
+  // singleton by construction). LEFT system = Token-OS, RIGHT = askCivic —
+  // the rosters share no arrays and an id can never land on both sides. A
+  // status flip between polls moves the chip's id from one roster to the
+  // other in the SAME commit, so the rails render a coherent leave/appear.
+  // Each roster is rebuilt in snapshot (registration) order, preserving Agent
+  // object identity when nothing rendered changed — WorkerColumn's reconcile
+  // then sees arrivals as births and departures as instant drops.
+  //
+  // Tone is remembered per INSTANCE (not per roster) so a tintless chip keeps
+  // its cycled colour across the working↔idle flip — the chip is the same
+  // dial wherever it sits.
+  const toneRef = useRef<Map<string, string>>(new Map());
   useEffect(() => {
-    if (!liveWorkers) return; // feed down/warming — freeze the rails, hold last-good
-    const sides = workerSideRef.current;
-    const liveIds = new Set(liveWorkers.map((w) => w.id));
-    for (const id of [...sides.keys()]) if (!liveIds.has(id)) sides.delete(id);
-    let nLeft = 0;
-    let nRight = 0;
-    for (const side of sides.values()) side < 0 ? nLeft++ : nRight++;
-    for (const w of liveWorkers) {
-      if (sides.has(w.id)) continue;
-      const side: OriginSide = nLeft <= nRight ? -1 : 1;
-      side < 0 ? nLeft++ : nRight++;
-      sides.set(w.id, side);
-    }
-    const rebuild = (side: OriginSide) => (prev: Agent[]): Agent[] => {
+    if (!liveFleet) return; // feed down/warming — freeze all four rails, hold last-good
+    const tones = toneRef.current;
+    const liveIds = new Set(
+      [
+        ...liveFleet.tokenOs.working, ...liveFleet.tokenOs.idle,
+        ...liveFleet.askCivic.working, ...liveFleet.askCivic.idle,
+      ].map((w) => w.id),
+    );
+    for (const id of [...tones.keys()]) if (!liveIds.has(id)) tones.delete(id);
+    const mirror = (items: WorkerItem[], side: OriginSide) => (prev: Agent[]): Agent[] => {
       const prevById = new Map(prev.map((a) => [a.id, a]));
-      const next = liveWorkers
-        .filter((w) => sides.get(w.id) === side)
-        .map((w): Agent => {
-          const existing = prevById.get(w.id);
-          const tone = w.tint ?? existing?.tone ?? WORKER_TONES[seqRef.current++ % WORKER_TONES.length];
-          if (
-            existing &&
-            existing.persona === w.persona &&
-            existing.tone === tone &&
-            existing.label === w.name &&
-            existing.chapterChild === w.chapterChild
-          )
-            return existing;
-          return { id: w.id, persona: w.persona, tone, originSide: side, label: w.name, chapterChild: w.chapterChild };
-        });
+      const next = items.map((w): Agent => {
+        let tone = w.tint ?? tones.get(w.id);
+        if (!tone) tone = WORKER_TONES[seqRef.current++ % WORKER_TONES.length];
+        tones.set(w.id, tone);
+        const existing = prevById.get(w.id);
+        if (
+          existing &&
+          existing.persona === w.persona &&
+          existing.tone === tone &&
+          existing.label === w.name &&
+          existing.chapterChild === w.chapterChild
+        )
+          return existing;
+        return { id: w.id, persona: w.persona, tone, originSide: side, label: w.name, chapterChild: w.chapterChild };
+      });
       return next.length === prev.length && next.every((a, i) => a === prev[i]) ? prev : next;
     };
-    setWorkerLeft(rebuild(-1));
-    setWorkerRight(rebuild(1));
-  }, [liveWorkers]);
+    setWorkerLeft(mirror(liveFleet.tokenOs.working, -1));
+    setIdleLeft(mirror(liveFleet.tokenOs.idle, -1));
+    setWorkerRight(mirror(liveFleet.askCivic.working, 1));
+    setIdleRight(mirror(liveFleet.askCivic.idle, 1));
+  }, [liveFleet]);
 
   // ── THE WEAVE DRIVER — diff each healthy live snapshot ─────────────────────
   useEffect(() => {
@@ -3717,44 +3722,11 @@ function useLifecycle(
       return;
     }
 
-    const curIds = new Set(liveTts.map((i) => i.id));
     const addedItems = liveTts.filter((i) => !prev.has(i.id));
-    const removedItems = [...prev.values()].filter((i) => !curIds.has(i.id));
-
-    // Edge B FIRST (measure the departing dials while their nodes are still in
-    // the DOM — the roster update below is what triggers their dismissal).
-    for (const item of removedItems) {
-      const fromVp = agentNodeCenter(item.id, '.tts-stack');
-      const side: OriginSide =
-        originSideRef.current.get(item.id) ??
-        (altSideRef.current = (altSideRef.current < 0 ? 1 : -1) as OriginSide);
-      originSideRef.current.delete(item.id);
-      const n = seqRef.current++;
-      const idleAgent: Agent = {
-        id: item.id, // the SAME identity rides TTS → idle (scoped measures disambiguate)
-        persona: item.persona,
-        tone: WORKER_TONES[n % WORKER_TONES.length],
-        originSide: side,
-      };
-      // FIFO retention: the oldest demo chip retires as the new one lands.
-      (side < 0 ? setIdleLeft : setIdleRight)((prevIdle) =>
-        [...prevIdle, idleAgent].slice(-IDLE_DEMO_CAP),
-      );
-      if (reducedRef.current) continue; // synchronous handoff
-      addPending(item.id);
-      spawnFlightToAgent(item.id, '.idle-worker-queue', (destVp) => {
-        pushFlight({
-          id: `fl-${item.id}-b`,
-          destId: item.id,
-          persona: item.persona,
-          tone: idleAgent.tone,
-          d: pointsToPath([fromVp ?? destVp, destVp]),
-          sizeFrom: TTS_DIAL_PX * uiScaleRef.current,
-          sizeTo: WORKER_CHIP_PX * uiScaleRef.current,
-          durationMs: FLIGHT_TTS_IDLE_MS,
-        });
-      });
-    }
+    // A drain simply leaves: the roster rebuild below drops the departed dial
+    // (instant reconcile removal), with no outbound flight. The old edge B —
+    // parking a demo idle chip per drained utterance — is excised: the idle
+    // rails are live fleet truth now, never TTS dressing.
 
     // Rebuild the TTS roster in live-queue order: existing agents keep identity
     // (item refreshed only when its rendered fields moved), arrivals mint fresh.
@@ -3772,21 +3744,46 @@ function useLifecycle(
         : nextAgents,
     );
 
-    // Edge A: the SENDER's own worker chip is the live arrival's visual source —
-    // the utterance joins to its instance's registration chip by instance id.
-    // ONE handoff per pass (requests within a pass would collapse anyway — the
-    // columns act per finishRequest change); a multi-arrival burst flies its
-    // first item and the rest appear in place, exactly like an absent sender.
+    // Edge A: the SENDER's own chip is the live arrival's visual source,
+    // wherever that chip currently sits — the utterance joins to its
+    // instance's chip by instance id. A top-rail chip rides its arm via the
+    // finishRequest → WorkerColumn measure; an idle-rail chip flies straight
+    // from its measured spot (rect-based, so the flipped rail needs no arm
+    // geometry). ONE handoff per pass (requests within a pass would collapse
+    // anyway — the columns act per finishRequest change); a multi-arrival
+    // burst flies its first item and the rest appear in place, exactly like
+    // an absent sender.
     if (!reducedRef.current && addedItems.length) {
       const item = addedItems[0];
-      const source = [...workerLeftRef.current, ...workerRightRef.current].find(
+      const topSource = [...workerLeftRef.current, ...workerRightRef.current].find(
         (a) => a.id === item.senderInstanceId,
       );
-      if (source) {
-        originSideRef.current.set(item.id, source.originSide);
-        handoffRef.current.set(source.id, item.id);
+      const idleSource = topSource
+        ? null
+        : [...idleLeftRef.current, ...idleRightRef.current].find(
+            (a) => a.id === item.senderInstanceId,
+          );
+      if (topSource) {
+        handoffRef.current.set(topSource.id, item.id);
         addPending(item.id); // arriving-invisible until the flight lands
-        setFinishRequest({ agentId: source.id, nonce: ++nonceRef.current });
+        setFinishRequest({ agentId: topSource.id, nonce: ++nonceRef.current });
+      } else if (idleSource) {
+        const fromVp = agentNodeCenter(idleSource.id, '.idle-worker-queue');
+        if (fromVp) {
+          addPending(item.id);
+          spawnFlightToAgent(item.id, '.tts-stack', (destVp) => {
+            pushFlight({
+              id: `fl-${item.id}-a`,
+              destId: item.id,
+              persona: idleSource.persona,
+              tone: idleSource.tone,
+              d: pointsToPath([fromVp, destVp]),
+              sizeFrom: WORKER_CHIP_PX * uiScaleRef.current,
+              sizeTo: TTS_DIAL_PX * uiScaleRef.current,
+              durationMs: FLIGHT_WORKER_TTS_MS,
+            });
+          });
+        }
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4028,10 +4025,11 @@ export function OpsCockpit() {
   const [focusedDial, setFocusedDial] = useState<string | null>(null);
   const [fracTop, setFracTop] = usePersistedNumber('fracTop', 4); // big-dial numerator (focus)
   const [fracBot, setFracBot] = usePersistedNumber('fracBot', 1); // big-dial denominator (distraction)
-  // The three queues are ONE woven lifecycle, owned by useLifecycle (instantiated
-  // after uiScale below): the worker rails mirror the registered fleet (a chip =
-  // a live registration), live TTS arrivals fly off the sender's chip (edge A),
-  // live TTS drains park demo idle chips (edge B). Worker depth, TTS depth, idle
+  // The rails are ONE woven lifecycle, owned by useLifecycle (instantiated
+  // after uiScale below): the four fleet rails mirror the pre-partitioned live
+  // queues (LEFT system = Token-OS, RIGHT = askCivic; top = processing a
+  // prompt, bottom = idle — one chip, exactly one queue), and live TTS
+  // arrivals fly off the sender's chip (edge A). Worker depth, TTS depth, idle
   // depth, and the clock value are all DERIVED — no manual queue knobs remain.
   const reducedMotion = usePrefersReducedMotion();
 
@@ -4142,22 +4140,42 @@ export function OpsCockpit() {
       dials: s ? buildDials(s) : [],
       compassStars: s ? occupancyCompassStars(s) : [{ dir: 'N', color: 'red' }],
       ttsQueue: s ? toTtsQueue(s) : [],
-      workerQueue: s ? toWorkerQueue(s) : [],
+      fleetQueues: s
+        ? toFleetQueues(s)
+        : { tokenOs: { working: [], idle: [] }, askCivic: { working: [], idle: [] } },
       muster: s ? toMusterBoard(s) : {},
       degraded,
     };
   }, [opsState.data, opsState.loading, opsState.error, timerHistory.data, timerHistory.loading, timerHistory.error]);
 
-  // The woven worker → TTS → idle lifecycle. Instantiated here so it can read the
+  // The woven worker/TTS lifecycle. Instantiated here so it can read the
   // derived uiScale (flight sizes), the reduced-motion preference, and the LIVE
-  // TTS + worker queues (null while the state feed is down — freezes the weave
-  // and the rails at last-good, see useLifecycle).
+  // TTS + fleet queues (null while the state feed is down — freezes the weave
+  // and all four rails at last-good, see useLifecycle).
   const life = useLifecycle(
     uiScale,
     reducedMotion,
     opsState.data ? cockpitData.ttsQueue : null,
-    opsState.data ? cockpitData.workerQueue : null,
+    opsState.data ? cockpitData.fleetQueues : null,
   );
+
+  // Persona-singleton breach glow, computed across the WHOLE fleet — all four
+  // rails of both systems (civic personas are distinct slugs, so a global scope
+  // cannot false-positive across sides). Walked in queue order (working before
+  // idle, Token-OS before askCivic): the first occurrence stays clean, repeats
+  // glow. Chapter children are exempt, mirroring the DB singleton trigger.
+  const fleetDupKeys = useMemo(() => {
+    const q = cockpitData.fleetQueues;
+    const all = [...q.tokenOs.working, ...q.tokenOs.idle, ...q.askCivic.working, ...q.askCivic.idle]
+      .map((w, order) => ({ w, order }));
+    return duplicatePersonaKeys(
+      all,
+      (e) => e.order,
+      (e) => e.w.persona,
+      (e) => e.w.id,
+      (e) => e.w.chapterChild,
+    );
+  }, [cockpitData.fleetQueues]);
   // The timer band tracks the cluster: same coherent factor as everything else,
   // optionally softened via GRAPH_SHRINK. uiScale === 1 ⇒ graphScale === 1, so
   // desktop stays pixel-identical. This is the ONE tuning point for the midline.
@@ -4266,26 +4284,27 @@ export function OpsCockpit() {
       <Dials onOpenDrawer={openDrawer} uiScale={uiScale} />
 
       {/* left-side TTS-queue stack — the LIVE speak queue (head + hot + pause).
-          A live arrival lands via the edge-A flight; a live drain flies out to
-          the idle rail (edge B). Clicks open the drawer. */}
+          A live arrival lands via the edge-A flight; a live drain simply
+          leaves. Clicks open the drawer. */}
       <TtsStack agents={life.ttsAgents} pendingIds={life.pendingIds} onOpenDrawer={openDrawer}
         uiScale={uiScale} />
 
-      {/* worker queues — LIVE registered fleet: two icon-chip stacks below the
-          lemon that grow outward from centre then trail down the two edges (a
-          soft "M"). Empty until instances register; each registration births a
-          chip wearing that instance's chapter persona (THE registration
-          signal), and a stop drops it. A LIVE TTS arrival flies a copy off the
+      {/* top worker rails — the PROCESSING queues of the two systems (LEFT =
+          Token-OS, RIGHT = askCivic; they share no rosters). A chip here means
+          the instance is actively working a prompt (registry status
+          'working'); when it stops it leaves this rail and appears in the
+          idle rail of the SAME side. A LIVE TTS arrival flies a copy off the
           sender's chip to the TTS stack bottom (edge A). */}
       <WorkerQueues leftRoster={life.workerLeft} rightRoster={life.workerRight} pendingIds={life.pendingIds}
+        dupKeys={fleetDupKeys}
         uiScale={uiScale} gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
         onFinishLeft={life.finishWorker} onFinishRight={life.finishWorker} finishRequest={life.finishRequest} />
 
-      {/* idle worker queue (demo) — the flipped bottom rail. Fed by LIVE TTS drains
-          (edge B); the clock numerals DERIVE from idle depth. Terminal this pass
-          (clicks inert). */}
+      {/* idle worker queue — the flipped bottom rail, LIVE fleet truth: the
+          idle queues of the two systems (left Token-OS, right askCivic). The
+          clock numerals DERIVE from idle depth. Clicks inert. */}
       <IdleWorkerQueue clockValue={life.clockValue} idleLeft={life.idleLeft} idleRight={life.idleRight}
-        pendingIds={life.pendingIds} uiScale={uiScale} animate={!reducedMotion} />
+        pendingIds={life.pendingIds} dupKeys={fleetDupKeys} uiScale={uiScale} animate={!reducedMotion} />
 
       {/* kanban — the Muster Ledger filling the band between the worker
           crossbar and the idle crossbar, geometry-bound to the SAME railCrossbar
@@ -4345,13 +4364,13 @@ export function OpsCockpit() {
           <EditableNum value={scaleMin} display={scaleMin.toFixed(2)} step={0.01} onCommit={setScaleMin} />
         </label>
         <span className="demobar__scale" aria-label={`Live UI scale ${uiScale.toFixed(2)}`}>uiScale {uiScale.toFixed(2)}</span>
-        {/* Queue depths readout — ALL live-derived now: workers mirror the
-            registered fleet, TTS depth is the LIVE speak queue, idle chips park
-            on live drains, the clock numerals derive from idle depth. The
-            add-worker demo buttons are retired — a chip can only be born by a
-            real instance registration. */}
-        <span className="demobar__adds" aria-label={`Registered workers left ${life.workerLeft.length}, right ${life.workerRight.length} · live TTS ${life.ttsAgents.length} · idle ${life.idleLeft.length}·${life.idleRight.length}`}>
-          <span className="demobar__addlabel">Workers <b>{life.workerLeft.length}·{life.workerRight.length}</b> → TTS <b>{life.ttsAgents.length}</b> → Idle <b>{life.idleLeft.length}·{life.idleRight.length}</b></span>
+        {/* Queue depths readout — ALL live-derived: the four rails mirror the
+            pre-partitioned fleet queues (Token-OS working·idle / askCivic
+            working·idle), TTS depth is the LIVE speak queue, the clock
+            numerals derive from idle depth. A chip can only be born by a real
+            instance registration. */}
+        <span className="demobar__adds" aria-label={`Token-OS working ${life.workerLeft.length}, idle ${life.idleLeft.length} · askCivic working ${life.workerRight.length}, idle ${life.idleRight.length} · live TTS ${life.ttsAgents.length}`}>
+          <span className="demobar__addlabel">Token-OS <b>{life.workerLeft.length}·{life.idleLeft.length}</b> · askCivic <b>{life.workerRight.length}·{life.idleRight.length}</b> · TTS <b>{life.ttsAgents.length}</b></span>
         </span>
         <Stepper label="Focus" value={fracTop} onChange={setFracTop} />
         <Stepper label="Distract" value={fracBot} onChange={setFracBot} />

@@ -48,6 +48,11 @@ export type OpsInstance = {
   engine: string;
   device_id: string | null;
   working_dir: string | null;
+  // Fleet-queue domain — server-side cwd classification (the browser never
+  // decides from a raw path). 'token-os' = the LEFT worker system,
+  // 'askcivic' = the RIGHT. Optional in the wire shape: an old payload
+  // missing it must not blank the cockpit (consumers default to 'token-os').
+  domain?: 'token-os' | 'askcivic' | string;
   runtime: { live: boolean; pane_id: string | null; role: string | null; source: string };
   last_activity: string | null;
   created_at: string | null;
@@ -657,6 +662,7 @@ export const OpsInstanceSchema = z.looseObject({
   engine: z.string().optional(),
   device_id: z.string().nullable().optional(),
   working_dir: z.string().nullable().optional(),
+  domain: z.string().optional(),
   last_activity: z.string().nullable().optional(),
   age_seconds: z.number().nullable().optional(),
   is_subagent: z.boolean().optional(),

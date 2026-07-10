@@ -114,16 +114,29 @@ def test_ops_state_returns_expected_top_level_keys(client, app_env) -> None:
 
 
 def test_ops_state_health_includes_typed_tmuxctld_status(client, app_env, monkeypatch) -> None:
-    async def _fake_tmuxctld_health():
+    async def _fake_tmuxctld_snapshot(generated_at):
         return {
             "reachable": True,
             "tmux_reachable": True,
             "version": "pytest-tmuxctld",
             "sha": "abc1234",
             "error": None,
+            "occupancy": {
+                "status": "ok",
+                "total": 1,
+                "occupied": 1,
+                "free": 0,
+                "dead": 0,
+                "protected": 0,
+                "drift": 0,
+                "unknown": 0,
+                "errors": [],
+                "cells": [],
+                "generated_at": generated_at.isoformat(),
+            },
         }
 
-    monkeypatch.setattr(app_env.main, "_ops_read_tmuxctld_health", _fake_tmuxctld_health)
+    monkeypatch.setattr(app_env.main, "_ops_read_tmuxctld_snapshot", _fake_tmuxctld_snapshot)
 
     resp = client.get("/api/ui/ops/state")
 
@@ -475,6 +488,64 @@ def test_ops_instances_include_attention_rank_and_sort_by_urgency(client, app_en
     assert active[0]["stale"]["is_stale"] is True
     fresh = next(item for item in active if item["id"] == working_id)
     assert fresh["attention_rank"] == 6
+
+
+def test_ops_instances_carry_domain_and_status(client, app_env) -> None:
+    """Fleet-queue contract: every embedded active row carries `domain` (the
+    server-side cwd classification — the browser never sees a raw path decide)
+    and `status` (the working/idle queue oracle). cwd-less rows fail toward
+    'token-os' — the home fleet is the default left system."""
+    now = datetime.now()
+    civic_id = str(uuid.uuid4())
+    token_id = str(uuid.uuid4())
+    homeless_id = str(uuid.uuid4())
+    conn = sqlite3.connect(app_env.db_path)
+    conn.executemany(
+        """INSERT INTO instances
+           (id, name, working_dir, origin_type, device_id,
+            status, engine, created_at, last_activity)
+           VALUES (?, ?, ?, 'local', 'Mac-Mini',
+                   ?, 'codex', ?, ?)""",
+        [
+            (
+                civic_id,
+                "civic-worker",
+                "/Volumes/Civic/askcivic.git/wt-thing",
+                "working",
+                now.isoformat(),
+                now.isoformat(),
+            ),
+            (
+                token_id,
+                "token-worker",
+                str(Path.home() / "worktrees" / "Token-OS" / "wt-feat" / "x"),
+                "idle",
+                now.isoformat(),
+                now.isoformat(),
+            ),
+            (
+                homeless_id,
+                "cwd-less",
+                None,
+                "reviewing",
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ui/ops/state")
+
+    assert resp.status_code == 200, resp.text
+    active = {row["id"]: row for row in resp.json()["instances"]["active"]}
+    assert active[civic_id]["domain"] == "askcivic"
+    assert active[civic_id]["status"] == "working"
+    assert active[token_id]["domain"] == "token-os"
+    assert active[token_id]["status"] == "idle"
+    assert active[homeless_id]["domain"] == "token-os"
+    assert active[homeless_id]["status"] == "reviewing"
 
 
 def test_ops_instances_split_golden_throne_due_armed_and_processing_ranks(

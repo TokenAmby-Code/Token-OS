@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 from enum import Enum
+from pathlib import Path
 
 # Class keys used as plain strings across the timer/accounting boundary so the
 # pure TimerEngine never has to import this module.
@@ -73,6 +74,35 @@ def _path_has_prefix(path: str, prefix: str) -> bool:
     if not path or not prefix:
         return False
     return path == prefix or path.startswith(prefix.rstrip(os.sep) + os.sep)
+
+
+# Fleet-queue domain prefixes: cwd under any of these = the askCivic system
+# (the cockpit's RIGHT rails). askPax is civic-side tooling, so it rides along.
+ASKCIVIC_DOMAIN_PREFIXES: tuple[str, ...] = (
+    "/Volumes/Civic",
+    str(Path(_HOME) / "worktrees" / "askCivic"),
+    str(Path(_HOME) / "worktrees" / "askPax"),
+)
+
+# The two fleet-queue domains. Plain strings across the API boundary — the
+# cockpit contract carries the enum value, never a raw path.
+DOMAIN_KEYS: tuple[str, str] = ("token-os", "askcivic")
+
+
+def classify_domain(working_dir: str | None) -> str:
+    """Fleet-queue domain oracle: which worker system an instance belongs to.
+
+    Deliberately NOT classify_work_class: binary (no 'unknown'), cwd-only (no
+    legion override), and it fails toward 'token-os' — the home fleet is the
+    default LEFT system, so a null/foreign cwd must never file a worker onto
+    the civic side. This function is the single seam the incoming hardware
+    split (the new work PC) will replace with a machine oracle.
+    """
+    wd = os.path.normpath(working_dir.strip()) if working_dir and working_dir.strip() else ""
+    for pref in ASKCIVIC_DOMAIN_PREFIXES:
+        if _path_has_prefix(wd, os.path.normpath(pref)):
+            return "askcivic"
+    return "token-os"
 
 
 def classify_work_class(working_dir: str | None, legion: str | None = None) -> WorkClass:
