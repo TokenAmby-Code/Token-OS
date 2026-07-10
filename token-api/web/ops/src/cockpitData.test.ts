@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { OPS_COCKPIT_POLLS } from './api';
-import { enforcementDial, goldenThroneDial, laneForStatus, toMusterBoard, toTtsQueue, toWorkerQueue, ttsDial, type WorkerItem } from './cockpitData';
+import { enforcementDial, goldenThroneDial, laneForStatus, toFleetQueues, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
 import type { OpsState } from './contracts';
 
 type TestInstance = {
@@ -11,6 +11,8 @@ type TestInstance = {
   is_subagent?: boolean;
   commander_type?: string | null;
   persona?: { slug: string | null; chip_color: string | null } | null;
+  domain?: string;
+  status?: string;
 };
 
 function stateWith(instances: TestInstance[]): OpsState {
@@ -28,67 +30,120 @@ function stateWith(instances: TestInstance[]): OpsState {
               chip_color: i.persona.chip_color,
             }
           : null,
+        // domain/status deliberately absent unless the test sets them — the
+        // old-payload fallback (token-os / idle) is part of the contract.
+        ...(i.domain !== undefined ? { domain: i.domain } : {}),
+        ...(i.status !== undefined ? { status: i.status } : {}),
       })),
     },
   } as unknown as OpsState;
 }
 
-describe('toWorkerQueue', () => {
-  it('maps top-level active instances newest-first across SQLite and ISO timestamps', () => {
-    const workers: WorkerItem[] = toWorkerQueue(
+const allBuckets = (q: FleetQueues): WorkerItem[][] => [
+  q.tokenOs.working,
+  q.tokenOs.idle,
+  q.askCivic.working,
+  q.askCivic.idle,
+];
+
+describe('toFleetQueues', () => {
+  it('partitions each instance into exactly one of the four buckets (queue singleton)', () => {
+    const queues = toFleetQueues(
       stateWith([
-        {
-          id: 'older-space',
-          display_name: 'Older Space',
-          created_at: '2026-07-09 09:00:00',
-          persona: { slug: 'ultramarines', chip_color: '#243cff' },
-        },
-        {
-          id: 'newer-iso',
-          display_name: 'Newer ISO',
-          created_at: '2026-07-09T10:00:00',
-          commander_type: 'chapter',
-          persona: { slug: 'blood-angels', chip_color: '#b00020' },
-        },
-        {
-          id: 'subagent-filtered',
-          display_name: 'Filtered Subagent',
-          created_at: '2026-07-09T11:00:00',
-          is_subagent: true,
-          persona: { slug: 'raven-guard', chip_color: '#111111' },
-        },
-        {
-          id: 'middle-space',
-          display_name: 'Middle Space',
-          created_at: '2026-07-09 09:30:00',
-          persona: null,
-        },
+        { id: 'tw', display_name: 'Token Working', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'working' },
+        { id: 'ti', display_name: 'Token Idle', created_at: '2026-07-09T10:01:00', domain: 'token-os', status: 'idle' },
+        { id: 'cw', display_name: 'Civic Working', created_at: '2026-07-09T10:02:00', domain: 'askcivic', status: 'working' },
+        { id: 'ci', display_name: 'Civic Idle', created_at: '2026-07-09T10:03:00', domain: 'askcivic', status: 'reviewing' },
       ]),
     );
 
-    expect(workers).toEqual([
-      {
-        id: 'newer-iso',
-        persona: 'blood-angels',
-        name: 'Newer ISO',
-        tint: '#b00020',
-        chapterChild: true,
-      },
-      {
-        id: 'middle-space',
-        persona: 'astartes',
-        name: 'Middle Space',
-        tint: null,
-        chapterChild: false,
-      },
-      {
-        id: 'older-space',
-        persona: 'ultramarines',
-        name: 'Older Space',
-        tint: '#243cff',
-        chapterChild: false,
-      },
+    expect(queues.tokenOs.working.map((w) => w.id)).toEqual(['tw']);
+    expect(queues.tokenOs.idle.map((w) => w.id)).toEqual(['ti']);
+    expect(queues.askCivic.working.map((w) => w.id)).toEqual(['cw']);
+    expect(queues.askCivic.idle.map((w) => w.id)).toEqual(['ci']);
+    // the invariant, stated flat: no id appears in two buckets
+    const ids = allBuckets(queues).flat().map((w) => w.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toHaveLength(4);
+  });
+
+  it('never mixes domains across sides (the two systems never touch)', () => {
+    const queues = toFleetQueues(
+      stateWith([
+        { id: 'c1', display_name: 'Civic 1', created_at: '2026-07-09T10:00:00', domain: 'askcivic', status: 'working' },
+        { id: 'c2', display_name: 'Civic 2', created_at: '2026-07-09T10:01:00', domain: 'askcivic', status: 'idle' },
+        { id: 't1', display_name: 'Token 1', created_at: '2026-07-09T10:02:00', domain: 'token-os', status: 'working' },
+      ]),
+    );
+
+    const tokenIds = [...queues.tokenOs.working, ...queues.tokenOs.idle].map((w) => w.id);
+    const civicIds = [...queues.askCivic.working, ...queues.askCivic.idle].map((w) => w.id);
+    expect(tokenIds).toEqual(['t1']);
+    expect(civicIds.sort()).toEqual(['c1', 'c2']);
+  });
+
+  it("maps status 'working' to the top queue and every other status to idle", () => {
+    const queues = toFleetQueues(
+      stateWith([
+        { id: 'w', display_name: 'W', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'working' },
+        { id: 'r', display_name: 'R', created_at: '2026-07-09T10:01:00', domain: 'token-os', status: 'reviewing' },
+        { id: 'v', display_name: 'V', created_at: '2026-07-09T10:02:00', domain: 'token-os', status: 'victorious' },
+        { id: 'u', display_name: 'U', created_at: '2026-07-09T10:03:00', domain: 'token-os', status: 'somenewstatus' },
+      ]),
+    );
+
+    expect(queues.tokenOs.working.map((w) => w.id)).toEqual(['w']);
+    expect(queues.tokenOs.idle.map((w) => w.id)).toEqual(['u', 'v', 'r']); // newest-first
+  });
+
+  it('defaults a missing domain to token-os and a missing status to idle (old payloads)', () => {
+    const queues = toFleetQueues(
+      stateWith([{ id: 'legacy', display_name: 'Legacy Row', created_at: '2026-07-09T10:00:00' }]),
+    );
+
+    expect(queues.tokenOs.idle.map((w) => w.id)).toEqual(['legacy']);
+    expect(queues.tokenOs.working).toEqual([]);
+    expect(queues.askCivic.working).toEqual([]);
+    expect(queues.askCivic.idle).toEqual([]);
+  });
+
+  it('keeps newest-first regKey ordering inside each bucket across SQLite and ISO timestamps', () => {
+    const queues = toFleetQueues(
+      stateWith([
+        { id: 'older-space', display_name: 'Older Space', created_at: '2026-07-09 09:00:00', domain: 'token-os', status: 'working', persona: { slug: 'ultramarines', chip_color: '#243cff' } },
+        { id: 'newer-iso', display_name: 'Newer ISO', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'working', commander_type: 'chapter', persona: { slug: 'blood-angels', chip_color: '#b00020' } },
+        { id: 'middle-space', display_name: 'Middle Space', created_at: '2026-07-09 09:30:00', domain: 'token-os', status: 'working', persona: null },
+      ]),
+    );
+
+    expect(queues.tokenOs.working).toEqual([
+      { id: 'newer-iso', persona: 'blood-angels', name: 'Newer ISO', tint: '#b00020', chapterChild: true },
+      { id: 'middle-space', persona: 'astartes', name: 'Middle Space', tint: null, chapterChild: false },
+      { id: 'older-space', persona: 'ultramarines', name: 'Older Space', tint: '#243cff', chapterChild: false },
     ]);
+  });
+
+  it('excludes subagents from every bucket', () => {
+    const queues = toFleetQueues(
+      stateWith([
+        { id: 'sub', display_name: 'Subagent', created_at: '2026-07-09T11:00:00', is_subagent: true, domain: 'token-os', status: 'working' },
+        { id: 'top', display_name: 'Top Level', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'working' },
+      ]),
+    );
+
+    expect(allBuckets(queues).flat().map((w) => w.id)).toEqual(['top']);
+  });
+
+  it('carries identical WorkerItem identity fields whichever bucket an instance lands in', () => {
+    const mk = (status: string) =>
+      stateWith([
+        { id: 'x', display_name: 'Chip X', created_at: '2026-07-09T10:00:00', domain: 'askcivic', status, commander_type: 'chapter', persona: { slug: 'pax', chip_color: '#aa9955' } },
+      ]);
+    const working = toFleetQueues(mk('working')).askCivic.working[0];
+    const idle = toFleetQueues(mk('idle')).askCivic.idle[0];
+
+    expect(working).toEqual(idle); // the chip is the same dial wherever it sits
+    expect(working).toEqual({ id: 'x', persona: 'pax', name: 'Chip X', tint: '#aa9955', chapterChild: true });
   });
 });
 
