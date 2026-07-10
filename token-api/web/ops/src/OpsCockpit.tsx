@@ -3242,8 +3242,12 @@ function IdleWorkerQueue({ clockValue, idleLeft, idleRight, pendingIds, dupKeys,
     <section className="idle-worker-queue"
       aria-label={`Idle worker queue — ${total} idle worker${total === 1 ? '' : 's'} (left Token-OS, right askCivic)`}>
       {/* Idle chips fire no arm handoffs (the controller measures them directly
-          for edge A), so no onFinish — clicks inert. */}
-      <WorkerQueues leftRoster={idleLeft} rightRoster={idleRight} pendingIds={pendingIds} dupKeys={dupKeys} uiScale={uiScale}
+          for edge A), so no onFinish — clicks inert.
+          Roster→column swap: the 180° flip mirrors the assembly HORIZONTALLY too,
+          so the side=+1 (clock) column reads screen-LEFT and side=−1 reads
+          screen-RIGHT. Token-OS idle therefore rides rightRoster (+1) to sit
+          under the Token-OS top rail; askCivic rides leftRoster (−1). */}
+      <WorkerQueues leftRoster={idleRight} rightRoster={idleLeft} pendingIds={pendingIds} dupKeys={dupKeys} uiScale={uiScale}
         gap={W_DROP_PX} pitch={W_SPACE_PX} inset={W_INSET_PX} split={W_SPLIT_PX}
         variant="clock" queueValue={clockValue} flip animate={animate} />
     </section>
