@@ -43,6 +43,26 @@ def pane(pid: str, role: str, window_index: int = 4, window_name: str = "council
     )
 
 
+def tombstone(pid: str, role: str) -> PaneSnapshot:
+    """A council pane carrying the DESIGNED audience-redirect tombstone kind."""
+    return PaneSnapshot(
+        pane_id=pid,
+        session_name="main",
+        window_index=4,
+        window_name="council",
+        pane_index=0,
+        width=80,
+        height=24,
+        current_command="zsh",
+        tty="/dev/ttys000",
+        pane_role=role,
+        grid_state=GridState.UNKNOWN,
+        pane_kind=PaneKind.TOMBSTONE,
+        reserved=False,
+        active=False,
+    )
+
+
 def council_workspace(*panes: PaneSnapshot) -> WorkspaceSnapshot:
     return WorkspaceSnapshot(
         session_name="main",
@@ -124,6 +144,20 @@ def test_duplicate_worker_role_fails_loud() -> None:
         resolve_pane_in_snapshot(snapshot, "somnium:NE")
     with pytest.raises(ValueError, match="ambiguous"):
         resolve_pane_in_snapshot(snapshot, "2:NE")
+
+
+def test_two_live_claims_separated_by_tombstone_fail_loud() -> None:
+    """A tombstone redirect indexed BETWEEN two distinct live claimants must not
+    mask their collision. Old code let the tombstone absorb the second live claim
+    (early return, no poison); the live-claimant tracker poisons the key so two
+    distinct live @PANE_ID stamps always fail loud, tombstone interposed or not."""
+    snapshot = council_workspace(
+        pane("%28", "council:custodes"),  # first live claim
+        tombstone("%30", "council:custodes"),  # designed redirect, indexed between
+        pane("%29", "council:custodes"),  # second distinct live claim
+    )
+    with pytest.raises(ValueError, match="ambiguous"):
+        resolve_pane_in_snapshot(snapshot, "council:custodes")
 
 
 def test_physical_id_still_resolves_when_labels_are_duplicated() -> None:

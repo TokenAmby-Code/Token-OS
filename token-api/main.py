@@ -13732,6 +13732,7 @@ async def brief_send(request: BriefSendRequest):
                     request.payload,
                     engine,
                     instance_id=(instance or {}).get("id") or pane_id,
+                    expected_role=expected_role,
                     queue_sender=enqueue_pane_write,
                     queue_drainer=process_pane_write_queue_once,
                 )

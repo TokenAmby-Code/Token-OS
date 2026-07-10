@@ -71,7 +71,7 @@ def test_resolve_pane_duplicate_custodes_labels_fail_loud(
 ) -> None:
     """The misroute red: two panes claim council:custodes → raise, do not pick
     the first enumerated pane, do not consult weaker fallbacks."""
-    _patch_scan(monkeypatch, _council_rows(["%30", "%28"]))
+    _patch_scan(monkeypatch, _council_rows(["%31", "%28"]))
     _forbid_fallback(monkeypatch)
     with pytest.raises(ValueError, match="ambiguous"):
         asyncio.run(talk.resolve_pane("council:custodes"))
@@ -82,7 +82,7 @@ def test_resolve_brief_targets_surfaces_ambiguity_as_loud_unresolved(
 ) -> None:
     """brief --pane council:custodes with duplicate stamps must deliver to ZERO
     panes and report the ambiguity, not misdeliver."""
-    _patch_scan(monkeypatch, _council_rows(["%30", "%28"]))
+    _patch_scan(monkeypatch, _council_rows(["%31", "%28"]))
     _forbid_fallback(monkeypatch)
     resolved, unresolved = asyncio.run(
         talk.resolve_brief_targets(panes=["council:custodes"], pages=None)
