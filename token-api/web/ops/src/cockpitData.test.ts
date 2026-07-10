@@ -463,6 +463,18 @@ describe('tmux occupancy adapters', () => {
     expect(dials.find((d) => d.id === 'tmux')).toMatchObject({ tone: 'bad', noteworthy: true });
   });
 
+
+
+  it('does not invent compass stars when occupancy data is absent or empty', () => {
+    expect(occupancyCompassStars({ tmux: { reachable: false, occupancy: null } } as unknown as OpsState)).toEqual([]);
+    expect(occupancyCompassStars({
+      tmux: {
+        reachable: true,
+        occupancy: { status: 'ok', total: 0, occupied: 0, free: 0, dead: 0, protected: 0, drift: 0, unknown: 0, errors: [], generated_at: 'x', cells: [] },
+      },
+    } as unknown as OpsState)).toEqual([]);
+  });
+
   it('maps occupied palace/somnium pane slots to compass star colors', () => {
     const stars = occupancyCompassStars({
       tmux: {
