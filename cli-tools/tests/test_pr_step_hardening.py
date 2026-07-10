@@ -1244,3 +1244,29 @@ coderabbit_state_for_head headsha
     )
 
     assert result.stdout.strip() == "success"
+
+
+def test_latest_coderabbit_issue_comment_helpers_paginate(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+repo_slug() { echo owner/repo; }
+gh() {
+  if [[ "$*" == *"issues/17/comments"* ]]; then
+    cat <<'JSON'
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z","body":"old"}]
+[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-07-10T01:00:00Z","updated_at":"2026-07-10T01:30:00Z","body":"new"}]
+JSON
+    return 0
+  fi
+  return 2
+}
+printf 'body=%s\\n' "$(coderabbit_latest_issue_comment_body 17)"
+printf 'stamp=%s\\n' "$(coderabbit_latest_issue_comment_timestamp 17)"
+""",
+        repo,
+    )
+
+    assert "body=new" in result.stdout
+    assert "stamp=2026-07-10T01:30:00Z" in result.stdout
