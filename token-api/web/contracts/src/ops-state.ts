@@ -674,6 +674,44 @@ export const OpsInstanceSchema = z.looseObject({
   attention_reasons: z.array(z.string()).optional(),
 });
 
+
+export const TmuxOccupancyCellStateSchema = z.enum(['occupied', 'free', 'dead', 'protected', 'drift', 'unknown']);
+
+export const TmuxOccupancyCellSchema = z.looseObject({
+  pane_positional_id: z.string().nullable(),
+  instance_id: z.string().nullable().optional(),
+  persona: z.string().nullable().optional(),
+  engine: z.string().nullable().optional(),
+  working_dir: z.string().nullable().optional(),
+  wrapper_id: z.string().nullable().optional(),
+  state: TmuxOccupancyCellStateSchema,
+  source: z.string().optional(),
+});
+
+export const TmuxOccupancySchema = z.looseObject({
+  status: z.string(),
+  generated_at: z.string(),
+  total: z.number(),
+  occupied: z.number(),
+  free: z.number(),
+  dead: z.number(),
+  protected: z.number(),
+  drift: z.number(),
+  unknown: z.number(),
+  errors: z.array(z.string()).optional(),
+  cells: z.array(TmuxOccupancyCellSchema),
+});
+
+export const TmuxHealthSchema = z.looseObject({
+  reachable: z.boolean().nullable().optional(),
+  tmux_reachable: z.boolean().nullable().optional(),
+  version: z.string().nullable().optional(),
+  sha: z.string().nullable().optional(),
+  error: z.string().nullable().optional(),
+  payload: z.unknown().optional(),
+  occupancy: TmuxOccupancySchema.optional(),
+});
+
 export const OpsStateSchema = z.looseObject({
   surface: z.string().optional(),
   contract_version: z.string(),
@@ -690,6 +728,7 @@ export const OpsStateSchema = z.looseObject({
   tts: z
     .looseObject({ routing: TtsRoutingSchema.nullable().optional() })
     .optional(),
+  tmux: TmuxHealthSchema.optional(),
 });
 
 export const OpsStatusSchema = z.looseObject({
