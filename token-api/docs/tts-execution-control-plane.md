@@ -5,10 +5,10 @@ Authoritative contract as of 2026-07-09:
 - Token-API owns TTS session, queue compatibility metadata, current playback id, control state, ack/error state.
 - Backends are execution-only: `wsl`, `phone`, later `linux`; routing order is Discord voice → WSL → phone.
 - Mac `say` is removed as a TTS backend. If the active backend fails, Token-API records/returns an error; it does not fall back to Mac.
-- Order remains: `sanitize -> compatibility chunking -> enqueue -> dispatch one full utterance to backend`.
+- Order is: `sanitize -> compatibility chunking -> render WAV artifact at enqueue -> dispatch one artifact URL per utterance to backend`. Token-API renders OpenAI TTS to cached WAV artifacts (keyed by voice + text hash, so repeat text is served from cache without a second OpenAI call) and mints a reachable `artifact_url` from config.
+- Backends are audio-file players (`transport: openai_tts_wav_artifact`): Discord voice plays via the daemon `/voice/play`, WSL via the satellite `/audio/play`, phone via the MacroDroid `/tts-artifact` macro. None of them synthesize text or choose voices.
 - Phone and WSL both receive exactly one full utterance per message. Token-API may still sanitize/split internally for legacy contracts, but backend handoff collapses prepared chunks into one `1/1` utterance.
-- WSL playback uses the `/tts/synth-and-play` WAV artifact transport (`wsl_sapi_wav_file`) and returns `rendered_hash`/`rendered_chars` for the full utterance to guard against SAPI text truncation.
-- Advisor bypass remains a Token-OS queue policy; backends receive already-sanitized chunks only.
+- Advisor bypass remains a Token-OS queue policy; backends receive already-rendered artifacts only.
 
 ## Control ingress
 
@@ -39,32 +39,33 @@ Phone echo endpoint used by Token-OS:
 
 WSL echo uses its local `/tts/control` endpoint with equivalent command semantics.
 
-## Target architecture: Token-API-owned audio artifacts
+## Token-API-owned audio artifacts (implemented 2026-07-09)
 
-The intended end-state is for Token-API to own TTS synthesis, voice selection, and audio artifacts. Playback surfaces should eventually receive only pre-rendered audio artifacts, not text. In that model:
+Token-API owns TTS synthesis, voice selection, and audio artifacts. Playback surfaces receive only pre-rendered audio artifacts, not text:
 
-- Token-API applies sanitization, persona voice selection, and synthesis once, producing a durable audio artifact such as WAV.
-- Queue entries can be pre-synthesized at enqueue time so dequeue/playback only has to resolve routing and deliver an already-rendered artifact.
-- WSL, phone, and future Linux playback backends become audio-file players. They should not independently synthesize text or reinterpret persona voice choices.
-- A single Token-API synthesis path gives all playback surfaces the same voice set, the same persona TTS behavior, and the same rendered audio for replay/debugging.
-- Completion semantics move from backend TTS-engine state to audio-artifact playback state: render success proves the whole utterance was synthesized; playback success proves the artifact was played or explicitly stopped/skipped.
-
-This target trades some enqueue-time work and storage cleanup for stronger reliability, consistent voices, replayability, and simpler execution backends. The current WSL hardening step should move WSL toward this model by making text input render to a full WAV and then playing that artifact to completion. Phone can keep its current one-utterance MacroDroid text path until an audio-artifact delivery/player path is built.
+- Token-API applies sanitization, persona voice selection, and synthesis once, producing a durable WAV artifact under the `tts-artifacts` store with sha256 + render metadata recorded.
+- Queue entries are pre-synthesized at enqueue time so dequeue/playback only resolves routing and delivers an already-rendered artifact.
+- Discord voice, WSL, phone (and future Linux) playback backends are audio-file players. They do not independently synthesize text or reinterpret persona voice choices.
+- A single Token-API synthesis path gives all playback surfaces the same voice set (13 OpenAI voices, Emperor casts personas), the same persona TTS behavior, and the same rendered audio for replay/debugging.
+- Completion semantics are audio-artifact playback state: render success proves the whole utterance was synthesized; playback success proves the artifact was played or explicitly stopped/skipped.
+- Dispatch without a rendered artifact is a hard error (`tts_artifact_required`); there is no text fallback to a backend engine.
 
 ## Current phone and WSL dispatch
 
-Token-OS dispatches one full sanitized utterance to the selected backend. Phone uses the local endpoint:
+Token-OS dispatches one artifact URL per full sanitized utterance to the selected backend. Phone uses the local MacroDroid endpoint:
 
 ```text
-/tts-chunk?session_id&playback_id&current_index&current_chunk&next_index&next_chunk&speed
+/tts-artifact?session_id&playback_id&utterance_id&artifact_id&artifact_url&current_index&current_chunk
 ```
+
+The phone macro shell-fetches `artifact_url` to local storage, plays it with `PlaySoundAction` (`waitToFinish`), and posts `buffer_drained`. See `mobile/macros/MACRODROID.md` for the on-device gotchas (MacroDroid's native save-response path is broken; the shell fetch is the transport).
 
 Invariants:
 
-- `current_chunk` is the complete sanitized utterance; `next_chunk` is empty and `next_index` is `null`.
-- WSL receives the same complete utterance through `/tts/synth-and-play`; the satellite synthesizes the full text to a WAV artifact, verifies the rendered text hash, plays that WAV with a 3600s safety timeout, and Token-API records `current` as that full utterance and `next` as `null`.
+- `current_chunk` is the complete sanitized utterance text (compatibility metadata only — the phone never speaks it); `next_chunk` is empty and `next_index` is `null`.
+- WSL receives the artifact through the satellite `POST /audio/play` (`{artifact_url, artifact_id, sha256, format}`); the satellite downloads, sha256-verifies, and plays the WAV to completion, failing loud on any player error. `409` means the satellite is busy with another playback.
 - Both phone and WSL report chunk-compatible metadata with `chunks=1`, `completed_chunks=1`, one `results[0]`, `chunk_id`, and `playback_id`.
-- WSL integrity checks compare `rendered_hash`/`rendered_chars` against the full utterance, not a sentence chunk. Current WSL transport is `wsl_sapi_wav_file`; playback is bounded by `MAX_PLAYBACK_SECONDS` (3600s), after which playback is killed and reported as a timeout error; pause/resume/toggle/restart are explicit unsupported-backend errors until a controllable media-player layer replaces `SoundPlayer.PlaySync()`.
+- Playback is bounded by a 3600s safety timeout; pause/resume/toggle/restart remain explicit unsupported-backend errors until a controllable media-player layer lands.
 - Backends must not reconstruct a queue or mutate playback state before Token-OS control acknowledgement.
 
 Token-OS also includes compatibility metadata fields such as `chunk_id`, `current_chunk_hash`, `next_chunk_hash`, and `chunk_count` for integrity/observability.
