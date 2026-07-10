@@ -503,10 +503,28 @@ pr_head_sha() {
 }
 
 coderabbit_state_for_head() {
-    local head="$1" repo
+    local head="$1" repo state check
     repo="$(repo_slug)"
     [[ -n "$repo" && -n "$head" ]] || return 1
-    gh api "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true
+    state="$(gh api "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true)"
+    if [[ -n "$state" ]]; then
+        printf '%s\n' "$state"
+        return 0
+    fi
+    check="$(gh api "repos/${repo}/commits/${head}/check-runs" 2>/dev/null | jq -r '
+        [.check_runs[]? | select(
+            (((.name // "") | ascii_downcase) | startswith("coderabbit"))
+            or (((.app.slug // "") | ascii_downcase) == "coderabbitai")
+        )]
+        | sort_by(.completed_at // .started_at // .created_at // "")
+        | .[-1] // empty
+        | if . == null then "" elif (.status // "") != "completed" then (.status // "") else (.conclusion // "") end
+    ' 2>/dev/null || true)"
+    case "$check" in
+        success|neutral) printf 'success\n' ;;
+        failure|cancelled|timed_out|action_required) printf 'failure\n' ;;
+        *) printf '%s\n' "$check" ;;
+    esac
 }
 
 latest_coderabbit_review_state() {

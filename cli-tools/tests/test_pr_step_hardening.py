@@ -1153,3 +1153,32 @@ main --no-merge
 
     assert "unexpected-rerequest" not in result.stdout
     assert "already green; skipping re-review" in result.stderr + result.stdout
+
+
+def test_coderabbit_state_for_head_accepts_check_run_when_commit_status_absent(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+repo_slug() { echo owner/repo; }
+gh() {
+  if [[ "$*" == *"commits/headsha/statuses"* ]]; then
+    printf '[]\n'
+    return 0
+  fi
+  if [[ "$*" == *"commits/headsha/check-runs"* ]]; then
+    cat <<'JSON'
+{"check_runs":[{"name":"CodeRabbit / Review","status":"completed","conclusion":"success","completed_at":"2026-07-10T02:47:00Z","app":{"slug":"coderabbitai"}}]}
+JSON
+    return 0
+  fi
+  return 2
+}
+coderabbit_state_for_head headsha
+""",
+        repo,
+    )
+
+    assert result.stdout.strip() == "success"
