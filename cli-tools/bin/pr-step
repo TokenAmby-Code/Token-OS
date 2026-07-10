@@ -683,6 +683,7 @@ coderabbit_body_is_ratelimit() {
     local body="$1"
     [[ -n "$body" ]] || return 1
     grep -qiE '^[[:space:]]*#{1,3}[[:space:]]*Summary by CodeRabbit' <<<"$body" && return 1
+    grep -qiE 'Full review finished|No actionable comments were generated' <<<"$body" && return 1
     grep -qiE 'Result:[[:space:]]*Skipped[[:space:]]*-[[:space:]]*Already reviewed|Skipped[[:space:]]*-[[:space:]]*Already reviewed' <<<"$body" && return 1
     grep -qiE "$CR_RATELIMIT_REGEX" <<<"$body"
 }
