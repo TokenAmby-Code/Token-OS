@@ -8,6 +8,7 @@ import {
   mapMode,
   nowClock,
   toFleetQueues,
+  toLemonActivity,
   toModeSegments,
   toMusterBoard,
   toTimerPoints,
@@ -87,6 +88,8 @@ interface CockpitData {
   fleetQueues: FleetQueues; // the four live worker rails — LEFT system = Token-OS
   //                           (working + idle), RIGHT system = askCivic; one chip
   //                           per registered instance, in exactly one queue
+  lemonActive: Set<string>; // lemon-resident persona slugs currently WORKING —
+  //                           drives the section reverb (empty = all seats idle)
   muster: Record<string, KanbanLane>; // the Muster Ledger lanes, keyed by canonical slug
   degraded: string | null; // non-null → render the degraded banner with this text
 }
@@ -1896,6 +1899,8 @@ interface Segment {
   region: string; // closed fill path (the compartment outline)
   tone: string; // glow colour
   glow: boolean; // interior glow on/off (reservist / persona indicator)
+  reverb?: boolean; // slow-reverb the lit glow — a lemon seat actively WORKING
+  //                   (omitted/false = the static glow, byte-identical to idle)
   cx: number; // core radial centre x
   cy: number; // core radial centre y
   gr: number; // section width metric → core radius (× 0.5)
@@ -1926,7 +1931,8 @@ function SegmentGlowLayer({ segments, idPrefix, blur, rimW }: {
         </radialGradient>
       ))}
       {lit.map(({ s, i }) => (
-        <g key={`p${i}`} clipPath={`url(#${idPrefix}-clip-${i})`} style={{ color: s.tone }}>
+        <g key={`p${i}`} clipPath={`url(#${idPrefix}-clip-${i})`} style={{ color: s.tone }}
+          className={s.reverb ? 'segment--reverb' : undefined}>
           <path className="section-rim" d={s.region} strokeWidth={rimW} filter={`url(#${idPrefix}-blur)`} />
           <path className="section-core" d={s.region} fill={`url(#${idPrefix}-core-${i})`} />
         </g>
@@ -1935,8 +1941,10 @@ function SegmentGlowLayer({ segments, idPrefix, blur, rimW }: {
   );
 }
 
-function ArcLayer({ uiScale }: {
+function ArcLayer({ uiScale, activePersonas }: {
   uiScale: number; // one viewport-derived factor scaling every instrument length
+  activePersonas: ReadonlySet<string>; // lemon-resident slugs currently WORKING
+  //                                      (toLemonActivity) — their section reverbs
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState({ w: 1000, h: 800 });
@@ -2033,7 +2041,18 @@ function ArcLayer({ uiScale }: {
   // Three of them (Malcador, Pax, CI) are FULL-COLOUR brand images (personaImage), not tintable
   // glyphs — the render branches on that below. The tone palette still lights each
   // section's glow (curated later); it just no longer recolours the image personas.
-  const SECTION_PERSONAS = ['malcador', 'fabricator-general', 'custodes', 'ci', 'pax', 'administratum'];
+  // Each section binds its ART key (icon/image registry) to the persona's LIVE
+  // registry slug (the activity signal). They differ only for the Orchestrator
+  // seat, which wears the CI monogram; membership truth for the roster is
+  // LEMON_RESIDENT_PERSONAS in cockpitData (the queue exclusion reads the same set).
+  const SECTION_PERSONAS = [
+    { art: 'malcador', slug: 'malcador' },
+    { art: 'fabricator-general', slug: 'fabricator-general' },
+    { art: 'custodes', slug: 'custodes' },
+    { art: 'ci', slug: 'orchestrator' },
+    { art: 'pax', slug: 'pax' },
+    { art: 'administratum', slug: 'administratum' },
+  ];
   const SECTION_TONES = ['var(--good)', 'var(--warn)', 'var(--bad)', 'var(--neutral)', 'var(--idle)', 'var(--brass-bright)'];
   const ICON_PX = 40 * uiScale; // rendered icon box (the glyph's 512 viewBox scaled to this)
   const IMG_PX = 52 * uiScale; // image-persona box — brand art carries its own padding,
@@ -2059,7 +2078,7 @@ function ArcLayer({ uiScale }: {
   // top arc between the tips is divided into six icon sections; both boundaries + the
   // section dividers stay brass, colour lives only in the icons.
   const { xL, xR, hasSpan, wy } = geo;
-  const sections: { cx: number; cy: number; inner: string; img?: string | undefined; tone: string; region: string; gr: number; glow: boolean }[] = [];
+  const sections: { cx: number; cy: number; inner: string; img?: string | undefined; tone: string; region: string; gr: number; glow: boolean; reverb: boolean }[] = [];
   const dividers: { x1: number; y1: number; x2: number; y2: number }[] = [];
   const caps: string[] = []; // the two tapered tip regions, filled solid gold
   let lemonArcD = '';
@@ -2100,15 +2119,16 @@ function ArcLayer({ uiScale }: {
       const cy = (arc.f(xm) + wy(xm)) / 2 + ICON_NUDGE;
       // Image personas (Pax, CI) resolve to a brand-asset URL; glyph personas to a
       // single-path currentColor SVG. `img` wins in the render (the <image> branch).
-      const img = personaImage(SECTION_PERSONAS[k]);
+      const img = personaImage(SECTION_PERSONAS[k].art);
       sections.push({
         cx: xm, cy,
-        inner: img ? '' : personaIconInner(SECTION_PERSONAS[k]) ?? '',
+        inner: img ? '' : personaIconInner(SECTION_PERSONAS[k].art) ?? '',
         img,
         tone: SECTION_TONES[k],
         region: regionPath(bxs[k], bxs[k + 1]),
         gr: (bxs[k + 1] - bxs[k]) * 0.62,
         glow: true, // per-persona indicator — flip off to disable this segment's glow
+        reverb: activePersonas.has(SECTION_PERSONAS[k].slug), // seat WORKING → slow reverb
       });
     }
     // Dividers run full-height between the arcs at every boundary (band edges + interior).
@@ -4144,6 +4164,7 @@ export function OpsCockpit() {
       fleetQueues: s
         ? toFleetQueues(s)
         : { tokenOs: { working: [], idle: [] }, askCivic: { working: [], idle: [] } },
+      lemonActive: s ? toLemonActivity(s) : new Set<string>(),
       muster: s ? toMusterBoard(s) : {},
       degraded,
     };
@@ -4275,7 +4296,7 @@ export function OpsCockpit() {
       {/* connecting arc — static shape study springing off the dial rim to the
           left border. Own debug state (below); outside the breakHubView contract.
           z:3 so it reads over the timer graph and meets the rim. */}
-      <ArcLayer uiScale={uiScale} />
+      <ArcLayer uiScale={uiScale} activePersonas={cockpitData.lemonActive} />
 
       {/* the big fraction dial in the reserved top-right nook */}
       <CornerDial top={fracTop} bottom={fracBot} />

@@ -414,6 +414,41 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
   return items;
 }
 
+// ── Lemon residents (the always-on singleton seats) ─────────────────────────
+// Emperor's ruling (2026-07-09): the standing command personas live in the
+// LEMON — the persona-section arc above the worker rails — not in the fleet
+// queues. This set is the ONE membership definition both consumers read: the
+// queue partition drops these instances (they never consume a slot) and the
+// lemon activity binding lights their section while they work. Slugs are the
+// registry keys; the Orchestrator seat wears the CI monogram in the lemon art
+// but registers (and lights) as 'orchestrator'.
+export const LEMON_RESIDENT_PERSONAS: ReadonlySet<string> = new Set([
+  'custodes',
+  'fabricator-general',
+  'malcador',
+  'pax',
+  'orchestrator',
+  'administratum',
+]);
+
+/**
+ * OpsState → the set of lemon-resident persona slugs with a WORKING instance.
+ * Drives the lemon section reverb: a slug in the set means that seat is
+ * actively processing a prompt; absent means the section renders its static
+ * idle glow. Subagents are excluded for the same reason the rails exclude
+ * them — a child inheriting Custodes' persona must not light Custodes' seat.
+ */
+export function toLemonActivity(s: OpsState): Set<string> {
+  const active = new Set<string>();
+  for (const i of s.instances.active) {
+    const slug = i.persona?.slug;
+    if (!i.is_subagent && i.status === 'working' && slug && LEMON_RESIDENT_PERSONAS.has(slug)) {
+      active.add(slug);
+    }
+  }
+  return active;
+}
+
 // ── Fleet queues (two systems × two rails) ──────────────────────────────────
 // The worker rails are the LIVE registration surface: one chip per registered
 // instance, wearing that instance's chapter-persona icon. A chip appearing IS
@@ -458,7 +493,10 @@ export type FleetQueues = {
  * fleet is the default left system), a missing `status` files as idle (never
  * fake "processing"). Subagents are excluded — the rails signal top-level
  * fleet registrations, and a subagent inheriting its parent's persona would
- * false-trigger the singleton-breach glow.
+ * false-trigger the singleton-breach glow. Lemon-resident personas
+ * (LEMON_RESIDENT_PERSONAS) are excluded too — the always-on singleton seats
+ * live in the lemon's persona sections, so the rails stay mechanicus/one-off
+ * territory.
  *
  * Persona falls back to the generic 'astartes' key when the instance has no
  * persona bound — the chip still appears (the registration was real) but wears
@@ -477,7 +515,7 @@ export function toFleetQueues(s: OpsState): FleetQueues {
     askCivic: { working: [], idle: [] },
   };
   const sorted = s.instances.active
-    .filter((i) => !i.is_subagent)
+    .filter((i) => !i.is_subagent && !LEMON_RESIDENT_PERSONAS.has(i.persona?.slug ?? ''))
     .sort((a, b) => regKey(b.created_at).localeCompare(regKey(a.created_at)));
   for (const i of sorted) {
     const system = i.domain === 'askcivic' ? queues.askCivic : queues.tokenOs;
