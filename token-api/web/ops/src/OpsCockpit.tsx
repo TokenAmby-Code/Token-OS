@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   balanceMinutes,
@@ -3899,53 +3899,15 @@ const KANBAN_SEAM_GAP = 4; // seam ends shy of the 2px bar strokes — dashes ki
 const KANBAN_SEAM_DASH = 20; // dash length — big segments, clearly a seam not a wire
 const KANBAN_SEAM_SPACE = 26; // dash gap — more air than metal
 
-// One session-doc plate — real ink on the same gold-outlined plate the metal
-// pass seated (see .kanban-card). Line 1 = the doc title. Line 2 = the Golden
-// Throne accusation (⚑ awaiting <first unmet criterion>) when an incomplete
-// rubric is present, else the head excerpt. A present rubric wears its
-// pip-strip + tally (phosphor = met, hollow = unmet, brass slash = skipped);
-// a doc whose raw frontmatter status ≠ its lane's canonical slug wears the raw
-// stamp (lane = projection, raw stamp = truth). The left edge is the live
-// filament: persona-tinted + lit while instances are bound to the doc, cold
-// when dormant. Still INERT: no handlers, no tabindex — the card-open funnel
-// is a later wave.
+// One session-doc plate — TITLE-ONLY by Emperor's ruling (2026-07-09): the v4
+// ink (accusation line, rubric pips, raw-status stamp, live filament) read as
+// the old card's dressing. It returns in deliberate later waves, re-cut from
+// git history onto this plate. Still INERT: no handlers, no tabindex — the
+// card-open funnel is a later wave.
 function KanbanCard({ card }: { card: KanbanCardModel }) {
-  const pips: ReactNode[] = [];
-  if (card.rubric) {
-    const { met, total, skipped } = card.rubric;
-    // Counts only — the feed carries no per-criterion order. Cap the strip so a
-    // sprawling rubric never overruns the plate; the tally stays authoritative.
-    for (let i = 0; i < Math.min(total, 12); i++) {
-      const kind = i < met ? 'met' : i < met + skipped ? 'skip' : 'unmet';
-      pips.push(<i key={i} className={`kanban-card__pip kanban-card__pip--${kind}`} />);
-    }
-  }
   return (
-    <div
-      className={`kanban-card${card.live ? ' kanban-card--live' : ''}`}
-      style={card.tint ? ({ '--filament': card.tint } as CSSProperties) : undefined}
-    >
-      <span className="kanban-card__toprow">
-        <span className="kanban-card__title">{card.title}</span>
-        {card.rawStatus !== card.laneKey ? (
-          <span className="kanban-card__stamp">{card.rawStatus}</span>
-        ) : null}
-      </span>
-      {card.awaiting != null ? (
-        <span className="kanban-card__second kanban-card__second--accusation">
-          ⚑ awaiting {card.awaiting}
-        </span>
-      ) : (
-        <span className="kanban-card__second">{card.head ?? ''}</span>
-      )}
-      {card.rubric ? (
-        <span className="kanban-card__rubric">
-          {pips}
-          <span className="kanban-card__tally">
-            {card.rubric.met}/{card.rubric.total}
-          </span>
-        </span>
-      ) : null}
+    <div className="kanban-card">
+      <span className="kanban-card__title">{card.title}</span>
     </div>
   );
 }
@@ -4062,9 +4024,11 @@ function KanbanBoard({ uiScale, board }: { uiScale: number; board: Record<string
 
 // ═══════════════════════════════════════════════════════════════════════════
 export function OpsCockpit() {
-  // ── The live data spine — the two Token-API read-model feeds ──────────────
-  const opsState = useOpsState(2000);
-  const timerHistory = useTimerHistory(60, 30000);
+  // ── The live data spine — the two Token-API read-model feeds. Tick cadence
+  // comes from the OPS_COCKPIT_POLLS ledger defaults (api.ts) — never a
+  // call-site literal, so the ledger stays the single source. ────────────────
+  const opsState = useOpsState();
+  const timerHistory = useTimerHistory(60);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [focusedDial, setFocusedDial] = useState<string | null>(null);
