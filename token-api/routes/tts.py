@@ -445,12 +445,32 @@ def _finalize_wav_header(data: bytes) -> bytes:
     return bytes(buf)
 
 
+_tts_render_locks: dict[str, threading.Lock] = {}
+_tts_render_locks_guard = threading.Lock()
+
+
+def _tts_render_lock(cache_key: str) -> threading.Lock:
+    with _tts_render_locks_guard:
+        return _tts_render_locks.setdefault(cache_key, threading.Lock())
+
+
 def render_openai_tts_artifact(text: str, voice: str | None) -> dict:
     clean = (text or "").strip()
     if not clean:
         return {"success": False, "error": "empty_audio_payload"}
     voice_id = _normalize_openai_voice(voice)
     artifact_id, cache_key, text_hash = _tts_cache_key(voice_id=voice_id, text=clean)
+    # Serialize check/claim/render per cache_key: concurrent identical requests
+    # must not both miss the ready row and both pay for an OpenAI render.
+    with _tts_render_lock(cache_key):
+        return _render_openai_tts_artifact_locked(
+            clean, voice_id, artifact_id, cache_key, text_hash
+        )
+
+
+def _render_openai_tts_artifact_locked(
+    clean: str, voice_id: str, artifact_id: str, cache_key: str, text_hash: str
+) -> dict:
     artifact_path = _tts_artifact_dir() / f"{artifact_id}.wav"
     now = _now_iso()
     with sqlite3.connect(_tts_metadata_db()) as conn:
@@ -519,7 +539,9 @@ def render_openai_tts_artifact(text: str, voice: str | None) -> dict:
         if resp.status_code >= 400:
             raise RuntimeError(f"openai_tts_http_{resp.status_code}: {resp.text[:300]}")
         wav_bytes = _finalize_wav_header(resp.content)
-        artifact_path.write_bytes(wav_bytes)
+        tmp_path = artifact_path.with_name(artifact_path.name + ".part")
+        tmp_path.write_bytes(wav_bytes)
+        tmp_path.replace(artifact_path)
         sha = hashlib.sha256(wav_bytes).hexdigest()
         with sqlite3.connect(_tts_metadata_db()) as conn:
             _ensure_tts_metadata_table(conn)
@@ -989,8 +1011,12 @@ def _get_discord_voice_bot() -> str | None:
 def speak_tts_discord(
     message: str, bot_name: str, voice: str = None, rate: int = 0, artifact: dict | None = None
 ) -> dict:
-    """Route a pre-rendered OpenAI WAV artifact through Discord voice channel."""
-    if not artifact:
+    """Route a pre-rendered OpenAI WAV artifact through Discord voice channel.
+
+    Playback is fully artifact-driven; ``voice``/``rate`` are accepted for queue-worker
+    call-shape compatibility but do not influence playback.
+    """
+    if not artifact or not artifact.get("artifact_url"):
         return {
             "success": False,
             "error": "tts_artifact_required",
@@ -1920,11 +1946,15 @@ def _send_phone_tts_chunk(payload: dict) -> dict:
 def _post_wsl_chunk(
     payload: dict, *, voice: str | None, rate: int = 0, artifact: dict | None = None
 ) -> dict:
-    """Send one queued Token-API chunk through WSL dumb artifact playback."""
+    """Send one queued Token-API chunk through WSL dumb artifact playback.
+
+    Playback is fully artifact-driven; ``voice``/``rate`` are accepted for queue-worker
+    call-shape compatibility but do not influence playback.
+    """
     chunk_id = payload.get("chunk_id")
     playback_id = payload.get("playback_id")
     session_id = payload.get("session_id")
-    if not artifact:
+    if not artifact or not artifact.get("artifact_url"):
         return {
             "success": False,
             "error": "tts_artifact_required",

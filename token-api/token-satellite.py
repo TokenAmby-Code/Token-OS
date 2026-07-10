@@ -300,6 +300,25 @@ class TTSEngine:
     def is_speaking(self):
         return self._speaking
 
+    def try_reserve_playback(self) -> bool:
+        """Atomically claim the playback slot ahead of download/verify work.
+
+        _play_wav_file() only flips _playing after Popen(), so callers that do
+        slow preparation first must reserve here or two requests can both pass
+        the busy check and launch parallel playback processes.
+        """
+        with self._playback_lock:
+            if self._playing or self._speaking:
+                return False
+            self._playing = True
+            return True
+
+    def release_playback_reservation(self) -> None:
+        """Release a reservation that never reached playback startup."""
+        with self._playback_lock:
+            if self._playback_process is None:
+                self._playing = False
+
     def skip(self) -> bool:
         """Cancel current speech (direct SAPI or WAV artifact playback)."""
         with self._playback_lock:
@@ -570,6 +589,7 @@ class TTSEngine:
         wav_path_win = synth_result["wav_path_win"]
         wav_path_wsl = Path(synth_result["wav_path_wsl"])
         if not wav_path_wsl.exists():
+            self.release_playback_reservation()
             return {"success": False, "error": f"WAV file missing: {wav_path_wsl}"}
 
         play_script_dir_wsl = Path(self.PLAY_SCRIPT_DIR_WSL)
@@ -2174,12 +2194,17 @@ class TTSChunkRequest(BaseModel):
     rate: int = 0
 
 
+_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
 @app.post("/audio/play")
 def audio_play(request: AudioPlayRequest):
     """Download and play a server-rendered WAV artifact. No local synthesis."""
     if request.format != "wav":
         raise HTTPException(status_code=400, detail="only wav artifacts are supported")
-    if tts_engine.is_speaking or tts_engine._playing:
+    if request.artifact_id and not _ARTIFACT_ID_RE.match(request.artifact_id):
+        raise HTTPException(status_code=400, detail="invalid artifact_id")
+    if not tts_engine.try_reserve_playback():
         raise HTTPException(status_code=409, detail="TTS engine is busy")
 
     cache_dir = Path(
@@ -2192,6 +2217,7 @@ def audio_play(request: AudioPlayRequest):
         request.artifact_id or hashlib.sha256(request.artifact_url.encode("utf-8")).hexdigest()[:32]
     )
     wav_path = cache_dir / f"{file_id}.wav"
+    handed_off = False
     try:
         if not wav_path.exists():
             resp = http_requests.get(request.artifact_url, timeout=(5, 180))
@@ -2209,6 +2235,8 @@ def audio_play(request: AudioPlayRequest):
         win_path = subprocess.check_output(
             ["wslpath", "-w", str(wav_path)], text=True, timeout=5
         ).strip()
+        # _play_wav_file owns the reservation from here; its finally releases it.
+        handed_off = True
         result = tts_engine._play_wav_file(
             {
                 "file_id": file_id,
@@ -2226,6 +2254,9 @@ def audio_play(request: AudioPlayRequest):
     except Exception as exc:
         logger.warning(f"audio/play failed: {exc}")
         return {"success": False, "error": str(exc)}
+    finally:
+        if not handed_off:
+            tts_engine.release_playback_reservation()
 
 
 @app.post("/tts/synthesize")

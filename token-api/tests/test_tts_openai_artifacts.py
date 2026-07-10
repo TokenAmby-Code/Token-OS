@@ -36,6 +36,43 @@ def test_openai_tts_render_creates_wav_and_cache_hit(tmp_path, monkeypatch):
     assert Path(first["artifact_path"]).read_bytes() == b"RIFFfake-wave"
 
 
+def test_openai_tts_concurrent_identical_renders_call_provider_once(tmp_path, monkeypatch):
+    import threading
+
+    tts = _load_tts(tmp_path, monkeypatch)
+    calls = []
+    barrier = threading.Barrier(2, timeout=10)
+
+    class Resp:
+        status_code = 200
+        content = b"RIFFfake-wave"
+        text = ""
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        return Resp()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(tts.requests, "post", fake_post)
+
+    results = [None, None]
+
+    def render(slot):
+        barrier.wait()
+        results[slot] = tts.render_openai_tts_artifact("same text", "ballad")
+
+    threads = [threading.Thread(target=render, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert all(r and r["success"] for r in results)
+    assert len(calls) == 1
+    assert sorted(r["cache_hit"] for r in results) == [False, True]
+    assert Path(results[0]["artifact_path"]).read_bytes() == b"RIFFfake-wave"
+
+
 def test_artifact_url_is_never_loopback_when_mesh_ip_known(tmp_path, monkeypatch):
     tts = _load_tts(tmp_path, monkeypatch)
 

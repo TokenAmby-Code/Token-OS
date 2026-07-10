@@ -2,8 +2,8 @@
 // Pure Node.js HTTP server (no Express/Fastify dependency needed)
 
 import { createServer } from 'http';
-import { createWriteStream } from 'fs';
-import { mkdir } from 'fs/promises';
+import { createWriteStream, existsSync } from 'fs';
+import { mkdir, rename, unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createHash } from 'crypto';
@@ -58,30 +58,41 @@ export function createHttpServer(
     await mkdir(cacheDir, { recursive: true });
     const nameHash = createHash('sha256').update(url).digest('hex').slice(0, 32);
     const target = join(cacheDir, `${nameHash}.wav`);
+    if (existsSync(target)) return target;
+    // Download to a per-request temp path and rename into place so concurrent
+    // requests for the same url never interleave writes on the shared target,
+    // and a failed/mismatched download never leaves a bad file at target.
+    const partial = `${target}.${process.pid}.${Date.now()}.part`;
     const getter = url.startsWith('https:') ? httpsGet : httpGet;
-    await new Promise((resolve, reject) => {
-      const req = getter(url, (response) => {
-        if (response.statusCode !== 200) {
-          response.resume();
-          reject(new Error(`artifact download returned ${response.statusCode}`));
-          return;
-        }
-        const hash = createHash('sha256');
-        const out = createWriteStream(target);
-        response.on('data', chunk => hash.update(chunk));
-        response.pipe(out);
-        out.on('finish', () => {
-          out.close(() => {
-            const actual = hash.digest('hex');
-            if (expectedSha && actual !== expectedSha) reject(new Error('artifact_hash_mismatch'));
-            else resolve();
+    try {
+      await new Promise((resolve, reject) => {
+        const req = getter(url, (response) => {
+          if (response.statusCode !== 200) {
+            response.resume();
+            reject(new Error(`artifact download returned ${response.statusCode}`));
+            return;
+          }
+          const hash = createHash('sha256');
+          const out = createWriteStream(partial);
+          response.on('data', chunk => hash.update(chunk));
+          response.pipe(out);
+          out.on('finish', () => {
+            out.close(() => {
+              const actual = hash.digest('hex');
+              if (expectedSha && actual !== expectedSha) reject(new Error('artifact_hash_mismatch'));
+              else resolve();
+            });
           });
+          out.on('error', reject);
         });
-        out.on('error', reject);
+        req.on('error', reject);
+        req.setTimeout(180000, () => req.destroy(new Error('artifact_download_timeout')));
       });
-      req.on('error', reject);
-      req.setTimeout(180000, () => req.destroy(new Error('artifact_download_timeout')));
-    });
+      await rename(partial, target);
+    } catch (err) {
+      await unlink(partial).catch(() => {});
+      throw err;
+    }
     return target;
   }
 
