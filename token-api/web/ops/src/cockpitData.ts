@@ -7,12 +7,13 @@
 // fetching lives here — src/api.ts owns the polling hooks; the root component
 // runs these adapters over each feed and provides the result via context.
 //
-// Honesty rule: an adapter maps only what the live contract actually carries.
-// Subsystems the contract doesn't cover this phase (enforce, gt, mac, wsl,
-// mesh) render an explicit '—' placeholder dial — never a frozen fake value.
+// Honesty rule: an adapter maps only what the live contract actually carries —
+// never a frozen fake value. Every dial declares its EXPECTED readout
+// (DialModel.defaultValue); the fan shows a dial only while its live value
+// departs from that default, so the optimal cockpit is an empty fan.
 // ─────────────────────────────────────────────────────────────────────────
 
-import type { OpsSourceHealth, OpsState, PipelineDoc, TimerHistory, TimerMode, TmuxOccupancyCell } from './contracts';
+import type { OpsSourceHealth, OpsState, PipelineDoc, TimerHistory, TimerMode } from './contracts';
 import type { CompassStar } from './compass';
 
 export type CockpitMode = 'working' | 'multitasking' | 'distracted' | 'break' | 'idle';
@@ -61,6 +62,7 @@ export type DialTone = 'good' | 'warn' | 'bad' | 'neutral' | 'idle';
 // override kinds are added here (and to <Dial>'s switch) as features land.
 export type DialAction =
   | { kind: 'toggle-timer' } // timer dial → pause/resume the running timer
+  | { kind: 'end-morning' } // timer dial in morning_session → end the morning session
   | { kind: 'dismiss-phone' } // phone dial → force-clear stuck phone attention
   | { kind: 'ack-enforce' }; // enforce dial → acknowledge the pending enforcement
 
@@ -70,12 +72,19 @@ export type DialModel = {
   glyph: string;
   value: string;
   tone: DialTone;
-  noteworthy: boolean;
+  defaultValue: string; // the dial's EXPECTED readout. The fan renders a dial only
+  //                       while `value !== defaultValue` — a subsystem in its
+  //                       expected state shows nothing, so the optimal cockpit is
+  //                       an empty fan. Builders collapse nominal readouts onto
+  //                       this token (detail stays in `subtitle` for the drawer).
   subtitle: string; // "what is this dial?" subheader — hover tip + drawer line
   tag?: string; // optional mono id chip shown before the label in the hover tip
   //               (the TTS stack uses it for the sender's short instance id)
   action?: DialAction; // omit → default click opens the dials drawer
 };
+
+/** The fan's visibility rule — a dial earns pixels only in an unusual state. */
+export const dialIsUnusual = (d: DialModel): boolean => d.value !== d.defaultValue;
 
 // ── TTS queue (the left-side stack) ─────────────────────────────────────────
 // Modelled as a QUEUE, not a flat status list. `posInQueue` is the order key
@@ -196,15 +205,17 @@ function healthDial(h: OpsSourceHealth): { value: string; tone: DialTone } {
 
 export function ttsDial(s: OpsState): DialModel {
   const h = healthDial(s.sources.tts);
-  if (h.tone === 'bad' || h.tone === 'neutral') {
-    return { id: 'tts', label: 'TTS', glyph: '♪', value: h.value, tone: h.tone, noteworthy: true, subtitle: `Text-to-speech queue — ${s.sources.tts.message ?? h.value}.` };
+  if (h.tone !== 'good') {
+    // Degraded/down/unknown source health reads as its own unusual value — a
+    // sick TTS backend must never hide behind an 'idle' queue.
+    return { id: 'tts', label: 'TTS', glyph: '♪', value: h.value, tone: h.tone, defaultValue: 'idle', subtitle: `Text-to-speech queue — ${s.sources.tts.message ?? h.value}.` };
   }
   const hot = s.tts.hot_queue_length ?? s.tts.hot_queue?.length ?? 0;
   const pause = s.tts.pause_queue_length ?? s.tts.pause_queue?.length ?? 0;
   const speaking = Boolean(s.tts.current);
   const value = speaking ? 'speaking' : hot ? `hot ${hot}` : pause ? `pause ${pause}` : 'idle';
   const tone: DialTone = speaking || hot ? 'warn' : pause ? 'neutral' : 'good';
-  return { id: 'tts', label: 'TTS', glyph: '♪', value, tone, noteworthy: speaking || hot > 0 || pause > 0 || h.tone !== 'good', subtitle: `Text-to-speech queue — hot ${hot}, pause ${pause}, backend ${s.tts.backend ?? 'unknown'}, satellite ${String(s.tts.satellite_available)}.` };
+  return { id: 'tts', label: 'TTS', glyph: '♪', value, tone, defaultValue: 'idle', subtitle: `Text-to-speech queue — hot ${hot}, pause ${pause}, backend ${s.tts.backend ?? 'unknown'}, satellite ${String(s.tts.satellite_available)}.` };
 }
 
 export function enforcementDial(s: OpsState): DialModel {
@@ -212,12 +223,14 @@ export function enforcementDial(s: OpsState): DialModel {
   const pending = s.enforcement.pending_count ?? 0;
   const pavlok = s.enforcement.pavlok ?? {};
   const pavlokEnabled = typeof pavlok.enabled === 'boolean' ? `Pavlok ${pavlok.enabled ? 'on' : 'off'}` : 'Pavlok unknown';
-  const sourceBad = h.tone === 'bad' || h.tone === 'neutral';
+  // Any non-good source health is its own unusual value — a degraded
+  // enforcement source must never hide behind an empty pending queue.
+  const sourceBad = h.tone !== 'good';
   return {
     id: 'enforce', label: 'Enforce', glyph: '!',
     value: sourceBad ? h.value : pending ? `pending ${pending}` : 'clear',
     tone: sourceBad ? h.tone : pending ? 'bad' : 'good',
-    noteworthy: sourceBad || pending > 0,
+    defaultValue: 'clear',
     subtitle: `Enforcement queue — ${pavlokEnabled}${s.enforcement.error ? `; ${s.enforcement.error}` : ''}.`,
     ...(pending > 0 ? { action: { kind: 'ack-enforce' } as DialAction } : {}),
   };
@@ -229,16 +242,18 @@ export function goldenThroneDial(s: OpsState): DialModel {
   const armed = active.filter((gt) => gt.next_fire).length;
   const resume = active.reduce((n, gt) => n + (gt.resume_count ?? 0), 0);
   const victory = active.filter((gt) => gt.victory_at).length;
-  const value = due ? `due ${due}` : resume ? `resume ${resume}` : armed ? `armed ${armed}` : victory ? `victory ${victory}` : 'clear';
-  const tone: DialTone = due ? 'bad' : resume || armed ? 'warn' : victory ? 'good' : 'idle';
-  return { id: 'gt', label: 'Gold. Throne', glyph: '♛', value, tone, noteworthy: due > 0 || resume > 0 || armed > 0, subtitle: `Golden Throne rubrics — ${armed} armed, ${resume} resume signal(s), ${victory} victory ack(s).` };
+  // Victory acks are a healthy terminal, not an unusual state — they stay in
+  // the subtitle (drawer detail) and never earn the fan a dial.
+  const value = due ? `due ${due}` : resume ? `resume ${resume}` : armed ? `armed ${armed}` : 'clear';
+  const tone: DialTone = due ? 'bad' : resume || armed ? 'warn' : 'idle';
+  return { id: 'gt', label: 'Gold. Throne', glyph: '♛', value, tone, defaultValue: 'clear', subtitle: `Golden Throne rubrics — ${armed} armed, ${resume} resume signal(s), ${victory} victory ack(s).` };
 }
 
 function sourceDial(s: OpsState): DialModel {
   const degraded = Object.values(s.sources ?? {}).filter((src) => ['warn', 'bad', 'unknown'].includes(src?.status ?? 'unknown')).length;
   return {
     id: 'sources', label: 'Sources', glyph: '◇', value: degraded ? `${degraded} degraded` : 'nominal',
-    tone: degraded ? 'warn' : 'good', noteworthy: degraded > 0,
+    tone: degraded ? 'warn' : 'good', defaultValue: 'nominal',
     subtitle: `Aggregate source health — ${degraded} degraded source(s).`,
   };
 }
@@ -247,8 +262,8 @@ function fleetDial(s: OpsState): DialModel {
   const c = s.instances.counts;
   const engines = Object.entries(c.by_engine ?? {}).map(([k, v]) => `${k}:${v}`).join(' ') || 'engines unknown';
   return {
-    id: 'fleet', label: 'Fleet', glyph: '◆', value: `${c.active} active`,
-    tone: c.stale ? 'warn' : c.active ? 'good' : 'idle', noteworthy: c.stale > 0,
+    id: 'fleet', label: 'Fleet', glyph: '◆', value: c.stale ? `${c.stale} stale` : 'nominal',
+    tone: c.stale ? 'warn' : c.active ? 'good' : 'idle', defaultValue: 'nominal',
     subtitle: `Instance registry — ${c.active} active, ${c.stale} stale; ${engines}.`,
   };
 }
@@ -258,8 +273,8 @@ function workDial(s: OpsState): DialModel {
   const typing = w.typing_active ? 'typing' : 'not typing';
   const hold = w.productivity_hold ? `; hold ${w.productivity_hold}` : '';
   return {
-    id: 'work', label: 'Work', glyph: '⌁', value: w.productivity_active ? 'active' : 'idle',
-    tone: w.productivity_active ? 'good' : 'neutral', noteworthy: Boolean(w.productivity_hold || w.typing_active),
+    id: 'work', label: 'Work', glyph: '⌁', value: w.productivity_hold ? 'hold' : w.typing_active ? 'typing' : 'nominal',
+    tone: w.productivity_hold ? 'warn' : 'neutral', defaultValue: 'nominal',
     subtitle: `Productivity state — ${w.reason}; ${typing}${hold}.`,
   };
 }
@@ -269,17 +284,18 @@ function tmuxDial(s: OpsState): DialModel {
   const reachable = s.tmux.reachable === true;
   const drift = occ?.drift ?? 0;
   const dead = occ?.dead ?? 0;
-  const value = !reachable ? 'unreachable' : occ ? `${occ.occupied}/${occ.total} used` : 'unknown';
-  const tone: DialTone = !reachable ? 'bad' : occ?.status === 'bad' ? 'bad' : drift || dead || occ?.status === 'warn' ? 'warn' : 'good';
+  const tone: DialTone = !reachable ? 'bad' : !occ ? 'neutral' : occ.status === 'bad' ? 'bad' : drift || dead || occ.status === 'warn' ? 'warn' : 'good';
+  // Healthy occupancy collapses onto the nominal token (the M/N readout lives
+  // in the drawer subtitle); reachable-but-no-occupancy is an honest unknown.
+  const value = !reachable ? 'unreachable' : !occ ? 'unknown' : tone === 'good' ? 'nominal' : `${occ.occupied}/${occ.total} used`;
   return {
-    id: 'tmux', label: 'tmux', glyph: '▦', value, tone, noteworthy: tone !== 'good',
-    subtitle: `tmuxctld occupancy — free ${occ?.free ?? 0}, dead ${dead}, drift ${drift}${occ?.errors?.length ? `; ${occ.errors.join('; ')}` : ''}.`,
+    id: 'tmux', label: 'tmux', glyph: '▦', value, tone, defaultValue: 'nominal',
+    subtitle: `tmuxctld occupancy — occupied ${occ?.occupied ?? 0}/${occ?.total ?? 0}, free ${occ?.free ?? 0}, dead ${dead}, drift ${drift}${occ?.errors?.length ? `; ${occ.errors.join('; ')}` : ''}.`,
   };
 }
 
 const COMPASS_DIRECTIONS = new Set(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']);
-
-function paneCompassStar(cell: Pick<TmuxOccupancyCell, 'pane_positional_id' | 'state'>): CompassStar | null {
+function paneCompassStar(cell: { pane_positional_id?: string | null; state?: string | null }): CompassStar | null {
   // Stable pane roles arrive as palace:N / somnium:NE. Some tmuxctld views can
   // expose the equivalent numeric window positions, where 1 is palace and 2 is
   // somnium. The compass reducer already handles coalescing and red+blue=purple;
@@ -310,12 +326,17 @@ const fmtBalanceValue = (ms: number): string => {
 };
 
 /**
- * OpsState → the floating state-dial cluster. Live values where the contract
- * carries them (timer, balance, phone, desktop, cron, tts); honest '—'
- * placeholders for the phase-2 tail (enforce, gt, mac, wsl, mesh). Ordered
- * noteworthy-first so the important gauges fan out before the nominal tail.
+ * OpsState → the floating state-dial cluster, every dial live-contract-backed.
+ * This is the full CATALOG (the drawer lists all of it); the fan renders only
+ * the unusual subset (`dialIsUnusual` — value ≠ defaultValue), so a fully
+ * nominal system fans out ZERO dials. Each builder collapses its nominal
+ * readout onto its defaultValue token and keeps the detail in the subtitle.
  */
 export function buildDials(s: OpsState): DialModel[] {
+  // morning_session maps to 'working' for the graph palette, but the dial must
+  // distinguish it: MORNING is an unusual state with its own click contract
+  // (end the morning session), while plain WORKING is the hidden default.
+  const morning = s.timer.mode === 'morning_session';
   const mode = mapMode(s.timer.mode);
   const timerTone: DialTone =
     mode === 'break' ? 'warn' : mode === 'distracted' ? 'bad' : mode === 'idle' ? 'neutral' : 'good';
@@ -323,23 +344,28 @@ export function buildDials(s: OpsState): DialModel[] {
   const phone = s.attention.phone;
   const cron = healthDial(s.sources.cron);
   return [
-    { id: 'timer', label: 'Timer', glyph: '❚❚', value: mode.toUpperCase(), tone: timerTone, noteworthy: true,
-      subtitle: 'Focus timer state — the live timer mode.', action: { kind: 'toggle-timer' } },
-    { id: 'balance', label: 'Balance', glyph: '▼', value: fmtBalanceValue(balMs), tone: balMs >= 0 ? 'good' : 'bad',
-      noteworthy: true, subtitle: 'Running break-balance — minutes of credit vs. debt.' },
-    { id: 'phone', label: 'Phone', glyph: '✕', value: phone.app ?? 'clear', tone: phone.is_distracted ? 'bad' : 'good',
-      noteworthy: true, subtitle: 'Phone foreground app — live distraction telemetry.',
+    { id: 'timer', label: 'Timer', glyph: '❚❚', value: morning ? 'MORNING' : mode.toUpperCase(), tone: timerTone,
+      defaultValue: 'WORKING',
+      subtitle: morning
+        ? 'Morning session running — click to end it and resume the normal timer.'
+        : 'Focus timer state — the live timer mode.',
+      action: morning ? { kind: 'end-morning' } : { kind: 'toggle-timer' } },
+    { id: 'balance', label: 'Balance', glyph: '▼', value: balMs < 0 ? fmtBalanceValue(balMs) : 'credit',
+      tone: balMs >= 0 ? 'good' : 'bad', defaultValue: 'credit',
+      subtitle: `Running break-balance — ${fmtBalanceValue(balMs)} of credit vs. debt.` },
+    { id: 'phone', label: 'Phone', glyph: '✕', value: phone.is_distracted ? (phone.app ?? 'distracted') : 'clear',
+      tone: phone.is_distracted ? 'bad' : 'good', defaultValue: 'clear',
+      subtitle: 'Phone foreground app — live distraction telemetry.',
       action: { kind: 'dismiss-phone' } },
-    { id: 'desktop', label: 'Desktop', glyph: '▣', value: s.attention.desktop.mode || '—', tone: 'neutral',
-      noteworthy: true, subtitle: 'Desktop presence — inferred from keyboard & focus.' },
+    { id: 'desktop', label: 'Desktop', glyph: '▣', value: s.attention.desktop.mode || 'unknown', tone: 'neutral',
+      defaultValue: 'silence', subtitle: 'Desktop media detection — video / music / gaming vs. silence.' },
     tmuxDial(s),
     fleetDial(s),
     workDial(s),
     sourceDial(s),
     enforcementDial(s),
     goldenThroneDial(s),
-    // nominal / suppressed subsystems — the tail of the stack
-    { id: 'cron', label: 'Cron', glyph: '◷', value: cron.value, tone: cron.tone, noteworthy: false,
+    { id: 'cron', label: 'Cron', glyph: '◷', value: cron.value, tone: cron.tone, defaultValue: 'nominal',
       subtitle: 'Scheduled cron routines — subsystem health.' },
     ttsDial(s),
   ];
@@ -413,6 +439,41 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
   return items;
 }
 
+// ── Lemon residents (the always-on singleton seats) ─────────────────────────
+// Emperor's ruling (2026-07-09): the standing command personas live in the
+// LEMON — the persona-section arc above the worker rails — not in the fleet
+// queues. This set is the ONE membership definition both consumers read: the
+// queue partition drops these instances (they never consume a slot) and the
+// lemon activity binding lights their section while they work. Slugs are the
+// registry keys; the Orchestrator seat wears the CI monogram in the lemon art
+// but registers (and lights) as 'orchestrator'.
+export const LEMON_RESIDENT_PERSONAS: ReadonlySet<string> = new Set([
+  'custodes',
+  'fabricator-general',
+  'malcador',
+  'pax',
+  'orchestrator',
+  'administratum',
+]);
+
+/**
+ * OpsState → the set of lemon-resident persona slugs with a WORKING instance.
+ * Drives the lemon section reverb: a slug in the set means that seat is
+ * actively processing a prompt; absent means the section renders its static
+ * idle glow. Subagents are excluded for the same reason the rails exclude
+ * them — a child inheriting Custodes' persona must not light Custodes' seat.
+ */
+export function toLemonActivity(s: OpsState): Set<string> {
+  const active = new Set<string>();
+  for (const i of s.instances.active) {
+    const slug = i.persona?.slug;
+    if (!i.is_subagent && i.status === 'working' && slug && LEMON_RESIDENT_PERSONAS.has(slug)) {
+      active.add(slug);
+    }
+  }
+  return active;
+}
+
 // ── Fleet queues (two systems × two rails) ──────────────────────────────────
 // The worker rails are the LIVE registration surface: one chip per registered
 // instance, wearing that instance's chapter-persona icon. A chip appearing IS
@@ -457,7 +518,10 @@ export type FleetQueues = {
  * fleet is the default left system), a missing `status` files as idle (never
  * fake "processing"). Subagents are excluded — the rails signal top-level
  * fleet registrations, and a subagent inheriting its parent's persona would
- * false-trigger the singleton-breach glow.
+ * false-trigger the singleton-breach glow. Lemon-resident personas
+ * (LEMON_RESIDENT_PERSONAS) are excluded too — the always-on singleton seats
+ * live in the lemon's persona sections, so the rails stay mechanicus/one-off
+ * territory.
  *
  * Persona falls back to the generic 'astartes' key when the instance has no
  * persona bound — the chip still appears (the registration was real) but wears
@@ -476,7 +540,7 @@ export function toFleetQueues(s: OpsState): FleetQueues {
     askCivic: { working: [], idle: [] },
   };
   const sorted = s.instances.active
-    .filter((i) => !i.is_subagent)
+    .filter((i) => !i.is_subagent && !LEMON_RESIDENT_PERSONAS.has(i.persona?.slug ?? ''))
     .sort((a, b) => regKey(b.created_at).localeCompare(regKey(a.created_at)));
   for (const i of sorted) {
     const system = i.domain === 'askcivic' ? queues.askCivic : queues.tokenOs;

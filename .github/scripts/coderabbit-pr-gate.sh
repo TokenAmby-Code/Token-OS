@@ -18,7 +18,7 @@ set -euo pipefail
 : "${PR_NUMBER:?PR_NUMBER is required}"
 : "${SHA:?SHA is required}"
 
-TIMEOUT_SECONDS="${CODERABBIT_GATE_TIMEOUT_SECONDS:-600}"
+TIMEOUT_SECONDS="${CODERABBIT_GATE_TIMEOUT_SECONDS:-1800}"
 POLL_INTERVAL_SECONDS="${CODERABBIT_GATE_POLL_INTERVAL_SECONDS:-15}"
 CODERABBIT_LOGIN="${CODERABBIT_LOGIN:-coderabbitai[bot]}"
 
@@ -34,12 +34,39 @@ is_disabled_or_skipped_review() {
     || [[ "$description_lc" == *"insufficient credits"* ]]
 }
 
+evaluate_coderabbit_signal() {
+  local description="$1" state="$2" kind="$3"
+
+  if is_disabled_or_skipped_review "$description"; then
+    echo "::error::CodeRabbit reported a skipped/disabled review ('$description'). Failing PR Gate so a disabled/free-trial/credit-skipped review cannot merge silently."
+    exit 1
+  fi
+
+  case "$state" in
+    success|neutral)
+      return 0
+      ;;
+    pending|queued|in_progress|"")
+      return 2
+      ;;
+    skipped)
+      echo "::error::CodeRabbit ${kind} was skipped: $description"
+      exit 1
+      ;;
+    *)
+      echo "::error::CodeRabbit ${kind} is $state: $description"
+      exit 1
+      ;;
+  esac
+}
+
 wait_for_coderabbit_status() {
-  local deadline line context state description updated_at
+  local deadline line context state description updated_at check_line check_name check_status check_conclusion check_description check_url status_passed
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while true; do
-    if ! line="$(gh api --method GET "repos/$REPO/commits/$SHA/status" \
+    status_passed=false
+    if ! line="$(gh api --paginate --method GET "repos/$REPO/commits/$SHA/status" \
       --jq '[.statuses[]? | select((((.context // "") | ascii_downcase) | startswith("coderabbit")))] | sort_by(.updated_at // .created_at) | if length == 0 then empty else last | [.context, .state, (.description // ""), (.updated_at // .created_at // "")] | @tsv end')"; then
       echo "::error::Failed to query CodeRabbit commit status for $SHA. Check GH_TOKEN, REPO, SHA, and statuses: read."
       exit 1
@@ -49,30 +76,36 @@ wait_for_coderabbit_status() {
       IFS=$'\t' read -r context state description updated_at <<< "$line"
       echo "CodeRabbit status: context=$context state=$state updated_at=$updated_at description=$description"
 
-      if is_disabled_or_skipped_review "$description"; then
-        echo "::error::CodeRabbit reported a skipped/disabled review ('$description'). Failing PR Gate so a disabled/free-trial/credit-skipped review cannot merge silently."
-        exit 1
+      if evaluate_coderabbit_signal "$description" "$state" "status"; then
+        status_passed=true
       fi
-
-      case "$state" in
-        success)
-          return 0
-          ;;
-        pending)
-          ;;
-        *)
-          echo "::error::CodeRabbit status is $state: $description"
-          exit 1
-          ;;
-      esac
     fi
 
-    if [[ "$SECONDS" -ge "$deadline" ]]; then
-      echo "::error::Timed out waiting for CodeRabbit commit status on $SHA. Failing closed so skipped/disabled/missing reviews cannot merge silently."
+    if ! check_line="$(gh api --paginate --method GET "repos/$REPO/commits/$SHA/check-runs" \
+      --jq '[.check_runs[]? | select(((.name // "") | ascii_downcase) as $n | (((.app.slug // "") | ascii_downcase) == "coderabbitai" and ($n == "coderabbit / review" or $n == "coderabbit" or $n == "coderabbitai" or ($n | test("^coderabbit([[:space:]/_-]+review)?$")))))] | sort_by(.completed_at // .started_at // .created_at // "") | if length == 0 then empty else last | [.name, .status, (.conclusion // ""), ((.output.summary // "") as $s | if ($s | length) > 0 then $s else (.output.title // "") end), (.details_url // "")] | @tsv end')"; then
+      echo "::error::Failed to query CodeRabbit check runs for $SHA. Check GH_TOKEN, REPO, SHA, and checks: read."
       exit 1
     fi
 
-    echo "Waiting for CodeRabbit commit status on $SHA..."
+    if [[ -n "$check_line" ]]; then
+      IFS=$'\t' read -r check_name check_status check_conclusion check_description check_url <<< "$check_line"
+      echo "CodeRabbit check run: name=$check_name status=$check_status conclusion=$check_conclusion url=$check_url"
+
+      if [[ "$check_status" != "completed" ]]; then
+        :
+      else
+        evaluate_coderabbit_signal "$check_description" "$check_conclusion" "check run" && return 0
+      fi
+    elif [[ "$status_passed" == "true" ]]; then
+      return 0
+    fi
+
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+      echo "::error::Timed out waiting for CodeRabbit commit status/check run on $SHA. Failing closed so skipped/disabled/missing reviews cannot merge silently."
+      exit 1
+    fi
+
+    echo "Waiting for CodeRabbit commit status/check run on $SHA..."
     sleep "$POLL_INTERVAL_SECONDS"
   done
 }

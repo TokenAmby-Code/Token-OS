@@ -4007,16 +4007,20 @@ def _h_context_governor_inject(control, params):
 def _h_context_governor_stop(control, params):
     """No-progress stage: stop further autonomous input via daemon-owned actuation.
 
-    For singleton/orchestrator panes this is intentionally conservative: insert a
-    visible hard-stop handoff prompt rather than killing a pane. Worker lifecycle
-    closure remains available through /close when policy class support is expanded.
+    For singleton/orchestrator panes this is intentionally conservative: rather than
+    killing the pane, route it into plan mode so the hard stop itself produces the
+    handoff plan the governor was waiting for (plan submission is the progress event,
+    and approval clears context). Worker lifecycle closure remains available through
+    /close when policy class support is expanded.
     """
     reason = _s(params, "reason") or "context_exhausted"
     text = (
-        "Context governor hard stop: no compaction, handoff, plan submission, or "
-        "session-doc checkpoint was observed after the forced context warning. "
-        "Stop autonomous work now, preserve handoff state, and wait for supervisor routing. "
-        f"Reason: {reason}."
+        "/plan Context governor hard stop: no compaction, handoff, plan submission, or "
+        "session-doc checkpoint was observed after the forced context warning "
+        f"(reason: {reason}). Your context is exhausted and will be cleared on plan "
+        "approval. Do not gather more context. Pose the handoff plan now from what you "
+        "already have: work completed, in-flight state, decisions made, and exact next "
+        "steps for the successor session."
     )
     injected = _h_context_governor_inject(
         control, {**params, "text": text, "stage": "no_progress_stop"}
@@ -4559,8 +4563,20 @@ class TmuxctldServer(ThreadingHTTPServer):
         except Exception:
             log.exception("tmuxctld prompt-submit callback load failed")
         try:
-            _DEFERRED_SEND_QUEUE.load()
-            _schedule_all_deferred_drains()
+            loaded_deferred = _DEFERRED_SEND_QUEUE.load()
+            # Do not auto-drain persisted typing-guard sends at daemon boot.
+            # A restart/kickstart is not a human-clear edge: hooks may not have
+            # rehydrated the pane-local HUMAN/PENDING guard yet, and queued
+            # records are keyed to physical panes.  Auto-replay here can flush a
+            # stale report into the Emperor's active composer and the submit key
+            # is part of that replay.  Deferred sends are drained only from a
+            # fresh guard-clear/expiry signal in this daemon lifetime (or an
+            # explicit drain call in tests/tools).
+            if loaded_deferred.get("queued"):
+                log.warning(
+                    "tmuxctld: deferred-send queue loaded queued=%s; boot auto-drain suppressed",
+                    loaded_deferred.get("queued"),
+                )
         except Exception:
             log.exception("tmuxctld deferred-send queue load failed")
         # Throttle state for the /health-driven lifecycle-hook re-assertion. A

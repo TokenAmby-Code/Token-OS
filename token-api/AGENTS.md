@@ -13,12 +13,12 @@ Local FastAPI server for Claude instance management, notifications, and system c
 
 ```
 Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
-  ├── WSL (100.66.10.74:7777)     ← satellite: TTS (Windows SAPI), process enforcement, /restart
+  ├── WSL (100.66.10.74:7777)     ← satellite: TTS artifact playback, process enforcement, /restart
   └── Phone (SSH)                  ← webhook notifications
 ```
 
 - Mac proxies to WSL via `DESKTOP_CONFIG` for enforcement and `/satellite/restart`
-- **TTS routing**: Token-API owns authoritative TTS state/queue/control. Execution backends are `{phone, WSL, later Linux}`; Mac `say` is not a TTS backend and must not be used as fallback. Phone-first is situational (away/mobile); WSL remains first-class at the desk. Sanitization happens server-side at `speak_tts`, then chunking/enqueue/backend dispatch.
+- **TTS routing**: Token-API owns authoritative TTS state/queue/control **and synthesis**: OpenAI TTS is rendered to cached WAV artifacts at enqueue (voice+text-hash keyed; repeat text served from cache) and backends receive an `artifact_url`, never text. Execution backends are audio-file players — Discord voice (`/voice/play`), WSL (`/audio/play`), phone (`/tts-artifact`), later Linux — in that routing order; Mac `say` is not a TTS backend and must not be used as fallback. Sanitization happens server-side at `speak_tts`, then chunking/enqueue/artifact-render/backend dispatch. See `docs/tts-execution-control-plane.md`.
 - `token-restart` orchestrates Mac restart → WSL restart
 - Android/browser clients can reach the Mac API over Tailscale. New rich visualization work should target the local TypeScript web cockpit at `/ui/ops`.
 - 15s startup grace period ignores silence detections after server restart (AHK restart race)
@@ -42,7 +42,7 @@ Do not build parallel live surfaces. New actions should be Token-API/CLI mutatio
 |------|---------|
 | `main.py` | FastAPI server (~5000 lines) |
 | `token-satellite.py` | WSL companion server: TTS engine, enforcement (systemd: `token-satellite.service`) |
-| `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) |
+| `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) — legacy; queue-path voices are server-rendered OpenAI |
 | `timer.py` | TimerEngine v2 — layered composite model, pure logic, no I/O |
 | `test_timer.py` | Unit tests for TimerEngine v2 (83 tests) |
 | `web/ops/` | Vite React TypeScript source for the Terminus ops cockpit |
@@ -222,8 +222,9 @@ GET    /api/ui/ops/state                # Aggregate read model for cockpit UI
 GET    /health                          # Heartbeat (includes tts_engine + kvm_watchdog status)
 POST   /enforce                         # Close Windows process by alias
 GET    /processes                       # List distraction-relevant processes
-POST   /tts/speak                       # Speak via Windows SAPI (blocking, persistent PS engine)
-POST   /tts/chunk                       # Token-OS chunk-dispatch contract (current + one next chunk)
+POST   /audio/play                      # Play a server-rendered WAV artifact by URL (sha256-verified, blocking) — the queue path
+POST   /tts/speak                       # Speak via Windows SAPI (blocking, persistent PS engine) — legacy, off the queue path
+POST   /tts/chunk                       # Token-OS chunk-dispatch contract (current + one next chunk) — legacy
 POST   /tts/skip                        # Skip current TTS playback
 GET    /kvm/status                      # DeskFlow watchdog state (state, mac_reachable, deskflow_running)
 POST   /kvm/control                     # Manual DeskFlow control (action: start|reload|stop|hold, hold_minutes: 30)
@@ -482,16 +483,13 @@ Remaining direct-write debt worth tracking:
 
 Suspicious statuses emit `instance_reconciliation_drift` into the normal `events` log.
 
-**Ultimate fallback**: Microsoft David (if 12+ concurrent instances somehow)
-
-Re-select voices via `tts-studio.py` on WSL. The DB `tts_voice` column stores the WSL voice name. Profile lookup derives mac_voice for fallback.
+**Legacy (WSL-SAPI era)**: Microsoft David was the 12+-instance overflow fallback; voices were re-selected via `tts-studio.py` on WSL with the DB `tts_voice` column storing the WSL voice name. Queue-path voices are now OpenAI voice ids cast per persona by the Emperor; the render happens server-side.
 
 ### TTS Routing
 
-- **Queue path** (`tts_queue_worker`): Looks up profile by WSL voice, tries satellite first, falls back to Mac
-- **Direct path** (`/api/notify/tts`, `/api/notify`): Mac-only (no profile context)
+- **Queue path** (`tts_queue_worker`): resolves the persona's OpenAI voice, renders/caches the WAV artifact, then dispatches the `artifact_url` in routing order Discord voice → WSL `/audio/play` → phone `/tts-artifact`. No Mac fallback; a failed backend records an authoritative error.
 - **Mobile path** (`device_id == "Token-S24"`): Webhook to phone, no TTS queue
-- **Skip**: Routes to satellite `/tts/skip` or kills local `say` process based on `TTS_BACKEND["current"]`
+- **Skip**: Routes to satellite `/tts/skip` (WSL) or queue-level control for other backends based on `TTS_BACKEND["current"]`
 - **Satellite down**: Health probe cached 30s, re-detected within 30s of PC coming online
 
 ### TTS Mode Cycle

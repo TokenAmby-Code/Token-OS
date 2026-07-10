@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { OPS_COCKPIT_POLLS } from './api';
-import { buildDials, enforcementDial, goldenThroneDial, laneForStatus, occupancyCompassStars, toFleetQueues, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
+import { buildDials, dialIsUnusual, enforcementDial, goldenThroneDial, laneForStatus, LEMON_RESIDENT_PERSONAS, occupancyCompassStars, toFleetQueues, toLemonActivity, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
 import type { OpsState } from './contracts';
 
 type TestInstance = {
@@ -137,13 +137,69 @@ describe('toFleetQueues', () => {
   it('carries identical WorkerItem identity fields whichever bucket an instance lands in', () => {
     const mk = (status: string) =>
       stateWith([
-        { id: 'x', display_name: 'Chip X', created_at: '2026-07-09T10:00:00', domain: 'askcivic', status, commander_type: 'chapter', persona: { slug: 'pax', chip_color: '#aa9955' } },
+        { id: 'x', display_name: 'Chip X', created_at: '2026-07-09T10:00:00', domain: 'askcivic', status, commander_type: 'chapter', persona: { slug: 'salamanders', chip_color: '#1b7a3d' } },
       ]);
     const working = toFleetQueues(mk('working')).askCivic.working[0];
     const idle = toFleetQueues(mk('idle')).askCivic.idle[0];
 
     expect(working).toEqual(idle); // the chip is the same dial wherever it sits
-    expect(working).toEqual({ id: 'x', persona: 'pax', name: 'Chip X', tint: '#aa9955', chapterChild: true });
+    expect(working).toEqual({ id: 'x', persona: 'salamanders', name: 'Chip X', tint: '#1b7a3d', chapterChild: true });
+  });
+
+  it('excludes lemon-resident personas from every bucket, working and idle alike', () => {
+    // The full roster, alternating working/idle across both domains — none of
+    // them may consume a queue slot; the lone mechanicus worker still lands.
+    const residents = [...LEMON_RESIDENT_PERSONAS].map((slug, k) => ({
+      id: `res-${slug}`,
+      display_name: slug,
+      created_at: `2026-07-09T10:0${k}:00`,
+      domain: k % 2 ? 'askcivic' : 'token-os',
+      status: k % 2 ? 'working' : 'idle',
+      persona: { slug, chip_color: '#c0a040' },
+    }));
+    const queues = toFleetQueues(
+      stateWith([
+        ...residents,
+        { id: 'wkr', display_name: 'Worker', created_at: '2026-07-09T11:00:00', domain: 'token-os', status: 'working', persona: { slug: 'mechanicus-worker', chip_color: '#884422' } },
+      ]),
+    );
+
+    expect(allBuckets(queues).flat().map((w) => w.id)).toEqual(['wkr']);
+  });
+});
+
+describe('toLemonActivity', () => {
+  it('lights exactly the residents with a working instance', () => {
+    const active = toLemonActivity(
+      stateWith([
+        { id: 'c', display_name: 'Custodes', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'working', persona: { slug: 'custodes', chip_color: '#c0a040' } },
+        { id: 'm', display_name: 'Malcador', created_at: '2026-07-09T10:01:00', domain: 'token-os', status: 'idle', persona: { slug: 'malcador', chip_color: '#8a7a4a' } },
+        { id: 'p', display_name: 'Pax', created_at: '2026-07-09T10:02:00', domain: 'askcivic', status: 'working', persona: { slug: 'pax', chip_color: '#aa9955' } },
+      ]),
+    );
+
+    expect(active).toEqual(new Set(['custodes', 'pax']));
+  });
+
+  it('ignores working non-residents — a busy chapter worker never lights the lemon', () => {
+    const active = toLemonActivity(
+      stateWith([
+        { id: 'w', display_name: 'Worker', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'working', persona: { slug: 'salamanders', chip_color: '#1b7a3d' } },
+      ]),
+    );
+
+    expect(active.size).toBe(0);
+  });
+
+  it("ignores non-'working' residents and subagents wearing a resident persona", () => {
+    const active = toLemonActivity(
+      stateWith([
+        { id: 'r', display_name: 'FG', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'reviewing', persona: { slug: 'fabricator-general', chip_color: '#c05030' } },
+        { id: 's', display_name: 'Custodes Sub', created_at: '2026-07-09T10:01:00', is_subagent: true, domain: 'token-os', status: 'working', persona: { slug: 'custodes', chip_color: '#c0a040' } },
+      ]),
+    );
+
+    expect(active.size).toBe(0);
   });
 });
 
@@ -237,6 +293,21 @@ describe('toTtsQueue', () => {
   });
 });
 
+// A fully-nominal OpsState — every subsystem in its expected state. Tests mutate
+// one facet at a time to prove exactly that facet makes its dial unusual.
+function nominalState(): OpsState {
+  return {
+    timer: { mode: 'working', break_balance_ms: 60000 },
+    attention: { phone: { app: null, is_distracted: false }, desktop: { mode: 'silence' } },
+    sources: { cron: { status: 'ok' }, tts: { status: 'ok' }, enforcement: { status: 'ok' }, token_api: { status: 'ok' }, agents_db: { status: 'ok' }, timer_engine: { status: 'ok' }, tmuxctld: { status: 'ok' } },
+    tts: { hot_queue_length: 0, pause_queue_length: 0, hot_queue: [], pause_queue: [], current: null, backend: 'wsl', satellite_available: true },
+    enforcement: { pending_count: 0, pavlok: { enabled: true } },
+    instances: { active: [], counts: { active: 2, stale: 0, by_engine: { codex: 2 }, by_status: {}, by_persona: {} } },
+    work_state: { productivity_active: true, reason: 'recent activity', typing_active: false },
+    tmux: { reachable: true, occupancy: { status: 'ok', total: 4, occupied: 2, free: 2, dead: 0, protected: 0, drift: 0, unknown: 0, errors: [], cells: [], generated_at: 'x' } },
+  } as unknown as OpsState;
+}
+
 describe('dial builders', () => {
   it('ttsDial reports speaking and queued metadata', () => {
     const dial = ttsDial({
@@ -244,7 +315,8 @@ describe('dial builders', () => {
       tts: { current: { message: 'x' }, hot_queue_length: 1, pause_queue_length: 2, hot_queue: [], pause_queue: [], backend: 'wsl', satellite_available: true },
     } as unknown as OpsState);
 
-    expect(dial).toMatchObject({ id: 'tts', value: 'speaking', tone: 'warn', noteworthy: true });
+    expect(dial).toMatchObject({ id: 'tts', value: 'speaking', tone: 'warn', defaultValue: 'idle' });
+    expect(dialIsUnusual(dial)).toBe(true);
   });
 
   it('enforcementDial reports pending actions', () => {
@@ -256,12 +328,48 @@ describe('dial builders', () => {
     expect(dial).toMatchObject({ id: 'enforce', value: 'pending 2', tone: 'bad', action: { kind: 'ack-enforce' } });
   });
 
+  it('enforcementDial surfaces a warn-health source even with an empty pending queue', () => {
+    const dial = enforcementDial({
+      sources: { enforcement: { status: 'warn', message: 'stale heartbeat' } },
+      enforcement: { pending_count: 0, pavlok: { enabled: true } },
+    } as unknown as OpsState);
+
+    expect(dial).toMatchObject({ id: 'enforce', value: 'degraded', tone: 'warn', defaultValue: 'clear' });
+    expect(dialIsUnusual(dial)).toBe(true);
+  });
+
+  // The optimal-cockpit invariant: with every subsystem in its expected state,
+  // every dial's value collapses onto its defaultValue — the fan renders NOTHING.
+  it('buildDials yields zero unusual dials when every subsystem is nominal', () => {
+    const dials = buildDials(nominalState());
+    expect(dials.filter(dialIsUnusual)).toEqual([]);
+  });
+
+  it('timer dial surfaces morning_session as unusual with the end-morning click contract', () => {
+    const s = nominalState();
+    (s.timer as { mode: string }).mode = 'morning_session';
+    const timer = buildDials(s).find((d) => d.id === 'timer');
+    expect(timer).toMatchObject({ value: 'MORNING', defaultValue: 'WORKING', action: { kind: 'end-morning' } });
+    expect(dialIsUnusual(timer!)).toBe(true);
+  });
+
+  it('balance dial hides credit and surfaces debt', () => {
+    const credit = buildDials(nominalState()).find((d) => d.id === 'balance');
+    expect(dialIsUnusual(credit!)).toBe(false);
+    const s = nominalState();
+    (s.timer as { break_balance_ms: number }).break_balance_ms = -120000;
+    const debt = buildDials(s).find((d) => d.id === 'balance');
+    expect(debt).toMatchObject({ value: '−2m', tone: 'bad' });
+    expect(dialIsUnusual(debt!)).toBe(true);
+  });
+
   it('goldenThroneDial reports due rubrics', () => {
     const dial = goldenThroneDial({
       instances: { active: [{ gt: { next_fire: '2000-01-01T00:00:00Z', resume_count: 0, victory_at: null } }] },
     } as unknown as OpsState);
 
-    expect(dial).toMatchObject({ id: 'gt', value: 'due 1', tone: 'bad', noteworthy: true });
+    expect(dial).toMatchObject({ id: 'gt', value: 'due 1', tone: 'bad', defaultValue: 'clear' });
+    expect(dialIsUnusual(dial)).toBe(true);
   });
 });
 
@@ -460,19 +568,9 @@ describe('tmux occupancy adapters', () => {
       tmux: { reachable: true, occupancy: { status: 'bad', total: 2, occupied: 0, free: 0, dead: 1, protected: 0, drift: 1, unknown: 0, errors: ['partial failure'], cells: [], generated_at: 'x' } },
     } as unknown as OpsState);
 
-    expect(dials.find((d) => d.id === 'tmux')).toMatchObject({ tone: 'bad', noteworthy: true });
-  });
-
-
-
-  it('does not invent compass stars when occupancy data is absent or empty', () => {
-    expect(occupancyCompassStars({ tmux: { reachable: false, occupancy: null } } as unknown as OpsState)).toEqual([]);
-    expect(occupancyCompassStars({
-      tmux: {
-        reachable: true,
-        occupancy: { status: 'ok', total: 0, occupied: 0, free: 0, dead: 0, protected: 0, drift: 0, unknown: 0, errors: [], generated_at: 'x', cells: [] },
-      },
-    } as unknown as OpsState)).toEqual([]);
+    const tmux = dials.find((d) => d.id === 'tmux');
+    expect(tmux).toMatchObject({ tone: 'bad', value: '0/2 used' });
+    expect(dialIsUnusual(tmux!)).toBe(true);
   });
 
   it('maps occupied palace/somnium pane slots to compass star colors', () => {
