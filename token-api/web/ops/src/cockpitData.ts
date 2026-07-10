@@ -270,7 +270,7 @@ function tmuxDial(s: OpsState): DialModel {
   const drift = occ?.drift ?? 0;
   const dead = occ?.dead ?? 0;
   const value = !reachable ? 'unreachable' : occ ? `${occ.occupied}/${occ.total} used` : 'unknown';
-  const tone: DialTone = !reachable ? 'bad' : drift || dead || occ?.status === 'warn' ? 'warn' : occ?.status === 'bad' ? 'bad' : 'good';
+  const tone: DialTone = !reachable ? 'bad' : occ?.status === 'bad' ? 'bad' : drift || dead || occ?.status === 'warn' ? 'warn' : 'good';
   return {
     id: 'tmux', label: 'tmux', glyph: '▦', value, tone, noteworthy: tone !== 'good',
     subtitle: `tmuxctld occupancy — free ${occ?.free ?? 0}, dead ${dead}, drift ${drift}${occ?.errors?.length ? `; ${occ.errors.join('; ')}` : ''}.`,

@@ -226,7 +226,7 @@ export type InstanceCounts = {
   by_work_class?: Counts;
 };
 
-export type TmuxOccupancyCellState = 'occupied' | 'free' | 'dead' | 'protected' | 'drift' | 'unknown' | string;
+export type TmuxOccupancyCellState = 'occupied' | 'free' | 'dead' | 'protected' | 'drift' | 'unknown';
 
 export type TmuxOccupancyCell = {
   pane_positional_id: string | null;
@@ -240,7 +240,7 @@ export type TmuxOccupancyCell = {
 };
 
 export type TmuxOccupancy = {
-  status: OpsHealthStatus | string;
+  status: OpsHealthStatus;
   generated_at: string;
   total: number;
   occupied: number;

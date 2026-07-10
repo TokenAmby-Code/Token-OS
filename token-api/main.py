@@ -22279,10 +22279,10 @@ def _ops_tmux_cell_state(row: dict, free_ids: set[str]) -> str:
         return "protected"
     if row.get("drift") or row.get("projection_drift"):
         return "drift"
-    if pane_ref and pane_ref in free_ids:
-        return "free"
     if row.get("instance_id") or row.get("persona") or row.get("wrapper_id"):
         return "occupied"
+    if pane_ref and pane_ref in free_ids:
+        return "free"
     return "unknown" if pane_ref else "drift"
 
 
@@ -22290,16 +22290,24 @@ def _ops_build_tmux_occupancy(
     generated_at: datetime, health: dict, ledger_payload, freelist_payload
 ) -> dict:
     errors: list[str] = []
-    ledger_rows = (
-        ledger_payload.get("result", ledger_payload)
-        if isinstance(ledger_payload, dict)
-        else ledger_payload
-    )
-    freelist = (
-        freelist_payload.get("result", freelist_payload)
-        if isinstance(freelist_payload, dict)
-        else freelist_payload
-    )
+    if isinstance(ledger_payload, Exception):
+        errors.append(f"tmuxctld ledger unavailable: {ledger_payload}")
+        ledger_rows = []
+    else:
+        ledger_rows = (
+            ledger_payload.get("result", ledger_payload)
+            if isinstance(ledger_payload, dict)
+            else ledger_payload
+        )
+    if isinstance(freelist_payload, Exception):
+        errors.append(f"tmuxctld freelist unavailable: {freelist_payload}")
+        freelist = []
+    else:
+        freelist = (
+            freelist_payload.get("result", freelist_payload)
+            if isinstance(freelist_payload, dict)
+            else freelist_payload
+        )
     if not isinstance(ledger_rows, list):
         errors.append("tmuxctld ledger rows malformed")
         ledger_rows = []
@@ -22389,6 +22397,7 @@ async def _ops_read_tmuxctld_snapshot(generated_at: datetime) -> dict:
         ledger_payload, freelist_payload = await asyncio.gather(
             asyncio.to_thread(read_json, "/ledger/rows"),
             asyncio.to_thread(read_json, "/freelist"),
+            return_exceptions=True,
         )
         health["occupancy"] = _ops_build_tmux_occupancy(
             generated_at, health, ledger_payload, freelist_payload

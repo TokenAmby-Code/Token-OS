@@ -1228,6 +1228,30 @@ def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) 
     assert occ["cells"][0]["state"] == "occupied"
 
 
+def test_ops_tmux_occupancy_preserves_ledger_when_freelist_fails(app_env) -> None:
+    generated_at = app_env.main.datetime.fromisoformat("2026-07-09T10:00:00+00:00")
+    occ = app_env.main._ops_build_tmux_occupancy(
+        generated_at,
+        {"reachable": True},
+        [{"pane_positional_id": "somnium:N", "instance_id": "i1", "persona": "p"}],
+        RuntimeError("freelist boom"),
+    )
+
+    assert occ["status"] == "warn"
+    assert occ["occupied"] == 1
+    assert occ["total"] == 1
+    assert occ["errors"] == ["tmuxctld freelist unavailable: freelist boom"]
+
+
+def test_ops_tmux_cell_state_prefers_occupied_signal_over_freelist(app_env) -> None:
+    assert (
+        app_env.main._ops_tmux_cell_state(
+            {"pane_positional_id": "somnium:N", "instance_id": "i1"}, {"somnium:N"}
+        )
+        == "occupied"
+    )
+
+
 def test_ops_state_tmux_occupancy_unavailable(client, app_env, monkeypatch) -> None:
     async def _fake_snapshot(generated_at):
         return {

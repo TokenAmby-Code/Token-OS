@@ -434,6 +434,22 @@ describe('tmux occupancy adapters', () => {
     expect(ids).not.toEqual(expect.arrayContaining(['mac', 'wsl', 'mesh']));
   });
 
+
+  it('keeps tmux dial bad when bad occupancy also reports drift or dead panes', () => {
+    const dials = buildDials({
+      sources: { cron: { status: 'ok' }, tts: { status: 'ok' }, enforcement: { status: 'ok' }, token_api: { status: 'ok' }, agents_db: { status: 'ok' }, timer_engine: { status: 'ok' }, tmuxctld: { status: 'warn' } },
+      timer: { mode: 'working', break_balance_ms: 0 },
+      attention: { phone: {}, desktop: {} },
+      tts: { hot_queue_length: 0, pause_queue_length: 0, hot_queue: [], pause_queue: [], current: null, backend: 'wsl', satellite_available: true },
+      enforcement: { pending_count: 0, pavlok: {} },
+      instances: { active: [], counts: { active: 0, stale: 0, by_engine: {}, by_status: {}, by_persona: {} } },
+      work_state: { productivity_active: false, reason: 'idle', typing_active: false },
+      tmux: { reachable: true, occupancy: { status: 'bad', total: 2, occupied: 0, free: 0, dead: 1, protected: 0, drift: 1, errors: ['partial failure'], cells: [], generated_at: 'x' } },
+    } as unknown as OpsState);
+
+    expect(dials.find((d) => d.id === 'tmux')).toMatchObject({ tone: 'bad', noteworthy: true });
+  });
+
   it('maps occupied palace/somnium pane slots to compass star colors', () => {
     const stars = occupancyCompassStars({
       tmux: {
