@@ -4007,16 +4007,20 @@ def _h_context_governor_inject(control, params):
 def _h_context_governor_stop(control, params):
     """No-progress stage: stop further autonomous input via daemon-owned actuation.
 
-    For singleton/orchestrator panes this is intentionally conservative: insert a
-    visible hard-stop handoff prompt rather than killing a pane. Worker lifecycle
-    closure remains available through /close when policy class support is expanded.
+    For singleton/orchestrator panes this is intentionally conservative: rather than
+    killing the pane, route it into plan mode so the hard stop itself produces the
+    handoff plan the governor was waiting for (plan submission is the progress event,
+    and approval clears context). Worker lifecycle closure remains available through
+    /close when policy class support is expanded.
     """
     reason = _s(params, "reason") or "context_exhausted"
     text = (
-        "Context governor hard stop: no compaction, handoff, plan submission, or "
-        "session-doc checkpoint was observed after the forced context warning. "
-        "Stop autonomous work now, preserve handoff state, and wait for supervisor routing. "
-        f"Reason: {reason}."
+        "/plan Context governor hard stop: no compaction, handoff, plan submission, or "
+        "session-doc checkpoint was observed after the forced context warning "
+        f"(reason: {reason}). Your context is exhausted and will be cleared on plan "
+        "approval. Do not gather more context. Pose the handoff plan now from what you "
+        "already have: work completed, in-flight state, decisions made, and exact next "
+        "steps for the successor session."
     )
     injected = _h_context_governor_inject(
         control, {**params, "text": text, "stage": "no_progress_stop"}
