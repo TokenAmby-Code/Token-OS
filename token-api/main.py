@@ -22286,28 +22286,22 @@ def _ops_tmux_cell_state(row: dict, free_ids: set[str]) -> str:
     return "unknown" if pane_ref else "drift"
 
 
+def _ops_normalize_tmux_payload(payload, surface: str, errors: list[str]):
+    if isinstance(payload, Exception):
+        errors.append(f"tmuxctld {surface} unavailable: {payload}")
+        return []
+    return payload.get("result", payload) if isinstance(payload, dict) else payload
+
+
 def _ops_build_tmux_occupancy(
-    generated_at: datetime, health: dict, ledger_payload, freelist_payload
+    generated_at: datetime,
+    health: dict,
+    ledger_payload: dict | list | Exception,
+    freelist_payload: dict | list | Exception,
 ) -> dict:
     errors: list[str] = []
-    if isinstance(ledger_payload, Exception):
-        errors.append(f"tmuxctld ledger unavailable: {ledger_payload}")
-        ledger_rows = []
-    else:
-        ledger_rows = (
-            ledger_payload.get("result", ledger_payload)
-            if isinstance(ledger_payload, dict)
-            else ledger_payload
-        )
-    if isinstance(freelist_payload, Exception):
-        errors.append(f"tmuxctld freelist unavailable: {freelist_payload}")
-        freelist = []
-    else:
-        freelist = (
-            freelist_payload.get("result", freelist_payload)
-            if isinstance(freelist_payload, dict)
-            else freelist_payload
-        )
+    ledger_rows = _ops_normalize_tmux_payload(ledger_payload, "ledger", errors)
+    freelist = _ops_normalize_tmux_payload(freelist_payload, "freelist", errors)
     if not isinstance(ledger_rows, list):
         errors.append("tmuxctld ledger rows malformed")
         ledger_rows = []
