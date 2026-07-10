@@ -3,6 +3,7 @@ import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   balanceMinutes,
   buildDials,
+  LEMON_RESIDENT_PERSONAS,
   OCCUPANCY_COMPASS_FALLBACK_STARS,
   occupancyCompassStars,
   mapMode,
@@ -2053,6 +2054,15 @@ function ArcLayer({ uiScale, activePersonas }: {
     { art: 'pax', slug: 'pax' },
     { art: 'administratum', slug: 'administratum' },
   ];
+  // Section ORDER and art keys are view concerns owned here; slug MEMBERSHIP is not —
+  // it must stay in lockstep with LEMON_RESIDENT_PERSONAS, enforced at dev time.
+  if (import.meta.env.DEV) {
+    const sectionSlugs = new Set(SECTION_PERSONAS.map((p) => p.slug));
+    if (sectionSlugs.size !== LEMON_RESIDENT_PERSONAS.size
+      || [...LEMON_RESIDENT_PERSONAS].some((s) => !sectionSlugs.has(s))) {
+      throw new Error('SECTION_PERSONAS slugs diverged from LEMON_RESIDENT_PERSONAS — update both rosters together');
+    }
+  }
   const SECTION_TONES = ['var(--good)', 'var(--warn)', 'var(--bad)', 'var(--neutral)', 'var(--idle)', 'var(--brass-bright)'];
   const ICON_PX = 40 * uiScale; // rendered icon box (the glyph's 512 viewBox scaled to this)
   const IMG_PX = 52 * uiScale; // image-persona box — brand art carries its own padding,
