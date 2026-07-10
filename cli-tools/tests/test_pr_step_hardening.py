@@ -1161,8 +1161,7 @@ def test_timeout_prefers_rate_limit_reset_signal_before_rerequest(tmp_path: Path
 slept=0
 rerequested=0
 order=
-coderabbit_latest_issue_comment_body() { echo 'Review limit reached. Your next review will be available in 18 minutes.'; }
-coderabbit_latest_issue_comment_timestamp() { echo '1970-01-01T00:00:00Z'; }
+coderabbit_latest_issue_comment_json() { printf '%s\n' '{"body":"Review limit reached. Your next review will be available in 18 minutes.","updated_at":"1970-01-01T00:00:00Z"}'; }
 sleep_until_rate_limit_reset() { slept=$1; order="${order}sleep "; return 0; }
 rate_limit_reset_reached() { return 0; }
 coderabbit_rerequest_review() { rerequested=$((rerequested + 1)); order="${order}rerequest"; return 0; }

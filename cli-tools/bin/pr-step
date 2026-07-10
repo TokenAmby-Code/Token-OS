@@ -795,10 +795,11 @@ coderabbit_maybe_rerequest_on_timeout() {
 }
 
 coderabbit_maybe_wait_rate_limit_on_timeout() {
-    local pr="$1" done_var="${2:-}" max="${3:-${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}}" body stamp
-    body="$(coderabbit_latest_issue_comment_body "$pr")"
+    local pr="$1" done_var="${2:-}" max="${3:-${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}}" latest body stamp
+    latest="$(coderabbit_latest_issue_comment_json "$pr")"
+    body="$(printf '%s' "$latest" | jq -r '.body // ""' 2>/dev/null || true)"
     coderabbit_body_is_ratelimit "$body" || return 1
-    stamp="$(coderabbit_latest_issue_comment_timestamp "$pr")"
+    stamp="$(printf '%s' "$latest" | jq -r '.updated_at // .created_at // ""' 2>/dev/null || true)"
     coderabbit_handle_ratelimit_comment "$pr" "$body" "$stamp" "$done_var" "$max"
 }
 
