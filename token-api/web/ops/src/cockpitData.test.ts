@@ -328,6 +328,16 @@ describe('dial builders', () => {
     expect(dial).toMatchObject({ id: 'enforce', value: 'pending 2', tone: 'bad', action: { kind: 'ack-enforce' } });
   });
 
+  it('enforcementDial surfaces a warn-health source even with an empty pending queue', () => {
+    const dial = enforcementDial({
+      sources: { enforcement: { status: 'warn', message: 'stale heartbeat' } },
+      enforcement: { pending_count: 0, pavlok: { enabled: true } },
+    } as unknown as OpsState);
+
+    expect(dial).toMatchObject({ id: 'enforce', value: 'degraded', tone: 'warn', defaultValue: 'clear' });
+    expect(dialIsUnusual(dial)).toBe(true);
+  });
+
   // The optimal-cockpit invariant: with every subsystem in its expected state,
   // every dial's value collapses onto its defaultValue — the fan renders NOTHING.
   it('buildDials yields zero unusual dials when every subsystem is nominal', () => {

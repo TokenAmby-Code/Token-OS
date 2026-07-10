@@ -801,7 +801,6 @@ function Dial({
       // Override hooks. dismiss-phone and end-morning are LIVE; the others still
       // land on the drawer (no timer/enforce mutation is wired yet — no fake success).
       case 'toggle-timer':
-        console.log('[dial] toggle-timer — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       case 'end-morning':
@@ -821,7 +820,6 @@ function Dial({
         );
         break;
       case 'ack-enforce':
-        console.log('[dial] ack-enforce — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       default:

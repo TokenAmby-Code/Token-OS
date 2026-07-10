@@ -223,7 +223,9 @@ export function enforcementDial(s: OpsState): DialModel {
   const pending = s.enforcement.pending_count ?? 0;
   const pavlok = s.enforcement.pavlok ?? {};
   const pavlokEnabled = typeof pavlok.enabled === 'boolean' ? `Pavlok ${pavlok.enabled ? 'on' : 'off'}` : 'Pavlok unknown';
-  const sourceBad = h.tone === 'bad' || h.tone === 'neutral';
+  // Any non-good source health is its own unusual value — a degraded
+  // enforcement source must never hide behind an empty pending queue.
+  const sourceBad = h.tone !== 'good';
   return {
     id: 'enforce', label: 'Enforce', glyph: '!',
     value: sourceBad ? h.value : pending ? `pending ${pending}` : 'clear',
