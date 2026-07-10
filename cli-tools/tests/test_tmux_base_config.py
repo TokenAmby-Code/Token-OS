@@ -180,6 +180,8 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
     status_left = _line_starting("set -g status-left ")
     assert "#S" in status_left
     assert "@PERSONA" in status_left
+    assert "#(" not in status_left, "status-left must not fork during status redraws"
+    assert "tmux-persona-for-pane" not in status_left
 
     border = _line_starting("set -g pane-border-format ")
     start = border.index("#{?@PANE_LABEL,")
