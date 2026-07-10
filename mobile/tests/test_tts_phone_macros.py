@@ -120,38 +120,44 @@ def test_local_control_echo_is_private_consumed_endpoint_not_authority() -> None
     assert "mac say" not in lowered
 
 
-def test_chunk_player_speaks_one_utterance_and_reports_buffer_drained() -> None:
+def test_artifact_player_downloads_wav_plays_and_reports_buffer_drained() -> None:
     macro = load("tts-phone-chunk-player.macro")
-    assert macro["m_name"] == "04 TTS Chunk Player"
+    assert macro["m_name"] == "04 TTS Artifact Player"
     assert (
         token_os_global("tts-phone-chunk-player.macro")["m_stringValue"]
         == "http://100.95.109.23:7777"
     )
-    assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
-    speak_actions = actions(macro, "SpeakTextAction")
-    assert len(speak_actions) == 1
-    assert speak_actions[0]["m_textToSay"] == "{lv=current_chunk_text}"
-    assert speak_actions[0]["m_queue"] is False
-    assert speak_actions[0]["m_waitToFinish"] is True
+    assert macro["m_triggerList"][0]["identifier"] == "tts-artifact"
+    assert actions(macro, "SpeakTextAction") == []
+
+    http_actions = actions(macro, "HttpRequestAction")
+    download = http_actions[0]["requestConfig"]
+    assert download["urlToOpen"] == "{lv=request[artifact_url]}"
+    assert download["saveResponseType"] == 2
+    assert download["saveResponseUseAllFilesAccess"] is True
+    assert download["saveResponseAllFilesAccessPath"] == "/storage/emulated/0/Notifications"
+    assert download["saveResponseFileName"] == "token-tts-{lv=playback_id}.wav"
+
+    play_actions = actions(macro, "PlaySoundAction")
+    assert len(play_actions) == 1
+    assert play_actions[0]["waitToFinish"] is True
+    assert play_actions[0]["useAllFilesAccess"] is True
+    assert play_actions[0]["allFilesFilename"] == "token-tts-{lv=playback_id}.wav"
 
     assignments = dict(set_variable_assignments(macro))
-    assert assignments["current_index"] == "{lv=request[current_index]}"
     assert assignments["session_id"] == "{lv=request[session_id]}"
     assert assignments["playback_id"] == "{lv=request[playback_id]}"
-    assert assignments["utterance_id"] == "{lv=request[utterance_id]}"
 
     serialized = json.dumps(macro)
     assert "LoopAction" not in serialized
     assert "/api/tts/chunk-next" not in serialized
-    assert "backfill" not in serialized.lower()
-    assert "next_chunk_text" not in [a[0] for a in set_variable_assignments(macro)]
+    assert "SpeakTextAction" not in serialized
 
     urls = request_urls(macro)
-    assert urls == [f"{TOKEN_OS_BASE}/api/tts/chunk-event"]
-    bodies = request_bodies(macro)
+    assert urls == ["{lv=request[artifact_url]}", f"{TOKEN_OS_BASE}/api/tts/chunk-event"]
+    bodies = [body for body in request_bodies(macro) if body]
     assert len(bodies) == 1
     assert "buffer_drained" in bodies[0]
-    assert "last_index" in bodies[0]
 
 
 def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:

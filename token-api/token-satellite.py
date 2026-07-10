@@ -2142,6 +2142,13 @@ class TTSSynthAndPlayRequest(BaseModel):
     rate: int = 0
 
 
+class AudioPlayRequest(BaseModel):
+    artifact_url: str
+    artifact_id: str | None = None
+    sha256: str | None = None
+    format: str = "wav"
+
+
 class TTSChunkRequest(BaseModel):
     session_id: str | None = None
     playback_id: str
@@ -2157,6 +2164,60 @@ class TTSChunkRequest(BaseModel):
     message: str | None = None
     voice: str = "Microsoft David"
     rate: int = 0
+
+
+@app.post("/audio/play")
+def audio_play(request: AudioPlayRequest):
+    """Download and play a server-rendered WAV artifact. No local synthesis."""
+    if request.format != "wav":
+        raise HTTPException(status_code=400, detail="only wav artifacts are supported")
+    if tts_engine.is_speaking or tts_engine._playing:
+        raise HTTPException(status_code=409, detail="TTS engine is busy")
+
+    cache_dir = Path(
+        os.environ.get(
+            "TOKEN_SATELLITE_AUDIO_CACHE", str(Path.home() / ".cache" / "token-satellite" / "audio")
+        )
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    file_id = (
+        request.artifact_id or hashlib.sha256(request.artifact_url.encode("utf-8")).hexdigest()[:32]
+    )
+    wav_path = cache_dir / f"{file_id}.wav"
+    try:
+        if not wav_path.exists():
+            resp = http_requests.get(request.artifact_url, timeout=(5, 180))
+            if resp.status_code != 200:
+                return {"success": False, "error": f"artifact_download_http_{resp.status_code}"}
+            wav_path.write_bytes(resp.content)
+        data = wav_path.read_bytes()
+        actual_sha = hashlib.sha256(data).hexdigest()
+        if request.sha256 and actual_sha != request.sha256:
+            try:
+                wav_path.unlink()
+            except OSError:
+                pass
+            return {"success": False, "error": "artifact_hash_mismatch", "sha256": actual_sha}
+        win_path = subprocess.check_output(
+            ["wslpath", "-w", str(wav_path)], text=True, timeout=5
+        ).strip()
+        result = tts_engine._play_wav_file(
+            {
+                "file_id": file_id,
+                "wav_path_wsl": str(wav_path),
+                "wav_path_win": win_path,
+                "rendered_hash": request.sha256,
+                "rendered_chars": None,
+                "message_chars": None,
+            }
+        )
+        result["transport"] = "openai_tts_wav_artifact"
+        result["artifact_id"] = request.artifact_id
+        result["sha256"] = actual_sha
+        return result
+    except Exception as exc:
+        logger.warning(f"audio/play failed: {exc}")
+        return {"success": False, "error": str(exc)}
 
 
 @app.post("/tts/synthesize")
