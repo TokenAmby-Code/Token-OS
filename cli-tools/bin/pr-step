@@ -506,12 +506,12 @@ coderabbit_state_for_head() {
     local head="$1" repo state check
     repo="$(repo_slug)"
     [[ -n "$repo" && -n "$head" ]] || return 1
-    state="$(gh api "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true)"
+    state="$(gh api --paginate "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true)"
     if [[ -n "$state" ]]; then
         printf '%s\n' "$state"
         return 0
     fi
-    check="$(gh api "repos/${repo}/commits/${head}/check-runs" 2>/dev/null | jq -r '
+    check="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null | jq -r '
         [.check_runs[]? | select(
             (((.name // "") | ascii_downcase) | startswith("coderabbit"))
             or (((.app.slug // "") | ascii_downcase) == "coderabbitai")
@@ -773,7 +773,7 @@ coderabbit_rerequest_review() {
 coderabbit_maybe_rerequest_on_timeout() {
     local pr="$1" done_var="$2" max="${3:-${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}}" done
     [[ "$max" =~ ^[0-9]+$ ]] || return 1
-    eval "done=\${${done_var}:-0}"
+    done="${!done_var:-0}"
     [[ "$done" =~ ^[0-9]+$ ]] || done=0
     (( done < max )) || return 1
     done=$((done + 1))

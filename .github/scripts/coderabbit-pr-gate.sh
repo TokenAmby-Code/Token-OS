@@ -39,7 +39,7 @@ wait_for_coderabbit_status() {
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while true; do
-    if ! line="$(gh api --method GET "repos/$REPO/commits/$SHA/status" \
+    if ! line="$(gh api --paginate --method GET "repos/$REPO/commits/$SHA/status" \
       --jq '[.statuses[]? | select((((.context // "") | ascii_downcase) | startswith("coderabbit")))] | sort_by(.updated_at // .created_at) | if length == 0 then empty else last | [.context, .state, (.description // ""), (.updated_at // .created_at // "")] | @tsv end')"; then
       echo "::error::Failed to query CodeRabbit commit status for $SHA. Check GH_TOKEN, REPO, SHA, and statuses: read."
       exit 1
@@ -67,7 +67,7 @@ wait_for_coderabbit_status() {
       esac
     fi
 
-    if ! check_line="$(gh api --method GET "repos/$REPO/commits/$SHA/check-runs" \
+    if ! check_line="$(gh api --paginate --method GET "repos/$REPO/commits/$SHA/check-runs" \
       --jq '[.check_runs[]? | select(((((.name // "") | ascii_downcase) | startswith("coderabbit")) or ((((.app.slug // "") | ascii_downcase) == "coderabbitai"))))] | sort_by(.completed_at // .started_at // .created_at // "") | if length == 0 then empty else last | [.name, .status, (.conclusion // ""), (.output.summary // .output.title // ""), (.details_url // "")] | @tsv end')"; then
       echo "::error::Failed to query CodeRabbit check runs for $SHA. Check GH_TOKEN, REPO, SHA, and checks: read."
       exit 1
@@ -88,6 +88,10 @@ wait_for_coderabbit_status() {
         case "$check_conclusion" in
           success|neutral)
             return 0
+            ;;
+          skipped)
+            echo "::error::CodeRabbit check run was skipped: $check_description"
+            exit 1
             ;;
           *)
             echo "::error::CodeRabbit check run concluded $check_conclusion: $check_description"
