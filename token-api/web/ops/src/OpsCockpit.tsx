@@ -795,7 +795,6 @@ function Dial({
       // Override hooks. dismiss-phone is LIVE; the others still land on the
       // drawer (no timer/enforce mutation is wired this phase — no fake success).
       case 'toggle-timer':
-        console.log('[dial] toggle-timer — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       case 'dismiss-phone':
@@ -807,7 +806,6 @@ function Dial({
         );
         break;
       case 'ack-enforce':
-        console.log('[dial] ack-enforce — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       default:

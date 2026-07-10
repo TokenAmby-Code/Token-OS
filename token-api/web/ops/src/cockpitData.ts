@@ -12,7 +12,7 @@
 // mesh) render an explicit '—' placeholder dial — never a frozen fake value.
 // ─────────────────────────────────────────────────────────────────────────
 
-import type { OpsSourceHealth, OpsState, PipelineDoc, TimerHistory, TimerMode } from './contracts';
+import type { OpsSourceHealth, OpsState, PipelineDoc, TimerHistory, TimerMode, TmuxOccupancyCell } from './contracts';
 import type { CompassStar } from './compass';
 
 export type CockpitMode = 'working' | 'multitasking' | 'distracted' | 'break' | 'idle';
@@ -279,7 +279,7 @@ function tmuxDial(s: OpsState): DialModel {
 
 const COMPASS_DIRECTIONS = new Set(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']);
 
-function paneCompassStar(cell: { pane_positional_id?: string | null; state?: string | null }): CompassStar | null {
+function paneCompassStar(cell: Pick<TmuxOccupancyCell, 'pane_positional_id' | 'state'>): CompassStar | null {
   // Stable pane roles arrive as palace:N / somnium:NE. Some tmuxctld views can
   // expose the equivalent numeric window positions, where 1 is palace and 2 is
   // somnium. The compass reducer already handles coalescing and red+blue=purple;

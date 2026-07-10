@@ -22291,7 +22291,9 @@ def _ops_tmux_cell_state(row: dict, free_ids: set[str]) -> str:
     return "unknown" if pane_ref else "drift"
 
 
-def _ops_normalize_tmux_payload(payload, surface: str, errors: list[str]):
+def _ops_normalize_tmux_payload(
+    payload: dict | list | Exception, surface: str, errors: list[str]
+) -> dict | list:
     if isinstance(payload, Exception):
         errors.append(f"tmuxctld {surface} unavailable: {payload}")
         return []
@@ -22556,11 +22558,11 @@ async def _ops_collect_facts(now: datetime) -> dict:
 
     tmux_occupancy_status = (tmux_health.get("occupancy") or {}).get("status")
     sources["tmuxctld"] = _ops_source_health(
-        "warn"
-        if tmux_health.get("reachable") and tmux_occupancy_status in {"warn", "bad"}
-        else "ok"
-        if tmux_health.get("reachable")
-        else "warn",
+        "bad"
+        if not tmux_health.get("reachable") or tmux_occupancy_status == "bad"
+        else "warn"
+        if tmux_occupancy_status == "warn"
+        else "ok",
         available=bool(tmux_health.get("reachable")),
         message="tmuxctld occupancy degraded"
         if tmux_health.get("reachable") and tmux_occupancy_status in {"warn", "bad"}

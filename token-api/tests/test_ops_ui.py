@@ -659,7 +659,7 @@ def test_ops_status_tmuxctld_health_unavailable_degrades_without_crash(client) -
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["sources"]["tmuxctld"]["status"] == "warn"
+    assert body["sources"]["tmuxctld"]["status"] == "bad"
     assert body["sources"]["tmuxctld"]["available"] is False
     assert body["tmux"]["reachable"] is False
     assert body["tmux"]["tmux_reachable"] is None
@@ -1419,4 +1419,4 @@ def test_ops_state_tmux_occupancy_unavailable(client, app_env, monkeypatch) -> N
     body = client.get("/api/ui/ops/state").json()
     assert body["tmux"]["occupancy"]["status"] == "bad"
     assert body["tmux"]["occupancy"]["errors"] == ["boom"]
-    assert body["sources"]["tmuxctld"]["status"] == "warn"
+    assert body["sources"]["tmuxctld"]["status"] == "bad"
