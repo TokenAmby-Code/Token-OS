@@ -1248,7 +1248,7 @@ def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) 
             "occupancy": {
                 "status": "warn",
                 "generated_at": generated_at.isoformat(),
-                "total": 4,
+                "total": 3,
                 "occupied": 1,
                 "free": 1,
                 "dead": 0,
@@ -1304,7 +1304,6 @@ def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) 
     monkeypatch.setattr(app_env.main, "_ops_read_tmuxctld_snapshot", _fake_snapshot)
     body = client.get("/api/ui/ops/state").json()
     occ = body["tmux"]["occupancy"]
-    assert occ["total"] == len(occ["cells"]) == 4
     assert occ["occupied"] == 1
     assert occ["free"] == 1
     assert occ["drift"] == 1

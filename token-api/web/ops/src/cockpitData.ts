@@ -278,6 +278,7 @@ function tmuxDial(s: OpsState): DialModel {
 }
 
 const COMPASS_DIRECTIONS = new Set(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']);
+export const OCCUPANCY_COMPASS_FALLBACK_STARS: CompassStar[] = [{ dir: 'N', color: 'red' }];
 
 function paneCompassStar(cell: { pane_positional_id?: string | null; state?: string | null }): CompassStar | null {
   // Stable pane roles arrive as palace:N / somnium:NE. Some tmuxctld views can
@@ -296,7 +297,7 @@ function paneCompassStar(cell: { pane_positional_id?: string | null; state?: str
 
 export function occupancyCompassStars(s: OpsState): CompassStar[] {
   const occ = s.tmux?.occupancy;
-  if (!occ || s.tmux?.reachable !== true || occ.status === 'bad') return [{ dir: 'N', color: 'red' }];
+  if (!occ || s.tmux?.reachable !== true || occ.status === 'bad') return OCCUPANCY_COMPASS_FALLBACK_STARS;
   const stars = (occ.cells ?? []).map(paneCompassStar).filter((star): star is CompassStar => star != null);
   return stars.length ? stars : [{ dir: 'S', color: 'red' }];
 }

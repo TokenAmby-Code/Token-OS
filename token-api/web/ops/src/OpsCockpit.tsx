@@ -3,6 +3,7 @@ import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   balanceMinutes,
   buildDials,
+  OCCUPANCY_COMPASS_FALLBACK_STARS,
   occupancyCompassStars,
   mapMode,
   nowClock,
@@ -4138,7 +4139,7 @@ export function OpsCockpit() {
       segments: h ? toModeSegments(h) : [],
       nowPoint,
       dials: s ? buildDials(s) : [],
-      compassStars: s ? occupancyCompassStars(s) : [{ dir: 'N', color: 'red' }],
+      compassStars: s ? occupancyCompassStars(s) : OCCUPANCY_COMPASS_FALLBACK_STARS,
       ttsQueue: s ? toTtsQueue(s) : [],
       fleetQueues: s
         ? toFleetQueues(s)
