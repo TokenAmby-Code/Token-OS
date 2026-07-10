@@ -733,9 +733,10 @@ printf 'rc=%s\\n' "$rc"
     )
 
     assert "rc=1" in result.stdout
-    assert "No new review comments found before the explicit timeout." in result.stderr
+    assert "cr_wait_exceeded" in result.stderr
+    assert "Check manually" not in result.stderr
     call_lines = calls.read_text().splitlines()
-    assert sum(1 for line in call_lines if line.startswith("pr comment 7")) == 1
+    assert sum(1 for line in call_lines if line.startswith("pr comment 7")) == 3
 
 
 def test_mark_instance_status_reviewing_sends_workflow_payload(tmp_path: Path) -> None:
@@ -874,10 +875,11 @@ main --no-merge
     assert hooks[0]["subscriber_instance_id"] == "inst-123"
     assert hooks[0]["target_pane"] == "%ledger"
     assert hooks[0]["subscriber_pane"] == "%ledger"
-    assert hooks[0]["payload"] == (
+    assert hooks[0]["payload"].startswith(
         "/plan PR #17 review returned "
         "(https://github.com/owner/repo/pull/17); plan fixes or next review action."
     )
+    assert "CodeRabbit verdict:" in hooks[0]["payload"]
 
 
 def test_merge_completion_does_not_arm_terminal_plan_followup(tmp_path: Path) -> None:
@@ -1025,10 +1027,11 @@ arm_pr_plan_followup review 17 https://github.com/owner/repo/pull/17 "plan fixes
     hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
     assert len(hooks) == 1
     assert hooks[0]["target_pane"] == "%ledger"
-    assert hooks[0]["payload"] == (
+    assert hooks[0]["payload"].startswith(
         "/plan PR #17 review returned "
         "(https://github.com/owner/repo/pull/17); plan fixes or next review action."
     )
+    assert "CodeRabbit verdict:" in hooks[0]["payload"]
 
 
 def test_findings_summary_filters_to_current_head_and_marks_historical(tmp_path: Path) -> None:
@@ -1064,3 +1067,89 @@ fi
     assert "current head finding" in result.stdout
     assert ".worktree.env" not in result.stdout
     assert "historical/resolved CodeRabbit findings omitted: 1" in result.stdout
+
+
+def test_plan_followup_payload_embeds_coderabbit_context(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    fake_bin, curl_log = install_fake_curl(tmp_path)
+
+    bash_with_pr_step(
+        """
+repo_slug() { echo owner/repo; }
+pr_head_sha() { echo headsha123456; }
+coderabbit_state_for_head() { echo success; }
+latest_coderabbit_review_state() { echo CHANGES_REQUESTED; }
+changes_requested_count() { echo 1; }
+checks_summary() { echo "  - unit / pytest: passing"; }
+summarize_actionable_findings() { echo "  - cli-tools/bin/pr-step:42 — missing CR context"; }
+arm_pr_plan_followup review 17 https://github.com/owner/repo/pull/17 "plan fixes or next review action."
+""",
+        repo,
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CURL_LOG": str(curl_log),
+            "CURL_LEDGER_JSON": ledger_json("inst-123", "%ledger"),
+            "TOKEN_API_WRAPPER_ID": "wrap-123",
+        },
+    )
+
+    payload = curl_json_bodies(curl_log, "/api/hooks/subscribe")[0]["payload"]
+    assert (
+        "CodeRabbit verdict: commit=success; review=CHANGES_REQUESTED; changes_requested=1"
+        in payload
+    )
+    assert "Checks:" in payload
+    assert "unit / pytest: passing" in payload
+    assert "Actionable CodeRabbit findings:" in payload
+    assert "cli-tools/bin/pr-step:42" in payload
+
+
+def test_review_timeout_rerequests_coderabbit_without_agent_visible_bounce(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+rerequests=0
+coderabbit_rerequest_review() { rerequests=$((rerequests + 1)); printf 'body:%s\n' "$2"; return 0; }
+TIMEOUT_REREQUESTS_DONE=0
+if coderabbit_maybe_rerequest_on_timeout 17 TIMEOUT_REREQUESTS_DONE 1; then
+  printf 'first=yes done=%s rerequests=%s\n' "$TIMEOUT_REREQUESTS_DONE" "$rerequests"
+fi
+if ! coderabbit_maybe_rerequest_on_timeout 17 TIMEOUT_REREQUESTS_DONE 1; then
+  printf 'second=no done=%s rerequests=%s\n' "$TIMEOUT_REREQUESTS_DONE" "$rerequests"
+fi
+""",
+        repo,
+    )
+
+    assert "first=yes done=1 rerequests=1" in result.stdout
+    assert "second=no done=1 rerequests=1" in result.stdout
+    assert "timed out with no fresh verdict; re-requesting" in result.stdout
+    assert "Check manually" not in result.stdout
+    assert "Possible reasons" not in result.stdout
+
+
+def test_fresh_current_head_verdict_skips_rerequest(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+current_pr_number() { echo 17; }
+current_pr_state() { echo OPEN; }
+current_pr_url() { echo https://github.com/owner/repo/pull/17; }
+assert_repo() { :; }
+mark_instance_status() { :; }
+mark_pr_flag() { :; }
+commit_if_needed() { return 1; }
+push_branch() { :; }
+checks_green() { return 0; }
+review_pr_normal() { echo unexpected-rerequest; return 99; }
+summarize_pr() { :; }
+merge_pr_normal() { :; }
+main --no-merge
+""",
+        repo,
+    )
+
+    assert "unexpected-rerequest" not in result.stdout
+    assert "already green; skipping re-review" in result.stderr + result.stdout

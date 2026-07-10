@@ -321,8 +321,25 @@ mark_pr_flag() {
         "${api%/}/api/instances/${iid}/pr" >/dev/null 2>&1 || true
 }
 
+pr_plan_followup_context() {
+    local pr="$1" head short cr review changes findings checks
+    head="$(pr_head_sha "$pr" 2>/dev/null || true)"
+    short="${head:0:7}"
+    cr="$(coderabbit_state_for_head "$head" 2>/dev/null || true)"
+    review="$(latest_coderabbit_review_state "$pr" 2>/dev/null || true)"
+    changes="$(changes_requested_count "$pr" 2>/dev/null || true)"
+    checks="$(checks_summary "$pr" 2>/dev/null || true)"
+    findings="$(summarize_actionable_findings "$pr" "$head" 2>/dev/null || true)"
+
+    printf 'CodeRabbit verdict: commit=%s; review=%s; changes_requested=%s; head=%s\n' "${cr:-none}" "${review:-none}" "${changes:-unknown}" "${short:-unknown}"
+    printf 'Checks:\n'
+    if [[ -n "$checks" ]]; then printf '%s\n' "$checks"; else printf '  - none reported\n'; fi
+    printf 'Actionable CodeRabbit findings:\n'
+    if [[ -n "$findings" ]]; then printf '%s\n' "$findings"; else printf '  - none found on current head\n'; fi
+}
+
 arm_pr_plan_followup() {
-    local stage="$1" pr="$2" url="${3:-}" summary="${4:-}" pane iid api prompt body
+    local stage="$1" pr="$2" url="${3:-}" summary="${4:-}" pane iid api prompt body context
     pane="$(pr_step_resolve_pane)"
     [[ -n "$pane" ]] || return 0
     iid="$(pr_step_resolve_instance_id || true)"
@@ -332,7 +349,9 @@ arm_pr_plan_followup() {
             [[ -n "$summary" ]] || summary="plan fixes or next review action."
             prompt="/plan PR #${pr} review returned"
             [[ -n "$url" ]] && prompt+=" (${url})"
+            context="$(pr_plan_followup_context "$pr" 2>/dev/null || true)"
             prompt+="; ${summary}"
+            [[ -n "$context" ]] && prompt+=$'\n\n'"${context}"
             ;;
         merge)
             [[ -n "$summary" ]] || summary="summarize closure and update context."
@@ -629,7 +648,6 @@ sleep_until_rate_limit_reset() {
         [[ "$now" =~ ^[0-9]+$ ]] || return 1
         (( now >= reset_epoch )) && return 0
         wait_for=$(( reset_epoch - now ))
-        emit_coderabbit_heartbeat "${label}: waiting ${wait_for}s until reset signal clears"
         sleep "$wait_for"
     done
 }
@@ -733,6 +751,18 @@ coderabbit_rerequest_review() {
 @coderabbitai full review" >/dev/null 2>&1
 }
 
+coderabbit_maybe_rerequest_on_timeout() {
+    local pr="$1" done_var="$2" max="${3:-${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}}" done
+    [[ "$max" =~ ^[0-9]+$ ]] || return 1
+    eval "done=\${${done_var}:-0}"
+    [[ "$done" =~ ^[0-9]+$ ]] || done=0
+    (( done < max )) || return 1
+    done=$((done + 1))
+    coderabbit_rerequest_review "$pr" "CodeRabbit review timed out with no fresh verdict; re-requesting the full review (attempt ${done}/${max})." || return 2
+    printf -v "$done_var" '%s' "$done"
+    return 0
+}
+
 coderabbit_handle_ratelimit_comment() {
     local pr="$1" body="${2:-}" stamp="${3:-}" signature reset padded_reset
     coderabbit_body_is_ratelimit "$body" || return 1
@@ -743,18 +773,16 @@ coderabbit_handle_ratelimit_comment() {
     reset="$(coderabbit_ratelimit_reset_epoch_at "$body" "$stamp")"
     if [[ "$reset" =~ ^[0-9]+$ ]]; then
         padded_reset="$(rate_limit_reset_epoch_with_review_padding "$reset")"
-        warn "CodeRabbit rate-limited the review request; waiting until reset + 60s before re-requesting."
         sleep_until_rate_limit_reset "$padded_reset" "CodeRabbit rate limit"
         if rate_limit_reset_reached "$padded_reset"; then
             coderabbit_rerequest_review "$pr" "CodeRabbit rate limit reset + 60s reached; re-requesting the full review." || {
                 error "Failed to re-request CodeRabbit review after rate-limit reset"
                 exit 1
             }
-            log "Re-requested CodeRabbit review after rate-limit reset + 60s."
             return 0
         fi
     else
-        warn "CodeRabbit rate-limit response did not include a reset signal; continuing the normal gate wait without a blind retry."
+        :
     fi
     return 1
 }
@@ -1887,6 +1915,10 @@ BASELINE_OVERVIEW_TIMESTAMP=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments
     jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].updated_at // ""')
 BASELINE_REVIEW_TIMESTAMP=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null | \
     jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.submitted_at) | .[-1].submitted_at // ""')
+CURRENT_REVIEW_COMMENTS="$BASELINE_REVIEW_COMMENTS"
+CURRENT_ISSUE_COMMENTS="$BASELINE_ISSUE_COMMENTS"
+CURRENT_OVERVIEW_TIMESTAMP="$BASELINE_OVERVIEW_TIMESTAMP"
+CURRENT_REVIEW_TIMESTAMP="$BASELINE_REVIEW_TIMESTAMP"
 
 # Capture the head SHA so we can check the coderabbit commit status against it.
 HEAD_SHA=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
@@ -1928,12 +1960,22 @@ FOUND_OVERVIEW=false
 OVERVIEW_UPDATED=false
 REVIEW_VERDICT_FOUND=false
 LAST_RATELIMIT_SIGNATURE=""
+TIMEOUT_REREQUESTS_DONE=0
+TIMEOUT_REREQUESTS_MAX="${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}"
 
 while true; do
     ELAPSED=$(($(date +%s) - START_TIME))
 
     if wait_timed_out "$ELAPSED" "$MAX_WAIT_TIME"; then
-        warn "Explicit timeout reached (${TIMEOUT_MINS} minutes)."
+        if [[ "$READ_ONLY" == "false" ]] && coderabbit_maybe_rerequest_on_timeout "$PR_NUMBER" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
+            START_TIME=$(date +%s)
+            BASELINE_REVIEW_COMMENTS="$CURRENT_REVIEW_COMMENTS"
+            BASELINE_ISSUE_COMMENTS="$CURRENT_ISSUE_COMMENTS"
+            BASELINE_OVERVIEW_TIMESTAMP="$CURRENT_OVERVIEW_TIMESTAMP"
+            BASELINE_REVIEW_TIMESTAMP="$CURRENT_REVIEW_TIMESTAMP"
+            continue
+        fi
+        warn "cr_wait_exceeded: CodeRabbit review timed out after ${TIMEOUT_MINS} minutes and bounded re-request attempts were exhausted."
         break
     fi
 
@@ -2041,14 +2083,7 @@ done
 # Step 4: Fetch and output the results
 if [[ "$FOUND_OVERVIEW" == "false" ]] && [[ "$REVIEW_VERDICT_FOUND" == "false" ]] && \
    [[ $NEW_INLINE_COUNT -eq 0 ]] && [[ $NEW_OVERVIEW_COUNT -eq 0 ]]; then
-    warn "No new review comments found before the explicit timeout."
-    echo ""
-    echo "Possible reasons:"
-    echo "  - CodeRabbit is still processing"
-    echo "  - No new issues found"
-    echo "  - CodeRabbit App not installed for this repo"
-    echo ""
-    echo "Check manually: https://github.com/${REPO}/pull/${PR_NUMBER}"
+    warn "cr_wait_exceeded: no fresh CodeRabbit verdict or review comments after bounded wait/re-request policy; PR=https://github.com/${REPO}/pull/${PR_NUMBER}"
     exit 1
 fi
 
