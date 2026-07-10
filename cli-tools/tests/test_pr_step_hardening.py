@@ -1173,6 +1173,30 @@ fi
     assert "waited=1140 rerequested=1" in result.stdout
 
 
+def test_rate_limit_reset_rerequest_consumes_retry_budget(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+rerequested=0
+LAST_RATELIMIT_SIGNATURE=""
+sleep_until_rate_limit_reset() { return 0; }
+rate_limit_reset_reached() { return 0; }
+coderabbit_rerequest_review() { rerequested=$((rerequested + 1)); return 0; }
+done_count=0
+body_one='Review limit reached. Your next review will be available in 1 second.'
+body_two='Review limit reached. Your next review will be available in 2 seconds.'
+coderabbit_handle_ratelimit_comment 17 "$body_one" '1970-01-01T00:00:00Z' done_count 1
+if ! coderabbit_handle_ratelimit_comment 17 "$body_two" '1970-01-01T00:00:01Z' done_count 1; then
+  printf 'blocked done=%s rerequested=%s\\n' "$done_count" "$rerequested"
+fi
+""",
+        repo,
+    )
+
+    assert "blocked done=1 rerequested=1" in result.stdout
+
+
 def test_coderabbit_heartbeat_is_opaque_when_requested(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     heartbeat = tmp_path / "heartbeat.log"
@@ -1254,6 +1278,10 @@ def test_latest_coderabbit_issue_comment_helpers_paginate(tmp_path: Path) -> Non
 repo_slug() { echo owner/repo; }
 gh() {
   if [[ "$*" == *"issues/17/comments"* ]]; then
+    [[ " $* " == *" --paginate "* ]] || {
+      printf '%s\n' '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z","body":"old"}]'
+      return 0
+    }
     cat <<'JSON'
 [{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z","body":"old"}]
 [{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-07-10T01:00:00Z","updated_at":"2026-07-10T01:30:00Z","body":"new"}]

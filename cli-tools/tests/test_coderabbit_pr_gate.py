@@ -17,6 +17,9 @@ set -euo pipefail
 args="$*"
 if [[ "$args" == *"commits/head-sha/status"* ]]; then
   # GitHub's combined status endpoint can be empty when CodeRabbit reports as a check run.
+  if [[ "${FAKE_CR_STATUS_STATE:-}" != "" ]]; then
+    printf '%s\t%s\t%s\t%s\n' 'CodeRabbit' "$FAKE_CR_STATUS_STATE" "${FAKE_CR_STATUS_DESCRIPTION:-ok}" '2026-07-10T00:00:00Z'
+  fi
   exit 0
 fi
 if [[ "$args" == *"commits/head-sha/check-runs"* ]]; then
@@ -95,6 +98,38 @@ def test_coderabbit_gate_rejects_skipped_check_run(tmp_path: Path) -> None:
     )
 
     assert result.returncode != 0
+    assert "CodeRabbit check run was skipped" in result.stdout
+
+
+def test_coderabbit_gate_check_run_overrides_successful_status_when_skipped(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_fake_gh(bin_dir)
+    script = tmp_path / "coderabbit-pr-gate.sh"
+    shutil.copy2(SCRIPT, script)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "GH_TOKEN": "token",
+            "REPO": "owner/repo",
+            "PR_NUMBER": "17",
+            "SHA": "head-sha",
+            "CODERABBIT_GATE_TIMEOUT_SECONDS": "1",
+            "CODERABBIT_GATE_POLL_INTERVAL_SECONDS": "1",
+            "FAKE_CR_STATUS_STATE": "success",
+            "FAKE_CR_CHECK_CONCLUSION": "skipped",
+            "FAKE_CR_CHECK_SUMMARY": "Result: Skipped - disabled by policy",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(script)], env=env, text=True, capture_output=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert "CodeRabbit status: context=CodeRabbit state=success" in result.stdout
     assert "CodeRabbit check run was skipped" in result.stdout
 
 

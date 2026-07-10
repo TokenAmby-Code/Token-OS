@@ -61,10 +61,11 @@ evaluate_coderabbit_signal() {
 }
 
 wait_for_coderabbit_status() {
-  local deadline line context state description updated_at check_line check_name check_status check_conclusion check_description check_url
+  local deadline line context state description updated_at check_line check_name check_status check_conclusion check_description check_url status_passed
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while true; do
+    status_passed=false
     if ! line="$(gh api --paginate --method GET "repos/$REPO/commits/$SHA/status" \
       --jq '[.statuses[]? | select((((.context // "") | ascii_downcase) | startswith("coderabbit")))] | sort_by(.updated_at // .created_at) | if length == 0 then empty else last | [.context, .state, (.description // ""), (.updated_at // .created_at // "")] | @tsv end')"; then
       echo "::error::Failed to query CodeRabbit commit status for $SHA. Check GH_TOKEN, REPO, SHA, and statuses: read."
@@ -75,7 +76,9 @@ wait_for_coderabbit_status() {
       IFS=$'\t' read -r context state description updated_at <<< "$line"
       echo "CodeRabbit status: context=$context state=$state updated_at=$updated_at description=$description"
 
-      evaluate_coderabbit_signal "$description" "$state" "status" && return 0
+      if evaluate_coderabbit_signal "$description" "$state" "status"; then
+        status_passed=true
+      fi
     fi
 
     if ! check_line="$(gh api --paginate --method GET "repos/$REPO/commits/$SHA/check-runs" \
@@ -93,6 +96,8 @@ wait_for_coderabbit_status() {
       else
         evaluate_coderabbit_signal "$check_description" "$check_conclusion" "check run" && return 0
       fi
+    elif [[ "$status_passed" == "true" ]]; then
+      return 0
     fi
 
     if [[ "$SECONDS" -ge "$deadline" ]]; then
