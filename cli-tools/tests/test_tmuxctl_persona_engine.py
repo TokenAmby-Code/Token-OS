@@ -55,15 +55,8 @@ def test_rotate_persona_engine_toggles_fg_to_codex() -> None:
     assert launched[0][0] == "%42"
     assert launched[0][1].persona == "fabricator-general"
     assert launched[0][1].engine == "codex"
-    assert ("set-option", "-p", "-t", "%42", "window-style", "bg=#300808") in adapter.commands
-    assert (
-        "set-option",
-        "-p",
-        "-t",
-        "%42",
-        "window-active-style",
-        "bg=#300808",
-    ) in adapter.commands
+    assert ("set-option", "-pu", "-t", "%42", "window-style") in adapter.commands
+    assert ("set-option", "-pu", "-t", "%42", "window-active-style") in adapter.commands
 
 
 def test_rotate_persona_engine_refuses_non_persona_pane() -> None:

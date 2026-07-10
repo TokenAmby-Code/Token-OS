@@ -1036,53 +1036,36 @@ def _set_pane_tint(adapter: TmuxAdapter, pane_id: str, bg: str) -> None:
     adapter.run("set-option", "-p", "-t", pane_id, "window-active-style", style, allow_failure=True)
 
 
-# Persona → pane background tint. Only the two seats with a distinct chrome
-# carry a non-default tint; every other persona seat stays at the tmux default.
-# Shared by the focus-gated reconcile painter (_assert_persona_color) and the
-# birth-time wrapperstart painter (apply_persona_pane_tint) so the colors never
-# drift between the two paths.
-PERSONA_TINTS = {
-    "custodes": "#302800",
-    "fabricator-general": "#300808",
-}
-
-
+# Pane tint belongs to token-api after registry commit because the persona table
+# is the sole color source of truth. tmuxctld assertion/reconcile code must never
+# hardcode or infer colors; if it cannot prove a committed persona-table color, it
+# clears stale tint and leaves the lost-registration-anchor signal loud.
 def _assert_persona_color(adapter: TmuxAdapter, pane_id: str, spec: PersonaSpec) -> None:
+    del spec
     current = adapter.run(
         "display-message", "-t", pane_id, "-p", "#{pane_id}", allow_failure=True
     ).strip()
     if current != pane_id:
         return
-    bg = PERSONA_TINTS.get(spec.persona)
-    if bg:
-        _set_pane_tint(adapter, pane_id, bg)
+    _set_pane_tint(adapter, pane_id, "default")
 
 
 def apply_persona_pane_tint(
     adapter: TmuxAdapter, pane_id: str, pane_label: str | None
 ) -> str | None:
-    """Paint a singleton seat's persona tint from its durable ``@PANE_ID`` label.
+    """Legacy compatibility shim: fail dark; do not tint from label-only state."""
+    del pane_label
+    _set_pane_tint(adapter, pane_id, "default")
+    return None
 
-    Unlike :func:`_assert_persona_color` (focus-gated, used in the per-tick
-    reconcile loop), this paints the target pane unconditionally so the seat
-    carries its tint whether or not it is the active pane. Crucially the color
-    derives from the stable pane label, NOT from ``@INSTANCE_ID`` — so a seat is
-    tinted at wrapper birth even before its instance registers (the empty-stamp →
-    no-tint root). Returns the applied background, or ``None`` when the label is
-    not a tinted persona seat.
-    """
-    label = (pane_label or "").strip()
-    if label not in PERSONA_LABELS:
-        return None
-    try:
-        spec = persona_spec(label)
-    except ValueError:
-        return None
-    bg = PERSONA_TINTS.get(spec.persona)
-    if not bg:
-        return None
-    _set_pane_tint(adapter, pane_id, bg)
-    return bg
+
+def apply_bound_persona_pane_tint(
+    adapter: TmuxAdapter, pane_id: str, pane_label: str | None, persona: str | None
+) -> str | None:
+    """Legacy compatibility shim: fail dark; colors come only from personas table."""
+    del pane_label, persona
+    _set_pane_tint(adapter, pane_id, "default")
+    return None
 
 
 def _clear_pane_overlay(adapter: TmuxAdapter, pane_id: str) -> None:
@@ -1173,6 +1156,33 @@ def _row_matches_persona(row, spec: PersonaSpec) -> bool:
     # Fallback for any other persona pane: stable pane_label plus persona-derived
     # tab name.
     return row.pane_label == spec.pane_label and spec.persona in tab
+
+
+def _stopped_row_matches_persona_identity(row, spec: PersonaSpec) -> bool:
+    """Match a stopped singleton row when its pane binding columns were cleared.
+
+    The normal persona predicate deliberately requires the pane label for legacy
+    rows. Specimen 6 lost both the live @INSTANCE_ID stamp and stored pane
+    columns, leaving only persona identity in the stopped registry row. This
+    helper is used only after live-pane/stamp/pane-label lookup fails, and only
+    for STOPPED rows, so it cannot steal an active row from a different pane.
+    """
+    if row is None:
+        return False
+    if _row_matches_persona(row, spec):
+        return True
+    slug = (getattr(row, "persona_slug", "") or "").strip().lower()
+    if slug:
+        # Slug identity was already decided by _row_matches_persona above.
+        return False
+    tab = (getattr(row, "tab_name", "") or "").lower()
+    if spec.persona == "fabricator-general":
+        return getattr(row, "legion", "") == "fabricator" or spec.persona in tab
+    if spec.persona == "custodes":
+        return getattr(row, "legion", "") == "custodes" or spec.persona in tab
+    if spec.persona in {"administratum", "malcador", "pax", "orchestrator"}:
+        return getattr(row, "primarch", "") == spec.persona or spec.persona in tab
+    return spec.persona in tab
 
 
 def _row_age_seconds(created_at: str) -> float | None:
@@ -1461,13 +1471,38 @@ def _assert_instance_impl(
             result.update({"ok": False, "action": action, "reason": reason})
             return finish(result, clear_failed=False)
         if row is None:
-            stopped_rows = _registry_entries(pane_id, pane_label, include_stopped=True)
+            # A split-brain persona row may have lost both the live pane stamp and
+            # all stored pane-label columns (the exact specimen-6 state: live
+            # persona-labeled pane, empty @INSTANCE_ID, stopped row with no
+            # pane_label/tmux_pane).  In that state _registry_entries cannot
+            # key by stamp/pane, so fall back to persona identity for stopped
+            # singleton rows only. Active rows still require pane/stamp binding
+            # above to avoid stealing a live row from another pane.
+            try:
+                stopped_rows = _registry_entries(pane_id, pane_label, include_stopped=True)
+                if not stopped_rows:
+                    stopped_rows = [
+                        candidate
+                        for candidate in fetch_instance_registry().instances
+                        if candidate.status is InstanceStatus.STOPPED
+                        and _stopped_row_matches_persona_identity(candidate, spec)
+                    ]
+                    stopped_rows.sort(key=lambda r: r.last_activity, reverse=True)
+            except Exception as exc:  # noqa: BLE001 — pane-death reconciliation must degrade
+                result.update(
+                    {
+                        "ok": bool(runtime_ok),
+                        "action": "registry_unavailable",
+                        "reason": f"registry_unavailable:{exc}",
+                    }
+                )
+                return finish(result, clear_failed=False)
             stopped_match = next(
                 (
                     candidate
                     for candidate in stopped_rows
                     if candidate.status is InstanceStatus.STOPPED
-                    and _row_matches_persona(candidate, spec)
+                    and _stopped_row_matches_persona_identity(candidate, spec)
                 ),
                 None,
             )

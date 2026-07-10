@@ -124,7 +124,7 @@ def test_codex_default_is_fg_scoped_other_singletons_stay_claude() -> None:
     assert persona_spec("mechanicus:orchestrator").engine == "claude"
 
 
-def test_persona_tint_reassert_ignores_stale_voice_lock() -> None:
+def test_persona_tint_reassert_fails_dark_without_persona_table_color() -> None:
     adapter = FakeAdapter()
     adapter.options["@DISCORD_VOICE_LOCK"] = "1"
     original_run = adapter.run
@@ -138,19 +138,19 @@ def test_persona_tint_reassert_ignores_stale_voice_lock() -> None:
 
     _assert_persona_color(adapter, "%25", _custodes_spec())
 
-    assert adapter.options["window-style"] == "bg=#302800"
-    assert adapter.options["window-active-style"] == "bg=#302800"
+    assert adapter.options.get("window-style", "") == ""
+    assert adapter.options.get("window-active-style", "") == ""
 
 
-def test_wrapperstart_persona_tint_ignores_stale_voice_lock() -> None:
+def test_wrapperstart_persona_tint_fails_dark_label_only() -> None:
     adapter = FakeAdapter()
     adapter.options["@DISCORD_VOICE_LOCK"] = "1"
 
     tint = apply_persona_pane_tint(adapter, "%25", "council:custodes")
 
-    assert tint == "#302800"
-    assert adapter.options["window-style"] == "bg=#302800"
-    assert adapter.options["window-active-style"] == "bg=#302800"
+    assert tint is None
+    assert adapter.options.get("window-style", "") == ""
+    assert adapter.options.get("window-active-style", "") == ""
 
 
 def test_fg_seat_command_launches_codex() -> None:
@@ -1124,6 +1124,80 @@ def test_live_persona_empty_stamp_stopped_row_reasserts_binding():
     assert adapter.options["@INSTANCE_ID"] == "i-fg"
     activity.assert_called_once_with("i-fg", "prompt_submit")
     upsert.assert_called_once()
+    assert upsert.call_args.kwargs["pane_positional_id"] == FG_LABEL
+    assert upsert.call_args.kwargs["instance_id"] == "i-fg"
+    log.assert_any_call("persona_binding_reasserted", instance_id="i-fg", details=ANY)
+
+
+def test_live_persona_stopped_row_fallback_degrades_on_registry_error():
+    adapter = FakeAdapter()
+    adapter.options.update(
+        {
+            "@PANE_ID": FG_LABEL,
+            "@PANE_TYPE": "mechanicus",
+            "@TOKEN_API_WRAPPER_ID": "wrap-fg",
+            "@TOKEN_API_ENGINE": "codex",
+            "@TOKEN_API_CWD": "/Volumes/Imperium/Imperium-ENV",
+            "@INSTANCE_ID": "",
+        }
+    )
+    resolved = SimpleNamespace(pane_id="%fg", pane_role=FG_LABEL)
+
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="mechanicus"),
+        patch.object(assertions, "_pane_dead", return_value=False),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "_registry_entries", side_effect=[[], RuntimeError("api down")]),
+    ):
+        result = assertions.assert_instance(adapter, FG_LABEL)
+
+    assert result["ok"] is True
+    assert result["action"] == "registry_unavailable"
+    assert result["reason"] == "registry_unavailable:api down"
+
+
+def test_live_persona_empty_stamp_stopped_row_without_pane_columns_reasserts_binding():
+    adapter = FakeAdapter()
+    adapter.options.update(
+        {
+            "@PANE_ID": FG_LABEL,
+            "@PANE_TYPE": "mechanicus",
+            "@TOKEN_API_WRAPPER_ID": "wrap-fg",
+            "@TOKEN_API_ENGINE": "codex",
+            "@TOKEN_API_CWD": "/Volumes/Imperium/Imperium-ENV",
+            "@INSTANCE_ID": "",
+        }
+    )
+    stopped = _row(
+        instance_id="i-fg",
+        status=assertions.InstanceStatus.STOPPED,
+        pane_label="",
+        tmux_pane="",
+        last_activity="2026-07-09T10:00:00",
+    )
+    registry = SimpleNamespace(instances=[stopped])
+    resolved = SimpleNamespace(pane_id="%fg", pane_role=FG_LABEL)
+
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="mechanicus"),
+        patch.object(assertions, "_pane_dead", return_value=False),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "_registry_entries", return_value=[]),
+        patch.object(assertions, "fetch_instance_registry", return_value=registry),
+        patch.object(assertions, "update_instance_activity") as activity,
+        patch.object(assertions, "log_event") as log,
+        patch("tmuxctl.wrapper_ledger.LEDGER.upsert") as upsert,
+    ):
+        upsert.return_value.as_dict.return_value = {"wrapper_id": "wrap-fg", "instance_id": "i-fg"}
+        result = assertions.assert_instance(adapter, FG_LABEL)
+
+    assert result["ok"] is True
+    assert result["action"] == "binding_reasserted"
+    assert result["reason"] == "live_runtime_stopped_registry_row_rebound"
+    assert adapter.options["@INSTANCE_ID"] == "i-fg"
+    activity.assert_called_once_with("i-fg", "prompt_submit")
     assert upsert.call_args.kwargs["pane_positional_id"] == FG_LABEL
     assert upsert.call_args.kwargs["instance_id"] == "i-fg"
     log.assert_any_call("persona_binding_reasserted", instance_id="i-fg", details=ANY)

@@ -2940,7 +2940,12 @@ def _h_reconcile(control, params):
     ledger = control.ledger_reconcile()
     results = control.reconcile_personas(session=_s(params, "session", "main"))
     errored = [r for r in results if isinstance(r, dict) and (r.get("ok") is False or r.get("error"))]
-    if results and len(errored) == len(results):
+    # `/reconcile` also owns wrapper-ledger recovery. Do not discard a successful
+    # ledger repair just because the persona/reservist sweep is degraded in the
+    # same call; return a loud degraded result instead. If the whole reconcile has
+    # no repaired/open ledger evidence and every persona target errored, preserve
+    # the old fail-loud behavior.
+    if results and len(errored) == len(results) and not ledger.get("open_rows"):
         raise ValueError("reconcile degraded: every target row errored")
     return {
         "status": "degraded" if errored else "ok",
@@ -3306,17 +3311,13 @@ def _h_hook_wrapperstart(control, params):
     1. Stamps the wrapper-ownership id (``@TOKEN_API_WRAPPER_LAUNCH_ID``) so the
        later WrapperEnd can always find + clear its own pane, even if the wrapper's
        local stamp never landed.
-    2. Derives the persona from the pane's durable ``@PANE_ID`` label and paints
-       its tint immediately. This binds from the LABEL, not from ``@INSTANCE_ID``,
-       so a singleton seat (Custodes / Fabricator-General) is never left tint-less
-       in the window between WrapperEnd clearing the pane and the next
-       wrapper/reconcile landing — the empty-stamp → no-tint root.
+    2. Records wrapper ledger metadata but does not paint persona tint until the
+       canonical instance stamp binds a persona. Tint must fail dark: a durable
+       label alone is not proof of an occupied persona.
 
     Fail-open and idempotent: a missing pane is a successful no-op (the wrapper
     fires this best-effort; it must never block a launch).
     """
-    from . import assertions
-
     env = params.get("env") if isinstance(params.get("env"), dict) else {}
     wrapper_launch_id = _wrapper_id_from_params(params)
     pane = _s(params, "tmux_pane") or _s(env, "TMUX_PANE")
@@ -3371,7 +3372,7 @@ def _h_hook_wrapperstart(control, params):
         allow_failure=True,
     )
 
-    # (2) Persona tint from the durable pane label (no @INSTANCE_ID dependency).
+    # (2) Ledger metadata only; tint waits for bound persona stamp.
     pane_label = _adapter_show_pane_option(control, pane, "@PANE_ID")
     engine = _s(params, "engine") or _s(env, "TOKEN_API_ENGINE")
     working_dir = _s(params, "cwd") or _s(params, "working_dir") or _s(env, "TOKEN_API_CWD")
@@ -3385,15 +3386,14 @@ def _h_hook_wrapperstart(control, params):
         born_epoch=time.time(),
         state="OPEN",
     )
+    # Fail dark: wrapper birth is not yet a bound persona.  Clear stale chrome so
+    # a recycled singleton/worker cannot display a false-positive tint before
+    # /instance/stamp supplies the canonical persona binding.
     tint = ""
-    voice_lock = _adapter_show_pane_option(control, pane, _VOICE_LOCK_OPTION)
-    if not voice_lock:
-        try:
-            tint = assertions.apply_persona_pane_tint(control.adapter, pane, pane_label) or ""
-        except Exception as exc:  # never let a tint failure break wrapper registration
-            log.warning(
-                "tmuxctld wrapperstart tint failed pane=%s label=%s: %s", pane, pane_label, exc
-            )
+    try:
+        control.adapter.clear_pane_style(pane)
+    except Exception as exc:  # never let chrome cleanup break wrapper registration
+        log.warning("tmuxctld wrapperstart tint clear failed pane=%s: %s", pane, exc)
 
     return {
         "status": "stamped",

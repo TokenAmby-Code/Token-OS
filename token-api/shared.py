@@ -433,7 +433,7 @@ def resolve_persona_profile(primarch: str | None, legion: str | None = None) -> 
             "notification_sound": None,
             "color": "#302800",
             "chip_color": "#302800",
-            "pane_tint": "#302800",
+            "pane_tint": None,
             "tts_voice": None,
             "tts_rate": None,
             "silent": True,
