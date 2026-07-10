@@ -88,6 +88,7 @@ async def send_temp_message(
     engine: str | None = None,
     *,
     instance_id: str | None = None,
+    expected_role: str | None = None,
     queue_sender: QueueSender | None = None,
     queue_drainer: QueueDrainer | None = None,
 ) -> dict[str, Any]:
@@ -96,6 +97,11 @@ async def send_temp_message(
     Production callers pass ``main.enqueue_pane_write`` and
     ``main.process_pane_write_queue_once`` so dispatch uses the existing
     server-owned typing guard and send-keys implementation.
+
+    ``expected_role`` carries the requested semantic address (e.g.
+    ``council:custodes``) so a pane-targeted ephemeral send participates in the
+    daemon's byte-time singleton addressee gate, exactly like the non-ephemeral
+    brief path. It is a no-op for non-singleton specs and raw ``%NN``.
     """
     _, mode = temp_command_for_engine(engine, payload)
     if queue_sender is None:
@@ -108,6 +114,7 @@ async def send_temp_message(
             source=TEMP_MESSAGE_SOURCE,
             purpose="ethereal",
             payload=payload,
+            expected_role=expected_role,
         )
     )
     result: dict[str, Any] = {

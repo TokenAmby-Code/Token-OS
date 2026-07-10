@@ -274,6 +274,58 @@ def _reconcile_then_reread(adapter: TmuxAdapter, pane: str) -> LedgerPaneOccupan
     return ledger_occupancy_for_pane(adapter, pane)
 
 
+def assert_singleton_addressee(
+    adapter: TmuxAdapter,
+    requested: str,
+    phys_pane: str,
+) -> None:
+    """Byte-time addressee identity gate for persona-singleton addressed sends.
+
+    Resolution and delivery are separated in time; duplicate/churned/stale
+    ``@PANE_ID`` stamps let a ``council:custodes``-addressed report land in the
+    live ``council:malcador`` pane with no error. When the REQUESTED target is a
+    persona singleton label, re-read live stamps immediately before bytes and
+    require exactly one live pane to carry that label AND that pane to be the
+    resolved delivery target. Missing, duplicated, or mismatched stamps raise —
+    silent wrong-recipient delivery is a P0 (#600 loud-fail ruling). Non-singleton
+    requests (raw ``%NN``, worker roles) pass through untouched. A failed tmux
+    scan raises too: an unreadable address space is fail-closed, never fallback.
+    """
+
+    label = canonical_singleton_label(requested or "")
+    if not is_persona_singleton_label(label):
+        return
+    raw = adapter.run(
+        "list-panes",
+        "-a",
+        "-F",
+        "\t".join(["#{pane_id}", "#{@PANE_ID}"]),
+    )
+    holders: list[str] = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        pane_id, role = parts[0].strip(), parts[1].strip()
+        if pane_id and role and canonical_singleton_label(role) == label:
+            holders.append(pane_id)
+    if not holders:
+        raise ValueError(
+            f"singleton_addressee_missing: no live pane is stamped {label}; "
+            f"refusing delivery of a {label}-addressed send into {phys_pane}"
+        )
+    if len(holders) > 1:
+        raise ValueError(
+            f"singleton_addressee_ambiguous: {label} is stamped on multiple live "
+            f"panes {sorted(holders)}; refusing silent wrong-recipient delivery"
+        )
+    if holders[0] != phys_pane:
+        raise ValueError(
+            f"singleton_addressee_mismatch: {label} is live on {holders[0]} but "
+            f"delivery resolved {phys_pane}; refusing wrong-recipient delivery"
+        )
+
+
 def assert_comms_delivery_target_occupied(
     adapter: TmuxAdapter,
     pane: str,

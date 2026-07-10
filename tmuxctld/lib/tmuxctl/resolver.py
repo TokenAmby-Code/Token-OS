@@ -117,13 +117,50 @@ def _role_position_aliases(role: str) -> tuple[str, ...]:
     return (position,) if position else ()
 
 
-def _add_unique(index: dict[str, PaneSnapshot], key: str, pane: PaneSnapshot) -> None:
-    if key:
+def _add_unique(
+    index: dict[str, PaneSnapshot],
+    live_claims: dict[str, str],
+    ambiguous: set[str],
+    key: str,
+    pane: PaneSnapshot,
+) -> None:
+    if not key:
+        return
+    # Track distinct LIVE claimants per key independently of the index slot: two
+    # distinct live @PANE_ID stamps on one public address are always ambiguous
+    # (the custodes->malcador misroute), even when a tombstone redirect is
+    # indexed between them and would otherwise absorb the second live claim
+    # before it reaches the poison branch below.
+    if pane.pane_kind is not PaneKind.TOMBSTONE:
+        prior_live = live_claims.get(key)
+        if prior_live is None:
+            live_claims[key] = pane.pane_id
+        elif prior_live != pane.pane_id:
+            ambiguous.add(key)
+    existing = index.get(key)
+    if existing is None or existing.pane_id == pane.pane_id:
         index.setdefault(key, pane)
+        return
+    # A tombstone sharing an address with another pane is the DESIGNED audience
+    # redirect topology (the tombstone carries the source role and chains to the
+    # real pane) — keep the tombstone as the indexed hop, no ambiguity.
+    if existing.pane_kind is PaneKind.TOMBSTONE and pane.pane_kind is not PaneKind.TOMBSTONE:
+        return
+    if pane.pane_kind is PaneKind.TOMBSTONE and existing.pane_kind is not PaneKind.TOMBSTONE:
+        index[key] = pane
+        return
+    # Two distinct live panes claim the same public address (duplicate or
+    # churned @PANE_ID stamps). First-writer-wins here silently delivered a
+    # council:custodes-addressed report into council:malcador; the key is
+    # poisoned instead so lookups fail loud. (The live_claims tracker above
+    # already flagged this; retained as a direct-collision backstop.)
+    ambiguous.add(key)
 
 
 def _index_positionals(
     by_positional: dict[str, PaneSnapshot],
+    positional_live: dict[str, str],
+    ambiguous: set[str],
     window: WindowSnapshot,
     pane: PaneSnapshot,
 ) -> None:
@@ -149,27 +186,34 @@ def _index_positionals(
     )
     for position in _role_position_aliases(pane.pane_role):
         for window_name in window_names:
-            _add_unique(by_positional, f"{window_name}:{position}", pane)
+            _add_unique(
+                by_positional, positional_live, ambiguous, f"{window_name}:{position}", pane
+            )
 
 
 def _index_workspace(
     workspace: WorkspaceSnapshot,
-) -> tuple[dict[str, PaneSnapshot], dict[str, PaneSnapshot], dict[str, PaneSnapshot]]:
+) -> tuple[dict[str, PaneSnapshot], dict[str, PaneSnapshot], dict[str, PaneSnapshot], set[str]]:
     by_physical: dict[str, PaneSnapshot] = {}
     by_logical: dict[str, PaneSnapshot] = {}
     by_positional: dict[str, PaneSnapshot] = {}
+    ambiguous: set[str] = set()
+    # First distinct live @PANE_ID seen per key, per index namespace, so a second
+    # distinct live claimant poisons the key even across tombstone redirects.
+    positional_live: dict[str, str] = {}
+    logical_live: dict[str, str] = {}
     for window in workspace.windows:
         for pane in window.panes:
             by_physical[pane.pane_id] = pane
-            _index_positionals(by_positional, window, pane)
+            _index_positionals(by_positional, positional_live, ambiguous, window, pane)
             if pane.pane_role:
                 for role in indexable_pane_roles(pane.pane_role):
-                    by_logical.setdefault(role, pane)
-    return by_physical, by_logical, by_positional
+                    _add_unique(by_logical, logical_live, ambiguous, role, pane)
+    return by_physical, by_logical, by_positional, ambiguous
 
 
 def resolve_pane_in_snapshot(workspace: WorkspaceSnapshot, target: str) -> PaneResolution:
-    by_physical, by_logical, by_positional = _index_workspace(workspace)
+    by_physical, by_logical, by_positional, ambiguous = _index_workspace(workspace)
 
     def lookup(value: str) -> PaneSnapshot | None:
         if value.startswith("%"):
@@ -179,6 +223,12 @@ def resolve_pane_in_snapshot(workspace: WorkspaceSnapshot, target: str) -> PaneR
             # part of the public address space, so they miss the canonical index.
             return by_physical.get(value)
         canonical = canonical_pane_role(value)
+        for key in dict.fromkeys((value, canonical)):
+            if key in ambiguous:
+                raise ValueError(
+                    f"ambiguous pane target: {key!r} is claimed by multiple live panes "
+                    "(duplicate @PANE_ID stamps); refusing silent first-match delivery"
+                )
         return (
             by_positional.get(value)
             or by_positional.get(canonical)
