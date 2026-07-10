@@ -55,6 +55,39 @@ def test_artifact_url_is_never_loopback_when_mesh_ip_known(tmp_path, monkeypatch
     assert tts._tts_artifact_base_url() == tts.TOKEN_API_URL
 
 
+def _streaming_wav(pcm: bytes) -> bytes:
+    import struct
+
+    header = b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+    fmt = b"fmt " + struct.pack("<I", 16) + struct.pack("<HHIIHH", 1, 1, 24000, 48000, 2, 16)
+    data = b"data" + struct.pack("<I", 0xFFFFFFFF) + pcm
+    return header + fmt + data
+
+
+def test_render_finalizes_streaming_wav_header(tmp_path, monkeypatch):
+    import struct
+
+    tts = _load_tts(tmp_path, monkeypatch)
+    pcm = b"\x00\x01" * 600
+
+    class Resp:
+        status_code = 200
+        content = _streaming_wav(pcm)
+        text = ""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(tts.requests, "post", lambda url, **kw: Resp())
+    result = tts.render_openai_tts_artifact("finalize me", "ballad")
+    assert result["success"] is True
+    written = Path(result["artifact_path"]).read_bytes()
+    assert struct.unpack("<I", written[4:8])[0] == len(written) - 8
+    data_pos = written.index(b"data")
+    assert struct.unpack("<I", written[data_pos + 4 : data_pos + 8])[0] == len(pcm)
+    import hashlib
+
+    assert result["sha256"] == hashlib.sha256(written).hexdigest()
+
+
 def test_openai_tts_render_failure_is_named(tmp_path, monkeypatch):
     tts = _load_tts(tmp_path, monkeypatch)
     monkeypatch.setattr(tts, "_openai_api_key", lambda: None)

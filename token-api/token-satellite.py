@@ -533,14 +533,22 @@ class TTSEngine:
         }
 
     def _wav_player_script(self, wav_path_win: str) -> str:
+        # powershell -File exits 0 even when a statement throws, so an invalid
+        # WAV "played successfully" unless the script converts errors to exit 1.
         escaped = wav_path_win.replace("'", "''")
         return (
-            "Add-Type -AssemblyName System.Windows.Extensions -ErrorAction SilentlyContinue\n"
-            "Add-Type -AssemblyName System\n"
-            f"$player = New-Object System.Media.SoundPlayer '{escaped}'\n"
-            "$player.Load()\n"
-            "$player.PlaySync()\n"
-            "$player.Dispose()\n"
+            "$ErrorActionPreference = 'Stop'\n"
+            "try { Add-Type -AssemblyName System.Windows.Extensions } catch { }\n"
+            "try {\n"
+            "  Add-Type -AssemblyName System\n"
+            f"  $player = New-Object System.Media.SoundPlayer '{escaped}'\n"
+            "  $player.Load()\n"
+            "  $player.PlaySync()\n"
+            "  $player.Dispose()\n"
+            "} catch {\n"
+            "  [Console]::Error.WriteLine($_.Exception.Message)\n"
+            "  exit 1\n"
+            "}\n"
         )
 
     def _terminate_wav_playback(self) -> None:

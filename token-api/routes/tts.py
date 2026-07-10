@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -419,6 +420,31 @@ def _tts_cache_key(*, voice_id: str, text: str) -> tuple[str, str, str]:
     return artifact_id, cache_key, text_hash
 
 
+def _finalize_wav_header(data: bytes) -> bytes:
+    """Patch streaming-placeholder RIFF/data sizes with real byte counts.
+
+    OpenAI streams WAV with 0xFFFFFFFF in the RIFF and data chunk size fields
+    (unknown at header-write time). Strict players — Windows SoundPlayer,
+    Android media actions — reject that as "not a valid wave file", so the
+    artifact must be finalized before it is cached or served.
+    """
+    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return data
+    buf = bytearray(data)
+    struct.pack_into("<I", buf, 4, len(buf) - 8)
+    pos = 12
+    while pos + 8 <= len(buf):
+        chunk_id = bytes(buf[pos : pos + 4])
+        chunk_size = struct.unpack_from("<I", buf, pos + 4)[0]
+        if chunk_id == b"data":
+            struct.pack_into("<I", buf, pos + 4, len(buf) - pos - 8)
+            break
+        if chunk_size in (0, 0xFFFFFFFF):
+            break
+        pos += 8 + chunk_size + (chunk_size % 2)
+    return bytes(buf)
+
+
 def render_openai_tts_artifact(text: str, voice: str | None) -> dict:
     clean = (text or "").strip()
     if not clean:
@@ -492,8 +518,9 @@ def render_openai_tts_artifact(text: str, voice: str | None) -> dict:
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"openai_tts_http_{resp.status_code}: {resp.text[:300]}")
-        artifact_path.write_bytes(resp.content)
-        sha = hashlib.sha256(resp.content).hexdigest()
+        wav_bytes = _finalize_wav_header(resp.content)
+        artifact_path.write_bytes(wav_bytes)
+        sha = hashlib.sha256(wav_bytes).hexdigest()
         with sqlite3.connect(_tts_metadata_db()) as conn:
             _ensure_tts_metadata_table(conn)
             conn.execute(
