@@ -995,6 +995,56 @@ def test_sweep_half_bound_live_persona_fails_loud_on_ambiguous_stamp() -> None:
             raise AssertionError("expected ambiguous stamp to fail loud")
 
 
+def test_sweep_half_bound_live_persona_projection_absent_is_registry_unavailable() -> None:
+    from tmuxctl.assertions import assert_instance
+
+    adapter = FakeAdapter()
+    adapter.options.update({"@INSTANCE_ID": "i-cust", "@PERSONA": ""})
+    row = _row(instance_id="i-cust", persona_slug="custodes", rank="overseer")
+    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="council"),
+        patch.object(assertions, "_pane_dead", return_value=False),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "_registry_entries", return_value=[row]),
+        patch.object(assertions, "fetch_instance_rows_raw", return_value=[]),
+    ):
+        result = assert_instance(adapter, "council:custodes", registry_optional=True)
+
+    assert result["ok"] is False
+    assert result["action"] == "registry_unavailable"
+    assert "live row persona mismatch" in result["reason"]
+    assert adapter.options["@PERSONA"] == ""
+
+
+def test_sweep_half_bound_live_persona_missing_tint_is_registry_unavailable() -> None:
+    from tmuxctl.assertions import assert_instance
+
+    adapter = FakeAdapter()
+    adapter.options.update({"@INSTANCE_ID": "i-cust", "@PERSONA": ""})
+    row = _row(instance_id="i-cust", persona_slug="custodes", rank="overseer")
+    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
+    with (
+        patch.object(assertions, "resolve_pane", return_value=resolved),
+        patch.object(assertions, "_pane_type", return_value="council"),
+        patch.object(assertions, "_pane_dead", return_value=False),
+        patch.object(assertions, "_runtime_has_instance", return_value=True),
+        patch.object(assertions, "_registry_entries", return_value=[row]),
+        patch.object(
+            assertions,
+            "fetch_instance_rows_raw",
+            return_value=[{"id": "i-cust", "persona": {"slug": "custodes"}}],
+        ),
+    ):
+        result = assert_instance(adapter, "council:custodes", registry_optional=True)
+
+    assert result["ok"] is False
+    assert result["action"] == "registry_unavailable"
+    assert "pane_tint" in result["reason"]
+    assert adapter.options["@PERSONA"] == ""
+
+
 def test_sweep_captures_per_pane_errors_without_aborting():
     # An absent pane (resolve_pane raises) must not stop the rest of the sweep —
     # the error is captured for that label and the others still run.

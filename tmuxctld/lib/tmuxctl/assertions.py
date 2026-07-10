@@ -957,7 +957,8 @@ def _rebind_half_bound_live_persona_if_proven(
     pane_label: str,
     spec: PersonaSpec,
     row,
-    projection: dict[str, Any],
+    display: str,
+    tint: str,
 ) -> dict[str, Any] | None:
     """Narrow heal for a live singleton with a row and stamp but missing surface.
 
@@ -972,7 +973,6 @@ def _rebind_half_bound_live_persona_if_proven(
     claims = _live_panes_claiming_instance(adapter, instance_id)
     if len(claims) != 1 or claims[0][0] != pane_id:
         raise ValueError(f"ambiguous live pane claims for {instance_id}: {claims!r}")
-    display, tint = _persona_display_and_tint_from_projection(projection, spec)
     adapter.run("set-option", "-p", "-t", pane_id, "@PERSONA", display)
     observed_persona = adapter.show_pane_option(pane_id, "@PERSONA").strip()
     if observed_persona != display:
@@ -1369,6 +1369,7 @@ def _assert_instance_impl(
             if not persona_surface:
                 try:
                     projection = _persona_row_projection(getattr(row, "instance_id", "") or "")
+                    display, tint = _persona_display_and_tint_from_projection(projection, spec)
                 except Exception as exc:  # noqa: BLE001
                     result.update(
                         {
@@ -1379,7 +1380,7 @@ def _assert_instance_impl(
                     )
                     return result
                 rebound = _rebind_half_bound_live_persona_if_proven(
-                    adapter, pane_id, pane_label, spec, row, projection
+                    adapter, pane_id, pane_label, spec, row, display, tint
                 )
                 result.update(
                     {
