@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { OPS_COCKPIT_POLLS } from './api';
-import { buildDials, enforcementDial, goldenThroneDial, laneForStatus, LEMON_RESIDENT_PERSONAS, occupancyCompassStars, toFleetQueues, toLemonActivity, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
+import { buildDials, dialIsUnusual, enforcementDial, goldenThroneDial, laneForStatus, LEMON_RESIDENT_PERSONAS, occupancyCompassStars, toFleetQueues, toLemonActivity, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
 import type { OpsState } from './contracts';
 
 type TestInstance = {
@@ -293,6 +293,21 @@ describe('toTtsQueue', () => {
   });
 });
 
+// A fully-nominal OpsState — every subsystem in its expected state. Tests mutate
+// one facet at a time to prove exactly that facet makes its dial unusual.
+function nominalState(): OpsState {
+  return {
+    timer: { mode: 'working', break_balance_ms: 60000 },
+    attention: { phone: { app: null, is_distracted: false }, desktop: { mode: 'silence' } },
+    sources: { cron: { status: 'ok' }, tts: { status: 'ok' }, enforcement: { status: 'ok' }, token_api: { status: 'ok' }, agents_db: { status: 'ok' }, timer_engine: { status: 'ok' }, tmuxctld: { status: 'ok' } },
+    tts: { hot_queue_length: 0, pause_queue_length: 0, hot_queue: [], pause_queue: [], current: null, backend: 'wsl', satellite_available: true },
+    enforcement: { pending_count: 0, pavlok: { enabled: true } },
+    instances: { active: [], counts: { active: 2, stale: 0, by_engine: { codex: 2 }, by_status: {}, by_persona: {} } },
+    work_state: { productivity_active: true, reason: 'recent activity', typing_active: false },
+    tmux: { reachable: true, occupancy: { status: 'ok', total: 4, occupied: 2, free: 2, dead: 0, protected: 0, drift: 0, unknown: 0, errors: [], cells: [], generated_at: 'x' } },
+  } as unknown as OpsState;
+}
+
 describe('dial builders', () => {
   it('ttsDial reports speaking and queued metadata', () => {
     const dial = ttsDial({
@@ -300,7 +315,8 @@ describe('dial builders', () => {
       tts: { current: { message: 'x' }, hot_queue_length: 1, pause_queue_length: 2, hot_queue: [], pause_queue: [], backend: 'wsl', satellite_available: true },
     } as unknown as OpsState);
 
-    expect(dial).toMatchObject({ id: 'tts', value: 'speaking', tone: 'warn', noteworthy: true });
+    expect(dial).toMatchObject({ id: 'tts', value: 'speaking', tone: 'warn', defaultValue: 'idle' });
+    expect(dialIsUnusual(dial)).toBe(true);
   });
 
   it('enforcementDial reports pending actions', () => {
@@ -312,12 +328,38 @@ describe('dial builders', () => {
     expect(dial).toMatchObject({ id: 'enforce', value: 'pending 2', tone: 'bad', action: { kind: 'ack-enforce' } });
   });
 
+  // The optimal-cockpit invariant: with every subsystem in its expected state,
+  // every dial's value collapses onto its defaultValue — the fan renders NOTHING.
+  it('buildDials yields zero unusual dials when every subsystem is nominal', () => {
+    const dials = buildDials(nominalState());
+    expect(dials.filter(dialIsUnusual)).toEqual([]);
+  });
+
+  it('timer dial surfaces morning_session as unusual with the end-morning click contract', () => {
+    const s = nominalState();
+    (s.timer as { mode: string }).mode = 'morning_session';
+    const timer = buildDials(s).find((d) => d.id === 'timer');
+    expect(timer).toMatchObject({ value: 'MORNING', defaultValue: 'WORKING', action: { kind: 'end-morning' } });
+    expect(dialIsUnusual(timer!)).toBe(true);
+  });
+
+  it('balance dial hides credit and surfaces debt', () => {
+    const credit = buildDials(nominalState()).find((d) => d.id === 'balance');
+    expect(dialIsUnusual(credit!)).toBe(false);
+    const s = nominalState();
+    (s.timer as { break_balance_ms: number }).break_balance_ms = -120000;
+    const debt = buildDials(s).find((d) => d.id === 'balance');
+    expect(debt).toMatchObject({ value: '−2m', tone: 'bad' });
+    expect(dialIsUnusual(debt!)).toBe(true);
+  });
+
   it('goldenThroneDial reports due rubrics', () => {
     const dial = goldenThroneDial({
       instances: { active: [{ gt: { next_fire: '2000-01-01T00:00:00Z', resume_count: 0, victory_at: null } }] },
     } as unknown as OpsState);
 
-    expect(dial).toMatchObject({ id: 'gt', value: 'due 1', tone: 'bad', noteworthy: true });
+    expect(dial).toMatchObject({ id: 'gt', value: 'due 1', tone: 'bad', defaultValue: 'clear' });
+    expect(dialIsUnusual(dial)).toBe(true);
   });
 });
 
@@ -516,7 +558,9 @@ describe('tmux occupancy adapters', () => {
       tmux: { reachable: true, occupancy: { status: 'bad', total: 2, occupied: 0, free: 0, dead: 1, protected: 0, drift: 1, unknown: 0, errors: ['partial failure'], cells: [], generated_at: 'x' } },
     } as unknown as OpsState);
 
-    expect(dials.find((d) => d.id === 'tmux')).toMatchObject({ tone: 'bad', noteworthy: true });
+    const tmux = dials.find((d) => d.id === 'tmux');
+    expect(tmux).toMatchObject({ tone: 'bad', value: '0/2 used' });
+    expect(dialIsUnusual(tmux!)).toBe(true);
   });
 
   it('maps occupied palace/somnium pane slots to compass star colors', () => {
