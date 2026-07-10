@@ -1151,6 +1151,46 @@ fi
     assert "Possible reasons" not in result.stdout
 
 
+def test_timeout_prefers_rate_limit_reset_signal_before_rerequest(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+
+    result = bash_with_pr_step(
+        """
+slept=0
+rerequested=0
+coderabbit_latest_issue_comment_body() { echo 'Review limit reached. Your next review will be available in 18 minutes.'; }
+coderabbit_latest_issue_comment_timestamp() { echo '1970-01-01T00:00:00Z'; }
+sleep_until_rate_limit_reset() { slept=$1; return 0; }
+rate_limit_reset_reached() { return 0; }
+coderabbit_rerequest_review() { rerequested=$((rerequested + 1)); return 0; }
+if coderabbit_maybe_wait_rate_limit_on_timeout 17; then
+  printf 'waited=%s rerequested=%s\\n' "$slept" "$rerequested"
+fi
+""",
+        repo,
+    )
+
+    assert "waited=1140 rerequested=1" in result.stdout
+
+
+def test_coderabbit_heartbeat_is_opaque_when_requested(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    heartbeat = tmp_path / "heartbeat.log"
+
+    result = bash_with_pr_step(
+        f"""
+PR_STEP_OPAQUE_WAIT=true
+PR_STEP_HEARTBEAT_FILE={str(heartbeat)!r}
+emit_coderabbit_heartbeat 'CodeRabbit poll: hidden'
+echo done
+""",
+        repo,
+    )
+
+    assert "done" in result.stdout
+    assert not heartbeat.exists() or heartbeat.read_text() == ""
+
+
 def test_fresh_current_head_verdict_skips_rerequest(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
 

@@ -89,6 +89,7 @@ default_commit_message_from_staged() {
 
 emit_coderabbit_heartbeat() {
     local message="$1"
+    [[ "${PR_STEP_OPAQUE_WAIT:-false}" == "true" ]] && return 0
     if [[ -n "${PR_STEP_HEARTBEAT_FILE:-}" ]]; then
         printf '%s\n' "$message" >>"$PR_STEP_HEARTBEAT_FILE" 2>/dev/null || true
     else
@@ -743,6 +744,16 @@ coderabbit_latest_issue_comment_body() {
         | sort_by(.created_at) | .[-1].body // ""' 2>/dev/null || true
 }
 
+coderabbit_latest_issue_comment_timestamp() {
+    local pr="$1" repo
+    repo="$(repo_slug)"
+    [[ -n "$repo" ]] || return 1
+    gh api "repos/${repo}/issues/${pr}/comments" 2>/dev/null | jq -r '
+        [.[] | select((.user.login // "" | ascii_downcase) as $u
+            | $u == "coderabbitai[bot]" or $u == "coderabbitai" or $u == "coderabbit")]
+        | sort_by(.updated_at // .created_at // "") | .[-1].updated_at // .[-1].created_at // ""' 2>/dev/null || true
+}
+
 # True when CodeRabbit's most recent activity on the PR is a rate-limit/shelved
 # deferral (i.e. no genuine review has landed for the current request).
 coderabbit_review_is_deferred() {
@@ -780,6 +791,14 @@ coderabbit_maybe_rerequest_on_timeout() {
     coderabbit_rerequest_review "$pr" "CodeRabbit review timed out with no fresh verdict; re-requesting the full review (attempt ${done}/${max})." || return 2
     printf -v "$done_var" '%s' "$done"
     return 0
+}
+
+coderabbit_maybe_wait_rate_limit_on_timeout() {
+    local pr="$1" body stamp
+    body="$(coderabbit_latest_issue_comment_body "$pr")"
+    coderabbit_body_is_ratelimit "$body" || return 1
+    stamp="$(coderabbit_latest_issue_comment_timestamp "$pr")"
+    coderabbit_handle_ratelimit_comment "$pr" "$body" "$stamp"
 }
 
 coderabbit_handle_ratelimit_comment() {
@@ -1986,6 +2005,14 @@ while true; do
     ELAPSED=$(($(date +%s) - START_TIME))
 
     if wait_timed_out "$ELAPSED" "$MAX_WAIT_TIME"; then
+        if [[ "$READ_ONLY" == "false" ]] && coderabbit_maybe_wait_rate_limit_on_timeout "$PR_NUMBER"; then
+            START_TIME=$(date +%s)
+            BASELINE_REVIEW_COMMENTS="$CURRENT_REVIEW_COMMENTS"
+            BASELINE_ISSUE_COMMENTS="$CURRENT_ISSUE_COMMENTS"
+            BASELINE_OVERVIEW_TIMESTAMP="$CURRENT_OVERVIEW_TIMESTAMP"
+            BASELINE_REVIEW_TIMESTAMP="$CURRENT_REVIEW_TIMESTAMP"
+            continue
+        fi
         if [[ "$READ_ONLY" == "false" ]] && coderabbit_maybe_rerequest_on_timeout "$PR_NUMBER" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
             START_TIME=$(date +%s)
             BASELINE_REVIEW_COMMENTS="$CURRENT_REVIEW_COMMENTS"
@@ -2557,7 +2584,7 @@ create_pr_normal() {
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
         pr_create_main --title "$subject" --body "$body" "${wait_args[@]}"
     else
-        PR_STEP_PRINT_CAPTURED_OUTPUT=true run_internal_capture create true pr_create_main --title "$subject" --body "$body" "${wait_args[@]}"
+        PR_STEP_OPAQUE_WAIT=true PR_STEP_PRINT_CAPTURED_OUTPUT=true run_internal_capture create true pr_create_main --title "$subject" --body "$body" "${wait_args[@]}"
     fi
     pr_num="$(current_pr_number)"
     [[ -n "$pr_num" ]] || { error "Could not determine created PR number"; exit 1; }
@@ -2576,7 +2603,7 @@ review_pr_normal() {
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
         pr_review_main "${review_args[@]}" || rc=$?
     else
-        PR_STEP_PRINT_CAPTURED_OUTPUT=true run_internal_capture review false pr_review_main "${review_args[@]}" || rc=$?
+        PR_STEP_OPAQUE_WAIT=true PR_STEP_PRINT_CAPTURED_OUTPUT=false run_internal_capture review false pr_review_main "${review_args[@]}" || rc=$?
     fi
     return "$rc"
 }
@@ -2589,7 +2616,7 @@ read_review_normal() {
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
         pr_review_main "${review_args[@]}" || rc=$?
     else
-        PR_STEP_PRINT_CAPTURED_OUTPUT=true run_internal_capture review-read false pr_review_main "${review_args[@]}" || rc=$?
+        PR_STEP_OPAQUE_WAIT=true PR_STEP_PRINT_CAPTURED_OUTPUT=false run_internal_capture review-read false pr_review_main "${review_args[@]}" || rc=$?
     fi
     return "$rc"
 }
