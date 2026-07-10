@@ -16,6 +16,9 @@ def _fake_tmux(tmp_path: pathlib.Path) -> pathlib.Path:
             r"""
             #!/usr/bin/env bash
             set -euo pipefail
+            if [[ -n "${TMUX_FAKE_LOG:-}" ]]; then
+              printf '%s\n' "$*" >>"$TMUX_FAKE_LOG"
+            fi
             if [[ "${1:-}" == "list-panes" && "${2:-}" == "-a" && "${3:-}" == "-F" && "${4:-}" == $'#{pane_id}\t#{@PANE_ID}' ]]; then
               printf '%%11\tpalace:N\n%%12\tmechanicus:3\n'
               exit 0
@@ -53,6 +56,19 @@ def _fake_tmux(tmp_path: pathlib.Path) -> pathlib.Path:
                 ;;
               "display-message -t %11 -p #{session_name}:#{window_index}")
                 printf 'palace:0\n'
+                ;;
+              "display-message -t %11 -p ")
+                ;;
+              "display-message -t palace:0 -p #{window_zoomed_flag}")
+                printf '0\n'
+                ;;
+              set-option\ -w\ -t\ palace:0\ @GRID_EXPANDED\ none|\
+              set-option\ -w\ -t\ palace:0\ @GRID_STASH\ |\
+              set-option\ -w\ -t\ palace:0\ @GENERIC_EXPANDED\ none|\
+              set-option\ -w\ -t\ palace:0\ @GENERIC_STASH\ |\
+              set-option\ -w\ -t\ palace:0\ @SIDE_EXPANDED\ none)
+                ;;
+              "resize-pane -Z -t %11")
                 ;;
               "capture-pane -p -t %11")
                 printf 'Last raw panes: %%11 and %%99\n'
@@ -154,6 +170,35 @@ def test_tmux_grid_expand_pane_id_round_trips_as_resolvable_target(tmp_path) -> 
     )
     assert reuse.returncode == 0, (target, reuse.stderr)
     assert reuse.stdout == "palace:0\n", reuse.stdout
+
+
+def test_tmux_grid_expand_direct_client_path_uses_only_local_tmux(tmp_path) -> None:
+    """Prefix-e regression: the direct helper resolves the client pane and zooms
+    locally. No tmuxctld transport is involved, so a degraded daemon cannot emit a
+    false status-line expand failure after native zoom succeeds.
+    """
+    log = tmp_path / "tmux.log"
+    fake_tmux = _fake_tmux(tmp_path)
+    tmux_cmd = tmp_path / "tmux"
+    tmux_cmd.symlink_to(fake_tmux)
+    env = {
+        **os.environ,
+        "TMUX_FAKE_LOG": str(log),
+        "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+    }
+
+    proc = subprocess.run(
+        [str(ROOT / "bin" / "tmux-grid-expand"), "--client", "/dev/ttys003"],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text(encoding="utf-8")
+    assert "display-message -c /dev/ttys003 -p #{pane_id}" in calls
+    assert "resize-pane -Z -t %11" in calls
+    assert "tmuxctld" not in calls
 
 
 def test_human_facing_display_still_sanitizes(tmp_path) -> None:
