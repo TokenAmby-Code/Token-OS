@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 from enum import Enum
+from pathlib import Path
 
 # Class keys used as plain strings across the timer/accounting boundary so the
 # pure TimerEngine never has to import this module.
@@ -79,8 +80,8 @@ def _path_has_prefix(path: str, prefix: str) -> bool:
 # (the cockpit's RIGHT rails). askPax is civic-side tooling, so it rides along.
 ASKCIVIC_DOMAIN_PREFIXES: tuple[str, ...] = (
     "/Volumes/Civic",
-    os.path.join(_HOME, "worktrees", "askCivic"),
-    os.path.join(_HOME, "worktrees", "askPax"),
+    str(Path(_HOME) / "worktrees" / "askCivic"),
+    str(Path(_HOME) / "worktrees" / "askPax"),
 )
 
 # The two fleet-queue domains. Plain strings across the API boundary — the

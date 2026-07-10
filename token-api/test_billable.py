@@ -1,6 +1,7 @@
 """Unit tests for billable.py — classification + the x/y accrual model."""
 
 import os
+from pathlib import Path
 
 from billable import (
     WorkClass,
@@ -54,16 +55,16 @@ class TestClassifyDomain:
         assert classify_domain("/Volumes/Civic") == "askcivic"
 
     def test_askcivic_worktree_is_askcivic(self):
-        wd = os.path.join(HOME, "worktrees", "askCivic", "wt-civic-invariant")
-        assert classify_domain(wd) == "askcivic"
+        wd = Path.home() / "worktrees" / "askCivic" / "wt-civic-invariant"
+        assert classify_domain(str(wd)) == "askcivic"
 
     def test_askpax_worktree_is_askcivic(self):
-        wd = os.path.join(HOME, "worktrees", "askPax", "wt-pax-thing")
-        assert classify_domain(wd) == "askcivic"
+        wd = Path.home() / "worktrees" / "askPax" / "wt-pax-thing"
+        assert classify_domain(str(wd)) == "askcivic"
 
     def test_token_os_worktree_is_token_os(self):
-        wd = os.path.join(HOME, "worktrees", "Token-OS", "wt-feat", "fleet-domain-queues")
-        assert classify_domain(wd) == "token-os"
+        wd = Path.home() / "worktrees" / "Token-OS" / "wt-feat" / "fleet-domain-queues"
+        assert classify_domain(str(wd)) == "token-os"
 
     def test_imperium_is_token_os(self):
         assert classify_domain("/Volumes/Imperium/Imperium-ENV") == "token-os"

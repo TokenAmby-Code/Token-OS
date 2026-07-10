@@ -486,7 +486,6 @@ def test_ops_instances_carry_domain_and_status(client, app_env) -> None:
     civic_id = str(uuid.uuid4())
     token_id = str(uuid.uuid4())
     homeless_id = str(uuid.uuid4())
-    home = os.path.expanduser("~")
     conn = sqlite3.connect(app_env.db_path)
     conn.executemany(
         """INSERT INTO instances
@@ -506,7 +505,7 @@ def test_ops_instances_carry_domain_and_status(client, app_env) -> None:
             (
                 token_id,
                 "token-worker",
-                os.path.join(home, "worktrees", "Token-OS", "wt-feat", "x"),
+                str(Path.home() / "worktrees" / "Token-OS" / "wt-feat" / "x"),
                 "idle",
                 now.isoformat(),
                 now.isoformat(),
