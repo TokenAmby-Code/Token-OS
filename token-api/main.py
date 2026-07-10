@@ -22252,6 +22252,7 @@ def _ops_tmuxctld_error_occupancy(generated_at: datetime, message: str) -> dict:
         "dead": 0,
         "protected": 0,
         "drift": 0,
+        "unknown": 0,
         "errors": [message],
         "cells": [],
     }
@@ -22355,13 +22356,13 @@ def _ops_build_tmux_occupancy(
             seen.add(pane_positional_id)
     counts = {
         key: sum(1 for c in cells if c.get("state") == key)
-        for key in ["occupied", "free", "dead", "protected", "drift"]
+        for key in ["occupied", "free", "dead", "protected", "drift", "unknown"]
     }
     status = (
         "bad"
         if not health.get("reachable")
         else "warn"
-        if errors or counts["dead"] or counts["drift"]
+        if errors or counts["dead"] or counts["drift"] or counts["unknown"]
         else "ok"
     )
     return {
@@ -22550,7 +22551,12 @@ async def _ops_collect_facts(now: datetime) -> dict:
         else "tmuxctld health available"
         if tmux_health.get("reachable")
         else "tmuxctld health unavailable",
-        details=tmux_health,
+        details={
+            "error": tmux_health.get("error"),
+            "tmux_reachable": tmux_health.get("tmux_reachable"),
+            "occupancy_status": tmux_occupancy_status,
+            "occupancy_errors": (tmux_health.get("occupancy") or {}).get("errors", []),
+        },
     )
 
     sources["cron"] = _ops_source_health(

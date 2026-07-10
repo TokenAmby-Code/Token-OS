@@ -1183,6 +1183,7 @@ def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) 
                 "dead": 0,
                 "protected": 0,
                 "drift": 1,
+                "unknown": 1,
                 "errors": [],
                 "cells": [
                     {
@@ -1215,6 +1216,16 @@ def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) 
                         "state": "drift",
                         "source": "tmuxctld:ledger",
                     },
+                    {
+                        "pane_positional_id": "somnium:W",
+                        "instance_id": None,
+                        "persona": None,
+                        "engine": None,
+                        "working_dir": None,
+                        "wrapper_id": None,
+                        "state": "unknown",
+                        "source": "tmuxctld:ledger",
+                    },
                 ],
             },
         }
@@ -1225,6 +1236,8 @@ def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) 
     assert occ["occupied"] == 1
     assert occ["free"] == 1
     assert occ["drift"] == 1
+    assert occ["unknown"] == 1
+    assert occ["status"] == "warn"
     assert occ["cells"][0]["state"] == "occupied"
 
 
@@ -1239,6 +1252,7 @@ def test_ops_tmux_occupancy_preserves_ledger_when_freelist_fails(app_env) -> Non
 
     assert occ["status"] == "warn"
     assert occ["occupied"] == 1
+    assert occ["unknown"] == 0
     assert occ["total"] == 1
     assert occ["errors"] == ["tmuxctld freelist unavailable: freelist boom"]
 
@@ -1249,6 +1263,37 @@ def test_ops_tmux_cell_state_prefers_occupied_signal_over_freelist(app_env) -> N
             {"pane_positional_id": "somnium:N", "instance_id": "i1"}, {"somnium:N"}
         )
         == "occupied"
+    )
+
+
+def test_ops_tmux_occupancy_counts_unknown_and_malformed_payloads(app_env) -> None:
+    generated_at = app_env.main.datetime.fromisoformat("2026-07-09T10:00:00+00:00")
+    occ = app_env.main._ops_build_tmux_occupancy(
+        generated_at,
+        {"reachable": True},
+        {"result": [{"pane_positional_id": "somnium:W"}]},
+        {"result": "not-a-list"},
+    )
+
+    assert occ["status"] == "warn"
+    assert occ["unknown"] == 1
+    assert occ["free"] == 0
+    assert occ["errors"] == ["tmuxctld freelist malformed"]
+
+    malformed = app_env.main._ops_build_tmux_occupancy(
+        generated_at, {"reachable": True}, "not-a-list", "also-not-a-list"
+    )
+    assert malformed["status"] == "warn"
+    assert malformed["total"] == 0
+    assert malformed["errors"] == [
+        "tmuxctld ledger rows malformed",
+        "tmuxctld freelist malformed",
+    ]
+
+
+def test_ops_tmux_cell_state_unknown_fallback(app_env) -> None:
+    assert (
+        app_env.main._ops_tmux_cell_state({"pane_positional_id": "somnium:W"}, set()) == "unknown"
     )
 
 

@@ -248,6 +248,7 @@ export type TmuxOccupancy = {
   dead: number;
   protected: number;
   drift: number;
+  unknown: number;
   errors: string[];
   cells: TmuxOccupancyCell[];
 };

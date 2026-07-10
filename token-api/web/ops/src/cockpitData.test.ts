@@ -427,7 +427,7 @@ describe('tmux occupancy adapters', () => {
       enforcement: { pending_count: 0, pavlok: {} },
       instances: { active: [], counts: { active: 2, stale: 1, by_engine: { codex: 2 }, by_status: {}, by_persona: {} } },
       work_state: { productivity_active: true, reason: 'recent activity', typing_active: true },
-      tmux: { reachable: true, occupancy: { status: 'warn', total: 4, occupied: 2, free: 1, dead: 0, protected: 0, drift: 1, errors: [], cells: [], generated_at: 'x' } },
+      tmux: { reachable: true, occupancy: { status: 'warn', total: 4, occupied: 2, free: 1, dead: 0, protected: 0, drift: 1, unknown: 0, errors: [], cells: [], generated_at: 'x' } },
     } as unknown as OpsState);
     const ids = dials.map((d) => d.id);
     expect(ids).toEqual(expect.arrayContaining(['tmux', 'fleet', 'work', 'sources']));
@@ -444,7 +444,7 @@ describe('tmux occupancy adapters', () => {
       enforcement: { pending_count: 0, pavlok: {} },
       instances: { active: [], counts: { active: 0, stale: 0, by_engine: {}, by_status: {}, by_persona: {} } },
       work_state: { productivity_active: false, reason: 'idle', typing_active: false },
-      tmux: { reachable: true, occupancy: { status: 'bad', total: 2, occupied: 0, free: 0, dead: 1, protected: 0, drift: 1, errors: ['partial failure'], cells: [], generated_at: 'x' } },
+      tmux: { reachable: true, occupancy: { status: 'bad', total: 2, occupied: 0, free: 0, dead: 1, protected: 0, drift: 1, unknown: 0, errors: ['partial failure'], cells: [], generated_at: 'x' } },
     } as unknown as OpsState);
 
     expect(dials.find((d) => d.id === 'tmux')).toMatchObject({ tone: 'bad', noteworthy: true });
@@ -455,7 +455,7 @@ describe('tmux occupancy adapters', () => {
       tmux: {
         reachable: true,
         occupancy: {
-          status: 'ok', total: 4, occupied: 3, free: 1, dead: 0, protected: 0, drift: 0, errors: [], generated_at: 'x',
+          status: 'ok', total: 4, occupied: 3, free: 1, dead: 0, protected: 0, drift: 0, unknown: 0, errors: [], generated_at: 'x',
           cells: [
             { pane_positional_id: 'palace:N', state: 'occupied' },
             { pane_positional_id: '2:NE', state: 'occupied' },
