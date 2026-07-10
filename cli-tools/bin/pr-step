@@ -506,13 +506,13 @@ coderabbit_state_for_head() {
     local head="$1" repo state check
     repo="$(repo_slug)"
     [[ -n "$repo" && -n "$head" ]] || return 1
-    state="$(gh api --paginate "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true)"
+    state="$(gh api --paginate "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -s -r 'add | [.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true)"
     if [[ -n "$state" ]]; then
         printf '%s\n' "$state"
         return 0
     fi
-    check="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null | jq -r '
-        [.check_runs[]? | select(
+    check="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null | jq -s -r '
+        [.[].check_runs[]? | select(
             (((.name // "") | ascii_downcase) | startswith("coderabbit"))
             or (((.app.slug // "") | ascii_downcase) == "coderabbitai")
         )]

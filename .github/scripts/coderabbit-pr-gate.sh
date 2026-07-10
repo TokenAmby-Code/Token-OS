@@ -34,6 +34,32 @@ is_disabled_or_skipped_review() {
     || [[ "$description_lc" == *"insufficient credits"* ]]
 }
 
+evaluate_coderabbit_signal() {
+  local description="$1" state="$2" kind="$3"
+
+  if is_disabled_or_skipped_review "$description"; then
+    echo "::error::CodeRabbit reported a skipped/disabled review ('$description'). Failing PR Gate so a disabled/free-trial/credit-skipped review cannot merge silently."
+    exit 1
+  fi
+
+  case "$state" in
+    success|neutral)
+      return 0
+      ;;
+    pending|queued|in_progress|"")
+      return 2
+      ;;
+    skipped)
+      echo "::error::CodeRabbit ${kind} was skipped: $description"
+      exit 1
+      ;;
+    *)
+      echo "::error::CodeRabbit ${kind} is $state: $description"
+      exit 1
+      ;;
+  esac
+}
+
 wait_for_coderabbit_status() {
   local deadline line context state description updated_at check_line check_name check_status check_conclusion check_description check_url
   deadline=$((SECONDS + TIMEOUT_SECONDS))
@@ -49,22 +75,7 @@ wait_for_coderabbit_status() {
       IFS=$'\t' read -r context state description updated_at <<< "$line"
       echo "CodeRabbit status: context=$context state=$state updated_at=$updated_at description=$description"
 
-      if is_disabled_or_skipped_review "$description"; then
-        echo "::error::CodeRabbit reported a skipped/disabled review ('$description'). Failing PR Gate so a disabled/free-trial/credit-skipped review cannot merge silently."
-        exit 1
-      fi
-
-      case "$state" in
-        success)
-          return 0
-          ;;
-        pending)
-          ;;
-        *)
-          echo "::error::CodeRabbit status is $state: $description"
-          exit 1
-          ;;
-      esac
+      evaluate_coderabbit_signal "$description" "$state" "status" && return 0
     fi
 
     if ! check_line="$(gh api --paginate --method GET "repos/$REPO/commits/$SHA/check-runs" \
@@ -77,27 +88,10 @@ wait_for_coderabbit_status() {
       IFS=$'\t' read -r check_name check_status check_conclusion check_description check_url <<< "$check_line"
       echo "CodeRabbit check run: name=$check_name status=$check_status conclusion=$check_conclusion url=$check_url"
 
-      if is_disabled_or_skipped_review "$check_description"; then
-        echo "::error::CodeRabbit reported a skipped/disabled review ('$check_description'). Failing PR Gate so a disabled/free-trial/credit-skipped review cannot merge silently."
-        exit 1
-      fi
-
       if [[ "$check_status" != "completed" ]]; then
         :
       else
-        case "$check_conclusion" in
-          success|neutral)
-            return 0
-            ;;
-          skipped)
-            echo "::error::CodeRabbit check run was skipped: $check_description"
-            exit 1
-            ;;
-          *)
-            echo "::error::CodeRabbit check run concluded $check_conclusion: $check_description"
-            exit 1
-            ;;
-        esac
+        evaluate_coderabbit_signal "$check_description" "$check_conclusion" "check run" && return 0
       fi
     fi
 

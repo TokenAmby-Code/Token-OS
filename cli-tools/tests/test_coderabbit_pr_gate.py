@@ -98,6 +98,39 @@ def test_coderabbit_gate_rejects_skipped_check_run(tmp_path: Path) -> None:
     assert "CodeRabbit check run was skipped" in result.stdout
 
 
+def test_coderabbit_gate_accepts_neutral_check_run_with_benign_summary(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_fake_gh(bin_dir)
+    script = tmp_path / "coderabbit-pr-gate.sh"
+    shutil.copy2(SCRIPT, script)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "GH_TOKEN": "token",
+            "REPO": "owner/repo",
+            "PR_NUMBER": "17",
+            "SHA": "head-sha",
+            "CODERABBIT_GATE_TIMEOUT_SECONDS": "1",
+            "CODERABBIT_GATE_POLL_INTERVAL_SECONDS": "1",
+            "FAKE_CR_CHECK_CONCLUSION": "neutral",
+            "FAKE_CR_CHECK_SUMMARY": "No actionable comments were generated.",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(script)], env=env, text=True, capture_output=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert (
+        "CodeRabbit check run: name=CodeRabbit / Review status=completed conclusion=neutral"
+        in result.stdout
+    )
+
+
 def test_coderabbit_gate_rejects_disabled_neutral_review(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
