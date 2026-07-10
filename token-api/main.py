@@ -88,7 +88,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import shared
 import talk as talk_service
 import temp_message as temp_message_service
-from billable import accrual_weight, classify_work_class, trickle_numerator
+from billable import accrual_weight, classify_domain, classify_work_class, trickle_numerator
 from context_governor import (
     ContextSweepRequest,
     record_context_governor_progress,
@@ -21107,6 +21107,10 @@ async def _ops_read_instances(now: datetime) -> dict:
                 # singleton trigger exempts them, so UI breach-marking must too.
                 "commander_type": inst.get("commander_type"),
                 "work_class": work_class,
+                # Fleet-queue domain (cwd oracle, see classify_domain) — picks the
+                # cockpit's LEFT (token-os) vs RIGHT (askcivic) worker system. The
+                # browser receives this enum, never a raw path decision.
+                "domain": classify_domain(inst.get("working_dir")),
                 "golden_throne": inst.get("golden_throne"),
                 # "Agent has PR open" flag (Phase 1) — /ui/ops renders a badge linking
                 # pr_url when pr_state == 'open'. Flipped to 'merged' by CD (Phase 2).
