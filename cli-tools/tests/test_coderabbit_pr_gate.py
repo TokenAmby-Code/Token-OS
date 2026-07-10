@@ -25,6 +25,11 @@ fi
 if [[ "$args" == *"commits/head-sha/check-runs"* ]]; then
   conclusion="${FAKE_CR_CHECK_CONCLUSION:-success}"
   summary="${FAKE_CR_CHECK_SUMMARY:-No actionable comments were generated.}"
+  title="${FAKE_CR_CHECK_TITLE:-CodeRabbit Review Progress}"
+  if [[ "${FAKE_CR_CHECK_JSON:-}" == "empty_summary_title" ]]; then
+    printf 'CodeRabbit / Review\tcompleted\t%s\t%s\t%s\n' "$conclusion" "$title" 'https://app.coderabbit.ai/change-stack/test'
+    exit 0
+  fi
   printf '%s\t%s\t%s\t%s\t%s\n' 'CodeRabbit / Review' 'completed' "$conclusion" "$summary" 'https://app.coderabbit.ai/change-stack/test'
   exit 0
 fi
@@ -194,3 +199,34 @@ def test_coderabbit_gate_rejects_disabled_neutral_review(tmp_path: Path) -> None
 
     assert result.returncode != 0
     assert "CodeRabbit reported a skipped/disabled review" in result.stdout
+
+
+def test_coderabbit_gate_rejects_disabled_title_when_summary_empty(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_fake_gh(bin_dir)
+    script = tmp_path / "coderabbit-pr-gate.sh"
+    shutil.copy2(SCRIPT, script)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "GH_TOKEN": "token",
+            "REPO": "owner/repo",
+            "PR_NUMBER": "17",
+            "SHA": "head-sha",
+            "CODERABBIT_GATE_TIMEOUT_SECONDS": "1",
+            "CODERABBIT_GATE_POLL_INTERVAL_SECONDS": "1",
+            "FAKE_CR_CHECK_JSON": "empty_summary_title",
+            "FAKE_CR_CHECK_CONCLUSION": "neutral",
+            "FAKE_CR_CHECK_TITLE": "Review skipped: free tier disabled",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(script)], env=env, text=True, capture_output=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert "Review skipped: free tier disabled" in result.stdout

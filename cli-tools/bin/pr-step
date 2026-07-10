@@ -811,13 +811,15 @@ coderabbit_handle_ratelimit_comment() {
     reset="$(coderabbit_ratelimit_reset_epoch_at "$body" "$stamp")"
     if [[ "$reset" =~ ^[0-9]+$ ]]; then
         padded_reset="$(rate_limit_reset_epoch_with_review_padding "$reset")"
+        if [[ -n "$done_var" ]]; then
+            [[ "$max" =~ ^[0-9]+$ ]] || return 1
+            done="${!done_var:-0}"
+            [[ "$done" =~ ^[0-9]+$ ]] || done=0
+            (( done < max )) || return 1
+        fi
         sleep_until_rate_limit_reset "$padded_reset" "CodeRabbit rate limit"
         if rate_limit_reset_reached "$padded_reset"; then
             if [[ -n "$done_var" ]]; then
-                [[ "$max" =~ ^[0-9]+$ ]] || return 1
-                done="${!done_var:-0}"
-                [[ "$done" =~ ^[0-9]+$ ]] || done=0
-                (( done < max )) || return 1
                 done=$((done + 1))
                 printf -v "$done_var" '%s' "$done"
             fi

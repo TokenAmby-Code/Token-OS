@@ -82,7 +82,7 @@ wait_for_coderabbit_status() {
     fi
 
     if ! check_line="$(gh api --paginate --method GET "repos/$REPO/commits/$SHA/check-runs" \
-      --jq '[.check_runs[]? | select(((((.name // "") | ascii_downcase) | startswith("coderabbit")) or ((((.app.slug // "") | ascii_downcase) == "coderabbitai"))))] | sort_by(.completed_at // .started_at // .created_at // "") | if length == 0 then empty else last | [.name, .status, (.conclusion // ""), (.output.summary // .output.title // ""), (.details_url // "")] | @tsv end')"; then
+      --jq '[.check_runs[]? | select(((((.name // "") | ascii_downcase) | startswith("coderabbit")) or ((((.app.slug // "") | ascii_downcase) == "coderabbitai"))))] | sort_by(.completed_at // .started_at // .created_at // "") | if length == 0 then empty else last | [.name, .status, (.conclusion // ""), ((.output.summary // "") as $s | if ($s | length) > 0 then $s else (.output.title // "") end), (.details_url // "")] | @tsv end')"; then
       echo "::error::Failed to query CodeRabbit check runs for $SHA. Check GH_TOKEN, REPO, SHA, and checks: read."
       exit 1
     fi
