@@ -3,6 +3,7 @@ import { personaIcon, personaIconInner, personaImage } from './personaIcons';
 import {
   balanceMinutes,
   buildDials,
+  dialIsUnusual,
   LEMON_RESIDENT_PERSONAS,
   OCCUPANCY_COMPASS_FALLBACK_STARS,
   occupancyCompassStars,
@@ -27,7 +28,7 @@ import {
   type TtsItemStatus,
   type WorkerItem,
 } from './cockpitData';
-import { clearPhoneAttention, playTtsItem, useOpsState, useTimerHistory } from './api';
+import { clearPhoneAttention, endMorningSession, playTtsItem, useOpsState, useTimerHistory } from './api';
 import {
   DIR_DEGREES,
   resolveCompass,
@@ -797,11 +798,18 @@ function Dial({
       return;
     }
     switch (dial.action?.kind) {
-      // Override hooks. dismiss-phone is LIVE; the others still land on the
-      // drawer (no timer/enforce mutation is wired this phase — no fake success).
+      // Override hooks. dismiss-phone and end-morning are LIVE; the others still
+      // land on the drawer (no timer/enforce mutation is wired yet — no fake success).
       case 'toggle-timer':
-        console.log('[dial] toggle-timer — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
+        break;
+      case 'end-morning':
+        // Live: officially end the morning session through Token-API. The timer
+        // dial leaves the fan when the next 2s state poll reports the mode flip —
+        // nothing is optimistically faked; a failure surfaces in the console.
+        endMorningSession().catch((err) =>
+          console.error('[dial] end-morning — morning end failed', err),
+        );
         break;
       case 'dismiss-phone':
         // Live: force-clear stuck phone attention through Token-API. The dial's
@@ -812,7 +820,6 @@ function Dial({
         );
         break;
       case 'ack-enforce':
-        console.log('[dial] ack-enforce — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       default:
@@ -857,13 +864,15 @@ function Dial({
 }
 
 function Dials({ onOpenDrawer, uiScale }: { onOpenDrawer: (id: string) => void; uiScale: number }) {
-  // The live dial models — the array length IS the density (the demo cycling
-  // slider is retired; live data drives the count).
+  // The live dial models, filtered to the UNUSUAL subset — a dial earns pixels
+  // only while its value departs from its declared default, so a fully nominal
+  // system renders an empty fan. The full catalog stays in the drawer.
   const { dials } = useCockpitData();
+  const unusual = dials.filter(dialIsUnusual);
 
   return (
-    <div className="dials" aria-label={`Floating state dials · ${dials.length}`}>
-      {dials.map((dial, i) => (
+    <div className="dials" aria-label={`Floating state dials · ${unusual.length}`}>
+      {unusual.map((dial, i) => (
         <Dial
           key={dial.id}
           dial={dial}
@@ -919,7 +928,9 @@ function ttsItemToDial(item: TtsItem): DialModel {
     glyph: TTS_GLYPH[item.status],
     value: item.route,
     tone: TTS_TONE[item.status],
-    noteworthy: item.status === 'speaking',
+    // A queue item is inherently unusual — its presence in the stack IS the
+    // signal — so the default never matches and the stack renders every item.
+    defaultValue: '',
     subtitle: item.text,
   };
 }
