@@ -22291,11 +22291,23 @@ def _ops_tmux_cell_state(row: dict, free_ids: set[str]) -> str:
     return "unknown" if pane_ref else "drift"
 
 
-def _ops_normalize_tmux_payload(payload, surface: str, errors: list[str]):
+def _ops_normalize_tmux_payload(
+    payload: dict | list | Exception, surface: str, errors: list[str]
+) -> dict | list:
     if isinstance(payload, Exception):
         errors.append(f"tmuxctld {surface} unavailable: {payload}")
         return []
-    return payload.get("result", payload) if isinstance(payload, dict) else payload
+    if not isinstance(payload, dict):
+        return payload
+    result = payload.get("result", payload)
+    if surface == "ledger" and isinstance(result, dict) and isinstance(result.get("rows"), list):
+        return result["rows"]
+    return result
+
+
+def _ops_tmux_ledger_row_is_current(row: dict) -> bool:
+    raw_state = str(row.get("state") or row.get("status") or "").upper()
+    return raw_state not in {"CLOSED", "EXITED", "DEAD"}
 
 
 def _ops_build_tmux_occupancy(
@@ -22323,6 +22335,8 @@ def _ops_build_tmux_occupancy(
     for row in ledger_rows:
         if not isinstance(row, dict):
             errors.append("tmuxctld ledger row malformed")
+            continue
+        if not _ops_tmux_ledger_row_is_current(row):
             continue
         pane_positional_id = _ops_public_pane_ref(row)
         state = _ops_tmux_cell_state(row, free_ids)
@@ -22390,7 +22404,7 @@ async def _ops_read_tmuxctld_snapshot(generated_at: datetime) -> dict:
         base = shared._tmuxctld_url(default_loopback=True)
 
         def read_json(path: str):
-            with shared._TMUXCTLD_OPENER.open(f"{base}{path}", timeout=0.75) as resp:
+            with shared._TMUXCTLD_OPENER.open(f"{base}{path}", timeout=3.0) as resp:
                 return json.loads(resp.read().decode(errors="ignore") or "{}")
 
         ledger_payload, freelist_payload = await asyncio.gather(
@@ -22544,11 +22558,11 @@ async def _ops_collect_facts(now: datetime) -> dict:
 
     tmux_occupancy_status = (tmux_health.get("occupancy") or {}).get("status")
     sources["tmuxctld"] = _ops_source_health(
-        "warn"
-        if tmux_health.get("reachable") and tmux_occupancy_status in {"warn", "bad"}
-        else "ok"
-        if tmux_health.get("reachable")
-        else "warn",
+        "bad"
+        if not tmux_health.get("reachable") or tmux_occupancy_status == "bad"
+        else "warn"
+        if tmux_occupancy_status == "warn"
+        else "ok",
         available=bool(tmux_health.get("reachable")),
         message="tmuxctld occupancy degraded"
         if tmux_health.get("reachable") and tmux_occupancy_status in {"warn", "bad"}

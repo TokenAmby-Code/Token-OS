@@ -5,7 +5,6 @@ import {
   buildDials,
   dialIsUnusual,
   LEMON_RESIDENT_PERSONAS,
-  OCCUPANCY_COMPASS_FALLBACK_STARS,
   occupancyCompassStars,
   mapMode,
   nowClock,
@@ -4180,7 +4179,7 @@ export function OpsCockpit() {
       segments: h ? toModeSegments(h) : [],
       nowPoint,
       dials: s ? buildDials(s) : [],
-      compassStars: s ? occupancyCompassStars(s) : OCCUPANCY_COMPASS_FALLBACK_STARS,
+      compassStars: s ? occupancyCompassStars(s) : [],
       ttsQueue: s ? toTtsQueue(s) : [],
       fleetQueues: s
         ? toFleetQueues(s)

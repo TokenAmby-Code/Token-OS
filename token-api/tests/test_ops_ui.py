@@ -659,7 +659,7 @@ def test_ops_status_tmuxctld_health_unavailable_degrades_without_crash(client) -
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["sources"]["tmuxctld"]["status"] == "warn"
+    assert body["sources"]["tmuxctld"]["status"] == "bad"
     assert body["sources"]["tmuxctld"]["available"] is False
     assert body["tmux"]["reachable"] is False
     assert body["tmux"]["tmux_reachable"] is None
@@ -1248,7 +1248,7 @@ def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) 
             "occupancy": {
                 "status": "warn",
                 "generated_at": generated_at.isoformat(),
-                "total": 3,
+                "total": 4,
                 "occupied": 1,
                 "free": 1,
                 "dead": 0,
@@ -1304,6 +1304,7 @@ def test_ops_state_includes_tmux_occupancy_counts(client, app_env, monkeypatch) 
     monkeypatch.setattr(app_env.main, "_ops_read_tmuxctld_snapshot", _fake_snapshot)
     body = client.get("/api/ui/ops/state").json()
     occ = body["tmux"]["occupancy"]
+    assert occ["total"] == len(occ["cells"]) == 4
     assert occ["occupied"] == 1
     assert occ["free"] == 1
     assert occ["drift"] == 1
@@ -1335,6 +1336,41 @@ def test_ops_tmux_cell_state_prefers_occupied_signal_over_freelist(app_env) -> N
         )
         == "occupied"
     )
+
+
+def test_ops_tmux_occupancy_accepts_daemon_ledger_rows_envelope(app_env) -> None:
+    generated_at = app_env.main.datetime.fromisoformat("2026-07-09T10:00:00+00:00")
+    occ = app_env.main._ops_build_tmux_occupancy(
+        generated_at,
+        {"reachable": True},
+        {
+            "ok": True,
+            "result": {
+                "path": "/tmp/ledger.json",
+                "rows": [
+                    {
+                        "pane_positional_id": "palace:N",
+                        "instance_id": "i1",
+                        "wrapper_id": "w1",
+                        "state": "OPEN",
+                    },
+                    {
+                        "pane_positional_id": "palace:S",
+                        "instance_id": "old",
+                        "wrapper_id": "closed",
+                        "state": "CLOSED",
+                    },
+                ],
+            },
+        },
+        {"ok": True, "result": [{"pane_role": "palace:S"}]},
+    )
+
+    assert occ["status"] == "ok"
+    assert occ["total"] == 2
+    assert occ["occupied"] == 1
+    assert occ["free"] == 1
+    assert [cell["pane_positional_id"] for cell in occ["cells"]] == ["palace:N", "palace:S"]
 
 
 def test_ops_tmux_occupancy_counts_unknown_and_malformed_payloads(app_env) -> None:
@@ -1383,4 +1419,4 @@ def test_ops_state_tmux_occupancy_unavailable(client, app_env, monkeypatch) -> N
     body = client.get("/api/ui/ops/state").json()
     assert body["tmux"]["occupancy"]["status"] == "bad"
     assert body["tmux"]["occupancy"]["errors"] == ["boom"]
-    assert body["sources"]["tmuxctld"]["status"] == "warn"
+    assert body["sources"]["tmuxctld"]["status"] == "bad"
