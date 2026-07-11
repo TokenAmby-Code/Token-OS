@@ -32,6 +32,12 @@ def _detect_machine() -> str:
         return "wsl"
     if os.path.isdir("/data/data/com.termux"):
         return "phone"
+    # Generic Linux: distinguish the K12 boxes by hostname so the personal/work
+    # split stays nameable for routing and enforcement scoping. Any other Linux
+    # node stays the generic "linux" fallback.
+    host = platform.node().split(".")[0]
+    if host in ("k12-personal", "k12-work"):
+        return host
     return "linux"
 
 
@@ -40,6 +46,12 @@ MACHINE = _detect_machine()
 # ============================================================
 # CONFIG REGISTRY — mirrors nas-path.sh exactly
 # ============================================================
+
+# Token-API host — the single tailnet node currently serving Token-API (the mac
+# today; migrates to k12-personal at cutover). Hoisted once so satellite rows
+# don't each embed the literal IP. Machines that run their OWN local Token-API
+# (mac, k12-personal) point at localhost instead of this host.
+_IMPERIUM_TOKEN_API_HOST = "100.95.109.23"
 
 _REGISTRY: dict[str, dict[str, str]] = {
     "mac": {
@@ -56,7 +68,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "nas_imperium": "/mnt/imperium",
         "nas_civic": "/mnt/civic",
         "tailscale_ip": "100.66.10.74",
-        "token_api_url": "http://100.95.109.23:7777",
+        "token_api_url": f"http://{_IMPERIUM_TOKEN_API_HOST}:7777",
         "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "wsl",
         "device_name": "TokenPC",
@@ -66,7 +78,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "nas_imperium": "",
         "nas_civic": "",
         "tailscale_ip": "100.102.92.24",
-        "token_api_url": "http://100.95.109.23:7777",
+        "token_api_url": f"http://{_IMPERIUM_TOKEN_API_HOST}:7777",
         "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "phone",
         "device_name": "Token-S24",
@@ -76,11 +88,39 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "nas_imperium": "/mnt/imperium",
         "nas_civic": "/mnt/civic",
         "tailscale_ip": "",
-        "token_api_url": "http://100.95.109.23:7777",
+        "token_api_url": f"http://{_IMPERIUM_TOKEN_API_HOST}:7777",
         "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "",
         "device_name": "",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
+    },
+    # K12 personal (GMKtec K12; Imperium domain — replaces the Mac Mini). Runs
+    # its OWN local Token-API (per-box registry pre-cutover) and is the long-term
+    # Token-API home, so token_api_url is localhost. Civic is NOT mounted here:
+    # the personal/work boundary is physical — cross-mounting is prohibited.
+    "k12-personal": {
+        "nas_imperium": "/mnt/imperium",
+        "nas_civic": "",
+        "tailscale_ip": "100.113.115.32",
+        "token_api_url": "http://localhost:7777",
+        "tmuxctld_url": "http://127.0.0.1:7778",
+        "ssh_alias": "k12-personal",
+        "device_name": "K12-Personal",
+        "token_os_runtime": "~/runtimes/token-os/live",
+    },
+    # K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE).
+    # Present in the Imperium registry only to be nameable for routing/enforcement
+    # scoping; civic-specific config lives in Pax-ENV. Imperium is NOT mounted on
+    # the work box (boundary), and it runs no Token-OS runtime.
+    "k12-work": {
+        "nas_imperium": "",
+        "nas_civic": "/mnt/civic",
+        "tailscale_ip": "100.67.168.105",
+        "token_api_url": f"http://{_IMPERIUM_TOKEN_API_HOST}:7777",
+        "tmuxctld_url": "http://127.0.0.1:7778",
+        "ssh_alias": "k12-work",
+        "device_name": "K12-Work",
+        "token_os_runtime": "",
     },
 }
 
