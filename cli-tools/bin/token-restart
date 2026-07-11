@@ -160,6 +160,49 @@ Notes:
 EOF
 }
 
+
+# ============ Opt-in tmux geometry tracing ============
+
+TOKEN_RESTART_TMUX_GEOMETRY_LOG="${TOKEN_RESTART_TMUX_GEOMETRY_LOG:-$HOME/.claude/token-restart-tmux-geometry.log}"
+
+tmux_geometry_trace_enabled() {
+    [[ "${TOKEN_RESTART_TRACE_TMUX_GEOMETRY:-}" == "1" ]]
+}
+
+trace_tmux_geometry() {
+    local label="${1:-snapshot}"
+    tmux_geometry_trace_enabled || return 0
+
+    local log="$TOKEN_RESTART_TMUX_GEOMETRY_LOG"
+    local dir
+    dir="$(dirname "$log")"
+
+    # Fail-soft by design: geometry tracing is diagnostic only and must never
+    # affect restart/deploy success. Keep all tmux calls read-only.
+    {
+        mkdir -p "$dir" 2>/dev/null || true
+        {
+            printf '\n=== %s | %s ===\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$label"
+            if ! command -v tmux >/dev/null 2>&1; then
+                echo "tmux: not found"
+                return 0
+            fi
+
+            echo "-- attached clients --"
+            tmux list-clients -F 'tty=#{client_tty} pid=#{client_pid} size=#{client_width}x#{client_height} flags=#{client_flags} session=#{session_name} window=#{window_index}:#{window_name}' 2>&1 || true
+
+            echo "-- windows --"
+            tmux list-windows -a -F 'session=#{session_name} window=#{window_index}:#{window_name} size=#{window_width}x#{window_height} layout=#{window_layout} window-size=#{window-size}' 2>&1 || true
+
+            echo "-- global options --"
+            printf 'window-size='
+            tmux show-options -gqv window-size 2>&1 || true
+            printf 'aggressive-resize='
+            tmux show-options -gqv aggressive-resize 2>&1 || true
+        } >> "$log" 2>&1
+    } >/dev/null 2>&1 || true
+}
+
 # ============ Remote Proxy ============
 # When run from WSL or phone, proxy to Mac which orchestrates everything
 
@@ -1880,6 +1923,7 @@ abort_deploy_if_superseded() {
 full_restart() {
     echo -e "${BOLD}=== Token Restart ===${NC}"
     echo ""
+    trace_tmux_geometry "start full_restart"
 
     # 0. Git sync (default): ff-only pull the live checkout so a merge ships
     #    before we restart. Sets SYNC_DID_ADVANCE + SYNC_CHANGED_PATHS. Always
@@ -1957,9 +2001,11 @@ full_restart() {
     # 2. Mac token-api
     abort_deploy_if_superseded "before token-api restart" && return 0
     if [[ "$RESTART_TOKENAPI" == true ]]; then
+        trace_tmux_geometry "before restart_mac"
         restart_mac || return 1
         abort_deploy_if_superseded "after token-api restart" && return 0
         verify_mac_git_sha || return 1
+        trace_tmux_geometry "after token-api health/git-sha verification"
         echo ""
     fi
 
@@ -2006,8 +2052,12 @@ full_restart() {
 
     # 6. Browser cockpit refresh — only if token-api was (re)started and healthy.
     if [[ "$RESTART_TOKENAPI" == true ]] && check_mac_health; then
+        trace_tmux_geometry "before Ops browser refresh"
         refresh_ops_browser_gui || true
+        trace_tmux_geometry "after Ops browser refresh"
     fi
+
+    trace_tmux_geometry "final summary"
 
     # 7. Summary — report only what we touched.
     echo ""

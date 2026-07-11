@@ -679,6 +679,58 @@ def test_no_advance_full_restart_still_never_wipes_fleet(tmp_path: Path) -> None
     _assert_no_fleet_wipe(calls)
 
 
+def test_opt_in_tmux_geometry_trace_captures_labeled_snapshots(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "token-api/main.py")
+    env["TOKEN_RESTART_TRACE_TMUX_GEOMETRY"] = "1"
+    trace_log = tmp_path / "trace" / "token-restart-tmux-geometry.log"
+    env["TOKEN_RESTART_TMUX_GEOMETRY_LOG"] = str(trace_log)
+
+    proc = _run(env)
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    calls = logfile.read_text()
+    assert "tmux list-clients -F" in calls
+    assert "tmux list-windows -a -F" in calls
+    assert "tmux show-options -gqv window-size" in calls
+    assert "tmux show-options -gqv aggressive-resize" in calls
+
+    trace = trace_log.read_text()
+    for label in (
+        "start full_restart",
+        "before restart_mac",
+        "after token-api health/git-sha verification",
+        "before Ops browser refresh",
+        "after Ops browser refresh",
+        "final summary",
+    ):
+        assert label in trace
+    assert "-- attached clients --" in trace
+    assert "-- windows --" in trace
+    assert "-- global options --" in trace
+
+
+def test_opt_in_tmux_geometry_trace_failures_are_fail_soft(tmp_path: Path) -> None:
+    env, logfile = _stub_env(tmp_path, "token-api/main.py")
+    env["TOKEN_RESTART_TRACE_TMUX_GEOMETRY"] = "1"
+    trace_log = tmp_path / "trace" / "token-restart-tmux-geometry.log"
+    env["TOKEN_RESTART_TMUX_GEOMETRY_LOG"] = str(trace_log)
+    tmux = Path(env["PATH"].split(os.pathsep, 1)[0]) / "tmux"
+    tmux.write_text(
+        f'''#!/usr/bin/env bash
+echo "tmux $*" >> "{logfile}"
+echo "simulated tmux failure" >&2
+exit 88
+'''
+    )
+    tmux.chmod(0o755)
+
+    proc = _run(env)
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert RESTART_TOKENAPI in logfile.read_text()
+    assert "simulated tmux failure" in trace_log.read_text()
+
+
 def test_trailing_resync_clears_pinned_sha_to_converge_newest_main(tmp_path: Path) -> None:
     """Regression for #413/#418-style lag: a lock contender queued a trailing
     re-sync, but the holder kept its original TOKEN_RESTART_TARGET_SHA pinned.
@@ -712,6 +764,7 @@ _reset_deploy_run_state
 def test_deploy_verify_alarm_fails_when_health_sha_mismatch(tmp_path: Path) -> None:
     env, _logfile = _stub_env(tmp_path, "token-api/main.py")
     env["STUB_RUNNING_SHA"] = "STALE999"
+    env.pop("STUB_CURL_HEALTH_COUNTER", None)
     proc = _run(env)
     assert proc.returncode != 0
     assert "DEPLOY VERIFY ALARM" in proc.stdout
