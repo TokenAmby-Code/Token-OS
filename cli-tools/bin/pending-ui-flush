@@ -317,8 +317,6 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     lines: list[str] = []
     if args.rename:
         lines.append(_format_line(ts, session, pane, f"/rename {args.rename}"))
-    if args.clear_context:
-        lines.append(_format_line(ts, session, pane, "/clear"))
     if not lines:
         print(json.dumps({"enqueued": 0}))
         return 0
@@ -476,11 +474,6 @@ def main(argv: list[str]) -> int:
     p_enq.add_argument("--session", default="")
     p_enq.add_argument("--ts", type=int, default=None)
     p_enq.add_argument("--rename", default="")
-    p_enq.add_argument(
-        "--clear-context",
-        action="store_true",
-        help="enqueue a guarded /clear context command for this pane/session",
-    )
     p_enq.set_defaults(func=cmd_enqueue)
 
     p_flush = sub.add_parser("flush", help="safely drain one pane's queue")

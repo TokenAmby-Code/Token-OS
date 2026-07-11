@@ -2,8 +2,8 @@
 // components never call endpoints ad-hoc. Each hook owns one read-model.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Counts, OpsState, TimerHistory, TtsGlobalMode } from './contracts';
-import { CONTRACT_VERSION, OpsStateSchema, TimerHistorySchema } from './contracts';
+import type { Counts, OpsState, TimerHistory, OpsGraph, SessionDocsFeed, TtsGlobalMode } from './types';
+import { mockOpsGraph } from './mock';
 
 export type Feed<T> = {
   data: T | null;
@@ -15,45 +15,6 @@ export type Feed<T> = {
   /** force an immediate refetch (resets the poll timer) */
   refresh: () => void;
 };
-
-// ── THE OPS COCKPIT POLL LEDGER ─────────────────────────────────────────────
-// Every poll this cockpit runs, in ONE strict canonical list. The Emperor
-// detests polling; event-driven transport is the target architecture and will
-// replace these ticks. This monitor is the ONE surface where tick-refresh is
-// tolerated — and only under registration: every `usesPolling` call site MUST
-// have a ledger entry. Adding a poll without registering it here is a
-// review-blocking offense. (A tripwire test in cockpitData.test.ts pins the
-// exact entries.)
-export type OpsCockpitPoll = {
-  route: string; // the endpoint the poll ticks against
-  intervalMs: number; // the default tick interval (the hook's default arg)
-  hook: string; // the usesPolling-backed hook that owns the tick
-  purpose: string; // why this poll is tolerated
-};
-
-export const OPS_COCKPIT_POLLS: readonly OpsCockpitPoll[] = [
-  {
-    route: '/api/ui/ops/state',
-    intervalMs: 2000,
-    hook: 'useOpsState',
-    purpose:
-      'The ONE aggregate read-model spine — dials, TTS stack, worker rails, the kanban session_docs embed, and deploy-follow all ride it; never a second poller per #671.',
-  },
-  {
-    route: '/api/ui/ops/timer/history',
-    intervalMs: 30000,
-    hook: 'useTimerHistory',
-    purpose: 'Balance-line history for the timer graph.',
-  },
-] as const;
-
-// Hook defaults derive FROM the ledger — the manifest is the single source of
-// the tick cadence, so the ledger and the real polling intervals cannot drift.
-function ledgeredInterval(hook: string): number {
-  const poll = OPS_COCKPIT_POLLS.find((p) => p.hook === hook);
-  if (!poll) throw new Error(`unledgered poll hook: ${hook}`);
-  return poll.intervalMs;
-}
 
 function usesPolling<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
@@ -109,26 +70,6 @@ async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   return (await res.json()) as T;
 }
 
-/**
- * Advisory runtime validation at the poll boundary. A schema miss logs loudly
- * with the Zod issue list but ALWAYS returns the raw payload — a contract gap
- * must never blank the live operator surface.
- */
-function boundaryValidate<T>(
-  label: string,
-  schema: { safeParse: (data: unknown) => { success: boolean; error?: { issues: unknown[] } } },
-  payload: T,
-): T {
-  const result = schema.safeParse(payload);
-  if (!result.success) {
-    console.error(
-      `[contracts] ${label} failed ${CONTRACT_VERSION} validation — rendering raw payload anyway`,
-      result.error?.issues,
-    );
-  }
-  return payload;
-}
-
 function countMap(value: unknown): Counts {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(
@@ -171,12 +112,9 @@ function normalizeOpsState(payload: OpsState): OpsState {
 }
 
 /** Live cockpit state — polled fast (brief: every 2s). */
-export function useOpsState(intervalMs = ledgeredInterval('useOpsState')): Feed<OpsState> {
+export function useOpsState(intervalMs = 2000): Feed<OpsState> {
   return usesPolling<OpsState>(
-    async (signal) =>
-      normalizeOpsState(
-        boundaryValidate('ops-state', OpsStateSchema, await getJson<OpsState>('/api/ui/ops/state', signal)),
-      ),
+    async (signal) => normalizeOpsState(await getJson<OpsState>('/api/ui/ops/state', signal)),
     intervalMs,
   );
 }
@@ -185,14 +123,12 @@ export function useOpsState(intervalMs = ledgeredInterval('useOpsState')): Feed<
 // Thin POSTs to Token-API (the authority). These are NOT a dual-write: routing
 // the mutation *through* Token-API is exactly the read-only-documents contract.
 
-async function postJson<T = unknown>(url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function postJson<T = unknown>(url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
     cache: 'no-store',
-    ...(signal ? { signal } : {}),
-    ...(body !== undefined
-      ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-      : {}),
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json().catch(() => ({}))) as T;
@@ -200,13 +136,6 @@ async function postJson<T = unknown>(url: string, body?: unknown, signal?: Abort
 
 export type SkipResult = { skipped: boolean; cleared: number; backend?: string | null };
 export type PromoteResult = { success: boolean; promoted: number };
-export type PlayItemResult = {
-  success: boolean;
-  promoted: number;
-  item_key: string;
-  reason?: string;
-  from_queue?: string;
-};
 export type GlobalModeResult = { status: string; mode: TtsGlobalMode; old_mode: string };
 export type FocusResult = { snapped: boolean; reason: string | null };
 export type MorningEndResult = { status: string; changed: boolean; morning_status: string };
@@ -225,11 +154,6 @@ export function promotePause(instanceId?: string): Promise<PromoteResult> {
 /** Promote all of one instance's paused items to the front of the hot queue. */
 export function playPane(instanceId: string): Promise<PromoteResult> {
   return postJson<PromoteResult>('/api/tts/queue/play-pane', { instance_id: instanceId });
-}
-
-/** Promote/play one exact queued TTS item. */
-export function playTtsItem(itemKey: string, signal?: AbortSignal): Promise<PlayItemResult> {
-  return postJson<PlayItemResult>('/api/tts/queue/play-item', { item_key: itemKey }, signal);
 }
 
 /** Set the global TTS mode (verbose | muted | silent). */
@@ -301,16 +225,40 @@ function secondsSinceDayStart(): number {
  * `GET /api/ui/ops/timer/history`; no mock fallback, because fake timer data is
  * worse than an explicit degraded state. Polled slowly per the brief.
  */
-export function useTimerHistory(bucketSec = 60, intervalMs = ledgeredInterval('useTimerHistory')): Feed<TimerHistory> {
+export function useTimerHistory(bucketSec = 60, intervalMs = 30000): Feed<TimerHistory> {
   return usesPolling<TimerHistory>(async (signal) => {
     const windowSec = secondsSinceDayStart();
-    return boundaryValidate(
-      'timer-history',
-      TimerHistorySchema,
-      await getJson<TimerHistory>(
-        `/api/ui/ops/timer/history?window=${windowSec}s&bucket=${bucketSec}s`,
-        signal,
-      ),
+    return getJson<TimerHistory>(
+      `/api/ui/ops/timer/history?window=${windowSec}s&bucket=${bucketSec}s`,
+      signal,
     );
+  }, intervalMs);
+}
+
+/**
+ * Session-doc pipeline feed. Read-only board grouped by frontmatter `status`.
+ * Reads the same YAML Obsidian does; surfaces only a one-line head per doc and
+ * deep-links into Obsidian for the full document. Polled slowly — pipeline
+ * state changes on human timescales, not telemetry timescales.
+ */
+export function useSessionDocs(intervalMs = 30000): Feed<SessionDocsFeed> {
+  return usesPolling<SessionDocsFeed>(
+    (signal) => getJson<SessionDocsFeed>('/api/ui/ops/session-docs', signal),
+    intervalMs,
+  );
+}
+
+/**
+ * Graph feed. Brief: do not poll large graph endpoints at the state cadence;
+ * refresh on demand / slow. Falls back to mocked OpsGraph only if the backend
+ * read-model endpoint is unavailable.
+ */
+export function useOpsGraph(graph = 'active', intervalMs = 60000): Feed<OpsGraph> {
+  return usesPolling<OpsGraph>(async (signal) => {
+    try {
+      return await getJson<OpsGraph>(`/api/ui/ops/graph/${encodeURIComponent(graph)}`, signal);
+    } catch {
+      return mockOpsGraph(graph);
+    }
   }, intervalMs);
 }

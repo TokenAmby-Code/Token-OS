@@ -3,7 +3,7 @@ from __future__ import annotations
 import pathlib
 import sys
 from types import SimpleNamespace
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
@@ -882,7 +882,7 @@ def test_sweep_noops_on_healthy_rows():
     assert {r["action"] for r in results} == {"none"}
 
 
-def test_sweep_skips_mutation_for_live_persona_without_row() -> None:
+def test_sweep_skips_registry_for_live_persona() -> None:
     from tmuxctl.assertions import assert_instance
 
     adapter = FakeAdapter()
@@ -892,157 +892,19 @@ def test_sweep_skips_mutation_for_live_persona_without_row() -> None:
         patch.object(assertions, "_pane_type", return_value="council"),
         patch.object(assertions, "_pane_dead", return_value=False),
         patch.object(assertions, "_runtime_has_instance", return_value=True),
-        patch.object(assertions, "_registry_entries", return_value=[]),
-        patch.object(assertions, "_assert_persona_color") as assert_color,
-        patch.object(assertions, "_clear_persona_guard") as clear_guard,
-    ):
-        result = assert_instance(adapter, "council:custodes", registry_optional=True)
-
-    assert_color.assert_not_called()
-    clear_guard.assert_not_called()
-    assert result["ok"] is True
-    assert result["action"] == "none"
-    assert result["reason"] == "live_registry_skipped"
-
-
-def test_sweep_rebinds_half_bound_live_persona_from_stamp_and_row() -> None:
-    from tmuxctl.assertions import assert_instance
-
-    adapter = FakeAdapter()
-    adapter.options.update({"@INSTANCE_ID": "i-cust", "@PERSONA": ""})
-
-    def run(*args, allow_failure: bool = False) -> str:
-        adapter.calls.append(args)
-        if args[:2] == ("list-panes", "-a"):
-            return "%25\t0\ti-cust\tcouncil:custodes"
-        return FakeAdapter.run(adapter, *args, allow_failure=allow_failure)
-
-    adapter.run = run
-    row = _row(
-        instance_id="i-cust",
-        pane_label="",
-        tmux_pane="",
-        persona_slug="custodes",
-        rank="overseer",
-    )
-    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
-    with (
-        patch.object(assertions, "resolve_pane", return_value=resolved),
-        patch.object(assertions, "_pane_type", return_value="council"),
-        patch.object(assertions, "_pane_dead", return_value=False),
-        patch.object(assertions, "_runtime_has_instance", return_value=True),
-        patch.object(assertions, "_registry_entries", return_value=[row]),
         patch.object(
             assertions,
-            "fetch_instance_rows_raw",
-            return_value=[
-                {
-                    "id": "i-cust",
-                    "persona": {
-                        "slug": "custodes",
-                        "display_name": "Custodes",
-                        "pane_tint": "#302800",
-                    },
-                }
-            ],
+            "_registry_entries",
+            side_effect=AssertionError("registry skipped"),
         ),
-        patch.object(assertions, "log_event") as log,
+        patch.object(assertions, "_assert_persona_color"),
+        patch.object(assertions, "_clear_persona_guard"),
     ):
         result = assert_instance(adapter, "council:custodes", registry_optional=True)
 
     assert result["ok"] is True
-    assert result["action"] == "binding_reasserted"
-    assert result["reason"] == "half_bound_live_persona_rebound"
-    assert adapter.options["@PERSONA"] == "Custodes"
-    assert adapter.options["window-style"] == "bg=#302800"
-    log.assert_called_with("persona_half_bound_live_rebound", instance_id="i-cust", details=ANY)
-
-
-def test_sweep_half_bound_live_persona_fails_loud_on_ambiguous_stamp() -> None:
-    from tmuxctl.assertions import assert_instance
-
-    adapter = FakeAdapter()
-    adapter.options.update({"@INSTANCE_ID": "i-cust", "@PERSONA": ""})
-
-    def run(*args, allow_failure: bool = False) -> str:
-        adapter.calls.append(args)
-        if args[:2] == ("list-panes", "-a"):
-            return "%25\t0\ti-cust\tcouncil:custodes\n%26\t0\ti-cust\tcouncil:other"
-        return FakeAdapter.run(adapter, *args, allow_failure=allow_failure)
-
-    adapter.run = run
-    row = _row(instance_id="i-cust", persona_slug="custodes", rank="overseer")
-    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
-    with (
-        patch.object(assertions, "resolve_pane", return_value=resolved),
-        patch.object(assertions, "_pane_type", return_value="council"),
-        patch.object(assertions, "_pane_dead", return_value=False),
-        patch.object(assertions, "_runtime_has_instance", return_value=True),
-        patch.object(assertions, "_registry_entries", return_value=[row]),
-        patch.object(
-            assertions,
-            "fetch_instance_rows_raw",
-            return_value=[
-                {"id": "i-cust", "persona": {"slug": "custodes", "pane_tint": "#302800"}}
-            ],
-        ),
-    ):
-        try:
-            assert_instance(adapter, "council:custodes", registry_optional=True)
-        except ValueError as exc:
-            assert "ambiguous live pane claims" in str(exc)
-        else:  # pragma: no cover
-            raise AssertionError("expected ambiguous stamp to fail loud")
-
-
-def test_sweep_half_bound_live_persona_projection_absent_is_registry_unavailable() -> None:
-    from tmuxctl.assertions import assert_instance
-
-    adapter = FakeAdapter()
-    adapter.options.update({"@INSTANCE_ID": "i-cust", "@PERSONA": ""})
-    row = _row(instance_id="i-cust", persona_slug="custodes", rank="overseer")
-    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
-    with (
-        patch.object(assertions, "resolve_pane", return_value=resolved),
-        patch.object(assertions, "_pane_type", return_value="council"),
-        patch.object(assertions, "_pane_dead", return_value=False),
-        patch.object(assertions, "_runtime_has_instance", return_value=True),
-        patch.object(assertions, "_registry_entries", return_value=[row]),
-        patch.object(assertions, "fetch_instance_rows_raw", return_value=[]),
-    ):
-        result = assert_instance(adapter, "council:custodes", registry_optional=True)
-
-    assert result["ok"] is False
-    assert result["action"] == "registry_unavailable"
-    assert "live row persona mismatch" in result["reason"]
-    assert adapter.options["@PERSONA"] == ""
-
-
-def test_sweep_half_bound_live_persona_missing_tint_is_registry_unavailable() -> None:
-    from tmuxctl.assertions import assert_instance
-
-    adapter = FakeAdapter()
-    adapter.options.update({"@INSTANCE_ID": "i-cust", "@PERSONA": ""})
-    row = _row(instance_id="i-cust", persona_slug="custodes", rank="overseer")
-    resolved = SimpleNamespace(pane_id="%25", pane_role="council:custodes")
-    with (
-        patch.object(assertions, "resolve_pane", return_value=resolved),
-        patch.object(assertions, "_pane_type", return_value="council"),
-        patch.object(assertions, "_pane_dead", return_value=False),
-        patch.object(assertions, "_runtime_has_instance", return_value=True),
-        patch.object(assertions, "_registry_entries", return_value=[row]),
-        patch.object(
-            assertions,
-            "fetch_instance_rows_raw",
-            return_value=[{"id": "i-cust", "persona": {"slug": "custodes"}}],
-        ),
-    ):
-        result = assert_instance(adapter, "council:custodes", registry_optional=True)
-
-    assert result["ok"] is False
-    assert result["action"] == "registry_unavailable"
-    assert "pane_tint" in result["reason"]
-    assert adapter.options["@PERSONA"] == ""
+    assert result["action"] == "none"
+    assert result["reason"] == "live_registry_skipped"
 
 
 def test_sweep_captures_per_pane_errors_without_aborting():
@@ -1089,41 +951,3 @@ def test_build_snapshot_extracts_persona_slug_and_rank():
     entry = snap.instances[0]
     assert entry.persona_slug == "custodes"
     assert entry.rank == "overseer"
-
-
-def test_live_persona_empty_stamp_stopped_row_reasserts_binding():
-    adapter = FakeAdapter()
-    adapter.options.update(
-        {
-            "@PANE_ID": FG_LABEL,
-            "@PANE_TYPE": "mechanicus",
-            "@TOKEN_API_WRAPPER_ID": "wrap-fg",
-            "@TOKEN_API_ENGINE": "codex",
-            "@TOKEN_API_CWD": "/Volumes/Imperium/Imperium-ENV",
-            "@INSTANCE_ID": "",
-        }
-    )
-    stopped = _row(instance_id="i-fg", status=assertions.InstanceStatus.STOPPED)
-    resolved = SimpleNamespace(pane_id="%fg", pane_role=FG_LABEL)
-
-    with (
-        patch.object(assertions, "resolve_pane", return_value=resolved),
-        patch.object(assertions, "_pane_type", return_value="mechanicus"),
-        patch.object(assertions, "_pane_dead", return_value=False),
-        patch.object(assertions, "_runtime_has_instance", return_value=True),
-        patch.object(assertions, "_registry_entries", side_effect=[[], [stopped]]),
-        patch.object(assertions, "update_instance_activity") as activity,
-        patch.object(assertions, "log_event") as log,
-        patch("tmuxctl.wrapper_ledger.LEDGER.upsert") as upsert,
-    ):
-        upsert.return_value.as_dict.return_value = {"wrapper_id": "wrap-fg", "instance_id": "i-fg"}
-        result = assertions.assert_instance(adapter, FG_LABEL)
-
-    assert result["ok"] is True
-    assert result["action"] == "binding_reasserted"
-    assert adapter.options["@INSTANCE_ID"] == "i-fg"
-    activity.assert_called_once_with("i-fg", "prompt_submit")
-    upsert.assert_called_once()
-    assert upsert.call_args.kwargs["pane_positional_id"] == FG_LABEL
-    assert upsert.call_args.kwargs["instance_id"] == "i-fg"
-    log.assert_any_call("persona_binding_reasserted", instance_id="i-fg", details=ANY)

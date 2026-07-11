@@ -89,7 +89,6 @@ default_commit_message_from_staged() {
 
 emit_coderabbit_heartbeat() {
     local message="$1"
-    [[ "${PR_STEP_OPAQUE_WAIT:-false}" == "true" ]] && return 0
     if [[ -n "${PR_STEP_HEARTBEAT_FILE:-}" ]]; then
         printf '%s\n' "$message" >>"$PR_STEP_HEARTBEAT_FILE" 2>/dev/null || true
     else
@@ -263,19 +262,10 @@ pr_step_wrapper_id() {
 }
 
 pr_step_resolve_instance_id() {
-    local wrapper pane value env_iid
+    local wrapper pane value
     wrapper="$(pr_step_wrapper_id)"
     value="$(pr_step_ledger_resolve_field wrapper_id "$wrapper" instance_id || true)"
     [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
-
-    # Non-Token-OS repos and some revival/wave workers may not have a tmuxctld
-    # wrapper row available to this shell, but the harness still exports the
-    # originating instance id. Prefer that explicit identity before falling back
-    # to pane lookup: pane variables are easier to inherit stale across nested
-    # shells and caused PR flags to land on the wrong row.
-    env_iid="${TOKEN_API_INSTANCE_ID:-}"
-    [[ -n "$env_iid" ]] && { printf '%s' "$env_iid"; return 0; }
-
     pane="${TMUX_PANE:-${TOKEN_API_DISPATCH_RESOLVED_PANE:-}}"
     value="$(pr_step_ledger_resolve_field pane_id "$pane" instance_id || true)"
     [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
@@ -322,25 +312,8 @@ mark_pr_flag() {
         "${api%/}/api/instances/${iid}/pr" >/dev/null 2>&1 || true
 }
 
-pr_plan_followup_context() {
-    local pr="$1" head short cr review changes findings checks
-    head="$(pr_head_sha "$pr" 2>/dev/null || true)"
-    short="${head:0:7}"
-    cr="$(coderabbit_state_for_head "$head" 2>/dev/null || true)"
-    review="$(latest_coderabbit_review_state "$pr" 2>/dev/null || true)"
-    changes="$(changes_requested_count "$pr" 2>/dev/null || true)"
-    checks="$(checks_summary "$pr" 2>/dev/null || true)"
-    findings="$(summarize_actionable_findings "$pr" "$head" 2>/dev/null || true)"
-
-    printf 'CodeRabbit verdict: commit=%s; review=%s; changes_requested=%s; head=%s\n' "${cr:-none}" "${review:-none}" "${changes:-unknown}" "${short:-unknown}"
-    printf 'Checks:\n'
-    if [[ -n "$checks" ]]; then printf '%s\n' "$checks"; else printf '  - none reported\n'; fi
-    printf 'Actionable CodeRabbit findings:\n'
-    if [[ -n "$findings" ]]; then printf '%s\n' "$findings"; else printf '  - none found on current head\n'; fi
-}
-
 arm_pr_plan_followup() {
-    local stage="$1" pr="$2" url="${3:-}" summary="${4:-}" pane iid api prompt body context
+    local stage="$1" pr="$2" url="${3:-}" summary="${4:-}" pane iid api prompt body
     pane="$(pr_step_resolve_pane)"
     [[ -n "$pane" ]] || return 0
     iid="$(pr_step_resolve_instance_id || true)"
@@ -350,9 +323,7 @@ arm_pr_plan_followup() {
             [[ -n "$summary" ]] || summary="plan fixes or next review action."
             prompt="/plan PR #${pr} review returned"
             [[ -n "$url" ]] && prompt+=" (${url})"
-            context="$(pr_plan_followup_context "$pr" 2>/dev/null || true)"
             prompt+="; ${summary}"
-            [[ -n "$context" ]] && prompt+=$'\n\n'"${context}"
             ;;
         merge)
             [[ -n "$summary" ]] || summary="summarize closure and update context."
@@ -504,28 +475,10 @@ pr_head_sha() {
 }
 
 coderabbit_state_for_head() {
-    local head="$1" repo state check
+    local head="$1" repo
     repo="$(repo_slug)"
     [[ -n "$repo" && -n "$head" ]] || return 1
-    state="$(gh api --paginate "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -s -r 'add | [.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true)"
-    if [[ -n "$state" ]]; then
-        printf '%s\n' "$state"
-        return 0
-    fi
-    check="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null | jq -s -r '
-        [.[].check_runs[]? | select(
-            (((.name // "") | ascii_downcase) | startswith("coderabbit"))
-            or (((.app.slug // "") | ascii_downcase) == "coderabbitai")
-        )]
-        | sort_by(.completed_at // .started_at // .created_at // "")
-        | .[-1] // empty
-        | if . == null then "" elif (.status // "") != "completed" then (.status // "") else (.conclusion // "") end
-    ' 2>/dev/null || true)"
-    case "$check" in
-        success|neutral) printf 'success\n' ;;
-        failure|cancelled|timed_out|action_required) printf 'failure\n' ;;
-        *) printf '%s\n' "$check" ;;
-    esac
+    gh api "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' 2>/dev/null || true
 }
 
 latest_coderabbit_review_state() {
@@ -667,6 +620,7 @@ sleep_until_rate_limit_reset() {
         [[ "$now" =~ ^[0-9]+$ ]] || return 1
         (( now >= reset_epoch )) && return 0
         wait_for=$(( reset_epoch - now ))
+        emit_coderabbit_heartbeat "${label}: waiting ${wait_for}s until reset signal clears"
         sleep "$wait_for"
     done
 }
@@ -683,8 +637,6 @@ coderabbit_body_is_ratelimit() {
     local body="$1"
     [[ -n "$body" ]] || return 1
     grep -qiE '^[[:space:]]*#{1,3}[[:space:]]*Summary by CodeRabbit' <<<"$body" && return 1
-    grep -qiE 'Full review finished|No actionable comments were generated' <<<"$body" && return 1
-    grep -qiE 'Result:[[:space:]]*Skipped[[:space:]]*-[[:space:]]*Already reviewed|Skipped[[:space:]]*-[[:space:]]*Already reviewed' <<<"$body" && return 1
     grep -qiE "$CR_RATELIMIT_REGEX" <<<"$body"
 }
 
@@ -734,25 +686,15 @@ coderabbit_ratelimit_reset_epoch_at() {
     rate_limit_reset_epoch_from_text "$base" <<<"$body" || true
 }
 
-coderabbit_latest_issue_comment_json() {
+# Fetch the body of CodeRabbit's most recent issue (general) comment on a PR.
+coderabbit_latest_issue_comment_body() {
     local pr="$1" repo
     repo="$(repo_slug)"
     [[ -n "$repo" ]] || return 1
-    gh api --paginate "repos/${repo}/issues/${pr}/comments" 2>/dev/null | jq -s -r '
-        [ .[] | .[] | select((.user.login // "" | ascii_downcase) as $u
+    gh api "repos/${repo}/issues/${pr}/comments" 2>/dev/null | jq -r '
+        [.[] | select((.user.login // "" | ascii_downcase) as $u
             | $u == "coderabbitai[bot]" or $u == "coderabbitai" or $u == "coderabbit")]
-        | sort_by(.updated_at // .created_at // "") | .[-1] // empty' 2>/dev/null || true
-}
-
-# Fetch the body of CodeRabbit's most recent issue (general) comment on a PR.
-coderabbit_latest_issue_comment_body() {
-    local pr="$1"
-    coderabbit_latest_issue_comment_json "$pr" | jq -r '.body // ""' 2>/dev/null || true
-}
-
-coderabbit_latest_issue_comment_timestamp() {
-    local pr="$1"
-    coderabbit_latest_issue_comment_json "$pr" | jq -r '.updated_at // .created_at // ""' 2>/dev/null || true
+        | sort_by(.created_at) | .[-1].body // ""' 2>/dev/null || true
 }
 
 # True when CodeRabbit's most recent activity on the PR is a rate-limit/shelved
@@ -782,29 +724,8 @@ coderabbit_rerequest_review() {
 @coderabbitai full review" >/dev/null 2>&1
 }
 
-coderabbit_maybe_rerequest_on_timeout() {
-    local pr="$1" done_var="$2" max="${3:-${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}}" done
-    [[ "$max" =~ ^[0-9]+$ ]] || return 1
-    done="${!done_var:-0}"
-    [[ "$done" =~ ^[0-9]+$ ]] || done=0
-    (( done < max )) || return 1
-    done=$((done + 1))
-    coderabbit_rerequest_review "$pr" "CodeRabbit review timed out with no fresh verdict; re-requesting the full review (attempt ${done}/${max})." || return 2
-    printf -v "$done_var" '%s' "$done"
-    return 0
-}
-
-coderabbit_maybe_wait_rate_limit_on_timeout() {
-    local pr="$1" done_var="${2:-}" max="${3:-${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}}" latest body stamp
-    latest="$(coderabbit_latest_issue_comment_json "$pr")"
-    body="$(printf '%s' "$latest" | jq -r '.body // ""' 2>/dev/null || true)"
-    coderabbit_body_is_ratelimit "$body" || return 1
-    stamp="$(printf '%s' "$latest" | jq -r '.updated_at // .created_at // ""' 2>/dev/null || true)"
-    coderabbit_handle_ratelimit_comment "$pr" "$body" "$stamp" "$done_var" "$max"
-}
-
 coderabbit_handle_ratelimit_comment() {
-    local pr="$1" body="${2:-}" stamp="${3:-}" done_var="${4:-}" max="${5:-${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}}" signature reset padded_reset done
+    local pr="$1" body="${2:-}" stamp="${3:-}" signature reset padded_reset
     coderabbit_body_is_ratelimit "$body" || return 1
     signature="$(printf '%s' "${stamp}:${body}" | cksum | awk '{print $1 ":" $2}')"
     [[ "$signature" != "${LAST_RATELIMIT_SIGNATURE:-}" ]] || return 1
@@ -813,26 +734,18 @@ coderabbit_handle_ratelimit_comment() {
     reset="$(coderabbit_ratelimit_reset_epoch_at "$body" "$stamp")"
     if [[ "$reset" =~ ^[0-9]+$ ]]; then
         padded_reset="$(rate_limit_reset_epoch_with_review_padding "$reset")"
-        if [[ -n "$done_var" ]]; then
-            [[ "$max" =~ ^[0-9]+$ ]] || return 1
-            done="${!done_var:-0}"
-            [[ "$done" =~ ^[0-9]+$ ]] || done=0
-            (( done < max )) || return 1
-        fi
+        warn "CodeRabbit rate-limited the review request; waiting until reset + 60s before re-requesting."
         sleep_until_rate_limit_reset "$padded_reset" "CodeRabbit rate limit"
         if rate_limit_reset_reached "$padded_reset"; then
-            if [[ -n "$done_var" ]]; then
-                done=$((done + 1))
-                printf -v "$done_var" '%s' "$done"
-            fi
             coderabbit_rerequest_review "$pr" "CodeRabbit rate limit reset + 60s reached; re-requesting the full review." || {
                 error "Failed to re-request CodeRabbit review after rate-limit reset"
                 exit 1
             }
+            log "Re-requested CodeRabbit review after rate-limit reset + 60s."
             return 0
         fi
     else
-        :
+        warn "CodeRabbit rate-limit response did not include a reset signal; continuing the normal gate wait without a blind retry."
     fi
     return 1
 }
@@ -1636,7 +1549,9 @@ while true; do
     # would keep waiting after a comment-free success.
     HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
     if [[ -n "$HEAD_SHA" ]]; then
-        CR_STATE="$(coderabbit_state_for_head "$HEAD_SHA")"
+        CR_STATE=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+            jq -r '[.[] | select(.context | ascii_downcase | startswith("coderabbit"))] | sort_by(.updated_at) | .[-1].state // ""' \
+            2>/dev/null || true)
         if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" ]]; then
             if coderabbit_body_is_ratelimit "$LATEST_ISSUE_COMMENT"; then
                 log "CodeRabbit commit status is terminal ($CR_STATE), but latest CodeRabbit comment is a rate-limit deferral; keeping the review gate open."
@@ -1963,10 +1878,6 @@ BASELINE_OVERVIEW_TIMESTAMP=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments
     jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].updated_at // ""')
 BASELINE_REVIEW_TIMESTAMP=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null | \
     jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.submitted_at) | .[-1].submitted_at // ""')
-CURRENT_REVIEW_COMMENTS="$BASELINE_REVIEW_COMMENTS"
-CURRENT_ISSUE_COMMENTS="$BASELINE_ISSUE_COMMENTS"
-CURRENT_OVERVIEW_TIMESTAMP="$BASELINE_OVERVIEW_TIMESTAMP"
-CURRENT_REVIEW_TIMESTAMP="$BASELINE_REVIEW_TIMESTAMP"
 
 # Capture the head SHA so we can check the coderabbit commit status against it.
 HEAD_SHA=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
@@ -2008,30 +1919,12 @@ FOUND_OVERVIEW=false
 OVERVIEW_UPDATED=false
 REVIEW_VERDICT_FOUND=false
 LAST_RATELIMIT_SIGNATURE=""
-TIMEOUT_REREQUESTS_DONE=0
-TIMEOUT_REREQUESTS_MAX="${PR_STEP_CR_TIMEOUT_REREQUESTS:-2}"
 
 while true; do
     ELAPSED=$(($(date +%s) - START_TIME))
 
     if wait_timed_out "$ELAPSED" "$MAX_WAIT_TIME"; then
-        if [[ "$READ_ONLY" == "false" ]] && coderabbit_maybe_wait_rate_limit_on_timeout "$PR_NUMBER" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
-            START_TIME=$(date +%s)
-            BASELINE_REVIEW_COMMENTS="$CURRENT_REVIEW_COMMENTS"
-            BASELINE_ISSUE_COMMENTS="$CURRENT_ISSUE_COMMENTS"
-            BASELINE_OVERVIEW_TIMESTAMP="$CURRENT_OVERVIEW_TIMESTAMP"
-            BASELINE_REVIEW_TIMESTAMP="$CURRENT_REVIEW_TIMESTAMP"
-            continue
-        fi
-        if [[ "$READ_ONLY" == "false" ]] && coderabbit_maybe_rerequest_on_timeout "$PR_NUMBER" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
-            START_TIME=$(date +%s)
-            BASELINE_REVIEW_COMMENTS="$CURRENT_REVIEW_COMMENTS"
-            BASELINE_ISSUE_COMMENTS="$CURRENT_ISSUE_COMMENTS"
-            BASELINE_OVERVIEW_TIMESTAMP="$CURRENT_OVERVIEW_TIMESTAMP"
-            BASELINE_REVIEW_TIMESTAMP="$CURRENT_REVIEW_TIMESTAMP"
-            continue
-        fi
-        warn "cr_wait_exceeded: CodeRabbit review timed out after ${TIMEOUT_MINS} minutes and bounded re-request attempts were exhausted."
+        warn "Explicit timeout reached (${TIMEOUT_MINS} minutes)."
         break
     fi
 
@@ -2051,7 +1944,7 @@ while true; do
         jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].body // ""')
 
     if coderabbit_body_is_ratelimit "$LATEST_ISSUE_COMMENT"; then
-        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
+        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
             START_TIME=$(date +%s)
             continue
         fi
@@ -2073,7 +1966,7 @@ while true; do
         LATEST_ISSUE_COMMENT=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
             jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '.[] | select(.user.login == $bot or .user.login == $user) | .body' | tail -1)
 
-        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
+        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
             START_TIME=$(date +%s)
             continue
         fi
@@ -2088,7 +1981,7 @@ while true; do
         LATEST_ISSUE_COMMENT=$(gh_api "repos/${REPO}/issues/${PR_NUMBER}/comments" 2>/dev/null | \
             jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].body')
 
-        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
+        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
             START_TIME=$(date +%s)
             continue
         fi
@@ -2103,11 +1996,13 @@ while true; do
 
     # Also accept terminal coderabbit commit status (success/failure) as a stop signal.
     if [[ -n "$HEAD_SHA" ]]; then
-        CR_STATE="$(coderabbit_state_for_head "$HEAD_SHA")"
+        CR_STATE=$(gh_api "repos/${REPO}/commits/${HEAD_SHA}/statuses" 2>/dev/null | \
+            jq --arg ctx "$COMMIT_STATUS_CONTEXT" -r \
+            '[.[] | select(.context | ascii_downcase | startswith($ctx))] | sort_by(.updated_at) | .[-1].state // ""')
         if [[ "$CR_STATE" == "success" || "$CR_STATE" == "failure" || "$CR_STATE" == "error" ]]; then
             if coderabbit_review_is_deferred "$PR_NUMBER"; then
                 LATEST_ISSUE_COMMENT="$(coderabbit_latest_issue_comment_body "$PR_NUMBER")"
-                if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
+                if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
                     START_TIME=$(date +%s)
                     continue
                 fi
@@ -2137,7 +2032,14 @@ done
 # Step 4: Fetch and output the results
 if [[ "$FOUND_OVERVIEW" == "false" ]] && [[ "$REVIEW_VERDICT_FOUND" == "false" ]] && \
    [[ $NEW_INLINE_COUNT -eq 0 ]] && [[ $NEW_OVERVIEW_COUNT -eq 0 ]]; then
-    warn "cr_wait_exceeded: no fresh CodeRabbit verdict or review comments after bounded wait/re-request policy; PR=https://github.com/${REPO}/pull/${PR_NUMBER}"
+    warn "No new review comments found before the explicit timeout."
+    echo ""
+    echo "Possible reasons:"
+    echo "  - CodeRabbit is still processing"
+    echo "  - No new issues found"
+    echo "  - CodeRabbit App not installed for this repo"
+    echo ""
+    echo "Check manually: https://github.com/${REPO}/pull/${PR_NUMBER}"
     exit 1
 fi
 
@@ -2592,7 +2494,7 @@ create_pr_normal() {
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
         pr_create_main --title "$subject" --body "$body" "${wait_args[@]}"
     else
-        PR_STEP_OPAQUE_WAIT=true PR_STEP_PRINT_CAPTURED_OUTPUT=true run_internal_capture create true pr_create_main --title "$subject" --body "$body" "${wait_args[@]}"
+        PR_STEP_PRINT_CAPTURED_OUTPUT=true run_internal_capture create true pr_create_main --title "$subject" --body "$body" "${wait_args[@]}"
     fi
     pr_num="$(current_pr_number)"
     [[ -n "$pr_num" ]] || { error "Could not determine created PR number"; exit 1; }
@@ -2611,7 +2513,7 @@ review_pr_normal() {
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
         pr_review_main "${review_args[@]}" || rc=$?
     else
-        PR_STEP_OPAQUE_WAIT=true PR_STEP_PRINT_CAPTURED_OUTPUT=false run_internal_capture review false pr_review_main "${review_args[@]}" || rc=$?
+        PR_STEP_PRINT_CAPTURED_OUTPUT=true run_internal_capture review false pr_review_main "${review_args[@]}" || rc=$?
     fi
     return "$rc"
 }
@@ -2624,7 +2526,7 @@ read_review_normal() {
     if [[ "$SHOW_RAW_REVIEW" == "true" ]]; then
         pr_review_main "${review_args[@]}" || rc=$?
     else
-        PR_STEP_OPAQUE_WAIT=true PR_STEP_PRINT_CAPTURED_OUTPUT=false run_internal_capture review-read false pr_review_main "${review_args[@]}" || rc=$?
+        PR_STEP_PRINT_CAPTURED_OUTPUT=true run_internal_capture review-read false pr_review_main "${review_args[@]}" || rc=$?
     fi
     return "$rc"
 }

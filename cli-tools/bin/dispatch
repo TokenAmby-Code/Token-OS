@@ -9,7 +9,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/../lib"
 CALLER_IMPERIUM="${IMPERIUM:-}"
 source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
-source "${LIB_DIR}/tmuxctld-timeouts.sh" 2>/dev/null || true
 source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
 source "${LIB_DIR}/agent-wrapper-common.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
@@ -358,34 +357,6 @@ if value:
     print(str(value), end="")
 PYLEDGER
 }
-
-pane_instance_id() {
-  local pane="$1"
-  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
-  TMUXCTLD_URL="$tmuxctld_url" PANE="$pane" python3 - <<'PYINSTANCE'
-import json
-import os
-import sys
-import urllib.parse
-import urllib.request
-
-base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:7778").rstrip("/")
-pane = os.environ.get("PANE", "")
-if not pane:
-    sys.exit(0)
-url = f"{base}/tmux/instance-id-for-pane?{urllib.parse.urlencode({'pane': pane})}"
-try:
-    with urllib.request.urlopen(url, timeout=1) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-except Exception:
-    sys.exit(0)
-result = data.get("result") if isinstance(data, dict) else {}
-value = result.get("instance_id") if isinstance(result, dict) else ""
-if value:
-    print(str(value), end="")
-PYINSTANCE
-}
-
 
 resolve_caller_instance_id() {
   local row
@@ -1514,6 +1485,8 @@ maybe_enter_worktree() {
   return 0
 }
 
+maybe_enter_worktree
+
 check_persona_behavior_invariant
 
 DISPATCH_WINDOW=""
@@ -1584,14 +1557,12 @@ fi
 
 tmuxctld_result_max_time() {
   # curl max-time is a transport budget, not the dispatch protocol bound.  The
-  # stack allocator and lifecycle reconcile/close transactions must be allowed
-  # to return their real daemon verdict; aborting them at an arbitrary client
-  # ceiling leaves the daemon thread free to finish after the caller abandoned
-  # the pane.
+  # stack allocator must be allowed to return its real daemon verdict: aborting
+  # POST /stack/dispatch at an arbitrary 60s client ceiling leaves the daemon
+  # thread free to finish later, after the caller has abandoned the pane.  Other
+  # routes keep the legacy 60s transport budget unless explicitly overridden.
   case "${1:-} ${2:-}" in
     "POST /stack/dispatch") printf '%s' "${TMUXCTLD_STACK_DISPATCH_MAX_TIME:-0}" ;;
-    "POST /reconcile"|"POST /close-pane"|"POST /close"|"POST /stack/add") printf '%s' "${TMUXCTLD_MAX_TIME:-0}" ;;
-    "POST /send-text") printf '%s' "${TMUXCTLD_MAX_TIME:-$(tmuxctld_send_client_timeout)}" ;;
     *) printf '%s' "${TMUXCTLD_MAX_TIME:-60}" ;;
   esac
 }
@@ -1880,20 +1851,19 @@ pane_has_active_agent_process() {
 assert_dispatch_target_unoccupied() {
   # Caller passes the canonical working id; resolve to physical once, here, at the
   # raw-tmux boundary.
-  local pane meta cmd pane_label pane_pid instance_id title
+  local pane meta cmd title pane_label pane_pid instance_id
   [[ "${TOKEN_API_DISPATCH_FORCE_OCCUPIED:-}" == "1" ]] && return 0
   pane="$(materialize_physical_pane "$1")"
-  meta="$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{@PANE_ID}|#{pane_pid}|#{@INSTANCE_ID}' 2>/dev/null || true)"
+  meta="$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{pane_title}|#{@PANE_ID}|#{pane_pid}|#{@INSTANCE_ID}' 2>/dev/null || true)"
   [[ -n "$meta" ]] || return 0
   cmd="${meta%%|*}"
-  title="$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)"
+  meta="${meta#*|}"
+  title="${meta%%|*}"
   meta="${meta#*|}"
   pane_label="${meta%%|*}"
   meta="${meta#*|}"
   pane_pid="${meta%%|*}"
   instance_id="${meta#*|}"
-  instance_id="${instance_id%%|*}"
-  [[ "$instance_id" =~ ^[0-9A-Fa-f-]{20,}$ ]] || instance_id=""
   case "$pane_label" in
     council:custodes|legion:custodes|council:malcador|mechanicus:fabricator-general|council:administratum|mechanicus:admin|council:pax|mechanicus:orchestrator)
       err "target pane $TARGET is a protected singleton seat ($pane_label); refusing dispatch injection"
@@ -1931,9 +1901,6 @@ assert_dispatch_target_unoccupied() {
 # stack pane's page:index, or an already-physical %NNN for direct/self launches).
 # No boundary resolve here — physical materializes only at the raw-tmux send sites.
 maybe_resolve_prealloc_new_target
-# Allocate/verify the target pane before provisioning a worktree. A pane allocation
-# failure must not orphan a fully provisioned branch/env/port/dev-DB worktree.
-maybe_enter_worktree
 
 DISCORD_BOT=""
 if [[ -n "$DISCORD_CHANNEL" ]]; then
@@ -2336,16 +2303,43 @@ dispatch_launch_observe_timeout() {
   # Generous, configurable ceiling for how long to wait for the agent process to
   # come up before declaring a GENUINE failure (pane created but no agent ever
   # appeared). This is the real-event bound, not a row-bind clock: it only gates
-  # exit 70 when liveness never confirms. Raised to cover engine-boot-bound bind latency; under fleet
+  # exit 70 when liveness never confirms. Raised from the old 20s — under fleet
   # load (2-4 panes, MCP init, worktree first-shell hooks) cold start routinely
-  # exceeds the old shorter windows. Override with DISPATCH_LAUNCH_OBSERVE_TIMEOUT; 0 disables the
+  # exceeded 20s. Override with DISPATCH_LAUNCH_OBSERVE_TIMEOUT; 0 disables the
   # observer entirely (the dispatcher trusts the send and returns immediately).
-  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-120}"
+  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-45}"
   if [[ "$value" =~ ^[0-9]+$ ]]; then
     printf '%s' "$value"
   else
-    printf '%s' "120"
+    printf '%s' "45"
   fi
+}
+
+pane_instance_id() {
+  local pane="$1"
+  local tmuxctld_url="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
+  TMUXCTLD_URL="$tmuxctld_url" PANE="$pane" python3 - <<'PYINSTANCE'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+base = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:7778").rstrip("/")
+pane = os.environ.get("PANE", "")
+if not pane:
+    sys.exit(0)
+url = f"{base}/tmux/instance-id-for-pane?{urllib.parse.urlencode({'pane': pane})}"
+try:
+    with urllib.request.urlopen(url, timeout=1) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+except Exception:
+    sys.exit(0)
+result = data.get("result") if isinstance(data, dict) else {}
+value = result.get("instance_id") if isinstance(result, dict) else ""
+if value:
+    print(str(value), end="")
+PYINSTANCE
 }
 
 pane_tmux_option() {
@@ -2418,88 +2412,11 @@ dispatch_pane_agent_live() {
   pane_has_active_agent_process "$pane_pid"
 }
 
-registry_bind_ok_for_wrapper_launch_id() {
-  local wrapper_id="$1" expected_workdir="$2"
-  [[ -n "$wrapper_id" ]] || return 1
-  local api_url="${TOKEN_API_URL:-http://localhost:7777}"
-  TOKEN_API_URL="$api_url" WRAPPER_LAUNCH_ID="$wrapper_id" EXPECTED_WORKDIR="$expected_workdir" RESUME_ID_VALUE="$RESUME_ID" python3 - <<'PYREGBIND'
-import json
-import os
-import sys
-import urllib.parse
-import urllib.request
-
-api = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
-wrapper = os.environ.get("WRAPPER_LAUNCH_ID", "")
-if not wrapper:
-    sys.exit(1)
-url = f"{api}/api/instances/resolve?{urllib.parse.urlencode({'wrapper_launch_id': wrapper})}"
-try:
-    with urllib.request.urlopen(url, timeout=1) as resp:
-        row = json.loads(resp.read().decode("utf-8"))
-except Exception:
-    sys.exit(1)
-if not isinstance(row, dict) or not (row.get("id") or row.get("instance_id")):
-    sys.exit(1)
-expected_workdir = os.environ.get("EXPECTED_WORKDIR", "")
-if not os.environ.get("RESUME_ID_VALUE") and expected_workdir and row.get("working_dir") != expected_workdir:
-    sys.exit(1)
-sys.exit(0)
-PYREGBIND
-}
-
-registry_instance_id_for_wrapper_launch_id() {
-  local wrapper_id="$1"
-  [[ -n "$wrapper_id" ]] || return 0
-  local api_url="${TOKEN_API_URL:-http://localhost:7777}"
-  TOKEN_API_URL="$api_url" WRAPPER_LAUNCH_ID="$wrapper_id" python3 - <<'PYREGAPI'
-import json
-import os
-import sys
-import urllib.parse
-import urllib.request
-
-api = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
-wrapper = os.environ.get("WRAPPER_LAUNCH_ID", "")
-if not wrapper:
-    sys.exit(0)
-url = f"{api}/api/instances/resolve?{urllib.parse.urlencode({'wrapper_launch_id': wrapper})}"
-try:
-    with urllib.request.urlopen(url, timeout=1) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-except Exception:
-    sys.exit(0)
-if not isinstance(data, dict):
-    sys.exit(0)
-value = data.get("id") or data.get("instance_id") or ""
-if value:
-    print(str(value), end="")
-PYREGAPI
-}
-
-registry_instance_id_for_wrapper_launch_id_sqlite() {
-  local wrapper_id="$1"
-  [[ -n "$wrapper_id" && -f "$DB_PATH" ]] || return 0
-  command -v sqlite3 >/dev/null 2>&1 || return 0
-  sqlite3 -readonly "$DB_PATH" \
-    "SELECT id FROM instances WHERE wrapper_launch_id = '$(sql_literal "$wrapper_id")' AND COALESCE(rank,'') != 'retired' ORDER BY last_activity DESC LIMIT 1;" \
-    2>/dev/null || true
-}
-
-pane_registry_instance_id() {
-  local pane="$1" wrapper_id="" instance_id=""
-  wrapper_id="$(pane_wrapper_launch_id "$pane" || true)"
-  [[ -n "$wrapper_id" ]] || return 0
-  instance_id="$(registry_instance_id_for_wrapper_launch_id "$wrapper_id" || true)"
-  [[ -n "$instance_id" ]] || instance_id="$(registry_instance_id_for_wrapper_launch_id_sqlite "$wrapper_id" || true)"
-  [[ -n "$instance_id" ]] && printf '%s' "$instance_id"
-}
-
 reconcile_dispatch_registry_bind() {
-  # Registry binding is a control-plane signal, but pane liveness is the launch
-  # oracle. This helper answers only whether the row is already bound; callers
-  # must not convert a live-pane row lag into launch failure.
-  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label wrapper_id
+  # Registration binding is control-plane truth, not an advisory. Liveness proves
+  # the engine came up, but after the observation window a missing/stopped row is
+  # a loud failure because downstream sends/renames depend on registry binding.
+  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label expected_label
   if ! command -v sqlite3 >/dev/null 2>&1; then
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because sqlite3 is unavailable"
     return 1
@@ -2508,27 +2425,23 @@ reconcile_dispatch_registry_bind() {
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because agents DB is missing at $DB_PATH"
     return 1
   fi
-  wrapper_id="$(pane_wrapper_launch_id "$pane" || true)"
-  if registry_bind_ok_for_wrapper_launch_id "$wrapper_id" "$WORK_DIR"; then
-    return 0
-  fi
-  instance_id="$(pane_registry_instance_id "$pane" || true)"
-  [[ -n "$instance_id" ]] || instance_id="$(pane_instance_id "$pane")"
+  instance_id="$(pane_instance_id "$pane")"
   if [[ -n "$instance_id" ]]; then
     row="$(sqlite3 -separator $'\t' "$DB_PATH" \
       "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
       2>/dev/null || true)"
     if [[ -n "$row" ]]; then
       IFS=$'\t' read -r status row_workdir row_label <<< "$row"
+      expected_label="$(resolve_pane_label_for_env "$pane")"
       if [[ "$status" != "stopped" && "$status" != "archived" ]] \
         && { [[ -n "$RESUME_ID" ]] || [[ "$row_workdir" == "$WORK_DIR" ]]; } \
-        ; then
+        && { [[ -z "$expected_label" ]] || [[ -n "$row_label" ]]; }; then
         return 0
       fi
     fi
   fi
   if [[ "$emit_error" == "1" ]]; then
-    warn "${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration slow/reconciliation lag; treating live pane as successful launch"
+    err "launch failed: ${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration is broken and reconciliation did not catch up"
   fi
   return 1
 }
@@ -2638,63 +2551,15 @@ ensure_dispatch_wrapper_ledger() {
   return 1
 }
 
-dispatch_observe_finalize_on_signal() {
-  # Caller-lifetime salvage. The observe loop below blocks the caller for up to
-  # DISPATCH_LAUNCH_OBSERVE_TIMEOUT seconds. That window is generous ON PURPOSE
-  # (codex cold start + MCP init + worktree first-shell hooks routinely run tens
-  # of seconds), but it is >= every caller ceiling that runs dispatch — the
-  # Claude Code Bash tool default (120000ms), the agent-to-agent send-text 60s
-  # ceiling, talk/brief's 60s POST. When the caller's own ceiling elapses first
-  # it sends SIGTERM (or SIGINT), and an untrapped dispatch simply dies 143/130.
-  #
-  # 143 is NOT dispatch's verdict — it is an undefined signal-death a retrying
-  # caller can misread as "launch failed" and blindly respawn, which is exactly
-  # how the duplicate-FG corruption was born (see refuse_if_worktree_has_live_agent).
-  # So collapse the interrupt into dispatch's OWN contract: one final synchronous
-  # confirmation using the identical success criteria (live agent + wrapper
-  # ledger; registry bind is warning-only). Confirmed-good at this instant => exit 0 (truthful: the
-  # launch DID land; the caller just gave up at the wrong moment). Not yet
-  # confirmed => exit 70 (dispatch's defined "unconfirmed" code, fail-closed) —
-  # never a raw 143. The ledger sub-check is capped short here so the handler
-  # finishes inside the SIGTERM->SIGKILL grace.
-  # The interrupt almost always lands while a liveness/bind/ledger probe is mid
-  # command-substitution ($(...)), whose pipe has captured fd1. Write the verdict
-  # to the real stdout/stderr saved as fds 6/7 at loop entry so the operator (and
-  # a capturing caller) actually see it, instead of it being swallowed by the
-  # discarded substitution. bash 3.2 has no {var}>&1 auto-fd, hence fixed numbers.
-  local sig="${1:-TERM}"
-  trap - TERM INT
-  if [[ -n "${OBSERVE_PANE:-}" ]] \
-    && dispatch_pane_agent_live "$OBSERVE_PANE" \
-    && DISPATCH_LEDGER_PRODUCER_CHECK_ATTEMPTS=2 \
-       ensure_dispatch_wrapper_ledger "$OBSERVE_PANE" "${OBSERVE_DISPLAY:-}"; then
-    printf '%s\n' "dispatched $ENGINE to ${OBSERVE_DISPLAY:-target} (confirmed live on caller interrupt SIG${sig})" >&6
-    exit 0
-  fi
-  echo "dispatch: launch observation interrupted by SIG${sig} before ${ENGINE} launch to ${OBSERVE_DISPLAY:-target} confirmed; reporting unconfirmed (exit 70) instead of signal-death so a retrying caller fails closed and the worktree dup-guard prevents a duplicate spawn" >&7
-  exit 70
-}
-
-dispatch_observe_disarm_signal_finalizer() {
-  # Undo the arm block from confirm_dispatch_launch_live on NORMAL (non-signal)
-  # completion. The signal path (dispatch_observe_finalize_on_signal) exit()s the
-  # process, so it never reaches here — this runs ONLY when the observe wait
-  # returns normally. Clearing the shell-global TERM/INT traps, the saved verdict
-  # fds 6/7, and OBSERVE_* means a later interrupt on an unrelated path cannot
-  # refire the finalizer against stale pane/display state.
-  trap - TERM INT
-  exec 6>&- 7>&-
-  OBSERVE_PANE=""
-  OBSERVE_DISPLAY=""
-}
-
-dispatch_observe_wait_for_launch() {
-  # Blocking observation loop. Success = the pane is up AND a live agent process
-  # is running in it. Registry bind is reconciled opportunistically; a row lag
-  # with a live pane is warning-only to avoid duplicate-worker retries. Returns 0
-  # on a confirmed-live launch, 1 on true launch failure. Runs under the caller-lifetime salvage
-  # armed by confirm_dispatch_launch_live.
-  local pane="$1" target_display="$2" timeout="$3" deadline saw_live=0
+confirm_dispatch_launch_live() {
+  # Liveness-driven launch confirmation. Success = the pane is up AND a live agent
+  # process is running in it AND the registry row binds by the end of the
+  # observation window. A row lag with a live pane is a control-plane failure.
+  local pane="$1" target_display="$2" timeout deadline saw_live=0
+  timeout="$(dispatch_launch_observe_timeout)"
+  # Observer disabled (0): trust the send and return immediately. Used by the
+  # bulk of the hermetic CLI tests and available as a production opt-out.
+  [[ "$timeout" -gt 0 ]] || return 0
   deadline=$((SECONDS + timeout))
   while (( SECONDS <= deadline )); do
     if dispatch_pane_agent_live "$pane"; then
@@ -2715,46 +2580,14 @@ dispatch_observe_wait_for_launch() {
       err "launch failed: the ${ENGINE} agent appeared in ${target_display} but exited before registry binding completed"
       return 1
     fi
-    local registry_bound=1
-    if ! reconcile_dispatch_registry_bind "$pane" "$target_display" 0; then
-      registry_bound=0
+    if reconcile_dispatch_registry_bind "$pane" "$target_display" 1; then
+      ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
+      return 0
     fi
-    ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
-    if [[ "$registry_bound" == "0" ]]; then
-      warn "${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration slow/reconciliation lag; treating live pane as successful launch"
-    fi
-    return 0
+    return 1
   fi
   err "launch failed: no live ${ENGINE} agent appeared in the pane within ${timeout}s for ${target_display}; the pane is up but the staged command never started the agent (raise DISPATCH_LAUNCH_OBSERVE_TIMEOUT if cold start is slow)"
   return 1
-}
-
-confirm_dispatch_launch_live() {
-  # Liveness-driven launch confirmation. Resolve the observe window, then run the
-  # blocking wait under the caller-lifetime signal salvage, disarming that salvage
-  # on normal completion so the finalizer can only fire during the wait itself.
-  local pane="$1" target_display="$2" timeout rc
-  timeout="$(dispatch_launch_observe_timeout)"
-  # Observer disabled (0): trust the send and return immediately, BEFORE arming —
-  # nothing to disarm. Used by the bulk of the hermetic CLI tests and available
-  # as a production opt-out.
-  [[ "$timeout" -gt 0 ]] || return 0
-  # Arm the caller-lifetime salvage for the blocking wait. A SIGTERM/SIGINT from
-  # the caller's ceiling now runs one final confirmation and exits with dispatch's
-  # own 0/70 contract rather than dying 143. OBSERVE_* carry the pane/display into
-  # the trap handler (bash traps see enclosing-scope state, not positional args).
-  OBSERVE_PANE="$pane"
-  OBSERVE_DISPLAY="$target_display"
-  # Snapshot the real stdout/stderr NOW, before any observe-loop command
-  # substitution can redirect fd1, so the signal handler can emit its verdict to
-  # them unconditionally (see dispatch_observe_finalize_on_signal).
-  exec 6>&1 7>&2
-  trap 'dispatch_observe_finalize_on_signal TERM' TERM
-  trap 'dispatch_observe_finalize_on_signal INT' INT
-  dispatch_observe_wait_for_launch "$pane" "$target_display" "$timeout"
-  rc=$?
-  dispatch_observe_disarm_signal_finalizer
-  return "$rc"
 }
 
 refuse_if_worktree_has_live_agent() {
@@ -2909,8 +2742,8 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   dispatch_send_text_via_tmuxctld "$pane_id" "$STAGED_COMMAND" || exit $?
   stack_display="${TARGET:-${DISPATCH_WINDOW}:new}"
   [[ "$stack_display" == %* ]] && stack_display="${DISPATCH_WINDOW}:new"
-  # Success = pane up + live agent process. Missing bind is a warning so the
-  # caller does not retry into a duplicate worker.
+  # Success = pane up + live agent process + registry bind inside the observation
+  # window. Missing bind is a loud failure, not eventual-reconciliation comfort.
   if ! confirm_dispatch_launch_live "$phys_pane" "$stack_display"; then
     exit 70
   fi

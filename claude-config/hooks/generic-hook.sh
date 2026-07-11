@@ -456,12 +456,6 @@ elif [[ "$ACTION_TYPE" == "SessionStart" ]]; then
     ENQ_ARGS=(enqueue --pane "$PANE" --session "$SESSION_ID" --rename "$TAB_NAME")
     "$PENDING_UI_FLUSH" "${ENQ_ARGS[@]}" >/dev/null 2>&1 || true
   fi
-  PLAN_RESUME_CLEAR=$(echo "$RESPONSE" | jq -r '.plan_resume_clear_context // false' 2>/dev/null || echo false)
-  if [[ "$PLAN_RESUME_CLEAR" == "true" && -n "$PANE" ]]; then
-    SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
-    "$PENDING_UI_FLUSH" enqueue --pane "$PANE" --session "$SESSION_ID" --clear-context >/dev/null 2>&1 || true
-    "$PENDING_UI_FLUSH" flush --pane "$PANE" --session "$SESSION_ID" --hold 0 >/dev/null 2>&1 || true
-  fi
   # Prune legacy/expired/dead-pane queue files every relaunch so the queue never
   # grows append-only (the 58-file, April-backlog failure mode).
   "$PENDING_UI_FLUSH" sweep >/dev/null 2>&1 || true

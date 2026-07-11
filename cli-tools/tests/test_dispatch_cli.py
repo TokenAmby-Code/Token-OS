@@ -1,15 +1,12 @@
 import json
 import os
-import shlex
 import shutil
-import signal
 import subprocess
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote
 
 import pytest
 
@@ -2824,11 +2821,12 @@ def test_dispatch_tmux_target_bakes_pane_label_into_launch_env(tmp_path: Path) -
     assert "TOKEN_API_PANE_LABEL=palace:E" in result.stdout
 
 
-def test_dispatch_warns_success_when_registry_row_lags(tmp_path: Path) -> None:
-    """A live pane whose instances row lags is success with a warning.
+def test_dispatch_fails_loud_when_registry_row_lags(tmp_path: Path) -> None:
+    """A live pane whose instances row does not bind is a loud failure.
 
-    Liveness is the launch oracle. A stale DB row must not make dispatch report
-    failure because operators will retry and duplicate the live worker.
+    The agent process is up and engaged in the pane, but the DB row has not
+    bound live (here it is still ``stopped``). Liveness and wrapper ledger are
+    not enough: registry binding is required before dispatch reports success.
     """
     import sqlite3
 
@@ -2915,107 +2913,17 @@ def test_dispatch_warns_success_when_registry_row_lags(tmp_path: Path) -> None:
         env=env,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "registration slow" in result.stderr
-    assert "launch failed" not in result.stderr
+    assert result.returncode != 0
+    assert "instances row did not bind within the observation window" in result.stderr
+    assert "registration slow" not in result.stderr
 
 
-def test_dispatch_registry_bind_reads_wrapper_launch_id_without_instance_stamp(
-    tmp_path: Path,
-) -> None:
-    """Bind observation succeeds from registry wrapper_launch_id, not tmux @INSTANCE_ID."""
-    import sqlite3
+def test_dispatch_fails_loud_when_instance_never_registers(tmp_path: Path) -> None:
+    """No registry row after the observation window is a loud failure.
 
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    db = tmp_path / "agents.db"
-    instance_id = "registry-bound-by-wrapper"
-    wrapper_id = "wrap-bind-123"
-
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            "CREATE TABLE instances (id TEXT PRIMARY KEY, status TEXT, working_dir TEXT, pane_label TEXT, wrapper_launch_id TEXT, rank TEXT, last_activity TEXT)"
-        )
-        conn.execute(
-            "INSERT INTO instances VALUES (?, 'processing', ?, 'palace:E', ?, 'worker', '2026-07-07T22:00:00')",
-            (instance_id, str(ROOT), wrapper_id),
-        )
-
-    fake_tmuxctl = fake_bin / "tmuxctl"
-    fake_tmuxctl.write_text(
-        "#!/usr/bin/env bash\n"
-        'if [[ "$1" == "resolve-pane" && "$2" == "--format" && "$3" == "physical" ]]; then echo "%44"; exit 0; fi\n'
-        'if [[ "$1" == "pane-live" ]]; then exit 0; fi\n'
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    fake_tmuxctl.chmod(0o755)
-
-    fake_ping = fake_bin / "tmuxctld-ping"
-    fake_ping.write_text(
-        "#!/usr/bin/env bash\n"
-        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
-        'method="${1:-}"; path="${2:-}"\n'
-        'case "$method $path" in\n'
-        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
-        '  "POST /pane-live") printf \'{"ok":true,"result":{"live":true}}\' ;;\n'
-        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
-        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
-        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
-        "esac\n",
-        encoding="utf-8",
-    )
-    fake_ping.chmod(0o755)
-
-    fake_tmux = fake_bin / "tmux"
-    fake_tmux.write_text(
-        "#!/usr/bin/env bash\n"
-        'if [[ "$1" == "show-options" && "$*" == *"@TOKEN_API_WRAPPER_ID"* ]]; then echo "wrap-bind-123"; exit 0; fi\n'
-        'if [[ "$1" == "show-options" ]]; then echo "palace:E"; exit 0; fi\n'
-        # No instance stamp exists; the old bind reader would fail here.
-        'if [[ "$1" == "display-message" && "$*" == *"@INSTANCE_ID"* ]]; then exit 0; fi\n'
-        'if [[ "$1" == "display-message" ]]; then printf "bash||palace:E|999|\\n"; exit 0; fi\n'
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    fake_tmux.chmod(0o755)
-
-    env = os.environ.copy()
-    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-    env["TOKEN_API_DB"] = str(db)
-    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
-    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
-    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "1"
-    env["TOKEN_API_WRAPPER_ID"] = wrapper_id
-
-    result = subprocess.run(
-        [
-            str(DISPATCH),
-            "--target",
-            "palace:E",
-            "--dir",
-            str(ROOT),
-            "--no-worktree",
-            "--no-gt",
-            "--prompt",
-            "noop",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=str(ROOT),
-        env=env,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "pane_instance_id: command not found" not in result.stderr
-
-
-def test_dispatch_warns_success_when_instance_never_registers(tmp_path: Path) -> None:
-    """No registry row after the observation window is success with warning.
-
-    For codex undercount/lifecycle lag, a live pane must not be reported as a
-    launch failure. The row may bind after the synchronous observation window.
+    Liveness and a wrapper ledger row are not enough: sends and rename require a
+    bound instances row. The old path printed registration-slow reassurance and
+    returned success; the current path fails loudly.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -3097,9 +3005,9 @@ def test_dispatch_warns_success_when_instance_never_registers(tmp_path: Path) ->
         env=env,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "registration slow" in result.stderr
-    assert "launch failed" not in result.stderr
+    assert result.returncode != 0
+    assert "instances row did not bind within the observation window" in result.stderr
+    assert "registration slow" not in result.stderr
     tmux_calls = tmux_log.read_text(encoding="utf-8")
     assert "DISPATCH LAUNCH FAILED" not in tmux_calls
 
@@ -3627,12 +3535,13 @@ def test_dispatch_resume_api_rejects_incomplete_metadata(tmp_path: Path) -> None
     assert "pass explicit --engine and --dir" not in result.stderr
 
 
-def test_dispatch_liveness_success_with_warning_when_row_lags_after_send(tmp_path: Path) -> None:
-    """A live pane with no bound registry row succeeds after launch delivery.
+def test_dispatch_liveness_fails_loud_when_row_lags_after_send(tmp_path: Path) -> None:
+    """A live pane with no bound registry row fails after launch delivery.
 
-    The staged command still reaches the pane. Dispatch must return success so
-    the already-live agent continues to the naming interview instead of being
-    retried into a duplicate worker.
+    The staged command still reaches the pane, but dispatch must not report
+    success until the instances row binds. Naming remains outside dispatch-
+    derived prefixes and happens through the naming interview / instance-name
+    boundary after a valid registration.
     """
     db = _persona_db(tmp_path, [("blood-angels", "Blood Angels", "astartes")])
     env = _persona_env(tmp_path, db)
@@ -3715,9 +3624,9 @@ def test_dispatch_liveness_success_with_warning_when_row_lags_after_send(tmp_pat
         timeout=60,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "registration slow" in result.stderr
-    assert "launch failed" not in result.stderr
+    assert result.returncode != 0
+    assert "instances row did not bind within the observation window" in result.stderr
+    assert "registration slow" not in result.stderr
 
     # Proof the launch text still reaches the pane without smuggling a
     # dispatch-derived naming prefix into the staged launch command.
@@ -4259,204 +4168,3 @@ def test_codex_dispatch_still_fails_when_daemon_reports_no_bytes_written(tmp_pat
 
     assert result.returncode != 0
     assert "send suppressed before bytes" in result.stderr
-
-
-# --- RC=143 observe-timeout / caller-lifetime salvage -----------------------
-#
-# ``confirm_dispatch_launch_live`` blocks the caller for up to
-# DISPATCH_LAUNCH_OBSERVE_TIMEOUT seconds. That window is >= every ceiling that
-# runs dispatch (Claude Code Bash tool 120000ms, the agent send-text 60s ceiling,
-# talk/brief's 60s POST), so the caller reliably SIGTERMs dispatch mid-observe.
-# An untrapped dispatch then dies 143 (128+SIGTERM) — an undefined signal-death
-# a retrying caller can misread as "launch failed" and blindly respawn (the
-# duplicate-FG corruption). The fix arms a TERM/INT trap that collapses the
-# interrupt into dispatch's OWN {0 confirmed | 70 unconfirmed} contract.
-
-
-def _stack_new_observe_fakes(tmp_path: Path, *, pane_live_body: str) -> Path:
-    """Fake bin dir wired for the tmux_stack_new launch path, parametrised by
-    the ``POST /pane-live`` responder body so callers control liveness/timing.
-    Every tmuxctld-ping call is appended to ``calls.log`` so a test can detect
-    the moment the observe loop is entered (its first ``POST /pane-live``)."""
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    call_log = tmp_path / "calls.log"
-
-    fake_tmux = fake_bin / "tmux"
-    fake_tmux.write_text(
-        "#!/usr/bin/env bash\n"
-        'if [[ "$1" == "display-message" ]]; then printf "%%77\\n"; exit 0; fi\n'
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    fake_tmux.chmod(0o755)
-
-    fake_ping = fake_bin / "tmuxctld-ping"
-    call_log_arg = shlex.quote(str(call_log))
-    fake_ping.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s %s\\n" "${{1:-}}" "${{2:-}}" >> {call_log_arg}\n'
-        'if [[ "${TMUXCTLD_PING_PRINT_RESPONSE:-}" != "1" ]]; then exit 0; fi\n'
-        'case "${1:-} ${2:-}" in\n'
-        '  "POST /stack/dispatch") printf \'{"ok":true,"result":"mechanicus:2"}\' ;;\n'
-        '  "GET /resolve-pane") printf \'{"ok":true,"result":"%%77"}\' ;;\n'
-        '  "POST /send-text") printf \'{"ok":true,"result":{"delivery":"confirmed"}}\' ;;\n'
-        f'  "POST /pane-live") {pane_live_body} ;;\n'
-        '  "POST /reconcile") printf \'{"ok":true,"result":{"reconciled":1}}\' ;;\n'
-        '  "GET /ledger/resolve") printf \'{"ok":true,"result":{"row":{"state":"OPEN"}}}\' ;;\n'
-        '  *) printf \'{"ok":true,"result":""}\' ;;\n'
-        "esac\n",
-        encoding="utf-8",
-    )
-    fake_ping.chmod(0o755)
-    return fake_bin
-
-
-def _dispatch_env(fake_bin: Path, **extra: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-    env["TOKEN_API_PARENT_INSTANCE_ID"] = "test-parent"
-    env["TOKEN_API_INTERNAL_DISPATCH"] = "1"
-    env["DISPATCH_LAUNCH_OBSERVE_TIMEOUT"] = "30"
-    env.update(extra)
-    return env
-
-
-def _launch_and_interrupt_in_observe(
-    env: dict[str, str], call_log: Path
-) -> subprocess.CompletedProcess:
-    """Popen dispatch, wait until the observe loop is entered (its first
-    ``POST /pane-live`` call — after the TERM trap is armed), send SIGTERM to
-    emulate the caller's ceiling, and return the completed process."""
-    proc = subprocess.Popen(
-        [
-            str(DISPATCH),
-            "--target",
-            "mechanicus:new",
-            "--dir",
-            str(ROOT),
-            "--no-worktree",
-            "--no-gt",
-            "--prompt",
-            "noop",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=str(ROOT),
-        env=env,
-    )
-    deadline = time.time() + 25
-    entered = False
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            break
-        if call_log.exists() and "POST /pane-live" in call_log.read_text(
-            encoding="utf-8", errors="replace"
-        ):
-            entered = True
-            break
-        time.sleep(0.05)
-    if not entered:
-        if proc.poll() is None:
-            proc.kill()
-        out, err = proc.communicate(timeout=5)
-        raise AssertionError(
-            f"observe loop never issued its first POST /pane-live probe\nstdout={out}\nstderr={err}"
-        )
-    proc.send_signal(signal.SIGTERM)
-    try:
-        out, err = proc.communicate(timeout=15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        raise
-    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
-
-
-def test_dispatch_observe_interrupt_fails_closed_not_signal_death(tmp_path: Path) -> None:
-    """A caller SIGTERM during observation of a launch whose agent never came
-    live must return dispatch's fail-closed contract (exit 70), NOT signal-death
-    143 (returncode -15). Fail-closed is preserved: the launch is genuinely
-    unconfirmed at interrupt, so dispatch reports unconfirmed, not success."""
-    fake_bin = _stack_new_observe_fakes(
-        tmp_path, pane_live_body='printf \'{"ok":true,"result":{"live":false}}\''
-    )
-    env = _dispatch_env(fake_bin)
-    result = _launch_and_interrupt_in_observe(env, tmp_path / "calls.log")
-    assert result.returncode == 70, (result.returncode, result.stderr)
-    assert result.returncode not in (-signal.SIGTERM, 143)
-    assert "interrupted by SIGTERM" in result.stderr
-
-
-def test_dispatch_observe_interrupt_salvages_confirmed_launch(tmp_path: Path) -> None:
-    """A caller SIGTERM during observation of a launch that IS confirmed-good
-    (live agent + registry bind + wrapper ledger) must be salvaged into a
-    truthful success (exit 0), not signal-death. The first pane-live probe is
-    slow so the loop is still inside observation when the interrupt lands; the
-    trap's final synchronous check then confirms and exits 0."""
-    server = _run_resolve_api_server(bound_working_dir=str(ROOT))
-    plc_path = shlex.quote(str(tmp_path / "plc"))
-    slow_first = (
-        f'c={plc_path}; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n+1)) > "$c"; '
-        'if [[ "$n" == "0" ]]; then sleep 2; fi; '
-        'printf \'{"ok":true,"result":{"live":true}}\''
-    )
-    try:
-        fake_bin = _stack_new_observe_fakes(tmp_path, pane_live_body=slow_first)
-        (tmp_path / "agents.db").write_text("", encoding="utf-8")
-        env = _dispatch_env(
-            fake_bin,
-            TOKEN_API_URL=f"http://127.0.0.1:{server.server_port}",
-            TOKEN_API_DB=str(tmp_path / "agents.db"),
-            TOKEN_API_WRAPPER_ID="wid-test",
-        )
-        result = _launch_and_interrupt_in_observe(env, tmp_path / "calls.log")
-    finally:
-        server.shutdown()
-        server.server_close()
-    assert result.returncode == 0, (result.returncode, result.stderr)
-    assert "confirmed live on caller interrupt" in result.stdout
-
-
-def _run_resolve_api_server(bound_working_dir: str) -> ThreadingHTTPServer:
-    """Fake Token API answering /api/instances/resolve?wrapper_launch_id=... with
-    a bound row, so registry_bind_ok_for_wrapper_launch_id() succeeds."""
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path == "/api/instances/resolve" and parse_qs(parsed.query).get(
-                "wrapper_launch_id"
-            ) == ["wid-test"]:
-                body = json.dumps({"id": "iid-test", "working_dir": bound_working_dir}).encode(
-                    "utf-8"
-                )
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            self.send_response(404)
-            self.end_headers()
-
-        def log_message(self, format: str, *args: object) -> None:
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server
-
-
-def test_live_pane_success_warning_is_not_emitted_before_ledger_failure() -> None:
-    text = DISPATCH.read_text(encoding="utf-8")
-    start = text.index("dispatch_observe_wait_for_launch() {")
-    end = text.index("\n}\n\nconfirm_dispatch_launch_live", start)
-    body = text[start:end]
-    assert 'if ! reconcile_dispatch_registry_bind "$pane" "$target_display" 0; then' in body
-    assert body.index(
-        'ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1'
-    ) < body.index("treating live pane as successful launch")
-    assert 'reconcile_dispatch_registry_bind "$pane" "$target_display" 1' not in body

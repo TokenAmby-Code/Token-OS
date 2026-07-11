@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT.parent / "tmuxctld" / "lib"))
+sys.path.insert(0, str(ROOT / "lib"))
 
 from tmuxctl import assertions, daemon, service
 from tmuxctl.service import TmuxControlPlane
@@ -334,16 +334,18 @@ def test_event_route_envelope_for_unhandled_event() -> None:
         server.shutdown()
 
 
-def test_reconcile_route_fails_loud_when_all_targets_error() -> None:
-    # With a stub adapter no seat resolves; every target row errors. The daemon
-    # must not return top-level ok/healthy with an all-error reconcile payload.
+def test_reconcile_route_returns_results_envelope() -> None:
+    # With a stub adapter no seat resolves, so each label errors and is captured
+    # per-label (the sweep never aborts) — a results list of all six personas PLUS
+    # the two reservist heartbeat seats (F3 fill-on-absence).
     server = _serve(FakeAdapter)
     try:
         status, payload = _post(server, "/reconcile", {})
         assert status == 200
-        assert payload["ok"] is False
-        assert payload["error"]["code"] == "ValueError"
-        assert "every target row errored" in payload["error"]["message"]
+        assert payload["ok"] is True
+        assert len(payload["result"]["results"]) == len(assertions.PERSONA_LABELS) + len(
+            assertions.RESERVIST_LABELS
+        )
     finally:
         server.shutdown()
 
@@ -557,234 +559,3 @@ def test_h_close_pane_passes_physical_id_through_untouched() -> None:
     # A raw %NN needs no resolution and must not be gated.
     daemon._h_close_pane(_Ctrl(), {"pane": "%7"})
     assert seen["pane"] == "%7"
-
-
-def test_reconcile_route_fails_loud_when_every_target_errors(monkeypatch) -> None:
-    class _Ctrl:
-        def ledger_reconcile(self):
-            return {"rows": 0}
-
-        def reconcile_personas(self, session="main"):
-            return [
-                {"ok": False, "error": "tmux unavailable"},
-                {"ok": False, "error": "tmux unavailable"},
-            ]
-
-    with pytest.raises(ValueError, match="every target row errored"):
-        daemon._h_reconcile(_Ctrl(), {})
-
-
-def test_h_close_pane_typing_guard_enqueues_close_operation(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
-    monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
-    monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
-    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: True)
-
-    class _Ctrl:
-        adapter = object()
-
-        def close_pane(self, pane, *, timeout=3.0):
-            raise AssertionError("must not close while typing guard is active")
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(daemon, "resolve_to_physical", lambda adapter, pane: "%42")
-        out = daemon._h_close_pane(_Ctrl(), {"pane": "somnium:SE"})
-
-    assert out["status"] == "queued"
-    assert out["operation"] == "close-pane"
-    assert out["gate"]["policy"] == "enqueue"
-    assert "queue_handle" in out
-
-
-def test_h_close_pane_cleared_in_place_marks_no_retire_required(monkeypatch) -> None:
-    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: False)
-
-    class _Ctrl:
-        adapter = object()
-
-        def close_pane(self, pane, *, timeout=3.0):
-            return {"status": "cleared_in_place", "pane": pane, "pane_class": "slot"}
-
-    out = daemon._h_close_pane(_Ctrl(), {"pane": "%8"})
-    assert out["retire_required"] is False
-    assert out["close_transaction_complete"] is True
-
-
-def test_pane_inventory_reports_roster_without_raw_scrape_by_callers() -> None:
-    class _Adapter:
-        def run(self, *args, allow_failure=False):
-            assert args[:3] == ("list-panes", "-a", "-F")
-            return "%8\tsomnium:SE\tsomnium\tSE title\t0\ti-1\tw-1\tpersona\toccupied\t123"
-
-    class _Ctrl:
-        adapter = _Adapter()
-
-    out = daemon._h_pane_inventory(_Ctrl(), {})
-    assert out["ok"] is True
-    assert out["panes"][0]["label"] == "somnium:SE"
-    assert out["panes"][0]["slot"] == "somnium"
-    assert out["panes"][0]["cardinal"] == "SE"
-    assert out["panes"][0]["live"] is True
-
-
-def test_ledger_reconcile_scrubs_chrome_on_unbound_free_slot(monkeypatch):
-    """/reconcile must derive chrome from ledger bind state, including FREE slots.
-
-    A free slot with no active wrapper-ledger row, no live agent, and no boot grace
-    may still carry stale tint/title from a prior bind. Reconcile is the ledger
-    transaction that makes bind state canonical, so it must scrub that chrome in
-    the same pass rather than merely returning ok.
-    """
-
-    class FreeSlotAdapter:
-        def __init__(self):
-            self.cleared = []
-
-        def run(self, *args, allow_failure=False):  # noqa: ARG002
-            if args[:2] == ("list-panes", "-a"):
-                fmt = args[-1]
-                if "TOKEN_API_WRAPPER_ID" in fmt:
-                    return ""
-                return "%22\tsomnium:N\tsomnium\t4242\t0"
-            return ""
-
-        def clear_runtime_state(self, target):
-            self.cleared.append(target)
-
-    adapter = FreeSlotAdapter()
-    control = TmuxControlPlane(adapter=adapter)
-    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
-    monkeypatch.setattr(
-        "tmuxctl.wrapper_ledger.LEDGER.reconcile_from_tmux", lambda a: {"open_rows": 0}
-    )
-
-    out = control.ledger_reconcile()
-
-    assert out["chrome_scrubbed_unbound_panes"] == ["%22"]
-    assert adapter.cleared == ["%22"]
-
-
-def test_ledger_reconcile_does_not_scrub_ledger_bound_or_singleton_panes(monkeypatch):
-    class MixedAdapter:
-        def __init__(self):
-            self.cleared = []
-
-        def run(self, *args, allow_failure=False):  # noqa: ARG002
-            if args[:2] == ("list-panes", "-a"):
-                fmt = args[-1]
-                if "TOKEN_API_WRAPPER_ID" in fmt:
-                    return ""
-                return "\n".join(
-                    [
-                        "%1\tsomnium:N\tsomnium\t100\t0",
-                        "%2\tmechanicus:1\tmechanicus\t101\t0",
-                        "%3\tcouncil:custodes\tcouncil\t102\t0",
-                    ]
-                )
-            return ""
-
-        def clear_runtime_state(self, target):
-            self.cleared.append(target)
-
-    adapter = MixedAdapter()
-    control = TmuxControlPlane(adapter=adapter)
-    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
-
-    class Row:
-        def __init__(self, instance_id):
-            self.instance_id = instance_id
-
-        def as_dict(self):
-            return {"instance_id": self.instance_id}
-
-    def fake_resolve(*, pane_positional_id, **kwargs):  # noqa: ARG001
-        if pane_positional_id == "mechanicus:1":
-            return Row("i-bound")
-        return None
-
-    monkeypatch.setattr("tmuxctl.wrapper_ledger.LEDGER.resolve", fake_resolve)
-    monkeypatch.setattr(
-        "tmuxctl.wrapper_ledger.LEDGER.reconcile_from_tmux", lambda a: {"open_rows": 1}
-    )
-
-    out = control.ledger_reconcile()
-
-    assert out["chrome_scrubbed_unbound_panes"] == ["%1"]
-    assert adapter.cleared == ["%1"]
-
-
-def test_ledger_reconcile_scrubs_unbound_nonfree_hollow_slot(monkeypatch):
-    """Unbound chrome drift is scrubbed even before the pane reaches freelist.
-
-    A hollow wrapper row can keep a bare shell out of freelist for one pass. Since
-    chrome derives from bind, reconcile scrubs when no live TUI is present.
-    """
-
-    class HollowAdapter:
-        def __init__(self):
-            self.cleared = []
-
-        def run(self, *args, allow_failure=False):  # noqa: ARG002
-            if args[:2] == ("list-panes", "-a"):
-                fmt = args[-1]
-                if "TOKEN_API_WRAPPER_ID" in fmt:
-                    return _raw_scan_line(
-                        wrapper_id="w-hollow",
-                        instance_id="",
-                        pane_id="somnium:N",
-                        engine="claude",
-                        working_dir="/tmp/stale",
-                    )
-                return "%22\tsomnium:N\tsomnium\t4242\t0"
-            return ""
-
-        def clear_runtime_state(self, target):
-            self.cleared.append(target)
-
-    adapter = HollowAdapter()
-    control = TmuxControlPlane(adapter=adapter)
-    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: False)
-
-    out = control.ledger_reconcile()
-
-    assert out["chrome_scrubbed_unbound_panes"] == ["%22"]
-    assert adapter.cleared == ["%22"]
-
-
-def test_ledger_reconcile_refuses_to_scrub_unbound_live_tui_divergence(monkeypatch):
-    """Live TUI + empty bind is split-brain, not free chrome residue."""
-
-    class LiveTuiAdapter:
-        def __init__(self):
-            self.cleared = []
-
-        def run(self, *args, allow_failure=False):  # noqa: ARG002
-            if args[:2] == ("list-panes", "-a"):
-                fmt = args[-1]
-                if "TOKEN_API_WRAPPER_ID" in fmt:
-                    return ""
-                return "%22\tsomnium:N\tsomnium\t4242\t0"
-            return ""
-
-        def clear_runtime_state(self, target):
-            self.cleared.append(target)
-
-    adapter = LiveTuiAdapter()
-    control = TmuxControlPlane(adapter=adapter)
-    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: True)
-    monkeypatch.setattr(
-        "tmuxctl.wrapper_ledger.LEDGER.reconcile_from_tmux", lambda a: {"open_rows": 0}
-    )
-
-    out = control.ledger_reconcile()
-
-    assert out["chrome_scrubbed_unbound_panes"] == []
-    assert adapter.cleared == []
-    assert out["chrome_unbound_live_divergences"] == [
-        {
-            "pane": "%22",
-            "pane_label": "somnium:N",
-            "reason": "live_agent_without_bind",
-        }
-    ]
-    assert out["chrome_unbound_live_divergence_count"] == 1

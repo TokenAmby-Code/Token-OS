@@ -10,17 +10,9 @@ CONF="${HOME}/Library/Deskflow/Deskflow.conf"
 HELPER_DIR="${HOME}/Library/Application Support/Imperium"
 HELPER="${HELPER_DIR}/deskflow-select-input-source"
 SRC="${HELPER_DIR}/deskflow-select-input-source.swift"
-LOCKDIR="${HELPER_DIR}/deskflow-keymap-guard.lock"
 
 mkdir -p "$HELPER_DIR"
-if ! mkdir "$LOCKDIR" 2>/dev/null; then
-  echo "deskflow-keymap-guard: another guard run is active; skipping" >&2
-  exit 0
-fi
-trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
-
-tmp_src="$(mktemp "${HELPER_DIR}/deskflow-select-input-source.swift.XXXXXX")"
-cat > "$tmp_src" <<'SWIFT'
+cat > "$SRC" <<'SWIFT'
 import Foundation
 import Carbon
 
@@ -59,17 +51,8 @@ fputs("input source not found: \(target)\n", stderr)
 exit(3)
 SWIFT
 
-if [[ ! -f "$SRC" ]] || ! cmp -s "$tmp_src" "$SRC"; then
-  mv "$tmp_src" "$SRC"
-else
-  rm -f "$tmp_src"
-fi
-
 if [[ ! -x "$HELPER" || "$SRC" -nt "$HELPER" ]]; then
-  tmp_helper="$(mktemp "${HELPER_DIR}/deskflow-select-input-source.XXXXXX")"
-  swiftc "$SRC" -o "$tmp_helper"
-  chmod 755 "$tmp_helper"
-  mv "$tmp_helper" "$HELPER"
+  swiftc "$SRC" -o "$HELPER"
 fi
 
 # Keep Deskflow client config deterministic. This does not wipe settings.

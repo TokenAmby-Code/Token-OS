@@ -242,36 +242,12 @@ def ledger_occupancy_for_pane(adapter: TmuxAdapter, pane: str) -> LedgerPaneOccu
 
 
 def _p0_incongruency(occ: LedgerPaneOccupancy, *, purpose: str) -> ValueError:
-    direction = (
-        "ledger_empty_agent_live"
-        if (not occ.ledger_occupied and occ.sniff_live_agent)
-        else "ledger_occupied_pane_bare"
-        if (occ.ledger_occupied and not occ.sniff_live_agent)
-        else "unknown"
-    )
-    repair = (
-        "repair_op=tmuxctld_assert_instance_or_restart_live_unbound_pane"
-        if direction == "ledger_empty_agent_live"
-        else "repair_op=tmuxctld_reconcile_wrapper_ledger"
-    )
     return ValueError(
         "P0_LEDGER_SNIFF_INCONGRUENCY "
         f"purpose={purpose} pane={occ.pane_role or occ.pane_id} "
         f"ledger_occupied={str(occ.ledger_occupied).lower()} "
-        f"sniff_live_agent={str(occ.sniff_live_agent).lower()} "
-        f"direction={direction} {repair}"
+        f"sniff_live_agent={str(occ.sniff_live_agent).lower()}"
     )
-
-
-def _reconcile_then_reread(adapter: TmuxAdapter, pane: str) -> LedgerPaneOccupancy | None:
-    """One bounded self-heal attempt for ledger/sniff disagreement."""
-    try:
-        from .wrapper_ledger import LEDGER
-
-        LEDGER.reconcile_from_tmux(adapter)
-    except Exception:
-        return None
-    return ledger_occupancy_for_pane(adapter, pane)
 
 
 def assert_singleton_addressee(
@@ -336,11 +312,7 @@ def assert_comms_delivery_target_occupied(
     if occ is None:
         raise ValueError(f"pane target not found: {pane}")
     if occ.ledger_occupied != occ.sniff_live_agent:
-        healed = _reconcile_then_reread(adapter, pane)
-        if healed is not None and healed.ledger_occupied == healed.sniff_live_agent:
-            occ = healed
-        else:
-            raise _p0_incongruency(occ, purpose="comms_delivery")
+        raise _p0_incongruency(occ, purpose="comms_delivery")
     if not occ.ledger_occupied:
         raise ValueError(
             "ledger_unoccupied: refusing non-delivery into blank/unoccupied pane "
@@ -397,13 +369,12 @@ def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
 
 
 def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupancy]:
-    """Return dispatch availability from wrapper ledger plus live-process sniffing.
+    """Return dispatch availability from the wrapper ledger without ps sniffing.
 
-    This is the allocator's first pass. It walks every live pane once, consults
-    the wrapper→pane ledger, and also sniffs the pane process tree. The sniff is
-    required for pre-deploy/stale panes that host a live agent but have neither
-    a current wrapper-ledger row nor an ``@INSTANCE_ID`` bind stamp; otherwise
-    they enter the freelist and are only refused later by the bind guard.
+    This is the allocator's first pass.  It walks every live pane once, consults
+    only the wrapper→pane ledger (plus singleton/boot-grace structural guards),
+    and intentionally does not call :func:`_active_agent`.  The selected free
+    candidate is later cross-checked by :func:`assert_dispatch_target_available`.
     """
 
     raw = adapter.run(
@@ -435,7 +406,7 @@ def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupanc
                 window_name=window_name.strip(),
                 pane_pid=pane_pid,
                 instance_id=str((ledger_row or {}).get("instance_id") or ""),
-                live_agent=_active_agent(pane_pid),
+                live_agent=False,
                 recently_born=_recently_born(born_raw),
             )
         )
@@ -502,11 +473,7 @@ def assert_dispatch_target_available(adapter: TmuxAdapter, pane: str) -> PaneOcc
             f"dispatch target is protected singleton seat: {ledger_occ.pane_role or ledger_occ.pane_id}"
         )
     if ledger_occ.ledger_occupied != ledger_occ.sniff_live_agent:
-        healed = _reconcile_then_reread(adapter, pane)
-        if healed is not None and healed.ledger_occupied == healed.sniff_live_agent:
-            ledger_occ = healed
-        else:
-            raise _p0_incongruency(ledger_occ, purpose="dispatch_allocation")
+        raise _p0_incongruency(ledger_occ, purpose="dispatch_allocation")
     if ledger_occ.ledger_occupied:
         instance_id = str((ledger_occ.ledger_row or {}).get("instance_id") or "")
         detail = f": ledger instance_id={instance_id}" if instance_id else ""

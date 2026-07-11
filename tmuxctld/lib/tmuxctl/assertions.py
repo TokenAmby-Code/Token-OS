@@ -14,7 +14,6 @@ from typing import Any
 
 from .api import (
     fetch_instance_registry,
-    fetch_instance_rows_raw,
     log_event,
     patch_instance,
     stop_instance,
@@ -280,11 +279,8 @@ def _registry_entries(
             or (pane_label and row.pane_label == pane_label)
         )
     ]
-    exact_rows = [r for r in rows if stamp and r.instance_id == stamp]
-    fallback_rows = [r for r in rows if not (stamp and r.instance_id == stamp)]
-    exact_rows.sort(key=lambda r: r.last_activity, reverse=True)
-    fallback_rows.sort(key=lambda r: r.last_activity, reverse=True)
-    return exact_rows + fallback_rows
+    rows.sort(key=lambda r: r.last_activity, reverse=True)
+    return rows
 
 
 def _runtime_has_instance(adapter: TmuxAdapter, pane_id: str) -> bool:
@@ -852,146 +848,6 @@ def _guarded_note_mismatched(
     return False, "persona_mismatch_live_runtime", "persona_mismatch_noted"
 
 
-def _reassert_live_persona_binding(
-    adapter: TmuxAdapter, pane_id: str, pane_label: str, spec: PersonaSpec, row
-) -> dict[str, Any]:
-    """Atomically re-settle the tmux stamp, wrapper ledger, tint, and active row.
-
-    This is the infrastructure-side self-heal for split-brain singleton panes:
-    the persona label plus live runtime is presence evidence, even when
-    @INSTANCE_ID was churn-cleared and the registry row was marked stopped.
-    Agents must not patch their own identity rows; tmuxctld owns the pane-local
-    bind and Token-API activity endpoint owns row reactivation.
-    """
-    instance_id = getattr(row, "instance_id", "") or ""
-    wrapper_id = adapter.show_pane_option(
-        pane_id, "@TOKEN_API_WRAPPER_ID"
-    ) or adapter.show_pane_option(pane_id, "@TOKEN_API_WRAPPER_LAUNCH_ID")
-    engine = adapter.show_pane_option(pane_id, "@TOKEN_API_ENGINE") or spec.engine
-    working_dir = adapter.show_pane_option(pane_id, "@TOKEN_API_CWD")
-
-    adapter.run("set-option", "-p", "-t", pane_id, "@INSTANCE_ID", instance_id, allow_failure=True)
-    ledger = None
-    if wrapper_id:
-        try:
-            from .wrapper_ledger import LEDGER
-
-            ledger = LEDGER.upsert(
-                wrapper_id=wrapper_id,
-                instance_id=instance_id,
-                persona=spec.persona,
-                pane_positional_id=pane_label,
-                engine=engine,
-                working_dir=working_dir,
-                state="OPEN",
-            ).as_dict()
-        except Exception as exc:  # noqa: BLE001 - row reactivation still matters
-            ledger = {"error": str(exc), "wrapper_id": wrapper_id}
-    update_instance_activity(instance_id, "prompt_submit")
-    if spec.persona == "custodes":
-        patch_instance(instance_id, "synced", {"synced": True})
-        patch_instance(instance_id, "legion", {"legion": "custodes"})
-    _assert_persona_color(adapter, pane_id, spec)
-    _clear_persona_guard(adapter, pane_id)
-    log_event(
-        "persona_binding_reasserted",
-        instance_id=instance_id,
-        details={
-            "pane": pane_id,
-            "pane_label": pane_label,
-            "persona": spec.persona,
-            "wrapper_id": wrapper_id,
-            "ledger": ledger,
-            "repair": "stamp_registry_ledger_tint_reassert",
-        },
-    )
-    return {"instance_id": instance_id, "ledger": ledger, "wrapper_id": wrapper_id}
-
-
-def _live_panes_claiming_instance(adapter: TmuxAdapter, instance_id: str) -> list[tuple[str, str]]:
-    """Return live tmux panes whose @INSTANCE_ID exactly claims instance_id."""
-    stamp = (instance_id or "").strip()
-    if not stamp:
-        return []
-    output = adapter.run(
-        "list-panes",
-        "-a",
-        "-F",
-        "#{pane_id}\t#{pane_dead}\t#{@INSTANCE_ID}\t#{@PANE_ID}",
-        allow_failure=True,
-    )
-    claims: list[tuple[str, str]] = []
-    for line in (output or "").splitlines():
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        pane, dead, claimed, label = parts[:4]
-        if dead != "1" and claimed.strip() == stamp:
-            claims.append((pane, label))
-    return claims
-
-
-def _persona_row_projection(instance_id: str) -> dict[str, Any]:
-    for row in fetch_instance_rows_raw():
-        if str(row.get("id") or "") == instance_id:
-            return row
-    return {}
-
-
-def _persona_display_and_tint_from_projection(
-    row: dict[str, Any], spec: PersonaSpec
-) -> tuple[str, str]:
-    persona = row.get("persona") if isinstance(row.get("persona"), dict) else {}
-    if (persona.get("slug") or "").strip() != spec.persona:
-        raise ValueError("live row persona mismatch for stamped singleton pane")
-    display = (persona.get("display_name") or spec.persona.replace("-", " ").title()).strip()
-    tint = (persona.get("pane_tint") or "").strip()
-    if not tint:
-        raise ValueError(f"persona table miss: pane_tint missing for {spec.persona}")
-    return display, tint
-
-
-def _rebind_half_bound_live_persona_if_proven(
-    adapter: TmuxAdapter,
-    pane_id: str,
-    pane_label: str,
-    spec: PersonaSpec,
-    row,
-    display: str,
-    tint: str,
-) -> dict[str, Any] | None:
-    """Narrow heal for a live singleton with a row and stamp but missing surface.
-
-    The only accepted proof is: the pane's @INSTANCE_ID equals the live row id,
-    exactly one live pane claims that id, and the row persona matches this singleton.
-    Then, and only then, restore pane-local @PERSONA and persona-table tint.
-    """
-    instance_id = getattr(row, "instance_id", "") or ""
-    stamp = adapter.show_pane_option(pane_id, "@INSTANCE_ID").strip()
-    if not instance_id or stamp != instance_id:
-        raise ValueError("stamp/row mismatch while healing half-bound live persona")
-    claims = _live_panes_claiming_instance(adapter, instance_id)
-    if len(claims) != 1 or claims[0][0] != pane_id:
-        raise ValueError(f"ambiguous live pane claims for {instance_id}: {claims!r}")
-    adapter.run("set-option", "-p", "-t", pane_id, "@PERSONA", display)
-    observed_persona = adapter.show_pane_option(pane_id, "@PERSONA").strip()
-    if observed_persona != display:
-        raise ValueError("@PERSONA write verification failed for half-bound live persona")
-    _set_pane_tint(adapter, pane_id, tint)
-    _clear_persona_guard(adapter, pane_id)
-    log_event(
-        "persona_half_bound_live_rebound",
-        instance_id=instance_id,
-        details={
-            "pane": pane_id,
-            "pane_label": pane_label,
-            "persona": spec.persona,
-            "tint": tint,
-            "repair": "stamp_row_persona_surface_reassert",
-        },
-    )
-    return {"instance_id": instance_id, "persona": display, "tint": tint}
-
 def _stop_rows(rows, *, pane_id: str, pane_label: str, reason: str) -> None:
     for row in rows:
         try:
@@ -1337,62 +1193,9 @@ def _assert_instance_impl(
     runtime_ok = _runtime_has_instance(adapter, pane_id)
     if pane_label in PERSONA_LABELS and runtime_ok and registry_optional:
         spec = persona_spec(pane_label)
-        instance_stamp = adapter.show_pane_option(pane_id, "@INSTANCE_ID")
-        try:
-            rows = _registry_entries(pane_id, pane_label, instance_stamp=instance_stamp)
-        except Exception as exc:  # noqa: BLE001
-            result = _base_result(pane_id, pane_label, pane_type, None)
-            result.update(
-                {
-                    "ok": True,
-                    "action": "registry_unavailable",
-                    "reason": f"registry_unavailable:{exc}",
-                }
-            )
-            return result
-        row = rows[0] if rows else None
-        result = _base_result(pane_id, pane_label, pane_type, row)
-        if row is None:
-            result.update({"ok": True, "action": "none", "reason": "live_registry_skipped"})
-            return result
-        if row is not None:
-            if not _row_matches_persona(row, spec):
-                result.update(
-                    {
-                        "ok": False,
-                        "action": "persona_mismatch",
-                        "reason": "live_row_persona_mismatch",
-                    }
-                )
-                return result
-            persona_surface = adapter.show_pane_option(pane_id, "@PERSONA").strip()
-            if not persona_surface:
-                try:
-                    projection = _persona_row_projection(getattr(row, "instance_id", "") or "")
-                    display, tint = _persona_display_and_tint_from_projection(projection, spec)
-                except Exception as exc:  # noqa: BLE001
-                    result.update(
-                        {
-                            "ok": False,
-                            "action": "registry_unavailable",
-                            "reason": f"registry_unavailable:{exc}",
-                        }
-                    )
-                    return result
-                rebound = _rebind_half_bound_live_persona_if_proven(
-                    adapter, pane_id, pane_label, spec, row, display, tint
-                )
-                result.update(
-                    {
-                        "ok": True,
-                        "action": "binding_reasserted",
-                        "reason": "half_bound_live_persona_rebound",
-                        "reasserted": rebound,
-                    }
-                )
-                return result
         _assert_persona_color(adapter, pane_id, spec)
         _clear_persona_guard(adapter, pane_id)
+        result = _base_result(pane_id, pane_label, pane_type, None)
         result.update({"ok": True, "action": "none", "reason": "live_registry_skipped"})
         return result
 
@@ -1473,16 +1276,21 @@ def _assert_instance_impl(
             )
             if stopped_match is not None:
                 try:
-                    reasserted = _reassert_live_persona_binding(
-                        adapter, pane_id, pane_label, spec, stopped_match
-                    )
+                    update_instance_activity(stopped_match.instance_id, "prompt_submit")
+                    if spec.persona == "custodes":
+                        # Plan-mode exits can mark the row stopped and synced=0 while
+                        # the live Custodes runtime remains in-pane. Reactivation must
+                        # restore synced=true too; color/state-hook predicates depend on it.
+                        patch_instance(stopped_match.instance_id, "synced", {"synced": True})
+                        patch_instance(stopped_match.instance_id, "legion", {"legion": "custodes"})
+                    _assert_persona_color(adapter, pane_id, spec)
+                    _clear_persona_guard(adapter, pane_id)
                     result.update(
                         {
                             "ok": True,
                             "instance_id": stopped_match.instance_id,
-                            "action": "binding_reasserted",
-                            "reason": "live_runtime_stopped_registry_row_rebound",
-                            "reasserted": reasserted,
+                            "action": "registry_reactivated",
+                            "reason": "live_runtime_stopped_registry_row_reactivated",
                         }
                     )
                     return finish(result, clear_failed=False)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import subprocess
 from pathlib import Path
 
@@ -208,28 +207,6 @@ printf 'seconds=%s\\n' "$(coderabbit_ratelimit_wait_seconds 'Retry-After: 9')"
     assert "coderabbit_reply_available=1240" in result.stdout
     assert "absent=<>" in result.stdout
     assert "seconds=9" in result.stdout
-
-
-def test_already_reviewed_skip_is_not_rate_limit_deferral(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-
-    result = bash_with_pr_step(
-        """
-if coderabbit_body_is_ratelimit 'Result: Skipped - Already reviewed'; then
-  echo bad
-else
-  echo ok
-fi
-if coderabbit_body_is_ratelimit 'Review limit reached. Next review available in: 12 minutes'; then
-  echo limited
-fi
-""",
-        repo,
-    )
-
-    assert "ok" in result.stdout
-    assert "bad" not in result.stdout
-    assert "limited" in result.stdout
 
 
 def test_normal_review_does_not_inject_empty_timeout(tmp_path: Path) -> None:
@@ -756,10 +733,9 @@ printf 'rc=%s\\n' "$rc"
     )
 
     assert "rc=1" in result.stdout
-    assert "cr_wait_exceeded" in result.stderr
-    assert "Check manually" not in result.stderr
+    assert "No new review comments found before the explicit timeout." in result.stderr
     call_lines = calls.read_text().splitlines()
-    assert sum(1 for line in call_lines if line.startswith("pr comment 7")) == 3
+    assert sum(1 for line in call_lines if line.startswith("pr comment 7")) == 1
 
 
 def test_mark_instance_status_reviewing_sends_workflow_payload(tmp_path: Path) -> None:
@@ -791,46 +767,6 @@ def test_mark_instance_status_reviewing_sends_workflow_payload(tmp_path: Path) -
         "next_required_action": "review",
         "next_action_owner": "human",
     }
-
-
-def test_pr_flag_uses_explicit_instance_env_when_no_wrapper(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-    fake_bin, curl_log = install_fake_curl(tmp_path)
-
-    bash_with_pr_step(
-        "mark_pr_flag https://github.com/owner/repo/pull/621 open",
-        repo,
-        {
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "CURL_LOG": str(curl_log),
-            "TOKEN_API_INSTANCE_ID": "inst-env-owner",
-        },
-    )
-
-    pr_calls = [call for call in curl_calls(curl_log) if "/api/instances/" in call[-1]]
-    assert len(pr_calls) == 1
-    assert pr_calls[0][-1].endswith("/api/instances/inst-env-owner/pr")
-
-
-def test_pr_flag_prefers_explicit_instance_env_over_stale_pane(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-    fake_bin, curl_log = install_fake_curl(tmp_path)
-
-    bash_with_pr_step(
-        "unset TOKEN_API_WRAPPER_ID TOKEN_API_WRAPPER_LAUNCH_ID; mark_pr_flag https://github.com/owner/repo/pull/622 merged",
-        repo,
-        {
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "CURL_LOG": str(curl_log),
-            "CURL_LEDGER_JSON": ledger_json("inst-stale-pane", "%stale"),
-            "TOKEN_API_INSTANCE_ID": "inst-true-owner",
-            "TMUX_PANE": "%stale",
-        },
-    )
-
-    pr_calls = [call for call in curl_calls(curl_log) if "/api/instances/" in call[-1]]
-    assert len(pr_calls) == 1
-    assert pr_calls[0][-1].endswith("/api/instances/inst-true-owner/pr")
 
 
 def test_pr_step_does_not_arm_generic_plan_hook_at_startup(tmp_path: Path) -> None:
@@ -898,11 +834,10 @@ main --no-merge
     assert hooks[0]["subscriber_instance_id"] == "inst-123"
     assert hooks[0]["target_pane"] == "%ledger"
     assert hooks[0]["subscriber_pane"] == "%ledger"
-    assert hooks[0]["payload"].startswith(
+    assert hooks[0]["payload"] == (
         "/plan PR #17 review returned "
         "(https://github.com/owner/repo/pull/17); plan fixes or next review action."
     )
-    assert "CodeRabbit verdict:" in hooks[0]["payload"]
 
 
 def test_merge_completion_does_not_arm_terminal_plan_followup(tmp_path: Path) -> None:
@@ -1050,11 +985,10 @@ arm_pr_plan_followup review 17 https://github.com/owner/repo/pull/17 "plan fixes
     hooks = curl_json_bodies(curl_log, "/api/hooks/subscribe")
     assert len(hooks) == 1
     assert hooks[0]["target_pane"] == "%ledger"
-    assert hooks[0]["payload"].startswith(
+    assert hooks[0]["payload"] == (
         "/plan PR #17 review returned "
         "(https://github.com/owner/repo/pull/17); plan fixes or next review action."
     )
-    assert "CodeRabbit verdict:" in hooks[0]["payload"]
 
 
 def test_findings_summary_filters_to_current_head_and_marks_historical(tmp_path: Path) -> None:
@@ -1090,225 +1024,3 @@ fi
     assert "current head finding" in result.stdout
     assert ".worktree.env" not in result.stdout
     assert "historical/resolved CodeRabbit findings omitted: 1" in result.stdout
-
-
-def test_plan_followup_payload_embeds_coderabbit_context(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-    fake_bin, curl_log = install_fake_curl(tmp_path)
-
-    bash_with_pr_step(
-        """
-repo_slug() { echo owner/repo; }
-pr_head_sha() { echo headsha123456; }
-coderabbit_state_for_head() { echo success; }
-latest_coderabbit_review_state() { echo CHANGES_REQUESTED; }
-changes_requested_count() { echo 1; }
-checks_summary() { echo "  - unit / pytest: passing"; }
-summarize_actionable_findings() { echo "  - cli-tools/bin/pr-step:42 — missing CR context"; }
-arm_pr_plan_followup review 17 https://github.com/owner/repo/pull/17 "plan fixes or next review action."
-""",
-        repo,
-        {
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "CURL_LOG": str(curl_log),
-            "CURL_LEDGER_JSON": ledger_json("inst-123", "%ledger"),
-            "TOKEN_API_WRAPPER_ID": "wrap-123",
-        },
-    )
-
-    payload = curl_json_bodies(curl_log, "/api/hooks/subscribe")[0]["payload"]
-    assert (
-        "CodeRabbit verdict: commit=success; review=CHANGES_REQUESTED; changes_requested=1"
-        in payload
-    )
-    assert "Checks:" in payload
-    assert "unit / pytest: passing" in payload
-    assert "Actionable CodeRabbit findings:" in payload
-    assert "cli-tools/bin/pr-step:42" in payload
-
-
-def test_review_timeout_rerequests_coderabbit_without_agent_visible_bounce(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-
-    result = bash_with_pr_step(
-        """
-rerequests=0
-coderabbit_rerequest_review() { rerequests=$((rerequests + 1)); printf 'body:%s\n' "$2"; return 0; }
-TIMEOUT_REREQUESTS_DONE=0
-if coderabbit_maybe_rerequest_on_timeout 17 TIMEOUT_REREQUESTS_DONE 1; then
-  printf 'first=yes done=%s rerequests=%s\n' "$TIMEOUT_REREQUESTS_DONE" "$rerequests"
-fi
-if ! coderabbit_maybe_rerequest_on_timeout 17 TIMEOUT_REREQUESTS_DONE 1; then
-  printf 'second=no done=%s rerequests=%s\n' "$TIMEOUT_REREQUESTS_DONE" "$rerequests"
-fi
-""",
-        repo,
-    )
-
-    assert "first=yes done=1 rerequests=1" in result.stdout
-    assert "second=no done=1 rerequests=1" in result.stdout
-    combined = result.stdout + result.stderr
-    assert "timed out with no fresh verdict; re-requesting" in combined
-    assert "Check manually" not in combined
-    assert "Possible reasons" not in combined
-
-
-def test_timeout_prefers_rate_limit_reset_signal_before_rerequest(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-
-    result = bash_with_pr_step(
-        """
-slept=0
-rerequested=0
-order=
-coderabbit_latest_issue_comment_json() { printf '%s\n' '{"body":"Review limit reached. Your next review will be available in 18 minutes.","updated_at":"1970-01-01T00:00:00Z"}'; }
-sleep_until_rate_limit_reset() { slept=$1; order="${order}sleep "; return 0; }
-rate_limit_reset_reached() { return 0; }
-coderabbit_rerequest_review() { rerequested=$((rerequested + 1)); order="${order}rerequest"; return 0; }
-if coderabbit_maybe_wait_rate_limit_on_timeout 17; then
-  printf 'waited=%s rerequested=%s order=%s\n' "$slept" "$rerequested" "$order"
-fi
-""",
-        repo,
-    )
-
-    assert "waited=1140 rerequested=1 order=sleep rerequest" in result.stdout
-
-
-def test_rate_limit_reset_rerequest_consumes_retry_budget(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-
-    result = bash_with_pr_step(
-        """
-rerequested=0
-LAST_RATELIMIT_SIGNATURE=""
-sleep_until_rate_limit_reset() { return 0; }
-rate_limit_reset_reached() { return 0; }
-coderabbit_rerequest_review() { rerequested=$((rerequested + 1)); return 0; }
-done_count=0
-body_one='Review limit reached. Your next review will be available in 1 second.'
-body_two='Review limit reached. Your next review will be available in 2 seconds.'
-coderabbit_handle_ratelimit_comment 17 "$body_one" '1970-01-01T00:00:00Z' done_count 1
-if ! coderabbit_handle_ratelimit_comment 17 "$body_two" '1970-01-01T00:00:01Z' done_count 1; then
-  printf 'blocked done=%s rerequested=%s\\n' "$done_count" "$rerequested"
-fi
-""",
-        repo,
-    )
-
-    assert "blocked done=1 rerequested=1" in result.stdout
-
-
-def test_coderabbit_heartbeat_is_opaque_when_requested(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-    visible_heartbeat = tmp_path / "visible heartbeat.log"
-    opaque_heartbeat = tmp_path / "opaque heartbeat.log"
-
-    visible = bash_with_pr_step(
-        f"""
-PR_STEP_HEARTBEAT_FILE={shlex.quote(str(visible_heartbeat))}
-emit_coderabbit_heartbeat 'CodeRabbit poll: visible'
-echo visible-done
-""",
-        repo,
-    )
-    result = bash_with_pr_step(
-        f"""
-PR_STEP_OPAQUE_WAIT=true
-PR_STEP_HEARTBEAT_FILE={shlex.quote(str(opaque_heartbeat))}
-emit_coderabbit_heartbeat 'CodeRabbit poll: hidden'
-echo done
-""",
-        repo,
-    )
-
-    assert "visible-done" in visible.stdout
-    assert visible_heartbeat.exists()
-    assert visible_heartbeat.read_text() != ""
-    assert "done" in result.stdout
-    assert not opaque_heartbeat.exists() or opaque_heartbeat.read_text() == ""
-
-
-def test_fresh_current_head_verdict_skips_rerequest(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-
-    result = bash_with_pr_step(
-        """
-current_pr_number() { echo 17; }
-current_pr_state() { echo OPEN; }
-current_pr_url() { echo https://github.com/owner/repo/pull/17; }
-assert_repo() { :; }
-mark_instance_status() { :; }
-mark_pr_flag() { :; }
-commit_if_needed() { return 1; }
-push_branch() { :; }
-checks_green() { return 0; }
-review_pr_normal() { echo unexpected-rerequest; return 99; }
-summarize_pr() { :; }
-merge_pr_normal() { :; }
-main --no-merge
-""",
-        repo,
-    )
-
-    assert "unexpected-rerequest" not in result.stdout
-    assert "already green; skipping re-review" in result.stderr + result.stdout
-
-
-def test_coderabbit_state_for_head_accepts_check_run_when_commit_status_absent(
-    tmp_path: Path,
-) -> None:
-    repo = init_repo(tmp_path)
-
-    result = bash_with_pr_step(
-        """
-repo_slug() { echo owner/repo; }
-gh() {
-  if [[ "$*" == *"commits/headsha/statuses"* ]]; then
-    printf '[]\n'
-    return 0
-  fi
-  if [[ "$*" == *"commits/headsha/check-runs"* ]]; then
-    cat <<'JSON'
-{"check_runs":[{"name":"CodeRabbit / Review","status":"completed","conclusion":"success","completed_at":"2026-07-10T02:47:00Z","app":{"slug":"coderabbitai"}}]}
-JSON
-    return 0
-  fi
-  return 2
-}
-coderabbit_state_for_head headsha
-""",
-        repo,
-    )
-
-    assert result.stdout.strip() == "success"
-
-
-def test_latest_coderabbit_issue_comment_helpers_paginate(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
-
-    result = bash_with_pr_step(
-        """
-repo_slug() { echo owner/repo; }
-gh() {
-  if [[ "$*" == *"issues/17/comments"* ]]; then
-    [[ " $* " == *" --paginate "* ]] || {
-      printf '%s\n' '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z","body":"old"}]'
-      return 0
-    }
-    cat <<'JSON'
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z","body":"old"}]
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-07-10T01:00:00Z","updated_at":"2026-07-10T01:30:00Z","body":"new"}]
-JSON
-    return 0
-  fi
-  return 2
-}
-printf 'body=%s\\n' "$(coderabbit_latest_issue_comment_body 17)"
-printf 'stamp=%s\\n' "$(coderabbit_latest_issue_comment_timestamp 17)"
-""",
-        repo,
-    )
-
-    assert "body=new" in result.stdout
-    assert "stamp=2026-07-10T01:30:00Z" in result.stdout

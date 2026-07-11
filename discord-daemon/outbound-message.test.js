@@ -5,7 +5,7 @@ import {
   DISCORD_MESSAGE_CONTENT_LIMIT,
   sendChunkedDiscordContent,
   splitDiscordMessageContent,
-} from './outbound-message.ts';
+} from './outbound-message.js';
 
 test('short content is not chunked or annotated', async () => {
   const calls = [];

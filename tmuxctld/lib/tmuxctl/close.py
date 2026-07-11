@@ -224,8 +224,8 @@ def _close_pane_unshielded(
         attempted_target=pane,
         enabled=os.environ.get("IMPERIUM_ALLOW_TMUX_FOCUS") != "1",
     ):
-        adapter.clear_runtime_state(pane)
-        runtime_cleared = True
+        if pane_class is PaneClass.WORKER:
+            adapter.clear_runtime_state(pane)
         for _ in range(3):
             adapter.send_keys(pane, "C-c", allow_failure=True)
             time.sleep(0.2)
@@ -258,11 +258,9 @@ def _close_pane_unshielded(
             post = detect_pane_tui(adapter, pane)
             if post.live:
                 return {
-                    "status": "partial_teardown",
+                    "status": "refused",
                     "reason": "live_tui_survived_graceful",
                     "guard": "slot-never-kill-live-tui",
-                    "chrome_cleared": runtime_cleared,
-                    "pane_freed": False,
                     "pane": pane,
                     "pane_role": role,
                     "pane_class": pane_class.value,
@@ -271,14 +269,10 @@ def _close_pane_unshielded(
                     "agent_command": post.agent_command,
                     "method": method,
                 }
-            result = apply_teardown(
-                adapter, pane, pane_class, pane_role=role, runtime_already_cleared=True
-            )
+            result = apply_teardown(adapter, pane, pane_class, pane_role=role)
             stack = _enforce_stack(adapter, window_target, window_name)
             return {
                 **result,
-                "chrome_cleared": runtime_cleared,
-                "pane_freed": True,
                 "method": "graceful-clear-in-place",
                 "graceful_timeout": max(timeout, 0.0),
                 "stack_enforcement": stack,
@@ -288,12 +282,8 @@ def _close_pane_unshielded(
         adapter.run("kill-pane", "-t", pane, allow_failure=True)
 
     stack = _enforce_stack(adapter, window_target, window_name)
-    pane_freed = not _pane_exists(adapter, pane)
     return {
-        "status": "closed" if pane_freed else "partial_teardown",
-        "reason": None if pane_freed else "kill_pane_failed_after_runtime_clear",
-        "chrome_cleared": runtime_cleared,
-        "pane_freed": pane_freed,
+        "status": "closed" if not _pane_exists(adapter, pane) else "failed",
         "pane": pane,
         "pane_role": role,
         "pane_class": pane_class.value,
@@ -302,57 +292,9 @@ def _close_pane_unshielded(
     }
 
 
-def _pane_wrapper_id(adapter: TmuxAdapter, pane: str) -> str:
-    """Read a pane's wrapper-ownership id BEFORE runtime clear wipes it."""
-    try:
-        resolved = _resolve_current(adapter, pane)
-    except Exception:  # noqa: BLE001 — a gone pane has no wrapper id to release
-        return ""
-    if not resolved:
-        return ""
-    owner = str(adapter.show_pane_option(resolved, "@TOKEN_API_WRAPPER_ID") or "").strip()
-    if not owner:
-        owner = str(
-            adapter.show_pane_option(resolved, "@TOKEN_API_WRAPPER_LAUNCH_ID") or ""
-        ).strip()
-    return owner
-
-
-def _release_ledger_occupancy(wrapper_id: str, result: dict[str, Any]) -> None:
-    """Close the wrapper-ledger occupancy row when a pane is closed.
-
-    ``/close-pane`` clears the pane runtime and kills the pane but — unlike the
-    WrapperEnd path — never released the ledger's OPEN occupancy row, so a canonical
-    close left ``ledger_occupied=true`` and jammed the next ``:new`` allocation until a
-    ``/reconcile`` pruned the stale row. Release it here, keyed by the wrapper id read
-    before the runtime scrub, on any terminal close outcome.
-    """
-    if not wrapper_id:
-        return
-    if result.get("status") not in {
-        "closed",
-        "already_closed",
-        "cleared_in_place",
-        "partial_teardown",
-    }:
-        return
-    try:
-        from .wrapper_ledger import LEDGER
-
-        row = LEDGER.close(wrapper_id)
-        result["ledger_released"] = bool(row)
-    except Exception:  # noqa: BLE001 — ledger release is best-effort, never fail the close
-        pass
-
-
 def close_pane(adapter: TmuxAdapter, pane: str, *, timeout: float = 3.0) -> dict[str, Any]:
     with close_contract_signal_shield():
-        # Read wrapper ownership BEFORE the close clears the pane runtime (which
-        # unsets @TOKEN_API_WRAPPER_ID), so we can release the ledger occupancy row.
-        wrapper_id = _pane_wrapper_id(adapter, pane)
-        result = _close_pane_unshielded(adapter, pane, timeout=timeout)
-        _release_ledger_occupancy(wrapper_id, result)
-        return result
+        return _close_pane_unshielded(adapter, pane, timeout=timeout)
 
 
 def close_instance(
@@ -377,13 +319,6 @@ def close_instance(
 
             resolved = resolve_instance(adapter, instance_id)
             resolved_pane = resolved.pane_id or ""
-        # Pin the physical pane handle once for the whole immediate close transaction.
-        # A preceding slot clear may erase role stamps; never re-resolve a role later
-        # and risk acting on a different live pane.
-        if resolved_pane and not resolved_pane.startswith("%"):
-            from .resolver import resolve_to_physical
-
-            resolved_pane = resolve_to_physical(adapter, resolved_pane)
 
         if mode == "after-stop":
             body = {"mode": "after-stop", "lifecycle": lifecycle}
@@ -432,17 +367,6 @@ def close_instance(
         close_result: dict[str, Any] | None = None
         if target_pane:
             close_result = _close_pane_unshielded(adapter, target_pane, timeout=timeout)
-            if close_result.get("status") == "cleared_in_place":
-                return {
-                    "status": "cleared_in_place",
-                    "reason": "slot_clear_completed_no_retire_required",
-                    "instance_id": instance_id,
-                    "lifecycle": lifecycle,
-                    "pane": target_pane,
-                    "retire_required": False,
-                    "close_transaction_complete": True,
-                    "close": close_result,
-                }
             if close_result.get("status") == "refused":
                 return {
                     "status": "refused",
@@ -466,11 +390,11 @@ def close_instance(
                     "agent_command": post.agent_command,
                     "close": close_result,
                 }
-            if close_result.get("status") in {"failed", "partial_teardown"}:
-                # Pane teardown did not complete (for example chrome scrubbed but
-                # kill/free failed). Fail closed rather than retire a half-applied pane.
+            if close_result.get("status") == "failed":
+                # Pane stubbornly persists (no agent, but kill-pane could not
+                # remove it). Fail closed rather than retire a still-present pane.
                 return {
-                    "status": close_result.get("status"),
+                    "status": "failed",
                     "reason": "pane_close_failed",
                     "instance_id": instance_id,
                     "lifecycle": lifecycle,

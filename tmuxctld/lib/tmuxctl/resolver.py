@@ -119,24 +119,12 @@ def _role_position_aliases(role: str) -> tuple[str, ...]:
 
 def _add_unique(
     index: dict[str, PaneSnapshot],
-    live_claims: dict[str, str],
     ambiguous: set[str],
     key: str,
     pane: PaneSnapshot,
 ) -> None:
     if not key:
         return
-    # Track distinct LIVE claimants per key independently of the index slot: two
-    # distinct live @PANE_ID stamps on one public address are always ambiguous
-    # (the custodes->malcador misroute), even when a tombstone redirect is
-    # indexed between them and would otherwise absorb the second live claim
-    # before it reaches the poison branch below.
-    if pane.pane_kind is not PaneKind.TOMBSTONE:
-        prior_live = live_claims.get(key)
-        if prior_live is None:
-            live_claims[key] = pane.pane_id
-        elif prior_live != pane.pane_id:
-            ambiguous.add(key)
     existing = index.get(key)
     if existing is None or existing.pane_id == pane.pane_id:
         index.setdefault(key, pane)
@@ -152,14 +140,12 @@ def _add_unique(
     # Two distinct live panes claim the same public address (duplicate or
     # churned @PANE_ID stamps). First-writer-wins here silently delivered a
     # council:custodes-addressed report into council:malcador; the key is
-    # poisoned instead so lookups fail loud. (The live_claims tracker above
-    # already flagged this; retained as a direct-collision backstop.)
+    # poisoned instead so lookups fail loud.
     ambiguous.add(key)
 
 
 def _index_positionals(
     by_positional: dict[str, PaneSnapshot],
-    positional_live: dict[str, str],
     ambiguous: set[str],
     window: WindowSnapshot,
     pane: PaneSnapshot,
@@ -186,9 +172,7 @@ def _index_positionals(
     )
     for position in _role_position_aliases(pane.pane_role):
         for window_name in window_names:
-            _add_unique(
-                by_positional, positional_live, ambiguous, f"{window_name}:{position}", pane
-            )
+            _add_unique(by_positional, ambiguous, f"{window_name}:{position}", pane)
 
 
 def _index_workspace(
@@ -198,17 +182,13 @@ def _index_workspace(
     by_logical: dict[str, PaneSnapshot] = {}
     by_positional: dict[str, PaneSnapshot] = {}
     ambiguous: set[str] = set()
-    # First distinct live @PANE_ID seen per key, per index namespace, so a second
-    # distinct live claimant poisons the key even across tombstone redirects.
-    positional_live: dict[str, str] = {}
-    logical_live: dict[str, str] = {}
     for window in workspace.windows:
         for pane in window.panes:
             by_physical[pane.pane_id] = pane
-            _index_positionals(by_positional, positional_live, ambiguous, window, pane)
+            _index_positionals(by_positional, ambiguous, window, pane)
             if pane.pane_role:
                 for role in indexable_pane_roles(pane.pane_role):
-                    _add_unique(by_logical, logical_live, ambiguous, role, pane)
+                    _add_unique(by_logical, ambiguous, role, pane)
     return by_physical, by_logical, by_positional, ambiguous
 
 
@@ -426,10 +406,11 @@ def instance_id_for_pane(adapter: TmuxAdapter, pane: str) -> str:
 class FreePane:
     """An unoccupied, agent-free pane — a candidate for split-alias-style routing.
 
-    Derived from current tmux structure plus the wrapper→pane ledger and live
-    process liveness: a pane is *free* when it has no active wrapper row, no live
-    agent process, is not a protected singleton label, and is past its boot
-    grace. (The retired ``@PANE_CLEAN`` clean-pane stamp is no longer consulted.)
+    Derived from current tmux structure plus the wrapper→pane ledger: a pane is
+    *free* when it has no active wrapper row, is not a protected singleton label,
+    and is past its boot grace. The allocator walk does not sniff process trees;
+    the selected candidate is cross-checked once immediately before dispatch
+    bytes. (The retired ``@PANE_CLEAN`` clean-pane stamp is no longer consulted.)
     """
 
     pane_id: str
@@ -440,10 +421,10 @@ class FreePane:
 def list_free_panes(adapter: TmuxAdapter) -> list[FreePane]:
     """Single global tmux scan → the dispatch-available panes.
 
-    Availability is read from the wrapper→pane ledger and current process tree:
-    a pane is free only when it has no active wrapper row, no live agent process,
-    is past its boot grace, and is not a protected singleton label. The selected
-    candidate is still sniffed again in the dispatch send gate. The singleton
+    Availability is read from the wrapper→pane ledger: a pane is free only when
+    it has no active wrapper row, is past its boot grace, and is not a protected
+    singleton label. This walk intentionally performs no process-tree sniff. The
+    selected candidate is sniffed once in the dispatch send gate. The singleton
     exclusion is unconditional so a corrupted/missing ledger row cannot expose
     Custodes, Fabricator-General, Administratum/Admin, etc. as a worker target.
     """

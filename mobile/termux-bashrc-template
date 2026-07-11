@@ -111,7 +111,7 @@ alias fetch-bashrc="fetch-mobile"
 
 # ====================================================
 # On Termux shell exit/app close, ask the Mac tmux server to drop only this
-# shell's phone client. Reopen uses the normal sticky mac() auto-attach path below.
+# shell's phone client. Reopen uses the normal sticky mac() auto-reconnect path below.
 TERMUX_MAC_TMUX_CLIENT_TAG="${TERMUX_MAC_TMUX_CLIENT_TAG:-termux-${USER:-phone}-$$}"
 TERMUX_MAC_TMUX_CLIENT_TAG="${TERMUX_MAC_TMUX_CLIENT_TAG//[^A-Za-z0-9_.-]/_}"
 
@@ -310,47 +310,19 @@ not-mac() {
     echo "Mac tmux auto-attach disabled for the next 'mac'. Run 'mac' to re-enable."
 }
 
-
-# Reconnect gate for bare Termux mac(). TERMUX_MAC_RECONNECT=false disables
-# reconnect inside this shell; $MAC_RECONNECT_FILE lets phone automation flip the
-# gate for already-running shells. When disabled, mac() blocks on a FIFO until
-# mac-reconnect-on (or equivalent MacroDroid action) wakes it; no polling.
-MAC_RECONNECT_FILE="${MAC_RECONNECT_FILE:-$HOME/.mac-reconnect-enabled}"
-MAC_RECONNECT_FIFO="${MAC_RECONNECT_FIFO:-$HOME/.mac-reconnect-wake}"
-
-_mac_reconnect_enabled() {
-    case "${TERMUX_MAC_RECONNECT:-}" in
-        0|false|FALSE|no|NO|off|OFF) return 1 ;;
-    esac
-    [[ "$(cat "$MAC_RECONNECT_FILE" 2>/dev/null || echo true)" != "false" ]]
-}
-
-_mac_wait_for_reconnect_enabled() {
-    while ! _mac_reconnect_enabled; do
-        rm -f "$MAC_RECONNECT_FIFO"
-        mkfifo "$MAC_RECONNECT_FIFO" 2>/dev/null || true
-        echo "Mac reconnect paused; waiting for Termux reopen..."
-        IFS= read -r _ < "$MAC_RECONNECT_FIFO" || true
-    done
-}
-
-mac-reconnect-on() {
-    echo true > "$MAC_RECONNECT_FILE"
-    if [[ -p "$MAC_RECONNECT_FIFO" ]]; then
-        if exec 9<>"$MAC_RECONNECT_FIFO"; then
-            printf 'wake\n' >&9
-            exec 9>&-
-        fi
-    fi
-}
-
-mac-reconnect-off() {
-    echo false > "$MAC_RECONNECT_FILE"
-}
-
-
 # _mac_reconnect_plan ATTEMPT BURST_MAX DEEP_DONE
-# Pure decision helper for the aggressive reconnect ladder — no sleeping, no ssh.
+# Pure decision helper for the sticky reconnect ladder — no sleeping, no ssh, so
+# it is unit-testable in isolation (see tests/test_mac_reconnect_ladder.py).
+# Given the current 1-based consecutive-failure ATTEMPT, the last attempt of the
+# 1s aggressive burst (BURST_MAX), and whether the deeper restart already fired
+# this outage (DEEP_DONE=0|1), it prints three space-separated tokens:
+#     <next_delay_secs> <do_print:0|1> <do_deep_restart:0|1>
+# Schedule:
+#     attempt 1               -> 0 0 0   instant, silent re-tap
+#     attempt 2               -> 1 1 0   1s wait, print the reconnect line once
+#     attempts 3..BURST_MAX   -> 1 0 0   aggressive 1s burst continues
+#     attempt BURST_MAX+1     -> 0 0 1   deeper restart (once), zero delay
+#     thereafter              -> exponential backoff 2,4,8 capped at 8s
 _mac_reconnect_plan() {
     local attempt="$1" burst_max="$2" deep_done="$3"
     local delay=0 do_print=0 do_deep=0
@@ -363,7 +335,8 @@ _mac_reconnect_plan() {
         delay=0
         do_deep=1
     else
-        local n=$(( attempt - burst_max - 1 ))
+        # Exponential backoff past the burst + deeper restart: 2, 4, 8, cap 8.
+        local n=$(( attempt - burst_max - 1 ))   # 1, 2, 3, ...
         if (( n >= 3 )); then
             delay=8
         else
@@ -398,11 +371,32 @@ mac() {
     local _mac_attach
     _mac_attach="$(_mac_tmux_attach_cmd)"
 
-    # Bare Termux: max-aggression reconnect while the reconnect gate is enabled.
-    # If phone automation marks the gate false (e.g. Termux closing/backgrounded),
-    # keep the mac() wrapper alive but block on a FIFO instead of reconnecting or
-    # polling. Reopening Termux should run mac-reconnect-on, which flips the file
-    # gate and writes the FIFO to kick this wrapper back into the aggressive loop.
+    # Bare Termux: stay glued to the Mac tmux workspace. A dropped SSH (screen
+    # lock, network blip, Wi-Fi↔LTE roam) lands back here and reconnects forever
+    # instead of dumping to the local Termux shell. Two deliberate ways out:
+    #   * Clean tmux detach (prefix + d → exit 0) — you meant to leave.
+    #   * Ctrl-C while it's waiting to reconnect — aborts the loop to the shell.
+    #
+    # Retry ladder (see _mac_reconnect_plan for the schedule). The old loop
+    # climbed an exponential backoff and *never* reset it: because a reconnect
+    # was never registered at the wrapper, every drop after the first started
+    # deep in the ladder and ate multi-second waits — torment mid-thought. The
+    # rework:
+    #   1. attempt 1 re-taps instantly and silently (most drops are momentary);
+    #   2. attempt 2 waits 1s and prints once;
+    #   3. attempts 3..6 keep hammering at 1s (the aggressive burst);
+    #   4. after the burst, one "deeper restart" — the exact reset a fresh `mac`
+    #      invocation does by hand (rebuild the attach env + a zero-delay ssh
+    #      with a tight ConnectTimeout). This is why Ctrl-C then re-typing `mac`
+    #      reconnects when the in-loop retry looks wedged: the fresh call resets
+    #      the ladder and drops the stalled attempt; nothing in the old loop did;
+    #   5. only then fall into exponential backoff (2→4→8s, capped) so a genuine
+    #      long outage doesn't hammer SSH while still reconnecting forever.
+    # Success is registered by timing each ssh: a session that lasted a real
+    # interval connected and only now dropped, so the ladder resets to attempt 1.
+    # Each attempt is bounded so a half-open / blackholed TCP can't wedge the
+    # loop: ConnectTimeout caps the handshake, and ServerAlive* tears a silently
+    # dead session down and returns non-zero → falls through to the ladder.
     local _mac_ssh_opts_relaxed=(-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
     local _mac_ssh_opts_tight=(-o ConnectTimeout=4 -o ServerAliveInterval=3 -o ServerAliveCountMax=2)
     local _mac_ssh_opts=("${_mac_ssh_opts_relaxed[@]}")
@@ -410,8 +404,6 @@ mac() {
     local _connect_ok=15     # an ssh lasting >= this counts as a real attach
     local attempt=0 printed=false deep_done=false
     while true; do
-        _mac_wait_for_reconnect_enabled
-
         local _t0=$SECONDS
         ssh "${_mac_ssh_opts[@]}" -t mac "$_mac_attach"
         local exit_code=$?
@@ -420,15 +412,11 @@ mac() {
         # Exit code 0 = clean detach / clean remote logout. You asked to leave.
         [[ $exit_code -eq 0 ]] && break
 
-        if ! _mac_reconnect_enabled; then
-            _mac_wait_for_reconnect_enabled
-            attempt=0; printed=false; deep_done=false
-            _mac_ssh_opts=("${_mac_ssh_opts_relaxed[@]}")
-            continue
-        fi
-
         # A session that lasted a real interval connected successfully and only
-        # now dropped. Reset the ladder so this drop gets an instant re-tap.
+        # now dropped. Register that success the old wrapper never did: reset the
+        # whole ladder so this drop is treated as attempt 1 (instant, silent),
+        # not a continuation of a stale backoff. (Connect *failures* return well
+        # under _connect_ok, so they don't trip this.)
         if (( _elapsed >= _connect_ok )); then
             attempt=0; printed=false; deep_done=false
             _mac_ssh_opts=("${_mac_ssh_opts_relaxed[@]}")
@@ -440,11 +428,14 @@ mac() {
         read -r _delay _do_print _do_deep <<< "$_plan"
 
         if (( _do_print )) && [[ "$printed" != true ]]; then
-            echo "Connection dropped — reconnecting (Ctrl-C to stop, mac-reconnect-off to pause)..."
+            echo "Connection dropped — reconnecting (Ctrl-C to stop)..."
             printed=true
         fi
 
         if (( _do_deep )); then
+            # Deeper restart: replicate a fresh `mac` invocation without dropping
+            # the wrapper — rebuild the attach env, tighten the ssh handshake so
+            # a wedged/blackholed socket is abandoned in ~4s, retry immediately.
             echo "  ...deeper restart (fresh attach)..."
             _mac_set_insist_tmux
             _mac_attach="$(_mac_tmux_attach_cmd)"
@@ -454,7 +445,6 @@ mac() {
 
         (( _delay > 0 )) && sleep "$_delay"
     done
-
 }
 
 # wsl: SSH to WSL. From tx panes → plain SSH. Standalone → SSH then attach tmux.
@@ -804,13 +794,11 @@ shutdown-mini() {
 # STARTUP
 # ====================================================
 # Sticky auto-attach: a fresh Termux open jumps straight to the Mac tmux
-# workspace via mac(). Drops reconnect aggressively while mac-reconnect is on;
-# when phone automation turns it off, the wrapper sleeps on a FIFO until reopen
-# turns it back on and wakes it. Guards:
+# workspace via mac(), which then reconnects forever on drops. Guards:
 #   * interactive shells only ($- has 'i') — never hijacks scp/`ssh phone cmd`,
 #   * skip if already inside tmux or an inbound SSH session (no recursion),
 #   * skip if `not-mac` set the one-shot opt-out — run `not-mac` then reopen
-#     Termux to reach a plain local shell.
+#     Termux (or Ctrl-C during reconnect) to reach a plain local shell.
 case $- in
     *i*)
         if [[ -f "$MAC_NOT_MAC_FILE" ]]; then

@@ -32,7 +32,6 @@ set -euo pipefail
 
 _LIB_DIR="$(dirname "$(readlink -f "$0")")/../lib"
 source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
-source "${_LIB_DIR}/tmuxctld-timeouts.sh" 2>/dev/null || true
 source "${_LIB_DIR}/pane-id.sh" 2>/dev/null || true
 
 # --- Colors ---
@@ -54,21 +53,9 @@ log_dry()     { echo -e "${CYAN}~${NC} $1" >&2; }
 # --- Vault path ---
 VAULT_DIR="${IMPERIUM}/Imperium-ENV"
 
-tmuxctld_result_max_time() {
-    # curl max-time is a transport budget, not the lifecycle protocol bound.
-    # Allocation/reconcile/close operations may legitimately finish after the
-    # send ceiling; keep them reattachable by waiting for daemon receipt.
-    case "${1:-} ${2:-}" in
-        "POST /reconcile"|"POST /close-pane"|"POST /close"|"POST /stack/add") printf '%s' "${TMUXCTLD_MAX_TIME:-0}" ;;
-        "POST /send-text") printf '%s' "${TMUXCTLD_MAX_TIME:-$(tmuxctld_send_client_timeout)}" ;;
-        *) printf '%s' "${TMUXCTLD_MAX_TIME:-3}" ;;
-    esac
-}
-
 tmuxctld_result() {
-    local response max_time
-    max_time="$(tmuxctld_result_max_time "$@")"
-    response="$(TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="$max_time" "${_LIB_DIR}/../bin/tmuxctld-ping" "$@")" || return $?
+    local response
+    response="$(TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-60}" "${_LIB_DIR}/../bin/tmuxctld-ping" "$@")" || return $?
     TMUXCTLD_RESPONSE="$response" python3 - <<'PY'
 import json
 import os

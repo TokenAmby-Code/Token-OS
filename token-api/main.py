@@ -21,21 +21,15 @@ import re
 import shlex
 import signal
 import sqlite3
-import sys
 import time
 import uuid
-from pathlib import Path
-
-_CLI_LIB = Path(__file__).resolve().parents[1] / "cli-tools" / "lib"
-if str(_CLI_LIB) not in sys.path:
-    sys.path.insert(0, str(_CLI_LIB))
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from tmuxctld_timeouts import SEND_CLIENT_TIMEOUT_SECONDS
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -88,7 +82,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import shared
 import talk as talk_service
 import temp_message as temp_message_service
-from billable import accrual_weight, classify_domain, classify_work_class, trickle_numerator
+from billable import accrual_weight, classify_work_class, trickle_numerator
 from context_governor import (
     ContextSweepRequest,
     record_context_governor_progress,
@@ -155,7 +149,6 @@ from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
 from personas import (
-    PROFILE_BY_SLUG,
     assign_astartes_persona,
     persona_to_profile,
     resolve_live_persona_instance,
@@ -604,7 +597,7 @@ async def send_prompt_to_pane(
         # recovery/ack handshake.  Do not time out early and fall back to a
         # second send path; that creates the exact "bytes landed, receipt says
         # failed" behavior brief is meant to eliminate.
-        timeout=SEND_CLIENT_TIMEOUT_SECONDS,
+        timeout=45,
         default_loopback=_tmuxctld_default_loopback(),
     )
     if daemon_payload is None:
@@ -3003,9 +2996,12 @@ async def stop_instance(instance_id: str):
         if lifecycle_result.get("status") == "failed":
             raise HTTPException(status_code=404, detail="Instance not found")
 
-        # Pane chrome teardown is owned by tmuxctld's atomic clear/free transaction.
-        # Do not run a second stamp-gated, title-blind tint clear here: teardown must
-        # not depend on @INSTANCE_ID still being present after death begins.
+        # Resolve the stopping instance's LIVE pane (tmuxctl owns instance->pane) for
+        # the tint-clear below — never the stored tmux_pane column. resolve-instance
+        # only returns a pane that still carries THIS instance's @INSTANCE_ID stamp,
+        # so a truthy result is unambiguously ours to vacate; a dead, reused, or
+        # taken-over pane resolves to None and we leave the tint to its current owner.
+        stopped_pane, _stopped_role = await shared.resolve_instance_pane(instance_id)
         await db.commit()
 
         # Check remaining active instances (all)
@@ -3021,6 +3017,11 @@ async def stop_instance(instance_id: str):
         )
         count_row = await cursor.fetchone()
         remaining_non_sub = count_row[0] if count_row else 0
+
+    # Event-driven tint: the persona vacated this pane — clear its persona tint
+    # back to default. No queue, no poll.
+    if stopped_pane:
+        await asyncio.to_thread(shared.clear_pane_tint, stopped_pane, source="stop-instance")
 
     # Log event
     await log_event(
@@ -5792,9 +5793,6 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     daemon explicitly says bytes were gated/suppressed or the process failed.
     """
     verification = str(send_result.get("verification_status") or "").lower()
-    if send_result.get("queued") or send_result.get("deferred"):
-        reason = send_result.get("reason") or send_result.get("gate_reason") or "dispatch_deferred"
-        return PANE_WRITE_PENDING, str(reason)
     if verification == "gated" or send_result.get("gated"):
         return PANE_WRITE_PENDING, f"send_gated:{send_result.get('gate_reason') or 'gated'}"
     if send_result.get("returncode") != 0:
@@ -5809,24 +5807,6 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
         PANE_WRITE_SENT,
         None,
     )
-
-
-def _pane_delivery_is_pending(send_result: dict) -> bool:
-    return str(send_result.get("status") or "").lower() == PANE_WRITE_PENDING or bool(
-        send_result.get("queued") or send_result.get("deferred")
-    )
-
-
-def _pane_delivery_is_accepted_for_await(send_result: dict) -> bool:
-    """True when talk should keep an await open for this send receipt.
-
-    A queued/deferred send has not delivered bytes yet, but it has a durable
-    delivery handle/correlation id.  Treat that as success-pending for talk's
-    caller-visible contract instead of cancelling the pair and forcing a blind
-    retry.
-    """
-
-    return send_result.get("status") == PANE_WRITE_SENT or _pane_delivery_is_pending(send_result)
 
 
 def _pane_input_line_has_text(line: str) -> bool:
@@ -12763,14 +12743,6 @@ async def resolve_instance(
 
     Returns instance + session doc info in a single call.
     Resolution order: wrapper_id → CWD match (prefer processing over idle).
-
-    FAIL CLOSED on the CWD fallback: a singleton persona seat (Custodes,
-    Fabricator-General, Administratum, Pax — any ``personas.default_rank !=
-    'astartes'``) is NEVER returned by a working_dir match. Workers and singletons
-    routinely share a cwd (the vault, the main repo), so a cwd fallback that could
-    land on a singleton row is identity theft: a worker whose wrapper_id lookup
-    missed would resolve AS the singleton. Singletons resolve by wrapper_id only;
-    an unmatched worker 404s rather than adopt a singleton identity.
     """
     async with connect_agents_db(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -12809,10 +12781,6 @@ async def resolve_instance(
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
                    WHERE i.working_dir = ? AND i.status = 'working'
-                     AND COALESCE(
-                           (SELECT default_rank FROM personas WHERE id = i.persona_id),
-                           'astartes'
-                         ) = 'astartes'
                    ORDER BY i.last_activity DESC LIMIT 1""",
                 (cwd,),
             )
@@ -12830,10 +12798,6 @@ async def resolve_instance(
                        FROM instances i
                        LEFT JOIN personas p ON p.id = i.persona_id
                        WHERE i.working_dir = ? AND i.status = 'idle'
-                         AND COALESCE(
-                               (SELECT default_rank FROM personas WHERE id = i.persona_id),
-                               'astartes'
-                             ) = 'astartes'
                        ORDER BY i.last_activity DESC LIMIT 1""",
                     (cwd,),
                 )
@@ -13547,7 +13511,7 @@ async def talk_send(request: TalkSendRequest):
                 correlation_id=returned["talk_id"],
                 expected_role=target_raw,
             )
-            if not _pane_delivery_is_accepted_for_await(send_result):
+            if send_result.get("status") != PANE_WRITE_SENT:
                 raise RuntimeError(
                     send_result.get("reason")
                     or send_result.get("error")
@@ -13598,7 +13562,7 @@ async def talk_send(request: TalkSendRequest):
                 correlation_id=record["talk_id"],
                 expected_role=target_raw,
             )
-            if not _pane_delivery_is_accepted_for_await(send_result):
+            if send_result.get("status") != PANE_WRITE_SENT:
                 raise RuntimeError(
                     send_result.get("reason")
                     or send_result.get("error")
@@ -13613,7 +13577,7 @@ async def talk_send(request: TalkSendRequest):
                 correlation_id=record["talk_id"],
                 expected_role=target_raw,
             )
-            if not _pane_delivery_is_accepted_for_await(send_result):
+            if send_result.get("status") != PANE_WRITE_SENT:
                 raise RuntimeError(
                     send_result.get("reason")
                     or send_result.get("error")
@@ -13732,7 +13696,6 @@ async def brief_send(request: BriefSendRequest):
                     request.payload,
                     engine,
                     instance_id=(instance or {}).get("id") or pane_id,
-                    expected_role=expected_role,
                     queue_sender=enqueue_pane_write,
                     queue_drainer=process_pane_write_queue_once,
                 )
@@ -19468,43 +19431,6 @@ async def _cd_flip_pr_merged(pr_url: str) -> int:
     return len(ids)
 
 
-async def _cd_claim_pr_merged_delivery(pr_url: str | None, sha: str | None) -> tuple[bool, str]:
-    """Durably claim pr_merged delivery before Administratum injection.
-
-    The CD webhook can be re-entered for one merge (concurrent restart/manual
-    verification). File-append dedupe is too late: delivery/injection has already
-    fired. This table is keyed on stable event identity and INSERTed before any
-    non-critical event delivery so duplicates skip injection across process
-    restarts.
-    """
-    pr_key = (pr_url or "").strip()
-    sha_key = (sha or "").strip()
-    key = f"pr_merged|{pr_key}|{sha_key}"
-    async with connect_agents_db(DB_PATH) as db:
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS cd_event_dedupe ("
-            "dedupe_key TEXT PRIMARY KEY, "
-            "event_type TEXT NOT NULL, "
-            "pr_url TEXT, "
-            "sha TEXT, "
-            "claimed_at TEXT NOT NULL DEFAULT (datetime('now'))"
-            ")"
-        )
-        try:
-            await db.execute(
-                "INSERT INTO cd_event_dedupe (dedupe_key, event_type, pr_url, sha) VALUES (?, ?, ?, ?)",
-                (key, "pr_merged", pr_key or None, sha_key or None),
-            )
-            await db.commit()
-            return True, key
-        except Exception as e:
-            if "UNIQUE" in str(e).upper() or "constraint" in str(e).lower():
-                await db.rollback()
-                return False, key
-            await db.rollback()
-            raise
-
-
 @app.post("/api/cd/restart")
 async def cd_restart(request: Request):
     """CD restart-on-merge webhook. Secret-validated, ack-first, restart-detached.
@@ -19551,11 +19477,22 @@ async def cd_restart(request: Request):
             merged_flips = await _cd_flip_pr_merged(pr_url)
         except Exception as e:
             logger.warning("CD: pr_state→merged flip failed for %s: %s", pr_url, e)
-    # Spawn/schedule token-restart BEFORE non-critical Administratum/state-event
-    # delivery. Administratum logging/frontmatter failures must never block deploy.
     administratum_delivery = None
-    administratum_dedupe_key = None
-    administratum_delivery_claimed = False
+    if sha or pr_url:
+        administratum_delivery = await handle_custodes_state_event(
+            "pr_merged",
+            "cd_restart",
+            instance_id=None,
+            severity=1,
+            payload={
+                "sha": sha,
+                "pr_url": pr_url,
+                "services": services,
+                "pr_merged_flips": merged_flips,
+            },
+            event_class="state",
+            quiet_hours_exempt=True,
+        )
 
     # Spawn ONE detached, git-aware token-restart AFTER acking (the child sleeps so
     # this 200 fully flushes before launchd may kick us). `token-restart --sync`
@@ -19594,50 +19531,12 @@ async def cd_restart(request: Request):
         restart = "scheduled (detached, ~2s)"
         logger.info("CD: token-restart scheduled (sha=%s, services=%s)", sha, services)
 
-    if sha or pr_url:
-        try:
-            (
-                administratum_delivery_claimed,
-                administratum_dedupe_key,
-            ) = await _cd_claim_pr_merged_delivery(
-                pr_url if isinstance(pr_url, str) else None,
-                sha if isinstance(sha, str) else None,
-            )
-            if administratum_delivery_claimed:
-                administratum_delivery = await handle_custodes_state_event(
-                    "pr_merged",
-                    "cd_restart",
-                    instance_id=None,
-                    severity=1,
-                    payload={
-                        "sha": sha,
-                        "pr_url": pr_url,
-                        "services": services,
-                        "pr_merged_flips": merged_flips,
-                        "dedupe_key": administratum_dedupe_key,
-                    },
-                    event_class="state",
-                    quiet_hours_exempt=True,
-                )
-            else:
-                administratum_delivery = {"deduped": True, "dedupe_key": administratum_dedupe_key}
-                logger.info(
-                    "CD: pr_merged delivery deduped before injection (%s)", administratum_dedupe_key
-                )
-        except Exception as e:
-            administratum_delivery = {"degraded": True, "error": str(e)}
-            logger.warning(
-                "CD: Administratum pr_merged delivery failed after restart scheduling: %s", e
-            )
-
     return {
         "ok": True,
         "sha": sha,
         "restart": restart,
         "pr_merged_flips": merged_flips,
         "administratum_delivery": administratum_delivery,
-        "administratum_delivery_claimed": administratum_delivery_claimed,
-        "administratum_dedupe_key": administratum_dedupe_key,
     }
 
 
@@ -21157,14 +21056,7 @@ async def _ops_read_instances(now: datetime) -> dict:
                 "age_seconds": age_seconds,
                 "age_minutes": None if age_seconds is None else age_seconds // 60,
                 "is_subagent": bool(inst.get("is_subagent") or 0),
-                # Chapter children ('chapter') legitimately share a persona; the DB
-                # singleton trigger exempts them, so UI breach-marking must too.
-                "commander_type": inst.get("commander_type"),
                 "work_class": work_class,
-                # Fleet-queue domain (cwd oracle, see classify_domain) — picks the
-                # cockpit's LEFT (token-os) vs RIGHT (askcivic) worker system. The
-                # browser receives this enum, never a raw path decision.
-                "domain": classify_domain(inst.get("working_dir")),
                 "golden_throne": inst.get("golden_throne"),
                 # "Agent has PR open" flag (Phase 1) — /ui/ops renders a badge linking
                 # pr_url when pr_state == 'open'. Flipped to 'merged' by CD (Phase 2).
@@ -22300,180 +22192,6 @@ async def _ops_read_tmuxctld_health() -> dict:
     }
 
 
-def _ops_tmuxctld_error_occupancy(generated_at: datetime, message: str) -> dict:
-    return {
-        "status": "bad",
-        "generated_at": generated_at.isoformat(),
-        "total": 0,
-        "occupied": 0,
-        "free": 0,
-        "dead": 0,
-        "protected": 0,
-        "drift": 0,
-        "unknown": 0,
-        "errors": [message],
-        "cells": [],
-    }
-
-
-def _ops_public_pane_ref(row: dict) -> str:
-    for key in ("pane_positional_id", "pane_role", "role"):
-        value = row.get(key)
-        if value is None:
-            continue
-        text = str(value)
-        if text and ":" in text:
-            return text
-    return ""
-
-
-def _ops_tmux_cell_state(row: dict, free_ids: set[str]) -> str:
-    pane_ref = _ops_public_pane_ref(row)
-    raw_state = str(row.get("state") or row.get("status") or "").lower()
-    if raw_state in {"dead", "protected", "drift", "unknown", "free", "occupied"}:
-        return raw_state
-    if row.get("dead") or row.get("pane_dead"):
-        return "dead"
-    if row.get("protected") or row.get("is_protected"):
-        return "protected"
-    if row.get("drift") or row.get("projection_drift"):
-        return "drift"
-    if row.get("instance_id") or row.get("persona") or row.get("wrapper_id"):
-        return "occupied"
-    if pane_ref and pane_ref in free_ids:
-        return "free"
-    return "unknown" if pane_ref else "drift"
-
-
-def _ops_normalize_tmux_payload(
-    payload: dict | list | Exception, surface: str, errors: list[str]
-) -> dict | list:
-    if isinstance(payload, Exception):
-        errors.append(f"tmuxctld {surface} unavailable: {payload}")
-        return []
-    if not isinstance(payload, dict):
-        return payload
-    result = payload.get("result", payload)
-    if surface == "ledger" and isinstance(result, dict) and isinstance(result.get("rows"), list):
-        return result["rows"]
-    return result
-
-
-def _ops_tmux_ledger_row_is_current(row: dict) -> bool:
-    raw_state = str(row.get("state") or row.get("status") or "").upper()
-    return raw_state not in {"CLOSED", "EXITED", "DEAD"}
-
-
-def _ops_build_tmux_occupancy(
-    generated_at: datetime,
-    health: dict,
-    ledger_payload: dict | list | Exception,
-    freelist_payload: dict | list | Exception,
-) -> dict:
-    errors: list[str] = []
-    ledger_rows = _ops_normalize_tmux_payload(ledger_payload, "ledger", errors)
-    freelist = _ops_normalize_tmux_payload(freelist_payload, "freelist", errors)
-    if not isinstance(ledger_rows, list):
-        errors.append("tmuxctld ledger rows malformed")
-        ledger_rows = []
-    if not isinstance(freelist, list):
-        errors.append("tmuxctld freelist malformed")
-        freelist = []
-    free_ids = {
-        _ops_public_pane_ref(item)
-        for item in freelist
-        if isinstance(item, dict) and _ops_public_pane_ref(item)
-    }
-    cells: list[dict] = []
-    seen: set[str] = set()
-    for row in ledger_rows:
-        if not isinstance(row, dict):
-            errors.append("tmuxctld ledger row malformed")
-            continue
-        if not _ops_tmux_ledger_row_is_current(row):
-            continue
-        pane_positional_id = _ops_public_pane_ref(row)
-        state = _ops_tmux_cell_state(row, free_ids)
-        if pane_positional_id:
-            seen.add(pane_positional_id)
-        cells.append(
-            {
-                "pane_positional_id": pane_positional_id or None,
-                "instance_id": row.get("instance_id"),
-                "persona": row.get("persona") or row.get("persona_slug"),
-                "engine": row.get("engine"),
-                "working_dir": row.get("working_dir") or row.get("cwd"),
-                "wrapper_id": row.get("wrapper_id"),
-                "state": state,
-                "source": "tmuxctld:ledger",
-            }
-        )
-    for item in freelist:
-        if not isinstance(item, dict):
-            continue
-        pane_positional_id = _ops_public_pane_ref(item)
-        if pane_positional_id and pane_positional_id not in seen:
-            cells.append(
-                {
-                    "pane_positional_id": pane_positional_id,
-                    "instance_id": None,
-                    "persona": None,
-                    "engine": None,
-                    "working_dir": None,
-                    "wrapper_id": None,
-                    "state": "free",
-                    "source": "tmuxctld:freelist",
-                }
-            )
-            seen.add(pane_positional_id)
-    counts = {
-        key: sum(1 for c in cells if c.get("state") == key)
-        for key in ["occupied", "free", "dead", "protected", "drift", "unknown"]
-    }
-    status = (
-        "bad"
-        if not health.get("reachable")
-        else "warn"
-        if errors or counts["dead"] or counts["drift"] or counts["unknown"]
-        else "ok"
-    )
-    return {
-        "status": status,
-        "generated_at": generated_at.isoformat(),
-        "total": len(cells),
-        **counts,
-        "errors": errors,
-        "cells": cells,
-    }
-
-
-async def _ops_read_tmuxctld_snapshot(generated_at: datetime) -> dict:
-    health = await _ops_read_tmuxctld_health()
-    if not health.get("reachable"):
-        health["occupancy"] = _ops_tmuxctld_error_occupancy(
-            generated_at, health.get("error") or "tmuxctld unreachable"
-        )
-        return health
-    try:
-        base = shared._tmuxctld_url(default_loopback=True)
-
-        def read_json(path: str):
-            with shared._TMUXCTLD_OPENER.open(f"{base}{path}", timeout=3.0) as resp:
-                return json.loads(resp.read().decode(errors="ignore") or "{}")
-
-        ledger_payload, freelist_payload = await asyncio.gather(
-            asyncio.to_thread(read_json, "/ledger/rows"),
-            asyncio.to_thread(read_json, "/freelist"),
-            return_exceptions=True,
-        )
-        health["occupancy"] = _ops_build_tmux_occupancy(
-            generated_at, health, ledger_payload, freelist_payload
-        )
-    except Exception as exc:
-        health["occupancy"] = _ops_tmuxctld_error_occupancy(generated_at, str(exc))
-    return health
-
-
 async def _ops_collect_facts(now: datetime) -> dict:
     """Collect the shared facts backing both ops cockpit state and ops status."""
     sources: dict[str, dict] = {
@@ -22563,22 +22281,7 @@ async def _ops_collect_facts(now: datetime) -> dict:
         record_error("agents_db", exc)
         work_actions = _ops_empty_work_actions()
 
-    # Muster Ledger feed for the kanban board (#671 contract: the board consumes
-    # useOpsState — the feed is embedded here, never a second board-side poller).
-    # Capped at 4/lane: the board is a today-only glance surface, not an index.
-    try:
-        session_docs = await _ops_session_docs_feed(limit_per_lane=4)
-    except Exception as exc:
-        logger.warning("Ops fact collection failed reading session docs: %s", exc)
-        session_docs = {
-            "generated_at": now.isoformat(),
-            "lane_totals": {},
-            "limit_per_lane": 4,
-            "docs": [],
-            "error": str(exc),
-        }
-
-    tmux_health = await _ops_read_tmuxctld_snapshot(now)
+    tmux_health = await _ops_read_tmuxctld_health()
 
     if "agents_db" in source_errors:
         sources["agents_db"] = _ops_source_health(
@@ -22610,25 +22313,13 @@ async def _ops_collect_facts(now: datetime) -> dict:
             details={"mode": timer_engine.current_mode.value},
         )
 
-    tmux_occupancy_status = (tmux_health.get("occupancy") or {}).get("status")
     sources["tmuxctld"] = _ops_source_health(
-        "bad"
-        if not tmux_health.get("reachable") or tmux_occupancy_status == "bad"
-        else "warn"
-        if tmux_occupancy_status == "warn"
-        else "ok",
+        "ok" if tmux_health.get("reachable") else "warn",
         available=bool(tmux_health.get("reachable")),
-        message="tmuxctld occupancy degraded"
-        if tmux_health.get("reachable") and tmux_occupancy_status in {"warn", "bad"}
-        else "tmuxctld health available"
+        message="tmuxctld health available"
         if tmux_health.get("reachable")
         else "tmuxctld health unavailable",
-        details={
-            "error": tmux_health.get("error"),
-            "tmux_reachable": tmux_health.get("tmux_reachable"),
-            "occupancy_status": tmux_occupancy_status,
-            "occupancy_errors": (tmux_health.get("occupancy") or {}).get("errors", []),
-        },
+        details=tmux_health,
     )
 
     sources["cron"] = _ops_source_health(
@@ -22746,7 +22437,6 @@ async def _ops_collect_facts(now: datetime) -> dict:
         "enforcement": enforcement_summary,
         "tts": tts_summary,
         "work_actions": work_actions,
-        "session_docs": session_docs,
         "assertions": assertions,
         "timer": timer_snapshot,
         "attention": attention_snapshot,
@@ -22847,7 +22537,6 @@ def _ops_build_ui_state(facts: dict) -> dict:
         "enforcement": facts["enforcement"],
         "tmux": facts["tmux"],
         "work_actions": facts["work_actions"],
-        "session_docs": facts["session_docs"],
     }
 
 
@@ -22901,8 +22590,7 @@ def _ops_build_status(facts: dict) -> dict:
             "version": tmux_health.get("version"),
             "sha": tmux_health.get("sha"),
             "live_instance_panes": None,
-            "projection_drift": (tmux_health.get("occupancy") or {}).get("drift"),
-            "occupancy": tmux_health.get("occupancy"),
+            "projection_drift": None,
         },
         "tts": {
             "current": current_tts_label,
@@ -23344,16 +23032,17 @@ def _ops_session_doc_head(body: str, limit: int = 160) -> str | None:
     return None
 
 
-async def _ops_session_docs_feed(
+@app.get("/api/ui/ops/session-docs")
+async def get_ops_session_docs(
     include_archived: bool = False,
     limit_per_lane: int = 12,
-) -> dict:
-    """Build the read-only pipeline-board feed for the ops cockpit.
+):
+    """Read-only pipeline-board feed for the ops cockpit.
 
     Groups DB-registered session docs into status lanes, each doc carrying a
     one-line *head excerpt* and an `obsidian://` deep-link. The cockpit never
     renders more than the head — the document is authored and read in Obsidian
-    (the single writer of `status:`). This builder performs no mutations.
+    (the single writer of `status:`). This endpoint performs no mutations.
 
     `archived` docs are excluded by default (there are hundreds). Each lane is
     capped at `limit_per_lane` most-recently-*created* docs; `lane_totals`
@@ -23361,9 +23050,6 @@ async def _ops_session_docs_feed(
     rather than silently truncating. Ordering is by `created_at` because
     `updated_at` is unreliable (bulk-touched), and age-since-creation honestly
     surfaces docs that have been open a long time.
-
-    Shared by GET /api/ui/ops/session-docs and the OpsState embed (the kanban
-    board consumes useOpsState per the #671 contract — one poller, one feed).
     """
     from urllib.parse import quote
 
@@ -23434,46 +23120,6 @@ async def _ops_session_docs_feed(
             note = note_rel[:-3] if note_rel.endswith(".md") else note_rel
             obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
 
-        # Rubric summary for the kanban card. evaluate_rubric is pure and the
-        # frontmatter is already in hand (read post-cap), so this adds zero I/O.
-        # `present` is the load-bearing flag: a missing rubric evaluates as
-        # complete:true so legacy docs never trip GT, and the cockpit must key
-        # every rubric treatment on `present` — never `complete` alone.
-        # Frontmatter is untrusted operator-authored YAML; any surprise shape
-        # degrades to the present:false fallback rather than failing the feed.
-        try:
-            rubric_status = evaluate_rubric(fm)
-            rubric_total = len(rubric_status.rubric)
-            rubric_summary = {
-                "present": rubric_status.present,
-                "complete": rubric_status.complete,
-                "met": rubric_total - len(rubric_status.missing) - len(rubric_status.skipped),
-                "total": rubric_total,
-                "skipped": len(rubric_status.skipped),
-                "first_unmet": rubric_status.missing[0] if rubric_status.missing else None,
-                "notified_at": rubric_status.notified_at,
-                "acknowledged_at": rubric_status.acknowledged_at,
-            }
-        except Exception:
-            rubric_summary = {
-                "present": False,
-                "complete": False,
-                "met": 0,
-                "total": 0,
-                "skipped": 0,
-                "first_unmet": None,
-                "notified_at": None,
-                "acknowledged_at": None,
-            }
-
-        persona_slug = fm.get("persona_slug") or fm.get("persona") or fm.get("legion")
-        profile = PROFILE_BY_SLUG.get(persona_slug or "")
-        persona_summary = {
-            "slug": persona_slug,
-            "chip_color": (profile or {}).get("chip_color"),
-            "display_name": (profile or {}).get("display_name"),
-        }
-
         created = d.get("created_at")
         session_date, session_date_source = _ops_session_doc_date_basis(fm, created)
         age_seconds = None
@@ -23496,10 +23142,8 @@ async def _ops_session_docs_feed(
                 "status": status,
                 "project": d.get("project") or fm.get("project"),
                 "primarch": d.get("primarch_name") or fm.get("primarch"),
-                "persona_slug": persona_slug,
-                "persona": persona_summary,
+                "persona_slug": fm.get("persona_slug") or fm.get("persona") or fm.get("legion"),
                 "golden_throne": fm.get("golden_throne") or fm.get("instance_type"),
-                "rubric": rubric_summary,
                 "head": head,
                 "created_at": created,
                 "session_date": session_date,
@@ -23515,17 +23159,6 @@ async def _ops_session_docs_feed(
         "limit_per_lane": max(1, limit_per_lane),
         "docs": docs,
     }
-
-
-@app.get("/api/ui/ops/session-docs")
-async def get_ops_session_docs(
-    include_archived: bool = False,
-    limit_per_lane: int = 12,
-) -> dict:
-    """Read-only pipeline-board feed — see _ops_session_docs_feed."""
-    return await _ops_session_docs_feed(
-        include_archived=include_archived, limit_per_lane=limit_per_lane
-    )
 
 
 # [MOVED to shared.py / routes/tts.py] — was: # ============ TTS/Notification System ===========

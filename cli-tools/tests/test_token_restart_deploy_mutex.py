@@ -159,9 +159,10 @@ def test_trailing_resync_restarts_when_process_stale(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     assert "trailing re-sync 1/3" in proc.stdout
     assert RESTART_TOKENAPI in logfile.read_text(), "stale live process must bounce"
-    # Trailing runs re-exec current token-restart before adopting; if the primary
-    # restart already repaired /health, the adopted trailing run may legitimately
-    # converge to a no-op instead of re-reporting stale state.
+    assert "live token-api serving" in proc.stdout, "must report the stale state"
+    assert "nothing further to redeploy" not in proc.stdout, (
+        "must NOT claim convergence while the process is stale"
+    )
     assert not lockdir.exists()
 
 

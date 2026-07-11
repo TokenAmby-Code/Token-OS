@@ -475,12 +475,3 @@ def test_dispatch_worktree_refuses_github_com_substring_origin(
     res = _run_token_os_worktree(token_os_worktree_env, "--worktree", "remote-guard", "do it")
     assert res.returncode == 64
     assert "TokenAmby-Code/Token-OS" in res.stderr
-
-
-def test_prealloc_new_target_resolves_before_worktree_provisioning() -> None:
-    text = DISPATCH.read_text(encoding="utf-8")
-    call = text.index("maybe_resolve_prealloc_new_target")
-    call = text.index("maybe_resolve_prealloc_new_target", call + 1)
-    worktree_call = text.index("maybe_enter_worktree", call)
-    final_command = text.index('FINAL_COMMAND="$(LC_ALL=C; build_agent_command)"')
-    assert call < worktree_call < final_command

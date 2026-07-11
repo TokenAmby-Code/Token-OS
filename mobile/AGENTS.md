@@ -8,11 +8,9 @@ Tools and configuration for phone automation via Termux and MacroDroid.
 Use event-driven patterns: MacroDroid notification triggers, HTTP webhooks, LaunchAgent intervals.
 If polling is truly unavoidable, staple it to the existing single poll macro in MacroDroid.
 
-## Shizuku (ARCHIVED 2026-03-10; reconfirmed unviable 2026-07-05)
+## Shizuku (ARCHIVED 2026-03-10)
 
 Shizuku is no longer used. v2+ enforcement uses stock Android + MacroDroid (no root/ADB). Archive at `macros/archive/pre-v2-shizuku-era-2026-03-10.mdr`. CLI tools (`shizuku-connect`) still exist but are inactive.
-
-July 2026 recheck: MacroDroid can trigger on `ShizukuStoppedTrigger` and attempt a bootstrap, but Wireless debugging appears to behave as a Shizuku runtime dependency in this stack. Android disables Wireless debugging shortly after start, Shizuku dies, and the macro loops. Do not add Shizuku/root/ADB back to active automation unless `mobile/SHIZUKU-PLAN.md` reopen criteria are met and this AGENTS file is updated.
 
 ## Overview
 

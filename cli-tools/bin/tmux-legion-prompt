@@ -90,7 +90,6 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="${TOKEN_OS:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
-source "${SCRIPT_DIR}/../lib/tmuxctld-timeouts.sh" 2>/dev/null || true
 TMUXCTLD_LIB="${TMUXCTLD_LIB:-${REPO_ROOT}/tmuxctld/lib}"
 CLI_LIB="${REPO_ROOT}/cli-tools/lib"
 
@@ -112,7 +111,7 @@ if $DRY_RUN; then
 fi
 
 PANE_RESPONSE="$(
-    TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-$(tmuxctld_send_client_timeout)}" "${SCRIPT_DIR}/tmuxctld-ping" \
+    TMUXCTLD_PING_PRINT_RESPONSE=1 TMUXCTLD_MAX_TIME="${TMUXCTLD_MAX_TIME:-60}" "${SCRIPT_DIR}/tmuxctld-ping" \
         POST /stack/dispatch \
         base=mechanicus \
         session="$SESSION" \

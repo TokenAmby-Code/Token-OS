@@ -13,7 +13,7 @@ Endpoints:
     POST /tts/skip         — skip current TTS speech
     POST /tts/synthesize   — synthesize text to WAV file (blocking)
     POST /tts/control      — transport controls: pause/resume/stop (non-blocking)
-    POST /tts/synth-and-play — synthesize to WAV + play WAV artifact (blocking, for queued TTS)
+    POST /tts/synth-and-play — synthesize to WAV + speak via SAPI (blocking, for queued TTS)
     GET  /tts/status       — current TTS engine state
     POST /ahk/execute      — execute a one-shot AHK v2 script
     POST /restart          — restart current service
@@ -224,9 +224,6 @@ class TTSEngine:
         self._current_message: str | None = None
         self._current_voice: str | None = None
         self._current_rate: int = 0
-        self._playback_process: subprocess.Popen | None = None
-        self._playback_windows_pid: int | None = None
-        self._playback_lock = threading.Lock()
 
     def _write_script(self):
         """Write the PS script to a Windows-accessible path."""
@@ -300,53 +297,13 @@ class TTSEngine:
     def is_speaking(self):
         return self._speaking
 
-    def try_reserve_playback(self) -> bool:
-        """Atomically claim the playback slot ahead of download/verify work.
-
-        _play_wav_file() only flips _playing after Popen(), so callers that do
-        slow preparation first must reserve here or two requests can both pass
-        the busy check and launch parallel playback processes.
-        """
-        with self._playback_lock:
-            if self._playing or self._speaking:
-                return False
-            self._playing = True
-            return True
-
-    def release_playback_reservation(self) -> None:
-        """Release a reservation that never reached playback startup."""
-        with self._playback_lock:
-            if self._playback_process is None:
-                self._playing = False
-
     def skip(self) -> bool:
-        """Cancel current speech (direct SAPI or WAV artifact playback)."""
-        with self._playback_lock:
-            playback_active = self._playing
-            playback_proc = self._playback_process
-        if playback_active and playback_proc is not None:
-            self._was_skipped = True
-            self._terminate_wav_playback()
-            return True
-        if playback_active:
-            # Startup/shutdown edge: avoid silently dropping a stop while the
-            # playback process handle is being published or cleared.
-            for _ in range(10):
-                time.sleep(0.01)
-                with self._playback_lock:
-                    playback_proc = self._playback_process
-                    playback_active = self._playing
-                if playback_proc is not None:
-                    self._was_skipped = True
-                    self._terminate_wav_playback()
-                    return True
-                if not playback_active:
-                    break
-        if not self._speaking or self._process is None:
+        """Cancel current speech (direct or managed playback). Returns True if was active."""
+        if not (self._speaking or self._playing) or self._process is None:
             return False
         with self._io_lock:
             self._send({"action": "skip"})
-            self._readline()
+            resp = self._readline()
         self._was_skipped = True
         return True
 
@@ -366,9 +323,6 @@ class TTSEngine:
 
     TTS_DIR_WSL = "/mnt/c/temp/tts"
     TTS_DIR_WIN = r"C:\temp\tts"
-    PLAY_SCRIPT_DIR_WSL = "/mnt/c/temp"
-    PLAY_SCRIPT_DIR_WIN = r"C:\temp"
-    MAX_PLAYBACK_SECONDS = 3600
 
     @staticmethod
     def _text_hash(message: str) -> str:
@@ -551,156 +505,41 @@ class TTSEngine:
             "rendered_hash": ack["rendered_hash"],
         }
 
-    def _wav_player_script(self, wav_path_win: str) -> str:
-        # powershell -File exits 0 even when a statement throws, so an invalid
-        # WAV "played successfully" unless the script converts errors to exit 1.
-        escaped = wav_path_win.replace("'", "''")
-        return (
-            "$ErrorActionPreference = 'Stop'\n"
-            "try { Add-Type -AssemblyName System.Windows.Extensions } catch { }\n"
-            "try {\n"
-            "  Add-Type -AssemblyName System\n"
-            f"  $player = New-Object System.Media.SoundPlayer '{escaped}'\n"
-            "  $player.Load()\n"
-            "  $player.PlaySync()\n"
-            "  $player.Dispose()\n"
-            "} catch {\n"
-            "  [Console]::Error.WriteLine($_.Exception.Message)\n"
-            "  exit 1\n"
-            "}\n"
-        )
-
-    def _terminate_wav_playback(self) -> None:
-        with self._playback_lock:
-            proc = self._playback_process
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-    def _play_wav_file(self, synth_result: dict) -> dict:
-        """Play a synthesized WAV artifact with SoundPlayer.PlaySync()."""
-        wav_path_win = synth_result["wav_path_win"]
-        wav_path_wsl = Path(synth_result["wav_path_wsl"])
-        if not wav_path_wsl.exists():
-            self.release_playback_reservation()
-            return {"success": False, "error": f"WAV file missing: {wav_path_wsl}"}
-
-        play_script_dir_wsl = Path(self.PLAY_SCRIPT_DIR_WSL)
-        play_script_dir_wsl.mkdir(parents=True, exist_ok=True)
-        fd, script_path_raw = tempfile.mkstemp(
-            prefix="token_tts_play_", suffix=".ps1", dir=str(play_script_dir_wsl)
-        )
-        os.close(fd)
-        script_path_wsl = Path(script_path_raw)
-        script_path_win = self.PLAY_SCRIPT_DIR_WIN + "\\" + script_path_wsl.name
-        script_path_wsl.write_text(self._wav_player_script(wav_path_win), encoding="utf-8")
-
-        self._was_skipped = False
-        self._current_file = str(wav_path_wsl)
-        try:
-            try:
-                proc = subprocess.Popen(
-                    [
-                        POWERSHELL_EXE,
-                        "-NoProfile",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        script_path_win,
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-            except OSError as e:
-                return {"success": False, "error": f"Failed to start WAV playback: {e}"}
-            with self._playback_lock:
-                self._playing = True
-                self._playback_process = proc
-                self._playback_windows_pid = proc.pid
-            try:
-                stdout, stderr = proc.communicate(timeout=self.MAX_PLAYBACK_SECONDS)
-            except subprocess.TimeoutExpired:
-                self._was_skipped = True
-                proc.kill()
-                try:
-                    stdout, stderr = proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    stdout, stderr = "", ""
-                return {"success": False, "error": "WAV playback timed out"}
-            skipped = self._was_skipped or proc.returncode < 0
-            if proc.returncode not in (0, None) and not skipped:
-                return {
-                    "success": False,
-                    "error": stderr.strip() or f"WAV playback exited {proc.returncode}",
-                }
-            return {
-                "success": not skipped,
-                "skipped": skipped,
-                "transport": "wsl_sapi_wav_file",
-                "file_id": synth_result.get("file_id"),
-                "wav_path_win": wav_path_win,
-                "wav_path_wsl": str(wav_path_wsl),
-                "playback_pid": self._playback_windows_pid,
-                "rendered_chars": synth_result.get("rendered_chars"),
-                "rendered_hash": synth_result.get("rendered_hash"),
-                "message_chars": synth_result.get("message_chars"),
-            }
-        finally:
-            with self._playback_lock:
-                self._playing = False
-                self._playback_process = None
-                self._playback_windows_pid = None
-            self._play_paused = False
-            self._current_file = None
-            try:
-                script_path_wsl.unlink()
-            except OSError:
-                pass
-
     def synth_and_speak(self, message: str, voice: str, rate: int = 0) -> dict:
-        """Synthesize the full utterance to WAV, then play that WAV artifact."""
+        """Synthesize text to WAV (for replay/persistence) then speak it via SAPI.
+
+        Blocks until speech completes or is skipped. Supports pause/resume mid-speech.
+        """
         synth_result = self.synthesize(message, voice, rate)
         if not synth_result.get("success"):
             return synth_result
 
+        self._playing = True
+        self._current_file = synth_result.get("wav_path_wsl")
         self._current_message = message
         self._current_voice = voice
         self._current_rate = rate
-        try:
-            return self._play_wav_file(synth_result)
-        finally:
-            self._current_message = None
-            self._current_voice = None
-            self._current_rate = 0
+        speak_result = self.speak(message, voice, rate)
+        self._playing = False
+        self._play_paused = False
+        self._current_file = None
+        self._current_message = None
+        self._current_voice = None
+        self._current_rate = 0
+
+        return {
+            **speak_result,
+            "file_id": synth_result.get("file_id"),
+            "wav_path_win": synth_result.get("wav_path_win"),
+        }
 
     def play_control(self, command: str) -> dict:
-        """Transport controls for direct SAPI; WAV playback only supports stop."""
-        if self._playing and not self._speaking:
-            if command == "stop":
-                stopped = self.skip()
-                return {"success": stopped, "command": command, "skipped": stopped}
-            if command in {"pause", "resume", "toggle", "restart"}:
-                return {
-                    "success": False,
-                    "error": "unsupported_backend_control",
-                    "reason": "wsl_wav_playback_pause_resume_unsupported",
-                    "command": command,
-                    "transport": "wsl_sapi_wav_file",
-                }
-
-        # Resolve toggle to pause or resume for direct SAPI speech
+        """Send transport control (pause/resume/stop/toggle/restart) to SAPI. Non-blocking."""
+        # Resolve toggle to pause or resume
         if command == "toggle":
             if self._play_paused:
                 command = "resume"
-            elif self._speaking:
+            elif self._speaking or self._playing:
                 command = "pause"
             else:
                 return {"success": False, "error": "Not speaking or playing"}
@@ -729,7 +568,7 @@ class TTSEngine:
                 return {"success": False, "error": f"Restart speak failed: {resp}"}
             return {"success": True, "command": "restart"}
 
-        if not self._speaking and command != "stop":
+        if not (self._speaking or self._playing) and command != "stop":
             return {"success": False, "error": "Not speaking or playing"}
         self._ensure_running()
 
@@ -2170,13 +2009,6 @@ class TTSSynthAndPlayRequest(BaseModel):
     rate: int = 0
 
 
-class AudioPlayRequest(BaseModel):
-    artifact_url: str
-    artifact_id: str | None = None
-    sha256: str | None = None
-    format: str = "wav"
-
-
 class TTSChunkRequest(BaseModel):
     session_id: str | None = None
     playback_id: str
@@ -2192,71 +2024,6 @@ class TTSChunkRequest(BaseModel):
     message: str | None = None
     voice: str = "Microsoft David"
     rate: int = 0
-
-
-_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-
-
-@app.post("/audio/play")
-def audio_play(request: AudioPlayRequest):
-    """Download and play a server-rendered WAV artifact. No local synthesis."""
-    if request.format != "wav":
-        raise HTTPException(status_code=400, detail="only wav artifacts are supported")
-    if request.artifact_id and not _ARTIFACT_ID_RE.match(request.artifact_id):
-        raise HTTPException(status_code=400, detail="invalid artifact_id")
-    if not tts_engine.try_reserve_playback():
-        raise HTTPException(status_code=409, detail="TTS engine is busy")
-
-    cache_dir = Path(
-        os.environ.get(
-            "TOKEN_SATELLITE_AUDIO_CACHE", str(Path.home() / ".cache" / "token-satellite" / "audio")
-        )
-    )
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    file_id = (
-        request.artifact_id or hashlib.sha256(request.artifact_url.encode("utf-8")).hexdigest()[:32]
-    )
-    wav_path = cache_dir / f"{file_id}.wav"
-    handed_off = False
-    try:
-        if not wav_path.exists():
-            resp = http_requests.get(request.artifact_url, timeout=(5, 180))
-            if resp.status_code != 200:
-                return {"success": False, "error": f"artifact_download_http_{resp.status_code}"}
-            wav_path.write_bytes(resp.content)
-        data = wav_path.read_bytes()
-        actual_sha = hashlib.sha256(data).hexdigest()
-        if request.sha256 and actual_sha != request.sha256:
-            try:
-                wav_path.unlink()
-            except OSError:
-                pass
-            return {"success": False, "error": "artifact_hash_mismatch", "sha256": actual_sha}
-        win_path = subprocess.check_output(
-            ["wslpath", "-w", str(wav_path)], text=True, timeout=5
-        ).strip()
-        # _play_wav_file owns the reservation from here; its finally releases it.
-        handed_off = True
-        result = tts_engine._play_wav_file(
-            {
-                "file_id": file_id,
-                "wav_path_wsl": str(wav_path),
-                "wav_path_win": win_path,
-                "rendered_hash": request.sha256,
-                "rendered_chars": None,
-                "message_chars": None,
-            }
-        )
-        result["transport"] = "openai_tts_wav_artifact"
-        result["artifact_id"] = request.artifact_id
-        result["sha256"] = actual_sha
-        return result
-    except Exception as exc:
-        logger.warning(f"audio/play failed: {exc}")
-        return {"success": False, "error": str(exc)}
-    finally:
-        if not handed_off:
-            tts_engine.release_playback_reservation()
 
 
 @app.post("/tts/synthesize")
@@ -2300,8 +2067,6 @@ def tts_chunk(request: TTSChunkRequest):
         "current_index": request.current_index,
         "next_index": request.next_index,
         "file_id": result.get("file_id"),
-        "wav_path_win": result.get("wav_path_win"),
-        "playback_pid": result.get("playback_pid"),
         "transport": result.get("transport"),
         "message_chars": len(message),
         "rendered_chars": result.get("rendered_chars"),
@@ -2312,7 +2077,7 @@ def tts_chunk(request: TTSChunkRequest):
 
 @app.post("/tts/synth-and-play")
 def tts_synth_and_play(request: TTSSynthAndPlayRequest):
-    """Synthesize text to WAV, then play that WAV artifact. Blocks until done."""
+    """Synthesize text to WAV (for replay) then speak it via SAPI. Blocks until done."""
     if tts_engine.is_speaking or tts_engine._playing:
         raise HTTPException(status_code=409, detail="TTS engine is busy")
 
@@ -2326,8 +2091,6 @@ def tts_synth_and_play(request: TTSSynthAndPlayRequest):
         "method": method,
         "voice": request.voice,
         "file_id": result.get("file_id"),
-        "wav_path_win": result.get("wav_path_win"),
-        "playback_pid": result.get("playback_pid"),
         "transport": result.get("transport"),
         "message_chars": len(request.message),
         "rendered_chars": result.get("rendered_chars"),

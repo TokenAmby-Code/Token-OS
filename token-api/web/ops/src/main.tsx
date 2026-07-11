@@ -1,10 +1,5 @@
-import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { OpsCockpit } from './OpsCockpit';
-import './cockpit.css';
+import { App } from './App';
+import './styles.css';
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <OpsCockpit />
-  </StrictMode>,
-);
+createRoot(document.getElementById('root')!).render(<App />);

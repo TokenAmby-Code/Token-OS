@@ -156,22 +156,6 @@ def test_enqueue_writes_epoch_and_timestamp(tmp_path: Path) -> None:
     assert cmd == "/rename foo"
 
 
-def test_enqueue_clear_context_writes_guarded_clear_command(tmp_path: Path) -> None:
-    qdir = tmp_path / "q"
-    qdir.mkdir()
-    fakes = _mkfakes(tmp_path)
-    proc = _run(
-        ["enqueue", "--pane", "%42", "--session", SID, "--clear-context"],
-        qdir=qdir,
-        fakes=fakes,
-    )
-    assert proc.returncode == 0, proc.stderr
-    _ts, sid, pane, cmd = _qfile(qdir, "%42").read_text().strip().split(None, 3)
-    assert sid == SID
-    assert pane == "%42"
-    assert cmd == "/clear"
-
-
 # --------------------------------------------------------------------------- #
 # Defect 1 / acceptance 1+3: typing-guard HOLD — never inject while typing.    #
 # --------------------------------------------------------------------------- #

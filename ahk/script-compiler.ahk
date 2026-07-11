@@ -156,19 +156,15 @@ Media_Prev:: {  ; Restart current TTS message from beginning
 }
 
 ^!k:: {  ; Ctrl+Alt+K = ask the WSL watchdog to run Deskflow recovery
-    logPath := A_Temp "\\deskflow-recovery-hotkey.log"
-    FileAppend(Format("{1} deskflow hotkey start\n", A_Now), logPath)
     ToolTip("deskflow watchdog…")
     try {
         cmd := "wsl.exe -d Ubuntu -e bash -lc `"/home/token/runtimes/token-os/live/Shell/deskflow-recover reload`""
         exitCode := RunWait(cmd,, "Hide")
-        FileAppend(Format("{1} deskflow hotkey exit={2}\n", A_Now, exitCode), logPath)
         if (exitCode = 0)
             ToolTip("deskflow recovery requested")
         else
             ToolTip("deskflow recovery failed: exit " exitCode)
     } catch as err {
-        FileAppend(Format("{1} deskflow hotkey error={2}\n", A_Now, err.Message), logPath)
         ToolTip("deskflow failed: " err.Message)
     }
     SetTimer(() => ToolTip(), -1500)

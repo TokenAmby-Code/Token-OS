@@ -17,48 +17,22 @@ satellite_url="${SATELLITE_URL:-http://localhost:7777}"
 satellite_url="${satellite_url%/}"
 startup_timeout_seconds="${DESKFLOW_RECOVER_STARTUP_TIMEOUT_SECONDS:-90}"
 startup_deadline=$(( $(date +%s) + startup_timeout_seconds ))
-state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/imperium"
-log_path="${DESKFLOW_RECOVER_LOG:-$state_dir/deskflow-recover.log}"
-mkdir -p "$state_dir"
-
-log() {
-  printf '[%s] deskflow-recover action=%s satellite=%s %s\n' \
-    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$action" "$satellite_url" "$*" >>"$log_path"
-}
-
-log "start pid=$$"
 
 # The manual bind can be the first thing that starts WSL. In that case the
 # distro exists before token-satellite is listening, and a raw POST exits 7.
 # Wait for the local satellite health endpoint so Ctrl+Alt+K can bootstrap WSL
 # instead of failing during the systemd/user-service startup gap.
-health_attempts=0
 until curl -sf --connect-timeout 1 --max-time 2 "$satellite_url/health" >/dev/null; do
-  health_attempts=$((health_attempts + 1))
   if (( $(date +%s) >= startup_deadline )); then
-    log "health_timeout attempts=$health_attempts timeout_seconds=$startup_timeout_seconds"
     break
   fi
   sleep 1
 done
-log "health_wait_done attempts=$health_attempts"
 
 # /kvm/control reload is synchronous and may wait on Mac API/reconnect windows.
 # Keep the curl deadline longer than the watchdog recovery path so AHK does not
 # report failure while the endpoint is still recovering successfully.
-response_file="$(mktemp "${TMPDIR:-/tmp}/deskflow-recover.XXXXXX")"
-rc=0
-http_code="$({
-  curl -sS -f --connect-timeout 3 --max-time 60 \
-    -o "$response_file" -w '%{http_code}' \
-    -X POST "$satellite_url/kvm/control" \
-    -H "Content-Type: application/json" \
-    -d "{\"action\":\"$action\"}"
-} 2>>"$log_path")" || rc=$?
-response="$(tr '\n' ' ' <"$response_file" | cut -c1-500)"
-rm -f "$response_file"
-log "finish rc=$rc http_code=${http_code:-000} response=$response"
-if (( rc != 0 )); then
-  exit "$rc"
-fi
-printf '%s\n' "$response"
+curl -sf --connect-timeout 3 --max-time 60 -X POST "$satellite_url/kvm/control" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"$action\"}"
+printf '\n'

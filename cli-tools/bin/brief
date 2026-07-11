@@ -31,13 +31,8 @@ import json
 import os
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
-
-_LIB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "lib"))
-if _LIB_DIR not in sys.path:
-    sys.path.insert(0, _LIB_DIR)
-from tmuxctld_timeouts import SEND_CLIENT_TIMEOUT_SECONDS  # noqa: E402
+import urllib.parse
 
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 TMUXCTLD_URL = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:8765")
@@ -54,7 +49,7 @@ def _ledger_get(path: str, timeout: float = 2.0) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _post(path: str, body: dict, timeout: float = SEND_CLIENT_TIMEOUT_SECONDS) -> dict:
+def _post(path: str, body: dict, timeout: float = 60.0) -> dict:
     url = f"{TOKEN_API_URL}{path}"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -146,29 +141,7 @@ def main(argv: list[str]) -> int:
         "idempotency_key": args.idempotency_key,
     }
     try:
-        result = _post("/api/brief/send", body, timeout=SEND_CLIENT_TIMEOUT_SECONDS)
-    except TimeoutError as exc:
-        failure = {
-            "status": "send_timeout",
-            "error": f"transport timeout: {exc}",
-            "delivery": {
-                "status": "unknown",
-                "correlation_handle": {
-                    "caller_pane": body.get("caller_pane"),
-                    "panes": args.pane,
-                    "pages": args.page,
-                    "idempotency_key": args.idempotency_key,
-                },
-            },
-        }
-        if args.json_out:
-            print(json.dumps(failure, indent=2, sort_keys=True))
-        else:
-            _err(
-                "send transport timeout; delivery unknown; do not blindly retry "
-                "without checking the correlation handle"
-            )
-        return 1
+        result = _post("/api/brief/send", body, timeout=60.0)
     except urllib.error.HTTPError as exc:
         try:
             detail = json.loads(exc.read().decode("utf-8")).get("detail", str(exc))

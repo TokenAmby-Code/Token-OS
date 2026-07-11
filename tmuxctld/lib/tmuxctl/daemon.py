@@ -99,16 +99,6 @@ _PANE_DIED_HOOK = (
 # self-heals within one interval of any clear.
 _HOOK_REASSERT_INTERVAL_SECONDS = 60.0
 
-# When a re-assertion FAILS (``set-hook`` timed out against a wedged/slow tmux —
-# the 2026-07-07 outage condition), holding the full interval strands the global
-# pane-died hook uninstalled for a whole minute: nothing self-heals in that window
-# (twice-bitten). A failed attempt therefore pulls the throttle deadline in to this
-# short retry window so the very next /health heartbeat retries and re-installs the
-# instant tmux recovers. The retry cadence is still bounded by the heartbeat itself
-# (no new poller) and each attempt is one 5s-capped ``set-hook`` — matching the
-# install timeout, so this never busy-loops faster than the daemon can act.
-_HOOK_REASSERT_RETRY_SECONDS = 5.0
-
 # The permanent typing-guard PENDING-branch root keys (Enter/C-m/BSpace/C-h/C-c) are
 # bound once at tmux-server start and — unlike ``Any`` — have no focus/rehydrate
 # re-source path, so a deploy that advances the daemon SHA leaves the LIVE key-table
@@ -883,7 +873,6 @@ def _typing_gate_detail(phys_pane: str, *, gate: dict | None = None) -> dict:
 
 
 def _deferred_receipt(item: dict, *, gate: dict) -> dict:
-    phys_pane = str(item.get("phys_pane") or "")
     return {
         "status": "queued",
         "queued": True,
@@ -892,19 +881,11 @@ def _deferred_receipt(item: dict, *, gate: dict) -> dict:
         "submitted": False,
         "queue_id": item["id"],
         "queue_seq": item["seq"],
-        "queue_handle": {"id": item["id"], "seq": item["seq"], "pane": phys_pane},
-        "queue_state": {
-            "path": str(_DEFERRED_SEND_QUEUE.path),
-            "queued_total": _DEFERRED_SEND_QUEUE.size(),
-            "queued_for_pane": _DEFERRED_SEND_QUEUE.by_pane().get(phys_pane, 0),
-            "drain_scheduled": phys_pane in _DEFERRED_DRAINING,
-            "drain_guarantee": "scheduled_until_typing_guard_clears",
-        },
-        "pane": item.get("pane") or phys_pane,
-        "physical_pane": phys_pane,
-        "target": phys_pane,
+        "pane": item.get("pane") or item.get("phys_pane"),
+        "physical_pane": item.get("phys_pane"),
+        "target": item.get("phys_pane"),
         "reason": "typing_guard",
-        "gate": {**gate, "policy": "enqueue", "deferred": True},
+        "gate": gate,
         "queue_path": str(_DEFERRED_SEND_QUEUE.path),
     }
 
@@ -1088,49 +1069,26 @@ def _emit_prompt_submit_callback(control, callback: dict, event: dict) -> dict:
         f"correlation_id={correlation_id} delivered=1 turn=submitted target={target}"
     )
     try:
-        # Hook echoes are byte-bearing notifications. They may target a raw
-        # caller pane that is outside normal managed-agent resolution, but they
-        # still must pass the universal typing-guard chokepoint before any
-        # direct adapter injection.
-        params = {
-            "pane": caller_pane,
-            "text": text,
-            "submit": True,
-            "verify": False,
-            "operation_id": f"hook-echo:{correlation_id}",
-            "correlation_id": correlation_id,
-        }
-        gate = send_gate.evaluate(("send-keys", "-t", caller_pane, "-l", text))
-        receipt = _defer_or_drop_typing_guard(
-            route="/send-text",
-            params=params,
-            pane=caller_pane,
-            phys_pane=caller_pane,
-            gate=gate,
-        )
-        if receipt is None:
-            if hasattr(control.adapter, "send_text_then_submit"):
-                control.adapter.send_text_then_submit(
-                    caller_pane,
-                    text,
-                    clear_prompt=False,
-                    pre_submit_keys=(),
-                    submit_settle_seconds=0,
-                )
+        if hasattr(control.adapter, "send_text_then_submit"):
+            control.adapter.send_text_then_submit(
+                caller_pane,
+                text,
+                clear_prompt=False,
+                pre_submit_keys=(),
+                submit_settle_seconds=0,
+            )
+        else:
+            control.adapter.run("send-keys", "-t", caller_pane, "-l", text)
+            if hasattr(control.adapter, "send_keys"):
+                control.adapter.send_keys(caller_pane, "C-m")
             else:
-                control.adapter.run("send-keys", "-t", caller_pane, "-l", text)
-                if hasattr(control.adapter, "send_keys"):
-                    control.adapter.send_keys(caller_pane, "C-m")
-                else:
-                    control.adapter.run("send-keys", "-t", caller_pane, "C-m")
-            receipt = {"status": "sent", "queued": False}
+                control.adapter.run("send-keys", "-t", caller_pane, "C-m")
         return {
             "correlation_id": correlation_id,
             "caller_pane": caller_pane,
             "target_pane": callback.get("target_pane"),
             "target_label": callback.get("target_label"),
-            "status": "queued" if receipt.get("queued") else "sent",
-            "delivery": receipt,
+            "status": "sent",
             "event": event,
         }
     except Exception as exc:  # noqa: BLE001
@@ -1366,88 +1324,8 @@ def read_sha() -> str:
 # reintroduce a heartbeat-file poller — prefer /health.
 
 
-def tmux_socket_path() -> Path:
-    """Return the tmux control socket path this daemon depends on."""
-    configured = os.environ.get("TMUXCTLD_TMUX_SOCKET_PATH", "").strip()
-    if configured:
-        return Path(configured)
-    return Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / "default"
-
-
-def tmux_socket_connectable(path: Path | None = None) -> bool:
-    """Fail-closed AF_UNIX connect probe for the tmux socket file."""
-    socket_path = path or tmux_socket_path()
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(float(os.environ.get("TMUXCTLD_SOCKET_PROBE_SECONDS", "0.25")))
-            sock.connect(str(socket_path))
-        return True
-    except Exception:
-        return False
-
-
-def _live_fleet_tmux_server_pids(session: str = "main") -> list[int]:
-    """Find live fleet tmux server processes without starting tmux."""
-    try:
-        proc = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except Exception:
-        return []
-    pids: list[int] = []
-    for line in proc.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        pid_s, _, command = stripped.partition(" ")
-        try:
-            pid = int(pid_s)
-        except ValueError:
-            continue
-        if pid == os.getpid() or "tmux" not in command or "new-session" not in command:
-            continue
-        if f"-s {session}" in command or f"-s{session}" in command:
-            pids.append(pid)
-    return pids
-
-
-def recover_missing_tmux_socket(session: str = "main") -> dict:
-    """Name and heal socket-file loss by asking the live server to re-bind.
-
-    Never boots tmux. If the socket is absent/unconnectable and exactly one live
-    fleet server process is present, send SIGUSR1; tmux recreates its socket.
-    """
-    path = tmux_socket_path()
-    before = tmux_socket_connectable(path)
-    state = "reachable" if before else ("socket_loss" if path.exists() else "socket_missing")
-    result = {
-        "state": state,
-        "socket_path": str(path),
-        "recovery": "none",
-        "server_pids": [],
-    }
-    if before:
-        return result
-    pids = _live_fleet_tmux_server_pids(session=session)
-    result["server_pids"] = pids
-    if len(pids) == 1:
-        os.kill(pids[0], signal.SIGUSR1)
-        result["recovery"] = "sigusr1_rebind"
-    elif len(pids) > 1:
-        result["recovery"] = "ambiguous_live_servers_noop"
-    else:
-        result["recovery"] = "no_live_server_noop"
-    return result
-
-
 def tmux_reachable(adapter: TmuxAdapter) -> bool:
-    """Fail-closed probe: socket connect must work, then tmux must answer."""
-    if not tmux_socket_connectable():
-        return False
+    """Cheap fail-closed probe: can we list sessions at all?"""
     try:
         adapter.list_sessions()
         return True
@@ -1697,7 +1575,7 @@ def _resolve_physical_pane_or_gate(control, pane: str) -> str:
                 "suppressed": True,
                 "reason": "typing_guard",
                 "gate": "pane_unresolved",
-                "policy": "enqueue",
+                "policy": "cancel",
                 "target": pane,
                 "deferred": True,
             }
@@ -1711,7 +1589,7 @@ def _raise_if_human_locked(phys: str) -> None:
                 "suppressed": True,
                 "reason": "typing_guard",
                 "gate": "human_lock",
-                "policy": "enqueue",
+                "policy": "cancel",
                 "target": phys,
                 "deferred": True,
             }
@@ -2937,45 +2815,10 @@ def _h_assert_instance(control, params):
 
 def _h_reconcile(control, params):
     # The detached daemon has no ambient tmux session; the fleet lives in `main`.
-    ledger = control.ledger_reconcile()
-    results = control.reconcile_personas(session=_s(params, "session", "main"))
-    errored = [r for r in results if isinstance(r, dict) and (r.get("ok") is False or r.get("error"))]
-    if results and len(errored) == len(results):
-        raise ValueError("reconcile degraded: every target row errored")
     return {
-        "status": "degraded" if errored else "ok",
-        "degraded": bool(errored),
-        "ledger": ledger,
-        "results": results,
-        "errors": len(errored),
+        "ledger": control.ledger_reconcile(),
+        "results": control.reconcile_personas(session=_s(params, "session", "main")),
     }
-
-
-def _h_pane_inventory(control, params):
-    fmt = "\t".join([
-        "#{pane_id}", "#{@PANE_ID}", "#{window_name}", "#{pane_title}",
-        "#{pane_dead}", "#{@INSTANCE_ID}", "#{@TOKEN_API_WRAPPER_ID}",
-        "#{@PERSONA}", "#{@PANE_OCCUPANCY}", "#{@PANE_BORN}",
-    ])
-    try:
-        raw = control.adapter.run("list-panes", "-a", "-F", fmt, allow_failure=False)
-    except Exception as exc:  # noqa: BLE001 - endpoint must fail loud/degraded, not empty-healthy
-        return {"ok": False, "degraded": True, "error": "tmux_unreachable", "message": str(exc), "panes": []}
-    panes = []
-    for line in raw.splitlines():
-        parts = (line.split("\t") + [""] * 10)[:10]
-        phys, label, window, title, dead, instance, wrapper, persona, occupancy, born = parts
-        if label and ":" in label:
-            slot, cardinal = label.split(":", 1)
-        else:
-            slot, cardinal = "", label
-        panes.append({
-            "pane_id": phys, "slot": slot, "cardinal": cardinal, "label": label,
-            "title": title, "window": window, "live": dead != "1", "dead": dead == "1",
-            "stamp": {"instance_id": instance, "wrapper_id": wrapper, "persona": persona, "born_epoch": born},
-            "instance_id": instance, "occupancy": occupancy or ("occupied" if instance or wrapper or persona else "unknown"),
-        })
-    return {"ok": True, "degraded": False, "count": len(panes), "panes": panes}
 
 
 def _h_event(control, params):
@@ -3406,7 +3249,6 @@ def _h_hook_wrapperstart(control, params):
 
 
 def _h_close_pane(control, params):
-    requested_pane = _s(params, "pane")
     # Resolve a canonical id (e.g. ``mechanicus:1``) to its physical ``%NN`` FIRST,
     # exactly as _h_pane_live does. close_pane's tmux probes only understand real
     # pane handles; handed a canonical id, ``display-message -t mechanicus:1`` misses
@@ -3414,29 +3256,10 @@ def _h_close_pane(control, params):
     # (the #314-class stale-handle failure, liveness.py). A caller — including the
     # husk reaper — trusting that ``already_closed`` would believe a pane was reaped
     # when it was not. ``current`` is left for close_pane's own resolution.
-    pane = requested_pane
+    pane = _s(params, "pane")
     if pane and pane != "current":
-        try:
-            pane = _resolve_physical_pane_or_gate(control, pane)
-            deferred = _defer_or_drop_typing_guard(
-                route="/close-pane", params=params, pane=requested_pane, phys_pane=pane
-            )
-        except TmuxSendGated as exc:
-            deferred = _defer_or_drop_typing_guard(
-                route="/close-pane",
-                params=params,
-                pane=requested_pane,
-                phys_pane=str(exc.gate.get("target") or requested_pane),
-                gate=exc.gate,
-            )
-            if deferred is None:
-                raise
-        if deferred is not None:
-            return {**deferred, "operation": "close-pane", "sent": False}
-    result = control.close_pane(pane, timeout=_f(params, "timeout", 3.0))
-    if result.get("status") == "cleared_in_place":
-        result = {**result, "retire_required": False, "close_transaction_complete": True}
-    return result
+        pane = _resolve_physical_pane_or_gate(control, pane)
+    return control.close_pane(pane, timeout=_f(params, "timeout", 3.0))
 
 
 def _h_close(control, params):
@@ -3958,19 +3781,6 @@ def _h_instance_unset_option(control, params):
     return control.instance_unset_option(_s(params, "instance_id"), _s(params, "option"))
 
 
-def _h_instance_stamp(control, params):
-    return control.instance_stamp(
-        instance_id=_s(params, "instance_id"),
-        pane=_s(params, "pane"),
-        wrapper_id=_s(params, "wrapper_id") or _s(params, "wrapper_launch_id"),
-        pane_positional_id=_s(params, "pane_positional_id"),
-        persona=_s(params, "persona"),
-        engine=_s(params, "engine"),
-        working_dir=_s(params, "working_dir"),
-        vacate_pane=_s(params, "vacate_pane"),
-    )
-
-
 def _h_instance_rename(control, params):
     return control.instance_rename(
         _s(params, "name"),
@@ -4016,20 +3826,16 @@ def _h_context_governor_inject(control, params):
 def _h_context_governor_stop(control, params):
     """No-progress stage: stop further autonomous input via daemon-owned actuation.
 
-    For singleton/orchestrator panes this is intentionally conservative: rather than
-    killing the pane, route it into plan mode so the hard stop itself produces the
-    handoff plan the governor was waiting for (plan submission is the progress event,
-    and approval clears context). Worker lifecycle closure remains available through
-    /close when policy class support is expanded.
+    For singleton/orchestrator panes this is intentionally conservative: insert a
+    visible hard-stop handoff prompt rather than killing a pane. Worker lifecycle
+    closure remains available through /close when policy class support is expanded.
     """
     reason = _s(params, "reason") or "context_exhausted"
     text = (
-        "/plan Context governor hard stop: no compaction, handoff, plan submission, or "
-        "session-doc checkpoint was observed after the forced context warning "
-        f"(reason: {reason}). Your context is exhausted and will be cleared on plan "
-        "approval. Do not gather more context. Pose the handoff plan now from what you "
-        "already have: work completed, in-flight state, decisions made, and exact next "
-        "steps for the successor session."
+        "Context governor hard stop: no compaction, handoff, plan submission, or "
+        "session-doc checkpoint was observed after the forced context warning. "
+        "Stop autonomous work now, preserve handoff state, and wait for supervisor routing. "
+        f"Reason: {reason}."
     )
     injected = _h_context_governor_inject(
         control, {**params, "text": text, "stage": "no_progress_stop"}
@@ -4365,7 +4171,6 @@ _DEFERRED_ROUTE_HANDLERS: dict[str, RouteHandler] = {
     "/append-user-text": _h_append_user_text,
     "/insert-invocation": _h_insert_invocation,
     "/context-governor/inject": _h_context_governor_inject,
-    "/close-pane": _h_close_pane,
 }
 
 ROUTES: dict[tuple[str, str], RouteHandler] = {
@@ -4389,8 +4194,6 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("GET", "/inspect/pane"): _h_inspect_pane,
     ("GET", "/inspect/restart-plan"): _h_inspect_restart_plan,
     ("GET", "/doctor"): _h_doctor,
-    ("GET", "/pane-inventory"): _h_pane_inventory,
-    ("GET", "/roster"): _h_pane_inventory,
     ("GET", "/instance/show-option"): _h_instance_show_option,
     ("POST", "/tmux/run"): _h_tmux_run,
     # Send + act (POST)
@@ -4480,7 +4283,6 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ("POST", "/instance/set-option"): _h_instance_set_option,
     ("POST", "/instance/unset-option"): _h_instance_unset_option,
     ("POST", "/instance/rename"): _h_instance_rename,
-    ("POST", "/instance/stamp"): _h_instance_stamp,
     ("POST", "/context-governor/inject"): _h_context_governor_inject,
     ("POST", "/context-governor/stop"): _h_context_governor_stop,
     ("POST", "/instance/send-text"): _h_instance_send_text,
@@ -4572,20 +4374,8 @@ class TmuxctldServer(ThreadingHTTPServer):
         except Exception:
             log.exception("tmuxctld prompt-submit callback load failed")
         try:
-            loaded_deferred = _DEFERRED_SEND_QUEUE.load()
-            # Do not auto-drain persisted typing-guard sends at daemon boot.
-            # A restart/kickstart is not a human-clear edge: hooks may not have
-            # rehydrated the pane-local HUMAN/PENDING guard yet, and queued
-            # records are keyed to physical panes.  Auto-replay here can flush a
-            # stale report into the Emperor's active composer and the submit key
-            # is part of that replay.  Deferred sends are drained only from a
-            # fresh guard-clear/expiry signal in this daemon lifetime (or an
-            # explicit drain call in tests/tools).
-            if loaded_deferred.get("queued"):
-                log.warning(
-                    "tmuxctld: deferred-send queue loaded queued=%s; boot auto-drain suppressed",
-                    loaded_deferred.get("queued"),
-                )
+            _DEFERRED_SEND_QUEUE.load()
+            _schedule_all_deferred_drains()
         except Exception:
             log.exception("tmuxctld deferred-send queue load failed")
         # Throttle state for the /health-driven lifecycle-hook re-assertion. A
@@ -4624,32 +4414,16 @@ class TmuxctldServer(ThreadingHTTPServer):
         when a re-assertion was performed this call (so it ran), False when the
         throttle suppressed it. ``ensure_tmux_lifecycle_hooks`` is idempotent and
         non-fatal, and any failure is swallowed so /health never breaks.
-
-        A re-assertion that does not actually land (``ensure_tmux_lifecycle_hooks``
-        reports ``ok=False`` because ``set-hook`` timed out on a wedged tmux, or it
-        raised) pulls the throttle deadline in to ``_HOOK_REASSERT_RETRY_SECONDS`` so
-        the hook self-heals on the next heartbeat rather than staying uninstalled for
-        a full interval.
         """
         now = time.monotonic()
         with self._hook_reassert_lock:
             if now < self._hook_reassert_deadline:
                 return False
             self._hook_reassert_deadline = now + _HOOK_REASSERT_INTERVAL_SECONDS
-        installed = False
         try:
-            result = ensure_tmux_lifecycle_hooks()
-            installed = bool(result and result.get("ok"))
+            ensure_tmux_lifecycle_hooks()
         except Exception:  # never let a hook re-install break the health contract
             log.exception("tmux lifecycle hook re-assertion failed")
-        if not installed:
-            # The install did not land — retry soon instead of holding the full
-            # interval, so a wedged tmux self-heals the moment it recovers. Only ever
-            # pull the deadline EARLIER; never push a concurrent success later.
-            retry_deadline = now + _HOOK_REASSERT_RETRY_SECONDS
-            with self._hook_reassert_lock:
-                if retry_deadline < self._hook_reassert_deadline:
-                    self._hook_reassert_deadline = retry_deadline
         return True
 
     def maybe_reconcile_guard_bindings(self) -> bool:
@@ -4823,12 +4597,9 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             self.server.operation_monitor.finish(op_id, ok=op_ok)
 
     def _health_payload(self) -> dict:
-        socket_health = recover_missing_tmux_socket()
         return {
             "ok": True,
             "tmux_reachable": tmux_reachable(self.server.adapter_factory()),
-            "tmux_socket_state": socket_health["state"],
-            "tmux_socket_recovery": socket_health["recovery"],
             "version": self.server.version,
             "sha": self.server.sha,
             "port": self.server.advertised_port,

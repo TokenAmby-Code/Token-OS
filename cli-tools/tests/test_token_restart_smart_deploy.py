@@ -68,8 +68,6 @@ def _stub_env(
     repo.mkdir(exist_ok=True)
     (repo / ".git").mkdir(exist_ok=True)
     (repo / "token-api" / "web" / "ops").mkdir(parents=True, exist_ok=True)
-    (repo / "token-api" / "web" / "contracts").mkdir(parents=True, exist_ok=True)
-    (repo / "discord-daemon").mkdir(parents=True, exist_ok=True)
     bare = tmp_path / "token-os.git"
     bare.mkdir(exist_ok=True)
 
@@ -105,15 +103,7 @@ echo "curl $*" >> "{logfile}"
 for arg in "$@"; do
   if [[ "$arg" == *"%{{http_code}}"* ]]; then echo 200; exit 0; fi
 done
-health_counter="${{STUB_CURL_HEALTH_COUNTER:-}}"
-if [[ -n "$health_counter" ]]; then
-  count=0; [[ -f "$health_counter" ]] && count="$(cat "$health_counter")"
-  count=$((count + 1)); echo "$count" > "$health_counter"
-  if (( count <= 1 )); then sha="${{STUB_RUNNING_SHA:-}}"; else sha="NEW111"; fi
-else
-  sha="${{STUB_RUNNING_SHA:-}}"
-fi
-echo '{{"connected": true, "git_sha": "'"$sha"'"}}'
+echo '{{"connected": true, "git_sha": "'"${{STUB_RUNNING_SHA:-}}"'"}}'
 exit 0
 """
     )
@@ -230,7 +220,6 @@ esac
         "MERGE_FAIL_MSG": merge_fail_msg,
         "MERGE_COUNTER": str(tmp_path / "merge_count.txt"),
         "STUB_OPS_DIRT_CLEARED": str(tmp_path / "ops_dirt_cleared"),
-        "STUB_CURL_HEALTH_COUNTER": str(tmp_path / "curl_health_count"),
         # Default the post-restart /health SHA to the deploy target so the new
         # deploy-verification gate can pass under stubs. Tests can still opt into
         # a stale process by overriding env["STUB_RUNNING_SHA"] (e.g. "STALE999").
@@ -425,30 +414,6 @@ def test_ops_committed_bundle_change_also_rebuilds_bundle(tmp_path: Path) -> Non
     assert "npm run build" in calls
     assert RESTART_TOKENAPI in calls
     assert "ops-ui" in proc.stdout
-
-
-def test_discord_deps_refresh_failure_degrades_but_token_api_still_restarts(tmp_path: Path) -> None:
-    env, logfile = _stub_env(tmp_path, "discord-daemon/package-lock.json")
-    npm = Path(env["PATH"].split(os.pathsep, 1)[0]) / "npm"
-    npm.write_text(
-        f"""#!/usr/bin/env bash
-echo "npm $*" >> "{logfile}"
-case "$PWD" in
-  *discord-daemon*) echo "simulated npm EACCES" >&2; exit 13;;
-esac
-exit 0
-"""
-    )
-    npm.chmod(0o755)
-
-    proc = _run(env)
-
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    calls = logfile.read_text()
-    assert RESTART_TOKENAPI in calls, "Token-API must restart even after sidecar refresh failure"
-    assert "discord-daemon deps refresh failed; degrading" in proc.stdout
-    assert "Sidecars:" in proc.stdout and "discord-daemon-deps-refresh" in proc.stdout
-    assert "deploy verified: /health git_sha=NEW111" in proc.stdout
 
 
 def test_docs_only_change_does_not_run_npm_without_generated_ops_dirt(

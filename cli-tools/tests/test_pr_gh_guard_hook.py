@@ -1,40 +1,16 @@
 """Tests for the PreToolUse direct gh-pr guard.
 
-Agents use the `pr` skill / `pr-step` for PR lifecycle writes. This hook denies
-write-position `gh pr <write-subcommand> ...` while allowing read-only `gh pr`,
-read-only `gh run`, `pr-step`, non-PR `gh` commands, and commands that merely
-mention the text "gh pr" as an argument.
+Agents use the `pr` skill / `pr-step` for PR lifecycle work. This hook denies
+command-position `gh pr ...` while allowing `pr-step`, non-PR `gh` commands, and
+commands that merely mention the text "gh pr" as an argument.
 """
 
 import json
 import subprocess
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HOOK = REPO_ROOT / "claude-config" / "hooks" / "command-boundary-guard.sh"
-
-GH_PR_READ_COMMANDS = [
-    "gh pr view",
-    "gh pr list",
-    "gh pr status",
-    "gh pr checks",
-    "gh pr diff",
-]
-GH_RUN_READ_COMMANDS = ["gh run view", "gh run list"]
-GH_PR_WRITE_SUBCOMMANDS = [
-    "create",
-    "merge",
-    "close",
-    "edit",
-    "ready",
-    "reopen",
-    "comment",
-    "review",
-    "lock",
-    "unlock",
-]
 
 
 def run_hook(command: str):
@@ -63,44 +39,31 @@ def assert_allowed(proc):
 
 
 # --------------------------------------------------------------------------- #
-# DENY: direct command-position gh-pr write invocations.
+# DENY: direct command-position gh-pr invocations.
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("subcommand", GH_PR_WRITE_SUBCOMMANDS)
-def test_gh_pr_write_subcommands_are_denied(subcommand):
-    reason = assert_denied(run_hook(f"gh pr {subcommand}"))
+def test_gh_pr_view_is_denied():
+    reason = assert_denied(run_hook("gh pr view"))
     assert "`pr` skill" in reason
     assert "`pr-step`" in reason
-    assert "`/pr`" in reason
-    assert "self-sufficient since #598" in reason
 
 
-def test_gh_pr_write_after_and_separator_is_denied():
+def test_gh_pr_after_and_separator_is_denied():
     assert_denied(run_hook("cd repo && gh pr create"))
 
 
-def test_gh_pr_write_after_env_prefix_is_denied():
+def test_gh_pr_after_env_prefix_is_denied():
     assert_denied(run_hook("GH_TOKEN=x gh pr merge 123"))
 
 
-def test_gh_pr_write_after_newline_is_denied():
-    assert_denied(run_hook("pwd\ngh pr comment 123 --body ok"))
+def test_gh_pr_after_newline_is_denied():
+    assert_denied(run_hook("pwd\ngh pr checks"))
 
 
 # --------------------------------------------------------------------------- #
-# ALLOW: read-only gh commands, canonical workflow, non-PR/text-search commands.
+# ALLOW: canonical workflow and non-PR/text-search commands.
 # --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize("command", GH_PR_READ_COMMANDS)
-def test_gh_pr_read_commands_are_allowed(command):
-    assert_allowed(run_hook(command))
-
-
-@pytest.mark.parametrize("command", GH_RUN_READ_COMMANDS)
-def test_gh_run_read_commands_are_allowed(command):
-    assert_allowed(run_hook(command))
 
 
 def test_pr_step_is_allowed():

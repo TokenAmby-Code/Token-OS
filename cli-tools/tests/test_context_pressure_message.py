@@ -98,15 +98,7 @@ def test_tmux_context_color_uses_absolute_used_token_thresholds() -> None:
     assert module.context_color(None, pct=70) == module.RED
 
 
-def test_codex_footer_context_pct_uses_258k_denominator() -> None:
-    module = _load_tmux_context()
-
-    assert module.codex_footer_context_pct(129_000) == "50%"
-    assert module.codex_footer_context_pct(160_000) == "62%"
-    assert module.codex_footer_context_pct(None) == "..."
-
-
-def test_tmux_context_main_matches_codex_footer_layout(monkeypatch, capsys):
+def test_tmux_context_main_colors_footer_by_used_tokens_not_percentage(monkeypatch, capsys):
     module = _load_tmux_context()
 
     monkeypatch.setenv("TMUX_PANE", "%77")
@@ -146,7 +138,9 @@ def test_tmux_context_main_matches_codex_footer_layout(monkeypatch, capsys):
     module.main()
 
     out = capsys.readouterr().out
-    assert out == f"{module.LIGHT_GREEN}/tmp/work{module.RESET} • Context 62% used • Claude\n"
+    assert out.startswith(f"{module.BOLD}{module.RED}40%{module.RESET}")
+    assert f"{module.BOLD}{module.RED}160k/400k{module.RESET}" in out
+    assert "\033[38;2;255;0;0mTest Chapter" in out
 
 
 def test_tmux_context_main_reports_telemetry_without_legacy_nudge(monkeypatch, capsys):

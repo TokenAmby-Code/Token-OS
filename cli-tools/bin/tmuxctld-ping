@@ -38,8 +38,6 @@ esac
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${_SCRIPT_DIR}/../lib/nas-path.sh" >/dev/null 2>&1 || true
-# shellcheck source=/dev/null
-source "${_SCRIPT_DIR}/../lib/tmuxctld-timeouts.sh" >/dev/null 2>&1 || true
 
 DAEMON_URL="${TMUXCTLD_URL:-}"
 if [[ -z "$DAEMON_URL" ]] && type imperium_cfg >/dev/null 2>&1; then
@@ -88,19 +86,7 @@ PY
     URL="${URL}?${QUERY}"
 fi
 
-case "${METHOD} ${PATH_PART}" in
-    "POST /reconcile"|"POST /close-pane"|"POST /close"|"POST /stack/add")
-        # Lifecycle allocation/reconcile/close transactions must not be severed by a client-side max-time;
-        # curl --max-time 0 means no transfer timeout after the daemon accepts.
-        MAX_TIME="${TMUXCTLD_MAX_TIME:-0}"
-        ;;
-    "POST /send-text")
-        MAX_TIME="${TMUXCTLD_MAX_TIME:-$(tmuxctld_send_client_timeout)}"
-        ;;
-    *)
-        MAX_TIME="${TMUXCTLD_MAX_TIME:-3}"
-        ;;
-esac
+MAX_TIME="${TMUXCTLD_MAX_TIME:-3}"
 if [[ "$METHOD" == "POST" && "$PATH_PART" == "/typing-guard-state" ]]; then
     for item in "$@"; do
         if [[ "$item" == "cmd=arm" || "$item" == "action=arm" ]]; then

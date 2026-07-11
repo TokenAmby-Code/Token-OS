@@ -16,14 +16,11 @@ Does NOT own:
 import asyncio
 import functools
 import hashlib
-import hmac
 import json
 import logging
 import os
 import re
 import shutil
-import sqlite3
-import struct
 import subprocess
 import sys
 import threading
@@ -33,14 +30,12 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
 
 import aiosqlite
 import requests
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import shared
@@ -79,39 +74,6 @@ TTS_AUTO_FOCUS_ENABLED = os.environ.get("TOKEN_API_TTS_AUTO_FOCUS", "").lower() 
     "on",
 }
 
-TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
-
-
-def _tts_artifact_base_url() -> str:
-    """Base URL minted into artifact URLs handed to playback consumers.
-
-    TOKEN_API_URL is the *local* loopback on the machine serving Token-API, so
-    it can never be advertised to the phone or the WSL satellite. Resolve this
-    machine's mesh address from imperium_config (lazy import: routes.tts loads
-    before main.py puts cli-tools/lib on sys.path) so the value follows the
-    registry when Token-API moves hosts. TOKEN_API_ADVERTISED_URL overrides
-    both for hosts the registry doesn't know yet.
-    """
-    override = os.environ.get("TOKEN_API_ADVERTISED_URL", "").strip()
-    if override:
-        return override.rstrip("/")
-    try:
-        from urllib.parse import urlsplit
-
-        from imperium_config import cfg
-
-        mesh_ip = (cfg("tailscale_ip") or "").strip()
-        if mesh_ip:
-            port = urlsplit(TOKEN_API_URL).port or 7777
-            return f"http://{mesh_ip}:{port}"
-    except Exception:
-        pass
-    return TOKEN_API_URL
-
-
-def _tts_artifact_public_url(artifact_id: str) -> str:
-    return f"{_tts_artifact_base_url()}/api/tts/artifacts/{artifact_id}"
-
 
 def _sanitize_public_text(value: str | None) -> str:
     """Translate/redact raw tmux pane ids at synchronous human boundaries."""
@@ -125,35 +87,6 @@ async def _sanitize_public_text_async(value: str | None) -> str:
     if not value:
         return ""
     return await sanitize_human_render_text(str(value)) or ""
-
-
-def _require_privileged_tts_probe_request(request: Request | None) -> None:
-    """Allow the phone TTS probe only from local/operator-controlled callers.
-
-    Unit tests call the route function directly with ``request=None``. Live use is
-    via localhost after deploy; an optional bearer token can authorize non-local
-    operator tooling without making the debug playback endpoint public.
-    """
-    if request is None:
-        return
-    host = request.client.host if request.client else ""
-    if host in {"127.0.0.1", "::1", "localhost"}:
-        return
-    configured = os.environ.get("TOKEN_API_PRIVILEGED_ROUTE_TOKEN", "").strip()
-    auth = request.headers.get("Authorization", "")
-    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
-    if configured and presented and hmac.compare_digest(presented, configured):
-        return
-    raise HTTPException(status_code=403, detail="privileged route required")
-
-
-def _phone_test_probe_conflicts_with_active_tts(state: dict) -> bool:
-    control = dict(state.get("control") or {})
-    if control.get("state") != "playing":
-        return False
-    if control.get("source") == "phone_test":
-        return False
-    return bool(state.get("current") or state.get("playback_id"))
 
 
 router = APIRouter()
@@ -213,8 +146,6 @@ class NotifyRequest(BaseModel):
     banner: str | None = None  # phone banner text (defaults to message head)
     voice: str | None = None  # optional TTS voice override
     instance_id: str | None = None  # instance whose voice profile to use
-    context: dict | None = None  # optional contract metadata, e.g. {"kind":"enforcement"}
-    enforcement: bool = False  # explicit live-enforcement audio: bypass persona_silent or fail loud
 
 
 class SoundRequest(BaseModel):
@@ -229,10 +160,6 @@ class QueueTTSRequest(BaseModel):
 
 class PlayPaneRequest(BaseModel):
     instance_id: str  # Promote all items from this instance to hot queue
-
-
-class PlayQueueItemRequest(BaseModel):
-    item_key: str  # Promote/play one exact queued item
 
 
 class PlaybackCompleteRequest(BaseModel):
@@ -302,18 +229,6 @@ class TTSChunkNextRequest(BaseModel):
     detail: dict | None = None
 
 
-class TTSPhoneTestRequest(BaseModel):
-    """Explicit phone-stream test request.
-
-    This bypasses normal router device selection so WSL availability does not
-    affect phone MacroDroid validation.
-    """
-
-    message: str
-    rate: int = 0
-    max_chars: int | None = None
-
-
 # ============ TTS/Notification System ============
 
 # Platform detection
@@ -328,274 +243,6 @@ SOUND_MAP = {
     "ding.wav": "/System/Library/Sounds/Tink.aiff",
     "tada.wav": "/System/Library/Sounds/Hero.aiff",
 }
-
-OPENAI_TTS_PROVIDER = "openai"
-OPENAI_TTS_MODEL = os.environ.get("TOKEN_API_OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-OPENAI_TTS_FORMAT = "wav"
-OPENAI_TTS_VOICES = {
-    "alloy",
-    "ash",
-    "ballad",
-    "coral",
-    "echo",
-    "fable",
-    "nova",
-    "onyx",
-    "sage",
-    "shimmer",
-    "verse",
-    "marin",
-    "cedar",
-}
-OPENAI_TTS_DEFAULT_VOICE = "ballad"
-OPENAI_TTS_INSTRUCTIONS = os.environ.get("TOKEN_API_OPENAI_TTS_INSTRUCTIONS", "")
-
-
-def _tts_artifact_dir() -> Path:
-    configured = os.environ.get("TOKEN_API_TTS_ARTIFACT_DIR")
-    base = (
-        Path(configured).expanduser()
-        if configured
-        else Path(DB_PATH).expanduser().parent / "tts-artifacts"
-    )
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def _tts_metadata_db() -> Path:
-    return _tts_artifact_dir() / "metadata.sqlite3"
-
-
-def _ensure_tts_metadata_table(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tts_artifacts (
-            artifact_id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL,
-            voice_id TEXT NOT NULL, format TEXT NOT NULL, text_hash TEXT NOT NULL,
-            cache_key TEXT NOT NULL UNIQUE, path TEXT NOT NULL, sha256 TEXT,
-            created_at TEXT NOT NULL, last_used_at TEXT NOT NULL,
-            render_status TEXT NOT NULL, render_error TEXT
-        )
-    """)
-
-
-def _openai_api_key() -> str | None:
-    key = os.environ.get("OPENAI_API_KEY")
-    if key:
-        return key
-    for candidate in (
-        Path.cwd() / "config.json",
-        Path(__file__).resolve().parents[2] / "config.json",
-    ):
-        try:
-            data = json.loads(candidate.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        key = data.get("openai_api_key")
-        if key:
-            return str(key)
-    return None
-
-
-def _normalize_openai_voice(voice: str | None) -> str:
-    voice_id = (voice or OPENAI_TTS_DEFAULT_VOICE).strip()
-    return voice_id if voice_id in OPENAI_TTS_VOICES else OPENAI_TTS_DEFAULT_VOICE
-
-
-def _tts_cache_key(*, voice_id: str, text: str) -> tuple[str, str, str]:
-    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    material = json.dumps(
-        {
-            "provider": OPENAI_TTS_PROVIDER,
-            "model": OPENAI_TTS_MODEL,
-            "voice_id": voice_id,
-            "instructions": OPENAI_TTS_INSTRUCTIONS,
-            "format": OPENAI_TTS_FORMAT,
-            "text": text,
-        },
-        sort_keys=True,
-        ensure_ascii=False,
-    )
-    cache_key = hashlib.sha256(material.encode("utf-8")).hexdigest()
-    artifact_id = cache_key[:32]
-    return artifact_id, cache_key, text_hash
-
-
-def _finalize_wav_header(data: bytes) -> bytes:
-    """Patch streaming-placeholder RIFF/data sizes with real byte counts.
-
-    OpenAI streams WAV with 0xFFFFFFFF in the RIFF and data chunk size fields
-    (unknown at header-write time). Strict players — Windows SoundPlayer,
-    Android media actions — reject that as "not a valid wave file", so the
-    artifact must be finalized before it is cached or served.
-    """
-    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
-        return data
-    buf = bytearray(data)
-    struct.pack_into("<I", buf, 4, len(buf) - 8)
-    pos = 12
-    while pos + 8 <= len(buf):
-        chunk_id = bytes(buf[pos : pos + 4])
-        chunk_size = struct.unpack_from("<I", buf, pos + 4)[0]
-        if chunk_id == b"data":
-            struct.pack_into("<I", buf, pos + 4, len(buf) - pos - 8)
-            break
-        if chunk_size in (0, 0xFFFFFFFF):
-            break
-        pos += 8 + chunk_size + (chunk_size % 2)
-    return bytes(buf)
-
-
-_tts_render_locks: dict[str, threading.Lock] = {}
-_tts_render_locks_guard = threading.Lock()
-
-
-def _tts_render_lock(cache_key: str) -> threading.Lock:
-    with _tts_render_locks_guard:
-        return _tts_render_locks.setdefault(cache_key, threading.Lock())
-
-
-def render_openai_tts_artifact(text: str, voice: str | None) -> dict:
-    clean = (text or "").strip()
-    if not clean:
-        return {"success": False, "error": "empty_audio_payload"}
-    voice_id = _normalize_openai_voice(voice)
-    artifact_id, cache_key, text_hash = _tts_cache_key(voice_id=voice_id, text=clean)
-    # Serialize check/claim/render per cache_key: concurrent identical requests
-    # must not both miss the ready row and both pay for an OpenAI render.
-    with _tts_render_lock(cache_key):
-        return _render_openai_tts_artifact_locked(
-            clean, voice_id, artifact_id, cache_key, text_hash
-        )
-
-
-def _render_openai_tts_artifact_locked(
-    clean: str, voice_id: str, artifact_id: str, cache_key: str, text_hash: str
-) -> dict:
-    artifact_path = _tts_artifact_dir() / f"{artifact_id}.wav"
-    now = _now_iso()
-    with sqlite3.connect(_tts_metadata_db()) as conn:
-        _ensure_tts_metadata_table(conn)
-        row = conn.execute(
-            "SELECT path, sha256, render_status FROM tts_artifacts WHERE cache_key=?", (cache_key,)
-        ).fetchone()
-        if row and row[2] == "ready" and Path(row[0]).exists():
-            conn.execute(
-                "UPDATE tts_artifacts SET last_used_at=? WHERE cache_key=?", (now, cache_key)
-            )
-            return {
-                "success": True,
-                "cache_hit": True,
-                "artifact_id": artifact_id,
-                "artifact_path": row[0],
-                "artifact_url": _tts_artifact_public_url(artifact_id),
-                "voice_id": voice_id,
-                "text_hash": text_hash,
-                "format": OPENAI_TTS_FORMAT,
-                "sha256": row[1],
-            }
-        conn.execute(
-            "INSERT OR REPLACE INTO tts_artifacts (artifact_id,provider,model,voice_id,format,text_hash,cache_key,path,sha256,created_at,last_used_at,render_status,render_error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                artifact_id,
-                OPENAI_TTS_PROVIDER,
-                OPENAI_TTS_MODEL,
-                voice_id,
-                OPENAI_TTS_FORMAT,
-                text_hash,
-                cache_key,
-                str(artifact_path),
-                None,
-                now,
-                now,
-                "rendering",
-                None,
-            ),
-        )
-    key = _openai_api_key()
-    if not key:
-        error = "openai_api_key_missing"
-        with sqlite3.connect(_tts_metadata_db()) as conn:
-            _ensure_tts_metadata_table(conn)
-            conn.execute(
-                "UPDATE tts_artifacts SET render_status='error', render_error=?, last_used_at=? WHERE cache_key=?",
-                (error, now, cache_key),
-            )
-        return {"success": False, "error": error, "artifact_id": artifact_id}
-    payload = {
-        "model": OPENAI_TTS_MODEL,
-        "voice": voice_id,
-        "input": clean,
-        "response_format": OPENAI_TTS_FORMAT,
-    }
-    if OPENAI_TTS_INSTRUCTIONS:
-        payload["instructions"] = OPENAI_TTS_INSTRUCTIONS
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/audio/speech",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=(10, 180),
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"openai_tts_http_{resp.status_code}: {resp.text[:300]}")
-        wav_bytes = _finalize_wav_header(resp.content)
-        tmp_path = artifact_path.with_name(artifact_path.name + ".part")
-        tmp_path.write_bytes(wav_bytes)
-        tmp_path.replace(artifact_path)
-        sha = hashlib.sha256(wav_bytes).hexdigest()
-        with sqlite3.connect(_tts_metadata_db()) as conn:
-            _ensure_tts_metadata_table(conn)
-            conn.execute(
-                "UPDATE tts_artifacts SET sha256=?, render_status='ready', render_error=NULL, last_used_at=? WHERE cache_key=?",
-                (sha, _now_iso(), cache_key),
-            )
-        return {
-            "success": True,
-            "cache_hit": False,
-            "artifact_id": artifact_id,
-            "artifact_path": str(artifact_path),
-            "artifact_url": _tts_artifact_public_url(artifact_id),
-            "voice_id": voice_id,
-            "text_hash": text_hash,
-            "format": OPENAI_TTS_FORMAT,
-            "sha256": sha,
-        }
-    except Exception as exc:
-        error = str(exc)
-        with sqlite3.connect(_tts_metadata_db()) as conn:
-            _ensure_tts_metadata_table(conn)
-            conn.execute(
-                "UPDATE tts_artifacts SET render_status='error', render_error=?, last_used_at=? WHERE cache_key=?",
-                (error[:1000], _now_iso(), cache_key),
-            )
-        return {
-            "success": False,
-            "error": "openai_tts_render_failed",
-            "detail": error,
-            "artifact_id": artifact_id,
-        }
-
-
-def get_tts_artifact(artifact_id: str) -> dict | None:
-    if not re.fullmatch(r"[0-9a-f]{32}", artifact_id or ""):
-        return None
-    with sqlite3.connect(_tts_metadata_db()) as conn:
-        _ensure_tts_metadata_table(conn)
-        row = conn.execute(
-            "SELECT path, voice_id, text_hash, format, sha256, render_status FROM tts_artifacts WHERE artifact_id=?",
-            (artifact_id,),
-        ).fetchone()
-    if not row or row[5] != "ready" or not Path(row[0]).exists():
-        return None
-    return {
-        "artifact_id": artifact_id,
-        "artifact_path": row[0],
-        "voice_id": row[1],
-        "text_hash": row[2],
-        "format": row[3],
-        "sha256": row[4],
-        "artifact_url": _tts_artifact_public_url(artifact_id),
-    }
 
 
 def play_sound(sound_file: str = None) -> dict:
@@ -899,8 +546,8 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
     """Speak a message via WSL satellite TTS (Windows SAPI voices).
 
     Blocks until satellite returns (speech complete or skipped).
-    When use_file_playback=True, uses synthesize-to-file + WAV artifact playback
-    (stop supported; pause/resume deferred). Otherwise uses direct SpeakAsync.
+    When use_file_playback=True, uses synthesize-to-file + WMP playback
+    (supports pause/resume/speed). Otherwise uses direct SpeakAsync.
     """
     host = DESKTOP_CONFIG["host"]
     port = DESKTOP_CONFIG["port"]
@@ -909,13 +556,12 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
     endpoint = "/tts/synth-and-play" if use_file_playback else "/tts/speak"
     biased_rate = max(-10, min(10, rate + TTS_WSL_RATE_BIAS))
     payload = {"message": message, "voice": voice, "rate": biased_rate}
-    timeout = (5, max(3600, len(message) * 3)) if use_file_playback else (5, 300)
 
     try:
         resp = requests.post(
             f"http://{host}:{port}{endpoint}",
             json=payload,
-            timeout=timeout,  # Bounded connect; long read window for WAV playback
+            timeout=300,  # Long timeout — blocks until speech/playback done
         )
         TTS_BACKEND["current"] = None
 
@@ -953,9 +599,6 @@ def speak_tts_wsl(message: str, voice: str, rate: int = 0, use_file_playback: bo
                 "rendered_chars": data.get("rendered_chars"),
                 "rendered_hash": rendered_hash,
                 "transport": data.get("transport"),
-                "file_id": data.get("file_id"),
-                "wav_path_win": data.get("wav_path_win"),
-                "playback_pid": data.get("playback_pid"),
                 "reason": "skipped" if skipped else data.get("reason"),
             }
         elif resp.status_code == 409:
@@ -1008,43 +651,32 @@ def _get_discord_voice_bot() -> str | None:
     return result
 
 
-def speak_tts_discord(
-    message: str, bot_name: str, voice: str = None, rate: int = 0, artifact: dict | None = None
-) -> dict:
-    """Route a pre-rendered OpenAI WAV artifact through Discord voice channel.
+def speak_tts_discord(message: str, bot_name: str, voice: str = None, rate: int = 0) -> dict:
+    """Route TTS through Discord voice channel. Device-agnostic — audio plays wherever the operator is listening."""
+    mac_voice = voice or "Daniel"
+    wpm = _wpm_for_rate(rate)
 
-    Playback is fully artifact-driven; ``voice``/``rate`` are accepted for queue-worker
-    call-shape compatibility but do not influence playback.
-    """
-    if not artifact or not artifact.get("artifact_url"):
-        return {
-            "success": False,
-            "error": "tts_artifact_required",
-            "reason": "tts_artifact_required",
-        }
     try:
         resp = requests.post(
-            f"{DISCORD_DAEMON_URL}/voice/play",
-            json={
-                "url": artifact.get("artifact_url"),
-                "file": artifact.get("artifact_path"),
-                "bot": bot_name,
-                "sha256": artifact.get("sha256"),
-            },
+            f"{DISCORD_DAEMON_URL}/voice/tts",
+            json={"message": message, "bot": bot_name, "voice": mac_voice, "rate": wpm},
+            # Long lines legitimately block on the daemon's AudioPlayerStatus.Idle
+            # (now serialized per-bot), so allow generous headroom over a single
+            # spoken line before declaring a transport timeout.
             timeout=TTS_DISCORD_HTTP_TIMEOUT_S,
         )
         if resp.status_code == 200:
             data = resp.json()
-            if data.get("played") or data.get("success"):
+            if data.get("played"):
                 return {
                     "success": True,
                     "method": "discord_voice",
-                    "transport": "openai_tts_wav_artifact",
                     "bot": bot_name,
-                    "voice": artifact.get("voice_id"),
-                    "artifact_id": artifact.get("artifact_id"),
+                    "voice": mac_voice,
                     "message": message[:50],
                 }
+            # 200 but no confirmed playback: the daemon accepted the request but
+            # did not deliver audio to a live channel. Do not claim success.
             return {
                 "success": False,
                 "error": "discord_voice_not_played",
@@ -1055,13 +687,13 @@ def speak_tts_discord(
             return {"success": False, "error": "discord_voice_busy", "reason": "discord_voice_busy"}
         return {
             "success": False,
-            "error": f"Discord play returned {resp.status_code}",
+            "error": f"Discord TTS returned {resp.status_code}",
             "reason": "discord_daemon_error",
         }
     except requests.Timeout:
-        return {"success": False, "error": "discord_play_timeout", "reason": "discord_play_timeout"}
+        return {"success": False, "error": "discord_tts_timeout", "reason": "discord_tts_timeout"}
     except Exception as e:
-        logger.warning(f"TTS Discord artifact playback failed: {e}")
+        logger.warning(f"TTS Discord: failed ({e}), will fall through to local")
         return {"success": False, "error": str(e), "reason": "discord_unreachable"}
 
 
@@ -1129,7 +761,6 @@ def speak_tts(
     wsl_voice: str = None,
     wsl_rate: int = None,
     use_file_playback: bool = False,
-    artifact: dict | None = None,
 ) -> dict:
     """Route TTS to the best available device via resolve_tts_device().
 
@@ -1186,7 +817,7 @@ def speak_tts(
     # Dispatch without Mac fallthrough. The selected active backend either plays
     # or Token-OS records/returns an error state.
     if device == "discord":
-        result = speak_tts_discord(message, routing["discord_bot"], voice, rate, artifact=artifact)
+        result = speak_tts_discord(message, routing["discord_bot"], voice, rate)
         if result.get("success"):
             return _finish(result)
         logger.info("TTS: Discord failed (%s); no Mac fallback", result.get("error"))
@@ -1200,29 +831,12 @@ def speak_tts(
             rate=rate,
             wsl_voice=wsl_voice,
             wsl_rate=wsl_rate if wsl_rate is not None else rate,
-            artifact=artifact,
         )
         if not result.get("success"):
             logger.info("TTS: %s backend failed (%s); no Mac fallback", device, result.get("error"))
         return _finish(result)
 
     return _finish(_no_playback_backend("unknown_playback_backend"))
-
-
-def send_discord_notification(message: str, level: str = "info") -> dict:
-    """The one daemon HTTP hop for the Discord notification leg.
-
-    POSTs to the daemon's /notify endpoint, which routes to the notifications
-    channel. Callers never talk to the daemon directly — the router owns the
-    transport (same contract as _send_to_phone for the tactile leg).
-    """
-    resp = requests.post(
-        f"{DISCORD_DAEMON_URL}/notify",
-        json={"message": message, "level": level},
-        timeout=5,
-    )
-    resp.raise_for_status()
-    return {"success": True, **resp.json()}
 
 
 async def dispatch_notify(
@@ -1235,8 +849,6 @@ async def dispatch_notify(
     voice: str | None = None,
     instance_id: str | None = None,
     context: dict | None = None,
-    discord: bool = False,
-    enforcement: bool = False,
 ) -> dict:
     """Authoritative comms entry — the single front door to the router.
 
@@ -1257,15 +869,7 @@ async def dispatch_notify(
     message = await _sanitize_public_text_async(message)
     banner = await _sanitize_public_text_async(banner) if banner is not None else None
 
-    context = context or {}
-    enforcement = bool(
-        enforcement
-        or context.get("enforcement")
-        or context.get("kind") == "enforcement"
-        or context.get("type") == "enforcement"
-    )
-
-    if _is_quiet_hours() and not enforcement:
+    if _is_quiet_hours():
         logger.info(f"Notify suppressed (quiet hours): {(message or banner or '')[:80]}")
         return {
             "delivered": False,
@@ -1292,11 +896,7 @@ async def dispatch_notify(
         completion: asyncio.Future = loop.create_future()
         audio_instance_id = instance_id or SYSTEM_INSTANCE_ID
         enqueue = await queue_tts(
-            audio_instance_id,
-            message,
-            queue_target="hot",
-            completion=completion,
-            bypass_persona_silent=enforcement,
+            audio_instance_id, message, queue_target="hot", completion=completion
         )
         if enqueue.get("queued"):
             try:
@@ -1354,20 +954,6 @@ async def dispatch_notify(
             functools.partial(_send_to_phone, "/notify", phone_params),
         )
 
-    # Discord leg: device-agnostic notification channel via the daemon. Sits
-    # AFTER the quiet-hours early-return (suppressed notifies never reach the
-    # daemon) and is try/except-isolated so a dead daemon can never mask the
-    # TTS/tactile legs.
-    discord_result = None
-    if discord and message:
-        try:
-            discord_result = await loop.run_in_executor(
-                None, functools.partial(send_discord_notification, message)
-            )
-        except Exception as e:
-            logger.warning(f"notify: discord leg failed (isolated): {e}")
-            discord_result = {"success": False, "error": str(e)}
-
     tactile_delivered = bool(
         tactile_result and (tactile_result.get("success") or tactile_result.get("overall_success"))
     )
@@ -1376,23 +962,12 @@ async def dispatch_notify(
     # playback. A phone banner/vibe must not mask a failed/no-backend TTS leg.
     delivered = audio_delivered if audio_requested else tactile_delivered
     route = tts_result.get("route") if tts_result else None
-    reason = None
-    if audio_requested and not audio_delivered:
-        reason = (
-            (tts_result or {}).get("reason")
-            or (tts_result or {}).get("error")
-            or "audio_not_delivered"
-        )
-        if enforcement and reason == "persona_silent":
-            reason = "enforcement_persona_silent_contract_violation"
     result = {
         "delivered": delivered,
         "audio_delivered": audio_delivered,
         "route": route,
-        "reason": reason,
         "tts": tts_result,
         "tactile": tactile_result,
-        "discord": discord_result,
     }
     await log_event(
         "notify",
@@ -1407,7 +982,6 @@ async def dispatch_notify(
             "delivered": delivered,
             "audio_delivered": audio_delivered,
             "tactile_delivered": tactile_delivered,
-            "discord_delivered": bool(discord_result and discord_result.get("success")),
             "context": context,
         },
     )
@@ -1434,17 +1008,6 @@ class TTSQueueItem:
     tmux_pane: str | None = None  # live-resolved pane id for @TTS_STATE tracking (set at playback)
     focus_on_playback: bool = False  # true only for explicit operator-initiated playback
     playback_target: str | None = None  # resolved non-null audio target at enqueue time
-    artifact_id: str | None = None
-    artifact_url: str | None = None
-    artifact_path: str | None = None
-    artifact_sha256: str | None = None
-    voice_id: str | None = None
-    text_hash: str | None = None
-    format: str = OPENAI_TTS_FORMAT
-    persona_slug: str | None = None
-    persona_display_name: str | None = None
-    commander_type: str | None = None
-    item_key: str = field(default_factory=lambda: uuid.uuid4().hex)
     started_at: str | None = None  # ISO; stamped when the worker begins audible playback
     # Future resolved by the worker when this item reaches a terminal playback
     # state (success/skip/fail/muted/exception). The single front door
@@ -1542,12 +1105,10 @@ _last_pause_queue_expiry_sweep = 0.0
 SYSTEM_INSTANCE_ID = "system"
 _SYSTEM_TTS_ROW: dict[str, object] = {
     "name": "System",
-    "tts_voice": "ballad",  # Custodes/System OpenAI voice
+    "tts_voice": "Microsoft George",  # Custodes' reserved voice
     "notification_sound": "chimes.wav",
     "tts_mode": "verbose",
     "persona_slug": "system",
-    "persona_display_name": "System",
-    "commander_type": "system",
     "advisor": True,  # jump ahead of the pause queue, but the worker still
     # serializes — a system ping waits out whatever is currently audible.
     "tts_policy": "hot",
@@ -1747,46 +1308,39 @@ def _split_phone_utterance_text(text: str, *, max_chars: int | None = None) -> t
     return current, next_text
 
 
-def build_one_utterance_tts_chunk_handoff(
-    chunks: list[dict], *, max_chars: int | None = None
-) -> list[dict]:
-    """Build one full-utterance backend handoff from sanitized chunks.
-
-    Phone and WSL execute exactly one full utterance per Token-API TTS
-    message. Token-API may still split text internally for legacy contracts,
-    but backend handoff collapses those prepared chunks into a single ``1/1``
-    chunk with integrity metadata for the full rendered text.
-    """
-    del max_chars  # Kept for test/back-compat call sites; backends do not split here.
-    texts = [str(chunk.get("text") or "").strip() for chunk in chunks]
-    full_text = " ".join(text for text in texts if text).strip()
-    if not full_text:
-        return []
-
-    utterance_id = str((chunks[0] if chunks else {}).get("utterance_id") or uuid.uuid4().hex)
-    playback_id = utterance_id
-    return [
-        {
-            "playback_id": playback_id,
-            "utterance_id": utterance_id,
-            "chunk_id": f"{utterance_id}:1/1",
-            "index": 0,
-            "total": 1,
-            "text": full_text,
-            "text_hash": hashlib.sha256(full_text.encode("utf-8")).hexdigest(),
-        }
-    ]
-
-
 def build_phone_tts_chunk_handoff(
     chunks: list[dict], *, max_chars: int | None = None
 ) -> list[dict]:
-    """Build one full-utterance phone handoff.
+    """Build the phone streaming handoff from sanitized speech chunks.
 
-    Compatibility wrapper for older call sites/tests. Phone v1 no longer
-    streams/backfills intra-message chunks.
+    Phone streaming uses the same sentence/word chunks as the generic backend
+    contract, but a single ``playback_id`` identifies the whole phone utterance.
+    The initial /tts-chunk payload carries chunks 0 and 1; later
+    /api/tts/chunk-next calls backfill chunk n+2 after chunk n is consumed.
     """
-    return build_one_utterance_tts_chunk_handoff(chunks, max_chars=max_chars)
+    del max_chars  # Kept for test/back-compat call sites; phone no longer re-splits here.
+    cleaned_chunks = [chunk for chunk in chunks if str(chunk.get("text") or "").strip()]
+    if not cleaned_chunks:
+        return []
+
+    utterance_id = str(cleaned_chunks[0].get("utterance_id") or uuid.uuid4().hex)
+    playback_id = utterance_id
+    total = len(cleaned_chunks)
+    result = []
+    for index, chunk in enumerate(cleaned_chunks):
+        text = str(chunk.get("text") or "").strip()
+        result.append(
+            {
+                "playback_id": playback_id,
+                "utterance_id": utterance_id,
+                "chunk_id": f"{utterance_id}:{index + 1}/{total}",
+                "index": index,
+                "total": total,
+                "text": text,
+                "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            }
+        )
+    return result
 
 
 def _backend_chunk_payload(
@@ -1811,18 +1365,6 @@ def _backend_chunk_payload(
         "speed": rate,
         "rate": rate,
     }
-    artifact = current_chunk.get("artifact")
-    if artifact:
-        payload.update(
-            {
-                "artifact_id": artifact.get("artifact_id"),
-                "artifact_url": artifact.get("artifact_url"),
-                "artifact_path": artifact.get("artifact_path"),
-                "artifact_sha256": artifact.get("sha256"),
-                "voice_id": artifact.get("voice_id"),
-                "format": artifact.get("format", OPENAI_TTS_FORMAT),
-            }
-        )
     if next_public:
         payload.update(
             {
@@ -1916,7 +1458,7 @@ def _send_phone_tts_chunk(payload: dict) -> dict:
     pending_phone_playbacks[playback_id] = event
     try:
         try:
-            result = dict(_send_to_phone("/tts-artifact", payload) or {})
+            result = dict(_send_to_phone("/tts-chunk", payload) or {})
         except Exception as exc:
             logger.warning("TTS: Phone chunk send failed (%s)", exc)
             return {"success": False, "error": "phone_send_failed", "reason": str(exc)}
@@ -1943,68 +1485,46 @@ def _send_phone_tts_chunk(payload: dict) -> dict:
         pending_phone_playbacks.pop(playback_id, None)
 
 
-def _post_wsl_chunk(
-    payload: dict, *, voice: str | None, rate: int = 0, artifact: dict | None = None
-) -> dict:
-    """Send one queued Token-API chunk through WSL dumb artifact playback.
+def _post_wsl_chunk(payload: dict, *, voice: str | None, rate: int = 0) -> dict:
+    """Send one queued Token-API chunk through the WSL satellite's SAPI transport.
 
-    Playback is fully artifact-driven; ``voice``/``rate`` are accepted for queue-worker
-    call-shape compatibility but do not influence playback.
+    The live satellite's real playback surface is /tts/speak; it writes the text
+    to a temp file on the WSL side and returns rendered_chars/rendered_hash as an
+    integrity ack. Keep Token-API's current/next chunk state here, but do not
+    require a separate satellite /tts/chunk endpoint.
     """
     chunk_id = payload.get("chunk_id")
     playback_id = payload.get("playback_id")
     session_id = payload.get("session_id")
-    if not artifact or not artifact.get("artifact_url"):
-        return {
-            "success": False,
-            "error": "tts_artifact_required",
-            "chunk_id": chunk_id,
-            "playback_id": playback_id,
-            "session_id": session_id,
-        }
-    body = {
-        "artifact_url": artifact.get("artifact_url"),
-        "artifact_id": artifact.get("artifact_id"),
-        "sha256": artifact.get("sha256"),
-        "format": artifact.get("format", "wav"),
-    }
-    try:
-        resp = requests.post(
-            f"http://{DESKTOP_CONFIG['host']}:{DESKTOP_CONFIG['port']}/audio/play",
-            json=body,
-            timeout=(5, 3600),
-        )
-        if resp.status_code == 409:
-            return {
-                "success": False,
-                "error": "satellite_busy",
-                "chunk_id": chunk_id,
-                "playback_id": playback_id,
-                "session_id": session_id,
-            }
-        if resp.status_code != 200:
-            return {
-                "success": False,
-                "error": f"satellite returned {resp.status_code}",
-                "chunk_id": chunk_id,
-                "playback_id": playback_id,
-                "session_id": session_id,
-            }
-        result = dict(resp.json() or {})
-    except (requests.ConnectionError, requests.Timeout):
-        return {
-            "success": False,
-            "error": "satellite_unreachable",
-            "chunk_id": chunk_id,
-            "playback_id": playback_id,
-            "session_id": session_id,
-        }
-    result.setdefault("method", "wsl_artifact_playback")
-    result.setdefault("transport", "openai_tts_wav_artifact")
+    message = payload["current_chunk_text"]
+    result = speak_tts_wsl(message, voice or "Microsoft David", rate=rate)
+    result = dict(result or {})
+    result.setdefault("method", "wsl_sapi_chunk")
     result["chunk_id"] = chunk_id
     result["playback_id"] = playback_id
     result["session_id"] = session_id
-    result.setdefault("artifact_id", artifact.get("artifact_id"))
+
+    if result.get("success") and result.get("rendered_hash"):
+        expected_hash = payload["current_chunk_hash"]
+        if result["rendered_hash"] != expected_hash:
+            logger.error(
+                "TTS WSL chunk integrity mismatch: chunk_id=%s playback_id=%s "
+                "session_id=%s method=%s expected_hash=%s rendered_hash=%s",
+                chunk_id,
+                playback_id,
+                session_id,
+                result.get("method"),
+                expected_hash,
+                result.get("rendered_hash"),
+            )
+            return {
+                "success": False,
+                "error": "satellite_text_integrity_check_failed",
+                "method": result.get("method"),
+                "chunk_id": chunk_id,
+                "playback_id": playback_id,
+                "session_id": session_id,
+            }
     return result
 
 
@@ -2016,7 +1536,6 @@ def dispatch_tts_chunks_to_backend(
     rate: int = 0,
     wsl_voice: str | None = None,
     wsl_rate: int | None = None,
-    artifact: dict | None = None,
 ) -> dict:
     """Dispatch sanitized chunks to the selected execution backend.
 
@@ -2036,16 +1555,21 @@ def dispatch_tts_chunks_to_backend(
         if not phone_chunks:
             return {"success": False, "error": "empty_audio_payload", "method": None}
         current_chunk = phone_chunks[0]
+        next_chunk = phone_chunks[1] if len(phone_chunks) > 1 else None
         session_id = str(TTS_AUTHORITATIVE_STATE["session_id"])
+        _register_phone_tts_stream(
+            session_id=session_id,
+            playback_id=current_chunk["playback_id"],
+            utterance_id=current_chunk["utterance_id"],
+            chunks=phone_chunks,
+        )
         _record_tts_backend_active(
             backend,
             playback_id=current_chunk["playback_id"],
             current=_chunk_public_payload(current_chunk),
-            next_chunk=None,
+            next_chunk=_chunk_public_payload(next_chunk),
         )
-        if artifact:
-            current_chunk["artifact"] = artifact
-        payload = _backend_chunk_payload(current_chunk, None, rate=rate)
+        payload = _backend_chunk_payload(current_chunk, next_chunk, rate=rate)
         result = dict(_send_phone_tts_chunk(payload) or {})
         result.setdefault("chunk_id", current_chunk["chunk_id"])
         real_chunks = len(phone_chunks)
@@ -2079,74 +1603,6 @@ def dispatch_tts_chunks_to_backend(
             "backend": backend,
             "chunks": real_chunks,
             "completed_chunks": real_chunks,
-            "playback_id": result.get("playback_id"),
-            "playback_confirmed": result.get("playback_confirmed"),
-            "results": [result],
-        }
-
-    if backend == "wsl":
-        wsl_chunks = build_one_utterance_tts_chunk_handoff(chunks)
-        if not wsl_chunks:
-            return {"success": False, "error": "empty_audio_payload", "method": None}
-        chunk = wsl_chunks[0]
-        _record_tts_backend_active(
-            backend,
-            playback_id=chunk["playback_id"],
-            current=_chunk_public_payload(chunk),
-            next_chunk=None,
-        )
-        if artifact:
-            chunk["artifact"] = artifact
-        payload = _backend_chunk_payload(chunk, None, rate=wsl_rate or rate)
-        result = dict(
-            _post_wsl_chunk(
-                payload, voice=wsl_voice or voice, rate=wsl_rate or rate, artifact=artifact
-            )
-            or {}
-        )
-        result.setdefault("chunk_id", chunk["chunk_id"])
-        result.setdefault("playback_id", chunk["playback_id"])
-        if result.get("skipped"):
-            return {
-                "success": False,
-                "skipped": True,
-                "method": result.get("method") or backend,
-                "chunks": 1,
-                "completed_chunks": 0,
-                "chunk_id": chunk["chunk_id"],
-                "playback_id": result.get("playback_id"),
-                "results": [result],
-                "reason": "skipped",
-            }
-        if not result.get("success"):
-            error = result.get("error") or "backend_chunk_failed"
-            _update_tts_authoritative_state(
-                last_error={
-                    "backend": backend,
-                    "playback_id": chunk["playback_id"],
-                    "chunk_id": chunk["chunk_id"],
-                    "error": error,
-                    "reported_at": _now_iso(),
-                }
-            )
-            return {
-                "success": False,
-                "error": error,
-                "method": result.get("method") or backend,
-                "chunks": 1,
-                "completed_chunks": 0,
-                "chunk_id": chunk["chunk_id"],
-                "playback_id": result.get("playback_id"),
-                "results": [result],
-                "reason": result.get("reason") or error,
-            }
-        return {
-            "success": True,
-            "method": result.get("method") or backend,
-            "backend": backend,
-            "chunks": 1,
-            "completed_chunks": 1,
-            "chunk_id": chunk["chunk_id"],
             "playback_id": result.get("playback_id"),
             "playback_confirmed": result.get("playback_confirmed"),
             "results": [result],
@@ -2601,15 +2057,6 @@ async def tts_queue_worker() -> None:
                             wsl_voice,
                             wsl_rate,
                             use_file_playback=True,
-                            artifact={
-                                "artifact_id": item.artifact_id,
-                                "artifact_url": item.artifact_url,
-                                "artifact_path": item.artifact_path,
-                                "sha256": item.artifact_sha256,
-                                "voice_id": item.voice_id,
-                                "text_hash": item.text_hash,
-                                "format": item.format,
-                            },
                         ),
                     )
                     logger.info(f"TTS worker: speak result = {json.dumps(tts_result)}")
@@ -2770,7 +2217,6 @@ async def queue_tts(
     message: str,
     queue_target: str = "pause",
     completion: "asyncio.Future | None" = None,
-    bypass_persona_silent: bool = False,
 ) -> dict:
     """Queue a TTS message for an instance, using their profile's voice/sound.
 
@@ -2792,9 +2238,8 @@ async def queue_tts(
     """
     message = await _sanitize_public_text_async(message)
 
-    # Silence TTS during quiet hours (11 PM - 9 AM), except explicit live
-    # enforcement where policy requires audible-or-named-failure semantics.
-    if _is_quiet_hours() and not bypass_persona_silent:
+    # Silence TTS during quiet hours (11 PM - 9 AM)
+    if _is_quiet_hours():
         logger.info(f"TTS suppressed (quiet hours): {message[:80]}")
         return {"success": True, "queued": False, "reason": "quiet_hours"}
 
@@ -2815,8 +2260,7 @@ async def queue_tts(
                 """SELECT i.name, p.tts_voice, p.notification_sound,
                           CASE WHEN i.interaction_mode = 'voice_chat'
                                THEN 'voice-chat' ELSE i.notification_mode END AS tts_mode,
-                          p.slug AS persona_slug, p.display_name AS persona_display_name,
-                          p.tts_policy AS tts_policy, i.commander_type AS commander_type,
+                          p.slug AS persona_slug, p.tts_policy AS tts_policy,
                           COALESCE(p.advisor, 0) AS advisor
                    FROM instances i
                    LEFT JOIN personas p ON p.id = i.persona_id
@@ -2849,26 +2293,8 @@ async def queue_tts(
     # an unknown/NULL policy is SILENT + WARN: a visible registration failure, never
     # a leak (see [[anti-blind-dedup]] — never silently swallow). The voiced
     # Astartes already resolve, so normal speech is unaffected.
-    def _row_get(key: str, default=None):
-        try:
-            return row[key]
-        except (KeyError, IndexError):
-            return default
-
-    tts_policy = _row_get("tts_policy")
-    persona_slug = _row_get("persona_slug")
-    persona_display_name = _row_get("persona_display_name")
-    commander_type = _row_get("commander_type")
-
-    def _system_audio_with_sender_metadata() -> dict[str, object]:
-        system_row = dict(_SYSTEM_TTS_ROW)
-        system_row.update(
-            persona_slug=persona_slug,
-            persona_display_name=persona_display_name,
-            commander_type=commander_type,
-        )
-        return system_row
-
+    tts_policy = row["tts_policy"]
+    persona_slug = row["persona_slug"]
     if tts_policy not in ("silent", "hot", "pause"):
         logger.warning(
             "TTS denied (persona_unresolved): instance=%s persona_slug=%r "
@@ -2882,30 +2308,13 @@ async def queue_tts(
         return {"success": True, "queued": False, "reason": "persona_unresolved"}
 
     if tts_policy == "silent":
-        if not bypass_persona_silent:
-            logger.info(f"TTS suppressed (persona_silent): {message[:80]}")
-            return {"success": True, "queued": False, "reason": "persona_silent"}
-        logger.warning(
-            "TTS enforcement bypassed persona_silent: instance=%s persona=%r message=%r",
-            instance_id,
-            persona_slug,
-            message[:80],
-        )
-        row = _system_audio_with_sender_metadata()
+        logger.info(f"TTS suppressed (persona_silent): {message[:80]}")
+        return {"success": True, "queued": False, "reason": "persona_silent"}
 
     # Belt-and-suspenders: an independent silence guarantee. A voiced policy
-    # without a resolved persona voice still must not speak unless this is an
-    # enforcement notification, in which case use the system/Custodes voice.
+    # without a resolved persona voice still must not speak.
     if row["tts_voice"] is None:
-        if not bypass_persona_silent:
-            return {"success": True, "queued": False, "reason": "persona_silent"}
-        logger.warning(
-            "TTS enforcement bypassed missing persona voice: instance=%s persona=%r message=%r",
-            instance_id,
-            persona_slug,
-            message[:80],
-        )
-        row = _system_audio_with_sender_metadata()
+        return {"success": True, "queued": False, "reason": "persona_silent"}
 
     voice = row["tts_voice"]
     sound = row["notification_sound"]
@@ -2935,53 +2344,29 @@ async def queue_tts(
         logger.info(f"TTS suppressed (silent mode): {message[:80]}")
         return {"success": True, "queued": False, "reason": "silent"}
 
-    rendered_message = sanitize_tts_for_speech(
-        _sanitize_public_text(clean_markdown_for_tts(message))
-    )
-    artifact = None
-    if effective_mode != "muted" and rendered_message:
-        artifact = await asyncio.to_thread(render_openai_tts_artifact, rendered_message, voice)
-        if not artifact.get("success"):
-            await log_event(
-                "tts_render_failed",
-                instance_id=instance_id,
-                device_id="tts_queue",
-                details={
-                    "message": message[:100],
-                    "voice": voice,
-                    "error": artifact.get("error"),
-                    "detail": artifact.get("detail"),
-                },
-            )
-            return {
-                "success": False,
-                "queued": False,
-                "reason": "tts_render_failed",
-                "error": artifact.get("error"),
-                "detail": artifact.get("detail"),
-            }
-
-    item = TTSQueueItem(
-        instance_id=instance_id,
-        message="" if effective_mode == "muted" else rendered_message,
-        voice=voice,
-        sound=sound,
-        name=name,
-        queue_target=queue_target,
-        focus_on_playback=False,
-        persona_slug=persona_slug,
-        persona_display_name=persona_display_name,
-        commander_type=commander_type,
-        completion=completion,
-    )
-    if artifact:
-        item.artifact_id = artifact.get("artifact_id")
-        item.artifact_url = artifact.get("artifact_url")
-        item.artifact_path = artifact.get("artifact_path")
-        item.artifact_sha256 = artifact.get("sha256")
-        item.voice_id = artifact.get("voice_id")
-        item.text_hash = artifact.get("text_hash")
-        item.format = artifact.get("format", OPENAI_TTS_FORMAT)
+    if effective_mode == "muted":
+        # Sound only, no TTS speech
+        item = TTSQueueItem(
+            instance_id=instance_id,
+            message="",  # Empty message = no speech
+            voice=voice,
+            sound=sound,
+            name=name,
+            queue_target=queue_target,
+            focus_on_playback=False,
+            completion=completion,
+        )
+    else:
+        item = TTSQueueItem(
+            instance_id=instance_id,
+            message=message,
+            voice=voice,
+            sound=sound,
+            name=name,
+            queue_target=queue_target,
+            focus_on_playback=False,
+            completion=completion,
+        )
 
     target = _resolve_queue_playback_target(
         message=item.message,
@@ -3034,12 +2419,6 @@ async def queue_tts(
             "queue": queue_target,
             "focus_on_playback": item.focus_on_playback,
             "playback_target": item.playback_target,
-            "artifact_id": item.artifact_id,
-            "artifact_url": item.artifact_url,
-            "artifact_path": item.artifact_path,
-            "voice_id": item.voice_id,
-            "text_hash": item.text_hash,
-            "format": item.format,
         },
     )
 
@@ -3059,12 +2438,6 @@ async def queue_tts(
         "voice": voice,
         "sound": sound,
         "playback_target": item.playback_target,
-        "artifact_id": item.artifact_id,
-        "artifact_url": item.artifact_url,
-        "artifact_path": item.artifact_path,
-        "voice_id": item.voice_id,
-        "text_hash": item.text_hash,
-        "format": item.format,
     }
 
 
@@ -3324,21 +2697,11 @@ async def _maybe_emit_tts_languishing_enforcement(*, position: int, item: TTSQue
 def _queue_item_to_dict(item: TTSQueueItem) -> dict:
     """Serialize a TTSQueueItem for API responses."""
     return {
-        "item_key": item.item_key,
         "instance_id": item.instance_id,
         "name": item.name,
         "message": item.message[:50] + "..." if len(item.message) > 50 else item.message,
         "voice": item.voice,
         "playback_target": item.playback_target,
-        "artifact_id": item.artifact_id,
-        "artifact_url": item.artifact_url,
-        "artifact_path": item.artifact_path,
-        "voice_id": item.voice_id,
-        "text_hash": item.text_hash,
-        "format": item.format,
-        "persona_slug": item.persona_slug,
-        "persona_display_name": item.persona_display_name,
-        "commander_type": item.commander_type,
         "queue": item.queue_target,
         "queued_at": item.queued_at.isoformat(),
     }
@@ -3358,7 +2721,6 @@ def get_tts_queue_status() -> dict:
     current = None
     if current_item:
         current = {
-            "item_key": current_item.item_key,
             "instance_id": current_item.instance_id,
             "name": current_item.name,
             "message": current_item.message[:50] + "..."
@@ -3366,9 +2728,6 @@ def get_tts_queue_status() -> dict:
             else current_item.message,
             "voice": current_item.voice,
             "playback_target": current_item.playback_target,
-            "persona_slug": current_item.persona_slug,
-            "persona_display_name": current_item.persona_display_name,
-            "commander_type": current_item.commander_type,
             "started_at": current_item.started_at,
         }
 
@@ -3481,16 +2840,6 @@ def send_webhook(webhook_url: str, message: str, data: dict = None) -> dict:
 # ============ TTS Endpoints ============
 
 
-@router.get("/api/tts/artifacts/{artifact_id}")
-def api_tts_artifact(artifact_id: str):
-    artifact = get_tts_artifact(artifact_id)
-    if not artifact:
-        raise HTTPException(status_code=404, detail="tts artifact not found")
-    return FileResponse(
-        artifact["artifact_path"], media_type="audio/wav", filename=f"{artifact_id}.wav"
-    )
-
-
 def _active_tts_backend(requested: str | None = None) -> str | None:
     if requested in TTS_EXECUTION_BACKENDS:
         return requested
@@ -3518,6 +2867,7 @@ def _echo_tts_control_to_backend(backend: str | None, payload: dict) -> dict:
             "command": action,
             "session_id": payload.get("session_id") or TTS_AUTHORITATIVE_STATE.get("session_id"),
             "playback_id": payload.get("playback_id"),
+            "speed": payload.get("speed"),
         }
         try:
             result = dict(_send_to_phone("/tts-local-control", params) or {})
@@ -3560,50 +2910,12 @@ async def api_tts_control(request: TTSControlRequest) -> dict:
        endpoint/mechanism and returns that echo/error without falling back to Mac.
     """
     action = (request.command or request.action or "").strip().lower()
-    if action in {"faster", "speed"}:
-        raise HTTPException(
-            status_code=400, detail="speed controls are retired for phone one-chunk v1"
-        )
-    if action == "stop":
-        action = "skip"
-        request.command = "skip"
-        request.action = "skip"
-    if action not in {"pause", "resume", "skip"}:
-        raise HTTPException(status_code=400, detail="command must be pause, resume, skip, or stop")
+    if action not in {"pause", "resume", "skip", "speed"}:
+        raise HTTPException(status_code=400, detail="command must be pause, resume, skip, or speed")
+    if action == "speed" and request.speed is None:
+        raise HTTPException(status_code=400, detail="speed action requires speed")
 
     backend = _active_tts_backend(request.backend)
-    if backend == "phone" and action in {"pause", "resume"}:
-        backend_echo = {
-            "success": False,
-            "backend": backend,
-            "error": "phone_pause_unsupported",
-            "reason": "phone_pause_unsupported",
-        }
-        _update_tts_authoritative_state(
-            last_error={
-                "backend": backend,
-                "playback_id": request.playback_id or TTS_AUTHORITATIVE_STATE.get("playback_id"),
-                "error": "phone_pause_unsupported",
-                "reported_at": _now_iso(),
-            }
-        )
-        await log_event(
-            "tts_control",
-            device_id="tts_control",
-            details={
-                "action": action,
-                "speed": request.speed,
-                "backend": backend,
-                "success": False,
-                "backend_echo": backend_echo,
-            },
-        )
-        return {
-            "success": False,
-            "state": get_tts_authoritative_state(),
-            "backend_echo": backend_echo,
-        }
-
     recorded = _record_tts_control_state(request, backend)
     echo_payload = {
         "action": action,
@@ -3661,18 +2973,90 @@ async def api_tts_backend_ack(request: TTSBackendAckRequest) -> dict:
 
 @router.post("/api/tts/chunk-next")
 async def api_tts_chunk_next(request: TTSChunkNextRequest) -> dict:
-    """Compatibility-only endpoint; phone streaming/backfill is retired."""
-    payload = {
-        "success": True,
-        "done": True,
-        "reason": "streaming_retired",
-        "next_chunk": "",
-        "next_chunk_text": "",
-        "next_index": None,
-        "session_id": request.session_id,
-        "playback_id": request.playback_id,
-        "control_state": (TTS_AUTHORITATIVE_STATE.get("control") or {}).get("state"),
-    }
+    """Return the next phone streaming backfill chunk, or explicit done.
+
+    The phone starts with current chunk ``n`` and buffered chunk ``n+1``. After
+    ``n`` is consumed it asks for ``n+2``. Token-OS remains authoritative: pause
+    returns a paused response without advancing, skip completes the active phone
+    stream, and resume allows normal backfill again.
+    """
+    stream = _get_phone_tts_stream(request.session_id, request.playback_id)
+    if stream is None:
+        return {
+            "success": True,
+            "done": True,
+            "reason": "unknown_or_expired_stream",
+            "next_chunk": "",
+            "next_chunk_text": "",
+            "next_index": None,
+            "control_state": (TTS_AUTHORITATIVE_STATE.get("control") or {}).get("state"),
+        }
+
+    control = dict(TTS_AUTHORITATIVE_STATE.get("control") or {})
+    control_state = control.get("state")
+    if control_state == "paused":
+        payload = _chunk_next_payload(None, done=False, reason="paused")
+        payload.update(
+            {"paused": True, "session_id": request.session_id, "playback_id": request.playback_id}
+        )
+        await log_event(
+            "tts_chunk_next",
+            device_id=request.backend,
+            details={**payload, "last_consumed_index": request.last_consumed_index},
+        )
+        return payload
+    if control_state == "skipping":
+        _complete_phone_tts_stream(request.session_id, request.playback_id)
+        payload = _chunk_next_payload(None, done=True, reason="skipped")
+        payload.update(
+            {"skipped": True, "session_id": request.session_id, "playback_id": request.playback_id}
+        )
+        await log_event(
+            "tts_chunk_next",
+            device_id=request.backend,
+            details={**payload, "last_consumed_index": request.last_consumed_index},
+        )
+        return payload
+
+    chunks = list(stream.get("chunks") or [])
+    total = len(chunks)
+    last_consumed = int(request.last_consumed_index)
+    backfill_index = last_consumed + 2
+    if backfill_index < total:
+        chunk = chunks[backfill_index]
+        current = chunks[last_consumed + 1] if last_consumed + 1 < total else None
+        _record_tts_backend_active(
+            "phone",
+            playback_id=request.playback_id,
+            current=current,
+            next_chunk=chunk,
+        )
+        payload = _chunk_next_payload(chunk, done=False)
+        with _tts_phone_streams_lock:
+            key = _phone_stream_key(request.session_id, request.playback_id)
+            if key in TTS_PHONE_STREAMS:
+                TTS_PHONE_STREAMS[key]["updated_at"] = _now_iso()
+                TTS_PHONE_STREAMS[key]["last_backfill_index"] = backfill_index
+    else:
+        current = chunks[last_consumed + 1] if last_consumed + 1 < total else None
+        _record_tts_backend_active(
+            "phone",
+            playback_id=request.playback_id,
+            current=current,
+            next_chunk=None,
+        )
+        payload = _chunk_next_payload(None, done=True, reason="stream_exhausted")
+
+    payload.update(
+        {
+            "session_id": request.session_id,
+            "playback_id": request.playback_id,
+            "utterance_id": stream.get("utterance_id"),
+            "last_consumed_index": last_consumed,
+            "backfill_index": backfill_index,
+            "total": total,
+        }
+    )
     await log_event("tts_chunk_next", device_id=request.backend, details=payload)
     return payload
 
@@ -3722,93 +3106,6 @@ async def api_tts_chunk_event(request: TTSChunkEventRequest) -> dict:
         "matched_playback": matched_playback,
         "state": get_tts_authoritative_state(),
     }
-
-
-async def api_tts_phone_test(
-    request: TTSPhoneTestRequest, http_request: Request | None = None
-) -> dict:
-    """Run a real phone-only streaming TTS probe.
-
-    This endpoint is intentionally not part of the normal notification router:
-    it exists to validate the phone MacroDroid chunk player while WSL remains
-    healthy and independently available.
-    """
-    _require_privileged_tts_probe_request(http_request)
-    state = get_tts_authoritative_state()
-    if _phone_test_probe_conflicts_with_active_tts(state):
-        raise HTTPException(status_code=409, detail="active TTS playback in progress")
-
-    message = sanitize_tts_for_speech(
-        _sanitize_public_text(clean_markdown_for_tts(request.message))
-    )
-    if not message.strip():
-        raise HTTPException(status_code=400, detail="message required")
-
-    session_id = f"phone-test-{uuid.uuid4().hex}"
-    _update_tts_authoritative_state(
-        session_id=session_id,
-        control={
-            "state": "playing",
-            "last_action": None,
-            "speed": 1.0,
-            "source": "phone_test",
-            "updated_at": _now_iso(),
-        },
-    )
-    chunks = build_tts_chunk_handoff(message, max_chars=request.max_chars)
-    result: dict = {}
-    try:
-        result = await asyncio.to_thread(
-            dispatch_tts_chunks_to_backend,
-            "phone",
-            chunks,
-            rate=request.rate,
-        )
-        result = dict(result or {})
-    except Exception:
-        _update_tts_authoritative_state(
-            control={
-                "state": "error",
-                "last_action": "phone_test",
-                "speed": 1.0,
-                "source": "phone_test",
-                "updated_at": _now_iso(),
-            }
-        )
-        raise
-    terminal_state = "idle" if result.get("success") else "error"
-    _update_tts_authoritative_state(
-        control={
-            "state": terminal_state,
-            "last_action": "phone_test",
-            "speed": 1.0,
-            "source": "phone_test",
-            "updated_at": _now_iso(),
-        }
-    )
-    result["session_id"] = session_id
-    result["requested_backend"] = "phone"
-    result["router_bypassed"] = True
-    result["input_chunks"] = len(chunks)
-    await log_event(
-        "tts_phone_test",
-        device_id="phone",
-        details={
-            "success": bool(result.get("success")),
-            "playback_id": result.get("playback_id"),
-            "chunks": result.get("chunks"),
-            "input_chunks": len(chunks),
-            "playback_confirmed": result.get("playback_confirmed"),
-            "error": result.get("error"),
-            "reason": result.get("reason"),
-        },
-    )
-    return result
-
-
-@router.post("/api/tts/phone-test")
-async def api_tts_phone_test_route(request: TTSPhoneTestRequest, http_request: Request) -> dict:
-    return await api_tts_phone_test(request, http_request)
 
 
 @router.post("/api/tts/backend-error")
@@ -3881,8 +3178,6 @@ async def send_notification(request: NotifyRequest):
         banner=request.banner,
         voice=request.voice,
         instance_id=request.instance_id,
-        context=request.context,
-        enforcement=request.enforcement,
     )
 
 
@@ -3968,38 +3263,6 @@ async def promote_from_pause(request: Request, instance_id: str | None = None) -
 
     logger.info(f"Promoted {promoted} item(s) from pause to hot queue")
     return {"success": True, "promoted": promoted}
-
-
-@router.post("/api/tts/queue/play-item")
-async def play_queue_item(request: PlayQueueItemRequest) -> dict:
-    """Promote one exact queued TTS item to hot/front by stable item_key."""
-    item_key = (request.item_key or "").strip()
-    if not item_key:
-        return {
-            "success": False,
-            "promoted": 0,
-            "item_key": item_key,
-            "reason": "item_key_required",
-        }
-
-    async with tts_queue_lock:
-        for queue_name, queue in (("hot", hot_queue), ("pause", pause_queue)):
-            for item in list(queue):
-                if item.item_key != item_key:
-                    continue
-                queue.remove(item)
-                item.queue_target = "hot"
-                item.focus_on_playback = True
-                hot_queue.appendleft(item)
-                logger.info("play-item: promoted %s from %s to hot/front", item_key, queue_name)
-                return {
-                    "success": True,
-                    "promoted": 1,
-                    "item_key": item_key,
-                    "from_queue": queue_name,
-                }
-
-    return {"success": False, "promoted": 0, "item_key": item_key, "reason": "item_not_found"}
 
 
 @router.post("/api/tts/queue/play-all")

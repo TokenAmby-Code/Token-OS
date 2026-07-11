@@ -5,7 +5,7 @@ import {
   createVoiceTranscriptRouter,
   normalizeVoiceCommand,
   parseVoiceCommand,
-} from './voice-transcript-router.ts';
+} from './voice-transcript-router.js';
 
 function fakeClient(ops) {
   let seq = 0;

@@ -445,12 +445,10 @@ done
         seat against the rebuilt session (the same per-seat ``assert_instance``
         sweep the retired in-process loop ran, but executed *inside* the daemon
         so the daemon owns every persona respawn). Uses stdlib ``urllib`` (same
-        idiom as ``api.py``/``close.py``) and deliberately does not impose a
-        shorter client timeout: lifecycle reconcile is already bounded by the
-        daemon's pane operations, and a client-side ceiling can sever the
-        ledger/chrome transaction. Raises on transport failure or an ``ok=false``
-        envelope so the caller can fail loudly — if the daemon is down, restart
-        seating MUST NOT silently succeed.
+        idiom as ``api.py``/``close.py``); ``timeout=20`` because respawns return
+        fast while agent boot is async. Raises on transport failure or an
+        ``ok=false`` envelope so the caller can fail loudly — if the daemon is
+        down, restart seating MUST NOT silently succeed.
         """
         port = os.environ.get("TMUXCTLD_PORT", "7778")
         url = f"http://127.0.0.1:{port}/reconcile"
@@ -462,7 +460,7 @@ done
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 text = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")

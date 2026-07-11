@@ -38,13 +38,11 @@ FLUSH_COOLDOWN = 86400  # seconds — once per context window (24h effectively p
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 WARNING_CONTEXT_TOKEN_THRESHOLD = 100_000
 CRITICAL_CONTEXT_TOKEN_THRESHOLD = 150_000
-CODEX_FOOTER_CONTEXT_WINDOW_TOKENS = 258_000
 
 # ANSI colors for status line output
 RED = "\033[31m"
 YELLOW = "\033[33m"
 GREEN = "\033[32m"
-LIGHT_GREEN = "\033[92m"
 CYAN = "\033[36m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -172,26 +170,6 @@ def format_tokens(tokens):
     if tokens >= 1_000:
         return f"{tokens // 1_000}k"
     return str(tokens)
-
-
-def codex_footer_context_pct(used_tokens, window_tokens=CODEX_FOOTER_CONTEXT_WINDOW_TOKENS):
-    """Return Codex-style footer context percentage from used tokens.
-
-    Codex's footer reports context against its 258k-token window. Claude's
-    statusLine payload may expose a different model window, but the operator
-    footer intentionally uses the Codex denominator so mixed Claude/Codex panes
-    read the same way.
-    """
-    if used_tokens is None:
-        return "..."
-    try:
-        used = int(used_tokens)
-        window = int(window_tokens)
-    except (TypeError, ValueError):
-        return "..."
-    if window <= 0:
-        return "..."
-    return f"{round((used / window) * 100)}%"
 
 
 def context_color(used_tokens, pct=None):
@@ -410,6 +388,9 @@ def main():
     else:
         used_tokens = input_tokens + output_tokens
 
+    cost = data.get("cost", {})
+    cost_usd = cost.get("total_cost_usd")
+
     # Fetch instance data and TTS state from Token-API
     instance = get_instance_by_pane(pane_id)
     # Chapter/persona is the operator-facing identity. The chip colour is a hex
@@ -461,14 +442,17 @@ def main():
         check_pre_compact(pane_id, pct, total_tokens, planning_state)
 
     # --- 4. Output status line for Claude Code ---
-    cwd_display = cwd or "?"
-    context_display = codex_footer_context_pct(used_tokens)
+    color = context_color(used_tokens, pct=pct)
+    pressure = context_is_warning(used_tokens)
+    context_style = f"{BOLD}{color}" if pressure else color
+    token_style = context_style if pressure else DIM
+    pct_display = f"{pct}%" if pct is not None else "..."
+    cost_str = f" ${cost_usd:.2f}" if cost_usd is not None else ""
+    chapter_color = ansi_fg_from_hex(chip_color)
+    chapter_str = f" {chapter_color}{chapter}{RESET}" if chapter else ""
+    doc_str = f" {CYAN}{session_doc}{RESET}" if session_doc else ""
 
-    print(
-        f"{LIGHT_GREEN}{cwd_display}{RESET}"
-        f" • Context {context_display} used"
-        f" • {model_name}"
-    )
+    print(f"{context_style}{pct_display}{RESET} {token_style}{used_str}/{total_str}{RESET}{cost_str}{chapter_str}{doc_str}")
 
 
 if __name__ == "__main__":

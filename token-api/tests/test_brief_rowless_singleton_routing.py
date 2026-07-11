@@ -727,64 +727,6 @@ async def test_talk_rowless_live_codex_accepts_likely_ingestion(
 
 
 @pytest.mark.asyncio
-async def test_talk_keeps_await_open_for_deferred_delivery(
-    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """dispatch_deferred is a delivery state, not fatal send failure."""
-    main = app_env.main
-
-    async def _resolve(spec):
-        return {"council:custodes": "%10", "mechanicus:fabricator-general": "%44"}.get(spec)
-
-    async def _no_return(**_kwargs):
-        return None
-
-    async def _row(_pane):
-        return {"id": "fg-instance", "engine": "codex"}
-
-    async def _sender_is_custodes(_pane):
-        return True
-
-    registered = {}
-
-    async def _register(**kwargs):
-        registered.update(kwargs)
-        return {
-            "talk_id": "talk-deferred-1",
-            "target_instance_id": "fg-instance",
-        }
-
-    async def _send(_target, _payload, **_kwargs):
-        return {
-            "status": main.PANE_WRITE_PENDING,
-            "reason": "dispatch_deferred",
-            "queue_id": "queue-1",
-            "correlation_id": "talk-deferred-1",
-        }
-
-    monkeypatch.setattr(main.talk_service, "resolve_pane", _resolve)
-    monkeypatch.setattr(main.talk_service, "return_talk", _no_return)
-    monkeypatch.setattr(main.talk_service, "lookup_instance_for_pane", _row)
-    monkeypatch.setattr(main.talk_service, "register_talk", _register)
-    monkeypatch.setattr(main, "_pane_sender_is_custodes", _sender_is_custodes)
-    monkeypatch.setattr(main, "_talk_send_payload", _send)
-
-    result = await main.talk_send(
-        main.TalkSendRequest(
-            caller_pane="council:custodes",
-            target_pane="mechanicus:fabricator-general",
-            payload="deferred probe",
-        )
-    )
-
-    assert result["status"] == "open"
-    assert result["talk_id"] == "talk-deferred-1"
-    assert result["delivery"]["status"] == main.PANE_WRITE_PENDING
-    assert result["delivery"]["reason"] == "dispatch_deferred"
-    assert registered["target_instance"]["id"] == "fg-instance"
-
-
-@pytest.mark.asyncio
 async def test_talk_resolve_pane_accepts_unique_label_suffix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

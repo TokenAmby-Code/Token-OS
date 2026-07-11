@@ -724,42 +724,6 @@ async def _apply_persona_seat_name(
     return display_name
 
 
-async def _bind_instance_stamp(
-    *,
-    tmux_pane: str | None,
-    session_id: str | None,
-    wrapper_launch_id: str | None = None,
-    engine: str | None = None,
-    working_dir: str | None = None,
-    persona: str | None = None,
-    vacate_pane: str | None = None,
-) -> None:
-    """Hand the canonical instance id to tmuxctld to stamp on the pane (single-writer).
-
-    tmuxctld owns the durable ``@INSTANCE_ID`` write; SessionStart is the only place
-    the canonical ``instances`` row id is known, so token-api resolves it and delegates
-    the write through :func:`shared.tmuxctld_stamp_instance`. token-api NEVER authors a
-    raw ``set-option @INSTANCE_ID``. Best-effort: a down daemon must not fail
-    registration — wrapperstart/reconcile rebuild the ledger and the stamp lands on the
-    next fire. ``session_id`` is already the canonical row id at every SessionStart site
-    (fresh INSERT mints it; re-register/transplant reuse it; supplant re-keys onto it).
-    """
-    if not tmux_pane or not (session_id or "").strip():
-        return
-    try:
-        await shared.tmuxctld_stamp_instance(
-            instance_id=session_id,
-            pane=tmux_pane,
-            wrapper_id=wrapper_launch_id or None,
-            engine=engine or None,
-            working_dir=working_dir or None,
-            persona=persona or None,
-            vacate_pane=vacate_pane or None,
-        )
-    except Exception as exc:  # pragma: no cover - never fail registration on the stamp
-        logger.debug("Hook: @INSTANCE_ID stamp delegation failed for %s: %s", tmux_pane, exc)
-
-
 async def _session_start_effective_pane(
     tmux_pane: str | None,
     pane_label: str | None,
@@ -811,66 +775,6 @@ def _normalize_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _session_start_is_resume(payload: dict) -> bool:
-    raw = " ".join(
-        str(v or "")
-        for v in (
-            payload.get("source"),
-            payload.get("reason"),
-            payload.get("hook_event_name"),
-            payload.get("session_start_reason"),
-        )
-    ).lower()
-    return "resume" in raw
-
-
-def _transcript_tail_has_plan_mode_exit_sync(payload: dict, *, max_lines: int = 80) -> bool:
-    """Detect Claude's in-TUI/resume plan approval surface in recent JSONL.
-
-    The normal PermissionRequest/ExitPlanMode path is handled by
-    tmux-plan-approve-clear.  The regression path resumes with transcript records
-    containing ``plan_mode_exit`` and a ``SessionStart`` reason of ``resume``;
-    that path has already accepted the plan without going through the clear
-    approver.  Only inspect the recent tail so an old plan exit in a long resumed
-    transcript cannot arm a later ordinary resume.
-    """
-    inline_tail = _normalize_text(payload.get("transcript_tail"))
-    if inline_tail:
-        lines = inline_tail.splitlines()[-max_lines:]
-    else:
-        transcript_path = _normalize_text(payload.get("transcript_path"))
-        if not transcript_path:
-            return False
-        try:
-            path = Path(transcript_path).expanduser()
-            if not path.exists() or not path.is_file():
-                return False
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
-        except OSError:
-            return False
-
-    for line in reversed(lines):
-        if "SessionStart" in line and "clear" in line:
-            return False
-        if "SessionStart" in line and "resume" in line:
-            continue
-        if "plan_mode_exit" in line:
-            return True
-    return False
-
-
-async def _session_start_needs_plan_resume_clear(payload: dict) -> bool:
-    if not _session_start_is_resume(payload):
-        return False
-    return await asyncio.to_thread(_transcript_tail_has_plan_mode_exit_sync, payload)
-
-
-def _with_plan_resume_clear(response: dict, needs_clear: bool) -> dict:
-    if needs_clear:
-        response["plan_resume_clear_context"] = True
-    return response
 
 
 async def _name_has_official_provenance(
@@ -2700,7 +2604,6 @@ def _supplant_would_leak_singleton(
 
 async def handle_session_start(payload: dict) -> dict:
     """Handle SessionStart hook - register new Claude instance."""
-    plan_resume_needs_clear = await _session_start_needs_plan_resume_clear(payload)
     session_id = payload.get("session_id") or payload.get("conversation_id")
     if not session_id:
         session_id = f"claude-{int(time.time())}-{os.getpid()}"
@@ -3202,18 +3105,6 @@ async def handle_session_start(payload: dict) -> dict:
                 await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
                 )
-                # Single-writer identity stamp: hand the canonical row id to tmuxctld
-                # to stamp @INSTANCE_ID on the effective pane (guarded vacate of the
-                # old pane on a genuine move). token-api never writes the stamp itself.
-                await _bind_instance_stamp(
-                    tmux_pane=target_pane,
-                    session_id=session_id,
-                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
-                    engine=engine or existing_row["engine"],
-                    working_dir=working_dir,
-                    persona=primarch_name or dispatch_legion,
-                    vacate_pane=old_tmux_pane,
-                )
                 await _apply_instance_workflow_state(
                     db,
                     instance_id=session_id,
@@ -3368,17 +3259,6 @@ async def handle_session_start(payload: dict) -> dict:
                 await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
                 )
-                # Single-writer identity stamp (re-register / Codex resume): tmuxctld
-                # stamps @INSTANCE_ID on the effective pane, guarded-vacates the prior.
-                await _bind_instance_stamp(
-                    tmux_pane=tmux_pane or prior_pane,
-                    session_id=session_id,
-                    wrapper_launch_id=wrapper_launch_id or existing_row["wrapper_launch_id"],
-                    engine=engine or existing_row["engine"],
-                    working_dir=working_dir,
-                    persona=primarch_name or dispatch_legion,
-                    vacate_pane=prior_pane,
-                )
                 await db.commit()
                 auto_subscription = await _auto_subscribe_parent_on_start(
                     db,
@@ -3438,17 +3318,14 @@ async def handle_session_start(payload: dict) -> dict:
                         "was_status": existing_row["status"],
                     },
                 )
-                return _with_plan_resume_clear(
-                    {
-                        "success": True,
-                        "action": "reregistered",
-                        "instance_id": session_id,
-                        "stop_subscription": auto_subscription,
-                        "mechanicus_stop_subscription": mechanicus_subscription,
-                        "commander_stop_subscription": mechanicus_subscription,
-                    },
-                    plan_resume_needs_clear,
-                )
+                return {
+                    "success": True,
+                    "action": "reregistered",
+                    "instance_id": session_id,
+                    "stop_subscription": auto_subscription,
+                    "mechanicus_stop_subscription": mechanicus_subscription,
+                    "commander_stop_subscription": mechanicus_subscription,
+                }
 
         if supplant_id:
             # Fetch the old instance to preserve its config
@@ -3569,18 +3446,6 @@ async def handle_session_start(payload: dict) -> dict:
                 await _apply_persona_seat_name(
                     db, instance_id=session_id, persona_identity=persona_identity
                 )
-                # Single-writer identity stamp (supplant): the new session_id is
-                # stamped on the supplanted pane; the old id is guarded-vacated so the
-                # oracle never reports the defunct id on a moved-off pane.
-                await _bind_instance_stamp(
-                    tmux_pane=target_tmux_pane,
-                    session_id=session_id,
-                    wrapper_launch_id=wrapper_launch_id or old_inst["wrapper_launch_id"],
-                    engine=engine or old_inst["engine"],
-                    working_dir=working_dir,
-                    persona=primarch_name or dispatch_legion,
-                    vacate_pane=old_tmux_pane,
-                )
 
                 await _apply_commander_binding(
                     db,
@@ -3688,20 +3553,17 @@ async def handle_session_start(payload: dict) -> dict:
                         "source": supplant_source,
                     },
                 )
-                return _with_plan_resume_clear(
-                    {
-                        "success": True,
-                        "action": "supplanted",
-                        "instance_id": session_id,
-                        "supplanted_from": supplant_id,
-                        "persona": _persona_response_from_profile(prof, slug=preserved_profile),
-                        "session_doc_id": session_doc_id,
-                        "stop_subscription": auto_subscription,
-                        "mechanicus_stop_subscription": mechanicus_subscription,
-                        "commander_stop_subscription": mechanicus_subscription,
-                    },
-                    plan_resume_needs_clear,
-                )
+                return {
+                    "success": True,
+                    "action": "supplanted",
+                    "instance_id": session_id,
+                    "supplanted_from": supplant_id,
+                    "persona": _persona_response_from_profile(prof, slug=preserved_profile),
+                    "session_doc_id": session_doc_id,
+                    "stop_subscription": auto_subscription,
+                    "mechanicus_stop_subscription": mechanicus_subscription,
+                    "commander_stop_subscription": mechanicus_subscription,
+                }
 
         if singleton_incumbent_to_retire:
             retire_now = datetime.now().isoformat()
@@ -3896,16 +3758,6 @@ async def handle_session_start(payload: dict) -> dict:
         )
         await _apply_persona_seat_name(
             db, instance_id=session_id, persona_identity=persona_identity
-        )
-        # Single-writer identity stamp (fresh register): tmuxctld stamps @INSTANCE_ID
-        # on the freshly-minted row's pane. No prior pane to vacate.
-        await _bind_instance_stamp(
-            tmux_pane=tmux_pane,
-            session_id=session_id,
-            wrapper_launch_id=wrapper_launch_id,
-            engine=engine,
-            working_dir=working_dir,
-            persona=primarch_name or dispatch_legion,
         )
         # Auto-link primarch instance to its active session doc
         session_doc_id, resolved_session_doc_policy = await resolve_session_doc_for_start(
@@ -4143,19 +3995,16 @@ async def handle_session_start(payload: dict) -> dict:
         },
     )
 
-    return _with_plan_resume_clear(
-        {
-            "success": True,
-            "action": "registered",
-            "instance_id": session_id,
-            "persona": _persona_response_from_profile(profile) if not is_subagent else None,
-            "session_doc_id": session_doc_id,
-            "stop_subscription": auto_subscription,
-            "mechanicus_stop_subscription": mechanicus_subscription,
-            "commander_stop_subscription": mechanicus_subscription,
-        },
-        plan_resume_needs_clear,
-    )
+    return {
+        "success": True,
+        "action": "registered",
+        "instance_id": session_id,
+        "persona": _persona_response_from_profile(profile) if not is_subagent else None,
+        "session_doc_id": session_doc_id,
+        "stop_subscription": auto_subscription,
+        "mechanicus_stop_subscription": mechanicus_subscription,
+        "commander_stop_subscription": mechanicus_subscription,
+    }
 
 
 def _persona_response_from_profile(profile: dict | None, *, slug: str | None = None) -> dict | None:

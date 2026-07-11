@@ -49,8 +49,6 @@ def _no_live_tmux_guard(monkeypatch, tmp_path):
     monkeypatch.setenv("TMUXCTLD_WRAPPER_LEDGER_PATH", str(tmp_path / "wrapper-ledger.json"))
     monkeypatch.setenv("TMUXCTLD_CALLBACKS_PATH", str(tmp_path / "callbacks.json"))
     monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
-    monkeypatch.setenv("TMUXCTLD_TMUX_SOCKET_PATH", str(tmp_path / "tmux-scratch.sock"))
-    monkeypatch.setattr(daemon, "tmux_socket_connectable", lambda path=None: True)
     monkeypatch.setattr(daemon, "_PROMPT_SUBMIT_SNIFFER", daemon.PromptSubmitSniffer())
     monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
     monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
@@ -197,53 +195,6 @@ def test_server_signals_ready_event() -> None:
     server, _ = _serve(StubAdapter)
     try:
         assert server.ready.is_set()
-    finally:
-        server.shutdown()
-
-
-def test_default_tmux_socket_path_ignores_macos_tmpdir(monkeypatch) -> None:
-    monkeypatch.delenv("TMUXCTLD_TMUX_SOCKET_PATH", raising=False)
-    monkeypatch.delenv("TMUX_TMPDIR", raising=False)
-    monkeypatch.setenv("TMPDIR", "/var/folders/not-tmux")
-
-    assert str(daemon.tmux_socket_path()) == f"/tmp/tmux-{os.getuid()}/default"
-
-
-def test_health_reports_socket_failure_before_adapter_probe(monkeypatch) -> None:
-    calls = {"list_sessions": 0}
-
-    class Adapter(StubAdapter):
-        def list_sessions(self):
-            calls["list_sessions"] += 1
-            return []
-
-    monkeypatch.setattr(daemon, "tmux_socket_connectable", lambda path=None: False)
-    monkeypatch.setattr(daemon, "_live_fleet_tmux_server_pids", lambda session="main": [])
-    server, _ = _serve(Adapter)
-    try:
-        status, payload = _get(server, "/health")
-        assert status == 200
-        assert payload["tmux_reachable"] is False
-        assert payload["tmux_socket_state"] == "socket_missing"
-        assert payload["tmux_socket_recovery"] == "no_live_server_noop"
-        assert calls["list_sessions"] == 0
-    finally:
-        server.shutdown()
-
-
-def test_health_socket_loss_recovers_with_sigusr1_not_second_server(monkeypatch) -> None:
-    sent = []
-    monkeypatch.setattr(daemon, "tmux_socket_connectable", lambda path=None: False)
-    monkeypatch.setattr(daemon, "_live_fleet_tmux_server_pids", lambda session="main": [4242])
-    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: sent.append((pid, sig)))
-
-    server, _ = _serve(StubAdapter)
-    try:
-        status, payload = _get(server, "/health")
-        assert status == 200
-        assert payload["tmux_reachable"] is False
-        assert payload["tmux_socket_recovery"] == "sigusr1_rebind"
-        assert sent == [(4242, daemon.signal.SIGUSR1)]
     finally:
         server.shutdown()
 
@@ -1245,56 +1196,6 @@ def test_health_reasserts_lifecycle_hooks_throttled(monkeypatch) -> None:
         server.shutdown()
 
 
-def test_reassert_failure_shortens_retry_backoff(monkeypatch) -> None:
-    """A FAILED hook install must not hold the full throttle interval.
-
-    On a wedged/slow tmux server (the 2026-07-07 outage condition) ``set-hook``
-    times out and ``ensure_tmux_lifecycle_hooks`` returns ``{"ok": False}``. The
-    old code advanced the 60s throttle deadline BEFORE the attempt and ignored the
-    result, so a failed install stranded the global ``pane-died`` hook uninstalled
-    for a full minute — nothing self-heals in that window. A failed attempt must
-    instead pull the deadline in to the short retry window so the daemon retries on
-    its next heartbeat and re-installs the moment tmux recovers.
-    """
-    monkeypatch.setattr(
-        daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", _REAL_MAYBE_REASSERT
-    )
-    server, _ = _serve(StubAdapter)
-    try:
-        outcome = {"ok": False}
-        calls = []
-        monkeypatch.setattr(
-            daemon, "ensure_tmux_lifecycle_hooks", lambda: calls.append(1) or outcome
-        )
-        # First heartbeat attempts the install; it FAILS (wedged tmux).
-        now = time.monotonic()
-        assert server.maybe_reassert_lifecycle_hooks() is True
-        assert len(calls) == 1
-        # The deadline was pulled in to the retry window, NOT the full interval.
-        remaining = server._hook_reassert_deadline - now
-        assert remaining <= daemon._HOOK_REASSERT_RETRY_SECONDS + 0.5
-        assert remaining < daemon._HOOK_REASSERT_INTERVAL_SECONDS
-    finally:
-        server.shutdown()
-
-
-def test_reassert_success_holds_full_interval(monkeypatch) -> None:
-    """A SUCCESSFUL install keeps the full throttle — no needless re-install churn."""
-    monkeypatch.setattr(
-        daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", _REAL_MAYBE_REASSERT
-    )
-    server, _ = _serve(StubAdapter)
-    try:
-        monkeypatch.setattr(daemon, "ensure_tmux_lifecycle_hooks", lambda: {"ok": True})
-        now = time.monotonic()
-        assert server.maybe_reassert_lifecycle_hooks() is True
-        remaining = server._hook_reassert_deadline - now
-        # Held the full interval (well beyond the short retry window).
-        assert remaining > daemon._HOOK_REASSERT_RETRY_SECONDS
-    finally:
-        server.shutdown()
-
-
 def test_health_endpoint_rides_heartbeat_to_reassert_hooks(monkeypatch) -> None:
     monkeypatch.setattr(
         daemon.TmuxctldServer, "maybe_reassert_lifecycle_hooks", _REAL_MAYBE_REASSERT
@@ -2187,60 +2088,6 @@ def test_send_text_pending_turn_registers_one_late_hook_echo() -> None:
         server.shutdown()
 
 
-def test_hook_echo_queues_under_typing_guard_instead_of_direct_inject(monkeypatch) -> None:
-    SendAckAdapter.calls = []
-    server, _ = _serve(SendAckAdapter)
-    try:
-        status, payload = _post_timeout(
-            server,
-            "/send-text",
-            {
-                "pane": "%42",
-                "text": "do the thing",
-                "verify": True,
-                "verify_timeout": 0.01,
-                "ack_submit_retries": 0,
-                "submit_settle_seconds": 0,
-                "hook_echo_pane": "%99",
-                "correlation_id": "corr-guarded-echo",
-            },
-            timeout=5,
-        )
-        assert status == 200
-        result = payload["result"]
-
-        monkeypatch.setattr(
-            daemon.send_gate,
-            "evaluate",
-            lambda *a, **k: {
-                "suppressed": True,
-                "policy": "delay",
-                "reason": "typing_guard",
-                "target": "%99",
-            },
-        )
-        monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda pane: pane == "%99")
-        monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
-
-        _, ack = _post(
-            server,
-            "/hooks/user-prompt-submit",
-            {"pane": "%42", "prompt_hash": result["payload_hash"]},
-        )
-        echo = ack["result"]["hook_echoes"][0]
-        assert echo["status"] == "queued"
-        assert echo["delivery"]["queued"] is True
-        assert echo["delivery"]["reason"] == "typing_guard"
-        assert not [
-            c
-            for c in SendAckAdapter.calls
-            if c[:4] == ("send-keys", "-t", "%99", "-l")
-            and "correlation_id=corr-guarded-echo" in c[4]
-        ]
-    finally:
-        server.shutdown()
-
-
 def test_pending_hook_echo_survives_sniffer_rehydrate_and_server_restart(
     tmp_path, monkeypatch
 ) -> None:
@@ -3125,49 +2972,6 @@ def test_ambient_cancel_policy_still_enqueues_typing_guard_by_default(monkeypatc
         assert payload["ok"] is True
         assert payload["result"]["status"] == "queued"
         assert daemon._DEFERRED_SEND_QUEUE.size() == 1
-    finally:
-        server.shutdown()
-
-
-def test_deferred_send_queue_load_does_not_auto_drain_on_daemon_boot(monkeypatch) -> None:
-    """A daemon kickstart is not a guard-clear edge for persisted sends.
-
-    Regression: startup loaded the durable deferred-send queue and immediately
-    scheduled drains for every physical pane. If the restart window lost or had
-    not rehydrated the pane-local HUMAN/PENDING guard, a parked report could be
-    replayed into an active human composer and submitted by the replay Enter.
-    """
-    path = pathlib.Path(os.environ["TMUXCTLD_DEFERRED_SENDS_PATH"])
-    path.write_text(
-        json.dumps(
-            {
-                "version": daemon.DEFERRED_SENDS_VERSION,
-                "updated_epoch": time.time(),
-                "seq": 1,
-                "items": [
-                    {
-                        "id": "parked-report",
-                        "seq": 1,
-                        "route": "/send-text",
-                        "pane": "%42",
-                        "phys_pane": "%42",
-                        "params": {"pane": "%42", "text": "do not replay on boot"},
-                        "queued_at": time.time(),
-                        "ttl_seconds": None,
-                        "gate": {"reason": "typing_guard"},
-                    }
-                ],
-            }
-        )
-        + "\n"
-    )
-    scheduled: list[str] = []
-    monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda pane: scheduled.append(pane))
-
-    server, _ = _serve(SendAckAdapter)
-    try:
-        assert daemon._DEFERRED_SEND_QUEUE.size() == 1
-        assert scheduled == []
     finally:
         server.shutdown()
 

@@ -7,8 +7,8 @@
 // never invoke `player.play()` mid-line.
 //
 // This lives in its own file (not voice.test.js) because it module-mocks
-// '@discordjs/voice' and must import voice.ts FRESH, after the mock is installed —
-// voice.test.js statically imports voice.ts, which would bind the real deps first.
+// '@discordjs/voice' and must import voice.js FRESH, after the mock is installed —
+// voice.test.js statically imports voice.js, which would bind the real deps first.
 // Requires the runner flag `--experimental-test-module-mocks` (set in package.json).
 
 import { test, mock } from 'node:test';
@@ -82,12 +82,12 @@ function makeReadyConnection() {
   };
 }
 
-// Each test imports voice.ts under a unique query so it re-evaluates against its
+// Each test imports voice.js under a unique query so it re-evaluates against its
 // own active mock — ESM caches modules by resolved URL, so two tests sharing
-// './voice.ts' would otherwise both bind the first test's fake player.
+// './voice.js' would otherwise both bind the first test's fake player.
 async function loadVoiceManager(player, tag) {
   mock.module('@discordjs/voice', fakeDiscordVoiceExports(player, makeReadyConnection()));
-  const { createVoiceManager } = await import(`./voice.ts?case=${tag}`);
+  const { createVoiceManager } = await import(`./voice.js?case=${tag}`);
   const vm = createVoiceManager(
     { mechanicus: fakeBotClient() },
     { guild_id: 'g', operator_user_id: 'op', voice_channels: { mechanicus: 'vc' } },

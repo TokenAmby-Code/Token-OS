@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createRealtimeTranscriber } from './realtime-transcriber.ts';
+import { createRealtimeTranscriber } from './realtime-transcriber.js';
 
 class FakeWebSocket extends EventEmitter {
   static instances = [];

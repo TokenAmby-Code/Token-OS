@@ -74,7 +74,7 @@ def test_deprecated_public_aliases_rejected(target: str):
         resolve_pane_in_snapshot(workspace(), target)
 
 
-def test_duplicate_public_roles_fail_loud() -> None:
+def test_duplicate_public_roles_fail_loud():
     # Formerly first-writer-wins; that silent tie-break is how a
     # council:custodes-addressed report landed in council:malcador. Duplicate
     # public roles are an ambiguous address and must refuse resolution.

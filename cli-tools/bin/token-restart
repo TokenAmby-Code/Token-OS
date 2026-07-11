@@ -360,7 +360,6 @@ DEPLOY_REDEPLOY_MAX=3
 # no-advance → full-restart fallback (a trailing run that finds nothing new must
 # no-op, not bounce every service).
 DEPLOY_COALESCE_TRAILING=false
-SIDECAR_DEGRADED=()
 
 # PID recorded in the lockdir owner file ("<pid> <sha>"), or empty/unreadable.
 deploy_lock_owner_pid() {
@@ -503,7 +502,6 @@ _reset_deploy_run_state() {
     RESTART_WSL=false
     REFRESH_WSL=false
     RESTART_MOBILE=false
-    SIDECAR_DEGRADED=()
 }
 
 # Serialize full_restart under the deploy mutex with trailing coalescing. If a
@@ -519,9 +517,7 @@ run_coalesced_deploy() {
     [[ -n "$target" ]] || \
         target="$(git --git-dir="$TOKEN_OS_BARE_REPO" rev-parse -q --verify refs/heads/main 2>/dev/null || true)"
 
-    if [[ "${TOKEN_RESTART_ADOPT_LOCK:-}" == "1" && "$(deploy_lock_owner_pid 2>/dev/null || true)" == "$$" ]]; then
-        DEPLOY_LOCK_HELD=true
-    elif ! deploy_lock_acquire "$target"; then
+    if ! deploy_lock_acquire "$target"; then
         return 0
     fi
 
@@ -545,13 +541,6 @@ run_coalesced_deploy() {
     local iter=0
     while true; do
         while [[ -f "$DEPLOY_LOCKDIR/redeploy-pending" && "$iter" -lt "$DEPLOY_REDEPLOY_MAX" ]]; do
-            if [[ "${TOKEN_RESTART_REEXECED_TRAILING:-}" != "1" ]]; then
-                echo ""
-                echo -e "${BLUE}→${NC} deploy: trailing re-sync queued — re-execing current token-restart before adopting newest deploy logic"
-                export TOKEN_RESTART_ADOPT_LOCK=1
-                export TOKEN_RESTART_REEXECED_TRAILING=1
-                exec "$0" --sync
-            fi
             rm -f "$DEPLOY_LOCKDIR/redeploy-pending" 2>/dev/null || true
             iter=$((iter + 1))
             echo ""
@@ -719,7 +708,7 @@ ops_refresh_needed_for_paths() {
     while IFS= read -r path; do
         [[ -n "$path" ]] || continue
         case "$path" in
-            token-api/web/ops/* | token-api/web/contracts/* | token-api/ui/ops/*) return 0 ;;
+            token-api/web/ops/* | token-api/ui/ops/*) return 0 ;;
         esac
     done <<< "$changed_paths"
     return 1
@@ -736,97 +725,12 @@ refresh_ops_bundle_unlocked() {
         return 1
     fi
 
-    # The shared contracts package is a TS-source file: dep — Vite resolves its
-    # imports (zod) from the package's REAL path, so its node_modules must be
-    # populated before the ops build or the bundle refresh fails.
-    local contracts_dir="${dir}/token-api/web/contracts"
-    if [[ -d "$contracts_dir" ]]; then
-        echo -e "${BLUE}→${NC} CD-sync: installing shared contracts deps..."
-        if ! (cd "$contracts_dir" && npm ci --no-audit --no-fund); then
-            echo -e "  ${RED}✗${NC} CD-sync: contracts npm ci failed; aborting before Token-API restart"
-            return 1
-        fi
-    fi
-
     echo -e "${BLUE}→${NC} CD-sync: refreshing ops cockpit bundle..."
     if (cd "$web_dir" && npm ci --no-audit --no-fund && npm run build); then
         echo -e "  ${GREEN}✓${NC} CD-sync: ops cockpit bundle refreshed"
         return 0
     fi
     echo -e "  ${RED}✗${NC} CD-sync: ops cockpit bundle refresh failed; aborting before Token-API restart"
-    return 1
-}
-
-discord_deps_refresh_needed_for_paths() {
-    local changed_paths="$1" path
-    while IFS= read -r path; do
-        [[ -n "$path" ]] || continue
-        case "$path" in
-            # Dependency manifests only — daemon code changes don't need an
-            # install. Contracts changes count: the daemon consumes
-            # @token-os/contracts via a file: dep and resolves zod through the
-            # contracts package's real path.
-            discord-daemon/package.json | discord-daemon/package-lock.json | token-api/web/contracts/*) return 0 ;;
-        esac
-    done <<< "$changed_paths"
-    return 1
-}
-
-refresh_discord_daemon_deps_unlocked() {
-    # The daemon's node_modules was hand-managed historically; with the daemon
-    # on @token-os/contracts (+ zod) a dependency change that lands WITHOUT an
-    # install is a guaranteed crash-loop on stale deps. Fail the deploy loudly
-    # instead — a dead deploy is recoverable, a crash-looping daemon is not.
-    local dir="$1" daemon_dir="${dir}/discord-daemon"
-    if ! command -v npm >/dev/null 2>&1; then
-        echo -e "  ${RED}✗${NC} CD-sync: discord-daemon deps refresh required but npm is not available"
-        return 1
-    fi
-    [[ -d "$daemon_dir" ]] || return 0
-
-    # The daemon resolves zod through the contracts package's real path, so the
-    # contracts install must exist even when the ops refresh didn't run this
-    # deploy (idempotent if it did).
-    local contracts_dir="${dir}/token-api/web/contracts"
-    if [[ -d "$contracts_dir" ]]; then
-        echo -e "${BLUE}→${NC} CD-sync: installing shared contracts deps (daemon consumer)..."
-        if ! (cd "$contracts_dir" && npm ci --no-audit --no-fund); then
-            echo -e "  ${RED}✗${NC} CD-sync: contracts npm ci failed"
-            return 1
-        fi
-    fi
-
-    # The daemon's node_modules is git-excluded, so the deploy's git-aware
-    # write-unlock never touches it (2026-07-08 incident: PR #640's deploy
-    # aborted mid-restart and crash-looped the daemon). Three sharp edges:
-    #   1. node_modules may be a LEGACY SYMLINK to the external hand-managed
-    #      tree (~/discord-daemon-modules, the Jun-11 NAS-era arrangement);
-    #   2. macOS chflags/chmod -R do NOT follow a symlink operand, so the
-    #      unlock must target the RESOLVED path;
-    #   3. the daemon dir itself is write-guarded, and npm must be able to
-    #      replace the symlink with a real in-place directory.
-    # Unlock all three, then drop the legacy symlink — npm ci owns the tree
-    # from here on.
-    chflags nouchg "$daemon_dir" 2>/dev/null || true
-    chmod u+w "$daemon_dir" 2>/dev/null || true
-    if [[ -e "${daemon_dir}/node_modules" || -L "${daemon_dir}/node_modules" ]]; then
-        local nm_real=""
-        nm_real="$(cd "${daemon_dir}/node_modules" 2>/dev/null && pwd -P)" || nm_real=""
-        if [[ -n "$nm_real" && -d "$nm_real" ]]; then
-            chflags -R nouchg "$nm_real" 2>/dev/null || true
-            chmod -R u+w "$nm_real" 2>/dev/null || true
-        fi
-        if [[ -L "${daemon_dir}/node_modules" ]]; then
-            rm -f "${daemon_dir}/node_modules" 2>/dev/null || true
-        fi
-    fi
-
-    echo -e "${BLUE}→${NC} CD-sync: installing discord-daemon deps..."
-    if (cd "$daemon_dir" && npm ci --no-audit --no-fund); then
-        echo -e "  ${GREEN}✓${NC} CD-sync: discord-daemon deps installed"
-        return 0
-    fi
-    echo -e "  ${RED}✗${NC} CD-sync: discord-daemon npm ci failed"
     return 1
 }
 
@@ -1039,17 +943,7 @@ _sync_live_checkout_unlocked() {
 
     if [[ "$ops_bundle_dirt" == true ]] || ops_refresh_needed_for_paths "$changed_paths"; then
         SYNC_OPS_REFRESH_REQUIRED=true
-        if ! refresh_ops_bundle_unlocked "$dir"; then
-            SIDECAR_DEGRADED+=("ops-cockpit-bundle-refresh")
-            echo -e "  ${YELLOW}⚠${NC} CD-sync: ops cockpit bundle refresh failed; degrading and continuing to Token-API restart"
-        fi
-    fi
-
-    if discord_deps_refresh_needed_for_paths "$changed_paths"; then
-        if ! refresh_discord_daemon_deps_unlocked "$dir"; then
-            SIDECAR_DEGRADED+=("discord-daemon-deps-refresh")
-            echo -e "  ${YELLOW}⚠${NC} CD-sync: discord-daemon deps refresh failed; degrading and continuing to Token-API restart"
-        fi
+        refresh_ops_bundle_unlocked "$dir" || return 1
     fi
 
     SYNC_DID_ADVANCE=true
@@ -1837,15 +1731,6 @@ map_changed_to_services() {
             discord-daemon/*)
                 RESTART_DISCORD=true
                 ;;
-            token-api/web/contracts/*)
-                # Shared contracts feed the ops bundle (rebuilt above — restart
-                # token-api/ops so the build-id bump reloads browsers) and, from
-                # PR C, the discord daemon — bounce it so a contract change never
-                # leaves a stale in-memory schema.
-                RESTART_OPS=true
-                RESTART_TOKENAPI=true
-                RESTART_DISCORD=true
-                ;;
             mobile/*)
                 RESTART_MOBILE=true
                 ;;
@@ -2043,9 +1928,6 @@ full_restart() {
     if [[ "$RESTART_MOBILE" == true ]]; then
         echo -e "  Mobile:  ${GREEN}●${NC} push-mobile dispatched"
     fi
-    if (( ${#SIDECAR_DEGRADED[@]} > 0 )); then
-        echo -e "  Sidecars:${YELLOW}⚠${NC} degraded (${SIDECAR_DEGRADED[*]})"
-    fi
 }
 
 # ============ Parse Arguments ============
@@ -2076,7 +1958,6 @@ TMUXCTLD_PLIST_CHANGED=false
 RESTART_WSL=false
 REFRESH_WSL=false
 RESTART_MOBILE=false
-SIDECAR_DEGRADED=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
