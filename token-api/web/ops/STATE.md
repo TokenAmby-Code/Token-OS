@@ -127,6 +127,22 @@ must stay pixel-identical.
 ]
 ```
 
+
+### Resize/scaling note — 2026-07-09
+
+Future cockpit resize/scaling reports should start from the cockpit's own
+viewport path:
+
+- The cockpit derives layout from `document.documentElement.clientWidth` /
+  `clientHeight` and the `uiScale` pipeline.
+- The `Scale floor` knob persists in the browser profile through the
+  `localStorage` key family `ops-mock:*`.
+- Same-profile reloads should preserve those keys; if sizing appears to reset,
+  verify the active browser profile, viewport dimensions, and stored scale keys
+  before changing layout code.
+- Phone-vs-desktop cockpit tuning should be handled as explicit viewport/device
+  classes if it returns, not as global hard-coded dimensions.
+
 ## Open threads / next steps
 
 0. **Mobile display tuning (ACTIVE)** — `uiScale` makes the cluster fit the phone,
