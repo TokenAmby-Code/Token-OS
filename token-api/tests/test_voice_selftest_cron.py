@@ -10,6 +10,8 @@ import asyncio
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 
 class _FakeResponse:
     def __init__(self, status_code=200, payload=None):
@@ -47,7 +49,7 @@ def _fake_client_class(calls, response=None, exc=None):
     return FakeClient
 
 
-def _capture_log_event(monkeypatch, main):
+def _capture_log_event(monkeypatch: pytest.MonkeyPatch, main):
     logged = []
 
     async def fake_log_event(event_type, instance_id=None, details=None):
@@ -63,7 +65,9 @@ def test_voice_selftest_task_registered(app_env: SimpleNamespace) -> None:
     assert callable(main.TASK_REGISTRY["voice_selftest_morning"])
 
 
-def test_voice_selftest_task_posts_full_variant(app_env: SimpleNamespace, monkeypatch) -> None:
+def test_voice_selftest_task_posts_full_variant(
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     main = sys.modules["main"]
     calls = {}
     response = _FakeResponse(payload={"overall": "pass", "probe_id": "probe-1"})
@@ -79,7 +83,7 @@ def test_voice_selftest_task_posts_full_variant(app_env: SimpleNamespace, monkey
 
 
 def test_voice_selftest_task_records_non_2xx_as_failure(
-    app_env: SimpleNamespace, monkeypatch
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     main = sys.modules["main"]
     calls = {}
@@ -92,11 +96,13 @@ def test_voice_selftest_task_records_non_2xx_as_failure(
     assert result == {"error": "HTTP 409", "status_code": 409}
     assert logged and logged[0]["event_type"] == "voice_selftest"
     assert logged[0]["details"]["overall"] == "fail"
+    assert logged[0]["details"]["error"] == "HTTP 409"
+    assert logged[0]["details"]["trigger"] == "cron"
     assert logged[0]["details"]["detail"] == {"errorCode": "probe_in_progress"}
 
 
 def test_voice_selftest_task_records_daemon_down_as_failure(
-    app_env: SimpleNamespace, monkeypatch
+    app_env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     main = sys.modules["main"]
     calls = {}
@@ -107,6 +113,8 @@ def test_voice_selftest_task_records_daemon_down_as_failure(
 
     result = asyncio.run(main.run_morning_voice_selftest())
 
-    assert "error" in result
+    assert result["error"] == "daemon down"
     assert logged and logged[0]["event_type"] == "voice_selftest"
     assert logged[0]["details"]["overall"] == "fail"
+    assert logged[0]["details"]["error"] == "daemon down"
+    assert logged[0]["details"]["trigger"] == "cron"
