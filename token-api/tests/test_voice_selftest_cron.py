@@ -8,14 +8,17 @@ so the cron result is just a fired/failed record.
 
 import asyncio
 import sys
+from types import SimpleNamespace
 
 
 class _FakeResponse:
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
         self.is_success = 200 <= status_code < 300
-        self._payload = payload or {}
-        self.content = b"{}" if self._payload is not None else b""
+        # Preserve an explicit None payload: production reads `resp.content`
+        # before json(), so None models the empty-response branch.
+        self._payload = payload
+        self.content = b"" if payload is None else b"{}"
 
     def json(self):
         return self._payload
@@ -54,13 +57,13 @@ def _capture_log_event(monkeypatch, main):
     return logged
 
 
-def test_voice_selftest_task_registered(app_env):
+def test_voice_selftest_task_registered(app_env: SimpleNamespace) -> None:
     main = sys.modules["main"]
     assert "voice_selftest_morning" in main.TASK_REGISTRY
     assert callable(main.TASK_REGISTRY["voice_selftest_morning"])
 
 
-def test_voice_selftest_task_posts_full_variant(app_env, monkeypatch):
+def test_voice_selftest_task_posts_full_variant(app_env: SimpleNamespace, monkeypatch) -> None:
     main = sys.modules["main"]
     calls = {}
     response = _FakeResponse(payload={"overall": "pass", "probe_id": "probe-1"})
@@ -75,7 +78,9 @@ def test_voice_selftest_task_posts_full_variant(app_env, monkeypatch):
     assert result["overall"] == "pass"
 
 
-def test_voice_selftest_task_records_non_2xx_as_failure(app_env, monkeypatch):
+def test_voice_selftest_task_records_non_2xx_as_failure(
+    app_env: SimpleNamespace, monkeypatch
+) -> None:
     main = sys.modules["main"]
     calls = {}
     response = _FakeResponse(status_code=409, payload={"errorCode": "probe_in_progress"})
@@ -90,7 +95,9 @@ def test_voice_selftest_task_records_non_2xx_as_failure(app_env, monkeypatch):
     assert logged[0]["details"]["detail"] == {"errorCode": "probe_in_progress"}
 
 
-def test_voice_selftest_task_records_daemon_down_as_failure(app_env, monkeypatch):
+def test_voice_selftest_task_records_daemon_down_as_failure(
+    app_env: SimpleNamespace, monkeypatch
+) -> None:
     main = sys.modules["main"]
     calls = {}
     monkeypatch.setattr(
