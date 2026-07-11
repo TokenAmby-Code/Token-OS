@@ -22,6 +22,7 @@ def test_voice_selftest_task_posts_full_variant(app_env, monkeypatch):
 
     class FakeResponse:
         status_code = 200
+        is_success = True
         content = b"{}"
 
         def json(self):
@@ -51,6 +52,46 @@ def test_voice_selftest_task_posts_full_variant(app_env, monkeypatch):
     # Client timeout must outlast the probe's own 60s hard deadline.
     assert calls["timeout"] > 60
     assert result["overall"] == "pass"
+
+
+def test_voice_selftest_task_records_non_2xx_as_failure(app_env, monkeypatch):
+    main = sys.modules["main"]
+
+    class BusyResponse:
+        status_code = 409
+        is_success = False
+        content = b"{}"
+
+        def json(self):
+            return {"errorCode": "probe_in_progress"}
+
+    class BusyClient:
+        def __init__(self, timeout=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            return BusyResponse()
+
+    logged = []
+
+    async def fake_log_event(event_type, instance_id=None, details=None):
+        logged.append({"event_type": event_type, "details": details})
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", BusyClient)
+    monkeypatch.setattr(main, "log_event", fake_log_event)
+
+    result = asyncio.run(main.run_morning_voice_selftest())
+
+    assert result == {"error": "HTTP 409", "status_code": 409}
+    assert logged and logged[0]["event_type"] == "voice_selftest"
+    assert logged[0]["details"]["overall"] == "fail"
+    assert logged[0]["details"]["detail"] == {"errorCode": "probe_in_progress"}
 
 
 def test_voice_selftest_task_records_daemon_down_as_failure(app_env, monkeypatch):

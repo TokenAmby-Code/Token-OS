@@ -2096,6 +2096,20 @@ async def run_morning_voice_selftest() -> dict:
                 json={"variant": "full", "trigger": "cron"},
             )
         payload = resp.json() if resp.content else {}
+        if not resp.is_success:
+            # A non-2xx from the daemon (409 probe_in_progress, 5xx) means the
+            # probe did not run to a report — the daemon logged nothing, so
+            # record the failure event here.
+            await log_event(
+                "voice_selftest",
+                details={
+                    "overall": "fail",
+                    "error": f"HTTP {resp.status_code}",
+                    "trigger": "cron",
+                    "detail": payload,
+                },
+            )
+            return {"error": f"HTTP {resp.status_code}", "status_code": resp.status_code}
         return {
             "status_code": resp.status_code,
             "overall": payload.get("overall"),

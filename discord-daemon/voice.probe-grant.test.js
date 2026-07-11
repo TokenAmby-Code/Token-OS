@@ -95,15 +95,20 @@ test('bot userId is still ignored without a grant; granted probe speaker subscri
 test('grant TTL-expires on its own without a revoke (fail-closed)', async () => {
   const { vm, speak } = await loadManager('grant-ttl');
 
+  // Minimum-TTL grant from a "crashed" probe that never revokes: the grant
+  // must expire on its own and the filter must fail closed afterwards.
   vm.allowProbeSpeaker('probe-crashed', 'inq-bot', 1_000);
-  await new Promise((r) => setTimeout(r, 30));
-  // Grant TTLs are clamped to >=1s live; simulate expiry by issuing a
-  // zero-remaining grant via revoke-free expiry: re-grant with minimum TTL and
-  // wait past it is too slow for a unit test, so assert the clamp floor and
-  // the read-time expiry path with a manipulated grant instead.
   speak('inq-bot');
   await tick();
   assert.equal(vm.getStatus('mechanicus').activeListeners, 1, 'grant active within TTL');
+
+  vm.stopListening('mechanicus');
+  vm.startListening('mechanicus');
+  await new Promise((r) => setTimeout(r, 1_100));
+
+  speak('inq-bot');
+  await tick();
+  assert.equal(vm.getStatus('mechanicus').activeListeners, 0, 'expired grant fails closed without a revoke');
 
   mock.reset();
 });

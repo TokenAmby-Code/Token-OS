@@ -91,6 +91,7 @@ export function createVoiceSelftest({
   abortGraceMs = 2_000,
   openaiTimeoutMs = 10_000,
   transcriptTimeoutMs = 20_000,
+  playAudioTimeoutMs = 15_000,
   audioLoopAttempts = 2,
   alertDedupeMs = 60 * 60_000,
   probeGrantTtlMs = 90_000,
@@ -295,6 +296,29 @@ export function createVoiceSelftest({
     return `joined ${probeChannelId} (speaker=${speakerBot}, listener=${listenerBot})`;
   }
 
+  // Bound an external call (Discord join/play) with both the probe abort
+  // signal and its own timeout, so a wedged dependency can never hold the
+  // runner past cleanup — the stage fails typed and runFull unwinds normally.
+  function raceStageCall(ctx, promise, timeoutMs, errorCode, what) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn(value);
+      };
+      const timer = setTimeout(() => {
+        finish(reject, stageError(errorCode, `${what} did not complete within ${timeoutMs}ms`));
+      }, timeoutMs);
+      ctx.abortWaiters.push(() => finish(reject, stageError('aborted', ctx.abortReason || 'aborted')));
+      Promise.resolve(promise).then(
+        (value) => finish(resolve, value),
+        (err) => finish(reject, err),
+      );
+    });
+  }
+
   function waitForTranscript(ctx) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -314,7 +338,13 @@ export function createVoiceSelftest({
     for (let attempt = 1; attempt <= audioLoopAttempts; attempt++) {
       if (ctx.aborted) throw stageError('aborted', ctx.abortReason || 'aborted');
       const wait = waitForTranscript(ctx);
-      await voiceManager.playAudio(fixturePath, speakerBot);
+      await raceStageCall(
+        ctx,
+        voiceManager.playAudio(fixturePath, speakerBot),
+        playAudioTimeoutMs,
+        'play_timeout',
+        `playAudio(${speakerBot})`,
+      );
       const text = await wait;
       if (ctx.aborted) throw stageError('aborted', ctx.abortReason || 'aborted');
       if (text === null) {
@@ -421,8 +451,8 @@ export function createVoiceSelftest({
       if (ctx.aborted || gate?.ok === false) return;
       const join = await runStage(ctx, 'voice_join', 'fail', () => stageVoiceJoin(ctx));
       if (ctx.aborted || join?.ok === false) return;
-      await runStage(ctx, 'audio_loop', 'fail', () => stageAudioLoop(ctx));
-      if (ctx.aborted) return;
+      const audio = await runStage(ctx, 'audio_loop', 'fail', () => stageAudioLoop(ctx));
+      if (ctx.aborted || audio?.ok === false) return;
       await runStage(ctx, 'tmuxctld_session', 'fail', () => stageTmuxctldSession(ctx));
     } finally {
       await runCleanup(ctx);

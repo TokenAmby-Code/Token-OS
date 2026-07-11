@@ -270,10 +270,18 @@ test('wrong phrase fails the audio loop with transcript_mismatch', async () => {
 
   const report = await selftest.run({ variant: 'full' });
   assert.equal(report.overall, 'fail');
+  assert.deepEqual(
+    report.stages.map(s => s.stage),
+    ['operator_gate', 'voice_join', 'audio_loop', 'cleanup'],
+    'audio failure skips tmuxctld_session but still cleans up',
+  );
   const stage = report.stages.find(s => s.stage === 'audio_loop');
   assert.equal(stage.errorCode, 'transcript_mismatch');
   assert.equal(report.transcript_match.matched, false);
-  assert.ok(report.stages.find(s => s.stage === 'cleanup'), 'cleanup still runs');
+  assert.ok(
+    !fakes.tmuxctld.calls.some(c => c[0] === 'start'),
+    'no tmuxctld session is started after the audio loop fails',
+  );
   assertNoErrorLogs(logs);
 });
 
