@@ -121,21 +121,23 @@ def test_discord_voice_still_preempts(monkeypatch: pytest.MonkeyPatch) -> None:
     assert routing["discord_bot"] == "custodes-bot"
 
 
-def test_discord_failure_reports_error_without_backend_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_discord_failure_falls_forward_to_wsl(monkeypatch: pytest.MonkeyPatch) -> None:
     tts = _load_tts()
-    _patch_world(tts, monkeypatch, phone_reachable=True, discord_bot="custodes-bot")
+    _patch_world(
+        tts, monkeypatch, phone_reachable=True, satellite_healthy=True, discord_bot="custodes-bot"
+    )
+    attempted = []
     monkeypatch.setattr(
         tts,
         "speak_tts_discord",
         lambda *a, **k: {"success": False, "error": "discord_voice_not_played"},
     )
-    monkeypatch.setattr(
-        tts,
-        "dispatch_tts_chunks_to_backend",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("backend fallback must not run")),
-    )
+
+    def fake_dispatch(device, *args, **kwargs):
+        attempted.append(device)
+        return {"success": True, "method": device}
+
+    monkeypatch.setattr(tts, "dispatch_tts_chunks_to_backend", fake_dispatch)
     monkeypatch.setattr(
         tts,
         "speak_tts_mac",
@@ -144,9 +146,11 @@ def test_discord_failure_reports_error_without_backend_fallback(
 
     result = tts.speak_tts("discord failure")
 
-    assert result["success"] is False
+    assert result["success"] is True
     assert result["requested_device"] == "discord"
-    assert result["route"] is None
+    assert result["route"] == "wsl"
+    assert result["fallback_from"] == "discord"
+    assert attempted == ["wsl"]
 
 
 def test_phone_failure_reports_error_without_mac_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -159,6 +163,8 @@ def test_phone_failure_reports_error_without_mac_fallback(monkeypatch: pytest.Mo
     monkeypatch.setattr(
         tts, "_send_to_phone", lambda *a, **k: {"success": False, "error": "phone_down"}
     )
+    monkeypatch.setattr(tts, "is_phone_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(tts, "is_satellite_tts_available", lambda *a, **k: False)
     monkeypatch.setattr(tts, "PHONE_PLAYBACK_WATCHDOG_S", 0.01)
     monkeypatch.setattr(tts, "_mac_tts_available", lambda: True)
     monkeypatch.setattr(
