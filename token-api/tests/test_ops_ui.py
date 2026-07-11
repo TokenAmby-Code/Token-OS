@@ -659,7 +659,7 @@ def test_ops_status_tmuxctld_health_unavailable_degrades_without_crash(client) -
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["sources"]["tmuxctld"]["status"] == "warn"
+    assert body["sources"]["tmuxctld"]["status"] == "bad"
     assert body["sources"]["tmuxctld"]["available"] is False
     assert body["tmux"]["reachable"] is False
     assert body["tmux"]["tmux_reachable"] is None
@@ -1362,6 +1362,28 @@ def test_ops_tmux_occupancy_counts_unknown_and_malformed_payloads(app_env) -> No
     ]
 
 
+def test_ops_tmux_occupancy_parses_result_rows_and_skips_closed(app_env) -> None:
+    generated_at = app_env.main.datetime.fromisoformat("2026-07-09T10:00:00+00:00")
+    occ = app_env.main._ops_build_tmux_occupancy(
+        generated_at,
+        {"reachable": True},
+        {
+            "result": {
+                "rows": [
+                    {"pane_positional_id": "somnium:N", "instance_id": "i1"},
+                    {"pane_positional_id": "somnium:S", "state": "CLOSED", "instance_id": "old"},
+                ]
+            }
+        },
+        {"result": []},
+    )
+
+    assert occ["status"] == "ok"
+    assert occ["total"] == 1
+    assert occ["occupied"] == 1
+    assert occ["cells"][0]["pane_positional_id"] == "somnium:N"
+
+
 def test_ops_tmux_cell_state_unknown_fallback(app_env) -> None:
     assert (
         app_env.main._ops_tmux_cell_state({"pane_positional_id": "somnium:W"}, set()) == "unknown"
@@ -1383,4 +1405,4 @@ def test_ops_state_tmux_occupancy_unavailable(client, app_env, monkeypatch) -> N
     body = client.get("/api/ui/ops/state").json()
     assert body["tmux"]["occupancy"]["status"] == "bad"
     assert body["tmux"]["occupancy"]["errors"] == ["boom"]
-    assert body["sources"]["tmuxctld"]["status"] == "warn"
+    assert body["sources"]["tmuxctld"]["status"] == "bad"

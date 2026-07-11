@@ -4,7 +4,6 @@ import {
   balanceMinutes,
   buildDials,
   LEMON_RESIDENT_PERSONAS,
-  OCCUPANCY_COMPASS_FALLBACK_STARS,
   occupancyCompassStars,
   mapMode,
   nowClock,
@@ -800,7 +799,6 @@ function Dial({
       // Override hooks. dismiss-phone is LIVE; the others still land on the
       // drawer (no timer/enforce mutation is wired this phase — no fake success).
       case 'toggle-timer':
-        console.log('[dial] toggle-timer — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       case 'dismiss-phone':
@@ -812,7 +810,6 @@ function Dial({
         );
         break;
       case 'ack-enforce':
-        console.log('[dial] ack-enforce — not wired yet (phase 2)');
         onOpenDrawer(dial.id);
         break;
       default:
@@ -4169,7 +4166,7 @@ export function OpsCockpit() {
       segments: h ? toModeSegments(h) : [],
       nowPoint,
       dials: s ? buildDials(s) : [],
-      compassStars: s ? occupancyCompassStars(s) : OCCUPANCY_COMPASS_FALLBACK_STARS,
+      compassStars: s ? occupancyCompassStars(s) : [],
       ttsQueue: s ? toTtsQueue(s) : [],
       fleetQueues: s
         ? toFleetQueues(s)
