@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/runtimes/token-os/live/edge_proxy
+WorkingDirectory=%h/runtimes/Token-OS/live/edge_proxy
 Environment=EDGE_PROXY_CONFIG=%h/secrets/token-os/edge_proxy.json
 Environment=IMPERIUM_MACHINE=k12-personal
 ExecStart=%h/.bun/bin/bun src/server.ts
