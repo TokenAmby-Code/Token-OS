@@ -32,3 +32,46 @@ test('@token-os/contracts exposes OpsStateSchema (Zod) that parses ops-state.v1'
   assert.equal(parsed.instances.active.length, 2);
   assert.equal(parsed.instances.active[0].id, 'custodes');
 });
+
+// voice-selftest.v1 — the probe report emitted by the daemon's own
+// voice-selftest module and consumed via /voice/selftest + events log.
+const SELFTEST_REPORT_FIXTURE = {
+  contract_version: 'voice-selftest.v1',
+  probe_id: 'probe-abc-1',
+  variant: 'full',
+  trigger: 'cron',
+  started_at: '2026-07-10T07:30:00.000Z',
+  finished_at: '2026-07-10T07:30:24.000Z',
+  duration_ms: 24000,
+  overall: 'degraded',
+  abort_reason: null,
+  first_failed_stage: null,
+  stages: [
+    { stage: 'operator_gate', ok: true, ms: 120 },
+    { stage: 'voice_join', ok: true, ms: 2200 },
+    { stage: 'audio_loop', ok: true, ms: 18000, detail: 'matched 6/7 tokens (attempt 2)' },
+    { stage: 'tmuxctld_session', ok: true, ms: 300 },
+    { stage: 'cleanup', ok: true, ms: 900 },
+  ],
+  transcript_match: {
+    matched: true,
+    matched_tokens: 6,
+    total_tokens: 7,
+    attempts: 2,
+    passed_on_retry: true,
+    transcript: 'golden signal probe verifying discord audio loop',
+  },
+  daemon: { version: null, pid: 1234, node: 'v22.22.0' },
+};
+
+test('@token-os/contracts SelftestReportSchema parses voice-selftest.v1 and rejects a bad overall', async () => {
+  const contracts = await import('@token-os/contracts');
+  assert.equal(contracts.VOICE_SELFTEST_CONTRACT_VERSION, 'voice-selftest.v1');
+  const parsed = contracts.SelftestReportSchema.parse(SELFTEST_REPORT_FIXTURE);
+  assert.equal(parsed.overall, 'degraded');
+  assert.equal(parsed.stages.length, 5);
+  assert.equal(parsed.transcript_match.passed_on_retry, true);
+
+  const bad = { ...SELFTEST_REPORT_FIXTURE, overall: 'sort-of-fine' };
+  assert.throws(() => contracts.SelftestReportSchema.parse(bad));
+});

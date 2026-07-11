@@ -23,6 +23,7 @@ export function createHttpServer(
   logger,
   voiceManager = null,
   voiceTranscriptRouter = null,
+  voiceSelftest = null,
 ) {
   // botClients: { mechanicus: client, custodes: client, ... } OR a single client object (legacy)
   // Normalize to a clients map
@@ -599,6 +600,26 @@ export function createHttpServer(
         const body = await parseBody(req);
         const result = await voiceManager.unmuteMember(body.user_id, body.bot || 'mechanicus');
         return json(res, result);
+      }
+
+      // POST /voice/selftest — run a voice pipeline probe (seams | full)
+      if (method === 'POST' && path === '/voice/selftest') {
+        if (!voiceSelftest) return json(res, { error: 'Selftest not available' }, 501);
+        const body = await parseBody(req);
+        const report = await voiceSelftest.run({
+          variant: body.variant === 'full' ? 'full' : 'seams',
+          trigger: body.trigger || 'manual',
+        });
+        if (report?.errorCode === 'probe_in_progress') return json(res, report, 409);
+        return json(res, report);
+      }
+
+      // GET /voice/selftest/last — most recent probe report
+      if (method === 'GET' && path === '/voice/selftest/last') {
+        if (!voiceSelftest) return json(res, { error: 'Selftest not available' }, 501);
+        const report = voiceSelftest.last();
+        if (!report) return json(res, { error: 'no probe has run yet' }, 404);
+        return json(res, report);
       }
 
       // 404

@@ -17,6 +17,7 @@ import { tmuxctldClient } from './tmuxctld-client.ts';
 import { splitDiscordMessageContent } from './outbound-message.ts';
 import { createFleetStatusPublisher } from './fleet-status-publisher.ts';
 import { createStartupVoiceCleanup } from './startup-voice-cleanup.ts';
+import { createVoiceSelftest } from './voice-selftest.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -198,6 +199,14 @@ async function main() {
   const voiceManager = createVoiceManager(botClients, config, logger);
   const transcriber = createTranscriber(config, logger);
   const voiceTranscriptRouter = createVoiceTranscriptRouter({ logger, voiceManager });
+  const voiceSelftest = createVoiceSelftest({
+    config,
+    logger,
+    voiceManager,
+    transcriber,
+    tmuxctld: tmuxctldClient,
+    botClients,
+  });
 
   // Clear stale voice locks/options/drafts from a previous Discord daemon
   // process before any new VC auto-join can create fresh sessions. tmuxctld
@@ -243,6 +252,9 @@ async function main() {
   // Route voice transcripts through tmuxctld. Persona and active-client
   // target policy are daemon-owned and never depend on Token API row freshness.
   transcriber.onTranscription(async (result) => {
+    // Ship prevention: probe transcripts belong to the selftest and must never
+    // reach the router (no draft, no pane injection, no TTS warning).
+    if (voiceSelftest.consumeTranscript(result)) return;
     const botLabel = result.botName || 'voice';
     logger.info(`Transcription [${botLabel}] from ${result.userId}: "${result.text}"`);
     try {
@@ -283,6 +295,7 @@ async function main() {
     logger,
     voiceManager,
     voiceTranscriptRouter,
+    voiceSelftest,
   );
 
   // Forward incoming messages to Token API if configured (main listening bot only)
@@ -466,6 +479,15 @@ async function main() {
   }
 
   logger.info('Daemon ready.');
+
+  // Seams probe ~5s after boot: exercises config/gateway/tmuxctld/OpenAI
+  // Realtime seams without audio. Fire-and-forget — never blocks boot, and the
+  // probe itself never logs at error (that would page the fixer every restart).
+  setTimeout(() => {
+    voiceSelftest.run({ variant: 'seams', trigger: 'boot' }).catch((err) => {
+      logger.warn(`Voice selftest (boot) failed to run: ${err?.message}`);
+    });
+  }, 5_000);
 
   // --- Graceful shutdown ---
   async function shutdown(signal) {
