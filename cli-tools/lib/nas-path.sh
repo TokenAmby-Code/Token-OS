@@ -48,6 +48,9 @@ else
     # other Linux node stays the generic "linux" fallback (never silently
     # inheriting k12-conditioned behavior).
     _imperium_host="$(hostname -s 2>/dev/null || hostname 2>/dev/null)"
+    # Strip any domain suffix: a fallback `hostname` (where -s is unsupported)
+    # may return a dotted FQDN. Mirrors platform.node().split(".")[0] in Python.
+    _imperium_host="${_imperium_host%%.*}"
     case "$_imperium_host" in
         k12-personal) export IMPERIUM_MACHINE="k12-personal" ;;
         k12-work)     export IMPERIUM_MACHINE="k12-work" ;;

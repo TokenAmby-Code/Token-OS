@@ -84,6 +84,10 @@ printf '%s' "$(imperium_cfg {key} {machine})"
 def test_shell_detects_k12_boxes_by_hostname():
     assert _shell_detect("k12-personal") == "k12-personal"
     assert _shell_detect("k12-work") == "k12-work"
+    # A dotted FQDN (e.g. from a fallback `hostname` without -s) must still map
+    # to the short id, matching the Python .split(".")[0] behavior.
+    assert _shell_detect("k12-work.tailnet.ts.net") == "k12-work"
+    assert _shell_detect("k12-personal.local") == "k12-personal"
 
 
 def test_shell_unknown_linux_stays_generic_fallback():
