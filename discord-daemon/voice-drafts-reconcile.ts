@@ -55,6 +55,9 @@ export function createVoiceDraftReconciler({
     }
   }
 
+  // Throws on transport failure or non-OK response so the caller's catch logs
+  // token-api clears through the same voice_reconcile_clear_failed path as the
+  // other surfaces — a swallowed failure would report cleared=false silently.
   async function clearTokenApiDraft(botName, authorId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), tokenApiTimeoutMs);
@@ -68,9 +71,11 @@ export function createVoiceDraftReconciler({
           signal: controller.signal,
         },
       );
-      return resp.ok;
-    } catch {
-      return false;
+      if (!resp.ok) {
+        const err = new Error(`token-api voice-drafts/clear HTTP ${resp.status}`);
+        err.code = `HTTP_${resp.status}`;
+        throw err;
+      }
     } finally {
       clearTimeout(timer);
     }
@@ -159,7 +164,8 @@ export function createVoiceDraftReconciler({
             );
             orphan.cleared = true;
           } else if (orphan.source === 'token_api_draft') {
-            orphan.cleared = await clearTokenApiDraft(orphan.bot_name, orphan.author_id);
+            await clearTokenApiDraft(orphan.bot_name, orphan.author_id);
+            orphan.cleared = true;
           }
         } catch (err) {
           logger?.warn?.(

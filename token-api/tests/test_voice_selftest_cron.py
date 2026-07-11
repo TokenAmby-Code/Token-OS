@@ -118,3 +118,20 @@ def test_voice_selftest_task_records_daemon_down_as_failure(
     assert logged[0]["details"]["overall"] == "fail"
     assert logged[0]["details"]["error"] == "daemon down"
     assert logged[0]["details"]["trigger"] == "cron"
+
+
+def test_voice_selftest_task_seeded(app_env: SimpleNamespace) -> None:
+    """The cron row is code-owned: init_database seeds it (INSERT OR IGNORE)."""
+    import sqlite3
+
+    conn = sqlite3.connect(app_env.db_path)
+    row = conn.execute(
+        "SELECT task_type, schedule, enabled FROM scheduled_tasks WHERE id = 'voice_selftest_morning'"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    task_type, schedule, enabled = row
+    assert task_type == "cron"
+    assert schedule == "45 7 * * *"
+    assert enabled == 1

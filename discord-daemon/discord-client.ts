@@ -2,9 +2,9 @@
 // Subscribes to ALL messages in configured channels (not just pings)
 
 import { Client, GatewayIntentBits, Partials, Events } from 'discord.js';
-import { readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, chmodSync, realpathSync } from 'fs';
 import { execSync } from 'child_process';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import {
   DISCORD_MESSAGE_CONTENT_LIMIT,
@@ -23,15 +23,24 @@ const ENV_PATH = join(process.env.HOME, '.discord-cli', '.env');
 // fallback.
 const NAS_MOUNT_ROOTS = ['/Volumes/Imperium', '/mnt/imperium'];
 
-export function assertConfigPathSafe(configPath) {
-  const normalized = String(configPath || '');
-  if (NAS_MOUNT_ROOTS.some((root) => normalized === root || normalized.startsWith(`${root}/`))) {
+export function assertConfigPathSafe(configPath: string, mountRoots: string[] = NAS_MOUNT_ROOTS): string {
+  const input = String(configPath || '');
+  // Canonicalize before checking: `..` segments and symlinks must not smuggle
+  // a NAS-resident config past a lexical prefix test. A missing file falls
+  // back to lexical resolution — the subsequent read fails loud on its own.
+  let canonical;
+  try {
+    canonical = realpathSync(input);
+  } catch {
+    canonical = resolve(input);
+  }
+  if (mountRoots.some((root) => canonical === root || canonical.startsWith(`${root}/`))) {
     throw new Error(
-      `discord-daemon config path resolved onto the NAS (${normalized}); ` +
+      `discord-daemon config path resolved onto the NAS (${canonical}); ` +
       'run the daemon from a local runtime checkout',
     );
   }
-  return normalized;
+  return canonical;
 }
 
 // Load .env file into a map (does not pollute process.env)

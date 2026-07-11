@@ -2014,6 +2014,18 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 "30 8 * * *",
                 0,
             ),
+            (
+                "voice_selftest_morning",
+                "Morning Voice Selftest",
+                "Pre-morning Discord voice pipeline probe (full audio loop through the "
+                "discord daemon's /voice/selftest). Catches dead decoders / wedged "
+                "Realtime handshakes / missing tmuxctld voice targets before the operator "
+                "speaks. The daemon owns surfacing (events row always; alerts channel on "
+                "fail/degraded); operator VC presence aborts the probe silently.",
+                "cron",
+                "45 7 * * *",
+                0,
+            ),
         ]
         for task_id, name, description, task_type, schedule, max_retries in scheduled_task_seed:
             await db.execute(
