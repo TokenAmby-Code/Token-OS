@@ -3,8 +3,8 @@
 # TAGS: tmux, daemon
 # AUDIENCE: human, agent
 #
-# Usage: tmuxctld-ctl attach [session]              # self-heal workspace + attach
-#        tmuxctld-ctl workspace [session]           # self-heal workspace, no attach
+# Usage: tmuxctld-ctl attach [main]                 # self-heal main workspace + attach
+#        tmuxctld-ctl workspace [main]              # self-heal main workspace, no attach
 #        tmuxctld-ctl <status|health|logs>          # read-only inspection
 #        tmuxctld-ctl <start|restart|stop>          # delegate to launchd
 #        tmuxctld-ctl install                       # sync plist + (re)bootstrap
@@ -39,6 +39,12 @@ DAEMON_WAIT_TIMEOUT="${TMUXCTLD_CTL_DAEMON_WAIT_TIMEOUT:-20}"
 
 die() { echo "Error: $*" >&2; exit 1; }
 warn() { echo "Warning: $*" >&2; }
+
+validate_main_session() {
+  local session="${1:-main}"
+  [[ -n "$session" && "$session" != -* ]] || die "invalid session: ${session}"
+  [[ "$session" == "main" ]] || die "only the 'main' tmux session is supported on this Mac (got: ${session})"
+}
 
 raw_tmux() {
   env IMPERIUM_TMUX_RAW=1 tmux "$@"
@@ -158,7 +164,7 @@ cmd_workspace() {
     esac
   done
   [[ $# -eq 0 ]] || die "workspace accepts at most one session"
-  [[ -n "$session" && "$session" != -* ]] || die "invalid session: ${session}"
+  validate_main_session "$session"
 
   ensure_imperium_mounted
 
@@ -170,7 +176,7 @@ cmd_workspace() {
     post_tmuxctld /restart "session=${session}" "dry_run=false"
   elif workspace_needs_rebuild "$session"; then
     if main_has_clients "$session"; then
-      warn "Workspace '${session}' looks incomplete but has attached clients; not auto-rebuilding. Run: tmuxctld-ctl workspace ${session} --rebuild"
+      warn "Workspace '${session}' looks incomplete but has attached clients; not auto-rebuilding. Run: tmuxctld-ctl workspace --rebuild"
     else
       echo "Workspace '${session}' looks incomplete; rebuilding through tmuxctld..."
       post_tmuxctld /restart "session=${session}" "dry_run=false"
@@ -189,7 +195,7 @@ cmd_attach() {
   local session="${1:-main}"
   shift || true
   [[ $# -eq 0 ]] || die "attach accepts at most one session"
-  [[ -n "$session" && "$session" != -* ]] || die "invalid session: ${session}"
+  validate_main_session "$session"
 
   # This is the sanctioned human-attach path. It owns startup recovery: wait for
   # the Imperium vault, create a missing workspace through tmuxctld, repair
@@ -285,8 +291,8 @@ case "$1" in
   logs)    shift; cmd_logs "$@" ;;
   -h|--help)
     echo "Usage: tmuxctld-ctl <attach|workspace|status|health|logs|start|restart|stop|install>"
-    echo "  attach [session]       self-heal workspace + blessed human attach (default: main)"
-    echo "  workspace [session]    self-heal workspace without attaching"
+    echo "  attach [main]          self-heal main workspace + blessed human attach"
+    echo "  workspace [main]       self-heal main workspace without attaching"
     echo "    --rebuild            force tmuxctld restart/rebuild of the workspace"
     echo "  status, health, logs   read-only inspection"
     echo "  start, restart         -> launchctl kickstart -k (launchd, authoritative)"

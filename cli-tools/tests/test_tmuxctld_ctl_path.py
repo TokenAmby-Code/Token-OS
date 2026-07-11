@@ -23,4 +23,4 @@ def test_tmuxctld_ctl_is_available_from_cli_tools_path() -> None:
 
     assert CLI_CTL.exists()
     assert proc.returncode == 0, proc.stderr
-    assert "attach [session]" in proc.stdout
+    assert "attach [main]" in proc.stdout
