@@ -260,6 +260,16 @@ Loose threads from the 2026-06-16 startup/monitor brain dump, ready to split int
 - **Steam gamepad mouse movement:** Confirm whether Steam Input Desktop Layout alone is enough for mouse movement via gamepad, or whether a specific Steam shortcut/app id, GlosSI/GloSC-style target, or Steam Big Picture behavior is needed.
 - **Wootility / Caps 3 path:** Export/check the current Wootility profile. `Caps 3` currently triggers a Wootility layer swap and `1`, `2`, `3` are dynamic keys that execute modifier macro keystrokes. Investigate whether the Wootility SDK can automate or introspect this.
 - **Ring remapper device detection:** `ring-remap.ahk` bound to the regular mouse after restart. `MINIMUM_RING_ID` was lowered from `20` to `14` on 2026-07-09 because the D06 Pro can reappear below 20 on the WSL PC; the local elevated copy must be refreshed/restarted through the satellite refresh path. If this binds a regular mouse again, stop relying on "highest mouse above threshold" and identify the D06 Pro by hardware path / VID-PID / name from AutoHotInterception's device list.
+
+### Ring remapper signature-detection experiment (2026-07-10)
+
+`ahk/ring-remap.ahk` now logs detection candidates to `%USERPROFILE%\Imperium-Startup\logs\ring-remap-detect.log` and stores the last confirmed event-source signature in `%USERPROFILE%\Imperium-Startup\ring-profile.ini` under `[LastWorking]`. Selection order is:
+
+1. `[D06Pro]` configured signature in `ring-profile.ini` (`VID`, `PID`, optional `Handle` substring),
+2. `[LastWorking]` signature written after subscribed ring input is received,
+3. fallback to the highest mouse ID `>= MINIMUM_RING_ID` (`14`).
+
+`ahk/ring-monitor.ahk` also writes `%USERPROFILE%\Imperium-Startup\logs\ring-monitor.log` with every mouse candidate and the device ID that emits button events. Use that observe-only monitor while the D06 Pro is known working, then copy the observed stable VID/PID/Handle into `[D06Pro]` if reconnect testing proves it stable. Do not change `MINIMUM_RING_ID` unless signature detection is disproven.
 - **Monitor selection hardening:** Current code selects left vertical by geometry and mini by smallest area. If Windows display IDs or geometry drift, replace with a small monitor registry/config file and assertion check.
 - **Mini-monitor taskbar:** User would prefer no taskbar on the 7-inch monitor unless intentionally interacting there, but per-monitor hover/swipe taskbar behavior is out of active startup scope because it likely requires a persistent window-manager layer rather than the short-lived startup launcher.
 - **Ops cockpit testing doctrine:** Formalize that browser automation uses localhost ops cockpits on the Mac Token-API host only. The physical Windows vertical-monitor cockpit is a human/runtime surface and should not be hijacked by Playwright or agent browser tests.

@@ -83,6 +83,11 @@ DEVICE_POLL_INTERVAL_MS := 3000  ; How often to check for ring when not found
 DEVICE_POLL_MAX_ATTEMPTS := 100  ; Stop polling after 100 attempts
 INACTIVITY_CHECK_MS := 30000  ; Check connection after 30 seconds of no input (was 5 minutes)
 TRAYTIP_DURATION_MS := 2000  ; Auto-dismiss tray notifications after 2 seconds
+RING_PROFILE_PATH := A_UserProfile "\Imperium-Startup\ring-profile.ini"
+RING_LOG_PATH := A_UserProfile "\Imperium-Startup\logs\ring-remap-detect.log"
+RING_LEARNED_VID := ""     ; Optional override: decimal or 0x-prefixed VID from diagnostics/config
+RING_LEARNED_PID := ""     ; Optional override: decimal or 0x-prefixed PID from diagnostics/config
+RING_LEARNED_HANDLE := ""  ; Optional override: substring or exact Handle from diagnostics/config
 
 ; ============== AUTO-DETECT RING DEVICE ==============
 ; The Bluetooth ring gets a floating device ID that changes on reconnect.
@@ -192,26 +197,147 @@ global scriptEnabled := true
     }
 }
 
+EnsureRingLogDir() {
+    global RING_LOG_PATH
+    SplitPath(RING_LOG_PATH, , &dir)
+    if (dir != "" && !DirExist(dir))
+        DirCreate(dir)
+}
+
+AppendRingLog(message) {
+    global RING_LOG_PATH
+    try {
+        EnsureRingLogDir()
+        FileAppend(FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") A_Tab message "`n", RING_LOG_PATH)
+    }
+}
+
+FmtHex(value) {
+    try
+        return "0x" Format("{:04X}", value)
+    catch
+        return ""
+}
+
+DeviceSummary(id, device) {
+    return "id=" id " Handle=" device.Handle " VID=" FmtHex(device.VID) " PID=" FmtHex(device.PID)
+}
+
+NormalizeId(value) {
+    value := Trim(value)
+    if (value == "")
+        return ""
+    if (SubStr(value, 1, 2) = "0x" || SubStr(value, 1, 2) = "0X")
+        return Integer(value)
+    return Integer(value)
+}
+
+LoadConfiguredSignature() {
+    global RING_PROFILE_PATH, RING_LEARNED_VID, RING_LEARNED_PID, RING_LEARNED_HANDLE
+    vid := RING_LEARNED_VID
+    pid := RING_LEARNED_PID
+    handle := RING_LEARNED_HANDLE
+    try vid := IniRead(RING_PROFILE_PATH, "D06Pro", "VID", vid)
+    try pid := IniRead(RING_PROFILE_PATH, "D06Pro", "PID", pid)
+    try handle := IniRead(RING_PROFILE_PATH, "D06Pro", "Handle", handle)
+    return {vid: vid, pid: pid, handle: handle}
+}
+
+LoadLastWorkingSignature() {
+    global RING_PROFILE_PATH
+    try {
+        return {
+            vid: IniRead(RING_PROFILE_PATH, "LastWorking", "VID", ""),
+            pid: IniRead(RING_PROFILE_PATH, "LastWorking", "PID", ""),
+            handle: IniRead(RING_PROFILE_PATH, "LastWorking", "Handle", "")
+        }
+    } catch {
+        return {vid: "", pid: "", handle: ""}
+    }
+}
+
+SignatureMatches(device, sig) {
+    if (!IsObject(sig))
+        return false
+    vid := Trim(sig.vid), pid := Trim(sig.pid), handle := Trim(sig.handle)
+    if (vid == "" && pid == "" && handle == "")
+        return false
+    if (vid != "" && device.VID != NormalizeId(vid))
+        return false
+    if (pid != "" && device.PID != NormalizeId(pid))
+        return false
+    if (handle != "" && !InStr(device.Handle, handle))
+        return false
+    return true
+}
+
+SaveLastWorkingSignature(deviceId) {
+    global AHI, RING_PROFILE_PATH
+    try {
+        devices := AHI.GetDeviceList()
+        if (!devices.Has(deviceId))
+            return
+        device := devices[deviceId]
+        SplitPath(RING_PROFILE_PATH, , &dir)
+        if (dir != "" && !DirExist(dir))
+            DirCreate(dir)
+        IniWrite(FmtHex(device.VID), RING_PROFILE_PATH, "LastWorking", "VID")
+        IniWrite(FmtHex(device.PID), RING_PROFILE_PATH, "LastWorking", "PID")
+        IniWrite(device.Handle, RING_PROFILE_PATH, "LastWorking", "Handle")
+        IniWrite(deviceId, RING_PROFILE_PATH, "LastWorking", "LastId")
+        IniWrite(FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss"), RING_PROFILE_PATH, "LastWorking", "Updated")
+        AppendRingLog("event-source confirmed " DeviceSummary(deviceId, device))
+    }
+}
+
 DetectRingDevice() {
     global AHI, MINIMUM_RING_ID
     try {
         devices := AHI.GetDeviceList()
-    } catch {
+    } catch as err {
+        AppendRingLog("GetDeviceList failed: " err.Message)
         return 0
     }
+
+    AppendRingLog("mouse candidates begin")
     highestMouseId := 0
+    selectedId := 0
+    selectedReason := "none"
+    learned := LoadConfiguredSignature()
+    lastWorking := LoadLastWorkingSignature()
 
     for id, device in devices {
-        if (device.IsMouse && id > highestMouseId) {
+        if (!device.IsMouse)
+            continue
+        AppendRingLog("candidate " DeviceSummary(id, device))
+        if (id > highestMouseId)
             highestMouseId := id
+        if (selectedId == 0 && SignatureMatches(device, learned)) {
+            selectedId := id
+            selectedReason := "learned-signature"
         }
     }
 
-    ; Only return if above minimum threshold (avoids detecting built-in devices as ring)
-    if (highestMouseId < MINIMUM_RING_ID) {
-        return 0
+    if (selectedId == 0) {
+        for id, device in devices {
+            if (device.IsMouse && SignatureMatches(device, lastWorking)) {
+                selectedId := id
+                selectedReason := "last-working-signature"
+                break
+            }
+        }
     }
-    return highestMouseId
+
+    if (selectedId == 0 && highestMouseId >= MINIMUM_RING_ID) {
+        selectedId := highestMouseId
+        selectedReason := "fallback-highest-id>=MINIMUM_RING_ID"
+    }
+
+    if (selectedId == 0)
+        AppendRingLog("selected id=0 reason=none highestMouseId=" highestMouseId " minimum=" MINIMUM_RING_ID)
+    else
+        AppendRingLog("selected id=" selectedId " reason=" selectedReason " minimum=" MINIMUM_RING_ID)
+    return selectedId
 }
 
 IsDevicePresent(deviceId) {
@@ -465,10 +591,12 @@ IsDictationActive() {
 }
 
 LeftButtonCallback(state) {
+    global RING_DEVICE_ID
     global LEFT_TAP_THRESHOLD_MS
     global leftButtonDownTime, leftHoldActionSent, dictationEndTime
 
     ResetActivityTimer()
+    SaveLastWorkingSignature(RING_DEVICE_ID)
 
     if (state) {
         ; Button pressed - start hold timer
@@ -585,10 +713,12 @@ SendQueuedEnter() {
 }
 
 RightButtonCallback(state) {
+    global RING_DEVICE_ID
     global TAP_THRESHOLD_MS, DICTATION_BUFFER_MS, rightButtonDownTime
     global rightButtonHeld, toggleActive, enterQueued, dictationEndTime
 
     ResetActivityTimer()
+    SaveLastWorkingSignature(RING_DEVICE_ID)
 
     if (state) {
         ; Button pressed
@@ -644,7 +774,9 @@ OnDictationEnd() {
 }
 
 MiddleButtonCallback(state) {
+    global RING_DEVICE_ID
     ResetActivityTimer()
+    SaveLastWorkingSignature(RING_DEVICE_ID)
 
     if (state) {
         ; Button pressed - send period and space
@@ -658,11 +790,13 @@ MiddleButtonCallback(state) {
 ; Button 5: state=1 for up, state=-1 for down
 
 ScrollCallback(state) {
+    global RING_DEVICE_ID
     global scrollVelocity, scrollTimerRunning, SCROLL_MULTIPLIER, SCROLL_TICK_MS
 
     ; state: 1 = up, -1 = down, 0 = ignore
     if (state == 0)
         return
+    SaveLastWorkingSignature(RING_DEVICE_ID)
 
     ; Immediate output if fresh start (velocity is 0).
     ; Blind mode keeps any held modifier down so Ctrl+scroll (zoom), etc. pass through.
@@ -719,9 +853,11 @@ SmoothScrollTick() {
 
 ; ============== GESTURE HANDLING ==============
 RingMoveCallback(x, y) {
+    global RING_DEVICE_ID
     global gestureX, gestureY, gestureActive, GESTURE_TIMEOUT_MS
 
     ResetActivityTimer()
+    SaveLastWorkingSignature(RING_DEVICE_ID)
 
     gestureX += x
     gestureY += y
