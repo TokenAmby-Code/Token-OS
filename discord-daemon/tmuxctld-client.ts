@@ -19,11 +19,20 @@ function normalizeBotName(botName) {
 
 async function request(method, path, body = null, { timeoutMs: routeTimeoutMs = null } = {}) {
   const url = `${baseUrl()}${path}`;
-  const defaultTimeoutMs = routeTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  const configuredTimeoutMs = Number(process.env.TMUXCTLD_REQUEST_TIMEOUT_MS || defaultTimeoutMs);
-  const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
-    ? Math.max(configuredTimeoutMs, defaultTimeoutMs)
-    : defaultTimeoutMs;
+  // An explicit route timeout wins outright: bounded probes (health, boot
+  // clears) must not be stretched by the env-wide override. The env override
+  // applies only to routes that fall back to the default timeout, and can
+  // only raise it — a stale short env value must not shorten requests.
+  let timeoutMs;
+  const explicitTimeoutMs = Number(routeTimeoutMs);
+  if (routeTimeoutMs !== null && Number.isFinite(explicitTimeoutMs) && explicitTimeoutMs > 0) {
+    timeoutMs = explicitTimeoutMs;
+  } else {
+    const configuredTimeoutMs = Number(process.env.TMUXCTLD_REQUEST_TIMEOUT_MS || DEFAULT_REQUEST_TIMEOUT_MS);
+    timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+      ? Math.max(configuredTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS)
+      : DEFAULT_REQUEST_TIMEOUT_MS;
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const opts = {

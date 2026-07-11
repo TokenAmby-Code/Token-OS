@@ -12,6 +12,17 @@ export const DEFAULT_HEALTH_TIMEOUT_MS = 1_500;
 export const DEFAULT_CLEAR_TIMEOUT_MS = 5_000;
 export const DEFAULT_TOKEN_API_TIMEOUT_MS = 3_000;
 
+/**
+ * @typedef {object} StartupVoiceCleanup
+ * @property {function(): Promise<{tmuxctld: object, clears: object[], tokenApiSweep: object}>} run
+ * @property {function(): Promise<{healthy: boolean, attempts: number, reason?: string}>} waitForTmuxctld
+ * @property {function(): Promise<object[]>} clearTmuxctldSessions
+ * @property {function(): Promise<object>} sweepTokenApiDrafts
+ */
+
+/**
+ * @returns {StartupVoiceCleanup}
+ */
 export function createStartupVoiceCleanup({
   config,
   logger,

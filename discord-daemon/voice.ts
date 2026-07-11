@@ -401,7 +401,15 @@ export function createVoiceManager(botClients, config, logger) {
     }
 
     function teardownSubscription() {
-      state.activeSubscriptions.delete(userId);
+      // Destroy the receive stream too: @discordjs/voice returns the SAME
+      // stream for a repeat receiver.subscribe(userId) while the old one is
+      // alive, so leaving it undestroyed would double-pipe the next
+      // subscription for this user.
+      if (state.activeSubscriptions.get(userId) === sub) {
+        try { sub.stream.destroy(); } catch {}
+        try { sub.decoder?.destroy(); } catch {}
+        state.activeSubscriptions.delete(userId);
+      }
       if (!suppressEndClose && onAudioEnd) {
         try { onAudioEnd(userId, botName); } catch {}
       }
