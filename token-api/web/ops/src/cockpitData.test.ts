@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { OPS_COCKPIT_POLLS } from './api';
-import { buildDials, enforcementDial, goldenThroneDial, laneForStatus, occupancyCompassStars, toFleetQueues, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
+import { buildDials, enforcementDial, goldenThroneDial, laneForStatus, LEMON_RESIDENT_PERSONAS, occupancyCompassStars, toFleetQueues, toLemonActivity, toMusterBoard, toTtsQueue, ttsDial, type FleetQueues, type WorkerItem } from './cockpitData';
 import type { OpsState } from './contracts';
 
 type TestInstance = {
@@ -137,13 +137,69 @@ describe('toFleetQueues', () => {
   it('carries identical WorkerItem identity fields whichever bucket an instance lands in', () => {
     const mk = (status: string) =>
       stateWith([
-        { id: 'x', display_name: 'Chip X', created_at: '2026-07-09T10:00:00', domain: 'askcivic', status, commander_type: 'chapter', persona: { slug: 'pax', chip_color: '#aa9955' } },
+        { id: 'x', display_name: 'Chip X', created_at: '2026-07-09T10:00:00', domain: 'askcivic', status, commander_type: 'chapter', persona: { slug: 'salamanders', chip_color: '#1b7a3d' } },
       ]);
     const working = toFleetQueues(mk('working')).askCivic.working[0];
     const idle = toFleetQueues(mk('idle')).askCivic.idle[0];
 
     expect(working).toEqual(idle); // the chip is the same dial wherever it sits
-    expect(working).toEqual({ id: 'x', persona: 'pax', name: 'Chip X', tint: '#aa9955', chapterChild: true });
+    expect(working).toEqual({ id: 'x', persona: 'salamanders', name: 'Chip X', tint: '#1b7a3d', chapterChild: true });
+  });
+
+  it('excludes lemon-resident personas from every bucket, working and idle alike', () => {
+    // The full roster, alternating working/idle across both domains — none of
+    // them may consume a queue slot; the lone mechanicus worker still lands.
+    const residents = [...LEMON_RESIDENT_PERSONAS].map((slug, k) => ({
+      id: `res-${slug}`,
+      display_name: slug,
+      created_at: `2026-07-09T10:0${k}:00`,
+      domain: k % 2 ? 'askcivic' : 'token-os',
+      status: k % 2 ? 'working' : 'idle',
+      persona: { slug, chip_color: '#c0a040' },
+    }));
+    const queues = toFleetQueues(
+      stateWith([
+        ...residents,
+        { id: 'wkr', display_name: 'Worker', created_at: '2026-07-09T11:00:00', domain: 'token-os', status: 'working', persona: { slug: 'mechanicus-worker', chip_color: '#884422' } },
+      ]),
+    );
+
+    expect(allBuckets(queues).flat().map((w) => w.id)).toEqual(['wkr']);
+  });
+});
+
+describe('toLemonActivity', () => {
+  it('lights exactly the residents with a working instance', () => {
+    const active = toLemonActivity(
+      stateWith([
+        { id: 'c', display_name: 'Custodes', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'working', persona: { slug: 'custodes', chip_color: '#c0a040' } },
+        { id: 'm', display_name: 'Malcador', created_at: '2026-07-09T10:01:00', domain: 'token-os', status: 'idle', persona: { slug: 'malcador', chip_color: '#8a7a4a' } },
+        { id: 'p', display_name: 'Pax', created_at: '2026-07-09T10:02:00', domain: 'askcivic', status: 'working', persona: { slug: 'pax', chip_color: '#aa9955' } },
+      ]),
+    );
+
+    expect(active).toEqual(new Set(['custodes', 'pax']));
+  });
+
+  it('ignores working non-residents — a busy chapter worker never lights the lemon', () => {
+    const active = toLemonActivity(
+      stateWith([
+        { id: 'w', display_name: 'Worker', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'working', persona: { slug: 'salamanders', chip_color: '#1b7a3d' } },
+      ]),
+    );
+
+    expect(active.size).toBe(0);
+  });
+
+  it("ignores non-'working' residents and subagents wearing a resident persona", () => {
+    const active = toLemonActivity(
+      stateWith([
+        { id: 'r', display_name: 'FG', created_at: '2026-07-09T10:00:00', domain: 'token-os', status: 'reviewing', persona: { slug: 'fabricator-general', chip_color: '#c05030' } },
+        { id: 's', display_name: 'Custodes Sub', created_at: '2026-07-09T10:01:00', is_subagent: true, domain: 'token-os', status: 'working', persona: { slug: 'custodes', chip_color: '#c0a040' } },
+      ]),
+    );
+
+    expect(active.size).toBe(0);
   });
 });
 

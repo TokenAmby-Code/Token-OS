@@ -120,38 +120,93 @@ def test_local_control_echo_is_private_consumed_endpoint_not_authority() -> None
     assert "mac say" not in lowered
 
 
-def test_chunk_player_speaks_one_utterance_and_reports_buffer_drained() -> None:
+def test_artifact_player_shell_fetches_wav_plays_and_reports_buffer_drained() -> None:
     macro = load("tts-phone-chunk-player.macro")
-    assert macro["m_name"] == "04 TTS Chunk Player"
+    assert macro["m_name"] == "04 TTS Artifact Player"
     assert (
         token_os_global("tts-phone-chunk-player.macro")["m_stringValue"]
         == "http://100.95.109.23:7777"
     )
-    assert macro["m_triggerList"][0]["identifier"] == "tts-chunk"
-    speak_actions = actions(macro, "SpeakTextAction")
-    assert len(speak_actions) == 1
-    assert speak_actions[0]["m_textToSay"] == "{lv=current_chunk_text}"
-    assert speak_actions[0]["m_queue"] is False
-    assert speak_actions[0]["m_waitToFinish"] is True
+    assert macro["m_triggerList"][0]["identifier"] == "tts-artifact"
+    assert actions(macro, "SpeakTextAction") == []
+
+    tts_dir = "/storage/emulated/0/MacroDroid/tts"
+    wav = f"{tts_dir}/token-tts-current.wav"
+    scripts = [a["m_script"] for a in actions(macro, "ShellScriptAction")]
+    assert len(scripts) == 4
+
+    entry, fetch, finished, fail_log = scripts
+    assert f"mkdir -p {tts_dir}" in entry
+    assert f"rm -f {wav}" in entry
+    assert "{lv=request[session_id]}" in entry
+    assert "{lv=request[playback_id]}" in entry
+    # {http_param=...} does not expand inside shell scripts (verified on-device)
+    assert all("{http_param=" not in s for s in scripts)
+
+    # MacroDroid's native save-response path writes nothing on this device;
+    # the shell fetch is the artifact transport. Keep the dead path excised.
+    assert '"{lv=request[artifact_url]}"' in fetch
+    assert "curl -s -o" in fetch
+    assert "wget -q -O" in fetch
+    assert wav in fetch
+    for action in actions(macro, "HttpRequestAction"):
+        assert action["requestConfig"]["saveResponseType"] == 0
+
+    assert "playback finished" in finished
+
+    # Fail closed: the fetch script emits a machine-readable outcome captured to
+    # fetch_status, and an If/Else gates playback + buffer_drained on success.
+    assert "echo fetch_ok" in fetch
+    assert "echo fetch_failed" in fetch
+    fetch_action = actions(macro, "ShellScriptAction")[1]
+    assert fetch_action["m_variableToSaveResponse"]["m_name"] == "fetch_status"
+
+    flat = [a["m_classType"] for a in actions(macro)]
+    if_idx = flat.index("IfConditionAction")
+    else_idx = flat.index("ElseAction")
+    endif_idx = flat.index("EndIfAction")
+    play_idx = flat.index("PlaySoundAction")
+    assert if_idx < play_idx < else_idx < endif_idx
+
+    if_action = actions(macro, "IfConditionAction")[0]
+    constraint = if_action["m_constraintList"][0]
+    assert constraint["m_classType"] == "MacroDroidVariableConstraint"
+    assert constraint["m_variable"]["m_name"] == "fetch_status"
+    assert constraint["m_stringValue"] == "fetch_ok"
+
+    # buffer_drained success report lives inside the If branch; the Else branch
+    # reports through the phone-local /tts-error contract instead.
+    http_indices = [i for i, ct in enumerate(flat) if ct == "HttpRequestAction"]
+    assert len(http_indices) == 2
+    drained_idx, error_idx = http_indices
+    assert if_idx < drained_idx < else_idx
+    assert else_idx < error_idx < endif_idx
+    assert "reporting artifact_download_failed" in fail_log
+
+    play_actions = actions(macro, "PlaySoundAction")
+    assert len(play_actions) == 1
+    assert play_actions[0]["waitToFinish"] is True
+    assert play_actions[0]["useAllFilesAccess"] is True
+    assert play_actions[0]["allFilesPath"] == tts_dir
+    assert play_actions[0]["allFilesFilename"] == "token-tts-current.wav"
 
     assignments = dict(set_variable_assignments(macro))
-    assert assignments["current_index"] == "{lv=request[current_index]}"
     assert assignments["session_id"] == "{lv=request[session_id]}"
     assert assignments["playback_id"] == "{lv=request[playback_id]}"
-    assert assignments["utterance_id"] == "{lv=request[utterance_id]}"
 
     serialized = json.dumps(macro)
     assert "LoopAction" not in serialized
     assert "/api/tts/chunk-next" not in serialized
-    assert "backfill" not in serialized.lower()
-    assert "next_chunk_text" not in [a[0] for a in set_variable_assignments(macro)]
+    assert "SpeakTextAction" not in serialized
 
     urls = request_urls(macro)
-    assert urls == [f"{TOKEN_OS_BASE}/api/tts/chunk-event"]
-    bodies = request_bodies(macro)
+    assert urls[0] == f"{TOKEN_OS_BASE}/api/tts/chunk-event"
+    assert urls[1].startswith("http://127.0.0.1:7777/tts-error?")
+    assert "error_code=artifact_download_failed" in urls[1]
+    assert "playback_id={lv=playback_id}" in urls[1]
+    bodies = [body for body in request_bodies(macro) if body]
     assert len(bodies) == 1
     assert "buffer_drained" in bodies[0]
-    assert "last_index" in bodies[0]
 
 
 def test_error_report_goes_up_to_token_os_and_has_no_mac_fallback() -> None:

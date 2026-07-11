@@ -4563,8 +4563,20 @@ class TmuxctldServer(ThreadingHTTPServer):
         except Exception:
             log.exception("tmuxctld prompt-submit callback load failed")
         try:
-            _DEFERRED_SEND_QUEUE.load()
-            _schedule_all_deferred_drains()
+            loaded_deferred = _DEFERRED_SEND_QUEUE.load()
+            # Do not auto-drain persisted typing-guard sends at daemon boot.
+            # A restart/kickstart is not a human-clear edge: hooks may not have
+            # rehydrated the pane-local HUMAN/PENDING guard yet, and queued
+            # records are keyed to physical panes.  Auto-replay here can flush a
+            # stale report into the Emperor's active composer and the submit key
+            # is part of that replay.  Deferred sends are drained only from a
+            # fresh guard-clear/expiry signal in this daemon lifetime (or an
+            # explicit drain call in tests/tools).
+            if loaded_deferred.get("queued"):
+                log.warning(
+                    "tmuxctld: deferred-send queue loaded queued=%s; boot auto-drain suppressed",
+                    loaded_deferred.get("queued"),
+                )
         except Exception:
             log.exception("tmuxctld deferred-send queue load failed")
         # Throttle state for the /health-driven lifecycle-hook re-assertion. A

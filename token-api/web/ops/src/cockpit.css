@@ -946,6 +946,22 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   stroke: none;
   mix-blend-mode: screen;
 }
+/* LEMON REVERB — a resident seat whose instance is actively WORKING. Same
+   reverberation family as the TTS head dial's throb (tts-glow, 1.6s), slowed to
+   a long breath: the rim glow swells to full and settles, forever, while the
+   core dips slightly in counter-phase so the whole section reads as breathing.
+   Idle seats carry no class and render the static glow above byte-identically.
+   Reduced motion: the global animation kill leaves exactly that static glow. */
+.segment--reverb .section-rim { animation: lemon-reverb-rim 3.2s ease-in-out infinite; }
+.segment--reverb .section-core { animation: lemon-reverb-core 3.2s ease-in-out infinite; }
+@keyframes lemon-reverb-rim {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1; }
+}
+@keyframes lemon-reverb-core {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.65; }
+}
 /* lower lemon boundary — the inverted arc that mirrors the connecting arc. A SOLID
    gold instrument line, identical weight/colour to .arc-line, so the two close into
    one clean lens (was a faint dashed worker guide). */
