@@ -16,6 +16,7 @@ import { routeVoiceTranscriptWithRetry } from './voice-route-retry.ts';
 import { tmuxctldClient } from './tmuxctld-client.ts';
 import { splitDiscordMessageContent } from './outbound-message.ts';
 import { createFleetStatusPublisher } from './fleet-status-publisher.ts';
+import { createStartupVoiceCleanup } from './startup-voice-cleanup.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -198,15 +199,19 @@ async function main() {
   const transcriber = createTranscriber(config, logger);
   const voiceTranscriptRouter = createVoiceTranscriptRouter({ logger, voiceManager });
 
-  // Clear stale tmuxctld voice locks/options from a previous Discord daemon
-  // process before any new VC auto-join can create fresh sessions.
-  for (const botName of Object.keys(config.voice_channels || {})) {
-    try {
-      await voiceTranscriptRouter.clear({ bot: botName });
-    } catch (err) {
-      logger.warn(`Voice [${botName}]: startup voice cleanup failed: ${err.code || err.message}`);
-    }
-  }
+  // Clear stale voice locks/options/drafts from a previous Discord daemon
+  // process before any new VC auto-join can create fresh sessions. tmuxctld
+  // restarts alongside this daemon under token-restart, so wait for its
+  // /health first instead of racing a socket that is still coming up, then
+  // sweep all three copies of draft truth (daemon map, tmuxctld sessions,
+  // token-api dict) with short per-call timeouts.
+  const startupVoiceCleanup = createStartupVoiceCleanup({
+    config,
+    logger,
+    voiceTranscriptRouter,
+    tmuxctld: tmuxctldClient,
+  });
+  await startupVoiceCleanup.run();
 
   // Wire live decoded Discord PCM frames into OpenAI Realtime transcription.
   voiceManager.setAudioFrameCallback((userId, pcmChunk, botName, meta) => {

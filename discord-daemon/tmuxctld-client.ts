@@ -59,6 +59,10 @@ async function request(method, path, body = null, { timeoutMs: routeTimeoutMs = 
       timeoutErr.timeoutMs = timeoutMs;
       throw timeoutErr;
     }
+    // Surface the transport-level cause (ECONNREFUSED etc.) — callers need to
+    // distinguish "daemon down" from "endpoint wedged" without string-matching
+    // undici's generic "fetch failed".
+    if (!err.code && err?.cause?.code) err.code = err.cause.code;
     throw err;
   } finally {
     clearTimeout(timeout);
@@ -71,9 +75,10 @@ async function request(method, path, body = null, { timeoutMs: routeTimeoutMs = 
  * @property {function({voiceSessionId: string, text: string}): Promise<object>} appendVoiceSession
  * @property {function({voiceSessionId: string, text?: string}): Promise<object>} shipVoiceSession
  * @property {function({voiceSessionId: string}): Promise<object>} scratchVoiceSession
- * @property {function({voiceSessionId?: string, botName?: string, userId?: string}=): Promise<object>} clearVoiceSession
+ * @property {function({voiceSessionId?: string, botName?: string, userId?: string, timeoutMs?: number}=): Promise<object>} clearVoiceSession
  * @property {function({target: string, text: string, submit?: boolean, clearPrompt?: boolean}): Promise<object>} sendText
  * @property {function(string): Promise<object>} voiceTarget
+ * @property {function({timeoutMs?: number}=): Promise<object>} health
  */
 
 /**
@@ -106,12 +111,12 @@ export function createTmuxctldClient() {
         voice_session_id: voiceSessionId,
       }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
     },
-    clearVoiceSession({ voiceSessionId = '', botName = '', userId = '' } = {}) {
+    clearVoiceSession({ voiceSessionId = '', botName = '', userId = '', timeoutMs = LONG_HOLD_TIMEOUT_MS } = {}) {
       return request('POST', '/voice/session/clear', {
         voice_session_id: voiceSessionId,
         bot_name: botName ? normalizeBotName(botName) : '',
         user_id: userId ? String(userId) : '',
-      }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
+      }, { timeoutMs });
     },
     sendText({ target, text, submit = true, clearPrompt = false }) {
       return request('POST', '/send-text', {
@@ -124,6 +129,9 @@ export function createTmuxctldClient() {
     voiceTarget(botName) {
       const query = new URLSearchParams({ bot_name: normalizeBotName(botName) });
       return request('GET', `/voice/target?${query.toString()}`);
+    },
+    health({ timeoutMs = 2_000 } = {}) {
+      return request('GET', '/health', null, { timeoutMs });
     },
   };
 }
