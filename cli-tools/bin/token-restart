@@ -1981,6 +1981,19 @@ full_restart() {
         echo ""
     fi
 
+    # 3c. Post-deploy voice probe (best-effort, fire-and-forget): full
+    #     audio-loop selftest through the freshly deployed daemon. Fires after
+    #     tmuxctld so the probe's session stage doesn't race that restart. The
+    #     daemon owns surfacing (events row + alerts channel on fail/degraded);
+    #     operator VC presence aborts it silently. A cold daemon just refuses
+    #     the connection — never blocks the deploy.
+    if [[ "$RESTART_DISCORD" == true ]]; then
+        echo -e "${BLUE}→${NC} Firing post-deploy voice selftest (fire-and-forget)..."
+        ( curl -s -m 90 -X POST "${DISCORD_URL}/voice/selftest" \
+            -H 'Content-Type: application/json' \
+            -d '{"variant":"full","trigger":"deploy"}' >/dev/null 2>&1 & )
+    fi
+
     # 4. WSL satellite. Runtime refreshes are verified by /health.git_sha, so they
     #    are synchronous and fail loudly instead of silently leaving WSL stale.
     abort_deploy_if_superseded "before WSL refresh" && return 0

@@ -44,6 +44,8 @@ function normalizeBotName(botName) {
  * @property {function(string=, string=, string=): object} clearLocalVoiceSession
  * @property {function(string, string=, number=): Promise<object>} muteMember
  * @property {function(string, string=): Promise<object>} unmuteMember
+ * @property {function(string, string, number=): object} allowProbeSpeaker
+ * @property {function(string): boolean} revokeProbeSpeaker
  * @property {function(function): void} setAudioFrameCallback
  * @property {function(function): void} setAudioEndCallback
  * @property {function(function): void} setAudioCommitCallback
@@ -72,6 +74,35 @@ export function createVoiceManager(botClients, config, logger) {
       const id = client.botUserId || client.client?.user?.id;
       if (id) botUserIds.add(id);
     }
+  }
+
+  // Probe-scoped, TTL'd exceptions to the ouroboros filter (voice selftest).
+  // Checked at read time and expired lazily, so the filter stays fail-closed:
+  // a crashed probe can never leave bots permanently unfiltered.
+  const probeSpeakerGrants = new Map(); // probeId -> { userId, expiresAt }
+
+  function allowProbeSpeaker(probeId, userId, ttlMs = 90_000) {
+    if (!probeId || !userId) return { granted: false };
+    const expiresAt = Date.now() + Math.max(1_000, Number(ttlMs) || 90_000);
+    probeSpeakerGrants.set(String(probeId), { userId: String(userId), expiresAt });
+    logger.info(`Voice: probe speaker grant ${probeId} for user ${userId} (ttl=${ttlMs}ms)`);
+    return { granted: true, probeId: String(probeId), userId: String(userId), expiresAt };
+  }
+
+  function revokeProbeSpeaker(probeId) {
+    return probeSpeakerGrants.delete(String(probeId));
+  }
+
+  function probeSpeakerAllowed(userId) {
+    const now = Date.now();
+    for (const [probeId, grant] of probeSpeakerGrants) {
+      if (grant.expiresAt <= now) {
+        probeSpeakerGrants.delete(probeId);
+        continue;
+      }
+      if (grant.userId === String(userId)) return true;
+    }
+    return false;
   }
 
   // Realtime transcription callbacks — set externally
@@ -177,8 +208,9 @@ export function createVoiceManager(botClients, config, logger) {
       state.connection.receiver.speaking.on('start', (userId) => {
         if (!state.listening) return;
         if (state.activeSubscriptions.has(userId)) return;
-        // Ignore other bots to prevent ouroboros (bot transcribing its own TTS or other bots)
-        if (botUserIds.has(userId)) {
+        // Ignore other bots to prevent ouroboros (bot transcribing its own TTS
+        // or other bots) — unless a live probe grant names this bot user.
+        if (botUserIds.has(userId) && !probeSpeakerAllowed(userId)) {
           logger.debug(`Voice [${botName}]: ignoring bot user ${userId}`);
           return;
         }
@@ -1105,6 +1137,8 @@ export function createVoiceManager(botClients, config, logger) {
     clearLocalVoiceSession,
     muteMember,
     unmuteMember,
+    allowProbeSpeaker,
+    revokeProbeSpeaker,
     setAudioFrameCallback(cb) { onAudioFrame = cb; },
     setAudioEndCallback(cb) { onAudioEnd = cb; },
     setAudioCommitCallback(cb) { onAudioCommit = cb; },

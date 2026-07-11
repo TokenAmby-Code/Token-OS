@@ -2078,6 +2078,53 @@ async def purge_old_events() -> dict:
     return {"deleted": deleted}
 
 
+async def run_morning_voice_selftest() -> dict:
+    """Pre-morning Discord voice self-test (full audio-loop probe).
+
+    Fires the discord daemon's probe endpoint before the morning session so a
+    dead decoder / wedged Realtime handshake / missing tmuxctld voice target is
+    caught before the operator speaks. The daemon owns all surfacing (events
+    row always; alerts channel on fail/degraded); this task only records that
+    it fired. Operator VC presence aborts the probe silently — the operator
+    always wins.
+    """
+    try:
+        # Client timeout must outlast the probe's own 60s hard deadline.
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                f"{DISCORD_DAEMON_URL}/voice/selftest",
+                json={"variant": "full", "trigger": "cron"},
+            )
+        payload = resp.json() if resp.content else {}
+        if not resp.is_success:
+            # A non-2xx from the daemon (409 probe_in_progress, 5xx) means the
+            # probe did not run to a report — the daemon logged nothing, so
+            # record the failure event here.
+            await log_event(
+                "voice_selftest",
+                details={
+                    "overall": "fail",
+                    "error": f"HTTP {resp.status_code}",
+                    "trigger": "cron",
+                    "detail": payload,
+                },
+            )
+            return {"error": f"HTTP {resp.status_code}", "status_code": resp.status_code}
+        return {
+            "status_code": resp.status_code,
+            "overall": payload.get("overall"),
+            "probe_id": payload.get("probe_id"),
+        }
+    except Exception as e:
+        # The daemon being unreachable IS a failed selftest; the daemon cannot
+        # log its own absence, so record the event here.
+        await log_event(
+            "voice_selftest",
+            details={"overall": "fail", "error": str(e), "trigger": "cron"},
+        )
+        return {"error": str(e)}
+
+
 # Task registry mapping task IDs to their implementation functions
 TASK_REGISTRY = {
     "cleanup_stale_instances": cleanup_stale_instances,
@@ -2089,6 +2136,9 @@ TASK_REGISTRY = {
     "morning_supervisor_arm": arm_morning_supervisor,
     # 08:30 backstop: fires fan-out only if day hasn't started yet (Hatch broken).
     "day_start_schedule_fallback": fire_day_start_schedule_fallback,
+    # Pre-morning voice pipeline probe (full audio loop through the discord
+    # daemon). DB-driven schedule; the daemon owns surfacing.
+    "voice_selftest_morning": run_morning_voice_selftest,
     "checkin_morning_start": lambda: trigger_checkin("morning_start"),
     "checkin_mid_morning": lambda: trigger_checkin("mid_morning"),
     "checkin_decision_point": lambda: trigger_checkin("decision_point"),
