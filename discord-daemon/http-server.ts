@@ -2,13 +2,6 @@
 // Pure Node.js HTTP server (no Express/Fastify dependency needed)
 
 import { createServer } from 'http';
-import { createWriteStream, existsSync } from 'fs';
-import { mkdir, rename, unlink } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { createHash } from 'crypto';
-import { get as httpGet } from 'http';
-import { get as httpsGet } from 'https';
 import {
   DISCORD_MESSAGE_CONTENT_LIMIT,
   isDiscordContentLengthValidationError,
@@ -50,50 +43,6 @@ export function createHttpServer(
       if (cid === id) return name;
     }
     return id;
-  }
-
-
-  async function downloadVoiceArtifact(url, expectedSha) {
-    const cacheDir = join(tmpdir(), 'discord-voice-artifacts');
-    await mkdir(cacheDir, { recursive: true });
-    const nameHash = createHash('sha256').update(url).digest('hex').slice(0, 32);
-    const target = join(cacheDir, `${nameHash}.wav`);
-    if (existsSync(target)) return target;
-    // Download to a per-request temp path and rename into place so concurrent
-    // requests for the same url never interleave writes on the shared target,
-    // and a failed/mismatched download never leaves a bad file at target.
-    const partial = `${target}.${process.pid}.${Date.now()}.part`;
-    const getter = url.startsWith('https:') ? httpsGet : httpGet;
-    try {
-      await new Promise((resolve, reject) => {
-        const req = getter(url, (response) => {
-          if (response.statusCode !== 200) {
-            response.resume();
-            reject(new Error(`artifact download returned ${response.statusCode}`));
-            return;
-          }
-          const hash = createHash('sha256');
-          const out = createWriteStream(partial);
-          response.on('data', chunk => hash.update(chunk));
-          response.pipe(out);
-          out.on('finish', () => {
-            out.close(() => {
-              const actual = hash.digest('hex');
-              if (expectedSha && actual !== expectedSha) reject(new Error('artifact_hash_mismatch'));
-              else resolve();
-            });
-          });
-          out.on('error', reject);
-        });
-        req.on('error', reject);
-        req.setTimeout(180000, () => req.destroy(new Error('artifact_download_timeout')));
-      });
-      await rename(partial, target);
-    } catch (err) {
-      await unlink(partial).catch(() => {});
-      throw err;
-    }
-    return target;
   }
 
   function logOutboundResult(kind, target, result, content) {
@@ -554,15 +503,13 @@ export function createHttpServer(
         return json(res, { cleared: cleared.length, drafts: cleared });
       }
 
-      // POST /voice/play — Play an audio file or URL artifact in voice channel
+      // POST /voice/play — Play an audio file in voice channel
       if (method === 'POST' && path === '/voice/play') {
         if (!voiceManager) return json(res, { error: 'Voice not available' }, 501);
         const body = await parseBody(req);
-        let file = body.file;
-        if (body.url) file = await downloadVoiceArtifact(body.url, body.sha256);
-        if (!file) return json(res, { error: 'file path or url required' }, 400);
-        const result = await voiceManager.playAudio(file, body.bot || 'mechanicus');
-        return json(res, { ...result, transport: body.url ? 'openai_tts_wav_artifact' : result.transport });
+        if (!body.file) return json(res, { error: 'file path required' }, 400);
+        const result = await voiceManager.playAudio(body.file, body.bot || 'mechanicus');
+        return json(res, result);
       }
 
       // POST /voice/stop-playback — Stop current audio playback

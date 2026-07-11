@@ -88,7 +88,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import shared
 import talk as talk_service
 import temp_message as temp_message_service
-from billable import accrual_weight, classify_domain, classify_work_class, trickle_numerator
+from billable import accrual_weight, classify_work_class, trickle_numerator
 from context_governor import (
     ContextSweepRequest,
     record_context_governor_progress,
@@ -155,7 +155,6 @@ from pane_surface import (
     sanitize_human_surface as _sanitize_human_surface,
 )
 from personas import (
-    PROFILE_BY_SLUG,
     assign_astartes_persona,
     persona_to_profile,
     resolve_live_persona_instance,
@@ -572,14 +571,8 @@ async def send_prompt_to_pane(
     operation_id: str | None = None,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
-    expected_role: str | None = None,
 ) -> dict:
-    """Token-API pane prompt facade: tmuxctld is the only local byte boundary.
-
-    ``expected_role`` carries the REQUESTED semantic address (e.g.
-    ``council:custodes``) alongside the resolved pane so the daemon can enforce
-    its byte-time singleton addressee identity gate.
-    """
+    """Token-API pane prompt facade: tmuxctld is the only local byte boundary."""
     daemon_payload = await asyncio.to_thread(
         shared._tmuxctld_post_json,
         "/send-text",
@@ -589,7 +582,6 @@ async def send_prompt_to_pane(
             "clear_prompt": clear_prompt,
             "submit": submit,
             "verify": verify,
-            "expected_role": expected_role or "",
             # Two-level delivery contract: wait one initial 30-60s window for
             # the level-2 UserPromptSubmit hook, but level-1 bytes-delivered is
             # already success if the daemon send returns rc0.
@@ -5923,7 +5915,6 @@ async def enqueue_pane_write(
     operation_id: str | None = None,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
-    expected_role: str | None = None,
 ) -> dict:
     if not (tmux_pane or "").strip():
         raise ValueError("pane write requires a concrete tmux pane target")
@@ -5957,7 +5948,6 @@ async def enqueue_pane_write(
                                 "hook_driven": bool(hook_driven),
                                 "hook_echo_pane": hook_echo_pane or "",
                                 "correlation_id": correlation_id or queue_id,
-                                "expected_role": expected_role or "",
                             },
                         },
                         sort_keys=True,
@@ -5989,7 +5979,6 @@ async def enqueue_pane_write(
                 or str(existing_effects.get("hook_echo_pane") or "") != str(hook_echo_pane or "")
                 or str(existing_effects.get("correlation_id") or queue_id)
                 != str(correlation_id or queue_id)
-                or str(existing_effects.get("expected_role") or "") != str(expected_role or "")
             ):
                 raise ValueError(
                     "pane write operation_id reused for different target/payload/effects"
@@ -6086,7 +6075,6 @@ async def _tmux_send_payload_then_submit(
     operation_id: str | None = None,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
-    expected_role: str | None = None,
 ) -> dict:
     """Backward-compatible prompt send wrapper; local delivery is tmuxctld only.
 
@@ -6101,7 +6089,6 @@ async def _tmux_send_payload_then_submit(
         operation_id=operation_id,
         hook_echo_pane=hook_echo_pane,
         correlation_id=correlation_id,
-        expected_role=expected_role,
     )
 
 
@@ -6211,7 +6198,6 @@ async def process_pane_write_queue_once(
             effects = {}
         hook_echo_pane = str(effects.get("hook_echo_pane") or "")
         correlation_id = str(effects.get("correlation_id") or item["id"])
-        expected_role = str(effects.get("expected_role") or "")
         try:
             # Some system prompts clear/replace a stale composer rather than
             # deferring forever. Live symptom: leftover Codex/Claude drafts kept
@@ -6255,7 +6241,6 @@ async def process_pane_write_queue_once(
                     operation_id=item["id"],
                     hook_echo_pane=hook_echo_pane,
                     correlation_id=correlation_id,
-                    expected_role=expected_role,
                 )
             else:
                 send_result = await _tmux_send_payload_then_submit(
@@ -6264,7 +6249,6 @@ async def process_pane_write_queue_once(
                     operation_id=item["id"],
                     hook_echo_pane=hook_echo_pane,
                     correlation_id=correlation_id,
-                    expected_role=expected_role,
                 )
             if send_result.get("gated"):
                 # Gate suppressed the send (no bytes issued). Keep the item
@@ -13382,7 +13366,6 @@ async def _direct_tmux_pane_delivery(
     operation_id: str | None = None,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
-    expected_role: str | None = None,
 ) -> dict:
     """Deliver directly to a live pane when no registry row exists.
 
@@ -13418,7 +13401,6 @@ async def _direct_tmux_pane_delivery(
         operation_id=operation_id,
         hook_echo_pane=hook_echo_pane,
         correlation_id=correlation_id,
-        expected_role=expected_role,
     )
     if send_result.get("gated"):
         # Direct rowless sends have no registry row, but they still must not
@@ -13436,7 +13418,6 @@ async def _direct_tmux_pane_delivery(
             operation_id=operation_id,
             hook_echo_pane=hook_echo_pane,
             correlation_id=correlation_id,
-            expected_role=expected_role,
         )
         drained = await process_pane_write_queue_once(queued["id"])
         result = drained[0] if drained else queued
@@ -13465,7 +13446,6 @@ async def _talk_send_payload(
     hook_driven: bool = False,
     hook_echo_pane: str | None = None,
     correlation_id: str | None = None,
-    expected_role: str | None = None,
 ) -> dict:
     """Inject `payload` into ``target_pane`` via the existing pane-write queue.
 
@@ -13480,7 +13460,6 @@ async def _talk_send_payload(
         hook_driven=hook_driven,
         hook_echo_pane=hook_echo_pane,
         correlation_id=correlation_id,
-        expected_role=expected_role,
     )
     drained = await process_pane_write_queue_once(queued["id"])
     return drained[0] if drained else queued
@@ -13497,12 +13476,8 @@ async def talk_send(request: TalkSendRequest):
     """
     caller_raw = request.caller_pane.strip()
     target_raw = request.target_pane.strip()
-    try:
-        caller_pane = await talk_service.resolve_pane(caller_raw)
-        target_pane = await talk_service.resolve_pane(target_raw)
-    except talk_service.AmbiguousPaneTarget as exc:
-        # Loud non-delivery: an ambiguous semantic address reaches ZERO panes.
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    caller_pane = await talk_service.resolve_pane(caller_raw)
+    target_pane = await talk_service.resolve_pane(target_raw)
     if not caller_pane:
         raise HTTPException(
             status_code=400,
@@ -13545,7 +13520,6 @@ async def talk_send(request: TalkSendRequest):
                 hook_driven=talk_hook_driven,
                 hook_echo_pane=caller_pane,
                 correlation_id=returned["talk_id"],
-                expected_role=target_raw,
             )
             if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
@@ -13596,7 +13570,6 @@ async def talk_send(request: TalkSendRequest):
                 operation_id=record["talk_id"],
                 hook_echo_pane=caller_pane,
                 correlation_id=record["talk_id"],
-                expected_role=target_raw,
             )
             if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
@@ -13611,7 +13584,6 @@ async def talk_send(request: TalkSendRequest):
                 hook_driven=talk_hook_driven,
                 hook_echo_pane=caller_pane,
                 correlation_id=record["talk_id"],
-                expected_role=target_raw,
             )
             if not _pane_delivery_is_accepted_for_await(send_result):
                 raise RuntimeError(
@@ -13663,14 +13635,9 @@ async def brief_send(request: BriefSendRequest):
     # hook_driven classification: flag each target unless the SENDER is Custodes
     # (Emperor-proxied → no flag). An absent/unknown caller is not Custodes →
     # flag (agent-to-agent / system default; typing-guard still overrides).
-    try:
-        caller_resolved = (
-            await talk_service.resolve_pane(request.caller_pane) if request.caller_pane else None
-        )
-    except talk_service.AmbiguousPaneTarget:
-        # Ambiguous CALLER identity must not block the send; fail toward the
-        # stricter hook_driven classification (unknown sender is not Custodes).
-        caller_resolved = None
+    caller_resolved = (
+        await talk_service.resolve_pane(request.caller_pane) if request.caller_pane else None
+    )
     brief_hook_driven = not await _pane_sender_is_custodes(caller_resolved)
 
     resolved, unresolved = await talk_service.resolve_brief_targets(
@@ -13689,34 +13656,16 @@ async def brief_send(request: BriefSendRequest):
     delivered: list[dict] = []
     for target in resolved:
         pane_id = target["pane_id"]
-        # Scope idempotency to the REQUESTED address, not the resolved %pane: a
-        # blind retry of the same logical send whose resolution drifted to a
-        # different physical pane must reuse the same operation id, so the
-        # daemon idempotency layer collapses it (or loudly refuses the reuse)
-        # instead of double-delivering — the redelivery-storm amplifier in the
-        # custodes→malcador misroute. Page fan-outs stay unique per seat via
-        # the live position id.
-        if target.get("source") == "pane":
-            target_scope = target["spec"]
-        else:
-            target_scope = f"{target.get('spec')}:{target.get('position_id') or pane_id}"
         idempotency_key = request.idempotency_key
         if not (idempotency_key or "").strip():
             # Idempotency-by-default (issue #480 double-send): a keyless brief
-            # derives a DETERMINISTIC key from (requested target, payload) so
-            # blind transport or tool retries of the same logical send collapse
-            # onto one operation_id and dedupe (tmuxctld idempotency cache on
-            # the rowless path, pane_write_queue id on the registry path). An
-            # explicit caller-provided key stays authoritative.
-            idempotency_key = f"auto:{target_scope}:{_prompt_payload_hash(request.payload)}"
-        operation_id = _scoped_send_operation_id(
-            "brief", idempotency_key, target_scope, request.payload
-        )
-        # For --pane sends the requested spec IS the addressee; the daemon's
-        # byte-time singleton identity gate keys on it (no-op for non-singleton
-        # specs and raw %NN). Page fan-outs are addressed to the page, not a
-        # singleton seat, so they carry no expected role.
-        expected_role = target["spec"] if target.get("source") == "pane" else None
+            # derives a DETERMINISTIC key from (pane, payload) so blind transport
+            # or tool retries of the same logical send collapse onto one
+            # operation_id and dedupe (tmuxctld idempotency cache on the rowless
+            # path, pane_write_queue id on the registry path). An explicit
+            # caller-provided key stays authoritative.
+            idempotency_key = f"auto:{pane_id}:{_prompt_payload_hash(request.payload)}"
+        operation_id = _scoped_send_operation_id("brief", idempotency_key, pane_id, request.payload)
         try:
             if request.ephemeral:
                 # Reuse the temp_message semantic side-channel infra. The
@@ -13732,7 +13681,6 @@ async def brief_send(request: BriefSendRequest):
                     request.payload,
                     engine,
                     instance_id=(instance or {}).get("id") or pane_id,
-                    expected_role=expected_role,
                     queue_sender=enqueue_pane_write,
                     queue_drainer=process_pane_write_queue_once,
                 )
@@ -13751,7 +13699,6 @@ async def brief_send(request: BriefSendRequest):
                         operation_id=operation_id,
                         hook_echo_pane=caller_resolved,
                         correlation_id=operation_id,
-                        expected_role=expected_role,
                     )
                 else:
                     queued = await enqueue_pane_write(
@@ -13764,7 +13711,6 @@ async def brief_send(request: BriefSendRequest):
                         operation_id=operation_id,
                         hook_echo_pane=caller_resolved,
                         correlation_id=operation_id,
-                        expected_role=expected_role,
                     )
                     drained = await process_pane_write_queue_once(queued["id"])
                     receipt = drained[0] if drained else queued
@@ -13792,7 +13738,6 @@ async def brief_send(request: BriefSendRequest):
                         operation_id=operation_id,
                         hook_echo_pane=caller_resolved,
                         correlation_id=operation_id,
-                        expected_role=expected_role,
                     )
                     receipt = {
                         **receipt,
@@ -21161,10 +21106,6 @@ async def _ops_read_instances(now: datetime) -> dict:
                 # singleton trigger exempts them, so UI breach-marking must too.
                 "commander_type": inst.get("commander_type"),
                 "work_class": work_class,
-                # Fleet-queue domain (cwd oracle, see classify_domain) — picks the
-                # cockpit's LEFT (token-os) vs RIGHT (askcivic) worker system. The
-                # browser receives this enum, never a raw path decision.
-                "domain": classify_domain(inst.get("working_dir")),
                 "golden_throne": inst.get("golden_throne"),
                 # "Agent has PR open" flag (Phase 1) — /ui/ops renders a badge linking
                 # pr_url when pr_state == 'open'. Flipped to 'merged' by CD (Phase 2).
@@ -22300,180 +22241,6 @@ async def _ops_read_tmuxctld_health() -> dict:
     }
 
 
-def _ops_tmuxctld_error_occupancy(generated_at: datetime, message: str) -> dict:
-    return {
-        "status": "bad",
-        "generated_at": generated_at.isoformat(),
-        "total": 0,
-        "occupied": 0,
-        "free": 0,
-        "dead": 0,
-        "protected": 0,
-        "drift": 0,
-        "unknown": 0,
-        "errors": [message],
-        "cells": [],
-    }
-
-
-def _ops_public_pane_ref(row: dict) -> str:
-    for key in ("pane_positional_id", "pane_role", "role"):
-        value = row.get(key)
-        if value is None:
-            continue
-        text = str(value)
-        if text and ":" in text:
-            return text
-    return ""
-
-
-def _ops_tmux_cell_state(row: dict, free_ids: set[str]) -> str:
-    pane_ref = _ops_public_pane_ref(row)
-    raw_state = str(row.get("state") or row.get("status") or "").lower()
-    if raw_state in {"dead", "protected", "drift", "unknown", "free", "occupied"}:
-        return raw_state
-    if row.get("dead") or row.get("pane_dead"):
-        return "dead"
-    if row.get("protected") or row.get("is_protected"):
-        return "protected"
-    if row.get("drift") or row.get("projection_drift"):
-        return "drift"
-    if row.get("instance_id") or row.get("persona") or row.get("wrapper_id"):
-        return "occupied"
-    if pane_ref and pane_ref in free_ids:
-        return "free"
-    return "unknown" if pane_ref else "drift"
-
-
-def _ops_normalize_tmux_payload(
-    payload: dict | list | Exception, surface: str, errors: list[str]
-) -> dict | list:
-    if isinstance(payload, Exception):
-        errors.append(f"tmuxctld {surface} unavailable: {payload}")
-        return []
-    if not isinstance(payload, dict):
-        return payload
-    result = payload.get("result", payload)
-    if surface == "ledger" and isinstance(result, dict) and isinstance(result.get("rows"), list):
-        return result["rows"]
-    return result
-
-
-def _ops_tmux_ledger_row_is_current(row: dict) -> bool:
-    raw_state = str(row.get("state") or row.get("status") or "").upper()
-    return raw_state not in {"CLOSED", "EXITED", "DEAD"}
-
-
-def _ops_build_tmux_occupancy(
-    generated_at: datetime,
-    health: dict,
-    ledger_payload: dict | list | Exception,
-    freelist_payload: dict | list | Exception,
-) -> dict:
-    errors: list[str] = []
-    ledger_rows = _ops_normalize_tmux_payload(ledger_payload, "ledger", errors)
-    freelist = _ops_normalize_tmux_payload(freelist_payload, "freelist", errors)
-    if not isinstance(ledger_rows, list):
-        errors.append("tmuxctld ledger rows malformed")
-        ledger_rows = []
-    if not isinstance(freelist, list):
-        errors.append("tmuxctld freelist malformed")
-        freelist = []
-    free_ids = {
-        _ops_public_pane_ref(item)
-        for item in freelist
-        if isinstance(item, dict) and _ops_public_pane_ref(item)
-    }
-    cells: list[dict] = []
-    seen: set[str] = set()
-    for row in ledger_rows:
-        if not isinstance(row, dict):
-            errors.append("tmuxctld ledger row malformed")
-            continue
-        if not _ops_tmux_ledger_row_is_current(row):
-            continue
-        pane_positional_id = _ops_public_pane_ref(row)
-        state = _ops_tmux_cell_state(row, free_ids)
-        if pane_positional_id:
-            seen.add(pane_positional_id)
-        cells.append(
-            {
-                "pane_positional_id": pane_positional_id or None,
-                "instance_id": row.get("instance_id"),
-                "persona": row.get("persona") or row.get("persona_slug"),
-                "engine": row.get("engine"),
-                "working_dir": row.get("working_dir") or row.get("cwd"),
-                "wrapper_id": row.get("wrapper_id"),
-                "state": state,
-                "source": "tmuxctld:ledger",
-            }
-        )
-    for item in freelist:
-        if not isinstance(item, dict):
-            continue
-        pane_positional_id = _ops_public_pane_ref(item)
-        if pane_positional_id and pane_positional_id not in seen:
-            cells.append(
-                {
-                    "pane_positional_id": pane_positional_id,
-                    "instance_id": None,
-                    "persona": None,
-                    "engine": None,
-                    "working_dir": None,
-                    "wrapper_id": None,
-                    "state": "free",
-                    "source": "tmuxctld:freelist",
-                }
-            )
-            seen.add(pane_positional_id)
-    counts = {
-        key: sum(1 for c in cells if c.get("state") == key)
-        for key in ["occupied", "free", "dead", "protected", "drift", "unknown"]
-    }
-    status = (
-        "bad"
-        if not health.get("reachable")
-        else "warn"
-        if errors or counts["dead"] or counts["drift"] or counts["unknown"]
-        else "ok"
-    )
-    return {
-        "status": status,
-        "generated_at": generated_at.isoformat(),
-        "total": len(cells),
-        **counts,
-        "errors": errors,
-        "cells": cells,
-    }
-
-
-async def _ops_read_tmuxctld_snapshot(generated_at: datetime) -> dict:
-    health = await _ops_read_tmuxctld_health()
-    if not health.get("reachable"):
-        health["occupancy"] = _ops_tmuxctld_error_occupancy(
-            generated_at, health.get("error") or "tmuxctld unreachable"
-        )
-        return health
-    try:
-        base = shared._tmuxctld_url(default_loopback=True)
-
-        def read_json(path: str):
-            with shared._TMUXCTLD_OPENER.open(f"{base}{path}", timeout=3.0) as resp:
-                return json.loads(resp.read().decode(errors="ignore") or "{}")
-
-        ledger_payload, freelist_payload = await asyncio.gather(
-            asyncio.to_thread(read_json, "/ledger/rows"),
-            asyncio.to_thread(read_json, "/freelist"),
-            return_exceptions=True,
-        )
-        health["occupancy"] = _ops_build_tmux_occupancy(
-            generated_at, health, ledger_payload, freelist_payload
-        )
-    except Exception as exc:
-        health["occupancy"] = _ops_tmuxctld_error_occupancy(generated_at, str(exc))
-    return health
-
-
 async def _ops_collect_facts(now: datetime) -> dict:
     """Collect the shared facts backing both ops cockpit state and ops status."""
     sources: dict[str, dict] = {
@@ -22563,22 +22330,7 @@ async def _ops_collect_facts(now: datetime) -> dict:
         record_error("agents_db", exc)
         work_actions = _ops_empty_work_actions()
 
-    # Muster Ledger feed for the kanban board (#671 contract: the board consumes
-    # useOpsState — the feed is embedded here, never a second board-side poller).
-    # Capped at 4/lane: the board is a today-only glance surface, not an index.
-    try:
-        session_docs = await _ops_session_docs_feed(limit_per_lane=4)
-    except Exception as exc:
-        logger.warning("Ops fact collection failed reading session docs: %s", exc)
-        session_docs = {
-            "generated_at": now.isoformat(),
-            "lane_totals": {},
-            "limit_per_lane": 4,
-            "docs": [],
-            "error": str(exc),
-        }
-
-    tmux_health = await _ops_read_tmuxctld_snapshot(now)
+    tmux_health = await _ops_read_tmuxctld_health()
 
     if "agents_db" in source_errors:
         sources["agents_db"] = _ops_source_health(
@@ -22610,25 +22362,13 @@ async def _ops_collect_facts(now: datetime) -> dict:
             details={"mode": timer_engine.current_mode.value},
         )
 
-    tmux_occupancy_status = (tmux_health.get("occupancy") or {}).get("status")
     sources["tmuxctld"] = _ops_source_health(
-        "bad"
-        if not tmux_health.get("reachable") or tmux_occupancy_status == "bad"
-        else "warn"
-        if tmux_occupancy_status == "warn"
-        else "ok",
+        "ok" if tmux_health.get("reachable") else "warn",
         available=bool(tmux_health.get("reachable")),
-        message="tmuxctld occupancy degraded"
-        if tmux_health.get("reachable") and tmux_occupancy_status in {"warn", "bad"}
-        else "tmuxctld health available"
+        message="tmuxctld health available"
         if tmux_health.get("reachable")
         else "tmuxctld health unavailable",
-        details={
-            "error": tmux_health.get("error"),
-            "tmux_reachable": tmux_health.get("tmux_reachable"),
-            "occupancy_status": tmux_occupancy_status,
-            "occupancy_errors": (tmux_health.get("occupancy") or {}).get("errors", []),
-        },
+        details=tmux_health,
     )
 
     sources["cron"] = _ops_source_health(
@@ -22746,7 +22486,6 @@ async def _ops_collect_facts(now: datetime) -> dict:
         "enforcement": enforcement_summary,
         "tts": tts_summary,
         "work_actions": work_actions,
-        "session_docs": session_docs,
         "assertions": assertions,
         "timer": timer_snapshot,
         "attention": attention_snapshot,
@@ -22847,7 +22586,6 @@ def _ops_build_ui_state(facts: dict) -> dict:
         "enforcement": facts["enforcement"],
         "tmux": facts["tmux"],
         "work_actions": facts["work_actions"],
-        "session_docs": facts["session_docs"],
     }
 
 
@@ -22901,8 +22639,7 @@ def _ops_build_status(facts: dict) -> dict:
             "version": tmux_health.get("version"),
             "sha": tmux_health.get("sha"),
             "live_instance_panes": None,
-            "projection_drift": (tmux_health.get("occupancy") or {}).get("drift"),
-            "occupancy": tmux_health.get("occupancy"),
+            "projection_drift": None,
         },
         "tts": {
             "current": current_tts_label,
@@ -23344,16 +23081,17 @@ def _ops_session_doc_head(body: str, limit: int = 160) -> str | None:
     return None
 
 
-async def _ops_session_docs_feed(
+@app.get("/api/ui/ops/session-docs")
+async def get_ops_session_docs(
     include_archived: bool = False,
     limit_per_lane: int = 12,
-) -> dict:
-    """Build the read-only pipeline-board feed for the ops cockpit.
+):
+    """Read-only pipeline-board feed for the ops cockpit.
 
     Groups DB-registered session docs into status lanes, each doc carrying a
     one-line *head excerpt* and an `obsidian://` deep-link. The cockpit never
     renders more than the head — the document is authored and read in Obsidian
-    (the single writer of `status:`). This builder performs no mutations.
+    (the single writer of `status:`). This endpoint performs no mutations.
 
     `archived` docs are excluded by default (there are hundreds). Each lane is
     capped at `limit_per_lane` most-recently-*created* docs; `lane_totals`
@@ -23361,9 +23099,6 @@ async def _ops_session_docs_feed(
     rather than silently truncating. Ordering is by `created_at` because
     `updated_at` is unreliable (bulk-touched), and age-since-creation honestly
     surfaces docs that have been open a long time.
-
-    Shared by GET /api/ui/ops/session-docs and the OpsState embed (the kanban
-    board consumes useOpsState per the #671 contract — one poller, one feed).
     """
     from urllib.parse import quote
 
@@ -23434,46 +23169,6 @@ async def _ops_session_docs_feed(
             note = note_rel[:-3] if note_rel.endswith(".md") else note_rel
             obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
 
-        # Rubric summary for the kanban card. evaluate_rubric is pure and the
-        # frontmatter is already in hand (read post-cap), so this adds zero I/O.
-        # `present` is the load-bearing flag: a missing rubric evaluates as
-        # complete:true so legacy docs never trip GT, and the cockpit must key
-        # every rubric treatment on `present` — never `complete` alone.
-        # Frontmatter is untrusted operator-authored YAML; any surprise shape
-        # degrades to the present:false fallback rather than failing the feed.
-        try:
-            rubric_status = evaluate_rubric(fm)
-            rubric_total = len(rubric_status.rubric)
-            rubric_summary = {
-                "present": rubric_status.present,
-                "complete": rubric_status.complete,
-                "met": rubric_total - len(rubric_status.missing) - len(rubric_status.skipped),
-                "total": rubric_total,
-                "skipped": len(rubric_status.skipped),
-                "first_unmet": rubric_status.missing[0] if rubric_status.missing else None,
-                "notified_at": rubric_status.notified_at,
-                "acknowledged_at": rubric_status.acknowledged_at,
-            }
-        except Exception:
-            rubric_summary = {
-                "present": False,
-                "complete": False,
-                "met": 0,
-                "total": 0,
-                "skipped": 0,
-                "first_unmet": None,
-                "notified_at": None,
-                "acknowledged_at": None,
-            }
-
-        persona_slug = fm.get("persona_slug") or fm.get("persona") or fm.get("legion")
-        profile = PROFILE_BY_SLUG.get(persona_slug or "")
-        persona_summary = {
-            "slug": persona_slug,
-            "chip_color": (profile or {}).get("chip_color"),
-            "display_name": (profile or {}).get("display_name"),
-        }
-
         created = d.get("created_at")
         session_date, session_date_source = _ops_session_doc_date_basis(fm, created)
         age_seconds = None
@@ -23496,10 +23191,8 @@ async def _ops_session_docs_feed(
                 "status": status,
                 "project": d.get("project") or fm.get("project"),
                 "primarch": d.get("primarch_name") or fm.get("primarch"),
-                "persona_slug": persona_slug,
-                "persona": persona_summary,
+                "persona_slug": fm.get("persona_slug") or fm.get("persona") or fm.get("legion"),
                 "golden_throne": fm.get("golden_throne") or fm.get("instance_type"),
-                "rubric": rubric_summary,
                 "head": head,
                 "created_at": created,
                 "session_date": session_date,
@@ -23515,17 +23208,6 @@ async def _ops_session_docs_feed(
         "limit_per_lane": max(1, limit_per_lane),
         "docs": docs,
     }
-
-
-@app.get("/api/ui/ops/session-docs")
-async def get_ops_session_docs(
-    include_archived: bool = False,
-    limit_per_lane: int = 12,
-) -> dict:
-    """Read-only pipeline-board feed — see _ops_session_docs_feed."""
-    return await _ops_session_docs_feed(
-        include_archived=include_archived, limit_per_lane=limit_per_lane
-    )
 
 
 # [MOVED to shared.py / routes/tts.py] — was: # ============ TTS/Notification System ===========

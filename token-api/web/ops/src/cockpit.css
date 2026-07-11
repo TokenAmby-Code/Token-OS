@@ -82,9 +82,6 @@
 
   --radius: 12px;
   --radius-sm: 7px;
-  /* card plates only — the fat rounding that makes a kanban card read as a
-     seated gold plate rather than ops-board chrome. */
-  --radius-card: 16px;
 
   font-family: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
   font-size: 15px;
@@ -362,13 +359,6 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   30%  { transform: translate(var(--tts-unit), calc(var(--n) * var(--tts-unit))); } /* right 1 */
   70%  { transform: translate(var(--tts-unit), 0); }                                /* up n    */
   100% { transform: translate(0,               0); }                                /* left 1 → slot 0 */
-}
-
-
-.tts-stack .ring.tts-dial--error {
-  animation: none;
-  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.55), 0 0 18px color-mix(in srgb, var(--error) 90%, transparent);
-  outline: 2px solid color-mix(in srgb, var(--error) 80%, transparent);
 }
 
 /* SPEAKING — reverberation, applied only once the dial has LANDED at the head
@@ -815,10 +805,8 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
    reads as a bottom rail (cap → left, chips → below the bar). */
 .idle-worker-queue {
   /* Fixed in the FIRST viewport at ~80vh so both crossbars (the mid-page worker
-     crossbar and this idle crossbar) are visible at once; the kanban board
-     (.kanban) fills the band between them. Position is INDEPENDENT of
-     queue depth. Mirrored in OpsCockpit.tsx as KANBAN_IDLE_TOP_VH — the board
-     maps the flipped crossbar into page coords from it; change one, change both. */
+     crossbar and this idle crossbar) are visible at once, with clear space between
+     them for the future kanban board. Position is INDEPENDENT of queue depth. */
   position: absolute;
   left: 0;
   right: 0;
@@ -838,9 +826,7 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
    LEFT and the chips hang BELOW the bar. The reused rail draws at FIXED local y
    (inherited from the full-page arc geometry, ~246px·uiScale centre), so we pivot
    about THAT point — not the section centre — to keep the band framed regardless
-   of the section height. The ClockDial counter-rotates in SVG to stay upright.
-   The 246px pivot is mirrored in OpsCockpit.tsx as KANBAN_IDLE_FLIP_PIVOT_PX —
-   the kanban board unflips the crossbar with it; change one, change both. */
+   of the section height. The ClockDial counter-rotates in SVG to stay upright. */
 .worker-queues--flip {
   transform: rotate(180deg);
   transform-origin: 50% calc(246px * var(--ui-scale, 1));
@@ -866,11 +852,11 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   pointer-events: auto;
   transition: transform 320ms ease;
 }
-/* the visible round dial — translucent surface fill, NO brass border: the
-   per-chip tone lives on `color` (inline) and the currentColor glow ring IS the
-   dial's edge — a brass instrument ring underneath it clashed with the glow
-   (Emperor's ruling, kanban-docs-wiring wave). Collapse/fade on dismiss rides
-   the inner disc so the outer transform (slot position) is never disturbed. */
+/* the visible round dial — same instrument chrome as the old worker rings
+   (translucent surface fill + brass border). The per-chip tone lives on `color`
+   (inline), tinting ONLY the currentColor icon + the hover glow; the border stays
+   brass. Collapse/fade on dismiss rides the inner disc so the outer transform
+   (slot position) is never disturbed. */
 .worker-chip__disc {
   display: grid;
   place-items: center;
@@ -878,7 +864,7 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   height: 100%;
   border-radius: 50%;
   background: color-mix(in srgb, var(--surface) 55%, transparent);
-  border: 0;
+  border: var(--instrument-w) solid var(--instrument);
   /* always-on tone edge glow — mirrors the TTS .ring base halo (currentColor
      here, since the chip's tone rides `color` inline), so every worker disc
      carries the same beveled tone bleed the TTS dials do. The richer :hover
@@ -946,22 +932,6 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   stroke: none;
   mix-blend-mode: screen;
 }
-/* LEMON REVERB — a resident seat whose instance is actively WORKING. Same
-   reverberation family as the TTS head dial's throb (tts-glow, 1.6s), slowed to
-   a long breath: the rim glow swells to full and settles, forever, while the
-   core dips slightly in counter-phase so the whole section reads as breathing.
-   Idle seats carry no class and render the static glow above byte-identically.
-   Reduced motion: the global animation kill leaves exactly that static glow. */
-.segment--reverb .section-rim { animation: lemon-reverb-rim 3.2s ease-in-out infinite; }
-.segment--reverb .section-core { animation: lemon-reverb-core 3.2s ease-in-out infinite; }
-@keyframes lemon-reverb-rim {
-  0%, 100% { opacity: 0.55; }
-  50%      { opacity: 1; }
-}
-@keyframes lemon-reverb-core {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.65; }
-}
 /* lower lemon boundary — the inverted arc that mirrors the connecting arc. A SOLID
    gold instrument line, identical weight/colour to .arc-line, so the two close into
    one clean lens (was a faint dashed worker guide). */
@@ -970,127 +940,6 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
   stroke: var(--instrument);
   stroke-width: var(--instrument-w);
   stroke-linecap: round;
-}
-
-/* ══ KANBAN ═══════════════════════════════════════════════════════════════════
-   The Muster Ledger — today's session-doc cards on the gold board filling the
-   band between the worker crossbar and the idle crossbar. Live ink, still
-   INERT: read-only projection of the OpsState session_docs feed (Obsidian is
-   the sole writer of status); pointer-events stay off, no interaction.
-   GEOMETRY-BOUND: an inset:0 page layer (like the crossbar assemblies); the
-   component positions every seam and column inline off railCrossbar — the SAME
-   curve+span both rails render from — so the board hugs the bars' bows and
-   never reaches past the handlebar ends into the drain ditches. No static band
-   maths lives here anymore.
-   NO outer border, NO column chrome: gold-outlined plates on the bare metal,
-   seamed only by dashed SVG dividers. Column count is the KANBAN_COLUMNS config
-   array in OpsCockpit.tsx — the only knob.
-   Z-ORDER INVARIANT: z:40 — above the composition layers (arc z:3, hub z:4,
-   worker rails z:6) but strictly BELOW the idle-worker-queue (z:62): idle chips
-   climbing up and clobbering the board is the intended "too many idle" error
-   signifier. Never raise this past 61. */
-.kanban {
-  position: absolute;
-  inset: 0;
-  z-index: 40;
-  pointer-events: none;
-}
-.kanban__svg {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  overflow: visible;
-}
-
-/* Column seams — dashed SVG verticals running crossbar-to-crossbar, each end
-   landing on the bar's bow (endpoints + dasharray set inline, uiScale-scaled).
-   Deliberately NOT routed through --instrument: the translucency IS the point
-   (the alpha-never-a-knob doctrine governs instrument strokes; these seams are
-   furniture, not instrument). */
-.kanban__seam {
-  fill: none;
-  stroke: var(--brass-deep);
-  stroke-opacity: 0.32;
-  stroke-width: 1;
-}
-
-/* Columns wear no chrome — position/size arrive inline from the component
-   (sampled off the crossbar curves); the seams are the SVG layer's. */
-.kanban__col {
-  position: absolute;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-/* column header — quiet Roman-numeral chrome, no underline */
-.kanban__col-head {
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: calc(11.5px * var(--ui-scale, 1));
-  font-weight: 600;
-  text-transform: uppercase; /* ALL CAPS (Emperor's ruling) — supersedes the small-caps chrome */
-  letter-spacing: 0.22em;
-  text-align: center;
-  color: var(--muted);
-  padding: 0 2px calc(9px * var(--ui-scale, 1));
-}
-
-.kanban__col-body {
-  flex: 1;
-  min-height: 0;
-  overflow: hidden; /* static plates — the band never grows past the idle rail */
-  display: flex;
-  flex-direction: column;
-  gap: calc(10px * var(--ui-scale, 1));
-}
-
-/* The plate — TITLE-ONLY by Emperor's ruling (2026-07-09): one readable line
-   written directly on the plate. The v4 ink (toprow/stamp, accusation, rubric
-   pips, left filament) is excised — it returns in deliberate later waves,
-   re-cut from git history. The background mirrors the rail band's FROZEN
-   bandFill: 0.14 (RAIL_SHAPE_DEFAULTS) — the same faint brass wash over the
-   page metal, so plates and table lip read as one material; keep the 14% in
-   step with bandFill if that ever moves. Border thinned to a hairline 1px —
-   deliberately NOT var(--instrument-w): that token is shared by the arc, rim
-   and horizon strokes and must not move with the plates. Still inert: no
-   hover, no motion, no pointer. Fixed plate height — the board keeps its
-   rhythm; a title that overruns ellipsizes, never grows. */
-.kanban-card {
-  flex: none;
-  height: calc(56px * var(--ui-scale, 1));
-  border-radius: var(--radius-card);
-  border: 1px solid var(--instrument);
-  background: color-mix(in srgb, var(--instrument) 14%, var(--bg-deep));
-  padding: 0 calc(14px * var(--ui-scale, 1));
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.kanban-card__title {
-  min-width: 0;
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: calc(15px * var(--ui-scale, 1));
-  font-weight: 600;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* honesty counter — "+N more": the lane truly holds more docs than the board
-   shows (per-lane feed cap + today filter). Quiet mono, never a card. */
-.kanban__more {
-  flex: none;
-  text-align: center;
-  font-family: 'IBM Plex Mono', ui-monospace, monospace;
-  font-size: calc(11px * var(--ui-scale, 1));
-  color: var(--faint);
-  padding-top: calc(2px * var(--ui-scale, 1));
 }
 
 /* ══ coordinate-capture placement layer (authoring tool, mockup only) ═════════
@@ -1257,14 +1106,3 @@ h1, h2, h3 { font-family: 'Chakra Petch', sans-serif; }
    Future portrait reflows / data-driven per-size tweaks belong HERE, nowhere else.
    Breakpoint: --bp-narrow = 720px (media queries take the literal below).
    ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Shared instrument spinner primitive. Compass pointer and clock hands both use
-   this CSS animation so local full-motion cockpit instruments do not depend on
-   SVG SMIL support and do not freeze under OS reduced-motion preferences. */
-.instrument-spinner {
-  animation: instrument-spin var(--instrument-spin-duration, 18s) linear infinite;
-  will-change: transform;
-}
-@keyframes instrument-spin {
-  100% { transform: rotate(360deg); }
-}

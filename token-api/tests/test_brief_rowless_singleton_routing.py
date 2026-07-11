@@ -211,13 +211,12 @@ async def test_brief_registry_row_path_still_uses_queue(
         main.BriefSendRequest(panes=["council:custodes"], payload="row path")
     )
 
-    # Idempotency-by-default: a keyless brief derives a deterministic
-    # operation_id from the REQUESTED target spec + payload (not the resolved
-    # %pane) so blind retries dedupe even across resolution drift.
+    # Idempotency-by-default: a keyless brief still derives a deterministic
+    # operation_id from (pane, payload) so blind retries dedupe on the queue.
     expected_operation_id = main._scoped_send_operation_id(
         "brief",
-        f"auto:council:custodes:{main._prompt_payload_hash('row path')}",
-        "council:custodes",
+        f"auto:%46:{main._prompt_payload_hash('row path')}",
+        "%46",
         "row path",
     )
     assert expected_operation_id is not None
@@ -233,7 +232,6 @@ async def test_brief_registry_row_path_still_uses_queue(
             "operation_id": expected_operation_id,
             "hook_echo_pane": None,
             "correlation_id": expected_operation_id,
-            "expected_role": "council:custodes",
         }
     ]
     assert "fallback" not in result["resolved"][0]
@@ -384,8 +382,8 @@ async def test_brief_rowless_unverified_issued_bytes_stays_unverified(
     # rowless/codex direct path; pending UserPromptSubmit is level-2, not delivery failure.
     expected_operation_id = main._scoped_send_operation_id(
         "brief",
-        f"auto:council:pax:{main._prompt_payload_hash('codex probe')}",
-        "council:pax",
+        f"auto:%44:{main._prompt_payload_hash('codex probe')}",
+        "%44",
         "codex probe",
     )
     assert expected_operation_id is not None
@@ -592,8 +590,8 @@ async def test_brief_keyless_identical_sends_dedupe_to_one_delivery(
 
     expected_operation_id = main._scoped_send_operation_id(
         "brief",
-        f"auto:council:custodes:{main._prompt_payload_hash('keyless dedupe')}",
-        "council:custodes",
+        f"auto:%46:{main._prompt_payload_hash('keyless dedupe')}",
+        "%46",
         "keyless dedupe",
     )
     assert first["delivered"] == second["delivered"] == 1

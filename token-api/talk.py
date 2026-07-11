@@ -228,26 +228,6 @@ async def publicize_payload(payload: Any) -> Any:
     return publicize_pane_payload(payload, await _public_pane_map())
 
 
-class AmbiguousPaneTarget(ValueError):
-    """A semantic pane selector matched more than one live pane.
-
-    Silent first-match resolution delivered a ``council:custodes``-addressed
-    report into the live ``council:malcador`` pane (duplicate/churned @PANE_ID
-    stamps). Ambiguity is a loud resolution failure, never a tie-break, and it
-    must not fall through to weaker matchers or the tmuxctld fallback.
-    """
-
-
-def _unique_or_ambiguous(matches: list[str], selector: str, kind: str) -> str | None:
-    distinct = list(dict.fromkeys(matches))
-    if len(distinct) > 1:
-        raise AmbiguousPaneTarget(
-            f"ambiguous pane target {selector!r}: {kind} matches multiple live "
-            f"panes; refusing silent first-match delivery"
-        )
-    return distinct[0] if distinct else None
-
-
 async def resolve_pane(identifier: str) -> str | None:
     """Resolve a public pane identifier to an internal raw tmux pane id.
 
@@ -255,9 +235,6 @@ async def resolve_pane(identifier: str) -> str | None:
       * position ids (``somnium:SE``)
       * window-position aliases (``1:W`` / ``palace:W``)
       * fully qualified ``session:window:position`` (``main:2:SE`` → ``somnium:SE``)
-
-    Raises :class:`AmbiguousPaneTarget` when a selector matches more than one
-    live pane; returns ``None`` only for a genuine no-match.
     """
     raw = _normalize_pane(identifier)
     if not raw:
@@ -269,55 +246,39 @@ async def resolve_pane(identifier: str) -> str | None:
     # main:2:SE -> match by session+window_index+position.
     if raw.count(":") == 2:
         session, window_index, pos = raw.split(":", 2)
-        triple = _unique_or_ambiguous(
-            [
-                p["pane_id"]
-                for p in panes
-                if p["session"] == session and _pane_position_matches(p, window_index, pos)
-            ],
-            raw,
-            "session:window:position",
-        )
-        if triple:
-            return triple
+        for p in panes:
+            if p["session"] == session and _pane_position_matches(p, window_index, pos):
+                return p["pane_id"]
 
-    exact = _unique_or_ambiguous(
-        [p["pane_id"] for p in panes if p["position_id"] == raw], raw, "@PANE_ID"
-    )
-    if exact:
-        return exact
+    for p in panes:
+        if p["position_id"] == raw:
+            return p["pane_id"]
 
     # 1:W / palace:W -> match by live tmux window index/name plus canonical
     # pane position.  This keeps Token-API brief/talk aligned with tmuxctl's
     # resolver without depending on stored registry rows.
     if raw.count(":") == 1:
         window_ref, pos = raw.split(":", 1)
-        positional = _unique_or_ambiguous(
-            [p["pane_id"] for p in panes if _pane_position_matches(p, window_ref, pos)],
-            raw,
-            "window:position",
-        )
-        if positional:
-            return positional
+        positional_matches = [
+            p["pane_id"] for p in panes if _pane_position_matches(p, window_ref, pos)
+        ]
+        if len(positional_matches) == 1:
+            return positional_matches[0]
 
     # Operator/persona shorthand: accept a unique pane-label suffix (``pax`` ->
     # ``council:pax``, ``fabricator-general`` -> ``mechanicus:fabricator-general``).
-    # Ambiguous nicknames fail loud and the API error tells the caller to use a
-    # public pane id. This fixes the cryptic caller_pane unresolved UX without
-    # guessing among multiple live panes.
+    # Ambiguous nicknames still fail closed and the API error tells the caller to
+    # use a public pane id. This fixes the cryptic caller_pane unresolved UX
+    # without guessing among multiple live panes.
     if ":" not in raw:
         wanted = raw.lower()
-        suffix = _unique_or_ambiguous(
-            [
-                p["pane_id"]
-                for p in panes
-                if (p.get("position_id") or "").lower().rsplit(":", 1)[-1] == wanted
-            ],
-            raw,
-            "pane-label suffix",
-        )
-        if suffix:
-            return suffix
+        suffix_matches = [
+            p["pane_id"]
+            for p in panes
+            if (p.get("position_id") or "").lower().rsplit(":", 1)[-1] == wanted
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
 
     # Fail closed to tmuxctl's native resolver when Token-API's direct pane scan
     # misses a public singleton. During tmuxctld registry/scan degradation the
@@ -934,14 +895,7 @@ async def resolve_brief_targets(
         raw = _normalize_pane(spec)
         if not raw:
             continue
-        try:
-            pane_id = await resolve_pane(raw)
-        except AmbiguousPaneTarget as exc:
-            # Loud non-delivery: an ambiguous address must reach ZERO panes.
-            unresolved.append(
-                {"source": "pane", "spec": raw, "reason": f"ambiguous_pane_label: {exc}"}
-            )
-            continue
+        pane_id = await resolve_pane(raw)
         if not pane_id:
             unresolved.append({"source": "pane", "spec": raw, "reason": "no_match"})
             continue

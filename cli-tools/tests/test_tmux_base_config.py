@@ -65,14 +65,17 @@ def test_pane_select_prefix_hjkl_deexpand_before_routing() -> None:
         assert "switch-client -T pane-select" in line
 
 
-def test_pane_select_enter_expands_directly_without_daemon_ping() -> None:
+def test_pane_select_enter_expands_without_status_flash() -> None:
     line = _line_starting("bind -T pane-select Enter ")
-    assert "tmux-grid-expand" in line
-    assert "--client" in line
-    assert "--expand" in line
+    assert "tmuxctld-ping POST /grid-expand" in line
+    assert "expand=1" in line
     assert "#{client_tty}" in line
-    assert "tmuxctld-ping" not in line
     assert "tmux-run" not in line
+    assert "tmux-grid-expand" not in line
+    # A transport/handler failure surfaces a concise human message, never a raw
+    # `tmuxctld-ping-/…` transport slug.
+    assert "tmuxctld-ping-/grid-expand-failed" not in line
+    assert "IMPERIUM_TMUX_RAW" not in line
     assert "display-message 'expand failed'" in line
 
 
@@ -180,8 +183,6 @@ def test_blue_nametag_uses_only_pane_label_while_context_stays_outside() -> None
     status_left = _line_starting("set -g status-left ")
     assert "#S" in status_left
     assert "@PERSONA" in status_left
-    assert "#(" not in status_left, "status-left must not fork during status redraws"
-    assert "tmux-persona-for-pane" not in status_left
 
     border = _line_starting("set -g pane-border-format ")
     start = border.index("#{?@PANE_LABEL,")
@@ -516,16 +517,6 @@ def test_portable_status_guard_indicator_is_also_per_pane() -> None:
     assert "#(" not in status_right
 
 
-def test_prefix_e_expands_directly_without_daemon_ping() -> None:
-    line = _line_starting("bind e ")
-    assert "tmux-grid-expand" in line
-    assert "--client" in line
-    assert "#{client_tty}" in line
-    assert "tmuxctld-ping" not in line
-    assert "tmux-run" not in line
-    assert "display-message 'expand failed'" in line
-
-
 def test_prefix_e_hot_swaps_persona_engine() -> None:
     line = _line_starting("bind E ")
     assert "tmuxctld-ping POST /persona-engine" in line
@@ -554,7 +545,9 @@ def test_first_slice_keybinds_route_to_tmuxctld_ping_not_tmux_run() -> None:
     """Only routes with implemented daemon handlers move off tmux-run."""
 
     expected = {
+        "bind -T pane-select Enter ": ("/grid-expand", ('client=\\"#{client_tty}\\"', "expand=1")),
         "bind F ": ("/focus", ('window=\\"#{session_name}:#{window_index}\\"', "mode=toggle")),
+        "bind e ": ("/grid-expand", ('client=\\"#{client_tty}\\"',)),
         "bind E ": ("/persona-engine", ('pane=\\"#{pane_id}\\"', "toggle=1")),
         "bind M ": ("/mode-toggle", ('pane=\\"#{pane_id}\\"',)),
         "bind S ": ("/open-session-doc", ('pane=\\"#{pane_id}\\"',)),
@@ -690,6 +683,7 @@ def test_implemented_route_keybinds_use_concise_message_not_raw_slug() -> None:
     `tmuxctld-ping-/…` transport slug."""
     expected = {
         "bind F ": ("/focus", "focus failed"),
+        "bind e ": ("/grid-expand", "expand failed"),
         "bind E ": ("/persona-engine", "persona swap failed"),
         "bind M ": ("/mode-toggle", "mode toggle failed"),
         "bind S ": ("/open-session-doc", "session doc unavailable"),

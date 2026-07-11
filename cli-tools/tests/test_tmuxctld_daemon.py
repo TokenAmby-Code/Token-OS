@@ -3122,49 +3122,6 @@ def test_ambient_cancel_policy_still_enqueues_typing_guard_by_default(monkeypatc
         server.shutdown()
 
 
-def test_deferred_send_queue_load_does_not_auto_drain_on_daemon_boot(monkeypatch) -> None:
-    """A daemon kickstart is not a guard-clear edge for persisted sends.
-
-    Regression: startup loaded the durable deferred-send queue and immediately
-    scheduled drains for every physical pane. If the restart window lost or had
-    not rehydrated the pane-local HUMAN/PENDING guard, a parked report could be
-    replayed into an active human composer and submitted by the replay Enter.
-    """
-    path = pathlib.Path(os.environ["TMUXCTLD_DEFERRED_SENDS_PATH"])
-    path.write_text(
-        json.dumps(
-            {
-                "version": daemon.DEFERRED_SENDS_VERSION,
-                "updated_epoch": time.time(),
-                "seq": 1,
-                "items": [
-                    {
-                        "id": "parked-report",
-                        "seq": 1,
-                        "route": "/send-text",
-                        "pane": "%42",
-                        "phys_pane": "%42",
-                        "params": {"pane": "%42", "text": "do not replay on boot"},
-                        "queued_at": time.time(),
-                        "ttl_seconds": None,
-                        "gate": {"reason": "typing_guard"},
-                    }
-                ],
-            }
-        )
-        + "\n"
-    )
-    scheduled: list[str] = []
-    monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda pane: scheduled.append(pane))
-
-    server, _ = _serve(SendAckAdapter)
-    try:
-        assert daemon._DEFERRED_SEND_QUEUE.size() == 1
-        assert scheduled == []
-    finally:
-        server.shutdown()
-
-
 def test_deferred_send_drains_fifo_after_guard_drops(monkeypatch) -> None:
     locked = {"value": True}
     monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: locked["value"])

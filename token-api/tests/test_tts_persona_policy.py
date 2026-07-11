@@ -90,20 +90,6 @@ def _quiet_world(tts, monkeypatch):
         },
     )
     monkeypatch.setattr(tts, "_custodes_state_event_handler", None)
-    monkeypatch.setattr(
-        tts,
-        "render_openai_tts_artifact",
-        lambda text, voice: {
-            "success": True,
-            "artifact_id": "a" * 32,
-            "artifact_url": "http://localhost:7777/api/tts/artifacts/" + "a" * 32,
-            "artifact_path": "/tmp/test.wav",
-            "sha256": "b" * 64,
-            "voice_id": voice,
-            "text_hash": "c" * 64,
-            "format": "wav",
-        },
-    )
     tts.pause_queue.clear()
     tts.hot_queue.clear()
 
@@ -171,7 +157,7 @@ def test_system_instance_enqueues_hot_custodes_voiced(
     app_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The synthetic ``system`` sender short-circuits the DB lookup to a fixed,
-    always-resolved profile: Custodes-voiced (ballad), advisor-hot. It
+    always-resolved profile: Custodes-voiced (Microsoft George), advisor-hot. It
     enqueues to the hot queue WITHOUT any instance row — instance-less system pings
     SPEAK through the single gate, never go silent and never need a registration."""
     tts = _load_tts()
@@ -184,12 +170,12 @@ def test_system_instance_enqueues_hot_custodes_voiced(
 
     assert result["queued"] is True
     assert result["queue"] == "hot"
-    assert result["voice"] == "ballad"
+    assert result["voice"] == "Microsoft George"
     assert len(tts.hot_queue) == 1
     assert len(tts.pause_queue) == 0
     item = tts.hot_queue[0]
     assert item.instance_id == "system"
-    assert item.voice == "ballad"
+    assert item.voice == "Microsoft George"
 
 
 def test_wpm_for_rate_base_and_clamp() -> None:
@@ -210,7 +196,7 @@ def test_cockpit_status_never_null_while_item_playing() -> None:
     item = tts.TTSQueueItem(
         instance_id="custodes",
         message="the Emperor must hear this",
-        voice="ballad",
+        voice="Microsoft George",
         sound="chimes.wav",
         name="Custodes",
         started_at="2026-06-28T10:00:00",

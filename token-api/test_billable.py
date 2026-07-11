@@ -1,12 +1,10 @@
 """Unit tests for billable.py — classification + the x/y accrual model."""
 
 import os
-from pathlib import Path
 
 from billable import (
     WorkClass,
     accrual_weight,
-    classify_domain,
     classify_work_class,
     trickle_numerator,
 )
@@ -40,43 +38,6 @@ class TestClassifyByPath:
     def test_path_boundary_not_prefix_substring(self):
         # /Volumes/CivicOther must NOT match the /Volumes/Civic billable prefix.
         assert classify_work_class("/Volumes/CivicOther/x") == WorkClass.UNKNOWN
-
-
-class TestClassifyDomain:
-    """Fleet-queue domain oracle — the cwd seam the hardware split will replace.
-
-    Distinct from work-class: binary (no 'unknown'), cwd-only (no legion
-    override), and fails toward 'token-os' (the home fleet is the default left
-    system; a cwd-less row must never land on the civic side).
-    """
-
-    def test_civic_mount_is_askcivic(self):
-        assert classify_domain("/Volumes/Civic/askcivic.git") == "askcivic"
-        assert classify_domain("/Volumes/Civic") == "askcivic"
-
-    def test_askcivic_worktree_is_askcivic(self):
-        wd = Path.home() / "worktrees" / "askCivic" / "wt-civic-invariant"
-        assert classify_domain(str(wd)) == "askcivic"
-
-    def test_askpax_worktree_is_askcivic(self):
-        wd = Path.home() / "worktrees" / "askPax" / "wt-pax-thing"
-        assert classify_domain(str(wd)) == "askcivic"
-
-    def test_token_os_worktree_is_token_os(self):
-        wd = Path.home() / "worktrees" / "Token-OS" / "wt-feat" / "fleet-domain-queues"
-        assert classify_domain(str(wd)) == "token-os"
-
-    def test_imperium_is_token_os(self):
-        assert classify_domain("/Volumes/Imperium/Imperium-ENV") == "token-os"
-
-    def test_null_and_unknown_cwd_default_token_os(self):
-        assert classify_domain(None) == "token-os"
-        assert classify_domain("") == "token-os"
-        assert classify_domain("/tmp/whatever") == "token-os"
-
-    def test_path_boundary_not_prefix_substring(self):
-        # /Volumes/CivicOther must NOT match the /Volumes/Civic domain prefix.
-        assert classify_domain("/Volumes/CivicOther/x") == "token-os"
 
 
 class TestClassifyByLegion:

@@ -74,10 +74,7 @@ def test_deprecated_public_aliases_rejected(target: str):
         resolve_pane_in_snapshot(workspace(), target)
 
 
-def test_duplicate_public_roles_fail_loud() -> None:
-    # Formerly first-writer-wins; that silent tie-break is how a
-    # council:custodes-addressed report landed in council:malcador. Duplicate
-    # public roles are an ambiguous address and must refuse resolution.
+def test_duplicate_public_roles_resolve_first_writer_wins():
     snapshot = WorkspaceSnapshot(
         session_name="main",
         windows=(
@@ -98,7 +95,5 @@ def test_duplicate_public_roles_fail_loud() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="ambiguous"):
-        resolve_pane_in_snapshot(snapshot, "somnium:NE")
-    with pytest.raises(ValueError, match="ambiguous"):
-        resolve_pane_in_snapshot(snapshot, "2:NE")
+    assert resolve_pane_in_snapshot(snapshot, "somnium:NE").pane_id == "%31"
+    assert resolve_pane_in_snapshot(snapshot, "2:NE").pane_id == "%31"

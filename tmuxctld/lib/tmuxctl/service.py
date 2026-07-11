@@ -462,14 +462,7 @@ class TmuxControlPlane:
         pane_positional_id: str = "",
         include_closed: bool = False,
     ) -> dict:
-        """Resolve wrapper_id, instance_id, or positional pane id to one row.
-
-        A cold (never-reconciled-this-boot) ledger quarantines its file-loaded
-        rows from pane-label resolution — fail closed, never stale. Re-warming
-        rides the /health heartbeat (``maybe_warm_wrapper_ledger``), NOT this
-        read path: reconcile replaces active rows wholesale, so a read must
-        never trigger it as a side effect.
-        """
+        """Resolve wrapper_id, instance_id, or positional pane id to one row."""
         from .wrapper_ledger import LEDGER
 
         row = LEDGER.resolve(
@@ -971,7 +964,6 @@ class TmuxControlPlane:
         from .occupancy import (
             assert_comms_delivery_target_occupied,
             assert_dispatch_target_available,
-            assert_singleton_addressee,
             looks_like_dispatch_launcher_payload,
         )
 
@@ -980,7 +972,6 @@ class TmuxControlPlane:
             assert_dispatch_target_available(self.adapter, physical_pane)
         else:
             assert_comms_delivery_target_occupied(self.adapter, physical_pane)
-            assert_singleton_addressee(self.adapter, pane, physical_pane)
         if not submit:
             self.insert_text(physical_pane, text)
             return {"status": "inserted", "pane": pane, "physical_pane": physical_pane}

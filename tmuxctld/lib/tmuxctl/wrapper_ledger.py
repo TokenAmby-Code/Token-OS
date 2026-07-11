@@ -114,25 +114,10 @@ class WrapperLedger:
         self._rows: dict[str, WrapperLedgerRow] = {}
         self._by_instance: dict[str, str] = {}
         self._by_pane_positional: dict[str, str] = {}
-        self._ambiguous_pane_positional: set[str] = set()
-        # Cold-state discipline: rows read back from the write-behind file are
-        # pre-restart state, not live truth. They stay resolution-invisible until
-        # a successful tmux reconcile confirms/replaces them (``warmed``); a
-        # post-boot upsert is fresh producer truth and lifts the quarantine for
-        # that wrapper id. This is the fail-closed half of the 63s-post-cold-start
-        # custodes→malcador misroute fix.
-        self._tmux_reconciled = False
-        self._file_loaded_ids: set[str] = set()
 
     @property
     def path(self) -> Path:
         return self._path
-
-    @property
-    def warmed(self) -> bool:
-        """True once active rows have been reconciled against live tmux this boot."""
-        with self._lock:
-            return self._tmux_reconciled
 
     def load(self, *, force: bool = False) -> dict[str, Any]:
         with self._lock:
@@ -158,7 +143,6 @@ class WrapperLedger:
                     if row.wrapper_id and not _is_hollow_active_row(row):
                         rows[row.wrapper_id] = row
             self._rows = rows
-            self._file_loaded_ids = set(rows)
             self._reindex_locked()
             self._loaded = True
             return {"loaded": True, "path": str(self._path), "rows": len(self._rows)}
@@ -170,21 +154,13 @@ class WrapperLedger:
     def _reindex_locked(self) -> None:
         self._by_instance = {}
         self._by_pane_positional = {}
-        self._ambiguous_pane_positional = set()
         for wrapper_id, row in self._rows.items():
             if not row.active or _is_hollow_active_row(row):
                 continue
             if row.instance_id:
                 self._by_instance[row.instance_id] = wrapper_id
             if row.pane_positional_id:
-                claimed = self._by_pane_positional.get(row.pane_positional_id)
-                if claimed is not None and claimed != wrapper_id:
-                    # Two active wrapper rows claim one pane label: resolution by
-                    # that label is ambiguous and must fail loud, never last-writer.
-                    self._ambiguous_pane_positional.add(row.pane_positional_id)
-                    self._by_pane_positional.pop(row.pane_positional_id, None)
-                elif row.pane_positional_id not in self._ambiguous_pane_positional:
-                    self._by_pane_positional[row.pane_positional_id] = wrapper_id
+                self._by_pane_positional[row.pane_positional_id] = wrapper_id
 
     def _write_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,9 +207,6 @@ class WrapperLedger:
             if _is_hollow_active_row(row):
                 raise ValueError("refusing hollow active wrapper ledger row")
             self._rows[wrapper_id] = row
-            # A live producer write is fresh truth; it lifts the cold-state
-            # quarantine that applies to rows read back from the file.
-            self._file_loaded_ids.discard(wrapper_id)
             self._reindex_locked()
             self._write_locked()
             return row
@@ -265,58 +238,43 @@ class WrapperLedger:
         needle = _s(value)
         with self._lock:
             self._ensure_loaded_locked()
-            for pane_key in (_s(pane_positional_id), needle):
-                if pane_key and pane_key in self._ambiguous_pane_positional:
-                    raise ValueError(
-                        f"ambiguous ledger pane label: {pane_key!r} is claimed by "
-                        "multiple active wrapper rows; refusing last-writer resolution"
-                    )
-            candidates: list[tuple[str, bool]]
             if wrapper_id:
-                candidates = [(_s(wrapper_id), False)]
+                candidates = [_s(wrapper_id)]
             elif instance_id:
                 instance_key = _s(instance_id)
-                candidates = [(self._by_instance.get(instance_key, ""), False)]
+                candidates = [self._by_instance.get(instance_key, "")]
                 if include_closed:
                     candidates.extend(
-                        (row.wrapper_id, False)
+                        row.wrapper_id
                         for row in self._rows.values()
                         if row.instance_id == instance_key
                     )
             elif pane_positional_id:
                 pane_key = _s(pane_positional_id)
-                candidates = [(self._by_pane_positional.get(pane_key, ""), True)]
+                candidates = [self._by_pane_positional.get(pane_key, "")]
                 if include_closed:
                     candidates.extend(
-                        (row.wrapper_id, True)
+                        row.wrapper_id
                         for row in self._rows.values()
                         if row.pane_positional_id == pane_key
                     )
             elif needle:
                 candidates = [
-                    (needle, False),
-                    (self._by_instance.get(needle, ""), False),
-                    (self._by_pane_positional.get(needle, ""), True),
+                    needle,
+                    self._by_instance.get(needle, ""),
+                    self._by_pane_positional.get(needle, ""),
                 ]
                 if include_closed:
                     candidates.extend(
-                        (row.wrapper_id, row.instance_id != needle)
+                        row.wrapper_id
                         for row in self._rows.values()
                         if row.instance_id == needle or row.pane_positional_id == needle
                     )
             else:
                 candidates = []
-            for key, label_derived in candidates:
+            for key in candidates:
                 row = self._rows.get(key) if key else None
-                if row is None:
-                    continue
-                if label_derived and not self._tmux_reconciled and key in self._file_loaded_ids:
-                    # Cold state: a pane-LABEL lookup hitting unverified
-                    # pre-restart file state is how a freshly cold-started daemon
-                    # misroutes semantic-label sends. Fail closed; wrapper/instance
-                    # keyed lookups stay served (unique producer-issued keys).
-                    continue
-                if include_closed or row.active:
+                if row and (include_closed or row.active):
                     return row
             return None
 
@@ -413,8 +371,6 @@ class WrapperLedger:
                 if not row.active and key not in live_rows
             }
             self._rows = {**closed_rows, **live_rows}
-            self._file_loaded_ids.clear()
-            self._tmux_reconciled = True
             self._reindex_locked()
             self._write_locked()
             return {

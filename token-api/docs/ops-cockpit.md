@@ -26,7 +26,6 @@ FastAPI routes:
 - `GET /ui/ops` returns `ui/ops/index.html`.
 - `GET /ui/ops/{asset_path}` returns built assets, guarded against path traversal and arbitrary file exposure.
 - `GET /api/ui/ops/state` returns the aggregate cockpit read model.
-- Data roadmap: `token-api/docs/ops-cockpit-data-roadmap.md` captures the TypeScript-daemon ownership direction, passthrough/no-state doctrine, error propagation requirements, and phased TTS/dial/occupancy/lifecycle work.
 
 The frontend polls `/api/ui/ops/state` every 2 seconds. Live acceptance confirmed that the browser surface updates when desktop/phone attention state changes, including opening a distraction.
 
@@ -58,10 +57,9 @@ The graph components are bespoke SVG (no chart/graph library) to keep the commit
 
 ### Polling cadence
 
-The canonical poll ledger lives in `web/ops/src/api.ts` (`OPS_COCKPIT_POLLS`) — one strict list of every poll the cockpit runs, pinned by a tripwire test. Polling posture: the Emperor detests polling and event-driven transport is the target architecture; the ops cockpit is the ONE surface where tick-refresh is tolerated, and only for polls registered in that ledger — a `usesPolling` call site without a ledger entry is a review-blocking offense.
-
 - `useOpsState` — `/api/ui/ops/state` every **2s** (live posture).
 - `useTimerHistory` — `/api/ui/ops/timer/history` every **30s** (slow; live, no mock fallback).
+- `useOpsGraph` — `/api/ui/ops/graph/{name}` every **60s** (on-demand cadence; falls back to mock only on endpoint failure).
 
 ### Design language (`modes.ts` + `styles.css`)
 
@@ -109,7 +107,7 @@ Current top-level keys:
 - `tts` — current item, queue lengths, backend, satellite availability, global mode.
 - `voice_drafts` — top-level Discord voice-draft summaries awaiting operator review.
 - `enforcement` — pending acknowledgement count/sample and Pavlok summary.
-- `tmux` — direct tmuxctld health plus `tmux.occupancy` summary brokered from tmuxctld `/health`, `/ledger/rows`, and `/freelist`; the UI should not scrape tmuxctld or legacy health routes independently.
+- `tmux` — direct tmuxctld health snapshot surfaced in the aggregate state; the UI should not scrape tmuxctld or legacy health routes independently.
 - `work_actions` — explicit work-action ticks and daily counts for the HUD work dial.
 
 ## Development workflow

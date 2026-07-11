@@ -2306,7 +2306,6 @@ def _send_text_pipeline(
     post_submit_actions: tuple[dict, ...] = (),
     hook_echo_pane: str = "",
     correlation_id: str = "",
-    expected_role: str = "",
 ) -> dict:
     if verify is None:
         verify = submit
@@ -2330,7 +2329,6 @@ def _send_text_pipeline(
     from .occupancy import (
         assert_comms_delivery_target_occupied,
         assert_dispatch_target_available,
-        assert_singleton_addressee,
         looks_like_dispatch_launcher_payload,
     )
 
@@ -2342,12 +2340,6 @@ def _send_text_pipeline(
         assert_dispatch_target_available(control.adapter, phys_pane)
     else:
         assert_comms_delivery_target_occupied(control.adapter, phys_pane)
-        # Addressee identity gate: when this send is ADDRESSED to a persona
-        # singleton (label target, or %NN pre-resolved by a caller that passes
-        # the requested label as expected_role), the pane receiving bytes must
-        # be the unique live holder of that label RIGHT NOW — resolution-time
-        # truth is not delivery-time truth (custodes→malcador misroute).
-        assert_singleton_addressee(control.adapter, expected_role or pane, phys_pane)
 
     if not submit:
         return _insert_without_submit_pipeline(
@@ -2695,7 +2687,6 @@ def _h_send_text(control, params):
         pre_submit_keys=_parse_pre_submit_keys(params.get("pre_submit_keys", ())),
         hook_echo_pane=_s(params, "hook_echo_pane") or _s(params, "caller_pane"),
         correlation_id=_s(params, "correlation_id"),
-        expected_role=_s(params, "expected_role"),
     )
 
 
@@ -4016,20 +4007,16 @@ def _h_context_governor_inject(control, params):
 def _h_context_governor_stop(control, params):
     """No-progress stage: stop further autonomous input via daemon-owned actuation.
 
-    For singleton/orchestrator panes this is intentionally conservative: rather than
-    killing the pane, route it into plan mode so the hard stop itself produces the
-    handoff plan the governor was waiting for (plan submission is the progress event,
-    and approval clears context). Worker lifecycle closure remains available through
-    /close when policy class support is expanded.
+    For singleton/orchestrator panes this is intentionally conservative: insert a
+    visible hard-stop handoff prompt rather than killing a pane. Worker lifecycle
+    closure remains available through /close when policy class support is expanded.
     """
     reason = _s(params, "reason") or "context_exhausted"
     text = (
-        "/plan Context governor hard stop: no compaction, handoff, plan submission, or "
-        "session-doc checkpoint was observed after the forced context warning "
-        f"(reason: {reason}). Your context is exhausted and will be cleared on plan "
-        "approval. Do not gather more context. Pose the handoff plan now from what you "
-        "already have: work completed, in-flight state, decisions made, and exact next "
-        "steps for the successor session."
+        "Context governor hard stop: no compaction, handoff, plan submission, or "
+        "session-doc checkpoint was observed after the forced context warning. "
+        "Stop autonomous work now, preserve handoff state, and wait for supervisor routing. "
+        f"Reason: {reason}."
     )
     injected = _h_context_governor_inject(
         control, {**params, "text": text, "stage": "no_progress_stop"}
@@ -4572,20 +4559,8 @@ class TmuxctldServer(ThreadingHTTPServer):
         except Exception:
             log.exception("tmuxctld prompt-submit callback load failed")
         try:
-            loaded_deferred = _DEFERRED_SEND_QUEUE.load()
-            # Do not auto-drain persisted typing-guard sends at daemon boot.
-            # A restart/kickstart is not a human-clear edge: hooks may not have
-            # rehydrated the pane-local HUMAN/PENDING guard yet, and queued
-            # records are keyed to physical panes.  Auto-replay here can flush a
-            # stale report into the Emperor's active composer and the submit key
-            # is part of that replay.  Deferred sends are drained only from a
-            # fresh guard-clear/expiry signal in this daemon lifetime (or an
-            # explicit drain call in tests/tools).
-            if loaded_deferred.get("queued"):
-                log.warning(
-                    "tmuxctld: deferred-send queue loaded queued=%s; boot auto-drain suppressed",
-                    loaded_deferred.get("queued"),
-                )
+            _DEFERRED_SEND_QUEUE.load()
+            _schedule_all_deferred_drains()
         except Exception:
             log.exception("tmuxctld deferred-send queue load failed")
         # Throttle state for the /health-driven lifecycle-hook re-assertion. A
@@ -4598,24 +4573,6 @@ class TmuxctldServer(ThreadingHTTPServer):
         # a deploy re-sources the live key-table on its very first heartbeat.
         self._binding_reconcile_lock = threading.Lock()
         self._binding_reconcile_deadline = 0.0
-
-    def maybe_warm_wrapper_ledger(self) -> bool:
-        """Retry the boot-failed tmux ledger reconcile on the /health heartbeat.
-
-        Idempotent and cheap once warmed (a single flag read). While cold the
-        ledger already fails closed (file-loaded rows are quarantined from
-        resolution), so this is purely self-healing, never correctness-bearing.
-        Returns True when a reconcile ran and warmed the ledger this call.
-        """
-        try:
-            from .wrapper_ledger import LEDGER
-
-            if LEDGER.warmed:
-                return False
-            LEDGER.reconcile_from_tmux(self.adapter_factory())
-            return LEDGER.warmed
-        except Exception:  # never let warm-up break the health contract
-            return False
 
     def maybe_reassert_lifecycle_hooks(self) -> bool:
         """Re-install the tmux lifecycle hooks if the throttle interval has elapsed.
@@ -4766,11 +4723,6 @@ class TmuxctldHandler(BaseHTTPRequestHandler):
             # guard PENDING-branch keys onto the running server if they drifted from
             # canonical after a deploy (throttled; idempotent; fail-open).
             self.server.maybe_reconcile_guard_bindings()
-            # A ledger left cold by a failed boot reconcile (tmux briefly away)
-            # quarantines its file-loaded rows fail-closed; ride the heartbeat to
-            # re-attempt the live scan so the daemon self-heals instead of staying
-            # resolution-degraded until a manual /reconcile. No-op once warmed.
-            self.server.maybe_warm_wrapper_ledger()
             self._write(200, self._health_payload())
             return
 

@@ -48,11 +48,6 @@ export type OpsInstance = {
   engine: string;
   device_id: string | null;
   working_dir: string | null;
-  // Fleet-queue domain — server-side cwd classification (the browser never
-  // decides from a raw path). 'token-os' = the LEFT worker system,
-  // 'askcivic' = the RIGHT. Optional in the wire shape: an old payload
-  // missing it must not blank the cockpit (consumers default to 'token-os').
-  domain?: 'token-os' | 'askcivic' | string;
   runtime: { live: boolean; pane_id: string | null; role: string | null; source: string };
   last_activity: string | null;
   created_at: string | null;
@@ -85,31 +80,21 @@ export type OpsInstance = {
 };
 
 export type TtsQueueItem = {
-  item_key?: string;
   instance_id: string;
   name: string | null;
   message: string; // full text — UI clamps with CSS, expands on click
   voice: string | null;
-  persona_slug?: string | null;
-  persona_display_name?: string | null;
-  commander_type?: string | null;
-  playback_target?: string | null;
   queue: string; // "hot" | "pause"
   status?: string; // queued | playing | completed
   queued_at: string; // ISO timestamp
 };
 
 export type TtsCurrent = {
-  item_key?: string;
   instance_id: string;
   name: string | null;
   message: string;
   voice: string | null;
   backend?: string | null;
-  persona_slug?: string | null;
-  persona_display_name?: string | null;
-  commander_type?: string | null;
-  playback_target?: string | null;
   started_at?: string | null; // ISO; present when cheaply available
 };
 
@@ -231,33 +216,6 @@ export type InstanceCounts = {
   by_work_class?: Counts;
 };
 
-export type TmuxOccupancyCellState = 'occupied' | 'free' | 'dead' | 'protected' | 'drift' | 'unknown';
-
-export type TmuxOccupancyCell = {
-  pane_positional_id: string | null;
-  instance_id: string | null;
-  persona: string | null;
-  engine: string | null;
-  working_dir: string | null;
-  wrapper_id: string | null;
-  state: TmuxOccupancyCellState;
-  source: string;
-};
-
-export type TmuxOccupancy = {
-  status: OpsHealthStatus;
-  generated_at: string;
-  total: number;
-  occupied: number;
-  free: number;
-  dead: number;
-  protected: number;
-  drift: number;
-  unknown: number;
-  errors: string[];
-  cells: TmuxOccupancyCell[];
-};
-
 export type OpsState = {
   surface: 'ops';
   contract_version: 'ops-state.v1' | string;
@@ -366,7 +324,6 @@ export type OpsState = {
     sha: string | null;
     error?: string | null;
     payload?: unknown;
-    occupancy?: TmuxOccupancy;
   };
   alarm?: {
     acked: boolean;
@@ -374,12 +331,6 @@ export type OpsState = {
     source: string | null;
   };
   work_actions?: WorkActionSummary;
-  /**
-   * Muster Ledger feed embedded per the #671 contract: the kanban board
-   * consumes useOpsState — one poller, one feed (same builder as
-   * GET /api/ui/ops/session-docs, capped tighter for the board).
-   */
-  session_docs?: SessionDocsFeed;
 };
 
 // Concise agent/script read model (GET /api/ops/status).
@@ -420,7 +371,6 @@ export type OpsStatus = {
     sha: string | null;
     live_instance_panes: number | null;
     projection_drift: number | null;
-    occupancy?: TmuxOccupancy;
   };
   tts: {
     current: string | null;
@@ -527,23 +477,6 @@ export type TimerHistory = {
 // Read-only board feed. The cockpit groups these into status lanes and never
 // renders more than `head` (one line); the document itself lives in Obsidian.
 
-/**
- * Golden Throne rubric state as summarized by the session-docs feed. `present`
- * is the load-bearing flag: legacy docs with no rubric evaluate as
- * complete:true, so consumers must key every rubric treatment on `present` —
- * never `complete` alone.
- */
-export type RubricSummary = {
-  present: boolean;
-  complete: boolean;
-  met: number;
-  total: number;
-  skipped: number;
-  first_unmet: string | null;
-  notified_at: string | null;
-  acknowledged_at: string | null;
-};
-
 export type PipelineDoc = {
   id: number | null;
   title: string | null;
@@ -554,10 +487,7 @@ export type PipelineDoc = {
   project: string | null;
   primarch: string | null;
   persona_slug: string | null;
-  /** seeded persona profile join — chip_color null for unknown/absent slugs */
-  persona: { slug: string | null; chip_color: string | null; display_name: string | null } | null;
   golden_throne: string | null;
-  rubric: RubricSummary | null;
   head: string | null; // one-line excerpt only — never the full document
   created_at: string | null;
   /**
@@ -662,7 +592,6 @@ export const OpsInstanceSchema = z.looseObject({
   engine: z.string().optional(),
   device_id: z.string().nullable().optional(),
   working_dir: z.string().nullable().optional(),
-  domain: z.string().optional(),
   last_activity: z.string().nullable().optional(),
   age_seconds: z.number().nullable().optional(),
   is_subagent: z.boolean().optional(),
@@ -672,44 +601,6 @@ export const OpsInstanceSchema = z.looseObject({
   workflow_state: z.string().nullable().optional(),
   attention_rank: z.number().optional(),
   attention_reasons: z.array(z.string()).optional(),
-});
-
-
-export const TmuxOccupancyCellStateSchema = z.enum(['occupied', 'free', 'dead', 'protected', 'drift', 'unknown']);
-
-export const TmuxOccupancyCellSchema = z.looseObject({
-  pane_positional_id: z.string().nullable(),
-  instance_id: z.string().nullable().optional(),
-  persona: z.string().nullable().optional(),
-  engine: z.string().nullable().optional(),
-  working_dir: z.string().nullable().optional(),
-  wrapper_id: z.string().nullable().optional(),
-  state: TmuxOccupancyCellStateSchema,
-  source: z.string().optional(),
-});
-
-export const TmuxOccupancySchema = z.looseObject({
-  status: z.string(),
-  generated_at: z.string(),
-  total: z.number(),
-  occupied: z.number(),
-  free: z.number(),
-  dead: z.number(),
-  protected: z.number(),
-  drift: z.number(),
-  unknown: z.number(),
-  errors: z.array(z.string()).optional(),
-  cells: z.array(TmuxOccupancyCellSchema),
-});
-
-export const TmuxHealthSchema = z.looseObject({
-  reachable: z.boolean().nullable().optional(),
-  tmux_reachable: z.boolean().nullable().optional(),
-  version: z.string().nullable().optional(),
-  sha: z.string().nullable().optional(),
-  error: z.string().nullable().optional(),
-  payload: z.unknown().optional(),
-  occupancy: TmuxOccupancySchema.optional(),
 });
 
 export const OpsStateSchema = z.looseObject({
@@ -728,7 +619,6 @@ export const OpsStateSchema = z.looseObject({
   tts: z
     .looseObject({ routing: TtsRoutingSchema.nullable().optional() })
     .optional(),
-  tmux: TmuxHealthSchema.optional(),
 });
 
 export const OpsStatusSchema = z.looseObject({
@@ -748,57 +638,10 @@ export const TimerHistorySchema = z.looseObject({
   segments: z.array(z.looseObject({ start: z.string(), end: z.string() })).optional(),
 });
 
-// Golden Throne rubric state as summarized by the session-docs feed. `present`
-// is the load-bearing flag: legacy docs with no rubric evaluate as
-// complete:true, so consumers must key every rubric treatment on `present` —
-// never `complete` alone.
-export const RubricSummarySchema = z.looseObject({
-  present: z.boolean().optional(),
-  complete: z.boolean().optional(),
-  met: z.number().optional(),
-  total: z.number().optional(),
-  skipped: z.number().optional(),
-  first_unmet: z.string().nullable().optional(),
-  notified_at: z.string().nullable().optional(),
-  acknowledged_at: z.string().nullable().optional(),
-});
-
-// One session-doc card on the Muster Ledger. Spine (`id`/`status`) required;
-// everything else optional/nullable — validation is advisory and must never
-// block a render.
-export const PipelineDocSchema = z.looseObject({
-  id: z.number(),
-  status: z.string(),
-  title: z.string().nullable().optional(),
-  path: z.string().nullable().optional(),
-  vault_rel: z.string().nullable().optional(),
-  obsidian_uri: z.string().nullable().optional(),
-  project: z.string().nullable().optional(),
-  primarch: z.string().nullable().optional(),
-  persona_slug: z.string().nullable().optional(),
-  persona: z
-    .looseObject({
-      slug: z.string().nullable().optional(),
-      chip_color: z.string().nullable().optional(),
-      display_name: z.string().nullable().optional(),
-    })
-    .nullable()
-    .optional(),
-  golden_throne: z.string().nullable().optional(),
-  rubric: RubricSummarySchema.nullable().optional(),
-  head: z.string().nullable().optional(),
-  created_at: z.string().nullable().optional(),
-  session_date: z.string().nullable().optional(),
-  session_date_source: z.string().nullable().optional(),
-  age_seconds: z.number().nullable().optional(),
-  linked_instances: z.number().optional(),
-});
-
 export const SessionDocsFeedSchema = z.looseObject({
   generated_at: z.string(),
   lane_totals: z.record(z.string(), z.number()).optional(),
-  limit_per_lane: z.number().optional(),
-  docs: z.array(PipelineDocSchema),
+  docs: z.array(z.looseObject({ status: z.string().optional() })),
 });
 
 export const OpsGraphSchema = z.looseObject({
@@ -814,6 +657,3 @@ export const OpsGraphSchema = z.looseObject({
 export type OpsStateParsed = z.infer<typeof OpsStateSchema>;
 export type OpsStatusParsed = z.infer<typeof OpsStatusSchema>;
 export type OpsInstanceParsed = z.infer<typeof OpsInstanceSchema>;
-export type RubricSummaryParsed = z.infer<typeof RubricSummarySchema>;
-export type PipelineDocParsed = z.infer<typeof PipelineDocSchema>;
-export type SessionDocsFeedParsed = z.infer<typeof SessionDocsFeedSchema>;

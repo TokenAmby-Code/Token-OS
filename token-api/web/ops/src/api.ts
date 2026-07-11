@@ -16,45 +16,6 @@ export type Feed<T> = {
   refresh: () => void;
 };
 
-// ── THE OPS COCKPIT POLL LEDGER ─────────────────────────────────────────────
-// Every poll this cockpit runs, in ONE strict canonical list. The Emperor
-// detests polling; event-driven transport is the target architecture and will
-// replace these ticks. This monitor is the ONE surface where tick-refresh is
-// tolerated — and only under registration: every `usesPolling` call site MUST
-// have a ledger entry. Adding a poll without registering it here is a
-// review-blocking offense. (A tripwire test in cockpitData.test.ts pins the
-// exact entries.)
-export type OpsCockpitPoll = {
-  route: string; // the endpoint the poll ticks against
-  intervalMs: number; // the default tick interval (the hook's default arg)
-  hook: string; // the usesPolling-backed hook that owns the tick
-  purpose: string; // why this poll is tolerated
-};
-
-export const OPS_COCKPIT_POLLS: readonly OpsCockpitPoll[] = [
-  {
-    route: '/api/ui/ops/state',
-    intervalMs: 2000,
-    hook: 'useOpsState',
-    purpose:
-      'The ONE aggregate read-model spine — dials, TTS stack, worker rails, the kanban session_docs embed, and deploy-follow all ride it; never a second poller per #671.',
-  },
-  {
-    route: '/api/ui/ops/timer/history',
-    intervalMs: 30000,
-    hook: 'useTimerHistory',
-    purpose: 'Balance-line history for the timer graph.',
-  },
-] as const;
-
-// Hook defaults derive FROM the ledger — the manifest is the single source of
-// the tick cadence, so the ledger and the real polling intervals cannot drift.
-function ledgeredInterval(hook: string): number {
-  const poll = OPS_COCKPIT_POLLS.find((p) => p.hook === hook);
-  if (!poll) throw new Error(`unledgered poll hook: ${hook}`);
-  return poll.intervalMs;
-}
-
 function usesPolling<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   intervalMs: number,
@@ -171,7 +132,7 @@ function normalizeOpsState(payload: OpsState): OpsState {
 }
 
 /** Live cockpit state — polled fast (brief: every 2s). */
-export function useOpsState(intervalMs = ledgeredInterval('useOpsState')): Feed<OpsState> {
+export function useOpsState(intervalMs = 2000): Feed<OpsState> {
   return usesPolling<OpsState>(
     async (signal) =>
       normalizeOpsState(
@@ -185,11 +146,10 @@ export function useOpsState(intervalMs = ledgeredInterval('useOpsState')): Feed<
 // Thin POSTs to Token-API (the authority). These are NOT a dual-write: routing
 // the mutation *through* Token-API is exactly the read-only-documents contract.
 
-async function postJson<T = unknown>(url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function postJson<T = unknown>(url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
     cache: 'no-store',
-    ...(signal ? { signal } : {}),
     ...(body !== undefined
       ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
       : {}),
@@ -200,13 +160,6 @@ async function postJson<T = unknown>(url: string, body?: unknown, signal?: Abort
 
 export type SkipResult = { skipped: boolean; cleared: number; backend?: string | null };
 export type PromoteResult = { success: boolean; promoted: number };
-export type PlayItemResult = {
-  success: boolean;
-  promoted: number;
-  item_key: string;
-  reason?: string;
-  from_queue?: string;
-};
 export type GlobalModeResult = { status: string; mode: TtsGlobalMode; old_mode: string };
 export type FocusResult = { snapped: boolean; reason: string | null };
 export type MorningEndResult = { status: string; changed: boolean; morning_status: string };
@@ -225,11 +178,6 @@ export function promotePause(instanceId?: string): Promise<PromoteResult> {
 /** Promote all of one instance's paused items to the front of the hot queue. */
 export function playPane(instanceId: string): Promise<PromoteResult> {
   return postJson<PromoteResult>('/api/tts/queue/play-pane', { instance_id: instanceId });
-}
-
-/** Promote/play one exact queued TTS item. */
-export function playTtsItem(itemKey: string, signal?: AbortSignal): Promise<PlayItemResult> {
-  return postJson<PlayItemResult>('/api/tts/queue/play-item', { item_key: itemKey }, signal);
 }
 
 /** Set the global TTS mode (verbose | muted | silent). */
@@ -301,7 +249,7 @@ function secondsSinceDayStart(): number {
  * `GET /api/ui/ops/timer/history`; no mock fallback, because fake timer data is
  * worse than an explicit degraded state. Polled slowly per the brief.
  */
-export function useTimerHistory(bucketSec = 60, intervalMs = ledgeredInterval('useTimerHistory')): Feed<TimerHistory> {
+export function useTimerHistory(bucketSec = 60, intervalMs = 30000): Feed<TimerHistory> {
   return usesPolling<TimerHistory>(async (signal) => {
     const windowSec = secondsSinceDayStart();
     return boundaryValidate(

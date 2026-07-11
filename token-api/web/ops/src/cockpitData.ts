@@ -7,14 +7,12 @@
 // fetching lives here — src/api.ts owns the polling hooks; the root component
 // runs these adapters over each feed and provides the result via context.
 //
-// Honesty rule: an adapter maps only what the live contract actually carries —
-// never a frozen fake value. Every dial declares its EXPECTED readout
-// (DialModel.defaultValue); the fan shows a dial only while its live value
-// departs from that default, so the optimal cockpit is an empty fan.
+// Honesty rule: an adapter maps only what the live contract actually carries.
+// Subsystems the contract doesn't cover this phase (enforce, gt, mac, wsl,
+// mesh) render an explicit '—' placeholder dial — never a frozen fake value.
 // ─────────────────────────────────────────────────────────────────────────
 
-import type { OpsSourceHealth, OpsState, PipelineDoc, TimerHistory, TimerMode } from './contracts';
-import type { CompassStar } from './compass';
+import type { OpsSourceHealth, OpsState, TimerHistory, TimerMode } from './contracts';
 
 export type CockpitMode = 'working' | 'multitasking' | 'distracted' | 'break' | 'idle';
 
@@ -62,7 +60,6 @@ export type DialTone = 'good' | 'warn' | 'bad' | 'neutral' | 'idle';
 // override kinds are added here (and to <Dial>'s switch) as features land.
 export type DialAction =
   | { kind: 'toggle-timer' } // timer dial → pause/resume the running timer
-  | { kind: 'end-morning' } // timer dial in morning_session → end the morning session
   | { kind: 'dismiss-phone' } // phone dial → force-clear stuck phone attention
   | { kind: 'ack-enforce' }; // enforce dial → acknowledge the pending enforcement
 
@@ -72,19 +69,12 @@ export type DialModel = {
   glyph: string;
   value: string;
   tone: DialTone;
-  defaultValue: string; // the dial's EXPECTED readout. The fan renders a dial only
-  //                       while `value !== defaultValue` — a subsystem in its
-  //                       expected state shows nothing, so the optimal cockpit is
-  //                       an empty fan. Builders collapse nominal readouts onto
-  //                       this token (detail stays in `subtitle` for the drawer).
+  noteworthy: boolean;
   subtitle: string; // "what is this dial?" subheader — hover tip + drawer line
   tag?: string; // optional mono id chip shown before the label in the hover tip
   //               (the TTS stack uses it for the sender's short instance id)
   action?: DialAction; // omit → default click opens the dials drawer
 };
-
-/** The fan's visibility rule — a dial earns pixels only in an unusual state. */
-export const dialIsUnusual = (d: DialModel): boolean => d.value !== d.defaultValue;
 
 // ── TTS queue (the left-side stack) ─────────────────────────────────────────
 // Modelled as a QUEUE, not a flat status list. `posInQueue` is the order key
@@ -93,13 +83,8 @@ export const dialIsUnusual = (d: DialModel): boolean => d.value !== d.defaultVal
 // as 'done'; the stack simply renders shorter as the queue drains.
 export type TtsItemStatus = 'speaking' | 'queued' | 'done';
 
-export type TtsQueueState = 'current' | 'hot' | 'pause';
-
 export type TtsItem = {
   id: string;
-  itemKey: string | undefined;
-  queueState: TtsQueueState | undefined;
-  promotable: boolean;
   text: string; // the utterance — surfaced in the hover tip + drawer
   route: string; // sender / delivery route (e.g. "hot · Custodes")
   senderInstanceId: string; // sender's FULL instance id — joins the utterance to its
@@ -108,8 +93,6 @@ export type TtsItem = {
   senderName: string; // sender's instance-name (the live session's descriptive name)
   persona: string; // sender's persona key → its icon (see src/personaIcons.tsx).
   //                   Lower-kebab, matching the registry keys (vault/DB slugs).
-  commanderType?: string | null; // backend sender commander_type; chapter is duplicate-glow exempt.
-  playbackTarget?: string | null;
   status: TtsItemStatus;
   posInQueue: number; // 0-based order key; head (0) is the one speaking
   durationMs?: number; // speak length hint; the live contract doesn't carry one,
@@ -202,119 +185,15 @@ function healthDial(h: OpsSourceHealth): { value: string; tone: DialTone } {
   }
 }
 
-
-export function ttsDial(s: OpsState): DialModel {
-  const h = healthDial(s.sources.tts);
-  if (h.tone !== 'good') {
-    // Degraded/down/unknown source health reads as its own unusual value — a
-    // sick TTS backend must never hide behind an 'idle' queue.
-    return { id: 'tts', label: 'TTS', glyph: '♪', value: h.value, tone: h.tone, defaultValue: 'idle', subtitle: `Text-to-speech queue — ${s.sources.tts.message ?? h.value}.` };
-  }
-  const hot = s.tts.hot_queue_length ?? s.tts.hot_queue?.length ?? 0;
-  const pause = s.tts.pause_queue_length ?? s.tts.pause_queue?.length ?? 0;
-  const speaking = Boolean(s.tts.current);
-  const value = speaking ? 'speaking' : hot ? `hot ${hot}` : pause ? `pause ${pause}` : 'idle';
-  const tone: DialTone = speaking || hot ? 'warn' : pause ? 'neutral' : 'good';
-  return { id: 'tts', label: 'TTS', glyph: '♪', value, tone, defaultValue: 'idle', subtitle: `Text-to-speech queue — hot ${hot}, pause ${pause}, backend ${s.tts.backend ?? 'unknown'}, satellite ${String(s.tts.satellite_available)}.` };
-}
-
-export function enforcementDial(s: OpsState): DialModel {
-  const h = healthDial(s.sources.enforcement);
-  const pending = s.enforcement.pending_count ?? 0;
-  const pavlok = s.enforcement.pavlok ?? {};
-  const pavlokEnabled = typeof pavlok.enabled === 'boolean' ? `Pavlok ${pavlok.enabled ? 'on' : 'off'}` : 'Pavlok unknown';
-  // Any non-good source health is its own unusual value — a degraded
-  // enforcement source must never hide behind an empty pending queue.
-  const sourceBad = h.tone !== 'good';
+// a placeholder dial for subsystems NOT wired this phase — explicit, never fake.
+function unwiredDial(id: string, label: string, glyph: string, what: string): DialModel {
   return {
-    id: 'enforce', label: 'Enforce', glyph: '!',
-    value: sourceBad ? h.value : pending ? `pending ${pending}` : 'clear',
-    tone: sourceBad ? h.tone : pending ? 'bad' : 'good',
-    defaultValue: 'clear',
-    subtitle: `Enforcement queue — ${pavlokEnabled}${s.enforcement.error ? `; ${s.enforcement.error}` : ''}.`,
-    ...(pending > 0 ? { action: { kind: 'ack-enforce' } as DialAction } : {}),
+    id, label, glyph,
+    value: '—',
+    tone: 'idle',
+    noteworthy: false,
+    subtitle: `${what} — not wired yet (phase 2).`,
   };
-}
-
-export function goldenThroneDial(s: OpsState): DialModel {
-  const active = s.instances.active.map((i) => i.gt).filter(Boolean);
-  const due = active.filter((gt) => gt.next_fire && Date.parse(gt.next_fire) <= Date.now()).length;
-  const armed = active.filter((gt) => gt.next_fire).length;
-  const resume = active.reduce((n, gt) => n + (gt.resume_count ?? 0), 0);
-  const victory = active.filter((gt) => gt.victory_at).length;
-  // Victory acks are a healthy terminal, not an unusual state — they stay in
-  // the subtitle (drawer detail) and never earn the fan a dial.
-  const value = due ? `due ${due}` : resume ? `resume ${resume}` : armed ? `armed ${armed}` : 'clear';
-  const tone: DialTone = due ? 'bad' : resume || armed ? 'warn' : 'idle';
-  return { id: 'gt', label: 'Gold. Throne', glyph: '♛', value, tone, defaultValue: 'clear', subtitle: `Golden Throne rubrics — ${armed} armed, ${resume} resume signal(s), ${victory} victory ack(s).` };
-}
-
-function sourceDial(s: OpsState): DialModel {
-  const degraded = Object.values(s.sources ?? {}).filter((src) => ['warn', 'bad', 'unknown'].includes(src?.status ?? 'unknown')).length;
-  return {
-    id: 'sources', label: 'Sources', glyph: '◇', value: degraded ? `${degraded} degraded` : 'nominal',
-    tone: degraded ? 'warn' : 'good', defaultValue: 'nominal',
-    subtitle: `Aggregate source health — ${degraded} degraded source(s).`,
-  };
-}
-
-function fleetDial(s: OpsState): DialModel {
-  const c = s.instances.counts;
-  const engines = Object.entries(c.by_engine ?? {}).map(([k, v]) => `${k}:${v}`).join(' ') || 'engines unknown';
-  return {
-    id: 'fleet', label: 'Fleet', glyph: '◆', value: c.stale ? `${c.stale} stale` : 'nominal',
-    tone: c.stale ? 'warn' : c.active ? 'good' : 'idle', defaultValue: 'nominal',
-    subtitle: `Instance registry — ${c.active} active, ${c.stale} stale; ${engines}.`,
-  };
-}
-
-function workDial(s: OpsState): DialModel {
-  const w = s.work_state;
-  const typing = w.typing_active ? 'typing' : 'not typing';
-  const hold = w.productivity_hold ? `; hold ${w.productivity_hold}` : '';
-  return {
-    id: 'work', label: 'Work', glyph: '⌁', value: w.productivity_hold ? 'hold' : w.typing_active ? 'typing' : 'nominal',
-    tone: w.productivity_hold ? 'warn' : 'neutral', defaultValue: 'nominal',
-    subtitle: `Productivity state — ${w.reason}; ${typing}${hold}.`,
-  };
-}
-
-function tmuxDial(s: OpsState): DialModel {
-  const occ = s.tmux.occupancy;
-  const reachable = s.tmux.reachable === true;
-  const drift = occ?.drift ?? 0;
-  const dead = occ?.dead ?? 0;
-  const tone: DialTone = !reachable ? 'bad' : !occ ? 'neutral' : occ.status === 'bad' ? 'bad' : drift || dead || occ.status === 'warn' ? 'warn' : 'good';
-  // Healthy occupancy collapses onto the nominal token (the M/N readout lives
-  // in the drawer subtitle); reachable-but-no-occupancy is an honest unknown.
-  const value = !reachable ? 'unreachable' : !occ ? 'unknown' : tone === 'good' ? 'nominal' : `${occ.occupied}/${occ.total} used`;
-  return {
-    id: 'tmux', label: 'tmux', glyph: '▦', value, tone, defaultValue: 'nominal',
-    subtitle: `tmuxctld occupancy — occupied ${occ?.occupied ?? 0}/${occ?.total ?? 0}, free ${occ?.free ?? 0}, dead ${dead}, drift ${drift}${occ?.errors?.length ? `; ${occ.errors.join('; ')}` : ''}.`,
-  };
-}
-
-const COMPASS_DIRECTIONS = new Set(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']);
-function paneCompassStar(cell: { pane_positional_id?: string | null; state?: string | null }): CompassStar | null {
-  // Stable pane roles arrive as palace:N / somnium:NE. Some tmuxctld views can
-  // expose the equivalent numeric window positions, where 1 is palace and 2 is
-  // somnium. The compass reducer already handles coalescing and red+blue=purple;
-  // this adapter only translates occupied slots into authored stars.
-  const raw = String(cell.pane_positional_id ?? '');
-  const [page, pos] = raw.split(':');
-  if (!page || !pos || !COMPASS_DIRECTIONS.has(pos)) return null;
-  const color = page === 'palace' || page === '1' ? 'red' : page === 'somnium' || page === '2' ? 'blue' : null;
-  if (!color) return null;
-  const state = cell.state ?? 'unknown';
-  if (!['occupied', 'protected', 'drift'].includes(state)) return null;
-  return { dir: pos as CompassStar['dir'], color };
-}
-
-export function occupancyCompassStars(s: OpsState): CompassStar[] {
-  const occ = s.tmux?.occupancy;
-  if (!occ || s.tmux?.reachable !== true || occ.status === 'bad') return [];
-  const stars = (occ.cells ?? []).map(paneCompassStar).filter((star): star is CompassStar => star != null);
-  return stars;
 }
 
 // Signed break balance in ms → the balance dial's compact readout ('+9m'/'−12m').
@@ -326,48 +205,39 @@ const fmtBalanceValue = (ms: number): string => {
 };
 
 /**
- * OpsState → the floating state-dial cluster, every dial live-contract-backed.
- * This is the full CATALOG (the drawer lists all of it); the fan renders only
- * the unusual subset (`dialIsUnusual` — value ≠ defaultValue), so a fully
- * nominal system fans out ZERO dials. Each builder collapses its nominal
- * readout onto its defaultValue token and keeps the detail in the subtitle.
+ * OpsState → the floating state-dial cluster. Live values where the contract
+ * carries them (timer, balance, phone, desktop, cron, tts); honest '—'
+ * placeholders for the phase-2 tail (enforce, gt, mac, wsl, mesh). Ordered
+ * noteworthy-first so the important gauges fan out before the nominal tail.
  */
 export function buildDials(s: OpsState): DialModel[] {
-  // morning_session maps to 'working' for the graph palette, but the dial must
-  // distinguish it: MORNING is an unusual state with its own click contract
-  // (end the morning session), while plain WORKING is the hidden default.
-  const morning = s.timer.mode === 'morning_session';
   const mode = mapMode(s.timer.mode);
   const timerTone: DialTone =
     mode === 'break' ? 'warn' : mode === 'distracted' ? 'bad' : mode === 'idle' ? 'neutral' : 'good';
   const balMs = s.timer.break_balance_ms;
   const phone = s.attention.phone;
   const cron = healthDial(s.sources.cron);
+  const tts = healthDial(s.sources.tts);
   return [
-    { id: 'timer', label: 'Timer', glyph: '❚❚', value: morning ? 'MORNING' : mode.toUpperCase(), tone: timerTone,
-      defaultValue: 'WORKING',
-      subtitle: morning
-        ? 'Morning session running — click to end it and resume the normal timer.'
-        : 'Focus timer state — the live timer mode.',
-      action: morning ? { kind: 'end-morning' } : { kind: 'toggle-timer' } },
-    { id: 'balance', label: 'Balance', glyph: '▼', value: balMs < 0 ? fmtBalanceValue(balMs) : 'credit',
-      tone: balMs >= 0 ? 'good' : 'bad', defaultValue: 'credit',
-      subtitle: `Running break-balance — ${fmtBalanceValue(balMs)} of credit vs. debt.` },
-    { id: 'phone', label: 'Phone', glyph: '✕', value: phone.is_distracted ? (phone.app ?? 'distracted') : 'clear',
-      tone: phone.is_distracted ? 'bad' : 'good', defaultValue: 'clear',
-      subtitle: 'Phone foreground app — live distraction telemetry.',
+    { id: 'timer', label: 'Timer', glyph: '❚❚', value: mode.toUpperCase(), tone: timerTone, noteworthy: true,
+      subtitle: 'Focus timer state — the live timer mode.', action: { kind: 'toggle-timer' } },
+    { id: 'balance', label: 'Balance', glyph: '▼', value: fmtBalanceValue(balMs), tone: balMs >= 0 ? 'good' : 'bad',
+      noteworthy: true, subtitle: 'Running break-balance — minutes of credit vs. debt.' },
+    { id: 'phone', label: 'Phone', glyph: '✕', value: phone.app ?? 'clear', tone: phone.is_distracted ? 'bad' : 'good',
+      noteworthy: true, subtitle: 'Phone foreground app — live distraction telemetry.',
       action: { kind: 'dismiss-phone' } },
-    { id: 'desktop', label: 'Desktop', glyph: '▣', value: s.attention.desktop.mode || 'unknown', tone: 'neutral',
-      defaultValue: 'silence', subtitle: 'Desktop media detection — video / music / gaming vs. silence.' },
-    tmuxDial(s),
-    fleetDial(s),
-    workDial(s),
-    sourceDial(s),
-    enforcementDial(s),
-    goldenThroneDial(s),
-    { id: 'cron', label: 'Cron', glyph: '◷', value: cron.value, tone: cron.tone, defaultValue: 'nominal',
+    { id: 'desktop', label: 'Desktop', glyph: '▣', value: s.attention.desktop.mode || '—', tone: 'neutral',
+      noteworthy: true, subtitle: 'Desktop presence — inferred from keyboard & focus.' },
+    unwiredDial('enforce', 'Enforce', '!', 'Enforcement queue'),
+    unwiredDial('gt', 'Gold. Throne', '♛', 'Golden Throne armed rubrics'),
+    // nominal / suppressed subsystems — the tail of the stack
+    { id: 'cron', label: 'Cron', glyph: '◷', value: cron.value, tone: cron.tone, noteworthy: false,
       subtitle: 'Scheduled cron routines — subsystem health.' },
-    ttsDial(s),
+    { id: 'tts', label: 'TTS', glyph: '♪', value: tts.value, tone: tts.tone, noteworthy: false,
+      subtitle: 'Text-to-speech voice queue — subsystem health.' },
+    unwiredDial('mac', 'Mac', '⌘', 'Mac node reachability'),
+    unwiredDial('wsl', 'WSL', '⊞', 'WSL satellite reachability'),
+    unwiredDial('mesh', 'Mesh', '⇄', 'Tailscale mesh reachability'),
   ];
 }
 
@@ -388,50 +258,34 @@ export function buildDials(s: OpsState): DialModel[] {
  * useLifecycle in OpsCockpit.tsx).
  */
 export function toTtsQueue(s: OpsState): TtsItem[] {
-  const instanceOf = (instanceId: string) => s.instances.active.find((i) => i.id === instanceId);
+  const personaOf = (instanceId: string): string =>
+    s.instances.active.find((i) => i.id === instanceId)?.persona?.slug ?? 'astartes';
   const shortId = (instanceId: string): string => instanceId.slice(0, 8);
-  const personaOf = (item: { instance_id: string; persona_slug?: string | null }): string =>
-    item.persona_slug ?? instanceOf(item.instance_id)?.persona?.slug ?? 'astartes';
-  const displayNameOf = (item: { instance_id: string; name: string | null; persona_display_name?: string | null }): string =>
-    item.name ?? item.persona_display_name ?? instanceOf(item.instance_id)?.display_name ?? shortId(item.instance_id);
-  const commanderOf = (item: { instance_id: string; commander_type?: string | null }): string | null =>
-    item.commander_type ?? instanceOf(item.instance_id)?.commander_type ?? null;
 
   const items: TtsItem[] = [];
   const c = s.tts.current;
   if (c) {
     items.push({
-      id: `cur:${c.item_key ?? c.instance_id}:${c.started_at ?? ''}`,
-      itemKey: c.item_key,
-      queueState: 'current',
-      promotable: false,
+      id: `cur:${c.instance_id}:${c.started_at ?? ''}`,
       text: c.message,
-      route: `${c.backend ?? c.playback_target ?? 'speaking'} · ${displayNameOf(c)}`,
+      route: `${c.backend ?? 'speaking'} · ${c.name ?? shortId(c.instance_id)}`,
       senderInstanceId: c.instance_id,
       senderTmuxId: shortId(c.instance_id),
-      senderName: displayNameOf(c),
-      persona: personaOf(c),
-      commanderType: commanderOf(c),
-      playbackTarget: c.playback_target ?? null,
+      senderName: c.name ?? shortId(c.instance_id),
+      persona: personaOf(c.instance_id),
       status: 'speaking',
       posInQueue: 0,
     });
   }
   for (const q of [...(s.tts.hot_queue ?? []), ...(s.tts.pause_queue ?? [])]) {
-    const queueState: TtsQueueState | undefined = q.queue === 'hot' || q.queue === 'pause' ? q.queue : undefined;
     items.push({
-      id: q.item_key ? `tts:${q.item_key}` : `${q.queue}:${q.instance_id}:${q.queued_at}`,
-      itemKey: q.item_key,
-      queueState,
-      promotable: Boolean(q.item_key),
+      id: `${q.queue}:${q.instance_id}:${q.queued_at}`,
       text: q.message,
-      route: `${q.queue}${q.playback_target ? `/${q.playback_target}` : ''} · ${displayNameOf(q)}`,
+      route: `${q.queue} · ${q.name ?? shortId(q.instance_id)}`,
       senderInstanceId: q.instance_id,
       senderTmuxId: shortId(q.instance_id),
-      senderName: displayNameOf(q),
-      persona: personaOf(q),
-      commanderType: commanderOf(q),
-      playbackTarget: q.playback_target ?? null,
+      senderName: q.name ?? shortId(q.instance_id),
+      persona: personaOf(q.instance_id),
       status: 'queued',
       posInQueue: items.length,
     });
@@ -439,42 +293,7 @@ export function toTtsQueue(s: OpsState): TtsItem[] {
   return items;
 }
 
-// ── Lemon residents (the always-on singleton seats) ─────────────────────────
-// Emperor's ruling (2026-07-09): the standing command personas live in the
-// LEMON — the persona-section arc above the worker rails — not in the fleet
-// queues. This set is the ONE membership definition both consumers read: the
-// queue partition drops these instances (they never consume a slot) and the
-// lemon activity binding lights their section while they work. Slugs are the
-// registry keys; the Orchestrator seat wears the CI monogram in the lemon art
-// but registers (and lights) as 'orchestrator'.
-export const LEMON_RESIDENT_PERSONAS: ReadonlySet<string> = new Set([
-  'custodes',
-  'fabricator-general',
-  'malcador',
-  'pax',
-  'orchestrator',
-  'administratum',
-]);
-
-/**
- * OpsState → the set of lemon-resident persona slugs with a WORKING instance.
- * Drives the lemon section reverb: a slug in the set means that seat is
- * actively processing a prompt; absent means the section renders its static
- * idle glow. Subagents are excluded for the same reason the rails exclude
- * them — a child inheriting Custodes' persona must not light Custodes' seat.
- */
-export function toLemonActivity(s: OpsState): Set<string> {
-  const active = new Set<string>();
-  for (const i of s.instances.active) {
-    const slug = i.persona?.slug;
-    if (!i.is_subagent && i.status === 'working' && slug && LEMON_RESIDENT_PERSONAS.has(slug)) {
-      active.add(slug);
-    }
-  }
-  return active;
-}
-
-// ── Fleet queues (two systems × two rails) ──────────────────────────────────
+// ── Worker queue (the two rails below the lemon) ────────────────────────────
 // The worker rails are the LIVE registration surface: one chip per registered
 // instance, wearing that instance's chapter-persona icon. A chip appearing IS
 // the "this instance registered properly" signal; a chip leaving means the
@@ -491,209 +310,34 @@ export type WorkerItem = {
   //                        children, so the rail's breach glow must too)
 };
 
-// One worker SYSTEM: the top (actively processing a prompt) rail + the bottom
-// (idle) rail. A worker sits in exactly one of the two — the status flip
-// between polls IS the inter-queue movement.
-export type DomainQueues = {
-  working: WorkerItem[]; // status === 'working' — the top rail
-  idle: WorkerItem[]; // every other alive status — the bottom rail
-};
-
-// The two systems (Emperor's ruling, 2026-07-09): LEFT = Token-OS workers,
-// RIGHT = askCivic workers. They never touch — no shared arrays, no crossover.
-export type FleetQueues = {
-  tokenOs: DomainQueues;
-  askCivic: DomainQueues;
-};
-
 /**
- * OpsState → the four fleet rails. ONE partition pass: each active top-level
- * instance lands in exactly one of the four buckets — `domain` picks the side
- * (server-side cwd classification; the browser never sees a raw path decide),
- * `status === 'working'` picks top vs bottom. The one-queue-at-a-time
- * invariant is STRUCTURAL: a single `push` per instance, so no id can ever
- * occupy two buckets — there is nothing to filter after the fact.
- *
- * Old-payload honesty: a missing `domain` files under token-os (the home
- * fleet is the default left system), a missing `status` files as idle (never
- * fake "processing"). Subagents are excluded — the rails signal top-level
- * fleet registrations, and a subagent inheriting its parent's persona would
- * false-trigger the singleton-breach glow. Lemon-resident personas
- * (LEMON_RESIDENT_PERSONAS) are excluded too — the always-on singleton seats
- * live in the lemon's persona sections, so the rails stay mechanicus/one-off
- * territory.
+ * OpsState → the live worker rails. One chip per active registered instance
+ * (the backend already excludes stopped/archived). Subagents are excluded —
+ * the rails signal top-level fleet registrations, and a subagent inheriting
+ * its parent's persona would false-trigger the singleton-breach glow.
  *
  * Persona falls back to the generic 'astartes' key when the instance has no
  * persona bound — the chip still appears (the registration was real) but wears
  * the generic helmet, which is exactly the "registered without a chapter
- * persona" diagnostic. Duplicate personas are NOT deduped here; the rails mark
+ * persona" diagnostic. Duplicate personas are NOT deduped here; the rail marks
  * them as singleton breaches (see duplicatePersonaKeys in OpsCockpit).
  */
-export function toFleetQueues(s: OpsState): FleetQueues {
+export function toWorkerQueue(s: OpsState): WorkerItem[] {
   // created_at crosses the boundary in BOTH SQLite ('YYYY-MM-DD HH:MM:SS') and
   // ISO ('YYYY-MM-DDTHH:MM:SS…') spellings; space sorts before 'T', so a raw
   // lexicographic compare interleaves the two formats. Normalizing the
   // separator makes the compare chronological across both.
   const regKey = (created: string | null): string => (created ?? '').replace(' ', 'T');
-  const queues: FleetQueues = {
-    tokenOs: { working: [], idle: [] },
-    askCivic: { working: [], idle: [] },
-  };
-  const sorted = s.instances.active
-    .filter((i) => !i.is_subagent && !LEMON_RESIDENT_PERSONAS.has(i.persona?.slug ?? ''))
-    .sort((a, b) => regKey(b.created_at).localeCompare(regKey(a.created_at)));
-  for (const i of sorted) {
-    const system = i.domain === 'askcivic' ? queues.askCivic : queues.tokenOs;
-    const bucket = i.status === 'working' ? system.working : system.idle;
-    // Identity fields are IDENTICAL whichever bucket the instance lands in —
-    // the chip is the same dial wherever it sits (same React key on both
-    // rails, so a status flip moves the chip instead of reminting it).
-    bucket.push({
+  return s.instances.active
+    .filter((i) => !i.is_subagent)
+    .sort((a, b) => regKey(b.created_at).localeCompare(regKey(a.created_at)))
+    .map((i) => ({
       id: i.id,
       persona: i.persona?.slug ?? 'astartes',
       name: i.display_name,
       tint: i.persona?.chip_color ?? null,
       chapterChild: i.commander_type === 'chapter',
-    });
-  }
-  return queues;
-}
-
-// ── Muster Ledger (the kanban board between the crossbars) ──────────────────
-// The board renders the session-doc pipeline embedded in OpsState (the
-// `session_docs` feed — ONE poller, per the #671 contract; never a bespoke
-// board-side fetch). Lane membership is a PROJECTION: raw frontmatter `status:`
-// (dialect-rich, Obsidian-authored) → the five canonical lifecycle lanes.
-// Cards are TITLE-ONLY by Emperor's ruling (2026-07-09): the v4 ink —
-// accusation line, rubric pips, raw-status stamp, live filament — over-carried
-// the old card's dressing. It returns in deliberate later waves, re-cut from
-// git history onto this plate.
-
-/**
- * Raw frontmatter `status:` → canonical lane slug, per the absorption table in
- * the vault decree "Ultramar/Session Lifecycle Decree" (2026-07-09). Change
- * the decree, change this map (and the KANBAN_COLUMNS lane set with it).
- * `null` = hidden terminal — never rendered (victory-ack archives; the board
- * has no archived lane). Unknown/prose dialects project to 'astartes' (the
- * working default) with the raw stamp visible on the card. The projection
- * lives board-side until the writer-retarget PR lands canonical statuses.
- */
-export function laneForStatus(status: string): string | null {
-  switch (status.trim().toLowerCase()) {
-    case 'stub':
-    case 'ready':
-    case 'planning':
-    case 'dispatched':
-    case 'aspirant':
-      return 'aspirant';
-    case 'in-review':
-    case 'fix-landed-pre-merge':
-    case 'parked-ready-to-merge':
-    case 'arbites':
-      return 'arbites';
-    case 'merged':
-    case 'deployment':
-    case 'merged-deployed-live-verified':
-    case 'inquisitor':
-      return 'inquisitor';
-    case 'complete':
-    case 'completed':
-    case 'done':
-    case 'consolidated':
-    case 'victorious':
-      return 'victorious';
-    case 'archived':
-    case 'reference':
-    case 'captured':
-      return null; // hidden terminal — not a lane
-    default:
-      // active / in-progress / astartes, plus every unmapped dialect: the
-      // decree's nearest-lane default is the working lane.
-      return 'astartes';
-  }
-}
-
-/** Local YYYY-MM-DD — the today-filter's date key, from the VIEWER's clock.
- *  The old kanban's hardcoded America/Denver is deliberately not reproduced. */
-const localYmd = (now: Date): string =>
-  `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-
-/**
- * Today-only gate (Emperor's ruling: the Muster Ledger is a runtime-demo
- * board, not an index). Doc timestamps are local-naive ('YYYY-MM-DD HH:MM:SS'
- * or ISO-T), so a date-prefix compare IS the local-midnight test — a bare
- * `new Date('YYYY-MM-DD')` would parse as UTC midnight and misfile evening
- * docs, which is exactly the timezone landmine this avoids. Docs with no
- * usable timestamp fall back to age-since-creation vs. local midnight; a doc
- * with neither is dropped (the honesty counter still reports it).
- */
-function isFromToday(doc: PipelineDoc, now: Date): boolean {
-  const stamp = doc.session_date ?? doc.created_at;
-  if (stamp) return String(stamp).slice(0, 10) === localYmd(now);
-  if (doc.age_seconds != null) {
-    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    return doc.age_seconds * 1000 <= now.getTime() - midnight.getTime();
-  }
-  return false;
-}
-
-const docBasename = (p: string | null): string | null => {
-  if (!p) return null;
-  const stem = (p.split('/').pop() ?? '').replace(/\.md$/i, '');
-  return stem || null;
-};
-
-export type KanbanCardModel = {
-  key: string; // stable render key — the doc id, falling back to path
-  laneKey: string; // canonical lane slug (the projection of the raw status)
-  title: string; // doc title, falling back to the path basename — the plate's ONLY ink
-};
-
-export type KanbanLane = {
-  cards: KanbanCardModel[];
-  /** Honesty counter — docs truly in this lane (per the feed's pre-cap
-   *  lane_totals) beyond the cards shown. The per-lane cap and the today
-   *  filter both drop docs; the board reports the drop, never hides it. */
-  overflow: number;
-};
-
-/**
- * OpsState → the Muster Ledger lanes, keyed by canonical lane slug. Pure
- * projection of the embedded session_docs feed: decree lane mapping and the
- * today-only gate. `now` is injectable for tests; lanes the feed doesn't
- * populate are simply absent (an empty lane renders empty).
- */
-export function toMusterBoard(s: OpsState, now: Date = new Date()): Record<string, KanbanLane> {
-  const lanes: Record<string, KanbanLane> = {};
-  const feed = s.session_docs;
-  if (!feed) return lanes;
-  const laneOf = (key: string): KanbanLane => (lanes[key] ??= { cards: [], overflow: 0 });
-  for (const doc of feed.docs) {
-    const laneKey = laneForStatus(doc.status);
-    if (!laneKey || !isFromToday(doc, now)) continue;
-    const lane = laneOf(laneKey);
-    // Re-cap after projection: the feed caps per RAW status, but several raw
-    // statuses absorb into one lane (active + in-progress → astartes), so the
-    // raw caps can stack past the per-lane limit. Docs arrive created_at DESC,
-    // so the newest survive; the honesty counter reports the rest.
-    if (lane.cards.length >= feed.limit_per_lane) continue;
-    lane.cards.push({
-      key: doc.id != null ? `doc:${doc.id}` : `path:${doc.path ?? doc.title ?? 'unknown'}`,
-      laneKey,
-      title: doc.title ?? docBasename(doc.path) ?? 'untitled',
-    });
-  }
-  // lane_totals is keyed by RAW status and counts every non-archived doc
-  // (pre-cap, all days) — project each raw total onto its lane, then subtract
-  // what the board actually shows.
-  for (const [raw, total] of Object.entries(feed.lane_totals ?? {})) {
-    const laneKey = laneForStatus(raw);
-    if (laneKey) laneOf(laneKey).overflow += total;
-  }
-  for (const lane of Object.values(lanes)) {
-    lane.overflow = Math.max(0, lane.overflow - lane.cards.length);
-  }
-  return lanes;
+    }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
