@@ -10,6 +10,50 @@ import asyncio
 import sys
 
 
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self.is_success = 200 <= status_code < 300
+        self._payload = payload or {}
+        self.content = b"{}" if self._payload is not None else b""
+
+    def json(self):
+        return self._payload
+
+
+def _fake_client_class(calls, response=None, exc=None):
+    """Fake httpx.AsyncClient: records the post, returns `response` or raises `exc`."""
+
+    class FakeClient:
+        def __init__(self, timeout=None):
+            calls["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *excinfo):
+            return False
+
+        async def post(self, url, json=None):
+            calls["url"] = url
+            calls["json"] = json
+            if exc is not None:
+                raise exc
+            return response
+
+    return FakeClient
+
+
+def _capture_log_event(monkeypatch, main):
+    logged = []
+
+    async def fake_log_event(event_type, instance_id=None, details=None):
+        logged.append({"event_type": event_type, "details": details})
+
+    monkeypatch.setattr(main, "log_event", fake_log_event)
+    return logged
+
+
 def test_voice_selftest_task_registered(app_env):
     main = sys.modules["main"]
     assert "voice_selftest_morning" in main.TASK_REGISTRY
@@ -19,31 +63,8 @@ def test_voice_selftest_task_registered(app_env):
 def test_voice_selftest_task_posts_full_variant(app_env, monkeypatch):
     main = sys.modules["main"]
     calls = {}
-
-    class FakeResponse:
-        status_code = 200
-        is_success = True
-        content = b"{}"
-
-        def json(self):
-            return {"overall": "pass", "probe_id": "probe-1"}
-
-    class FakeClient:
-        def __init__(self, timeout=None):
-            calls["timeout"] = timeout
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def post(self, url, json=None):
-            calls["url"] = url
-            calls["json"] = json
-            return FakeResponse()
-
-    monkeypatch.setattr(main.httpx, "AsyncClient", FakeClient)
+    response = _FakeResponse(payload={"overall": "pass", "probe_id": "probe-1"})
+    monkeypatch.setattr(main.httpx, "AsyncClient", _fake_client_class(calls, response=response))
 
     result = asyncio.run(main.run_morning_voice_selftest())
 
@@ -56,35 +77,10 @@ def test_voice_selftest_task_posts_full_variant(app_env, monkeypatch):
 
 def test_voice_selftest_task_records_non_2xx_as_failure(app_env, monkeypatch):
     main = sys.modules["main"]
-
-    class BusyResponse:
-        status_code = 409
-        is_success = False
-        content = b"{}"
-
-        def json(self):
-            return {"errorCode": "probe_in_progress"}
-
-    class BusyClient:
-        def __init__(self, timeout=None):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def post(self, url, json=None):
-            return BusyResponse()
-
-    logged = []
-
-    async def fake_log_event(event_type, instance_id=None, details=None):
-        logged.append({"event_type": event_type, "details": details})
-
-    monkeypatch.setattr(main.httpx, "AsyncClient", BusyClient)
-    monkeypatch.setattr(main, "log_event", fake_log_event)
+    calls = {}
+    response = _FakeResponse(status_code=409, payload={"errorCode": "probe_in_progress"})
+    monkeypatch.setattr(main.httpx, "AsyncClient", _fake_client_class(calls, response=response))
+    logged = _capture_log_event(monkeypatch, main)
 
     result = asyncio.run(main.run_morning_voice_selftest())
 
@@ -96,27 +92,11 @@ def test_voice_selftest_task_records_non_2xx_as_failure(app_env, monkeypatch):
 
 def test_voice_selftest_task_records_daemon_down_as_failure(app_env, monkeypatch):
     main = sys.modules["main"]
-
-    class DownClient:
-        def __init__(self, timeout=None):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def post(self, url, json=None):
-            raise ConnectionError("daemon down")
-
-    logged = []
-
-    async def fake_log_event(event_type, instance_id=None, details=None):
-        logged.append({"event_type": event_type, "details": details})
-
-    monkeypatch.setattr(main.httpx, "AsyncClient", DownClient)
-    monkeypatch.setattr(main, "log_event", fake_log_event)
+    calls = {}
+    monkeypatch.setattr(
+        main.httpx, "AsyncClient", _fake_client_class(calls, exc=ConnectionError("daemon down"))
+    )
+    logged = _capture_log_event(monkeypatch, main)
 
     result = asyncio.run(main.run_morning_voice_selftest())
 
