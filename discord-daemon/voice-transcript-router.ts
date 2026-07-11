@@ -82,15 +82,18 @@ export function createVoiceTranscriptRouter({
     };
   }
 
-  async function clearDraft(key) {
+  async function clearDraft(key, { timeoutMs = null } = {}) {
     const state = drafts.get(key.value);
     if (!state) return null;
-    await client.clearVoiceSession({ voiceSessionId: state.voiceSessionId });
+    await client.clearVoiceSession({
+      voiceSessionId: state.voiceSessionId,
+      ...(timeoutMs ? { timeoutMs } : {}),
+    });
     drafts.delete(key.value);
     return summarizeDraft(key, state);
   }
 
-  async function clearDrafts(filter = {}) {
+  async function clearDrafts(filter = {}, { timeoutMs = null } = {}) {
     const cleared = [];
     const filterBot = filter.bot ? normalizeBot(filter.bot) : null;
     const filterUserId = filter.userId ? String(filter.userId) : null;
@@ -98,13 +101,17 @@ export function createVoiceTranscriptRouter({
       const [bot, userId] = value.split(':', 2);
       if (filterBot && filterBot !== bot) continue;
       if (filterUserId && filterUserId !== userId) continue;
-      const item = await clearDraft({ bot, userId, value });
+      const item = await clearDraft({ bot, userId, value }, { timeoutMs });
       if (item) cleared.push(item);
     }
     // Startup/leave cleanup can run before local draft state exists, so also
     // clear tmuxctld's process-local sessions by semantic owner.
     if (filterBot || filterUserId) {
-      await client.clearVoiceSession({ botName: filterBot || '', userId: filterUserId || '' });
+      await client.clearVoiceSession({
+        botName: filterBot || '',
+        userId: filterUserId || '',
+        ...(timeoutMs ? { timeoutMs } : {}),
+      });
     }
     return cleared;
   }
@@ -305,8 +312,8 @@ export function createVoiceTranscriptRouter({
         return summarizeDraft({ bot, userId, value }, state);
       });
     },
-    async clear(filter = {}) {
-      return clearDrafts(filter);
+    async clear(filter = {}, opts = {}) {
+      return clearDrafts(filter, opts);
     },
   };
 }

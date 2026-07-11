@@ -211,6 +211,8 @@ export function createVoiceManager(botClients, config, logger) {
     // Filter out Discord silence frames before they hit the Opus decoder.
     // During silence, Discord sends padding frames (0xF8 0xFF 0xFE etc.)
     // that corrupt the decoder. We filter these and use them as silence signals.
+    // The last forwarded frame is kept for decoder-error diagnostics.
+    let lastOpusFrame = null;
     const silenceFilter = new Transform({
       transform(chunk, encoding, callback) {
         // Discord silence frames are ≤5 bytes (typically 3 bytes: 0xF8 0xFF 0xFE).
@@ -219,16 +221,10 @@ export function createVoiceManager(botClients, config, logger) {
           silenceFilter.emit('silence');
           callback();
         } else {
+          lastOpusFrame = chunk;
           callback(null, chunk);
         }
       }
-    });
-
-    // Decode Opus → PCM (48kHz mono s16le)
-    const decoder = new prism.opus.Decoder({
-      rate: 48000,
-      channels: 1, // Mono for transcription
-      frameSize: 960,
     });
 
     let hasAudioSinceCommit = false;
@@ -329,7 +325,7 @@ export function createVoiceManager(botClients, config, logger) {
       }
     });
 
-    decoder.on('data', (chunk) => {
+    function onDecodedAudio(chunk) {
       if (discarded) return;
       // First real audio frame of a local utterance: tmuxctld creates the
       // semantic voice session. Discord carries only the opaque session id.
@@ -381,45 +377,113 @@ export function createVoiceManager(botClients, config, logger) {
 
       hasAudioSinceCommit = true;
       bytesSinceCommit += chunk.length;
-    });
+    }
 
-    audioStream.pipe(silenceFilter).pipe(decoder);
+    // A single corrupted Opus frame must not cost the rest of the utterance or
+    // the session: recreate the decoder in place (bounded per subscription) and
+    // keep every per-utterance closure state — voice session, commit counters,
+    // the live Realtime stream — intact. Only exhaustion tears the subscription
+    // down and pages via logger.error.
+    const MAX_DECODER_RECOVERIES = 3;
+    let decoderRecoveries = 0;
 
-    // Stream only ends on manual destroy (leave/stop) — we handle that in leaveChannel
-    decoder.on('end', () => {
-      if (silenceTimer) clearTimeout(silenceTimer);
-      state.activeSubscriptions.delete(userId);
-      commitPending('stream-end');
-      if (!suppressEndClose && onAudioEnd) {
-        try { onAudioEnd(userId, botName); } catch {}
-      }
-    });
-
-    decoder.on('error', (err) => {
-      if (silenceTimer) clearTimeout(silenceTimer);
-      logger.error(`Voice [${botName}]: decoder error for ${userId}: ${err.message}`);
-      state.activeSubscriptions.delete(userId);
-      if (!suppressEndClose && onAudioEnd) {
-        try { onAudioEnd(userId, botName); } catch {}
-      }
-    });
-
-    audioStream.on('error', (err) => {
-      if (silenceTimer) clearTimeout(silenceTimer);
-      logger.error(`Voice [${botName}]: stream error for ${userId}: ${err.message}`);
-      state.activeSubscriptions.delete(userId);
-      if (!suppressEndClose && onAudioEnd) {
-        try { onAudioEnd(userId, botName); } catch {}
-      }
-    });
-
-    state.activeSubscriptions.set(userId, {
+    const sub = {
       stream: audioStream,
-      decoder,
+      decoder: null,
       commit: commitPending,
       discard: discardPending,
       clearVoiceSession: clearLocalVoiceSession,
+    };
+
+    function frameDiagnostics() {
+      if (!lastOpusFrame) return 'frame=none';
+      return `frame_len=${lastOpusFrame.length} frame_head=${lastOpusFrame.subarray(0, 8).toString('hex')}`;
+    }
+
+    function teardownSubscription() {
+      // Destroy the receive stream too: @discordjs/voice returns the SAME
+      // stream for a repeat receiver.subscribe(userId) while the old one is
+      // alive, so leaving it undestroyed would double-pipe the next
+      // subscription for this user.
+      if (state.activeSubscriptions.get(userId) === sub) {
+        try { sub.stream.destroy(); } catch {}
+        try { sub.decoder?.destroy(); } catch {}
+        state.activeSubscriptions.delete(userId);
+      }
+      if (!suppressEndClose && onAudioEnd) {
+        try { onAudioEnd(userId, botName); } catch {}
+      }
+    }
+
+    function makeDecoder() {
+      // Decode Opus → PCM (48kHz mono s16le)
+      const dec = new prism.opus.Decoder({
+        rate: 48000,
+        channels: 1, // Mono for transcription
+        frameSize: 960,
+      });
+
+      dec.on('data', onDecodedAudio);
+
+      // Stream only ends on manual destroy (leave/stop) — we handle that in leaveChannel
+      dec.on('end', () => {
+        if (silenceTimer) clearTimeout(silenceTimer);
+        state.activeSubscriptions.delete(userId);
+        commitPending('stream-end');
+        if (!suppressEndClose && onAudioEnd) {
+          try { onAudioEnd(userId, botName); } catch {}
+        }
+      });
+
+      dec.on('error', (err) => {
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+        const live = !discarded && state.activeSubscriptions.get(userId) === sub;
+        if (live && decoderRecoveries < MAX_DECODER_RECOVERIES) {
+          decoderRecoveries += 1;
+          logger.warn(
+            `Voice [${botName}]: decoder error for ${userId}: ${err.message} — ` +
+            `recreating decoder (recovery ${decoderRecoveries}/${MAX_DECODER_RECOVERIES}, ${frameDiagnostics()})`,
+            { errorCode: 'opus_decode_failed', botName, userId, recovered: true },
+          );
+          try { silenceFilter.unpipe(dec); } catch {}
+          try { dec.destroy(); } catch {}
+          sub.decoder = makeDecoder();
+          silenceFilter.pipe(sub.decoder);
+          return;
+        }
+        if (!live) {
+          // Teardown/hop race: the subscription is already discarded or replaced.
+          logger.warn(
+            `Voice [${botName}]: decoder error for ${userId} after subscription teardown: ${err.message}`,
+            { errorCode: 'opus_decode_failed', botName, userId, recovered: false },
+          );
+          teardownSubscription();
+          return;
+        }
+        logger.error(
+          `Voice [${botName}]: decoder error for ${userId}: ${err.message} ` +
+          `(recoveries exhausted ${decoderRecoveries}/${MAX_DECODER_RECOVERIES}, ${frameDiagnostics()})`,
+          { errorCode: 'opus_decode_failed', botName, userId, recovered: false },
+        );
+        teardownSubscription();
+      });
+
+      return dec;
+    }
+
+    sub.decoder = makeDecoder();
+    audioStream.pipe(silenceFilter).pipe(sub.decoder);
+
+    audioStream.on('error', (err) => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      logger.error(
+        `Voice [${botName}]: stream error for ${userId}: ${err.message}`,
+        { errorCode: 'voice_audio_stream_error', botName, userId },
+      );
+      teardownSubscription();
     });
+
+    state.activeSubscriptions.set(userId, sub);
   }
 
   function clearLocalVoiceSession(botName = 'mechanicus', userId = '', voiceSessionId = '') {

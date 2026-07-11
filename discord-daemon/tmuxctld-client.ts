@@ -19,11 +19,20 @@ function normalizeBotName(botName) {
 
 async function request(method, path, body = null, { timeoutMs: routeTimeoutMs = null } = {}) {
   const url = `${baseUrl()}${path}`;
-  const defaultTimeoutMs = routeTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  const configuredTimeoutMs = Number(process.env.TMUXCTLD_REQUEST_TIMEOUT_MS || defaultTimeoutMs);
-  const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
-    ? Math.max(configuredTimeoutMs, defaultTimeoutMs)
-    : defaultTimeoutMs;
+  // An explicit route timeout wins outright: bounded probes (health, boot
+  // clears) must not be stretched by the env-wide override. The env override
+  // applies only to routes that fall back to the default timeout, and can
+  // only raise it — a stale short env value must not shorten requests.
+  let timeoutMs;
+  const explicitTimeoutMs = Number(routeTimeoutMs);
+  if (routeTimeoutMs !== null && Number.isFinite(explicitTimeoutMs) && explicitTimeoutMs > 0) {
+    timeoutMs = explicitTimeoutMs;
+  } else {
+    const configuredTimeoutMs = Number(process.env.TMUXCTLD_REQUEST_TIMEOUT_MS || DEFAULT_REQUEST_TIMEOUT_MS);
+    timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+      ? Math.max(configuredTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS)
+      : DEFAULT_REQUEST_TIMEOUT_MS;
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const opts = {
@@ -59,6 +68,10 @@ async function request(method, path, body = null, { timeoutMs: routeTimeoutMs = 
       timeoutErr.timeoutMs = timeoutMs;
       throw timeoutErr;
     }
+    // Surface the transport-level cause (ECONNREFUSED etc.) — callers need to
+    // distinguish "daemon down" from "endpoint wedged" without string-matching
+    // undici's generic "fetch failed".
+    if (!err.code && err?.cause?.code) err.code = err.cause.code;
     throw err;
   } finally {
     clearTimeout(timeout);
@@ -71,9 +84,10 @@ async function request(method, path, body = null, { timeoutMs: routeTimeoutMs = 
  * @property {function({voiceSessionId: string, text: string}): Promise<object>} appendVoiceSession
  * @property {function({voiceSessionId: string, text?: string}): Promise<object>} shipVoiceSession
  * @property {function({voiceSessionId: string}): Promise<object>} scratchVoiceSession
- * @property {function({voiceSessionId?: string, botName?: string, userId?: string}=): Promise<object>} clearVoiceSession
+ * @property {function({voiceSessionId?: string, botName?: string, userId?: string, timeoutMs?: number}=): Promise<object>} clearVoiceSession
  * @property {function({target: string, text: string, submit?: boolean, clearPrompt?: boolean}): Promise<object>} sendText
  * @property {function(string): Promise<object>} voiceTarget
+ * @property {function({timeoutMs?: number}=): Promise<object>} health
  */
 
 /**
@@ -106,12 +120,12 @@ export function createTmuxctldClient() {
         voice_session_id: voiceSessionId,
       }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
     },
-    clearVoiceSession({ voiceSessionId = '', botName = '', userId = '' } = {}) {
+    clearVoiceSession({ voiceSessionId = '', botName = '', userId = '', timeoutMs = LONG_HOLD_TIMEOUT_MS } = {}) {
       return request('POST', '/voice/session/clear', {
         voice_session_id: voiceSessionId,
         bot_name: botName ? normalizeBotName(botName) : '',
         user_id: userId ? String(userId) : '',
-      }, { timeoutMs: LONG_HOLD_TIMEOUT_MS });
+      }, { timeoutMs });
     },
     sendText({ target, text, submit = true, clearPrompt = false }) {
       return request('POST', '/send-text', {
@@ -124,6 +138,9 @@ export function createTmuxctldClient() {
     voiceTarget(botName) {
       const query = new URLSearchParams({ bot_name: normalizeBotName(botName) });
       return request('GET', `/voice/target?${query.toString()}`);
+    },
+    health({ timeoutMs = 2_000 } = {}) {
+      return request('GET', '/health', null, { timeoutMs });
     },
   };
 }
