@@ -65,7 +65,16 @@ function makeFakes({ playAudioImpl = null } = {}) {
   };
   const transcriber = {
     dropped: [],
+    frames: [],
+    commits: [],
     dropBot(bot) { transcriber.dropped.push(bot); return 1; },
+    handleAudioFrame(userId, chunk, bot, meta) {
+      transcriber.frames.push({ userId, bytes: chunk.length, bot, meta });
+    },
+    commitUser(userId, bot, meta) {
+      transcriber.commits.push({ userId, bot, meta });
+      return true;
+    },
   };
   const tmuxctldCalls = [];
   const tmuxctld = {
@@ -124,6 +133,9 @@ function makeSelftest(fakes, logs, overrides = {}) {
     watchOperatorVoice: () => () => {},
     openaiTimeoutMs: 60,
     transcriptTimeoutMs: 80,
+    // Unit tests fake the loopback injection; the dedicated loopback test
+    // passes injectFixtureAudio: null to exercise the real fixture path.
+    injectFixtureAudio: async () => ({ frames: 150, pcmBytes: 288_000 }),
     ...overrides,
   });
 }
@@ -432,4 +444,31 @@ test('selftest openai_ws stage resolves the key env-first (matches realtime-tran
     if (prior === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = prior;
   }
+});
+
+test('default loopback injection feeds the real fixture PCM into the transcriber', async () => {
+  const fakes = makeFakes();
+  const logs = [];
+  let selftest;
+  // Simulate Realtime completing: the commit triggers the transcript, keyed by
+  // the probe's synthetic inject user — never the router.
+  fakes.transcriber.commitUser = (userId, bot, meta) => {
+    fakes.transcriber.commits.push({ userId, bot, meta });
+    setTimeout(() => {
+      const consumed = selftest.consumeTranscript({ botName: bot, userId, text: SELFTEST_PHRASE });
+      assert.equal(consumed, true, 'loopback transcript is swallowed');
+    }, 5);
+    return true;
+  };
+  selftest = makeSelftest(fakes, logs, { injectFixtureAudio: null });
+
+  const report = await selftest.run({ variant: 'full' });
+
+  assert.equal(report.overall, 'pass');
+  assert.ok(fakes.transcriber.frames.length > 100, `real decoded frames reached the transcriber (${fakes.transcriber.frames.length})`);
+  assert.ok(fakes.transcriber.frames.every(f => f.bytes === 1920), '20ms 48kHz mono s16le frames');
+  assert.ok(fakes.transcriber.frames.every(f => f.bot === 'mechanicus'));
+  assert.equal(fakes.transcriber.commits.length, 1);
+  assert.match(fakes.transcriber.commits[0].userId, /^selftest-/);
+  assertNoErrorLogs(logs);
 });

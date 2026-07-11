@@ -6,9 +6,16 @@
 //
 // - seams (≤15s, no audio): config / gateway / tmuxctld / OpenAI Realtime
 //   handshake. Fired ~5s after boot, fire-and-forget.
-// - full (≤60s): inquisition (no voice_channels assignment — invisible to
-//   auto-join routing) speaks a committed fixture phrase into the dedicated
-//   probe VC while mechanicus listens; the transcript must fuzzy-match the
+// - full (≤60s): mechanicus joins the dedicated probe VC and listens while
+//   inquisition (no voice_channels assignment — invisible to auto-join
+//   routing) plays the committed fixture phrase (sender-path coverage; also
+//   audible to any human in the VC). The transcript itself comes from a
+//   LOOPBACK INJECTION: the fixture PCM is fed into the same transcriber
+//   path Discord-decoded audio takes, because Discord does not relay
+//   bot-originated audio to bot receivers — a bot listener never gets
+//   speaking/RTP for another bot, so a true bot→bot loop is impossible at
+//   the Discord layer (verified live 2026-07-11: bot→human and human→bot
+//   deliver; bot→bot is silent). The transcript must fuzzy-match the
 //   phrase. tmuxctld session start+clear only — the probe never appends or
 //   ships, and probe transcripts never reach the router (consumeTranscript).
 //
@@ -23,7 +30,7 @@
 //   hook, and a boot probe would page after every restart. warn + explicit
 //   sinks (events row always; alerts channel only on fail/degraded/deadline).
 
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
@@ -92,6 +99,8 @@ export function createVoiceSelftest({
   openaiTimeoutMs = 10_000,
   transcriptTimeoutMs = 20_000,
   playAudioTimeoutMs = 15_000,
+  readFixture = () => readFileSync(fixturePath),
+  injectFixtureAudio = null,
   audioLoopAttempts = 2,
   alertDedupeMs = 60 * 60_000,
   probeGrantTtlMs = 90_000,
@@ -336,16 +345,66 @@ export function createVoiceSelftest({
     });
   }
 
+  // --- loopback audio injection ---
+  // Discord never relays bot-originated audio to bot receivers, so the
+  // transcript leg cannot ride the VC. Instead the fixture PCM is fed as
+  // 20ms 48kHz mono frames into the same transcriber path Discord-decoded
+  // audio takes (handleAudioFrame → Realtime → transcription → routing).
+  //
+  // Deliberately NO opus encode round-trip: @discordjs/opus's mono encoder
+  // aborts the whole process (dyld "missing symbol called") on certain
+  // speech-frame content — a probe must never be able to SIGABRT the daemon.
+  // Decoder coverage lives in voice.decoder-recovery tests and every live
+  // operator utterance.
+
+  function wavPcmData(buffer) {
+    if (buffer.length < 12 || buffer.toString('ascii', 0, 4) !== 'RIFF') {
+      throw stageError('bad_fixture', 'fixture is not a RIFF WAV');
+    }
+    let offset = 12;
+    while (offset + 8 <= buffer.length) {
+      const chunkId = buffer.toString('ascii', offset, offset + 4);
+      const chunkSize = buffer.readUInt32LE(offset + 4);
+      if (chunkId === 'data') return Buffer.from(buffer.subarray(offset + 8, offset + 8 + chunkSize));
+      offset += 8 + chunkSize + (chunkSize % 2);
+    }
+    throw stageError('bad_fixture', 'fixture WAV has no data chunk');
+  }
+
+  const defaultInjectFixtureAudio = async (ctx) => {
+    const pcm = wavPcmData(readFixture());
+    if (!pcm.length) throw stageError('bad_fixture', 'fixture has no PCM data');
+    const FRAME_BYTES = 960 * 2; // 20ms of 48kHz mono s16le, like the live decoder output
+    let frames = 0;
+    for (let i = 0; i + FRAME_BYTES <= pcm.length; i += FRAME_BYTES) {
+      transcriber.handleAudioFrame(ctx.injectUserId, pcm.subarray(i, i + FRAME_BYTES), listenerBot, {
+        selftest: true,
+        probe_id: ctx.probeId,
+      });
+      frames += 1;
+    }
+    transcriber.commitUser(ctx.injectUserId, listenerBot, { reason: 'selftest', probe_id: ctx.probeId });
+    return { frames, pcmBytes: pcm.length };
+  };
+
   async function stageAudioLoop(ctx) {
+    const inject = injectFixtureAudio || defaultInjectFixtureAudio;
     for (let attempt = 1; attempt <= audioLoopAttempts; attempt++) {
       if (ctx.aborted) throw stageError('aborted', ctx.abortReason || 'aborted');
       const wait = waitForTranscript(ctx);
+      // Sender-path coverage (and a human-audible artifact in the probe VC):
+      // the playback result is not the transcript source.
       await raceStageCall(
         ctx,
         voiceManager.playAudio(fixturePath, speakerBot),
         playAudioTimeoutMs,
         'play_timeout',
         `playAudio(${speakerBot})`,
+      );
+      const injected = await inject(ctx);
+      logger.info(
+        `Voice selftest [${ctx.probeId}]: injected ${injected?.frames ?? '?'} loopback PCM frames ` +
+        `into the transcriber (attempt ${attempt}/${audioLoopAttempts})`,
       );
       const text = await wait;
       if (ctx.aborted) throw stageError('aborted', ctx.abortReason || 'aborted');
@@ -568,6 +627,7 @@ export function createVoiceSelftest({
       joinedListener: false,
       joinedSpeaker: false,
       speakerUserId: null,
+      injectUserId: `selftest-${probeCounter}`,
       unwatchOperator: null,
       abortRelease: null,
     };
@@ -610,12 +670,18 @@ export function createVoiceSelftest({
   }
 
   function consumeTranscript(result) {
-    // Ship prevention: while a full probe is live, transcripts spoken by the
-    // probe speaker on the listener bot are the probe's — they must never
-    // reach the router. Everything else (e.g. the operator) passes through.
+    // Ship prevention: while a full probe is live, transcripts from the
+    // probe's loopback injection (or from the probe speaker, should Discord
+    // ever relay bot audio to bot receivers) are the probe's — they must
+    // never reach the router. Everything else (e.g. the operator) passes
+    // through untouched.
     if (!active || active.variant !== 'full') return false;
     if (normalizeBot(result?.botName) !== normalizeBot(listenerBot)) return false;
-    if (!active.speakerUserId || String(result?.userId || '') !== active.speakerUserId) return false;
+    const userId = String(result?.userId || '');
+    const isProbeAudio =
+      userId === active.injectUserId ||
+      (active.speakerUserId && userId === active.speakerUserId);
+    if (!isProbeAudio) return false;
     const sink = active.transcriptSink;
     if (sink) sink(result?.text || '');
     return true;
