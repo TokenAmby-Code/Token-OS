@@ -1,0 +1,17 @@
+[Unit]
+Description=Token-OS edge_proxy stateless routing proxy
+After=network-online.target token-api.socket
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/runtimes/token-os/live/edge_proxy
+Environment=EDGE_PROXY_CONFIG=%h/secrets/token-os/edge_proxy.json
+Environment=IMPERIUM_MACHINE=k12-personal
+ExecStart=%h/.bun/bin/bun src/server.ts
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

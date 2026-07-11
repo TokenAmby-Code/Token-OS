@@ -1,0 +1,11 @@
+{
+  "bind": "127.0.0.1",
+  "port": 7780,
+  "upstream": "http://127.0.0.1:7777",
+  "machine": "auto",
+  "allowlist": [
+    { "method": "GET", "path": "/openapi.json" },
+    { "method": "GET", "pathPrefix": "/api/" },
+    { "method": "POST", "pathPrefix": "/api/hooks/" }
+  ]
+}
