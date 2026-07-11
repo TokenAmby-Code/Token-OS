@@ -2,7 +2,7 @@
 # nas-path.sh — Centralized machine identity and config for all Imperium scripts
 #
 # Exports:
-#   IMPERIUM_MACHINE — Machine identifier: mac, wsl, phone
+#   IMPERIUM_MACHINE — Machine identifier: mac, wsl, phone, k12-personal, k12-work, linux
 #   IMPERIUM         — Root of the Imperium NAS share
 #   CIVIC            — Root of the Civic NAS share
 #   TOKEN_OS         — Token-OS runtime checkout (machine-local when available)
@@ -43,7 +43,17 @@ elif [[ -d "/data/data/com.termux" ]]; then
 elif [[ "$(uname -r)" == *microsoft* ]]; then
     export IMPERIUM_MACHINE="wsl"
 else
-    export IMPERIUM_MACHINE="linux"
+    # Generic Linux: distinguish the K12 boxes by hostname so the personal/work
+    # split is nameable for routing, TTS chains, and enforcement scoping. Any
+    # other Linux node stays the generic "linux" fallback (never silently
+    # inheriting k12-conditioned behavior).
+    _imperium_host="$(hostname -s 2>/dev/null || hostname 2>/dev/null)"
+    case "$_imperium_host" in
+        k12-personal) export IMPERIUM_MACHINE="k12-personal" ;;
+        k12-work)     export IMPERIUM_MACHINE="k12-work" ;;
+        *)            export IMPERIUM_MACHINE="linux" ;;
+    esac
+    unset _imperium_host
 fi
 
 # ============================================================
@@ -63,6 +73,12 @@ fi
 #   shell         — Default interactive shell (zsh/bash)
 #   token_os_runtime — Preferred machine-local Token-OS runtime checkout
 
+# Token-API host — the single tailnet node currently serving Token-API (the mac
+# today; migrates to k12-personal at cutover). Hoisted once so satellite rows
+# don't each embed the literal IP. Machines that run their OWN local Token-API
+# (mac, k12-personal) point at localhost instead of this host.
+_IMPERIUM_TOKEN_API_HOST="100.95.109.23"
+
 # --- Mac Mini ---
 _IMPERIUM_CFG_mac_nas_imperium="/Volumes/Imperium"
 _IMPERIUM_CFG_mac_nas_civic="/Volumes/Civic"
@@ -78,7 +94,7 @@ _IMPERIUM_CFG_mac_token_os_runtime="$HOME/runtimes/Token-OS/live"
 _IMPERIUM_CFG_wsl_nas_imperium="/mnt/imperium"
 _IMPERIUM_CFG_wsl_nas_civic="/mnt/civic"
 _IMPERIUM_CFG_wsl_tailscale_ip="100.66.10.74"
-_IMPERIUM_CFG_wsl_token_api_url="http://100.95.109.23:7777"
+_IMPERIUM_CFG_wsl_token_api_url="http://${_IMPERIUM_TOKEN_API_HOST}:7777"
 _IMPERIUM_CFG_wsl_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_wsl_ssh_alias="wsl"
 _IMPERIUM_CFG_wsl_device_name="TokenPC"
@@ -89,7 +105,7 @@ _IMPERIUM_CFG_wsl_token_os_runtime="/home/token/runtimes/token-os/live"
 _IMPERIUM_CFG_phone_nas_imperium=""
 _IMPERIUM_CFG_phone_nas_civic=""
 _IMPERIUM_CFG_phone_tailscale_ip="100.102.92.24"
-_IMPERIUM_CFG_phone_token_api_url="http://100.95.109.23:7777"
+_IMPERIUM_CFG_phone_token_api_url="http://${_IMPERIUM_TOKEN_API_HOST}:7777"
 _IMPERIUM_CFG_phone_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_phone_ssh_alias="phone"
 _IMPERIUM_CFG_phone_device_name="Token-S24"
@@ -100,12 +116,43 @@ _IMPERIUM_CFG_phone_token_os_runtime=""
 _IMPERIUM_CFG_linux_nas_imperium="/mnt/imperium"
 _IMPERIUM_CFG_linux_nas_civic="/mnt/civic"
 _IMPERIUM_CFG_linux_tailscale_ip=""
-_IMPERIUM_CFG_linux_token_api_url="http://100.95.109.23:7777"
+_IMPERIUM_CFG_linux_token_api_url="http://${_IMPERIUM_TOKEN_API_HOST}:7777"
 _IMPERIUM_CFG_linux_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_linux_ssh_alias=""
 _IMPERIUM_CFG_linux_device_name=""
 _IMPERIUM_CFG_linux_shell="bash"
 _IMPERIUM_CFG_linux_token_os_runtime="/home/token/runtimes/token-os/live"
+
+# --- K12 personal (GMKtec K12; Imperium domain — replaces the Mac Mini) ---
+# NOTE: IMPERIUM_MACHINE is the hyphenated public id "k12-personal", but bash
+# variable names cannot contain hyphens, so the registry suffix uses underscores
+# ("k12_personal"). imperium_cfg maps hyphens→underscores before the lookup.
+# Runs its OWN local Token-API (docket: per-box registry pre-cutover) and is the
+# long-term Token-API home, so token_api_url is localhost. Civic is NOT mounted
+# here: the personal/work boundary is physical — cross-mounting is prohibited.
+_IMPERIUM_CFG_k12_personal_nas_imperium="/mnt/imperium"
+_IMPERIUM_CFG_k12_personal_nas_civic=""
+_IMPERIUM_CFG_k12_personal_tailscale_ip="100.113.115.32"
+_IMPERIUM_CFG_k12_personal_token_api_url="http://localhost:7777"
+_IMPERIUM_CFG_k12_personal_tmuxctld_url="http://127.0.0.1:7778"
+_IMPERIUM_CFG_k12_personal_ssh_alias="k12-personal"
+_IMPERIUM_CFG_k12_personal_device_name="K12-Personal"
+_IMPERIUM_CFG_k12_personal_shell="bash"
+_IMPERIUM_CFG_k12_personal_token_os_runtime="$HOME/runtimes/token-os/live"
+
+# --- K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE) ---
+# In the Imperium registry only to be nameable for routing/enforcement scoping;
+# civic-specific config lives in Pax-ENV. Imperium is NOT mounted on the work box
+# (boundary), and it runs no Token-OS runtime, so those fields are empty.
+_IMPERIUM_CFG_k12_work_nas_imperium=""
+_IMPERIUM_CFG_k12_work_nas_civic="/mnt/civic"
+_IMPERIUM_CFG_k12_work_tailscale_ip="100.67.168.105"
+_IMPERIUM_CFG_k12_work_token_api_url="http://${_IMPERIUM_TOKEN_API_HOST}:7777"
+_IMPERIUM_CFG_k12_work_tmuxctld_url="http://127.0.0.1:7778"
+_IMPERIUM_CFG_k12_work_ssh_alias="k12-work"
+_IMPERIUM_CFG_k12_work_device_name="K12-Work"
+_IMPERIUM_CFG_k12_work_shell="bash"
+_IMPERIUM_CFG_k12_work_token_os_runtime=""
 
 # ============================================================
 # CONFIG LOOKUP FUNCTION
@@ -118,6 +165,9 @@ _IMPERIUM_CFG_linux_token_os_runtime="/home/token/runtimes/token-os/live"
 imperium_cfg() {
     local key="$1"
     local machine="${2:-$IMPERIUM_MACHINE}"
+    # Registry suffixes use underscores; public machine ids may be hyphenated
+    # (e.g. k12-personal). Normalize so the variable name is a valid identifier.
+    machine="${machine//-/_}"
     local var="_IMPERIUM_CFG_${machine}_${key}"
     eval "echo \"\${${var}}\""
 }
