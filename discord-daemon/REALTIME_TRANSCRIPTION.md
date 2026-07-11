@@ -90,3 +90,11 @@ Defaults are intentionally fast but nonzero: `voice_silence_commit_ms = 700` and
 ## Gapless capture notes
 
 The Discord receiver subscription stays active across commits. Local silence commits only close the current Realtime input buffer; the next real PCM frame immediately creates a fresh Realtime session and queues audio while its WebSocket becomes ready. Server VAD may also auto-commit before the local timer; the daemon treats `input_audio_buffer.committed` as a committed session so subsequent frames start the next session rather than appending to an already-committed buffer. This may create overlapping or duplicated syllables at boundaries, which is preferred over dropped speech.
+
+## API key resolution
+
+The Realtime transcriber (and the voice selftest probe) resolve the OpenAI key
+**env-first**: `process.env.OPENAI_API_KEY || config.openai_api_key`. This
+matches token-api's `_openai_api_key()` (routes/tts.py), so Discord voice and
+TTS share one effective key source. The `config.json` copy is the fallback for
+launchd contexts without the env var. (Full keychain migration is deferred.)

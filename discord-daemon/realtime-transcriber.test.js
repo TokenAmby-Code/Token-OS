@@ -165,3 +165,23 @@ test('Realtime transcripts carry route epoch and channel metadata', () => {
   assert.equal(transcripts[0].channelId, 'terra');
   assert.equal(transcripts[0].commitMeta.routeEpoch, 7);
 });
+
+test('OPENAI_API_KEY env wins over the config.json copy (single effective key source)', () => {
+  FakeWebSocket.instances = [];
+  const prior = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = 'sk-env';
+  try {
+    const transcriber = createRealtimeTranscriber(
+      { openai_api_key: 'sk-config', _websocket_class: FakeWebSocket },
+      logger(),
+      () => {}
+    );
+    transcriber.appendPCM('user-1', Buffer.alloc(19200), 'mechanicus');
+    const ws = FakeWebSocket.instances[0];
+    assert.ok(ws);
+    assert.equal(ws.options.headers.Authorization, 'Bearer sk-env');
+  } finally {
+    if (prior === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = prior;
+  }
+});

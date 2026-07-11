@@ -415,3 +415,21 @@ test('hard deadline aborts a wedged probe, finalizes the report, and alerts', as
   assert.notEqual(next.errorCode, 'probe_in_progress');
   assertNoErrorLogs(logs);
 });
+
+test('selftest openai_ws stage resolves the key env-first (matches realtime-transcriber)', async () => {
+  FakeWebSocket.instances = [];
+  FakeWebSocket.behavior = 'ack';
+  const fakes = makeFakes();
+  fakes.config.openai_api_key = 'sk-config';
+  const prior = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = 'sk-env';
+  try {
+    const selftest = makeSelftest(fakes, []);
+    const report = await selftest.run({ variant: 'seams' });
+    assert.equal(report.overall, 'pass');
+    assert.equal(FakeWebSocket.instances[0].options.headers.Authorization, 'Bearer sk-env');
+  } finally {
+    if (prior === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = prior;
+  }
+});

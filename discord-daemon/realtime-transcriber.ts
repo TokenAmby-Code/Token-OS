@@ -8,8 +8,24 @@ const DEFAULT_REALTIME_MODEL = 'gpt-realtime';
 const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
 const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
 
+/**
+ * @typedef {object} RealtimeTranscriber
+ * @property {function(string, Buffer, string, object=): void} appendPCM
+ * @property {function(string, string, object=): boolean} commitUser
+ * @property {function(string, string): void} closeUser
+ * @property {function(): void} closeAll
+ * @property {function(string): number} dropBot
+ * @property {function(): object} getStatus
+ */
+
+/**
+ * @returns {RealtimeTranscriber}
+ */
 export function createRealtimeTranscriber(config, logger, emitTranscript) {
-  const apiKey = config.openai_api_key || process.env.OPENAI_API_KEY;
+  // Env-first, matching token-api's _openai_api_key() (routes/tts.py): both
+  // services then share one effective key source instead of Discord silently
+  // preferring the config.json copy.
+  const apiKey = process.env.OPENAI_API_KEY || config.openai_api_key;
   const WebSocketImpl = config._websocket_class || WebSocket;
   const realtimeModel = config.realtime_model || DEFAULT_REALTIME_MODEL;
   const transcriptionModel = config.realtime_transcription_model || DEFAULT_TRANSCRIBE_MODEL;

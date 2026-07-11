@@ -3,3 +3,4 @@
 // from PR C via Node type-stripping) compile this source directly — no build.
 export * from './ops-state.ts';
 export * from './voice-selftest.ts';
+export * from './voice-reconcile.ts';

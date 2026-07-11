@@ -18,6 +18,7 @@ import { splitDiscordMessageContent } from './outbound-message.ts';
 import { createFleetStatusPublisher } from './fleet-status-publisher.ts';
 import { createStartupVoiceCleanup } from './startup-voice-cleanup.ts';
 import { createVoiceSelftest } from './voice-selftest.ts';
+import { createVoiceDraftReconciler } from './voice-drafts-reconcile.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = join(__dirname, '..');
@@ -207,6 +208,12 @@ async function main() {
     tmuxctld: tmuxctldClient,
     botClients,
   });
+  const voiceDraftReconciler = createVoiceDraftReconciler({
+    config,
+    logger,
+    voiceTranscriptRouter,
+    tmuxctld: tmuxctldClient,
+  });
 
   // Clear stale voice locks/options/drafts from a previous Discord daemon
   // process before any new VC auto-join can create fresh sessions. tmuxctld
@@ -296,6 +303,7 @@ async function main() {
     voiceManager,
     voiceTranscriptRouter,
     voiceSelftest,
+    voiceDraftReconciler,
   );
 
   // Forward incoming messages to Token API if configured (main listening bot only)
