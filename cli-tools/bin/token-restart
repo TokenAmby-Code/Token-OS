@@ -1967,6 +1967,19 @@ full_restart() {
     abort_deploy_if_superseded "before discord restart" && return 0
     if [[ "$RESTART_DISCORD" == true ]]; then
         restart_discord || true
+        # Heal draft-truth divergence left by the restart: the daemon's map
+        # reset but tmuxctld VOICE_SESSIONS and token-api's dict may still
+        # hold orphans that would swallow the next utterance. Best-effort.
+        if check_discord_health; then
+            reconcile_result="$(curl -s -m 10 -X POST "${DISCORD_URL}/voice/drafts/reconcile" \
+                -H 'Content-Type: application/json' \
+                -d '{"auto_clear":true}' 2>/dev/null || true)"
+            if [[ -n "$reconcile_result" ]]; then
+                echo -e "  ${GREEN}✓${NC} Voice draft reconcile: $(echo "$reconcile_result" | head -c 200)"
+            else
+                echo -e "  ${YELLOW}○${NC} Voice draft reconcile skipped (daemon not answering)"
+            fi
+        fi
         abort_deploy_if_superseded "after discord restart" && return 0
         echo ""
     fi

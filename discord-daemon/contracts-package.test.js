@@ -75,3 +75,36 @@ test('@token-os/contracts SelftestReportSchema parses voice-selftest.v1 and reje
   const bad = { ...SELFTEST_REPORT_FIXTURE, overall: 'sort-of-fine' };
   assert.throws(() => contracts.SelftestReportSchema.parse(bad));
 });
+
+// voice-drafts-reconcile.v1 — the three-way draft-truth compare returned by
+// the daemon's POST /voice/drafts/reconcile.
+const RECONCILE_REPORT_FIXTURE = {
+  contract_version: 'voice-drafts-reconcile.v1',
+  auto_clear: true,
+  counts: { daemon_drafts: 1, tmuxctld_sessions: 2, token_api_drafts: 0 },
+  sources: { tmuxctld: { ok: true }, token_api: { ok: false, error: 'ECONNREFUSED' } },
+  orphans: [
+    {
+      source: 'tmuxctld_session',
+      bot_name: 'custodes',
+      author_id: 'user-1',
+      voice_session_id: 'vs-orphan',
+      cleared: true,
+    },
+  ],
+  in_sync: false,
+};
+
+test('@token-os/contracts ReconcileReportSchema parses voice-drafts-reconcile.v1 and rejects a bad source', async () => {
+  const contracts = await import('@token-os/contracts');
+  assert.equal(contracts.VOICE_RECONCILE_CONTRACT_VERSION, 'voice-drafts-reconcile.v1');
+  const parsed = contracts.ReconcileReportSchema.parse(RECONCILE_REPORT_FIXTURE);
+  assert.equal(parsed.orphans[0].source, 'tmuxctld_session');
+  assert.equal(parsed.in_sync, false);
+
+  const bad = {
+    ...RECONCILE_REPORT_FIXTURE,
+    orphans: [{ ...RECONCILE_REPORT_FIXTURE.orphans[0], source: 'somewhere-else' }],
+  };
+  assert.throws(() => contracts.ReconcileReportSchema.parse(bad));
+});

@@ -24,6 +24,7 @@ export function createHttpServer(
   voiceManager = null,
   voiceTranscriptRouter = null,
   voiceSelftest = null,
+  voiceDraftReconciler = null,
 ) {
   // botClients: { mechanicus: client, custodes: client, ... } OR a single client object (legacy)
   // Normalize to a clients map
@@ -542,6 +543,16 @@ export function createHttpServer(
         if (!voiceTranscriptRouter) return json(res, { count: 0, drafts: [] });
         const drafts = voiceTranscriptRouter.listDrafts();
         return json(res, { count: drafts.length, drafts });
+      }
+
+      // POST /voice/drafts/reconcile — three-way draft-truth compare
+      // (daemon map vs tmuxctld VOICE_SESSIONS vs token-api dict);
+      // auto_clear: true also heals the orphans through their owning surfaces.
+      if (method === 'POST' && path === '/voice/drafts/reconcile') {
+        if (!voiceDraftReconciler) return json(res, { error: 'Reconcile not available' }, 501);
+        const body = await parseBody(req);
+        const report = await voiceDraftReconciler.reconcile({ autoClear: !!body.auto_clear });
+        return json(res, report);
       }
 
       // POST /voice/drafts/clear — clear daemon-local voice draft locks

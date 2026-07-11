@@ -15,6 +15,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, '..', 'config.json');
 const ENV_PATH = join(process.env.HOME, '.discord-cli', '.env');
 
+// Config resolution is pinned to <checkout>/config.json via import.meta.url.
+// Guard the stale-NAS-path resurrection class: the daemon must run from a
+// local runtime checkout, never a NAS mount — a NAS-resident config brings
+// back the stale-config crashloop
+// (Mars/Tasks/discord-daemon-stale-nas-config-path-pin.md). Fail loud, no
+// fallback.
+const NAS_MOUNT_ROOTS = ['/Volumes/Imperium', '/mnt/imperium'];
+
+export function assertConfigPathSafe(configPath) {
+  const normalized = String(configPath || '');
+  if (NAS_MOUNT_ROOTS.some((root) => normalized === root || normalized.startsWith(`${root}/`))) {
+    throw new Error(
+      `discord-daemon config path resolved onto the NAS (${normalized}); ` +
+      'run the daemon from a local runtime checkout',
+    );
+  }
+  return normalized;
+}
+
 // Load .env file into a map (does not pollute process.env)
 function loadEnvFile() {
   if (!existsSync(ENV_PATH)) return {};
@@ -31,7 +50,7 @@ function loadEnvFile() {
 const envTokens = loadEnvFile();
 
 export function loadConfig() {
-  return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+  return JSON.parse(readFileSync(assertConfigPathSafe(CONFIG_PATH), 'utf-8'));
 }
 
 // Map keychain service names to .env variable names

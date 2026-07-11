@@ -143,7 +143,9 @@ export function createVoiceSelftest({
   const postAlert = sendAlert || defaultSendAlert;
 
   function openaiApiKey() {
-    return config.openai_api_key || process.env.OPENAI_API_KEY || '';
+    // Env-first, matching realtime-transcriber.ts and token-api's
+    // _openai_api_key(): one effective key source across the stack.
+    return process.env.OPENAI_API_KEY || config.openai_api_key || '';
   }
 
   function stageError(errorCode, message) {

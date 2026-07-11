@@ -87,6 +87,7 @@ async function request(method, path, body = null, { timeoutMs: routeTimeoutMs = 
  * @property {function({voiceSessionId?: string, botName?: string, userId?: string, timeoutMs?: number}=): Promise<object>} clearVoiceSession
  * @property {function({target: string, text: string, submit?: boolean, clearPrompt?: boolean}): Promise<object>} sendText
  * @property {function(string): Promise<object>} voiceTarget
+ * @property {function({voiceSessionId?: string, botName?: string, userId?: string, timeoutMs?: number}=): Promise<object>} voiceStatus
  * @property {function({timeoutMs?: number}=): Promise<object>} health
  */
 
@@ -138,6 +139,14 @@ export function createTmuxctldClient() {
     voiceTarget(botName) {
       const query = new URLSearchParams({ bot_name: normalizeBotName(botName) });
       return request('GET', `/voice/target?${query.toString()}`);
+    },
+    voiceStatus({ voiceSessionId = '', botName = '', userId = '', timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+      const query = new URLSearchParams();
+      if (voiceSessionId) query.set('voice_session_id', voiceSessionId);
+      if (botName) query.set('bot_name', normalizeBotName(botName));
+      if (userId) query.set('user_id', String(userId));
+      const suffix = query.size ? `?${query.toString()}` : '';
+      return request('GET', `/voice/status${suffix}`, null, { timeoutMs });
     },
     health({ timeoutMs = 2_000 } = {}) {
       return request('GET', '/health', null, { timeoutMs });
