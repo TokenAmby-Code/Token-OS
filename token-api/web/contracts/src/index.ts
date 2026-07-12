@@ -4,3 +4,4 @@
 export * from './ops-state.ts';
 export * from './voice-selftest.ts';
 export * from './voice-reconcile.ts';
+export * from './k12-lifecycle.ts';
