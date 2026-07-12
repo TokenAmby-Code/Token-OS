@@ -62,6 +62,8 @@
 		<string>__SET_BY_OPERATOR__</string>
 		<key>TOKEN_SATELLITE_REFRESH_SECRET</key>
 		<string>__SET_BY_OPERATOR__</string>
+		<key>TOKEN_API_OPENAI_TTS_INSTRUCTIONS</key>
+		<string>Read briskly and clearly. Use a fast default speaking pace. Do not add theatrical pauses, sighs, breaths, gasps, inhalations, exhalations, or other nonverbal breathing sounds. Deliver the text directly without performative affect.</string>
 	</dict>
 	<key>KeepAlive</key>
 	<dict>
