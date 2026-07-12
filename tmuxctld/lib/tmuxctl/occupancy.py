@@ -74,6 +74,10 @@ class PaneOccupancy:
     instance_id: str
     live_agent: bool
     recently_born: bool = False
+    # The wrapper-ledger row's wrapper_id occupying this role, if any. Carried so
+    # a half-bound divergence (live agent, empty instance bind) can name the exact
+    # orphaned wrapper for an actionable repair, instead of a bare "unbound" flag.
+    wrapper_id: str = ""
 
     @property
     def singleton(self) -> bool:
@@ -437,6 +441,7 @@ def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupanc
                 instance_id=str((ledger_row or {}).get("instance_id") or ""),
                 live_agent=_active_agent(pane_pid),
                 recently_born=_recently_born(born_raw),
+                wrapper_id=str((ledger_row or {}).get("wrapper_id") or ""),
             )
         )
     return ledger

@@ -60,7 +60,13 @@ PAGE_LEGACY_POSITION_ALIASES = {
     },
     "somnium": {
         "W": "NW",
-        "N": "NE",
+        # NB: no "N": "NE" reverse alias. Under the 5-pane somnium layout NE is a
+        # FIRST-CLASS native pane (SOMNIUM_GRID_ROLES), so aliasing canonical N's
+        # legacy form to NE made the somnium:N pane index under the somnium:NE
+        # address too — colliding with the real somnium:NE pane and poisoning it
+        # as ``ambiguous`` (the 2026-07-11 somnium:NE pane_unresolved outage).
+        # Legacy NE requests still resolve: canonical_pane_role() maps them
+        # forward on the request side, so no reverse-index key is needed.
     },
 }
 
