@@ -1,11 +1,29 @@
 {
   "bind": "127.0.0.1",
   "port": 7780,
-  "upstream": "http://127.0.0.1:7777",
   "machine": "auto",
-  "allowlist": [
-    { "method": "GET", "path": "/openapi.json" },
-    { "method": "GET", "pathPrefix": "/api/" },
-    { "method": "POST", "pathPrefix": "/api/hooks/" }
+  "routes": [
+    {
+      "prefix": "/k12",
+      "upstream": "http://127.0.0.1:7781",
+      "stripPrefix": true,
+      "allowlist": [
+        { "method": "GET", "path": "/health" },
+        { "method": "POST", "path": "/launch" },
+        { "method": "POST", "path": "/send" },
+        { "method": "POST", "path": "/reconcile" },
+        { "method": "GET", "path": "/entities" },
+        { "method": "GET", "pathPrefix": "/entities/" }
+      ]
+    },
+    {
+      "prefix": "/",
+      "upstream": "http://127.0.0.1:7777",
+      "allowlist": [
+        { "method": "GET", "path": "/openapi.json" },
+        { "method": "GET", "pathPrefix": "/api/" },
+        { "method": "POST", "pathPrefix": "/api/hooks/" }
+      ]
+    }
   ]
 }

@@ -1,0 +1,17 @@
+[Unit]
+Description=Token-OS k12_daemon event-sourced tmux control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/runtimes/Token-OS/live/k12_daemon
+Environment=K12_DAEMON_CONFIG=%h/secrets/token-os/k12_daemon.json
+Environment=IMPERIUM_MACHINE=k12-personal
+ExecStart=%h/.bun/bin/bun src/daemon.ts
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
