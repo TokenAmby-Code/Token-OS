@@ -183,6 +183,25 @@ def test_follower_connected_latches_fallback_probe() -> None:
     assert wd._follower.connected is True
 
 
+def test_observe_clears_stale_follower_when_mac_client_stopped() -> None:
+    # Regression: after the Mac supervisor went quiet, WSL could keep reporting
+    # follower_connected=true even though the Mac API said the launchd client was
+    # stopped. Status/recovery must clear that stale latch.
+    module = load_satellite_module()
+    wd = make_watchdog(module, follower_connected=True)
+    wd._check_deskflow_running = lambda: True
+    wd._check_deskflow_listening = lambda: True
+    wd._check_mac_reachable = lambda: True
+    wd._get_mac_kvm_status = lambda: {"running": False}
+    wd._observe = module.DeskFlowWatchdog._observe.__get__(wd)
+
+    observation = wd._observe()
+
+    assert observation["deskflow_connected"] is False
+    assert observation["mac_client_running"] is False
+    assert wd._follower.connected is False
+
+
 def test_drop_while_running_schedules_recovery() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, record_recover=True)
@@ -235,6 +254,25 @@ def test_recovery_stops_after_mac_quick_reconnect() -> None:
     module = load_satellite_module()
     wd = make_watchdog(module, wait_results=[True])
     module.DeskFlowWatchdog._recover_connection(wd, "test")
+    assert wd.actions == ["mac_quick_reconnect", "wait"]
+    assert wd.state == "running"
+
+
+def test_recovery_reconciles_stale_connected_latch_before_opportunistic_noop() -> None:
+    # This is the live failure from 2026-07-11: manual reload entered recovery
+    # while the follower was stale-true and the Mac client was stopped. The old
+    # path returned at opportunistic_defer() without calling /api/kvm/start.
+    module = load_satellite_module()
+    wd = make_watchdog(module, follower_connected=True, wait_results=[True])
+    wd._check_deskflow_running = lambda: True
+    wd._check_deskflow_listening = lambda: True
+    wd._check_mac_reachable = lambda: True
+    wd._get_mac_kvm_status = lambda: {"running": False}
+    wd._observe = module.DeskFlowWatchdog._observe.__get__(wd)
+    wd._opportunistic_defer = lambda seconds=None: wd._follower.connected
+
+    module.DeskFlowWatchdog._recover_connection(wd, "manual_reload")
+
     assert wd.actions == ["mac_quick_reconnect", "wait"]
     assert wd.state == "running"
 

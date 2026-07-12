@@ -1225,12 +1225,29 @@ class DeskFlowWatchdog:
         connected = self._follower.connected if running else False
         mac_reachable = self._check_mac_reachable()
         mac_status = self._get_mac_kvm_status() if mac_reachable else {"running": None}
+        mac_client_running = mac_status.get("running")
+
+        # A quiet Mac launchd client can leave the WSL follower latched connected:
+        # Deskflow logs "server is dead", the Mac supervisor kills its core and
+        # exits 0, but the Windows server side may not emit a DROP edge that the
+        # follower classifies. Treat a reachable Mac explicitly reporting no
+        # client process as a contradictory observation and clear the latch. This
+        # makes both /kvm/status and manual /kvm/control reload converge through
+        # the normal recovery ladder instead of no-oping on stale follower state.
+        if connected and mac_client_running is False:
+            logger.warning(
+                "KVM watchdog: follower said connected but Mac client is stopped; "
+                "clearing stale connection latch"
+            )
+            self._follower.connected = False
+            connected = False
+
         return {
             "deskflow_running": running,
             "deskflow_listening": listening,
             "deskflow_connected": connected,
             "mac_reachable": mac_reachable,
-            "mac_client_running": mac_status.get("running"),
+            "mac_client_running": mac_client_running,
         }
 
     # ── Connection check ──
@@ -1597,6 +1614,20 @@ class DeskFlowWatchdog:
             return
 
         try:
+            # First reconcile any contradictory Mac-side state. This is the
+            # failure seen on 2026-07-11: the Mac supervisor had gone quiet while
+            # the WSL follower still believed the link was connected, causing
+            # manual reload to self-heal/no-op before it ever called /api/kvm/start.
+            observation = self._observe()
+            self.last_observation = observation
+            if observation["deskflow_connected"]:
+                self._mark_connected()
+                logger.info(
+                    f"KVM watchdog: Already connected at recovery start ({reason}) "
+                    f"observation={observation}"
+                )
+                return
+
             # Rung 0 — opportunistic grace: watch the follower for a self-heal
             # before any escalation. Aborts the ladder without touching the Mac.
             if self._opportunistic_defer():
