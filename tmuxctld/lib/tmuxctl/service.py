@@ -497,7 +497,11 @@ class TmuxControlPlane:
         live agent are split-brain bind divergences, not free residue; they are
         excluded from scrubbing and reported via
         ``chrome_unbound_live_divergences``/``*_count`` with reason
-        ``live_agent_without_bind``. This lets a released bind release
+        ``live_agent_without_bind`` plus the orphaned ``wrapper_id`` (when a
+        ledger row exists) and an actionable ``repair`` hint. Reconcile has no
+        trusted source to invent a bind from, so it neither scrubs the live
+        surface nor fabricates a binding — it names the divergence so callers can
+        route close+re-dispatch. This lets a released bind release
         tint/title/runtime chrome transactionally without erasing live TUIs whose
         bind has failed to land.
         """
@@ -519,11 +523,26 @@ class TmuxControlPlane:
             if pane.singleton or pane.instance_id:
                 continue
             if pane.live_agent:
+                # Half-bound live seat: a running TUI whose instance bind never
+                # landed (e.g. a resume that skipped SessionStart registration, or
+                # a wrapper row opened but never bound). Reconcile has no trusted
+                # binding source to invent from, so it does NOT scrub the live
+                # operator surface and does NOT fabricate a bind — it reports the
+                # divergence truthfully AND actionably: name the orphaned wrapper
+                # (when a ledger row exists) and the sanctioned repair op, so the
+                # caller can route the seat to close+re-dispatch instead of
+                # mistaking it for a clean free slot or a silent gap.
                 live_divergences.append(
                     {
                         "pane": pane.pane_id,
                         "pane_label": pane.pane_role or "",
                         "reason": "live_agent_without_bind",
+                        "wrapper_id": pane.wrapper_id,
+                        "repair": (
+                            "close_and_redispatch: live agent has no instance "
+                            "bind; reconcile cannot heal without a stamp/registry "
+                            "source"
+                        ),
                     }
                 )
                 continue

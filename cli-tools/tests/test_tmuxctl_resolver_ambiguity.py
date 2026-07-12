@@ -146,6 +146,46 @@ def test_duplicate_worker_role_fails_loud() -> None:
         resolve_pane_in_snapshot(snapshot, "2:NE")
 
 
+def somnium_workspace(*roles: str) -> WorkspaceSnapshot:
+    return WorkspaceSnapshot(
+        session_name="main",
+        windows=(
+            WindowSnapshot(
+                session_name="main",
+                window_index=2,
+                window_name="somnium",
+                archetype=WindowArchetype.SOMNIUM,
+                focused=False,
+                grid_expanded="",
+                grid_stash="",
+                side_expanded="",
+                panes=tuple(
+                    pane(f"%{40 + i}", role, window_index=2, window_name="somnium")
+                    for i, role in enumerate(roles)
+                ),
+            ),
+        ),
+    )
+
+
+def test_healthy_somnium_window_resolves_ne_not_ambiguous() -> None:
+    """The 2026-07-11 somnium:NE outage: a fully-stamped 5-pane somnium window
+    (W|N/NE/S/SE, every @PANE_ID distinct) must resolve somnium:NE to its own
+    pane. The stale ``PAGE_LEGACY_POSITION_ALIASES['somnium']['N'] = 'NE'`` made
+    the somnium:N pane also index under the somnium:NE address, poisoning the key
+    as ambiguous so every send raised ``pane_unresolved``. NE is a first-class
+    native pane, so N must NOT shadow it."""
+    snapshot = somnium_workspace("somnium:W", "somnium:N", "somnium:NE", "somnium:S", "somnium:SE")
+    # Every native address resolves to its own distinct pane — NE especially.
+    assert resolve_pane_in_snapshot(snapshot, "somnium:NE").pane_role == "somnium:NE"
+    assert resolve_pane_in_snapshot(snapshot, "somnium:N").pane_role == "somnium:N"
+    ne = resolve_pane_in_snapshot(snapshot, "somnium:NE").pane_id
+    n = resolve_pane_in_snapshot(snapshot, "somnium:N").pane_id
+    assert ne != n
+    for role in ("somnium:W", "somnium:S", "somnium:SE"):
+        assert resolve_pane_in_snapshot(snapshot, role).pane_role == role
+
+
 def test_two_live_claims_separated_by_tombstone_fail_loud() -> None:
     """A tombstone redirect indexed BETWEEN two distinct live claimants must not
     mask their collision. Old code let the tombstone absorb the second live claim

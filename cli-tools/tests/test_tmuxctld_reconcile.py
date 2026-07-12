@@ -814,11 +814,58 @@ def test_ledger_reconcile_refuses_to_scrub_unbound_live_tui_divergence(monkeypat
 
     assert out["chrome_scrubbed_unbound_panes"] == []
     assert adapter.cleared == []
-    assert out["chrome_unbound_live_divergences"] == [
-        {
-            "pane": "%22",
-            "pane_label": "somnium:N",
-            "reason": "live_agent_without_bind",
-        }
-    ]
+    div = out["chrome_unbound_live_divergences"]
+    assert len(div) == 1
+    assert div[0]["pane"] == "%22"
+    assert div[0]["pane_label"] == "somnium:N"
+    assert div[0]["reason"] == "live_agent_without_bind"
+    # No wrapper row for this pane (bare stampless live TUI): wrapper_id is empty
+    # but the actionable repair hint is always present.
+    assert div[0]["wrapper_id"] == ""
+    assert "close_and_redispatch" in div[0]["repair"]
     assert out["chrome_unbound_live_divergence_count"] == 1
+
+
+def test_ledger_reconcile_divergence_names_orphaned_wrapper(monkeypatch, tmp_path):
+    """palace:W autopsy shape (2026-07-11): a live agent whose wrapper row is OPEN
+    but never bound an instance (instance_id="") is a half-bound seat. Reconcile
+    must not scrub it, and must name the exact orphaned wrapper_id so the caller
+    can route close+re-dispatch — a bare "unbound" flag is not actionable."""
+
+    class HollowLiveAdapter:
+        def __init__(self):
+            self.cleared = []
+
+        def run(self, *args, allow_failure=False):  # noqa: ARG002
+            if args[:2] == ("list-panes", "-a"):
+                fmt = args[-1]
+                if "TOKEN_API_WRAPPER_ID" in fmt:
+                    return _raw_scan_line(
+                        wrapper_id="d6dc436b-open-never-bound",
+                        instance_id="",
+                        pane_id="palace:W",
+                        engine="codex",
+                        working_dir="/Users/tokenclaw",
+                    )
+                return "%19\tpalace:W\tpalace\t21211\t0"
+            return ""
+
+        def clear_runtime_state(self, target):
+            self.cleared.append(target)
+
+    adapter = HollowLiveAdapter()
+    control = TmuxControlPlane(adapter=adapter)
+    # The wrapper row is OPEN with a live agent process: half-bound, not a husk.
+    monkeypatch.setattr("tmuxctl.occupancy._active_agent", lambda pane_pid: True)
+
+    out = control.ledger_reconcile()
+
+    assert out["chrome_scrubbed_unbound_panes"] == []
+    assert adapter.cleared == []
+    div = out["chrome_unbound_live_divergences"]
+    assert len(div) == 1
+    assert div[0]["pane"] == "%19"
+    assert div[0]["pane_label"] == "palace:W"
+    assert div[0]["reason"] == "live_agent_without_bind"
+    assert div[0]["wrapper_id"] == "d6dc436b-open-never-bound"
+    assert "close_and_redispatch" in div[0]["repair"]
