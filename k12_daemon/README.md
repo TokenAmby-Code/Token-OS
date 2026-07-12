@@ -42,7 +42,7 @@ Per spec §12 (RULED): one edge proxy per box is the box's front door. The daemo
 is reached through the box `edge_proxy` (`:7780`) under the `/k12` route prefix,
 which strips the prefix and forwards to the daemon (`:7781`):
 
-```
+```text
 /k12/health           → 127.0.0.1:7781 /health
 /k12/launch           → 127.0.0.1:7781 /launch
 /k12/entities         → 127.0.0.1:7781 /entities

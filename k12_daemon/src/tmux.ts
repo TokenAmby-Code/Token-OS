@@ -12,6 +12,10 @@
 
 export type SeatObservation = { seat_id: string; pane: 'live' | 'dead' };
 
+// Below-membrane delivery outcome. `partial_delivered` = the literal text reached
+// the pane but the submit (Enter) did not — first-class, never collapsed to failure.
+export type SendOutcome = { bytes: number; verdict: 'delivered' | 'partial_delivered' | 'failed_none_delivered' };
+
 export interface TmuxControlPlane {
   reachable(): Promise<boolean>;
   version(): Promise<string | null>;
@@ -27,8 +31,8 @@ export interface TmuxControlPlane {
    * pane. No shadow state, no keystroke hook.
    */
   presentSeats(windowMs: number, nowMs?: number): Promise<Set<string>>;
-  /** Type text into the seat's pane. Returns bytes delivered. Resolves %id below the membrane. */
-  sendToSeat(seatId: string, text: string): Promise<{ bytes: number; delivered: boolean }>;
+  /** Type text into the seat's pane. Reports full/partial/none delivery. Resolves %id below the membrane. */
+  sendToSeat(seatId: string, text: string): Promise<SendOutcome>;
 }
 
 const CANON_OPT = '@canonical_id';
@@ -84,7 +88,12 @@ export class RealTmux implements TmuxControlPlane {
     // Sanitized tmux session name (canonical id may contain `:`); the true id
     // lives in the pane option only.
     const safe = `seat_${seatId.replace(/[^A-Za-z0-9_]/g, '_')}`;
-    await run(this.socket, ['new-session', '-d', '-s', safe, '-x', '200', '-y', '50']);
+    const created = await run(this.socket, ['new-session', '-d', '-s', safe, '-x', '200', '-y', '50']);
+    // Fail loud: if the session didn't come up, do NOT go on to list/retag some
+    // other pane and record a seat that was never really created.
+    if (created.code !== 0) {
+      throw new Error(`k12_daemon tmux createSeat failed for ${seatId}: ${created.stderr.trim() || `exit ${created.code}`}`);
+    }
     const paneR = await run(this.socket, ['list-panes', '-t', safe, '-F', '#{pane_id}']);
     const paneId = paneR.stdout.trim().split('\n')[0];
     if (paneId) await run(this.socket, ['set-option', '-p', '-t', paneId, CANON_OPT, seatId]);
@@ -122,13 +131,16 @@ export class RealTmux implements TmuxControlPlane {
     return present;
   }
 
-  async sendToSeat(seatId: string, text: string): Promise<{ bytes: number; delivered: boolean }> {
+  async sendToSeat(seatId: string, text: string): Promise<SendOutcome> {
     const paneId = await this.resolvePane(seatId);
-    if (!paneId) return { bytes: 0, delivered: false };
+    if (!paneId) return { bytes: 0, verdict: 'failed_none_delivered' };
     const literal = await run(this.socket, ['send-keys', '-t', paneId, '-l', text]);
+    if (literal.code !== 0) return { bytes: 0, verdict: 'failed_none_delivered' };
+    // Literal insert succeeded → the text is in the pane. If the separate Enter
+    // fails, it's inserted-but-not-submitted = partial, not pure failure.
+    const bytes = Buffer.byteLength(text, 'utf8');
     const enter = await run(this.socket, ['send-keys', '-t', paneId, 'Enter']);
-    const delivered = literal.code === 0 && enter.code === 0;
-    return { bytes: delivered ? Buffer.byteLength(text, 'utf8') : 0, delivered };
+    return enter.code === 0 ? { bytes, verdict: 'delivered' } : { bytes, verdict: 'partial_delivered' };
   }
 }
 
@@ -168,9 +180,9 @@ export class FakeTmux implements TmuxControlPlane {
     for (const [seat, at] of this.present) if (nowMs - at <= windowMs) out.add(seat);
     return out;
   }
-  async sendToSeat(seatId: string, text: string): Promise<{ bytes: number; delivered: boolean }> {
+  async sendToSeat(seatId: string, text: string): Promise<SendOutcome> {
     const s = this.seats.get(seatId);
-    if (!s || s.pane === 'dead') return { bytes: 0, delivered: false };
-    return { bytes: Buffer.byteLength(text, 'utf8'), delivered: true };
+    if (!s || s.pane === 'dead') return { bytes: 0, verdict: 'failed_none_delivered' };
+    return { bytes: Buffer.byteLength(text, 'utf8'), verdict: 'delivered' };
   }
 }

@@ -29,7 +29,9 @@ function envDefaults(): Partial<DaemonConfig> {
 const HARD_DEFAULTS = {
   bind: '127.0.0.1',
   port: 7781,
-  dbPath: `${process.env.HOME ?? ''}/runtimes/database/k12_daemon.events.sqlite`,
+  // No HOME ⇒ no default path. Fail loud in assertConfig rather than silently
+  // writing the event store to a bogus root-level `/runtimes/...` path.
+  dbPath: process.env.HOME ? `${process.env.HOME}/runtimes/database/k12_daemon.events.sqlite` : undefined,
   tmuxSocket: 'k12',
 } as const;
 

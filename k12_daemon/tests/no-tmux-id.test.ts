@@ -32,7 +32,7 @@ test('assertNoTmuxId throws loud on a leak', () => {
 
 test('no tmux id appears in any /launch, /send, /entities, or /reconcile response', async () => {
   const d = new Daemon(new EventStore(`/tmp/k12noid-${crypto.randomUUID()}.sqlite`), new FakeTmux());
-  const srv = makeServer({ bind: '127.0.0.1', port: 21000 + Math.floor(Math.random() * 9000), daemon: d, build: { version: '0.1.0', git_sha: 'test', bun: '1.0' }, machine: 'test' });
+  const srv = makeServer({ bind: '127.0.0.1', port: 0, daemon: d, build: { version: '0.1.0', git_sha: 'test', bun: '1.0' }, machine: 'test' });
   try {
     const post = (p: string, body: unknown) => fetch(`http://127.0.0.1:${srv.port}${p}`, { method: 'POST', body: JSON.stringify(body) });
     const bodies: unknown[] = [];

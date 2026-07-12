@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { EventStore } from '../src/store.ts';
 import type { EventInput } from '@token-os/contracts';
 
@@ -36,7 +37,6 @@ test('events table is structurally append-only (UPDATE/DELETE raise)', () => {
   const store = new EventStore(path);
   store.append(ev());
   // Reach the underlying db via a fresh handle on the same file.
-  const { Database } = require('bun:sqlite');
   const raw = new Database(path);
   expect(() => raw.exec("UPDATE events SET entity_id = 'x'")).toThrow(/append-only/);
   expect(() => raw.exec('DELETE FROM events')).toThrow(/append-only/);

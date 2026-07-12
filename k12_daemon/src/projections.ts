@@ -15,6 +15,7 @@
 //   act.send_delivered (send)     payload.target → queue_depth -1   (gated is a no-op: still enqueued)
 //   reg.contradiction_flagged     open unless a later event exists on the same entity_id
 
+import { PANE_STATES } from '@token-os/contracts';
 import type {
   ActivityBoardRow,
   ActivityState,
@@ -36,6 +37,13 @@ function str(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
 }
 
+// Only accept a declared PaneState; an unexpected/typo'd payload string must not
+// slip through as a bogus state and corrupt the freelist/board reads.
+function paneState(v: unknown): PaneState {
+  const s = str(v);
+  return s && (PANE_STATES as readonly string[]).includes(s) ? (s as PaneState) : 'live';
+}
+
 export function buildProjections(events: EventRecord[]): Projections {
   const paneBySeat = new Map<string, PaneState>();
   const bindingBySeat = new Map<string, CurrentBinding>();
@@ -49,7 +57,7 @@ export function buildProjections(events: EventRecord[]): Projections {
     lastSeqByEntity.set(e.entity_id, e.seq);
     switch (e.event_type) {
       case 'reg.pane_created':
-        paneBySeat.set(e.entity_id, (str(e.payload.pane_state) as PaneState) ?? 'live');
+        paneBySeat.set(e.entity_id, paneState(e.payload.pane_state));
         break;
       case 'reg.teardown_started':
       case 'reg.process_reaped':

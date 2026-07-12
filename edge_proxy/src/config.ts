@@ -76,6 +76,13 @@ export function assertConfig(raw: Partial<EdgeProxyConfig> & LegacyConfig): Edge
   if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) throw new Error(`edge_proxy config error: invalid port ${cfg.port}`);
   if (!Array.isArray(cfg.routes) || cfg.routes.length === 0) throw new Error("edge_proxy config error: routes must be non-empty");
   cfg.routes.forEach(assertRoute);
+  // Reject duplicate prefixes: routes carry independent allowlists + auth tokens
+  // (a security boundary), so a silent shadow would be a config-review landmine.
+  const seen = new Set<string>();
+  for (const [i, r] of cfg.routes.entries()) {
+    if (seen.has(r.prefix)) throw new Error(`edge_proxy config error: routes[${i}] duplicate prefix ${r.prefix}`);
+    seen.add(r.prefix);
+  }
   // Longest prefix first so the catch-all "/" never shadows a specific route.
   cfg.routes.sort((a, b) => b.prefix.length - a.prefix.length);
   return cfg;

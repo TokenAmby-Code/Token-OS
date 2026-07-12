@@ -278,7 +278,9 @@ export const SendRequestSchema = z.object({
 });
 export type SendRequest = z.infer<typeof SendRequestSchema>;
 
-export const SendReceiptSchema = z.object({
+// Base shape kept separate so consumers can still .extend()/.pick()/.omit();
+// the refined schema below enforces the partial-delivery evidence invariant.
+export const SendReceiptBaseSchema = z.object({
   verdict: DeliveryVerdictSchema,
   resolution: SendResolutionSchema, // the SAME resolution the send used
   gate_reason: SendGateReasonSchema.nullable(),
@@ -286,7 +288,11 @@ export const SendReceiptSchema = z.object({
   bytes_delivered: z.number().int().nullable(), // required non-null for partial_delivered
   send_seq: z.number().int(),
 });
-export type SendReceipt = z.infer<typeof SendReceiptSchema>;
+export const SendReceiptSchema = SendReceiptBaseSchema.refine(
+  (r) => r.verdict !== 'partial_delivered' || r.bytes_delivered !== null,
+  { message: 'partial_delivered must carry non-null bytes_delivered', path: ['bytes_delivered'] },
+);
+export type SendReceipt = z.infer<typeof SendReceiptBaseSchema>;
 
 // Admission refusal (fail-loud; nothing admitted to the queue).
 export const SendRefusalSchema = z.object({

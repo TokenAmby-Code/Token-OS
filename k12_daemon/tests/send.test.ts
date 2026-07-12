@@ -74,6 +74,24 @@ test('receipt carries the send OWN resolution (never re-derived) — bound_seq p
   expect(delivered.payload.resolved_seq).toBe(boundSeq); // the SAME seq the send resolved against
 });
 
+// A tmux fake whose literal-insert succeeds but the submit (Enter) does not.
+class PartialTmux extends FakeTmux {
+  override async sendToSeat(_seatId: string, text: string) {
+    return { bytes: Buffer.byteLength(text, 'utf8'), verdict: 'partial_delivered' as const };
+  }
+}
+
+test('partial delivery (inserted, not submitted) → partial_delivered carries bytes, stays enqueued', async () => {
+  const store = new EventStore(`/tmp/k12send-${crypto.randomUUID()}.sqlite`);
+  const d = new Daemon(store, new PartialTmux());
+  await bareSeat(d, 'somnium:NE'); // operator idle → reaches delivery
+  const res = (await d.send({ target: 'somnium:NE', text: 'hello', schema_version: 1 })) as SendReceipt;
+  expect(res.verdict).toBe('partial_delivered');
+  expect(res.bytes_delivered).toBe(5); // contract: partial MUST carry non-null byte evidence
+  const types = store.readAll().map((e) => e.event_type);
+  expect(types).not.toContain('act.send_delivered'); // not a full delivery → does not dequeue
+});
+
 test('schema_version mismatch REFUSED loud, nothing admitted', async () => {
   const { store, d } = setup();
   await bareSeat(d, 'somnium:NE');

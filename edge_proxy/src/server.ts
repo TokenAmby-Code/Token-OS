@@ -2,12 +2,16 @@ import { allowed, forwardPath, loadConfig, resolveRoute, type EdgeProxyConfig, t
 
 const build = { service: "edge_proxy", version: "0.1.0", git_sha: process.env.GIT_SHA || "unknown", bun: Bun.version };
 
+// A hung (not merely down) upstream must not wedge the proxy forever.
+const UPSTREAM_TIMEOUT_MS = 30_000;
+const HEALTH_PROBE_TIMEOUT_MS = 2_000;
+
 function authorized(req: Request, route: RouteConfig): boolean {
   if (!route.token) return true;
   return req.headers.get("authorization") === `Bearer ${route.token}`;
 }
 
-export function makeServer(cfg: EdgeProxyConfig) {
+export function makeServer(cfg: EdgeProxyConfig): ReturnType<typeof Bun.serve> {
   return Bun.serve({
     hostname: cfg.bind,
     port: cfg.port,
@@ -39,8 +43,11 @@ export function makeServer(cfg: EdgeProxyConfig) {
         headers.set("x-edge-proxy-machine", cfg.machine);
         headers.delete("host");
         headers.delete("authorization"); // route cred is proxy-terminated, never forwarded upstream
-        const proxied = new Request(upstreamUrl, { method: req.method, headers, body: req.body, redirect: "manual" });
-        const resp = await fetch(proxied);
+        // duplex:"half" is required by Bun/WHATWG fetch when streaming a request body.
+        const init: RequestInit = { method: req.method, headers, body: req.body, redirect: "manual" };
+        if (req.body) (init as RequestInit & { duplex: "half" }).duplex = "half";
+        const proxied = new Request(upstreamUrl, init);
+        const resp = await fetch(proxied, { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
         const outHeaders = new Headers(resp.headers);
         outHeaders.set("x-edge-proxy", "edge_proxy");
         return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: outHeaders });
@@ -53,18 +60,17 @@ export function makeServer(cfg: EdgeProxyConfig) {
 }
 
 async function healthResponse(cfg: EdgeProxyConfig): Promise<Response> {
-  const upstreams: Record<string, unknown>[] = [];
-  let ok = true;
-  for (const route of cfg.routes) {
+  // Probe all upstreams in parallel with a bounded timeout — a hung upstream
+  // must not stall the liveness endpoint the way a sequential un-timed loop would.
+  const upstreams = await Promise.all(cfg.routes.map(async (route) => {
     try {
-      const r = await fetch(new URL("/health", route.upstream), { method: "GET" });
-      upstreams.push({ prefix: route.prefix, upstream: route.upstream, reachable: r.ok, status: r.status });
-      if (!r.ok) ok = false;
+      const r = await fetch(new URL("/health", route.upstream), { method: "GET", signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS) });
+      return { prefix: route.prefix, upstream: route.upstream, reachable: r.ok, status: r.status };
     } catch (err) {
-      upstreams.push({ prefix: route.prefix, upstream: route.upstream, reachable: false, error: String(err) });
-      ok = false;
+      return { prefix: route.prefix, upstream: route.upstream, reachable: false, error: String(err) };
     }
-  }
+  }));
+  const ok = upstreams.every((u) => u.reachable);
   return json({ ok, build, machine: cfg.machine, upstreams }, ok ? 200 : 503);
 }
 

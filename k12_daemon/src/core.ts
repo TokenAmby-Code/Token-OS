@@ -8,8 +8,11 @@
 import {
   SCHEMA_VERSION,
   SEND_PRESENCE_ACTIVITY_WINDOW_MS,
+  type ActivityBoardRow,
   type DeliveryVerdict,
   type EventInput,
+  type EventRecord,
+  type Health,
   type LaunchRequest,
   type LaunchResponse,
   type OpenContradiction,
@@ -23,6 +26,7 @@ import {
   type SendResolution,
 } from '@token-os/contracts';
 import { EventStore } from './store.ts';
+import { findTmuxId } from './ids.ts';
 import { buildProjections, type Projections } from './projections.ts';
 import type { TmuxControlPlane } from './tmux.ts';
 
@@ -191,8 +195,8 @@ export class Daemon {
 
       // Operator idle at BOTH decision points → deliver (canonical in, %id internal).
       const result = await this.tmux.sendToSeat(resolution.seat_id, req.text);
-      const verdict: DeliveryVerdict = result.delivered ? 'delivered' : 'failed_none_delivered';
-      if (result.delivered) {
+      const verdict: DeliveryVerdict = result.verdict;
+      if (verdict === 'delivered') {
         this.store.append({
           entity_type: 'send',
           entity_id: sendId,
@@ -202,7 +206,10 @@ export class Daemon {
           occurred_at: this.now(),
         });
       }
-      return this.receipt(verdict, resolution, sendId, null, null, result.delivered ? result.bytes : 0);
+      // partial_delivered = text inserted but not submitted → stays enqueued (like a
+      // gate); the receipt still carries the partial verdict + its byte evidence
+      // (contract requires non-null bytes for partial). Only a full delivery dequeues.
+      return this.receipt(verdict, resolution, sendId, null, null, verdict === 'failed_none_delivered' ? 0 : result.bytes);
     });
   }
 
@@ -218,7 +225,10 @@ export class Daemon {
   }
 
   private refuse(reason: SendRefusalReason, target: string): SendRefusal {
-    console.error(JSON.stringify({ level: 'error', event: 'send_refused', reason, target }));
+    // The membrane also covers logs: a client may hand us a raw `%5`; redact it
+    // in the log line while returning the caller's original target unchanged.
+    const loggedTarget = findTmuxId(target) ? '<redacted-tmux-id>' : target;
+    console.error(JSON.stringify({ level: 'error', event: 'send_refused', reason, target: loggedTarget }));
     return { ok: false, refused: true, reason, target };
   }
 
@@ -326,17 +336,19 @@ export class Daemon {
   }
 
   // ── Read models (spec §7 rung 6) ───────────────────────────────────────────
-  entities() {
+  entities(): ActivityBoardRow[] {
     return this.projections().activityBoard;
   }
 
-  entityEvents(entityId: string) {
+  entityEvents(entityId: string): EventRecord[] {
     return this.store.readByEntity(entityId);
   }
 
-  async health(machine: string, build: { version: string; git_sha: string; bun: string }) {
+  async health(machine: string, build: { version: string; git_sha: string; bun: string }): Promise<Health> {
     const proj = this.projections();
-    const tmux_reachable = (await this.tmux.version()) !== null;
+    // Probe the daemon's OWN tmux socket (start-server + list-panes), not just
+    // `tmux -V` — a responding binary over a dead socket must not read healthy.
+    const tmux_reachable = await this.tmux.reachable();
     const open = proj.openContradictions.length;
     return {
       ok: open === 0, // bring-up mode: any open contradiction ⇒ not ok

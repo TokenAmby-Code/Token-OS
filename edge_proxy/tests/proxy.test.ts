@@ -34,7 +34,7 @@ test("forwardPath strips the route prefix only when asked", () => {
 });
 
 test("legacy single-upstream config normalizes to one default route", () => {
-  const cfg = assertConfig({ bind: "127.0.0.1", port: 7780, machine: "test", upstream: "http://127.0.0.1:7777", allowlist: [{ pathPrefix: "/api/" }] } as any);
+  const cfg = assertConfig({ bind: "127.0.0.1", port: 7780, machine: "test", upstream: "http://127.0.0.1:7777", allowlist: [{ pathPrefix: "/api/" }] });
   expect(cfg.routes.length).toBe(1);
   expect(cfg.routes[0]!.prefix).toBe("/");
   expect(cfg.routes[0]!.upstream).toBe("http://127.0.0.1:7777");

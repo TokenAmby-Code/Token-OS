@@ -58,7 +58,7 @@ test('present at ADMISSION → gated (defer this pass), even if idle by drain', 
   await d.launch({ seat_id: SEAT, schema_version: 1 });
   const res = (await d.send({ target: SEAT, text: 'hi', schema_version: 1 })) as SendReceipt;
   expect(res.verdict).toBe('enqueued_gated'); // the admission read gated it
-  expect(tmux.calls).toBeGreaterThanOrEqual(1);
+  expect(tmux.calls).toBe(1); // gated at admission → send returns without the drain read
 });
 
 test('idle at admission but present at DRAIN → gated (drain read is consulted)', async () => {

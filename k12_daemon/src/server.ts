@@ -121,7 +121,7 @@ export function buildRoutes(daemon: Daemon, build: BuildInfo, machine: string): 
   ];
 }
 
-export function makeServer(opts: { bind: string; port: number; daemon: Daemon; build: BuildInfo; machine: string }) {
+export function makeServer(opts: { bind: string; port: number; daemon: Daemon; build: BuildInfo; machine: string }): ReturnType<typeof Bun.serve> {
   const routes = buildRoutes(opts.daemon, opts.build, opts.machine);
   return Bun.serve({
     hostname: opts.bind,
@@ -136,7 +136,9 @@ export function makeServer(opts: { bind: string; port: number; daemon: Daemon; b
           return await route.handler(req, params);
         } catch (err) {
           console.error(JSON.stringify({ level: 'error', event: 'handler_error', route: route.label, error: String(err) }));
-          return json({ ok: false, error: 'internal_error', detail: String(err) }, 500);
+          // Generic body: the full error stays in the server log only. Serializing
+          // String(err) could echo a raw %id back through the membrane (assertNoTmuxId).
+          return json({ ok: false, error: 'internal_error' }, 500);
         }
       }
       return json({ ok: false, error: 'not_found', method: req.method, path: url.pathname }, 404);

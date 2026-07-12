@@ -31,8 +31,9 @@ console.log(
   }),
 );
 
-function shutdown() {
-  server.stop(true);
+async function shutdown() {
+  // Graceful: let in-flight requests finish before closing the store and exiting.
+  await server.stop();
   store.close();
   process.exit(0);
 }
