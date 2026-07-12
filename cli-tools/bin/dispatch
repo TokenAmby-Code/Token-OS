@@ -149,11 +149,11 @@ WITH_BROWSER=false
 WITH_DESKTOP=false
 WITH_MCP=""
 CODEX_PROFILE="${TOKEN_API_CODEX_PROFILE:-}"
-# Static model pin: claude dispatches default to opus unless explicitly
-# overridden (--model / TOKEN_API_CLAUDE_MODEL). In-session model changes are
-# volatile by design — the next launch re-pins from here, never from the
-# harness's sticky "saved default".
-CLAUDE_MODEL="${TOKEN_API_CLAUDE_MODEL:-opus}"
+# Static model pin: claude dispatches default to fable unless explicitly
+# overridden (--model / TOKEN_API_CLAUDE_MODEL — e.g. opus). In-session model
+# changes are volatile by design — the next launch re-pins from here, never
+# from the harness's sticky "saved default".
+CLAUDE_MODEL="${TOKEN_API_CLAUDE_MODEL:-fable}"
 DISCORD_CHANNEL=""
 NO_WORKTREE=false
 WORKTREE_BRANCH=""
