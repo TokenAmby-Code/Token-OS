@@ -90,6 +90,7 @@ test('partial delivery (inserted, not submitted) → partial_delivered carries b
   expect(res.bytes_delivered).toBe(5); // contract: partial MUST carry non-null byte evidence
   const types = store.readAll().map((e) => e.event_type);
   expect(types).not.toContain('act.send_delivered'); // not a full delivery → does not dequeue
+  store.close();
 });
 
 test('schema_version mismatch REFUSED loud, nothing admitted', async () => {

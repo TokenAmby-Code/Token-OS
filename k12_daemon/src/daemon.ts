@@ -32,8 +32,9 @@ console.log(
 );
 
 async function shutdown() {
-  // Graceful: let in-flight requests finish before closing the store and exiting.
-  await server.stop();
+  // Graceful, but bounded: let in-flight requests finish, yet never let a stuck
+  // request block termination — close the store and exit after 5s regardless.
+  await Promise.race([server.stop(), Bun.sleep(5_000)]);
   store.close();
   process.exit(0);
 }

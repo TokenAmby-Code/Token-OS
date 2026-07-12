@@ -284,15 +284,15 @@ export const SendReceiptBaseSchema = z.object({
   verdict: DeliveryVerdictSchema,
   resolution: SendResolutionSchema, // the SAME resolution the send used
   gate_reason: SendGateReasonSchema.nullable(),
-  activity_window_ms: z.number().int().nullable(), // echoed when gated
-  bytes_delivered: z.number().int().nullable(), // required non-null for partial_delivered
-  send_seq: z.number().int(),
+  activity_window_ms: z.number().int().nonnegative().nullable(), // echoed when gated
+  bytes_delivered: z.number().int().nonnegative().nullable(), // required non-null for partial_delivered
+  send_seq: z.number().int().nonnegative(), // seq is 1-based and monotonic
 });
 export const SendReceiptSchema = SendReceiptBaseSchema.refine(
   (r) => r.verdict !== 'partial_delivered' || r.bytes_delivered !== null,
   { message: 'partial_delivered must carry non-null bytes_delivered', path: ['bytes_delivered'] },
 );
-export type SendReceipt = z.infer<typeof SendReceiptBaseSchema>;
+export type SendReceipt = z.infer<typeof SendReceiptSchema>;
 
 // Admission refusal (fail-loud; nothing admitted to the queue).
 export const SendRefusalSchema = z.object({

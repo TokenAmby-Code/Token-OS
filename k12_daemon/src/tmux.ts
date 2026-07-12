@@ -12,9 +12,13 @@
 
 export type SeatObservation = { seat_id: string; pane: 'live' | 'dead' };
 
-// Below-membrane delivery outcome. `partial_delivered` = the literal text reached
-// the pane but the submit (Enter) did not — first-class, never collapsed to failure.
-export type SendOutcome = { bytes: number; verdict: 'delivered' | 'partial_delivered' | 'failed_none_delivered' };
+// Below-membrane delivery outcome (discriminated by verdict). `partial_delivered`
+// = the literal text reached the pane but the submit (Enter) did not — first-class,
+// never collapsed to failure. A total failure carries zero bytes by construction.
+export type SendOutcome =
+  | { verdict: 'delivered'; bytes: number }
+  | { verdict: 'partial_delivered'; bytes: number }
+  | { verdict: 'failed_none_delivered'; bytes: 0 };
 
 export interface TmuxControlPlane {
   reachable(): Promise<boolean>;
@@ -96,9 +100,13 @@ export class RealTmux implements TmuxControlPlane {
     }
     const paneR = await run(this.socket, ['list-panes', '-t', safe, '-F', '#{pane_id}']);
     const paneId = paneR.stdout.trim().split('\n')[0];
-    // A seat without its canonical-id tag is a broken seat — fail loud rather
-    // than leave an untagged pane the membrane can never resolve.
-    if (!paneId) throw new Error(`k12_daemon tmux createSeat: no pane for ${seatId} (session ${safe})`);
+    // A seat without its canonical-id tag is a broken seat. Tear the just-created
+    // session back down (no orphan) before failing loud, rather than leave an
+    // untagged pane the membrane can never resolve.
+    if (!paneId) {
+      await run(this.socket, ['kill-session', '-t', safe]);
+      throw new Error(`k12_daemon tmux createSeat: no pane for ${seatId} (session ${safe})`);
+    }
     await run(this.socket, ['set-option', '-p', '-t', paneId, CANON_OPT, seatId]);
   }
 

@@ -83,6 +83,22 @@ test("route-scoped auth: a route token gates only its own route", async () => {
   expect(r.status).toBe(200);
 });
 
+test("forwards a POST request body intact (duplex:\"half\" path)", async () => {
+  const upPort = port();
+  const proxyPort = port();
+  servers.push(Bun.serve({ hostname: "127.0.0.1", port: upPort, async fetch(req) {
+    const body = await req.text(); // reading the body proves it survived forwarding
+    return Response.json({ method: req.method, got: body });
+  }}));
+  servers.push(makeServer({ bind: "127.0.0.1", port: proxyPort, machine: "test", routes: [
+    { prefix: "/", upstream: `http://127.0.0.1:${upPort}`, allowlist: [{ method: "POST", pathPrefix: "/api/" }] },
+  ] }));
+  const payload = JSON.stringify({ hello: "world" });
+  const r = await fetch(`http://127.0.0.1:${proxyPort}/api/echo`, { method: "POST", body: payload });
+  expect(r.status).toBe(200);
+  expect(await r.json()).toEqual({ method: "POST", got: payload });
+});
+
 test("forward, refuse non-allowlisted, and fail loud when upstream dies", async () => {
   const upPort = port();
   const proxyPort = port();
