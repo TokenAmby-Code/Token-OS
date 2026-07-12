@@ -397,23 +397,32 @@ class TTSEngine:
                     return frames / float(rate)
         except Exception:
             pass
-        # Manual RIFF fallback for WAV variants the stdlib rejects.
+        # Manual RIFF fallback for WAV variants the stdlib rejects. Seek through
+        # chunk headers rather than buffering the whole clip (a malformed long
+        # WAV could be hundreds of MB of PCM).
         try:
-            raw = wav_path.read_bytes()
-            if raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
-                return None
-            i, byte_rate, data_len = 12, None, None
-            while i + 8 <= len(raw):
-                cid = raw[i : i + 4]
-                (csize,) = struct.unpack("<I", raw[i + 4 : i + 8])
-                body = i + 8
-                if cid == b"fmt " and body + 16 <= len(raw):
-                    byte_rate = struct.unpack("<I", raw[body + 8 : body + 12])[0]
-                elif cid == b"data":
-                    data_len = csize
-                i = body + csize + (csize & 1)
-            if byte_rate and data_len:
-                return data_len / float(byte_rate)
+            with open(wav_path, "rb") as fh:
+                header = fh.read(12)
+                if header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+                    return None
+                byte_rate, data_len = None, None
+                while True:
+                    chunk_hdr = fh.read(8)
+                    if len(chunk_hdr) < 8:
+                        break
+                    cid, csize = chunk_hdr[:4], struct.unpack("<I", chunk_hdr[4:8])[0]
+                    if cid == b"fmt ":
+                        fmt_body = fh.read(min(csize, 16))
+                        if len(fmt_body) >= 16:
+                            byte_rate = struct.unpack("<I", fmt_body[8:12])[0]
+                        fh.seek(max(csize - len(fmt_body), 0) + (csize & 1), 1)
+                    elif cid == b"data":
+                        data_len = csize
+                        break  # audio payload length is all we need
+                    else:
+                        fh.seek(csize + (csize & 1), 1)
+                if byte_rate and data_len:
+                    return data_len / float(byte_rate)
         except Exception:
             pass
         return None
