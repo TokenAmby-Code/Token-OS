@@ -1,5 +1,4 @@
-// Bounty-board lane for the discord daemon — JS mirror of the pytest lane
-// (token-api/tests/bounty_board/, xfail strict=False semantics).
+// Bounty-board lane for the discord daemon (xfail strict=False semantics).
 //
 // A bounty records intent for an UNBUILT feature. The wrapped body is
 // expected to fail today; that failure is an OPEN bounty and the lane stays

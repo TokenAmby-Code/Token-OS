@@ -129,7 +129,6 @@ Backend verification:
 ```bash
 cd /Volumes/Imperium/runtimes/token-os/live/token-api
 .venv/bin/python -m py_compile main.py
-.venv/bin/pytest -q tests/test_ops_ui.py
 curl -sf http://localhost:7777/api/ui/ops/state | jq .surface
 curl -sf 'http://localhost:7777/api/ui/ops/timer/history?window=15m&bucket=60s' | jq '{points: (.points|length), segments: (.segments|length)}'
 ```

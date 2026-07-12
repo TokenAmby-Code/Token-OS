@@ -1,8 +1,7 @@
 # Bounty board — discord-daemon
 
-JS mirror of the pytest bounty lane (`token-api/tests/bounty_board/`,
-`cli-tools/tests/bounty_board/`). Speculative tests for **unbuilt** daemon
-features, recording intent as executable contracts.
+Speculative tests for **unbuilt** daemon features, recording intent as
+executable contracts.
 
 ## Contract (xfail strict=False semantics)
 

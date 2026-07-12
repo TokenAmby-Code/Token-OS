@@ -92,12 +92,6 @@ jobs:
           fi
 
 
-      # NOTE: pytest intentionally does NOT run on the dev path (not even advisory).
-      # Per Emperor CI-policy decree the heavyweight regression suite was stripped
-      # from dev entirely — it wasted Actions minutes and polluted agent attention
-      # on every push. The full suite lives in prod-gate.yml (prod branch + nightly).
-      # Do not re-add a pytest step here.
-
       - name: CodeRabbit chill review
         id: cr
         continue-on-error: true

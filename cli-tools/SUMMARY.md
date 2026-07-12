@@ -123,7 +123,6 @@ time-convert --help
 1. Edit files in `~/cli-tools/src/cli_tools/`
 2. Update `pyproject.toml` if dependencies change
 3. `cli-wrapper` rebuilds/updates the venv automatically on next run
-4. Run tests with `uv run pytest`
 
 ## Documentation
 

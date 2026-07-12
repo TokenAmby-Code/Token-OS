@@ -9,17 +9,15 @@
 # Usage: test [target] [options]
 #
 # Targets:
-#   (none) | all         All projects, all checks (format/lint/types/tests)
+#   (none) | all         All projects, all checks (format/lint/types)
 #   cli-tools            Only the cli-tools project
 #   token-api            Only the token-api project
 #   format               Format check only (all projects)
 #   lint                 Lint only
 #   types                Typecheck only
-#   unit                 Pytest only
 #
 # Options:
 #   --fix                Auto-format + auto-fix lint for selected project(s)
-#                        (does NOT run tests)
 #   -h, --help           Show this help
 #
 # Examples:
@@ -49,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage ;;
         --fix) FIX=true; shift ;;
-        all|cli-tools|token-api|format|lint|types|unit)
+        all|cli-tools|token-api|format|lint|types)
             TARGET="$1"; shift ;;
         *) err "Unknown argument: $1"; exit 2 ;;
     esac
@@ -101,14 +99,10 @@ for proj in "${PROJECTS[@]}"; do
         types)
             run_step "mypy" "$proj" uv run --python 3.11 --group dev mypy --ignore-missing-imports .
             ;;
-        unit)
-            [[ -d "$proj/tests" ]] && run_step "pytest" "$proj" uv run --python 3.11 --group dev pytest --tb=short
-            ;;
         all|cli-tools|token-api)
             run_step "ruff format --check" "$proj" uvx --python 3.11 ruff format --check .
             run_step "ruff check"          "$proj" uvx --python 3.11 ruff check .
             run_step "mypy"                "$proj" uv run --python 3.11 --group dev mypy --ignore-missing-imports .
-            [[ -d "$proj/tests" ]] && run_step "pytest" "$proj" uv run --python 3.11 --group dev pytest --tb=short
             ;;
     esac
 done

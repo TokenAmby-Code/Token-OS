@@ -6,16 +6,9 @@ name: PR Gate (blocking)
 # assertive review (governed by .coderabbit.yaml in repo root) — this
 # workflow runs the fast deterministic gates: format, lint, typecheck.
 #
-# pytest does NOT run here. Per Emperor CI-policy decree, the heavyweight
-# regression suite was stripped from the dev PR->main hot path entirely: it wastes
-# Actions minutes and pollutes agent attention on every dev PR. The full suite is
-# preserved intact in prod-gate.yml and runs as the merge-to-prod gate (and
-# nightly) on the `prod` branch — NOT here. Do not re-add a pytest step to this
-# job. Authority model: dev = CodeRabbit + CD; prod = full regression suite.
-#
 # The job name stays `quality` (branch-protection-required on main). Branch
 # protection on main requires `quality` (this job) + `secrets-scan` + the
-# CodeRabbit commit status — unchanged by this strip.
+# CodeRabbit commit status.
 
 on:
   pull_request:
@@ -104,10 +97,6 @@ jobs:
             (cd token-api && uv run --python 3.11 --group dev mypy --ignore-missing-imports .)
           fi
 
-
-      # NOTE: pytest intentionally does NOT run on the dev PR->main hot path.
-      # The full regression suite lives in prod-gate.yml (prod branch + nightly).
-      # See the header comment. Do not re-add a pytest step here.
 
       - name: CodeRabbit PR gate
         env:
