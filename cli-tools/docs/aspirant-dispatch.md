@@ -114,16 +114,9 @@ Validated on 2026-05-15:
 
 ```bash
 bash -n cli-tools/bin/dispatch
-pytest -q cli-tools/tests/test_aspirant_create_cli.py cli-tools/tests/test_dispatch_cli.py
-cd token-api && UV_LINK_MODE=copy uv run python -m pytest -q tests/test_aspirant_launch.py
 ```
 
-Results:
-
-- CLI aspirant/dispatch tests: `21 passed`
-- Token-API aspirant launch tests: `4 passed`
-
-Coverage includes:
+Coverage included:
 
 - Token-API managed legion launch,
 - duplicate suppression,

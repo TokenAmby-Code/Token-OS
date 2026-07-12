@@ -49,9 +49,3 @@ tmuxctl assert-instance --pane council:custodes
 - `tmuxctld/lib/tmuxctl/daemon.py` must install global `pane-died[90]` to POST `/event event=pane-died`.
 - `/health` should reassert the hook on its throttled heartbeat.
 - `tmuxctld/lib/tmuxctl/service.py::handle_event` should route `pane-died` on must-fill persona labels to `assert_instance`.
-- Focused tests:
-
-```bash
-python -m pytest cli-tools/tests/test_tmuxctld_reconcile.py cli-tools/tests/test_tmuxctld_daemon.py -q
-python -m pytest cli-tools/tests/test_tmuxctl_persona_assert.py -q
-```

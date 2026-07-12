@@ -12,10 +12,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["lib/tmuxctl"]
 
-[tool.pytest.ini_options]
-testpaths = ["../cli-tools/tests"]
-pythonpath = ["lib", "../cli-tools/lib"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py311"

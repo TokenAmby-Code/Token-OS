@@ -44,7 +44,6 @@ Do not build parallel live surfaces. New actions should be Token-API/CLI mutatio
 | `token-satellite.py` | WSL companion server: TTS engine, enforcement (systemd: `token-satellite.service`) |
 | `tts-studio.py` | TUI for auditioning/selecting Windows SAPI voices (run on WSL) — legacy; queue-path voices are server-rendered OpenAI |
 | `timer.py` | TimerEngine v2 — layered composite model, pure logic, no I/O |
-| `test_timer.py` | Unit tests for TimerEngine v2 (83 tests) |
 | `web/ops/` | Vite React TypeScript source for the Terminus ops cockpit |
 | `ui/ops/` | Committed Vite build served at `/ui/ops` by FastAPI |
 | `docs/ops-cockpit.md` | Ops cockpit route, state contract, and dev workflow |
