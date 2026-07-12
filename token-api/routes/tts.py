@@ -348,7 +348,15 @@ OPENAI_TTS_VOICES = {
     "cedar",
 }
 OPENAI_TTS_DEFAULT_VOICE = "ballad"
-OPENAI_TTS_INSTRUCTIONS = os.environ.get("TOKEN_API_OPENAI_TTS_INSTRUCTIONS", "")
+DEFAULT_OPENAI_TTS_INSTRUCTIONS = (
+    "Read briskly and clearly. Use a fast default speaking pace. "
+    "Do not add theatrical pauses, sighs, breaths, gasps, inhalations, "
+    "exhalations, or other nonverbal breathing sounds. Deliver the text "
+    "directly without performative affect."
+)
+OPENAI_TTS_INSTRUCTIONS = os.environ.get(
+    "TOKEN_API_OPENAI_TTS_INSTRUCTIONS", DEFAULT_OPENAI_TTS_INSTRUCTIONS
+).strip()
 
 
 def _tts_artifact_dir() -> Path:

@@ -44,6 +44,7 @@ WSL echo uses its local `/tts/control` endpoint with equivalent command semantic
 Token-API owns TTS synthesis, voice selection, and audio artifacts. Playback surfaces receive only pre-rendered audio artifacts, not text:
 
 - Token-API applies sanitization, persona voice selection, and synthesis once, producing a durable WAV artifact under the `tts-artifacts` store with sha256 + render metadata recorded.
+- OpenAI synthesis sends `instructions` with a durable default that asks for brisk, direct delivery and explicitly disallows fake breathing/nonverbal breath sounds; operators may override it with `TOKEN_API_OPENAI_TTS_INSTRUCTIONS`.
 - Queue entries are pre-synthesized at enqueue time so dequeue/playback only resolves routing and delivers an already-rendered artifact.
 - Discord voice, WSL, phone (and future Linux) playback backends are audio-file players. They do not independently synthesize text or reinterpret persona voice choices.
 - A single Token-API synthesis path gives all playback surfaces the same voice set (13 OpenAI voices, Emperor casts personas), the same persona TTS behavior, and the same rendered audio for replay/debugging.
