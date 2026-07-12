@@ -32,12 +32,14 @@ import logging
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
+import wave
 from datetime import datetime
 from pathlib import Path
 
@@ -369,6 +371,52 @@ class TTSEngine:
     PLAY_SCRIPT_DIR_WSL = "/mnt/c/temp"
     PLAY_SCRIPT_DIR_WIN = r"C:\temp"
     MAX_PLAYBACK_SECONDS = 3600
+    # Playback verification. SoundPlayer.PlaySync() blocks for the clip's full
+    # length only when audio actually reaches the output device; if the default
+    # endpoint was swallowed (disconnected/replaced mid-session, no render
+    # device) PlaySync returns near-instantly with exit 0 — a silent
+    # false-positive. We reject a "success" whose measured playback ran shorter
+    # than PLAYBACK_MIN_RATIO of the WAV's real length. Clips under
+    # PLAYBACK_VERIFY_MIN_SECONDS aren't gated (timing noise dominates).
+    PLAYBACK_MIN_RATIO = 0.5
+    PLAYBACK_VERIFY_MIN_SECONDS = 0.75
+
+    @staticmethod
+    def _wav_duration_seconds(wav_path: Path) -> float | None:
+        """Best-effort playback length (seconds) from a WAV header.
+
+        Used to verify that SoundPlayer.PlaySync() actually blocked for the
+        clip. Returns None when the length can't be determined (never gate on
+        an unknown expected length).
+        """
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                if frames and rate:
+                    return frames / float(rate)
+        except Exception:
+            pass
+        # Manual RIFF fallback for WAV variants the stdlib rejects.
+        try:
+            raw = wav_path.read_bytes()
+            if raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+                return None
+            i, byte_rate, data_len = 12, None, None
+            while i + 8 <= len(raw):
+                cid = raw[i : i + 4]
+                (csize,) = struct.unpack("<I", raw[i + 4 : i + 8])
+                body = i + 8
+                if cid == b"fmt " and body + 16 <= len(raw):
+                    byte_rate = struct.unpack("<I", raw[body + 8 : body + 12])[0]
+                elif cid == b"data":
+                    data_len = csize
+                i = body + csize + (csize & 1)
+            if byte_rate and data_len:
+                return data_len / float(byte_rate)
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _text_hash(message: str) -> str:
@@ -562,8 +610,16 @@ class TTSEngine:
             "  Add-Type -AssemblyName System\n"
             f"  $player = New-Object System.Media.SoundPlayer '{escaped}'\n"
             "  $player.Load()\n"
+            "  $sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
             "  $player.PlaySync()\n"
+            "  $sw.Stop()\n"
             "  $player.Dispose()\n"
+            # PlaySync() blocks for the audio's full length only when it reaches
+            # the device; emit the measured seconds so the caller can reject a
+            # near-instant (silent) return as a false-positive.
+            "  [Console]::Out.WriteLine('PLAY_SECONDS=' + "
+            "$sw.Elapsed.TotalSeconds.ToString("
+            "[System.Globalization.CultureInfo]::InvariantCulture))\n"
             "} catch {\n"
             "  [Console]::Error.WriteLine($_.Exception.Message)\n"
             "  exit 1\n"
@@ -591,6 +647,8 @@ class TTSEngine:
         if not wav_path_wsl.exists():
             self.release_playback_reservation()
             return {"success": False, "error": f"WAV file missing: {wav_path_wsl}"}
+
+        expected_seconds = self._wav_duration_seconds(wav_path_wsl)
 
         play_script_dir_wsl = Path(self.PLAY_SCRIPT_DIR_WSL)
         play_script_dir_wsl.mkdir(parents=True, exist_ok=True)
@@ -641,6 +699,51 @@ class TTSEngine:
                     "success": False,
                     "error": stderr.strip() or f"WAV playback exited {proc.returncode}",
                 }
+
+            play_seconds = None
+            if stdout:
+                m = re.search(r"PLAY_SECONDS=([0-9]+(?:\.[0-9]+)?)", stdout)
+                if m:
+                    try:
+                        play_seconds = float(m.group(1))
+                    except ValueError:
+                        play_seconds = None
+
+            # Device-truthful success: a clip whose playback returned far faster
+            # than its real length never reached the output device. Report it as
+            # NOT delivered instead of a silent false-positive. No blind retry —
+            # the caller/queue decides what to do with an honest failure.
+            if (
+                not skipped
+                and expected_seconds is not None
+                and expected_seconds >= self.PLAYBACK_VERIFY_MIN_SECONDS
+                and play_seconds is not None
+                and play_seconds < expected_seconds * self.PLAYBACK_MIN_RATIO
+            ):
+                logger.warning(
+                    "TTS playback not audible: played %.2fs of expected %.2fs for %s",
+                    play_seconds,
+                    expected_seconds,
+                    wav_path_wsl.name,
+                )
+                return {
+                    "success": False,
+                    "skipped": False,
+                    "error": "playback_not_audible",
+                    "reason": "playback_not_audible",
+                    "transport": "wsl_sapi_wav_file",
+                    "file_id": synth_result.get("file_id"),
+                    "play_seconds": play_seconds,
+                    "expected_seconds": expected_seconds,
+                }
+
+            if not skipped and play_seconds is not None:
+                logger.info(
+                    "TTS playback verified: %.2fs played (expected %s) for %s",
+                    play_seconds,
+                    f"{expected_seconds:.2f}s" if expected_seconds else "unknown",
+                    wav_path_wsl.name,
+                )
             return {
                 "success": not skipped,
                 "skipped": skipped,
@@ -649,6 +752,8 @@ class TTSEngine:
                 "wav_path_win": wav_path_win,
                 "wav_path_wsl": str(wav_path_wsl),
                 "playback_pid": self._playback_windows_pid,
+                "play_seconds": play_seconds,
+                "expected_seconds": expected_seconds,
                 "rendered_chars": synth_result.get("rendered_chars"),
                 "rendered_hash": synth_result.get("rendered_hash"),
                 "message_chars": synth_result.get("message_chars"),
