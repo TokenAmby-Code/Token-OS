@@ -877,7 +877,7 @@ def _typing_gate_detail(phys_pane: str, *, gate: dict | None = None) -> dict:
     }
     if gate:
         detail.update(gate)
-        detail["reason"] = "typing_guard"
+        detail["reason"] = gate.get("reason") or detail["reason"]
         detail["target"] = gate.get("target") or phys_pane
     return detail
 
@@ -898,12 +898,16 @@ def _deferred_receipt(item: dict, *, gate: dict) -> dict:
             "queued_total": _DEFERRED_SEND_QUEUE.size(),
             "queued_for_pane": _DEFERRED_SEND_QUEUE.by_pane().get(phys_pane, 0),
             "drain_scheduled": phys_pane in _DEFERRED_DRAINING,
-            "drain_guarantee": "scheduled_until_typing_guard_clears",
+            "drain_guarantee": (
+                "scheduled_until_typing_guard_clears"
+                if gate.get("reason") == "typing_guard"
+                else "scheduled_until_gate_clears"
+            ),
         },
         "pane": item.get("pane") or phys_pane,
         "physical_pane": phys_pane,
         "target": phys_pane,
-        "reason": "typing_guard",
+        "reason": gate.get("reason") or "gated",
         "gate": {**gate, "policy": "enqueue", "deferred": True},
         "queue_path": str(_DEFERRED_SEND_QUEUE.path),
     }
@@ -919,7 +923,7 @@ def _drop_receipt(*, pane: str, phys_pane: str, reason: str, gate: dict) -> dict
         "submitted": False,
         "pane": pane,
         "physical_pane": phys_pane,
-        "reason": "typing_guard",
+        "reason": gate.get("reason") or "gated",
         "drop_reason": reason,
         "gate": {**gate, "policy": "drop", "drop_reason": reason},
     }
@@ -935,7 +939,7 @@ def _defer_or_drop_typing_guard(
 ) -> dict | None:
     """Return a queued/dropped receipt when the typing guard blocks this send."""
 
-    active_gate = gate if gate and gate.get("reason") == "typing_guard" else None
+    active_gate = gate if gate and gate.get("suppressed", True) else None
     if active_gate is None and send_gate._pane_human_locked(phys_pane):
         active_gate = _typing_gate_detail(phys_pane)
     if active_gate is None or not active_gate.get("suppressed", True):
@@ -996,7 +1000,7 @@ def _drain_deferred_sends_for_pane(phys_pane: str) -> dict:
             _execute_deferred_send(item)
             drained += 1
         except TmuxSendGated as exc:
-            if exc.gate.get("reason") == "typing_guard":
+            if exc.gate.get("suppressed", True):
                 _DEFERRED_SEND_QUEUE.requeue_front(item)
                 reblocked = True
                 break
@@ -1695,7 +1699,7 @@ def _resolve_physical_pane_or_gate(control, pane: str) -> str:
         raise TmuxSendGated(
             {
                 "suppressed": True,
-                "reason": "typing_guard",
+                "reason": "pane_unresolved",
                 "gate": "pane_unresolved",
                 "policy": "enqueue",
                 "target": pane,

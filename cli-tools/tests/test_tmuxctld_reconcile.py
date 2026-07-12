@@ -592,6 +592,40 @@ def test_h_close_pane_typing_guard_enqueues_close_operation(monkeypatch, tmp_pat
 
     assert out["status"] == "queued"
     assert out["operation"] == "close-pane"
+    assert out["reason"] == "typing_guard"
+    assert out["gate"]["reason"] == "typing_guard"
+    assert out["gate"]["gate"] == "human_lock"
+    assert out["gate"]["policy"] == "enqueue"
+    assert "queue_handle" in out
+
+
+def test_h_close_pane_unresolved_enqueues_with_pane_unresolved_reason(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("TMUXCTLD_DEFERRED_SENDS_PATH", str(tmp_path / "deferred-sends.json"))
+    monkeypatch.setattr(daemon, "_DEFERRED_SEND_QUEUE", daemon.DeferredSendQueue())
+    monkeypatch.setattr(daemon, "_schedule_deferred_drain", lambda _pane: None)
+    monkeypatch.setattr(daemon.send_gate, "_pane_human_locked", lambda _phys: False)
+
+    class _Ctrl:
+        adapter = object()
+
+        def close_pane(self, pane: str, *, timeout: float = 3.0) -> None:
+            raise AssertionError("must not close an unresolved pane")
+
+    def unresolved(adapter: object, pane: str) -> None:
+        raise ValueError("no pane for label")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(daemon, "resolve_to_physical", unresolved)
+        out = daemon._h_close_pane(_Ctrl(), {"pane": "somnium:SE"})
+
+    assert out["status"] == "queued"
+    assert out["operation"] == "close-pane"
+    assert out["reason"] == "pane_unresolved"
+    assert out["gate"]["reason"] == "pane_unresolved"
+    assert out["gate"]["gate"] == "pane_unresolved"
+    assert out["gate"]["target"] == "somnium:SE"
     assert out["gate"]["policy"] == "enqueue"
     assert "queue_handle" in out
 
