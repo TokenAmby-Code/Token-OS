@@ -96,7 +96,10 @@ export class RealTmux implements TmuxControlPlane {
     }
     const paneR = await run(this.socket, ['list-panes', '-t', safe, '-F', '#{pane_id}']);
     const paneId = paneR.stdout.trim().split('\n')[0];
-    if (paneId) await run(this.socket, ['set-option', '-p', '-t', paneId, CANON_OPT, seatId]);
+    // A seat without its canonical-id tag is a broken seat — fail loud rather
+    // than leave an untagged pane the membrane can never resolve.
+    if (!paneId) throw new Error(`k12_daemon tmux createSeat: no pane for ${seatId} (session ${safe})`);
+    await run(this.socket, ['set-option', '-p', '-t', paneId, CANON_OPT, seatId]);
   }
 
   async killSeat(seatId: string): Promise<void> {
