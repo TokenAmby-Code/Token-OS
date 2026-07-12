@@ -610,10 +610,10 @@ def test_h_close_pane_unresolved_enqueues_with_pane_unresolved_reason(
     class _Ctrl:
         adapter = object()
 
-        def close_pane(self, pane, *, timeout=3.0):
+        def close_pane(self, pane: str, *, timeout: float = 3.0) -> None:
             raise AssertionError("must not close an unresolved pane")
 
-    def unresolved(adapter, pane):
+    def unresolved(adapter: object, pane: str) -> None:
         raise ValueError("no pane for label")
 
     with pytest.MonkeyPatch.context() as mp:

@@ -898,7 +898,11 @@ def _deferred_receipt(item: dict, *, gate: dict) -> dict:
             "queued_total": _DEFERRED_SEND_QUEUE.size(),
             "queued_for_pane": _DEFERRED_SEND_QUEUE.by_pane().get(phys_pane, 0),
             "drain_scheduled": phys_pane in _DEFERRED_DRAINING,
-            "drain_guarantee": "scheduled_until_typing_guard_clears",
+            "drain_guarantee": (
+                "scheduled_until_typing_guard_clears"
+                if gate.get("reason") == "typing_guard"
+                else "scheduled_until_gate_clears"
+            ),
         },
         "pane": item.get("pane") or phys_pane,
         "physical_pane": phys_pane,
