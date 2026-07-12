@@ -16526,6 +16526,12 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             DESKTOP_STATE["steam_app_name"] = request.steam_app_name
             DESKTOP_STATE["steam_exe"] = request.steam_exe
             DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+        # The blocked branch never advances current_mode, so a distraction clearing
+        # to its prior allowed mode surfaces here (detected == current) rather than
+        # in the allowed branch below. Treat it as the block's negative edge and
+        # clear the enforcement signature, so a later return to the blocked mode is
+        # a genuinely new occurrence that re-fires.
+        DESKTOP_STATE["last_enforced_block_signature"] = None
         print(f"    Mode unchanged ({detected_mode}), skipping")
         return DesktopDetectionResponse(
             action="none",
@@ -16623,6 +16629,10 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
             )
         DESKTOP_STATE["current_mode"] = detected_mode
         DESKTOP_STATE["last_detection"] = datetime.now().isoformat()
+        # Negative edge: an allowed mode change ends any prior block, so clear the
+        # block-enforcement edge. A subsequent return to a blocked mode is then a
+        # genuinely new occurrence and re-fires the physical attention signals.
+        DESKTOP_STATE["last_enforced_block_signature"] = None
         DESKTOP_STATE["steam_app_id"] = request.steam_app_id if detected_mode == "gaming" else None
         DESKTOP_STATE["steam_app_name"] = (
             request.steam_app_name if detected_mode == "gaming" else None
@@ -16744,6 +16754,11 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         )
     else:
         if is_quiet_hours():
+            # Quiet-hours block is a suppression, not an enforcement. Clear the edge
+            # so a block that persists past quiet hours fires once when enforcement
+            # resumes (fail toward firing — never carry an "already enforced" claim
+            # across a window in which nothing was actually enforced).
+            DESKTOP_STATE["last_enforced_block_signature"] = None
             suppression = await log_quiet_hours_suppressed(
                 source="desktop_detection",
                 event_type="desktop_mode_blocked",
@@ -16768,12 +16783,28 @@ async def handle_desktop_detection(request: DesktopDetectionRequest):
         # Mode change blocked - immediately enforce by closing distraction windows
         print(f"<<< Mode change BLOCKED: {detected_mode} | reason={reason}")
 
+        # The AHK monitor re-POSTs the same blocked state every poll (~9s) while a
+        # distraction persists. The blocked branch never advances current_mode, so
+        # the `mode_unchanged` early-return above never trips here — without an edge
+        # guard the physical attention signals (Pavlok shock + vibe/banner) re-fire
+        # on every re-POST for one unchanged state. Edge-trigger them on the block
+        # signature: the window-close stays idempotent (keep ejecting) and the 403 +
+        # Custodes fanout (self-deduped) are unchanged, but the shock/buzz fire only
+        # when the block is NEW. The signature resets on any allowed mode change
+        # (negative edge, below), so a distraction that clears and recurs re-fires.
+        # Fail toward firing: a fresh/reset signature (e.g. post-restart) always
+        # fires — a missed enforcement is worse than a repeated one.
+        block_signature = f"{detected_mode}:{reason}"
+        already_enforced = DESKTOP_STATE.get("last_enforced_block_signature") == block_signature
+        DESKTOP_STATE["last_enforced_block_signature"] = block_signature
+
         enforce_result = close_distraction_windows()
-        send_pavlok_stimulus(reason="desktop_distraction_blocked")
-        # Buzz + banner attention signal through the comms middleware (no speech).
-        asyncio.create_task(
-            dispatch_notify("", tts=False, vibe=30, banner=f"Desktop blocked: {detected_mode}")
-        )
+        if not already_enforced:
+            send_pavlok_stimulus(reason="desktop_distraction_blocked")
+            # Buzz + banner attention signal through the comms middleware (no speech).
+            asyncio.create_task(
+                dispatch_notify("", tts=False, vibe=30, banner=f"Desktop blocked: {detected_mode}")
+            )
 
         await log_event(
             "desktop_mode_blocked",
