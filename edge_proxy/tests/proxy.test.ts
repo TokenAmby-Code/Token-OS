@@ -70,6 +70,7 @@ test("route-scoped auth: a route token gates only its own route", async () => {
   servers.push(Bun.serve({ hostname: "127.0.0.1", port: apiPort, fetch() { return Response.json({ who: "api" }); } }));
   servers.push(makeServer({ bind: "127.0.0.1", port: proxyPort, machine: "test", routes: [
     { prefix: "/k12", upstream: `http://127.0.0.1:${daemonPort}`, stripPrefix: true, token: "s3cret", allowlist: [{ method: "GET", path: "/health" }] },
+    { prefix: "/other", upstream: `http://127.0.0.1:${apiPort}`, stripPrefix: true, token: "other-s3cret", allowlist: [{ method: "GET", path: "/health" }] },
     { prefix: "/", upstream: `http://127.0.0.1:${apiPort}`, allowlist: [{ method: "GET", pathPrefix: "/api/" }] },
   ] }));
   // Missing cred on the guarded route → 401.
@@ -79,6 +80,9 @@ test("route-scoped auth: a route token gates only its own route", async () => {
   r = await fetch(`http://127.0.0.1:${proxyPort}/k12/health`, { headers: { authorization: "Bearer s3cret" } });
   expect(r.status).toBe(200);
   expect(await r.json()).toEqual({ who: "daemon", auth: null });
+  // The k12 token does NOT authorize a DIFFERENT guarded route (route-scoped by construction).
+  r = await fetch(`http://127.0.0.1:${proxyPort}/other/health`, { headers: { authorization: "Bearer s3cret" } });
+  expect(r.status).toBe(401);
   // The k12 token does NOT grant the default route (which requires none, still works without it).
   r = await fetch(`http://127.0.0.1:${proxyPort}/api/echo`);
   expect(r.status).toBe(200);

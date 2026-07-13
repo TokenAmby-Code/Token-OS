@@ -95,11 +95,10 @@ jobs:
             ip_secret: TAILSCALE_IP_K12_WORK
             cd_port: "7780"
             cd_base: "/token-api"
+    # Job-level env carries ONLY non-secret matrix values; each secret is injected
+    # into just the steps that consume it (least-privilege — a job-wide secret env
+    # would also reach unrelated steps and the third-party tailscale action).
     env:
-      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-      CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
-      # Dynamic index: each matrix leg reads its own host IP secret.
-      CD_HOST: ${{ secrets[matrix.ip_secret] }}
       CD_TARGET: ${{ matrix.target }}
       CD_PORT: ${{ matrix.cd_port }}
       CD_BASE: ${{ matrix.cd_base }}
@@ -108,6 +107,10 @@ jobs:
         id: gate
         env:
           IP_SECRET_NAME: ${{ matrix.ip_secret }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
+          # Dynamic index: each matrix leg reads its own host IP secret.
+          CD_HOST: ${{ secrets[matrix.ip_secret] }}
         run: |
           if [ -z "$TS_AUTHKEY" ] || [ -z "$CD_SECRET" ] || [ -z "$CD_HOST" ]; then
             echo "::notice::CD secrets not fully provisioned for ${CD_TARGET} (TS_AUTHKEY/CD_RESTART_SECRET/${IP_SECRET_NAME}) — skipping this host's restart. This is NOT a failure."
@@ -139,6 +142,8 @@ jobs:
         env:
           PR_URL: ${{ steps.pr.outputs.url }}
           SHA: ${{ github.sha }}
+          CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
+          CD_HOST: ${{ secrets[matrix.ip_secret] }}
         run: |
           body=$(jq -nc \
             --arg sha "$SHA" \
@@ -166,6 +171,7 @@ jobs:
         if: steps.gate.outputs.go == 'true'
         env:
           SHA: ${{ github.sha }}
+          CD_HOST: ${{ secrets[matrix.ip_secret] }}
         run: |
           deadline=$((SECONDS + 180))
           last=""
