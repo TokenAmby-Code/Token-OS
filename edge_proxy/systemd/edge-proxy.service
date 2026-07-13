@@ -2,6 +2,10 @@
 Description=Token-OS edge_proxy stateless routing proxy
 After=network-online.target token-api.socket
 Wants=network-online.target
+# The proxy binds the box's tailnet IP; at boot that IP can lag tailscaled, so a
+# failed bind must retry until the address exists instead of tripping the
+# default start-limit (5 in 10s) and staying down.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

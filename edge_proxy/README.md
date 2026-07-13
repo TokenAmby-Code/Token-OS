@@ -13,7 +13,10 @@ Invariants (spec §12 — one edge proxy per box, the box's front door):
   business logic accreting at the front door.
 - **Route-scoped auth**: a route's optional bearer `token` gates only that route —
   compromising one upstream's cred never grants another route or the box. The
-  proxy terminates the cred and never forwards `Authorization` upstream.
+  proxy terminates the cred and never forwards `Authorization` upstream. A
+  **tokenless** route passes the caller's `Authorization` through untouched:
+  upstreams that do their own bearer auth (e.g. token-api `/api/cd/restart`,
+  fail-closed on `CD_RESTART_SECRET`) remain the auth authority.
 - No queues, retry buffers, store-and-forward, or dedupe caches.
 - Upstream failure returns an immediate `502 upstream_unreachable` and logs the error.
 - Bind, port, machine, and the route table (prefix → upstream, allowlist, token)
@@ -27,6 +30,13 @@ A route may `stripPrefix` so the upstream sees its own paths. Example: the k12
 daemon lives behind `/k12` and is reached as `/k12/health → 127.0.0.1:7781 /health`,
 while everything else falls through to Token-API on `:7777`. Cross-box traffic is
 proxy-to-proxy over the tailnet — each box has exactly one front door.
+
+The `/token-api` route exists because the proxy answers `GET /health` itself
+(its own liveness), which shadows the upstream's. CD callers reach token-api's
+`/health` deploy proof as `/token-api/health` and the merge webhook as
+`/token-api/api/cd/restart` — one tightly-allowlisted route for the box's CD
+ingress, keeping token-api loopback-bound (one ingress per box: the proxy binds
+the tailnet IP; nothing else does).
 
 ## Config
 

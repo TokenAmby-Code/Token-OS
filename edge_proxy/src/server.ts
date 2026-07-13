@@ -42,7 +42,11 @@ export function makeServer(cfg: EdgeProxyConfig): ReturnType<typeof Bun.serve> {
         headers.set("x-edge-proxy", "edge_proxy");
         headers.set("x-edge-proxy-machine", cfg.machine);
         headers.delete("host");
-        headers.delete("authorization"); // route cred is proxy-terminated, never forwarded upstream
+        // A ROUTE cred is proxy-terminated, never forwarded upstream. A tokenless
+        // route passes the caller's Authorization through untouched — upstream
+        // endpoints that do their own bearer auth (e.g. token-api /api/cd/restart,
+        // fail-closed on CD_RESTART_SECRET) stay the auth authority.
+        if (route.token) headers.delete("authorization");
         // duplex:"half" is required by Bun/WHATWG fetch when streaming a request body.
         const init: RequestInit = { method: req.method, headers, body: req.body, redirect: "manual" };
         if (req.body) (init as RequestInit & { duplex: "half" }).duplex = "half";

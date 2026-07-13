@@ -12,7 +12,7 @@ boxes) over Tailscale.
 | `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, chill CodeRabbit — all **non-blocking** annotations. |
 | `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. |
 | `secrets-scan.yml` | push/PR → `main` | Blocks on leaked IPs/secrets (patterns kept in repo secrets). |
-| `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD fan-out: one matrix leg per host (mac, k12-personal, k12-work; `fail-fast: false`). Each leg: Tailscale ephemeral node → POST `/api/cd/restart` on that host (ack-first) → poll `/health` until `git_sha == github.sha`; mismatch after 180s is a deploy alarm/failure. A leg whose host IP secret is unset skips green (config-ready). |
+| `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD fan-out: one matrix leg per host (mac, k12-personal, k12-work; `fail-fast: false`). Each leg: Tailscale ephemeral node → POST the host's CD door (ack-first) → poll token-api health until `git_sha == github.sha`; mismatch after 180s is a deploy alarm/failure. The Mac's door is token-api directly (`:7777/api/cd/restart`, `:7777/health`); the k12 boxes keep token-api loopback-bound and route through the box `edge_proxy` (`:7780/token-api/api/cd/restart`, `:7780/token-api/health`) — one ingress per box. A leg whose host IP secret is unset skips green (config-ready). |
 
 ### Ruff never-drift
 
@@ -52,7 +52,8 @@ otherwise collide by name.
 - `TAILSCALE_IP_K12_PERSONAL` / `TAILSCALE_IP_K12_WORK` — the k12 boxes' tailnet
   IPs. While one is unset, that leg of the fan-out skips green (config-ready).
 - `TS_AUTHKEY` — Tailscale auth key for the ephemeral CI node (tagged `tag:ci`); the
-  tailnet ACL must allow `tag:ci` → `<host>:7777` for **each** provisioned host.
+  tailnet ACL must allow `tag:ci` → each provisioned host's CD door: the Mac on
+  `:7777` (token-api direct), the k12 boxes on `:7780` (edge_proxy front door).
 
 ### Box-side deploy executor (k12)
 

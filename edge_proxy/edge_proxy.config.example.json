@@ -17,6 +17,15 @@
       ]
     },
     {
+      "prefix": "/token-api",
+      "upstream": "http://127.0.0.1:7777",
+      "stripPrefix": true,
+      "allowlist": [
+        { "method": "GET", "path": "/health" },
+        { "method": "POST", "path": "/api/cd/restart" }
+      ]
+    },
+    {
       "prefix": "/",
       "upstream": "http://127.0.0.1:7777",
       "allowlist": [
