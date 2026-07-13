@@ -106,7 +106,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "k12-personal",
         "device_name": "K12-Personal",
-        "token_os_runtime": "~/runtimes/token-os/live",
+        "token_os_runtime": "~/runtimes/Token-OS/live",
     },
     # K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE).
     # Present in the Imperium registry only to be nameable for routing/enforcement

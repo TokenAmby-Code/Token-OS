@@ -141,7 +141,7 @@ _IMPERIUM_CFG_k12_personal_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_k12_personal_ssh_alias="k12-personal"
 _IMPERIUM_CFG_k12_personal_device_name="K12-Personal"
 _IMPERIUM_CFG_k12_personal_shell="bash"
-_IMPERIUM_CFG_k12_personal_token_os_runtime="$HOME/runtimes/token-os/live"
+_IMPERIUM_CFG_k12_personal_token_os_runtime="$HOME/runtimes/Token-OS/live"
 
 # --- K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE) ---
 # In the Imperium registry only to be nameable for routing/enforcement scoping;

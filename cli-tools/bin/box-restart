@@ -62,10 +62,20 @@ esac
 
 # ============ Config ============
 # Box canon (verified on k12-personal): runtime checkout ~/runtimes/Token-OS/live,
-# CD bare cache ~/runtimes/Token-OS/token-os.git, all services are systemd USER
-# units, token-api is the templated token-api@<checkout-name>.service.
-RUNTIME="${TOKEN_OS_RUNTIME_CHECKOUT:-${TOKEN_OS:-$HOME/runtimes/Token-OS/live}}"
-BARE="${TOKEN_OS_BARE_REPO:-$HOME/runtimes/Token-OS/token-os.git}"
+# CD bare cache ~/runtimes/Token-OS/token-os.git beside it, all services are
+# systemd USER units, token-api is the templated token-api@<checkout-name>.service.
+# Resolution rides the shared machine registry (cli-tools/lib/nas-path.sh):
+# explicit override > TOKEN_OS (unit env / nas-path export) > imperium_cfg
+# token_os_runtime > box-canon default.
+_LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib"
+# shellcheck source=/dev/null
+source "${_LIB_DIR}/nas-path.sh" 2> /dev/null || true
+_cfg_runtime=""
+if command -v imperium_cfg > /dev/null 2>&1; then
+    _cfg_runtime="$(imperium_cfg token_os_runtime 2> /dev/null || true)"
+fi
+RUNTIME="${TOKEN_OS_RUNTIME_CHECKOUT:-${TOKEN_OS:-${_cfg_runtime:-$HOME/runtimes/Token-OS/live}}}"
+BARE="${TOKEN_OS_BARE_REPO:-$(dirname "$RUNTIME")/token-os.git}"
 TOKEN_API_UNIT="token-api@$(basename "$RUNTIME").service"
 HEALTH_URL="${TOKEN_API_URL:-http://127.0.0.1:7777}/health"
 LOCK_FILE="/tmp/box-restart-$(id -u).lock"
