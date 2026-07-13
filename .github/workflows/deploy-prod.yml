@@ -31,7 +31,9 @@ name: Deploy (prod)
 # and vice versa. The Mac stays in the fan-out until the k12 cutover retires it.
 #
 # Required GitHub secrets (provisioned OUTSIDE this repo):
-#   TS_AUTHKEY                 — ephemeral, pre-authorized Tailscale auth key (tag:ci)
+#   TS_OAUTH_CLIENT_ID         — Tailscale OAuth client ID for ephemeral CI nodes.
+#   TS_OAUTH_SECRET            — Tailscale OAuth client secret for ephemeral CI nodes
+#                                tagged tag:ci.
 #   CD_RESTART_SECRET          — shared bearer secret; must match each host
 #                                token-api's env of the same name (launchd/systemd
 #                                injected). Fail-closed there.
@@ -43,8 +45,9 @@ name: Deploy (prod)
 # (edge_proxy) — via the tailnet admin console (easy to forget; shows up as a
 # curl timeout).
 #
-# GUARD (per host): if TS_AUTHKEY, CD_RESTART_SECRET, or that host's IP secret is
-# unset, that host's job SKIPS the tailnet join + webhook (logs a notice, stays
+# GUARD (per host): if the Tailscale OAuth client secrets, CD_RESTART_SECRET, or
+# that host's IP secret is unset, that host's job SKIPS the tailnet join + webhook
+# (logs a notice, stays
 # GREEN) instead of failing. So this workflow is safe to merge before a box is
 # provisioned — the unprovisioned leg just no-ops until its secret lands.
 
@@ -107,13 +110,14 @@ jobs:
         id: gate
         env:
           IP_SECRET_NAME: ${{ matrix.ip_secret }}
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
           # Dynamic index: each matrix leg reads its own host IP secret.
           CD_HOST: ${{ secrets[matrix.ip_secret] }}
         run: |
-          if [ -z "$TS_AUTHKEY" ] || [ -z "$CD_SECRET" ] || [ -z "$CD_HOST" ]; then
-            echo "::notice::CD secrets not fully provisioned for ${CD_TARGET} (TS_AUTHKEY/CD_RESTART_SECRET/${IP_SECRET_NAME}) — skipping this host's restart. This is NOT a failure."
+          if [ -z "$TS_OAUTH_CLIENT_ID" ] || [ -z "$TS_OAUTH_SECRET" ] || [ -z "$CD_SECRET" ] || [ -z "$CD_HOST" ]; then
+            echo "::notice::CD secrets not fully provisioned for ${CD_TARGET} (TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET/CD_RESTART_SECRET/${IP_SECRET_NAME}) — skipping this host's restart. This is NOT a failure."
             echo "go=false" >> "$GITHUB_OUTPUT"
           else
             echo "go=true" >> "$GITHUB_OUTPUT"
@@ -131,9 +135,11 @@ jobs:
 
       - name: Tailscale (ephemeral)
         if: steps.gate.outputs.go == 'true'
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
           # Mark the node ephemeral so it's auto-removed from the tailnet on exit.
           args: --accept-routes
 

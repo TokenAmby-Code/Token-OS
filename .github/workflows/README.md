@@ -51,9 +51,11 @@ otherwise collide by name.
 - `TAILSCALE_IP_MAC` — the Mac's tailnet IP (reused infra secret) = the Mac leg's webhook host.
 - `TAILSCALE_IP_K12_PERSONAL` / `TAILSCALE_IP_K12_WORK` — the k12 boxes' tailnet
   IPs. While one is unset, that leg of the fan-out skips green (config-ready).
-- `TS_AUTHKEY` — Tailscale auth key for the ephemeral CI node (tagged `tag:ci`); the
-  tailnet ACL must allow `tag:ci` → each provisioned host's CD door: the Mac on
-  `:7777` (token-api direct), the k12 boxes on `:7780` (edge_proxy front door).
+- `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` — Tailscale OAuth client credentials
+  with `auth_keys` scope for ephemeral CI nodes; the OAuth client must be allowed
+  to create auth keys tagged `tag:ci`. The tailnet ACL must allow `tag:ci` → each
+  provisioned host's CD door: the Mac on `:7777` (token-api direct), the k12
+  boxes on `:7780` (edge_proxy front door).
 
 ### Box-side deploy executor (k12)
 
@@ -65,17 +67,3 @@ systemd user units whose files changed (`edge-proxy` / `k12-daemon` /
 the deploy proof. It self-escapes into a transient `systemd-run --user --collect`
 unit first, because a child in the token-api unit's cgroup would be killed by its
 own `systemctl --user restart` (the Mac's setsid trick doesn't escape cgroups).
-
-### TODO — migrate `TS_AUTHKEY` → Tailscale OAuth client (by Sep 2026)
-
-`tailscale/github-action` now recommends an **OAuth client** over a raw auth key,
-and the `tailscale/github-action` run warns about it. The current raw `TS_AUTHKEY`
-**expires September 2026** — use that forced rotation as the moment to switch:
-
-1. Tailscale admin → **Settings → OAuth clients → Generate** with scope
-   `devices:write` (or `auth_keys`) and tag `tag:ci`.
-2. Add repo secrets `TS_OAUTH_CLIENT_ID` + `TS_OAUTH_SECRET`.
-3. In `deploy-prod.yml`, replace the `authkey:` input with
-   `oauth-client-id:` / `oauth-secret:` + `tags: tag:ci`.
-4. Delete the `TS_AUTHKEY` secret. (OAuth clients don't expire like auth keys, so
-   this also ends the annual rotation chore.)
