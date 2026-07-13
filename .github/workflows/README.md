@@ -52,8 +52,9 @@ otherwise collide by name.
 - `TAILSCALE_IP_K12_PERSONAL` / `TAILSCALE_IP_K12_WORK` — the k12 boxes' tailnet
   IPs. While one is unset, that leg of the fan-out skips green (config-ready).
 - `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` — Tailscale OAuth client credentials
-  for ephemeral CI nodes tagged `tag:ci`; the tailnet ACL must allow `tag:ci` →
-  each provisioned host's CD door: the Mac on `:7777` (token-api direct), the k12
+  with `auth_keys` scope for ephemeral CI nodes; the OAuth client must be allowed
+  to create auth keys tagged `tag:ci`. The tailnet ACL must allow `tag:ci` → each
+  provisioned host's CD door: the Mac on `:7777` (token-api direct), the k12
   boxes on `:7780` (edge_proxy front door).
 
 ### Box-side deploy executor (k12)
