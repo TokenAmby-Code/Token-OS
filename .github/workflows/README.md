@@ -1,8 +1,9 @@
 # Token-OS CI/CD
 
-Token-OS is personal software on a local Mac — there is no remote prod. "Deploy"
+Token-OS is personal software on local boxes — there is no remote prod. "Deploy"
 means **restart the right local services**. CI is a two-tier gate; CD is a
-merge-triggered webhook that reaches the Mac over Tailscale.
+merge-triggered webhook fan-out that reaches each deploy host (the Mac + the k12
+boxes) over Tailscale.
 
 ## Workflows
 
@@ -11,7 +12,7 @@ merge-triggered webhook that reaches the Mac over Tailscale.
 | `push.yml` — *Push Gate (advisory)* | push to non-`main` branches | Tier 1. Job `push-advisory`. ruff format/lint, mypy, chill CodeRabbit — all **non-blocking** annotations. |
 | `pr.yml` — *PR Gate (blocking)* | PR → `main` | Tier 2. Job **`quality`** (the required check). `ruff format --check` + `ruff check` + `mypy` **block**. |
 | `secrets-scan.yml` | push/PR → `main` | Blocks on leaked IPs/secrets (patterns kept in repo secrets). |
-| `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD. Tailscale ephemeral node → POST `/api/cd/restart` on the Mac (ack-first) → poll `/health` until `git_sha == github.sha`; mismatch after 180s is a deploy alarm/failure. |
+| `deploy-prod.yml` — *Deploy (prod)* | push to `main` (merge) | CD fan-out: one matrix leg per host (mac, k12-personal, k12-work; `fail-fast: false`). Each leg: Tailscale ephemeral node → POST `/api/cd/restart` on that host (ack-first) → poll `/health` until `git_sha == github.sha`; mismatch after 180s is a deploy alarm/failure. A leg whose host IP secret is unset skips green (config-ready). |
 
 ### Ruff never-drift
 
@@ -41,13 +42,28 @@ otherwise collide by name.
 
 ## CD secrets (provisioned OUTSIDE the repo)
 
-- `CD_RESTART_SECRET` — shared bearer; **must match** token-api's launchd-plist env
-  of the same name (`~/Library/LaunchAgents/ai.openclaw.tokenapi.plist`,
-  `EnvironmentVariables`). Endpoint is fail-closed. NOTE: editing the plist env
-  needs `launchctl bootout`+`bootstrap`, not `kickstart`/`token-restart`.
-- `TAILSCALE_IP_MAC` — the Mac's tailnet IP (reused infra secret) = the webhook host.
+- `CD_RESTART_SECRET` — shared bearer; **must match** each host token-api's env of
+  the same name. Mac: launchd plist (`~/Library/LaunchAgents/ai.openclaw.tokenapi.plist`,
+  `EnvironmentVariables`; editing it needs `launchctl bootout`+`bootstrap`, not
+  `kickstart`/`token-restart`). k12 boxes: the `token-api@live` systemd user
+  unit's environment (e.g. the unit's `EnvironmentFile` `.env`), then
+  `systemctl --user restart token-api@live`. Endpoint is fail-closed everywhere.
+- `TAILSCALE_IP_MAC` — the Mac's tailnet IP (reused infra secret) = the Mac leg's webhook host.
+- `TAILSCALE_IP_K12_PERSONAL` / `TAILSCALE_IP_K12_WORK` — the k12 boxes' tailnet
+  IPs. While one is unset, that leg of the fan-out skips green (config-ready).
 - `TS_AUTHKEY` — Tailscale auth key for the ephemeral CI node (tagged `tag:ci`); the
-  tailnet ACL must allow `tag:ci` → `<Mac>:7777`.
+  tailnet ACL must allow `tag:ci` → `<host>:7777` for **each** provisioned host.
+
+### Box-side deploy executor (k12)
+
+On merge, the k12 legs' webhook spawns `cli-tools/bin/box-restart` (the Linux
+analog of the Mac's `token-restart --sync`): ff-only bare-cache sync → detached
+runtime checkout → frozen bun dep refresh when manifests changed → restart the
+systemd user units whose files changed (`edge-proxy` / `k12-daemon` /
+`tmuxctld`), always bouncing `token-api@live` last so `/health.git_sha` becomes
+the deploy proof. It self-escapes into a transient `systemd-run --user --collect`
+unit first, because a child in the token-api unit's cgroup would be killed by its
+own `systemctl --user restart` (the Mac's setsid trick doesn't escape cgroups).
 
 ### TODO — migrate `TS_AUTHKEY` → Tailscale OAuth client (by Sep 2026)
 
