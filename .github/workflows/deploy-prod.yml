@@ -3,33 +3,44 @@ name: Deploy (prod)
 # Triggers ONLY on merge to main. Per-worktree local dev URLs are untouched —
 # there is no "merge to deploy dev" path. Merge means ship.
 #
-# Token-OS is personal software on a local Mac — "deploy to prod" == sync the local
-# bare skeleton, update the deploy-owned runtime checkout, and restart the right
-# local services. This pipeline is intentionally
-# DUMB: it does NOT figure out what changed. A GH-hosted runner cannot reach the
-# Mac directly, so it joins the Emperor's tailnet (ephemeral node) and POSTs to
-# token-api's /api/cd/restart webhook. The webhook spawns a single git-aware
-# `token-restart --sync`, which ff-only syncs the Mac-local CD bare cache
+# Token-OS is personal software on local boxes — "deploy to prod" == sync each
+# box's bare skeleton, update its deploy-owned runtime checkout, and restart the
+# right local services. This pipeline is intentionally DUMB: it does NOT figure
+# out what changed. A GH-hosted runner cannot reach the boxes directly, so each
+# matrix job joins the Emperor's tailnet (ephemeral node) and POSTs to that
+# host's token-api /api/cd/restart webhook. The webhook spawns a single git-aware
+# sync — `token-restart --sync` on the Mac, `box-restart --sync` on the Linux k12
+# boxes — which ff-only syncs the box-local CD bare cache
 # (`~/runtimes/Token-OS/token-os.git`) from GitHub main, checks out the requested
-# SHA detached in the deploy-owned runtime checkout, refreshes/verifies the WSL
-# satellite runtime to the same SHA, and restarts ONLY the additional services
-# whose files the merge changed (see
-# map_changed_to_services in cli-tools/bin/token-restart). All the "what changed →
-# what restarts" intelligence lives there, in one git-aware place — not split
-# across this workflow and the webhook. The endpoint is ACK-FIRST: it returns 200
-# immediately and restarts detached, so this job does not hang on the restart.
+# SHA detached in the deploy-owned runtime checkout, and restarts ONLY the
+# services whose files the merge changed (see map_changed_to_services in
+# cli-tools/bin/token-restart and the unit map in cli-tools/bin/box-restart; the
+# Mac leg also refreshes/verifies the WSL satellite runtime). All the "what
+# changed → what restarts" intelligence lives box-side, in one git-aware place —
+# not split across this workflow and the webhook. The endpoint is ACK-FIRST: it
+# returns 200 immediately and restarts detached, so this job does not hang on
+# the restart.
+#
+# FAN-OUT: one matrix job per deploy host — mac, k12-personal, k12-work.
+# fail-fast is OFF: a failing/unprovisioned box never cancels the Mac deploy,
+# and vice versa. The Mac stays in the fan-out until the k12 cutover retires it.
 #
 # Required GitHub secrets (provisioned OUTSIDE this repo):
-#   TS_AUTHKEY        — ephemeral, pre-authorized Tailscale auth key (tagged tag:ci)
-#   CD_RESTART_SECRET — shared bearer secret; must match token-api's env of the
-#                       same name (launchd-injected). Fail-closed there.
-#   TAILSCALE_IP_MAC  — the Mac's tailnet IP (reused existing infra secret).
-# Tailnet ACL must also allow the tag:ci ephemeral node to reach <Mac>:7777
-# (configured in the tailnet admin console — easy to forget; shows up as a curl timeout).
+#   TS_AUTHKEY                 — ephemeral, pre-authorized Tailscale auth key (tag:ci)
+#   CD_RESTART_SECRET          — shared bearer secret; must match each host
+#                                token-api's env of the same name (launchd/systemd
+#                                injected). Fail-closed there.
+#   TAILSCALE_IP_MAC           — the Mac's tailnet IP (reused existing infra secret).
+#   TAILSCALE_IP_K12_PERSONAL  — k12-personal's tailnet IP.
+#   TAILSCALE_IP_K12_WORK      — k12-work's tailnet IP.
+# Tailnet ACL must also allow the tag:ci ephemeral node to reach <host>:7777 for
+# EACH provisioned host (tailnet admin console — easy to forget; shows up as a
+# curl timeout).
 #
-# GUARD: if any of the three secrets is unset, the restart job SKIPS the tailnet
-# join + webhook (logs a notice, stays GREEN) instead of failing. So this workflow
-# is safe to merge before provisioning is complete — it just no-ops until ready.
+# GUARD (per host): if TS_AUTHKEY, CD_RESTART_SECRET, or that host's IP secret is
+# unset, that host's job SKIPS the tailnet join + webhook (logs a notice, stays
+# GREEN) instead of failing. So this workflow is safe to merge before a box is
+# provisioned — the unprovisioned leg just no-ops until its secret lands.
 
 on:
   push:
@@ -47,25 +58,42 @@ env:
 concurrency:
   group: deploy-prod
   # Last merge wins: a newer push to main invalidates any older deploy run. The
-  # latest run will POST/verify the tip; the local Mac deploy mutex also drops
-  # obsolete in-flight restart sets when a newer webhook arrives.
+  # latest run will POST/verify the tip; each host's local deploy mutex also
+  # drops obsolete in-flight restart sets when a newer webhook arrives.
   cancel-in-progress: true
 
 jobs:
-  # ── Hit the restart endpoint. token-restart (git-aware) does the rest. ──
+  # ── Hit each host's restart endpoint. The box-side git-aware sync does the rest. ──
   restart:
+    name: restart (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      # Independent legs: an unprovisioned/broken box must never cancel the Mac
+      # deploy (or any other box's).
+      fail-fast: false
+      matrix:
+        include:
+          - target: mac
+            ip_secret: TAILSCALE_IP_MAC
+          - target: k12-personal
+            ip_secret: TAILSCALE_IP_K12_PERSONAL
+          - target: k12-work
+            ip_secret: TAILSCALE_IP_K12_WORK
     env:
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
       CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
-      CD_HOST: ${{ secrets.TAILSCALE_IP_MAC }}
+      # Dynamic index: each matrix leg reads its own host IP secret.
+      CD_HOST: ${{ secrets[matrix.ip_secret] }}
+      CD_TARGET: ${{ matrix.target }}
     steps:
       - name: Provisioning gate (skip cleanly if secrets unset)
         id: gate
+        env:
+          IP_SECRET_NAME: ${{ matrix.ip_secret }}
         run: |
           if [ -z "$TS_AUTHKEY" ] || [ -z "$CD_SECRET" ] || [ -z "$CD_HOST" ]; then
-            echo "::notice::CD secrets not fully provisioned (TS_AUTHKEY/CD_RESTART_SECRET/TAILSCALE_IP_MAC) — skipping restart. This is NOT a failure."
+            echo "::notice::CD secrets not fully provisioned for ${CD_TARGET} (TS_AUTHKEY/CD_RESTART_SECRET/${IP_SECRET_NAME}) — skipping this host's restart. This is NOT a failure."
             echo "go=false" >> "$GITHUB_OUTPUT"
           else
             echo "go=true" >> "$GITHUB_OUTPUT"
@@ -99,7 +127,7 @@ jobs:
             --arg sha "$SHA" \
             --arg pr_url "$PR_URL" \
             '{sha: $sha} | if ($pr_url | length) > 0 then . + {pr_url: $pr_url} else . end')
-          echo "Posting runtime deploy for merge $SHA (local bare sync + detached runtime checkout)"
+          echo "Posting runtime deploy for merge $SHA to ${CD_TARGET} (local bare sync + detached runtime checkout)"
           # The endpoint acks immediately then restarts detached; a short timeout is
           # fine. A timeout here almost always means the tailnet ACL blocks :7777.
           code=$(curl -sS -o /tmp/cd_resp.json -w '%{http_code}' \
@@ -112,7 +140,7 @@ jobs:
           cat /tmp/cd_resp.json 2>/dev/null || true
           echo
           if [ "$code" != "200" ]; then
-            echo "::error::CD restart webhook returned HTTP $code"
+            echo "::error::CD restart webhook (${CD_TARGET}) returned HTTP $code"
             exit 1
           fi
 
@@ -123,12 +151,12 @@ jobs:
         run: |
           deadline=$((SECONDS + 180))
           last=""
-          echo "Verifying live /health git_sha reaches $SHA"
+          echo "Verifying live /health git_sha on ${CD_TARGET} reaches $SHA"
           while [ "$SECONDS" -lt "$deadline" ]; do
             if curl -fsS -m 5 "http://${CD_HOST}:7777/health" -o /tmp/cd_health.json; then
               last=$(jq -r '.git_sha // empty' /tmp/cd_health.json)
               if [ "$last" = "$SHA" ]; then
-                echo "Live deploy verified: /health git_sha=$last"
+                echo "Live deploy verified on ${CD_TARGET}: /health git_sha=$last"
                 exit 0
               fi
               echo "Waiting for live sha: got '${last:-empty}', want '$SHA'"
@@ -137,6 +165,6 @@ jobs:
             fi
             sleep 5
           done
-          echo "::error::DEPLOY VERIFY ALARM: live /health git_sha='${last:-unreachable}' != merged sha '$SHA' after 180s"
+          echo "::error::DEPLOY VERIFY ALARM (${CD_TARGET}): live /health git_sha='${last:-unreachable}' != merged sha '$SHA' after 180s"
           cat /tmp/cd_health.json 2>/dev/null || true
           exit 1

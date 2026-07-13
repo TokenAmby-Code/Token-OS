@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# box-restart - Linux-box CD deploy executor (k12 boxes)
+# TAGS: token-api, cd
+# AUDIENCE: human, agent
+#
+# Usage:
+#   box-restart              # Git-aware deploy: ff-only sync the box bare cache from
+#                            #   GitHub main, detach-checkout the runtime, restart
+#                            #   the systemd user units whose files changed
+#   box-restart --sync       # Accepted no-op alias (sync is the default; the CD
+#                            #   webhook passes it explicitly)
+#   box-restart --sha <sha>  # Deploy a specific merged SHA (must be reachable from main)
+#   box-restart --status     # Show runtime/bare SHAs, unit states, live /health SHA
+#
+# The Linux analog of token-restart's Mac deploy leg. token-restart on a non-Mac
+# machine PROXIES to the Mac over ssh — never what a box's OWN /api/cd/restart
+# webhook means — so token-api spawns THIS script on Linux instead (see
+# cd_restart in token-api/main.py). Same contract: ff-only sync the CD bare
+# cache, detached runtime checkout, restart only changed services, and ALWAYS
+# bounce token-api on an advanced merge so /health.git_sha is the deploy proof
+# the workflow verifies.
+#
+# CGROUP ESCAPE: token-api spawns this script detached (setsid), but on systemd
+# a new session does NOT leave the service cgroup — `systemctl --user restart
+# token-api@live` would kill this very script mid-deploy (the Mac gets away with
+# setsid because launchd kills by process group). So the first thing a deploy
+# run does is re-exec itself into a transient systemd user unit via
+# `systemd-run --user --collect`, which survives the token-api bounce.
+# Output of the escaped run: journalctl --user + /tmp/box-restart.log.
+
+set -euo pipefail
+
+is_darwin() { [[ "$(uname -s)" == "Darwin" ]]; }
+if is_darwin; then
+    echo "box-restart is the Linux box deploy path — on the Mac use token-restart." >&2
+    exit 1
+fi
+
+# ============ Cgroup escape (before anything else) ============
+# Skip for read-only invocations; forward the deploy-relevant env explicitly
+# (systemd-run does not inherit the caller's environment).
+case " $* " in
+    *" --status "* | *" --help "* | *" -h "*) ;;
+    *)
+        if [[ "${BOX_RESTART_ESCAPED:-}" != "1" ]] && command -v systemd-run > /dev/null 2>&1; then
+            _self="$(readlink -f "${BASH_SOURCE[0]}")"
+            echo "→ box-restart: escaping into a transient systemd user unit (survives the token-api restart)"
+            if systemd-run --user --collect \
+                -p StandardOutput=append:/tmp/box-restart.log \
+                -p StandardError=append:/tmp/box-restart.log \
+                --setenv=BOX_RESTART_ESCAPED=1 \
+                --setenv=TOKEN_RESTART_TARGET_SHA="${TOKEN_RESTART_TARGET_SHA:-}" \
+                --setenv=TOKEN_OS_RUNTIME_CHECKOUT="${TOKEN_OS_RUNTIME_CHECKOUT:-}" \
+                --setenv=TOKEN_OS_BARE_REPO="${TOKEN_OS_BARE_REPO:-}" \
+                "$_self" "$@"; then
+                exit 0
+            fi
+            echo "⚠ systemd-run escape failed — continuing inline (unsafe only when spawned by token-api itself)" >&2
+        fi
+        ;;
+esac
+
+# ============ Config ============
+# Box canon (verified on k12-personal): runtime checkout ~/runtimes/Token-OS/live,
+# CD bare cache ~/runtimes/Token-OS/token-os.git beside it, all services are
+# systemd USER units, token-api is the templated token-api@<checkout-name>.service.
+# Resolution rides the shared machine registry (cli-tools/lib/nas-path.sh):
+# explicit override > TOKEN_OS (unit env / nas-path export) > imperium_cfg
+# token_os_runtime > box-canon default.
+_LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib"
+# shellcheck source=/dev/null
+source "${_LIB_DIR}/nas-path.sh" 2> /dev/null || true
+_cfg_runtime=""
+if command -v imperium_cfg > /dev/null 2>&1; then
+    _cfg_runtime="$(imperium_cfg token_os_runtime 2> /dev/null || true)"
+fi
+RUNTIME="${TOKEN_OS_RUNTIME_CHECKOUT:-${TOKEN_OS:-${_cfg_runtime:-$HOME/runtimes/Token-OS/live}}}"
+BARE="${TOKEN_OS_BARE_REPO:-$(dirname "$RUNTIME")/token-os.git}"
+TOKEN_API_UNIT="token-api@$(basename "$RUNTIME").service"
+HEALTH_URL="${TOKEN_API_URL:-http://127.0.0.1:7777}/health"
+LOCK_FILE="/tmp/box-restart-$(id -u).lock"
+
+ACTION="restart"
+TARGET_SHA="${TOKEN_RESTART_TARGET_SHA:-}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sync) shift ;; # sync is the default; kept so the CD webhook contract matches token-restart
+        --sha)
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+                echo "Error: --sha requires a commit SHA" >&2
+                exit 1
+            fi
+            TARGET_SHA="$2"
+            shift 2
+            ;;
+        --status) ACTION="status"; shift ;;
+        -h | --help)
+            sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1 (see --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+unit_present() { systemctl --user cat "$1" > /dev/null 2>&1; }
+
+running_git_sha() {
+    curl -sf -m 3 "$HEALTH_URL" 2> /dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("git_sha") or "")' 2> /dev/null || true
+}
+
+if [[ "$ACTION" == "status" ]]; then
+    echo "runtime:  $RUNTIME @ $(git -C "$RUNTIME" rev-parse --short HEAD 2> /dev/null || echo '?')"
+    echo "bare:     $BARE main @ $(git --git-dir="$BARE" rev-parse --short refs/heads/main 2> /dev/null || echo '?')"
+    echo "live:     /health git_sha $(running_git_sha || echo '?')"
+    for unit in "$TOKEN_API_UNIT" edge-proxy.service k12-daemon.service tmuxctld.service; do
+        unit_present "$unit" || continue
+        echo "unit:     $unit $(systemctl --user is-active "$unit" 2> /dev/null || true)"
+    done
+    exit 0
+fi
+
+# ============ Deploy ============
+# Serialize deploys; a queued later merge waits for the in-flight one, then runs
+# with its own (newer) target. 10-minute bound matches the workflow job timeout.
+exec 9> "$LOCK_FILE"
+if ! flock -w 600 9; then
+    echo "✗ another box-restart holds the deploy lock after 600s — aborting" >&2
+    exit 1
+fi
+
+echo "=== box-restart deploy $(date -Is) ==="
+
+[[ -d "$RUNTIME/.git" || -f "$RUNTIME/.git" ]] || { echo "✗ runtime checkout missing: $RUNTIME" >&2; exit 1; }
+[[ -d "$BARE" ]] || { echo "✗ CD bare cache missing: $BARE" >&2; exit 1; }
+
+# 1. ff-only sync the bare cache from GitHub main. The non-forced refspec makes
+#    git itself enforce fast-forward; divergence fails loud.
+echo "→ syncing bare cache from origin main"
+git --git-dir="$BARE" fetch origin main:main
+
+# 2. Resolve + validate the deploy target.
+if [[ -z "$TARGET_SHA" ]]; then
+    TARGET_SHA="$(git --git-dir="$BARE" rev-parse refs/heads/main)"
+fi
+if ! git --git-dir="$BARE" cat-file -e "${TARGET_SHA}^{commit}" 2> /dev/null; then
+    echo "✗ target sha $TARGET_SHA not present in bare cache after fetch — refusing" >&2
+    exit 1
+fi
+
+OLD_SHA="$(git -C "$RUNTIME" rev-parse HEAD)"
+RUNNING_SHA="$(running_git_sha)"
+
+# 3. A dirty runtime aborts the deploy (runtime checkouts are deploy artifacts;
+#    boxes get no WIP shunt — a dirty box runtime is someone editing the runtime,
+#    which is always an error).
+if [[ -n "$(git -C "$RUNTIME" status --porcelain 2> /dev/null)" ]]; then
+    echo "✗ runtime checkout is DIRTY — refusing to deploy (never edit the runtime checkout)" >&2
+    exit 1
+fi
+
+if [[ "$OLD_SHA" == "$TARGET_SHA" && "$RUNNING_SHA" == "$TARGET_SHA" ]]; then
+    echo "✓ already serving $TARGET_SHA — nothing to do"
+    exit 0
+fi
+
+# 4. Advance the runtime checkout (detached, like the Mac deploy leg). Fetch from
+#    the local bare cache so the bare stays the single CD ingress.
+if [[ "$OLD_SHA" != "$TARGET_SHA" ]]; then
+    echo "→ runtime checkout: $OLD_SHA → $TARGET_SHA"
+    git -C "$RUNTIME" fetch "$BARE" main
+    git -C "$RUNTIME" checkout --detach "$TARGET_SHA"
+else
+    echo "→ runtime already at $TARGET_SHA but live process serves '${RUNNING_SHA:-unreachable}' — restart-only deploy"
+fi
+
+CHANGED_PATHS="$(git -C "$RUNTIME" diff --name-only "$OLD_SHA" "$TARGET_SHA" 2> /dev/null || true)"
+
+# 5. Refresh frozen bun deps when a dep manifest changed (fail BEFORE any unit
+#    restart so a half-installed tree never serves). Contracts precede k12_daemon
+#    (the daemon's file: link resolves zod from the contracts source path).
+BUN="${BUN:-$HOME/.bun/bin/bun}"
+command -v "$BUN" > /dev/null 2>&1 || BUN="$(command -v bun || true)"
+bun_refresh() {
+    local dir="$1"
+    echo "→ bun install --frozen-lockfile ($dir)"
+    if [[ -z "$BUN" ]]; then
+        echo "✗ bun not found but $dir deps changed — aborting before restarts" >&2
+        exit 1
+    fi
+    (cd "$RUNTIME/$dir" && "$BUN" install --frozen-lockfile)
+}
+contracts_deps_changed=false
+k12_deps_changed=false
+edge_deps_changed=false
+while IFS= read -r path; do
+    case "$path" in
+        token-api/web/contracts/package.json | token-api/web/contracts/bun.lock) contracts_deps_changed=true ;;
+        k12_daemon/package.json | k12_daemon/bun.lock) k12_deps_changed=true ;;
+        edge_proxy/package.json | edge_proxy/bun.lock) edge_deps_changed=true ;;
+    esac
+done <<< "$CHANGED_PATHS"
+[[ "$contracts_deps_changed" == true ]] && bun_refresh "token-api/web/contracts"
+[[ "$k12_deps_changed" == true || "$contracts_deps_changed" == true ]] && bun_refresh "k12_daemon"
+[[ "$edge_deps_changed" == true ]] && bun_refresh "edge_proxy"
+
+# 6. Map changed paths → units. token-api ALWAYS restarts on an advanced merge
+#    (mac parity: /health.git_sha must become the merged SHA or the workflow's
+#    verify step alarms). Sidecars restart first; token-api last.
+restart_edge=false
+restart_k12=false
+restart_tmuxctld=false
+while IFS= read -r path; do
+    case "$path" in
+        edge_proxy/*) restart_edge=true ;;
+        k12_daemon/*) restart_k12=true ;;
+        token-api/web/contracts/*) restart_k12=true ;; # contracts feed the daemon's zod schemas
+        tmuxctld/*) restart_tmuxctld=true ;;
+    esac
+done <<< "$CHANGED_PATHS"
+
+restart_unit() {
+    local unit="$1"
+    if ! unit_present "$unit"; then
+        echo "  - $unit not installed on this box — skipping"
+        return 0
+    fi
+    echo "→ systemctl --user restart $unit"
+    systemctl --user restart "$unit"
+}
+
+[[ "$restart_edge" == true ]] && restart_unit edge-proxy.service
+[[ "$restart_k12" == true ]] && restart_unit k12-daemon.service
+[[ "$restart_tmuxctld" == true ]] && restart_unit tmuxctld.service
+restart_unit "$TOKEN_API_UNIT"
+
+# 7. Verify the live process serves the target (the same proof the workflow
+#    polls over the tailnet).
+deadline=$((SECONDS + 120))
+got=""
+while ((SECONDS < deadline)); do
+    got="$(running_git_sha)"
+    if [[ "$got" == "$TARGET_SHA" ]]; then
+        echo "✓ box deploy verified: /health git_sha=$got"
+        exit 0
+    fi
+    sleep 3
+done
+echo "✗ BOX DEPLOY VERIFY ALARM: /health git_sha='${got:-unreachable}' != target '$TARGET_SHA' after 120s" >&2
+exit 1

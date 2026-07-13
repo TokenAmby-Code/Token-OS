@@ -19488,6 +19488,14 @@ async def cancel_shutdown():
 # not a substitute for the secret.
 _CD_SECRET_ENV = "CD_RESTART_SECRET"
 
+# CD host role. The Mac runs the launchd-orchestrated `token-restart`; the Linux
+# k12 boxes run the systemd box-local `box-restart` (token-restart on a non-Mac
+# machine PROXIES to the Mac over ssh — never what a box's own CD webhook means).
+# The Mac is also the canonical host for merge SIDE EFFECTS (pr_state badge flip,
+# Administratum pr_merged delivery): boxes deploy code only, so one merge never
+# multi-fires operator-facing events across the fan-out.
+_CD_IS_MAC = sys.platform == "darwin"
+
 # In-flight guard: coalesce duplicate restart webhooks for the SAME commit within
 # a short time window. A latched boolean can't work anymore — a git-aware
 # token-restart may NOT restart token-api (e.g. a discord-only or mobile-only
@@ -19591,7 +19599,8 @@ async def cd_restart(request: Request):
     """CD restart-on-merge webhook. Secret-validated, ack-first, restart-detached.
 
     Body: {"sha": "...", "pr_url": "..."}. The merge to main is shipped by a single
-    detached, git-aware `token-restart --sync`: it fast-forwards the local bare
+    detached, git-aware sync — `token-restart --sync` on the Mac, `box-restart
+    --sync` on the Linux k12 boxes: it fast-forwards the local bare
     skeleton from GitHub main, updates the deploy-owned runtime checkout detached,
     and then restarts ONLY the services whose files the deploy
     changed (see map_changed_to_services in cli-tools/bin/token-restart). The CD
@@ -19626,8 +19635,9 @@ async def cd_restart(request: Request):
     services = body.get("services")
 
     # Flip the merged PR's originating instance badge (Phase 1 → merged).
+    # Mac-canonical: box legs of the CD fan-out skip merge side effects.
     merged_flips = 0
-    if pr_url:
+    if pr_url and _CD_IS_MAC:
         try:
             merged_flips = await _cd_flip_pr_merged(pr_url)
         except Exception as e:
@@ -19658,7 +19668,8 @@ async def cd_restart(request: Request):
             save_restart_state()
         except Exception as e:
             logger.warning("CD: save_restart_state failed (continuing): %s", e)
-        token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / "token-restart")
+        restart_bin = "token-restart" if _CD_IS_MAC else "box-restart"
+        token_restart = str(SCRIPTS_DIR / "cli-tools" / "bin" / restart_bin)
         target_env = ""
         if isinstance(sha, str) and sha.strip():
             target_env = f"TOKEN_RESTART_TARGET_SHA={shlex.quote(sha.strip())} "
@@ -19675,7 +19686,10 @@ async def cd_restart(request: Request):
         restart = "scheduled (detached, ~2s)"
         logger.info("CD: token-restart scheduled (sha=%s, services=%s)", sha, services)
 
-    if sha or pr_url:
+    # Administratum pr_merged delivery is Mac-canonical too — a 3-host fan-out
+    # must not triple-page one merge (the dedupe table is per-box, so the claim
+    # alone cannot dedupe across hosts).
+    if (sha or pr_url) and _CD_IS_MAC:
         try:
             (
                 administratum_delivery_claimed,
