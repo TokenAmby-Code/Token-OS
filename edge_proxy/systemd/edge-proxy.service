@@ -8,6 +8,13 @@ Type=simple
 WorkingDirectory=%h/runtimes/Token-OS/live/edge_proxy
 Environment=EDGE_PROXY_CONFIG=%h/secrets/token-os/edge_proxy.json
 Environment=IMPERIUM_MACHINE=k12-personal
+# The proxy binds the box's tailnet IP, which can lag tailscaled at boot. Gate
+# startup on the IP existing (bounded by TimeoutStartSec) instead of letting a
+# failed bind crashloop; restart rate limiting stays at the bounded default
+# (5 in 10s), so a genuinely broken config/binary still fails fast and stays
+# visibly failed rather than looping forever.
+ExecStartPre=/bin/sh -c 'until /usr/bin/tailscale ip -4 >/dev/null 2>&1; do sleep 2; done'
+TimeoutStartSec=180
 ExecStart=%h/.bun/bin/bun src/server.ts
 Restart=on-failure
 RestartSec=2

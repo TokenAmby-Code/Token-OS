@@ -8,7 +8,12 @@ name: Deploy (prod)
 # right local services. This pipeline is intentionally DUMB: it does NOT figure
 # out what changed. A GH-hosted runner cannot reach the boxes directly, so each
 # matrix job joins the Emperor's tailnet (ephemeral node) and POSTs to that
-# host's token-api /api/cd/restart webhook. The webhook spawns a single git-aware
+# host's token-api /api/cd/restart webhook. On the Mac that's token-api directly
+# on :7777; on the k12 boxes token-api is loopback-bound (one ingress per box),
+# so the webhook + health verify route through the box's edge_proxy front door on
+# :7780 under the /token-api route (see edge_proxy/README.md — the route is
+# tokenless, so the CD bearer passes through and token-api stays the auth
+# authority, fail-closed on CD_RESTART_SECRET). The webhook spawns a single git-aware
 # sync — `token-restart --sync` on the Mac, `box-restart --sync` on the Linux k12
 # boxes — which ff-only syncs the box-local CD bare cache
 # (`~/runtimes/Token-OS/token-os.git`) from GitHub main, checks out the requested
@@ -33,8 +38,9 @@ name: Deploy (prod)
 #   TAILSCALE_IP_MAC           — the Mac's tailnet IP (reused existing infra secret).
 #   TAILSCALE_IP_K12_PERSONAL  — k12-personal's tailnet IP.
 #   TAILSCALE_IP_K12_WORK      — k12-work's tailnet IP.
-# Tailnet ACL must also allow the tag:ci ephemeral node to reach <host>:7777 for
-# EACH provisioned host (tailnet admin console — easy to forget; shows up as a
+# Tailnet ACL must also allow the tag:ci ephemeral node to reach each provisioned
+# host's CD door — the Mac on :7777 (token-api direct), the k12 boxes on :7780
+# (edge_proxy) — via the tailnet admin console (easy to forget; shows up as a
 # curl timeout).
 #
 # GUARD (per host): if TS_AUTHKEY, CD_RESTART_SECRET, or that host's IP secret is
@@ -74,23 +80,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Mac: token-api is the CD door directly. k12 boxes: token-api is
+          # loopback-bound; the box's edge_proxy (:7780) is the single tailnet
+          # ingress and serves the CD webhook + health under /token-api.
           - target: mac
             ip_secret: TAILSCALE_IP_MAC
+            cd_port: "7777"
+            cd_base: ""
           - target: k12-personal
             ip_secret: TAILSCALE_IP_K12_PERSONAL
+            cd_port: "7780"
+            cd_base: "/token-api"
           - target: k12-work
             ip_secret: TAILSCALE_IP_K12_WORK
+            cd_port: "7780"
+            cd_base: "/token-api"
+    # Job-level env carries ONLY non-secret matrix values; each secret is injected
+    # into just the steps that consume it (least-privilege — a job-wide secret env
+    # would also reach unrelated steps and the third-party tailscale action).
     env:
-      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-      CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
-      # Dynamic index: each matrix leg reads its own host IP secret.
-      CD_HOST: ${{ secrets[matrix.ip_secret] }}
       CD_TARGET: ${{ matrix.target }}
+      CD_PORT: ${{ matrix.cd_port }}
+      CD_BASE: ${{ matrix.cd_base }}
     steps:
       - name: Provisioning gate (skip cleanly if secrets unset)
         id: gate
         env:
           IP_SECRET_NAME: ${{ matrix.ip_secret }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
+          # Dynamic index: each matrix leg reads its own host IP secret.
+          CD_HOST: ${{ secrets[matrix.ip_secret] }}
         run: |
           if [ -z "$TS_AUTHKEY" ] || [ -z "$CD_SECRET" ] || [ -z "$CD_HOST" ]; then
             echo "::notice::CD secrets not fully provisioned for ${CD_TARGET} (TS_AUTHKEY/CD_RESTART_SECRET/${IP_SECRET_NAME}) — skipping this host's restart. This is NOT a failure."
@@ -122,6 +142,8 @@ jobs:
         env:
           PR_URL: ${{ steps.pr.outputs.url }}
           SHA: ${{ github.sha }}
+          CD_SECRET: ${{ secrets.CD_RESTART_SECRET }}
+          CD_HOST: ${{ secrets[matrix.ip_secret] }}
         run: |
           body=$(jq -nc \
             --arg sha "$SHA" \
@@ -129,13 +151,14 @@ jobs:
             '{sha: $sha} | if ($pr_url | length) > 0 then . + {pr_url: $pr_url} else . end')
           echo "Posting runtime deploy for merge $SHA to ${CD_TARGET} (local bare sync + detached runtime checkout)"
           # The endpoint acks immediately then restarts detached; a short timeout is
-          # fine. A timeout here almost always means the tailnet ACL blocks :7777.
+          # fine. A timeout here almost always means the tailnet ACL blocks the
+          # host's CD door (mac :7777, k12 :7780).
           code=$(curl -sS -o /tmp/cd_resp.json -w '%{http_code}' \
             -m 20 -X POST \
             -H "Authorization: Bearer ${CD_SECRET}" \
             -H "Content-Type: application/json" \
             -d "$body" \
-            "http://${CD_HOST}:7777/api/cd/restart")
+            "http://${CD_HOST}:${CD_PORT}${CD_BASE}/api/cd/restart")
           echo "HTTP $code"
           cat /tmp/cd_resp.json 2>/dev/null || true
           echo
@@ -148,12 +171,16 @@ jobs:
         if: steps.gate.outputs.go == 'true'
         env:
           SHA: ${{ github.sha }}
+          CD_HOST: ${{ secrets[matrix.ip_secret] }}
         run: |
           deadline=$((SECONDS + 180))
           last=""
-          echo "Verifying live /health git_sha on ${CD_TARGET} reaches $SHA"
+          # On the k12 boxes /token-api/health is token-api's own /health via the
+          # edge_proxy (the proxy answers bare /health itself), so .git_sha is the
+          # same deploy proof on every target.
+          echo "Verifying live token-api /health git_sha on ${CD_TARGET} reaches $SHA"
           while [ "$SECONDS" -lt "$deadline" ]; do
-            if curl -fsS -m 5 "http://${CD_HOST}:7777/health" -o /tmp/cd_health.json; then
+            if curl -fsS -m 5 "http://${CD_HOST}:${CD_PORT}${CD_BASE}/health" -o /tmp/cd_health.json; then
               last=$(jq -r '.git_sha // empty' /tmp/cd_health.json)
               if [ "$last" = "$SHA" ]; then
                 echo "Live deploy verified on ${CD_TARGET}: /health git_sha=$last"

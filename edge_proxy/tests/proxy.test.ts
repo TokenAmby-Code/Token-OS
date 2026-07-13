@@ -66,21 +66,42 @@ test("route-scoped auth: a route token gates only its own route", async () => {
   const daemonPort = port();
   const apiPort = port();
   const proxyPort = port();
-  servers.push(Bun.serve({ hostname: "127.0.0.1", port: daemonPort, fetch() { return Response.json({ who: "daemon" }); } }));
+  servers.push(Bun.serve({ hostname: "127.0.0.1", port: daemonPort, fetch(req) { return Response.json({ who: "daemon", auth: req.headers.get("authorization") }); } }));
   servers.push(Bun.serve({ hostname: "127.0.0.1", port: apiPort, fetch() { return Response.json({ who: "api" }); } }));
   servers.push(makeServer({ bind: "127.0.0.1", port: proxyPort, machine: "test", routes: [
     { prefix: "/k12", upstream: `http://127.0.0.1:${daemonPort}`, stripPrefix: true, token: "s3cret", allowlist: [{ method: "GET", path: "/health" }] },
+    { prefix: "/other", upstream: `http://127.0.0.1:${apiPort}`, stripPrefix: true, token: "other-s3cret", allowlist: [{ method: "GET", path: "/health" }] },
     { prefix: "/", upstream: `http://127.0.0.1:${apiPort}`, allowlist: [{ method: "GET", pathPrefix: "/api/" }] },
   ] }));
   // Missing cred on the guarded route → 401.
   let r = await fetch(`http://127.0.0.1:${proxyPort}/k12/health`);
   expect(r.status).toBe(401);
-  // Correct cred → forwarded.
+  // Correct cred → forwarded, and the route cred is TERMINATED at the proxy.
   r = await fetch(`http://127.0.0.1:${proxyPort}/k12/health`, { headers: { authorization: "Bearer s3cret" } });
   expect(r.status).toBe(200);
+  expect(await r.json()).toEqual({ who: "daemon", auth: null });
+  // The k12 token does NOT authorize a DIFFERENT guarded route (route-scoped by construction).
+  r = await fetch(`http://127.0.0.1:${proxyPort}/other/health`, { headers: { authorization: "Bearer s3cret" } });
+  expect(r.status).toBe(401);
   // The k12 token does NOT grant the default route (which requires none, still works without it).
   r = await fetch(`http://127.0.0.1:${proxyPort}/api/echo`);
   expect(r.status).toBe(200);
+});
+
+test("tokenless route passes the caller's Authorization through to the upstream", async () => {
+  const upPort = port();
+  const proxyPort = port();
+  servers.push(Bun.serve({ hostname: "127.0.0.1", port: upPort, fetch(req) {
+    return Response.json({ auth: req.headers.get("authorization") });
+  }}));
+  servers.push(makeServer({ bind: "127.0.0.1", port: proxyPort, machine: "test", routes: [
+    // Mirrors the CD webhook route: token-api behind /token-api, no proxy cred —
+    // the upstream (fail-closed on CD_RESTART_SECRET) does its own bearer auth.
+    { prefix: "/token-api", upstream: `http://127.0.0.1:${upPort}`, stripPrefix: true, allowlist: [{ method: "POST", path: "/api/cd/restart" }] },
+  ] }));
+  const r = await fetch(`http://127.0.0.1:${proxyPort}/token-api/api/cd/restart`, { method: "POST", headers: { authorization: "Bearer cd-secret" } });
+  expect(r.status).toBe(200);
+  expect(await r.json()).toEqual({ auth: "Bearer cd-secret" });
 });
 
 test("forwards a POST request body intact (duplex:\"half\" path)", async () => {
