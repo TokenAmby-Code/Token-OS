@@ -28,6 +28,7 @@ import {
 import { EventStore } from './store.ts';
 import { findTmuxId } from './ids.ts';
 import { buildProjections, type Projections } from './projections.ts';
+import { K12_ESTATE } from './estate.ts';
 import type { TmuxControlPlane } from './tmux.ts';
 
 // Reg-audit attestation set DEFINED SO FAR (door step 1). The refusal machinery
@@ -127,6 +128,78 @@ export class Daemon {
       });
 
       return { ok: true, seat_id: req.seat_id, handover: true, missing_attestations: [], reason: null };
+    });
+  }
+
+  // ── constructEstate — boot-time idempotent ensure (k12 estate, rung 2) ──────
+  // Stands the canonical persistent estate (src/estate.ts) declaratively. NOT an
+  // endpoint or CLI — the seed vocab/endpoint set is closed; this is a boot
+  // ensure. Runs under the single-writer mutex so it can't interleave with a
+  // concurrent launch/send. Idempotent: a re-run over a fully-present-and-attested
+  // estate creates nothing and appends zero events. Each fresh seat records ONE
+  // bare `reg.pane_created` (unbound) — it lands in freelist + activity_board and
+  // triggers NO contradiction (reconcile only flags bound-dead / retired-live).
+  //
+  // Buckets: `created` = pane made + event written this run; `backfilled` = pane
+  // already there but its event was missing (repaired, no new pane); `existing` =
+  // present AND attested (skipped); `failed` = a seat that threw (logged, others
+  // continue). Truth is the stream, so a pane with no `reg.pane_created` is
+  // invisible to every projection — backfill closes that gap.
+  constructEstate(): Promise<{ created: string[]; existing: string[]; backfilled: string[]; failed: string[] }> {
+    return this.locked(async () => {
+      // Live OR dead counts as present — a dead seat's session still exists, so
+      // createSeat would throw on a duplicate session name. Skip creation either
+      // way; attestation is tracked separately below.
+      const present = new Set((await this.tmux.listSeats()).map((o) => o.seat_id));
+      // Seats that already carry a `reg.pane_created` fact. A prior boot could
+      // have torn (createSeat committed, its append did not) — the pane persists
+      // but the fact was lost. Presence WITHOUT attestation is that torn state.
+      const attested = new Set(
+        this.store.readAll().filter((e) => e.event_type === 'reg.pane_created').map((e) => e.entity_id),
+      );
+      const created: string[] = [];
+      const existing: string[] = [];
+      const backfilled: string[] = [];
+      const failed: string[] = [];
+
+      const recordCreated = (seat: string): void => {
+        this.store.append({
+          entity_type: 'seat',
+          entity_id: seat,
+          event_type: 'reg.pane_created',
+          payload: { pane_state: 'live' },
+          provenance: this.prov('observer', null),
+          occurred_at: this.now(),
+        });
+      };
+
+      for (const seat of K12_ESTATE) {
+        try {
+          if (present.has(seat)) {
+            if (attested.has(seat)) {
+              existing.push(seat); // present AND attested — nothing to do
+            } else {
+              // Repair the torn state: backfill the lost fact. No second tmux
+              // session is spawned, so idempotency and the pane both hold.
+              recordCreated(seat);
+              backfilled.push(seat);
+            }
+          } else {
+            await this.tmux.createSeat(seat);
+            recordCreated(seat);
+            created.push(seat);
+          }
+        } catch (err) {
+          // A single seat failing must not sink the estate or crash boot — health
+          // stays up. Fail loud, then carry on to the next seat.
+          failed.push(seat);
+          console.error(
+            JSON.stringify({ level: 'error', event: 'estate_seat_failed', seat, detail: String(err) }),
+          );
+        }
+      }
+
+      return { created, existing, backfilled, failed };
     });
   }
 
