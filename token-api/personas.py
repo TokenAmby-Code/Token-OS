@@ -231,7 +231,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
         None,
         "#302800",
         "#d4af37",
-        "ballad",
+        "fable",
         "2",
         "chimes.wav",
         default_session_doc="daily_note",

@@ -1592,7 +1592,7 @@ _last_pause_queue_expiry_sweep = 0.0
 SYSTEM_INSTANCE_ID = "system"
 _SYSTEM_TTS_ROW: dict[str, object] = {
     "name": "System",
-    "tts_voice": "ballad",  # Custodes/System OpenAI voice
+    "tts_voice": "fable",  # Custodes/System OpenAI voice
     "notification_sound": "chimes.wav",
     "tts_mode": "verbose",
     "persona_slug": "system",
