@@ -28,6 +28,7 @@ import {
 import { EventStore } from './store.ts';
 import { findTmuxId } from './ids.ts';
 import { buildProjections, type Projections } from './projections.ts';
+import { K12_ESTATE } from './estate.ts';
 import type { TmuxControlPlane } from './tmux.ts';
 
 // Reg-audit attestation set DEFINED SO FAR (door step 1). The refusal machinery
@@ -127,6 +128,53 @@ export class Daemon {
       });
 
       return { ok: true, seat_id: req.seat_id, handover: true, missing_attestations: [], reason: null };
+    });
+  }
+
+  // ── constructEstate — boot-time idempotent ensure (k12 estate, rung 2) ──────
+  // Stands the canonical persistent estate (src/estate.ts) declaratively. NOT an
+  // endpoint or CLI — the seed vocab/endpoint set is closed; this is a boot
+  // ensure. Runs under the single-writer mutex so it can't interleave with a
+  // concurrent launch/send. Idempotent: a re-run over a fully-present estate
+  // creates nothing and appends zero events. Each fresh seat records ONE bare
+  // `reg.pane_created` (unbound) — it lands in freelist + activity_board and
+  // triggers NO contradiction (reconcile only flags bound-dead / retired-live).
+  constructEstate(): Promise<{ created: string[]; existing: string[]; failed: string[] }> {
+    return this.locked(async () => {
+      // Live OR dead counts as present — a dead seat's session still exists, so
+      // createSeat would throw on a duplicate session name. Skip it either way.
+      const present = new Set((await this.tmux.listSeats()).map((o) => o.seat_id));
+      const created: string[] = [];
+      const existing: string[] = [];
+      const failed: string[] = [];
+
+      for (const seat of K12_ESTATE) {
+        if (present.has(seat)) {
+          existing.push(seat);
+          continue;
+        }
+        try {
+          await this.tmux.createSeat(seat);
+          this.store.append({
+            entity_type: 'seat',
+            entity_id: seat,
+            event_type: 'reg.pane_created',
+            payload: { pane_state: 'live' },
+            provenance: this.prov('observer', null),
+            occurred_at: this.now(),
+          });
+          created.push(seat);
+        } catch (err) {
+          // A single seat failing must not sink the estate or crash boot — health
+          // stays up. Fail loud, then carry on to the next seat.
+          failed.push(seat);
+          console.error(
+            JSON.stringify({ level: 'error', event: 'estate_seat_failed', seat, detail: String(err) }),
+          );
+        }
+      }
+
+      return { created, existing, failed };
     });
   }
 

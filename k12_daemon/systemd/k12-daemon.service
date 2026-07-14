@@ -12,6 +12,12 @@ ExecStart=%h/.bun/bin/bun src/daemon.ts
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
+# Terminate only the bun main process on stop/restart — NOT the whole cgroup.
+# The default (control-group) SIGTERMs the daemon-spawned tmux server, killing
+# the persistent estate on every `systemctl restart`. The daemon otherwise
+# spawns only short-lived tmux CLI children, so process-scope teardown is safe
+# and leaves the estate (and its seat sessions) alive for clean idempotency.
+KillMode=process
 
 [Install]
 WantedBy=default.target
