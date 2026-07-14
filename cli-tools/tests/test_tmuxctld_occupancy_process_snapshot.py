@@ -24,7 +24,13 @@ class FakeAdapter:
         )
 
 
-def main() -> None:
+class PaneOccupancyAdapter:
+    def run(self, *args: str, allow_failure: bool = False) -> str:  # noqa: ARG002
+        assert args[:3] == ("list-panes", "-a", "-F")
+        return "%1\tinstance-1\tworker:1\tmechanicus\t100\t1000.0"
+
+
+def test_scan_ledger_dispatch_availability_single_snapshot() -> None:
     calls = 0
 
     def fake_process_tree() -> tuple[dict[int, list[int]], dict[int, str]]:
@@ -44,6 +50,30 @@ def main() -> None:
 
     assert calls == 1, f"expected one process snapshot, got {calls}"
     assert [row.live_agent for row in rows] == [True, True, False]
+
+
+def test_scan_pane_occupancy_single_snapshot() -> None:
+    calls = 0
+
+    def fake_process_tree() -> tuple[dict[int, list[int]], dict[int, str]]:
+        nonlocal calls
+        calls += 1
+        return ({100: [101]}, {101: "claude"})
+
+    original_snapshot = occupancy._process_tree_snapshot
+    try:
+        occupancy._process_tree_snapshot = fake_process_tree
+        rows = occupancy.scan_pane_occupancy(PaneOccupancyAdapter())
+    finally:
+        occupancy._process_tree_snapshot = original_snapshot
+
+    assert calls == 1, f"expected one process snapshot, got {calls}"
+    assert [row.live_agent for row in rows] == [True]
+
+
+def main() -> None:
+    test_scan_ledger_dispatch_availability_single_snapshot()
+    test_scan_pane_occupancy_single_snapshot()
 
 
 if __name__ == "__main__":
