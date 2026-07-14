@@ -12,6 +12,7 @@ source "${LIB_DIR}/nas-path.sh" 2>/dev/null || true
 source "${LIB_DIR}/tmuxctld-timeouts.sh" 2>/dev/null || true
 source "${LIB_DIR}/pane-id.sh" 2>/dev/null || true
 source "${LIB_DIR}/agent-wrapper-common.sh" 2>/dev/null || true
+source "${LIB_DIR}/disk-preflight.sh" 2>/dev/null || true
 # Tests and callers may intentionally point dispatch at an alternate vault root.
 [[ -n "$CALLER_IMPERIUM" ]] && export IMPERIUM="$CALLER_IMPERIUM"
 source "${LIB_DIR}/git-remote.sh"
@@ -1433,6 +1434,9 @@ enter_worktree_for_project() {
   if $DRY_RUN; then
     WORKTREE_DECISION="would create+enter $dest (branch $branch)"
     return 0
+  fi
+  if declare -f token_os_preflight_free_space >/dev/null 2>&1; then
+    token_os_preflight_free_space "$parent" "dispatch worktree isolation for ${proj}/${branch}" || exit $?
   fi
   if worktree-setup "$branch" --project "$proj" --no-transplant --require-free --skip-sync >&2; then
     if [[ -n "$rel" && -d "$wt_path/$rel" ]]; then
