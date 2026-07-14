@@ -209,6 +209,7 @@ def main(argv: list[str]) -> int:
     blocked = sum(1 for r in resolved if _is_blocked(r))
     pending = sum(1 for r in resolved if r.get("status") == "pending" and not _is_blocked(r))
     unverified = sum(1 for r in resolved if r.get("status") == "unverified")
+    unknown = sum(1 for r in resolved if r.get("status") == "delivery_unknown")
     turn_pending = sum(
         1 for r in resolved if r.get("status") == "sent" and r.get("turn") == "pending"
     )
@@ -225,6 +226,10 @@ def main(argv: list[str]) -> int:
         suffix_parts.append(f"{blocked} blocked — not delivered")
     if unverified:
         suffix_parts.append(f"{unverified} unverified — bytes may have issued, no target turn proven")
+    if unknown:
+        suffix_parts.append(
+            f"{unknown} delivery-unknown — transport severed; daemon owns the outcome, do not blind-retry"
+        )
     if turn_pending:
         suffix_parts.append(f"{turn_pending} turn pending — hook echo will follow on ack")
     suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
@@ -242,6 +247,12 @@ def main(argv: list[str]) -> int:
             _err(
                 f"  {label}: unverified ({r.get('reason') or 'no submit ack'}) — "
                 "bytes may have issued; do not blind-retry"
+            )
+        elif st == "delivery_unknown":
+            corr = r.get("correlation_id") or r.get("operation_id") or "?"
+            _err(
+                f"  {label}: delivery unknown ({r.get('reason') or 'transport severed'}) — "
+                f"daemon owns the outcome; reconcile via correlation={corr}, do not blind-retry"
             )
         else:
             detail = r.get("reason") or r.get("error") or r.get("stderr") or ""
