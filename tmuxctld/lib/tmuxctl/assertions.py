@@ -1662,7 +1662,11 @@ def sweep_persona_panes(
 
 
 def assert_reservist_seat(
-    adapter: TmuxAdapter, target: str, *, session: str | None = None
+    adapter: TmuxAdapter,
+    target: str,
+    *,
+    session: str | None = None,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
 ) -> dict[str, Any]:
     """Fill a vacant reservist heartbeat seat with a standby agent (idempotent).
 
@@ -1679,11 +1683,17 @@ def assert_reservist_seat(
 
     reservist_spec(target)  # validate the label before touching tmux
     with preserve_focus(adapter, source="tmuxctl assert-reservist", attempted_target=target):
-        return _assert_reservist_seat_impl(adapter, target, session=session)
+        return _assert_reservist_seat_impl(
+            adapter, target, session=session, process_tree=process_tree
+        )
 
 
 def _assert_reservist_seat_impl(
-    adapter: TmuxAdapter, target: str, *, session: str | None = None
+    adapter: TmuxAdapter,
+    target: str,
+    *,
+    session: str | None = None,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
 ) -> dict[str, Any]:
     spec = reservist_spec(target)
     try:
@@ -1704,7 +1714,12 @@ def _assert_reservist_seat_impl(
     pane_type = _pane_type(adapter, pane_id)
     result = _base_result(pane_id, pane_label, pane_type, None)
 
-    if _runtime_has_instance(adapter, pane_id):
+    live = _runtime_has_instance(adapter, pane_id, process_tree=process_tree)
+    if not live and process_tree is not None:
+        # Sweep-shared snapshot said vacant — the vacant path stops rows and
+        # respawns the seat, so the verdict must be re-read fresh before acting.
+        live = _runtime_has_instance(adapter, pane_id)
+    if live:
         result.update({"ok": True, "action": "none", "reason": "live"})
         return result
 
@@ -1738,9 +1753,14 @@ def sweep_reservist_panes(
     the sweep.
     """
     results: list[dict[str, Any]] = []
+    # One process snapshot for the sweep's read-only liveness verdicts (same
+    # rationale as sweep_persona_panes); vacant verdicts re-read fresh inside.
+    process_tree = process_tree_snapshot()
     for label in RESERVIST_LABELS:
         try:
-            results.append(assert_reservist_seat(adapter, label, session=session))
+            results.append(
+                assert_reservist_seat(adapter, label, session=session, process_tree=process_tree)
+            )
         except Exception as exc:  # noqa: BLE001 — one bad pane must not stop the sweep
             results.append(
                 {"ok": False, "pane_label": label, "action": "error", "reason": str(exc)}

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .custodes import active_agent_in_pane
+from .custodes import active_agent_in_pane, process_tree_snapshot
 from .tmux_adapter import TmuxAdapter
 
 
@@ -63,10 +63,14 @@ def read_pane_pid(adapter: TmuxAdapter, pane_id: str) -> int | None:
         return None
 
 
-def detect_pane_tui(adapter: TmuxAdapter, pane_id: str) -> LiveTui:
+def detect_pane_tui(
+    adapter: TmuxAdapter,
+    pane_id: str,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+) -> LiveTui:
     """Walk one pane's process subtree for a live Claude/Codex TUI."""
     pane_pid = read_pane_pid(adapter, pane_id)
-    agent = active_agent_in_pane(pane_pid)
+    agent = active_agent_in_pane(pane_pid, process_tree=process_tree)
     if agent is None:
         return LiveTui(pane_id=pane_id, pane_pid=pane_pid, agent_pid=None, agent_command=None)
     agent_pid, command = agent
@@ -115,14 +119,19 @@ def instance_live_tui(adapter: TmuxAdapter, instance_id: str, resolved_pane: str
     instance (so the guard refuses), or None when the instance is a genuinely
     reapable husk (no resolved-pane agent and no stamped live pane).
     """
+    # One snapshot for the resolved-pane check plus the divergence sweep: the
+    # stamped-pane loop forked a fresh `ps -A` per pane, multiplying the scan
+    # cost that starved the daemon. Freshness is unchanged in practice — the
+    # verdict was always as old as the first walk by the time it was returned.
+    process_tree = process_tree_snapshot()
     if resolved_pane:
-        tui = detect_pane_tui(adapter, resolved_pane)
+        tui = detect_pane_tui(adapter, resolved_pane, process_tree=process_tree)
         if tui.live:
             return tui
     for pane_id, pid in _stamped_panes(adapter, instance_id):
         if resolved_pane and pane_id == resolved_pane:
             continue
-        agent = active_agent_in_pane(pid)
+        agent = active_agent_in_pane(pid, process_tree=process_tree)
         if agent is not None:
             agent_pid, command = agent
             return LiveTui(
