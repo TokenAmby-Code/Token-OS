@@ -159,6 +159,7 @@ export class RealTmux implements TmuxControlPlane {
 export class FakeTmux implements TmuxControlPlane {
   private seats = new Map<string, { pane: 'live' | 'dead' }>();
   private present = new Map<string, number>(); // seat -> last activity epoch ms
+  private failCreate = new Set<string>(); // seats whose createSeat is forced to throw
   reachableFlag = true;
 
   async reachable(): Promise<boolean> {
@@ -171,7 +172,14 @@ export class FakeTmux implements TmuxControlPlane {
     return [...this.seats].map(([seat_id, s]) => ({ seat_id, pane: s.pane }));
   }
   async createSeat(seatId: string): Promise<void> {
+    // Test control: a configured seat throws (simulates a below-membrane tmux
+    // failure), exercising the constructor's per-seat isolation.
+    if (this.failCreate.has(seatId)) throw new Error(`FakeTmux: forced createSeat failure for ${seatId}`);
     this.seats.set(seatId, { pane: 'live' });
+  }
+  /** Test control: force createSeat(seatId) to throw. */
+  failCreateSeat(seatId: string): void {
+    this.failCreate.add(seatId);
   }
   async killSeat(seatId: string): Promise<void> {
     const s = this.seats.get(seatId);

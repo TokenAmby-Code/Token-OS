@@ -38,14 +38,17 @@ console.log(
 // best-effort: constructEstate swallows per-seat errors internally, so this can
 // never crash boot — a partial estate is logged, not fatal.
 const est = await daemon.constructEstate();
-console.log(
+// Structured logs go to stderr here as elsewhere in the daemon (core.ts).
+console.error(
   JSON.stringify({
     level: 'info',
     event: 'estate_constructed',
     created: est.created.length,
     existing: est.existing.length,
+    backfilled: est.backfilled.length,
     failed: est.failed.length,
     created_seats: est.created,
+    backfilled_seats: est.backfilled,
   }),
 );
 

@@ -135,35 +135,60 @@ export class Daemon {
   // Stands the canonical persistent estate (src/estate.ts) declaratively. NOT an
   // endpoint or CLI — the seed vocab/endpoint set is closed; this is a boot
   // ensure. Runs under the single-writer mutex so it can't interleave with a
-  // concurrent launch/send. Idempotent: a re-run over a fully-present estate
-  // creates nothing and appends zero events. Each fresh seat records ONE bare
-  // `reg.pane_created` (unbound) — it lands in freelist + activity_board and
+  // concurrent launch/send. Idempotent: a re-run over a fully-present-and-attested
+  // estate creates nothing and appends zero events. Each fresh seat records ONE
+  // bare `reg.pane_created` (unbound) — it lands in freelist + activity_board and
   // triggers NO contradiction (reconcile only flags bound-dead / retired-live).
-  constructEstate(): Promise<{ created: string[]; existing: string[]; failed: string[] }> {
+  //
+  // Buckets: `created` = pane made + event written this run; `backfilled` = pane
+  // already there but its event was missing (repaired, no new pane); `existing` =
+  // present AND attested (skipped); `failed` = a seat that threw (logged, others
+  // continue). Truth is the stream, so a pane with no `reg.pane_created` is
+  // invisible to every projection — backfill closes that gap.
+  constructEstate(): Promise<{ created: string[]; existing: string[]; backfilled: string[]; failed: string[] }> {
     return this.locked(async () => {
       // Live OR dead counts as present — a dead seat's session still exists, so
-      // createSeat would throw on a duplicate session name. Skip it either way.
+      // createSeat would throw on a duplicate session name. Skip creation either
+      // way; attestation is tracked separately below.
       const present = new Set((await this.tmux.listSeats()).map((o) => o.seat_id));
+      // Seats that already carry a `reg.pane_created` fact. A prior boot could
+      // have torn (createSeat committed, its append did not) — the pane persists
+      // but the fact was lost. Presence WITHOUT attestation is that torn state.
+      const attested = new Set(
+        this.store.readAll().filter((e) => e.event_type === 'reg.pane_created').map((e) => e.entity_id),
+      );
       const created: string[] = [];
       const existing: string[] = [];
+      const backfilled: string[] = [];
       const failed: string[] = [];
 
+      const recordCreated = (seat: string): void => {
+        this.store.append({
+          entity_type: 'seat',
+          entity_id: seat,
+          event_type: 'reg.pane_created',
+          payload: { pane_state: 'live' },
+          provenance: this.prov('observer', null),
+          occurred_at: this.now(),
+        });
+      };
+
       for (const seat of K12_ESTATE) {
-        if (present.has(seat)) {
-          existing.push(seat);
-          continue;
-        }
         try {
-          await this.tmux.createSeat(seat);
-          this.store.append({
-            entity_type: 'seat',
-            entity_id: seat,
-            event_type: 'reg.pane_created',
-            payload: { pane_state: 'live' },
-            provenance: this.prov('observer', null),
-            occurred_at: this.now(),
-          });
-          created.push(seat);
+          if (present.has(seat)) {
+            if (attested.has(seat)) {
+              existing.push(seat); // present AND attested — nothing to do
+            } else {
+              // Repair the torn state: backfill the lost fact. No second tmux
+              // session is spawned, so idempotency and the pane both hold.
+              recordCreated(seat);
+              backfilled.push(seat);
+            }
+          } else {
+            await this.tmux.createSeat(seat);
+            recordCreated(seat);
+            created.push(seat);
+          }
         } catch (err) {
           // A single seat failing must not sink the estate or crash boot — health
           // stays up. Fail loud, then carry on to the next seat.
@@ -174,7 +199,7 @@ export class Daemon {
         }
       }
 
-      return { created, existing, failed };
+      return { created, existing, backfilled, failed };
     });
   }
 
