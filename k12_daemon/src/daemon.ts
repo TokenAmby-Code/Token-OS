@@ -6,10 +6,13 @@ import { EventStore } from './store.ts';
 import { RealTmux } from './tmux.ts';
 import { Daemon } from './core.ts';
 import { makeServer, type BuildInfo } from './server.ts';
+import { resolveGitSha } from './build.ts';
 
 const build: BuildInfo = {
   version: '0.1.0',
-  git_sha: process.env.GIT_SHA ?? 'unknown',
+  // Resolved from the checkout this file was loaded from (src/ → package dir);
+  // rev-parse walks up to the repo root, so the daemon subdir is sufficient.
+  git_sha: resolveGitSha(new URL('..', import.meta.url).pathname),
   bun: Bun.version,
 };
 
