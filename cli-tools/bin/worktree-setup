@@ -25,6 +25,7 @@ source "${_LIB_DIR}/nas-path.sh" 2>/dev/null || true
 [[ -n "$_CALLER_IMPERIUM" ]] && export IMPERIUM="$_CALLER_IMPERIUM"
 source "${_LIB_DIR}/git-remote.sh" 2>/dev/null || true
 source "${_LIB_DIR}/worktree-ports.sh" 2>/dev/null || true
+source "${_LIB_DIR}/disk-preflight.sh" 2>/dev/null || true
 
 # Ensure Homebrew is on PATH (Apple Silicon Macs, non-interactive shells)
 [[ -d /opt/homebrew/bin ]] && export PATH="/opt/homebrew/bin:$PATH"
@@ -236,7 +237,6 @@ load_config() {
         log_error "Secrets dir not found: $SECRETS_DIR (is NAS mounted?)"
         exit 1
     fi
-    mkdir -p "$WORKTREE_PARENT"
 }
 
 print_init_template() {
@@ -365,6 +365,12 @@ if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "master" ]]; then
 fi
 
 WORKTREE_DIR="$WORKTREE_PARENT/wt-$BRANCH_NAME"
+
+# Fail loudly before any worktree/setup mutation when the target volume is low on space.
+if declare -f token_os_preflight_free_space >/dev/null 2>&1; then
+    token_os_preflight_free_space "$WORKTREE_PARENT" "worktree setup for ${PROJECT}/${BRANCH_NAME}" || exit $?
+fi
+mkdir -p "$WORKTREE_PARENT"
 
 # Resume: an interrupted setup (SIGKILL mid-sync, dropped SSH) leaves a real
 # worktree with some later steps missing (secrets, port, hooks, venvs). With
