@@ -19509,6 +19509,45 @@ _cd_last_restart_spawn = 0.0  # time.monotonic() of the last token-restart spawn
 _cd_last_restart_sha: str | None = None  # sha of that spawn (coalesce only true dupes)
 _CD_COALESCE_WINDOW_S = 15.0
 
+# Durable deploy record — the fast-path convergence oracle for potentially-OFF
+# nodes (WSL/mobile) that miss the merge-time push and converge on their own boot
+# (device-doctrine ruling #9; see docs/cd-offline-node-propagation.md). cd_restart
+# persists the last deploy it was told to ship here; GET /api/cd/current serves it
+# tokenless. Runtime-writable and survives a hub restart (unlike the in-memory
+# _cd_last_restart_sha). GitHub `main` tip remains the canonical record — this is
+# the cheap "am I stale?" answer plus pr_url/timestamp metadata, backstopped by a
+# converging node's git ls-remote fallback when the hub is also down.
+_CD_DEPLOY_RECORD_PATH = Path.home() / ".claude" / "cd-deploy-record.json"
+
+
+def _cd_save_deploy_record(sha: str, pr_url: str | None) -> None:
+    """Persist the current deploy so off nodes can converge to it on boot."""
+    record = {
+        "sha": sha,
+        "pr_url": pr_url or None,
+        "deployed_at": datetime.now().isoformat(),
+    }
+    tmp = _CD_DEPLOY_RECORD_PATH.with_suffix(".json.tmp")
+    try:
+        _CD_DEPLOY_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(record))
+        tmp.replace(_CD_DEPLOY_RECORD_PATH)  # atomic swap; no torn read by a converging node
+    except Exception as e:
+        # Best-effort: a record write failure must never block the deploy. The
+        # GitHub-main fallback still lets nodes converge.
+        logger.warning("CD: deploy-record write failed (continuing): %s", e)
+        tmp.unlink(missing_ok=True)
+
+
+def _cd_load_deploy_record() -> dict | None:
+    try:
+        return json.loads(_CD_DEPLOY_RECORD_PATH.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning("CD: deploy-record read failed: %s", e)
+        return None
+
 
 def _cd_spawn_detached(cmd: list[str], *, log_name: str) -> None:
     """Fire-and-forget a detached child that survives our own restart."""
@@ -19634,6 +19673,13 @@ async def cd_restart(request: Request):
     # the pre-git-aware workflow body.
     services = body.get("services")
 
+    # Cache the deploy record so potentially-OFF nodes (WSL/mobile) that miss this
+    # push can converge to it on their own boot (ruling #9). Written on every host
+    # that receives the webhook — the always-on hub's copy is what off nodes query
+    # via GET /api/cd/current. Best-effort; never blocks the deploy.
+    if isinstance(sha, str) and sha.strip():
+        _cd_save_deploy_record(sha.strip(), pr_url if isinstance(pr_url, str) else None)
+
     # Flip the merged PR's originating instance badge (Phase 1 → merged).
     # Mac-canonical: box legs of the CD fan-out skip merge side effects.
     merged_flips = 0
@@ -19733,6 +19779,34 @@ async def cd_restart(request: Request):
         "administratum_delivery": administratum_delivery,
         "administratum_delivery_claimed": administratum_delivery_claimed,
         "administratum_dedupe_key": administratum_dedupe_key,
+    }
+
+
+@app.get("/api/cd/current")
+async def cd_current():
+    """Current deploy record — the convergence oracle for potentially-OFF nodes.
+
+    Tokenless read (same posture as /health): a node coming online GETs this to
+    learn the SHA it should be serving, compares to its own /health git_sha, and
+    self-deploys if stale (ruling #9; docs/cd-offline-node-propagation.md). Serves
+    the durable record cd_restart persisted; if no deploy has been recorded yet
+    (fresh hub), falls back to this process's own LAUNCHED_GIT_SHA so the answer is
+    always truthful about what the fleet is serving. GitHub `main` tip remains the
+    canonical record and a converging node's fallback when this hub is unreachable.
+    """
+    record = _cd_load_deploy_record()
+    if record and record.get("sha"):
+        return {
+            "sha": record.get("sha"),
+            "pr_url": record.get("pr_url"),
+            "deployed_at": record.get("deployed_at"),
+            "source": "record",
+        }
+    return {
+        "sha": LAUNCHED_GIT_SHA,
+        "pr_url": None,
+        "deployed_at": None,
+        "source": "launched",
     }
 
 

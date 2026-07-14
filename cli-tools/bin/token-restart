@@ -138,11 +138,14 @@ Smart-deploy flow (default):
          token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
          token-api/{ui,web}/ops/**                  → token-api + reload ops tabs
          discord-daemon/**                          → Discord daemon (launchd)
-         every advanced deploy                         → WSL /runtime/refresh + /health.git_sha verify
          mobile/**                                    → push-mobile -a (phone)
+       WSL is a potentially-OFF node (device-doctrine ruling #9): the Mac
+       deploy no longer pushes to it. WSL converges to the deployed SHA on its
+       own boot/reconnect (event-driven, verified by /health.git_sha parity).
     2. If the pull was a no-op (already current) or --no-sync: full restart of
        the standard set (Mac token-api → Discord → WSL), preserving the human
-       "restart my stuff now" workflow.
+       "restart my stuff now" workflow. The WSL leg here is the operator
+       convenience path, not a deploy push.
     3. Health-check what was restarted, print summary.
 
 Notes:
@@ -150,7 +153,8 @@ Notes:
       A dirty runtime NEVER blocks deploy: stray WIP is auto-committed to a
       timestamped wip/live-dirty-<ts> branch and pushed to the bare cache, then
       the tree is reset onto the target SHA. The WIP is recoverable from there.
-    - WSL runtime refresh in smart deploy is blocking and verified by /health.git_sha
+    - Smart deploy does NOT push to WSL: it is a potentially-OFF node that
+      converges to the deployed SHA on its own boot (ruling #9)
     - Manual non-refresh WSL restarts remain backgrounded when appropriate
     - WSL satellite self-restarts via systemd (Restart=always)
     - Mac server managed by launchd (ai.openclaw.tokenapi)
@@ -1814,12 +1818,6 @@ map_changed_to_services() {
                 # routes to the daemon restart only — no WSL refresh.
                 RESTART_TMUXCTLD=true
                 ;;
-            token-api/token-satellite.py | token-api/scripts/token-satellite-refresh | ahk/* | cli-tools/bin/dispatch | cli-tools/lib/* | config/deskflow/*)
-                # WSL-hosted runtime dependencies. Push the target SHA into the
-                # WSL-local runtime/AHK cache instead of merely restarting NAS code.
-                RESTART_WSL=true
-                REFRESH_WSL=true
-                ;;
             token-api/ui/ops/* | token-api/web/ops/*)
                 # Ops cockpit is served by token-api; a restart bumps the build-id
                 # so connected browsers reload, and we also refresh open tabs.
@@ -1828,8 +1826,6 @@ map_changed_to_services() {
                 ;;
             token-api/uv.lock | token-api/pyproject.toml)
                 RESTART_TOKENAPI=true
-                RESTART_WSL=true
-                REFRESH_WSL=true
                 ;;
             token-api/*.py)
                 RESTART_TOKENAPI=true
@@ -1915,8 +1911,6 @@ full_restart() {
         map_changed_to_services
         source_tmux_config_if_changed || return 1
         RESTART_TOKENAPI=true
-        RESTART_WSL=true
-        REFRESH_WSL=true
         if [[ "$RESTART_TOKENAPI" != true && "$RESTART_DISCORD" != true \
             && "$RESTART_WSL" != true && "$RESTART_MOBILE" != true \
             && "$RESTART_TMUXCTLD" != true ]]; then

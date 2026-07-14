@@ -2160,6 +2160,10 @@ async def startup_event():
     deskflow_watchdog.start()
     # Announce to Mac in background thread (non-blocking, non-fatal)
     threading.Thread(target=_announce_to_mac, daemon=True).start()
+    # Converge to the current deploy on boot: WSL may have been OFF at merge time,
+    # so it pulls the deploy record now instead of relying on a merge-time push
+    # (ruling #9; docs/cd-offline-node-propagation.md). Idempotent + non-fatal.
+    threading.Thread(target=_cd_converge_on_boot, daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -2904,6 +2908,207 @@ async def golden_throne_followup(req: GoldenThroneFollowupRequest):
     return {"success": True, "transport": transport, "session_id": req.session_id}
 
 
+# ============ CD convergence (potentially-OFF node) ============
+# Ruling #9: WSL retires its deploy-node duty; the merge-time push no longer
+# targets it (see cli-tools/bin/token-restart). Instead the satellite converges to
+# the current deploy on its OWN boot/reconnect — it may be OFF at merge time, so a
+# push would silently miss. Design: docs/cd-offline-node-propagation.md.
+
+# CD bare cache + git url mirror token-satellite-refresh's resolution so overrides
+# stay consistent. The satellite runs from the live checkout (REPO_ROOT); the CD
+# bare cache sits beside it (base/token-os.git).
+_CD_BARE = Path(os.environ.get("TOKEN_OS_CD_BARE_REPO") or (REPO_ROOT.parent / "token-os.git"))
+
+
+def _cd_hub_base() -> str:
+    """Resolve the always-on hub's Token-API base URL — never hardcoded.
+
+    $TOKEN_API_URL wins; else the machine registry (imperium_config), which maps
+    this box to the current hub and migrates Mac→k12-personal at cutover with no
+    code change. MAC_API_BASE is the last-resort fallback (pre-existing hub const).
+    """
+    url = os.environ.get("TOKEN_API_URL", "").strip()
+    if url:
+        return url.rstrip("/")
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "cli-tools" / "lib"))
+        import imperium_config
+
+        cfg_url = imperium_config.cfg("token_api_url")
+        if cfg_url:
+            return cfg_url.rstrip("/")
+    except Exception as e:
+        logger.warning("CD converge: imperium_config hub lookup failed: %s", e)
+    return MAC_API_BASE
+
+
+def _cd_git(args: list[str], *, git_dir: Path | None = None, timeout: int = 30) -> str | None:
+    """Run a git command, returning trimmed stdout or None on failure."""
+    cmd = ["git"]
+    if git_dir is not None:
+        cmd += ["--git-dir", str(git_dir)]
+    cmd += args
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    except Exception as e:
+        logger.warning("CD converge: git %s failed: %s", " ".join(args), e)
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _cd_bare_main_tip() -> str | None:
+    """GitHub `main` tip via the box-local bare cache — the canonical deploy record.
+
+    Fetches origin main into the bare (ff-only refspec; divergence fails loud), then
+    reads the ref. This is the durable fallback when the hub oracle is unreachable
+    (e.g. the hub is also off), since GitHub is the sole code SoT.
+    """
+    if not _CD_BARE.is_dir():
+        return None
+    _cd_git(["fetch", "--tags", "origin", "+refs/heads/main:refs/heads/main"], git_dir=_CD_BARE)
+    return _cd_git(["rev-parse", "refs/heads/main"], git_dir=_CD_BARE)
+
+
+def _cd_resolve_target() -> tuple[str | None, str]:
+    """Resolve the SHA this node should be serving, with its source.
+
+    Prefer the hub deploy-record oracle (one cheap GET); fall back to the GitHub
+    `main` tip via the bare cache so a node converges even when the hub is also
+    down.
+    """
+    hub = _cd_hub_base()
+    try:
+        resp = http_requests.get(f"{hub}/api/cd/current", timeout=5)
+        if resp.ok:
+            sha = (resp.json() or {}).get("sha")
+            if isinstance(sha, str) and re.fullmatch(r"[0-9A-Fa-f]{7,64}", sha):
+                return sha, "hub"
+    except Exception as e:
+        logger.info("CD converge: hub oracle unreachable (%s); falling back to GitHub", e)
+    tip = _cd_bare_main_tip()
+    if tip and re.fullmatch(r"[0-9A-Fa-f]{7,64}", tip):
+        return tip, "github"
+    return None, "unresolved"
+
+
+def _cd_changed_paths(current: str | None, target: str) -> list[str]:
+    """Changed paths current..target, computed the way a pusher's manifest would be.
+
+    Ensures the bare cache holds `target` (fetch main + the sha), then diffs. On any
+    failure, force a conservative full refresh (venv + AHK) so a dep/AHK change is
+    never silently skipped when the precise set can't be computed.
+    """
+    force_full = ["token-api/uv.lock", "ahk/force-refresh"]
+    if not current:
+        return force_full
+    _cd_bare_main_tip()  # idempotent: ensure the bare has main history
+    if not _cd_git(["cat-file", "-e", f"{target}^{{commit}}"], git_dir=_CD_BARE):
+        _cd_git(["fetch", "origin", target], git_dir=_CD_BARE)
+    diff = _cd_git(["diff", "--name-only", current, target], git_dir=_CD_BARE)
+    if diff is None:
+        return force_full
+    return [p for p in diff.splitlines() if p.strip()]
+
+
+def _spawn_runtime_refresh(sha: str, changed_paths: list[str]) -> str:
+    """Spawn the box-local git-aware runtime refresh helper detached.
+
+    Shared by the authenticated /runtime/refresh push and the boot-driven
+    convergence pull. Returns the manifest path. Raises FileNotFoundError if the
+    helper is not installed (callers translate).
+    """
+    if not RUNTIME_REFRESH_HELPER.exists():
+        raise FileNotFoundError(f"refresh helper not found: {RUNTIME_REFRESH_HELPER}")
+    manifest = {
+        "sha": sha,
+        "changed_paths": [p for p in changed_paths if isinstance(p, str) and p],
+        "requested_at": datetime.now().isoformat(),
+    }
+    handle = tempfile.NamedTemporaryFile(
+        "w", prefix="token-runtime-refresh-", suffix=".json", delete=False, encoding="utf-8"
+    )
+    try:
+        json.dump(manifest, handle)
+        handle.write("\n")
+        manifest_path = handle.name
+    finally:
+        handle.close()
+
+    log_handle = Path("/tmp/token-satellite-refresh.log").open("a", encoding="utf-8")
+    try:
+        subprocess.Popen(
+            [str(RUNTIME_REFRESH_HELPER), sha, manifest_path],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_handle.close()
+    return manifest_path
+
+
+def _cd_converge() -> dict:
+    """One idempotent convergence check — no loop, no timeout, no debounce.
+
+    Resolve the target (hub oracle → GitHub), compare to this node's live runtime
+    SHA, and if stale run the box-local git-aware deploy (which restarts the
+    satellite). Verification lands on the next boot's check (already_current) and
+    externally via /health.git_sha parity. Safe to call repeatedly: a current
+    runtime never spawns a refresh, and the helper holds a flock.
+    """
+    current = _runtime_git_sha()
+    target, source = _cd_resolve_target()
+    result = {"node": "wsl", "was": current, "target": target, "source": source}
+    if not target:
+        logger.warning("CD converge: could not resolve a target SHA (hub + GitHub both failed)")
+        return {**result, "converged": False, "action": "no_target"}
+    if target == current:
+        logger.info("CD converge: already current at %s (source=%s)", target[:9], source)
+        return {**result, "converged": True, "action": "already_current"}
+
+    changed = _cd_changed_paths(current, target)
+    logger.info(
+        "CD converge: stale (was=%s target=%s source=%s) — scheduling refresh, %d changed paths",
+        (current or "unknown")[:9],
+        target[:9],
+        source,
+        len(changed),
+    )
+    try:
+        _spawn_runtime_refresh(target, changed)
+    except FileNotFoundError as e:
+        logger.error("CD converge: %s", e)
+        return {**result, "converged": False, "action": "helper_missing"}
+    return {**result, "converged": False, "action": "refresh_scheduled", "changed_paths": changed}
+
+
+def _cd_converge_on_boot():
+    """Background boot trigger: converge to the current deploy once at startup."""
+    time.sleep(4)  # let the server bind + _announce_to_mac settle first
+    try:
+        outcome = _cd_converge()
+        logger.info("CD converge (boot): %s", outcome)
+    except Exception as e:
+        logger.warning("CD converge (boot) failed: %s", e)
+
+
+@app.post("/cd/converge")
+async def cd_converge():
+    """Converge this node to the current deploy record (boot/reconnect trigger).
+
+    Endpoint-first surface for the pull-convergence lane (ruling #9). Unauthenticated
+    like /restart: the target SHA is derived only from trusted sources (the hub
+    deploy record / GitHub main), never from the request, so this cannot be steered
+    to an attacker sha. Triggered on the satellite's own boot event and available to
+    a tailnet-reconnect hook or a manual operator poke.
+    """
+    return _cd_converge()
+
+
 @app.post("/runtime/refresh")
 async def runtime_refresh(req: RuntimeRefreshRequest, request: Request):
     """Refresh WSL-local Token-OS runtime and AHK cache to an authenticated SHA."""
@@ -2921,43 +3126,14 @@ async def runtime_refresh(req: RuntimeRefreshRequest, request: Request):
     sha = req.sha.strip()
     if not re.fullmatch(r"[0-9A-Fa-f]{7,64}", sha):
         raise HTTPException(status_code=400, detail="sha must be a git commit hash")
-    if not RUNTIME_REFRESH_HELPER.exists():
-        raise HTTPException(
-            status_code=503, detail=f"refresh helper not found: {RUNTIME_REFRESH_HELPER}"
-        )
 
-    manifest = {
-        "sha": sha,
-        "changed_paths": [p for p in req.changed_paths if isinstance(p, str) and p],
-        "requested_at": datetime.now().isoformat(),
-    }
-    handle = tempfile.NamedTemporaryFile(
-        "w", prefix="token-runtime-refresh-", suffix=".json", delete=False, encoding="utf-8"
-    )
+    changed = [p for p in req.changed_paths if isinstance(p, str) and p]
     try:
-        json.dump(manifest, handle)
-        handle.write("\n")
-        manifest_path = handle.name
-    finally:
-        handle.close()
+        manifest_path = _spawn_runtime_refresh(sha, changed)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
-    log_path = Path("/tmp/token-satellite-refresh.log")
-    log_handle = log_path.open("a", encoding="utf-8")
-    try:
-        subprocess.Popen(
-            [str(RUNTIME_REFRESH_HELPER), sha, manifest_path],
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=log_handle,
-            start_new_session=True,
-            close_fds=True,
-        )
-    finally:
-        log_handle.close()
-
-    logger.info(
-        "runtime refresh scheduled: sha=%s paths=%d", sha[:9], len(manifest["changed_paths"])
-    )
+    logger.info("runtime refresh scheduled: sha=%s paths=%d", sha[:9], len(changed))
     return {"ok": True, "refresh": "scheduled", "sha": sha, "manifest": manifest_path}
 
 
