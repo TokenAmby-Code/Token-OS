@@ -124,7 +124,7 @@ def test_runtime_has_instance_uses_injected_tree() -> None:
 
 def test_live_sweeps_fast_path_avoid_per_label_asserts() -> None:
     class Registry:
-        instances = []
+        instances: list[object] = []
 
     panes = {
         label: {
