@@ -30,12 +30,15 @@ def test_sweep_persona_panes_single_snapshot() -> None:
 
     original_snapshot = assertions.process_tree_snapshot
     original_assert = assertions.assert_instance
+    original_panes = assertions._sweep_pane_snapshot
     try:
         assertions.process_tree_snapshot = fake_snapshot
+        assertions._sweep_pane_snapshot = lambda adapter, session=None: {}
         assertions.assert_instance = fake_assert_instance
         results = assertions.sweep_persona_panes(object(), session="main")
     finally:
         assertions.process_tree_snapshot = original_snapshot
+        assertions._sweep_pane_snapshot = original_panes
         assertions.assert_instance = original_assert
 
     assert snapshots == 1, f"expected one process snapshot, got {snapshots}"
@@ -58,12 +61,15 @@ def test_sweep_reservist_panes_single_snapshot() -> None:
 
     original_snapshot = assertions.process_tree_snapshot
     original_assert = assertions.assert_reservist_seat
+    original_panes = assertions._sweep_pane_snapshot
     try:
         assertions.process_tree_snapshot = fake_snapshot
+        assertions._sweep_pane_snapshot = lambda adapter, session=None: {}
         assertions.assert_reservist_seat = fake_assert_reservist
         results = assertions.sweep_reservist_panes(object(), session="main")
     finally:
         assertions.process_tree_snapshot = original_snapshot
+        assertions._sweep_pane_snapshot = original_panes
         assertions.assert_reservist_seat = original_assert
 
     assert snapshots == 1, f"expected one process snapshot, got {snapshots}"
@@ -116,11 +122,74 @@ def test_runtime_has_instance_uses_injected_tree() -> None:
     assert live is True
 
 
+def test_live_sweeps_fast_path_avoid_per_label_asserts() -> None:
+    class Registry:
+        instances = []
+
+    panes = {
+        label: {
+            "session": "main",
+            "pane": f"%{idx}",
+            "dead": "0",
+            "pid": str(1000 + idx),
+            "pane_label": label,
+            "pane_type": label.split(":", 1)[0],
+            "instance_id": "",
+            "persona": "Bound",
+        }
+        for idx, label in enumerate(sorted(assertions.PERSONA_LABELS), 1)
+    }
+    for idx, label in enumerate(assertions.RESERVIST_LABELS, 100):
+        panes[label] = {
+            "session": "main",
+            "pane": f"%{idx}",
+            "dead": "0",
+            "pid": str(1000 + idx),
+            "pane_label": label,
+            "pane_type": "reservists",
+            "instance_id": "",
+            "persona": "",
+        }
+    tree = (
+        {int(p["pid"]): [int(p["pid"]) + 10000] for p in panes.values()},
+        {int(p["pid"]) + 10000: "claude" for p in panes.values()},
+    )
+
+    def fail_assert(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("fast path should not call per-label assertion")
+
+    original_snapshot = assertions.process_tree_snapshot
+    original_panes = assertions._sweep_pane_snapshot
+    original_registry = assertions.fetch_instance_registry
+    original_assert_instance = assertions.assert_instance
+    original_assert_reservist = assertions.assert_reservist_seat
+    try:
+        assertions.process_tree_snapshot = lambda: tree
+        assertions._sweep_pane_snapshot = lambda adapter, session=None: panes
+        assertions.fetch_instance_registry = lambda: Registry()
+        assertions.assert_instance = fail_assert
+        assertions.assert_reservist_seat = fail_assert
+        persona_results = assertions.sweep_persona_panes(object(), session="main")
+        reservist_results = assertions.sweep_reservist_panes(object(), session="main")
+    finally:
+        assertions.process_tree_snapshot = original_snapshot
+        assertions._sweep_pane_snapshot = original_panes
+        assertions.fetch_instance_registry = original_registry
+        assertions.assert_instance = original_assert_instance
+        assertions.assert_reservist_seat = original_assert_reservist
+
+    assert len(persona_results) == len(assertions.PERSONA_LABELS)
+    assert all(r["ok"] and r["reason"] == "live_registry_skipped" for r in persona_results)
+    assert len(reservist_results) == len(assertions.RESERVIST_LABELS)
+    assert all(r["ok"] and r["reason"] == "live" for r in reservist_results)
+
+
 def main() -> None:
     test_sweep_persona_panes_single_snapshot()
     test_sweep_reservist_panes_single_snapshot()
     test_instance_live_tui_single_snapshot()
     test_runtime_has_instance_uses_injected_tree()
+    test_live_sweeps_fast_path_avoid_per_label_asserts()
 
 
 if __name__ == "__main__":
