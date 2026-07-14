@@ -444,6 +444,7 @@ class PromptSubmitSniffer:
             "caller_pane": caller_pane,
             "target_pane": str(item.get("target_pane") or "").strip(),
             "target_label": str(item.get("target_label") or "").strip(),
+            "target_public": str(item.get("target_public") or "").strip(),
             "instance_id": str(item.get("instance_id") or "").strip(),
             "payload_hash": str(item.get("payload_hash") or "").strip(),
             "since": since,
@@ -507,38 +508,51 @@ class PromptSubmitSniffer:
         return event
 
     @staticmethod
-    def _matches(
+    def _classify(
         event: dict,
         *,
         instance_id: str,
         pane: str = "",
         payload_hash: str,
         since: float,
-    ) -> bool:
+    ) -> str | None:
+        """Attribute ``event`` to a send and return a landing verdict.
+
+        Returns ``None`` when the event is not attributable to the send.
+        Otherwise the verdict reconciles the ack against the ACTUAL landing
+        pane the hook reported:
+
+        - ``"confirmed"``: the event's pane IS the pane the send targeted.
+        - ``"mismatch"``: both panes are known and DIFFER — the turn the ack
+          proves happened somewhere other than where the bytes were aimed
+          (misdelivery / resolve split-brain). Never a delivery confirmation.
+        - ``"unverified"``: the hook carried no pane, so instance identity is
+          the only correlator; the landing pane cannot be reconciled.
+
+        Attribution requires at least one strong correlator: matching
+        instance ids, or an exact landing-pane match. A pane match is
+        deliberately sufficient on its own — the send-time ledger
+        ``instance_id`` resolution is exactly the split-brain read this
+        reconciliation exists to distrust, so an ack from the true target
+        pane must not be discarded just because the ledger id disagrees.
+        """
         if event.get("at", 0) < since:
-            return False
+            return None
         event_instance_id = str(event.get("instance_id") or "").strip()
-        if instance_id:
-            if event_instance_id:
-                if event_instance_id != instance_id:
-                    return False
-            elif pane and event.get("pane") != pane:
-                # Some UserPromptSubmit hooks are pane+hash-only. When the send
-                # callback has an authoritative ledger instance_id but the hook
-                # omitted it, allow an exact target pane match to carry the
-                # event through to the payload-hash check below.
-                return False
-            elif not pane:
-                return False
-        elif pane and event.get("pane") != pane:
-            return False
+        event_pane = str(event.get("pane") or "").strip()
         event_hash = str(event.get("prompt_hash") or "").strip()
         # Prefer exact hash matching when the hook surface supplies it. Some
         # current Claude/Codex UserPromptSubmit payloads do not; in that case,
-        # same-instance-after-send is still a real submit acknowledgement.
+        # a strong correlator match is still a real submit acknowledgement.
         if event_hash and payload_hash and event_hash != payload_hash:
-            return False
-        return True
+            return None
+        instance_match = bool(instance_id) and event_instance_id == instance_id
+        pane_match = bool(pane) and bool(event_pane) and event_pane == pane
+        if not instance_match and not pane_match:
+            return None
+        if pane and event_pane:
+            return "confirmed" if event_pane == pane else "mismatch"
+        return "unverified"
 
     def wait(
         self,
@@ -547,21 +561,26 @@ class PromptSubmitSniffer:
         payload_hash: str,
         since: float,
         timeout: float,
+        pane: str = "",
     ) -> dict | None:
-        if not instance_id or timeout <= 0:
+        if (not instance_id and not pane) or timeout <= 0:
             return None
         deadline = time.monotonic() + timeout
         with self._cond:
             while True:
                 for event in reversed(self._events):
-                    if self._matches(
+                    verdict = self._classify(
                         event,
                         instance_id=instance_id,
-                        pane="",
+                        pane=pane,
                         payload_hash=payload_hash,
                         since=since,
-                    ):
-                        return dict(event)
+                    )
+                    # A "mismatch" event never acknowledges the send — the turn
+                    # happened in a different pane than the bytes targeted.
+                    # Keep waiting: a real ack from the target pane may follow.
+                    if verdict in ("confirmed", "unverified"):
+                        return {**event, "landing": verdict}
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
@@ -577,6 +596,7 @@ class PromptSubmitSniffer:
         payload_hash: str,
         since: float,
         target_label: str = "",
+        target_public: str = "",
     ) -> dict | None:
         correlation_id = str(correlation_id or "").strip()
         caller_pane = str(caller_pane or "").strip()
@@ -587,6 +607,10 @@ class PromptSubmitSniffer:
             "caller_pane": caller_pane,
             "target_pane": str(target_pane or "").strip(),
             "target_label": str(target_label or "").strip(),
+            # The send's own resolution of the target, carried forward so the
+            # late echo reports the SAME answer the delivery used instead of
+            # re-deriving (and failing open to "unresolved").
+            "target_public": str(target_public or "").strip(),
             "instance_id": str(instance_id or "").strip(),
             "payload_hash": str(payload_hash or "").strip(),
             "since": since,
@@ -611,16 +635,23 @@ class PromptSubmitSniffer:
                     self._callbacks.pop(correlation_id, None)
                     changed = True
                     continue
-                if not self._matches(
+                verdict = self._classify(
                     event,
                     instance_id=str(callback.get("instance_id") or ""),
                     pane=str(callback.get("target_pane") or ""),
                     payload_hash=str(callback.get("payload_hash") or ""),
                     since=float(callback.get("since") or 0),
-                ):
+                )
+                if verdict is None:
                     continue
+                # A mismatch still consumes the callback: firing an explicit
+                # landing-mismatch echo beats letting the callback rot to TTL
+                # and reporting nothing (the silent-drop failure mode).
                 callback["fired"] = True
-                matched.append(dict(callback))
+                fired = dict(callback)
+                fired["landing"] = verdict
+                fired["landing_pane"] = str(event.get("pane") or "").strip()
+                matched.append(fired)
                 self._callbacks.pop(correlation_id, None)
                 changed = True
             if changed:
@@ -1074,23 +1105,66 @@ def _activated_listen_fd() -> tuple[int, str] | None:
     return None
 
 
+def _resolve_echo_target(control, callback: dict) -> str:
+    """Resolve the echo's target display id, preferring the send's resolution.
+
+    ``_safe_public_role`` returns the literal string ``"unresolved"`` (truthy)
+    on failure, so a bare ``a or b`` chain over it never falls through — check
+    each candidate explicitly. The carried ``target_public`` / ``expected_role``
+    is the SAME answer the delivery used; only when nothing was carried do we
+    reverse-resolve the physical pane the bytes actually hit.
+    """
+    for key in ("target_public", "target_label"):
+        value = _safe_public_role(str(callback.get(key) or ""))
+        if value != "unresolved":
+            return value
+    phys = str(callback.get("target_pane") or "").strip()
+    if phys:
+        try:
+            return _safe_public_role(control.public_pane_id(phys))
+        except Exception:  # noqa: BLE001
+            return "unresolved"
+    return "unresolved"
+
+
+def _resolve_landing_public(control, landing_pane: str) -> str:
+    if not landing_pane:
+        return "unresolved"
+    try:
+        return _safe_public_role(control.public_pane_id(landing_pane))
+    except Exception:  # noqa: BLE001
+        return "unresolved"
+
+
 def _emit_prompt_submit_callback(control, callback: dict, event: dict) -> dict:
     """Best-effort late level-2 echo to the original caller pane.
 
     The callback is deliberately a one-shot side effect keyed by correlation id.
     It is not a delivery verdict; level-1 was already returned to the caller when
-    bytes reached the target pane.
+    bytes reached the target pane. The echo's delivered/turn claims are derived
+    from the landing verdict stamped by ``pop_matching_callbacks`` — an ack whose
+    actual landing pane differs from the send target must never read as a clean
+    delivery confirmation.
     """
 
     correlation_id = str(callback.get("correlation_id") or "").strip()
     caller_pane = str(callback.get("caller_pane") or "").strip()
-    target = _safe_public_role(str(callback.get("target_label") or "")) or _safe_public_role(
-        str(callback.get("target_pane") or "")
-    )
-    text = (
-        "[tmuxctld:hook-echo] "
-        f"correlation_id={correlation_id} delivered=1 turn=submitted target={target}"
-    )
+    target = _resolve_echo_target(control, callback)
+    landing = str(callback.get("landing") or "unverified").strip() or "unverified"
+    landing_pane = str(callback.get("landing_pane") or "").strip()
+    if landing == "mismatch":
+        landing_public = _resolve_landing_public(control, landing_pane)
+        text = (
+            "[tmuxctld:hook-echo] "
+            f"correlation_id={correlation_id} delivered=0 turn=landing_mismatch "
+            f"target={target} landing={landing_public}"
+        )
+    else:
+        text = (
+            "[tmuxctld:hook-echo] "
+            f"correlation_id={correlation_id} delivered=1 turn=submitted "
+            f"target={target} landing={landing}"
+        )
     try:
         # Hook echoes are byte-bearing notifications. They may target a raw
         # caller pane that is outside normal managed-agent resolution, but they
@@ -1133,6 +1207,9 @@ def _emit_prompt_submit_callback(control, callback: dict, event: dict) -> dict:
             "caller_pane": caller_pane,
             "target_pane": callback.get("target_pane"),
             "target_label": callback.get("target_label"),
+            "target": target,
+            "landing": landing,
+            "landing_pane": landing_pane or None,
             "status": "queued" if receipt.get("queued") else "sent",
             "delivery": receipt,
             "event": event,
@@ -1149,6 +1226,9 @@ def _emit_prompt_submit_callback(control, callback: dict, event: dict) -> dict:
             "caller_pane": caller_pane,
             "target_pane": callback.get("target_pane"),
             "target_label": callback.get("target_label"),
+            "target": target,
+            "landing": landing,
+            "landing_pane": landing_pane or None,
             "status": "failed",
             "error": str(exc),
             "event": event,
@@ -2531,6 +2611,7 @@ def _send_text_pipeline(
                         payload_hash=payload_hash,
                         since=started,
                         timeout=verify_timeout,
+                        pane=phys_pane,
                     )
                     if ack or attempt >= max(0, ack_submit_retries):
                         break
@@ -2595,6 +2676,10 @@ def _send_text_pipeline(
                                 "prompt_hash": payload_hash,
                                 "at": time.monotonic(),
                                 "recovered": True,
+                                # Recovery credit is pane-capture truth of the
+                                # send target itself, so the landing is the
+                                # target pane by construction.
+                                "landing": "confirmed",
                             }
                             recovery_submit_credited = True
                             break
@@ -2633,6 +2718,24 @@ def _send_text_pipeline(
     if submit_delivery == "failed":
         failures.append({"type": "submit_not_cleared", "detail": advisory})
     hook_echo = None
+    # The send's own target resolution, carried into the late echo so the echo
+    # reports the same answer delivery used. Callers pass the semantic address
+    # via expected_role (talk/brief resolve labels to raw %NN before sending);
+    # the raw pane param is second choice; a live reverse-resolve of the
+    # physical pane is the last resort before admitting "unresolved".
+    target_public = ""
+    for candidate in (expected_role, pane):
+        resolved_candidate = _safe_public_role(str(candidate or ""))
+        if resolved_candidate != "unresolved":
+            target_public = resolved_candidate
+            break
+    if not target_public:
+        try:
+            resolved_candidate = _safe_public_role(control.public_pane_id(phys_pane))
+            if resolved_candidate != "unresolved":
+                target_public = resolved_candidate
+        except Exception as exc:  # noqa: BLE001
+            log.debug("tmuxctld: send target reverse-resolve skipped: %s", exc)
     if verify and not ack:
         callback_pane = str(hook_echo_pane or "").strip()
         if callback_pane:
@@ -2645,6 +2748,7 @@ def _send_text_pipeline(
             caller_pane=callback_pane,
             target_pane=phys_pane,
             target_label=pane,
+            target_public=target_public,
             instance_id=instance_id,
             payload_hash=payload_hash,
             since=started,
@@ -2652,6 +2756,8 @@ def _send_text_pipeline(
     result = {
         "status": status,
         "pane": pane,
+        "target_public": target_public or None,
+        "landing": (ack or {}).get("landing") if ack else None,
         "instance_id": instance_id,
         "dispatch_id": dispatch_id,
         "operation_id": operation_id or None,
