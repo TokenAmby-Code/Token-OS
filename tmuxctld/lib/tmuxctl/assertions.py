@@ -255,6 +255,8 @@ def _registry_entries(
     *,
     include_stopped: bool = False,
     instance_stamp: str = "",
+    registry=None,
+    registry_error: Exception | None = None,
 ):
     """Registry rows bound to this pane, newest-active first.
 
@@ -269,7 +271,9 @@ def _registry_entries(
     # post-extraction) still resolves to its row, instead of being refused. The
     # stored-pane / pane_label matches remain as legacy fallbacks.
     stamp = (instance_stamp or "").strip()
-    registry = fetch_instance_registry()
+    if registry_error is not None:
+        raise registry_error
+    registry = registry or fetch_instance_registry()
     rows = [
         row
         for row in registry.instances
@@ -1308,6 +1312,8 @@ def assert_instance(
     session: str | None = None,
     registry_optional: bool = False,
     process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+    registry=None,
+    registry_error: Exception | None = None,
 ) -> dict[str, Any]:
     from .focus_guard import preserve_focus
 
@@ -1320,6 +1326,8 @@ def assert_instance(
             session=session,
             registry_optional=registry_optional,
             process_tree=process_tree,
+            registry=registry,
+            registry_error=registry_error,
         )
 
 
@@ -1332,6 +1340,8 @@ def _assert_instance_impl(
     session: str | None = None,
     registry_optional: bool = False,
     process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+    registry=None,
+    registry_error: Exception | None = None,
 ) -> dict[str, Any]:
     # upsert/prune are accepted only for internal compatibility; public CLI no longer exposes them.
     # session pins resolution to the restart target (`main`); None keeps the
@@ -1361,7 +1371,13 @@ def _assert_instance_impl(
         spec = persona_spec(pane_label)
         instance_stamp = adapter.show_pane_option(pane_id, "@INSTANCE_ID")
         try:
-            rows = _registry_entries(pane_id, pane_label, instance_stamp=instance_stamp)
+            rows = _registry_entries(
+                pane_id,
+                pane_label,
+                instance_stamp=instance_stamp,
+                registry=registry,
+                registry_error=registry_error,
+            )
         except Exception as exc:  # noqa: BLE001
             result = _base_result(pane_id, pane_label, pane_type, None)
             result.update(
@@ -1608,6 +1624,128 @@ def _assert_instance_impl(
     return finish(result)
 
 
+
+
+def _sweep_pane_snapshot(
+    adapter: TmuxAdapter, *, session: str | None = None
+) -> dict[str, dict[str, str]]:
+    """One tmux snapshot keyed by stable pane label for reconcile sweeps."""
+    args = [
+        "list-panes",
+        "-a",
+        "-F",
+        (
+            "#{session_name}\t#{pane_id}\t#{pane_dead}\t#{pane_pid}"
+            "\t#{@PANE_ID}\t#{@PANE_TYPE}\t#{@INSTANCE_ID}\t#{@PERSONA}"
+        ),
+    ]
+    output = adapter.run(*args, allow_failure=True)
+    panes: dict[str, dict[str, str]] = {}
+    for line in (output or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 8:
+            continue
+        sess, pane_id, dead, pid, label, pane_type, instance_id, persona = parts[:8]
+        if session is not None and sess != session:
+            continue
+        if not label:
+            continue
+        panes[label] = {
+            "session": sess,
+            "pane": pane_id,
+            "dead": dead,
+            "pid": pid,
+            "pane_label": label,
+            "pane_type": pane_type,
+            "instance_id": instance_id,
+            "persona": persona,
+        }
+    return panes
+
+
+def _snapshot_runtime_ok(
+    pane: dict[str, str],
+    process_tree: tuple[dict[int, list[int]], dict[int, str]],
+) -> bool:
+    try:
+        pid = int((pane.get("pid") or "").strip())
+    except ValueError:
+        return False
+    return pane.get("dead") != "1" and pane_has_active_agent(pid, process_tree=process_tree)
+
+
+def _fast_persona_sweep_result(
+    pane: dict[str, str] | None,
+    *,
+    registry,
+    registry_error: Exception | None,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]],
+) -> dict[str, Any] | None:
+    """Return the no-op live persona result, or None when full assertion is needed."""
+    if pane is None or not _snapshot_runtime_ok(pane, process_tree):
+        return None
+    pane_id = pane["pane"]
+    pane_label = pane["pane_label"]
+    pane_type = pane["pane_type"]
+    spec = persona_spec(pane_label)
+    if registry_error is not None:
+        result = _base_result(pane_id, pane_label, pane_type, None)
+        result.update(
+            {
+                "ok": True,
+                "action": "registry_unavailable",
+                "reason": f"registry_unavailable:{registry_error}",
+            }
+        )
+        return result
+    try:
+        rows = _registry_entries(
+            pane_id,
+            pane_label,
+            instance_stamp=pane.get("instance_id", ""),
+            registry=registry,
+            registry_error=registry_error,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result = _base_result(pane_id, pane_label, pane_type, None)
+        result.update(
+            {
+                "ok": True,
+                "action": "registry_unavailable",
+                "reason": f"registry_unavailable:{exc}",
+            }
+        )
+        return result
+    row = rows[0] if rows else None
+    result = _base_result(pane_id, pane_label, pane_type, row)
+    if row is None:
+        result.update({"ok": True, "action": "none", "reason": "live_registry_skipped"})
+        return result
+    if not _row_matches_persona(row, spec):
+        return None
+    if not (pane.get("persona") or "").strip():
+        return None
+    result.update({"ok": True, "action": "none", "reason": "live_registry_skipped"})
+    return result
+
+
+def _fast_reservist_sweep_result(
+    pane: dict[str, str] | None,
+    *,
+    label: str,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]],
+) -> dict[str, Any] | None:
+    if pane is None or not _snapshot_runtime_ok(pane, process_tree):
+        return None
+    result = _base_result(
+        pane["pane"],
+        pane.get("pane_label") or label,
+        pane.get("pane_type") or "reservists",
+        None,
+    )
+    result.update({"ok": True, "action": "none", "reason": "live"})
+    return result
+
 def sweep_persona_panes(
     adapter: TmuxAdapter, *, session: str | None = None
 ) -> list[dict[str, Any]]:
@@ -1629,14 +1767,35 @@ def sweep_persona_panes(
     # per-label `ps -A` fork was part of the O(panes) fan-out that starved the
     # daemon. Mutation decisions still re-read fresh inside assert_instance.
     process_tree = process_tree_snapshot()
+    registry = None
+    registry_error: Exception | None = None
+    try:
+        registry = fetch_instance_registry()
+    except Exception as exc:  # noqa: BLE001
+        registry_error = exc
+    panes = _sweep_pane_snapshot(adapter, session=session)
     for pane_label in sorted(PERSONA_LABELS):
         try:
+            fast = _fast_persona_sweep_result(
+                panes.get(pane_label),
+                registry=registry,
+                registry_error=registry_error,
+                process_tree=process_tree,
+            )
+            if fast is not None:
+                results.append(fast)
+                continue
             # Only pin when a session was requested; the ambient in-pane sweep
             # (service/cli) resolves against the current session unchanged.
             if session is None:
                 results.append(
                     assert_instance(
-                        adapter, pane_label, registry_optional=True, process_tree=process_tree
+                        adapter,
+                        pane_label,
+                        registry_optional=True,
+                        process_tree=process_tree,
+                        registry=registry,
+                        registry_error=registry_error,
                     )
                 )
             else:
@@ -1647,6 +1806,8 @@ def sweep_persona_panes(
                         session=session,
                         registry_optional=True,
                         process_tree=process_tree,
+                        registry=registry,
+                        registry_error=registry_error,
                     )
                 )
         except Exception as exc:  # noqa: BLE001 — one bad pane must not stop the sweep
@@ -1756,8 +1917,15 @@ def sweep_reservist_panes(
     # One process snapshot for the sweep's read-only liveness verdicts (same
     # rationale as sweep_persona_panes); vacant verdicts re-read fresh inside.
     process_tree = process_tree_snapshot()
+    panes = _sweep_pane_snapshot(adapter, session=session)
     for label in RESERVIST_LABELS:
         try:
+            fast = _fast_reservist_sweep_result(
+                panes.get(label), label=label, process_tree=process_tree
+            )
+            if fast is not None:
+                results.append(fast)
+                continue
             results.append(
                 assert_reservist_seat(adapter, label, session=session, process_tree=process_tree)
             )
