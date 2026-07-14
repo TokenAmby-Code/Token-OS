@@ -139,12 +139,21 @@ def _parse_ledger_identity_parts(parts: list[str]) -> tuple[str, str, str, int |
     return pane_id, role, window_name.strip(), _parse_pid(pane_pid_raw), born_raw
 
 
-def _active_agent(pane_pid: int | None) -> bool:
+def _process_tree_snapshot() -> tuple[dict[int, list[int]], dict[int, str]]:
+    from .custodes import _process_tree
+
+    return _process_tree()
+
+
+def _active_agent(
+    pane_pid: int | None,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+) -> bool:
     # Lazy import avoids the historical custodes.py -> stack.py -> _stack_core.py
     # cycle while still using the shared process-tree oracle.
     from .custodes import active_agent_in_pane
 
-    return active_agent_in_pane(pane_pid) is not None
+    return active_agent_in_pane(pane_pid, process_tree=process_tree) is not None
 
 
 def _active_wrapper_row_for_role(pane_role: str) -> dict[str, Any] | None:
@@ -376,6 +385,7 @@ def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
         allow_failure=True,
     )
     ledger: list[PaneOccupancy] = []
+    process_tree = _process_tree_snapshot()
     for line in raw.splitlines():
         parts = line.split("\t")
         # 6 columns from live tmux; tolerate the 5-column legacy form (and unit
@@ -393,7 +403,7 @@ def scan_pane_occupancy(adapter: TmuxAdapter) -> list[PaneOccupancy]:
                 window_name=window_name.strip(),
                 pane_pid=pane_pid,
                 instance_id=instance_id.strip(),
-                live_agent=_active_agent(pane_pid),
+                live_agent=_active_agent(pane_pid, process_tree=process_tree),
                 recently_born=_recently_born(born_raw),
             )
         )
@@ -426,6 +436,7 @@ def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupanc
         allow_failure=True,
     )
     ledger: list[PaneOccupancy] = []
+    process_tree = _process_tree_snapshot()
     for line in raw.splitlines():
         parsed = _parse_ledger_identity_parts(line.split("\t"))
         if parsed is None:
@@ -439,7 +450,7 @@ def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupanc
                 window_name=window_name.strip(),
                 pane_pid=pane_pid,
                 instance_id=str((ledger_row or {}).get("instance_id") or ""),
-                live_agent=_active_agent(pane_pid),
+                live_agent=_active_agent(pane_pid, process_tree=process_tree),
                 recently_born=_recently_born(born_raw),
                 wrapper_id=str((ledger_row or {}).get("wrapper_id") or ""),
             )

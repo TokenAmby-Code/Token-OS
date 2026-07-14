@@ -94,7 +94,23 @@ def _process_tree() -> tuple[dict[int, list[int]], dict[int, str]]:
     return children, commands
 
 
-def _find_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> tuple[int, str] | None:
+def process_tree_snapshot() -> tuple[dict[int, list[int]], dict[int, str]]:
+    """One `ps -A` snapshot for callers that check many panes in a single pass.
+
+    Multi-pane loops (occupancy scans, persona/reservist sweeps, stamped-pane
+    liveness walks) must take one snapshot and thread it through their per-pane
+    checks instead of forking `ps -A` per pane — the O(panes) fan-out starved
+    the daemon under the ops-cockpit poll load. Single-pane correctness gates
+    keep the default fresh read.
+    """
+    return _process_tree()
+
+
+def _find_active_process(
+    pane_pid: int | None,
+    needles: tuple[str, ...],
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+) -> tuple[int, str] | None:
     """First match in pane_pid's own process subtree (incl. pane_pid itself):
     (pid, command) whose command contains a needle.
 
@@ -112,7 +128,7 @@ def _find_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> tupl
     """
     if not pane_pid:
         return None
-    children, commands = _process_tree()
+    children, commands = process_tree if process_tree is not None else _process_tree()
     if not commands:
         return None
     stack = [pane_pid]
@@ -129,18 +145,25 @@ def _find_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> tupl
     return None
 
 
-def _pane_has_active_process(pane_pid: int | None, needles: tuple[str, ...]) -> bool:
+def _pane_has_active_process(
+    pane_pid: int | None,
+    needles: tuple[str, ...],
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+) -> bool:
     """True if any descendant of pane_pid command contains one of needles."""
-    return _find_active_process(pane_pid, needles) is not None
+    return _find_active_process(pane_pid, needles, process_tree=process_tree) is not None
 
 
-def active_agent_in_pane(pane_pid: int | None) -> tuple[int, str] | None:
+def active_agent_in_pane(
+    pane_pid: int | None,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+) -> tuple[int, str] | None:
     """The first live Claude/Codex descendant of pane_pid as (pid, command).
 
     Engine-neutral sibling of ``pane_has_active_agent`` that surfaces *which*
     process is alive, for the refuse-retire-while-TUI-live guard's payload.
     """
-    return _find_active_process(pane_pid, AGENT_PROCESS_NEEDLES)
+    return _find_active_process(pane_pid, AGENT_PROCESS_NEEDLES, process_tree=process_tree)
 
 
 def pane_has_active_claude(pane_pid: int | None) -> bool:
@@ -153,14 +176,19 @@ def pane_has_active_claude(pane_pid: int | None) -> bool:
     return _pane_has_active_process(pane_pid, CLAUDE_PROCESS_NEEDLES)
 
 
-def pane_has_active_agent(pane_pid: int | None) -> bool:
+def pane_has_active_agent(
+    pane_pid: int | None,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+) -> bool:
     """True if any descendant of pane_pid is a live Claude or Codex process.
 
     ``assert-instance`` is engine-neutral: a live Codex pane is a valid managed
     runtime and must not be pruned/stopped just because the detector was written
     originally for Claude-only persona panes.
     """
-    return _pane_has_active_process(pane_pid, AGENT_PROCESS_NEEDLES)
+    return _pane_has_active_process(
+        pane_pid, AGENT_PROCESS_NEEDLES, process_tree=process_tree
+    )
 
 
 def _upsert_via_claude_cmd(pane_id: str, prompt: str) -> tuple[bool, str]:

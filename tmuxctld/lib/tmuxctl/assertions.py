@@ -20,7 +20,7 @@ from .api import (
     stop_instance,
     update_instance_activity,
 )
-from .custodes import _pane_pid, pane_has_active_agent
+from .custodes import _pane_pid, pane_has_active_agent, process_tree_snapshot
 from .enums import VACANCY_POLICY, InstanceStatus, SeatVacancyPolicy
 from .resolver import resolve_pane
 from .tmux_adapter import TmuxAdapter, TmuxError
@@ -287,8 +287,12 @@ def _registry_entries(
     return exact_rows + fallback_rows
 
 
-def _runtime_has_instance(adapter: TmuxAdapter, pane_id: str) -> bool:
-    return pane_has_active_agent(_pane_pid(adapter, pane_id))
+def _runtime_has_instance(
+    adapter: TmuxAdapter,
+    pane_id: str,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
+) -> bool:
+    return pane_has_active_agent(_pane_pid(adapter, pane_id), process_tree=process_tree)
 
 
 # Identity env vars scrubbed off the inherited tmux-server environment before a
@@ -1303,6 +1307,7 @@ def assert_instance(
     prune: bool = False,
     session: str | None = None,
     registry_optional: bool = False,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
 ) -> dict[str, Any]:
     from .focus_guard import preserve_focus
 
@@ -1314,6 +1319,7 @@ def assert_instance(
             prune=prune,
             session=session,
             registry_optional=registry_optional,
+            process_tree=process_tree,
         )
 
 
@@ -1325,6 +1331,7 @@ def _assert_instance_impl(
     prune: bool = False,
     session: str | None = None,
     registry_optional: bool = False,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
 ) -> dict[str, Any]:
     # upsert/prune are accepted only for internal compatibility; public CLI no longer exposes them.
     # session pins resolution to the restart target (`main`); None keeps the
@@ -1344,7 +1351,12 @@ def _assert_instance_impl(
         result.update({"ok": ok, "action": "launched" if ok else "launch_failed", "reason": reason})
         return result
 
-    runtime_ok = _runtime_has_instance(adapter, pane_id)
+    runtime_ok = _runtime_has_instance(adapter, pane_id, process_tree=process_tree)
+    if not runtime_ok and process_tree is not None:
+        # A sweep-shared snapshot may predate a just-booted engine; every
+        # not-live verdict feeds a mutation decision (stop rows / respawn /
+        # prune), so it must be re-read fresh before acting.
+        runtime_ok = _runtime_has_instance(adapter, pane_id)
     if pane_label in PERSONA_LABELS and runtime_ok and registry_optional:
         spec = persona_spec(pane_label)
         instance_stamp = adapter.show_pane_option(pane_id, "@INSTANCE_ID")
@@ -1613,15 +1625,29 @@ def sweep_persona_panes(
     captured per-label so one absent pane never aborts the rest of the sweep.
     """
     results: list[dict[str, Any]] = []
+    # One process snapshot for the whole sweep's read-only liveness verdicts; a
+    # per-label `ps -A` fork was part of the O(panes) fan-out that starved the
+    # daemon. Mutation decisions still re-read fresh inside assert_instance.
+    process_tree = process_tree_snapshot()
     for pane_label in sorted(PERSONA_LABELS):
         try:
             # Only pin when a session was requested; the ambient in-pane sweep
             # (service/cli) resolves against the current session unchanged.
             if session is None:
-                results.append(assert_instance(adapter, pane_label, registry_optional=True))
+                results.append(
+                    assert_instance(
+                        adapter, pane_label, registry_optional=True, process_tree=process_tree
+                    )
+                )
             else:
                 results.append(
-                    assert_instance(adapter, pane_label, session=session, registry_optional=True)
+                    assert_instance(
+                        adapter,
+                        pane_label,
+                        session=session,
+                        registry_optional=True,
+                        process_tree=process_tree,
+                    )
                 )
         except Exception as exc:  # noqa: BLE001 — one bad pane must not stop the sweep
             results.append(
@@ -1636,7 +1662,11 @@ def sweep_persona_panes(
 
 
 def assert_reservist_seat(
-    adapter: TmuxAdapter, target: str, *, session: str | None = None
+    adapter: TmuxAdapter,
+    target: str,
+    *,
+    session: str | None = None,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
 ) -> dict[str, Any]:
     """Fill a vacant reservist heartbeat seat with a standby agent (idempotent).
 
@@ -1653,11 +1683,17 @@ def assert_reservist_seat(
 
     reservist_spec(target)  # validate the label before touching tmux
     with preserve_focus(adapter, source="tmuxctl assert-reservist", attempted_target=target):
-        return _assert_reservist_seat_impl(adapter, target, session=session)
+        return _assert_reservist_seat_impl(
+            adapter, target, session=session, process_tree=process_tree
+        )
 
 
 def _assert_reservist_seat_impl(
-    adapter: TmuxAdapter, target: str, *, session: str | None = None
+    adapter: TmuxAdapter,
+    target: str,
+    *,
+    session: str | None = None,
+    process_tree: tuple[dict[int, list[int]], dict[int, str]] | None = None,
 ) -> dict[str, Any]:
     spec = reservist_spec(target)
     try:
@@ -1678,7 +1714,12 @@ def _assert_reservist_seat_impl(
     pane_type = _pane_type(adapter, pane_id)
     result = _base_result(pane_id, pane_label, pane_type, None)
 
-    if _runtime_has_instance(adapter, pane_id):
+    live = _runtime_has_instance(adapter, pane_id, process_tree=process_tree)
+    if not live and process_tree is not None:
+        # Sweep-shared snapshot said vacant — the vacant path stops rows and
+        # respawns the seat, so the verdict must be re-read fresh before acting.
+        live = _runtime_has_instance(adapter, pane_id)
+    if live:
         result.update({"ok": True, "action": "none", "reason": "live"})
         return result
 
@@ -1712,9 +1753,14 @@ def sweep_reservist_panes(
     the sweep.
     """
     results: list[dict[str, Any]] = []
+    # One process snapshot for the sweep's read-only liveness verdicts (same
+    # rationale as sweep_persona_panes); vacant verdicts re-read fresh inside.
+    process_tree = process_tree_snapshot()
     for label in RESERVIST_LABELS:
         try:
-            results.append(assert_reservist_seat(adapter, label, session=session))
+            results.append(
+                assert_reservist_seat(adapter, label, session=session, process_tree=process_tree)
+            )
         except Exception as exc:  # noqa: BLE001 — one bad pane must not stop the sweep
             results.append(
                 {"ok": False, "pane_label": label, "action": "error", "reason": str(exc)}
