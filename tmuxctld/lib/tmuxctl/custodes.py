@@ -94,6 +94,18 @@ def _process_tree() -> tuple[dict[int, list[int]], dict[int, str]]:
     return children, commands
 
 
+def process_tree_snapshot() -> tuple[dict[int, list[int]], dict[int, str]]:
+    """One `ps -A` snapshot for callers that check many panes in a single pass.
+
+    Multi-pane loops (occupancy scans, persona/reservist sweeps, stamped-pane
+    liveness walks) must take one snapshot and thread it through their per-pane
+    checks instead of forking `ps -A` per pane — the O(panes) fan-out starved
+    the daemon under the ops-cockpit poll load. Single-pane correctness gates
+    keep the default fresh read.
+    """
+    return _process_tree()
+
+
 def _find_active_process(
     pane_pid: int | None,
     needles: tuple[str, ...],
