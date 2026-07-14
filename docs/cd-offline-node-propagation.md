@@ -149,3 +149,9 @@ repo-only change. No mobile code ships in the WSL PR.
    exists; only the edge hook is pending.
 3. **Cutover** — when the Token-API home moves Mac→k12-personal, the hub URL follows
    automatically via `imperium_config` (`token_api_url` registry row); no code change.
+4. **Agent-config repo as a second converge target** — ruled 2026-07-14: shared
+   inter-machine agent configuration (shell configs, personas, hook configs) moves into
+   its own repo in the TokenAmby-Code org, hydrated the same way — pull on boot plus a
+   converge ping, with the origin repo as the buffer for offline nodes (NAS hydration
+   explicitly rejected). When that repo lands, `/cd/converge` should iterate a small list
+   of (repo, checkout, refresh-helper) targets rather than growing a parallel mechanism.
