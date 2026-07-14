@@ -1334,8 +1334,8 @@ async def dispatch_notify(
     # notify with no named instance rides the synthetic ``system`` sender
     # (Custodes-voiced, hot): per the Emperor's two-part contract these terse pings
     # ARE "the Custodes are impending," and a recognized synthetic id keeps the
-    # single-queue invariant without a parallel speak path. queue_tts owns voice +
-    # the deny-by-default persona gate, so the inline voice lookup is gone.
+    # single-queue invariant without a parallel speak path. queue_tts owns the
+    # deny-by-default persona gate; an explicit voice override only affects render.
     audio_requested = bool(tts and message)
     tts_result = None
     if audio_requested:
@@ -1347,6 +1347,7 @@ async def dispatch_notify(
             queue_target="hot",
             completion=completion,
             bypass_persona_silent=enforcement,
+            voice=voice,
         )
         if enqueue.get("queued"):
             try:
@@ -2825,6 +2826,7 @@ async def queue_tts(
     queue_target: str = "pause",
     completion: "asyncio.Future | None" = None,
     bypass_persona_silent: bool = False,
+    voice: str | None = None,
 ) -> dict:
     """Queue a TTS message for an instance, using their profile's voice/sound.
 
@@ -2843,6 +2845,8 @@ async def queue_tts(
         completion: Optional future the worker resolves with
             ``{success, route, audio_delivered}`` when this item reaches a
             terminal playback state. Only the awaiting front door passes one.
+        voice: Optional render voice override. ``None`` preserves persona/system
+            row voice resolution exactly; non-None is normalized at render time.
     """
     message = await _sanitize_public_text_async(message)
 
@@ -2961,7 +2965,7 @@ async def queue_tts(
         )
         row = _system_audio_with_sender_metadata()
 
-    voice = row["tts_voice"]
+    render_voice = voice if voice is not None else row["tts_voice"]
     sound = row["notification_sound"]
     name = row["name"] or instance_id
 
@@ -2994,7 +2998,9 @@ async def queue_tts(
     )
     artifact = None
     if effective_mode != "muted" and rendered_message:
-        artifact = await asyncio.to_thread(render_openai_tts_artifact, rendered_message, voice)
+        artifact = await asyncio.to_thread(
+            render_openai_tts_artifact, rendered_message, render_voice
+        )
         if not artifact.get("success"):
             await log_event(
                 "tts_render_failed",
@@ -3002,7 +3008,7 @@ async def queue_tts(
                 device_id="tts_queue",
                 details={
                     "message": message[:100],
-                    "voice": voice,
+                    "voice": render_voice,
                     "error": artifact.get("error"),
                     "detail": artifact.get("detail"),
                 },
@@ -3961,7 +3967,12 @@ async def queue_tts_message(request: QueueTTSRequest) -> dict:
     Messages are played sequentially - if another TTS is playing, this will queue.
     Returns the queue position.
     """
-    return await queue_tts(request.instance_id, request.message, queue_target=request.queue_target)
+    return await queue_tts(
+        request.instance_id,
+        request.message,
+        queue_target=request.queue_target,
+        voice=request.voice,
+    )
 
 
 @router.get("/api/notify/queue/status")
