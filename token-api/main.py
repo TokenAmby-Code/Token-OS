@@ -441,127 +441,6 @@ def _scoped_send_operation_id(
     return f"{namespace}:{digest}"
 
 
-async def _tmuxctl_send_text_fallback(
-    tmux_pane: str,
-    prompt: str,
-    *,
-    clear_prompt: bool,
-    submit: bool,
-) -> dict:
-    """Cold ``tmuxctl send-text`` fallback for Token-API's daemon send facade."""
-    logger.error(
-        "410 retired raw-tmux fallback touched: tmuxctl send-text fallback is disabled; "
-        "Token-API must use tmuxctld /send-text only"
-    )
-    return {
-        "returncode": 410,
-        "stdout": "",
-        "stderr": "410 retired raw-tmux fallback: tmuxctl send-text fallback is disabled",
-        "operation": "tmuxctl.send_text_fallback_retired",
-        "failed_operation": ["tmuxctld", "send-text"],
-        "gated": False,
-        "pane": tmux_pane,
-        "instance_id": None,
-        "retired": True,
-    }
-
-    operation = "tmuxctl.send_text_fallback"
-    if clear_prompt and not submit:
-        return {
-            "returncode": 2,
-            "stdout": "",
-            "stderr": "tmuxctl send-text fallback invalid args: --no-submit cannot clear prompt",
-            "operation": operation,
-            "failed_operation": ["tmuxctl", "send-text"],
-            "gated": False,
-            "pane": tmux_pane,
-            "instance_id": None,
-        }
-
-    tmuxctld_lib = SCRIPTS_DIR / "tmuxctld" / "lib"
-    cli_lib = SCRIPTS_DIR / "cli-tools" / "lib"
-    fallback_env = {
-        **os.environ,
-        "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-        # The fallback CLI may need to fetch the live registry.  LaunchAgent
-        # environments have drifted before, so bind the subprocess to the local
-        # service/daemon explicitly instead of letting tmuxctl infer a remote
-        # Tailscale URL and report a false delivery failure after bytes landed.
-        "TOKEN_API_URL": os.environ.get("TOKEN_API_URL") or "http://localhost:7777",
-        "TMUXCTLD_URL": os.environ.get("TMUXCTLD_URL")
-        or cfg("tmuxctld_url")
-        or "http://127.0.0.1:7778",
-    }
-    args: list[str] = [
-        sys.executable,
-        "-m",
-        "tmuxctl.cli",
-        "send-text",
-        "--pane",
-        tmux_pane,
-        "--stdin",
-    ]
-    if clear_prompt:
-        args.append("--clear-prompt")
-    if not submit:
-        args.append("--no-submit")
-    try:
-        proc = await shared._run_subprocess_offloop(
-            tuple(args),
-            input=prompt,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=fallback_env,
-            timeout=15,
-        )
-    except Exception as exc:
-        return {
-            "returncode": 1,
-            "stdout": "",
-            "stderr": f"tmuxctl send-text fallback failed: {type(exc).__name__}: {exc}",
-            "operation": operation,
-            "failed_operation": ["tmuxctl", "send-text"],
-            "gated": False,
-            "pane": tmux_pane,
-            "instance_id": None,
-        }
-
-    stdout = _text_from_completed(proc.stdout)
-    stderr = _text_from_completed(proc.stderr)
-    if proc.returncode != 0:
-        return {
-            "returncode": proc.returncode,
-            "stdout": stdout,
-            "stderr": stderr.strip() or f"tmuxctl send-text failed with rc={proc.returncode}",
-            "operation": operation,
-            "failed_operation": ["tmuxctl", "send-text"],
-            "gated": False,
-            "pane": tmux_pane,
-            "instance_id": None,
-        }
-    return {
-        "returncode": 0,
-        "stdout": stdout,
-        "stderr": stderr,
-        "operation": operation,
-        "dispatch_id": str(uuid.uuid4()),
-        "payload_hash": _prompt_payload_hash(prompt),
-        "gated": False,
-        "verification_status": "pending",
-        "verified_by": None,
-        "delivered": True,
-        "submitted": False,
-        "turn": "pending",
-        "guard_held": False,
-        "swallowed_submit_detected": False,
-        "recovery_attempts": 0,
-        "failures": [],
-        "pane": tmux_pane,
-        "instance_id": None,
-    }
-
-
 async def send_prompt_to_pane(
     tmux_pane: str,
     prompt: str,
@@ -608,12 +487,42 @@ async def send_prompt_to_pane(
         default_loopback=_tmuxctld_default_loopback(),
     )
     if daemon_payload is None:
-        return await _tmuxctl_send_text_fallback(
+        # Transport severance, NOT a delivery failure. ``_tmuxctld_post_json``
+        # returns None on ANY exception (read-timeout / connection reset /
+        # non-200 / malformed read) -- even when the daemon received and
+        # completed the send. The daemon is the sole byte-delivery authority and
+        # registers the correlation-keyed level-2 hook-echo callback only after a
+        # successful send, so this severance is INDETERMINATE. The retired-410
+        # fallback fabricated a positive ``not_delivered`` here, which tripped a
+        # resend -> proven duplicate. Return a delivery-unknown verdict carrying
+        # the correlation handle; the async hook-echo resolves it, and the
+        # surfaced ``operation_id`` lets any deliberate retry collapse via
+        # daemon idempotency. Do NOT bump the client timeout (band-aid).
+        corr = correlation_id or operation_id
+        logger.warning(
+            "send transport severed (tmuxctld post->None) pane=%s op=%s corr=%s: "
+            "delivery unknown, not scored as failed",
             tmux_pane,
-            prompt,
-            clear_prompt=clear_prompt,
-            submit=submit,
+            operation_id,
+            corr,
         )
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "operation": "tmuxctld.send_text",
+            "transport": "severed",
+            "delivery": "unknown",
+            "verification_status": "unknown",
+            "delivered": None,
+            "submitted": False,
+            "do_not_retry": True,
+            "operation_id": operation_id,
+            "correlation_id": corr,
+            "payload_hash": _prompt_payload_hash(prompt),
+            "pane": tmux_pane,
+            "instance_id": None,
+        }
     if not daemon_payload.get("ok"):
         gated = _tmuxctld_gate_result(
             operation="tmuxctld.send_text", tmux_pane=tmux_pane, daemon_payload=daemon_payload
@@ -5777,6 +5686,13 @@ PANE_WRITE_SENT = "sent"
 PANE_WRITE_FAILED = "failed"
 PANE_WRITE_UNVERIFIED = "unverified"
 PANE_WRITE_CANCELLED = "cancelled"
+# Transport-severance verdict: the synchronous Token-API->tmuxctld round-trip
+# severed (read-timeout / connection reset / non-200 / malformed read) on a send
+# the daemon may have COMPLETED server-side. The daemon is the sole authority on
+# byte delivery, so a severance is INDETERMINATE, never a proven non-delivery.
+# Clients must treat this as do-not-blind-retry and reconcile against the
+# correlation-keyed level-2 hook-echo -- NOT collapse it to `failed`/`sent`.
+PANE_WRITE_UNKNOWN = "delivery_unknown"
 PANE_WRITE_DEFERRED = "deferred"
 # queue_id -> last truthful delivered result whose DB status update hit a
 # transient lock.  Suppresses in-process duplicate sends while retrying only the
@@ -5847,6 +5763,15 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
         return PANE_WRITE_PENDING, str(reason)
     if verification == "gated" or send_result.get("gated"):
         return PANE_WRITE_PENDING, f"send_gated:{send_result.get('gate_reason') or 'gated'}"
+    if (
+        send_result.get("transport") == "severed"
+        or str(send_result.get("delivery") or "").lower() == "unknown"
+    ):
+        # Token-API<->daemon transport severed on a send the daemon owns and may
+        # have completed. Indeterminate: never `sent` (would read as delivered),
+        # never `failed` (would trip a resend->duplicate). The correlation-keyed
+        # hook-echo is the async source of truth that resolves it.
+        return PANE_WRITE_UNKNOWN, send_result.get("reason") or "transport_severed"
     if send_result.get("returncode") != 0:
         return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
     if send_result.get("delivered") is False:
@@ -5876,7 +5801,14 @@ def _pane_delivery_is_accepted_for_await(send_result: dict) -> bool:
     retry.
     """
 
-    return send_result.get("status") == PANE_WRITE_SENT or _pane_delivery_is_pending(send_result)
+    # A transport-severed send (delivery_unknown) also keeps the await open: the
+    # daemon owns the outcome and may have delivered, so the talk pair's response
+    # (or timeout) is the honest resolver -- cancelling here would force the exact
+    # blind retry the indeterminate verdict is meant to prevent.
+    return send_result.get("status") in {
+        PANE_WRITE_SENT,
+        PANE_WRITE_UNKNOWN,
+    } or _pane_delivery_is_pending(send_result)
 
 
 def _pane_input_line_has_text(line: str) -> bool:
@@ -13878,6 +13810,12 @@ async def brief_send(request: BriefSendRequest):
         # actionable delivery state directly instead of collapsing it to
         # "failed"; callers must know this is a do-not-blind-retry case.
         brief_status = "unverified"
+    elif any(r.get("status") == PANE_WRITE_UNKNOWN for r in delivered):
+        # Token-API<->daemon transport severed on a send the daemon owns and may
+        # have completed. Never collapse to "failed" -- that manufactured the
+        # false negative that tripped a resend->duplicate. Surface the
+        # indeterminate state so callers reconcile against the hook-echo.
+        brief_status = "unknown"
     else:
         brief_status = "failed"
     return {

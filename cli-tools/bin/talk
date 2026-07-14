@@ -232,9 +232,16 @@ def main(argv: list[str]) -> int:
         # server still attempts to inject the payload into the original caller's
         # pane; that delivery can fail independently of the pair-return.
         delivery = send.get("delivery") or {}
-        delivered_ok = delivery.get("status") != "failed"
+        delivery_status = delivery.get("status")
+        delivered_ok = delivery_status != "failed"
         if args.json_out:
             print(json.dumps(send, indent=2, sort_keys=True))
+        elif delivery_status == "delivery_unknown":
+            corr = delivery.get("correlation_id") or send.get("talk_id") or "?"
+            _err(
+                f"[talk:returned] delivery unknown to {args.pane}: transport severed; "
+                f"daemon owns the outcome; reconcile via correlation={corr}, do not blind-retry"
+            )
         elif delivered_ok:
             print(f"[talk:returned] delivered to {args.pane}")
         else:
@@ -242,6 +249,11 @@ def main(argv: list[str]) -> int:
                 f"[talk:returned] delivery failed to {args.pane}: "
                 f"{delivery.get('error') or delivery.get('status')}"
             )
+        # delivery_unknown is indeterminate, not a proven return delivery: exit
+        # non-zero (aligned with the send_timeout posture) so the caller does not
+        # treat it as a confirmed hand-back.
+        if delivery_status == "delivery_unknown":
+            return 1
         return 0 if delivered_ok else 1
     if args.no_wait:
         if args.json_out:
