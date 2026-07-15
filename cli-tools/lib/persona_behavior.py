@@ -21,7 +21,7 @@ def _db_path() -> Path:
     return Path(
         os.environ.get("TOKEN_API_AGENTS_DB")
         or os.environ.get("TOKEN_API_DB")
-        or Path.home() / "runtimes" / "database" / "agents.db"
+        or Path(os.environ.get("TOKEN_API_DATABASE_DIR") or "~/runtimes/database") / "agents.db"
     ).expanduser()
 
 

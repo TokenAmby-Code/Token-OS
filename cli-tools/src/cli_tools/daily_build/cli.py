@@ -97,11 +97,13 @@ def _resolve_vault(arg: str | None) -> Path:
 
 def _resolve_db(arg: str | None) -> Path:
     if arg:
-        return Path(arg)
+        return Path(arg).expanduser()
     env = os.environ.get("TOKEN_API_AGENTS_DB") or os.environ.get("TOKEN_API_DB")
     if env:
-        return Path(env)
-    return Path.home() / "runtimes" / "database" / "agents.db"
+        return Path(env).expanduser()
+    return (
+        Path(os.environ.get("TOKEN_API_DATABASE_DIR") or "~/runtimes/database") / "agents.db"
+    ).expanduser()
 
 
 def _date_arg(value: str) -> str:

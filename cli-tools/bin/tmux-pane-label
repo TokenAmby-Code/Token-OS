@@ -24,7 +24,9 @@ AGENTS_DB = (
     os.environ.get("AGENTS_DB")
     or os.environ.get("TOKEN_API_AGENTS_DB")
     or os.environ.get("TOKEN_API_DB")
-    or os.path.expanduser("~/runtimes/database/agents.db")
+    or os.path.expanduser(
+        os.path.join(os.environ.get("TOKEN_API_DATABASE_DIR") or "~/runtimes/database", "agents.db")
+    )
 )
 
 

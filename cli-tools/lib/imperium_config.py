@@ -15,6 +15,7 @@ import os
 import platform
 import re
 import sys
+from pathlib import PurePath
 
 # ============================================================
 # MACHINE IDENTITY
@@ -210,7 +211,7 @@ TOKEN_API_TIMER_DB = os.path.expanduser(
 )
 TOKEN_API_TELEMETRY_DB = os.path.expanduser(
     os.environ.get("TOKEN_API_TELEMETRY_DB")
-    or (os.path.join(os.path.dirname(_TOKEN_API_DB), "telemetry.db") if _TOKEN_API_DB else "")
+    or (str(PurePath(_TOKEN_API_DB).with_name("telemetry.db")) if _TOKEN_API_DB else "")
     or os.path.join(RUNTIME_DATABASE_DIR, "telemetry.db")
 )
 

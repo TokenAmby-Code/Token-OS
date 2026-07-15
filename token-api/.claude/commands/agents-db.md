@@ -1,6 +1,6 @@
 # agents-db
 
-Query the local instance registry database (`~/runtimes/database/agents.db`, SQLite).
+Query the local instance registry database (SQLite; defaults to `~/runtimes/database/agents.db`, overridable via `TOKEN_API_AGENTS_DB` > `TOKEN_API_DB`).
 
 ## Commands
 

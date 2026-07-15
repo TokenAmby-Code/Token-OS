@@ -10,9 +10,9 @@ from pathlib import Path
 
 DB_PATH = str(
     Path(
-        os.environ.get("TOKEN_API_AGENTS_DB")
+        os.environ.get("TOKEN_API_TIMER_DB")
         or os.environ.get("TOKEN_API_DB")
-        or Path.home() / "runtimes" / "database" / "agents.db"
+        or Path(os.environ.get("TOKEN_API_DATABASE_DIR") or "~/runtimes/database") / "timer.db"
     ).expanduser()
 )
 API_URL = "http://localhost:7777"

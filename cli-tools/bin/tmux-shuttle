@@ -65,7 +65,7 @@ relocate_pane() {
         return 0
     fi
 
-    local db_path="${TOKEN_API_AGENTS_DB:-${TOKEN_API_DB:-$HOME/runtimes/database/agents.db}}"
+    local db_path="${TOKEN_API_AGENTS_DB:-${TOKEN_API_DB:-${TOKEN_API_DATABASE_DIR:-$HOME/runtimes/database}/agents.db}}"
     command -v sqlite3 >/dev/null 2>&1 || return 0
     [[ -f "$db_path" ]] || return 0
     pane_id="${pane_id//\'/\'\'}"

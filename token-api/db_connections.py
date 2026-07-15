@@ -37,10 +37,9 @@ def _split_db_path(env_name: str, filename: str) -> Path:
         return Path(value).expanduser()
     legacy = os.environ.get("TOKEN_API_DB")
     if legacy:
-        # Preserve dev/test redirection without collapsing every split store into
-        # the same file.  ``TOKEN_API_DB=/tmp/agents.db`` yields
-        # ``/tmp/telemetry.db`` / ``/tmp/timer.db`` unless a store-specific
-        # override is supplied.
+        # Preserve dev/test redirection without collapsing the telemetry store
+        # into the same file.  ``TOKEN_API_DB=/tmp/agents.db`` yields
+        # ``/tmp/telemetry.db`` unless a store-specific override is supplied.
         legacy_path = Path(legacy).expanduser()
         return legacy_path.with_name(filename)
     return RUNTIME_DATABASE_DIR / filename
@@ -56,7 +55,14 @@ AGENTS_DB_PATH = Path(
     or os.environ.get("TOKEN_API_DB")
     or RUNTIME_DATABASE_DIR / "agents.db"
 ).expanduser()
-TIMER_DB_PATH = _split_db_path("TOKEN_API_TIMER_DB", "timer.db")
+# Timer keeps the historic TOKEN_API_DB-verbatim fallback so dev/test harnesses
+# that point TOKEN_API_DB at one isolated file get timer tables in that same
+# file — matching shared.py / db_schema.py / init_db.py.
+TIMER_DB_PATH = Path(
+    os.environ.get("TOKEN_API_TIMER_DB")
+    or os.environ.get("TOKEN_API_DB")
+    or RUNTIME_DATABASE_DIR / "timer.db"
+).expanduser()
 TELEMETRY_DB_PATH = resolve_telemetry_db_path()
 
 _CURRENT_ENDPOINT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
