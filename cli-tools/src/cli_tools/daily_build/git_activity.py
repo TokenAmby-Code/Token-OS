@@ -27,8 +27,8 @@ def _pr_num(subject: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _run(args: list[str], cwd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+def _run(args: list[str], cwd: str, *, timeout: float | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
 def _looks_like_date(value: str) -> bool:
@@ -65,6 +65,11 @@ def repo_head(repo: str, ref: str = "main") -> str:
     return ref_sha
 
 
+# ls-remote can hang on network/DNS/SSH/credential prompts; the honesty check
+# is best-effort, so a stuck remote must not stall the build.
+REMOTE_TIMEOUT_S = 10
+
+
 def remote_head(repo: str, ref: str = "main") -> str:
     """Full sha of ``ref`` on the first resolvable remote, or '' if offline.
 
@@ -72,7 +77,14 @@ def remote_head(repo: str, ref: str = "main") -> str:
     (checkout head vs remote main), best-effort like everything else here.
     """
     for remote in ("origin", "github"):
-        proc = _run(["git", "ls-remote", remote, f"refs/heads/{ref}"], repo)
+        try:
+            proc = _run(
+                ["git", "ls-remote", remote, f"refs/heads/{ref}"],
+                repo,
+                timeout=REMOTE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if proc.returncode == 0 and proc.stdout.strip():
             return proc.stdout.split()[0]
     return ""
@@ -83,6 +95,19 @@ def sha_in_repo(repo: str, sha: str) -> bool:
     if not sha:
         return False
     proc = _run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], repo)
+    return proc.returncode == 0
+
+
+def is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
+    """True if ``ancestor`` is an ancestor of (or equal to) ``descendant``.
+
+    Guards divergent-branch anchors: a prior note written on another branch
+    names a commit that exists here but whose ``base..head`` window would not
+    mean "since last build".
+    """
+    if not ancestor or not descendant:
+        return False
+    proc = _run(["git", "merge-base", "--is-ancestor", ancestor, descendant], repo)
     return proc.returncode == 0
 
 

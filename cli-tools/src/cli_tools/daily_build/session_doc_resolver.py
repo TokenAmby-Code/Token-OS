@@ -10,14 +10,16 @@ as ``wt-<branch>``). Frontmatter is parsed the same way as
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger("daily-build")
 
 # Headings the assembler transcludes per thread, when present in the doc.
 KEY_FILES_HEADINGS = ("Key Files", "Key files")
@@ -209,30 +211,35 @@ def _reference_doc_candidates(vault_root: Path) -> list[Path] | None:
     unavailable so the caller can fall back to a full glob scan. A wedged NAS
     mount can pin grep in uninterruptible I/O forever — on timeout we skip
     diagram enrichment entirely (``[]``, NOT the glob fallback, which would
-    hang against the same mount) so the build still lands.
+    hang against the same mount) so the build still lands. The deadline is
+    hard: after kill we do NOT wait() — a D-state grep may never reap, and
+    ``subprocess.run(timeout=...)`` would block on exactly that.
     """
     dirs = [str(vault_root / base) for base in _SESSION_DIRS if (vault_root / base).is_dir()]
     if not dirs:
         return []
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["grep", "-rlE", r"^type:[[:space:]]*reference[[:space:]]*$", "--include=*.md", *dirs],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
-            timeout=DIAGRAM_SCAN_TIMEOUT_S,
         )
-    except subprocess.TimeoutExpired:
-        print(
-            f"[daily-build] warning: vault diagram scan exceeded {DIAGRAM_SCAN_TIMEOUT_S}s "
-            "(wedged NAS mount?) — skipping diagram enrichment for this build.",
-            file=sys.stderr,
-        )
-        return []
     except OSError:
         return None
+    try:
+        out, _ = proc.communicate(timeout=DIAGRAM_SCAN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()  # best-effort; deliberately no wait() on a possibly-wedged child
+        logger.warning(
+            "vault diagram scan exceeded %ss (wedged NAS mount?) — "
+            "skipping diagram enrichment for this build.",
+            DIAGRAM_SCAN_TIMEOUT_S,
+        )
+        return []
     if proc.returncode not in (0, 1):  # 0 = matches, 1 = no matches (both fine)
         return None
-    return [Path(line) for line in proc.stdout.splitlines() if line.strip()]
+    return [Path(line) for line in out.splitlines() if line.strip()]
 
 
 def build_diagram_index(vault_root: Path) -> dict[str, list[Path]]:

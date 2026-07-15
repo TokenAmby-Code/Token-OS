@@ -10,6 +10,8 @@ Run directly: uv run --directory cli-tools python tests/test_daily_build_attribu
 
 from __future__ import annotations
 
+import argparse
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -19,7 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from cli_tools.daily_build import git_activity as git  # noqa: E402
 from cli_tools.daily_build import review_generator as gen  # noqa: E402
-from cli_tools.daily_build.cli import _is_code_repo, _window_too_wide  # noqa: E402
+from cli_tools.daily_build.cli import _date_arg, _is_code_repo, _window_too_wide  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -32,15 +34,27 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
+_GIT_ORIGINALS = {name: getattr(git, name) for name in ("commit_iso", "web_url", "window_shas")}
+
+
 def _patch_git(
     iso_by_sha: dict[str, str],
     url: str = "https://github.com/org/repo",
     in_window: set[str] | None = None,
 ):
-    """Stub the subprocess-backed helpers attribute_window leans on."""
+    """Stub the subprocess-backed helpers attribute_window leans on.
+
+    main() restores the originals after every test so the module isn't left
+    mutated for tests (or imports) that run afterwards in the same process.
+    """
     git.commit_iso = lambda repo, sha: iso_by_sha.get(sha, "")  # type: ignore[assignment]
     git.web_url = lambda repo: url  # type: ignore[assignment]
     git.window_shas = lambda repo, base, ref="main": in_window or set()  # type: ignore[assignment]
+
+
+def _restore_git() -> None:
+    for name, fn in _GIT_ORIGINALS.items():
+        setattr(git, name, fn)
 
 
 def test_git_truth_survives_gh_outage() -> None:
@@ -171,6 +185,96 @@ def test_window_cap() -> None:
     check("cap: garbage dates fail open", not _window_too_wide("", "2026-07-14"))
 
 
+def test_date_arg_validation() -> None:
+    check("date arg: valid date passes through", _date_arg("2026-07-14") == "2026-07-14")
+    for bad in ("not-a-date", "2026-13-40", "07-14-2026"):
+        try:
+            _date_arg(bad)
+            check(f"date arg: {bad!r} rejected", False, "no error raised")
+        except argparse.ArgumentTypeError:
+            check(f"date arg: {bad!r} rejected", True)
+
+
+def test_is_ancestor_gates_divergent_anchor() -> None:
+    """A prior-note anchor on a divergent branch must not survive as a base."""
+
+    def run(args: list[str], cwd: str) -> str:
+        proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=True)
+        return proc.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run(["git", "init", "-q", "-b", "main"], tmp)
+        run(
+            [
+                "git",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "A",
+            ],
+            tmp,
+        )
+        run(
+            [
+                "git",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "B",
+            ],
+            tmp,
+        )
+        b = run(["git", "rev-parse", "HEAD"], tmp)
+        run(
+            [
+                "git",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "C",
+            ],
+            tmp,
+        )
+        c = run(["git", "rev-parse", "HEAD"], tmp)
+        run(["git", "checkout", "-q", "-b", "side", b], tmp)
+        run(
+            [
+                "git",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "D",
+            ],
+            tmp,
+        )
+        d = run(["git", "rev-parse", "HEAD"], tmp)
+
+        check("ancestor: B is ancestor of C", git.is_ancestor(tmp, b, c))
+        check("ancestor: self counts as ancestor", git.is_ancestor(tmp, c, c))
+        check("ancestor: divergent D rejected vs C", not git.is_ancestor(tmp, d, c))
+        check("ancestor: empty shas rejected", not git.is_ancestor(tmp, "", c))
+
+
 def main() -> int:
     for test in (
         test_git_truth_survives_gh_outage,
@@ -182,9 +286,14 @@ def main() -> int:
         test_bundle_labels_checkout_and_divergence,
         test_repo_sentinel,
         test_window_cap,
+        test_date_arg_validation,
+        test_is_ancestor_gates_divergent_anchor,
     ):
         print(f"— {test.__name__}")
-        test()
+        try:
+            test()
+        finally:
+            _restore_git()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURE(S): {FAILURES}")
         return 1

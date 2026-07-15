@@ -104,6 +104,15 @@ def _resolve_db(arg: str | None) -> Path:
     return Path.home() / ".claude" / "agents.db"
 
 
+def _date_arg(value: str) -> str:
+    """argparse type for --date: reject malformed dates at the CLI boundary."""
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from None
+    return value
+
+
 MAX_WINDOW_DAYS = 7
 
 
@@ -214,7 +223,9 @@ def main() -> int:
         description="Assemble the day's Obsidian-hosted build review note.",
     )
     parser.add_argument("--since", help="Base override: a sha/ref or YYYY-MM-DD date.")
-    parser.add_argument("--date", help="Build date (default: today, local).")
+    parser.add_argument(
+        "--date", type=_date_arg, help="Build date, YYYY-MM-DD (default: today, local)."
+    )
     parser.add_argument("--repo", help="Token-OS repo root (default: auto-detect).")
     parser.add_argument("--vault", help="Imperium-ENV vault root (default: auto-detect).")
     parser.add_argument(
@@ -258,6 +269,13 @@ def main() -> int:
         warn(
             f"prior build note's head_sha {prior_head[:9]} is not a commit in {repo} "
             "(note written against another repo?) — ignoring it as a base anchor."
+        )
+        prior_head = None
+    elif prior_head and not git.is_ancestor(repo, prior_head, head_sha):
+        warn(
+            f"prior build note's head_sha {prior_head[:9]} is not an ancestor of "
+            f"{head_sha[:9]} (note written on a divergent branch?) — ignoring it as "
+            "a base anchor."
         )
         prior_head = None
     # All ranges walk from the resolved head sha (which may be a detached deploy
