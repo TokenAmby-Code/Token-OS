@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -196,13 +197,19 @@ def _resolve_vault_note(reference: str, vault_root: Path) -> Path | None:
 _SESSION_DIRS = ("Mars/Sessions", "Terra/Sessions")
 
 
+DIAGRAM_SCAN_TIMEOUT_S = 60
+
+
 def _reference_doc_candidates(vault_root: Path) -> list[Path] | None:
     """Fast prefilter for ``type: reference`` docs via grep.
 
     The vault holds thousands of session docs; reference (diagram) docs are a
     handful. grep scans them in one C-level pass instead of opening every file
     from Python (which is brutal over SMB/NAS). Returns ``None`` if grep is
-    unavailable so the caller can fall back to a full glob scan.
+    unavailable so the caller can fall back to a full glob scan. A wedged NAS
+    mount can pin grep in uninterruptible I/O forever — on timeout we skip
+    diagram enrichment entirely (``[]``, NOT the glob fallback, which would
+    hang against the same mount) so the build still lands.
     """
     dirs = [str(vault_root / base) for base in _SESSION_DIRS if (vault_root / base).is_dir()]
     if not dirs:
@@ -212,7 +219,15 @@ def _reference_doc_candidates(vault_root: Path) -> list[Path] | None:
             ["grep", "-rlE", r"^type:[[:space:]]*reference[[:space:]]*$", "--include=*.md", *dirs],
             capture_output=True,
             text=True,
+            timeout=DIAGRAM_SCAN_TIMEOUT_S,
         )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[daily-build] warning: vault diagram scan exceeded {DIAGRAM_SCAN_TIMEOUT_S}s "
+            "(wedged NAS mount?) — skipping diagram enrichment for this build.",
+            file=sys.stderr,
+        )
+        return []
     except OSError:
         return None
     if proc.returncode not in (0, 1):  # 0 = matches, 1 = no matches (both fine)

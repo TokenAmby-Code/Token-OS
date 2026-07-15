@@ -2,7 +2,7 @@
 """daily-build CLI — assemble the day's Obsidian-hosted build review note.
 
 Usage:
-    daily-build                       # since the last build (or last 24h)
+    daily-build                       # since the last build (or the build date's calendar day)
     daily-build --since <sha|date>    # override the base
     daily-build --date 2026-06-07     # assemble for a specific day (default: today)
     daily-build --dry-run             # print the note to stdout, write nothing
@@ -42,18 +42,44 @@ BUILDS_SUBDIR = "Terra/Journal/Builds"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
+def _git_toplevel(path: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", path, "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _is_code_repo(root: str) -> bool:
+    """Sentinel for the Token-OS code repo (the vault is a git repo too —
+    silently building against it produces an empty note)."""
+    return (Path(root) / "cli-tools" / "pyproject.toml").is_file()
+
+
 def _resolve_repo(arg: str | None) -> str:
-    for cand in (arg, os.environ.get("TOKEN_OS_DIR"), os.getcwd(), DEFAULT_REPO):
+    if arg:
+        top = _git_toplevel(arg)
+        if top and _is_code_repo(top):
+            return top
+        print(
+            f"error: --repo {arg} is not the Token-OS code repo "
+            "(no cli-tools/pyproject.toml at its git toplevel).",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    for cand in (os.environ.get("TOKEN_OS_DIR"), os.getcwd(), DEFAULT_REPO):
         if not cand:
             continue
-        proc = subprocess.run(
-            ["git", "-C", cand, "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode == 0:
-            return proc.stdout.strip()
-    return arg or DEFAULT_REPO
+        top = _git_toplevel(cand)
+        if top and _is_code_repo(top):
+            return top
+    print(
+        "error: could not auto-detect the Token-OS code repo "
+        "(cwd is not inside it — running from the vault?). Pass --repo <path>.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 def _resolve_vault(arg: str | None) -> Path:
@@ -76,6 +102,19 @@ def _resolve_db(arg: str | None) -> Path:
     if env:
         return Path(env)
     return Path.home() / ".claude" / "agents.db"
+
+
+MAX_WINDOW_DAYS = 7
+
+
+def _window_too_wide(base_date: str, build_date: str, max_days: int = MAX_WINDOW_DAYS) -> bool:
+    """True when an inherited base anchor would produce an unusably wide window."""
+    try:
+        base = datetime.strptime(base_date, "%Y-%m-%d")
+        build = datetime.strptime(build_date, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return False
+    return (build - base).days > max_days
 
 
 def _is_skip(fm: dict) -> bool:
@@ -198,18 +237,45 @@ def main() -> int:
         if args.verbose:
             print(f"[daily-build] {msg}", file=sys.stderr)
 
+    def warn(msg: str) -> None:
+        print(f"[daily-build] warning: {msg}", file=sys.stderr)
+
     log(f"repo={repo} vault={vault} db={db_path} date={date} ref={args.ref}")
 
-    prior_head = _prior_head_sha(builds_dir, date)
-    base_sha, base_date = git.resolve_base(repo, args.since, prior_head, args.ref)
     head_sha = git.repo_head(repo, args.ref)
-    log(f"base_sha={base_sha or '(none)'} base_date={base_date} head_sha={head_sha or '(none)'}")
     if not head_sha:
         print(f"error: could not resolve `{args.ref}` HEAD in {repo}", file=sys.stderr)
         return 1
+    remote_main_sha = git.remote_head(repo, args.ref)
+    if remote_main_sha and remote_main_sha != head_sha:
+        warn(
+            f"checkout {args.ref} ({head_sha[:9]}) != remote {args.ref} ({remote_main_sha[:9]}) "
+            "— the note covers the checkout, not deployed truth."
+        )
 
-    merged = git.merged_prs(repo, base_date)
-    log(f"merged PRs in window: {len(merged)}")
+    prior_head = _prior_head_sha(builds_dir, date)
+    if prior_head and not git.sha_in_repo(repo, prior_head):
+        warn(
+            f"prior build note's head_sha {prior_head[:9]} is not a commit in {repo} "
+            "(note written against another repo?) — ignoring it as a base anchor."
+        )
+        prior_head = None
+    # All ranges walk from the resolved head sha (which may be a detached deploy
+    # HEAD ahead of the named ref) so the note's head and its window agree.
+    base_sha, base_date = git.resolve_base(repo, args.since, prior_head, head_sha, build_date=date)
+    if not args.since and _window_too_wide(base_date, date):
+        warn(
+            f"inherited base {base_sha[:9] if base_sha else '(none)'} ({base_date}) is more than "
+            f"{MAX_WINDOW_DAYS} days before {date} — re-anchoring to the build date's calendar "
+            "day. Pass --since to widen deliberately."
+        )
+        base_sha, base_date = git.resolve_base(repo, None, None, head_sha, build_date=date)
+    log(f"base_sha={base_sha or '(none)'} base_date={base_date} head_sha={head_sha or '(none)'}")
+
+    commits = git.commits_in_range(repo, base_sha, head_sha)
+    gh_rows = git.merged_prs(repo, base_date)
+    merged = git.attribute_window(repo, commits, gh_rows, base_sha, head_sha)
+    log(f"merged PRs in window: {len(merged)} (git-attributed ∪ gh; gh rows: {len(gh_rows)})")
     reverse_index = build_diagram_index(vault)
 
     included: list[dict] = []
@@ -224,8 +290,7 @@ def main() -> int:
             included.append(thread)
             log(f"  #{pr['number']} {pr['headRefName']} → {thread['stem'] or 'no session doc'}")
 
-    commits = git.commits_in_range(repo, base_sha, args.ref)
-    churn = git.numstat_churn(repo, base_sha, args.ref)
+    churn = git.numstat_churn(repo, base_sha, head_sha)
     top_files = _rank_top_files(included, churn, repo)
     open_prs = git.open_prs(repo)
     log(f"commits={len(commits)} top_files={len(top_files)} open_prs={len(open_prs)}")
@@ -235,6 +300,7 @@ def main() -> int:
         base_sha=base_sha,
         base_date=base_date,
         head_sha=head_sha,
+        remote_main_sha=remote_main_sha,
         ref=args.ref,
         threads=included,
         opted_out=opted_out,
