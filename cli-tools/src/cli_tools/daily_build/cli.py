@@ -98,10 +98,10 @@ def _resolve_vault(arg: str | None) -> Path:
 def _resolve_db(arg: str | None) -> Path:
     if arg:
         return Path(arg)
-    env = os.environ.get("TOKEN_API_DB")
+    env = os.environ.get("TOKEN_API_AGENTS_DB") or os.environ.get("TOKEN_API_DB")
     if env:
         return Path(env)
-    return Path.home() / ".claude" / "agents.db"
+    return Path.home() / "runtimes" / "database" / "agents.db"
 
 
 def _date_arg(value: str) -> str:
@@ -229,7 +229,9 @@ def main() -> int:
     parser.add_argument("--repo", help="Token-OS repo root (default: auto-detect).")
     parser.add_argument("--vault", help="Imperium-ENV vault root (default: auto-detect).")
     parser.add_argument(
-        "--db", help="agents.db path (default: $TOKEN_API_DB or ~/.claude/agents.db)."
+        "--db",
+        help="agents.db path (default: $TOKEN_API_AGENTS_DB, $TOKEN_API_DB, "
+        "or ~/runtimes/database/agents.db).",
     )
     parser.add_argument("--ref", default="main", help="Branch tip to build to (default: main).")
     parser.add_argument("--dry-run", action="store_true", help="Print the note; write nothing.")

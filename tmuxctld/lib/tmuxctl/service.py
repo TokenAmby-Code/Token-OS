@@ -1235,7 +1235,12 @@ class TmuxControlPlane:
         max_age_seconds: int = 600,
     ) -> dict:
         """Focus the pane whose instance most recently emitted a TTS event."""
-        path = Path(db_path or os.environ.get("TOKEN_API_DB") or Path.home() / ".claude/agents.db")
+        path = Path(
+            db_path
+            or os.environ.get("TOKEN_API_AGENTS_DB")
+            or os.environ.get("TOKEN_API_DB")
+            or Path.home() / "runtimes" / "database" / "agents.db"
+        ).expanduser()
         if not path.exists():
             self.adapter.run(
                 "display-message",

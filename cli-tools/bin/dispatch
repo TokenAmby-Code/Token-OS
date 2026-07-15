@@ -162,7 +162,7 @@ DRY_RUN=false
 INTERACTIVE=false
 DISPATCH_SELF=false
 DISPATCH_AUTO_EXPANDED_PANE=""
-DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
+DB_PATH="${TOKEN_API_AGENTS_DB:-${TOKEN_API_DB:-$HOME/runtimes/database/agents.db}}"
 
 # Positional target shorthand: `dispatch legion ...` ≡ `dispatch --target mechanicus:new ...`
 # (same for mechanicus/civic and fixed prealloc pages palace/somnium). Only the

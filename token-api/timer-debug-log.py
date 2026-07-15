@@ -2,11 +2,19 @@
 """Log TUI timer prediction vs authoritative API state every 0.5s for pattern analysis."""
 
 import json
+import os
 import sqlite3
 import time
 import urllib.request
+from pathlib import Path
 
-DB_PATH = "/home/token/.claude/agents.db"
+DB_PATH = str(
+    Path(
+        os.environ.get("TOKEN_API_AGENTS_DB")
+        or os.environ.get("TOKEN_API_DB")
+        or Path.home() / "runtimes" / "database" / "agents.db"
+    ).expanduser()
+)
 API_URL = "http://localhost:7777"
 
 # Mirror the TUI's break rate table

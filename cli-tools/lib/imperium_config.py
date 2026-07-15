@@ -196,34 +196,21 @@ TMUXCTLD_URL = os.environ.get("TMUXCTLD_URL") or cfg("tmuxctld_url")
 RUNTIME_DATABASE_DIR = os.path.expanduser(
     os.environ.get("TOKEN_API_DATABASE_DIR") or "~/runtimes/database"
 )
-_LEGACY_AGENTS_DB = os.path.expanduser("~/.claude/agents.db")
-
-
-def _legacy_token_api_db_unless_live() -> str:
-    value = os.environ.get("TOKEN_API_DB") or ""
-    if value and os.path.abspath(os.path.expanduser(value)) != os.path.abspath(_LEGACY_AGENTS_DB):
-        return os.path.expanduser(value)
-    return ""
-
+_TOKEN_API_DB = os.path.expanduser(os.environ.get("TOKEN_API_DB") or "") or ""
 
 TOKEN_API_AGENTS_DB = os.path.expanduser(
     os.environ.get("TOKEN_API_AGENTS_DB")
-    or _legacy_token_api_db_unless_live()
+    or _TOKEN_API_DB
     or os.path.join(RUNTIME_DATABASE_DIR, "agents.db")
 )
 TOKEN_API_TIMER_DB = os.path.expanduser(
     os.environ.get("TOKEN_API_TIMER_DB")
-    or _legacy_token_api_db_unless_live()
+    or _TOKEN_API_DB
     or os.path.join(RUNTIME_DATABASE_DIR, "timer.db")
 )
-_LEGACY_TOKEN_API_DB = _legacy_token_api_db_unless_live()
 TOKEN_API_TELEMETRY_DB = os.path.expanduser(
     os.environ.get("TOKEN_API_TELEMETRY_DB")
-    or (
-        os.path.join(os.path.dirname(_LEGACY_TOKEN_API_DB), "telemetry.db")
-        if _LEGACY_TOKEN_API_DB
-        else ""
-    )
+    or (os.path.join(os.path.dirname(_TOKEN_API_DB), "telemetry.db") if _TOKEN_API_DB else "")
     or os.path.join(RUNTIME_DATABASE_DIR, "telemetry.db")
 )
 

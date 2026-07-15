@@ -105,15 +105,7 @@ _wp_agents_db() {
     # shellcheck source=nas-path.sh
     source "$lib_dir/nas-path.sh" 2>/dev/null || true
 
-    local legacy_agents_db="${HOME}/.claude/agents.db"
-    local token_api_db="${TOKEN_API_DB:-}"
-    if [[ -n "$token_api_db" ]]; then
-        local resolved legacy_resolved
-        resolved="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$token_api_db" 2>/dev/null || printf '%s' "$token_api_db")"
-        legacy_resolved="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$legacy_agents_db" 2>/dev/null || printf '%s' "$legacy_agents_db")"
-        [[ "$resolved" != "$legacy_resolved" ]] && { printf '%s\n' "$token_api_db"; return 0; }
-    fi
-    printf '%s\n' "${TOKEN_API_AGENTS_DB:-${TOKEN_API_DATABASE_DIR:-${HOME}/runtimes/database}/agents.db}"
+    printf '%s\n' "${TOKEN_API_AGENTS_DB:-${TOKEN_API_DB:-${TOKEN_API_DATABASE_DIR:-${HOME}/runtimes/database}/agents.db}}"
 }
 
 _wp_port_from_env_file() {

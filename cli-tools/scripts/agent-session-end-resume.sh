@@ -79,7 +79,7 @@ if command -v tmux >/dev/null 2>&1; then
     PANE_LABEL="$(tmux show-options -pv -t "$PANE" @PANE_ID 2>/dev/null || true)"
 fi
 
-DB_PATH="${TOKEN_API_DB:-${HOME}/.claude/agents.db}"
+DB_PATH="${TOKEN_API_AGENTS_DB:-${TOKEN_API_DB:-${HOME}/runtimes/database/agents.db}}"
 RESUME_ID=""
 if [[ -r "$DB_PATH" ]]; then
     for candidate in "$INSTANCE_ID" "$TOKEN_SESSION_ID" "$BRIDGE_ID" "$SESSION_ID"; do

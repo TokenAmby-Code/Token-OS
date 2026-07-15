@@ -55,7 +55,7 @@ if [[ -z "$DEV_CMD" ]]; then
     if [[ -f "$WORKTREE_ROOT/token-api/main.py" ]]; then
         # Fail closed (P0 2026-06-09): never launch a worktree token-api against
         # the live agents.db. TOKEN_API_DB must be set and must not resolve to it.
-        LIVE_DB="$HOME/.claude/agents.db"
+        LIVE_DB="$HOME/runtimes/database/agents.db"
         if [[ -z "${TOKEN_API_DB:-}" ]]; then
             echo "post-push: REFUSING to start token-api — TOKEN_API_DB not set in $ENV_FILE (would write live agents.db)"
             echo "post-push: run worktree-setup's DB seed or add TOKEN_API_DB=$WORKTREE_ROOT/token-api/.dev-agents.db"

@@ -191,9 +191,9 @@ Use `ssh mini` or the repo wrapper `cli-tools/bin/ssh-mac`.
 Recommended checks:
 
 ```bash
-ssh mini "sqlite3 ~/.claude/agents.db '.schema claude_instances'"
-ssh mini "sqlite3 ~/.claude/agents.db '.schema session_documents'"
-ssh mini "sqlite3 ~/.claude/agents.db 'pragma table_info(claude_instances);'"
+ssh mini "sqlite3 ~/runtimes/database/agents.db '.schema claude_instances'"
+ssh mini "sqlite3 ~/runtimes/database/agents.db '.schema session_documents'"
+ssh mini "sqlite3 ~/runtimes/database/agents.db 'pragma table_info(claude_instances);'"
 ```
 
 Then restart `token-api` and confirm:

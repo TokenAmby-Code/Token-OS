@@ -1,6 +1,6 @@
 # agents-db
 
-Query the local instance registry database (`~/.claude/agents.db`, SQLite).
+Query the local instance registry database (`~/runtimes/database/agents.db`, SQLite).
 
 ## Commands
 

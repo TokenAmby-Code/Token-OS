@@ -143,16 +143,9 @@ _OFFICIAL_MORNING_SOURCES = frozenset(
 
 
 def _db_path() -> Path:
-    legacy = Path.home() / ".claude" / "agents.db"
-    token_api_db = os.environ.get("TOKEN_API_DB")
-    compat = None
-    if token_api_db:
-        token_api_path = Path(token_api_db).expanduser()
-        if token_api_path.resolve() != legacy.resolve():
-            compat = token_api_db
     return Path(
         os.environ.get("TOKEN_API_AGENTS_DB")
-        or compat
+        or os.environ.get("TOKEN_API_DB")
         or Path.home() / "runtimes" / "database" / "agents.db"
     ).expanduser()
 

@@ -122,8 +122,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--db",
-        default=os.environ.get("TOKEN_API_DB", str(Path.home() / ".claude" / "agents.db")),
-        help="Path to agents.db (default: TOKEN_API_DB or ~/.claude/agents.db)",
+        default=(
+            os.environ.get("TOKEN_API_AGENTS_DB")
+            or os.environ.get("TOKEN_API_DB")
+            or str(Path.home() / "runtimes" / "database" / "agents.db")
+        ),
+        help="Path to agents.db (default: TOKEN_API_AGENTS_DB, TOKEN_API_DB, "
+        "or ~/runtimes/database/agents.db)",
     )
     args = parser.parse_args()
     print(json.dumps(audit(Path(args.db).expanduser()), indent=2, sort_keys=True))

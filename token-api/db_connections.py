@@ -29,24 +29,13 @@ BUSY_TIMEOUT_SECONDS = max(BUSY_TIMEOUT_MS / 1000.0, 0.001)
 RUNTIME_DATABASE_DIR = Path(
     os.environ.get("TOKEN_API_DATABASE_DIR", Path.home() / "runtimes" / "database")
 ).expanduser()
-LEGACY_AGENTS_DB_PATH = Path.home() / ".claude" / "agents.db"
-
-
-def _legacy_token_api_db_unless_live() -> str | None:
-    value = os.environ.get("TOKEN_API_DB")
-    if not value:
-        return None
-    path = Path(value).expanduser()
-    if path.resolve() == LEGACY_AGENTS_DB_PATH.resolve():
-        return None
-    return value
 
 
 def _split_db_path(env_name: str, filename: str) -> Path:
     value = os.environ.get(env_name)
     if value:
         return Path(value).expanduser()
-    legacy = _legacy_token_api_db_unless_live()
+    legacy = os.environ.get("TOKEN_API_DB")
     if legacy:
         # Preserve dev/test redirection without collapsing every split store into
         # the same file.  ``TOKEN_API_DB=/tmp/agents.db`` yields
@@ -64,7 +53,7 @@ def resolve_telemetry_db_path() -> Path:
 
 AGENTS_DB_PATH = Path(
     os.environ.get("TOKEN_API_AGENTS_DB")
-    or _legacy_token_api_db_unless_live()
+    or os.environ.get("TOKEN_API_DB")
     or RUNTIME_DATABASE_DIR / "agents.db"
 ).expanduser()
 TIMER_DB_PATH = _split_db_path("TOKEN_API_TIMER_DB", "timer.db")
