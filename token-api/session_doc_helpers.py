@@ -385,6 +385,40 @@ def update_frontmatter(
     )
 
 
+async def stamp_session_doc_branch(
+    db: aiosqlite.Connection,
+    doc_id: int,
+    branch: str,
+    *,
+    file_path: Path | str | None = None,
+) -> None:
+    """Stamp a session doc's current lane branch (k12-era registry R4).
+
+    The DB row is truth: UPDATE session_documents.branch (+updated_at) on the
+    caller's connection — the caller owns the transaction/commit. The
+    frontmatter ``branch:`` key is a best-effort readability mirror; file
+    errors are logged, never raised. Restamp-same is idempotent; re-dispatch
+    onto a new branch last-writes, matching the worktree registry's
+    one-active invariant. When ``file_path`` is omitted it is read from the
+    doc's own row.
+    """
+    await db.execute(
+        "UPDATE session_documents SET branch = ?, updated_at = ? WHERE id = ?",
+        (branch, datetime.now().isoformat(), doc_id),
+    )
+    if file_path is None:
+        cursor = await db.execute("SELECT file_path FROM session_documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        file_path = row[0] if row else None
+    if not file_path:
+        return
+    fp = Path(file_path)
+    try:
+        await asyncio.to_thread(update_frontmatter, fp, {"branch": branch})
+    except Exception as exc:
+        logger.warning(f"branch stamp: frontmatter mirror failed for {fp}: {exc}")
+
+
 def update_session_doc_worktrees(
     file_path: Path,
     *,
@@ -442,6 +476,11 @@ def update_session_doc_worktrees(
                         "claimed_at": claimed_at,
                     }
                 )
+            # Top-level `branch:` mirrors the active entry's branch in the same
+            # atomic write (k12-era R4). Archive leaves it alone — the
+            # last-known branch stays as attribution truth.
+            if branch:
+                fm["branch"] = branch
         else:  # archive
             for w in wts:
                 if w.get("path") == path and w.get("status") == "active":

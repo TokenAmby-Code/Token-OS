@@ -1369,6 +1369,10 @@ WORKTREE_DECISION="n/a (not a code checkout)"
 # --require-free (so the dir is provably exclusive). Every other launch enters a
 # pre-existing dir and must pass the duplicate-refusal guard before launching.
 WORKTREE_FRESHLY_CREATED=false
+# The lane branch this dispatch entered a worktree for — forwarded to the child
+# as TOKEN_API_WORKTREE_BRANCH so SessionStart can stamp the session doc's
+# branch column (k12-era R4). Empty when no worktree was entered.
+DISPATCHED_WORKTREE_BRANCH=""
 
 dispatch_conf_var() {
   ( BARE_REPO=""; WORKTREE_PARENT=""; SECRETS_DIR=""; SYNC_SUBDIR=""
@@ -1447,6 +1451,7 @@ enter_worktree_for_project() {
     assert_worktree_pr_capable "$wt_path" "$proj"
     WORKTREE_DECISION="created+entered $WORK_DIR (branch $branch)"
     WORKTREE_FRESHLY_CREATED=true
+    DISPATCHED_WORKTREE_BRANCH="$branch"
   else
     err "worktree-setup refused/failed for branch '$branch' (already claimed?); refusing to dispatch into shared checkout $WORK_DIR"
     err "pass --worktree <new-branch> or --no-worktree"
@@ -1471,6 +1476,7 @@ maybe_enter_worktree() {
     if (( ${#resume_worktree_matches[@]} == 1 )); then
       WORK_DIR="$(cd "${resume_worktree_matches[0]}" && pwd)"
       WORKTREE_DECISION="resume entered existing $WORK_DIR (branch $WORKTREE_BRANCH)"
+      DISPATCHED_WORKTREE_BRANCH="$WORKTREE_BRANCH"
       return 0
     fi
     if (( ${#resume_worktree_matches[@]} > 1 )); then
@@ -2011,6 +2017,7 @@ COMMON_ENV=(
   "TOKEN_API_DISPATCH_SLOT=${DISPATCH_SLOT}"
   "TOKEN_API_DISPATCH_SESSION_DOC_PATH=${SESSION_DOC}"
   "TOKEN_API_TARGET_WORKING_DIR=${WORK_DIR}"
+  "TOKEN_API_WORKTREE_BRANCH=${DISPATCHED_WORKTREE_BRANCH:-}"
   "TOKEN_API_LAUNCH_MODE=${LAUNCH_MODE}"
   "TOKEN_API_INSTANCE_TYPE=${INSTANCE_TYPE}"
   "TOKEN_API_ZEALOTRY=${ZEALOTRY}"
@@ -2112,6 +2119,8 @@ DISPATCH_INHERITED_ENV_SCRUB=(
   SESSION_DOC
   TOKEN_API_SESSION_DOC_PATH
   SESSION_DOC_PATH
+  TOKEN_API_WORKTREE_BRANCH
+  WORKTREE_BRANCH
 )
 
 build_agent_command() {
