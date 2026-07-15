@@ -7,8 +7,10 @@
 // woven into event provenance (hook-never-fired vs swallowed-after-arrival).
 
 import {
+  CloseRequestSchema,
   LaunchRequestSchema,
   SendRequestSchema,
+  StopRequestSchema,
   type EntitiesResponse,
   type EntityEventsResponse,
 } from '@token-os/contracts';
@@ -82,6 +84,32 @@ export function buildRoutes(daemon: Daemon, build: BuildInfo, machine: string): 
         if (!parsed.success) return json({ ok: false, error: 'invalid_send_request', detail: parsed.error.issues }, 422);
         const res = await daemon.send(parsed.data, receipt(req));
         // Admission refusal fails loud (not admitted); gated/delivered are 200.
+        if ('refused' in res) return json(res, 422);
+        return json(res, 200);
+      },
+    },
+    {
+      method: 'POST',
+      match: exact('/close'),
+      label: 'POST /close',
+      handler: async (req) => {
+        const parsed = CloseRequestSchema.safeParse(await readJson(req));
+        if (!parsed.success) return json({ ok: false, error: 'invalid_close_request', detail: parsed.error.issues }, 422);
+        const res = await daemon.close(parsed.data, receipt(req));
+        // A refused/failed close (no binding, reap failed, schema mismatch) is loud:
+        // non-2xx so a caller can never read a no-op as success.
+        return json(res, res.closed ? 200 : 409);
+      },
+    },
+    {
+      method: 'POST',
+      match: exact('/stop'),
+      label: 'POST /stop',
+      handler: async (req) => {
+        const parsed = StopRequestSchema.safeParse(await readJson(req));
+        if (!parsed.success) return json({ ok: false, error: 'invalid_stop_request', detail: parsed.error.issues }, 422);
+        const res = await daemon.stop(parsed.data, receipt(req));
+        // Ghost/schema refusal fails loud (nothing recorded); recorded/deduped are 200.
         if ('refused' in res) return json(res, 422);
         return json(res, 200);
       },

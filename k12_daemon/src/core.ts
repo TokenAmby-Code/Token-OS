@@ -9,6 +9,8 @@ import {
   SCHEMA_VERSION,
   SEND_PRESENCE_ACTIVITY_WINDOW_MS,
   type ActivityBoardRow,
+  type CloseRequest,
+  type CloseResponse,
   type DeliveryVerdict,
   type EventInput,
   type EventRecord,
@@ -24,6 +26,10 @@ import {
   type SendRefusalReason,
   type SendRequest,
   type SendResolution,
+  type StopReceipt,
+  type StopRefusal,
+  type StopRefusalReason,
+  type StopRequest,
 } from '@token-os/contracts';
 import { EventStore } from './store.ts';
 import { findTmuxId } from './ids.ts';
@@ -321,6 +327,123 @@ export class Daemon {
       bytes_delivered: bytes,
       send_seq: this.store.readByEntity(sendId).at(-1)?.seq ?? -1,
     };
+  }
+
+  // ── /close — the generic "close this instance" system (rung 3) ──────────────
+  // Reaps the agent process and returns the estate seat to the freelist. Terminal
+  // chain (retired + process_reaped + seat_cleared) is atomic and only written
+  // AFTER the process is confirmed reaped — a retire-with-live-process is
+  // unspellable (spec §4). No silent no-op: an unbound target or a failed reap
+  // refuses loud and changes nothing (the mac mark-for-close-noop class, killed).
+  close(req: CloseRequest, transportReceipt: string | null = null): Promise<CloseResponse> {
+    return this.locked(async () => {
+      if (req.schema_version !== SCHEMA_VERSION) {
+        return {
+          ok: false,
+          target: req.target,
+          seat_id: null,
+          instance_id: null,
+          closed: false,
+          reason: `schema_version_mismatch: daemon pins ${SCHEMA_VERSION}, request sent ${req.schema_version}`,
+        };
+      }
+
+      const proj = this.projections();
+      const binding = proj.currentBindings.find((b) => b.seat_id === req.target || b.instance_id === req.target);
+      if (!binding) {
+        // Refuse loud — closing a non-bound target is a no-op the caller must see,
+        // never a silent success (the mac /mark-for-close returned ok on nothing).
+        return {
+          ok: false,
+          target: req.target,
+          seat_id: null,
+          instance_id: null,
+          closed: false,
+          reason: 'no_binding: target resolves to no current binding (already free or never bound)',
+        };
+      }
+
+      // Reap FIRST; attest only on a confirmed kill. respawn-pane -k keeps the
+      // estate pane (bare shell) → the seat survives and returns to the freelist.
+      const reaped = await this.tmux.reapSeat(binding.seat_id);
+      if (!reaped) {
+        return {
+          ok: false,
+          target: req.target,
+          seat_id: binding.seat_id,
+          instance_id: binding.instance_id,
+          closed: false,
+          reason: 'reap_failed: agent process could not be reaped; seat left bound (fail-loud, no half-close)',
+        };
+      }
+
+      const occurred_at = this.now();
+      const prov = this.prov('observer', transportReceipt);
+      // One transaction: instance retired + process reaped + seat cleared. seat_cleared
+      // frees the binding (the ledger PROJECTION follows — no separate ledger to leak).
+      const inputs: EventInput[] = [];
+      if (binding.instance_id) {
+        inputs.push({ entity_type: 'instance', entity_id: binding.instance_id, event_type: 'reg.retired', payload: {}, provenance: prov, occurred_at });
+      }
+      inputs.push({ entity_type: 'seat', entity_id: binding.seat_id, event_type: 'reg.process_reaped', payload: { instance_id: binding.instance_id }, provenance: prov, occurred_at });
+      inputs.push({ entity_type: 'seat', entity_id: binding.seat_id, event_type: 'reg.seat_cleared', payload: {}, provenance: prov, occurred_at });
+      this.store.appendAll(inputs);
+
+      return { ok: true, target: req.target, seat_id: binding.seat_id, instance_id: binding.instance_id, closed: true, reason: null };
+    });
+  }
+
+  // ── /stop — the stop-hook's door (rung 3) ───────────────────────────────────
+  // Three honest outcomes, no blind swallow: record a fresh stop (bound + live),
+  // dedupe a repeat/late stop (act.receipt_deduped), or REFUSE a ghost — a stop for
+  // an id that never walked through /launch. The ghost is refused at admission, so
+  // nothing is recorded: no phantom row, no re-firing subscription (the 77f7cfb4
+  // class is structurally dead). The stop-hook is a REAL but UNTRUSTED witness.
+  stop(req: StopRequest, transportReceipt: string | null = null): Promise<StopReceipt | StopRefusal> {
+    return this.locked(async () => {
+      if (req.schema_version !== SCHEMA_VERSION) {
+        return this.refuseStop('schema_version_mismatch', req.instance_id);
+      }
+
+      const proj = this.projections();
+      // Ghost preclusion: never bound ⇒ never existed ⇒ refuse loud.
+      if (!proj.everBoundInstances.has(req.instance_id)) {
+        return this.refuseStop('no_such_instance', req.instance_id);
+      }
+
+      const activity = proj.activityByInstance.get(req.instance_id) ?? null;
+      const stillBound = proj.currentBindings.some((b) => b.instance_id === req.instance_id);
+      // Dedupe: already stopped/retired, or already closed (no longer bound) →
+      // idempotent, but RECORDED as receipt_deduped (never a blind swallow).
+      if (activity === 'stopped' || activity === 'retired' || !stillBound) {
+        this.store.append({
+          entity_type: 'instance',
+          entity_id: req.instance_id,
+          event_type: 'act.receipt_deduped',
+          payload: { of: 'stop_reported', reason: activity ?? 'unbound' },
+          provenance: this.prov('observer', transportReceipt),
+          occurred_at: this.now(),
+        });
+        return { ok: true, instance_id: req.instance_id, recorded: false, deduped: true, activity };
+      }
+
+      // Fresh stop for a live, bound instance → record it (activity → stopped).
+      this.store.append({
+        entity_type: 'instance',
+        entity_id: req.instance_id,
+        event_type: 'act.stop_reported',
+        payload: {},
+        provenance: this.prov('hook', transportReceipt),
+        occurred_at: this.now(),
+      });
+      return { ok: true, instance_id: req.instance_id, recorded: true, deduped: false, activity: 'stopped' };
+    });
+  }
+
+  private refuseStop(reason: StopRefusalReason, instanceId: string): StopRefusal {
+    const logged = findTmuxId(instanceId) ? '<redacted-tmux-id>' : instanceId;
+    console.error(JSON.stringify({ level: 'error', event: 'stop_refused', reason, instance_id: logged }));
+    return { ok: false, refused: true, reason, instance_id: instanceId };
   }
 
   // ── /reconcile — replay + contradiction observation (spec §6) ───────────────

@@ -11,6 +11,8 @@
         { "method": "GET", "path": "/health" },
         { "method": "POST", "path": "/launch" },
         { "method": "POST", "path": "/send" },
+        { "method": "POST", "path": "/close" },
+        { "method": "POST", "path": "/stop" },
         { "method": "POST", "path": "/reconcile" },
         { "method": "GET", "path": "/entities" },
         { "method": "GET", "pathPrefix": "/entities/" }
