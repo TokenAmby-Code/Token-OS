@@ -55,4 +55,11 @@ SHIM
 # installer can be exercised end-to-end against a sandbox in tests without
 # touching the real vendor binaries.
 install_one claude "${CLAUDE_FRONT_DOOR:-$HOME/.local/bin/claude}"
-install_one codex "${CODEX_FRONT_DOOR:-/opt/homebrew/bin/codex}"
+if [[ -n "${CODEX_FRONT_DOOR:-}" ]]; then
+  _codex_front="$CODEX_FRONT_DOOR"
+elif [[ -e "$HOME/.local/bin/codex" || -L "$HOME/.local/bin/codex" || -e "$HOME/.local/bin/codex.token-os-real" || -L "$HOME/.local/bin/codex.token-os-real" ]]; then
+  _codex_front="$HOME/.local/bin/codex"
+else
+  _codex_front="/opt/homebrew/bin/codex"
+fi
+install_one codex "$_codex_front"
