@@ -90,6 +90,13 @@ def _runtime_git_sha() -> str | None:
     return sha or None
 
 
+# Git SHA of the checkout this process loaded code from. Captured ONCE at
+# import so it reflects the code THIS process is running and cannot drift if
+# the live checkout advances under a still-running server (mirrors
+# main.py:_capture_launched_git_sha on the hub).
+LAUNCHED_GIT_SHA = _runtime_git_sha()
+
+
 # PowerShell script for persistent TTS engine.
 # Uses SpeakAsync so the main loop stays responsive to skip/poll/pause/resume commands.
 # Also supports file-based synthesis (SetOutputToWaveFile) for replay/persistence.
@@ -2183,7 +2190,11 @@ async def health():
         "status": "ok",
         "service": "token-satellite",
         "timestamp": datetime.now().isoformat(),
-        "git_sha": _runtime_git_sha(),
+        # Process truth: the sha this server is actually running. checkout_sha
+        # is the on-disk checkout — divergence means a refresh landed but the
+        # restart didn't (observable drift instead of a masked deploy gap).
+        "git_sha": LAUNCHED_GIT_SHA,
+        "checkout_sha": _runtime_git_sha(),
         "runtime_path": str(REPO_ROOT),
         "tts_engine": "running"
         if tts_engine._process and tts_engine._process.poll() is None
@@ -3065,7 +3076,12 @@ def _cd_converge() -> dict:
     externally via /health.git_sha parity. Safe to call repeatedly: a current
     runtime never spawns a refresh, and the helper holds a flock.
     """
-    current = _runtime_git_sha()
+    # Compare against process truth, not checkout truth: if a prior refresh
+    # checked out the target but the restart never happened (e.g. the helper
+    # crashed mid-flight), checkout==target would mask the stale process and
+    # converge would no-op forever. Process≠target re-runs the idempotent
+    # refresh, whose restart heals exactly that state.
+    current = LAUNCHED_GIT_SHA
     target, source = _cd_resolve_target()
     result = {"node": "wsl", "was": current, "target": target, "source": source}
     if not target:

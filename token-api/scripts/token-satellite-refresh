@@ -86,8 +86,13 @@ repo_helper="$live/token-api/scripts/token-satellite-refresh"
 if [[ -f "$repo_helper" && "$helper_install" != "$repo_helper" ]]; then
   echo "installing refreshed helper: $helper_install"
   mkdir -p "$(dirname "$helper_install")"
-  cp "$repo_helper" "$helper_install"
-  chmod +x "$helper_install"
+  # Atomic replace: this script IS $helper_install while running. cp truncates
+  # the inode bash is reading and crashes the refresh mid-flight; mv swaps the
+  # directory entry so the running process keeps its original inode.
+  tmp="$(dirname "$helper_install")/.token-satellite-refresh.tmp.$$"
+  cp "$repo_helper" "$tmp"
+  chmod +x "$tmp"
+  mv -f "$tmp" "$helper_install"
 fi
 
 changed_paths=$(

@@ -219,6 +219,16 @@ jobs:
   # GREEN: the satellite's boot-time converge self-heals any missed ping. The
   # only red outcome is an ACKed converge that then fails /health git_sha
   # parity — that means the box heard us and still didn't land the deploy.
+  #
+  # Shape: a single re-ping loop, NOT ping-then-verify. The box resolves its
+  # target from the hub deploy record, and the hub's own restart leg may not
+  # have recorded this merge yet when the first ping lands (hub lag) — a
+  # one-shot ping would converge to the PREVIOUS sha and the verify step would
+  # red on ~every GitHub-side merge. /cd/converge is idempotent and
+  # flock-serialized, so re-pinging until process truth reaches the merged sha
+  # is safe; later pings see the caught-up hub record. No `needs:` on the mac
+  # leg on purpose — coupling to that flaky leg would trade one false red for
+  # another.
   converge-wsl:
     name: converge (wsl)
     runs-on: ubuntu-latest
@@ -247,47 +257,43 @@ jobs:
           tags: tag:ci
           args: --accept-routes
 
-      - name: POST converge ping (miss-tolerant)
-        id: ping
+      - name: Converge via re-ping loop (miss-tolerant)
         if: steps.gate.outputs.go == 'true'
-        env:
-          WSL_HOST: ${{ secrets.TAILSCALE_IP_WSL }}
-        run: |
-          echo "Pinging WSL satellite converge for merge ${{ github.sha }}"
-          code=$(curl -sS -o /tmp/wsl_converge.json -w '%{http_code}' \
-            -m 20 -X POST "http://${WSL_HOST}:7777/cd/converge" || echo "000")
-          echo "HTTP $code"
-          cat /tmp/wsl_converge.json 2>/dev/null || true
-          echo
-          if [ "$code" != "200" ]; then
-            echo "::notice::WSL converge ping not delivered (HTTP $code) — box likely OFF or unreachable; boot-time converge will self-heal. Staying green."
-            echo "acked=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "acked=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Verify live satellite SHA (only after an ACK)
-        if: steps.gate.outputs.go == 'true' && steps.ping.outputs.acked == 'true'
         env:
           SHA: ${{ github.sha }}
           WSL_HOST: ${{ secrets.TAILSCALE_IP_WSL }}
         run: |
-          deadline=$((SECONDS + 120))
+          echo "Converging WSL satellite to merge $SHA"
+          deadline=$((SECONDS + 180))
+          acked=false
           last=""
-          echo "Verifying WSL satellite /health git_sha reaches $SHA"
           while [ "$SECONDS" -lt "$deadline" ]; do
-            if curl -fsS -m 5 "http://${WSL_HOST}:7777/health" -o /tmp/wsl_health.json; then
-              last=$(jq -r '.git_sha // empty' /tmp/wsl_health.json)
-              if [ "$last" = "$SHA" ]; then
-                echo "WSL satellite converged: /health git_sha=$last"
-                exit 0
-              fi
-              echo "Waiting for live sha: got '${last:-empty}', want '$SHA'"
-            else
-              echo "Waiting for /health to respond"
+            code=$(curl -sS -o /tmp/wsl_converge.json -w '%{http_code}' \
+              -m 20 -X POST "http://${WSL_HOST}:7777/cd/converge" || echo "000")
+            echo "converge POST → HTTP $code"
+            cat /tmp/wsl_converge.json 2>/dev/null || true
+            echo
+            if [ "$code" = "200" ]; then
+              acked=true
             fi
-            sleep 5
+            # Give the box a window to land the refresh, polling process truth.
+            poll_deadline=$((SECONDS + 20))
+            while [ "$SECONDS" -lt "$poll_deadline" ]; do
+              if curl -fsS -m 5 "http://${WSL_HOST}:7777/health" -o /tmp/wsl_health.json; then
+                last=$(jq -r '.git_sha // empty' /tmp/wsl_health.json)
+                if [ "$last" = "$SHA" ]; then
+                  echo "WSL satellite converged: /health git_sha=$last"
+                  exit 0
+                fi
+              fi
+              sleep 5
+            done
+            echo "not converged yet (git_sha='${last:-empty}', want '$SHA') — re-pinging"
           done
-          echo "::error::WSL CONVERGE ALARM: satellite ACKed the converge ping but /health git_sha='${last:-unreachable}' != merged sha '$SHA' after 120s"
+          if [ "$acked" = "false" ]; then
+            echo "::notice::WSL converge never ACKed (box likely OFF or unreachable) — boot-time converge will self-heal. Staying green."
+            exit 0
+          fi
+          echo "::error::WSL CONVERGE ALARM: satellite ACKed a converge ping but /health git_sha='${last:-unreachable}' != merged sha '$SHA' after 180s"
           cat /tmp/wsl_health.json 2>/dev/null || true
           exit 1
