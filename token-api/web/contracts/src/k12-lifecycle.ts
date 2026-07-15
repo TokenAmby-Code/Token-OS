@@ -303,6 +303,67 @@ export const SendRefusalSchema = z.object({
 });
 export type SendRefusal = z.infer<typeof SendRefusalSchema>;
 
+// ── Close operation (rung 3) — the generic "close this instance" system ──────
+// Executes the terminal-retirement chain for a bound estate seat: reg.retired +
+// reg.process_reaped (the agent process is reaped) + reg.seat_cleared (binding
+// cleared → seat returns to the freelist). The persistent estate PANE is kept
+// and respawned bare, so the estate stays standing. Reap-first, attest-after: the
+// three events are recorded only once the process is confirmed reaped, so a
+// retire-with-live-process is unspellable — a failed reap refuses loud, changing
+// nothing (spec §4: retired is not terminal until process_reaped + seat_cleared).
+export const CloseRequestSchema = z.object({
+  target: z.string().min(1), // canonical seat id OR instance id — never a tmux %id
+  schema_version: z.number().int(),
+});
+export type CloseRequest = z.infer<typeof CloseRequestSchema>;
+
+export const CloseResponseSchema = z.object({
+  ok: z.boolean(),
+  target: z.string(),
+  seat_id: z.string().nullable(),
+  instance_id: z.string().nullable(),
+  closed: z.boolean(), // true = full retire chain attested + seat freed
+  reason: z.string().nullable(),
+});
+export type CloseResponse = z.infer<typeof CloseResponseSchema>;
+
+// ── Stop ingestion (rung 3) — the stop-hook's door into the daemon ───────────
+// A stop-hook reports that an instance's turn ended. The door has three honest
+// outcomes, none of them a blind swallow:
+//   - recorded: a fresh act.stop_reported for a currently-bound, not-yet-stopped
+//     instance (activity → stopped).
+//   - deduped: a repeat/late stop for an instance already stopped or already
+//     closed — writes act.receipt_deduped (idempotent, NO blind swallow).
+//   - refused: a stop for an instance that NEVER walked through /launch (never
+//     bound) — a ghost. Refused loud at admission; nothing recorded, so no
+//     phantom row and no re-firing subscription can exist (the 77f7cfb4 class).
+export const StopRequestSchema = z.object({
+  instance_id: z.string().min(1), // canonical instance id ONLY — never a tmux %id
+  schema_version: z.number().int(),
+});
+export type StopRequest = z.infer<typeof StopRequestSchema>;
+
+export const STOP_REFUSAL_REASONS = ['no_such_instance', 'schema_version_mismatch'] as const;
+export type StopRefusalReason = (typeof STOP_REFUSAL_REASONS)[number];
+export const StopRefusalReasonSchema = z.enum(STOP_REFUSAL_REASONS);
+
+export const StopReceiptSchema = z.object({
+  ok: z.literal(true),
+  instance_id: z.string(),
+  recorded: z.boolean(), // true = stop_reported appended; false = deduped
+  deduped: z.boolean(),
+  activity: ActivityStateSchema.nullable(), // resulting activity for the instance
+});
+export type StopReceipt = z.infer<typeof StopReceiptSchema>;
+
+export const StopRefusalSchema = z.object({
+  ok: z.literal(false),
+  refused: z.literal(true),
+  reason: StopRefusalReasonSchema,
+  instance_id: z.string(),
+});
+export type StopRefusal = z.infer<typeof StopRefusalSchema>;
+
 export const ReconcileResponseSchema = z.object({
   ok: z.boolean(),
   replayed_events: z.number().int(),

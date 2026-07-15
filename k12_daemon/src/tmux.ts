@@ -30,6 +30,14 @@ export interface TmuxControlPlane {
   /** Kill the seat's pane (teardown). Idempotent. */
   killSeat(seatId: string): Promise<void>;
   /**
+   * Reap the seat's agent PROCESS while KEEPING the estate pane: respawn the pane
+   * bare (kill the running command, restart the shell). The pane id and its
+   * canonical-id tag survive, so the seat stays in the estate and returns to the
+   * freelist live+empty. Returns false if the pane could not be resolved/respawned
+   * (caller must NOT attest process_reaped/seat_cleared on a failed reap).
+   */
+  reapSeat(seatId: string): Promise<boolean>;
+  /**
    * Canonical ids of seats an attached client is actively on within windowMs —
    * a point-in-time READ of the server-maintained client_activity + active
    * pane. No shadow state, no keystroke hook.
@@ -115,6 +123,15 @@ export class RealTmux implements TmuxControlPlane {
     if (paneId) await run(this.socket, ['kill-pane', '-t', paneId]);
   }
 
+  async reapSeat(seatId: string): Promise<boolean> {
+    const paneId = await this.resolvePane(seatId);
+    if (!paneId) return false;
+    // -k kills the pane's current command; the pane (and its @canonical_id option)
+    // is REUSED and a fresh default shell is started — the estate seat persists.
+    const r = await run(this.socket, ['respawn-pane', '-k', '-t', paneId]);
+    return r.code === 0;
+  }
+
   async presentSeats(windowMs: number, nowMs = Date.now()): Promise<Set<string>> {
     // Active pane (canonical) per session.
     const panes = await run(this.socket, [
@@ -160,6 +177,7 @@ export class FakeTmux implements TmuxControlPlane {
   private seats = new Map<string, { pane: 'live' | 'dead' }>();
   private present = new Map<string, number>(); // seat -> last activity epoch ms
   private failCreate = new Set<string>(); // seats whose createSeat is forced to throw
+  private failReap = new Set<string>(); // seats whose reapSeat is forced to fail
   reachableFlag = true;
 
   async reachable(): Promise<boolean> {
@@ -184,6 +202,19 @@ export class FakeTmux implements TmuxControlPlane {
   async killSeat(seatId: string): Promise<void> {
     const s = this.seats.get(seatId);
     if (s) s.pane = 'dead';
+  }
+  async reapSeat(seatId: string): Promise<boolean> {
+    // Respawn keeps the pane LIVE (bare shell) — a live seat is reapable; a dead
+    // or missing pane is not (nothing to respawn without a teardown+recreate).
+    if (this.failReap.has(seatId)) return false;
+    const s = this.seats.get(seatId);
+    if (!s || s.pane === 'dead') return false;
+    s.pane = 'live';
+    return true;
+  }
+  /** Test control: force reapSeat(seatId) to fail (simulates a wedged process). */
+  failReapSeat(seatId: string): void {
+    this.failReap.add(seatId);
   }
   /** Test control: kill a pane out-of-band (simulates a raw tmux kill). */
   killOutOfBand(seatId: string): void {
