@@ -66,6 +66,7 @@ from session_doc_helpers import (
     create_deferred_interactive_session_doc,
     read_frontmatter,
     resolve_session_doc_for_start,
+    stamp_session_doc_branch,
     update_frontmatter,
 )
 from shared import (
@@ -215,6 +216,43 @@ def _is_dev_worktree_dir(working_dir: str | None) -> bool:
     except Exception:
         return False
     return len(rel.parts) == 2 and rel.parts[-1].startswith("wt-")
+
+
+def _read_worktree_env_branch(working_dir: str | None) -> str | None:
+    """Fallback branch source when the dispatch env is absent (--continue,
+    manual launches): exact parse of WORKTREE_BRANCH= from the worktree's own
+    .worktree.env (written by worktree-setup). No derivation, no slugify —
+    missing/unreadable means None (k12-era R4 honest-NULL)."""
+    if not working_dir:
+        return None
+    env_file = Path(working_dir) / ".worktree.env"
+    try:
+        if not env_file.is_file():
+            return None
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("WORKTREE_BRANCH="):
+                value = line.split("=", 1)[1].strip()
+                return value or None
+    except OSError:
+        return None
+    return None
+
+
+async def _stamp_branch_for_start(
+    db, *, doc_id: int | None, branch: str | None, policy: str | None
+) -> None:
+    """Best-effort lane-branch stamp after session-doc resolution (k12-era R4).
+
+    Shared daily notes never get a lane branch; a failed stamp must never
+    break SessionStart registration."""
+    if not doc_id or not branch or policy == "daily_note":
+        return
+    try:
+        await stamp_session_doc_branch(db, doc_id, branch)
+    except Exception as exc:
+        logger.warning(
+            "SessionStart: branch stamp failed for doc %s (branch %s): %s", doc_id, branch, exc
+        )
 
 
 def _spawn_dev_server_stop(working_dir: str | None, session_id: str) -> None:
@@ -2788,6 +2826,11 @@ async def handle_session_start(payload: dict) -> dict:
     )
     if launch_instance_type not in VALID_LAUNCH_INSTANCE_TYPES:
         launch_instance_type = None
+    # Lane branch for the R4 session-doc stamp: dispatch env first, then the
+    # worktree's own .worktree.env (covers --continue / manual launches).
+    worktree_branch = _normalize_text(
+        payload.get("worktree_branch") or env.get("TOKEN_API_WORKTREE_BRANCH", "")
+    ) or _read_worktree_env_branch(working_dir)
     # Persona/orchestrator pane (tmuxctl stamps a stable @PANE_ID like
     # "council:custodes" / "mechanicus:fabricator-general" / "council:administratum").
     # A fresh spawn in one of these panes IS that persona — derive its row identity
@@ -3113,6 +3156,12 @@ async def handle_session_start(payload: dict) -> dict:
                         legion=dispatch_legion or None,
                     )
                     session_doc_policy = resolved_session_doc_policy or session_doc_policy
+                    await _stamp_branch_for_start(
+                        db,
+                        doc_id=resolved_session_doc_id,
+                        branch=worktree_branch,
+                        policy=resolved_session_doc_policy,
+                    )
                 workflow_state = _derive_launch_workflow_state(
                     dispatch_target=dispatch_target,
                     engine=engine,
@@ -3486,6 +3535,12 @@ async def handle_session_start(payload: dict) -> dict:
                         legion=dispatch_legion or None,
                     )
                     session_doc_policy = resolved_session_doc_policy or session_doc_policy
+                    await _stamp_branch_for_start(
+                        db,
+                        doc_id=resolved_session_doc_id,
+                        branch=worktree_branch,
+                        policy=resolved_session_doc_policy,
+                    )
                 workflow_state = _derive_launch_workflow_state(
                     dispatch_target=dispatch_target,
                     engine=engine,
@@ -3921,6 +3976,12 @@ async def handle_session_start(payload: dict) -> dict:
             legion=dispatch_legion or None,
         )
         session_doc_policy = resolved_session_doc_policy or session_doc_policy
+        await _stamp_branch_for_start(
+            db,
+            doc_id=session_doc_id,
+            branch=worktree_branch,
+            policy=resolved_session_doc_policy,
+        )
         # Automated launch that couldn't resolve a doc: leave session_doc_id NULL
         # (no placeholder minted) and surface the miss for the orchestrator.
         if session_doc_id is None and resolved_session_doc_policy == "unresolved_dispatch":

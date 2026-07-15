@@ -215,6 +215,7 @@ from session_doc_helpers import (
     read_frontmatter,
     reconcile_coderabbit_comments,
     serialize_frontmatter,
+    stamp_session_doc_branch,
     unique_human_path,
     update_frontmatter,
     update_rubric_field,
@@ -1418,6 +1419,8 @@ class SessionDocCreateRequest(BaseModel):
     project: str | None = None
     file_path: str | None = None
     primarch_name: str | None = None
+    # Lane branch for the doc (k12-era R4); optional, honest-NULL when absent.
+    branch: str | None = None
 
 
 class SessionDocUpdateRequest(BaseModel):
@@ -11933,6 +11936,19 @@ async def session_doc_worktrees(doc_id: int, request: Request):
         except Exception as exc:
             logger.warning(f"worktrees: write failed for doc {doc_id}: {exc}")
             raise HTTPException(status_code=500, detail=f"worktree registry write failed: {exc}")
+
+    # DB-truth leg of the branch stamp (k12-era R4): a claim carrying a branch
+    # sets session_documents.branch alongside the frontmatter mirror written by
+    # update_session_doc_worktrees above. Covers worktree-setup --session-doc
+    # flows with zero client plumbing. Archive never clears it — last-known
+    # branch stays as attribution truth.
+    if action == "claim" and body.get("branch"):
+        async with connect_agents_db(DB_PATH) as db:
+            await db.execute(
+                "UPDATE session_documents SET branch = ?, updated_at = ? WHERE id = ?",
+                (body.get("branch"), datetime.now().isoformat(), doc_id),
+            )
+            await db.commit()
 
     administratum_delivery = None
     if action == "claim":
@@ -29202,9 +29218,17 @@ async def create_session_doc(request: SessionDocCreateRequest):
     now = datetime.now().isoformat()
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
-            """INSERT INTO session_documents (title, file_path, project, primarch_name, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'active', ?, ?)""",
-            (request.title, str(fp), request.project, request.primarch_name, now, now),
+            """INSERT INTO session_documents (title, file_path, project, primarch_name, branch, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (
+                request.title,
+                str(fp),
+                request.project,
+                request.primarch_name,
+                request.branch,
+                now,
+                now,
+            ),
         )
         doc_id = cursor.lastrowid
 
@@ -29223,6 +29247,13 @@ async def create_session_doc(request: SessionDocCreateRequest):
         await db.commit()
 
     create_session_doc_file(fp, request.title, doc_id, request.project, request.primarch_name)
+
+    # Frontmatter mirror of the branch already inserted above (restamp-same is
+    # idempotent; the helper never raises on file errors).
+    if request.branch:
+        async with connect_agents_db(DB_PATH) as db:
+            await stamp_session_doc_branch(db, doc_id, request.branch, file_path=fp)
+            await db.commit()
 
     await log_event(
         "session_doc_created",
@@ -29868,12 +29899,13 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
 
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
-            """INSERT INTO session_documents (title, file_path, project, status, created_at, updated_at)
-               VALUES (?, ?, ?, 'active', ?, ?)""",
+            """INSERT INTO session_documents (title, file_path, project, branch, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'active', ?, ?)""",
             (
                 request.title,
                 str(fp),
                 request.project,
+                request.branch,
                 datetime.now().isoformat(),
                 datetime.now().isoformat(),
             ),
@@ -29918,6 +29950,13 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
         await db.commit()
 
     create_session_doc_file(fp, request.title, doc_id, request.project)
+
+    # Frontmatter mirror of the branch already inserted above (restamp-same is
+    # idempotent; the helper never raises on file errors).
+    if request.branch:
+        async with connect_agents_db(DB_PATH) as db:
+            await stamp_session_doc_branch(db, doc_id, request.branch, file_path=fp)
+            await db.commit()
 
     # Handle orphan cleanup for old doc
     if old_doc_id:
