@@ -11,6 +11,7 @@ Run directly: uv run --directory cli-tools python tests/test_daily_build_attribu
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -275,6 +276,66 @@ def test_is_ancestor_gates_divergent_anchor() -> None:
         check("ancestor: empty shas rejected", not git.is_ancestor(tmp, "", c))
 
 
+def test_gh_slug_resolution_and_repo_flag() -> None:
+    """Runtime checkout has no GitHub remote → bare gh resolved no repo, 0 rows.
+
+    _gh_slug order: GH_REPO env > remote-derived > Token-OS default; every
+    gh pr-list call must carry the explicit --repo flag.
+    """
+    orig_run = git._run
+    orig_env = os.environ.pop("GH_REPO", None)
+    calls: list[list[str]] = []
+
+    def make_run(remote_url: str):
+        def fake_run(args: list[str], cwd: str, **kw: object) -> subprocess.CompletedProcess:
+            calls.append(args)
+            if args[:3] == ["git", "remote", "get-url"]:
+                rc = 0 if remote_url else 1
+                return subprocess.CompletedProcess(args, rc, stdout=f"{remote_url}\n", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+
+        return fake_run
+
+    try:
+        os.environ["GH_REPO"] = "envorg/envrepo"
+        git._run = make_run("git@github.com:someorg/somerepo.git")  # type: ignore[assignment]
+        check("slug: GH_REPO env wins over remote", git._gh_slug("/repo") == "envorg/envrepo")
+        del os.environ["GH_REPO"]
+
+        check("slug: ssh remote derived", git._gh_slug("/repo") == "someorg/somerepo")
+        git._run = make_run("https://github.com/other/thing.git")  # type: ignore[assignment]
+        check("slug: https remote derived", git._gh_slug("/repo") == "other/thing")
+
+        # the live failure shape: only remote is the local CD bare path
+        git._run = make_run("/Users/x/runtimes/Token-OS/token-os.git")  # type: ignore[assignment]
+        check(
+            "slug: local-path remote falls back to default",
+            git._gh_slug("/repo") == "TokenAmby-Code/Token-OS",
+        )
+        check(
+            "web_url: never empty on the runtime shape",
+            git.web_url("/repo") == "https://github.com/TokenAmby-Code/Token-OS",
+        )
+
+        calls.clear()
+        git.merged_prs("/repo", "2026-07-14")
+        git.open_prs("/repo")
+        gh_calls = [c for c in calls if c and c[0] == "gh"]
+        check("gh: both pr-list calls issued", len(gh_calls) == 2, f"got {len(gh_calls)}")
+        check(
+            "gh: every call carries explicit --repo slug",
+            all(
+                "--repo" in c and c[c.index("--repo") + 1] == "TokenAmby-Code/Token-OS"
+                for c in gh_calls
+            ),
+            str(gh_calls),
+        )
+    finally:
+        git._run = orig_run  # type: ignore[assignment]
+        if orig_env is not None:
+            os.environ["GH_REPO"] = orig_env
+
+
 def main() -> int:
     for test in (
         test_git_truth_survives_gh_outage,
@@ -288,6 +349,7 @@ def main() -> int:
         test_window_cap,
         test_date_arg_validation,
         test_is_ancestor_gates_divergent_anchor,
+        test_gh_slug_resolution_and_repo_flag,
     ):
         print(f"— {test.__name__}")
         try:

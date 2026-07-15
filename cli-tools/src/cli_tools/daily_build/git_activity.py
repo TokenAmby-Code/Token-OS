@@ -10,6 +10,7 @@ with whatever activity could be resolved.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from datetime import datetime, timedelta
@@ -158,6 +159,30 @@ def resolve_base(
     return sha, commit_date(repo, sha) or fallback
 
 
+# The runtime checkout's only remote is the local CD bare (a path, not GitHub),
+# so bare ``gh`` invoked there resolves no repo and pr-list silently returns
+# nothing. Resolve an explicit owner/name slug instead and pass it as --repo on
+# every gh call. The hardcoded default is safe: cli.py's _resolve_repo sentinel
+# guarantees daily-build only ever runs against the Token-OS code repo.
+_GH_URL_RE = re.compile(r"(?:git@github\.com:|https://github\.com/)([^/]+/[^/\s]+?)(?:\.git)?$")
+_DEFAULT_GH_SLUG = "TokenAmby-Code/Token-OS"
+
+
+def _gh_slug(repo: str) -> str:
+    """owner/name for ``gh --repo``: GH_REPO env > remote-derived > Token-OS."""
+    env = os.environ.get("GH_REPO")
+    if env:
+        return env
+    for remote in ("origin", "github"):
+        proc = _run(["git", "remote", "get-url", remote], repo)
+        if proc.returncode != 0:
+            continue
+        match = _GH_URL_RE.match(proc.stdout.strip())
+        if match:
+            return match.group(1)
+    return _DEFAULT_GH_SLUG
+
+
 def merged_prs(repo: str, base_date: str) -> list[dict]:
     """PRs merged into ``main`` on/after ``base_date`` (newest first)."""
     if not base_date:
@@ -167,6 +192,8 @@ def merged_prs(repo: str, base_date: str) -> list[dict]:
             "gh",
             "pr",
             "list",
+            "--repo",
+            _gh_slug(repo),
             "--base",
             "main",
             "--state",
@@ -197,6 +224,8 @@ def open_prs(repo: str) -> list[dict]:
             "gh",
             "pr",
             "list",
+            "--repo",
+            _gh_slug(repo),
             "--base",
             "main",
             "--state",
@@ -249,18 +278,8 @@ def window_shas(repo: str, base_sha: str, ref: str = "main") -> set[str]:
 
 
 def web_url(repo: str) -> str:
-    """https URL of the repo's GitHub remote, or '' if none resolvable."""
-    for remote in ("origin", "github"):
-        proc = _run(["git", "remote", "get-url", remote], repo)
-        if proc.returncode != 0:
-            continue
-        url = proc.stdout.strip()
-        match = re.match(
-            r"(?:git@github\.com:|https://github\.com/)([^/]+/[^/\s]+?)(?:\.git)?$", url
-        )
-        if match:
-            return f"https://github.com/{match.group(1)}"
-    return ""
+    """https URL of the repo's GitHub home (same slug resolution as gh calls)."""
+    return f"https://github.com/{_gh_slug(repo)}"
 
 
 def _parse_iso(value: str | None) -> datetime | None:
