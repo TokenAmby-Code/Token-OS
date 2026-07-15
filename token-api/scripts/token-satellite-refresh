@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# token-satellite-refresh — satellite-local Token-OS runtime/AHK cache updater.
+# token-satellite-refresh — satellite-local Token-OS runtime updater.
 # Intended install location: ~/.local/bin/token-satellite-refresh (outside runtime).
+# The Windows AHK deploy is owned by Token-Fleet machines/wsl/apply.sh
+# (2026-07-14 payload cutover); this script only syncs the runtime checkout.
 set -euo pipefail
 
 sha="${1:-}"
@@ -19,11 +21,6 @@ bare="${TOKEN_OS_CD_BARE_REPO:-$base/token-os.git}"
 live="${TOKEN_OS_RUNTIME_CHECKOUT:-$base/live}"
 git_url="${TOKEN_OS_GIT_URL:-git@github.com:TokenAmby-Code/Token-OS.git}"
 venv="${UV_PROJECT_ENVIRONMENT:-$HOME/.local/venvs/token-api}"
-ahk_cache="${TOKEN_OS_AHK_DIR:-/mnt/c/TokenOS/ahk}"
-windows_user="${TOKEN_OS_WINDOWS_USER:-colby}"
-windows_user_profile="${TOKEN_OS_WINDOWS_USER_PROFILE:-/mnt/c/Users/$windows_user}"
-startup_root="${TOKEN_OS_STARTUP_ROOT:-$windows_user_profile/Imperium-Startup}"
-refresh_windows_ahk="${TOKEN_OS_REFRESH_WINDOWS_AHK:-auto}"
 helper_install="${TOKEN_SATELLITE_REFRESH_HELPER_INSTALL:-$HOME/.local/bin/token-satellite-refresh}"
 lock_dir="${XDG_STATE_HOME:-$HOME/.local/state}"
 lock_file="$lock_dir/token-satellite-refresh.lock"
@@ -114,62 +111,6 @@ done <<< "$changed_paths"
 if [[ "$needs_uv" == true ]]; then
   echo "syncing token-api venv: $venv"
   (cd "$live/token-api" && UV_PROJECT_ENVIRONMENT="$venv" uv sync)
-fi
-
-is_windows_ahk_available() {
-  case "$refresh_windows_ahk" in
-    never|false|0) return 1 ;;
-    always|true|1) return 0 ;;
-  esac
-  [[ -d /mnt/c && ( -d "$(dirname "$ahk_cache")" || -d "$windows_user_profile" || -n "${WSL_DISTRO_NAME:-}" ) ]]
-}
-
-copy_file() {
-  local src="$1" dst="$2"
-  if [[ ! -f "$src" ]]; then
-    echo "missing required AHK deploy source: $src" >&2
-    exit 69
-  fi
-  mkdir -p "$(dirname "$dst")"
-  cp -f "$src" "$dst"
-}
-
-if is_windows_ahk_available; then
-  if [[ ! -d /mnt/c && "$refresh_windows_ahk" != "auto" ]]; then
-    echo "Windows AHK refresh requested but /mnt/c is unavailable" >&2
-    exit 70
-  fi
-  echo "refreshing Windows AHK cache: $ahk_cache"
-  mkdir -p "$ahk_cache"
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a --delete "$live/ahk/" "$ahk_cache/"
-  else
-    find "$ahk_cache" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-    cp -a "$live/ahk/." "$ahk_cache/"
-  fi
-
-  echo "refreshing Windows startup AHK artifacts: $windows_user_profile / $startup_root"
-  copy_file "$live/ahk/startup.ahk" "$windows_user_profile/startup.ahk"
-  copy_file "$live/ahk/ahk-nas-wait.bat" "$windows_user_profile/ahk-nas-wait.bat"
-  copy_file "$live/ahk/ring-remap.ahk" "$startup_root/ring-remap.ahk"
-  # script-compiler is launched from C:\TokenOS\ahk.  Keep the Imperium-Startup
-  # copy fresh too so the manual/diagnostic copy cannot drift silently.
-  copy_file "$live/ahk/script-compiler.ahk" "$startup_root/script-compiler.ahk"
-
-  validator="$live/token-api/scripts/validate-windows-ahk-startup-drift"
-  if [[ -x "$validator" ]]; then
-    echo "validating Windows AHK startup drift"
-    TOKEN_OS_RUNTIME_CHECKOUT="$live" \
-      TOKEN_OS_AHK_DIR="$ahk_cache" \
-      TOKEN_OS_WINDOWS_USER_PROFILE="$windows_user_profile" \
-      TOKEN_OS_STARTUP_ROOT="$startup_root" \
-      "$validator"
-  else
-    echo "missing startup drift validator: $validator" >&2
-    exit 71
-  fi
-else
-  echo "Windows AHK cache unavailable; skipping Windows-only AHK artifact refresh"
 fi
 
 make_runtime_readonly

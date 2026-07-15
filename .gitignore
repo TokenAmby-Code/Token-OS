@@ -6,9 +6,6 @@
 .env.*
 !.env.example
 
-# Private AHK macros (contains passwords, emails, etc.)
-ahk/private.ahk
-
 # Config files with secrets
 config.json
 mesh-pipe/config.json
