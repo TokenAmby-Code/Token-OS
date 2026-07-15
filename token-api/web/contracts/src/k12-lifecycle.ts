@@ -8,8 +8,9 @@
 //   - ONE stream, typed domains within it (`reg.*` / `act.*`) — the domain is a
 //     prefix on `event_type`, NOT a second store. reg.* = registration/binding
 //     lifecycle + daemon observations; act.* = agent behavior + send activity.
-//   - The seed 16 event types are CLOSED day-one — no additions without a
-//     `schema_version` bump landed daemon+cockpit together.
+//   - The event vocabulary is CLOSED — no additions without a `schema_version`
+//     bump. The seed was 16 (v1); v2 added `reg.stop_subscribed` → 17, per this
+//     rule (rung 3, the registration close/subscribe door).
 //   - The single `status` field is DEAD. Orthogonal axes only.
 //   - `schema_version` is a single integer; the daemon pins it exactly.
 //
@@ -20,7 +21,12 @@ import { z } from 'zod';
 // The daemon pins this exact integer. Additive vocabulary = minor bump (cockpit
 // conforms lazily); breaking changes land daemon+cockpit in ONE PR. Old events
 // replay under the vocabulary that wrote them via `provenance.emitter_version`.
-export const SCHEMA_VERSION = 1;
+//
+// v2 (rung 3): additive — adds `reg.stop_subscribed` (the generic stop-hook
+// subscription that composes `final message → auto-close`). Old v1 events replay
+// unchanged; the seed set grew by one WITH this bump, per spec §3 ("no additions
+// without a schema_version bump").
+export const SCHEMA_VERSION = 2;
 
 // ── Entities ────────────────────────────────────────────────────────────────
 // The four entity kinds the daemon tracks. `send` is a first-class entity: a
@@ -43,6 +49,7 @@ export const REG_EVENT_NAMES = [
   'wrapper_started',
   'session_started',
   'bound',
+  'stop_subscribed', // v2: a close-on-next-stop subscription (bound-keyed, satiated-once)
   'contradiction_flagged',
   'teardown_started',
   'process_reaped',
@@ -67,13 +74,15 @@ export const ACT_EVENT_NAMES = [
 ] as const;
 
 // The qualified event_type union (`<domain>.<name>`), enumerated literally so
-// the type stays a narrow literal union and stays greppable. 10 reg + 6 act = 16.
+// the type stays a narrow literal union and stays greppable. 11 reg + 6 act = 17
+// (v2: +reg.stop_subscribed).
 export const EVENT_TYPES = [
   'reg.dispatch_requested',
   'reg.pane_created',
   'reg.wrapper_started',
   'reg.session_started',
   'reg.bound',
+  'reg.stop_subscribed',
   'reg.contradiction_flagged',
   'reg.teardown_started',
   'reg.process_reaped',
@@ -347,14 +356,56 @@ export const STOP_REFUSAL_REASONS = ['no_such_instance', 'schema_version_mismatc
 export type StopRefusalReason = (typeof STOP_REFUSAL_REASONS)[number];
 export const StopRefusalReasonSchema = z.enum(STOP_REFUSAL_REASONS);
 
+// A recorded stop can reflexively fire a close-on-stop subscription (rung-3 PR-B).
+// `auto_close` reports that side effect honestly: 'fired' = the subscription ran
+// and the seat was closed; 'reap_failed' = it tried but the process wouldn't reap
+// (logged loud, instance left stopped+bound — visible, never a silent leak);
+// 'none' = no open subscription (the common case).
+export const STOP_AUTO_CLOSE_OUTCOMES = ['none', 'fired', 'reap_failed'] as const;
+export type StopAutoCloseOutcome = (typeof STOP_AUTO_CLOSE_OUTCOMES)[number];
+export const StopAutoCloseOutcomeSchema = z.enum(STOP_AUTO_CLOSE_OUTCOMES);
+
 export const StopReceiptSchema = z.object({
   ok: z.literal(true),
   instance_id: z.string(),
   recorded: z.boolean(), // true = stop_reported appended; false = deduped
   deduped: z.boolean(),
   activity: ActivityStateSchema.nullable(), // resulting activity for the instance
+  auto_close: StopAutoCloseOutcomeSchema, // reflexive close-on-stop side effect
 });
 export type StopReceipt = z.infer<typeof StopReceiptSchema>;
+
+// ── Subscribe (rung 3 PR-B) — the generic stop-hook subscription system ──────
+// One day-one action: `close`. Composing `/subscribe` (mark) with `/stop` (the
+// hook's door) yields `final message → auto-close on next stop-hook` — no bespoke
+// latch, no special reflexive fold. BOUND-KEYED by construction: a subscription
+// can only be created for a currently-bound instance, so an orphan/never-bound id
+// can never hold one — the 77f7cfb4 re-firing-subscription class is structurally
+// dead. Satiation is DERIVED (fires on the first stop_reported after the subscribe
+// seq); no separate fire/satiate event.
+export const SUBSCRIBE_ACTIONS = ['close'] as const;
+export type SubscribeAction = (typeof SUBSCRIBE_ACTIONS)[number];
+export const SubscribeActionSchema = z.enum(SUBSCRIBE_ACTIONS);
+
+export const SubscribeRequestSchema = z.object({
+  instance_id: z.string().min(1), // canonical instance id ONLY — never a tmux %id
+  schema_version: z.number().int(),
+  action: SubscribeActionSchema.default('close'),
+});
+export type SubscribeRequest = z.infer<typeof SubscribeRequestSchema>;
+
+export const SUBSCRIBE_REFUSAL_REASONS = ['not_bound', 'schema_version_mismatch'] as const;
+export type SubscribeRefusalReason = (typeof SUBSCRIBE_REFUSAL_REASONS)[number];
+export const SubscribeRefusalReasonSchema = z.enum(SUBSCRIBE_REFUSAL_REASONS);
+
+export const SubscribeResponseSchema = z.object({
+  ok: z.boolean(),
+  instance_id: z.string(),
+  action: SubscribeActionSchema.nullable(),
+  subscribed: z.boolean(), // false = refused (never bound / schema mismatch)
+  reason: z.string().nullable(),
+});
+export type SubscribeResponse = z.infer<typeof SubscribeResponseSchema>;
 
 export const StopRefusalSchema = z.object({
   ok: z.literal(false),

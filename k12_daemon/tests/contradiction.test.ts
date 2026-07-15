@@ -16,7 +16,7 @@ function setup() {
 
 test('out-of-band pane kill on a bound seat → contradiction_flagged, p0, health ok=false', async () => {
   const { tmux, store, d } = setup();
-  await d.launch({ seat_id: 'palace:W', schema_version: 1, identity: 'i-1', persona: 'salamander', tint: '#302800' });
+  await d.launch({ seat_id: 'palace:W', schema_version: 2, identity: 'i-1', persona: 'salamander', tint: '#302800' });
 
   // Raw kill below the daemon — no teardown_started/process_reaped/seat_cleared attested.
   tmux.killOutOfBand('palace:W');
@@ -43,7 +43,7 @@ test('out-of-band pane kill on a bound seat → contradiction_flagged, p0, healt
 
 test('re-reconcile does not double-flag an already-open contradiction', async () => {
   const { tmux, d } = setup();
-  await d.launch({ seat_id: 'palace:W', schema_version: 1, identity: 'i-1', persona: 'salamander', tint: '#302800' });
+  await d.launch({ seat_id: 'palace:W', schema_version: 2, identity: 'i-1', persona: 'salamander', tint: '#302800' });
   tmux.killOutOfBand('palace:W');
 
   const first = await d.reconcile();

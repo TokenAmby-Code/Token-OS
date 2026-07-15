@@ -13,10 +13,10 @@ function setup() {
 // A bare seat: launch with NO attestations creates the seat (pane_created) but
 // never binds — resolvable as an unbound live seat.
 async function bareSeat(d: Daemon, seat: string) {
-  await d.launch({ seat_id: seat, schema_version: 1 });
+  await d.launch({ seat_id: seat, schema_version: 2 });
 }
 async function boundSeat(d: Daemon, seat: string, identity: string) {
-  await d.launch({ seat_id: seat, schema_version: 1, identity, persona: 'salamander', tint: '#302800' });
+  await d.launch({ seat_id: seat, schema_version: 2, identity, persona: 'salamander', tint: '#302800' });
 }
 
 // Spec §5: ONE chokepoint; enqueue-by-default; typed gate/refusal causes; the
@@ -25,7 +25,7 @@ async function boundSeat(d: Daemon, seat: string, identity: string) {
 test('bare pane, operator idle → enqueue-by-default then delivered', async () => {
   const { store, d } = setup();
   await bareSeat(d, 'somnium:NE');
-  const res = (await d.send({ target: 'somnium:NE', text: 'hello', schema_version: 1 })) as SendReceipt;
+  const res = (await d.send({ target: 'somnium:NE', text: 'hello', schema_version: 2 })) as SendReceipt;
   expect(res.verdict).toBe('delivered');
   expect(res.gate_reason).toBe(null);
   expect(res.bytes_delivered).toBe(5);
@@ -36,7 +36,7 @@ test('bare pane, operator idle → enqueue-by-default then delivered', async () 
 
 test('unresolved target REFUSED at admission — never gated, never enqueued', async () => {
   const { store, d } = setup();
-  const res = await d.send({ target: 'ghost:X', text: 'hi', schema_version: 1 });
+  const res = await d.send({ target: 'ghost:X', text: 'hi', schema_version: 2 });
   // The #699 class is unrepresentable: an unresolved target is a typed REFUSAL,
   // never a typing_guard gate.
   expect(res).toMatchObject({ ok: false, refused: true, reason: 'pane_unresolved', target: 'ghost:X' });
@@ -47,7 +47,7 @@ test('operator present → gated typing_guard, window echoed, STAYS enqueued (no
   const { tmux, store, d } = setup();
   await bareSeat(d, 'somnium:NE');
   tmux.setPresence('somnium:NE', Date.now()); // active within the window
-  const res = (await d.send({ target: 'somnium:NE', text: 'hello', schema_version: 1 })) as SendReceipt;
+  const res = (await d.send({ target: 'somnium:NE', text: 'hello', schema_version: 2 })) as SendReceipt;
   expect(res.verdict).toBe('enqueued_gated');
   expect(res.gate_reason).toBe('typing_guard'); // TRUE cause, not pane_unresolved
   expect(res.activity_window_ms).toBe(SEND_PRESENCE_ACTIVITY_WINDOW_MS); // no buried magic number
@@ -65,7 +65,7 @@ test('receipt carries the send OWN resolution (never re-derived) — bound_seq p
   const boundSeq = store.readAll().find((e) => e.event_type === 'reg.bound')!.seq;
   // Resolve by the INSTANCE id — a different surface than the seat id, so a
   // re-derivation would diverge. It must not.
-  const res = (await d.send({ target: 'i-42', text: 'yo', schema_version: 1 })) as SendReceipt;
+  const res = (await d.send({ target: 'i-42', text: 'yo', schema_version: 2 })) as SendReceipt;
   expect(res.verdict).toBe('delivered');
   expect(res.resolution.target).toBe('i-42');
   expect(res.resolution.seat_id).toBe('palace:W');
@@ -85,7 +85,7 @@ test('partial delivery (inserted, not submitted) → partial_delivered carries b
   const store = new EventStore(`/tmp/k12send-${crypto.randomUUID()}.sqlite`);
   const d = new Daemon(store, new PartialTmux());
   await bareSeat(d, 'somnium:NE'); // operator idle → reaches delivery
-  const res = (await d.send({ target: 'somnium:NE', text: 'hello', schema_version: 1 })) as SendReceipt;
+  const res = (await d.send({ target: 'somnium:NE', text: 'hello', schema_version: 2 })) as SendReceipt;
   expect(res.verdict).toBe('partial_delivered');
   expect(res.bytes_delivered).toBe(5); // contract: partial MUST carry non-null byte evidence
   const types = store.readAll().map((e) => e.event_type);

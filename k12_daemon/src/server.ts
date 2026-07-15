@@ -11,6 +11,7 @@ import {
   LaunchRequestSchema,
   SendRequestSchema,
   StopRequestSchema,
+  SubscribeRequestSchema,
   type EntitiesResponse,
   type EntityEventsResponse,
 } from '@token-os/contracts';
@@ -112,6 +113,18 @@ export function buildRoutes(daemon: Daemon, build: BuildInfo, machine: string): 
         // Ghost/schema refusal fails loud (nothing recorded); recorded/deduped are 200.
         if ('refused' in res) return json(res, 422);
         return json(res, 200);
+      },
+    },
+    {
+      method: 'POST',
+      match: exact('/subscribe'),
+      label: 'POST /subscribe',
+      handler: async (req) => {
+        const parsed = SubscribeRequestSchema.safeParse(await readJson(req));
+        if (!parsed.success) return json({ ok: false, error: 'invalid_subscribe_request', detail: parsed.error.issues }, 422);
+        const res = await daemon.subscribe(parsed.data, receipt(req));
+        // A refused subscribe (not bound / schema mismatch) is loud: non-2xx.
+        return json(res, res.subscribed ? 200 : 409);
       },
     },
     {

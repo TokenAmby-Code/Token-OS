@@ -32,7 +32,7 @@ test('GET /entities resolves to the collection route, not the events route', () 
 
 test('server serves collection at /entities and event stream at /entities/:id/events', async () => {
   const d = daemon();
-  await d.launch({ seat_id: 'somnium:NE', schema_version: 1, identity: 'i1', persona: 'p', tint: '#1' });
+  await d.launch({ seat_id: 'somnium:NE', schema_version: 2, identity: 'i1', persona: 'p', tint: '#1' });
   const srv = makeServer({ bind: '127.0.0.1', port: 0, daemon: d, build, machine: 'test' });
   try {
     const coll = await fetch(`http://127.0.0.1:${srv.port}/entities`);

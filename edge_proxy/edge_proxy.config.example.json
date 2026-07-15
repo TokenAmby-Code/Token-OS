@@ -13,6 +13,7 @@
         { "method": "POST", "path": "/send" },
         { "method": "POST", "path": "/close" },
         { "method": "POST", "path": "/stop" },
+        { "method": "POST", "path": "/subscribe" },
         { "method": "POST", "path": "/reconcile" },
         { "method": "GET", "path": "/entities" },
         { "method": "GET", "pathPrefix": "/entities/" }

@@ -18,12 +18,14 @@ control plane (Bun/TypeScript). Door step 1 skeleton — see the ruled spec
   `contradiction_flagged` event (p0, fail-loud in bring-up mode), never a
   silently synthesized lifecycle.
 
-## HTTP surface (spec §7 + rung-3 close/stop door)
+## HTTP surface (spec §7 + rung-3 registration door)
 
-Eight honest endpoints, bound to loopback only. Ingress is via the per-box
+Nine honest endpoints, bound to loopback only. Ingress is via the per-box
 `edge_proxy` ONLY (see below) — the daemon never faces the tailnet directly. The
-seed six are spec §7; `/close` and `/stop` are the rung-3 registration-door pair
-(the generic close system + the stop-hook's door).
+seed six are spec §7; `/close`, `/stop`, and `/subscribe` are the rung-3
+registration-door trio: the generic close system, the stop-hook's door, and the
+generic stop-hook subscription. Composing `/subscribe` (action `close`) with
+`/stop` yields `final message → auto-close on next stop-hook` — no bespoke latch.
 
 | Method | Path                     | Purpose                                   |
 |--------|--------------------------|-------------------------------------------|
@@ -31,7 +33,8 @@ seed six are spec §7; `/close` and `/stop` are the rung-3 registration-door pai
 | POST   | `/launch`                | Atomic reg-audited seat bind / handover   |
 | POST   | `/send`                  | Send chokepoint (enqueue-by-default)      |
 | POST   | `/close`                 | Generic close: reap process, keep estate pane, seat → freelist |
-| POST   | `/stop`                  | Stop-hook door: record / dedupe / refuse-ghost |
+| POST   | `/stop`                  | Stop-hook door: record / dedupe / refuse-ghost; fires auto-close |
+| POST   | `/subscribe`             | Bound-keyed close-on-next-stop subscription (satiated-once) |
 | POST   | `/reconcile`             | Replay-driven reconcile; p0 on contradiction |
 | GET    | `/entities`              | `activity_board` projection (collection)  |
 | GET    | `/entities/:id/events`   | Per-entity event stream                   |
