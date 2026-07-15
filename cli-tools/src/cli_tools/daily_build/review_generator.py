@@ -19,7 +19,13 @@ def _fmt_date(iso: str | None) -> str:
 
 
 def _frontmatter(
-    date: str, base_sha: str, head_sha: str, generated_at: str, n_threads: int, n_opted_out: int
+    date: str,
+    base_sha: str,
+    head_sha: str,
+    remote_main_sha: str,
+    generated_at: str,
+    n_threads: int,
+    n_opted_out: int,
 ) -> str:
     base = base_sha or ""
     return (
@@ -30,6 +36,8 @@ def _frontmatter(
         f'daily_note: "[[Daily/{date}]]"\n'
         f"covered_base_sha: {base}\n"
         f"head_sha: {head_sha}\n"
+        "head_source: checkout\n"
+        f"remote_main_sha: {remote_main_sha}\n"
         "status: active\n"
         f"generated_at: {generated_at}\n"
         f"thread_count: {n_threads}\n"
@@ -38,20 +46,38 @@ def _frontmatter(
     )
 
 
+def _pr_line(pr: dict, branch: str) -> str:
+    num = pr["number"]
+    line = f"- **#{num}** {pr['title']}"
+    if branch:
+        line += f" (`{branch}`)"
+    line += f" — merged {_fmt_date(pr.get('mergedAt'))}"
+    if pr.get("url"):
+        line += f" · [link]({pr['url']})"
+    return line
+
+
 def _bundle_section(
     threads: list[dict],
     commits: list[tuple],
     base_sha: str,
     base_date: str,
     head_sha: str,
+    remote_main_sha: str,
     ref: str,
 ) -> str:
     lines = ["## Bundle", ""]
-    short_base = base_sha[:9] if base_sha else "(bootstrap: last 24h)"
+    short_base = base_sha[:9] if base_sha else "(bootstrap: build-date calendar day)"
     lines.append(
         f"*Base `{short_base}` (merged since {base_date or '?'}) → "
-        f"`{head_sha[:9] or '?'}` on `{ref}`.*"
+        f"checkout `{head_sha[:9] or '?'}` on `{ref}`.*"
     )
+    if remote_main_sha and remote_main_sha != head_sha:
+        lines.append("")
+        lines.append(
+            f"> ⚠️ Checkout `{ref}` (`{head_sha[:9]}`) ≠ remote `{ref}` "
+            f"(`{remote_main_sha[:9]}`) — this note covers the checkout, not deployed truth."
+        )
     lines.append("")
 
     by_pr: dict[int, list[tuple]] = {}
@@ -64,15 +90,24 @@ def _bundle_section(
 
     if not threads:
         lines.append("- *No merged PRs resolved for this window.*")
+    covered_nums: set[int] = set()
     for thread in threads:
         pr = thread["pr"]
         num = pr["number"]
-        lines.append(
-            f"- **#{num}** {pr['title']} (`{thread['branch']}`) — "
-            f"merged {_fmt_date(pr.get('mergedAt'))} · [link]({pr['url']})"
-        )
+        covered_nums.add(num)
+        lines.append(_pr_line(pr, thread["branch"]))
         for sha, subject in by_pr.get(num, []):
             lines.append(f"  - `{sha}` {subject}")
+
+    # Belt and braces: a PR-numbered commit is never silently dropped, even if
+    # it somehow escaped the attribution union above.
+    leftovers = {num: pairs for num, pairs in by_pr.items() if num not in covered_nums}
+    if leftovers:
+        lines.append("")
+        lines.append("**PR-attributed commits without a thread entry:**")
+        for num in sorted(leftovers, reverse=True):
+            for sha, subject in leftovers[num]:
+                lines.append(f"- `#{num}` `{sha}` {subject}")
 
     if unattributed:
         lines.append("")
@@ -86,14 +121,18 @@ def _bundle_section(
 def _thread_block(thread: dict) -> str:
     pr = thread["pr"]
     num = pr["number"]
-    lines = [
-        f"### #{num} · {pr['title']}",
-        f"`{thread['branch']}` · merged {_fmt_date(pr.get('mergedAt'))} · [PR #{num}]({pr['url']})",
-    ]
+    meta_parts = []
+    if thread["branch"]:
+        meta_parts.append(f"`{thread['branch']}`")
+    meta_parts.append(f"merged {_fmt_date(pr.get('mergedAt'))}")
+    if pr.get("url"):
+        meta_parts.append(f"[PR #{num}]({pr['url']})")
+    lines = [f"### #{num} · {pr['title']}", " · ".join(meta_parts)]
     stem = thread.get("stem")
     if not stem:
         lines.append("")
-        lines.append(f"*No session doc resolved for branch `{thread['branch']}`.*")
+        branch = thread["branch"] or "(branch unknown — attributed from git commit)"
+        lines.append(f"*No session doc resolved for branch `{branch}`.*")
         return "\n".join(lines)
 
     title = thread.get("title") or stem
@@ -183,6 +222,7 @@ def generate(
     base_sha: str,
     base_date: str,
     head_sha: str,
+    remote_main_sha: str,
     ref: str,
     threads: list[dict],
     opted_out: list[dict],
@@ -199,9 +239,11 @@ def generate(
         "re-running the same day regenerates this note in place."
     )
     parts = [
-        _frontmatter(date, base_sha, head_sha, generated_at, len(threads), len(opted_out)),
+        _frontmatter(
+            date, base_sha, head_sha, remote_main_sha, generated_at, len(threads), len(opted_out)
+        ),
         header,
-        _bundle_section(threads, commits, base_sha, base_date, head_sha, ref),
+        _bundle_section(threads, commits, base_sha, base_date, head_sha, remote_main_sha, ref),
         _threads_section(threads),
         _top_files_section(top_files),
         _open_pr_section(open_prs),

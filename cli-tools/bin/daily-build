@@ -4,4 +4,12 @@
 # AUDIENCE: human, agent
 set -euo pipefail
 CLI_TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Standing decree: never `uv run` (sync) against the live cli-tools venv — the
+# runtime write-guard blocks sync's entrypoint rewrites. Use the venv python
+# directly when it exists; fall back to uv only where no venv is present (dev
+# worktrees), where syncing is safe.
+VENV_PY="$CLI_TOOLS_DIR/.venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+    exec "$VENV_PY" -m cli_tools.daily_build.cli "$@"
+fi
 exec uv run --directory "$CLI_TOOLS_DIR" python -m cli_tools.daily_build.cli "$@"
