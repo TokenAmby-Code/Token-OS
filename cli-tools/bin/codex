@@ -12,6 +12,7 @@ AGENT_WRAPPER="${BIN_DIR}/../scripts/agent-wrapper.sh"
 if [[ "${TOKEN_API_AGENT_WRAPPER_BYPASS:-}" == "1" ]]; then
   for candidate in \
     "${CODEX_BIN:-}" \
+    "$HOME/.local/bin/codex.token-os-real" \
     "/opt/homebrew/bin/codex.token-os-real"
   do
     [[ -n "$candidate" && -x "$candidate" ]] || continue
