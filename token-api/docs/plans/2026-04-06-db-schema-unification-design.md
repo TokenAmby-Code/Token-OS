@@ -188,12 +188,13 @@ The first pass is complete when all of the following are true:
 
 Use `ssh mini` or the repo wrapper `cli-tools/bin/ssh-mac`.
 
-Recommended checks:
+Recommended checks (`~/runtimes/database/agents.db` is the default; if the host
+sets `TOKEN_API_AGENTS_DB`/`TOKEN_API_DB`, inspect that path instead):
 
 ```bash
-ssh mini "sqlite3 ~/.claude/agents.db '.schema claude_instances'"
-ssh mini "sqlite3 ~/.claude/agents.db '.schema session_documents'"
-ssh mini "sqlite3 ~/.claude/agents.db 'pragma table_info(claude_instances);'"
+ssh mini "sqlite3 ~/runtimes/database/agents.db '.schema claude_instances'"
+ssh mini "sqlite3 ~/runtimes/database/agents.db '.schema session_documents'"
+ssh mini "sqlite3 ~/runtimes/database/agents.db 'pragma table_info(claude_instances);'"
 ```
 
 Then restart `token-api` and confirm:

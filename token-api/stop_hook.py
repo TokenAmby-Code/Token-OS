@@ -27,23 +27,8 @@ from pathlib import Path
 
 from instance_mutation import update_instance_sync
 from pane_surface import human_tab_name
+from shared import AGENTS_DB_PATH as DB_PATH
 
-_LEGACY_AGENTS_DB_PATH = (Path.home() / ".claude" / "agents.db").resolve()
-
-
-def _token_api_db_compat() -> str | None:
-    value = os.environ.get("TOKEN_API_DB")
-    if not value:
-        return None
-    path = Path(value).expanduser()
-    return None if path.resolve() == _LEGACY_AGENTS_DB_PATH else value
-
-
-DB_PATH = Path(
-    os.environ.get("TOKEN_API_AGENTS_DB")
-    or _token_api_db_compat()
-    or (Path.home() / "runtimes" / "database" / "agents.db")
-).expanduser()
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 
 # Device → satellite URL mapping for cross-machine file access

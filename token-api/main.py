@@ -227,8 +227,6 @@ from shared import (
     DESKTOP_STATE,
     DICTATION_STATE,
     DISCORD_DAEMON_URL,
-    LEGACY_AGENTS_DB_PATH,
-    LEGACY_TIMER_DB_PATH,
     PAVLOK_CONFIG,
     PAVLOK_STATE,
     PEDAL_BUFFER_MS,
@@ -819,123 +817,6 @@ async def append_direct_user_text_to_pane(
         "direct_user": True,
         "submitted": False,
     }
-
-
-def _sqlite_backup_file(source: Path, dest: Path) -> None:
-    """Copy a SQLite DB with sqlite backup API instead of raw file copying."""
-    import sqlite3
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.closing(sqlite3.connect(source, timeout=10.0)) as src:
-        with contextlib.closing(sqlite3.connect(dest, timeout=10.0)) as dst:
-            src.backup(dst)
-            dst.commit()
-
-
-def _copy_timer_tables_from_agents_db(source: Path, dest: Path) -> bool:
-    """Migrate embedded timer tables from the legacy agents DB into timer.db."""
-    import sqlite3
-
-    timer_tables = (
-        "timer_state",
-        "timer_state_daily",
-        "timer_sessions",
-        "timer_mode_changes",
-        "timer_daily_scores",
-        "timer_shifts",
-        "timer_samples",
-    )
-    copied = False
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.closing(sqlite3.connect(source, timeout=10.0)) as src:
-        src.row_factory = sqlite3.Row
-        with contextlib.closing(sqlite3.connect(dest, timeout=10.0)) as dst:
-            dst.execute("PRAGMA busy_timeout=5000")
-            for table in timer_tables:
-                schema_row = src.execute(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                    (table,),
-                ).fetchone()
-                if not schema_row or not schema_row["sql"]:
-                    continue
-                exists = dst.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-                    (table,),
-                ).fetchone()
-                if exists:
-                    continue
-                dst.execute(schema_row["sql"])
-                columns = [row["name"] for row in src.execute(f'PRAGMA table_info("{table}")')]
-                if columns:
-                    col_sql = ", ".join(f'"{col}"' for col in columns)
-                    rows = src.execute(f'SELECT {col_sql} FROM "{table}"').fetchall()
-                    if rows:
-                        placeholders = ", ".join("?" for _ in columns)
-                        dst.executemany(
-                            f'INSERT INTO "{table}" ({col_sql}) VALUES ({placeholders})',
-                            [tuple(row[col] for col in columns) for row in rows],
-                        )
-                copied = True
-            dst.commit()
-    return copied
-
-
-def migrate_runtime_databases_if_needed() -> None:
-    """First-start migration for the stable runtime database directory.
-
-    - agents.db moves from ~/.claude/agents.db to ~/runtimes/database/agents.db.
-    - timer.db is created separately. Prefer an existing ~/.claude/timer.db; if
-      none exists, extract existing timer_* tables from the legacy agents DB.
-    """
-    token_api_db = os.environ.get("TOKEN_API_DB")
-    legacy_compat_db = (
-        token_api_db
-        and not os.environ.get("TOKEN_API_AGENTS_DB")
-        and Path(token_api_db).expanduser().resolve() != LEGACY_AGENTS_DB_PATH.resolve()
-    )
-    if legacy_compat_db:
-        logger.info("DB migration skipped: TOKEN_API_DB compatibility override is active")
-        return
-
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if DB_PATH.resolve() != LEGACY_AGENTS_DB_PATH.resolve():
-            if LEGACY_AGENTS_DB_PATH.exists() and not DB_PATH.exists():
-                _sqlite_backup_file(LEGACY_AGENTS_DB_PATH, DB_PATH)
-                logger.info("Migrated agents DB %s -> %s", LEGACY_AGENTS_DB_PATH, DB_PATH)
-            else:
-                logger.info(
-                    "Agents DB migration skipped (source_exists=%s dest_exists=%s)",
-                    LEGACY_AGENTS_DB_PATH.exists(),
-                    DB_PATH.exists(),
-                )
-    except Exception as exc:
-        logger.warning("Agents DB migration failed: %s", exc)
-
-    try:
-        if TIMER_DB_PATH.resolve() == DB_PATH.resolve():
-            logger.info("Timer DB migration skipped: timer DB path equals agents DB path")
-            return
-        if TIMER_DB_PATH.exists():
-            logger.info("Timer DB migration skipped: destination exists at %s", TIMER_DB_PATH)
-            return
-        if LEGACY_TIMER_DB_PATH.exists():
-            _sqlite_backup_file(LEGACY_TIMER_DB_PATH, TIMER_DB_PATH)
-            logger.info("Migrated timer DB %s -> %s", LEGACY_TIMER_DB_PATH, TIMER_DB_PATH)
-        elif LEGACY_AGENTS_DB_PATH.exists():
-            copied = _copy_timer_tables_from_agents_db(LEGACY_AGENTS_DB_PATH, TIMER_DB_PATH)
-            logger.info(
-                "Migrated embedded timer tables from %s -> %s (copied=%s)",
-                LEGACY_AGENTS_DB_PATH,
-                TIMER_DB_PATH,
-                copied,
-            )
-        else:
-            logger.info("Timer DB migration skipped: no legacy source found")
-    except Exception as exc:
-        logger.warning("Timer DB migration failed: %s", exc)
 
 
 def _run_tmux_focus_preserved(
@@ -2136,11 +2017,11 @@ async def load_tasks_from_db():
             print(f"Failed to register task {task_id}: {e}")
 
 
-# Runtime state, NOT source: lives in ~/.claude (alongside agents.db and
-# corax-state.json), never inside the deploy-owned runtime checkout. The tree is
-# frozen read-only after deploy (runtime-write-protect.sh), so a path under
-# token-api/ here would EACCES on both the shutdown write and the pragma-once
-# unlink. ~/.claude is always writable.
+# Runtime state, NOT source: lives in ~/.claude (alongside corax-state.json),
+# never inside the deploy-owned runtime checkout. The tree is frozen read-only
+# after deploy (runtime-write-protect.sh), so a path under token-api/ here would
+# EACCES on both the shutdown write and the pragma-once unlink. ~/.claude is
+# always writable.
 RESTART_STATE_PATH = Path.home() / ".claude" / "restart_state.json"
 
 # Keys that must NOT survive a restart — derived from live signals or boot-time config.
@@ -2311,7 +2192,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # DB_PATH still resolves to a live DB, refuse to start instead of racing the
     # production :7777 writer.
     _live_dbs = {
-        (Path.home() / ".claude" / "agents.db").resolve(),
         (Path.home() / "runtimes" / "database" / "agents.db").resolve(),
     }
     _run_roots = (Path(__file__).resolve(), Path.cwd().resolve())
@@ -2323,7 +2203,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
     # Startup
-    migrate_runtime_databases_if_needed()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TIMER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     await init_database_async(DB_PATH)
     await init_timer_database_async(TIMER_DB_PATH)
     await init_context_telemetry_database_async(TELEMETRY_DB_PATH)

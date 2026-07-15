@@ -47,12 +47,7 @@ def _configured_agents_db_path() -> Path:
     TOKEN_API_AGENTS_DB is the canonical override. TOKEN_API_DB remains a
     compatibility override for existing worktree/test isolation.
     """
-    value = os.environ.get("TOKEN_API_AGENTS_DB")
-    legacy = os.environ.get("TOKEN_API_DB")
-    if not value and legacy:
-        legacy_path = Path(legacy).expanduser()
-        if legacy_path.resolve() != (Path.home() / ".claude" / "agents.db").resolve():
-            value = legacy
+    value = os.environ.get("TOKEN_API_AGENTS_DB") or os.environ.get("TOKEN_API_DB")
     return Path(value).expanduser() if value else DEFAULT_AGENTS_DB_PATH
 
 
@@ -64,15 +59,8 @@ def _configured_timer_db_path() -> Path:
     isolated DB for existing dev/test harnesses. Production defaults split timer
     writes into ~/runtimes/database/timer.db.
     """
-    value = os.environ.get("TOKEN_API_TIMER_DB")
-    if value:
-        return Path(value).expanduser()
-    legacy = os.environ.get("TOKEN_API_DB")
-    if legacy:
-        legacy_path = Path(legacy).expanduser()
-        if legacy_path.resolve() != (Path.home() / ".claude" / "agents.db").resolve():
-            return legacy_path
-    return DEFAULT_TIMER_DB_PATH
+    value = os.environ.get("TOKEN_API_TIMER_DB") or os.environ.get("TOKEN_API_DB")
+    return Path(value).expanduser() if value else DEFAULT_TIMER_DB_PATH
 
 
 def _configured_telemetry_db_path() -> Path:
@@ -89,8 +77,6 @@ DB_PATH = _configured_agents_db_path()
 AGENTS_DB_PATH = DB_PATH
 TIMER_DB_PATH = _configured_timer_db_path()
 TELEMETRY_DB_PATH = _configured_telemetry_db_path()
-LEGACY_AGENTS_DB_PATH = Path.home() / ".claude" / "agents.db"
-LEGACY_TIMER_DB_PATH = Path.home() / ".claude" / "timer.db"
 
 
 @asynccontextmanager

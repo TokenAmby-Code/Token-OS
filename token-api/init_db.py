@@ -14,27 +14,15 @@ from db_schema import (
 RUNTIME_DATABASE_DIR = Path(
     os.environ.get("TOKEN_API_DATABASE_DIR", Path.home() / "runtimes" / "database")
 ).expanduser()
-LEGACY_AGENTS_DB_PATH = Path.home() / ".claude" / "agents.db"
-
-
-def _legacy_token_api_db_unless_live() -> str | None:
-    value = os.environ.get("TOKEN_API_DB")
-    if not value:
-        return None
-    path = Path(value).expanduser()
-    if path.resolve() == LEGACY_AGENTS_DB_PATH.resolve():
-        return None
-    return value
-
 
 DB_PATH = Path(
     os.environ.get("TOKEN_API_AGENTS_DB")
-    or _legacy_token_api_db_unless_live()
+    or os.environ.get("TOKEN_API_DB")
     or RUNTIME_DATABASE_DIR / "agents.db"
 ).expanduser()
 TIMER_DB_PATH = Path(
     os.environ.get("TOKEN_API_TIMER_DB")
-    or _legacy_token_api_db_unless_live()
+    or os.environ.get("TOKEN_API_DB")
     or RUNTIME_DATABASE_DIR / "timer.db"
 ).expanduser()
 TELEMETRY_DB_PATH = resolve_telemetry_db_path()

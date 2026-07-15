@@ -34,7 +34,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="$HOME/.claude/guardsman-results"
-DB_PATH="${TOKEN_API_DB:-$HOME/.claude/agents.db}"
+DB_PATH="${TOKEN_API_AGENTS_DB:-${TOKEN_API_DB:-$HOME/runtimes/database/agents.db}}"
 mkdir -p "$RESULTS_DIR"
 
 SYSTEM_MSG='You are an Imperial Guardsman — a disposable validation judge.

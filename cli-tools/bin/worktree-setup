@@ -623,13 +623,14 @@ else
 fi
 
 # DB isolation (P0 2026-06-09): a worktree dev token-api must never write the live
-# ~/.claude/agents.db. Seed the worktree with a consistent snapshot of the live DB
-# (sqlite .backup — safe against a running writer) so agents develop and live-test
-# against realistic data with zero risk to production, and point TOKEN_API_DB at it.
+# ~/runtimes/database/agents.db. Seed the worktree with a consistent snapshot of the
+# live DB (sqlite .backup — safe against a running writer) so agents develop and
+# live-test against realistic data with zero risk to production, and point
+# TOKEN_API_DB at it.
 # Independent of port assignment: isolation must hold even if the port pool failed.
 if [[ -d "$WORKTREE_DIR/token-api" ]]; then
     DEV_DB="$WORKTREE_DIR/token-api/.dev-agents.db"
-    LIVE_DB="$HOME/.claude/agents.db"
+    LIVE_DB="$HOME/runtimes/database/agents.db"
     if [[ -f "$LIVE_DB" ]] && command -v sqlite3 &>/dev/null; then
         if sqlite3 "$LIVE_DB" ".backup '$DEV_DB'" 2>/dev/null; then
             log_success "Seeded dev DB from live snapshot: $DEV_DB"
@@ -641,7 +642,7 @@ if [[ -d "$WORKTREE_DIR/token-api" ]]; then
         log_warn "No live DB (or sqlite3 missing) — dev server will initialize an empty isolated DB at $DEV_DB"
     fi
     {
-        echo "# Dev DB isolation: never point this at ~/.claude/agents.db (live)."
+        echo "# Dev DB isolation: never point this at ~/runtimes/database/agents.db (live)."
         echo "TOKEN_API_DB=$DEV_DB"
     } >> "$WORKTREE_DIR/.worktree.env"
     log_success "TOKEN_API_DB written to .worktree.env (isolated from live)"

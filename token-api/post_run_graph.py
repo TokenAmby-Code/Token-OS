@@ -20,7 +20,7 @@ from typing import TypedDict
 import httpx
 from langgraph.graph import END, StateGraph
 
-from db_connections import connect_agents_db
+from db_connections import AGENTS_DB_PATH, connect_agents_db
 
 _MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 _MINIMAX_MODEL = "MiniMax-M2.5"
@@ -162,8 +162,7 @@ async def aggregate_guards_node(state: PostRunState) -> PostRunState:
 
     # Store in DB
     try:
-        db_path = Path(_HOME) / ".claude" / "agents.db"
-        async with connect_agents_db(db_path) as db:
+        async with connect_agents_db(AGENTS_DB_PATH) as db:
             for r in results:
                 await db.execute(
                     """

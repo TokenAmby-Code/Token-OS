@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-DB_PATH="${QUIET_BUSTER_RESUME_DB:-$HOME/.claude/agents.db}"
+DB_PATH="${TOKEN_API_AGENTS_DB:-${TOKEN_API_DB:-${TOKEN_API_DATABASE_DIR:-$HOME/runtimes/database}/agents.db}}"
 THREAD_ID="${QUIET_BUSTER_RESUME_THREAD_ID:-}"
 WORKDIR="${QUIET_BUSTER_RESUME_WORKDIR:-$HOME/runtimes/Token-OS/live/token-api}"
 CHECK_AFTER="${QUIET_BUSTER_RESUME_CHECK_AFTER:-}"

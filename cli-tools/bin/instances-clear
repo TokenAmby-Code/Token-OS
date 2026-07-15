@@ -31,20 +31,9 @@ from tmuxctl.singleton_labels import (  # noqa: E402
     is_persona_singleton_label,
 )
 
-LEGACY_AGENTS_DB = (Path.home() / ".claude" / "agents.db").resolve()
-
-
-def _legacy_token_api_db_unless_live() -> str | None:
-    value = os.environ.get("TOKEN_API_DB")
-    if not value:
-        return None
-    path = Path(value).expanduser()
-    return None if path.resolve() == LEGACY_AGENTS_DB else value
-
-
 DB_PATH = Path(
     os.environ.get("TOKEN_API_AGENTS_DB")
-    or _legacy_token_api_db_unless_live()
+    or os.environ.get("TOKEN_API_DB")
     or (Path.home() / "runtimes" / "database" / "agents.db")
 ).expanduser()
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")

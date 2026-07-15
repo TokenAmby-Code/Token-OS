@@ -357,7 +357,7 @@ The explicit `POST /session/start` is no longer needed.
 ## Finalized Decisions
 
 1. **Port number**: Keep 7777 for compatibility with existing clients (MacroDroid, AHK)
-2. **State persistence**: SQLite - aligns with existing `~/.claude/agents.db` infrastructure
+2. **State persistence**: SQLite - aligns with existing `~/runtimes/database/agents.db` infrastructure
 3. **Heartbeat mechanism**:
    - **Primary**: Rely on SessionStart/SessionEnd hooks (fail loudly to validate hook system)
    - **Fallback**: 3-hour expiry for edge cases (crashed instances, lost connections)
@@ -415,7 +415,7 @@ GET /api/dashboard
 
 ## SQLite Schema
 
-Extends existing `~/.claude/agents.db` with new tables:
+Extends existing `~/runtimes/database/agents.db` with new tables:
 
 ### claude_instances
 ```sql

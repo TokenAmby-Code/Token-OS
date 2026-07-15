@@ -47,28 +47,14 @@ RUNTIME_DATABASE_DIR = Path(
 DEFAULT_AGENTS_DB_PATH = RUNTIME_DATABASE_DIR / "agents.db"
 DEFAULT_TIMER_DB_PATH = RUNTIME_DATABASE_DIR / "timer.db"
 DEFAULT_TELEMETRY_DB_PATH = RUNTIME_DATABASE_DIR / "telemetry.db"
-LEGACY_AGENTS_DB_PATH = Path.home() / ".claude" / "agents.db"
-
-
-def _legacy_token_api_db_unless_live() -> str | None:
-    value = os.environ.get("TOKEN_API_DB")
-    if not value:
-        return None
-    path = Path(value).expanduser()
-    if path.resolve() == LEGACY_AGENTS_DB_PATH.resolve():
-        return None
-    return value
-
 
 DEFAULT_DB_PATH = Path(
     os.environ.get("TOKEN_API_AGENTS_DB")
-    or _legacy_token_api_db_unless_live()
+    or os.environ.get("TOKEN_API_DB")
     or DEFAULT_AGENTS_DB_PATH
 ).expanduser()
 DEFAULT_TIMER_PATH = Path(
-    os.environ.get("TOKEN_API_TIMER_DB")
-    or _legacy_token_api_db_unless_live()
-    or DEFAULT_TIMER_DB_PATH
+    os.environ.get("TOKEN_API_TIMER_DB") or os.environ.get("TOKEN_API_DB") or DEFAULT_TIMER_DB_PATH
 ).expanduser()
 DEFAULT_TELEMETRY_PATH = Path(resolve_telemetry_db_path()).expanduser()
 
