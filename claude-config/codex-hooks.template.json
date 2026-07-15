@@ -84,6 +84,12 @@
             "command": "HOOK_AGENT=codex COMMAND_BOUNDARY_RULES_CONFIG=${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/claude-config/hooks/command-boundary-rules.json bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/claude-config/hooks/command-boundary-guard.sh",
             "timeout": 5,
             "statusMessage": "Command boundary guard"
+          },
+          {
+            "type": "command",
+            "command": "HOOK_AGENT=codex bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/claude-config/hooks/managed-vault-write-report.sh",
+            "timeout": 5,
+            "statusMessage": "Managed vault report"
           }
         ]
       }
