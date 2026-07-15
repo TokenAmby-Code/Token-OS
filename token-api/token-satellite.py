@@ -57,9 +57,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CMD_EXE = "/mnt/c/Windows/System32/cmd.exe"
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 AHK_EXE = "/mnt/c/Program Files/AutoHotkey/v2/AutoHotkey.exe"
-# AHK scripts default to the repo's ahk/ dir, but WSL production runs from a
-# Windows-local cache (C:\TokenOS\ahk) so AHK execution does not hit the NAS.
-AHK_SCRIPTS_DIR = Path(os.environ.get("TOKEN_OS_AHK_DIR") or (REPO_ROOT / "ahk"))
+# AHK scripts live in the Token-Fleet checkout (machines/wsl/ahk) since the
+# 2026-07-14 payload cutover; WSL production runs from a Windows-local cache
+# (C:\TokenOS\ahk, set via TOKEN_OS_AHK_DIR in token-satellite.service) so AHK
+# execution does not hit the NAS.
+AHK_SCRIPTS_DIR = Path(
+    os.environ.get("TOKEN_OS_AHK_DIR")
+    or (Path.home() / "runtimes/Token-Fleet/live/machines/wsl/ahk")
+)
 RUNTIME_REFRESH_SECRET_ENV = "TOKEN_SATELLITE_REFRESH_SECRET"
 RUNTIME_REFRESH_HELPER = Path(
     os.environ.get("TOKEN_SATELLITE_REFRESH_HELPER")
@@ -2997,10 +3002,10 @@ def _cd_changed_paths(current: str | None, target: str) -> list[str]:
     """Changed paths current..target, computed the way a pusher's manifest would be.
 
     Ensures the bare cache holds `target` (fetch main + the sha), then diffs. On any
-    failure, force a conservative full refresh (venv + AHK) so a dep/AHK change is
+    failure, force a conservative full refresh (venv) so a dep change is
     never silently skipped when the precise set can't be computed.
     """
-    force_full = ["token-api/uv.lock", "ahk/force-refresh"]
+    force_full = ["token-api/uv.lock"]
     if not current:
         return force_full
     _cd_bare_main_tip()  # idempotent: ensure the bare has main history

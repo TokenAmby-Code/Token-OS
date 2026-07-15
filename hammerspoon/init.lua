@@ -9,7 +9,7 @@
 --   Middle click  -> F17                  -> ". "
 --   Dial CW       -> F13                  -> scroll (unified curve, see postDialScroll)
 --   Dial CCW      -> F14                  -> opposite scroll
---   F15           -> Ctrl+Space           -> tmux prefix (mirrors ahk/script-compiler.ahk)
+--   F15           -> Ctrl+Space           -> tmux prefix (mirrors Token-Fleet machines/wsl/ahk/script-compiler.ahk)
 
 -- ===== Key codes =====
 local F18_CODE = 79  -- left click
@@ -94,7 +94,7 @@ local function sendTmuxPrefix()
 end
 
 -- ===== Dial scroll: unified curve + momentum coast =====
--- twin: ahk/dial-scroll.ahk — same algorithm + constants.
+-- twin: Token-Fleet machines/wsl/ahk/dial-scroll.ahk — same algorithm + constants.
 --
 -- NOTE: this path is normally DORMANT. The dial is plugged into Windows, and
 -- deskflow ignores the dial software's injected F13/F14 while forwarding the
