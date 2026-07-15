@@ -1,7 +1,10 @@
 # k12-era agent registry rebuild — architecture rulings (rung 0)
 
-**Status:** rulings posed 2026-07-15; awaiting Emperor ratification. Design-only — no
-rebuild code ships until the slate below is ruled.
+**Status:** ratified 2026-07-15 (same-day sitting) — **R1/R2/R4/R5 as recommended; R3 as
+amended** (the canonical shape binds surviving/new boxes; the Mac is exempted — its
+deviation recorded as known and rider-mitigated, no corpse churn). **R6 remains OPEN**:
+the Emperor flagged follow-up discussion owed on the DB write-door before closing; rung 2
+(writers) stays gated on it. Rebuild rungs gated only on R1–R5 may proceed.
 **Contract:** device-doctrine reconciliation rulings **#2** (Token-OS home = k12-personal,
 no work-box copy), **#3** (k12-personal = inter-agent comms hub AND the only persistent
 tmux estate; work-box agents run inside mini tmux envelopes echoing up), **#9** (WSL =
@@ -108,23 +111,28 @@ touches data once, small and known.
 **Decision needed:** is the k12 git topology (target-structure §2) canonical for every
 box, including the Mac for its remaining lifetime?
 
-**Recommendation: bless the k12 shape as canonical per-box, INCLUDING the Mac:** bare
-with `origin` = GitHub, detached CD `live/` checkout, single `~/worktrees/<repo>/` root.
-The probe shows where the Mac deviates and that the deviation is a *live bug*, not mere
-asymmetry: the runtime checkout's only remote is the local CD bare path, so `gh` run from
-the runtime resolves no repo and daily-build attribution silently returns 0 rows. The
-rider in this PR makes the tooling deterministic anyway (`--repo` explicit), but the
-rider is belt-and-suspenders — the shape itself should stop lying. `battlefield/`
-(dev-branch deploy checkout) and `config/` (0700 machine-local secrets) are recorded as
-already-canon per §2; the Mac's duplicate `origin`+`github` bare remotes are the §2-named
-accident and collapse to `origin` only.
+**Ratified verdict (amended from the posed recommendation): the k12 shape is canonical
+for surviving and future boxes; the Mac is EXEMPT.** The shape: bare with `origin` =
+GitHub, detached CD `live/` checkout, single `~/worktrees/<repo>/` root. `battlefield/`
+(dev-branch deploy checkout) and `config/` (0700 machine-local secrets) already-canon
+per §2.
 
-**Alternatives:** (a) leave the Mac as-is since it's dying — rejected: the Mac remains
-the live hub until cutover and its tooling output (daily-build, PR links) is consumed
-daily; (b) give the runtime checkout a GitHub remote — acceptable as an ops one-liner,
-but the canonical statement is the shape, not the patch.
+The posed recommendation included conforming the Mac, because its deviation is a live
+bug, not mere asymmetry: the runtime checkout's only remote is the local CD bare path,
+so `gh` run from the runtime resolves no repo and daily-build attribution silently
+returned 0 rows. The sitting weighed it and exempted the Mac: the rider (this PR's
+companion commit) fixed that one live symptom deterministically, no other `gh` consumer
+runs from the runtime checkout (verified — pr-step/worktree-delete run from worktrees,
+which carry GitHub remotes), collapsing the bare's duplicate `origin`+`github` remotes
+risks breaking worktree pushes that name the `github` remote, and the box retires within
+about a week. The Mac's deviation is recorded here as known and rider-mitigated;
+corpse-polish only.
 
-**Consequences:** one documented git shape to verify on any box; `gh --repo
+**Alternatives considered:** (a) conform the Mac anyway — rejected at the sitting per
+the weighing above; (b) additive `git remote add github` on `live/` as insurance —
+unnecessary once the rider landed and no other consumer exists.
+
+**Consequences:** one documented git shape to verify on any surviving box; `gh --repo
 TokenAmby-Code/Token-OS` stays PR truth everywhere (§2); tooling never infers the repo
 from whichever checkout it happens to run in.
 
@@ -174,7 +182,11 @@ whose lifetime is one session; (b) rebuild with a `claude_instances` view for st
 archive snapshot by design; any tool still reading `claude_instances` breaks loudly at
 cutover and gets fixed, not shimmed.
 
-## R6 — Sanctioned writers
+## R6 — Sanctioned writers — **OPEN, not ratified 2026-07-15**
+
+At the sitting the Emperor held this ruling open: the DB write-door discussion warrants
+follow-ups before closing. The recommendation below stands as posed; rung 2 (writers) is
+gated on resolving it.
 
 **Decision needed:** who may write the registry, through what door?
 
@@ -182,11 +194,11 @@ cutover and gets fixed, not shimmed.
 Today's probe shows the debt precisely: k12-personal's DB is WAL-hot with *no API on the
 box*, because `stop_hook.py:49,85` and `agent-session-end-resume.sh:82` write directly
 through the canonical env chain. That is correct *for now* (the vaporize lane made the
-chain safe) and named transitional. Once hub token-api runs on k12-personal (§6 step 6),
-hooks POST to the box-local API — the existing durable-retry outbox already covers
-down-API windows — and any residual direct-sqlite writer goes through the
-`instance_mutation` layer so the field allowlist/forbidden-field guard applies to every
-write path, not just HTTP.
+chain safe) and named transitional. After the hub token-api service is running on
+k12-personal (§6 step 6), hooks POST to the box-local API — the existing durable-retry
+outbox already covers down-API windows — and any residual direct-sqlite writer goes
+through the `instance_mutation` layer so the field allowlist/forbidden-field guard
+applies to every write path, not just HTTP.
 
 **Open sub-question, flagged honestly:** attribute the current WAL traffic on-box —
 confirm the two known direct writers account for *all* of it before cutover, so no
@@ -216,9 +228,9 @@ regardless of checkout shape.
 - **Rung 1 — schema:** k12-era schema module (instances v2 + R4 branch column +
   session_documents import script), landing behind the existing init_db path; no consumer
   flips.
-- **Rung 2 — writers:** hook writers gain the API-first path with sqlite fallback
-  removed on the hub box; `instance_mutation` becomes the sole mutation surface; WAL
-  attribution audit (R6 sub-question) closes.
+- **Rung 2 — writers (GATED on R6, still open):** hook writers gain the API-first path
+  with sqlite fallback removed on the hub box; `instance_mutation` becomes the sole
+  mutation surface; WAL attribution audit (R6 sub-question) closes.
 - **Rung 3 — satellite live:** k12-personal token-api serves the new schema in satellite
   mode (§6 step 6), registration door + envelope echo verified end-to-end.
 - **Rung 4 — cutover:** §6 step 7 as amended by R2 (import, flip
@@ -226,14 +238,16 @@ regardless of checkout shape.
   fixed.
 - **Rung 5 — Mac registry retirement:** archive snapshot taken, Mac DB frozen read-only.
 
-Each rung is its own PR lane with its own live proof; none starts before this doc's
-slate is ratified.
+Each rung is its own PR lane with its own live proof. R1–R5 are ratified (2026-07-15
+sitting); rungs gated only on them may start. Rung 2 waits for the R6 follow-ups.
 
 ## Follow-ons (not this lane)
 
-- **Ultramar canonization ceremony:** once ratified, R1/R3/R6 join the four
-  device-doctrine canon notes (Hub-and-Envelope Estate Topology, etc.) as k12-era
-  registry canon.
+- **Ultramar canonization ceremony:** R1/R3 (ratified) join the four device-doctrine
+  canon notes (Hub-and-Envelope Estate Topology, etc.) as k12-era registry canon; R6
+  follows once its follow-ups close.
+- **R6 follow-up sitting:** the write-door ruling plus the WAL-attribution sub-question,
+  held open by the Emperor at the 2026-07-15 sitting.
 - **FleetView:** the hub-authoritative registry is the natural read-model source for a
   fleet dashboard; out of scope until rung 3 exists.
 - **Wedged NAS read path** (ops, tracked separately) and the k12-work civic-side layout
