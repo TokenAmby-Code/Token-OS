@@ -227,7 +227,8 @@ regardless of checkout shape.
 
 - **Rung 1 — schema:** k12-era schema module (instances v2 + R4 branch column +
   session_documents import script), landing behind the existing init_db path; no consumer
-  flips.
+  flips. **LANDED 2026-07-15** (branch `k12-registry-rung1`: branch column + partial
+  index, stamping surfaces, one-shot import script).
 - **Rung 2 — writers (GATED on R6, still open):** hook writers gain the API-first path
   with sqlite fallback removed on the hub box; `instance_mutation` becomes the sole
   mutation surface; WAL attribution audit (R6 sub-question) closes.
