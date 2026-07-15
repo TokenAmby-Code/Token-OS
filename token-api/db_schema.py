@@ -1570,6 +1570,7 @@ async def init_database_async(db_path: Path | None = None) -> None:
                 project     TEXT,
                 primarch_name TEXT,
                 cron_job_id TEXT,
+                branch      TEXT,
                 status      TEXT DEFAULT 'active',
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1581,10 +1582,20 @@ async def init_database_async(db_path: Path | None = None) -> None:
         session_doc_migrations = [
             ("primarch_name", "ALTER TABLE session_documents ADD COLUMN primarch_name TEXT"),
             ("cron_job_id", "ALTER TABLE session_documents ADD COLUMN cron_job_id TEXT"),
+            ("branch", "ALTER TABLE session_documents ADD COLUMN branch TEXT"),
         ]
         for column_name, sql in session_doc_migrations:
             if column_name not in session_doc_columns:
                 await db.execute(sql)
+
+        # k12-era registry R4: branch = the doc's current lane branch (1:1 with
+        # the frontmatter worktree registry's one-active invariant). NULL means
+        # never dispatched onto a branch — honest-NULL, no backfill guessing.
+        # Non-unique: branch names recur across eras.
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_docs_branch
+              ON session_documents(branch) WHERE branch IS NOT NULL
+        """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS primarch_session_docs (
