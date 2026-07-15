@@ -13,7 +13,7 @@ function setup() {
 
 test('missing attestation refuses handover — seat created, NO bound event', async () => {
   const { store, d } = setup();
-  const res = await d.launch({ seat_id: 'somnium:NE', schema_version: 1, identity: 'i1', persona: 'p' }); // tint missing
+  const res = await d.launch({ seat_id: 'somnium:NE', schema_version: 2, identity: 'i1', persona: 'p' }); // tint missing
   expect(res.handover).toBe(false);
   expect(res.missing_attestations).toEqual(['tint']);
   const types = store.readAll().map((e) => e.event_type);
@@ -23,7 +23,7 @@ test('missing attestation refuses handover — seat created, NO bound event', as
 
 test('full attestation tuple hands over with ONE atomic bound event', async () => {
   const { store, d } = setup();
-  const res = await d.launch({ seat_id: 'palace:W', schema_version: 1, identity: 'i1', persona: 'salamander', tint: '#302800' });
+  const res = await d.launch({ seat_id: 'palace:W', schema_version: 2, identity: 'i1', persona: 'salamander', tint: '#302800' });
   expect(res.handover).toBe(true);
   expect(res.missing_attestations).toEqual([]);
   const bound = store.readAll().filter((e) => e.event_type === 'reg.bound');

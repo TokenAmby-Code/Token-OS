@@ -36,8 +36,8 @@ test('no tmux id appears in any /launch, /send, /entities, or /reconcile respons
   try {
     const post = (p: string, body: unknown) => fetch(`http://127.0.0.1:${srv.port}${p}`, { method: 'POST', body: JSON.stringify(body) });
     const bodies: unknown[] = [];
-    bodies.push(await (await post('/launch', { seat_id: 'somnium:NE', schema_version: 1, identity: 'i1', persona: 'p', tint: '#1' })).json());
-    bodies.push(await (await post('/send', { target: 'somnium:NE', text: 'hello', schema_version: 1 })).json());
+    bodies.push(await (await post('/launch', { seat_id: 'somnium:NE', schema_version: 2, identity: 'i1', persona: 'p', tint: '#1' })).json());
+    bodies.push(await (await post('/send', { target: 'somnium:NE', text: 'hello', schema_version: 2 })).json());
     bodies.push(await (await fetch(`http://127.0.0.1:${srv.port}/entities`)).json());
     bodies.push(await (await fetch(`http://127.0.0.1:${srv.port}/entities/${encodeURIComponent('somnium:NE')}/events`)).json());
     bodies.push(await (await post('/reconcile', {})).json());
@@ -51,8 +51,8 @@ test('no tmux id appears in any /launch, /send, /entities, or /reconcile respons
 test('no tmux id lands in any persisted event payload', async () => {
   const store = new EventStore(`/tmp/k12noid-${crypto.randomUUID()}.sqlite`);
   const d = new Daemon(store, new FakeTmux());
-  await d.launch({ seat_id: 'palace:W', schema_version: 1, identity: 'i1', persona: 'p', tint: '#1' });
-  await d.send({ target: 'palace:W', text: 'hi', schema_version: 1 });
+  await d.launch({ seat_id: 'palace:W', schema_version: 2, identity: 'i1', persona: 'p', tint: '#1' });
+  await d.send({ target: 'palace:W', text: 'hi', schema_version: 2 });
   await d.reconcile();
   for (const e of store.readAll()) {
     expect(findTmuxIdDeep(e.payload)).toBeNull();

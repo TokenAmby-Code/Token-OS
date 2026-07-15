@@ -11,6 +11,7 @@ import {
   type ActivityBoardRow,
   type CloseRequest,
   type CloseResponse,
+  type CurrentBinding,
   type DeliveryVerdict,
   type EventInput,
   type EventRecord,
@@ -26,10 +27,13 @@ import {
   type SendRefusalReason,
   type SendRequest,
   type SendResolution,
+  type StopAutoCloseOutcome,
   type StopReceipt,
   type StopRefusal,
   type StopRefusalReason,
   type StopRequest,
+  type SubscribeRequest,
+  type SubscribeResponse,
 } from '@token-os/contracts';
 import { EventStore } from './store.ts';
 import { findTmuxId } from './ids.ts';
@@ -363,10 +367,10 @@ export class Daemon {
         };
       }
 
-      // Reap FIRST; attest only on a confirmed kill. respawn-pane -k keeps the
-      // estate pane (bare shell) → the seat survives and returns to the freelist.
-      const reaped = await this.tmux.reapSeat(binding.seat_id);
-      if (!reaped) {
+      // Reap FIRST; attest only on a confirmed kill (executeClose is the SAME path
+      // the reflexive auto-close fires — one close mechanism, no bespoke variant).
+      const closed = await this.executeClose(binding, transportReceipt);
+      if (!closed) {
         return {
           ok: false,
           target: req.target,
@@ -376,20 +380,67 @@ export class Daemon {
           reason: 'reap_failed: agent process could not be reaped; seat left bound (fail-loud, no half-close)',
         };
       }
-
-      const occurred_at = this.now();
-      const prov = this.prov('observer', transportReceipt);
-      // One transaction: instance retired + process reaped + seat cleared. seat_cleared
-      // frees the binding (the ledger PROJECTION follows — no separate ledger to leak).
-      const inputs: EventInput[] = [];
-      if (binding.instance_id) {
-        inputs.push({ entity_type: 'instance', entity_id: binding.instance_id, event_type: 'reg.retired', payload: {}, provenance: prov, occurred_at });
-      }
-      inputs.push({ entity_type: 'seat', entity_id: binding.seat_id, event_type: 'reg.process_reaped', payload: { instance_id: binding.instance_id }, provenance: prov, occurred_at });
-      inputs.push({ entity_type: 'seat', entity_id: binding.seat_id, event_type: 'reg.seat_cleared', payload: {}, provenance: prov, occurred_at });
-      this.store.appendAll(inputs);
-
       return { ok: true, target: req.target, seat_id: binding.seat_id, instance_id: binding.instance_id, closed: true, reason: null };
+    });
+  }
+
+  // The generic close mechanism, shared by /close and the reflexive auto-close.
+  // Reap-first, attest-after: respawn-pane -k keeps the estate pane (bare shell)
+  // so the seat survives and returns to the freelist. On a confirmed reap, ONE
+  // transaction writes retired + process_reaped + seat_cleared (seat_cleared frees
+  // the binding — the ledger PROJECTION follows, no separate ledger to leak).
+  // Returns false (nothing written) if the process could not be reaped, so a
+  // retire-with-live-process is unspellable. Caller holds the single-writer mutex.
+  private async executeClose(binding: CurrentBinding, transportReceipt: string | null): Promise<boolean> {
+    const reaped = await this.tmux.reapSeat(binding.seat_id);
+    if (!reaped) return false;
+    const occurred_at = this.now();
+    const prov = this.prov('observer', transportReceipt);
+    const inputs: EventInput[] = [];
+    if (binding.instance_id) {
+      inputs.push({ entity_type: 'instance', entity_id: binding.instance_id, event_type: 'reg.retired', payload: {}, provenance: prov, occurred_at });
+    }
+    inputs.push({ entity_type: 'seat', entity_id: binding.seat_id, event_type: 'reg.process_reaped', payload: { instance_id: binding.instance_id }, provenance: prov, occurred_at });
+    inputs.push({ entity_type: 'seat', entity_id: binding.seat_id, event_type: 'reg.seat_cleared', payload: {}, provenance: prov, occurred_at });
+    this.store.appendAll(inputs);
+    return true;
+  }
+
+  // ── /subscribe — the generic stop-hook subscription system (rung 3) ─────────
+  // Records a close-on-next-stop subscription. BOUND-KEYED: refuses unless the
+  // instance is currently bound, so an orphan/never-bound id can never hold a
+  // subscription (the 77f7cfb4 re-firing class is structurally dead). Composing
+  // this with /stop yields `final message → auto-close on next stop-hook`.
+  subscribe(req: SubscribeRequest, transportReceipt: string | null = null): Promise<SubscribeResponse> {
+    return this.locked(async () => {
+      if (req.schema_version !== SCHEMA_VERSION) {
+        return {
+          ok: false,
+          instance_id: req.instance_id,
+          action: null,
+          subscribed: false,
+          reason: `schema_version_mismatch: daemon pins ${SCHEMA_VERSION}, request sent ${req.schema_version}`,
+        };
+      }
+      const proj = this.projections();
+      if (!proj.currentBindings.some((b) => b.instance_id === req.instance_id)) {
+        return {
+          ok: false,
+          instance_id: req.instance_id,
+          action: null,
+          subscribed: false,
+          reason: 'not_bound: subscriptions are bound-keyed — an unbound/never-bound instance cannot subscribe',
+        };
+      }
+      this.store.append({
+        entity_type: 'instance',
+        entity_id: req.instance_id,
+        event_type: 'reg.stop_subscribed',
+        payload: { action: req.action },
+        provenance: this.prov('wrapper', transportReceipt),
+        occurred_at: this.now(),
+      });
+      return { ok: true, instance_id: req.instance_id, action: req.action, subscribed: true, reason: null };
     });
   }
 
@@ -424,7 +475,7 @@ export class Daemon {
           provenance: this.prov('observer', transportReceipt),
           occurred_at: this.now(),
         });
-        return { ok: true, instance_id: req.instance_id, recorded: false, deduped: true, activity };
+        return { ok: true, instance_id: req.instance_id, recorded: false, deduped: true, activity, auto_close: 'none' };
       }
 
       // Fresh stop for a live, bound instance → record it (activity → stopped).
@@ -436,7 +487,26 @@ export class Daemon {
         provenance: this.prov('hook', transportReceipt),
         occurred_at: this.now(),
       });
-      return { ok: true, instance_id: req.instance_id, recorded: true, deduped: false, activity: 'stopped' };
+
+      // Reflexive auto-close: an OPEN close-on-stop subscription fires now (the stop
+      // we just recorded satiates it). `proj` is the pre-stop read, so the binding
+      // is still present; executeClose is the SAME mechanism as /close.
+      let auto_close: StopAutoCloseOutcome = 'none';
+      if (proj.openStopSubscriptions.has(req.instance_id)) {
+        const binding = proj.currentBindings.find((b) => b.instance_id === req.instance_id);
+        if (binding) {
+          const closed = await this.executeClose(binding, transportReceipt);
+          auto_close = closed ? 'fired' : 'reap_failed';
+          if (!closed) {
+            // Loud, not silent: the instance stays stopped+bound (visible), never a
+            // quiet leak. Reconcile catches any lingering retire-with-live-process.
+            console.error(
+              JSON.stringify({ level: 'error', event: 'auto_close_reap_failed', instance_id: req.instance_id, seat_id: binding.seat_id }),
+            );
+          }
+        }
+      }
+      return { ok: true, instance_id: req.instance_id, recorded: true, deduped: false, activity: 'stopped', auto_close };
     });
   }
 
