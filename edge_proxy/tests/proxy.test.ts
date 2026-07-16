@@ -14,8 +14,10 @@ test("allowlist matches exact and prefix", () => {
 });
 
 test("example k12 route admits launch and send, but not rung-3 lifecycle doors", async () => {
-  const config = await Bun.file(new URL("../edge_proxy.config.example.json", import.meta.url)).json();
-  const k12 = config.routes.find((route: RouteConfig) => route.prefix === "/k12") as RouteConfig;
+  const config: { routes: RouteConfig[] } = await Bun.file(new URL("../edge_proxy.config.example.json", import.meta.url)).json();
+  const k12 = config.routes.find((route) => route.prefix === "/k12");
+  expect(k12).toBeDefined();
+  if (!k12) throw new Error("example config is missing the /k12 route");
   expect(allowed("POST", "/launch", k12.allowlist)).toBe(true);
   expect(allowed("POST", "/send", k12.allowlist)).toBe(true);
   expect(allowed("POST", "/stop", k12.allowlist)).toBe(false);
