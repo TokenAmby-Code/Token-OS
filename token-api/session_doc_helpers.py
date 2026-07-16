@@ -1301,8 +1301,72 @@ async def async_obsidian_create(vault: str, path: str, content: str) -> bool:
 # ============ Session Doc File Management ============
 
 
+def session_doc_initial_content(
+    title: str, doc_id: int, project: str | None = None, primarch_name: str | None = None
+) -> str:
+    """Build initial session-doc content without performing vault I/O.
+
+    Token API serializes this payload through ``obsidian session-docs create``.
+    Keeping rendering separate prevents new lifecycle endpoints from acquiring a
+    direct managed-vault write exception.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    fm: dict[str, Any] = {
+        "session_doc_id": doc_id,
+        "created": today,
+    }
+    if project:
+        fm["project"] = project
+    fm["agents"] = []
+    if primarch_name:
+        fm["primarch"] = primarch_name
+    fm.update(
+        {
+            "status": "active",
+            "type": "session",
+            "rubric_key": DEFAULT_RUBRIC_KEY,
+            "start_time": None,
+            "end_time": None,
+            "duration_minutes": None,
+            "legion": None,
+            "faction": None,
+            "victory_conditions": [],
+            "commentary": None,
+            "sanguinius_is": "yet to take wing",
+            "drafts": [],
+            "victory": dict(DEFAULT_SESSION_DOC_RUBRIC),
+            "victory_skip": [],
+            "victory_notified_at": None,
+            "victory_acknowledged_at": None,
+            "victory_reason": None,
+            "deliverables": [],
+            "instance_type": "one_off",
+            "zealotry": 4,
+            "pr_url": None,
+            "worktrees": [],
+        }
+    )
+    body = (
+        f"# Session: {title}\n\n"
+        "<!-- visual:html BEGIN -->\n"
+        '<div class="session-visual">\n'
+        "  <em>Sanguinius is yet to take wing. Dispatch with "
+        "<code>dispatch --persona sanguinius --session-doc &lt;name&gt;</code>.</em>\n"
+        "</div>\n<!-- visual:html END -->\n\n"
+        "## Drafts\n_Sanguinius stages alternates here while he hovers. On wings-fold the top kept draft is promoted into the canonical region above and these regions are cleared._\n\n"
+        "## HTML Corrections Buffer\n<!-- corrections:html BEGIN -->\n<!-- corrections:html END -->\n\n"
+        "## Scratchpad\n\n_Assumptions, decisions in flight, handoff state. One thread per ongoing concern; flat is fine for one-off docs._\n\n"
+        "## Activity Log\n\n"
+    )
+    return serialize_frontmatter(fm, body)
+
+
 def create_session_doc_file(
-    file_path: Path, title: str, doc_id: int, project: str = None, primarch_name: str = None
+    file_path: Path,
+    title: str,
+    doc_id: int,
+    project: str | None = None,
+    primarch_name: str | None = None,
 ) -> None:
     """Create the markdown file for a session document.
 
@@ -1312,61 +1376,9 @@ def create_session_doc_file(
     """
     _assert_not_live_vault(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y-%m-%d")
-    fm: dict[str, Any] = {
-        "session_doc_id": doc_id,
-        "created": today,
-    }
-    if project:
-        fm["project"] = project
-    fm["agents"] = []  # append-only launch roster (see _update_doc_agents_list)
-    if primarch_name:
-        fm["primarch"] = primarch_name
-    fm["status"] = "active"
-    fm["type"] = "session"
-    fm["rubric_key"] = DEFAULT_RUBRIC_KEY
-    fm["start_time"] = None
-    fm["end_time"] = None
-    fm["duration_minutes"] = None
-    fm["legion"] = None
-    fm["faction"] = None
-    fm["victory_conditions"] = []
-    fm["commentary"] = None
-    fm["sanguinius_is"] = "yet to take wing"
-    fm["drafts"] = []
-    fm["victory"] = dict(DEFAULT_SESSION_DOC_RUBRIC)
-    fm["victory_skip"] = []
-    fm["victory_notified_at"] = None
-    fm["victory_acknowledged_at"] = None
-    fm["victory_reason"] = None
-    fm["deliverables"] = []
-    fm["instance_type"] = "one_off"
-    fm["zealotry"] = 4
-    fm["pr_url"] = None
-    # Worktree registry (Phase 3). List of {path, branch, port, status, claimed_at};
-    # exactly one entry is status:active at a time, archived entries are retained.
-    # NOT the dormant `worktrees` DB table. Mutated server-side via
-    # update_session_doc_worktrees() to hold the one-active invariant.
-    fm["worktrees"] = []
-
-    body = (
-        f"# Session: {title}\n\n"
-        "<!-- visual:html BEGIN -->\n"
-        '<div class="session-visual">\n'
-        "  <em>Sanguinius is yet to take wing. Dispatch with "
-        "<code>dispatch --persona sanguinius --session-doc &lt;name&gt;</code>.</em>\n"
-        "</div>\n"
-        "<!-- visual:html END -->\n\n"
-        "## Drafts\n"
-        "_Sanguinius stages alternates here while he hovers. On wings-fold the top kept draft is promoted into the canonical region above and these regions are cleared._\n\n"
-        "## HTML Corrections Buffer\n"
-        "<!-- corrections:html BEGIN -->\n"
-        "<!-- corrections:html END -->\n\n"
-        "## Scratchpad\n\n"
-        "_Assumptions, decisions in flight, handoff state. One thread per ongoing concern; flat is fine for one-off docs._\n\n"
-        "## Activity Log\n\n"
+    file_path.write_text(
+        session_doc_initial_content(title, doc_id, project, primarch_name), encoding="utf-8"
     )
-    file_path.write_text(serialize_frontmatter(fm, body), encoding="utf-8")
 
 
 async def _update_doc_agents_list(db, doc_id: int) -> None:

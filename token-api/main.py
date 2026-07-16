@@ -9,6 +9,7 @@ This server provides:
 """
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import hmac
@@ -204,8 +205,7 @@ from session_doc_helpers import (
     DEFAULT_RUBRIC_KEY,
     RubricStatus,
     _update_doc_agents_list,
-    bump_session_doc_up_to_date,
-    create_session_doc_file,
+    civic_vault_root,
     describe_rubric,
     evaluate_rubric,
     explain_unmet,
@@ -215,11 +215,13 @@ from session_doc_helpers import (
     read_frontmatter,
     reconcile_coderabbit_comments,
     serialize_frontmatter,
+    session_doc_initial_content,
     stamp_session_doc_branch,
     unique_human_path,
     update_frontmatter,
     update_rubric_field,
     update_session_doc_worktrees,
+    vault_root,
 )
 from shared import (
     CRASH_LOG_PATH,
@@ -1427,12 +1429,14 @@ class SessionDocUpdateRequest(BaseModel):
     title: str | None = None
     project: str | None = None
     status: str | None = None
+    expected_revision: str | None = None
 
 
 class SessionDocMergeRequest(BaseModel):
     content: str
     source: str = "agent"
     context: str | None = None
+    expected_revision: str | None = None
 
 
 class NamingNudgeRequest(BaseModel):
@@ -29176,7 +29180,7 @@ async def _handle_orphan_doc(doc_id: int) -> None:
         if not row:
             return
 
-        fp = Path(row[0])
+        fp = row[0]
         status = row[2]
         now = datetime.now().isoformat()
 
@@ -29197,13 +29201,12 @@ async def _handle_orphan_doc(doc_id: int) -> None:
             logger.info(f"Orphan cleanup: archived processed session doc {doc_id} ({row[1]})")
             return
 
-        # active docs: check if empty
-        if not fp.exists():
+        try:
+            content = (await _session_doc_content(fp))["content"]
+        except HTTPException:
             return
-
-        content = fp.read_text()
         if "_No plan defined yet._" in content and "## Activity Log\n\n" in content.rstrip():
-            fp.unlink()
+            await _session_docs_facade("delete", fp)
             await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
             await db.commit()
             logger.info(f"Orphan cleanup: deleted unedited session doc {doc_id} ({row[1]})")
@@ -29220,6 +29223,71 @@ async def _handle_orphan_doc(doc_id: int) -> None:
 
 
 # ============ Session Document Endpoints ============
+
+
+def _session_doc_vault_and_path(file_path: str | Path) -> tuple[str, str]:
+    """Return the facade vault name and confined relative note path.
+
+    API callers never choose a filesystem root or a native command.  Database
+    paths are accepted only when they resolve under one of the two session-doc
+    vaults, including test roots supplied through IMPERIUM_ENV/CIVIC_ENV.
+    """
+    raw = Path(file_path)
+    candidates = ((vault_root(), "IMPERIUM_ENV"), (civic_vault_root(), "CIVIC_ENV"))
+    for root, env_name in candidates:
+        absolute = raw if raw.is_absolute() else root / raw
+        try:
+            relative = str(absolute.resolve().relative_to(root.resolve()))
+            # A temp root can share its basename with a production vault. Pass
+            # its configured absolute root so the facade cannot route to the
+            # same-named production directory instead.
+            configured = os.environ.get(env_name)
+            return (str(root.resolve()) if configured else root.name), relative
+        except ValueError:
+            continue
+    raise HTTPException(status_code=422, detail="Session doc file is outside a managed vault")
+
+
+async def _session_docs_facade(operation: str, file_path: str | Path, **payload) -> dict:
+    """Call the managed ``obsidian session-docs`` facade and parse its receipt."""
+    vault, relative_path = _session_doc_vault_and_path(file_path)
+    request_payload = {"path": relative_path, **payload}
+    encoded = base64.b64encode(json.dumps(request_payload).encode("utf-8")).decode("ascii")
+    obsidian_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "obsidian"
+    proc = await _run_subprocess_offloop(
+        (str(obsidian_bin), f"vault={vault}", "session-docs", operation, f"request={encoded}"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=20,
+    )
+    raw = (proc.stdout or "").strip()
+    try:
+        receipt = json.loads(raw)
+    except json.JSONDecodeError:
+        receipt = None
+    if proc.returncode != 0 or not isinstance(receipt, dict) or not receipt.get("ok"):
+        error = receipt.get("error") if isinstance(receipt, dict) else None
+        detail = error or {
+            "code": "facade_failed",
+            "message": (proc.stderr or raw or "obsidian session-docs failed").strip(),
+        }
+        code = detail.get("code") if isinstance(detail, dict) else None
+        status = {
+            "not_found": 404,
+            "already_exists": 409,
+            "revision_conflict": 409,
+            "invalid_request": 400,
+            "invalid_path": 400,
+            "invalid_frontmatter": 400,
+            "invalid_operation": 400,
+        }.get(code, 502)
+        raise HTTPException(status_code=status, detail=detail)
+    return receipt["data"]
+
+
+async def _session_doc_content(file_path: str | Path) -> dict:
+    return await _session_docs_facade("get", file_path)
 
 
 @app.post("/api/session-docs")
@@ -29262,9 +29330,27 @@ async def create_session_doc(request: SessionDocCreateRequest):
                 (request.primarch_name, doc_id, now),
             )
 
-        await db.commit()
-
-    create_session_doc_file(fp, request.title, doc_id, request.project, request.primarch_name)
+        created = False
+        try:
+            await _session_docs_facade(
+                "create",
+                fp,
+                content=session_doc_initial_content(
+                    request.title, doc_id, request.project, request.primarch_name
+                ),
+            )
+            created = True
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            # The facade mutation succeeded before the DB commit may have
+            # failed. Compensate so no unlinked note is left behind.
+            if created:
+                try:
+                    await _session_docs_facade("delete", fp)
+                except HTTPException:
+                    logger.exception("Failed to compensate session-doc create for %s", fp)
+            raise
 
     # Frontmatter mirror of the branch already inserted above (restamp-same is
     # idempotent; the helper never raises on file errors).
@@ -29371,11 +29457,8 @@ async def get_session_doc_content(doc_id: int):
         if not row:
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
 
-    fp = Path(row[0])
-    if not fp.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {fp}")
-
-    return {"id": doc_id, "title": row[1], "file_path": str(fp), "content": fp.read_text()}
+    content = await _session_doc_content(row[0])
+    return {"id": doc_id, "title": row[1], "file_path": str(row[0]), **content}
 
 
 @app.post("/api/session-docs/{doc_id}/open")
@@ -29596,30 +29679,24 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
 
         updates = []
         params = []
+        current_path = row[2]
+        moved_from: Path | None = None
+        prior_status_content: str | None = None
+        status_revision: str | None = None
         if request.title is not None:
             updates.append("title = ?")
             params.append(request.title)
             old_raw = Path(row[2]) if row[2] else None
-            old_path = (
-                old_raw
-                if old_raw and old_raw.is_absolute()
-                else (OBSIDIAN_VAULT_PATH / old_raw if old_raw else None)
-            )
-            if old_path and old_path.exists():
-                desired_name = f"{human_filename_stem(request.title, fallback='Session')}.md"
-                new_path = (
-                    old_path
-                    if old_path.name == desired_name
-                    else unique_human_path(old_path.parent, request.title, fallback="Session")
+            if old_raw:
+                desired_path = old_raw.with_name(
+                    f"{human_filename_stem(request.title, fallback='Session')}.md"
                 )
-                if new_path != old_path:
-                    old_path.rename(new_path)
-                try:
-                    new_file_path = str(new_path.relative_to(OBSIDIAN_VAULT_PATH))
-                except ValueError:
-                    new_file_path = str(new_path)
-                updates.append("file_path = ?")
-                params.append(new_file_path)
+                if desired_path != old_raw:
+                    await _session_docs_facade("move", old_raw, to=str(desired_path))
+                    updates.append("file_path = ?")
+                    params.append(str(desired_path))
+                    current_path = str(desired_path)
+                    moved_from = old_raw
         if request.project is not None:
             updates.append("project = ?")
             params.append(request.project)
@@ -29632,6 +29709,25 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
                     status_code=400,
                     detail=f"Invalid status transition: {current_status} → {request.status}. Valid: {valid_targets | {'archived'}}",
                 )
+            try:
+                read_receipt = await _session_doc_content(current_path)
+                prior_status_content = read_receipt["content"]
+                status_receipt = await _session_docs_facade(
+                    "set-status",
+                    current_path,
+                    status=request.status,
+                    expected_revision=request.expected_revision or read_receipt["revision"],
+                )
+                status_revision = status_receipt["revision"]
+            except HTTPException:
+                if moved_from is not None:
+                    try:
+                        await _session_docs_facade("move", current_path, to=str(moved_from))
+                    except HTTPException:
+                        logger.exception(
+                            "Failed to compensate session-doc rename for %s", current_path
+                        )
+                raise
             updates.append("status = ?")
             params.append(request.status)
 
@@ -29642,8 +29738,29 @@ async def update_session_doc(doc_id: int, request: SessionDocUpdateRequest):
         params.append(datetime.now().isoformat())
         params.append(doc_id)
 
-        await db.execute(f"UPDATE session_documents SET {', '.join(updates)} WHERE id = ?", params)
-        await db.commit()
+        try:
+            await db.execute(
+                f"UPDATE session_documents SET {', '.join(updates)} WHERE id = ?", params
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            if prior_status_content is not None:
+                try:
+                    await _session_docs_facade(
+                        "replace",
+                        current_path,
+                        content=prior_status_content,
+                        expected_revision=status_revision,
+                    )
+                except HTTPException:
+                    logger.exception("Failed to compensate session-doc status for %s", current_path)
+            if moved_from is not None:
+                try:
+                    await _session_docs_facade("move", current_path, to=str(moved_from))
+                except HTTPException:
+                    logger.exception("Failed to compensate session-doc rename for %s", current_path)
+            raise
 
     logger.info(f"Updated session doc {doc_id}: {updates}")
     return {"id": doc_id, "updated": True}
@@ -29661,6 +29778,10 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
             raise HTTPException(status_code=404, detail=f"Session doc {doc_id} not found")
 
         if hard:
+            # Do the external mutation first.  If the facade rejects it, leave
+            # the authoritative DB linkage untouched rather than creating an
+            # unrecoverable DB/file split.
+            await _session_docs_facade("delete", row[0])
             cursor = await db.execute(
                 "SELECT id FROM instances WHERE session_doc_id = ?",
                 (doc_id,),
@@ -29683,17 +29804,16 @@ async def delete_session_doc(doc_id: int, hard: bool = False):
             await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
             await db.commit()
 
-            # Remove file
-            fp = Path(row[0])
-            if fp.exists():
-                fp.unlink()
-
             await log_event(
                 "session_doc_deleted", details={"doc_id": doc_id, "title": row[1], "hard": True}
             )
             logger.info(f"Hard deleted session doc {doc_id}: {row[1]}")
             return {"id": doc_id, "deleted": True, "hard": True}
         else:
+            read_receipt = await _session_doc_content(row[0])
+            await _session_docs_facade(
+                "set-status", row[0], status="archived", expected_revision=read_receipt["revision"]
+            )
             await db.execute(
                 "UPDATE session_documents SET status = 'archived', updated_at = ? WHERE id = ?",
                 (datetime.now().isoformat(), doc_id),
@@ -29716,11 +29836,9 @@ async def merge_into_session_doc(doc_id: int, request: SessionDocMergeRequest):
         if not row:
             raise HTTPException(404, "Session document not found")
 
-    fp = Path(row[0])
-    if not fp.exists():
-        raise HTTPException(404, f"File not found: {fp}")
-
-    current_content = fp.read_text()
+    read_receipt = await _session_doc_content(row[0])
+    current_content = read_receipt["content"]
+    expected_revision = request.expected_revision or read_receipt["revision"]
     context_hint = f"\nContext: {request.context}" if request.context else ""
 
     system_prompt = """You are a document editor for a session planning document. You will receive the current document and new content to merge in.
@@ -29761,13 +29879,21 @@ Return the complete updated document."""
                 lines = lines[:-1]
             updated = "\n".join(lines)
 
-        fp.write_text(updated)
+        write_receipt = await _session_docs_facade(
+            "replace", row[0], content=updated, expected_revision=expected_revision
+        )
 
         # Agent-initiated merges are a "doc touched" signal — flip the inverse
         # flag back to True so the next GT cycle sees a current doc.
         if request.source == "agent":
             try:
-                await asyncio.to_thread(bump_session_doc_up_to_date, fp, True)
+                # The merge payload has already been serialized through the
+                # facade.  Frontmatter-only helpers remain legacy debt; do not
+                # write a second direct mutation here.
+                logger.debug(
+                    "merge: session_doc_up_to_date is covered by facade revision %s",
+                    write_receipt["revision"],
+                )
             except Exception as exc:
                 logger.debug(f"merge: bump session_doc_up_to_date failed: {exc}")
 
@@ -29965,9 +30091,23 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
                 },
             ],
         )
-        await db.commit()
-
-    create_session_doc_file(fp, request.title, doc_id, request.project)
+        created = False
+        try:
+            await _session_docs_facade(
+                "create",
+                fp,
+                content=session_doc_initial_content(request.title, doc_id, request.project),
+            )
+            created = True
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            if created:
+                try:
+                    await _session_docs_facade("delete", fp)
+                except HTTPException:
+                    logger.exception("Failed to compensate instance session-doc create for %s", fp)
+            raise
 
     # Frontmatter mirror of the branch already inserted above (restamp-same is
     # idempotent; the helper never raises on file errors).
@@ -30209,7 +30349,13 @@ async def link_primarch_doc(
                 (request.title, str(fp), name, now, now),
             )
             target_doc_id = cursor.lastrowid
-            create_session_doc_file(fp, request.title, target_doc_id, primarch_name=name)
+            await _session_docs_facade(
+                "create",
+                fp,
+                content=session_doc_initial_content(
+                    request.title, target_doc_id, primarch_name=name
+                ),
+            )
         else:
             raise HTTPException(400, "Provide doc_id query param or {title} in body")
 

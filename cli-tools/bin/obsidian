@@ -20,6 +20,7 @@
 #   obsidian vault=<name> move path="<old>.md" to="<new>.md"
 #   obsidian vault=<name> daily:read
 #   obsidian vault=<name> open path="<note>.md"
+#   obsidian vault=<name> session-docs <get|create|replace|append|move|delete> request=<base64-json>
 
 set -euo pipefail
 
@@ -47,6 +48,24 @@ fi
 # --- Vault resolution ---
 resolve_vault() {
   local vault_name="$1"
+
+  # Token API may supply an explicit managed root for an isolated test vault.
+  # Do not treat arbitrary absolute paths as vaults: the only permitted roots
+  # are the two roots configured for the managed session-doc boundary.
+  if [[ "$vault_name" == /* ]]; then
+    local allowed resolved candidate
+    resolved=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$vault_name")
+    for candidate in "${IMPERIUM_ENV:-}" "${CIVIC_ENV:-}"; do
+      [[ -z "$candidate" ]] && continue
+      allowed=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$candidate")
+      if [[ "$resolved" == "$allowed" && -d "$resolved" ]]; then
+        echo "$resolved"
+        return 0
+      fi
+    done
+    echo "Error: explicit vault root is not a configured managed vault" >&2
+    return 1
+  fi
 
   # NAS mounts first (canonical locations)
   # macOS mounts to /Volumes/, Linux mounts to /mnt/
@@ -92,6 +111,9 @@ PARAM_content=""
 PARAM_property=""
 PARAM_value=""
 PARAM_to=""
+PARAM_request=""
+SESSION_DOCS_OP=""
+ORIGINAL_ARGS=("$@")
 
 for arg in "$@"; do
   if [[ "$arg" == vault=* ]]; then
@@ -114,6 +136,10 @@ for arg in "$@"; do
   elif [[ "$arg" == to=* ]]; then
     val="${arg#to=}"; val="${val#\"}"; val="${val%\"}"; val="${val#\'}"; val="${val%\'}"
     PARAM_to="$val"
+  elif [[ "$arg" == request=* ]]; then
+    PARAM_request="${arg#request=}"
+  elif [[ "$COMMAND" == "session-docs" && -z "$SESSION_DOCS_OP" && "$arg" != *=* ]]; then
+    SESSION_DOCS_OP="$arg"
   elif [[ -z "$COMMAND" && "$arg" != *=* ]]; then
     COMMAND="$arg"
   fi
@@ -362,6 +388,124 @@ print(f'obsidian://open?vault={vault}&file={path}')
   esac
 }
 
+# Managed session-document boundary.  Token API uses this JSON protocol instead
+# of filesystem calls so revision checks and path confinement are identical for
+# every session lifecycle writer.  The native-container facade may replace this
+# implementation, but its public contract is deliberately small and stable.
+cmd_session_docs() {
+  local op="${1:-}"
+  if [[ -z "$op" || -z "$PARAM_request" ]]; then
+    echo '{"ok":false,"error":{"code":"invalid_request","message":"operation and request= are required"}}' >&2
+    return 2
+  fi
+
+  # All session-document mutations share one sidecar lock for this vault.  The
+  # lock is acquired before the Python protocol performs any existence or
+  # revision check, and stays held until its JSON receipt is generated.
+  case "$op" in
+    create|replace|append|move|delete|set-status)
+      if [[ -z "${SESSION_DOCS_LOCK_HELD:-}" && -f "$LOCK_HELPER" ]]; then
+        exec python3 "$LOCK_HELPER" "$VAULT_ROOT" -- env SESSION_DOCS_LOCK_HELD=1 "$0" "${ORIGINAL_ARGS[@]}"
+      fi
+      ;;
+  esac
+  python3 - "$VAULT_ROOT" "$op" "$PARAM_request" <<'PY'
+import base64, hashlib, json, os, sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+op = sys.argv[2]
+try:
+    request = json.loads(base64.b64decode(sys.argv[3]).decode("utf-8"))
+except Exception as exc:
+    print(json.dumps({"ok": False, "error": {"code": "invalid_request", "message": str(exc)}}))
+    raise SystemExit(2)
+
+def fail(code, message, **extra):
+    print(json.dumps({"ok": False, "error": {"code": code, "message": message, **extra}}))
+    raise SystemExit(3 if code == "revision_conflict" else 2)
+
+def path_for(value):
+    if not isinstance(value, str) or not value:
+        fail("invalid_path", "path is required")
+    candidate = (root / value).resolve()
+    if candidate == root or root not in candidate.parents or candidate.suffix != ".md":
+        fail("invalid_path", "path must be a vault-relative markdown path")
+    return candidate
+
+def revision(content):
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+def result(path, content=None, **extra):
+    data = {"path": str(path.relative_to(root))}
+    if content is not None:
+        data.update({"content": content, "revision": revision(content)})
+    data.update(extra)
+    print(json.dumps({"ok": True, "data": data}))
+
+path = path_for(request.get("path"))
+if op == "get":
+    if not path.is_file(): fail("not_found", "note not found")
+    result(path, path.read_text(encoding="utf-8"))
+elif op == "create":
+    if path.exists(): fail("already_exists", "note already exists")
+    content = request.get("content")
+    if not isinstance(content, str): fail("invalid_request", "content must be a string")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    result(path, content, created=True)
+elif op in ("replace", "append"):
+    if not path.is_file(): fail("not_found", "note not found")
+    current = path.read_text(encoding="utf-8")
+    expected = request.get("expected_revision")
+    actual = revision(current)
+    if expected is not None and expected != actual:
+        fail("revision_conflict", "note changed since it was read", expected_revision=expected, actual_revision=actual)
+    content = request.get("content")
+    if not isinstance(content, str): fail("invalid_request", "content must be a string")
+    updated = content if op == "replace" else current + content
+    path.write_text(updated, encoding="utf-8")
+    result(path, updated)
+elif op == "move":
+    if not path.is_file(): fail("not_found", "note not found")
+    target = path_for(request.get("to"))
+    if target.exists(): fail("already_exists", "destination already exists")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    path.rename(target)
+    result(target, target.read_text(encoding="utf-8"), moved_from=str(path.relative_to(root)))
+elif op == "delete":
+    if not path.is_file(): fail("not_found", "note not found")
+    path.unlink()
+    result(path, deleted=True)
+elif op == "set-status":
+    if not path.is_file(): fail("not_found", "note not found")
+    status = request.get("status")
+    if not isinstance(status, str) or not status:
+        fail("invalid_request", "status must be a non-empty string")
+    current = path.read_text(encoding="utf-8")
+    expected = request.get("expected_revision")
+    actual = revision(current)
+    if expected is not None and expected != actual:
+        fail("revision_conflict", "note changed since it was read", expected_revision=expected, actual_revision=actual)
+    if not current.startswith("---") or "\n---" not in current[3:]:
+        fail("invalid_frontmatter", "managed session doc has no frontmatter")
+    head, tail = current[3:].split("\n---", 1)
+    lines = head.splitlines()
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.startswith("status:"):
+            lines[index] = f"status: {status}"
+            replaced = True
+            break
+    if not replaced: lines.append(f"status: {status}")
+    updated = "---" + "\n".join(lines) + "\n---" + tail
+    path.write_text(updated, encoding="utf-8")
+    result(path, updated, status=status)
+else:
+    fail("invalid_operation", f"unsupported session-docs operation: {op}")
+PY
+}
+
 # --- Auto-flock daily-note mutations ---
 # Re-exec the whole invocation under vault_lock.py so the flock is held for the
 # real write, then set OBSIDIAN_LOCK_HELD=1 to prevent infinite re-exec. Graceful
@@ -380,6 +524,7 @@ esac
 
 # --- Dispatch ---
 case "$COMMAND" in
+  session-docs)   cmd_session_docs "$SESSION_DOCS_OP" ;;
   read)           cmd_read ;;
   search)         cmd_search ;;
   search:context) cmd_search_context ;;
@@ -397,7 +542,7 @@ case "$COMMAND" in
     ;;
   *)
     echo "Error: unknown command '$COMMAND'" >&2
-    echo "Commands: read, search, search:context, backlinks, create, append, property:set, property:read, orphans, move, daily:read, open" >&2
+    echo "Commands: read, search, search:context, backlinks, create, append, property:set, property:read, orphans, move, daily:read, open, session-docs" >&2
     exit 1
     ;;
 esac

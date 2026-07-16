@@ -91,11 +91,24 @@
           },
           {
             "type": "command",
+            "command": "bash ~/.claude/hooks/managed-vault-write-report.sh"
+          },
+          {
+            "type": "command",
             "command": "HOOK_DEBUG=1 HOOK_ACTION_TYPE=PreToolUse bash ~/.claude/hooks/generic-hook.sh"
           },
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/uv-python-policy.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/managed-vault-write-report.sh"
           }
         ]
       },
