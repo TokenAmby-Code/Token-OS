@@ -16,10 +16,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Historical records, not live surfaces.
-HISTORICAL_ALLOWLIST = (
-    "WIP-MERGE-PLAN.md",
-    "token-api/docs/handoffs/",
-)
+HISTORICAL_FILES = ("WIP-MERGE-PLAN.md",)
+HISTORICAL_DIRS = ("token-api/docs/handoffs/",)
 
 BANNED_PATHS = (
     "claude-config/commands",
@@ -55,7 +53,7 @@ def test_banned_strings_absent() -> None:
     this_test = str(Path(__file__).resolve().relative_to(REPO_ROOT))
     offenders: list[str] = []
     for name in _tracked_files():
-        if name == this_test or name.startswith(HISTORICAL_ALLOWLIST):
+        if name == this_test or name in HISTORICAL_FILES or name.startswith(HISTORICAL_DIRS):
             continue
         path = REPO_ROOT / name
         try:
