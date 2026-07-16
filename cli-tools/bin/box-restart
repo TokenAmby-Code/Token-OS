@@ -79,6 +79,8 @@ BARE="${TOKEN_OS_BARE_REPO:-$(dirname "$RUNTIME")/token-os.git}"
 TOKEN_API_UNIT="token-api@$(basename "$RUNTIME").service"
 HEALTH_URL="${TOKEN_API_URL:-http://127.0.0.1:7777}/health"
 LOCK_FILE="/tmp/box-restart-$(id -u).lock"
+# shellcheck source=../lib/runtime-dirty-shunt.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/runtime-dirty-shunt.sh"
 
 ACTION="restart"
 TARGET_SHA="${TOKEN_RESTART_TARGET_SHA:-}"
@@ -154,13 +156,12 @@ fi
 OLD_SHA="$(git -C "$RUNTIME" rev-parse HEAD)"
 RUNNING_SHA="$(running_git_sha)"
 
-# 3. A dirty runtime aborts the deploy (runtime checkouts are deploy artifacts;
-#    boxes get no WIP shunt — a dirty box runtime is someone editing the runtime,
-#    which is always an error).
-if [[ -n "$(git -C "$RUNTIME" status --porcelain 2> /dev/null)" ]]; then
-    echo "✗ runtime checkout is DIRTY — refusing to deploy (never edit the runtime checkout)" >&2
+# 3. Preserve a dirty runtime before any checkout can replace it. Failure is
+# fail-closed: no reset/checkout occurs until the verified WIP branch + receipt exist.
+runtime_shunt_dirty "$RUNTIME" "$BARE" "Token-OS" "$TARGET_SHA" "${IMPERIUM_MACHINE:-k12}" || {
+    echo "✗ dirty-runtime preservation failed; refusing to deploy" >&2
     exit 1
-fi
+}
 
 if [[ "$OLD_SHA" == "$TARGET_SHA" && "$RUNNING_SHA" == "$TARGET_SHA" ]]; then
     echo "✓ already serving $TARGET_SHA — nothing to do"

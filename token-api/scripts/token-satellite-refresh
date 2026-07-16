@@ -24,6 +24,13 @@ venv="${UV_PROJECT_ENVIRONMENT:-$HOME/.local/venvs/token-api}"
 helper_install="${TOKEN_SATELLITE_REFRESH_HELPER_INSTALL:-$HOME/.local/bin/token-satellite-refresh}"
 lock_dir="${XDG_STATE_HOME:-$HOME/.local/state}"
 lock_file="$lock_dir/token-satellite-refresh.lock"
+shunt_lib=""
+for candidate in "$live/cli-tools/lib/runtime-dirty-shunt.sh" "$(dirname "$0")/../../cli-tools/lib/runtime-dirty-shunt.sh"; do
+  [[ -r "$candidate" ]] && { shunt_lib="$candidate"; break; }
+done
+[[ -n "$shunt_lib" ]] || { echo "missing dirty-runtime shunt" >&2; exit 69; }
+# shellcheck source=/dev/null
+source "$shunt_lib"
 
 mkdir -p "$lock_dir" "$(dirname "$bare")" "$(dirname "$live")"
 exec 9>"$lock_file"
@@ -69,11 +76,10 @@ if [[ ! -e "$live" ]]; then
   git clone "$bare" "$live"
 fi
 make_runtime_writable
-if [[ -n "$(git -C "$live" status --porcelain 2>/dev/null)" ]]; then
-  echo "runtime checkout dirty; refusing to overwrite: $live" >&2
-  git -C "$live" status --short >&2 || true
+runtime_shunt_dirty "$live" "$bare" "Token-OS" "$sha" "${IMPERIUM_MACHINE:-wsl}" || {
+  echo "runtime checkout preservation failed; refusing to overwrite: $live" >&2
   exit 68
-fi
+}
 
 git -C "$live" fetch "$bare" '+refs/heads/*:refs/remotes/local-bare/*' '+refs/runtime-refresh/*:refs/remotes/runtime-refresh/*'
 if ! git -C "$live" cat-file -e "$sha^{commit}" 2>/dev/null; then
