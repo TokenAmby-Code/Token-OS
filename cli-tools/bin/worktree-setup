@@ -654,15 +654,29 @@ fi
 if [[ -n "$SESSION_DOC_ID" ]]; then
     _claimed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     _wt_api="${TOKEN_API_URL:-http://localhost:7777}"
+    _wt_claim_url="$_wt_api/api/session-docs/$SESSION_DOC_ID/worktrees"
     _wt_body=$(printf '{"action":"claim","path":"%s","branch":"%s","port":"%s","claimed_at":"%s"}' \
         "$WORKTREE_DIR" "$BRANCH_NAME" "${ASSIGNED_PORT:-}" "$_claimed_at")
-    if curl -fsS -m 5 -X POST \
+    if curl -fsS --connect-timeout 2 --max-time 15 \
+        --retry 3 --retry-connrefused --retry-delay 1 -X POST \
         -H "Content-Type: application/json" \
         -d "$_wt_body" \
-        "$_wt_api/api/session-docs/$SESSION_DOC_ID/worktrees" >/dev/null 2>&1; then
+        "$_wt_claim_url" >/dev/null 2>&1; then
         log_success "Registered worktree in session doc $SESSION_DOC_ID (active)"
     else
-        log_warn "Could not register worktree in session doc $SESSION_DOC_ID (token-api unreachable?)"
+        # No short silent timeouts on core infra: retries exhausted, so enqueue
+        # the claim to the durable outbox. The claim endpoint is idempotent for
+        # the same path/branch, so a later drain double-post is safe.
+        _wt_rc=$?
+        _wt_outbox="$(dirname "$(readlink -f "$0")")/generic-token-api-durable-retry-outbox"
+        if [[ -x "$_wt_outbox" ]] && printf '%s' "$_wt_body" | "$_wt_outbox" enqueue \
+            --action-type worktree_claim \
+            --url "$_wt_claim_url" \
+            --cause "curl-rc${_wt_rc}" >/dev/null 2>&1; then
+            log_warn "Could not register worktree in session doc $SESSION_DOC_ID — claim queued to durable outbox for retry"
+        else
+            log_warn "Could not register worktree in session doc $SESSION_DOC_ID — and outbox enqueue failed (claim not queued)"
+        fi
     fi
 fi
 

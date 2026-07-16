@@ -1503,6 +1503,9 @@ maybe_enter_worktree() {
     bare="$(dispatch_conf_var "$conf" BARE_REPO)"
     if [[ -n "$parent" && ( "$WORK_DIR" == "$parent" || "$WORK_DIR" == "$parent"/* ) ]]; then
       assert_worktree_pr_capable "$WORK_DIR" "$proj"
+      if [[ -n "$WORKTREE_BRANCH" ]]; then
+        err "WARNING: explicit --worktree $WORKTREE_BRANCH IGNORED — session is already in an isolated worktree ($WORK_DIR); dispatching there instead"
+      fi
       WORKTREE_DECISION="n/a (already isolated worktree)"
       return 0
     fi
