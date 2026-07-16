@@ -95,16 +95,21 @@ export class Daemon {
         };
       }
 
-      // Create the seat (real pane below the membrane) + record the fact.
-      await this.tmux.createSeat(req.seat_id);
-      this.store.append({
-        entity_type: 'seat',
-        entity_id: req.seat_id,
-        event_type: 'reg.pane_created',
-        payload: { pane_state: 'live' },
-        provenance: prov,
-        occurred_at,
-      });
+      // The estate is persistent. A launch may bind an already-made canonical
+      // seat; creating it again would turn a valid handover into a raw tmux
+      // duplicate-session failure. Record creation only when this door made it.
+      const existingSeat = (await this.tmux.listSeats()).some((seat) => seat.seat_id === req.seat_id);
+      if (!existingSeat) {
+        await this.tmux.createSeat(req.seat_id);
+        this.store.append({
+          entity_type: 'seat',
+          entity_id: req.seat_id,
+          event_type: 'reg.pane_created',
+          payload: { pane_state: 'live' },
+          provenance: prov,
+          occurred_at,
+        });
+      }
 
       // Reg-audit: every attestation-defined-so-far must be present.
       const missing = DOOR1_REQUIRED_ATTESTATIONS.filter((a) => !req[a]);

@@ -1649,6 +1649,30 @@ else:
 PY
 }
 
+# k12-personal has no tmuxctld. Its persistent estate is controlled through the
+# local proxy door instead. Keep the wrapper as the only engine launcher: this
+# adapter merely carries its staged command to a canonical estate seat.
+k12_proxy_dispatch() {
+  [[ "${IMPERIUM_MACHINE:-}" == "k12-personal" ]]
+}
+
+k12_proxy_url() {
+  if [[ -n "${K12_PROXY_URL:-}" ]]; then
+    printf '%s' "${K12_PROXY_URL%/}"
+    return 0
+  fi
+  local host
+  host="$(imperium_cfg tailscale_ip k12-personal 2>/dev/null || true)"
+  [[ -n "$host" ]] || return 1
+  printf 'http://%s:7780/k12' "$host"
+}
+
+k12_physical_pane() {
+  local seat="$1"
+  command -v tmux >/dev/null 2>&1 || return 1
+  tmux list-panes -a -F '#{pane_id}\t#{@canonical_id}' 2>/dev/null | awk -F '\t' -v seat="$seat" '$2 == seat { print $1; exit }'
+}
+
 tmuxctld_stack_dispatch() {
   local base="$1" session="$2" cwd="$3" command_text="$4"
   tmuxctld_result POST /stack/dispatch \
@@ -1817,6 +1841,10 @@ PY
 materialize_physical_pane() {
   local target="$1" resolved
   [[ -n "$target" ]] || return 0
+  if k12_proxy_dispatch && [[ "$target" =~ ^[a-z][a-z0-9-]*:[A-Za-z0-9-]+$ ]]; then
+    resolved="$(k12_physical_pane "$target" || true)"
+    [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
+  fi
   resolved="$(tmuxctld_result GET /resolve-pane target="$target" format=physical 2>/dev/null || true)"
   [[ -n "$resolved" ]] && { printf '%s' "$resolved"; return 0; }
   printf '%s' "$target"
@@ -1830,6 +1858,9 @@ resolve_pane_label_for_env() {
   fi
   if [[ -z "$label" && "$pane" =~ ^[a-z][a-z0-9-]*:[A-Za-z0-9-]+$ ]]; then
     label="$pane"
+  fi
+  if [[ -z "$label" ]] && k12_proxy_dispatch; then
+    label="$(tmux display-message -p -t "$pane" '#{@canonical_id}' 2>/dev/null || true)"
   fi
   printf '%s' "$label"
 }
@@ -2135,11 +2166,15 @@ build_agent_command() {
   # the canonical working id at this hand-off boundary so storage + consumers stay
   # unchanged (column stays physical, fleet launchable at every commit).
   if [[ -n "${RESOLVED_TARGET:-}" ]]; then
-    local resolved_physical_pane resolved_pane_label
+    local resolved_physical_pane resolved_pane_label canonical_pane_label
     resolved_physical_pane="$(materialize_physical_pane "$RESOLVED_TARGET")"
     envs+=("TOKEN_API_DISPATCH_RESOLVED_PANE=${resolved_physical_pane}")
     envs+=("TMUX_PANE=${resolved_physical_pane}")
-    resolved_pane_label="$(resolve_pane_label_for_env "$resolved_physical_pane")"
+    canonical_pane_label=""
+    if [[ "$RESOLVED_TARGET" =~ ^[a-z][a-z0-9-]*:[A-Za-z0-9-]+$ ]]; then
+      canonical_pane_label="$RESOLVED_TARGET"
+    fi
+    resolved_pane_label="${canonical_pane_label:-$(resolve_pane_label_for_env "$resolved_physical_pane")}"
     [[ -n "$resolved_pane_label" ]] && envs+=("TOKEN_API_PANE_LABEL=${resolved_pane_label}")
   fi
   if [[ -n "$RESUME_ID" ]]; then
@@ -2228,6 +2263,29 @@ dispatch_send_text_via_tmuxctld() {
   # through tmuxctld so canonical ids (palace:E, somnium:N, mechanicus:2, …) are
   # resolved by the same oracle the rest of the fleet uses, not by raw tmux.
   local pane="$1" text="$2" settle="${DISPATCH_TMUXCTLD_SUBMIT_SETTLE_SECONDS:-0.2}"
+  if k12_proxy_dispatch; then
+    local base payload response verdict
+    base="$(k12_proxy_url)" || { err "k12 proxy URL is unavailable"; return 69; }
+    payload="$(TARGET="$pane" TEXT="$text" python3 - <<'PY'
+import json, os
+print(json.dumps({'target': os.environ['TARGET'], 'text': os.environ['TEXT'], 'schema_version': 2}))
+PY
+)"
+    response="$(curl -fsS --max-time "${K12_PROXY_MAX_TIME:-60}" -H 'content-type: application/json' --data-binary "$payload" "$base/send")" || {
+      err "k12 proxy send failed for dispatch target $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
+      return 70
+    }
+    verdict="$(K12_SEND_RESPONSE="$response" python3 - <<'PY'
+import json, os
+try:
+    print(json.loads(os.environ['K12_SEND_RESPONSE']).get('verdict', ''))
+except Exception:
+    pass
+PY
+)"
+    [[ "$verdict" == "delivered" ]] || { err "k12 proxy did not deliver dispatch command (verdict=${verdict:-unknown})"; return 70; }
+    return 0
+  fi
   if ! command -v tmuxctld-ping >/dev/null 2>&1; then
     err "tmuxctld-ping is required to send dispatch launch commands to $(printf '%s' "$pane" | redact_tmux_panes_for_display)"
     return 69
@@ -2716,7 +2774,11 @@ dispatch_observe_wait_for_launch() {
     if dispatch_pane_agent_live "$pane"; then
       saw_live=1
       if reconcile_dispatch_registry_bind "$pane" "$target_display" 0; then
-        ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
+        # k12-personal's daemon stream is the delivery ledger; it deliberately
+        # does not expose tmuxctld's legacy wrapper ledger.
+        if ! k12_proxy_dispatch; then
+          ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
+        fi
         return 0
       fi
     fi
@@ -2735,7 +2797,9 @@ dispatch_observe_wait_for_launch() {
     if ! reconcile_dispatch_registry_bind "$pane" "$target_display" 0; then
       registry_bound=0
     fi
-    ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
+    if ! k12_proxy_dispatch; then
+      ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
+    fi
     if [[ "$registry_bound" == "0" ]]; then
       warn "${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration slow/reconciliation lag; treating live pane as successful launch"
     fi
@@ -2944,9 +3008,9 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   # Canonical working id in, physical materialized once at the raw-tmux boundary.
   # assert/stamp take the canonical id and resolve internally; the two send-keys
   # syscalls share a single materialized physical id.
-  assert_dispatch_target_unoccupied "$RESOLVED_TARGET"
-  stamp_resume_instance_id "$RESOLVED_TARGET"
   PHYSICAL_TARGET="$(materialize_physical_pane "$RESOLVED_TARGET")"
+  assert_dispatch_target_unoccupied "$PHYSICAL_TARGET"
+  stamp_resume_instance_id "$PHYSICAL_TARGET"
   dispatch_send_text_via_tmuxctld "$RESOLVED_TARGET" "clear" || exit $?
   sleep 0.2
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"

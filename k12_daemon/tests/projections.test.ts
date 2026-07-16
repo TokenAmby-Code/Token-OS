@@ -25,7 +25,7 @@ test('bound seat leaves the freelist and carries the full tuple', () => {
   const bound = s.append(e({ entity_id: 'palace:W', event_type: 'reg.bound', payload: { wrapper_id: 'w1', instance_id: 'i1', persona: 'salamander', tint: '#302800' } }));
   const p = buildProjections(s.readAll());
   expect(p.freelist).toEqual([]);
-  expect(p.currentBindings).toEqual([{ seat_id: 'palace:W', wrapper_id: 'w1', instance_id: 'i1', persona: 'salamander', tint: '#302800', bound_seq: bound.seq }]);
+  expect(p.currentBindings).toEqual([{ seat_id: 'palace:W', wrapper_id: 'w1', instance_id: 'i1', persona: 'salamander', rank: null, commander: null, tint: '#302800', bound_seq: bound.seq }]);
   const row = p.activityBoard[0]!;
   expect(row).toMatchObject({ entity_id: 'i1', entity_type: 'instance', binding: 'bound', persona: 'salamander', tint: '#302800' });
   s.close();

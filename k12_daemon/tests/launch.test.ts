@@ -31,6 +31,30 @@ test('full attestation tuple hands over with ONE atomic bound event', async () =
   expect(bound[0]!.payload).toMatchObject({ instance_id: 'i1', persona: 'salamander', tint: '#302800' });
 });
 
+test('binds an existing estate seat without attempting a duplicate pane creation', async () => {
+  const { store, d } = setup();
+  await d.constructEstate();
+  const before = store.readAll().filter((e) => e.entity_id === 'council:custodes' && e.event_type === 'reg.pane_created');
+  const res = await d.launch({
+    seat_id: 'council:custodes',
+    schema_version: 2,
+    identity: 'k12p:redub-custodes',
+    persona: 'custodes',
+    rank: 'overseer',
+    commander: 'council:custodes',
+    tint: '#c9a227',
+  });
+  expect(res.handover).toBe(true);
+  const after = store.readAll().filter((e) => e.entity_id === 'council:custodes' && e.event_type === 'reg.pane_created');
+  expect(after).toHaveLength(before.length);
+  expect(d.entities().find((r) => r.seat_id === 'council:custodes')).toMatchObject({
+    binding: 'bound',
+    persona: 'custodes',
+    rank: 'overseer',
+    commander: 'council:custodes',
+  });
+});
+
 test('schema_version mismatch refuses loud, no seat, no bind', async () => {
   const { store, d } = setup();
   const res = await d.launch({ seat_id: 'x', schema_version: 999, identity: 'i', persona: 'p', tint: '#1' });
