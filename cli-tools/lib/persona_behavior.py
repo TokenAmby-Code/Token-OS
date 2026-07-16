@@ -62,11 +62,11 @@ def _safe_path_component(value: str) -> str:
     return value
 
 
-def _candidate(root: Path, component: str) -> Path | None:
+def _candidate(personas_root: Path, component: str) -> Path | None:
     safe = _safe_path_component(component)
     if not safe:
         return None
-    return root / "Personas" / f"{safe}.md"
+    return personas_root / f"{safe}.md"
 
 
 def _existing_candidates(root: Path, components: Iterable[str]) -> list[Path]:
@@ -79,10 +79,9 @@ def _existing_candidates(root: Path, components: Iterable[str]) -> list[Path]:
 
 
 def _imperium_root() -> Path:
-    base = os.environ.get("IMPERIUM")
-    if base:
-        return Path(base) / "Imperium-ENV"
-    return Path("/Volumes/Imperium/Imperium-ENV")
+    """Canonical Token-Fleet directory for Imperium persona definitions."""
+    checkout = os.environ.get("TOKEN_FLEET_CHECKOUT") or "~/runtimes/Token-Fleet/live"
+    return Path(checkout).expanduser() / "shared" / "personas"
 
 
 def _pax_root() -> Path:
@@ -106,14 +105,14 @@ def behavior_file_for(row: PersonaRow) -> tuple[Path | None, list[Path]]:
     titled = title_slug(slug) if slug else ""
 
     if slug in {"pax", "orchestrator"}:
-        root = _pax_root()
+        root = _pax_root() / "Personas"
         candidates = _existing_candidates(root, [slug, titled, display])
         return _first_existing(candidates), candidates
 
     root = _imperium_root()
     if rank == "astartes":
         candidates = _existing_candidates(root, [titled, display, slug])
-        candidates.append(root / "Personas" / "Astartes.md")
+        candidates.append(root / "Astartes.md")
         return _first_existing(candidates), candidates
 
     if rank in {"overseer", "primarch"}:
@@ -125,17 +124,17 @@ def behavior_file_for(row: PersonaRow) -> tuple[Path | None, list[Path]]:
 
 
 def _root_for(row: PersonaRow) -> Path:
-    """The vault root that owns a persona — Pax for the Civic orchestrators,
-    Imperium for everyone else. Mirrors the root selection in behavior_file_for
-    so a persona's rank doc resolves under the same vault as its behavior doc."""
+    """The persona-definition root for a persona — Pax for Civic orchestrators,
+    Token-Fleet for everyone else. Mirrors behavior_file_for so a persona's
+    rank doc resolves under the same root as its behavior doc."""
     slug = _safe_path_component(row.slug.strip().lower())
     if slug in {"pax", "orchestrator"}:
-        return _pax_root()
+        return _pax_root() / "Personas"
     return _imperium_root()
 
 
 def rank_file_for(row: PersonaRow) -> Path | None:
-    """Resolve <root>/Personas/Ranks/<Rank>.md for a persona's default_rank.
+    """Resolve <personas-root>/Ranks/<Rank>.md for a persona's default_rank.
 
     Ranks are Overseer/Astartes/Primarch. Resolution is case-insensitive so a
     default_rank stored as 'OVERSEER' / 'overseer' / 'Overseer' all land on
@@ -144,7 +143,7 @@ def rank_file_for(row: PersonaRow) -> Path | None:
     rank = _safe_path_component((row.default_rank or "astartes").strip())
     if not rank:
         return None
-    ranks_dir = _root_for(row) / "Personas" / "Ranks"
+    ranks_dir = _root_for(row) / "Ranks"
     if not ranks_dir.is_dir():
         return None
     # Scan for the real on-disk entry rather than constructing a path: on a
@@ -237,7 +236,7 @@ def invariant_issues(db_path: Path | None = None) -> list[str]:
             # behavior doc. Fail closed here (preflight + tmuxctl doctor consume
             # this); the wrapper fails loud-but-open at runtime.
             if rank_file_for(row) is None:
-                ranks_dir = _root_for(row) / "Personas" / "Ranks"
+                ranks_dir = _root_for(row) / "Ranks"
                 rank_name = (row.default_rank or "astartes").strip()
                 titled = rank_name[:1].upper() + rank_name[1:] if rank_name else rank_name
                 issues.append(

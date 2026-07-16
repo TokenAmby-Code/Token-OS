@@ -29,7 +29,7 @@
 # Also require CLI_TOOLS to point at a real dir: a shell carrying a stale path
 # (e.g. the archived legacy checkout) must NOT short-circuit — it has to re-derive
 # so it self-heals instead of propagating the dead path into the offline cache.
-if [[ -n "${IMPERIUM_MACHINE:-}" ]] && type imperium_cfg &>/dev/null && [[ -d "${CLI_TOOLS:-/nonexistent}" ]]; then
+if [[ -n "${IMPERIUM_MACHINE:-}" ]] && type imperium_cfg &>/dev/null         && [[ -d "${CLI_TOOLS:-/nonexistent}" ]]         && [[ -n "${TOKEN_FLEET_CHECKOUT:-}" ]]         && [[ -d "${TOKEN_FLEET_CHECKOUT}/shared/personas" ]]; then
     return 0 2>/dev/null || true
 fi
 
@@ -75,6 +75,7 @@ fi
 #   device_name   — Canonical device name (matches Token-API DEVICE_IPS)
 #   shell         — Default interactive shell (zsh/bash)
 #   token_os_runtime — Preferred machine-local Token-OS runtime checkout
+#   token_fleet_runtime — Preferred machine-local Token-Fleet runtime checkout
 
 # Token-API host — the single tailnet node currently serving Token-API (the mac
 # today; migrates to k12-personal at cutover). Hoisted once so satellite rows
@@ -92,6 +93,7 @@ _IMPERIUM_CFG_mac_ssh_alias="mini"
 _IMPERIUM_CFG_mac_device_name="Mac-Mini"
 _IMPERIUM_CFG_mac_shell="zsh"
 _IMPERIUM_CFG_mac_token_os_runtime="$HOME/runtimes/Token-OS/live"
+_IMPERIUM_CFG_mac_token_fleet_runtime="$HOME/runtimes/Token-Fleet/live"
 
 # --- WSL (Ubuntu on Windows PC) ---
 _IMPERIUM_CFG_wsl_nas_imperium="/mnt/imperium"
@@ -103,6 +105,7 @@ _IMPERIUM_CFG_wsl_ssh_alias="wsl"
 _IMPERIUM_CFG_wsl_device_name="TokenPC"
 _IMPERIUM_CFG_wsl_shell="bash"
 _IMPERIUM_CFG_wsl_token_os_runtime="/home/token/runtimes/token-os/live"
+_IMPERIUM_CFG_wsl_token_fleet_runtime="/home/token/runtimes/Token-Fleet/live"
 
 # --- Phone (Termux) ---
 _IMPERIUM_CFG_phone_nas_imperium=""
@@ -114,6 +117,7 @@ _IMPERIUM_CFG_phone_ssh_alias="phone"
 _IMPERIUM_CFG_phone_device_name="Token-S24"
 _IMPERIUM_CFG_phone_shell="bash"
 _IMPERIUM_CFG_phone_token_os_runtime=""
+_IMPERIUM_CFG_phone_token_fleet_runtime=""
 
 # --- Linux fallback ---
 _IMPERIUM_CFG_linux_nas_imperium="/mnt/imperium"
@@ -125,6 +129,7 @@ _IMPERIUM_CFG_linux_ssh_alias=""
 _IMPERIUM_CFG_linux_device_name=""
 _IMPERIUM_CFG_linux_shell="bash"
 _IMPERIUM_CFG_linux_token_os_runtime="/home/token/runtimes/token-os/live"
+_IMPERIUM_CFG_linux_token_fleet_runtime="/home/token/runtimes/Token-Fleet/live"
 
 # --- K12 personal (GMKtec K12; Imperium domain — replaces the Mac Mini) ---
 # NOTE: IMPERIUM_MACHINE is the hyphenated public id "k12-personal", but bash
@@ -142,6 +147,7 @@ _IMPERIUM_CFG_k12_personal_ssh_alias="k12-personal"
 _IMPERIUM_CFG_k12_personal_device_name="K12-Personal"
 _IMPERIUM_CFG_k12_personal_shell="bash"
 _IMPERIUM_CFG_k12_personal_token_os_runtime="$HOME/runtimes/Token-OS/live"
+_IMPERIUM_CFG_k12_personal_token_fleet_runtime="$HOME/runtimes/Token-Fleet/live"
 
 # --- K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE) ---
 # In the Imperium registry only to be nameable for routing/enforcement scoping;
@@ -156,6 +162,7 @@ _IMPERIUM_CFG_k12_work_ssh_alias="k12-work"
 _IMPERIUM_CFG_k12_work_device_name="K12-Work"
 _IMPERIUM_CFG_k12_work_shell="bash"
 _IMPERIUM_CFG_k12_work_token_os_runtime=""
+_IMPERIUM_CFG_k12_work_token_fleet_runtime=""
 
 # ============================================================
 # CONFIG LOOKUP FUNCTION
@@ -208,5 +215,8 @@ else
 fi
 unset _token_os_runtime
 export CLI_TOOLS="$TOKEN_OS/cli-tools"
+# Fleet-owned shared artifacts (including Imperium persona definitions) resolve
+# from a local checkout, never from the Imperium NAS vault.
+export TOKEN_FLEET_CHECKOUT="${TOKEN_FLEET_CHECKOUT:-$(imperium_cfg token_fleet_runtime)}"
 export TOKEN_API_URL="${TOKEN_API_URL:-$(imperium_cfg token_api_url)}"
 export TMUXCTLD_URL="${TMUXCTLD_URL:-$(imperium_cfg tmuxctld_url)}"

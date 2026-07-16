@@ -497,9 +497,7 @@ persona_vault_root() {
   local vault_name="$1"
   case "$vault_name" in
     Imperium-ENV|imperium|Imperium)
-      if [[ -n "${IMPERIUM:-}" && -d "${IMPERIUM}/Imperium-ENV" ]]; then
-        printf '%s/Imperium-ENV' "$IMPERIUM"
-      fi
+      printf '%s/shared/personas' "${TOKEN_FLEET_CHECKOUT:-$HOME/runtimes/Token-Fleet/live}"
       ;;
     Pax-ENV|civic|Civic)
       if [[ -n "${CIVIC:-}" && -d "${CIVIC}/Pax-ENV" ]]; then
@@ -513,14 +511,13 @@ persona_vault_root() {
 find_local_persona_file() {
   local name="$1" dir candidate cap_name
   cap_name="$(printf '%s' "$name" | awk -F- '{for(i=1;i<=NF;i++){ $i=toupper(substr($i,1,1)) substr($i,2)}; print}' OFS='-')"
-  for dir in "$WORK_DIR" "$(pwd)" "$(vault_root_for_aspirant 2>/dev/null || true)"; do
-    [[ -n "$dir" && -d "$dir/Personas" ]] || continue
-    for candidate in "$dir/Personas/${name}.md" "$dir/Personas/${cap_name}.md"; do
-      [[ -f "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
-    done
-    candidate="$(find "$dir/Personas" -maxdepth 1 -type f -iname "${name}.md" -print -quit 2>/dev/null || true)"
-    [[ -n "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+  dir="${TOKEN_FLEET_CHECKOUT:-$HOME/runtimes/Token-Fleet/live}/shared/personas"
+  [[ -d "$dir" ]] || return 0
+  for candidate in "$dir/${name}.md" "$dir/${cap_name}.md"; do
+    [[ -f "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
   done
+  candidate="$(find "$dir" -maxdepth 1 -type f -iname "${name}.md" -print -quit 2>/dev/null || true)"
+  [[ -n "$candidate" ]] && printf '%s' "$candidate"
   return 0
 }
 
@@ -545,14 +542,26 @@ persona_operational_env() {
   if [[ -n "$row" ]]; then
     IFS=$'\x1f' read -r title vault_name note_path <<< "$row"
     vault_root="$(persona_vault_root "$vault_name")"
-    [[ -z "${persona_file:-}" && -n "$vault_root" && -n "$note_path" ]] && persona_file="$vault_root/$note_path"
+    if [[ -z "${persona_file:-}" && -n "$vault_root" && -n "$note_path" ]]; then
+      if [[ "$vault_name" =~ ^(Imperium-ENV|imperium|Imperium)$ ]]; then
+        persona_file="$vault_root/${note_path#Personas/}"
+      else
+        persona_file="$vault_root/$note_path"
+      fi
+    fi
   fi
   if [[ -z "${persona_file:-}" || ! -f "$persona_file" ]]; then
     persona_file="$(find_local_persona_file "$persona")"
   fi
-  # Vault domain falls back to the persona file's owning vault (…/<Vault>/Personas/x.md).
+  # Token-Fleet owns Imperium persona definitions even though its directory shape
+  # is shared/personas rather than <vault>/Personas. Preserve legacy inference
+  # for every other file so incomplete historical rows still behave unchanged.
   if [[ -z "${vault_name:-}" && -n "${persona_file:-}" && -f "$persona_file" ]]; then
-    vault_name="$(basename "$(dirname "$(dirname "$persona_file")")")"
+    if [[ "$persona_file" == "${TOKEN_FLEET_CHECKOUT:-$HOME/runtimes/Token-Fleet/live}"/shared/personas/* ]]; then
+      vault_name="Imperium-ENV"
+    else
+      vault_name="$(basename "$(dirname "$(dirname "$persona_file")")")"
+    fi
   fi
   doc_id="$(sqlite_query "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = '${persona_sql}' AND unlinked_at IS NULL LIMIT 1;")"
   printf '%s\x1f%s' "${vault_name:-}" "${doc_id:-}"
