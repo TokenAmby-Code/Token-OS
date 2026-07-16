@@ -250,8 +250,14 @@ _tx_wait_for_vault_mount() {
     log_warn "Token-Fleet checkout is not ready at ${vault_path}; waiting before tmux workspace build."
 
     while [[ "$waited" -lt "$timeout" ]]; do
-        sleep "$interval" 2>/dev/null || sleep 2
-        waited=$((waited + interval))
+        local remaining sleep_for fallback_sleep
+        remaining=$((timeout - waited))
+        sleep_for="$interval"
+        (( sleep_for > remaining )) && sleep_for="$remaining"
+        fallback_sleep="$sleep_for"
+        (( fallback_sleep > 2 )) && fallback_sleep=2
+        sleep "$sleep_for" 2>/dev/null || sleep "$fallback_sleep"
+        waited=$((waited + sleep_for))
         if _tx_vault_mounted "$vault_path"; then
             log_success "Token-Fleet checkout ready at ${vault_path}"
             return 0

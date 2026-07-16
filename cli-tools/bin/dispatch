@@ -553,9 +553,15 @@ persona_operational_env() {
   if [[ -z "${persona_file:-}" || ! -f "$persona_file" ]]; then
     persona_file="$(find_local_persona_file "$persona")"
   fi
-  # Vault domain falls back to the persona file's owning vault (…/<Vault>/Personas/x.md).
+  # Token-Fleet owns Imperium persona definitions even though its directory shape
+  # is shared/personas rather than <vault>/Personas. Preserve legacy inference
+  # for every other file so incomplete historical rows still behave unchanged.
   if [[ -z "${vault_name:-}" && -n "${persona_file:-}" && -f "$persona_file" ]]; then
-    vault_name="$(basename "$(dirname "$(dirname "$persona_file")")")"
+    if [[ "$persona_file" == "${TOKEN_FLEET_CHECKOUT:-$HOME/runtimes/Token-Fleet/live}"/shared/personas/* ]]; then
+      vault_name="Imperium-ENV"
+    else
+      vault_name="$(basename "$(dirname "$(dirname "$persona_file")")")"
+    fi
   fi
   doc_id="$(sqlite_query "SELECT session_doc_id FROM primarch_session_docs WHERE primarch_name = '${persona_sql}' AND unlinked_at IS NULL LIMIT 1;")"
   printf '%s\x1f%s' "${vault_name:-}" "${doc_id:-}"

@@ -49,3 +49,9 @@ def test_missing_persona_doc_remains_fail_closed(
     issues = persona_behavior.invariant_issues(db)
     assert any("persona behavior file missing: slug=missing" in issue for issue in issues)
     assert any("persona rank doc missing: slug=missing" in issue for issue in issues)
+
+
+def test_fleet_persona_root_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fleet = tmp_path / "Token-Fleet"
+    monkeypatch.setenv("TOKEN_FLEET_CHECKOUT", str(fleet))
+    assert persona_behavior._imperium_root() == fleet / "shared" / "personas"
