@@ -1103,6 +1103,12 @@ PHONE_CONFIG = {
 PHONE_STATE = {
     "current_app": None,  # Current distraction app or None
     "last_activity": None,
+    # Receipt-monotonic timestamp for a current distraction observation.
+    "last_distraction_signal_mono": None,
+    # YouTube foreground is insufficient: only a positive playback edge proves use.
+    "youtube_playback_active": False,
+    # Set only after policy has decided the current app is physically enforceable.
+    "enforcement_eligible": False,
     "is_distracted": False,
     "reachable": None,  # Last known reachability status
     "last_reachable_check": None,

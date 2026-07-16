@@ -9091,6 +9091,10 @@ async def _nudge_instance(instance_id: str, reason: str = "") -> dict:
 
 _CUSTODES_STATE_DEBOUNCE_SECONDS = 20 * 60
 _custodes_state_debounce: dict[str, dict] = {}
+# The decision reads SQLite, so every concurrent delivery can observe an empty
+# cache before its first await completes. Serialize decision+claim, not merely
+# the in-memory write after that await.
+_custodes_state_dedupe_claim_lock = asyncio.Lock()
 _CUSTODES_CANCEL_REASON = "intervention_canceled_by_negative_edge"
 
 # ── L2: typing-guard hold-and-queue for Custodes-bound enforcement ────────────
@@ -9272,6 +9276,21 @@ async def _custodes_state_dedupe_decision(dedupe_key: str, severity: int) -> tup
             return True, "event_log_debounce"
 
     return False, "not_duplicate"
+
+
+async def _custodes_state_dedupe_claim(dedupe_key: str, severity: int) -> tuple[bool, str]:
+    """Atomically decide and reserve a Custodes dedupe key.
+
+    `_custodes_state_dedupe_decision` awaits SQLite. Without this lock, concurrent
+    deliveries can all read the cache before any one claims it, then each dispatch.
+    The reservation deliberately retains the existing 20-minute policy window.
+    """
+    async with _custodes_state_dedupe_claim_lock:
+        suppressed, reason = await _custodes_state_dedupe_decision(dedupe_key, severity)
+        if suppressed:
+            return True, reason
+        _custodes_state_debounce[dedupe_key] = {"at": time.time(), "severity": severity}
+        return False, "claimed"
 
 
 async def _tts_queue_languishing_live_status(payload: dict | None = None) -> tuple[bool, str, dict]:
@@ -10783,7 +10802,7 @@ async def handle_custodes_state_event(
             "quiet_hours": suppression["quiet_hours"],
         }
 
-    suppressed, dedupe_reason = await _custodes_state_dedupe_decision(
+    suppressed, dedupe_reason = await _custodes_state_dedupe_claim(
         intervention.dedupe_key,
         intervention.severity,
     )
@@ -10809,15 +10828,7 @@ async def handle_custodes_state_event(
             "reason": dedupe_reason,
         }
 
-    # Claim the dedupe key BEFORE dispatch to close the TOCTOU window.
-    # Without this, two events with the same dedupe_key arriving in quick succession
-    # both pass the check above and both dispatch, because the cache is only written
-    # after dispatch completes. Writing the claim here means the second event sees
-    # the cache hit and is suppressed.
-    _custodes_state_debounce[intervention.dedupe_key] = {
-        "at": time.time(),
-        "severity": intervention.severity,
-    }
+    # `_custodes_state_dedupe_claim` reserved this key before dispatch.
 
     async def cancel_check(stage: str) -> dict | None:
         return await _custodes_intervention_negative_edge_cancel_result(
@@ -14394,6 +14405,12 @@ PHONE_DISTRACTION_ENFORCE_DELAY_SECONDS = int(
 # re-shoot in a tight loop. Doubles as the "sustained gap" threshold that tells a
 # clean app close (resets the ramp) apart from a close→reopen flap (keeps it).
 PHONE_ENFORCE_MIN_GAP_SECONDS = float(os.environ.get("PHONE_ENFORCE_MIN_GAP_SECONDS", "45"))
+# A foreground/open observation expires quickly. A retained app state is not
+# evidence that the phone is still in use. YouTube additionally requires a
+# current positive playback edge: a paused player is not active watching.
+PHONE_DISTRACTION_SIGNAL_MAX_AGE_SECONDS = float(
+    os.environ.get("PHONE_DISTRACTION_SIGNAL_MAX_AGE_SECONDS", "30")
+)
 
 # Human-readable display names for phone apps (key = lowercased app name or package)
 PHONE_APP_DISPLAY_NAMES = {
@@ -15913,6 +15930,33 @@ def _phone_enforcement_guard_reason() -> str | None:
     return None
 
 
+def _phone_distraction_signal_freshness(app_name: str) -> tuple[bool, str, float | None]:
+    """Return whether a recent affirmative phone-use signal supports enforcement."""
+    observed_mono = PHONE_STATE.get("last_distraction_signal_mono")
+    if not isinstance(observed_mono, (int, float)):
+        return False, "phone_signal_unverifiable", None
+    age = time.monotonic() - observed_mono
+    if age < 0 or age > PHONE_DISTRACTION_SIGNAL_MAX_AGE_SECONDS:
+        return False, "phone_signal_stale", age
+    if app_name.lower() in PHONE_YOUTUBE_APP_KEYS and not PHONE_STATE.get(
+        "youtube_playback_active"
+    ):
+        return False, "youtube_playback_unverified", age
+    return True, "fresh", age
+
+
+def _log_phone_enforcement_freshness_skip(app_name: str, reason: str, age: float | None) -> None:
+    details = {
+        "app": app_name,
+        "reason": reason,
+        "signal_age_seconds": round(age, 3) if age is not None else None,
+        "max_age_seconds": PHONE_DISTRACTION_SIGNAL_MAX_AGE_SECONDS,
+        "youtube_playback_active": PHONE_STATE.get("youtube_playback_active"),
+    }
+    logger.error("ENFORCE: skipped phone shock due to unverifiable current signal: %s", details)
+    _schedule_or_run(log_event("phone_enforcement_freshness_skipped", details=details))
+
+
 async def _phone_enforcement_condition_still_warranted(app_name: str) -> tuple[bool, str]:
     """Live re-check for a held phone enforcement transaction.
 
@@ -15920,6 +15964,9 @@ async def _phone_enforcement_condition_still_warranted(app_name: str) -> tuple[b
     do not gain void semantics.
     """
     app_key = app_name.lower()
+    fresh, freshness_reason, _signal_age = _phone_distraction_signal_freshness(app_name)
+    if not fresh:
+        return False, freshness_reason
     current = (PHONE_STATE.get("current_app") or "").lower()
     if not PHONE_STATE.get("is_distracted", False):
         return False, "phone_distraction_cleared"
@@ -15975,6 +16022,11 @@ async def _execute_phone_enforcement_transaction(app_name: str) -> dict:
     the transaction is re-queued instead of letting redirect bypass the guard.
     """
     key = app_name.lower()
+    fresh, freshness_reason, signal_age = _phone_distraction_signal_freshness(app_name)
+    if not fresh:
+        _log_phone_enforcement_freshness_skip(app_name, freshness_reason, signal_age)
+        return {"fired": False, "reason": freshness_reason}
+
     now_mono = time.monotonic()
     state = _PHONE_ENFORCE_STATE.get(key)
     last_fired = state.get("last_fired_mono") if state else None
@@ -16118,6 +16170,11 @@ def start_enforcement_cascade(app_name: str) -> None:
     physical transaction waits behind the global typing guard and re-checks the
     live phone-distraction condition on guard drop before firing.
     """
+    fresh, freshness_reason, signal_age = _phone_distraction_signal_freshness(app_name)
+    if not fresh:
+        _log_phone_enforcement_freshness_skip(app_name, freshness_reason, signal_age)
+        return
+
     if is_quiet_hours():
         print(f"ENFORCE: quiet hours suppressed for {app_name}")
         _schedule_or_run(
@@ -17035,6 +17092,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
 
     # Handle app close
     if action == "close":
+        PHONE_STATE["enforcement_eligible"] = False
         old_app = PHONE_STATE.get("current_app")
         old_app_norm = (old_app or "").lower()
         close_matches_current = bool(old_app_norm) and (
@@ -17491,6 +17549,7 @@ async def handle_phone_activity(request: PhoneActivityRequest):
             )
 
         print("    BLOCKED: no break time, no productivity")
+        PHONE_STATE["enforcement_eligible"] = True
         # Start enforcement cascade instead of Shizuku disable
         if is_quiet_hours():
             await log_quiet_hours_suppressed(
@@ -17559,6 +17618,20 @@ async def manual_enforce_phone(app: str, action: str = "disable"):
     """Manually trigger phone enforcement (for testing)."""
     result = enforce_phone_app(app, action)
     return result
+
+
+def _phone_event_timestamp_is_current(raw_timestamp: str | None) -> bool:
+    """Validate the phone's observation time; receipt time alone is not evidence."""
+    if not raw_timestamp:
+        return False
+    try:
+        observed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+        if observed.tzinfo is not None:
+            observed = observed.astimezone().replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return False
+    age = (datetime.now() - observed).total_seconds()
+    return -5 <= age <= PHONE_DISTRACTION_SIGNAL_MAX_AGE_SECONDS
 
 
 @app.post("/phone/event")
@@ -17678,8 +17751,38 @@ async def handle_phone_system_event(request: PhoneSystemEventRequest):
         if action == "close":
             stop_enforcement_cascade(reason="app_close")
 
+        # Receipt time is the only locally verifiable freshness evidence. Do not
+        # revive a retained state from an old event timestamp. YouTube needs an
+        # affirmative playback edge, since foreground/paused state proves no use.
+        if action == "open":
+            # MacroDroid's observation timestamp is required. A request receipt
+            # time can be delayed/retried and is not proof of current use.
+            if _phone_event_timestamp_is_current(request.time):
+                PHONE_STATE["last_distraction_signal_mono"] = time.monotonic()
+            else:
+                PHONE_STATE["last_distraction_signal_mono"] = None
+                logger.error(
+                    "PHONE: rejecting unenforceable distraction signal with invalid/stale timestamp: app=%s time=%r",
+                    app_key,
+                    request.time,
+                )
+            if app_key in PHONE_YOUTUBE_APP_KEYS:
+                PHONE_STATE["youtube_playback_active"] = bool(play_state)
+        elif app_key in PHONE_YOUTUBE_APP_KEYS:
+            PHONE_STATE["youtube_playback_active"] = False
+
         phone_req = PhoneActivityRequest(app=app_key, action=action, package=app_key)
         result = await handle_phone_activity(phone_req)
+        # The generic foreground edge may arrive before the YouTube playback
+        # edge. Its start attempt correctly fails closed; this later positive
+        # edge may start the already policy-approved enforcement transaction.
+        if (
+            event == "app_playback"
+            and play_state is True
+            and app_key in PHONE_YOUTUBE_APP_KEYS
+            and PHONE_STATE.get("enforcement_eligible")
+        ):
+            start_enforcement_cascade(app_key)
         return {
             "received": True,
             "event": event,
