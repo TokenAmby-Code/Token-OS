@@ -1,7 +1,0 @@
-interface:
-  display_name: "Vault Mind"
-  short_description: "Load vault session context"
-  default_prompt: "$vault-mind load and summarize the linked vault context."
-
-policy:
-  allow_implicit_invocation: true

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Golden Throne Progress"
-  short_description: "Make GT recovery progress"
-  default_prompt: "Use $golden-throne-progress during Golden Throne recovery."

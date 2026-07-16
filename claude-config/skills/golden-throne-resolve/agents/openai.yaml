@@ -1,4 +1,0 @@
-interface:
-  display_name: "Golden Throne Resolve"
-  short_description: "Resolve Golden Throne state"
-  default_prompt: "Use $golden-throne-resolve during Golden Throne recovery."

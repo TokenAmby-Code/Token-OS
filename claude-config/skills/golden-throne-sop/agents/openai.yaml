@@ -1,4 +1,0 @@
-interface:
-  display_name: "Golden Throne SOP"
-  short_description: "Recover unmet victory criteria"
-  default_prompt: "Use $golden-throne-sop to resolve an unmet victory condition."

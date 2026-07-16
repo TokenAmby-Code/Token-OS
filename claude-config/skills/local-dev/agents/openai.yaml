@@ -1,7 +1,0 @@
-interface:
-  display_name: "Local Dev"
-  short_description: "Run local dev and browser tests"
-  default_prompt: "$local-dev launch and validate the local development workflow."
-
-policy:
-  allow_implicit_invocation: true

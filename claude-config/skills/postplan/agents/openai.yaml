@@ -1,7 +1,0 @@
-interface:
-  display_name: "Postplan"
-  short_description: "Pose the plan without more context gathering."
-  default_prompt: "Use $postplan to pose the plan now without additional context gathering."
-
-policy:
-  allow_implicit_invocation: true

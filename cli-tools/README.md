@@ -56,7 +56,7 @@ nas-grep --dry-run "pattern" /Volumes/Imperium
 
 ### Shared agent skills (`skills-sync`)
 
-`skills-sync --check` verifies that the NAS-backed canonical skills in `claude-config/skills` are visible to Claude and Codex and resolve to the same real paths. `skills-sync --install` repairs symlinks only: it keeps `~/.codex/skills/.system` intact and exposes shared skills under both `~/.agents/skills` and `~/.codex/skills`.
+`skills-sync --check` verifies that the canonical skills in the Token-Fleet checkout (`${TOKEN_FLEET_CHECKOUT:-~/runtimes/Token-Fleet/live}/shared/skills`) are visible to Claude and Codex and resolve to the same real paths. `skills-sync --install` repairs symlinks only: it keeps `~/.codex/skills/.system` intact and exposes shared skills under both `~/.agents/skills` and `~/.codex/skills`.
 
 ```bash
 skills-sync --check
