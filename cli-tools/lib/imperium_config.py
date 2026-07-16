@@ -166,7 +166,9 @@ def cfg(key: str, machine: str | None = None) -> str:
 
 IMPERIUM = os.environ.get("IMPERIUM") or cfg("nas_imperium")
 CIVIC = os.environ.get("CIVIC") or cfg("nas_civic")
-IMPERIUM_VAULTS_ROOT = os.path.expanduser(os.environ.get("IMPERIUM_VAULTS_ROOT") or cfg("vaults_root"))
+IMPERIUM_VAULTS_ROOT = os.path.expanduser(
+    os.environ.get("IMPERIUM_VAULTS_ROOT") or cfg("vaults_root")
+)
 IMPERIUM_VAULT = os.path.expanduser(os.environ.get("IMPERIUM_VAULT") or cfg("vault_root"))
 IMPERIUM_LOGS_VAULT = os.path.expanduser(
     os.environ.get("IMPERIUM_LOGS_VAULT") or cfg("vault_logs_root")
