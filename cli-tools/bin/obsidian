@@ -49,6 +49,24 @@ fi
 resolve_vault() {
   local vault_name="$1"
 
+  # Token API may supply an explicit managed root for an isolated test vault.
+  # Do not treat arbitrary absolute paths as vaults: the only permitted roots
+  # are the two roots configured for the managed session-doc boundary.
+  if [[ "$vault_name" == /* ]]; then
+    local allowed resolved candidate
+    resolved=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$vault_name")
+    for candidate in "${IMPERIUM_ENV:-}" "${CIVIC_ENV:-}"; do
+      [[ -z "$candidate" ]] && continue
+      allowed=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$candidate")
+      if [[ "$resolved" == "$allowed" && -d "$resolved" ]]; then
+        echo "$resolved"
+        return 0
+      fi
+    done
+    echo "Error: explicit vault root is not a configured managed vault" >&2
+    return 1
+  fi
+
   # NAS mounts first (canonical locations)
   # macOS mounts to /Volumes/, Linux mounts to /mnt/
   if [[ -d "/Volumes/Imperium/$vault_name" ]]; then
@@ -95,6 +113,7 @@ PARAM_value=""
 PARAM_to=""
 PARAM_request=""
 SESSION_DOCS_OP=""
+ORIGINAL_ARGS=("$@")
 
 for arg in "$@"; do
   if [[ "$arg" == vault=* ]]; then
@@ -379,6 +398,17 @@ cmd_session_docs() {
     echo '{"ok":false,"error":{"code":"invalid_request","message":"operation and request= are required"}}' >&2
     return 2
   fi
+
+  # All session-document mutations share one sidecar lock for this vault.  The
+  # lock is acquired before the Python protocol performs any existence or
+  # revision check, and stays held until its JSON receipt is generated.
+  case "$op" in
+    create|replace|append|move|delete|set-status)
+      if [[ -z "${SESSION_DOCS_LOCK_HELD:-}" && -f "$LOCK_HELPER" ]]; then
+        exec python3 "$LOCK_HELPER" "$VAULT_ROOT" -- env SESSION_DOCS_LOCK_HELD=1 "$0" "${ORIGINAL_ARGS[@]}"
+      fi
+      ;;
+  esac
   python3 - "$VAULT_ROOT" "$op" "$PARAM_request" <<'PY'
 import base64, hashlib, json, os, sys
 from pathlib import Path

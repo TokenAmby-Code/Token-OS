@@ -104,6 +104,15 @@
         ]
       },
       {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/managed-vault-write-report.sh"
+          }
+        ]
+      },
+      {
         "matcher": "Task",
         "hooks": [
           {

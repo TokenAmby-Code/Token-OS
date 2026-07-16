@@ -1302,7 +1302,7 @@ async def async_obsidian_create(vault: str, path: str, content: str) -> bool:
 
 
 def session_doc_initial_content(
-    title: str, doc_id: int, project: str = None, primarch_name: str = None
+    title: str, doc_id: int, project: str | None = None, primarch_name: str | None = None
 ) -> str:
     """Build initial session-doc content without performing vault I/O.
 
@@ -1362,7 +1362,11 @@ def session_doc_initial_content(
 
 
 def create_session_doc_file(
-    file_path: Path, title: str, doc_id: int, project: str = None, primarch_name: str = None
+    file_path: Path,
+    title: str,
+    doc_id: int,
+    project: str | None = None,
+    primarch_name: str | None = None,
 ) -> None:
     """Create the markdown file for a session document.
 
