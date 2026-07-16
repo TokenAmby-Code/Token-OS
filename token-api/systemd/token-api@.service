@@ -1,0 +1,19 @@
+[Unit]
+Description=Token-API %i service
+After=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=/home/tokenamby/runtimes/Token-OS/%i/token-api
+Environment=TOKEN_OS=/home/tokenamby/runtimes/Token-OS/%i
+Environment=CLI_TOOLS=/home/tokenamby/runtimes/Token-OS/%i/cli-tools
+Environment=TOKEN_API_URL=http://localhost:7777
+Environment=TMUXCTLD_URL=http://127.0.0.1:7778
+Environment=IMPERIUM_MACHINE=k12-personal
+Environment=IMPERIUM=/mnt/imperium
+Environment=IMPERIUM_ENV=/mnt/imperium/Imperium-ENV
+Environment=TOKEN_API_DATABASE_DIR=/home/tokenamby/runtimes/database
+Environment=PYTHONPATH=/home/tokenamby/runtimes/Token-OS/%i/tmuxctld/lib:/home/tokenamby/runtimes/Token-OS/%i/cli-tools/lib
+EnvironmentFile=-/home/tokenamby/runtimes/Token-OS/%i/token-api/.env
+ExecStart=/home/tokenamby/runtimes/Token-OS/%i/token-api/.venv/bin/uvicorn main:app --fd 3 --timeout-graceful-shutdown 10
+Restart=always
+RestartSec=5

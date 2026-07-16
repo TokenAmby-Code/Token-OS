@@ -240,7 +240,17 @@ regardless of checkout shape.
   `/api/hooks/clear-human-anchor`, stop_hook API-first with Mac-side sqlite fallback
   kept until rung 3, WAL audit closed).
 - **Rung 3 — satellite live:** k12-personal token-api serves the new schema in satellite
-  mode (§6 step 6), registration door + envelope echo verified end-to-end.
+  mode (§6 step 6), registration door + envelope echo verified end-to-end. **LANDED
+  2026-07-16** (branch `k12-registry-rung3`). Recorded honestly: the satellite service
+  itself (`token-api@live` template unit + socket on `127.0.0.1:7777` behind edge_proxy,
+  `box-restart` CD executor, linger) was stood up by the parallel k12 bring-up lane
+  before this rung — this rung captured the units into the checkout
+  (`token-api/systemd/`, §5 source-of-truth), shed the stop_hook direct-sqlite fallback
+  on the k12 boxes (durable-outbox corrective path + token-api startup recovery drain
+  replacing the Mac's watchdog drain leg), and live-proved the registration door.
+  Deviation at landing: the §6 step-6 `/health git_sha == origin/main` check was blocked
+  by an unmerged parallel lane's dirty runtime checkout on the box (vault-migration
+  live-patches wedging `box-restart`); tracked outside this lane.
 - **Rung 4 — cutover:** §6 step 7 as amended by R2 (import, flip
   `_IMPERIUM_TOKEN_API_HOST`, verify); `claude_instances` readers fail loud and get
   fixed.

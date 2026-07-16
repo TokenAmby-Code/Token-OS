@@ -37,6 +37,72 @@ SATELLITE_URLS = {
 }
 LOCAL_DEVICE = os.environ.get("IMPERIUM_DEVICE_NAME", "Mac-Mini")
 
+# k12-era registry R6 (rung 3): boxes that shed the direct-sqlite fallback.
+# k12-personal runs its OWN local token-api under systemd (Restart=always), so
+# a failed write-door POST enqueues into the durable retry outbox and the
+# recovery drain replays it — direct sqlite is never a second write door there.
+# k12-work never grows an agents.db at all (R1), so a direct-sqlite fallback
+# would CREATE the split-brain the era erases. The Mac keeps the fallback
+# until its retirement (rung 5).
+_SQLITE_FALLBACK_SHED_MACHINES = frozenset({"k12-personal", "k12-work"})
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _sheds_sqlite_fallback() -> bool:
+    """True on boxes where the direct-sqlite fallback is retired (rung 3)."""
+    try:
+        lib = str(_REPO_ROOT / "cli-tools" / "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        from imperium_config import MACHINE
+
+        return MACHINE in _SQLITE_FALLBACK_SHED_MACHINES
+    except Exception as e:
+        # Unknown machine identity: keep the pre-rung-3 conservative fallback.
+        print(f"[warn] machine detection failed ({e}) — keeping sqlite fallback", file=sys.stderr)
+        return False
+
+
+def _enqueue_hook_outbox(path: str, instance_id: str, cause: str) -> bool:
+    """Enqueue a failed write-door POST into the durable retry outbox.
+
+    The recovery edge drains it: tokenapi-watchdog on the Mac, token-api
+    startup on the k12 boxes (systemd restart IS the down→up transition).
+    """
+    outbox = _REPO_ROOT / "cli-tools" / "bin" / "generic-token-api-durable-retry-outbox"
+    action = path.rsplit("/", 1)[-1]
+    try:
+        res = subprocess.run(
+            [
+                str(outbox),
+                "enqueue",
+                "--action-type",
+                action,
+                "--url",
+                f"{TOKEN_API_URL}{path}",
+                "--payload",
+                json.dumps({"instance_id": instance_id}),
+                "--cause",
+                cause[:200],
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if res.returncode == 0:
+            print(
+                f"[info] {action} for {instance_id[:8]} enqueued to durable outbox",
+                file=sys.stderr,
+            )
+            return True
+        print(
+            f"[warn] outbox enqueue failed rc={res.returncode}: {res.stderr.strip()}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(f"[warn] outbox enqueue failed: {e}", file=sys.stderr)
+    return False
+
 
 def _post_hook_write_door(path: str, instance_id: str) -> dict:
     """POST to a token-api stop-hook write door (k12 registry rung 2 / R6).
@@ -73,8 +139,9 @@ def mark_cron_instance_stopped(instance_id: str):
     not have received a DELETE for this instance yet — explicitly writing
     'stopped' here gives the cron mutex check a reliable signal.
 
-    API-first: POST the write door, fall back to direct sqlite on any HTTP
-    failure (this box keeps the fallback until rung 3).
+    API-first: POST the write door. On HTTP failure the k12 boxes enqueue the
+    intent into the durable retry outbox (rung 3 — no direct sqlite there);
+    the Mac falls back to direct sqlite until retirement.
     """
     try:
         data = _post_hook_write_door("/api/hooks/instance-stopped", instance_id)
@@ -90,6 +157,13 @@ def mark_cron_instance_stopped(instance_id: str):
             )
         return
     except Exception as api_err:
+        if _sheds_sqlite_fallback():
+            print(
+                f"[info] Write door unreachable (api: {api_err}) — durable outbox, no direct sqlite on this box",
+                file=sys.stderr,
+            )
+            _enqueue_hook_outbox("/api/hooks/instance-stopped", instance_id, f"api: {api_err}")
+            return
         print(
             f"[info] Marking cron instance stopped via direct sqlite fallback (api: {api_err})",
             file=sys.stderr,
@@ -131,8 +205,9 @@ def mark_cron_instance_stopped(instance_id: str):
 def clear_human_anchor_on_stop(instance_id: str) -> None:
     """Defensively clear AUQ human-time anchors when a Stop hook fires.
 
-    API-first: POST the write door, fall back to direct sqlite on any HTTP
-    failure (this box keeps the fallback until rung 3).
+    API-first: POST the write door. On HTTP failure the k12 boxes enqueue the
+    intent into the durable retry outbox (rung 3 — no direct sqlite there);
+    the Mac falls back to direct sqlite until retirement.
     """
     try:
         _post_hook_write_door("/api/hooks/clear-human-anchor", instance_id)
@@ -142,6 +217,13 @@ def clear_human_anchor_on_stop(instance_id: str) -> None:
         )
         return
     except Exception as api_err:
+        if _sheds_sqlite_fallback():
+            print(
+                f"[info] Write door unreachable (api: {api_err}) — durable outbox, no direct sqlite on this box",
+                file=sys.stderr,
+            )
+            _enqueue_hook_outbox("/api/hooks/clear-human-anchor", instance_id, f"api: {api_err}")
+            return
         print(
             f"[info] Clearing human anchor via direct sqlite fallback (api: {api_err})",
             file=sys.stderr,
