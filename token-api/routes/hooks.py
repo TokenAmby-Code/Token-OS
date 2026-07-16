@@ -35,6 +35,7 @@ from pydantic import BaseModel
 import ask_service
 import shared
 import talk as talk_service
+import temp_message as temp_message_service
 from context_governor import record_context_governor_progress
 from db_connections import connect_agents_db
 from enforcement_service import close_distraction_windows
@@ -2002,6 +2003,11 @@ async def _enqueue_and_send_stop_delivery(
     stop_event_key: str,
     payload: str,
 ) -> dict:
+    if subscription.get("delivery") == "ephemeral":
+        return {
+            "status": "failed",
+            "error": temp_message_service.EPHEMERAL_CHANNEL_DISABLED_ERROR,
+        }
     # Subscriber is woken autonomously by this Stop — flag it before the send. The
     # flag is committed together with the delivery rows below (db.commit precedes
     # _direct_pane_write), so the subscriber's PromptSubmit can't observe a stale 0.
@@ -7018,7 +7024,12 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
         return {"success": False, "action": "unsupported_event", "event": request.event}
     if request.delivery == "close-pane":
         return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
-    if request.delivery not in {"prompt", "ephemeral"}:
+    if request.delivery == "ephemeral":
+        raise HTTPException(
+            status_code=410,
+            detail=temp_message_service.EPHEMERAL_CHANNEL_DISABLED_ERROR,
+        )
+    if request.delivery != "prompt":
         return {"success": False, "action": "unsupported_delivery", "delivery": request.delivery}
     async with connect_agents_db(DB_PATH, timeout=5.0) as db:
         # Resolve each distinct pane at most once per request. The plan-menu

@@ -19,6 +19,7 @@ from shared import DB_PATH
 TEMP_MESSAGE_SOURCE = "temp_message"
 TEMP_MESSAGE_PURPOSE = "orchestrator_poll"
 POLL_TTL_MINUTES = 10
+EPHEMERAL_CHANNEL_DISABLED_ERROR = "ephemeral channel disabled by decree"
 
 QueueSender = Callable[..., Awaitable[dict[str, Any]]]
 QueueDrainer = Callable[..., Awaitable[list[dict[str, Any]]]]
@@ -26,6 +27,11 @@ QueueDrainer = Callable[..., Awaitable[list[dict[str, Any]]]]
 
 class SelectorError(ValueError):
     """Raised when a temp-message selector is invalid."""
+
+
+def reject_ephemeral_channel() -> None:
+    """Fail every ephemeral entrypoint until a future decree revives it."""
+    raise RuntimeError(EPHEMERAL_CHANNEL_DISABLED_ERROR)
 
 
 def temp_command_for_engine(engine: str | None, payload: str) -> tuple[str, str]:
@@ -103,6 +109,7 @@ async def send_temp_message(
     daemon's byte-time singleton addressee gate, exactly like the non-ephemeral
     brief path. It is a no-op for non-singleton specs and raw ``%NN``.
     """
+    reject_ephemeral_channel()
     _, mode = temp_command_for_engine(engine, payload)
     if queue_sender is None:
         raise RuntimeError("send_temp_message requires the existing pane-write queue sender")
