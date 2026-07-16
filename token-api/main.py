@@ -2175,6 +2175,53 @@ async def run_overdue_tasks():
                 asyncio.create_task(execute_task(task_id))
 
 
+async def _drain_hook_outbox_once() -> None:
+    """One-shot recovery drain of the durable hook→API retry outbox.
+
+    Fired from lifespan startup: this process coming up is the down→up
+    transition the outbox waits for. Replays POST back at this server, so
+    give uvicorn a short grace to start serving before the subprocess runs
+    (under socket activation the requests would queue anyway; the grace
+    covers dev runs that bind the port after startup).
+    """
+    await asyncio.sleep(3)
+    outbox = (
+        Path(__file__).resolve().parent.parent
+        / "cli-tools"
+        / "bin"
+        / "generic-token-api-durable-retry-outbox"
+    )
+    if not outbox.exists():
+        logger.warning(f"Hook outbox drainer not found at {outbox} — skipping recovery drain")
+        return
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(outbox),
+            "drain",
+            "--timeout",
+            "30",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        summary = (stdout or b"").decode().strip() or (stderr or b"").decode().strip()
+        logger.info(f"Hook outbox recovery drain: rc={proc.returncode} {summary}")
+    except asyncio.CancelledError:
+        # Lifespan teardown cancelled us — never leave a stray drain child.
+        _kill_subprocess(proc)
+        raise
+    except Exception as exc:
+        _kill_subprocess(proc)
+        logger.warning(f"Hook outbox recovery drain failed: {exc}")
+
+
+def _kill_subprocess(proc: asyncio.subprocess.Process | None) -> None:
+    if proc is not None and proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+
 # Lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -2355,6 +2402,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start autonomous context-governor no-progress sweep
     asyncio.create_task(context_governor_sweep_worker())
     print("Context governor sweep worker started")
+    # k12-registry rung 3: recovery-edge drain of the durable hook→API outbox.
+    # On the Mac the tokenapi-watchdog drains on down→up transitions; on the k12
+    # boxes systemd (Restart=always) is the supervisor, so service startup IS the
+    # recovery edge. One-shot, not a poll. Rows are idempotency-keyed and the
+    # write doors carry where-guards, so a double drain (watchdog + startup) is
+    # a no-op.
+    outbox_drain_task = asyncio.create_task(_drain_hook_outbox_once())
+    print("Durable hook outbox recovery drain scheduled")
     await run_overdue_tasks()
     yield
 
@@ -2370,6 +2425,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     save_restart_state()
 
     # Shutdown
+    if not outbox_drain_task.done():
+        outbox_drain_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await outbox_drain_task
     if _tts_mod.tts_worker_task:
         _tts_mod.tts_worker_task.cancel()
         try:

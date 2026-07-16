@@ -1,0 +1,8 @@
+[Unit]
+Description=Token-API socket (:7777)
+[Socket]
+Service=token-api@live.service
+ListenStream=127.0.0.1:7777
+NoDelay=true
+[Install]
+WantedBy=sockets.target
