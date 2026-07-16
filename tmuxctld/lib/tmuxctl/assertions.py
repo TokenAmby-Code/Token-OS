@@ -69,10 +69,7 @@ class PersonaSpec:
 
 
 def _vault_root() -> Path:
-    root = os.environ.get("IMPERIUM")
-    if root:
-        return Path(root) / "Imperium-ENV"
-    return Path("/Volumes/Imperium/Imperium-ENV")
+    return Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
 
 
 # The civic seats live in the Civic vault, not the Imperium vault. Kept separate

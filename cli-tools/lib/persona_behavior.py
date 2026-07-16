@@ -86,7 +86,7 @@ def _imperium_root() -> Path:
 
 def _pax_root() -> Path:
     base = os.environ.get("CIVIC")
-    if base:
+    if base and (Path(base) / "Pax-ENV").is_dir():
         return Path(base) / "Pax-ENV"
     return Path("/Volumes/Civic/Pax-ENV")
 

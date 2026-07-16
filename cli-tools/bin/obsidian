@@ -21,6 +21,7 @@
 #   obsidian vault=<name> daily:read
 #   obsidian vault=<name> open path="<note>.md"
 #   obsidian vault=<name> session-docs <get|create|replace|append|move|delete> request=<base64-json>
+#   obsidian session-docs fetch <session-doc-name>
 
 set -euo pipefail
 
@@ -36,6 +37,20 @@ detect_platform() {
 }
 
 PLATFORM=$(detect_platform)
+
+# Ordinary operations default to the curated ENV vault. Session-document
+# operations default to Logs. Tests and isolated callers may supply both roots.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -z "${IMPERIUM_VAULT:-}" || -z "${IMPERIUM_LOGS_VAULT:-}" ]]; then
+  source "$SCRIPT_DIR/../lib/nas-path.sh" 2>/dev/null || true
+fi
+
+vault_pair_is_valid() {
+  [[ -n "${IMPERIUM_VAULT:-}" && -n "${IMPERIUM_LOGS_VAULT:-}" ]] || return 1
+  [[ "$(basename "$IMPERIUM_VAULT")" == "Imperium-ENV" ]] || return 1
+  [[ "$(basename "$IMPERIUM_LOGS_VAULT")" == "Imperium-Logs" ]] || return 1
+  [[ "$(dirname "$IMPERIUM_VAULT")" == "$(dirname "$IMPERIUM_LOGS_VAULT")" ]]
+}
 
 # --- WSL: proxy to Obsidian.exe if available ---
 if [[ "$PLATFORM" == "wsl" ]]; then
@@ -55,7 +70,7 @@ resolve_vault() {
   if [[ "$vault_name" == /* ]]; then
     local allowed resolved candidate
     resolved=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$vault_name")
-    for candidate in "${IMPERIUM_ENV:-}" "${CIVIC_ENV:-}"; do
+    for candidate in "${IMPERIUM_ENV:-}" "${IMPERIUM_LOGS_ENV:-}" "${CIVIC_ENV:-}" "${IMPERIUM_VAULT:-}" "${IMPERIUM_LOGS_VAULT:-}"; do
       [[ -z "$candidate" ]] && continue
       allowed=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$candidate")
       if [[ "$resolved" == "$allowed" && -d "$resolved" ]]; then
@@ -67,18 +82,18 @@ resolve_vault() {
     return 1
   fi
 
-  # NAS mounts first (canonical locations)
-  # macOS mounts to /Volumes/, Linux mounts to /mnt/
-  if [[ -d "/Volumes/Imperium/$vault_name" ]]; then
-    echo "/Volumes/Imperium/$vault_name"
+  if [[ "$vault_name" == "Imperium-ENV" || "$vault_name" == "Imperium-Logs" ]]; then
+    vault_pair_is_valid || { echo "Error: Imperium ENV/Logs roots must be a colocated pair" >&2; return 1; }
+    local selected="$IMPERIUM_VAULT"
+    [[ "$vault_name" == "Imperium-Logs" ]] && selected="$IMPERIUM_LOGS_VAULT"
+    [[ -d "$selected" ]] || { echo "Error: local vault '$vault_name' not found at $selected" >&2; return 1; }
+    echo "$selected"
     return 0
   fi
+
+  # Civic remains separately configured; Imperium vaults never probe NAS paths.
   if [[ -d "/Volumes/Civic/$vault_name" ]]; then
     echo "/Volumes/Civic/$vault_name"
-    return 0
-  fi
-  if [[ -d "/mnt/imperium/$vault_name" ]]; then
-    echo "/mnt/imperium/$vault_name"
     return 0
   fi
   if [[ -d "/mnt/civic/$vault_name" ]]; then
@@ -113,7 +128,12 @@ PARAM_value=""
 PARAM_to=""
 PARAM_request=""
 SESSION_DOCS_OP=""
+SESSION_DOCS_TARGET=""
 ORIGINAL_ARGS=("$@")
+
+# Human-facing session-document commands always use the Logs vault. The legacy
+# `vault=<name> session-docs … request=<base64-json>` protocol remains valid.
+[[ "${1:-}" == "session-docs" ]] && VAULT_NAME="Imperium-Logs"
 
 for arg in "$@"; do
   if [[ "$arg" == vault=* ]]; then
@@ -140,15 +160,15 @@ for arg in "$@"; do
     PARAM_request="${arg#request=}"
   elif [[ "$COMMAND" == "session-docs" && -z "$SESSION_DOCS_OP" && "$arg" != *=* ]]; then
     SESSION_DOCS_OP="$arg"
+  elif [[ "$COMMAND" == "session-docs" && -n "$SESSION_DOCS_OP" && -z "$SESSION_DOCS_TARGET" && "$arg" != *=* ]]; then
+    SESSION_DOCS_TARGET="$arg"
   elif [[ -z "$COMMAND" && "$arg" != *=* ]]; then
     COMMAND="$arg"
   fi
 done
 
 if [[ -z "$VAULT_NAME" ]]; then
-  echo "Error: vault=<name> is required" >&2
-  echo "Usage: obsidian vault=<name> <command> [args...]" >&2
-  exit 1
+  VAULT_NAME="Imperium-ENV"
 fi
 
 VAULT_ROOT=$(resolve_vault "$VAULT_NAME")
@@ -506,6 +526,69 @@ else:
 PY
 }
 
+cmd_session_docs_fetch() {
+  local target="${1:-}" env_root
+  if [[ -z "$target" || "$target" == */* || "$target" == "." || "$target" == ".." ]]; then
+    echo "fetch requires a session-document filename, not a path" >&2
+    return 2
+  fi
+  [[ "$target" == *.md ]] || target="$target.md"
+  env_root="$(resolve_vault "Imperium-ENV")"
+
+  python3 - "$VAULT_ROOT" "$env_root" "$target" <<'PY'
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+import sys
+
+logs_root = Path(sys.argv[1]).resolve()
+env_root = Path(sys.argv[2]).resolve()
+filename = sys.argv[3]
+search_roots = (logs_root / "Sessions", logs_root / "Terra" / "Sessions", logs_root / "Mars" / "Sessions")
+matches = []
+for directory in search_roots:
+    if directory.is_dir():
+        matches.extend(path for path in directory.rglob(filename) if path.is_file() and ".obsidian" not in path.parts)
+matches = sorted(set(matches))
+if not matches:
+    raise SystemExit(f"session document not found in Imperium-Logs: {filename}")
+if len(matches) != 1:
+    rendered = ", ".join(str(path.relative_to(logs_root)) for path in matches)
+    raise SystemExit(f"ambiguous session document '{filename}': {rendered}")
+
+source = matches[0]
+source_rel = source.relative_to(logs_root)
+destination = env_root / "Embassy" / source_rel
+destination.parent.mkdir(parents=True, exist_ok=True)
+content = source.read_text(encoding="utf-8")
+now = datetime.now(UTC)
+metadata = {
+    "embassy": "true",
+    "embassy_source_vault": "Imperium-Logs",
+    "embassy_source_path": str(source_rel),
+    "embassy_fetched_at": now.isoformat(),
+    "embassy_expires_at": (now + timedelta(hours=1)).isoformat(),
+}
+
+if content.startswith("---\n"):
+    end = content.find("\n---", 4)
+    if end != -1:
+        frontmatter, body = content[4:end], content[end + 4:]
+        retained = [line for line in frontmatter.splitlines() if line.split(":", 1)[0] not in metadata]
+        content = "---\n" + "\n".join(retained + [f"{key}: {value}" for key, value in metadata.items()]) + "\n---" + body
+    else:
+        content = "---\n" + "\n".join(f"{key}: {value}" for key, value in metadata.items()) + "\n---\n\n" + content
+else:
+    content = "---\n" + "\n".join(f"{key}: {value}" for key, value in metadata.items()) + "\n---\n\n" + content
+
+temporary = destination.with_suffix(destination.suffix + ".tmp")
+temporary.write_text(content, encoding="utf-8")
+temporary.replace(destination)
+print(destination.relative_to(env_root))
+PY
+}
+
 # --- Auto-flock daily-note mutations ---
 # Re-exec the whole invocation under vault_lock.py so the flock is held for the
 # real write, then set OBSIDIAN_LOCK_HELD=1 to prevent infinite re-exec. Graceful
@@ -524,7 +607,13 @@ esac
 
 # --- Dispatch ---
 case "$COMMAND" in
-  session-docs)   cmd_session_docs "$SESSION_DOCS_OP" ;;
+  session-docs)
+    if [[ "$SESSION_DOCS_OP" == "fetch" ]]; then
+      cmd_session_docs_fetch "$SESSION_DOCS_TARGET"
+    else
+      cmd_session_docs "$SESSION_DOCS_OP"
+    fi
+    ;;
   read)           cmd_read ;;
   search)         cmd_search ;;
   search:context) cmd_search_context ;;
@@ -543,6 +632,7 @@ case "$COMMAND" in
   *)
     echo "Error: unknown command '$COMMAND'" >&2
     echo "Commands: read, search, search:context, backlinks, create, append, property:set, property:read, orphans, move, daily:read, open, session-docs" >&2
+    echo "Session docs: obsidian session-docs fetch <session-doc-name>" >&2
     exit 1
     ;;
 esac

@@ -97,9 +97,8 @@ PERSONA_WINDOWS = {COUNCIL_WINDOW, MECHANICUS_WINDOW}
 
 
 def _imperium_vault() -> str | None:
-    """Resolve the Imperium-ENV vault root, or None if it is not mounted."""
-    root = os.environ.get("IMPERIUM") or "/Volumes/Imperium"
-    vault = os.path.join(root, "Imperium-ENV")
+    """Resolve the machine-local Imperium-ENV vault, or None if absent."""
+    vault = os.path.expanduser(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV"))
     return vault if os.path.isdir(vault) else None
 
 
