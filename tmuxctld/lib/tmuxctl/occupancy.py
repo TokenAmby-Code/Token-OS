@@ -78,6 +78,14 @@ class PaneOccupancy:
     # a half-bound divergence (live agent, empty instance bind) can name the exact
     # orphaned wrapper for an actionable repair, instead of a bare "unbound" flag.
     wrapper_id: str = ""
+    # Per-pane fault isolation: True when THIS seat's wrapper-ledger occupancy
+    # lookup itself failed (e.g. an engine swap that left an ambiguous/inconsistent
+    # ledger row for the seat).  A faulted seat is excluded from dispatch — its
+    # occupancy is unknown, so it fails CLOSED — and surfaced loudly rather than
+    # taking the whole pool scan down with it.  ``fault_reason`` carries the raised
+    # detail for the response payload.
+    faulted: bool = False
+    fault_reason: str = ""
 
     @property
     def singleton(self) -> bool:
@@ -94,11 +102,12 @@ class PaneOccupancy:
 
     @property
     def dispatch_available(self) -> bool:
-        # A pane is dispatch-available iff it is not occupied. Occupancy is derived
-        # purely from the daemon ledger signals (instance stamp, live agent,
-        # singleton label, boot grace) — the retired @PANE_CLEAN "clean" stamp is
-        # no longer consulted.
-        return not self.occupied
+        # A pane is dispatch-available iff it is not occupied AND not faulted.
+        # Occupancy is derived purely from the daemon ledger signals (instance
+        # stamp, live agent, singleton label, boot grace) — the retired
+        # @PANE_CLEAN "clean" stamp is no longer consulted.  A seat whose own
+        # occupancy lookup faulted has unknown occupancy and is never dispatched to.
+        return not self.occupied and not self.faulted
 
 
 def _parse_pid(raw: str) -> int | None:
@@ -442,7 +451,31 @@ def scan_ledger_dispatch_availability(adapter: TmuxAdapter) -> list[PaneOccupanc
         if parsed is None:
             continue
         pane_id, role, window_name, pane_pid, born_raw = parsed
-        ledger_row = _active_wrapper_row_for_role(role)
+        try:
+            ledger_row = _active_wrapper_row_for_role(role)
+        except Exception as exc:
+            # Per-pane fault isolation.  A single seat whose wrapper-ledger
+            # occupancy lookup raises (e.g. an engine swap that left an
+            # ambiguous/inconsistent ledger row for the seat, per the codex
+            # no-ledger-rows gap) must NOT blind the whole pool scan.  Mark THIS
+            # seat faulted — excluded from dispatch and surfaced loudly in the
+            # payload — and keep scanning the rest of the panes.  Fail-loud is
+            # preserved (the fault is named, never swallowed); the blast radius is
+            # just no longer total.
+            ledger.append(
+                PaneOccupancy(
+                    pane_id=pane_id,
+                    pane_role=role,
+                    window_name=window_name.strip(),
+                    pane_pid=pane_pid,
+                    instance_id="",
+                    live_agent=False,
+                    recently_born=_recently_born(born_raw),
+                    faulted=True,
+                    fault_reason=str(exc),
+                )
+            )
+            continue
         ledger.append(
             PaneOccupancy(
                 pane_id=pane_id,

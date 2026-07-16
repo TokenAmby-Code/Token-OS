@@ -1766,13 +1766,22 @@ except Exception as exc:
 page = os.environ.get("PAGE", "")
 raw = os.environ.get("FREELIST_JSON", "")
 try:
-    freelist = json.loads(raw) if raw else []
+    payload = json.loads(raw) if raw else {"free": []}
 except json.JSONDecodeError as exc:
     print(f"invalid tmuxctld freelist JSON: {exc}", file=sys.stderr)
     raise SystemExit(2)
 
+# /freelist result is {"free": [...], "faulted": [...]}: the free pool sits
+# alongside a loud list of seats whose occupancy lookup faulted (excluded, not
+# fatal). Tolerate a bare list too, defending against daemon/dispatch version
+# skew across a rolling deploy.
+if isinstance(payload, dict):
+    freelist = payload.get("free", [])
+else:
+    freelist = payload
+
 if not isinstance(freelist, list):
-    print("invalid tmuxctld freelist: expected list", file=sys.stderr)
+    print("invalid tmuxctld freelist: expected a free-pane list", file=sys.stderr)
     raise SystemExit(2)
 
 role = first_free_prealloc_role(page, freelist)

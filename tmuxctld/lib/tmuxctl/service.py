@@ -570,6 +570,41 @@ class TmuxControlPlane:
             for p in list_free_panes(self.adapter)
         ]
 
+    def freelist_pool(self) -> dict:
+        """Partition the live pool into dispatch-free panes and faulted seats.
+
+        A single global occupancy scan; each seat is either dispatch-available
+        (``free``) or one whose own wrapper-ledger occupancy lookup faulted
+        (``faulted`` — e.g. a seat whose engine was swapped and left an
+        ambiguous/inconsistent ledger row). Per-pane fault isolation keeps a
+        faulted seat OUT of the free list while surfacing it loudly, instead of
+        one bad row failing the whole scan and blinding the pool. Occupied seats
+        (live agents, singletons, boot-grace panes) are simply absent from both.
+        """
+        from .occupancy import scan_ledger_dispatch_availability
+
+        free: list[dict] = []
+        faulted: list[dict] = []
+        for entry in scan_ledger_dispatch_availability(self.adapter):
+            if entry.faulted:
+                faulted.append(
+                    {
+                        "pane_id": entry.pane_id,
+                        "pane_role": entry.pane_role or "",
+                        "window_name": entry.window_name,
+                        "fault_reason": entry.fault_reason,
+                    }
+                )
+            elif entry.dispatch_available:
+                free.append(
+                    {
+                        "pane_id": entry.pane_id,
+                        "pane_role": entry.pane_role or "",
+                        "window_name": entry.window_name,
+                    }
+                )
+        return {"free": free, "faulted": faulted}
+
     def cardinal_pane_label(self, target: str) -> str:
         """Resolve a target to its stable cardinal @PANE_ID label.
 

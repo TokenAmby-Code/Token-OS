@@ -1680,11 +1680,26 @@ def _h_resolve_agent(control, params):
 def _h_freelist(control, params):
     # Redact raw physical ids to the canonical role (mirrors the CLI json shape):
     # both pane_id and pane_role carry the public {page}:{id}, never a raw %NN.
-    out = []
-    for free_pane in control.freelist():
+    # The response carries the free pool AND a ``faulted`` list ALONGSIDE it: a
+    # seat whose wrapper-ledger occupancy lookup failed (per-pane fault isolation)
+    # is surfaced loudly-and-excluded, never allowed to blank the whole pool.
+    pool = control.freelist_pool()
+    free = []
+    for free_pane in pool["free"]:
         role = _safe_public_role(free_pane.get("pane_role"))
-        out.append({"pane_id": role, "pane_role": role, "window_name": free_pane["window_name"]})
-    return out
+        free.append({"pane_id": role, "pane_role": role, "window_name": free_pane["window_name"]})
+    faulted = []
+    for faulted_pane in pool["faulted"]:
+        role = _safe_public_role(faulted_pane.get("pane_role"))
+        faulted.append(
+            {
+                "pane_id": role,
+                "pane_role": role,
+                "window_name": faulted_pane["window_name"],
+                "fault_reason": faulted_pane.get("fault_reason", ""),
+            }
+        )
+    return {"free": free, "faulted": faulted}
 
 
 def _h_session_doc(control, params):
