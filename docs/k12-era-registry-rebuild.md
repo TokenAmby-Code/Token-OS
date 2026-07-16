@@ -2,9 +2,10 @@
 
 **Status:** ratified 2026-07-15 (same-day sitting) — **R1/R2/R4/R5 as recommended; R3 as
 amended** (the canonical shape binds surviving/new boxes; the Mac is exempted — its
-deviation recorded as known and rider-mitigated, no corpse churn). **R6 remains OPEN**:
-the Emperor flagged follow-up discussion owed on the DB write-door before closing; rung 2
-(writers) stays gated on it. Rebuild rungs gated only on R1–R5 may proceed.
+deviation recorded as known and rider-mitigated, no corpse churn). **R6 resolved
+2026-07-15** at rung 2: hub API is the write door, direct sqlite transitional (Mac keeps
+the fallback until rung 3); the WAL-attribution sub-question closed by audit. All six
+rulings stand; the rebuild rungs are ungated.
 **Contract:** device-doctrine reconciliation rulings **#2** (Token-OS home = k12-personal,
 no work-box copy), **#3** (k12-personal = inter-agent comms hub AND the only persistent
 tmux estate; work-box agents run inside mini tmux envelopes echoing up), **#9** (WSL =
@@ -41,14 +42,14 @@ Repo-verified facts (every citation re-checked against `main` @ `03ee6c5b`, 2026
 | Deprecated `claude_instances` table still read/updated alongside `instances` v2 | `token-api/db_schema.py:338-410` |
 | Sanctioned-write layer for instance rows already exists (runtime-writable field allowlist, forbidden-field guard) | `token-api/instance_mutation.py` |
 | Stop hook writes agents.db directly via sqlite3 (`shared.AGENTS_DB_PATH`), not through the API | `token-api/stop_hook.py:30,49,85` |
-| Session-end resume script writes directly too; DB chain `TOKEN_API_AGENTS_DB` > `TOKEN_API_DB` > `~/runtimes/database/agents.db` | `cli-tools/scripts/agent-session-end-resume.sh:82` |
+| Session-end resume script only READS the DB (rung-2 audit corrected the earlier writer miscite); DB chain `TOKEN_API_AGENTS_DB` > `TOKEN_API_DB` > `~/runtimes/database/agents.db` | `cli-tools/scripts/agent-session-end-resume.sh:82` |
 | daily-build hard-enforces the Token-OS repo via the `cli-tools/pyproject.toml` sentinel | `cli-tools/src/cli_tools/daily_build/cli.py:54-60` |
 
 Box-probe facts (live probes 2026-07-15, not derivable from the repo):
 
 - **k12-personal already runs a WAL-hot `~/runtimes/database/agents.db` with NO token-api
-  service on the box.** Explained: `stop_hook.py` and `agent-session-end-resume.sh` write
-  directly via sqlite through the canonical env chain — the DB is alive without its API.
+  service on the box.** Explained: `stop_hook.py` writes directly via sqlite through the
+  canonical env chain (the resume script only reads) — the DB is alive without its API.
 - **k12-personal's bare repo fetches straight from GitHub** (`origin` =
   `git@github.com:TokenAmby-Code/Token-OS.git`), matching the target-structure §2 shape.
 - **Mac bare** carries `origin` + `github` remotes, both → GitHub (the duplicate named
@@ -182,27 +183,30 @@ whose lifetime is one session; (b) rebuild with a `claude_instances` view for st
 archive snapshot by design; any tool still reading `claude_instances` breaks loudly at
 cutover and gets fixed, not shimmed.
 
-## R6 — Sanctioned writers — **OPEN, not ratified 2026-07-15**
+## R6 — Sanctioned writers — **RESOLVED, ratified 2026-07-15**
 
-At the sitting the Emperor held this ruling open: the DB write-door discussion warrants
-follow-ups before closing. The recommendation below stands as posed; rung 2 (writers) is
-gated on resolving it.
+Held open at the morning sitting for write-door follow-ups; closed the same day at rung 2
+per the recommendation as posed, with the audit sub-question answered below.
 
 **Decision needed:** who may write the registry, through what door?
 
-**Recommendation: the hub API is the write door; direct sqlite is transitional debt.**
+**Ruling: the hub API is the write door; direct sqlite is transitional debt.**
 Today's probe shows the debt precisely: k12-personal's DB is WAL-hot with *no API on the
-box*, because `stop_hook.py:49,85` and `agent-session-end-resume.sh:82` write directly
-through the canonical env chain. That is correct *for now* (the vaporize lane made the
-chain safe) and named transitional. After the hub token-api service is running on
-k12-personal (§6 step 6), hooks POST to the box-local API — the existing durable-retry
-outbox already covers down-API windows — and any residual direct-sqlite writer goes
-through the `instance_mutation` layer so the field allowlist/forbidden-field guard
-applies to every write path, not just HTTP.
+box*, because `stop_hook.py`'s two teardown writes go directly through the canonical env
+chain (the earlier draft also miscited `agent-session-end-resume.sh:82` as a writer —
+the rung-2 audit found it read-only). That is correct *for now* (the vaporize lane made
+the chain safe) and named transitional. Rung 2 lands the door: hooks POST the box-local
+API first (`/api/hooks/instance-stopped`, `/api/hooks/clear-human-anchor`) and fall back
+to direct sqlite; the Mac keeps its fallback until rung 3, the hub box sheds it once the
+token-api service runs there (§6 step 6) — the existing durable-retry outbox covers
+down-API windows. Every path, HTTP or fallback, goes through the `instance_mutation`
+layer so the field allowlist/forbidden-field guard applies to every write, and the
+mutation log attributes the door (actor `stop-hook:api` vs `stop-hook`).
 
-**Open sub-question, flagged honestly:** attribute the current WAL traffic on-box —
-confirm the two known direct writers account for *all* of it before cutover, so no
-unsanctioned writer rides into the new era unnoticed.
+**Audit sub-question — CLOSED:** the rung-2 sweep attributed the WAL traffic: the only
+real non-server direct writers are `stop_hook.py`'s `mark_cron_instance_stopped` and
+`clear_human_anchor_on_stop` (both via `update_instance_sync`) — the ENTIRE non-server
+write surface. No unsanctioned writer rides into the new era.
 
 **Alternatives:** (a) keep direct sqlite as a permanent sanctioned path — rejected: two
 write doors means the allowlist guard is advisory; (b) API-only immediately (before the
@@ -229,9 +233,12 @@ regardless of checkout shape.
   session_documents import script), landing behind the existing init_db path; no consumer
   flips. **LANDED 2026-07-15** (branch `k12-registry-rung1`: branch column + partial
   index, stamping surfaces, one-shot import script).
-- **Rung 2 — writers (GATED on R6, still open):** hook writers gain the API-first path
-  with sqlite fallback removed on the hub box; `instance_mutation` becomes the sole
-  mutation surface; WAL attribution audit (R6 sub-question) closes.
+- **Rung 2 — writers:** hook writers gain the API-first path with sqlite fallback
+  removed on the hub box; `instance_mutation` stays the sole mutation surface; WAL
+  attribution audit (R6 sub-question) closes. **LANDED 2026-07-15** (branch
+  `k12-registry-rung2`: write-door endpoints `/api/hooks/instance-stopped` +
+  `/api/hooks/clear-human-anchor`, stop_hook API-first with Mac-side sqlite fallback
+  kept until rung 3, WAL audit closed).
 - **Rung 3 — satellite live:** k12-personal token-api serves the new schema in satellite
   mode (§6 step 6), registration door + envelope echo verified end-to-end.
 - **Rung 4 — cutover:** §6 step 7 as amended by R2 (import, flip
@@ -239,16 +246,14 @@ regardless of checkout shape.
   fixed.
 - **Rung 5 — Mac registry retirement:** archive snapshot taken, Mac DB frozen read-only.
 
-Each rung is its own PR lane with its own live proof. R1–R5 are ratified (2026-07-15
-sitting); rungs gated only on them may start. Rung 2 waits for the R6 follow-ups.
+Each rung is its own PR lane with its own live proof. All six rulings are ratified
+(2026-07-15); no rung is gated on an open decision.
 
 ## Follow-ons (not this lane)
 
 - **Ultramar canonization ceremony:** R1/R3 (ratified) join the four device-doctrine
   canon notes (Hub-and-Envelope Estate Topology, etc.) as k12-era registry canon; R6
-  follows once its follow-ups close.
-- **R6 follow-up sitting:** the write-door ruling plus the WAL-attribution sub-question,
-  held open by the Emperor at the 2026-07-15 sitting.
+  (closed 2026-07-15 at rung 2) joins them.
 - **FleetView:** the hub-authoritative registry is the natural read-model source for a
   fleet dashboard; out of scope until rung 3 exists.
 - **Wedged NAS read path** (ops, tracked separately) and the k12-work civic-side layout
