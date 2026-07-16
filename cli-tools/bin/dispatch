@@ -575,8 +575,8 @@ directory_candidates() {
 
   local path label
   for path in \
-    "/Volumes/Imperium/Imperium-ENV" \
-    "/Volumes/Civic/Pax-ENV" \
+    "${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV" \
+    "${CIVIC:-/Volumes/Civic}/Pax-ENV" \
     "${TOKEN_OS_RUNTIME_CHECKOUT:-$HOME/runtimes/Token-OS/live}" \
     "$HOME/worktrees/Token-OS" \
     "$HOME/worktrees/askCivic" \
@@ -1230,7 +1230,7 @@ vault_root_for_aspirant() {
   if [[ -n "${IMPERIUM:-}" ]]; then
     printf '%s/Imperium-ENV' "$IMPERIUM"
   else
-    printf '%s' "/Volumes/Imperium/Imperium-ENV"
+    printf '%s/Imperium-ENV' "${IMPERIUM:-/Volumes/Imperium}"
   fi
 }
 
