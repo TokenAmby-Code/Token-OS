@@ -1,4 +1,0 @@
-interface:
-  display_name: "Token-OS DB"
-  short_description: "Inspect Token-OS SQLite state"
-  default_prompt: "Use $db to inspect the Token-OS instance registry read-only."

@@ -1,7 +1,0 @@
-interface:
-  display_name: "Session Update"
-  short_description: "Update session continuity"
-  default_prompt: "$session-update record the important session state."
-
-policy:
-  allow_implicit_invocation: true

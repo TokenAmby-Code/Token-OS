@@ -1,7 +1,0 @@
-interface:
-  display_name: "Enforce"
-  short_description: "Work with phone enforcement"
-  default_prompt: "$enforce handle the requested enforcement workflow."
-
-policy:
-  allow_implicit_invocation: true

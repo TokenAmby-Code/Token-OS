@@ -1,4 +1,0 @@
-interface:
-  display_name: "Dispatch"
-  short_description: "Route work to Imperium agents"
-  default_prompt: "Use $dispatch to route this work to the right Imperium agent."

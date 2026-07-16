@@ -15,8 +15,11 @@ from pathlib import Path
 from typing import Any
 
 SCRIPT = Path(__file__).resolve()
-TOKEN_OS = SCRIPT.parents[2]
-DEFAULT_CANONICAL = TOKEN_OS / "claude-config" / "skills"
+TOKEN_FLEET = Path(
+    os.environ.get("TOKEN_FLEET_CHECKOUT")
+    or Path.home() / "runtimes" / "Token-Fleet" / "live"
+)
+DEFAULT_CANONICAL = TOKEN_FLEET / "shared" / "skills"
 CLAUDE_COMMAND_SKILLS = {"preplan", "postplan"}
 
 

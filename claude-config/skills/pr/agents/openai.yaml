@@ -1,7 +1,0 @@
-interface:
-  display_name: "PR"
-  short_description: "Create and manage pull requests"
-  default_prompt: "$pr handle the pull request workflow."
-
-policy:
-  allow_implicit_invocation: true

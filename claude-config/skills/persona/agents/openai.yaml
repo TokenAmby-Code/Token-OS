@@ -1,7 +1,0 @@
-interface:
-  display_name: "Persona"
-  short_description: "Register persona identity"
-  default_prompt: "$persona register or update the current persona identity."
-
-policy:
-  allow_implicit_invocation: true

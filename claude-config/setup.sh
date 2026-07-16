@@ -63,7 +63,7 @@ echo ""
 echo "--- Symlinks ---"
 link "$CONFIG_DIR/hooks"    "$CLAUDE_HOME/hooks"    "hooks/"
 link "$CONFIG_DIR/commands" "$CLAUDE_HOME/commands"  "commands/"
-link "$CONFIG_DIR/skills"   "$CLAUDE_HOME/skills"    "skills/"
+link "${TOKEN_FLEET_CHECKOUT:-$HOME/runtimes/Token-Fleet/live}/shared/skills" "$CLAUDE_HOME/skills" "skills/"
 link "$CONFIG_DIR/CLAUDE.md" "$HOME/CLAUDE.md"       "~/CLAUDE.md"
 
 # 1b. Expose the same canonical skills to Codex without touching bundled .system skills.
