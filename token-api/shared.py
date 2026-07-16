@@ -108,20 +108,25 @@ def _vault_root() -> Path:
     env = os.environ.get("IMPERIUM_ENV")
     if env:
         return Path(env)
-    imperium = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
-    if not imperium.exists():
-        imperium = Path.home()
-    return imperium / "Imperium-ENV"
+    return Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
+
+
+def _logs_vault_root() -> Path:
+    """Return the sibling local Logs vault; generated sessions never use ENV."""
+    configured = os.environ.get("IMPERIUM_LOGS_ENV") or os.environ.get("IMPERIUM_LOGS_VAULT")
+    if configured:
+        return Path(configured).expanduser()
+    return _vault_root().parent / "Imperium-Logs"
 
 
 def default_sessions_dir() -> Path:
-    """Terra/Sessions under the live vault, resolved lazily."""
-    return _vault_root() / "Terra" / "Sessions"
+    """Terra/Sessions under the generated-output Logs vault."""
+    return _logs_vault_root() / "Terra" / "Sessions"
 
 
 def mars_sessions_dir() -> Path:
-    """Mars/Sessions under the live vault, resolved lazily."""
-    return _vault_root() / "Mars" / "Sessions"
+    """Mars/Sessions under the generated-output Logs vault."""
+    return _logs_vault_root() / "Mars" / "Sessions"
 
 
 SERVER_PORT = 7777

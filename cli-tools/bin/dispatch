@@ -497,8 +497,8 @@ persona_vault_root() {
   local vault_name="$1"
   case "$vault_name" in
     Imperium-ENV|imperium|Imperium)
-      if [[ -n "${IMPERIUM:-}" && -d "${IMPERIUM}/Imperium-ENV" ]]; then
-        printf '%s/Imperium-ENV' "$IMPERIUM"
+      if [[ -n "${IMPERIUM_VAULT:-}" && -d "${IMPERIUM_VAULT}" ]]; then
+        printf '%s' "$IMPERIUM_VAULT"
       fi
       ;;
     Pax-ENV|civic|Civic)
@@ -575,8 +575,8 @@ directory_candidates() {
 
   local path label
   for path in \
-    "${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV" \
-    "${CIVIC:-/Volumes/Civic}/Pax-ENV" \
+    "${IMPERIUM_VAULT:-$HOME/vaults/Imperium-ENV}" \
+    "/Volumes/Civic/Pax-ENV" \
     "${TOKEN_OS_RUNTIME_CHECKOUT:-$HOME/runtimes/Token-OS/live}" \
     "$HOME/worktrees/Token-OS" \
     "$HOME/worktrees/askCivic" \
@@ -1227,11 +1227,7 @@ run_internal_aspirant_create() {
 }
 
 vault_root_for_aspirant() {
-  if [[ -n "${IMPERIUM:-}" ]]; then
-    printf '%s/Imperium-ENV' "$IMPERIUM"
-  else
-    printf '%s/Imperium-ENV' "${IMPERIUM:-/Volumes/Imperium}"
-  fi
+  printf '%s' "${IMPERIUM_VAULT:-$HOME/vaults/Imperium-ENV}"
 }
 
 abs_vault_path() {
