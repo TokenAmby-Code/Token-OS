@@ -802,6 +802,35 @@ async def _bind_instance_stamp(
         logger.debug("Hook: @INSTANCE_ID stamp delegation failed for %s: %s", tmux_pane, exc)
 
 
+async def _commit_registration_before_stamp(
+    db,
+    *,
+    tmux_pane: str | None,
+    session_id: str | None,
+    wrapper_launch_id: str | None = None,
+    engine: str | None = None,
+    working_dir: str | None = None,
+    persona: str | None = None,
+) -> None:
+    """Make the row durable before the external tmuxctld stamp call.
+
+    ``/instance/stamp`` is an RPC.  Holding the SessionStart SQLite write
+    transaction across it turns a slow daemon call into fleet-wide registration
+    lock contention; a Codex hook can then hit its five-second ceiling and lose
+    both the uncommitted row and its identity surface.  The row is the
+    prerequisite for the stamp, so commit the local registration boundary first.
+    """
+    await db.commit()
+    await _bind_instance_stamp(
+        tmux_pane=tmux_pane,
+        session_id=session_id,
+        wrapper_launch_id=wrapper_launch_id,
+        engine=engine,
+        working_dir=working_dir,
+        persona=persona,
+    )
+
+
 async def _session_start_effective_pane(
     tmux_pane: str | None,
     pane_label: str | None,
@@ -3957,9 +3986,12 @@ async def handle_session_start(payload: dict) -> dict:
         await _apply_persona_seat_name(
             db, instance_id=session_id, persona_identity=persona_identity
         )
-        # Single-writer identity stamp (fresh register): tmuxctld stamps @INSTANCE_ID
-        # on the freshly-minted row's pane. No prior pane to vacate.
-        await _bind_instance_stamp(
+        # Commit the registry row before the external single-writer stamp RPC.
+        # Never hold the SessionStart SQLite writer lock while tmuxctld resolves
+        # and stamps the pane: a slow daemon call otherwise makes later starts
+        # exhaust their hook deadline and roll their rows back.
+        await _commit_registration_before_stamp(
+            db,
             tmux_pane=tmux_pane,
             session_id=session_id,
             wrapper_launch_id=wrapper_launch_id,
