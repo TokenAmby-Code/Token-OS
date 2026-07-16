@@ -513,6 +513,7 @@ class TmuxControlPlane:
 
         scrubbed: list[str] = []
         live_divergences: list[dict[str, str]] = []
+        faulted: list[dict[str, str]] = []
         for pane in scan_ledger_dispatch_availability(self.adapter):
             # chrome = f(bind), but only when the bind truth is trustworthy.  A
             # live TUI with no active bind is split-brain, not free residue; do
@@ -520,6 +521,21 @@ class TmuxControlPlane:
             # liveness/bind-repair lane can reconcile it.  Report it loudly so
             # callers can route the divergence instead of mistaking it for a
             # clean free slot.
+            if pane.faulted:
+                # A seat whose own occupancy lookup faulted has UNKNOWN state: its
+                # synthetic empty instance_id/live_agent are fault sentinels, not a
+                # trusted "unbound + agent-free" reading.  Never scrub its chrome
+                # (that would erase an operator surface on a guess) — report it and
+                # move on so the fault stays visible without a destructive side effect.
+                faulted.append(
+                    {
+                        "pane": pane.pane_id,
+                        "pane_label": pane.pane_role or "",
+                        "reason": "occupancy_lookup_faulted",
+                        "fault_reason": pane.fault_reason,
+                    }
+                )
+                continue
             if pane.singleton or pane.instance_id:
                 continue
             if pane.live_agent:
@@ -553,6 +569,8 @@ class TmuxControlPlane:
         out["chrome_scrubbed_unbound_count"] = len(scrubbed)
         out["chrome_unbound_live_divergences"] = live_divergences
         out["chrome_unbound_live_divergence_count"] = len(live_divergences)
+        out["occupancy_faulted_panes"] = faulted
+        out["occupancy_faulted_count"] = len(faulted)
         return out
 
     def freelist(self) -> list[dict]:
