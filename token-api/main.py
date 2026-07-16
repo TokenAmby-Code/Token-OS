@@ -10246,6 +10246,20 @@ async def _dispatch_administratum_record(
     return await inject(record_prompt, instance["tmux_pane"], **kwargs)
 
 
+def _log_administratum_dispatch_failure(task: asyncio.Task) -> None:
+    """Done-callback for detached Administratum record dispatches.
+
+    All interaction with Administratum is async — nothing in a request path may
+    block on the recorder's pane inject. The dispatch is fire-and-forget, but a
+    failure must be logged, never swallowed.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Detached Administratum record dispatch failed", exc_info=exc)
+
+
 # ── L2: enforcement defer queue (hold-and-queue under typing guard) ────────────
 
 
@@ -10631,9 +10645,11 @@ async def handle_custodes_state_event(
             payload=payload or {},
             observed=", ".join(_snapshot_items({}, payload or {}, source)) or "no extra state",
         )
-        administratum_delivery = await _dispatch_administratum_record(
-            event, unknown_intervention, "state"
+        unknown_dispatch_task = asyncio.create_task(
+            _dispatch_administratum_record(event, unknown_intervention, "state")
         )
+        unknown_dispatch_task.add_done_callback(_log_administratum_dispatch_failure)
+        administratum_delivery = {"dispatched": "queued"}
         await log_event(
             "administratum_record",
             instance_id=instance_id,
@@ -10671,9 +10687,11 @@ async def handle_custodes_state_event(
     # Administratum seizes the full state-hook stream: every recognized hook is
     # recorded + pushed to the recorder's pane immediately, ungated by quiet-hours
     # or dedupe (the recorder runs 24/7). Trinity: state hooks → Administratum.
-    administratum_delivery = await _dispatch_administratum_record(
-        event, intervention, classification
+    administratum_dispatch_task = asyncio.create_task(
+        _dispatch_administratum_record(event, intervention, classification)
     )
+    administratum_dispatch_task.add_done_callback(_log_administratum_dispatch_failure)
+    administratum_delivery = {"dispatched": "queued"}
 
     if classification == "state":
         # Pure state hooks no longer interrupt Custodes — Administratum owns them.
