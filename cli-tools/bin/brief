@@ -135,8 +135,6 @@ def main(argv: list[str]) -> int:
     parser.add_argument("message", help="The message body")
     args = parser.parse_args(argv)
 
-    if not args.pane and not args.page:
-        parser.error("at least one --pane or --page is required")
     if args.ephemeral:
         if args.json_out:
             print(
@@ -153,6 +151,8 @@ def main(argv: list[str]) -> int:
         else:
             _err(EPHEMERAL_CHANNEL_DISABLED_ERROR)
         return 1
+    if not args.pane and not args.page:
+        parser.error("at least one --pane or --page is required")
 
     body = {
         "caller_pane": _resolve_caller(args.caller),

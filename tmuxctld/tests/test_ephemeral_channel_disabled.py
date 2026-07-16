@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -28,7 +29,7 @@ def _load_extensionless_module(name: str, path: Path):
     return module
 
 
-def test_brief_ephemeral_fails_loud_without_transport(monkeypatch, capsys):
+def test_brief_ephemeral_fails_loud_without_transport(monkeypatch, capsys) -> None:
     brief = _load_extensionless_module("brief_cli", ROOT / "cli-tools" / "bin" / "brief")
 
     def unexpected_post(*_args, **_kwargs):
@@ -44,7 +45,7 @@ def test_brief_ephemeral_fails_loud_without_transport(monkeypatch, capsys):
     assert captured.err == f"brief: {DISABLED_ERROR}\n"
 
 
-def test_hook_ephemeral_fails_loud_without_transport(monkeypatch, capsys):
+def test_hook_ephemeral_fails_loud_without_transport(monkeypatch, capsys) -> None:
     hook = _load_extensionless_module("hook_cli", ROOT / "cli-tools" / "bin" / "hook")
 
     def unexpected_request(*_args, **_kwargs):
@@ -70,7 +71,34 @@ def test_hook_ephemeral_fails_loud_without_transport(monkeypatch, capsys):
     assert captured.err == f"hook: {DISABLED_ERROR}\n"
 
 
-def test_tmuxctld_send_ethereal_fails_before_pane_resolution():
+def test_hook_ephemeral_json_rejection_preserves_machine_contract(monkeypatch, capsys) -> None:
+    hook = _load_extensionless_module("hook_json_cli", ROOT / "cli-tools" / "bin" / "hook")
+
+    def unexpected_request(*_args, **_kwargs):
+        pytest.fail("disabled hook ephemeral path attempted Token-API transport")
+
+    monkeypatch.setattr(hook, "_request", unexpected_request)
+
+    result = hook.main(
+        [
+            "--json",
+            "subscribe",
+            "--pane",
+            "fake:target",
+            "--notify",
+            "fake:subscriber",
+            "--delivery",
+            "ephemeral",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert json.loads(captured.out) == {"status": "disabled", "error": DISABLED_ERROR}
+    assert captured.err == ""
+
+
+def test_tmuxctld_send_ethereal_fails_before_pane_resolution() -> None:
     class NoTmuxControl:
         @property
         def adapter(self):
@@ -88,12 +116,12 @@ def test_tmuxctld_send_ethereal_fails_before_pane_resolution():
     assert daemon.ROUTES[("POST", "/send-ethereal")] is daemon._h_send_ethereal
 
 
-def test_ethereal_renderer_cannot_bypass_disabled_route():
+def test_ethereal_renderer_cannot_bypass_disabled_route() -> None:
     with pytest.raises(ValueError, match=f"^{DISABLED_ERROR}$"):
         ethereal_invocation_text("claude", "status only")
 
 
-def test_user_prompt_hook_and_keybinding_cannot_arm_btw_reprompt():
+def test_user_prompt_hook_and_keybinding_cannot_arm_btw_reprompt() -> None:
     settings = json.loads((ROOT / "claude-config" / "settings.template.json").read_text())
     prompt_hooks = settings["hooks"]["UserPromptSubmit"]
     commands = [hook["command"] for group in prompt_hooks for hook in group["hooks"]]
@@ -108,7 +136,9 @@ def test_user_prompt_hook_and_keybinding_cannot_arm_btw_reprompt():
     "relative_path",
     ["cli-tools/bin/ethereal-prompt", "claude-config/hooks/btw-capture.sh"],
 )
-def test_legacy_reprompt_entrypoints_are_terminal_errors(relative_path):
+def test_legacy_reprompt_entrypoints_are_terminal_errors(
+    relative_path: str, tmp_path: Path
+) -> None:
     path = ROOT / relative_path
     result = subprocess.run(
         ["bash", str(path), "fake:ephemeral"],
@@ -116,6 +146,7 @@ def test_legacy_reprompt_entrypoints_are_terminal_errors(relative_path):
         capture_output=True,
         check=False,
         timeout=2,
+        env={**os.environ, "HOME": str(tmp_path)},
     )
 
     assert result.returncode != 0

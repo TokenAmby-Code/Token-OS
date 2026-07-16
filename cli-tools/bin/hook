@@ -120,7 +120,18 @@ def main(argv: list[str]) -> int:
 
     args = parser.parse_args(argv)
     if args.cmd == "subscribe" and args.delivery == "ephemeral":
-        _err(EPHEMERAL_CHANNEL_DISABLED_ERROR)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": "disabled",
+                        "error": EPHEMERAL_CHANNEL_DISABLED_ERROR,
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            _err(EPHEMERAL_CHANNEL_DISABLED_ERROR)
         return 1
     try:
         if args.cmd == "subscribe":

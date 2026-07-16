@@ -17,7 +17,7 @@ if str(TOKEN_API_DIR) not in sys.path:
 DISABLED_ERROR = "ephemeral channel disabled by decree"
 
 
-def test_hook_subscription_refuses_ephemeral_before_resolution():
+def test_hook_subscription_refuses_ephemeral_before_resolution() -> None:
     hooks = importlib.import_module("routes.hooks")
     request = hooks.HookSubscribeRequest(
         target_pane="fake:target",
@@ -31,7 +31,7 @@ def test_hook_subscription_refuses_ephemeral_before_resolution():
     assert raised.value.detail == DISABLED_ERROR
 
 
-def test_existing_ephemeral_subscription_cannot_deliver_or_retry():
+def test_existing_ephemeral_subscription_cannot_deliver_or_retry() -> None:
     hooks = importlib.import_module("routes.hooks")
 
     result = asyncio.run(

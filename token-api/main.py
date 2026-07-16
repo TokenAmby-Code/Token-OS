@@ -13657,10 +13657,10 @@ async def talk_cancel(talk_id: str):
 @app.post("/api/brief/send")
 async def brief_send(request: BriefSendRequest):
     """Fire-and-forget delivery to one or more panes/pages with dedup."""
-    if not request.panes and not request.pages:
-        raise HTTPException(status_code=400, detail="at least one --pane or --page required")
     if request.ephemeral:
         _reject_ephemeral_channel_http()
+    if not request.panes and not request.pages:
+        raise HTTPException(status_code=400, detail="at least one --pane or --page required")
 
     # hook_driven classification: flag each target unless the SENDER is Custodes
     # (Emperor-proxied → no flag). An absent/unknown caller is not Custodes →
