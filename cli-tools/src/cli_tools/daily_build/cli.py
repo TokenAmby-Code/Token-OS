@@ -219,6 +219,19 @@ def _rank_top_files(
     return ranked
 
 
+def _github_attribution_zero_warning(
+    commits: list[tuple[str, str, int | None]], gh_rows: list[dict], diagnostic: str | None
+) -> str | None:
+    """Return the non-silent warning for a failed expected GitHub attribution."""
+    git_pr_numbers = {pr_number for _, _, pr_number in commits if pr_number is not None}
+    if gh_rows or not diagnostic or not git_pr_numbers:
+        return None
+    return (
+        "GitHub attribution=0 despite PR-numbered commits "
+        f"({', '.join(f'#{number}' for number in sorted(git_pr_numbers))}): {diagnostic}"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="daily-build",
@@ -295,7 +308,9 @@ def main() -> int:
     log(f"base_sha={base_sha or '(none)'} base_date={base_date} head_sha={head_sha or '(none)'}")
 
     commits = git.commits_in_range(repo, base_sha, head_sha)
-    gh_rows = git.merged_prs(repo, base_date)
+    gh_rows, gh_diagnostic = git.merged_prs_result(repo, base_date)
+    if warning := _github_attribution_zero_warning(commits, gh_rows, gh_diagnostic):
+        warn(warning)
     merged = git.attribute_window(repo, commits, gh_rows, base_sha, head_sha)
     log(f"merged PRs in window: {len(merged)} (git-attributed ∪ gh; gh rows: {len(gh_rows)})")
     reverse_index = build_diagram_index(vault)
