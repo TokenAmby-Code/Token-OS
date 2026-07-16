@@ -13,6 +13,18 @@ test("allowlist matches exact and prefix", () => {
   expect(allowed("DELETE", "/api/hooks/Stop", [{ method: "POST", pathPrefix: "/api/hooks/" }])).toBe(false);
 });
 
+test("example k12 route admits launch and send, but not rung-3 lifecycle doors", async () => {
+  const config: { routes: RouteConfig[] } = await Bun.file(new URL("../edge_proxy.config.example.json", import.meta.url)).json();
+  const k12 = config.routes.find((route) => route.prefix === "/k12");
+  expect(k12).toBeDefined();
+  if (!k12) throw new Error("example config is missing the /k12 route");
+  expect(allowed("POST", "/launch", k12.allowlist)).toBe(true);
+  expect(allowed("POST", "/send", k12.allowlist)).toBe(true);
+  expect(allowed("POST", "/stop", k12.allowlist)).toBe(false);
+  expect(allowed("POST", "/subscribe", k12.allowlist)).toBe(false);
+  expect(allowed("POST", "/close", k12.allowlist)).toBe(false);
+});
+
 test("resolveRoute picks the longest matching prefix, default catches the rest", () => {
   const routes: RouteConfig[] = [
     { prefix: "/k12", upstream: "http://127.0.0.1:7781", stripPrefix: true, allowlist: [{ pathPrefix: "/" }] },
