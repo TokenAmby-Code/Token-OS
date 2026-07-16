@@ -38,13 +38,62 @@ SATELLITE_URLS = {
 LOCAL_DEVICE = os.environ.get("IMPERIUM_DEVICE_NAME", "Mac-Mini")
 
 
+def _post_hook_write_door(path: str, instance_id: str) -> dict:
+    """POST to a token-api stop-hook write door (k12 registry rung 2 / R6).
+
+    Returns the parsed response dict on HTTP success; raises on any failure
+    (conn refused, timeout, non-2xx, bad JSON) so the caller can fall back to
+    direct sqlite. This is a teardown path: short timeout, one quick retry.
+    """
+    import time
+    import urllib.request
+
+    payload = json.dumps({"instance_id": instance_id}).encode()
+    last_err: Exception = RuntimeError("no attempt made")
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(
+                f"{TOKEN_API_URL}{path}",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(0.2)
+    raise last_err
+
+
 def mark_cron_instance_stopped(instance_id: str):
     """Explicitly mark a cron instance as stopped in agents.db.
 
     The stop hook fires during Claude Code teardown. The Token API may or may
     not have received a DELETE for this instance yet — explicitly writing
     'stopped' here gives the cron mutex check a reliable signal.
+
+    API-first: POST the write door, fall back to direct sqlite on any HTTP
+    failure (this box keeps the fallback until rung 3).
     """
+    try:
+        data = _post_hook_write_door("/api/hooks/instance-stopped", instance_id)
+        if data.get("rows"):
+            print(
+                f"[info] Cron instance {instance_id[:8]} marked stopped in DB via API",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[info] Cron instance {instance_id[:8]} already stopped or not found via API",
+                file=sys.stderr,
+            )
+        return
+    except Exception as api_err:
+        print(
+            f"[info] Marking cron instance stopped via direct sqlite fallback (api: {api_err})",
+            file=sys.stderr,
+        )
     try:
         con = sqlite3.connect(str(DB_PATH))
         try:
@@ -80,7 +129,23 @@ def mark_cron_instance_stopped(instance_id: str):
 
 
 def clear_human_anchor_on_stop(instance_id: str) -> None:
-    """Defensively clear AUQ human-time anchors when a Stop hook fires."""
+    """Defensively clear AUQ human-time anchors when a Stop hook fires.
+
+    API-first: POST the write door, fall back to direct sqlite on any HTTP
+    failure (this box keeps the fallback until rung 3).
+    """
+    try:
+        _post_hook_write_door("/api/hooks/clear-human-anchor", instance_id)
+        print(
+            f"[info] Human anchor cleared for {instance_id[:8]} via API",
+            file=sys.stderr,
+        )
+        return
+    except Exception as api_err:
+        print(
+            f"[info] Clearing human anchor via direct sqlite fallback (api: {api_err})",
+            file=sys.stderr,
+        )
     try:
         with contextlib.closing(sqlite3.connect(str(DB_PATH))) as con, con:
             try:

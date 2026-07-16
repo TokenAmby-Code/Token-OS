@@ -459,6 +459,10 @@ class HookPruneRequest(BaseModel):
     event: str = "stop"
 
 
+class HookInstanceWriteRequest(BaseModel):
+    instance_id: str
+
+
 # ============ Hook Handler State ============
 # Debouncing for PostToolUse to avoid excessive API calls
 _post_tool_debounce: dict = {}  # session_id -> last_call_time
@@ -7362,6 +7366,69 @@ async def prune_hook_subscriptions(request: HookPruneRequest) -> dict:
         return await _prune_dangling_stop_subscriptions(
             db, confirm=request.confirm, event=request.event
         )
+
+
+# Stop-hook write doors (k12 registry rung 2 / R6). Same mutations the stop
+# hook's direct-sqlite path performs, routed through the async
+# instance_mutation layer so the field allowlist/forbidden-field guard applies
+# and the mutation log attributes the door (actor "...:api"). Registered
+# before the /api/hooks/{action_type} catch-all — Starlette matches in
+# registration order.
+
+
+@router.post("/api/hooks/instance-stopped")
+async def hook_instance_stopped(request: HookInstanceWriteRequest) -> dict:
+    """Write door for stop_hook.mark_cron_instance_stopped."""
+    instance_id = (request.instance_id or "").strip()
+    if not instance_id:
+        raise HTTPException(status_code=400, detail="instance_id required")
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
+        try:
+            await update_instance(
+                db,
+                instance_id=instance_id,
+                updates={
+                    "status": "stopped",
+                    "golden_throne": None,
+                    "input_lock": None,
+                    "stopped_at": datetime.now().isoformat(),
+                },
+                mutation_type="instance_stopped",
+                write_source="stop_hook",
+                actor="stop-hook:api",
+                where_clause="id = ? AND status != 'stopped'",
+                where_params=(instance_id,),
+            )
+        except LookupError as e:
+            action = "not_found" if "not found" in str(e).lower() else "already_stopped"
+            return {"success": True, "action": action, "rows": 0}
+        await db.commit()
+    return {"success": True, "action": "stopped", "rows": 1}
+
+
+@router.post("/api/hooks/clear-human-anchor")
+async def hook_clear_human_anchor(request: HookInstanceWriteRequest) -> dict:
+    """Write door for stop_hook.clear_human_anchor_on_stop."""
+    instance_id = (request.instance_id or "").strip()
+    if not instance_id:
+        raise HTTPException(status_code=400, detail="instance_id required")
+    async with connect_agents_db(DB_PATH, timeout=5.0) as db:
+        try:
+            await update_instance(
+                db,
+                instance_id=instance_id,
+                updates={
+                    "human_anchored_at": None,
+                    "human_anchor_source": None,
+                },
+                mutation_type="instance_updated",
+                write_source="stop_hook",
+                actor="stop-hook:clear-human-anchor:api",
+            )
+        except LookupError:
+            return {"success": True, "action": "not_found", "rows": 0}
+        await db.commit()
+    return {"success": True, "action": "cleared", "rows": 1}
 
 
 # Hook dispatcher endpoint
