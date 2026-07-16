@@ -3577,7 +3577,6 @@ def _h_pane_live(control, params):
         public_pane = requested_pane if not requested_pane.startswith("%") else physical_pane
     return {
         "pane_id": public_pane,
-        "physical_pane_id": physical_pane,
         "pane_pid": tui.pane_pid,
         "agent_pid": tui.agent_pid,
         "agent_command": tui.agent_command,
