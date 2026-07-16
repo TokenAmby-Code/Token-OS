@@ -54,15 +54,14 @@ nas-grep -F "literal text" /mnt/imperium/Vault --max-results 50
 nas-grep --dry-run "pattern" /Volumes/Imperium
 ```
 
-### Shared agent skills (`skills-sync`)
+### Shared agent skills and commands
 
-`skills-sync --check` verifies that the canonical skills in the Token-Fleet checkout (`${TOKEN_FLEET_CHECKOUT:-~/runtimes/Token-Fleet/live}/shared/skills`) are visible to Claude and Codex and resolve to the same real paths. `skills-sync --install` repairs symlinks only: it keeps `~/.codex/skills/.system` intact and exposes shared skills under both `~/.agents/skills` and `~/.codex/skills`.
-
-```bash
-skills-sync --check
-skills-sync --install
-skills-sync --check --json
-```
+Skill and command surfaces are single whole-directory symlinks into the
+Token-Fleet checkout (`~/.claude/skills`, `~/.claude/commands`,
+`~/.codex/skills` → `shared/skills` / `shared/commands`), created and
+enforced by Token-Fleet's `shared/bin/agent-surfaces-converge` during
+`fleet-converge`. The check is `readlink` equals the canonical path; there
+is no per-skill link management in Token-OS.
 
 ### Live agent pane prompt delivery (`agent-cmd`)
 

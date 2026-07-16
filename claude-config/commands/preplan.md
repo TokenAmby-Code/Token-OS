@@ -1,1 +1,0 @@
-../skills/preplan/SKILL.md
