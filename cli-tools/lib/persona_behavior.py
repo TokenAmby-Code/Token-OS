@@ -80,14 +80,14 @@ def _existing_candidates(root: Path, components: Iterable[str]) -> list[Path]:
 
 def _imperium_root() -> Path:
     base = os.environ.get("IMPERIUM")
-    if base and (Path(base) / "Imperium-ENV").is_dir():
+    if base:
         return Path(base) / "Imperium-ENV"
     return Path("/Volumes/Imperium/Imperium-ENV")
 
 
 def _pax_root() -> Path:
     base = os.environ.get("CIVIC")
-    if base and (Path(base) / "Pax-ENV").is_dir():
+    if base:
         return Path(base) / "Pax-ENV"
     return Path("/Volumes/Civic/Pax-ENV")
 
