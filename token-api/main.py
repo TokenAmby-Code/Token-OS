@@ -22545,6 +22545,10 @@ def _ops_normalize_tmux_payload(
     result = payload.get("result", payload)
     if surface == "ledger" and isinstance(result, dict) and isinstance(result.get("rows"), list):
         return result["rows"]
+    if surface == "freelist" and isinstance(result, dict) and isinstance(result.get("free"), list):
+        # /freelist now returns {"free": [...], "faulted": [...]}; occupancy only
+        # needs the free pool (faulted seats already surface as ledger cells).
+        return result["free"]
     return result
 
 

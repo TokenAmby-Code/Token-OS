@@ -513,6 +513,7 @@ class TmuxControlPlane:
 
         scrubbed: list[str] = []
         live_divergences: list[dict[str, str]] = []
+        faulted: list[dict[str, str]] = []
         for pane in scan_ledger_dispatch_availability(self.adapter):
             # chrome = f(bind), but only when the bind truth is trustworthy.  A
             # live TUI with no active bind is split-brain, not free residue; do
@@ -520,6 +521,21 @@ class TmuxControlPlane:
             # liveness/bind-repair lane can reconcile it.  Report it loudly so
             # callers can route the divergence instead of mistaking it for a
             # clean free slot.
+            if pane.faulted:
+                # A seat whose own occupancy lookup faulted has UNKNOWN state: its
+                # synthetic empty instance_id/live_agent are fault sentinels, not a
+                # trusted "unbound + agent-free" reading.  Never scrub its chrome
+                # (that would erase an operator surface on a guess) — report it and
+                # move on so the fault stays visible without a destructive side effect.
+                faulted.append(
+                    {
+                        "pane": pane.pane_id,
+                        "pane_label": pane.pane_role or "",
+                        "reason": "occupancy_lookup_faulted",
+                        "fault_reason": pane.fault_reason,
+                    }
+                )
+                continue
             if pane.singleton or pane.instance_id:
                 continue
             if pane.live_agent:
@@ -553,6 +569,8 @@ class TmuxControlPlane:
         out["chrome_scrubbed_unbound_count"] = len(scrubbed)
         out["chrome_unbound_live_divergences"] = live_divergences
         out["chrome_unbound_live_divergence_count"] = len(live_divergences)
+        out["occupancy_faulted_panes"] = faulted
+        out["occupancy_faulted_count"] = len(faulted)
         return out
 
     def freelist(self) -> list[dict]:
@@ -569,6 +587,41 @@ class TmuxControlPlane:
             }
             for p in list_free_panes(self.adapter)
         ]
+
+    def freelist_pool(self) -> dict:
+        """Partition the live pool into dispatch-free panes and faulted seats.
+
+        A single global occupancy scan; each seat is either dispatch-available
+        (``free``) or one whose own wrapper-ledger occupancy lookup faulted
+        (``faulted`` — e.g. a seat whose engine was swapped and left an
+        ambiguous/inconsistent ledger row). Per-pane fault isolation keeps a
+        faulted seat OUT of the free list while surfacing it loudly, instead of
+        one bad row failing the whole scan and blinding the pool. Occupied seats
+        (live agents, singletons, boot-grace panes) are simply absent from both.
+        """
+        from .occupancy import scan_ledger_dispatch_availability
+
+        free: list[dict] = []
+        faulted: list[dict] = []
+        for entry in scan_ledger_dispatch_availability(self.adapter):
+            if entry.faulted:
+                faulted.append(
+                    {
+                        "pane_id": entry.pane_id,
+                        "pane_role": entry.pane_role or "",
+                        "window_name": entry.window_name,
+                        "fault_reason": entry.fault_reason,
+                    }
+                )
+            elif entry.dispatch_available:
+                free.append(
+                    {
+                        "pane_id": entry.pane_id,
+                        "pane_role": entry.pane_role or "",
+                        "window_name": entry.window_name,
+                    }
+                )
+        return {"free": free, "faulted": faulted}
 
     def cardinal_pane_label(self, target: str) -> str:
         """Resolve a target to its stable cardinal @PANE_ID label.
