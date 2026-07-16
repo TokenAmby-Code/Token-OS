@@ -313,7 +313,7 @@ runtime_invariant_preflight() {
 }
 
 if [[ "${IMPERIUM_TMUX_RAW:-}" != "1" ]] && is_launch_command "$@"; then
-    exec "$_TX_BIN" start
+    exec "$_TX_BIN"
 fi
 
 if [[ $# -gt 0 && "${IMPERIUM_TMUX_RAW:-}" == "1" ]]; then

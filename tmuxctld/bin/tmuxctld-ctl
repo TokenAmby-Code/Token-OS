@@ -87,10 +87,8 @@ cmd_attach() {
       || die "tmuxctld create failed on ${DAEMON_URL}/create"
   fi
 
-  # This is the sanctioned human-attach path. The public tmux shim deliberately
-  # routes raw human attach/new invocations into the tx tombstone. Keep that
-  # guard intact: only this daemon-owned control surface performs the raw attach
-  # on the operator's behalf.
+  # This is the daemon-owned attach primitive used by the human `tx` autopilot.
+  # Only this control surface performs raw tmux attach on the operator's behalf.
   env IMPERIUM_TMUX_RAW=1 tmux has-session -t "$session" 2>/dev/null \
     || die "tmux session not found: ${session}"
   exec env IMPERIUM_TMUX_RAW=1 tmux attach-session -t "$session"
