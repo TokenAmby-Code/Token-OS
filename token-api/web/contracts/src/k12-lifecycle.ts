@@ -191,6 +191,8 @@ export const CurrentBindingSchema = z.object({
   wrapper_id: z.string().nullable(),
   instance_id: z.string().nullable(),
   persona: z.string().nullable(),
+  rank: z.string().nullable(),
+  commander: z.string().nullable(),
   tint: z.string().nullable(),
   // The bound-event seq the binding resolved against — receipts and drains
   // resolve against this exact seq (stale-target-at-drain unrepresentable).
@@ -213,6 +215,8 @@ export const ActivityBoardRowSchema = z.object({
   activity: ActivityStateSchema,
   queue_depth: z.number().int(), // projection column, NOT an axis
   persona: z.string().nullable(),
+  rank: z.string().nullable(),
+  commander: z.string().nullable(),
   tint: z.string().nullable(),
 });
 export type ActivityBoardRow = z.infer<typeof ActivityBoardRowSchema>;
