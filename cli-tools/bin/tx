@@ -217,15 +217,15 @@ _tx_is_agent_context() {
 _tx_vault_mount_path() {
     if [[ -n "${TX_NAS_WAIT_PATH:-}" ]]; then
         printf '%s\n' "$TX_NAS_WAIT_PATH"
-    elif [[ -n "${IMPERIUM:-}" ]]; then
-        printf '%s/Imperium-ENV\n' "${IMPERIUM%/}"
+    else
+        printf '%s\n' "${TOKEN_FLEET_CHECKOUT:-$HOME/runtimes/Token-Fleet/live}"
     fi
 }
 
 _tx_vault_mounted() {
     local vault_path="${1:-}"
     [[ -n "$vault_path" ]] || return 0
-    [[ -d "$vault_path" && -d "$vault_path/Personas" && -d "$vault_path/Terra" ]]
+    [[ -d "$vault_path" && -d "$vault_path/shared/personas" ]]
 }
 
 _tx_wait_for_vault_mount() {
@@ -247,19 +247,19 @@ _tx_wait_for_vault_mount() {
         return 1
     fi
     waited=0
-    log_warn "Imperium vault is not mounted at ${vault_path}; waiting before tmux workspace build."
+    log_warn "Token-Fleet checkout is not ready at ${vault_path}; waiting before tmux workspace build."
 
     while [[ "$waited" -lt "$timeout" ]]; do
         sleep "$interval" 2>/dev/null || sleep 2
         waited=$((waited + interval))
         if _tx_vault_mounted "$vault_path"; then
-            log_success "Imperium vault mounted at ${vault_path}"
+            log_success "Token-Fleet checkout ready at ${vault_path}"
             return 0
         fi
     done
 
-    log_error "Imperium vault is still unavailable at ${vault_path}; refusing to build a ghost-town tmux workspace."
-    log_error "Mount the NAS and rerun tx, or set TX_NAS_WAIT_DISABLE=1 only for an intentional degraded shell-only start."
+    log_error "Token-Fleet checkout is still unavailable at ${vault_path}; refusing to build a ghost-town tmux workspace."
+    log_error "Provision Token-Fleet and rerun tx, or set TX_NAS_WAIT_DISABLE=1 only for an intentional degraded shell-only start."
     return 1
 }
 

@@ -64,6 +64,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "mini",
         "device_name": "Mac-Mini",
         "token_os_runtime": "~/runtimes/Token-OS/live",
+        "token_fleet_runtime": "~/runtimes/Token-Fleet/live",
     },
     "wsl": {
         "nas_imperium": "/mnt/imperium",
@@ -74,6 +75,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "wsl",
         "device_name": "TokenPC",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
+        "token_fleet_runtime": "/home/token/runtimes/Token-Fleet/live",
     },
     "phone": {
         "nas_imperium": "",
@@ -84,6 +86,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "phone",
         "device_name": "Token-S24",
         "token_os_runtime": "",
+        "token_fleet_runtime": "",
     },
     "linux": {
         "nas_imperium": "/mnt/imperium",
@@ -94,6 +97,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "",
         "device_name": "",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
+        "token_fleet_runtime": "/home/token/runtimes/Token-Fleet/live",
     },
     # K12 personal (GMKtec K12; Imperium domain — replaces the Mac Mini). Runs
     # its OWN local Token-API (per-box registry pre-cutover) and is the long-term
@@ -108,6 +112,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "k12-personal",
         "device_name": "K12-Personal",
         "token_os_runtime": "~/runtimes/Token-OS/live",
+        "token_fleet_runtime": "~/runtimes/Token-Fleet/live",
     },
     # K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE).
     # Present in the Imperium registry only to be nameable for routing/enforcement
@@ -122,6 +127,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "k12-work",
         "device_name": "K12-Work",
         "token_os_runtime": "",
+        "token_fleet_runtime": "",
     },
 }
 
@@ -192,6 +198,9 @@ def _runtime_checkout() -> str:
 
 TOKEN_OS = _runtime_checkout()
 CLI_TOOLS = f"{TOKEN_OS}/cli-tools"
+TOKEN_FLEET_CHECKOUT = os.path.expanduser(
+    os.environ.get("TOKEN_FLEET_CHECKOUT") or cfg("token_fleet_runtime")
+)
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL") or cfg("token_api_url")
 TMUXCTLD_URL = os.environ.get("TMUXCTLD_URL") or cfg("tmuxctld_url")
 RUNTIME_DATABASE_DIR = os.path.expanduser(

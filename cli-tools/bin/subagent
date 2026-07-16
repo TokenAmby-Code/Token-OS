@@ -4,7 +4,7 @@
 # AUDIENCE: deprecated
 set -euo pipefail
 case "subagent" in
-  inquisitor) replacement='dispatch --target mechanicus:new --prompt "Read $IMPERIUM/Imperium-ENV/Personas/Inquisitor.md first. <task>"' ;;
+  inquisitor) replacement='dispatch --target mechanicus:new --prompt "Read ${TOKEN_FLEET_CHECKOUT:-$HOME/runtimes/Token-Fleet/live}/shared/personas/Inquisitor.md first. <task>"' ;;
   subagent) replacement='dispatch --target mechanicus:new --prompt <task>' ;;
 esac
 echo "subagent has been retired. Use: $replacement" >&2
