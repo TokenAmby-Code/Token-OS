@@ -36,6 +36,7 @@ import db_schema  # noqa: E402
 db_schema.init_database_sync(_DB)
 
 import stop_hook  # noqa: E402
+from instance_mutation import insert_instance_sync  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -49,12 +50,16 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def _seed_instance(instance_id: str, **overrides) -> None:
-    fields = {"id": instance_id, "device_id": "test-box", "status": "working"}
-    fields.update(overrides)
-    cols = ", ".join(fields)
-    marks = ", ".join("?" for _ in fields)
+    values = {"id": instance_id, "device_id": "test-box", "status": "working"}
+    values.update(overrides)
     conn = sqlite3.connect(_DB)
-    conn.execute(f"INSERT INTO instances ({cols}) VALUES ({marks})", tuple(fields.values()))
+    insert_instance_sync(
+        conn,
+        values=values,
+        mutation_type="instance_registered",
+        write_source="test",
+        actor="rung3-test-seed",
+    )
     conn.commit()
     conn.close()
 

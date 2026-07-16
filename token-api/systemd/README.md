@@ -17,7 +17,7 @@ Captured verbatim from the live k12-personal install (rung 3, 2026-07-16).
 cp token-api/systemd/token-api.socket token-api/systemd/token-api@.service ~/.config/systemd/user/
 loginctl enable-linger "$USER"        # non-negotiable on a headless box (§5)
 systemctl --user daemon-reload
-systemctl --user enable --now token-api.socket token-api@live.service
+systemctl --user enable --now token-api.socket   # template unit has no [Install]; the socket activates token-api@live on demand
 ```
 
 Deploys never re-install units by default — `box-restart` restarts the units

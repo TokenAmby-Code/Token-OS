@@ -132,7 +132,7 @@ def _post_hook_write_door(path: str, instance_id: str) -> dict:
     raise last_err
 
 
-def mark_cron_instance_stopped(instance_id: str):
+def mark_cron_instance_stopped(instance_id: str) -> None:
     """Explicitly mark a cron instance as stopped in agents.db.
 
     The stop hook fires during Claude Code teardown. The Token API may or may

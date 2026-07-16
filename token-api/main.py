@@ -2194,6 +2194,7 @@ async def _drain_hook_outbox_once() -> None:
     if not outbox.exists():
         logger.warning(f"Hook outbox drainer not found at {outbox} — skipping recovery drain")
         return
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             str(outbox),
@@ -2205,9 +2206,20 @@ async def _drain_hook_outbox_once() -> None:
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
         summary = (stdout or b"").decode().strip() or (stderr or b"").decode().strip()
-        print(f"Hook outbox recovery drain: rc={proc.returncode} {summary}")
+        logger.info(f"Hook outbox recovery drain: rc={proc.returncode} {summary}")
+    except asyncio.CancelledError:
+        # Lifespan teardown cancelled us — never leave a stray drain child.
+        _kill_subprocess(proc)
+        raise
     except Exception as exc:
+        _kill_subprocess(proc)
         logger.warning(f"Hook outbox recovery drain failed: {exc}")
+
+
+def _kill_subprocess(proc: asyncio.subprocess.Process | None) -> None:
+    if proc is not None and proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
 
 
 # Lifespan context manager
@@ -2396,7 +2408,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # recovery edge. One-shot, not a poll. Rows are idempotency-keyed and the
     # write doors carry where-guards, so a double drain (watchdog + startup) is
     # a no-op.
-    asyncio.create_task(_drain_hook_outbox_once())
+    outbox_drain_task = asyncio.create_task(_drain_hook_outbox_once())
     print("Durable hook outbox recovery drain scheduled")
     await run_overdue_tasks()
     yield
@@ -2413,6 +2425,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     save_restart_state()
 
     # Shutdown
+    if not outbox_drain_task.done():
+        outbox_drain_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await outbox_drain_task
     if _tts_mod.tts_worker_task:
         _tts_mod.tts_worker_task.cancel()
         try:
