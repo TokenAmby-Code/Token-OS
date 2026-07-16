@@ -828,7 +828,7 @@ cmd_mechanicus() {
             fi
 
             # Parse optional flags from remaining args (already shifted once)
-            local label="" working_dir="/Volumes/Imperium/Imperium-ENV"
+            local label="" working_dir="${IMPERIUM_VAULT:-$HOME/vaults/Imperium-ENV}"
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --label) label="$2"; shift 2 ;;

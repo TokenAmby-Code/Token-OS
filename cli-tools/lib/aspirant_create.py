@@ -30,11 +30,8 @@ def eprint(*args: object) -> None:
 
 
 def vault_root() -> Path:
-    imperium = os.environ.get("IMPERIUM")
-    if imperium:
-        return Path(imperium) / "Imperium-ENV"
-    # Fallback for local mac level-1 testing. Production shells should source nas-path.sh.
-    return Path("/Volumes/Imperium/Imperium-ENV")
+    """Return the sanctioned machine-local Imperium vault, never a NAS path."""
+    return Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
 
 
 def imperium_env_vault_root() -> str:
