@@ -183,17 +183,23 @@ def _gh_slug(repo: str) -> str:
     return _DEFAULT_GH_SLUG
 
 
-def merged_prs(repo: str, base_date: str) -> list[dict]:
-    """PRs merged into ``main`` on/after ``base_date`` (newest first)."""
+def merged_prs_result(repo: str, base_date: str) -> tuple[list[dict], str | None]:
+    """Return merged PRs plus a diagnostic when GitHub supplied no usable data.
+
+    Callers must not mistake an unavailable or empty GitHub query for successful
+    attribution.  The list-only ``merged_prs`` wrapper remains for consumers
+    that do not need to surface that distinction.
+    """
     if not base_date:
         base_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    slug = _gh_slug(repo)
     proc = _run(
         [
             "gh",
             "pr",
             "list",
             "--repo",
-            _gh_slug(repo),
+            slug,
             "--base",
             "main",
             "--state",
@@ -208,13 +214,21 @@ def merged_prs(repo: str, base_date: str) -> list[dict]:
         repo,
     )
     if proc.returncode != 0:
-        return []
+        detail = proc.stderr.strip() or "no stderr"
+        return [], f"gh pr list --repo {slug} exited {proc.returncode}: {detail}"
     try:
         prs = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError:
-        return []
+        return [], "gh pr list returned invalid JSON"
+    if not prs:
+        return [], f"gh pr list --repo {slug} returned 0 merged PR rows"
     prs.sort(key=lambda p: p.get("mergedAt") or "", reverse=True)
-    return prs
+    return prs, None
+
+
+def merged_prs(repo: str, base_date: str) -> list[dict]:
+    """PRs merged into ``main`` on/after ``base_date`` (newest first)."""
+    return merged_prs_result(repo, base_date)[0]
 
 
 def open_prs(repo: str) -> list[dict]:

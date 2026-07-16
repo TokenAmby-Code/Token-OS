@@ -22,7 +22,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from cli_tools.daily_build import git_activity as git  # noqa: E402
 from cli_tools.daily_build import review_generator as gen  # noqa: E402
-from cli_tools.daily_build.cli import _date_arg, _is_code_repo, _window_too_wide  # noqa: E402
+from cli_tools.daily_build.cli import (  # noqa: E402
+    _date_arg,
+    _github_attribution_zero_warning,
+    _is_code_repo,
+    _window_too_wide,
+)
 
 FAILURES: list[str] = []
 
@@ -336,6 +341,39 @@ def test_gh_slug_resolution_and_repo_flag() -> None:
             os.environ["GH_REPO"] = orig_env
 
 
+def test_gh_zero_rows_carries_diagnostic() -> None:
+    """A zero-row GitHub response must be distinguishable from successful data."""
+    orig_run = git._run
+
+    def fake_run(args: list[str], cwd: str, **kw: object) -> subprocess.CompletedProcess:
+        if args[:3] == ["git", "remote", "get-url"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+
+    try:
+        git._run = fake_run  # type: ignore[assignment]
+        rows, diagnostic = git.merged_prs_result("/repo", "2026-07-14")
+        check("gh zero rows: empty result", rows == [], str(rows))
+        check(
+            "gh zero rows: diagnostic names attribution query",
+            diagnostic == "gh pr list --repo TokenAmby-Code/Token-OS returned 0 merged PR rows",
+            str(diagnostic),
+        )
+    finally:
+        git._run = orig_run  # type: ignore[assignment]
+
+
+def test_expected_gh_zero_rows_warns_loudly() -> None:
+    warning = _github_attribution_zero_warning(
+        [("abc", "fix: runtime attribution (#730)", 730)],
+        [],
+        "gh pr list --repo TokenAmby-Code/Token-OS returned 0 merged PR rows",
+    )
+    check("gh zero rows: CLI warning emitted", warning is not None, str(warning))
+    check("gh zero rows: warning declares attribution=0", "attribution=0" in (warning or ""))
+    check("gh zero rows: warning includes cause", "returned 0 merged PR rows" in (warning or ""))
+
+
 def main() -> int:
     for test in (
         test_git_truth_survives_gh_outage,
@@ -350,6 +388,8 @@ def main() -> int:
         test_date_arg_validation,
         test_is_ancestor_gates_divergent_anchor,
         test_gh_slug_resolution_and_repo_flag,
+        test_gh_zero_rows_carries_diagnostic,
+        test_expected_gh_zero_rows_warns_loudly,
     ):
         print(f"— {test.__name__}")
         try:
