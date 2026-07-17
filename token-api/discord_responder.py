@@ -39,7 +39,7 @@ result = subprocess.run(
     ],
     capture_output=True,
     text=True,
-    timeout=300 if "sonnet" in model or "opus" in model else 120,
+    timeout=300 if "sonnet" in model or "opus" in model else 300,
     env={**os.environ, "CLAUDECODE": ""},
 )
 

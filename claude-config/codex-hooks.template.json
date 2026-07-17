@@ -53,7 +53,7 @@
           {
             "type": "command",
             "command": "HOOK_AGENT=codex bash ${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/cli-tools/scripts/post-tool-format.sh",
-            "timeout": 15,
+            "timeout": 120,
             "statusMessage": "Formatting touched Python files"
           },
           {

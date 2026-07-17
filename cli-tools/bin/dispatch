@@ -2428,11 +2428,11 @@ dispatch_launch_observe_timeout() {
   # load (2-4 panes, MCP init, worktree first-shell hooks) cold start routinely
   # exceeds the old shorter windows. Override with DISPATCH_LAUNCH_OBSERVE_TIMEOUT; 0 disables the
   # observer entirely (the dispatcher trusts the send and returns immediately).
-  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-120}"
+  local value="${DISPATCH_LAUNCH_OBSERVE_TIMEOUT:-300}"
   if [[ "$value" =~ ^[0-9]+$ ]]; then
     printf '%s' "$value"
   else
-    printf '%s' "120"
+    printf '%s' "300"
   fi
 }
 
@@ -2614,9 +2614,6 @@ reconcile_dispatch_registry_bind() {
         return 0
       fi
     fi
-  fi
-  if [[ "$emit_error" == "1" ]]; then
-    warn "${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration slow/reconciliation lag; treating live pane as successful launch"
   fi
   return 1
 }
@@ -2807,15 +2804,9 @@ dispatch_observe_wait_for_launch() {
       err "launch failed: the ${ENGINE} agent appeared in ${target_display} but exited before registry binding completed"
       return 1
     fi
-    local registry_bound=1
-    if ! reconcile_dispatch_registry_bind "$pane" "$target_display" 0; then
-      registry_bound=0
-    fi
+    reconcile_dispatch_registry_bind "$pane" "$target_display" 0 || true
     if ! k12_proxy_dispatch; then
       ensure_dispatch_wrapper_ledger "$pane" "$target_display" || return 1
-    fi
-    if [[ "$registry_bound" == "0" ]]; then
-      warn "${ENGINE} agent is live at ${target_display}, but its instances row did not bind within the observation window; registration slow/reconciliation lag; treating live pane as successful launch"
     fi
     return 0
   fi

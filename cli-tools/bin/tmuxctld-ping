@@ -98,7 +98,7 @@ case "${METHOD} ${PATH_PART}" in
         MAX_TIME="${TMUXCTLD_MAX_TIME:-$(tmuxctld_send_client_timeout)}"
         ;;
     *)
-        MAX_TIME="${TMUXCTLD_MAX_TIME:-3}"
+        MAX_TIME="${TMUXCTLD_MAX_TIME:-30}"
         ;;
 esac
 if [[ "$METHOD" == "POST" && "$PATH_PART" == "/typing-guard-state" ]]; then
@@ -108,7 +108,7 @@ if [[ "$METHOD" == "POST" && "$PATH_PART" == "/typing-guard-state" ]]; then
             # Keep it off the generic hook/scrape ping budget so transient tmux
             # command-socket contention from longer send-text requests does not
             # fail-open by timing out before the daemon can arm the guard.
-            MAX_TIME="${TMUXCTLD_ARM_MAX_TIME:-10}"
+            MAX_TIME="${TMUXCTLD_ARM_MAX_TIME:-30}"
             break
         fi
     done

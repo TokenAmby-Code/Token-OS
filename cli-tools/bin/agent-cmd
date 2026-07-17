@@ -155,7 +155,7 @@ send_command() {
 
     if [[ -n "${INSTANCE_ID:-}" ]]; then
         for _ in {1..20}; do
-            lock_resp=$(curl -s --connect-timeout 1 --max-time 2 \
+            lock_resp=$(curl -s --connect-timeout 1 --max-time 10 \
                 -X POST "$API_URL/api/instances/$INSTANCE_ID/input-lock?locker=$locker" 2>/dev/null || true)
             if echo "$lock_resp" | grep -q '"acquired": *true'; then
                 locked=true
@@ -182,7 +182,7 @@ body = {
     "text": text,
     "submit": not no_submit,
     "verify": not no_submit,
-    "verify_timeout": 6.0,
+    "verify_timeout": 30.0,
 }
 req = urllib.request.Request(
     url.rstrip("/") + "/send-text",
@@ -191,7 +191,7 @@ req = urllib.request.Request(
     method="POST",
 )
 try:
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with urllib.request.urlopen(req, timeout=90) as resp:
         payload = json.loads(resp.read().decode("utf-8") or "{}")
 except urllib.error.HTTPError as exc:  # daemon answered with a transport error
     sys.stderr.write(f"tmuxctld http error: {exc}\n")

@@ -75,7 +75,7 @@ import json, sys
 print(json.dumps({"cmd": "status", "pane": sys.argv[1]}, separators=(",", ":")))
 PY
 )" || return 1
-    curl -fsS --connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "${TMUXCTLD_MAX_TIME:-3}" \
+    curl -fsS --connect-timeout "${TMUXCTLD_CONNECT_TIMEOUT:-1}" --max-time "${TMUXCTLD_MAX_TIME:-10}" \
         -H 'Content-Type: application/json' \
         -d "$body" \
         "${url%/}/typing-guard-state" 2>/dev/null |

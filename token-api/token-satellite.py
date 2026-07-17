@@ -2088,7 +2088,7 @@ def _dispatch_resume_into_pane(
         ],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=300,
         env=env,
     )
 
@@ -2720,7 +2720,7 @@ def _resolve_instance_pane(session_id: str) -> tuple[str | None, str | None]:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=30,
             env={
                 **os.environ,
                 "PYTHONPATH": f"{tmuxctld_lib}{os.pathsep}{cli_lib}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",

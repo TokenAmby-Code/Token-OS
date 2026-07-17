@@ -445,7 +445,7 @@ def profile_by_name(profile_name: str | None) -> dict | None:
 DESKTOP_CONFIG = {
     "host": "100.66.10.74",  # WSL Tailscale IP
     "port": 7777,
-    "timeout": 5,
+    "timeout": 30,
 }
 
 # TTS backend routing state (WSL-first with Mac fallback)
@@ -1098,7 +1098,7 @@ def is_phone_reachable() -> bool:
 PHONE_CONFIG = {
     "host": "100.102.92.24",
     "port": 7777,
-    "timeout": 5,
+    "timeout": 30,
     # === TEST SHIM - REMOVE AFTER TESTING ===
     # Set to True to bypass break time check and force blocking
     "test_force_block": False,
