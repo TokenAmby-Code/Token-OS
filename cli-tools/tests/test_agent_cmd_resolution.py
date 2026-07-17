@@ -21,7 +21,7 @@ class ResolveHandler(BaseHTTPRequestHandler):
         ("instance_id", INSTANCE_ID): "%21",
     }
 
-    def do_GET(self):  # noqa: N802 - stdlib handler API
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         result = ""
@@ -42,24 +42,24 @@ class ResolveHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *_args):
+    def log_message(self, *_args: object) -> None:
         pass
 
 
 class AgentCmdResolutionTest(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), ResolveHandler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.env = os.environ | {"TMUXCTLD_URL": f"http://127.0.0.1:{cls.server.server_port}"}
 
     @classmethod
-    def tearDownClass(cls):
+    def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.server.server_close()
 
-    def resolve(self, *args):
+    def resolve(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(AGENT_CMD), "--resolve-only", *args],
             env=self.env,
@@ -68,22 +68,22 @@ class AgentCmdResolutionTest(unittest.TestCase):
             check=False,
         )
 
-    def test_page_cardinal_label_resolves(self):
+    def test_page_cardinal_label_resolves(self) -> None:
         result = self.resolve("--pane", "palace:E")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "%21")
 
-    def test_numeric_page_label_resolves(self):
+    def test_numeric_page_label_resolves(self) -> None:
         result = self.resolve("--pane", "2:NE")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "%34")
 
-    def test_instance_resolves_through_same_ledger(self):
+    def test_instance_resolves_through_same_ledger(self) -> None:
         result = self.resolve("--instance", INSTANCE_ID)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "%21")
 
-    def test_absent_label_fails_closed(self):
+    def test_absent_label_fails_closed(self) -> None:
         result = self.resolve("--pane", "missing:seat")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pane target not found: missing:seat", result.stderr)
