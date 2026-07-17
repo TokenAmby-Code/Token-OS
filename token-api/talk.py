@@ -368,7 +368,7 @@ async def _resolve_agent_for_pane(pane_id: str) -> str | None:
         shared._tmuxctld_get_value,
         "/resolve-agent",
         {"pane": pane_id, "agent": "auto", "default": "auto"},
-        timeout=3,
+        timeout=10,
         default_loopback=True,
     )
     engine = str(result or "").strip().lower()

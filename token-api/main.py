@@ -2194,7 +2194,7 @@ async def _drain_hook_outbox_once() -> None:
     (under socket activation the requests would queue anyway; the grace
     covers dev runs that bind the port after startup).
     """
-    await asyncio.sleep(3)
+    await asyncio.sleep(30)
     outbox = (
         Path(__file__).resolve().parent.parent
         / "cli-tools"
@@ -8155,7 +8155,7 @@ async def _get_or_create_mechanicus_pane() -> str:
         shared._tmuxctld_post_json,
         "/stack/add",
         {"base": "mechanicus", "session": "main", "cwd": str(Path.home())},
-        timeout=10,
+        timeout=30,
         default_loopback=True,
     )
     if not isinstance(envelope, dict) or not envelope.get("ok"):
@@ -8214,7 +8214,7 @@ async def _dispatch_resume_into_pane(
         env=env,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
     except TimeoutError:
         # Don't leak the dispatch child: if it survives the timeout it could
         # resume the agent in the background while this path records a failure,
@@ -9813,7 +9813,7 @@ async def _assert_and_send_custodes(prompt: str, *, source: str) -> dict:
             shared._tmuxctld_post_json,
             "/assert-instance",
             {"pane": "council:custodes"},
-            timeout=45,
+            timeout=120,
             default_loopback=True,
         )
         if not isinstance(envelope, dict):
@@ -13358,7 +13358,7 @@ async def _pane_live_agent_engine(tmux_pane: str | None) -> str | None:
         shared._tmuxctld_get_value,
         "/resolve-agent",
         {"pane": pane, "agent": "auto", "default": "auto"},
-        timeout=3,
+        timeout=10,
         default_loopback=True,
     )
     engine = str(result or "").strip().lower()
@@ -13639,7 +13639,7 @@ async def talk_send(request: TalkSendRequest):
 @app.get("/api/talk/await/{talk_id}")
 async def talk_await(talk_id: str, timeout: float = 30.0):
     """Long-poll for a talk pair result. ``timeout`` capped server-side."""
-    timeout = max(1.0, min(float(timeout or 30.0), 120.0))
+    timeout = max(1.0, min(float(timeout or 30.0), 600.0))
     record = await talk_service.await_talk(talk_id, timeout=timeout)
     if record is None:
         raise HTTPException(status_code=404, detail=f"talk_id not found: {talk_id}")
@@ -27566,7 +27566,7 @@ async def launch_aspirant_session(
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
         if proc.returncode != 0:
             err_text = (
                 stderr.decode("utf-8", errors="replace").strip()
