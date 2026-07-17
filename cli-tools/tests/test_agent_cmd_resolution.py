@@ -8,6 +8,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import parse_qs, urlparse
 
 AGENT_CMD = Path(__file__).parents[1] / "bin" / "agent-cmd"
@@ -30,7 +31,7 @@ class ResolveHandler(BaseHTTPRequestHandler):
                 if key in query:
                     result = self.mappings.get((key, query[key][0]), "")
                     break
-        payload = {"ok": bool(result)}
+        payload: dict[str, object] = {"ok": bool(result)}
         if result:
             payload["result"] = result
         else:
@@ -47,6 +48,10 @@ class ResolveHandler(BaseHTTPRequestHandler):
 
 
 class AgentCmdResolutionTest(unittest.TestCase):
+    server: ClassVar[ThreadingHTTPServer]
+    thread: ClassVar[threading.Thread]
+    env: ClassVar[dict[str, str]]
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), ResolveHandler)
