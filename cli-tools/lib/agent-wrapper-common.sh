@@ -43,7 +43,7 @@ normalize_pane_to_canonical() {
     return 0
   fi
   if command -v curl >/dev/null 2>&1; then
-    resolved="$(curl -sfG --max-time 1 \
+    resolved="$(curl -sfG --max-time 5 \
       --data-urlencode "target=$pane" \
       --data-urlencode "format=id" \
       "${TMUXCTLD_URL:-http://127.0.0.1:7778}/resolve-pane" 2>/dev/null \

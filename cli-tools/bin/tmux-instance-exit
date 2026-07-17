@@ -91,7 +91,7 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-if curl -sf --max-time 8 -X POST "${TMUXCTLD_URL%/}/close" \
+if curl -sf --max-time 30 -X POST "${TMUXCTLD_URL%/}/close" \
     -H 'Content-Type: application/json' -d "$body" >/dev/null; then
     tmux display-message "tmux-instance-exit: $LIFECYCLE executed" 2>/dev/null || true
     echo "CLOSE_CONTRACT_OK lifecycle=$LIFECYCLE instance=$INSTANCE_ID pane=$PANE"

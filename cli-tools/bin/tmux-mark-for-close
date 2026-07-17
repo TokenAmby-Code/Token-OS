@@ -78,7 +78,7 @@ api, path, body = sys.argv[1], sys.argv[2], sys.argv[3]
 url = api.rstrip('/') + path
 req = urllib.request.Request(url, data=body.encode(), method='POST', headers={'Content-Type': 'application/json'})
 try:
-    with urllib.request.urlopen(req, timeout=8) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         text = resp.read().decode()
         if resp.status >= 300:
             raise SystemExit(text)
@@ -116,7 +116,7 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    curl -sf --max-time 8 -X POST "${TMUXCTLD_URL%/}/send-text" \
+    curl -sf --max-time 75 -X POST "${TMUXCTLD_URL%/}/send-text" \
         -H 'Content-Type: application/json' -d "$body" >/dev/null || rc=$?
     return "$rc"
 }
