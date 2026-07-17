@@ -83,10 +83,36 @@ resolve_pane() {
         printf '%s\n' "$target"
         return 0
     fi
-    if ! "${_BIN_DIR}/tmux-resolve-pane" --format physical "$target" 2>/dev/null; then
+    if ! tmuxctld_resolve physical target "$target"; then
         printf 'agent-cmd: pane target not found: %s\n' "$target" >&2
         return 1
     fi
+}
+
+tmuxctld_resolve() {
+    local format="$1" key="$2" value="$3"
+    python3 - "$TMUXCTLD_URL" "$format" "$key" "$value" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+base_url, fmt, key, value = sys.argv[1:]
+query = urllib.parse.urlencode({key: value, "format": fmt})
+try:
+    with urllib.request.urlopen(
+        base_url.rstrip("/") + "/resolve-pane?" + query, timeout=10
+    ) as response:
+        payload = json.loads(response.read().decode("utf-8") or "{}")
+except (OSError, ValueError, urllib.error.URLError):
+    raise SystemExit(1)
+
+result = payload.get("result") if isinstance(payload, dict) and payload.get("ok") is True else None
+if not isinstance(result, str) or not result:
+    raise SystemExit(1)
+print(result)
+PY
 }
 
 payload_hash() {
@@ -127,10 +153,7 @@ case "$TARGET_MODE" in
         ;;
     instance)
         INSTANCE_ID="$TARGET_VALUE"
-        INSTANCE_DATA=$(curl -s --connect-timeout 2 "$API_URL/api/instances/$TARGET_VALUE" 2>/dev/null || true)
-        PANE=$(echo "$INSTANCE_DATA" | jq -r '.tmux_pane // empty' 2>/dev/null || true)
-        INSTANCE_PID=$(echo "$INSTANCE_DATA" | jq -r '.pid // empty' 2>/dev/null || true)
-        [[ -z "$PANE" && -n "$INSTANCE_PID" ]] && PANE=$(find_tmux_pane "$INSTANCE_PID" || true)
+        PANE=$(tmuxctld_resolve physical instance_id "$TARGET_VALUE" || true)
         [[ -z "$PANE" ]] && { echo "Error: Could not find pane for instance '$TARGET_VALUE'." >&2; exit 1; }
         ;;
 esac
