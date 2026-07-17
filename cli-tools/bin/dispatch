@@ -137,6 +137,7 @@ ASPIRANT_SOURCE="dispatch"
 SESSION_DOC=""
 PROMPT=""
 PROMPT_FILE=""
+LAUNCH_PROMPT_FILE=""
 SYSTEM_PROMPT=""
 SYSTEM_PROMPT_FILE=""
 SYSTEM_PROMPT_INLINE_USED=false
@@ -2054,6 +2055,21 @@ fi
 # persona — the systemic singleton-decapitation channel. The caller-pane-identity
 # guard above (TMUX_PANE/INSTANCE_ID/PARENT/PERSONA) missed this one leak channel.
 WRAPPER_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+# Normalize every dispatch prompt into a launcher-owned file. The staged command
+# may carry this path, but prompt bytes must never be serialized into its argv:
+# frontmatter briefs begin with `---`, which engine CLI parsers treat as flags.
+if [[ -n "$PROMPT" ]]; then
+  LAUNCH_PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/dispatch-prompt.XXXXXX")"
+  chmod 0600 "$LAUNCH_PROMPT_FILE"
+  printf '%s' "$PROMPT" >"$LAUNCH_PROMPT_FILE"
+fi
+LAUNCH_PROMPT_HANDED_OFF=false
+cleanup_dispatch_prompt_file() {
+  if [[ -n "$LAUNCH_PROMPT_FILE" && "$LAUNCH_PROMPT_HANDED_OFF" != true ]]; then
+    rm -f -- "$LAUNCH_PROMPT_FILE" 2>/dev/null || true
+  fi
+}
+trap cleanup_dispatch_prompt_file EXIT
 COMMON_ENV=(
   "TOKEN_API_LAUNCHER=dispatch"
   "TOKEN_API_ENGINE=${ENGINE}"
@@ -2075,6 +2091,7 @@ COMMON_ENV=(
   "TOKEN_API_DISPATCH_WITH_DESKTOP=${WITH_DESKTOP}"
   "TOKEN_API_DISPATCH_MCP_LIST=${WITH_MCP}"
 )
+[[ -n "$LAUNCH_PROMPT_FILE" ]] && COMMON_ENV+=("TOKEN_API_DISPATCH_PROMPT_FILE=${LAUNCH_PROMPT_FILE}")
 if $DISPATCH_SELF; then
   COMMON_ENV+=("TOKEN_API_TRANSPLANT_EXPECTED=true")
 fi
@@ -2195,20 +2212,16 @@ build_agent_command() {
     if [[ "$ENGINE" == "codex" ]]; then
       cmd=("${SCRIPT_DIR}/../scripts/agent-wrapper.sh" codex)
       envs+=("TOKEN_API_CODEX_RESUME_ID=${RESUME_ID}")
-      [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
     else
       cmd=("${SCRIPT_DIR}/../scripts/agent-wrapper.sh" claude --dangerously-skip-permissions)
       [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
       cmd+=(--resume "$RESUME_ID")
       [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
-      # Forward an initial prompt into the resumed interactive session (e.g. a
-      # Golden Throne follow-up SOP). Codex resume already forwards PROMPT above;
-      # without this, `dispatch --id <id> --prompt-file <sop>` silently dropped it.
-      [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
+      # The wrapper consumes TOKEN_API_DISPATCH_PROMPT_FILE for both fresh and
+      # resumed sessions; prompt bytes never join this command array.
     fi
   elif [[ "$ENGINE" == "codex" ]]; then
     cmd=("${SCRIPT_DIR}/../scripts/agent-wrapper.sh" codex)
-    [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   else
     cmd=("${SCRIPT_DIR}/../scripts/agent-wrapper.sh" claude --dangerously-skip-permissions)
     [[ -n "$CLAUDE_MODEL" ]] && cmd+=(--model "$CLAUDE_MODEL")
@@ -2236,7 +2249,6 @@ build_agent_command() {
     else
       [[ -n "$SYSTEM_PROMPT" ]] && cmd+=(--append-system-prompt "$SYSTEM_PROMPT")
     fi
-    [[ -n "$PROMPT" ]] && cmd+=("$PROMPT")
   fi
   printf 'cd %q && env' "$WORK_DIR"
   local scrub_var alt_scrub_var
@@ -2365,17 +2377,17 @@ def _emit(prefix: str) -> None:
 
 if delivery == "failed":
     engine = os.environ.get("DISPATCH_ENGINE", "")
-    # Codex dispatch delivers the initial task prompt via argv inside the staged
-    # launcher, not by submitting into an already-running TUI composer. A composer
+    # Codex dispatch delivers the initial task through the staged launcher's
+    # prompt-file reference, not by submitting into an already-running TUI composer. A composer
     # scrape can therefore be the wrong probe for codex launch success. Do not
     # suppress verification: return success here only so the caller's launch
-    # observer can verify the right signal (argv launch actually produced a live
-    # codex process). If that process never appears, confirm_dispatch_launch_live()
+    # observer can verify the right signal (the staged file-reference launch
+    # produced a live codex process). If that process never appears, confirm_dispatch_launch_live()
     # still fails the dispatch.
     if engine == "codex":
         _emit(
             (advisory or "composer scrape reported submit failure")
-            + "; codex launch delivery will be verified by argv launch + live process"
+            + "; codex launch delivery will be verified by staged launch + live process"
         )
         raise SystemExit(0)
     _emit(advisory or "submit did not clear the composer; message NOT delivered")
@@ -2413,7 +2425,12 @@ stage_agent_command() {
   {
     printf '%s\n' '#!/usr/bin/env bash'
     printf '%s\n' 'set -euo pipefail'
-    printf 'trap %q EXIT\n' "rm -f $stage"
+    local cleanup
+    printf -v cleanup 'rm -f -- %q' "$stage"
+    if [[ -n "$LAUNCH_PROMPT_FILE" ]]; then
+      printf -v cleanup '%s %q' "$cleanup" "$LAUNCH_PROMPT_FILE"
+    fi
+    printf 'trap %q EXIT\n' "$cleanup"
     printf '%s\n' "$cmd"
   } >"$stage"
   chmod 0700 "$stage"
@@ -2900,7 +2917,7 @@ build_dispatch_command() {
   [[ -n "$WITH_MCP" ]] && args+=(--with-mcp "$WITH_MCP")
   [[ -n "$DISCORD_CHANNEL" ]] && args+=(--discord "$DISCORD_CHANNEL")
   [[ -n "$SYSTEM_PROMPT" ]] && args+=(--system-prompt "$SYSTEM_PROMPT")
-  [[ -n "$PROMPT" ]] && args+=(--prompt "$PROMPT")
+  [[ -n "$LAUNCH_PROMPT_FILE" ]] && args+=(--prompt-file "$LAUNCH_PROMPT_FILE")
   for a in "${args[@]}"; do printf '%q ' "$a"; done
 }
 
@@ -2988,6 +3005,7 @@ if [[ "$LAUNCH_MODE" == "tmux_stack_new" ]]; then
   stamp_resume_instance_id "$pane_id"
   FINAL_COMMAND="$(LC_ALL=C; build_agent_command)"
   sleep 0.3
+  LAUNCH_PROMPT_HANDED_OFF=true
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   phys_pane="$(materialize_physical_pane "$pane_id")"
   clear_pane_wrapper_launch_id "$phys_pane"
@@ -3018,6 +3036,7 @@ if [[ "$LAUNCH_MODE" == "tmux_target" && -n "$TARGET" ]]; then
   stamp_resume_instance_id "$PHYSICAL_TARGET"
   dispatch_send_text_via_tmuxctld "$RESOLVED_TARGET" "clear" || exit $?
   sleep 0.2
+  LAUNCH_PROMPT_HANDED_OFF=true
   STAGED_COMMAND="$(stage_agent_command "$FINAL_COMMAND")"
   clear_pane_wrapper_launch_id "$PHYSICAL_TARGET"
   dispatch_send_text_via_tmuxctld "$RESOLVED_TARGET" "$STAGED_COMMAND" || exit $?
