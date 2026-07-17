@@ -23,7 +23,7 @@ import aiosqlite
 
 logger = logging.getLogger("token_api")
 
-BUSY_TIMEOUT_MS = int(os.environ.get("TOKEN_API_SQLITE_BUSY_TIMEOUT_MS", "5000"))
+BUSY_TIMEOUT_MS = int(os.environ.get("TOKEN_API_SQLITE_BUSY_TIMEOUT_MS", "30000"))
 BUSY_TIMEOUT_SECONDS = max(BUSY_TIMEOUT_MS / 1000.0, 0.001)
 
 RUNTIME_DATABASE_DIR = Path(
