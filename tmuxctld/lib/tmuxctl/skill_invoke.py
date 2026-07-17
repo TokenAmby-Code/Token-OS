@@ -16,6 +16,12 @@ SkillSinkKeys = tuple[str, ...]
 # instead of being re-derived in bash per call.
 INVOCATION_KINDS = ("skill", "command")
 ETHEREAL_COMMANDS = {"claude": "btw", "codex": "side"}
+EPHEMERAL_CHANNEL_DISABLED_ERROR = "ephemeral channel disabled by decree"
+
+
+def reject_ephemeral_channel() -> None:
+    """Fail every ephemeral entrypoint until a future decree revives it."""
+    raise ValueError(EPHEMERAL_CHANNEL_DISABLED_ERROR)
 
 
 def normalize_invocation_kind(kind: str | None) -> str:
@@ -83,6 +89,7 @@ def ethereal_invocation_text(agent: str | None, message: str) -> str:
     ``/side``.  Unknown engines fail closed rather than polluting the main
     conversation with a bare message.
     """
+    reject_ephemeral_channel()
     resolved_agent = normalize_agent(agent)
     command = ETHEREAL_COMMANDS.get(resolved_agent)
     if not command:

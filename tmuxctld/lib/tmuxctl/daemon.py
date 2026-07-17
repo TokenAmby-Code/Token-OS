@@ -60,6 +60,7 @@ from .skill_invoke import (
     invocation_sink_keys,
     invocation_text,
     normalize_invocation_kind,
+    reject_ephemeral_channel,
     resolve_agent_for_pane,
 )
 from .tmux_adapter import (
@@ -2938,6 +2939,7 @@ def _resolve_target_pane(control, params) -> tuple[str, str]:
 
 
 def _h_send_ethereal(control, params):
+    reject_ephemeral_channel()
     pane, instance_id = _resolve_target_pane(control, params)
     requested_agent = _s(params, "agent", "auto")
     resolved_agent = resolve_agent_for_pane(control.adapter, pane, requested_agent, default="auto")
@@ -4575,7 +4577,7 @@ ROUTES: dict[tuple[str, str], RouteHandler] = {
     ),
     ("POST", "/ethereal-prompt"): _keybind_anchor(
         "/ethereal-prompt",
-        "active-pane /btw capture and codex /side flow need a dedicated safe daemon primitive",
+        "ephemeral channel disabled by decree",
     ),
     ("POST", "/tts/listen"): _keybind_anchor(
         "/tts/listen",

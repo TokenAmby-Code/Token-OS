@@ -690,6 +690,7 @@ async def send_ethereal_to_pane(
     clear_prompt: bool = False,
 ) -> dict:
     """Send a semantic side-channel message; tmuxctld renders /btw or /side."""
+    temp_message_service.reject_ephemeral_channel()
     body = {
         "pane": tmux_pane,
         "kind": "ethereal",
@@ -972,6 +973,14 @@ class BriefSendRequest(BaseModel):
     payload: str = Field(..., min_length=1)
     ephemeral: bool = False
     idempotency_key: str | None = None
+
+
+def _reject_ephemeral_channel_http() -> None:
+    """Expose the decree as a terminal API error, never a silent no-op."""
+    raise HTTPException(
+        status_code=410,
+        detail=temp_message_service.EPHEMERAL_CHANNEL_DISABLED_ERROR,
+    )
 
 
 class ProfileResponse(BaseModel):
@@ -6071,6 +6080,25 @@ async def process_pane_write_queue_once(
     results: list[dict] = []
     for row in rows:
         item = dict(row)
+        if str(item.get("purpose") or "") == "ethereal":
+            result = {
+                "queue_id": item["id"],
+                "instance_id": item["instance_id"],
+                "tmux_pane": item["tmux_pane"],
+                "stored_pane": item["tmux_pane"],
+                "source": item["source"],
+                "purpose": item["purpose"],
+                "status": PANE_WRITE_FAILED,
+                "error": temp_message_service.EPHEMERAL_CHANNEL_DISABLED_ERROR,
+            }
+            result = await _mark_pane_write_best_effort(
+                item["id"],
+                status=PANE_WRITE_FAILED,
+                result=result,
+                error=temp_message_service.EPHEMERAL_CHANNEL_DISABLED_ERROR,
+            )
+            results.append(result)
+            continue
         delivered_pending = _PANE_WRITE_DELIVERED_BOOKKEEPING_PENDING.get(item["id"])
         if delivered_pending is not None:
             retry_result = {
@@ -13629,6 +13657,8 @@ async def talk_cancel(talk_id: str):
 @app.post("/api/brief/send")
 async def brief_send(request: BriefSendRequest):
     """Fire-and-forget delivery to one or more panes/pages with dedup."""
+    if request.ephemeral:
+        _reject_ephemeral_channel_http()
     if not request.panes and not request.pages:
         raise HTTPException(status_code=400, detail="at least one --pane or --page required")
 
@@ -13824,6 +13854,8 @@ async def orchestrator_temp_message(request: TempMessageRequest):
     Set ``dry_run=true`` to evaluate selectors and return preview receipts without
     enqueueing or sending any text to tmux.
     """
+    _reject_ephemeral_channel_http()
+
     poll_id = request.idempotency_key or str(uuid.uuid4())
     try:
         receipts = await temp_message_service.broadcast_temp_message(

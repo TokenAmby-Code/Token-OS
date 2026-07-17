@@ -9,7 +9,7 @@ Usage:
     brief --pane <id> --pane <id2> "..."      # multiple panes (deduped)
     brief --page <name|index|all> "..."       # whole page/window
     brief --pane <id> --page palace "..."     # mixed (deduped across)
-    brief --ephemeral --pane <id> "..."       # side-channel (/btw or /side)
+    brief --ephemeral --pane <id> "..."       # disabled by decree; exits nonzero
     brief --json --pane <id> "..."            # machine-readable JSON
 
 Pane addressing accepts public ids (``somnium:SE``) or full triples
@@ -41,6 +41,7 @@ from tmuxctld_timeouts import SEND_CLIENT_TIMEOUT_SECONDS  # noqa: E402
 
 TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")
 TMUXCTLD_URL = os.environ.get("TMUXCTLD_URL", "http://127.0.0.1:8765")
+EPHEMERAL_CHANNEL_DISABLED_ERROR = "ephemeral channel disabled by decree"
 
 
 def _err(msg: str) -> None:
@@ -113,7 +114,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--ephemeral",
         action="store_true",
-        help="Use the side-channel (/btw or /side) — no context burn on target",
+        help="Disabled by decree; fails without contacting Token-API or tmux",
     )
     parser.add_argument(
         "--caller",
@@ -134,6 +135,22 @@ def main(argv: list[str]) -> int:
     parser.add_argument("message", help="The message body")
     args = parser.parse_args(argv)
 
+    if args.ephemeral:
+        if args.json_out:
+            print(
+                json.dumps(
+                    {
+                        "status": "disabled",
+                        "error": EPHEMERAL_CHANNEL_DISABLED_ERROR,
+                        "delivered": 0,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            _err(EPHEMERAL_CHANNEL_DISABLED_ERROR)
+        return 1
     if not args.pane and not args.page:
         parser.error("at least one --pane or --page is required")
 
