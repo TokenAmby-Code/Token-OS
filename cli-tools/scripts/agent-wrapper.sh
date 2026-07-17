@@ -82,6 +82,9 @@ wrapper_cleanup() {
   set +e
   wrapper_mode_cleanup
   token_wrapper_end "$exit_code"
+  if [[ -n "${TOKEN_API_DISPATCH_PROMPT_FILE:-}" ]]; then
+    rm -f -- "$TOKEN_API_DISPATCH_PROMPT_FILE" 2>/dev/null || true
+  fi
   exit "$exit_code"
 }
 
@@ -301,6 +304,13 @@ run_claude() {
     final_append="${final_append:+$final_append$'\n\n'}$caller_append"
   fi
   [[ -n "$final_append" ]] && claude_argv+=(--append-system-prompt "$final_append")
+  if [[ -n "${TOKEN_API_DISPATCH_PROMPT_FILE:-}" ]]; then
+    [[ -f "$TOKEN_API_DISPATCH_PROMPT_FILE" ]] || {
+      echo "dispatch prompt file not found: $TOKEN_API_DISPATCH_PROMPT_FILE" >&2
+      exit 66
+    }
+    claude_argv+=(-- "Read and follow the complete task brief in $TOKEN_API_DISPATCH_PROMPT_FILE")
+  fi
 
   run_engine_binary claude ${claude_argv[@]+"${claude_argv[@]}"} 2> >(grep -v 'Overriding existing handler for signal' >&2)
 }
@@ -409,6 +419,13 @@ run_codex() {
   bridge_dir="${HOME}/.codex/session-bridges"
   working_dir="${TOKEN_API_TARGET_WORKING_DIR:-$WORKING_DIR}"
   prompt="$*"
+  if [[ -n "${TOKEN_API_DISPATCH_PROMPT_FILE:-}" ]]; then
+    [[ -f "$TOKEN_API_DISPATCH_PROMPT_FILE" ]] || {
+      echo "dispatch prompt file not found: $TOKEN_API_DISPATCH_PROMPT_FILE" >&2
+      exit 66
+    }
+    prompt="Read and follow the complete task brief in $TOKEN_API_DISPATCH_PROMPT_FILE"
+  fi
   resume_id="${TOKEN_API_CODEX_RESUME_ID:-${TOKEN_API_RESUME_INSTANCE_ID:-}}"
 
   mkdir -p "$bridge_dir" 2>/dev/null || true
@@ -460,7 +477,8 @@ run_codex() {
     codex_args=(exec)
     [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_args+=(--profile "$TOKEN_API_CODEX_PROFILE")
     codex_args+=("${native_compact_args[@]}")
-    codex_args+=("$augmented_prompt" -C "$working_dir" "$bypass_flag" --json -o "$output_file")
+    codex_args+=(-C "$working_dir" "$bypass_flag" --json -o "$output_file")
+    [[ -n "$augmented_prompt" ]] && codex_args+=(-- "$augmented_prompt")
     run_engine_binary codex "${codex_args[@]}"
     status=$?
   elif [[ -n "$resume_id" ]]; then
@@ -468,15 +486,15 @@ run_codex() {
     [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_args+=(--profile "$TOKEN_API_CODEX_PROFILE")
     codex_args+=("${native_compact_args[@]}")
     codex_args+=("$resume_id")
-    [[ -n "$prompt" ]] && codex_args+=("$prompt")
+    [[ -n "$prompt" ]] && codex_args+=(-- "$prompt")
     run_engine_binary codex "${codex_args[@]}"
     status=$?
   elif [[ "${TOKEN_API_INTERNAL_DISPATCH:-0}" == "1" || "$LAUNCHER" == "dispatch" ]]; then
     codex_args=()
     [[ -n "${TOKEN_API_CODEX_PROFILE:-}" ]] && codex_args+=(--profile "$TOKEN_API_CODEX_PROFILE")
     codex_args+=("${native_compact_args[@]}")
-    [[ -n "$augmented_prompt" ]] && codex_args+=("$augmented_prompt")
     codex_args+=(-C "$working_dir" "$bypass_flag")
+    [[ -n "$augmented_prompt" ]] && codex_args+=(-- "$augmented_prompt")
     run_engine_binary codex "${codex_args[@]}"
     status=$?
   else
