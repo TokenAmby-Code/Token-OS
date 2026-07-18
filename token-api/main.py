@@ -555,6 +555,8 @@ async def send_prompt_to_pane(
         "queued": bool(result.get("queued")),
         "deferred": bool(result.get("deferred")),
         "reason": result.get("reason") or result.get("gate_reason"),
+        "error": result.get("error"),
+        "gate_reason": result.get("gate_reason"),
         "queue_id": result.get("queue_id"),
         "verification_status": result.get("verification_status") or "unverified",
         "verified_by": result.get("verified_by"),
@@ -5740,9 +5742,13 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     if send_result.get("returncode") != 0:
         return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
     if send_result.get("delivered") is False:
-        return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get(
-            "error"
-        ) or "not_delivered"
+        return PANE_WRITE_FAILED, (
+            send_result.get("reason")
+            or send_result.get("gate_reason")
+            or send_result.get("stderr")
+            or send_result.get("error")
+            or "daemon_not_delivered_without_reason"
+        )
     if verification in {"submitted", "pending", "not_requested", "likely", "unverified"}:
         return PANE_WRITE_SENT, None
     return (
@@ -6272,7 +6278,9 @@ async def process_pane_write_queue_once(
                 "status": terminal_status,
                 **send_result,
             }
-            if terminal_error and "reason" not in result:
+            if terminal_error and not (
+                result.get("reason") or result.get("error") or result.get("stderr")
+            ):
                 result["reason"] = terminal_error
             if hook_effect_error:
                 result["hook_effect_error"] = hook_effect_error
@@ -13461,7 +13469,7 @@ async def _direct_tmux_pane_delivery(
         "status": terminal_status,
         **send_result,
     }
-    if terminal_error and "reason" not in result:
+    if terminal_error and not (result.get("reason") or result.get("error") or result.get("stderr")):
         result["reason"] = terminal_error
     return result
 
