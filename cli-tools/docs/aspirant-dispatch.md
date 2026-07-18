@@ -170,7 +170,7 @@ dispatch \
   --aspirant-kind dispatch \
   --engine claude \
   --persona aspirant \
-  --dir /Volumes/Imperium/Imperium-ENV \
+  --dir "$IMPERIUM_VAULT" \
   --target legion:new \
   --victory-condition "Aspirant reads note/session doc and writes trials output back to the note" \
   "VALIDATION: CLI dispatch aspirant full-session launch. Read this note and session doc, append a short Implantation and Trials section, and stop at the dispatch boundary."
@@ -210,7 +210,7 @@ dispatch \
   --intake-only \
   --engine claude \
   --persona aspirant \
-  --dir /Volumes/Imperium/Imperium-ENV \
+  --dir "$IMPERIUM_VAULT" \
   --target legion:new \
   --victory-condition "No pane should launch" \
   "VALIDATION: intake-only dispatch aspirant should create note and session doc only."
@@ -285,4 +285,4 @@ Then inspect the aspirant note frontmatter and the linked session doc before cha
 
 ## Questions gate
 
-Aspirant session docs use the generic Golden Throne questions gate: when `questions: []` is present, each entry must reach `state: closed` before the first StopValidate pass is allowed. See `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Golden Throne Protocol.md` for hook behavior and `/Volumes/Imperium/Imperium-ENV/Aspirants/test.md` Design Decisions D1–D4 for schema and predicate context.
+Aspirant session docs use the generic Golden Throne questions gate: when `questions: []` is present, each entry must reach `state: closed` before the first StopValidate pass is allowed. See `$IMPERIUM_VAULT/Terra/Ultramar/Golden Throne Protocol.md` for hook behavior and `$IMPERIUM_VAULT/Aspirants/test.md` Design Decisions D1–D4 for schema and predicate context.

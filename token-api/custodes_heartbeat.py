@@ -628,7 +628,8 @@ def check_morning_greeting(metrics: dict) -> str | None:
 
 def log_to_daily_note(summary: str):
     today = datetime.date.today().isoformat()
-    note_path = f"/Volumes/Imperium/Imperium-ENV/Terra/Journal/Daily/{today}.md"
+    vault = Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
+    note_path = vault / "Terra" / "Journal" / "Daily" / f"{today}.md"
     timestamp = datetime.datetime.now().strftime("%H:%M")
     line = f"\n- [{timestamp}] Custodes heartbeat: {summary} — ROUTINE\n"
     try:

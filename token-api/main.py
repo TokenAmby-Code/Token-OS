@@ -10196,8 +10196,8 @@ ADMINISTRATUM_LOG_REL_DIR = Path("Ultramar") / "Logs" / "Mars"
 def _administratum_vault_root() -> Path:
     """Return the vault root for the deterministic Administratum state-hook log.
 
-    Tests set IMPERIUM_ENV to a temp vault; production falls back to the legacy
-    module-level OBSIDIAN_VAULT_PATH rooted at /Volumes/Imperium/Imperium-ENV.
+    Tests set IMPERIUM_ENV to a temp vault; production falls back to the
+    module-level OBSIDIAN_VAULT_PATH (env-resolved via IMPERIUM_VAULT).
     """
     env_root = os.environ.get("IMPERIUM_ENV")
     return Path(env_root) if env_root else OBSIDIAN_VAULT_PATH
@@ -13006,7 +13006,7 @@ _KNOWN_VAULTS = ("Imperium-ENV", "Pax-ENV", "Civic-ENV")
 def _derive_vault_and_relative(file_path: str) -> tuple[str, str]:
     """Split an absolute session-doc path into (vault_name, vault_relative_path).
 
-    file_path may be stored as absolute (/Volumes/Imperium/Imperium-ENV/Terra/…)
+    file_path may be stored as absolute (<vault-root>/Terra/…)
     or as vault-relative (Terra/Sessions/…). Writers vary by machine; readers
     need a normalized form for the obsidian:// URI and the obsidian CLI.
     """
@@ -14010,11 +14010,8 @@ def reset_idle_timer():
     timer_engine.set_productivity(True, now_ms)
 
 
-# Paths for Obsidian vault — NAS mount preferred, home fallback
-_imperium_root = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
-if not _imperium_root.exists():
-    _imperium_root = Path.home()
-OBSIDIAN_VAULT_PATH = _imperium_root / "Imperium-ENV"
+# Paths for Obsidian vault — env-resolved (IMPERIUM_ENV for tests, IMPERIUM_VAULT in production)
+OBSIDIAN_VAULT_PATH = shared._vault_root()  # noqa: SLF001 - shared owns lazy vault resolution.
 OBSIDIAN_DAILY_PATH = OBSIDIAN_VAULT_PATH / "Terra" / "Journal" / "Daily"
 OBSIDIAN_INBOX_PATH = OBSIDIAN_VAULT_PATH / "Aspirants"
 
@@ -14215,7 +14212,7 @@ async def trigger_checkin(checkin_type: str) -> dict:
     }
 
 
-DAILY_NOTE_DIR = Path("/Volumes/Imperium/Imperium-ENV/Terra/Journal/Daily")
+DAILY_NOTE_DIR = OBSIDIAN_DAILY_PATH
 
 
 def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:

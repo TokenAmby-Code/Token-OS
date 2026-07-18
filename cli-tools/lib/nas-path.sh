@@ -97,9 +97,9 @@ _IMPERIUM_CFG_mac_device_name="Mac-Mini"
 _IMPERIUM_CFG_mac_shell="zsh"
 _IMPERIUM_CFG_mac_token_os_runtime="$HOME/runtimes/Token-OS/live"
 _IMPERIUM_CFG_mac_token_fleet_runtime="$HOME/runtimes/Token-Fleet/live"
-_IMPERIUM_CFG_mac_vaults_root="$HOME/vaults"
-_IMPERIUM_CFG_mac_vault_root="$HOME/vaults/Imperium-ENV"
-_IMPERIUM_CFG_mac_vault_logs_root="$HOME/vaults/Imperium-Logs"
+_IMPERIUM_CFG_mac_vaults_root="$HOME/Documents"
+_IMPERIUM_CFG_mac_vault_root="$HOME/Documents/Imperium-ENV"
+_IMPERIUM_CFG_mac_vault_logs_root="$HOME/Documents/Imperium-Logs"
 
 # --- WSL (Ubuntu on Windows PC) ---
 _IMPERIUM_CFG_wsl_nas_imperium="/mnt/imperium"

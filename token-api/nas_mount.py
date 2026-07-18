@@ -18,7 +18,7 @@ NAS_SHARES = {
 # Probe file that must exist and be readable to confirm the mount is live
 # (not just a stale ghost directory)
 _PROBE_FILES = {
-    "/Volumes/Imperium": "/Volumes/Imperium/Imperium-ENV",
+    "/Volumes/Imperium": "/Volumes/Imperium/runtimes",
     "/Volumes/Civic": "/Volumes/Civic/Pax-ENV",
 }
 
