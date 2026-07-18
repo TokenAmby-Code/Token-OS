@@ -249,6 +249,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Civic is a logical legion on the shared mechanicus floor, not a property of
+# the shorthand itself. A later explicit target override wins completely.
+if [[ -n "$DISPATCH_LEGION" && "$TARGET" != mechanicus:* ]]; then
+  DISPATCH_LEGION=""
+fi
+
 dispatch_origin_is_human_surface() {
   local origin="${TOKEN_API_DISPATCH_ORIGIN:-${DISPATCH_ORIGIN:-}}"
   case "$origin" in
@@ -2554,6 +2560,8 @@ except Exception:
     sys.exit(1)
 if not isinstance(row, dict) or not (row.get("id") or row.get("instance_id")):
     sys.exit(1)
+if str(row.get("status") or "").lower() in {"stopped", "archived"}:
+    sys.exit(1)
 expected_workdir = os.environ.get("EXPECTED_WORKDIR", "")
 if not os.environ.get("RESUME_ID_VALUE") and expected_workdir and row.get("working_dir") != expected_workdir:
     sys.exit(1)
@@ -2590,6 +2598,18 @@ if value:
 PYREGAPI
 }
 
+db_backing_mount_available() {
+  local relative volume
+  case "$DB_PATH" in
+    /Volumes/*)
+      relative="${DB_PATH#/Volumes/}"
+      volume="/Volumes/${relative%%/*}"
+      ;;
+    *) return 0 ;;
+  esac
+  [[ -d "$volume" ]] && mount | grep -F " on $volume " >/dev/null 2>&1
+}
+
 registry_instance_id_for_wrapper_launch_id_sqlite() {
   local wrapper_id="$1"
   [[ -n "$wrapper_id" && -f "$DB_PATH" ]] || return 0
@@ -2615,6 +2635,10 @@ reconcile_dispatch_registry_bind() {
   local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir wrapper_id
   if ! command -v sqlite3 >/dev/null 2>&1; then
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because sqlite3 is unavailable"
+    return 1
+  fi
+  if ! db_backing_mount_available; then
+    [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because the DB volume is unavailable for $DB_PATH"
     return 1
   fi
   if [[ ! -f "$DB_PATH" ]]; then
