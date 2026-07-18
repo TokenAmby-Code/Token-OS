@@ -62,7 +62,7 @@ Usage:
   The optional leading word is target shorthand:
     dispatch legion ...       ≡  dispatch --target mechanicus:new ...
     dispatch mechanicus ...   ≡  dispatch --target mechanicus:new ...
-    dispatch civic ...        ≡  dispatch --target civic:new ...
+    dispatch civic ...        ≡  civic worker via shared mechanicus:new stack ...
     dispatch palace ...       ≡  dispatch --target palace:new ...
     dispatch somnium ...      ≡  dispatch --target somnium:new ...
 
@@ -142,6 +142,7 @@ SYSTEM_PROMPT=""
 SYSTEM_PROMPT_FILE=""
 SYSTEM_PROMPT_INLINE_USED=false
 TARGET=""
+DISPATCH_LEGION=""
 GT_MODE=false
 ZEALOTRY=""
 SYNC=false
@@ -174,7 +175,14 @@ case "${1:-}" in
     TARGET="mechanicus:new"
     shift
     ;;
-  civic|palace|somnium)
+  civic)
+    # The dedicated civic stack is retired. Civic workers share the physical
+    # mechanicus floor and remain logically Civic through the launch legion.
+    TARGET="mechanicus:new"
+    DISPATCH_LEGION="civic"
+    shift
+    ;;
+  palace|somnium)
     TARGET="$1:new"
     shift
     ;;
@@ -240,6 +248,12 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Civic is a logical legion on the shared mechanicus floor, not a property of
+# the shorthand itself. A later explicit target override wins completely.
+if [[ -n "$DISPATCH_LEGION" && "$TARGET" != "mechanicus:new" ]]; then
+  DISPATCH_LEGION=""
+fi
 
 dispatch_origin_is_human_surface() {
   local origin="${TOKEN_API_DISPATCH_ORIGIN:-${DISPATCH_ORIGIN:-}}"
@@ -2014,7 +2028,7 @@ fi
 # assigns a fresh worker (astartes) identity. Automated custodes launches still bind
 # correctly: they target the `council:custodes` slot, handled by the DISPATCH_SLOT case
 # below.
-LEGION=""
+LEGION="$DISPATCH_LEGION"
 if [[ -z "$LEGION" && -n "$PERSONA" ]]; then
   case "$(printf '%s' "$PERSONA" | tr '[:upper:]' '[:lower:]')" in
     custodes) LEGION="custodes" ;;
@@ -2546,6 +2560,8 @@ except Exception:
     sys.exit(1)
 if not isinstance(row, dict) or not (row.get("id") or row.get("instance_id")):
     sys.exit(1)
+if str(row.get("status") or "").lower() in {"stopped", "archived"}:
+    sys.exit(1)
 expected_workdir = os.environ.get("EXPECTED_WORKDIR", "")
 if not os.environ.get("RESUME_ID_VALUE") and expected_workdir and row.get("working_dir") != expected_workdir:
     sys.exit(1)
@@ -2582,6 +2598,18 @@ if value:
 PYREGAPI
 }
 
+db_backing_mount_available() {
+  local relative volume
+  case "$DB_PATH" in
+    /Volumes/*)
+      relative="${DB_PATH#/Volumes/}"
+      volume="/Volumes/${relative%%/*}"
+      ;;
+    *) return 0 ;;
+  esac
+  [[ -d "$volume" ]] && mount | grep -F " on $volume " >/dev/null 2>&1
+}
+
 registry_instance_id_for_wrapper_launch_id_sqlite() {
   local wrapper_id="$1"
   [[ -n "$wrapper_id" && -f "$DB_PATH" ]] || return 0
@@ -2604,9 +2632,13 @@ reconcile_dispatch_registry_bind() {
   # Registry binding is a control-plane signal, but pane liveness is the launch
   # oracle. This helper answers only whether the row is already bound; callers
   # must not convert a live-pane row lag into launch failure.
-  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir row_label wrapper_id
+  local pane="$1" target_display="$2" emit_error="${3:-1}" instance_id row status row_workdir wrapper_id
   if ! command -v sqlite3 >/dev/null 2>&1; then
     [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because sqlite3 is unavailable"
+    return 1
+  fi
+  if ! db_backing_mount_available; then
+    [[ "$emit_error" == "1" ]] && err "launch failed: cannot verify registry binding because the DB volume is unavailable for $DB_PATH"
     return 1
   fi
   if [[ ! -f "$DB_PATH" ]]; then
@@ -2621,10 +2653,10 @@ reconcile_dispatch_registry_bind() {
   [[ -n "$instance_id" ]] || instance_id="$(pane_instance_id "$pane")"
   if [[ -n "$instance_id" ]]; then
     row="$(sqlite3 -separator $'\t' "$DB_PATH" \
-      "SELECT COALESCE(status,''), COALESCE(working_dir,''), COALESCE(pane_label,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
+      "SELECT COALESCE(status,''), COALESCE(working_dir,'') FROM instances WHERE id = '$(printf "%s" "$instance_id" | sed "s/'/''/g")' LIMIT 1;" \
       2>/dev/null || true)"
     if [[ -n "$row" ]]; then
-      IFS=$'\t' read -r status row_workdir row_label <<< "$row"
+      IFS=$'\t' read -r status row_workdir <<< "$row"
       if [[ "$status" != "stopped" && "$status" != "archived" ]] \
         && { [[ -n "$RESUME_ID" ]] || [[ "$row_workdir" == "$WORK_DIR" ]]; } \
         ; then

@@ -548,6 +548,16 @@ async def send_prompt_to_pane(
         "operation_id": result.get("operation_id") or operation_id,
         "payload_hash": result.get("payload_hash") or _prompt_payload_hash(prompt),
         "gated": False,
+        # Preserve the daemon's typing-guard deferral contract. Dropping these
+        # fields turned a safely queued zero-byte send into delivered=False and
+        # then the false terminal verdict `not_delivered`.
+        "status": result.get("status"),
+        "queued": bool(result.get("queued")),
+        "deferred": bool(result.get("deferred")),
+        "reason": result.get("reason") or result.get("gate_reason"),
+        "error": result.get("error"),
+        "gate_reason": result.get("gate_reason"),
+        "queue_id": result.get("queue_id"),
         "verification_status": result.get("verification_status") or "unverified",
         "verified_by": result.get("verified_by"),
         "delivered": bool(result.get("delivered", True)),
@@ -5732,9 +5742,13 @@ def _pane_send_terminal_status(send_result: dict) -> tuple[str, str | None]:
     if send_result.get("returncode") != 0:
         return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get("error")
     if send_result.get("delivered") is False:
-        return PANE_WRITE_FAILED, send_result.get("stderr") or send_result.get(
-            "error"
-        ) or "not_delivered"
+        return PANE_WRITE_FAILED, (
+            send_result.get("reason")
+            or send_result.get("gate_reason")
+            or send_result.get("stderr")
+            or send_result.get("error")
+            or "daemon_not_delivered_without_reason"
+        )
     if verification in {"submitted", "pending", "not_requested", "likely", "unverified"}:
         return PANE_WRITE_SENT, None
     return (
@@ -6264,7 +6278,9 @@ async def process_pane_write_queue_once(
                 "status": terminal_status,
                 **send_result,
             }
-            if terminal_error and "reason" not in result:
+            if terminal_error and not (
+                result.get("reason") or result.get("error") or result.get("stderr")
+            ):
                 result["reason"] = terminal_error
             if hook_effect_error:
                 result["hook_effect_error"] = hook_effect_error
@@ -13453,7 +13469,7 @@ async def _direct_tmux_pane_delivery(
         "status": terminal_status,
         **send_result,
     }
-    if terminal_error and "reason" not in result:
+    if terminal_error and not (result.get("reason") or result.get("error") or result.get("stderr")):
         result["reason"] = terminal_error
     return result
 
@@ -29489,9 +29505,69 @@ async def _session_doc_content(file_path: str | Path) -> dict:
     return await _session_docs_facade("get", file_path)
 
 
+# The facade subprocess has a 20-second hard timeout. Three times that bound
+# distinguishes abandoned reservations from a request still unwinding cleanup.
+SESSION_DOC_CREATING_STALE_SECONDS = 60
+
+
+async def _reconcile_stale_creating_session_docs() -> None:
+    """Remove abandoned facade-pending reservations without holding SQLite over I/O."""
+    now = datetime.now()
+    cutoff = (now - timedelta(seconds=SESSION_DOC_CREATING_STALE_SECONDS)).isoformat()
+    claimed: list[tuple[int, str]] = []
+    async with connect_agents_db(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, file_path FROM session_documents WHERE status = 'creating' AND updated_at < ?",
+            (cutoff,),
+        )
+        for doc_id, file_path in await cursor.fetchall():
+            claim = await db.execute(
+                """UPDATE session_documents SET status = 'reconciling', updated_at = ?
+                   WHERE id = ? AND status = 'creating' AND updated_at < ?""",
+                (now.isoformat(), doc_id, cutoff),
+            )
+            if claim.rowcount:
+                claimed.append((doc_id, file_path))
+        await db.commit()
+
+    for doc_id, file_path in claimed:
+        cleanup_succeeded = False
+        try:
+            await _session_docs_facade("delete", file_path)
+            cleanup_succeeded = True
+        except HTTPException as exc:
+            cleanup_succeeded = exc.status_code == 404
+            if not cleanup_succeeded:
+                logger.warning(
+                    "Failed to reconcile stale creating session doc %s (%s): %s",
+                    doc_id,
+                    file_path,
+                    exc.detail,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to reconcile stale creating session doc %s (%s)", doc_id, file_path
+            )
+
+        async with connect_agents_db(DB_PATH) as db:
+            if cleanup_succeeded:
+                await db.execute(
+                    "DELETE FROM session_documents WHERE id = ? AND status = 'reconciling'",
+                    (doc_id,),
+                )
+            else:
+                await db.execute(
+                    """UPDATE session_documents SET status = 'creating', updated_at = ?
+                       WHERE id = ? AND status = 'reconciling'""",
+                    (datetime.now().isoformat(), doc_id),
+                )
+            await db.commit()
+
+
 @app.post("/api/session-docs")
 async def create_session_doc(request: SessionDocCreateRequest):
     """Create a new session document."""
+    await _reconcile_stale_creating_session_docs()
     if request.file_path:
         fp = Path(request.file_path)
     else:
@@ -29501,10 +29577,13 @@ async def create_session_doc(request: SessionDocCreateRequest):
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
 
     now = datetime.now().isoformat()
+    # Reserve the id, then release SQLite before invoking the external Obsidian
+    # facade. Holding this write transaction across a subprocess (up to 20
+    # seconds) starves concurrent session-doc writers with `database is locked`.
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, primarch_name, branch, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, 'creating', ?, ?)""",
             (
                 request.title,
                 str(fp),
@@ -29516,40 +29595,52 @@ async def create_session_doc(request: SessionDocCreateRequest):
             ),
         )
         doc_id = cursor.lastrowid
+        await db.commit()
 
-        # Auto-link primarch if specified
-        if request.primarch_name:
-            # Unlink any existing active doc for this primarch
-            await db.execute(
-                "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
-                (now, request.primarch_name),
+    created = False
+    try:
+        await _session_docs_facade(
+            "create",
+            fp,
+            content=session_doc_initial_content(
+                request.title, doc_id, request.project, request.primarch_name
+            ),
+        )
+        created = True
+        async with connect_agents_db(DB_PATH) as db:
+            if request.primarch_name:
+                await db.execute(
+                    "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
+                    (now, request.primarch_name),
+                )
+                await db.execute(
+                    "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
+                    (request.primarch_name, doc_id, now),
+                )
+            activated = await db.execute(
+                """UPDATE session_documents SET status = 'active', updated_at = ?
+                   WHERE id = ? AND status = 'creating'""",
+                (datetime.now().isoformat(), doc_id),
             )
-            await db.execute(
-                "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
-                (request.primarch_name, doc_id, now),
-            )
-
-        created = False
-        try:
-            await _session_docs_facade(
-                "create",
-                fp,
-                content=session_doc_initial_content(
-                    request.title, doc_id, request.project, request.primarch_name
-                ),
-            )
-            created = True
+            if activated.rowcount != 1:
+                raise RuntimeError(f"Session-doc reservation {doc_id} is no longer creating")
             await db.commit()
-        except Exception:
-            await db.rollback()
-            # The facade mutation succeeded before the DB commit may have
-            # failed. Compensate so no unlinked note is left behind.
-            if created:
-                try:
-                    await _session_docs_facade("delete", fp)
-                except HTTPException:
-                    logger.exception("Failed to compensate session-doc create for %s", fp)
-            raise
+    except Exception as exc:
+        async with connect_agents_db(DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM primarch_session_docs WHERE session_doc_id = ?", (doc_id,)
+            )
+            await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
+            await db.commit()
+        cleanup_file = created or not (
+            isinstance(exc, HTTPException) and exc.status_code in {400, 404, 409}
+        )
+        if cleanup_file:
+            try:
+                await _session_docs_facade("delete", fp)
+            except Exception:
+                logger.exception("Failed to compensate session-doc create for %s", fp)
+        raise
 
     # Frontmatter mirror of the branch already inserted above (restamp-same is
     # idempotent; the helper never raises on file errors).
@@ -30217,6 +30308,7 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
 @app.post("/api/instances/{instance_id}/create-doc")
 async def create_doc_for_instance(instance_id: str, request: SessionDocCreateRequest):
     """Create a new session document and assign it to the instance."""
+    await _reconcile_stale_creating_session_docs()
     async with connect_agents_db(DB_PATH) as db:
         # Verify instance exists
         cursor = await db.execute(
@@ -30240,10 +30332,12 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
     if fp.exists():
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
 
+    # As above, commit the reservation before the external facade call. The
+    # binding transaction below either completes or compensates the reservation.
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, branch, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'active', ?, ?)""",
+               VALUES (?, ?, ?, ?, 'creating', ?, ?)""",
             (
                 request.title,
                 str(fp),
@@ -30254,59 +30348,74 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
             ),
         )
         doc_id = cursor.lastrowid
+        await db.commit()
 
-        # Assign to instance
-        await update_instance(
-            db,
-            instance_id=instance_id,
-            updates={
-                "session_doc_id": doc_id,
-                "session_doc_policy": "manual_created",
-                "continuity_binding_source": "manual",
-            },
-            mutation_type="continuity_binding_changed",
-            write_source="api",
-            actor="create-doc",
-            workflow_events=[
-                {
-                    "workflow_state": workflow_state,
-                    "event_type": "continuity_binding_changed",
-                    "event_owner": "api",
-                    "details": {
-                        "old_session_doc_id": old_doc_id,
-                        "new_session_doc_id": doc_id,
-                        "continuity_binding_source": "manual",
-                    },
-                },
-                {
-                    "workflow_state": workflow_state,
-                    "event_type": "session_doc_bound",
-                    "event_owner": "api",
-                    "details": {
-                        "session_doc_id": doc_id,
-                        "session_doc_policy": "manual_created",
-                        "continuity_binding_source": "manual",
-                    },
-                },
-            ],
+    created = False
+    try:
+        await _session_docs_facade(
+            "create",
+            fp,
+            content=session_doc_initial_content(request.title, doc_id, request.project),
         )
-        created = False
-        try:
-            await _session_docs_facade(
-                "create",
-                fp,
-                content=session_doc_initial_content(request.title, doc_id, request.project),
+        created = True
+        async with connect_agents_db(DB_PATH) as db:
+            await update_instance(
+                db,
+                instance_id=instance_id,
+                updates={
+                    "session_doc_id": doc_id,
+                    "session_doc_policy": "manual_created",
+                    "continuity_binding_source": "manual",
+                },
+                where_clause="id = ? AND session_doc_id IS ?",
+                where_params=(instance_id, old_doc_id),
+                mutation_type="continuity_binding_changed",
+                write_source="api",
+                actor="create-doc",
+                workflow_events=[
+                    {
+                        "workflow_state": workflow_state,
+                        "event_type": "continuity_binding_changed",
+                        "event_owner": "api",
+                        "details": {
+                            "old_session_doc_id": old_doc_id,
+                            "new_session_doc_id": doc_id,
+                            "continuity_binding_source": "manual",
+                        },
+                    },
+                    {
+                        "workflow_state": workflow_state,
+                        "event_type": "session_doc_bound",
+                        "event_owner": "api",
+                        "details": {
+                            "session_doc_id": doc_id,
+                            "session_doc_policy": "manual_created",
+                            "continuity_binding_source": "manual",
+                        },
+                    },
+                ],
             )
-            created = True
+            activated = await db.execute(
+                """UPDATE session_documents SET status = 'active', updated_at = ?
+                   WHERE id = ? AND status = 'creating'""",
+                (datetime.now().isoformat(), doc_id),
+            )
+            if activated.rowcount != 1:
+                raise RuntimeError(f"Session-doc reservation {doc_id} is no longer creating")
             await db.commit()
-        except Exception:
-            await db.rollback()
-            if created:
-                try:
-                    await _session_docs_facade("delete", fp)
-                except HTTPException:
-                    logger.exception("Failed to compensate instance session-doc create for %s", fp)
-            raise
+    except Exception as exc:
+        async with connect_agents_db(DB_PATH) as db:
+            await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
+            await db.commit()
+        cleanup_file = created or not (
+            isinstance(exc, HTTPException) and exc.status_code in {400, 404, 409}
+        )
+        if cleanup_file:
+            try:
+                await _session_docs_facade("delete", fp)
+            except Exception:
+                logger.exception("Failed to compensate instance session-doc create for %s", fp)
+        raise
 
     # Frontmatter mirror of the branch already inserted above (restamp-same is
     # idempotent; the helper never raises on file errors).

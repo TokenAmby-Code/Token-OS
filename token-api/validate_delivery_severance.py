@@ -25,6 +25,8 @@ Covers:
    honest ``delivered=0`` — never ``failed``.
 5. Loud paths preserved: happy delivery still maps to ``sent``; a genuine daemon
    drop (``delivered:False`` rc0, not severed) still maps to ``failed``.
+6. Typing-guard deferral remains ``pending`` with its durable queue id rather
+   than being flattened to a false terminal ``not_delivered`` verdict.
 """
 
 from __future__ import annotations
@@ -96,7 +98,20 @@ def test_terminal_status_mapping() -> None:
     status, reason = main._pane_send_terminal_status(drop)
     check(
         "genuine drop -> failed (loud path preserved)",
-        status == main.PANE_WRITE_FAILED and "not_delivered" in str(reason or ""),
+        status == main.PANE_WRITE_FAILED and reason == "daemon_not_delivered_without_reason",
+        f"{status}/{reason}",
+    )
+
+    named_drop = {
+        "returncode": 0,
+        "delivered": False,
+        "status": "dropped",
+        "reason": "identity_gate_rejected",
+    }
+    status, reason = main._pane_send_terminal_status(named_drop)
+    check(
+        "genuine drop preserves daemon gate reason",
+        status == main.PANE_WRITE_FAILED and reason == "identity_gate_rejected",
         f"{status}/{reason}",
     )
 
@@ -150,6 +165,52 @@ def test_send_prompt_severance() -> None:
     check("severed send maps to delivery_unknown", status == main.PANE_WRITE_UNKNOWN, status)
 
 
+def test_send_prompt_typing_guard_deferral() -> None:
+    orig = shared._tmuxctld_post_json
+
+    def deferred_transport(*_args, **_kwargs):
+        return {
+            "ok": True,
+            "result": {
+                "status": "queued",
+                "queued": True,
+                "deferred": True,
+                "delivered": False,
+                "reason": "user_input_pending",
+                "queue_id": "queue-1",
+            },
+        }
+
+    shared._tmuxctld_post_json = deferred_transport  # type: ignore[assignment]
+    try:
+        result = run(main.send_prompt_to_pane("%1", "hello council"))
+    finally:
+        restore_transport(orig)
+
+    status, reason = main._pane_send_terminal_status(result)
+    check("deferred send preserves queued", result.get("queued") is True, result.get("queued"))
+    check(
+        "deferred send preserves deferred",
+        result.get("deferred") is True,
+        result.get("deferred"),
+    )
+    check(
+        "deferred send preserves status",
+        result.get("status") == "queued",
+        result.get("status"),
+    )
+    check(
+        "deferred send preserves queue id",
+        result.get("queue_id") == "queue-1",
+        result.get("queue_id"),
+    )
+    check(
+        "deferred send -> pending",
+        status == main.PANE_WRITE_PENDING and reason == "user_input_pending",
+        f"{status}/{reason}",
+    )
+
+
 # --- Test 3: _direct_tmux_pane_delivery (rowless path) ----------------------
 
 
@@ -185,6 +246,45 @@ def test_direct_delivery_severance() -> None:
         "direct delivery keeps correlation handle",
         result.get("correlation_id") == "brief:bd53aa1f",
         result.get("correlation_id"),
+    )
+
+
+def test_direct_reasonless_drop() -> None:
+    orig_send = main._tmux_send_payload_then_submit
+    orig_engine = main._pane_live_agent_engine
+    orig_resolve = shared.resolve_tmux_pane_id
+
+    async def reasonless_drop(*_args, **_kwargs):
+        return {
+            "returncode": 0,
+            "delivered": False,
+            "reason": None,
+            "error": None,
+            "stderr": "",
+        }
+
+    main._tmux_send_payload_then_submit = reasonless_drop  # type: ignore[assignment]
+    main._pane_live_agent_engine = _fake_engine  # type: ignore[assignment]
+    shared.resolve_tmux_pane_id = _fake_resolve_pane_id  # type: ignore[assignment]
+    try:
+        result = run(
+            main._direct_tmux_pane_delivery(
+                "%1",
+                "hello council",
+                source="brief",
+                purpose="brief_send",
+                operation_id="op-reasonless",
+            )
+        )
+    finally:
+        main._tmux_send_payload_then_submit = orig_send  # type: ignore[assignment]
+        main._pane_live_agent_engine = orig_engine  # type: ignore[assignment]
+        shared.resolve_tmux_pane_id = orig_resolve  # type: ignore[assignment]
+
+    check(
+        "direct reasonless drop surfaces a named failure",
+        result.get("reason") == "daemon_not_delivered_without_reason",
+        result,
     )
 
 
@@ -254,7 +354,9 @@ def test_brief_send_rollup() -> None:
 def main_entry() -> int:
     test_terminal_status_mapping()
     test_send_prompt_severance()
+    test_send_prompt_typing_guard_deferral()
     test_direct_delivery_severance()
+    test_direct_reasonless_drop()
     test_brief_send_rollup()
     print()
     if FAILURES:
