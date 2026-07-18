@@ -89,7 +89,6 @@ default_commit_message_from_staged() {
 
 emit_coderabbit_heartbeat() {
     local message="$1"
-    [[ "${PR_STEP_OPAQUE_WAIT:-false}" == "true" ]] && return 0
     if [[ -n "${PR_STEP_HEARTBEAT_FILE:-}" ]]; then
         printf '%s\n' "$message" >>"$PR_STEP_HEARTBEAT_FILE" 2>/dev/null || true
     else
