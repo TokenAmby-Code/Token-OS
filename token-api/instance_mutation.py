@@ -603,6 +603,11 @@ def insert_instance_sync(
     }
 
 
+async def copy_instances_for_rank_schema_migration(db) -> None:
+    """Copy rows byte-for-byte during the Scribe constraint-only rebuild."""
+    await db.execute("INSERT INTO instances SELECT * FROM instances_pre_scribe")
+
+
 async def delete_instance(
     db,
     *,

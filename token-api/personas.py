@@ -415,10 +415,12 @@ def persona_schema_sql() -> str:
 
 
 def _persona_schema_accepts_scribe(sql: str | None) -> bool:
+    """Return whether a persisted personas schema accepts the Scribe rank."""
     return bool(sql and "'scribe'" in sql)
 
 
 def _persona_rebuild_sql(table: str) -> str:
+    """Render the canonical personas schema for a migration table name."""
     return persona_schema_sql().replace(
         "CREATE TABLE IF NOT EXISTS personas", f"CREATE TABLE {table}", 1
     )
@@ -502,6 +504,7 @@ def _migrate_persona_columns_sync(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_persona_rank_constraint_sync(conn: sqlite3.Connection) -> None:
+    """Synchronously rebuild an old personas rank CHECK constraint."""
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='personas'"
     ).fetchone()
@@ -530,6 +533,7 @@ async def _migrate_persona_columns(db: aiosqlite.Connection) -> None:
 
 
 async def _migrate_persona_rank_constraint(db: aiosqlite.Connection) -> None:
+    """Rebuild an old personas rank CHECK constraint without changing rows."""
     cursor = await db.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='personas'"
     )

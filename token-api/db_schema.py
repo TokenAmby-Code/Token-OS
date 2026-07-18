@@ -22,6 +22,7 @@ from db_connections import (
     connect_timer_db,
     resolve_telemetry_db_path,
 )
+from instance_mutation import copy_instances_for_rank_schema_migration
 from instance_registry import (
     DEFAULT_INSTANCE_NAME,
     INSTANCE_COLUMNS,
@@ -299,6 +300,7 @@ async def _create_instances_table(db, table: str = "instances") -> None:
 
 
 async def _migrate_instances_rank_constraint(db) -> None:
+    """Rebuild the canonical instances CHECK constraint to accept Scribe."""
     cursor = await db.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='instances'"
     )
@@ -311,10 +313,9 @@ async def _migrate_instances_rank_constraint(db) -> None:
     await db.execute("PRAGMA legacy_alter_table=ON")
     await db.execute("ALTER TABLE instances RENAME TO instances_pre_scribe")
     await _create_instances_table(db)
-    names = ", ".join(INSTANCE_COLUMNS)
     if columns != set(INSTANCE_COLUMNS):
         return
-    await db.execute(f"INSERT INTO instances ({names}) SELECT {names} FROM instances_pre_scribe")
+    await copy_instances_for_rank_schema_migration(db)
     await db.execute("DROP TABLE instances_pre_scribe")
     await db.execute("PRAGMA legacy_alter_table=OFF")
     await db.commit()
