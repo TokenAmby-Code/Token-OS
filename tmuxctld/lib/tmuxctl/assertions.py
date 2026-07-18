@@ -45,7 +45,7 @@ PERSONA_LABELS = {
 EXPECTED_PERSONA_RANKS = {
     "custodes": "overseer",
     "fabricator-general": "overseer",
-    "administratum": "overseer",
+    "administratum": "scribe",
     "malcador": "primarch",
     "pax": "overseer",
     "orchestrator": "overseer",

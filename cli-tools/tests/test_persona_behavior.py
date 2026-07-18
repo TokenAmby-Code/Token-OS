@@ -55,3 +55,22 @@ def test_fleet_persona_root_is_explicit(tmp_path: Path, monkeypatch: pytest.Monk
     fleet = tmp_path / "Token-Fleet"
     monkeypatch.setenv("TOKEN_FLEET_CHECKOUT", str(fleet))
     assert persona_behavior._imperium_root() == fleet / "shared" / "personas"
+
+
+def test_administratum_resolves_scribe_rank_doc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fleet = tmp_path / "Token-Fleet"
+    personas = fleet / "shared" / "personas"
+    (personas / "Ranks").mkdir(parents=True)
+    (personas / "Administratum.md").write_text("recorder", encoding="utf-8")
+    (personas / "Ranks" / "Scribe.md").write_text("scribe", encoding="utf-8")
+    db = tmp_path / "agents.db"
+    make_db(db, [("administratum", "Administratum", "scribe")])
+    monkeypatch.setenv("TOKEN_FLEET_CHECKOUT", str(fleet))
+
+    row = persona_behavior.resolve_persona("administratum", db)
+    assert row is not None
+    assert persona_behavior.rank_file_for(row) == personas / "Ranks" / "Scribe.md"
+    assert persona_behavior.system_doc_for("administratum", db) == "scribe\n\n---\n\nrecorder"
+    assert persona_behavior.invariant_issues(db) == []

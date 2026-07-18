@@ -228,9 +228,9 @@ async def _persona_id_for_legacy_row(db, row: dict) -> str | None:
     return persona_id
 
 
-async def _create_instances_table(db) -> None:
+async def _create_instances_table(db, table: str = "instances") -> None:
     await db.execute(f"""
-        CREATE TABLE instances (
+        CREATE TABLE {table} (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '{DEFAULT_INSTANCE_NAME}',
             engine TEXT,
@@ -249,7 +249,7 @@ async def _create_instances_table(db) -> None:
             archived_at TIMESTAMP,
             persona_id TEXT REFERENCES personas(id),
             rank TEXT NOT NULL DEFAULT 'astartes'
-                CHECK(rank IN ('astartes','overseer','primarch','retired') OR rank GLOB 'aspirant:*'),
+                CHECK(rank IN ('astartes','scribe','overseer','primarch','retired') OR rank GLOB 'aspirant:*'),
             session_doc_id INTEGER,
             continuity_binding_source TEXT,
             wrapper_launch_id TEXT,
@@ -296,6 +296,29 @@ async def _create_instances_table(db) -> None:
             CHECK(status != 'archived' OR rank = 'retired')
         )
     """)
+
+
+async def _migrate_instances_rank_constraint(db) -> None:
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='instances'"
+    )
+    row = await cursor.fetchone()
+    if not row or "'scribe'" in (row[0] or ""):
+        return
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys=OFF")
+    columns = await _table_columns(db, "instances")
+    await db.execute("PRAGMA legacy_alter_table=ON")
+    await db.execute("ALTER TABLE instances RENAME TO instances_pre_scribe")
+    await _create_instances_table(db)
+    names = ", ".join(INSTANCE_COLUMNS)
+    if columns != set(INSTANCE_COLUMNS):
+        return
+    await db.execute(f"INSERT INTO instances ({names}) SELECT {names} FROM instances_pre_scribe")
+    await db.execute("DROP TABLE instances_pre_scribe")
+    await db.execute("PRAGMA legacy_alter_table=OFF")
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys=ON")
 
 
 EXTERMINATED_INSTANCE_COLUMNS = frozenset(
@@ -473,6 +496,7 @@ async def _ensure_instances(db) -> None:
             )
         if extras:
             await _exterminate_instances_runtime_launch_columns(db, extras)
+        await _migrate_instances_rank_constraint(db)
     else:
         await _create_instances_table(db)
 

@@ -136,7 +136,7 @@ def _root_for(row: PersonaRow) -> Path:
 def rank_file_for(row: PersonaRow) -> Path | None:
     """Resolve <personas-root>/Ranks/<Rank>.md for a persona's default_rank.
 
-    Ranks are Overseer/Astartes/Primarch. Resolution is case-insensitive so a
+    Ranks include Scribe, Overseer, Astartes, and Primarch. Resolution is case-insensitive so a
     default_rank stored as 'OVERSEER' / 'overseer' / 'Overseer' all land on
     Overseer.md. Returns None when no rank doc exists (the invariant fails closed
     on that at preflight; the wrapper fails loud-but-open at runtime)."""
