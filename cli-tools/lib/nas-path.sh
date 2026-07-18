@@ -173,7 +173,7 @@ _IMPERIUM_CFG_k12_personal_vault_logs_root="$HOME/vaults/Imperium-Logs"
 # (boundary), and it runs no Token-OS runtime, so those fields are empty.
 _IMPERIUM_CFG_k12_work_nas_imperium=""
 _IMPERIUM_CFG_k12_work_nas_civic="/mnt/civic"
-_IMPERIUM_CFG_k12_work_tailscale_ip="100.67.168.105"
+_IMPERIUM_CFG_k12_work_tailscale_ip="100.112.169.103"
 _IMPERIUM_CFG_k12_work_token_api_url="http://${_IMPERIUM_TOKEN_API_HOST}:7777"
 _IMPERIUM_CFG_k12_work_tmuxctld_url="http://127.0.0.1:7778"
 _IMPERIUM_CFG_k12_work_ssh_alias="k12-work"
