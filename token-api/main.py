@@ -29508,6 +29508,7 @@ async def _session_doc_content(file_path: str | Path) -> dict:
 # The facade subprocess has a 20-second hard timeout. Three times that bound
 # distinguishes abandoned reservations from a request still unwinding cleanup.
 SESSION_DOC_CREATING_STALE_SECONDS = 60
+SESSION_DOC_RECONCILE_BATCH_SIZE = 1
 
 
 async def _reconcile_stale_creating_session_docs() -> None:
@@ -29517,13 +29518,16 @@ async def _reconcile_stale_creating_session_docs() -> None:
     claimed: list[tuple[int, str]] = []
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, file_path FROM session_documents WHERE status = 'creating' AND updated_at < ?",
-            (cutoff,),
+            """SELECT id, file_path FROM session_documents
+               WHERE status IN ('creating', 'reconciling') AND updated_at < ?
+               ORDER BY updated_at, id LIMIT ?""",
+            (cutoff, SESSION_DOC_RECONCILE_BATCH_SIZE),
         )
         for doc_id, file_path in await cursor.fetchall():
             claim = await db.execute(
                 """UPDATE session_documents SET status = 'reconciling', updated_at = ?
-                   WHERE id = ? AND status = 'creating' AND updated_at < ?""",
+                   WHERE id = ? AND status IN ('creating', 'reconciling')
+                     AND updated_at < ?""",
                 (now.isoformat(), doc_id, cutoff),
             )
             if claim.rowcount:

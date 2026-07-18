@@ -163,12 +163,14 @@ async def exercise_endpoint(*, bind_instance: bool) -> tuple[int, int | None, st
         )
 
 
-async def exercise_stale_reconciliation() -> tuple[int, bool]:
+async def exercise_stale_reconciliation() -> tuple[int, int, bool]:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         db_path = root / "agents.db"
         stale_file = root / "stale.md"
+        reconciling_file = root / "reconciling.md"
         stale_file.write_text("partial", encoding="utf-8")
+        reconciling_file.write_text("partial", encoding="utf-8")
         initialize_db(db_path)
         stale_at = (
             datetime.now() - timedelta(seconds=main.SESSION_DOC_CREATING_STALE_SECONDS + 1)
@@ -179,6 +181,12 @@ async def exercise_stale_reconciliation() -> tuple[int, bool]:
                    (title, file_path, status, created_at, updated_at)
                    VALUES ('Stale', ?, 'creating', ?, ?)""",
                 (str(stale_file), stale_at, stale_at),
+            )
+            db.execute(
+                """INSERT INTO session_documents
+                   (title, file_path, status, created_at, updated_at)
+                   VALUES ('Interrupted cleanup', ?, 'reconciling', ?, ?)""",
+                (str(reconciling_file), stale_at, stale_at),
             )
             db.commit()
 
@@ -194,6 +202,12 @@ async def exercise_stale_reconciliation() -> tuple[int, bool]:
         main._session_docs_facade = delete_facade  # type: ignore[assignment]
         try:
             await main._reconcile_stale_creating_session_docs()
+            with sqlite3.connect(db_path) as db:
+                remaining_after_one = db.execute(
+                    """SELECT COUNT(*) FROM session_documents
+                       WHERE status IN ('creating', 'reconciling')"""
+                ).fetchone()[0]
+            await main._reconcile_stale_creating_session_docs()
         finally:
             main.DB_PATH = original_db_path
             main._session_docs_facade = original_facade  # type: ignore[assignment]
@@ -202,7 +216,7 @@ async def exercise_stale_reconciliation() -> tuple[int, bool]:
             remaining = db.execute(
                 "SELECT COUNT(*) FROM session_documents WHERE status IN ('creating', 'reconciling')"
             ).fetchone()[0]
-        return remaining, stale_file.exists()
+        return remaining_after_one, remaining, stale_file.exists() or reconciling_file.exists()
 
 
 async def main_async() -> int:
@@ -226,7 +240,8 @@ async def main_async() -> int:
     check("create_doc_for_instance activates after bind", final_status == "active", final_status)
     check("create_doc_for_instance binds reserved doc", bool(bound_doc_id), bound_doc_id)
 
-    remaining, stale_file_exists = await exercise_stale_reconciliation()
+    remaining_after_one, remaining, stale_file_exists = await exercise_stale_reconciliation()
+    check("stale reconciliation batch is bounded", remaining_after_one == 1, remaining_after_one)
     check("stale creating reservation is reconciled", remaining == 0, remaining)
     check("stale facade artifact is reconciled", not stale_file_exists, stale_file_exists)
 
