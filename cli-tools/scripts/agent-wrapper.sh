@@ -150,9 +150,7 @@ wrapper_real_candidates() {
       [[ -n "${CODEX_BIN:-}" ]] && printf '%s\n' "$CODEX_BIN"
       printf '%s\n' \
         "$HOME/.local/bin/codex.token-os-real" \
-        "$HOME/.local/bin/codex" \
-        "/opt/homebrew/bin/codex.token-os-real" \
-        "/opt/homebrew/bin/codex"
+        "$HOME/.local/bin/codex"
       ;;
   esac
 }
