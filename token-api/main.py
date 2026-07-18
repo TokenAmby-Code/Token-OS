@@ -552,6 +552,7 @@ async def send_prompt_to_pane(
         # fields turned a safely queued zero-byte send into delivered=False and
         # then the false terminal verdict `not_delivered`.
         "status": result.get("status"),
+        "daemon_status": result.get("status"),
         "queued": bool(result.get("queued")),
         "deferred": bool(result.get("deferred")),
         "reason": result.get("reason") or result.get("gate_reason"),
@@ -6275,8 +6276,11 @@ async def process_pane_write_queue_once(
                         hook_effect_error = str(exc)
             result = {
                 **base,
-                "status": terminal_status,
                 **send_result,
+                # The daemon may report its own lifecycle state (for example
+                # ``submitted``). Keep that in ``daemon_status``; the durable
+                # pane-write contract must expose the canonical terminal state.
+                "status": terminal_status,
             }
             if terminal_error and not (
                 result.get("reason") or result.get("error") or result.get("stderr")
@@ -13466,8 +13470,8 @@ async def _direct_tmux_pane_delivery(
     terminal_status, terminal_error = _pane_send_terminal_status(send_result)
     result = {
         **base,
-        "status": terminal_status,
         **send_result,
+        "status": terminal_status,
     }
     if terminal_error and not (result.get("reason") or result.get("error") or result.get("stderr")):
         result["reason"] = terminal_error

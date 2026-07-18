@@ -351,6 +351,77 @@ def test_brief_send_rollup() -> None:
     )
 
 
+def test_brief_submitted_rollup() -> None:
+    orig_post = shared._tmuxctld_post_json
+    orig_resolve = shared.resolve_tmux_pane_id
+    orig_engine = main._pane_live_agent_engine
+    orig_targets = main.talk_service.resolve_brief_targets
+    orig_lookup = main.talk_service.lookup_instance_for_pane
+    orig_publicize = main.talk_service.publicize_payload
+    orig_custodes = main._pane_sender_is_custodes
+
+    def confirmed_transport(*_args, **_kwargs):
+        return {
+            "ok": True,
+            "result": {
+                "status": "submitted",
+                "delivered": True,
+                "submitted": True,
+                "delivery": "confirmed",
+                "verification_status": "submitted",
+                "dispatch_id": "dispatch-confirmed",
+            },
+        }
+
+    async def fake_targets(*, panes, pages):
+        return ([{"pane_id": "%1", "spec": "council:custodes", "source": "pane"}], [])
+
+    async def fake_lookup(_pane):
+        return None
+
+    async def fake_publicize(payload):
+        return payload
+
+    async def fake_custodes(_caller):
+        return True
+
+    shared._tmuxctld_post_json = confirmed_transport  # type: ignore[assignment]
+    shared.resolve_tmux_pane_id = _fake_resolve_pane_id  # type: ignore[assignment]
+    main._pane_live_agent_engine = _fake_engine  # type: ignore[assignment]
+    main.talk_service.resolve_brief_targets = fake_targets  # type: ignore[assignment]
+    main.talk_service.lookup_instance_for_pane = fake_lookup  # type: ignore[assignment]
+    main.talk_service.publicize_payload = fake_publicize  # type: ignore[assignment]
+    main._pane_sender_is_custodes = fake_custodes  # type: ignore[assignment]
+    try:
+        result = run(
+            main.brief_send(
+                main.BriefSendRequest(
+                    caller_pane=None,
+                    panes=["council:custodes"],
+                    pages=[],
+                    payload="morning handoff",
+                    ephemeral=False,
+                    idempotency_key="confirmed-rollup",
+                )
+            )
+        )
+    finally:
+        restore_transport(orig_post)
+        shared.resolve_tmux_pane_id = orig_resolve  # type: ignore[assignment]
+        main._pane_live_agent_engine = orig_engine  # type: ignore[assignment]
+        main.talk_service.resolve_brief_targets = orig_targets  # type: ignore[assignment]
+        main.talk_service.lookup_instance_for_pane = orig_lookup  # type: ignore[assignment]
+        main.talk_service.publicize_payload = orig_publicize  # type: ignore[assignment]
+        main._pane_sender_is_custodes = orig_custodes  # type: ignore[assignment]
+
+    resolved = result.get("resolved") or []
+    row = resolved[0] if resolved else {}
+    check("submitted brief rolls up to ok", result.get("status") == "ok", result)
+    check("submitted brief counts delivered", result.get("delivered") == 1, result)
+    check("submitted brief row is canonical sent", row.get("status") == main.PANE_WRITE_SENT, row)
+    check("submitted daemon state remains observable", row.get("daemon_status") == "submitted", row)
+
+
 def main_entry() -> int:
     test_terminal_status_mapping()
     test_send_prompt_severance()
@@ -358,6 +429,7 @@ def main_entry() -> int:
     test_direct_delivery_severance()
     test_direct_reasonless_drop()
     test_brief_send_rollup()
+    test_brief_submitted_rollup()
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): {', '.join(FAILURES)}")
