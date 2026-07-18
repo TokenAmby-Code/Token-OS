@@ -136,7 +136,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
     "k12-work": {
         "nas_imperium": "",
         "nas_civic": "/mnt/civic",
-        "tailscale_ip": "100.67.168.105",
+        "tailscale_ip": "100.112.169.103",
         "token_api_url": f"http://{_IMPERIUM_TOKEN_API_HOST}:7777",
         "tmuxctld_url": "http://127.0.0.1:7778",
         "ssh_alias": "k12-work",
