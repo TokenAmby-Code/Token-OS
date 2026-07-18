@@ -25,7 +25,7 @@ Mac Mini (100.95.109.23:7777)     ← primary server, all state lives here
 
 ### Ops Cockpit Direction
 
-High-level directive: see `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Somnium Display and Control Surface Directive.md`.
+High-level directive: see `$IMPERIUM_VAULT/Terra/Ultramar/Somnium Display and Control Surface Directive.md`.
 
 The current direction is:
 

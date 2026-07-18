@@ -133,7 +133,7 @@ Use shell actions that append timestamped checkpoints before/after HTTP requests
 
 ## TTS execution macros — artifact transport, 2026-07-09
 
-Track B phone-side artifacts for [[/Volumes/Imperium/Imperium-ENV/Mars/Tasks/tts-execution-architecture-tokenos-authoritative-phone-wsl-linux.md]]. These are official `.macro` wrappers maintained in this directory, validated with `macrodroid-validate`, and delivered only via `MACRODROID_AUTO_IMPORT=1 macrodroid-import --replace`.
+Track B phone-side artifacts for [[Mars/Tasks/tts-execution-architecture-tokenos-authoritative-phone-wsl-linux.md]]. These are official `.macro` wrappers maintained in this directory, validated with `macrodroid-validate`, and delivered only via `MACRODROID_AUTO_IMPORT=1 macrodroid-import --replace`.
 
 Phone-side contract:
 

@@ -12,8 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 BASE = "http://localhost:7777"
-LOG_PATH = "/Volumes/Imperium/Imperium-ENV/Mars/Logs/fleet_dispatch_log.md"
-FLEET_REPORT_PATH = "/Volumes/Imperium/Imperium-ENV/Mars/Fleet/fleet_status.md"
+_VAULT = Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
+LOG_PATH = str(_VAULT / "Mars/Logs/fleet_dispatch_log.md")
+FLEET_REPORT_PATH = str(_VAULT / "Mars/Fleet/fleet_status.md")
 N = 10
 DAILY_BUDGET_USD = 2.00
 GUARDSMAN_BIN = (
@@ -71,7 +72,7 @@ def _scan_mars_tasks(limit: int) -> list:
     """Scan Mars/Tasks for autonomy: researchable files, fabricate guardsman tasks."""
     import glob as _glob
 
-    tasks_dir = "/Volumes/Imperium/Imperium-ENV/Mars/Tasks"
+    tasks_dir = str(_VAULT / "Mars/Tasks")
     assertions = [
         "task file has a title and autonomy frontmatter",
         "this task file exists and has actionable content",

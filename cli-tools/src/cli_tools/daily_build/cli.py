@@ -37,7 +37,7 @@ from .session_doc_resolver import (
 )
 
 DEFAULT_REPO = str(Path.home() / "runtimes" / "Token-OS" / "live")
-DEFAULT_VAULT = "/Volumes/Imperium/Imperium-ENV"
+DEFAULT_VAULT = str(Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser())
 BUILDS_SUBDIR = "Terra/Journal/Builds"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 

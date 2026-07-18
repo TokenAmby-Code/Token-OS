@@ -8,7 +8,7 @@ All source code, vaults, and project data live on the NAS (`Token-NAS`, `192.168
 
 | Volume | Mac Mount | WSL Mount | Encryption | Contents |
 |--------|-----------|-----------|-----------|----------|
-| **Imperium** | `/Volumes/Imperium` | `/mnt/imperium` | None | Imperium-ENV vault, Token-OS runtime, CLI tools, Plans |
+| **Imperium** | `/Volumes/Imperium` | `/mnt/imperium` | None | Token-OS runtime, CLI tools, Plans |
 | **Civic** | `/Volumes/Civic` | `/mnt/civic` | AES-256 | Pax-ENV vault, ProcurementAgentAI, Civic work projects |
 
 Use `$IMPERIUM` and `$CIVIC` env vars — never hardcode mount paths. See `$IMPERIUM/runtimes/token-os/live/cli-tools/lib/nas-path.sh`.
@@ -138,10 +138,12 @@ tmux-legion-prompt --prompt "prompt"                                 # quick leg
 
 The Obsidian vault is your extended mind. Each vault (-ENV) is a domain you can exist within:
 
-| Vault | NAS Volume | Path | Domain |
-|-------|-----------|------|--------|
-| **Imperium-ENV** | Imperium | `$IMPERIUM/Imperium-ENV/` | Personal + agent workspace (Terra/ + Mars/) |
-| **Pax-ENV** | Civic | `$CIVIC/Pax-ENV/` | Work (Civic Initiatives, professional projects) |
+| Vault | Location | Path | Domain |
+|-------|----------|------|--------|
+| **Imperium-ENV** | Local (Obsidian Sync) | `$IMPERIUM_VAULT` (`~/Documents/Imperium-ENV` on this machine) | Personal + agent workspace (Terra/ + Mars/) |
+| **Pax-ENV** | Civic (NAS) | `$CIVIC/Pax-ENV/` | Work (Civic Initiatives, professional projects) |
+
+The Imperium-ENV vault lives ONLY at `$IMPERIUM_VAULT` (Obsidian Sync-connected). It is not on the NAS. `~/vaults/Imperium-ENV`, `~/Imperium-ENV`, and `/Volumes/Imperium/Imperium-ENV` do not exist — never read from, write to, or recreate them.
 
 ### Identity Model
 
@@ -199,5 +201,5 @@ Key projects:
 - `$CIVIC/ProcurementAgentAI/CLAUDE.md` - Main project (architecture + CLI tool docs)
 - `$IMPERIUM/runtimes/token-os/live/token-api/CLAUDE.md` - Token-API server
 - `$IMPERIUM/runtimes/token-os/live/mobile/CLAUDE.md` - Mobile/MacroDroid tools
-- `$IMPERIUM/Imperium-ENV/CLAUDE.md` - Primary Obsidian vault (Imperium)
+- `$IMPERIUM_VAULT/CLAUDE.md` - Primary Obsidian vault (Imperium)
 - `$CIVIC/Pax-ENV/CLAUDE.md` - Work Obsidian vault (obsidian-cli docs live here)

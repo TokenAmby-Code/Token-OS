@@ -65,9 +65,9 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "device_name": "Mac-Mini",
         "token_os_runtime": "~/runtimes/Token-OS/live",
         "token_fleet_runtime": "~/runtimes/Token-Fleet/live",
-        "vaults_root": "~/vaults",
-        "vault_root": "~/vaults/Imperium-ENV",
-        "vault_logs_root": "~/vaults/Imperium-Logs",
+        "vaults_root": "~/Documents",
+        "vault_root": "~/Documents/Imperium-ENV",
+        "vault_logs_root": "~/Documents/Imperium-Logs",
     },
     "wsl": {
         "nas_imperium": "/mnt/imperium",

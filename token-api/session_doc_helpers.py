@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 # Imperium = personal-infra vault; Pax-ENV = civic (day-job / askCivic) vault.
 LIVE_VAULT_ROOT = Path("~/vaults/Imperium-ENV").expanduser()
 LIVE_LOGS_VAULT_ROOT = Path("~/vaults/Imperium-Logs").expanduser()
+# Mac hosts the live vault under ~/Documents (Obsidian Sync), not ~/vaults.
+LIVE_MAC_VAULT_ROOT = Path("~/Documents/Imperium-ENV").expanduser()
+LIVE_MAC_LOGS_VAULT_ROOT = Path("~/Documents/Imperium-Logs").expanduser()
 LIVE_CIVIC_VAULT_ROOT = Path("/Volumes/Civic/Pax-ENV")
 
 OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
@@ -137,7 +140,13 @@ def _assert_not_live_vault(path: Path) -> None:
         resolved = path.resolve()
     except OSError:
         resolved = path
-    for live_root in (LIVE_VAULT_ROOT, LIVE_LOGS_VAULT_ROOT, LIVE_CIVIC_VAULT_ROOT):
+    for live_root in (
+        LIVE_VAULT_ROOT,
+        LIVE_LOGS_VAULT_ROOT,
+        LIVE_MAC_VAULT_ROOT,
+        LIVE_MAC_LOGS_VAULT_ROOT,
+        LIVE_CIVIC_VAULT_ROOT,
+    ):
         if resolved == live_root or live_root in resolved.parents:
             raise RuntimeError(
                 f"Test attempted to write a session doc into the LIVE vault: {resolved}. "
