@@ -251,7 +251,7 @@ done
 
 # Civic is a logical legion on the shared mechanicus floor, not a property of
 # the shorthand itself. A later explicit target override wins completely.
-if [[ -n "$DISPATCH_LEGION" && "$TARGET" != mechanicus:* ]]; then
+if [[ -n "$DISPATCH_LEGION" && "$TARGET" != "mechanicus:new" ]]; then
   DISPATCH_LEGION=""
 fi
 

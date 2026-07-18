@@ -29497,9 +29497,69 @@ async def _session_doc_content(file_path: str | Path) -> dict:
     return await _session_docs_facade("get", file_path)
 
 
+# The facade subprocess has a 20-second hard timeout. Three times that bound
+# distinguishes abandoned reservations from a request still unwinding cleanup.
+SESSION_DOC_CREATING_STALE_SECONDS = 60
+
+
+async def _reconcile_stale_creating_session_docs() -> None:
+    """Remove abandoned facade-pending reservations without holding SQLite over I/O."""
+    now = datetime.now()
+    cutoff = (now - timedelta(seconds=SESSION_DOC_CREATING_STALE_SECONDS)).isoformat()
+    claimed: list[tuple[int, str]] = []
+    async with connect_agents_db(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, file_path FROM session_documents WHERE status = 'creating' AND updated_at < ?",
+            (cutoff,),
+        )
+        for doc_id, file_path in await cursor.fetchall():
+            claim = await db.execute(
+                """UPDATE session_documents SET status = 'reconciling', updated_at = ?
+                   WHERE id = ? AND status = 'creating' AND updated_at < ?""",
+                (now.isoformat(), doc_id, cutoff),
+            )
+            if claim.rowcount:
+                claimed.append((doc_id, file_path))
+        await db.commit()
+
+    for doc_id, file_path in claimed:
+        cleanup_succeeded = False
+        try:
+            await _session_docs_facade("delete", file_path)
+            cleanup_succeeded = True
+        except HTTPException as exc:
+            cleanup_succeeded = exc.status_code == 404
+            if not cleanup_succeeded:
+                logger.warning(
+                    "Failed to reconcile stale creating session doc %s (%s): %s",
+                    doc_id,
+                    file_path,
+                    exc.detail,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to reconcile stale creating session doc %s (%s)", doc_id, file_path
+            )
+
+        async with connect_agents_db(DB_PATH) as db:
+            if cleanup_succeeded:
+                await db.execute(
+                    "DELETE FROM session_documents WHERE id = ? AND status = 'reconciling'",
+                    (doc_id,),
+                )
+            else:
+                await db.execute(
+                    """UPDATE session_documents SET status = 'creating', updated_at = ?
+                       WHERE id = ? AND status = 'reconciling'""",
+                    (datetime.now().isoformat(), doc_id),
+                )
+            await db.commit()
+
+
 @app.post("/api/session-docs")
 async def create_session_doc(request: SessionDocCreateRequest):
     """Create a new session document."""
+    await _reconcile_stale_creating_session_docs()
     if request.file_path:
         fp = Path(request.file_path)
     else:
@@ -29515,7 +29575,7 @@ async def create_session_doc(request: SessionDocCreateRequest):
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, primarch_name, branch, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, 'creating', ?, ?)""",
             (
                 request.title,
                 str(fp),
@@ -29539,8 +29599,8 @@ async def create_session_doc(request: SessionDocCreateRequest):
             ),
         )
         created = True
-        if request.primarch_name:
-            async with connect_agents_db(DB_PATH) as db:
+        async with connect_agents_db(DB_PATH) as db:
+            if request.primarch_name:
                 await db.execute(
                     "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
                     (now, request.primarch_name),
@@ -29549,18 +29609,28 @@ async def create_session_doc(request: SessionDocCreateRequest):
                     "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
                     (request.primarch_name, doc_id, now),
                 )
-                await db.commit()
-    except Exception:
+            activated = await db.execute(
+                """UPDATE session_documents SET status = 'active', updated_at = ?
+                   WHERE id = ? AND status = 'creating'""",
+                (datetime.now().isoformat(), doc_id),
+            )
+            if activated.rowcount != 1:
+                raise RuntimeError(f"Session-doc reservation {doc_id} is no longer creating")
+            await db.commit()
+    except Exception as exc:
         async with connect_agents_db(DB_PATH) as db:
             await db.execute(
                 "DELETE FROM primarch_session_docs WHERE session_doc_id = ?", (doc_id,)
             )
             await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
             await db.commit()
-        if created:
+        cleanup_file = created or not (
+            isinstance(exc, HTTPException) and exc.status_code in {400, 404, 409}
+        )
+        if cleanup_file:
             try:
                 await _session_docs_facade("delete", fp)
-            except HTTPException:
+            except Exception:
                 logger.exception("Failed to compensate session-doc create for %s", fp)
         raise
 
@@ -30230,6 +30300,7 @@ async def assign_doc_to_instance(instance_id: str, doc_id: int):
 @app.post("/api/instances/{instance_id}/create-doc")
 async def create_doc_for_instance(instance_id: str, request: SessionDocCreateRequest):
     """Create a new session document and assign it to the instance."""
+    await _reconcile_stale_creating_session_docs()
     async with connect_agents_db(DB_PATH) as db:
         # Verify instance exists
         cursor = await db.execute(
@@ -30258,7 +30329,7 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, branch, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'active', ?, ?)""",
+               VALUES (?, ?, ?, ?, 'creating', ?, ?)""",
             (
                 request.title,
                 str(fp),
@@ -30288,6 +30359,8 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
                     "session_doc_policy": "manual_created",
                     "continuity_binding_source": "manual",
                 },
+                where_clause="id = ? AND session_doc_id IS ?",
+                where_params=(instance_id, old_doc_id),
                 mutation_type="continuity_binding_changed",
                 write_source="api",
                 actor="create-doc",
@@ -30314,15 +30387,25 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
                     },
                 ],
             )
+            activated = await db.execute(
+                """UPDATE session_documents SET status = 'active', updated_at = ?
+                   WHERE id = ? AND status = 'creating'""",
+                (datetime.now().isoformat(), doc_id),
+            )
+            if activated.rowcount != 1:
+                raise RuntimeError(f"Session-doc reservation {doc_id} is no longer creating")
             await db.commit()
-    except Exception:
+    except Exception as exc:
         async with connect_agents_db(DB_PATH) as db:
             await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
             await db.commit()
-        if created:
+        cleanup_file = created or not (
+            isinstance(exc, HTTPException) and exc.status_code in {400, 404, 409}
+        )
+        if cleanup_file:
             try:
                 await _session_docs_facade("delete", fp)
-            except HTTPException:
+            except Exception:
                 logger.exception("Failed to compensate instance session-doc create for %s", fp)
         raise
 

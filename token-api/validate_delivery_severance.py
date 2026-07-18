@@ -177,6 +177,16 @@ def test_send_prompt_typing_guard_deferral() -> None:
     status, reason = main._pane_send_terminal_status(result)
     check("deferred send preserves queued", result.get("queued") is True, result.get("queued"))
     check(
+        "deferred send preserves deferred",
+        result.get("deferred") is True,
+        result.get("deferred"),
+    )
+    check(
+        "deferred send preserves status",
+        result.get("status") == "queued",
+        result.get("status"),
+    )
+    check(
         "deferred send preserves queue id",
         result.get("queue_id") == "queue-1",
         result.get("queue_id"),
