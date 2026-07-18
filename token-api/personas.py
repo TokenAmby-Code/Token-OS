@@ -255,7 +255,7 @@ SINGLETON_PERSONAS: tuple[PersonaSeed, ...] = (
     PersonaSeed(
         "administratum",
         "Administratum",
-        "overseer",
+        "scribe",
         None,
         None,
         "#24201a",
@@ -396,7 +396,7 @@ def persona_schema_sql() -> str:
             id TEXT PRIMARY KEY,
             slug TEXT UNIQUE NOT NULL,
             display_name TEXT NOT NULL,
-            default_rank TEXT NOT NULL CHECK (default_rank IN ('astartes','primarch','overseer')),
+            default_rank TEXT NOT NULL CHECK (default_rank IN ('astartes','scribe','primarch','overseer')),
             assignment_pool TEXT CHECK (assignment_pool IN ('primary','backup') OR assignment_pool IS NULL),
             assignment_order INTEGER,
             pane_tint TEXT,
@@ -412,6 +412,18 @@ def persona_schema_sql() -> str:
             CHECK (default_rank = 'astartes' OR assignment_pool IS NULL)
         )
     """
+
+
+def _persona_schema_accepts_scribe(sql: str | None) -> bool:
+    """Return whether a persisted personas schema accepts the Scribe rank."""
+    return bool(sql and "'scribe'" in sql)
+
+
+def _persona_rebuild_sql(table: str) -> str:
+    """Render the canonical personas schema for a migration table name."""
+    return persona_schema_sql().replace(
+        "CREATE TABLE IF NOT EXISTS personas", f"CREATE TABLE {table}", 1
+    )
 
 
 def seed_params(seed: PersonaSeed) -> tuple:
@@ -491,6 +503,27 @@ def _migrate_persona_columns_sync(conn: sqlite3.Connection) -> None:
             conn.execute(sql)
 
 
+def _migrate_persona_rank_constraint_sync(conn: sqlite3.Connection) -> None:
+    """Synchronously rebuild an old personas rank CHECK constraint."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='personas'"
+    ).fetchone()
+    if not row or _persona_schema_accepts_scribe(row[0]):
+        return
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    columns = [item[1] for item in conn.execute("PRAGMA table_info(personas)")]
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    conn.execute("ALTER TABLE personas RENAME TO personas_pre_scribe")
+    conn.execute(_persona_rebuild_sql("personas"))
+    names = ", ".join(columns)
+    conn.execute(f"INSERT INTO personas ({names}) SELECT {names} FROM personas_pre_scribe")
+    conn.execute("DROP TABLE personas_pre_scribe")
+    conn.execute("PRAGMA legacy_alter_table=OFF")
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
 async def _migrate_persona_columns(db: aiosqlite.Connection) -> None:
     cursor = await db.execute("PRAGMA table_info(personas)")
     existing = {row[1] for row in await cursor.fetchall()}
@@ -499,11 +532,35 @@ async def _migrate_persona_columns(db: aiosqlite.Connection) -> None:
             await db.execute(sql)
 
 
+async def _migrate_persona_rank_constraint(db: aiosqlite.Connection) -> None:
+    """Rebuild an old personas rank CHECK constraint without changing rows."""
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='personas'"
+    )
+    row = await cursor.fetchone()
+    if not row or _persona_schema_accepts_scribe(row[0]):
+        return
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys=OFF")
+    cursor = await db.execute("PRAGMA table_info(personas)")
+    columns = [item[1] for item in await cursor.fetchall()]
+    await db.execute("PRAGMA legacy_alter_table=ON")
+    await db.execute("ALTER TABLE personas RENAME TO personas_pre_scribe")
+    await db.execute(_persona_rebuild_sql("personas"))
+    names = ", ".join(columns)
+    await db.execute(f"INSERT INTO personas ({names}) SELECT {names} FROM personas_pre_scribe")
+    await db.execute("DROP TABLE personas_pre_scribe")
+    await db.execute("PRAGMA legacy_alter_table=OFF")
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys=ON")
+
+
 def ensure_personas_table_sync(db_path: Path) -> None:
     with contextlib.closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute(persona_schema_sql())
         _migrate_persona_columns_sync(conn)
+        _migrate_persona_rank_constraint_sync(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_personas_assignment
@@ -517,6 +574,7 @@ def ensure_personas_table_sync(db_path: Path) -> None:
 async def ensure_personas_table(db: aiosqlite.Connection) -> None:
     await db.execute(persona_schema_sql())
     await _migrate_persona_columns(db)
+    await _migrate_persona_rank_constraint(db)
     await db.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_personas_assignment

@@ -150,7 +150,7 @@ VALID_STATUSES = {
     "stopped",
     "archived",
 }
-VALID_RANKS = {"astartes", "overseer", "primarch", "retired"}
+VALID_RANKS = {"astartes", "scribe", "overseer", "primarch", "retired"}
 VALID_NOTIFICATION_MODES = {"verbose", "muted", "silent"}
 VALID_INTERACTION_MODES = {"text", "voice_chat"}
 
