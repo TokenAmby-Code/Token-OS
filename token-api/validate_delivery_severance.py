@@ -25,6 +25,8 @@ Covers:
    honest ``delivered=0`` — never ``failed``.
 5. Loud paths preserved: happy delivery still maps to ``sent``; a genuine daemon
    drop (``delivered:False`` rc0, not severed) still maps to ``failed``.
+6. Typing-guard deferral remains ``pending`` with its durable queue id rather
+   than being flattened to a false terminal ``not_delivered`` verdict.
 """
 
 from __future__ import annotations
@@ -150,6 +152,42 @@ def test_send_prompt_severance() -> None:
     check("severed send maps to delivery_unknown", status == main.PANE_WRITE_UNKNOWN, status)
 
 
+def test_send_prompt_typing_guard_deferral() -> None:
+    orig = shared._tmuxctld_post_json
+
+    def deferred_transport(*_args, **_kwargs):
+        return {
+            "ok": True,
+            "result": {
+                "status": "queued",
+                "queued": True,
+                "deferred": True,
+                "delivered": False,
+                "reason": "user_input_pending",
+                "queue_id": "queue-1",
+            },
+        }
+
+    shared._tmuxctld_post_json = deferred_transport  # type: ignore[assignment]
+    try:
+        result = run(main.send_prompt_to_pane("%1", "hello council"))
+    finally:
+        restore_transport(orig)
+
+    status, reason = main._pane_send_terminal_status(result)
+    check("deferred send preserves queued", result.get("queued") is True, result.get("queued"))
+    check(
+        "deferred send preserves queue id",
+        result.get("queue_id") == "queue-1",
+        result.get("queue_id"),
+    )
+    check(
+        "deferred send -> pending",
+        status == main.PANE_WRITE_PENDING and reason == "user_input_pending",
+        f"{status}/{reason}",
+    )
+
+
 # --- Test 3: _direct_tmux_pane_delivery (rowless path) ----------------------
 
 
@@ -254,6 +292,7 @@ def test_brief_send_rollup() -> None:
 def main_entry() -> int:
     test_terminal_status_mapping()
     test_send_prompt_severance()
+    test_send_prompt_typing_guard_deferral()
     test_direct_delivery_severance()
     test_brief_send_rollup()
     print()

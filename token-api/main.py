@@ -548,6 +548,14 @@ async def send_prompt_to_pane(
         "operation_id": result.get("operation_id") or operation_id,
         "payload_hash": result.get("payload_hash") or _prompt_payload_hash(prompt),
         "gated": False,
+        # Preserve the daemon's typing-guard deferral contract. Dropping these
+        # fields turned a safely queued zero-byte send into delivered=False and
+        # then the false terminal verdict `not_delivered`.
+        "status": result.get("status"),
+        "queued": bool(result.get("queued")),
+        "deferred": bool(result.get("deferred")),
+        "reason": result.get("reason") or result.get("gate_reason"),
+        "queue_id": result.get("queue_id"),
         "verification_status": result.get("verification_status") or "unverified",
         "verified_by": result.get("verified_by"),
         "delivered": bool(result.get("delivered", True)),
@@ -29501,6 +29509,9 @@ async def create_session_doc(request: SessionDocCreateRequest):
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
 
     now = datetime.now().isoformat()
+    # Reserve the id, then release SQLite before invoking the external Obsidian
+    # facade. Holding this write transaction across a subprocess (up to 20
+    # seconds) starves concurrent session-doc writers with `database is locked`.
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, primarch_name, branch, status, created_at, updated_at)
@@ -29516,40 +29527,42 @@ async def create_session_doc(request: SessionDocCreateRequest):
             ),
         )
         doc_id = cursor.lastrowid
+        await db.commit()
 
-        # Auto-link primarch if specified
+    created = False
+    try:
+        await _session_docs_facade(
+            "create",
+            fp,
+            content=session_doc_initial_content(
+                request.title, doc_id, request.project, request.primarch_name
+            ),
+        )
+        created = True
         if request.primarch_name:
-            # Unlink any existing active doc for this primarch
+            async with connect_agents_db(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
+                    (now, request.primarch_name),
+                )
+                await db.execute(
+                    "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
+                    (request.primarch_name, doc_id, now),
+                )
+                await db.commit()
+    except Exception:
+        async with connect_agents_db(DB_PATH) as db:
             await db.execute(
-                "UPDATE primarch_session_docs SET unlinked_at = ? WHERE primarch_name = ? AND unlinked_at IS NULL",
-                (now, request.primarch_name),
+                "DELETE FROM primarch_session_docs WHERE session_doc_id = ?", (doc_id,)
             )
-            await db.execute(
-                "INSERT INTO primarch_session_docs (primarch_name, session_doc_id, linked_at) VALUES (?, ?, ?)",
-                (request.primarch_name, doc_id, now),
-            )
-
-        created = False
-        try:
-            await _session_docs_facade(
-                "create",
-                fp,
-                content=session_doc_initial_content(
-                    request.title, doc_id, request.project, request.primarch_name
-                ),
-            )
-            created = True
+            await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
             await db.commit()
-        except Exception:
-            await db.rollback()
-            # The facade mutation succeeded before the DB commit may have
-            # failed. Compensate so no unlinked note is left behind.
-            if created:
-                try:
-                    await _session_docs_facade("delete", fp)
-                except HTTPException:
-                    logger.exception("Failed to compensate session-doc create for %s", fp)
-            raise
+        if created:
+            try:
+                await _session_docs_facade("delete", fp)
+            except HTTPException:
+                logger.exception("Failed to compensate session-doc create for %s", fp)
+        raise
 
     # Frontmatter mirror of the branch already inserted above (restamp-same is
     # idempotent; the helper never raises on file errors).
@@ -30240,6 +30253,8 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
     if fp.exists():
         raise HTTPException(status_code=409, detail=f"File already exists: {fp}")
 
+    # As above, commit the reservation before the external facade call. The
+    # binding transaction below either completes or compensates the reservation.
     async with connect_agents_db(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO session_documents (title, file_path, project, branch, status, created_at, updated_at)
@@ -30254,59 +30269,62 @@ async def create_doc_for_instance(instance_id: str, request: SessionDocCreateReq
             ),
         )
         doc_id = cursor.lastrowid
+        await db.commit()
 
-        # Assign to instance
-        await update_instance(
-            db,
-            instance_id=instance_id,
-            updates={
-                "session_doc_id": doc_id,
-                "session_doc_policy": "manual_created",
-                "continuity_binding_source": "manual",
-            },
-            mutation_type="continuity_binding_changed",
-            write_source="api",
-            actor="create-doc",
-            workflow_events=[
-                {
-                    "workflow_state": workflow_state,
-                    "event_type": "continuity_binding_changed",
-                    "event_owner": "api",
-                    "details": {
-                        "old_session_doc_id": old_doc_id,
-                        "new_session_doc_id": doc_id,
-                        "continuity_binding_source": "manual",
-                    },
-                },
-                {
-                    "workflow_state": workflow_state,
-                    "event_type": "session_doc_bound",
-                    "event_owner": "api",
-                    "details": {
-                        "session_doc_id": doc_id,
-                        "session_doc_policy": "manual_created",
-                        "continuity_binding_source": "manual",
-                    },
-                },
-            ],
+    created = False
+    try:
+        await _session_docs_facade(
+            "create",
+            fp,
+            content=session_doc_initial_content(request.title, doc_id, request.project),
         )
-        created = False
-        try:
-            await _session_docs_facade(
-                "create",
-                fp,
-                content=session_doc_initial_content(request.title, doc_id, request.project),
+        created = True
+        async with connect_agents_db(DB_PATH) as db:
+            await update_instance(
+                db,
+                instance_id=instance_id,
+                updates={
+                    "session_doc_id": doc_id,
+                    "session_doc_policy": "manual_created",
+                    "continuity_binding_source": "manual",
+                },
+                mutation_type="continuity_binding_changed",
+                write_source="api",
+                actor="create-doc",
+                workflow_events=[
+                    {
+                        "workflow_state": workflow_state,
+                        "event_type": "continuity_binding_changed",
+                        "event_owner": "api",
+                        "details": {
+                            "old_session_doc_id": old_doc_id,
+                            "new_session_doc_id": doc_id,
+                            "continuity_binding_source": "manual",
+                        },
+                    },
+                    {
+                        "workflow_state": workflow_state,
+                        "event_type": "session_doc_bound",
+                        "event_owner": "api",
+                        "details": {
+                            "session_doc_id": doc_id,
+                            "session_doc_policy": "manual_created",
+                            "continuity_binding_source": "manual",
+                        },
+                    },
+                ],
             )
-            created = True
             await db.commit()
-        except Exception:
-            await db.rollback()
-            if created:
-                try:
-                    await _session_docs_facade("delete", fp)
-                except HTTPException:
-                    logger.exception("Failed to compensate instance session-doc create for %s", fp)
-            raise
+    except Exception:
+        async with connect_agents_db(DB_PATH) as db:
+            await db.execute("DELETE FROM session_documents WHERE id = ?", (doc_id,))
+            await db.commit()
+        if created:
+            try:
+                await _session_docs_facade("delete", fp)
+            except HTTPException:
+                logger.exception("Failed to compensate instance session-doc create for %s", fp)
+        raise
 
     # Frontmatter mirror of the branch already inserted above (restamp-same is
     # idempotent; the helper never raises on file errors).
