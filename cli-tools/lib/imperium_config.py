@@ -66,7 +66,6 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_os_runtime": "~/runtimes/Token-OS/live",
         "token_fleet_runtime": "~/runtimes/Token-Fleet/live",
         "vaults_root": "~/Documents",
-        "imperium_env_path": "~/Documents/Imperium-ENV",
         "vault_root": "~/Documents/Imperium-ENV",
         "vault_logs_root": "~/Documents/Imperium-Logs",
     },
@@ -81,7 +80,6 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_os_runtime": "/home/token/runtimes/token-os/live",
         "token_fleet_runtime": "/home/token/runtimes/Token-Fleet/live",
         "vaults_root": "/home/token/vaults",
-        "imperium_env_path": "/home/token/vaults/Imperium-ENV",
         "vault_root": "/home/token/vaults/Imperium-ENV",
         "vault_logs_root": "/home/token/vaults/Imperium-Logs",
     },
@@ -96,7 +94,6 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_os_runtime": "",
         "token_fleet_runtime": "",
         "vaults_root": "",
-        "imperium_env_path": "",
         "vault_root": "",
         "vault_logs_root": "",
     },
@@ -111,7 +108,6 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_os_runtime": "/home/token/runtimes/token-os/live",
         "token_fleet_runtime": "/home/token/runtimes/Token-Fleet/live",
         "vaults_root": "~/vaults",
-        "imperium_env_path": "~/vaults/Imperium-ENV",
         "vault_root": "~/vaults/Imperium-ENV",
         "vault_logs_root": "~/vaults/Imperium-Logs",
     },
@@ -130,7 +126,6 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_os_runtime": "~/runtimes/Token-OS/live",
         "token_fleet_runtime": "~/runtimes/Token-Fleet/live",
         "vaults_root": "~/vaults",
-        "imperium_env_path": "~/vaults/Imperium-ENV",
         "vault_root": "~/vaults/Imperium-ENV",
         "vault_logs_root": "~/vaults/Imperium-Logs",
     },
@@ -149,7 +144,6 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "token_os_runtime": "",
         "token_fleet_runtime": "",
         "vaults_root": "",
-        "imperium_env_path": "",
         "vault_root": "",
         "vault_logs_root": "",
     },
@@ -176,9 +170,6 @@ IMPERIUM_VAULTS_ROOT = os.path.expanduser(
     os.environ.get("IMPERIUM_VAULTS_ROOT") or cfg("vaults_root")
 )
 IMPERIUM_VAULT = os.path.expanduser(os.environ.get("IMPERIUM_VAULT") or cfg("vault_root"))
-IMPERIUM_ENV_PATH = os.path.expanduser(
-    os.environ.get("IMPERIUM_ENV_PATH") or cfg("imperium_env_path")
-)
 IMPERIUM_LOGS_VAULT = os.path.expanduser(
     os.environ.get("IMPERIUM_LOGS_VAULT") or cfg("vault_logs_root")
 )
