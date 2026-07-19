@@ -125,7 +125,6 @@ Modified:
 - `cli-tools/bin/macrodroid-*`
 - `cli-tools/bin/pr-create`, `pr-merge`, `pr-review-loop`
 - `cli-tools/bin/primarch`
-- `cli-tools/bin/push-mobile`
 - `cli-tools/bin/ssh-connect`
 - `cli-tools/bin/stash`
 - `cli-tools/bin/token-restart`
@@ -174,8 +173,6 @@ New:
 - `mobile/macros/morning-setup.*`
 
 Modified:
-- `mobile/termux-bashrc-template` (major)
-- `mobile/termux-properties-template`
 - `mobile/AGENTS.md`, `mobile/macros/MACRODROID.md`
 
 ---
