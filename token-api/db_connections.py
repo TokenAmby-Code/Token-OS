@@ -125,6 +125,32 @@ def _is_locked(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
 
 
+def probe_sqlite_write_readiness(db_path: Path | str) -> dict[str, bool | str | None]:
+    """Report whether SQLite can accept a writer now, without changing data.
+
+    ``SELECT 1`` is insufficient: WAL readers remain healthy while every hook
+    write is blocked. ``BEGIN IMMEDIATE`` exercises the exact writer-reservation
+    boundary and an immediate rollback leaves no application mutation behind.
+    The probe deliberately does not wait behind a writer; readiness describes
+    current admission capacity, while process liveness remains independently
+    true.
+    """
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(Path(db_path).expanduser(), timeout=0, isolation_level=None)
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.rollback()
+        return {"live": True, "ready": True, "reason": None}
+    except sqlite3.OperationalError as exc:
+        if _is_locked(exc):
+            return {"live": True, "ready": False, "reason": "database_locked"}
+        return {"live": True, "ready": False, "reason": "database_unavailable"}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _instrument_async_connection(
     conn: aiosqlite.Connection,
     *,
