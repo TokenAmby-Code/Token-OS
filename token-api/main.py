@@ -10210,29 +10210,6 @@ async def _resolve_administratum_instance() -> dict | None:
     }
 
 
-ADMINISTRATUM_LOG_REL_DIR = Path("Ultramar") / "Logs" / "Mars"
-
-
-def _administratum_vault_root() -> Path:
-    """Return the vault root for the deterministic Administratum state-hook log.
-
-    Tests set IMPERIUM_ENV to a temp vault; production falls back to the
-    module-level OBSIDIAN_VAULT_PATH (env-resolved via IMPERIUM_VAULT).
-    """
-    env_root = os.environ.get("IMPERIUM_ENV")
-    return Path(env_root) if env_root else OBSIDIAN_VAULT_PATH
-
-
-def _administratum_log_path(instance: dict | None) -> Path:
-    """Canonical Administratum record-keeping log for today.
-
-    The deterministic state-hook stream is a daily dispatcher-written log, not an
-    instance/session document.
-    """
-    date = datetime.now().strftime("%Y-%m-%d")
-    return _administratum_vault_root() / ADMINISTRATUM_LOG_REL_DIR / f"administratum-{date}.md"
-
-
 async def _append_administratum_log(
     instance: dict | None,
     *,
@@ -10240,58 +10217,17 @@ async def _append_administratum_log(
     event: StateEvent,
     intervention: CustodesIntervention,
 ) -> None:
-    """Deterministically append a state-hook record to the Administratum log.
+    """DISABLED 2026-07-18: Administratum deterministic log writer, retired with
+    this mac and rebuilt fresh on the new system.
 
-    The DISPATCHER writes this log; Administratum READS it. This split is the
-    load-bearing trick that lets Admin run on Sonnet without burning context on
-    rote logging (Trinity Realization, 2026-05-20).
+    This was the deterministic file sink — the DISPATCHER wrote the state-hook log
+    here and Administratum READ it (the Trinity split that let Admin run on Sonnet
+    without burning context on rote logging, 2026-05-20). The writer is now a no-op
+    so state hooks stop producing the log file; the dispatcher's pane inject is
+    unaffected. Kept as a signature-stable no-op for its two callers in
+    ``_dispatch_administratum_record`` (arguments intentionally unused).
     """
-    path = _administratum_log_path(instance)
-    stamp = datetime.now().strftime("%H:%M:%S")
-    entry_identity = (
-        f"**{classification}** `{intervention.event_type}` "
-        f"sev={intervention.severity} src=`{event.source}`"
-    )
-    dedupe_identity = f"(dedupe `{intervention.dedupe_key}`)"
-    line = f"- `{stamp}` {entry_identity} — observed: {intervention.observed} {dedupe_identity}\n"
-
-    def _header(date: str) -> str:
-        return (
-            f"---\ntitle: Administratum {date}\ntype: log/administratum\n---\n\n"
-            f"# Administratum — {date}\n\n"
-            "Deterministic state-hook record (written by the dispatcher; "
-            "Administratum reads).\n\n## State-hook stream\n\n"
-        )
-
-    def _write():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        date = datetime.now().strftime("%Y-%m-%d")
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        frontmatter_blocks = existing.count("---\n")
-        if existing and frontmatter_blocks != 2:
-            raise RuntimeError(
-                f"malformed Administratum log frontmatter at {path}: "
-                f"expected 1 block, found {frontmatter_blocks // 2}"
-            )
-        if entry_identity in existing and dedupe_identity in existing:
-            logger.info(
-                "Administratum record: duplicate append suppressed for %s:%s",
-                classification,
-                intervention.dedupe_key,
-            )
-            return
-        prefix = _header(date) if not existing else ""
-        with open(path, "a", encoding="utf-8") as fh:
-            if prefix:
-                fh.write(prefix)
-            fh.write(line)
-
-    try:
-        await asyncio.to_thread(_write)
-    except Exception as exc:
-        message = f"Administratum record: log append failed for {path}: {exc}"
-        logger.exception(message)
-        raise RuntimeError(message) from exc
+    return
 
 
 async def _dispatch_administratum_record(
