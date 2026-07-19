@@ -64,7 +64,7 @@ def _post(path: str, body: dict, timeout: float = SEND_CLIENT_TIMEOUT_SECONDS) -
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _ledger_get(path: str, timeout: float = 2.0) -> dict:
+def _ledger_get(path: str, timeout: float = SEND_CLIENT_TIMEOUT_SECONDS) -> dict:
     url = f"{TMUXCTLD_URL}{path}"
     req = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:

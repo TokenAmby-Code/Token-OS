@@ -78,38 +78,61 @@ resolve_instance_id() {
 }
 
 resolve_pane() {
-    local target="${1:-}"
+    local target="${1:-}" rc=0
     if [[ "$target" =~ ^%[0-9]+$ ]]; then
         printf '%s\n' "$target"
         return 0
     fi
-    if ! tmuxctld_resolve physical target "$target"; then
-        printf 'agent-cmd: pane target not found: %s\n' "$target" >&2
-        return 1
+    tmuxctld_resolve physical target "$target" && return 0 || rc=$?
+    # A transport failure (daemon slow/unreachable) is NOT proof the pane is
+    # gone — /resolve-pane runs multi-second under live load. Surface it as a
+    # distinct retryable verdict (exit 3) so callers never treat a registered
+    # pane as unaddressable. Only a daemon ok:false (exit 1) is a missing pane.
+    if [[ "$rc" == 3 ]]; then
+        printf 'agent-cmd: resolve transport error (daemon slow/unreachable) for %s — retryable, not a missing pane\n' "$target" >&2
+        return 3
     fi
+    printf 'agent-cmd: pane target not found: %s\n' "$target" >&2
+    return 1
 }
 
 tmuxctld_resolve() {
     local format="$1" key="$2" value="$3"
-    python3 - "$TMUXCTLD_URL" "$format" "$key" "$value" <<'PY'
+    python3 - "$TMUXCTLD_URL" "$format" "$key" "$value" "$_LIB_DIR" <<'PY'
 import json
+import socket
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-base_url, fmt, key, value = sys.argv[1:]
-query = urllib.parse.urlencode({key: value, "format": fmt})
+base_url, fmt, key, value, lib_dir = sys.argv[1:6]
+# Reuse the canonical client transport budget (no short timeouts on core infra).
+if lib_dir and lib_dir not in sys.path:
+    sys.path.insert(0, lib_dir)
 try:
-    with urllib.request.urlopen(
-        base_url.rstrip("/") + "/resolve-pane?" + query, timeout=10
-    ) as response:
-        payload = json.loads(response.read().decode("utf-8") or "{}")
-except (OSError, ValueError, urllib.error.URLError):
-    raise SystemExit(1)
+    from tmuxctld_timeouts import SEND_CLIENT_TIMEOUT_SECONDS as _TIMEOUT
+except Exception:
+    _TIMEOUT = 75.0  # matches SEND_HOLD_CEILING(60) + CLIENT_TIMEOUT_MARGIN(15)
+
+query = urllib.parse.urlencode({key: value, "format": fmt})
+url = base_url.rstrip("/") + "/resolve-pane?" + query
+try:
+    with urllib.request.urlopen(url, timeout=_TIMEOUT) as response:
+        raw = response.read().decode("utf-8")
+except (urllib.error.URLError, OSError, socket.timeout) as exc:
+    # Timeout / connection refused / daemon 5xx: retryable transport failure.
+    sys.stderr.write("resolve transport error: %s\n" % exc)
+    raise SystemExit(3)
+try:
+    payload = json.loads(raw or "{}")
+except ValueError as exc:
+    sys.stderr.write("resolve transport error: malformed daemon payload: %s\n" % exc)
+    raise SystemExit(3)
 
 result = payload.get("result") if isinstance(payload, dict) and payload.get("ok") is True else None
 if not isinstance(result, str) or not result:
+    # Daemon answered ok:false / empty result: a genuine missing pane.
     raise SystemExit(1)
 print(result)
 PY
