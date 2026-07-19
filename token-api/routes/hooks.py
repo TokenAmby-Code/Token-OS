@@ -152,6 +152,7 @@ _HOOK_DB_LOCKED_BACKOFF = 0.15
 _QUESTION_LOG_TITLE = "AskUserQuestion Log"
 _UNANSWERED_TITLE = "Unanswered Questions"
 _ASKQ_PERSIST_LOCK = asyncio.Lock()
+_STOP_SUBSCRIPTION_WRITE_LOCK = asyncio.Lock()
 VALID_LAUNCH_INSTANCE_TYPES = {"golden_throne", "sync", "one_off", "hook_driven"}
 
 # SessionEnd `reason` values that are NON-terminal: the wrapper is still alive
@@ -1374,6 +1375,14 @@ async def _upsert_stop_subscription(
     )
     row = await lookup.fetchone()
     return int(row[0]) if row else 0
+
+
+async def _commit_stop_subscription(db, **kwargs) -> int:
+    """Serialize the hot stop-subscription writer through one commit boundary."""
+    async with _STOP_SUBSCRIPTION_WRITE_LOCK:
+        subscription_id = await _upsert_stop_subscription(db, **kwargs)
+        await db.commit()
+        return subscription_id
 
 
 async def _auto_subscribe_parent_on_start(
@@ -7080,7 +7089,7 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
             return {"success": False, "action": "target_unresolved"}
         if not subscriber_pane:
             return {"success": False, "action": "subscriber_unresolved"}
-        sub_id = await _upsert_stop_subscription(
+        sub_id = await _commit_stop_subscription(
             db,
             target_instance_id=target_id,
             target_pane=target_pane,
@@ -7092,7 +7101,6 @@ async def subscribe_hook(request: HookSubscribeRequest) -> dict:
             payload=request.payload,
             oneshot=request.oneshot,
         )
-        await db.commit()
     return {
         "success": True,
         "action": "subscribed",

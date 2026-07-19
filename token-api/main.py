@@ -119,6 +119,7 @@ from dailynote_callout import (
 from db_connections import (
     connect_agents_db,
     connect_timer_db,
+    probe_sqlite_write_readiness,
     reset_sqlite_endpoint,
     set_sqlite_endpoint,
 )
@@ -20606,9 +20607,13 @@ async def get_heartbeat_status():
 # Health check
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Process liveness plus critical agents.db write readiness."""
+    db_readiness = await asyncio.to_thread(probe_sqlite_write_readiness, DB_PATH)
     return {
-        "status": "healthy",
+        "status": "healthy" if db_readiness["ready"] else "degraded",
+        "live": True,
+        "ready": db_readiness["ready"],
+        "readiness": {"agents_db_write": db_readiness},
         "timestamp": datetime.now().isoformat(),
         "tts_backend": {
             "current": TTS_BACKEND["current"],
