@@ -188,7 +188,25 @@ fi
 
 (
     exec 0</dev/null 1>/dev/null 2>/dev/null
-    http_code=$(printf '%s' "$HOOK_INPUT" | curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
+    # SessionStart is the codex instances-row registrar: codex has no other
+    # registrar (WrapperStart is telemetry only, and codex lacks the claude-side
+    # SessionStart critical path). A single dropped POST under fleet load (slow
+    # accept / brief SQLite write contention -> http-000) strands a LIVE codex
+    # agent with no registry row -> invisible to liveness oracles + comms routing
+    # -> operator sees "unbound" and re-dispatches (the mechanicus:new churn).
+    # The durable outbox is only a belt here: it drains solely on a token-api
+    # down->up recovery edge, so an enqueued-but-undrained SessionStart never
+    # lands while token-api stays healthy (observed: 97 pending SessionStart rows
+    # at attempts=0). Give the registrar a bounded retry so its row lands now,
+    # mirroring the claude SessionStart sender idiom (claude-config/hooks/
+    # generic-hook.sh). This subshell is already disowned, so the retry runs
+    # after codex's foreground hook returns and never blocks its 5s hooks.json
+    # timeout. Other (high-frequency, non-identity) hooks keep the single-shot post.
+    curl_reg_args=(--max-time 5)
+    if [[ "$ACTION_TYPE" == "SessionStart" ]]; then
+        curl_reg_args=(--max-time 8 --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 12)
+    fi
+    http_code=$(printf '%s' "$HOOK_INPUT" | curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 "${curl_reg_args[@]}" \
         -X POST "${API_URL}/api/hooks/${ACTION_TYPE}" \
         -H "Content-Type: application/json" \
         -d @- 2>/dev/null) || true
