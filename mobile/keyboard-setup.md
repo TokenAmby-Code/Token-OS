@@ -235,5 +235,4 @@ After using for a full day:
 - [ ] Spacebar cursor control working well? → should feel natural for text editing
 - [ ] Missing autocorrect for prose? → Wispr + suggestion strip should cover it
 
-<!-- CD: merging a change under mobile/ to main auto-deploys it — the git-aware
-     token-restart runs `push-mobile -a`, pushing the new assets to the phone. -->
+<!-- Termux shell delivery is owned by Token-Fleet and verified by payload hash. -->

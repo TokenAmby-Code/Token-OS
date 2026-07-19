@@ -99,6 +99,7 @@ _IMPERIUM_CFG_mac_token_os_runtime="$HOME/runtimes/Token-OS/live"
 _IMPERIUM_CFG_mac_token_fleet_runtime="$HOME/runtimes/Token-Fleet/live"
 _IMPERIUM_CFG_mac_vaults_root="$HOME/Documents"
 _IMPERIUM_CFG_mac_vault_root="$HOME/Documents/Imperium-ENV"
+_IMPERIUM_CFG_mac_imperium_env_path="$HOME/Documents/Imperium-ENV"
 _IMPERIUM_CFG_mac_vault_logs_root="$HOME/Documents/Imperium-Logs"
 
 # --- WSL (Ubuntu on Windows PC) ---
@@ -114,6 +115,7 @@ _IMPERIUM_CFG_wsl_token_os_runtime="/home/token/runtimes/token-os/live"
 _IMPERIUM_CFG_wsl_token_fleet_runtime="/home/token/runtimes/Token-Fleet/live"
 _IMPERIUM_CFG_wsl_vaults_root="/home/token/vaults"
 _IMPERIUM_CFG_wsl_vault_root="/home/token/vaults/Imperium-ENV"
+_IMPERIUM_CFG_wsl_imperium_env_path="/home/token/vaults/Imperium-ENV"
 _IMPERIUM_CFG_wsl_vault_logs_root="/home/token/vaults/Imperium-Logs"
 
 # --- Phone (Termux) ---
@@ -129,6 +131,7 @@ _IMPERIUM_CFG_phone_token_os_runtime=""
 _IMPERIUM_CFG_phone_token_fleet_runtime=""
 _IMPERIUM_CFG_phone_vaults_root=""
 _IMPERIUM_CFG_phone_vault_root=""
+_IMPERIUM_CFG_phone_imperium_env_path=""
 _IMPERIUM_CFG_phone_vault_logs_root=""
 
 # --- Linux fallback ---
@@ -144,6 +147,7 @@ _IMPERIUM_CFG_linux_token_os_runtime="/home/token/runtimes/token-os/live"
 _IMPERIUM_CFG_linux_token_fleet_runtime="/home/token/runtimes/Token-Fleet/live"
 _IMPERIUM_CFG_linux_vaults_root="$HOME/vaults"
 _IMPERIUM_CFG_linux_vault_root="$HOME/vaults/Imperium-ENV"
+_IMPERIUM_CFG_linux_imperium_env_path="$HOME/vaults/Imperium-ENV"
 _IMPERIUM_CFG_linux_vault_logs_root="$HOME/vaults/Imperium-Logs"
 
 # --- K12 personal (GMKtec K12; Imperium domain — replaces the Mac Mini) ---
@@ -165,6 +169,7 @@ _IMPERIUM_CFG_k12_personal_token_os_runtime="$HOME/runtimes/Token-OS/live"
 _IMPERIUM_CFG_k12_personal_token_fleet_runtime="$HOME/runtimes/Token-Fleet/live"
 _IMPERIUM_CFG_k12_personal_vaults_root="$HOME/vaults"
 _IMPERIUM_CFG_k12_personal_vault_root="$HOME/vaults/Imperium-ENV"
+_IMPERIUM_CFG_k12_personal_imperium_env_path="$HOME/vaults/Imperium-ENV"
 _IMPERIUM_CFG_k12_personal_vault_logs_root="$HOME/vaults/Imperium-Logs"
 
 # --- K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE) ---
@@ -183,6 +188,7 @@ _IMPERIUM_CFG_k12_work_token_os_runtime=""
 _IMPERIUM_CFG_k12_work_token_fleet_runtime=""
 _IMPERIUM_CFG_k12_work_vaults_root=""
 _IMPERIUM_CFG_k12_work_vault_root=""
+_IMPERIUM_CFG_k12_work_imperium_env_path=""
 _IMPERIUM_CFG_k12_work_vault_logs_root=""
 
 # ============================================================
@@ -225,6 +231,7 @@ export CIVIC="$(imperium_cfg nas_civic)"
 # an archive/exchange mount, never a fallback vault root.
 export IMPERIUM_VAULTS_ROOT="$(imperium_cfg vaults_root)"
 export IMPERIUM_VAULT="$(imperium_cfg vault_root)"
+export IMPERIUM_ENV_PATH="$(imperium_cfg imperium_env_path)"
 export IMPERIUM_LOGS_VAULT="$(imperium_cfg vault_logs_root)"
 
 imperium_vault_pair_is_valid() {
