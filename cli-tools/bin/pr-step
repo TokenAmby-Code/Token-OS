@@ -1491,12 +1491,12 @@ if [[ -z "$CURRENT_BRANCH" ]]; then
     error "Cannot determine current branch (detached HEAD?)"
     exit 1
 fi
-if ! gh_args_have_head "${GH_ARGS[@]}"; then
+if ! gh_args_have_head ${GH_ARGS[@]+"${GH_ARGS[@]}"}; then
     GH_ARGS+=(--head "$CURRENT_BRANCH")
 fi
 
 # Create the PR and capture URL
-PR_URL=$(gh pr create "${GH_ARGS[@]}" 2>&1) || {
+PR_URL=$(gh pr create ${GH_ARGS[@]+"${GH_ARGS[@]}"} 2>&1) || {
     error "Failed to create PR: $PR_URL"
     exit 1
 }
