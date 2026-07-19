@@ -349,18 +349,8 @@ Place logs at entry, after parsing, inside iterations, and before/after constrai
 
 ## Termux Configuration
 
-### Templates
-
-- `termux-bashrc-template` - Bash configuration with aliases and shortcuts
-- `termux-properties-template` - Termux appearance/behavior settings
-
-### Key Aliases (from bashrc)
-
-```bash
-ssh-mac         # SSH to Mac Mini (with redirect-on-exit)
-ssh-wsl         # SSH to WSL (with redirect-on-exit)
-fetch-bashrc    # Pull latest bashrc from Mac
-```
+Termux bash, properties, tmux, and toolbar assets are owned by
+`Token-Fleet/machines/phone`. Token-OS owns only phone automation schemas.
 
 ### Storage Access
 

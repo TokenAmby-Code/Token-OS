@@ -138,7 +138,7 @@ Smart-deploy flow (default):
          token-api/**/*.py|uv.lock|pyproject.toml  → Mac token-api
          token-api/{ui,web}/ops/**                  → token-api + reload ops tabs
          discord-daemon/**                          → Discord daemon (launchd)
-         mobile/**                                    → push-mobile -a (phone)
+         mobile/macros/**                             → phone automation is applied separately
        WSL is a potentially-OFF node (device-doctrine ruling #9): the Mac
        deploy no longer pushes to it. WSL converges to the deployed SHA on its
        own boot/reconnect (event-driven, verified by /health.git_sha parity).
@@ -1752,22 +1752,14 @@ PYEOF
 # ============ Mobile ============
 
 restart_mobile() {
-    echo -e "${BLUE}→${NC} Deploying mobile (push-mobile -a)..."
-    # Resolve PATH-first (the standard cli-tools push-mobile), falling back to our
-    # sibling in _BIN_DIR if PATH doesn't carry it (e.g. a bare CD environment).
-    local push_mobile
-    push_mobile="$(command -v push-mobile 2>/dev/null || true)"
-    [[ -n "$push_mobile" ]] || push_mobile="${_BIN_DIR}/push-mobile"
-    if [[ ! -x "$push_mobile" ]]; then
-        echo -e "  ${YELLOW}⚠${NC} push-mobile not found — skipping mobile deploy"
-        return 0
-    fi
-    # push-mobile validates + pushes the mobile/ tree to the phone. Fire it but
-    # never let a phone-unreachable push fail the whole deploy.
-    if "$push_mobile" -a; then
-        echo -e "  ${GREEN}✓${NC} push-mobile completed"
+    echo -e "${BLUE}→${NC} Deploying Fleet-owned phone shell from k12-personal..."
+    # Token-Fleet owns all Termux shell assets. Execute its versioned, hash-
+    # verified delivery on the fleet hub; Token-OS carries no fallback copy.
+    local fleet_push='~/runtimes/Token-Fleet/live/shared/bin/push-phone-shell'
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 k12-personal "$fleet_push"; then
+        echo -e "  ${GREEN}✓${NC} Token-Fleet phone payload applied"
     else
-        echo -e "  ${YELLOW}⚠${NC} push-mobile failed (continuing)"
+        echo -e "  ${YELLOW}⚠${NC} Token-Fleet phone delivery failed (continuing)"
     fi
 }
 
@@ -2065,7 +2057,7 @@ full_restart() {
         fi
     fi
     if [[ "$RESTART_MOBILE" == true ]]; then
-        echo -e "  Mobile:  ${GREEN}●${NC} push-mobile dispatched"
+        echo -e "  Mobile:  ${GREEN}●${NC} Token-Fleet payload dispatched"
     fi
     if (( ${#SIDECAR_DEGRADED[@]} > 0 )); then
         echo -e "  Sidecars:${YELLOW}⚠${NC} degraded (${SIDECAR_DEGRADED[*]})"
