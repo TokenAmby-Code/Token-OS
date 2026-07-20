@@ -18,6 +18,16 @@ QUEUE_BIN="${GENERIC_TOKEN_API_DURABLE_RETRY_OUTBOX_BIN:-generic-token-api-durab
 STALE_THRESHOLD="${TOKEN_API_STALE_THRESHOLD:-180}"
 COOLDOWN="${TOKEN_API_RESTART_COOLDOWN:-300}"
 ESCALATE_THRESHOLD="${TOKEN_API_ESCALATE_THRESHOLD:-600}"
+# FastAPI's observed controlled shutdown completes in about one second. Ten
+# seconds gives in-flight request cleanup a 10x margin while remaining well
+# below the watchdog's 60-second launchd cadence. The wait is a kqueue process-
+# exit event with this explicit deadline, not a status poll.
+TERM_GRACE_SECONDS="${TOKEN_API_TERM_GRACE_SECONDS:-10}"
+
+[[ "$TERM_GRACE_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'tokenapi-watchdog: TOKEN_API_TERM_GRACE_SECONDS must be a positive integer\n' >&2
+  exit 1
+}
 
 now_epoch() { date +%s; }
 
@@ -53,6 +63,60 @@ heartbeat_age() {
   mtime=$(stat -f %m "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
   printf '%s\n' "$(( $(now_epoch) - mtime ))"
 }
+
+wait_for_pid_exit() {
+  local pid="$1" grace_seconds="$2"
+  python3 - "$pid" "$grace_seconds" <<'PY'
+import errno
+import os
+import select
+import sys
+
+pid = int(sys.argv[1])
+timeout = int(sys.argv[2])
+
+# Resolve the TERM->observer registration race once. This is not a poll: if the
+# process is still present, kqueue supplies the actual NOTE_EXIT event.
+try:
+    os.kill(pid, 0)
+except ProcessLookupError:
+    raise SystemExit(0)
+except PermissionError as exc:
+    print(f"cannot observe pid {pid}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    kqueue = select.kqueue()
+    event = select.kevent(
+        pid,
+        filter=select.KQ_FILTER_PROC,
+        flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+        fflags=select.KQ_NOTE_EXIT,
+    )
+    observed = kqueue.control([event], 1, timeout)
+except OSError as exc:
+    if exc.errno == errno.ESRCH:
+        raise SystemExit(0)
+    print(f"cannot observe pid {pid}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+except (AttributeError, ValueError) as exc:
+    print(f"cannot observe pid {pid}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+raise SystemExit(0 if observed else 124)
+PY
+}
+
+# Hermetic entry point for exercising the real kqueue observer without running
+# the watchdog's stale-process recovery flow.
+if [[ "${1:-}" == "--wait-for-pid-exit" ]]; then
+  [[ $# -eq 3 ]] || {
+    printf 'usage: tokenapi-watchdog --wait-for-pid-exit PID SECONDS\n' >&2
+    exit 2
+  }
+  wait_for_pid_exit "$2" "$3"
+  exit $?
+fi
 
 drain_hook_queue() {
   command -v "$QUEUE_BIN" >/dev/null 2>&1 || [[ -x "$QUEUE_BIN" ]] || {
@@ -108,8 +172,43 @@ log "stale age=${age_s}s >= ${STALE_THRESHOLD}s — kickstarting $SERVICE_LABEL"
 
 stale_pid=$(lsof -ti:"$PORT" 2>/dev/null | head -n1 || true)
 if [[ -n "$stale_pid" ]]; then
-  log "killing stale PID $stale_pid on port $PORT"
-  kill -9 "$stale_pid" 2>/dev/null || true
+  log "sending SIGTERM to stale PID $stale_pid on port $PORT"
+  set +e
+  signal_error=$(kill -TERM "$stale_pid" 2>&1)
+  signal_rc=$?
+  set -e
+  if (( signal_rc != 0 )); then
+    if [[ "$signal_error" == *"No such process"* || "$signal_error" == *"no such process"* ]]; then
+      log "stale PID $stale_pid was already gone before SIGTERM delivery"
+      stale_pid=""
+    else
+      log "SIGTERM failed for stale PID $stale_pid: ${signal_error:-unknown error} — refusing blind escalation"
+      exit 1
+    fi
+  fi
+
+  if [[ -n "$stale_pid" ]]; then
+    set +e
+    wait_for_pid_exit "$stale_pid" "$TERM_GRACE_SECONDS"
+    wait_rc=$?
+    set -e
+    case "$wait_rc" in
+      0)
+        log "stale PID $stale_pid exited after SIGTERM"
+        ;;
+      124)
+        log "SIGTERM grace deadline ${TERM_GRACE_SECONDS}s expired for stale PID $stale_pid — sending one SIGKILL"
+        if ! kill -KILL "$stale_pid" 2>/dev/null; then
+          log "SIGKILL failed for stale PID $stale_pid"
+          exit 1
+        fi
+        ;;
+      *)
+        log "process-exit observation failed rc=$wait_rc for stale PID $stale_pid — refusing blind SIGKILL"
+        exit 1
+        ;;
+    esac
+  fi
 fi
 
 if launchctl kickstart -k "gui/$UID/$SERVICE_LABEL" >/dev/null 2>&1; then
