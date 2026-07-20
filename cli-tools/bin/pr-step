@@ -347,19 +347,19 @@ arm_pr_plan_followup() {
     case "$stage" in
         review)
             [[ -n "$summary" ]] || summary="plan fixes or next review action."
-            prompt="/plan PR #${pr} review returned"
+            prompt="plan PR #${pr} review returned"
             [[ -n "$url" ]] && prompt+=" (${url})"
             context="$(pr_plan_followup_context "$pr" 2>/dev/null || true)"
             prompt+="; ${summary}"
             [[ -n "$context" ]] && prompt+=$'\n\n'"${context}"
-            # Plan-cycled agents lose their place unless the plan they pose is a
-            # continuation plan; /postplan makes the injected plan capture state,
-            # reference map, and exact remaining steps before context clears.
-            prompt+=$'\n\n'"/postplan"
+            # Deliberately de-slashed (Mac-era stopgap): a leading-slash token
+            # here plan-cycles the receiving seat. The payload stays inert
+            # prose; "postplan" is information, not a skill invocation.
+            prompt+=$'\n\n'"postplan"
             ;;
         merge)
             [[ -n "$summary" ]] || summary="summarize closure and update context."
-            prompt="/plan PR #${pr} merged"
+            prompt="plan PR #${pr} merged"
             [[ -n "$url" ]] && prompt+=" (${url})"
             prompt+="; ${summary}"
             ;;
