@@ -3,7 +3,7 @@
 
 import { Client, GatewayIntentBits, Partials, Events } from 'discord.js';
 import { readFileSync, writeFileSync, existsSync, chmodSync, realpathSync } from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import {
@@ -70,54 +70,35 @@ const KEYCHAIN_TO_ENV = {
   'discord-bot-token-imperial-guard': 'DISCORD_BOT_TOKEN_IMPERIAL_GUARD',
 };
 
-// Backfill .env from keychain so launchd can use it next boot
-function backfillEnv(config) {
-  try {
-    const bots = config.bots || {};
-    const lines = [];
-    for (const [, botCfg] of Object.entries(bots)) {
-      const svc = botCfg.keychain_service;
-      const envKey = KEYCHAIN_TO_ENV[svc];
-      if (!svc || !envKey) continue;
-      try {
-        const token = execSync(
-          `security find-generic-password -s "${svc}" -w`,
-          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
-        ).trim();
-        if (token) lines.push(`${envKey}=${token}`);
-      } catch { /* skip missing tokens */ }
-    }
-    if (lines.length > 0) {
-      writeFileSync(ENV_PATH, lines.join('\n') + '\n', { encoding: 'utf-8', mode: 0o600 });
-    }
-  } catch { /* non-fatal — .env is a convenience cache */ }
-}
-
-function getToken(config, botConfig = null) {
+// Token resolution priority: keychain (canonical, config.token_source) first,
+// then the .env cache, then the fallback JSON file. The .env file is ONLY a
+// cache for launchd boots where the keychain is locked/unavailable — it must
+// never shadow a live keychain read, or a rotated keychain token can never
+// take effect while a stale cache exists (that wedge kept dead tokens in use
+// after the 2026-07-17 fleet-wide token invalidation).
+/**
+ * @returns {{token: string, source: 'keychain'|'env'|'fallback_file', keychainService: string|undefined}}
+ */
+export function resolveBotToken(config, botConfig, { readKeychainToken, envTokens }) {
   const keychainService = botConfig?.keychain_service
     || config.token_keychain_service
     || config.bots?.mechanicus?.keychain_service;
 
-  // Priority 1: .env file (reliable for launchd)
-  if (keychainService) {
-    const envKey = KEYCHAIN_TO_ENV[keychainService];
-    if (envKey && envTokens[envKey]) return envTokens[envKey];
-  }
-
-  // Priority 2: macOS keychain (+ backfill .env for next boot)
+  // Priority 1: macOS keychain — canonical source
   if (config.token_source === 'keychain' && keychainService) {
     try {
-      const token = execSync(
-        `security find-generic-password -s "${keychainService}" -w`,
-        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
-      ).trim();
-      if (token) {
-        // Keychain worked — backfill .env so launchd has it next time
-        if (!existsSync(ENV_PATH)) backfillEnv(config);
-        return token;
-      }
+      const token = String(readKeychainToken(keychainService) || '').trim();
+      if (token) return { token, source: 'keychain', keychainService };
     } catch {
-      // Fall through
+      // Keychain locked/unavailable (headless launchd boot) — fall through
+    }
+  }
+
+  // Priority 2: .env cache (survives a locked keychain under launchd)
+  if (keychainService) {
+    const envKey = KEYCHAIN_TO_ENV[keychainService];
+    if (envKey && envTokens[envKey]) {
+      return { token: envTokens[envKey], source: 'env', keychainService };
     }
   }
 
@@ -129,7 +110,7 @@ function getToken(config, botConfig = null) {
       const keys = config.token_fallback_path.split('.');
       let val = data;
       for (const k of keys) val = val[k];
-      return val;
+      if (val) return { token: val, source: 'fallback_file', keychainService };
     } catch {
       // Fall through
     }
@@ -138,6 +119,36 @@ function getToken(config, botConfig = null) {
   throw new Error(`No Discord bot token found for bot${botConfig ? ` (${botConfig.keychain_service})` : ''}`);
 }
 
+function readKeychainToken(service) {
+  // Argument array, not shell interpolation: the service name must never be
+  // parsed by a shell.
+  return execFileSync(
+    'security', ['find-generic-password', '-s', service, '-w'],
+    { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
+  ).trim();
+}
+
+// Keep the launchd .env cache in sync with the keychain, preserving entries
+// the keychain does not hold (e.g. a bot whose token only lives in .env).
+function refreshEnvCache(keychainService, token) {
+  const envKey = KEYCHAIN_TO_ENV[keychainService];
+  if (!envKey || envTokens[envKey] === token) return;
+  envTokens[envKey] = token;
+  try {
+    const lines = Object.entries(envTokens).map(([k, v]) => `${k}=${v}`);
+    writeFileSync(ENV_PATH, lines.join('\n') + '\n', { encoding: 'utf-8', mode: 0o600 });
+  } catch { /* non-fatal — .env is a convenience cache */ }
+}
+
+function getToken(config, botConfig = null) {
+  const resolved = resolveBotToken(config, botConfig, { readKeychainToken, envTokens });
+  if (resolved.source === 'keychain') refreshEnvCache(resolved.keychainService, resolved.token);
+  return resolved.token;
+}
+
+/**
+ * @returns {object} client handle: { start, stop, sendMessage, getStatus, ... }
+ */
 export function createDiscordClient(config, logger, botName = 'mechanicus', botConfig = null) {
   const resolvedBotConfig = botConfig || config.bots?.[botName] || null;
   const token = getToken(config, resolvedBotConfig);
@@ -287,25 +298,33 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
   });
 
   // Reconnection handling — discord.js v14 handles this automatically
-  // but we log the events
+  // but we log the events. Every line carries the bot name: untagged
+  // "Disconnected (code 4004)" lines made the 2026-07-17 token invalidation
+  // undiagnosable without correlating timestamps by hand.
   client.on(Events.ShardDisconnect, (event) => {
-    logger.warn(`Disconnected (code ${event.code}). discord.js will auto-reconnect.`);
+    const authFailed = event.code === 4004;
+    logger.warn(
+      `[${botName}] Disconnected (code ${event.code}).` +
+      (authFailed
+        ? ' Authentication failed — token invalid/rotated; gateway and REST stay dead until a valid token is provisioned and the daemon restarts.'
+        : ' discord.js will auto-reconnect.'),
+    );
   });
 
   client.on(Events.ShardReconnecting, () => {
-    logger.info('Reconnecting...');
+    logger.info(`[${botName}] Reconnecting...`);
   });
 
   client.on(Events.ShardResume, (_, replayedEvents) => {
-    logger.info(`Resumed. Replayed ${replayedEvents} events.`);
+    logger.info(`[${botName}] Resumed. Replayed ${replayedEvents} events.`);
   });
 
   client.on(Events.Error, (error) => {
-    logger.error(`Client error: ${error.message}`);
+    logger.error(`[${botName}] Client error: ${error.message}`);
   });
 
   client.on(Events.Warn, (warning) => {
-    logger.warn(`Client warning: ${warning}`);
+    logger.warn(`[${botName}] Client warning: ${warning}`);
   });
 
   return {
@@ -448,7 +467,12 @@ export function createDiscordClient(config, logger, botName = 'mechanicus', botC
 
     getStatus() {
       return {
-        connected: client.ws.status === 0, // 0 = READY
+        // ws.status goes stale after discord.js gives up on an unrecoverable
+        // close (4004): a destroyed client kept reporting READY for three days
+        // while inbound and REST were dead. destroy() nulls the token — gate
+        // connectedness on it.
+        connected: client.ws.status === 0 && client.token !== null, // 0 = READY
+        token_present: client.token !== null,
         status: client.ws.status,
         ping: client.ws.ping,
         uptime: client.uptime,

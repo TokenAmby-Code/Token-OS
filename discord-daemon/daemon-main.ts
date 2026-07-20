@@ -2,8 +2,9 @@
 // Maintains WebSocket connection, exposes local HTTP API
 
 import { createDiscordClient, createBotClients, loadConfig } from './discord-client.ts';
+import { createBotLogin } from './bot-login.ts';
 import { createHttpServer } from './http-server.ts';
-import { createMessageStore } from './message-store.ts';
+import { createMessageStore, isStalePending } from './message-store.ts';
 import { createVoiceManager } from './voice.ts';
 import { createTranscriber } from './transcribe.ts';
 import { writeFileSync, unlinkSync, mkdirSync, appendFileSync, readFileSync } from 'fs';
@@ -354,16 +355,10 @@ async function main() {
     logger.info(`Recovering ${pending.length} pending messages...`);
   }
 
-  // Start all bot clients (mechanicus first as it's the listener)
-  for (const [name, client] of Object.entries(botClients)) {
-    try {
-      await client.start();
-      logger.info(`Bot '${name}' connected`);
-    } catch (err) {
-      logger.warn(`Bot '${name}' failed to connect: ${err.message}`);
-      delete botClients[name];
-    }
-  }
+  // Start all bot clients (mechanicus first as it's the listener). Failed
+  // logins retry on the same client with bounded backoff — see bot-login.ts.
+  const botLogin = createBotLogin({ botClients, logger });
+  await botLogin.startAll();
 
   await voiceManager.reconcileOperatorVoiceState();
 
@@ -448,6 +443,14 @@ async function main() {
   for (const msg of pending) {
     const pendingFile = msg._filename ? join(BASE_DIR, 'pending', msg._filename) : null;
     try {
+      if (isStalePending(msg)) {
+        logger.warn(
+          `Dropping stale pending message (persisted_at=${msg.persisted_at || 'unknown'}, ` +
+          `channel=${msg.channel}): human-facing messages are never replayed late`,
+        );
+        if (pendingFile) { try { unlinkSync(pendingFile); } catch {} }
+        continue;
+      }
       const channelId = config.channels[msg.channel] || msg.channelId;
       if (channelId && msg.content && SNOWFLAKE_RE.test(channelId)) {
         const result = await discordClient.sendMessage(channelId, msg.content);
