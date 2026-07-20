@@ -107,6 +107,17 @@ raise SystemExit(0 if observed else 124)
 PY
 }
 
+# Hermetic entry point for exercising the real kqueue observer without running
+# the watchdog's stale-process recovery flow.
+if [[ "${1:-}" == "--wait-for-pid-exit" ]]; then
+  [[ $# -eq 3 ]] || {
+    printf 'usage: tokenapi-watchdog --wait-for-pid-exit PID SECONDS\n' >&2
+    exit 2
+  }
+  wait_for_pid_exit "$2" "$3"
+  exit $?
+fi
+
 drain_hook_queue() {
   command -v "$QUEUE_BIN" >/dev/null 2>&1 || [[ -x "$QUEUE_BIN" ]] || {
     log "recovery detected but outbox drainer not found: $QUEUE_BIN"
@@ -162,31 +173,42 @@ log "stale age=${age_s}s >= ${STALE_THRESHOLD}s — kickstarting $SERVICE_LABEL"
 stale_pid=$(lsof -ti:"$PORT" 2>/dev/null | head -n1 || true)
 if [[ -n "$stale_pid" ]]; then
   log "sending SIGTERM to stale PID $stale_pid on port $PORT"
-  if ! kill -TERM "$stale_pid" 2>/dev/null; then
-    log "SIGTERM failed for stale PID $stale_pid — refusing blind escalation"
-    exit 1
+  set +e
+  signal_error=$(kill -TERM "$stale_pid" 2>&1)
+  signal_rc=$?
+  set -e
+  if (( signal_rc != 0 )); then
+    if [[ "$signal_error" == *"No such process"* || "$signal_error" == *"no such process"* ]]; then
+      log "stale PID $stale_pid was already gone before SIGTERM delivery"
+      stale_pid=""
+    else
+      log "SIGTERM failed for stale PID $stale_pid: ${signal_error:-unknown error} — refusing blind escalation"
+      exit 1
+    fi
   fi
 
-  set +e
-  wait_for_pid_exit "$stale_pid" "$TERM_GRACE_SECONDS"
-  wait_rc=$?
-  set -e
-  case "$wait_rc" in
-    0)
-      log "stale PID $stale_pid exited after SIGTERM"
-      ;;
-    124)
-      log "SIGTERM grace deadline ${TERM_GRACE_SECONDS}s expired for stale PID $stale_pid — sending one SIGKILL"
-      if ! kill -KILL "$stale_pid" 2>/dev/null; then
-        log "SIGKILL failed for stale PID $stale_pid"
+  if [[ -n "$stale_pid" ]]; then
+    set +e
+    wait_for_pid_exit "$stale_pid" "$TERM_GRACE_SECONDS"
+    wait_rc=$?
+    set -e
+    case "$wait_rc" in
+      0)
+        log "stale PID $stale_pid exited after SIGTERM"
+        ;;
+      124)
+        log "SIGTERM grace deadline ${TERM_GRACE_SECONDS}s expired for stale PID $stale_pid — sending one SIGKILL"
+        if ! kill -KILL "$stale_pid" 2>/dev/null; then
+          log "SIGKILL failed for stale PID $stale_pid"
+          exit 1
+        fi
+        ;;
+      *)
+        log "process-exit observation failed rc=$wait_rc for stale PID $stale_pid — refusing blind SIGKILL"
         exit 1
-      fi
-      ;;
-    *)
-      log "process-exit observation failed rc=$wait_rc for stale PID $stale_pid — refusing blind SIGKILL"
-      exit 1
-      ;;
-  esac
+        ;;
+    esac
+  fi
 fi
 
 if launchctl kickstart -k "gui/$UID/$SERVICE_LABEL" >/dev/null 2>&1; then

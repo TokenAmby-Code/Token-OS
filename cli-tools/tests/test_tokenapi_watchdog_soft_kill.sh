@@ -30,6 +30,10 @@ EOF
 cat > "$TMP/bin/kill" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$WATCHDOG_TEST_KILL_LOG"
+if [[ "${WATCHDOG_TEST_TERM_ESRCH:-0}" == 1 && "${1:-}" == -TERM ]]; then
+  printf 'kill: (%s) - No such process\n' "${2:-}" >&2
+  exit 1
+fi
 exit "${WATCHDOG_TEST_KILL_RC:-0}"
 EOF
 cat > "$TMP/bin/launchctl" <<'EOF'
@@ -96,6 +100,29 @@ if grep -q -- '-KILL\|-9' "$TMP/observer_failure/kills"; then
 fi
 [[ ! -s "$TMP/observer_failure/launchctl" ]]
 grep -q 'process-exit observation failed' "$TMP/observer_failure/watchdog.log"
+
+WATCHDOG_TEST_TERM_ESRCH=1 run_case already_gone 0
+[[ "$(cat "$TMP/already_gone/rc")" == 0 ]]
+[[ "$(cat "$TMP/already_gone/kills")" == '-TERM 4242' ]]
+[[ ! -s "$TMP/already_gone/waits" ]]
+grep -q 'already gone before SIGTERM delivery' "$TMP/already_gone/watchdog.log"
+grep -q 'kickstart -k gui/.*/ai.openclaw.tokenapi' "$TMP/already_gone/launchctl"
+
+# Exercise the production kqueue observer rather than the python3 dispatch stub.
+python3 -c 'import time; time.sleep(30)' & graceful_pid=$!
+( sleep 0.2; kill -TERM "$graceful_pid" ) &
+bash "$WATCHDOG" --wait-for-pid-exit "$graceful_pid" 2
+wait "$graceful_pid" 2>/dev/null || true
+
+python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)' & timeout_pid=$!
+sleep 0.2
+set +e
+bash "$WATCHDOG" --wait-for-pid-exit "$timeout_pid" 1
+observer_rc=$?
+set -e
+[[ "$observer_rc" == 124 ]]
+kill -KILL "$timeout_pid"
+wait "$timeout_pid" 2>/dev/null || true
 
 # Scope pin: only the PID returned for the Token-API port may be signaled.
 if grep -R -E 'tmux|pane|wrapper' "$TMP"/*/kills; then
