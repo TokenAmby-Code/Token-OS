@@ -20,6 +20,7 @@ import mimetypes
 import os
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import sys
@@ -27743,7 +27744,9 @@ async def inbox_create(request: InboxCreateRequest):
 
 # ---- Stage 2: Implantation ----
 
-OBSIDIAN_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "obsidian")
+# The obsidian CLI is Token-Fleet-owned and reached by ordinary PATH contract;
+# Token-OS holds no copy of it.
+OBSIDIAN_CLI = "obsidian"
 WEB_SEARCH_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "web-search")
 DISCORD_CLI = str(SCRIPTS_DIR / "cli-tools" / "bin" / "discord")
 
@@ -29413,9 +29416,8 @@ async def _session_docs_facade(operation: str, file_path: str | Path, **payload)
     vault, relative_path = _session_doc_vault_and_path(file_path)
     request_payload = {"path": relative_path, **payload}
     encoded = base64.b64encode(json.dumps(request_payload).encode("utf-8")).decode("ascii")
-    obsidian_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "obsidian"
     proc = await _run_subprocess_offloop(
-        (str(obsidian_bin), f"vault={vault}", "session-docs", operation, f"request={encoded}"),
+        ("obsidian", f"vault={vault}", "session-docs", operation, f"request={encoded}"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -29741,12 +29743,11 @@ async def open_session_doc(doc_id: int):
     note = note_rel[:-3] if note_rel.endswith(".md") else note_rel
     obsidian_uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(note)}"
 
-    obsidian_bin = SCRIPTS_DIR / "cli-tools" / "bin" / "obsidian"
-    if not obsidian_bin.exists():
+    if shutil.which("obsidian") is None:
         raise HTTPException(status_code=500, detail="obsidian CLI not found")
 
     proc = await _run_subprocess_offloop(
-        (str(obsidian_bin), f"vault={vault_name}", "open", f"path={note_rel}"),
+        ("obsidian", f"vault={vault_name}", "open", f"path={note_rel}"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
