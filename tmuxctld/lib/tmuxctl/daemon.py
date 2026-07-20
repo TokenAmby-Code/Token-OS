@@ -64,6 +64,7 @@ from .skill_invoke import (
     resolve_agent_for_pane,
 )
 from .tmux_adapter import (
+    HISTORY_SEARCH_OVERLAY_RE,
     TmuxAdapter,
     TmuxError,
     TmuxSendGated,
@@ -862,6 +863,26 @@ class DeferredSendQueue:
                 counts[pane] = counts.get(pane, 0) + 1
             return counts
 
+    def oldest_queued_at_for_pane(self, phys_pane: str) -> float | None:
+        """Epoch of the oldest queued (non-expired) item for ``phys_pane``.
+
+        Read-only: expiry is evaluated but expired entries are not dropped here
+        (``pop_ready_for_pane`` owns the destructive sweep). Feeds the drain
+        worker's starvation-age escalation clock.
+        """
+        with self._lock:
+            now = time.time()
+            oldest: float | None = None
+            for item in self._items:
+                if str(item.get("phys_pane") or "") != phys_pane:
+                    continue
+                if self._is_expired(item, now=now):
+                    continue
+                queued_at = float(item.get("queued_at") or 0)
+                if oldest is None or queued_at < oldest:
+                    oldest = queued_at
+            return oldest
+
     def size(self) -> int:
         with self._lock:
             return len(self._items)
@@ -1043,6 +1064,76 @@ def _drain_deferred_sends_for_pane(phys_pane: str) -> dict:
     return {"pane": phys_pane, "drained": drained, "reblocked": reblocked, "failures": failures}
 
 
+# Deferred sends to an AGENT-owned pane must not starve. 2026-07-19 live
+# failure: an always-active Custodes pane accumulated an entire evening of
+# worker reports (36 queued sends) because each drain pass that re-blocked
+# exited the worker permanently — nothing rescheduled the drain until the NEXT
+# enqueue for that pane, so the queue sat untouched even while the pane was
+# idle and unlocked. Past this age the worker escalates: it surfaces the
+# starvation on the human notify path (once per drain episode).
+DEFAULT_DEFERRED_STARVATION_AGE_SECONDS = 900.0
+
+
+def _deferred_starvation_age_seconds() -> float:
+    raw = os.environ.get("TMUXCTLD_DEFERRED_STARVATION_AGE_SECONDS")
+    try:
+        age = float(raw) if raw is not None else DEFAULT_DEFERRED_STARVATION_AGE_SECONDS
+    except ValueError:
+        age = DEFAULT_DEFERRED_STARVATION_AGE_SECONDS
+    return max(1.0, age)
+
+
+def _pane_agent_owned(phys_pane: str) -> bool:
+    """True when ``phys_pane`` hosts a live managed agent (ledger + sniff agree).
+
+    The starvation escalation keys off AGENT ownership, never off guard state:
+    a genuinely human-attended pane must keep full human-lock/quiet-hours
+    semantics. Fail-safe False — an unreadable ledger or tmux means no
+    escalation, not a spurious one.
+    """
+    try:
+        from .occupancy import ledger_occupancy_for_pane
+
+        occ = ledger_occupancy_for_pane(TmuxAdapter(), phys_pane)
+    except Exception as exc:  # noqa: BLE001 - ownership probe is best-effort
+        log.debug("tmuxctld: agent-ownership probe failed pane=%s: %s", phys_pane, exc)
+        return False
+    return bool(occ is not None and occ.ledger_occupied and occ.sniff_live_agent)
+
+
+def _notify_deferred_starvation(*, pane_public: str, queued: int, age_seconds: float) -> None:
+    """Surface deferred-send starvation on the human notify path (best-effort).
+
+    Mirrors ``_notify_swallowed_submit``: the loud record is the caller's
+    ``log.warning``; this additionally routes the fact to token-api's
+    ``/api/notify`` so a starving agent inbox is reported, not silently eaten.
+    Never raises.
+    """
+    base = os.environ.get("TOKEN_API_URL", "http://localhost:7777").rstrip("/")
+    target = pane_public if pane_public and pane_public != "unresolved" else "a pane"
+    message = (
+        f"tmuxctld: {queued} deferred send(s) to {target} have been queued for "
+        f"{int(age_seconds // 60)}+ minutes behind its typing guard; the drain worker is "
+        "holding for the next between-turns gap to deliver."
+    )
+    body = json.dumps({"message": message, "tts": True, "vibe": 30}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base}/api/notify",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2.0):
+            pass
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log.warning(
+            "tmuxctld: deferred-starvation notify failed pane=%s (surfaced via log only): %s",
+            pane_public,
+            exc,
+        )
+
+
 def _schedule_deferred_drain(phys_pane: str) -> None:
     if not phys_pane:
         return
@@ -1052,10 +1143,56 @@ def _schedule_deferred_drain(phys_pane: str) -> None:
         _DEFERRED_DRAINING.add(phys_pane)
 
     def _worker() -> None:
+        # The worker owns the pane's queue until it is EMPTY. The previous
+        # shape (wait for lock clear, one drain pass, exit) starved the queue:
+        # a pass that re-blocked — the common case on a busy agent pane whose
+        # guard re-arms between turns — exited here, and no drain ran again
+        # until the next enqueue for this pane. Sleeps are paced by
+        # _typing_delay_sleep (toward the live hold's expiry, capped) so a
+        # guard-clear releases queued sends within ~1s of the between-turns
+        # gap; a non-typing re-block (e.g. quiet hours) re-checks coarsely.
+        starvation_notified = False
         try:
-            while send_gate._pane_human_locked(phys_pane):
-                time.sleep(send_gate._typing_delay_sleep(phys_pane))
-            _drain_deferred_sends_for_pane(phys_pane)
+            while True:
+                while send_gate._pane_human_locked(phys_pane):
+                    if not starvation_notified:
+                        oldest = _DEFERRED_SEND_QUEUE.oldest_queued_at_for_pane(phys_pane)
+                        age = max(0.0, time.time() - oldest) if oldest is not None else 0.0
+                        if age >= _deferred_starvation_age_seconds() and _pane_agent_owned(
+                            phys_pane
+                        ):
+                            # Bounded-age escalation, keyed off agent ownership.
+                            # Delivery still waits for the next keystroke-lock
+                            # gap (D5: a live HUMAN/PENDING lock is inviolable,
+                            # even on an agent-owned pane — a sanctioned
+                            # agent-pane pierce is a TODO tracked in the PR),
+                            # but the starvation is surfaced loudly instead of
+                            # accumulating silently.
+                            starvation_notified = True
+                            queued = _DEFERRED_SEND_QUEUE.by_pane().get(phys_pane, 0)
+                            pane_public = _safe_public_role(phys_pane)
+                            log.warning(
+                                "tmuxctld: deferred-send starvation pane=%s queued=%d "
+                                "oldest_age=%.0fs — agent-owned pane, escalating via notify; "
+                                "delivery holds for the next typing-guard gap",
+                                pane_public,
+                                queued,
+                                age,
+                            )
+                            _notify_deferred_starvation(
+                                pane_public=pane_public, queued=queued, age_seconds=age
+                            )
+                    time.sleep(send_gate._typing_delay_sleep(phys_pane))
+                _drain_deferred_sends_for_pane(phys_pane)
+                if not _DEFERRED_SEND_QUEUE.by_pane().get(phys_pane, 0):
+                    break
+                # Items remain: the drain re-blocked mid-pass (guard re-armed,
+                # or a non-typing gate like quiet hours held the replay). Pace
+                # the retry, then loop — never exit with a non-empty queue.
+                if send_gate._pane_human_locked(phys_pane):
+                    time.sleep(send_gate._typing_delay_sleep(phys_pane))
+                else:
+                    time.sleep(send_gate._QUIET_DELAY_RECHECK_SECONDS)
         finally:
             with _DEFERRED_DRAIN_LOCK:
                 _DEFERRED_DRAINING.discard(phys_pane)
@@ -1948,6 +2085,37 @@ def _detect_swallowed_submit(capture: str, payload: str) -> bool:
     return True
 
 
+# History-search overlay boxes render at pane width and truncate long payloads,
+# so match a SHORT head of the payload after the overlay marker rather than the
+# full 48-char swallow needle.
+_SEARCH_OVERLAY_NEEDLE_LEN = 16
+
+
+def _detect_search_overlay_capture(capture: str, payload: str) -> bool:
+    """Did the payload land inside a shell history-search overlay?
+
+    2026-07-19 live repro: the target pane sat in a reverse-i-search overlay, so
+    every payload byte went into the SEARCH BOX (``bck-i-search: <payload>`` /
+    ``(reverse-i-search)`<payload>'``) instead of the composer, and the submit
+    key never delivered a prompt — yet the send was classified level-1
+    "delivered" all evening. The capture signature is an overlay marker line
+    that carries a head of the payload after the marker. That is authoritative
+    NON-delivery: the target agent never saw the text.
+    """
+    if not capture or not payload:
+        return False
+    needle = normalize_prompt_payload(payload).strip()[:_SEARCH_OVERLAY_NEEDLE_LEN]
+    if not needle:
+        return False
+    for line in capture.splitlines():
+        match = HISTORY_SEARCH_OVERLAY_RE.search(line)
+        if match is None:
+            continue
+        if needle in line[match.end() :]:
+            return True
+    return False
+
+
 @contextlib.contextmanager
 def _agent_guard_transaction(control, pane: str, *, seconds: int = 8):
     """Own a multi-part daemon pane-write transaction with a JSON AGENT guard."""
@@ -2157,14 +2325,20 @@ def _classify_submit_delivery(
     for minutes). Fast-failing there is the bug: the send genuinely succeeded,
     it is just not confirmed yet.
 
-    Pane-scrape is unreliable for precise matching, so this NEVER hard-asserts
-    delivery — it returns an ADVISORY the caller can weigh, not a verdict.
+    Pane-scrape is unreliable for precise matching, so this never hard-asserts
+    delivery SUCCESS — a positive scrape is an ADVISORY the caller can weigh.
+    A ``"failed"`` verdict is different: it is capture-pane proof the text is
+    sitting somewhere the target agent will never read it (stuck composer
+    draft, history-search overlay box), so callers MUST treat it as
+    non-delivery, not as level-1 "bytes reached the pane" success.
 
     Returns ``(delivery, advisory, capture_excerpt, verified_by)`` where
     ``delivery`` is:
       * ``"confirmed"`` — an ack is present (no scrape needed);
       * ``"failed"``    — the draft is still stuck in the composer with a
-        swallowed Enter (the submit did NOT clear the input);
+        swallowed Enter (the submit did NOT clear the input), or the payload
+        landed inside a history-search overlay (reverse/bck/fwd-i-search)
+        instead of the composer;
       * ``"likely"``    — an engine-specific capture signal shows the target TUI
         accepted the prompt even though no hook ack arrived;
       * ``"unverified"`` — bytes may have been issued, but neither ack nor
@@ -2184,6 +2358,15 @@ def _classify_submit_delivery(
     except Exception as exc:
         log.debug("tmuxctld: submit-advisory agent resolution failed pane=%s: %s", phys_pane, exc)
         agent = "auto"
+
+    if _detect_search_overlay_capture(capture, text):
+        return (
+            "failed",
+            "payload landed in a history-search overlay (reverse-i-search) — the text "
+            "went into the search box, not the composer; the message was NOT delivered",
+            capture[-500:],
+            None,
+        )
 
     if agent == "codex" and _detect_codex_user_message(capture, text):
         return (
@@ -2725,14 +2908,21 @@ def _send_text_pipeline(
     verification_status = "submitted" if ack else ("pending" if verify else "not_requested")
     status = "submitted" if ack else "delivered"
     turn = "submitted" if ack else ("pending" if verify else "not_requested")
-    # Advisory submit classification for the no-ack case. The classifier may
-    # find a stuck composer or engine-specific ingestion signal, but it must not
-    # demote level-1 byte delivery to failure.
+    # Submit classification for the no-ack case. A "likely"/"unverified" scrape
+    # is advisory only, but a "failed" verdict is capture-pane PROOF the text
+    # never reached the target's composer as a delivered prompt (stuck draft
+    # with a swallowed Enter, or a history-search overlay that ate the payload).
+    # 2026-07-19 defect: that case was reported delivered=True all evening while
+    # the target agent never received a byte of it — so "failed" now demotes the
+    # send to a real failure instead of only appending to `failures`.
     submit_delivery, advisory, capture_excerpt, delivery_verified_by = _classify_submit_delivery(
         control, phys_pane=phys_pane, text=text, ack=ack
     )
-    if submit_delivery == "failed":
+    delivery_failed = submit_delivery == "failed"
+    if delivery_failed:
         failures.append({"type": "submit_not_cleared", "detail": advisory})
+        status = "failed"
+        verification_status = "failed"
     hook_echo = None
     # The send's own target resolution, carried into the late echo so the echo
     # reports the same answer delivery used. Callers pass the semantic address
@@ -2781,11 +2971,15 @@ def _send_text_pipeline(
         "verification_status": verification_status,
         "verified_by": "UserPromptSubmit" if ack else delivery_verified_by,
         "ack": ack,
-        "delivered": True,
+        "delivered": not delivery_failed,
         "submitted": bool(ack),
         "turn": turn,
-        "delivery": "confirmed" if ack else "delivered",
+        "delivery": "confirmed" if ack else ("failed" if delivery_failed else "delivered"),
         "submit_delivery": submit_delivery,
+        # Token-API's _pane_send_terminal_status maps delivered=False -> FAILED
+        # using `reason`; carry the classifier's advisory there so the failure
+        # is self-describing instead of "daemon_not_delivered_without_reason".
+        "reason": advisory if delivery_failed else None,
         "advisory": advisory or None,
         "capture_excerpt": capture_excerpt,
         "correlation_id": correlation_id or operation_id or dispatch_id,
