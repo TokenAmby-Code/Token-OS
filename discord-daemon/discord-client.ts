@@ -3,7 +3,7 @@
 
 import { Client, GatewayIntentBits, Partials, Events } from 'discord.js';
 import { readFileSync, writeFileSync, existsSync, chmodSync, realpathSync } from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import {
@@ -76,6 +76,9 @@ const KEYCHAIN_TO_ENV = {
 // never shadow a live keychain read, or a rotated keychain token can never
 // take effect while a stale cache exists (that wedge kept dead tokens in use
 // after the 2026-07-17 fleet-wide token invalidation).
+/**
+ * @returns {{token: string, source: 'keychain'|'env'|'fallback_file', keychainService: string|undefined}}
+ */
 export function resolveBotToken(config, botConfig, { readKeychainToken, envTokens }) {
   const keychainService = botConfig?.keychain_service
     || config.token_keychain_service
@@ -117,8 +120,10 @@ export function resolveBotToken(config, botConfig, { readKeychainToken, envToken
 }
 
 function readKeychainToken(service) {
-  return execSync(
-    `security find-generic-password -s "${service}" -w`,
+  // Argument array, not shell interpolation: the service name must never be
+  // parsed by a shell.
+  return execFileSync(
+    'security', ['find-generic-password', '-s', service, '-w'],
     { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
   ).trim();
 }
@@ -141,6 +146,9 @@ function getToken(config, botConfig = null) {
   return resolved.token;
 }
 
+/**
+ * @returns {object} client handle: { start, stop, sendMessage, getStatus, ... }
+ */
 export function createDiscordClient(config, logger, botName = 'mechanicus', botConfig = null) {
   const resolvedBotConfig = botConfig || config.bots?.[botName] || null;
   const token = getToken(config, resolvedBotConfig);

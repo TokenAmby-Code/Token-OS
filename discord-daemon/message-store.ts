@@ -15,11 +15,17 @@ const PENDING_DIR = join(__dirname, '..', 'pending');
 // recovery time is dropped loudly instead of resent.
 export const PENDING_MAX_AGE_MS = 10 * 60_000;
 
+/**
+ * Decide whether a persisted pending message is too old to replay.
+ * @returns {boolean} true when the message must be dropped instead of resent.
+ */
 export function isStalePending(msg, nowMs = Date.now(), maxAgeMs = PENDING_MAX_AGE_MS) {
   const persistedAt = Date.parse(msg?.persisted_at || '');
   // Unknown age is stale: never resend a human-facing message of unknown vintage.
   if (Number.isNaN(persistedAt)) return true;
-  return nowMs - persistedAt > maxAgeMs;
+  // A future persisted_at means the clock moved since persistence — the true
+  // age is unknowable, so anything outside ±maxAgeMs is stale too.
+  return Math.abs(nowMs - persistedAt) > maxAgeMs;
 }
 
 export function createMessageStore(logger) {

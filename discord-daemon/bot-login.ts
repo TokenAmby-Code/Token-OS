@@ -13,6 +13,9 @@
 
 export const LOGIN_RETRY_DELAYS_MS = [60_000, 300_000, 900_000];
 
+/**
+ * @returns {{connect: (name: string, client: object, attempt?: number) => Promise<boolean>}}
+ */
 export function createBotLogin({
   botClients,
   logger,

@@ -23,6 +23,16 @@ test('a pending message past the TTL is stale', () => {
   assert.equal(isStalePending(msg, NOW), true);
 });
 
+test('a future-dated persisted_at is stale — clock moved, true age unknowable', () => {
+  const msg = { persisted_at: new Date(NOW + PENDING_MAX_AGE_MS + 1_000).toISOString() };
+  assert.equal(isStalePending(msg, NOW), true);
+});
+
+test('slightly-future persisted_at (within TTL) still replays', () => {
+  const msg = { persisted_at: new Date(NOW + 5_000).toISOString() };
+  assert.equal(isStalePending(msg, NOW), false);
+});
+
 test('unknown age is stale — never replay a message of unknown vintage', () => {
   assert.equal(isStalePending({}, NOW), true);
   assert.equal(isStalePending({ persisted_at: 'not-a-date' }, NOW), true);
