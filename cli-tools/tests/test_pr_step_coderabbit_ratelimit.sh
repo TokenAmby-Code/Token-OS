@@ -111,9 +111,9 @@ gh() {
 STATUSES_JSON='[{"context":"CodeRabbit","state":"failure","description":"Review rate limited","updated_at":"2026-07-20T22:11:06Z"},{"context":"CodeRabbit","state":"pending","description":"Review in progress","updated_at":"2026-07-20T22:05:39Z"}]'
 coderabbit_head_signal_is_ratelimit head123
 STATUSES_JSON='[{"context":"CodeRabbit","state":"failure","description":"Review failed","updated_at":"2026-07-20T22:11:06Z"}]'
-! coderabbit_head_signal_is_ratelimit head123
+if coderabbit_head_signal_is_ratelimit head123; then echo 'FAIL: red-with-other-text must not classify as rate-limit'; exit 1; fi
 STATUSES_JSON='[{"context":"CodeRabbit","state":"pending","description":"Review in progress","updated_at":"2026-07-20T22:11:06Z"},{"context":"CodeRabbit","state":"failure","description":"Review rate limited","updated_at":"2026-07-20T22:05:39Z"}]'
-! coderabbit_head_signal_is_ratelimit head123
+if coderabbit_head_signal_is_ratelimit head123; then echo 'FAIL: newest-pending must not classify as rate-limit'; exit 1; fi
 
 # non_coderabbit_checks_green: "no checks" is green (the --required variant
 # fails outright on repos without required checks — the PR #96 refusal); a
@@ -130,7 +130,7 @@ non_coderabbit_checks_green 42
 CHECKS_OUT='[{"name":"CodeRabbit","bucket":"fail","workflow":""}]' CHECKS_RC=1
 non_coderabbit_checks_green 42
 CHECKS_OUT='[{"name":"CodeRabbit","bucket":"fail","workflow":""},{"name":"tests","bucket":"fail","workflow":"CI"}]' CHECKS_RC=1
-! non_coderabbit_checks_green 42
+if non_coderabbit_checks_green 42; then echo 'FAIL: failing non-CodeRabbit check must not be green'; exit 1; fi
 CHECKS_OUT='[{"name":"CodeRabbit","bucket":"fail","workflow":""},{"name":"tests","bucket":"pass","workflow":"CI"}]' CHECKS_RC=1
 non_coderabbit_checks_green 42
 
