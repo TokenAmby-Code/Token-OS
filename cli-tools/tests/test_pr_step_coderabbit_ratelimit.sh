@@ -134,4 +134,20 @@ if non_coderabbit_checks_green 42; then echo 'FAIL: failing non-CodeRabbit check
 CHECKS_OUT='[{"name":"CodeRabbit","bucket":"fail","workflow":""},{"name":"tests","bucket":"pass","workflow":"CI"}]' CHECKS_RC=1
 non_coderabbit_checks_green 42
 
-echo 'PASS: rate-limit skip merges; current-head findings still block; rate-limit-only blockage force-merges'
+# --- Review-return plan injection poses a continuation plan ------------------
+# The injected review-return prompt must still open with /plan and must end
+# with /postplan so a plan-cycled agent captures state instead of losing it.
+curl_capture="$(mktemp)"
+trap 'rm -f "$log_file" "$curl_capture"' EXIT
+pr_step_resolve_pane() { echo pane0; }
+pr_step_resolve_instance_id() { echo inst1; }
+pr_plan_followup_context() { echo 'CodeRabbit verdict: commit=success'; }
+curl() { printf '%s\n' "$@" >"$curl_capture"; }
+arm_pr_plan_followup review 42 https://example.test/pr/42
+grep -qF '/plan PR #42 review returned' "$curl_capture"
+grep -qF '\n\n/postplan' "$curl_capture"
+if grep -qF '/postplan' <(printf '%s' "$(pr_plan_followup_context 42)"); then
+    echo 'FAIL: /postplan must come from the prompt, not the context'; exit 1
+fi
+
+echo 'PASS: rate-limit skip merges; current-head findings still block; rate-limit-only blockage force-merges; review injection ends with /postplan'
