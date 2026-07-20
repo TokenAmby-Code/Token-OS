@@ -9,7 +9,6 @@ source "${_LIB_DIR}/tmux-guard.sh"
 
 API_URL="${TOKEN_API_URL:-http://localhost:7777}"
 TMUXCTLD_URL="${TMUXCTLD_URL:-http://127.0.0.1:7778}"
-TMUXCTL_BIN="${TMUXCTL_BIN:-${_BIN_DIR}/tmuxctl}"
 TARGET_MODE="self"
 TARGET_VALUE=""
 DETACH=false
@@ -211,11 +210,11 @@ send_command() {
         done
     fi
 
-    # Prefer the daemon-native send (verified handshake). Exit codes from the
+    # Daemon-native send only (verified handshake). Exit codes from the
     # helper: 0 = ok, 2 = daemon RESPONDED with ok:false (a real, handled
-    # failure — do NOT fall back, the daemon owns it), 3 = daemon UNREACHABLE
-    # (connection refused / timeout — fall back to direct tmuxctl so a daemon
-    # that is down or mid-restart never wedges a send).
+    # failure — the daemon owns it), 3 = daemon UNREACHABLE (connection
+    # refused / timeout — a hard failure: the old direct-tmuxctl fallback is
+    # 410-retired, so there is no cold path that can deliver).
     out=$(python3 - "$TMUXCTLD_URL" "$pane" "$cmd" "$NO_SUBMIT" <<'PY' 2>&1
 import json
 import sys
@@ -251,20 +250,16 @@ if not payload.get("ok"):
 PY
     ) || rc=$?
     if [[ "$rc" == 3 ]]; then
-        # Daemon unreachable — fall back to the direct tmuxctl send path so the
-        # send still lands (still routed through the universal send gate).
-        local -a send_args=(send-text --pane "$pane" --text "$cmd")
-        [[ "$NO_SUBMIT" == true ]] && send_args+=(--no-submit)
-        if out=$("$TMUXCTL_BIN" "${send_args[@]}" 2>&1); then
-            rc=0
-            verification_status="sent"
-            verified_by="tmuxctl"
-        else
-            echo "$out" >&2
-            rc=1
-            verification_status="failed"
-            verified_by="tmuxctl"
-        fi
+        # Daemon unreachable. The former fallback ($TMUXCTL_BIN send-text) can
+        # never succeed: cli-tools/bin/tmuxctl is 410-retired and exits 154 on
+        # touch, so pretending it might deliver only masked the outage. Surface
+        # the transport truth loudly instead (surface-don't-suppress): nothing
+        # was delivered, and the fix is to restore tmuxctld, not to detour.
+        echo "agent-cmd: tmuxctld unreachable at ${TMUXCTLD_URL} and no fallback exists (cold tmuxctl CLI is 410-retired); send NOT delivered — restore tmuxctld (launchctl kickstart / tmuxctld-ping) and retry." >&2
+        rc=1
+        verification_status="failed"
+        verified_by=""
+        reason="tmuxctld_unreachable"
     elif [[ "$rc" != 0 ]]; then
         echo "$out" >&2
         # A daemon `ok:false` with error.code=="gated" means ZERO bytes were

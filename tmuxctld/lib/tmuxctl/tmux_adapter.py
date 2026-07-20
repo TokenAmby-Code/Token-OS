@@ -36,6 +36,18 @@ class TmuxSendGated(TmuxError):
 DEFAULT_SUBMIT_SETTLE_SECONDS = 1.0
 DEFAULT_PRE_SUBMIT_SETTLE_SECONDS = 1.0
 
+# Shell/readline incremental history-search overlay markers. zsh renders
+# ``bck-i-search:`` / ``fwd-i-search:`` at the bottom of the pane; bash renders
+# ``(reverse-i-search)`...':`` (with a ``failed `` prefix once the search
+# misses). Payload bytes injected while one of these overlays is live land in
+# the SEARCH BOX, not the composer/command line — the 2026-07-19 defect where a
+# whole evening of reports was typed into a reverse-i-search prompt and never
+# submitted. Shared by the pre-send preflight here and the post-submit
+# delivery classifier in daemon.py.
+HISTORY_SEARCH_OVERLAY_RE = re.compile(
+    r"(?:\((?:failed )?(?:reverse|forward)-i-search\)|(?:bck|fwd|reverse|forward)-i-search\s*:)"
+)
+
 _PANE_TARGET_COMMANDS = {
     "break-pane",
     "capture-pane",
@@ -738,6 +750,47 @@ class TmuxAdapter:
                 self.last_send_gate_result = gate
                 raise TmuxSendGated(gate)
 
+    def _preflight_clear_pane_overlays(self, target: str) -> None:
+        """Exit copy-mode / history-search overlays before injecting payload text.
+
+        2026-07-19 live repro, two flavors on the same evening:
+        (a) the target pane sat in a shell reverse-i-search overlay — every
+            payload byte went into the search box and the submit never fired;
+        (b) the target pane sat in tmux copy-mode — payload characters replayed
+            through copy-mode key bindings, a mid-payload key exited the mode,
+            and each remaining bound ``send -X`` errored "not in a mode"
+            (raised fatally by ``run``).
+
+        Both states are cleared here, and both probes are read-only on a
+        healthy pane: the ``-X cancel`` is issued only when ``#{pane_in_mode}``
+        is 1, and Escape only when the captured tail shows a live
+        history-search overlay marker — so this is a safe no-op on panes that
+        are ready for input. Detection failures fail open (send proceeds as
+        before this preflight existed).
+        """
+        in_mode = ""
+        try:
+            in_mode = self.run(
+                "display-message", "-p", "-t", target, "#{pane_in_mode}", allow_failure=True
+            ).strip()
+        except TmuxError:
+            in_mode = ""
+        if in_mode == "1":
+            # Exit copy-mode (or any other pane mode) so payload bytes reach
+            # the underlying program instead of replaying through mode
+            # bindings. allow_failure: racing a self-exit must not kill the send.
+            self.run("send-keys", "-t", target, "-X", "cancel", allow_failure=True)
+        tail = ""
+        try:
+            tail = self.capture_pane(target, lines=5)
+        except TmuxError:
+            tail = ""
+        if HISTORY_SEARCH_OVERLAY_RE.search(tail):
+            # A live shell history-search overlay eats literal text into its
+            # search box; Escape dismisses it and returns the shell/TUI to the
+            # normal input line before the payload lands.
+            self.send_keys(target, "Escape", allow_failure=True)
+
     def send_text_then_submit(
         self,
         target: str,
@@ -762,6 +815,10 @@ class TmuxAdapter:
         """
         payload = normalize_prompt_payload(text)
         self._preflight_send_text_transaction(target, payload)
+        # Mode/overlay preflight AFTER the gate preflight (a gated send must
+        # write zero bytes, including the cancel/Escape clears) and BEFORE the
+        # first payload byte.
+        self._preflight_clear_pane_overlays(target)
         # Initial mutating sends run in the normal gate path so a re-armed guard
         # after the preflight is caught rather than silently pierced.  After the
         # first write lands, check last_send_gate_result and raise if it is set,
