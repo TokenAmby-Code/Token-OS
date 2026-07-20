@@ -540,11 +540,9 @@ latest_coderabbit_review_state() {
 
 # --- Rate-limit / CodeRabbit shelved-review handling -------------------------
 # When CodeRabbit hits its own usage/rate limit it does NOT run a review: it
-# posts a "review skipped / rate limit exceeded" deferral and never comes back
-# on its own. That deferral must never be mistaken for a completed review — the
-# gate is only satisfied by a genuine review. pr-step detects the deferral,
-# re-requests deliberately, and keeps waiting (reusing the unbounded wait) until
-# a real review lands.
+# posts a "review skipped / rate limit exceeded" deferral. This state is
+# explicitly non-blocking when every other required check is green, but it must
+# remain distinct from an active review or actual findings.
 CR_RATELIMIT_REGEX='rate limit exceeded|rate limited|review limit reached|exceeded the (rate )?limit|before requesting another review|review skipped|reached (your|the) [^.]*limit|usage limits?|next review (will be )?available|please wait [0-9]|retry-after|x-ratelimit-reset|x-rate-limit-reset|ratelimit-reset|rate-limit-reset'
 
 rate_limit_reset_epoch_from_text() {
@@ -850,6 +848,33 @@ changes_requested_count() {
     ' 2>/dev/null || echo 1
 }
 
+coderabbit_has_actionable_findings() {
+    local pr="$1" head="$2" repo
+    repo="$(repo_slug)"
+    [[ -n "$repo" && -n "$head" ]] || return 0
+    [[ "$(gh api "repos/${repo}/pulls/${pr}/comments" 2>/dev/null | jq -r --arg head "$head" '
+        [.[] | select(
+            ((.user.login // "" | ascii_downcase) as $u
+                | $u == "coderabbitai[bot]" or $u == "coderabbitai" or $u == "coderabbit")
+            and ((.commit_id // "") == $head)
+            and ((.position // .line // .original_line // null) != null)
+        )] | length
+    ' 2>/dev/null || echo 1)" != "0" ]]
+}
+
+non_coderabbit_required_checks_green() {
+    local pr="$1" checks
+    checks="$(gh pr checks "$pr" --required --json name,bucket,workflow 2>/dev/null || true)"
+    [[ -n "$checks" ]] || return 1
+    jq -e '
+        [ .[] | select(
+            ((.name // "" | ascii_downcase | startswith("coderabbit")) | not)
+            and ((.workflow // "" | ascii_downcase | contains("coderabbit")) | not)
+        ) ]
+        | all(.bucket == "pass" or .bucket == "skipping")
+    ' <<<"$checks" >/dev/null 2>&1
+}
+
 checks_summary() {
     local pr="$1" out rc
     out="$(mktemp -t pr-step-checks.XXXXXX)"
@@ -881,16 +906,18 @@ checks_green() {
     [[ "$state" == "OPEN" ]] || return 1
     mergeable="$(gh pr view "$pr" --json mergeable -q '.mergeable' 2>/dev/null || true)"
     [[ "$mergeable" != "CONFLICTING" ]] || return 1
-    cr_state="$(coderabbit_state_for_head "$head")"
-    [[ "$cr_state" == "success" ]] || return 1
-    # A rate-limit/shelved deferral is not a completed review even if the commit
-    # status flipped to success. Never let a skipped review satisfy the gate —
-    # this is the path that otherwise voids the Golden Throne victory condition.
-    if coderabbit_review_is_deferred "$pr"; then
-        return 1
-    fi
     changes="$(changes_requested_count "$pr")"
     [[ "$changes" == "0" ]] || return 1
+    if coderabbit_has_actionable_findings "$pr" "$head"; then
+        return 1
+    fi
+    if coderabbit_review_is_deferred "$pr"; then
+        non_coderabbit_required_checks_green "$pr" || return 1
+        warn "Skipping CodeRabbit review because it is rate-limited/unavailable; all other required checks are green."
+        return 0
+    fi
+    cr_state="$(coderabbit_state_for_head "$head")"
+    [[ "$cr_state" == "success" ]] || return 1
     checks_tmp="$(mktemp -t pr-step-checks.XXXXXX)"
     if gh pr checks "$pr" --watch=false --fail-fast=false >"$checks_tmp" 2>/dev/null; then
         rm -f "$checks_tmp"
@@ -1599,11 +1626,8 @@ while true; do
         end
     ' 2>/dev/null || true)
     if coderabbit_body_is_ratelimit "$LATEST_ISSUE_COMMENT"; then
-        if coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP"; then
-            START_TIME=$(date +%s)
-            continue
-        fi
-        log "Latest CodeRabbit activity is a rate-limit deferral; keeping the review gate open."
+        warn "CodeRabbit is rate-limited/unavailable; stopping the review wait so other required checks can decide merge readiness."
+        break
     elif echo "$LATEST_ISSUE_COMMENT" | grep -qE '^[[:space:]]*#{1,3}[[:space:]]*Summary by CodeRabbit'; then
         FOUND_REVIEWS=true
         log "Found CodeRabbit summary comment."
@@ -2051,11 +2075,8 @@ while true; do
         jq --arg bot "$REVIEWER_BOT" --arg user "$REVIEWER_USER" -r '[.[] | select(.user.login == $bot or .user.login == $user)] | sort_by(.updated_at) | .[-1].body // ""')
 
     if coderabbit_body_is_ratelimit "$LATEST_ISSUE_COMMENT"; then
-        if [[ "$READ_ONLY" == "false" ]] && coderabbit_handle_ratelimit_comment "$PR_NUMBER" "$LATEST_ISSUE_COMMENT" "$CURRENT_OVERVIEW_TIMESTAMP" TIMEOUT_REREQUESTS_DONE "$TIMEOUT_REREQUESTS_MAX"; then
-            START_TIME=$(date +%s)
-            continue
-        fi
-        log "Latest CodeRabbit activity is a rate-limit deferral; keeping the review gate open."
+        warn "CodeRabbit is rate-limited/unavailable; stopping the review wait so other required checks can decide merge readiness."
+        break
     fi
 
     CURRENT_REVIEW_TIMESTAMP=$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" 2>/dev/null | \
