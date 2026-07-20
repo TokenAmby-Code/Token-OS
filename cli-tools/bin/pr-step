@@ -931,6 +931,82 @@ checks_green() {
     return 1
 }
 
+# All non-CodeRabbit checks — required or not — pass or skip. The --required
+# variant above exits with empty output on repos that configure no required
+# checks, so this reads the full check list and treats "no checks" as green.
+non_coderabbit_checks_green() {
+    local pr="$1" checks
+    checks="$(gh pr checks "$pr" --json name,bucket,workflow 2>&1 || true)"
+    if grep -qi "no checks" <<<"$checks"; then
+        return 0
+    fi
+    jq -e '
+        [ .[] | select(
+            ((.name // "" | ascii_downcase | startswith("coderabbit")) | not)
+            and ((.workflow // "" | ascii_downcase | contains("coderabbit")) | not)
+        ) ]
+        | all(.bucket == "pass" or .bucket == "skipping")
+    ' <<<"$checks" >/dev/null 2>&1
+}
+
+# The rate-limit can surface as CodeRabbit's own commit status/check going red
+# with rate-limit text (e.g. "Review rate limited") while the latest CodeRabbit
+# comment is something else entirely (a "starting full review" reply). Read the
+# newest CodeRabbit status/check text for the head and match it against the
+# rate-limit signals; a red signal with any other text is a real failure.
+coderabbit_head_signal_is_ratelimit() {
+    local head="$1" repo text
+    repo="$(repo_slug)"
+    [[ -n "$repo" && -n "$head" ]] || return 1
+    text="$(gh api --paginate "repos/${repo}/commits/${head}/statuses" 2>/dev/null | jq -s -r '
+        add
+        | [.[] | select(.context | ascii_downcase | startswith("coderabbit"))]
+        | sort_by(.updated_at)
+        | .[-1] // empty
+        | select((.state // "") == "failure" or (.state // "") == "error")
+        | .description // ""
+    ' 2>/dev/null || true)"
+    if [[ -z "$text" ]]; then
+        text="$(gh api --paginate "repos/${repo}/commits/${head}/check-runs" 2>/dev/null | jq -s -r '
+            [.[].check_runs[]? | select(
+                (((.name // "") | ascii_downcase) | startswith("coderabbit"))
+                or (((.app.slug // "") | ascii_downcase) == "coderabbitai")
+            )]
+            | sort_by(.completed_at // .started_at // .created_at // "")
+            | .[-1] // empty
+            | select((.conclusion // "") | IN("failure", "cancelled", "timed_out", "action_required"))
+            | ((.output.title // "") + "\n" + (.output.summary // ""))
+        ' 2>/dev/null || true)"
+    fi
+    [[ -n "$text" ]] || return 1
+    grep -qiE "$CR_RATELIMIT_REGEX" <<<"$text"
+}
+
+# Standing posture (2026-07-20): CodeRabbit rate-limited/unavailable is
+# NON-blocking; only real actionable findings block. True when the ONLY thing
+# keeping the PR from green is CodeRabbit's rate-limit/unavailability: open and
+# conflict-free, no CHANGES_REQUESTED review, no actionable inline findings on
+# the current head, every non-CodeRabbit check green, and CodeRabbit's latest
+# signal is a rate-limit notice rather than a real verdict.
+only_blocker_is_coderabbit_ratelimit() {
+    local pr="$1" head state mergeable changes
+    head="$(pr_head_sha "$pr")"
+    [[ -n "$head" ]] || return 1
+    state="$(gh pr view "$pr" --json state -q '.state' 2>/dev/null || true)"
+    [[ "$state" == "OPEN" ]] || return 1
+    mergeable="$(gh pr view "$pr" --json mergeable -q '.mergeable' 2>/dev/null || true)"
+    [[ "$mergeable" != "CONFLICTING" ]] || return 1
+    changes="$(changes_requested_count "$pr")"
+    [[ "$changes" == "0" ]] || return 1
+    if coderabbit_has_actionable_findings "$pr" "$head"; then
+        return 1
+    fi
+    if ! coderabbit_review_is_deferred "$pr" && ! coderabbit_head_signal_is_ratelimit "$head"; then
+        return 1
+    fi
+    non_coderabbit_checks_green "$pr"
+}
+
 summarize_actionable_findings() {
     local pr="$1" head="${2:-}" repo short
     repo="$(repo_slug)"
@@ -2732,6 +2808,13 @@ main() {
 
     if [[ "$AUTO_MERGE" == "true" ]] && checks_green "$pr"; then
         success "PR #$pr is green; auto-merging."
+        merge_pr_normal "$pr"
+        pr_url="$(current_pr_url "$pr")"
+        [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
+        mark_instance_status victorious
+        disarm_pr_plan_followup
+    elif [[ "$AUTO_MERGE" == "true" ]] && only_blocker_is_coderabbit_ratelimit "$pr"; then
+        warn "AUTO-FORCE-MERGE: PR #$pr is blocked only by a CodeRabbit rate-limit/unavailability; taking the force-merge path automatically per standing posture (2026-07-20: CodeRabbit rate-limits are non-blocking; only real findings block)."
         merge_pr_normal "$pr"
         pr_url="$(current_pr_url "$pr")"
         [[ -n "$pr_url" ]] && mark_pr_flag "$pr_url" merged
