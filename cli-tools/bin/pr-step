@@ -352,6 +352,10 @@ arm_pr_plan_followup() {
             context="$(pr_plan_followup_context "$pr" 2>/dev/null || true)"
             prompt+="; ${summary}"
             [[ -n "$context" ]] && prompt+=$'\n\n'"${context}"
+            # Plan-cycled agents lose their place unless the plan they pose is a
+            # continuation plan; /postplan makes the injected plan capture state,
+            # reference map, and exact remaining steps before context clears.
+            prompt+=$'\n\n'"/postplan"
             ;;
         merge)
             [[ -n "$summary" ]] || summary="summarize closure and update context."
