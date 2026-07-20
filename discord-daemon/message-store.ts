@@ -8,6 +8,20 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PENDING_DIR = join(__dirname, '..', 'pending');
 
+// Pending messages are human-facing and often time-sensitive (alerts, morning
+// briefings). Recovery must not replay one hours or days after it was queued —
+// a stale "it's 05:19, firing the backstop now" resent after a token fix is
+// noise at best and misinformation at worst. Anything older than this at
+// recovery time is dropped loudly instead of resent.
+export const PENDING_MAX_AGE_MS = 10 * 60_000;
+
+export function isStalePending(msg, nowMs = Date.now(), maxAgeMs = PENDING_MAX_AGE_MS) {
+  const persistedAt = Date.parse(msg?.persisted_at || '');
+  // Unknown age is stale: never resend a human-facing message of unknown vintage.
+  if (Number.isNaN(persistedAt)) return true;
+  return nowMs - persistedAt > maxAgeMs;
+}
+
 export function createMessageStore(logger) {
   mkdirSync(PENDING_DIR, { recursive: true });
 
