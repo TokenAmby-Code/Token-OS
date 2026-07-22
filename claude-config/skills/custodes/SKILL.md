@@ -32,7 +32,7 @@ If `talk`/`brief` returns `unverified` with “bytes may have issued,” do not 
 
 ## Context
 
-- Persona: `$IMPERIUM/Imperium-ENV/Personas/Custodes.md`.
+- Persona: `$IMPERIUM_VAULT/Personas/Custodes.md`.
 - Related procedures: `$daily-note`, `$dispatch`, `$session-update`, `$vault-update`.
 - Dispatch posture: Custodes directly handles bounded one-offs; coordinated waves go to Fabricator-General.
 

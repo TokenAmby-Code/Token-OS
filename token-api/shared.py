@@ -108,10 +108,7 @@ def _vault_root() -> Path:
     env = os.environ.get("IMPERIUM_ENV")
     if env:
         return Path(env)
-    imperium = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
-    if not imperium.exists():
-        imperium = Path.home()
-    return imperium / "Imperium-ENV"
+    return Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
 
 
 def default_sessions_dir() -> Path:

@@ -84,7 +84,9 @@ fallback needs a new terminal before power-off.
 
 ## Shared Roots
 
-- `$IMPERIUM`: NAS root for Imperium-ENV.
+- `$IMPERIUM`: NAS root for archive/exchange only; it is not a vault root.
+- `$IMPERIUM_VAULT`: sanctioned machine-local Imperium-ENV root. K12 work has no
+  Imperium vault path, preserving the physical personal/work boundary.
 - `$CIVIC`: civic/askCivic root when mounted/configured.
 - `$TOKEN_OS`: Token-OS runtime checkout.
 - `$TOKEN_API_URL`: active Token-API URL for the current machine.

@@ -9,7 +9,7 @@ Resolve the live instance and read the linked session doc before doing any recov
 
 1. Load machine config if available:
    ```bash
-   source "${TOKEN_OS_ROOT:-$HOME/runtimes/Token-OS/live}/cli-tools/lib/nas-path.sh" 2>/dev/null || source "${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV/Scripts/cli-tools/lib/nas-path.sh" 2>/dev/null || true
+   source "${TOKEN_OS_ROOT:-$HOME/runtimes/Token-OS/live}/cli-tools/lib/nas-path.sh" 2>/dev/null || true
    ```
 2. Resolve the instance:
    ```bash

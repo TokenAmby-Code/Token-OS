@@ -9,7 +9,7 @@ Terminus is the migration direction away from Python-monolith-centered operator 
 
 ## Canon
 
-- Vault note: `$IMPERIUM/Imperium-ENV/Ultramar/Terminus Decree.md`.
+- Vault note: `$IMPERIUM_VAULT/Ultramar/Terminus Decree.md`.
 - Current Token-OS anchor/nexus: ops cockpit at `$TOKEN_API_URL/ui/ops`.
 - Token-OS keeps local computer control, tmux-managed agent wall automation, enforcement, TTS, and local runtime adapters.
 - askCivic keeps procurement/RAG/domain delivery. Shared value is stack and patterns, not code/data.

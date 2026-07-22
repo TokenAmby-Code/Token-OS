@@ -16,7 +16,7 @@ Use this skill to understand or debug the persona system. Do **not** use it to s
 
 ## Identity Axes
 
-- **Persona:** named behavior/context, usually from `$IMPERIUM/Imperium-ENV/Personas/<Name>.md`.
+- **Persona:** named behavior/context, usually from `$IMPERIUM_VAULT/Personas/<Name>.md`.
 - **Rank:** authority class such as Aspirant, Astartes, Overseer, Primarch, or retired.
 - **Legion/chapter/lock:** routing/voice constraints for Astartes-style personas; chapter locks should not override registry truth.
 - **Singleton pane:** static persona seats such as Custodes, Fabricator-General, Administratum, Pax, Orchestrator, or Malcador. These are protected infrastructure seats.

@@ -12,7 +12,7 @@ Inquisitor is a skeptical Astartes-rank reviewer persona. Use it by launching a 
 Use a bounded worker dispatch and make the persona context explicit in the prompt:
 
 ```bash
-dispatch --target mechanicus:new --prompt "Read $IMPERIUM/Imperium-ENV/Personas/Inquisitor.md first. Review <claim/PR/files> skeptically against the implementation. Cite file:line evidence, separate verified facts from claims, do not implement fixes, and report contradictions plus recommended follow-up."
+dispatch --target mechanicus:new --prompt "Read $IMPERIUM_VAULT/Personas/Inquisitor.md first. Review <claim/PR/files> skeptically against the implementation. Cite file:line evidence, separate verified facts from claims, do not implement fixes, and report contradictions plus recommended follow-up."
 ```
 
 If a wave or multiple reviews are needed, brief Fabricator-General instead of hand-launching many workers.

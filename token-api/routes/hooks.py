@@ -5777,8 +5777,7 @@ def _imperium_env_root() -> Path:
     configured = os.environ.get("IMPERIUM_ENV")
     if configured:
         return Path(configured)
-    imperium_root = os.environ.get("IMPERIUM", "/Volumes/Imperium")
-    return Path(imperium_root) / "Imperium-ENV"
+    return Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
 
 
 def _question_log_paths() -> tuple[Path, Path]:

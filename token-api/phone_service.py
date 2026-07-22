@@ -429,15 +429,14 @@ def _roll_daily_zap_count(now: datetime) -> None:
 def _daily_note_path(date_str: str) -> Path:
     """Resolve the Imperium daily-note path for ``date_str``.
 
-    Mirrors ``_append_work_action_to_daily_note`` (main.py): resolve the vault
-    from ``IMPERIUM_ENV`` at call time, else ``$IMPERIUM/Imperium-ENV`` — so a
-    temp test vault and a relocated NAS mount both land in the right note.
+    Mirrors ``_append_work_action_to_daily_note`` (main.py): resolve an explicit
+    test vault first, then the sanctioned machine-local vault.
     """
     vault = os.environ.get("IMPERIUM_ENV")
     root = (
         Path(vault)
         if vault
-        else Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV"
+        else Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
     )
     return root / "Terra" / "Journal" / "Daily" / f"{date_str}.md"
 

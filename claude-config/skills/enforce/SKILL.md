@@ -167,7 +167,7 @@ When `/enforce --build` is invoked, read these files before starting implementat
 
 ### Architecture Docs
 4. **Vault notes:**
-   - `/Volumes/Imperium/Imperium-ENV/Terra/Ultramar/Phone Enforcement Architecture.md`
+   - `$IMPERIUM_VAULT/Terra/Ultramar/Phone Enforcement Architecture.md`
    - `${TOKEN_OS:-$HOME/runtimes/Token-OS/live}/mobile/AGENTS.md` — mobile dev tools, macro spec format, CLI tools
 
 ### Mobile CLI Tools

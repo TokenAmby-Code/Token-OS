@@ -75,6 +75,7 @@ fi
 #   device_name   — Canonical device name (matches Token-API DEVICE_IPS)
 #   shell         — Default interactive shell (zsh/bash)
 #   token_os_runtime — Preferred machine-local Token-OS runtime checkout
+#   vault_root    — Machine-local Imperium Obsidian vault (never NAS-hosted)
 
 # Token-API host — the single tailnet node currently serving Token-API (the mac
 # today; migrates to k12-personal at cutover). Hoisted once so satellite rows
@@ -92,6 +93,7 @@ _IMPERIUM_CFG_mac_ssh_alias="mini"
 _IMPERIUM_CFG_mac_device_name="Mac-Mini"
 _IMPERIUM_CFG_mac_shell="zsh"
 _IMPERIUM_CFG_mac_token_os_runtime="$HOME/runtimes/Token-OS/live"
+_IMPERIUM_CFG_mac_vault_root="$HOME/vaults/Imperium-ENV"
 
 # --- WSL (Ubuntu on Windows PC) ---
 _IMPERIUM_CFG_wsl_nas_imperium="/mnt/imperium"
@@ -103,6 +105,7 @@ _IMPERIUM_CFG_wsl_ssh_alias="wsl"
 _IMPERIUM_CFG_wsl_device_name="TokenPC"
 _IMPERIUM_CFG_wsl_shell="bash"
 _IMPERIUM_CFG_wsl_token_os_runtime="/home/token/runtimes/token-os/live"
+_IMPERIUM_CFG_wsl_vault_root="/home/token/vaults/Imperium-ENV"
 
 # --- Phone (Termux) ---
 _IMPERIUM_CFG_phone_nas_imperium=""
@@ -114,6 +117,7 @@ _IMPERIUM_CFG_phone_ssh_alias="phone"
 _IMPERIUM_CFG_phone_device_name="Token-S24"
 _IMPERIUM_CFG_phone_shell="bash"
 _IMPERIUM_CFG_phone_token_os_runtime=""
+_IMPERIUM_CFG_phone_vault_root=""
 
 # --- Linux fallback ---
 _IMPERIUM_CFG_linux_nas_imperium="/mnt/imperium"
@@ -125,6 +129,7 @@ _IMPERIUM_CFG_linux_ssh_alias=""
 _IMPERIUM_CFG_linux_device_name=""
 _IMPERIUM_CFG_linux_shell="bash"
 _IMPERIUM_CFG_linux_token_os_runtime="/home/token/runtimes/token-os/live"
+_IMPERIUM_CFG_linux_vault_root="$HOME/vaults/Imperium-ENV"
 
 # --- K12 personal (GMKtec K12; Imperium domain — replaces the Mac Mini) ---
 # NOTE: IMPERIUM_MACHINE is the hyphenated public id "k12-personal", but bash
@@ -142,6 +147,7 @@ _IMPERIUM_CFG_k12_personal_ssh_alias="k12-personal"
 _IMPERIUM_CFG_k12_personal_device_name="K12-Personal"
 _IMPERIUM_CFG_k12_personal_shell="bash"
 _IMPERIUM_CFG_k12_personal_token_os_runtime="$HOME/runtimes/Token-OS/live"
+_IMPERIUM_CFG_k12_personal_vault_root="$HOME/vaults/Imperium-ENV"
 
 # --- K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE) ---
 # In the Imperium registry only to be nameable for routing/enforcement scoping;
@@ -156,6 +162,7 @@ _IMPERIUM_CFG_k12_work_ssh_alias="k12-work"
 _IMPERIUM_CFG_k12_work_device_name="K12-Work"
 _IMPERIUM_CFG_k12_work_shell="bash"
 _IMPERIUM_CFG_k12_work_token_os_runtime=""
+_IMPERIUM_CFG_k12_work_vault_root=""
 
 # ============================================================
 # CONFIG LOOKUP FUNCTION
@@ -193,9 +200,13 @@ imperium_path_is_quarantined() {
 # ============================================================
 export IMPERIUM="$(imperium_cfg nas_imperium)"
 export CIVIC="$(imperium_cfg nas_civic)"
+# Obsidian vaults are machine-local. $IMPERIUM is an exchange/archive mount,
+# never a vault root.
+export IMPERIUM_VAULT="$(imperium_cfg vault_root)"
 # Token-OS now runs from a deploy-owned runtime checkout (protected-main/local-CD).
 # Hot runtime execution is machine-local when that checkout exists; $IMPERIUM remains
-# the NAS root for vault/archive/exchange and worktree skeletons. Agents edit branch
+# the NAS root for archive/exchange and worktree skeletons, never an Obsidian vault.
+# Agents edit branch
 # worktrees under ~/worktrees/Token-OS/wt-<branch>, never runtime checkouts.
 # Unconditional (not ${TOKEN_OS:-...}): long-lived tmux/launchd parents may export a
 # stale legacy TOKEN_OS, and this is the one canonical derivation — it must override.

@@ -37,7 +37,7 @@ from .session_doc_resolver import (
 )
 
 DEFAULT_REPO = str(Path.home() / "runtimes" / "Token-OS" / "live")
-DEFAULT_VAULT = "/Volumes/Imperium/Imperium-ENV"
+DEFAULT_VAULT = "~/vaults/Imperium-ENV"
 BUILDS_SUBDIR = "Terra/Journal/Builds"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
@@ -89,10 +89,7 @@ def _resolve_vault(arg: str | None) -> Path:
         val = os.environ.get(env)
         if val:
             return Path(val)
-    imperium = os.environ.get("IMPERIUM")
-    if imperium and (Path(imperium) / "Imperium-ENV").is_dir():
-        return Path(imperium) / "Imperium-ENV"
-    return Path(DEFAULT_VAULT)
+    return Path(DEFAULT_VAULT).expanduser()
 
 
 def _resolve_db(arg: str | None) -> Path:

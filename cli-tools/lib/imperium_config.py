@@ -64,6 +64,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "mini",
         "device_name": "Mac-Mini",
         "token_os_runtime": "~/runtimes/Token-OS/live",
+        "vault_root": "~/vaults/Imperium-ENV",
     },
     "wsl": {
         "nas_imperium": "/mnt/imperium",
@@ -74,6 +75,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "wsl",
         "device_name": "TokenPC",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
+        "vault_root": "/home/token/vaults/Imperium-ENV",
     },
     "phone": {
         "nas_imperium": "",
@@ -84,6 +86,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "phone",
         "device_name": "Token-S24",
         "token_os_runtime": "",
+        "vault_root": "",
     },
     "linux": {
         "nas_imperium": "/mnt/imperium",
@@ -94,6 +97,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "",
         "device_name": "",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
+        "vault_root": "~/vaults/Imperium-ENV",
     },
     # K12 personal (GMKtec K12; Imperium domain — replaces the Mac Mini). Runs
     # its OWN local Token-API (per-box registry pre-cutover) and is the long-term
@@ -108,6 +112,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "k12-personal",
         "device_name": "K12-Personal",
         "token_os_runtime": "~/runtimes/Token-OS/live",
+        "vault_root": "~/vaults/Imperium-ENV",
     },
     # K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE).
     # Present in the Imperium registry only to be nameable for routing/enforcement
@@ -122,6 +127,7 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "k12-work",
         "device_name": "K12-Work",
         "token_os_runtime": "",
+        "vault_root": "",
     },
 }
 
@@ -142,6 +148,9 @@ def cfg(key: str, machine: str | None = None) -> str:
 
 IMPERIUM = os.environ.get("IMPERIUM") or cfg("nas_imperium")
 CIVIC = os.environ.get("CIVIC") or cfg("nas_civic")
+# The Obsidian vault is deliberately separate from the NAS root. A missing local
+# vault stays missing; callers must not silently fall back to NAS storage.
+IMPERIUM_VAULT = os.path.expanduser(os.environ.get("IMPERIUM_VAULT") or cfg("vault_root"))
 
 
 _QUARANTINE_RE = re.compile(r"\.legacy-\d")

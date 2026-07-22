@@ -41,7 +41,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VAULT = Path(os.environ.get("IMPERIUM_VAULT", "/Volumes/Imperium/Imperium-ENV"))
+VAULT = Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
 WAVES_PATH = VAULT / "Terra/Inbox/active-waves.json"
 DAILY_DIR = VAULT / "Terra/Journal/Daily"
 API_URL = os.environ.get("TOKEN_API_URL", "http://localhost:7777")

@@ -4,11 +4,12 @@ This file provides global guidance for AI agents working across projects in this
 
 ## NAS Volumes — Single Source of Truth
 
-All source code, vaults, and project data live on the NAS (`Token-NAS`, `192.168.0.12`). Local `~/` paths are legacy — always use NAS mount paths.
+Obsidian vaults are machine-local. The NAS is for archive and exchange only;
+never resolve, mount, or fall back to it for a vault.
 
 | Volume | Mac Mount | WSL Mount | Encryption | Contents |
 |--------|-----------|-----------|-----------|----------|
-| **Imperium** | `/Volumes/Imperium` | `/mnt/imperium` | None | Imperium-ENV vault, Token-OS runtime, CLI tools, Plans |
+| **Imperium** | `/Volumes/Imperium` | `/mnt/imperium` | None | Archive/exchange and plans (not an Obsidian vault) |
 | **Civic** | `/Volumes/Civic` | `/mnt/civic` | AES-256 | Pax-ENV vault, ProcurementAgentAI, Civic work projects |
 
 Use `$IMPERIUM` and `$CIVIC` env vars — never hardcode mount paths. See `$IMPERIUM/runtimes/token-os/live/cli-tools/lib/nas-path.sh`.
@@ -140,7 +141,7 @@ The Obsidian vault is your extended mind. Each vault (-ENV) is a domain you can 
 
 | Vault | NAS Volume | Path | Domain |
 |-------|-----------|------|--------|
-| **Imperium-ENV** | Imperium | `$IMPERIUM/Imperium-ENV/` | Personal + agent workspace (Terra/ + Mars/) |
+| **Imperium-ENV** | local disk | `$IMPERIUM_VAULT/` | Personal + agent workspace (Terra/ + Mars/) |
 | **Pax-ENV** | Civic | `$CIVIC/Pax-ENV/` | Work (Civic Initiatives, professional projects) |
 
 ### Identity Model
@@ -199,5 +200,5 @@ Key projects:
 - `$CIVIC/ProcurementAgentAI/CLAUDE.md` - Main project (architecture + CLI tool docs)
 - `$IMPERIUM/runtimes/token-os/live/token-api/CLAUDE.md` - Token-API server
 - `$IMPERIUM/runtimes/token-os/live/mobile/CLAUDE.md` - Mobile/MacroDroid tools
-- `$IMPERIUM/Imperium-ENV/CLAUDE.md` - Primary Obsidian vault (Imperium)
+- `$IMPERIUM_VAULT/CLAUDE.md` - Primary local Obsidian vault (Imperium)
 - `$CIVIC/Pax-ENV/CLAUDE.md` - Work Obsidian vault (obsidian-cli docs live here)

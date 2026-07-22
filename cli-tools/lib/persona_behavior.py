@@ -79,10 +79,7 @@ def _existing_candidates(root: Path, components: Iterable[str]) -> list[Path]:
 
 
 def _imperium_root() -> Path:
-    base = os.environ.get("IMPERIUM")
-    if base and (Path(base) / "Imperium-ENV").is_dir():
-        return Path(base) / "Imperium-ENV"
-    return Path("/Volumes/Imperium/Imperium-ENV")
+    return Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
 
 
 def _pax_root() -> Path:

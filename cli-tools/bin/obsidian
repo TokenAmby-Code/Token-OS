@@ -67,18 +67,13 @@ resolve_vault() {
     return 1
   fi
 
-  # NAS mounts first (canonical locations)
-  # macOS mounts to /Volumes/, Linux mounts to /mnt/
-  if [[ -d "/Volumes/Imperium/$vault_name" ]]; then
-    echo "/Volumes/Imperium/$vault_name"
+  # Imperium-ENV is local by doctrine. Never probe NAS paths as a fallback.
+  if [[ "$vault_name" == "Imperium-ENV" && -n "${IMPERIUM_VAULT:-}" && -d "$IMPERIUM_VAULT" ]]; then
+    echo "$IMPERIUM_VAULT"
     return 0
   fi
   if [[ -d "/Volumes/Civic/$vault_name" ]]; then
     echo "/Volumes/Civic/$vault_name"
-    return 0
-  fi
-  if [[ -d "/mnt/imperium/$vault_name" ]]; then
-    echo "/mnt/imperium/$vault_name"
     return 0
   fi
   if [[ -d "/mnt/civic/$vault_name" ]]; then

@@ -56,7 +56,7 @@ log "CATCH ${SUBAGENT_TYPE} agent: ${AGENT_DESC}"
 
 # --- Resolve environment ---
 source "$(dirname "$(readlink -f "$0")")/../../cli-tools/lib/nas-path.sh" 2>/dev/null || true
-VAULT_DIR="${IMPERIUM:-/Volumes/Imperium}/Imperium-ENV"
+VAULT_DIR="${IMPERIUM_VAULT:-$HOME/vaults/Imperium-ENV}"
 DISPATCH_BIN="${IMPERIUM:-/Volumes/Imperium}/runtimes/token-os/live/cli-tools/bin/dispatch"
 
 # Resolve parent's working directory from the hook's CWD

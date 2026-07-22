@@ -13,7 +13,7 @@ Vault-first intake doctrine belongs to `Personas/Ranks/Aspirant.md`; use that ra
 
 | CWD | Default Project | Default Vault |
 |-----|----------------|---------------|
-| `$IMPERIUM/Imperium-ENV` | Token-OS | Imperium-ENV |
+| `$IMPERIUM_VAULT` | Token-OS | Imperium-ENV |
 | `$CIVIC/Pax-ENV` | askCivic | Pax-ENV |
 | Worktree path | From worktree config | From session doc |
 

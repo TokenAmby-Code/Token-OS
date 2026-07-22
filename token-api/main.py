@@ -13918,11 +13918,8 @@ def reset_idle_timer():
     timer_engine.set_productivity(True, now_ms)
 
 
-# Paths for Obsidian vault — NAS mount preferred, home fallback
-_imperium_root = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
-if not _imperium_root.exists():
-    _imperium_root = Path.home()
-OBSIDIAN_VAULT_PATH = _imperium_root / "Imperium-ENV"
+# Paths for Obsidian vault — always machine-local, never a NAS fallback.
+OBSIDIAN_VAULT_PATH = Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
 OBSIDIAN_DAILY_PATH = OBSIDIAN_VAULT_PATH / "Terra" / "Journal" / "Daily"
 OBSIDIAN_INBOX_PATH = OBSIDIAN_VAULT_PATH / "Aspirants"
 
@@ -14123,7 +14120,7 @@ async def trigger_checkin(checkin_type: str) -> dict:
     }
 
 
-DAILY_NOTE_DIR = Path("/Volumes/Imperium/Imperium-ENV/Terra/Journal/Daily")
+DAILY_NOTE_DIR = OBSIDIAN_DAILY_PATH
 
 
 def update_daily_note_frontmatter(checkin_type: str, data: dict) -> bool:
@@ -14188,7 +14185,7 @@ def _append_work_action_to_daily_note(at: str, source: str) -> None:
     root = (
         Path(vault)
         if vault
-        else Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV"
+        else Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
     )
     date_str = datetime.now().strftime("%Y-%m-%d")
     note_path = root / "Terra" / "Journal" / "Daily" / f"{date_str}.md"
@@ -23498,7 +23495,7 @@ async def _ops_session_docs_feed(
 
     vault_root = Path(
         os.environ.get("IMPERIUM_ENV")
-        or (Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV")
+        or Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
     )
     vault_name = vault_root.name
     now = datetime.now()
@@ -29190,12 +29187,8 @@ async def _find_latest_transcript(instance_id_short: str) -> str | None:
             timeout=10,
         )
         # Fallback: glob on disk
-        disk_pattern = str(Path.home() / "Imperium-ENV" / pattern)
+        disk_pattern = str(OBSIDIAN_VAULT_PATH / pattern)
         matches = sorted(_glob.glob(disk_pattern), reverse=True)
-        if not matches:
-            # Also check NAS path
-            nas_pattern = f"/Volumes/Imperium/Imperium-ENV/{pattern}"
-            matches = sorted(_glob.glob(nas_pattern), reverse=True)
         if matches:
             # Return vault-relative path
             for m in matches:
@@ -29587,7 +29580,7 @@ async def open_session_doc(doc_id: int):
 
     vault_root = Path(
         os.environ.get("IMPERIUM_ENV")
-        or (Path(os.environ.get("IMPERIUM", "/Volumes/Imperium")) / "Imperium-ENV")
+        or Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
     )
     vault_name = vault_root.name
 

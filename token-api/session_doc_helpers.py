@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # The live Obsidian vaults. Tests MUST NOT write here; the chokepoint guard below
 # hard-fails any session-doc creation that targets either tree while under pytest.
 # Imperium = personal-infra vault; Pax-ENV = civic (day-job / askCivic) vault.
-LIVE_VAULT_ROOT = Path("/Volumes/Imperium/Imperium-ENV")
+LIVE_VAULT_ROOT = Path("~/vaults/Imperium-ENV").expanduser()
 LIVE_CIVIC_VAULT_ROOT = Path("/Volumes/Civic/Pax-ENV")
 
 OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
@@ -47,10 +47,7 @@ def vault_root() -> Path:
     env = os.environ.get("IMPERIUM_ENV")
     if env:
         return Path(env)
-    imperium = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
-    if not imperium.exists():
-        imperium = Path.home()
-    return imperium / "Imperium-ENV"
+    return Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
 
 
 def civic_vault_root() -> Path:
