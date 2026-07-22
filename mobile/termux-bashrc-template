@@ -4,9 +4,6 @@
 # ====================================================
 # ENVIRONMENT CONFIGURATION
 # ====================================================
-# Mac Mini IP for Token-API HTTP endpoints
-MINI_IP="100.95.109.23"
-
 # Source local .env file for optional overrides
 # Store secrets here (e.g. CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`)
 if [[ -f "$HOME/.env" ]]; then
@@ -16,118 +13,63 @@ if [[ -f "$HOME/.env" ]]; then
 fi
 
 # ====================================================
-# STANDARDIZED SSH (via SSH config + redirect-on-exit)
+# K12 ATTACH
 # ====================================================
-# SSH config (~/.ssh/config) defines: desktop, wsl, mac, mini, phone
-# All use key-based authentication with id_ed25519
-#
-# When SSH'd into a host and you run ssh-wsl (for example), instead of
-# nesting (phone→mac→wsl), this redirects: closes the mac session and
-# connects directly from phone to wsl. Use --proxy to nest intentionally.
+# `tx` is explicit: new Termux sessions remain local until it is invoked.
+# Set K12_SSH_HOST in ~/.env to override the SSH-config host (default: k12-personal).
+K12_SSH_HOST="${K12_SSH_HOST:-k12-personal}"
+TX_RECONNECT_FILE="${TX_RECONNECT_FILE:-$HOME/.tx-reconnect-enabled}"
+TX_RECONNECT_FIFO="${TX_RECONNECT_FIFO:-$HOME/.tx-reconnect-wake}"
+TX_ATTACH_LOCK="${TX_ATTACH_LOCK:-$HOME/.tx-attach.lock}"
 
-_ssh_target_to_host() {
-    case "$1" in
-        mac)   echo "mini" ;;
-        wsl)   echo "wsl" ;;
-        phone) echo "phone" ;;
-        *)     echo "" ;;
-    esac
-}
-
-_ssh_ip_to_host() {
-    case "$1" in
-        100.95.109.23)  echo "mini" ;;
-        100.69.198.87)  echo "desktop" ;;
-        100.66.10.74)   echo "wsl" ;;
-        100.102.92.24)  echo "phone" ;;
-        *)              echo "" ;;
-    esac
-}
-
-ssh-connect() {
-    local TARGET="$1"; shift
-    local PROXY=false
-    [[ "$1" == "--proxy" ]] && { PROXY=true; shift; }
-
-    local HOST=$(_ssh_target_to_host "$TARGET")
-    if [[ -z "$HOST" ]]; then
-        echo "Unknown target: $TARGET (expected mac, wsl, or phone)"
-        return 1
-    fi
-
-    # Redirect-on-exit: if in SSH session and not --proxy
-    if [[ -n "$SSH_CONNECTION" ]] && ! $PROXY; then
-        local origin_ip="${SSH_CLIENT%% *}"
-        local origin_host=$(_ssh_ip_to_host "$origin_ip")
-        if [[ -n "$origin_host" ]]; then
-            echo "Redirecting: closing this session → connecting to $TARGET from origin..."
-            if ssh -o ConnectTimeout=3 -o BatchMode=yes "$origin_host" \
-                "echo $TARGET > \$HOME/.ssh-next" 2>/dev/null; then
-                # Kill parent shell to close SSH session automatically
-                kill -HUP $PPID 2>/dev/null
-                exit 0
-            fi
-            echo "Reverse SSH to origin failed, falling back to direct connection..."
-        fi
-        exec ssh "$HOST" "$@"
-    fi
-
-    # Direct connection with redirect loop
-    while true; do
-        if [[ $# -gt 0 ]]; then
-            ssh "$HOST" -t "$*"
-            break
-        else
-            ssh "$HOST"
-        fi
-        if [[ -f ~/.ssh-next ]]; then
-            local next=$(cat ~/.ssh-next)
-            rm -f ~/.ssh-next
-            HOST=$(_ssh_target_to_host "$next")
-            TARGET="$next"
-            if [[ -z "$HOST" ]]; then
-                echo "Invalid redirect target: $next"
-                break
-            fi
-            echo "Redirecting to $TARGET..."
-        else
-            break
-        fi
+_tx_reconnect_enabled() { [[ "$(cat "$TX_RECONNECT_FILE" 2>/dev/null || printf false)" == true ]]; }
+_tx_wait_for_reconnect_enabled() {
+    while ! _tx_reconnect_enabled; do
+        rm -f "$TX_RECONNECT_FIFO"; mkfifo "$TX_RECONNECT_FIFO"
+        printf 'K12 reconnect paused; waiting for Termux or DeX activity...\n'
+        IFS= read -r _ < "$TX_RECONNECT_FIFO" || true
     done
 }
+_tx_release_lock() {
+    [[ -f "$TX_ATTACH_LOCK/pid" && "$(cat "$TX_ATTACH_LOCK/pid" 2>/dev/null)" == "$$" ]] && rm -rf "$TX_ATTACH_LOCK"
+}
+_tx_acquire_lock() {
+    if mkdir "$TX_ATTACH_LOCK" 2>/dev/null; then printf '%s\n' "$$" > "$TX_ATTACH_LOCK/pid"; return 0; fi
+    local owner; owner=$(cat "$TX_ATTACH_LOCK/pid" 2>/dev/null || true)
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+        printf 'tx is already attached (owner PID %s); this shell remains local.\n' "$owner" >&2; return 1
+    fi
+    rm -rf "$TX_ATTACH_LOCK"; mkdir "$TX_ATTACH_LOCK" && printf '%s\n' "$$" > "$TX_ATTACH_LOCK/pid"
+}
+tx() {
+    _tx_acquire_lock || return 1
+    trap '_tx_release_lock; trap - EXIT INT TERM HUP; return 130' INT TERM HUP
+    trap '_tx_release_lock' EXIT
+    local exit_code=0
+    while true; do
+        _tx_wait_for_reconnect_enabled
+        ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -t "$K12_SSH_HOST"
+        exit_code=$?; [[ $exit_code -eq 0 ]] && break
+        _tx_reconnect_enabled || continue
+        printf 'K12 connection dropped; reconnecting... (Ctrl-C to stop)\n'; sleep 1
+    done
+    trap - EXIT INT TERM HUP; _tx_release_lock; return "$exit_code"
+}
+alias t=tx
 
-ssh-mac() { ssh-connect mac "$@"; }
-ssh-wsl() { ssh-connect wsl "$@"; }
-
-# Backwards-compatible aliases
-alias sshpc="ssh-wsl"
-alias sshmac="ssh-mac"
-alias sshmini="ssh-mac"
-
-# Pull configs from NAS (reverse path via Mac — inefficient but reliable backup)
-fetch-mobile() { ssh -t mac "push-mobile -b"; }
-alias fetch-bashrc="fetch-mobile"
-
+# Exactly one interactive shell per Termux app launch becomes the attach owner.
+# If MacroDroid reaches the lifecycle script after this shell starts, it wakes the
+# owner through the reconnect FIFO; New Session shells see the owner lock and stay local.
+TX_FIRST_SHELL_LOCK="${TX_FIRST_SHELL_LOCK:-$HOME/.tx-first-shell.lock}"
+_tx_autostart_first_shell() {
+    [[ $- == *i* && -z "${SSH_CONNECTION:-}" && -z "${TMUX:-}" ]] || return 0
+    mkdir "$TX_FIRST_SHELL_LOCK" 2>/dev/null || return 0
+    printf '%s\n' "$$" > "$TX_FIRST_SHELL_LOCK/pid"
+    _tx_wait_for_reconnect_enabled
+    tx
+}
 
 # ====================================================
-# On Termux shell exit/app close, ask the Mac tmux server to drop only this
-# shell's phone client. Reopen uses the normal sticky mac() auto-attach path below.
-TERMUX_MAC_TMUX_CLIENT_TAG="${TERMUX_MAC_TMUX_CLIENT_TAG:-termux-${USER:-phone}-$$}"
-TERMUX_MAC_TMUX_CLIENT_TAG="${TERMUX_MAC_TMUX_CLIENT_TAG//[^A-Za-z0-9_.-]/_}"
-
-_termux_detach_mac_tmux_client() {
-    [[ -n "${TERMUX_SKIP_TMUX_DETACH:-}" ]] && return 0
-    ssh -o BatchMode=yes -o ConnectTimeout=2 mac "client=\$(cat ~/.termux-mac-tmux-client-${TERMUX_MAC_TMUX_CLIENT_TAG} 2>/dev/null || true); rm -f ~/.termux-mac-tmux-client-${TERMUX_MAC_TMUX_CLIENT_TAG}; [[ -n \"\$client\" ]] && tmux detach-client -t \"\$client\" 2>/dev/null || true" >/dev/null 2>&1 &
-}
-trap _termux_detach_mac_tmux_client EXIT
-
-_mac_tmux_attach_cmd() {
-    # Blessed human attach path: phone knows only the daemon-owned ctl verb.
-    # Raw `tmux attach` stays tombstoned by the Mac tmux shim; any required
-    # RAW bypass is internal to tmuxctld-ctl attach.
-    printf '%s\n' "zsh -il -c 'exec tmuxctld-ctl attach'"
-}
-
 # TMUX — local session + remote attach
 # ====================================================
 # is_portable_monitor: true when terminal is wide enough to be an external display.
@@ -229,16 +171,12 @@ portable-monitor() {
             rm -f "$HOME/.no_portable_monitor"
             echo "Portable monitor: ON"
             _write_termux_props portable-nav
-            # Sync state to Mac for TUI sliver (skip if called from Mac via SSH)
-            [[ -z "$SSH_CONNECTION" ]] && ssh mini "echo on > ~/.portable_monitor_state" 2>/dev/null &
             ;;
         off)
             touch "$HOME/.no_portable_monitor"
             rm -f "$HOME/.portable_monitor"
             echo "Portable monitor: OFF"
             _write_termux_props mobile-nav
-            # Sync state to Mac for TUI sliver (skip if called from Mac via SSH)
-            [[ -z "$SSH_CONNECTION" ]] && ssh mini "echo off > ~/.portable_monitor_state" 2>/dev/null &
             ;;
         auto|"")
             rm -f "$HOME/.portable_monitor" "$HOME/.no_portable_monitor"
@@ -251,209 +189,7 @@ portable-monitor() {
             ;;
     esac
 
-    # If called remotely (e.g. Mac SSHing in to flip the flag), skip reconnect —
-    # the caller is already in the right session and just wants the flag + toolbar updated.
-    [[ -n "$SSH_CONNECTION" ]] && return 0
-
-    # Reconnect to mac with updated mode.
-    # In tx pane: respawn this pane with mac — kills current process, restarts clean.
-    # Bare Termux: call mac() directly (full session selection path).
-    if [[ -n "$TMUX" ]]; then
-        tmux respawn-pane -k -t "$TMUX_PANE" "bash -ic mac"
-    else
-        echo "Reconnecting..."
-        mac
-    fi
-}
-
-# tx / t: local tmux with 2 vertically-split raw terminals. No SSH, no remote attach.
-tx() {
-    if tmux has-session -t local 2>/dev/null; then
-        tmux attach -t local
-        return
-    fi
-
-    tmux new-session -d -s local
-    tmux split-window -v -t local:0
-    tmux select-pane -t local:0.0
-    tmux attach -t local
-}
-alias t=tx
-
-# Mac attach state. Default is assertive: `mac` means "get me to the Mac tmux
-# workspace", including from local tx panes and after dropped/reloaded sessions.
-# `not-mac` disables the remembered preference for the next `mac` call. That
-# call re-enables the default for future reconnects, but honors the one-shot
-# opt-out by opening a plain Mac shell instead of attaching tmux.
-MAC_INSIST_TMUX_FILE="$HOME/.mac-insist-tmux"
-MAC_NOT_MAC_FILE="$HOME/.not-mac"
-if [[ -f "$MAC_NOT_MAC_FILE" ]]; then
-    export MAC_INSIST_TMUX=false
-else
-    export MAC_INSIST_TMUX="${MAC_INSIST_TMUX:-true}"
-fi
-
-_mac_insist_tmux_enabled() {
-    [[ "${MAC_INSIST_TMUX:-true}" == "true" ]] && [[ ! -f "$MAC_NOT_MAC_FILE" ]]
-}
-
-_mac_set_insist_tmux() {
-    export MAC_INSIST_TMUX=true
-    rm -f "$MAC_NOT_MAC_FILE"
-    : > "$MAC_INSIST_TMUX_FILE"
-}
-
-not-mac() {
-    export MAC_INSIST_TMUX=false
-    rm -f "$MAC_INSIST_TMUX_FILE"
-    : > "$MAC_NOT_MAC_FILE"
-    echo "Mac tmux auto-attach disabled for the next 'mac'. Run 'mac' to re-enable."
-}
-
-
-# Reconnect gate for bare Termux mac(). TERMUX_MAC_RECONNECT=false disables
-# reconnect inside this shell; $MAC_RECONNECT_FILE lets phone automation flip the
-# gate for already-running shells. When disabled, mac() blocks on a FIFO until
-# mac-reconnect-on (or equivalent MacroDroid action) wakes it; no polling.
-MAC_RECONNECT_FILE="${MAC_RECONNECT_FILE:-$HOME/.mac-reconnect-enabled}"
-MAC_RECONNECT_FIFO="${MAC_RECONNECT_FIFO:-$HOME/.mac-reconnect-wake}"
-
-_mac_reconnect_enabled() {
-    case "${TERMUX_MAC_RECONNECT:-}" in
-        0|false|FALSE|no|NO|off|OFF) return 1 ;;
-    esac
-    [[ "$(cat "$MAC_RECONNECT_FILE" 2>/dev/null || echo true)" != "false" ]]
-}
-
-_mac_wait_for_reconnect_enabled() {
-    while ! _mac_reconnect_enabled; do
-        rm -f "$MAC_RECONNECT_FIFO"
-        mkfifo "$MAC_RECONNECT_FIFO" 2>/dev/null || true
-        echo "Mac reconnect paused; waiting for Termux reopen..."
-        IFS= read -r _ < "$MAC_RECONNECT_FIFO" || true
-    done
-}
-
-mac-reconnect-on() {
-    echo true > "$MAC_RECONNECT_FILE"
-    if [[ -p "$MAC_RECONNECT_FIFO" ]]; then
-        if exec 9<>"$MAC_RECONNECT_FIFO"; then
-            printf 'wake\n' >&9
-            exec 9>&-
-        fi
-    fi
-}
-
-mac-reconnect-off() {
-    echo false > "$MAC_RECONNECT_FILE"
-}
-
-
-# _mac_reconnect_plan ATTEMPT BURST_MAX DEEP_DONE
-# Pure decision helper for the aggressive reconnect ladder — no sleeping, no ssh.
-_mac_reconnect_plan() {
-    local attempt="$1" burst_max="$2" deep_done="$3"
-    local delay=0 do_print=0 do_deep=0
-    if (( attempt <= 1 )); then
-        delay=0
-    elif (( attempt <= burst_max )); then
-        delay=1
-        (( attempt == 2 )) && do_print=1
-    elif (( deep_done == 0 )); then
-        delay=0
-        do_deep=1
-    else
-        local n=$(( attempt - burst_max - 1 ))
-        if (( n >= 3 )); then
-            delay=8
-        else
-            delay=$(( 1 << n ))
-        fi
-    fi
-    printf '%s %s %s\n' "$delay" "$do_print" "$do_deep"
-}
-
-# mac: SSH to Mac. Assertively attach tmux by default, even from tx panes.
-# Portable monitor and phone both enter through the sanctioned daemon-owned
-# tmuxctld-ctl attach surface. Raw `tmux attach` remains tombstoned on the Mac.
-# SSH connects first; tmuxctld-ctl owns the human attach.
-mac() {
-    local insist_tmux=true
-    _mac_insist_tmux_enabled || insist_tmux=false
-
-    # Running `mac` always restores the assertive default for future prompts.
-    # If `not-mac` set a one-shot opt-out, honor it for this invocation only.
-    _mac_set_insist_tmux
-
-    if [[ "$insist_tmux" != "true" ]]; then
-        ssh -t mac "exec zsh -il"
-        return
-    fi
-
-    if [[ -n "$TMUX" ]]; then
-        ssh -t mac "$(_mac_tmux_attach_cmd)"
-        return
-    fi
-
-    local _mac_attach
-    _mac_attach="$(_mac_tmux_attach_cmd)"
-
-    # Bare Termux: max-aggression reconnect while the reconnect gate is enabled.
-    # If phone automation marks the gate false (e.g. Termux closing/backgrounded),
-    # keep the mac() wrapper alive but block on a FIFO instead of reconnecting or
-    # polling. Reopening Termux should run mac-reconnect-on, which flips the file
-    # gate and writes the FIFO to kick this wrapper back into the aggressive loop.
-    local _mac_ssh_opts_relaxed=(-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
-    local _mac_ssh_opts_tight=(-o ConnectTimeout=4 -o ServerAliveInterval=3 -o ServerAliveCountMax=2)
-    local _mac_ssh_opts=("${_mac_ssh_opts_relaxed[@]}")
-    local _burst_max=6       # attempts 1..6 = the 0s + five 1s aggressive burst
-    local _connect_ok=15     # an ssh lasting >= this counts as a real attach
-    local attempt=0 printed=false deep_done=false
-    while true; do
-        _mac_wait_for_reconnect_enabled
-
-        local _t0=$SECONDS
-        ssh "${_mac_ssh_opts[@]}" -t mac "$_mac_attach"
-        local exit_code=$?
-        local _elapsed=$(( SECONDS - _t0 ))
-
-        # Exit code 0 = clean detach / clean remote logout. You asked to leave.
-        [[ $exit_code -eq 0 ]] && break
-
-        if ! _mac_reconnect_enabled; then
-            _mac_wait_for_reconnect_enabled
-            attempt=0; printed=false; deep_done=false
-            _mac_ssh_opts=("${_mac_ssh_opts_relaxed[@]}")
-            continue
-        fi
-
-        # A session that lasted a real interval connected successfully and only
-        # now dropped. Reset the ladder so this drop gets an instant re-tap.
-        if (( _elapsed >= _connect_ok )); then
-            attempt=0; printed=false; deep_done=false
-            _mac_ssh_opts=("${_mac_ssh_opts_relaxed[@]}")
-        fi
-
-        ((attempt++))
-        local _plan _delay _do_print _do_deep
-        _plan=$(_mac_reconnect_plan "$attempt" "$_burst_max" "$([[ $deep_done == true ]] && echo 1 || echo 0)")
-        read -r _delay _do_print _do_deep <<< "$_plan"
-
-        if (( _do_print )) && [[ "$printed" != true ]]; then
-            echo "Connection dropped — reconnecting (Ctrl-C to stop, mac-reconnect-off to pause)..."
-            printed=true
-        fi
-
-        if (( _do_deep )); then
-            echo "  ...deeper restart (fresh attach)..."
-            _mac_set_insist_tmux
-            _mac_attach="$(_mac_tmux_attach_cmd)"
-            _mac_ssh_opts=("${_mac_ssh_opts_tight[@]}")
-            deep_done=true
-        fi
-
-        (( _delay > 0 )) && sleep "$_delay"
-    done
+    # Profile selection is local; it never starts or redirects an SSH session.
 
 }
 
@@ -658,50 +394,6 @@ alias e='micro'
 # ====================================================
 # CONVENIENCE
 # ====================================================
-alias c="clear"
-alias cc="clear &&"
-alias python="python3"
-
-# cdc - run claude on Mac (not installed on phone) with optional path/args
-# Uses zsh -il (interactive login) so Mac sources ~/.zprofile (PATH) + ~/.zshrc (aliases)
-# Note: Mac has its own OAuth credentials — don't forward CLAUDE_CODE_OAUTH_TOKEN
-# (env var overrides stored credentials, and phone token may be stale)
-cdc() {
-    ssh -t mac "zsh -il -c 'cdc $*'"
-}
-
-# ====================================================
-# COMMAND NOT FOUND — INTERACTIVE ROUTING MODAL
-# ====================================================
-# Fires only for genuinely missing commands (bash exit 127 hook).
-# --local in any arg position suppresses the modal entirely.
-command_not_found_handle() {
-    local cmd="$1"; shift
-    local args=("$@")
-
-    # --local flag: suppress remote fallback, return 127 normally
-    for arg in "${args[@]}"; do
-        [[ "$arg" == "--local" ]] && { echo "Command not found: $cmd"; return 127; }
-    done
-
-    echo ""
-    echo "Command not found: $cmd"
-    echo "  1) Run on Mac"
-    echo "  2) Run on WSL"
-    echo "  3) Don't run remotely"
-    printf "Route to: "
-    read -r choice
-
-    # Use zsh -i on Mac / bash -i on WSL so ~/.zshrc is sourced and
-    # aliases/functions (like claude, monitor) are available
-    case "$choice" in
-        1) ssh -t mac "zsh -il -c '$cmd ${args[*]}'" ;;
-        2) ssh -t wsl "bash -ic '$cmd ${args[*]}'" ;;
-        *) return 127 ;;
-    esac
-}
-
-# ====================================================
 # UTILITY FUNCTIONS
 # ====================================================
 # Timestamps
@@ -748,15 +440,6 @@ extract() {
 }
 
 # ====================================================
-# MAC-SIDE COMMANDS — explicit functions (bypass routing modal)
-# Uses zsh -il -c so Mac's ~/.zshrc is sourced (needed for aliases/functions)
-# ====================================================
-monitor()       { ssh -t mac "zsh -il -c 'monitor'"; }
-token-restart() { ssh -t mac "zsh -il -c 'token-restart $*'"; }
-token-status()  { ssh -t mac "zsh -il -c 'token-status $*'"; }
-instance-name() { ssh -t mac "zsh -il -c 'instance-name $*'"; }
-
-# ====================================================
 # GIT
 # ====================================================
 alias gs="git status"
@@ -767,58 +450,5 @@ alias gpush="git push origin"
 alias gpull="git pull origin"
 alias gadd="git add ."
 
-# ====================================================
-# SYSTEM CONTROL (Mac Mini Token-API)
-# ====================================================
-# Token-API now runs on Mac Mini (100.95.109.23:7777)
-# Shutdown Mac Mini with 1min delay, Ctrl+C to cancel
-shutdown-mini() {
-    local API="http://${MINI_IP}:7777"
-
-    echo "Initiating Mac Mini shutdown in 60 seconds... (Ctrl+C to cancel)"
-
-    local response=$(curl -s -X POST "$API/api/system/shutdown" \
-        -H "Content-Type: application/json" \
-        -d '{"action": "shutdown", "delay_seconds": 60}')
-
-    local success=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success', False))" 2>/dev/null)
-
-    if [[ "$success" != "True" ]]; then
-        echo "Failed to initiate shutdown: $response"
-        return 1
-    fi
-
-    trap 'echo ""; echo "Cancelling shutdown..."; curl -s -X POST "$API/api/system/shutdown/cancel" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"message\", \"Unknown\"))"; trap - INT; return 130' INT
-
-    for i in {60..1}; do
-        printf "\rShutdown in %2d seconds... (Ctrl+C to cancel)" "$i"
-        sleep 1
-    done
-
-    trap - INT
-    echo ""
-    echo "Shutdown initiated."
-}
-
-# ====================================================
-# STARTUP
-# ====================================================
-# Sticky auto-attach: a fresh Termux open jumps straight to the Mac tmux
-# workspace via mac(). Drops reconnect aggressively while mac-reconnect is on;
-# when phone automation turns it off, the wrapper sleeps on a FIFO until reopen
-# turns it back on and wakes it. Guards:
-#   * interactive shells only ($- has 'i') — never hijacks scp/`ssh phone cmd`,
-#   * skip if already inside tmux or an inbound SSH session (no recursion),
-#   * skip if `not-mac` set the one-shot opt-out — run `not-mac` then reopen
-#     Termux to reach a plain local shell.
-case $- in
-    *i*)
-        if [[ -f "$MAC_NOT_MAC_FILE" ]]; then
-            # One-shot opt-out from `not-mac`: skip auto-attach exactly once,
-            # then consume the flag so the next Termux open is sticky again.
-            rm -f "$MAC_NOT_MAC_FILE"
-        elif [[ -z "$TMUX" && -z "$SSH_CONNECTION" ]]; then
-            mac
-        fi
-        ;;
-esac
+# First shell after a Termux app launch auto-attaches; later New Session shells do not.
+_tx_autostart_first_shell

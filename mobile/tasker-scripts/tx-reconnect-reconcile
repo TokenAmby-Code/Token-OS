@@ -1,0 +1,14 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Reconcile the reconnect gate from its two independent local inputs.
+set -euo pipefail
+HOME=/data/data/com.termux/files/home
+termux_active=$(cat "$HOME/.termux-active" 2>/dev/null || printf false)
+dex_active=$(cat "$HOME/.dex-active" 2>/dev/null || printf false)
+if [[ "$termux_active" == true || "$dex_active" == true ]]; then
+    printf 'true\n' > "$HOME/.tx-reconnect-enabled"
+    if [[ -p "$HOME/.tx-reconnect-wake" ]]; then
+        if exec 9<>"$HOME/.tx-reconnect-wake"; then printf 'wake\n' >&9; exec 9>&-; fi
+    fi
+else
+    printf 'false\n' > "$HOME/.tx-reconnect-enabled"
+fi

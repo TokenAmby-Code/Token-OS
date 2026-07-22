@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+HOME=/data/data/com.termux/files/home
+printf 'true\n' > "$HOME/.termux-active"
+rm -rf "$HOME/.tx-first-shell.lock"
+exec "$HOME/.termux/tasker/tx-reconnect-reconcile"

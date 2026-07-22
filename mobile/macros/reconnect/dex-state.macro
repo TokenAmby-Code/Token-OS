@@ -1,0 +1,95 @@
+{
+  "macroExportVersion": 1,
+  "globalVariables": [],
+  "userIcons": null,
+  "aiFeedback": "Generated from official MacroDroid schema.",
+  "macro": {
+    "m_name": "DEX state",
+    "m_enabled": true,
+    "m_completed": true,
+    "m_GUID": 0,
+    "m_category": "System",
+    "aiGenerated": 1,
+    "m_description": "Respond only to Knox DeX enter/exit intents: update the independent DeX marker, select the local taskbar profile, and reconcile tx reconnect.",
+    "m_triggerList": [
+      {
+        "m_classType": "IntentReceivedTrigger",
+        "m_SIGUID": 112233445566771,
+        "action": "android.app.action.ENTER_KNOX_DESKTOP_MODE",
+        "enableRegex": false,
+        "extraDictionaryKeys": [],
+        "extraParams": [],
+        "extraValuePatterns": [],
+        "extraVariables": [],
+        "saveExtrasToDict": false,
+        "disableLogging": false
+      },
+      {
+        "m_classType": "IntentReceivedTrigger",
+        "m_SIGUID": 112233445566772,
+        "action": "android.app.action.EXIT_KNOX_DESKTOP_MODE",
+        "enableRegex": false,
+        "extraDictionaryKeys": [],
+        "extraParams": [],
+        "extraValuePatterns": [],
+        "extraVariables": [],
+        "saveExtrasToDict": false,
+        "disableLogging": false
+      }
+    ],
+    "m_actionList": [
+      {
+        "m_classType": "IfConditionAction",
+        "m_SIGUID": 0,
+        "childrenCollapsed": false,
+        "dontLogIfConditionIsFalse": false,
+        "disableLogging": false,
+        "m_constraintList": [
+          {
+            "m_classType": "TriggerThatInvokedConstraint",
+            "m_SIGUID": 0,
+            "m_not": false,
+            "m_siGuidThatInvoked": 112233445566771,
+            "m_triggerName": "Intent Received: android.app.action.ENTER_KNOX_DESKTOP_MODE",
+            "disableLogging": false
+          }
+        ]
+      },
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": 0,
+        "m_nonRoot": true,
+        "blockNextAction": true,
+        "timeoutSeconds": 30,
+        "useHelper": true,
+        "useShizuku": false,
+        "disableLogging": false,
+        "m_script": "am startservice --user 0 -n com.termux/com.termux.app.RunCommandService -a com.termux.RUN_COMMAND --es com.termux.RUN_COMMAND_PATH '/data/data/com.termux/files/home/.termux/tasker/dex-enter.sh' --ez com.termux.RUN_COMMAND_BACKGROUND 'true'"
+      },
+      {
+        "m_classType": "ElseAction",
+        "m_SIGUID": 0,
+        "dontLogIfConditionIsFalse": false,
+        "disableLogging": false
+      },
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": 0,
+        "m_nonRoot": true,
+        "blockNextAction": true,
+        "timeoutSeconds": 30,
+        "useHelper": true,
+        "useShizuku": false,
+        "disableLogging": false,
+        "m_script": "am startservice --user 0 -n com.termux/com.termux.app.RunCommandService -a com.termux.RUN_COMMAND --es com.termux.RUN_COMMAND_PATH '/data/data/com.termux/files/home/.termux/tasker/dex-exit.sh' --ez com.termux.RUN_COMMAND_BACKGROUND 'true'"
+      },
+      {
+        "m_classType": "EndIfAction",
+        "m_SIGUID": 0,
+        "dontLogIfConditionIsFalse": false,
+        "disableLogging": false
+      }
+    ],
+    "m_constraintList": []
+  }
+}

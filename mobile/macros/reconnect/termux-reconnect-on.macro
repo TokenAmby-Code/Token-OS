@@ -1,0 +1,46 @@
+{
+  "macroExportVersion": 1,
+  "globalVariables": [],
+  "userIcons": null,
+  "aiFeedback": "Generated from official MacroDroid schema.",
+  "macro": {
+    "m_name": "Termux Reconnect On",
+    "m_enabled": true,
+    "m_completed": true,
+    "m_GUID": 0,
+    "m_category": "System",
+    "aiGenerated": 1,
+    "m_description": "Set only the local Termux lifecycle marker, then reconcile the tx reconnect gate.",
+    "m_triggerList": [
+      {
+        "m_classType": "ApplicationLaunchedTrigger",
+        "m_SIGUID": 0,
+        "excludeMode": false,
+        "isAllApps": false,
+        "m_applicationNameList": [
+          "Termux"
+        ],
+        "m_launched": true,
+        "m_packageNameList": [
+          "com.termux"
+        ],
+        "usePackageNameOption": 0,
+        "disableLogging": false
+      }
+    ],
+    "m_actionList": [
+      {
+        "m_classType": "ShellScriptAction",
+        "m_SIGUID": 0,
+        "m_nonRoot": true,
+        "blockNextAction": true,
+        "timeoutSeconds": 30,
+        "useHelper": true,
+        "useShizuku": false,
+        "disableLogging": false,
+        "m_script": "am startservice --user 0 -n com.termux/com.termux.app.RunCommandService -a com.termux.RUN_COMMAND --es com.termux.RUN_COMMAND_PATH '/data/data/com.termux/files/home/.termux/tasker/termux-reconnect-on' --ez com.termux.RUN_COMMAND_BACKGROUND 'true'"
+      }
+    ],
+    "m_constraintList": []
+  }
+}
