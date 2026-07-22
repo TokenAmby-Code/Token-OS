@@ -133,7 +133,7 @@ echo "" >&2
 # ── Build PowerShell capture script ──────────────────────────────────────────
 
 if [[ -n "$WINDOW" ]]; then
-    # Window-specific capture using PrintWindow (same as obsidian-screenshot)
+    # Window-specific capture using Win32 PrintWindow (no foreground needed)
     PS_CAPTURE_FN=$(cat << 'PSEOF'
 Add-Type @"
 using System;
