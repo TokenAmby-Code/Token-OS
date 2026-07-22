@@ -36,6 +36,41 @@ macrodroid-state --list 2>/dev/null || true
 curl -sf "http://$(imperium_cfg tailscale_ip phone):7777/server-heartbeat"
 ```
 
+## Mobile Taskbar Layer Coupling
+
+The mobile taskbar layer selector is intentionally local-only. Do not require
+Token-API, Tailscale, or any server/network endpoint to switch visible layers.
+Layer state should live in MacroDroid/local Android state unless a future design
+explicitly changes this.
+
+Target gesture model:
+
+- **Tap 1**: normal layer-1 tap profile.
+- **Hold 1 + tap 2**: selects/toggles layer 2. This replaces the older
+  standalone held-layer behavior; the held layer is now coupled to tap layer 2.
+- **Hold 2**: reserved for a third distinct profile once layer 2 is active.
+
+This coupling is deliberate: three profiles are represented by tap 1,
+hold-1/tap-2, and hold 2. When changing taskbar macros, preserve those three
+distinct profiles and document any remapping in the macro description or session
+notes.
+
+**Implementation boundary:** Termux `extra-keys` macros only inject terminal
+input. When the terminal is attached to SSH/tmux, prefix sequences are handled
+by that remote session and cannot select a phone-local profile. Do not map a
+layer selector to `prefix+1`, `prefix+2`, or any other terminal byte sequence.
+Use an Android-local control (for example, a MacroDroid floating button or
+Tasker/Termux:Tasker action) that updates local state and reloads the toolbar.
+
+Typing buffer affordance:
+
+- Provide a **non-swipe** gesture/control to open the typing buffer.
+- The buffer is for composing with normal keyboard spell-correct before sending.
+- Before any send action, mirror the composed text to the clipboard so failed
+  sends do not lose the message.
+- The UI must permit select-all and copy. If a direct select-all/copy path is
+  unavailable, use a clipboard-backed buffer variable plus a visible copy action.
+
 ## Official Macro Delivery Path
 
 This is the only approved way to deliver MacroDroid macros to the operator’s phone. Do not use alternate “push” methods.
